@@ -18,14 +18,13 @@ class PositionalEncoder(eqx.Module):
     pe: Array
 
     def __init__(self, in_dim: int, seq_len: int, n: int = 10_000) -> None:
-        # Create matrix of [SeqLen, TokenSize] representing the positional 
-        # encoding for max_len inputs
+        # Swap indices to create [seq_len, in_dim] instead of [in_dim, seq_len]
+        pe = np.zeros((seq_len, in_dim))
+        position = np.arange(0, seq_len, dtype=np.float32)[:, None] # Shape (1024, 1)
+        div_term = np.power(n, np.arange(0, in_dim, 2) / in_dim)[None, :] # Shape (1, 16)
         
-        pe = np.zeros((in_dim, seq_len))
-        position = np.arange(0, seq_len, dtype=np.float32)[None, :]
-        div_term = np.power(n, np.arange(0, in_dim, 2) / in_dim)[:, None]
-        pe[0::2, :] = np.sin(position * div_term)
-        pe[1::2, :] = np.cos(position * div_term)
+        pe[:, 0::2] = np.sin(position * div_term)
+        pe[:, 1::2] = np.cos(position * div_term)
         self.pe = jax.device_put(pe)
 
     def __call__(self, x: Array) -> Array:
@@ -49,17 +48,17 @@ class MLP(eqx.Module):
         key: PRNGKey
     ) -> None:
         super().__init__()
-        keys = jrand.split(key, len(layers))
+        keys = jrand.split(key, len(layers) + 1)
         layer_list = [
             eqx.nn.Linear(in_size, layers[0], key=keys[0]), 
             eqx.nn.Lambda(activation)
         ]
-        for i, key in enumerate(keys[1:]):
+        for i, key in enumerate(keys[1:-1]):
             layer_list.append(eqx.nn.Linear(layers[i], layers[i+1], key=key))
             layer_list.append(eqx.nn.Lambda(activation))
         layer_list.append(eqx.nn.Linear(layers[-1], out_size, key=keys[-1]))
         layer_list.append(eqx.nn.Lambda(final_activation))
-        self.layers = layer_list
+        self.layers = eqx.nn.Sequential(layer_list)
         
     def __call__(self, x: Array) -> Array:
         for layer in self.layers:

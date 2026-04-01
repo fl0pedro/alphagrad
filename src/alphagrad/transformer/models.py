@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 from typing import Optional, Sequence, Tuple
 
 import equinox as eqx
 import jax
+import jax.nn as jnn
 import jax.numpy as jnp
 import jax.random as jrand
-import jax.nn as jnn
 from jax import Array
 from jax.random import PRNGKey
 
@@ -391,140 +393,52 @@ class TransformerBlock(eqx.Module):
         return x
 
 
-class BaseSSM(eqx.Module):
-    A_log: Array
-    B: Array
-    C: Array
-    D: Array
-    dt: Array
-
-    state_dim: int
-    embd_dim: int
-
-    def __init__(self, embd_dim: int, state_dim: int = 16, key: PRNGKey = None):
-        super().__init__()
-        key_A, key_B, key_C, key_D, key_dt = jrand.split(key, 5)
-        self.state_dim = state_dim
-        self.embd_dim = embd_dim
-
-        self.A_log = jrand.uniform(
-            key_A, (embd_dim, state_dim), minval=-3.0, maxval=0.0
-        )
-
-        self.B = jrand.normal(key_B, (embd_dim, state_dim)) * 0.02
-        self.C = jrand.normal(key_C, (embd_dim, state_dim)) * 0.02
-        self.D = jrand.normal(key_D, (embd_dim,))
-
-        self.dt = jrand.uniform(key_dt, (embd_dim,), minval=-3.0, maxval=-1.0)
-
-    def __call__(self, x: Array) -> Array:
-        dt = jnp.exp(self.dt)[:, None]
-        A = -jnp.exp(self.A_log)
-
-        A_bar = jnp.exp(A * dt)
-        B_bar = (A_bar - 1.0) / A * self.B
-
-        bu = jax.vmap(lambda u: u[:, None] * B_bar)(x)
-
-        def scan_fn(h_prev, bu_curr):
-            h_new = A_bar * h_prev + bu_curr
-            return h_new, h_new
-
-        h0 = jnp.zeros((self.embd_dim, self.state_dim))
-        _, hs = jax.lax.scan(scan_fn, h0, bu)
-        y_ssm = jnp.sum(hs * self.C[None, :, :], axis=-1)
-        y_skip = x * self.D[None, :]
-        return y_ssm + y_skip
-
-
-class SSMBlock(eqx.Module):
-    norm: eqx.nn.LayerNorm
-    ssm: BaseSSM
-    mlp_norm: eqx.nn.LayerNorm
-    mlp: SwiGLU
-
-    def __init__(self, embd_dim: int, hidden_dim: int, key: PRNGKey):
-        super().__init__()
-        ssm_key, mlp_key = jrand.split(key)
-        self.norm = eqx.nn.LayerNorm(embd_dim)
-        self.ssm = BaseSSM(embd_dim, key=ssm_key)
-        self.mlp_norm = eqx.nn.LayerNorm(embd_dim)
-        self.mlp = SwiGLU(embd_dim, hidden_dim, key=mlp_key)
-
-    def __call__(self, x: Array) -> Array:
-        # Pre-norm architecture
-        norm_x = jax.vmap(self.norm)(x)
-        x = x + self.ssm(norm_x)
-
-        norm_x = jax.vmap(self.mlp_norm)(x)
-        x = x + jax.vmap(self.mlp)(norm_x)
-        return x
-
-
-class TransformerClassifier(eqx.Module):
+class ApproxModel(eqx.Module):
     embedding: eqx.nn.Embedding
-    layers: list[TransformerBlock]
-    head: eqx.nn.Linear
+    pos_enc: PositionalEncoder
+    encoder: Encoder
+    policy_head: MLP
+    fmas_value_head: MLP
+    acc_value_head: MLP
+    num_actions: int = eqx.field(static=True)
 
     def __init__(
         self,
-        vocab_size: int = 256,
-        embd_dim: int = 256,
-        hidden_dim: int = 256,
-        num_layers: int = 6,
-        num_heads: int = 6,
-        key: PRNGKey = None,
+        vocab_size,
+        embd_dim,
+        num_layers,
+        num_heads,
+        hidden_dim,
+        num_actions,
+        policy_dims,
+        value_dims,
+        seq_len,
+        key,
     ):
-        super().__init__()
+        k1, k2, k3, k4, k5 = jrand.split(key, 5)
+        self.num_actions = num_actions
+        self.embedding = eqx.nn.Embedding(vocab_size, embd_dim, key=k1)
+        self.pos_enc = PositionalEncoder(embd_dim, seq_len)
+        self.encoder = Encoder(num_layers, num_heads, embd_dim, hidden_dim, key=k2)
 
-        keys = jrand.split(key, num_layers + 2)
-        embed_key, head_key = keys[0], keys[1]
-        layer_keys = keys[2:]
+        self.policy_head = MLP(embd_dim, num_actions, policy_dims, key=k3)
+        self.fmas_value_head = MLP(embd_dim, 1, value_dims, key=k4)
+        self.acc_value_head = MLP(embd_dim, 1, value_dims, key=k5)
 
-        self.embedding = eqx.nn.Embedding(vocab_size, embd_dim, key=embed_key)
-        self.layers = [
-            TransformerBlock(embd_dim, num_heads, hidden_dim, key=k) for k in layer_keys
-        ]
-        self.head = eqx.nn.Linear(embd_dim, 2, key=head_key)
+    def __call__(self, tokens, key=None, inference=False):
+        if tokens.ndim == 1:
+            x = jax.vmap(self.embedding)(tokens)
+            x = self.pos_enc(x)
+            enc_key = key if key is not None else jrand.PRNGKey(0)
+            x = self.encoder(x, key=enc_key)
 
-    def __call__(self, x: Array, key: Optional[PRNGKey] = None) -> Array:
-        x = jax.vmap(self.embedding)(x)
+            summary = jnp.mean(x, axis=0)
 
-        for layer in self.layers:
-            x = layer(x, mask=None, key=key)
+            logits = self.policy_head(summary)
+            fmas_value = self.fmas_value_head(summary).squeeze(-1)
+            acc_value = self.acc_value_head(summary).squeeze(-1)
 
-        x = jnp.mean(x, axis=0)
-        return self.head(x)
-
-
-class SSMClassifier(eqx.Module):
-    embedding: eqx.nn.Embedding
-    layers: list[SSMBlock]
-    head: eqx.nn.Linear
-
-    def __init__(
-        self,
-        vocab_size: int = 256,
-        embd_dim: int = 256,
-        hidden_dim: int = 256,
-        num_layers: int = 6,
-        key: PRNGKey = None,
-    ):
-        super().__init__()
-
-        keys = jrand.split(key, num_layers + 2)
-        embed_key, head_key = keys[0], keys[1]
-        layer_keys = keys[2:]
-
-        self.embedding = eqx.nn.Embedding(vocab_size, embd_dim, key=embed_key)
-        self.layers = [SSMBlock(embd_dim, hidden_dim, key=k) for k in layer_keys]
-        self.head = eqx.nn.Linear(embd_dim, 2, key=head_key)
-
-    def __call__(self, x: Array, key: Optional[PRNGKey] = None) -> Array:
-        x = jax.vmap(self.embedding)(x)
-
-        for layer in self.layers:
-            x = layer(x)
-
-        x = jnp.mean(x, axis=0)
-        return self.head(x)
+            return logits, fmas_value, acc_value
+        else:
+            batched_call = jax.vmap(self, in_axes=(0, None, None))
+            return batched_call(tokens, key, inference)
