@@ -1,0 +1,127 @@
+Total vertices: 9, Valid vertices: 8, Valid set: (1, 2, 3, 4, 5, 6, 7, 8)
+NUM_ACTIONS=45, ROLLOUT_LENGTH=8, MINIBATCHES=32
+  0%|          | 0/1 [00:00<?, ?it/s]ERROR:2026-04-10 08:27:56,968:jax._src.callback:442: jax.io_callback failed
+Traceback (most recent call last):
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/callback.py", line 440, in io_callback_impl
+    return tree_util.tree_map(np.asarray, callback(*args))
+                                          ~~~~~~~~^^^^^^^
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/callback.py", line 70, in __call__
+    return tree_util.tree_leaves(self.callback_func(*args, **kwargs))
+                                 ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/alphagrad/src/alphagrad/approx/env.py", line 97, in _callback
+    ve = extract_jaxpr(
+        jaxpr,
+    ...<5 lines>...
+        sparsity_map=sparsity_map,
+    )
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/core.py", line 566, in extract_jaxpr
+    closed = jax.make_jaxpr(eval_graph)(*dummy_args)
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/core.py", line 549, in eval_graph
+    res = vertex_elimination_jaxpr(
+        jaxpr,
+    ...<5 lines>...
+        sparsity_map=_sparsity_map,
+    )
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/core.py", line 434, in vertex_elimination_jaxpr
+    graph, _, fmas, counts = eliminator.eliminate(
+                             ~~~~~~~~~~~~~~~~~~~~^
+        order, jaxpr, sparsity_map, iota, vo_vertices, count_ops
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/core.py", line 381, in eliminate
+    step_fmas = _eliminate_vertex(
+        vertex, jaxpr, m_graph, m_transpose_graph, iota, vo_vertices, sp_rules
+    )
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/core.py", line 287, in _eliminate_vertex
+    edge_outval = apply_dynamic_sparsity(edge_outval, sp_rules)
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/sparse/tensor.py", line 2575, in apply_dynamic_sparsity
+    st = st.dense()
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/sparse/tensor.py", line 266, in dense
+    return _dense(st, axes, hard)
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/sparse/tensor.py", line 570, in _dense
+    val, res_dims = _apply_dense_scattering(
+                    ~~~~~~~~~~~~~~~~~~~~~~~^
+        val, new_dims, actual_to_scatter_logical, phys_to_scatter
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/sparse/tensor.py", line 698, in _apply_dense_scattering
+    val = val.reshape(total_new_shape)
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py", line 1152, in meth
+    return getattr(self.aval, name).fun(self, *args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py", line 316, in _reshape
+    newshape = _compute_newshape(self, args[0] if len(args) == 1 else args)
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py", line 481, in _compute_newshape
+    raise TypeError(f"cannot reshape array of shape {arr.shape} (size {arr.size}) "
+                    f"into shape {orig_newshape} (size {math.prod(newshape)})")
+TypeError: cannot reshape array of shape (4, 8, 2, 8, 4, 4, 8, 4, 4) (size 1048576) into shape (4, 4, 2, 8, 4, 4, 8, 4, 4) (size 524288)
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+DEBUG: _dense i=0 lid=None type=<class 'graphax.sparse.tensor.SparseDimension'> new_type=<class 'graphax.sparse.tensor.SparseDimension'>
+DEBUG: _dense i=0 lid=None type=<class 'graphax.sparse.tensor.SparseDimension'> new_type=<class 'graphax.sparse.tensor.SparseDimension'>
+DEBUG: _dense i=0 lid=None type=<class 'graphax.sparse.tensor.SparseDimension'> new_type=<class 'graphax.sparse.tensor.SparseDimension'>
+DEBUG: _dense i=0 lid=None type=<class 'graphax.sparse.tensor.SparseDimension'> new_type=<class 'graphax.sparse.tensor.SparseDimension'>
+DEBUG: _dense i=0 lid=None type=<class 'graphax.sparse.tensor.SparseDimension'> new_type=<class 'graphax.sparse.tensor.SparseDimension'>
+DEBUG: _dense i=0 lid=None type=<class 'graphax.sparse.tensor.SparseDimension'> new_type=<class 'graphax.sparse.tensor.SparseDimension'>
+DEBUG: _dense i=1 lid=None type=<class 'graphax.sparse.tensor.SparseDimension'> new_type=<class 'graphax.sparse.tensor.SparseDimension'>
+DEBUG: _dense i=1 lid=None type=<class 'graphax.sparse.tensor.SparseDimension'> new_type=<class 'graphax.sparse.tensor.SparseDimension'>
+DEBUG: _dense i=1 lid=None type=<class 'graphax.sparse.tensor.SparseDimension'> new_type=<class 'graphax.sparse.tensor.SparseDimension'>
+DEBUG: _dense i=1 lid=None type=<class 'graphax.sparse.tensor.SparseDimension'> new_type=<class 'graphax.sparse.tensor.SparseDimension'>
+DEBUG: _dense i=1 lid=None type=<class 'graphax.sparse.tensor.SparseDimension'> new_type=<class 'graphax.sparse.tensor.SparseDimension'>
+DEBUG: _dense i=1 lid=None type=<class 'graphax.sparse.tensor.SparseDimension'> new_type=<class 'graphax.sparse.tensor.SparseDimension'>
+DEBUG: _dense i=1 lid=None type=<class 'graphax.sparse.tensor.SparseDimension'> new_type=<class 'graphax.sparse.tensor.SparseDimension'>
+DEBUG: _dense i=1 lid=None type=<class 'graphax.sparse.tensor.SparseDimension'> new_type=<class 'graphax.sparse.tensor.SparseDimension'>
+Traceback (most recent call last):
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/alphagrad/src/alphagrad/approx/ppo.py", line 703, in <module>
+    main()
+    ~~~~^^
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/alphagrad/src/alphagrad/approx/ppo.py", line 680, in main
+    agent, opt_state, _, metrics, total_rewards, actions = train_episode(
+                                                           ~~~~~~~~~~~~~^
+        agent, opt_state, env_states, ep_key
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/equinox/_jit.py", line 209, in __call__
+    return _call(self, False, args, kwargs)
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/equinox/_jit.py", line 263, in _call
+    marker, _, _ = out = jit_wrapper._cached(
+                         ~~~~~~~~~~~~~~~~~~~^
+        dynamic_donate, dynamic_nodonate, static
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+jax.errors.JaxRuntimeError: INTERNAL: CpuCallback error calling callback: Traceback (most recent call last):
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/callback.py", line 851, in _wrapped_callback
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/callback.py", line 497, in _callback
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/callback.py", line 443, in io_callback_impl
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/callback.py", line 70, in __call__
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/alphagrad/src/alphagrad/approx/env.py", line 97, in _callback
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/core.py", line 575, in extract_jaxpr
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/traceback_util.py", line 225, in reraise_with_filtered_traceback
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/api.py", line 2566, in make_jaxpr_f
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/traceback_util.py", line 199, in reraise_with_filtered_traceback
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 299, in jit_trace
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 544, in _trace_for_jit
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/partial_eval.py", line 2412, in trace_to_jaxpr
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/core.py", line 549, in eval_graph
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/core.py", line 434, in vertex_elimination_jaxpr
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/core.py", line 381, in eliminate
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/core.py", line 287, in _eliminate_vertex
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/traceback_util.py", line 199, in reraise_with_filtered_traceback
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 257, in cache_miss
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 544, in _trace_for_jit
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/partial_eval.py", line 2412, in trace_to_jaxpr
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/sparse/tensor.py", line 2575, in apply_dynamic_sparsity
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/sparse/tensor.py", line 266, in dense
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/sparse/tensor.py", line 570, in _dense
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/graphax/src/graphax/sparse/tensor.py", line 698, in _apply_dense_scattering
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py", line 1152, in meth
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py", line 316, in _reshape
+  File "/Users/florian/Downloads/tmp/home/florian/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py", line 481, in _compute_newshape
+TypeError: cannot reshape array of shape (4, 8, 2, 8, 4, 4, 8, 4, 4) (size 1048576) into shape (4, 4, 2, 8, 4, 4, 8, 4, 4) (size 524288)
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+  0%|          | 0/1 [00:14<?, ?it/s]
