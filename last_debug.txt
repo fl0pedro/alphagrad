@@ -1,0 +1,4 @@
+Total vertices: 9, Valid vertices: 8, Valid set: (1, 2, 3, 4, 5, 6, 7, 8)
+NUM_ACTIONS=45, ROLLOUT_LENGTH=8, MINIBATCHES=32
+  0%|          | 0/1 [00:00<?, ?it/s]/opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/resource_tracker.py:400: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/mp-ucwh0qs7'}
+  warnings.warn(

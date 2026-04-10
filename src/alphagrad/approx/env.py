@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, NamedTuple, Sequence
+from typing import Callable, Literal, NamedTuple, Sequence
 
 import jax
 import jax._src.core as core
@@ -50,6 +50,13 @@ def cossim(target, preds):
     return -jnp.sum(target * preds)
 
 
+sp_type_to_map = {1: (0, 0), 2: (0, 1), 3: (1, 0), 4: (1, 1)}
+
+
+# analytical = fmas, sum(max(lhs.val.size, rhs.val.size, out.val.size), ...)
+# estimated = cost_analysis() -> flops, bytes accessed
+# empirical = latency, bytes accessed (?)
+# if its not empirical we set the fmas/flops to negative.
 def _callback(
     jaxpr,
     argnums,
@@ -63,7 +70,8 @@ def _callback(
     sparsity_types,
     stop,
     *,
-    stage,
+    init: bool = False,
+    compute_metric: Literal["analytical", "estimated", "empirical"] = "analytical",
 ):
     partial_order, partial_sp = _get_partials(order, sparsity_types, stop)
 
@@ -72,12 +80,19 @@ def _callback(
 
     sparsity_map = []
     for v, sp in zip(o_list, sp_list):
-        if sp > 0:
+        if sp > 0 and sp in sp_type_to_map:  # sp == 0 skips rule creation
             eqn = jaxpr.eqns[v - 1]
-            if eqn.outvars and hasattr(eqn.outvars[0], "aval"):
-                out_len = len(eqn.outvars[0].aval.shape)
-                rule = ((0, out_len + sp - 1, -1),)
-                sparsity_map.append((v, rule))
+            if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
+                continue
+
+            out_len = len(eqn.outvars[0].aval.shape)
+            base_idx1, base_idx2 = sp_type_to_map[sp]
+
+            idx1 = base_idx1
+            idx2 = out_len + base_idx2
+
+            rule = ((idx1, idx2, -1),)
+            sparsity_map.append((v, rule))
 
     ve = extract_jaxpr(
         jaxpr,
@@ -91,7 +106,7 @@ def _callback(
     tokens = ve.tokenized()[:MAX_TOKENS]
     tokens = jnp.pad(tokens, (0, MAX_TOKENS - tokens.shape[0]))
 
-    if stage >= 1:
+    if not init:
         _, aux = vertex_elimination_jaxpr(
             jaxpr,
             o_list,
@@ -106,10 +121,10 @@ def _callback(
     else:
         fmas = jnp.array(0, dtype=jnp.int32)
 
-    if (
-        stage >= 2 and target_fun is not None
-    ):  # this can be ran all the time, by adding keep_unused=True
+    if target_fun is not None:
         eval_args = list(args)
+
+        # TODO data generator or dataset retriever, most efficient would be to get some mini batches
         if data_gen is not None:
             data = data_gen(jrand.split(jrand.PRNGKey(int(stop)), 4))
 
@@ -119,9 +134,7 @@ def _callback(
             else:
                 eval_args[0] = jnp.asarray(data)
 
-        # todo mini batch to loop for some number of tests
         # this jit should be cached so its fine to compile regardless
-
         out_exact = jax.jit(
             jacve(
                 target_fun,
@@ -129,19 +142,23 @@ def _callback(
                 argnums=argnums,
                 has_aux=has_aux,
                 sparse_representation=sparse,
-            )
+            ),
+            keep_unused=True,
         )(*eval_args)
 
-        # this fn always changes so it won't be cached and should only be compiled for mini batches
-
-        out_approx = jacve(
-            target_fun,
-            o_list,
-            argnums=argnums,
-            has_aux=has_aux,
-            sparse_representation=sparse,
-            sparsity_map=sparsity_map,
+        out_approx = jax.jit(
+            jacve(
+                target_fun,
+                o_list,
+                argnums=argnums,
+                has_aux=has_aux,
+                sparse_representation=sparse,
+                sparsity_map=sparsity_map,
+            ),
+            keep_unused=True,
         )(*eval_args)
+
+        # TODO:
 
         jac_exact = out_exact[1] if has_aux else out_exact
         jac_approx = out_approx[1] if has_aux else out_approx
@@ -160,6 +177,8 @@ def _callback(
             else:
                 flat_cossim.append(jnp.array(1.0, dtype=jnp.float32))
 
+        # maybe we can make this a weighted average based on the magnitude measuring error (e.g. MSE)
+        # TODO figure out if this makes sense mathematically.
         error = jnp.mean(jnp.array(flat_cossim))
     else:
         error = jnp.array(0, dtype=jnp.float32)
@@ -278,7 +297,7 @@ class VertexEliminationEnv:
         )
         return obj
 
-    def tokenize(self, stage=0):
+    def tokenize(self, init: bool = False):
         return partial(
             _callback,
             self.jaxpr,
@@ -287,7 +306,7 @@ class VertexEliminationEnv:
             self.sparse,
             self.target_fun,
             self.data_gen,
-            stage=stage,
+            init=init,
         )
 
     @property
@@ -306,7 +325,7 @@ class VertexEliminationEnv:
         initial_sp_types = jnp.zeros_like(initial_order)
 
         tokens, _, _ = io_callback(
-            self.tokenize(stage=0),
+            self.tokenize(init=True),
             self._token_shape,
             self.args,
             self.consts,
@@ -317,7 +336,6 @@ class VertexEliminationEnv:
 
         max_steps_val = initial_order.shape[0]
         step_count = jnp.array(0, dtype=jnp.int32)
-        fmas_init = jnp.array(0, dtype=jnp.int32)
         max_steps = max_steps_val
         reward = jnp.zeros(2, dtype=jnp.float32)
         terminated = jnp.array(False, dtype=jnp.bool_)
@@ -360,7 +378,7 @@ class VertexEliminationEnv:
         new_sp = curr_sp[shifted.astype(jnp.int32)].at[idx].set(sp_type)
 
         tokens, fmas, error = io_callback(
-            self.tokenize(stage=2),
+            self.tokenize(),
             self._token_shape,
             self.args,
             self.consts,
