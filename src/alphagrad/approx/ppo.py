@@ -17,10 +17,10 @@ import wandb
 from graphax import examples
 from tqdm import tqdm
 
+import heapq
 from alphagrad.approx.env import MAX_TOKENS, VertexEliminationEnv
 from alphagrad.transformer import MLP, Encoder, PositionalEncoder
 from alphagrad.utils import entropy, explained_variance, symexp, symlog
-
 
 class Trajectory(NamedTuple):
     tokens: jax.Array
@@ -31,6 +31,7 @@ class Trajectory(NamedTuple):
     next_value: jax.Array
     prob_dist: jax.Array
     discount: jax.Array
+    action_mask: jax.Array
 
 
 class TrainBatch(NamedTuple):
@@ -39,6 +40,7 @@ class TrainBatch(NamedTuple):
     old_prob_dist: jax.Array
     estim_returns: jax.Array
     norm_adv: jax.Array
+    action_mask: jax.Array
 
 
 def data_gen(fn_str):
@@ -105,8 +107,8 @@ def data_gen(fn_str):
 
 
 def _neural_network(x, y, W1, b1, W2, b2):
-    a1 = jnp.tanh(W1 @ x + b1)
-    return 0.5 * (jnp.tanh(W2 @ a1 + b2) - y) ** 2
+    a1 = jnp.tanh(x @ W1.T + b1)
+    return 0.5 * (jnp.tanh(a1 @ W2.T + b2) - y) ** 2
 
 
 def get_args(fn_str, key):
@@ -259,11 +261,12 @@ def get_num_clipping_triggers(ratio, eps):
     return jnp.sum(_ratio)
 
 
-@partial(jax.vmap, in_axes=(None, 0, 0, 0))
-def get_log_probs_and_value(agent, tokens, action, key):
+@partial(jax.vmap, in_axes=(None, 0, 0, 0, 0))
+def get_log_probs_and_value(agent, tokens, action, action_mask, key):
     logits, value = agent(tokens, key=key)
     action_idx = action - 1
-    prob_dist = jnn.softmax(logits, axis=-1)
+    masked_logits = jnp.where(action_mask > 0.5, logits, -1e9)
+    prob_dist = jnn.softmax(masked_logits, axis=-1)
     log_prob = jnp.log(prob_dist[action_idx] + 1e-8)
     return log_prob, prob_dist, value, entropy(prob_dist)
 
@@ -316,20 +319,37 @@ def main():
     parser.add_argument("--name", type=str, default="approx-ppo")
     parser.add_argument("--gpus", type=str, default="0")
     parser.add_argument("--seed", type=int, default=250197)
-    parser.add_argument("--wandb", type=str, default="disabled")
+    parser.add_argument("--wandb", type=str, default="offline")
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--example", type=str, default="Helmholtz")
     parser.add_argument("--no-jit", action="store_true")
     parser.add_argument("--disable-sparsification", action="store_true")
-    parser.add_argument("--disable-eval", action="store_true")
+    parser.add_argument("--reward-type", type=str, default="analytical")
+    parser.add_argument("--rewards", nargs="+", type=str, default=["cmp", "mem", "acc"], choices=["cmp", "mem", "acc"])
+    parser.add_argument("--lambda-cmp", type=float, default=1.0)
+    parser.add_argument("--lambda-mem", type=float, default=1.0)
+    parser.add_argument("--top-n", type=int, default=10, help="Number of top trajectories to capture for each metric")
+    parser.add_argument("--capture-perfect-grads", action="store_true", help="Capture trajectories with perfect accuracy (cosine similarity = 1.0)")
+    parser.add_argument("--exec-on-gpu", action="store_true", help="Enforce execution on GPU 0 and data on GPU 1")
     args = parser.parse_args()
+
+    if args.exec_on_gpu:
+        try:
+            gpus = jax.devices("gpu")
+        except:
+            gpus = []
+        if len(gpus) < 2:
+            raise RuntimeError(f"Requested --exec-on-gpu but only {len(gpus)} GPU(s) found. "
+                               "Check your --gpus argument and CUDA_VISIBLE_DEVICES.")
+        main_device = gpus[0]
+    else:
+        main_device = None
 
     if args.no_jit:
         jax.config.update("jax_disable_jit", True)
 
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpus)
-
     key = jrand.PRNGKey(args.seed)
     key, args_key = jrand.split(key)
 
@@ -339,8 +359,16 @@ def main():
 
     closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
 
+    env_target_fun = target_fn if "acc" in args.rewards else None
+    argnums = None
+    if args.example.endswith("NeuralNetwork"):
+        argnums = (2, 3, 4, 5)
+    elif args.example.endswith("Perceptron"):
+        argnums = (2, 3, 4, 5, 6, 7)
+
     env = VertexEliminationEnv.from_jaxpr(
-        closed_jaxpr, args=xs, num_envs=0, data_gen=gen, target_fun=target_fn
+        closed_jaxpr, args=xs, argnums=argnums, num_envs=0, data_gen=gen, target_fun=env_target_fun,
+        reward_type=args.reward_type, exec_on_gpu=args.exec_on_gpu,
     )
 
     total_v = len(closed_jaxpr.jaxpr.eqns)
@@ -367,21 +395,21 @@ def main():
         invars = [v for v in eqn.invars if hasattr(v, "aval")]
 
         if invars:
-            max_in_ndim = max(len(v.aval.shape) for v in invars)
+            min_in_ndim = min(len(v.aval.shape) for v in invars)
 
-            if out_ndim == 2 and max_in_ndim == 2:
+            if out_ndim == 2 and min_in_ndim == 2:
                 sp_valid_mask_np[1:5, i] = 1.0
-            elif out_ndim == 1 and max_in_ndim == 2:
+            elif out_ndim == 1 and min_in_ndim == 2:
                 sp_valid_mask_np[1:3, i] = 1.0
-            elif out_ndim == 2 and max_in_ndim == 1:
+            elif out_ndim == 2 and min_in_ndim == 1:
                 sp_valid_mask_np[1, i] = 1.0
                 sp_valid_mask_np[3, i] = 1.0
-            elif out_ndim == 1 and max_in_ndim == 1:
+            elif out_ndim == 1 and min_in_ndim == 1:
                 sp_valid_mask_np[1, i] = 1.0
 
     sp_valid_mask = jnp.array(sp_valid_mask_np)
 
-    ENTROPY_WEIGHT = 0.01
+    ENTROPY_WEIGHT = 0.05
     VALUE_WEIGHT = 0.5
     EPISODES = args.episodes
     # Synchronize environment parallelism with model batch size for Vmapped examples
@@ -393,9 +421,9 @@ def main():
     GAE_LAMBDA = 0.95
     EPS = 0.2
     MINIBATCHES = 32
-    PPO_EPOCHS = 4
+    PPO_EPOCHS = 2
 
-    NUM_REWARDS = 1 if args.disable_eval else 2
+    NUM_REWARDS = len(args.rewards)
     OBS_SHAPE = MAX_TOKENS
     NUM_ACTIONS = 5 * total_v
     ROLLOUT_LENGTH = num_valid
@@ -421,11 +449,25 @@ def main():
     )
     agent = init_linear_weights(agent, init_key)
 
+    def get_policy_weight(agent):
+        return agent.policy_head.layers[-2].weight
+
+    agent = eqx.tree_at(get_policy_weight, agent, get_policy_weight(agent) * 0.1)
+
+    if args.exec_on_gpu:
+        agent = jax.tree_util.tree_map(
+            lambda x: jax.device_put(x, main_device) if eqx.is_array(x) else x,
+            agent
+        )
+
     def reset_envs():
         def _single_reset(_):
             return env.reset()
 
         return jax.vmap(_single_reset)(jnp.arange(NUM_ENVS))
+
+    LAMBDA_CMP = args.lambda_cmp
+    LAMBDA_MEM = args.lambda_mem
 
     @eqx.filter_jit
     @partial(jax.vmap, in_axes=(None, None, 0, 0))
@@ -465,7 +507,13 @@ def main():
 
             env_out = env.step(state, env_action)
             next_state = env_out.state
-            rewards = env_out.reward[:NUM_REWARDS]
+            raw_rewards = env_out.reward
+            # Store raw rewards for stable GAE
+            rewards = jnp.array([
+                raw_rewards[0],
+                raw_rewards[1],
+                raw_rewards[2]
+            ])[:NUM_REWARDS]
             done = env_out.terminated.astype(jnp.float32)
 
             _, next_value = agent(next_state.tokens, key=next_net_key, inference=True)
@@ -479,13 +527,15 @@ def main():
                 next_value=jnp.atleast_1d(next_value),
                 prob_dist=prob_dist,
                 discount=jnp.array(0.99),
+                action_mask=available_flat,
             )
 
-            return next_state, transition
+            return next_state, (transition, raw_rewards)
 
-        return lax.scan(step_fn, env_state, keys)
+        final_state, (traj, all_raw_rewards) = lax.scan(step_fn, env_state, keys)
+        return final_state, traj, all_raw_rewards[-1]
 
-    schedule = optax.cosine_decay_schedule(LR, EPISODES * PPO_EPOCHS * MINIBATCHES, 0.0)
+    schedule = optax.cosine_decay_schedule(LR, EPISODES * PPO_EPOCHS * MINIBATCHES, 0.1)
     optimizer = optax.chain(
         optax.clip_by_global_norm(0.5),
         optax.adam(schedule, b1=0.9, eps=1e-7),
@@ -493,8 +543,8 @@ def main():
     opt_state = optimizer.init(eqx.filter(agent, eqx.is_inexact_array))
 
     def loss(agent, batch: TrainBatch, keys):
-        log_probs, prob_dist, values, entropies = get_log_probs_and_value(
-            agent, batch.tokens, batch.action, keys
+        log_probs, prob_dist, values, entropies = get_log_probs_and_value( # only measure entropy at the beginning?
+            agent, batch.tokens, batch.action, batch.action_mask, keys
         )
 
         old_log_probs = jnp.log(
@@ -546,7 +596,7 @@ def main():
         rollout_key, key = jrand.split(key)
         rollout_keys = jrand.split(rollout_key, NUM_ENVS)
 
-        env_states, traj = rollout_fn(agent, ROLLOUT_LENGTH, env_states, rollout_keys)
+        env_states, traj, total_rewards_full = rollout_fn(agent, ROLLOUT_LENGTH, env_states, rollout_keys)
 
         _, estim_returns, advantages = get_advantages(
             traj.reward,
@@ -560,12 +610,12 @@ def main():
         def normalize(x):
             return (x - jnp.mean(x)) / (jnp.std(x) + 1e-7)
 
-        norm_adv = jnp.sum(
-            jax.vmap(normalize, in_axes=-1, out_axes=-1)(
-                advantages.reshape(-1, advantages.shape[-1])
-            ).reshape(advantages.shape),
-            axis=-1,
-        )
+        norm_adv_components = jax.vmap(normalize, in_axes=-1, out_axes=-1)(
+            advantages.reshape(-1, advantages.shape[-1])
+        ).reshape(advantages.shape)
+        
+        weights = jnp.array([args.lambda_cmp, 1.0, args.lambda_mem])[:NUM_REWARDS]
+        norm_adv = jnp.sum(norm_adv_components * weights, axis=-1)
 
         full_batch = TrainBatch(
             tokens=traj.tokens,
@@ -573,6 +623,7 @@ def main():
             old_prob_dist=traj.prob_dist,
             estim_returns=estim_returns,
             norm_adv=norm_adv,
+            action_mask=traj.action_mask,
         )
 
         dynamic_carry, static_carry = eqx.partition((agent, opt_state), eqx.is_array)
@@ -603,9 +654,8 @@ def main():
         agent, opt_state = eqx.combine(dynamic_carry, static_carry)
         metrics = jax.tree_util.tree_map(lambda x: jnp.mean(x), metrics_seq)
 
-        total_rewards = jnp.sum(traj.reward[..., 0], axis=-1)
-
-        return agent, opt_state, env_states, metrics, total_rewards, traj.action
+        # total_rewards_full shape: (NUM_ENVS, 3)
+        return agent, opt_state, env_states, metrics, total_rewards_full, traj.action
 
     if not args.no_jit:
         train_episode = eqx.filter_jit(train_episode)
@@ -624,12 +674,17 @@ def main():
         "samplecounts": 0,
         "best_global_return": -float("inf"),
         "best_global_act_seq": None,
+        "top_n_total": [],  # (value, episode, rewards, actions)
+        "top_n_cmp": [],
+        "top_n_mem": [],
+        "top_n_acc": [],
     }
 
-    def host_log(ep, b_ret, b_seq, mean_r, mets):
+    def host_log(ep, all_rets, all_seqs, mean_r, mets):
         ep = int(ep)
-        b_ret = float(b_ret)
-        mean_r = float(mean_r)
+        all_rets = np.array(all_rets)
+        all_seqs = np.array(all_seqs)
+        mean_r = np.atleast_1d(np.array(mean_r))
 
         host_state["samplecounts"] += NUM_ENVS * ROLLOUT_LENGTH
         (
@@ -644,59 +699,121 @@ def main():
             clipping_trigger_ratio,
         ) = [float(m) for m in mets]
 
-        if b_ret > host_state["best_global_return"]:
-            host_state["best_global_return"] = b_ret
-            host_state["best_global_act_seq"] = b_seq
+        # Categories mapping in all_rets (raw_rewards from env.py):
+        # 0: -cmp, 1: error (acc), 2: -mem
+        weights = np.array([args.lambda_cmp, 1.0, args.lambda_mem])[:NUM_REWARDS]
+        
+        for i in range(all_rets.shape[0]):
+            rets = all_rets[i]
+            seq = all_seqs[i]
+            
+            # 1. Total Reward
+            total_ret = float(np.sum(rets[:NUM_REWARDS] * weights))
+            if len(host_state["top_n_total"]) < args.top_n:
+                heapq.heappush(host_state["top_n_total"], (total_ret, ep, list(rets), list(seq)))
+            else:
+                heapq.heappushpop(host_state["top_n_total"], (total_ret, ep, list(rets), list(seq)))
+            
+            # 2. CMP (minimize FLOPs -> maximize -cmp)
+            cmp_val = float(rets[0])
+            if len(host_state["top_n_cmp"]) < args.top_n:
+                heapq.heappush(host_state["top_n_cmp"], (cmp_val, ep, list(rets), list(seq)))
+            else:
+                heapq.heappushpop(host_state["top_n_cmp"], (cmp_val, ep, list(rets), list(seq)))
+                
+            # 3. Memory (minimize memory -> maximize -mem)
+            mem_val = float(rets[2])
+            if len(host_state["top_n_mem"]) < args.top_n:
+                heapq.heappush(host_state["top_n_mem"], (mem_val, ep, list(rets), list(seq)))
+            else:
+                heapq.heappushpop(host_state["top_n_mem"], (mem_val, ep, list(rets), list(seq)))
+                
+            # 4. Accuracy (maximize cosine similarity)
+            acc_val = float(rets[1])
+            if args.capture_perfect_grads or acc_val < 0.999999: # Allow perfect grads only if flag is set
+                if len(host_state["top_n_acc"]) < args.top_n:
+                    heapq.heappush(host_state["top_n_acc"], (acc_val, ep, list(rets), list(seq)))
+                else:
+                    heapq.heappushpop(host_state["top_n_acc"], (acc_val, ep, list(rets), list(seq)))
 
-            action_pairs = [
-                (int((i - 1) % total_v) + 1, int((i - 1) // total_v)) for i in b_seq
-            ]
-            print(f"\nNew best return: {b_ret}")
-            print(f"New best action sequence (vertex, sp_type): {action_pairs}")
-            elim_order_table.add_data(ep, b_ret, np.array(b_seq))
+        # Update global best for traditional tracking
+        best_of_batch_idx = np.argmax(np.sum(all_rets[:, :NUM_REWARDS] * weights, axis=-1))
+        best_of_batch_ret = float(np.sum(all_rets[best_of_batch_idx, :NUM_REWARDS] * weights))
+        
+        if best_of_batch_ret > host_state["best_global_return"]:
+            host_state["best_global_return"] = best_of_batch_ret
+            host_state["best_global_act_seq"] = all_seqs[best_of_batch_idx]
 
-        wandb.log(
-            {
-                "best_return": host_state["best_global_return"],
-                "mean_return": mean_r,
-                "KL divergence": kl_div,
-                "entropy evolution": policy_entropy,
-                "explained variance": explained_var,
-                "sample count": host_state["samplecounts"],
-                "ppo loss": ppo_loss,
-                "value loss": value_loss,
-                "total loss": total_loss,
-            }
-        )
+        log_dict = {
+            "best_return": host_state["best_global_return"],
+            "mean_return": mean_r[0],
+            "KL divergence": kl_div,
+            "entropy evolution": policy_entropy,
+            "explained variance": explained_var,
+            "sample count": host_state["samplecounts"],
+            "ppo loss": ppo_loss,
+            "value loss": value_loss,
+            "total loss": total_loss,
+        }
+        if len(mean_r) > 1:
+            for i in range(1, len(mean_r)):
+                log_dict[f"mean_return_{i}"] = mean_r[i]
+
+        wandb.log(log_dict)
         pbar.update(1)
-        pbar.set_description(
-            f"ent: {policy_entropy:.4f}, best: {b_ret:.1f}, mean: {mean_r:.1f}"
-        )
+        
+        # Display best from CURRENT episode in pbar
+        b_ret_unnorm = np.abs(all_rets[best_of_batch_idx])
+        mean_r_unnorm = np.abs(mean_r)
+        b_ret_desc = ", ".join([f"{float(x):.1f}" for x in b_ret_unnorm])
+        means_str = ", ".join([f"{float(x):.2f}" for x in mean_r_unnorm])
+        desc = f"ent:{policy_entropy:.3f} best:{b_ret_desc} means:{means_str}"
+        pbar.set_description(desc)
 
     for ep in range(EPISODES):
         ep_key, key = jrand.split(key)
 
         env_states = reset_envs()
-        agent, opt_state, _, metrics, total_rewards, actions = train_episode(
+        agent, opt_state, _, metrics, total_rewards_full, actions = train_episode(
             agent, opt_state, env_states, ep_key
         )
 
-        max_idx = jnp.argmax(total_rewards)
-        best_reward = total_rewards[max_idx]
-        best_act_seq = actions[max_idx]
-
-        host_log(ep, best_reward, best_act_seq, jnp.mean(total_rewards), metrics)
+        host_log(ep, total_rewards_full, actions, jnp.mean(total_rewards_full[:, :NUM_REWARDS], axis=0), metrics)
 
     pbar.close()
+
+    def print_top_n(name, heap, reverse_val=True):
+        print(f"\nTop {args.top_n} trajectories for {name}:")
+        sorted_items = sorted(heap, key=lambda x: x[0], reverse=reverse_val)
+        
+        table = wandb.Table(columns=["rank", "episode", "total_reward", "cmp", "acc", "mem", "sequence"])
+        
+        weights = np.array([args.lambda_cmp, 1.0, args.lambda_mem])[:NUM_REWARDS]
+
+        for rank, (val, ep, rets, seq) in enumerate(sorted_items, 1):
+            total_ret = np.sum(np.array(rets)[:NUM_REWARDS] * weights)
+            cmp_val = -rets[0]
+            acc_val = rets[1]
+            mem_val = -rets[2]
+            
+            # Recover pairs from seq (seq is list of action_idx + 1)
+            action_pairs = [
+                (int((i - 1) % total_v) + 1, int((i - 1) // total_v)) for i in seq
+            ]
+            
+            print(f"{rank}. Ep {ep} | Total Reward: {total_ret:.2f} | CMP: {cmp_val:.1f} | Acc: {acc_val:.4f} | Mem: {mem_val:.1f}")
+            print(f"   Sequence (vertex, sp_type): {action_pairs}")
+            
+            table.add_data(rank, ep, total_ret, cmp_val, acc_val, mem_val, str(action_pairs))
+            
+        wandb.log({f"Top N {name}": table})
+
+    print_top_n("Total Reward", host_state["top_n_total"])
+    print_top_n("CMP (Lowest FLOPs)", host_state["top_n_cmp"])
+    print_top_n("Memory (Lowest Bytes)", host_state["top_n_mem"])
+    print_top_n("Accuracy (Highest Cosine Similarity)", host_state["top_n_acc"])
+
     wandb.log({"Elimination order": elim_order_table})
-    if host_state["best_global_act_seq"] is not None:
-        best_pairs = [
-            (int((i - 1) % total_v) + 1, int((i - 1) // total_v))
-            for i in host_state["best_global_act_seq"]
-        ]
-        print(
-            f"\nBest vertex elimination sequence after {EPISODES} episodes: {best_pairs} with {host_state['best_global_return']} score."
-        )
 
 
 if __name__ == "__main__":
