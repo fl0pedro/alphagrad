@@ -16,13 +16,18 @@ dependencies = [
     "more-itertools",
     "graphax",
     "immutables",
+    "grain",
+    "tensorflow-datasets",
+    "tensorflow",
+    "importlib_resources",
+    "psutil",
 ]
 
 
-[tool.uv.sources]
+#[tool.uv.sources]
 #alphagrad = { path = ".", editable = true }
 #alphagrad = { workspace = true }
-graphax = { workspace = true }
+#graphax = { workspace = true }
 
 [build-system]
 requires = ["setuptools", "setuptools_scm[toml]"]
