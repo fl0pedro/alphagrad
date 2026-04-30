@@ -81,7 +81,7 @@ def _callback(
     order,
     sparsity_types,
     stop,
-    *,
+    *eval_samples,
     init: bool = False,
 ):
     partial_order, partial_sp = _get_partials(order, sparsity_types, stop)
@@ -141,7 +141,7 @@ def _callback(
         config.sparse,
         args,
         consts,
-        sparsity_map=sparsity_map,  # can we add the padding somewhere internally?
+        sparsity_map=sparsity_map,
     )
     tokens = ve.tokenized()[:MAX_TOKENS]
     tokens = jnp.pad(tokens, (0, MAX_TOKENS - tokens.shape[0]))
@@ -175,20 +175,13 @@ def _callback(
         "Must provide a valid Callable for `target_fun` if compilation is required"
     )
 
-    eval_args = list(args)
-
-    # TODO data generator or dataset retriever, most efficient would be to get some mini batches
-    if config.data_gen is not None:
-        data = config.data_gen(
-            jrand.split(jrand.PRNGKey(int(stop)), 5)
-        )  # must return tuples, don't provide a split key, let internals split as it goes
-        for i, d in enumerate(data):
-            eval_args[i] = jnp.asarray(d)
-
+    callback_device = None
     if config.exec_on_gpu:
         gpu_devices = jax.devices("gpu")
         callback_device = gpu_devices[1]
-        eval_args = [jax.device_put(d, callback_device) for d in eval_args]
+
+    # Ensure compilation target matches execution device
+    args_for_lower = jax.device_put(args, callback_device) if config.exec_on_gpu else args
 
     def compiled(sp_map=None):
         return (
@@ -203,7 +196,7 @@ def _callback(
                 ),
                 keep_unused=True,
             )
-            .lower(*eval_args)
+            .lower(*args_for_lower)
             .compile()
         )
 
@@ -215,52 +208,84 @@ def _callback(
         cmp = jnp.array(cost_analysis.get("flops", 0), dtype=jnp.int32)
         mem = jnp.array(cost_analysis.get("bytes accessed", 0), dtype=jnp.int32)
 
+    out_approxs = []
+    out_exacts = []
+    # hardcode sample size of 10 for now
+    stats = jnp.zeros((2, 10), jnp.int32)
+
+    unique_devices = None
     if config.reward_type == "empirical":
-        # Identify devices for monitoring from eval_args
+        # Identify devices for monitoring from representative args
         monitoring_devices = []
-        for x in jax.tree_util.tree_leaves(eval_args):
+        for x in jax.tree_util.tree_leaves(args):
             if hasattr(x, "devices"):
                 monitoring_devices.extend(list(x.devices()))
         unique_devices = list(set(monitoring_devices))
+        if config.exec_on_gpu and callback_device not in unique_devices:
+            unique_devices.append(callback_device)
         if not unique_devices:
             unique_devices = jax.local_devices()
 
-        with ResourceMonitor(devices=unique_devices) as monitor:
-            out_approx = compiled_approx(*eval_args)
-        cmp, mem = monitor.stats.values()
-        cmp = jnp.array(cmp*10**9, jnp.int32)
-        mem = jnp.array(mem, jnp.int32)
-    else:
-        out_approx = compiled_approx(*eval_args)
-
-    # out_approx = compiled_approx(*eval_args)
-    out_exact = compiled_exact(*eval_args)
-
-    jac_approx = out_approx[1] if config.has_aux else out_approx
-    jac_exact = out_exact[1] if config.has_aux else out_exact
-
-    leaves_approx = jax.tree_util.tree_leaves(jac_approx)
-    leaves_exact = jax.tree_util.tree_leaves(jac_exact)
-
-    # flat_mse = [
-    #     jnp.mean((e - a) ** 2) for e, a in zip(leaves_exact, leaves_approx)
-    # ]
-
-    flat_cossim = []
-    for e, a in zip(leaves_exact, leaves_approx):
-        if hasattr(e, "shape") and hasattr(a, "shape") and e.shape == a.shape:
-            flat_cossim.append(cossim(e, a))
+    for i in range(10):
+        if eval_samples:
+            eval_args_i = [arg[i] for arg in eval_samples]
         else:
-            flat_cossim.append(jnp.array(1.0, dtype=jnp.float32))
+            eval_args_i = list(args)
 
-        # maybe we can make this a weighted average based on the magnitude measuring error (e.g. MSE)
-        # TODO figure out if this makes sense mathematically.
-        error = jnp.mean(jnp.stack(flat_cossim))
+        if config.exec_on_gpu:
+            eval_args_i = [jax.device_put(d, callback_device) for d in eval_args_i]
+
+        if config.reward_type == "empirical":
+            with ResourceMonitor(devices=unique_devices) as monitor:
+                out_approx = compiled_approx(*eval_args_i)
+            cmp_val, mem_val = monitor.stats.values()
+            stats = stats.at[0, i].set(cmp_val * 10**9).at[1, i].set(mem_val)
+        else:
+            out_approx = compiled_approx(*eval_args_i)
+
+        out_exact = compiled_exact(*eval_args_i)
+        out_approxs.append(out_approx)
+        out_exacts.append(out_exact)
+
+    if config.reward_type == "empirical":
+        cmp = stats[0].sort()[6:8].mean().astype(jnp.int32)  # top quartile
+        mem = stats[1].max()  # likely all equal, else "worst"
+
+    all_cossims = []
+    for out_approx, out_exact in zip(out_approxs, out_exacts):
+        jac_approx = out_approx[1] if config.has_aux else out_approx
+        jac_exact = out_exact[1] if config.has_aux else out_exact
+
+        leaves_approx = jax.tree_util.tree_leaves(jac_approx)
+        leaves_exact = jax.tree_util.tree_leaves(jac_exact)
+
+        # flat_mse = [
+        #     jnp.mean((e - a) ** 2) for e, a in zip(leaves_exact, leaves_approx)
+        # ]
+
+        if leaves_approx and leaves_exact:
+            flat_approx = jnp.concatenate([jnp.ravel(l) for l in leaves_approx])
+            flat_exact = jnp.concatenate([jnp.ravel(l) for l in leaves_exact])
+            if flat_approx.shape == flat_exact.shape and flat_approx.size > 0:
+                all_cossims.append(cossim(flat_exact, flat_approx))
+            else:
+                all_cossims.append(jnp.array(1.0, dtype=jnp.float32))
+        else:
+            all_cossims.append(jnp.array(1.0, dtype=jnp.float32))
+
+    if not all_cossims:
+        error = jnp.array(1.0, dtype=jnp.float32)
+    else:
+        error = jnp.mean(jnp.stack(all_cossims))
+
+
+
 
     return tokens, cmp, mem, error
 
 
 @register_pytree_node_class
+
 @dataclass(init=False, frozen=True)
 class VertexEliminationEnv:
     config: EnvConfig
@@ -268,6 +293,7 @@ class VertexEliminationEnv:
     consts: tuple
     valid_vertices: tuple
     num_envs: int | None = None
+    eval_args_samples: tuple | None = None
 
     def __init__(
         self,
@@ -276,10 +302,12 @@ class VertexEliminationEnv:
         consts: Sequence,
         valid_vertices: tuple | None = None,
         num_envs: int | None = None,
+        eval_args_samples: tuple | None = None,
     ):
         object.__setattr__(self, "config", config)
         object.__setattr__(self, "args", tuple(args))
         object.__setattr__(self, "consts", tuple(consts))
+        object.__setattr__(self, "eval_args_samples", eval_args_samples)
 
         if num_envs is None:
             num_envs = jax.local_device_count()
@@ -329,15 +357,15 @@ class VertexEliminationEnv:
         )
 
     def tree_flatten(self):
-        children = (self.args, self.consts)
+        children = (self.args, self.consts, self.eval_args_samples)
         aux_data = (self.config, self.valid_vertices, self.num_envs)
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        args, consts = children
+        args, consts, eval_args_samples = children
         config, valid_vertices, num_envs = aux_data
-        return cls(config, args, consts, valid_vertices, num_envs)
+        return cls(config, args, consts, valid_vertices, num_envs, eval_args_samples)
 
     def tokenize(self, init: bool = False):
         return partial(_callback, self.config, init=init)
@@ -366,6 +394,7 @@ class VertexEliminationEnv:
             initial_order,
             initial_sp_types,
             0,
+            *(self.eval_args_samples if self.eval_args_samples is not None else ()),
         )
 
         max_steps_val = initial_order.shape[0]
@@ -419,6 +448,7 @@ class VertexEliminationEnv:
             new_order,
             new_sp,
             new_step,
+            *(self.eval_args_samples if self.eval_args_samples is not None else ()),
         )
 
         terminated = new_step >= state.max_steps
