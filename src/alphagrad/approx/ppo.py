@@ -365,6 +365,9 @@ def main():
         argnums = (2, 3, 4, 5)
     elif args.example.endswith("Perceptron"):
         argnums = (2, 3, 4, 5, 6, 7)
+    else:
+        argnums = (0,)
+
 
     env = VertexEliminationEnv.from_jaxpr(
         closed_jaxpr, args=xs, argnums=argnums, num_envs=0, data_gen=gen, target_fun=env_target_fun,
@@ -460,9 +463,37 @@ def main():
             agent
         )
 
-    def reset_envs():
+    def generate_eval_samples(env_obj, key):
+        config = env_obj.config
+        args = env_obj.args
+
+        def get_one_sample(k):
+            dk, wk = jrand.split(k)
+            e_args = list(args)
+            if config.data_gen is not None:
+                data = config.data_gen(jrand.split(dk, 5))
+                for i, d in enumerate(data):
+                    e_args[i] = d
+            if config.argnums:
+                w_keys = jrand.split(wk, len(config.argnums))
+                for i, arg_idx in enumerate(config.argnums):
+                    if config.data_gen is not None and arg_idx < len(data):
+                        continue
+                    curr_val = e_args[arg_idx]
+                    e_args[arg_idx] = jrand.normal(
+                        w_keys[i], curr_val.shape, curr_val.dtype
+                    )
+
+            return tuple(e_args)
+
+        keys = jrand.split(key, 10)
+        stacked_args = jax.vmap(get_one_sample)(keys)
+        return stacked_args
+
+
+    def reset_envs(env_obj):
         def _single_reset(_):
-            return env.reset()
+            return env_obj.reset()
 
         return jax.vmap(_single_reset)(jnp.arange(NUM_ENVS))
 
@@ -470,8 +501,8 @@ def main():
     LAMBDA_MEM = args.lambda_mem
 
     @eqx.filter_jit
-    @partial(jax.vmap, in_axes=(None, None, 0, 0))
-    def rollout_fn(agent, rollout_length, env_state, key):
+    @partial(jax.vmap, in_axes=(None, None, None, 0, 0))
+    def rollout_fn(agent, env_obj, rollout_length, env_state, key):
         keys = jrand.split(key, rollout_length)
 
         def step_fn(state, key):
@@ -505,7 +536,7 @@ def main():
             target_vertex = (action_idx % total_v) + 1
             env_action = sp_type * MAX_TOKENS + target_vertex
 
-            env_out = env.step(state, env_action)
+            env_out = env_obj.step(state, env_action)
             next_state = env_out.state
             raw_rewards = env_out.reward
             # Store raw rewards for stable GAE
@@ -534,6 +565,7 @@ def main():
 
         final_state, (traj, all_raw_rewards) = lax.scan(step_fn, env_state, keys)
         return final_state, traj, all_raw_rewards[-1]
+
 
     schedule = optax.cosine_decay_schedule(LR, EPISODES * PPO_EPOCHS * MINIBATCHES, 0.1)
     optimizer = optax.chain(
@@ -591,12 +623,13 @@ def main():
             trigger_ratio,
         )
 
-    def train_episode(agent, opt_state, env_states, key):
+    def train_episode(agent, opt_state, env_states, env_obj, key):
         subkey, key = jrand.split(key)
         rollout_key, key = jrand.split(key)
         rollout_keys = jrand.split(rollout_key, NUM_ENVS)
 
-        env_states, traj, total_rewards_full = rollout_fn(agent, ROLLOUT_LENGTH, env_states, rollout_keys)
+        env_states, traj, total_rewards_full = rollout_fn(agent, env_obj, ROLLOUT_LENGTH, env_states, rollout_keys)
+
 
         _, estim_returns, advantages = get_advantages(
             traj.reward,
@@ -772,11 +805,16 @@ def main():
 
     for ep in range(EPISODES):
         ep_key, key = jrand.split(key)
+        ep_eval_key, ep_key = jrand.split(ep_key)
+        
+        eval_samples = generate_eval_samples(env, ep_eval_key)
+        env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
 
-        env_states = reset_envs()
+        env_states = reset_envs(env_episode)
         agent, opt_state, _, metrics, total_rewards_full, actions = train_episode(
-            agent, opt_state, env_states, ep_key
+            agent, opt_state, env_states, env_episode, ep_key
         )
+
 
         host_log(ep, total_rewards_full, actions, jnp.mean(total_rewards_full[:, :NUM_REWARDS], axis=0), metrics)
 
