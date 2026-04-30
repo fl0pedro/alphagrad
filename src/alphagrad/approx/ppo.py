@@ -43,7 +43,42 @@ class TrainBatch(NamedTuple):
     action_mask: jax.Array
 
 
-def data_gen(fn_str):
+NN_HIDDEN_DIM = 128
+NN_VMAP_BATCH = 16
+
+_DATASET_CACHE: dict = {}
+
+
+def _dataset_dims(name):
+    if name == "mnist":
+        return 784, 10
+    raise ValueError(f"Unknown dataset '{name}'")
+
+
+def _load_dataset(name, dataset_size):
+    cache_key = (name, dataset_size)
+    if cache_key in _DATASET_CACHE:
+        return _DATASET_CACHE[cache_key]
+
+    if name == "mnist":
+        import tensorflow_datasets as tfds
+
+        ds = tfds.load("mnist", split="train", as_supervised=True, batch_size=-1)
+        x_np, y_np = tfds.as_numpy(ds)
+        x_np = x_np.reshape(x_np.shape[0], -1).astype(np.float32) / 255.0
+        y_np = np.eye(10, dtype=np.float32)[y_np]
+        if dataset_size is not None and dataset_size > 0:
+            x_np = x_np[:dataset_size]
+            y_np = y_np[:dataset_size]
+        result = (jnp.asarray(x_np), jnp.asarray(y_np))
+    else:
+        raise ValueError(f"Unknown dataset '{name}'")
+
+    _DATASET_CACHE[cache_key] = result
+    return result
+
+
+def data_gen(fn_str, dataset=None, dataset_size=-1):
     fn = None
     if fn_str == "Helmholtz":
 
@@ -55,11 +90,25 @@ def data_gen(fn_str):
         return fn
 
     if fn_str.endswith("NeuralNetwork"):
+        if dataset is not None:
+            x_data, y_data = _load_dataset(dataset, dataset_size)
+            n_samples = int(x_data.shape[0])
+            is_vmapped = fn_str.startswith("Vmapped")
+
+            @jax.jit
+            def fn(keys):
+                if is_vmapped:
+                    idx = jrand.randint(keys[0], (NN_VMAP_BATCH,), 0, n_samples)
+                else:
+                    idx = jrand.randint(keys[0], (), 0, n_samples)
+                return x_data[idx], y_data[idx]
+
+            return fn
 
         @jax.jit
         def fn(keys):
             if fn_str.startswith("Vmapped"):
-                shape = (16,)
+                shape = (NN_VMAP_BATCH,)
             else:
                 shape = ()
             r1 = jrand.uniform(keys[0], shape)
@@ -111,9 +160,18 @@ def _neural_network(x, y, W1, b1, W2, b2):
     return 0.5 * (jnp.tanh(a1 @ W2.T + b2) - y) ** 2
 
 
-def get_args(fn_str, key):
+def get_args(fn_str, key, dataset=None):
     if fn_str.endswith("NeuralNetwork"):
-        shapes = [(4,), (4,), (8, 4), (8,), (4, 8), (4,)]
+        if dataset is not None:
+            in_dim, out_dim = _dataset_dims(dataset)
+            h = NN_HIDDEN_DIM
+            shapes = [
+                (in_dim,), (out_dim,),
+                (h, in_dim), (h,),
+                (out_dim, h), (out_dim,),
+            ]
+        else:
+            shapes = [(4,), (4,), (8, 4), (8,), (4, 8), (4,)]
     elif fn_str.endswith("Perceptron"):
         shapes = [(4,), (4,), (8, 4), (8,), (4, 8), (4,), (8,), (8,)]
     elif "EncoderDecoder" in fn_str:
@@ -139,9 +197,9 @@ def get_args(fn_str, key):
         }[fn_str]
 
     if fn_str.startswith("Vmapped"):
-        shapes[0] = (16, *shapes[0])
+        shapes[0] = (NN_VMAP_BATCH, *shapes[0])
         if "Encoder" in fn_str or fn_str.endswith(("NeuralNetwork", "Perceptron")):
-            shapes[1] = (16, *shapes[1])
+            shapes[1] = (NN_VMAP_BATCH, *shapes[1])
 
     keys = jax.random.split(key, len(shapes))
     return [jax.random.normal(k, s) for k, s in zip(keys, shapes)]
@@ -324,13 +382,20 @@ def main():
     parser.add_argument("--example", type=str, default="Helmholtz")
     parser.add_argument("--no-jit", action="store_true")
     parser.add_argument("--disable-sparsification", action="store_true")
-    parser.add_argument("--reward-type", type=str, default="analytical")
+    parser.add_argument("--cmp-type", type=str, default="flops",
+                        choices=["graphax", "flops", "latency"])
+    parser.add_argument("--mem-type", type=str, default="peak_memory",
+                        choices=["graphax", "bytes_accessed", "peak_memory"])
     parser.add_argument("--rewards", nargs="+", type=str, default=["cmp", "mem", "acc"], choices=["cmp", "mem", "acc"])
     parser.add_argument("--lambda-cmp", type=float, default=1.0)
     parser.add_argument("--lambda-mem", type=float, default=1.0)
     parser.add_argument("--top-n", type=int, default=10, help="Number of top trajectories to capture for each metric")
     parser.add_argument("--capture-perfect-grads", action="store_true", help="Capture trajectories with perfect accuracy (cosine similarity = 1.0)")
     parser.add_argument("--exec-on-gpu", action="store_true", help="Enforce execution on GPU 0 and data on GPU 1")
+    parser.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "none"],
+                        help="Dataset to use for NeuralNetwork examples. 'none' falls back to the synthetic 4-D generator.")
+    parser.add_argument("--dataset-size", type=int, default=-1,
+                        help="Number of training samples to draw batches from. -1 (default) uses the full training set.")
     args = parser.parse_args()
 
     if args.exec_on_gpu:
@@ -353,9 +418,13 @@ def main():
     key = jrand.PRNGKey(args.seed)
     key, args_key = jrand.split(key)
 
+    dataset_arg = None if args.dataset == "none" else args.dataset
+    use_dataset = dataset_arg is not None and args.example.endswith("NeuralNetwork")
+    dataset_for_call = dataset_arg if use_dataset else None
+
     target_fn = get_fn(args.example)
-    xs = get_args(args.example, args_key)
-    gen = data_gen(args.example)
+    xs = get_args(args.example, args_key, dataset=dataset_for_call)
+    gen = data_gen(args.example, dataset=dataset_for_call, dataset_size=args.dataset_size)
 
     closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
 
@@ -371,7 +440,7 @@ def main():
 
     env = VertexEliminationEnv.from_jaxpr(
         closed_jaxpr, args=xs, argnums=argnums, num_envs=0, data_gen=gen, target_fun=env_target_fun,
-        reward_type=args.reward_type, exec_on_gpu=args.exec_on_gpu,
+        cmp_type=args.cmp_type, mem_type=args.mem_type, exec_on_gpu=args.exec_on_gpu,
     )
 
     total_v = len(closed_jaxpr.jaxpr.eqns)

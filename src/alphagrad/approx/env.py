@@ -1,20 +1,21 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from functools import partial
+from itertools import zip_longest
 from typing import Callable, Literal, NamedTuple, Sequence
-from jax_memory_monitor import ResourceMonitor
 
-import time
 import jax
 import jax._src.core as core
 import jax.numpy as jnp
 import jax.random as jrand
-from graphax.core import _build_graph, extract_jaxpr, jacve, vertex_elimination_jaxpr
 from jax import Array, jit
 from jax.experimental import io_callback
 from jax.tree_util import register_pytree_node_class
-from itertools import zip_longest
+
+from graphax.core import _build_graph, extract_jaxpr, jacve, vertex_elimination_jaxpr
+from jax_memory_monitor import ResourceMonitor
 
 MAX_TOKENS = 4096
 
@@ -40,7 +41,8 @@ class EnvConfig(NamedTuple):
     argnums: tuple[int, ...]
     has_aux: bool
     sparse: bool
-    reward_type: Literal["analytical", "estimated", "empirical"]
+    cmp_type: Literal["graphax", "flops", "latency"]
+    mem_type: Literal["graphax", "bytes_accessed", "peak_memory"]
     target_fun: Callable | None = None
     data_gen: Callable | None = None
     exec_on_gpu: bool = False
@@ -71,9 +73,14 @@ sp_type_to_map = {1: (0, 0), 2: (0, 1), 3: (1, 0), 4: (1, 1)}
 # other = {log, no log} x {div, no div}
 
 
-# analytical = fmas, sum(max(lhs.val.size, rhs.val.size, out.val.size), ...)
-# estimated = cost_analysis() -> flops, bytes accessed
-# empirical = latency, bytes accessed (?)
+# cmp_type:
+#   graphax  -> adds + muls + fmas from vertex_elimination_jaxpr
+#   flops    -> cost_analysis()["flops"]
+#   latency  -> ResourceMonitor.duration over 10 runs (top-quartile mean)
+# mem_type:
+#   graphax        -> "mem" from vertex_elimination_jaxpr
+#   bytes_accessed -> cost_analysis()["bytes accessed"]
+#   peak_memory    -> ResourceMonitor.peak (single run; or max over runs if cmp_type == latency)
 def _callback(
     config: EnvConfig,
     args,
@@ -150,7 +157,7 @@ def _callback(
     mem = jnp.array(0, dtype=jnp.int32)
     error = jnp.array(0.0, dtype=jnp.float32)
 
-    if not init and config.reward_type == "analytical":
+    if not init and (config.cmp_type == "graphax" or config.mem_type == "graphax"):
         _, aux = vertex_elimination_jaxpr(
             config.jaxpr,
             o_list,
@@ -161,11 +168,17 @@ def _callback(
             sparse_representation=config.sparse,
             sparsity_map=sparsity_map,
         )
-        cmp = jnp.array(aux["adds"] + aux["muls"] + aux["fmas"], dtype=jnp.int32)
-        mem = jnp.array(aux["mem"], dtype=jnp.int32)
+        if config.cmp_type == "graphax":
+            cmp = jnp.array(aux["adds"] + aux["muls"] + aux["fmas"], dtype=jnp.int32)
+        if config.mem_type == "graphax":
+            mem = jnp.array(aux["mem"], dtype=jnp.int32)
 
+    needs_cost_analysis = (
+        config.cmp_type == "flops" or config.mem_type == "bytes_accessed"
+    )
+    needs_runtime = config.cmp_type == "latency" or config.mem_type == "peak_memory"
     should_compile = not init and (
-        config.reward_type != "analytical" or config.target_fun is not None
+        needs_cost_analysis or needs_runtime or config.target_fun is not None
     )
 
     if init or not should_compile:
@@ -181,7 +194,9 @@ def _callback(
         callback_device = gpu_devices[1]
 
     # Ensure compilation target matches execution device
-    args_for_lower = jax.device_put(args, callback_device) if config.exec_on_gpu else args
+    args_for_lower = (
+        jax.device_put(args, callback_device) if config.exec_on_gpu else args
+    )
 
     def compiled(sp_map=None):
         return (
@@ -203,19 +218,23 @@ def _callback(
     compiled_approx = compiled(sparsity_map)
     compiled_exact = compiled()
 
-    if config.reward_type == "estimated":
+    if needs_cost_analysis:
         cost_analysis = compiled_approx.cost_analysis()
-        cmp = jnp.array(cost_analysis.get("flops", 0), dtype=jnp.int32)
-        mem = jnp.array(cost_analysis.get("bytes accessed", 0), dtype=jnp.int32)
+        if config.cmp_type == "flops":
+            cmp = jnp.array(cost_analysis.get("flops", 0), dtype=jnp.int32)
+        if config.mem_type == "bytes_accessed":
+            mem = jnp.array(cost_analysis.get("bytes accessed", 0), dtype=jnp.int32)
 
+    # only run multiple times when measuring latency; otherwise a single sample
+    # is enough for cossim error and (optionally) peak_memory.
+    n_samples = 10 if config.cmp_type == "latency" else 1
     out_approxs = []
     out_exacts = []
-    # hardcode sample size of 10 for now
-    stats = jnp.zeros((2, 10), jnp.int32)
+    stats = jnp.zeros((2, n_samples), jnp.int32)
 
     unique_devices = None
-    if config.reward_type == "empirical":
-        # Identify devices for monitoring from representative args
+    if needs_runtime:
+        # identify devices for monitoring from representative args
         monitoring_devices = []
         for x in jax.tree_util.tree_leaves(args):
             if hasattr(x, "devices"):
@@ -226,7 +245,7 @@ def _callback(
         if not unique_devices:
             unique_devices = jax.local_devices()
 
-    for i in range(10):
+    for i in range(n_samples):
         if eval_samples:
             eval_args_i = [arg[i] for arg in eval_samples]
         else:
@@ -235,11 +254,14 @@ def _callback(
         if config.exec_on_gpu:
             eval_args_i = [jax.device_put(d, callback_device) for d in eval_args_i]
 
-        if config.reward_type == "empirical":
+        if needs_runtime:
             with ResourceMonitor(devices=unique_devices) as monitor:
                 out_approx = compiled_approx(*eval_args_i)
             cmp_val, mem_val = monitor.stats.values()
-            stats = stats.at[0, i].set(cmp_val * 10**9).at[1, i].set(mem_val)
+            if config.cmp_type == "latency":
+                stats = stats.at[0, i].set(cmp_val * 10**9)
+            if config.mem_type == "peak_memory":
+                stats = stats.at[1, i].set(mem_val)
         else:
             out_approx = compiled_approx(*eval_args_i)
 
@@ -247,9 +269,10 @@ def _callback(
         out_approxs.append(out_approx)
         out_exacts.append(out_exact)
 
-    if config.reward_type == "empirical":
+    if config.cmp_type == "latency":
         cmp = stats[0].sort()[6:8].mean().astype(jnp.int32)  # top quartile
-        mem = stats[1].max()  # likely all equal, else "worst"
+    if config.mem_type == "peak_memory":
+        mem = stats[1].max()  # single sample when n_samples == 1
 
     all_cossims = []
     for out_approx, out_exact in zip(out_approxs, out_exacts):
@@ -276,16 +299,12 @@ def _callback(
     if not all_cossims:
         error = jnp.array(1.0, dtype=jnp.float32)
     else:
-        error = jnp.mean(jnp.stack(all_cossims))
-
-
-
+        error = jnp.stack(all_cossims).sort()[6:8].mean()  # top quartile
 
     return tokens, cmp, mem, error
 
 
 @register_pytree_node_class
-
 @dataclass(init=False, frozen=True)
 class VertexEliminationEnv:
     config: EnvConfig
@@ -314,7 +333,9 @@ class VertexEliminationEnv:
         object.__setattr__(self, "num_envs", num_envs)
 
         if valid_vertices is None:
-            _, _, _, _, vo_vertices = _build_graph(config.jaxpr, args, consts, config.argnums)
+            _, _, _, _, vo_vertices = _build_graph(
+                config.jaxpr, args, consts, config.argnums
+            )
             valid = []
             for i, eqn in enumerate(config.jaxpr.eqns, 1):
                 if eqn.outvars[0] not in config.jaxpr.outvars or i in vo_vertices:
@@ -333,7 +354,8 @@ class VertexEliminationEnv:
         num_envs=None,
         data_gen: Callable | None = None,
         target_fun: Callable | None = None,
-        reward_type: str = "analytical",
+        cmp_type: str = "flops",
+        mem_type: str = "peak_memory",
         exec_on_gpu: bool = False,
     ):
         assert (argnums is None and args is None) or not (args is None or args is None)
@@ -344,7 +366,8 @@ class VertexEliminationEnv:
             else tuple(argnums),
             has_aux=has_aux,
             sparse=sparse,
-            reward_type=reward_type,
+            cmp_type=cmp_type,
+            mem_type=mem_type,
             target_fun=target_fun,
             data_gen=data_gen,
             exec_on_gpu=exec_on_gpu,
