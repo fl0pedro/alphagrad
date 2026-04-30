@@ -227,13 +227,17 @@ def get_fn(fn_str):
     return fn
 
 
-class TransformerPPOAgent(eqx.Module):
+class TransformerPointerPPOAgent(eqx.Module):
     embedding: eqx.nn.Embedding
     pos_enc: PositionalEncoder
     encoder: Encoder
-    policy_head: MLP
+    vertex_embedding: eqx.nn.Embedding
+    cross_attn: eqx.nn.MultiheadAttention
+    sp_head: MLP
+    pointer_proj: eqx.nn.Linear
     value_head: MLP
-    num_actions: int = eqx.field(static=True)
+    num_vertices: int = eqx.field(static=True)
+    num_sp_types: int = eqx.field(static=True)
     num_rewards: int = eqx.field(static=True)
 
     def __init__(
@@ -243,33 +247,53 @@ class TransformerPPOAgent(eqx.Module):
         num_layers,
         num_heads,
         hidden_dim,
-        num_actions,
+        num_vertices,
+        num_sp_types,
         num_rewards,
-        policy_dims,
+        sp_dims,
         value_dims,
         seq_len,
         key,
     ):
-        k1, k2, k3, k4 = jrand.split(key, 4)
-        self.num_actions = num_actions
+        keys = jrand.split(key, 7)
+        self.num_vertices = num_vertices
+        self.num_sp_types = num_sp_types
         self.num_rewards = num_rewards
-        self.embedding = eqx.nn.Embedding(vocab_size, embd_dim, key=k1)
+        self.embedding = eqx.nn.Embedding(vocab_size, embd_dim, key=keys[0])
         self.pos_enc = PositionalEncoder(embd_dim, seq_len)
-        self.encoder = Encoder(num_layers, num_heads, embd_dim, hidden_dim, key=k2)
-        self.policy_head = MLP(embd_dim, num_actions, policy_dims, key=k3)
-        self.value_head = MLP(embd_dim, num_rewards, value_dims, key=k4)
+        self.encoder = Encoder(num_layers, num_heads, embd_dim, hidden_dim, key=keys[1])
+        self.vertex_embedding = eqx.nn.Embedding(num_vertices, embd_dim, key=keys[2])
+        self.cross_attn = eqx.nn.MultiheadAttention(num_heads, embd_dim, key=keys[3])
+        self.sp_head = MLP(embd_dim, num_sp_types, sp_dims, key=keys[4])
+        self.pointer_proj = eqx.nn.Linear(embd_dim, 1, key=keys[5])
+        self.value_head = MLP(embd_dim, num_rewards, value_dims, key=keys[6])
 
     def __call__(self, tokens, key=None, inference=False):
         if tokens.ndim == 1:
-            mask = (tokens != 0)[..., None]
+            token_mask = tokens != 0
+            mask = token_mask[..., None]
             x = jax.vmap(self.embedding)(tokens)
             x = self.pos_enc(x)
             enc_key = key if key is not None else jrand.PRNGKey(0)
             x = self.encoder(x, key=enc_key)
+
+            vertex_ids = jnp.arange(self.num_vertices)
+            v_q = jax.vmap(self.vertex_embedding)(vertex_ids)
+
+            attn_mask = jnp.broadcast_to(
+                token_mask[None, :], (self.num_vertices, tokens.shape[0])
+            )
+            v_repr = self.cross_attn(v_q, x, x, mask=attn_mask)
+
+            pointer_logits = jax.vmap(self.pointer_proj)(v_repr).squeeze(-1)
+            sp_logits = jax.vmap(self.sp_head)(v_repr)
+
+            combined = pointer_logits[None, :] + sp_logits.T
+            logits = combined.reshape(-1)
+
             summary = jnp.sum(x * mask, axis=0) / jnp.maximum(
                 jnp.sum(mask, axis=0), 1e-9
             )
-            logits = self.policy_head(summary)
             value = self.value_head(summary)
             return logits, value
         else:
@@ -506,25 +530,26 @@ def main():
     )
 
     agent_key, init_key, key = jrand.split(key, 3)
-    agent = TransformerPPOAgent(
+    agent = TransformerPointerPPOAgent(
         vocab_size=256,
         embd_dim=32,
         num_layers=2,
         num_heads=2,
         hidden_dim=64,
-        num_actions=NUM_ACTIONS,
+        num_vertices=total_v,
+        num_sp_types=5,
         num_rewards=NUM_REWARDS,
-        policy_dims=[64, 32],
+        sp_dims=[64, 32],
         value_dims=[64, 32],
         seq_len=OBS_SHAPE,
         key=agent_key,
     )
     agent = init_linear_weights(agent, init_key)
 
-    def get_policy_weight(agent):
-        return agent.policy_head.layers[-2].weight
+    def get_pointer_weight(agent):
+        return agent.pointer_proj.weight
 
-    agent = eqx.tree_at(get_policy_weight, agent, get_policy_weight(agent) * 0.1)
+    agent = eqx.tree_at(get_pointer_weight, agent, get_pointer_weight(agent) * 0.1)
 
     if args.exec_on_gpu:
         agent = jax.tree_util.tree_map(
