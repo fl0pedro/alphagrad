@@ -18,11 +18,16 @@ from graphax.core import _build_graph, extract_jaxpr, jacve, vertex_elimination_
 from jax_memory_monitor import ResourceMonitor
 
 MAX_TOKENS = 4096
+MAX_RULES_PER_VERTEX = 4
+NUM_AXIS_PAIRS = 4
+
+# Axis pair index -> (base_idx1, base_idx2). base_idx1 picks output axis 0/1; base_idx2 picks input axis 0/1.
+axis_pair_idx_to_base = {0: (0, 0), 1: (0, 1), 2: (1, 0), 3: (1, 1)}
 
 
 class EnvState(NamedTuple):
     order: Array
-    sparsity_types: Array
+    sparsity_specs: Array  # (N, MAX_RULES_PER_VERTEX, 3) int32; row [base_idx1, base_idx2, factor]; base_idx1 < 0 means slot unused
     tokens: Array
     step_count: Array
     max_steps: int
@@ -34,6 +39,11 @@ class EnvOut(NamedTuple):
     state: EnvState
     reward: Array
     terminated: bool
+
+
+class StepAction(NamedTuple):
+    target_vertex: Array  # scalar int32
+    rule_specs: Array  # (MAX_RULES_PER_VERTEX, 3) int32; row [base_idx1, base_idx2, factor]; base_idx1 < 0 marks unused
 
 
 class EnvConfig(NamedTuple):
@@ -48,13 +58,33 @@ class EnvConfig(NamedTuple):
     exec_on_gpu: bool = False
 
 
-def _get_partials(order, sparsity_types, stop):
+def _get_partials(order, sparsity_specs, stop):
     v_stop = int(stop)
     partial_order = order[:v_stop] if v_stop < len(order) else order
-    partial_sp = (
-        sparsity_types[:v_stop] if v_stop < len(sparsity_types) else sparsity_types
+    partial_specs = (
+        sparsity_specs[:v_stop] if v_stop < len(sparsity_specs) else sparsity_specs
     )
-    return partial_order, partial_sp
+    return partial_order, partial_specs
+
+
+# Lookup row used to convert a legacy scalar sp_type ∈ {0..4} into a single-rule (MAX_RULES, 3) spec.
+_LEGACY_SP_TO_RULE_ROW = jnp.array(
+    [
+        [-1, -1, 0],   # sp 0: unused
+        [0, 0, -1],    # sp 1 -> (0,0)
+        [0, 1, -1],    # sp 2 -> (0,1)
+        [1, 0, -1],    # sp 3 -> (1,0)
+        [1, 1, -1],    # sp 4 -> (1,1)
+    ],
+    dtype=jnp.int32,
+)
+
+
+def _legacy_sp_to_specs(sp_type: Array) -> Array:
+    """Convert a scalar legacy sp_type ∈ {0..4} into (MAX_RULES_PER_VERTEX, 3) rule specs."""
+    first = _LEGACY_SP_TO_RULE_ROW[sp_type]  # (3,)
+    pad = jnp.tile(jnp.array([-1, -1, 0], dtype=jnp.int32), (MAX_RULES_PER_VERTEX - 1, 1))
+    return jnp.concatenate([first[None, :], pad], axis=0)
 
 
 @jax.jit
@@ -86,31 +116,42 @@ def _callback(
     args,
     consts,
     order,
-    sparsity_types,
+    sparsity_specs,
     stop,
     *eval_samples,
     init: bool = False,
 ):
-    partial_order, partial_sp = _get_partials(order, sparsity_types, stop)
+    partial_order, partial_specs = _get_partials(order, sparsity_specs, stop)
 
     o_list = [int(x) for x in partial_order.tolist()]
-    sp_list = [int(x) for x in partial_sp.tolist()]
+    specs_list = partial_specs.tolist()  # list of MAX_RULES x 3 lists
 
     sparsity_map = []
-    for v, sp in zip(o_list, sp_list):
-        if sp > 0 and sp in sp_type_to_map:  # sp == 0 skips rule creation
-            eqn = config.jaxpr.eqns[v - 1]
-            if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
+    for v_idx, v in enumerate(o_list):
+        eqn = config.jaxpr.eqns[v - 1]
+        if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
+            continue
+
+        out_len = len(eqn.outvars[0].aval.shape)
+        rules: list[tuple[int, int, int]] = []
+        used_axes: set[int] = set()
+        for slot in range(MAX_RULES_PER_VERTEX):
+            row = specs_list[v_idx][slot]
+            bi1 = int(row[0])
+            bi2 = int(row[1])
+            factor = int(row[2])
+            if bi1 < 0:
+                break  # stop / unused slot terminates the sequence
+            idx1 = bi1
+            idx2 = out_len + bi2
+            # Skip rules that would reuse an axis (graphax filters them anyway, drop here for clarity)
+            if idx1 in used_axes or idx2 in used_axes or idx1 == idx2:
                 continue
-
-            out_len = len(eqn.outvars[0].aval.shape)
-            base_idx1, base_idx2 = sp_type_to_map[sp]
-
-            idx1 = base_idx1
-            idx2 = out_len + base_idx2
-
-            rule = ((idx1, idx2, -1),)
-            sparsity_map.append((v, rule))
+            used_axes.add(idx1)
+            used_axes.add(idx2)
+            rules.append((idx1, idx2, factor))
+        if rules:
+            sparsity_map.append((v, tuple(rules)))
 
     blacklist = [
         # [(1, ((1, 2, -1),)), (7, ((1, 3, -1),)), (4, ((1, 2, -1),)), (2, ((0, 3, -1),))],
@@ -407,7 +448,12 @@ class VertexEliminationEnv:
             num_envs = getattr(self, "num_envs", None)
 
         initial_order = jnp.array(self.valid_vertices, dtype=jnp.int32)
-        initial_sp_types = jnp.zeros_like(initial_order)
+        initial_specs = jnp.full(
+            (initial_order.shape[0], MAX_RULES_PER_VERTEX, 3),
+            -1,
+            dtype=jnp.int32,
+        )
+        initial_specs = initial_specs.at[..., 2].set(0)  # factor=0 default for unused rows
 
         tokens, _, _, _ = io_callback(
             self.tokenize(init=True),
@@ -415,7 +461,7 @@ class VertexEliminationEnv:
             self.args,
             self.consts,
             initial_order,
-            initial_sp_types,
+            initial_specs,
             0,
             *(self.eval_args_samples if self.eval_args_samples is not None else ()),
         )
@@ -428,7 +474,7 @@ class VertexEliminationEnv:
 
         state = EnvState(
             order=initial_order,
-            sparsity_types=initial_sp_types,
+            sparsity_specs=initial_specs,
             tokens=tokens,  # Directly use the unpacked token array
             step_count=step_count,
             max_steps=max_steps,
@@ -444,16 +490,22 @@ class VertexEliminationEnv:
         return state
 
     @jit
-    def step(self, state: EnvState, action: int | Array) -> EnvOut:
-        action = jnp.asarray(action, dtype=jnp.int32)
-
-        sp_type = action // MAX_TOKENS
-        target_vertex = action % MAX_TOKENS
+    def step(self, state: EnvState, action) -> EnvOut:
+        # Action may be either a `StepAction` (multi-rule) or a legacy scalar int
+        # encoded as `sp_type * MAX_TOKENS + target_vertex`.
+        if isinstance(action, StepAction):
+            target_vertex = jnp.asarray(action.target_vertex, dtype=jnp.int32)
+            rule_specs = jnp.asarray(action.rule_specs, dtype=jnp.int32)
+        else:
+            action = jnp.asarray(action, dtype=jnp.int32)
+            sp_type = action // MAX_TOKENS
+            target_vertex = action % MAX_TOKENS
+            rule_specs = _legacy_sp_to_specs(sp_type)
 
         idx = state.step_count
         new_step = idx + 1
         curr_order = state.order
-        curr_sp = state.sparsity_types
+        curr_specs = state.sparsity_specs
 
         pos = jnp.argwhere(curr_order == target_vertex, size=1).squeeze()
 
@@ -461,7 +513,7 @@ class VertexEliminationEnv:
         shifted = jnp.where((indices > idx) & (indices <= pos), indices - 1, indices)
 
         new_order = curr_order[shifted.astype(jnp.int32)].at[idx].set(target_vertex)
-        new_sp = curr_sp[shifted.astype(jnp.int32)].at[idx].set(sp_type)
+        new_specs = curr_specs[shifted.astype(jnp.int32)].at[idx].set(rule_specs)
 
         tokens, cmp, mem, error = io_callback(
             self.tokenize(),
@@ -469,7 +521,7 @@ class VertexEliminationEnv:
             self.args,
             self.consts,
             new_order,
-            new_sp,
+            new_specs,
             new_step,
             *(self.eval_args_samples if self.eval_args_samples is not None else ()),
         )
@@ -481,7 +533,7 @@ class VertexEliminationEnv:
 
         new_state = EnvState(
             order=new_order,
-            sparsity_types=new_sp,
+            sparsity_specs=new_specs,
             tokens=tokens,
             step_count=new_step,
             max_steps=state.max_steps,
