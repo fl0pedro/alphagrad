@@ -13,102 +13,16 @@ import mctx
 import numpy as np
 import optax
 import wandb
-from graphax import examples, jacve
 from tqdm import tqdm
 
-from alphagrad.approx.env import VertexEliminationEnv
+from alphagrad.approx.common import (
+    build_legacy_sp_valid_mask,
+    data_gen,
+    get_args,
+    get_fn,
+)
+from alphagrad.approx.env import MAX_TOKENS, VertexEliminationEnv
 from alphagrad.transformer import MLP, Encoder, PositionalEncoder
-
-MAX_TOKENS = 4096
-
-
-def get_args(fn_str, key):
-    basic_args = {
-        "Simple": (5.0, 7.0),
-        "Lighthouse": (0.02,) * 4,
-        "Helmholtz": (jnp.array([0.05, 0.15, 0.25, 0.35]),),
-        "RobotArm_6DOF": [0.02] * 6,
-        "RoFlux_1d": (0.01, 0.02, 0.02, 0.01, 0.03, 0.03),
-        "RoeFlux_3d": (
-            jnp.array([0.1]),
-            jnp.array([0.1, 0.2, 0.3]),
-            jnp.array([0.5]),
-            jnp.array([0.2]),
-            jnp.array([0.2, 0.2, 0.4]),
-            jnp.array([0.6]),
-        ),
-        "BlackScholes_Jacobian": (1.0,) * 5,
-    }
-    shapes = []
-    if fn_str.endswith("NeuralNetwork") or fn_str.endswith("Perceptron"):
-        shapes = [(4,), (4,), (8, 4), (8,), (4, 8), (4,)]
-    elif fn_str.startswith("Encoder"):
-        shapes = [(4, 4), (2, 4), (4, 4) * 6, (4, 4), (4,), (2, 4), (2, 1)]
-
-    if fn_str.startswith("Vmapped"):
-        shapes[0] = (16,) + shapes[0]
-        shapes[1] = (16,) + shapes[1]
-    elif fn_str.endswith("Decoder"):
-        shapes = shapes[:8] + [(4, 4) * 3] + shapes[8:]
-
-    args = []
-    for shape in shapes:
-        key, k = jrand.split(key)
-        args.append(jrand.normal(k, shape))
-
-    if args == []:
-        args = basic_args[fn_str]
-
-    return args
-
-
-def get_fn(fn_str):
-    if fn_str.endswith("NeuralNetwork"):
-
-        def NeuralNetwork(x, y, W1, b1, W2, b2):
-            y1 = W1 @ x
-            z1 = y1 + b1
-            a1 = jnp.tanh(z1)
-            y2 = W2 @ a1
-            z2 = y2 + b2
-            return 0.5 * (jnp.tanh(z2) - y) ** 2
-
-        fn = NeuralNetwork
-    elif fn_str.endswith("Perceptron"):
-        fn = examples.Perceptron
-    else:
-        fn = getattr(examples, fn_str)
-        if fn is None:
-            raise ValueError
-
-    if fn_str.startswith("Vmapped"):
-        fn = jax.vmap(fn, in_axes=(0, 0) + (None,) * 4)
-
-    return fn
-
-
-def data_gen(fn_str):
-    if fn_str == "NeuralNetwork":
-
-        @jax.jit
-        def get_kinematics_data(keys):
-            r1 = jrand.uniform(keys[0])
-            th1 = jrand.uniform(keys[1], minval=-jnp.pi, maxval=jnp.pi)
-            r2 = jrand.uniform(keys[2])
-            th2 = jrand.uniform(keys[3], minval=-jnp.pi, maxval=jnp.pi)
-            x = jnp.stack([r1, th1 / jnp.pi, r2, th2 / jnp.pi], axis=-1)
-            y = jnp.stack(
-                [
-                    r1 * jnp.cos(th1),
-                    r1 * jnp.sin(th1),
-                    r2 * jnp.cos(th2),
-                    r2 * jnp.sin(th2),
-                ],
-                axis=-1,
-            )
-            return x, y
-
-        return get_kinematics_data
 
 
 # ---------------------------------------------------------------------------
@@ -209,21 +123,12 @@ def main():
     valid_vertices = jnp.array(env.valid_vertices, dtype=jnp.int32)
     num_valid = len(env.valid_vertices)
 
-    sp_valid_mask_np = np.zeros((3, total_v), dtype=np.float32)
-    for i, eqn in enumerate(closed_jaxpr.jaxpr.eqns):
-        sp_valid_mask_np[0, i] = 1.0
-        if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
-            continue
-        out_ndim = len(eqn.outvars[0].aval.shape)
-        invars = [v for v in eqn.invars if hasattr(v, "aval")]
-        if invars:
-            max_in_ndim = max(len(v.aval.shape) for v in invars)
-            if out_ndim >= 1 and max_in_ndim >= 1:
-                sp_valid_mask_np[1, i] = 1.0
-            if out_ndim >= 1 and max_in_ndim >= 2:
-                sp_valid_mask_np[2, i] = 1.0
-
-    sp_valid_mask = jnp.array(sp_valid_mask_np)
+    sp_valid_mask = build_legacy_sp_valid_mask(
+        closed_jaxpr.jaxpr,
+        total_v,
+        num_sp_types=3,
+        use_min_in_ndim=False,
+    )
 
     EPISODES = args.episodes
     NUM_ENVS = os.cpu_count() or 64
