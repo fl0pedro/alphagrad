@@ -1,18 +1,21 @@
 """PPO trainer for the vertex-elimination env.
 
-Three policy architectures are available and selectable via CLI flags:
+The agent factors as `Agent = encoder + VertexPolicy + RulePolicy + value_head`.
+Two independent CLI flags swap each policy axis:
 
-* default — full transformer pointer net + autoregressive `RuleDecoder` that
-  emits a sequence of `(axis_pair, factor)` rules per chosen vertex.
-* `--not-autoreg` — transformer pointer net, but with a single per-vertex
-  `sp_head` (one rule per vertex, factor fixed to -1).
-* `--no-ptr` — original architecture with no pointer net: a single MLP policy
-  head over the unrolled `(sp_type, vertex)` action space.
+* vertex selection (`--no-ptr` toggles)
+    * default          : `PointerVertexPolicy` — learned per-vertex queries
+                          cross-attend to the encoded tokens.
+    * `--no-ptr`       : `MLPVertexPolicy` — masked MLP over the encoded summary.
+* rule emission (`--not-autoreg` toggles)
+    * default          : `AutoregRulePolicy` — `RuleDecoder` scan emitting up to
+                          `--max-rules` `(axis_pair, factor)` rules per vertex.
+    * `--not-autoreg`  : `SingleRulePolicy` — single per-vertex sp head, one rule
+                          per vertex with factor fixed to -1.
 
-All three share the same trajectory layout, GAE machinery, and PPO loss; the
-only differences live inside the agent classes (sampling and log-prob). All
-hyperparameters (network widths, optimisation, PPO knobs, mask layout) are
-behind CLI arguments.
+All four combinations are valid; they share the same trajectory layout, GAE
+machinery, and PPO loss. Every hyperparameter (network widths, optimisation,
+PPO knobs, factor table, etc.) is behind a CLI argument.
 """
 
 from __future__ import annotations
@@ -209,17 +212,35 @@ def _pad_dists(active: jax.Array, max_rules: int, num_choices: int, fill_idx: in
     return jnp.concatenate([active, pad_one_hot], axis=0)
 
 
+
 # ---------------------------------------------------------------------------
-# Variant A: full autoregressive pointer + RuleDecoder
+# Composable agent: VertexPolicy x RulePolicy
+#
+# `VertexPolicy` produces vertex logits (selection over `total_v` vertices)
+# and a per-vertex context vector that conditions the rule head.
+#   * `PointerVertexPolicy`: one learned vertex query per vertex cross-attends
+#     over the encoded tokens; the cross-attended representation is the
+#     context.
+#   * `MLPVertexPolicy`: a single MLP off the masked-mean summary produces
+#     vertex logits; per-vertex contexts are summary + vertex_embedding(v).
+#
+# `RulePolicy` consumes the chosen vertex's context (plus the per-vertex
+# pair-validity mask) and emits a sequence of `(axis_pair, factor)` rules.
+#   * `AutoregRulePolicy`: the autoregressive `RuleDecoder` scan from before;
+#     emits up to `max_rules` rules with arbitrary factors from the table.
+#   * `SingleRulePolicy`: a single per-vertex sp head emitting one rule with
+#     factor fixed to -1 (the factor table is ignored).
+#
+# Both axes are independent: any of the four combinations is valid.
 # ---------------------------------------------------------------------------
 
 
 class RuleDecoder(eqx.Module):
     """Per-slot autoregressive head emitting `(axis_pair, factor)` rules.
 
-    The pair head is conditioned on the previous slot's `(pair, factor)` and the
-    chosen vertex; the factor head is conditioned on the *current* pair so the
-    two heads are autoregressive within a single rule slot.
+    The pair head is conditioned on the previous slot's `(pair, factor)` and
+    the chosen vertex; the factor head is conditioned on the *current* pair so
+    the two heads are autoregressive within a single rule slot.
     """
 
     pair_embed: eqx.nn.Embedding
@@ -257,172 +278,142 @@ class RuleDecoder(eqx.Module):
         return self.factor_head(jnp.concatenate([h, self.pair_embed(pair_idx)]))
 
 
-class AutoregPointerAgent(eqx.Module):
-    """Default variant: pointer net + autoregressive rule decoder."""
+# === Vertex policies =======================================================
 
-    embedding: eqx.nn.Embedding
-    pos_enc: PositionalEncoder
-    encoder: Encoder
+
+class PointerVertexPolicy(eqx.Module):
+    """Vertex selection via cross-attention from learned per-vertex queries."""
+
     vertex_embedding: eqx.nn.Embedding
     cross_attn: eqx.nn.MultiheadAttention
     pointer_proj: eqx.nn.Linear
-    rule_decoder: RuleDecoder
-    value_head: MLP
 
     num_vertices: int = eqx.field(static=True)
-    num_rewards: int = eqx.field(static=True)
-    max_rules: int = eqx.field(static=True)
-    num_pair_choices: int = eqx.field(static=True)
-    num_factors: int = eqx.field(static=True)
-    embd_dim: int = eqx.field(static=True)
-    use_factor_table: bool = eqx.field(static=True)
 
-    def __init__(
-        self,
-        *,
-        vocab_size,
-        embd_dim,
-        num_layers,
-        num_heads,
-        hidden_dim,
-        num_vertices,
-        num_rewards,
-        max_rules,
-        num_pair_choices,
-        num_factors,
-        value_dims,
-        seq_len,
-        key,
-    ):
-        keys = jrand.split(key, 7)
+    def __init__(self, *, num_vertices, embd_dim, num_heads, key):
+        keys = jrand.split(key, 3)
         self.num_vertices = num_vertices
-        self.num_rewards = num_rewards
-        self.max_rules = max_rules
-        self.num_pair_choices = num_pair_choices
-        self.num_factors = num_factors
-        self.embd_dim = embd_dim
-        self.use_factor_table = True
-        self.embedding = eqx.nn.Embedding(vocab_size, embd_dim, key=keys[0])
-        self.pos_enc = PositionalEncoder(embd_dim, seq_len)
-        self.encoder = Encoder(num_layers, num_heads, embd_dim, hidden_dim, key=keys[1])
-        self.vertex_embedding = eqx.nn.Embedding(num_vertices, embd_dim, key=keys[2])
-        self.cross_attn = eqx.nn.MultiheadAttention(num_heads, embd_dim, key=keys[3])
-        self.pointer_proj = eqx.nn.Linear(embd_dim, 1, key=keys[4])
-        self.rule_decoder = RuleDecoder(
-            embd_dim, max_rules, num_pair_choices, num_factors, key=keys[5]
-        )
-        self.value_head = MLP(embd_dim, num_rewards, value_dims, key=keys[6])
+        self.vertex_embedding = eqx.nn.Embedding(num_vertices, embd_dim, key=keys[0])
+        self.cross_attn = eqx.nn.MultiheadAttention(num_heads, embd_dim, key=keys[1])
+        self.pointer_proj = eqx.nn.Linear(embd_dim, 1, key=keys[2])
 
-    def encode(self, tokens, key=None):
-        token_mask = tokens != 0
-        mask = token_mask[..., None]
-        x = jax.vmap(self.embedding)(tokens)
-        x = self.pos_enc(x)
-        enc_key = key if key is not None else jrand.PRNGKey(0)
-        enc_x = self.encoder(x, key=enc_key)
-
-        vertex_ids = jnp.arange(self.num_vertices)
-        v_q = jax.vmap(self.vertex_embedding)(vertex_ids)
+    def __call__(self, enc_x, token_mask):
+        v_q = jax.vmap(self.vertex_embedding)(jnp.arange(self.num_vertices))
         attn_mask = jnp.broadcast_to(
-            token_mask[None, :], (self.num_vertices, tokens.shape[0])
+            token_mask[None, :], (self.num_vertices, enc_x.shape[0])
         )
         vertex_reprs = self.cross_attn(v_q, enc_x, enc_x, mask=attn_mask)
-
         vertex_logits = jax.vmap(self.pointer_proj)(vertex_reprs).squeeze(-1)
+        return vertex_logits, vertex_reprs
+
+
+class MLPVertexPolicy(eqx.Module):
+    """Vertex selection via a single MLP over the masked-mean summary.
+
+    The per-vertex context fed into the rule head is `summary + vertex_embedding(v)`,
+    so the rule policy still gets a meaningful, vertex-specific conditioning even
+    though there is no pointer net.
+    """
+
+    vertex_embedding: eqx.nn.Embedding
+    head: MLP
+
+    num_vertices: int = eqx.field(static=True)
+
+    def __init__(self, *, num_vertices, embd_dim, hidden_dims, key):
+        keys = jrand.split(key, 2)
+        self.num_vertices = num_vertices
+        self.vertex_embedding = eqx.nn.Embedding(num_vertices, embd_dim, key=keys[0])
+        self.head = MLP(embd_dim, num_vertices, hidden_dims, key=keys[1])
+
+    def __call__(self, enc_x, token_mask):
+        mask = token_mask[..., None]
         summary = jnp.sum(enc_x * mask, axis=0) / jnp.maximum(
             jnp.sum(mask, axis=0), 1e-9
         )
-        return vertex_logits, vertex_reprs, self.value_head(summary)
+        vertex_logits = self.head(summary)
+        v_q = jax.vmap(self.vertex_embedding)(jnp.arange(self.num_vertices))
+        per_vertex_context = v_q + summary[None, :]
+        return vertex_logits, per_vertex_context
 
-    def sample_action(self, tokens, vertex_avail_mask, pair_valid_mask, key):
-        net_key, vertex_key, decoder_key = jrand.split(key, 3)
-        vertex_logits, vertex_reprs, value = self.encode(tokens, key=net_key)
 
-        masked_v_logits = jnp.where(vertex_avail_mask > 0.5, vertex_logits, -1e9)
-        vertex_dist = jnn.softmax(masked_v_logits, axis=-1)
-        vertex_idx = distrax.Categorical(probs=vertex_dist).sample(seed=vertex_key)
-        v_repr = vertex_reprs[vertex_idx]
-        v_pair_mask = pair_valid_mask[vertex_idx]
+# === Rule policies =========================================================
+
+
+class AutoregRulePolicy(eqx.Module):
+    """Autoregressive (axis_pair, factor) rule decoder."""
+
+    decoder: RuleDecoder
+
+    embd_dim: int = eqx.field(static=True)
+    max_rules: int = eqx.field(static=True)
+    num_pair_choices: int = eqx.field(static=True)
+    num_factors: int = eqx.field(static=True)
+    use_factor_table: bool = eqx.field(static=True)
+
+    def __init__(self, *, embd_dim, max_rules, num_pair_choices, num_factors, key):
+        self.embd_dim = embd_dim
+        self.max_rules = max_rules
+        self.num_pair_choices = num_pair_choices
+        self.num_factors = num_factors
+        self.use_factor_table = True
+        self.decoder = RuleDecoder(
+            embd_dim, max_rules, num_pair_choices, num_factors, key=key
+        )
+
+    def _init_carry(self):
+        return (
+            jnp.array(PAIR_STOP, dtype=jnp.int32),
+            jnp.array(0, dtype=jnp.int32),
+            jnp.zeros(self.embd_dim),
+            jnp.array(True, dtype=jnp.bool_),
+        )
+
+    def sample(self, vertex_context, v_pair_mask, key):
+        slot_keys = jrand.split(key, self.max_rules)
         stop_only = _stop_only_logits(self.num_pair_choices)
-
-        slot_keys = jrand.split(decoder_key, self.max_rules)
 
         def rule_step(carry, slot_data):
             prev_pair, prev_factor, prev_h, active = carry
             slot_idx, k = slot_data
             kp, kf = jrand.split(k)
-            new_h, pair_logits = self.rule_decoder.step(
-                v_repr, slot_idx, prev_pair, prev_factor, prev_h
+            new_h, pair_logits = self.decoder.step(
+                vertex_context, slot_idx, prev_pair, prev_factor, prev_h
             )
             pair_logits = jnp.where(v_pair_mask > 0.5, pair_logits, -1e9)
             pair_logits_eff = jnp.where(active, pair_logits, stop_only)
             pair_dist = jnn.softmax(pair_logits_eff, axis=-1)
             pair_idx = distrax.Categorical(probs=pair_dist).sample(seed=kp)
 
-            factor_logits = self.rule_decoder.factor_logits_for(new_h, pair_idx)
+            factor_logits = self.decoder.factor_logits_for(new_h, pair_idx)
             factor_dist = jnn.softmax(factor_logits, axis=-1)
             factor_idx = distrax.Categorical(probs=factor_dist).sample(seed=kf)
 
             new_active = active & (pair_idx != PAIR_STOP)
             return (pair_idx, factor_idx, new_h, new_active), (
-                pair_idx,
-                factor_idx,
-                pair_dist,
-                factor_dist,
+                pair_idx, factor_idx, pair_dist, factor_dist,
             )
 
-        init_carry = (
-            jnp.array(PAIR_STOP, dtype=jnp.int32),
-            jnp.array(0, dtype=jnp.int32),
-            jnp.zeros(self.embd_dim),
-            jnp.array(True, dtype=jnp.bool_),
-        )
         _, (pair_seq, factor_seq, pair_dists, factor_dists) = lax.scan(
-            rule_step, init_carry, (jnp.arange(self.max_rules), slot_keys)
+            rule_step, self._init_carry(), (jnp.arange(self.max_rules), slot_keys)
         )
-        return (
-            vertex_idx,
-            pair_seq,
-            factor_seq,
-            vertex_dist,
-            pair_dists,
-            factor_dists,
-            value,
-        )
+        return pair_seq, factor_seq, pair_dists, factor_dists
 
-    def evaluate_action(
-        self,
-        tokens,
-        vertex_idx,
-        pair_seq,
-        factor_seq,
-        vertex_avail_mask,
-        pair_valid_mask,
-        key,
-    ):
-        vertex_logits, vertex_reprs, value = self.encode(tokens, key=key)
-
-        masked_v_logits = jnp.where(vertex_avail_mask > 0.5, vertex_logits, -1e9)
-        vertex_dist = jnn.softmax(masked_v_logits, axis=-1)
-        log_p_vertex = jnp.log(vertex_dist[vertex_idx] + 1e-8)
-        vertex_entropy = entropy(vertex_dist)
-
-        v_repr = vertex_reprs[vertex_idx]
-        v_pair_mask = pair_valid_mask[vertex_idx]
+    def evaluate(self, vertex_context, v_pair_mask, pair_seq, factor_seq):
         stop_only = _stop_only_logits(self.num_pair_choices)
 
         def rule_step(carry, slot_data):
             prev_pair, prev_factor, prev_h, active = carry
             slot_idx, true_pair, true_factor = slot_data
-            new_h, pair_logits = self.rule_decoder.step(
-                v_repr, slot_idx, prev_pair, prev_factor, prev_h
+            new_h, pair_logits = self.decoder.step(
+                vertex_context, slot_idx, prev_pair, prev_factor, prev_h
             )
             pair_logits = jnp.where(v_pair_mask > 0.5, pair_logits, -1e9)
             pair_logits_eff = jnp.where(active, pair_logits, stop_only)
             pair_dist = jnn.softmax(pair_logits_eff, axis=-1)
             log_p_pair = jnp.log(pair_dist[true_pair] + 1e-8)
 
-            factor_logits = self.rule_decoder.factor_logits_for(new_h, true_pair)
+            factor_logits = self.decoder.factor_logits_for(new_h, true_pair)
             factor_dist = jnn.softmax(factor_logits, axis=-1)
             log_p_factor = jnp.log(factor_dist[true_factor] + 1e-8)
 
@@ -437,227 +428,105 @@ class AutoregPointerAgent(eqx.Module):
 
             new_active = active & (true_pair != PAIR_STOP)
             return (true_pair, true_factor, new_h, new_active), (
-                log_p_pair_eff,
-                log_p_factor_eff,
-                pair_ent,
-                factor_ent,
-                pair_dist,
-                factor_dist,
+                log_p_pair_eff, log_p_factor_eff,
+                pair_ent, factor_ent,
+                pair_dist, factor_dist,
             )
 
-        init_carry = (
-            jnp.array(PAIR_STOP, dtype=jnp.int32),
-            jnp.array(0, dtype=jnp.int32),
-            jnp.zeros(self.embd_dim),
-            jnp.array(True, dtype=jnp.bool_),
-        )
         _, (lp_pairs, lp_factors, ent_pairs, ent_factors, pair_dists, factor_dists) = (
             lax.scan(
                 rule_step,
-                init_carry,
+                self._init_carry(),
                 (jnp.arange(self.max_rules), pair_seq, factor_seq),
             )
         )
+        return lp_pairs, lp_factors, ent_pairs, ent_factors, pair_dists, factor_dists
 
-        total_log_p = log_p_vertex + jnp.sum(lp_pairs) + jnp.sum(lp_factors)
-        total_entropy = vertex_entropy + jnp.sum(ent_pairs) + jnp.sum(ent_factors)
-        return (
-            total_log_p,
-            total_entropy,
-            value,
-            vertex_dist,
-            pair_dists,
-            factor_dists,
-        )
-
-    def to_env_action(self, vertex_idx, pair_seq, factor_seq, factor_table):
-        return StepAction(
-            target_vertex=jnp.asarray(vertex_idx + 1, dtype=jnp.int32),
-            rule_specs=build_rule_specs(pair_seq, factor_seq, factor_table),
-        )
-
-    def value_for(self, tokens, key=None):
-        _, _, value = self.encode(tokens, key=key)
-        return value
+    def to_env_specs(self, pair_seq, factor_seq, factor_table):
+        return build_rule_specs(pair_seq, factor_seq, factor_table)
 
 
-# ---------------------------------------------------------------------------
-# Variant B: pointer net, single per-vertex sp head (no autoregression)
-# ---------------------------------------------------------------------------
+class SingleRulePolicy(eqx.Module):
+    """Single rule per vertex (factor=-1 fixed). Equivalent to the legacy sp head."""
 
-
-class PointerAgent(eqx.Module):
-    """Pointer + per-vertex sp head. One rule per vertex, factor=-1 fixed."""
-
-    embedding: eqx.nn.Embedding
-    pos_enc: PositionalEncoder
-    encoder: Encoder
-    vertex_embedding: eqx.nn.Embedding
-    cross_attn: eqx.nn.MultiheadAttention
-    pointer_proj: eqx.nn.Linear
     sp_head: MLP
-    value_head: MLP
 
-    num_vertices: int = eqx.field(static=True)
-    num_rewards: int = eqx.field(static=True)
+    embd_dim: int = eqx.field(static=True)
     max_rules: int = eqx.field(static=True)
     num_pair_choices: int = eqx.field(static=True)
     num_factors: int = eqx.field(static=True)
-    embd_dim: int = eqx.field(static=True)
     use_factor_table: bool = eqx.field(static=True)
 
     def __init__(
-        self,
-        *,
-        vocab_size,
-        embd_dim,
-        num_layers,
-        num_heads,
-        hidden_dim,
-        num_vertices,
-        num_rewards,
-        max_rules,
-        num_pair_choices,
-        num_factors,
-        sp_dims,
-        value_dims,
-        seq_len,
-        key,
+        self, *, embd_dim, max_rules, num_pair_choices, num_factors, sp_dims, key
     ):
-        keys = jrand.split(key, 7)
-        self.num_vertices = num_vertices
-        self.num_rewards = num_rewards
+        self.embd_dim = embd_dim
         self.max_rules = max_rules
         self.num_pair_choices = num_pair_choices
         self.num_factors = num_factors
-        self.embd_dim = embd_dim
         self.use_factor_table = False
-        self.embedding = eqx.nn.Embedding(vocab_size, embd_dim, key=keys[0])
-        self.pos_enc = PositionalEncoder(embd_dim, seq_len)
-        self.encoder = Encoder(num_layers, num_heads, embd_dim, hidden_dim, key=keys[1])
-        self.vertex_embedding = eqx.nn.Embedding(num_vertices, embd_dim, key=keys[2])
-        self.cross_attn = eqx.nn.MultiheadAttention(num_heads, embd_dim, key=keys[3])
-        self.pointer_proj = eqx.nn.Linear(embd_dim, 1, key=keys[4])
-        # `sp_head` outputs `num_pair_choices` logits — one for each (pair, STOP) choice.
-        self.sp_head = MLP(embd_dim, num_pair_choices, sp_dims, key=keys[5])
-        self.value_head = MLP(embd_dim, num_rewards, value_dims, key=keys[6])
+        self.sp_head = MLP(embd_dim, num_pair_choices, sp_dims, key=key)
 
-    def encode(self, tokens, key=None):
-        token_mask = tokens != 0
-        mask = token_mask[..., None]
-        x = jax.vmap(self.embedding)(tokens)
-        x = self.pos_enc(x)
-        enc_key = key if key is not None else jrand.PRNGKey(0)
-        enc_x = self.encoder(x, key=enc_key)
-
-        vertex_ids = jnp.arange(self.num_vertices)
-        v_q = jax.vmap(self.vertex_embedding)(vertex_ids)
-        attn_mask = jnp.broadcast_to(
-            token_mask[None, :], (self.num_vertices, tokens.shape[0])
-        )
-        vertex_reprs = self.cross_attn(v_q, enc_x, enc_x, mask=attn_mask)
-
-        vertex_logits = jax.vmap(self.pointer_proj)(vertex_reprs).squeeze(-1)
-        summary = jnp.sum(enc_x * mask, axis=0) / jnp.maximum(
-            jnp.sum(mask, axis=0), 1e-9
-        )
-        return vertex_logits, vertex_reprs, self.value_head(summary)
-
-    def _slot0_dist(self, v_repr, v_pair_mask):
-        """Compute the per-vertex pair distribution at slot 0 (with vertex-validity masking)."""
-        sp_logits = self.sp_head(v_repr)
+    def _slot0_dist(self, vertex_context, v_pair_mask):
+        sp_logits = self.sp_head(vertex_context)
         sp_logits = jnp.where(v_pair_mask > 0.5, sp_logits, -1e9)
         return jnn.softmax(sp_logits, axis=-1)
 
-    def _build_uniform_action(self, vertex_idx, vertex_dist, pair_idx, slot0_dist):
-        """Pad (vertex, single pair) into the uniform autoreg-shaped action structure."""
-        pair_seq = _pad_seq(jnp.atleast_1d(pair_idx).astype(jnp.int32), self.max_rules, pad=PAIR_STOP)
-        factor_seq = jnp.zeros((self.max_rules,), dtype=jnp.int32)
-        pair_dists = _pad_dists(slot0_dist[None, :], self.max_rules, self.num_pair_choices, PAIR_STOP)
-        factor_dists = jnp.broadcast_to(
+    def _padded_pair_dists(self, slot0_dist):
+        return _pad_dists(
+            slot0_dist[None, :], self.max_rules, self.num_pair_choices, PAIR_STOP
+        )
+
+    def _degenerate_factor_dists(self):
+        return jnp.broadcast_to(
             jnn.one_hot(0, self.num_factors), (self.max_rules, self.num_factors)
         )
-        return pair_seq, factor_seq, vertex_dist, pair_dists, factor_dists
 
-    def sample_action(self, tokens, vertex_avail_mask, pair_valid_mask, key):
-        net_key, vertex_key, sp_key = jrand.split(key, 3)
-        vertex_logits, vertex_reprs, value = self.encode(tokens, key=net_key)
-
-        masked_v_logits = jnp.where(vertex_avail_mask > 0.5, vertex_logits, -1e9)
-        vertex_dist = jnn.softmax(masked_v_logits, axis=-1)
-        vertex_idx = distrax.Categorical(probs=vertex_dist).sample(seed=vertex_key)
-        v_repr = vertex_reprs[vertex_idx]
-        v_pair_mask = pair_valid_mask[vertex_idx]
-
-        slot0_dist = self._slot0_dist(v_repr, v_pair_mask)
-        pair_idx = distrax.Categorical(probs=slot0_dist).sample(seed=sp_key)
-        pair_seq, factor_seq, vd, pair_dists, factor_dists = self._build_uniform_action(
-            vertex_idx, vertex_dist, pair_idx, slot0_dist
+    def sample(self, vertex_context, v_pair_mask, key):
+        slot0_dist = self._slot0_dist(vertex_context, v_pair_mask)
+        pair_idx = distrax.Categorical(probs=slot0_dist).sample(seed=key)
+        pair_seq = _pad_seq(
+            jnp.atleast_1d(pair_idx).astype(jnp.int32), self.max_rules, pad=PAIR_STOP
         )
-        return vertex_idx, pair_seq, factor_seq, vd, pair_dists, factor_dists, value
+        factor_seq = jnp.zeros((self.max_rules,), dtype=jnp.int32)
+        return pair_seq, factor_seq, self._padded_pair_dists(slot0_dist), self._degenerate_factor_dists()
 
-    def evaluate_action(
-        self,
-        tokens,
-        vertex_idx,
-        pair_seq,
-        factor_seq,
-        vertex_avail_mask,
-        pair_valid_mask,
-        key,
-    ):
-        vertex_logits, vertex_reprs, value = self.encode(tokens, key=key)
-
-        masked_v_logits = jnp.where(vertex_avail_mask > 0.5, vertex_logits, -1e9)
-        vertex_dist = jnn.softmax(masked_v_logits, axis=-1)
-        log_p_vertex = jnp.log(vertex_dist[vertex_idx] + 1e-8)
-        vertex_ent = entropy(vertex_dist)
-
-        v_repr = vertex_reprs[vertex_idx]
-        v_pair_mask = pair_valid_mask[vertex_idx]
-
-        slot0_dist = self._slot0_dist(v_repr, v_pair_mask)
+    def evaluate(self, vertex_context, v_pair_mask, pair_seq, factor_seq):
+        slot0_dist = self._slot0_dist(vertex_context, v_pair_mask)
         pair_idx = pair_seq[0]
         log_p_pair = jnp.log(slot0_dist[pair_idx] + 1e-8)
         pair_ent = entropy(slot0_dist)
 
-        # Slots 1+ are degenerate STOP and the factor head is degenerate; their
+        # Slots > 0 are degenerate STOP and the factor head is degenerate; their
         # log-prob and entropy contributions are zero.
-        pair_dists = _pad_dists(
-            slot0_dist[None, :], self.max_rules, self.num_pair_choices, PAIR_STOP
-        )
-        factor_dists = jnp.broadcast_to(
-            jnn.one_hot(0, self.num_factors), (self.max_rules, self.num_factors)
-        )
-
-        total_log_p = log_p_vertex + log_p_pair
-        total_entropy = vertex_ent + pair_ent
-        return total_log_p, total_entropy, value, vertex_dist, pair_dists, factor_dists
-
-    def to_env_action(self, vertex_idx, pair_seq, factor_seq, factor_table):
-        # Single-rule, factor=-1: ignore factor_seq / factor_table.
-        return StepAction(
-            target_vertex=jnp.asarray(vertex_idx + 1, dtype=jnp.int32),
-            rule_specs=build_legacy_rule_specs(pair_seq),
+        lp_pairs = jnp.zeros((self.max_rules,), dtype=jnp.float32).at[0].set(log_p_pair)
+        lp_factors = jnp.zeros((self.max_rules,), dtype=jnp.float32)
+        ent_pairs = jnp.zeros((self.max_rules,), dtype=jnp.float32).at[0].set(pair_ent)
+        ent_factors = jnp.zeros((self.max_rules,), dtype=jnp.float32)
+        return (
+            lp_pairs,
+            lp_factors,
+            ent_pairs,
+            ent_factors,
+            self._padded_pair_dists(slot0_dist),
+            self._degenerate_factor_dists(),
         )
 
-    def value_for(self, tokens, key=None):
-        _, _, value = self.encode(tokens, key=key)
-        return value
+    def to_env_specs(self, pair_seq, factor_seq, factor_table):
+        return build_legacy_rule_specs(pair_seq)
 
 
-# ---------------------------------------------------------------------------
-# Variant C: original MLP head (no pointer net), unrolled (sp_type, vertex)
-# ---------------------------------------------------------------------------
+# === Composed agent ========================================================
 
 
-class MLPAgent(eqx.Module):
-    """Encoder + MLP policy head over the unrolled `(sp_type, vertex)` action space."""
+class Agent(eqx.Module):
+    """Encoder + composable (vertex policy, rule policy) + value head."""
 
     embedding: eqx.nn.Embedding
     pos_enc: PositionalEncoder
     encoder: Encoder
-    policy_head: MLP
+    vertex_policy: eqx.Module
+    rule_policy: eqx.Module
     value_head: MLP
 
     num_vertices: int = eqx.field(static=True)
@@ -666,42 +535,35 @@ class MLPAgent(eqx.Module):
     num_pair_choices: int = eqx.field(static=True)
     num_factors: int = eqx.field(static=True)
     embd_dim: int = eqx.field(static=True)
-    use_factor_table: bool = eqx.field(static=True)
 
     def __init__(
         self,
         *,
-        vocab_size,
-        embd_dim,
-        num_layers,
-        num_heads,
-        hidden_dim,
+        embedding,
+        pos_enc,
+        encoder,
+        vertex_policy,
+        rule_policy,
+        value_head,
         num_vertices,
         num_rewards,
         max_rules,
         num_pair_choices,
         num_factors,
-        policy_dims,
-        value_dims,
-        seq_len,
-        key,
+        embd_dim,
     ):
-        keys = jrand.split(key, 4)
+        self.embedding = embedding
+        self.pos_enc = pos_enc
+        self.encoder = encoder
+        self.vertex_policy = vertex_policy
+        self.rule_policy = rule_policy
+        self.value_head = value_head
         self.num_vertices = num_vertices
         self.num_rewards = num_rewards
         self.max_rules = max_rules
         self.num_pair_choices = num_pair_choices
         self.num_factors = num_factors
         self.embd_dim = embd_dim
-        self.use_factor_table = False
-        self.embedding = eqx.nn.Embedding(vocab_size, embd_dim, key=keys[0])
-        self.pos_enc = PositionalEncoder(embd_dim, seq_len)
-        self.encoder = Encoder(num_layers, num_heads, embd_dim, hidden_dim, key=keys[1])
-        # Output dim == num_pair_choices * num_vertices: rows are sp-type / pair-index, cols are vertices.
-        self.policy_head = MLP(
-            embd_dim, num_pair_choices * num_vertices, policy_dims, key=keys[2]
-        )
-        self.value_head = MLP(embd_dim, num_rewards, value_dims, key=keys[3])
 
     def encode(self, tokens, key=None):
         token_mask = tokens != 0
@@ -710,61 +572,30 @@ class MLPAgent(eqx.Module):
         x = self.pos_enc(x)
         enc_key = key if key is not None else jrand.PRNGKey(0)
         enc_x = self.encoder(x, key=enc_key)
+
+        vertex_logits, vertex_contexts = self.vertex_policy(enc_x, token_mask)
+
         summary = jnp.sum(enc_x * mask, axis=0) / jnp.maximum(
             jnp.sum(mask, axis=0), 1e-9
         )
-        return self.policy_head(summary), self.value_head(summary)
+        return vertex_logits, vertex_contexts, self.value_head(summary)
 
-    def _joint_dist_and_marginal(
-        self, summary_logits, vertex_avail_mask, pair_valid_mask
-    ):
-        """Compute the full joint dist (pair × vertex) and the vertex marginal under masking."""
-        joint_logits = summary_logits.reshape(self.num_pair_choices, self.num_vertices)
-        # Mask: vertex must be available AND the (pair, vertex) combination must be valid.
-        # `pair_valid_mask` is shape (num_vertices, num_pair_choices) -> transpose for joint layout.
-        joint_mask = (
-            vertex_avail_mask[None, :] * pair_valid_mask.T
-        )  # (num_pair_choices, num_vertices)
-        joint_logits = jnp.where(joint_mask > 0.5, joint_logits, -1e9)
-        joint_flat = joint_logits.reshape(-1)
-        joint_dist_flat = jnn.softmax(joint_flat, axis=-1)
-        joint_dist = joint_dist_flat.reshape(
-            self.num_pair_choices, self.num_vertices
-        )
-        vertex_dist = jnp.sum(joint_dist, axis=0)  # (num_vertices,)
-        return joint_dist_flat, joint_dist, vertex_dist
-
-    def _build_uniform_action(self, vertex_idx, pair_idx, vertex_dist, joint_dist):
-        """Pad the chosen (vertex, pair) into the uniform autoreg-shaped action."""
-        pair_seq = _pad_seq(jnp.atleast_1d(pair_idx).astype(jnp.int32), self.max_rules, pad=PAIR_STOP)
-        factor_seq = jnp.zeros((self.max_rules,), dtype=jnp.int32)
-
-        # Conditional pair distribution at the chosen vertex (used only for KL diagnostics).
-        cond_denom = jnp.maximum(vertex_dist[vertex_idx], 1e-8)
-        slot0_dist = joint_dist[:, vertex_idx] / cond_denom
-
-        pair_dists = _pad_dists(
-            slot0_dist[None, :], self.max_rules, self.num_pair_choices, PAIR_STOP
-        )
-        factor_dists = jnp.broadcast_to(
-            jnn.one_hot(0, self.num_factors), (self.max_rules, self.num_factors)
-        )
-        return pair_seq, factor_seq, pair_dists, factor_dists, slot0_dist
+    def value_for(self, tokens, key=None):
+        _, _, value = self.encode(tokens, key=key)
+        return value
 
     def sample_action(self, tokens, vertex_avail_mask, pair_valid_mask, key):
-        net_key, act_key = jrand.split(key, 2)
-        summary_logits, value = self.encode(tokens, key=net_key)
+        net_key, vertex_key, rule_key = jrand.split(key, 3)
+        vertex_logits, vertex_contexts, value = self.encode(tokens, key=net_key)
 
-        joint_flat, joint_dist, vertex_dist = self._joint_dist_and_marginal(
-            summary_logits, vertex_avail_mask, pair_valid_mask
-        )
-        action_idx = distrax.Categorical(probs=joint_flat).sample(seed=act_key)
-        # Joint layout is (pair, vertex), so divmod by num_vertices.
-        pair_idx = action_idx // self.num_vertices
-        vertex_idx = action_idx % self.num_vertices
+        masked_v_logits = jnp.where(vertex_avail_mask > 0.5, vertex_logits, -1e9)
+        vertex_dist = jnn.softmax(masked_v_logits, axis=-1)
+        vertex_idx = distrax.Categorical(probs=vertex_dist).sample(seed=vertex_key)
 
-        pair_seq, factor_seq, pair_dists, factor_dists, _ = self._build_uniform_action(
-            vertex_idx, pair_idx, vertex_dist, joint_dist
+        v_context = vertex_contexts[vertex_idx]
+        v_pair_mask = pair_valid_mask[vertex_idx]
+        pair_seq, factor_seq, pair_dists, factor_dists = self.rule_policy.sample(
+            v_context, v_pair_mask, rule_key
         )
         return (
             vertex_idx,
@@ -786,37 +617,35 @@ class MLPAgent(eqx.Module):
         pair_valid_mask,
         key,
     ):
-        summary_logits, value = self.encode(tokens, key=key)
-        joint_flat, joint_dist, vertex_dist = self._joint_dist_and_marginal(
-            summary_logits, vertex_avail_mask, pair_valid_mask
-        )
+        vertex_logits, vertex_contexts, value = self.encode(tokens, key=key)
 
-        pair_idx = pair_seq[0]
-        action_idx = pair_idx * self.num_vertices + vertex_idx
-        log_p_action = jnp.log(joint_flat[action_idx] + 1e-8)
-        joint_entropy = entropy(joint_flat)
+        masked_v_logits = jnp.where(vertex_avail_mask > 0.5, vertex_logits, -1e9)
+        vertex_dist = jnn.softmax(masked_v_logits, axis=-1)
+        log_p_vertex = jnp.log(vertex_dist[vertex_idx] + 1e-8)
+        vertex_ent = entropy(vertex_dist)
 
-        pair_seq, factor_seq, pair_dists, factor_dists, _ = self._build_uniform_action(
-            vertex_idx, pair_idx, vertex_dist, joint_dist
-        )
-        return (
-            log_p_action,
-            joint_entropy,
-            value,
-            vertex_dist,
+        v_context = vertex_contexts[vertex_idx]
+        v_pair_mask = pair_valid_mask[vertex_idx]
+        (
+            lp_pairs,
+            lp_factors,
+            ent_pairs,
+            ent_factors,
             pair_dists,
             factor_dists,
-        )
+        ) = self.rule_policy.evaluate(v_context, v_pair_mask, pair_seq, factor_seq)
+
+        total_log_p = log_p_vertex + jnp.sum(lp_pairs) + jnp.sum(lp_factors)
+        total_entropy = vertex_ent + jnp.sum(ent_pairs) + jnp.sum(ent_factors)
+        return total_log_p, total_entropy, value, vertex_dist, pair_dists, factor_dists
 
     def to_env_action(self, vertex_idx, pair_seq, factor_seq, factor_table):
         return StepAction(
             target_vertex=jnp.asarray(vertex_idx + 1, dtype=jnp.int32),
-            rule_specs=build_legacy_rule_specs(pair_seq),
+            rule_specs=self.rule_policy.to_env_specs(
+                pair_seq, factor_seq, factor_table
+            ),
         )
-
-    def value_for(self, tokens, key=None):
-        _, value = self.encode(tokens, key=key)
-        return value
 
 
 # ---------------------------------------------------------------------------
@@ -859,23 +688,26 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--dataset-size", type=int, default=-1)
     p.add_argument("--num-eval-samples", type=int, default=10)
 
-    # Agent variant
+    # Agent variant — the two flags are independent. Combinations:
+    #   (default)                : pointer + autoregressive RuleDecoder
+    #   --not-autoreg            : pointer + single-rule sp head
+    #   --no-ptr                 : masked MLP vertex head + autoregressive RuleDecoder
+    #   --no-ptr --not-autoreg   : masked MLP vertex head + single-rule sp head (the
+    #                              pre-pointer-net baseline)
     p.add_argument(
         "--no-ptr",
         action="store_true",
         help=(
-            "Drop the pointer net and use the original MLP policy head over the "
-            "unrolled (sp_type, vertex) action space. Implies non-autoregressive "
-            "(combining with --not-autoreg gives the same MLP variant)."
+            "Drop the pointer net for vertex selection and use a masked MLP head "
+            "over the `total_v` vertices instead. Independent of --not-autoreg."
         ),
     )
     p.add_argument(
         "--not-autoreg",
         action="store_true",
         help=(
-            "With the pointer net, use a single per-vertex sp head (one rule, "
-            "factor=-1) instead of the autoregressive RuleDecoder. Ignored when "
-            "--no-ptr is also set."
+            "Replace the autoregressive RuleDecoder with a single per-vertex sp "
+            "head (one rule per vertex, factor fixed to -1). Independent of --no-ptr."
         ),
     )
 
@@ -951,12 +783,12 @@ def _resolve_main_device(args):
     return gpus[0]
 
 
-def _build_factor_table(args, variant: str):
+def _build_factor_table(args, use_autoreg: bool):
     factors_py = tuple(_parse_int_list(args.factors))
     if not factors_py:
         raise ValueError("--factors must contain at least one factor value")
 
-    if variant == "autoreg":
+    if use_autoreg:
         if args.max_rules > MAX_RULES_PER_VERTEX:
             raise ValueError(
                 f"--max-rules ({args.max_rules}) exceeds env-side "
@@ -964,7 +796,7 @@ def _build_factor_table(args, variant: str):
             )
         max_rules = args.max_rules
     else:
-        # Simpler agents emit a single rule per vertex with factor=-1 (factor_table unused).
+        # Single-rule policy emits exactly one rule with factor=-1; the factor table is unused.
         factors_py = (-1,)
         max_rules = 1
 
@@ -972,56 +804,106 @@ def _build_factor_table(args, variant: str):
     return factor_table, factors_py, factor_table.shape[0], max_rules
 
 
-def _select_variant(args) -> str:
-    if args.no_ptr:
-        return "mlp"
-    if args.not_autoreg:
-        return "pointer"
-    return "autoreg"
+def _select_variant(args) -> tuple[bool, bool]:
+    """Return `(use_pointer, use_autoreg)` — independent flags."""
+    return (not args.no_ptr, not args.not_autoreg)
 
 
-def _build_agent(variant: str, args, total_v: int, num_rewards: int, num_factors: int, max_rules: int, key):
-    common_kwargs = dict(
-        vocab_size=args.vocab_size,
-        embd_dim=args.embd_dim,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        hidden_dim=args.hidden_dim,
+def _variant_label(use_pointer: bool, use_autoreg: bool) -> str:
+    v = "pointer" if use_pointer else "mlp-vertex"
+    r = "autoreg" if use_autoreg else "single-rule"
+    return f"{v}+{r}"
+
+
+def _build_agent(
+    use_pointer: bool,
+    use_autoreg: bool,
+    args,
+    total_v: int,
+    num_rewards: int,
+    num_factors: int,
+    max_rules: int,
+    key,
+):
+    encoder_keys = jrand.split(key, 5)
+    embedding = eqx.nn.Embedding(args.vocab_size, args.embd_dim, key=encoder_keys[0])
+    pos_enc = PositionalEncoder(args.embd_dim, MAX_TOKENS)
+    encoder = Encoder(
+        args.num_layers, args.num_heads, args.embd_dim, args.hidden_dim,
+        key=encoder_keys[1],
+    )
+    if use_pointer:
+        vertex_policy = PointerVertexPolicy(
+            num_vertices=total_v,
+            embd_dim=args.embd_dim,
+            num_heads=args.num_heads,
+            key=encoder_keys[2],
+        )
+    else:
+        vertex_policy = MLPVertexPolicy(
+            num_vertices=total_v,
+            embd_dim=args.embd_dim,
+            hidden_dims=_parse_int_list(args.policy_dims),
+            key=encoder_keys[2],
+        )
+    if use_autoreg:
+        rule_policy = AutoregRulePolicy(
+            embd_dim=args.embd_dim,
+            max_rules=max_rules,
+            num_pair_choices=NUM_PAIR_CHOICES,
+            num_factors=num_factors,
+            key=encoder_keys[3],
+        )
+    else:
+        rule_policy = SingleRulePolicy(
+            embd_dim=args.embd_dim,
+            max_rules=max_rules,
+            num_pair_choices=NUM_PAIR_CHOICES,
+            num_factors=num_factors,
+            sp_dims=_parse_int_list(args.policy_dims),
+            key=encoder_keys[3],
+        )
+    value_head = MLP(
+        args.embd_dim, num_rewards, _parse_int_list(args.value_dims),
+        key=encoder_keys[4],
+    )
+    return Agent(
+        embedding=embedding,
+        pos_enc=pos_enc,
+        encoder=encoder,
+        vertex_policy=vertex_policy,
+        rule_policy=rule_policy,
+        value_head=value_head,
         num_vertices=total_v,
         num_rewards=num_rewards,
         max_rules=max_rules,
         num_pair_choices=NUM_PAIR_CHOICES,
         num_factors=num_factors,
-        value_dims=_parse_int_list(args.value_dims),
-        seq_len=MAX_TOKENS,
-        key=key,
+        embd_dim=args.embd_dim,
     )
-    if variant == "mlp":
-        return MLPAgent(policy_dims=_parse_int_list(args.policy_dims), **common_kwargs)
-    if variant == "pointer":
-        return PointerAgent(sp_dims=_parse_int_list(args.policy_dims), **common_kwargs)
-    return AutoregPointerAgent(**common_kwargs)
 
 
-def _scale_output_heads(agent, scale: float, variant: str):
+def _scale_output_heads(agent, scale: float, use_pointer: bool, use_autoreg: bool):
     """Scale policy-head weights so the initial action distribution is near-uniform."""
-    if variant == "mlp":
-        return scale_module_weight(
-            agent, lambda a: a.policy_head.layers[-2].weight, scale
+    if use_pointer:
+        agent = scale_module_weight(
+            agent, lambda a: a.vertex_policy.pointer_proj.weight, scale
         )
-
-    agent = scale_module_weight(agent, lambda a: a.pointer_proj.weight, scale)
-    if variant == "pointer":
-        return scale_module_weight(
-            agent, lambda a: a.sp_head.layers[-2].weight, scale
+    else:
+        agent = scale_module_weight(
+            agent, lambda a: a.vertex_policy.head.layers[-2].weight, scale
         )
-    # autoreg: pointer + pair head + factor head
-    agent = scale_module_weight(
-        agent, lambda a: a.rule_decoder.pair_head.weight, scale
-    )
-    agent = scale_module_weight(
-        agent, lambda a: a.rule_decoder.factor_head.weight, scale
-    )
+    if use_autoreg:
+        agent = scale_module_weight(
+            agent, lambda a: a.rule_policy.decoder.pair_head.weight, scale
+        )
+        agent = scale_module_weight(
+            agent, lambda a: a.rule_policy.decoder.factor_head.weight, scale
+        )
+    else:
+        agent = scale_module_weight(
+            agent, lambda a: a.rule_policy.sp_head.layers[-2].weight, scale
+        )
     return agent
 
 
@@ -1049,7 +931,8 @@ def _action_to_pylist(vertex_seq, pair_seq, factor_seq, max_rules, factor_table_
 
 def main():
     args = make_argparser().parse_args()
-    variant = _select_variant(args)
+    use_pointer, use_autoreg = _select_variant(args)
+    variant_label = _variant_label(use_pointer, use_autoreg)
 
     main_device = _resolve_main_device(args)
     if args.no_jit:
@@ -1102,20 +985,22 @@ def main():
     )
 
     # Hyperparameters / agent.
-    factor_table, factors_py, num_factors, max_rules = _build_factor_table(args, variant)
+    factor_table, factors_py, num_factors, max_rules = _build_factor_table(args, use_autoreg)
     factor_table_np = np.array(factors_py, dtype=np.int32)
     num_envs = _resolve_num_envs(args.num_envs, args.example)
     num_rewards = len(args.rewards)
 
     print(
-        f"variant={variant}, num_envs={num_envs}, max_rules={max_rules}, "
+        f"variant={variant_label}, num_envs={num_envs}, max_rules={max_rules}, "
         f"factors={factors_py}, rollout_length={num_valid}, minibatches={args.minibatches}"
     )
 
     agent_key, init_key, key = jrand.split(key, 3)
-    agent = _build_agent(variant, args, total_v, num_rewards, num_factors, max_rules, agent_key)
+    agent = _build_agent(
+        use_pointer, use_autoreg, args, total_v, num_rewards, num_factors, max_rules, agent_key
+    )
     agent = init_linear_weights(agent, init_key)
-    agent = _scale_output_heads(agent, args.head_init_scale, variant)
+    agent = _scale_output_heads(agent, args.head_init_scale, use_pointer, use_autoreg)
     if args.exec_on_gpu:
         agent = jax.tree_util.tree_map(
             lambda x: jax.device_put(x, main_device) if eqx.is_array(x) else x,
