@@ -13,12 +13,22 @@ import jax.random as jrand
 import numpy as np
 import optax
 import wandb
-from graphax import examples
 from tqdm import tqdm
 
-from alphagrad.transformer import MLP, Encoder, PositionalEncoder
-from alphagrad.utils import entropy, explained_variance, symexp, symlog
+from alphagrad.approx.common import (
+    build_legacy_sp_valid_mask,
+    data_gen,
+    get_advantages,
+    get_args,
+    get_fn,
+    get_num_clipping_triggers,
+    init_linear_weights,
+    reward_normalization_fn,
+    shuffle_and_batch,
+)
 from alphagrad.approx.env import MAX_TOKENS, VertexEliminationEnv
+from alphagrad.transformer import MLP, Encoder, PositionalEncoder
+from alphagrad.utils import entropy, explained_variance
 
 
 class Trajectory(NamedTuple):
@@ -38,110 +48,6 @@ class TrainBatch(NamedTuple):
     old_prob_dist: jax.Array
     estim_returns: jax.Array
     norm_adv: jax.Array
-
-
-def get_args(fn_str, key): 
-    basic_args = {
-        "Simple": (5.0, 7.0),
-        "Lighthouse": (0.02,) * 4,
-        "Helmholtz": (jnp.array([0.05, 0.15, 0.25, 0.35]),),
-        "RobotArm_6DOF": (0.02,) * 6,
-        "RoeFlux_1d": (0.01, 0.02, 0.02, 0.01, 0.03, 0.03),
-        "RoeFlux_3d": (
-            jnp.array([0.1]),
-            jnp.array([0.1, 0.2, 0.3]),
-            jnp.array([0.5]),
-            jnp.array([0.2]),
-            jnp.array([0.2, 0.2, 0.4]),
-            jnp.array([0.6]),
-        ),
-        "BlackScholes_Jacobian": (1.0,) * 5,
-    }
-    shapes = []
-    if fn_str.endswith("NeuralNetwork") or fn_str.endswith("Perceptron"):
-        shapes = [(4,), (4,), (8, 4), (8,), (4, 8), (4,)]
-    elif fn_str.startswith("Encoder"):
-        shapes = [(4, 4), (2, 4), (4, 4) * 6, (4, 4), (4,), (2, 4), (2, 1)]
-
-    if fn_str.startswith("Vmapped"):
-        shapes[0] = (16,) + shapes[0]
-        shapes[1] = (16,) + shapes[1]
-    elif fn_str.endswith("Decoder"):
-        shapes = shapes[:8] + [(4, 4) * 3] + shapes[8:]
-
-    args = []
-    for shape in shapes:
-        key, k = jrand.split(key)
-        args.append(jrand.normal(k, shape))
-
-    if args == []:
-        args = basic_args[fn_str]
-
-    return args
-
-
-def get_fn(fn_str):
-    if fn_str.endswith("NeuralNetwork"):
-
-        def NeuralNetwork(x, y, W1, b1, W2, b2):
-            y1 = W1 @ x
-            z1 = y1 + b1
-            a1 = jnp.tanh(z1)
-            y2 = W2 @ a1
-            z2 = y2 + b2
-            return 0.5 * (jnp.tanh(z2) - y) ** 2
-
-        fn = NeuralNetwork
-    elif fn_str.endswith("Perceptron"):
-        fn = examples.Perceptron
-    else:
-        fn = getattr(examples, fn_str)
-        if fn is None:
-            raise ValueError
-
-    if fn_str.startswith("Vmapped"):
-        fn = jax.vmap(fn, in_axes=(0, 0) + (None,) * 4)
-
-    return fn
-
-
-def data_gen(fn_str):
-    fn = None
-    if fn_str == "Helmholtz":
-
-        @jax.jit
-        def fn(keys):
-            x = jrand.uniform(keys[0], (4,))
-            return (x / jnp.sum(x) * 0.9,)
-
-    if fn_str.endswith("NeuralNetwork"):
-
-        @jax.jit
-        def fn(keys):
-            if fn_str.startswith("Vmapped"):
-                shape = (16,)
-            else:
-                shape = ()
-            r1 = jrand.uniform(keys[0], shape)
-            th1 = jrand.uniform(keys[1], shape, minval=-jnp.pi, maxval=jnp.pi)
-            r2 = jrand.uniform(keys[2], shape)
-            th2 = jrand.uniform(keys[3], shape, minval=-jnp.pi, maxval=jnp.pi)
-
-            x = jnp.stack([r1, th1 / jnp.pi, r2, th2 / jnp.pi], axis=-1)
-
-            y = jnp.stack(
-                [
-                    r1 * jnp.cos(th1),
-                    r1 * jnp.sin(th1),
-                    r2 * jnp.cos(th2),
-                    r2 * jnp.sin(th2),
-                ],
-                axis=-1,
-            )
-
-            return x, y
-
-    return fn
 
 
 class TransformerPPOAgent(eqx.Module):
@@ -192,37 +98,6 @@ class TransformerPPOAgent(eqx.Module):
             return batched_call(tokens, key, inference)
 
 
-def init_linear_weights(model, key):
-    is_linear = lambda x: isinstance(x, eqx.nn.Linear)
-    get_weights = lambda m: [x.weight for x in jax.tree_util.tree_leaves(m, is_leaf=is_linear) if is_linear(x)]
-    get_biases = lambda m: [x.bias for x in jax.tree_util.tree_leaves(m, is_leaf=is_linear) if is_linear(x) and x.bias is not None]
-    
-    weights = get_weights(model)
-    biases = get_biases(model)
-    init_fn = jnn.initializers.orthogonal(jnp.sqrt(2))
-    
-    new_weights = [init_fn(subkey, weight.shape) for weight, subkey in zip(weights, jax.random.split(key, len(weights)))]
-    new_biases = [jnp.zeros_like(bias) for bias in biases]
-    
-    new_model = eqx.tree_at(get_weights, model, new_weights)
-    new_model = eqx.tree_at(get_biases, new_model, new_biases)
-    return new_model
-
-
-def reward_normalization_fn(reward):
-    return symlog(reward)
-
-
-def inverse_reward_normalization_fn(reward):
-    return symexp(reward)
-
-
-def get_num_clipping_triggers(ratio, eps):
-    _ratio = jnp.where(ratio <= 1.0 + eps, ratio, 0.0)
-    _ratio = jnp.where(ratio >= 1.0 - eps, 1.0, 0.0)
-    return jnp.sum(_ratio)
-
-
 @partial(jax.vmap, in_axes=(None, 0, 0, 0))
 def get_log_probs_and_value(agent, tokens, action, key):
     logits, value = agent(tokens, key=key)
@@ -230,49 +105,6 @@ def get_log_probs_and_value(agent, tokens, action, key):
     prob_dist = jnn.softmax(logits, axis=-1)
     log_prob = jnp.log(prob_dist[action_idx] + 1e-8)
     return log_prob, prob_dist, value, entropy(prob_dist)
-
-
-@jax.jit
-@partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, None))
-def get_advantages(rewards, dones, values, next_values, discounts, gae_lambda): 
-    def loop_fn(carry, traj):
-        episodic_return, lastgaelam = carry
-        reward, done, value, next_value, discount = traj
-
-        mask = 1.0 - done
-        episodic_return = reward + discount * episodic_return * mask
-
-        value_raw = inverse_reward_normalization_fn(value)
-        next_value_raw = inverse_reward_normalization_fn(next_value)
-
-        delta = reward + next_value_raw * discount * mask - value_raw
-        advantage = delta + discount * gae_lambda * lastgaelam * mask
-
-        estim_return = advantage + value_raw
-        return (episodic_return, advantage), (episodic_return, estim_return, advantage)
-    
-    inputs = (rewards, dones, values, next_values, discounts)
-    rev_inputs = jax.tree.map(lambda x: x[::-1], inputs)
-    init_val = jnp.zeros_like(rewards[0])
-    _, output = lax.scan(loop_fn, (init_val, init_val), rev_inputs)
-    return jax.tree.map(lambda x: x[::-1], output)
-
-
-@partial(jax.jit, static_argnums=1)
-def shuffle_and_batch(tree, minibatches, key):
-    leaves, _ = jax.tree_util.tree_flatten(tree)
-    num_envs, rollout_length = leaves[0].shape[:2]
-    size = num_envs * rollout_length // minibatches
-    valid_samples = size * minibatches
-
-    indices = jrand.permutation(key, jnp.arange(num_envs * rollout_length))
-    indices = indices[:valid_samples].reshape(minibatches, size)
-
-    def _process(x):
-        x = x.reshape(-1, *x.shape[2:])
-        return x[indices]
-
-    return jax.tree_util.tree_map(_process, tree)
 
 
 def main():
@@ -316,27 +148,13 @@ def main():
         f"Valid set: {env.valid_vertices}"
     )
 
-    sp_valid_mask_np = np.zeros((3, total_v), dtype=np.float32)
-    for i, eqn in enumerate(closed_jaxpr.jaxpr.eqns):
-        sp_valid_mask_np[0, i] = 1.0
-
-        if args.disable_sparsification:
-            continue
-
-        if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
-            continue
-
-        out_ndim = len(eqn.outvars[0].aval.shape)
-        invars = [v for v in eqn.invars if hasattr(v, "aval")]
-
-        if invars:
-            max_in_ndim = max(len(v.aval.shape) for v in invars)
-            if out_ndim >= 1 and max_in_ndim >= 1:
-                sp_valid_mask_np[1, i] = 1.0
-            if out_ndim >= 1 and max_in_ndim >= 2:
-                sp_valid_mask_np[2, i] = 1.0
-
-    sp_valid_mask = jnp.array(sp_valid_mask_np)
+    sp_valid_mask = build_legacy_sp_valid_mask(
+        closed_jaxpr.jaxpr,
+        total_v,
+        num_sp_types=3,
+        use_min_in_ndim=False,
+        disable_sparsification=args.disable_sparsification,
+    )
 
     ENTROPY_WEIGHT = 0.01
     VALUE_WEIGHT = 0.5
