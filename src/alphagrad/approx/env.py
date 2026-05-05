@@ -374,7 +374,7 @@ class VertexEliminationEnv:
         object.__setattr__(self, "num_envs", num_envs)
 
         if valid_vertices is None:
-            _, _, _, _, vo_vertices = _build_graph(
+            _, _, _, vo_vertices = _build_graph(
                 config.jaxpr, args, consts, config.argnums
             )
             valid = []

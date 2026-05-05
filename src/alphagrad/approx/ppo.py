@@ -139,28 +139,49 @@ def _stop_only_logits(num_pair_choices: int) -> jax.Array:
     ).astype(jnp.float32)
 
 
+def _pad_specs_to_env_slot(specs: jax.Array) -> jax.Array:
+    """Pad/truncate per-vertex rule specs to the env's `(MAX_RULES_PER_VERTEX, 3)` slot shape.
+
+    The agent's policy may emit fewer rules than the env can store (`--max-rules` <
+    `MAX_RULES_PER_VERTEX`); unused trailing slots are filled with `(-1, -1, 0)` so
+    the env's `_callback` correctly treats them as empty.
+    """
+    n = specs.shape[0]
+    if n == MAX_RULES_PER_VERTEX:
+        return specs
+    if n > MAX_RULES_PER_VERTEX:
+        return specs[:MAX_RULES_PER_VERTEX]
+    pad = jnp.tile(
+        jnp.array([-1, -1, 0], dtype=jnp.int32), (MAX_RULES_PER_VERTEX - n, 1)
+    )
+    return jnp.concatenate([specs, pad], axis=0)
+
+
 def build_rule_specs(pair_seq, factor_seq, factor_table) -> jax.Array:
-    """Convert per-slot `(pair_idx, factor_idx)` -> `(MAX_RULES, 3)` rule specs.
+    """Convert per-slot `(pair_idx, factor_idx)` -> `(MAX_RULES_PER_VERTEX, 3)` rule specs.
 
     `pair_idx == PAIR_STOP` terminates the sequence; subsequent slots are
-    written as unused (`base_idx1 = -1, factor = 0`).
+    written as unused (`base_idx1 = -1, factor = 0`). The output is always
+    padded out to `MAX_RULES_PER_VERTEX` so the env's fixed-shape slot
+    accepts it directly.
     """
-    base = _PAIR_TO_BASE[pair_seq]  # (MAX_RULES, 2)
-    factor_vals = factor_table[factor_seq]  # (MAX_RULES,)
+    base = _PAIR_TO_BASE[pair_seq]
+    factor_vals = factor_table[factor_seq]
 
     is_stop = pair_seq == PAIR_STOP
-    has_stopped = jnp.cumsum(is_stop.astype(jnp.int32)) > 0  # (MAX_RULES,) bool
+    has_stopped = jnp.cumsum(is_stop.astype(jnp.int32)) > 0
 
     base_final = jnp.where(has_stopped[:, None], -1, base)
     factor_final = jnp.where(has_stopped, 0, factor_vals)
-    return jnp.concatenate([base_final, factor_final[:, None]], axis=-1).astype(
+    specs = jnp.concatenate([base_final, factor_final[:, None]], axis=-1).astype(
         jnp.int32
     )
+    return _pad_specs_to_env_slot(specs)
 
 
 def build_legacy_rule_specs(pair_seq) -> jax.Array:
     """Rule specs for the single-rule (factor=-1) variants. Ignores the factor table."""
-    base = _PAIR_TO_BASE[pair_seq]  # (MAX_RULES, 2)
+    base = _PAIR_TO_BASE[pair_seq]
     factor = jnp.full(pair_seq.shape, -1, dtype=jnp.int32)
 
     is_stop = pair_seq == PAIR_STOP
@@ -168,9 +189,10 @@ def build_legacy_rule_specs(pair_seq) -> jax.Array:
 
     base_final = jnp.where(has_stopped[:, None], -1, base)
     factor_final = jnp.where(has_stopped, 0, factor)
-    return jnp.concatenate([base_final, factor_final[:, None]], axis=-1).astype(
+    specs = jnp.concatenate([base_final, factor_final[:, None]], axis=-1).astype(
         jnp.int32
     )
+    return _pad_specs_to_env_slot(specs)
 
 
 def old_log_prob_for_action(
