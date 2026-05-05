@@ -751,6 +751,10 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--top-n", type=int, default=10)
     p.add_argument("--capture-perfect-grads", action="store_true",
                    help="Allow the top-N accuracy heap to keep trajectories with cosine similarity == 1.0.")
+    p.add_argument("--stats-out", type=str, default=None,
+                   help="If set, dump per-component reward statistics (mean/std/min/max/etc.) "
+                        "across all (episode, env) samples to this JSON path on completion. "
+                        "Used by dispatch_nns.py to compute --lambda-cmp/--lambda-mem for the next phase.")
 
     return p
 
@@ -988,7 +992,25 @@ def main():
     factor_table, factors_py, num_factors, max_rules = _build_factor_table(args, use_autoreg)
     factor_table_np = np.array(factors_py, dtype=np.int32)
     num_envs = _resolve_num_envs(args.num_envs, args.example)
-    num_rewards = len(args.rewards)
+
+    # raw_rewards from env.py is always [-cmp, error/acc, -mem] (size 3).
+    # Filter / order args.rewards by this natural order so the result is
+    # independent of the order the user passes them on the CLI.
+    REWARD_NATURAL_ORDER = ("cmp", "acc", "mem")
+    REWARD_INDEX = {"cmp": 0, "acc": 1, "mem": 2}
+    sorted_rewards = [r for r in REWARD_NATURAL_ORDER if r in args.rewards]
+    reward_indices = tuple(REWARD_INDEX[r] for r in sorted_rewards)
+
+    def reward_weights():
+        # acc keeps a fixed weight of 1.0; cmp/mem are scaled by lambdas.
+        return [
+            args.lambda_cmp if r == "cmp"
+            else args.lambda_mem if r == "mem"
+            else 1.0
+            for r in sorted_rewards
+        ]
+
+    num_rewards = len(sorted_rewards)
 
     print(
         f"variant={variant_label}, num_envs={num_envs}, max_rules={max_rules}, "
@@ -1052,9 +1074,8 @@ def main():
             env_out = env_obj.step(state, env_action)
             next_state = env_out.state
             raw_rewards = env_out.reward
-            rewards = jnp.array(
-                [raw_rewards[0], raw_rewards[1], raw_rewards[2]]
-            )[:num_rewards]
+            # Pick the components named in args.rewards (order-independent, by name).
+            rewards = jnp.stack([raw_rewards[i] for i in reward_indices])
             done = env_out.terminated.astype(jnp.float32)
 
             next_value = agent.value_for(next_state.tokens, key=next_net_key)
@@ -1190,9 +1211,7 @@ def main():
         norm_adv_components = jax.vmap(normalize, in_axes=-1, out_axes=-1)(
             advantages.reshape(-1, advantages.shape[-1])
         ).reshape(advantages.shape)
-        adv_weights = jnp.array(
-            [args.lambda_cmp, 1.0, args.lambda_mem]
-        )[:num_rewards]
+        adv_weights = jnp.array(reward_weights())
         norm_adv = jnp.sum(norm_adv_components * adv_weights, axis=-1)
 
         full_batch = TrainBatch(
@@ -1261,6 +1280,7 @@ def main():
         "top_n_cmp": [],
         "top_n_mem": [],
         "top_n_acc": [],
+        "reward_samples": [],  # list of (num_envs, 3) arrays for --stats-out
     }
 
     def host_log(ep, all_rets, actions_pack, mean_r, mets):
@@ -1270,6 +1290,9 @@ def main():
         pair_arr = np.array(actions_pack[1])
         factor_arr = np.array(actions_pack[2])
         mean_r = np.atleast_1d(np.array(mean_r))
+
+        if args.stats_out is not None:
+            host_state["reward_samples"].append(all_rets[:, :3].astype(np.float64).copy())
 
         host_state["samplecounts"] += num_envs * num_valid
         (
@@ -1284,13 +1307,16 @@ def main():
             _clipping_trigger_ratio,
         ) = [float(m) for m in mets]
 
-        weights = np.array([args.lambda_cmp, 1.0, args.lambda_mem])[:num_rewards]
+        # all_rets is the full raw_rewards array (size 3): 0=-cmp, 1=acc, 2=-mem.
+        # Pick the components in args.rewards (sorted natural order).
+        weights = np.array(reward_weights())
+        sel = np.array(reward_indices)
         for i in range(all_rets.shape[0]):
             rets = all_rets[i]
             decoded = _action_to_pylist(
                 v_idx_arr[i], pair_arr[i], factor_arr[i], max_rules, factor_table_np
             )
-            total_ret = float(np.sum(rets[:num_rewards] * weights))
+            total_ret = float(np.sum(rets[sel] * weights))
             heaps_and_keys = [
                 ("top_n_total", total_ret),
                 ("top_n_cmp", float(rets[0])),
@@ -1313,8 +1339,8 @@ def main():
                 else:
                     heapq.heappushpop(heap, payload)
 
-        best_idx = int(np.argmax(np.sum(all_rets[:, :num_rewards] * weights, axis=-1)))
-        best_ret = float(np.sum(all_rets[best_idx, :num_rewards] * weights))
+        best_idx = int(np.argmax(np.sum(all_rets[:, sel] * weights, axis=-1)))
+        best_ret = float(np.sum(all_rets[best_idx, sel] * weights))
         if best_ret > host_state["best_global_return"]:
             host_state["best_global_return"] = best_ret
             host_state["best_global_act_seq"] = _action_to_pylist(
@@ -1357,13 +1383,10 @@ def main():
         agent, opt_state, _, metrics, total_rewards_full, actions_pack = train_episode(
             agent, opt_state, env_states, env_episode, ep_key
         )
-        host_log(
-            ep,
-            total_rewards_full,
-            actions_pack,
-            jnp.mean(total_rewards_full[:, :num_rewards], axis=0),
-            metrics,
+        mean_active = jnp.mean(
+            total_rewards_full[:, jnp.array(reward_indices)], axis=0
         )
+        host_log(ep, total_rewards_full, actions_pack, mean_active, metrics)
 
     pbar.close()
 
@@ -1373,9 +1396,10 @@ def main():
         table = wandb.Table(
             columns=["rank", "episode", "total_reward", "cmp", "acc", "mem", "sequence"]
         )
-        weights = np.array([args.lambda_cmp, 1.0, args.lambda_mem])[:num_rewards]
+        weights = np.array(reward_weights())
+        sel = np.array(reward_indices)
         for rank, (val, ep, rets, seq) in enumerate(sorted_items, 1):
-            total_ret = np.sum(np.array(rets)[:num_rewards] * weights)
+            total_ret = float(np.sum(np.array(rets)[sel] * weights))
             cmp_val = -rets[0]
             acc_val = rets[1]
             mem_val = -rets[2]
@@ -1391,6 +1415,43 @@ def main():
     print_top_n("CMP (Lowest FLOPs)", host_state["top_n_cmp"])
     print_top_n("Memory (Lowest Bytes)", host_state["top_n_mem"])
     print_top_n("Accuracy (Highest Cosine Similarity)", host_state["top_n_acc"])
+
+    if args.stats_out is not None and host_state["reward_samples"]:
+        import json
+        samples = np.concatenate(host_state["reward_samples"], axis=0)
+        # raw rewards: column 0 = -cmp, column 1 = acc/error, column 2 = -mem.
+        # Report magnitudes for cmp/mem so users reason about positive cost values.
+        mags = np.stack(
+            [np.abs(samples[:, 0]), samples[:, 1], np.abs(samples[:, 2])], axis=-1
+        )
+        names = ["cmp", "acc", "mem"]
+        rewards_stats = {}
+        for i, name in enumerate(names):
+            col = mags[:, i]
+            rewards_stats[name] = {
+                "mean": float(col.mean()),
+                "std": float(col.std()),
+                "min": float(col.min()),
+                "max": float(col.max()),
+                "median": float(np.median(col)),
+                "p10": float(np.percentile(col, 10)),
+                "p90": float(np.percentile(col, 90)),
+            }
+        out = {
+            "n_episodes": len(host_state["reward_samples"]),
+            "n_envs": int(samples.shape[0] // len(host_state["reward_samples"])),
+            "n_samples": int(samples.shape[0]),
+            "example": args.example,
+            "rewards_active": sorted_rewards,
+            "lambda_cmp_used": args.lambda_cmp,
+            "lambda_mem_used": args.lambda_mem,
+            "rewards": rewards_stats,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(args.stats_out)) or ".", exist_ok=True)
+        with open(args.stats_out, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"Wrote reward stats to {args.stats_out}")
+
     wandb.log({"Elimination order": elim_order_table})
 
 

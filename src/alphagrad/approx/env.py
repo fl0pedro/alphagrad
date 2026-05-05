@@ -70,11 +70,11 @@ def _get_partials(order, sparsity_specs, stop):
 # Lookup row used to convert a legacy scalar sp_type ∈ {0..4} into a single-rule (MAX_RULES, 3) spec.
 _LEGACY_SP_TO_RULE_ROW = jnp.array(
     [
-        [-1, -1, 0],   # sp 0: unused
-        [0, 0, -1],    # sp 1 -> (0,0)
-        [0, 1, -1],    # sp 2 -> (0,1)
-        [1, 0, -1],    # sp 3 -> (1,0)
-        [1, 1, -1],    # sp 4 -> (1,1)
+        [-1, -1, 0],  # sp 0: unused
+        [0, 0, -1],  # sp 1 -> (0,0)
+        [0, 1, -1],  # sp 2 -> (0,1)
+        [1, 0, -1],  # sp 3 -> (1,0)
+        [1, 1, -1],  # sp 4 -> (1,1)
     ],
     dtype=jnp.int32,
 )
@@ -83,7 +83,9 @@ _LEGACY_SP_TO_RULE_ROW = jnp.array(
 def _legacy_sp_to_specs(sp_type: Array) -> Array:
     """Convert a scalar legacy sp_type ∈ {0..4} into (MAX_RULES_PER_VERTEX, 3) rule specs."""
     first = _LEGACY_SP_TO_RULE_ROW[sp_type]  # (3,)
-    pad = jnp.tile(jnp.array([-1, -1, 0], dtype=jnp.int32), (MAX_RULES_PER_VERTEX - 1, 1))
+    pad = jnp.tile(
+        jnp.array([-1, -1, 0], dtype=jnp.int32), (MAX_RULES_PER_VERTEX - 1, 1)
+    )
     return jnp.concatenate([first[None, :], pad], axis=0)
 
 
@@ -374,7 +376,7 @@ class VertexEliminationEnv:
         object.__setattr__(self, "num_envs", num_envs)
 
         if valid_vertices is None:
-            _, _, _, _, vo_vertices = _build_graph(
+            _, _, _, vo_vertices = _build_graph(
                 config.jaxpr, args, consts, config.argnums
             )
             valid = []
@@ -453,7 +455,9 @@ class VertexEliminationEnv:
             -1,
             dtype=jnp.int32,
         )
-        initial_specs = initial_specs.at[..., 2].set(0)  # factor=0 default for unused rows
+        initial_specs = initial_specs.at[..., 2].set(
+            0
+        )  # factor=0 default for unused rows
 
         tokens, _, _, _ = io_callback(
             self.tokenize(init=True),
