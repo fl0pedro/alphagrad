@@ -14,12 +14,66 @@ from jax import Array, jit
 from jax.experimental import io_callback
 from jax.tree_util import register_pytree_node_class
 
+import numpy as np
+
+from alphagrad.approx.common.relations import compute_eqn_ids_from_tokens
 from graphax.core import _build_graph, extract_jaxpr, jacve, vertex_elimination_jaxpr
+from graphax.jaxpr import get_vocab as _graphax_get_vocab
 from jax_memory_monitor import ResourceMonitor
+
+# Cache the graphax vocabulary used by `compute_eqn_ids_from_tokens` — the
+# tokenizer always uses the same digit_base, so the vocab is constant and
+# rebuilding it on every callback is pure overhead.
+_TOKEN_VOCAB, _, _ = _graphax_get_vocab()
 
 MAX_TOKENS = 4096
 MAX_RULES_PER_VERTEX = 4
 NUM_AXIS_PAIRS = 4
+
+# Canonical 8-component reward vector layout. The env reports raw reward values
+# in the convention "higher is better": every cost component is stored *negated*
+# (so r = -cost), `cosine_sim` is in [0, 1] (1 = identical Jacobian), and
+# `frob_residual` is stored as `-||J_e - J_a||_F / ||J_e||_F` so larger residuals
+# correspond to lower reward. Downstream code can therefore treat all 8 entries
+# uniformly as "reward to maximize".
+#
+# Compute family (indices 0..5):
+#   0 muls_adds_fmas   — graphax `adds + muls + fmas` op count from VE.
+#   1 flops            — XLA cost-analysis FLOPs of the compiled approx fn.
+#   2 latency_ns       — wall-clock latency in ns (only populated when
+#                        `EnvConfig.measure_latency` is True; else 0).
+#   3 max_io_sum       — graphax `mem` accumulator = sum over Jacobian
+#                        accumulations of `max(in_size, out_size, edge_out_size)
+#                        * itemsize`. (This is the "sum of max-input/max-output
+#                        sizes per Jacobian accumulation" metric in the spec.)
+#   4 bytes_accessed   — XLA cost-analysis bytes-accessed of the approx fn.
+#   5 peak_memory      — peak HBM bytes during a single execution of the approx
+#                        fn, captured via `ResourceMonitor`.
+# Quality family (indices 6..7):
+#   6 cosine_sim       — cosine similarity between flattened approximated and
+#                        exact Jacobians, averaged over the calibration samples.
+#   7 frob_residual    — relative Frobenius residual ||J_e - J_a||_F / ||J_e||_F.
+NUM_REWARDS = 8
+REWARD_NAMES: tuple[str, ...] = (
+    "muls_adds_fmas",
+    "flops",
+    "latency_ns",
+    "max_io_sum",
+    "bytes_accessed",
+    "peak_memory",
+    "cosine_sim",
+    "frob_residual",
+)
+REWARD_INDEX = {name: i for i, name in enumerate(REWARD_NAMES)}
+COMPUTE_REWARD_INDICES = tuple(range(0, 6))  # cost components
+QUALITY_REWARD_INDICES = (6, 7)             # cosine, frobenius
+
+# Sentinel reward returned when a sparsity_map matches an entry in the in-file
+# blacklist (used during exploration to penalise pathological configurations).
+_SENTINEL_BAD_REWARD = jnp.array(
+    [-1e10, -1e10, -1e10, -1e10, -1e10, -1e10, -1.0, -1e10],
+    dtype=jnp.float32,
+)
 
 # Axis pair index -> (base_idx1, base_idx2). base_idx1 picks output axis 0/1; base_idx2 picks input axis 0/1.
 axis_pair_idx_to_base = {0: (0, 0), 1: (0, 1), 2: (1, 0), 3: (1, 1)}
@@ -29,9 +83,10 @@ class EnvState(NamedTuple):
     order: Array
     sparsity_specs: Array  # (N, MAX_RULES_PER_VERTEX, 3) int32; row [base_idx1, base_idx2, factor]; base_idx1 < 0 means slot unused
     tokens: Array
+    eqn_ids: Array  # (MAX_TOKENS,) int32; per-token equation ID, -1 for non-eqn tokens
     step_count: Array
     max_steps: int
-    reward: Array
+    reward: Array  # (NUM_REWARDS,) float32; see REWARD_NAMES for layout
     terminated: bool
 
 
@@ -51,11 +106,20 @@ class EnvConfig(NamedTuple):
     argnums: tuple[int, ...]
     has_aux: bool
     sparse: bool
+    # cmp_type / mem_type used to gate which compute/memory metric was measured.
+    # The env now reports the full 8-component reward vector every step, so they
+    # are kept only as *primary-metric hints* for legacy CLI/host-side reporting.
+    # New callers should ignore them and pick the desired component from the
+    # reward vector explicitly via REWARD_INDEX.
     cmp_type: Literal["graphax", "flops", "latency"]
     mem_type: Literal["graphax", "bytes_accessed", "peak_memory"]
     target_fun: Callable | None = None
     data_gen: Callable | None = None
     exec_on_gpu: bool = False
+    # Latency requires running the compiled fn 10x per step, which roughly 10xs
+    # rollout-to-reward time. Off by default; flip on when the latency component
+    # of the reward is actually being weighted.
+    measure_latency: bool = False
 
 
 def _get_partials(order, sparsity_specs, stop):
@@ -70,11 +134,11 @@ def _get_partials(order, sparsity_specs, stop):
 # Lookup row used to convert a legacy scalar sp_type ∈ {0..4} into a single-rule (MAX_RULES, 3) spec.
 _LEGACY_SP_TO_RULE_ROW = jnp.array(
     [
-        [-1, -1, 0],  # sp 0: unused
-        [0, 0, -1],  # sp 1 -> (0,0)
-        [0, 1, -1],  # sp 2 -> (0,1)
-        [1, 0, -1],  # sp 3 -> (1,0)
-        [1, 1, -1],  # sp 4 -> (1,1)
+        [-1, -1, 0],   # sp 0: unused
+        [0, 0, -1],    # sp 1 -> (0,0)
+        [0, 1, -1],    # sp 2 -> (0,1)
+        [1, 0, -1],    # sp 3 -> (1,0)
+        [1, 1, -1],    # sp 4 -> (1,1)
     ],
     dtype=jnp.int32,
 )
@@ -83,9 +147,7 @@ _LEGACY_SP_TO_RULE_ROW = jnp.array(
 def _legacy_sp_to_specs(sp_type: Array) -> Array:
     """Convert a scalar legacy sp_type ∈ {0..4} into (MAX_RULES_PER_VERTEX, 3) rule specs."""
     first = _LEGACY_SP_TO_RULE_ROW[sp_type]  # (3,)
-    pad = jnp.tile(
-        jnp.array([-1, -1, 0], dtype=jnp.int32), (MAX_RULES_PER_VERTEX - 1, 1)
-    )
+    pad = jnp.tile(jnp.array([-1, -1, 0], dtype=jnp.int32), (MAX_RULES_PER_VERTEX - 1, 1))
     return jnp.concatenate([first[None, :], pad], axis=0)
 
 
@@ -105,14 +167,50 @@ sp_type_to_map = {1: (0, 0), 2: (0, 1), 3: (1, 0), 4: (1, 1)}
 # other = {log, no log} x {div, no div}
 
 
-# cmp_type:
-#   graphax  -> adds + muls + fmas from vertex_elimination_jaxpr
-#   flops    -> cost_analysis()["flops"]
-#   latency  -> ResourceMonitor.duration over 10 runs (top-quartile mean)
-# mem_type:
-#   graphax        -> "mem" from vertex_elimination_jaxpr
-#   bytes_accessed -> cost_analysis()["bytes accessed"]
-#   peak_memory    -> ResourceMonitor.peak (single run; or max over runs if cmp_type == latency)
+def _flatten_jacobians(jac):
+    """Concatenate all leaves of a (possibly nested) jacobian pytree to a flat 1-d array."""
+    leaves = jax.tree_util.tree_leaves(jac)
+    if not leaves:
+        return None
+    flats = [jnp.ravel(l) for l in leaves]
+    return jnp.concatenate(flats)
+
+
+def _quality_metrics(jac_exact, jac_approx):
+    """`(cosine_sim, relative_frobenius)` of `jac_approx` against `jac_exact`.
+
+    Returns the trivial `(1.0, 0.0)` (perfect agreement) when either side has
+    no leaves, mismatched shapes, or zero size, mirroring the original `error`
+    fallback so a degenerate plan can't poison downstream normalisation.
+    """
+    flat_exact = _flatten_jacobians(jac_exact)
+    flat_approx = _flatten_jacobians(jac_approx)
+    if flat_exact is None or flat_approx is None:
+        return jnp.array(1.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32)
+    if flat_approx.shape != flat_exact.shape or flat_approx.size == 0:
+        return jnp.array(1.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32)
+    cos = cossim(flat_exact, flat_approx)
+    exact_norm = jnp.linalg.norm(flat_exact)
+    resid_norm = jnp.linalg.norm(flat_exact - flat_approx)
+    rel_frob = resid_norm / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
+    return cos, rel_frob
+
+
+def _aggregate_samples(values, want_top_quartile: bool):
+    """Reduce a list of per-sample scalars to a single jnp scalar.
+
+    With ≥8 samples and `want_top_quartile`, takes the top-quartile mean
+    (matching legacy behaviour for latency); otherwise falls back to a plain
+    mean. Handles the empty-list case by returning `0.0`.
+    """
+    if not values:
+        return jnp.array(0.0, dtype=jnp.float32)
+    stack = jnp.stack([jnp.asarray(v, dtype=jnp.float32) for v in values])
+    if want_top_quartile and stack.shape[0] >= 8:
+        return stack.sort()[6:8].mean()
+    return stack.mean()
+
+
 def _callback(
     config: EnvConfig,
     args,
@@ -123,6 +221,11 @@ def _callback(
     *eval_samples,
     init: bool = False,
 ):
+    """Stage A reward harness: returns `(tokens, rewards)` where `rewards` is
+    the canonical `(NUM_REWARDS,)` float32 vector documented at the top of this
+    file. Every component is computed every (non-init) call, except `latency`
+    which is gated behind `config.measure_latency`.
+    """
     partial_order, partial_specs = _get_partials(order, sparsity_specs, stop)
 
     o_list = [int(x) for x in partial_order.tolist()]
@@ -157,15 +260,6 @@ def _callback(
 
     blacklist = [
         # [(1, ((1, 2, -1),)), (7, ((1, 3, -1),)), (4, ((1, 2, -1),)), (2, ((0, 3, -1),))],
-        # [(1, ((1, 2, -1),)), (7, ((1, 3, -1),)), (4, ((1, 2, -1),)), (9, ((0, 2, -1),)), (2, ((0, 3, -1),))],
-        # [(5, ((0, 3, -1),)), (4, ((1, 3, -1),)), (3, ((1, 2, -1),)), (1, ((0, 3, -1),))],
-        # [(4, ((0, 2, -1),)), (10, ((1, 3, -1),)), (12, ((0, 3, -1),)), (2, ((0, 3, -1),))],
-        # [(3, ((1, 2, -1),)), (1, ((0, 3, -1),))],
-        # [(4, ((0, 3, -1),)), (8, ((0, 2, -1),)), (6, ((0, 3, -1),)), (7, ((1, 2, -1),))],
-        # [(10, ((0, 3, -1),)), (5, ((1, 2, -1),)), (1, ((1, 3, -1),)), (12, ((1, 3, -1),)), (7, ((1, 2, -1),)), (6, ((1, 3, -1),))],
-        # [(6, ((1, 3, -1),)), (4, ((0, 2, -1),)), (1, ((0, 2, -1),)), (7, ((1, 2, -1),))],
-        # [(10, ((0, 3, -1),)), (7, ((0, 3, -1),)), (11, ((0, 3, -1),)), (6, ((0, 2, -1),))],
-        # [(1, ((1, 2, -1),)), (7, ((1, 3, -1),)), (4, ((1, 2, -1),)), (9, ((0, 2, -1),)), (2, ((0, 3, -1),)), (10, ((0, 2, -1),))],
         # ...
     ]
 
@@ -179,9 +273,8 @@ def _callback(
         print("skipping blacklisted")
         return (
             jnp.zeros(MAX_TOKENS, dtype=jnp.int32),
-            jnp.array(jnp.iinfo(jnp.int32).min, dtype=jnp.int32),
-            jnp.array(jnp.iinfo(jnp.int32).min, dtype=jnp.int32),
-            jnp.array(-1.0, dtype=jnp.float32),
+            jnp.full(MAX_TOKENS, -1, dtype=jnp.int32),
+            _SENTINEL_BAD_REWARD,
         )
 
     ve = extract_jaxpr(
@@ -196,49 +289,57 @@ def _callback(
     tokens = ve.tokenized()[:MAX_TOKENS]
     tokens = jnp.pad(tokens, (0, MAX_TOKENS - tokens.shape[0]))
 
-    cmp = jnp.array(0, dtype=jnp.int32)
-    mem = jnp.array(0, dtype=jnp.int32)
-    error = jnp.array(0.0, dtype=jnp.float32)
+    # Compute per-token equation IDs once for the relational-bias encoder
+    # (Stage B.1). Cheap (single Python scan over a length-≤4096 numpy array)
+    # and adds (MAX_TOKENS,) int32 to EnvState.
+    tokens_np = np.asarray(tokens)
+    eqn_ids_np = compute_eqn_ids_from_tokens(tokens_np, _TOKEN_VOCAB)
+    eqn_ids = jnp.asarray(eqn_ids_np, dtype=jnp.int32)
 
-    if not init and (config.cmp_type == "graphax" or config.mem_type == "graphax"):
-        _, aux = vertex_elimination_jaxpr(
-            config.jaxpr,
-            o_list,
-            consts,
-            *args,
-            argnums=config.argnums,
-            count_ops=True,
-            sparse_representation=config.sparse,
-            sparsity_map=sparsity_map,
+    if init:
+        return tokens, eqn_ids, jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
+
+    # ------------------------------------------------------------------
+    # Compute family — graphax counters (always) → muls_adds_fmas, max_io_sum.
+    # ------------------------------------------------------------------
+    _, aux = vertex_elimination_jaxpr(
+        config.jaxpr,
+        o_list,
+        consts,
+        *args,
+        argnums=config.argnums,
+        count_ops=True,
+        sparse_representation=config.sparse,
+        sparsity_map=sparsity_map,
+    )
+    muls_adds_fmas = float(aux["adds"] + aux["muls"] + aux["fmas"])
+    max_io_sum = float(aux["mem"])
+
+    # If no `target_fun` is supplied, we can't compile/execute. Skip every
+    # execution-derived metric and return a partial reward vector.
+    if config.target_fun is None:
+        rewards = jnp.array(
+            [
+                -muls_adds_fmas, 0.0, 0.0, -max_io_sum,
+                0.0, 0.0, 1.0, 0.0,
+            ],
+            dtype=jnp.float32,
         )
-        if config.cmp_type == "graphax":
-            cmp = jnp.array(aux["adds"] + aux["muls"] + aux["fmas"], dtype=jnp.int32)
-        if config.mem_type == "graphax":
-            mem = jnp.array(aux["mem"], dtype=jnp.int32)
+        return tokens, eqn_ids, rewards
 
-    needs_cost_analysis = (
-        config.cmp_type == "flops" or config.mem_type == "bytes_accessed"
-    )
-    needs_runtime = config.cmp_type == "latency" or config.mem_type == "peak_memory"
-    should_compile = not init and (
-        needs_cost_analysis or needs_runtime or config.target_fun is not None
-    )
-
-    if init or not should_compile:
-        return tokens, cmp, mem, error
-
-    assert config.target_fun is not None, (
-        "Must provide a valid Callable for `target_fun` if compilation is required"
-    )
-
+    # ------------------------------------------------------------------
+    # Compile both the approximated and exact jacobian functions once.
+    # ------------------------------------------------------------------
     callback_device = None
     if config.exec_on_gpu:
         gpu_devices = jax.devices("gpu")
-        callback_device = gpu_devices[1]
+        if len(gpu_devices) >= 2:
+            callback_device = gpu_devices[1]
 
-    # Ensure compilation target matches execution device
     args_for_lower = (
-        jax.device_put(args, callback_device) if config.exec_on_gpu else args
+        jax.device_put(args, callback_device)
+        if (config.exec_on_gpu and callback_device is not None)
+        else args
     )
 
     def compiled(sp_map=None):
@@ -261,90 +362,93 @@ def _callback(
     compiled_approx = compiled(sparsity_map)
     compiled_exact = compiled()
 
-    if needs_cost_analysis:
-        cost_analysis = compiled_approx.cost_analysis()
-        if config.cmp_type == "flops":
-            cmp = jnp.array(cost_analysis.get("flops", 0), dtype=jnp.int32)
-        if config.mem_type == "bytes_accessed":
-            mem = jnp.array(cost_analysis.get("bytes accessed", 0), dtype=jnp.int32)
+    # XLA cost analysis — flops + bytes accessed. Falls back to 0 when the
+    # backend doesn't expose them (CPU sometimes returns an empty dict).
+    cost_analysis = compiled_approx.cost_analysis() or {}
+    flops = float(cost_analysis.get("flops", 0))
+    bytes_accessed = float(cost_analysis.get("bytes accessed", 0))
 
-    # only run multiple times when measuring latency; otherwise a single sample
-    # is enough for cossim error and (optionally) peak_memory.
-    n_samples = 10 if config.cmp_type == "latency" else 1
-    out_approxs = []
-    out_exacts = []
-    stats = jnp.zeros((2, n_samples), jnp.int32)
+    # ------------------------------------------------------------------
+    # Execution loop — runs once for peak_memory + quality, or 10x when
+    # `measure_latency` is on (the latency reading is noisy enough that the
+    # top-quartile-mean smoothing from the original code is worth keeping).
+    # ------------------------------------------------------------------
+    n_samples = 10 if config.measure_latency else 1
 
-    unique_devices = None
-    if needs_runtime:
-        # identify devices for monitoring from representative args
-        monitoring_devices = []
-        for x in jax.tree_util.tree_leaves(args):
-            if hasattr(x, "devices"):
-                monitoring_devices.extend(list(x.devices()))
-        unique_devices = list(set(monitoring_devices))
-        if config.exec_on_gpu and callback_device not in unique_devices:
-            unique_devices.append(callback_device)
-        if not unique_devices:
-            unique_devices = jax.local_devices()
+    monitoring_devices: list = []
+    for x in jax.tree_util.tree_leaves(args):
+        if hasattr(x, "devices"):
+            monitoring_devices.extend(list(x.devices()))
+    unique_devices = list(set(monitoring_devices))
+    if (
+        config.exec_on_gpu
+        and callback_device is not None
+        and callback_device not in unique_devices
+    ):
+        unique_devices.append(callback_device)
+    if not unique_devices:
+        unique_devices = jax.local_devices()
+
+    out_approxs: list = []
+    out_exacts: list = []
+    latency_samples: list[float] = []
+    peak_mem_samples: list[float] = []
 
     for i in range(n_samples):
         if eval_samples:
             eval_args_i = [arg[i] for arg in eval_samples]
         else:
             eval_args_i = list(args)
-
-        if config.exec_on_gpu:
+        if config.exec_on_gpu and callback_device is not None:
             eval_args_i = [jax.device_put(d, callback_device) for d in eval_args_i]
 
-        if needs_runtime:
-            with ResourceMonitor(devices=unique_devices) as monitor:
-                out_approx = compiled_approx(*eval_args_i)
-            cmp_val, mem_val = monitor.stats.values()
-            if config.cmp_type == "latency":
-                stats = stats.at[0, i].set(cmp_val * 10**9)
-            if config.mem_type == "peak_memory":
-                stats = stats.at[1, i].set(mem_val)
-        else:
+        with ResourceMonitor(devices=unique_devices) as monitor:
             out_approx = compiled_approx(*eval_args_i)
+        latency_s, peak_bytes = monitor.stats.values()
+        latency_samples.append(float(latency_s) * 1e9)  # → ns
+        peak_mem_samples.append(float(peak_bytes))
 
         out_exact = compiled_exact(*eval_args_i)
         out_approxs.append(out_approx)
         out_exacts.append(out_exact)
 
-    if config.cmp_type == "latency":
-        cmp = stats[0].sort()[6:8].mean().astype(jnp.int32)  # top quartile
-    if config.mem_type == "peak_memory":
-        mem = stats[1].max()  # single sample when n_samples == 1
+    latency_ns = (
+        float(_aggregate_samples(latency_samples, want_top_quartile=True))
+        if config.measure_latency
+        else 0.0
+    )
+    peak_memory = float(max(peak_mem_samples)) if peak_mem_samples else 0.0
 
-    all_cossims = []
+    # ------------------------------------------------------------------
+    # Quality family — cosine similarity + relative Frobenius residual.
+    # ------------------------------------------------------------------
+    cosines: list = []
+    frobs: list = []
     for out_approx, out_exact in zip(out_approxs, out_exacts):
         jac_approx = out_approx[1] if config.has_aux else out_approx
         jac_exact = out_exact[1] if config.has_aux else out_exact
+        cos, rel_frob = _quality_metrics(jac_exact, jac_approx)
+        cosines.append(cos)
+        frobs.append(rel_frob)
 
-        leaves_approx = jax.tree_util.tree_leaves(jac_approx)
-        leaves_exact = jax.tree_util.tree_leaves(jac_exact)
+    cosine_sim = float(_aggregate_samples(cosines, want_top_quartile=True))
+    frob_residual = float(_aggregate_samples(frobs, want_top_quartile=True))
 
-        # flat_mse = [
-        #     jnp.mean((e - a) ** 2) for e, a in zip(leaves_exact, leaves_approx)
-        # ]
+    rewards = jnp.array(
+        [
+            -muls_adds_fmas,
+            -flops,
+            -latency_ns,
+            -max_io_sum,
+            -bytes_accessed,
+            -peak_memory,
+            cosine_sim,
+            -frob_residual,
+        ],
+        dtype=jnp.float32,
+    )
 
-        if leaves_approx and leaves_exact:
-            flat_approx = jnp.concatenate([jnp.ravel(l) for l in leaves_approx])
-            flat_exact = jnp.concatenate([jnp.ravel(l) for l in leaves_exact])
-            if flat_approx.shape == flat_exact.shape and flat_approx.size > 0:
-                all_cossims.append(cossim(flat_exact, flat_approx))
-            else:
-                all_cossims.append(jnp.array(1.0, dtype=jnp.float32))
-        else:
-            all_cossims.append(jnp.array(1.0, dtype=jnp.float32))
-
-    if not all_cossims:
-        error = jnp.array(1.0, dtype=jnp.float32)
-    else:
-        error = jnp.stack(all_cossims).sort()[6:8].mean()  # top quartile
-
-    return tokens, cmp, mem, error
+    return tokens, eqn_ids, rewards
 
 
 @register_pytree_node_class
@@ -400,6 +504,7 @@ class VertexEliminationEnv:
         cmp_type: str = "flops",
         mem_type: str = "peak_memory",
         exec_on_gpu: bool = False,
+        measure_latency: bool = False,
     ):
         assert (argnums is None and args is None) or not (args is None or args is None)
         config = EnvConfig(
@@ -414,6 +519,7 @@ class VertexEliminationEnv:
             target_fun=target_fun,
             data_gen=data_gen,
             exec_on_gpu=exec_on_gpu,
+            measure_latency=measure_latency,
         )
         return cls(
             config,
@@ -440,9 +546,8 @@ class VertexEliminationEnv:
     def _callback_shape(self):
         return (
             jax.ShapeDtypeStruct((MAX_TOKENS,), jnp.int32),
-            jax.ShapeDtypeStruct((), jnp.int32),
-            jax.ShapeDtypeStruct((), jnp.int32),
-            jax.ShapeDtypeStruct((), jnp.float32),
+            jax.ShapeDtypeStruct((MAX_TOKENS,), jnp.int32),
+            jax.ShapeDtypeStruct((NUM_REWARDS,), jnp.float32),
         )
 
     def reset(self, num_envs: int | None = None) -> EnvState:
@@ -455,11 +560,9 @@ class VertexEliminationEnv:
             -1,
             dtype=jnp.int32,
         )
-        initial_specs = initial_specs.at[..., 2].set(
-            0
-        )  # factor=0 default for unused rows
+        initial_specs = initial_specs.at[..., 2].set(0)  # factor=0 default for unused rows
 
-        tokens, _, _, _ = io_callback(
+        tokens, eqn_ids, _ = io_callback(
             self.tokenize(init=True),
             self._callback_shape,
             self.args,
@@ -473,13 +576,14 @@ class VertexEliminationEnv:
         max_steps_val = initial_order.shape[0]
         step_count = jnp.array(0, dtype=jnp.int32)
         max_steps = max_steps_val
-        reward = jnp.zeros(3, dtype=jnp.float32)
+        reward = jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
         terminated = jnp.array(False, dtype=jnp.bool_)
 
         state = EnvState(
             order=initial_order,
             sparsity_specs=initial_specs,
-            tokens=tokens,  # Directly use the unpacked token array
+            tokens=tokens,
+            eqn_ids=eqn_ids,
             step_count=step_count,
             max_steps=max_steps,
             reward=reward,
@@ -519,7 +623,7 @@ class VertexEliminationEnv:
         new_order = curr_order[shifted.astype(jnp.int32)].at[idx].set(target_vertex)
         new_specs = curr_specs[shifted.astype(jnp.int32)].at[idx].set(rule_specs)
 
-        tokens, cmp, mem, error = io_callback(
+        tokens, eqn_ids, reward = io_callback(
             self.tokenize(),
             self._callback_shape,
             self.args,
@@ -531,14 +635,12 @@ class VertexEliminationEnv:
         )
 
         terminated = new_step >= state.max_steps
-        reward = jnp.array(
-            [-cmp, error, -mem],
-        )
 
         new_state = EnvState(
             order=new_order,
             sparsity_specs=new_specs,
             tokens=tokens,
+            eqn_ids=eqn_ids,
             step_count=new_step,
             max_steps=state.max_steps,
             reward=reward,
@@ -550,7 +652,9 @@ class VertexEliminationEnv:
 
         def _step_done(_):
             return EnvOut(
-                state, jnp.zeros(3, jnp.float32), jnp.array(True, dtype=jnp.bool_)
+                state,
+                jnp.zeros(NUM_REWARDS, jnp.float32),
+                jnp.array(True, dtype=jnp.bool_),
             )
 
         return jax.lax.cond(state.terminated, _step_done, _step_process, None)
