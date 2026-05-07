@@ -64,6 +64,97 @@ def build_pair_valid_mask(
     return jnp.array(mask)
 
 
+# Pair-index → (out_axis, primal_axis) — must match the trainer's `_PAIR_TO_BASE`.
+_PAIR_TO_BASE = ((0, 0), (0, 1), (1, 0), (1, 1))
+
+
+def _vertex_pair_dim_sizes(jaxpr, total_v: int, num_pair_choices: int):
+    """Per-(vertex, pair) ``(d1, d2)`` axis sizes, or ``(0, 0)`` if invalid.
+
+    ``d1`` is the size of output axis ``pair.bi1``; ``d2`` is the size of the
+    same-position axis on the *first non-literal* input variable. For pair
+    indices that exceed the vertex's available axes (or the STOP slot),
+    both are ``0`` so every factor will be marked invalid for that slot.
+    """
+    sizes = np.zeros((total_v, num_pair_choices, 2), dtype=np.int32)
+    for i, eqn in enumerate(jaxpr.eqns):
+        if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
+            continue
+        out_shape = eqn.outvars[0].aval.shape
+        invars = [v for v in eqn.invars if hasattr(v, "aval")]
+        if not invars:
+            continue
+        primal_shape = invars[0].aval.shape  # first input as the primal proxy
+        for pair_idx, (bi1, bi2) in enumerate(_PAIR_TO_BASE):
+            if pair_idx >= num_pair_choices:
+                break
+            if bi1 >= len(out_shape) or bi2 >= len(primal_shape):
+                continue
+            sizes[i, pair_idx, 0] = int(out_shape[bi1])
+            sizes[i, pair_idx, 1] = int(primal_shape[bi2])
+    return sizes
+
+
+def _factor_is_valid(factor: int, d1: int, d2: int) -> bool:
+    """Does ``apply_dynamic_sparsity`` produce a finite, matmul-compatible
+    SparseTensor for this ``(d1, d2)`` pair under ``factor``?
+
+    Mirrors the contract that the rewritten `apply_dynamic_sparsity` honours:
+    * ``factor == -1`` — always valid (gcd-collapse).
+    * ``factor == 0``  — always valid (drops the axes).
+    * ``factor == 1``  — always valid (no-op; the rule is silently dropped).
+    * ``factor > 1``   — valid iff it divides both ``d1`` and ``d2`` *and*
+                          is at most ``gcd(d1, d2)``.
+
+    Returns ``False`` only when the slot itself is unused (``d1 == 0`` or
+    ``d2 == 0``), so the policy never picks an action for a pair the
+    vertex doesn't actually have.
+    """
+    if d1 == 0 or d2 == 0:
+        return False
+    if factor in (-1, 0, 1):
+        return True
+    if factor < 0:
+        return False
+    return d1 % factor == 0 and d2 % factor == 0 and factor <= min(d1, d2)
+
+
+def build_pair_factor_valid_mask(
+    jaxpr,
+    total_v: int,
+    num_pair_choices: int,
+    factor_table,
+    pair_stop_idx: int,
+):
+    """Build the per-(vertex, pair, factor) validity mask used by the
+    autoregressive factor head.
+
+    Returns ``jnp.float32`` shape ``(total_v, num_pair_choices, num_factors)``.
+    The STOP pair gets ``factor_table[0]`` enabled so the categorical over
+    factors is never fully masked when the rule terminates (the chosen
+    factor is ignored anyway in the env).
+    """
+    factor_table_np = np.asarray(factor_table)
+    num_factors = factor_table_np.shape[0]
+    sizes = _vertex_pair_dim_sizes(jaxpr, total_v, num_pair_choices)
+
+    mask = np.zeros((total_v, num_pair_choices, num_factors), dtype=np.float32)
+    for v in range(total_v):
+        for p in range(num_pair_choices):
+            if p == pair_stop_idx:
+                # Keep at least one factor valid so the categorical sums to 1
+                # even when the agent picks STOP. The factor is unused.
+                mask[v, p, 0] = 1.0
+                continue
+            d1 = int(sizes[v, p, 0])
+            d2 = int(sizes[v, p, 1])
+            for f_idx in range(num_factors):
+                f = int(factor_table_np[f_idx])
+                if _factor_is_valid(f, d1, d2):
+                    mask[v, p, f_idx] = 1.0
+    return jnp.array(mask)
+
+
 def build_legacy_sp_valid_mask(
     jaxpr,
     total_v: int,
