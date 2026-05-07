@@ -29,7 +29,7 @@ cd ~/dsnn
 # `alias uv=...` is shell-only; use the absolute path so subprocess.Popen finds it too.
 export PATH="$HOME/.local/bin:$PATH"
 
-uv run alphagrad/dispatch_nns.py \
+uv run --no-sync alphagrad/dispatch_nns.py \
     --calibration-mode per-reward \
     --calibration-episodes 30 \
     --full-episodes 500 \
