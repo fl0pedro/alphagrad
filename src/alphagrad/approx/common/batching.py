@@ -30,3 +30,30 @@ def shuffle_and_batch(tree, minibatches: int, key):
         return x[indices]
 
     return jax.tree_util.tree_map(_process, tree)
+
+
+@partial(jax.jit, static_argnums=1)
+def shuffle_and_batch_by_trajectory(tree, minibatches: int, key):
+    """Per-trajectory minibatching for the B.4.next "encode once per episode" path.
+
+    Reshapes a ``(num_envs, rollout_length, ...)`` pytree into
+    ``(minibatches, envs_per_minibatch, rollout_length, ...)`` — the env axis
+    is shuffled but the trajectory dimension is preserved so the loss can
+    encode each trajectory's tokens once and reuse the result for all
+    ``rollout_length`` steps.
+
+    Trailing trajectories that don't fit into a full minibatch are dropped.
+    """
+    leaves, _ = jax.tree_util.tree_flatten(tree)
+    num_envs, rollout_length = leaves[0].shape[:2]
+    envs_per_mb = num_envs // minibatches
+    valid_envs = envs_per_mb * minibatches
+
+    perm = jrand.permutation(key, jnp.arange(num_envs))[:valid_envs]
+    perm = perm.reshape(minibatches, envs_per_mb)
+
+    def _process(x):
+        # x: (num_envs, rollout_length, ...) → (minibatches, envs_per_mb, K, ...)
+        return x[perm]
+
+    return jax.tree_util.tree_map(_process, tree)

@@ -26,7 +26,7 @@ from alphagrad.approx.common import (
     reward_normalization_fn,
     shuffle_and_batch,
 )
-from alphagrad.approx.env import MAX_TOKENS, VertexEliminationEnv
+from alphagrad.approx.env import MAX_TOKENS, REWARD_INDEX, VertexEliminationEnv
 from alphagrad.transformer import MLP, Encoder, PositionalEncoder
 from alphagrad.utils import entropy, explained_variance
 
@@ -166,7 +166,17 @@ def main():
     MINIBATCHES = 32
     PPO_EPOCHS = 4
 
-    NUM_REWARDS = 1 if args.disable_eval else 2
+    # Stage A: env now reports the full 8-vec reward; gdpo only needs the
+    # legacy `[-cmp, error]` (or `[-cmp]` when --disable-eval) view, where
+    # `cmp` is the XLA-flops component and `error` is cosine similarity.
+    if args.disable_eval:
+        REWARD_INDICES_NP = np.array([REWARD_INDEX["flops"]], dtype=np.int32)
+    else:
+        REWARD_INDICES_NP = np.array(
+            [REWARD_INDEX["flops"], REWARD_INDEX["cosine_sim"]], dtype=np.int32,
+        )
+    REWARD_INDICES = jnp.asarray(REWARD_INDICES_NP)
+    NUM_REWARDS = int(REWARD_INDICES_NP.shape[0])
     OBS_SHAPE = MAX_TOKENS
     NUM_ACTIONS = 3 * total_v
     ROLLOUT_LENGTH = num_valid
@@ -236,7 +246,7 @@ def main():
 
             env_out = env.step(state, env_action)
             next_state = env_out.state
-            rewards = env_out.reward[:NUM_REWARDS]
+            rewards = env_out.reward[REWARD_INDICES]
             done = env_out.terminated.astype(jnp.float32)
 
             _, next_value = agent(next_state.tokens, key=next_net_key, inference=True)
