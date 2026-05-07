@@ -39,8 +39,13 @@ import wandb
 from tqdm import tqdm
 
 from alphagrad.approx.common import (
+    NUM_VERTEX_FEATURES,
+    OP_TYPE_VOCAB_SIZE,
+    build_pair_factor_valid_mask,
     build_pair_valid_mask,
     build_vertex_valid_static,
+    compute_per_sample_vertex_features,
+    compute_vertex_features,
     data_gen,
     generate_eval_samples,
     get_advantages,
@@ -49,19 +54,27 @@ from alphagrad.approx.common import (
     get_num_clipping_triggers,
     infer_argnums,
     init_linear_weights,
+    inverse_reward_normalization_fn,
     reward_normalization_fn,
     scale_module_weight,
     shuffle_and_batch,
+    shuffle_and_batch_by_trajectory,
     vertex_avail_at_step,
 )
 from alphagrad.approx.env import (
+    COMPUTE_REWARD_INDICES,
     MAX_RULES_PER_VERTEX,
     MAX_TOKENS,
     NUM_AXIS_PAIRS,
+    NUM_REWARDS,
+    QUALITY_REWARD_INDICES,
+    REWARD_INDEX,
+    REWARD_NAMES,
     StepAction,
     VertexEliminationEnv,
 )
 from alphagrad.transformer import MLP, Encoder, PositionalEncoder
+from alphagrad.transformer.encoder import RelationalMultiheadAttention
 from alphagrad.utils import entropy, explained_variance
 
 
@@ -100,6 +113,9 @@ _SP_TYPE_TO_PAIR = jnp.array([PAIR_STOP, 0, 1, 2, 3], dtype=jnp.int32)
 
 class Trajectory(NamedTuple):
     tokens: jax.Array
+    eqn_ids: jax.Array
+    residual_state: jax.Array  # (V, embd_dim) at the start of this step
+    preference: jax.Array      # (NUM_REWARDS,) — same value across all steps
     vertex_idx: jax.Array
     pair_seq: jax.Array
     factor_seq: jax.Array
@@ -116,6 +132,9 @@ class Trajectory(NamedTuple):
 
 class TrainBatch(NamedTuple):
     tokens: jax.Array
+    eqn_ids: jax.Array
+    residual_state: jax.Array
+    preference: jax.Array
     vertex_idx: jax.Array
     pair_seq: jax.Array
     factor_seq: jax.Array
@@ -139,28 +158,49 @@ def _stop_only_logits(num_pair_choices: int) -> jax.Array:
     ).astype(jnp.float32)
 
 
+def _pad_specs_to_env_slot(specs: jax.Array) -> jax.Array:
+    """Pad/truncate per-vertex rule specs to the env's `(MAX_RULES_PER_VERTEX, 3)` slot shape.
+
+    The agent's policy may emit fewer rules than the env can store (`--max-rules` <
+    `MAX_RULES_PER_VERTEX`); unused trailing slots are filled with `(-1, -1, 0)` so
+    the env's `_callback` correctly treats them as empty.
+    """
+    n = specs.shape[0]
+    if n == MAX_RULES_PER_VERTEX:
+        return specs
+    if n > MAX_RULES_PER_VERTEX:
+        return specs[:MAX_RULES_PER_VERTEX]
+    pad = jnp.tile(
+        jnp.array([-1, -1, 0], dtype=jnp.int32), (MAX_RULES_PER_VERTEX - n, 1)
+    )
+    return jnp.concatenate([specs, pad], axis=0)
+
+
 def build_rule_specs(pair_seq, factor_seq, factor_table) -> jax.Array:
-    """Convert per-slot `(pair_idx, factor_idx)` -> `(MAX_RULES, 3)` rule specs.
+    """Convert per-slot `(pair_idx, factor_idx)` -> `(MAX_RULES_PER_VERTEX, 3)` rule specs.
 
     `pair_idx == PAIR_STOP` terminates the sequence; subsequent slots are
-    written as unused (`base_idx1 = -1, factor = 0`).
+    written as unused (`base_idx1 = -1, factor = 0`). The output is always
+    padded out to `MAX_RULES_PER_VERTEX` so the env's fixed-shape slot
+    accepts it directly.
     """
-    base = _PAIR_TO_BASE[pair_seq]  # (MAX_RULES, 2)
-    factor_vals = factor_table[factor_seq]  # (MAX_RULES,)
+    base = _PAIR_TO_BASE[pair_seq]
+    factor_vals = factor_table[factor_seq]
 
     is_stop = pair_seq == PAIR_STOP
-    has_stopped = jnp.cumsum(is_stop.astype(jnp.int32)) > 0  # (MAX_RULES,) bool
+    has_stopped = jnp.cumsum(is_stop.astype(jnp.int32)) > 0
 
     base_final = jnp.where(has_stopped[:, None], -1, base)
     factor_final = jnp.where(has_stopped, 0, factor_vals)
-    return jnp.concatenate([base_final, factor_final[:, None]], axis=-1).astype(
+    specs = jnp.concatenate([base_final, factor_final[:, None]], axis=-1).astype(
         jnp.int32
     )
+    return _pad_specs_to_env_slot(specs)
 
 
 def build_legacy_rule_specs(pair_seq) -> jax.Array:
     """Rule specs for the single-rule (factor=-1) variants. Ignores the factor table."""
-    base = _PAIR_TO_BASE[pair_seq]  # (MAX_RULES, 2)
+    base = _PAIR_TO_BASE[pair_seq]
     factor = jnp.full(pair_seq.shape, -1, dtype=jnp.int32)
 
     is_stop = pair_seq == PAIR_STOP
@@ -168,9 +208,10 @@ def build_legacy_rule_specs(pair_seq) -> jax.Array:
 
     base_final = jnp.where(has_stopped[:, None], -1, base)
     factor_final = jnp.where(has_stopped, 0, factor)
-    return jnp.concatenate([base_final, factor_final[:, None]], axis=-1).astype(
+    specs = jnp.concatenate([base_final, factor_final[:, None]], axis=-1).astype(
         jnp.int32
     )
+    return _pad_specs_to_env_slot(specs)
 
 
 def old_log_prob_for_action(
@@ -369,9 +410,25 @@ class AutoregRulePolicy(eqx.Module):
             jnp.array(True, dtype=jnp.bool_),
         )
 
-    def sample(self, vertex_context, v_pair_mask, key):
+    def sample(self, vertex_context, v_pair_mask, v_factor_mask, key,
+               *, pin_factor_idx: int | None = None):
+        """Sample ``(pair_seq, factor_seq)`` autoregressively.
+
+        ``v_factor_mask`` is the per-(pair, factor) validity mask for the
+        chosen vertex (``shape == (num_pair_choices, num_factors)``). For
+        each emitted ``pair_idx`` we mask the factor logits with
+        ``v_factor_mask[pair_idx]`` so the agent can only sample factors
+        that ``apply_dynamic_sparsity`` will accept downstream.
+
+        Stage D: when ``pin_factor_idx`` is set, every slot's factor is
+        forced to that index regardless of the factor head's output. The
+        next slot's autoregressive conditioning sees the forced factor as
+        ``prev_factor``, so rollout and loss-time evaluation agree on the
+        sequence — same trick the env uses for the rule_specs themselves.
+        """
         slot_keys = jrand.split(key, self.max_rules)
         stop_only = _stop_only_logits(self.num_pair_choices)
+        pin_static = pin_factor_idx  # capture in closure for jit
 
         def rule_step(carry, slot_data):
             prev_pair, prev_factor, prev_h, active = carry
@@ -385,9 +442,16 @@ class AutoregRulePolicy(eqx.Module):
             pair_dist = jnn.softmax(pair_logits_eff, axis=-1)
             pair_idx = distrax.Categorical(probs=pair_dist).sample(seed=kp)
 
-            factor_logits = self.decoder.factor_logits_for(new_h, pair_idx)
-            factor_dist = jnn.softmax(factor_logits, axis=-1)
-            factor_idx = distrax.Categorical(probs=factor_dist).sample(seed=kf)
+            if pin_static is None:
+                factor_logits = self.decoder.factor_logits_for(new_h, pair_idx)
+                factor_logits = jnp.where(
+                    v_factor_mask[pair_idx] > 0.5, factor_logits, -1e9
+                )
+                factor_dist = jnn.softmax(factor_logits, axis=-1)
+                factor_idx = distrax.Categorical(probs=factor_dist).sample(seed=kf)
+            else:
+                factor_idx = jnp.asarray(pin_static, dtype=jnp.int32)
+                factor_dist = jnn.one_hot(factor_idx, self.num_factors)
 
             new_active = active & (pair_idx != PAIR_STOP)
             return (pair_idx, factor_idx, new_h, new_active), (
@@ -399,8 +463,10 @@ class AutoregRulePolicy(eqx.Module):
         )
         return pair_seq, factor_seq, pair_dists, factor_dists
 
-    def evaluate(self, vertex_context, v_pair_mask, pair_seq, factor_seq):
+    def evaluate(self, vertex_context, v_pair_mask, v_factor_mask, pair_seq, factor_seq,
+                 *, pin_factor_idx: int | None = None):
         stop_only = _stop_only_logits(self.num_pair_choices)
+        pin_static = pin_factor_idx
 
         def rule_step(carry, slot_data):
             prev_pair, prev_factor, prev_h, active = carry
@@ -413,9 +479,21 @@ class AutoregRulePolicy(eqx.Module):
             pair_dist = jnn.softmax(pair_logits_eff, axis=-1)
             log_p_pair = jnp.log(pair_dist[true_pair] + 1e-8)
 
-            factor_logits = self.decoder.factor_logits_for(new_h, true_pair)
-            factor_dist = jnn.softmax(factor_logits, axis=-1)
-            log_p_factor = jnp.log(factor_dist[true_factor] + 1e-8)
+            if pin_static is None:
+                factor_logits = self.decoder.factor_logits_for(new_h, true_pair)
+                factor_logits = jnp.where(
+                    v_factor_mask[true_pair] > 0.5, factor_logits, -1e9
+                )
+                factor_dist = jnn.softmax(factor_logits, axis=-1)
+                log_p_factor = jnp.log(factor_dist[true_factor] + 1e-8)
+                factor_ent_raw = entropy(factor_dist)
+            else:
+                # Factor is deterministic — log p = 0, entropy = 0. Returning
+                # a degenerate one-hot for `factor_dist` keeps the KL terms
+                # downstream well-defined (KL(δ‖δ) = 0).
+                factor_dist = jnn.one_hot(jnp.asarray(pin_static, dtype=jnp.int32), self.num_factors)
+                log_p_factor = jnp.array(0.0, dtype=jnp.float32)
+                factor_ent_raw = jnp.array(0.0, dtype=jnp.float32)
 
             active_f32 = active.astype(jnp.float32)
             log_p_pair_eff = log_p_pair * active_f32
@@ -424,7 +502,263 @@ class AutoregRulePolicy(eqx.Module):
             factor_active = active & (true_pair != PAIR_STOP)
             factor_active_f32 = factor_active.astype(jnp.float32)
             log_p_factor_eff = log_p_factor * factor_active_f32
-            factor_ent = entropy(factor_dist) * factor_active_f32
+            factor_ent = factor_ent_raw * factor_active_f32
+
+            new_active = active & (true_pair != PAIR_STOP)
+            # Conditioning for the next slot uses `true_pair, true_factor` so
+            # the autoregressive trace matches what `sample` produced — when
+            # factor is pinned, both rollout and evaluate see the pinned
+            # value as `prev_factor`.
+            return (true_pair, true_factor, new_h, new_active), (
+                log_p_pair_eff, log_p_factor_eff,
+                pair_ent, factor_ent,
+                pair_dist, factor_dist,
+            )
+
+        _, (lp_pairs, lp_factors, ent_pairs, ent_factors, pair_dists, factor_dists) = (
+            lax.scan(
+                rule_step,
+                self._init_carry(),
+                (jnp.arange(self.max_rules), pair_seq, factor_seq),
+            )
+        )
+        return lp_pairs, lp_factors, ent_pairs, ent_factors, pair_dists, factor_dists
+
+    def to_env_specs(self, pair_seq, factor_seq, factor_table):
+        return build_rule_specs(pair_seq, factor_seq, factor_table)
+
+
+class SparsityRatioRuleDecoder(eqx.Module):
+    """Per-slot autoregressive head with rho-based factor parameterization.
+
+    Same RNN backbone as :class:`RuleDecoder`, but the factor-side projection
+    is a *single scalar* ``rho_logit`` instead of K factor logits. The discrete
+    factor index used as the action is derived externally by snap-mixing this
+    rho onto the precomputed sparsity-ratio table; this decoder just exposes
+    the per-slot rho for the policy.
+
+    Stage E prior anneal: ``rho_init_bias`` is added to the rho_head bias at
+    construction time so that ``sigmoid(rho_init_bias) ≈ 1`` at step 0. This
+    matches Stage D's strict-diagonal pin (the factor head behaves as if it
+    was still pinned). Gradient through ``rho_head.bias`` then naturally
+    anneals the prior toward the learned distribution as training proceeds —
+    no explicit schedule needed because the bias is just a normal parameter.
+    """
+
+    pair_embed: eqx.nn.Embedding
+    factor_embed: eqx.nn.Embedding
+    slot_embed: eqx.nn.Embedding
+    rnn_proj: eqx.nn.Linear
+    pair_head: eqx.nn.Linear
+    rho_head: eqx.nn.Linear
+
+    embd_dim: int = eqx.field(static=True)
+    num_pair_choices: int = eqx.field(static=True)
+    num_factors: int = eqx.field(static=True)
+
+    def __init__(
+        self, embd_dim, max_rules, num_pair_choices, num_factors, key,
+        *, rho_init_bias: float = 0.0,
+    ):
+        keys = jrand.split(key, 6)
+        self.embd_dim = embd_dim
+        self.num_pair_choices = num_pair_choices
+        self.num_factors = num_factors
+        self.pair_embed = eqx.nn.Embedding(num_pair_choices, embd_dim, key=keys[0])
+        self.factor_embed = eqx.nn.Embedding(num_factors, embd_dim, key=keys[1])
+        self.slot_embed = eqx.nn.Embedding(max_rules, embd_dim, key=keys[2])
+        self.rnn_proj = eqx.nn.Linear(embd_dim * 4, embd_dim, key=keys[3])
+        self.pair_head = eqx.nn.Linear(embd_dim, num_pair_choices, key=keys[4])
+        rho_head = eqx.nn.Linear(embd_dim * 2, 1, key=keys[5])
+        if rho_init_bias != 0.0 and rho_head.bias is not None:
+            rho_head = eqx.tree_at(
+                lambda l: l.bias, rho_head,
+                rho_head.bias + jnp.asarray(rho_init_bias, dtype=rho_head.bias.dtype),
+            )
+        self.rho_head = rho_head
+
+    def step(self, vertex_repr, slot_idx, prev_pair, prev_factor, prev_h):
+        slot_emb = self.slot_embed(slot_idx)
+        pair_emb = self.pair_embed(prev_pair)
+        factor_emb = self.factor_embed(prev_factor)
+        inp = jnp.concatenate([vertex_repr, slot_emb, pair_emb, factor_emb])
+        new_h = jnn.tanh(prev_h + self.rnn_proj(inp))
+        return new_h, self.pair_head(new_h)
+
+    def rho_logit_for(self, h, pair_idx):
+        return self.rho_head(jnp.concatenate([h, self.pair_embed(pair_idx)])).squeeze()
+
+
+class SparsityRatioAutoregRulePolicy(eqx.Module):
+    """Stage E: autoregressive (pair, factor) policy with sparsity-ratio reparam.
+
+    The factor head emits a continuous coordinate ``ρ ∈ [0, 1]`` representing
+    the fraction of the way from "no compression" to "strict diagonal" for
+    the pair at hand. Given the precomputed sparsity ratios per factor in the
+    table, ρ is snapped to the two adjacent factors ``(i, i+1)`` with mixing
+    weight ``α = (ρ - ρ_i) / (ρ_{i+1} - ρ_i)``. The discrete factor index used
+    in the rollout's action is sampled from ``{i, i+1}`` with probabilities
+    ``(1-α, α)``; the log-probability of any sampled action has the closed
+    form ``log α`` or ``log(1-α)``, so PPO works unchanged. The smooth
+    relaxation lives entirely in the policy's gradient through ρ — no DARTS
+    straight-through is needed for the action itself.
+
+    The mixing weight α is the natural training-time signal: when the head
+    is uncertain it spreads ρ between two factors, and the gradient through
+    α tells it which way to slide. Collapse to "always strict diagonal"
+    shows up as ρ saturating at 1, i.e. α stuck at 0 with idx_upper at the
+    last factor; this is the marginal-distribution monitor the spec calls
+    out as the early-warning signal.
+    """
+
+    decoder: SparsityRatioRuleDecoder
+    sparsity_ratios: jax.Array  # (num_factors,) sorted ascending
+
+    embd_dim: int = eqx.field(static=True)
+    max_rules: int = eqx.field(static=True)
+    num_pair_choices: int = eqx.field(static=True)
+    num_factors: int = eqx.field(static=True)
+    use_factor_table: bool = eqx.field(static=True)
+
+    def __init__(
+        self, *, embd_dim, max_rules, num_pair_choices, num_factors,
+        sparsity_ratios, key, rho_init_bias: float = 0.0,
+    ):
+        self.embd_dim = embd_dim
+        self.max_rules = max_rules
+        self.num_pair_choices = num_pair_choices
+        self.num_factors = num_factors
+        self.use_factor_table = True
+        self.decoder = SparsityRatioRuleDecoder(
+            embd_dim, max_rules, num_pair_choices, num_factors, key=key,
+            rho_init_bias=rho_init_bias,
+        )
+        self.sparsity_ratios = jnp.asarray(sparsity_ratios, dtype=jnp.float32)
+
+    def _init_carry(self):
+        return (
+            jnp.array(PAIR_STOP, dtype=jnp.int32),
+            jnp.array(0, dtype=jnp.int32),
+            jnp.zeros(self.embd_dim),
+            jnp.array(True, dtype=jnp.bool_),
+        )
+
+    def _snap_mix(self, rho):
+        """Given ``rho ∈ [0, 1]``, return ``(idx_lower, idx_upper, alpha)``.
+
+        Indices are into ``self.sparsity_ratios``; α is the mixing weight on
+        ``idx_upper``. When ρ is at or past the table extremes both indices
+        collapse to the same value and α = 0/1 accordingly.
+        """
+        rho = jnp.clip(rho, self.sparsity_ratios[0], self.sparsity_ratios[-1])
+        idx_upper = jnp.searchsorted(self.sparsity_ratios, rho).astype(jnp.int32)
+        idx_upper = jnp.clip(idx_upper, 1, self.num_factors - 1)
+        idx_lower = idx_upper - 1
+        rho_lower = self.sparsity_ratios[idx_lower]
+        rho_upper = self.sparsity_ratios[idx_upper]
+        denom = jnp.maximum(rho_upper - rho_lower, 1e-9)
+        alpha = jnp.clip((rho - rho_lower) / denom, 0.0, 1.0)
+        return idx_lower, idx_upper, alpha
+
+    def _factor_dist_from_snap(self, idx_lower, idx_upper, alpha):
+        d = jnp.zeros(self.num_factors)
+        d = d.at[idx_lower].add(1.0 - alpha)
+        d = d.at[idx_upper].add(alpha)
+        return d
+
+    def sample(
+        self, vertex_context, v_pair_mask, v_factor_mask, key,
+        *, pin_factor_idx: int | None = None,
+    ):
+        slot_keys = jrand.split(key, self.max_rules)
+        stop_only = _stop_only_logits(self.num_pair_choices)
+        pin_static = pin_factor_idx
+
+        def rule_step(carry, slot_data):
+            prev_pair, prev_factor, prev_h, active = carry
+            slot_idx, k = slot_data
+            kp, kf = jrand.split(k)
+            new_h, pair_logits = self.decoder.step(
+                vertex_context, slot_idx, prev_pair, prev_factor, prev_h,
+            )
+            pair_logits = jnp.where(v_pair_mask > 0.5, pair_logits, -1e9)
+            pair_logits_eff = jnp.where(active, pair_logits, stop_only)
+            pair_dist = jnn.softmax(pair_logits_eff, axis=-1)
+            pair_idx = distrax.Categorical(probs=pair_dist).sample(seed=kp)
+
+            if pin_static is None:
+                rho_logit = self.decoder.rho_logit_for(new_h, pair_idx)
+                rho = jnn.sigmoid(rho_logit)
+                idx_lower, idx_upper, alpha = self._snap_mix(rho)
+                u = jrand.uniform(kf)
+                sample_upper = u < alpha
+                factor_idx = jnp.where(sample_upper, idx_upper, idx_lower).astype(jnp.int32)
+                factor_dist = self._factor_dist_from_snap(idx_lower, idx_upper, alpha)
+            else:
+                factor_idx = jnp.asarray(pin_static, dtype=jnp.int32)
+                factor_dist = jnn.one_hot(factor_idx, self.num_factors)
+
+            new_active = active & (pair_idx != PAIR_STOP)
+            return (pair_idx, factor_idx, new_h, new_active), (
+                pair_idx, factor_idx, pair_dist, factor_dist,
+            )
+
+        _, (pair_seq, factor_seq, pair_dists, factor_dists) = lax.scan(
+            rule_step, self._init_carry(), (jnp.arange(self.max_rules), slot_keys),
+        )
+        return pair_seq, factor_seq, pair_dists, factor_dists
+
+    def evaluate(
+        self, vertex_context, v_pair_mask, v_factor_mask, pair_seq, factor_seq,
+        *, pin_factor_idx: int | None = None,
+    ):
+        stop_only = _stop_only_logits(self.num_pair_choices)
+        pin_static = pin_factor_idx
+
+        def rule_step(carry, slot_data):
+            prev_pair, prev_factor, prev_h, active = carry
+            slot_idx, true_pair, true_factor = slot_data
+            new_h, pair_logits = self.decoder.step(
+                vertex_context, slot_idx, prev_pair, prev_factor, prev_h,
+            )
+            pair_logits = jnp.where(v_pair_mask > 0.5, pair_logits, -1e9)
+            pair_logits_eff = jnp.where(active, pair_logits, stop_only)
+            pair_dist = jnn.softmax(pair_logits_eff, axis=-1)
+            log_p_pair = jnp.log(pair_dist[true_pair] + 1e-8)
+
+            if pin_static is None:
+                rho_logit = self.decoder.rho_logit_for(new_h, true_pair)
+                rho = jnn.sigmoid(rho_logit)
+                idx_lower, idx_upper, alpha = self._snap_mix(rho)
+                # ``true_factor`` should always equal ``idx_upper`` or
+                # ``idx_lower`` because we only sample from those — but the
+                # action might have been recorded under a slightly different
+                # ρ (post optimizer step). Compute log p robustly.
+                p_true = jnp.where(
+                    true_factor == idx_upper, alpha,
+                    jnp.where(true_factor == idx_lower, 1.0 - alpha, 1e-9),
+                )
+                log_p_factor = jnp.log(p_true + 1e-9)
+                ent_factor_raw = -(
+                    alpha * jnp.log(alpha + 1e-9)
+                    + (1.0 - alpha) * jnp.log(1.0 - alpha + 1e-9)
+                )
+                factor_dist = self._factor_dist_from_snap(idx_lower, idx_upper, alpha)
+            else:
+                factor_dist = jnn.one_hot(
+                    jnp.asarray(pin_static, dtype=jnp.int32), self.num_factors,
+                )
+                log_p_factor = jnp.array(0.0, dtype=jnp.float32)
+                ent_factor_raw = jnp.array(0.0, dtype=jnp.float32)
+
+            active_f32 = active.astype(jnp.float32)
+            log_p_pair_eff = log_p_pair * active_f32
+            pair_ent = entropy(pair_dist) * active_f32
+
+            factor_active = active & (true_pair != PAIR_STOP)
+            factor_active_f32 = factor_active.astype(jnp.float32)
+            log_p_factor_eff = log_p_factor * factor_active_f32
+            factor_ent = ent_factor_raw * factor_active_f32
 
             new_active = active & (true_pair != PAIR_STOP)
             return (true_pair, true_factor, new_h, new_active), (
@@ -482,7 +816,11 @@ class SingleRulePolicy(eqx.Module):
             jnn.one_hot(0, self.num_factors), (self.max_rules, self.num_factors)
         )
 
-    def sample(self, vertex_context, v_pair_mask, key):
+    def sample(self, vertex_context, v_pair_mask, v_factor_mask, key,
+               *, pin_factor_idx: int | None = None):
+        # SingleRulePolicy ignores v_factor_mask and the pin: factor is
+        # already fixed to the legacy "-1 / first-table-entry" by construction.
+        del v_factor_mask, pin_factor_idx
         slot0_dist = self._slot0_dist(vertex_context, v_pair_mask)
         pair_idx = distrax.Categorical(probs=slot0_dist).sample(seed=key)
         pair_seq = _pad_seq(
@@ -491,7 +829,9 @@ class SingleRulePolicy(eqx.Module):
         factor_seq = jnp.zeros((self.max_rules,), dtype=jnp.int32)
         return pair_seq, factor_seq, self._padded_pair_dists(slot0_dist), self._degenerate_factor_dists()
 
-    def evaluate(self, vertex_context, v_pair_mask, pair_seq, factor_seq):
+    def evaluate(self, vertex_context, v_pair_mask, v_factor_mask, pair_seq, factor_seq,
+                 *, pin_factor_idx: int | None = None):
+        del v_factor_mask, pin_factor_idx
         slot0_dist = self._slot0_dist(vertex_context, v_pair_mask)
         pair_idx = pair_seq[0]
         log_p_pair = jnp.log(slot0_dist[pair_idx] + 1e-8)
@@ -519,15 +859,178 @@ class SingleRulePolicy(eqx.Module):
 # === Composed agent ========================================================
 
 
+class SetTransformerAggregator(eqx.Module):
+    """Stage B.3 — permutation-invariant aggregator over calibration samples.
+
+    Spec: "A small Set Transformer aggregates these features across the
+    calibration samples, permutation-invariantly, to produce a per-vertex
+    data embedding $d_v$." The per-sample variability is what tells the
+    policy whether a vertex's behaviour is stable on the data distribution.
+
+    Architecture (intentionally lightweight):
+
+    * Embed the static op-type id (column 0) and concatenate with the
+      remaining ``F-1`` continuous features → ``(S, V, hidden)``.
+    * One self-attention block over the **sample** axis per vertex (each
+      vertex's S samples form a set; attention is permutation-equivariant).
+    * Mean-pool over samples → permutation-invariant ``(V, hidden)``.
+    * Project to ``embd_dim`` → per-vertex data embedding.
+
+    With 5 calibration samples this is essentially free; for larger sample
+    counts the attention cost is O(S²) per vertex which is still tiny vs
+    the main encoder.
+    """
+
+    op_embedding: eqx.nn.Embedding
+    input_proj: eqx.nn.Linear
+    sample_attn: RelationalMultiheadAttention
+    output_proj: eqx.nn.Linear
+
+    hidden_dim: int = eqx.field(static=True)
+    num_heads: int = eqx.field(static=True)
+    op_embd_dim: int = eqx.field(static=True)
+    num_features: int = eqx.field(static=True)
+
+    def __init__(self, *, num_features, op_embd_dim, hidden_dim, num_heads,
+                 embd_dim, vocab_size, key):
+        keys = jrand.split(key, 4)
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.op_embd_dim = op_embd_dim
+        self.num_features = num_features
+        self.op_embedding = eqx.nn.Embedding(vocab_size, op_embd_dim, key=keys[0])
+        # +op_embd_dim for op_emb, +num_features-1 for continuous features
+        # (we drop column 0 since the op-type id is consumed by the embedding).
+        self.input_proj = eqx.nn.Linear(
+            op_embd_dim + num_features - 1, hidden_dim, key=keys[1],
+        )
+        self.sample_attn = RelationalMultiheadAttention(
+            num_heads, hidden_dim, key=keys[2],
+        )
+        self.output_proj = eqx.nn.Linear(hidden_dim, embd_dim, key=keys[3])
+
+    def __call__(self, per_sample_features, *, key):
+        """``per_sample_features``: ``(S, V, F)``. Returns ``(V, embd_dim)``."""
+        S, V, _ = per_sample_features.shape
+        op_ids = per_sample_features[0, :, 0].astype(jnp.int32)
+        op_emb = jax.vmap(self.op_embedding)(op_ids)            # (V, op_d)
+        cont = per_sample_features[:, :, 1:]                    # (S, V, F-1)
+        op_emb_b = jnp.broadcast_to(op_emb[None, :, :], (S, V, op_emb.shape[-1]))
+        combined = jnp.concatenate([op_emb_b, cont], axis=-1)   # (S, V, op_d+F-1)
+        h = jax.vmap(jax.vmap(self.input_proj))(combined)       # (S, V, hidden)
+
+        # Self-attention over samples, per-vertex independently.
+        h_perm = jnp.transpose(h, (1, 0, 2))                    # (V, S, hidden)
+        attn_keys = jrand.split(key, V)
+        h_attn = jax.vmap(
+            lambda x, k: self.sample_attn(x, x, x, key=k)
+        )(h_perm, attn_keys)                                    # (V, S, hidden)
+
+        pooled = jnp.mean(h_attn, axis=1)                       # (V, hidden)
+        return jax.vmap(self.output_proj)(pooled)               # (V, embd_dim)
+
+
+class CachedEncoding(NamedTuple):
+    """Per-rollout cache for the B.4.next "encode once" path.
+
+    Captured from the initial residual jaxpr at episode start; reused for
+    every step of the rollout (and at loss time) instead of re-running the
+    transformer stack on the per-step residual jaxpr. The residual state is
+    the only thing that varies inside an episode.
+    """
+
+    enc_x: jax.Array          # (T, embd_dim) — full encoder output
+    token_mask: jax.Array     # (T,) bool, non-pad tokens
+    summary: jax.Array        # (embd_dim,) masked-mean over enc_x
+    vertex_logits_base: jax.Array     # (V,) before per-step masking
+    vertex_contexts_base: jax.Array   # (V, embd_dim) pre-residual / pre-data
+
+
+class ResidualStateUpdate(eqx.Module):
+    """Stage B.4: small recurrent update on the per-vertex residual state.
+
+    Spec calls for tracking the cumulative effect of past eliminations so the
+    decoder can condition on what's already happened without re-encoding the
+    full residual jaxpr. The minimal-viable form here is a per-slot GRU-style
+    gate: when vertex ``v`` is eliminated, blend its new representation into
+    ``s_v`` with a learned scalar gate; other slots are unchanged.
+
+    A future B.4.next can extend this to propagate updates through the DAG
+    neighbours of the eliminated vertex (using the relation masks from B.1)
+    so the residual carries dataflow information beyond just "this vertex
+    was eliminated".
+    """
+
+    event_proj: eqx.nn.Linear
+    decay_logit: jax.Array
+
+    residual_dim: int = eqx.field(static=True)
+
+    def __init__(self, *, residual_dim: int, key):
+        keys = jrand.split(key, 2)
+        self.residual_dim = residual_dim
+        self.event_proj = eqx.nn.Linear(residual_dim, residual_dim, key=keys[0])
+        # Initialised at 0 → gate sigmoid(0) = 0.5; first-step blend is
+        # symmetric. Letting this become a learned scalar saves us from
+        # picking a hyperparameter.
+        self.decay_logit = jnp.zeros((), dtype=jnp.float32)
+
+    def __call__(self, residual_state, vertex_idx, vertex_repr):
+        """Update slot ``vertex_idx`` of ``residual_state`` with ``vertex_repr``.
+
+        ``residual_state`` is `(V, residual_dim)`; ``vertex_repr`` is
+        `(residual_dim,)`. Returns a new array of the same shape.
+        """
+        gate = jnn.sigmoid(self.decay_logit)
+        update = self.event_proj(vertex_repr)
+        new_slot = residual_state[vertex_idx] * (1.0 - gate) + update * gate
+        return residual_state.at[vertex_idx].set(new_slot)
+
+
 class Agent(eqx.Module):
-    """Encoder + composable (vertex policy, rule policy) + value head."""
+    """Encoder + composable (vertex policy, rule policy) + split value head.
+
+    The value head is split into `compute_value_head` (6 outputs — one per
+    cost-family reward index) and `quality_value_head` (2 outputs — cosine and
+    Frobenius). Their concatenation is the (NUM_REWARDS,) = (8,) value vector
+    that the rest of the trainer consumes; splitting them at the head keeps
+    gradient scales sane across the qualitatively different reward families,
+    which is what the architecture spec calls for.
+
+    Stage B.2.A adds a data-dependent path: when `vertex_features` are
+    supplied, the agent embeds the per-vertex op-type id and projects the
+    remaining `NUM_VERTEX_FEATURES - 1` continuous moments + static features
+    into the encoder's `embd_dim`, then *adds* the result to the per-vertex
+    contexts that feed both the rule policy and the value head. The op
+    embedding + projection are zero-initialised on the output side so the
+    initial behaviour matches the pre-B.2 agent and gradient signal can flow
+    in once features start mattering.
+    """
 
     embedding: eqx.nn.Embedding
     pos_enc: PositionalEncoder
     encoder: Encoder
     vertex_policy: eqx.Module
     rule_policy: eqx.Module
-    value_head: MLP
+    compute_value_head: MLP
+    quality_value_head: MLP
+    op_embedding: eqx.nn.Embedding
+    vertex_feature_proj: eqx.nn.Linear
+    # B.3: Set Transformer aggregator over calibration samples. Always
+    # constructed; only invoked when `vertex_features` arrives with a leading
+    # sample axis (rank-3) — the agent dispatches automatically.
+    set_transformer_agg: SetTransformerAggregator
+    residual_update: ResidualStateUpdate
+    # B.4.next: residual-state → summary projection used by the cached-encoding
+    # value path. Zero-initialised so the cached and re-encoding paths agree
+    # on the initial value at episode start (residual_state == 0).
+    residual_to_summary: eqx.nn.Linear
+    # F: preference-vector → embd_dim projection. Adds the per-episode
+    # preference w ∈ Δ^7 into the policy's per-vertex contexts and the
+    # value-head summary so a single net covers the whole Pareto front.
+    # Zero-initialised so the conditioned and unconditioned paths agree at
+    # step 0; gradient learns the conditioning from there.
+    pref_proj: eqx.nn.Linear
 
     num_vertices: int = eqx.field(static=True)
     num_rewards: int = eqx.field(static=True)
@@ -535,6 +1038,7 @@ class Agent(eqx.Module):
     num_pair_choices: int = eqx.field(static=True)
     num_factors: int = eqx.field(static=True)
     embd_dim: int = eqx.field(static=True)
+    op_embd_dim: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -544,49 +1048,192 @@ class Agent(eqx.Module):
         encoder,
         vertex_policy,
         rule_policy,
-        value_head,
+        compute_value_head,
+        quality_value_head,
+        op_embedding,
+        vertex_feature_proj,
+        set_transformer_agg,
+        residual_update,
+        residual_to_summary,
+        pref_proj,
         num_vertices,
         num_rewards,
         max_rules,
         num_pair_choices,
         num_factors,
         embd_dim,
+        op_embd_dim,
     ):
         self.embedding = embedding
         self.pos_enc = pos_enc
         self.encoder = encoder
         self.vertex_policy = vertex_policy
         self.rule_policy = rule_policy
-        self.value_head = value_head
+        self.compute_value_head = compute_value_head
+        self.quality_value_head = quality_value_head
+        self.op_embedding = op_embedding
+        self.vertex_feature_proj = vertex_feature_proj
+        self.set_transformer_agg = set_transformer_agg
+        self.residual_update = residual_update
+        self.residual_to_summary = residual_to_summary
+        self.pref_proj = pref_proj
         self.num_vertices = num_vertices
         self.num_rewards = num_rewards
         self.max_rules = max_rules
         self.num_pair_choices = num_pair_choices
         self.num_factors = num_factors
         self.embd_dim = embd_dim
+        self.op_embd_dim = op_embd_dim
 
-    def encode(self, tokens, key=None):
+    def _data_embedding(self, vertex_features, *, agg_key=None):
+        """Project per-vertex features to a per-vertex embedding ``(V, embd_dim)``.
+
+        Two input shapes are accepted, dispatched on rank:
+
+        * ``(V, NUM_VERTEX_FEATURES)`` — already aggregated across samples
+          (Stage B.2.A path). Goes through :attr:`vertex_feature_proj`.
+        * ``(S, V, NUM_VERTEX_FEATURES)`` — per-sample features (Stage B.3).
+          The :class:`SetTransformerAggregator` is invoked to do a learned,
+          permutation-invariant pool across the sample axis.
+        """
+        if vertex_features.ndim == 3:
+            key = agg_key if agg_key is not None else jrand.PRNGKey(0)
+            return self.set_transformer_agg(vertex_features, key=key)
+        op_ids = vertex_features[:, 0].astype(jnp.int32)
+        op_emb = jax.vmap(self.op_embedding)(op_ids)
+        cont = vertex_features[:, 1:]
+        combined = jnp.concatenate([op_emb, cont], axis=-1)
+        return jax.vmap(self.vertex_feature_proj)(combined)
+
+    def encode_once(self, tokens, eqn_ids=None, *, key=None) -> CachedEncoding:
+        """B.4.next: encode the residual jaxpr *once* per episode.
+
+        Returns a :class:`CachedEncoding` capturing everything the per-step
+        decoder path needs that doesn't depend on the residual state. Reuse
+        this for every step of the rollout instead of re-running the
+        transformer stack on the per-step residual jaxpr.
+        """
         token_mask = tokens != 0
         mask = token_mask[..., None]
         x = jax.vmap(self.embedding)(tokens)
         x = self.pos_enc(x)
         enc_key = key if key is not None else jrand.PRNGKey(0)
-        enc_x = self.encoder(x, key=enc_key)
+        enc_x = self.encoder(x, eqn_ids=eqn_ids, key=enc_key)
+        vertex_logits_base, vertex_contexts_base = self.vertex_policy(
+            enc_x, token_mask,
+        )
+        summary = jnp.sum(enc_x * mask, axis=0) / jnp.maximum(
+            jnp.sum(mask, axis=0), 1e-9
+        )
+        return CachedEncoding(
+            enc_x=enc_x,
+            token_mask=token_mask,
+            summary=summary,
+            vertex_logits_base=vertex_logits_base,
+            vertex_contexts_base=vertex_contexts_base,
+        )
+
+    def _decode_from_cache(self, cached, vertex_features, residual_state,
+                           preference=None):
+        """Combine cached encoding with per-step residual_state / data feats /
+        Stage F preference vector."""
+        vertex_logits = cached.vertex_logits_base
+        vertex_contexts = cached.vertex_contexts_base
+        if vertex_features is not None:
+            vertex_contexts = vertex_contexts + self._data_embedding(vertex_features)
+        if residual_state is not None:
+            vertex_contexts = vertex_contexts + residual_state
+            residual_summary = jnp.mean(residual_state, axis=0)
+            summary_eff = cached.summary + self.residual_to_summary(residual_summary)
+        else:
+            summary_eff = cached.summary
+        if preference is not None:
+            pref_emb = self.pref_proj(preference)
+            vertex_contexts = vertex_contexts + pref_emb[None, :]
+            summary_eff = summary_eff + pref_emb
+        compute_value = self.compute_value_head(summary_eff)
+        quality_value = self.quality_value_head(summary_eff)
+        value = jnp.concatenate([compute_value, quality_value], axis=-1)
+        return vertex_logits, vertex_contexts, value
+
+    def encode(
+        self,
+        tokens,
+        eqn_ids=None,
+        vertex_features=None,
+        residual_state=None,
+        preference=None,
+        key=None,
+    ):
+        token_mask = tokens != 0
+        mask = token_mask[..., None]
+        x = jax.vmap(self.embedding)(tokens)
+        x = self.pos_enc(x)
+        enc_key = key if key is not None else jrand.PRNGKey(0)
+        # Stage B.1: when `eqn_ids` is provided, the encoder layers add
+        # learned per-relation biases derived from it. When None, the encoder
+        # falls back to vanilla self-attention so the path is preserved for
+        # callers that haven't been wired yet.
+        enc_x = self.encoder(x, eqn_ids=eqn_ids, key=enc_key)
 
         vertex_logits, vertex_contexts = self.vertex_policy(enc_x, token_mask)
+
+        # Stage B.2.A: fold per-vertex data features into the per-vertex
+        # contexts so the rule policy and value head are conditioned on
+        # the calibration-sample-derived signal alongside the IR encoding.
+        if vertex_features is not None:
+            vertex_contexts = vertex_contexts + self._data_embedding(vertex_features)
+
+        # Stage B.4: add the cumulative-elimination residual state so the
+        # decoder can condition on which vertices have already been picked
+        # without paying for re-encoding the residual jaxpr from scratch.
+        if residual_state is not None:
+            vertex_contexts = vertex_contexts + residual_state
 
         summary = jnp.sum(enc_x * mask, axis=0) / jnp.maximum(
             jnp.sum(mask, axis=0), 1e-9
         )
-        return vertex_logits, vertex_contexts, self.value_head(summary)
+        # Stage F: add the per-episode preference projection to both the
+        # per-vertex contexts (so the rule head sees w) and the summary
+        # (so the value heads see w). With pref_proj zero-initialised the
+        # path is a no-op at step 0 and matches the unconditioned baseline.
+        if preference is not None:
+            pref_emb = self.pref_proj(preference)
+            vertex_contexts = vertex_contexts + pref_emb[None, :]
+            summary = summary + pref_emb
+        compute_value = self.compute_value_head(summary)
+        quality_value = self.quality_value_head(summary)
+        value = jnp.concatenate([compute_value, quality_value], axis=-1)
+        return vertex_logits, vertex_contexts, value
 
-    def value_for(self, tokens, key=None):
-        _, _, value = self.encode(tokens, key=key)
+    def value_for(
+        self, tokens, eqn_ids=None, vertex_features=None,
+        residual_state=None, preference=None, key=None,
+    ):
+        _, _, value = self.encode(
+            tokens, eqn_ids=eqn_ids, vertex_features=vertex_features,
+            residual_state=residual_state, preference=preference, key=key,
+        )
         return value
 
-    def sample_action(self, tokens, vertex_avail_mask, pair_valid_mask, key):
+    def sample_action(
+        self, tokens, vertex_avail_mask, pair_valid_mask, pair_factor_mask, key,
+        eqn_ids=None, vertex_features=None, residual_state=None,
+        cached_encoding=None, pin_rules_to_exact: bool = False,
+        pin_factor_idx: int | None = None,
+        preference=None,
+    ):
         net_key, vertex_key, rule_key = jrand.split(key, 3)
-        vertex_logits, vertex_contexts, value = self.encode(tokens, key=net_key)
+        if cached_encoding is None:
+            vertex_logits, vertex_contexts, value = self.encode(
+                tokens, eqn_ids=eqn_ids, vertex_features=vertex_features,
+                residual_state=residual_state, preference=preference, key=net_key,
+            )
+        else:
+            vertex_logits, vertex_contexts, value = self._decode_from_cache(
+                cached_encoding, vertex_features, residual_state,
+                preference=preference,
+            )
 
         masked_v_logits = jnp.where(vertex_avail_mask > 0.5, vertex_logits, -1e9)
         vertex_dist = jnn.softmax(masked_v_logits, axis=-1)
@@ -594,9 +1241,19 @@ class Agent(eqx.Module):
 
         v_context = vertex_contexts[vertex_idx]
         v_pair_mask = pair_valid_mask[vertex_idx]
-        pair_seq, factor_seq, pair_dists, factor_dists = self.rule_policy.sample(
-            v_context, v_pair_mask, rule_key
-        )
+        v_factor_mask = pair_factor_mask[vertex_idx]
+        if pin_rules_to_exact:
+            pair_seq, factor_seq, pair_dists, factor_dists = (
+                self._pinned_rule_outputs()
+            )
+        else:
+            pair_seq, factor_seq, pair_dists, factor_dists = self.rule_policy.sample(
+                v_context, v_pair_mask, v_factor_mask, rule_key,
+                pin_factor_idx=pin_factor_idx,
+            )
+        # `v_context` is the chosen vertex's representation as fed to the
+        # rule head — exactly what the B.4 residual update wants to remember
+        # about this elimination event.
         return (
             vertex_idx,
             pair_seq,
@@ -605,7 +1262,35 @@ class Agent(eqx.Module):
             pair_dists,
             factor_dists,
             value,
+            v_context,
         )
+
+    def update_residual(self, residual_state, vertex_idx, vertex_repr):
+        """Apply the per-slot recurrent update to ``residual_state``."""
+        return self.residual_update(residual_state, vertex_idx, vertex_repr)
+
+    def _pinned_rule_outputs(self):
+        """Stage C: exact-AD pinned rule outputs.
+
+        Returns ``(pair_seq, factor_seq, pair_dists, factor_dists)`` where
+        every slot is STOP / factor 0 and the distributions are degenerate
+        one-hots at those values. The policy is therefore identity in this
+        mode — the rule head receives zero gradient and the env always sees
+        a no-rules action (exact AD), letting the vertex pointer carry the
+        whole learning signal as the spec calls for.
+        """
+        max_rules = self.max_rules
+        pair_seq = jnp.full((max_rules,), PAIR_STOP, dtype=jnp.int32)
+        factor_seq = jnp.zeros((max_rules,), dtype=jnp.int32)
+        pair_dists = jnp.broadcast_to(
+            jnn.one_hot(PAIR_STOP, self.num_pair_choices)[None, :],
+            (max_rules, self.num_pair_choices),
+        )
+        factor_dists = jnp.broadcast_to(
+            jnn.one_hot(0, self.num_factors)[None, :],
+            (max_rules, self.num_factors),
+        )
+        return pair_seq, factor_seq, pair_dists, factor_dists
 
     def evaluate_action(
         self,
@@ -615,9 +1300,26 @@ class Agent(eqx.Module):
         factor_seq,
         vertex_avail_mask,
         pair_valid_mask,
+        pair_factor_mask,
         key,
+        eqn_ids=None,
+        vertex_features=None,
+        residual_state=None,
+        cached_encoding=None,
+        pin_rules_to_exact: bool = False,
+        pin_factor_idx: int | None = None,
+        preference=None,
     ):
-        vertex_logits, vertex_contexts, value = self.encode(tokens, key=key)
+        if cached_encoding is None:
+            vertex_logits, vertex_contexts, value = self.encode(
+                tokens, eqn_ids=eqn_ids, vertex_features=vertex_features,
+                residual_state=residual_state, preference=preference, key=key,
+            )
+        else:
+            vertex_logits, vertex_contexts, value = self._decode_from_cache(
+                cached_encoding, vertex_features, residual_state,
+                preference=preference,
+            )
 
         masked_v_logits = jnp.where(vertex_avail_mask > 0.5, vertex_logits, -1e9)
         vertex_dist = jnn.softmax(masked_v_logits, axis=-1)
@@ -626,6 +1328,16 @@ class Agent(eqx.Module):
 
         v_context = vertex_contexts[vertex_idx]
         v_pair_mask = pair_valid_mask[vertex_idx]
+        v_factor_mask = pair_factor_mask[vertex_idx]
+        if pin_rules_to_exact:
+            # Skip the rule policy entirely. Stage C: the recorded action is
+            # always (STOP, factor 0); the log-prob is 0 (deterministic) and
+            # entropy is 0 too — no gradient flows through the rule head.
+            _, _, pair_dists, factor_dists = self._pinned_rule_outputs()
+            zero = jnp.array(0.0, dtype=jnp.float32)
+            total_log_p = log_p_vertex
+            total_entropy = vertex_ent
+            return total_log_p, total_entropy, value, vertex_dist, pair_dists, factor_dists
         (
             lp_pairs,
             lp_factors,
@@ -633,7 +1345,10 @@ class Agent(eqx.Module):
             ent_factors,
             pair_dists,
             factor_dists,
-        ) = self.rule_policy.evaluate(v_context, v_pair_mask, pair_seq, factor_seq)
+        ) = self.rule_policy.evaluate(
+            v_context, v_pair_mask, v_factor_mask, pair_seq, factor_seq,
+            pin_factor_idx=pin_factor_idx,
+        )
 
         total_log_p = log_p_vertex + jnp.sum(lp_pairs) + jnp.sum(lp_factors)
         total_entropy = vertex_ent + jnp.sum(ent_pairs) + jnp.sum(ent_factors)
@@ -680,10 +1395,22 @@ def make_argparser() -> argparse.ArgumentParser:
                    choices=["graphax", "flops", "latency"])
     p.add_argument("--mem-type", type=str, default="peak_memory",
                    choices=["graphax", "bytes_accessed", "peak_memory"])
+    # Reward selection / weighting. The env now reports the full 8-component
+    # vector `REWARD_NAMES` every step; these flags determine how those
+    # components are combined into the scalar advantage used by PPO. The
+    # defaults reproduce the legacy `[-cmp, error, -mem]` behaviour with
+    # `cmp` and `mem` mapped to whichever components `--cmp-type` / `--mem-type`
+    # select. `--lambda-frob` is new and defaults to 0 (Frobenius residual is
+    # measured but not weighted unless explicitly opted into).
     p.add_argument("--rewards", nargs="+", type=str,
                    default=["cmp", "mem", "acc"], choices=["cmp", "mem", "acc"])
     p.add_argument("--lambda-cmp", type=float, default=1.0)
     p.add_argument("--lambda-mem", type=float, default=1.0)
+    p.add_argument("--lambda-frob", type=float, default=0.0,
+                   help="Weight on the Frobenius-residual reward component (idx 7). Default 0.")
+    p.add_argument("--measure-latency", action="store_true",
+                   help="Run the compiled approx fn 10x per env step to populate the latency reward "
+                        "component. Significantly slower; turn on only when latency is being weighted.")
     p.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "none"])
     p.add_argument("--dataset-size", type=int, default=-1)
     p.add_argument("--num-eval-samples", type=int, default=10)
@@ -720,6 +1447,8 @@ def make_argparser() -> argparse.ArgumentParser:
     # Network architecture
     p.add_argument("--vocab-size", type=int, default=256)
     p.add_argument("--embd-dim", type=int, default=32)
+    p.add_argument("--op-embd-dim", type=int, default=8,
+                   help="Per-vertex op-type embedding dimension (Stage B.2.A).")
     p.add_argument("--num-layers", type=int, default=2)
     p.add_argument("--num-heads", type=int, default=2)
     p.add_argument("--hidden-dim", type=int, default=64)
@@ -746,15 +1475,126 @@ def make_argparser() -> argparse.ArgumentParser:
                    help="Cosine decay floor as a multiple of the initial learning rate.")
     p.add_argument("--head-init-scale", type=float, default=0.1,
                    help="Multiplier applied to output-head weights at startup for a near-uniform initial policy.")
+    p.add_argument("--pretrained-encoder", type=str, default=None,
+                   help="Path to a `PretrainModel` saved by `alphagrad.approx.pretrain` "
+                        "(Stage B.5). When set, the embedding/pos_enc/encoder modules "
+                        "of the freshly-built agent are replaced with the pretrained ones.")
+    p.add_argument("--cache-encoding", action="store_true",
+                   help="Stage B.4.next: encode the residual jaxpr once at the start "
+                        "of each rollout episode and reuse the encoder output for every "
+                        "step. The residual state captures per-step variation; the value "
+                        "head consumes summary + W_residual @ mean(residual_state). At "
+                        "loss time the same cached path is used, so policy/value "
+                        "definitions match between rollout and training.")
+    p.add_argument("--pin-rules-to-exact", action="store_true",
+                   help="Stage C: pin the axis-pair / factor heads to exact-AD "
+                        "(every slot = STOP, factor 0). The rule policy is skipped "
+                        "entirely so gradient only flows through the vertex head. "
+                        "Use this when isolating elimination-order learning from "
+                        "approximation choice.")
+    p.add_argument("--pin-factor", type=int, default=None,
+                   help="Stage D: pin every emitted factor to this VALUE from "
+                        "--factors (e.g. -1 for the gcd-collapse / strict-diagonal "
+                        "default). The axis-pair head still trains; the factor "
+                        "head's contribution is deterministic so its log-prob "
+                        "and entropy are zero. Mutually exclusive with "
+                        "--pin-rules-to-exact.")
+    p.add_argument("--axis-warmup-steps", type=int, default=0,
+                   help="Stage D head curriculum (§3.2): linearly ramp the "
+                        "axis-pair head's LR multiplier from 1/3 → 1 over the "
+                        "first N optimizer steps after which point it stays at 1. "
+                        "0 = ramp disabled, full LR from step 0. The vertex and "
+                        "shared params always run at full base LR.")
+    p.add_argument("--factor-warmup-steps", type=int, default=0,
+                   help="Stage E head curriculum: same ramp, applied to the "
+                        "factor head. 0 = no ramp.")
+    p.add_argument("--sparsity-ratio", action="store_true",
+                   help="Stage E: replace the categorical factor head with a "
+                        "scalar sparsity-ratio coordinate ρ ∈ [0, 1] that "
+                        "snap-mixes onto the two adjacent valid factors (§2.2). "
+                        "Implies --autoreg (no effect on --not-autoreg). "
+                        "The factor table is mapped to ρ via "
+                        "ρ_i = (1 - 1/f_i) / (1 - 1/f_max), with f=-1 → ρ=1.")
+    p.add_argument("--rho-prior-bias", type=float, default=4.0,
+                   help="Stage E prior anneal: initial bias added to the "
+                        "rho_head's output. With the default 4.0 the initial "
+                        "ρ ≈ sigmoid(4) = 0.982, matching Stage D's "
+                        "strict-diagonal pin. Gradient pulls the bias down "
+                        "as training learns useful per-op factors. Set to "
+                        "0 to disable the prior anneal entirely.")
+    p.add_argument("--preference-conditioned", action="store_true",
+                   help="Stage F: train a single preference-conditioned policy "
+                        "πθ(a | s, w) where w ∈ Δ^7 over the 8-vec reward simplex. "
+                        "w is sampled per episode from Dirichlet(α) with α set by "
+                        "--dirichlet-alpha; the same w drives advantage weighting. "
+                        "When off, the static --lambda-* CLI weights are used.")
+    p.add_argument("--dirichlet-alpha", type=float, default=0.3,
+                   help="Concentration parameter for the corner-emphasis "
+                        "component of the Stage F preference mixture. Values "
+                        "< 1 emphasise corners and edges of the simplex so "
+                        "the policy sees pure-FLOP / pure-quality regimes.")
+    p.add_argument("--dirichlet-alpha-uniform", type=float, default=1.0,
+                   help="Concentration parameter for the uniform-coverage "
+                        "component of the mixture. Spec calls for both "
+                        "corners and interior coverage; this is the interior "
+                        "side. Default α=1.0 yields a uniform Dirichlet.")
+    p.add_argument("--dirichlet-mix-ratio", type=float, default=0.5,
+                   help="Probability of drawing each per-env preference from "
+                        "the corner Dirichlet (the rest go through the "
+                        "uniform component). 0.5 ≈ even mixture (spec "
+                        "recommendation); 1.0 = corners only; 0.0 = uniform "
+                        "only.")
+    p.add_argument(
+        "--lagrangian-constraint", action="append", default=[],
+        metavar="NAME>=THRESH",
+        help="Stage F hard-constraint deployment. Each occurrence adds a "
+             "constraint of the form `<reward_name>>=<threshold>` (rewards "
+             "are 'higher is better'; e.g. cosine_sim>=0.8, or for cost "
+             "components flops>=-1e10 to cap FLOPs at 1e10). The trainer "
+             "augments the per-step advantage with -λ_i · max(0, t_i - r_i) "
+             "and updates λ_i ≥ 0 by dual ascent on the mean violation. "
+             "May be repeated; default no constraints (= unconstrained PPO).",
+    )
+    p.add_argument(
+        "--lagrangian-lr", type=float, default=1e-2,
+        help="Dual-ascent step size on the Lagrangian multipliers, applied "
+             "once per episode against the mean per-step violation.",
+    )
+    p.add_argument("--calibrate-steps", type=int, default=0,
+                   help="Stage G: after the main training loop, run this many "
+                        "few-shot calibration episodes against the env's "
+                        "calibration samples. Only the factor head and Set "
+                        "Transformer aggregator update; all other modules are "
+                        "frozen via gradient masking. Reward weights for these "
+                        "episodes are quality-focused (cosine + Frob) so the "
+                        "calibration signal matches what the spec calls for.")
+    p.add_argument("--calibrate-lr", type=float, default=1e-3,
+                   help="Adam learning rate for the calibration optimizer. "
+                        "Independent of the main optimizer's state, since "
+                        "the calibration signal is a different objective.")
+    p.add_argument("--potential-shaping", type=float, default=0.0,
+                   help="Stage C: scale on potential-based reward shaping. "
+                        "Augments per-step reward with `c · (γ V_ψ(s') - V_ψ(s))` "
+                        "(values stop-gradient'd) so long-horizon vertex-elim "
+                        "rollouts get a denser per-step learning signal "
+                        "without biasing the optimum (Ng et al. 1999). "
+                        "0.0 disables; spec recommends starting around 0.1.")
+    p.add_argument("--bc-warmstart-steps", type=int, default=0,
+                   help="Stage C: number of supervised cross-entropy steps "
+                        "training the vertex pointer to match the Markowitz "
+                        "min-degree heuristic before PPO begins. 0 = skip.")
+    p.add_argument("--bc-lr", type=float, default=1e-3,
+                   help="Learning rate for the BC warm-start phase.")
+    p.add_argument("--set-transformer-agg", action="store_true",
+                   help="Stage B.3: aggregate per-vertex features across the "
+                        "calibration samples with a learned Set Transformer "
+                        "instead of a simple mean. Lets the policy distinguish "
+                        "stable behaviour from sample-specific accidents.")
 
     # Reporting
     p.add_argument("--top-n", type=int, default=10)
     p.add_argument("--capture-perfect-grads", action="store_true",
                    help="Allow the top-N accuracy heap to keep trajectories with cosine similarity == 1.0.")
-    p.add_argument("--stats-out", type=str, default=None,
-                   help="If set, dump per-component reward statistics (mean/std/min/max/etc.) "
-                        "across all (episode, env) samples to this JSON path on completion. "
-                        "Used by dispatch_nns.py to compute --lambda-cmp/--lambda-mem for the next phase.")
 
     return p
 
@@ -787,6 +1627,36 @@ def _resolve_main_device(args):
     return gpus[0]
 
 
+def _compute_sparsity_ratios(factors_py: tuple[int, ...]) -> np.ndarray:
+    """Map factor values to sparsity ratios per the spec (§2.2).
+
+    For positive factors:  ``ρ_i = (1 - 1/f_i) / (1 - 1/f_max)``.
+    Special values:  ``f == -1`` → ρ = 1 (gcd-collapse / strict-diagonal
+    convention);  ``f == 0`` or ``f == 1`` → ρ = 0 (dense / no compression).
+
+    Returns the ratios sorted ascending alongside an order array so the
+    rule-policy decoder sees a monotone table for ``searchsorted``.
+    """
+    factors = np.asarray(factors_py, dtype=np.float32)
+    pos = factors[factors > 1]
+    if pos.size == 0:
+        # Pure dense table — every factor maps to ρ=0 except f=-1 which
+        # we lift to 1. Avoid 1/(1-1/1) = 0/0.
+        f_max = 2.0
+    else:
+        f_max = float(pos.max())
+
+    ratios = np.zeros_like(factors)
+    for i, f in enumerate(factors):
+        if f == -1:
+            ratios[i] = 1.0
+        elif f <= 1:
+            ratios[i] = 0.0
+        else:
+            ratios[i] = (1.0 - 1.0 / f) / (1.0 - 1.0 / f_max)
+    return ratios
+
+
 def _build_factor_table(args, use_autoreg: bool):
     factors_py = tuple(_parse_int_list(args.factors))
     if not factors_py:
@@ -803,6 +1673,22 @@ def _build_factor_table(args, use_autoreg: bool):
         # Single-rule policy emits exactly one rule with factor=-1; the factor table is unused.
         factors_py = (-1,)
         max_rules = 1
+
+    # Stage E: when sparsity-ratio reparam is on, the factor table must be
+    # sorted by ρ ascending and have distinct ratios so the policy's
+    # `searchsorted` snap is well-defined. We sort here so trajectory
+    # factor_idx values index the same (sorted) table the policy sees.
+    if use_autoreg and getattr(args, "sparsity_ratio", False):
+        ratios = _compute_sparsity_ratios(factors_py)
+        if len(set(float(r) for r in ratios)) != len(ratios):
+            raise ValueError(
+                f"--sparsity-ratio requires factors with distinct ρ-values. "
+                f"Got factors {factors_py} → ratios {ratios.tolist()}. "
+                f"e.g. `--factors=1,2,4` works (ρ ∈ {{0, 2/3, 1}}); "
+                f"avoid mixing -1 with f≥f_max because both produce ρ=1."
+            )
+        perm = np.argsort(ratios)
+        factors_py = tuple(int(factors_py[i]) for i in perm)
 
     factor_table = jnp.array(factors_py, dtype=jnp.int32)
     return factor_table, factors_py, factor_table.shape[0], max_rules
@@ -824,12 +1710,11 @@ def _build_agent(
     use_autoreg: bool,
     args,
     total_v: int,
-    num_rewards: int,
     num_factors: int,
     max_rules: int,
     key,
 ):
-    encoder_keys = jrand.split(key, 5)
+    encoder_keys = jrand.split(key, 12)
     embedding = eqx.nn.Embedding(args.vocab_size, args.embd_dim, key=encoder_keys[0])
     pos_enc = PositionalEncoder(args.embd_dim, MAX_TOKENS)
     encoder = Encoder(
@@ -851,13 +1736,27 @@ def _build_agent(
             key=encoder_keys[2],
         )
     if use_autoreg:
-        rule_policy = AutoregRulePolicy(
-            embd_dim=args.embd_dim,
-            max_rules=max_rules,
-            num_pair_choices=NUM_PAIR_CHOICES,
-            num_factors=num_factors,
-            key=encoder_keys[3],
-        )
+        if args.sparsity_ratio:
+            sparsity_ratios = _compute_sparsity_ratios(
+                tuple(_parse_int_list(args.factors))
+            )
+            rule_policy = SparsityRatioAutoregRulePolicy(
+                embd_dim=args.embd_dim,
+                max_rules=max_rules,
+                num_pair_choices=NUM_PAIR_CHOICES,
+                num_factors=num_factors,
+                sparsity_ratios=sparsity_ratios,
+                key=encoder_keys[3],
+                rho_init_bias=getattr(args, "rho_prior_bias", 4.0),
+            )
+        else:
+            rule_policy = AutoregRulePolicy(
+                embd_dim=args.embd_dim,
+                max_rules=max_rules,
+                num_pair_choices=NUM_PAIR_CHOICES,
+                num_factors=num_factors,
+                key=encoder_keys[3],
+            )
     else:
         rule_policy = SingleRulePolicy(
             embd_dim=args.embd_dim,
@@ -867,23 +1766,65 @@ def _build_agent(
             sp_dims=_parse_int_list(args.policy_dims),
             key=encoder_keys[3],
         )
-    value_head = MLP(
-        args.embd_dim, num_rewards, _parse_int_list(args.value_dims),
+    n_compute = len(COMPUTE_REWARD_INDICES)
+    n_quality = len(QUALITY_REWARD_INDICES)
+    compute_value_head = MLP(
+        args.embd_dim, n_compute, _parse_int_list(args.value_dims),
         key=encoder_keys[4],
     )
+    quality_value_head = MLP(
+        args.embd_dim, n_quality, _parse_int_list(args.value_dims),
+        key=encoder_keys[5],
+    )
+    op_embedding = eqx.nn.Embedding(
+        OP_TYPE_VOCAB_SIZE, args.op_embd_dim, key=encoder_keys[6],
+    )
+    # Continuous part of the feature vector = NUM_VERTEX_FEATURES - 1 (we drop
+    # column 0 / op_type_id which is consumed by the embedding).
+    proj_in_dim = args.op_embd_dim + NUM_VERTEX_FEATURES - 1
+    vertex_feature_proj = eqx.nn.Linear(
+        proj_in_dim, args.embd_dim, key=encoder_keys[7],
+    )
+    residual_update = ResidualStateUpdate(
+        residual_dim=args.embd_dim, key=encoder_keys[8],
+    )
+    residual_to_summary = eqx.nn.Linear(
+        args.embd_dim, args.embd_dim, key=encoder_keys[9],
+    )
+    # Hidden dim must be divisible by num_heads — keep it at embd_dim for
+    # simplicity. The aggregator is small (one attention block over the
+    # sample axis), so this isn't a meaningful parameter cost.
+    set_transformer_agg = SetTransformerAggregator(
+        num_features=NUM_VERTEX_FEATURES,
+        op_embd_dim=args.op_embd_dim,
+        hidden_dim=args.embd_dim,
+        num_heads=args.num_heads,
+        embd_dim=args.embd_dim,
+        vocab_size=OP_TYPE_VOCAB_SIZE,
+        key=encoder_keys[10],
+    )
+    pref_proj = eqx.nn.Linear(NUM_REWARDS, args.embd_dim, key=encoder_keys[11])
     return Agent(
         embedding=embedding,
         pos_enc=pos_enc,
         encoder=encoder,
         vertex_policy=vertex_policy,
         rule_policy=rule_policy,
-        value_head=value_head,
+        compute_value_head=compute_value_head,
+        quality_value_head=quality_value_head,
+        op_embedding=op_embedding,
+        vertex_feature_proj=vertex_feature_proj,
+        set_transformer_agg=set_transformer_agg,
+        residual_update=residual_update,
+        residual_to_summary=residual_to_summary,
+        pref_proj=pref_proj,
         num_vertices=total_v,
-        num_rewards=num_rewards,
+        num_rewards=NUM_REWARDS,
         max_rules=max_rules,
         num_pair_choices=NUM_PAIR_CHOICES,
         num_factors=num_factors,
         embd_dim=args.embd_dim,
+        op_embd_dim=args.op_embd_dim,
     )
 
 
@@ -901,13 +1842,49 @@ def _scale_output_heads(agent, scale: float, use_pointer: bool, use_autoreg: boo
         agent = scale_module_weight(
             agent, lambda a: a.rule_policy.decoder.pair_head.weight, scale
         )
-        agent = scale_module_weight(
-            agent, lambda a: a.rule_policy.decoder.factor_head.weight, scale
-        )
+        # The factor side is either ``factor_head`` (categorical, K logits) or
+        # ``rho_head`` (sparsity-ratio scalar) depending on which autoreg
+        # variant was constructed. Detect and scale the right one.
+        if hasattr(agent.rule_policy.decoder, "rho_head"):
+            agent = scale_module_weight(
+                agent, lambda a: a.rule_policy.decoder.rho_head.weight, scale
+            )
+        else:
+            agent = scale_module_weight(
+                agent, lambda a: a.rule_policy.decoder.factor_head.weight, scale
+            )
     else:
         agent = scale_module_weight(
             agent, lambda a: a.rule_policy.sp_head.layers[-2].weight, scale
         )
+    # Stage B.2.A: zero the data-feature projection's output so the initial
+    # data embedding is `0` and the agent's behaviour at step 0 matches the
+    # B.1 agent. Gradient still flows in normally once training starts.
+    agent = scale_module_weight(
+        agent, lambda a: a.vertex_feature_proj.weight, 0.0,
+    )
+    # B.3: zero the Set Transformer's output projection too. Same idea —
+    # initial data embedding from the per-sample path is exactly zero, so
+    # toggling --set-transformer-agg doesn't perturb the initial policy.
+    agent = scale_module_weight(
+        agent, lambda a: a.set_transformer_agg.output_proj.weight, 0.0,
+    )
+    # Stage B.4: zero the residual-update event projection so the residual
+    # state contributes nothing at initialisation. Same idea — keeps the
+    # initial policy distribution uncorrupted by uninitialised additive paths.
+    agent = scale_module_weight(
+        agent, lambda a: a.residual_update.event_proj.weight, 0.0,
+    )
+    # B.4.next: zero residual_to_summary so the cached-encoding value path
+    # produces the same initial summary as the re-encoding path.
+    agent = scale_module_weight(
+        agent, lambda a: a.residual_to_summary.weight, 0.0,
+    )
+    # F: zero the preference projection so the conditioned and
+    # unconditioned paths produce identical step-0 policies on the same seed.
+    agent = scale_module_weight(
+        agent, lambda a: a.pref_proj.weight, 0.0,
+    )
     return agent
 
 
@@ -929,8 +1906,387 @@ def _action_to_pylist(vertex_seq, pair_seq, factor_seq, max_rules, factor_table_
 
 
 # ---------------------------------------------------------------------------
+# Reward-weight helpers (Stage A: backward-compatible mapping from the legacy
+# `--cmp-type` / `--mem-type` / `--rewards` CLI surface onto the canonical
+# 8-component reward vector). Stage F will replace this with full preference
+# conditioning over the simplex.
+# ---------------------------------------------------------------------------
+
+
+_CMP_TYPE_TO_REWARD = {
+    "graphax": "muls_adds_fmas",
+    "flops": "flops",
+    "latency": "latency_ns",
+}
+_MEM_TYPE_TO_REWARD = {
+    "graphax": "max_io_sum",
+    "bytes_accessed": "bytes_accessed",
+    "peak_memory": "peak_memory",
+}
+
+
+def _cmp_reward_index(cmp_type: str) -> int:
+    return REWARD_INDEX[_CMP_TYPE_TO_REWARD[cmp_type]]
+
+
+def _mem_reward_index(mem_type: str) -> int:
+    return REWARD_INDEX[_MEM_TYPE_TO_REWARD[mem_type]]
+
+
+def parse_lagrangian_constraints(specs: list[str]) -> list[tuple[int, float]]:
+    """Parse ``--lagrangian-constraint`` strings to ``(reward_idx, threshold)`` pairs.
+
+    Format is ``<reward_name>>=<threshold>`` matching the canonical
+    ``REWARD_NAMES``. The constraint is interpreted as ``reward[idx] ≥
+    threshold`` (rewards are higher-is-better; cost components are stored
+    negated).
+    """
+    parsed: list[tuple[int, float]] = []
+    for s in specs:
+        if ">=" not in s:
+            raise ValueError(
+                f"--lagrangian-constraint must be of the form NAME>=THRESH, got {s!r}"
+            )
+        name, thresh_s = s.split(">=", 1)
+        name = name.strip()
+        if name not in REWARD_INDEX:
+            raise ValueError(
+                f"Unknown reward name {name!r} in constraint {s!r}; "
+                f"valid names: {list(REWARD_INDEX.keys())}"
+            )
+        parsed.append((REWARD_INDEX[name], float(thresh_s.strip())))
+    return parsed
+
+
+def _build_reward_weights(args) -> np.ndarray:
+    """Map legacy CLI flags to a (NUM_REWARDS,) advantage-weight vector.
+
+    `--rewards` selects which families contribute; within a family the weight
+    lands on the canonical component picked by `--cmp-type` / `--mem-type`.
+    Quality terms: cosine gets weight 1.0 (matching legacy behaviour) when
+    "acc" is in `--rewards`; Frobenius gets `--lambda-frob` (default 0).
+    """
+    weights = np.zeros(NUM_REWARDS, dtype=np.float32)
+    if "cmp" in args.rewards:
+        weights[_cmp_reward_index(args.cmp_type)] = args.lambda_cmp
+    if "mem" in args.rewards:
+        weights[_mem_reward_index(args.mem_type)] = args.lambda_mem
+    if "acc" in args.rewards:
+        weights[REWARD_INDEX["cosine_sim"]] = 1.0
+    if args.lambda_frob != 0.0:
+        weights[REWARD_INDEX["frob_residual"]] = args.lambda_frob
+    return weights
+
+
+# ---------------------------------------------------------------------------
+# Stage D: per-head learning-rate ramp
+# ---------------------------------------------------------------------------
+
+
+# Single source of truth for the per-head parameter taxonomy. Each entry maps
+# a head label to the substrings that identify that head's parameters in the
+# agent pytree's path strings. ``defstructure``-style: add a label here once
+# and every downstream consumer (LR ramp, freeze mask, calibration mask) sees
+# it. Keep the entries narrow — the smallest set of params whose updates are
+# *exclusively* driven by that head's gradient signal.
+_HEAD_PATH_MARKERS: dict[str, tuple[str, ...]] = {
+    "axis": (
+        "rule_policy.decoder.pair_head",
+        "rule_policy.decoder.rnn_proj",
+        "rule_policy.decoder.pair_embed",
+        "rule_policy.decoder.slot_embed",
+        "rule_policy.sp_head",  # legacy SingleRulePolicy axis head
+    ),
+    "factor": (
+        "rule_policy.decoder.factor_head",
+        "rule_policy.decoder.rho_head",  # Stage E sparsity-ratio variant
+        "rule_policy.decoder.factor_embed",
+    ),
+    "aggregator": (
+        "set_transformer_agg",
+    ),
+}
+
+
+def _path_in(path: str, head: str) -> bool:
+    return any(marker in path for marker in _HEAD_PATH_MARKERS[head])
+
+
+def _build_param_mask(agent, predicate) -> "jax.Array":
+    """Build a bool pytree aligned with ``eqx.filter(agent, eqx.is_inexact_array)``
+    where each leaf is True iff its path matches ``predicate(path_str)``."""
+    params = eqx.filter(agent, eqx.is_inexact_array)
+    leaves_with_path, treedef = jax.tree_util.tree_flatten_with_path(params)
+    return treedef.unflatten([
+        jnp.full_like(leaf, predicate(jax.tree_util.keystr(path)), dtype=jnp.bool_)
+        for path, leaf in leaves_with_path
+    ])
+
+
+def _build_head_masks(agent):
+    """Return ``(axis_mask, factor_mask)`` — bool trees for the LR ramp."""
+    return (
+        _build_param_mask(agent, lambda p: _path_in(p, "axis")),
+        _build_param_mask(agent, lambda p: _path_in(p, "factor")),
+    )
+
+
+def _build_calibration_mask(agent):
+    """Stage G: True = trainable during calibration (factor head + aggregator),
+    False = frozen (encoder, vertex head, axis-pair head, value heads, …)."""
+    return _build_param_mask(
+        agent,
+        lambda p: _path_in(p, "factor") or _path_in(p, "aggregator"),
+    )
+
+
+def _head_lr_mult(step: "jax.Array", warmup_steps: int) -> "jax.Array":
+    """Linear warm-up multiplier from 1/3 → 1 over `warmup_steps` steps.
+
+    Matches §3.2 of the architecture spec with ``T_h = 0`` (head introduced
+    at the start of this run). Returns 1.0 when ``warmup_steps <= 0``.
+    """
+    if warmup_steps <= 0:
+        return jnp.array(1.0, dtype=jnp.float32)
+    frac = jnp.minimum(step.astype(jnp.float32) / float(warmup_steps), 1.0)
+    return (1.0 / 3.0) + (2.0 / 3.0) * frac
+
+
+def _scale_grads(grads, axis_mask, factor_mask, freeze_mask,
+                 axis_mult, factor_mult):
+    """Single fused per-leaf gradient scaling.
+
+    Combines the Stage D head-LR ramp (per-head multiplier on axis / factor
+    params) with the Stage G freeze mask (zero gradient for non-trainable
+    params during calibration) into one pass through the pytree. One
+    ``tree_map`` instead of two means half as many ``where`` ops in the
+    compiled jaxpr.
+    """
+    return jax.tree_util.tree_map(
+        lambda g, am, fm, fz: jnp.where(
+            fz, g * jnp.where(am, axis_mult, jnp.where(fm, factor_mult, 1.0)),
+            jnp.zeros_like(g),
+        ),
+        grads, axis_mask, factor_mask, freeze_mask,
+    )
+
+
+def run_calibration_phase(
+    agent, opt_state, env, env_episode_template_args,
+    *, train_episode, reset_envs, num_envs, args, global_step, key,
+):
+    """Stage G: few-shot calibration loop.
+
+    Freezes everything except the factor head + Set Transformer aggregator
+    (via ``cal_mask``), forces a quality-focused preference vector, and
+    runs ``args.calibrate_steps`` extra episodes through the same
+    ``train_episode`` JIT'd path used during PPO. Reuses the main
+    optimizer state so no JIT recompile fires.
+
+    ``env_episode_template_args = (closed_jaxpr, base_args, argnums)``
+    captures the jaxpr details needed to recompute per-vertex features each
+    episode without pulling all of `main`'s closure into the call site.
+    """
+    closed_jaxpr, base_args, argnums = env_episode_template_args
+
+    cal_mask = _build_calibration_mask(agent)
+    leaves = jax.tree_util.tree_leaves(cal_mask)
+    n_cal = sum(int(jnp.sum(l.astype(jnp.int32))) for l in leaves)
+    n_total = sum(int(l.size) for l in leaves)
+    print(
+        f"\nStage G: calibrating for {args.calibrate_steps} episodes; "
+        f"{n_cal}/{n_total} param leaves are trainable "
+        f"(factor head + set_transformer_agg). All other modules frozen."
+    )
+
+    # Quality-focused preference: cosine_sim + frob_residual carry the
+    # learning signal; the compute-family components are 0 so the advantage
+    # weighting is purely quality-driven (matches the spec's "supervised
+    # against the Frobenius and cosine quality signals").
+    cal_pref = jnp.broadcast_to(
+        jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
+            .at[REWARD_INDEX["cosine_sim"]].set(1.0)
+            .at[REWARD_INDEX["frob_residual"]].set(1.0),
+        (num_envs, NUM_REWARDS),
+    )
+
+    # Stage G never enforces hard constraints — calibration is a supervised
+    # quality nudge, not a constraint-satisfaction problem. Pass empty
+    # constraint arrays so the augmentation in train_episode is a no-op.
+    no_idx = jnp.zeros((0,), dtype=jnp.int32)
+    no_thr = jnp.zeros((0,), dtype=jnp.float32)
+    no_lam = jnp.zeros((0,), dtype=jnp.float32)
+
+    for step_idx in range(args.calibrate_steps):
+        ep_key, key = jrand.split(key)
+        ep_eval_key, ep_key = jrand.split(ep_key)
+        eval_samples = generate_eval_samples(env, ep_eval_key, args.num_eval_samples)
+        env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
+        vertex_features = _episode_vertex_features(
+            args, closed_jaxpr.jaxpr, tuple(closed_jaxpr.literals),
+            base_args, eval_samples=eval_samples, argnums=argnums,
+        )
+        env_states = reset_envs(env_episode)
+        (
+            agent, opt_state, _, _metrics, totals, _actions, global_step,
+            _new_lam, _diag_pack,
+        ) = train_episode(
+            agent, opt_state, env_states, env_episode, vertex_features,
+            cal_pref, global_step, ep_key, cal_mask, no_lam, no_idx, no_thr,
+        )
+        cosine = float(jnp.mean(totals[:, REWARD_INDEX["cosine_sim"]]))
+        neg_frob = float(jnp.mean(totals[:, REWARD_INDEX["frob_residual"]]))
+        print(
+            f"  cal step {step_idx:3d}/{args.calibrate_steps}  "
+            f"cosine_sim={cosine:.4f}  frob_residual={-neg_frob:.4f}"
+        )
+
+    return agent, global_step, key
+
+
+def _episode_vertex_features(
+    args, jaxpr, consts: tuple, base_args: tuple,
+    eval_samples, argnums: tuple,
+) -> "jax.Array":
+    """Single dispatch site for the per-vertex feature computation.
+
+    Switches between mean-aggregated (Stage B.2.A) and per-sample (Stage B.3
+    Set Transformer aggregator) features based on ``--set-transformer-agg``;
+    used by the main training loop, the BC warm-start, and the calibration
+    phase. Returns a `jnp.float32` array.
+    """
+    fn = (
+        compute_per_sample_vertex_features
+        if args.set_transformer_agg else compute_vertex_features
+    )
+    return jnp.asarray(
+        fn(jaxpr, consts, base_args, eval_samples=eval_samples, argnums=argnums),
+        dtype=jnp.float32,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage C: Markowitz behaviour-clone warm-start
+# ---------------------------------------------------------------------------
+
+
+def _markowitz_bc_dataset(env, target_order, total_v, embd_dim,
+                          vertex_valid_static, num_valid):
+    """Roll the env forward following ``target_order`` to produce a list of
+    (tokens, eqn_ids, vertex_avail, residual_state, target_vertex_idx) tuples.
+
+    The agent is trained to pick the *index* of each Markowitz vertex (0-indexed
+    over the original ``total_v`` action space).
+    """
+    state = env.reset(num_envs=0)
+    residual_state = jnp.zeros((total_v, embd_dim), dtype=jnp.float32)
+    samples = []
+    empty_specs = jnp.full(
+        (MAX_RULES_PER_VERTEX, 3), -1, dtype=jnp.int32,
+    ).at[..., 2].set(0)
+
+    for v_id in target_order:
+        vertex_avail = vertex_avail_at_step(
+            state, vertex_valid_static, total_v, num_valid,
+        )
+        target_idx = jnp.asarray(int(v_id) - 1, dtype=jnp.int32)
+        samples.append((
+            state.tokens.astype(jnp.int32),
+            state.eqn_ids.astype(jnp.int32),
+            vertex_avail,
+            residual_state,
+            target_idx,
+        ))
+        action = StepAction(
+            target_vertex=jnp.asarray(int(v_id), dtype=jnp.int32),
+            rule_specs=empty_specs,
+        )
+        out = env.step(state, action)
+        state = out.state
+        # Best-effort residual update — encode the current state and grab the
+        # chosen vertex's context, like the rollout would. Compute is small.
+        # (For BC the residual is only used to *condition* the policy; the
+        # gradient signal still comes from the cross-entropy loss.)
+        residual_state = jnp.zeros_like(residual_state)
+    return samples
+
+
+def _bc_warmstart_step(agent, opt_state, optimizer, sample, vertex_features,
+                       pair_valid_mask, pair_factor_mask, key):
+    tokens, eqn_ids, vertex_avail, residual_state, target_idx = sample
+
+    def loss_fn(agent):
+        vertex_logits, _vertex_contexts, _value = agent.encode(
+            tokens, eqn_ids=eqn_ids,
+            vertex_features=vertex_features,
+            residual_state=residual_state,
+            key=key,
+        )
+        masked_logits = jnp.where(vertex_avail > 0.5, vertex_logits, -1e9)
+        log_probs = jax.nn.log_softmax(masked_logits, axis=-1)
+        return -log_probs[target_idx]
+
+    loss, grads = eqx.filter_value_and_grad(loss_fn)(agent)
+    updates, new_opt_state = optimizer.update(
+        grads, opt_state, eqx.filter(agent, eqx.is_inexact_array),
+    )
+    new_agent = eqx.apply_updates(agent, updates)
+    return new_agent, new_opt_state, loss
+
+
+def run_bc_warmstart(
+    agent, env, target_order, total_v, embd_dim,
+    vertex_valid_static, num_valid,
+    vertex_features, pair_valid_mask, pair_factor_mask,
+    n_steps, lr, key,
+):
+    """Run ``n_steps`` of supervised cross-entropy on the vertex pointer head
+    against the Markowitz heuristic. Returns the warm-started agent."""
+    print(
+        f"BC warmstart: {n_steps} steps against Markowitz order {list(target_order)}"
+    )
+    bc_optimizer = optax.adam(lr)
+    bc_opt_state = bc_optimizer.init(eqx.filter(agent, eqx.is_inexact_array))
+    samples = _markowitz_bc_dataset(
+        env, target_order, total_v, embd_dim, vertex_valid_static, num_valid,
+    )
+    losses = []
+    for step in range(n_steps):
+        sample = samples[step % len(samples)]
+        step_key, key = jrand.split(key)
+        agent, bc_opt_state, loss = _bc_warmstart_step(
+            agent, bc_opt_state, bc_optimizer, sample, vertex_features,
+            pair_valid_mask, pair_factor_mask, step_key,
+        )
+        losses.append(float(loss))
+        if step == 0 or step == n_steps - 1 or step % max(1, n_steps // 10) == 0:
+            print(f"  bc step {step:4d}/{n_steps}  loss={float(loss):7.4f}")
+    print(f"  BC final loss: {losses[-1]:.4f}  (started at {losses[0]:.4f})")
+    return agent
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+
+def _setup_jax_compile_cache() -> None:
+    """Enable XLA's persistent compile cache so successive runs of the same
+    config skip JIT recompile. Honoured by JAX>=0.4.16 via env-var; we set a
+    sensible default if the user hasn't already, then turn it on through the
+    `jax.config` API too (belt-and-braces — JAX is in transition between
+    the two surfaces). The cache lives at ``~/.cache/jax-compilation-cache``
+    by default and is keyed on the HLO + flags + JAX/XLA version, so stale
+    entries are never hit."""
+    cache_dir = os.environ.setdefault(
+        "JAX_COMPILATION_CACHE_DIR",
+        os.path.expanduser("~/.cache/jax-compilation-cache"),
+    )
+    try:
+        from jax.experimental.compilation_cache import compilation_cache
+        compilation_cache.set_cache_dir(cache_dir)
+    except Exception:
+        pass
 
 
 def main():
@@ -944,6 +2300,7 @@ def main():
 
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpus)
+    _setup_jax_compile_cache()
 
     key = jrand.PRNGKey(args.seed)
     key, args_key = jrand.split(key)
@@ -960,6 +2317,10 @@ def main():
     env_target_fun = target_fn if "acc" in args.rewards else None
     argnums = infer_argnums(args.example)
 
+    # Latency is the only optional component of the reward harness; auto-enable
+    # measurement when the user has selected it as their primary compute metric
+    # so the reward isn't silently zeroed out.
+    measure_latency = args.measure_latency or args.cmp_type == "latency"
     env = VertexEliminationEnv.from_jaxpr(
         closed_jaxpr,
         args=xs,
@@ -970,6 +2331,7 @@ def main():
         cmp_type=args.cmp_type,
         mem_type=args.mem_type,
         exec_on_gpu=args.exec_on_gpu,
+        measure_latency=measure_latency,
     )
 
     total_v = len(closed_jaxpr.jaxpr.eqns)
@@ -991,38 +2353,103 @@ def main():
     # Hyperparameters / agent.
     factor_table, factors_py, num_factors, max_rules = _build_factor_table(args, use_autoreg)
     factor_table_np = np.array(factors_py, dtype=np.int32)
+
+    # Resolve --pin-factor to an index in the factor_table. Mutually exclusive
+    # with --pin-rules-to-exact (which pins both axis and factor).
+    pin_factor_idx: int | None = None
+    if args.pin_factor is not None:
+        if args.pin_rules_to_exact:
+            raise ValueError(
+                "--pin-factor and --pin-rules-to-exact are mutually exclusive."
+            )
+        matches = np.where(factor_table_np == args.pin_factor)[0]
+        if matches.size == 0:
+            raise ValueError(
+                f"--pin-factor={args.pin_factor} not in --factors {factors_py}; "
+                f"available indices: {list(zip(range(num_factors), factors_py))}"
+            )
+        pin_factor_idx = int(matches[0])
+        print(
+            f"Stage D: pinning factor to {args.pin_factor} (index {pin_factor_idx} "
+            f"in factor_table). Axis head trains; factor head deterministic."
+        )
     num_envs = _resolve_num_envs(args.num_envs, args.example)
+    # 8-component reward vector. The advantage weights map the legacy
+    # --cmp-type / --mem-type / --rewards / --lambda-frob flags to canonical
+    # indices in the 8-vec; the value head consumes the full vector.
+    reward_weights_np = _build_reward_weights(args)
+    reward_weights = jnp.asarray(reward_weights_np, dtype=jnp.float32)
+    cmp_idx = _cmp_reward_index(args.cmp_type)
+    mem_idx = _mem_reward_index(args.mem_type)
+    cosine_idx = REWARD_INDEX["cosine_sim"]
+    frob_idx = REWARD_INDEX["frob_residual"]
 
-    # raw_rewards from env.py is always [-cmp, error/acc, -mem] (size 3).
-    # Filter / order args.rewards by this natural order so the result is
-    # independent of the order the user passes them on the CLI.
-    REWARD_NATURAL_ORDER = ("cmp", "acc", "mem")
-    REWARD_INDEX = {"cmp": 0, "acc": 1, "mem": 2}
-    sorted_rewards = [r for r in REWARD_NATURAL_ORDER if r in args.rewards]
-    reward_indices = tuple(REWARD_INDEX[r] for r in sorted_rewards)
-
-    def reward_weights():
-        # acc keeps a fixed weight of 1.0; cmp/mem are scaled by lambdas.
-        return [
-            args.lambda_cmp if r == "cmp"
-            else args.lambda_mem if r == "mem"
-            else 1.0
-            for r in sorted_rewards
-        ]
-
-    num_rewards = len(sorted_rewards)
+    # Per-(vertex, pair, factor) validity mask. Used by the autoreg policy's
+    # factor head to mask out factors that don't divide the relevant axis
+    # sizes — those would otherwise hit the matmul fallback path. The
+    # single-rule policy ignores it (factor is fixed to -1).
+    pair_factor_mask = build_pair_factor_valid_mask(
+        closed_jaxpr.jaxpr,
+        total_v,
+        num_pair_choices=NUM_PAIR_CHOICES,
+        factor_table=factor_table_np,
+        pair_stop_idx=PAIR_STOP,
+    )
 
     print(
         f"variant={variant_label}, num_envs={num_envs}, max_rules={max_rules}, "
         f"factors={factors_py}, rollout_length={num_valid}, minibatches={args.minibatches}"
     )
+    nonzero_w = ", ".join(
+        f"{REWARD_NAMES[i]}={float(reward_weights_np[i]):+.3g}"
+        for i in range(NUM_REWARDS)
+        if reward_weights_np[i] != 0.0
+    )
+    print(f"reward weights: {nonzero_w or '<all zero — debug only>'}")
 
     agent_key, init_key, key = jrand.split(key, 3)
     agent = _build_agent(
-        use_pointer, use_autoreg, args, total_v, num_rewards, num_factors, max_rules, agent_key
+        use_pointer, use_autoreg, args, total_v, num_factors, max_rules, agent_key
     )
     agent = init_linear_weights(agent, init_key)
     agent = _scale_output_heads(agent, args.head_init_scale, use_pointer, use_autoreg)
+    if args.pretrained_encoder:
+        from alphagrad.approx.pretrain import load_pretrained_encoder
+        agent = load_pretrained_encoder(args.pretrained_encoder, agent)
+        print(f"Loaded pretrained encoder from {args.pretrained_encoder}")
+
+    # Stage D: build per-head boolean parameter masks once. Used inside
+    # train_minibatch to scale gradients by the head-specific LR multiplier
+    # (warm-up ramp from §3.2). Masks are pytree leaves aligned with the
+    # filtered (inexact-array) agent params.
+    axis_mask, factor_mask = _build_head_masks(agent)
+
+    # Stage G default freeze mask: all-True (no freezing) — the same
+    # train_episode path serves both regular training and calibration. The
+    # all-True mask makes the gradient unchanged so there's no JIT recompile
+    # when we swap to the cal_mask in the calibration phase.
+    default_freeze_mask = jax.tree_util.tree_map(
+        lambda x: jnp.ones_like(x, dtype=jnp.bool_),
+        eqx.filter(agent, eqx.is_inexact_array),
+    )
+
+    if args.bc_warmstart_steps > 0:
+        from alphagrad.approx.heuristics import markowitz_order
+        target_order = markowitz_order(closed_jaxpr.jaxpr, env.valid_vertices)
+        # BC needs vertex_features for the data-conditioned encode; reuse the
+        # episode-0 features against the env's initial args so the supervised
+        # signal is computed in a regime consistent with the upcoming PPO.
+        bc_vertex_features = _episode_vertex_features(
+            args, closed_jaxpr.jaxpr, tuple(closed_jaxpr.literals),
+            tuple(xs), eval_samples=None, argnums=tuple(argnums),
+        )
+        bc_key, key = jrand.split(key)
+        agent = run_bc_warmstart(
+            agent, env, target_order, total_v, args.embd_dim,
+            vertex_valid_static, num_valid,
+            bc_vertex_features, pair_valid_mask, pair_factor_mask,
+            args.bc_warmstart_steps, args.bc_lr, bc_key,
+        )
     if args.exec_on_gpu:
         agent = jax.tree_util.tree_map(
             lambda x: jax.device_put(x, main_device) if eqx.is_array(x) else x,
@@ -1046,11 +2473,33 @@ def main():
         return jax.vmap(lambda _: env_obj.reset())(jnp.arange(num_envs))
 
     @eqx.filter_jit
-    @partial(jax.vmap, in_axes=(None, None, None, 0, 0))
-    def rollout_fn(agent, env_obj, rollout_length, env_state, key):
+    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None, 0))
+    def rollout_fn(
+        agent, env_obj, rollout_length, env_state, key, vertex_features,
+        preference,
+    ):
         keys = jrand.split(key, rollout_length)
+        # Stage B.4: per-vertex residual state, initialised to zero at episode
+        # start. Carried through the rollout's scan alongside env_state.
+        init_residual = jnp.zeros((total_v, args.embd_dim), dtype=jnp.float32)
 
-        def step_fn(state, k):
+        # Stage B.4.next: encode the initial residual jaxpr once if
+        # --cache-encoding is on. The cached encoding is closed over by
+        # step_fn — it doesn't change within an episode.
+        encode_key, scan_key = jrand.split(keys[0], 2)
+        if args.cache_encoding:
+            cached_encoding = agent.encode_once(
+                env_state.tokens, eqn_ids=env_state.eqn_ids, key=encode_key,
+            )
+            initial_tokens = env_state.tokens
+            initial_eqn_ids = env_state.eqn_ids
+        else:
+            cached_encoding = None
+            initial_tokens = None
+            initial_eqn_ids = None
+
+        def step_fn(carry, k):
+            state, residual_state = carry
             sample_key, next_net_key = jrand.split(k, 2)
             vertex_avail_mask = vertex_avail_at_step(
                 state, vertex_valid_static, total_v, num_valid
@@ -1064,8 +2513,20 @@ def main():
                 pair_dists,
                 factor_dists,
                 value,
+                v_context,
             ) = agent.sample_action(
-                state.tokens, vertex_avail_mask, pair_valid_mask, sample_key
+                state.tokens,
+                vertex_avail_mask,
+                pair_valid_mask,
+                pair_factor_mask,
+                sample_key,
+                eqn_ids=state.eqn_ids,
+                vertex_features=vertex_features,
+                residual_state=residual_state,
+                cached_encoding=cached_encoding,
+                pin_rules_to_exact=args.pin_rules_to_exact,
+                pin_factor_idx=pin_factor_idx,
+                preference=preference if args.preference_conditioned else None,
             )
 
             env_action = agent.to_env_action(
@@ -1074,14 +2535,64 @@ def main():
             env_out = env_obj.step(state, env_action)
             next_state = env_out.state
             raw_rewards = env_out.reward
-            # Pick the components named in args.rewards (order-independent, by name).
-            rewards = jnp.stack([raw_rewards[i] for i in reward_indices])
+            rewards = raw_rewards
             done = env_out.terminated.astype(jnp.float32)
+            # Stage C potential-based shaping. Bootstraps a denser per-step
+            # learning signal from the critic; provably preserves the
+            # optimum (Ng et al. 1999). The shaping uses raw (un-symlog'd)
+            # value space and is stop-gradient'd so the value head only
+            # trains against the original returns. Disabled when the
+            # coefficient is zero.
 
-            next_value = agent.value_for(next_state.tokens, key=next_net_key)
+            new_residual = agent.update_residual(
+                residual_state, vertex_idx, v_context,
+            )
+
+            pref_arg = preference if args.preference_conditioned else None
+            next_value = agent.value_for(
+                next_state.tokens, eqn_ids=next_state.eqn_ids,
+                vertex_features=vertex_features,
+                residual_state=new_residual,
+                preference=pref_arg,
+                key=next_net_key,
+            ) if not args.cache_encoding else (
+                agent._decode_from_cache(
+                    cached_encoding, vertex_features, new_residual,
+                    preference=pref_arg,
+                )[2]
+            )
+
+            if args.potential_shaping != 0.0:
+                v_raw = inverse_reward_normalization_fn(
+                    lax.stop_gradient(value),
+                )
+                v_next_raw = inverse_reward_normalization_fn(
+                    lax.stop_gradient(next_value),
+                )
+                # F_t = γ Φ(s_{t+1}) - Φ(s_t), with Φ(s_{T+1}) ≡ 0 at the
+                # terminal step. The (1 - done) gate zeros only the bootstrap
+                # term so the per-episode total reduces to the constant
+                # -Φ(s_0) (Ng et al. 1999) — preserves the optimum exactly.
+                shaping = args.discount * v_next_raw * (1.0 - done) - v_raw
+                rewards = rewards + args.potential_shaping * shaping
+
+            # In cache-encoding mode the trajectory's tokens/eqn_ids fields
+            # carry the *initial* episode tokens (constant across the
+            # rollout) so the loss path can encode_once + decode_from_cache
+            # against the same reference. In the legacy path they remain
+            # the per-step residual jaxpr tokens.
+            traj_tokens = (
+                initial_tokens if args.cache_encoding else state.tokens
+            ).astype(jnp.int32)
+            traj_eqn_ids = (
+                initial_eqn_ids if args.cache_encoding else state.eqn_ids
+            ).astype(jnp.int32)
 
             transition = Trajectory(
-                tokens=state.tokens.astype(jnp.int32),
+                tokens=traj_tokens,
+                eqn_ids=traj_eqn_ids,
+                residual_state=residual_state,
+                preference=preference.astype(jnp.float32),
                 vertex_idx=jnp.asarray(vertex_idx, dtype=jnp.int32),
                 pair_seq=jnp.asarray(pair_seq, dtype=jnp.int32),
                 factor_seq=jnp.asarray(factor_seq, dtype=jnp.int32),
@@ -1095,32 +2606,76 @@ def main():
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
             )
-            return next_state, (transition, raw_rewards)
+            return (next_state, new_residual), (transition, raw_rewards)
 
-        final_state, (traj, all_raw_rewards) = lax.scan(step_fn, env_state, keys)
+        (final_state, _), (traj, all_raw_rewards) = lax.scan(
+            step_fn, (env_state, init_residual), keys,
+        )
         return final_state, traj, all_raw_rewards[-1]
 
-    def loss_fn(agent, batch: TrainBatch, keys):
-        eval_batched = jax.vmap(
-            lambda toks, vidx, pseq, fseq, vmask, k: agent.evaluate_action(
-                toks, vidx, pseq, fseq, vmask, pair_valid_mask, k
+    def loss_fn(agent, batch: TrainBatch, vertex_features, key):
+        # Three batching regimes share one ``evaluate_action`` vmap:
+        #   1. Per-trajectory cache (B.4.next): batch arrives `(E, K, ...)`,
+        #      encode once per trajectory and replicate K times.
+        #   2. Per-step cache: flat `(B, ...)`, encode each entry separately.
+        #   3. No cache: flat `(B, ...)`, no cached encoding (None).
+        # `cached_flat` is the only thing that changes between regimes.
+        pref_or_none = (lambda p: p) if args.preference_conditioned else (lambda _: None)
+
+        if batch.tokens.ndim == 3:
+            E, K = batch.tokens.shape[:2]
+            enc_key, eval_key = jrand.split(key, 2)
+            cached_per_traj = jax.vmap(
+                lambda t, e, k: agent.encode_once(t, eqn_ids=e, key=k)
+            )(batch.tokens[:, 0], batch.eqn_ids[:, 0], jrand.split(enc_key, E))
+            batch = jax.tree_util.tree_map(
+                lambda x: x.reshape(E * K, *x.shape[2:]), batch,
             )
-        )
-        (
-            log_probs,
-            entropies,
-            values,
-            vertex_dist,
-            pair_dists,
-            factor_dists,
-        ) = eval_batched(
-            batch.tokens,
-            batch.vertex_idx,
-            batch.pair_seq,
-            batch.factor_seq,
-            batch.vertex_avail_mask,
-            keys,
-        )
+            cached_flat = jax.tree_util.tree_map(
+                lambda x: jnp.repeat(x, K, axis=0), cached_per_traj,
+            )
+            keys = jrand.split(eval_key, E * K)
+        elif args.cache_encoding:
+            B = batch.tokens.shape[0]
+            enc_key, eval_key = jrand.split(key, 2)
+            cached_flat = jax.vmap(
+                lambda t, e, k: agent.encode_once(t, eqn_ids=e, key=k)
+            )(batch.tokens, batch.eqn_ids, jrand.split(enc_key, B))
+            keys = jrand.split(eval_key, B)
+        else:
+            cached_flat = None
+            keys = jrand.split(key, batch.tokens.shape[0])
+
+        def _eval_one(toks, eids, rs, pref, vidx, pseq, fseq, vmask, cached, k):
+            return agent.evaluate_action(
+                toks, vidx, pseq, fseq, vmask,
+                pair_valid_mask, pair_factor_mask, k,
+                eqn_ids=eids, vertex_features=vertex_features,
+                residual_state=rs, cached_encoding=cached,
+                pin_rules_to_exact=args.pin_rules_to_exact,
+                pin_factor_idx=pin_factor_idx,
+                preference=pref_or_none(pref),
+            )
+
+        if cached_flat is None:
+            # vmap can't ingest `None` over the cached axis; collapse to a
+            # variant that hard-codes ``cached=None`` instead.
+            (log_probs, entropies, values, vertex_dist, pair_dists,
+             factor_dists) = jax.vmap(
+                lambda toks, eids, rs, pref, vidx, pseq, fseq, vmask, k:
+                    _eval_one(toks, eids, rs, pref, vidx, pseq, fseq, vmask, None, k)
+            )(
+                batch.tokens, batch.eqn_ids, batch.residual_state, batch.preference,
+                batch.vertex_idx, batch.pair_seq, batch.factor_seq,
+                batch.vertex_avail_mask, keys,
+            )
+        else:
+            (log_probs, entropies, values, vertex_dist, pair_dists,
+             factor_dists) = jax.vmap(_eval_one)(
+                batch.tokens, batch.eqn_ids, batch.residual_state, batch.preference,
+                batch.vertex_idx, batch.pair_seq, batch.factor_seq,
+                batch.vertex_avail_mask, cached_flat, keys,
+            )
 
         old_log_probs = jax.vmap(old_log_prob_for_action)(
             batch.vertex_idx,
@@ -1187,13 +2742,18 @@ def main():
             trigger_ratio,
         )
 
-    def train_episode(agent, opt_state, env_states, env_obj, key):
+    def train_episode(
+        agent, opt_state, env_states, env_obj, vertex_features,
+        preferences_per_env, global_step, key, freeze_mask,
+        multipliers, constraint_indices, constraint_thresholds,
+    ):
         subkey, key = jrand.split(key)
         rollout_key, key = jrand.split(key)
         rollout_keys = jrand.split(rollout_key, num_envs)
 
         env_states, traj, total_rewards_full = rollout_fn(
-            agent, env_obj, num_valid, env_states, rollout_keys
+            agent, env_obj, num_valid, env_states, rollout_keys, vertex_features,
+            preferences_per_env,
         )
 
         _, estim_returns, advantages = get_advantages(
@@ -1211,11 +2771,38 @@ def main():
         norm_adv_components = jax.vmap(normalize, in_axes=-1, out_axes=-1)(
             advantages.reshape(-1, advantages.shape[-1])
         ).reshape(advantages.shape)
-        adv_weights = jnp.array(reward_weights())
-        norm_adv = jnp.sum(norm_adv_components * adv_weights, axis=-1)
+        # Always use the per-step preference for advantage weighting. In
+        # the unconditioned (Stage A–E) path it's broadcast from the static
+        # CLI --lambda-* weights; in Stage F it's the Dirichlet sample; in
+        # Stage G calibration it's the quality-focused override. Same code
+        # path either way.
+        norm_adv = jnp.sum(norm_adv_components * traj.preference, axis=-1)
+
+        # Stage F Lagrangian: per-step constraint violations and multiplier
+        # update. ``constraint_indices`` / ``constraint_thresholds`` are
+        # static-shape arrays (length 0 means no constraints, in which case
+        # the gather is a no-op). Violation = max(0, threshold - reward[idx])
+        # for each constraint (rewards are higher-is-better). The advantage
+        # gets penalized by ``-λ_i · violation_i`` so the policy is pushed
+        # away from constraint-violating regions.
+        if constraint_indices.shape[0] > 0:
+            picked = traj.reward[..., constraint_indices]                   # (E, T, C)
+            violations = jnp.maximum(0.0, constraint_thresholds - picked)   # (E, T, C)
+            penalty = jnp.sum(violations * multipliers, axis=-1)            # (E, T)
+            norm_adv = norm_adv - penalty
+            mean_violations = jnp.mean(violations, axis=(0, 1))             # (C,)
+            new_multipliers = jnp.maximum(
+                0.0, multipliers + args.lagrangian_lr * mean_violations,
+            )
+        else:
+            mean_violations = multipliers  # zero-length sentinel
+            new_multipliers = multipliers
 
         full_batch = TrainBatch(
             tokens=traj.tokens,
+            eqn_ids=traj.eqn_ids,
+            residual_state=traj.residual_state,
+            preference=traj.preference,
             vertex_idx=traj.vertex_idx,
             pair_seq=traj.pair_seq,
             factor_seq=traj.factor_seq,
@@ -1229,16 +2816,36 @@ def main():
 
         dynamic_carry, static_carry = eqx.partition((agent, opt_state), eqx.is_array)
 
-        def train_epoch(carry, epoch_key):
-            batches = shuffle_and_batch(full_batch, args.minibatches, epoch_key)
+        # Stage D head curriculum: thread a step counter through both scans
+        # (epoch × minibatch) so the per-head LR multiplier ramps continuously
+        # across episodes. The optimizer also has its own internal count
+        # (cosine-decay schedule reads it) but we want a separate, explicit
+        # ramp anchored at the start of this run.
+        def epoch_step_fn(carry_with_step, epoch_key):
+            carry, step = carry_with_step
+            batches = (
+                shuffle_and_batch_by_trajectory(full_batch, args.minibatches, epoch_key)
+                if args.cache_encoding
+                else shuffle_and_batch(full_batch, args.minibatches, epoch_key)
+            )
             mb_keys = jrand.split(epoch_key, args.minibatches)
 
-            def train_minibatch(c, batch_and_key):
+            def mb_step_fn(c_with_step, batch_and_key):
+                c, step = c_with_step
                 comb_agent, comb_opt_state = eqx.combine(c, static_carry)
                 batch, t_key = batch_and_key
-                inner_keys = jrand.split(t_key, batch.tokens.shape[0])
                 grads, metrics = eqx.filter_grad(loss_fn, has_aux=True)(
-                    comb_agent, batch, inner_keys
+                    comb_agent, batch, vertex_features, t_key,
+                )
+                # Single fused per-leaf gradient scaling: combines the
+                # Stage D head-LR ramp and the Stage G freeze mask. With an
+                # all-True ``freeze_mask`` (regular training) the freeze
+                # branch is a no-op; with the cal-mask the LR ramp is also
+                # active for the trainable params (factor head, aggregator).
+                grads = _scale_grads(
+                    grads, axis_mask, factor_mask, freeze_mask,
+                    _head_lr_mult(step, args.axis_warmup_steps),
+                    _head_lr_mult(step, args.factor_warmup_steps),
                 )
                 updates, new_opt_state = optimizer.update(
                     grads, comb_opt_state, comb_agent
@@ -1247,17 +2854,31 @@ def main():
                 next_carry, _ = eqx.partition(
                     (new_agent, new_opt_state), eqx.is_array
                 )
-                return next_carry, metrics
+                return (next_carry, step + 1), metrics
 
-            return lax.scan(train_minibatch, carry, (batches, mb_keys))
+            return lax.scan(mb_step_fn, (carry, step), (batches, mb_keys))
 
         epoch_keys = jrand.split(subkey, args.ppo_epochs)
-        dynamic_carry, metrics_seq = lax.scan(train_epoch, dynamic_carry, epoch_keys)
+        (dynamic_carry, final_step), metrics_seq = lax.scan(
+            epoch_step_fn, (dynamic_carry, global_step), epoch_keys,
+        )
 
         agent, opt_state = eqx.combine(dynamic_carry, static_carry)
         metrics = jax.tree_util.tree_map(lambda x: jnp.mean(x), metrics_seq)
         actions_pack = (traj.vertex_idx, traj.pair_seq, traj.factor_seq)
-        return agent, opt_state, env_states, metrics, total_rewards_full, actions_pack
+        # Pair / factor / preference marginals — Stage D / E / F diagnostics.
+        # Average over (env, time, slot) — broad enough to detect global
+        # collapse without exposing per-step noise.
+        diag_pack = (
+            jnp.mean(traj.pair_dists, axis=(0, 1, 2)),
+            jnp.mean(traj.factor_dists, axis=(0, 1, 2)),
+            jnp.mean(traj.preference, axis=(0, 1)),
+            mean_violations,
+        )
+        return (
+            agent, opt_state, env_states, metrics, total_rewards_full,
+            actions_pack, final_step, new_multipliers, diag_pack,
+        )
 
     if not args.no_jit:
         train_episode = eqx.filter_jit(train_episode)
@@ -1280,19 +2901,16 @@ def main():
         "top_n_cmp": [],
         "top_n_mem": [],
         "top_n_acc": [],
-        "reward_samples": [],  # list of (num_envs, 3) arrays for --stats-out
     }
 
-    def host_log(ep, all_rets, actions_pack, mean_r, mets):
+    def host_log(ep, all_rets, actions_pack, mean_r, mets,
+                 diag_pack=None, multipliers_arr=None):
         ep = int(ep)
-        all_rets = np.array(all_rets)
+        all_rets = np.array(all_rets)  # (num_envs, NUM_REWARDS)
         v_idx_arr = np.array(actions_pack[0])
         pair_arr = np.array(actions_pack[1])
         factor_arr = np.array(actions_pack[2])
         mean_r = np.atleast_1d(np.array(mean_r))
-
-        if args.stats_out is not None:
-            host_state["reward_samples"].append(all_rets[:, :3].astype(np.float64).copy())
 
         host_state["samplecounts"] += num_envs * num_valid
         (
@@ -1307,20 +2925,19 @@ def main():
             _clipping_trigger_ratio,
         ) = [float(m) for m in mets]
 
-        # all_rets is the full raw_rewards array (size 3): 0=-cmp, 1=acc, 2=-mem.
-        # Pick the components in args.rewards (sorted natural order).
-        weights = np.array(reward_weights())
-        sel = np.array(reward_indices)
+        weights = reward_weights_np
         for i in range(all_rets.shape[0]):
             rets = all_rets[i]
             decoded = _action_to_pylist(
                 v_idx_arr[i], pair_arr[i], factor_arr[i], max_rules, factor_table_np
             )
-            total_ret = float(np.sum(rets[sel] * weights))
+            total_ret = float(np.sum(rets * weights))
+            # Per-family heap keys: cmp uses the canonical compute index,
+            # mem uses the canonical memory index, and acc tracks cosine_sim.
             heaps_and_keys = [
                 ("top_n_total", total_ret),
-                ("top_n_cmp", float(rets[0])),
-                ("top_n_mem", float(rets[2])),
+                ("top_n_cmp", float(rets[cmp_idx])),
+                ("top_n_mem", float(rets[mem_idx])),
             ]
             for heap_name, key_val in heaps_and_keys:
                 heap = host_state[heap_name]
@@ -1330,7 +2947,7 @@ def main():
                 else:
                     heapq.heappushpop(heap, payload)
 
-            acc_val = float(rets[1])
+            acc_val = float(rets[cosine_idx])
             if args.capture_perfect_grads or acc_val < 0.999999:
                 heap = host_state["top_n_acc"]
                 payload = (acc_val, ep, list(rets), decoded)
@@ -1339,8 +2956,9 @@ def main():
                 else:
                     heapq.heappushpop(heap, payload)
 
-        best_idx = int(np.argmax(np.sum(all_rets[:, sel] * weights, axis=-1)))
-        best_ret = float(np.sum(all_rets[best_idx, sel] * weights))
+        weighted_sums = np.sum(all_rets * weights, axis=-1)
+        best_idx = int(np.argmax(weighted_sums))
+        best_ret = float(weighted_sums[best_idx])
         if best_ret > host_state["best_global_return"]:
             host_state["best_global_return"] = best_ret
             host_state["best_global_act_seq"] = _action_to_pylist(
@@ -1350,7 +2968,7 @@ def main():
 
         log_dict = {
             "best_return": host_state["best_global_return"],
-            "mean_return": mean_r[0],
+            "mean_return": float(np.sum(mean_r * weights)),
             "KL divergence": kl_div,
             "entropy evolution": policy_entropy,
             "explained variance": explained_var,
@@ -1359,8 +2977,28 @@ def main():
             "value loss": value_loss,
             "total loss": total_loss,
         }
-        for j in range(1, len(mean_r)):
-            log_dict[f"mean_return_{j}"] = mean_r[j]
+        for j, name in enumerate(REWARD_NAMES):
+            log_dict[f"mean_{name}"] = float(mean_r[j]) if j < len(mean_r) else 0.0
+
+        # Stage D/E/F marginals — pair-index distribution (axis-pair head),
+        # factor-index distribution (Stage E ρ-collapse early-warning), and
+        # the per-episode preference vector (Stage F sanity check).
+        if diag_pack is not None:
+            pair_marg, factor_marg, pref_mean, mean_viol = (
+                np.asarray(x) for x in diag_pack
+            )
+            for j, p in enumerate(pair_marg):
+                log_dict[f"pair_marginal/{j}"] = float(p)
+            for j, p in enumerate(factor_marg):
+                log_dict[f"factor_marginal/{j}"] = float(p)
+            for j, name in enumerate(REWARD_NAMES):
+                log_dict[f"preference/{name}"] = float(pref_mean[j])
+            if multipliers_arr is not None and np.size(multipliers_arr) > 0:
+                lam = np.asarray(multipliers_arr)
+                viol = np.asarray(mean_viol)
+                for j, (idx, t) in enumerate(constraint_specs):
+                    log_dict[f"lagrangian/{REWARD_NAMES[idx]}_lambda"] = float(lam[j])
+                    log_dict[f"lagrangian/{REWARD_NAMES[idx]}_violation"] = float(viol[j])
         wandb.log(log_dict)
 
         pbar.update(1)
@@ -1372,86 +3010,144 @@ def main():
         )
 
     # Training loop.
+    # Stage D global step counter — increments by ppo_epochs * minibatches per
+    # episode and feeds the per-head LR ramp from §3.2.
+    global_step = jnp.array(0, dtype=jnp.int32)
+
+    # Stage F Lagrangian state. Constraint indices / thresholds are static
+    # shape (length-C jax arrays). Multipliers are dynamic (length-C, ≥ 0,
+    # updated by dual ascent each episode). C == 0 → empty arrays, in which
+    # case the augmentation in train_episode is a no-op.
+    constraint_specs = parse_lagrangian_constraints(args.lagrangian_constraint)
+    if constraint_specs:
+        print(
+            f"Stage F Lagrangian: {len(constraint_specs)} constraints — "
+            + ", ".join(
+                f"{REWARD_NAMES[idx]}>={t:g}" for idx, t in constraint_specs
+            )
+        )
+    constraint_indices = jnp.asarray(
+        [idx for idx, _ in constraint_specs], dtype=jnp.int32,
+    )
+    constraint_thresholds = jnp.asarray(
+        [t for _, t in constraint_specs], dtype=jnp.float32,
+    )
+    multipliers = jnp.zeros(len(constraint_specs), dtype=jnp.float32)
+
+    # Stage F: per-env preference sampling. Uses a Dirichlet with the
+    # configured concentration; values < 1 emphasise corners and edges.
+    # When --preference-conditioned is off we fall back to broadcasting
+    # the static reward_weights so all downstream code sees a consistent
+    # `(num_envs, NUM_REWARDS)` shape.
+    static_pref = jnp.broadcast_to(reward_weights, (num_envs, NUM_REWARDS))
+
     for ep in range(args.episodes):
         ep_key, key = jrand.split(key)
         ep_eval_key, ep_key = jrand.split(ep_key)
+        if args.preference_conditioned:
+            # Stage F mixture: each env independently draws its preference
+            # from either the corner Dirichlet (α<1) or the uniform Dirichlet
+            # (α=1). With ``--dirichlet-mix-ratio=0.5`` the trainer sees a
+            # balanced supply of pure-corner / interior preferences so the
+            # conditioned policy covers the whole Pareto front.
+            corner_key, uniform_key, choice_key, ep_key = jrand.split(ep_key, 4)
+            alpha_corner = jnp.full(
+                (NUM_REWARDS,), args.dirichlet_alpha, dtype=jnp.float32,
+            )
+            alpha_uniform = jnp.full(
+                (NUM_REWARDS,), args.dirichlet_alpha_uniform, dtype=jnp.float32,
+            )
+            corner_samples = jrand.dirichlet(
+                corner_key, alpha_corner, shape=(num_envs,),
+            )
+            uniform_samples = jrand.dirichlet(
+                uniform_key, alpha_uniform, shape=(num_envs,),
+            )
+            use_corner = (
+                jrand.uniform(choice_key, (num_envs, 1)) < args.dirichlet_mix_ratio
+            )
+            preferences_per_env = jnp.where(
+                use_corner, corner_samples, uniform_samples,
+            )
+        else:
+            preferences_per_env = static_pref
 
         eval_samples = generate_eval_samples(env, ep_eval_key, args.num_eval_samples)
         env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
 
+        # Stage B.2.A / B.3: per-vertex features depend on the calibration
+        # samples; recompute them per episode. The dispatch (mean-aggregated
+        # vs Set-Transformer per-sample) is centralised in
+        # ``_episode_vertex_features``.
+        vertex_features = _episode_vertex_features(
+            args, closed_jaxpr.jaxpr, tuple(closed_jaxpr.literals),
+            tuple(xs), eval_samples=eval_samples, argnums=tuple(argnums),
+        )
+
         env_states = reset_envs(env_episode)
-        agent, opt_state, _, metrics, total_rewards_full, actions_pack = train_episode(
-            agent, opt_state, env_states, env_episode, ep_key
+        (
+            agent, opt_state, _, metrics, total_rewards_full,
+            actions_pack, global_step, multipliers, diag_pack,
+        ) = train_episode(
+            agent, opt_state, env_states, env_episode, vertex_features,
+            preferences_per_env, global_step, ep_key,
+            default_freeze_mask, multipliers,
+            constraint_indices, constraint_thresholds,
         )
-        mean_active = jnp.mean(
-            total_rewards_full[:, jnp.array(reward_indices)], axis=0
+        host_log(
+            ep,
+            total_rewards_full,
+            actions_pack,
+            jnp.mean(total_rewards_full, axis=0),
+            metrics,
+            diag_pack,
+            multipliers,
         )
-        host_log(ep, total_rewards_full, actions_pack, mean_active, metrics)
 
     pbar.close()
+
+    # ------------------------------------------------------------------
+    # Stage G: few-shot calibration
+    # ------------------------------------------------------------------
+    if args.calibrate_steps > 0:
+        agent, global_step, key = run_calibration_phase(
+            agent, opt_state, env, env_episode_template_args=(
+                closed_jaxpr, tuple(xs), tuple(argnums),
+            ),
+            train_episode=train_episode, reset_envs=reset_envs,
+            num_envs=num_envs, args=args,
+            global_step=global_step, key=key,
+        )
 
     def print_top_n(name, heap, reverse_val=True):
         print(f"\nTop {args.top_n} trajectories for {name}:")
         sorted_items = sorted(heap, key=lambda x: x[0], reverse=reverse_val)
         table = wandb.Table(
-            columns=["rank", "episode", "total_reward", "cmp", "acc", "mem", "sequence"]
+            columns=["rank", "episode", "total_reward", "cmp", "acc", "mem", "frob", "sequence"]
         )
-        weights = np.array(reward_weights())
-        sel = np.array(reward_indices)
+        weights = reward_weights_np
         for rank, (val, ep, rets, seq) in enumerate(sorted_items, 1):
-            total_ret = float(np.sum(np.array(rets)[sel] * weights))
-            cmp_val = -rets[0]
-            acc_val = rets[1]
-            mem_val = -rets[2]
+            arr = np.array(rets)
+            total_ret = float(np.sum(arr * weights))
+            cmp_val = -float(arr[cmp_idx])      # display as positive cost
+            mem_val = -float(arr[mem_idx])      # display as positive cost
+            acc_val = float(arr[cosine_idx])    # cosine ∈ [0, 1]
+            frob_val = -float(arr[frob_idx])    # display as positive residual
             print(
                 f"{rank}. Ep {ep} | Total Reward: {total_ret:.2f} | "
-                f"CMP: {cmp_val:.1f} | Acc: {acc_val:.4f} | Mem: {mem_val:.1f}"
+                f"CMP({args.cmp_type}): {cmp_val:.1f} | Acc: {acc_val:.4f} | "
+                f"Mem({args.mem_type}): {mem_val:.1f} | Frob: {frob_val:.4f}"
             )
             print(f"   Sequence (vertex, [(idx1, idx2, factor), ...]): {seq}")
-            table.add_data(rank, ep, total_ret, cmp_val, acc_val, mem_val, str(seq))
+            table.add_data(
+                rank, ep, total_ret, cmp_val, acc_val, mem_val, frob_val, str(seq)
+            )
         wandb.log({f"Top N {name}": table})
 
     print_top_n("Total Reward", host_state["top_n_total"])
-    print_top_n("CMP (Lowest FLOPs)", host_state["top_n_cmp"])
-    print_top_n("Memory (Lowest Bytes)", host_state["top_n_mem"])
+    print_top_n(f"CMP (Lowest {args.cmp_type})", host_state["top_n_cmp"])
+    print_top_n(f"Memory (Lowest {args.mem_type})", host_state["top_n_mem"])
     print_top_n("Accuracy (Highest Cosine Similarity)", host_state["top_n_acc"])
-
-    if args.stats_out is not None and host_state["reward_samples"]:
-        import json
-        samples = np.concatenate(host_state["reward_samples"], axis=0)
-        # raw rewards: column 0 = -cmp, column 1 = acc/error, column 2 = -mem.
-        # Report magnitudes for cmp/mem so users reason about positive cost values.
-        mags = np.stack(
-            [np.abs(samples[:, 0]), samples[:, 1], np.abs(samples[:, 2])], axis=-1
-        )
-        names = ["cmp", "acc", "mem"]
-        rewards_stats = {}
-        for i, name in enumerate(names):
-            col = mags[:, i]
-            rewards_stats[name] = {
-                "mean": float(col.mean()),
-                "std": float(col.std()),
-                "min": float(col.min()),
-                "max": float(col.max()),
-                "median": float(np.median(col)),
-                "p10": float(np.percentile(col, 10)),
-                "p90": float(np.percentile(col, 90)),
-            }
-        out = {
-            "n_episodes": len(host_state["reward_samples"]),
-            "n_envs": int(samples.shape[0] // len(host_state["reward_samples"])),
-            "n_samples": int(samples.shape[0]),
-            "example": args.example,
-            "rewards_active": sorted_rewards,
-            "lambda_cmp_used": args.lambda_cmp,
-            "lambda_mem_used": args.lambda_mem,
-            "rewards": rewards_stats,
-        }
-        os.makedirs(os.path.dirname(os.path.abspath(args.stats_out)) or ".", exist_ok=True)
-        with open(args.stats_out, "w") as f:
-            json.dump(out, f, indent=2)
-        print(f"Wrote reward stats to {args.stats_out}")
-
     wandb.log({"Elimination order": elim_order_table})
 
 
