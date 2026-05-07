@@ -17,8 +17,6 @@ dependencies = [
     "graphax",
     "immutables",
     "grain",
-    "tensorflow-datasets",
-    "tensorflow",
     "importlib_resources",
     "psutil",
 ]
