@@ -2653,7 +2653,14 @@ def _scale_output_heads(agent, scale: float, use_pointer: bool, use_autoreg: boo
 
 
 def _action_to_pylist(vertex_seq, pair_seq, factor_seq, max_rules, factor_table_np):
-    """Decode (vertex, pair, factor) sequences into a list of `(vertex, [(idx1, idx2, factor), ...])`."""
+    """Decode legacy `(vertex, pair, factor)` sequences into
+    ``(vertex, [(idx1, idx2, factor), ...])``.
+
+    This is the LEGACY-mode display formatter. In `--dynamic-substeps`
+    mode the legacy `pair_seq` / `factor_seq` are zero-filled and the
+    real action lives in the `micro_*_seq` fields — call
+    :func:`_action_to_pylist_dynamic` instead.
+    """
     out = []
     for v_idx, p_row, f_row in zip(vertex_seq, pair_seq, factor_seq):
         rules: list[tuple[int, int, int]] = []
@@ -2666,6 +2673,35 @@ def _action_to_pylist(vertex_seq, pair_seq, factor_seq, max_rules, factor_table_
             factor = int(factor_table_np[int(f_row[slot])])
             rules.append((base_idx1, base_idx2, factor))
         out.append((int(v_idx) + 1, rules))
+    return out
+
+
+_OP_NAME = {0: "DIAG", 1: "COMPRESS", 2: "END"}
+
+
+def _action_to_pylist_dynamic(
+    vertex_seq, op_seq, i_seq, j_seq, factor_seq, max_substeps,
+):
+    """Decode typed micro-action sequences into a readable per-vertex list.
+
+    Each entry is ``(vertex, [(op_name, i, j, factor), ...])`` where the
+    sub-list contains every sub-step up to and including the first END
+    (``j`` and ``factor`` are 0 for COMPRESS / END). Mirrors the legacy
+    formatter's shape so the existing top-N heap / wandb logging code
+    can render either flavour uniformly.
+    """
+    out = []
+    for v_idx, op_row, i_row, j_row, f_row in zip(
+        vertex_seq, op_seq, i_seq, j_seq, factor_seq,
+    ):
+        steps: list[tuple[str, int, int, int]] = []
+        for slot in range(max_substeps):
+            op = int(op_row[slot])
+            name = _OP_NAME.get(op, f"OP{op}")
+            steps.append((name, int(i_row[slot]), int(j_row[slot]), int(f_row[slot])))
+            if name == "END":
+                break
+        out.append((int(v_idx) + 1, steps))
     return out
 
 
@@ -3333,6 +3369,20 @@ def main():
         f"variant={variant_label}, num_envs={num_envs}, max_rules={max_rules}, "
         f"factors={factors_py}, rollout_length={num_valid}, minibatches={args.minibatches}"
     )
+    # Catch the "20-samples-into-32-minibatches → 0-elem minibatch → silent NaN
+    # loss" pitfall as early as possible. `shuffle_and_batch` does integer
+    # division (num_envs * rollout_length // minibatches); when the result is
+    # zero, the PPO loss is `jnp.mean(<empty>) = NaN`, training is a no-op,
+    # and the only surface signal is `ent:nan` in the progress bar.
+    _mb_size = (num_envs * num_valid) // args.minibatches
+    if _mb_size == 0:
+        raise ValueError(
+            f"--minibatches={args.minibatches} > num_envs * rollout "
+            f"({num_envs} * {num_valid} = {num_envs * num_valid}). "
+            "Each minibatch would be empty, so the PPO loss becomes NaN "
+            "and no learning happens. Lower --minibatches or raise "
+            "--num-envs."
+        )
     nonzero_w = ", ".join(
         f"{REWARD_NAMES[i]}={float(reward_weights_np[i]):+.3g}"
         for i in range(NUM_REWARDS)
@@ -4229,7 +4279,18 @@ def main():
         metrics = jax.tree_util.tree_map(
             lambda x: jnp.mean(x, axis=(0, 1)), metrics_seq,
         )
-        actions_pack = (traj.vertex_idx, traj.pair_seq, traj.factor_seq)
+        # Legacy slots are zero-filled in --dynamic-substeps mode; the
+        # micro_* slots carry the real typed action there. Pack both so
+        # `host_log` can pick the right formatter.
+        actions_pack = (
+            traj.vertex_idx,
+            traj.pair_seq,
+            traj.factor_seq,
+            traj.micro_op_seq,
+            traj.micro_i_seq,
+            traj.micro_j_seq,
+            traj.micro_factor_seq,
+        )
         # Pair / factor / preference marginals — Stage D / E / F diagnostics.
         # Average over (env, time, slot) — broad enough to detect global
         # collapse without exposing per-step noise.
@@ -4306,6 +4367,25 @@ def main():
         v_idx_arr = np.array(actions_pack[0])
         pair_arr = np.array(actions_pack[1])
         factor_arr = np.array(actions_pack[2])
+        # Typed micro-action slots — populated only in --dynamic-substeps;
+        # legacy mode passes zero-filled tensors. The decoder branch below
+        # uses these whenever the dynamic policy is active.
+        micro_op_arr = np.array(actions_pack[3])
+        micro_i_arr = np.array(actions_pack[4])
+        micro_j_arr = np.array(actions_pack[5])
+        micro_factor_arr = np.array(actions_pack[6])
+
+        def _decode(env_i):
+            if args.dynamic_substeps:
+                return _action_to_pylist_dynamic(
+                    v_idx_arr[env_i], micro_op_arr[env_i], micro_i_arr[env_i],
+                    micro_j_arr[env_i], micro_factor_arr[env_i],
+                    args.max_substeps,
+                )
+            return _action_to_pylist(
+                v_idx_arr[env_i], pair_arr[env_i], factor_arr[env_i],
+                max_rules, factor_table_np,
+            )
         mean_r = np.atleast_1d(np.array(mean_r))
 
         host_state["samplecounts"] += num_envs * num_valid
@@ -4328,9 +4408,7 @@ def main():
         weights = reward_weights_np
         for i in range(all_rets.shape[0]):
             rets = all_rets[i]
-            decoded = _action_to_pylist(
-                v_idx_arr[i], pair_arr[i], factor_arr[i], max_rules, factor_table_np
-            )
+            decoded = _decode(i)
             total_ret = float(np.sum(rets * weights))
             # Per-family heap keys: cmp uses the canonical compute index,
             # mem uses the canonical memory index, and acc tracks cosine_sim.
@@ -4361,10 +4439,7 @@ def main():
         best_ret = float(weighted_sums[best_idx])
         if best_ret > host_state["best_global_return"]:
             host_state["best_global_return"] = best_ret
-            host_state["best_global_act_seq"] = _action_to_pylist(
-                v_idx_arr[best_idx], pair_arr[best_idx], factor_arr[best_idx],
-                max_rules, factor_table_np,
-            )
+            host_state["best_global_act_seq"] = _decode(best_idx)
 
         log_dict = {
             "best_return": host_state["best_global_return"],
