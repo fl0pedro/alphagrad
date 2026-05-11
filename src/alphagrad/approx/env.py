@@ -144,9 +144,15 @@ class EnvState(NamedTuple):
     # space. `axis_state` is a packed int32 array of (size, is_output,
     # is_compressed, group_id) per axis slot; `axis_valid_mask` flags
     # which slots carry a real axis (vs. padding up to MAX_AXES_PER_VERTEX).
-    # Today the values are static-from-jaxpr and constant across the
-    # rollout; the heads.py wiring will mutate them per sub-step as DIAG
-    # pairs axes and COMPRESS marks axes compressed.
+    # After `step()` the row for the just-eliminated vertex is updated to
+    # reflect DIAG group_ids / shrunk sizes and COMPRESS marks
+    # (see `_apply_rules_to_axis_state`). Downstream propagation across
+    # the jaxpr DAG (where vertex `v`'s output axes feed into vertex
+    # `v'`'s input axes later in the order) is intentionally not
+    # implemented — the agent never revisits an eliminated vertex, and
+    # the policy carries its own per-substep axis state through the
+    # heads.py scan, so the missing signal is "useful debug metadata"
+    # not "training signal".
     axis_state: Array          # (total_v, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM) int32
     axis_valid_mask: Array     # (total_v, MAX_AXES_PER_VERTEX) float32
     step_count: Array
@@ -201,6 +207,97 @@ def _get_partials(order, sparsity_specs, stop):
         sparsity_specs[:v_stop] if v_stop < len(sparsity_specs) else sparsity_specs
     )
     return partial_order, partial_specs
+
+
+def _apply_rules_to_axis_state(axis_state_v: Array, rule_specs: Array) -> Array:
+    """Mutate one vertex's axis_state to reflect the rules just applied.
+
+    Single-vertex update — the downstream / symbolic-shape propagation
+    across the jaxpr DAG (where compressed / paired axes of vertex `v`
+    show up as input axes of vertex `v'` later in the order) is the
+    "deeper" piece called out in the env's roadmap and is **not**
+    implemented here. The reason is that nothing in this scope actually
+    needs the downstream signal: once a vertex is eliminated the agent
+    never revisits it, and the policy carries its own per-substep axis
+    state through `_features_after_diag` / `_features_after_compress` in
+    `heads.py`. What this function buys is:
+
+    * Honest top-N / replay output — `EnvState.axis_state[v]` after
+      `step()` shows what the rules did to vertex `v`, which is helpful
+      for debugging.
+    * A baseline for the future cross-vertex propagation: when that
+      lands, it will read the per-vertex mutations from here and
+      forward them along the data-flow edges.
+
+    Per rule:
+
+    * DIAG ``(bi1, bi2, factor)`` — the output axis at relative position
+      ``bi1`` and the primal axis at relative position ``bi2`` are paired
+      under a fresh `group_id`. Their sizes shrink by `factor` (so an
+      original (4, 4) pair with factor=2 becomes (2, 2)).
+    * COMPRESS ``(SENTINEL, axis, _)`` — the axis at the recorded token
+      position is marked `is_compressed = 1` and its size collapses to 1.
+    * Unused / END sentinel rows leave the state unchanged.
+
+    Implementation is JAX-traceable so callers inside the jitted
+    `step()` can use it. ``rule_specs`` is iterated with
+    ``lax.fori_loop`` and per-slot updates are gated by ``jnp.where``.
+    """
+    is_output = axis_state_v[:, _AXIS_FEAT_IS_OUTPUT]
+    n_out = jnp.sum(is_output).astype(jnp.int32)
+
+    # The fresh group_id starts after the largest existing one — that
+    # way we don't overwrite groups recorded by earlier steps on this
+    # same vertex (if any) and the per-vertex group sequence stays
+    # monotonic. `_AXIS_FEAT_GROUP_ID` defaults to -1 (ungrouped), so
+    # max(-1, ...) + 1 = 0 on the first DIAG.
+    init_gid = jnp.max(axis_state_v[:, _AXIS_FEAT_GROUP_ID]) + 1
+
+    def _body(slot, carry):
+        state, gid = carry
+        row = rule_specs[slot]
+        bi1 = row[0]
+        bi2 = row[1]
+        factor = row[2]
+
+        is_diag = bi1 >= 0
+        is_compress = bi1 == COMPRESS_SENTINEL
+
+        # DIAG: pair the (bi1, n_out + bi2) axes under `gid` and shrink
+        # both sizes by `factor`. Clamp factor to >= 1 so the dummy
+        # path (`factor == 0` from the unused row) leaves sizes alone.
+        diag_out_tok = jnp.clip(bi1, 0, axis_state_v.shape[0] - 1)
+        diag_prim_tok = jnp.clip(n_out + bi2, 0, axis_state_v.shape[0] - 1)
+        safe_factor = jnp.maximum(factor, 1)
+
+        def _apply_diag(s):
+            s = s.at[diag_out_tok, _AXIS_FEAT_GROUP_ID].set(gid)
+            s = s.at[diag_prim_tok, _AXIS_FEAT_GROUP_ID].set(gid)
+            s = s.at[diag_out_tok, _AXIS_FEAT_SIZE].set(
+                jnp.maximum(s[diag_out_tok, _AXIS_FEAT_SIZE] // safe_factor, 1)
+            )
+            s = s.at[diag_prim_tok, _AXIS_FEAT_SIZE].set(
+                jnp.maximum(s[diag_prim_tok, _AXIS_FEAT_SIZE] // safe_factor, 1)
+            )
+            return s
+
+        # COMPRESS: mark axis is_compressed, collapse size to 1.
+        comp_tok = jnp.clip(bi2, 0, axis_state_v.shape[0] - 1)
+
+        def _apply_compress(s):
+            s = s.at[comp_tok, _AXIS_FEAT_IS_COMPRESSED].set(1)
+            s = s.at[comp_tok, _AXIS_FEAT_SIZE].set(1)
+            return s
+
+        state = jax.lax.cond(is_diag, _apply_diag, lambda s: s, state)
+        state = jax.lax.cond(is_compress, _apply_compress, lambda s: s, state)
+        new_gid = jnp.where(is_diag, gid + 1, gid)
+        return state, new_gid
+
+    final_state, _ = jax.lax.fori_loop(
+        0, MAX_RULES_PER_VERTEX, _body, (axis_state_v, init_gid)
+    )
+    return final_state
 
 
 def compute_static_axis_state(jaxpr, total_v: int) -> tuple[np.ndarray, np.ndarray]:
@@ -1107,16 +1204,24 @@ class VertexEliminationEnv:
 
         terminated = new_step >= state.max_steps
 
+        # Single-vertex axis_state mutation: the just-acted-on vertex's
+        # row records the DIAG pairings / COMPRESS markings the agent
+        # committed to. See `_apply_rules_to_axis_state` for the per-rule
+        # semantics and for why downstream propagation is deliberately
+        # deferred. `target_vertex` is 1-indexed (matches the env's
+        # vertex IDs); axis_state is 0-indexed by equation, so subtract 1.
+        v_idx = target_vertex - jnp.int32(1)
+        updated_axis_v = _apply_rules_to_axis_state(
+            state.axis_state[v_idx], rule_specs,
+        )
+        new_axis_state = state.axis_state.at[v_idx].set(updated_axis_v)
+
         new_state = EnvState(
             order=new_order,
             sparsity_specs=new_specs,
             tokens=tokens,
             eqn_ids=eqn_ids,
-            # Static for now — passes through unchanged. Once heads.py wires
-            # MicroActions into the env, this is where DIAG / COMPRESS
-            # mutations land (e.g. setting `is_compressed` on dropped
-            # axes, `group_id` on paired DIAG axes, updated sizes).
-            axis_state=state.axis_state,
+            axis_state=new_axis_state,
             axis_valid_mask=state.axis_valid_mask,
             step_count=new_step,
             max_steps=state.max_steps,

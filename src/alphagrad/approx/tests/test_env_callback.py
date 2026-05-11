@@ -37,8 +37,16 @@ from alphagrad.approx.env import (
     EnvConfig,
     StepAction,
     VertexEliminationEnv,
+    _apply_rules_to_axis_state,
     _callback,
     cossim,
+)
+from alphagrad.approx.env import (
+    _AXIS_FEAT_GROUP_ID,
+    _AXIS_FEAT_IS_COMPRESSED,
+    _AXIS_FEAT_IS_OUTPUT,
+    _AXIS_FEAT_SIZE,
+    AXIS_FEATURE_DIM,
 )
 
 
@@ -433,6 +441,56 @@ def test_callback_compress_drops_out_of_range_axes():
 
 
 # ---------------------------------------------------------------------------
+# Per-vertex axis_state mutation reflects DIAG + COMPRESS rules
+# ---------------------------------------------------------------------------
+
+
+def test_apply_rules_to_axis_state_diag_and_compress():
+    """`_apply_rules_to_axis_state` should update size / group_id /
+    is_compressed on the affected slots and leave everything else alone.
+    The function is JAX-traceable and runs inside the jitted env.step,
+    so we exercise it via jax.jit here too — catches type errors that
+    only surface under tracing.
+    """
+    print("\n[env] _apply_rules_to_axis_state mutates touched axes only")
+    # Vertex with 2 output axes (size 4, 4) and 2 primal axes (size 4, 4).
+    axis_state_v = jnp.zeros((6, AXIS_FEATURE_DIM), dtype=jnp.int32)
+    axis_state_v = (
+        axis_state_v
+        .at[:, _AXIS_FEAT_GROUP_ID].set(-1)
+        .at[0, _AXIS_FEAT_SIZE].set(4).at[0, _AXIS_FEAT_IS_OUTPUT].set(1)
+        .at[1, _AXIS_FEAT_SIZE].set(4).at[1, _AXIS_FEAT_IS_OUTPUT].set(1)
+        .at[2, _AXIS_FEAT_SIZE].set(4).at[2, _AXIS_FEAT_IS_OUTPUT].set(0)
+        .at[3, _AXIS_FEAT_SIZE].set(4).at[3, _AXIS_FEAT_IS_OUTPUT].set(0)
+    )
+    # Slot 0: DIAG bi1=0, bi2=0, factor=2 → pair (out 0, primal 0) at gid=0, sizes 4→2.
+    # Slot 1: COMPRESS axis=3 → mark primal axis 1 (token idx 3) compressed, size→1.
+    # Slot 2: end sentinel.
+    rule_specs = jnp.array([
+        [0, 0, 2],
+        [COMPRESS_SENTINEL, 3, 0],
+        [-1, -1, 0],
+        [-1, -1, 0],
+    ], dtype=jnp.int32)
+
+    out = jax.jit(_apply_rules_to_axis_state)(axis_state_v, rule_specs)
+
+    # DIAG effects
+    assert int(out[0, _AXIS_FEAT_GROUP_ID]) == 0
+    assert int(out[2, _AXIS_FEAT_GROUP_ID]) == 0  # primal at token n_out + bi2 = 2 + 0 = 2
+    assert int(out[0, _AXIS_FEAT_SIZE]) == 2
+    assert int(out[2, _AXIS_FEAT_SIZE]) == 2
+    # COMPRESS effects on token 3 (primal axis 1)
+    assert int(out[3, _AXIS_FEAT_IS_COMPRESSED]) == 1
+    assert int(out[3, _AXIS_FEAT_SIZE]) == 1
+    # Untouched: output axis 1 (token 1)
+    assert int(out[1, _AXIS_FEAT_GROUP_ID]) == -1
+    assert int(out[1, _AXIS_FEAT_SIZE]) == 4
+    assert int(out[1, _AXIS_FEAT_IS_COMPRESSED]) == 0
+    print(f"  out axis_state[0..3] = {out[:4].tolist()}")
+
+
+# ---------------------------------------------------------------------------
 # Smoke test: full env.step round-trip on the smallest real example
 # ---------------------------------------------------------------------------
 
@@ -482,6 +540,7 @@ def main():
     test_callback_drops_rules_that_dont_fit_every_invar()
     test_callback_emits_compress_for_sentinel_rows()
     test_callback_compress_drops_out_of_range_axes()
+    test_apply_rules_to_axis_state_diag_and_compress()
     test_env_step_roundtrip_on_helmholtz()
     print("\nALL ENV CALLBACK TESTS OK")
 
