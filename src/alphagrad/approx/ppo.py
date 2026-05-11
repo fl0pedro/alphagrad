@@ -3532,6 +3532,17 @@ def main():
             args.entropy_weight * entropy_loss,
             total_loss,
             trigger_ratio,
+            # Per-component KLs (vertex / op / i / j / exp). Legacy path
+            # exposes the closest available signal: (vertex_kl, pair_kl,
+            # factor_kl, 0, 0). The op/i/j/exp slot semantics are
+            # dynamic-mode specific; the legacy values fill the first
+            # three to preserve some signal for the per-component KL
+            # dashboard panels.
+            jnp.stack([
+                vertex_kl, pair_kl, factor_kl,
+                jnp.array(0.0, dtype=jnp.float32),
+                jnp.array(0.0, dtype=jnp.float32),
+            ]),
         )
 
     def _dynamic_loss_fn(agent, batch: TrainBatch, vertex_features, key):
@@ -3704,6 +3715,11 @@ def main():
             active_steps * is_diag_step,
         )
         kl_div = kl_vertex + kl_op + kl_i + kl_j + kl_exp
+        # Stash per-component KLs so they can be logged separately — they're
+        # the most useful single signal for debugging the dynamic head
+        # (factor head and END decision are where collapse starts per the
+        # design spec).
+        _kl_components = (kl_vertex, kl_op, kl_i, kl_j, kl_exp)
 
         total_loss = (
             ppo_loss
@@ -3720,6 +3736,10 @@ def main():
             args.entropy_weight * entropy_loss,
             total_loss,
             trigger_ratio,
+            # Per-component KLs for dynamic-mode debugging; legacy loss_fn
+            # returns the same 5-slot suffix with zeros so the metrics
+            # tuple shape is uniform across modes (lax.scan needs that).
+            jnp.stack(_kl_components),
         )
 
     def train_episode(
@@ -3873,7 +3893,13 @@ def main():
         )
 
         agent, opt_state = eqx.combine(dynamic_carry, static_carry)
-        metrics = jax.tree_util.tree_map(lambda x: jnp.mean(x), metrics_seq)
+        # metrics_seq leaves have a leading (ppo_epochs, minibatches) pair.
+        # Reduce by mean over those two scan axes only — scalars become
+        # scalars, and the per-component KL slot (a (5,) array per step)
+        # stays a (5,) array instead of being globally scalarized.
+        metrics = jax.tree_util.tree_map(
+            lambda x: jnp.mean(x, axis=(0, 1)), metrics_seq,
+        )
         actions_pack = (traj.vertex_idx, traj.pair_seq, traj.factor_seq)
         # Pair / factor / preference marginals — Stage D / E / F diagnostics.
         # Average over (env, time, slot) — broad enough to detect global
@@ -3889,9 +3915,24 @@ def main():
             # for spotting collapse in a specific op-type (e.g. policy
             # only emits END, never DIAG).
             op_marginals = jnp.mean(traj.micro_op_dists, axis=(0, 1, 2))
+            # Mean sub-episode length: number of "active" sub-steps
+            # before the first OP_END (inclusive of the END action itself).
+            # Bounded by `max_substeps`. Tracking this catches the two
+            # common failure modes: collapse to length-1 (always END) or
+            # collapse to length=max_substeps (never END, gets truncated).
+            is_end_seq = traj.micro_op_seq == OP_END
+            prior_ends = (
+                jnp.cumsum(is_end_seq.astype(jnp.int32), axis=-1)
+                - is_end_seq.astype(jnp.int32)
+            )
+            active_steps_per_rollout = (prior_ends == 0).astype(jnp.float32)
+            mean_sub_episode_length = jnp.mean(
+                jnp.sum(active_steps_per_rollout, axis=-1)
+            )
         else:
             p_stop_slot0 = jnp.mean(traj.pair_dists[..., 0, PAIR_STOP])
             op_marginals = jnp.zeros((NUM_OPS,), dtype=jnp.float32)
+            mean_sub_episode_length = jnp.array(0.0, dtype=jnp.float32)
         diag_pack = (
             jnp.mean(traj.pair_dists, axis=(0, 1, 2)),
             jnp.mean(traj.factor_dists, axis=(0, 1, 2)),
@@ -3899,6 +3940,7 @@ def main():
             mean_violations,
             p_stop_slot0,
             op_marginals,
+            mean_sub_episode_length,
         )
         return (
             agent, opt_state, env_states, metrics, total_rewards_full,
@@ -3938,17 +3980,20 @@ def main():
         mean_r = np.atleast_1d(np.array(mean_r))
 
         host_state["samplecounts"] += num_envs * num_valid
-        (
-            kl_div,
-            policy_entropy,
-            _fit_quality,
-            explained_var,
-            ppo_loss,
-            value_loss,
-            _entropy_loss,
-            total_loss,
-            _clipping_trigger_ratio,
-        ) = [float(m) for m in mets]
+        # mets is a 10-tuple: the last entry is a (5,) per-component KL
+        # array (vertex / op / i / j / exp in dynamic mode; vertex / pair /
+        # factor / 0 / 0 in legacy mode). Unpack scalars separately and
+        # cast the array to a numpy view for per-component logging.
+        kl_div = float(mets[0])
+        policy_entropy = float(mets[1])
+        _fit_quality = float(mets[2])
+        explained_var = float(mets[3])
+        ppo_loss = float(mets[4])
+        value_loss = float(mets[5])
+        _entropy_loss = float(mets[6])
+        total_loss = float(mets[7])
+        _clipping_trigger_ratio = float(mets[8])
+        kl_components = np.asarray(mets[9])
 
         weights = reward_weights_np
         for i in range(all_rets.shape[0]):
@@ -4002,6 +4047,18 @@ def main():
             "value loss": value_loss,
             "total loss": total_loss,
         }
+        # Per-component KL: slot semantics depend on the trainer mode.
+        # In dynamic mode the components are vertex / op / i / j / exp
+        # (the heads.py policy components); in legacy mode they are
+        # vertex / pair / factor / 0 / 0. Logging both naming conventions
+        # so dashboards can pick whichever applies.
+        if kl_components.shape[0] >= 5:
+            if args.dynamic_substeps:
+                names = ("vertex", "op", "i", "j", "exp")
+            else:
+                names = ("vertex", "pair", "factor", "_unused1", "_unused2")
+            for j, nm in enumerate(names):
+                log_dict[f"kl/{nm}"] = float(kl_components[j])
         for j, name in enumerate(REWARD_NAMES):
             log_dict[f"mean_{name}"] = float(mean_r[j]) if j < len(mean_r) else 0.0
 
@@ -4011,7 +4068,7 @@ def main():
         if diag_pack is not None:
             (
                 pair_marg, factor_marg, pref_mean, mean_viol,
-                p_stop_slot0, op_marginals,
+                p_stop_slot0, op_marginals, mean_sub_episode_length,
             ) = (np.asarray(x) for x in diag_pack)
             for j, p in enumerate(pair_marg):
                 log_dict[f"pair_marginal/{j}"] = float(p)
@@ -4024,6 +4081,7 @@ def main():
             # Zero in legacy mode (filled with zeros by train_episode).
             for j, op_name in enumerate(("diag", "compress", "end")):
                 log_dict[f"op_marginal/{op_name}"] = float(op_marginals[j])
+            log_dict["sub_episode_length"] = float(mean_sub_episode_length)
             if multipliers_arr is not None and np.size(multipliers_arr) > 0:
                 lam = np.asarray(multipliers_arr)
                 viol = np.asarray(mean_viol)
