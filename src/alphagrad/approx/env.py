@@ -983,9 +983,19 @@ def _callback(
 
         with ResourceMonitor(devices=unique_devices) as monitor:
             out_approx = compiled_approx(*eval_args_i)
-        latency_s, peak_bytes = monitor.stats.values()
-        latency_samples.append(float(latency_s) * 1e9)  # → ns
-        peak_mem_samples.append(float(peak_bytes))
+            # JAX dispatches asynchronously; without a block here the
+            # monitor exits before the device finishes the work and both
+            # the time and memory readings are dominated by dispatch
+            # overhead (peak comes back as 0 bytes). Forcing the result to
+            # land synchronizes the device queue so the tracker sees the
+            # full peak allocation and the timer captures real wall-clock.
+            out_approx = jax.block_until_ready(out_approx)
+        # Key by name instead of unpacking ``.values()`` so this stays
+        # robust to dict-order / API tweaks in jax_memory_monitor.
+        latency_s = float(monitor.stats.get("time", 0.0))
+        peak_bytes = float(monitor.stats.get("memory", 0.0))
+        latency_samples.append(latency_s * 1e9)  # → ns
+        peak_mem_samples.append(peak_bytes)
 
         out_exact = compiled_exact(*eval_args_i)
         out_approxs.append(out_approx)
