@@ -1627,22 +1627,39 @@ class Agent(eqx.Module):
             v_context, features, factor_tables, micro_key,
         )
 
-        # Apply the op-legality override post-hoc: if COMPRESS isn't
-        # allowed, rewrite every COMPRESS action as END. This is a
-        # safety net so the env doesn't silently drop COMPRESS rows.
-        # Doesn't affect log_prob_step because evaluate_action_dynamic
-        # mirrors the same rewrite before recomputing.
-        compress_allowed = op_legality_override[1] > 0.5
-        is_compress = actions.op_type == 1  # OP_COMPRESS
+        # Apply the op-legality override post-hoc on both DIAG and
+        # COMPRESS: any disallowed op_type is rewritten to END. The
+        # MicroActionPolicy.sample doesn't take the override directly —
+        # it computes legality from axis-state (always allowing both
+        # DIAG and COMPRESS when axes are available). The override is
+        # how the curriculum runner forces `ve_only` (no DIAG, no
+        # COMPRESS) or `compress` (no DIAG) or `diag_*` (no COMPRESS)
+        # behaviour at sampling time.
+        diag_allowed = op_legality_override[OP_DIAG] > 0.5
+        compress_allowed = op_legality_override[OP_COMPRESS] > 0.5
+        is_diag = actions.op_type == OP_DIAG
+        is_compress = actions.op_type == OP_COMPRESS
+        disallowed = (
+            (is_diag & ~diag_allowed) | (is_compress & ~compress_allowed)
+        )
         rewritten_op = jnp.where(
-            is_compress & ~compress_allowed,
+            disallowed,
             jnp.full_like(actions.op_type, OP_END),
             actions.op_type,
         )
+        # When op_type is rewritten to END the sampled i / j / exponents /
+        # factor are stale. Zero them so the recorded action is canonical
+        # (matches what sample_step produces for genuine END outputs).
+        zeros_i = jnp.zeros_like(actions.i)
+        zeros_j = jnp.zeros_like(actions.j)
+        zeros_exp = jnp.zeros_like(actions.exponents)
+        zeros_f = jnp.zeros_like(actions.factor)
         actions = MicroAction(
             op_type=rewritten_op,
-            i=actions.i, j=actions.j, exponents=actions.exponents,
-            factor=actions.factor,
+            i=jnp.where(disallowed, zeros_i, actions.i),
+            j=jnp.where(disallowed, zeros_j, actions.j),
+            exponents=jnp.where(disallowed[..., None], zeros_exp, actions.exponents),
+            factor=jnp.where(disallowed, zeros_f, actions.factor),
         )
 
         return (
