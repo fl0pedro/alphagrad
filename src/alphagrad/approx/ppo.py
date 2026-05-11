@@ -41,7 +41,6 @@ from tqdm import tqdm
 from alphagrad.approx.common import (
     NUM_VERTEX_FEATURES,
     OP_TYPE_VOCAB_SIZE,
-    build_pair_factor_valid_mask,
     build_pair_valid_mask,
     build_vertex_valid_static,
     compute_per_sample_vertex_features,
@@ -3291,16 +3290,15 @@ def main():
     cosine_idx = REWARD_INDEX["cosine_sim"]
     frob_idx = REWARD_INDEX["frob_residual"]
 
-    # Per-(vertex, pair, factor) validity mask. Used by the autoreg policy's
-    # factor head to mask out factors that don't divide the relevant axis
-    # sizes — those would otherwise hit the matmul fallback path. The
-    # single-rule policy ignores it (factor is fixed to -1).
-    pair_factor_mask = build_pair_factor_valid_mask(
-        closed_jaxpr.jaxpr,
-        total_v,
-        num_pair_choices=NUM_PAIR_CHOICES,
-        factor_table=factor_table_np,
-        pair_stop_idx=PAIR_STOP,
+    # Per-(vertex, pair, factor) validity mask. The legacy mask filtered
+    # out factors that didn't divide the relevant axis sizes. With
+    # graphax's typed-transform API (apply_diag) silently skipping
+    # non-dividing factors at apply time, the pre-mask is redundant —
+    # the policy can emit any factor index and the env-side translator
+    # drops the invalid slot. Pass an all-ones tensor in the shape the
+    # autoreg factor head expects.
+    pair_factor_mask = jnp.ones(
+        (total_v, NUM_PAIR_CHOICES, num_factors), dtype=jnp.float32,
     )
 
     # Dynamic-substeps state: only constructed when the flag is on, but

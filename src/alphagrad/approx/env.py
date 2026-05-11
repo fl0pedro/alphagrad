@@ -3,7 +3,6 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from functools import partial
-from itertools import zip_longest
 from typing import Callable, Literal, NamedTuple, Sequence
 
 import jax
@@ -19,7 +18,10 @@ import numpy as np
 from alphagrad.approx.common.relations import compute_eqn_ids_from_tokens
 from graphax.core import _build_graph, extract_jaxpr, jacve, vertex_elimination_jaxpr
 from graphax.jaxpr import get_vocab as _graphax_get_vocab
+from graphax.sparse.micro_actions import Diag
 from jax_memory_monitor import ResourceMonitor
+
+import math as _math
 
 # Cache the graphax vocabulary used by `compute_eqn_ids_from_tokens` — the
 # tokenizer always uses the same digit_base, so the vocab is constant and
@@ -84,8 +86,10 @@ REWARD_INDEX = {name: i for i, name in enumerate(REWARD_NAMES)}
 COMPUTE_REWARD_INDICES = tuple(range(0, 6))  # cost components
 QUALITY_REWARD_INDICES = (6, 7)             # cosine, frobenius
 
-# Sentinel reward returned when a sparsity_map matches an entry in the in-file
-# blacklist (used during exploration to penalise pathological configurations).
+# Sentinel reward returned when a per-vertex transform sequence matches an
+# entry in the in-file blacklist (used during exploration to penalise
+# pathological configurations). The blacklist is no longer wired up after
+# the typed-transform migration; the array is kept for potential reuse.
 _SENTINEL_BAD_REWARD = jnp.array(
     [-1e10, -1e10, -1e10, -1e10, -1e10, -1e10, -1.0, -1e10],
     dtype=jnp.float32,
@@ -216,18 +220,20 @@ def compute_static_axis_state(jaxpr, total_v: int) -> tuple[np.ndarray, np.ndarr
 
 
 # ---------------------------------------------------------------------------
-# Typed MicroAction <-> legacy sparsity_specs translator
+# Typed MicroAction -> EnvState.sparsity_specs row translator
 # ---------------------------------------------------------------------------
 #
-# The heads.py policy emits a typed `MicroAction(op_type, i, j, exponents)`
-# sequence per vertex. The env-side path through graphax's
-# `extract_jaxpr` / `vertex_elimination_jaxpr` still consumes the legacy
-# `sparsity_map` tuple-of-tuples (one `(idx1, idx2, factor)` per rule slot).
-# Until graphax's vertex_elimination is rewritten to accept typed micro-
-# actions, this translator bridges the gap: each DIAG micro-action becomes
-# a single rule_specs row with an explicit positive factor; COMPRESS raises
-# (the legacy path has no equivalent — its `factor == 0` is drop-axes, not
-# mean-compression, per the user's recent clarification).
+# The heads.py policy emits a typed `MicroAction(op_type, i, j, exponents,
+# factor)` sequence per vertex. The env's _callback turns the stored
+# specs (one (base_idx1, base_idx2, factor) row per slot) into typed
+# graphax.sparse.micro_actions.Diag entries before handing them to
+# graphax's `transforms` API. This translator converts the policy's
+# typed action sequence into the 3-tuple row format the EnvState carries
+# in `sparsity_specs` — the rest of the env then dispatches normally.
+# COMPRESS micro-actions are silently dropped today since the graphax
+# `transforms` API only handles Diag end-to-end through the env's reward
+# path (a Compress callable would need to be threaded all the way to
+# graphax's per-vertex transform list — straightforward but not yet wired).
 
 
 def micro_actions_to_rule_specs(
@@ -262,11 +268,11 @@ def micro_actions_to_rule_specs(
         are filled with the unused sentinel ``[-1, -1, 0]``.
 
     Raises:
-        NotImplementedError: if any micro-action is ``OP_COMPRESS``. Real
-        mean-compression has no representation in the legacy
-        sparsity_map format; the trainer must wait for graphax's
-        vertex-elimination rewrite to consume typed micro-actions
-        directly (graphax.sparse.micro_actions.apply_micro_actions).
+        NotImplementedError: if any micro-action is ``OP_COMPRESS``. The
+        env's `sparsity_specs` carries Diag-shaped 3-tuples only; routing
+        Compress through the env requires adding a parallel `compress_specs`
+        field and a translator on the env-side that builds
+        ``graphax.sparse.micro_actions.Compress`` entries alongside Diag.
     """
     # Lazy import to avoid circular dependency at module import time —
     # heads.py imports nothing from env.py but env.py only needs the
@@ -298,14 +304,13 @@ def micro_actions_to_rule_specs(
             break
         if op == OP_COMPRESS:
             raise NotImplementedError(
-                "COMPRESS micro-actions have no representation in the legacy "
-                "sparsity_map format consumed by graphax.extract_jaxpr. "
-                "Real mean-compression lives in "
-                "`graphax.sparse.micro_actions.apply_compress`; wiring it "
-                "into the env requires rewriting "
-                "graphax.core.vertex_elimination_jaxpr to take typed "
-                "micro-action sequences (next step after the heads.py "
-                "policy integration)."
+                "COMPRESS micro-actions are not yet stored in the env's "
+                "`sparsity_specs` row format (which only carries Diag-shaped "
+                "(idx1, idx2, factor) tuples). Real mean-compression is "
+                "available via `graphax.sparse.micro_actions.apply_compress`; "
+                "wiring it through requires adding a parallel "
+                "`compress_specs` EnvState field and translating those rows "
+                "to `Compress(axes=(...))` in the env's `_callback`."
             )
         if op != OP_DIAG:
             raise ValueError(f"Unknown op_type {op!r} at sub-step {s_idx}.")
@@ -321,10 +326,10 @@ def micro_actions_to_rule_specs(
         # will go away when the typed action becomes the canonical form.
         if is_out_i == is_out_j:
             # Both axes on the same side (both output or both primal). The
-            # legacy sparsity_map format strictly pairs one output axis with
-            # one primal axis; no representation for this. Terminate the
-            # sub-episode here — the policy is expected to mask these out
-            # before sampling, but a stray pair shouldn't crash the env.
+            # env's sparsity_specs row format strictly pairs one output axis
+            # with one primal axis; no representation for this. Terminate
+            # the sub-episode here — the policy is expected to mask these
+            # out before sampling, but a stray pair shouldn't crash the env.
             break
         # bi1 = output-side axis position, bi2 = primal-side axis position.
         if is_out_i:
@@ -538,14 +543,27 @@ def _callback(
     o_list = [int(x) for x in partial_order.tolist()]
     specs_list = partial_specs.tolist()  # list of MAX_RULES x 3 lists
 
-    sparsity_map = []
+    # Build the per-vertex `transforms` sequence consumed by graphax's
+    # typed-transform API. Each row in `sparsity_specs` is
+    # ``[base_idx1, base_idx2, factor]``; we resolve the logical axis
+    # indices and the legacy -1 (gcd) / 0 (drop) / 1 (no-op) sentinels
+    # into explicit Diag(i, j, factor) entries with a strictly positive
+    # integer factor — the only form graphax's apply_diag accepts. Slots
+    # with factor=0 (legacy drop-axes) or factor=1 (legacy no-op) are
+    # silently skipped: drop has no replacement under the new API, and
+    # no-op is dead weight.
+    transforms: list[tuple[int, tuple]] = []
     for v_idx, v in enumerate(o_list):
         eqn = config.jaxpr.eqns[v - 1]
         if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
             continue
 
-        out_len = len(eqn.outvars[0].aval.shape)
-        rules: list[tuple[int, int, int]] = []
+        out_shape = eqn.outvars[0].aval.shape
+        out_len = len(out_shape)
+        invars = [iv for iv in eqn.invars if hasattr(iv, "aval")]
+        primal_shape = invars[0].aval.shape if invars else ()
+
+        rules: list[Diag] = []
         used_axes: set[int] = set()
         for slot in range(MAX_RULES_PER_VERTEX):
             row = specs_list[v_idx][slot]
@@ -554,35 +572,37 @@ def _callback(
             factor = int(row[2])
             if bi1 < 0:
                 break  # stop / unused slot terminates the sequence
-            idx1 = bi1
-            idx2 = out_len + bi2
-            # Skip rules that would reuse an axis (graphax filters them anyway, drop here for clarity)
+            idx1 = bi1            # logical output-side axis
+            idx2 = out_len + bi2  # logical primal-side axis
+            # Skip rules that would reuse an axis (graphax expected bipartite
+            # disjoint pairs; the legacy translator filtered them, do it here
+            # so apply_diag's stricter checks don't crash).
             if idx1 in used_axes or idx2 in used_axes or idx1 == idx2:
+                continue
+            # Resolve the legacy factor sentinels to an explicit divisor.
+            if 0 <= bi1 < out_len:
+                n1 = int(out_shape[bi1])
+            else:
+                continue
+            if 0 <= bi2 < len(primal_shape):
+                n2 = int(primal_shape[bi2])
+            else:
+                continue
+            if factor == 0 or factor == 1:
+                continue  # drop-axes and no-op have no equivalent in the new API
+            if factor == -1:
+                factor = _math.gcd(n1, n2)
+            # apply_diag requires factor | gcd(n1, n2); silently skip
+            # mismatches rather than crash (the legacy fallback was
+            # gcd-collapse, but the new API treats this as a policy bug
+            # that should be caught upstream by the action mask).
+            if factor <= 0 or n1 % factor != 0 or n2 % factor != 0:
                 continue
             used_axes.add(idx1)
             used_axes.add(idx2)
-            rules.append((idx1, idx2, factor))
+            rules.append(Diag(i=idx1, j=idx2, factor=factor))
         if rules:
-            sparsity_map.append((v, tuple(rules)))
-
-    blacklist = [
-        # [(1, ((1, 2, -1),)), (7, ((1, 3, -1),)), (4, ((1, 2, -1),)), (2, ((0, 3, -1),))],
-        # ...
-    ]
-
-    if sparsity_map != [] and any(
-        all(
-            a is not None and b is not None and a == b
-            for a, b in zip_longest(sparsity_map, x)
-        )
-        for x in blacklist
-    ):
-        print("skipping blacklisted")
-        return (
-            jnp.zeros(MAX_TOKENS, dtype=jnp.int32),
-            jnp.full(MAX_TOKENS, -1, dtype=jnp.int32),
-            _SENTINEL_BAD_REWARD,
-        )
+            transforms.append((int(v), tuple(rules)))
 
     ve = extract_jaxpr(
         config.jaxpr,
@@ -591,7 +611,7 @@ def _callback(
         config.sparse,
         args,
         consts,
-        sparsity_map=sparsity_map,
+        transforms=transforms,
     )
     tokens = ve.tokenized()[:MAX_TOKENS]
     tokens = jnp.pad(tokens, (0, MAX_TOKENS - tokens.shape[0]))
@@ -626,7 +646,7 @@ def _callback(
         argnums=config.argnums,
         count_ops=True,
         sparse_representation=config.sparse,
-        sparsity_map=sparsity_map,
+        transforms=transforms,
     )
     muls_adds_fmas = float(aux["adds"] + aux["muls"] + aux["fmas"])
     max_io_sum = float(aux["mem"])
@@ -658,7 +678,7 @@ def _callback(
         else args
     )
 
-    def compiled(sp_map=None):
+    def compiled(transforms_arg=None):
         return (
             jax.jit(
                 jacve(
@@ -667,7 +687,7 @@ def _callback(
                     argnums=config.argnums,
                     has_aux=config.has_aux,
                     sparse_representation=config.sparse,
-                    sparsity_map=sp_map,
+                    transforms=transforms_arg,
                 ),
                 keep_unused=True,
             )
@@ -675,7 +695,7 @@ def _callback(
             .compile()
         )
 
-    compiled_approx = compiled(sparsity_map)
+    compiled_approx = compiled(transforms)
     compiled_exact = compiled()
 
     # XLA cost analysis — flops + bytes accessed. Falls back to 0 when the

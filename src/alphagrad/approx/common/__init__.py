@@ -30,7 +30,6 @@ from alphagrad.approx.common.init import (
 )
 from alphagrad.approx.common.masks import (
     build_legacy_sp_valid_mask,
-    build_pair_factor_valid_mask,
     build_pair_valid_mask,
     build_vertex_valid_static,
     vertex_avail_at_step,
@@ -69,7 +68,6 @@ __all__ = [
     "SCHEDULES",
     "VERTEX_FEATURE_NAMES",
     "build_legacy_sp_valid_mask",
-    "build_pair_factor_valid_mask",
     "build_pair_valid_mask",
     "build_vertex_valid_static",
     "compute_eqn_ids_from_tokens",

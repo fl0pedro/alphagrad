@@ -52,7 +52,6 @@ from alphagrad.approx.common import (
     init_linear_weights,
     init_replay_buffer,
     load_replay_buffer,
-    build_pair_factor_valid_mask,
     build_pair_valid_mask,
     build_vertex_valid_static,
     replay_add_batch,
@@ -379,12 +378,9 @@ def main():
 
     factor_table, factors_py, num_factors, max_rules = _build_factor_table(args, use_autoreg)
     factor_table_np = np.array(factors_py, dtype=np.int32)
-    pair_factor_mask = build_pair_factor_valid_mask(
-        closed_jaxpr.jaxpr,
-        total_v,
-        num_pair_choices=NUM_PAIR_CHOICES,
-        factor_table=factor_table_np,
-        pair_stop_idx=PAIR_STOP,
+    # All-ones placeholder — see ppo.py for rationale.
+    pair_factor_mask = jnp.ones(
+        (total_v, NUM_PAIR_CHOICES, num_factors), dtype=jnp.float32,
     )
 
     num_envs = _resolve_num_envs(args.num_envs, args.example)
