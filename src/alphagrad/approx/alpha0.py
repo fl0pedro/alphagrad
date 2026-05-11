@@ -62,7 +62,6 @@ from tqdm import tqdm
 
 from alphagrad.approx.common import (
     SCHEDULES,
-    build_pair_factor_valid_mask,
     build_pair_valid_mask,
     build_vertex_valid_static,
     data_gen,
@@ -412,12 +411,10 @@ def main():
         args, use_autoreg,
     )
     factor_table_np = np.array(factors_py, dtype=np.int32)
-    pair_factor_mask = build_pair_factor_valid_mask(
-        closed_jaxpr.jaxpr,
-        total_v,
-        num_pair_choices=NUM_PAIR_CHOICES,
-        factor_table=factor_table_np,
-        pair_stop_idx=PAIR_STOP,
+    # All-ones placeholder — graphax's apply_diag validates factor
+    # divisibility at apply time, so the legacy pre-mask is redundant.
+    pair_factor_mask = jnp.ones(
+        (total_v, NUM_PAIR_CHOICES, num_factors), dtype=jnp.float32,
     )
 
     DECISION_DEPTH = 1 + 2 * max_rules

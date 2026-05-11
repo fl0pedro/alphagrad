@@ -18,7 +18,6 @@ from alphagrad.approx.env import (
 )
 from alphagrad.approx.common import (
     build_legacy_sp_valid_mask,
-    build_pair_factor_valid_mask,
     build_pair_valid_mask,
     build_vertex_valid_static,
     get_advantages,
@@ -126,54 +125,11 @@ def test_masks():
     print(f"  legacy 5-row mask shape ok; 3-row mask shape ok")
 
 
-def test_pair_factor_valid_mask():
-    """Per-(vertex, pair, factor) validity mask used by the autoreg head.
-
-    For each (vertex, pair) the mask should:
-    * always allow factor in {-1, 0, 1} (these go through specialised
-      paths in `apply_dynamic_sparsity` that don't crash);
-    * allow factor K > 1 only if K divides both axis sizes for that pair;
-    * keep at least one factor enabled in the STOP slot so the
-      categorical never produces NaN softmax.
-    """
-    print("\n[common] build_pair_factor_valid_mask")
-    jaxpr = fake_jaxpr(4)  # vertex 0 has out (4,4), in (4,4); 4 % 2 == 0 etc.
-    factor_table = jnp.array([-1, 1, 2, 4, 3])  # 3 doesn't divide 4
-    pair_stop_idx = 4
-    num_pair_choices = pair_stop_idx + 1  # 4 pair indices + STOP
-    mask = build_pair_factor_valid_mask(
-        jaxpr, total_v=4, num_pair_choices=num_pair_choices,
-        factor_table=factor_table, pair_stop_idx=pair_stop_idx,
-    )
-    assert mask.shape == (4, num_pair_choices, 5)
-
-    # vertex 0 has out (4,4), inv[0] (4,4). All four real pairs reference
-    # axes of size 4. So {-1, 0, 1, 2, 4} are valid; 3 doesn't divide 4.
-    for p in range(4):
-        assert float(mask[0, p, 0]) == 1.0, "factor=-1 always valid"
-        assert float(mask[0, p, 1]) == 1.0, "factor=1 (no-op) always valid"
-        assert float(mask[0, p, 2]) == 1.0, "factor=2 divides 4"
-        assert float(mask[0, p, 3]) == 1.0, "factor=4 divides 4"
-        assert float(mask[0, p, 4]) == 0.0, "factor=3 does NOT divide 4"
-
-    # STOP slot keeps factor 0 valid (any factor is fine; it's ignored
-    # downstream when pair_idx == STOP).
-    assert float(mask[0, pair_stop_idx, 0]) == 1.0
-
-    # vertex 1 has out (4,), in (4,4): only pair 0 (= (0,0)) is valid.
-    # All others should have all factors masked off.
-    assert float(mask[1, 0, 0]) == 1.0  # pair 0 with factor=-1
-    for p in (1, 2, 3):
-        for f in range(5):
-            assert float(mask[1, p, f]) == 0.0, (
-                f"vertex 1 pair {p} factor {f} should be masked"
-            )
-
-    # Sums per (v, p) should be > 0 for valid slots, exactly 1 for STOP.
-    sums = jnp.sum(mask, axis=-1)
-    assert float(sums[0, pair_stop_idx]) == 1.0
-    print(f"  vertex 0 valid factors per pair: {mask[0].tolist()}")
-    print(f"  vertex 1 valid factors per pair: {mask[1].tolist()}")
+# test_pair_factor_valid_mask removed — `build_pair_factor_valid_mask`
+# was deleted with the legacy `apply_dynamic_sparsity` migration.
+# graphax's typed-transform API (apply_diag / apply_compress) now
+# validates factor divisibility at apply time; the per-(vertex, pair,
+# factor) pre-mask is dead weight.
 
 
 def test_vertex_avail_at_step():
@@ -238,7 +194,6 @@ def main():
     test_legacy_sp_to_specs()
     test_step_action_vs_int()
     test_masks()
-    test_pair_factor_valid_mask()
     test_vertex_avail_at_step()
     test_gae()
     test_norm_roundtrip()
