@@ -103,6 +103,23 @@ axis_pair_idx_to_base = {0: (0, 0), 1: (0, 1), 2: (1, 0), 3: (1, 1)}
 # marker). The value is encoded as ``-2`` so existing `bi1 < 0` guards still
 # recognise the slot as "not a DIAG", and `_callback` dispatches on the
 # specific sentinel value.
+#
+# Caveat — COMPRESS through the vertex elimination DAG is only partial:
+# `_callback` emits the correct `graphax.sparse.micro_actions.Compress`,
+# but graphax's `_eliminate_vertex` assumes every edge keeps its nominal
+# `(out_dims, primal_dims)` shape. Compress is lossy and reduces
+# `val.ndim`, so a Compress applied to a vertex whose edge feeds into a
+# subsequent elimination step trips the shape-preservation assertion at
+# `core.py:417`. Practical implications:
+#   * COMPRESS works end-to-end when it lands on the LAST vertex of the
+#     elimination order (no downstream edge to matmul against).
+#   * Earlier vertices in the order will assert. Hold off on
+#     ``--allow-compress`` unless you've ordered the agent to only emit
+#     COMPRESS on the final vertex, or are prepared to do the graphax
+#     pre_transforms / shape-bookkeeping work.
+# The reverse direction — graphax silently dropping a transform whose
+# axes don't fit `val.ndim` at all (e.g. axis 1 on a 1-D val) — has been
+# fixed (graphax commit `fa0a088`).
 COMPRESS_SENTINEL = -2
 
 
