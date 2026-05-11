@@ -137,7 +137,7 @@ class AxisSetEncoder(eqx.Module):
     """
 
     proj_in: eqx.nn.Linear
-    group_embedding: eqx.nn.Embedding
+    group_embedding: eqx.nn.Embedding | None
     blocks: tuple
     pool_query: jax.Array
     output_proj: eqx.nn.Linear
@@ -145,23 +145,32 @@ class AxisSetEncoder(eqx.Module):
     embd_dim: int = eqx.field(static=True)
     num_heads: int = eqx.field(static=True)
     max_groups: int = eqx.field(static=True)
+    use_group_embedding: bool = eqx.field(static=True)
 
     def __init__(self, embd_dim: int, num_heads: int, num_layers: int = 1,
-                 max_groups: int = 16, *, key):
+                 max_groups: int = 16, *, key,
+                 use_group_embedding: bool = False):
         self.embd_dim = embd_dim
         self.num_heads = num_heads
         self.max_groups = max_groups
+        self.use_group_embedding = use_group_embedding
 
         keys = jrand.split(key, num_layers + 4)
-        # In features: size, log_size, AXIS_TAG_BITS tag bits, group_emb.
-        # We embed group_id separately and concatenate.
-        feat_in = 1 + 1 + AXIS_TAG_BITS + embd_dim
+        # In features: size, log_size, AXIS_TAG_BITS tag bits, plus an
+        # optional group embedding when --axis-group-embedding is on.
+        # Group membership is already represented in tag_bits[in_diag_group],
+        # so the embedding is off by default — it adds an embedding table
+        # (max_groups+1, embd_dim) and bloats proj_in's input by embd_dim.
+        feat_in = 1 + 1 + AXIS_TAG_BITS + (embd_dim if use_group_embedding else 0)
         self.proj_in = eqx.nn.Linear(feat_in, embd_dim, key=keys[0])
-        # `+1` slot: index 0 reserved for "no group" (group_id == -1 gets
-        # remapped to 0 before the embedding lookup).
-        self.group_embedding = eqx.nn.Embedding(
-            max_groups + 1, embd_dim, key=keys[1],
-        )
+        if use_group_embedding:
+            # `+1` slot: index 0 reserved for "no group" (group_id == -1
+            # gets remapped to 0 before the embedding lookup).
+            self.group_embedding = eqx.nn.Embedding(
+                max_groups + 1, embd_dim, key=keys[1],
+            )
+        else:
+            self.group_embedding = None
 
         self.blocks = tuple(
             _SelfAttentionBlock(embd_dim, num_heads, key=keys[2 + i])
@@ -184,13 +193,16 @@ class AxisSetEncoder(eqx.Module):
         size_f = features.size.astype(jnp.float32)[..., None]              # (N, 1)
         log_size_f = features.log_size[..., None]                          # (N, 1)
         tag_f = features.tag_bits.astype(jnp.float32)                      # (N, T)
-        group_slot = jnp.where(
-            features.group_id >= 0, features.group_id + 1, 0,
-        ).astype(jnp.int32)
-        group_slot = jnp.clip(group_slot, 0, self.max_groups)
-        group_emb = jax.vmap(self.group_embedding)(group_slot)             # (N, E)
 
-        feats = jnp.concatenate([size_f, log_size_f, tag_f, group_emb], axis=-1)
+        feat_list = [size_f, log_size_f, tag_f]
+        if self.use_group_embedding:
+            group_slot = jnp.where(
+                features.group_id >= 0, features.group_id + 1, 0,
+            ).astype(jnp.int32)
+            group_slot = jnp.clip(group_slot, 0, self.max_groups)
+            group_emb = jax.vmap(self.group_embedding)(group_slot)         # (N, E)
+            feat_list.append(group_emb)
+        feats = jnp.concatenate(feat_list, axis=-1)
         x = jax.vmap(self.proj_in)(feats)                                  # (N, E)
         # Add the vertex context at every axis token so the attention has
         # both axis-local and vertex-global signal at every layer.
@@ -980,6 +992,7 @@ class MicroActionPolicy(eqx.Module):
     def __init__(
         self, embd_dim: int, num_heads: int, max_substeps: int,
         num_encoder_layers: int = 1, max_groups: int = 16, *, key,
+        use_group_embedding: bool = False,
     ):
         self.embd_dim = embd_dim
         self.max_substeps = max_substeps
@@ -987,6 +1000,7 @@ class MicroActionPolicy(eqx.Module):
         self.encoder = AxisSetEncoder(
             embd_dim, num_heads, num_layers=num_encoder_layers,
             max_groups=max_groups, key=keys[0],
+            use_group_embedding=use_group_embedding,
         )
         self.head = MicroActionHead(embd_dim, key=keys[1])
 
@@ -997,15 +1011,19 @@ class MicroActionPolicy(eqx.Module):
         *,
         vertex_context: jax.Array,
         tables: FactorTables,
+        cap: jax.Array,
     ):
-        features, ended, next_gid = carry
+        features, ended, next_gid, step_idx = carry
         key = step_input
 
         axis_tokens, summary = self.encoder(features, vertex_context)
         op_legal = _compute_op_legality(features)
-        # Force END once the sub-episode has ended (sticky termination).
+        # Force END once the sub-episode has ended (sticky termination) or
+        # the per-vertex hard cap (2 × num_axes) is reached — the latter is
+        # a length bound, not a structural constraint.
+        force_end = ended | (step_idx >= cap)
         op_legal = jnp.where(
-            ended,
+            force_end,
             jnp.array([0.0, 0.0, 1.0], dtype=op_legal.dtype),
             op_legal,
         )
@@ -1061,7 +1079,7 @@ class MicroActionPolicy(eqx.Module):
         new_ended = ended | (action.op_type == OP_END)
 
         return (
-            (new_features, new_ended, new_gid),
+            (new_features, new_ended, new_gid, step_idx + 1),
             (action, log_p, ent, arity, op_d, i_d, j_d, exp_d),
         )
 
@@ -1080,16 +1098,22 @@ class MicroActionPolicy(eqx.Module):
         entropy bonus across variable-arity sub-episodes).
         """
         keys = jrand.split(key, self.max_substeps)
+        # Per-vertex hard cap: 2 × number of real axes. The scan runs
+        # `max_substeps` iterations regardless (JAX-static shape); once
+        # `step_idx >= cap` the op-type head is forced to END so any
+        # remaining iterations contribute zero log-prob / entropy.
+        cap = 2 * jnp.sum(init_features.valid_mask.astype(jnp.int32))
         init_carry = (
             init_features,
             jnp.array(False, dtype=jnp.bool_),
+            jnp.array(0, dtype=jnp.int32),
             jnp.array(0, dtype=jnp.int32),
         )
 
         def step_fn(carry, k):
             return self._step_sample(
                 carry, k,
-                vertex_context=vertex_context, tables=tables,
+                vertex_context=vertex_context, tables=tables, cap=cap,
             )
 
         _, (actions, logps, ents, arities, op_dists, i_dists, j_dists, exp_dists) = (
@@ -1113,14 +1137,16 @@ class MicroActionPolicy(eqx.Module):
         *,
         vertex_context: jax.Array,
         tables: FactorTables,
+        cap: jax.Array,
     ):
-        features, ended, next_gid = carry
+        features, ended, next_gid, step_idx = carry
         action: MicroAction = step_input
 
         axis_tokens, summary = self.encoder(features, vertex_context)
         op_legal = _compute_op_legality(features)
+        force_end = ended | (step_idx >= cap)
         op_legal = jnp.where(
-            ended,
+            force_end,
             jnp.array([0.0, 0.0, 1.0], dtype=op_legal.dtype),
             op_legal,
         )
@@ -1170,7 +1196,7 @@ class MicroActionPolicy(eqx.Module):
         new_ended = ended | (action.op_type == OP_END)
 
         return (
-            (new_features, new_ended, new_gid),
+            (new_features, new_ended, new_gid, step_idx + 1),
             (log_p, ent, arity, op_dist, i_dist, j_dist, exp_dists),
         )
 
@@ -1193,16 +1219,18 @@ class MicroActionPolicy(eqx.Module):
         ``(max_substeps, ...)``. Pair these with the stored old-policy
         dists in the trajectory to compute per-component KL.
         """
+        cap = 2 * jnp.sum(init_features.valid_mask.astype(jnp.int32))
         init_carry = (
             init_features,
             jnp.array(False, dtype=jnp.bool_),
+            jnp.array(0, dtype=jnp.int32),
             jnp.array(0, dtype=jnp.int32),
         )
 
         def step_fn(carry, action_step):
             return self._step_evaluate(
                 carry, action_step,
-                vertex_context=vertex_context, tables=tables,
+                vertex_context=vertex_context, tables=tables, cap=cap,
             )
 
         _, (logps, ents, arities, op_dists, i_dists, j_dists, exp_dists) = (

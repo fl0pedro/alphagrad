@@ -1854,26 +1854,28 @@ def make_argparser() -> argparse.ArgumentParser:
         ),
     )
 
-    # Dynamic-substeps (heads.py) mode. When `--dynamic-substeps` is on, the
-    # legacy AutoregRulePolicy is swapped for the MicroActionPolicy in
-    # heads.py: a typed (op_type, i, j, prime_exponents) sequence per
-    # vertex, scanned to `--max-substeps` with END termination. The
+    # Dynamic-substeps (heads.py) mode is the default. The MicroActionPolicy
+    # emits a typed (op_type, i, j, prime_exponents) sequence per vertex,
+    # scanned to `--max-substeps` with END termination (and a forced END at
+    # the per-vertex `2 × num_axes` hard cap to bound rollout length). The
     # FactorTables (precomputed prime / gcd lookup) are built from
     # `--max-axis-size`. COMPRESS legality is gated by `--allow-compress`
     # (off by default — graphax's vertex_elimination_jaxpr doesn't yet
     # consume real mean-compression, so any emitted COMPRESS is silently
-    # dropped by the legacy translator).
-    p.add_argument("--dynamic-substeps", action="store_true",
-                   help="Swap the legacy rule head for the heads.py "
-                        "MicroActionPolicy (autoregressive typed sub-episode "
-                        "with op_type ∈ {DIAG, COMPRESS, END}, axis pointers, "
-                        "and a prime-exponent factor head). Trajectories "
-                        "carry typed micro-actions; the loss path uses "
-                        "MicroActionPolicy.evaluate for joint log-probs.")
-    p.add_argument("--max-substeps", type=int, default=MAX_RULES_PER_VERTEX,
-                   help="Max sub-episode length when --dynamic-substeps is on. "
-                        "Keep ≤ MAX_RULES_PER_VERTEX to avoid silent truncation "
-                        "in the legacy sparsity_specs path.")
+    # dropped by the legacy translator). Pass `--no-dynamic-substeps` to
+    # fall back to the legacy AutoregRulePolicy (pair + categorical-factor
+    # over a static factor table).
+    p.add_argument("--dynamic-substeps", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Use the heads.py MicroActionPolicy (default). Pass "
+                        "--no-dynamic-substeps to use the legacy "
+                        "AutoregRulePolicy with the static `--factors` table.")
+    p.add_argument("--max-substeps", type=int, default=2 * MAX_AXES_PER_VERTEX,
+                   help="Hard upper bound on sub-episode length per vertex. "
+                        "At runtime each vertex's cap is `2 × #active axes`; "
+                        "this flag is the static JAX-shape ceiling. Defaults "
+                        "to 2 × MAX_AXES_PER_VERTEX so the cap is never "
+                        "truncated by the static bound.")
     p.add_argument("--max-axis-size", type=int, default=1024,
                    help="Max bound on logical axis sizes for the precomputed "
                         "FactorTables (gcd / prime / exp lookup). Must be ≥ "
@@ -1886,6 +1888,14 @@ def make_argparser() -> argparse.ArgumentParser:
                         "would emit them but they wouldn't affect the env. "
                         "Turn on only once graphax's vertex_elimination_jaxpr "
                         "consumes typed micro-actions.")
+    p.add_argument("--axis-group-embedding", action="store_true",
+                   help="Add a learned per-DIAG-group embedding to each axis "
+                        "token in the AxisSetEncoder. Off by default: "
+                        "tag_bits[in_diag_group] already exposes group "
+                        "membership, and the embedding bloats proj_in by "
+                        "embd_dim plus a (max_groups+1, embd_dim) table. "
+                        "Turn on when you want the encoder to learn per-block "
+                        "representations beyond bare membership.")
 
     # Multi-rule / autoregressive head config (ignored when --no-ptr or --not-autoreg)
     p.add_argument("--max-rules", type=int, default=MAX_RULES_PER_VERTEX,
@@ -2026,12 +2036,12 @@ def make_argparser() -> argparse.ArgumentParser:
                    help="Stage E head curriculum: same ramp, applied to the "
                         "factor head. 0 = no ramp.")
     p.add_argument("--sparsity-ratio", action="store_true",
-                   help="Stage E: replace the categorical factor head with a "
-                        "scalar sparsity-ratio coordinate ρ ∈ [0, 1] that "
-                        "snap-mixes onto the two adjacent valid factors (§2.2). "
-                        "Implies --autoreg (no effect on --not-autoreg). "
-                        "The factor table is mapped to ρ via "
-                        "ρ_i = (1 - 1/f_i) / (1 - 1/f_max), with f=-1 → ρ=1.")
+                   help="LEGACY ONLY (--no-dynamic-substeps): replace the "
+                        "categorical factor head with a scalar sparsity-ratio "
+                        "coordinate ρ ∈ [0, 1] that snap-mixes onto the two "
+                        "adjacent valid factors. Ignored in the default "
+                        "dynamic-substeps path (factors there come from the "
+                        "prime-exponent head).")
     p.add_argument("--rho-prior-bias", type=float, default=4.0,
                    help="Stage E prior anneal: initial bias added to the "
                         "rho_head's output. With the default 4.0 the initial "
@@ -2472,7 +2482,14 @@ def _build_agent(
             key=encoder_keys[2],
         )
     if use_autoreg:
-        if args.sparsity_ratio:
+        # Sparsity-ratio is a legacy-only factor head; the dynamic-substeps
+        # path uses the prime-exponent head instead. Silently downgrade to
+        # plain AutoregRulePolicy when both flags are on so the unused
+        # legacy rule_policy doesn't carry the heavier ρ module.
+        use_sparsity_ratio = (
+            args.sparsity_ratio and not getattr(args, "dynamic_substeps", False)
+        )
+        if use_sparsity_ratio:
             sparsity_ratios = _compute_sparsity_ratios(
                 tuple(_parse_int_list(args.factors))
             )
@@ -2551,6 +2568,7 @@ def _build_agent(
             num_encoder_layers=1,
             max_groups=max(args.max_substeps, 16),
             key=encoder_keys[13],
+            use_group_embedding=getattr(args, "axis_group_embedding", False),
         )
     else:
         micro_action_policy = None
