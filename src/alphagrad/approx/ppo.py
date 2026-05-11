@@ -2293,6 +2293,25 @@ def _current_stage_at(
     return stages[-1][0] if stages else ""
 
 
+def _micro_introduction_stage(
+    curriculum_stages: list[tuple[str, int]], allow_compress: bool,
+) -> int:
+    """First stage index where the dynamic head sees gradient signal.
+
+    The micro_action_policy heads only carry useful signal when at least
+    one of DIAG / COMPRESS is legal — ``ve_only`` forces END every
+    sub-step, so the head's outputs are masked to 0 entropy / 0 log-prob
+    contributions and gradients vanish. Returns ``len(stages)`` if the
+    head is never introduced (i.e., all stages are ve_only) so the
+    "past introduction" check stays well-defined.
+    """
+    for stage_idx, (variant, _) in enumerate(curriculum_stages):
+        legal = _op_legality_for_variant(variant, allow_compress)
+        if float(legal[0]) > 0.5 or float(legal[1]) > 0.5:
+            return stage_idx
+    return len(curriculum_stages)
+
+
 def _pin_rules_for_variant(variant: str) -> bool:
     """Per-variant `pin_rules_to_exact` flag for the legacy rule head.
 
@@ -2751,18 +2770,26 @@ def _build_param_mask(agent, predicate) -> "jax.Array":
 
 
 def _build_head_masks(agent):
-    """Return ``(axis_mask, factor_mask, vertex_mask)`` — bool trees for the LR ramp.
+    """Return ``(axis_mask, factor_mask, vertex_mask, micro_mask)`` — bool trees for the LR ramp.
 
     `vertex_mask` selects every parameter belonging to the base pointer
-    net (``vertex_policy.*``). Used by the curriculum runner to scale
-    the vertex-selection head's gradient down in non-initial stages so
-    the policy doesn't forget the vertex-ordering signal it learned in
-    stage 0 when new heads (op_type / axis / factor) come online.
+    net (``vertex_policy.*``). `micro_mask` selects every parameter of
+    the dynamic-substeps head (``micro_action_policy.*``) — both the
+    AxisSetEncoder and the three sub-heads (op_type / axis pointers /
+    prime-exponent). The curriculum runner uses them to apply
+    introduction-stage-aware LR scaling: a head's gradient runs at
+    full LR in the first stage where it sees signal, then drops to
+    ``--curriculum-existing-head-mult`` in subsequent stages.
+
+    For agents without a dynamic head (``--dynamic-substeps`` off,
+    ``micro_action_policy is None``), the micro_mask is empty since
+    None children don't appear in the pytree.
     """
     return (
         _build_param_mask(agent, lambda p: _path_in(p, "axis")),
         _build_param_mask(agent, lambda p: _path_in(p, "factor")),
         _build_param_mask(agent, lambda p: "vertex_policy" in p),
+        _build_param_mask(agent, lambda p: "micro_action_policy" in p),
     )
 
 
@@ -2787,29 +2814,36 @@ def _head_lr_mult(step: "jax.Array", warmup_steps: int) -> "jax.Array":
     return (1.0 / 3.0) + (2.0 / 3.0) * frac
 
 
-def _scale_grads(grads, axis_mask, factor_mask, vertex_mask, freeze_mask,
-                 axis_mult, factor_mult, vertex_mult):
+def _scale_grads(
+    grads, axis_mask, factor_mask, vertex_mask, micro_mask, freeze_mask,
+    axis_mult, factor_mult, vertex_mult, micro_mult,
+):
     """Single fused per-leaf gradient scaling.
 
     Combines the Stage D head-LR ramp (per-head multiplier on axis / factor
-    params), the curriculum existing-head multiplier on the vertex policy,
-    and the Stage G freeze mask (zero gradient for non-trainable params
-    during calibration) into one pass through the pytree. Mask precedence:
-    freeze → axis → factor → vertex → 1.0.
+    params), the curriculum existing-head multipliers on vertex_policy
+    and micro_action_policy, and the Stage G freeze mask (zero gradient
+    for non-trainable params during calibration) into one pass through
+    the pytree. Mask precedence (first match wins):
+
+        freeze → axis → factor → vertex → micro → 1.0
     """
     return jax.tree_util.tree_map(
-        lambda g, am, fm, vm, fz: jnp.where(
+        lambda g, am, fm, vm, mm, fz: jnp.where(
             fz,
             g * jnp.where(
                 am, axis_mult,
                 jnp.where(
                     fm, factor_mult,
-                    jnp.where(vm, vertex_mult, 1.0),
+                    jnp.where(
+                        vm, vertex_mult,
+                        jnp.where(mm, micro_mult, 1.0),
+                    ),
                 ),
             ),
             jnp.zeros_like(g),
         ),
-        grads, axis_mask, factor_mask, vertex_mask, freeze_mask,
+        grads, axis_mask, factor_mask, vertex_mask, micro_mask, freeze_mask,
     )
 
 
@@ -2891,6 +2925,7 @@ def run_calibration_phase(
             # we honour args.pin_rules_to_exact (Python bool) by lifting it
             # into a JAX scalar so the per-call API stays uniform.
             jnp.asarray(args.pin_rules_to_exact, dtype=jnp.bool_),
+            jnp.array(1.0, dtype=jnp.float32),  # calibration: no micro scaling
         )
         cosine = float(jnp.mean(totals[:, REWARD_INDEX["cosine_sim"]]))
         neg_frob = float(jnp.mean(totals[:, REWARD_INDEX["frob_residual"]]))
@@ -3285,7 +3320,7 @@ def main():
     # train_minibatch to scale gradients by the head-specific LR multiplier
     # (warm-up ramp from §3.2). Masks are pytree leaves aligned with the
     # filtered (inexact-array) agent params.
-    axis_mask, factor_mask, vertex_mask = _build_head_masks(agent)
+    axis_mask, factor_mask, vertex_mask, micro_mask = _build_head_masks(agent)
 
     # Stage G default freeze mask: all-True (no freezing) — the same
     # train_episode path serves both regular training and calibration. The
@@ -3995,6 +4030,7 @@ def main():
         op_legality_override_arg,
         vertex_mult_arg,
         pin_rules_to_exact_arg,
+        micro_mult_arg,
     ):
         subkey, key = jrand.split(key)
         rollout_key, key = jrand.split(key)
@@ -4122,10 +4158,12 @@ def main():
                 # branch is a no-op; with the cal-mask the LR ramp is also
                 # active for the trainable params (factor head, aggregator).
                 grads = _scale_grads(
-                    grads, axis_mask, factor_mask, vertex_mask, freeze_mask,
+                    grads, axis_mask, factor_mask, vertex_mask, micro_mask,
+                    freeze_mask,
                     _head_lr_mult(step, args.axis_warmup_steps),
                     _head_lr_mult(step, args.factor_warmup_steps),
                     vertex_mult_arg,
+                    micro_mult_arg,
                 )
                 updates, new_opt_state = optimizer.update(
                     grads, comb_opt_state, comb_agent
@@ -4386,6 +4424,21 @@ def main():
         head_reward_weights, (num_envs, NUM_VALUE_HEADS)
     )
 
+    # Per-head introduction-stage for the curriculum runner. Static
+    # (depends on the curriculum spec, not on the current episode) so
+    # compute once before the loop.
+    if curriculum_stages:
+        micro_intro_stage = _micro_introduction_stage(
+            curriculum_stages, args.allow_compress,
+        )
+        print(
+            f"curriculum: micro_action_policy first sees signal in stage "
+            f"{micro_intro_stage}/{len(curriculum_stages)}"
+            + (" (never)" if micro_intro_stage >= len(curriculum_stages) else "")
+        )
+    else:
+        micro_intro_stage = 0  # unused outside curriculum runs
+
     for ep in range(args.episodes):
         ep_key, key = jrand.split(key)
         ep_eval_key, ep_key = jrand.split(ep_key)
@@ -4450,13 +4503,20 @@ def main():
             stage_pin_rules = jnp.asarray(
                 _pin_rules_for_variant(current_stage_name), dtype=jnp.bool_,
             )
-            # Vertex-policy gradient multiplier — 1.0 in the first stage
-            # (where vertex_policy is the only thing being trained); set
-            # to `--curriculum-existing-head-mult` in later stages so the
-            # vertex-ordering signal isn't blown out when new heads
-            # (op_type / axis / factor) come online.
+            # Per-head LR multipliers: each head runs at full LR in the
+            # first stage where it sees signal, then drops to
+            # --curriculum-existing-head-mult in subsequent stages.
+            # vertex_policy is introduced at stage 0 (always); the
+            # dynamic head's introduction is the first stage where DIAG
+            # or COMPRESS is legal (see _micro_introduction_stage).
             stage_vertex_mult = jnp.array(
                 1.0 if current_stage_idx == 0 else args.curriculum_existing_head_mult,
+                dtype=jnp.float32,
+            )
+            stage_micro_mult = jnp.array(
+                1.0
+                if current_stage_idx <= micro_intro_stage
+                else args.curriculum_existing_head_mult,
                 dtype=jnp.float32,
             )
             # Log the stage boundary on transition (cheap host-side check).
@@ -4468,11 +4528,13 @@ def main():
                 print(
                     f"[ep {ep}] curriculum stage → {current_stage_name}"
                     f"  (vertex_mult={float(stage_vertex_mult):.2f}, "
+                    f"micro_mult={float(stage_micro_mult):.2f}, "
                     f"pin_rules={bool(stage_pin_rules)})"
                 )
         else:
             stage_override = op_legality_override
             stage_vertex_mult = jnp.array(1.0, dtype=jnp.float32)
+            stage_micro_mult = jnp.array(1.0, dtype=jnp.float32)
             stage_pin_rules = jnp.asarray(
                 args.pin_rules_to_exact, dtype=jnp.bool_,
             )
@@ -4487,6 +4549,7 @@ def main():
             stage_override,
             stage_vertex_mult,
             stage_pin_rules,
+            stage_micro_mult,
         )
         host_log(
             ep,
