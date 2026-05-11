@@ -30,6 +30,22 @@ MAX_TOKENS = 4096
 MAX_RULES_PER_VERTEX = 4
 NUM_AXIS_PAIRS = 4
 
+# Per-vertex axis-state observation surface. The policy's dynamic action
+# space (DIAG / COMPRESS / END) emits indices into a per-vertex axis set;
+# this is the static observation that feeds heads.py's `AxisSetEncoder`.
+# `MAX_AXES_PER_VERTEX` is the JAX-static upper bound on axes any vertex
+# can have — most graphax ops have ≤ 4-6 axes (out_ndim + min_in_ndim);
+# 8 leaves headroom without bloating state. `AXIS_FEATURE_DIM`'s four
+# fields are [size, is_output, is_compressed, group_id]: only the first
+# two are populated today (the others are placeholders for the future
+# DIAG/COMPRESS state updates that micro_actions wiring will fill in).
+MAX_AXES_PER_VERTEX = 8
+AXIS_FEATURE_DIM = 4
+_AXIS_FEAT_SIZE = 0
+_AXIS_FEAT_IS_OUTPUT = 1
+_AXIS_FEAT_IS_COMPRESSED = 2
+_AXIS_FEAT_GROUP_ID = 3
+
 # Canonical 8-component reward vector layout. The env reports raw reward values
 # in the convention "higher is better": every cost component is stored *negated*
 # (so r = -cost), `cosine_sim` is in [0, 1] (1 = identical Jacobian), and
@@ -84,6 +100,15 @@ class EnvState(NamedTuple):
     sparsity_specs: Array  # (N, MAX_RULES_PER_VERTEX, 3) int32; row [base_idx1, base_idx2, factor]; base_idx1 < 0 means slot unused
     tokens: Array
     eqn_ids: Array  # (MAX_TOKENS,) int32; per-token equation ID, -1 for non-eqn tokens
+    # Per-vertex axis state — observation surface for the dynamic action
+    # space. `axis_state` is a packed int32 array of (size, is_output,
+    # is_compressed, group_id) per axis slot; `axis_valid_mask` flags
+    # which slots carry a real axis (vs. padding up to MAX_AXES_PER_VERTEX).
+    # Today the values are static-from-jaxpr and constant across the
+    # rollout; the heads.py wiring will mutate them per sub-step as DIAG
+    # pairs axes and COMPRESS marks axes compressed.
+    axis_state: Array          # (total_v, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM) int32
+    axis_valid_mask: Array     # (total_v, MAX_AXES_PER_VERTEX) float32
     step_count: Array
     max_steps: int
     reward: Array  # (NUM_REWARDS,) float32; see REWARD_NAMES for layout
@@ -136,6 +161,182 @@ def _get_partials(order, sparsity_specs, stop):
         sparsity_specs[:v_stop] if v_stop < len(sparsity_specs) else sparsity_specs
     )
     return partial_order, partial_specs
+
+
+def compute_static_axis_state(jaxpr, total_v: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per-vertex axis features extracted statically from the jaxpr.
+
+    Each vertex's axes are concatenated as ``(out_dims..., primal_dims...)``
+    into a fixed-size slot of ``MAX_AXES_PER_VERTEX``. The primal proxy
+    is the first non-literal input variable (matching the convention used
+    by ``vertex_axis_dims`` in common/masks.py). Returns:
+
+    * ``axis_state`` — ``(total_v, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM)``
+      int32. Field layout: ``[size, is_output, is_compressed, group_id]``.
+      ``is_compressed`` and ``group_id`` are placeholders (0 / -1) until
+      the heads.py wiring lands and the env starts mutating them per
+      sub-step.
+    * ``axis_valid_mask`` — ``(total_v, MAX_AXES_PER_VERTEX)`` float32.
+      ``1.0`` for slots carrying a real axis.
+
+    Vertices with no shape info (literal-only inputs, etc.) get an
+    all-zero / all-invalid row — same convention as
+    ``vertex_axis_dims``.
+    """
+    axis_state = np.zeros(
+        (total_v, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM), dtype=np.int32,
+    )
+    axis_state[..., _AXIS_FEAT_GROUP_ID] = -1  # ungrouped sentinel
+    axis_valid = np.zeros((total_v, MAX_AXES_PER_VERTEX), dtype=np.float32)
+
+    for v_idx, eqn in enumerate(jaxpr.eqns):
+        if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
+            continue
+        out_shape = eqn.outvars[0].aval.shape
+        invars = [v for v in eqn.invars if hasattr(v, "aval")]
+        primal_shape = invars[0].aval.shape if invars else ()
+
+        slot = 0
+        for size in out_shape:
+            if slot >= MAX_AXES_PER_VERTEX:
+                break
+            axis_state[v_idx, slot, _AXIS_FEAT_SIZE] = int(size)
+            axis_state[v_idx, slot, _AXIS_FEAT_IS_OUTPUT] = 1
+            axis_valid[v_idx, slot] = 1.0
+            slot += 1
+        for size in primal_shape:
+            if slot >= MAX_AXES_PER_VERTEX:
+                break
+            axis_state[v_idx, slot, _AXIS_FEAT_SIZE] = int(size)
+            axis_state[v_idx, slot, _AXIS_FEAT_IS_OUTPUT] = 0
+            axis_valid[v_idx, slot] = 1.0
+            slot += 1
+
+    return axis_state, axis_valid
+
+
+# ---------------------------------------------------------------------------
+# Typed MicroAction <-> legacy sparsity_specs translator
+# ---------------------------------------------------------------------------
+#
+# The heads.py policy emits a typed `MicroAction(op_type, i, j, exponents)`
+# sequence per vertex. The env-side path through graphax's
+# `extract_jaxpr` / `vertex_elimination_jaxpr` still consumes the legacy
+# `sparsity_map` tuple-of-tuples (one `(idx1, idx2, factor)` per rule slot).
+# Until graphax's vertex_elimination is rewritten to accept typed micro-
+# actions, this translator bridges the gap: each DIAG micro-action becomes
+# a single rule_specs row with an explicit positive factor; COMPRESS raises
+# (the legacy path has no equivalent — its `factor == 0` is drop-axes, not
+# mean-compression, per the user's recent clarification).
+
+
+def micro_actions_to_rule_specs(
+    op_types,
+    i_indices,
+    j_indices,
+    factors,
+    *,
+    axis_state_for_vertex,
+):
+    """Translate a sub-episode's typed micro-actions into legacy rule_specs.
+
+    Args:
+        op_types: (S,) int32 — per-sub-step op type (heads.py OP_DIAG /
+            OP_COMPRESS / OP_END).
+        i_indices: (S,) int32 — axis-token index for `i` (DIAG and COMPRESS).
+        j_indices: (S,) int32 — axis-token index for `j` (DIAG only).
+        factors: (S,) int32 — explicit positive factor (DIAG only),
+            already collapsed from the prime-exponent head.
+        axis_state_for_vertex: ``(MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM)``
+            int32 — used to map axis-token indices to the legacy
+            ``base_idx1 / base_idx2`` (out_axis_position /
+            primal_axis_position) representation. ``is_output`` of each
+            axis token (column ``_AXIS_FEAT_IS_OUTPUT``) determines which
+            side of the pair it lands on; the relative position is the
+            running count of output-or-primal axes encountered before it.
+
+    Returns:
+        rule_specs: ``(MAX_RULES_PER_VERTEX, 3)`` int32 — same layout
+        the legacy env consumes. Slots past the first ``OP_END`` (or
+        past ``MAX_RULES_PER_VERTEX`` DIAGs, whichever comes first)
+        are filled with the unused sentinel ``[-1, -1, 0]``.
+
+    Raises:
+        NotImplementedError: if any micro-action is ``OP_COMPRESS``. Real
+        mean-compression has no representation in the legacy
+        sparsity_map format; the trainer must wait for graphax's
+        vertex-elimination rewrite to consume typed micro-actions
+        directly (graphax.sparse.micro_actions.apply_micro_actions).
+    """
+    # Lazy import to avoid circular dependency at module import time —
+    # heads.py imports nothing from env.py but env.py only needs the
+    # heads.py constants when this translator is actually invoked.
+    from alphagrad.approx.heads import OP_COMPRESS, OP_DIAG, OP_END
+
+    op_types_arr = np.asarray(op_types)
+    i_arr = np.asarray(i_indices)
+    j_arr = np.asarray(j_indices)
+    f_arr = np.asarray(factors)
+    axis_state_np = np.asarray(axis_state_for_vertex)
+
+    n_out = int(np.sum(axis_state_np[:, _AXIS_FEAT_IS_OUTPUT]))
+    # Build a per-token-index → (is_output, relative_position) map matching
+    # `compute_static_axis_state`'s layout: out axes come first in slots
+    # 0..n_out-1, then primal axes in slots n_out..n_out+n_primal-1.
+    def _to_base(token_idx: int) -> tuple[int, int]:
+        token_idx = int(token_idx)
+        is_out = int(axis_state_np[token_idx, _AXIS_FEAT_IS_OUTPUT])
+        rel = token_idx if is_out else token_idx - n_out
+        return (rel, is_out)
+
+    specs = np.full((MAX_RULES_PER_VERTEX, 3), -1, dtype=np.int32)
+    specs[:, 2] = 0  # factor=0 default for unused slots (matches reset path)
+
+    slot = 0
+    for s_idx, op in enumerate(op_types_arr.tolist()):
+        if op == OP_END:
+            break
+        if op == OP_COMPRESS:
+            raise NotImplementedError(
+                "COMPRESS micro-actions have no representation in the legacy "
+                "sparsity_map format consumed by graphax.extract_jaxpr. "
+                "Real mean-compression lives in "
+                "`graphax.sparse.micro_actions.apply_compress`; wiring it "
+                "into the env requires rewriting "
+                "graphax.core.vertex_elimination_jaxpr to take typed "
+                "micro-action sequences (next step after the heads.py "
+                "policy integration)."
+            )
+        if op != OP_DIAG:
+            raise ValueError(f"Unknown op_type {op!r} at sub-step {s_idx}.")
+        if slot >= MAX_RULES_PER_VERTEX:
+            break
+        rel_i, is_out_i = _to_base(i_arr[s_idx])
+        rel_j, is_out_j = _to_base(j_arr[s_idx])
+        # Legacy rule_specs layout: row [base_idx1, base_idx2, factor]
+        # where base_idx1 indexes the output axis and base_idx2 indexes
+        # the primal axis. If both i and j are on the same side, the
+        # mapping isn't lossless — log + fall through to OP_END so the
+        # rest of the sub-episode doesn't poison the spec. This case
+        # will go away when the typed action becomes the canonical form.
+        if is_out_i == is_out_j:
+            # Both axes on the same side (both output or both primal). The
+            # legacy sparsity_map format strictly pairs one output axis with
+            # one primal axis; no representation for this. Terminate the
+            # sub-episode here — the policy is expected to mask these out
+            # before sampling, but a stray pair shouldn't crash the env.
+            break
+        # bi1 = output-side axis position, bi2 = primal-side axis position.
+        if is_out_i:
+            bi1, bi2 = rel_i, rel_j
+        else:
+            bi1, bi2 = rel_j, rel_i
+        specs[slot, 0] = bi1
+        specs[slot, 1] = bi2
+        specs[slot, 2] = int(f_arr[s_idx])
+        slot += 1
+
+    return specs
 
 
 # Lookup row used to convert a legacy scalar sp_type ∈ {0..4} into a single-rule (MAX_RULES, 3) spec.
@@ -478,6 +679,14 @@ class VertexEliminationEnv:
     args: tuple
     consts: tuple
     valid_vertices: tuple
+    # Static per-vertex axis state derived from `config.jaxpr` at __init__
+    # time. Stored as a JAX array so it travels through reset/step without
+    # recomputation; values are constant across all episodes for a given
+    # env. The pair `(axis_state_static, axis_valid_static)` matches the
+    # shape contract documented on EnvState's `axis_state` / `axis_valid_mask`
+    # fields.
+    axis_state_static: Array | None = None
+    axis_valid_static: Array | None = None
     num_envs: int | None = None
     eval_args_samples: tuple | None = None
 
@@ -489,6 +698,8 @@ class VertexEliminationEnv:
         valid_vertices: tuple | None = None,
         num_envs: int | None = None,
         eval_args_samples: tuple | None = None,
+        axis_state_static: Array | None = None,
+        axis_valid_static: Array | None = None,
     ):
         object.__setattr__(self, "config", config)
         object.__setattr__(self, "args", tuple(args))
@@ -509,6 +720,16 @@ class VertexEliminationEnv:
                     valid.append(i)
             valid_vertices = tuple(valid)
         object.__setattr__(self, "valid_vertices", valid_vertices)
+
+        if axis_state_static is None or axis_valid_static is None:
+            total_v = len(config.jaxpr.eqns)
+            axis_state_np, axis_valid_np = compute_static_axis_state(
+                config.jaxpr, total_v,
+            )
+            axis_state_static = jnp.asarray(axis_state_np, dtype=jnp.int32)
+            axis_valid_static = jnp.asarray(axis_valid_np, dtype=jnp.float32)
+        object.__setattr__(self, "axis_state_static", axis_state_static)
+        object.__setattr__(self, "axis_valid_static", axis_valid_static)
 
     @classmethod
     def from_jaxpr(
@@ -551,15 +772,24 @@ class VertexEliminationEnv:
         )
 
     def tree_flatten(self):
-        children = (self.args, self.consts, self.eval_args_samples)
+        children = (
+            self.args, self.consts, self.eval_args_samples,
+            self.axis_state_static, self.axis_valid_static,
+        )
         aux_data = (self.config, self.valid_vertices, self.num_envs)
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        args, consts, eval_args_samples = children
+        args, consts, eval_args_samples, axis_state_static, axis_valid_static = (
+            children
+        )
         config, valid_vertices, num_envs = aux_data
-        return cls(config, args, consts, valid_vertices, num_envs, eval_args_samples)
+        return cls(
+            config, args, consts, valid_vertices, num_envs, eval_args_samples,
+            axis_state_static=axis_state_static,
+            axis_valid_static=axis_valid_static,
+        )
 
     def tokenize(self, init: bool = False):
         return partial(_callback, self.config, init=init)
@@ -606,6 +836,8 @@ class VertexEliminationEnv:
             sparsity_specs=initial_specs,
             tokens=tokens,
             eqn_ids=eqn_ids,
+            axis_state=self.axis_state_static,
+            axis_valid_mask=self.axis_valid_static,
             step_count=step_count,
             max_steps=max_steps,
             reward=reward,
@@ -663,6 +895,12 @@ class VertexEliminationEnv:
             sparsity_specs=new_specs,
             tokens=tokens,
             eqn_ids=eqn_ids,
+            # Static for now — passes through unchanged. Once heads.py wires
+            # MicroActions into the env, this is where DIAG / COMPRESS
+            # mutations land (e.g. setting `is_compressed` on dropped
+            # axes, `group_id` on paired DIAG axes, updated sizes).
+            axis_state=state.axis_state,
+            axis_valid_mask=state.axis_valid_mask,
             step_count=new_step,
             max_steps=state.max_steps,
             reward=reward,
