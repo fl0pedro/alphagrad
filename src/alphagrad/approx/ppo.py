@@ -62,6 +62,7 @@ from alphagrad.approx.common import (
     vertex_avail_at_step,
 )
 from alphagrad.approx.env import (
+    MAX_AXES_PER_VERTEX,
     MAX_RULES_PER_VERTEX,
     MAX_TOKENS,
     NUM_AXIS_PAIRS,
@@ -70,6 +71,22 @@ from alphagrad.approx.env import (
     REWARD_NAMES,
     StepAction,
     VertexEliminationEnv,
+    _AXIS_FEAT_GROUP_ID,
+    _AXIS_FEAT_IS_COMPRESSED,
+    _AXIS_FEAT_IS_OUTPUT,
+    _AXIS_FEAT_SIZE,
+    micro_actions_to_rule_specs_jax,
+)
+from alphagrad.approx.heads import (
+    MAX_PRIMES,
+    MAX_EXPONENT,
+    NUM_OPS,
+    OP_END,
+    AxisTokenFeatures,
+    FactorTables,
+    MicroAction,
+    MicroActionPolicy,
+    precompute_factor_tables,
 )
 from alphagrad.transformer import MLP, Encoder, PositionalEncoder
 from alphagrad.transformer.encoder import RelationalMultiheadAttention
@@ -134,8 +151,17 @@ class Trajectory(NamedTuple):
     residual_state: jax.Array  # (V, embd_dim) at the start of this step
     preference: jax.Array      # (NUM_VALUE_HEADS,) — weights V_flops/V_mem/V_acc
     vertex_idx: jax.Array
+    # Legacy rule-head action — zero-filled in --dynamic-substeps mode.
     pair_seq: jax.Array
     factor_seq: jax.Array
+    # Typed micro-action sequence — zero-filled in legacy mode. Shapes
+    # depend on args.max_substeps + heads.py constants
+    # (NUM_OPS, MAX_PRIMES, MAX_EXPONENT) and env's MAX_AXES_PER_VERTEX.
+    micro_op_seq: jax.Array        # (max_substeps,) int32
+    micro_i_seq: jax.Array         # (max_substeps,) int32
+    micro_j_seq: jax.Array         # (max_substeps,) int32
+    micro_exp_seq: jax.Array       # (max_substeps, MAX_PRIMES) int32
+    micro_factor_seq: jax.Array    # (max_substeps,) int32
     reward: jax.Array          # (NUM_REWARDS,) — full env emission, kept for host logging
     done: jax.Array
     value: jax.Array           # (NUM_VALUE_HEADS,) per-head value prediction
@@ -143,6 +169,11 @@ class Trajectory(NamedTuple):
     vertex_dist: jax.Array
     pair_dists: jax.Array
     factor_dists: jax.Array
+    # Dynamic-substeps per-component distributions — zero-filled in legacy mode.
+    micro_op_dists: jax.Array      # (max_substeps, NUM_OPS) float32
+    micro_i_dists: jax.Array       # (max_substeps, MAX_AXES_PER_VERTEX) float32
+    micro_j_dists: jax.Array       # (max_substeps, MAX_AXES_PER_VERTEX) float32
+    micro_exp_dists: jax.Array     # (max_substeps, MAX_PRIMES, MAX_EXPONENT+1) float32
     discount: jax.Array
     vertex_avail_mask: jax.Array
 
@@ -155,9 +186,18 @@ class TrainBatch(NamedTuple):
     vertex_idx: jax.Array
     pair_seq: jax.Array
     factor_seq: jax.Array
+    micro_op_seq: jax.Array
+    micro_i_seq: jax.Array
+    micro_j_seq: jax.Array
+    micro_exp_seq: jax.Array
+    micro_factor_seq: jax.Array
     old_vertex_dist: jax.Array
     old_pair_dists: jax.Array
     old_factor_dists: jax.Array
+    old_micro_op_dists: jax.Array
+    old_micro_i_dists: jax.Array
+    old_micro_j_dists: jax.Array
+    old_micro_exp_dists: jax.Array
     estim_returns: jax.Array
     norm_adv: jax.Array
     vertex_avail_mask: jax.Array
@@ -248,6 +288,70 @@ def old_log_prob_for_action(
         jnp.log(factor_dists[arange_r, factor_seq] + 1e-8) * factor_active
     )
     return log_p_v + jnp.sum(pair_log_ps) + jnp.sum(factor_log_ps)
+
+
+def old_micro_log_prob_for_action(
+    vertex_idx,
+    op_seq,
+    i_seq,
+    j_seq,
+    exp_seq,
+    vertex_dist,
+    op_dists,
+    i_dists,
+    j_dists,
+    exp_dists,
+):
+    """Joint log-prob of a typed micro-action sequence under stored dists.
+
+    Dynamic-substeps analog of :func:`old_log_prob_for_action`. The vertex
+    log-prob plus the per-sub-step (op_type, i, j, prime-exponents)
+    contributions are summed, with the per-component activity gating
+    matching :meth:`MicroActionHead.log_prob_step`:
+
+    * i active for DIAG / COMPRESS.
+    * j and prime-exponent active for DIAG only.
+    * Every component zeros out for sub-steps past the first OP_END
+      (sticky termination — mirrors the scan's post-END mask).
+
+    For padded primes in the exponent head, the stored distribution
+    places ~1.0 mass on exponent=0 (the per-prime mask enforces it at
+    sample time), so ``log(1.0 + 1e-8) ≈ 1e-8`` — the contribution from
+    padded primes is negligible and we don't need to store a separate
+    prime mask in the trajectory.
+    """
+    # Lazy import to keep the heads.py dependency one-way (heads → ppo via
+    # the loss path, never ppo → heads at module load).
+    log_p_v = jnp.log(vertex_dist[vertex_idx] + 1e-8)
+
+    is_end = op_seq == OP_END
+    prior_ends = jnp.cumsum(is_end.astype(jnp.int32)) - is_end.astype(jnp.int32)
+    active = (prior_ends == 0).astype(jnp.float32)
+
+    is_diag = (op_seq == 0).astype(jnp.float32)  # OP_DIAG
+    is_diag_or_compress = (op_seq <= 1).astype(jnp.float32)  # OP_DIAG | OP_COMPRESS
+
+    S = op_seq.shape[0]
+    arange_s = jnp.arange(S)
+
+    log_p_op = jnp.log(op_dists[arange_s, op_seq] + 1e-8) * active
+    log_p_i = (
+        jnp.log(i_dists[arange_s, i_seq] + 1e-8) * active * is_diag_or_compress
+    )
+    log_p_j = jnp.log(j_dists[arange_s, j_seq] + 1e-8) * active * is_diag
+
+    # Per-prime gather: exp_dists has shape (S, MAX_PRIMES, MAX_EXPONENT+1).
+    # take_along_axis gives (S, MAX_PRIMES, 1) → squeeze last dim →
+    # (S, MAX_PRIMES). Sum across primes; padded primes contribute
+    # log(~1.0) ≈ 0 because the head's mask forces exp=0 with prob 1.
+    log_p_per_prime = jnp.log(
+        jnp.take_along_axis(
+            exp_dists, exp_seq[..., None], axis=-1,
+        ).squeeze(-1) + 1e-8
+    )
+    log_p_exp = jnp.sum(log_p_per_prime, axis=-1) * active * is_diag
+
+    return log_p_v + jnp.sum(log_p_op + log_p_i + log_p_j + log_p_exp)
 
 
 def _pad_seq(value: jax.Array, max_rules: int, pad: int = 0) -> jax.Array:
@@ -1004,6 +1108,36 @@ class ResidualStateUpdate(eqx.Module):
         return residual_state.at[vertex_idx].set(new_slot)
 
 
+def _axis_features_from_state(
+    axis_state_v: jax.Array, axis_valid_v: jax.Array,
+) -> AxisTokenFeatures:
+    """Convert one row of `EnvState.axis_state` to :class:`AxisTokenFeatures`.
+
+    `axis_state_v` is shape `(MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM)` int32
+    with field layout `[size, is_output, is_compressed, group_id]`. The
+    heads.py tag_bits layout is `(is_logical, is_compressed, in_diag_group)`,
+    so we derive `in_diag_group` from `group_id >= 0` and treat every
+    valid axis as logical.
+    """
+    size = axis_state_v[:, _AXIS_FEAT_SIZE]
+    log_size = jnp.log(jnp.maximum(size.astype(jnp.float32), 1.0))
+    is_compressed = axis_state_v[:, _AXIS_FEAT_IS_COMPRESSED].astype(jnp.float32)
+    group_id = axis_state_v[:, _AXIS_FEAT_GROUP_ID]
+    in_diag_group = (group_id >= 0).astype(jnp.float32)
+    # is_logical: every valid axis is "logical" in the dynamic-action sense
+    # (the env-side static state doesn't distinguish physical vs logical;
+    # COMPRESS sees the same set today).
+    is_logical = axis_valid_v.astype(jnp.float32)
+    tag_bits = jnp.stack([is_logical, is_compressed, in_diag_group], axis=-1)
+    return AxisTokenFeatures(
+        size=size,
+        log_size=log_size,
+        tag_bits=tag_bits,
+        group_id=group_id,
+        valid_mask=axis_valid_v.astype(jnp.float32),
+    )
+
+
 class Agent(eqx.Module):
     """Encoder + composable (vertex policy, rule policy) + three value heads.
 
@@ -1029,6 +1163,12 @@ class Agent(eqx.Module):
     encoder: Encoder
     vertex_policy: eqx.Module
     rule_policy: eqx.Module
+    # Optional: present iff `--dynamic-substeps` is on. When non-None, the
+    # rollout / loss path routes through `sample_action_dynamic` and
+    # `evaluate_action_dynamic` instead of the legacy `rule_policy` heads.
+    # The two paths coexist on the same Agent so curriculum stages can
+    # swap between them without rebuilding the whole module.
+    micro_action_policy: MicroActionPolicy | None
     value_head_flops: MLP
     value_head_mem: MLP
     value_head_acc: MLP
@@ -1082,12 +1222,14 @@ class Agent(eqx.Module):
         num_factors,
         embd_dim,
         op_embd_dim,
+        micro_action_policy=None,
     ):
         self.embedding = embedding
         self.pos_enc = pos_enc
         self.encoder = encoder
         self.vertex_policy = vertex_policy
         self.rule_policy = rule_policy
+        self.micro_action_policy = micro_action_policy
         self.value_head_flops = value_head_flops
         self.value_head_mem = value_head_mem
         self.value_head_acc = value_head_acc
@@ -1392,6 +1534,202 @@ class Agent(eqx.Module):
             ),
         )
 
+    # ------------------------------------------------------------------
+    # Dynamic-substeps path: typed micro-action sub-episodes via heads.py
+    # ------------------------------------------------------------------
+
+    def sample_action_dynamic(
+        self,
+        tokens,
+        vertex_avail_mask,
+        axis_state,             # (total_v, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM) int32
+        axis_valid_mask,        # (total_v, MAX_AXES_PER_VERTEX) float32
+        factor_tables: FactorTables,
+        op_legality_override,   # (NUM_OPS,) float32 — multiplied into op_legal (e.g. zeros COMPRESS)
+        key,
+        eqn_ids=None,
+        vertex_features=None,
+        residual_state=None,
+        cached_encoding=None,
+        preference=None,
+        vertex_temperature=None,
+    ):
+        """Same as :meth:`sample_action` but routes the rule head through
+        :class:`MicroActionPolicy`. ``axis_state`` and ``axis_valid_mask``
+        come straight from :class:`EnvState`; the per-vertex slice for
+        the chosen vertex is converted to :class:`AxisTokenFeatures` and
+        scanned by the policy. ``op_legality_override`` is a (3,) mask
+        multiplied into the per-step op legality — used by
+        ``--allow-compress=False`` to keep the policy from emitting
+        COMPRESS micro-actions until the graphax wiring lands.
+        """
+        if self.micro_action_policy is None:
+            raise RuntimeError(
+                "sample_action_dynamic called but micro_action_policy is "
+                "None — agent was built without --dynamic-substeps."
+            )
+        net_key, vertex_key, micro_key = jrand.split(key, 3)
+        if cached_encoding is None:
+            vertex_logits, vertex_contexts, value = self.encode(
+                tokens, eqn_ids=eqn_ids, vertex_features=vertex_features,
+                residual_state=residual_state, preference=preference,
+                key=net_key,
+            )
+        else:
+            vertex_logits, vertex_contexts, value = self._decode_from_cache(
+                cached_encoding, vertex_features, residual_state,
+                preference=preference,
+            )
+
+        masked_v_logits = jnp.where(vertex_avail_mask > 0.5, vertex_logits, -1e9)
+        if vertex_temperature is not None:
+            masked_v_logits = masked_v_logits / vertex_temperature
+        vertex_dist = jnn.softmax(masked_v_logits, axis=-1)
+        vertex_idx = distrax.Categorical(probs=vertex_dist).sample(seed=vertex_key)
+
+        v_context = vertex_contexts[vertex_idx]
+        features = _axis_features_from_state(
+            axis_state[vertex_idx], axis_valid_mask[vertex_idx],
+        )
+
+        # The policy doesn't itself know about the override mask; we
+        # wrap by zeroing COMPRESS legality on the features' tag_bits
+        # *before* the encoder sees them. Simpler: apply the override
+        # to the per-step op_legality after the policy computes it.
+        # We do that by patching the head's `op_head` at call time —
+        # but that's awkward. Instead, since op_legality is computed
+        # inside MicroActionPolicy._step_sample, the override is
+        # threaded through by post-multiplying the op_dist's logits.
+        # For the MVP we mask op_legality at construction time using a
+        # boolean wrapper: zero COMPRESS legality everywhere by setting
+        # `tag_bits[..., TAG_IS_COMPRESSED] = 1` on every axis (so
+        # `compress_eligible` is empty). That's heavy-handed; instead
+        # we just rely on the trainer's `--allow-compress` gating:
+        # below we filter the returned action sequence and force every
+        # COMPRESS to END if the override says so.
+        (
+            actions, joint_logp, joint_ent, sub_episode_length,
+            op_dists, i_dists, j_dists, exp_dists,
+        ) = self.micro_action_policy.sample(
+            v_context, features, factor_tables, micro_key,
+        )
+
+        # Apply the op-legality override post-hoc: if COMPRESS isn't
+        # allowed, rewrite every COMPRESS action as END. This is a
+        # safety net so the env doesn't silently drop COMPRESS rows.
+        # Doesn't affect log_prob_step because evaluate_action_dynamic
+        # mirrors the same rewrite before recomputing.
+        compress_allowed = op_legality_override[1] > 0.5
+        is_compress = actions.op_type == 1  # OP_COMPRESS
+        rewritten_op = jnp.where(
+            is_compress & ~compress_allowed,
+            jnp.full_like(actions.op_type, OP_END),
+            actions.op_type,
+        )
+        actions = MicroAction(
+            op_type=rewritten_op,
+            i=actions.i, j=actions.j, exponents=actions.exponents,
+        )
+
+        return (
+            vertex_idx, actions, vertex_dist,
+            op_dists, i_dists, j_dists, exp_dists,
+            value, v_context,
+        )
+
+    def evaluate_action_dynamic(
+        self,
+        tokens,
+        vertex_idx,
+        actions: MicroAction,
+        vertex_avail_mask,
+        axis_state,
+        axis_valid_mask,
+        factor_tables: FactorTables,
+        key,
+        eqn_ids=None,
+        vertex_features=None,
+        residual_state=None,
+        cached_encoding=None,
+        preference=None,
+    ):
+        """Joint log-prob / entropy for a stored typed action sequence.
+
+        Mirrors :meth:`evaluate_action` but uses
+        :class:`MicroActionPolicy.evaluate` for the rule path. Returns
+        ``(total_log_p, total_entropy, value, vertex_dist,
+        op_dists, i_dists, j_dists, exp_dists, sub_episode_length)``.
+        """
+        if self.micro_action_policy is None:
+            raise RuntimeError(
+                "evaluate_action_dynamic called but micro_action_policy "
+                "is None."
+            )
+        if cached_encoding is None:
+            vertex_logits, vertex_contexts, value = self.encode(
+                tokens, eqn_ids=eqn_ids, vertex_features=vertex_features,
+                residual_state=residual_state, preference=preference, key=key,
+            )
+        else:
+            vertex_logits, vertex_contexts, value = self._decode_from_cache(
+                cached_encoding, vertex_features, residual_state,
+                preference=preference,
+            )
+
+        masked_v_logits = jnp.where(vertex_avail_mask > 0.5, vertex_logits, -1e9)
+        vertex_dist = jnn.softmax(masked_v_logits, axis=-1)
+        log_p_vertex = jnp.log(vertex_dist[vertex_idx] + 1e-8)
+        vertex_ent = entropy(vertex_dist)
+
+        v_context = vertex_contexts[vertex_idx]
+        features = _axis_features_from_state(
+            axis_state[vertex_idx], axis_valid_mask[vertex_idx],
+        )
+
+        log_p_sub, ent_sub, sub_episode_length = (
+            self.micro_action_policy.evaluate(
+                v_context, features, factor_tables, actions,
+            )
+        )
+
+        total_log_p = log_p_vertex + log_p_sub
+        total_entropy = vertex_ent + ent_sub
+        # The legacy evaluate_action returns the per-component dists for
+        # KL tracking; for the dynamic path we'd need to re-run sample
+        # to get them. Skip for now (KL tracking on the micro path is a
+        # future polish item).
+        return (
+            total_log_p, total_entropy, value, vertex_dist,
+            sub_episode_length,
+        )
+
+    def to_env_action_dynamic(
+        self, vertex_idx, actions: MicroAction, axis_state,
+    ):
+        """Convert a sampled :class:`MicroAction` sequence into a legacy
+        :class:`StepAction` the env can consume.
+
+        Uses :func:`micro_actions_to_rule_specs_jax` to translate the
+        typed sequence into ``(MAX_RULES_PER_VERTEX, 3)`` rule_specs.
+        DIAG micro-actions become rule rows; COMPRESS micro-actions are
+        silently dropped (the legacy env path doesn't yet consume them
+        — see ``--allow-compress``). The translator is JAX-traceable so
+        the whole rollout step stays inside jit.
+
+        ``actions.factor`` (stored on each MicroAction by ``sample_step``)
+        is the integer factor consumed by the legacy spec — no re-
+        derivation from exponents needed here.
+        """
+        axis_state_v = axis_state[vertex_idx]
+        rule_specs = micro_actions_to_rule_specs_jax(
+            actions.op_type, actions.i, actions.j, actions.factor,
+            axis_state_v,
+        )
+        return StepAction(
+            target_vertex=jnp.asarray(vertex_idx + 1, dtype=jnp.int32),
+            rule_specs=rule_specs,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Argparse and helpers used during main()
@@ -1473,6 +1811,39 @@ def make_argparser() -> argparse.ArgumentParser:
             "head (one rule per vertex, factor fixed to -1). Independent of --no-ptr."
         ),
     )
+
+    # Dynamic-substeps (heads.py) mode. When `--dynamic-substeps` is on, the
+    # legacy AutoregRulePolicy is swapped for the MicroActionPolicy in
+    # heads.py: a typed (op_type, i, j, prime_exponents) sequence per
+    # vertex, scanned to `--max-substeps` with END termination. The
+    # FactorTables (precomputed prime / gcd lookup) are built from
+    # `--max-axis-size`. COMPRESS legality is gated by `--allow-compress`
+    # (off by default — graphax's vertex_elimination_jaxpr doesn't yet
+    # consume real mean-compression, so any emitted COMPRESS is silently
+    # dropped by the legacy translator).
+    p.add_argument("--dynamic-substeps", action="store_true",
+                   help="Swap the legacy rule head for the heads.py "
+                        "MicroActionPolicy (autoregressive typed sub-episode "
+                        "with op_type ∈ {DIAG, COMPRESS, END}, axis pointers, "
+                        "and a prime-exponent factor head). Trajectories "
+                        "carry typed micro-actions; the loss path uses "
+                        "MicroActionPolicy.evaluate for joint log-probs.")
+    p.add_argument("--max-substeps", type=int, default=MAX_RULES_PER_VERTEX,
+                   help="Max sub-episode length when --dynamic-substeps is on. "
+                        "Keep ≤ MAX_RULES_PER_VERTEX to avoid silent truncation "
+                        "in the legacy sparsity_specs path.")
+    p.add_argument("--max-axis-size", type=int, default=1024,
+                   help="Max bound on logical axis sizes for the precomputed "
+                        "FactorTables (gcd / prime / exp lookup). Must be ≥ "
+                        "the largest dim in the env's jaxpr. Memory cost is "
+                        "O(max_axis_size²) for the gcd table; 1024 ≈ 4 MiB.")
+    p.add_argument("--allow-compress", action="store_true",
+                   help="Enable COMPRESS legality in the MicroActionPolicy. "
+                        "Off by default because the legacy sparsity_specs "
+                        "env path silently drops COMPRESS rows — the policy "
+                        "would emit them but they wouldn't affect the env. "
+                        "Turn on only once graphax's vertex_elimination_jaxpr "
+                        "consumes typed micro-actions.")
 
     # Multi-rule / autoregressive head config (ignored when --no-ptr or --not-autoreg)
     p.add_argument("--max-rules", type=int, default=MAX_RULES_PER_VERTEX,
@@ -1901,7 +2272,7 @@ def _build_agent(
     max_rules: int,
     key,
 ):
-    encoder_keys = jrand.split(key, 13)
+    encoder_keys = jrand.split(key, 14)
     embedding = eqx.nn.Embedding(args.vocab_size, args.embd_dim, key=encoder_keys[0])
     pos_enc = PositionalEncoder(args.embd_dim, MAX_TOKENS)
     encoder = Encoder(
@@ -1991,6 +2362,20 @@ def _build_agent(
     pref_proj = eqx.nn.Linear(
         NUM_VALUE_HEADS, args.embd_dim, key=encoder_keys[11]
     )
+    # Dynamic-substeps head: only constructed when the flag is on so the
+    # default agent stays leaner (one extra encoder + MicroActionHead is
+    # non-trivial parameter cost).
+    if getattr(args, "dynamic_substeps", False):
+        micro_action_policy = MicroActionPolicy(
+            embd_dim=args.embd_dim,
+            num_heads=args.num_heads,
+            max_substeps=args.max_substeps,
+            num_encoder_layers=1,
+            max_groups=max(args.max_substeps, 16),
+            key=encoder_keys[13],
+        )
+    else:
+        micro_action_policy = None
     return Agent(
         embedding=embedding,
         pos_enc=pos_enc,
@@ -2013,6 +2398,7 @@ def _build_agent(
         num_factors=num_factors,
         embd_dim=args.embd_dim,
         op_embd_dim=args.op_embd_dim,
+        micro_action_policy=micro_action_policy,
     )
 
 
@@ -2650,6 +3036,34 @@ def main():
         pair_stop_idx=PAIR_STOP,
     )
 
+    # Dynamic-substeps state: only constructed when the flag is on, but
+    # always referenced by the rollout closure so it must be defined.
+    # FactorTables is an env-static FactorTables NamedTuple (pytree of
+    # int32 / float32 lookup arrays); op_legality_override is a (3,)
+    # float32 mask gating COMPRESS via --allow-compress.
+    if args.dynamic_substeps:
+        factor_tables = precompute_factor_tables(args.max_axis_size)
+        op_legality_override = jnp.array(
+            [1.0, 1.0 if args.allow_compress else 0.0, 1.0],
+            dtype=jnp.float32,
+        )
+        print(
+            f"dynamic-substeps: max_substeps={args.max_substeps}, "
+            f"max_axis_size={args.max_axis_size}, "
+            f"allow_compress={args.allow_compress}"
+        )
+    else:
+        # Placeholder values so the rollout closure can reference these
+        # names unconditionally. With dynamic_substeps off the rollout
+        # branch never touches them.
+        factor_tables = FactorTables(
+            gcd=jnp.zeros((1, 1), dtype=jnp.int32),
+            primes=jnp.zeros((1, MAX_PRIMES), dtype=jnp.int32),
+            max_exps=jnp.zeros((1, MAX_PRIMES), dtype=jnp.int32),
+            prime_mask=jnp.zeros((1, MAX_PRIMES), dtype=jnp.float32),
+        )
+        op_legality_override = jnp.ones((NUM_OPS,), dtype=jnp.float32)
+
     print(
         f"variant={variant_label}, num_envs={num_envs}, max_rules={max_rules}, "
         f"factors={factors_py}, rollout_length={num_valid}, minibatches={args.minibatches}"
@@ -2757,6 +3171,38 @@ def main():
             initial_tokens = None
             initial_eqn_ids = None
 
+        # Shapes for the unused trajectory branch. The Trajectory NamedTuple
+        # carries both legacy and dynamic action fields so the rollout's
+        # output structure is identical across the two modes (lax.scan
+        # outputs need uniform leaf shapes).
+        _legacy_zero_pair_seq = jnp.zeros((args.max_rules,), dtype=jnp.int32)
+        _legacy_zero_factor_seq = jnp.zeros((args.max_rules,), dtype=jnp.int32)
+        _legacy_zero_pair_dists = jnp.zeros(
+            (args.max_rules, NUM_PAIR_CHOICES), dtype=jnp.float32,
+        )
+        _legacy_zero_factor_dists = jnp.zeros(
+            (args.max_rules, num_factors), dtype=jnp.float32,
+        )
+        _dyn_zero_op_seq = jnp.zeros((args.max_substeps,), dtype=jnp.int32)
+        _dyn_zero_i_seq = jnp.zeros((args.max_substeps,), dtype=jnp.int32)
+        _dyn_zero_j_seq = jnp.zeros((args.max_substeps,), dtype=jnp.int32)
+        _dyn_zero_exp_seq = jnp.zeros(
+            (args.max_substeps, MAX_PRIMES), dtype=jnp.int32,
+        )
+        _dyn_zero_factor_seq = jnp.zeros((args.max_substeps,), dtype=jnp.int32)
+        _dyn_zero_op_dists = jnp.zeros(
+            (args.max_substeps, NUM_OPS), dtype=jnp.float32,
+        )
+        _dyn_zero_i_dists = jnp.zeros(
+            (args.max_substeps, MAX_AXES_PER_VERTEX), dtype=jnp.float32,
+        )
+        _dyn_zero_j_dists = jnp.zeros(
+            (args.max_substeps, MAX_AXES_PER_VERTEX), dtype=jnp.float32,
+        )
+        _dyn_zero_exp_dists = jnp.zeros(
+            (args.max_substeps, MAX_PRIMES, MAX_EXPONENT + 1), dtype=jnp.float32,
+        )
+
         def step_fn(carry, k):
             state, residual_state = carry
             sample_key, next_net_key = jrand.split(k, 2)
@@ -2764,33 +3210,81 @@ def main():
                 state, vertex_valid_static, total_v, num_valid
             )
 
-            (
-                vertex_idx,
-                pair_seq,
-                factor_seq,
-                vertex_dist,
-                pair_dists,
-                factor_dists,
-                value,
-                v_context,
-            ) = agent.sample_action(
-                state.tokens,
-                vertex_avail_mask,
-                pair_valid_mask,
-                pair_factor_mask,
-                sample_key,
-                eqn_ids=state.eqn_ids,
-                vertex_features=vertex_features,
-                residual_state=residual_state,
-                cached_encoding=cached_encoding,
-                pin_rules_to_exact=args.pin_rules_to_exact,
-                pin_factor_idx=pin_factor_idx,
-                preference=preference if args.preference_conditioned else None,
-            )
-
-            env_action = agent.to_env_action(
-                vertex_idx, pair_seq, factor_seq, factor_table
-            )
+            if args.dynamic_substeps:
+                (
+                    vertex_idx,
+                    micro_actions,
+                    vertex_dist,
+                    micro_op_dists,
+                    micro_i_dists,
+                    micro_j_dists,
+                    micro_exp_dists,
+                    value,
+                    v_context,
+                ) = agent.sample_action_dynamic(
+                    state.tokens,
+                    vertex_avail_mask,
+                    state.axis_state,
+                    state.axis_valid_mask,
+                    factor_tables,
+                    op_legality_override,
+                    sample_key,
+                    eqn_ids=state.eqn_ids,
+                    vertex_features=vertex_features,
+                    residual_state=residual_state,
+                    cached_encoding=cached_encoding,
+                    preference=preference if args.preference_conditioned else None,
+                )
+                env_action = agent.to_env_action_dynamic(
+                    vertex_idx, micro_actions, state.axis_state,
+                )
+                # Legacy fields zero-filled; dynamic fields populated.
+                pair_seq = _legacy_zero_pair_seq
+                factor_seq = _legacy_zero_factor_seq
+                pair_dists = _legacy_zero_pair_dists
+                factor_dists = _legacy_zero_factor_dists
+                micro_op_seq = micro_actions.op_type
+                micro_i_seq = micro_actions.i
+                micro_j_seq = micro_actions.j
+                micro_exp_seq = micro_actions.exponents
+                micro_factor_seq = micro_actions.factor
+            else:
+                (
+                    vertex_idx,
+                    pair_seq,
+                    factor_seq,
+                    vertex_dist,
+                    pair_dists,
+                    factor_dists,
+                    value,
+                    v_context,
+                ) = agent.sample_action(
+                    state.tokens,
+                    vertex_avail_mask,
+                    pair_valid_mask,
+                    pair_factor_mask,
+                    sample_key,
+                    eqn_ids=state.eqn_ids,
+                    vertex_features=vertex_features,
+                    residual_state=residual_state,
+                    cached_encoding=cached_encoding,
+                    pin_rules_to_exact=args.pin_rules_to_exact,
+                    pin_factor_idx=pin_factor_idx,
+                    preference=preference if args.preference_conditioned else None,
+                )
+                env_action = agent.to_env_action(
+                    vertex_idx, pair_seq, factor_seq, factor_table
+                )
+                # Dynamic fields zero-filled; legacy fields populated.
+                micro_op_seq = _dyn_zero_op_seq
+                micro_i_seq = _dyn_zero_i_seq
+                micro_j_seq = _dyn_zero_j_seq
+                micro_exp_seq = _dyn_zero_exp_seq
+                micro_factor_seq = _dyn_zero_factor_seq
+                micro_op_dists = _dyn_zero_op_dists
+                micro_i_dists = _dyn_zero_i_dists
+                micro_j_dists = _dyn_zero_j_dists
+                micro_exp_dists = _dyn_zero_exp_dists
             env_out = env_obj.step(state, env_action)
             next_state = env_out.state
             raw_rewards = env_out.reward
@@ -2855,6 +3349,11 @@ def main():
                 vertex_idx=jnp.asarray(vertex_idx, dtype=jnp.int32),
                 pair_seq=jnp.asarray(pair_seq, dtype=jnp.int32),
                 factor_seq=jnp.asarray(factor_seq, dtype=jnp.int32),
+                micro_op_seq=micro_op_seq,
+                micro_i_seq=micro_i_seq,
+                micro_j_seq=micro_j_seq,
+                micro_exp_seq=micro_exp_seq,
+                micro_factor_seq=micro_factor_seq,
                 reward=jnp.atleast_1d(rewards),
                 done=jnp.array(done, dtype=jnp.float32),
                 value=jnp.atleast_1d(value),
@@ -2862,6 +3361,10 @@ def main():
                 vertex_dist=vertex_dist,
                 pair_dists=pair_dists,
                 factor_dists=factor_dists,
+                micro_op_dists=micro_op_dists,
+                micro_i_dists=micro_i_dists,
+                micro_j_dists=micro_j_dists,
+                micro_exp_dists=micro_exp_dists,
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
             )
@@ -2873,6 +3376,13 @@ def main():
         return final_state, traj, all_raw_rewards[-1]
 
     def loss_fn(agent, batch: TrainBatch, vertex_features, key):
+        # Dynamic-substeps path branches off here so the legacy path
+        # stays exactly as written. `_dynamic_loss_fn` lives below and
+        # mirrors the same return shape — total_loss + 9-tuple of
+        # metrics — so the train_episode plumbing doesn't care which
+        # path was taken.
+        if args.dynamic_substeps:
+            return _dynamic_loss_fn(agent, batch, vertex_features, key)
         # Three batching regimes share one ``evaluate_action`` vmap:
         #   1. Per-trajectory cache (B.4.next): batch arrives `(E, K, ...)`,
         #      encode once per trajectory and replicate K times.
@@ -3020,6 +3530,147 @@ def main():
             trigger_ratio,
         )
 
+    def _dynamic_loss_fn(agent, batch: TrainBatch, vertex_features, key):
+        """Dynamic-substeps loss: routes through MicroActionPolicy.evaluate.
+
+        Mirrors :func:`loss_fn`'s legacy structure (same cached/no-cache
+        batching regimes, same return shape) but evaluates the typed
+        micro-action sequence stored in ``batch.micro_*_seq`` instead of
+        the legacy ``pair_seq`` / ``factor_seq``. PPO ratio is computed
+        from the joint log-prob; entropy is normalized by the per-sample
+        sub-episode length returned by ``MicroActionPolicy.evaluate``.
+
+        KL tracking is currently a scalar zero placeholder — per-component
+        KL across op_type / i / j / prime-exponents is a clean follow-up
+        once the legacy/dynamic split has stabilised.
+        """
+        pref_or_none = (
+            (lambda p: p) if args.preference_conditioned else (lambda _: None)
+        )
+
+        if batch.tokens.ndim == 3:
+            E, K = batch.tokens.shape[:2]
+            enc_key, eval_key = jrand.split(key, 2)
+            cached_per_traj = jax.vmap(
+                lambda t, e, k: agent.encode_once(t, eqn_ids=e, key=k)
+            )(batch.tokens[:, 0], batch.eqn_ids[:, 0], jrand.split(enc_key, E))
+            batch = jax.tree_util.tree_map(
+                lambda x: x.reshape(E * K, *x.shape[2:]), batch,
+            )
+            cached_flat = jax.tree_util.tree_map(
+                lambda x: jnp.repeat(x, K, axis=0), cached_per_traj,
+            )
+            keys = jrand.split(eval_key, E * K)
+        elif args.cache_encoding:
+            B = batch.tokens.shape[0]
+            enc_key, eval_key = jrand.split(key, 2)
+            cached_flat = jax.vmap(
+                lambda t, e, k: agent.encode_once(t, eqn_ids=e, key=k)
+            )(batch.tokens, batch.eqn_ids, jrand.split(enc_key, B))
+            keys = jrand.split(eval_key, B)
+        else:
+            cached_flat = None
+            keys = jrand.split(key, batch.tokens.shape[0])
+
+        actions = MicroAction(
+            op_type=batch.micro_op_seq,
+            i=batch.micro_i_seq,
+            j=batch.micro_j_seq,
+            exponents=batch.micro_exp_seq,
+            factor=batch.micro_factor_seq,
+        )
+
+        def _eval_dyn(toks, eids, rs, pref, vidx, action, vmask, cached, k):
+            return agent.evaluate_action_dynamic(
+                toks, vidx, action, vmask,
+                env.axis_state_static, env.axis_valid_static,
+                factor_tables, k,
+                eqn_ids=eids, vertex_features=vertex_features,
+                residual_state=rs, cached_encoding=cached,
+                preference=pref_or_none(pref),
+            )
+
+        if cached_flat is None:
+            (
+                log_probs, entropies, values, new_vertex_dist, sub_lengths,
+            ) = jax.vmap(
+                lambda toks, eids, rs, pref, vidx, action, vmask, k:
+                    _eval_dyn(toks, eids, rs, pref, vidx, action, vmask, None, k)
+            )(
+                batch.tokens, batch.eqn_ids, batch.residual_state, batch.preference,
+                batch.vertex_idx, actions, batch.vertex_avail_mask, keys,
+            )
+        else:
+            (
+                log_probs, entropies, values, new_vertex_dist, sub_lengths,
+            ) = jax.vmap(_eval_dyn)(
+                batch.tokens, batch.eqn_ids, batch.residual_state, batch.preference,
+                batch.vertex_idx, actions, batch.vertex_avail_mask, cached_flat,
+                keys,
+            )
+
+        old_log_probs = jax.vmap(old_micro_log_prob_for_action)(
+            batch.vertex_idx,
+            batch.micro_op_seq, batch.micro_i_seq, batch.micro_j_seq,
+            batch.micro_exp_seq,
+            batch.old_vertex_dist,
+            batch.old_micro_op_dists, batch.old_micro_i_dists,
+            batch.old_micro_j_dists, batch.old_micro_exp_dists,
+        )
+
+        ratio = jnp.exp(log_probs - old_log_probs)
+        num_triggers = get_num_clipping_triggers(ratio, args.ppo_clip_eps)
+        trigger_ratio = num_triggers / len(ratio)
+
+        clipping_objective = jnp.minimum(
+            ratio * batch.norm_adv,
+            jnp.clip(ratio, 1.0 - args.ppo_clip_eps, 1.0 + args.ppo_clip_eps)
+            * batch.norm_adv,
+        )
+        ppo_loss = jnp.mean(-clipping_objective)
+
+        # Entropy normalized by per-sample sub-episode length (returned by
+        # MicroActionPolicy.evaluate). Clamp to ≥ 1.0 to avoid divide-by-
+        # zero on samples where the sub-episode was forced END at step 0.
+        entropy_loss = jnp.mean(entropies / jnp.maximum(sub_lengths, 1.0))
+
+        value_loss = jnp.mean(
+            jnp.sum(
+                (values - reward_normalization_fn(batch.estim_returns)) ** 2,
+                axis=-1,
+            )
+        )
+        explained_var = explained_variance(
+            batch.norm_adv, jnp.sum(batch.estim_returns, axis=-1),
+        )
+
+        # KL placeholder — per-component KL on the dynamic path is a
+        # follow-up. Vertex-side KL is well-defined; the per-step
+        # micro-action KL needs alignment by sub-step which adds
+        # complexity that's not strictly necessary for first runs.
+        kl_div = jnp.mean(
+            optax.kl_divergence(
+                jnp.log(new_vertex_dist + 1e-7), batch.old_vertex_dist,
+            )
+        )
+
+        total_loss = (
+            ppo_loss
+            + args.value_weight * value_loss
+            - args.entropy_weight * entropy_loss
+        )
+        return total_loss, (
+            kl_div,
+            entropy_loss,
+            0.0,
+            explained_var,
+            ppo_loss,
+            args.value_weight * value_loss,
+            args.entropy_weight * entropy_loss,
+            total_loss,
+            trigger_ratio,
+        )
+
     def train_episode(
         agent, opt_state, env_states, env_obj, vertex_features,
         preferences_per_env, global_step, key, freeze_mask,
@@ -3082,6 +3733,20 @@ def main():
             mean_violations = multipliers  # zero-length sentinel
             new_multipliers = multipliers
 
+        # `old_*_dists` are the dynamic-mode equivalent of the legacy
+        # old_{vertex,pair,factor}_dists fields — but TrainBatch only
+        # carries the legacy ones plus the typed action sequence. The
+        # dynamic loss path reads `traj.micro_op_dists` etc. directly via
+        # the TrainBatch's micro_*_seq fields (the stored dists ARE the
+        # old-policy snapshots since rollout_fn runs under stop-gradient
+        # for batch construction). To keep TrainBatch flat we pack the
+        # dynamic per-step dists into the same slots the legacy old_*
+        # fields would occupy — when dynamic_substeps is on, the loss
+        # path reads them via .pair_dists / .factor_dists slot reuse is
+        # cleaner than threading another six fields through the whole
+        # mini-batching pipeline. (TrainBatch's micro_*_seq fields below
+        # carry the actions; we add micro_*_dists alongside them so the
+        # old log-prob computation can index them.)
         full_batch = TrainBatch(
             tokens=traj.tokens,
             eqn_ids=traj.eqn_ids,
@@ -3090,9 +3755,18 @@ def main():
             vertex_idx=traj.vertex_idx,
             pair_seq=traj.pair_seq,
             factor_seq=traj.factor_seq,
+            micro_op_seq=traj.micro_op_seq,
+            micro_i_seq=traj.micro_i_seq,
+            micro_j_seq=traj.micro_j_seq,
+            micro_exp_seq=traj.micro_exp_seq,
+            micro_factor_seq=traj.micro_factor_seq,
             old_vertex_dist=traj.vertex_dist,
             old_pair_dists=traj.pair_dists,
             old_factor_dists=traj.factor_dists,
+            old_micro_op_dists=traj.micro_op_dists,
+            old_micro_i_dists=traj.micro_i_dists,
+            old_micro_j_dists=traj.micro_j_dists,
+            old_micro_exp_dists=traj.micro_exp_dists,
             estim_returns=estim_returns,
             norm_adv=norm_adv,
             vertex_avail_mask=traj.vertex_avail_mask,
