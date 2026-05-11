@@ -41,6 +41,12 @@ import optax
 import wandb
 from tqdm import tqdm
 
+# Swap tqdm's default multiprocessing.RLock for a threading.RLock so the
+# named POSIX semaphore behind it never gets created — otherwise it leaks
+# on signal-kill. See ppo.py for the full rationale.
+import threading as _threading
+tqdm.set_lock(_threading.RLock())
+
 from alphagrad.approx.common import (
     SCHEDULES,
     build_pair_valid_mask,

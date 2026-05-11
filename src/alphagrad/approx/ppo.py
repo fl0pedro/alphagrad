@@ -38,6 +38,18 @@ import optax
 import wandb
 from tqdm import tqdm
 
+# tqdm allocates a multiprocessing.RLock on first use (`TqdmDefaultWriteLock`)
+# for cross-process bar coordination. The RLock is backed by a named POSIX
+# semaphore on macOS / Linux; if the process is signal-killed (SIGTERM from
+# `timeout`, Ctrl-C, OOM killer) before tqdm's atexit cleanup runs, the
+# semaphore leaks and `multiprocessing.resource_tracker` prints:
+#   "There appear to be N leaked semaphore objects to clean up at shutdown"
+# at the next Python shutdown. We only ever drive tqdm from the main thread
+# of a single process, so a threading.RLock is sufficient and never touches
+# `multiprocessing`.
+import threading as _threading
+tqdm.set_lock(_threading.RLock())
+
 from alphagrad.approx.common import (
     NUM_VERTEX_FEATURES,
     OP_TYPE_VOCAB_SIZE,
