@@ -252,6 +252,74 @@ def test_callback_resolves_minus_one_factor_to_gcd():
 
 
 # ---------------------------------------------------------------------------
+# Multi-invar invariant: rules that don't fit every invar must be dropped
+# ---------------------------------------------------------------------------
+
+
+def test_callback_drops_rules_that_dont_fit_every_invar():
+    """graphax's `_eliminate_vertex` applies each transform to every
+    incoming edge of the vertex; if a vertex has heterogeneous-rank
+    invars (e.g. ``div((4,), ())``), a Diag with ``j`` past the scalar
+    edge's primal dims raises inside ``apply_diag``. Caught the
+    `Diag.j = 1 out of range [0, 1); out_dims=1, primal_dims=0` crash
+    in the PPO smoke test on Helmholtz.
+
+    The env-side translator must therefore validate the rule against
+    EVERY non-literal invar and silently drop it when any one of them
+    can't host the chosen ``(bi1, bi2)`` pair.
+    """
+    from graphax import examples
+    from graphax.sparse.micro_actions import Diag
+
+    print("\n[env] _callback drops rules that don't fit every invar")
+    target_fn = examples.Helmholtz
+    x = jnp.array([0.05, 0.15, 0.25, 0.35], dtype=jnp.float32)
+    closed_jaxpr = jax.make_jaxpr(target_fn)(x)
+    jaxpr = closed_jaxpr.jaxpr
+    total_v = len(jaxpr.eqns)
+
+    # Find the div vertex; its second invar is the scalar denominator,
+    # which is exactly the multi-invar shape mismatch we want to test.
+    div_idx = next(
+        i for i, e in enumerate(jaxpr.eqns) if e.primitive.name == "div"
+    )
+
+    config = EnvConfig(
+        jaxpr=jaxpr,
+        argnums=(0,),
+        has_aux=False,
+        sparse=False,
+        cmp_type="graphax",
+        mem_type="graphax",
+        target_fun=None,
+        data_gen=None,
+    )
+    initial_order, initial_specs = _build_callback_state(closed_jaxpr, total_v)
+    # Plant (0, 0, -1) on the div vertex — fits the (4,) numerator but
+    # not the () denominator. The translator must reject it.
+    sparsity_specs = initial_specs.at[div_idx, 0].set(
+        jnp.array([0, 0, -1], jnp.int32)
+    )
+    stop = jnp.asarray(total_v, dtype=jnp.int32)
+
+    captured, fake_extract = _spy_extract_jaxpr_to_record_transforms()
+    with mock.patch("alphagrad.approx.env.extract_jaxpr", fake_extract):
+        _callback(
+            config, (x,), closed_jaxpr.literals,
+            initial_order, sparsity_specs, stop, init=True,
+        )
+
+    transforms = captured["transforms"] or []
+    div_v = div_idx + 1
+    div_entry = next((t for t in transforms if t[0] == div_v), None)
+    assert div_entry is None, (
+        f"rule on div (scalar-invar) leaked through: {div_entry}. "
+        "The translator must validate against EVERY invar, not just invars[0]."
+    )
+    print(f"  div vertex correctly excluded from transforms = {transforms}")
+
+
+# ---------------------------------------------------------------------------
 # Smoke test: full env.step round-trip on the smallest real example
 # ---------------------------------------------------------------------------
 
@@ -298,6 +366,7 @@ def main():
     test_cossim_aggregation_full_quartile_path_unchanged()
     test_callback_forwards_arbitrary_factors_as_diag()
     test_callback_resolves_minus_one_factor_to_gcd()
+    test_callback_drops_rules_that_dont_fit_every_invar()
     test_env_step_roundtrip_on_helmholtz()
     print("\nALL ENV CALLBACK TESTS OK")
 

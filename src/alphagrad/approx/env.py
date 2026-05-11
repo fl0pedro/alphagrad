@@ -551,7 +551,12 @@ def _callback(
     # integer factor — the only form graphax's apply_diag accepts. Slots
     # with factor=0 (legacy drop-axes) or factor=1 (legacy no-op) are
     # silently skipped: drop has no replacement under the new API, and
-    # no-op is dead weight.
+    # no-op is dead weight. The rule must also fit **every** non-literal
+    # invar of the eqn: graphax's `_eliminate_vertex` applies each
+    # transform to every incoming edge, and apply_diag raises if the
+    # primal axis index is out of range for any of them (e.g. a div by
+    # a scalar denominator has one (n,) edge and one () edge — a Diag
+    # with j=1 only fits the first).
     transforms: list[tuple[int, tuple]] = []
     for v_idx, v in enumerate(o_list):
         eqn = config.jaxpr.eqns[v - 1]
@@ -560,8 +565,11 @@ def _callback(
 
         out_shape = eqn.outvars[0].aval.shape
         out_len = len(out_shape)
-        invars = [iv for iv in eqn.invars if hasattr(iv, "aval")]
-        primal_shape = invars[0].aval.shape if invars else ()
+        primal_shapes = [
+            iv.aval.shape for iv in eqn.invars if hasattr(iv, "aval")
+        ]
+        if not primal_shapes:
+            continue  # no non-literal inputs → no edges to transform
 
         rules: list[Diag] = []
         used_axes: set[int] = set()
@@ -579,24 +587,32 @@ def _callback(
             # so apply_diag's stricter checks don't crash).
             if idx1 in used_axes or idx2 in used_axes or idx1 == idx2:
                 continue
-            # Resolve the legacy factor sentinels to an explicit divisor.
-            if 0 <= bi1 < out_len:
-                n1 = int(out_shape[bi1])
-            else:
+            if not (0 <= bi1 < out_len):
                 continue
-            if 0 <= bi2 < len(primal_shape):
-                n2 = int(primal_shape[bi2])
-            else:
+            n1 = int(out_shape[bi1])
+            # The rule must fit every primal edge of this vertex.
+            n2_list: list[int] = []
+            fits_all = True
+            for ps in primal_shapes:
+                if not (0 <= bi2 < len(ps)):
+                    fits_all = False
+                    break
+                n2_list.append(int(ps[bi2]))
+            if not fits_all:
                 continue
             if factor == 0 or factor == 1:
                 continue  # drop-axes and no-op have no equivalent in the new API
             if factor == -1:
-                factor = _math.gcd(n1, n2)
-            # apply_diag requires factor | gcd(n1, n2); silently skip
-            # mismatches rather than crash (the legacy fallback was
-            # gcd-collapse, but the new API treats this as a policy bug
-            # that should be caught upstream by the action mask).
-            if factor <= 0 or n1 % factor != 0 or n2 % factor != 0:
+                # Joint gcd across the out axis and every primal axis.
+                from functools import reduce as _reduce
+                factor = _reduce(_math.gcd, [n1] + n2_list)
+            # apply_diag requires factor | gcd(n_i, n_j) on every edge it
+            # touches. Silently skip mismatches rather than crash.
+            if (
+                factor <= 0
+                or n1 % factor != 0
+                or any(n2 % factor != 0 for n2 in n2_list)
+            ):
                 continue
             used_axes.add(idx1)
             used_axes.add(idx2)
