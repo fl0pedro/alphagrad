@@ -2215,6 +2215,62 @@ def _apply_variant_preset(args, variant: str | None = None):
         setattr(args, k, v)
 
 
+def _current_stage_at(
+    stages: list[tuple[str, int]], ep: int,
+) -> str:
+    """Map an episode index to the variant of the stage it falls into.
+
+    Used by the curriculum runner to print a stage-transition message
+    once per boundary. Returns the last stage's name if ``ep`` exceeds
+    the total budget (shouldn't happen — total_episodes is set to the
+    sum of stage counts — but harmless).
+    """
+    cumulative = 0
+    for name, n in stages:
+        if ep < cumulative + n:
+            return name
+        cumulative += n
+    return stages[-1][0] if stages else ""
+
+
+def _op_legality_for_variant(
+    variant: str, allow_compress: bool,
+) -> jax.Array:
+    """Per-variant op-type legality mask for the dynamic action space.
+
+    Maps a comparison-study variant to the ``(NUM_OPS,) = (DIAG,
+    COMPRESS, END)`` float32 mask consumed by
+    :meth:`Agent.sample_action_dynamic`. END is always legal so the
+    sub-episode can terminate. ``allow_compress`` overrides the
+    COMPRESS slot to 0 for any variant — useful while the graphax-side
+    real-COMPRESS wiring is pending.
+
+    * ``custom`` / ``full``: every op legal (gated by allow_compress).
+    * ``ve_only``: force END at every sub-step (the dynamic-mode
+      analogue of ``--pin-rules-to-exact``).
+    * ``diag_gcd`` / ``diag_factor``: DIAG and END only.
+    * ``compress``: COMPRESS and END only (requires allow_compress).
+    """
+    diag = 1.0
+    compress = 1.0 if allow_compress else 0.0
+    end = 1.0
+    if variant == "ve_only":
+        return jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32)
+    if variant in ("diag_gcd", "diag_factor"):
+        return jnp.array([diag, 0.0, end], dtype=jnp.float32)
+    if variant == "compress":
+        if not allow_compress:
+            raise ValueError(
+                "Variant 'compress' requires --allow-compress (and the "
+                "graphax vertex_elimination_jaxpr rewrite to actually "
+                "consume COMPRESS micro-actions through the env)."
+            )
+        return jnp.array([0.0, compress, end], dtype=jnp.float32)
+    # `custom` and `full` (and anything else) get the unrestricted mask
+    # gated by allow_compress.
+    return jnp.array([diag, compress, end], dtype=jnp.float32)
+
+
 def _parse_curriculum(spec: str) -> list[tuple[str, int]]:
     """Parse `stage1:N1,stage2:N2,...` into a list of (variant, episodes) pairs.
 
@@ -2728,12 +2784,23 @@ def run_calibration_phase(
             base_args, eval_samples=eval_samples, argnums=argnums,
         )
         env_states = reset_envs(env_episode)
+        # Calibration uses the env's current op-legality (no per-stage
+        # override). For dynamic-substeps calibration the caller will
+        # provide the active override via args.
+        if args.dynamic_substeps:
+            cal_override = jnp.array(
+                [1.0, 1.0 if args.allow_compress else 0.0, 1.0],
+                dtype=jnp.float32,
+            )
+        else:
+            cal_override = jnp.ones((NUM_OPS,), dtype=jnp.float32)
         (
             agent, opt_state, _, _metrics, totals, _actions, global_step,
             _new_lam, _diag_pack,
         ) = train_episode(
             agent, opt_state, env_states, env_episode, vertex_features,
             cal_pref, global_step, ep_key, cal_mask, no_lam, no_idx, no_thr,
+            cal_override,
         )
         cosine = float(jnp.mean(totals[:, REWARD_INDEX["cosine_sim"]]))
         neg_frob = float(jnp.mean(totals[:, REWARD_INDEX["frob_residual"]]))
@@ -2918,17 +2985,29 @@ def main():
     # is requested.
     curriculum_stages = _parse_curriculum(args.curriculum)
     if curriculum_stages:
-        raise NotImplementedError(
-            "Curriculum runner is not yet wired. Parsed stages:\n  "
+        # Dynamic-mode curriculum: stage transitions toggle the op-type
+        # legality (via `_op_legality_for_variant`) without re-JIT,
+        # because `op_legality_override` is now a per-call argument to
+        # `train_episode`. Legacy-mode curricula still need a separate
+        # implementation (the legacy rule head doesn't have a single
+        # mask analogous to op_legality_override — it would need
+        # pin_rules_to_exact threaded the same way, plus factor-table
+        # swapping for stages that change --factors).
+        if not args.dynamic_substeps:
+            raise NotImplementedError(
+                "Legacy-mode curriculum is not yet wired. Stages: "
+                + ", ".join(f"{name}:{n}" for name, n in curriculum_stages)
+                + ". Add --dynamic-substeps to run the curriculum on the "
+                "heads.py path (where stage transitions toggle the op-type "
+                "legality without forcing a recompile), or run each stage "
+                "as its own training invocation until the legacy-mode "
+                "runner is implemented."
+            )
+        args.episodes = sum(n for _, n in curriculum_stages)
+        print(
+            "curriculum: "
             + " → ".join(f"{name}:{n}" for name, n in curriculum_stages)
-            + "\nBlocked on heads.py: the per-stage runner needs to "
-            "toggle pin_rules_to_exact (and eventually the op_type / "
-            "factor heads) across stages without forcing a full re-JIT, "
-            "which requires those values to be explicit rollout_fn "
-            "arguments rather than closed-over args fields. Run each "
-            "stage as its own --variant invocation until the rewrite "
-            "lands; the LR schedule lives in "
-            "`alphagrad.approx.common.schedules.cosine_warmup_exp_decay_lr`."
+            + f"  (total {args.episodes} episodes, dynamic-substeps mode)"
         )
 
     use_pointer, use_autoreg = _select_variant(args)
@@ -3150,10 +3229,10 @@ def main():
         return jax.vmap(lambda _: env_obj.reset())(jnp.arange(num_envs))
 
     @eqx.filter_jit
-    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None, 0))
+    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None, 0, None))
     def rollout_fn(
         agent, env_obj, rollout_length, env_state, key, vertex_features,
-        preference,
+        preference, op_legality_override,
     ):
         keys = jrand.split(key, rollout_length)
         # Stage B.4: per-vertex residual state, initialised to zero at episode
@@ -3746,6 +3825,7 @@ def main():
         agent, opt_state, env_states, env_obj, vertex_features,
         preferences_per_env, global_step, key, freeze_mask,
         multipliers, constraint_indices, constraint_thresholds,
+        op_legality_override_arg,
     ):
         subkey, key = jrand.split(key)
         rollout_key, key = jrand.split(key)
@@ -3753,7 +3833,7 @@ def main():
 
         env_states, traj, total_rewards_full = rollout_fn(
             agent, env_obj, num_valid, env_states, rollout_keys, vertex_features,
-            preferences_per_env,
+            preferences_per_env, op_legality_override_arg,
         )
 
         # Per-head GAE: only the three training-reward indices (flops /
@@ -4177,6 +4257,30 @@ def main():
         )
 
         env_states = reset_envs(env_episode)
+        # Curriculum stage resolution: figure out which stage `ep` falls
+        # into and derive the op-legality override from the stage's
+        # variant. Empty curriculum (the default) just uses the
+        # main-level `op_legality_override` set at startup.
+        if curriculum_stages:
+            cumulative = 0
+            current_stage_name = curriculum_stages[-1][0]
+            for stage_name, stage_n in curriculum_stages:
+                if ep < cumulative + stage_n:
+                    current_stage_name = stage_name
+                    break
+                cumulative += stage_n
+            stage_override = _op_legality_for_variant(
+                current_stage_name, args.allow_compress,
+            )
+            # Log the stage boundary on transition (cheap host-side check).
+            if ep == 0 or (
+                ep > 0
+                and _current_stage_at(curriculum_stages, ep - 1)
+                != current_stage_name
+            ):
+                print(f"[ep {ep}] curriculum stage → {current_stage_name}")
+        else:
+            stage_override = op_legality_override
         (
             agent, opt_state, _, metrics, total_rewards_full,
             actions_pack, global_step, multipliers, diag_pack,
@@ -4185,6 +4289,7 @@ def main():
             preferences_per_env, global_step, ep_key,
             default_freeze_mask, multipliers,
             constraint_indices, constraint_thresholds,
+            stage_override,
         )
         host_log(
             ep,
