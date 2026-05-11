@@ -18,7 +18,7 @@ import numpy as np
 from alphagrad.approx.common.relations import compute_eqn_ids_from_tokens
 from graphax.core import _build_graph, extract_jaxpr, jacve, vertex_elimination_jaxpr
 from graphax.jaxpr import get_vocab as _graphax_get_vocab
-from graphax.sparse.micro_actions import Compress, Diag
+from graphax.sparse.micro_actions import COMPRESS_KINDS, Compress, Diag
 from jax_memory_monitor import ResourceMonitor
 
 import math as _math
@@ -29,7 +29,13 @@ import math as _math
 _TOKEN_VOCAB, _, _ = _graphax_get_vocab()
 
 MAX_TOKENS = 4096
-MAX_RULES_PER_VERTEX = 4
+# Upper bound on rule_specs rows per vertex. In dynamic-substeps mode this
+# also bounds the number of typed micro-actions per vertex that survive
+# :func:`micro_actions_to_rule_specs_jax` — set it to the same scale as
+# the policy's ``max_substeps`` (≈ 2 × MAX_AXES_PER_VERTEX) so the
+# translator doesn't silently truncate DIAG / COMPRESS rows the policy
+# emitted. Memory cost is O(total_v × MAX_RULES_PER_VERTEX × 3) int32.
+MAX_RULES_PER_VERTEX = 16
 NUM_AXIS_PAIRS = 4
 
 # Per-vertex axis-state observation surface. The policy's dynamic action
@@ -376,6 +382,7 @@ def micro_actions_to_rule_specs(
     factors,
     *,
     axis_state_for_vertex,
+    compress_kinds=None,
 ):
     """Translate a sub-episode's typed micro-actions into legacy rule_specs.
 
@@ -397,7 +404,8 @@ def micro_actions_to_rule_specs(
     Returns:
         rule_specs: ``(MAX_RULES_PER_VERTEX, 3)`` int32 — same layout
         the env consumes. DIAG rows are ``[bi1, bi2, factor]``;
-        COMPRESS rows are ``[COMPRESS_SENTINEL, physical_axis, 0]``.
+        COMPRESS rows are ``[COMPRESS_SENTINEL, physical_axis, kind_idx]``
+        where ``kind_idx`` indexes :data:`COMPRESS_KINDS`.
         Slots past the first ``OP_END`` (or past ``MAX_RULES_PER_VERTEX``,
         whichever comes first) are filled with the unused sentinel
         ``[-1, -1, 0]``.
@@ -411,6 +419,10 @@ def micro_actions_to_rule_specs(
     i_arr = np.asarray(i_indices)
     j_arr = np.asarray(j_indices)
     f_arr = np.asarray(factors)
+    if compress_kinds is None:
+        k_arr = np.zeros_like(op_types_arr)
+    else:
+        k_arr = np.asarray(compress_kinds)
     axis_state_np = np.asarray(axis_state_for_vertex)
 
     n_out = int(np.sum(axis_state_np[:, _AXIS_FEAT_IS_OUTPUT]))
@@ -431,10 +443,10 @@ def micro_actions_to_rule_specs(
         if op == OP_END:
             break
         if op == OP_COMPRESS:
-            # COMPRESS encodes a single axis to mean-compress. The env stores
-            # it as `(COMPRESS_SENTINEL, physical_axis, 0)` in the sparsity
-            # specs row; `_callback` recognises the sentinel and emits
-            # `graphax.sparse.micro_actions.Compress(axes=(physical_axis,))`.
+            # COMPRESS encodes a single axis to reduce. The env stores it
+            # as `(COMPRESS_SENTINEL, physical_axis, kind_idx)` in the
+            # sparsity specs row; `_callback` recognises the sentinel and
+            # emits `Compress(axes=(physical_axis,), kind=COMPRESS_KINDS[kind_idx])`.
             # The axis-token index equals the physical position because
             # tokens are arranged as (outs..., primals...) matching the
             # SparseTensor edge layout.
@@ -443,7 +455,7 @@ def micro_actions_to_rule_specs(
             physical_axis = int(i_arr[s_idx])
             specs[slot, 0] = COMPRESS_SENTINEL
             specs[slot, 1] = physical_axis
-            specs[slot, 2] = 0
+            specs[slot, 2] = int(k_arr[s_idx])
             slot += 1
             continue
         if op != OP_DIAG:
@@ -484,6 +496,7 @@ def micro_actions_to_rule_specs_jax(
     j_indices,
     factors,
     axis_state_for_vertex,
+    compress_kinds=None,
 ):
     """JAX-traceable MicroAction → rule_specs (DIAG and COMPRESS).
 
@@ -498,10 +511,12 @@ def micro_actions_to_rule_specs_jax(
     * Each DIAG sub-step's `(i, j, factor)` becomes one rule_specs row
       `[bi1, bi2, factor]` where bi1/bi2 are out-side / primal-side
       relative positions.
-    * Each COMPRESS sub-step writes a `[COMPRESS_SENTINEL, axis, 0]` row
-      where ``axis`` is the policy's i-index (which equals the physical
-      axis position in the SparseTensor edge). The env's `_callback`
-      recognises the sentinel and emits a graphax `Compress(axes=(axis,))`.
+    * Each COMPRESS sub-step writes a `[COMPRESS_SENTINEL, axis, kind_idx]`
+      row where ``axis`` is the policy's i-index (which equals the
+      physical axis position in the SparseTensor edge) and ``kind_idx``
+      indexes :data:`graphax.sparse.micro_actions.COMPRESS_KINDS`. The
+      env's `_callback` recognises the sentinel and emits a graphax
+      `Compress(axes=(axis,), kind=COMPRESS_KINDS[kind_idx])`.
     * `op_type == OP_END` and every sub-step after the first END are
       marked unused.
     * The output is truncated to ``MAX_RULES_PER_VERTEX`` rows; trailing
@@ -530,6 +545,9 @@ def micro_actions_to_rule_specs_jax(
 
     is_output = axis_state_for_vertex[:, _AXIS_FEAT_IS_OUTPUT].astype(jnp.int32)
     n_out = jnp.sum(is_output)
+
+    if compress_kinds is None:
+        compress_kinds = jnp.zeros_like(op_types)
 
     is_end_per = (op_types == OP_END)
     prior_ends = (
@@ -568,7 +586,9 @@ def micro_actions_to_rule_specs_jax(
 
         # Compose the row. Priority: COMPRESS over DIAG over unused
         # (these branches are mutually exclusive because is_compress and
-        # is_diag look at the same op_type slot).
+        # is_diag look at the same op_type slot). For DIAG the third
+        # column carries the integer factor; for COMPRESS it carries the
+        # `compress_kind` index into :data:`COMPRESS_KINDS`.
         bi1 = jnp.where(
             compress_used, compress_bi1,
             jnp.where(diag_used, diag_bi1, -1),
@@ -577,7 +597,10 @@ def micro_actions_to_rule_specs_jax(
             compress_used, compress_bi2,
             jnp.where(diag_used, diag_bi2, -1),
         ).astype(jnp.int32)
-        f = jnp.where(diag_used, factors[s_idx], 0).astype(jnp.int32)
+        f = jnp.where(
+            compress_used, compress_kinds[s_idx],
+            jnp.where(diag_used, factors[s_idx], 0),
+        ).astype(jnp.int32)
         return jnp.stack([bi1, bi2, f])
 
     rows = jax.vmap(_row)(jnp.arange(op_types.shape[0]))
@@ -739,10 +762,12 @@ def _callback(
                 # COMPRESS slot: row[1] is the *physical* axis index in the
                 # SparseTensor edge (same layout as Diag's idx: out axes 0..
                 # out_len-1, primal axes out_len..out_len+primal_dims-1).
-                # Skip the slot if the axis index doesn't fit every invar's
-                # edge — graphax's apply_compress will validate too, but
-                # raising would crash the io_callback.
+                # row[2] is the kind index into COMPRESS_KINDS. Skip the
+                # slot if the axis index doesn't fit every invar's edge —
+                # graphax's apply_compress will validate too, but raising
+                # would crash the io_callback.
                 axis_idx = bi2
+                kind_idx = factor  # row[2] reused as kind index for COMPRESS
                 fits_all = True
                 if axis_idx < 0:
                     fits_all = False
@@ -755,8 +780,15 @@ def _callback(
                     continue
                 if axis_idx in used_axes:
                     continue
+                if not (0 <= kind_idx < len(COMPRESS_KINDS)):
+                    # Unknown kind — fall back to the default "mean" rather
+                    # than dropping the row, since the axis-removal effect is
+                    # the dominant signal.
+                    kind_idx = 0
                 used_axes.add(axis_idx)
-                rules.append(Compress(axes=(axis_idx,)))
+                rules.append(
+                    Compress(axes=(axis_idx,), kind=COMPRESS_KINDS[kind_idx])
+                )
                 continue
             if bi1 < 0:
                 # Any other negative bi1 is reserved for future sentinels;

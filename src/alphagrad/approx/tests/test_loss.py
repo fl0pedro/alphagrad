@@ -104,11 +104,13 @@ def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, nu
     max_axes_per_vertex = 8
     num_ops = 3
     max_exponent = 30
+    num_compress_kinds = 6
     micro_op_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
     micro_i_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
     micro_j_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
     micro_exp_seq = jnp.zeros((batch_size, max_substeps, max_primes), dtype=jnp.int32)
     micro_factor_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
+    micro_compress_kind_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
     micro_op_dists = jnp.zeros((batch_size, max_substeps, num_ops), dtype=jnp.float32)
     micro_i_dists = jnp.zeros(
         (batch_size, max_substeps, max_axes_per_vertex), dtype=jnp.float32,
@@ -119,6 +121,9 @@ def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, nu
     micro_exp_dists = jnp.zeros(
         (batch_size, max_substeps, max_primes, max_exponent + 1),
         dtype=jnp.float32,
+    )
+    micro_kind_dists = jnp.zeros(
+        (batch_size, max_substeps, num_compress_kinds), dtype=jnp.float32,
     )
     return TrainBatch(
         tokens=tokens,
@@ -133,6 +138,7 @@ def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, nu
         micro_j_seq=micro_j_seq,
         micro_exp_seq=micro_exp_seq,
         micro_factor_seq=micro_factor_seq,
+        micro_compress_kind_seq=micro_compress_kind_seq,
         old_vertex_dist=old_v,
         old_pair_dists=old_p,
         old_factor_dists=old_f,
@@ -140,6 +146,7 @@ def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, nu
         old_micro_i_dists=micro_i_dists,
         old_micro_j_dists=micro_j_dists,
         old_micro_exp_dists=micro_exp_dists,
+        old_micro_kind_dists=micro_kind_dists,
         estim_returns=estim_returns,
         norm_adv=norm_adv,
         vertex_avail_mask=vertex_avail,
