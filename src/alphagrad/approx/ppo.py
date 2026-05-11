@@ -3748,6 +3748,13 @@ def main():
                 jnp.array(0.0, dtype=jnp.float32),
                 jnp.array(0.0, dtype=jnp.float32),
             ]),
+            # Per-component entropies — legacy path doesn't currently
+            # surface vertex/pair/factor entropies separately (the
+            # evaluate_action return is summed), so all 5 slots are 0.
+            # Wiring legacy per-component entropies would require an
+            # extra return tuple from evaluate_action; deferring until
+            # there's a concrete user for it.
+            jnp.zeros((5,), dtype=jnp.float32),
         )
 
     def _dynamic_loss_fn(agent, batch: TrainBatch, vertex_features, key):
@@ -3926,6 +3933,36 @@ def main():
         # design spec).
         _kl_components = (kl_vertex, kl_op, kl_i, kl_j, kl_exp)
 
+        # Per-component entropy under the current policy, using the same
+        # active-substep / DIAG gating as the KL split. Pairs with the
+        # per-component KL for diagnosing which head is collapsing vs which
+        # is exploring. The trailing component axes (NUM_OPS / MAX_AXES /
+        # MAX_PRIMES × MAX_EXPONENT+1) are collapsed via the standard
+        # -sum(p log p) entropy.
+        def _step_entropy(d):
+            return -jnp.sum(d * jnp.log(d + 1e-8), axis=-1)
+
+        op_ent_per = _step_entropy(new_op_dists)                # (B, S)
+        i_ent_per = _step_entropy(new_i_dists)
+        j_ent_per = _step_entropy(new_j_dists)
+        # exp_dists: (B, S, MAX_PRIMES, MAX_EXPONENT+1) — entropy over the
+        # exponent axis, then sum over the (padded) prime axis.
+        exp_ent_per = jnp.sum(_step_entropy(new_exp_dists), axis=-1)  # (B, S)
+
+        ent_vertex = jnp.mean(_step_entropy(new_vertex_dist))
+        ent_op = jnp.mean(jnp.sum(op_ent_per * active_steps, axis=-1) / denom)
+        ent_i = jnp.mean(
+            jnp.sum(i_ent_per * active_steps * is_diag_or_compress, axis=-1)
+            / denom
+        )
+        ent_j = jnp.mean(
+            jnp.sum(j_ent_per * active_steps * is_diag_step, axis=-1) / denom
+        )
+        ent_exp = jnp.mean(
+            jnp.sum(exp_ent_per * active_steps * is_diag_step, axis=-1) / denom
+        )
+        _entropy_components = (ent_vertex, ent_op, ent_i, ent_j, ent_exp)
+
         total_loss = (
             ppo_loss
             + args.value_weight * value_loss
@@ -3945,6 +3982,10 @@ def main():
             # returns the same 5-slot suffix with zeros so the metrics
             # tuple shape is uniform across modes (lax.scan needs that).
             jnp.stack(_kl_components),
+            # Per-component entropies (same 5-slot layout); legacy returns
+            # zeros for the dynamic-only slots and the vertex entropy in
+            # slot 0 if available.
+            jnp.stack(_entropy_components),
         )
 
     def train_episode(
@@ -4190,10 +4231,10 @@ def main():
         mean_r = np.atleast_1d(np.array(mean_r))
 
         host_state["samplecounts"] += num_envs * num_valid
-        # mets is a 10-tuple: the last entry is a (5,) per-component KL
-        # array (vertex / op / i / j / exp in dynamic mode; vertex / pair /
-        # factor / 0 / 0 in legacy mode). Unpack scalars separately and
-        # cast the array to a numpy view for per-component logging.
+        # mets is an 11-tuple: 9 scalars + two (5,) per-component arrays.
+        # Slot 9 is per-component KL (vertex/op/i/j/exp in dynamic mode;
+        # vertex/pair/factor/0/0 in legacy). Slot 10 is per-component
+        # entropy (same slot layout; legacy = all zeros today).
         kl_div = float(mets[0])
         policy_entropy = float(mets[1])
         _fit_quality = float(mets[2])
@@ -4204,6 +4245,7 @@ def main():
         total_loss = float(mets[7])
         _clipping_trigger_ratio = float(mets[8])
         kl_components = np.asarray(mets[9])
+        entropy_components = np.asarray(mets[10])
 
         weights = reward_weights_np
         for i in range(all_rets.shape[0]):
@@ -4257,11 +4299,11 @@ def main():
             "value loss": value_loss,
             "total loss": total_loss,
         }
-        # Per-component KL: slot semantics depend on the trainer mode.
-        # In dynamic mode the components are vertex / op / i / j / exp
-        # (the heads.py policy components); in legacy mode they are
-        # vertex / pair / factor / 0 / 0. Logging both naming conventions
-        # so dashboards can pick whichever applies.
+        # Per-component KL and entropy: slot semantics depend on the
+        # trainer mode. In dynamic mode the components are vertex / op /
+        # i / j / exp; in legacy mode they are vertex / pair / factor /
+        # 0 / 0 (and entropy is currently all zeros in legacy — wiring it
+        # would need an extra return-tuple from evaluate_action).
         if kl_components.shape[0] >= 5:
             if args.dynamic_substeps:
                 names = ("vertex", "op", "i", "j", "exp")
@@ -4269,6 +4311,7 @@ def main():
                 names = ("vertex", "pair", "factor", "_unused1", "_unused2")
             for j, nm in enumerate(names):
                 log_dict[f"kl/{nm}"] = float(kl_components[j])
+                log_dict[f"ent/{nm}"] = float(entropy_components[j])
         for j, name in enumerate(REWARD_NAMES):
             log_dict[f"mean_{name}"] = float(mean_r[j]) if j < len(mean_r) else 0.0
 
