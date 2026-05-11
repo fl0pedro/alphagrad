@@ -63,6 +63,7 @@ import jax.lax as lax
 import jax.nn as jnn
 import jax.numpy as jnp
 import jax.random as jrand
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +89,11 @@ MAX_EXPONENT = 30
 # Layout: (is_logical, is_compressed, in_diag_group). group_id is encoded as
 # a small embedding via :class:`AxisSetEncoder.group_embedding`.
 AXIS_TAG_BITS = 3
+# Indices into the tag_bits array — keep these in sync with the layout above
+# and the env-side _AXIS_FEAT_* constants.
+TAG_IS_LOGICAL = 0
+TAG_IS_COMPRESSED = 1
+TAG_IN_DIAG_GROUP = 2
 
 
 class AxisTokenFeatures(NamedTuple):
@@ -201,7 +207,7 @@ class AxisSetEncoder(eqx.Module):
         attn = jnn.softmax(scores, axis=-1)
         pooled = jnp.sum(attn[:, None] * x, axis=0)
 
-        return self.output_proj(x), self.output_proj(pooled)
+        return jax.vmap(self.output_proj)(x), self.output_proj(pooled)
 
 
 class _SelfAttentionBlock(eqx.Module):
@@ -531,6 +537,166 @@ class PrimeExponentHead(eqx.Module):
 
 
 # ---------------------------------------------------------------------------
+# Prime-factor lookup tables (env-static; gathered inside the policy scan)
+# ---------------------------------------------------------------------------
+
+
+class FactorTables(NamedTuple):
+    """Static prime-factorization lookup tables consumed by the scan.
+
+    Indexed by integer in ``[0, max_axis_size]`` (and ``[0, max_axis_size]
+    × [0, max_axis_size]`` for the gcd table). Built once at env-init time
+    from :func:`precompute_factor_tables` and passed into
+    :class:`MicroActionPolicy` at every call; gathered inside the scan
+    once we know which axes were picked.
+    """
+
+    gcd: jax.Array            # (S, S) int32; S = max_axis_size + 1
+    primes: jax.Array         # (S, MAX_PRIMES) int32; padded with 0
+    max_exps: jax.Array       # (S, MAX_PRIMES) int32; padded with 0
+    prime_mask: jax.Array     # (S, MAX_PRIMES) float32; 1 for real, 0 for pad
+
+
+def precompute_factor_tables(max_axis_size: int) -> FactorTables:
+    """Build the static factor / gcd lookup tables.
+
+    For an env whose axis sizes are bounded by ``max_axis_size`` (the max
+    over the jaxpr's logical dim sizes), this returns the tables that
+    let :class:`PrimeExponentHead` operate inside a JAX scan without
+    trial-dividing integers at trace time.
+
+    The tables are dense: ``(max_axis_size + 1)`` rows for the
+    prime/exp tables, and ``(max_axis_size + 1)²`` entries for the gcd
+    table. For ``max_axis_size = 1024`` that's ~1M int32 entries = 4 MiB
+    in the gcd table; for typical jaxpr sizes (≤ 256) it's < 256 KiB.
+
+    Index 0 represents "no axis" (the policy never samples it, but the
+    table needs the row to keep static shape). ``gcd[0, *] = gcd[*, 0]
+    = 0``; ``primes[0] = 0``; ``prime_mask[0] = 0``.
+    """
+    S = int(max_axis_size) + 1
+    gcd = np.zeros((S, S), dtype=np.int32)
+    primes = np.zeros((S, MAX_PRIMES), dtype=np.int32)
+    exps = np.zeros((S, MAX_PRIMES), dtype=np.int32)
+    prime_mask = np.zeros((S, MAX_PRIMES), dtype=np.float32)
+
+    for n in range(1, S):
+        factors = factorize(n, MAX_PRIMES)
+        for k, (p, e) in enumerate(factors):
+            primes[n, k] = p
+            exps[n, k] = e
+            prime_mask[n, k] = 1.0
+
+    for i in range(S):
+        for j in range(S):
+            gcd[i, j] = math.gcd(i, j)
+
+    return FactorTables(
+        gcd=jnp.asarray(gcd),
+        primes=jnp.asarray(primes),
+        max_exps=jnp.asarray(exps),
+        prime_mask=jnp.asarray(prime_mask),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axis-state update helpers (used by MicroActionPolicy's scan carry)
+# ---------------------------------------------------------------------------
+
+
+def _features_after_diag(
+    features: AxisTokenFeatures,
+    i: jax.Array, j: jax.Array, factor: jax.Array, group_id: jax.Array,
+) -> AxisTokenFeatures:
+    """Mutate ``features`` to reflect a DIAG(i, j, factor) micro-action.
+
+    Both axes ``i`` and ``j`` are tagged ``in_diag_group``, assigned the
+    same ``group_id``, and have their size set to ``factor`` (the
+    post-block-diagonalisation per-block index size). The block axes are
+    not separately tracked in the policy's view — the structural
+    consequence the policy cares about is "these two axes are paired and
+    now have size ``factor``".
+    """
+    new_size = features.size.at[i].set(factor).at[j].set(factor)
+    log_f = jnp.log(jnp.maximum(factor.astype(jnp.float32), 1.0))
+    new_log_size = features.log_size.at[i].set(log_f).at[j].set(log_f)
+    new_tag = features.tag_bits.at[i, TAG_IN_DIAG_GROUP].set(1.0).at[
+        j, TAG_IN_DIAG_GROUP
+    ].set(1.0)
+    new_gid = features.group_id.at[i].set(group_id).at[j].set(group_id)
+    return AxisTokenFeatures(
+        size=new_size,
+        log_size=new_log_size,
+        tag_bits=new_tag,
+        group_id=new_gid,
+        valid_mask=features.valid_mask,
+    )
+
+
+def _features_after_compress(
+    features: AxisTokenFeatures, i: jax.Array,
+) -> AxisTokenFeatures:
+    """Mutate ``features`` to reflect a COMPRESS(i) micro-action.
+
+    Axis ``i`` is tagged ``is_compressed`` and removed from the active
+    set via ``valid_mask[i] = 0`` (size collapses to 1, log_size to 0).
+    The axis stays at its slot — JAX-static shape — but downstream
+    attention masks zero it out at every layer.
+    """
+    new_tag = features.tag_bits.at[i, TAG_IS_COMPRESSED].set(1.0)
+    new_valid = features.valid_mask.at[i].set(0.0)
+    new_size = features.size.at[i].set(1)
+    new_log_size = features.log_size.at[i].set(0.0)
+    return AxisTokenFeatures(
+        size=new_size,
+        log_size=new_log_size,
+        tag_bits=new_tag,
+        group_id=features.group_id,
+        valid_mask=new_valid,
+    )
+
+
+def _compute_op_legality(features: AxisTokenFeatures) -> jax.Array:
+    """Op-type legality (3,) — DIAG / COMPRESS / END."""
+    is_compressed = features.tag_bits[:, TAG_IS_COMPRESSED] > 0.5
+    in_diag = features.tag_bits[:, TAG_IN_DIAG_GROUP] > 0.5
+    valid = features.valid_mask > 0.5
+
+    diag_eligible = valid & ~is_compressed & ~in_diag
+    compress_eligible = valid & ~is_compressed
+
+    diag_legal = (jnp.sum(diag_eligible.astype(jnp.int32)) >= 2).astype(jnp.float32)
+    compress_legal = (jnp.sum(compress_eligible.astype(jnp.int32)) >= 1).astype(
+        jnp.float32
+    )
+    end_legal = jnp.array(1.0, dtype=jnp.float32)
+    return jnp.stack([diag_legal, compress_legal, end_legal])
+
+
+def _compute_axis_masks(
+    features: AxisTokenFeatures,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Per-step axis legality: ``(i_mask_diag, i_mask_compress, j_mask_for_i_diag)``.
+
+    ``j_mask_for_i_diag[i]`` is the legal ``j`` set when DIAG is chosen
+    with that particular ``i``; it's ``i_mask_diag`` with the ``i``-th
+    slot zeroed so the bipartite ``i != j`` constraint is enforced.
+    """
+    is_compressed = features.tag_bits[:, TAG_IS_COMPRESSED] > 0.5
+    in_diag = features.tag_bits[:, TAG_IN_DIAG_GROUP] > 0.5
+    valid = features.valid_mask > 0.5
+
+    diag_eligible = (valid & ~is_compressed & ~in_diag).astype(jnp.float32)
+    compress_eligible = (valid & ~is_compressed).astype(jnp.float32)
+
+    N = diag_eligible.shape[0]
+    eye = jnp.eye(N, dtype=jnp.float32)
+    j_mask_for_i = diag_eligible[None, :] * (1.0 - eye)
+
+    return diag_eligible, compress_eligible, j_mask_for_i
+
+
+# ---------------------------------------------------------------------------
 # Composed micro-action head (one sub-step)
 # ---------------------------------------------------------------------------
 
@@ -601,38 +767,58 @@ class MicroActionHead(eqx.Module):
         self,
         summary: jax.Array,             # (E,) pooled axis-set summary
         axis_tokens: jax.Array,         # (N, E) per-axis embeddings
+        axis_sizes: jax.Array,          # (N,) int32 — current logical sizes
         op_legality_mask: jax.Array,    # (NUM_OPS,)
-        i_mask: jax.Array,              # (N,) — valid axes for `i`
-        j_mask_for_i: jax.Array,        # (N, N) — valid `j` axes given `i`
-        primes: jax.Array,              # (MAX_PRIMES,) for the chosen (i, j)
-        max_exps: jax.Array,            # (MAX_PRIMES,)
-        prime_mask: jax.Array,          # (MAX_PRIMES,)
-        N_i: jax.Array, N_j: jax.Array, g: jax.Array,
+        i_mask_diag: jax.Array,         # (N,) — valid `i` for DIAG
+        i_mask_compress: jax.Array,     # (N,) — valid `i` for COMPRESS
+        j_mask_for_i_diag: jax.Array,   # (N, N) — valid `j` given `i`, DIAG only
+        tables: FactorTables,           # precomputed gcd / prime tables
         key,
-    ) -> tuple[MicroAction, jax.Array, jax.Array, jax.Array, jax.Array]:
-        """Sample one micro-action. Returns ``(action, op_dist, i_dist, j_dist, exp_dists)``.
+    ) -> tuple[MicroAction, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Sample one micro-action.
 
-        The caller is responsible for re-running the axis encoder after
-        applying ``action`` and updating the axis-state features. The
-        prime / max_exp / mask / N_i / N_j / g arrays are pre-computed
-        host-side from the current axis state.
+        Returns ``(action, factor, op_dist, i_dist, j_dist, exp_dists)``.
+        The factor is the *integer* derived from the sampled prime
+        exponents — used by the surrounding scan to update axis sizes
+        for the next sub-step.
+
+        The op-conditional ``i_mask`` selection happens inside this
+        method: ``op_type`` is sampled first, then ``jnp.where`` picks
+        between ``i_mask_diag`` and ``i_mask_compress``. END falls back
+        to ``i_mask_diag`` (the sampled ``i`` is masked out downstream
+        anyway).
         """
         k_op, k_i, k_j, k_f = jrand.split(key, 4)
 
         op_dist = self.op_head(summary, op_legality_mask)
         op_type = distrax.Categorical(probs=op_dist).sample(seed=k_op)
 
+        is_diag = op_type == OP_DIAG
+        is_compress = op_type == OP_COMPRESS
+
+        # Op-conditional `i` mask. For END, falls back to the diag mask
+        # (the resulting `i` is masked out via `i_active` downstream).
+        i_mask = jnp.where(is_diag, i_mask_diag, i_mask_compress)
         i_dist = self.axis_i_head(summary, axis_tokens, i_mask)
         i_idx = distrax.Categorical(probs=i_dist).sample(seed=k_i)
 
-        # `j` legality depends on which `i` was chosen. ``j_mask_for_i`` is
-        # the precomputed per-i row.
-        j_mask = j_mask_for_i[i_idx]
-        # Use the chosen-axis embedding as additional context for the j head
-        # so the pointer can pick a complementary axis.
+        # `j` is sampled even for non-DIAG ops (its log-prob is masked
+        # out in log_prob_step); using the DIAG j-mask keeps the
+        # categorical well-defined.
+        j_mask = j_mask_for_i_diag[i_idx]
         j_context = summary + axis_tokens[i_idx]
         j_dist = self.axis_j_head(j_context, axis_tokens, j_mask)
         j_idx = distrax.Categorical(probs=j_dist).sample(seed=k_j)
+
+        # Per-pair prime-table gather. `axis_sizes` carries the current
+        # logical sizes; `tables.gcd[N_i, N_j]` resolves the gcd at trace
+        # time without a JAX-side trial division.
+        N_i = axis_sizes[i_idx]
+        N_j = axis_sizes[j_idx]
+        g = tables.gcd[N_i, N_j]
+        primes = tables.primes[g]
+        max_exps = tables.max_exps[g]
+        prime_mask = tables.prime_mask[g]
 
         exponents, exp_dists = self.factor_head.sample(
             init_hidden=summary,
@@ -640,11 +826,16 @@ class MicroActionHead(eqx.Module):
             N_i=N_i, N_j=N_j, g=g, key=k_f,
         )
 
-        # Force i/j/exponents to 0 for non-DIAG ops so the recorded action
-        # is unambiguous. The masking in `log_prob_step` mirrors this.
-        is_diag = op_type == OP_DIAG
-        is_compress = op_type == OP_COMPRESS
+        # Derive integer factor from sampled exponents. ``primes ** 0 == 1``
+        # for the padded entries, so the product is just ``∏ p_k^c_k`` over
+        # the real primes.
+        factor = jnp.prod(
+            primes.astype(jnp.int32) ** exponents.astype(jnp.int32),
+        ).astype(jnp.int32)
 
+        # Force i/j/exponents to canonical values for non-emitting ops so
+        # the recorded action is unambiguous. The masking in
+        # `log_prob_step` mirrors this.
         i_out = jnp.where(is_diag | is_compress, i_idx, 0).astype(jnp.int32)
         j_out = jnp.where(is_diag, j_idx, 0).astype(jnp.int32)
         exp_out = jnp.where(is_diag, exponents, jnp.zeros_like(exponents))
@@ -653,22 +844,28 @@ class MicroActionHead(eqx.Module):
             op_type=op_type.astype(jnp.int32),
             i=i_out, j=j_out, exponents=exp_out,
         )
-        return action, op_dist, i_dist, j_dist, exp_dists
+        return action, factor, op_dist, i_dist, j_dist, exp_dists
 
     def log_prob_step(
         self,
         action: MicroAction,
         summary: jax.Array,
         axis_tokens: jax.Array,
+        axis_sizes: jax.Array,
         op_legality_mask: jax.Array,
-        i_mask: jax.Array,
-        j_mask_for_i: jax.Array,
-        primes: jax.Array,
-        max_exps: jax.Array,
-        prime_mask: jax.Array,
-        N_i: jax.Array, N_j: jax.Array, g: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
-        """Joint log-prob + entropy for one sub-step (variable-arity gated by op_type)."""
+        i_mask_diag: jax.Array,
+        i_mask_compress: jax.Array,
+        j_mask_for_i_diag: jax.Array,
+        tables: FactorTables,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Joint log-prob + entropy + arity for one sub-step.
+
+        Same per-op masking semantics as :meth:`sample_step`. The arity
+        is the number of categoricals actually emitted (1 for END, 2 for
+        COMPRESS, and ``2 + MAX_PRIMES`` for DIAG — the prime sub-loop
+        contributes one categorical per real prime, masked to ``MAX_PRIMES``
+        for static shape but only the active ones contribute to entropy).
+        """
         op_dist = self.op_head(summary, op_legality_mask)
         log_p_op = jnp.log(op_dist[action.op_type] + 1e-8)
         ent_op = -jnp.sum(op_dist * jnp.log(op_dist + 1e-8))
@@ -676,21 +873,31 @@ class MicroActionHead(eqx.Module):
         is_diag = action.op_type == OP_DIAG
         is_compress = action.op_type == OP_COMPRESS
 
-        # i: emitted for DIAG and COMPRESS.
+        # i: emitted for DIAG and COMPRESS under the op-conditional mask.
+        i_mask = jnp.where(is_diag, i_mask_diag, i_mask_compress)
         i_dist = self.axis_i_head(summary, axis_tokens, i_mask)
         log_p_i = jnp.log(i_dist[action.i] + 1e-8)
         ent_i = -jnp.sum(i_dist * jnp.log(i_dist + 1e-8))
         i_active = (is_diag | is_compress).astype(jnp.float32)
 
         # j: emitted only for DIAG.
-        j_mask = j_mask_for_i[action.i]
+        j_mask = j_mask_for_i_diag[action.i]
         j_context = summary + axis_tokens[action.i]
         j_dist = self.axis_j_head(j_context, axis_tokens, j_mask)
         log_p_j = jnp.log(j_dist[action.j] + 1e-8)
         ent_j = -jnp.sum(j_dist * jnp.log(j_dist + 1e-8))
         j_active = is_diag.astype(jnp.float32)
 
-        # Prime exponents: emitted only for DIAG.
+        # Prime exponents: emitted only for DIAG. Tables gathered at the
+        # stored (i, j); for non-DIAG actions the gather still runs but
+        # the resulting log-prob / entropy are masked out.
+        N_i = axis_sizes[action.i]
+        N_j = axis_sizes[action.j]
+        g = tables.gcd[N_i, N_j]
+        primes = tables.primes[g]
+        max_exps = tables.max_exps[g]
+        prime_mask = tables.prime_mask[g]
+
         log_p_f, ent_f, _ = self.factor_head.evaluate(
             init_hidden=summary,
             primes=primes, max_exps=max_exps, prime_mask=prime_mask,
@@ -699,14 +906,18 @@ class MicroActionHead(eqx.Module):
         )
         f_active = is_diag.astype(jnp.float32)
 
-        log_p = log_p_op + log_p_i * i_active + log_p_j * j_active + log_p_f * f_active
+        log_p = (
+            log_p_op + log_p_i * i_active + log_p_j * j_active + log_p_f * f_active
+        )
         entropy = ent_op + ent_i * i_active + ent_j * j_active + ent_f * f_active
 
-        # Sub-step "arity" = number of component categoricals actually emitted.
-        # Used by the surrounding PPO loss to normalize the entropy bonus by
-        # expected sub-episode length (mirroring the existing pair_active /
-        # factor_active masking in AutoregRulePolicy.evaluate).
-        arity = 1.0 + i_active + j_active + f_active
+        # Arity counts the *components* actually emitted: 1 (op_type) + i +
+        # j + the prime sub-loop. The prime sub-loop's contribution scales
+        # with the number of real primes in g; we use ``prime_mask.sum()``
+        # so DIAG sub-steps with more primes count for more (matching the
+        # entropy term that already weights by prime_mask).
+        prime_arity = jnp.sum(prime_mask) * f_active
+        arity = 1.0 + i_active + j_active + prime_arity
         return log_p, entropy, arity
 
 
@@ -736,24 +947,13 @@ class MicroActionPolicy(eqx.Module):
     The axis state stops mutating after END (the update functions all
     no-op when ``ended == True``), so the scan stays shape-static.
 
-    Open dependency (host-side preprocessing required)
-    --------------------------------------------------
-    Prime factorisations of the (per-pair) ``gcd(N_i, N_j)`` are needed
-    by :class:`PrimeExponentHead`. Trial division inside a JAX scan is
-    awkward; the practical answer is either:
-
-    * A static lookup table built at env-init time, gathered inside the
-      scan from ``axis_features.size[i]`` and ``axis_features.size[j]``.
-      Works when axis sizes are bounded (which they are for any
-      concrete jaxpr) — table size ``O(MAX_AXIS_SIZE)``.
-    * A host-side ``io_callback`` per scan iteration. Slower but no
-      bound on axis sizes.
-
-    Neither is implemented in this module — the scan currently expects
-    the caller to provide pre-computed ``(primes, max_exps, prime_mask,
-    g)`` arrays keyed by sub-step index. The env-side change that wires
-    :class:`MicroActionPolicy` into ``Agent.sample_action`` will own
-    this preprocessing.
+    Prime tables
+    ------------
+    The :class:`PrimeExponentHead` is gathered from the
+    :class:`FactorTables` precomputed via :func:`precompute_factor_tables`
+    at env init. The gather is over the *current* ``(N_i, N_j)`` axis
+    sizes inside the scan, so post-DIAG size changes feed through
+    naturally to the next sub-step's factor head.
     """
 
     encoder: AxisSetEncoder
@@ -775,33 +975,226 @@ class MicroActionPolicy(eqx.Module):
         )
         self.head = MicroActionHead(embd_dim, key=keys[1])
 
-    # The actual scan body needs (a) the axis-feature update function and
-    # (b) the per-pair prime tables. Both depend on env-side choices we
-    # haven't pinned down (lookup table size, how compressed-axis
-    # sizes propagate, etc.). The skeleton below documents the expected
-    # control flow; the env-side wiring will fill in the gaps.
+    def _step_sample(
+        self,
+        carry,
+        step_input,
+        *,
+        vertex_context: jax.Array,
+        tables: FactorTables,
+    ):
+        features, ended, next_gid = carry
+        key = step_input
 
-    def sample(self, *args, **kwargs):  # pragma: no cover — scaffold only
-        raise NotImplementedError(
-            "MicroActionPolicy.sample is scaffolded but not wired. "
-            "Implementation needs: (1) prime-factor lookup or io_callback "
-            "for per-pair gcd factorisation, (2) axis-feature update "
-            "function consistent with graphax.sparse.micro_actions semantics, "
-            "(3) per-step legality mask computation. See module docstring."
+        axis_tokens, summary = self.encoder(features, vertex_context)
+        op_legal = _compute_op_legality(features)
+        # Force END once the sub-episode has ended (sticky termination).
+        op_legal = jnp.where(
+            ended,
+            jnp.array([0.0, 0.0, 1.0], dtype=op_legal.dtype),
+            op_legal,
+        )
+        i_diag, i_compress, j_diag = _compute_axis_masks(features)
+
+        action, factor, op_d, i_d, j_d, exp_d = self.head.sample_step(
+            summary, axis_tokens, features.size,
+            op_legal, i_diag, i_compress, j_diag,
+            tables, key,
         )
 
-    def evaluate(self, *args, **kwargs):  # pragma: no cover — scaffold only
-        raise NotImplementedError(
-            "MicroActionPolicy.evaluate is scaffolded but not wired. "
-            "Same dependencies as sample; needs to mirror the scan with "
-            "fixed actions and return summed log-prob / entropy / arity."
+        log_p, ent, arity = self.head.log_prob_step(
+            action, summary, axis_tokens, features.size,
+            op_legal, i_diag, i_compress, j_diag, tables,
         )
+        # Past-END contributions are zeroed so the joint log-prob /
+        # entropy / arity reflect only the real sub-episode prefix.
+        active = (1.0 - ended.astype(jnp.float32))
+        log_p = log_p * active
+        ent = ent * active
+        arity = arity * active
+
+        # Apply the action to the axis features — DIAG and COMPRESS get
+        # the right update; END / past-END leave features untouched.
+        is_diag = (action.op_type == OP_DIAG) & ~ended
+        is_compress = (action.op_type == OP_COMPRESS) & ~ended
+
+        diag_features = _features_after_diag(
+            features, action.i, action.j, factor, next_gid,
+        )
+        compress_features = _features_after_compress(features, action.i)
+
+        def _select(name):
+            base = getattr(features, name)
+            d = getattr(diag_features, name)
+            c = getattr(compress_features, name)
+            chosen_d = jnp.where(is_diag, d, base)
+            return jnp.where(is_compress, c, chosen_d)
+
+        new_features = AxisTokenFeatures(
+            size=_select("size"),
+            log_size=_select("log_size"),
+            tag_bits=_select("tag_bits"),
+            group_id=_select("group_id"),
+            valid_mask=_select("valid_mask"),
+        )
+
+        new_gid = jnp.where(is_diag, next_gid + 1, next_gid)
+        new_ended = ended | (action.op_type == OP_END)
+
+        return (
+            (new_features, new_ended, new_gid),
+            (action, log_p, ent, arity, op_d, i_d, j_d, exp_d),
+        )
+
+    def sample(
+        self,
+        vertex_context: jax.Array,
+        init_features: AxisTokenFeatures,
+        tables: FactorTables,
+        key,
+    ):
+        """Run the sub-episode autoregressively.
+
+        Returns the per-step :class:`MicroAction` sequence (padded to
+        ``max_substeps``) plus the joint log-prob, entropy, and total
+        emitted-component count (used by the PPO loss to normalize the
+        entropy bonus across variable-arity sub-episodes).
+        """
+        keys = jrand.split(key, self.max_substeps)
+        init_carry = (
+            init_features,
+            jnp.array(False, dtype=jnp.bool_),
+            jnp.array(0, dtype=jnp.int32),
+        )
+
+        def step_fn(carry, k):
+            return self._step_sample(
+                carry, k,
+                vertex_context=vertex_context, tables=tables,
+            )
+
+        _, (actions, logps, ents, arities, op_dists, i_dists, j_dists, exp_dists) = (
+            lax.scan(step_fn, init_carry, keys)
+        )
+        return (
+            actions,
+            jnp.sum(logps),
+            jnp.sum(ents),
+            jnp.sum(arities),
+            op_dists,
+            i_dists,
+            j_dists,
+            exp_dists,
+        )
+
+    def _step_evaluate(
+        self,
+        carry,
+        step_input,
+        *,
+        vertex_context: jax.Array,
+        tables: FactorTables,
+    ):
+        features, ended, next_gid = carry
+        action: MicroAction = step_input
+
+        axis_tokens, summary = self.encoder(features, vertex_context)
+        op_legal = _compute_op_legality(features)
+        op_legal = jnp.where(
+            ended,
+            jnp.array([0.0, 0.0, 1.0], dtype=op_legal.dtype),
+            op_legal,
+        )
+        i_diag, i_compress, j_diag = _compute_axis_masks(features)
+
+        log_p, ent, arity = self.head.log_prob_step(
+            action, summary, axis_tokens, features.size,
+            op_legal, i_diag, i_compress, j_diag, tables,
+        )
+        active = (1.0 - ended.astype(jnp.float32))
+        log_p = log_p * active
+        ent = ent * active
+        arity = arity * active
+
+        # Reconstruct factor from stored exponents + table gather so the
+        # axis-state update uses the *same* integer the sampler did.
+        N_i = features.size[action.i]
+        N_j = features.size[action.j]
+        g = tables.gcd[N_i, N_j]
+        primes = tables.primes[g]
+        factor = jnp.prod(
+            primes.astype(jnp.int32) ** action.exponents.astype(jnp.int32),
+        ).astype(jnp.int32)
+
+        is_diag = (action.op_type == OP_DIAG) & ~ended
+        is_compress = (action.op_type == OP_COMPRESS) & ~ended
+
+        diag_features = _features_after_diag(
+            features, action.i, action.j, factor, next_gid,
+        )
+        compress_features = _features_after_compress(features, action.i)
+
+        def _select(name):
+            base = getattr(features, name)
+            d = getattr(diag_features, name)
+            c = getattr(compress_features, name)
+            chosen_d = jnp.where(is_diag, d, base)
+            return jnp.where(is_compress, c, chosen_d)
+
+        new_features = AxisTokenFeatures(
+            size=_select("size"),
+            log_size=_select("log_size"),
+            tag_bits=_select("tag_bits"),
+            group_id=_select("group_id"),
+            valid_mask=_select("valid_mask"),
+        )
+
+        new_gid = jnp.where(is_diag, next_gid + 1, next_gid)
+        new_ended = ended | (action.op_type == OP_END)
+
+        return (
+            (new_features, new_ended, new_gid),
+            (log_p, ent, arity),
+        )
+
+    def evaluate(
+        self,
+        vertex_context: jax.Array,
+        init_features: AxisTokenFeatures,
+        tables: FactorTables,
+        actions: MicroAction,
+    ):
+        """Recompute joint log-prob / entropy / arity for a stored sequence.
+
+        ``actions`` is the per-step :class:`MicroAction` sequence emitted
+        by :meth:`sample` (each field has a leading ``max_substeps`` dim).
+        Returns ``(log_prob, entropy, arity)`` summed across the
+        sub-episode prefix (contributions past END are masked out by the
+        same logic as :meth:`sample`).
+        """
+        init_carry = (
+            init_features,
+            jnp.array(False, dtype=jnp.bool_),
+            jnp.array(0, dtype=jnp.int32),
+        )
+
+        def step_fn(carry, action_step):
+            return self._step_evaluate(
+                carry, action_step,
+                vertex_context=vertex_context, tables=tables,
+            )
+
+        _, (logps, ents, arities) = lax.scan(step_fn, init_carry, actions)
+        return jnp.sum(logps), jnp.sum(ents), jnp.sum(arities)
 
 
 __all__ = [
     "OP_DIAG", "OP_COMPRESS", "OP_END", "NUM_OPS",
-    "MAX_PRIMES", "MAX_EXPONENT", "AXIS_TAG_BITS",
+    "MAX_PRIMES", "MAX_EXPONENT",
+    "AXIS_TAG_BITS", "TAG_IS_LOGICAL", "TAG_IS_COMPRESSED", "TAG_IN_DIAG_GROUP",
     "AxisTokenFeatures",
+    "FactorTables",
+    "precompute_factor_tables",
     "AxisSetEncoder",
     "OpTypeHead",
     "AxisPointerHead",
