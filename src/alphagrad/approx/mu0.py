@@ -657,6 +657,15 @@ def main():
     num_envs = _resolve_num_envs(args.num_envs)
     rollout_length = num_valid
 
+    # See ppo.py for rationale: empty minibatches → NaN losses → silent no-op.
+    if (num_envs * rollout_length) // args.minibatches == 0:
+        raise ValueError(
+            f"--minibatches={args.minibatches} > num_envs * rollout "
+            f"({num_envs} * {rollout_length} = {num_envs * rollout_length}). "
+            "Each minibatch would be empty, so the loss becomes NaN and no "
+            "learning happens. Lower --minibatches or raise --num-envs."
+        )
+
     reward_weights_np = _build_reward_weights(args)
     reward_weights = jnp.asarray(reward_weights_np, dtype=jnp.float32)
 

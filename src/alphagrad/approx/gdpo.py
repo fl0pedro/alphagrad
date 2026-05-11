@@ -426,6 +426,17 @@ def main():
         f"max_rules={max_rules}, factors={factors_py}, "
         f"rollout_length={rollout_length}, MINIBATCHES={args.minibatches}"
     )
+    # See ppo.py for rationale: `shuffle_and_batch` does integer division
+    # (num_envs * rollout_length // minibatches), so when --minibatches >
+    # num_envs * rollout_length each minibatch is empty and every loss
+    # becomes `jnp.mean(<empty>) = NaN` — training is a silent no-op.
+    if (num_envs * rollout_length) // args.minibatches == 0:
+        raise ValueError(
+            f"--minibatches={args.minibatches} > num_envs * rollout "
+            f"({num_envs} * {rollout_length} = {num_envs * rollout_length}). "
+            "Each minibatch would be empty, so the loss becomes NaN and no "
+            "learning happens. Lower --minibatches or raise --num-envs."
+        )
 
     # ---------------- Agent ----------------
     agent_key, init_key, key = jrand.split(key, 3)
