@@ -2426,6 +2426,26 @@ def make_argparser() -> argparse.ArgumentParser:
         help="Dual-ascent step size on the Lagrangian multipliers, applied "
         "once per episode against the mean per-step violation.",
     )
+    # Cosine-similarity band: keep cosine_sim in [lower, upper] via the
+    # Lagrangian. Lower nudges the policy away from collapsing accuracy to
+    # zero; upper prevents it from saturating at perfect agreement and
+    # spending the remaining compute on quality nobody can spend. Set
+    # ``--cosine-lower-bound <= 0`` or ``--cosine-upper-bound >= 1`` to
+    # disable either side.
+    p.add_argument(
+        "--cosine-lower-bound",
+        type=float,
+        default=0.8,
+        help="Floor on cosine_sim enforced via a Lagrangian multiplier. "
+        "Default 0.8. Pass 0.0 to disable.",
+    )
+    p.add_argument(
+        "--cosine-upper-bound",
+        type=float,
+        default=0.9,
+        help="Ceiling on cosine_sim enforced via a Lagrangian multiplier. "
+        "Default 0.9. Pass 1.0 to disable.",
+    )
     p.add_argument(
         "--calibrate-steps",
         type=int,
