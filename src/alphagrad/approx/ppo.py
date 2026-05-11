@@ -378,9 +378,7 @@ def old_micro_log_prob_for_action(
     log_p_exp = jnp.sum(log_p_per_prime, axis=-1) * active * is_diag
     log_p_kind = jnp.log(kind_dists[arange_s, kind_seq] + 1e-8) * active * is_compress
 
-    return log_p_v + jnp.sum(
-        log_p_op + log_p_i + log_p_j + log_p_exp + log_p_kind
-    )
+    return log_p_v + jnp.sum(log_p_op + log_p_i + log_p_j + log_p_exp + log_p_kind)
 
 
 def _pad_seq(value: jax.Array, max_rules: int, pad: int = 0) -> jax.Array:
@@ -2132,13 +2130,14 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--allow-compress",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Enable COMPRESS legality in the MicroActionPolicy. "
-        "Off by default because the legacy sparsity_specs "
-        "env path silently drops COMPRESS rows — the policy "
-        "would emit them but they wouldn't affect the env. "
-        "Turn on only once graphax's vertex_elimination_jaxpr "
-        "consumes typed micro-actions.",
+        "On by default now that the typed-COMPRESS path is wired through "
+        "the env translator and graphax's apply_compress (with a "
+        "selectable reduction kind). Pass --no-allow-compress to "
+        "force every COMPRESS sub-step to END instead — useful for "
+        "isolating the elimination-order / DIAG signal.",
     )
     p.add_argument(
         "--axis-group-embedding",
@@ -2426,26 +2425,6 @@ def make_argparser() -> argparse.ArgumentParser:
         default=1e-2,
         help="Dual-ascent step size on the Lagrangian multipliers, applied "
         "once per episode against the mean per-step violation.",
-    )
-    # Cosine-similarity band: keep cosine_sim in [lower, upper] via the
-    # Lagrangian. Lower nudges the policy away from collapsing accuracy to
-    # zero; upper prevents it from saturating at perfect agreement and
-    # spending the remaining compute on quality nobody can spend. Set
-    # ``--cosine-lower-bound <= 0`` or ``--cosine-upper-bound >= 1`` to
-    # disable either side.
-    p.add_argument(
-        "--cosine-lower-bound",
-        type=float,
-        default=0.8,
-        help="Floor on cosine_sim enforced via a Lagrangian multiplier. "
-        "Default 0.8. Pass 0.0 to disable.",
-    )
-    p.add_argument(
-        "--cosine-upper-bound",
-        type=float,
-        default=0.9,
-        help="Ceiling on cosine_sim enforced via a Lagrangian multiplier. "
-        "Default 0.9. Pass 1.0 to disable.",
     )
     p.add_argument(
         "--calibrate-steps",
