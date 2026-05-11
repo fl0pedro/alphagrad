@@ -1222,6 +1222,7 @@ class Agent(eqx.Module):
         cached_encoding=None, pin_rules_to_exact: bool = False,
         pin_factor_idx: int | None = None,
         preference=None,
+        vertex_temperature=None,
     ):
         net_key, vertex_key, rule_key = jrand.split(key, 3)
         if cached_encoding is None:
@@ -1236,6 +1237,13 @@ class Agent(eqx.Module):
             )
 
         masked_v_logits = jnp.where(vertex_avail_mask > 0.5, vertex_logits, -1e9)
+        # Optional rollout-time logit temperature on the vertex head. The
+        # stored vertex_dist reflects the tempered distribution, so the
+        # downstream importance-ratio path (PPO/GDPO) corrects for it via
+        # log_p_old. A `None` default keeps the existing fast path
+        # bit-identical for callers that don't opt in.
+        if vertex_temperature is not None:
+            masked_v_logits = masked_v_logits / vertex_temperature
         vertex_dist = jnn.softmax(masked_v_logits, axis=-1)
         vertex_idx = distrax.Categorical(probs=vertex_dist).sample(seed=vertex_key)
 
@@ -1411,6 +1419,12 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--measure-latency", action="store_true",
                    help="Run the compiled approx fn 10x per env step to populate the latency reward "
                         "component. Significantly slower; turn on only when latency is being weighted.")
+    p.add_argument("--terminal-rewards-only", action="store_true",
+                   help="Compute the env's reward vector only at the final elimination step; "
+                        "intermediate steps return zeros. Skips per-step jacve compile/exec — the "
+                        "dominant rollout cost. PPO+GAE handles sparse rewards natively; the only "
+                        "knob to consider is reducing --potential-shaping (which assumes per-step "
+                        "value differences).")
     p.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "none"])
     p.add_argument("--dataset-size", type=int, default=-1)
     p.add_argument("--num-eval-samples", type=int, default=10)
@@ -2332,6 +2346,7 @@ def main():
         mem_type=args.mem_type,
         exec_on_gpu=args.exec_on_gpu,
         measure_latency=measure_latency,
+        terminal_rewards_only=args.terminal_rewards_only,
     )
 
     total_v = len(closed_jaxpr.jaxpr.eqns)
