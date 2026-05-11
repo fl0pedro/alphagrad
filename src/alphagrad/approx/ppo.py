@@ -1419,15 +1419,23 @@ class Agent(eqx.Module):
         v_context = vertex_contexts[vertex_idx]
         v_pair_mask = pair_valid_mask[vertex_idx]
         v_factor_mask = pair_factor_mask[vertex_idx]
-        if pin_rules_to_exact:
-            pair_seq, factor_seq, pair_dists, factor_dists = (
-                self._pinned_rule_outputs()
-            )
-        else:
-            pair_seq, factor_seq, pair_dists, factor_dists = self.rule_policy.sample(
-                v_context, v_pair_mask, v_factor_mask, rule_key,
-                pin_factor_idx=pin_factor_idx,
-            )
+        # Compute both pinned and sampled outputs unconditionally and select
+        # by `pin_rules_to_exact` via jnp.where. This is the JAX-traced
+        # equivalent of the original Python-level branch — accepts both
+        # a static Python bool (fast path: jnp.where folds at trace time)
+        # and a traced 0/1 scalar (used by the curriculum runner to swap
+        # ve_only ↔ full without forcing a recompile). The 2x rule-head
+        # compute is negligible next to the encoder.
+        ps_pinned, fs_pinned, pd_pinned, fd_pinned = self._pinned_rule_outputs()
+        ps_sampled, fs_sampled, pd_sampled, fd_sampled = self.rule_policy.sample(
+            v_context, v_pair_mask, v_factor_mask, rule_key,
+            pin_factor_idx=pin_factor_idx,
+        )
+        pin = jnp.asarray(pin_rules_to_exact, dtype=jnp.bool_)
+        pair_seq = jnp.where(pin, ps_pinned, ps_sampled)
+        factor_seq = jnp.where(pin, fs_pinned, fs_sampled)
+        pair_dists = jnp.where(pin, pd_pinned, pd_sampled)
+        factor_dists = jnp.where(pin, fd_pinned, fd_sampled)
         # `v_context` is the chosen vertex's representation as fed to the
         # rule head — exactly what the B.4 residual update wants to remember
         # about this elimination event.
@@ -1506,29 +1514,29 @@ class Agent(eqx.Module):
         v_context = vertex_contexts[vertex_idx]
         v_pair_mask = pair_valid_mask[vertex_idx]
         v_factor_mask = pair_factor_mask[vertex_idx]
-        if pin_rules_to_exact:
-            # Skip the rule policy entirely. Stage C: the recorded action is
-            # always (STOP, factor 0); the log-prob is 0 (deterministic) and
-            # entropy is 0 too — no gradient flows through the rule head.
-            _, _, pair_dists, factor_dists = self._pinned_rule_outputs()
-            zero = jnp.array(0.0, dtype=jnp.float32)
-            total_log_p = log_p_vertex
-            total_entropy = vertex_ent
-            return total_log_p, total_entropy, value, vertex_dist, pair_dists, factor_dists
+        # Always run both branches and select via jnp.where on pin_rules_to_exact.
+        # Pinned branch: the recorded action is always (STOP, factor 0); the
+        # rule head's log-prob / entropy contributions are 0 and the returned
+        # dists are degenerate one-hots. Sampled branch: the usual rule_policy
+        # evaluate path.
+        _, _, pd_pinned, fd_pinned = self._pinned_rule_outputs()
         (
-            lp_pairs,
-            lp_factors,
-            ent_pairs,
-            ent_factors,
-            pair_dists,
-            factor_dists,
+            lp_pairs, lp_factors, ent_pairs, ent_factors, pd_sampled, fd_sampled,
         ) = self.rule_policy.evaluate(
             v_context, v_pair_mask, v_factor_mask, pair_seq, factor_seq,
             pin_factor_idx=pin_factor_idx,
         )
-
-        total_log_p = log_p_vertex + jnp.sum(lp_pairs) + jnp.sum(lp_factors)
-        total_entropy = vertex_ent + jnp.sum(ent_pairs) + jnp.sum(ent_factors)
+        pin = jnp.asarray(pin_rules_to_exact, dtype=jnp.bool_)
+        total_log_p_sampled = (
+            log_p_vertex + jnp.sum(lp_pairs) + jnp.sum(lp_factors)
+        )
+        total_entropy_sampled = (
+            vertex_ent + jnp.sum(ent_pairs) + jnp.sum(ent_factors)
+        )
+        total_log_p = jnp.where(pin, log_p_vertex, total_log_p_sampled)
+        total_entropy = jnp.where(pin, vertex_ent, total_entropy_sampled)
+        pair_dists = jnp.where(pin, pd_pinned, pd_sampled)
+        factor_dists = jnp.where(pin, fd_pinned, fd_sampled)
         return total_log_p, total_entropy, value, vertex_dist, pair_dists, factor_dists
 
     def to_env_action(self, vertex_idx, pair_seq, factor_seq, factor_table):
@@ -2285,6 +2293,16 @@ def _current_stage_at(
     return stages[-1][0] if stages else ""
 
 
+def _pin_rules_for_variant(variant: str) -> bool:
+    """Per-variant `pin_rules_to_exact` flag for the legacy rule head.
+
+    Only ``ve_only`` requires the pinned (no-rules) output; every other
+    variant lets the rule head sample normally. The dynamic-substeps
+    path uses :func:`_op_legality_for_variant` instead.
+    """
+    return variant == "ve_only"
+
+
 def _op_legality_for_variant(
     variant: str, allow_compress: bool,
 ) -> jax.Array:
@@ -2869,6 +2887,10 @@ def run_calibration_phase(
             cal_pref, global_step, ep_key, cal_mask, no_lam, no_idx, no_thr,
             cal_override,
             jnp.array(1.0, dtype=jnp.float32),  # calibration: no curriculum scaling
+            # Calibration runs with the env's static pin_rules_to_exact:
+            # we honour args.pin_rules_to_exact (Python bool) by lifting it
+            # into a JAX scalar so the per-call API stays uniform.
+            jnp.asarray(args.pin_rules_to_exact, dtype=jnp.bool_),
         )
         cosine = float(jnp.mean(totals[:, REWARD_INDEX["cosine_sim"]]))
         neg_frob = float(jnp.mean(totals[:, REWARD_INDEX["frob_residual"]]))
@@ -3053,29 +3075,46 @@ def main():
     # is requested.
     curriculum_stages = _parse_curriculum(args.curriculum)
     if curriculum_stages:
-        # Dynamic-mode curriculum: stage transitions toggle the op-type
-        # legality (via `_op_legality_for_variant`) without re-JIT,
-        # because `op_legality_override` is now a per-call argument to
-        # `train_episode`. Legacy-mode curricula still need a separate
-        # implementation (the legacy rule head doesn't have a single
-        # mask analogous to op_legality_override — it would need
-        # pin_rules_to_exact threaded the same way, plus factor-table
-        # swapping for stages that change --factors).
+        # Both dynamic-substeps and legacy curricula are wired now —
+        # stage transitions toggle (op_legality_override, vertex_mult,
+        # pin_rules_to_exact) per call without forcing a recompile.
+        # Legacy curricula still need to share the SAME --factors and
+        # --max-rules across stages: the agent's rule head is sized at
+        # build time and isn't rebuilt mid-run. Validate that here so
+        # mis-specified stages fail fast rather than silently producing
+        # wrong-shape rule outputs.
         if not args.dynamic_substeps:
-            raise NotImplementedError(
-                "Legacy-mode curriculum is not yet wired. Stages: "
-                + ", ".join(f"{name}:{n}" for name, n in curriculum_stages)
-                + ". Add --dynamic-substeps to run the curriculum on the "
-                "heads.py path (where stage transitions toggle the op-type "
-                "legality without forcing a recompile), or run each stage "
-                "as its own training invocation until the legacy-mode "
-                "runner is implemented."
-            )
+            from collections import Counter
+            stage_factors = []
+            stage_max_rules = []
+            for stage_name, _ in curriculum_stages:
+                preset = VARIANT_PRESETS.get(stage_name)
+                if preset is None:
+                    raise NotImplementedError(
+                        f"Curriculum stage '{stage_name}' is not yet wired "
+                        "(blocked on the heads.py rewrite or atomic COMPRESS "
+                        "in graphax)."
+                    )
+                stage_factors.append(preset.get("factors", args.factors))
+                stage_max_rules.append(preset.get("max_rules", args.max_rules))
+            f_counts = Counter(stage_factors)
+            r_counts = Counter(stage_max_rules)
+            if len(f_counts) > 1 or len(r_counts) > 1:
+                raise NotImplementedError(
+                    "Legacy-mode curriculum requires every stage to share "
+                    "--factors and --max-rules (the rule head's output dim "
+                    "is fixed at agent-build time). Got per-stage factors "
+                    f"{stage_factors!r}, max_rules {stage_max_rules!r}. "
+                    "Add --dynamic-substeps for the heads.py path that "
+                    "doesn't have this restriction, or unify the stages' "
+                    "factor table."
+                )
         args.episodes = sum(n for _, n in curriculum_stages)
+        mode_label = "dynamic-substeps" if args.dynamic_substeps else "legacy"
         print(
             "curriculum: "
             + " → ".join(f"{name}:{n}" for name, n in curriculum_stages)
-            + f"  (total {args.episodes} episodes, dynamic-substeps mode)"
+            + f"  (total {args.episodes} episodes, {mode_label} mode)"
         )
 
     use_pointer, use_autoreg = _select_variant(args)
@@ -3313,10 +3352,10 @@ def main():
         return jax.vmap(lambda _: env_obj.reset())(jnp.arange(num_envs))
 
     @eqx.filter_jit
-    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None, 0, None))
+    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None, 0, None, None))
     def rollout_fn(
         agent, env_obj, rollout_length, env_state, key, vertex_features,
-        preference, op_legality_override,
+        preference, op_legality_override, pin_rules_to_exact_jax,
     ):
         keys = jrand.split(key, rollout_length)
         # Stage B.4: per-vertex residual state, initialised to zero at episode
@@ -3435,7 +3474,7 @@ def main():
                     vertex_features=vertex_features,
                     residual_state=residual_state,
                     cached_encoding=cached_encoding,
-                    pin_rules_to_exact=args.pin_rules_to_exact,
+                    pin_rules_to_exact=pin_rules_to_exact_jax,
                     pin_factor_idx=pin_factor_idx,
                     preference=preference if args.preference_conditioned else None,
                 )
@@ -3542,12 +3581,15 @@ def main():
         )
         return final_state, traj, all_raw_rewards[-1]
 
-    def loss_fn(agent, batch: TrainBatch, vertex_features, key):
+    def loss_fn(
+        agent, batch: TrainBatch, vertex_features, key, pin_rules_to_exact_jax,
+    ):
         # Dynamic-substeps path branches off here so the legacy path
         # stays exactly as written. `_dynamic_loss_fn` lives below and
-        # mirrors the same return shape — total_loss + 9-tuple of
+        # mirrors the same return shape — total_loss + 10-tuple of
         # metrics — so the train_episode plumbing doesn't care which
-        # path was taken.
+        # path was taken. (The dynamic path doesn't use pin_rules_to_exact;
+        # the JAX-traced arg is ignored there.)
         if args.dynamic_substeps:
             return _dynamic_loss_fn(agent, batch, vertex_features, key)
         # Three batching regimes share one ``evaluate_action`` vmap:
@@ -3588,7 +3630,7 @@ def main():
                 pair_valid_mask, pair_factor_mask, k,
                 eqn_ids=eids, vertex_features=vertex_features,
                 residual_state=rs, cached_encoding=cached,
-                pin_rules_to_exact=args.pin_rules_to_exact,
+                pin_rules_to_exact=pin_rules_to_exact_jax,
                 pin_factor_idx=pin_factor_idx,
                 preference=pref_or_none(pref),
             )
@@ -3911,6 +3953,7 @@ def main():
         multipliers, constraint_indices, constraint_thresholds,
         op_legality_override_arg,
         vertex_mult_arg,
+        pin_rules_to_exact_arg,
     ):
         subkey, key = jrand.split(key)
         rollout_key, key = jrand.split(key)
@@ -3918,7 +3961,7 @@ def main():
 
         env_states, traj, total_rewards_full = rollout_fn(
             agent, env_obj, num_valid, env_states, rollout_keys, vertex_features,
-            preferences_per_env, op_legality_override_arg,
+            preferences_per_env, op_legality_override_arg, pin_rules_to_exact_arg,
         )
 
         # Per-head GAE: only the three training-reward indices (flops /
@@ -4030,6 +4073,7 @@ def main():
                 batch, t_key = batch_and_key
                 grads, metrics = eqx.filter_grad(loss_fn, has_aux=True)(
                     comb_agent, batch, vertex_features, t_key,
+                    pin_rules_to_exact_arg,
                 )
                 # Single fused per-leaf gradient scaling: combines the
                 # Stage D head-LR ramp and the Stage G freeze mask. With an
@@ -4344,9 +4388,9 @@ def main():
 
         env_states = reset_envs(env_episode)
         # Curriculum stage resolution: figure out which stage `ep` falls
-        # into and derive the op-legality override from the stage's
-        # variant. Empty curriculum (the default) just uses the
-        # main-level `op_legality_override` set at startup.
+        # into and derive the per-call overrides from the stage's variant.
+        # Empty curriculum (the default) uses the main-level values set at
+        # startup.
         if curriculum_stages:
             cumulative = 0
             current_stage_name = curriculum_stages[-1][0]
@@ -4359,6 +4403,9 @@ def main():
                 cumulative += stage_n
             stage_override = _op_legality_for_variant(
                 current_stage_name, args.allow_compress,
+            )
+            stage_pin_rules = jnp.asarray(
+                _pin_rules_for_variant(current_stage_name), dtype=jnp.bool_,
             )
             # Vertex-policy gradient multiplier — 1.0 in the first stage
             # (where vertex_policy is the only thing being trained); set
@@ -4377,11 +4424,15 @@ def main():
             ):
                 print(
                     f"[ep {ep}] curriculum stage → {current_stage_name}"
-                    f"  (vertex_mult={float(stage_vertex_mult):.2f})"
+                    f"  (vertex_mult={float(stage_vertex_mult):.2f}, "
+                    f"pin_rules={bool(stage_pin_rules)})"
                 )
         else:
             stage_override = op_legality_override
             stage_vertex_mult = jnp.array(1.0, dtype=jnp.float32)
+            stage_pin_rules = jnp.asarray(
+                args.pin_rules_to_exact, dtype=jnp.bool_,
+            )
         (
             agent, opt_state, _, metrics, total_rewards_full,
             actions_pack, global_step, multipliers, diag_pack,
@@ -4392,6 +4443,7 @@ def main():
             constraint_indices, constraint_thresholds,
             stage_override,
             stage_vertex_mult,
+            stage_pin_rules,
         )
         host_log(
             ep,
