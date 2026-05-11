@@ -2608,6 +2608,30 @@ def _scale_output_heads(agent, scale: float, use_pointer: bool, use_autoreg: boo
     agent = scale_module_weight(
         agent, lambda a: a.pref_proj.weight, 0.0,
     )
+    # Dynamic-substeps heads — scale the four output projections so the
+    # initial typed-action distribution is also near-uniform. The base
+    # encoder and AxisSetEncoder still contribute non-zero magnitude
+    # signal, so "near uniform" rather than "exactly uniform"; this is
+    # the same trade-off the legacy rule-head scaling makes.
+    if agent.micro_action_policy is not None:
+        agent = scale_module_weight(
+            agent, lambda a: a.micro_action_policy.head.op_head.proj.weight, scale,
+        )
+        agent = scale_module_weight(
+            agent,
+            lambda a: a.micro_action_policy.head.axis_i_head.key_proj.weight,
+            scale,
+        )
+        agent = scale_module_weight(
+            agent,
+            lambda a: a.micro_action_policy.head.axis_j_head.key_proj.weight,
+            scale,
+        )
+        agent = scale_module_weight(
+            agent,
+            lambda a: a.micro_action_policy.head.factor_head.head_proj.weight,
+            scale,
+        )
     return agent
 
 
