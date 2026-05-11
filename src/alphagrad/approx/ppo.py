@@ -2733,10 +2733,18 @@ def _build_param_mask(agent, predicate) -> "jax.Array":
 
 
 def _build_head_masks(agent):
-    """Return ``(axis_mask, factor_mask)`` — bool trees for the LR ramp."""
+    """Return ``(axis_mask, factor_mask, vertex_mask)`` — bool trees for the LR ramp.
+
+    `vertex_mask` selects every parameter belonging to the base pointer
+    net (``vertex_policy.*``). Used by the curriculum runner to scale
+    the vertex-selection head's gradient down in non-initial stages so
+    the policy doesn't forget the vertex-ordering signal it learned in
+    stage 0 when new heads (op_type / axis / factor) come online.
+    """
     return (
         _build_param_mask(agent, lambda p: _path_in(p, "axis")),
         _build_param_mask(agent, lambda p: _path_in(p, "factor")),
+        _build_param_mask(agent, lambda p: "vertex_policy" in p),
     )
 
 
@@ -2761,22 +2769,29 @@ def _head_lr_mult(step: "jax.Array", warmup_steps: int) -> "jax.Array":
     return (1.0 / 3.0) + (2.0 / 3.0) * frac
 
 
-def _scale_grads(grads, axis_mask, factor_mask, freeze_mask,
-                 axis_mult, factor_mult):
+def _scale_grads(grads, axis_mask, factor_mask, vertex_mask, freeze_mask,
+                 axis_mult, factor_mult, vertex_mult):
     """Single fused per-leaf gradient scaling.
 
     Combines the Stage D head-LR ramp (per-head multiplier on axis / factor
-    params) with the Stage G freeze mask (zero gradient for non-trainable
-    params during calibration) into one pass through the pytree. One
-    ``tree_map`` instead of two means half as many ``where`` ops in the
-    compiled jaxpr.
+    params), the curriculum existing-head multiplier on the vertex policy,
+    and the Stage G freeze mask (zero gradient for non-trainable params
+    during calibration) into one pass through the pytree. Mask precedence:
+    freeze → axis → factor → vertex → 1.0.
     """
     return jax.tree_util.tree_map(
-        lambda g, am, fm, fz: jnp.where(
-            fz, g * jnp.where(am, axis_mult, jnp.where(fm, factor_mult, 1.0)),
+        lambda g, am, fm, vm, fz: jnp.where(
+            fz,
+            g * jnp.where(
+                am, axis_mult,
+                jnp.where(
+                    fm, factor_mult,
+                    jnp.where(vm, vertex_mult, 1.0),
+                ),
+            ),
             jnp.zeros_like(g),
         ),
-        grads, axis_mask, factor_mask, freeze_mask,
+        grads, axis_mask, factor_mask, vertex_mask, freeze_mask,
     )
 
 
@@ -2853,6 +2868,7 @@ def run_calibration_phase(
             agent, opt_state, env_states, env_episode, vertex_features,
             cal_pref, global_step, ep_key, cal_mask, no_lam, no_idx, no_thr,
             cal_override,
+            jnp.array(1.0, dtype=jnp.float32),  # calibration: no curriculum scaling
         )
         cosine = float(jnp.mean(totals[:, REWARD_INDEX["cosine_sim"]]))
         neg_frob = float(jnp.mean(totals[:, REWARD_INDEX["frob_residual"]]))
@@ -3230,7 +3246,7 @@ def main():
     # train_minibatch to scale gradients by the head-specific LR multiplier
     # (warm-up ramp from §3.2). Masks are pytree leaves aligned with the
     # filtered (inexact-array) agent params.
-    axis_mask, factor_mask = _build_head_masks(agent)
+    axis_mask, factor_mask, vertex_mask = _build_head_masks(agent)
 
     # Stage G default freeze mask: all-True (no freezing) — the same
     # train_episode path serves both regular training and calibration. The
@@ -3894,6 +3910,7 @@ def main():
         preferences_per_env, global_step, key, freeze_mask,
         multipliers, constraint_indices, constraint_thresholds,
         op_legality_override_arg,
+        vertex_mult_arg,
     ):
         subkey, key = jrand.split(key)
         rollout_key, key = jrand.split(key)
@@ -4020,9 +4037,10 @@ def main():
                 # branch is a no-op; with the cal-mask the LR ramp is also
                 # active for the trainable params (factor head, aggregator).
                 grads = _scale_grads(
-                    grads, axis_mask, factor_mask, freeze_mask,
+                    grads, axis_mask, factor_mask, vertex_mask, freeze_mask,
                     _head_lr_mult(step, args.axis_warmup_steps),
                     _head_lr_mult(step, args.factor_warmup_steps),
+                    vertex_mult_arg,
                 )
                 updates, new_opt_state = optimizer.update(
                     grads, comb_opt_state, comb_agent
@@ -4332,13 +4350,24 @@ def main():
         if curriculum_stages:
             cumulative = 0
             current_stage_name = curriculum_stages[-1][0]
-            for stage_name, stage_n in curriculum_stages:
+            current_stage_idx = len(curriculum_stages) - 1
+            for stage_idx, (stage_name, stage_n) in enumerate(curriculum_stages):
                 if ep < cumulative + stage_n:
                     current_stage_name = stage_name
+                    current_stage_idx = stage_idx
                     break
                 cumulative += stage_n
             stage_override = _op_legality_for_variant(
                 current_stage_name, args.allow_compress,
+            )
+            # Vertex-policy gradient multiplier — 1.0 in the first stage
+            # (where vertex_policy is the only thing being trained); set
+            # to `--curriculum-existing-head-mult` in later stages so the
+            # vertex-ordering signal isn't blown out when new heads
+            # (op_type / axis / factor) come online.
+            stage_vertex_mult = jnp.array(
+                1.0 if current_stage_idx == 0 else args.curriculum_existing_head_mult,
+                dtype=jnp.float32,
             )
             # Log the stage boundary on transition (cheap host-side check).
             if ep == 0 or (
@@ -4346,9 +4375,13 @@ def main():
                 and _current_stage_at(curriculum_stages, ep - 1)
                 != current_stage_name
             ):
-                print(f"[ep {ep}] curriculum stage → {current_stage_name}")
+                print(
+                    f"[ep {ep}] curriculum stage → {current_stage_name}"
+                    f"  (vertex_mult={float(stage_vertex_mult):.2f})"
+                )
         else:
             stage_override = op_legality_override
+            stage_vertex_mult = jnp.array(1.0, dtype=jnp.float32)
         (
             agent, opt_state, _, metrics, total_rewards_full,
             actions_pack, global_step, multipliers, diag_pack,
@@ -4358,6 +4391,7 @@ def main():
             default_freeze_mask, multipliers,
             constraint_indices, constraint_thresholds,
             stage_override,
+            stage_vertex_mult,
         )
         host_log(
             ep,
