@@ -710,17 +710,23 @@ class MicroAction(NamedTuple):
       ``i`` is the physical axis being compressed.
     * ``exponents``: ``(MAX_PRIMES,)`` int32 prime exponents for DIAG;
       zeros for COMPRESS / END.
+    * ``factor``: derived integer factor for DIAG (``∏ p_k^c_k``); 0 for
+      COMPRESS / END. Stored explicitly because deriving it requires the
+      prime table at sample time, and re-deriving inside evaluate would
+      need the same gather — easier to keep the integer alongside its
+      exponents.
 
-    The env-side translator (alphagrad.approx.env, future change) maps
-    this tuple to a graphax ``Diag`` / ``Compress`` using the current
-    axis state's ``(prime_list, max_exponents)`` for the chosen ``(i, j)``
-    pair, then dispatches to ``apply_micro_actions``.
+    The env-side translator (alphagrad.approx.env) maps this tuple to a
+    legacy rule_specs row via :func:`micro_actions_to_rule_specs_jax` or
+    a graphax ``Diag`` / ``Compress`` via ``apply_micro_actions`` for the
+    future end-to-end path.
     """
 
     op_type: jax.Array
     i: jax.Array
     j: jax.Array
     exponents: jax.Array
+    factor: jax.Array
 
 
 class MicroActionHead(eqx.Module):
@@ -839,12 +845,13 @@ class MicroActionHead(eqx.Module):
         i_out = jnp.where(is_diag | is_compress, i_idx, 0).astype(jnp.int32)
         j_out = jnp.where(is_diag, j_idx, 0).astype(jnp.int32)
         exp_out = jnp.where(is_diag, exponents, jnp.zeros_like(exponents))
+        factor_out = jnp.where(is_diag, factor, jnp.array(0, dtype=jnp.int32))
 
         action = MicroAction(
             op_type=op_type.astype(jnp.int32),
-            i=i_out, j=j_out, exponents=exp_out,
+            i=i_out, j=j_out, exponents=exp_out, factor=factor_out,
         )
-        return action, factor, op_dist, i_dist, j_dist, exp_dists
+        return action, factor_out, op_dist, i_dist, j_dist, exp_dists
 
     def log_prob_step(
         self,
@@ -1116,15 +1123,11 @@ class MicroActionPolicy(eqx.Module):
         ent = ent * active
         arity = arity * active
 
-        # Reconstruct factor from stored exponents + table gather so the
-        # axis-state update uses the *same* integer the sampler did.
-        N_i = features.size[action.i]
-        N_j = features.size[action.j]
-        g = tables.gcd[N_i, N_j]
-        primes = tables.primes[g]
-        factor = jnp.prod(
-            primes.astype(jnp.int32) ** action.exponents.astype(jnp.int32),
-        ).astype(jnp.int32)
+        # Axis-state update uses the *stored* factor from the action.
+        # This is the same integer sample_step computed via the prime
+        # table; storing it avoids the re-derivation gather here and
+        # makes the stored action self-contained for replay / debugging.
+        factor = action.factor
 
         is_diag = (action.op_type == OP_DIAG) & ~ended
         is_compress = (action.op_type == OP_COMPRESS) & ~ended
