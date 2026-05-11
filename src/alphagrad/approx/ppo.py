@@ -23,6 +23,17 @@ from __future__ import annotations
 import argparse
 import heapq
 import os
+
+# tqdm allocates a multiprocessing.RLock on first use (`TqdmDefaultWriteLock`)
+# for cross-process bar coordination. The RLock is backed by a named POSIX
+# semaphore on macOS / Linux; if the process is signal-killed (SIGTERM from
+# `timeout`, Ctrl-C, OOM killer) before tqdm's atexit cleanup runs, the
+# semaphore leaks and `multiprocessing.resource_tracker` prints:
+#   "There appear to be N leaked semaphore objects to clean up at shutdown"
+# at the next Python shutdown. We only ever drive tqdm from the main thread
+# of a single process, so a threading.RLock is sufficient and never touches
+# `multiprocessing`.
+import threading as _threading
 from functools import partial
 from typing import NamedTuple
 
@@ -35,19 +46,10 @@ import jax.numpy as jnp
 import jax.random as jrand
 import numpy as np
 import optax
-import wandb
 from tqdm import tqdm
 
-# tqdm allocates a multiprocessing.RLock on first use (`TqdmDefaultWriteLock`)
-# for cross-process bar coordination. The RLock is backed by a named POSIX
-# semaphore on macOS / Linux; if the process is signal-killed (SIGTERM from
-# `timeout`, Ctrl-C, OOM killer) before tqdm's atexit cleanup runs, the
-# semaphore leaks and `multiprocessing.resource_tracker` prints:
-#   "There appear to be N leaked semaphore objects to clean up at shutdown"
-# at the next Python shutdown. We only ever drive tqdm from the main thread
-# of a single process, so a threading.RLock is sufficient and never touches
-# `multiprocessing`.
-import threading as _threading
+import wandb
+
 tqdm.set_lock(_threading.RLock())
 
 from alphagrad.approx.common import (
@@ -74,6 +76,10 @@ from alphagrad.approx.common import (
 )
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
+    _AXIS_FEAT_GROUP_ID,
+    _AXIS_FEAT_IS_COMPRESSED,
+    _AXIS_FEAT_IS_OUTPUT,
+    _AXIS_FEAT_SIZE,
     MAX_AXES_PER_VERTEX,
     MAX_RULES_PER_VERTEX,
     MAX_TOKENS,
@@ -83,15 +89,13 @@ from alphagrad.approx.env import (
     REWARD_NAMES,
     StepAction,
     VertexEliminationEnv,
-    _AXIS_FEAT_GROUP_ID,
-    _AXIS_FEAT_IS_COMPRESSED,
-    _AXIS_FEAT_IS_OUTPUT,
-    _AXIS_FEAT_SIZE,
     micro_actions_to_rule_specs_jax,
 )
 from alphagrad.approx.heads import (
-    MAX_PRIMES,
+    COMPRESS_KINDS,
     MAX_EXPONENT,
+    MAX_PRIMES,
+    NUM_COMPRESS_KINDS,
     NUM_OPS,
     OP_COMPRESS,
     OP_DIAG,
@@ -105,7 +109,6 @@ from alphagrad.approx.heads import (
 from alphagrad.transformer import MLP, Encoder, PositionalEncoder
 from alphagrad.transformer.encoder import RelationalMultiheadAttention
 from alphagrad.utils import entropy, explained_variance
-
 
 # ---------------------------------------------------------------------------
 # Constants shared by all three agent variants
@@ -163,7 +166,7 @@ class Trajectory(NamedTuple):
     tokens: jax.Array
     eqn_ids: jax.Array
     residual_state: jax.Array  # (V, embd_dim) at the start of this step
-    preference: jax.Array      # (NUM_VALUE_HEADS,) — weights V_flops/V_mem/V_acc
+    preference: jax.Array  # (NUM_VALUE_HEADS,) — weights V_flops/V_mem/V_acc
     vertex_idx: jax.Array
     # Legacy rule-head action — zero-filled in --dynamic-substeps mode.
     pair_seq: jax.Array
@@ -171,23 +174,25 @@ class Trajectory(NamedTuple):
     # Typed micro-action sequence — zero-filled in legacy mode. Shapes
     # depend on args.max_substeps + heads.py constants
     # (NUM_OPS, MAX_PRIMES, MAX_EXPONENT) and env's MAX_AXES_PER_VERTEX.
-    micro_op_seq: jax.Array        # (max_substeps,) int32
-    micro_i_seq: jax.Array         # (max_substeps,) int32
-    micro_j_seq: jax.Array         # (max_substeps,) int32
-    micro_exp_seq: jax.Array       # (max_substeps, MAX_PRIMES) int32
-    micro_factor_seq: jax.Array    # (max_substeps,) int32
-    reward: jax.Array          # (NUM_REWARDS,) — full env emission, kept for host logging
+    micro_op_seq: jax.Array  # (max_substeps,) int32
+    micro_i_seq: jax.Array  # (max_substeps,) int32
+    micro_j_seq: jax.Array  # (max_substeps,) int32
+    micro_exp_seq: jax.Array  # (max_substeps, MAX_PRIMES) int32
+    micro_factor_seq: jax.Array  # (max_substeps,) int32
+    micro_compress_kind_seq: jax.Array  # (max_substeps,) int32
+    reward: jax.Array  # (NUM_REWARDS,) — full env emission, kept for host logging
     done: jax.Array
-    value: jax.Array           # (NUM_VALUE_HEADS,) per-head value prediction
-    next_value: jax.Array      # (NUM_VALUE_HEADS,) per-head bootstrap value
+    value: jax.Array  # (NUM_VALUE_HEADS,) per-head value prediction
+    next_value: jax.Array  # (NUM_VALUE_HEADS,) per-head bootstrap value
     vertex_dist: jax.Array
     pair_dists: jax.Array
     factor_dists: jax.Array
     # Dynamic-substeps per-component distributions — zero-filled in legacy mode.
-    micro_op_dists: jax.Array      # (max_substeps, NUM_OPS) float32
-    micro_i_dists: jax.Array       # (max_substeps, MAX_AXES_PER_VERTEX) float32
-    micro_j_dists: jax.Array       # (max_substeps, MAX_AXES_PER_VERTEX) float32
-    micro_exp_dists: jax.Array     # (max_substeps, MAX_PRIMES, MAX_EXPONENT+1) float32
+    micro_op_dists: jax.Array  # (max_substeps, NUM_OPS) float32
+    micro_i_dists: jax.Array  # (max_substeps, MAX_AXES_PER_VERTEX) float32
+    micro_j_dists: jax.Array  # (max_substeps, MAX_AXES_PER_VERTEX) float32
+    micro_exp_dists: jax.Array  # (max_substeps, MAX_PRIMES, MAX_EXPONENT+1) float32
+    micro_kind_dists: jax.Array  # (max_substeps, NUM_COMPRESS_KINDS) float32
     discount: jax.Array
     vertex_avail_mask: jax.Array
 
@@ -205,6 +210,7 @@ class TrainBatch(NamedTuple):
     micro_j_seq: jax.Array
     micro_exp_seq: jax.Array
     micro_factor_seq: jax.Array
+    micro_compress_kind_seq: jax.Array
     old_vertex_dist: jax.Array
     old_pair_dists: jax.Array
     old_factor_dists: jax.Array
@@ -212,6 +218,7 @@ class TrainBatch(NamedTuple):
     old_micro_i_dists: jax.Array
     old_micro_j_dists: jax.Array
     old_micro_exp_dists: jax.Array
+    old_micro_kind_dists: jax.Array
     estim_returns: jax.Array
     norm_adv: jax.Array
     vertex_avail_mask: jax.Array
@@ -224,9 +231,9 @@ class TrainBatch(NamedTuple):
 
 def _stop_only_logits(num_pair_choices: int) -> jax.Array:
     """Logits that put all mass on the STOP pair index."""
-    return jnp.where(
-        jnp.arange(num_pair_choices) == PAIR_STOP, 0.0, -1e9
-    ).astype(jnp.float32)
+    return jnp.where(jnp.arange(num_pair_choices) == PAIR_STOP, 0.0, -1e9).astype(
+        jnp.float32
+    )
 
 
 def _pad_specs_to_env_slot(specs: jax.Array) -> jax.Array:
@@ -298,9 +305,7 @@ def old_log_prob_for_action(
 
     arange_r = jnp.arange(pair_seq.shape[0])
     pair_log_ps = jnp.log(pair_dists[arange_r, pair_seq] + 1e-8) * pair_active
-    factor_log_ps = (
-        jnp.log(factor_dists[arange_r, factor_seq] + 1e-8) * factor_active
-    )
+    factor_log_ps = jnp.log(factor_dists[arange_r, factor_seq] + 1e-8) * factor_active
     return log_p_v + jnp.sum(pair_log_ps) + jnp.sum(factor_log_ps)
 
 
@@ -310,21 +315,24 @@ def old_micro_log_prob_for_action(
     i_seq,
     j_seq,
     exp_seq,
+    kind_seq,
     vertex_dist,
     op_dists,
     i_dists,
     j_dists,
     exp_dists,
+    kind_dists,
 ):
     """Joint log-prob of a typed micro-action sequence under stored dists.
 
     Dynamic-substeps analog of :func:`old_log_prob_for_action`. The vertex
-    log-prob plus the per-sub-step (op_type, i, j, prime-exponents)
-    contributions are summed, with the per-component activity gating
-    matching :meth:`MicroActionHead.log_prob_step`:
+    log-prob plus the per-sub-step (op_type, i, j, prime-exponents,
+    compress_kind) contributions are summed, with the per-component
+    activity gating matching :meth:`MicroActionHead.log_prob_step`:
 
     * i active for DIAG / COMPRESS.
     * j and prime-exponent active for DIAG only.
+    * compress_kind active for COMPRESS only.
     * Every component zeros out for sub-steps past the first OP_END
       (sticky termination — mirrors the scan's post-END mask).
 
@@ -343,17 +351,16 @@ def old_micro_log_prob_for_action(
     active = (prior_ends == 0).astype(jnp.float32)
 
     is_diag = (op_seq == OP_DIAG).astype(jnp.float32)
-    is_diag_or_compress = (
-        (op_seq == OP_DIAG) | (op_seq == OP_COMPRESS)
-    ).astype(jnp.float32)
+    is_compress = (op_seq == OP_COMPRESS).astype(jnp.float32)
+    is_diag_or_compress = ((op_seq == OP_DIAG) | (op_seq == OP_COMPRESS)).astype(
+        jnp.float32
+    )
 
     S = op_seq.shape[0]
     arange_s = jnp.arange(S)
 
     log_p_op = jnp.log(op_dists[arange_s, op_seq] + 1e-8) * active
-    log_p_i = (
-        jnp.log(i_dists[arange_s, i_seq] + 1e-8) * active * is_diag_or_compress
-    )
+    log_p_i = jnp.log(i_dists[arange_s, i_seq] + 1e-8) * active * is_diag_or_compress
     log_p_j = jnp.log(j_dists[arange_s, j_seq] + 1e-8) * active * is_diag
 
     # Per-prime gather: exp_dists has shape (S, MAX_PRIMES, MAX_EXPONENT+1).
@@ -362,12 +369,18 @@ def old_micro_log_prob_for_action(
     # log(~1.0) ≈ 0 because the head's mask forces exp=0 with prob 1.
     log_p_per_prime = jnp.log(
         jnp.take_along_axis(
-            exp_dists, exp_seq[..., None], axis=-1,
-        ).squeeze(-1) + 1e-8
+            exp_dists,
+            exp_seq[..., None],
+            axis=-1,
+        ).squeeze(-1)
+        + 1e-8
     )
     log_p_exp = jnp.sum(log_p_per_prime, axis=-1) * active * is_diag
+    log_p_kind = jnp.log(kind_dists[arange_s, kind_seq] + 1e-8) * active * is_compress
 
-    return log_p_v + jnp.sum(log_p_op + log_p_i + log_p_j + log_p_exp)
+    return log_p_v + jnp.sum(
+        log_p_op + log_p_i + log_p_j + log_p_exp + log_p_kind
+    )
 
 
 def _pad_seq(value: jax.Array, max_rules: int, pad: int = 0) -> jax.Array:
@@ -379,7 +392,9 @@ def _pad_seq(value: jax.Array, max_rules: int, pad: int = 0) -> jax.Array:
     return jnp.concatenate([value, pad_arr], axis=0)
 
 
-def _pad_dists(active: jax.Array, max_rules: int, num_choices: int, fill_idx: int) -> jax.Array:
+def _pad_dists(
+    active: jax.Array, max_rules: int, num_choices: int, fill_idx: int
+) -> jax.Array:
     """Stack `active` (1, num_choices) with `(max_rules - 1)` degenerate one-hots at `fill_idx`."""
     pad_len = max_rules - active.shape[0]
     if pad_len <= 0:
@@ -388,7 +403,6 @@ def _pad_dists(active: jax.Array, max_rules: int, num_choices: int, fill_idx: in
         jnn.one_hot(fill_idx, num_choices), (pad_len, num_choices)
     )
     return jnp.concatenate([active, pad_one_hot], axis=0)
-
 
 
 # ---------------------------------------------------------------------------
@@ -547,8 +561,15 @@ class AutoregRulePolicy(eqx.Module):
             jnp.array(True, dtype=jnp.bool_),
         )
 
-    def sample(self, vertex_context, v_pair_mask, v_factor_mask, key,
-               *, pin_factor_idx: int | None = None):
+    def sample(
+        self,
+        vertex_context,
+        v_pair_mask,
+        v_factor_mask,
+        key,
+        *,
+        pin_factor_idx: int | None = None,
+    ):
         """Sample ``(pair_seq, factor_seq)`` autoregressively.
 
         ``v_factor_mask`` is the per-(pair, factor) validity mask for the
@@ -592,7 +613,10 @@ class AutoregRulePolicy(eqx.Module):
 
             new_active = active & (pair_idx != PAIR_STOP)
             return (pair_idx, factor_idx, new_h, new_active), (
-                pair_idx, factor_idx, pair_dist, factor_dist,
+                pair_idx,
+                factor_idx,
+                pair_dist,
+                factor_dist,
             )
 
         _, (pair_seq, factor_seq, pair_dists, factor_dists) = lax.scan(
@@ -600,8 +624,16 @@ class AutoregRulePolicy(eqx.Module):
         )
         return pair_seq, factor_seq, pair_dists, factor_dists
 
-    def evaluate(self, vertex_context, v_pair_mask, v_factor_mask, pair_seq, factor_seq,
-                 *, pin_factor_idx: int | None = None):
+    def evaluate(
+        self,
+        vertex_context,
+        v_pair_mask,
+        v_factor_mask,
+        pair_seq,
+        factor_seq,
+        *,
+        pin_factor_idx: int | None = None,
+    ):
         stop_only = _stop_only_logits(self.num_pair_choices)
         pin_static = pin_factor_idx
 
@@ -628,7 +660,9 @@ class AutoregRulePolicy(eqx.Module):
                 # Factor is deterministic — log p = 0, entropy = 0. Returning
                 # a degenerate one-hot for `factor_dist` keeps the KL terms
                 # downstream well-defined (KL(δ‖δ) = 0).
-                factor_dist = jnn.one_hot(jnp.asarray(pin_static, dtype=jnp.int32), self.num_factors)
+                factor_dist = jnn.one_hot(
+                    jnp.asarray(pin_static, dtype=jnp.int32), self.num_factors
+                )
                 log_p_factor = jnp.array(0.0, dtype=jnp.float32)
                 factor_ent_raw = jnp.array(0.0, dtype=jnp.float32)
 
@@ -647,9 +681,12 @@ class AutoregRulePolicy(eqx.Module):
             # factor is pinned, both rollout and evaluate see the pinned
             # value as `prev_factor`.
             return (true_pair, true_factor, new_h, new_active), (
-                log_p_pair_eff, log_p_factor_eff,
-                pair_ent, factor_ent,
-                pair_dist, factor_dist,
+                log_p_pair_eff,
+                log_p_factor_eff,
+                pair_ent,
+                factor_ent,
+                pair_dist,
+                factor_dist,
             )
 
         _, (lp_pairs, lp_factors, ent_pairs, ent_factors, pair_dists, factor_dists) = (
@@ -694,8 +731,14 @@ class SparsityRatioRuleDecoder(eqx.Module):
     num_factors: int = eqx.field(static=True)
 
     def __init__(
-        self, embd_dim, max_rules, num_pair_choices, num_factors, key,
-        *, rho_init_bias: float = 0.0,
+        self,
+        embd_dim,
+        max_rules,
+        num_pair_choices,
+        num_factors,
+        key,
+        *,
+        rho_init_bias: float = 0.0,
     ):
         keys = jrand.split(key, 6)
         self.embd_dim = embd_dim
@@ -709,7 +752,8 @@ class SparsityRatioRuleDecoder(eqx.Module):
         rho_head = eqx.nn.Linear(embd_dim * 2, 1, key=keys[5])
         if rho_init_bias != 0.0 and rho_head.bias is not None:
             rho_head = eqx.tree_at(
-                lambda l: l.bias, rho_head,
+                lambda l: l.bias,
+                rho_head,
                 rho_head.bias + jnp.asarray(rho_init_bias, dtype=rho_head.bias.dtype),
             )
         self.rho_head = rho_head
@@ -758,8 +802,15 @@ class SparsityRatioAutoregRulePolicy(eqx.Module):
     use_factor_table: bool = eqx.field(static=True)
 
     def __init__(
-        self, *, embd_dim, max_rules, num_pair_choices, num_factors,
-        sparsity_ratios, key, rho_init_bias: float = 0.0,
+        self,
+        *,
+        embd_dim,
+        max_rules,
+        num_pair_choices,
+        num_factors,
+        sparsity_ratios,
+        key,
+        rho_init_bias: float = 0.0,
     ):
         self.embd_dim = embd_dim
         self.max_rules = max_rules
@@ -767,7 +818,11 @@ class SparsityRatioAutoregRulePolicy(eqx.Module):
         self.num_factors = num_factors
         self.use_factor_table = True
         self.decoder = SparsityRatioRuleDecoder(
-            embd_dim, max_rules, num_pair_choices, num_factors, key=key,
+            embd_dim,
+            max_rules,
+            num_pair_choices,
+            num_factors,
+            key=key,
             rho_init_bias=rho_init_bias,
         )
         self.sparsity_ratios = jnp.asarray(sparsity_ratios, dtype=jnp.float32)
@@ -804,8 +859,13 @@ class SparsityRatioAutoregRulePolicy(eqx.Module):
         return d
 
     def sample(
-        self, vertex_context, v_pair_mask, v_factor_mask, key,
-        *, pin_factor_idx: int | None = None,
+        self,
+        vertex_context,
+        v_pair_mask,
+        v_factor_mask,
+        key,
+        *,
+        pin_factor_idx: int | None = None,
     ):
         slot_keys = jrand.split(key, self.max_rules)
         stop_only = _stop_only_logits(self.num_pair_choices)
@@ -816,7 +876,11 @@ class SparsityRatioAutoregRulePolicy(eqx.Module):
             slot_idx, k = slot_data
             kp, kf = jrand.split(k)
             new_h, pair_logits = self.decoder.step(
-                vertex_context, slot_idx, prev_pair, prev_factor, prev_h,
+                vertex_context,
+                slot_idx,
+                prev_pair,
+                prev_factor,
+                prev_h,
             )
             pair_logits = jnp.where(v_pair_mask > 0.5, pair_logits, -1e9)
             pair_logits_eff = jnp.where(active, pair_logits, stop_only)
@@ -829,7 +893,9 @@ class SparsityRatioAutoregRulePolicy(eqx.Module):
                 idx_lower, idx_upper, alpha = self._snap_mix(rho)
                 u = jrand.uniform(kf)
                 sample_upper = u < alpha
-                factor_idx = jnp.where(sample_upper, idx_upper, idx_lower).astype(jnp.int32)
+                factor_idx = jnp.where(sample_upper, idx_upper, idx_lower).astype(
+                    jnp.int32
+                )
                 factor_dist = self._factor_dist_from_snap(idx_lower, idx_upper, alpha)
             else:
                 factor_idx = jnp.asarray(pin_static, dtype=jnp.int32)
@@ -837,17 +903,28 @@ class SparsityRatioAutoregRulePolicy(eqx.Module):
 
             new_active = active & (pair_idx != PAIR_STOP)
             return (pair_idx, factor_idx, new_h, new_active), (
-                pair_idx, factor_idx, pair_dist, factor_dist,
+                pair_idx,
+                factor_idx,
+                pair_dist,
+                factor_dist,
             )
 
         _, (pair_seq, factor_seq, pair_dists, factor_dists) = lax.scan(
-            rule_step, self._init_carry(), (jnp.arange(self.max_rules), slot_keys),
+            rule_step,
+            self._init_carry(),
+            (jnp.arange(self.max_rules), slot_keys),
         )
         return pair_seq, factor_seq, pair_dists, factor_dists
 
     def evaluate(
-        self, vertex_context, v_pair_mask, v_factor_mask, pair_seq, factor_seq,
-        *, pin_factor_idx: int | None = None,
+        self,
+        vertex_context,
+        v_pair_mask,
+        v_factor_mask,
+        pair_seq,
+        factor_seq,
+        *,
+        pin_factor_idx: int | None = None,
     ):
         stop_only = _stop_only_logits(self.num_pair_choices)
         pin_static = pin_factor_idx
@@ -856,7 +933,11 @@ class SparsityRatioAutoregRulePolicy(eqx.Module):
             prev_pair, prev_factor, prev_h, active = carry
             slot_idx, true_pair, true_factor = slot_data
             new_h, pair_logits = self.decoder.step(
-                vertex_context, slot_idx, prev_pair, prev_factor, prev_h,
+                vertex_context,
+                slot_idx,
+                prev_pair,
+                prev_factor,
+                prev_h,
             )
             pair_logits = jnp.where(v_pair_mask > 0.5, pair_logits, -1e9)
             pair_logits_eff = jnp.where(active, pair_logits, stop_only)
@@ -872,7 +953,8 @@ class SparsityRatioAutoregRulePolicy(eqx.Module):
                 # action might have been recorded under a slightly different
                 # ρ (post optimizer step). Compute log p robustly.
                 p_true = jnp.where(
-                    true_factor == idx_upper, alpha,
+                    true_factor == idx_upper,
+                    alpha,
                     jnp.where(true_factor == idx_lower, 1.0 - alpha, 1e-9),
                 )
                 log_p_factor = jnp.log(p_true + 1e-9)
@@ -883,7 +965,8 @@ class SparsityRatioAutoregRulePolicy(eqx.Module):
                 factor_dist = self._factor_dist_from_snap(idx_lower, idx_upper, alpha)
             else:
                 factor_dist = jnn.one_hot(
-                    jnp.asarray(pin_static, dtype=jnp.int32), self.num_factors,
+                    jnp.asarray(pin_static, dtype=jnp.int32),
+                    self.num_factors,
                 )
                 log_p_factor = jnp.array(0.0, dtype=jnp.float32)
                 ent_factor_raw = jnp.array(0.0, dtype=jnp.float32)
@@ -899,9 +982,12 @@ class SparsityRatioAutoregRulePolicy(eqx.Module):
 
             new_active = active & (true_pair != PAIR_STOP)
             return (true_pair, true_factor, new_h, new_active), (
-                log_p_pair_eff, log_p_factor_eff,
-                pair_ent, factor_ent,
-                pair_dist, factor_dist,
+                log_p_pair_eff,
+                log_p_factor_eff,
+                pair_ent,
+                factor_ent,
+                pair_dist,
+                factor_dist,
             )
 
         _, (lp_pairs, lp_factors, ent_pairs, ent_factors, pair_dists, factor_dists) = (
@@ -953,8 +1039,15 @@ class SingleRulePolicy(eqx.Module):
             jnn.one_hot(0, self.num_factors), (self.max_rules, self.num_factors)
         )
 
-    def sample(self, vertex_context, v_pair_mask, v_factor_mask, key,
-               *, pin_factor_idx: int | None = None):
+    def sample(
+        self,
+        vertex_context,
+        v_pair_mask,
+        v_factor_mask,
+        key,
+        *,
+        pin_factor_idx: int | None = None,
+    ):
         # SingleRulePolicy ignores v_factor_mask and the pin: factor is
         # already fixed to the legacy "-1 / first-table-entry" by construction.
         del v_factor_mask, pin_factor_idx
@@ -964,10 +1057,23 @@ class SingleRulePolicy(eqx.Module):
             jnp.atleast_1d(pair_idx).astype(jnp.int32), self.max_rules, pad=PAIR_STOP
         )
         factor_seq = jnp.zeros((self.max_rules,), dtype=jnp.int32)
-        return pair_seq, factor_seq, self._padded_pair_dists(slot0_dist), self._degenerate_factor_dists()
+        return (
+            pair_seq,
+            factor_seq,
+            self._padded_pair_dists(slot0_dist),
+            self._degenerate_factor_dists(),
+        )
 
-    def evaluate(self, vertex_context, v_pair_mask, v_factor_mask, pair_seq, factor_seq,
-                 *, pin_factor_idx: int | None = None):
+    def evaluate(
+        self,
+        vertex_context,
+        v_pair_mask,
+        v_factor_mask,
+        pair_seq,
+        factor_seq,
+        *,
+        pin_factor_idx: int | None = None,
+    ):
         del v_factor_mask, pin_factor_idx
         slot0_dist = self._slot0_dist(vertex_context, v_pair_mask)
         pair_idx = pair_seq[0]
@@ -1028,8 +1134,17 @@ class SetTransformerAggregator(eqx.Module):
     op_embd_dim: int = eqx.field(static=True)
     num_features: int = eqx.field(static=True)
 
-    def __init__(self, *, num_features, op_embd_dim, hidden_dim, num_heads,
-                 embd_dim, vocab_size, key):
+    def __init__(
+        self,
+        *,
+        num_features,
+        op_embd_dim,
+        hidden_dim,
+        num_heads,
+        embd_dim,
+        vocab_size,
+        key,
+    ):
         keys = jrand.split(key, 4)
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
@@ -1039,10 +1154,14 @@ class SetTransformerAggregator(eqx.Module):
         # +op_embd_dim for op_emb, +num_features-1 for continuous features
         # (we drop column 0 since the op-type id is consumed by the embedding).
         self.input_proj = eqx.nn.Linear(
-            op_embd_dim + num_features - 1, hidden_dim, key=keys[1],
+            op_embd_dim + num_features - 1,
+            hidden_dim,
+            key=keys[1],
         )
         self.sample_attn = RelationalMultiheadAttention(
-            num_heads, hidden_dim, key=keys[2],
+            num_heads,
+            hidden_dim,
+            key=keys[2],
         )
         self.output_proj = eqx.nn.Linear(hidden_dim, embd_dim, key=keys[3])
 
@@ -1050,21 +1169,21 @@ class SetTransformerAggregator(eqx.Module):
         """``per_sample_features``: ``(S, V, F)``. Returns ``(V, embd_dim)``."""
         S, V, _ = per_sample_features.shape
         op_ids = per_sample_features[0, :, 0].astype(jnp.int32)
-        op_emb = jax.vmap(self.op_embedding)(op_ids)            # (V, op_d)
-        cont = per_sample_features[:, :, 1:]                    # (S, V, F-1)
+        op_emb = jax.vmap(self.op_embedding)(op_ids)  # (V, op_d)
+        cont = per_sample_features[:, :, 1:]  # (S, V, F-1)
         op_emb_b = jnp.broadcast_to(op_emb[None, :, :], (S, V, op_emb.shape[-1]))
-        combined = jnp.concatenate([op_emb_b, cont], axis=-1)   # (S, V, op_d+F-1)
-        h = jax.vmap(jax.vmap(self.input_proj))(combined)       # (S, V, hidden)
+        combined = jnp.concatenate([op_emb_b, cont], axis=-1)  # (S, V, op_d+F-1)
+        h = jax.vmap(jax.vmap(self.input_proj))(combined)  # (S, V, hidden)
 
         # Self-attention over samples, per-vertex independently.
-        h_perm = jnp.transpose(h, (1, 0, 2))                    # (V, S, hidden)
+        h_perm = jnp.transpose(h, (1, 0, 2))  # (V, S, hidden)
         attn_keys = jrand.split(key, V)
-        h_attn = jax.vmap(
-            lambda x, k: self.sample_attn(x, x, x, key=k)
-        )(h_perm, attn_keys)                                    # (V, S, hidden)
+        h_attn = jax.vmap(lambda x, k: self.sample_attn(x, x, x, key=k))(
+            h_perm, attn_keys
+        )  # (V, S, hidden)
 
-        pooled = jnp.mean(h_attn, axis=1)                       # (V, hidden)
-        return jax.vmap(self.output_proj)(pooled)               # (V, embd_dim)
+        pooled = jnp.mean(h_attn, axis=1)  # (V, hidden)
+        return jax.vmap(self.output_proj)(pooled)  # (V, embd_dim)
 
 
 class CachedEncoding(NamedTuple):
@@ -1076,11 +1195,11 @@ class CachedEncoding(NamedTuple):
     the only thing that varies inside an episode.
     """
 
-    enc_x: jax.Array          # (T, embd_dim) — full encoder output
-    token_mask: jax.Array     # (T,) bool, non-pad tokens
-    summary: jax.Array        # (embd_dim,) masked-mean over enc_x
-    vertex_logits_base: jax.Array     # (V,) before per-step masking
-    vertex_contexts_base: jax.Array   # (V, embd_dim) pre-residual / pre-data
+    enc_x: jax.Array  # (T, embd_dim) — full encoder output
+    token_mask: jax.Array  # (T,) bool, non-pad tokens
+    summary: jax.Array  # (embd_dim,) masked-mean over enc_x
+    vertex_logits_base: jax.Array  # (V,) before per-step masking
+    vertex_contexts_base: jax.Array  # (V, embd_dim) pre-residual / pre-data
 
 
 class ResidualStateUpdate(eqx.Module):
@@ -1125,7 +1244,8 @@ class ResidualStateUpdate(eqx.Module):
 
 
 def _axis_features_from_state(
-    axis_state_v: jax.Array, axis_valid_v: jax.Array,
+    axis_state_v: jax.Array,
+    axis_valid_v: jax.Array,
 ) -> AxisTokenFeatures:
     """Convert one row of `EnvState.axis_state` to :class:`AxisTokenFeatures`.
 
@@ -1298,7 +1418,8 @@ class Agent(eqx.Module):
         enc_key = key if key is not None else jrand.PRNGKey(0)
         enc_x = self.encoder(x, eqn_ids=eqn_ids, key=enc_key)
         vertex_logits_base, vertex_contexts_base = self.vertex_policy(
-            enc_x, token_mask,
+            enc_x,
+            token_mask,
         )
         summary = jnp.sum(enc_x * mask, axis=0) / jnp.maximum(
             jnp.sum(mask, axis=0), 1e-9
@@ -1311,8 +1432,9 @@ class Agent(eqx.Module):
             vertex_contexts_base=vertex_contexts_base,
         )
 
-    def _decode_from_cache(self, cached, vertex_features, residual_state,
-                           preference=None):
+    def _decode_from_cache(
+        self, cached, vertex_features, residual_state, preference=None
+    ):
         """Combine cached encoding with per-step residual_state / data feats /
         Stage F preference vector."""
         vertex_logits = cached.vertex_logits_base
@@ -1387,19 +1509,36 @@ class Agent(eqx.Module):
         return vertex_logits, vertex_contexts, value
 
     def value_for(
-        self, tokens, eqn_ids=None, vertex_features=None,
-        residual_state=None, preference=None, key=None,
+        self,
+        tokens,
+        eqn_ids=None,
+        vertex_features=None,
+        residual_state=None,
+        preference=None,
+        key=None,
     ):
         _, _, value = self.encode(
-            tokens, eqn_ids=eqn_ids, vertex_features=vertex_features,
-            residual_state=residual_state, preference=preference, key=key,
+            tokens,
+            eqn_ids=eqn_ids,
+            vertex_features=vertex_features,
+            residual_state=residual_state,
+            preference=preference,
+            key=key,
         )
         return value
 
     def sample_action(
-        self, tokens, vertex_avail_mask, pair_valid_mask, pair_factor_mask, key,
-        eqn_ids=None, vertex_features=None, residual_state=None,
-        cached_encoding=None, pin_rules_to_exact: bool = False,
+        self,
+        tokens,
+        vertex_avail_mask,
+        pair_valid_mask,
+        pair_factor_mask,
+        key,
+        eqn_ids=None,
+        vertex_features=None,
+        residual_state=None,
+        cached_encoding=None,
+        pin_rules_to_exact: bool = False,
         pin_factor_idx: int | None = None,
         preference=None,
         vertex_temperature=None,
@@ -1407,12 +1546,18 @@ class Agent(eqx.Module):
         net_key, vertex_key, rule_key = jrand.split(key, 3)
         if cached_encoding is None:
             vertex_logits, vertex_contexts, value = self.encode(
-                tokens, eqn_ids=eqn_ids, vertex_features=vertex_features,
-                residual_state=residual_state, preference=preference, key=net_key,
+                tokens,
+                eqn_ids=eqn_ids,
+                vertex_features=vertex_features,
+                residual_state=residual_state,
+                preference=preference,
+                key=net_key,
             )
         else:
             vertex_logits, vertex_contexts, value = self._decode_from_cache(
-                cached_encoding, vertex_features, residual_state,
+                cached_encoding,
+                vertex_features,
+                residual_state,
                 preference=preference,
             )
 
@@ -1439,7 +1584,10 @@ class Agent(eqx.Module):
         # compute is negligible next to the encoder.
         ps_pinned, fs_pinned, pd_pinned, fd_pinned = self._pinned_rule_outputs()
         ps_sampled, fs_sampled, pd_sampled, fd_sampled = self.rule_policy.sample(
-            v_context, v_pair_mask, v_factor_mask, rule_key,
+            v_context,
+            v_pair_mask,
+            v_factor_mask,
+            rule_key,
             pin_factor_idx=pin_factor_idx,
         )
         pin = jnp.asarray(pin_rules_to_exact, dtype=jnp.bool_)
@@ -1508,12 +1656,18 @@ class Agent(eqx.Module):
     ):
         if cached_encoding is None:
             vertex_logits, vertex_contexts, value = self.encode(
-                tokens, eqn_ids=eqn_ids, vertex_features=vertex_features,
-                residual_state=residual_state, preference=preference, key=key,
+                tokens,
+                eqn_ids=eqn_ids,
+                vertex_features=vertex_features,
+                residual_state=residual_state,
+                preference=preference,
+                key=key,
             )
         else:
             vertex_logits, vertex_contexts, value = self._decode_from_cache(
-                cached_encoding, vertex_features, residual_state,
+                cached_encoding,
+                vertex_features,
+                residual_state,
                 preference=preference,
             )
 
@@ -1532,18 +1686,23 @@ class Agent(eqx.Module):
         # evaluate path.
         _, _, pd_pinned, fd_pinned = self._pinned_rule_outputs()
         (
-            lp_pairs, lp_factors, ent_pairs, ent_factors, pd_sampled, fd_sampled,
+            lp_pairs,
+            lp_factors,
+            ent_pairs,
+            ent_factors,
+            pd_sampled,
+            fd_sampled,
         ) = self.rule_policy.evaluate(
-            v_context, v_pair_mask, v_factor_mask, pair_seq, factor_seq,
+            v_context,
+            v_pair_mask,
+            v_factor_mask,
+            pair_seq,
+            factor_seq,
             pin_factor_idx=pin_factor_idx,
         )
         pin = jnp.asarray(pin_rules_to_exact, dtype=jnp.bool_)
-        total_log_p_sampled = (
-            log_p_vertex + jnp.sum(lp_pairs) + jnp.sum(lp_factors)
-        )
-        total_entropy_sampled = (
-            vertex_ent + jnp.sum(ent_pairs) + jnp.sum(ent_factors)
-        )
+        total_log_p_sampled = log_p_vertex + jnp.sum(lp_pairs) + jnp.sum(lp_factors)
+        total_entropy_sampled = vertex_ent + jnp.sum(ent_pairs) + jnp.sum(ent_factors)
         total_log_p = jnp.where(pin, log_p_vertex, total_log_p_sampled)
         total_entropy = jnp.where(pin, vertex_ent, total_entropy_sampled)
         pair_dists = jnp.where(pin, pd_pinned, pd_sampled)
@@ -1566,10 +1725,10 @@ class Agent(eqx.Module):
         self,
         tokens,
         vertex_avail_mask,
-        axis_state,             # (total_v, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM) int32
-        axis_valid_mask,        # (total_v, MAX_AXES_PER_VERTEX) float32
+        axis_state,  # (total_v, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM) int32
+        axis_valid_mask,  # (total_v, MAX_AXES_PER_VERTEX) float32
         factor_tables: FactorTables,
-        op_legality_override,   # (NUM_OPS,) float32 — multiplied into op_legal (e.g. zeros COMPRESS)
+        op_legality_override,  # (NUM_OPS,) float32 — multiplied into op_legal (e.g. zeros COMPRESS)
         key,
         eqn_ids=None,
         vertex_features=None,
@@ -1595,13 +1754,18 @@ class Agent(eqx.Module):
         net_key, vertex_key, micro_key = jrand.split(key, 3)
         if cached_encoding is None:
             vertex_logits, vertex_contexts, value = self.encode(
-                tokens, eqn_ids=eqn_ids, vertex_features=vertex_features,
-                residual_state=residual_state, preference=preference,
+                tokens,
+                eqn_ids=eqn_ids,
+                vertex_features=vertex_features,
+                residual_state=residual_state,
+                preference=preference,
                 key=net_key,
             )
         else:
             vertex_logits, vertex_contexts, value = self._decode_from_cache(
-                cached_encoding, vertex_features, residual_state,
+                cached_encoding,
+                vertex_features,
+                residual_state,
                 preference=preference,
             )
 
@@ -1613,7 +1777,8 @@ class Agent(eqx.Module):
 
         v_context = vertex_contexts[vertex_idx]
         features = _axis_features_from_state(
-            axis_state[vertex_idx], axis_valid_mask[vertex_idx],
+            axis_state[vertex_idx],
+            axis_valid_mask[vertex_idx],
         )
 
         # The policy doesn't itself know about the override mask; we
@@ -1632,10 +1797,20 @@ class Agent(eqx.Module):
         # below we filter the returned action sequence and force every
         # COMPRESS to END if the override says so.
         (
-            actions, joint_logp, joint_ent, sub_episode_length,
-            op_dists, i_dists, j_dists, exp_dists,
+            actions,
+            joint_logp,
+            joint_ent,
+            sub_episode_length,
+            op_dists,
+            i_dists,
+            j_dists,
+            exp_dists,
+            kind_dists,
         ) = self.micro_action_policy.sample(
-            v_context, features, factor_tables, micro_key,
+            v_context,
+            features,
+            factor_tables,
+            micro_key,
         )
 
         # Apply the op-legality override post-hoc on both DIAG and
@@ -1650,33 +1825,40 @@ class Agent(eqx.Module):
         compress_allowed = op_legality_override[OP_COMPRESS] > 0.5
         is_diag = actions.op_type == OP_DIAG
         is_compress = actions.op_type == OP_COMPRESS
-        disallowed = (
-            (is_diag & ~diag_allowed) | (is_compress & ~compress_allowed)
-        )
+        disallowed = (is_diag & ~diag_allowed) | (is_compress & ~compress_allowed)
         rewritten_op = jnp.where(
             disallowed,
             jnp.full_like(actions.op_type, OP_END),
             actions.op_type,
         )
         # When op_type is rewritten to END the sampled i / j / exponents /
-        # factor are stale. Zero them so the recorded action is canonical
-        # (matches what sample_step produces for genuine END outputs).
+        # factor / kind are stale. Zero them so the recorded action is
+        # canonical (matches what sample_step produces for genuine END outputs).
         zeros_i = jnp.zeros_like(actions.i)
         zeros_j = jnp.zeros_like(actions.j)
         zeros_exp = jnp.zeros_like(actions.exponents)
         zeros_f = jnp.zeros_like(actions.factor)
+        zeros_k = jnp.zeros_like(actions.compress_kind)
         actions = MicroAction(
             op_type=rewritten_op,
             i=jnp.where(disallowed, zeros_i, actions.i),
             j=jnp.where(disallowed, zeros_j, actions.j),
             exponents=jnp.where(disallowed[..., None], zeros_exp, actions.exponents),
             factor=jnp.where(disallowed, zeros_f, actions.factor),
+            compress_kind=jnp.where(disallowed, zeros_k, actions.compress_kind),
         )
 
         return (
-            vertex_idx, actions, vertex_dist,
-            op_dists, i_dists, j_dists, exp_dists,
-            value, v_context,
+            vertex_idx,
+            actions,
+            vertex_dist,
+            op_dists,
+            i_dists,
+            j_dists,
+            exp_dists,
+            kind_dists,
+            value,
+            v_context,
         )
 
     def evaluate_action_dynamic(
@@ -1704,17 +1886,22 @@ class Agent(eqx.Module):
         """
         if self.micro_action_policy is None:
             raise RuntimeError(
-                "evaluate_action_dynamic called but micro_action_policy "
-                "is None."
+                "evaluate_action_dynamic called but micro_action_policy is None."
             )
         if cached_encoding is None:
             vertex_logits, vertex_contexts, value = self.encode(
-                tokens, eqn_ids=eqn_ids, vertex_features=vertex_features,
-                residual_state=residual_state, preference=preference, key=key,
+                tokens,
+                eqn_ids=eqn_ids,
+                vertex_features=vertex_features,
+                residual_state=residual_state,
+                preference=preference,
+                key=key,
             )
         else:
             vertex_logits, vertex_contexts, value = self._decode_from_cache(
-                cached_encoding, vertex_features, residual_state,
+                cached_encoding,
+                vertex_features,
+                residual_state,
                 preference=preference,
             )
 
@@ -1725,14 +1912,24 @@ class Agent(eqx.Module):
 
         v_context = vertex_contexts[vertex_idx]
         features = _axis_features_from_state(
-            axis_state[vertex_idx], axis_valid_mask[vertex_idx],
+            axis_state[vertex_idx],
+            axis_valid_mask[vertex_idx],
         )
 
         (
-            log_p_sub, ent_sub, sub_episode_length,
-            new_op_dists, new_i_dists, new_j_dists, new_exp_dists,
+            log_p_sub,
+            ent_sub,
+            sub_episode_length,
+            new_op_dists,
+            new_i_dists,
+            new_j_dists,
+            new_exp_dists,
+            new_kind_dists,
         ) = self.micro_action_policy.evaluate(
-            v_context, features, factor_tables, actions,
+            v_context,
+            features,
+            factor_tables,
+            actions,
         )
 
         total_log_p = log_p_vertex + log_p_sub
@@ -1740,13 +1937,23 @@ class Agent(eqx.Module):
         # Per-step dists are forwarded for KL tracking against the
         # rollout-time old-policy snapshots stored in the trajectory.
         return (
-            total_log_p, total_entropy, value, vertex_dist,
+            total_log_p,
+            total_entropy,
+            value,
+            vertex_dist,
             sub_episode_length,
-            new_op_dists, new_i_dists, new_j_dists, new_exp_dists,
+            new_op_dists,
+            new_i_dists,
+            new_j_dists,
+            new_exp_dists,
+            new_kind_dists,
         )
 
     def to_env_action_dynamic(
-        self, vertex_idx, actions: MicroAction, axis_state,
+        self,
+        vertex_idx,
+        actions: MicroAction,
+        axis_state,
     ):
         """Convert a sampled :class:`MicroAction` sequence into a legacy
         :class:`StepAction` the env can consume.
@@ -1764,8 +1971,12 @@ class Agent(eqx.Module):
         """
         axis_state_v = axis_state[vertex_idx]
         rule_specs = micro_actions_to_rule_specs_jax(
-            actions.op_type, actions.i, actions.j, actions.factor,
+            actions.op_type,
+            actions.i,
+            actions.j,
+            actions.factor,
             axis_state_v,
+            compress_kinds=actions.compress_kind,
         )
         return StepAction(
             target_vertex=jnp.asarray(vertex_idx + 1, dtype=jnp.int32),
@@ -1791,20 +2002,32 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--name", type=str, default="approx-ppo")
     p.add_argument("--gpus", type=str, default="0")
     p.add_argument("--seed", type=int, default=250197)
-    p.add_argument("--wandb", type=str, default="offline",
-                   choices=["disabled", "offline", "online"])
+    p.add_argument(
+        "--wandb",
+        type=str,
+        default="offline",
+        choices=["disabled", "offline", "online"],
+    )
     p.add_argument("--episodes", type=int, default=50)
     p.add_argument("--no-jit", action="store_true")
-    p.add_argument("--exec-on-gpu", action="store_true",
-                   help="Pin training to GPU 0 and the env eval callback to GPU 1.")
+    p.add_argument(
+        "--exec-on-gpu",
+        action="store_true",
+        help="Pin training to GPU 0 and the env eval callback to GPU 1.",
+    )
 
     # Environment / reward
     p.add_argument("--example", type=str, default="Helmholtz")
     p.add_argument("--disable-sparsification", action="store_true")
-    p.add_argument("--cmp-type", type=str, default="flops",
-                   choices=["graphax", "flops", "latency"])
-    p.add_argument("--mem-type", type=str, default="peak_memory",
-                   choices=["graphax", "bytes_accessed", "peak_memory"])
+    p.add_argument(
+        "--cmp-type", type=str, default="flops", choices=["graphax", "flops", "latency"]
+    )
+    p.add_argument(
+        "--mem-type",
+        type=str,
+        default="peak_memory",
+        choices=["graphax", "bytes_accessed", "peak_memory"],
+    )
     # Reward selection / weighting. The env now reports the full 8-component
     # vector `REWARD_NAMES` every step; these flags determine how those
     # components are combined into the scalar advantage used by PPO. The
@@ -1812,21 +2035,36 @@ def make_argparser() -> argparse.ArgumentParser:
     # `cmp` and `mem` mapped to whichever components `--cmp-type` / `--mem-type`
     # select. `--lambda-frob` is new and defaults to 0 (Frobenius residual is
     # measured but not weighted unless explicitly opted into).
-    p.add_argument("--rewards", nargs="+", type=str,
-                   default=["cmp", "mem", "acc"], choices=["cmp", "mem", "acc"])
+    p.add_argument(
+        "--rewards",
+        nargs="+",
+        type=str,
+        default=["cmp", "mem", "acc"],
+        choices=["cmp", "mem", "acc"],
+    )
     p.add_argument("--lambda-cmp", type=float, default=1.0)
     p.add_argument("--lambda-mem", type=float, default=1.0)
-    p.add_argument("--lambda-frob", type=float, default=0.0,
-                   help="Weight on the Frobenius-residual reward component (idx 7). Default 0.")
-    p.add_argument("--measure-latency", action="store_true",
-                   help="Run the compiled approx fn 10x per env step to populate the latency reward "
-                        "component. Significantly slower; turn on only when latency is being weighted.")
-    p.add_argument("--terminal-rewards-only", action="store_true",
-                   help="Compute the env's reward vector only at the final elimination step; "
-                        "intermediate steps return zeros. Skips per-step jacve compile/exec — the "
-                        "dominant rollout cost. PPO+GAE handles sparse rewards natively; the only "
-                        "knob to consider is reducing --potential-shaping (which assumes per-step "
-                        "value differences).")
+    p.add_argument(
+        "--lambda-frob",
+        type=float,
+        default=0.0,
+        help="Weight on the Frobenius-residual reward component (idx 7). Default 0.",
+    )
+    p.add_argument(
+        "--measure-latency",
+        action="store_true",
+        help="Run the compiled approx fn 10x per env step to populate the latency reward "
+        "component. Significantly slower; turn on only when latency is being weighted.",
+    )
+    p.add_argument(
+        "--terminal-rewards-only",
+        action="store_true",
+        help="Compute the env's reward vector only at the final elimination step; "
+        "intermediate steps return zeros. Skips per-step jacve compile/exec — the "
+        "dominant rollout cost. PPO+GAE handles sparse rewards natively; the only "
+        "knob to consider is reducing --potential-shaping (which assumes per-step "
+        "value differences).",
+    )
     p.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "none"])
     p.add_argument("--dataset-size", type=int, default=-1)
     p.add_argument("--num-eval-samples", type=int, default=10)
@@ -1865,49 +2103,74 @@ def make_argparser() -> argparse.ArgumentParser:
     # dropped by the legacy translator). Pass `--no-dynamic-substeps` to
     # fall back to the legacy AutoregRulePolicy (pair + categorical-factor
     # over a static factor table).
-    p.add_argument("--dynamic-substeps", action=argparse.BooleanOptionalAction,
-                   default=True,
-                   help="Use the heads.py MicroActionPolicy (default). Pass "
-                        "--no-dynamic-substeps to use the legacy "
-                        "AutoregRulePolicy with the static `--factors` table.")
-    p.add_argument("--max-substeps", type=int, default=2 * MAX_AXES_PER_VERTEX,
-                   help="Hard upper bound on sub-episode length per vertex. "
-                        "At runtime each vertex's cap is `2 × #active axes`; "
-                        "this flag is the static JAX-shape ceiling. Defaults "
-                        "to 2 × MAX_AXES_PER_VERTEX so the cap is never "
-                        "truncated by the static bound.")
-    p.add_argument("--max-axis-size", type=int, default=1024,
-                   help="Max bound on logical axis sizes for the precomputed "
-                        "FactorTables (gcd / prime / exp lookup). Must be ≥ "
-                        "the largest dim in the env's jaxpr. Memory cost is "
-                        "O(max_axis_size²) for the gcd table; 1024 ≈ 4 MiB.")
-    p.add_argument("--allow-compress", action="store_true",
-                   help="Enable COMPRESS legality in the MicroActionPolicy. "
-                        "Off by default because the legacy sparsity_specs "
-                        "env path silently drops COMPRESS rows — the policy "
-                        "would emit them but they wouldn't affect the env. "
-                        "Turn on only once graphax's vertex_elimination_jaxpr "
-                        "consumes typed micro-actions.")
-    p.add_argument("--axis-group-embedding", action="store_true",
-                   help="Add a learned per-DIAG-group embedding to each axis "
-                        "token in the AxisSetEncoder. Off by default: "
-                        "tag_bits[in_diag_group] already exposes group "
-                        "membership, and the embedding bloats proj_in by "
-                        "embd_dim plus a (max_groups+1, embd_dim) table. "
-                        "Turn on when you want the encoder to learn per-block "
-                        "representations beyond bare membership.")
+    p.add_argument(
+        "--dynamic-substeps",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the heads.py MicroActionPolicy (default). Pass "
+        "--no-dynamic-substeps to use the legacy "
+        "AutoregRulePolicy with the static `--factors` table.",
+    )
+    p.add_argument(
+        "--max-substeps",
+        type=int,
+        default=2 * MAX_AXES_PER_VERTEX,
+        help="Hard upper bound on sub-episode length per vertex. "
+        "At runtime each vertex's cap is `2 × #active axes`; "
+        "this flag is the static JAX-shape ceiling. Defaults "
+        "to 2 × MAX_AXES_PER_VERTEX so the cap is never "
+        "truncated by the static bound.",
+    )
+    p.add_argument(
+        "--max-axis-size",
+        type=int,
+        default=1024,
+        help="Max bound on logical axis sizes for the precomputed "
+        "FactorTables (gcd / prime / exp lookup). Must be ≥ "
+        "the largest dim in the env's jaxpr. Memory cost is "
+        "O(max_axis_size²) for the gcd table; 1024 ≈ 4 MiB.",
+    )
+    p.add_argument(
+        "--allow-compress",
+        action="store_true",
+        help="Enable COMPRESS legality in the MicroActionPolicy. "
+        "Off by default because the legacy sparsity_specs "
+        "env path silently drops COMPRESS rows — the policy "
+        "would emit them but they wouldn't affect the env. "
+        "Turn on only once graphax's vertex_elimination_jaxpr "
+        "consumes typed micro-actions.",
+    )
+    p.add_argument(
+        "--axis-group-embedding",
+        action="store_true",
+        help="Add a learned per-DIAG-group embedding to each axis "
+        "token in the AxisSetEncoder. Off by default: "
+        "tag_bits[in_diag_group] already exposes group "
+        "membership, and the embedding bloats proj_in by "
+        "embd_dim plus a (max_groups+1, embd_dim) table. "
+        "Turn on when you want the encoder to learn per-block "
+        "representations beyond bare membership.",
+    )
 
     # Multi-rule / autoregressive head config (ignored when --no-ptr or --not-autoreg)
-    p.add_argument("--max-rules", type=int, default=MAX_RULES_PER_VERTEX,
-                   help="Max number of (axis_pair, factor) rules per chosen vertex (autoregressive head only). "
-                        "Pending the heads.py rewrite this is a static upper bound; the future dynamic head will "
-                        "let sub-episodes terminate via END at any sub-step.")
-    p.add_argument("--factors", type=str, default="-1,1,2,4",
-                   help="Comma-separated factor choices for the per-rule factor head. "
-                        "Legacy sentinels: -1 = gcd-collapse, 0 = drop-axes (NOT semantically COMPRESS — "
-                        "real mean-COMPRESS lives in graphax.sparse.micro_actions.apply_compress and "
-                        "will be exposed as a distinct op once the heads.py rewrite lands). "
-                        "Going forward, prefer explicit positive divisors; the gcd is just one such value.")
+    p.add_argument(
+        "--max-rules",
+        type=int,
+        default=MAX_RULES_PER_VERTEX,
+        help="Max number of (axis_pair, factor) rules per chosen vertex (autoregressive head only). "
+        "Pending the heads.py rewrite this is a static upper bound; the future dynamic head will "
+        "let sub-episodes terminate via END at any sub-step.",
+    )
+    p.add_argument(
+        "--factors",
+        type=str,
+        default="-1,1,2,4",
+        help="Comma-separated factor choices for the per-rule factor head. "
+        "Legacy sentinels: -1 = gcd-collapse, 0 = drop-axes (NOT semantically COMPRESS — "
+        "real mean-COMPRESS lives in graphax.sparse.micro_actions.apply_compress and "
+        "will be exposed as a distinct op once the heads.py rewrite lands). "
+        "Going forward, prefer explicit positive divisors; the gcd is just one such value.",
+    )
 
     # Comparison-study variants. `custom` honours whatever was passed on the
     # CLI verbatim. The other values pre-set --factors / --max-rules /
@@ -1918,7 +2181,12 @@ def make_argparser() -> argparse.ArgumentParser:
         type=str,
         default="custom",
         choices=[
-            "custom", "ve_only", "diag_gcd", "diag_factor", "compress", "full",
+            "custom",
+            "ve_only",
+            "diag_gcd",
+            "diag_factor",
+            "compress",
+            "full",
         ],
         help=(
             "Pre-canned configuration mapping to --factors / --max-rules / "
@@ -1974,19 +2242,35 @@ def make_argparser() -> argparse.ArgumentParser:
     # Network architecture
     p.add_argument("--vocab-size", type=int, default=256)
     p.add_argument("--embd-dim", type=int, default=32)
-    p.add_argument("--op-embd-dim", type=int, default=8,
-                   help="Per-vertex op-type embedding dimension (Stage B.2.A).")
+    p.add_argument(
+        "--op-embd-dim",
+        type=int,
+        default=8,
+        help="Per-vertex op-type embedding dimension (Stage B.2.A).",
+    )
     p.add_argument("--num-layers", type=int, default=2)
     p.add_argument("--num-heads", type=int, default=2)
     p.add_argument("--hidden-dim", type=int, default=64)
-    p.add_argument("--policy-dims", type=str, default="64,32",
-                   help="MLP policy/sp head hidden widths (comma-separated).")
-    p.add_argument("--value-dims", type=str, default="64,32",
-                   help="MLP value head hidden widths (comma-separated).")
+    p.add_argument(
+        "--policy-dims",
+        type=str,
+        default="64,32",
+        help="MLP policy/sp head hidden widths (comma-separated).",
+    )
+    p.add_argument(
+        "--value-dims",
+        type=str,
+        default="64,32",
+        help="MLP value head hidden widths (comma-separated).",
+    )
 
     # Optimisation
-    p.add_argument("--num-envs", type=int, default=-1,
-                   help="Parallel rollout envs. -1 = os.cpu_count() (or 16 for Vmapped examples).")
+    p.add_argument(
+        "--num-envs",
+        type=int,
+        default=-1,
+        help="Parallel rollout envs. -1 = os.cpu_count() (or 16 for Vmapped examples).",
+    )
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--ppo-clip-eps", type=float, default=0.2)
@@ -1998,130 +2282,232 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-grad-norm", type=float, default=0.5)
     p.add_argument("--adam-b1", type=float, default=0.9)
     p.add_argument("--adam-eps", type=float, default=1e-7)
-    p.add_argument("--lr-decay-min-mult", type=float, default=0.1,
-                   help="Cosine decay floor as a multiple of the initial learning rate.")
-    p.add_argument("--head-init-scale", type=float, default=0.1,
-                   help="Multiplier applied to output-head weights at startup for a near-uniform initial policy.")
-    p.add_argument("--pretrained-encoder", type=str, default=None,
-                   help="Path to a `PretrainModel` saved by `alphagrad.approx.pretrain` "
-                        "(Stage B.5). When set, the embedding/pos_enc/encoder modules "
-                        "of the freshly-built agent are replaced with the pretrained ones.")
-    p.add_argument("--cache-encoding", action="store_true",
-                   help="Stage B.4.next: encode the residual jaxpr once at the start "
-                        "of each rollout episode and reuse the encoder output for every "
-                        "step. The residual state captures per-step variation; the value "
-                        "head consumes summary + W_residual @ mean(residual_state). At "
-                        "loss time the same cached path is used, so policy/value "
-                        "definitions match between rollout and training.")
-    p.add_argument("--pin-rules-to-exact", action="store_true",
-                   help="Stage C: pin the axis-pair / factor heads to exact-AD "
-                        "(every slot = STOP, factor 0). The rule policy is skipped "
-                        "entirely so gradient only flows through the vertex head. "
-                        "Use this when isolating elimination-order learning from "
-                        "approximation choice.")
-    p.add_argument("--pin-factor", type=int, default=None,
-                   help="Stage D: pin every emitted factor to this VALUE from "
-                        "--factors (e.g. -1 for the gcd-collapse / strict-diagonal "
-                        "default). The axis-pair head still trains; the factor "
-                        "head's contribution is deterministic so its log-prob "
-                        "and entropy are zero. Mutually exclusive with "
-                        "--pin-rules-to-exact.")
-    p.add_argument("--axis-warmup-steps", type=int, default=0,
-                   help="Stage D head curriculum (§3.2): linearly ramp the "
-                        "axis-pair head's LR multiplier from 1/3 → 1 over the "
-                        "first N optimizer steps after which point it stays at 1. "
-                        "0 = ramp disabled, full LR from step 0. The vertex and "
-                        "shared params always run at full base LR.")
-    p.add_argument("--factor-warmup-steps", type=int, default=0,
-                   help="Stage E head curriculum: same ramp, applied to the "
-                        "factor head. 0 = no ramp.")
-    p.add_argument("--sparsity-ratio", action="store_true",
-                   help="LEGACY ONLY (--no-dynamic-substeps): replace the "
-                        "categorical factor head with a scalar sparsity-ratio "
-                        "coordinate ρ ∈ [0, 1] that snap-mixes onto the two "
-                        "adjacent valid factors. Ignored in the default "
-                        "dynamic-substeps path (factors there come from the "
-                        "prime-exponent head).")
-    p.add_argument("--rho-prior-bias", type=float, default=4.0,
-                   help="Stage E prior anneal: initial bias added to the "
-                        "rho_head's output. With the default 4.0 the initial "
-                        "ρ ≈ sigmoid(4) = 0.982, matching Stage D's "
-                        "strict-diagonal pin. Gradient pulls the bias down "
-                        "as training learns useful per-op factors. Set to "
-                        "0 to disable the prior anneal entirely.")
-    p.add_argument("--preference-conditioned", action="store_true",
-                   help="Stage F: train a single preference-conditioned policy "
-                        "πθ(a | s, w) where w ∈ Δ^7 over the 8-vec reward simplex. "
-                        "w is sampled per episode from Dirichlet(α) with α set by "
-                        "--dirichlet-alpha; the same w drives advantage weighting. "
-                        "When off, the static --lambda-* CLI weights are used.")
-    p.add_argument("--dirichlet-alpha", type=float, default=0.3,
-                   help="Concentration parameter for the corner-emphasis "
-                        "component of the Stage F preference mixture. Values "
-                        "< 1 emphasise corners and edges of the simplex so "
-                        "the policy sees pure-FLOP / pure-quality regimes.")
-    p.add_argument("--dirichlet-alpha-uniform", type=float, default=1.0,
-                   help="Concentration parameter for the uniform-coverage "
-                        "component of the mixture. Spec calls for both "
-                        "corners and interior coverage; this is the interior "
-                        "side. Default α=1.0 yields a uniform Dirichlet.")
-    p.add_argument("--dirichlet-mix-ratio", type=float, default=0.5,
-                   help="Probability of drawing each per-env preference from "
-                        "the corner Dirichlet (the rest go through the "
-                        "uniform component). 0.5 ≈ even mixture (spec "
-                        "recommendation); 1.0 = corners only; 0.0 = uniform "
-                        "only.")
     p.add_argument(
-        "--lagrangian-constraint", action="append", default=[],
+        "--lr-decay-min-mult",
+        type=float,
+        default=0.1,
+        help="Cosine decay floor as a multiple of the initial learning rate.",
+    )
+    p.add_argument(
+        "--head-init-scale",
+        type=float,
+        default=0.1,
+        help="Multiplier applied to output-head weights at startup for a near-uniform initial policy.",
+    )
+    p.add_argument(
+        "--pretrained-encoder",
+        type=str,
+        default=None,
+        help="Path to a `PretrainModel` saved by `alphagrad.approx.pretrain` "
+        "(Stage B.5). When set, the embedding/pos_enc/encoder modules "
+        "of the freshly-built agent are replaced with the pretrained ones.",
+    )
+    p.add_argument(
+        "--cache-encoding",
+        action="store_true",
+        help="Stage B.4.next: encode the residual jaxpr once at the start "
+        "of each rollout episode and reuse the encoder output for every "
+        "step. The residual state captures per-step variation; the value "
+        "head consumes summary + W_residual @ mean(residual_state). At "
+        "loss time the same cached path is used, so policy/value "
+        "definitions match between rollout and training.",
+    )
+    p.add_argument(
+        "--pin-rules-to-exact",
+        action="store_true",
+        help="Stage C: pin the axis-pair / factor heads to exact-AD "
+        "(every slot = STOP, factor 0). The rule policy is skipped "
+        "entirely so gradient only flows through the vertex head. "
+        "Use this when isolating elimination-order learning from "
+        "approximation choice.",
+    )
+    p.add_argument(
+        "--pin-factor",
+        type=int,
+        default=None,
+        help="Stage D: pin every emitted factor to this VALUE from "
+        "--factors (e.g. -1 for the gcd-collapse / strict-diagonal "
+        "default). The axis-pair head still trains; the factor "
+        "head's contribution is deterministic so its log-prob "
+        "and entropy are zero. Mutually exclusive with "
+        "--pin-rules-to-exact.",
+    )
+    p.add_argument(
+        "--axis-warmup-steps",
+        type=int,
+        default=0,
+        help="Stage D head curriculum (§3.2): linearly ramp the "
+        "axis-pair head's LR multiplier from 1/3 → 1 over the "
+        "first N optimizer steps after which point it stays at 1. "
+        "0 = ramp disabled, full LR from step 0. The vertex and "
+        "shared params always run at full base LR.",
+    )
+    p.add_argument(
+        "--factor-warmup-steps",
+        type=int,
+        default=0,
+        help="Stage E head curriculum: same ramp, applied to the "
+        "factor head. 0 = no ramp.",
+    )
+    p.add_argument(
+        "--sparsity-ratio",
+        action="store_true",
+        help="LEGACY ONLY (--no-dynamic-substeps): replace the "
+        "categorical factor head with a scalar sparsity-ratio "
+        "coordinate ρ ∈ [0, 1] that snap-mixes onto the two "
+        "adjacent valid factors. Ignored in the default "
+        "dynamic-substeps path (factors there come from the "
+        "prime-exponent head).",
+    )
+    p.add_argument(
+        "--rho-prior-bias",
+        type=float,
+        default=4.0,
+        help="Stage E prior anneal: initial bias added to the "
+        "rho_head's output. With the default 4.0 the initial "
+        "ρ ≈ sigmoid(4) = 0.982, matching Stage D's "
+        "strict-diagonal pin. Gradient pulls the bias down "
+        "as training learns useful per-op factors. Set to "
+        "0 to disable the prior anneal entirely.",
+    )
+    p.add_argument(
+        "--preference-conditioned",
+        action="store_true",
+        help="Stage F: train a single preference-conditioned policy "
+        "πθ(a | s, w) where w ∈ Δ^7 over the 8-vec reward simplex. "
+        "w is sampled per episode from Dirichlet(α) with α set by "
+        "--dirichlet-alpha; the same w drives advantage weighting. "
+        "When off, the static --lambda-* CLI weights are used.",
+    )
+    p.add_argument(
+        "--dirichlet-alpha",
+        type=float,
+        default=0.3,
+        help="Concentration parameter for the corner-emphasis "
+        "component of the Stage F preference mixture. Values "
+        "< 1 emphasise corners and edges of the simplex so "
+        "the policy sees pure-FLOP / pure-quality regimes.",
+    )
+    p.add_argument(
+        "--dirichlet-alpha-uniform",
+        type=float,
+        default=1.0,
+        help="Concentration parameter for the uniform-coverage "
+        "component of the mixture. Spec calls for both "
+        "corners and interior coverage; this is the interior "
+        "side. Default α=1.0 yields a uniform Dirichlet.",
+    )
+    p.add_argument(
+        "--dirichlet-mix-ratio",
+        type=float,
+        default=0.5,
+        help="Probability of drawing each per-env preference from "
+        "the corner Dirichlet (the rest go through the "
+        "uniform component). 0.5 ≈ even mixture (spec "
+        "recommendation); 1.0 = corners only; 0.0 = uniform "
+        "only.",
+    )
+    p.add_argument(
+        "--lagrangian-constraint",
+        action="append",
+        default=[],
         metavar="NAME>=THRESH",
         help="Stage F hard-constraint deployment. Each occurrence adds a "
-             "constraint of the form `<reward_name>>=<threshold>` (rewards "
-             "are 'higher is better'; e.g. cosine_sim>=0.8, or for cost "
-             "components flops>=-1e10 to cap FLOPs at 1e10). The trainer "
-             "augments the per-step advantage with -λ_i · max(0, t_i - r_i) "
-             "and updates λ_i ≥ 0 by dual ascent on the mean violation. "
-             "May be repeated; default no constraints (= unconstrained PPO).",
+        "constraint of the form `<reward_name>>=<threshold>` (rewards "
+        "are 'higher is better'; e.g. cosine_sim>=0.8, or for cost "
+        "components flops>=-1e10 to cap FLOPs at 1e10). The trainer "
+        "augments the per-step advantage with -λ_i · max(0, t_i - r_i) "
+        "and updates λ_i ≥ 0 by dual ascent on the mean violation. "
+        "May be repeated; default no constraints (= unconstrained PPO).",
     )
     p.add_argument(
-        "--lagrangian-lr", type=float, default=1e-2,
+        "--lagrangian-lr",
+        type=float,
+        default=1e-2,
         help="Dual-ascent step size on the Lagrangian multipliers, applied "
-             "once per episode against the mean per-step violation.",
+        "once per episode against the mean per-step violation.",
     )
-    p.add_argument("--calibrate-steps", type=int, default=0,
-                   help="Stage G: after the main training loop, run this many "
-                        "few-shot calibration episodes against the env's "
-                        "calibration samples. Only the factor head and Set "
-                        "Transformer aggregator update; all other modules are "
-                        "frozen via gradient masking. Reward weights for these "
-                        "episodes are quality-focused (cosine + Frob) so the "
-                        "calibration signal matches what the spec calls for.")
-    p.add_argument("--calibrate-lr", type=float, default=1e-3,
-                   help="Adam learning rate for the calibration optimizer. "
-                        "Independent of the main optimizer's state, since "
-                        "the calibration signal is a different objective.")
-    p.add_argument("--potential-shaping", type=float, default=0.0,
-                   help="Stage C: scale on potential-based reward shaping. "
-                        "Augments per-step reward with `c · (γ V_ψ(s') - V_ψ(s))` "
-                        "(values stop-gradient'd) so long-horizon vertex-elim "
-                        "rollouts get a denser per-step learning signal "
-                        "without biasing the optimum (Ng et al. 1999). "
-                        "0.0 disables; spec recommends starting around 0.1.")
-    p.add_argument("--bc-warmstart-steps", type=int, default=0,
-                   help="Stage C: number of supervised cross-entropy steps "
-                        "training the vertex pointer to match the Markowitz "
-                        "min-degree heuristic before PPO begins. 0 = skip.")
-    p.add_argument("--bc-lr", type=float, default=1e-3,
-                   help="Learning rate for the BC warm-start phase.")
-    p.add_argument("--set-transformer-agg", action="store_true",
-                   help="Stage B.3: aggregate per-vertex features across the "
-                        "calibration samples with a learned Set Transformer "
-                        "instead of a simple mean. Lets the policy distinguish "
-                        "stable behaviour from sample-specific accidents.")
+    # Cosine-similarity band: keep cosine_sim in [lower, upper] via the
+    # Lagrangian. Lower nudges the policy away from collapsing accuracy to
+    # zero; upper prevents it from saturating at perfect agreement and
+    # spending the remaining compute on quality nobody can spend. Set
+    # ``--cosine-lower-bound <= 0`` or ``--cosine-upper-bound >= 1`` to
+    # disable either side.
+    p.add_argument(
+        "--cosine-lower-bound",
+        type=float,
+        default=0.8,
+        help="Floor on cosine_sim enforced via a Lagrangian multiplier. "
+        "Default 0.8. Pass 0.0 to disable.",
+    )
+    p.add_argument(
+        "--cosine-upper-bound",
+        type=float,
+        default=0.9,
+        help="Ceiling on cosine_sim enforced via a Lagrangian multiplier. "
+        "Default 0.9. Pass 1.0 to disable.",
+    )
+    p.add_argument(
+        "--calibrate-steps",
+        type=int,
+        default=0,
+        help="Stage G: after the main training loop, run this many "
+        "few-shot calibration episodes against the env's "
+        "calibration samples. Only the factor head and Set "
+        "Transformer aggregator update; all other modules are "
+        "frozen via gradient masking. Reward weights for these "
+        "episodes are quality-focused (cosine + Frob) so the "
+        "calibration signal matches what the spec calls for.",
+    )
+    p.add_argument(
+        "--calibrate-lr",
+        type=float,
+        default=1e-3,
+        help="Adam learning rate for the calibration optimizer. "
+        "Independent of the main optimizer's state, since "
+        "the calibration signal is a different objective.",
+    )
+    p.add_argument(
+        "--potential-shaping",
+        type=float,
+        default=0.0,
+        help="Stage C: scale on potential-based reward shaping. "
+        "Augments per-step reward with `c · (γ V_ψ(s') - V_ψ(s))` "
+        "(values stop-gradient'd) so long-horizon vertex-elim "
+        "rollouts get a denser per-step learning signal "
+        "without biasing the optimum (Ng et al. 1999). "
+        "0.0 disables; spec recommends starting around 0.1.",
+    )
+    p.add_argument(
+        "--bc-warmstart-steps",
+        type=int,
+        default=0,
+        help="Stage C: number of supervised cross-entropy steps "
+        "training the vertex pointer to match the Markowitz "
+        "min-degree heuristic before PPO begins. 0 = skip.",
+    )
+    p.add_argument(
+        "--bc-lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for the BC warm-start phase.",
+    )
+    p.add_argument(
+        "--set-transformer-agg",
+        action="store_true",
+        help="Stage B.3: aggregate per-vertex features across the "
+        "calibration samples with a learned Set Transformer "
+        "instead of a simple mean. Lets the policy distinguish "
+        "stable behaviour from sample-specific accidents.",
+    )
 
     # Reporting
     p.add_argument("--top-n", type=int, default=10)
-    p.add_argument("--capture-perfect-grads", action="store_true",
-                   help="Allow the top-N accuracy heap to keep trajectories with cosine similarity == 1.0.")
+    p.add_argument(
+        "--capture-perfect-grads",
+        action="store_true",
+        help="Allow the top-N accuracy heap to keep trajectories with cosine similarity == 1.0.",
+    )
 
     return p
 
@@ -2227,13 +2613,20 @@ def _build_factor_table(args, use_autoreg: bool):
 # CLI flags later in argv still win because argparse picks the last
 # occurrence — see `_apply_variant_preset` for the merge order.
 VARIANT_PRESETS: dict[str, dict] = {
-    "custom":       {},
-    "ve_only":      {"pin_rules_to_exact": True},
-    "diag_gcd":     {"factors": "-1",            "max_rules": 1, "pin_rules_to_exact": False},
-    "diag_factor":  {"factors": "2,3,4,8,16",    "max_rules": 1, "pin_rules_to_exact": False},
-    "compress":     None,  # blocked on heads.py / atomic COMPRESS wiring
-    "full":         {"factors": "-1,2,3,4,8,16", "max_rules": MAX_RULES_PER_VERTEX,
-                     "pin_rules_to_exact": False},
+    "custom": {},
+    "ve_only": {"pin_rules_to_exact": True},
+    "diag_gcd": {"factors": "-1", "max_rules": 1, "pin_rules_to_exact": False},
+    "diag_factor": {
+        "factors": "2,3,4,8,16",
+        "max_rules": 1,
+        "pin_rules_to_exact": False,
+    },
+    "compress": None,  # blocked on heads.py / atomic COMPRESS wiring
+    "full": {
+        "factors": "-1,2,3,4,8,16",
+        "max_rules": MAX_RULES_PER_VERTEX,
+        "pin_rules_to_exact": False,
+    },
 }
 
 
@@ -2247,9 +2640,7 @@ def _apply_variant_preset(args, variant: str | None = None):
     """
     name = variant if variant is not None else getattr(args, "variant", "custom")
     if name not in VARIANT_PRESETS:
-        raise ValueError(
-            f"Unknown --variant '{name}'. Valid: {list(VARIANT_PRESETS)}."
-        )
+        raise ValueError(f"Unknown --variant '{name}'. Valid: {list(VARIANT_PRESETS)}.")
     preset = VARIANT_PRESETS[name]
     if preset is None:
         raise NotImplementedError(
@@ -2279,9 +2670,7 @@ def make_curriculum_schedule(args, curriculum_stages):
     calls (which read them with ``int(...)``).
     """
     steps_per_episode = args.ppo_epochs * args.minibatches
-    stage_step_counts = [
-        max(n * steps_per_episode, 1) for _, n in curriculum_stages
-    ]
+    stage_step_counts = [max(n * steps_per_episode, 1) for _, n in curriculum_stages]
     boundaries: list[int] = [0]
     for s in stage_step_counts:
         boundaries.append(boundaries[-1] + s)
@@ -2293,7 +2682,8 @@ def make_curriculum_schedule(args, curriculum_stages):
         # happen but the optimizer will keep stepping after the last
         # episode if the trainer over-runs).
         lr = jnp.asarray(
-            args.lr * args.lr_decay_min_mult, dtype=jnp.float32,
+            args.lr * args.lr_decay_min_mult,
+            dtype=jnp.float32,
         )
         for i, stage_steps in enumerate(stage_step_counts):
             lo = boundaries[i]
@@ -2315,7 +2705,8 @@ def make_curriculum_schedule(args, curriculum_stages):
 
 
 def _current_stage_at(
-    stages: list[tuple[str, int]], ep: int,
+    stages: list[tuple[str, int]],
+    ep: int,
 ) -> str:
     """Map an episode index to the variant of the stage it falls into.
 
@@ -2333,7 +2724,8 @@ def _current_stage_at(
 
 
 def _micro_introduction_stage(
-    curriculum_stages: list[tuple[str, int]], allow_compress: bool,
+    curriculum_stages: list[tuple[str, int]],
+    allow_compress: bool,
 ) -> int:
     """First stage index where the dynamic head sees gradient signal.
 
@@ -2362,7 +2754,8 @@ def _pin_rules_for_variant(variant: str) -> bool:
 
 
 def _op_legality_for_variant(
-    variant: str, allow_compress: bool,
+    variant: str,
+    allow_compress: bool,
 ) -> jax.Array:
     """Per-variant op-type legality mask for the dynamic action space.
 
@@ -2433,9 +2826,7 @@ def _parse_curriculum(spec: str) -> list[tuple[str, int]]:
                 "not an integer."
             ) from e
         if n_episodes <= 0:
-            raise ValueError(
-                f"Curriculum stage '{chunk}': episode count must be > 0."
-            )
+            raise ValueError(f"Curriculum stage '{chunk}': episode count must be > 0.")
         stages.append((name, n_episodes))
     return stages
 
@@ -2464,7 +2855,10 @@ def _build_agent(
     embedding = eqx.nn.Embedding(args.vocab_size, args.embd_dim, key=encoder_keys[0])
     pos_enc = PositionalEncoder(args.embd_dim, MAX_TOKENS)
     encoder = Encoder(
-        args.num_layers, args.num_heads, args.embd_dim, args.hidden_dim,
+        args.num_layers,
+        args.num_heads,
+        args.embd_dim,
+        args.hidden_dim,
         key=encoder_keys[1],
     )
     if use_pointer:
@@ -2486,8 +2880,8 @@ def _build_agent(
         # path uses the prime-exponent head instead. Silently downgrade to
         # plain AutoregRulePolicy when both flags are on so the unused
         # legacy rule_policy doesn't carry the heavier ρ module.
-        use_sparsity_ratio = (
-            args.sparsity_ratio and not getattr(args, "dynamic_substeps", False)
+        use_sparsity_ratio = args.sparsity_ratio and not getattr(
+            args, "dynamic_substeps", False
         )
         if use_sparsity_ratio:
             sparsity_ratios = _compute_sparsity_ratios(
@@ -2528,19 +2922,26 @@ def _build_agent(
     value_head_mem = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[5])
     value_head_acc = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[12])
     op_embedding = eqx.nn.Embedding(
-        OP_TYPE_VOCAB_SIZE, args.op_embd_dim, key=encoder_keys[6],
+        OP_TYPE_VOCAB_SIZE,
+        args.op_embd_dim,
+        key=encoder_keys[6],
     )
     # Continuous part of the feature vector = NUM_VERTEX_FEATURES - 1 (we drop
     # column 0 / op_type_id which is consumed by the embedding).
     proj_in_dim = args.op_embd_dim + NUM_VERTEX_FEATURES - 1
     vertex_feature_proj = eqx.nn.Linear(
-        proj_in_dim, args.embd_dim, key=encoder_keys[7],
+        proj_in_dim,
+        args.embd_dim,
+        key=encoder_keys[7],
     )
     residual_update = ResidualStateUpdate(
-        residual_dim=args.embd_dim, key=encoder_keys[8],
+        residual_dim=args.embd_dim,
+        key=encoder_keys[8],
     )
     residual_to_summary = eqx.nn.Linear(
-        args.embd_dim, args.embd_dim, key=encoder_keys[9],
+        args.embd_dim,
+        args.embd_dim,
+        key=encoder_keys[9],
     )
     # Hidden dim must be divisible by num_heads — keep it at embd_dim for
     # simplicity. The aggregator is small (one attention block over the
@@ -2554,9 +2955,7 @@ def _build_agent(
         vocab_size=OP_TYPE_VOCAB_SIZE,
         key=encoder_keys[10],
     )
-    pref_proj = eqx.nn.Linear(
-        NUM_VALUE_HEADS, args.embd_dim, key=encoder_keys[11]
-    )
+    pref_proj = eqx.nn.Linear(NUM_VALUE_HEADS, args.embd_dim, key=encoder_keys[11])
     # Dynamic-substeps head: only constructed when the flag is on so the
     # default agent stays leaner (one extra encoder + MicroActionHead is
     # non-trivial parameter cost).
@@ -2631,29 +3030,39 @@ def _scale_output_heads(agent, scale: float, use_pointer: bool, use_autoreg: boo
     # data embedding is `0` and the agent's behaviour at step 0 matches the
     # B.1 agent. Gradient still flows in normally once training starts.
     agent = scale_module_weight(
-        agent, lambda a: a.vertex_feature_proj.weight, 0.0,
+        agent,
+        lambda a: a.vertex_feature_proj.weight,
+        0.0,
     )
     # B.3: zero the Set Transformer's output projection too. Same idea —
     # initial data embedding from the per-sample path is exactly zero, so
     # toggling --set-transformer-agg doesn't perturb the initial policy.
     agent = scale_module_weight(
-        agent, lambda a: a.set_transformer_agg.output_proj.weight, 0.0,
+        agent,
+        lambda a: a.set_transformer_agg.output_proj.weight,
+        0.0,
     )
     # Stage B.4: zero the residual-update event projection so the residual
     # state contributes nothing at initialisation. Same idea — keeps the
     # initial policy distribution uncorrupted by uninitialised additive paths.
     agent = scale_module_weight(
-        agent, lambda a: a.residual_update.event_proj.weight, 0.0,
+        agent,
+        lambda a: a.residual_update.event_proj.weight,
+        0.0,
     )
     # B.4.next: zero residual_to_summary so the cached-encoding value path
     # produces the same initial summary as the re-encoding path.
     agent = scale_module_weight(
-        agent, lambda a: a.residual_to_summary.weight, 0.0,
+        agent,
+        lambda a: a.residual_to_summary.weight,
+        0.0,
     )
     # F: zero the preference projection so the conditioned and
     # unconditioned paths produce identical step-0 policies on the same seed.
     agent = scale_module_weight(
-        agent, lambda a: a.pref_proj.weight, 0.0,
+        agent,
+        lambda a: a.pref_proj.weight,
+        0.0,
     )
     # Dynamic-substeps heads — scale the four output projections so the
     # initial typed-action distribution is also near-uniform. The base
@@ -2662,7 +3071,9 @@ def _scale_output_heads(agent, scale: float, use_pointer: bool, use_autoreg: boo
     # the same trade-off the legacy rule-head scaling makes.
     if agent.micro_action_policy is not None:
         agent = scale_module_weight(
-            agent, lambda a: a.micro_action_policy.head.op_head.proj.weight, scale,
+            agent,
+            lambda a: a.micro_action_policy.head.op_head.proj.weight,
+            scale,
         )
         agent = scale_module_weight(
             agent,
@@ -2683,8 +3094,12 @@ def _scale_output_heads(agent, scale: float, use_pointer: bool, use_autoreg: boo
 
 
 def _action_to_pylist(vertex_seq, pair_seq, factor_seq, max_rules, factor_table_np):
-    """Decode legacy `(vertex, pair, factor)` sequences into
-    ``(vertex, [(idx1, idx2, factor), ...])``.
+    """Decode legacy `(vertex, pair, factor)` sequences into copy-pastable lists.
+
+    Each entry is ``(vertex, [diag(idx1, idx2, factor), ...])`` — every emitted
+    rule renders as a call to ``graphax.sparse.micro_actions.diag``. PAIR_STOP
+    (and every slot past it) is dropped from the output so a no-rule vertex
+    becomes the empty list ``[]``.
 
     This is the LEGACY-mode display formatter. In `--dynamic-substeps`
     mode the legacy `pair_seq` / `factor_seq` are zero-filled and the
@@ -2693,7 +3108,7 @@ def _action_to_pylist(vertex_seq, pair_seq, factor_seq, max_rules, factor_table_
     """
     out = []
     for v_idx, p_row, f_row in zip(vertex_seq, pair_seq, factor_seq):
-        rules: list[tuple[int, int, int]] = []
+        rules: list[str] = []
         for slot in range(max_rules):
             p = int(p_row[slot])
             if p == PAIR_STOP:
@@ -2701,36 +3116,59 @@ def _action_to_pylist(vertex_seq, pair_seq, factor_seq, max_rules, factor_table_
             base = _PAIR_TO_BASE[p]
             base_idx1, base_idx2 = int(base[0]), int(base[1])
             factor = int(factor_table_np[int(f_row[slot])])
-            rules.append((base_idx1, base_idx2, factor))
+            rules.append(f"diag({base_idx1}, {base_idx2}, {factor})")
         out.append((int(v_idx) + 1, rules))
     return out
 
 
-_OP_NAME = {0: "DIAG", 1: "COMPRESS", 2: "END"}
-
-
 def _action_to_pylist_dynamic(
-    vertex_seq, op_seq, i_seq, j_seq, factor_seq, max_substeps,
+    vertex_seq,
+    op_seq,
+    i_seq,
+    j_seq,
+    factor_seq,
+    kind_seq,
+    max_substeps,
 ):
-    """Decode typed micro-action sequences into a readable per-vertex list.
+    """Decode typed micro-action sequences into copy-pastable per-vertex lists.
 
-    Each entry is ``(vertex, [(op_name, i, j, factor), ...])`` where the
-    sub-list contains every sub-step up to and including the first END
-    (``j`` and ``factor`` are 0 for COMPRESS / END). Mirrors the legacy
-    formatter's shape so the existing top-N heap / wandb logging code
-    can render either flavour uniformly.
+    Each entry is ``(vertex, [<call>, ...])`` where ``<call>`` is one of:
+
+    * ``diag(i, j, factor)`` for an OP_DIAG sub-step.
+    * ``compress("kind", axis)`` for an OP_COMPRESS sub-step (the kind
+      is the string from :data:`COMPRESS_KINDS` at the sampled index).
+
+    OP_END (and every sub-step past it) is dropped from the output, so a
+    vertex whose sub-episode is just OP_END renders as ``(v, [])`` —
+    matching how the user reads the no-approximation case.
     """
     out = []
-    for v_idx, op_row, i_row, j_row, f_row in zip(
-        vertex_seq, op_seq, i_seq, j_seq, factor_seq,
+    for v_idx, op_row, i_row, j_row, f_row, k_row in zip(
+        vertex_seq,
+        op_seq,
+        i_seq,
+        j_seq,
+        factor_seq,
+        kind_seq,
     ):
-        steps: list[tuple[str, int, int, int]] = []
+        steps: list[str] = []
         for slot in range(max_substeps):
             op = int(op_row[slot])
-            name = _OP_NAME.get(op, f"OP{op}")
-            steps.append((name, int(i_row[slot]), int(j_row[slot]), int(f_row[slot])))
-            if name == "END":
+            if op == OP_END:
                 break
+            if op == OP_DIAG:
+                steps.append(
+                    f"diag({int(i_row[slot])}, {int(j_row[slot])}, {int(f_row[slot])})"
+                )
+            elif op == OP_COMPRESS:
+                k = int(k_row[slot])
+                if 0 <= k < len(COMPRESS_KINDS):
+                    kind_name = COMPRESS_KINDS[k]
+                else:
+                    kind_name = f"kind{k}"
+                steps.append(f"compress({kind_name!r}, {int(i_row[slot])})")
+            else:
+                steps.append(f"op{op}({int(i_row[slot])}, {int(j_row[slot])})")
         out.append((int(v_idx) + 1, steps))
     return out
 
@@ -2763,28 +3201,42 @@ def _mem_reward_index(mem_type: str) -> int:
     return REWARD_INDEX[_MEM_TYPE_TO_REWARD[mem_type]]
 
 
-def parse_lagrangian_constraints(specs: list[str]) -> list[tuple[int, float]]:
-    """Parse ``--lagrangian-constraint`` strings to ``(reward_idx, threshold)`` pairs.
+def parse_lagrangian_constraints(specs: list[str]) -> list[tuple[int, float, int]]:
+    """Parse ``--lagrangian-constraint`` strings to ``(idx, threshold, sign)`` triples.
 
-    Format is ``<reward_name>>=<threshold>`` matching the canonical
-    ``REWARD_NAMES``. The constraint is interpreted as ``reward[idx] ≥
-    threshold`` (rewards are higher-is-better; cost components are stored
-    negated).
+    Supported forms:
+
+    * ``<reward_name>>=<threshold>``  → ``reward[idx] ≥ threshold``
+      (sign +1; violation when reward dips below the floor).
+    * ``<reward_name><=<threshold>``  → ``reward[idx] ≤ threshold``
+      (sign −1; violation when reward exceeds the ceiling — useful for
+      bounding quality terms like ``cosine_sim<=0.9`` so the policy is
+      pushed to leave compute / memory headroom rather than maxing out
+      perfect agreement).
+
+    Rewards are higher-is-better (cost components are stored negated).
     """
-    parsed: list[tuple[int, float]] = []
+    parsed: list[tuple[int, float, int]] = []
     for s in specs:
-        if ">=" not in s:
+        if ">=" in s:
+            op = ">="
+            sign = 1
+        elif "<=" in s:
+            op = "<="
+            sign = -1
+        else:
             raise ValueError(
-                f"--lagrangian-constraint must be of the form NAME>=THRESH, got {s!r}"
+                f"--lagrangian-constraint must be of the form NAME>=THRESH "
+                f"or NAME<=THRESH, got {s!r}"
             )
-        name, thresh_s = s.split(">=", 1)
+        name, thresh_s = s.split(op, 1)
         name = name.strip()
         if name not in REWARD_INDEX:
             raise ValueError(
                 f"Unknown reward name {name!r} in constraint {s!r}; "
                 f"valid names: {list(REWARD_INDEX.keys())}"
             )
-        parsed.append((REWARD_INDEX[name], float(thresh_s.strip())))
+        parsed.append((REWARD_INDEX[name], float(thresh_s.strip()), sign))
     return parsed
 
 
@@ -2855,9 +3307,7 @@ _HEAD_PATH_MARKERS: dict[str, tuple[str, ...]] = {
         "rule_policy.decoder.rho_head",  # Stage E sparsity-ratio variant
         "rule_policy.decoder.factor_embed",
     ),
-    "aggregator": (
-        "set_transformer_agg",
-    ),
+    "aggregator": ("set_transformer_agg",),
 }
 
 
@@ -2870,10 +3320,12 @@ def _build_param_mask(agent, predicate) -> "jax.Array":
     where each leaf is True iff its path matches ``predicate(path_str)``."""
     params = eqx.filter(agent, eqx.is_inexact_array)
     leaves_with_path, treedef = jax.tree_util.tree_flatten_with_path(params)
-    return treedef.unflatten([
-        jnp.full_like(leaf, predicate(jax.tree_util.keystr(path)), dtype=jnp.bool_)
-        for path, leaf in leaves_with_path
-    ])
+    return treedef.unflatten(
+        [
+            jnp.full_like(leaf, predicate(jax.tree_util.keystr(path)), dtype=jnp.bool_)
+            for path, leaf in leaves_with_path
+        ]
+    )
 
 
 def _build_head_masks(agent):
@@ -2922,8 +3374,16 @@ def _head_lr_mult(step: "jax.Array", warmup_steps: int) -> "jax.Array":
 
 
 def _scale_grads(
-    grads, axis_mask, factor_mask, vertex_mask, micro_mask, freeze_mask,
-    axis_mult, factor_mult, vertex_mult, micro_mult,
+    grads,
+    axis_mask,
+    factor_mask,
+    vertex_mask,
+    micro_mask,
+    freeze_mask,
+    axis_mult,
+    factor_mult,
+    vertex_mult,
+    micro_mult,
 ):
     """Single fused per-leaf gradient scaling.
 
@@ -2938,25 +3398,43 @@ def _scale_grads(
     return jax.tree_util.tree_map(
         lambda g, am, fm, vm, mm, fz: jnp.where(
             fz,
-            g * jnp.where(
-                am, axis_mult,
+            g
+            * jnp.where(
+                am,
+                axis_mult,
                 jnp.where(
-                    fm, factor_mult,
+                    fm,
+                    factor_mult,
                     jnp.where(
-                        vm, vertex_mult,
+                        vm,
+                        vertex_mult,
                         jnp.where(mm, micro_mult, 1.0),
                     ),
                 ),
             ),
             jnp.zeros_like(g),
         ),
-        grads, axis_mask, factor_mask, vertex_mask, micro_mask, freeze_mask,
+        grads,
+        axis_mask,
+        factor_mask,
+        vertex_mask,
+        micro_mask,
+        freeze_mask,
     )
 
 
 def run_calibration_phase(
-    agent, opt_state, env, env_episode_template_args,
-    *, train_episode, reset_envs, num_envs, args, global_step, key,
+    agent,
+    opt_state,
+    env,
+    env_episode_template_args,
+    *,
+    train_episode,
+    reset_envs,
+    num_envs,
+    args,
+    global_step,
+    key,
 ):
     """Stage G: few-shot calibration loop.
 
@@ -2998,6 +3476,7 @@ def run_calibration_phase(
     # constraint arrays so the augmentation in train_episode is a no-op.
     no_idx = jnp.zeros((0,), dtype=jnp.int32)
     no_thr = jnp.zeros((0,), dtype=jnp.float32)
+    no_sign = jnp.zeros((0,), dtype=jnp.float32)
     no_lam = jnp.zeros((0,), dtype=jnp.float32)
 
     for step_idx in range(args.calibrate_steps):
@@ -3006,8 +3485,12 @@ def run_calibration_phase(
         eval_samples = generate_eval_samples(env, ep_eval_key, args.num_eval_samples)
         env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
         vertex_features = _episode_vertex_features(
-            args, closed_jaxpr.jaxpr, tuple(closed_jaxpr.literals),
-            base_args, eval_samples=eval_samples, argnums=argnums,
+            args,
+            closed_jaxpr.jaxpr,
+            tuple(closed_jaxpr.literals),
+            base_args,
+            eval_samples=eval_samples,
+            argnums=argnums,
         )
         env_states = reset_envs(env_episode)
         # Calibration uses the env's current op-legality (no per-stage
@@ -3021,11 +3504,29 @@ def run_calibration_phase(
         else:
             cal_override = jnp.ones((NUM_OPS,), dtype=jnp.float32)
         (
-            agent, opt_state, _, _metrics, totals, _actions, global_step,
-            _new_lam, _diag_pack,
+            agent,
+            opt_state,
+            _,
+            _metrics,
+            totals,
+            _actions,
+            global_step,
+            _new_lam,
+            _diag_pack,
         ) = train_episode(
-            agent, opt_state, env_states, env_episode, vertex_features,
-            cal_pref, global_step, ep_key, cal_mask, no_lam, no_idx, no_thr,
+            agent,
+            opt_state,
+            env_states,
+            env_episode,
+            vertex_features,
+            cal_pref,
+            global_step,
+            ep_key,
+            cal_mask,
+            no_lam,
+            no_idx,
+            no_thr,
+            no_sign,
             cal_override,
             jnp.array(1.0, dtype=jnp.float32),  # calibration: no curriculum scaling
             # Calibration runs with the env's static pin_rules_to_exact:
@@ -3045,8 +3546,12 @@ def run_calibration_phase(
 
 
 def _episode_vertex_features(
-    args, jaxpr, consts: tuple, base_args: tuple,
-    eval_samples, argnums: tuple,
+    args,
+    jaxpr,
+    consts: tuple,
+    base_args: tuple,
+    eval_samples,
+    argnums: tuple,
 ) -> "jax.Array":
     """Single dispatch site for the per-vertex feature computation.
 
@@ -3057,7 +3562,8 @@ def _episode_vertex_features(
     """
     fn = (
         compute_per_sample_vertex_features
-        if args.set_transformer_agg else compute_vertex_features
+        if args.set_transformer_agg
+        else compute_vertex_features
     )
     return jnp.asarray(
         fn(jaxpr, consts, base_args, eval_samples=eval_samples, argnums=argnums),
@@ -3070,8 +3576,9 @@ def _episode_vertex_features(
 # ---------------------------------------------------------------------------
 
 
-def _markowitz_bc_dataset(env, target_order, total_v, embd_dim,
-                          vertex_valid_static, num_valid):
+def _markowitz_bc_dataset(
+    env, target_order, total_v, embd_dim, vertex_valid_static, num_valid
+):
     """Roll the env forward following ``target_order`` to produce a list of
     (tokens, eqn_ids, vertex_avail, residual_state, target_vertex_idx) tuples.
 
@@ -3081,22 +3588,33 @@ def _markowitz_bc_dataset(env, target_order, total_v, embd_dim,
     state = env.reset(num_envs=0)
     residual_state = jnp.zeros((total_v, embd_dim), dtype=jnp.float32)
     samples = []
-    empty_specs = jnp.full(
-        (MAX_RULES_PER_VERTEX, 3), -1, dtype=jnp.int32,
-    ).at[..., 2].set(0)
+    empty_specs = (
+        jnp.full(
+            (MAX_RULES_PER_VERTEX, 3),
+            -1,
+            dtype=jnp.int32,
+        )
+        .at[..., 2]
+        .set(0)
+    )
 
     for v_id in target_order:
         vertex_avail = vertex_avail_at_step(
-            state, vertex_valid_static, total_v, num_valid,
+            state,
+            vertex_valid_static,
+            total_v,
+            num_valid,
         )
         target_idx = jnp.asarray(int(v_id) - 1, dtype=jnp.int32)
-        samples.append((
-            state.tokens.astype(jnp.int32),
-            state.eqn_ids.astype(jnp.int32),
-            vertex_avail,
-            residual_state,
-            target_idx,
-        ))
+        samples.append(
+            (
+                state.tokens.astype(jnp.int32),
+                state.eqn_ids.astype(jnp.int32),
+                vertex_avail,
+                residual_state,
+                target_idx,
+            )
+        )
         action = StepAction(
             target_vertex=jnp.asarray(int(v_id), dtype=jnp.int32),
             rule_specs=empty_specs,
@@ -3111,13 +3629,22 @@ def _markowitz_bc_dataset(env, target_order, total_v, embd_dim,
     return samples
 
 
-def _bc_warmstart_step(agent, opt_state, optimizer, sample, vertex_features,
-                       pair_valid_mask, pair_factor_mask, key):
+def _bc_warmstart_step(
+    agent,
+    opt_state,
+    optimizer,
+    sample,
+    vertex_features,
+    pair_valid_mask,
+    pair_factor_mask,
+    key,
+):
     tokens, eqn_ids, vertex_avail, residual_state, target_idx = sample
 
     def loss_fn(agent):
         vertex_logits, _vertex_contexts, _value = agent.encode(
-            tokens, eqn_ids=eqn_ids,
+            tokens,
+            eqn_ids=eqn_ids,
             vertex_features=vertex_features,
             residual_state=residual_state,
             key=key,
@@ -3128,35 +3655,55 @@ def _bc_warmstart_step(agent, opt_state, optimizer, sample, vertex_features,
 
     loss, grads = eqx.filter_value_and_grad(loss_fn)(agent)
     updates, new_opt_state = optimizer.update(
-        grads, opt_state, eqx.filter(agent, eqx.is_inexact_array),
+        grads,
+        opt_state,
+        eqx.filter(agent, eqx.is_inexact_array),
     )
     new_agent = eqx.apply_updates(agent, updates)
     return new_agent, new_opt_state, loss
 
 
 def run_bc_warmstart(
-    agent, env, target_order, total_v, embd_dim,
-    vertex_valid_static, num_valid,
-    vertex_features, pair_valid_mask, pair_factor_mask,
-    n_steps, lr, key,
+    agent,
+    env,
+    target_order,
+    total_v,
+    embd_dim,
+    vertex_valid_static,
+    num_valid,
+    vertex_features,
+    pair_valid_mask,
+    pair_factor_mask,
+    n_steps,
+    lr,
+    key,
 ):
     """Run ``n_steps`` of supervised cross-entropy on the vertex pointer head
     against the Markowitz heuristic. Returns the warm-started agent."""
-    print(
-        f"BC warmstart: {n_steps} steps against Markowitz order {list(target_order)}"
-    )
+    print(f"BC warmstart: {n_steps} steps against Markowitz order {list(target_order)}")
     bc_optimizer = optax.adam(lr)
     bc_opt_state = bc_optimizer.init(eqx.filter(agent, eqx.is_inexact_array))
     samples = _markowitz_bc_dataset(
-        env, target_order, total_v, embd_dim, vertex_valid_static, num_valid,
+        env,
+        target_order,
+        total_v,
+        embd_dim,
+        vertex_valid_static,
+        num_valid,
     )
     losses = []
     for step in range(n_steps):
         sample = samples[step % len(samples)]
         step_key, key = jrand.split(key)
         agent, bc_opt_state, loss = _bc_warmstart_step(
-            agent, bc_opt_state, bc_optimizer, sample, vertex_features,
-            pair_valid_mask, pair_factor_mask, step_key,
+            agent,
+            bc_opt_state,
+            bc_optimizer,
+            sample,
+            vertex_features,
+            pair_valid_mask,
+            pair_factor_mask,
+            step_key,
         )
         losses.append(float(loss))
         if step == 0 or step == n_steps - 1 or step % max(1, n_steps // 10) == 0:
@@ -3184,6 +3731,7 @@ def _setup_jax_compile_cache() -> None:
     )
     try:
         from jax.experimental.compilation_cache import compilation_cache
+
         compilation_cache.set_cache_dir(cache_dir)
     except Exception:
         pass
@@ -3227,6 +3775,7 @@ def main():
         # wrong-shape rule outputs.
         if not args.dynamic_substeps:
             from collections import Counter
+
             stage_factors = []
             stage_max_rules = []
             for stage_name, _ in curriculum_stages:
@@ -3280,7 +3829,9 @@ def main():
 
     target_fn = get_fn(args.example)
     xs = get_args(args.example, args_key, dataset=dataset_for_call)
-    gen = data_gen(args.example, dataset=dataset_for_call, dataset_size=args.dataset_size)
+    gen = data_gen(
+        args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
+    )
     closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
     env_target_fun = target_fn if "acc" in args.rewards else None
     argnums = infer_argnums(args.example)
@@ -3320,7 +3871,9 @@ def main():
     )
 
     # Hyperparameters / agent.
-    factor_table, factors_py, num_factors, max_rules = _build_factor_table(args, use_autoreg)
+    factor_table, factors_py, num_factors, max_rules = _build_factor_table(
+        args, use_autoreg
+    )
     factor_table_np = np.array(factors_py, dtype=np.int32)
 
     # Resolve --pin-factor to an index in the factor_table. Mutually exclusive
@@ -3364,7 +3917,8 @@ def main():
     # drops the invalid slot. Pass an all-ones tensor in the shape the
     # autoreg factor head expects.
     pair_factor_mask = jnp.ones(
-        (total_v, NUM_PAIR_CHOICES, num_factors), dtype=jnp.float32,
+        (total_v, NUM_PAIR_CHOICES, num_factors),
+        dtype=jnp.float32,
     )
 
     # Dynamic-substeps state: only constructed when the flag is on, but
@@ -3395,10 +3949,24 @@ def main():
         )
         op_legality_override = jnp.ones((NUM_OPS,), dtype=jnp.float32)
 
-    print(
-        f"variant={variant_label}, num_envs={num_envs}, max_rules={max_rules}, "
-        f"factors={factors_py}, rollout_length={num_valid}, minibatches={args.minibatches}"
-    )
+    # In dynamic-substeps mode the static `--factors` table is unused (the
+    # prime-exponent head emits factors on the fly), so don't pollute the
+    # banner with it.
+    if args.dynamic_substeps:
+        print(
+            f"variant={variant_label}, num_envs={num_envs}, max_rules={max_rules}, "
+            f"rollout_length={num_valid}, minibatches={args.minibatches}"
+        )
+    else:
+        print(
+            f"variant={variant_label}, num_envs={num_envs}, max_rules={max_rules}, "
+            f"factors={factors_py}, rollout_length={num_valid}, "
+            f"minibatches={args.minibatches}"
+        )
+    # Reward-vector column order: top-N / progress-bar dumps print eight
+    # floats per episode without per-column labels, so name the order
+    # once here.
+    print(f"reward order: {', '.join(REWARD_NAMES)}")
     # Catch the "20-samples-into-32-minibatches → 0-elem minibatch → silent NaN
     # loss" pitfall as early as possible. `shuffle_and_batch` does integer
     # division (num_envs * rollout_length // minibatches); when the result is
@@ -3433,6 +4001,7 @@ def main():
     agent = _scale_output_heads(agent, args.head_init_scale, use_pointer, use_autoreg)
     if args.pretrained_encoder:
         from alphagrad.approx.pretrain import load_pretrained_encoder
+
         agent = load_pretrained_encoder(args.pretrained_encoder, agent)
         print(f"Loaded pretrained encoder from {args.pretrained_encoder}")
 
@@ -3453,20 +4022,34 @@ def main():
 
     if args.bc_warmstart_steps > 0:
         from alphagrad.approx.heuristics import markowitz_order
+
         target_order = markowitz_order(closed_jaxpr.jaxpr, env.valid_vertices)
         # BC needs vertex_features for the data-conditioned encode; reuse the
         # episode-0 features against the env's initial args so the supervised
         # signal is computed in a regime consistent with the upcoming PPO.
         bc_vertex_features = _episode_vertex_features(
-            args, closed_jaxpr.jaxpr, tuple(closed_jaxpr.literals),
-            tuple(xs), eval_samples=None, argnums=tuple(argnums),
+            args,
+            closed_jaxpr.jaxpr,
+            tuple(closed_jaxpr.literals),
+            tuple(xs),
+            eval_samples=None,
+            argnums=tuple(argnums),
         )
         bc_key, key = jrand.split(key)
         agent = run_bc_warmstart(
-            agent, env, target_order, total_v, args.embd_dim,
-            vertex_valid_static, num_valid,
-            bc_vertex_features, pair_valid_mask, pair_factor_mask,
-            args.bc_warmstart_steps, args.bc_lr, bc_key,
+            agent,
+            env,
+            target_order,
+            total_v,
+            args.embd_dim,
+            vertex_valid_static,
+            num_valid,
+            bc_vertex_features,
+            pair_valid_mask,
+            pair_factor_mask,
+            args.bc_warmstart_steps,
+            args.bc_lr,
+            bc_key,
         )
     if args.exec_on_gpu:
         agent = jax.tree_util.tree_map(
@@ -3509,8 +4092,15 @@ def main():
     @eqx.filter_jit
     @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None, 0, None, None))
     def rollout_fn(
-        agent, env_obj, rollout_length, env_state, key, vertex_features,
-        preference, op_legality_override, pin_rules_to_exact_jax,
+        agent,
+        env_obj,
+        rollout_length,
+        env_state,
+        key,
+        vertex_features,
+        preference,
+        op_legality_override,
+        pin_rules_to_exact_jax,
     ):
         keys = jrand.split(key, rollout_length)
         # Stage B.4: per-vertex residual state, initialised to zero at episode
@@ -3523,7 +4113,9 @@ def main():
         encode_key, scan_key = jrand.split(keys[0], 2)
         if args.cache_encoding:
             cached_encoding = agent.encode_once(
-                env_state.tokens, eqn_ids=env_state.eqn_ids, key=encode_key,
+                env_state.tokens,
+                eqn_ids=env_state.eqn_ids,
+                key=encode_key,
             )
             initial_tokens = env_state.tokens
             initial_eqn_ids = env_state.eqn_ids
@@ -3539,29 +4131,41 @@ def main():
         _legacy_zero_pair_seq = jnp.zeros((args.max_rules,), dtype=jnp.int32)
         _legacy_zero_factor_seq = jnp.zeros((args.max_rules,), dtype=jnp.int32)
         _legacy_zero_pair_dists = jnp.zeros(
-            (args.max_rules, NUM_PAIR_CHOICES), dtype=jnp.float32,
+            (args.max_rules, NUM_PAIR_CHOICES),
+            dtype=jnp.float32,
         )
         _legacy_zero_factor_dists = jnp.zeros(
-            (args.max_rules, num_factors), dtype=jnp.float32,
+            (args.max_rules, num_factors),
+            dtype=jnp.float32,
         )
         _dyn_zero_op_seq = jnp.zeros((args.max_substeps,), dtype=jnp.int32)
         _dyn_zero_i_seq = jnp.zeros((args.max_substeps,), dtype=jnp.int32)
         _dyn_zero_j_seq = jnp.zeros((args.max_substeps,), dtype=jnp.int32)
         _dyn_zero_exp_seq = jnp.zeros(
-            (args.max_substeps, MAX_PRIMES), dtype=jnp.int32,
+            (args.max_substeps, MAX_PRIMES),
+            dtype=jnp.int32,
         )
         _dyn_zero_factor_seq = jnp.zeros((args.max_substeps,), dtype=jnp.int32)
         _dyn_zero_op_dists = jnp.zeros(
-            (args.max_substeps, NUM_OPS), dtype=jnp.float32,
+            (args.max_substeps, NUM_OPS),
+            dtype=jnp.float32,
         )
         _dyn_zero_i_dists = jnp.zeros(
-            (args.max_substeps, MAX_AXES_PER_VERTEX), dtype=jnp.float32,
+            (args.max_substeps, MAX_AXES_PER_VERTEX),
+            dtype=jnp.float32,
         )
         _dyn_zero_j_dists = jnp.zeros(
-            (args.max_substeps, MAX_AXES_PER_VERTEX), dtype=jnp.float32,
+            (args.max_substeps, MAX_AXES_PER_VERTEX),
+            dtype=jnp.float32,
         )
         _dyn_zero_exp_dists = jnp.zeros(
-            (args.max_substeps, MAX_PRIMES, MAX_EXPONENT + 1), dtype=jnp.float32,
+            (args.max_substeps, MAX_PRIMES, MAX_EXPONENT + 1),
+            dtype=jnp.float32,
+        )
+        _dyn_zero_kind_seq = jnp.zeros((args.max_substeps,), dtype=jnp.int32)
+        _dyn_zero_kind_dists = jnp.zeros(
+            (args.max_substeps, NUM_COMPRESS_KINDS),
+            dtype=jnp.float32,
         )
 
         def step_fn(carry, k):
@@ -3580,6 +4184,7 @@ def main():
                     micro_i_dists,
                     micro_j_dists,
                     micro_exp_dists,
+                    micro_kind_dists,
                     value,
                     v_context,
                 ) = agent.sample_action_dynamic(
@@ -3597,7 +4202,9 @@ def main():
                     preference=preference if args.preference_conditioned else None,
                 )
                 env_action = agent.to_env_action_dynamic(
-                    vertex_idx, micro_actions, state.axis_state,
+                    vertex_idx,
+                    micro_actions,
+                    state.axis_state,
                 )
                 # Legacy fields zero-filled; dynamic fields populated.
                 pair_seq = _legacy_zero_pair_seq
@@ -3609,6 +4216,7 @@ def main():
                 micro_j_seq = micro_actions.j
                 micro_exp_seq = micro_actions.exponents
                 micro_factor_seq = micro_actions.factor
+                micro_compress_kind_seq = micro_actions.compress_kind
             else:
                 (
                     vertex_idx,
@@ -3642,10 +4250,12 @@ def main():
                 micro_j_seq = _dyn_zero_j_seq
                 micro_exp_seq = _dyn_zero_exp_seq
                 micro_factor_seq = _dyn_zero_factor_seq
+                micro_compress_kind_seq = _dyn_zero_kind_seq
                 micro_op_dists = _dyn_zero_op_dists
                 micro_i_dists = _dyn_zero_i_dists
                 micro_j_dists = _dyn_zero_j_dists
                 micro_exp_dists = _dyn_zero_exp_dists
+                micro_kind_dists = _dyn_zero_kind_dists
             env_out = env_obj.step(state, env_action)
             next_state = env_out.state
             raw_rewards = env_out.reward
@@ -3659,21 +4269,30 @@ def main():
             # coefficient is zero.
 
             new_residual = agent.update_residual(
-                residual_state, vertex_idx, v_context,
+                residual_state,
+                vertex_idx,
+                v_context,
             )
 
             pref_arg = preference if args.preference_conditioned else None
-            next_value = agent.value_for(
-                next_state.tokens, eqn_ids=next_state.eqn_ids,
-                vertex_features=vertex_features,
-                residual_state=new_residual,
-                preference=pref_arg,
-                key=next_net_key,
-            ) if not args.cache_encoding else (
-                agent._decode_from_cache(
-                    cached_encoding, vertex_features, new_residual,
+            next_value = (
+                agent.value_for(
+                    next_state.tokens,
+                    eqn_ids=next_state.eqn_ids,
+                    vertex_features=vertex_features,
+                    residual_state=new_residual,
                     preference=pref_arg,
-                )[2]
+                    key=next_net_key,
+                )
+                if not args.cache_encoding
+                else (
+                    agent._decode_from_cache(
+                        cached_encoding,
+                        vertex_features,
+                        new_residual,
+                        preference=pref_arg,
+                    )[2]
+                )
             )
 
             if args.potential_shaping != 0.0:
@@ -3715,6 +4334,7 @@ def main():
                 micro_j_seq=micro_j_seq,
                 micro_exp_seq=micro_exp_seq,
                 micro_factor_seq=micro_factor_seq,
+                micro_compress_kind_seq=micro_compress_kind_seq,
                 reward=jnp.atleast_1d(rewards),
                 done=jnp.array(done, dtype=jnp.float32),
                 value=jnp.atleast_1d(value),
@@ -3726,18 +4346,25 @@ def main():
                 micro_i_dists=micro_i_dists,
                 micro_j_dists=micro_j_dists,
                 micro_exp_dists=micro_exp_dists,
+                micro_kind_dists=micro_kind_dists,
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
             )
             return (next_state, new_residual), (transition, raw_rewards)
 
         (final_state, _), (traj, all_raw_rewards) = lax.scan(
-            step_fn, (env_state, init_residual), keys,
+            step_fn,
+            (env_state, init_residual),
+            keys,
         )
         return final_state, traj, all_raw_rewards[-1]
 
     def loss_fn(
-        agent, batch: TrainBatch, vertex_features, key, pin_rules_to_exact_jax,
+        agent,
+        batch: TrainBatch,
+        vertex_features,
+        key,
+        pin_rules_to_exact_jax,
     ):
         # Dynamic-substeps path branches off here so the legacy path
         # stays exactly as written. `_dynamic_loss_fn` lives below and
@@ -3753,7 +4380,9 @@ def main():
         #   2. Per-step cache: flat `(B, ...)`, encode each entry separately.
         #   3. No cache: flat `(B, ...)`, no cached encoding (None).
         # `cached_flat` is the only thing that changes between regimes.
-        pref_or_none = (lambda p: p) if args.preference_conditioned else (lambda _: None)
+        pref_or_none = (
+            (lambda p: p) if args.preference_conditioned else (lambda _: None)
+        )
 
         if batch.tokens.ndim == 3:
             E, K = batch.tokens.shape[:2]
@@ -3762,10 +4391,12 @@ def main():
                 lambda t, e, k: agent.encode_once(t, eqn_ids=e, key=k)
             )(batch.tokens[:, 0], batch.eqn_ids[:, 0], jrand.split(enc_key, E))
             batch = jax.tree_util.tree_map(
-                lambda x: x.reshape(E * K, *x.shape[2:]), batch,
+                lambda x: x.reshape(E * K, *x.shape[2:]),
+                batch,
             )
             cached_flat = jax.tree_util.tree_map(
-                lambda x: jnp.repeat(x, K, axis=0), cached_per_traj,
+                lambda x: jnp.repeat(x, K, axis=0),
+                cached_per_traj,
             )
             keys = jrand.split(eval_key, E * K)
         elif args.cache_encoding:
@@ -3781,10 +4412,18 @@ def main():
 
         def _eval_one(toks, eids, rs, pref, vidx, pseq, fseq, vmask, cached, k):
             return agent.evaluate_action(
-                toks, vidx, pseq, fseq, vmask,
-                pair_valid_mask, pair_factor_mask, k,
-                eqn_ids=eids, vertex_features=vertex_features,
-                residual_state=rs, cached_encoding=cached,
+                toks,
+                vidx,
+                pseq,
+                fseq,
+                vmask,
+                pair_valid_mask,
+                pair_factor_mask,
+                k,
+                eqn_ids=eids,
+                vertex_features=vertex_features,
+                residual_state=rs,
+                cached_encoding=cached,
                 pin_rules_to_exact=pin_rules_to_exact_jax,
                 pin_factor_idx=pin_factor_idx,
                 preference=pref_or_none(pref),
@@ -3793,21 +4432,37 @@ def main():
         if cached_flat is None:
             # vmap can't ingest `None` over the cached axis; collapse to a
             # variant that hard-codes ``cached=None`` instead.
-            (log_probs, entropies, values, vertex_dist, pair_dists,
-             factor_dists) = jax.vmap(
-                lambda toks, eids, rs, pref, vidx, pseq, fseq, vmask, k:
-                    _eval_one(toks, eids, rs, pref, vidx, pseq, fseq, vmask, None, k)
-            )(
-                batch.tokens, batch.eqn_ids, batch.residual_state, batch.preference,
-                batch.vertex_idx, batch.pair_seq, batch.factor_seq,
-                batch.vertex_avail_mask, keys,
+            (log_probs, entropies, values, vertex_dist, pair_dists, factor_dists) = (
+                jax.vmap(
+                    lambda toks, eids, rs, pref, vidx, pseq, fseq, vmask, k: _eval_one(
+                        toks, eids, rs, pref, vidx, pseq, fseq, vmask, None, k
+                    )
+                )(
+                    batch.tokens,
+                    batch.eqn_ids,
+                    batch.residual_state,
+                    batch.preference,
+                    batch.vertex_idx,
+                    batch.pair_seq,
+                    batch.factor_seq,
+                    batch.vertex_avail_mask,
+                    keys,
+                )
             )
         else:
-            (log_probs, entropies, values, vertex_dist, pair_dists,
-             factor_dists) = jax.vmap(_eval_one)(
-                batch.tokens, batch.eqn_ids, batch.residual_state, batch.preference,
-                batch.vertex_idx, batch.pair_seq, batch.factor_seq,
-                batch.vertex_avail_mask, cached_flat, keys,
+            (log_probs, entropies, values, vertex_dist, pair_dists, factor_dists) = (
+                jax.vmap(_eval_one)(
+                    batch.tokens,
+                    batch.eqn_ids,
+                    batch.residual_state,
+                    batch.preference,
+                    batch.vertex_idx,
+                    batch.pair_seq,
+                    batch.factor_seq,
+                    batch.vertex_avail_mask,
+                    cached_flat,
+                    keys,
+                )
             )
 
         old_log_probs = jax.vmap(old_log_prob_for_action)(
@@ -3834,14 +4489,11 @@ def main():
         # and `old_log_prob_for_action`. Dividing the joint entropy by this
         # keeps long sub-episodes from dominating the entropy bonus.
         is_stop_seq = batch.pair_seq == PAIR_STOP
-        prior_stops = (
-            jnp.cumsum(is_stop_seq.astype(jnp.int32), axis=-1)
-            - is_stop_seq.astype(jnp.int32)
-        )
+        prior_stops = jnp.cumsum(
+            is_stop_seq.astype(jnp.int32), axis=-1
+        ) - is_stop_seq.astype(jnp.int32)
         pair_active_mask = (prior_stops == 0).astype(jnp.float32)
-        factor_active_mask = (
-            (prior_stops == 0) & (~is_stop_seq)
-        ).astype(jnp.float32)
+        factor_active_mask = ((prior_stops == 0) & (~is_stop_seq)).astype(jnp.float32)
         sub_episode_lengths = (
             1.0
             + jnp.sum(pair_active_mask, axis=-1)
@@ -3898,11 +4550,15 @@ def main():
             # dynamic-mode specific; the legacy values fill the first
             # three to preserve some signal for the per-component KL
             # dashboard panels.
-            jnp.stack([
-                vertex_kl, pair_kl, factor_kl,
-                jnp.array(0.0, dtype=jnp.float32),
-                jnp.array(0.0, dtype=jnp.float32),
-            ]),
+            jnp.stack(
+                [
+                    vertex_kl,
+                    pair_kl,
+                    factor_kl,
+                    jnp.array(0.0, dtype=jnp.float32),
+                    jnp.array(0.0, dtype=jnp.float32),
+                ]
+            ),
             # Per-component entropies — legacy path doesn't currently
             # surface vertex/pair/factor entropies separately (the
             # evaluate_action return is summed), so all 5 slots are 0.
@@ -3937,10 +4593,12 @@ def main():
                 lambda t, e, k: agent.encode_once(t, eqn_ids=e, key=k)
             )(batch.tokens[:, 0], batch.eqn_ids[:, 0], jrand.split(enc_key, E))
             batch = jax.tree_util.tree_map(
-                lambda x: x.reshape(E * K, *x.shape[2:]), batch,
+                lambda x: x.reshape(E * K, *x.shape[2:]),
+                batch,
             )
             cached_flat = jax.tree_util.tree_map(
-                lambda x: jnp.repeat(x, K, axis=0), cached_per_traj,
+                lambda x: jnp.repeat(x, K, axis=0),
+                cached_per_traj,
             )
             keys = jrand.split(eval_key, E * K)
         elif args.cache_encoding:
@@ -3960,46 +4618,89 @@ def main():
             j=batch.micro_j_seq,
             exponents=batch.micro_exp_seq,
             factor=batch.micro_factor_seq,
+            compress_kind=batch.micro_compress_kind_seq,
         )
 
         def _eval_dyn(toks, eids, rs, pref, vidx, action, vmask, cached, k):
             return agent.evaluate_action_dynamic(
-                toks, vidx, action, vmask,
-                env.axis_state_static, env.axis_valid_static,
-                factor_tables, k,
-                eqn_ids=eids, vertex_features=vertex_features,
-                residual_state=rs, cached_encoding=cached,
+                toks,
+                vidx,
+                action,
+                vmask,
+                env.axis_state_static,
+                env.axis_valid_static,
+                factor_tables,
+                k,
+                eqn_ids=eids,
+                vertex_features=vertex_features,
+                residual_state=rs,
+                cached_encoding=cached,
                 preference=pref_or_none(pref),
             )
 
         if cached_flat is None:
             (
-                log_probs, entropies, values, new_vertex_dist, sub_lengths,
-                new_op_dists, new_i_dists, new_j_dists, new_exp_dists,
+                log_probs,
+                entropies,
+                values,
+                new_vertex_dist,
+                sub_lengths,
+                new_op_dists,
+                new_i_dists,
+                new_j_dists,
+                new_exp_dists,
+                new_kind_dists,
             ) = jax.vmap(
-                lambda toks, eids, rs, pref, vidx, action, vmask, k:
-                    _eval_dyn(toks, eids, rs, pref, vidx, action, vmask, None, k)
+                lambda toks, eids, rs, pref, vidx, action, vmask, k: _eval_dyn(
+                    toks, eids, rs, pref, vidx, action, vmask, None, k
+                )
             )(
-                batch.tokens, batch.eqn_ids, batch.residual_state, batch.preference,
-                batch.vertex_idx, actions, batch.vertex_avail_mask, keys,
+                batch.tokens,
+                batch.eqn_ids,
+                batch.residual_state,
+                batch.preference,
+                batch.vertex_idx,
+                actions,
+                batch.vertex_avail_mask,
+                keys,
             )
         else:
             (
-                log_probs, entropies, values, new_vertex_dist, sub_lengths,
-                new_op_dists, new_i_dists, new_j_dists, new_exp_dists,
+                log_probs,
+                entropies,
+                values,
+                new_vertex_dist,
+                sub_lengths,
+                new_op_dists,
+                new_i_dists,
+                new_j_dists,
+                new_exp_dists,
+                new_kind_dists,
             ) = jax.vmap(_eval_dyn)(
-                batch.tokens, batch.eqn_ids, batch.residual_state, batch.preference,
-                batch.vertex_idx, actions, batch.vertex_avail_mask, cached_flat,
+                batch.tokens,
+                batch.eqn_ids,
+                batch.residual_state,
+                batch.preference,
+                batch.vertex_idx,
+                actions,
+                batch.vertex_avail_mask,
+                cached_flat,
                 keys,
             )
 
         old_log_probs = jax.vmap(old_micro_log_prob_for_action)(
             batch.vertex_idx,
-            batch.micro_op_seq, batch.micro_i_seq, batch.micro_j_seq,
+            batch.micro_op_seq,
+            batch.micro_i_seq,
+            batch.micro_j_seq,
             batch.micro_exp_seq,
+            batch.micro_compress_kind_seq,
             batch.old_vertex_dist,
-            batch.old_micro_op_dists, batch.old_micro_i_dists,
-            batch.old_micro_j_dists, batch.old_micro_exp_dists,
+            batch.old_micro_op_dists,
+            batch.old_micro_i_dists,
+            batch.old_micro_j_dists,
+            batch.old_micro_exp_dists,
+            batch.old_micro_kind_dists,
         )
 
         ratio = jnp.exp(log_probs - old_log_probs)
@@ -4025,7 +4726,8 @@ def main():
             )
         )
         explained_var = explained_variance(
-            batch.norm_adv, jnp.sum(batch.estim_returns, axis=-1),
+            batch.norm_adv,
+            jnp.sum(batch.estim_returns, axis=-1),
         )
 
         # Per-component KL on the dynamic path: vertex + op_type + i + j +
@@ -4035,24 +4737,24 @@ def main():
         # contribution is normalized the same way as the entropy bonus.
         kl_vertex = jnp.mean(
             optax.kl_divergence(
-                jnp.log(new_vertex_dist + 1e-7), batch.old_vertex_dist,
+                jnp.log(new_vertex_dist + 1e-7),
+                batch.old_vertex_dist,
             )
         )
 
         # Active-sub-step gating mirrors old_micro_log_prob_for_action:
         # entries past the first OP_END contribute 0.
         is_end_seq = batch.micro_op_seq == OP_END
-        prior_ends = (
-            jnp.cumsum(is_end_seq.astype(jnp.int32), axis=-1)
-            - is_end_seq.astype(jnp.int32)
-        )
-        active_steps = (prior_ends == 0).astype(jnp.float32)   # (B, S)
+        prior_ends = jnp.cumsum(
+            is_end_seq.astype(jnp.int32), axis=-1
+        ) - is_end_seq.astype(jnp.int32)
+        active_steps = (prior_ends == 0).astype(jnp.float32)  # (B, S)
         is_diag_step = (batch.micro_op_seq == OP_DIAG).astype(jnp.float32)
+        is_compress_step = (batch.micro_op_seq == OP_COMPRESS).astype(jnp.float32)
         is_diag_or_compress = (
-            (batch.micro_op_seq == OP_DIAG)
-            | (batch.micro_op_seq == OP_COMPRESS)
+            (batch.micro_op_seq == OP_DIAG) | (batch.micro_op_seq == OP_COMPRESS)
         ).astype(jnp.float32)
-        denom = jnp.maximum(sub_lengths, 1.0)                  # (B,)
+        denom = jnp.maximum(sub_lengths, 1.0)  # (B,)
 
         def _per_step_kl(new_d, old_d, gate):
             """KL[new || old] per (batch, sub-step) gated by `gate`, then
@@ -4062,31 +4764,41 @@ def main():
             # into the scalar per (B, S).
             while kl.ndim > 2:
                 kl = jnp.sum(kl, axis=-1)
-            kl = kl * gate                                           # (B, S)
-            per_sample = jnp.sum(kl, axis=-1) / denom                # (B,)
+            kl = kl * gate  # (B, S)
+            per_sample = jnp.sum(kl, axis=-1) / denom  # (B,)
             return jnp.mean(per_sample)
 
         kl_op = _per_step_kl(new_op_dists, batch.old_micro_op_dists, active_steps)
         kl_i = _per_step_kl(
-            new_i_dists, batch.old_micro_i_dists,
+            new_i_dists,
+            batch.old_micro_i_dists,
             active_steps * is_diag_or_compress,
         )
         kl_j = _per_step_kl(
-            new_j_dists, batch.old_micro_j_dists,
+            new_j_dists,
+            batch.old_micro_j_dists,
             active_steps * is_diag_step,
         )
         # exp_dists shape (B, S, MAX_PRIMES, MAX_EXPONENT+1). KL collapses
         # last two axes; gate by DIAG-active.
         kl_exp = _per_step_kl(
-            new_exp_dists, batch.old_micro_exp_dists,
+            new_exp_dists,
+            batch.old_micro_exp_dists,
             active_steps * is_diag_step,
         )
-        kl_div = kl_vertex + kl_op + kl_i + kl_j + kl_exp
+        kl_kind = _per_step_kl(
+            new_kind_dists,
+            batch.old_micro_kind_dists,
+            active_steps * is_compress_step,
+        )
+        kl_div = kl_vertex + kl_op + kl_i + kl_j + kl_exp + kl_kind
         # Stash per-component KLs so they can be logged separately — they're
         # the most useful single signal for debugging the dynamic head
         # (factor head and END decision are where collapse starts per the
-        # design spec).
-        _kl_components = (kl_vertex, kl_op, kl_i, kl_j, kl_exp)
+        # design spec). The 5-slot layout is preserved for back-compat; the
+        # kind KL is folded into the exponent slot since both gate on the
+        # corresponding op-type (DIAG / COMPRESS respectively).
+        _kl_components = (kl_vertex, kl_op, kl_i, kl_j, kl_exp + kl_kind)
 
         # Per-component entropy under the current policy, using the same
         # active-substep / DIAG gating as the KL split. Pairs with the
@@ -4097,18 +4809,18 @@ def main():
         def _step_entropy(d):
             return -jnp.sum(d * jnp.log(d + 1e-8), axis=-1)
 
-        op_ent_per = _step_entropy(new_op_dists)                # (B, S)
+        op_ent_per = _step_entropy(new_op_dists)  # (B, S)
         i_ent_per = _step_entropy(new_i_dists)
         j_ent_per = _step_entropy(new_j_dists)
         # exp_dists: (B, S, MAX_PRIMES, MAX_EXPONENT+1) — entropy over the
         # exponent axis, then sum over the (padded) prime axis.
         exp_ent_per = jnp.sum(_step_entropy(new_exp_dists), axis=-1)  # (B, S)
+        kind_ent_per = _step_entropy(new_kind_dists)  # (B, S)
 
         ent_vertex = jnp.mean(_step_entropy(new_vertex_dist))
         ent_op = jnp.mean(jnp.sum(op_ent_per * active_steps, axis=-1) / denom)
         ent_i = jnp.mean(
-            jnp.sum(i_ent_per * active_steps * is_diag_or_compress, axis=-1)
-            / denom
+            jnp.sum(i_ent_per * active_steps * is_diag_or_compress, axis=-1) / denom
         )
         ent_j = jnp.mean(
             jnp.sum(j_ent_per * active_steps * is_diag_step, axis=-1) / denom
@@ -4116,7 +4828,12 @@ def main():
         ent_exp = jnp.mean(
             jnp.sum(exp_ent_per * active_steps * is_diag_step, axis=-1) / denom
         )
-        _entropy_components = (ent_vertex, ent_op, ent_i, ent_j, ent_exp)
+        ent_kind = jnp.mean(
+            jnp.sum(kind_ent_per * active_steps * is_compress_step, axis=-1) / denom
+        )
+        # Fold the kind entropy into the exp slot to keep the 5-slot
+        # layout the legacy loss path returns.
+        _entropy_components = (ent_vertex, ent_op, ent_i, ent_j, ent_exp + ent_kind)
 
         total_loss = (
             ppo_loss
@@ -4144,9 +4861,19 @@ def main():
         )
 
     def train_episode(
-        agent, opt_state, env_states, env_obj, vertex_features,
-        preferences_per_env, global_step, key, freeze_mask,
-        multipliers, constraint_indices, constraint_thresholds,
+        agent,
+        opt_state,
+        env_states,
+        env_obj,
+        vertex_features,
+        preferences_per_env,
+        global_step,
+        key,
+        freeze_mask,
+        multipliers,
+        constraint_indices,
+        constraint_thresholds,
+        constraint_signs,
         op_legality_override_arg,
         vertex_mult_arg,
         pin_rules_to_exact_arg,
@@ -4157,8 +4884,15 @@ def main():
         rollout_keys = jrand.split(rollout_key, num_envs)
 
         env_states, traj, total_rewards_full = rollout_fn(
-            agent, env_obj, num_valid, env_states, rollout_keys, vertex_features,
-            preferences_per_env, op_legality_override_arg, pin_rules_to_exact_arg,
+            agent,
+            env_obj,
+            num_valid,
+            env_states,
+            rollout_keys,
+            vertex_features,
+            preferences_per_env,
+            op_legality_override_arg,
+            pin_rules_to_exact_arg,
         )
 
         # Per-head GAE: only the three training-reward indices (flops /
@@ -4190,20 +4924,26 @@ def main():
         norm_adv = jnp.sum(norm_adv_components * traj.preference, axis=-1)
 
         # Stage F Lagrangian: per-step constraint violations and multiplier
-        # update. ``constraint_indices`` / ``constraint_thresholds`` are
-        # static-shape arrays (length 0 means no constraints, in which case
-        # the gather is a no-op). Violation = max(0, threshold - reward[idx])
-        # for each constraint (rewards are higher-is-better). The advantage
-        # gets penalized by ``-λ_i · violation_i`` so the policy is pushed
-        # away from constraint-violating regions.
+        # update. ``constraint_indices`` / ``constraint_thresholds`` /
+        # ``constraint_signs`` are static-shape arrays (length 0 means no
+        # constraints, in which case the gather is a no-op). For ``>=``
+        # constraints (sign = +1) the violation is ``max(0, threshold -
+        # reward)``; for ``<=`` constraints (sign = -1) it's
+        # ``max(0, reward - threshold)``. Both collapse to
+        # ``max(0, sign * (threshold - reward))``. The advantage is
+        # penalized by ``-λ_i · violation_i`` so the policy is pushed away
+        # from constraint-violating regions, and ``λ_i`` rises by dual
+        # ascent on the mean violation.
         if constraint_indices.shape[0] > 0:
-            picked = traj.reward[..., constraint_indices]                   # (E, T, C)
-            violations = jnp.maximum(0.0, constraint_thresholds - picked)   # (E, T, C)
-            penalty = jnp.sum(violations * multipliers, axis=-1)            # (E, T)
+            picked = traj.reward[..., constraint_indices]  # (E, T, C)
+            signed = constraint_signs * (constraint_thresholds - picked)
+            violations = jnp.maximum(0.0, signed)  # (E, T, C)
+            penalty = jnp.sum(violations * multipliers, axis=-1)  # (E, T)
             norm_adv = norm_adv - penalty
-            mean_violations = jnp.mean(violations, axis=(0, 1))             # (C,)
+            mean_violations = jnp.mean(violations, axis=(0, 1))  # (C,)
             new_multipliers = jnp.maximum(
-                0.0, multipliers + args.lagrangian_lr * mean_violations,
+                0.0,
+                multipliers + args.lagrangian_lr * mean_violations,
             )
         else:
             mean_violations = multipliers  # zero-length sentinel
@@ -4236,6 +4976,7 @@ def main():
             micro_j_seq=traj.micro_j_seq,
             micro_exp_seq=traj.micro_exp_seq,
             micro_factor_seq=traj.micro_factor_seq,
+            micro_compress_kind_seq=traj.micro_compress_kind_seq,
             old_vertex_dist=traj.vertex_dist,
             old_pair_dists=traj.pair_dists,
             old_factor_dists=traj.factor_dists,
@@ -4243,6 +4984,7 @@ def main():
             old_micro_i_dists=traj.micro_i_dists,
             old_micro_j_dists=traj.micro_j_dists,
             old_micro_exp_dists=traj.micro_exp_dists,
+            old_micro_kind_dists=traj.micro_kind_dists,
             estim_returns=estim_returns,
             norm_adv=norm_adv,
             vertex_avail_mask=traj.vertex_avail_mask,
@@ -4269,7 +5011,10 @@ def main():
                 comb_agent, comb_opt_state = eqx.combine(c, static_carry)
                 batch, t_key = batch_and_key
                 grads, metrics = eqx.filter_grad(loss_fn, has_aux=True)(
-                    comb_agent, batch, vertex_features, t_key,
+                    comb_agent,
+                    batch,
+                    vertex_features,
+                    t_key,
                     pin_rules_to_exact_arg,
                 )
                 # Single fused per-leaf gradient scaling: combines the
@@ -4278,7 +5023,11 @@ def main():
                 # branch is a no-op; with the cal-mask the LR ramp is also
                 # active for the trainable params (factor head, aggregator).
                 grads = _scale_grads(
-                    grads, axis_mask, factor_mask, vertex_mask, micro_mask,
+                    grads,
+                    axis_mask,
+                    factor_mask,
+                    vertex_mask,
+                    micro_mask,
                     freeze_mask,
                     _head_lr_mult(step, args.axis_warmup_steps),
                     _head_lr_mult(step, args.factor_warmup_steps),
@@ -4289,16 +5038,16 @@ def main():
                     grads, comb_opt_state, comb_agent
                 )
                 new_agent = eqx.apply_updates(comb_agent, updates)
-                next_carry, _ = eqx.partition(
-                    (new_agent, new_opt_state), eqx.is_array
-                )
+                next_carry, _ = eqx.partition((new_agent, new_opt_state), eqx.is_array)
                 return (next_carry, step + 1), metrics
 
             return lax.scan(mb_step_fn, (carry, step), (batches, mb_keys))
 
         epoch_keys = jrand.split(subkey, args.ppo_epochs)
         (dynamic_carry, final_step), metrics_seq = lax.scan(
-            epoch_step_fn, (dynamic_carry, global_step), epoch_keys,
+            epoch_step_fn,
+            (dynamic_carry, global_step),
+            epoch_keys,
         )
 
         agent, opt_state = eqx.combine(dynamic_carry, static_carry)
@@ -4307,7 +5056,8 @@ def main():
         # scalars, and the per-component KL slot (a (5,) array per step)
         # stays a (5,) array instead of being globally scalarized.
         metrics = jax.tree_util.tree_map(
-            lambda x: jnp.mean(x, axis=(0, 1)), metrics_seq,
+            lambda x: jnp.mean(x, axis=(0, 1)),
+            metrics_seq,
         )
         # Legacy slots are zero-filled in --dynamic-substeps mode; the
         # micro_* slots carry the real typed action there. Pack both so
@@ -4320,6 +5070,7 @@ def main():
             traj.micro_i_seq,
             traj.micro_j_seq,
             traj.micro_factor_seq,
+            traj.micro_compress_kind_seq,
         )
         # Pair / factor / preference marginals — Stage D / E / F diagnostics.
         # Average over (env, time, slot) — broad enough to detect global
@@ -4341,10 +5092,9 @@ def main():
             # common failure modes: collapse to length-1 (always END) or
             # collapse to length=max_substeps (never END, gets truncated).
             is_end_seq = traj.micro_op_seq == OP_END
-            prior_ends = (
-                jnp.cumsum(is_end_seq.astype(jnp.int32), axis=-1)
-                - is_end_seq.astype(jnp.int32)
-            )
+            prior_ends = jnp.cumsum(
+                is_end_seq.astype(jnp.int32), axis=-1
+            ) - is_end_seq.astype(jnp.int32)
             active_steps_per_rollout = (prior_ends == 0).astype(jnp.float32)
             mean_sub_episode_length = jnp.mean(
                 jnp.sum(active_steps_per_rollout, axis=-1)
@@ -4363,8 +5113,15 @@ def main():
             mean_sub_episode_length,
         )
         return (
-            agent, opt_state, env_states, metrics, total_rewards_full,
-            actions_pack, final_step, new_multipliers, diag_pack,
+            agent,
+            opt_state,
+            env_states,
+            metrics,
+            total_rewards_full,
+            actions_pack,
+            final_step,
+            new_multipliers,
+            diag_pack,
         )
 
     if not args.no_jit:
@@ -4390,8 +5147,9 @@ def main():
         "top_n_acc": [],
     }
 
-    def host_log(ep, all_rets, actions_pack, mean_r, mets,
-                 diag_pack=None, multipliers_arr=None):
+    def host_log(
+        ep, all_rets, actions_pack, mean_r, mets, diag_pack=None, multipliers_arr=None
+    ):
         ep = int(ep)
         all_rets = np.array(all_rets)  # (num_envs, NUM_REWARDS)
         v_idx_arr = np.array(actions_pack[0])
@@ -4404,18 +5162,27 @@ def main():
         micro_i_arr = np.array(actions_pack[4])
         micro_j_arr = np.array(actions_pack[5])
         micro_factor_arr = np.array(actions_pack[6])
+        micro_kind_arr = np.array(actions_pack[7])
 
         def _decode(env_i):
             if args.dynamic_substeps:
                 return _action_to_pylist_dynamic(
-                    v_idx_arr[env_i], micro_op_arr[env_i], micro_i_arr[env_i],
-                    micro_j_arr[env_i], micro_factor_arr[env_i],
+                    v_idx_arr[env_i],
+                    micro_op_arr[env_i],
+                    micro_i_arr[env_i],
+                    micro_j_arr[env_i],
+                    micro_factor_arr[env_i],
+                    micro_kind_arr[env_i],
                     args.max_substeps,
                 )
             return _action_to_pylist(
-                v_idx_arr[env_i], pair_arr[env_i], factor_arr[env_i],
-                max_rules, factor_table_np,
+                v_idx_arr[env_i],
+                pair_arr[env_i],
+                factor_arr[env_i],
+                max_rules,
+                factor_table_np,
             )
+
         mean_r = np.atleast_1d(np.array(mean_r))
 
         host_state["samplecounts"] += num_envs * num_valid
@@ -4503,8 +5270,13 @@ def main():
         # the per-episode preference vector (Stage F sanity check).
         if diag_pack is not None:
             (
-                pair_marg, factor_marg, pref_mean, mean_viol,
-                p_stop_slot0, op_marginals, mean_sub_episode_length,
+                pair_marg,
+                factor_marg,
+                pref_mean,
+                mean_viol,
+                p_stop_slot0,
+                op_marginals,
+                mean_sub_episode_length,
             ) = (np.asarray(x) for x in diag_pack)
             for j, p in enumerate(pair_marg):
                 log_dict[f"pair_marginal/{j}"] = float(p)
@@ -4521,15 +5293,17 @@ def main():
             if multipliers_arr is not None and np.size(multipliers_arr) > 0:
                 lam = np.asarray(multipliers_arr)
                 viol = np.asarray(mean_viol)
-                for j, (idx, t) in enumerate(constraint_specs):
-                    log_dict[f"lagrangian/{REWARD_NAMES[idx]}_lambda"] = float(lam[j])
-                    log_dict[f"lagrangian/{REWARD_NAMES[idx]}_violation"] = float(viol[j])
+                for j, (idx, t, sign) in enumerate(constraint_specs):
+                    op_str = ">=" if sign > 0 else "<="
+                    name = f"{REWARD_NAMES[idx]}{op_str}{t:g}"
+                    log_dict[f"lagrangian/{name}_lambda"] = float(lam[j])
+                    log_dict[f"lagrangian/{name}_violation"] = float(viol[j])
         wandb.log(log_dict)
 
         pbar.update(1)
         b_ret_unnorm = np.abs(all_rets[best_idx])
-        means_str = ", ".join(f"{float(x):.2f}" for x in np.abs(mean_r))
-        b_ret_desc = ", ".join(f"{float(x):.1f}" for x in b_ret_unnorm)
+        means_str = ", ".join(f"{float(x):.2e}" for x in np.abs(mean_r))
+        b_ret_desc = ", ".join(f"{float(x):.2e}" for x in b_ret_unnorm)
         pbar.set_description(
             f"ent:{policy_entropy:.3f} best:{b_ret_desc} means:{means_str}"
         )
@@ -4539,23 +5313,38 @@ def main():
     # episode and feeds the per-head LR ramp from §3.2.
     global_step = jnp.array(0, dtype=jnp.int32)
 
-    # Stage F Lagrangian state. Constraint indices / thresholds are static
-    # shape (length-C jax arrays). Multipliers are dynamic (length-C, ≥ 0,
-    # updated by dual ascent each episode). C == 0 → empty arrays, in which
-    # case the augmentation in train_episode is a no-op.
-    constraint_specs = parse_lagrangian_constraints(args.lagrangian_constraint)
+    # Stage F Lagrangian state. Constraint indices / thresholds / signs are
+    # static-shape arrays (length-C jax arrays). Multipliers are dynamic
+    # (length-C, ≥ 0, updated by dual ascent each episode). C == 0 → empty
+    # arrays, in which case the augmentation in train_episode is a no-op.
+    # The cosine-similarity bounds are added automatically; pass
+    # ``--cosine-lower-bound <= 0`` / ``--cosine-upper-bound >= 1`` to disable.
+    user_constraints = list(args.lagrangian_constraint)
+    if args.cosine_lower_bound > 0.0:
+        user_constraints.append(f"cosine_sim>={args.cosine_lower_bound}")
+    if args.cosine_upper_bound < 1.0:
+        user_constraints.append(f"cosine_sim<={args.cosine_upper_bound}")
+    constraint_specs = parse_lagrangian_constraints(user_constraints)
     if constraint_specs:
+        ops_for_print = {1: ">=", -1: "<="}
         print(
             f"Stage F Lagrangian: {len(constraint_specs)} constraints — "
             + ", ".join(
-                f"{REWARD_NAMES[idx]}>={t:g}" for idx, t in constraint_specs
+                f"{REWARD_NAMES[idx]}{ops_for_print[sign]}{t:g}"
+                for idx, t, sign in constraint_specs
             )
         )
     constraint_indices = jnp.asarray(
-        [idx for idx, _ in constraint_specs], dtype=jnp.int32,
+        [idx for idx, _, _ in constraint_specs],
+        dtype=jnp.int32,
     )
     constraint_thresholds = jnp.asarray(
-        [t for _, t in constraint_specs], dtype=jnp.float32,
+        [t for _, t, _ in constraint_specs],
+        dtype=jnp.float32,
+    )
+    constraint_signs = jnp.asarray(
+        [float(sign) for _, _, sign in constraint_specs],
+        dtype=jnp.float32,
     )
     multipliers = jnp.zeros(len(constraint_specs), dtype=jnp.float32)
 
@@ -4565,16 +5354,15 @@ def main():
     # --preference-conditioned is off we broadcast the static
     # `head_reward_weights` so all downstream code sees a consistent
     # `(num_envs, NUM_VALUE_HEADS)` shape.
-    static_pref = jnp.broadcast_to(
-        head_reward_weights, (num_envs, NUM_VALUE_HEADS)
-    )
+    static_pref = jnp.broadcast_to(head_reward_weights, (num_envs, NUM_VALUE_HEADS))
 
     # Per-head introduction-stage for the curriculum runner. Static
     # (depends on the curriculum spec, not on the current episode) so
     # compute once before the loop.
     if curriculum_stages:
         micro_intro_stage = _micro_introduction_stage(
-            curriculum_stages, args.allow_compress,
+            curriculum_stages,
+            args.allow_compress,
         )
         print(
             f"curriculum: micro_action_policy first sees signal in stage "
@@ -4595,22 +5383,32 @@ def main():
             # conditioned policy covers the whole Pareto front.
             corner_key, uniform_key, choice_key, ep_key = jrand.split(ep_key, 4)
             alpha_corner = jnp.full(
-                (NUM_VALUE_HEADS,), args.dirichlet_alpha, dtype=jnp.float32,
+                (NUM_VALUE_HEADS,),
+                args.dirichlet_alpha,
+                dtype=jnp.float32,
             )
             alpha_uniform = jnp.full(
-                (NUM_VALUE_HEADS,), args.dirichlet_alpha_uniform, dtype=jnp.float32,
+                (NUM_VALUE_HEADS,),
+                args.dirichlet_alpha_uniform,
+                dtype=jnp.float32,
             )
             corner_samples = jrand.dirichlet(
-                corner_key, alpha_corner, shape=(num_envs,),
+                corner_key,
+                alpha_corner,
+                shape=(num_envs,),
             )
             uniform_samples = jrand.dirichlet(
-                uniform_key, alpha_uniform, shape=(num_envs,),
+                uniform_key,
+                alpha_uniform,
+                shape=(num_envs,),
             )
             use_corner = (
                 jrand.uniform(choice_key, (num_envs, 1)) < args.dirichlet_mix_ratio
             )
             preferences_per_env = jnp.where(
-                use_corner, corner_samples, uniform_samples,
+                use_corner,
+                corner_samples,
+                uniform_samples,
             )
         else:
             preferences_per_env = static_pref
@@ -4623,8 +5421,12 @@ def main():
         # vs Set-Transformer per-sample) is centralised in
         # ``_episode_vertex_features``.
         vertex_features = _episode_vertex_features(
-            args, closed_jaxpr.jaxpr, tuple(closed_jaxpr.literals),
-            tuple(xs), eval_samples=eval_samples, argnums=tuple(argnums),
+            args,
+            closed_jaxpr.jaxpr,
+            tuple(closed_jaxpr.literals),
+            tuple(xs),
+            eval_samples=eval_samples,
+            argnums=tuple(argnums),
         )
 
         env_states = reset_envs(env_episode)
@@ -4643,10 +5445,12 @@ def main():
                     break
                 cumulative += stage_n
             stage_override = _op_legality_for_variant(
-                current_stage_name, args.allow_compress,
+                current_stage_name,
+                args.allow_compress,
             )
             stage_pin_rules = jnp.asarray(
-                _pin_rules_for_variant(current_stage_name), dtype=jnp.bool_,
+                _pin_rules_for_variant(current_stage_name),
+                dtype=jnp.bool_,
             )
             # Per-head LR multipliers: each head runs at full LR in the
             # first stage where it sees signal, then drops to
@@ -4667,8 +5471,7 @@ def main():
             # Log the stage boundary on transition (cheap host-side check).
             if ep == 0 or (
                 ep > 0
-                and _current_stage_at(curriculum_stages, ep - 1)
-                != current_stage_name
+                and _current_stage_at(curriculum_stages, ep - 1) != current_stage_name
             ):
                 print(
                     f"[ep {ep}] curriculum stage → {current_stage_name}"
@@ -4681,16 +5484,33 @@ def main():
             stage_vertex_mult = jnp.array(1.0, dtype=jnp.float32)
             stage_micro_mult = jnp.array(1.0, dtype=jnp.float32)
             stage_pin_rules = jnp.asarray(
-                args.pin_rules_to_exact, dtype=jnp.bool_,
+                args.pin_rules_to_exact,
+                dtype=jnp.bool_,
             )
         (
-            agent, opt_state, _, metrics, total_rewards_full,
-            actions_pack, global_step, multipliers, diag_pack,
+            agent,
+            opt_state,
+            _,
+            metrics,
+            total_rewards_full,
+            actions_pack,
+            global_step,
+            multipliers,
+            diag_pack,
         ) = train_episode(
-            agent, opt_state, env_states, env_episode, vertex_features,
-            preferences_per_env, global_step, ep_key,
-            default_freeze_mask, multipliers,
-            constraint_indices, constraint_thresholds,
+            agent,
+            opt_state,
+            env_states,
+            env_episode,
+            vertex_features,
+            preferences_per_env,
+            global_step,
+            ep_key,
+            default_freeze_mask,
+            multipliers,
+            constraint_indices,
+            constraint_thresholds,
+            constraint_signs,
             stage_override,
             stage_vertex_mult,
             stage_pin_rules,
@@ -4713,36 +5533,62 @@ def main():
     # ------------------------------------------------------------------
     if args.calibrate_steps > 0:
         agent, global_step, key = run_calibration_phase(
-            agent, opt_state, env, env_episode_template_args=(
-                closed_jaxpr, tuple(xs), tuple(argnums),
+            agent,
+            opt_state,
+            env,
+            env_episode_template_args=(
+                closed_jaxpr,
+                tuple(xs),
+                tuple(argnums),
             ),
-            train_episode=train_episode, reset_envs=reset_envs,
-            num_envs=num_envs, args=args,
-            global_step=global_step, key=key,
+            train_episode=train_episode,
+            reset_envs=reset_envs,
+            num_envs=num_envs,
+            args=args,
+            global_step=global_step,
+            key=key,
         )
 
     def print_top_n(name, heap, reverse_val=True):
         print(f"\nTop {args.top_n} trajectories for {name}:")
         sorted_items = sorted(heap, key=lambda x: x[0], reverse=reverse_val)
         table = wandb.Table(
-            columns=["rank", "episode", "total_reward", "cmp", "acc", "mem", "frob", "sequence"]
+            columns=[
+                "rank",
+                "episode",
+                "total_reward",
+                "cmp",
+                "acc",
+                "mem",
+                "frob",
+                "sequence",
+            ]
         )
         weights = reward_weights_np
         for rank, (val, ep, rets, seq) in enumerate(sorted_items, 1):
             arr = np.array(rets)
             total_ret = float(np.sum(arr * weights))
-            cmp_val = -float(arr[cmp_idx])      # display as positive cost
-            mem_val = -float(arr[mem_idx])      # display as positive cost
-            acc_val = float(arr[cosine_idx])    # cosine ∈ [0, 1]
-            frob_val = -float(arr[frob_idx])    # display as positive residual
+            cmp_val = -float(arr[cmp_idx])  # display as positive cost
+            mem_val = -float(arr[mem_idx])  # display as positive cost
+            acc_val = float(arr[cosine_idx])  # cosine ∈ [0, 1]
+            frob_val = -float(arr[frob_idx])  # display as positive residual
             print(
-                f"{rank}. Ep {ep} | Total Reward: {total_ret:.2f} | "
-                f"CMP({args.cmp_type}): {cmp_val:.1f} | Acc: {acc_val:.4f} | "
-                f"Mem({args.mem_type}): {mem_val:.1f} | Frob: {frob_val:.4f}"
+                f"{rank}. Ep {ep} | Total Reward: {total_ret:.2e} | "
+                f"CMP({args.cmp_type}): {cmp_val:.2e} | Acc: {acc_val:.4f} | "
+                f"Mem({args.mem_type}): {mem_val:.2e} | Frob: {frob_val:.4e}"
             )
-            print(f"   Sequence (vertex, [(idx1, idx2, factor), ...]): {seq}")
+            # ``seq`` is a list of (vertex, [callable_str, ...]) tuples; the
+            # inner strings are already copy-pastable
+            # ``diag(...)`` / ``compress(...)`` expressions, so render the
+            # whole structure with the callable text un-quoted.
+            seq_strs = []
+            for v, calls in seq:
+                joined = ", ".join(calls)
+                seq_strs.append(f"({v}, [{joined}])")
+            seq_repr = "[" + ", ".join(seq_strs) + "]"
+            print(f"   Sequence (vertex, [calls...]): {seq_repr}")
             table.add_data(
-                rank, ep, total_ret, cmp_val, acc_val, mem_val, frob_val, str(seq)
+                rank, ep, total_ret, cmp_val, acc_val, mem_val, frob_val, seq_repr
             )
         wandb.log({f"Top N {name}": table})
 
