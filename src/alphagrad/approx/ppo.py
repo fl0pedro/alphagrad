@@ -2600,7 +2600,17 @@ VARIANT_PRESETS: dict[str, dict] = {
         "max_rules": 1,
         "pin_rules_to_exact": False,
     },
-    "compress": None,  # blocked on heads.py / atomic COMPRESS wiring
+    # COMPRESS is wired end-to-end via the typed MicroActionPolicy + the env's
+    # COMPRESS_SENTINEL rule_specs encoding + graphax.sparse.apply_compress.
+    # The preset's legacy fields (factors / max_rules) only matter when
+    # --no-dynamic-substeps is used — the dynamic path consults
+    # _op_legality_for_variant("compress") at sample time instead and masks
+    # DIAG out, leaving COMPRESS + END.
+    "compress": {
+        "factors": "-1",
+        "max_rules": 1,
+        "pin_rules_to_exact": False,
+    },
     "full": {
         "factors": "-1,2,3,4,8,16",
         "max_rules": MAX_RULES_PER_VERTEX,
