@@ -954,19 +954,20 @@ def _callback(
     # ------------------------------------------------------------------
     n_samples = 10 if config.measure_latency else 1
 
-    monitoring_devices: list = []
-    for x in jax.tree_util.tree_leaves(args):
-        if hasattr(x, "devices"):
-            monitoring_devices.extend(list(x.devices()))
-    unique_devices = list(set(monitoring_devices))
+    # Inside an io_callback, args come back to the host as ``CpuDevice``
+    # JAX arrays, so reading the device off the args points at CPU even
+    # when ``compiled_approx`` JIT-runs on GPU. Always monitor every local
+    # device so we catch wherever the compute actually lands; the
+    # MemoryTracker sums peaks across devices, so over-monitoring at most
+    # widens the search but never silently misses a peak.
+    monitoring_devices: list = list(jax.local_devices())
     if (
         config.exec_on_gpu
         and callback_device is not None
-        and callback_device not in unique_devices
+        and callback_device not in monitoring_devices
     ):
-        unique_devices.append(callback_device)
-    if not unique_devices:
-        unique_devices = jax.local_devices()
+        monitoring_devices.append(callback_device)
+    unique_devices = list({id(d): d for d in monitoring_devices}.values())
 
     out_approxs: list = []
     out_exacts: list = []
