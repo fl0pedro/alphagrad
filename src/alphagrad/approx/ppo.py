@@ -61,6 +61,7 @@ from alphagrad.approx.common import (
     shuffle_and_batch_by_trajectory,
     vertex_avail_at_step,
 )
+from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
     MAX_AXES_PER_VERTEX,
     MAX_RULES_PER_VERTEX,
@@ -2215,6 +2216,57 @@ def _apply_variant_preset(args, variant: str | None = None):
         setattr(args, k, v)
 
 
+def make_curriculum_schedule(args, curriculum_stages):
+    """Build an optax-compatible LR schedule for a curriculum run.
+
+    Each stage gets its own ``cosine_warmup_exp_decay_lr`` hill whose
+    ``period`` equals the stage's optimizer-step budget
+    (``stage_episodes × ppo_epochs × minibatches``). Warm-up takes the
+    first ``args.curriculum_warmup_frac`` of the stage; exponential
+    decay covers the rest, ending at ``args.lr_decay_min_mult * lr``.
+    Returns a JAX-traceable callable ``schedule(step) -> lr`` consumable
+    by ``optax.adam(schedule)``.
+
+    Boundaries are pre-computed at Python time so per-stage warmup
+    counts are concrete inside the inner ``cosine_warmup_exp_decay_lr``
+    calls (which read them with ``int(...)``).
+    """
+    steps_per_episode = args.ppo_epochs * args.minibatches
+    stage_step_counts = [
+        max(n * steps_per_episode, 1) for _, n in curriculum_stages
+    ]
+    boundaries: list[int] = [0]
+    for s in stage_step_counts:
+        boundaries.append(boundaries[-1] + s)
+    warmup_frac = float(args.curriculum_warmup_frac)
+
+    def schedule(step):
+        step_f = jnp.asarray(step, dtype=jnp.float32)
+        # Default LR (used when step falls outside any stage — shouldn't
+        # happen but the optimizer will keep stepping after the last
+        # episode if the trainer over-runs).
+        lr = jnp.asarray(
+            args.lr * args.lr_decay_min_mult, dtype=jnp.float32,
+        )
+        for i, stage_steps in enumerate(stage_step_counts):
+            lo = boundaries[i]
+            hi = boundaries[i + 1]
+            warmup_steps = max(int(stage_steps * warmup_frac), 1)
+            local_step = step_f - float(lo)
+            stage_lr = cosine_warmup_exp_decay_lr(
+                local_step,
+                args.lr,
+                stage_steps,
+                warmup_steps,
+                end_mult=args.lr_decay_min_mult,
+            )
+            in_stage = (step_f >= float(lo)) & (step_f < float(hi))
+            lr = jnp.where(in_stage, stage_lr, lr)
+        return lr
+
+    return schedule
+
+
 def _current_stage_at(
     stages: list[tuple[str, int]], ep: int,
 ) -> str:
@@ -3212,12 +3264,28 @@ def main():
             agent,
         )
 
-    # Optimiser.
-    schedule = optax.cosine_decay_schedule(
-        args.lr,
-        args.episodes * args.ppo_epochs * args.minibatches,
-        args.lr_decay_min_mult,
-    )
+    # Optimiser. Default = single cosine decay across the whole run.
+    # When --curriculum is set, swap in a piecewise schedule that gives
+    # each stage its own cosine-warmup + exp-decay hill so newly-
+    # introduced variants ramp up gently and existing-variant heads
+    # don't get blown out at stage boundaries.
+    if curriculum_stages:
+        schedule = make_curriculum_schedule(args, curriculum_stages)
+        print(
+            "curriculum LR: piecewise cosine_warmup_exp_decay across "
+            + " → ".join(
+                f"{name}({n * args.ppo_epochs * args.minibatches}st)"
+                for name, n in curriculum_stages
+            )
+            + f" (warmup_frac={args.curriculum_warmup_frac}, "
+            f"end_mult={args.lr_decay_min_mult})"
+        )
+    else:
+        schedule = optax.cosine_decay_schedule(
+            args.lr,
+            args.episodes * args.ppo_epochs * args.minibatches,
+            args.lr_decay_min_mult,
+        )
     optimizer = optax.chain(
         optax.clip_by_global_norm(args.max_grad_norm),
         optax.adam(schedule, b1=args.adam_b1, eps=args.adam_eps),
