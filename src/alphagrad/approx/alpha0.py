@@ -429,6 +429,15 @@ def main():
     NUM_SIMULATIONS = args.num_simulations
     ROLLOUT_LENGTH = num_valid
 
+    # See ppo.py for rationale: empty minibatches → NaN losses → silent no-op.
+    if (NUM_ENVS * ROLLOUT_LENGTH) // MINIBATCHES == 0:
+        raise ValueError(
+            f"--minibatches={MINIBATCHES} > num_envs * rollout "
+            f"({NUM_ENVS} * {ROLLOUT_LENGTH} = {NUM_ENVS * ROLLOUT_LENGTH}). "
+            "Each minibatch would be empty, so the loss becomes NaN and no "
+            "learning happens. Lower --minibatches or raise --num-envs."
+        )
+
     print(
         f"Total vertices: {total_v}, Valid vertices: {num_valid}, "
         f"num_envs={NUM_ENVS}, max_rules={max_rules}, "
