@@ -120,6 +120,13 @@ class EnvConfig(NamedTuple):
     # rollout-to-reward time. Off by default; flip on when the latency component
     # of the reward is actually being weighted.
     measure_latency: bool = False
+    # Skip the expensive jacve-compile/exec branch on every step EXCEPT the
+    # terminal one. Tokens/eqn_ids are still produced (the agent needs them as
+    # the next observation), but the reward vector is zero on intermediate
+    # steps and fully populated only when the order is complete. This is the
+    # paper-native form for AlphaZero / GDPO / GFlowNet and works fine for PPO
+    # / MuZero (just yields a sparse reward signal).
+    terminal_rewards_only: bool = False
 
 
 def _get_partials(order, sparsity_specs, stop):
@@ -224,9 +231,13 @@ def _callback(
     """Stage A reward harness: returns `(tokens, rewards)` where `rewards` is
     the canonical `(NUM_REWARDS,)` float32 vector documented at the top of this
     file. Every component is computed every (non-init) call, except `latency`
-    which is gated behind `config.measure_latency`.
+    which is gated behind `config.measure_latency`. When
+    `config.terminal_rewards_only` is on, intermediate steps return tokens
+    only — every reward component is zeroed so the heavy jacve compile/exec
+    is skipped entirely until the elimination order is complete.
     """
     partial_order, partial_specs = _get_partials(order, sparsity_specs, stop)
+    is_terminal = int(stop) >= len(order)
 
     o_list = [int(x) for x in partial_order.tolist()]
     specs_list = partial_specs.tolist()  # list of MAX_RULES x 3 lists
@@ -297,6 +308,15 @@ def _callback(
     eqn_ids = jnp.asarray(eqn_ids_np, dtype=jnp.int32)
 
     if init:
+        return tokens, eqn_ids, jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
+
+    # Terminal-only fast path: every reward component is sparse — only the
+    # final step (when the elimination order is complete) gets a non-zero
+    # signal, so we skip the expensive jacve compile/exec on every prior
+    # step. Cumsum-style returns (alpha0/mu0) and per-rollout aggregations
+    # (gdpo) collapse to the terminal reward; gfn already reads only the
+    # last step. PPO sees a sparse-reward MDP, which GAE handles natively.
+    if config.terminal_rewards_only and not is_terminal:
         return tokens, eqn_ids, jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
 
     # ------------------------------------------------------------------
@@ -505,6 +525,7 @@ class VertexEliminationEnv:
         mem_type: str = "peak_memory",
         exec_on_gpu: bool = False,
         measure_latency: bool = False,
+        terminal_rewards_only: bool = False,
     ):
         assert (argnums is None and args is None) or not (args is None or args is None)
         config = EnvConfig(
@@ -520,6 +541,7 @@ class VertexEliminationEnv:
             data_gen=data_gen,
             exec_on_gpu=exec_on_gpu,
             measure_latency=measure_latency,
+            terminal_rewards_only=terminal_rewards_only,
         )
         return cls(
             config,
