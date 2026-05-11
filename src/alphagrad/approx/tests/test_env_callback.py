@@ -32,6 +32,7 @@ import jax.random as jrand
 
 from alphagrad.approx.env import (
     MAX_RULES_PER_VERTEX,
+    COMPRESS_SENTINEL,
     MAX_TOKENS,
     EnvConfig,
     StepAction,
@@ -320,6 +321,118 @@ def test_callback_drops_rules_that_dont_fit_every_invar():
 
 
 # ---------------------------------------------------------------------------
+# COMPRESS sentinel: env-side emits `graphax.Compress` per slot
+# ---------------------------------------------------------------------------
+
+
+def test_callback_emits_compress_for_sentinel_rows():
+    """A `[COMPRESS_SENTINEL, axis, 0]` row in `sparsity_specs` must
+    become a `graphax.sparse.micro_actions.Compress(axes=(axis,))` in
+    the forwarded transforms — that's the bridge that lets the typed
+    micro-action policy's COMPRESS sub-step actually reduce the val.
+    """
+    from graphax.sparse.micro_actions import Compress, Diag
+
+    print("\n[env] _callback emits Compress for COMPRESS_SENTINEL rows")
+    closed_jaxpr, args = _tiny_jaxpr()
+    total_v = len(closed_jaxpr.jaxpr.eqns)
+
+    config = EnvConfig(
+        jaxpr=closed_jaxpr.jaxpr,
+        argnums=(0, 1),
+        has_aux=False,
+        sparse=False,
+        cmp_type="graphax",
+        mem_type="graphax",
+        target_fun=None,
+        data_gen=None,
+    )
+    initial_order, initial_specs = _build_callback_state(closed_jaxpr, total_v)
+    # Vertex 0 (matmul) has out_shape=(4, 4), primal_shape=(4, 4) →
+    # out_len=2, physical axes 0..3 are valid. Plant one COMPRESS on
+    # axis 0 (an output axis) and one DIAG on the remaining pair.
+    sparsity_specs = (
+        initial_specs
+        .at[0, 0].set(jnp.array([COMPRESS_SENTINEL, 0, 0], jnp.int32))
+        .at[0, 1].set(jnp.array([1, 1, -1], jnp.int32))
+    )
+    stop = jnp.asarray(total_v, dtype=jnp.int32)
+
+    captured, fake_extract = _spy_extract_jaxpr_to_record_transforms()
+    with mock.patch("alphagrad.approx.env.extract_jaxpr", fake_extract):
+        _callback(
+            config, args, closed_jaxpr.literals,
+            initial_order, sparsity_specs, stop, init=True,
+        )
+
+    transforms = captured["transforms"]
+    assert transforms is not None and len(transforms) > 0, (
+        f"_callback emitted no transforms; got {transforms!r}"
+    )
+    # The vertex 1 (vertex_id, not index) entry should contain both a
+    # Compress and a Diag.
+    flat = [t for _v, ts in transforms for t in ts]
+    types = {type(t).__name__ for t in flat}
+    assert "Compress" in types, f"no Compress emitted; got {flat}"
+    assert "Diag" in types, f"no Diag emitted (DIAG slot dropped); got {flat}"
+    compress = next(t for t in flat if isinstance(t, Compress))
+    assert compress.axes == (0,), (
+        f"unexpected Compress.axes={compress.axes}, expected (0,)"
+    )
+    print(f"  forwarded transforms = {transforms}")
+
+
+def test_callback_compress_drops_out_of_range_axes():
+    """COMPRESS axes outside every invar's edge rank must be dropped at
+    the env-side translator. Helmholtz's `v4 = div((4,), ())` has a
+    scalar denominator: a COMPRESS on physical axis 1 fits the (4,)
+    edge but not the () edge, so apply_compress would crash. The
+    translator drops it.
+    """
+    from graphax import examples
+    from graphax.sparse.micro_actions import Compress
+
+    print("\n[env] _callback drops out-of-range COMPRESS axes")
+    target_fn = examples.Helmholtz
+    x = jnp.array([0.05, 0.15, 0.25, 0.35], dtype=jnp.float32)
+    closed_jaxpr = jax.make_jaxpr(target_fn)(x)
+    jaxpr = closed_jaxpr.jaxpr
+    total_v = len(jaxpr.eqns)
+    div_idx = next(
+        i for i, e in enumerate(jaxpr.eqns) if e.primitive.name == "div"
+    )
+
+    config = EnvConfig(
+        jaxpr=jaxpr, argnums=(0,), has_aux=False, sparse=False,
+        cmp_type="graphax", mem_type="graphax",
+        target_fun=None, data_gen=None,
+    )
+    initial_order, initial_specs = _build_callback_state(closed_jaxpr, total_v)
+    # axis 1 is the primal-side first axis. For div((4,), ()), the
+    # scalar invar has primal_dims=0, so primal_pos=0 is out of range.
+    sparsity_specs = initial_specs.at[div_idx, 0].set(
+        jnp.array([COMPRESS_SENTINEL, 1, 0], jnp.int32),
+    )
+    stop = jnp.asarray(total_v, dtype=jnp.int32)
+
+    captured, fake_extract = _spy_extract_jaxpr_to_record_transforms()
+    with mock.patch("alphagrad.approx.env.extract_jaxpr", fake_extract):
+        _callback(
+            config, (x,), closed_jaxpr.literals,
+            initial_order, sparsity_specs, stop, init=True,
+        )
+
+    transforms = captured["transforms"] or []
+    div_v = div_idx + 1
+    div_entry = next((t for t in transforms if t[0] == div_v), None)
+    assert div_entry is None, (
+        f"COMPRESS on the div's scalar-edge axis leaked through: {div_entry}. "
+        "The translator must validate against every invar's edge rank."
+    )
+    print(f"  div vertex correctly excluded from transforms = {transforms}")
+
+
+# ---------------------------------------------------------------------------
 # Smoke test: full env.step round-trip on the smallest real example
 # ---------------------------------------------------------------------------
 
@@ -367,6 +480,8 @@ def main():
     test_callback_forwards_arbitrary_factors_as_diag()
     test_callback_resolves_minus_one_factor_to_gcd()
     test_callback_drops_rules_that_dont_fit_every_invar()
+    test_callback_emits_compress_for_sentinel_rows()
+    test_callback_compress_drops_out_of_range_axes()
     test_env_step_roundtrip_on_helmholtz()
     print("\nALL ENV CALLBACK TESTS OK")
 
