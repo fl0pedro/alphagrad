@@ -1642,6 +1642,7 @@ class Agent(eqx.Module):
         actions = MicroAction(
             op_type=rewritten_op,
             i=actions.i, j=actions.j, exponents=actions.exponents,
+            factor=actions.factor,
         )
 
         return (
