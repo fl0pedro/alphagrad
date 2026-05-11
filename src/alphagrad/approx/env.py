@@ -736,6 +736,7 @@ def _callback(
     # a scalar denominator has one (n,) edge and one () edge — a Diag
     # with j=1 only fits the first).
     transforms: list[tuple[int, tuple]] = []
+    last_v_idx = len(o_list) - 1
     for v_idx, v in enumerate(o_list):
         eqn = config.jaxpr.eqns[v - 1]
         if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
@@ -766,6 +767,17 @@ def _callback(
                 # slot if the axis index doesn't fit every invar's edge —
                 # graphax's apply_compress will validate too, but raising
                 # would crash the io_callback.
+                #
+                # COMPRESS reduces ``val.ndim``, which trips graphax's
+                # shape-preservation assertion in ``_eliminate_vertex``
+                # when the compressed edge feeds into a subsequent
+                # elimination. Until graphax learns to propagate the
+                # reduced shape, restrict COMPRESS rows to the **last**
+                # vertex of the partial elimination order — the only
+                # vertex with no downstream elimination step within this
+                # callback.
+                if v_idx != last_v_idx:
+                    continue
                 axis_idx = bi2
                 kind_idx = factor  # row[2] reused as kind index for COMPRESS
                 fits_all = True
