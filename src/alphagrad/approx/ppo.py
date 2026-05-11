@@ -62,12 +62,10 @@ from alphagrad.approx.common import (
     vertex_avail_at_step,
 )
 from alphagrad.approx.env import (
-    COMPUTE_REWARD_INDICES,
     MAX_RULES_PER_VERTEX,
     MAX_TOKENS,
     NUM_AXIS_PAIRS,
     NUM_REWARDS,
-    QUALITY_REWARD_INDICES,
     REWARD_INDEX,
     REWARD_NAMES,
     StepAction,
@@ -85,6 +83,25 @@ from alphagrad.utils import entropy, explained_variance
 # NUM_AXIS_PAIRS axis pairs + 1 STOP token marking end of a rule sequence.
 NUM_PAIR_CHOICES = NUM_AXIS_PAIRS + 1
 PAIR_STOP = NUM_AXIS_PAIRS
+
+# Three-head value/advantage configuration. The value head emits one scalar
+# per training reward — (V_flops, V_mem, V_acc) — and the per-episode
+# preference vector `w` (stored on Trajectory.preference) weights these three
+# advantages when scalarizing for the PPO loss. The mapping into the env's
+# 8-component reward vector is fixed:
+#   head 0  flops          (REWARD_INDEX["flops"])
+#   head 1  peak_memory    (REWARD_INDEX["peak_memory"])
+#   head 2  frob_residual  (REWARD_INDEX["frob_residual"])
+# The remaining 5 env-reward components are still emitted for host-side
+# logging / top-N heaps but do not enter the value head or advantage path.
+HEAD_REWARD_INDICES: tuple[int, ...] = (
+    REWARD_INDEX["flops"],
+    REWARD_INDEX["peak_memory"],
+    REWARD_INDEX["frob_residual"],
+)
+NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
+HEAD_NAMES: tuple[str, ...] = ("flops", "mem", "acc")
+_HEAD_REWARD_INDICES_ARR = jnp.asarray(HEAD_REWARD_INDICES, dtype=jnp.int32)
 
 # Mapping from pair index 0..NUM_AXIS_PAIRS-1 -> (base_idx1, base_idx2). STOP is unused.
 _PAIR_TO_BASE = jnp.array(
@@ -115,14 +132,14 @@ class Trajectory(NamedTuple):
     tokens: jax.Array
     eqn_ids: jax.Array
     residual_state: jax.Array  # (V, embd_dim) at the start of this step
-    preference: jax.Array      # (NUM_REWARDS,) — same value across all steps
+    preference: jax.Array      # (NUM_VALUE_HEADS,) — weights V_flops/V_mem/V_acc
     vertex_idx: jax.Array
     pair_seq: jax.Array
     factor_seq: jax.Array
-    reward: jax.Array
+    reward: jax.Array          # (NUM_REWARDS,) — full env emission, kept for host logging
     done: jax.Array
-    value: jax.Array
-    next_value: jax.Array
+    value: jax.Array           # (NUM_VALUE_HEADS,) per-head value prediction
+    next_value: jax.Array      # (NUM_VALUE_HEADS,) per-head bootstrap value
     vertex_dist: jax.Array
     pair_dists: jax.Array
     factor_dists: jax.Array
@@ -988,14 +1005,14 @@ class ResidualStateUpdate(eqx.Module):
 
 
 class Agent(eqx.Module):
-    """Encoder + composable (vertex policy, rule policy) + split value head.
+    """Encoder + composable (vertex policy, rule policy) + three value heads.
 
-    The value head is split into `compute_value_head` (6 outputs — one per
-    cost-family reward index) and `quality_value_head` (2 outputs — cosine and
-    Frobenius). Their concatenation is the (NUM_REWARDS,) = (8,) value vector
-    that the rest of the trainer consumes; splitting them at the head keeps
-    gradient scales sane across the qualitatively different reward families,
-    which is what the architecture spec calls for.
+    The value head is split into three single-output MLPs, one per training
+    reward: ``value_head_flops``, ``value_head_mem``, ``value_head_acc``.
+    Their concatenation is the (NUM_VALUE_HEADS,) = (3,) value vector the
+    trainer consumes; the per-head split keeps gradient scales sane across
+    the qualitatively different reward families and matches the per-head
+    GAE / preference-scalarization in ``train_episode``.
 
     Stage B.2.A adds a data-dependent path: when `vertex_features` are
     supplied, the agent embeds the per-vertex op-type id and projects the
@@ -1012,8 +1029,9 @@ class Agent(eqx.Module):
     encoder: Encoder
     vertex_policy: eqx.Module
     rule_policy: eqx.Module
-    compute_value_head: MLP
-    quality_value_head: MLP
+    value_head_flops: MLP
+    value_head_mem: MLP
+    value_head_acc: MLP
     op_embedding: eqx.nn.Embedding
     vertex_feature_proj: eqx.nn.Linear
     # B.3: Set Transformer aggregator over calibration samples. Always
@@ -1033,7 +1051,7 @@ class Agent(eqx.Module):
     pref_proj: eqx.nn.Linear
 
     num_vertices: int = eqx.field(static=True)
-    num_rewards: int = eqx.field(static=True)
+    num_value_heads: int = eqx.field(static=True)
     max_rules: int = eqx.field(static=True)
     num_pair_choices: int = eqx.field(static=True)
     num_factors: int = eqx.field(static=True)
@@ -1048,8 +1066,9 @@ class Agent(eqx.Module):
         encoder,
         vertex_policy,
         rule_policy,
-        compute_value_head,
-        quality_value_head,
+        value_head_flops,
+        value_head_mem,
+        value_head_acc,
         op_embedding,
         vertex_feature_proj,
         set_transformer_agg,
@@ -1057,7 +1076,7 @@ class Agent(eqx.Module):
         residual_to_summary,
         pref_proj,
         num_vertices,
-        num_rewards,
+        num_value_heads,
         max_rules,
         num_pair_choices,
         num_factors,
@@ -1069,8 +1088,9 @@ class Agent(eqx.Module):
         self.encoder = encoder
         self.vertex_policy = vertex_policy
         self.rule_policy = rule_policy
-        self.compute_value_head = compute_value_head
-        self.quality_value_head = quality_value_head
+        self.value_head_flops = value_head_flops
+        self.value_head_mem = value_head_mem
+        self.value_head_acc = value_head_acc
         self.op_embedding = op_embedding
         self.vertex_feature_proj = vertex_feature_proj
         self.set_transformer_agg = set_transformer_agg
@@ -1078,7 +1098,7 @@ class Agent(eqx.Module):
         self.residual_to_summary = residual_to_summary
         self.pref_proj = pref_proj
         self.num_vertices = num_vertices
-        self.num_rewards = num_rewards
+        self.num_value_heads = num_value_heads
         self.max_rules = max_rules
         self.num_pair_choices = num_pair_choices
         self.num_factors = num_factors
@@ -1151,9 +1171,10 @@ class Agent(eqx.Module):
             pref_emb = self.pref_proj(preference)
             vertex_contexts = vertex_contexts + pref_emb[None, :]
             summary_eff = summary_eff + pref_emb
-        compute_value = self.compute_value_head(summary_eff)
-        quality_value = self.quality_value_head(summary_eff)
-        value = jnp.concatenate([compute_value, quality_value], axis=-1)
+        v_flops = self.value_head_flops(summary_eff)
+        v_mem = self.value_head_mem(summary_eff)
+        v_acc = self.value_head_acc(summary_eff)
+        value = jnp.concatenate([v_flops, v_mem, v_acc], axis=-1)
         return vertex_logits, vertex_contexts, value
 
     def encode(
@@ -1201,9 +1222,10 @@ class Agent(eqx.Module):
             pref_emb = self.pref_proj(preference)
             vertex_contexts = vertex_contexts + pref_emb[None, :]
             summary = summary + pref_emb
-        compute_value = self.compute_value_head(summary)
-        quality_value = self.quality_value_head(summary)
-        value = jnp.concatenate([compute_value, quality_value], axis=-1)
+        v_flops = self.value_head_flops(summary)
+        v_mem = self.value_head_mem(summary)
+        v_acc = self.value_head_acc(summary)
+        value = jnp.concatenate([v_flops, v_mem, v_acc], axis=-1)
         return vertex_logits, vertex_contexts, value
 
     def value_for(
@@ -1454,9 +1476,77 @@ def make_argparser() -> argparse.ArgumentParser:
 
     # Multi-rule / autoregressive head config (ignored when --no-ptr or --not-autoreg)
     p.add_argument("--max-rules", type=int, default=MAX_RULES_PER_VERTEX,
-                   help="Max number of (axis_pair, factor) rules per chosen vertex (autoregressive head only).")
+                   help="Max number of (axis_pair, factor) rules per chosen vertex (autoregressive head only). "
+                        "Pending the heads.py rewrite this is a static upper bound; the future dynamic head will "
+                        "let sub-episodes terminate via END at any sub-step.")
     p.add_argument("--factors", type=str, default="-1,1,2,4",
-                   help="Comma-separated factor choices for the per-rule factor head. -1 = gcd-based collapse (legacy).")
+                   help="Comma-separated factor choices for the per-rule factor head. "
+                        "Legacy sentinels: -1 = gcd-collapse, 0 = drop-axes (NOT semantically COMPRESS — "
+                        "real mean-COMPRESS lives in graphax.sparse.micro_actions.apply_compress and "
+                        "will be exposed as a distinct op once the heads.py rewrite lands). "
+                        "Going forward, prefer explicit positive divisors; the gcd is just one such value.")
+
+    # Comparison-study variants. `custom` honours whatever was passed on the
+    # CLI verbatim. The other values pre-set --factors / --max-rules /
+    # --pin-rules-to-exact to specific comparison points (see VARIANT_PRESETS
+    # below). Explicit later flags still override the preset.
+    p.add_argument(
+        "--variant",
+        type=str,
+        default="custom",
+        choices=[
+            "custom", "ve_only", "diag_gcd", "diag_factor", "compress", "full",
+        ],
+        help=(
+            "Pre-canned configuration mapping to --factors / --max-rules / "
+            "--pin-rules-to-exact for the architecture comparison study. "
+            "`custom` (default) honours your explicit flags. `ve_only` "
+            "freezes the rule head (no DIAG/COMPRESS, pointer + vertex-order "
+            "only). `diag_gcd` allows a single gcd-collapse DIAG per vertex. "
+            "`diag_factor` allows a single DIAG with factor choice. "
+            "`compress` is currently unwired (depends on the heads.py / "
+            "atomic-compress rewrite — see graphax.sparse.micro_actions). "
+            "`full` enables the existing multi-rule DIAG path."
+        ),
+    )
+
+    # Curriculum: train through multiple variants with the same model. New
+    # heads added in each stage warm up via cosine; existing heads from
+    # earlier stages run at a reduced flat multiplier so their learned
+    # weights aren't blown away but can still adapt to the new objective.
+    p.add_argument(
+        "--curriculum",
+        type=str,
+        default="",
+        help=(
+            "Curriculum of variants to run in sequence. Format: "
+            "`stage1:N1,stage2:N2,...` where each stage names a --variant "
+            "and an episode count. Single optimizer carries across stages; "
+            "per-head LR uses cosine_warmup_exp_decay_lr with period = N_i "
+            "so the period matches the head-warmup window. Empty = single "
+            "training run on --variant."
+        ),
+    )
+    p.add_argument(
+        "--curriculum-warmup-frac",
+        type=float,
+        default=0.3,
+        help=(
+            "Fraction of each curriculum stage's episodes spent in the "
+            "cosine LR warm-up before the exponential-decay phase. 0.3 = "
+            "first 30%% of the stage warms up, remaining 70%% decays."
+        ),
+    )
+    p.add_argument(
+        "--curriculum-existing-head-mult",
+        type=float,
+        default=0.3,
+        help=(
+            "Flat LR multiplier applied to heads introduced in an earlier "
+            "curriculum stage. Keeps previously-learned concepts from being "
+            "discarded but lets them adapt. Default 0.3."
+        ),
+    )
 
     # Network architecture
     p.add_argument("--vocab-size", type=int, default=256)
@@ -1708,6 +1798,89 @@ def _build_factor_table(args, use_autoreg: bool):
     return factor_table, factors_py, factor_table.shape[0], max_rules
 
 
+# Comparison-study presets — applied by `_apply_variant_preset` when
+# `--variant` is anything other than "custom". Each value is `(factors,
+# max_rules, pin_rules_to_exact)`; None means "don't override". Explicit
+# CLI flags later in argv still win because argparse picks the last
+# occurrence — see `_apply_variant_preset` for the merge order.
+VARIANT_PRESETS: dict[str, dict] = {
+    "custom":       {},
+    "ve_only":      {"pin_rules_to_exact": True},
+    "diag_gcd":     {"factors": "-1",            "max_rules": 1, "pin_rules_to_exact": False},
+    "diag_factor":  {"factors": "2,3,4,8,16",    "max_rules": 1, "pin_rules_to_exact": False},
+    "compress":     None,  # blocked on heads.py / atomic COMPRESS wiring
+    "full":         {"factors": "-1,2,3,4,8,16", "max_rules": MAX_RULES_PER_VERTEX,
+                     "pin_rules_to_exact": False},
+}
+
+
+def _apply_variant_preset(args, variant: str | None = None):
+    """In-place apply a `--variant` preset to ``args``.
+
+    `variant` overrides ``args.variant`` if given (used by the curriculum
+    scheduler when stepping through stages). Raises if the preset is not
+    yet wired (currently ``compress``, which depends on the atomic-COMPRESS
+    action — see graphax.sparse.micro_actions and the heads.py rewrite).
+    """
+    name = variant if variant is not None else getattr(args, "variant", "custom")
+    if name not in VARIANT_PRESETS:
+        raise ValueError(
+            f"Unknown --variant '{name}'. Valid: {list(VARIANT_PRESETS)}."
+        )
+    preset = VARIANT_PRESETS[name]
+    if preset is None:
+        raise NotImplementedError(
+            f"--variant '{name}' is not yet wired through the trainer. "
+            "It needs the atomic-COMPRESS action emitted by the autoregressive "
+            "sub-episode head (see graphax.sparse.micro_actions.apply_compress "
+            "and the pending heads.py rewrite). For now, use --variant=full "
+            "with --factors=0 in the factor table for a coarse approximation."
+        )
+    for k, v in preset.items():
+        setattr(args, k, v)
+
+
+def _parse_curriculum(spec: str) -> list[tuple[str, int]]:
+    """Parse `stage1:N1,stage2:N2,...` into a list of (variant, episodes) pairs.
+
+    Empty string -> empty list (no curriculum). Whitespace tolerated.
+    Validates every variant name against ``VARIANT_PRESETS`` and every
+    episode count is a positive integer.
+    """
+    if not spec.strip():
+        return []
+    stages: list[tuple[str, int]] = []
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            raise ValueError(
+                f"Curriculum stage '{chunk}' missing ':'. Expected "
+                "`variant:episode_count`."
+            )
+        name, n_str = chunk.split(":", 1)
+        name = name.strip()
+        if name not in VARIANT_PRESETS:
+            raise ValueError(
+                f"Curriculum stage variant '{name}' unknown. Valid: "
+                f"{list(VARIANT_PRESETS)}."
+            )
+        try:
+            n_episodes = int(n_str.strip())
+        except ValueError as e:
+            raise ValueError(
+                f"Curriculum stage '{chunk}': episode count '{n_str}' is "
+                "not an integer."
+            ) from e
+        if n_episodes <= 0:
+            raise ValueError(
+                f"Curriculum stage '{chunk}': episode count must be > 0."
+            )
+        stages.append((name, n_episodes))
+    return stages
+
+
 def _select_variant(args) -> tuple[bool, bool]:
     """Return `(use_pointer, use_autoreg)` — independent flags."""
     return (not args.no_ptr, not args.not_autoreg)
@@ -1728,7 +1901,7 @@ def _build_agent(
     max_rules: int,
     key,
 ):
-    encoder_keys = jrand.split(key, 12)
+    encoder_keys = jrand.split(key, 13)
     embedding = eqx.nn.Embedding(args.vocab_size, args.embd_dim, key=encoder_keys[0])
     pos_enc = PositionalEncoder(args.embd_dim, MAX_TOKENS)
     encoder = Encoder(
@@ -1780,16 +1953,14 @@ def _build_agent(
             sp_dims=_parse_int_list(args.policy_dims),
             key=encoder_keys[3],
         )
-    n_compute = len(COMPUTE_REWARD_INDICES)
-    n_quality = len(QUALITY_REWARD_INDICES)
-    compute_value_head = MLP(
-        args.embd_dim, n_compute, _parse_int_list(args.value_dims),
-        key=encoder_keys[4],
-    )
-    quality_value_head = MLP(
-        args.embd_dim, n_quality, _parse_int_list(args.value_dims),
-        key=encoder_keys[5],
-    )
+    # One single-output MLP per training reward (flops / peak_memory /
+    # frob_residual). Per-head split keeps gradient scales sane across the
+    # qualitatively different reward families and matches the per-head GAE
+    # and preference-vector scalarization in `train_episode`.
+    value_dims = _parse_int_list(args.value_dims)
+    value_head_flops = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[4])
+    value_head_mem = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[5])
+    value_head_acc = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[12])
     op_embedding = eqx.nn.Embedding(
         OP_TYPE_VOCAB_SIZE, args.op_embd_dim, key=encoder_keys[6],
     )
@@ -1817,15 +1988,18 @@ def _build_agent(
         vocab_size=OP_TYPE_VOCAB_SIZE,
         key=encoder_keys[10],
     )
-    pref_proj = eqx.nn.Linear(NUM_REWARDS, args.embd_dim, key=encoder_keys[11])
+    pref_proj = eqx.nn.Linear(
+        NUM_VALUE_HEADS, args.embd_dim, key=encoder_keys[11]
+    )
     return Agent(
         embedding=embedding,
         pos_enc=pos_enc,
         encoder=encoder,
         vertex_policy=vertex_policy,
         rule_policy=rule_policy,
-        compute_value_head=compute_value_head,
-        quality_value_head=quality_value_head,
+        value_head_flops=value_head_flops,
+        value_head_mem=value_head_mem,
+        value_head_acc=value_head_acc,
         op_embedding=op_embedding,
         vertex_feature_proj=vertex_feature_proj,
         set_transformer_agg=set_transformer_agg,
@@ -1833,7 +2007,7 @@ def _build_agent(
         residual_to_summary=residual_to_summary,
         pref_proj=pref_proj,
         num_vertices=total_v,
-        num_rewards=NUM_REWARDS,
+        num_value_heads=NUM_VALUE_HEADS,
         max_rules=max_rules,
         num_pair_choices=NUM_PAIR_CHOICES,
         num_factors=num_factors,
@@ -1979,6 +2153,10 @@ def _build_reward_weights(args) -> np.ndarray:
     lands on the canonical component picked by `--cmp-type` / `--mem-type`.
     Quality terms: cosine gets weight 1.0 (matching legacy behaviour) when
     "acc" is in `--rewards`; Frobenius gets `--lambda-frob` (default 0).
+
+    Returned as an 8-vec for *host-side display* only (top-N heaps, mean
+    return printout). Training-side weighting uses the 3-vec from
+    :func:`_build_head_weights`.
     """
     weights = np.zeros(NUM_REWARDS, dtype=np.float32)
     if "cmp" in args.rewards:
@@ -1989,6 +2167,25 @@ def _build_reward_weights(args) -> np.ndarray:
         weights[REWARD_INDEX["cosine_sim"]] = 1.0
     if args.lambda_frob != 0.0:
         weights[REWARD_INDEX["frob_residual"]] = args.lambda_frob
+    return weights
+
+
+def _build_head_weights(args) -> np.ndarray:
+    """Build the (NUM_VALUE_HEADS,) = (3,) static preference vector.
+
+    Indexes the three training rewards (flops / peak_memory / frob_residual)
+    -- the value head and advantage path operate on exactly these three.
+    The `--cmp-type` and `--mem-type` flags only affect host-side display:
+    training always learns flops + peak_memory + frob_residual regardless
+    of those settings.
+    """
+    weights = np.zeros(NUM_VALUE_HEADS, dtype=np.float32)
+    if "cmp" in args.rewards:
+        weights[0] = args.lambda_cmp
+    if "mem" in args.rewards:
+        weights[1] = args.lambda_mem
+    if "acc" in args.rewards or args.lambda_frob != 0.0:
+        weights[2] = args.lambda_frob if args.lambda_frob != 0.0 else 1.0
     return weights
 
 
@@ -2113,15 +2310,15 @@ def run_calibration_phase(
         f"(factor head + set_transformer_agg). All other modules frozen."
     )
 
-    # Quality-focused preference: cosine_sim + frob_residual carry the
-    # learning signal; the compute-family components are 0 so the advantage
-    # weighting is purely quality-driven (matches the spec's "supervised
-    # against the Frobenius and cosine quality signals").
+    # Quality-focused preference: only the acc head (frob_residual) carries
+    # the learning signal during calibration. flops and peak_memory weights
+    # are 0 so the advantage scalarization is purely quality-driven, matching
+    # the spec's "supervised against the Frobenius quality signal". cosine_sim
+    # is no longer a value head under the 3-head split; its host-side display
+    # is preserved via the 8-vec `traj.reward`.
     cal_pref = jnp.broadcast_to(
-        jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
-            .at[REWARD_INDEX["cosine_sim"]].set(1.0)
-            .at[REWARD_INDEX["frob_residual"]].set(1.0),
-        (num_envs, NUM_REWARDS),
+        jnp.zeros(NUM_VALUE_HEADS, dtype=jnp.float32).at[2].set(1.0),
+        (num_envs, NUM_VALUE_HEADS),
     )
 
     # Stage G never enforces hard constraints — calibration is a supervised
@@ -2305,6 +2502,45 @@ def _setup_jax_compile_cache() -> None:
 
 def main():
     args = make_argparser().parse_args()
+
+    # Apply the --variant preset onto args before anything else looks at
+    # args.factors / args.max_rules / args.pin_rules_to_exact. `custom` is a
+    # no-op; other variants overwrite those three flags. Explicit CLI values
+    # passed alongside --variant are clobbered — pick `custom` if you want
+    # to mix-and-match.
+    _apply_variant_preset(args)
+    if args.variant != "custom":
+        print(
+            f"--variant={args.variant} applied: factors={args.factors!r}, "
+            f"max_rules={args.max_rules}, "
+            f"pin_rules_to_exact={args.pin_rules_to_exact}"
+        )
+
+    # Parse the curriculum spec early so misspelled stages fail fast. The
+    # full runner (which would toggle pin_rules_to_exact across stages and
+    # ramp per-head LR via cosine_warmup_exp_decay_lr) needs the heads.py
+    # refactor: today's rollout_fn / loss_fn capture pin_rules_to_exact and
+    # the factor table at JIT-compile time, so cross-stage transitions
+    # require either re-jitting (acceptable but unimplemented) or threading
+    # those values in as explicit per-call arguments (preferred — coming
+    # with heads.py). For now we parse + validate the spec so the CLI
+    # surface is stable, and raise a clear error if a non-empty curriculum
+    # is requested.
+    curriculum_stages = _parse_curriculum(args.curriculum)
+    if curriculum_stages:
+        raise NotImplementedError(
+            "Curriculum runner is not yet wired. Parsed stages:\n  "
+            + " → ".join(f"{name}:{n}" for name, n in curriculum_stages)
+            + "\nBlocked on heads.py: the per-stage runner needs to "
+            "toggle pin_rules_to_exact (and eventually the op_type / "
+            "factor heads) across stages without forcing a full re-JIT, "
+            "which requires those values to be explicit rollout_fn "
+            "arguments rather than closed-over args fields. Run each "
+            "stage as its own --variant invocation until the rewrite "
+            "lands; the LR schedule lives in "
+            "`alphagrad.approx.common.schedules.cosine_warmup_exp_decay_lr`."
+        )
+
     use_pointer, use_autoreg = _select_variant(args)
     variant_label = _variant_label(use_pointer, use_autoreg)
 
@@ -2389,11 +2625,14 @@ def main():
             f"in factor_table). Axis head trains; factor head deterministic."
         )
     num_envs = _resolve_num_envs(args.num_envs, args.example)
-    # 8-component reward vector. The advantage weights map the legacy
-    # --cmp-type / --mem-type / --rewards / --lambda-frob flags to canonical
-    # indices in the 8-vec; the value head consumes the full vector.
+    # 8-component reward vector is still emitted by the env and used for
+    # host-side display (top-N heaps, per-component means). Training-side
+    # value / advantage path operates on the 3-vec (flops / peak_memory /
+    # frob_residual); see HEAD_REWARD_INDICES and `_build_head_weights`.
     reward_weights_np = _build_reward_weights(args)
     reward_weights = jnp.asarray(reward_weights_np, dtype=jnp.float32)
+    head_reward_weights_np = _build_head_weights(args)
+    head_reward_weights = jnp.asarray(head_reward_weights_np, dtype=jnp.float32)
     cmp_idx = _cmp_reward_index(args.cmp_type)
     mem_idx = _mem_reward_index(args.mem_type)
     cosine_idx = REWARD_INDEX["cosine_sim"]
@@ -2420,7 +2659,12 @@ def main():
         for i in range(NUM_REWARDS)
         if reward_weights_np[i] != 0.0
     )
-    print(f"reward weights: {nonzero_w or '<all zero — debug only>'}")
+    print(f"reward weights (display): {nonzero_w or '<all zero — debug only>'}")
+    head_w_str = ", ".join(
+        f"{HEAD_NAMES[i]}={float(head_reward_weights_np[i]):+.3g}"
+        for i in range(NUM_VALUE_HEADS)
+    )
+    print(f"head weights (training): {head_w_str}")
 
     agent_key, init_key, key = jrand.split(key, 3)
     agent = _build_agent(
@@ -2710,7 +2954,26 @@ def main():
             * batch.norm_adv,
         )
         ppo_loss = jnp.mean(-clipping_objective)
-        entropy_loss = jnp.mean(entropies)
+
+        # Per-sample sub-episode length: 1 (vertex) + active pair slots +
+        # active factor slots, matching the masking in `AutoregRulePolicy.evaluate`
+        # and `old_log_prob_for_action`. Dividing the joint entropy by this
+        # keeps long sub-episodes from dominating the entropy bonus.
+        is_stop_seq = batch.pair_seq == PAIR_STOP
+        prior_stops = (
+            jnp.cumsum(is_stop_seq.astype(jnp.int32), axis=-1)
+            - is_stop_seq.astype(jnp.int32)
+        )
+        pair_active_mask = (prior_stops == 0).astype(jnp.float32)
+        factor_active_mask = (
+            (prior_stops == 0) & (~is_stop_seq)
+        ).astype(jnp.float32)
+        sub_episode_lengths = (
+            1.0
+            + jnp.sum(pair_active_mask, axis=-1)
+            + jnp.sum(factor_active_mask, axis=-1)
+        )
+        entropy_loss = jnp.mean(entropies / sub_episode_lengths)
 
         value_loss = jnp.mean(
             jnp.sum(
@@ -2771,8 +3034,14 @@ def main():
             preferences_per_env,
         )
 
+        # Per-head GAE: only the three training-reward indices (flops /
+        # peak_memory / frob_residual) feed the value head and advantage
+        # path. The other 5 components of `traj.reward` stay untouched for
+        # host-side logging. `get_advantages` is elementwise over the last
+        # axis, so it naturally produces per-head returns / advantages.
+        head_rewards = traj.reward[..., _HEAD_REWARD_INDICES_ARR]
         _, estim_returns, advantages = get_advantages(
-            traj.reward,
+            head_rewards,
             traj.done,
             traj.value,
             traj.next_value,
@@ -2884,11 +3153,19 @@ def main():
         # Pair / factor / preference marginals — Stage D / E / F diagnostics.
         # Average over (env, time, slot) — broad enough to detect global
         # collapse without exposing per-step noise.
+        # P(STOP | slot 0) averaged over (env, time) — slot-0 STOP is the
+        # "no rule, exact AD" decision, which under the dynamic action space
+        # corresponds to END at t=0. A spike here flags entropy collapse or
+        # reward-noise dominance and is the single highest-signal debugging
+        # metric, so it gets its own scalar instead of being folded into
+        # the slot-averaged `pair_marginal`.
+        p_stop_slot0 = jnp.mean(traj.pair_dists[..., 0, PAIR_STOP])
         diag_pack = (
             jnp.mean(traj.pair_dists, axis=(0, 1, 2)),
             jnp.mean(traj.factor_dists, axis=(0, 1, 2)),
             jnp.mean(traj.preference, axis=(0, 1)),
             mean_violations,
+            p_stop_slot0,
         )
         return (
             agent, opt_state, env_states, metrics, total_rewards_full,
@@ -2999,15 +3276,16 @@ def main():
         # factor-index distribution (Stage E ρ-collapse early-warning), and
         # the per-episode preference vector (Stage F sanity check).
         if diag_pack is not None:
-            pair_marg, factor_marg, pref_mean, mean_viol = (
+            pair_marg, factor_marg, pref_mean, mean_viol, p_stop_slot0 = (
                 np.asarray(x) for x in diag_pack
             )
             for j, p in enumerate(pair_marg):
                 log_dict[f"pair_marginal/{j}"] = float(p)
             for j, p in enumerate(factor_marg):
                 log_dict[f"factor_marginal/{j}"] = float(p)
-            for j, name in enumerate(REWARD_NAMES):
+            for j, name in enumerate(HEAD_NAMES):
                 log_dict[f"preference/{name}"] = float(pref_mean[j])
+            log_dict["p_stop_slot0"] = float(p_stop_slot0)
             if multipliers_arr is not None and np.size(multipliers_arr) > 0:
                 lam = np.asarray(multipliers_arr)
                 viol = np.asarray(mean_viol)
@@ -3049,12 +3327,15 @@ def main():
     )
     multipliers = jnp.zeros(len(constraint_specs), dtype=jnp.float32)
 
-    # Stage F: per-env preference sampling. Uses a Dirichlet with the
-    # configured concentration; values < 1 emphasise corners and edges.
-    # When --preference-conditioned is off we fall back to broadcasting
-    # the static reward_weights so all downstream code sees a consistent
-    # `(num_envs, NUM_REWARDS)` shape.
-    static_pref = jnp.broadcast_to(reward_weights, (num_envs, NUM_REWARDS))
+    # Stage F: per-env preference sampling over the 3-head simplex (flops /
+    # peak_memory / frob_residual). Uses a Dirichlet with the configured
+    # concentration; values < 1 emphasise corners and edges. When
+    # --preference-conditioned is off we broadcast the static
+    # `head_reward_weights` so all downstream code sees a consistent
+    # `(num_envs, NUM_VALUE_HEADS)` shape.
+    static_pref = jnp.broadcast_to(
+        head_reward_weights, (num_envs, NUM_VALUE_HEADS)
+    )
 
     for ep in range(args.episodes):
         ep_key, key = jrand.split(key)
@@ -3067,10 +3348,10 @@ def main():
             # conditioned policy covers the whole Pareto front.
             corner_key, uniform_key, choice_key, ep_key = jrand.split(ep_key, 4)
             alpha_corner = jnp.full(
-                (NUM_REWARDS,), args.dirichlet_alpha, dtype=jnp.float32,
+                (NUM_VALUE_HEADS,), args.dirichlet_alpha, dtype=jnp.float32,
             )
             alpha_uniform = jnp.full(
-                (NUM_REWARDS,), args.dirichlet_alpha_uniform, dtype=jnp.float32,
+                (NUM_VALUE_HEADS,), args.dirichlet_alpha_uniform, dtype=jnp.float32,
             )
             corner_samples = jrand.dirichlet(
                 corner_key, alpha_corner, shape=(num_envs,),

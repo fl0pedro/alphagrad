@@ -14,9 +14,10 @@ import jax.numpy as jnp
 import jax.random as jrand
 import optax
 
-from alphagrad.approx.env import MAX_TOKENS, NUM_REWARDS
+from alphagrad.approx.env import MAX_TOKENS
 from alphagrad.approx.ppo import (
     NUM_PAIR_CHOICES,
+    NUM_VALUE_HEADS,
     PAIR_STOP,
     TrainBatch,
     _build_agent,
@@ -68,7 +69,7 @@ def build_one(no_ptr, not_autoreg, total_v=6, batch_size=8, seed=0):
     return _variant_label(use_pointer, use_autoreg), agent, factor_table, max_rules, num_factors, batch_key
 
 
-def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, num_rewards, key):
+def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, num_value_heads, key):
     keys = jrand.split(key, 10)
     tokens = jrand.randint(keys[0], (batch_size, MAX_TOKENS), 1, 256, dtype=jnp.int32)
     tokens = tokens.at[:, 100:].set(0)
@@ -86,13 +87,15 @@ def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, nu
     old_p = jnp.ones((batch_size, max_rules, num_pair_choices)) / num_pair_choices
     old_f = jnp.ones((batch_size, max_rules, num_factors)) / num_factors
 
-    estim_returns = jrand.normal(keys[4], (batch_size, num_rewards))
+    estim_returns = jrand.normal(keys[4], (batch_size, num_value_heads))
     norm_adv = jrand.normal(keys[5], (batch_size,))
     vertex_avail = jnp.ones((batch_size, total_v))
     # B.4 residual state — zero-init mirrors the rollout's first-step value.
     residual_state = jnp.zeros((batch_size, total_v, 32), dtype=jnp.float32)
-    # F preference vector — uniform 1/N as a stand-in for the per-env Dirichlet sample.
-    preference = jnp.full((batch_size, num_rewards), 1.0 / num_rewards, dtype=jnp.float32)
+    # F preference vector — uniform 1/K as a stand-in for the per-env Dirichlet sample.
+    preference = jnp.full(
+        (batch_size, num_value_heads), 1.0 / num_value_heads, dtype=jnp.float32,
+    )
     return TrainBatch(
         tokens=tokens,
         eqn_ids=eqn_ids,
@@ -158,7 +161,7 @@ def test_variant(no_ptr, not_autoreg):
 
     batch = fake_batch(
         batch_size, total_v, max_rules, num_factors, NUM_PAIR_CHOICES,
-        num_rewards=NUM_REWARDS, key=batch_key,
+        num_value_heads=NUM_VALUE_HEADS, key=batch_key,
     )
     pair_valid = jnp.ones((total_v, NUM_PAIR_CHOICES))
     pair_factor = jnp.ones((total_v, NUM_PAIR_CHOICES, num_factors))

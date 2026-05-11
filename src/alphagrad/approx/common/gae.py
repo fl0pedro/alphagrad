@@ -30,7 +30,18 @@ def get_num_clipping_triggers(ratio, eps):
 @jax.jit
 @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, None))
 def get_advantages(rewards, dones, values, next_values, discounts, gae_lambda):
-    """GAE-λ over a single env trajectory; vmapped over the batch dimension."""
+    """GAE-λ over a single env trajectory; vmapped over the batch dimension.
+
+    Per-head friendly: ``rewards`` and ``values`` may carry a trailing
+    head axis ``(T, K)``, in which case the math runs element-wise across
+    the K heads and returns ``(T, K)`` per-head advantages / returns. The
+    PPO trainer uses ``K = 3`` (V_flops / V_mem / V_acc) and scalarizes
+    the resulting advantages by a per-trajectory preference vector
+    ``w ∈ Δ^{K-1}`` from ``preferences.py``. Symlog normalization is
+    applied through ``inverse_reward_normalization_fn`` element-wise, so
+    each head's value head learns its own symlog target — FLOPs and
+    peak-memory scales don't contaminate each other.
+    """
 
     def loop_fn(carry, traj):
         episodic_return, lastgaelam = carry
