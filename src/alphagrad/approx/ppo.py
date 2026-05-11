@@ -3878,19 +3878,27 @@ def main():
         # Pair / factor / preference marginals — Stage D / E / F diagnostics.
         # Average over (env, time, slot) — broad enough to detect global
         # collapse without exposing per-step noise.
-        # P(STOP | slot 0) averaged over (env, time) — slot-0 STOP is the
-        # "no rule, exact AD" decision, which under the dynamic action space
-        # corresponds to END at t=0. A spike here flags entropy collapse or
-        # reward-noise dominance and is the single highest-signal debugging
-        # metric, so it gets its own scalar instead of being folded into
-        # the slot-averaged `pair_marginal`.
-        p_stop_slot0 = jnp.mean(traj.pair_dists[..., 0, PAIR_STOP])
+        # P(END | t=0) averaged over (env, time) — the slot-0 END
+        # probability is the highest-signal debugging metric: a spike
+        # flags entropy collapse or reward-noise dominance. In the
+        # legacy path "END at t=0" maps to slot-0 PAIR_STOP; in the
+        # dynamic path it's the op_type head's OP_END mass at sub-step 0.
+        if args.dynamic_substeps:
+            p_stop_slot0 = jnp.mean(traj.micro_op_dists[..., 0, OP_END])
+            # Mean op-type marginals over (env, time, sub-step). Useful
+            # for spotting collapse in a specific op-type (e.g. policy
+            # only emits END, never DIAG).
+            op_marginals = jnp.mean(traj.micro_op_dists, axis=(0, 1, 2))
+        else:
+            p_stop_slot0 = jnp.mean(traj.pair_dists[..., 0, PAIR_STOP])
+            op_marginals = jnp.zeros((NUM_OPS,), dtype=jnp.float32)
         diag_pack = (
             jnp.mean(traj.pair_dists, axis=(0, 1, 2)),
             jnp.mean(traj.factor_dists, axis=(0, 1, 2)),
             jnp.mean(traj.preference, axis=(0, 1)),
             mean_violations,
             p_stop_slot0,
+            op_marginals,
         )
         return (
             agent, opt_state, env_states, metrics, total_rewards_full,
@@ -4001,9 +4009,10 @@ def main():
         # factor-index distribution (Stage E ρ-collapse early-warning), and
         # the per-episode preference vector (Stage F sanity check).
         if diag_pack is not None:
-            pair_marg, factor_marg, pref_mean, mean_viol, p_stop_slot0 = (
-                np.asarray(x) for x in diag_pack
-            )
+            (
+                pair_marg, factor_marg, pref_mean, mean_viol,
+                p_stop_slot0, op_marginals,
+            ) = (np.asarray(x) for x in diag_pack)
             for j, p in enumerate(pair_marg):
                 log_dict[f"pair_marginal/{j}"] = float(p)
             for j, p in enumerate(factor_marg):
@@ -4011,6 +4020,10 @@ def main():
             for j, name in enumerate(HEAD_NAMES):
                 log_dict[f"preference/{name}"] = float(pref_mean[j])
             log_dict["p_stop_slot0"] = float(p_stop_slot0)
+            # Dynamic-substeps op-type marginals — DIAG / COMPRESS / END.
+            # Zero in legacy mode (filled with zeros by train_episode).
+            for j, op_name in enumerate(("diag", "compress", "end")):
+                log_dict[f"op_marginal/{op_name}"] = float(op_marginals[j])
             if multipliers_arr is not None and np.size(multipliers_arr) > 0:
                 lam = np.asarray(multipliers_arr)
                 viol = np.asarray(mean_viol)
