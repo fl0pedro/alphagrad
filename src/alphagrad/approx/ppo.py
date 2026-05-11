@@ -81,6 +81,8 @@ from alphagrad.approx.heads import (
     MAX_PRIMES,
     MAX_EXPONENT,
     NUM_OPS,
+    OP_COMPRESS,
+    OP_DIAG,
     OP_END,
     AxisTokenFeatures,
     FactorTables,
@@ -328,8 +330,10 @@ def old_micro_log_prob_for_action(
     prior_ends = jnp.cumsum(is_end.astype(jnp.int32)) - is_end.astype(jnp.int32)
     active = (prior_ends == 0).astype(jnp.float32)
 
-    is_diag = (op_seq == 0).astype(jnp.float32)  # OP_DIAG
-    is_diag_or_compress = (op_seq <= 1).astype(jnp.float32)  # OP_DIAG | OP_COMPRESS
+    is_diag = (op_seq == OP_DIAG).astype(jnp.float32)
+    is_diag_or_compress = (
+        (op_seq == OP_DIAG) | (op_seq == OP_COMPRESS)
+    ).astype(jnp.float32)
 
     S = op_seq.shape[0]
     arange_s = jnp.arange(S)
@@ -1686,21 +1690,21 @@ class Agent(eqx.Module):
             axis_state[vertex_idx], axis_valid_mask[vertex_idx],
         )
 
-        log_p_sub, ent_sub, sub_episode_length = (
-            self.micro_action_policy.evaluate(
-                v_context, features, factor_tables, actions,
-            )
+        (
+            log_p_sub, ent_sub, sub_episode_length,
+            new_op_dists, new_i_dists, new_j_dists, new_exp_dists,
+        ) = self.micro_action_policy.evaluate(
+            v_context, features, factor_tables, actions,
         )
 
         total_log_p = log_p_vertex + log_p_sub
         total_entropy = vertex_ent + ent_sub
-        # The legacy evaluate_action returns the per-component dists for
-        # KL tracking; for the dynamic path we'd need to re-run sample
-        # to get them. Skip for now (KL tracking on the micro path is a
-        # future polish item).
+        # Per-step dists are forwarded for KL tracking against the
+        # rollout-time old-policy snapshots stored in the trajectory.
         return (
             total_log_p, total_entropy, value, vertex_dist,
             sub_episode_length,
+            new_op_dists, new_i_dists, new_j_dists, new_exp_dists,
         )
 
     def to_env_action_dynamic(
@@ -3593,6 +3597,7 @@ def main():
         if cached_flat is None:
             (
                 log_probs, entropies, values, new_vertex_dist, sub_lengths,
+                new_op_dists, new_i_dists, new_j_dists, new_exp_dists,
             ) = jax.vmap(
                 lambda toks, eids, rs, pref, vidx, action, vmask, k:
                     _eval_dyn(toks, eids, rs, pref, vidx, action, vmask, None, k)
@@ -3603,6 +3608,7 @@ def main():
         else:
             (
                 log_probs, entropies, values, new_vertex_dist, sub_lengths,
+                new_op_dists, new_i_dists, new_j_dists, new_exp_dists,
             ) = jax.vmap(_eval_dyn)(
                 batch.tokens, batch.eqn_ids, batch.residual_state, batch.preference,
                 batch.vertex_idx, actions, batch.vertex_avail_mask, cached_flat,
@@ -3644,15 +3650,60 @@ def main():
             batch.norm_adv, jnp.sum(batch.estim_returns, axis=-1),
         )
 
-        # KL placeholder — per-component KL on the dynamic path is a
-        # follow-up. Vertex-side KL is well-defined; the per-step
-        # micro-action KL needs alignment by sub-step which adds
-        # complexity that's not strictly necessary for first runs.
-        kl_div = jnp.mean(
+        # Per-component KL on the dynamic path: vertex + op_type + i + j +
+        # prime-exponents. Mean over the batch dim; for the per-sub-step
+        # dists we also sum over the max_substeps axis after the per-step
+        # KL, then divide by the per-sample sub-episode length so the
+        # contribution is normalized the same way as the entropy bonus.
+        kl_vertex = jnp.mean(
             optax.kl_divergence(
                 jnp.log(new_vertex_dist + 1e-7), batch.old_vertex_dist,
             )
         )
+
+        # Active-sub-step gating mirrors old_micro_log_prob_for_action:
+        # entries past the first OP_END contribute 0.
+        is_end_seq = batch.micro_op_seq == OP_END
+        prior_ends = (
+            jnp.cumsum(is_end_seq.astype(jnp.int32), axis=-1)
+            - is_end_seq.astype(jnp.int32)
+        )
+        active_steps = (prior_ends == 0).astype(jnp.float32)   # (B, S)
+        is_diag_step = (batch.micro_op_seq == OP_DIAG).astype(jnp.float32)
+        is_diag_or_compress = (
+            (batch.micro_op_seq == OP_DIAG)
+            | (batch.micro_op_seq == OP_COMPRESS)
+        ).astype(jnp.float32)
+        denom = jnp.maximum(sub_lengths, 1.0)                  # (B,)
+
+        def _per_step_kl(new_d, old_d, gate):
+            """KL[new || old] per (batch, sub-step) gated by `gate`, then
+            sum-over-substeps and batch-mean-with-sub-episode-length norm."""
+            kl = optax.kl_divergence(jnp.log(new_d + 1e-7), old_d)  # (B, S, ...)
+            # Collapse any trailing component axes (e.g. NUM_OPS, MAX_AXES)
+            # into the scalar per (B, S).
+            while kl.ndim > 2:
+                kl = jnp.sum(kl, axis=-1)
+            kl = kl * gate                                           # (B, S)
+            per_sample = jnp.sum(kl, axis=-1) / denom                # (B,)
+            return jnp.mean(per_sample)
+
+        kl_op = _per_step_kl(new_op_dists, batch.old_micro_op_dists, active_steps)
+        kl_i = _per_step_kl(
+            new_i_dists, batch.old_micro_i_dists,
+            active_steps * is_diag_or_compress,
+        )
+        kl_j = _per_step_kl(
+            new_j_dists, batch.old_micro_j_dists,
+            active_steps * is_diag_step,
+        )
+        # exp_dists shape (B, S, MAX_PRIMES, MAX_EXPONENT+1). KL collapses
+        # last two axes; gate by DIAG-active.
+        kl_exp = _per_step_kl(
+            new_exp_dists, batch.old_micro_exp_dists,
+            active_steps * is_diag_step,
+        )
+        kl_div = kl_vertex + kl_op + kl_i + kl_j + kl_exp
 
         total_loss = (
             ppo_loss
