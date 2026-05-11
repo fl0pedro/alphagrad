@@ -96,6 +96,30 @@ def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, nu
     preference = jnp.full(
         (batch_size, num_value_heads), 1.0 / num_value_heads, dtype=jnp.float32,
     )
+    # Dynamic-substeps fields — zero-filled because this synthetic test
+    # exercises the legacy rule head only. Shapes mirror the production
+    # rollout_fn placeholders (see _dyn_zero_* in ppo.main).
+    max_substeps = max_rules  # use the same bound for the test
+    max_primes = 9
+    max_axes_per_vertex = 8
+    num_ops = 3
+    max_exponent = 30
+    micro_op_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
+    micro_i_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
+    micro_j_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
+    micro_exp_seq = jnp.zeros((batch_size, max_substeps, max_primes), dtype=jnp.int32)
+    micro_factor_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
+    micro_op_dists = jnp.zeros((batch_size, max_substeps, num_ops), dtype=jnp.float32)
+    micro_i_dists = jnp.zeros(
+        (batch_size, max_substeps, max_axes_per_vertex), dtype=jnp.float32,
+    )
+    micro_j_dists = jnp.zeros(
+        (batch_size, max_substeps, max_axes_per_vertex), dtype=jnp.float32,
+    )
+    micro_exp_dists = jnp.zeros(
+        (batch_size, max_substeps, max_primes, max_exponent + 1),
+        dtype=jnp.float32,
+    )
     return TrainBatch(
         tokens=tokens,
         eqn_ids=eqn_ids,
@@ -104,9 +128,18 @@ def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, nu
         vertex_idx=vertex_idx,
         pair_seq=pair_seq,
         factor_seq=factor_seq,
+        micro_op_seq=micro_op_seq,
+        micro_i_seq=micro_i_seq,
+        micro_j_seq=micro_j_seq,
+        micro_exp_seq=micro_exp_seq,
+        micro_factor_seq=micro_factor_seq,
         old_vertex_dist=old_v,
         old_pair_dists=old_p,
         old_factor_dists=old_f,
+        old_micro_op_dists=micro_op_dists,
+        old_micro_i_dists=micro_i_dists,
+        old_micro_j_dists=micro_j_dists,
+        old_micro_exp_dists=micro_exp_dists,
         estim_returns=estim_returns,
         norm_adv=norm_adv,
         vertex_avail_mask=vertex_avail,

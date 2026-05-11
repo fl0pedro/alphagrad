@@ -339,6 +339,101 @@ def micro_actions_to_rule_specs(
     return specs
 
 
+def micro_actions_to_rule_specs_jax(
+    op_types,
+    i_indices,
+    j_indices,
+    factors,
+    axis_state_for_vertex,
+):
+    """JAX-traceable MicroAction → rule_specs (DIAG only).
+
+    Differs from :func:`micro_actions_to_rule_specs` in that the entire
+    transform is JAX-tracer-friendly — no Python loops over sub-steps,
+    no exceptions. It is *intended* for the rollout's JIT-compiled
+    sample-then-step path; the Python translator stays for host-side
+    code paths (e.g. tests, debugging, top-N replay).
+
+    Semantics:
+
+    * Each sub-step's `(i, j, factor)` becomes one rule_specs row.
+    * `op_type == OP_COMPRESS` is silently skipped (the row is marked
+      unused). The env's `_callback` ignores COMPRESS today; pumping it
+      end-to-end requires the graphax-side rewrite. The policy is
+      expected to mask COMPRESS legality off until that wiring lands —
+      see `--allow-compress` on the trainer.
+    * `op_type == OP_END` and every sub-step after the first END are
+      marked unused.
+    * The output is truncated to ``MAX_RULES_PER_VERTEX`` rows; trailing
+      sub-steps beyond the legacy capacity are dropped. The policy's
+      ``max_substeps`` should be ≤ ``MAX_RULES_PER_VERTEX`` to avoid
+      silent truncation, or the trainer should accept the truncation
+      (the dropped DIAGs become no-ops from the env's perspective).
+
+    Args:
+        op_types: (max_substeps,) int32 — heads.py OP_* values.
+        i_indices, j_indices: (max_substeps,) int32 — axis-token indices
+            into axis_state_for_vertex.
+        factors: (max_substeps,) int32 — the integer factor produced
+            by the prime-exponent head (already collapsed from exponents).
+        axis_state_for_vertex: ``(MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM)``
+            int32 — per-vertex axis features from EnvState.
+
+    Returns:
+        rule_specs: ``(MAX_RULES_PER_VERTEX, 3)`` int32 in the legacy
+        env layout ``[base_idx1, base_idx2, factor]``. Unused rows are
+        ``[-1, -1, 0]``.
+    """
+    # Lazy import — heads.py imports nothing from env.py, but env.py
+    # only needs the heads.py constants when this translator runs.
+    from alphagrad.approx.heads import OP_DIAG, OP_END
+
+    is_output = axis_state_for_vertex[:, _AXIS_FEAT_IS_OUTPUT].astype(jnp.int32)
+    n_out = jnp.sum(is_output)
+
+    is_end_per = (op_types == OP_END)
+    prior_ends = (
+        jnp.cumsum(is_end_per.astype(jnp.int32)) - is_end_per.astype(jnp.int32)
+    )
+    active = (prior_ends == 0)
+    is_diag = (op_types == OP_DIAG)
+
+    def _row(s_idx):
+        i = i_indices[s_idx]
+        j = j_indices[s_idx]
+        is_out_i = is_output[i] > 0
+        is_out_j = is_output[j] > 0
+        # Relative position within out vs primal axes mirrors the
+        # compute_static_axis_state layout: out axes come first.
+        rel_i = jnp.where(is_out_i, i, i - n_out)
+        rel_j = jnp.where(is_out_j, j, j - n_out)
+        # Legacy spec: base_idx1 = output side, base_idx2 = primal side.
+        # If both axes are on the same side, the legacy format can't
+        # express the pair → mark unused.
+        same_side = is_out_i == is_out_j
+        bi1 = jnp.where(is_out_i, rel_i, rel_j)
+        bi2 = jnp.where(is_out_i, rel_j, rel_i)
+
+        used = active[s_idx] & is_diag[s_idx] & (~same_side)
+        bi1 = jnp.where(used, bi1, -1).astype(jnp.int32)
+        bi2 = jnp.where(used, bi2, -1).astype(jnp.int32)
+        f = jnp.where(used, factors[s_idx], 0).astype(jnp.int32)
+        return jnp.stack([bi1, bi2, f])
+
+    rows = jax.vmap(_row)(jnp.arange(op_types.shape[0]))
+
+    # Truncate to MAX_RULES_PER_VERTEX. If max_substeps < MAX_RULES we
+    # pad the trailing rows with [-1, -1, 0].
+    rows_truncated = rows[:MAX_RULES_PER_VERTEX]
+    pad_needed = MAX_RULES_PER_VERTEX - rows_truncated.shape[0]
+    if pad_needed > 0:
+        pad = jnp.tile(
+            jnp.array([-1, -1, 0], dtype=jnp.int32), (pad_needed, 1),
+        )
+        rows_truncated = jnp.concatenate([rows_truncated, pad], axis=0)
+    return rows_truncated
+
+
 # Lookup row used to convert a legacy scalar sp_type ∈ {0..4} into a single-rule (MAX_RULES, 3) spec.
 _LEGACY_SP_TO_RULE_ROW = jnp.array(
     [
