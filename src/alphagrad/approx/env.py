@@ -909,15 +909,24 @@ def _callback(
     # ------------------------------------------------------------------
     # Compile both the approximated and exact jacobian functions once.
     # ------------------------------------------------------------------
+    # ``--exec-on-gpu`` pins the reward harness to a GPU distinct from the
+    # one the trainer (the main process) is loaded on — otherwise the
+    # callback's compile/exec would deadlock against the main program's
+    # outstanding work on gpu[0]. Pick the *last* available GPU so we
+    # stay as far from the trainer as possible; requires ≥ 2 GPUs.
     callback_device = None
     if config.exec_on_gpu:
         gpu_devices = jax.devices("gpu")
-        if len(gpu_devices) >= 2:
-            callback_device = gpu_devices[1]
+        if len(gpu_devices) < 2:
+            raise RuntimeError(
+                "--exec-on-gpu requires at least two GPUs (one for the "
+                f"trainer, one for the env callback); got {len(gpu_devices)}."
+            )
+        callback_device = gpu_devices[-1]
 
     args_for_lower = (
         jax.device_put(args, callback_device)
-        if (config.exec_on_gpu and callback_device is not None)
+        if callback_device is not None
         else args
     )
 
@@ -954,20 +963,20 @@ def _callback(
     # ------------------------------------------------------------------
     n_samples = 10 if config.measure_latency else 1
 
-    # Inside an io_callback, args come back to the host as ``CpuDevice``
-    # JAX arrays, so reading the device off the args points at CPU even
-    # when ``compiled_approx`` JIT-runs on GPU. Always monitor every local
-    # device so we catch wherever the compute actually lands; the
-    # MemoryTracker sums peaks across devices, so over-monitoring at most
-    # widens the search but never silently misses a peak.
-    monitoring_devices: list = list(jax.local_devices())
-    if (
-        config.exec_on_gpu
-        and callback_device is not None
-        and callback_device not in monitoring_devices
-    ):
-        monitoring_devices.append(callback_device)
+    # Match the monitor to whichever device the compiled JIT actually runs
+    # on. Without --exec-on-gpu the args arrive as CpuDevice JAX arrays
+    # from the io_callback and the JIT lands on CPU; with --exec-on-gpu we
+    # explicitly device_put both `args_for_lower` and `eval_args_i` onto
+    # the pinned callback device above, so the JIT lands there. Reading
+    # the device off `args_for_lower` covers both branches without
+    # forcing the user to opt into GPU monitoring.
+    monitoring_devices: list = []
+    for x in jax.tree_util.tree_leaves(args_for_lower):
+        if hasattr(x, "devices"):
+            monitoring_devices.extend(list(x.devices()))
     unique_devices = list({id(d): d for d in monitoring_devices}.values())
+    if not unique_devices:
+        unique_devices = jax.local_devices()
 
     out_approxs: list = []
     out_exacts: list = []
@@ -979,18 +988,15 @@ def _callback(
             eval_args_i = [arg[i] for arg in eval_samples]
         else:
             eval_args_i = list(args)
-        if config.exec_on_gpu and callback_device is not None:
+        if callback_device is not None:
             eval_args_i = [jax.device_put(d, callback_device) for d in eval_args_i]
 
+        # ResourceMonitor already runs ``jax.effects_barrier()`` in
+        # ``__enter__`` / ``__exit__``, so we don't need an extra
+        # ``block_until_ready`` on the result — the barriers drain the
+        # device queue both for the timer and the memory tracker.
         with ResourceMonitor(devices=unique_devices) as monitor:
             out_approx = compiled_approx(*eval_args_i)
-            # JAX dispatches asynchronously; without a block here the
-            # monitor exits before the device finishes the work and both
-            # the time and memory readings are dominated by dispatch
-            # overhead (peak comes back as 0 bytes). Forcing the result to
-            # land synchronizes the device queue so the tracker sees the
-            # full peak allocation and the timer captures real wall-clock.
-            out_approx = jax.block_until_ready(out_approx)
         # Key by name instead of unpacking ``.values()`` so this stays
         # robust to dict-order / API tweaks in jax_memory_monitor.
         latency_s = float(monitor.stats.get("time", 0.0))
