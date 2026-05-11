@@ -864,14 +864,22 @@ class MicroActionHead(eqx.Module):
         i_mask_compress: jax.Array,
         j_mask_for_i_diag: jax.Array,
         tables: FactorTables,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Joint log-prob + entropy + arity for one sub-step.
+    ) -> tuple[
+        jax.Array, jax.Array, jax.Array,
+        jax.Array, jax.Array, jax.Array, jax.Array,
+    ]:
+        """Joint log-prob + entropy + arity for one sub-step, plus the
+        per-component distributions used downstream for KL tracking.
 
         Same per-op masking semantics as :meth:`sample_step`. The arity
         is the number of categoricals actually emitted (1 for END, 2 for
-        COMPRESS, and ``2 + MAX_PRIMES`` for DIAG — the prime sub-loop
-        contributes one categorical per real prime, masked to ``MAX_PRIMES``
-        for static shape but only the active ones contribute to entropy).
+        COMPRESS, and ``2 + sum(prime_mask)`` for DIAG — the prime
+        sub-loop contributes one categorical per real prime in ``g``).
+
+        Returns ``(log_p, entropy, arity, op_dist, i_dist, j_dist,
+        exp_dists)`` so the caller can both train against the joint
+        log-prob and compute per-component KL against stored old
+        distributions.
         """
         op_dist = self.op_head(summary, op_legality_mask)
         log_p_op = jnp.log(op_dist[action.op_type] + 1e-8)
@@ -905,7 +913,7 @@ class MicroActionHead(eqx.Module):
         max_exps = tables.max_exps[g]
         prime_mask = tables.prime_mask[g]
 
-        log_p_f, ent_f, _ = self.factor_head.evaluate(
+        log_p_f, ent_f, exp_dists = self.factor_head.evaluate(
             init_hidden=summary,
             primes=primes, max_exps=max_exps, prime_mask=prime_mask,
             N_i=N_i, N_j=N_j, g=g,
@@ -925,7 +933,7 @@ class MicroActionHead(eqx.Module):
         # entropy term that already weights by prime_mask).
         prime_arity = jnp.sum(prime_mask) * f_active
         arity = 1.0 + i_active + j_active + prime_arity
-        return log_p, entropy, arity
+        return log_p, entropy, arity, op_dist, i_dist, j_dist, exp_dists
 
 
 # ---------------------------------------------------------------------------
@@ -1009,7 +1017,11 @@ class MicroActionPolicy(eqx.Module):
             tables, key,
         )
 
-        log_p, ent, arity = self.head.log_prob_step(
+        # log_prob_step recomputes the dists internally but we discard
+        # them here — the sample_step return values are the dists at the
+        # rollout-time policy snapshot (the "old" dists for PPO), which
+        # is exactly what the trajectory needs.
+        log_p, ent, arity, _, _, _, _ = self.head.log_prob_step(
             action, summary, axis_tokens, features.size,
             op_legal, i_diag, i_compress, j_diag, tables,
         )
@@ -1114,7 +1126,9 @@ class MicroActionPolicy(eqx.Module):
         )
         i_diag, i_compress, j_diag = _compute_axis_masks(features)
 
-        log_p, ent, arity = self.head.log_prob_step(
+        (
+            log_p, ent, arity, op_dist, i_dist, j_dist, exp_dists,
+        ) = self.head.log_prob_step(
             action, summary, axis_tokens, features.size,
             op_legal, i_diag, i_compress, j_diag, tables,
         )
@@ -1157,7 +1171,7 @@ class MicroActionPolicy(eqx.Module):
 
         return (
             (new_features, new_ended, new_gid),
-            (log_p, ent, arity),
+            (log_p, ent, arity, op_dist, i_dist, j_dist, exp_dists),
         )
 
     def evaluate(
@@ -1167,13 +1181,17 @@ class MicroActionPolicy(eqx.Module):
         tables: FactorTables,
         actions: MicroAction,
     ):
-        """Recompute joint log-prob / entropy / arity for a stored sequence.
+        """Recompute joint log-prob / entropy / arity for a stored sequence,
+        plus per-step distributions for KL tracking.
 
         ``actions`` is the per-step :class:`MicroAction` sequence emitted
         by :meth:`sample` (each field has a leading ``max_substeps`` dim).
-        Returns ``(log_prob, entropy, arity)`` summed across the
-        sub-episode prefix (contributions past END are masked out by the
-        same logic as :meth:`sample`).
+        Returns ``(log_prob, entropy, arity, op_dists, i_dists, j_dists,
+        exp_dists)`` — the scalars are summed across the sub-episode
+        prefix (contributions past END masked out); the dists are the
+        per-step distributions under the *current* policy, with shape
+        ``(max_substeps, ...)``. Pair these with the stored old-policy
+        dists in the trajectory to compute per-component KL.
         """
         init_carry = (
             init_features,
@@ -1187,8 +1205,13 @@ class MicroActionPolicy(eqx.Module):
                 vertex_context=vertex_context, tables=tables,
             )
 
-        _, (logps, ents, arities) = lax.scan(step_fn, init_carry, actions)
-        return jnp.sum(logps), jnp.sum(ents), jnp.sum(arities)
+        _, (logps, ents, arities, op_dists, i_dists, j_dists, exp_dists) = (
+            lax.scan(step_fn, init_carry, actions)
+        )
+        return (
+            jnp.sum(logps), jnp.sum(ents), jnp.sum(arities),
+            op_dists, i_dists, j_dists, exp_dists,
+        )
 
 
 __all__ = [
