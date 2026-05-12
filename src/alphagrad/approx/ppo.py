@@ -5090,11 +5090,23 @@ def main():
         # across episodes. The optimizer also has its own internal count
         # (cosine-decay schedule reads it) but we want a separate, explicit
         # ramp anchored at the start of this run.
+        # ``shuffle_and_batch_by_trajectory`` slices ENVS into minibatches
+        # (each mb keeps a whole trajectory together so the loss can
+        # encode the residual jaxpr once per env). It's only usable when
+        # there's at least one env per minibatch — otherwise the floor
+        # division ``num_envs // minibatches`` returns 0 and every batch
+        # is empty, producing ``jnp.mean(empty) = NaN`` for every loss
+        # term. Fall back to the per-sample ``shuffle_and_batch`` in that
+        # case; the loss path still cache-encodes per sample via the
+        # ``elif args.cache_encoding`` branch in ``_dynamic_loss_fn`` /
+        # ``loss_fn``.
+        use_traj_batch = args.cache_encoding and num_envs >= args.minibatches
+
         def epoch_step_fn(carry_with_step, epoch_key):
             carry, step = carry_with_step
             batches = (
                 shuffle_and_batch_by_trajectory(full_batch, args.minibatches, epoch_key)
-                if args.cache_encoding
+                if use_traj_batch
                 else shuffle_and_batch(full_batch, args.minibatches, epoch_key)
             )
             mb_keys = jrand.split(epoch_key, args.minibatches)
