@@ -5642,12 +5642,21 @@ def main():
             sl_per_step = _symlog_rewards(cal_traj.reward)
             mean_abs = np.asarray(jnp.mean(jnp.abs(sl_per_step), axis=(0, 1)))
             abs_sum = abs_sum + mean_abs
+            # Show every channel that the env actually emits (i.e. has a
+            # non-trivial magnitude) — even ones with zero user weight,
+            # because the head-reward-weights pick up the scale for the
+            # multi-head path regardless of the scalar-mode user lambda.
+            # In particular ``frob_residual`` defaults to ``lambda=0`` but
+            # is one of the 3 value heads (``HEAD_REWARD_INDICES[2]``), so
+            # its scale must be visible and applied.
             print(
                 f"  scale cal step {step_idx:3d}/{args.calibrate_steps}  "
                 + "  ".join(
                     f"{REWARD_NAMES[i]}={mean_abs[i]:.2e}"
                     for i in range(NUM_REWARDS)
-                    if reward_weights_np[i] != 0.0
+                    if mean_abs[i] > 0.0
+                    or reward_weights_np[i] != 0.0
+                    or i in HEAD_REWARD_INDICES
                 ),
                 flush=True,
             )
@@ -5675,10 +5684,15 @@ def main():
             ),
             flush=True,
         )
+        # Per-head weights drive the multi-head value targets. Head 2
+        # ("acc") is the frob_residual head — printing the underlying
+        # reward name avoids the "acc/frob" ambiguity for users who set
+        # ``--lambda-frob`` directly.
         print(
             "calibrated head_reward_weights: "
             + ", ".join(
-                f"{HEAD_NAMES[i]}={head_reward_weights_np[i]:+.3g}"
+                f"{HEAD_NAMES[i]}({REWARD_NAMES[HEAD_REWARD_INDICES[i]]})="
+                f"{head_reward_weights_np[i]:+.3g}"
                 for i in range(NUM_VALUE_HEADS)
                 if head_reward_weights_np[i] != 0.0
             ),
