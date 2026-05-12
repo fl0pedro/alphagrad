@@ -137,6 +137,42 @@ NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
 HEAD_NAMES: tuple[str, ...] = ("flops", "mem", "acc")
 _HEAD_REWARD_INDICES_ARR = jnp.asarray(HEAD_REWARD_INDICES, dtype=jnp.int32)
 
+# Cross-channel scale handling. Reward channels span ~10¹⁰ in flops, ~10⁹
+# in peak_memory, ~70 in frob_residual, ~1 in cosine_sim. Without
+# per-channel normalization the flops gradient (1e10) drowns out cosine_sim
+# (1) by ten orders of magnitude, and the policy learns to ignore quality.
+# Fix is two-fold:
+#   1) symlog every monotone channel before the per-step weighted sum;
+#      compresses the dynamic range to ~25 / ~21 / ~5 / ~1 across channels.
+#   2) calibration measures mean |symlog(r_i)| over K rollouts of the
+#      un-trained agent and rescales reward_weights[i] by 1/mean_abs_i so
+#      each weighted channel contributes on a comparable scale.
+# cosine_sim is intentionally excluded from both: it is already bounded
+# to [0, 1] and ~order 1, so symlog is a near-identity that only complicates
+# the Lagrangian threshold semantics, and the user's CLI lambda for cosine
+# is already in usable units (reward per unit of cosine similarity).
+_NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (REWARD_INDEX["cosine_sim"],)
+_NO_SYMLOG_MASK: "jax.Array" = (
+    jnp.zeros((NUM_REWARDS,), dtype=jnp.bool_)
+    .at[jnp.asarray(_NO_SYMLOG_REWARD_INDICES, dtype=jnp.int32)]
+    .set(True)
+)
+_NO_SYMLOG_MASK_NP: np.ndarray = np.zeros((NUM_REWARDS,), dtype=np.bool_)
+_NO_SYMLOG_MASK_NP[list(_NO_SYMLOG_REWARD_INDICES)] = True
+
+
+def _symlog_rewards(reward_vec: "jax.Array") -> "jax.Array":
+    """Apply symlog elementwise on the last axis, leaving cosine_sim raw.
+
+    ``reward_vec`` has trailing dim ``NUM_REWARDS``. The mask is broadcast
+    against any leading batch / time dims so the call is shape-agnostic.
+    """
+    return jnp.where(
+        _NO_SYMLOG_MASK,
+        reward_vec,
+        reward_normalization_fn(reward_vec),
+    )
+
 # Mapping from pair index 0..NUM_AXIS_PAIRS-1 -> (base_idx1, base_idx2). STOP is unused.
 _PAIR_TO_BASE = jnp.array(
     [
@@ -4980,14 +5016,28 @@ def main():
         #   loss path's value-head shape contract is unchanged. The value loss
         #   below masks out channels 1/2 in scalar mode so the (un-trained)
         #   mem / acc heads don't drift on synthetic zero targets.
+        # Project the raw reward vector through symlog (cosine_sim is
+        # passed through unchanged — see ``_NO_SYMLOG_MASK``). This
+        # compresses the ~10¹⁰ dynamic range across flops / peak_memory /
+        # frob_residual / … so the per-channel weighted sum is no longer
+        # dominated by flops by 10 orders of magnitude. ``reward_weights``
+        # / ``head_reward_weights`` have already been rescaled by the
+        # pre-training calibration (lines ~5545–5640) so each weighted
+        # channel contributes on a comparable scale.
+        sl_reward = _symlog_rewards(traj.reward)  # (E, T, NUM_REWARDS)
         if args.loss_mode == "scalar":
-            scalar_reward = jnp.sum(
-                traj.reward * reward_weights, axis=-1
-            )  # (E, T)
+            scalar_reward = jnp.sum(sl_reward * reward_weights, axis=-1)  # (E, T)
             zeros = jnp.zeros_like(scalar_reward)
             head_rewards = jnp.stack([scalar_reward, zeros, zeros], axis=-1)
         else:
-            head_rewards = traj.reward[..., _HEAD_REWARD_INDICES_ARR]
+            # ``HEAD_REWARD_INDICES`` selects (flops, peak_memory,
+            # frob_residual) — none of these are cosine_sim, so all three
+            # are symlog'd. The value head still learns the symlog of
+            # estim_returns in the value loss; the GAE math in ``gae.py``
+            # treats values as symlog'd (symexp back to "raw" — but with
+            # the rewards now in symlog space, "raw" here is the symlog
+            # scale, which is stable in the 10²-ish range).
+            head_rewards = sl_reward[..., _HEAD_REWARD_INDICES_ARR]
         _, estim_returns, advantages = get_advantages(
             head_rewards,
             traj.done,
@@ -5028,8 +5078,25 @@ def main():
         # from constraint-violating regions, and ``λ_i`` rises by dual
         # ascent on the mean violation.
         if constraint_indices.shape[0] > 0:
-            picked = traj.reward[..., constraint_indices]  # (E, T, C)
-            signed = constraint_signs * (constraint_thresholds - picked)
+            # Project picked rewards + thresholds through symlog for
+            # symlog'd channels, leave cosine_sim raw. This keeps the
+            # constraint penalty in the same units the policy gradient
+            # sees (symlog-space for flops / peak_memory / frob, raw for
+            # cosine), so the Lagrangian multiplier ``λ`` lives on a
+            # single scale instead of trying to bridge 10¹⁰× gaps.
+            is_no_symlog = jnp.take(_NO_SYMLOG_MASK, constraint_indices)  # (C,)
+            picked_raw = traj.reward[..., constraint_indices]  # (E, T, C)
+            picked = jnp.where(
+                is_no_symlog,
+                picked_raw,
+                reward_normalization_fn(picked_raw),
+            )
+            thresholds = jnp.where(
+                is_no_symlog,
+                constraint_thresholds,
+                reward_normalization_fn(constraint_thresholds),
+            )
+            signed = constraint_signs * (thresholds - picked)
             violations = jnp.maximum(0.0, signed)  # (E, T, C)
             penalty = jnp.sum(violations * multipliers, axis=-1)  # (E, T)
             norm_adv = norm_adv - penalty
@@ -5499,6 +5566,120 @@ def main():
         dtype=jnp.float32,
     )
     multipliers = jnp.zeros(len(constraint_specs), dtype=jnp.float32)
+
+    # ------------------------------------------------------------------
+    # Pre-training reward-scale calibration.
+    #
+    # Reward channels span ~10¹⁰ in flops vs ~1 in cosine_sim. Without
+    # per-channel normalisation the flops gradient drowns out everything
+    # else, the policy collapses to whatever action minimises raw flops
+    # (typically pure COMPRESS) and ignores quality. We run K rollouts of
+    # the un-trained agent (no gradient updates), accumulate
+    # ``mean_abs(symlog(reward))`` per channel, and rescale
+    # ``reward_weights`` / ``head_reward_weights`` by the inverse so each
+    # weighted channel contributes on a comparable scale. cosine_sim is
+    # excluded (already bounded to ~order 1; the user's CLI lambda is
+    # already a usable unit). The rescaled weights are picked up on the
+    # first call to ``train_episode`` via Python's lazy closure lookup.
+    # Skipping the block (``--calibrate-steps 0``) leaves the user's raw
+    # lambdas in place; the per-step symlog (applied unconditionally
+    # inside ``train_episode``) still compresses the dynamic range.
+    # ------------------------------------------------------------------
+    if args.calibrate_steps > 0:
+        print(
+            f"\nPre-training scale calibration: {args.calibrate_steps} rollouts "
+            "(measuring |symlog(reward)| per channel under the initial policy)"
+        )
+        # Uniform-preference rollouts: preference doesn't affect the env's
+        # reward emission (the full 8-vec is always computed), only the
+        # policy's behaviour — which is uninformative anyway with random
+        # weights. Uniform 1/K so we don't pre-bias the trajectory mix.
+        cal_uniform_pref = jnp.broadcast_to(
+            jnp.full((NUM_VALUE_HEADS,), 1.0 / NUM_VALUE_HEADS, dtype=jnp.float32),
+            (num_envs, NUM_VALUE_HEADS),
+        )
+        cal_pin_rules = jnp.asarray(args.pin_rules_to_exact, dtype=jnp.bool_)
+        abs_sum = np.zeros((NUM_REWARDS,), dtype=np.float32)
+        for step_idx in range(args.calibrate_steps):
+            cal_key, key = jrand.split(key)
+            cal_eval_key, cal_key = jrand.split(cal_key)
+            cal_rollout_keys = jrand.split(cal_key, num_envs)
+            cal_eval_samples = generate_eval_samples(
+                env, cal_eval_key, args.num_eval_samples
+            )
+            cal_env = eqx.tree_at(
+                lambda e: e.eval_args_samples, env, cal_eval_samples
+            )
+            cal_vfeat = _episode_vertex_features(
+                args,
+                closed_jaxpr.jaxpr,
+                tuple(closed_jaxpr.literals),
+                tuple(xs),
+                eval_samples=cal_eval_samples,
+                argnums=tuple(argnums),
+            )
+            cal_env_states = reset_envs(cal_env)
+            _, cal_traj, _cal_totals = rollout_fn(
+                agent,
+                cal_env,
+                num_valid,
+                cal_env_states,
+                cal_rollout_keys,
+                cal_vfeat,
+                cal_uniform_pref,
+                op_legality_override,
+                cal_pin_rules,
+            )
+            # ``cal_traj.reward`` is the per-step reward stream — shape
+            # ``(num_envs, T, NUM_REWARDS)``. That's the exact tensor the
+            # loss path will pass through ``_symlog_rewards`` and weight
+            # per channel, so calibrating against its per-step magnitudes
+            # gives the correct scale (using only the per-episode total
+            # would underweight flops by ~T× when rewards are dense, and
+            # produces the wrong scale when ``--terminal-rewards-only``
+            # makes rewards sparse).
+            sl_per_step = _symlog_rewards(cal_traj.reward)
+            mean_abs = np.asarray(jnp.mean(jnp.abs(sl_per_step), axis=(0, 1)))
+            abs_sum = abs_sum + mean_abs
+            print(
+                f"  scale cal step {step_idx:3d}/{args.calibrate_steps}  "
+                + "  ".join(
+                    f"{REWARD_NAMES[i]}={mean_abs[i]:.2e}"
+                    for i in range(NUM_REWARDS)
+                    if reward_weights_np[i] != 0.0
+                )
+            )
+        mean_abs_final = abs_sum / args.calibrate_steps
+        # ``1/mean_abs`` for symlog channels, ``1.0`` for cosine_sim. The
+        # ``+ 1e-3`` floor handles zero-magnitude channels (e.g. when a
+        # reward family is disabled or the env reports zero in this run).
+        reward_scales_np = np.where(
+            _NO_SYMLOG_MASK_NP, 1.0, 1.0 / (mean_abs_final + 1e-3)
+        ).astype(np.float32)
+        reward_weights_np = (reward_weights_np * reward_scales_np).astype(np.float32)
+        head_reward_weights_np = (
+            head_reward_weights_np * reward_scales_np[list(HEAD_REWARD_INDICES)]
+        ).astype(np.float32)
+        # Rebind the jax-array versions; ``train_episode``'s closure
+        # picks these up via name lookup at first-call trace time.
+        reward_weights = jnp.asarray(reward_weights_np, dtype=jnp.float32)
+        head_reward_weights = jnp.asarray(head_reward_weights_np, dtype=jnp.float32)
+        print(
+            "calibrated reward_weights: "
+            + ", ".join(
+                f"{REWARD_NAMES[i]}={reward_weights_np[i]:+.3g}"
+                for i in range(NUM_REWARDS)
+                if reward_weights_np[i] != 0.0
+            )
+        )
+        print(
+            "calibrated head_reward_weights: "
+            + ", ".join(
+                f"{HEAD_NAMES[i]}={head_reward_weights_np[i]:+.3g}"
+                for i in range(NUM_VALUE_HEADS)
+                if head_reward_weights_np[i] != 0.0
+            )
+        )
 
     # Stage F: per-env preference sampling over the 3-head simplex (flops /
     # peak_memory / frob_residual). Uses a Dirichlet with the configured
