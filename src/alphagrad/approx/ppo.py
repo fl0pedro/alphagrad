@@ -2507,6 +2507,15 @@ def make_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow the top-N accuracy heap to keep trajectories with cosine similarity == 1.0.",
     )
+    p.add_argument(
+        "--print-top-every",
+        type=int,
+        default=0,
+        help="Print the running top-N Total Reward every N training episodes "
+        "(in addition to the post-training + post-calibration dumps). 0 disables. "
+        "Useful for short smoke runs where waiting for the end-of-training dump "
+        "isn't ergonomic.",
+    )
 
     return p
 
@@ -5164,6 +5173,53 @@ def main():
         "top_n_acc": [],
     }
 
+    def print_top_n(name, heap, reverse_val=True, log_to_wandb=True):
+        print(f"\nTop {args.top_n} trajectories for {name}:")
+        sorted_items = sorted(heap, key=lambda x: x[0], reverse=reverse_val)
+        weights = reward_weights_np
+        table = None
+        if log_to_wandb:
+            table = wandb.Table(
+                columns=[
+                    "rank",
+                    "episode",
+                    "total_reward",
+                    "cmp",
+                    "acc",
+                    "mem",
+                    "frob",
+                    "sequence",
+                ]
+            )
+        for rank, (val, ep, rets, seq) in enumerate(sorted_items, 1):
+            arr = np.array(rets)
+            total_ret = float(np.sum(arr * weights))
+            cmp_val = -float(arr[cmp_idx])  # display as positive cost
+            mem_val = -float(arr[mem_idx])  # display as positive cost
+            acc_val = float(arr[cosine_idx])  # cosine ∈ [0, 1]
+            frob_val = -float(arr[frob_idx])  # display as positive residual
+            print(
+                f"{rank}. Ep {ep} | Total Reward: {total_ret:.2e} | "
+                f"CMP({args.cmp_type}): {cmp_val:.2e} | Acc: {acc_val:.4f} | "
+                f"Mem({args.mem_type}): {mem_val:.2e} | Frob: {frob_val:.4e}"
+            )
+            # ``seq`` is a list of (vertex, [callable_str, ...]) tuples; the
+            # inner strings are already copy-pastable
+            # ``diag(...)`` / ``compress(...)`` expressions, so render the
+            # whole structure with the callable text un-quoted.
+            seq_strs = []
+            for v, calls in seq:
+                joined = ", ".join(calls)
+                seq_strs.append(f"({v}, [{joined}])")
+            seq_repr = "[" + ", ".join(seq_strs) + "]"
+            print(f"   Sequence (vertex, [calls...]): {seq_repr}")
+            if table is not None:
+                table.add_data(
+                    rank, ep, total_ret, cmp_val, acc_val, mem_val, frob_val, seq_repr
+                )
+        if table is not None:
+            wandb.log({f"Top N {name}": table})
+
     def host_log(
         ep, all_rets, actions_pack, mean_r, mets, diag_pack=None, multipliers_arr=None
     ):
@@ -5542,6 +5598,22 @@ def main():
             diag_pack,
             multipliers,
         )
+        # Mid-training top-N snapshot. Skips the wandb table log so we
+        # don't pollute the offline run with duplicate tables — only the
+        # post-training / post-calibration dumps land in wandb.
+        if (
+            args.print_top_every > 0
+            and (ep + 1) % args.print_top_every == 0
+            and ep + 1 < args.episodes
+        ):
+            pbar.write(
+                f"\n=== top-{args.top_n} after episode {ep + 1}/{args.episodes} ==="
+            )
+            print_top_n(
+                "Total Reward",
+                host_state["top_n_total"],
+                log_to_wandb=False,
+            )
 
     pbar.close()
 
@@ -5565,49 +5637,6 @@ def main():
             global_step=global_step,
             key=key,
         )
-
-    def print_top_n(name, heap, reverse_val=True):
-        print(f"\nTop {args.top_n} trajectories for {name}:")
-        sorted_items = sorted(heap, key=lambda x: x[0], reverse=reverse_val)
-        table = wandb.Table(
-            columns=[
-                "rank",
-                "episode",
-                "total_reward",
-                "cmp",
-                "acc",
-                "mem",
-                "frob",
-                "sequence",
-            ]
-        )
-        weights = reward_weights_np
-        for rank, (val, ep, rets, seq) in enumerate(sorted_items, 1):
-            arr = np.array(rets)
-            total_ret = float(np.sum(arr * weights))
-            cmp_val = -float(arr[cmp_idx])  # display as positive cost
-            mem_val = -float(arr[mem_idx])  # display as positive cost
-            acc_val = float(arr[cosine_idx])  # cosine ∈ [0, 1]
-            frob_val = -float(arr[frob_idx])  # display as positive residual
-            print(
-                f"{rank}. Ep {ep} | Total Reward: {total_ret:.2e} | "
-                f"CMP({args.cmp_type}): {cmp_val:.2e} | Acc: {acc_val:.4f} | "
-                f"Mem({args.mem_type}): {mem_val:.2e} | Frob: {frob_val:.4e}"
-            )
-            # ``seq`` is a list of (vertex, [callable_str, ...]) tuples; the
-            # inner strings are already copy-pastable
-            # ``diag(...)`` / ``compress(...)`` expressions, so render the
-            # whole structure with the callable text un-quoted.
-            seq_strs = []
-            for v, calls in seq:
-                joined = ", ".join(calls)
-                seq_strs.append(f"({v}, [{joined}])")
-            seq_repr = "[" + ", ".join(seq_strs) + "]"
-            print(f"   Sequence (vertex, [calls...]): {seq_repr}")
-            table.add_data(
-                rank, ep, total_ret, cmp_val, acc_val, mem_val, frob_val, seq_repr
-            )
-        wandb.log({f"Top N {name}": table})
 
     print_top_n("Total Reward", host_state["top_n_total"])
     print_top_n(f"CMP (Lowest {args.cmp_type})", host_state["top_n_cmp"])
