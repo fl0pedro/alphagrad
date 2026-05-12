@@ -5588,7 +5588,8 @@ def main():
     if args.calibrate_steps > 0:
         print(
             f"\nPre-training scale calibration: {args.calibrate_steps} rollouts "
-            "(measuring |symlog(reward)| per channel under the initial policy)"
+            "(measuring |symlog(reward)| per channel under the initial policy)",
+            flush=True,
         )
         # Uniform-preference rollouts: preference doesn't affect the env's
         # reward emission (the full 8-vec is always computed), only the
@@ -5647,7 +5648,8 @@ def main():
                     f"{REWARD_NAMES[i]}={mean_abs[i]:.2e}"
                     for i in range(NUM_REWARDS)
                     if reward_weights_np[i] != 0.0
-                )
+                ),
+                flush=True,
             )
         mean_abs_final = abs_sum / args.calibrate_steps
         # ``1/mean_abs`` for symlog channels, ``1.0`` for cosine_sim. The
@@ -5670,7 +5672,8 @@ def main():
                 f"{REWARD_NAMES[i]}={reward_weights_np[i]:+.3g}"
                 for i in range(NUM_REWARDS)
                 if reward_weights_np[i] != 0.0
-            )
+            ),
+            flush=True,
         )
         print(
             "calibrated head_reward_weights: "
@@ -5678,7 +5681,8 @@ def main():
                 f"{HEAD_NAMES[i]}={head_reward_weights_np[i]:+.3g}"
                 for i in range(NUM_VALUE_HEADS)
                 if head_reward_weights_np[i] != 0.0
-            )
+            ),
+            flush=True,
         )
 
     # Stage F: per-env preference sampling over the 3-head simplex (flops /
