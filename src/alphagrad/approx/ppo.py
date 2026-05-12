@@ -2370,6 +2370,22 @@ def make_argparser() -> argparse.ArgumentParser:
         "0 to disable the prior anneal entirely.",
     )
     p.add_argument(
+        "--loss-mode",
+        type=str,
+        default="multi_head",
+        choices=["multi_head", "scalar"],
+        help="``multi_head`` (default): keep the 3-value-head architecture, "
+        "compute per-head GAE on (flops, peak_memory, frob_residual), and "
+        "scalarize advantages with either ``--preference-conditioned`` "
+        "Dirichlet samples or the static ``--lambda-*`` weights. "
+        "``scalar``: collapse to the single-channel vertex_ppo.py-style PPO — "
+        "build one scalar reward per step as "
+        "``sum_i(reward_weights[i] * symlog(reward_vec[i]))`` (symlog absorbs "
+        "the wide magnitude range across the 8 components), run single-channel "
+        "GAE, and use only the flops value head for the value loss. The other "
+        "two value heads stay frozen in this mode.",
+    )
+    p.add_argument(
         "--preference-conditioned",
         action="store_true",
         help="Stage F: train a single preference-conditioned policy "
@@ -4527,14 +4543,27 @@ def main():
         )
         entropy_loss = jnp.mean(entropies / sub_episode_lengths)
 
-        value_loss = jnp.mean(
-            jnp.sum(
-                (values - reward_normalization_fn(batch.estim_returns)) ** 2, axis=-1
+        # In scalar mode only slot 0 of the (value, return) pair carries
+        # signal; ignore the other heads so they don't drift training on
+        # zero targets.
+        if args.loss_mode == "scalar":
+            value_loss = jnp.mean(
+                (values[..., 0] - reward_normalization_fn(batch.estim_returns[..., 0]))
+                ** 2
             )
-        )
-        explained_var = explained_variance(
-            batch.norm_adv, jnp.sum(batch.estim_returns, axis=-1)
-        )
+            explained_var = explained_variance(
+                batch.norm_adv, batch.estim_returns[..., 0]
+            )
+        else:
+            value_loss = jnp.mean(
+                jnp.sum(
+                    (values - reward_normalization_fn(batch.estim_returns)) ** 2,
+                    axis=-1,
+                )
+            )
+            explained_var = explained_variance(
+                batch.norm_adv, jnp.sum(batch.estim_returns, axis=-1)
+            )
 
         vertex_kl = jnp.mean(
             optax.kl_divergence(jnp.log(vertex_dist + 1e-7), batch.old_vertex_dist)
@@ -4745,16 +4774,27 @@ def main():
         # zero on samples where the sub-episode was forced END at step 0.
         entropy_loss = jnp.mean(entropies / jnp.maximum(sub_lengths, 1.0))
 
-        value_loss = jnp.mean(
-            jnp.sum(
-                (values - reward_normalization_fn(batch.estim_returns)) ** 2,
-                axis=-1,
+        # See the legacy loss path's value-mode switch for the rationale;
+        # in scalar mode only slot 0 of (values, estim_returns) is alive.
+        if args.loss_mode == "scalar":
+            value_loss = jnp.mean(
+                (values[..., 0] - reward_normalization_fn(batch.estim_returns[..., 0]))
+                ** 2
             )
-        )
-        explained_var = explained_variance(
-            batch.norm_adv,
-            jnp.sum(batch.estim_returns, axis=-1),
-        )
+            explained_var = explained_variance(
+                batch.norm_adv, batch.estim_returns[..., 0]
+            )
+        else:
+            value_loss = jnp.mean(
+                jnp.sum(
+                    (values - reward_normalization_fn(batch.estim_returns)) ** 2,
+                    axis=-1,
+                )
+            )
+            explained_var = explained_variance(
+                batch.norm_adv,
+                jnp.sum(batch.estim_returns, axis=-1),
+            )
 
         # Per-component KL on the dynamic path: vertex + op_type + i + j +
         # prime-exponents. Mean over the batch dim; for the per-sub-step
@@ -4921,12 +4961,33 @@ def main():
             pin_rules_to_exact_arg,
         )
 
-        # Per-head GAE: only the three training-reward indices (flops /
-        # peak_memory / frob_residual) feed the value head and advantage
-        # path. The other 5 components of `traj.reward` stay untouched for
-        # host-side logging. `get_advantages` is elementwise over the last
-        # axis, so it naturally produces per-head returns / advantages.
-        head_rewards = traj.reward[..., _HEAD_REWARD_INDICES_ARR]
+        # GAE on the (E, T, NUM_VALUE_HEADS) reward tensor.
+        #
+        # ``multi_head`` (the default): use the three training-reward indices
+        #   (flops, peak_memory, frob_residual) as separate channels; downstream
+        #   the per-head advantages get normalized and scalarized by the
+        #   (Dirichlet or static-lambda) preference vector.
+        #
+        # ``scalar`` (vertex_ppo.py-style): collapse the reward vector to a
+        #   single scalar per step via ``sum_i(reward_weights[i] * r_i)`` —
+        #   raw weighted sum, *without* a per-component pre-normalization. The
+        #   cross-component magnitude gap (flops ~1e10 vs cosine_sim ~1) is
+        #   handled the same way ``vertex_ppo.py`` handles it: the value head
+        #   learns a ``symlog``-normalized target via
+        #   ``reward_normalization_fn(estim_returns)`` in the value loss, and
+        #   the standard PPO advantage normalization handles the rest. The
+        #   scalar is written into channel 0; channels 1/2 stay at zero so the
+        #   loss path's value-head shape contract is unchanged. The value loss
+        #   below masks out channels 1/2 in scalar mode so the (un-trained)
+        #   mem / acc heads don't drift on synthetic zero targets.
+        if args.loss_mode == "scalar":
+            scalar_reward = jnp.sum(
+                traj.reward * reward_weights, axis=-1
+            )  # (E, T)
+            zeros = jnp.zeros_like(scalar_reward)
+            head_rewards = jnp.stack([scalar_reward, zeros, zeros], axis=-1)
+        else:
+            head_rewards = traj.reward[..., _HEAD_REWARD_INDICES_ARR]
         _, estim_returns, advantages = get_advantages(
             head_rewards,
             traj.done,
@@ -4942,12 +5003,18 @@ def main():
         norm_adv_components = jax.vmap(normalize, in_axes=-1, out_axes=-1)(
             advantages.reshape(-1, advantages.shape[-1])
         ).reshape(advantages.shape)
-        # Always use the per-step preference for advantage weighting. In
-        # the unconditioned (Stage A–E) path it's broadcast from the static
-        # CLI --lambda-* weights; in Stage F it's the Dirichlet sample; in
-        # Stage G calibration it's the quality-focused override. Same code
-        # path either way.
-        norm_adv = jnp.sum(norm_adv_components * traj.preference, axis=-1)
+        if args.loss_mode == "scalar":
+            # Single-channel path: only slot 0 carries signal — skip the
+            # preference scalarization entirely so we don't multiply the
+            # advantage by an unrelated CLI lambda twice.
+            norm_adv = norm_adv_components[..., 0]
+        else:
+            # Always use the per-step preference for advantage weighting. In
+            # the unconditioned (Stage A–E) path it's broadcast from the static
+            # CLI --lambda-* weights; in Stage F it's the Dirichlet sample; in
+            # Stage G calibration it's the quality-focused override. Same code
+            # path either way.
+            norm_adv = jnp.sum(norm_adv_components * traj.preference, axis=-1)
 
         # Stage F Lagrangian: per-step constraint violations and multiplier
         # update. ``constraint_indices`` / ``constraint_thresholds`` /
