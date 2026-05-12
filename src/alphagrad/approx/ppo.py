@@ -3937,14 +3937,22 @@ def main():
     # float32 mask gating COMPRESS via --allow-compress.
     if args.dynamic_substeps:
         factor_tables = precompute_factor_tables(args.max_axis_size)
-        op_legality_override = jnp.array(
-            [1.0, 1.0 if args.allow_compress else 0.0, 1.0],
-            dtype=jnp.float32,
+        # The variant's op-type legality must reach the dynamic policy via
+        # ``op_legality_override``. The legacy ``pin_rules_to_exact`` only
+        # gates the legacy rule head, so without this branch
+        # ``--variant ve_only`` (or diag_gcd / diag_factor / compress)
+        # silently behaved like ``custom`` in dynamic-substeps mode — the
+        # MicroActionPolicy was free to emit DIAG / COMPRESS micro-actions
+        # that the env then applied, breaking the variant-comparison
+        # intent.
+        op_legality_override = _op_legality_for_variant(
+            args.variant, args.allow_compress
         )
         print(
             f"dynamic-substeps: max_substeps={args.max_substeps}, "
             f"max_axis_size={args.max_axis_size}, "
-            f"allow_compress={args.allow_compress}"
+            f"allow_compress={args.allow_compress}, "
+            f"op_legality={op_legality_override.tolist()}"
         )
     else:
         # Placeholder values so the rollout closure can reference these
