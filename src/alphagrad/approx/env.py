@@ -22,7 +22,54 @@ from alphagrad.approx.common.relations import compute_eqn_ids_from_tokens
 from graphax.core import _build_graph, extract_jaxpr, jacve, vertex_elimination_jaxpr
 from graphax.jaxpr import get_vocab as _graphax_get_vocab
 from graphax.sparse.micro_actions import COMPRESS_KINDS, Compress, Diag
-from jax_memory_monitor import ResourceMonitor
+from jax_memory_monitor import ResourceMonitor as _RealResourceMonitor
+
+
+class _NoopResourceMonitor:
+    """Drop-in replacement for ``jax_memory_monitor.ResourceMonitor`` that
+    does nothing — used to isolate the C++ ``MemoryTracker`` from the
+    rest of the reward harness during memory-leak experiments.
+
+    Each real ``ResourceMonitor`` constructs a fresh
+    ``xla_mem_bridge.MemoryTracker`` (and a ``TimeTracker``) at
+    ``__init__`` and tears them down at ``__exit__``. The C++ destructors
+    are reachable, but if they don't release every allocation the tracker
+    held during its lifetime, each io_callback-scoped instance leaks a
+    little — ~18 MB / call empirically, × 192 callbacks/episode = ~3.4
+    GB/ep. Activate this stub by setting
+    ``ALPHAGRAD_DISABLE_RESOURCE_MONITOR=1`` to confirm or rule out
+    that hypothesis; ``peak`` returns 0 and ``stats`` has all-zero
+    entries, so the reward harness silently records ``peak_memory=0`` for
+    the run — fine for a leak-hunt, not for production reward shaping.
+    """
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+    @property
+    def peak(self) -> int:
+        return 0
+
+    @property
+    def duration(self) -> float:
+        return 0.0
+
+    @property
+    def stats(self) -> dict:
+        return {"time": 0.0, "memory": 0.0}
+
+
+ResourceMonitor = (
+    _NoopResourceMonitor
+    if os.environ.get("ALPHAGRAD_DISABLE_RESOURCE_MONITOR", "0") == "1"
+    else _RealResourceMonitor
+)
 
 import math as _math
 
