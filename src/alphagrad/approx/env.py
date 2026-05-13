@@ -1218,14 +1218,30 @@ def _callback(
         # ``__enter__`` / ``__exit__``, so we don't need an extra
         # ``block_until_ready`` on the result — the barriers drain the
         # device queue both for the timer and the memory tracker.
-        with ResourceMonitor(devices=unique_devices) as monitor:
+        #
+        # ``ALPHAGRAD_BYPASS_RESOURCE_MONITOR=1`` skips the construction +
+        # context manager entirely (vs. the lighter
+        # ``ALPHAGRAD_DISABLE_RESOURCE_MONITOR`` which only swapped the
+        # class to a no-op). This is the strongest cut available short
+        # of patching the import: no monitor object is created, no
+        # ``__enter__`` / ``__exit__`` runs, no ``stats`` dict is read.
+        # Used to isolate whether the per-call Python lifecycle around
+        # ``ResourceMonitor`` (not its C++ tracker) leaks. peak_memory +
+        # latency_ns are zero for the run.
+        if os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1":
             out_approx = compiled_approx(*eval_args_i)
-        # Key by name instead of unpacking ``.values()`` so this stays
-        # robust to dict-order / API tweaks in jax_memory_monitor.
-        latency_s = float(monitor.stats.get("time", 0.0))
-        peak_bytes = float(monitor.stats.get("memory", 0.0))
-        latency_samples.append(latency_s * 1e9)  # → ns
-        peak_mem_samples.append(peak_bytes)
+            latency_samples.append(0.0)
+            peak_mem_samples.append(0.0)
+        else:
+            with ResourceMonitor(devices=unique_devices) as monitor:
+                out_approx = compiled_approx(*eval_args_i)
+            # Key by name instead of unpacking ``.values()`` so this
+            # stays robust to dict-order / API tweaks in
+            # jax_memory_monitor.
+            latency_s = float(monitor.stats.get("time", 0.0))
+            peak_bytes = float(monitor.stats.get("memory", 0.0))
+            latency_samples.append(latency_s * 1e9)  # → ns
+            peak_mem_samples.append(peak_bytes)
 
         out_exact = compiled_exact(*eval_args_i)
         out_approxs.append(out_approx)
