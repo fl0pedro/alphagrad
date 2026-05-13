@@ -3906,7 +3906,19 @@ def main():
 
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpus)
-    _setup_jax_compile_cache()
+    # Persistent JIT disk cache. Off-by-env when investigating memory leaks:
+    # the cache loader may retain in-memory references to every loaded
+    # ``Executable``, masquerading as an XLA C++ leak in profiling. Set
+    # ``ALPHAGRAD_DISABLE_JIT_DISK_CACHE=1`` to skip wiring up
+    # ``compilation_cache.set_cache_dir(...)`` for that experiment.
+    if os.environ.get("ALPHAGRAD_DISABLE_JIT_DISK_CACHE", "0") != "1":
+        _setup_jax_compile_cache()
+    else:
+        print(
+            "[experiment] JIT disk cache disabled "
+            "(ALPHAGRAD_DISABLE_JIT_DISK_CACHE=1)",
+            flush=True,
+        )
 
     key = jrand.PRNGKey(args.seed)
     key, args_key = jrand.split(key)
