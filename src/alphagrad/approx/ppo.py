@@ -5564,6 +5564,31 @@ def main():
         # that the next ``\r`` bar repaint clobbers on a live terminal.
         # Total cost when enabled: one /proc read + one Python walk of
         # live arrays (~1-2 ms per episode in practice).
+        # Experimental: brute-force flush JAX's C++ caches every K episodes.
+        # ``jax.clear_caches()`` releases JIT cache + HLO compile cache +
+        # backend executable registry. Useful as a leak-hunt probe — if a
+        # leak lives in XLA's C++ state (not in our LRU's Python refs), this
+        # call should reclaim it. The LRU's stored Executables remain valid
+        # because we hold direct Python refs; only the backend's *internal*
+        # registry of orphaned executables gets dropped.
+        _clear_every = os.environ.get("ALPHAGRAD_CLEAR_JIT_CACHES_EVERY", "0")
+        try:
+            _clear_every = int(_clear_every)
+        except ValueError:
+            _clear_every = 0
+        if _clear_every > 0 and (ep + 1) % _clear_every == 0:
+            try:
+                jax.clear_caches()
+                tqdm.write(
+                    f"[experiment] jax.clear_caches() called at ep={ep}",
+                    file=sys.stderr,
+                )
+            except Exception as _exc:
+                tqdm.write(
+                    f"[experiment] jax.clear_caches() failed: {_exc!r}",
+                    file=sys.stderr,
+                )
+
         if os.environ.get("ALPHAGRAD_DEBUG_MEM", "0") == "1":
             try:
                 rss_kb = 0
