@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import heapq
 import os
+import sys
 
 # tqdm allocates a multiprocessing.RLock on first use (`TqdmDefaultWriteLock`)
 # for cross-process bar coordination. The RLock is backed by a named POSIX
@@ -5536,6 +5537,55 @@ def main():
                     log_dict[f"lagrangian/{name}_lambda"] = float(lam[j])
                     log_dict[f"lagrangian/{name}_violation"] = float(viol[j])
         wandb.log(log_dict)
+
+        # Per-episode memory + JIT-cache diagnostic. Off by default; flip on
+        # via ``ALPHAGRAD_DEBUG_MEM=1`` for empirical leak investigation
+        # without recompiling. Prints to stderr (survives tqdm \r mangling).
+        # Captures:
+        #   * process RSS from /proc/self/status (host RAM truth)
+        #   * jax.live_arrays() count + total bytes + top-5 (shape, dtype)
+        #     buckets — if a particular shape grows monotonically, that
+        #     identifies the producer of the leak.
+        #   * env.py LRU cache hits / misses / size — to confirm the cache
+        #     is actually being hit and isn't thrashing.
+        # Total cost when enabled: one read of /proc + one Python-level
+        # walk of live arrays (~1-2 ms per episode in practice).
+        if os.environ.get("ALPHAGRAD_DEBUG_MEM", "0") == "1":
+            try:
+                rss_kb = 0
+                with open("/proc/self/status") as _f:
+                    for _line in _f:
+                        if _line.startswith("VmRSS:"):
+                            rss_kb = int(_line.split()[1])
+                            break
+                live = jax.live_arrays()
+                n_live = len(live)
+                live_bytes = sum(a.nbytes for a in live)
+                from collections import Counter as _Counter
+
+                top_shapes = _Counter(
+                    (a.shape, str(a.dtype)) for a in live
+                ).most_common(5)
+                shape_str = "; ".join(
+                    f"{s}x{d}={c}" for (s, d), c in top_shapes
+                )
+                from alphagrad.approx.env import get_compile_cache_stats as _ccs
+
+                _stats = _ccs()
+                _hits = _stats["hits"]
+                _misses = _stats["misses"]
+                _total = max(_hits + _misses, 1)
+                sys.stderr.write(
+                    f"[mem ep={ep:3d}] rss={rss_kb / 1024:7.0f}MB  "
+                    f"live={n_live:5d} arrays {live_bytes / 1024 / 1024:7.0f}MB  "
+                    f"jit_cache size={_stats['size']}/{_stats['max_size']} "
+                    f"hit_rate={_hits / _total:.2%} (h={_hits} m={_misses})  "
+                    f"top={shape_str}\n"
+                )
+                sys.stderr.flush()
+            except Exception as _exc:
+                sys.stderr.write(f"[mem ep={ep}] probe failed: {_exc!r}\n")
+                sys.stderr.flush()
 
         pbar.update(1)
         b_ret_unnorm = np.abs(all_rets[best_idx])
