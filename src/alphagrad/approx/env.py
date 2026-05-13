@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import collections
+import os
+import threading
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -697,6 +700,175 @@ def _aggregate_samples(values, want_top_quartile: bool):
     return stack.mean()
 
 
+# ---------------------------------------------------------------------------
+# In-memory LRU cache for `jit(jacve(...)).lower(...).compile()` results.
+#
+# The env's reward harness (`_callback`) re-builds and re-compiles the
+# approximate / exact jacobian per env-step. The original implementation
+# constructed a fresh ``jax.jit(...)`` object every call:
+#
+#     def compiled(transforms_arg=None):
+#         return jax.jit(
+#             jacve(config.target_fun, o_list, ..., transforms=transforms_arg),
+#             keep_unused=True,
+#         ).lower(*args_for_lower).compile()
+#
+# JAX's in-memory jit cache is keyed on the *Python identity* of the wrapped
+# callable. Because each call constructed a brand-new lambda/closure, the
+# cache always missed. Even with JAX's persistent disk compile cache enabled
+# (``JAX_COMPILATION_CACHE_DIR`` in ppo.py), every call still allocates a
+# fresh ``HloModule`` + ``Executable`` in process memory before the disk
+# cache lookup decides whether it can short-circuit the XLA passes — and
+# nothing references the previous ``Executable`` long enough for the disk
+# cache to skip the load.
+#
+# Empirically (pgi15-gpu10, ``--variant full`` profile, ep ≈ 10/20):
+#
+#     VmRSS @ start of probe : 96.2 GB
+#     VmRSS @ +60 s          : 99.9 GB
+#     VmRSS @ +120 s         : 110.3 GB        (~24–100 MB/s sustained)
+#     VmPeak                 : 166 GB
+#     Anonymous Pss          : 100.8 GB
+#     Python heap [heap]     : 7.4 GB  (~7 % of total — not Python objects)
+#     Anonymous regions ≥100 MB
+#                 count      : 216 regions
+#                 total      : 96.2 GB
+#     GPU util (trainer)     : 0 %
+#     GPU util (callback)    : 0 %
+#
+# 216 anonymous regions of 100 MB–1 GB each is the fingerprint of
+# accumulated XLA ``Executable`` + ``HloModule`` artifacts. The GPU sits
+# idle while the host RAM bleeds — training is host-bound on a leak, not
+# bound on real compute. Three trainers per sbatch × ~100 GB / process
+# blew the cgroup memory limit and got OOM-killed every time.
+#
+# Fix: cache the compiled result by a key that captures everything that
+# actually determines the HLO content. The policy converges to a small
+# set of unique (o_list, transforms) tuples after a few episodes, so an
+# LRU of moderate size achieves near-100 % hit rate in steady state.
+#
+# Cache size budget:
+#   * Each compiled entry is ~100 MB – 1 GB on host.
+#   * 64 × ~150 MB ≈ 10 GB worst-case host footprint, which still fits
+#     comfortably within a typical 200 GB cgroup limit (three trainers
+#     per sbatch ⇒ ~30 GB collectively).
+#   * Override via ``ALPHAGRAD_COMPILE_CACHE`` env var; set 0 to disable
+#     caching (useful for debugging or when leak is suspected elsewhere).
+# ---------------------------------------------------------------------------
+_COMPILE_CACHE: "collections.OrderedDict[tuple, object]" = collections.OrderedDict()
+_COMPILE_CACHE_LOCK = threading.Lock()
+_COMPILE_CACHE_MAX_SIZE = int(os.environ.get("ALPHAGRAD_COMPILE_CACHE", "64"))
+_COMPILE_CACHE_HITS = 0
+_COMPILE_CACHE_MISSES = 0
+
+
+def get_compile_cache_stats() -> dict[str, int]:
+    """Return a snapshot of cache hit / miss / size — handy for spot-checks
+    from a long-running trainer (e.g. periodic wandb log)."""
+    with _COMPILE_CACHE_LOCK:
+        return {
+            "hits": _COMPILE_CACHE_HITS,
+            "misses": _COMPILE_CACHE_MISSES,
+            "size": len(_COMPILE_CACHE),
+            "max_size": _COMPILE_CACHE_MAX_SIZE,
+        }
+
+
+def _normalise_transforms_key(transforms_arg):
+    """Hashable view of ``transforms`` list-of-tuples. ``Diag`` / ``Compress``
+    are ``@dataclass(frozen=True)`` so they're hashable as-is; just convert
+    the outer list to a tuple."""
+    if transforms_arg is None:
+        return None
+    return tuple((int(v), tuple(rules)) for v, rules in transforms_arg)
+
+
+def _get_cached_compiled(
+    *,
+    target_fun: Callable,
+    argnums: tuple,
+    has_aux: bool,
+    sparse: bool,
+    o_list: tuple,
+    transforms_arg,
+    args_for_lower,
+):
+    """LRU-cached ``jit(jacve(...)).lower(...).compile()``.
+
+    Key components (everything that affects the HLO):
+        * ``id(target_fun)``  — stable across the env's lifetime
+        * ``argnums``         — env-static tuple of int positions
+        * ``has_aux, sparse`` — env-static booleans
+        * ``o_list``          — per-step elimination order (tuple of ints)
+        * ``transforms``      — per-step sparsity rules (or ``None`` for the
+                                exact-jacobian variant)
+        * ``args_signature``  — shape/dtype of each arg in ``args_for_lower``
+                                (env-static in practice, but include for
+                                safety against future per-step shape changes)
+    """
+    global _COMPILE_CACHE_HITS, _COMPILE_CACHE_MISSES
+
+    transforms_key = _normalise_transforms_key(transforms_arg)
+    args_sig = tuple(
+        (tuple(getattr(a, "shape", ())), str(getattr(a, "dtype", None)))
+        for a in jax.tree_util.tree_leaves(args_for_lower)
+    )
+    key = (
+        id(target_fun),
+        argnums,
+        bool(has_aux),
+        bool(sparse),
+        tuple(o_list),
+        transforms_key,
+        args_sig,
+    )
+
+    with _COMPILE_CACHE_LOCK:
+        if key in _COMPILE_CACHE:
+            _COMPILE_CACHE.move_to_end(key)
+            _COMPILE_CACHE_HITS += 1
+            return _COMPILE_CACHE[key]
+        _COMPILE_CACHE_MISSES += 1
+
+    # Compile outside the lock so concurrent ``io_callback`` invocations for
+    # *different* keys can compile in parallel. Two threads compiling the
+    # same key is a rare race; the second insert wins (we re-check under the
+    # lock after compile finishes).
+    compiled = (
+        jax.jit(
+            jacve(
+                target_fun,
+                list(o_list),
+                argnums=argnums,
+                has_aux=has_aux,
+                sparse_representation=sparse,
+                transforms=transforms_arg,
+            ),
+            keep_unused=True,
+        )
+        .lower(*args_for_lower)
+        .compile()
+    )
+
+    if _COMPILE_CACHE_MAX_SIZE <= 0:
+        # Caching disabled — return the freshly compiled object without
+        # inserting. Caller still gets correct semantics, just no LRU.
+        return compiled
+
+    with _COMPILE_CACHE_LOCK:
+        existing = _COMPILE_CACHE.get(key)
+        if existing is not None:
+            # Another thread beat us to insertion. Drop our redundant
+            # compile and return the cached entry to keep the LRU ordering
+            # consistent.
+            _COMPILE_CACHE.move_to_end(key)
+            return existing
+        _COMPILE_CACHE[key] = compiled
+        while len(_COMPILE_CACHE) > _COMPILE_CACHE_MAX_SIZE:
+            _COMPILE_CACHE.popitem(last=False)
+    return compiled
+
+
 def _callback(
     config: EnvConfig,
     args,
@@ -930,25 +1102,29 @@ def _callback(
         else args
     )
 
-    def compiled(transforms_arg=None):
-        return (
-            jax.jit(
-                jacve(
-                    config.target_fun,
-                    o_list,
-                    argnums=config.argnums,
-                    has_aux=config.has_aux,
-                    sparse_representation=config.sparse,
-                    transforms=transforms_arg,
-                ),
-                keep_unused=True,
-            )
-            .lower(*args_for_lower)
-            .compile()
-        )
-
-    compiled_approx = compiled(transforms)
-    compiled_exact = compiled()
+    # LRU cache lookup — see ``_get_cached_compiled`` above for the
+    # rationale (without this, every env-step leaks ~100 MB – 1 GB of host
+    # RAM via accumulated ``HloModule`` + ``Executable`` allocations, and
+    # the cgroup OOM-kills the trainer after a few hours).
+    o_list_key = tuple(o_list)
+    compiled_approx = _get_cached_compiled(
+        target_fun=config.target_fun,
+        argnums=config.argnums,
+        has_aux=config.has_aux,
+        sparse=config.sparse,
+        o_list=o_list_key,
+        transforms_arg=transforms,
+        args_for_lower=args_for_lower,
+    )
+    compiled_exact = _get_cached_compiled(
+        target_fun=config.target_fun,
+        argnums=config.argnums,
+        has_aux=config.has_aux,
+        sparse=config.sparse,
+        o_list=o_list_key,
+        transforms_arg=None,
+        args_for_lower=args_for_lower,
+    )
 
     # XLA cost analysis — flops + bytes accessed. Falls back to 0 when the
     # backend doesn't expose them (CPU sometimes returns an empty dict).
