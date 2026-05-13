@@ -3792,12 +3792,30 @@ def _setup_jax_compile_cache() -> None:
     config skip JIT recompile. Honoured by JAX>=0.4.16 via env-var; we set a
     sensible default if the user hasn't already, then turn it on through the
     `jax.config` API too (belt-and-braces — JAX is in transition between
-    the two surfaces). The cache lives at ``~/.cache/jax-compilation-cache``
-    by default and is keyed on the HLO + flags + JAX/XLA version, so stale
-    entries are never hit."""
+    the two surfaces).
+
+    Default location: ``~/.cache/jax-compilation-cache/<short hostname>``.
+    The per-host suffix scopes the cache **per cluster node** — without
+    it, a cache populated on one node (e.g. an older-generation Intel CPU
+    with ``+prefer-no-gather`` / ``+prefer-no-scatter`` LLVM tuning
+    hints) leaks over the shared NFS home to nodes with different CPU
+    generations. XLA's ``cpu_aot_loader.cc`` then logs a "machine type
+    used for XLA:CPU compilation doesn't match the machine type for
+    execution" warning and may fall back to a fresh compile, costing
+    minutes per slow_operation_alarm hit. Per-node scoping silences the
+    warning and removes the spurious recompile.
+
+    The cache is keyed on the HLO + flags + JAX/XLA version, so stale
+    entries within a single node's subdirectory are never hit. Users
+    can opt out / override by setting ``JAX_COMPILATION_CACHE_DIR``
+    explicitly before launching.
+    """
+    import socket
+
+    short_host = socket.gethostname().split(".", 1)[0]
     cache_dir = os.environ.setdefault(
         "JAX_COMPILATION_CACHE_DIR",
-        os.path.expanduser("~/.cache/jax-compilation-cache"),
+        os.path.expanduser(f"~/.cache/jax-compilation-cache/{short_host}"),
     )
     try:
         from jax.experimental.compilation_cache import compilation_cache

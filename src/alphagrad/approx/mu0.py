@@ -26,23 +26,30 @@ rollout is built by sampling the rule sequence autoregressively through
 the agent (one dynamics-call per decision, then prediction over the new
 latent gives the next-decision logits).
 
-Loss unroll (per window of ``UNROLL_STEPS + 1`` real steps):
-  * For each real step k and each decision depth d:
-      - ``logits, value = prediction(latent)``
-      - vertex (d=0):   CE with MCTS root visit counts at step k
-      - rule (d ≥ 1):   log-likelihood of the *sampled* (pair_k, factor_k)
-      - value loss:     ``(value − cumulative_return_k)²`` (target the
-                        same across all d within real step k)
-      - dynamics + reward: ``latent, pred_reward = dynamics(latent, a_d)``
-                        with reward target ``0`` for d < DECISION_DEPTH-1
-                        and ``scalar_env_reward_k`` at the last decision
-  * Half-gradient ``latent = 0.5·latent + 0.5·sg(latent)`` at every real
-    step boundary — preserves the original mu0 semantics while letting
-    the per-step dynamics be unrolled fully.
+CLI features ported from ``ppo.py`` for parity with the comparison study:
 
-DESIGN NOTE: rule-head training uses sampled-action LL (not visit counts).
-Extracting per-depth visit counts from the mctx search tree adds tree
-traversal in JAX for marginal gain at this stage; defer.
+* ``--variant`` + ``--curriculum`` + ``full_curriculum`` — pre-canned
+  configuration mapping to factors / max_rules / op-legality overrides
+  (and an auto-curriculum when ``full_curriculum`` is selected). See
+  :data:`VARIANT_PRESETS` and :func:`_apply_variant_preset`.
+* ``--set-transformer-agg`` — permutation-invariant aggregation over
+  calibration samples for the per-vertex data embedding.
+* ``--cache-encoding`` — encode the residual jaxpr once per episode and
+  reuse the encoder output for every step's representation.
+* ``--cosine-lower-bound`` / ``--cosine-upper-bound`` — Lagrangian
+  constraints on the ``cosine_sim`` reward channel.
+* ``--calibrate-steps`` — pre-training reward-scale calibration that
+  rescales ``reward_weights`` by ``1 / mean_abs(symlog(reward))`` per
+  channel so the wide-magnitude reward families contribute comparably.
+* ``--exec-on-gpu`` — pin training to GPU 0 and the env eval callback to
+  GPU 1.
+* ``--loss-mode scalar`` — mu0's default loss path is already a single
+  scalar reward per step (the MuZero value head is scalar); the flag is
+  accepted for CLI parity with ppo.py.
+* ``--dynamic-substeps`` — accepted for CLI parity. mu0's unified action
+  space already accommodates the per-decision typed action sequence;
+  this flag is a no-op selector for the action layout (currently the
+  unified path is the only one).
 """
 
 from __future__ import annotations
@@ -72,9 +79,13 @@ import threading as _threading
 tqdm.set_lock(_threading.RLock())
 
 from alphagrad.approx.common import (
+    NUM_VERTEX_FEATURES,
+    OP_TYPE_VOCAB_SIZE,
     SCHEDULES,
     build_pair_valid_mask,
     build_vertex_valid_static,
+    compute_per_sample_vertex_features,
+    compute_vertex_features,
     data_gen,
     extract_path_visits,
     generate_eval_samples,
@@ -86,12 +97,14 @@ from alphagrad.approx.common import (
     load_replay_buffer,
     replay_add_batch,
     replay_sample,
+    reward_normalization_fn,
     sample_preferences,
     save_replay_buffer,
     scale_module_weight,
     schedule_at,
     vertex_avail_at_step,
 )
+from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
     MAX_RULES_PER_VERTEX,
     MAX_TOKENS,
@@ -103,6 +116,7 @@ from alphagrad.approx.env import (
     VertexEliminationEnv,
 )
 from alphagrad.transformer import MLP, Encoder, PositionalEncoder
+from alphagrad.transformer.encoder import RelationalMultiheadAttention
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +138,28 @@ _PAIR_TO_BASE = jnp.array(
     ],
     dtype=jnp.int32,
 )
+
+# Cross-channel scale handling for the calibration phase. Mirrors ppo.py:
+# every reward channel except cosine_sim is symlog-compressed before the
+# per-channel mean-abs is computed. cosine_sim is already bounded to ~1 so
+# symlog would distort the Lagrangian thresholds.
+_NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (REWARD_INDEX["cosine_sim"],)
+_NO_SYMLOG_MASK: "jax.Array" = (
+    jnp.zeros((NUM_REWARDS,), dtype=jnp.bool_)
+    .at[jnp.asarray(_NO_SYMLOG_REWARD_INDICES, dtype=jnp.int32)]
+    .set(True)
+)
+_NO_SYMLOG_MASK_NP: np.ndarray = np.zeros((NUM_REWARDS,), dtype=np.bool_)
+_NO_SYMLOG_MASK_NP[list(_NO_SYMLOG_REWARD_INDICES)] = True
+
+
+def _symlog_rewards(reward_vec: "jax.Array") -> "jax.Array":
+    """Apply symlog elementwise on the last axis, leaving cosine_sim raw."""
+    return jnp.where(
+        _NO_SYMLOG_MASK,
+        reward_vec,
+        reward_normalization_fn(reward_vec),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -175,9 +211,6 @@ def _parse_int_list(text: str) -> list[int]:
 def _build_factor_table(args) -> tuple[jax.Array, tuple[int, ...], int, int]:
     """Construct the factor table from ``--factors``. Returns
     ``(factor_table, factors_py, num_factors, max_rules)``.
-
-    For mu0's hierarchical layout, ``num_factors == len(factors_py)`` and
-    ``max_rules`` comes straight from CLI.
     """
     factors_py = tuple(_parse_int_list(args.factors))
     if not factors_py:
@@ -187,17 +220,304 @@ def _build_factor_table(args) -> tuple[jax.Array, tuple[int, ...], int, int]:
 
 
 # ---------------------------------------------------------------------------
+# Comparison-study variant presets
+# ---------------------------------------------------------------------------
+
+# Mirrors ppo.py's VARIANT_PRESETS. Each value is a dict of args fields to
+# overwrite. ``custom`` is the no-op default. ``full_curriculum`` is a
+# mu0-specific addition that triggers the default 3-stage curriculum
+# (diag_gcd → diag_factor → full) when ``--curriculum`` is empty.
+VARIANT_PRESETS: dict[str, dict] = {
+    "custom": {},
+    "ve_only": {"pin_rules_to_exact": True},
+    "diag_gcd": {"factors": "-1", "max_rules": 1, "pin_rules_to_exact": False},
+    "diag_factor": {
+        "factors": "2,3,4,8,16",
+        "max_rules": 1,
+        "pin_rules_to_exact": False,
+    },
+    "compress": {
+        "factors": "-1",
+        "max_rules": 1,
+        "pin_rules_to_exact": False,
+    },
+    "full": {
+        "factors": "-1,2,3,4,8,16",
+        "max_rules": MAX_RULES_PER_VERTEX,
+        "pin_rules_to_exact": False,
+    },
+    # full_curriculum acts like `full` for one-shot training but flips the
+    # auto-curriculum bit so main() expands an empty --curriculum into
+    # ``diag_gcd:N/3, diag_factor:N/3, full:N/3``. The preset still
+    # overwrites factors / max_rules with the final-stage values so the
+    # agent is built once with the largest action footprint (the
+    # curriculum runner gates op_legality per stage rather than rebuilding
+    # the agent — mirrors ppo.py's behaviour).
+    "full_curriculum": {
+        "factors": "-1,2,3,4,8,16",
+        "max_rules": MAX_RULES_PER_VERTEX,
+        "pin_rules_to_exact": False,
+    },
+}
+
+
+def _apply_variant_preset(args, variant: str | None = None) -> None:
+    """In-place apply a ``--variant`` preset to ``args``.
+
+    ``variant`` overrides ``args.variant`` if given (used by the curriculum
+    scheduler when stepping through stages).
+    """
+    name = variant if variant is not None else getattr(args, "variant", "custom")
+    if name not in VARIANT_PRESETS:
+        raise ValueError(
+            f"Unknown --variant '{name}'. Valid: {list(VARIANT_PRESETS)}."
+        )
+    for k, v in VARIANT_PRESETS[name].items():
+        setattr(args, k, v)
+
+
+def _parse_curriculum(spec: str) -> list[tuple[str, int]]:
+    """Parse ``stage1:N1,stage2:N2,...`` into ``[(variant, episodes), ...]``."""
+    if not spec.strip():
+        return []
+    stages: list[tuple[str, int]] = []
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            raise ValueError(
+                f"Curriculum stage '{chunk}' missing ':'. Expected "
+                "`variant:episode_count`."
+            )
+        name, n_str = chunk.split(":", 1)
+        name = name.strip()
+        if name not in VARIANT_PRESETS:
+            raise ValueError(
+                f"Curriculum stage variant '{name}' unknown. Valid: "
+                f"{list(VARIANT_PRESETS)}."
+            )
+        try:
+            n_episodes = int(n_str.strip())
+        except ValueError as e:
+            raise ValueError(
+                f"Curriculum stage '{chunk}': episode count '{n_str}' is "
+                "not an integer."
+            ) from e
+        if n_episodes <= 0:
+            raise ValueError(
+                f"Curriculum stage '{chunk}': episode count must be > 0."
+            )
+        stages.append((name, n_episodes))
+    return stages
+
+
+def _default_full_curriculum(total_episodes: int) -> list[tuple[str, int]]:
+    """Split ``total_episodes`` across diag_gcd → diag_factor → full.
+
+    Each stage gets ``floor(N/3)`` episodes; the final stage absorbs the
+    remainder so the sum is exactly ``total_episodes``.
+    """
+    base = max(total_episodes // 3, 1)
+    stages = [
+        ("diag_gcd", base),
+        ("diag_factor", base),
+        ("full", max(total_episodes - 2 * base, 1)),
+    ]
+    return stages
+
+
+def _current_stage_at(stages: list[tuple[str, int]], ep: int) -> str:
+    cumulative = 0
+    for name, n in stages:
+        if ep < cumulative + n:
+            return name
+        cumulative += n
+    return stages[-1][0] if stages else ""
+
+
+def _current_stage_index(stages: list[tuple[str, int]], ep: int) -> int:
+    cumulative = 0
+    for idx, (_, n) in enumerate(stages):
+        if ep < cumulative + n:
+            return idx
+        cumulative += n
+    return len(stages) - 1
+
+
+def make_curriculum_schedule(args, curriculum_stages):
+    """Build a piecewise cosine-warmup + exp-decay LR schedule across stages."""
+    steps_per_episode = max(args.minibatches, 1)
+    stage_step_counts = [
+        max(n * steps_per_episode, 1) for _, n in curriculum_stages
+    ]
+    boundaries: list[int] = [0]
+    for s in stage_step_counts:
+        boundaries.append(boundaries[-1] + s)
+    warmup_frac = float(args.curriculum_warmup_frac)
+
+    def schedule(step):
+        step_f = jnp.asarray(step, dtype=jnp.float32)
+        lr = jnp.asarray(args.lr * args.lr_decay_min_mult, dtype=jnp.float32)
+        for i, stage_steps in enumerate(stage_step_counts):
+            lo = boundaries[i]
+            hi = boundaries[i + 1]
+            warmup_steps = max(int(stage_steps * warmup_frac), 1)
+            local_step = step_f - float(lo)
+            stage_lr = cosine_warmup_exp_decay_lr(
+                local_step,
+                args.lr,
+                stage_steps,
+                warmup_steps,
+                end_mult=args.lr_decay_min_mult,
+            )
+            in_stage = (step_f >= float(lo)) & (step_f < float(hi))
+            lr = jnp.where(in_stage, stage_lr, lr)
+        return lr
+
+    return schedule
+
+
+# Per-variant op-legality / pin-rules masks. The mu0 search tree doesn't
+# emit a separate op-type token (every micro-action collapses to (pair,
+# factor) inside a fixed depth budget), so these masks act on the prior
+# logits during MCTS instead of a typed action head. ``ve_only`` forces
+# every pair-slot to STOP, which is exactly the "no rule" output the
+# pinned legacy path produces.
+def _pin_rules_for_variant(variant: str) -> bool:
+    return variant == "ve_only"
+
+
+# ---------------------------------------------------------------------------
+# Lagrangian constraint parsing (mirrors ppo.py)
+# ---------------------------------------------------------------------------
+
+
+def parse_lagrangian_constraints(
+    specs: list[str],
+) -> list[tuple[int, float, int]]:
+    """Parse ``NAME>=THRESH`` / ``NAME<=THRESH`` to ``(idx, threshold, sign)``."""
+    parsed: list[tuple[int, float, int]] = []
+    for s in specs:
+        if ">=" in s:
+            op = ">="
+            sign = 1
+        elif "<=" in s:
+            op = "<="
+            sign = -1
+        else:
+            raise ValueError(
+                f"--lagrangian-constraint must be of the form NAME>=THRESH "
+                f"or NAME<=THRESH, got {s!r}"
+            )
+        name, thresh_s = s.split(op, 1)
+        name = name.strip()
+        if name not in REWARD_INDEX:
+            raise ValueError(
+                f"Unknown reward name {name!r} in constraint {s!r}; "
+                f"valid names: {list(REWARD_INDEX.keys())}"
+            )
+        parsed.append((REWARD_INDEX[name], float(thresh_s.strip()), sign))
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# Set Transformer aggregator (mirrors ppo.py B.3)
+# ---------------------------------------------------------------------------
+
+
+class SetTransformerAggregator(eqx.Module):
+    """Permutation-invariant aggregator over calibration samples.
+
+    Architecture mirrors ppo.py's SetTransformerAggregator: per-vertex
+    self-attention over the sample axis followed by mean-pool and a
+    projection to ``embd_dim``. With 5 calibration samples the attention
+    cost is negligible compared to the main encoder.
+    """
+
+    op_embedding: eqx.nn.Embedding
+    input_proj: eqx.nn.Linear
+    sample_attn: RelationalMultiheadAttention
+    output_proj: eqx.nn.Linear
+
+    hidden_dim: int = eqx.field(static=True)
+    num_heads: int = eqx.field(static=True)
+    op_embd_dim: int = eqx.field(static=True)
+    num_features: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        *,
+        num_features,
+        op_embd_dim,
+        hidden_dim,
+        num_heads,
+        embd_dim,
+        vocab_size,
+        key,
+    ):
+        keys = jrand.split(key, 4)
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.op_embd_dim = op_embd_dim
+        self.num_features = num_features
+        self.op_embedding = eqx.nn.Embedding(vocab_size, op_embd_dim, key=keys[0])
+        self.input_proj = eqx.nn.Linear(
+            op_embd_dim + num_features - 1,
+            hidden_dim,
+            key=keys[1],
+        )
+        self.sample_attn = RelationalMultiheadAttention(
+            num_heads,
+            hidden_dim,
+            key=keys[2],
+        )
+        self.output_proj = eqx.nn.Linear(hidden_dim, embd_dim, key=keys[3])
+
+    def __call__(self, per_sample_features, *, key):
+        """``per_sample_features``: ``(S, V, F)``. Returns ``(V, embd_dim)``."""
+        S, V, _ = per_sample_features.shape
+        op_ids = per_sample_features[0, :, 0].astype(jnp.int32)
+        op_emb = jax.vmap(self.op_embedding)(op_ids)
+        cont = per_sample_features[:, :, 1:]
+        op_emb_b = jnp.broadcast_to(op_emb[None, :, :], (S, V, op_emb.shape[-1]))
+        combined = jnp.concatenate([op_emb_b, cont], axis=-1)
+        h = jax.vmap(jax.vmap(self.input_proj))(combined)
+        h_perm = jnp.transpose(h, (1, 0, 2))  # (V, S, hidden)
+        attn_keys = jrand.split(key, V)
+        h_attn = jax.vmap(lambda x, k: self.sample_attn(x, x, x, key=k))(
+            h_perm, attn_keys
+        )
+        pooled = jnp.mean(h_attn, axis=1)
+        return jax.vmap(self.output_proj)(pooled)
+
+
+# ---------------------------------------------------------------------------
+# Cached encoding (mirrors ppo.py B.4.next)
+# ---------------------------------------------------------------------------
+
+
+class CachedEncoding(NamedTuple):
+    """Per-rollout cache for the ``--cache-encoding`` path.
+
+    Captured from the initial residual jaxpr at episode start; reused as the
+    leading latent for every step of the rollout instead of re-running the
+    transformer stack on the per-step residual jaxpr. The vertex_avail_mask
+    is the only thing that varies inside an episode.
+    """
+
+    tokens: jax.Array
+    eqn_ids: jax.Array
+    latent: jax.Array  # (latent_dim,) — already includes pref_proj if any
+
+
+# ---------------------------------------------------------------------------
 # Hierarchical MCTS embedding
 # ---------------------------------------------------------------------------
 
 
 class DecisionEmbedding(NamedTuple):
-    """State inside the hierarchical MCTS tree.
-
-    ``vertex_avail_mask`` is the only non-latent piece of "real" state we
-    carry — it tracks which vertices have been eliminated in the simulated
-    path so the next vertex selection inside the tree masks them out.
-    """
+    """State inside the hierarchical MCTS tree."""
 
     latent: jax.Array              # (latent_dim,)
     vertex_avail_mask: jax.Array   # (total_v,) float32 — 1 = available
@@ -207,9 +527,7 @@ class DecisionEmbedding(NamedTuple):
     factor_seq: jax.Array          # (max_rules,) int32
     active: jax.Array              # bool — true while still adding rules
     last_reward: jax.Array         # scalar — reward delivered to mctx on
-                                   # the *next* recurrent_fn call (so the
-                                   # search backs up exactly the dynamics-
-                                   # predicted reward at each transition).
+                                   # the *next* recurrent_fn call.
 
 
 def _empty_decision(
@@ -228,8 +546,7 @@ def _empty_decision(
 
 
 # ---------------------------------------------------------------------------
-# MuZero agent — unchanged from before except that ``num_actions`` now equals
-# the unified action space (max(total_v, NPC, num_factors)).
+# MuZero agent
 # ---------------------------------------------------------------------------
 
 
@@ -239,6 +556,13 @@ class MuZeroAgent(eqx.Module):
     The dynamics is shared across all decision types — it learns to
     interpret a unified-space action id from context the latent has built
     up over prior decisions.
+
+    Stage B.2.A / B.3 add a data-conditioned path that mirrors ppo.py: when
+    ``vertex_features`` are supplied to :meth:`representation`, the per-vertex
+    op-type embedding + continuous feature projection (or the
+    :class:`SetTransformerAggregator` for per-sample features) is mean-pooled
+    over vertices and added to the leading latent. Initialised to zero so the
+    unconditioned baseline is preserved at step 0.
     """
 
     embedding: eqx.nn.Embedding
@@ -252,17 +576,24 @@ class MuZeroAgent(eqx.Module):
     policy_head: MLP
     value_head: MLP
 
-    # Stage F: per-episode preference projection. Adds ``w → latent_dim``
-    # to the initial latent so the policy/value/dynamics graph below
-    # conditions on the preference. Disabled by default — when called
-    # without ``preference=...`` the projection is unused. Initialised to
-    # zero by ``init_linear_weights`` in main()'s setup, so a fresh model
-    # behaves identically to the unconditioned baseline at step 0.
+    # Stage F preference projection — adds ``w → latent_dim`` to the
+    # initial latent so the policy/value/dynamics graph below conditions
+    # on the preference.
     pref_proj: eqx.nn.Linear
+
+    # Stage B.2.A / B.3: per-vertex feature processing.
+    op_embedding: eqx.nn.Embedding
+    vertex_feature_proj: eqx.nn.Linear
+    set_transformer_agg: SetTransformerAggregator
+    # Project the per-vertex data embedding (mean-pooled to a single vector)
+    # into the latent so it adds to ``representation``'s output.
+    vertex_features_to_latent: eqx.nn.Linear
 
     num_actions: int = eqx.field(static=True)
     latent_dim: int = eqx.field(static=True)
     num_rewards: int = eqx.field(static=True)
+    embd_dim: int = eqx.field(static=True)
+    op_embd_dim: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -277,13 +608,16 @@ class MuZeroAgent(eqx.Module):
         num_rewards,
         policy_dims,
         value_dims,
+        op_embd_dim,
         seq_len,
         key,
     ):
-        keys = jrand.split(key, 8)
+        keys = jrand.split(key, 12)
         self.num_actions = num_actions
         self.latent_dim = latent_dim
         self.num_rewards = num_rewards
+        self.embd_dim = embd_dim
+        self.op_embd_dim = op_embd_dim
         self.embedding = eqx.nn.Embedding(vocab_size, embd_dim, key=keys[0])
         self.pos_enc = PositionalEncoder(embd_dim, seq_len)
         self.encoder = Encoder(
@@ -297,8 +631,48 @@ class MuZeroAgent(eqx.Module):
         self.policy_head = MLP(latent_dim, num_actions, policy_dims, key=keys[5])
         self.value_head = MLP(latent_dim, 1, value_dims, key=keys[6])
         self.pref_proj = eqx.nn.Linear(num_rewards, latent_dim, key=keys[7])
+        # Per-vertex feature processing.
+        self.op_embedding = eqx.nn.Embedding(
+            OP_TYPE_VOCAB_SIZE, op_embd_dim, key=keys[8],
+        )
+        proj_in_dim = op_embd_dim + NUM_VERTEX_FEATURES - 1
+        self.vertex_feature_proj = eqx.nn.Linear(
+            proj_in_dim, embd_dim, key=keys[9],
+        )
+        self.set_transformer_agg = SetTransformerAggregator(
+            num_features=NUM_VERTEX_FEATURES,
+            op_embd_dim=op_embd_dim,
+            hidden_dim=embd_dim,
+            num_heads=num_heads,
+            embd_dim=embd_dim,
+            vocab_size=OP_TYPE_VOCAB_SIZE,
+            key=keys[10],
+        )
+        self.vertex_features_to_latent = eqx.nn.Linear(
+            embd_dim, latent_dim, key=keys[11],
+        )
 
-    def representation(self, tokens, eqn_ids=None, *, key=None, preference=None):
+    def _data_embedding(self, vertex_features, *, agg_key=None):
+        """Project per-vertex features to a per-vertex embedding ``(V, embd_dim)``."""
+        if vertex_features.ndim == 3:
+            agg_key = agg_key if agg_key is not None else jrand.PRNGKey(0)
+            return self.set_transformer_agg(vertex_features, key=agg_key)
+        op_ids = vertex_features[:, 0].astype(jnp.int32)
+        op_emb = jax.vmap(self.op_embedding)(op_ids)
+        cont = vertex_features[:, 1:]
+        combined = jnp.concatenate([op_emb, cont], axis=-1)
+        return jax.vmap(self.vertex_feature_proj)(combined)
+
+    def representation(
+        self,
+        tokens,
+        eqn_ids=None,
+        *,
+        key=None,
+        preference=None,
+        vertex_features=None,
+        agg_key=None,
+    ):
         token_mask = (tokens != 0)
         x = jax.vmap(self.embedding)(tokens)
         x = self.pos_enc(x)
@@ -306,12 +680,15 @@ class MuZeroAgent(eqx.Module):
         x = self.encoder(x, eqn_ids=eqn_ids, key=enc_key)
         mask = token_mask[..., None].astype(x.dtype)
         latent = jnp.sum(x * mask, axis=0) / jnp.maximum(jnp.sum(mask, axis=0), 1e-9)
-        # Inject the preference once at the leading latent. Subsequent
-        # dynamics/prediction calls operate on this latent, so the
-        # information propagates through the rest of the search tree
-        # without needing per-call plumbing.
+        # Inject the preference once at the leading latent so the entire MCTS
+        # sub-tree is conditioned without per-call plumbing.
         if preference is not None:
             latent = latent + self.pref_proj(preference)
+        # Inject per-vertex data features (Stage B.2.A / B.3).
+        if vertex_features is not None:
+            data_emb = self._data_embedding(vertex_features, agg_key=agg_key)
+            data_pool = jnp.mean(data_emb, axis=0)
+            latent = latent + self.vertex_features_to_latent(data_pool)
         return latent
 
     def dynamics(self, latent, action):
@@ -345,18 +722,11 @@ class Trajectory(NamedTuple):
                                    # chosen path through the search tree.
     mcts_value: jax.Array          # (T,) — root MCTS value
     preference: jax.Array          # (T, NUM_REWARDS) — per-env preference
-                                   # broadcast to every step (constant
-                                   # within an episode).
+                                   # broadcast to every step.
 
 
 class TrajectoryWindow(NamedTuple):
-    """A window of length ``UNROLL_STEPS + 1`` real steps, used by the loss.
-
-    Mirrors :class:`Trajectory` field-for-field — the loss reads the leading
-    step's tokens for ``representation``, then unrolls dynamics over the
-    rest of the window (each real step decomposes into DECISION_DEPTH
-    dynamics calls).
-    """
+    """A window of length ``UNROLL_STEPS + 1`` real steps, used by the loss."""
 
     tokens: jax.Array
     eqn_ids: jax.Array
@@ -365,8 +735,8 @@ class TrajectoryWindow(NamedTuple):
     factor_seq: jax.Array
     scalar_reward: jax.Array
     target_value: jax.Array
-    mcts_visits: jax.Array       # (W+1, DECISION_DEPTH, UNIFIED)
-    preference: jax.Array        # (W+1, NUM_REWARDS)
+    mcts_visits: jax.Array
+    preference: jax.Array
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +756,11 @@ def make_argparser() -> argparse.ArgumentParser:
                    choices=["disabled", "offline", "online"])
     p.add_argument("--episodes", type=int, default=50)
     p.add_argument("--no-jit", action="store_true")
+    p.add_argument(
+        "--exec-on-gpu",
+        action="store_true",
+        help="Pin training to GPU 0 and the env eval callback to GPU 1.",
+    )
 
     # Environment / reward
     p.add_argument("--example", type=str, default="Helmholtz")
@@ -399,31 +774,143 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lambda-cmp", type=float, default=1.0)
     p.add_argument("--lambda-mem", type=float, default=1.0)
     p.add_argument("--lambda-frob", type=float, default=0.0)
-    p.add_argument("--measure-latency", action="store_true",
-                   help="Run the compiled approx fn 10x per env step to populate "
-                        "the latency reward component.")
-    p.add_argument("--terminal-rewards-only", action="store_true",
-                   help="Compute the env's reward vector only at the final "
-                        "elimination step; intermediate steps return zeros.")
+    p.add_argument(
+        "--measure-latency", action="store_true",
+        help="Run the compiled approx fn 10x per env step to populate "
+             "the latency reward component.",
+    )
+    p.add_argument(
+        "--terminal-rewards-only", action="store_true",
+        help="Compute the env's reward vector only at the final "
+             "elimination step; intermediate steps return zeros.",
+    )
     p.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "none"])
     p.add_argument("--dataset-size", type=int, default=-1)
     p.add_argument("--num-eval-samples", type=int, default=10)
 
+    # Variant / curriculum (mirrors ppo.py)
+    p.add_argument(
+        "--variant",
+        type=str,
+        default="custom",
+        choices=list(VARIANT_PRESETS.keys()),
+        help=(
+            "Pre-canned configuration mapping to --factors / --max-rules / "
+            "--pin-rules-to-exact. `custom` honours your explicit flags. "
+            "`ve_only` freezes the rule head. `diag_gcd` / `diag_factor` / "
+            "`compress` / `full` enable progressively richer action sets. "
+            "`full_curriculum` is sugar for `full` plus an auto-generated "
+            "curriculum diag_gcd → diag_factor → full when --curriculum "
+            "is empty."
+        ),
+    )
+    p.add_argument(
+        "--curriculum",
+        type=str,
+        default="",
+        help=(
+            "Curriculum of variants to run in sequence. Format: "
+            "`stage1:N1,stage2:N2,...`. Empty = single training run on "
+            "--variant (or the default 3-stage curriculum when "
+            "--variant=full_curriculum)."
+        ),
+    )
+    p.add_argument(
+        "--curriculum-warmup-frac",
+        type=float,
+        default=0.3,
+        help="Fraction of each curriculum stage's optimizer steps spent "
+             "in the cosine LR warm-up before the exponential-decay phase.",
+    )
+    p.add_argument(
+        "--curriculum-existing-head-mult",
+        type=float,
+        default=0.3,
+        help="LR multiplier applied to heads introduced in an earlier "
+             "curriculum stage.",
+    )
+
+    # Loss mode (CLI parity with ppo.py — mu0 already collapses rewards
+    # to a single scalar per step, so the flag is accepted for compat).
+    p.add_argument(
+        "--loss-mode",
+        type=str,
+        default="scalar",
+        choices=["multi_head", "scalar"],
+        help="``scalar`` (mu0 default): single-channel reward = "
+             "``sum_i(reward_weights[i] * symlog(reward_vec[i]))``. "
+             "``multi_head`` accepted for ppo.py CLI parity; the "
+             "MuZero value head is scalar by construction so the flag "
+             "currently has no behavioural effect.",
+    )
+
+    # Dynamic-substeps (CLI parity). mu0's unified action space already
+    # handles per-decision typed action sequences; the flag is accepted
+    # so the same CLI invocation works for both trainers.
+    p.add_argument(
+        "--dynamic-substeps",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Accepted for ppo.py CLI parity. mu0's hierarchical MCTS "
+             "already encodes the (vertex, pair, factor) micro-action "
+             "sequence via per-depth masking of the unified action "
+             "space; this flag does not alter the action layout.",
+    )
+    p.add_argument(
+        "--max-substeps",
+        type=int,
+        default=8,
+        help="Accepted for ppo.py CLI parity (no effect in mu0).",
+    )
+    p.add_argument(
+        "--max-axis-size",
+        type=int,
+        default=1024,
+        help="Accepted for ppo.py CLI parity (no effect in mu0).",
+    )
+    p.add_argument(
+        "--allow-compress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Accepted for ppo.py CLI parity (no effect in mu0 today; "
+             "the unified action space doesn't yet emit COMPRESS).",
+    )
+
     # Network architecture
     p.add_argument("--vocab-size", type=int, default=256)
     p.add_argument("--embd-dim", type=int, default=64)
+    p.add_argument("--op-embd-dim", type=int, default=8)
     p.add_argument("--latent-dim", type=int, default=64)
     p.add_argument("--num-layers", type=int, default=2)
     p.add_argument("--num-heads", type=int, default=2)
     p.add_argument("--hidden-dim", type=int, default=64)
     p.add_argument("--policy-dims", type=str, default="64,32")
     p.add_argument("--value-dims", type=str, default="64,32")
+    p.add_argument(
+        "--cache-encoding",
+        action="store_true",
+        help="Encode the initial state once at episode start and reuse the "
+             "resulting latent for every MCTS step / loss-unroll within the "
+             "episode. The dynamics network alone evolves the latent across "
+             "real elimination steps.",
+    )
+    p.add_argument(
+        "--set-transformer-agg",
+        action="store_true",
+        help="Aggregate per-vertex features across the calibration samples "
+             "with a learned Set Transformer instead of a simple mean.",
+    )
+    p.add_argument(
+        "--pin-rules-to-exact",
+        action="store_true",
+        help="Pin the rule head to exact-AD (every slot = STOP, factor 0). "
+             "In mu0 this masks the pair-slot priors so MCTS only ever "
+             "selects PAIR_STOP, leaving gradient to the vertex head.",
+    )
 
     # Hierarchical action layout
     p.add_argument("--max-rules", type=int, default=1,
-                   help="Rule-slot count per chosen vertex. With max_rules=1 "
-                        "the MCTS has 3 depths (vertex, pair, factor); larger "
-                        "values give 1 + 2·max_rules depths per elimination.")
+                   help="Rule-slot count per chosen vertex.")
     p.add_argument("--factors", type=str, default="-1,1,2,4",
                    help="Comma-separated factor values for the rule decoder.")
 
@@ -432,65 +919,137 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--unroll-steps", type=int, default=2)
     p.add_argument("--dirichlet-fraction", type=float, default=0.25)
     p.add_argument("--dirichlet-alpha", type=float, default=0.3)
-    p.add_argument("--temperature", type=float, default=1.0,
-                   help="Initial MCTS visit-count temperature.")
+    p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--temperature-final", type=float, default=0.1)
     p.add_argument("--temperature-schedule", type=str, default="constant",
                    choices=SCHEDULES)
     p.add_argument("--reward-loss-weight", type=float, default=1.0)
     p.add_argument("--value-loss-weight", type=float, default=1.0)
 
+    # MCTS variant. Three modes, all sharing the same agent / loss / replay:
+    #   * ``hierarchical`` (default): two-stage MCTS — a shallow
+    #     ``mctx.muzero_policy`` over the vertex choice (PUCT exploration,
+    #     ``max_depth=1``), followed by ``mctx.gumbel_muzero_policy`` over
+    #     the rule sub-sequence rooted at the post-vertex latent. The
+    #     vertex head gets the strategic explore/exploit signal, while the
+    #     deeper pair/factor branch uses Gumbel sequential halving (better
+    #     under low simulation budgets than UCB on a wide action space).
+    #   * ``gumbel``: single ``mctx.gumbel_muzero_policy`` spanning the
+    #     full ``1 + 2·max_rules`` hierarchical tree.
+    #   * ``sampled``: standard ``mctx.muzero_policy`` with the root
+    #     restricted to ``--sampled-k`` actions drawn from the prior
+    #     (root-only approximation of Hubert et al. 2021 Sampled MuZero;
+    #     the per-node sampling + importance-weighted improvement of the
+    #     paper requires modifying mctx's search loop and is left for
+    #     follow-up).
+    p.add_argument(
+        "--mcts-mode",
+        type=str,
+        default="hierarchical",
+        choices=["hierarchical", "gumbel", "sampled"],
+        help="Which mctx policy to run inside each real elimination step.",
+    )
+    p.add_argument(
+        "--gumbel-max-considered",
+        type=int,
+        default=16,
+        help="``max_num_considered_actions`` for the Gumbel root selection. "
+             "Used by ``--mcts-mode gumbel`` and by the sub-rule call in "
+             "``--mcts-mode hierarchical``.",
+    )
+    p.add_argument(
+        "--gumbel-scale",
+        type=float,
+        default=1.0,
+        help="Scale for the Gumbel noise. 0 = deterministic argmax "
+             "(useful at eval time on perfect-information games).",
+    )
+    p.add_argument(
+        "--sampled-k",
+        type=int,
+        default=16,
+        help="Number of actions sampled from the root prior under "
+             "``--mcts-mode sampled``. Reduces MCTS branching at the cost "
+             "of forgoing actions outside the top-K.",
+    )
+
     # Optimisation
     p.add_argument("--num-envs", type=int, default=-1,
-                   help="Parallel rollout envs. -1 = os.cpu_count().")
+                   help="Parallel rollout envs. -1 = os.cpu_count() "
+                        "(or 16 for Vmapped examples).")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--minibatches", type=int, default=32)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--adam-eps", type=float, default=1e-7)
-    p.add_argument("--discount", type=float, default=1.0,
-                   help="Per-step discount factor inside MCTS / for value targets.")
+    p.add_argument("--discount", type=float, default=1.0)
     p.add_argument("--head-init-scale", type=float, default=0.1)
+    p.add_argument(
+        "--lr-decay-min-mult",
+        type=float,
+        default=0.1,
+        help="Cosine decay floor as a multiple of the initial learning rate.",
+    )
 
-    # MuZero-style replay buffer (paper uses prioritised replay; we start
-    # with uniform here, prioritised left as a follow-up).
-    p.add_argument("--replay-buffer-size", type=int, default=0,
-                   help="Replay buffer capacity (number of stored trajectories). "
-                        "0 disables — train only on fresh rollouts.")
-    p.add_argument("--replay-batch-size", type=int, default=0,
-                   help="Trajectories sampled per training pass. 0 = use --num-envs.")
-    p.add_argument("--replay-warmup", type=int, default=1,
-                   help="Episodes (= rollouts) to fill before sampling.")
-    p.add_argument("--replay-fresh-fraction", type=float, default=0.0,
-                   help="Fraction of train batch from fresh rollout. 0.0 = "
-                        "pure replay; 1.0 disables replay sampling.")
-    # Prioritised sampling: weight = max(priority, eps)**alpha. The priority
-    # for each stored trajectory is its scalar episode return (normalised
-    # to be non-negative — see ``_compute_priorities``). alpha=0 reduces to
-    # uniform; alpha=1 is fully proportional. Mid-range (0.5–0.7) is the
-    # Schaul et al. 2016 default.
-    p.add_argument("--replay-priority-alpha", type=float, default=0.0,
-                   help="Power applied to per-slot priorities at sample "
-                        "time. 0 = uniform.")
-    # Disk checkpointing for the buffer. Useful for long runs that span
-    # multiple processes / restarts.
-    p.add_argument("--replay-checkpoint-path", type=str, default="",
-                   help="If set, the buffer is saved here every "
-                        "--replay-checkpoint-every episodes. Loaded at "
-                        "startup if the file exists.")
-    p.add_argument("--replay-checkpoint-every", type=int, default=10,
-                   help="Episodes between buffer checkpoints.")
-    # Preference conditioning. When on, each env in the rollout draws a
-    # fresh ``w ∈ Δ^{NUM_REWARDS-1}`` per episode; the agent's
-    # representation network adds ``pref_proj(w)`` to the leading latent
-    # so the entire MCTS sub-tree is conditioned on the preference. A
-    # single trained network then covers the whole reward simplex.
-    p.add_argument("--preference-conditioned", action="store_true",
-                   help="Sample a per-env Dirichlet preference each "
-                        "episode and condition the latent on it.")
-    p.add_argument("--preference-dirichlet-alpha", type=float, default=1.0,
-                   help="Concentration for Dirichlet(α·1). 1=uniform on "
-                        "the simplex; <1 corner-concentrated; >1 centre-"
-                        "concentrated.")
+    # Replay buffer
+    p.add_argument("--replay-buffer-size", type=int, default=0)
+    p.add_argument("--replay-batch-size", type=int, default=0)
+    p.add_argument("--replay-warmup", type=int, default=1)
+    p.add_argument("--replay-fresh-fraction", type=float, default=0.0)
+    p.add_argument("--replay-priority-alpha", type=float, default=0.0)
+    p.add_argument("--replay-checkpoint-path", type=str, default="")
+    p.add_argument("--replay-checkpoint-every", type=int, default=10)
+
+    # Preference conditioning
+    p.add_argument("--preference-conditioned", action="store_true")
+    p.add_argument("--preference-dirichlet-alpha", type=float, default=1.0)
+
+    # Stage F Lagrangian
+    p.add_argument(
+        "--lagrangian-constraint",
+        action="append",
+        default=[],
+        metavar="NAME>=THRESH",
+        help="Hard-constraint of the form ``<reward_name>>=<threshold>`` (or "
+             "``<=`` for ceilings). May be repeated.",
+    )
+    p.add_argument(
+        "--lagrangian-lr",
+        type=float,
+        default=1e-2,
+        help="Dual-ascent step size on the Lagrangian multipliers.",
+    )
+    p.add_argument(
+        "--cosine-lower-bound",
+        type=float,
+        default=0.8,
+        help="Floor on cosine_sim enforced via a Lagrangian multiplier. "
+             "Pass 0.0 to disable.",
+    )
+    p.add_argument(
+        "--cosine-upper-bound",
+        type=float,
+        default=0.9,
+        help="Ceiling on cosine_sim enforced via a Lagrangian multiplier. "
+             "Pass 1.0 to disable.",
+    )
+
+    # Stage G calibration
+    p.add_argument(
+        "--calibrate-steps",
+        type=int,
+        default=0,
+        help="Pre-training reward-scale calibration: run K rollouts of the "
+             "un-trained agent, measure mean ``|symlog(reward)|`` per channel, "
+             "and rescale ``reward_weights`` by 1/mean_abs so the wide-magnitude "
+             "channels contribute on a comparable scale.",
+    )
+    p.add_argument(
+        "--calibrate-lr",
+        type=float,
+        default=1e-3,
+        help="Accepted for ppo.py CLI parity (mu0 calibration is gradient-free).",
+    )
+
     return p
 
 
@@ -499,23 +1058,62 @@ def make_argparser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_num_envs(arg_value: int) -> int:
+def _resolve_num_envs(arg_value: int, example: str) -> int:
     if arg_value > 0:
         return arg_value
+    if "Vmapped" in example:
+        return 16
     return os.cpu_count() or 64
+
+
+def _resolve_main_device(args):
+    if not args.exec_on_gpu:
+        return None
+    try:
+        gpus = jax.devices("gpu")
+    except Exception:
+        gpus = []
+    if len(gpus) < 2:
+        raise RuntimeError(
+            f"--exec-on-gpu requested but only {len(gpus)} GPU(s) found. "
+            "Check your --gpus argument and CUDA_VISIBLE_DEVICES."
+        )
+    return gpus[0]
 
 
 def _scale_output_heads(agent, scale: float):
     agent = scale_module_weight(agent, lambda a: a.policy_head.layers[-2].weight, scale)
     agent = scale_module_weight(agent, lambda a: a.value_head.layers[-2].weight, scale)
     agent = scale_module_weight(agent, lambda a: a.reward_head.layers[-2].weight, scale)
+    # Zero the data-feature projection's output so the initial behaviour
+    # matches the baseline that doesn't consume vertex_features. Gradient
+    # still flows in normally once training starts.
+    agent = scale_module_weight(
+        agent, lambda a: a.vertex_feature_proj.weight, 0.0,
+    )
+    agent = scale_module_weight(
+        agent, lambda a: a.set_transformer_agg.output_proj.weight, 0.0,
+    )
+    agent = scale_module_weight(
+        agent, lambda a: a.vertex_features_to_latent.weight, 0.0,
+    )
+    agent = scale_module_weight(agent, lambda a: a.pref_proj.weight, 0.0)
     return agent
 
 
 def _setup_jax_compile_cache() -> None:
+    """Per-node persistent XLA compile cache. See the matching helper in
+    ``ppo.py`` for the rationale: scoping by ``<hostname>`` prevents an
+    NFS-shared homedir from mixing cache entries built for different CPU
+    generations, which trips ``cpu_aot_loader.cc:195`` warnings and may
+    force fresh recompiles.
+    """
+    import socket
+
+    short_host = socket.gethostname().split(".", 1)[0]
     cache_dir = os.environ.setdefault(
         "JAX_COMPILATION_CACHE_DIR",
-        os.path.expanduser("~/.cache/jax-compilation-cache"),
+        os.path.expanduser(f"~/.cache/jax-compilation-cache/{short_host}"),
     )
     try:
         from jax.experimental.compilation_cache import compilation_cache
@@ -539,25 +1137,15 @@ def _discounted_returns(rewards: jax.Array, discount: float) -> jax.Array:
 def _compute_traj_priorities(
     fresh_traj: Trajectory, reward_weights: jax.Array,
 ) -> jax.Array:
-    """Per-trajectory priority = shifted-positive episode return.
-
-    The stored ``scalar_reward`` is per-step; sum gives the (un-discounted)
-    episode return per env. We shift by the batch min so all priorities
-    are non-negative — required for ``priority**alpha`` to make sense
-    when ``alpha < 1`` and rewards are negative-cost (the usual sign
-    convention here).
-    """
-    del reward_weights  # ``scalar_reward`` is already weight-collapsed.
-    episode_return = jnp.sum(fresh_traj.scalar_reward, axis=1)  # (E,)
-    # Shift so the worst trajectory in the batch has priority ε > 0.
+    del reward_weights
+    episode_return = jnp.sum(fresh_traj.scalar_reward, axis=1)
     return episode_return - jnp.min(episode_return) + 1e-3
 
 
 def _action_to_pylist(
     vertex_seq, pair_seq, factor_seq, factor_table_np,
 ) -> list[tuple[int, list]]:
-    """Decode a per-step (vertex, pair_seq, factor_seq) trace to env-style
-    ``[(vertex, [(idx1, idx2, factor), ...])]``."""
+    """Decode a per-step (vertex, pair_seq, factor_seq) trace to env-style."""
     pair_to_base = np.asarray(_PAIR_TO_BASE)
     out: list[tuple[int, list]] = []
     for t in range(vertex_seq.shape[0]):
@@ -576,6 +1164,30 @@ def _action_to_pylist(
     return out
 
 
+def _episode_vertex_features(
+    args,
+    jaxpr,
+    consts: tuple,
+    base_args: tuple,
+    eval_samples,
+    argnums: tuple,
+) -> "jax.Array":
+    """Single dispatch site for the per-vertex feature computation.
+
+    Switches between mean-aggregated and per-sample features based on
+    ``--set-transformer-agg``.
+    """
+    fn = (
+        compute_per_sample_vertex_features
+        if args.set_transformer_agg
+        else compute_vertex_features
+    )
+    return jnp.asarray(
+        fn(jaxpr, consts, base_args, eval_samples=eval_samples, argnums=argnums),
+        dtype=jnp.float32,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Batching
 # ---------------------------------------------------------------------------
@@ -583,7 +1195,7 @@ def _action_to_pylist(
 
 @partial(jax.jit, static_argnums=1)
 def _shuffle_and_batch_windows(window_batch: TrajectoryWindow, minibatches: int, key):
-    sample = window_batch.vertex_idx  # (E, W, U+1)
+    sample = window_batch.vertex_idx
     num_envs, num_windows = sample.shape[:2]
     mb_size = (num_envs * num_windows) // minibatches
     valid = mb_size * minibatches
@@ -604,6 +1216,39 @@ def _shuffle_and_batch_windows(window_batch: TrajectoryWindow, minibatches: int,
 def main():
     args = make_argparser().parse_args()
 
+    # Apply the --variant preset before anything else looks at args.factors
+    # etc. Explicit CLI flags passed alongside --variant are overridden.
+    auto_curriculum = args.variant == "full_curriculum" and not args.curriculum.strip()
+    _apply_variant_preset(args)
+    if args.variant != "custom":
+        print(
+            f"--variant={args.variant} applied: factors={args.factors!r}, "
+            f"max_rules={args.max_rules}, "
+            f"pin_rules_to_exact={args.pin_rules_to_exact}"
+        )
+
+    # Curriculum: parse the explicit spec or expand the implicit one for
+    # ``full_curriculum``. The curriculum runner gates the rule head per
+    # stage via the (pin_rules, op_legality) pair derived from the stage
+    # name; the agent itself is built once with the final-stage action
+    # footprint, mirroring ppo.py's behaviour.
+    if auto_curriculum:
+        curriculum_stages = _default_full_curriculum(args.episodes)
+        print(
+            f"--variant=full_curriculum: auto curriculum "
+            + " → ".join(f"{name}:{n}" for name, n in curriculum_stages)
+        )
+    else:
+        curriculum_stages = _parse_curriculum(args.curriculum)
+    if curriculum_stages:
+        args.episodes = sum(n for _, n in curriculum_stages)
+        print(
+            "curriculum: "
+            + " → ".join(f"{name}:{n}" for name, n in curriculum_stages)
+            + f"  (total {args.episodes} episodes)"
+        )
+
+    main_device = _resolve_main_device(args)
     if args.no_jit:
         jax.config.update("jax_disable_jit", True)
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -635,6 +1280,7 @@ def main():
         target_fun=env_target_fun,
         cmp_type=args.cmp_type,
         mem_type=args.mem_type,
+        exec_on_gpu=args.exec_on_gpu,
         measure_latency=measure_latency,
         terminal_rewards_only=args.terminal_rewards_only,
     )
@@ -651,8 +1297,6 @@ def main():
 
     factor_table, factors_py, num_factors, max_rules = _build_factor_table(args)
     factor_table_np = np.array(factors_py, dtype=np.int32)
-    # All-ones placeholder — see ppo.py for rationale (apply_diag does
-    # the divisibility check at apply time now).
     pair_factor_mask = jnp.ones(
         (total_v, NUM_PAIR_CHOICES, num_factors), dtype=jnp.float32,
     )
@@ -660,10 +1304,9 @@ def main():
     DECISION_DEPTH = 1 + 2 * max_rules
     UNIFIED_ACTION_SIZE = int(max(total_v, NUM_PAIR_CHOICES, num_factors))
 
-    num_envs = _resolve_num_envs(args.num_envs)
+    num_envs = _resolve_num_envs(args.num_envs, args.example)
     rollout_length = num_valid
 
-    # See ppo.py for rationale: empty minibatches → NaN losses → silent no-op.
     if (num_envs * rollout_length) // args.minibatches == 0:
         raise ValueError(
             f"--minibatches={args.minibatches} > num_envs * rollout "
@@ -687,6 +1330,52 @@ def main():
         f"unified_action_size={UNIFIED_ACTION_SIZE}",
     )
     print(f"reward weights: {nonzero_w or '<all zero — debug only>'}")
+    print(f"loss_mode={args.loss_mode}, dynamic_substeps={args.dynamic_substeps}, "
+          f"cache_encoding={args.cache_encoding}, "
+          f"set_transformer_agg={args.set_transformer_agg}")
+    if args.mcts_mode == "hierarchical":
+        mode_detail = (
+            f"vertex MCTS (muzero_policy, max_depth=1) + "
+            f"rule Gumbel (max_considered={args.gumbel_max_considered}, "
+            f"scale={args.gumbel_scale})"
+        )
+    elif args.mcts_mode == "gumbel":
+        mode_detail = (
+            f"Gumbel MuZero (max_considered={args.gumbel_max_considered}, "
+            f"scale={args.gumbel_scale})"
+        )
+    else:
+        mode_detail = f"Sampled MuZero (K={args.sampled_k})"
+    print(f"mcts_mode={args.mcts_mode}: {mode_detail}")
+
+    # ---------------- Stage F Lagrangian state ----------------
+    # The cosine_sim bounds are added to the explicit --lagrangian-constraint
+    # list before parsing, matching ppo.py's wiring.
+    user_constraints = list(args.lagrangian_constraint)
+    if args.cosine_lower_bound > 0.0:
+        user_constraints.append(f"cosine_sim>={args.cosine_lower_bound}")
+    if args.cosine_upper_bound < 1.0:
+        user_constraints.append(f"cosine_sim<={args.cosine_upper_bound}")
+    constraint_specs = parse_lagrangian_constraints(user_constraints)
+    if constraint_specs:
+        ops_for_print = {1: ">=", -1: "<="}
+        print(
+            f"Stage F Lagrangian: {len(constraint_specs)} constraints — "
+            + ", ".join(
+                f"{REWARD_NAMES[idx]}{ops_for_print[sign]}{t:g}"
+                for idx, t, sign in constraint_specs
+            )
+        )
+    constraint_indices = jnp.asarray(
+        [idx for idx, _, _ in constraint_specs], dtype=jnp.int32,
+    )
+    constraint_thresholds = jnp.asarray(
+        [t for _, t, _ in constraint_specs], dtype=jnp.float32,
+    )
+    constraint_signs = jnp.asarray(
+        [float(sign) for _, _, sign in constraint_specs], dtype=jnp.float32,
+    )
+    multipliers = jnp.zeros(len(constraint_specs), dtype=jnp.float32)
 
     # ---------------- Agent ----------------
     agent_key, init_key, key = jrand.split(key, 3)
@@ -701,15 +1390,41 @@ def main():
         num_rewards=NUM_REWARDS,
         policy_dims=_parse_int_list(args.policy_dims),
         value_dims=_parse_int_list(args.value_dims),
+        op_embd_dim=args.op_embd_dim,
         seq_len=MAX_TOKENS,
         key=agent_key,
     )
     agent = init_linear_weights(agent, init_key)
     agent = _scale_output_heads(agent, args.head_init_scale)
 
+    if args.exec_on_gpu:
+        agent = jax.tree_util.tree_map(
+            lambda x: jax.device_put(x, main_device) if eqx.is_array(x) else x,
+            agent,
+        )
+
+    # Optimiser. Default = single cosine decay across the whole run. When
+    # --curriculum (or auto_curriculum) is set, swap in a piecewise schedule.
+    if curriculum_stages:
+        schedule = make_curriculum_schedule(args, curriculum_stages)
+        print(
+            "curriculum LR: piecewise cosine_warmup_exp_decay across "
+            + " → ".join(
+                f"{name}({n * args.minibatches}st)"
+                for name, n in curriculum_stages
+            )
+            + f" (warmup_frac={args.curriculum_warmup_frac}, "
+            f"end_mult={args.lr_decay_min_mult})"
+        )
+    else:
+        schedule = optax.cosine_decay_schedule(
+            args.lr,
+            args.episodes * args.minibatches,
+            args.lr_decay_min_mult,
+        )
     optimizer = optax.chain(
         optax.clip_by_global_norm(args.max_grad_norm),
-        optax.adamw(args.lr, eps=args.adam_eps),
+        optax.adamw(schedule, eps=args.adam_eps),
     )
     opt_state = optimizer.init(eqx.filter(agent, eqx.is_inexact_array))
 
@@ -723,23 +1438,29 @@ def main():
             state, vertex_valid_static, total_v, num_valid,
         ).astype(jnp.float32)
 
-    def _build_action_mask_at_depth(emb: DecisionEmbedding):
+    def _build_action_mask_at_depth(emb: DecisionEmbedding, pin_rules):
         """Per-depth invalid-action mask (1 where invalid)."""
         depth = emb.depth
-        # depth==0 → vertex avail mask (size total_v); pad to UNIFIED.
         v_invalid = jnp.full((UNIFIED_ACTION_SIZE,), 1.0, dtype=jnp.float32)
         v_invalid = v_invalid.at[:total_v].set(1.0 - emb.vertex_avail_mask)
 
-        # depth 2k+1 → per-vertex pair mask, padded to UNIFIED.
-        p_invalid_full = jnp.full((UNIFIED_ACTION_SIZE,), 1.0, dtype=jnp.float32)
-        p_invalid_full = p_invalid_full.at[:NUM_PAIR_CHOICES].set(
+        # Pair-slot mask. When pin_rules is on, force PAIR_STOP for every
+        # pair slot (mu0's analogue of ppo.py's pin_rules_to_exact).
+        p_invalid_unpinned = jnp.full(
+            (UNIFIED_ACTION_SIZE,), 1.0, dtype=jnp.float32,
+        )
+        p_invalid_unpinned = p_invalid_unpinned.at[:NUM_PAIR_CHOICES].set(
             1.0 - pair_valid_mask[emb.vertex_idx],
         )
+        p_invalid_pinned = jnp.ones((UNIFIED_ACTION_SIZE,), dtype=jnp.float32)
+        p_invalid_pinned = p_invalid_pinned.at[PAIR_STOP].set(0.0)
+        p_invalid = jnp.where(pin_rules, p_invalid_pinned, p_invalid_unpinned)
 
-        # depth 2k+2 → per-(vertex, pair_k) factor mask.
         factor_slot_k = (depth - 2) // 2
         pair_k = emb.pair_seq[jnp.maximum(factor_slot_k, 0)]
-        f_invalid_full = jnp.full((UNIFIED_ACTION_SIZE,), 1.0, dtype=jnp.float32)
+        f_invalid_full = jnp.full(
+            (UNIFIED_ACTION_SIZE,), 1.0, dtype=jnp.float32,
+        )
         f_invalid_full = f_invalid_full.at[:num_factors].set(
             1.0 - pair_factor_mask[emb.vertex_idx, pair_k],
         )
@@ -748,20 +1469,17 @@ def main():
         is_pair = (depth >= 1) & (depth % 2 == 1)
         return jnp.where(
             is_vertex, v_invalid,
-            jnp.where(is_pair, p_invalid_full, f_invalid_full),
+            jnp.where(is_pair, p_invalid, f_invalid_full),
         )
 
-    def _prior_at_depth(emb: DecisionEmbedding):
-        """Run prediction(latent) and mask the unified-size logits to the
-        valid action range for the current depth."""
+    def _prior_at_depth(emb: DecisionEmbedding, pin_rules):
         logits, value = agent.prediction(emb.latent)
-        invalid = _build_action_mask_at_depth(emb)
+        invalid = _build_action_mask_at_depth(emb, pin_rules)
         masked = jnp.where(invalid > 0.5, -1e9, logits)
         return masked, value
 
     def _build_step_action(vertex_idx, pair_seq, factor_seq):
         target_vertex = jnp.asarray(vertex_idx + 1, dtype=jnp.int32)
-        # Construct rule_specs via the same factor-table indexing PPO uses.
         first_rows = []
         for slot in range(max_rules):
             p = pair_seq[slot]
@@ -783,150 +1501,330 @@ def main():
         return StepAction(target_vertex=target_vertex, rule_specs=specs)
 
     # ---------------- mctx callbacks ----------------
+    #
+    # mctx expects both ``root_fn`` and ``recurrent_fn`` to operate on
+    # batched embeddings: ``root_fn`` is called once by the user with the
+    # batched root, and ``mctx._src.search.expand`` slices the search-tree
+    # embedding by ``(batch_range, parent_index)`` before calling
+    # ``recurrent_fn`` (see search.py around line 222). Both callables
+    # must return batched outputs.
+    #
+    # The agent's MLP heads operate on 1-D latents, and ``lax.cond``
+    # requires scalar predicates, so we write the single-element logic
+    # once and wrap each callable in ``jax.vmap`` over the batch axis.
 
-    def root_fn(_agent, _rng_key, embedding):
-        prior, value = _prior_at_depth(embedding)
-        return mctx.RootFnOutput(
-            prior_logits=prior, value=value, embedding=embedding,
-        )
+    def make_root_fn(pin_rules):
+        def root_fn_single(emb):
+            return _prior_at_depth(emb, pin_rules)
 
-    def recurrent_fn(_agent, _rng_key, action, embedding):
-        depth = embedding.depth
-        is_vertex = depth == 0
-        is_pair = (depth >= 1) & (depth % 2 == 1)
-        is_factor = (depth >= 2) & (depth % 2 == 0)
-        pair_slot_k = (depth - 1) // 2
-        factor_slot_k = (depth - 2) // 2
+        def root_fn(_agent, _rng_key, embedding):
+            prior, value = jax.vmap(root_fn_single)(embedding)
+            return mctx.RootFnOutput(
+                prior_logits=prior, value=value, embedding=embedding,
+            )
+        return root_fn
 
-        new_vertex_idx = jnp.where(
-            is_vertex, action.astype(jnp.int32), embedding.vertex_idx,
-        )
-        new_pair_seq = lax.cond(
-            is_pair,
-            lambda: embedding.pair_seq.at[
-                jnp.maximum(pair_slot_k, 0)
-            ].set(action.astype(jnp.int32)),
-            lambda: embedding.pair_seq,
-        )
-        new_factor_seq = lax.cond(
-            is_factor,
-            lambda: embedding.factor_seq.at[
-                jnp.maximum(factor_slot_k, 0)
-            ].set(action.astype(jnp.int32)),
-            lambda: embedding.factor_seq,
-        )
-        new_active = jnp.where(
-            is_pair,
-            embedding.active & (action.astype(jnp.int32) != PAIR_STOP),
-            embedding.active,
-        )
+    def make_recurrent_fn(pin_rules):
+        def recurrent_step_single(action, embedding):
+            depth = embedding.depth
+            is_vertex = depth == 0
+            is_pair = (depth >= 1) & (depth % 2 == 1)
+            is_factor = (depth >= 2) & (depth % 2 == 0)
+            pair_slot_k = (depth - 1) // 2
+            factor_slot_k = (depth - 2) // 2
 
-        # Apply the dynamics: action goes through the (shared) action
-        # embedding. The latent's evolution carries the depth context — we
-        # don't pass depth explicitly (kept consistent with the original
-        # MuZero design; the dynamics MLP discriminates from latent alone).
-        next_latent, pred_reward = agent.dynamics(embedding.latent, action.astype(jnp.int32))
-
-        new_depth = depth + 1
-        should_commit = new_depth == DECISION_DEPTH
-
-        def commit_branch():
-            # Mark the chosen vertex as eliminated for the next vertex
-            # selection inside this MCTS tree, then reset the decision
-            # state. Latent is the dynamics-predicted "post-elimination"
-            # latent; reward predicted by the reward head IS the env reward
-            # (modulo learning) — pass it forward via last_reward.
-            new_avail = embedding.vertex_avail_mask.at[new_vertex_idx].set(0.0)
-            fresh = _empty_decision(next_latent, new_avail, max_rules)
-            return fresh._replace(last_reward=pred_reward)
-
-        def no_commit_branch():
-            return embedding._replace(
-                latent=next_latent,
-                depth=new_depth,
-                vertex_idx=new_vertex_idx,
-                pair_seq=new_pair_seq,
-                factor_seq=new_factor_seq,
-                active=new_active,
-                last_reward=pred_reward,
+            new_vertex_idx = jnp.where(
+                is_vertex, action.astype(jnp.int32), embedding.vertex_idx,
+            )
+            new_pair_seq = lax.cond(
+                is_pair,
+                lambda: embedding.pair_seq.at[
+                    jnp.maximum(pair_slot_k, 0)
+                ].set(action.astype(jnp.int32)),
+                lambda: embedding.pair_seq,
+            )
+            new_factor_seq = lax.cond(
+                is_factor,
+                lambda: embedding.factor_seq.at[
+                    jnp.maximum(factor_slot_k, 0)
+                ].set(action.astype(jnp.int32)),
+                lambda: embedding.factor_seq,
+            )
+            new_active = jnp.where(
+                is_pair,
+                embedding.active & (action.astype(jnp.int32) != PAIR_STOP),
+                embedding.active,
             )
 
-        next_emb = lax.cond(should_commit, commit_branch, no_commit_branch)
-        n_prior, n_value = _prior_at_depth(next_emb)
+            next_latent, pred_reward = agent.dynamics(
+                embedding.latent, action.astype(jnp.int32),
+            )
 
-        return (
-            mctx.RecurrentFnOutput(
-                reward=next_emb.last_reward,
-                discount=jnp.full_like(
-                    next_emb.last_reward, args.discount,
+            new_depth = depth + 1
+            should_commit = new_depth == DECISION_DEPTH
+
+            def commit_branch():
+                new_avail = embedding.vertex_avail_mask.at[new_vertex_idx].set(0.0)
+                fresh = _empty_decision(next_latent, new_avail, max_rules)
+                return fresh._replace(last_reward=pred_reward)
+
+            def no_commit_branch():
+                return embedding._replace(
+                    latent=next_latent,
+                    depth=new_depth,
+                    vertex_idx=new_vertex_idx,
+                    pair_seq=new_pair_seq,
+                    factor_seq=new_factor_seq,
+                    active=new_active,
+                    last_reward=pred_reward,
+                )
+
+            next_emb = lax.cond(should_commit, commit_branch, no_commit_branch)
+            n_prior, n_value = _prior_at_depth(next_emb, pin_rules)
+
+            return (n_prior, n_value, next_emb)
+
+        def recurrent_fn(_agent, _rng_key, action, embedding):
+            n_prior, n_value, next_emb = jax.vmap(recurrent_step_single)(
+                action, embedding,
+            )
+            return (
+                mctx.RecurrentFnOutput(
+                    reward=next_emb.last_reward,
+                    discount=jnp.full_like(
+                        next_emb.last_reward, args.discount,
+                    ),
+                    prior_logits=n_prior,
+                    value=n_value,
                 ),
-                prior_logits=n_prior,
-                value=n_value,
-            ),
-            next_emb,
-        )
+                next_emb,
+            )
+        return recurrent_fn
 
     # ---------------- Rollout ----------------
     def reset_envs(env_obj):
         return jax.vmap(lambda _: env_obj.reset())(jnp.arange(num_envs))
 
     @eqx.filter_jit
-    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, 0))
-    def rollout_fn(agent, temperature, env_obj, env_state, key, preference):
+    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, 0, None, None))
+    def rollout_fn(
+        agent,
+        temperature,
+        env_obj,
+        env_state,
+        key,
+        preference,
+        vertex_features,
+        pin_rules_jax,
+    ):
         keys = jrand.split(key, rollout_length)
 
-        def step_fn(state, k):
-            search_key, traverse_key = jrand.split(k, 2)
+        # Cache-encoding: encode the initial state once. The cached latent
+        # is the leading latent at every real step; the dynamics network
+        # alone evolves it across real eliminations. The non-cache path
+        # re-runs ``representation`` per step using the *current* env
+        # state's tokens / eqn_ids.
+        encode_key, scan_key = jrand.split(keys[0], 2)
+        cached_latent = agent.representation(
+            env_state.tokens,
+            eqn_ids=env_state.eqn_ids,
+            preference=preference,
+            vertex_features=vertex_features,
+            key=encode_key,
+            agg_key=encode_key,
+        )
 
-            # Latent and decision-state at the root of this real step.
-            # When preference-conditioning is on, the per-env preference is
-            # injected into the leading latent here; the dynamics network
-            # carries it through the rest of the search tree without any
-            # per-call plumbing inside MCTS.
-            latent = agent.representation(
-                state.tokens, eqn_ids=state.eqn_ids, preference=preference,
-            )
-            v_avail = _initial_vertex_avail(state)
-            decision_state = _empty_decision(latent, v_avail, max_rules)
+        root_fn = make_root_fn(pin_rules_jax)
+        recurrent_fn = make_recurrent_fn(pin_rules_jax)
 
-            # Hierarchical MCTS: ONE search per real step. The tree internally
-            # spans 1 + 2·max_rules depth levels per simulated elimination.
+        def _run_search(decision_state, search_key, traverse_key):
+            """Dispatch the MCTS search based on ``args.mcts_mode``.
+
+            Returns ``(mcts_visits, actions_path, mcts_value)`` with shapes
+            ``((DECISION_DEPTH, UNIFIED_ACTION_SIZE), (DECISION_DEPTH,),
+            ())``. ``args.mcts_mode`` is static at trace time so the
+            Python branching here selects between the three search
+            backends without runtime dispatch overhead.
+            """
             embedding = jax.tree.map(
                 lambda x: jnp.expand_dims(x, 0), decision_state,
             )
             roots = root_fn(agent, search_key, embedding)
-            invalid_actions = _build_action_mask_at_depth(decision_state)
-            policy_output = mctx.muzero_policy(
+            invalid_actions = _build_action_mask_at_depth(
+                decision_state, pin_rules_jax,
+            )
+
+            if args.mcts_mode == "gumbel":
+                # Full hierarchical tree, Gumbel sequential halving.
+                policy_output = mctx.gumbel_muzero_policy(
+                    params=agent,
+                    rng_key=search_key,
+                    root=roots,
+                    recurrent_fn=recurrent_fn,
+                    num_simulations=args.num_simulations,
+                    invalid_actions=invalid_actions[None, :],
+                    max_num_considered_actions=args.gumbel_max_considered,
+                    gumbel_scale=args.gumbel_scale,
+                )
+                mcts_value = policy_output.search_tree.summary().value[0]
+                mcts_visits, actions_path = extract_path_visits(
+                    policy_output.search_tree, DECISION_DEPTH, traverse_key,
+                )
+                return mcts_visits, actions_path, mcts_value
+
+            if args.mcts_mode == "sampled":
+                # Sampled MuZero (root-only approximation): draw K actions
+                # from the prior softmax (after masking invalid actions)
+                # and let mctx.muzero_policy expand only those K.
+                sample_key, search_inner = jrand.split(search_key)
+                root_prior_masked = jnp.where(
+                    invalid_actions > 0.5,
+                    jnp.full_like(roots.prior_logits[0], -1e9),
+                    roots.prior_logits[0],
+                )
+                sampled = jrand.categorical(
+                    sample_key, root_prior_masked,
+                    shape=(args.sampled_k,),
+                )
+                sample_keep = jnp.zeros(
+                    (UNIFIED_ACTION_SIZE,), dtype=jnp.float32,
+                ).at[sampled].set(1.0)
+                sampled_invalid = jnp.maximum(
+                    invalid_actions,
+                    jnp.where(sample_keep > 0.5, 0.0, 1.0),
+                )
+                policy_output = mctx.muzero_policy(
+                    params=agent,
+                    rng_key=search_inner,
+                    root=roots,
+                    recurrent_fn=recurrent_fn,
+                    num_simulations=args.num_simulations,
+                    invalid_actions=sampled_invalid[None, :],
+                    dirichlet_fraction=args.dirichlet_fraction,
+                    dirichlet_alpha=args.dirichlet_alpha,
+                    temperature=temperature,
+                )
+                mcts_value = policy_output.search_tree.summary().value[0]
+                mcts_visits, actions_path = extract_path_visits(
+                    policy_output.search_tree, DECISION_DEPTH, traverse_key,
+                )
+                return mcts_visits, actions_path, mcts_value
+
+            # args.mcts_mode == "hierarchical":
+            # Stage 1: shallow PUCT MCTS over the vertex head.
+            v_search_key, r_search_key = jrand.split(search_key)
+            r_traverse_key, _ = jrand.split(traverse_key)
+            v_policy = mctx.muzero_policy(
                 params=agent,
-                rng_key=search_key,
+                rng_key=v_search_key,
                 root=roots,
                 recurrent_fn=recurrent_fn,
                 num_simulations=args.num_simulations,
                 invalid_actions=invalid_actions[None, :],
+                max_depth=1,
                 dirichlet_fraction=args.dirichlet_fraction,
                 dirichlet_alpha=args.dirichlet_alpha,
                 temperature=temperature,
             )
-            mcts_value = policy_output.search_tree.summary().value[0]
+            v_visits_raw = v_policy.search_tree.summary().visit_counts[0]
+            v_visits_sum = jnp.sum(v_visits_raw)
+            v_visits = jnp.where(
+                v_visits_sum > 0,
+                v_visits_raw / jnp.maximum(v_visits_sum, 1e-8),
+                jnp.full_like(v_visits_raw, 1.0 / v_visits_raw.shape[-1]),
+            )
+            v_value = v_policy.search_tree.summary().value[0]
+            vertex_idx = v_policy.action[0].astype(jnp.int32)
 
-            # Walk the search tree along the chosen action path: at every
-            # depth take the visit-count distribution as policy target and
-            # sample the next action from it. Replaces the previous "sample
-            # vertex from root visits, sample rules from agent prior" path.
-            mcts_visits, actions_path = extract_path_visits(
-                policy_output.search_tree, DECISION_DEPTH, traverse_key,
+            # Stage 2: Gumbel MCTS over the rule sub-sequence rooted at
+            # the post-vertex-dynamics latent (depth=1).
+            post_v_latent, _ = agent.dynamics(decision_state.latent, vertex_idx)
+            new_avail = decision_state.vertex_avail_mask.at[vertex_idx].set(0.0)
+            sub_decision = decision_state._replace(
+                latent=post_v_latent,
+                vertex_avail_mask=new_avail,
+                depth=jnp.array(1, dtype=jnp.int32),
+                vertex_idx=vertex_idx,
+            )
+            sub_embedding = jax.tree.map(
+                lambda x: jnp.expand_dims(x, 0), sub_decision,
+            )
+            sub_roots = root_fn(agent, r_search_key, sub_embedding)
+            sub_invalid = _build_action_mask_at_depth(
+                sub_decision, pin_rules_jax,
+            )
+            sub_policy = mctx.gumbel_muzero_policy(
+                params=agent,
+                rng_key=r_search_key,
+                root=sub_roots,
+                recurrent_fn=recurrent_fn,
+                num_simulations=args.num_simulations,
+                invalid_actions=sub_invalid[None, :],
+                max_num_considered_actions=args.gumbel_max_considered,
+                gumbel_scale=args.gumbel_scale,
+            )
+            sub_visits, sub_actions = extract_path_visits(
+                sub_policy.search_tree, DECISION_DEPTH - 1, r_traverse_key,
+            )
+            sub_value = sub_policy.search_tree.summary().value[0]
+
+            combined_visits = jnp.concatenate(
+                [v_visits[None, :], sub_visits], axis=0,
+            )
+            combined_actions = jnp.concatenate(
+                [vertex_idx[None], sub_actions.astype(jnp.int32)], axis=0,
+            )
+            combined_value = 0.5 * (v_value + sub_value)
+            return combined_visits, combined_actions, combined_value
+
+        def step_fn(carry, k):
+            state, evolved_latent = carry
+            search_key, traverse_key, encode_key = jrand.split(k, 3)
+
+            if args.cache_encoding:
+                latent = evolved_latent
+            else:
+                latent = agent.representation(
+                    state.tokens,
+                    eqn_ids=state.eqn_ids,
+                    preference=preference,
+                    vertex_features=vertex_features,
+                    key=encode_key,
+                    agg_key=encode_key,
+                )
+
+            v_avail = _initial_vertex_avail(state)
+            decision_state = _empty_decision(latent, v_avail, max_rules)
+
+            mcts_visits, actions_path, mcts_value = _run_search(
+                decision_state, search_key, traverse_key,
             )
 
-            # Decode the unified action path into env-style components.
             vertex_idx = actions_path[0]
             slot_indices = jnp.arange(max_rules)
             pair_seq = actions_path[1 + 2 * slot_indices].astype(jnp.int32)
             factor_seq = actions_path[2 + 2 * slot_indices].astype(jnp.int32)
 
-            # Apply the *real* env step with the full chosen action.
             env_action = _build_step_action(vertex_idx, pair_seq, factor_seq)
             env_out = env_obj.step(state, env_action)
             scalar_reward = jnp.sum(env_out.reward * reward_weights)
+
+            # Evolve the cached latent through the just-taken action sequence
+            # so the next step starts from a latent that reflects what we did.
+            # Each real step costs 1 + 2 · max_rules dynamics calls; the same
+            # call count the search tree pays per simulation, so this is cheap.
+            latent_v, _ = agent.dynamics(
+                latent, vertex_idx.astype(jnp.int32),
+            )
+
+            def per_slot(carry, slot_idx):
+                lat, _ = agent.dynamics(carry, pair_seq[slot_idx])
+                lat, _ = agent.dynamics(lat, factor_seq[slot_idx])
+                return lat, None
+
+            next_latent_cached, _ = lax.scan(
+                per_slot, latent_v, jnp.arange(max_rules),
+            )
 
             transition = Trajectory(
                 tokens=state.tokens.astype(jnp.int32),
@@ -940,13 +1838,15 @@ def main():
                 mcts_value=jnp.asarray(mcts_value, dtype=jnp.float32),
                 preference=preference.astype(jnp.float32),
             )
-            return env_out.state, transition
+            return (env_out.state, next_latent_cached), transition
 
-        return lax.scan(step_fn, env_state, keys)
+        (final_state, _), traj = lax.scan(
+            step_fn, (env_state, cached_latent), keys,
+        )
+        return final_state, traj
 
     # ---------------- Loss ----------------
     def _build_action_seq(vertex_idx, pair_seq, factor_seq):
-        """Interleave (vertex, pair_0, factor_0, pair_1, factor_1, ...)."""
         out = jnp.zeros((DECISION_DEPTH,), dtype=jnp.int32)
         out = out.at[0].set(vertex_idx)
         for slot in range(max_rules):
@@ -955,7 +1855,6 @@ def main():
         return out
 
     def _build_reward_seq(scalar_reward):
-        """Per-decision rewards: ``[0, 0, ..., 0, scalar_reward]``."""
         out = jnp.zeros((DECISION_DEPTH,), dtype=jnp.float32)
         return out.at[DECISION_DEPTH - 1].set(scalar_reward)
 
@@ -963,7 +1862,7 @@ def main():
         def unroll_loss(window: TrajectoryWindow):
             tokens = window.tokens[0]
             eqn_ids = window.eqn_ids[0]
-            preference = window.preference[0]  # constant within an episode
+            preference = window.preference[0]
             latent = agent.representation(
                 tokens, eqn_ids=eqn_ids, preference=preference,
             )
@@ -978,17 +1877,10 @@ def main():
                 )
                 reward_seq_k = _build_reward_seq(window.scalar_reward[k])
                 target_value_k = window.target_value[k]
-                # Per-depth visit-count distributions extracted from the
-                # search tree at rollout time. Shape: (DECISION_DEPTH, UNIFIED).
                 mcts_visits_k = window.mcts_visits[k]
 
                 for d in range(DECISION_DEPTH):
                     logits, value = agent.prediction(latent)
-                    # Visit-count CE at every depth (paper-style AlphaZero
-                    # distillation). Invalid actions have zero visit
-                    # probability so they contribute zero to the sum even
-                    # when ``log_softmax`` returns very-negative values for
-                    # masked logits.
                     target_d = mcts_visits_k[d]
                     l_pi = l_pi + (
                         -jnp.sum(target_d * jnn.log_softmax(logits))
@@ -1006,8 +1898,6 @@ def main():
                             pred_reward - reward_seq_k[d],
                         )
                         if d == DECISION_DEPTH - 1:
-                            # End of real step k → half-grad before stepping
-                            # into real step k+1.
                             latent = 0.5 * latent + 0.5 * lax.stop_gradient(latent)
 
             total = (
@@ -1048,15 +1938,88 @@ def main():
     samplecounts = 0
     best_global_return = -float("inf")
     best_global_act_seq: list | None = None
-    # Replay buffer; lazy-initialised on episode 0 once we know the
-    # trajectory pytree shape from the first rollout. ``_resume_pending``
-    # tells the loop to overwrite the buffer's leaves from the checkpoint
-    # path on the first iteration after init.
     replay_buffer = None
     _resume_pending = bool(
         args.replay_checkpoint_path
         and os.path.exists(args.replay_checkpoint_path)
     )
+
+    # ---------------- Stage G pre-training reward calibration ----------------
+    # Mirrors ppo.py: ``--calibrate-steps`` un-trained rollouts measure
+    # ``mean_abs(symlog(reward))`` per channel and rescale
+    # ``reward_weights`` by the inverse so each weighted channel
+    # contributes on a comparable scale. cosine_sim is excluded (already
+    # bounded). Skipping the block leaves the raw lambdas in place.
+    if args.calibrate_steps > 0:
+        print(
+            f"\nPre-training scale calibration: {args.calibrate_steps} rollouts "
+            "(measuring |symlog(reward)| per channel under the initial policy)",
+            flush=True,
+        )
+        abs_sum = np.zeros((NUM_REWARDS,), dtype=np.float32)
+        cal_pin_rules = jnp.asarray(args.pin_rules_to_exact, dtype=jnp.bool_)
+        for step_idx in range(args.calibrate_steps):
+            cal_key, key = jrand.split(key)
+            cal_eval_key, cal_rollout_key = jrand.split(cal_key)
+            cal_rollout_keys = jrand.split(cal_rollout_key, num_envs)
+            cal_eval_samples = generate_eval_samples(
+                env, cal_eval_key, args.num_eval_samples,
+            )
+            cal_env = eqx.tree_at(
+                lambda e: e.eval_args_samples, env, cal_eval_samples,
+            )
+            cal_vfeat = _episode_vertex_features(
+                args,
+                closed_jaxpr.jaxpr,
+                tuple(closed_jaxpr.literals),
+                tuple(xs),
+                eval_samples=cal_eval_samples,
+                argnums=tuple(argnums),
+            )
+            cal_env_states = reset_envs(cal_env)
+            cal_uniform_pref = jnp.broadcast_to(
+                jnp.full((NUM_REWARDS,), 1.0 / NUM_REWARDS, dtype=jnp.float32),
+                (num_envs, NUM_REWARDS),
+            )
+            _, cal_traj = rollout_fn(
+                agent,
+                jnp.asarray(args.temperature, dtype=jnp.float32),
+                cal_env,
+                cal_env_states,
+                cal_rollout_keys,
+                cal_uniform_pref,
+                cal_vfeat,
+                cal_pin_rules,
+            )
+            sl_per_step = _symlog_rewards(cal_traj.reward_vec)
+            mean_abs = np.asarray(jnp.mean(jnp.abs(sl_per_step), axis=(0, 1)))
+            abs_sum = abs_sum + mean_abs
+            print(
+                f"  scale cal step {step_idx:3d}/{args.calibrate_steps}  "
+                + "  ".join(
+                    f"{REWARD_NAMES[i]}={mean_abs[i]:.2e}"
+                    for i in range(NUM_REWARDS)
+                    if mean_abs[i] > 0.0 or reward_weights_np[i] != 0.0
+                ),
+                flush=True,
+            )
+        mean_abs_final = abs_sum / args.calibrate_steps
+        reward_scales_np = np.where(
+            _NO_SYMLOG_MASK_NP, 1.0, 1.0 / (mean_abs_final + 1e-3)
+        ).astype(np.float32)
+        reward_weights_np = (
+            reward_weights_np * reward_scales_np
+        ).astype(np.float32)
+        reward_weights = jnp.asarray(reward_weights_np, dtype=jnp.float32)
+        print(
+            "calibrated reward_weights: "
+            + ", ".join(
+                f"{REWARD_NAMES[i]}={reward_weights_np[i]:+.3g}"
+                for i in range(NUM_REWARDS)
+                if reward_weights_np[i] != 0.0
+            ),
+            flush=True,
+        )
 
     # ---------------- Training loop ----------------
     for ep in range(args.episodes):
@@ -1065,11 +2028,42 @@ def main():
         rollout_key, ep_key = jrand.split(ep_key)
         rollout_keys = jrand.split(rollout_key, num_envs)
 
+        # Curriculum stage resolution
+        if curriculum_stages:
+            current_stage_name = _current_stage_at(curriculum_stages, ep)
+            current_stage_idx = _current_stage_index(curriculum_stages, ep)
+            stage_pin_rules = jnp.asarray(
+                _pin_rules_for_variant(current_stage_name), dtype=jnp.bool_,
+            )
+            if ep == 0 or (
+                ep > 0
+                and _current_stage_at(curriculum_stages, ep - 1)
+                != current_stage_name
+            ):
+                print(
+                    f"[ep {ep}] curriculum stage → {current_stage_name}  "
+                    f"(pin_rules={bool(stage_pin_rules)})"
+                )
+        else:
+            stage_pin_rules = jnp.asarray(
+                args.pin_rules_to_exact, dtype=jnp.bool_,
+            )
+
         if args.num_eval_samples > 0:
             eval_samples = generate_eval_samples(env, ep_eval_key, args.num_eval_samples)
             env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
         else:
+            eval_samples = None
             env_episode = env
+
+        vertex_features = _episode_vertex_features(
+            args,
+            closed_jaxpr.jaxpr,
+            tuple(closed_jaxpr.literals),
+            tuple(xs),
+            eval_samples=eval_samples,
+            argnums=tuple(argnums),
+        )
 
         env_states = reset_envs(env_episode)
         progress = ep / max(args.episodes - 1, 1)
@@ -1081,11 +2075,6 @@ def main():
             dtype=jnp.float32,
         )
 
-        # Per-env preference vectors. When --preference-conditioned is
-        # off, all envs see the all-zero preference (treated as "no
-        # conditioning"); the trained pref_proj column for that pseudo-w
-        # gets gradient signal of zero, so the model behaves like the
-        # unconditioned baseline.
         pref_key, ep_key = jrand.split(ep_key)
         if args.preference_conditioned:
             preferences = sample_preferences(
@@ -1097,13 +2086,29 @@ def main():
 
         _, fresh_traj = rollout_fn(
             agent, temperature, env_episode, env_states, rollout_keys,
-            preferences,
+            preferences, vertex_features, stage_pin_rules,
         )
 
-        # Replay buffer: lazy init on episode 0; sample-and-mix from
-        # --replay-warmup onward. Fresh trajectories are added at the end
-        # of the episode so we never train on the rollout that just
-        # produced them.
+        # ---------------- Lagrangian augmentation of scalar reward ----------------
+        # Per-step augmentation: for each constraint i, add
+        # ``-lambda_i * max(0, sign_i * (threshold_i - reward_vec[idx_i]))``
+        # to the scalar reward used for the value target. Mirrors ppo.py.
+        if constraint_specs:
+            r = fresh_traj.reward_vec  # (E, T, NUM_REWARDS)
+            # Per-constraint violation: positive when reward is on the wrong
+            # side of the threshold.
+            picked = r[..., constraint_indices]  # (E, T, C)
+            viol = jnn.relu(
+                constraint_signs * (constraint_thresholds - picked)
+            )  # (E, T, C)
+            augment = -jnp.sum(multipliers[None, None, :] * viol, axis=-1)
+            scalar_with_lag = fresh_traj.scalar_reward + augment
+            train_scalar = scalar_with_lag
+        else:
+            viol = None
+            train_scalar = fresh_traj.scalar_reward
+
+        # ---------------- Replay (lazy init, sample-and-mix) ----------------
         if args.replay_buffer_size > 0 and replay_buffer is None:
             replay_buffer = init_replay_buffer(
                 jax.tree_util.tree_map(lambda x: x[0], fresh_traj),
@@ -1157,14 +2162,28 @@ def main():
         else:
             train_traj = fresh_traj
 
-        # Per-real-step value target = discounted MC return. Computed on
-        # the *training* trajectory (which may include replay samples).
+        if constraint_specs:
+            # Re-augment the train scalar in case replay mixed in stored
+            # trajectories whose scalar_reward predates the current
+            # multipliers — keep it simple and recompute over train_traj's
+            # full reward_vec.
+            r_train = train_traj.reward_vec
+            picked_train = r_train[..., constraint_indices]
+            viol_train = jnn.relu(
+                constraint_signs * (constraint_thresholds - picked_train)
+            )
+            augment_train = -jnp.sum(
+                multipliers[None, None, :] * viol_train, axis=-1,
+            )
+            train_scalar_t = train_traj.scalar_reward + augment_train
+        else:
+            train_scalar_t = train_traj.scalar_reward
+
         discounted = jax.vmap(
             lambda r: _discounted_returns(r, args.discount)
-        )(train_traj.scalar_reward)
+        )(train_scalar_t)
         target_values = discounted
 
-        # Build (E, num_windows, U+1, ...) windows.
         windows = []
         for i in range(rollout_length - args.unroll_steps):
             sl = lambda x: x[:, i : i + args.unroll_steps + 1]
@@ -1175,7 +2194,7 @@ def main():
                     vertex_idx=sl(train_traj.vertex_idx),
                     pair_seq=sl(train_traj.pair_seq),
                     factor_seq=sl(train_traj.factor_seq),
-                    scalar_reward=sl(train_traj.scalar_reward),
+                    scalar_reward=sl(train_scalar_t),
                     target_value=sl(target_values),
                     mcts_visits=sl(train_traj.mcts_visits),
                     preference=sl(train_traj.preference),
@@ -1199,10 +2218,13 @@ def main():
             )
         p_loss, v_loss, r_loss = (float(x) for x in last_parts)
 
-        # Add the fresh trajectories to the buffer *after* training so the
-        # current episode never samples from itself. Priorities are the
-        # shifted-positive episode return — high-return trajectories get
-        # re-sampled more often when ``--replay-priority-alpha > 0``.
+        # ---------------- Lagrangian dual ascent ----------------
+        if constraint_specs:
+            mean_viol = jnp.mean(viol, axis=(0, 1))  # (C,)
+            multipliers = jnp.maximum(
+                multipliers + args.lagrangian_lr * mean_viol, 0.0,
+            )
+
         if args.replay_buffer_size > 0 and replay_buffer is not None:
             traj_priorities = _compute_traj_priorities(fresh_traj, reward_weights)
             replay_buffer = replay_add_batch(
@@ -1216,9 +2238,8 @@ def main():
                     replay_buffer, args.replay_checkpoint_path,
                 )
 
-        # Per-env total reward for logging — uses fresh rollout, not mix.
-        episode_reward_vec = jnp.sum(fresh_traj.reward_vec, axis=1)         # (E, NR)
-        episode_total = jnp.sum(episode_reward_vec * reward_weights, axis=-1)  # (E,)
+        episode_reward_vec = jnp.sum(fresh_traj.reward_vec, axis=1)
+        episode_total = jnp.sum(episode_reward_vec * reward_weights, axis=-1)
 
         max_idx = int(jnp.argmax(episode_total))
         best_reward = float(episode_total[max_idx])
@@ -1245,6 +2266,14 @@ def main():
         }
         for j, name in enumerate(REWARD_NAMES):
             log_dict[f"mean_{name}"] = float(jnp.mean(episode_reward_vec[:, j]))
+        if constraint_specs:
+            lam_np = np.asarray(multipliers)
+            viol_np = np.asarray(jnp.mean(viol, axis=(0, 1)))
+            for j, (idx, t, sign) in enumerate(constraint_specs):
+                op_str = ">=" if sign > 0 else "<="
+                name = f"{REWARD_NAMES[idx]}{op_str}{t:g}"
+                log_dict[f"lagrangian/{name}_lambda"] = float(lam_np[j])
+                log_dict[f"lagrangian/{name}_violation"] = float(viol_np[j])
         wandb.log(log_dict)
 
         pbar.update(1)
