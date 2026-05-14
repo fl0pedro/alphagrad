@@ -134,72 +134,27 @@ def _extend_argparser(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return p
 
 
-def _maybe_reexec_outside_uv() -> None:
-    """Re-exec via ``.venv/bin/python`` if launched under ``uv run``.
+def _disable_ray_uv_autodetect() -> None:
+    """Stop Ray 2.55+ from wrapping workers in ``uv run``.
 
-    Ray 2.55+ auto-detects uv-managed venvs and, when spawning worker
-    subprocesses, tries to recreate the venv by invoking ``uv venv`` +
-    ``uv sync`` inside Ray's runtime_resources working dir. That fresh
-    venv installs only what's in ``pyproject.toml`` + the uv lock, which
-    in this repo doesn't include ``ray`` (we add it imperatively in
-    ``sync_pgi15.sh`` with ``uv pip install``). The result is workers
-    that can't ``import ray`` and the actor immediately fails to spawn.
+    When the driver is launched via ``uv run``, Ray detects the
+    uv-managed venv (it reads ``uv = X.Y.Z`` from ``.venv/pyvenv.cfg``)
+    and switches to its ``uv_runtime_env_hook``, which sets every
+    worker's ``py_executable`` to ``uv run python ...``. Workers then
+    invoke uv, which tries to re-sync the venv from ``pyproject.toml``
+    + ``uv.lock``. Those don't list ``ray`` (we install it imperatively
+    in ``sync_pgi15.sh`` via ``uv pip install``), so the recreated venv
+    is missing ``ray`` and every actor fails immediately with
+    ``ModuleNotFoundError: No module named 'ray'``.
 
-    The reliable workaround is to launch the driver via the venv's
-    python directly (no uv shell). To keep the user-facing invocation
-    unchanged (``uv run alphagrad/src/alphagrad/approx/mu0_ray.py ...``
-    keeps working), this helper detects ``UV_*`` env markers and
-    ``os.execve``-s into the venv python with those markers cleared.
-
-    Idempotent: a sentinel env var prevents an infinite re-exec loop.
+    Ray documents the disable knob as ``RAY_ENABLE_UV_RUN_RUNTIME_ENV``
+    (see ``ray._private.ray_constants:RAY_ENABLE_UV_RUN_RUNTIME_ENV``).
+    Setting it to a falsy value here, *before* ``import ray``, makes
+    Ray fall back to its normal worker spawn — workers use
+    ``sys.executable`` (the venv's python) directly, which already has
+    ``ray`` installed.
     """
-    if os.environ.get("_MU0_RAY_REEXEC_DONE"):
-        return
-
-    venv = os.environ.get("VIRTUAL_ENV")
-    if not venv:
-        return  # No venv set — user is on their own.
-    venv_python = os.path.join(venv, "bin", "python")
-    if not os.path.exists(venv_python):
-        return
-
-    # Re-exec with a *minimal* env so Ray 2.55+ doesn't auto-detect a
-    # uv-managed venv (and therefore doesn't package the project as a
-    # runtime_env zip, which the workers can't unpack into a working
-    # venv because ray was installed imperatively, not via the lockfile).
-    #
-    # Empirically the working baseline is a fresh, non-interactive ssh
-    # invocation: it has no UV_*, no VIRTUAL_ENV, no PYTHONHOME, no
-    # PYTHONPATH — just PATH, HOME, a couple of locale vars, and basic
-    # SSH_* / TERM. Match that footprint by allow-listing the env vars
-    # we keep.
-    keep_keys = {
-        "HOME", "USER", "LOGNAME", "SHELL",
-        "LANG", "LC_ALL", "LC_CTYPE",
-        "TERM", "TMPDIR",
-        # wandb config / cred locations are nice to keep so the user's
-        # `wandb login` continues to work.
-        "WANDB_API_KEY", "WANDB_BASE_URL", "WANDB_MODE",
-        "WANDB_DIR", "WANDB_CONFIG_DIR", "WANDB_CACHE_DIR",
-        # Honour user-set CUDA_VISIBLE_DEVICES for the driver process;
-        # Ray re-sets it per actor anyway.
-        "CUDA_VISIBLE_DEVICES",
-    }
-    new_env = {k: v for k, v in os.environ.items() if k in keep_keys}
-    # PATH is *not* in keep_keys because under ``uv run`` the venv's bin
-    # is prepended to PATH; Ray 2.55+ scans PATH for venv bins and uses
-    # the presence of one to trigger auto-runtime_env packaging. Reset to
-    # a system-only PATH so Ray doesn't see ``.venv/bin``. The driver's
-    # own python invocations use sys.executable (absolute path), so
-    # losing PATH doesn't affect us.
-    new_env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    new_env["_MU0_RAY_REEXEC_DONE"] = "1"
-    print(
-        f"[mu0_ray] re-exec via {venv_python} with minimal env "
-        "(prevents Ray 2.55+ from packaging the project as a runtime_env)",
-        flush=True,
-    )
-    os.execve(venv_python, [venv_python] + sys.argv, new_env)
+    os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
 
 
 def _assert_jax_free() -> None:
@@ -510,7 +465,7 @@ def _run_one_variant(args, variant: str) -> None:
 
 
 def main() -> int:
-    _maybe_reexec_outside_uv()
+    _disable_ray_uv_autodetect()
 
     p = make_argparser()
     p = _extend_argparser(p)
@@ -524,31 +479,7 @@ def main() -> int:
     if args.ray_address:
         init_kwargs["address"] = args.ray_address
     os.environ.setdefault("RAY_DISABLE_IMPORT_WARNING", "1")
-
-    # Ray 2.55+ auto-packages the cwd as a runtime_env zip when it detects
-    # a project marker (pyproject.toml, .venv, editable installs). That
-    # zip is then unpacked in each worker's runtime_resources dir, which
-    # uv treats as a brand-new project and tries to recreate the venv —
-    # but ray was installed imperatively (not in the lockfile), so the
-    # recreated venv lacks ray and workers crash with ModuleNotFoundError.
-    #
-    # The reliable workaround is to chdir to a directory without project
-    # markers (here: a fresh /tmp dir) just before ray.init. Workers will
-    # boot in clean working dirs, find ``alphagrad`` etc. via the venv's
-    # editable-install egg-links on sys.path, and use the venv's ray
-    # naturally via sys.executable.
-    #
-    # The driver chdir's back to ``project_cwd`` immediately after init
-    # so wandb output / replay checkpoints land in the user's project
-    # dir, not /tmp.
-    import tempfile
-    project_cwd = os.getcwd()
-    ray_neutral_cwd = tempfile.mkdtemp(prefix="mu0_ray_init_")
-    os.chdir(ray_neutral_cwd)
-    try:
-        ray.init(**init_kwargs, ignore_reinit_error=True)
-    finally:
-        os.chdir(project_cwd)
+    ray.init(**init_kwargs, ignore_reinit_error=True)
 
     sweep = args.variant_sweep.strip()
     if sweep:
