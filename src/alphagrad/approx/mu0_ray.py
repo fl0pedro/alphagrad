@@ -449,13 +449,51 @@ def main() -> int:
 
     _assert_jax_free()
 
+    # ---- Ray init ----------------------------------------------------------
+    # Two things go wrong without the explicit setup below when this driver
+    # is launched via ``uv run`` from a project that has editable installs
+    # (alphagrad, graphax) in the active venv:
+    #
+    #   1. Ray auto-packages the working directory because it detects
+    #      editable installs, ships a runtime_env zip to each worker, and
+    #      the worker process re-runs ``uv sync`` in a fresh venv that
+    #      doesn't have ``ray`` (because ``ray`` is in pyproject's deps
+    #      only via our imperative ``uv pip install ray`` in
+    #      ``sync_pgi15.sh`` — uv-lock-driven sync doesn't see it).
+    #   2. ``uv run`` sets ``VIRTUAL_ENV`` to an absolute path but the
+    #      worker subprocesses are spawned with a different cwd, so uv
+    #      complains "VIRTUAL_ENV=... does not match the project env path
+    #      `.venv`" and falls back to a different env that lacks ray.
+    #
+    # Fix: explicit empty ``runtime_env`` to disable the auto-packaging,
+    # and clear ``VIRTUAL_ENV`` / ``UV_PROJECT_ENVIRONMENT`` from the
+    # worker env so uv stops trying to be clever. Workers inherit
+    # ``sys.executable`` from the driver, which is already the venv's
+    # python — they'll find ray on its site-packages naturally.
     import ray
     init_kwargs = {}
     if args.ray_address:
         init_kwargs["address"] = args.ray_address
-    # Disable Ray's automatic dashboard / logging-deduplication noise.
     os.environ.setdefault("RAY_DISABLE_IMPORT_WARNING", "1")
-    ray.init(**init_kwargs, ignore_reinit_error=True)
+    # Keep workers from inheriting the uv-shim-confusing env vars. Setting
+    # the value to an empty string in runtime_env's env_vars clears the var
+    # in the worker process (Ray's documented behaviour for env_vars).
+    worker_env_vars = {
+        "VIRTUAL_ENV": "",
+        "UV_PROJECT_ENVIRONMENT": "",
+        # Make sure the worker python doesn't accidentally use a uv shim.
+        # Ray's default Python search uses sys.executable, which already
+        # points at the venv's python; we just remove the path-prepended
+        # uv shim if any.
+    }
+    ray.init(
+        **init_kwargs,
+        ignore_reinit_error=True,
+        # Empty runtime_env disables auto-detection of editable installs
+        # → no working_dir packaging → workers use the existing venv's
+        # site-packages directly.
+        runtime_env={"env_vars": worker_env_vars},
+    )
 
     sweep = args.variant_sweep.strip()
     if sweep:
