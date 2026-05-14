@@ -175,7 +175,6 @@ def _maybe_reexec_outside_uv() -> None:
     # we keep.
     keep_keys = {
         "HOME", "USER", "LOGNAME", "SHELL",
-        "PATH",
         "LANG", "LC_ALL", "LC_CTYPE",
         "TERM", "TMPDIR",
         # wandb config / cred locations are nice to keep so the user's
@@ -187,6 +186,13 @@ def _maybe_reexec_outside_uv() -> None:
         "CUDA_VISIBLE_DEVICES",
     }
     new_env = {k: v for k, v in os.environ.items() if k in keep_keys}
+    # PATH is *not* in keep_keys because under ``uv run`` the venv's bin
+    # is prepended to PATH; Ray 2.55+ scans PATH for venv bins and uses
+    # the presence of one to trigger auto-runtime_env packaging. Reset to
+    # a system-only PATH so Ray doesn't see ``.venv/bin``. The driver's
+    # own python invocations use sys.executable (absolute path), so
+    # losing PATH doesn't affect us.
+    new_env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     new_env["_MU0_RAY_REEXEC_DONE"] = "1"
     print(
         f"[mu0_ray] re-exec via {venv_python} with minimal env "
