@@ -5832,7 +5832,36 @@ def main():
     else:
         micro_intro_stage = 0  # unused outside curriculum runs
 
+    # JAX profiler hook. ``ALPHAGRAD_JAX_TRACE_DIR=/path`` enables a
+    # per-episode trace: starts on the episode index given by
+    # ``ALPHAGRAD_JAX_TRACE_EP`` (default 2 — first ep after the cold
+    # JIT compile so the trace doesn't drown in compile noise) and stops
+    # on the next episode boundary. Output is a TensorBoard-compatible
+    # ``plugins/profile/.../`` tree the user opens in
+    # ``tensorboard --logdir`` or via Perfetto (open
+    # ``trace.json.gz`` directly).
+    _jax_trace_dir = os.environ.get("ALPHAGRAD_JAX_TRACE_DIR", "")
+    try:
+        _jax_trace_ep = int(os.environ.get("ALPHAGRAD_JAX_TRACE_EP", "2"))
+    except ValueError:
+        _jax_trace_ep = 2
+    _jax_trace_active = False
+
     for ep in range(args.episodes):
+        if _jax_trace_dir and ep == _jax_trace_ep and not _jax_trace_active:
+            tqdm.write(
+                f"[profiler] jax.profiler.start_trace -> {_jax_trace_dir} (ep={ep})",
+                file=sys.stderr,
+            )
+            jax.profiler.start_trace(_jax_trace_dir)
+            _jax_trace_active = True
+        elif _jax_trace_active and ep == _jax_trace_ep + 1:
+            jax.profiler.stop_trace()
+            _jax_trace_active = False
+            tqdm.write(
+                f"[profiler] jax.profiler.stop_trace (after ep={ep - 1})",
+                file=sys.stderr,
+            )
         ep_key, key = jrand.split(key)
         ep_eval_key, ep_key = jrand.split(ep_key)
         if args.preference_conditioned:
@@ -6003,6 +6032,18 @@ def main():
             )
 
     pbar.close()
+
+    # Safe stop for the profiler in case the training loop ended before
+    # the (trace_ep + 1) boundary (e.g. ``--episodes 3`` with
+    # ``ALPHAGRAD_JAX_TRACE_EP=2``). Without this, JAX leaks an open
+    # tracing session and the dump never lands on disk.
+    if _jax_trace_active:
+        jax.profiler.stop_trace()
+        _jax_trace_active = False
+        tqdm.write(
+            "[profiler] jax.profiler.stop_trace (post-loop safe-stop)",
+            file=sys.stderr,
+        )
 
     # ------------------------------------------------------------------
     # Stage G: few-shot calibration
