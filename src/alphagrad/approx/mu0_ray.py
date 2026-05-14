@@ -164,16 +164,29 @@ def _maybe_reexec_outside_uv() -> None:
         return
 
     uv_markers = [k for k in os.environ if k.startswith("UV_")]
-    # If neither uv markers nor a non-venv python interpreter, no re-exec
-    # is needed — we're already running cleanly.
-    if not uv_markers and os.path.realpath(sys.executable) == os.path.realpath(venv_python):
-        return
+    same_python = os.path.realpath(sys.executable) == os.path.realpath(venv_python)
+    # If we're already on the venv python AND there are no uv markers AND
+    # VIRTUAL_ENV isn't set (which Ray 2.55+ would also use to auto-detect
+    # the uv venv and trigger working_dir packaging), no re-exec needed.
+    if not uv_markers and same_python and not venv:
+        return  # unreachable in practice (venv was the truthy guard above)
 
-    new_env = {k: v for k, v in os.environ.items() if not k.startswith("UV_")}
+    # Strip every env var that Ray's auto-detection looks at. The venv's
+    # python finds its own site-packages via .venv/bin/.../pyvenv.cfg, so
+    # we don't actually need VIRTUAL_ENV for python to work — but Ray sees
+    # VIRTUAL_ENV and uses it to package the project as a runtime_env zip,
+    # which then fails when workers try to recreate the venv. UV_* markers
+    # cause uv to print "VIRTUAL_ENV does not match project environment"
+    # in worker subprocesses and fall back to a new env without ray.
+    stripped_keys = ("VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT")
+    new_env = {
+        k: v for k, v in os.environ.items()
+        if not k.startswith("UV_") and k not in stripped_keys
+    }
     new_env["_MU0_RAY_REEXEC_DONE"] = "1"
     print(
-        f"[mu0_ray] re-exec via {venv_python} to bypass uv markers "
-        "(needed for Ray worker subprocess setup)",
+        f"[mu0_ray] re-exec via {venv_python} (stripping VIRTUAL_ENV + UV_* "
+        "so Ray's auto-detection doesn't package the project)",
         flush=True,
     )
     os.execve(venv_python, [venv_python] + sys.argv, new_env)
