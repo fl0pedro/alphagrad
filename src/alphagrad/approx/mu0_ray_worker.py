@@ -15,7 +15,7 @@ import jax.random as jrand
 import mctx
 import numpy as np
 import optax
-from jax.sharding import PositionalSharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from alphagrad.approx.common import (
     build_pair_valid_mask,
@@ -184,9 +184,12 @@ def _build_actor_state(
     opt_state = optimizer.init(eqx.filter(agent, eqx.is_inexact_array))
 
     if is_spmd:
-        sharding = PositionalSharding(jax.devices())
-        agent = jax.device_put(agent, sharding.replicate())
-        opt_state = jax.device_put(opt_state, sharding.replicate())
+        mesh = Mesh(np.array(jax.devices()), axis_names=("dev",))
+
+        replicated_sharding = NamedSharding(mesh, PartitionSpec())
+
+        agent = jax.device_put(agent, replicated_sharding)
+        opt_state = jax.device_put(opt_state, replicated_sharding)
 
     key, eval_key = jrand.split(key)
     eval_samples = generate_eval_samples(env, eval_key, args.num_eval_samples)
