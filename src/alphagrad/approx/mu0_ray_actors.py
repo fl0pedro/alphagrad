@@ -37,7 +37,7 @@ class LearnerActor:
     def train_step(self) -> dict:
         return self._impl.train_step()
 
-    def get_params_numpy(self) -> dict:
+    def get_params_numpy(self) -> list:
         return self._impl.get_params_numpy()
 
     def set_reward_weights(self, weights_np: np.ndarray) -> None:
@@ -61,7 +61,7 @@ class RolloutActor:
         from alphagrad.approx.mu0_ray_worker import RolloutWorker
         self._impl = RolloutWorker(args_dict, variant, actor_id)
 
-    def set_params_numpy(self, params_np: dict) -> None:
+    def set_params_numpy(self, params_np: list) -> None:
         return self._impl.set_params_numpy(params_np)
 
     def set_reward_weights(self, weights_np: np.ndarray) -> None:

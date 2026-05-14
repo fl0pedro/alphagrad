@@ -683,34 +683,39 @@ def _build_actor_state(args_dict: dict, variant: str, actor_seed: int) -> dict:
     }
 
 
-def _agent_to_numpy(agent: MuZeroAgent) -> dict:
-    """Extract the array-valued leaves of ``agent`` as a numpy nested dict.
+def _agent_to_numpy(agent: MuZeroAgent) -> list:
+    """Extract the array-valued leaves of ``agent`` as a flat list of numpy arrays.
 
     Used by both actors to ship params across the Ray boundary without
-    sending JAX device arrays directly. The structure key is the leaf's
-    ``str(jax.tree_util.keystr(path))`` so the receiver can reconstruct
-    with the same key paths.
+    sending JAX device arrays or eqx's ``_Missing`` sentinel (which
+    doesn't survive Ray's pickle/unflatten cycle). The receiver
+    reconstructs the pytree by flattening its own freshly-built
+    skeleton agent and zipping our leaves in.
     """
-    leaves, treedef = jax.tree_util.tree_flatten(
-        eqx.filter(agent, eqx.is_inexact_array),
-    )
-    return {
-        "leaves": [np.asarray(x) for x in leaves],
-        "treedef": treedef,
-    }
+    params = eqx.filter(agent, eqx.is_inexact_array)
+    leaves = jax.tree_util.tree_leaves(params)
+    return [np.asarray(x) for x in leaves]
 
 
-def _agent_from_numpy(skeleton: MuZeroAgent, params_np: dict) -> MuZeroAgent:
+def _agent_from_numpy(skeleton: MuZeroAgent, leaves_np: list) -> MuZeroAgent:
     """Inverse of :func:`_agent_to_numpy`.
 
-    The skeleton must be a freshly-constructed agent with the same pytree
-    structure as the one whose params were serialised — the leaves are
-    overwritten, the static side is taken from the skeleton.
+    Uses the skeleton's own treedef to unflatten the incoming leaves,
+    then merges with the skeleton's static side via ``eqx.combine``.
+    Both sender and receiver must construct their skeleton with
+    identical args (and seed when the structure depends on it) so the
+    leaf order / count match.
     """
-    new_leaves = [jnp.asarray(x) for x in params_np["leaves"]]
-    new_params = jax.tree_util.tree_unflatten(params_np["treedef"], new_leaves)
-    # eqx.combine merges the new arrays with the static side of the
-    # skeleton (which we keep, since it's not array-valued).
+    params_skel = eqx.filter(skeleton, eqx.is_inexact_array)
+    leaves_skel, treedef = jax.tree_util.tree_flatten(params_skel)
+    if len(leaves_skel) != len(leaves_np):
+        raise ValueError(
+            f"param-leaf count mismatch: skeleton has {len(leaves_skel)}, "
+            f"sender shipped {len(leaves_np)}. Did the two actors build "
+            "their agent with different args?"
+        )
+    leaves_jax = [jnp.asarray(x) for x in leaves_np]
+    new_params = jax.tree_util.tree_unflatten(treedef, leaves_jax)
     return eqx.combine(new_params, skeleton)
 
 
@@ -878,7 +883,7 @@ class LearnerWorker:
             "train_step": self.train_step_counter,
         }
 
-    def get_params_numpy(self) -> dict:
+    def get_params_numpy(self) -> list:
         return _agent_to_numpy(self.state["agent"])
 
     def set_reward_weights(self, weights_np: np.ndarray) -> None:
@@ -928,7 +933,7 @@ class RolloutWorker:
         self._key = self.state["key"]
         self._pin_rules_default = _pin_rules_for_variant(variant)
 
-    def set_params_numpy(self, params_np: dict) -> None:
+    def set_params_numpy(self, params_np: list) -> None:
         new_agent = _agent_from_numpy(self.state["agent"], params_np)
         self.state["agent"] = new_agent
 
