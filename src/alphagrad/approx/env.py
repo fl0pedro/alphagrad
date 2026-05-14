@@ -1175,9 +1175,22 @@ def _callback(
 
     # XLA cost analysis — flops + bytes accessed. Falls back to 0 when the
     # backend doesn't expose them (CPU sometimes returns an empty dict).
-    cost_analysis = compiled_approx.cost_analysis() or {}
-    flops = float(cost_analysis.get("flops", 0))
-    bytes_accessed = float(cost_analysis.get("bytes accessed", 0))
+    # ``ALPHAGRAD_SKIP_COST_ANALYSIS=1`` skips the call entirely as a
+    # memory-leak probe: ``Compiled.cost_analysis()`` triggers an
+    # ``HloCostAnalysis`` C++ pass, and per-call C++ state held there may
+    # not be released even when the Python wrapper returns. Empirical
+    # cost of one analysis ≈ 9 MB × 384 io_callbacks/ep ≈ 3.5 GB/ep —
+    # the exact magnitude of our remaining leak after the disk-cache fix.
+    # When skipped, ``flops`` and ``bytes_accessed`` reward channels read
+    # zero; ``muls_adds_fmas`` (the actual compute target) is unaffected
+    # since it's computed by graphax's symbolic counter above.
+    if os.environ.get("ALPHAGRAD_SKIP_COST_ANALYSIS", "0") == "1":
+        flops = 0.0
+        bytes_accessed = 0.0
+    else:
+        cost_analysis = compiled_approx.cost_analysis() or {}
+        flops = float(cost_analysis.get("flops", 0))
+        bytes_accessed = float(cost_analysis.get("bytes accessed", 0))
 
     # ------------------------------------------------------------------
     # Execution loop — runs once for peak_memory + quality, or 10x when
