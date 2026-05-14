@@ -3829,6 +3829,24 @@ def _setup_jax_compile_cache() -> None:
 def main():
     args = make_argparser().parse_args()
 
+    # ``ALPHAGRAD_TRACEMALLOC=1`` — start the Python allocator tracker
+    # before any model code runs. Per-episode snapshots are diffed
+    # against the previous one (see host_log) to identify Python lines
+    # that allocate the most bytes / episode. Won't see C++ leaks
+    # (XLA, jax_memory_monitor's MemoryTracker, glibc malloc pool growth)
+    # but closes the loop on whether the leak has a Python ref-keeping
+    # side. Enabled here, before any imports finish, so the tracker is
+    # active for all subsequent allocations. ~5-10% overhead.
+    if os.environ.get("ALPHAGRAD_TRACEMALLOC", "0") == "1":
+        import tracemalloc
+
+        tracemalloc.start()
+        print(
+            "[experiment] tracemalloc started "
+            "(ALPHAGRAD_TRACEMALLOC=1)",
+            flush=True,
+        )
+
     # Apply the --variant preset onto args before anything else looks at
     # args.factors / args.max_rules / args.pin_rules_to_exact. `custom` is a
     # no-op; other variants overwrite those three flags. Explicit CLI values
@@ -5625,6 +5643,39 @@ def main():
             except Exception as _exc:
                 tqdm.write(
                     f"[mem ep={ep}] probe failed: {_exc!r}",
+                    file=sys.stderr,
+                )
+
+        # Per-episode tracemalloc diff. Top-K Python lines by allocated
+        # bytes since the previous snapshot. ``host_state["_tm_prev"]``
+        # caches the prior snapshot. With ALPHAGRAD_TRACEMALLOC=1 +
+        # ALPHAGRAD_DEBUG_MEM=1 together, both probes fire.
+        if os.environ.get("ALPHAGRAD_TRACEMALLOC", "0") == "1":
+            try:
+                import tracemalloc as _tm
+
+                _snap = _tm.take_snapshot()
+                _prev = host_state.get("_tm_prev")
+                if _prev is not None:
+                    _diff = _snap.compare_to(_prev, "lineno")
+                    _top = _diff[:10]
+                    _lines = []
+                    for s in _top:
+                        f = s.traceback[0]
+                        _lines.append(
+                            f"{f.filename.split('/')[-1]}:{f.lineno} "
+                            f"+{s.size_diff / 1024 / 1024:.1f}MB "
+                            f"+{s.count_diff} allocs"
+                        )
+                    tqdm.write(
+                        f"[tm ep={ep:3d}] top-10 Δalloc since last ep:\n  "
+                        + "\n  ".join(_lines),
+                        file=sys.stderr,
+                    )
+                host_state["_tm_prev"] = _snap
+            except Exception as _exc:
+                tqdm.write(
+                    f"[tm ep={ep}] probe failed: {_exc!r}",
                     file=sys.stderr,
                 )
 
