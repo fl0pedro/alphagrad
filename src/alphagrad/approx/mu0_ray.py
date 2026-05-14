@@ -514,7 +514,31 @@ def main() -> int:
     if args.ray_address:
         init_kwargs["address"] = args.ray_address
     os.environ.setdefault("RAY_DISABLE_IMPORT_WARNING", "1")
-    ray.init(**init_kwargs, ignore_reinit_error=True)
+
+    # Ray 2.55+ auto-packages the cwd as a runtime_env zip when it detects
+    # a project marker (pyproject.toml, .venv, editable installs). That
+    # zip is then unpacked in each worker's runtime_resources dir, which
+    # uv treats as a brand-new project and tries to recreate the venv —
+    # but ray was installed imperatively (not in the lockfile), so the
+    # recreated venv lacks ray and workers crash with ModuleNotFoundError.
+    #
+    # The reliable workaround is to chdir to a directory without project
+    # markers (here: a fresh /tmp dir) just before ray.init. Workers will
+    # boot in clean working dirs, find ``alphagrad`` etc. via the venv's
+    # editable-install egg-links on sys.path, and use the venv's ray
+    # naturally via sys.executable.
+    #
+    # The driver chdir's back to ``project_cwd`` immediately after init
+    # so wandb output / replay checkpoints land in the user's project
+    # dir, not /tmp.
+    import tempfile
+    project_cwd = os.getcwd()
+    ray_neutral_cwd = tempfile.mkdtemp(prefix="mu0_ray_init_")
+    os.chdir(ray_neutral_cwd)
+    try:
+        ray.init(**init_kwargs, ignore_reinit_error=True)
+    finally:
+        os.chdir(project_cwd)
 
     sweep = args.variant_sweep.strip()
     if sweep:
