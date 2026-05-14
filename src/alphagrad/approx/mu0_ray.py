@@ -163,30 +163,34 @@ def _maybe_reexec_outside_uv() -> None:
     if not os.path.exists(venv_python):
         return
 
-    uv_markers = [k for k in os.environ if k.startswith("UV_")]
-    same_python = os.path.realpath(sys.executable) == os.path.realpath(venv_python)
-    # If we're already on the venv python AND there are no uv markers AND
-    # VIRTUAL_ENV isn't set (which Ray 2.55+ would also use to auto-detect
-    # the uv venv and trigger working_dir packaging), no re-exec needed.
-    if not uv_markers and same_python and not venv:
-        return  # unreachable in practice (venv was the truthy guard above)
-
-    # Strip every env var that Ray's auto-detection looks at. The venv's
-    # python finds its own site-packages via .venv/bin/.../pyvenv.cfg, so
-    # we don't actually need VIRTUAL_ENV for python to work — but Ray sees
-    # VIRTUAL_ENV and uses it to package the project as a runtime_env zip,
-    # which then fails when workers try to recreate the venv. UV_* markers
-    # cause uv to print "VIRTUAL_ENV does not match project environment"
-    # in worker subprocesses and fall back to a new env without ray.
-    stripped_keys = ("VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT")
-    new_env = {
-        k: v for k, v in os.environ.items()
-        if not k.startswith("UV_") and k not in stripped_keys
+    # Re-exec with a *minimal* env so Ray 2.55+ doesn't auto-detect a
+    # uv-managed venv (and therefore doesn't package the project as a
+    # runtime_env zip, which the workers can't unpack into a working
+    # venv because ray was installed imperatively, not via the lockfile).
+    #
+    # Empirically the working baseline is a fresh, non-interactive ssh
+    # invocation: it has no UV_*, no VIRTUAL_ENV, no PYTHONHOME, no
+    # PYTHONPATH — just PATH, HOME, a couple of locale vars, and basic
+    # SSH_* / TERM. Match that footprint by allow-listing the env vars
+    # we keep.
+    keep_keys = {
+        "HOME", "USER", "LOGNAME", "SHELL",
+        "PATH",
+        "LANG", "LC_ALL", "LC_CTYPE",
+        "TERM", "TMPDIR",
+        # wandb config / cred locations are nice to keep so the user's
+        # `wandb login` continues to work.
+        "WANDB_API_KEY", "WANDB_BASE_URL", "WANDB_MODE",
+        "WANDB_DIR", "WANDB_CONFIG_DIR", "WANDB_CACHE_DIR",
+        # Honour user-set CUDA_VISIBLE_DEVICES for the driver process;
+        # Ray re-sets it per actor anyway.
+        "CUDA_VISIBLE_DEVICES",
     }
+    new_env = {k: v for k, v in os.environ.items() if k in keep_keys}
     new_env["_MU0_RAY_REEXEC_DONE"] = "1"
     print(
-        f"[mu0_ray] re-exec via {venv_python} (stripping VIRTUAL_ENV + UV_* "
-        "so Ray's auto-detection doesn't package the project)",
+        f"[mu0_ray] re-exec via {venv_python} with minimal env "
+        "(prevents Ray 2.55+ from packaging the project as a runtime_env)",
         flush=True,
     )
     os.execve(venv_python, [venv_python] + sys.argv, new_env)
