@@ -129,6 +129,13 @@ class CpuApproxPool:
         self._num_rewards = num_rewards
         self._cosine_sim_idx = cosine_sim_idx
         self._frob_residual_idx = frob_residual_idx
+        # Cached eval-samples ObjectRef. ``set_eval_samples`` does the
+        # ``ray.put`` once; ``evaluate`` then passes the ref in place of
+        # the per-call tuple, so Ray re-uses the deserialised value on
+        # each actor instead of re-serialising / re-shipping the same
+        # multi-MB payload on every io_callback. None means "no cached
+        # ref; pass through the per-call ``eval_samples`` argument."
+        self._eval_samples_ref = None
         # Telemetry counters — driver-side code can poll via ``stats()``.
         self._n_calls = 0
         self._n_timeouts = 0
@@ -215,6 +222,36 @@ class CpuApproxPool:
         t.start()
 
     # ------------------------------------------------------------------
+    # eval_samples object-store sharing
+    # ------------------------------------------------------------------
+    def set_eval_samples(self, eval_samples) -> None:
+        """``ray.put`` the eval_samples tuple once and cache the
+        ObjectRef.
+
+        After this, every ``evaluate`` call ships only the (tiny)
+        ObjectRef instead of re-serialising the same multi-MB tuple of
+        per-sample model inputs on every io_callback. Ray dedups by
+        ref-id on the actor side — the deserialised value lives in
+        each actor's object store cache after first deref.
+
+        Call once at SPMD-actor init (after ``generate_eval_samples``).
+        Subsequent training is amortised: with ``rollout_length=50 ×
+        num_envs=4 × 200 callbacks/ep`` and typical eval_samples size
+        ~2 MB, this is ~400 MB/ep of pure Ray-serialisation traffic
+        avoided. Setting to ``None`` re-enables the per-call passthrough
+        path.
+        """
+        import ray
+
+        if eval_samples is None:
+            with self._lock:
+                self._eval_samples_ref = None
+            return
+        ref = ray.put(tuple(eval_samples))
+        with self._lock:
+            self._eval_samples_ref = ref
+
+    # ------------------------------------------------------------------
     # Main dispatch — called from inside ``env.tokenize()``'s closure,
     # which is itself called from JAX's ``io_callback`` machinery on
     # the SPMD actor process.
@@ -256,11 +293,21 @@ class CpuApproxPool:
 
         future = None
         try:
+            # Prefer the cached ObjectRef when one is available — Ray
+            # sees ``ObjectRef`` and skips re-serialising the per-call
+            # ``eval_samples`` tuple (the actor reads the cached value
+            # from its local object store after the first fetch).
+            with self._lock:
+                samples_arg = self._eval_samples_ref
+            if samples_arg is None:
+                samples_arg = (
+                    tuple(eval_samples) if eval_samples is not None else None
+                )
             future = actor.evaluate.remote(
                 np.asarray(order_np),
                 np.asarray(specs_np),
                 int(step),
-                eval_samples=tuple(eval_samples) if eval_samples is not None else None,
+                eval_samples=samples_arg,
                 init=bool(init),
             )
             result = ray.get(future, timeout=self._timeout_s)
