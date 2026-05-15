@@ -688,12 +688,28 @@ class SPMDServerWorker:
         root_count = max(float(root_valid.sum()), 1.0)
         root_entropy = float((ent[..., 0] * root_valid).sum() / root_count)
 
+        # Per-channel raw rewards of the overall-best (highest weighted-sum)
+        # trajectory this episode. Distinct from ``best_per_reward`` —
+        # that one optimises each channel independently and may pick a
+        # different env per channel. ``best_overall_rewards`` is the
+        # cross-section "for the env that won the overall scalar".
+        best_overall_rewards = {
+            REWARD_NAMES[j]: float(r_per_env[best_idx, j])
+            for j in range(NUM_REWARDS)
+        }
+        best_overall_weighted = {
+            REWARD_NAMES[j]: float(weighted_per_env[best_idx, j])
+            for j in range(NUM_REWARDS)
+        }
+
         stats = {
             "best_return": float(per_env_tot[best_idx]),
             "mean_return": float(per_env_tot.mean()),
             "best_seq": _action_to_pylist(
                 v_np[best_idx], p_np[best_idx], f_np[best_idx], ftab,
             ),
+            "best_overall_rewards": best_overall_rewards,
+            "best_overall_weighted": best_overall_weighted,
             "per_reward_means": {
                 REWARD_NAMES[j]: float(r_vec_np[..., j].mean())
                 for j in range(NUM_REWARDS)
