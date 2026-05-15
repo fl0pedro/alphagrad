@@ -452,7 +452,13 @@ def _build_actor_state(
                 is_stop = p_seq == PAIR_STOP
                 has_stopped = jnp.cumsum(is_stop.astype(jnp.int32)) > 0
                 base_final = jnp.where(has_stopped[:, None], -1, _PAIR_TO_BASE[p_seq])
-                factor_final = jnp.where(has_stopped, 0, jnp.asarray(factor_table_np, dtype=jnp.int32)[f_seq])
+                # Use the already-jnp ``factor_table`` (built once in
+                # ``_build_factor_table`` above as ``jnp.array(..., int32)``)
+                # rather than re-converting ``factor_table_np`` each scan
+                # step. Identical semantics, ~5-8 s/episode saved at
+                # rollout_length=50, num_envs=4 (was profiling-survey
+                # finding #3 — safe).
+                factor_final = jnp.where(has_stopped, 0, factor_table[f_seq])
                 specs = jnp.concatenate([base_final, factor_final[:, None]], axis=-1).astype(jnp.int32)
                 
                 pad_len = MAX_RULES_PER_VERTEX - specs.shape[0]
