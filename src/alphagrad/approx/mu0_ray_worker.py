@@ -89,6 +89,8 @@ def _build_actor_state(
     actor_seed: int,
     is_spmd: bool = False,
     cpu_workers: list = None,
+    remote_pool: object = None,
+    remote_timeout_s: float = 60.0,
 ) -> dict:
     args = _args_from_dict(args_dict)
     _apply_variant_preset(args, variant)
@@ -234,6 +236,29 @@ def _build_actor_state(
     key, eval_key = jrand.split(key)
     eval_samples = generate_eval_samples(env, eval_key, args.num_eval_samples)
     env_with_samples = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
+
+    # Inject the CPU-approx Ray pool (if any) BEFORE building rollout_fn,
+    # because make_rollout_fn closes over env_with_samples and JIT-traces
+    # env.step() — which captures the Python object identity of the
+    # ``tokenize()`` closure. With the pool installed, tokenize() returns
+    # a closure that dispatches to Ray; without it, tokenize() returns
+    # the inline ``_callback`` path. We don't want to JIT a path and
+    # then change tokenize() later.
+    #
+    # ``_remote_pool`` rides in the env's tree_flatten aux_data (it's an
+    # opaque Python object — Ray actor handles + a deque), so
+    # round-tripping the pytree preserves it.
+    if remote_pool is not None:
+        children, aux_data = env_with_samples.tree_flatten()
+        # aux_data layout: (config, valid_vertices, num_envs,
+        #                   _remote_pool, _remote_timeout_s)
+        aux_data = (
+            aux_data[0], aux_data[1], aux_data[2],
+            remote_pool, float(remote_timeout_s),
+        )
+        env_with_samples = type(env_with_samples).tree_unflatten(
+            aux_data, children,
+        )
     vertex_features = _episode_vertex_features(
         args,
         closed_jaxpr.jaxpr,
@@ -568,10 +593,70 @@ def _build_actor_state(
 
 class SPMDServerWorker:
     def __init__(
-        self, args_dict: dict, variant: str, seed: int = 0, cpu_workers: list = None
+        self,
+        args_dict: dict,
+        variant: str,
+        seed: int = 0,
+        cpu_workers: list = None,
+        *,
+        callback_timeout_s: float = 60.0,
+        recycle_every: int = 50,
+        cpu_actor_options: dict | None = None,
+        starting_actor_id: int = 1000,
     ):
+        # Build the CPU-approx pool first (if any cpu_workers were
+        # provided) so we can hand it to ``_build_actor_state`` and have
+        # it baked into the env BEFORE rollout_fn JIT-traces. The pool
+        # itself is JAX-free; building it doesn't trigger any compile.
+        pool = None
+        self._pool = None
+        self._recycle_every = int(recycle_every) if recycle_every else 0
+        self._callback_timeout_s = float(callback_timeout_s)
+        self._episodes_since_recycle = 0
+        if cpu_workers:
+            from alphagrad.approx.cpu_approx_pool import CpuApproxPool
+            from alphagrad.approx.env import (
+                MAX_TOKENS as _MAX_TOKENS,
+                NUM_REWARDS as _NUM_REWARDS,
+                REWARD_INDEX as _REWARD_INDEX,
+            )
+            from alphagrad.approx.mu0_ray_actors import CPUApproximationActor
+
+            # Counter starts above the initial pool's IDs (driver gave
+            # 0..N-1) so log lines are visually distinguishable. We use
+            # a mutable single-element list so the closure can mutate
+            # it without ``nonlocal``.
+            _actor_counter = [int(starting_actor_id)]
+            _opts = dict(cpu_actor_options or {})
+            _args_dict = args_dict
+            _variant = variant
+
+            def _respawn_factory():
+                aid = _actor_counter[0]
+                _actor_counter[0] += 1
+                return CPUApproximationActor.options(**_opts).remote(
+                    _args_dict, _variant, aid,
+                )
+
+            pool = CpuApproxPool(
+                cpu_workers,
+                timeout_s=callback_timeout_s,
+                respawn_factory=_respawn_factory,
+                max_tokens=_MAX_TOKENS,
+                num_rewards=_NUM_REWARDS,
+                cosine_sim_idx=_REWARD_INDEX["cosine_sim"],
+                frob_residual_idx=_REWARD_INDEX["frob_residual"],
+            )
+            self._pool = pool
+
         self.state = _build_actor_state(
-            args_dict, variant, seed, is_spmd=True, cpu_workers=cpu_workers
+            args_dict,
+            variant,
+            seed,
+            is_spmd=True,
+            cpu_workers=cpu_workers,
+            remote_pool=pool,
+            remote_timeout_s=callback_timeout_s,
         )
         self.args = self.state["args"]
         self.variant = variant
@@ -835,7 +920,31 @@ class SPMDServerWorker:
                 "train_step": self.train_step_counter,
             }
         )
+
+        # Expose pool telemetry + maybe recycle. The pool is the
+        # only piece of state in this worker whose memory grows
+        # unboundedly with episode count (each actor accumulates
+        # ``cost_analysis()`` C++ state per call; ~9 MB × hundreds
+        # of calls ≈ GB-scale residual per ep). Recycle bounds it.
+        if self._pool is not None:
+            stats.update({f"pool/{k}": v for k, v in self._pool.stats().items()})
+            self._episodes_since_recycle += 1
+            if (
+                self._recycle_every > 0
+                and self._episodes_since_recycle >= self._recycle_every
+            ):
+                n_new = self._pool.recycle()
+                stats["pool/recycled"] = n_new
+                self._episodes_since_recycle = 0
+
         return stats
+
+    def get_pool_stats(self) -> dict:
+        """Driver-side polling hook for the CPU-approx pool. Empty
+        when no pool is attached."""
+        if self._pool is None:
+            return {}
+        return self._pool.stats()
 
     def reward_vec_means(self, rng_seed: int, num_rollouts: int) -> np.ndarray:
         sum_vec = np.zeros((NUM_REWARDS,), dtype=np.float32)
@@ -896,17 +1005,76 @@ class SPMDServerWorker:
 
 
 class CPUApproximationWorker:
+    """Real CPU-side approximation worker — wraps :class:`CpuApproximationServer`.
+
+    Was previously a stub returning ``{}``. The SPMDActor spawns one of
+    these per pool slot in :func:`alphagrad.approx.mu0_ray._run_one_variant`,
+    and the env's ``io_callback`` dispatches per-step ``(order, specs,
+    step)`` requests here via the :class:`CpuApproxPool` rather than
+    running ``jax.jit(jacve(...)).lower().compile()`` inline on the
+    GPU-owning SPMD process.
+
+    Each worker owns its own ``VertexEliminationEnv`` instance and
+    eval-samples bundle, built lazily on first ``evaluate`` so actor
+    spawn doesn't block on the (potentially expensive)
+    ``generate_eval_samples`` call.
+    """
+
     def __init__(self, args_dict: dict, variant: str, actor_id: int):
-        self.args = _args_from_dict(args_dict)
+        self.args_dict = args_dict
         self.variant = variant
         self.actor_id = actor_id
+        self._server = None  # lazy-init in ``_ensure_server``
+
+    def _ensure_server(self):
+        if self._server is None:
+            from alphagrad.approx.cpu_approx_worker import CpuApproximationServer
+            self._server = CpuApproximationServer.from_args_dict(
+                self.args_dict,
+                variant=self.variant,
+                seed=int(self.args_dict.get("seed", 0)) + self.actor_id,
+            )
+        return self._server
 
     def compile_approximations(self) -> dict:
-        time.sleep(1)
-        return {"status": "compiled"}
+        """Pre-warm the worker's compile cache.
 
-    def evaluate_graph(self, o_list, transforms, eval_samples):
-        return {}
+        Called once at startup by the driver — the first ``evaluate``
+        call will trigger an expensive XLA compile, so warm it eagerly
+        so the first real rollout doesn't pay that cost on the
+        critical path. Returns a small status dict.
+        """
+        srv = self._ensure_server()
+        return {"status": "ready", "actor_id": self.actor_id,
+                "valid_vertices": len(srv._env.valid_vertices)}
+
+    def evaluate(
+        self,
+        order,
+        sparsity_specs,
+        step,
+        eval_samples=None,
+        init: bool = False,
+    ):
+        """Run one ``_callback`` evaluation out-of-process.
+
+        Mirrors the signature ``env._callback`` is invoked with via
+        ``io_callback``. Returns ``(tokens, eqn_ids, reward)`` numpy
+        arrays. See :meth:`CpuApproximationServer.evaluate` for the
+        sentinel-on-error contract.
+        """
+        srv = self._ensure_server()
+        return srv.evaluate(
+            order, sparsity_specs, step,
+            eval_samples=eval_samples, init=init,
+        )
+
+    def reset_caches(self) -> dict:
+        srv = self._ensure_server()
+        return srv.reset_caches()
 
     def ready(self) -> bool:
+        # Don't force ``_ensure_server`` here — Ray uses ``ready()`` as
+        # a "did the actor's __init__ complete" probe, and we want
+        # that to return fast (~ms). Lazy init of the env is fine.
         return True

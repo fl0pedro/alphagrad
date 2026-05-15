@@ -4,7 +4,7 @@ import os
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Literal, NamedTuple, Sequence
+from typing import Any, Callable, Literal, NamedTuple, Sequence
 
 import jax
 import jax._src.core as core
@@ -1169,6 +1169,18 @@ class VertexEliminationEnv:
     axis_valid_static: Array | None = None
     num_envs: int | None = None
     eval_args_samples: tuple | None = None
+    # Optional remote-evaluation pool. When set (typically by
+    # ``mu0_ray_worker.SPMDServerWorker.init_server`` after spawning a
+    # bank of ``CPUApproximationActor``s), ``tokenize()`` returns a
+    # closure that dispatches ``(order, specs, step)`` requests to the
+    # pool via ``ray.get(future, timeout=_remote_timeout_s)`` instead
+    # of running ``jax.jit(jacve(...)).lower().compile()`` inline. The
+    # pool field is an opaque Python object (a
+    # :class:`alphagrad.approx.cpu_approx_pool.CpuApproxPool`), so it
+    # rides in ``tree_flatten``'s ``aux_data`` rather than as a JAX
+    # pytree child.
+    _remote_pool: Any = None
+    _remote_timeout_s: float = 60.0
 
     def __init__(
         self,
@@ -1180,11 +1192,15 @@ class VertexEliminationEnv:
         eval_args_samples: tuple | None = None,
         axis_state_static: Array | None = None,
         axis_valid_static: Array | None = None,
+        remote_pool: Any = None,
+        remote_timeout_s: float = 60.0,
     ):
         object.__setattr__(self, "config", config)
         object.__setattr__(self, "args", tuple(args))
         object.__setattr__(self, "consts", tuple(consts))
         object.__setattr__(self, "eval_args_samples", eval_args_samples)
+        object.__setattr__(self, "_remote_pool", remote_pool)
+        object.__setattr__(self, "_remote_timeout_s", float(remote_timeout_s))
 
         if num_envs is None:
             num_envs = jax.local_device_count()
@@ -1256,7 +1272,17 @@ class VertexEliminationEnv:
             self.args, self.consts, self.eval_args_samples,
             self.axis_state_static, self.axis_valid_static,
         )
-        aux_data = (self.config, self.valid_vertices, self.num_envs)
+        # ``_remote_pool`` is an opaque Python object (a CpuApproxPool
+        # instance, which itself holds Ray actor handles) — it can't
+        # round-trip through JAX's pytree machinery as a child. Stash
+        # it in aux_data alongside the other static fields. JAX will
+        # call ``tree_unflatten`` whenever the env is reconstructed
+        # inside a jit/vmap trace; we want the same pool handle to
+        # come out the other side.
+        aux_data = (
+            self.config, self.valid_vertices, self.num_envs,
+            self._remote_pool, self._remote_timeout_s,
+        )
         return children, aux_data
 
     @classmethod
@@ -1264,15 +1290,58 @@ class VertexEliminationEnv:
         args, consts, eval_args_samples, axis_state_static, axis_valid_static = (
             children
         )
-        config, valid_vertices, num_envs = aux_data
+        # Back-compat: aux_data tuples produced before the remote-pool
+        # fields were added are 3-tuples; new ones are 5-tuples.
+        if len(aux_data) == 3:
+            config, valid_vertices, num_envs = aux_data
+            remote_pool = None
+            remote_timeout_s = 60.0
+        else:
+            (
+                config, valid_vertices, num_envs,
+                remote_pool, remote_timeout_s,
+            ) = aux_data
         return cls(
             config, args, consts, valid_vertices, num_envs, eval_args_samples,
             axis_state_static=axis_state_static,
             axis_valid_static=axis_valid_static,
+            remote_pool=remote_pool,
+            remote_timeout_s=remote_timeout_s,
         )
 
     def tokenize(self, init: bool = False):
-        return partial(_callback, self.config, init=init)
+        """Build the host-side function passed into ``io_callback``.
+
+        If ``self._remote_pool`` is set, return a closure that
+        dispatches each call to the pool via ``ray.get(timeout=...)``;
+        on timeout / actor death the closure returns the standard
+        sentinel ``(zeros, -1e10 reward)`` tuple so the rollout
+        proceeds. Otherwise fall back to the inline ``_callback``
+        path (single-process, no Ray) for backward compatibility
+        with ``ppo.py`` / non-Ray callers.
+        """
+        if self._remote_pool is None:
+            return partial(_callback, self.config, init=init)
+
+        # The pool's ``evaluate`` signature is
+        # ``(order, specs, step, eval_samples, *, init)`` — but
+        # ``io_callback`` passes ``(args, consts, order, specs, step,
+        # *eval_samples)`` as positional args (see ``env.step`` line
+        # 1360 and ``env.reset`` line 1297). Build an adapter that
+        # drops ``args``/``consts`` (the actor's own env has its own
+        # bound args) and re-packages ``eval_samples`` as a tuple.
+        pool = self._remote_pool
+
+        def _remote_callback(args, consts, order, specs, step, *eval_samples):
+            eval_samples_t = tuple(eval_samples) if eval_samples else None
+            tokens, eqn_ids, reward = pool.evaluate(
+                order, specs, int(step),
+                eval_samples=eval_samples_t,
+                init=init,
+            )
+            return tokens, eqn_ids, reward
+
+        return _remote_callback
 
     @property
     def _callback_shape(self):
