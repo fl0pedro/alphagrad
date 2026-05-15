@@ -515,18 +515,31 @@ def _build_actor_state(
 
     @eqx.filter_jit
     def train_minibatches_scanned(agent_local, opt_state_local, all_batches):
-        def scan_body(carry, batch_i):
-            agent_c, opt_state_c = carry
+        dynamic_carry, static_carry = eqx.partition(
+            (agent_local, opt_state_local), eqx.is_array
+        )
+
+        def scan_body(dyn_carry, batch_i):
+            agent_c, opt_state_c = eqx.combine(dyn_carry, static_carry)
+
             (loss_val, parts), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
                 agent_c, batch_i
             )
             updates, opt_state_new = optimizer.update(
                 grads, opt_state_c, eqx.filter(agent_c, eqx.is_inexact_array)
             )
-            return (eqx.apply_updates(agent_c, updates), opt_state_new), (
-                loss_val,
-                parts,
-            )
+
+            new_agent = eqx.apply_updates(agent_c, updates)
+            new_dyn_carry, _ = eqx.partition((new_agent, opt_state_new), eqx.is_array)
+
+            return new_dyn_carry, (loss_val, parts)
+
+        final_dyn_carry, (losses, parts) = lax.scan(
+            scan_body, dynamic_carry, all_batches
+        )
+        final_agent, final_opt = eqx.combine(final_dyn_carry, static_carry)
+
+        return final_agent, final_opt, jnp.mean(losses), jax.tree.map(jnp.mean, parts)
 
         (final_agent, final_opt), (losses, parts) = lax.scan(
             scan_body, (agent_local, opt_state_local), all_batches
