@@ -166,7 +166,7 @@ def _run_one_variant(args, variant: str) -> None:
         CPUApproximationActor.options(
             num_cpus=1, num_gpus=0, runtime_env={"env_vars": {"JAX_PLATFORMS": "cpu"}}
         ).remote(args_dict, variant, i)
-        for i in range(args.num_cpu_workers)
+        for i in range(args.num_cpu_workers * 8)
     ]
 
     ray.get(spmd_actor.init_server.remote(cpu_workers))
