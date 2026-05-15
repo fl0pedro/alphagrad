@@ -148,14 +148,14 @@ def _build_actor_state(
 
     # --- START AUTO-TUNE ---
     num_devs = len(jax.devices()) if is_spmd else 1
-    if not getattr(args, 'strict_config', False) and num_devs > 1:
+    if not getattr(args, "strict_config", False) and num_devs > 1:
         old_envs = num_envs
         if num_envs % num_devs != 0:
             num_envs = max(num_devs, round(num_envs / num_devs) * num_devs)
-        
+
         tw = num_envs * max(1, rollout_length - args.unroll_steps)
         base = tw // num_devs
-        
+
         possible_m = [i for i in range(1, base + 1) if base % i == 0]
         if possible_m:
             best_m = min(possible_m, key=lambda x: abs(x - args.minibatches))
@@ -165,7 +165,9 @@ def _build_actor_state(
                     print(f"  * num_envs: {old_envs} -> {num_envs}")
                 if args.minibatches != best_m:
                     print(f"  * minibatches: {args.minibatches} -> {best_m}")
-                print(f"  * Resulting batch size: {tw // best_m} ({tw // best_m // num_devs} per GPU)\n")
+                print(
+                    f"  * Resulting batch size: {tw // best_m} ({tw // best_m // num_devs} per GPU)\n"
+                )
             args.minibatches = best_m
         args.num_envs = num_envs
     # --- END AUTO-TUNE ---
@@ -213,7 +215,7 @@ def _build_actor_state(
         replicated_sharding = NamedSharding(mesh, PartitionSpec())
         data_sharding = NamedSharding(mesh, PartitionSpec("dev"))
         # Add this: Shard dim 1 (batch), keep dim 0 (minibatch) unsharded for lax.scan
-        scan_data_sharding = NamedSharding(mesh, PartitionSpec(None, "dev")) 
+        scan_data_sharding = NamedSharding(mesh, PartitionSpec(None, "dev"))
 
         def shard_leaf(x):
             return jax.device_put(x, replicated_sharding) if eqx.is_array(x) else x
@@ -517,14 +519,15 @@ def _build_actor_state(
             updates, opt_state_new = optimizer.update(
                 grads, opt_state_c, eqx.filter(agent_c, eqx.is_inexact_array)
             )
-            return (eqx.apply_updates(agent_c, updates), opt_state_new), (loss_val, parts)
+            return (eqx.apply_updates(agent_c, updates), opt_state_new), (
+                loss_val,
+                parts,
+            )
 
         (final_agent, final_opt), (losses, parts) = lax.scan(
-            scan_body, 
-            (agent_local, opt_state_local), 
-            all_batches
+            scan_body, (agent_local, opt_state_local), all_batches
         )
-        
+
         return final_agent, final_opt, jnp.mean(losses), jax.tree.map(jnp.mean, parts)
 
     return {
@@ -553,8 +556,12 @@ def _build_actor_state(
 
 
 class SPMDServerWorker:
-    def __init__(self, args_dict: dict, variant: str, seed: int = 0):
-        self.state = _build_actor_state(args_dict, variant, seed, is_spmd=True)
+    def __init__(
+        self, args_dict: dict, variant: str, seed: int = 0, cpu_workers: list = None
+    ):
+        self.state = _build_actor_state(
+            args_dict, variant, seed, is_spmd=True, cpu_workers=cpu_workers
+        )
         self.args = self.state["args"]
         self.variant = variant
         self._key = self.state["key"]
@@ -594,32 +601,35 @@ class SPMDServerWorker:
         @contextlib.contextmanager
         def active_mesh():
             if mesh is not None:
-                with mesh: yield
+                with mesh:
+                    yield
             else:
                 yield
-        
+
         scan_ds = self.state.get("scan_data_sharding")
 
         with active_mesh():
             for _ in range(train_steps):
-                if self.replay_buffer is not None and int(self.replay_buffer.size) >= max(
-                    self.args.replay_warmup * self.state["num_envs"], 1
-                ):
+                if self.replay_buffer is not None and int(
+                    self.replay_buffer.size
+                ) >= max(self.args.replay_warmup * self.state["num_envs"], 1):
                     s_key, self._key = jrand.split(self._key)
                     t_traj = replay_sample(...)
                     t_vals = jax.vmap(...)(t_traj.scalar_reward)
                     w_batch = jax.tree_util.tree_map(...)
-                    
+
                     sh_key, self._key = jrand.split(self._key)
-                    
+
                     batches = _shuffle_and_batch_windows(
                         w_batch, self.args.minibatches, sh_key
                     )
 
                     b_size = jax.tree_util.tree_leaves(batches)[0].shape[1]
-                    
+
                     if scan_ds is not None and b_size % num_devs == 0:
-                        batches = jax.tree.map(lambda x: jax.device_put(x, scan_ds), batches)
+                        batches = jax.tree.map(
+                            lambda x: jax.device_put(x, scan_ds), batches
+                        )
 
                     (
                         self.state["agent"],
@@ -631,7 +641,7 @@ class SPMDServerWorker:
                         self.state["opt_state"],
                         batches,
                     )
-                    
+
                     self.train_step_counter += self.args.minibatches
                     stats.update(
                         {
@@ -683,9 +693,9 @@ class SPMDServerWorker:
 
         with active_mesh():
             for _ in range(train_steps):
-                if self.replay_buffer is not None and int(self.replay_buffer.size) >= max(
-                    self.args.replay_warmup * self.state["num_envs"], 1
-                ):
+                if self.replay_buffer is not None and int(
+                    self.replay_buffer.size
+                ) >= max(self.args.replay_warmup * self.state["num_envs"], 1):
                     s_key, self._key = jrand.split(self._key)
                     t_traj = replay_sample(
                         self.replay_buffer,
@@ -695,15 +705,17 @@ class SPMDServerWorker:
                         s_key,
                         alpha=self.args.replay_priority_alpha,
                     )
-                    t_vals = jax.vmap(lambda r: _discounted_returns(r, self.args.discount))(
-                        t_traj.scalar_reward
-                    )
+                    t_vals = jax.vmap(
+                        lambda r: _discounted_returns(r, self.args.discount)
+                    )(t_traj.scalar_reward)
 
                     w_batch = jax.tree_util.tree_map(
                         lambda *xs: jnp.stack(xs, axis=1),
                         *[
                             TrajectoryWindow(
-                                tokens=t_traj.tokens[:, i : i + self.args.unroll_steps + 1],
+                                tokens=t_traj.tokens[
+                                    :, i : i + self.args.unroll_steps + 1
+                                ],
                                 eqn_ids=t_traj.eqn_ids[
                                     :, i : i + self.args.unroll_steps + 1
                                 ],
@@ -719,7 +731,9 @@ class SPMDServerWorker:
                                 scalar_reward=t_traj.scalar_reward[
                                     :, i : i + self.args.unroll_steps + 1
                                 ],
-                                target_value=t_vals[:, i : i + self.args.unroll_steps + 1],
+                                target_value=t_vals[
+                                    :, i : i + self.args.unroll_steps + 1
+                                ],
                                 mcts_visits=t_traj.mcts_visits[
                                     :, i : i + self.args.unroll_steps + 1
                                 ],
@@ -741,9 +755,11 @@ class SPMDServerWorker:
                     for i in range(self.args.minibatches):
                         batch_i = jax.tree_util.tree_map(lambda x: x[i], batches)
                         b_size = jax.tree_util.tree_leaves(batch_i)[0].shape[0]
-                        
+
                         if ds is not None and b_size % num_devs == 0:
-                            batch_i = jax.tree.map(lambda x: jax.device_put(x, ds), batch_i)
+                            batch_i = jax.tree.map(
+                                lambda x: jax.device_put(x, ds), batch_i
+                            )
 
                         (
                             self.state["agent"],
@@ -784,19 +800,26 @@ class SPMDServerWorker:
         @contextlib.contextmanager
         def active_mesh():
             if mesh is not None:
-                with mesh: yield
+                with mesh:
+                    yield
             else:
                 yield
 
         with active_mesh():
             for i in range(num_rollouts):
                 pref = jnp.zeros((self.state["num_envs"], NUM_REWARDS), jnp.float32)
-                env_states = jax.vmap(lambda _: self.state["env"].reset())(jnp.arange(self.state["num_envs"]))
-                keys = jrand.split(jrand.PRNGKey(int(rng_seed) + i * 31 + 1), self.state["num_envs"])
-                
+                env_states = jax.vmap(lambda _: self.state["env"].reset())(
+                    jnp.arange(self.state["num_envs"])
+                )
+                keys = jrand.split(
+                    jrand.PRNGKey(int(rng_seed) + i * 31 + 1), self.state["num_envs"]
+                )
+
                 if ds is not None and self.state["num_envs"] % num_devs == 0:
                     pref = jax.device_put(pref, ds)
-                    env_states = jax.tree.map(lambda x: jax.device_put(x, ds), env_states)
+                    env_states = jax.tree.map(
+                        lambda x: jax.device_put(x, ds), env_states
+                    )
                     keys = jax.device_put(keys, ds)
 
                 traj = self.state["rollout_fn"](
