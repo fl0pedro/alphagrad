@@ -68,6 +68,23 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--discount", type=float, default=0.99)
 
+    # Lagrangian (Stage F)
+    p.add_argument(
+        "--lagrangian-constraint", nargs="*", type=str, default=[],
+        help="Inequality constraints of the form NAME>=THRESH or "
+        "NAME<=THRESH, where NAME is one of the env reward channel "
+        "names (muls_adds_fmas / flops / latency_ns / max_io_sum / "
+        "bytes_accessed / peak_memory / cosine_sim / frob_residual). "
+        "Mean per-step violations push the policy via dual-ascent on "
+        "per-constraint multipliers. Symlog-friendly: cost-family "
+        "constraints (everything except cosine_sim) are evaluated in "
+        "symlog space so multipliers live on a single scale.",
+    )
+    p.add_argument(
+        "--lagrangian-lr", type=float, default=1e-3,
+        help="Dual-ascent step size on the Lagrangian multipliers.",
+    )
+
     # Optimizer
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--lr-decay-min-mult", type=float, default=0.1)

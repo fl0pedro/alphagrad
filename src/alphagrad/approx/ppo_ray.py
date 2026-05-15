@@ -184,6 +184,13 @@ def _run(args) -> int:
             "entropy": ent,
             "total_loss": stats.get("total_loss", float("nan")),
         }
+        # Per-channel raw-reward means + Lagrangian multipliers / violations
+        # flow through to wandb as flat keys. The worker namespaces them with
+        # ``reward_mean/`` and ``lagrangian/`` prefixes already, so we just
+        # copy any matching keys across.
+        for k, v in stats.items():
+            if k.startswith("reward_mean/") or k.startswith("lagrangian/"):
+                log_dict[k] = v
         wandb.log(log_dict)
 
     pbar.close()
