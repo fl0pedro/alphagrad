@@ -217,7 +217,16 @@ def _run_one_variant(args, variant: str) -> None:
             }
         },
     }
-    initial_pool_size = max(args.num_cpu_workers * 8, 1)
+    # One actor per CPU worker. The previous ``* 8`` over-provisioning was
+    # a holdover from an older design where actors served concurrent
+    # io_callbacks; with the current ``num_envs=4``-driven dispatch we
+    # only ever have ``num_envs`` simultaneous outstanding calls, so 32
+    # actors meant 28 idle ones each paying the full JAX cold-cache
+    # compile cost on first invocation. Dropping to ``num_cpu_workers``
+    # (default 4) cuts calibration-phase wall time roughly 8x and saves
+    # ~28 GB of actor-process RAM. Bump ``--num-cpu-workers`` only if
+    # dispatch concurrency grows (e.g., bigger ``num_envs``).
+    initial_pool_size = max(args.num_cpu_workers, 1)
     cpu_workers = [
         CPUApproximationActor.options(**cpu_actor_options).remote(
             args_dict, variant, i,
