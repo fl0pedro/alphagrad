@@ -276,6 +276,41 @@ class SimplePPOAgent(eqx.Module):
             self.factor_head(ctx),
         )
 
+    def all_logits(self, tokens, key):
+        """Single-encode variant: ``(vertex_logits, value, op, i, j, factor)``.
+
+        Combined entry point that runs the encoder once and dispatches
+        to every head. Previously the rollout / loss paths called
+        ``policy_and_value`` and ``micro_action_logits`` back-to-back,
+        each of which re-encoded the tokens — i.e. one encoder forward
+        pass per head group. The transformer is the dominant model
+        cost, so collapsing the two calls into one is a ~2× win on the
+        per-step / per-sample GPU compute when ``dynamic_substeps`` is
+        on (no behavioural change otherwise — same softmax inputs).
+
+        On a non-dynamic agent the micro heads are ``None``; the
+        returned slots are placeholder zero arrays so the caller's
+        downstream unpacking stays uniform.
+        """
+        ctx = self.encode(tokens, key=key)
+        vertex_logits = self.vertex_logits_head(ctx)
+        value = jnp.squeeze(self.value_head(ctx), axis=-1)
+        if self.dynamic_substeps:
+            return (
+                vertex_logits, value,
+                self.op_type_head(ctx),
+                self.i_head(ctx),
+                self.j_head(ctx),
+                self.factor_head(ctx),
+            )
+        # Placeholders that match the dynamic shapes — the rollout /
+        # loss paths gate on ``self.dynamic_substeps`` before reading
+        # these, so the values are never observed.
+        zero_op = jnp.zeros((2,), dtype=jnp.float32)
+        zero_axes = jnp.zeros((MAX_AXES_PER_VERTEX,), dtype=jnp.float32)
+        zero_factor = jnp.zeros((max(self.num_factors, 1),), dtype=jnp.float32)
+        return vertex_logits, value, zero_op, zero_axes, zero_axes, zero_factor
+
 
 # ---------------------------------------------------------------------------
 # Worker
@@ -554,7 +589,14 @@ class PPORayWorker:
                 # `dynamic_substeps` off only the first two are used;
                 # the others are simply unused.
                 k_enc, k_v, k_op, k_i, k_j, k_f = jrand.split(k_i, 6)
-                logits, value = agent.policy_and_value(state_i.tokens, key=k_enc)
+                # Single encoder pass shared across the vertex / value
+                # heads AND the micro-action heads — see
+                # `SimplePPOAgent.all_logits`. When dynamic_substeps
+                # is off, the four micro slots are placeholders that
+                # the `if dynamic:` branch below never reads.
+                logits, value, op_l, i_l, j_l, f_l = agent.all_logits(
+                    state_i.tokens, key=k_enc,
+                )
                 masked = jnp.where(avail_i > 0.5, logits, -1e9)
                 log_probs_v = jax.nn.log_softmax(masked)
                 vertex_action = jrand.categorical(k_v, masked)
@@ -562,15 +604,6 @@ class PPORayWorker:
                 vertex_id = vertex_action + 1  # env vertex IDs are 1-indexed
 
                 if dynamic:
-                    # Re-encode for the micro-action heads under a fresh
-                    # sub-key. The four heads sit on the same pooled
-                    # context as the vertex head — cheap to recompute
-                    # under JIT and keeps the eqx.Module path clean
-                    # (the heads don't share a cached encoding because
-                    # the dropout key would differ in the future).
-                    op_l, i_l, j_l, f_l = agent.micro_action_logits(
-                        state_i.tokens, key=k_enc,
-                    )
                     # Mask i / j logits by the chosen vertex's axis_valid.
                     axis_valid_v = state_i.axis_valid_mask[
                         vertex_id - jnp.int32(1)
@@ -676,14 +709,20 @@ class PPORayWorker:
 
             def per_sample(tok, v_act, op, i_s, j_s, f_s, v_for_mask,
                             olp, ret, adv, k):
-                logits, value = agent.policy_and_value(tok, key=k)
+                # Single encoder forward for both the vertex/value
+                # heads and the micro-action heads; mirrors the
+                # equivalent share in `act_step`. When dynamic is off
+                # the (op_l, i_l, j_l, f_l) slots are placeholders and
+                # the `if dynamic:` branch below skips them.
+                logits, value, op_l, i_l, j_l, f_l = agent.all_logits(
+                    tok, key=k,
+                )
                 log_probs = jax.nn.log_softmax(logits)
                 lp_v = log_probs[v_act]
                 p = jax.nn.softmax(logits)
                 ent_v = -jnp.sum(p * log_probs)
 
                 if dynamic:
-                    op_l, i_l, j_l, f_l = agent.micro_action_logits(tok, key=k)
                     axis_valid = axis_valid_static_j[v_for_mask - 1]
                     i_l_m = jnp.where(axis_valid > 0.5, i_l, -1e9)
                     j_l_m = jnp.where(axis_valid > 0.5, j_l, -1e9)
