@@ -5626,17 +5626,9 @@ def main():
                 shape_str = "; ".join(
                     f"{s}x{d}={c}" for (s, d), c in top_shapes
                 )
-                from alphagrad.approx.env import get_compile_cache_stats as _ccs
-
-                _stats = _ccs()
-                _hits = _stats["hits"]
-                _misses = _stats["misses"]
-                _total = max(_hits + _misses, 1)
                 tqdm.write(
                     f"[mem ep={ep:3d}] rss={rss_kb / 1024:7.0f}MB  "
                     f"live={n_live:5d} arrays {live_bytes / 1024 / 1024:7.0f}MB  "
-                    f"jit_cache size={_stats['size']}/{_stats['max_size']} "
-                    f"hit_rate={_hits / _total:.2%} (h={_hits} m={_misses})  "
                     f"top={shape_str}",
                     file=sys.stderr,
                 )
