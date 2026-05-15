@@ -656,6 +656,17 @@ class SPMDServerWorker:
                         }
                     )
 
+            traj = self.state["rollout_fn"](
+                self.state["agent"],
+                jnp.asarray(self.args.temperature, jnp.float32),
+                self.state["env_states"],
+                keys,
+                pref,
+                self.state["vertex_features"],
+                self.state["reward_weights"],
+                pr,
+            )
+
         rw_np = np.asarray(self.state["reward_weights"])
         r_vec_np = np.asarray(traj.reward_vec)
         per_env_tot = (r_vec_np.sum(axis=1) * rw_np).sum(axis=-1)
