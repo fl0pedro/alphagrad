@@ -626,49 +626,6 @@ class SPMDServerWorker:
         scan_ds = self.state.get("scan_data_sharding")
 
         with active_mesh():
-            for _ in range(train_steps):
-                if self.replay_buffer is not None and int(
-                    self.replay_buffer.size
-                ) >= max(self.args.replay_warmup * self.state["num_envs"], 1):
-                    s_key, self._key = jrand.split(self._key)
-                    t_traj = replay_sample(...)
-                    t_vals = jax.vmap(...)(t_traj.scalar_reward)
-                    w_batch = jax.tree_util.tree_map(...)
-
-                    sh_key, self._key = jrand.split(self._key)
-
-                    batches = _shuffle_and_batch_windows(
-                        w_batch, self.args.minibatches, sh_key
-                    )
-
-                    b_size = jax.tree_util.tree_leaves(batches)[0].shape[1]
-
-                    if scan_ds is not None and b_size % num_devs == 0:
-                        batches = jax.tree.map(
-                            lambda x: jax.device_put(x, scan_ds), batches
-                        )
-
-                    (
-                        self.state["agent"],
-                        self.state["opt_state"],
-                        mean_loss,
-                        mean_parts,
-                    ) = self.state["train_minibatches"](
-                        self.state["agent"],
-                        self.state["opt_state"],
-                        batches,
-                    )
-
-                    self.train_step_counter += self.args.minibatches
-                    stats.update(
-                        {
-                            "policy_loss": float(mean_parts[0]),
-                            "value_loss": float(mean_parts[1]),
-                            "reward_loss": float(mean_parts[2]),
-                            "total_loss": float(mean_loss),
-                        }
-                    )
-
             traj = self.state["rollout_fn"](
                 self.state["agent"],
                 jnp.asarray(self.args.temperature, jnp.float32),
