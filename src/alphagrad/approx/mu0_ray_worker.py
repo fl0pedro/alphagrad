@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 from functools import partial
@@ -145,6 +146,30 @@ def _build_actor_state(
     num_envs = _resolve_num_envs(args.num_envs, args.example)
     rollout_length = num_valid
 
+    # --- START AUTO-TUNE ---
+    num_devs = len(jax.devices()) if is_spmd else 1
+    if not getattr(args, 'strict_config', False) and num_devs > 1:
+        old_envs = num_envs
+        if num_envs % num_devs != 0:
+            num_envs = max(num_devs, round(num_envs / num_devs) * num_devs)
+        
+        tw = num_envs * max(1, rollout_length - args.unroll_steps)
+        base = tw // num_devs
+        
+        possible_m = [i for i in range(1, base + 1) if base % i == 0]
+        if possible_m:
+            best_m = min(possible_m, key=lambda x: abs(x - args.minibatches))
+            if old_envs != num_envs or best_m != args.minibatches:
+                print(f"\n[Auto-Tune] Optimizing for {num_devs} GPUs:")
+                if old_envs != num_envs:
+                    print(f"  * num_envs: {old_envs} -> {num_envs}")
+                if args.minibatches != best_m:
+                    print(f"  * minibatches: {args.minibatches} -> {best_m}")
+                print(f"  * Resulting batch size: {tw // best_m} ({tw // best_m // num_devs} per GPU)\n")
+            args.minibatches = best_m
+        args.num_envs = num_envs
+    # --- END AUTO-TUNE ---
+
     reward_weights_np = _build_reward_weights(args)
     reward_weights = jnp.asarray(reward_weights_np, dtype=jnp.float32)
 
@@ -186,7 +211,7 @@ def _build_actor_state(
     if is_spmd:
         mesh = Mesh(np.array(jax.devices()), axis_names=("dev",))
         replicated_sharding = NamedSharding(mesh, PartitionSpec())
-        data_sharding = NamedSharding(mesh, PartitionSpec("dev")) # Add this
+        data_sharding = NamedSharding(mesh, PartitionSpec("dev"))
 
         def shard_leaf(x):
             return jax.device_put(x, replicated_sharding) if eqx.is_array(x) else x
@@ -195,6 +220,7 @@ def _build_actor_state(
         opt_state = jax.tree.map(shard_leaf, opt_state)
     else:
         data_sharding = None
+        mesh = None
 
     key, eval_key = jrand.split(key)
     eval_samples = generate_eval_samples(env, eval_key, args.num_eval_samples)
@@ -508,6 +534,7 @@ def _build_actor_state(
         "train_minibatch": train_minibatch,
         "key": key,
         "data_sharding": data_sharding,
+        "mesh": mesh,
     }
 
 
@@ -547,21 +574,32 @@ class SPMDServerWorker:
         keys = jrand.split(jrand.PRNGKey(int(rng_seed)), self.state["num_envs"])
 
         ds = self.state.get("data_sharding")
-        if ds is not None:
-            self.state["env_states"] = jax.tree.map(lambda x: jax.device_put(x, ds), self.state["env_states"])
-            pref = jax.device_put(pref, ds)
-            keys = jax.device_put(keys, ds)
+        mesh = self.state.get("mesh")
+        num_devs = len(jax.devices()) if ds is not None else 1
 
-        traj = self.state["rollout_fn"](
-            self.state["agent"],
-            jnp.asarray(self.args.temperature, jnp.float32),
-            self.state["env_states"],
-            keys, # Use the explicit variable
-            pref,
-            self.state["vertex_features"],
-            self.state["reward_weights"],
-            pr,
-        )
+        @contextlib.contextmanager
+        def active_mesh():
+            if mesh is not None:
+                with mesh: yield
+            else:
+                yield
+
+        with active_mesh():
+            if ds is not None and self.state["num_envs"] % num_devs == 0:
+                self.state["env_states"] = jax.tree.map(lambda x: jax.device_put(x, ds), self.state["env_states"])
+                pref = jax.device_put(pref, ds)
+                keys = jax.device_put(keys, ds)
+
+            traj = self.state["rollout_fn"](
+                self.state["agent"],
+                jnp.asarray(self.args.temperature, jnp.float32),
+                self.state["env_states"],
+                keys,
+                pref,
+                self.state["vertex_features"],
+                self.state["reward_weights"],
+                pr,
+            )
 
         rw_np = np.asarray(self.state["reward_weights"])
         r_vec_np = np.asarray(traj.reward_vec)
@@ -602,87 +640,89 @@ class SPMDServerWorker:
                 priorities=_compute_traj_priorities(traj, self.state["reward_weights"]),
             )
 
-        for _ in range(train_steps):
-            if self.replay_buffer is not None and int(self.replay_buffer.size) >= max(
-                self.args.replay_warmup * self.state["num_envs"], 1
-            ):
-                s_key, self._key = jrand.split(self._key)
-                t_traj = replay_sample(
-                    self.replay_buffer,
-                    self.args.replay_batch_size
-                    if self.args.replay_batch_size > 0
-                    else self.state["num_envs"],
-                    s_key,
-                    alpha=self.args.replay_priority_alpha,
-                )
-                t_vals = jax.vmap(lambda r: _discounted_returns(r, self.args.discount))(
-                    t_traj.scalar_reward
-                )
-
-                w_batch = jax.tree_util.tree_map(
-                    lambda *xs: jnp.stack(xs, axis=1),
-                    *[
-                        TrajectoryWindow(
-                            tokens=t_traj.tokens[:, i : i + self.args.unroll_steps + 1],
-                            eqn_ids=t_traj.eqn_ids[
-                                :, i : i + self.args.unroll_steps + 1
-                            ],
-                            vertex_idx=t_traj.vertex_idx[
-                                :, i : i + self.args.unroll_steps + 1
-                            ],
-                            pair_seq=t_traj.pair_seq[
-                                :, i : i + self.args.unroll_steps + 1
-                            ],
-                            factor_seq=t_traj.factor_seq[
-                                :, i : i + self.args.unroll_steps + 1
-                            ],
-                            scalar_reward=t_traj.scalar_reward[
-                                :, i : i + self.args.unroll_steps + 1
-                            ],
-                            target_value=t_vals[:, i : i + self.args.unroll_steps + 1],
-                            mcts_visits=t_traj.mcts_visits[
-                                :, i : i + self.args.unroll_steps + 1
-                            ],
-                            preference=t_traj.preference[
-                                :, i : i + self.args.unroll_steps + 1
-                            ],
-                        )
-                        for i in range(
-                            self.state["rollout_length"] - self.args.unroll_steps
-                        )
-                    ],
-                )
-
-                sh_key, self._key = jrand.split(self._key)
-                batches = _shuffle_and_batch_windows(
-                    w_batch, self.args.minibatches, sh_key
-                )
-
-                for i in range(self.args.minibatches):
-                    batch_i = jax.tree_util.tree_map(lambda x: x[i], batches)
-                    
-                    if ds is not None:
-                        batch_i = jax.tree.map(lambda x: jax.device_put(x, ds), batch_i)
-
-                    (
-                        self.state["agent"],
-                        self.state["opt_state"],
-                        last_loss,
-                        last_parts,
-                    ) = self.state["train_minibatch"](
-                        self.state["agent"],
-                        self.state["opt_state"],
-                        batch_i,
+        with active_mesh():
+            for _ in range(train_steps):
+                if self.replay_buffer is not None and int(self.replay_buffer.size) >= max(
+                    self.args.replay_warmup * self.state["num_envs"], 1
+                ):
+                    s_key, self._key = jrand.split(self._key)
+                    t_traj = replay_sample(
+                        self.replay_buffer,
+                        self.args.replay_batch_size
+                        if self.args.replay_batch_size > 0
+                        else self.state["num_envs"],
+                        s_key,
+                        alpha=self.args.replay_priority_alpha,
                     )
-                self.train_step_counter += self.args.minibatches
-                stats.update(
-                    {
-                        "policy_loss": float(last_parts[0]),
-                        "value_loss": float(last_parts[1]),
-                        "reward_loss": float(last_parts[2]),
-                        "total_loss": float(last_loss),
-                    }
-                )
+                    t_vals = jax.vmap(lambda r: _discounted_returns(r, self.args.discount))(
+                        t_traj.scalar_reward
+                    )
+
+                    w_batch = jax.tree_util.tree_map(
+                        lambda *xs: jnp.stack(xs, axis=1),
+                        *[
+                            TrajectoryWindow(
+                                tokens=t_traj.tokens[:, i : i + self.args.unroll_steps + 1],
+                                eqn_ids=t_traj.eqn_ids[
+                                    :, i : i + self.args.unroll_steps + 1
+                                ],
+                                vertex_idx=t_traj.vertex_idx[
+                                    :, i : i + self.args.unroll_steps + 1
+                                ],
+                                pair_seq=t_traj.pair_seq[
+                                    :, i : i + self.args.unroll_steps + 1
+                                ],
+                                factor_seq=t_traj.factor_seq[
+                                    :, i : i + self.args.unroll_steps + 1
+                                ],
+                                scalar_reward=t_traj.scalar_reward[
+                                    :, i : i + self.args.unroll_steps + 1
+                                ],
+                                target_value=t_vals[:, i : i + self.args.unroll_steps + 1],
+                                mcts_visits=t_traj.mcts_visits[
+                                    :, i : i + self.args.unroll_steps + 1
+                                ],
+                                preference=t_traj.preference[
+                                    :, i : i + self.args.unroll_steps + 1
+                                ],
+                            )
+                            for i in range(
+                                self.state["rollout_length"] - self.args.unroll_steps
+                            )
+                        ],
+                    )
+
+                    sh_key, self._key = jrand.split(self._key)
+                    batches = _shuffle_and_batch_windows(
+                        w_batch, self.args.minibatches, sh_key
+                    )
+
+                    for i in range(self.args.minibatches):
+                        batch_i = jax.tree_util.tree_map(lambda x: x[i], batches)
+                        b_size = jax.tree_util.tree_leaves(batch_i)[0].shape[0]
+                        
+                        if ds is not None and b_size % num_devs == 0:
+                            batch_i = jax.tree.map(lambda x: jax.device_put(x, ds), batch_i)
+
+                        (
+                            self.state["agent"],
+                            self.state["opt_state"],
+                            last_loss,
+                            last_parts,
+                        ) = self.state["train_minibatch"](
+                            self.state["agent"],
+                            self.state["opt_state"],
+                            batch_i,
+                        )
+                    self.train_step_counter += self.args.minibatches
+                    stats.update(
+                        {
+                            "policy_loss": float(last_parts[0]),
+                            "value_loss": float(last_parts[1]),
+                            "reward_loss": float(last_parts[2]),
+                            "total_loss": float(last_loss),
+                        }
+                    )
 
         stats.update(
             {
@@ -697,28 +737,38 @@ class SPMDServerWorker:
     def reward_vec_means(self, rng_seed: int, num_rollouts: int) -> np.ndarray:
         sum_vec = np.zeros((NUM_REWARDS,), dtype=np.float32)
         ds = self.state.get("data_sharding")
-        
-        for i in range(num_rollouts):
-            pref = jnp.zeros((self.state["num_envs"], NUM_REWARDS), jnp.float32)
-            env_states = jax.vmap(lambda _: self.state["env"].reset())(jnp.arange(self.state["num_envs"]))
-            keys = jrand.split(jrand.PRNGKey(int(rng_seed) + i * 31 + 1), self.state["num_envs"])
-            
-            if ds is not None:
-                pref = jax.device_put(pref, ds)
-                env_states = jax.tree.map(lambda x: jax.device_put(x, ds), env_states)
-                keys = jax.device_put(keys, ds)
+        mesh = self.state.get("mesh")
+        num_devs = len(jax.devices()) if ds is not None else 1
 
-            traj = self.state["rollout_fn"](
-                self.state["agent"],
-                jnp.asarray(self.args.temperature, jnp.float32),
-                env_states,
-                keys,
-                pref,
-                self.state["vertex_features"],
-                self.state["reward_weights"],
-                jnp.asarray(self._pin_rules_default, dtype=jnp.bool_),
-            )
-            sum_vec += np.asarray(traj.reward_vec).sum(axis=(0, 1))
+        @contextlib.contextmanager
+        def active_mesh():
+            if mesh is not None:
+                with mesh: yield
+            else:
+                yield
+
+        with active_mesh():
+            for i in range(num_rollouts):
+                pref = jnp.zeros((self.state["num_envs"], NUM_REWARDS), jnp.float32)
+                env_states = jax.vmap(lambda _: self.state["env"].reset())(jnp.arange(self.state["num_envs"]))
+                keys = jrand.split(jrand.PRNGKey(int(rng_seed) + i * 31 + 1), self.state["num_envs"])
+                
+                if ds is not None and self.state["num_envs"] % num_devs == 0:
+                    pref = jax.device_put(pref, ds)
+                    env_states = jax.tree.map(lambda x: jax.device_put(x, ds), env_states)
+                    keys = jax.device_put(keys, ds)
+
+                traj = self.state["rollout_fn"](
+                    self.state["agent"],
+                    jnp.asarray(self.args.temperature, jnp.float32),
+                    env_states,
+                    keys,
+                    pref,
+                    self.state["vertex_features"],
+                    self.state["reward_weights"],
+                    jnp.asarray(self._pin_rules_default, dtype=jnp.bool_),
+                )
+                sum_vec += np.asarray(traj.reward_vec).sum(axis=(0, 1))
         return sum_vec / max(
             float(num_rollouts * self.state["num_envs"] * self.state["rollout_length"]),
             1.0,
