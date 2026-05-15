@@ -122,33 +122,51 @@ class CpuApproximationServer:
         """
         import jax.numpy as jnp
         import numpy as np
-        from alphagrad.approx.env import _callback
+        from alphagrad.approx.env import MAX_TOKENS, NUM_REWARDS, _callback
 
         order_j = jnp.asarray(order, dtype=jnp.int32)
         specs_j = jnp.asarray(sparsity_specs, dtype=jnp.int32)
-        # Per-call eval_samples override; fall back to whatever the
-        # server was built with. An empty tuple is fine — `_callback`
-        # accepts `*eval_samples` variadically.
         es = (
             tuple(eval_samples)
             if eval_samples is not None
             else self._eval_samples
         )
-        # `_callback` itself converts each eval_samples leaf to a JAX
-        # array internally (via `arg[i]` indexing on the stacked
-        # leaves), so we just ensure each leaf is a JAX-friendly shape
-        # — numpy ndarrays pass straight through.
-        tokens, eqn_ids, reward = _callback(
-            self._config,
-            self._args,
-            self._consts,
-            order_j,
-            specs_j,
-            int(step),
-            *es,
-            init=bool(init),
-        )
-        return np.asarray(tokens), np.asarray(eqn_ids), np.asarray(reward)
+        try:
+            tokens, eqn_ids, reward = _callback(
+                self._config,
+                self._args,
+                self._consts,
+                order_j,
+                specs_j,
+                int(step),
+                *es,
+                init=bool(init),
+            )
+            return np.asarray(tokens), np.asarray(eqn_ids), np.asarray(reward)
+        except Exception as exc:
+            # graphax can raise on transforms that produce shape-incompatible
+            # edges (e.g. a DIAG whose factor doesn't divide some primal axis,
+            # or a COMPRESS in the middle of the elimination order). Killing
+            # the whole rollout for one bad action is over-strict — the
+            # rollout buffer would lose all preceding work. Emit a sentinel
+            # `(zeros, -1e10 cost reward)` so the policy gradient is pushed
+            # away from the bad action and the rollout proceeds. The actual
+            # tokens stay zero (the next-step policy will see an unhelpful
+            # obs for one step, then training continues from the new state).
+            #
+            # Stash the message so a curious caller can grep diagnostics —
+            # `last_eval_error` is updated atomically (just Python reference
+            # assignment).
+            self.last_eval_error = (type(exc).__name__, str(exc)[:200])
+            sentinel_tokens = np.zeros((MAX_TOKENS,), dtype=np.int32)
+            sentinel_eqn_ids = np.zeros((MAX_TOKENS,), dtype=np.int32)
+            sentinel_reward = np.full((NUM_REWARDS,), -1e10, dtype=np.float32)
+            # cosine_sim is "higher is better, capped at 1" — set to 0 so the
+            # acc head doesn't see a weirdly bad positive signal.
+            from alphagrad.approx.env import REWARD_INDEX
+            sentinel_reward[REWARD_INDEX["cosine_sim"]] = 0.0
+            sentinel_reward[REWARD_INDEX["frob_residual"]] = -1e10
+            return sentinel_tokens, sentinel_eqn_ids, sentinel_reward
 
     def evaluate_batch(self, batch: Sequence[tuple]):
         """Sequential fallback for callers that want to ship multiple
