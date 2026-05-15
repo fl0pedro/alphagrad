@@ -84,6 +84,25 @@ def _extend_argparser(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action="store_true",
         help="Disable auto-tuning of num_envs and minibatches for GPU divisibility.",
     )
+    # CPU approximation pool — see alphagrad/src/alphagrad/approx/cpu_approx_pool.py
+    p.add_argument(
+        "--cpu-callback-timeout",
+        type=float,
+        default=60.0,
+        help="Per-call timeout (seconds) for ray.get on the CPU-approx "
+             "pool. When exceeded, the actor is killed, a replacement is "
+             "respawned, and the env step receives a sentinel "
+             "(zeros / -1e10 reward) so the rollout continues. Default 60s "
+             "= ~70x normal per-callback wall (~0.9s baseline).",
+    )
+    p.add_argument(
+        "--cpu-worker-recycle-every",
+        type=int,
+        default=50,
+        help="Recycle (ray.kill + respawn) every actor in the CPU-approx "
+             "pool after this many episodes. Bounds the per-actor "
+             "cost_analysis() C++ residual (REPORT.md §6). 0 disables.",
+    )
     return p
 
 
@@ -181,24 +200,40 @@ def _run_one_variant(args, variant: str) -> None:
         args_dict, variant, int(variant_args.seed)
     )
 
+    # ``cpu_actor_options`` captures the same .options(...) kwargs the
+    # initial pool was spawned with, so the SPMD actor can use them to
+    # respawn killed actors after a callback timeout. Keep these in
+    # sync with the .options(...) call right below.
+    cpu_actor_options = {
+        "num_cpus": 1,
+        "num_gpus": 0,
+        "runtime_env": {
+            "env_vars": {
+                "JAX_PLATFORMS": "cpu",
+                # Same on-demand allocation policy; CPU JAX shouldn't
+                # preallocate but the var is harmless and keeps actor
+                # env consistent with the GPU side.
+                "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+            }
+        },
+    }
+    initial_pool_size = max(args.num_cpu_workers * 8, 1)
     cpu_workers = [
-        CPUApproximationActor.options(
-            num_cpus=1,
-            num_gpus=0,
-            runtime_env={
-                "env_vars": {
-                    "JAX_PLATFORMS": "cpu",
-                    # Same on-demand allocation policy; CPU JAX shouldn't
-                    # preallocate but the var is harmless and keeps actor
-                    # env consistent with the GPU side.
-                    "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-                }
-            },
-        ).remote(args_dict, variant, i)
-        for i in range(args.num_cpu_workers * 8)
+        CPUApproximationActor.options(**cpu_actor_options).remote(
+            args_dict, variant, i,
+        )
+        for i in range(initial_pool_size)
     ]
 
-    ray.get(spmd_actor.init_server.remote(cpu_workers))
+    ray.get(
+        spmd_actor.init_server.remote(
+            cpu_workers,
+            callback_timeout_s=args.cpu_callback_timeout,
+            recycle_every=args.cpu_worker_recycle_every,
+            cpu_actor_options=cpu_actor_options,
+            starting_actor_id=initial_pool_size,
+        )
+    )
     ray.get([spmd_actor.ready.remote()] + [c.ready.remote() for c in cpu_workers])
     print(f"  actors spawned and JIT-warm in {time.time() - args.t_start:.1f}s")
 
