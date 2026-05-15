@@ -16,11 +16,53 @@ class SPMDActor:
         self.seed = seed
         self._impl = None
 
-    def init_server(self, cpu_workers):
+    def init_server(
+        self,
+        cpu_workers,
+        *,
+        callback_timeout_s: float = 60.0,
+        recycle_every: int = 50,
+        cpu_actor_options: dict | None = None,
+        starting_actor_id: int = 1000,
+    ):
+        """Construct the SPMD-side training state and wire the
+        CPU approx pool into the env's ``io_callback``.
+
+        Parameters
+        ----------
+        cpu_workers
+            List of ``CPUApproximationActor`` handles spawned by the
+            driver. Used to build a :class:`CpuApproxPool` that the
+            env's tokenize closure delegates to.
+        callback_timeout_s
+            Per-actor-call timeout for ``ray.get`` inside the pool.
+            On timeout, the actor is killed and a replacement is
+            requested.
+        recycle_every
+            Recycle the entire pool every N episodes (bounds the
+            ``cost_analysis()`` C++ residual). 0 disables.
+        cpu_actor_options
+            Kwargs to pass to ``CPUApproximationActor.options(...)``
+            when respawning a killed actor. ``num_cpus``,
+            ``num_gpus``, ``runtime_env`` etc. — must match what the
+            driver used for the initial pool.
+        starting_actor_id
+            Initial counter for the actor_id arg of respawn-spawned
+            actors. The driver gave actor_ids 0..N-1 to the initial
+            pool; respawns get ids starting here so logs stay
+            distinguishable.
+        """
         from alphagrad.approx.mu0_ray_worker import SPMDServerWorker
 
         self._impl = SPMDServerWorker(
-            self.args_dict, self.variant, self.seed, cpu_workers=cpu_workers
+            self.args_dict,
+            self.variant,
+            self.seed,
+            cpu_workers=cpu_workers,
+            callback_timeout_s=callback_timeout_s,
+            recycle_every=recycle_every,
+            cpu_actor_options=cpu_actor_options,
+            starting_actor_id=starting_actor_id,
         )
         return True
 
@@ -49,6 +91,12 @@ class SPMDActor:
     def checkpoint_replay(self, path: str) -> None:
         return self._impl.checkpoint_replay(path)
 
+    def get_pool_stats(self) -> dict:
+        """Forward telemetry from the CPU-approx pool to the driver."""
+        if self._impl is None:
+            return {}
+        return self._impl.get_pool_stats()
+
     def ready(self) -> bool:
         if self._impl is None:
             return False
@@ -57,7 +105,15 @@ class SPMDActor:
 
 @ray.remote
 class CPUApproximationActor:
-    """CPU-only worker for compiling variants and generating dataset approximations."""
+    """CPU-only Ray actor wrapping :class:`CPUApproximationWorker`.
+
+    Spawned in pools by :func:`alphagrad.approx.mu0_ray._run_one_variant`
+    and consumed by the env's ``io_callback`` via
+    :class:`alphagrad.approx.cpu_approx_pool.CpuApproxPool`. Each call
+    runs one ``jax.jit(jacve(...)).lower().compile()`` + execution
+    out-of-process so the SPMD actor (which owns the GPUs) never
+    blocks on XLA's uninterruptible C++ compile.
+    """
 
     def __init__(self, args_dict: dict, variant: str, actor_id: int):
         from alphagrad.approx.mu0_ray_worker import CPUApproximationWorker
@@ -67,8 +123,27 @@ class CPUApproximationActor:
     def compile_approximations(self) -> dict:
         return self._impl.compile_approximations()
 
-    def evaluate_graph(self, o_list, transforms, eval_samples):
-        return self._impl.evaluate_graph(o_list, transforms, eval_samples)
+    def evaluate(
+        self,
+        order,
+        sparsity_specs,
+        step,
+        eval_samples=None,
+        init: bool = False,
+    ):
+        """Forward to ``CPUApproximationWorker.evaluate``.
+
+        Explicit method (not ``__getattr__``-based) so Ray's method
+        lookup is unambiguous and the actor signature is stable when
+        we add cancellation / timing later.
+        """
+        return self._impl.evaluate(
+            order, sparsity_specs, step,
+            eval_samples=eval_samples, init=init,
+        )
+
+    def reset_caches(self) -> dict:
+        return self._impl.reset_caches()
 
     def ready(self) -> bool:
         return self._impl.ready()
