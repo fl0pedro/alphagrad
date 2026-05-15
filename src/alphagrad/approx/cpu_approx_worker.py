@@ -31,6 +31,28 @@ from types import SimpleNamespace
 from typing import Any, Sequence
 
 
+def _setup_jax_compile_cache() -> None:
+    """Enable JAX's persistent disk compile cache for this process.
+
+    No-op if JAX is already configured. The cache dir defaults to
+    ``~/.cache/jax-compile`` and is shared across Ray actors on the
+    same host — duplicated compiles in different actors hit the same
+    on-disk cache and skip the HLO-generation pass.
+
+    Idempotent: re-runs of this function (e.g. from multiple
+    ``CpuApproximationServer.__init__``s in the same process) only
+    do anything once.
+    """
+    import jax
+
+    cache_dir = os.environ.get(
+        "JAX_COMPILATION_CACHE_DIR",
+        os.path.join(os.path.expanduser("~"), ".cache", "jax-compile"),
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", cache_dir)
+
+
 class CpuApproximationServer:
     """Process-local wrapper around `env._callback`.
 
@@ -65,6 +87,16 @@ class CpuApproximationServer:
             if eval_samples is not None
             else (tuple(env.eval_args_samples) if env.eval_args_samples is not None else ())
         )
+        # Wire the JAX persistent disk cache so each per-call
+        # `jax.jit(jacve(...)).lower(...).compile()` re-uses the XLA
+        # passes from the previous compile of the same (o_list, transforms).
+        # Without this the CPU worker pays the full HLO-generation cost
+        # on every step (~50-200 ms each). Cache is shared across all
+        # Ray actors on the host because the dir lives under
+        # ``~/.cache/jax-compile`` by default. JAX's hashing keys on
+        # the lowered HLO, so unrelated workers' caches don't poison
+        # each other.
+        _setup_jax_compile_cache()
 
     # ------------------------------------------------------------------
     # Constructors
