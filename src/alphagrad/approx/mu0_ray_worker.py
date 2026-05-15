@@ -633,22 +633,74 @@ class SPMDServerWorker:
 
         rw_np = np.asarray(self.state["reward_weights"])
         r_vec_np = np.asarray(traj.reward_vec)
-        per_env_tot = (r_vec_np.sum(axis=1) * rw_np).sum(axis=-1)
+        # Per-env per-channel raw episode return (sum over timesteps).
+        # Rewards are stored "higher is better" (costs are negated), so the
+        # ``argmax`` over the env axis gives the trajectory that scored
+        # best on a given channel.
+        r_per_env = r_vec_np.sum(axis=1)  # (num_envs, NUM_REWARDS)
+        weighted_per_env = r_per_env * rw_np  # (num_envs, NUM_REWARDS)
+        per_env_tot = weighted_per_env.sum(axis=-1)  # (num_envs,)
         best_idx = int(per_env_tot.argmax())
+
+        v_np = np.asarray(traj.vertex_idx)  # (E, T)
+        p_np = np.asarray(traj.pair_seq)    # (E, T, max_rules)
+        f_np = np.asarray(traj.factor_seq)  # (E, T, max_rules)
+        ftab = self.state["factor_table_np"]
+
+        # For each *tuned* reward channel (non-zero weight), find the env
+        # whose raw per-channel return is highest and grab its action
+        # sequence. Channels with zero weight are skipped to keep the
+        # per-reward report focused on what the user is actually
+        # optimising.
+        best_per_reward = {}
+        for j in range(NUM_REWARDS):
+            if float(rw_np[j]) == 0.0:
+                continue
+            bidx = int(r_per_env[:, j].argmax())
+            best_per_reward[REWARD_NAMES[j]] = {
+                "raw_value": float(r_per_env[bidx, j]),
+                "weighted_value": float(weighted_per_env[bidx, j]),
+                "weighted_total": float(per_env_tot[bidx]),
+                "env_idx": bidx,
+                "seq": _action_to_pylist(v_np[bidx], p_np[bidx], f_np[bidx], ftab),
+            }
+
+        # Mean MCTS visit-distribution entropy. ``mcts_visits`` has shape
+        # ``(E, T, DECISION_DEPTH, UNIFIED_ACTION_SIZE)`` and is the raw
+        # visit count per action at every decision node along the path.
+        # Normalise within each (env, step, depth) row, then ``-sum(p log p)``
+        # over the action axis. Mean is taken over the valid entries
+        # (rows where total visits > 0 — terminal/masked positions have
+        # zero visits and contribute nothing).
+        mv = np.asarray(traj.mcts_visits)  # (E, T, D, A)
+        v_sum = mv.sum(axis=-1, keepdims=True)
+        probs = mv / np.maximum(v_sum, 1e-8)
+        ent = -np.where(probs > 0, probs * np.log(probs + 1e-12), 0.0).sum(axis=-1)
+        valid = (v_sum.squeeze(-1) > 0).astype(np.float32)
+        ent_total = (ent * valid).sum()
+        valid_count = max(float(valid.sum()), 1.0)
+        mean_entropy = float(ent_total / valid_count)
+        # Entropy at depth 0 specifically — that's the strategic vertex
+        # choice, before pair/factor sub-decisions. Useful to see
+        # exploration of *which vertex to eliminate next* separately
+        # from the rule sub-policy entropy.
+        root_valid = valid[..., 0]
+        root_count = max(float(root_valid.sum()), 1.0)
+        root_entropy = float((ent[..., 0] * root_valid).sum() / root_count)
 
         stats = {
             "best_return": float(per_env_tot[best_idx]),
             "mean_return": float(per_env_tot.mean()),
             "best_seq": _action_to_pylist(
-                np.asarray(traj.vertex_idx[best_idx]),
-                np.asarray(traj.pair_seq[best_idx]),
-                np.asarray(traj.factor_seq[best_idx]),
-                self.state["factor_table_np"],
+                v_np[best_idx], p_np[best_idx], f_np[best_idx], ftab,
             ),
             "per_reward_means": {
                 REWARD_NAMES[j]: float(r_vec_np[..., j].mean())
                 for j in range(NUM_REWARDS)
             },
+            "best_per_reward": best_per_reward,
+            "entropy_mean": mean_entropy,
+            "entropy_root": root_entropy,
         }
 
         if self.replay_buffer is None and self.args.replay_buffer_size > 0:

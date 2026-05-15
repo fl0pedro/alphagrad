@@ -7,6 +7,12 @@ import sys
 import time
 
 import numpy as np
+from tqdm import tqdm
+
+# Use a plain threading lock so tqdm doesn't leak a named POSIX
+# semaphore when the driver is signal-killed (matches mu0.py).
+import threading as _threading
+tqdm.set_lock(_threading.RLock())
 
 from alphagrad.approx.mu0_args import make_argparser
 from alphagrad.approx.variants import (
@@ -180,7 +186,23 @@ def _run_one_variant(args, variant: str) -> None:
 
     best_global_return = -float("inf")
     best_global_seq = None
+    # Per-channel running bests: {reward_name: {"raw_value", "weighted_value",
+    # "weighted_total", "ep", "seq"}}. Populated as we see new bests from
+    # the actor each episode. Restricted to reward channels with non-zero
+    # weight on the driver side (the actor already filters).
+    best_per_reward: dict[str, dict] = {}
     seed_counter = int(variant_args.seed) + 100
+
+    pbar = tqdm(
+        total=variant_args.episodes,
+        desc=variant,
+        # Show the bar even when stderr isn't a TTY (nohup'd runs). We
+        # still print explicit milestone lines via tqdm.write below so
+        # a tailed log file has greppable content too.
+        disable=False,
+        leave=True,
+        ncols=180,
+    )
 
     for ep in range(variant_args.episodes):
         seed_counter += 1
@@ -195,38 +217,111 @@ def _run_one_variant(args, variant: str) -> None:
         )
 
         ep_best = stats.get("best_return", -float("inf"))
+        ep_mean = stats.get("mean_return", float("nan"))
+        ent_mean = stats.get("entropy_mean", float("nan"))
+        ent_root = stats.get("entropy_root", float("nan"))
+        ploss = stats.get("policy_loss", float("nan"))
+        vloss = stats.get("value_loss", float("nan"))
+        rloss = stats.get("reward_loss", float("nan"))
+        bsize = stats.get("buffer_size", 0)
+        tstep = stats.get("train_step", 0)
+
         if ep_best > best_global_return:
             best_global_return = ep_best
             best_global_seq = stats.get("best_seq")
 
+        # Update running per-channel bests.
+        for name, info in stats.get("best_per_reward", {}).items():
+            prev = best_per_reward.get(name)
+            if prev is None or info["raw_value"] > prev["raw_value"]:
+                best_per_reward[name] = {**info, "ep": ep}
+
+        # ---- Progress bar (one line, updated in place) ----
+        pbar.update(1)
+        pbar.set_description(
+            f"{variant} "
+            f"best:{best_global_return:+.3g} "
+            f"ep_best:{ep_best:+.3g} "
+            f"mean:{ep_mean:+.3g} "
+            f"ent:{ent_mean:.3f}({ent_root:.3f}) "
+            f"loss(p/v/r):{ploss:.2g}/{vloss:.2g}/{rloss:.2g} "
+            f"buf:{bsize} step:{tstep}"
+        )
+
+        # ---- Milestone line (greppable in log files) ----
+        if (ep + 1) % 5 == 0 or ep == variant_args.episodes - 1:
+            per_ch_str = " ".join(
+                f"{n[:4]}={info['raw_value']:+.2g}"
+                for n, info in best_per_reward.items()
+            )
+            tqdm.write(
+                f"  [{variant}] ep={ep + 1:>4}/{variant_args.episodes} "
+                f"best={best_global_return:+.4g} mean={ep_mean:+.4g} "
+                f"ent={ent_mean:.3f} buf={bsize} step={tstep} | "
+                f"per-channel-best: {per_ch_str}"
+            )
+
+        # ---- wandb log ----
         log_dict = {
             "episode": ep,
             "best_return": best_global_return,
             "best_return_this_ep": ep_best,
+            "mean_return": ep_mean,
+            "entropy_mean": ent_mean,
+            "entropy_root": ent_root,
+            "policy_loss": ploss,
+            "value_loss": vloss,
+            "reward_loss": rloss,
+            "total_loss": stats.get("total_loss", float("nan")),
+            "buffer_size": bsize,
+            "train_step": tstep,
         }
-        log_dict.update(
-            {
-                k: v
-                for k, v in stats.items()
-                if k not in ["best_return", "best_seq", "per_reward_means"]
-            }
-        )
         for name, val in stats.get("per_reward_means", {}).items():
-            log_dict[f"reward/{name}"] = val
-
+            log_dict[f"reward_mean/{name}"] = val
+        # Running per-channel best raw values — one wandb scalar per
+        # tuned channel, e.g. ``best_per_channel/flops``. The companion
+        # sequences are too large to log every step; we dump them once
+        # at the end below.
+        for name, info in best_per_reward.items():
+            log_dict[f"best_per_channel/{name}"] = info["raw_value"]
+            log_dict[f"best_per_channel_weighted_total/{name}"] = info[
+                "weighted_total"
+            ]
         wandb.log(log_dict)
 
-        if (ep + 1) % 25 == 0 or ep == variant_args.episodes - 1:
-            print(
-                f"  [{variant}] ep={ep + 1}/{variant_args.episodes} best={best_global_return:+.4g} step={stats.get('train_step', 0)}"
+    pbar.close()
+
+    # ---- Final per-variant summary (lands at the end of the log) ----
+    tqdm.write(f"\n========== [{variant}] FINAL ==========")
+    tqdm.write(f"  overall best weighted return: {best_global_return:+.6g}")
+    tqdm.write(f"  best sequence: {best_global_seq}")
+    if best_per_reward:
+        tqdm.write(f"  best-per-channel (raw episode-sum on that channel):")
+        # Sort by channel name for stable output.
+        for name in sorted(best_per_reward):
+            info = best_per_reward[name]
+            tqdm.write(
+                f"    {name:<18s}  raw={info['raw_value']:+.4g}  "
+                f"weighted={info['weighted_value']:+.4g}  "
+                f"(found at ep {info['ep']})  seq={info['seq']}"
             )
+
+    # Final wandb summary entries (single scalars + per-channel best
+    # sequences as a string).
+    summary: dict = {"best_global_return": best_global_return}
+    for name, info in best_per_reward.items():
+        summary[f"final_best_per_channel/{name}_raw"] = info["raw_value"]
+        summary[f"final_best_per_channel/{name}_weighted"] = info["weighted_value"]
+        summary[f"final_best_per_channel/{name}_seq"] = str(info["seq"])
+    if best_global_seq is not None:
+        summary["best_global_seq"] = str(best_global_seq)
+    wandb.log(summary)
 
     if variant_args.replay_checkpoint_path:
         ray.get(
             spmd_actor.checkpoint_replay.remote(variant_args.replay_checkpoint_path)
         )
 
-    wandb.log({"best_global_return": best_global_return})
     wandb.finish()
 
     ray.kill(spmd_actor, no_restart=True)
