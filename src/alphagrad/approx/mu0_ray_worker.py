@@ -767,25 +767,24 @@ class SPMDServerWorker:
                         w_batch, self.args.minibatches, sh_key
                     )
 
-                    for i in range(self.args.minibatches):
-                        batch_i = jax.tree_util.tree_map(lambda x: x[i], batches)
-                        b_size = jax.tree_util.tree_leaves(batch_i)[0].shape[0]
+                    b_size = jax.tree_util.tree_leaves(batches)[0].shape[1]
 
-                        if ds is not None and b_size % num_devs == 0:
-                            batch_i = jax.tree.map(
-                                lambda x: jax.device_put(x, ds), batch_i
-                            )
-
-                        (
-                            self.state["agent"],
-                            self.state["opt_state"],
-                            last_loss,
-                            last_parts,
-                        ) = self.state["train_minibatch"](
-                            self.state["agent"],
-                            self.state["opt_state"],
-                            batch_i,
+                    if scan_ds is not None and b_size % num_devs == 0:
+                        batches = jax.tree.map(
+                            lambda x: jax.device_put(x, scan_ds), batches
                         )
+
+                    (
+                        self.state["agent"],
+                        self.state["opt_state"],
+                        last_loss,
+                        last_parts,
+                    ) = self.state["train_minibatches"](
+                        self.state["agent"],
+                        self.state["opt_state"],
+                        batches,
+                    )
+
                     self.train_step_counter += self.args.minibatches
                     stats.update(
                         {
