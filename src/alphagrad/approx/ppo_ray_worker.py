@@ -57,6 +57,7 @@ from alphagrad.approx.common import (
     vertex_avail_at_step,
 )
 from alphagrad.approx.common.gae import get_advantages
+from alphagrad.utils import symlog
 from alphagrad.approx.env import (
     MAX_RULES_PER_VERTEX,
     MAX_TOKENS,
@@ -421,7 +422,12 @@ class PPORayWorker:
                 surr1 = ratio * adv
                 surr2 = jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps) * adv
                 policy_loss = -jnp.minimum(surr1, surr2)
-                value_loss = (value - ret) ** 2
+                # `value` is the symlog-scale prediction (matches gae.py's
+                # convention — it applies symexp(value) internally when
+                # computing the bootstrap term). `ret` is in raw scale,
+                # so train the head against symlog(ret) to keep the loss
+                # well-conditioned even when rewards run from -1e7 to 0.
+                value_loss = (value - symlog(ret)) ** 2
                 # Categorical entropy = -sum(p log p).
                 p = jax.nn.softmax(logits)
                 entropy = -jnp.sum(p * log_probs)
