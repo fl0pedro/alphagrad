@@ -185,11 +185,16 @@ def _build_actor_state(
 
     if is_spmd:
         mesh = Mesh(np.array(jax.devices()), axis_names=("dev",))
-
         replicated_sharding = NamedSharding(mesh, PartitionSpec())
+        data_sharding = NamedSharding(mesh, PartitionSpec("dev")) # Add this
 
-    def shard_leaf(x):
-        return jax.device_put(x, replicated_sharding) if eqx.is_array(x) else x
+        def shard_leaf(x):
+            return jax.device_put(x, replicated_sharding) if eqx.is_array(x) else x
+
+        agent = jax.tree.map(shard_leaf, agent)
+        opt_state = jax.tree.map(shard_leaf, opt_state)
+    else:
+        data_sharding = None
 
     key, eval_key = jrand.split(key)
     eval_samples = generate_eval_samples(env, eval_key, args.num_eval_samples)
@@ -502,6 +507,7 @@ def _build_actor_state(
         "rollout_fn": make_rollout_fn(agent),
         "train_minibatch": train_minibatch,
         "key": key,
+        "data_sharding": data_sharding,
     }
 
 
@@ -537,11 +543,20 @@ class SPMDServerWorker:
             if preference_np is None
             else jnp.asarray(preference_np, jnp.float32)
         )
+
+        keys = jrand.split(jrand.PRNGKey(int(rng_seed)), self.state["num_envs"])
+
+        ds = self.state.get("data_sharding")
+        if ds is not None:
+            self.state["env_states"] = jax.tree.map(lambda x: jax.device_put(x, ds), self.state["env_states"])
+            pref = jax.device_put(pref, ds)
+            keys = jax.device_put(keys, ds)
+
         traj = self.state["rollout_fn"](
             self.state["agent"],
             jnp.asarray(self.args.temperature, jnp.float32),
             self.state["env_states"],
-            jrand.split(jrand.PRNGKey(int(rng_seed)), self.state["num_envs"]),
+            keys, # Use the explicit variable
             pref,
             self.state["vertex_features"],
             self.state["reward_weights"],
@@ -643,7 +658,12 @@ class SPMDServerWorker:
                     w_batch, self.args.minibatches, sh_key
                 )
 
-                for i in range(self.args.minibatches):
+for i in range(self.args.minibatches):
+                    batch_i = jax.tree_util.tree_map(lambda x: x[i], batches)
+                    
+                    if ds is not None:
+                        batch_i = jax.tree.map(lambda x: jax.device_put(x, ds), batch_i)
+
                     (
                         self.state["agent"],
                         self.state["opt_state"],
@@ -652,7 +672,7 @@ class SPMDServerWorker:
                     ) = self.state["train_minibatch"](
                         self.state["agent"],
                         self.state["opt_state"],
-                        jax.tree_util.tree_map(lambda x: x[i], batches),
+                        batch_i,
                     )
                 self.train_step_counter += self.args.minibatches
                 stats.update(
@@ -676,24 +696,29 @@ class SPMDServerWorker:
 
     def reward_vec_means(self, rng_seed: int, num_rollouts: int) -> np.ndarray:
         sum_vec = np.zeros((NUM_REWARDS,), dtype=np.float32)
+        ds = self.state.get("data_sharding")
+        
         for i in range(num_rollouts):
             pref = jnp.zeros((self.state["num_envs"], NUM_REWARDS), jnp.float32)
+            env_states = jax.vmap(lambda _: self.state["env"].reset())(jnp.arange(self.state["num_envs"]))
+            keys = jrand.split(jrand.PRNGKey(int(rng_seed) + i * 31 + 1), self.state["num_envs"])
+            
+            if ds is not None:
+                pref = jax.device_put(pref, ds)
+                env_states = jax.tree.map(lambda x: jax.device_put(x, ds), env_states)
+                keys = jax.device_put(keys, ds)
+
             traj = self.state["rollout_fn"](
                 self.state["agent"],
                 jnp.asarray(self.args.temperature, jnp.float32),
-                jax.vmap(lambda _: self.state["env"].reset())(
-                    jnp.arange(self.state["num_envs"])
-                ),
-                jrand.split(
-                    jrand.PRNGKey(int(rng_seed) + i * 31 + 1), self.state["num_envs"]
-                ),
+                env_states,
+                keys,
                 pref,
                 self.state["vertex_features"],
                 self.state["reward_weights"],
                 jnp.asarray(self._pin_rules_default, dtype=jnp.bool_),
             )
-            sum_vec += np.asarray(traj.reward_vec).sum(axis=(0, 1))
-        return sum_vec / max(
+            sum_vec += np.asarray(traj.reward_vec).sum(axis=(0, 1))        return sum_vec / max(
             float(num_rollouts * self.state["num_envs"] * self.state["rollout_length"]),
             1.0,
         )
