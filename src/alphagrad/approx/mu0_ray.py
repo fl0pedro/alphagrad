@@ -157,26 +157,25 @@ def _run_one_variant(args, variant: str) -> None:
 
     print(f"\n========== variant: {variant} ==========")
     spmd_kwargs = {"num_gpus": args.spmd_gpus} if args.spmd_gpus > 0 else {}
+
     spmd_actor = SPMDActor.options(**spmd_kwargs).remote(
         args_dict, variant, int(variant_args.seed)
     )
 
     cpu_workers = [
         CPUApproximationActor.options(
-            num_cpus=1, 
-            num_gpus=0, 
-            runtime_env={"env_vars": {"JAX_PLATFORMS": "cpu"}}
+            num_cpus=1, num_gpus=0, runtime_env={"env_vars": {"JAX_PLATFORMS": "cpu"}}
         ).remote(args_dict, variant, i)
         for i in range(args.num_cpu_workers)
     ]
 
+    ray.get(spmd_actor.init_server.remote(cpu_workers))
     ray.get([spmd_actor.ready.remote()] + [c.ready.remote() for c in cpu_workers])
     print(f"  actors spawned and JIT-warm in {time.time() - args.t_start:.1f}s")
 
     if variant_args.calibrate_steps > 0:
         _run_calibration(variant_args, spmd_actor, variant_args.calibrate_steps)
 
-    # Launch asynchronous CPU tasks
     cpu_tasks = [c.compile_approximations.remote() for c in cpu_workers]
 
     best_global_return = -float("inf")
