@@ -424,23 +424,23 @@ def _build_actor_state(
                     actions_path[2 + 2 * slot_indices].astype(jnp.int32),
                 )
 
+                is_stop = p_seq == PAIR_STOP
+                has_stopped = jnp.cumsum(is_stop.astype(jnp.int32)) > 0
+                base_final = jnp.where(has_stopped[:, None], -1, _PAIR_TO_BASE[p_seq])
+                factor_final = jnp.where(has_stopped, 0, jnp.asarray(factor_table_np, dtype=jnp.int32)[f_seq])
+                specs = jnp.concatenate([base_final, factor_final[:, None]], axis=-1).astype(jnp.int32)
+                
+                pad_len = MAX_RULES_PER_VERTEX - specs.shape[0]
+                if pad_len > 0:
+                    specs = jnp.concatenate([specs, jnp.tile(jnp.array([-1, -1, 0], dtype=jnp.int32), (pad_len, 1))], axis=0)
+                else:
+                    specs = specs[:MAX_RULES_PER_VERTEX]
+
                 env_action = StepAction(
                     target_vertex=jnp.asarray(v_idx + 1, jnp.int32),
-                    rule_specs=jnp.stack(
-                        [
-                            jnp.concatenate(
-                                [
-                                    _PAIR_TO_BASE[p],
-                                    jnp.where(p == PAIR_STOP, 0, factor_table[f])[None],
-                                ]
-                            ).astype(jnp.int32)
-                            for p, f in zip(p_seq, f_seq)
-                        ]
-                        + [jnp.array([-1, -1, 0], jnp.int32)]
-                        * max(0, MAX_RULES_PER_VERTEX - max_rules)
-                    )[:MAX_RULES_PER_VERTEX],
+                    rule_specs=specs,
                 )
-                env_out = env.step(state, env_action)
+                env_out = env_with_samples.step(state, env_action)
 
                 next_latent_cached, _ = lax.scan(
                     lambda lat, idx: (
@@ -538,12 +538,6 @@ def _build_actor_state(
             scan_body, dynamic_carry, all_batches
         )
         final_agent, final_opt = eqx.combine(final_dyn_carry, static_carry)
-
-        return final_agent, final_opt, jnp.mean(losses), jax.tree.map(jnp.mean, parts)
-
-        (final_agent, final_opt), (losses, parts) = lax.scan(
-            scan_body, (agent_local, opt_state_local), all_batches
-        )
 
         return final_agent, final_opt, jnp.mean(losses), jax.tree.map(jnp.mean, parts)
 
@@ -842,6 +836,9 @@ class CPUApproximationWorker:
     def compile_approximations(self) -> dict:
         time.sleep(1)
         return {"status": "compiled"}
+
+    def evaluate_graph(self, o_list, transforms, eval_samples):
+        return {}
 
     def ready(self) -> bool:
         return True
