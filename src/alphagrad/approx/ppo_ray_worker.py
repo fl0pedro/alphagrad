@@ -354,6 +354,15 @@ class PPORayWorker:
         self.mesh = Mesh(np.asarray(devices), axis_names=("dev",))
         self.replicated_sharding = NamedSharding(self.mesh, PartitionSpec())
         self.data_sharding = NamedSharding(self.mesh, PartitionSpec("dev"))
+        # Update_step batches go through a 2-D layout
+        # ``(num_minibatches, mb_size, ...)`` — the data-parallel axis is
+        # the mb_size dimension (axis 1) since the minibatch axis is the
+        # Python-side loop variable. Mirrors `scan_data_sharding` in
+        # mu0_ray_worker. Keeps the per-device working set bounded by
+        # mb_size / num_devices instead of by mb_size.
+        self.scan_data_sharding = NamedSharding(
+            self.mesh, PartitionSpec(None, "dev"),
+        )
 
         # Auto-tune num_envs to a multiple of num_devices so the shard
         # split is even. Mirrors mu0_ray_worker's tuning — we silently
@@ -843,9 +852,13 @@ class PPORayWorker:
             buf_dones[t] = np.asarray(state.terminated).astype(np.float32)
 
         # Bootstrap value at the final state (for the GAE next_value
-        # term on the last timestep).
+        # term on the last timestep). `state` is sharded along the env
+        # axis under data_sharding; shard the keys to match so the
+        # vmap doesn't gather the state onto one device.
         key, boot_key = jrand.split(key)
-        boot_keys = jrand.split(boot_key, N)
+        boot_keys = jax.device_put(
+            jrand.split(boot_key, N), self.data_sharding,
+        )
         bootstrap = np.asarray(
             jax.vmap(lambda s, k: self.agent.value(s.tokens, key=k))(state, boot_keys),
         )
@@ -948,29 +961,69 @@ class PPORayWorker:
         flat_returns = flat_returns[perm]
         flat_advantages = flat_advantages[perm]
 
-        mb_size = (N * T) // self.minibatches
+        total = N * T
+        mb_size = total // self.minibatches
         if mb_size == 0:
-            mb_size = N * T  # fall back to a single mini-batch
+            mb_size = total
             mb_count = 1
         else:
             mb_count = self.minibatches
+        # The data-parallel axis (mb_size) must be evenly splittable
+        # across devices for the SPMD shard. If it isn't, fall back to
+        # a single un-sharded minibatch — the user will see the warning
+        # and can pick --minibatches accordingly.
+        if mb_size % self.num_devices != 0:
+            print(
+                f"[ppo_ray] mb_size={mb_size} is not divisible by "
+                f"num_devices={self.num_devices}; update_step will run "
+                f"un-sharded (likely host-bound + may OOM). Pick a "
+                f"--minibatches such that (num_envs*rollout_length)/"
+                f"minibatches is a multiple of {self.num_devices}.",
+            )
+            mb_sharded = False
+        else:
+            mb_sharded = True
+
+        # Reshape to ``(mb_count, mb_size, ...)`` so we can shard the
+        # data axis (axis 1) across devices. Each minibatch index `i`
+        # then yields a per-mb tensor that already lives in the
+        # data-parallel layout — the loss vmap's leading axis is the
+        # sharded one, and XLA distributes the work without a gather.
+        def _reshape_mb(flat, mb_extra_shape=()):
+            return flat.reshape((mb_count, mb_size, *mb_extra_shape))
+
+        mb_tokens = _reshape_mb(flat_tokens, (MAX_TOKENS,))
+        mb_actions = _reshape_mb(flat_actions)
+        mb_op = _reshape_mb(flat_op)
+        mb_i = _reshape_mb(flat_i)
+        mb_j = _reshape_mb(flat_j)
+        mb_f = _reshape_mb(flat_f)
+        mb_vmask = _reshape_mb(flat_vmask)
+        mb_log_probs = _reshape_mb(flat_log_probs)
+        mb_returns = _reshape_mb(flat_returns)
+        mb_advantages = _reshape_mb(flat_advantages)
+
+        if mb_sharded:
+            _shard = lambda x: jax.device_put(x, self.scan_data_sharding)
+            mb_tokens = _shard(mb_tokens)
+            mb_actions = _shard(mb_actions)
+            mb_op = _shard(mb_op)
+            mb_i = _shard(mb_i)
+            mb_j = _shard(mb_j)
+            mb_f = _shard(mb_f)
+            mb_vmask = _shard(mb_vmask)
+            mb_log_probs = _shard(mb_log_probs)
+            mb_returns = _shard(mb_returns)
+            mb_advantages = _shard(mb_advantages)
 
         agent = self.agent
         opt_state = self.opt_state
         last_aux = {}
         for i in range(mb_count):
-            sl = slice(i * mb_size, (i + 1) * mb_size)
             batch = (
-                flat_tokens[sl],
-                flat_actions[sl],
-                flat_op[sl],
-                flat_i[sl],
-                flat_j[sl],
-                flat_f[sl],
-                flat_vmask[sl],
-                flat_log_probs[sl],
-                flat_returns[sl],
-                flat_advantages[sl],
+                mb_tokens[i], mb_actions[i],
+                mb_op[i], mb_i[i], mb_j[i], mb_f[i], mb_vmask[i],
+                mb_log_probs[i], mb_returns[i], mb_advantages[i],
             )
             key, mb_key = jrand.split(key)
             agent, opt_state, aux = self._update_step(
