@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import collections
 import os
-import threading
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -747,173 +745,16 @@ def _aggregate_samples(values, want_top_quartile: bool):
     return stack.mean()
 
 
-# ---------------------------------------------------------------------------
-# In-memory LRU cache for `jit(jacve(...)).lower(...).compile()` results.
-#
-# The env's reward harness (`_callback`) re-builds and re-compiles the
-# approximate / exact jacobian per env-step. The original implementation
-# constructed a fresh ``jax.jit(...)`` object every call:
-#
-#     def compiled(transforms_arg=None):
-#         return jax.jit(
-#             jacve(config.target_fun, o_list, ..., transforms=transforms_arg),
-#             keep_unused=True,
-#         ).lower(*args_for_lower).compile()
-#
-# JAX's in-memory jit cache is keyed on the *Python identity* of the wrapped
-# callable. Because each call constructed a brand-new lambda/closure, the
-# cache always missed. Even with JAX's persistent disk compile cache enabled
-# (``JAX_COMPILATION_CACHE_DIR`` in ppo.py), every call still allocates a
-# fresh ``HloModule`` + ``Executable`` in process memory before the disk
-# cache lookup decides whether it can short-circuit the XLA passes — and
-# nothing references the previous ``Executable`` long enough for the disk
-# cache to skip the load.
-#
-# Empirically (pgi15-gpu10, ``--variant full`` profile, ep ≈ 10/20):
-#
-#     VmRSS @ start of probe : 96.2 GB
-#     VmRSS @ +60 s          : 99.9 GB
-#     VmRSS @ +120 s         : 110.3 GB        (~24–100 MB/s sustained)
-#     VmPeak                 : 166 GB
-#     Anonymous Pss          : 100.8 GB
-#     Python heap [heap]     : 7.4 GB  (~7 % of total — not Python objects)
-#     Anonymous regions ≥100 MB
-#                 count      : 216 regions
-#                 total      : 96.2 GB
-#     GPU util (trainer)     : 0 %
-#     GPU util (callback)    : 0 %
-#
-# 216 anonymous regions of 100 MB–1 GB each is the fingerprint of
-# accumulated XLA ``Executable`` + ``HloModule`` artifacts. The GPU sits
-# idle while the host RAM bleeds — training is host-bound on a leak, not
-# bound on real compute. Three trainers per sbatch × ~100 GB / process
-# blew the cgroup memory limit and got OOM-killed every time.
-#
-# Fix: cache the compiled result by a key that captures everything that
-# actually determines the HLO content. The policy converges to a small
-# set of unique (o_list, transforms) tuples after a few episodes, so an
-# LRU of moderate size achieves near-100 % hit rate in steady state.
-#
-# Cache size budget:
-#   * Each compiled entry is ~100 MB – 1 GB on host.
-#   * 64 × ~150 MB ≈ 10 GB worst-case host footprint, which still fits
-#     comfortably within a typical 200 GB cgroup limit (three trainers
-#     per sbatch ⇒ ~30 GB collectively).
-#   * Override via ``ALPHAGRAD_COMPILE_CACHE`` env var; set 0 to disable
-#     caching (useful for debugging or when leak is suspected elsewhere).
-# ---------------------------------------------------------------------------
-_COMPILE_CACHE: "collections.OrderedDict[tuple, object]" = collections.OrderedDict()
-_COMPILE_CACHE_LOCK = threading.Lock()
-_COMPILE_CACHE_MAX_SIZE = int(os.environ.get("ALPHAGRAD_COMPILE_CACHE", "64"))
-_COMPILE_CACHE_HITS = 0
-_COMPILE_CACHE_MISSES = 0
-
-
-def get_compile_cache_stats() -> dict[str, int]:
-    """Return a snapshot of cache hit / miss / size — handy for spot-checks
-    from a long-running trainer (e.g. periodic wandb log)."""
-    with _COMPILE_CACHE_LOCK:
-        return {
-            "hits": _COMPILE_CACHE_HITS,
-            "misses": _COMPILE_CACHE_MISSES,
-            "size": len(_COMPILE_CACHE),
-            "max_size": _COMPILE_CACHE_MAX_SIZE,
-        }
-
-
-def _normalise_transforms_key(transforms_arg):
-    """Hashable view of ``transforms`` list-of-tuples. ``Diag`` / ``Compress``
-    are ``@dataclass(frozen=True)`` so they're hashable as-is; just convert
-    the outer list to a tuple."""
-    if transforms_arg is None:
-        return None
-    return tuple((int(v), tuple(rules)) for v, rules in transforms_arg)
-
-
-def _get_cached_compiled(
-    *,
-    target_fun: Callable,
-    argnums: tuple,
-    has_aux: bool,
-    sparse: bool,
-    o_list: tuple,
-    transforms_arg,
-    args_for_lower,
-):
-    """LRU-cached ``jit(jacve(...)).lower(...).compile()``.
-
-    Key components (everything that affects the HLO):
-        * ``id(target_fun)``  — stable across the env's lifetime
-        * ``argnums``         — env-static tuple of int positions
-        * ``has_aux, sparse`` — env-static booleans
-        * ``o_list``          — per-step elimination order (tuple of ints)
-        * ``transforms``      — per-step sparsity rules (or ``None`` for the
-                                exact-jacobian variant)
-        * ``args_signature``  — shape/dtype of each arg in ``args_for_lower``
-                                (env-static in practice, but include for
-                                safety against future per-step shape changes)
-    """
-    global _COMPILE_CACHE_HITS, _COMPILE_CACHE_MISSES
-
-    transforms_key = _normalise_transforms_key(transforms_arg)
-    args_sig = tuple(
-        (tuple(getattr(a, "shape", ())), str(getattr(a, "dtype", None)))
-        for a in jax.tree_util.tree_leaves(args_for_lower)
-    )
-    key = (
-        id(target_fun),
-        argnums,
-        bool(has_aux),
-        bool(sparse),
-        tuple(o_list),
-        transforms_key,
-        args_sig,
-    )
-
-    with _COMPILE_CACHE_LOCK:
-        if key in _COMPILE_CACHE:
-            _COMPILE_CACHE.move_to_end(key)
-            _COMPILE_CACHE_HITS += 1
-            return _COMPILE_CACHE[key]
-        _COMPILE_CACHE_MISSES += 1
-
-    # Compile outside the lock so concurrent ``io_callback`` invocations for
-    # *different* keys can compile in parallel. Two threads compiling the
-    # same key is a rare race; the second insert wins (we re-check under the
-    # lock after compile finishes).
-    compiled = (
-        jax.jit(
-            jacve(
-                target_fun,
-                list(o_list),
-                argnums=argnums,
-                has_aux=has_aux,
-                sparse_representation=sparse,
-                transforms=transforms_arg,
-            ),
-            keep_unused=True,
-        )
-        .lower(*args_for_lower)
-        .compile()
-    )
-
-    if _COMPILE_CACHE_MAX_SIZE <= 0:
-        # Caching disabled — return the freshly compiled object without
-        # inserting. Caller still gets correct semantics, just no LRU.
-        return compiled
-
-    with _COMPILE_CACHE_LOCK:
-        existing = _COMPILE_CACHE.get(key)
-        if existing is not None:
-            # Another thread beat us to insertion. Drop our redundant
-            # compile and return the cached entry to keep the LRU ordering
-            # consistent.
-            _COMPILE_CACHE.move_to_end(key)
-            return existing
-        _COMPILE_CACHE[key] = compiled
-        while len(_COMPILE_CACHE) > _COMPILE_CACHE_MAX_SIZE:
-            _COMPILE_CACHE.popitem(last=False)
-    return compiled
+# The in-process LRU around `jit(jacve(...)).lower().compile()` that lived
+# here was thrashing under the actual rollout distribution: hit rate stayed
+# at ~2 % at startup and only climbed to ~11 % after ~15 episodes, meaning
+# we paid the full Executable allocation on virtually every call AND held
+# 64 stale entries on the side. Dropping the cache is a net win — the host
+# allocator's behaviour without the side-table is no worse than with the
+# thrashing LRU, and removing it eliminates the second source of
+# accumulated `HloModule` references hanging off OrderedDict slots.
+# See cpu_approx_worker.py for the Ray-actor path that bounds the
+# remaining `cost_analysis()` C++ leak by recycling workers.
 
 
 def _callback(
@@ -1149,28 +990,40 @@ def _callback(
         else args
     )
 
-    # LRU cache lookup — see ``_get_cached_compiled`` above for the
-    # rationale (without this, every env-step leaks ~100 MB – 1 GB of host
-    # RAM via accumulated ``HloModule`` + ``Executable`` allocations, and
-    # the cgroup OOM-kills the trainer after a few hours).
-    o_list_key = tuple(o_list)
-    compiled_approx = _get_cached_compiled(
-        target_fun=config.target_fun,
-        argnums=config.argnums,
-        has_aux=config.has_aux,
-        sparse=config.sparse,
-        o_list=o_list_key,
-        transforms_arg=transforms,
-        args_for_lower=args_for_lower,
+    # Per-call jit + lower + compile. The previous LRU around this didn't
+    # pay off (~2 % hit at startup, only ~11 % after 15 eps); the trainer
+    # is host-bound on the Executable allocation either way, so the
+    # cleanest thing is to not hold them on the side. The Ray-actor pool
+    # in `cpu_approx_worker` is where we'll bound the residual
+    # `cost_analysis()` C++ allocation, via periodic actor recycling.
+    compiled_approx = (
+        jax.jit(
+            jacve(
+                config.target_fun,
+                list(o_list),
+                argnums=config.argnums,
+                has_aux=config.has_aux,
+                sparse_representation=config.sparse,
+                transforms=transforms,
+            ),
+            keep_unused=True,
+        )
+        .lower(*args_for_lower)
+        .compile()
     )
-    compiled_exact = _get_cached_compiled(
-        target_fun=config.target_fun,
-        argnums=config.argnums,
-        has_aux=config.has_aux,
-        sparse=config.sparse,
-        o_list=o_list_key,
-        transforms_arg=None,
-        args_for_lower=args_for_lower,
+    compiled_exact = (
+        jax.jit(
+            jacve(
+                config.target_fun,
+                list(o_list),
+                argnums=config.argnums,
+                has_aux=config.has_aux,
+                sparse_representation=config.sparse,
+            ),
+            keep_unused=True,
+        )
+        .lower(*args_for_lower)
+        .compile()
     )
 
     # XLA cost analysis — flops + bytes accessed. Falls back to 0 when the
@@ -1553,3 +1406,169 @@ class VertexEliminationEnv:
             )
 
         return jax.lax.cond(state.terminated, _step_done, _step_process, None)
+
+    # ---------------------------------------------------------------------
+    # External-tokenizer entry points
+    # ---------------------------------------------------------------------
+    # The pair below splits `step()` (and `reset()`) into the JIT-only
+    # half (`*_external_jax_part`) and a host-side stitcher
+    # (`assemble_*_result`). The point is to take `io_callback` out of
+    # the hot path: today every `step()` does a host roundtrip + GIL-
+    # bound Python pass + unbounded `cost_analysis()` C++ allocation
+    # (see `_callback` and the comment at env.py:1182). With the split,
+    # the driver runs the JIT-side over a batch of envs once, ships the
+    # `(order, specs, step)` triples to a pool of CPU workers (see
+    # `cpu_approx_worker.CpuApproximationServer`), and stitches the
+    # tokenizer outputs back into the state in numpy.
+    #
+    # The existing `reset()` / `step()` are unchanged — single-process
+    # callers (legacy ppo, mu0, tests) keep working as-is. The new
+    # methods are opt-in and have **no behavioural difference** from the
+    # io_callback path for the same inputs: the only thing that moves is
+    # where the tokenizer work runs.
+
+    def step_external_jax_part(self, state: EnvState, action):
+        """JIT-only half of `step()` — everything except the tokenizer.
+
+        Returns the partial new state with placeholders for the three
+        tokenizer-dependent fields (`tokens`, `eqn_ids`, `reward`), plus
+        the `(order, specs, step)` triple the caller hands to the CPU
+        worker. The caller then calls `assemble_step_result(...)` with
+        the worker's output to recover the full :class:`EnvOut`.
+
+        The action-handling and order-update logic is byte-for-byte
+        identical to `step()` — this method is the JIT-friendly subset
+        of the same function. Keep them in sync if either changes.
+
+        Notes:
+            * Not `@jit`-decorated so callers can compose with their
+              policy's act() into a single JIT step.
+            * The terminated-state guard (the `state.terminated` branch
+              from `step()`) lives on the assemble side; if the env was
+              already terminated, `assemble_step_result` returns
+              the input state unchanged and the tokenizer output is
+              discarded.
+        """
+        if isinstance(action, StepAction):
+            target_vertex = jnp.asarray(action.target_vertex, dtype=jnp.int32)
+            rule_specs = jnp.asarray(action.rule_specs, dtype=jnp.int32)
+        else:
+            action = jnp.asarray(action, dtype=jnp.int32)
+            sp_type = action // MAX_TOKENS
+            target_vertex = action % MAX_TOKENS
+            rule_specs = _legacy_sp_to_specs(sp_type)
+
+        idx = state.step_count
+        new_step = idx + 1
+        curr_order = state.order
+        curr_specs = state.sparsity_specs
+
+        pos = jnp.argwhere(curr_order == target_vertex, size=1).squeeze()
+
+        indices = jnp.arange(curr_order.shape[0])
+        shifted = jnp.where((indices > idx) & (indices <= pos), indices - 1, indices)
+
+        new_order = curr_order[shifted.astype(jnp.int32)].at[idx].set(target_vertex)
+        new_specs = curr_specs[shifted.astype(jnp.int32)].at[idx].set(rule_specs)
+
+        terminated = new_step >= state.max_steps
+
+        v_idx = target_vertex - jnp.int32(1)
+        updated_axis_v = _apply_rules_to_axis_state(
+            state.axis_state[v_idx], rule_specs,
+        )
+        new_axis_state = state.axis_state.at[v_idx].set(updated_axis_v)
+
+        partial_state = EnvState(
+            order=new_order,
+            sparsity_specs=new_specs,
+            tokens=jnp.zeros_like(state.tokens),
+            eqn_ids=jnp.zeros_like(state.eqn_ids),
+            axis_state=new_axis_state,
+            axis_valid_mask=state.axis_valid_mask,
+            step_count=new_step,
+            max_steps=state.max_steps,
+            reward=jnp.zeros(NUM_REWARDS, dtype=jnp.float32),
+            terminated=terminated,
+        )
+        return partial_state, new_order, new_specs, new_step
+
+    def assemble_step_result(
+        self,
+        state_before: EnvState,
+        partial_state: EnvState,
+        tokens,
+        eqn_ids,
+        reward,
+    ) -> EnvOut:
+        """Stitch tokenizer outputs into the partial state.
+
+        Mirrors the `state.terminated` branch from `step()`: if the env
+        was already terminated, returns the input `state_before`
+        unchanged (with zero reward, terminated=True). Otherwise the
+        new EnvState gets the tokenizer's `(tokens, eqn_ids, reward)`
+        plus everything from `partial_state`.
+
+        Inputs may be numpy or jnp arrays — they're coerced to the env's
+        canonical dtypes before being stored.
+        """
+        tokens = jnp.asarray(tokens, dtype=jnp.int32)
+        eqn_ids = jnp.asarray(eqn_ids, dtype=jnp.int32)
+        reward = jnp.asarray(reward, dtype=jnp.float32)
+        new_state = partial_state._replace(
+            tokens=tokens,
+            eqn_ids=eqn_ids,
+            reward=reward,
+        )
+
+        def _process(_):
+            return EnvOut(new_state, reward, partial_state.terminated)
+
+        def _done(_):
+            return EnvOut(
+                state_before,
+                jnp.zeros(NUM_REWARDS, jnp.float32),
+                jnp.array(True, dtype=jnp.bool_),
+            )
+
+        return jax.lax.cond(state_before.terminated, _done, _process, None)
+
+    def reset_external_jax_part(self):
+        """JIT-only half of `reset()`. Returns ``(partial_state, order,
+        specs, step=0)``.
+
+        Unlike `reset()`, this **does not** broadcast across
+        ``num_envs`` — the caller is responsible for vmapping (or
+        building a batch by hand in a Python loop). Broadcasting is
+        skipped because the typical caller wants to ship per-env
+        `(order, specs)` tensors to the worker pool, which is easier
+        when each shard owns its own (un-broadcast) state.
+        """
+        initial_order = jnp.array(self.valid_vertices, dtype=jnp.int32)
+        initial_specs = jnp.full(
+            (initial_order.shape[0], MAX_RULES_PER_VERTEX, 3),
+            -1,
+            dtype=jnp.int32,
+        )
+        initial_specs = initial_specs.at[..., 2].set(0)
+
+        partial_state = EnvState(
+            order=initial_order,
+            sparsity_specs=initial_specs,
+            tokens=jnp.zeros((MAX_TOKENS,), dtype=jnp.int32),
+            eqn_ids=jnp.zeros((MAX_TOKENS,), dtype=jnp.int32),
+            axis_state=self.axis_state_static,
+            axis_valid_mask=self.axis_valid_static,
+            step_count=jnp.array(0, dtype=jnp.int32),
+            max_steps=initial_order.shape[0],
+            reward=jnp.zeros(NUM_REWARDS, dtype=jnp.float32),
+            terminated=jnp.array(False, dtype=jnp.bool_),
+        )
+        return partial_state, initial_order, initial_specs, jnp.int32(0)
+
+    def assemble_reset_result(self, partial_state: EnvState, tokens, eqn_ids) -> EnvState:
+        """Fold the reset-time tokenizer output into the partial state."""
+        return partial_state._replace(
+            tokens=jnp.asarray(tokens, dtype=jnp.int32),
+            eqn_ids=jnp.asarray(eqn_ids, dtype=jnp.int32),
+        )
