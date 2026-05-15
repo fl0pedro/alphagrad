@@ -44,6 +44,7 @@ import jax.numpy as jnp
 import jax.random as jrand
 import numpy as np
 import optax
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from alphagrad.approx.common import (
     build_pair_valid_mask,
@@ -262,7 +263,32 @@ class PPORayWorker:
             env.valid_vertices, self.total_v,
         )
         self.rollout_length = self.num_valid
-        self.num_envs = int(getattr(self.args, "num_envs", 4))
+        # SPMD mesh — replicate agent / opt_state across all visible
+        # devices, shard env_states along the env axis. When there's only
+        # one device, the sharding annotations are no-ops; the same code
+        # path runs on a laptop CPU and a 4-GPU node.
+        devices = jax.devices()
+        self.num_devices = len(devices)
+        self.mesh = Mesh(np.asarray(devices), axis_names=("dev",))
+        self.replicated_sharding = NamedSharding(self.mesh, PartitionSpec())
+        self.data_sharding = NamedSharding(self.mesh, PartitionSpec("dev"))
+
+        # Auto-tune num_envs to a multiple of num_devices so the shard
+        # split is even. Mirrors mu0_ray_worker's tuning — we silently
+        # round up rather than reject the config so the user can pass
+        # round numbers without having to remember the device count.
+        requested_envs = int(getattr(self.args, "num_envs", 4))
+        if self.num_devices > 1 and requested_envs % self.num_devices != 0:
+            self.num_envs = (
+                max(self.num_devices, round(requested_envs / self.num_devices))
+                * self.num_devices
+            )
+            print(
+                f"[ppo_ray] num_envs tuned: {requested_envs} -> "
+                f"{self.num_envs} (multiple of {self.num_devices} devices)"
+            )
+        else:
+            self.num_envs = max(requested_envs, self.num_devices)
         self.minibatches = max(int(getattr(self.args, "minibatches", 1)), 1)
         self.ppo_eps = float(getattr(self.args, "ppo_eps", 0.2))
         self.value_coef = float(getattr(self.args, "value_coef", 0.5))
@@ -289,6 +315,10 @@ class PPORayWorker:
             key=agent_key,
         )
         self.agent = init_linear_weights(self.agent, init_key)
+        # Replicate the agent across all devices — under SPMD this is
+        # cheap (params are < 100 MB) and lets `act_step` / loss path
+        # run sharded without the trainer having to think about it.
+        self.agent = self._replicate(self.agent)
 
         schedule = optax.cosine_decay_schedule(
             float(self.args.lr),
@@ -302,13 +332,18 @@ class PPORayWorker:
         self.opt_state = self.optimizer.init(
             eqx.filter(self.agent, eqx.is_inexact_array),
         )
+        self.opt_state = self._replicate(self.opt_state)
 
-        # Pre-reset batched env state (the JAX side only — tokens come
-        # from a real callback once on construction since the very first
-        # rollout needs valid tokens; subsequent resets use the external
-        # path).
-        self.env_states = jax.vmap(lambda _: self.env.reset())(
+        # Pre-reset batched env state. The env axis (axis 0) is the
+        # data-parallel dimension; shard it across devices so each
+        # GPU owns ``num_envs // num_devices`` envs.
+        env_states = jax.vmap(lambda _: self.env.reset())(
             jnp.arange(self.num_envs),
+        )
+        self.env_states = jax.tree_util.tree_map(
+            lambda x: jax.device_put(x, self.data_sharding)
+            if eqx.is_array(x) else x,
+            env_states,
         )
 
         # Cache the per-env vertex-valid mask. It's static (depends only on
@@ -327,6 +362,18 @@ class PPORayWorker:
         if not raw:
             return ()
         return tuple(int(x.strip()) for x in raw.split(",") if x.strip())
+
+    def _replicate(self, tree):
+        """Place every array leaf onto every device (replicated sharding).
+
+        Static (non-array) leaves pass through unchanged. Matches the
+        `shard_leaf` pattern in `mu0_ray_worker._build_actor_state`.
+        """
+        return jax.tree_util.tree_map(
+            lambda x: jax.device_put(x, self.replicated_sharding)
+            if eqx.is_array(x) else x,
+            tree,
+        )
 
     def _vertex_avail(self, state):
         """`(num_envs, num_vertices)` 0/1 mask of vertices still in the
@@ -477,9 +524,15 @@ class PPORayWorker:
         key = jrand.PRNGKey(int(rng_seed))
         key, reset_key = jrand.split(key)
 
-        # Fresh on-policy episode: reset state for every env.
-        self.env_states = jax.vmap(lambda _: self.env.reset())(
+        # Fresh on-policy episode: reset state for every env. Preserve
+        # the sharded layout (data-parallel along the env axis).
+        env_states = jax.vmap(lambda _: self.env.reset())(
             jnp.arange(self.num_envs),
+        )
+        self.env_states = jax.tree_util.tree_map(
+            lambda x: jax.device_put(x, self.data_sharding)
+            if eqx.is_array(x) else x,
+            env_states,
         )
 
         # Rollout buffers — numpy is fine; we re-stage to JAX once for
@@ -510,9 +563,18 @@ class PPORayWorker:
                 order_np, specs_np, step_np,
             )
 
-            tokens_j = jnp.asarray(tokens_np, dtype=jnp.int32)
-            eqn_ids_j = jnp.asarray(eqn_ids_np, dtype=jnp.int32)
-            reward_j = jnp.asarray(reward_np, dtype=jnp.float32)
+            # Shard the Ray-returned numpy back to the env axis so the
+            # assemble JIT runs SPMD (otherwise JAX would gather the
+            # already-sharded `state` / `partial` onto one device).
+            tokens_j = jax.device_put(
+                jnp.asarray(tokens_np, dtype=jnp.int32), self.data_sharding,
+            )
+            eqn_ids_j = jax.device_put(
+                jnp.asarray(eqn_ids_np, dtype=jnp.int32), self.data_sharding,
+            )
+            reward_j = jax.device_put(
+                jnp.asarray(reward_np, dtype=jnp.float32), self.data_sharding,
+            )
             state = self._assemble(state, partial, tokens_j, eqn_ids_j, reward_j)
 
             # Record. We store the *post-step* tokens so the next-step
