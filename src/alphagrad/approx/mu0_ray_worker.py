@@ -718,7 +718,8 @@ class SPMDServerWorker:
                 self.state["reward_weights"],
                 jnp.asarray(self._pin_rules_default, dtype=jnp.bool_),
             )
-            sum_vec += np.asarray(traj.reward_vec).sum(axis=(0, 1))        return sum_vec / max(
+            sum_vec += np.asarray(traj.reward_vec).sum(axis=(0, 1))
+        return sum_vec / max(
             float(num_rollouts * self.state["num_envs"] * self.state["rollout_length"]),
             1.0,
         )
