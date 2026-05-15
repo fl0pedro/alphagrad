@@ -73,6 +73,11 @@ def _extend_argparser(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default="dsnn-vertex",
         help="wandb project name.",
     )
+    p.add_argument(
+        "--strict-config",
+        action="store_true",
+        help="Disable auto-tuning of num_envs and minibatches for GPU divisibility.",
+    )
     return p
 
 
