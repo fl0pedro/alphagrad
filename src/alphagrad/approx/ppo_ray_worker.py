@@ -70,7 +70,7 @@ from alphagrad.approx.env import (
     VertexEliminationEnv,
     micro_actions_to_rule_specs_jax,
 )
-from alphagrad.approx.heads import OP_DIAG, OP_END
+from alphagrad.approx.heads import OP_COMPRESS, OP_DIAG, OP_END
 
 
 # Stage F: which reward channels skip symlog when used in the
@@ -222,7 +222,12 @@ class SimplePPOAgent(eqx.Module):
         )
         self.value_head = MLP(embd_dim, 1, value_dims, key=keys[3])
         if dynamic_substeps:
-            self.op_type_head = MLP(embd_dim, 2, policy_dims, key=keys[4])
+            # 3-way op-type head: 0=DIAG, 1=COMPRESS, 2=END. The
+            # `compress_kinds` parameter on the env's translator stays
+            # at the default (0=mean) for now; learning the kind is an
+            # easy follow-up (add a 5th categorical head over
+            # COMPRESS_KINDS) but isn't needed for the first FULL run.
+            self.op_type_head = MLP(embd_dim, 3, policy_dims, key=keys[4])
             self.i_head = MLP(embd_dim, MAX_AXES_PER_VERTEX, policy_dims, key=keys[5])
             self.j_head = MLP(embd_dim, MAX_AXES_PER_VERTEX, policy_dims, key=keys[6])
             self.factor_head = MLP(embd_dim, num_factors, policy_dims, key=keys[7])
@@ -306,7 +311,7 @@ class SimplePPOAgent(eqx.Module):
         # Placeholders that match the dynamic shapes — the rollout /
         # loss paths gate on ``self.dynamic_substeps`` before reading
         # these, so the values are never observed.
-        zero_op = jnp.zeros((2,), dtype=jnp.float32)
+        zero_op = jnp.zeros((3,), dtype=jnp.float32)  # DIAG / COMPRESS / END
         zero_axes = jnp.zeros((MAX_AXES_PER_VERTEX,), dtype=jnp.float32)
         zero_factor = jnp.zeros((max(self.num_factors, 1),), dtype=jnp.float32)
         return vertex_logits, value, zero_op, zero_axes, zero_axes, zero_factor
@@ -618,12 +623,20 @@ class PPORayWorker:
                     log_prob_i = jax.nn.log_softmax(i_l_masked)[i_sample]
                     log_prob_j = jax.nn.log_softmax(j_l_masked)[j_sample]
                     log_prob_f = jax.nn.log_softmax(f_l)[f_sample]
-                    # Map op_sample ∈ {0,1} → {OP_DIAG, OP_END}. We
-                    # restrict the policy to DIAG and END (no COMPRESS)
-                    # in this first cut — COMPRESS routing through the
-                    # env's translator only works for the last vertex
-                    # in the partial order, and the wiring is a follow-up.
-                    op_type = jnp.where(op_sample == 0, OP_DIAG, OP_END)
+                    # 3-way op-type: 0→DIAG, 1→COMPRESS, 2→END. The
+                    # env's translator routes COMPRESS to a Compress
+                    # transform only when the chosen vertex is the
+                    # last one in the partial elimination order (see
+                    # env._callback's `v_idx != last_v_idx` guard);
+                    # for any earlier vertex the COMPRESS slot is
+                    # silently dropped. The policy gradient still
+                    # flows through the op-type head — the env's
+                    # behaviour just degrades gracefully to "no rule"
+                    # on the bad placements.
+                    op_type = jnp.where(
+                        op_sample == 0, OP_DIAG,
+                        jnp.where(op_sample == 1, OP_COMPRESS, OP_END),
+                    )
                     factor_val = factor_table[f_sample]
                     rule_specs = micro_actions_to_rule_specs_jax(
                         op_types=jnp.array([op_type], dtype=jnp.int32),
