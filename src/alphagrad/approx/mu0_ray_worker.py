@@ -41,6 +41,7 @@ from alphagrad.approx.env import (
     MAX_TOKENS,
     NUM_AXIS_PAIRS,
     NUM_REWARDS,
+    QUALITY_REWARD_INDICES,
     REWARD_INDEX,
     REWARD_NAMES,
     StepAction,
@@ -81,6 +82,54 @@ from alphagrad.approx.variants import (
 
 def _args_from_dict(args_dict: dict) -> SimpleNamespace:
     return SimpleNamespace(**args_dict)
+
+
+# Per-channel "do not discount" mask. ``cosine_sim`` and ``frob_residual``
+# (env.QUALITY_REWARD_INDICES = (6, 7)) are quality metrics computed
+# against the *final* approximated Jacobian — they don't accumulate over
+# the rollout the way the per-step compute/memory costs do, so applying
+# ``--discount < 1`` to them would penalise the terminal quality signal
+# by ``γ^T`` for no good reason. The per-step compute/memory channels
+# still see ``--discount`` normally.
+_NO_DISCOUNT_MASK = jnp.zeros((NUM_REWARDS,), dtype=jnp.bool_).at[
+    jnp.asarray(list(QUALITY_REWARD_INDICES), dtype=jnp.int32)
+].set(True)
+
+
+def _per_channel_discounted_returns(
+    reward_vec: "jax.Array",
+    weights: "jax.Array",
+    discount: float,
+) -> "jax.Array":
+    """Per-step return where some channels are not discounted.
+
+    ``reward_vec`` is (T, NUM_REWARDS); ``weights`` is (NUM_REWARDS,);
+    returns (T,) — the per-step ``G_t = Σ_{j≥t} γ_c^{j-t} w_c r_{c,j}``
+    with ``γ_c = 1.0`` for channels flagged in ``_NO_DISCOUNT_MASK``
+    and ``γ_c = discount`` otherwise.
+
+    Implementation: keep per-channel accumulators in a single ``lax.scan``
+    over time (reversed) so the cost is the same as the original
+    single-channel ``_discounted_returns`` (one scan + a final sum)
+    regardless of how many channels are involved.
+    """
+    weighted = reward_vec * weights  # (T, NUM_REWARDS)
+    gammas = jnp.where(
+        _NO_DISCOUNT_MASK,
+        jnp.float32(1.0),
+        jnp.float32(discount),
+    )  # (NUM_REWARDS,)
+
+    def step(carry, x):
+        # carry: (NUM_REWARDS,) per-channel discounted-future sum
+        # x:     (NUM_REWARDS,) per-step weighted reward
+        new = x + gammas * carry
+        return new, new
+
+    init = jnp.zeros_like(gammas)
+    _, returns_rev = lax.scan(step, init, weighted[::-1])
+    # Sum channels to get the scalar return per step.
+    return returns_rev[::-1].sum(axis=-1)
 
 
 def _build_actor_state(
@@ -853,9 +902,20 @@ class SPMDServerWorker:
                         s_key,
                         alpha=self.args.replay_priority_alpha,
                     )
+                    # Per-channel discount: cosine_sim and frob_residual
+                    # are terminal quality metrics (env emits them only at
+                    # the final step), so γ=1.0 for those channels and
+                    # ``args.discount`` for the per-step cmp/mem channels.
+                    # Reads ``reward_vec`` (B, T, NUM_REWARDS) directly
+                    # instead of the already-aggregated ``scalar_reward``
+                    # so we can apply different γ per channel before the
+                    # final sum.
+                    rw = self.state["reward_weights"]
                     t_vals = jax.vmap(
-                        lambda r: _discounted_returns(r, self.args.discount)
-                    )(t_traj.scalar_reward)
+                        lambda rv: _per_channel_discounted_returns(
+                            rv, rw, self.args.discount,
+                        )
+                    )(t_traj.reward_vec)
 
                     w_batch = jax.tree_util.tree_map(
                         lambda *xs: jnp.stack(xs, axis=1),
