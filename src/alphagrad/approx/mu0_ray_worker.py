@@ -658,7 +658,7 @@ class SPMDServerWorker:
                     w_batch, self.args.minibatches, sh_key
                 )
 
-for i in range(self.args.minibatches):
+                for i in range(self.args.minibatches):
                     batch_i = jax.tree_util.tree_map(lambda x: x[i], batches)
                     
                     if ds is not None:
