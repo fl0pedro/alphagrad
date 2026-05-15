@@ -84,7 +84,11 @@ def _args_from_dict(args_dict: dict) -> SimpleNamespace:
 
 
 def _build_actor_state(
-    args_dict: dict, variant: str, actor_seed: int, is_spmd: bool = False
+    args_dict: dict,
+    variant: str,
+    actor_seed: int,
+    is_spmd: bool = False,
+    cpu_workers: list = None,
 ) -> dict:
     args = _args_from_dict(args_dict)
     _apply_variant_preset(args, variant)
@@ -559,9 +563,9 @@ class SPMDServerWorker:
     def __init__(
         self, args_dict: dict, variant: str, seed: int = 0, cpu_workers: list = None
     ):
-        def _build_actor_state(
-            args_dict: dict, variant: str, actor_seed: int, is_spmd: bool = False, cpu_workers: list = None
-        ) -> dict:
+        self.state = _build_actor_state(
+            args_dict, variant, seed, is_spmd=True, cpu_workers=cpu_workers
+        )
         self.args = self.state["args"]
         self.variant = variant
         self._key = self.state["key"]
