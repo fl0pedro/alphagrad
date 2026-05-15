@@ -212,6 +212,8 @@ def _build_actor_state(
         mesh = Mesh(np.array(jax.devices()), axis_names=("dev",))
         replicated_sharding = NamedSharding(mesh, PartitionSpec())
         data_sharding = NamedSharding(mesh, PartitionSpec("dev"))
+        # Add this: Shard dim 1 (batch), keep dim 0 (minibatch) unsharded for lax.scan
+        scan_data_sharding = NamedSharding(mesh, PartitionSpec(None, "dev")) 
 
         def shard_leaf(x):
             return jax.device_put(x, replicated_sharding) if eqx.is_array(x) else x
@@ -220,6 +222,7 @@ def _build_actor_state(
         opt_state = jax.tree.map(shard_leaf, opt_state)
     else:
         data_sharding = None
+        scan_data_sharding = None
         mesh = None
 
     key, eval_key = jrand.split(key)
@@ -505,14 +508,24 @@ def _build_actor_state(
         return jnp.mean(per_w_tot), (jnp.mean(lp), jnp.mean(lv), jnp.mean(lr))
 
     @eqx.filter_jit
-    def train_minibatch(agent_local, opt_state_local, batch):
-        (loss_val, parts), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
-            agent_local, batch
+    def train_minibatches_scanned(agent_local, opt_state_local, all_batches):
+        def scan_body(carry, batch_i):
+            agent_c, opt_state_c = carry
+            (loss_val, parts), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
+                agent_c, batch_i
+            )
+            updates, opt_state_new = optimizer.update(
+                grads, opt_state_c, eqx.filter(agent_c, eqx.is_inexact_array)
+            )
+            return (eqx.apply_updates(agent_c, updates), opt_state_new), (loss_val, parts)
+
+        (final_agent, final_opt), (losses, parts) = lax.scan(
+            scan_body, 
+            (agent_local, opt_state_local), 
+            all_batches
         )
-        updates, opt_state_new = optimizer.update(
-            grads, opt_state_local, eqx.filter(agent_local, eqx.is_inexact_array)
-        )
-        return eqx.apply_updates(agent_local, updates), opt_state_new, loss_val, parts
+        
+        return final_agent, final_opt, jnp.mean(losses), jax.tree.map(jnp.mean, parts)
 
     return {
         "args": args,
@@ -531,7 +544,8 @@ def _build_actor_state(
         "optimizer": optimizer,
         "opt_state": opt_state,
         "rollout_fn": make_rollout_fn(agent),
-        "train_minibatch": train_minibatch,
+        "train_minibatches": train_minibatches_scanned,
+        "scan_data_sharding": scan_data_sharding,
         "key": key,
         "data_sharding": data_sharding,
         "mesh": mesh,
@@ -583,23 +597,50 @@ class SPMDServerWorker:
                 with mesh: yield
             else:
                 yield
+        
+        scan_ds = self.state.get("scan_data_sharding")
 
         with active_mesh():
-            if ds is not None and self.state["num_envs"] % num_devs == 0:
-                self.state["env_states"] = jax.tree.map(lambda x: jax.device_put(x, ds), self.state["env_states"])
-                pref = jax.device_put(pref, ds)
-                keys = jax.device_put(keys, ds)
+            for _ in range(train_steps):
+                if self.replay_buffer is not None and int(self.replay_buffer.size) >= max(
+                    self.args.replay_warmup * self.state["num_envs"], 1
+                ):
+                    s_key, self._key = jrand.split(self._key)
+                    t_traj = replay_sample(...)
+                    t_vals = jax.vmap(...)(t_traj.scalar_reward)
+                    w_batch = jax.tree_util.tree_map(...)
+                    
+                    sh_key, self._key = jrand.split(self._key)
+                    
+                    batches = _shuffle_and_batch_windows(
+                        w_batch, self.args.minibatches, sh_key
+                    )
 
-            traj = self.state["rollout_fn"](
-                self.state["agent"],
-                jnp.asarray(self.args.temperature, jnp.float32),
-                self.state["env_states"],
-                keys,
-                pref,
-                self.state["vertex_features"],
-                self.state["reward_weights"],
-                pr,
-            )
+                    b_size = jax.tree_util.tree_leaves(batches)[0].shape[1]
+                    
+                    if scan_ds is not None and b_size % num_devs == 0:
+                        batches = jax.tree.map(lambda x: jax.device_put(x, scan_ds), batches)
+
+                    (
+                        self.state["agent"],
+                        self.state["opt_state"],
+                        mean_loss,
+                        mean_parts,
+                    ) = self.state["train_minibatches"](
+                        self.state["agent"],
+                        self.state["opt_state"],
+                        batches,
+                    )
+                    
+                    self.train_step_counter += self.args.minibatches
+                    stats.update(
+                        {
+                            "policy_loss": float(mean_parts[0]),
+                            "value_loss": float(mean_parts[1]),
+                            "reward_loss": float(mean_parts[2]),
+                            "total_loss": float(mean_loss),
+                        }
+                    )
 
         rw_np = np.asarray(self.state["reward_weights"])
         r_vec_np = np.asarray(traj.reward_vec)
