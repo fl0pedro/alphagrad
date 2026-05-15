@@ -162,7 +162,20 @@ def _run_one_variant(args, variant: str) -> None:
     )
 
     print(f"\n========== variant: {variant} ==========")
-    spmd_kwargs = {"num_gpus": args.spmd_gpus} if args.spmd_gpus > 0 else {}
+    # JAX must be told NOT to preallocate before it imports — otherwise it
+    # grabs ~90% of every visible GPU at startup, leaving no headroom for
+    # the ~6-10 GiB transient buffers that mctx's tree-search + SPMD
+    # collectives need at runtime. Ray's runtime_env env_vars fires in the
+    # actor process before any `import jax`, so this is the right knob.
+    spmd_env_vars = {
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+        "XLA_PYTHON_CLIENT_ALLOCATOR": "platform",  # CUDA allocator, on-demand
+    }
+    spmd_kwargs = (
+        {"num_gpus": args.spmd_gpus, "runtime_env": {"env_vars": spmd_env_vars}}
+        if args.spmd_gpus > 0
+        else {"runtime_env": {"env_vars": spmd_env_vars}}
+    )
 
     spmd_actor = SPMDActor.options(**spmd_kwargs).remote(
         args_dict, variant, int(variant_args.seed)
@@ -170,7 +183,17 @@ def _run_one_variant(args, variant: str) -> None:
 
     cpu_workers = [
         CPUApproximationActor.options(
-            num_cpus=1, num_gpus=0, runtime_env={"env_vars": {"JAX_PLATFORMS": "cpu"}}
+            num_cpus=1,
+            num_gpus=0,
+            runtime_env={
+                "env_vars": {
+                    "JAX_PLATFORMS": "cpu",
+                    # Same on-demand allocation policy; CPU JAX shouldn't
+                    # preallocate but the var is harmless and keeps actor
+                    # env consistent with the GPU side.
+                    "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+                }
+            },
         ).remote(args_dict, variant, i)
         for i in range(args.num_cpu_workers * 8)
     ]
