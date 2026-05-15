@@ -57,16 +57,55 @@ from alphagrad.approx.common import (
     init_linear_weights,
     vertex_avail_at_step,
 )
-from alphagrad.approx.common.gae import get_advantages
+from alphagrad.approx.common.gae import get_advantages, reward_normalization_fn
 from alphagrad.utils import symlog
 from alphagrad.approx.env import (
     MAX_RULES_PER_VERTEX,
     MAX_TOKENS,
     NUM_REWARDS,
     REWARD_INDEX,
+    REWARD_NAMES,
     StepAction,
     VertexEliminationEnv,
 )
+
+
+# Stage F: which reward channels skip symlog when used in the
+# Lagrangian comparison. Currently just cosine_sim — it's already
+# bounded to [0, 1], so symlog'ing it would only complicate the
+# threshold semantics. Mirrored from ppo._NO_SYMLOG_REWARD_INDICES.
+_NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (REWARD_INDEX["cosine_sim"],)
+
+
+def _parse_lagrangian_constraints(specs: list) -> list[tuple[int, float, int]]:
+    """Parse ``--lagrangian-constraint`` strings to (idx, threshold, sign).
+
+    * ``NAME>=THRESH`` → sign=+1, violation when reward < threshold
+    * ``NAME<=THRESH`` → sign=−1, violation when reward > threshold
+
+    Duplicates ``ppo.parse_lagrangian_constraints`` (kept local so this
+    file doesn't pull in the 6k-line single-process ppo module).
+    """
+    parsed: list[tuple[int, float, int]] = []
+    for s in specs or []:
+        if ">=" in s:
+            op, sign = ">=", 1
+        elif "<=" in s:
+            op, sign = "<=", -1
+        else:
+            raise ValueError(
+                f"--lagrangian-constraint must be NAME>=THRESH or NAME<=THRESH, "
+                f"got {s!r}"
+            )
+        name, thresh_s = s.split(op, 1)
+        name = name.strip()
+        if name not in REWARD_INDEX:
+            raise ValueError(
+                f"Unknown reward name {name!r} in {s!r}; "
+                f"valid names: {list(REWARD_INDEX.keys())}"
+            )
+        parsed.append((REWARD_INDEX[name], float(thresh_s.strip()), sign))
+    return parsed
 
 
 def _args_from_dict(args_dict: dict) -> SimpleNamespace:
@@ -299,6 +338,45 @@ class PPORayWorker:
         self.reward_weights = jnp.asarray(
             self.reward_weights_np, dtype=jnp.float32,
         )
+
+        # Stage F Lagrangian state. Stored as numpy because the multipliers
+        # update with simple dual-ascent steps after each episode — no
+        # need to keep them on the device. Empty config = no constraints
+        # (the violation path becomes a no-op).
+        constraint_specs = _parse_lagrangian_constraints(
+            getattr(self.args, "lagrangian_constraint", []) or []
+        )
+        if constraint_specs:
+            self.constraint_indices_np = np.array(
+                [c[0] for c in constraint_specs], dtype=np.int32,
+            )
+            self.constraint_thresholds_np = np.array(
+                [c[1] for c in constraint_specs], dtype=np.float32,
+            )
+            self.constraint_signs_np = np.array(
+                [c[2] for c in constraint_specs], dtype=np.float32,
+            )
+            self.constraint_names = [
+                REWARD_NAMES[c[0]] + (">=" if c[2] > 0 else "<=") + str(c[1])
+                for c in constraint_specs
+            ]
+            # No-symlog mask gathered per-constraint, so we can skip the
+            # symlog transform on the cosine-sim channel (and anything
+            # else flagged in _NO_SYMLOG_REWARD_INDICES).
+            self.constraint_no_symlog_np = np.array(
+                [c[0] in _NO_SYMLOG_REWARD_INDICES for c in constraint_specs],
+                dtype=np.bool_,
+            )
+        else:
+            self.constraint_indices_np = np.zeros((0,), dtype=np.int32)
+            self.constraint_thresholds_np = np.zeros((0,), dtype=np.float32)
+            self.constraint_signs_np = np.zeros((0,), dtype=np.float32)
+            self.constraint_names = []
+            self.constraint_no_symlog_np = np.zeros((0,), dtype=np.bool_)
+        self.multipliers_np = np.zeros(
+            (self.constraint_indices_np.shape[0],), dtype=np.float32,
+        )
+        self.lagrangian_lr = float(getattr(self.args, "lagrangian_lr", 1e-3))
 
         # Agent + optimizer.
         policy_dims = self._parse_int_list(self.args.policy_dims)
@@ -544,6 +622,10 @@ class PPORayWorker:
         buf_log_probs = np.zeros((T, N), dtype=np.float32)
         buf_values = np.zeros((T, N), dtype=np.float32)
         buf_rewards = np.zeros((T, N), dtype=np.float32)
+        # Raw 8-vec reward per step — Lagrangian violations and per-channel
+        # diagnostics read from this buffer; the scalar `buf_rewards` is
+        # only what the policy sees as the scalarised return.
+        buf_reward_vec = np.zeros((T, N, NUM_REWARDS), dtype=np.float32)
         buf_dones = np.zeros((T, N), dtype=np.float32)
 
         state = self.env_states
@@ -586,6 +668,7 @@ class PPORayWorker:
             buf_rewards[t] = np.asarray(
                 self._scalar_reward(reward_j),
             )
+            buf_reward_vec[t] = reward_np
             buf_dones[t] = np.asarray(state.terminated).astype(np.float32)
 
         # Bootstrap value at the final state (for the GAE next_value
@@ -614,8 +697,52 @@ class PPORayWorker:
             self.gae_lambda,
         )
 
+        # Stage F Lagrangian: penalise the advantage by the per-step
+        # constraint violation, weighted by the current multipliers.
+        # The violation is `max(0, sign * (threshold - reward))` —
+        # zero when the constraint is satisfied. After applying the
+        # penalty we update each multiplier by gradient ascent on the
+        # mean violation (clamped >= 0). Empty-constraint case is a
+        # no-op (the gather has zero columns).
+        violation_stats: dict = {}
+        if self.constraint_indices_np.shape[0] > 0:
+            # Pull the constrained channels across the rollout buffer.
+            # (T, N, C) where C = #constraints. Reshape to match the (N, T)
+            # advantages layout used by GAE.
+            picked = buf_reward_vec[:, :, self.constraint_indices_np]  # (T, N, C)
+            picked = np.transpose(picked, (1, 0, 2))  # (N, T, C)
+            # Symlog cost-family channels so the multipliers don't have to
+            # bridge ~10⁹× channel-scale gaps; leave cosine_sim raw.
+            no_symlog = self.constraint_no_symlog_np[None, None, :]  # (1,1,C)
+            picked_sl = np.where(
+                no_symlog, picked, np.sign(picked) * np.log1p(np.abs(picked)),
+            )
+            thresh_sl = np.where(
+                self.constraint_no_symlog_np,
+                self.constraint_thresholds_np,
+                np.sign(self.constraint_thresholds_np)
+                * np.log1p(np.abs(self.constraint_thresholds_np)),
+            )  # (C,)
+            signed = self.constraint_signs_np * (thresh_sl[None, None, :] - picked_sl)
+            violations = np.maximum(0.0, signed)  # (N, T, C)
+            penalty = np.sum(violations * self.multipliers_np[None, None, :], axis=-1)  # (N, T)
+            advantages_b = advantages_b - jnp.asarray(penalty)
+            mean_violations = violations.mean(axis=(0, 1))  # (C,)
+            # Dual ascent on the multipliers — applied AFTER the penalty
+            # has shaped this episode's gradient so the policy sees a
+            # consistent multiplier within the rollout.
+            self.multipliers_np = np.maximum(
+                0.0,
+                self.multipliers_np + self.lagrangian_lr * mean_violations,
+            )
+            for j, name in enumerate(self.constraint_names):
+                violation_stats[f"lagrangian/{name}_lambda"] = float(self.multipliers_np[j])
+                violation_stats[f"lagrangian/{name}_violation"] = float(mean_violations[j])
+
         # Normalise advantages per-rollout — mean 0 std 1, with the
-        # `+1e-8` floor that's standard PPO hygiene.
+        # `+1e-8` floor that's standard PPO hygiene. Applied AFTER the
+        # Lagrangian penalty so the policy still sees zero-mean
+        # advantages even when the multipliers shift the distribution.
         adv_flat = advantages_b.reshape(-1)
         adv_mean = jnp.mean(adv_flat)
         adv_std = jnp.std(adv_flat) + 1e-8
@@ -682,6 +809,12 @@ class PPORayWorker:
             "rollout_length": T,
             "num_envs": N,
         })
+        # Per-channel raw-reward means so the driver can log them — same
+        # spirit as `mu0_ray.run_rollout_and_train`'s `per_reward_means`.
+        per_channel_means = buf_reward_vec.mean(axis=(0, 1))
+        for j, name in enumerate(REWARD_NAMES):
+            last_aux[f"reward_mean/{name}"] = float(per_channel_means[j])
+        last_aux.update(violation_stats)
         return last_aux
 
     def _fan_out_tokenize(self, order_np, specs_np, step_np):
