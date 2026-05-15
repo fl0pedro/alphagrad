@@ -559,9 +559,9 @@ class SPMDServerWorker:
     def __init__(
         self, args_dict: dict, variant: str, seed: int = 0, cpu_workers: list = None
     ):
-        self.state = _build_actor_state(
-            args_dict, variant, seed, is_spmd=True, cpu_workers=cpu_workers
-        )
+        def _build_actor_state(
+            args_dict: dict, variant: str, actor_seed: int, is_spmd: bool = False, cpu_workers: list = None
+        ) -> dict:
         self.args = self.state["args"]
         self.variant = variant
         self._key = self.state["key"]
