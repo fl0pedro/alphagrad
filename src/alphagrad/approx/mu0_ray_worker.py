@@ -259,6 +259,16 @@ def _build_actor_state(
         env_with_samples = type(env_with_samples).tree_unflatten(
             aux_data, children,
         )
+        # ``ray.put`` the eval_samples tuple once and cache the ref on
+        # the pool, so per-step ``actor.evaluate.remote(...)`` calls ship
+        # only the (tiny) ObjectRef instead of re-serialising the same
+        # multi-MB tuple of per-sample model inputs on every
+        # io_callback. Convert to numpy first — JAX arrays serialise
+        # through host RAM anyway, and we want the actor to receive a
+        # plain numpy tuple matching ``CpuApproximationServer.evaluate``'s
+        # ``eval_samples`` contract.
+        eval_samples_np = tuple(np.asarray(x) for x in eval_samples)
+        remote_pool.set_eval_samples(eval_samples_np)
     vertex_features = _episode_vertex_features(
         args,
         closed_jaxpr.jaxpr,
