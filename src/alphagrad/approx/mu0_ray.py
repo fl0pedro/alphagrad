@@ -209,6 +209,12 @@ def _run_one_variant(args, variant: str) -> None:
 
     best_global_return = -float("inf")
     best_global_seq = None
+    # Per-channel raw rewards of the overall-best trajectory we've seen
+    # (i.e., the cross-section of the trajectory that won the scalar
+    # weighted-sum — *not* the per-channel argmaxes which can differ).
+    best_global_rewards: dict[str, float] = {}
+    best_global_weighted_split: dict[str, float] = {}
+    best_global_ep = -1
     # Per-channel running bests: {reward_name: {"raw_value", "weighted_value",
     # "weighted_total", "ep", "seq"}}. Populated as we see new bests from
     # the actor each episode. Restricted to reward channels with non-zero
@@ -252,6 +258,9 @@ def _run_one_variant(args, variant: str) -> None:
         if ep_best > best_global_return:
             best_global_return = ep_best
             best_global_seq = stats.get("best_seq")
+            best_global_rewards = dict(stats.get("best_overall_rewards", {}))
+            best_global_weighted_split = dict(stats.get("best_overall_weighted", {}))
+            best_global_ep = ep
 
         # Update running per-channel bests.
         for name, info in stats.get("best_per_reward", {}).items():
@@ -277,11 +286,23 @@ def _run_one_variant(args, variant: str) -> None:
                 f"{n[:4]}={info['raw_value']:+.2g}"
                 for n, info in best_per_reward.items()
             )
+            mean_str = " ".join(
+                f"{n[:4]}={v:+.2g}"
+                for n, v in stats.get("per_reward_means", {}).items()
+                if v != 0.0
+            )
+            best_overall_str = " ".join(
+                f"{n[:4]}={v:+.2g}"
+                for n, v in best_global_rewards.items()
+                if v != 0.0
+            )
             tqdm.write(
                 f"  [{variant}] ep={ep + 1:>4}/{variant_args.episodes} "
-                f"best={best_global_return:+.4g} mean={ep_mean:+.4g} "
-                f"ent={ent_mean:.3f} buf={bsize} step={tstep} | "
-                f"per-channel-best: {per_ch_str}"
+                f"best={best_global_return:+.4g}(ep{best_global_ep}) mean={ep_mean:+.4g} "
+                f"ent={ent_mean:.3f} buf={bsize} step={tstep}\n"
+                f"            best-overall-traj-rewards: {best_overall_str}\n"
+                f"            per-channel-best:          {per_ch_str}\n"
+                f"            mean-per-channel:          {mean_str}"
             )
 
         # ---- wandb log ----
@@ -310,34 +331,56 @@ def _run_one_variant(args, variant: str) -> None:
             log_dict[f"best_per_channel_weighted_total/{name}"] = info[
                 "weighted_total"
             ]
+        # Reward breakdown of the overall-best trajectory (running). Lets
+        # the user see e.g. "the trajectory that won the scalar got
+        # cosine_sim=4.5, flops=-7e10, peak_memory=-8e8" without having
+        # to mine the FINAL block.
+        for name, v in best_global_rewards.items():
+            log_dict[f"best_overall_reward/{name}"] = v
+        for name, v in best_global_weighted_split.items():
+            log_dict[f"best_overall_weighted/{name}"] = v
         wandb.log(log_dict)
 
     pbar.close()
 
     # ---- Final per-variant summary (lands at the end of the log) ----
     tqdm.write(f"\n========== [{variant}] FINAL ==========")
-    tqdm.write(f"  overall best weighted return: {best_global_return:+.6g}")
-    tqdm.write(f"  best sequence: {best_global_seq}")
+    tqdm.write(f"  overall best weighted return: {best_global_return:+.6g}  (found at ep {best_global_ep})")
+    if best_global_rewards:
+        tqdm.write(f"  best-overall-trajectory per-channel rewards (raw):")
+        for name in sorted(best_global_rewards):
+            raw = best_global_rewards[name]
+            wt = best_global_weighted_split.get(name, 0.0)
+            tqdm.write(f"    {name:<18s}  raw={raw:+.4g}   weighted={wt:+.4g}")
+    tqdm.write(f"  best-overall sequence: {best_global_seq}")
     if best_per_reward:
-        tqdm.write(f"  best-per-channel (raw episode-sum on that channel):")
-        # Sort by channel name for stable output.
+        tqdm.write(f"  best-per-channel (argmax over channel-sum per env, across all episodes):")
         for name in sorted(best_per_reward):
             info = best_per_reward[name]
             tqdm.write(
                 f"    {name:<18s}  raw={info['raw_value']:+.4g}  "
                 f"weighted={info['weighted_value']:+.4g}  "
-                f"(found at ep {info['ep']})  seq={info['seq']}"
+                f"weighted_total_of_traj={info['weighted_total']:+.4g}  "
+                f"(found at ep {info['ep']})\n"
+                f"      seq={info['seq']}"
             )
 
     # Final wandb summary entries (single scalars + per-channel best
     # sequences as a string).
-    summary: dict = {"best_global_return": best_global_return}
+    summary: dict = {
+        "best_global_return": best_global_return,
+        "best_global_ep": best_global_ep,
+    }
     for name, info in best_per_reward.items():
         summary[f"final_best_per_channel/{name}_raw"] = info["raw_value"]
         summary[f"final_best_per_channel/{name}_weighted"] = info["weighted_value"]
         summary[f"final_best_per_channel/{name}_seq"] = str(info["seq"])
+    for name, v in best_global_rewards.items():
+        summary[f"final_best_overall/{name}_raw"] = v
+    for name, v in best_global_weighted_split.items():
+        summary[f"final_best_overall/{name}_weighted"] = v
     if best_global_seq is not None:
-        summary["best_global_seq"] = str(best_global_seq)
+        summary["final_best_overall/sequence"] = str(best_global_seq)
     wandb.log(summary)
 
     if variant_args.replay_checkpoint_path:
