@@ -157,9 +157,11 @@ def _run_one_variant(args, variant: str) -> None:
     )
 
     cpu_workers = [
-        CPUApproximationActor.options(num_cpus=1, num_gpus=0).remote(
-            args_dict, variant, i
-        )
+        CPUApproximationActor.options(
+            num_cpus=1, 
+            num_gpus=0, 
+            runtime_env={"env_vars": {"JAX_PLATFORMS": "cpu"}}
+        ).remote(args_dict, variant, i)
         for i in range(args.num_cpu_workers)
     ]
 

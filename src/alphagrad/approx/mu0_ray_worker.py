@@ -188,8 +188,8 @@ def _build_actor_state(
 
         replicated_sharding = NamedSharding(mesh, PartitionSpec())
 
-        agent = jax.device_put(agent, replicated_sharding)
-        opt_state = jax.device_put(opt_state, replicated_sharding)
+    def shard_leaf(x):
+        return jax.device_put(x, replicated_sharding) if eqx.is_array(x) else x
 
     key, eval_key = jrand.split(key)
     eval_samples = generate_eval_samples(env, eval_key, args.num_eval_samples)
