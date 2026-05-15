@@ -91,6 +91,23 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-grad-norm", type=float, default=0.5)
     p.add_argument("--adam-eps", type=float, default=1e-8)
 
+    # Dynamic substeps (Phase C). When --dynamic-substeps is on the agent
+    # emits typed (op_type, i, j, factor) micro-actions per vertex which
+    # env.micro_actions_to_rule_specs_jax translates into the legacy
+    # rule_specs the env consumes. The first cut here is restricted to
+    # ``max_substeps == 1`` — a single DIAG-or-END per vertex. Multi-
+    # substep (sequence) support is a follow-up.
+    p.add_argument(
+        "--dynamic-substeps", action="store_true",
+        help="Enable the typed micro-action policy (1 substep per vertex).",
+    )
+    p.add_argument(
+        "--factors", type=str, default="-1,2,3,4",
+        help="Comma-separated DIAG factor choices the policy picks from. "
+        "``-1`` resolves to ``gcd(n_i, n_j)`` per env edge; everything "
+        "else is a literal divisor.",
+    )
+
     # Model
     p.add_argument("--vocab-size", type=int, default=512)
     p.add_argument("--embd-dim", type=int, default=128)
