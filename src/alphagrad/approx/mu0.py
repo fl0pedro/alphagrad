@@ -197,16 +197,17 @@ def _mem_reward_index(mem_type: str) -> int:
 
 
 def _build_reward_weights(args) -> np.ndarray:
-    weights = np.zeros(NUM_REWARDS, dtype=np.float32)
-    if "cmp" in args.rewards:
-        weights[_cmp_reward_index(args.cmp_type)] = args.lambda_cmp
-    if "mem" in args.rewards:
-        weights[_mem_reward_index(args.mem_type)] = args.lambda_mem
-    if "acc" in args.rewards:
-        weights[REWARD_INDEX["cosine_sim"]] = 1.0
-    if args.lambda_frob != 0.0:
-        weights[REWARD_INDEX["frob_residual"]] = args.lambda_frob
-    return weights
+    """Back-compat wrapper around
+    :func:`alphagrad.approx.common.reward_scaling.build_reward_weights`.
+
+    Note: the canonical helper applies a `muls_adds_fmas` fallback when
+    every channel ends up zero. Pre-refactor `mu0._build_reward_weights`
+    silently returned all-zeros in that case (and the downstream
+    `_per_channel_discounted_returns` would have multiplied by zero
+    everywhere), so the new behaviour is strictly safer.
+    """
+    from alphagrad.approx.common.reward_scaling import build_reward_weights
+    return build_reward_weights(args)
 
 
 # ---------------------------------------------------------------------------
@@ -670,24 +671,10 @@ def _scale_output_heads(agent, scale: float):
 
 
 def _setup_jax_compile_cache() -> None:
-    """Per-node persistent XLA compile cache. See the matching helper in
-    ``ppo.py`` for the rationale: scoping by ``<hostname>`` prevents an
-    NFS-shared homedir from mixing cache entries built for different CPU
-    generations, which trips ``cpu_aot_loader.cc:195`` warnings and may
-    force fresh recompiles.
-    """
-    import socket
-
-    short_host = socket.gethostname().split(".", 1)[0]
-    cache_dir = os.environ.setdefault(
-        "JAX_COMPILATION_CACHE_DIR",
-        os.path.expanduser(f"~/.cache/jax-compilation-cache/{short_host}"),
-    )
-    try:
-        from jax.experimental.compilation_cache import compilation_cache
-        compilation_cache.set_cache_dir(cache_dir)
-    except Exception:
-        pass
+    """Back-compat wrapper around
+    :func:`alphagrad.approx.common.cache.setup_jax_compile_cache`."""
+    from alphagrad.approx.common.cache import setup_jax_compile_cache
+    setup_jax_compile_cache()
 
 
 def _discounted_returns(rewards: jax.Array, discount: float) -> jax.Array:
@@ -801,9 +788,15 @@ def main():
     # name; the agent itself is built once with the final-stage action
     # footprint, mirroring ppo.py's behaviour.
     if auto_curriculum:
+        # MuZero uses the legacy 3-stage curriculum
+        # (diag_gcd → diag_factor → full). The 7-stage round-robin
+        # curriculum is PPO-only until MuZero's prior-gating learns
+        # to consume per-episode rotation masks. See
+        # alphagrad/src/alphagrad/approx/CURRICULUM.md §"MuZero" for
+        # the migration plan.
         curriculum_stages = _default_full_curriculum(args.episodes)
         print(
-            f"--variant=full_curriculum: auto curriculum "
+            f"--variant=full_curriculum: auto curriculum (3-stage, MuZero) "
             + " → ".join(f"{name}:{n}" for name, n in curriculum_stages)
         )
     else:

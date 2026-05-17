@@ -16,7 +16,9 @@ from jax.tree_util import register_pytree_node_class
 from alphagrad.approx.common.relations import compute_eqn_ids_from_tokens
 from graphax.core import _build_graph, extract_jaxpr, jacve, vertex_elimination_jaxpr
 from graphax.jaxpr import get_vocab as _graphax_get_vocab
-from graphax.sparse.micro_actions import COMPRESS_KINDS, Compress, Diag
+from graphax.sparse.micro_actions import (
+    COMPRESS_KINDS, QUANT_DTYPES, Compress, Diag, Quant,
+)
 from jax_memory_monitor import ResourceMonitor as _RealResourceMonitor
 
 
@@ -85,6 +87,7 @@ _SENTINEL_BAD_REWARD = jnp.array(
 
 axis_pair_idx_to_base = {0: (0, 0), 1: (0, 1), 2: (1, 0), 3: (1, 1)}
 COMPRESS_SENTINEL = -2
+QUANT_SENTINEL = -3
 
 
 class EnvState(NamedTuple):
@@ -225,8 +228,9 @@ def micro_actions_to_rule_specs(
     *,
     axis_state_for_vertex,
     compress_kinds=None,
+    quant_dtypes=None,
 ):
-    from alphagrad.approx.heads import OP_COMPRESS, OP_DIAG, OP_END
+    from alphagrad.approx.heads import OP_COMPRESS, OP_DIAG, OP_END, OP_QUANT
 
     op_types_arr = np.asarray(op_types)
     i_arr = np.asarray(i_indices)
@@ -236,6 +240,10 @@ def micro_actions_to_rule_specs(
         k_arr = np.zeros_like(op_types_arr)
     else:
         k_arr = np.asarray(compress_kinds)
+    if quant_dtypes is None:
+        q_arr = np.zeros_like(op_types_arr)
+    else:
+        q_arr = np.asarray(quant_dtypes)
     axis_state_np = np.asarray(axis_state_for_vertex)
 
     n_out = int(np.sum(axis_state_np[:, _AXIS_FEAT_IS_OUTPUT]))
@@ -260,6 +268,14 @@ def micro_actions_to_rule_specs(
             specs[slot, 0] = COMPRESS_SENTINEL
             specs[slot, 1] = physical_axis
             specs[slot, 2] = int(k_arr[s_idx])
+            slot += 1
+            continue
+        if op == OP_QUANT:
+            if slot >= MAX_RULES_PER_VERTEX:
+                break
+            specs[slot, 0] = QUANT_SENTINEL
+            specs[slot, 1] = int(q_arr[s_idx])
+            specs[slot, 2] = 0
             slot += 1
             continue
         if op != OP_DIAG:
@@ -289,20 +305,24 @@ def micro_actions_to_rule_specs_jax(
     factors,
     axis_state_for_vertex,
     compress_kinds=None,
+    quant_dtypes=None,
 ):
-    from alphagrad.approx.heads import OP_COMPRESS, OP_DIAG, OP_END
+    from alphagrad.approx.heads import OP_COMPRESS, OP_DIAG, OP_END, OP_QUANT
 
     is_output = axis_state_for_vertex[:, _AXIS_FEAT_IS_OUTPUT].astype(jnp.int32)
     n_out = jnp.sum(is_output)
 
     if compress_kinds is None:
         compress_kinds = jnp.zeros_like(op_types)
+    if quant_dtypes is None:
+        quant_dtypes = jnp.zeros_like(op_types)
 
     is_end_per = op_types == OP_END
     prior_ends = jnp.cumsum(is_end_per.astype(jnp.int32)) - is_end_per.astype(jnp.int32)
     active = prior_ends == 0
     is_diag = op_types == OP_DIAG
     is_compress = op_types == OP_COMPRESS
+    is_quant = op_types == OP_QUANT
 
     def _row(s_idx):
         i = i_indices[s_idx]
@@ -320,20 +340,30 @@ def micro_actions_to_rule_specs_jax(
         compress_bi1 = jnp.asarray(COMPRESS_SENTINEL, dtype=jnp.int32)
         compress_bi2 = i.astype(jnp.int32)
 
+        quant_used = active[s_idx] & is_quant[s_idx]
+        quant_bi1 = jnp.asarray(QUANT_SENTINEL, dtype=jnp.int32)
+        quant_bi2 = quant_dtypes[s_idx].astype(jnp.int32)
+
         bi1 = jnp.where(
-            compress_used,
-            compress_bi1,
-            jnp.where(diag_used, diag_bi1, -1),
+            quant_used, quant_bi1,
+            jnp.where(
+                compress_used, compress_bi1,
+                jnp.where(diag_used, diag_bi1, -1),
+            ),
         ).astype(jnp.int32)
         bi2 = jnp.where(
-            compress_used,
-            compress_bi2,
-            jnp.where(diag_used, diag_bi2, -1),
+            quant_used, quant_bi2,
+            jnp.where(
+                compress_used, compress_bi2,
+                jnp.where(diag_used, diag_bi2, -1),
+            ),
         ).astype(jnp.int32)
         f = jnp.where(
-            compress_used,
-            compress_kinds[s_idx],
-            jnp.where(diag_used, factors[s_idx], 0),
+            quant_used, jnp.asarray(0, dtype=jnp.int32),
+            jnp.where(
+                compress_used, compress_kinds[s_idx],
+                jnp.where(diag_used, factors[s_idx], 0),
+            ),
         ).astype(jnp.int32)
         return jnp.stack([bi1, bi2, f])
 
@@ -441,7 +471,7 @@ def _callback(
         if not primal_shapes:
             continue
 
-        rules: list = []
+        rules: list = []  # mixed list[Diag | Compress | Quant]
         used_axes: set[int] = set()
         for slot in range(MAX_RULES_PER_VERTEX):
             row = specs_list[v_idx][slot]
@@ -450,6 +480,12 @@ def _callback(
             factor = int(row[2])
             if bi1 == -1:
                 break
+            if bi1 == QUANT_SENTINEL:
+                dtype_idx = bi2
+                if not (0 <= dtype_idx < len(QUANT_DTYPES)):
+                    dtype_idx = 0
+                rules.append(Quant(dtype=QUANT_DTYPES[dtype_idx]))
+                continue
             if bi1 == COMPRESS_SENTINEL:
                 if v_idx != last_v_idx:
                     continue
@@ -517,7 +553,13 @@ def _callback(
         consts,
         transforms=transforms,
     )
-    tokens = ve.tokenized()[:MAX_TOKENS]
+    # Truncation diagnostic mirrors the canonical env.py path so legacy
+    # callers of this Ray variant get the same warn-once + counter
+    # behaviour without re-implementing it here.
+    raw_tokens = ve.tokenized()
+    from alphagrad.approx.env import _record_tokenization_truncation
+    _record_tokenization_truncation(int(raw_tokens.shape[0]))
+    tokens = raw_tokens[:MAX_TOKENS]
     tokens = jnp.pad(tokens, (0, MAX_TOKENS - tokens.shape[0]))
 
     tokens_np = np.asarray(tokens)

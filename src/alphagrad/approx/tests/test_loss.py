@@ -102,15 +102,18 @@ def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, nu
     max_substeps = max_rules  # use the same bound for the test
     max_primes = 9
     max_axes_per_vertex = 8
-    num_ops = 3
+    # Op-type vocabulary: DIAG / COMPRESS / QUANT / END = 4.
+    num_ops = 4
     max_exponent = 30
     num_compress_kinds = 6
+    num_quant_dtypes = 28
     micro_op_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
     micro_i_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
     micro_j_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
     micro_exp_seq = jnp.zeros((batch_size, max_substeps, max_primes), dtype=jnp.int32)
     micro_factor_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
     micro_compress_kind_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
+    micro_quant_dtype_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
     micro_op_dists = jnp.zeros((batch_size, max_substeps, num_ops), dtype=jnp.float32)
     micro_i_dists = jnp.zeros(
         (batch_size, max_substeps, max_axes_per_vertex), dtype=jnp.float32,
@@ -124,6 +127,9 @@ def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, nu
     )
     micro_kind_dists = jnp.zeros(
         (batch_size, max_substeps, num_compress_kinds), dtype=jnp.float32,
+    )
+    micro_quant_dists = jnp.zeros(
+        (batch_size, max_substeps, num_quant_dtypes), dtype=jnp.float32,
     )
     return TrainBatch(
         tokens=tokens,
@@ -139,6 +145,7 @@ def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, nu
         micro_exp_seq=micro_exp_seq,
         micro_factor_seq=micro_factor_seq,
         micro_compress_kind_seq=micro_compress_kind_seq,
+        micro_quant_dtype_seq=micro_quant_dtype_seq,
         old_vertex_dist=old_v,
         old_pair_dists=old_p,
         old_factor_dists=old_f,
@@ -147,6 +154,7 @@ def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, nu
         old_micro_j_dists=micro_j_dists,
         old_micro_exp_dists=micro_exp_dists,
         old_micro_kind_dists=micro_kind_dists,
+        old_micro_quant_dists=micro_quant_dists,
         estim_returns=estim_returns,
         norm_adv=norm_adv,
         vertex_avail_mask=vertex_avail,

@@ -88,3 +88,27 @@ class CpuApproximationActor:
 
     def ready(self) -> bool:
         return self._impl.ready()
+
+    def compile_approximations(self) -> dict:
+        """Pool warm-up handshake.
+
+        The underlying :class:`CpuApproximationServer` is constructed in
+        ``__init__`` (env build + JAX cache wiring), so this is mostly a
+        handshake — but we expose it for parity with the MuZero pool
+        (`mu0_ray_worker.CPUApproximationWorker.compile_approximations`)
+        so the shared `run_calibration` helper can `ray.get` a warm-up
+        future on either trainer before issuing zero-pref rollouts.
+        """
+        return {"status": "ready", "actor_id": self._actor_id}
+
+    def consume_tokenization_truncation_stats(self) -> dict:
+        """Pop the per-actor jaxpr-tokenization truncation counters.
+
+        Returns ``{"count": int, "max_observed_len": int}`` and resets
+        the per-process counters in ``env.py`` so subsequent rollouts
+        report only their own deltas. Pool aggregates across actors.
+        """
+        from alphagrad.approx.env import (
+            consume_tokenization_truncation_stats as _consume,
+        )
+        return _consume()
