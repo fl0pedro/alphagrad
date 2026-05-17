@@ -1,3 +1,23 @@
+"""Ray actor wrappers for the SEED-style off-policy GFlowNet trainer.
+
+Two actor classes:
+
+* :class:`GFNSPMDActor` — centralised JAX SPMD trainer. Owns the
+  GFN agent, the JAX mesh, the replay buffer, and the host-side
+  :class:`alphagrad.approx.cpu_approx_pool.CpuApproxPool` that the
+  env's ``io_callback`` dispatches to. Surface mirrors
+  :class:`alphagrad.approx.mu0_ray_actors.SPMDActor` 1:1 so the driver
+  loop in ``gfn_ray.py`` is structurally identical to ``mu0_ray.py``.
+
+* ``CPUApproximationActor`` — re-exported from
+  :mod:`alphagrad.approx.mu0_ray_actors`. The CPU-side approximation
+  actor is algorithm-agnostic (it wraps
+  :class:`alphagrad.approx.cpu_approx_worker.CpuApproximationServer`
+  which only depends on the env / variant / args_dict, not on the RL
+  algorithm), so we re-use it verbatim instead of duplicating the
+  class.
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -5,10 +25,21 @@ from typing import Any
 import numpy as np
 import ray
 
+# Re-export the CPU-side actor unchanged. Driver code can keep importing
+# ``CPUApproximationActor`` from this module the same way ``mu0_ray.py``
+# imports it from ``mu0_ray_actors``.
+from alphagrad.approx.mu0_ray_actors import CPUApproximationActor  # noqa: F401
+
 
 @ray.remote
-class SPMDActor:
-    """Centralized JAX SPMD Actor that handles natively sharded MCTS and Training."""
+class GFNSPMDActor:
+    """Centralised JAX SPMD actor for SEED-style off-policy GFN training.
+
+    Holds the GFN agent, optimiser state, JAX mesh, replay buffer, and
+    the host-side :class:`CpuApproxPool` that the env's ``io_callback``
+    dispatches per-step jacve/tokenize work to. All methods are thin
+    forwarders to :class:`alphagrad.approx.gfn_ray_worker.GFNServerWorker`.
+    """
 
     def __init__(self, args_dict: dict, variant: str, seed: int = 0):
         self.args_dict = args_dict
@@ -27,8 +58,8 @@ class SPMDActor:
         cpu_actor_options: dict | None = None,
         starting_actor_id: int = 1000,
     ):
-        """Construct the SPMD-side training state and wire the
-        CPU approx pool into the env's ``io_callback``.
+        """Construct the SPMD-side training state and wire the CPU
+        approx pool into the env's ``io_callback``.
 
         ``initial_timeout_s`` / ``warm_after`` enable a cold-cache
         budget — first ``warm_after`` calls per actor get a longer
@@ -36,9 +67,9 @@ class SPMDActor:
         Default ``initial_timeout_s=None`` uses ``callback_timeout_s``
         for all calls (legacy behaviour).
         """
-        from alphagrad.approx.mu0_ray_worker import SPMDServerWorker
+        from alphagrad.approx.gfn_ray_worker import GFNServerWorker
 
-        self._impl = SPMDServerWorker(
+        self._impl = GFNServerWorker(
             self.args_dict,
             self.variant,
             self.seed,
@@ -69,8 +100,9 @@ class SPMDActor:
         )
 
     def reward_vec_means(self, rng_seed: int, num_rollouts: int) -> dict:
-        """See ``CPUApproximationWorker.reward_vec_means`` for the dict
-        schema. Returns per-channel mean + median + quartile stats."""
+        """Per-channel calibration statistics over ``num_rollouts``
+        zero-pref rollouts. See ``mu0_ray_actors.SPMDActor`` for the
+        dict schema."""
         return self._impl.reward_vec_means(rng_seed, num_rollouts)
 
     def set_reward_weights(self, weights_np: np.ndarray) -> None:
@@ -89,57 +121,3 @@ class SPMDActor:
         if self._impl is None:
             return False
         return self._impl.ready()
-
-
-@ray.remote
-class CPUApproximationActor:
-    """CPU-only Ray actor wrapping :class:`CPUApproximationWorker`.
-
-    Spawned in pools by :func:`alphagrad.approx.mu0_ray._run_one_variant`
-    and consumed by the env's ``io_callback`` via
-    :class:`alphagrad.approx.cpu_approx_pool.CpuApproxPool`. Each call
-    runs one ``jax.jit(jacve(...)).lower().compile()`` + execution
-    out-of-process so the SPMD actor (which owns the GPUs) never
-    blocks on XLA's uninterruptible C++ compile.
-    """
-
-    def __init__(self, args_dict: dict, variant: str, actor_id: int):
-        from alphagrad.approx.mu0_ray_worker import CPUApproximationWorker
-
-        self._impl = CPUApproximationWorker(args_dict, variant, actor_id)
-
-    def compile_approximations(self) -> dict:
-        return self._impl.compile_approximations()
-
-    def evaluate(
-        self,
-        order,
-        sparsity_specs,
-        step,
-        eval_samples=None,
-        init: bool = False,
-    ):
-        """Forward to ``CPUApproximationWorker.evaluate``.
-
-        Explicit method (not ``__getattr__``-based) so Ray's method
-        lookup is unambiguous and the actor signature is stable when
-        we add cancellation / timing later.
-        """
-        return self._impl.evaluate(
-            order, sparsity_specs, step,
-            eval_samples=eval_samples, init=init,
-        )
-
-    def reset_caches(self) -> dict:
-        return self._impl.reset_caches()
-
-    def ready(self) -> bool:
-        return self._impl.ready()
-
-    def consume_tokenization_truncation_stats(self) -> dict:
-        """Pop per-process truncation counters; see PPO sibling for the
-        contract."""
-        from alphagrad.approx.env import (
-            consume_tokenization_truncation_stats as _consume,
-        )
-        return _consume()

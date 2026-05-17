@@ -118,9 +118,26 @@ class CpuApproxPool:
         num_rewards: int,
         cosine_sim_idx: int,
         frob_residual_idx: int,
+        initial_timeout_s: float | None = None,
+        warm_after: int = 3,
     ):
         self._alive: collections.deque = collections.deque(actor_handles)
         self._timeout_s = float(timeout_s)
+        # Phase 4f: cold-cache budget. The first ``warm_after`` calls
+        # per actor use ``initial_timeout_s`` (usually much larger than
+        # the warm timeout); after that each actor switches to the
+        # regular ``timeout_s``. We track the warm-state per actor in
+        # ``_call_counts``; brand-new actors (initial spawn or respawn)
+        # start at zero. ``None`` disables the cold-budget and uses
+        # ``timeout_s`` from the first call.
+        self._initial_timeout_s = (
+            float(initial_timeout_s) if initial_timeout_s is not None
+            else float(timeout_s)
+        )
+        self._warm_after = int(warm_after)
+        self._call_counts: dict[int, int] = {
+            id(a): 0 for a in actor_handles
+        }
         self._respawn_factory = respawn_factory
         self._lock = threading.Lock()
         self._closed = False
@@ -143,15 +160,50 @@ class CpuApproxPool:
         self._n_other_errors = 0
         self._n_respawn_requested = 0
 
+    def _timeout_for(self, actor: Any) -> float:
+        """Cold vs warm timeout for ``actor``. Returns 0 when the
+        user has disabled timeouts (``--cpu-callback-timeout 0``),
+        which the call site interprets as ``ray.get`` without a
+        timeout — i.e. block until the actor returns or dies.
+
+        Reads the call count under the lock. A brand-new actor (never
+        seen, ``warm_after`` not yet exhausted) gets
+        ``initial_timeout_s``; otherwise the regular ``timeout_s``.
+        """
+        # Explicit disable: any zero or negative timeout means "no
+        # timeout" for that phase. Cold/warm semantics still apply
+        # independently — set both to 0 to disable globally.
+        if self._timeout_s <= 0 and self._initial_timeout_s <= 0:
+            return 0.0
+        with self._lock:
+            n = self._call_counts.get(id(actor), 0)
+            if n < self._warm_after:
+                return self._initial_timeout_s
+            return self._timeout_s
+
+    def _mark_call(self, actor: Any) -> None:
+        """Increment the per-actor successful-call counter."""
+        with self._lock:
+            self._call_counts[id(actor)] = self._call_counts.get(id(actor), 0) + 1
+
     # ------------------------------------------------------------------
     # Actor pick / put-back
     # ------------------------------------------------------------------
     def _pick(self) -> Any | None:
+        """Pop an actor from the round-robin queue (or ``None`` when
+        the pool is empty / closed).
+
+        Sticky/key-based routing was tried and reverted: per-actor
+        LRU at 15% hit rate didn't beat the explicit-cache overhead.
+        The shared compile cache (``common/compile_cache.py``) lives
+        in a Ray named actor and is consulted from inside
+        ``env._callback``, so any actor can serve any compile target —
+        routing locality is no longer load-bearing.
+        """
         with self._lock:
             if self._closed or not self._alive:
                 return None
-            actor = self._alive.popleft()
-            return actor
+            return self._alive.popleft()
 
     def _put_back(self, actor: Any) -> None:
         with self._lock:
@@ -310,8 +362,18 @@ class CpuApproxPool:
                 eval_samples=samples_arg,
                 init=bool(init),
             )
-            result = ray.get(future, timeout=self._timeout_s)
+            # Per-actor cold/warm timeout. ``timeout_for`` returns 0
+            # when the user requested no-timeout (``--cpu-callback-timeout 0``);
+            # in that case we ``ray.get`` without a timeout so a slow
+            # compile never gets sentinel-poisoned. This is the
+            # debugging escape hatch: useful when the rollout's
+            # reward signal looks suspiciously zero and we want to
+            # rule out the sentinel path. The pool-recycle still
+            # bounds long-term memory growth.
+            timeout = self._timeout_for(actor)
+            result = ray.get(future) if timeout <= 0 else ray.get(future, timeout=timeout)
             tokens, eqn_ids, reward = result
+            self._mark_call(actor)
             self._put_back(actor)
             return (
                 np.asarray(tokens, dtype=np.int32),
@@ -352,6 +414,182 @@ class CpuApproxPool:
             )
 
     # ------------------------------------------------------------------
+    # Batched dispatch — fan out N futures concurrently with a single
+    # wall-clock timeout. Used by the PPO-ray rollout where ``num_envs``
+    # simultaneous calls would otherwise serialise through ``_pick``'s
+    # lock. The MuZero SPMD path is single-call at a time so it keeps
+    # using ``evaluate`` directly.
+    # ------------------------------------------------------------------
+    def evaluate_batch(
+        self,
+        order_batch: Sequence[Any],
+        specs_batch: Sequence[Any],
+        step_batch: Sequence[int],
+        *,
+        eval_samples: Any = None,
+        init: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Dispatch N requests concurrently. Returns
+        ``(tokens_stack, eqn_ids_stack, rewards_stack, sentinel_mask)``
+        of shapes ``(N, max_tokens)``, ``(N, max_tokens)``,
+        ``(N, num_rewards)``, ``(N,) bool``.
+
+        Picks up to ``N`` actors from the pool (each gets its own per-
+        actor cold/warm timeout), fires the futures in parallel, and
+        ``ray.wait``s them with the MAX per-actor timeout as the wall
+        clock. Per-call timeouts are then enforced by ``ray.get(...,
+        timeout=0)`` on already-ready futures and via a final
+        ``GetTimeoutError`` sweep on the still-pending ones.
+
+        If the pool has fewer actors than N, the surplus slots get
+        sentinel rows immediately (rather than blocking on respawn).
+        """
+        import ray
+        from ray.exceptions import GetTimeoutError, RayActorError
+
+        N = len(order_batch)
+        assert len(specs_batch) == N and len(step_batch) == N
+
+        # Pre-allocate output buffers + sentinel mask.
+        tokens_out = np.zeros((N, self._max_tokens), dtype=np.int32)
+        eqn_ids_out = np.zeros((N, self._max_tokens), dtype=np.int32)
+        rewards_out = np.zeros((N, self._num_rewards), dtype=np.float32)
+        sentinel_mask = np.zeros((N,), dtype=bool)
+
+        with self._lock:
+            samples_arg = self._eval_samples_ref
+        if samples_arg is None:
+            samples_arg = (
+                tuple(eval_samples) if eval_samples is not None else None
+            )
+
+        actors: list[Any | None] = []
+        for i in range(N):
+            actors.append(self._pick())
+
+        futures: list[Any | None] = [None] * N
+        timeouts: list[float] = []
+        for i, actor in enumerate(actors):
+            if actor is None:
+                # Slot couldn't get an actor — sentinel this row now.
+                tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
+                    _sentinel_callback_output(
+                        self._max_tokens,
+                        self._num_rewards,
+                        self._cosine_sim_idx,
+                        self._frob_residual_idx,
+                    )
+                )
+                sentinel_mask[i] = True
+                timeouts.append(0.0)
+                continue
+            self._n_calls += 1
+            try:
+                futures[i] = actor.evaluate.remote(
+                    np.asarray(order_batch[i]),
+                    np.asarray(specs_batch[i]),
+                    int(step_batch[i]),
+                    eval_samples=samples_arg,
+                    init=bool(init),
+                )
+                timeouts.append(self._timeout_for(actor))
+            except Exception:
+                self._n_other_errors += 1
+                self._poison(actor, future=None)
+                actors[i] = None
+                tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
+                    _sentinel_callback_output(
+                        self._max_tokens,
+                        self._num_rewards,
+                        self._cosine_sim_idx,
+                        self._frob_residual_idx,
+                    )
+                )
+                sentinel_mask[i] = True
+                timeouts.append(0.0)
+
+        # Single deadline for ``ray.wait`` — block up to the largest
+        # per-actor timeout for ALL futures to be ready. We then make
+        # per-future ``ray.get`` calls with the remaining budget to
+        # enforce per-actor timeouts individually. When the user
+        # disabled timeouts entirely (``--cpu-callback-timeout 0``),
+        # all entries in ``timeouts`` are 0.0, so we skip the
+        # ``ray.wait`` deadline and the per-future ``ray.get`` below
+        # uses an unbounded blocking get.
+        max_timeout = max((t for t in timeouts if t > 0.0), default=0.0)
+        no_timeout = max_timeout <= 0.0
+        live_futures = [f for f in futures if f is not None]
+        if live_futures and not no_timeout:
+            try:
+                ray.wait(
+                    live_futures,
+                    num_returns=len(live_futures),
+                    timeout=max_timeout,
+                )
+            except Exception:
+                pass
+
+        for i in range(N):
+            if sentinel_mask[i]:
+                continue
+            actor = actors[i]
+            future = futures[i]
+            try:
+                if no_timeout:
+                    # Block until the actor returns — slow compiles
+                    # are tolerated; only crashes / explicit
+                    # ``ray.kill`` produce sentinels.
+                    tokens, eqn_ids, reward = ray.get(future)
+                else:
+                    # ``timeout=0`` returns immediately if the future
+                    # is ready; otherwise raises GetTimeoutError
+                    # which we treat as a soft per-actor timeout.
+                    tokens, eqn_ids, reward = ray.get(future, timeout=0)
+                self._mark_call(actor)
+                self._put_back(actor)
+                tokens_out[i] = np.asarray(tokens, dtype=np.int32)
+                eqn_ids_out[i] = np.asarray(eqn_ids, dtype=np.int32)
+                rewards_out[i] = np.asarray(reward, dtype=np.float32)
+            except GetTimeoutError:
+                self._n_timeouts += 1
+                self._poison(actor, future=future)
+                tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
+                    _sentinel_callback_output(
+                        self._max_tokens,
+                        self._num_rewards,
+                        self._cosine_sim_idx,
+                        self._frob_residual_idx,
+                    )
+                )
+                sentinel_mask[i] = True
+            except RayActorError:
+                self._n_actor_errors += 1
+                self._poison(actor, future=future)
+                tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
+                    _sentinel_callback_output(
+                        self._max_tokens,
+                        self._num_rewards,
+                        self._cosine_sim_idx,
+                        self._frob_residual_idx,
+                    )
+                )
+                sentinel_mask[i] = True
+            except Exception:
+                self._n_other_errors += 1
+                self._poison(actor, future=future)
+                tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
+                    _sentinel_callback_output(
+                        self._max_tokens,
+                        self._num_rewards,
+                        self._cosine_sim_idx,
+                        self._frob_residual_idx,
+                    )
+                )
+                sentinel_mask[i] = True
+
+        return tokens_out, eqn_ids_out, rewards_out, sentinel_mask
+
+    # ------------------------------------------------------------------
     # Maintenance / introspection
     # ------------------------------------------------------------------
     def size(self) -> int:
@@ -370,6 +608,107 @@ class CpuApproxPool:
                 "other_errors": self._n_other_errors,
                 "respawn_requested": self._n_respawn_requested,
             }
+
+    def fetch_tokenization_truncation_stats(self) -> dict:
+        """Aggregate per-actor jaxpr-truncation telemetry across the
+        pool for the current period (= since the last poll, which
+        callers invoke once per rollout, so values are per-episode).
+
+        Each actor exposes ``consume_tokenization_truncation_stats``
+        which returns ``{count, max_observed_len, overflow_sum}`` and
+        resets its per-process counter. We ``ray.get`` from every live
+        actor in parallel, then:
+          * sum ``count`` and ``overflow_sum`` (per-episode totals);
+          * take the ``max`` of ``max_observed_len`` (largest single
+            jaxpr seen across the pool).
+        Best-effort: individual actor failures contribute zero and are
+        not raised.
+        """
+        import ray
+        with self._lock:
+            actors = list(self._alive)
+        empty = {"count": 0, "max_observed_len": 0, "overflow_sum": 0}
+        if not actors:
+            return empty
+        futures = [
+            a.consume_tokenization_truncation_stats.remote() for a in actors
+        ]
+        try:
+            results = ray.get(futures)
+        except Exception:
+            # Fall back to per-actor with-timeout reads — a single
+            # dead/stuck actor shouldn't kill the diagnostic.
+            results = []
+            for f in futures:
+                try:
+                    results.append(ray.get(f, timeout=2.0))
+                except Exception:
+                    results.append(dict(empty))
+        total = 0
+        max_len = 0
+        overflow_sum = 0
+        for r in results:
+            if not r:
+                continue
+            total += int(r.get("count", 0))
+            ml = int(r.get("max_observed_len", 0))
+            if ml > max_len:
+                max_len = ml
+            overflow_sum += int(r.get("overflow_sum", 0))
+        return {
+            "count": total,
+            "max_observed_len": max_len,
+            "overflow_sum": overflow_sum,
+        }
+
+    def recycle_one(self) -> int:
+        """Kill+respawn the OLDEST live actor (FIFO from the front of
+        the alive queue). Returns the pool size after the swap; ``-1``
+        when the recycle was skipped (no factory, empty pool, closed).
+
+        Cascading recycle: callers invoke this every
+        ``recycle_every / N`` episodes so a full ``recycle_every``
+        window rotates the entire pool but only ONE actor is mid-
+        respawn at any moment. Smears the memory spike + dead-pool
+        window that ``recycle()`` produces, without changing the
+        average per-actor lifetime.
+        """
+        import ray
+
+        with self._lock:
+            if self._closed or not self._alive:
+                return -1
+            if self._respawn_factory is None:
+                return -1
+            actor = self._alive.popleft()
+
+        # Kill outside the lock — ``ray.kill`` synchronously waits for
+        # the actor to die; holding the pool lock while waiting would
+        # block in-flight ``_pick`` calls unnecessarily.
+        try:
+            ray.kill(actor, no_restart=True)
+        except Exception:
+            pass
+
+        try:
+            new_handle = self._respawn_factory()
+        except Exception:
+            # Respawn failed — accept the smaller pool. The driver's
+            # next recycle attempt will try again.
+            with self._lock:
+                return len(self._alive)
+
+        with self._lock:
+            if self._closed:
+                # Pool was closed between our pop and respawn; kill
+                # the new handle immediately.
+                try:
+                    ray.kill(new_handle, no_restart=True)
+                except Exception:
+                    pass
+                return 0
+            self._alive.append(new_handle)
+            return len(self._alive)
 
     def recycle(self) -> int:
         """Kill every current actor and replace it via ``respawn_factory``.

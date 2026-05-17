@@ -98,9 +98,12 @@ from alphagrad.approx.heads import (
     MAX_PRIMES,
     NUM_COMPRESS_KINDS,
     NUM_OPS,
+    NUM_QUANT_DTYPES,
     OP_COMPRESS,
     OP_DIAG,
     OP_END,
+    OP_QUANT,
+    QUANT_DTYPES,
     AxisTokenFeatures,
     FactorTables,
     MicroAction,
@@ -217,6 +220,7 @@ class Trajectory(NamedTuple):
     micro_exp_seq: jax.Array  # (max_substeps, MAX_PRIMES) int32
     micro_factor_seq: jax.Array  # (max_substeps,) int32
     micro_compress_kind_seq: jax.Array  # (max_substeps,) int32
+    micro_quant_dtype_seq: jax.Array  # (max_substeps,) int32
     reward: jax.Array  # (NUM_REWARDS,) — full env emission, kept for host logging
     done: jax.Array
     value: jax.Array  # (NUM_VALUE_HEADS,) per-head value prediction
@@ -230,6 +234,7 @@ class Trajectory(NamedTuple):
     micro_j_dists: jax.Array  # (max_substeps, MAX_AXES_PER_VERTEX) float32
     micro_exp_dists: jax.Array  # (max_substeps, MAX_PRIMES, MAX_EXPONENT+1) float32
     micro_kind_dists: jax.Array  # (max_substeps, NUM_COMPRESS_KINDS) float32
+    micro_quant_dists: jax.Array  # (max_substeps, NUM_QUANT_DTYPES) float32
     discount: jax.Array
     vertex_avail_mask: jax.Array
 
@@ -248,6 +253,7 @@ class TrainBatch(NamedTuple):
     micro_exp_seq: jax.Array
     micro_factor_seq: jax.Array
     micro_compress_kind_seq: jax.Array
+    micro_quant_dtype_seq: jax.Array
     old_vertex_dist: jax.Array
     old_pair_dists: jax.Array
     old_factor_dists: jax.Array
@@ -256,6 +262,7 @@ class TrainBatch(NamedTuple):
     old_micro_j_dists: jax.Array
     old_micro_exp_dists: jax.Array
     old_micro_kind_dists: jax.Array
+    old_micro_quant_dists: jax.Array
     estim_returns: jax.Array
     norm_adv: jax.Array
     vertex_avail_mask: jax.Array
@@ -353,23 +360,26 @@ def old_micro_log_prob_for_action(
     j_seq,
     exp_seq,
     kind_seq,
+    quant_seq,
     vertex_dist,
     op_dists,
     i_dists,
     j_dists,
     exp_dists,
     kind_dists,
+    quant_dists,
 ):
     """Joint log-prob of a typed micro-action sequence under stored dists.
 
     Dynamic-substeps analog of :func:`old_log_prob_for_action`. The vertex
     log-prob plus the per-sub-step (op_type, i, j, prime-exponents,
-    compress_kind) contributions are summed, with the per-component
-    activity gating matching :meth:`MicroActionHead.log_prob_step`:
+    compress_kind, quant_dtype) contributions are summed, with the
+    per-component activity gating matching :meth:`MicroActionHead.log_prob_step`:
 
     * i active for DIAG / COMPRESS.
     * j and prime-exponent active for DIAG only.
     * compress_kind active for COMPRESS only.
+    * quant_dtype active for QUANT only.
     * Every component zeros out for sub-steps past the first OP_END
       (sticky termination — mirrors the scan's post-END mask).
 
@@ -389,6 +399,7 @@ def old_micro_log_prob_for_action(
 
     is_diag = (op_seq == OP_DIAG).astype(jnp.float32)
     is_compress = (op_seq == OP_COMPRESS).astype(jnp.float32)
+    is_quant = (op_seq == OP_QUANT).astype(jnp.float32)
     is_diag_or_compress = ((op_seq == OP_DIAG) | (op_seq == OP_COMPRESS)).astype(
         jnp.float32
     )
@@ -414,8 +425,13 @@ def old_micro_log_prob_for_action(
     )
     log_p_exp = jnp.sum(log_p_per_prime, axis=-1) * active * is_diag
     log_p_kind = jnp.log(kind_dists[arange_s, kind_seq] + 1e-8) * active * is_compress
+    log_p_quant = (
+        jnp.log(quant_dists[arange_s, quant_seq] + 1e-8) * active * is_quant
+    )
 
-    return log_p_v + jnp.sum(log_p_op + log_p_i + log_p_j + log_p_exp + log_p_kind)
+    return log_p_v + jnp.sum(
+        log_p_op + log_p_i + log_p_j + log_p_exp + log_p_kind + log_p_quant
+    )
 
 
 def _pad_seq(value: jax.Array, max_rules: int, pad: int = 0) -> jax.Array:
@@ -1841,6 +1857,7 @@ class Agent(eqx.Module):
             j_dists,
             exp_dists,
             kind_dists,
+            quant_dists,
         ) = self.micro_action_policy.sample(
             v_context,
             features,
@@ -1848,32 +1865,39 @@ class Agent(eqx.Module):
             micro_key,
         )
 
-        # Apply the op-legality override post-hoc on both DIAG and
-        # COMPRESS: any disallowed op_type is rewritten to END. The
+        # Apply the op-legality override post-hoc to DIAG / COMPRESS /
+        # QUANT: any disallowed op_type is rewritten to END. The
         # MicroActionPolicy.sample doesn't take the override directly —
-        # it computes legality from axis-state (always allowing both
-        # DIAG and COMPRESS when axes are available). The override is
-        # how the curriculum runner forces `ve_only` (no DIAG, no
-        # COMPRESS) or `compress` (no DIAG) or `diag_*` (no COMPRESS)
-        # behaviour at sampling time.
+        # it computes legality from axis-state (always allowing DIAG /
+        # COMPRESS / QUANT when applicable). The override is how the
+        # curriculum runner forces `ve_only` (no DIAG / COMPRESS / QUANT)
+        # or `compress` (no DIAG) or similar variants at sampling time.
         diag_allowed = op_legality_override[OP_DIAG] > 0.5
         compress_allowed = op_legality_override[OP_COMPRESS] > 0.5
+        quant_allowed = op_legality_override[OP_QUANT] > 0.5
         is_diag = actions.op_type == OP_DIAG
         is_compress = actions.op_type == OP_COMPRESS
-        disallowed = (is_diag & ~diag_allowed) | (is_compress & ~compress_allowed)
+        is_quant = actions.op_type == OP_QUANT
+        disallowed = (
+            (is_diag & ~diag_allowed)
+            | (is_compress & ~compress_allowed)
+            | (is_quant & ~quant_allowed)
+        )
         rewritten_op = jnp.where(
             disallowed,
             jnp.full_like(actions.op_type, OP_END),
             actions.op_type,
         )
         # When op_type is rewritten to END the sampled i / j / exponents /
-        # factor / kind are stale. Zero them so the recorded action is
-        # canonical (matches what sample_step produces for genuine END outputs).
+        # factor / kind / quant_dtype are stale. Zero them so the recorded
+        # action is canonical (matches what sample_step produces for genuine
+        # END outputs).
         zeros_i = jnp.zeros_like(actions.i)
         zeros_j = jnp.zeros_like(actions.j)
         zeros_exp = jnp.zeros_like(actions.exponents)
         zeros_f = jnp.zeros_like(actions.factor)
         zeros_k = jnp.zeros_like(actions.compress_kind)
+        zeros_q = jnp.zeros_like(actions.quant_dtype)
         actions = MicroAction(
             op_type=rewritten_op,
             i=jnp.where(disallowed, zeros_i, actions.i),
@@ -1881,6 +1905,7 @@ class Agent(eqx.Module):
             exponents=jnp.where(disallowed[..., None], zeros_exp, actions.exponents),
             factor=jnp.where(disallowed, zeros_f, actions.factor),
             compress_kind=jnp.where(disallowed, zeros_k, actions.compress_kind),
+            quant_dtype=jnp.where(disallowed, zeros_q, actions.quant_dtype),
         )
 
         return (
@@ -1892,6 +1917,7 @@ class Agent(eqx.Module):
             j_dists,
             exp_dists,
             kind_dists,
+            quant_dists,
             value,
             v_context,
         )
@@ -1960,6 +1986,7 @@ class Agent(eqx.Module):
             new_j_dists,
             new_exp_dists,
             new_kind_dists,
+            new_quant_dists,
         ) = self.micro_action_policy.evaluate(
             v_context,
             features,
@@ -1982,6 +2009,7 @@ class Agent(eqx.Module):
             new_j_dists,
             new_exp_dists,
             new_kind_dists,
+            new_quant_dists,
         )
 
     def to_env_action_dynamic(
@@ -1995,14 +2023,15 @@ class Agent(eqx.Module):
 
         Uses :func:`micro_actions_to_rule_specs_jax` to translate the
         typed sequence into ``(MAX_RULES_PER_VERTEX, 3)`` rule_specs.
-        DIAG micro-actions become rule rows; COMPRESS micro-actions are
-        silently dropped (the legacy env path doesn't yet consume them
-        — see ``--allow-compress``). The translator is JAX-traceable so
-        the whole rollout step stays inside jit.
+        DIAG / COMPRESS / QUANT micro-actions all map to typed rows; END
+        sub-steps are dropped. The translator is JAX-traceable so the
+        whole rollout step stays inside jit.
 
         ``actions.factor`` (stored on each MicroAction by ``sample_step``)
         is the integer factor consumed by the legacy spec — no re-
-        derivation from exponents needed here.
+        derivation from exponents needed here. ``actions.compress_kind``
+        and ``actions.quant_dtype`` carry the per-step kind / dtype
+        indices for COMPRESS / QUANT rows.
         """
         axis_state_v = axis_state[vertex_idx]
         rule_specs = micro_actions_to_rule_specs_jax(
@@ -2012,6 +2041,7 @@ class Agent(eqx.Module):
             actions.factor,
             axis_state_v,
             compress_kinds=actions.compress_kind,
+            quant_dtypes=actions.quant_dtype,
         )
         return StepAction(
             target_vertex=jnp.asarray(vertex_idx + 1, dtype=jnp.int32),
@@ -2801,7 +2831,7 @@ def _micro_introduction_stage(
     """First stage index where the dynamic head sees gradient signal.
 
     The micro_action_policy heads only carry useful signal when at least
-    one of DIAG / COMPRESS is legal — ``ve_only`` forces END every
+    one of DIAG / COMPRESS / QUANT is legal — ``ve_only`` forces END every
     sub-step, so the head's outputs are masked to 0 entropy / 0 log-prob
     contributions and gradients vanish. Returns ``len(stages)`` if the
     head is never introduced (i.e., all stages are ve_only) so the
@@ -2809,7 +2839,8 @@ def _micro_introduction_stage(
     """
     for stage_idx, (variant, _) in enumerate(curriculum_stages):
         legal = _op_legality_for_variant(variant, allow_compress)
-        if float(legal[0]) > 0.5 or float(legal[1]) > 0.5:
+        # Indices 0/1/2 correspond to OP_DIAG / OP_COMPRESS / OP_QUANT.
+        if any(float(legal[k]) > 0.5 for k in (0, 1, 2)):
             return stage_idx
     return len(curriculum_stages)
 
@@ -2827,29 +2858,32 @@ def _pin_rules_for_variant(variant: str) -> bool:
 def _op_legality_for_variant(
     variant: str,
     allow_compress: bool,
+    allow_quant: bool = True,
 ) -> jax.Array:
     """Per-variant op-type legality mask for the dynamic action space.
 
     Maps a comparison-study variant to the ``(NUM_OPS,) = (DIAG,
-    COMPRESS, END)`` float32 mask consumed by
+    COMPRESS, QUANT, END)`` float32 mask consumed by
     :meth:`Agent.sample_action_dynamic`. END is always legal so the
-    sub-episode can terminate. ``allow_compress`` overrides the
-    COMPRESS slot to 0 for any variant — useful while the graphax-side
-    real-COMPRESS wiring is pending.
+    sub-episode can terminate. ``allow_compress`` / ``allow_quant``
+    override the COMPRESS / QUANT slots to 0 for any variant — useful
+    for ablations or while the graphax-side wiring is pending.
 
-    * ``custom`` / ``full``: every op legal (gated by allow_compress).
+    * ``custom`` / ``full``: every op legal (gated by the allow flags).
     * ``ve_only``: force END at every sub-step (the dynamic-mode
       analogue of ``--pin-rules-to-exact``).
     * ``diag_gcd`` / ``diag_factor``: DIAG and END only.
     * ``compress``: COMPRESS and END only (requires allow_compress).
+    * ``quant``: QUANT and END only (requires allow_quant).
     """
     diag = 1.0
     compress = 1.0 if allow_compress else 0.0
+    quant = 1.0 if allow_quant else 0.0
     end = 1.0
     if variant == "ve_only":
-        return jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32)
+        return jnp.array([0.0, 0.0, 0.0, 1.0], dtype=jnp.float32)
     if variant in ("diag_gcd", "diag_factor"):
-        return jnp.array([diag, 0.0, end], dtype=jnp.float32)
+        return jnp.array([diag, 0.0, 0.0, end], dtype=jnp.float32)
     if variant == "compress":
         if not allow_compress:
             raise ValueError(
@@ -2857,10 +2891,16 @@ def _op_legality_for_variant(
                 "graphax vertex_elimination_jaxpr rewrite to actually "
                 "consume COMPRESS micro-actions through the env)."
             )
-        return jnp.array([0.0, compress, end], dtype=jnp.float32)
+        return jnp.array([0.0, compress, 0.0, end], dtype=jnp.float32)
+    if variant == "quant":
+        if not allow_quant:
+            raise ValueError(
+                "Variant 'quant' requires allow_quant=True."
+            )
+        return jnp.array([0.0, 0.0, quant, end], dtype=jnp.float32)
     # `custom` and `full` (and anything else) get the unrestricted mask
-    # gated by allow_compress.
-    return jnp.array([diag, compress, end], dtype=jnp.float32)
+    # gated by the allow flags.
+    return jnp.array([diag, compress, quant, end], dtype=jnp.float32)
 
 
 def _parse_curriculum(spec: str) -> list[tuple[str, int]]:
@@ -3199,6 +3239,7 @@ def _action_to_pylist_dynamic(
     j_seq,
     factor_seq,
     kind_seq,
+    quant_seq,
     max_substeps,
 ):
     """Decode typed micro-action sequences into copy-pastable per-vertex lists.
@@ -3208,19 +3249,22 @@ def _action_to_pylist_dynamic(
     * ``diag(i, j, factor)`` for an OP_DIAG sub-step.
     * ``compress("kind", axis)`` for an OP_COMPRESS sub-step (the kind
       is the string from :data:`COMPRESS_KINDS` at the sampled index).
+    * ``quant("dtype")`` for an OP_QUANT sub-step (the dtype is the
+      string from :data:`QUANT_DTYPES` at the sampled index).
 
     OP_END (and every sub-step past it) is dropped from the output, so a
     vertex whose sub-episode is just OP_END renders as ``(v, [])`` —
     matching how the user reads the no-approximation case.
     """
     out = []
-    for v_idx, op_row, i_row, j_row, f_row, k_row in zip(
+    for v_idx, op_row, i_row, j_row, f_row, k_row, q_row in zip(
         vertex_seq,
         op_seq,
         i_seq,
         j_seq,
         factor_seq,
         kind_seq,
+        quant_seq,
     ):
         steps: list[str] = []
         for slot in range(max_substeps):
@@ -3238,6 +3282,13 @@ def _action_to_pylist_dynamic(
                 else:
                     kind_name = f"kind{k}"
                 steps.append(f"compress({kind_name!r}, {int(i_row[slot])})")
+            elif op == OP_QUANT:
+                q = int(q_row[slot])
+                if 0 <= q < len(QUANT_DTYPES):
+                    dtype_name = QUANT_DTYPES[q]
+                else:
+                    dtype_name = f"dtype{q}"
+                steps.append(f"quant({dtype_name!r})")
             else:
                 steps.append(f"op{op}({int(i_row[slot])}, {int(j_row[slot])})")
         out.append((int(v_idx) + 1, steps))
@@ -3568,8 +3619,12 @@ def run_calibration_phase(
         # override). For dynamic-substeps calibration the caller will
         # provide the active override via args.
         if args.dynamic_substeps:
+            # Order: DIAG, COMPRESS, QUANT, END — calibration uses the env's
+            # current op-legality. Compress is gated by --allow-compress;
+            # QUANT is always enabled at calibration time (any per-stage
+            # override is applied separately by the trainer).
             cal_override = jnp.array(
-                [1.0, 1.0 if args.allow_compress else 0.0, 1.0],
+                [1.0, 1.0 if args.allow_compress else 0.0, 1.0, 1.0],
                 dtype=jnp.float32,
             )
         else:
@@ -3789,41 +3844,16 @@ def run_bc_warmstart(
 
 
 def _setup_jax_compile_cache() -> None:
-    """Enable XLA's persistent compile cache so successive runs of the same
-    config skip JIT recompile. Honoured by JAX>=0.4.16 via env-var; we set a
-    sensible default if the user hasn't already, then turn it on through the
-    `jax.config` API too (belt-and-braces — JAX is in transition between
-    the two surfaces).
+    """Back-compat wrapper around
+    :func:`alphagrad.approx.common.cache.setup_jax_compile_cache`.
 
-    Default location: ``~/.cache/jax-compilation-cache/<short hostname>``.
-    The per-host suffix scopes the cache **per cluster node** — without
-    it, a cache populated on one node (e.g. an older-generation Intel CPU
-    with ``+prefer-no-gather`` / ``+prefer-no-scatter`` LLVM tuning
-    hints) leaks over the shared NFS home to nodes with different CPU
-    generations. XLA's ``cpu_aot_loader.cc`` then logs a "machine type
-    used for XLA:CPU compilation doesn't match the machine type for
-    execution" warning and may fall back to a fresh compile, costing
-    minutes per slow_operation_alarm hit. Per-node scoping silences the
-    warning and removes the spurious recompile.
-
-    The cache is keyed on the HLO + flags + JAX/XLA version, so stale
-    entries within a single node's subdirectory are never hit. Users
-    can opt out / override by setting ``JAX_COMPILATION_CACHE_DIR``
-    explicitly before launching.
+    The default now points at a per-SLURM-job, per-node `/tmp/dsnn-jax-cache-...`
+    directory (previously: shared NFS ``~/.cache/jax-compilation-cache/<host>``).
+    Sbatch scripts that need cross-job reuse can set
+    ``DSNN_JAX_CACHE_REUSE=1`` before invocation.
     """
-    import socket
-
-    short_host = socket.gethostname().split(".", 1)[0]
-    cache_dir = os.environ.setdefault(
-        "JAX_COMPILATION_CACHE_DIR",
-        os.path.expanduser(f"~/.cache/jax-compilation-cache/{short_host}"),
-    )
-    try:
-        from jax.experimental.compilation_cache import compilation_cache
-
-        compilation_cache.set_cache_dir(cache_dir)
-    except Exception:
-        pass
+    from alphagrad.approx.common.cache import setup_jax_compile_cache
+    setup_jax_compile_cache()
 
 
 def main():
@@ -4294,6 +4324,11 @@ def main():
             (args.max_substeps, NUM_COMPRESS_KINDS),
             dtype=jnp.float32,
         )
+        _dyn_zero_quant_seq = jnp.zeros((args.max_substeps,), dtype=jnp.int32)
+        _dyn_zero_quant_dists = jnp.zeros(
+            (args.max_substeps, NUM_QUANT_DTYPES),
+            dtype=jnp.float32,
+        )
 
         def step_fn(carry, k):
             state, residual_state = carry
@@ -4312,6 +4347,7 @@ def main():
                     micro_j_dists,
                     micro_exp_dists,
                     micro_kind_dists,
+                    micro_quant_dists,
                     value,
                     v_context,
                 ) = agent.sample_action_dynamic(
@@ -4344,6 +4380,7 @@ def main():
                 micro_exp_seq = micro_actions.exponents
                 micro_factor_seq = micro_actions.factor
                 micro_compress_kind_seq = micro_actions.compress_kind
+                micro_quant_dtype_seq = micro_actions.quant_dtype
             else:
                 (
                     vertex_idx,
@@ -4378,11 +4415,13 @@ def main():
                 micro_exp_seq = _dyn_zero_exp_seq
                 micro_factor_seq = _dyn_zero_factor_seq
                 micro_compress_kind_seq = _dyn_zero_kind_seq
+                micro_quant_dtype_seq = _dyn_zero_quant_seq
                 micro_op_dists = _dyn_zero_op_dists
                 micro_i_dists = _dyn_zero_i_dists
                 micro_j_dists = _dyn_zero_j_dists
                 micro_exp_dists = _dyn_zero_exp_dists
                 micro_kind_dists = _dyn_zero_kind_dists
+                micro_quant_dists = _dyn_zero_quant_dists
             env_out = env_obj.step(state, env_action)
             next_state = env_out.state
             raw_rewards = env_out.reward
@@ -4462,6 +4501,7 @@ def main():
                 micro_exp_seq=micro_exp_seq,
                 micro_factor_seq=micro_factor_seq,
                 micro_compress_kind_seq=micro_compress_kind_seq,
+                micro_quant_dtype_seq=micro_quant_dtype_seq,
                 reward=jnp.atleast_1d(rewards),
                 done=jnp.array(done, dtype=jnp.float32),
                 value=jnp.atleast_1d(value),
@@ -4474,6 +4514,7 @@ def main():
                 micro_j_dists=micro_j_dists,
                 micro_exp_dists=micro_exp_dists,
                 micro_kind_dists=micro_kind_dists,
+                micro_quant_dists=micro_quant_dists,
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
             )
@@ -4759,6 +4800,7 @@ def main():
             exponents=batch.micro_exp_seq,
             factor=batch.micro_factor_seq,
             compress_kind=batch.micro_compress_kind_seq,
+            quant_dtype=batch.micro_quant_dtype_seq,
         )
 
         def _eval_dyn(toks, eids, rs, pref, vidx, action, vmask, cached, k):
@@ -4790,6 +4832,7 @@ def main():
                 new_j_dists,
                 new_exp_dists,
                 new_kind_dists,
+                new_quant_dists,
             ) = jax.vmap(
                 lambda toks, eids, rs, pref, vidx, action, vmask, k: _eval_dyn(
                     toks, eids, rs, pref, vidx, action, vmask, None, k
@@ -4816,6 +4859,7 @@ def main():
                 new_j_dists,
                 new_exp_dists,
                 new_kind_dists,
+                new_quant_dists,
             ) = jax.vmap(_eval_dyn)(
                 batch.tokens,
                 batch.eqn_ids,
@@ -4835,12 +4879,14 @@ def main():
             batch.micro_j_seq,
             batch.micro_exp_seq,
             batch.micro_compress_kind_seq,
+            batch.micro_quant_dtype_seq,
             batch.old_vertex_dist,
             batch.old_micro_op_dists,
             batch.old_micro_i_dists,
             batch.old_micro_j_dists,
             batch.old_micro_exp_dists,
             batch.old_micro_kind_dists,
+            batch.old_micro_quant_dists,
         )
 
         ratio = jnp.exp(log_probs - old_log_probs)
@@ -4902,6 +4948,7 @@ def main():
         active_steps = (prior_ends == 0).astype(jnp.float32)  # (B, S)
         is_diag_step = (batch.micro_op_seq == OP_DIAG).astype(jnp.float32)
         is_compress_step = (batch.micro_op_seq == OP_COMPRESS).astype(jnp.float32)
+        is_quant_step = (batch.micro_op_seq == OP_QUANT).astype(jnp.float32)
         is_diag_or_compress = (
             (batch.micro_op_seq == OP_DIAG) | (batch.micro_op_seq == OP_COMPRESS)
         ).astype(jnp.float32)
@@ -4942,14 +4989,21 @@ def main():
             batch.old_micro_kind_dists,
             active_steps * is_compress_step,
         )
-        kl_div = kl_vertex + kl_op + kl_i + kl_j + kl_exp + kl_kind
+        kl_quant = _per_step_kl(
+            new_quant_dists,
+            batch.old_micro_quant_dists,
+            active_steps * is_quant_step,
+        )
+        kl_div = kl_vertex + kl_op + kl_i + kl_j + kl_exp + kl_kind + kl_quant
         # Stash per-component KLs so they can be logged separately — they're
         # the most useful single signal for debugging the dynamic head
         # (factor head and END decision are where collapse starts per the
         # design spec). The 5-slot layout is preserved for back-compat; the
-        # kind KL is folded into the exponent slot since both gate on the
-        # corresponding op-type (DIAG / COMPRESS respectively).
-        _kl_components = (kl_vertex, kl_op, kl_i, kl_j, kl_exp + kl_kind)
+        # kind and quant KLs are folded into the exponent slot since both
+        # gate on their respective op-type (COMPRESS / QUANT) and the legacy
+        # consumer reads slot 4 as "non-vertex / non-op_type / non-axis"
+        # collateral.
+        _kl_components = (kl_vertex, kl_op, kl_i, kl_j, kl_exp + kl_kind + kl_quant)
 
         # Per-component entropy under the current policy, using the same
         # active-substep / DIAG gating as the KL split. Pairs with the
@@ -4967,6 +5021,7 @@ def main():
         # exponent axis, then sum over the (padded) prime axis.
         exp_ent_per = jnp.sum(_step_entropy(new_exp_dists), axis=-1)  # (B, S)
         kind_ent_per = _step_entropy(new_kind_dists)  # (B, S)
+        quant_ent_per = _step_entropy(new_quant_dists)  # (B, S)
 
         ent_vertex = jnp.mean(_step_entropy(new_vertex_dist))
         ent_op = jnp.mean(jnp.sum(op_ent_per * active_steps, axis=-1) / denom)
@@ -4982,9 +5037,14 @@ def main():
         ent_kind = jnp.mean(
             jnp.sum(kind_ent_per * active_steps * is_compress_step, axis=-1) / denom
         )
-        # Fold the kind entropy into the exp slot to keep the 5-slot
-        # layout the legacy loss path returns.
-        _entropy_components = (ent_vertex, ent_op, ent_i, ent_j, ent_exp + ent_kind)
+        ent_quant = jnp.mean(
+            jnp.sum(quant_ent_per * active_steps * is_quant_step, axis=-1) / denom
+        )
+        # Fold the kind + quant entropies into the exp slot to keep the
+        # 5-slot layout the legacy loss path returns.
+        _entropy_components = (
+            ent_vertex, ent_op, ent_i, ent_j, ent_exp + ent_kind + ent_quant,
+        )
 
         total_loss = (
             ppo_loss
@@ -5186,6 +5246,7 @@ def main():
             micro_exp_seq=traj.micro_exp_seq,
             micro_factor_seq=traj.micro_factor_seq,
             micro_compress_kind_seq=traj.micro_compress_kind_seq,
+            micro_quant_dtype_seq=traj.micro_quant_dtype_seq,
             old_vertex_dist=traj.vertex_dist,
             old_pair_dists=traj.pair_dists,
             old_factor_dists=traj.factor_dists,
@@ -5194,6 +5255,7 @@ def main():
             old_micro_j_dists=traj.micro_j_dists,
             old_micro_exp_dists=traj.micro_exp_dists,
             old_micro_kind_dists=traj.micro_kind_dists,
+            old_micro_quant_dists=traj.micro_quant_dists,
             estim_returns=estim_returns,
             norm_adv=norm_adv,
             vertex_avail_mask=traj.vertex_avail_mask,
@@ -5292,6 +5354,7 @@ def main():
             traj.micro_j_seq,
             traj.micro_factor_seq,
             traj.micro_compress_kind_seq,
+            traj.micro_quant_dtype_seq,
         )
         # Pair / factor / preference marginals — Stage D / E / F diagnostics.
         # Average over (env, time, slot) — broad enough to detect global
@@ -5431,6 +5494,7 @@ def main():
         micro_j_arr = np.array(actions_pack[5])
         micro_factor_arr = np.array(actions_pack[6])
         micro_kind_arr = np.array(actions_pack[7])
+        micro_quant_arr = np.array(actions_pack[8])
 
         def _decode(env_i):
             if args.dynamic_substeps:
@@ -5441,6 +5505,7 @@ def main():
                     micro_j_arr[env_i],
                     micro_factor_arr[env_i],
                     micro_kind_arr[env_i],
+                    micro_quant_arr[env_i],
                     args.max_substeps,
                 )
             return _action_to_pylist(

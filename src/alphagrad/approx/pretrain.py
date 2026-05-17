@@ -118,7 +118,13 @@ def _tokenize_one(target_fn, xs):
     """Run the same tokenization the env uses, end-to-end."""
     closed = jax.make_jaxpr(target_fn)(*xs)
     ve = VEJaxpr(closed.jaxpr)
-    tokens = np.asarray(ve.tokenized()[:MAX_TOKENS])
+    # Mirror env.py's tokenization-truncation diagnostic so the
+    # offline pretrain pipeline surfaces the same warning when a
+    # corpus example overflows MAX_TOKENS.
+    from alphagrad.approx.env import _record_tokenization_truncation
+    raw_tokens = np.asarray(ve.tokenized())
+    _record_tokenization_truncation(int(raw_tokens.shape[0]))
+    tokens = raw_tokens[:MAX_TOKENS]
     tokens = np.pad(tokens, (0, MAX_TOKENS - tokens.shape[0])).astype(np.int32)
     eqn_ids = compute_eqn_ids_from_tokens(tokens, TOKEN_VOCAB)
     return (

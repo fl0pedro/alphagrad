@@ -37,6 +37,35 @@ def make_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Pin training to GPU 0 and the env eval callback to GPU 1.",
     )
+    p.add_argument(
+        "--best-sequences-json", type=str, default="",
+        help="Path to write the running per-channel + overall best "
+        "sequences as JSON. Empty (default) → derive from the wandb "
+        "run dir as ``<wandb_dir>/best_sequences.json``. The file holds "
+        "one entry per reward channel + an ``overall`` entry, each "
+        "with the full (a_i, b_i, c_i, r_i) reward tuple and the "
+        "action sequence that produced it. Updated atomically every "
+        "``--best-sequences-every`` episodes and at run end.",
+    )
+    p.add_argument(
+        "--best-sequences-every", type=int, default=10,
+        help="Cadence (in episodes) for writing the best-sequences "
+        "JSON + logging the wandb table snapshot. Set to 0 to only "
+        "write at run end.",
+    )
+    p.add_argument(
+        "--calibration-statistic", type=str, default="iqr",
+        choices=["iqr", "mean_abs", "std"],
+        help="Per-channel dispersion statistic for pre-training "
+             "calibration. `iqr` (default, recommended): symlog-space "
+             "IQR / 1.349, σ-equivalent robust to outliers. `mean_abs` "
+             "(legacy): ``|symlog(mean)|`` — bias proxy, kept for A/B. "
+             "`std`: symlog-space std via the IQR proxy. MuZero uses "
+             "calibration to balance the scalarised reward stream that "
+             "feeds the value head; with raw cmp-channel magnitudes ~ "
+             "1e10, an uncalibrated value loss can hit 1e20+ on the "
+             "first gradient step.",
+    )
 
     # Environment / reward
     p.add_argument("--example", type=str, default="Helmholtz")
@@ -49,7 +78,11 @@ def make_argparser() -> argparse.ArgumentParser:
                    default=["cmp", "mem", "acc"], choices=["cmp", "mem", "acc"])
     p.add_argument("--lambda-cmp", type=float, default=1.0)
     p.add_argument("--lambda-mem", type=float, default=1.0)
-    p.add_argument("--lambda-frob", type=float, default=0.0)
+    # frob (Jacobian magnitude residual) is now active by default
+    # alongside cossim (direction). Bumped 0.0 → 1.0 so both quality
+    # channels contribute to the gradient; the Lagrangian range
+    # constraint stays on cossim only.
+    p.add_argument("--lambda-frob", type=float, default=1.0)
     p.add_argument(
         "--measure-latency", action="store_true",
         help="Run the compiled approx fn 10x per env step to populate "
@@ -310,15 +343,24 @@ def make_argparser() -> argparse.ArgumentParser:
     )
 
     # Stage G calibration
-    p.add_argument(
-        "--calibrate-steps",
-        type=int,
-        default=0,
-        help="Pre-training reward-scale calibration: run K rollouts of the "
-             "un-trained agent, measure mean ``|symlog(reward)|`` per channel, "
-             "and rescale ``reward_weights`` by 1/mean_abs so the wide-magnitude "
-             "channels contribute on a comparable scale.",
-    )
+    #
+    # NOTE: ``--calibrate-steps`` is now declared in
+    # :func:`alphagrad.approx.common.ray_runtime.add_common_ray_args` so
+    # both ``mu0_ray.py`` and ``ppo_ray.py`` share the default. The
+    # single-process ``mu0.py`` trainer (which doesn't call
+    # ``add_common_ray_args``) still needs its own declaration so its
+    # CLI surface stays unchanged.
+    if not any(a.dest == "calibrate_steps" for a in p._actions):
+        p.add_argument(
+            "--calibrate-steps",
+            type=int,
+            default=0,
+            help="Pre-training reward-scale calibration: run K rollouts of "
+                 "the un-trained agent, measure mean ``|symlog(reward)|`` "
+                 "per channel, and rescale ``reward_weights`` by 1/mean_abs "
+                 "so the wide-magnitude channels contribute on a comparable "
+                 "scale.",
+        )
     p.add_argument(
         "--calibrate-lr",
         type=float,

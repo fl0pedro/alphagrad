@@ -4,7 +4,7 @@ After the base pointer net picks a vertex ``v``, this module opens a
 sub-episode at ``v`` that emits a variable-length sequence of typed
 micro-actions until END:
 
-    a_t ∈ { Diag(i, j, factor),  Compress(physical_axes),  End }
+    a_t ∈ { Diag(i, j, factor),  Compress(physical_axes),  Quant(dtype),  End }
 
 Three concrete heads compose:
 
@@ -65,6 +65,8 @@ import jax.numpy as jnp
 import jax.random as jrand
 import numpy as np
 
+from graphax.sparse.micro_actions import NUM_QUANT_DTYPES, QUANT_DTYPES
+
 
 # ---------------------------------------------------------------------------
 # Constants and shape primitives
@@ -72,8 +74,9 @@ import numpy as np
 
 OP_DIAG = 0
 OP_COMPRESS = 1
-OP_END = 2
-NUM_OPS = 3
+OP_QUANT = 2
+OP_END = 3
+NUM_OPS = 4
 
 # Compress reductions emitted by :class:`CompressKindHead` and consumed by
 # :class:`graphax.sparse.micro_actions.apply_compress`. Index alignment is
@@ -678,7 +681,7 @@ def _features_after_compress(
 
 
 def _compute_op_legality(features: AxisTokenFeatures) -> jax.Array:
-    """Op-type legality (3,) — DIAG / COMPRESS / END."""
+    """Op-type legality (NUM_OPS,) — DIAG / COMPRESS / QUANT / END."""
     is_compressed = features.tag_bits[:, TAG_IS_COMPRESSED] > 0.5
     in_diag = features.tag_bits[:, TAG_IN_DIAG_GROUP] > 0.5
     valid = features.valid_mask > 0.5
@@ -690,8 +693,12 @@ def _compute_op_legality(features: AxisTokenFeatures) -> jax.Array:
     compress_legal = (jnp.sum(compress_eligible.astype(jnp.int32)) >= 1).astype(
         jnp.float32
     )
+    # QUANT is per-tensor, not per-axis — always legal at this layer. If the
+    # SparseTensor has ``val is None`` at apply time, ``apply_quant`` returns
+    # the tensor unchanged, so an emitted QUANT can't crash the env.
+    quant_legal = jnp.array(1.0, dtype=jnp.float32)
     end_legal = jnp.array(1.0, dtype=jnp.float32)
-    return jnp.stack([diag_legal, compress_legal, end_legal])
+    return jnp.stack([diag_legal, compress_legal, quant_legal, end_legal])
 
 
 def _compute_axis_masks(
@@ -725,25 +732,29 @@ def _compute_axis_masks(
 class MicroAction(NamedTuple):
     """Typed sample emitted by :meth:`MicroActionHead.sample` per sub-step.
 
-    * ``op_type`` ∈ ``{OP_DIAG, OP_COMPRESS, OP_END}``.
+    * ``op_type`` ∈ ``{OP_DIAG, OP_COMPRESS, OP_QUANT, OP_END}``.
     * ``i`` / ``j``: axis-token indices into the current axis set.
-      ``j`` is unused for COMPRESS / END (filled with 0). For COMPRESS
-      ``i`` is the physical axis being compressed.
+      ``j`` is unused for COMPRESS / QUANT / END (filled with 0). For
+      COMPRESS ``i`` is the physical axis being compressed. ``i`` is
+      unused for QUANT / END too.
     * ``exponents``: ``(MAX_PRIMES,)`` int32 prime exponents for DIAG;
-      zeros for COMPRESS / END.
+      zeros for COMPRESS / QUANT / END.
     * ``factor``: derived integer factor for DIAG (``∏ p_k^c_k``); 0 for
-      COMPRESS / END. Stored explicitly because deriving it requires the
-      prime table at sample time, and re-deriving inside evaluate would
+      COMPRESS / QUANT / END. Stored explicitly because deriving it requires
+      the prime table at sample time, and re-deriving inside evaluate would
       need the same gather — easier to keep the integer alongside its
       exponents.
     * ``compress_kind``: reduction-kind index ∈ ``[0, NUM_COMPRESS_KINDS)``
       consumed by :class:`graphax.sparse.micro_actions.Compress`. Meaningful
-      only when ``op_type == OP_COMPRESS``; zero for DIAG / END.
+      only when ``op_type == OP_COMPRESS``; zero for DIAG / QUANT / END.
+    * ``quant_dtype``: dtype index ∈ ``[0, NUM_QUANT_DTYPES)`` consumed by
+      :class:`graphax.sparse.micro_actions.Quant`. Meaningful only when
+      ``op_type == OP_QUANT``; zero for DIAG / COMPRESS / END.
 
     The env-side translator (alphagrad.approx.env) maps this tuple to a
     legacy rule_specs row via :func:`micro_actions_to_rule_specs_jax` or
-    a graphax ``Diag`` / ``Compress`` via ``apply_micro_actions`` for the
-    future end-to-end path.
+    a graphax ``Diag`` / ``Compress`` / ``Quant`` via ``apply_micro_actions``
+    for the future end-to-end path.
     """
 
     op_type: jax.Array
@@ -752,6 +763,7 @@ class MicroAction(NamedTuple):
     exponents: jax.Array
     factor: jax.Array
     compress_kind: jax.Array
+    quant_dtype: jax.Array
 
 
 class CompressKindHead(eqx.Module):
@@ -770,6 +782,27 @@ class CompressKindHead(eqx.Module):
 
     def __call__(self, summary: jax.Array, axis_token: jax.Array) -> jax.Array:
         logits = self.proj(summary + axis_token)
+        return jnn.softmax(logits, axis=-1)
+
+
+class QuantDtypeHead(eqx.Module):
+    """Categorical over the JAX dtypes in :data:`QUANT_DTYPES`.
+
+    Fires only when the op-type head picks ``OP_QUANT``; for non-QUANT
+    sub-steps its sampled value is recorded but masked out of the joint
+    log-prob, entropy, and arity (same gating used for
+    :class:`CompressKindHead`). Reads only the pooled axis-set summary —
+    Quant is per-tensor, not per-axis, so axis-token conditioning would
+    be misleading.
+    """
+
+    proj: eqx.nn.Linear
+
+    def __init__(self, embd_dim: int, *, key):
+        self.proj = eqx.nn.Linear(embd_dim, NUM_QUANT_DTYPES, key=key)
+
+    def __call__(self, summary: jax.Array) -> jax.Array:
+        logits = self.proj(summary)
         return jnn.softmax(logits, axis=-1)
 
 
@@ -799,17 +832,19 @@ class MicroActionHead(eqx.Module):
     axis_j_head: AxisPointerHead
     factor_head: PrimeExponentHead
     compress_kind_head: CompressKindHead
+    quant_dtype_head: QuantDtypeHead
 
     embd_dim: int = eqx.field(static=True)
 
     def __init__(self, embd_dim: int, *, key):
         self.embd_dim = embd_dim
-        keys = jrand.split(key, 5)
+        keys = jrand.split(key, 6)
         self.op_head = OpTypeHead(embd_dim, key=keys[0])
         self.axis_i_head = AxisPointerHead(embd_dim, key=keys[1])
         self.axis_j_head = AxisPointerHead(embd_dim, key=keys[2])
         self.factor_head = PrimeExponentHead(embd_dim, key=keys[3])
         self.compress_kind_head = CompressKindHead(embd_dim, key=keys[4])
+        self.quant_dtype_head = QuantDtypeHead(embd_dim, key=keys[5])
 
     # The sample / evaluate methods take per-sub-step state. They return
     # *flat* (single sub-step) outputs; the surrounding scan in
@@ -842,13 +877,14 @@ class MicroActionHead(eqx.Module):
         to ``i_mask_diag`` (the sampled ``i`` is masked out downstream
         anyway).
         """
-        k_op, k_i, k_j, k_f, k_kind = jrand.split(key, 5)
+        k_op, k_i, k_j, k_f, k_kind, k_quant = jrand.split(key, 6)
 
         op_dist = self.op_head(summary, op_legality_mask)
         op_type = distrax.Categorical(probs=op_dist).sample(seed=k_op)
 
         is_diag = op_type == OP_DIAG
         is_compress = op_type == OP_COMPRESS
+        is_quant = op_type == OP_QUANT
 
         # Op-conditional `i` mask. For END, falls back to the diag mask
         # (the resulting `i` is masked out via `i_active` downstream).
@@ -895,21 +931,31 @@ class MicroActionHead(eqx.Module):
         kind_dist = self.compress_kind_head(summary, axis_tokens[i_idx])
         kind_idx = distrax.Categorical(probs=kind_dist).sample(seed=k_kind)
 
-        # Force i/j/exponents/kind to canonical values for non-emitting ops
-        # so the recorded action is unambiguous. The masking in
+        # Quant-dtype head: categorical over the JAX dtype catalog. Per-tensor
+        # (no axis-token conditioning). Run unconditionally and mask out the
+        # contribution for non-QUANT steps in log_prob_step.
+        quant_dist = self.quant_dtype_head(summary)
+        quant_idx = distrax.Categorical(probs=quant_dist).sample(seed=k_quant)
+
+        # Force i/j/exponents/kind/quant to canonical values for non-emitting
+        # ops so the recorded action is unambiguous. The masking in
         # `log_prob_step` mirrors this.
         i_out = jnp.where(is_diag | is_compress, i_idx, 0).astype(jnp.int32)
         j_out = jnp.where(is_diag, j_idx, 0).astype(jnp.int32)
         exp_out = jnp.where(is_diag, exponents, jnp.zeros_like(exponents))
         factor_out = jnp.where(is_diag, factor, jnp.array(0, dtype=jnp.int32))
         kind_out = jnp.where(is_compress, kind_idx, 0).astype(jnp.int32)
+        quant_out = jnp.where(is_quant, quant_idx, 0).astype(jnp.int32)
 
         action = MicroAction(
             op_type=op_type.astype(jnp.int32),
             i=i_out, j=j_out, exponents=exp_out, factor=factor_out,
-            compress_kind=kind_out,
+            compress_kind=kind_out, quant_dtype=quant_out,
         )
-        return action, factor_out, op_dist, i_dist, j_dist, exp_dists, kind_dist
+        return (
+            action, factor_out, op_dist, i_dist, j_dist, exp_dists,
+            kind_dist, quant_dist,
+        )
 
     def log_prob_step(
         self,
@@ -943,6 +989,7 @@ class MicroActionHead(eqx.Module):
 
         is_diag = action.op_type == OP_DIAG
         is_compress = action.op_type == OP_COMPRESS
+        is_quant = action.op_type == OP_QUANT
 
         # i: emitted for DIAG and COMPRESS under the op-conditional mask.
         i_mask = jnp.where(is_diag, i_mask_diag, i_mask_compress)
@@ -984,25 +1031,38 @@ class MicroActionHead(eqx.Module):
         ent_kind = -jnp.sum(kind_dist * jnp.log(kind_dist + 1e-8))
         kind_active = is_compress.astype(jnp.float32)
 
+        # Quant-dtype: emitted only for QUANT. Per-tensor; no axis-token
+        # conditioning at sample time, so none here either.
+        quant_dist = self.quant_dtype_head(summary)
+        log_p_quant = jnp.log(quant_dist[action.quant_dtype] + 1e-8)
+        ent_quant = -jnp.sum(quant_dist * jnp.log(quant_dist + 1e-8))
+        quant_active = is_quant.astype(jnp.float32)
+
         log_p = (
             log_p_op + log_p_i * i_active + log_p_j * j_active
             + log_p_f * f_active + log_p_kind * kind_active
+            + log_p_quant * quant_active
         )
         entropy = (
             ent_op + ent_i * i_active + ent_j * j_active
             + ent_f * f_active + ent_kind * kind_active
+            + ent_quant * quant_active
         )
 
         # Arity counts the *components* actually emitted: 1 (op_type) + i +
-        # j + the prime sub-loop + compress_kind. The prime sub-loop's
-        # contribution scales with the number of real primes in g; we use
-        # ``prime_mask.sum()`` so DIAG sub-steps with more primes count for
-        # more (matching the entropy term that already weights by
-        # prime_mask). COMPRESS sub-steps add 1 for the kind categorical.
+        # j + the prime sub-loop + compress_kind + quant_dtype. The prime
+        # sub-loop's contribution scales with the number of real primes in g;
+        # we use ``prime_mask.sum()`` so DIAG sub-steps with more primes count
+        # for more (matching the entropy term that already weights by
+        # prime_mask). COMPRESS adds 1 for the kind categorical; QUANT adds
+        # 1 for the dtype categorical.
         prime_arity = jnp.sum(prime_mask) * f_active
-        arity = 1.0 + i_active + j_active + prime_arity + kind_active
+        arity = (
+            1.0 + i_active + j_active + prime_arity + kind_active + quant_active
+        )
         return (
-            log_p, entropy, arity, op_dist, i_dist, j_dist, exp_dists, kind_dist,
+            log_p, entropy, arity,
+            op_dist, i_dist, j_dist, exp_dists, kind_dist, quant_dist,
         )
 
 
@@ -1080,14 +1140,18 @@ class MicroActionPolicy(eqx.Module):
         # the per-vertex hard cap (2 × num_axes) is reached — the latter is
         # a length bound, not a structural constraint.
         force_end = ended | (step_idx >= cap)
+        # Order: DIAG, COMPRESS, QUANT, END — only END stays legal under
+        # force_end (sticky termination).
         op_legal = jnp.where(
             force_end,
-            jnp.array([0.0, 0.0, 1.0], dtype=op_legal.dtype),
+            jnp.array([0.0, 0.0, 0.0, 1.0], dtype=op_legal.dtype),
             op_legal,
         )
         i_diag, i_compress, j_diag = _compute_axis_masks(features)
 
-        action, factor, op_d, i_d, j_d, exp_d, kind_d = self.head.sample_step(
+        (
+            action, factor, op_d, i_d, j_d, exp_d, kind_d, quant_d,
+        ) = self.head.sample_step(
             summary, axis_tokens, features.size,
             op_legal, i_diag, i_compress, j_diag,
             tables, key,
@@ -1138,7 +1202,7 @@ class MicroActionPolicy(eqx.Module):
 
         return (
             (new_features, new_ended, new_gid, step_idx + 1),
-            (action, log_p, ent, arity, op_d, i_d, j_d, exp_d, kind_d),
+            (action, log_p, ent, arity, op_d, i_d, j_d, exp_d, kind_d, quant_d),
         )
 
     def sample(
@@ -1177,7 +1241,7 @@ class MicroActionPolicy(eqx.Module):
         (
             _,
             (actions, logps, ents, arities, op_dists, i_dists, j_dists,
-             exp_dists, kind_dists),
+             exp_dists, kind_dists, quant_dists),
         ) = lax.scan(step_fn, init_carry, keys)
         return (
             actions,
@@ -1189,6 +1253,7 @@ class MicroActionPolicy(eqx.Module):
             j_dists,
             exp_dists,
             kind_dists,
+            quant_dists,
         )
 
     def _step_evaluate(
@@ -1208,13 +1273,14 @@ class MicroActionPolicy(eqx.Module):
         force_end = ended | (step_idx >= cap)
         op_legal = jnp.where(
             force_end,
-            jnp.array([0.0, 0.0, 1.0], dtype=op_legal.dtype),
+            jnp.array([0.0, 0.0, 0.0, 1.0], dtype=op_legal.dtype),
             op_legal,
         )
         i_diag, i_compress, j_diag = _compute_axis_masks(features)
 
         (
-            log_p, ent, arity, op_dist, i_dist, j_dist, exp_dists, kind_dist,
+            log_p, ent, arity,
+            op_dist, i_dist, j_dist, exp_dists, kind_dist, quant_dist,
         ) = self.head.log_prob_step(
             action, summary, axis_tokens, features.size,
             op_legal, i_diag, i_compress, j_diag, tables,
@@ -1258,7 +1324,10 @@ class MicroActionPolicy(eqx.Module):
 
         return (
             (new_features, new_ended, new_gid, step_idx + 1),
-            (log_p, ent, arity, op_dist, i_dist, j_dist, exp_dists, kind_dist),
+            (
+                log_p, ent, arity,
+                op_dist, i_dist, j_dist, exp_dists, kind_dist, quant_dist,
+            ),
         )
 
     def evaluate(
@@ -1296,18 +1365,22 @@ class MicroActionPolicy(eqx.Module):
 
         (
             _,
-            (logps, ents, arities, op_dists, i_dists, j_dists, exp_dists, kind_dists),
+            (
+                logps, ents, arities,
+                op_dists, i_dists, j_dists, exp_dists, kind_dists, quant_dists,
+            ),
         ) = lax.scan(step_fn, init_carry, actions)
         return (
             jnp.sum(logps), jnp.sum(ents), jnp.sum(arities),
-            op_dists, i_dists, j_dists, exp_dists, kind_dists,
+            op_dists, i_dists, j_dists, exp_dists, kind_dists, quant_dists,
         )
 
 
 __all__ = [
-    "OP_DIAG", "OP_COMPRESS", "OP_END", "NUM_OPS",
+    "OP_DIAG", "OP_COMPRESS", "OP_QUANT", "OP_END", "NUM_OPS",
     "MAX_PRIMES", "MAX_EXPONENT",
     "COMPRESS_KINDS", "NUM_COMPRESS_KINDS",
+    "QUANT_DTYPES", "NUM_QUANT_DTYPES",
     "AXIS_TAG_BITS", "TAG_IS_LOGICAL", "TAG_IS_COMPRESSED", "TAG_IN_DIAG_GROUP",
     "AxisTokenFeatures",
     "FactorTables",
@@ -1317,6 +1390,7 @@ __all__ = [
     "AxisPointerHead",
     "PrimeExponentHead",
     "CompressKindHead",
+    "QuantDtypeHead",
     "MicroAction",
     "MicroActionHead",
     "MicroActionPolicy",

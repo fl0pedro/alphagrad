@@ -32,25 +32,16 @@ from typing import Any, Sequence
 
 
 def _setup_jax_compile_cache() -> None:
-    """Enable JAX's persistent disk compile cache for this process.
+    """Thin back-compat wrapper around the canonical helper.
 
-    No-op if JAX is already configured. The cache dir defaults to
-    ``~/.cache/jax-compile`` and is shared across Ray actors on the
-    same host — duplicated compiles in different actors hit the same
-    on-disk cache and skip the HLO-generation pass.
-
-    Idempotent: re-runs of this function (e.g. from multiple
-    ``CpuApproximationServer.__init__``s in the same process) only
-    do anything once.
+    The real implementation lives in :func:`alphagrad.approx.common.cache.setup_jax_compile_cache`
+    so every trainer (single-process ppo/mu0, Ray PPO worker, CPU
+    approx worker) hits the same per-SLURM-job, per-node cache and
+    we can fix the cross-node AOT-loader contamination in one place.
     """
-    import jax
+    from alphagrad.approx.common.cache import setup_jax_compile_cache
 
-    cache_dir = os.environ.get(
-        "JAX_COMPILATION_CACHE_DIR",
-        os.path.join(os.path.expanduser("~"), ".cache", "jax-compile"),
-    )
-    os.makedirs(cache_dir, exist_ok=True)
-    jax.config.update("jax_compilation_cache_dir", cache_dir)
+    setup_jax_compile_cache()
 
 
 class CpuApproximationServer:
@@ -97,6 +88,27 @@ class CpuApproximationServer:
         # the lowered HLO, so unrelated workers' caches don't poison
         # each other.
         _setup_jax_compile_cache()
+        # Per-actor leak profiler. Lazy-initialised on first call to
+        # ``evaluate`` so we don't pay the import cost when profiling
+        # is disabled. Gated by env-var ``ALPHAGRAD_LEAK_PROFILE`` so
+        # production runs aren't taxed.
+        self._n_calls = 0
+        self._leak_profile = None  # set by `_maybe_init_leak_profile`
+        # One-shot env-var banner: prints which ALPHAGRAD_* /
+        # JAX_COMPILATION_* keys the actor's runtime_env actually
+        # received. Lets us catch driver-side passthrough bugs (e.g.
+        # an ``ALPHAGRAD_DEBUG_QUALITY`` set in sbatch that never
+        # reaches the actor) without grepping by hand.
+        _alpha_keys = sorted(
+            (k, v) for k, v in os.environ.items()
+            if k.startswith("ALPHAGRAD_") or k.startswith("JAX_COMPILATION_")
+        )
+        if _alpha_keys:
+            print(
+                f"[cpu_approx_worker pid={os.getpid()}] env: "
+                + " ".join(f"{k}={v}" for k, v in _alpha_keys),
+                flush=True,
+            )
 
     # ------------------------------------------------------------------
     # Constructors
@@ -163,6 +175,11 @@ class CpuApproximationServer:
             if eval_samples is not None
             else self._eval_samples
         )
+        # Optional per-actor leak profile. Off by default — enable with
+        # ``ALPHAGRAD_LEAK_PROFILE=1``. Logs each `evaluate` call's RSS
+        # so we can attribute the leak to *this* process (not the
+        # GPU trainer that dispatched the request via Ray).
+        self._maybe_init_leak_profile()
         try:
             tokens, eqn_ids, reward = _callback(
                 self._config,
@@ -174,6 +191,9 @@ class CpuApproximationServer:
                 *es,
                 init=bool(init),
             )
+            self._n_calls += 1
+            if self._leak_profile is not None:
+                self._leak_profile.record_call(self._n_calls)
             return np.asarray(tokens), np.asarray(eqn_ids), np.asarray(reward)
         except Exception as exc:
             # graphax can raise on transforms that produce shape-incompatible
@@ -252,6 +272,14 @@ class CpuApproximationServer:
 
     def ready(self) -> bool:
         return True
+
+    def _maybe_init_leak_profile(self) -> None:
+        """Activate the per-actor RSS / tracemalloc profiler on first
+        ``evaluate`` if ``ALPHAGRAD_LEAK_PROFILE=1`` is set."""
+        if self._leak_profile is not None:
+            return
+        from alphagrad.approx.common.leak_profile import maybe_install
+        self._leak_profile = maybe_install("actor")
 
 
 # ---------------------------------------------------------------------------
