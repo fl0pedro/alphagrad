@@ -96,6 +96,7 @@ def _run(args) -> int:
     args_dict = vars(args)
     wandb.init(
         project=args.wandb_project,
+        entity=getattr(args, "wandb_entity", None) or None,
         name=args.name,
         config=args_dict,
         mode="disabled" if args.wandb == "disabled" else args.wandb,
@@ -363,6 +364,27 @@ def _run(args) -> int:
             raw = state["best_global_rewards"][name]
             wt = state["best_global_weighted_split"].get(name, 0.0)
             tqdm.write(f"    {name:<18s}  raw={raw:+.4g}   weighted={wt:+.4g}")
+    # Loud CPU-pool-sentinel summary. If ``total_timeouts == 0`` across a
+    # full training run, the sentinel-callback path in
+    # ``ppo_ray_worker._fan_out_tokenize`` is dead code and can be
+    # deleted (see CpuApproxPool.fetch_timeout_delta docstring). We log
+    # the running total here as the canonical "did the sentinel fire
+    # this run" signal so the cleanup decision is one line away.
+    try:
+        pool_stats = ray.get(actor.pool_stats.remote()) if hasattr(actor, "pool_stats") else None
+    except Exception:
+        pool_stats = None
+    if pool_stats is not None:
+        n_t = int(pool_stats.get("timeouts", 0))
+        n_c = int(pool_stats.get("calls", 0))
+        tag = "(sentinel path is dead code — can be dropped)" if n_t == 0 else ""
+        tqdm.write(f"  cpu-pool timeouts total: {n_t} / {n_c} calls  {tag}")
+        final_payload_extra = {
+            "final/cpu_pool_timeouts_total": n_t,
+            "final/cpu_pool_calls_total": n_c,
+        }
+    else:
+        final_payload_extra = {}
     # Final JSON + wandb dump of the running bests. The JSON file is
     # the canonical record (durable, easy to diff across runs); the
     # wandb Table is a UI nicety so the bests show up in the run page
@@ -375,6 +397,16 @@ def _run(args) -> int:
     )
     final_payload["final/best_return"] = state["best_global_return"]
     final_payload["final/best_ep"] = state["best_global_ep"]
+    final_payload.update(final_payload_extra)
+    if final_path:
+        try:
+            from alphagrad.approx.common.render_sequence import (
+                render_best_sequences_json,
+            )
+            for k, v in render_best_sequences_json(final_path).items():
+                final_payload[f"final/{k}/repr"] = v
+        except Exception as exc:
+            tqdm.write(f"  [render] best-sequence repr failed: {exc}")
     # The Table goes through wandb's artifact upload path which on some
     # wandb configurations (`base_url='redacted'` in
     # ~/.config/wandb/settings) hits a pydantic-v2 URL validation

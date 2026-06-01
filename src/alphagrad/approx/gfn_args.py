@@ -78,8 +78,14 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lambda-frob", type=float, default=0.0)
     p.add_argument(
         "--measure-latency", action="store_true",
-        help="Run the compiled approx fn 10x per env step to populate "
-             "the latency reward component.",
+        help="Time the compiled approx fn N times per env step to "
+             "populate the latency reward component (N = --latency-samples).",
+    )
+    p.add_argument(
+        "--latency-samples", type=int, default=1,
+        help="Per-step latency sample count when --measure-latency is on. "
+        "Default 1 (single noisy point, denoised by per-episode averaging "
+        "over ~12*num_envs calls). >=8 enables top-quartile-mean smoothing.",
     )
     p.add_argument(
         "--terminal-rewards-only",

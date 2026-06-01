@@ -830,7 +830,9 @@ def main():
     closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
     argnums = infer_argnums(args.example)
 
-    env_target_fun = target_fn if "acc" in args.rewards else None
+    # Always pass target_fun so flops/bytes_accessed/latency_ns/peak_memory
+    # populate every step (see cpu_approx_worker.py for the full rationale).
+    env_target_fun = target_fn
     measure_latency = args.measure_latency or args.cmp_type == "latency"
     env = VertexEliminationEnv.from_jaxpr(
         closed_jaxpr,
@@ -843,6 +845,7 @@ def main():
         mem_type=args.mem_type,
         exec_on_gpu=args.exec_on_gpu,
         measure_latency=measure_latency,
+        latency_samples=int(getattr(args, "latency_samples", 1)),
         terminal_rewards_only=args.terminal_rewards_only,
     )
 
@@ -910,13 +913,30 @@ def main():
     print(f"mcts_mode={args.mcts_mode}: {mode_detail}")
 
     # ---------------- Stage F Lagrangian state ----------------
-    # The cosine_sim bounds are added to the explicit --lagrangian-constraint
-    # list before parsing, matching ppo.py's wiring.
-    user_constraints = list(args.lagrangian_constraint)
-    if args.cosine_lower_bound > 0.0:
-        user_constraints.append(f"cosine_sim>={args.cosine_lower_bound}")
-    if args.cosine_upper_bound < 1.0:
-        user_constraints.append(f"cosine_sim<={args.cosine_upper_bound}")
+    # ``--anti-degeneracy`` is desugared here so the corridor bounds used
+    # by ``corridor/*_band_fraction`` instrumentation match the
+    # constraints the trainer enforces (single source of truth across
+    # PPO / MuZero / GFN).
+    from alphagrad.approx.common.anti_degeneracy import (
+        desugar_anti_degeneracy,
+    )
+    user_constraints, _corridor_low, _corridor_high = desugar_anti_degeneracy(
+        list(args.lagrangian_constraint),
+        getattr(args, "anti_degeneracy", "none"),
+        float(getattr(args, "anti_degeneracy_delta", 0.01)),
+        float(getattr(args, "cosine_lower_bound", 0.8)),
+        float(getattr(args, "cosine_upper_bound", 0.9)),
+    )
+    # Legacy: if --anti-degeneracy is left at its default "none", honour
+    # the explicit --cosine-lower-bound / --cosine-upper-bound bounds
+    # for back-compat with existing mu0 dispatch scripts.
+    if getattr(args, "anti_degeneracy", "none") == "none":
+        if args.cosine_lower_bound > 0.0:
+            user_constraints.append(f"cosine_sim>={args.cosine_lower_bound}")
+            _corridor_low = float(args.cosine_lower_bound)
+        if args.cosine_upper_bound < 1.0:
+            user_constraints.append(f"cosine_sim<={args.cosine_upper_bound}")
+            _corridor_high = float(args.cosine_upper_bound)
     constraint_specs = parse_lagrangian_constraints(user_constraints)
     if constraint_specs:
         ops_for_print = {1: ">=", -1: "<="}

@@ -175,7 +175,9 @@ def _build_actor_state(
     closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
     argnums = infer_argnums(args.example)
 
-    env_target_fun = target_fn if "acc" in args.rewards else None
+    # Always pass target_fun so flops/bytes_accessed/latency_ns/peak_memory
+    # populate every step (see cpu_approx_worker.py for the full rationale).
+    env_target_fun = target_fn
     measure_latency = args.measure_latency or args.cmp_type == "latency"
     env = VertexEliminationEnv.from_jaxpr(
         closed_jaxpr,
@@ -188,6 +190,7 @@ def _build_actor_state(
         mem_type=args.mem_type,
         exec_on_gpu=args.exec_on_gpu,
         measure_latency=measure_latency,
+        latency_samples=int(getattr(args, "latency_samples", 1)),
         terminal_rewards_only=args.terminal_rewards_only,
     )
 
@@ -959,6 +962,43 @@ class SPMDServerWorker:
             for j in range(NUM_REWARDS)
         }
 
+        per_reward_means = (
+            {
+                REWARD_NAMES[j]: float(
+                    r_vec_np[..., j][valid_mask].mean()
+                )
+                for j in range(NUM_REWARDS)
+            }
+            if valid_mask.any()
+            else {REWARD_NAMES[j]: 0.0 for j in range(NUM_REWARDS)}
+        )
+        # Terminal-step rewards (each env's last transition). mu0
+        # trajectories are fixed-length per env, so the per-env
+        # terminal step is always ``T - 1``. ``r_vec_np`` is
+        # (num_envs, T, NUM_REWARDS); slice the last step per env.
+        if r_vec_np.shape[1] > 0:
+            term_rewards = r_vec_np[:, -1, :]  # (num_envs, NUM_REWARDS)
+            term_valid_env = valid_mask[:, -1] if valid_mask.shape[1] > 0 else np.ones(
+                r_vec_np.shape[0], dtype=bool
+            )
+            if term_valid_env.any():
+                term_mean = term_rewards[term_valid_env].mean(axis=0)
+                term_max = term_rewards[term_valid_env].max(axis=0)
+            else:
+                term_mean = np.zeros((NUM_REWARDS,), dtype=np.float32)
+                term_max = np.zeros((NUM_REWARDS,), dtype=np.float32)
+            terminal_means = {
+                REWARD_NAMES[j]: float(term_mean[j]) for j in range(NUM_REWARDS)
+            }
+            best_terminal = {
+                REWARD_NAMES[j]: float(term_max[j]) for j in range(NUM_REWARDS)
+            }
+            terminal_cs = term_rewards[term_valid_env, REWARD_INDEX["cosine_sim"]]
+        else:
+            terminal_means = {n: 0.0 for n in REWARD_NAMES}
+            best_terminal = {n: 0.0 for n in REWARD_NAMES}
+            terminal_cs = np.zeros((0,), dtype=np.float32)
+
         stats = {
             "best_return": float(per_env_tot[best_idx]),
             "mean_return": float(per_env_tot.mean()),
@@ -967,20 +1007,27 @@ class SPMDServerWorker:
             ),
             "best_overall_rewards": best_overall_rewards,
             "best_overall_weighted": best_overall_weighted,
-            "per_reward_means": (
-                {
-                    REWARD_NAMES[j]: float(
-                        r_vec_np[..., j][valid_mask].mean()
-                    )
-                    for j in range(NUM_REWARDS)
-                }
-                if valid_mask.any()
-                else {REWARD_NAMES[j]: 0.0 for j in range(NUM_REWARDS)}
-            ),
+            "per_reward_means": per_reward_means,
+            "terminal_means": terminal_means,
+            "best_terminal": best_terminal,
             "best_per_reward": best_per_reward,
             "entropy_mean": mean_entropy,
             "entropy_root": root_entropy,
         }
+        # Unified `reward/{cost,quality}/{per_step,terminal,best_terminal}/<name>`
+        # keys + corridor instrumentation. Legacy `reward_mean/*` keys
+        # (emitted by the driver from ``per_reward_means``) remain.
+        from alphagrad.approx.common.reward_scaling import (
+            build_unified_reward_log_dict,
+        )
+        stats.update(
+            build_unified_reward_log_dict(
+                stats,
+                corridor_low=getattr(self, "_corridor_low", None),
+                corridor_high=getattr(self, "_corridor_high", None),
+                terminal_cossims=terminal_cs,
+            )
+        )
 
         if self.replay_buffer is None and self.args.replay_buffer_size > 0:
             self.replay_buffer = init_replay_buffer(
@@ -1119,6 +1166,14 @@ class SPMDServerWorker:
         # of calls ≈ GB-scale residual per ep). Recycle bounds it.
         if self._pool is not None:
             stats.update({f"pool/{k}": v for k, v in self._pool.stats().items()})
+            # Per-episode timeout delta (see PPO equivalent — sentinel-fire
+            # detector; should stay at 0 with the pool=num_envs fix).
+            try:
+                stats["pool/timeouts_this_episode"] = (
+                    self._pool.fetch_timeout_delta()
+                )
+            except Exception:
+                stats["pool/timeouts_this_episode"] = 0
             # Mirror PPO: pop per-rollout jaxpr-tokenization truncation
             # counters from each CPU actor's per-process state. All
             # values are PER-EPISODE (the actor counters reset on

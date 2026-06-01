@@ -91,6 +91,14 @@ def add_common_ray_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="wandb project name.",
     )
     _maybe_add(
+        p, "--wandb-entity",
+        type=str,
+        default="",
+        help="wandb entity (team / user namespace). Empty = wandb default "
+             "(your personal namespace). Set to e.g. 'dll-streetview' to "
+             "land the run in a team's project.",
+    )
+    _maybe_add(
         p, "--cpu-callback-timeout",
         type=float,
         default=600.0,

@@ -151,6 +151,9 @@ def test_aggregate_per_channel_stats_shape_and_keys():
         # Added with the best-sequence JSON dump: the overall winner's
         # action sequence (empty list when ``action_seq=None``).
         "best_overall_seq",
+        # Added with Infra 1 (unified per-episode logging). Empty
+        # dicts when ``dones_mask=None`` (this call site).
+        "terminal_means", "best_terminal",
     }
     # per_reward_means covers every channel.
     assert set(stats["per_reward_means"].keys()) == set(REWARD_NAMES)
@@ -160,6 +163,109 @@ def test_aggregate_per_channel_stats_shape_and_keys():
     assert "muls_adds_fmas" not in stats["best_per_reward"]
     # Env 2 has the best flops; verify.
     assert stats["best_per_reward"]["flops"]["env_idx"] == 2
+    # Without dones_mask, terminal_means / best_terminal stay empty.
+    assert stats["terminal_means"] == {}
+    assert stats["best_terminal"] == {}
+
+
+def test_aggregate_with_dones_mask_distinguishes_per_step_from_terminal():
+    """Sparse-terminal channels (cossim) — per_step mean is heavily diluted by
+    intermediate zero-reward steps, terminal mean is the honest signal."""
+    import numpy as np
+    from alphagrad.approx.common.reward_scaling import (
+        NUM_REWARDS,
+        REWARD_INDEX,
+        aggregate_per_channel_stats,
+    )
+    from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+
+    T, N = 5, 4
+    rv = np.zeros((T, N, NUM_REWARDS), dtype=np.float32)
+    cs_idx = REWARD_INDEX["cosine_sim"]
+    rv[-1, :, cs_idx] = np.array([0.95, 0.50, 1.00, 0.85], dtype=np.float32)
+    dones = np.zeros((T, N), dtype=bool)
+    dones[-1, :] = True
+    weights = np.zeros((NUM_REWARDS,), dtype=np.float32)
+    weights[cs_idx] = 1.0
+    stats = aggregate_per_channel_stats(
+        rv, weights, sentinel=SENTINEL_REWARD_VALUE, dones_mask=dones,
+    )
+    # Per-step: 4 envs * 5 timesteps = 20 entries, only 4 nonzero, sum=3.30.
+    # Mean = 3.30 / 20 = 0.165.
+    assert abs(stats["per_reward_means"]["cosine_sim"] - 0.165) < 1e-5
+    # Terminal: just the 4 terminal entries. Mean = (0.95+0.50+1.0+0.85)/4 = 0.825.
+    assert abs(stats["terminal_means"]["cosine_sim"] - 0.825) < 1e-5
+    # Best terminal: max over the 4 terminal entries = 1.0.
+    assert stats["best_terminal"]["cosine_sim"] == 1.0
+
+
+def test_build_unified_reward_log_dict_emits_grouped_keys():
+    import numpy as np
+    from alphagrad.approx.common.reward_scaling import (
+        NUM_REWARDS,
+        REWARD_INDEX,
+        aggregate_per_channel_stats,
+        build_unified_reward_log_dict,
+    )
+    from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+
+    T, N = 3, 2
+    rv = np.zeros((T, N, NUM_REWARDS), dtype=np.float32)
+    rv[-1, 0, REWARD_INDEX["cosine_sim"]] = 0.95
+    rv[-1, 1, REWARD_INDEX["cosine_sim"]] = 0.70
+    rv[-1, :, REWARD_INDEX["flops"]] = np.array([-1e6, -2e6], dtype=np.float32)
+    dones = np.zeros((T, N), dtype=bool)
+    dones[-1, :] = True
+    weights = np.ones((NUM_REWARDS,), dtype=np.float32)
+    stats = aggregate_per_channel_stats(
+        rv, weights, sentinel=SENTINEL_REWARD_VALUE, dones_mask=dones,
+    )
+    log = build_unified_reward_log_dict(
+        stats,
+        corridor_low=0.8,
+        corridor_high=0.9,
+        terminal_cossims=rv[-1, :, REWARD_INDEX["cosine_sim"]],
+    )
+    # Grouping: flops is cost, cosine_sim is quality.
+    assert "reward/cost/per_step/flops" in log
+    assert "reward/cost/terminal/flops" in log
+    assert "reward/cost/best_terminal/flops" in log
+    assert "reward/quality/per_step/cosine_sim" in log
+    assert "reward/quality/terminal/cosine_sim" in log
+    assert "reward/quality/best_terminal/cosine_sim" in log
+    # Symlog flags surfaced.
+    assert log["reward/cost/symlog_applied"] is True
+    assert log["reward/quality/symlog_applied"] is False
+    # Corridor [0.8, 0.9]: env 0 (0.95) is above, env 1 (0.70) is below.
+    assert log["corridor/in_band_fraction"] == 0.0
+    assert log["corridor/below_band_fraction"] == 0.5
+    assert log["corridor/above_band_fraction"] == 0.5
+
+
+def test_build_unified_reward_log_dict_ceiling_only_corridor():
+    """`--anti-degeneracy delta_ceiling` passes corridor_low=None."""
+    import numpy as np
+    from alphagrad.approx.common.reward_scaling import (
+        REWARD_NAMES,
+        build_unified_reward_log_dict,
+    )
+
+    stats = {
+        "per_reward_means": {n: 0.0 for n in REWARD_NAMES},
+        "terminal_means": {n: 0.0 for n in REWARD_NAMES},
+        "best_terminal": {n: 0.0 for n in REWARD_NAMES},
+    }
+    cossims = np.array([0.85, 0.98, 1.0, 0.5], dtype=np.float32)
+    log = build_unified_reward_log_dict(
+        stats, corridor_low=None, corridor_high=0.99, terminal_cossims=cossims,
+    )
+    # below_mask uses -inf as floor → no env is below, 1 env (1.0) is above.
+    assert log["corridor/below_band_fraction"] == 0.0
+    assert log["corridor/above_band_fraction"] == 0.25
+    assert log["corridor/in_band_fraction"] == 0.75
+    # corridor/low key omitted when no floor is set.
+    assert "corridor/low" not in log
+    assert log["corridor/high"] == 0.99
 
 
 def test_aggregate_filters_sentinels_from_per_channel_means():

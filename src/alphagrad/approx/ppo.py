@@ -2073,6 +2073,15 @@ def make_argparser() -> argparse.ArgumentParser:
         default="offline",
         choices=["disabled", "offline", "online"],
     )
+    p.add_argument(
+        "--wandb-project", type=str, default="dsnn-vertex",
+        help="wandb project name.",
+    )
+    p.add_argument(
+        "--wandb-entity", type=str, default="",
+        help="wandb entity (team / user namespace). Empty = personal default. "
+             "Set to 'dll-streetview' to land in that team's project.",
+    )
     p.add_argument("--episodes", type=int, default=50)
     p.add_argument("--no-jit", action="store_true")
     p.add_argument(
@@ -2252,7 +2261,11 @@ def make_argparser() -> argparse.ArgumentParser:
             "diag_gcd",
             "diag_factor",
             "compress",
+            "compress_scalar",
+            "quantize",
+            "quant_smallest_float",
             "full",
+            "full_curriculum",
         ],
         help=(
             "Pre-canned configuration mapping to --factors / --max-rules / "
@@ -3982,7 +3995,9 @@ def main():
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
     )
     closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
-    env_target_fun = target_fn if "acc" in args.rewards else None
+    # Always pass target_fun so flops/bytes_accessed/latency_ns/peak_memory
+    # populate every step (see cpu_approx_worker.py for the full rationale).
+    env_target_fun = target_fn
     argnums = infer_argnums(args.example)
 
     # Latency is the only optional component of the reward harness; auto-enable
@@ -4000,6 +4015,7 @@ def main():
         mem_type=args.mem_type,
         exec_on_gpu=args.exec_on_gpu,
         measure_latency=measure_latency,
+        latency_samples=int(getattr(args, "latency_samples", 1)),
         terminal_rewards_only=args.terminal_rewards_only,
     )
 
@@ -5171,9 +5187,38 @@ def main():
             # Always use the per-step preference for advantage weighting. In
             # the unconditioned (Stage A–E) path it's broadcast from the static
             # CLI --lambda-* weights; in Stage F it's the Dirichlet sample; in
-            # Stage G calibration it's the quality-focused override. Same code
-            # path either way.
-            norm_adv = jnp.sum(norm_adv_components * traj.preference, axis=-1)
+            # Stage G calibration it's the quality-focused override.
+            #
+            # RQ9 / Pitch B: ``--scalarization tchebycheff`` swaps the
+            # linear ``sum_k w_k * r_k`` for augmented Tchebycheff,
+            # which reaches concave Pareto regions a linear sum cannot
+            # (Miettinen 1999 §3.4.3). Ideal-point ``z*`` is the
+            # per-channel running max within this minibatch — for a
+            # stable EMA estimate at long-horizon training, refactor to
+            # carry z* in the training state (note in
+            # docs/experiments/pareto_front_tchebycheff.md).
+            scalarization = getattr(args, "scalarization", "linear")
+            if scalarization == "tchebycheff":
+                from alphagrad.approx.common.scalarization import (
+                    apply_scalarization,
+                )
+                # ideal point: per-channel running best in this batch
+                # (positive-orientation; advantages are oriented so
+                # higher = better). Per-batch is a reasonable proxy for
+                # the EMA-tracked ideal until the full state-carrying
+                # impl lands.
+                z_star = jnp.max(norm_adv_components, axis=tuple(
+                    range(norm_adv_components.ndim - 1),
+                ))
+                norm_adv = apply_scalarization(
+                    norm_adv_components,
+                    traj.preference,
+                    kind="tchebycheff",
+                    ideal_point=z_star,
+                    rho=float(getattr(args, "tchebycheff_rho", 0.05)),
+                )
+            else:
+                norm_adv = jnp.sum(norm_adv_components * traj.preference, axis=-1)
 
         # Stage F Lagrangian: per-step constraint violations and multiplier
         # update. ``constraint_indices`` / ``constraint_thresholds`` /
@@ -5413,10 +5458,11 @@ def main():
 
     # Reporting.
     wandb.init(
-        project="dsnn-vertex",
+        project=getattr(args, "wandb_project", None) or "dsnn-vertex",
+        entity=getattr(args, "wandb_entity", None) or None,
         name=args.name,
         config=vars(args),
-        mode="disabled" if args.wandb == "disabled" else "offline",
+        mode="disabled" if args.wandb == "disabled" else args.wandb,
     )
     elim_order_table = wandb.Table(columns=["episode", "return", "elimination order"])
     pbar = tqdm(total=args.episodes)
@@ -5753,13 +5799,25 @@ def main():
     # static-shape arrays (length-C jax arrays). Multipliers are dynamic
     # (length-C, ≥ 0, updated by dual ascent each episode). C == 0 → empty
     # arrays, in which case the augmentation in train_episode is a no-op.
-    # The cosine-similarity bounds are added automatically; pass
-    # ``--cosine-lower-bound <= 0`` / ``--cosine-upper-bound >= 1`` to disable.
-    user_constraints = list(args.lagrangian_constraint)
-    if args.cosine_lower_bound > 0.0:
-        user_constraints.append(f"cosine_sim>={args.cosine_lower_bound}")
-    if args.cosine_upper_bound < 1.0:
-        user_constraints.append(f"cosine_sim<={args.cosine_upper_bound}")
+    # ``--anti-degeneracy`` is desugared into the constraint list here;
+    # the legacy ``--cosine-lower-bound`` / ``--cosine-upper-bound`` flags
+    # are honoured (for back-compat with existing dispatch scripts) when
+    # ``--anti-degeneracy`` is left at its default "none".
+    from alphagrad.approx.common.anti_degeneracy import (
+        desugar_anti_degeneracy,
+    )
+    user_constraints, _, _ = desugar_anti_degeneracy(
+        list(args.lagrangian_constraint),
+        getattr(args, "anti_degeneracy", "none"),
+        float(getattr(args, "anti_degeneracy_delta", 0.01)),
+        float(getattr(args, "cosine_lower_bound", 0.8)),
+        float(getattr(args, "cosine_upper_bound", 0.9)),
+    )
+    if getattr(args, "anti_degeneracy", "none") == "none":
+        if args.cosine_lower_bound > 0.0:
+            user_constraints.append(f"cosine_sim>={args.cosine_lower_bound}")
+        if args.cosine_upper_bound < 1.0:
+            user_constraints.append(f"cosine_sim<={args.cosine_upper_bound}")
     constraint_specs = parse_lagrangian_constraints(user_constraints)
     if constraint_specs:
         ops_for_print = {1: ">=", -1: "<="}
@@ -5973,40 +6031,57 @@ def main():
         ep_key, key = jrand.split(key)
         ep_eval_key, ep_key = jrand.split(ep_key)
         if args.preference_conditioned:
-            # Stage F mixture: each env independently draws its preference
-            # from either the corner Dirichlet (α<1) or the uniform Dirichlet
-            # (α=1). With ``--dirichlet-mix-ratio=0.5`` the trainer sees a
-            # balanced supply of pure-corner / interior preferences so the
-            # conditioned policy covers the whole Pareto front.
-            corner_key, uniform_key, choice_key, ep_key = jrand.split(ep_key, 4)
-            alpha_corner = jnp.full(
-                (NUM_VALUE_HEADS,),
-                args.dirichlet_alpha,
-                dtype=jnp.float32,
-            )
-            alpha_uniform = jnp.full(
-                (NUM_VALUE_HEADS,),
-                args.dirichlet_alpha_uniform,
-                dtype=jnp.float32,
-            )
-            corner_samples = jrand.dirichlet(
-                corner_key,
-                alpha_corner,
-                shape=(num_envs,),
-            )
-            uniform_samples = jrand.dirichlet(
-                uniform_key,
-                alpha_uniform,
-                shape=(num_envs,),
-            )
-            use_corner = (
-                jrand.uniform(choice_key, (num_envs, 1)) < args.dirichlet_mix_ratio
-            )
-            preferences_per_env = jnp.where(
-                use_corner,
-                corner_samples,
-                uniform_samples,
-            )
+            sampler = getattr(args, "preference_sampler", "dirichlet")
+            if sampler == "kronecker":
+                # RQ9 / Pitch B: golden-ratio (K=2) / R_d (K>=3) Kronecker
+                # sequence on the simplex — O(log N / N) discrepancy vs
+                # O(N^-0.5) for Dirichlet, recovering more uniform front
+                # coverage. ``offset`` walks the sequence across episodes
+                # so successive rollouts cover fresh simplex points
+                # rather than re-drawing the first num_envs each time.
+                from alphagrad.approx.common.preferences import (
+                    kronecker_preferences,
+                )
+                preferences_per_env = kronecker_preferences(
+                    NUM_VALUE_HEADS,
+                    num_envs,
+                    offset=int(ep) * int(num_envs),
+                )
+            else:
+                # Stage F mixture: each env independently draws its preference
+                # from either the corner Dirichlet (α<1) or the uniform Dirichlet
+                # (α=1). With ``--dirichlet-mix-ratio=0.5`` the trainer sees a
+                # balanced supply of pure-corner / interior preferences so the
+                # conditioned policy covers the whole Pareto front.
+                corner_key, uniform_key, choice_key, ep_key = jrand.split(ep_key, 4)
+                alpha_corner = jnp.full(
+                    (NUM_VALUE_HEADS,),
+                    args.dirichlet_alpha,
+                    dtype=jnp.float32,
+                )
+                alpha_uniform = jnp.full(
+                    (NUM_VALUE_HEADS,),
+                    args.dirichlet_alpha_uniform,
+                    dtype=jnp.float32,
+                )
+                corner_samples = jrand.dirichlet(
+                    corner_key,
+                    alpha_corner,
+                    shape=(num_envs,),
+                )
+                uniform_samples = jrand.dirichlet(
+                    uniform_key,
+                    alpha_uniform,
+                    shape=(num_envs,),
+                )
+                use_corner = (
+                    jrand.uniform(choice_key, (num_envs, 1)) < args.dirichlet_mix_ratio
+                )
+                preferences_per_env = jnp.where(
+                    use_corner,
+                    corner_samples,
+                    uniform_samples,
+                )
         else:
             preferences_per_env = static_pref
 

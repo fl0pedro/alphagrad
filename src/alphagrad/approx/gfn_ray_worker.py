@@ -158,7 +158,9 @@ def _build_actor_state(
     closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
     argnums = infer_argnums(args.example)
 
-    env_target_fun = target_fn if "acc" in args.rewards else None
+    # Always pass target_fun so flops/bytes_accessed/latency_ns/peak_memory
+    # populate every step (see cpu_approx_worker.py for the full rationale).
+    env_target_fun = target_fn
     measure_latency = args.measure_latency or args.cmp_type == "latency"
     env = VertexEliminationEnv.from_jaxpr(
         closed_jaxpr,
@@ -171,6 +173,7 @@ def _build_actor_state(
         mem_type=args.mem_type,
         exec_on_gpu=args.exec_on_gpu,
         measure_latency=measure_latency,
+        latency_samples=int(getattr(args, "latency_samples", 1)),
         terminal_rewards_only=args.terminal_rewards_only,
     )
 
@@ -999,6 +1002,16 @@ class GFNServerWorker:
             REWARD_NAMES[j]: float(per_env_terminal[:, j].mean())
             for j in range(NUM_REWARDS)
         }
+        # In GFN the reward is *only* defined at terminal — ``per_reward_means``
+        # above is computed on per_env_terminal, so terminal_means == per_reward_means.
+        # Still emit terminal_means / best_terminal for naming-consistency
+        # with the unified PPO / MuZero logging layout (Infra 1).
+        terminal_means = dict(per_reward_means)
+        best_terminal = {
+            REWARD_NAMES[j]: float(per_env_terminal[:, j].max())
+            for j in range(NUM_REWARDS)
+        }
+        terminal_cs = per_env_terminal[:, REWARD_INDEX["cosine_sim"]]
 
         stats: dict = {
             "best_return": float(per_env_tot[best_idx]),
@@ -1010,6 +1023,8 @@ class GFNServerWorker:
             "best_overall_rewards": best_overall_rewards,
             "best_overall_weighted": best_overall_weighted,
             "per_reward_means": per_reward_means,
+            "terminal_means": terminal_means,
+            "best_terminal": best_terminal,
             "best_per_reward": best_per_reward,
             # TB has no MCTS visit-distribution — entropy is the agent's
             # forward-policy entropy averaged over the rollout (computed
@@ -1020,6 +1035,20 @@ class GFNServerWorker:
             "value_loss": 0.0,
             "reward_loss": 0.0,
         }
+        # Unified `reward/{cost,quality}/{per_step,terminal,best_terminal}/<name>`
+        # keys + corridor instrumentation (Infra 1). Legacy
+        # ``per_reward_means`` / ``reward_mean/*`` remain for back-compat.
+        from alphagrad.approx.common.reward_scaling import (
+            build_unified_reward_log_dict,
+        )
+        stats.update(
+            build_unified_reward_log_dict(
+                stats,
+                corridor_low=getattr(self, "_corridor_low", None),
+                corridor_high=getattr(self, "_corridor_high", None),
+                terminal_cossims=terminal_cs,
+            )
+        )
 
         # ---- Replay buffer lifecycle -------------------------------------
         if self.replay_buffer is None and args.replay_buffer_size > 0:
@@ -1143,6 +1172,13 @@ class GFNServerWorker:
         # ---- Pool telemetry + cascading recycle (mirror mu0_ray_worker) ---
         if self._pool is not None:
             stats.update({f"pool/{k}": v for k, v in self._pool.stats().items()})
+            # Per-episode timeout delta (see ppo_ray_worker equivalent).
+            try:
+                stats["pool/timeouts_this_episode"] = (
+                    self._pool.fetch_timeout_delta()
+                )
+            except Exception:
+                stats["pool/timeouts_this_episode"] = 0
             try:
                 trunc = self._pool.fetch_tokenization_truncation_stats()
                 count = int(trunc.get("count", 0))

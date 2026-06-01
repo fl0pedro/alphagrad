@@ -74,6 +74,125 @@ def make_argparser() -> argparse.ArgumentParser:
     # Lagrangian range constraint stays on cossim only.
     p.add_argument("--lambda-frob", type=float, default=1.0)
     p.add_argument("--measure-latency", action="store_true")
+    p.add_argument(
+        "--latency-samples", type=int, default=1,
+        help="Per-step latency sample count when --measure-latency is on. "
+        "Each sample runs the compiled approx-fn once (with ResourceMonitor) "
+        "to record (latency_ns, peak_memory). 1 = single noisy point per step "
+        "(per-episode mean across ~12*num_envs calls denoises it anyway); "
+        ">=8 enables the top-quartile-mean smoothing for low-noise per-step "
+        "values. Higher = more compute per step, linearly. Default 1.",
+    )
+
+    # ------- 2-phase cost pipeline (cheap_first → full) -------
+    # The full cost-channel path (XLA cost_analysis + ResourceMonitor +
+    # compiled_exact comparison) is ~10× slower than the graphax-symbolic-
+    # only path. ``--cost-pipeline-schedule cheap_first`` starts training
+    # with only the cheap symbolic counts (muls_adds_fmas, max_io_sum)
+    # plus the graphax-side jaxpr, runs until the policy stabilises
+    # (KL window mean below threshold OR episode cutover, whichever
+    # fires first), then swaps every CPU actor's env into the full path
+    # for the rest of training. Wandb event ``phase/cutover_ep`` records
+    # when the switch fires.
+    p.add_argument(
+        "--cost-pipeline-schedule", type=str, default="always_full",
+        choices=["always_full", "cheap_first"],
+        help="`always_full` (default): every step measures all 6 cost "
+             "channels + cossim/frob. `cheap_first`: phase 1 = graphax "
+             "symbolic only (target_fun=None — flops/latency/bytes/peak "
+             "are 0, cossim/frob are 0); phase 2 enables the full path "
+             "after the cutover trigger.",
+    )
+    p.add_argument(
+        "--phase-cutover-ep", type=int, default=200,
+        help="(cheap_first) Hard episode cutover — at episode N, force "
+             "the swap regardless of KL. 0 disables this trigger.",
+    )
+    p.add_argument(
+        "--phase-cutover-kl-threshold", type=float, default=0.01,
+        help="(cheap_first) Cut over when the windowed-mean policy KL "
+             "drops below this. 0 disables this trigger.",
+    )
+    p.add_argument(
+        "--phase-cutover-kl-window", type=int, default=20,
+        help="(cheap_first) Episode window over which KL is averaged "
+             "before checking the threshold. Larger = less spiky trigger.",
+    )
+
+    # ------- RQ8 (Pitch A) — reward pipeline -------
+    # All flags default to legacy behavior; --reward-pipeline pca2 opts
+    # in. Full design: docs/experiments/reward_pipeline_pca.md.
+    p.add_argument(
+        "--reward-pipeline", type=str, default="legacy",
+        choices=["legacy", "pca2"],
+        help="Reward scalarization pipeline. ``legacy`` (default): "
+             "current weighted-sum of 8 channels via --lambda-cmp/mem/frob. "
+             "``pca2``: PCA-2 compresses the 6 cost channels into 2 "
+             "decorrelated unit-variance latents, sums them; cossim/frob "
+             "still enter via --lambda-frob unless --reward-as-constraints "
+             "moves them to dual-ascent (RCPO).",
+    )
+    p.add_argument(
+        "--pca-refit-every", type=int, default=100,
+        help="(--reward-pipeline pca2) Episodes between eigendecomp refits "
+             "of the EMA correlation matrix. Slow timescale so the latent "
+             "reward stays continuous; Procrustes-aligned across refits.",
+    )
+    p.add_argument(
+        "--pca-warmup-episodes", type=int, default=50,
+        help="(--reward-pipeline pca2) Episodes of EMA-stats warmup before "
+             "the first PCA refit. Until then, projection falls back to "
+             "first-two-z-scored-channels.",
+    )
+    p.add_argument(
+        "--reward-as-constraints", type=str, default="",
+        help="Comma-separated channel names whose --lambda contribution is "
+             "ZEROED in the scalar reward; they only enter via the "
+             "Lagrangian dual-ascent path (RCPO). Typical: "
+             "``cosine_sim,frob_residual`` for the fidelity-as-constraint "
+             "formulation. Channel names match REWARD_NAMES in env.py.",
+    )
+    p.add_argument(
+        "--running-max-channels", type=str, default="",
+        help="Comma-separated channel names reduced via running-max instead "
+             "of sum along the rollout, before GAE/aggregation. Typical: "
+             "``peak_memory,max_io_sum`` since these are max-over-vertices "
+             "quantities — summing them over the rollout overstates the "
+             "true downstream cost. Implemented via "
+             "common/telescoping.telescope_increments.",
+    )
+
+    # ------- RQ9 (Pitch B scaffold) — front coverage -------
+    # Both flags default to legacy behavior (linear sum + Dirichlet);
+    # the actual trainer-side hookup for Tchebycheff + Kronecker is
+    # noted as outstanding in docs/experiments/pareto_front_tchebycheff.md
+    # — these flags exist so RQ9 can flip them once the impl lands.
+    p.add_argument(
+        "--preference-sampler", type=str, default="dirichlet",
+        choices=["dirichlet", "kronecker"],
+        help="(--preference-conditioned) Preference-vector sampler. "
+             "``dirichlet`` (default): current RQ7 behavior, O(N^-0.5) "
+             "discrepancy. ``kronecker``: golden-ratio (K=2) / R_d "
+             "low-discrepancy sequence, O(log N / N) — far more uniform "
+             "coverage of the simplex per fixed env count. See "
+             "common/preferences.kronecker_preferences.",
+    )
+    p.add_argument(
+        "--scalarization", type=str, default="linear",
+        choices=["linear", "tchebycheff"],
+        help="Per-channel-reward → scalar reduction. ``linear`` (default): "
+             "``sum_k w_k * r_k`` — current behavior, reaches only the "
+             "convex hull of the Pareto front. ``tchebycheff``: augmented "
+             "Tchebycheff ``-(max_k w_k * |r_k - z*|) - rho * sum|r_k - z*|`` "
+             "— reaches concave regions per Miettinen 1999 §3.4.3. See "
+             "common/scalarization.apply_scalarization.",
+    )
+    p.add_argument(
+        "--tchebycheff-rho", type=float, default=0.05,
+        help="(--scalarization tchebycheff) Augmentation weight on the "
+             "``sum_k |r_k - z*|`` term. Rules out weakly-Pareto-optimal "
+             "points; 0.05 per Steuer 1986.",
+    )
     p.add_argument("--terminal-rewards-only", action="store_true")
     p.add_argument("--num-eval-samples", type=int, default=10)
     p.add_argument("--dataset", type=str, default="none")
@@ -82,6 +201,8 @@ def make_argparser() -> argparse.ArgumentParser:
     # Rollout
     p.add_argument("--num-envs", type=int, default=4)
     p.add_argument("--minibatches", type=int, default=4)
+    p.add_argument("--ppo-epochs", type=int, default=4,
+                   help="Number of passes over the rollout buffer per episode.")
 
     # Advantage normalisation strategy. Default `gdpo` implements the
     # per-channel z-score → priority-weighted sum → batch-norm pipeline
@@ -132,12 +253,15 @@ def make_argparser() -> argparse.ArgumentParser:
              "0.4 by ep 13 in run-9s554e3x, where the per-head bonus "
              "drowns in value loss ≈ 4 and PPO clip loss ≈ 0.17).",
     )
+    p.add_argument("--entropy-coef-final", type=float, default=0.001,
+                   help="Final entropy coefficient after linear annealing.")
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--discount", type=float, default=0.99)
 
     # Lagrangian (Stage F)
     p.add_argument(
-        "--lagrangian-constraint", nargs="*", type=str, default=[],
+        "--lagrangian-constraint", action="append", default=[],
+        metavar="NAME>=THRESH",
         help="Inequality constraints of the form NAME>=THRESH or "
         "NAME<=THRESH, where NAME is one of the env reward channel "
         "names (muls_adds_fmas / flops / latency_ns / max_io_sum / "
@@ -145,11 +269,53 @@ def make_argparser() -> argparse.ArgumentParser:
         "Mean per-step violations push the policy via dual-ascent on "
         "per-constraint multipliers. Symlog-friendly: cost-family "
         "constraints (everything except cosine_sim) are evaluated in "
-        "symlog space so multipliers live on a single scale.",
+        "symlog space so multipliers live on a single scale. "
+        "Repeat the flag to add multiple constraints.",
     )
     p.add_argument(
         "--lagrangian-lr", type=float, default=1e-3,
         help="Dual-ascent step size on the Lagrangian multipliers.",
+    )
+    # Anti-degeneracy sugar — high-level CLI knob that desugars to one or
+    # two ``--lagrangian-constraint`` entries against ``cosine_sim``.
+    # Prevents the policy from collapsing to pure vertex-elim
+    # (``cossim=1.0``), which is the documented failure mode of runs
+    # without any quality constraint. Choose one of:
+    #   - ``none``           — no extra constraints (the trainer's
+    #                          ``args.lagrangian_constraint`` flows
+    #                          through unchanged).
+    #   - ``delta_ceiling``  — single soft ceiling
+    #                          ``cosine_sim <= 1 - --anti-degeneracy-delta``.
+    #                          Default ``delta=0.01`` (i.e. ``<=0.99``).
+    #   - ``corridor``       — both floor (``--cosine-lower-bound``,
+    #                          default 0.8) and ceiling
+    #                          (``--cosine-upper-bound``, default 0.9).
+    p.add_argument(
+        "--anti-degeneracy",
+        choices=("none", "delta_ceiling", "corridor"),
+        default="none",
+        help="High-level mechanism to prevent the policy from collapsing "
+        "to cossim=1.0 (the no-approximation degenerate solution). "
+        "``delta_ceiling`` adds a single soft ceiling ``cosine_sim <= 1 - δ``; "
+        "``corridor`` adds both a floor and a ceiling using "
+        "``--cosine-lower-bound`` / ``--cosine-upper-bound``. The "
+        "desugared constraints are appended to ``--lagrangian-constraint``.",
+    )
+    p.add_argument(
+        "--anti-degeneracy-delta", type=float, default=0.01,
+        help="δ for ``--anti-degeneracy delta_ceiling`` (the ceiling is "
+        "``cosine_sim <= 1 - δ``). Default 0.01. RQ5 sweeps "
+        "δ ∈ {0.01, 0.05, 0.1}.",
+    )
+    p.add_argument(
+        "--cosine-lower-bound", type=float, default=0.8,
+        help="Floor used by ``--anti-degeneracy corridor``. "
+        "Pass 0.0 to omit the floor.",
+    )
+    p.add_argument(
+        "--cosine-upper-bound", type=float, default=0.9,
+        help="Ceiling used by ``--anti-degeneracy corridor``. "
+        "Pass 1.0 to omit the ceiling.",
     )
 
     # Conditioned-reward gating (the GDPO paper's "easy reward on hard
@@ -213,8 +379,11 @@ def make_argparser() -> argparse.ArgumentParser:
         type=str,
         default="custom",
         choices=[
-            "custom", "ve_only", "diag_gcd", "diag_factor",
-            "compress", "quantize", "full", "full_curriculum",
+            "custom", "ve_only",
+            "diag_gcd", "diag_factor",
+            "compress", "compress_scalar",
+            "quantize", "quant_smallest_float",
+            "full", "full_curriculum",
         ],
         help="Pre-canned action-space restriction. ``custom`` honours "
              "--factors / --dynamic-substeps directly. ``ve_only`` "

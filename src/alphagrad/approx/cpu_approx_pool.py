@@ -609,6 +609,27 @@ class CpuApproxPool:
                 "respawn_requested": self._n_respawn_requested,
             }
 
+    def fetch_timeout_delta(self) -> int:
+        """Per-call (episode-delta) timeout count, AND-reset.
+
+        ``self._n_timeouts`` is the cumulative counter exposed via
+        :meth:`stats` — useful for `pool/timeouts` running-total wandb
+        plots. Drivers also want the **per-episode delta** to spot when
+        sentinel-replacement starts firing (it shouldn't, post-pool-size
+        fix on 2026-05-23). This method returns the count since the last
+        invocation and resets the per-episode bookkeeping; safe to call
+        every episode from the trainer's per-rollout log emission.
+
+        If this delta stays at 0 across the most complex training run
+        (full --variant + dynamic-substeps + max-rules), the entire
+        sentinel-callback handling in ``ppo_ray_worker._fan_out_tokenize``
+        is dead code and can be deleted.
+        """
+        with self._lock:
+            delta = self._n_timeouts - getattr(self, "_timeouts_last_seen", 0)
+            self._timeouts_last_seen = self._n_timeouts
+            return int(delta)
+
     def fetch_tokenization_truncation_stats(self) -> dict:
         """Aggregate per-actor jaxpr-truncation telemetry across the
         pool for the current period (= since the last poll, which

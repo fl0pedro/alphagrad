@@ -338,10 +338,16 @@ class EnvConfig(NamedTuple):
     target_fun: Callable | None = None
     data_gen: Callable | None = None
     exec_on_gpu: bool = False
-    # Latency requires running the compiled fn 10x per step, which roughly 10xs
-    # rollout-to-reward time. Off by default; flip on when the latency component
-    # of the reward is actually being weighted.
+    # Latency requires running the compiled fn N times per step (1× for a
+    # single noisy sample; >=8 for the top-quartile-mean smoothing). With
+    # ``--rewards cmp`` we always compute latency now (to populate the
+    # full 6-cost-channel vector), so the default went from N=10 to N=1 —
+    # per-call latency is noisier but the per-episode mean across ~192
+    # calls/ep is dominated by mean(noise)=0 anyway. Use
+    # ``latency_samples`` to crank back up if per-step denoised latency
+    # matters for your policy.
     measure_latency: bool = False
+    latency_samples: int = 1
     # Skip the expensive jacve-compile/exec branch on every step EXCEPT the
     # terminal one. Tokens/eqn_ids are still produced (the agent needs them as
     # the next observation), but the reward vector is zero on intermediate
@@ -1149,11 +1155,20 @@ def _callback(
 
     # If no `target_fun` is supplied, we can't compile/execute. Skip every
     # execution-derived metric and return a partial reward vector.
+    #
+    # cossim=0.0 (NOT 1.0 as in earlier revisions): the early-return path
+    # signifies "this channel is unmeasured", not "perfect fidelity". A 1.0
+    # value would (a) tank the scalar reward through the cossim weight,
+    # (b) falsely trigger anti-degeneracy ``cossim<=1-δ`` constraints
+    # whose entire point is to prevent the policy collapsing to cossim=1.
+    # 0.0 leaves the policy under no quality pressure during the cheap
+    # phase, which is what 2-phase schedules (--cost-pipeline-schedule
+    # cheap_first) want — measurement comes online at phase cutover.
     if config.target_fun is None:
         rewards = jnp.array(
             [
                 -muls_adds_fmas, 0.0, 0.0, -max_io_sum,
-                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 0.0,
             ],
             dtype=jnp.float32,
         )
@@ -1283,7 +1298,25 @@ def _callback(
     # `measure_latency` is on (the latency reading is noisy enough that the
     # top-quartile-mean smoothing from the original code is worth keeping).
     # ------------------------------------------------------------------
-    n_samples = 10 if config.measure_latency else 1
+    # Per-step latency sample count. The legacy default was hard-coded
+    # 10 (and 1 when measure_latency=False). Now driven by
+    # ``EnvConfig.latency_samples``; preserves the "1 sample, latency=0"
+    # behaviour when measure_latency is off so non-latency runs keep
+    # the same speed as before.
+    #
+    # IMPORTANT: ``compiled_approx`` (and ``compiled_exact``) were
+    # populated once above via ``cached_compile`` — the cluster-wide
+    # ObjectRef cache means only ONE actor in the pool compiles per
+    # unique (order, specs, shape) key, and all other actors fetch +
+    # ``deserialize_and_load`` from the shared blob. The for-loop below
+    # invokes the SAME compiled object n_samples times — there is no
+    # per-iteration recompile. So raising latency_samples is linear in
+    # exec cost only (no compile blow-up); the cache makes the per-step
+    # compile cost essentially zero after the first call per unique
+    # (order, transforms).
+    n_samples = int(config.latency_samples) if config.measure_latency else 1
+    if n_samples < 1:
+        n_samples = 1
 
     # Match the monitor to whichever device the compiled JIT actually runs
     # on. Without --exec-on-gpu the args arrive as CpuDevice JAX arrays
@@ -1492,6 +1525,7 @@ class VertexEliminationEnv:
         mem_type: str = "peak_memory",
         exec_on_gpu: bool = False,
         measure_latency: bool = False,
+        latency_samples: int = 1,
         terminal_rewards_only: bool = False,
     ):
         assert (argnums is None and args is None) or not (args is None or args is None)
@@ -1508,6 +1542,7 @@ class VertexEliminationEnv:
             data_gen=data_gen,
             exec_on_gpu=exec_on_gpu,
             measure_latency=measure_latency,
+            latency_samples=latency_samples,
             terminal_rewards_only=terminal_rewards_only,
         )
         return cls(

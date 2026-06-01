@@ -430,12 +430,9 @@ class PPORayWorker:
         else:
             self.num_envs = max(requested_envs, self.num_devices)
         self.minibatches = max(int(getattr(self.args, "minibatches", 1)), 1)
-        self.ppo_epochs = max(int(getattr(self.args, "ppo_epochs", 4)), 1)
         self.ppo_eps = float(getattr(self.args, "ppo_eps", 0.2))
         self.value_coef = float(getattr(self.args, "value_coef", 0.5))
-        self.entropy_coef_init = float(getattr(self.args, "entropy_coef", 0.05))
-        self.entropy_coef_final = float(getattr(self.args, "entropy_coef_final", 0.001))
-        self.entropy_coef = self.entropy_coef_init
+        self.entropy_coef = float(getattr(self.args, "entropy_coef", 0.01))
         self.gae_lambda = float(getattr(self.args, "gae_lambda", 0.95))
         self.discount = float(getattr(self.args, "discount", 0.99))
         self.reward_weights_np = _build_reward_weights(self.args)
@@ -719,7 +716,7 @@ class PPORayWorker:
 
         schedule = optax.cosine_decay_schedule(
             float(self.args.lr),
-            int(self.args.episodes) * self.minibatches * self.ppo_epochs,
+            int(self.args.episodes) * self.minibatches,
             float(getattr(self.args, "lr_decay_min_mult", 0.1)),
         )
         self.optimizer = optax.chain(
@@ -750,19 +747,6 @@ class PPORayWorker:
         )
 
         self._episode_counter = 0
-
-        # 2-phase cost pipeline state. ``always_full`` is the default
-        # (legacy behaviour, all channels every step). ``cheap_first``
-        # starts with the cheap path (target_fun=None, no JIT-exec) and
-        # swaps to the full path at the configured cutover. Wandb event
-        # ``phase/cutover_ep`` records when the swap fires.
-        self._cost_schedule = str(getattr(
-            self.args, "cost_pipeline_schedule", "always_full",
-        ))
-        self._cost_phase_full = (self._cost_schedule == "always_full")
-        self._cost_cutover_ep = int(getattr(
-            self.args, "phase_cutover_ep", 0,
-        ))
 
         # Trainer-side leak profile (mirror of the per-actor profiler in
         # cpu_approx_worker). Lets the user diff trainer-process RSS
@@ -1000,6 +984,7 @@ class PPORayWorker:
     def _make_update_step(self):
         clip_eps = self.ppo_eps
         value_coef = self.value_coef
+        entropy_coef = self.entropy_coef
         dynamic = self.dynamic_substeps
         # Mode-aware capture so the closure switches on the right path
         # without recompiling per call.
@@ -1019,7 +1004,13 @@ class PPORayWorker:
         # is a cheap re-import.
         from alphagrad.approx.common.gae import gdpo_normalise_advantages
 
-        def loss_fn(agent, batch, op_mask, factor_mask, quant_mask, key, entropy_coef):
+        def loss_fn(agent, batch, op_mask, factor_mask, quant_mask, key):
+            """``op_mask`` / ``factor_mask`` / ``quant_mask`` are the
+            curriculum masks for the CURRENT stage. They must match
+            the masks used at rollout time (in ``act_step``) —
+            otherwise the PPO log-prob ratio is computed against a
+            different distribution from the one that produced the
+            samples, breaking the on-policy assumption."""
             (
                 tokens, actions, op_a, i_a, j_a, f_a, q_a,
                 vertex_idx_for_mask,
@@ -1155,9 +1146,9 @@ class PPORayWorker:
 
         @eqx.filter_jit
         def update_step(agent, opt_state, batch,
-                        op_mask, factor_mask, quant_mask, key, entropy_coef):
+                        op_mask, factor_mask, quant_mask, key):
             (loss, aux), grads = grad_fn(
-                agent, batch, op_mask, factor_mask, quant_mask, key, entropy_coef,
+                agent, batch, op_mask, factor_mask, quant_mask, key,
             )
             # NaN-skip guard: if loss is non-finite (sentinel
             # poisoning, cold-cache compile-error fallback, etc.),
@@ -1318,30 +1309,253 @@ class PPORayWorker:
             jax.vmap(lambda s, k: self.agent.value(s.tokens, key=k))(state, boot_keys),
         )  # (N, NUM_REWARDS)
 
-        # Mask sentinel transitions (CPU pool timeouts).
+        # Phase 3 (b): mask sentinel transitions. Zero the per-channel
+        # reward vector AND force dones=1 so GAE treats sentinel
+        # timesteps as terminal and the value head bootstraps cleanly
+        # at the next state. Per-channel zero (vs the legacy scalar
+        # zero-out) means the gdpo path also sees zero reward on
+        # those steps.
         if buf_sentinel.any():
             buf_reward_vec = np.where(
                 buf_sentinel[..., None], 0.0, buf_reward_vec,
             )
             buf_dones = np.where(buf_sentinel, 1.0, buf_dones)
+            n_sentinels = int(buf_sentinel.sum())
+            print(
+                f"[ppo_ray] {n_sentinels}/{T*N} sentinel transitions "
+                f"this episode (CPU pool timeouts); zeroing rewards "
+                f"and forcing dones."
+            )
 
-        # GAE with symlog — scalar mode collapses K channels to scalar.
+        # Phase D: apply conditioned-reward gates. For each spec
+        # ``(easier, harder, op, threshold)``, zero the easier channel
+        # at any (t, n) where the harder channel doesn't satisfy
+        # ``op(harder, threshold)``. Threshold comparison happens in
+        # symlog space for cost channels (so the user can write
+        # ``flops>=1e9`` without thinking about the squashing) and in
+        # raw space for bounded channels (cosine_sim).
+        reward_condition_stats: dict = {}
+        if self._reward_conditions:
+            for easier_idx, harder_idx, op, thresh in self._reward_conditions:
+                harder_val = buf_reward_vec[..., harder_idx]  # (T, N)
+                if harder_idx in _NO_SYMLOG_REWARD_INDICES:
+                    h_compare = harder_val
+                    t_compare = np.float32(thresh)
+                else:
+                    h_compare = np.sign(harder_val) * np.log1p(np.abs(harder_val))
+                    t_compare = (
+                        np.sign(np.float32(thresh))
+                        * np.log1p(np.abs(np.float32(thresh)))
+                    )
+                if op == ">=":
+                    gate = (h_compare >= t_compare).astype(np.float32)
+                else:
+                    gate = (h_compare <= t_compare).astype(np.float32)
+                # Sparse-terminal harder channels carry signal only at
+                # the terminal step. Force the gate True on
+                # intermediate steps to avoid zeroing the easier
+                # channel everywhere when the policy hasn't reached
+                # the terminal step yet.
+                if harder_idx in self._sparse_terminal_idx_set:
+                    gate[:-1, :] = 1.0
+                # ``buf_reward_vec`` is the canonical reward buffer; we
+                # rebuild a writable copy because the sentinel path
+                # above may have produced a view.
+                buf_reward_vec = np.array(buf_reward_vec, copy=True)
+                buf_reward_vec[..., easier_idx] = (
+                    buf_reward_vec[..., easier_idx] * gate
+                )
+                gated_fraction = float(1.0 - gate.mean())
+                easier_name = REWARD_NAMES[easier_idx]
+                harder_name = REWARD_NAMES[harder_idx]
+                reward_condition_stats[
+                    f"reward_condition/{easier_name}_gated_fraction"
+                ] = gated_fraction
+                reward_condition_stats[
+                    f"reward_condition/{harder_name}_threshold_{op}"
+                ] = float(thresh)
+
+        # RQ8 / Pitch A — apply PCA-2 cost-channel compression + the
+        # telescoping running-max reduction here, AFTER sentinel /
+        # reward-condition gating but BEFORE GAE. Pipeline gated on
+        # ``--reward-pipeline pca2``; both transforms are no-ops on the
+        # legacy default.
+        if self._pca2_state is not None:
+            # Per-episode EMA stats update on the (T*N, 6) cost batch.
+            cost_flat = buf_reward_vec[..., :6].reshape(-1, 6)
+            self._pca2_state = self._pca2_state.observe_episode(cost_flat)
+            if self._pca2_state.should_refit():
+                self._pca2_state = self._pca2_state.refit()
+            # Project (T*N, 6) → (T*N, 2); reshape back to (T, N, 2).
+            latents_flat = self._pca2_state.project(cost_flat)
+            latents = latents_flat.reshape(buf_reward_vec.shape[0],
+                                           buf_reward_vec.shape[1], 2)
+            # Overwrite indices 0, 1 with the latents; zero 2-5 so they
+            # don't double-count via any residual weight. Writable copy
+            # — sentinel path above may have produced a view.
+            buf_reward_vec = np.array(buf_reward_vec, copy=True)
+            buf_reward_vec[..., 0:2] = latents.astype(np.float32)
+            buf_reward_vec[..., 2:6] = 0.0
+        if self._running_max_indices:
+            from alphagrad.approx.common.telescoping import (
+                telescope_increments,
+            )
+            buf_reward_vec = np.array(buf_reward_vec, copy=True)
+            for ch in self._running_max_indices:
+                # Per-env-slot telescoping (T, N) → (T, N) with cumsum
+                # equal to the rollout-wide max — keeps GAE additivity.
+                buf_reward_vec[..., ch] = telescope_increments(
+                    buf_reward_vec[..., ch]
+                )
+
+        # GAE over the rollout. Both modes use the same per-channel
+        # tensor contract — the difference is whether symlog squashing
+        # is applied inside GAE (scalar mode keeps it; gdpo mode drops
+        # it because the per-mb z-score handles magnitude). The
+        # factory caches the jit'd variant per mode.
+        if self._use_symlog_in_gae:
+            _gae = get_advantages  # legacy with symlog
+        else:
+            _gae = self._gae_no_symlog
+        # rewards_b shape: (N, T, K). dones / discounts broadcast over K.
         rewards_b = jnp.asarray(np.transpose(buf_reward_vec, (1, 0, 2)))
-        dones_b = jnp.asarray(buf_dones.T)
-        values_b = jnp.asarray(np.transpose(buf_values, (1, 0, 2)))
+        dones_b = jnp.asarray(buf_dones.T)             # (N, T)
+        values_b = jnp.asarray(np.transpose(buf_values, (1, 0, 2)))  # (N, T, K)
         next_values_b = jnp.concatenate(
             [values_b[:, 1:, :], jnp.asarray(bootstrap)[:, None, :]], axis=1,
-        )
-        discounts_b = jnp.full_like(dones_b, self.discount)
-        _gae = get_advantages  # symlog GAE
+        )  # (N, T, K)
+        discounts_b = jnp.full_like(dones_b, self.discount)  # (N, T)
         _episodic_return, returns_b, advantages_b = _gae(
             rewards_b, dones_b, values_b, next_values_b, discounts_b,
             self.gae_lambda,
         )
-        weights_j = self.reward_weights
-        returns_b = jnp.sum(returns_b * weights_j, axis=-1)
-        advantages_b = jnp.sum(advantages_b * weights_j, axis=-1)
-        # Flatten (N, T) -> (N*T,) for minibatch slicing.
+        # returns_b / advantages_b shape: (N, T, K) in gdpo mode.
+        # In scalar mode we still ran per-channel GAE above; collapse
+        # to scalar via the priority-weighted dot product so the
+        # downstream legacy path (global z-score, scalar value loss)
+        # receives (N, T) tensors.
+        if self.advantage_norm == "scalar":
+            weights_j = self.reward_weights
+            returns_b = jnp.sum(returns_b * weights_j, axis=-1)      # (N, T)
+            advantages_b = jnp.sum(advantages_b * weights_j, axis=-1)  # (N, T)
+
+        # Stage F Lagrangian: penalise the advantage by the per-step
+        # constraint violation, weighted by the current multipliers.
+        # The violation is `max(0, sign * (threshold - reward))` —
+        # zero when the constraint is satisfied. After applying the
+        # penalty we update each multiplier by gradient ascent on the
+        # mean violation (clamped >= 0). Empty-constraint case is a
+        # no-op (the gather has zero columns).
+        violation_stats: dict = {}
+        if self.constraint_indices_np.shape[0] > 0:
+            # Pull the constrained channels across the rollout buffer.
+            # (T, N, C) where C = #constraints. Reshape to match the (N, T)
+            # advantages layout used by GAE.
+            picked = buf_reward_vec[:, :, self.constraint_indices_np]  # (T, N, C)
+            picked = np.transpose(picked, (1, 0, 2))  # (N, T, C)
+            # Symlog cost-family channels so the multipliers don't have to
+            # bridge ~10⁹× channel-scale gaps; leave cosine_sim raw.
+            no_symlog = self.constraint_no_symlog_np[None, None, :]  # (1,1,C)
+            picked_sl = np.where(
+                no_symlog, picked, np.sign(picked) * np.log1p(np.abs(picked)),
+            )
+            thresh_sl = np.where(
+                self.constraint_no_symlog_np,
+                self.constraint_thresholds_np,
+                np.sign(self.constraint_thresholds_np)
+                * np.log1p(np.abs(self.constraint_thresholds_np)),
+            )  # (C,)
+            # Per-constraint normalisation so the same `lagrangian_lr`
+            # works for both `cosine_sim>=0.5` (small magnitudes) and
+            # `peak_memory<=1e8` (symlog'd to ~18). Without this the
+            # cosine_sim multiplier accumulated ~50× faster than other
+            # channels and dominated the objective by ep ~100.
+            thresh_scale = np.maximum(np.abs(thresh_sl), 1e-3)  # (C,)
+            signed = (
+                self.constraint_signs_np
+                * (thresh_sl[None, None, :] - picked_sl)
+                / thresh_scale[None, None, :]
+            )
+            violations = np.maximum(0.0, signed)  # (N, T, C)
+            # Sparse-terminal mask: for constraints on sparse channels
+            # (cosine_sim, frob_residual), only the terminal step
+            # carries a real value — graphax's ``jacve`` returns a
+            # zero-norm Jacobian for any partial elimination order, so
+            # ``reward[cos_idx] = 0`` at intermediate steps. Without
+            # this mask the Lagrangian sees a ``threshold - 0`` full
+            # violation on every non-terminal step (T-1 spurious
+            # violations per env per episode), accumulating spurious
+            # penalty and floor-flooding the dual multipliers.
+            if self.constraint_is_sparse_np.any():
+                # Last step (t = T-1) is the terminal vertex elimination.
+                # ``violations`` shape: (N, T, C).
+                is_terminal_step = np.zeros((N, T), dtype=np.float32)
+                is_terminal_step[:, -1] = 1.0
+                sparse_step_mask = np.where(
+                    self.constraint_is_sparse_np[None, None, :],  # (1,1,C)
+                    is_terminal_step[:, :, None],                  # (N,T,1)
+                    1.0,                                           # dense: keep
+                )
+                violations = violations * sparse_step_mask
+            # Phase 5: gate penalty + multiplier update on warm-up.
+            # During the first --lagrangian-warmup-eps episodes we still
+            # compute violations (for logging) but don't shape the
+            # advantage and don't ascend the multipliers — gives the
+            # policy a chance to learn the scalar reward before the
+            # constraint mechanic kicks in.
+            in_warmup = self._episode_counter < self.lagrangian_warmup_eps
+            if not in_warmup:
+                penalty = np.sum(
+                    violations * self.multipliers_np[None, None, :], axis=-1,
+                )  # (N, T)
+                # Broadcast the scalar penalty over the channel axis in
+                # gdpo mode so the per-channel z-score sees the same
+                # violation pressure on every active channel. In scalar
+                # mode advantages_b is already (N, T) and the broadcast
+                # is a no-op.
+                penalty_j = jnp.asarray(penalty)
+                if advantages_b.ndim == 3:
+                    penalty_j = penalty_j[..., None]
+                advantages_b = advantages_b - penalty_j
+                mean_violations = violations.mean(axis=(0, 1))  # (C,)
+                # Dual ascent with multiplier cap. Without the cap a
+                # structurally hard constraint sees the multiplier grow
+                # unbounded and overwhelm the rest of the objective.
+                self.multipliers_np = np.clip(
+                    self.multipliers_np
+                    + self.lagrangian_lr * mean_violations,
+                    0.0,
+                    self.lagrangian_multiplier_max,
+                )
+            else:
+                mean_violations = violations.mean(axis=(0, 1))
+            for j, name in enumerate(self.constraint_names):
+                violation_stats[f"lagrangian/{name}_lambda"] = float(
+                    self.multipliers_np[j]
+                )
+                violation_stats[f"lagrangian/{name}_violation"] = float(
+                    mean_violations[j]
+                )
+            violation_stats["lagrangian/warmup_active"] = int(in_warmup)
+
+        # Normalise advantages — scalar mode keeps the legacy
+        # rollout-wide z-score (mean 0, std 1, +1e-8 floor) applied AFTER
+        # the Lagrangian penalty. gdpo mode skips the global z-score
+        # entirely — per-channel z-scoring runs per-minibatch in the
+        # update step (see gdpo_normalise_advantages) so the global pass
+        # would double-normalise and wash out cross-minibatch signal.
+        if self.advantage_norm == "scalar":
+            adv_flat = advantages_b.reshape(-1)
+            adv_mean = jnp.mean(adv_flat)
+            adv_std = jnp.std(adv_flat) + 1e-8
+            advantages_b = (advantages_b - adv_mean) / adv_std
+
+        # Stage for the update. Flatten (N, T) -> (N*T,) along the env
+        # axis (each transition is independent for PPO). Returns and
+        # advantages carry a trailing K axis in gdpo mode (per-channel
+        # values flow into the per-mb gdpo normalisation inside the
+        # loss); scalar mode collapsed them above and they're already
+        # 1D here.
         flat_tokens = jnp.asarray(buf_tokens.transpose(1, 0, 2).reshape(N * T, MAX_TOKENS))
         flat_actions = jnp.asarray(buf_actions.T.reshape(N * T))
         flat_op = jnp.asarray(buf_op.T.reshape(N * T))
@@ -1351,8 +1565,29 @@ class PPORayWorker:
         flat_q = jnp.asarray(buf_q.T.reshape(N * T))
         flat_vmask = jnp.asarray(buf_vertex_for_loss.T.reshape(N * T))
         flat_log_probs = jnp.asarray(buf_log_probs.T.reshape(N * T))
-        flat_returns = returns_b.reshape(N * T)
-        flat_advantages = advantages_b.reshape(N * T)
+        if self.advantage_norm == "gdpo":
+            flat_returns = returns_b.reshape(N * T, NUM_REWARDS)
+            flat_advantages = advantages_b.reshape(N * T, NUM_REWARDS)
+        else:
+            flat_returns = returns_b.reshape(N * T)
+            flat_advantages = advantages_b.reshape(N * T)
+
+        # Single epoch × `minibatches` mini-batches. We rotate the batch
+        # split by a deterministic permutation so each episode's first
+        # minibatch isn't always envs 0..k-1.
+        perm_key = jrand.fold_in(key, int(self._episode_counter))
+        perm = jrand.permutation(perm_key, N * T)
+        flat_tokens = flat_tokens[perm]
+        flat_actions = flat_actions[perm]
+        flat_op = flat_op[perm]
+        flat_i = flat_i[perm]
+        flat_j = flat_j[perm]
+        flat_f = flat_f[perm]
+        flat_q = flat_q[perm]
+        flat_vmask = flat_vmask[perm]
+        flat_log_probs = flat_log_probs[perm]
+        flat_returns = flat_returns[perm]
+        flat_advantages = flat_advantages[perm]
 
         total = N * T
         mb_size = total // self.minibatches
@@ -1361,116 +1596,85 @@ class PPORayWorker:
             mb_count = 1
         else:
             mb_count = self.minibatches
-        mb_sharded = (mb_size % self.num_devices == 0)
+        # The data-parallel axis (mb_size) must be evenly splittable
+        # across devices for the SPMD shard. If it isn't, fall back to
+        # a single un-sharded minibatch — the user will see the warning
+        # and can pick --minibatches accordingly.
+        if mb_size % self.num_devices != 0:
+            print(
+                f"[ppo_ray] mb_size={mb_size} is not divisible by "
+                f"num_devices={self.num_devices}; update_step will run "
+                f"un-sharded (likely host-bound + may OOM). Pick a "
+                f"--minibatches such that (num_envs*rollout_length)/"
+                f"minibatches is a multiple of {self.num_devices}.",
+            )
+            mb_sharded = False
+        else:
+            mb_sharded = True
+
+        # Reshape to ``(mb_count, mb_size, ...)`` so we can shard the
+        # data axis (axis 1) across devices. Each minibatch index `i`
+        # then yields a per-mb tensor that already lives in the
+        # data-parallel layout — the loss vmap's leading axis is the
+        # sharded one, and XLA distributes the work without a gather.
+        def _reshape_mb(flat, mb_extra_shape=()):
+            return flat.reshape((mb_count, mb_size, *mb_extra_shape))
+
+        mb_tokens = _reshape_mb(flat_tokens, (MAX_TOKENS,))
+        mb_actions = _reshape_mb(flat_actions)
+        mb_op = _reshape_mb(flat_op)
+        mb_i = _reshape_mb(flat_i)
+        mb_j = _reshape_mb(flat_j)
+        mb_f = _reshape_mb(flat_f)
+        mb_q = _reshape_mb(flat_q)
+        mb_vmask = _reshape_mb(flat_vmask)
+        mb_log_probs = _reshape_mb(flat_log_probs)
+        # Returns + advantages carry a trailing K=NUM_REWARDS axis in
+        # gdpo mode and are scalar (no trailing axis) in scalar mode.
+        if self.advantage_norm == "gdpo":
+            mb_returns = _reshape_mb(flat_returns, (NUM_REWARDS,))
+            mb_advantages = _reshape_mb(flat_advantages, (NUM_REWARDS,))
+        else:
+            mb_returns = _reshape_mb(flat_returns)
+            mb_advantages = _reshape_mb(flat_advantages)
+
+        if mb_sharded:
+            _shard = lambda x: jax.device_put(x, self.scan_data_sharding)
+            mb_tokens = _shard(mb_tokens)
+            mb_actions = _shard(mb_actions)
+            mb_op = _shard(mb_op)
+            mb_i = _shard(mb_i)
+            mb_j = _shard(mb_j)
+            mb_f = _shard(mb_f)
+            mb_q = _shard(mb_q)
+            mb_vmask = _shard(mb_vmask)
+            mb_log_probs = _shard(mb_log_probs)
+            mb_returns = _shard(mb_returns)
+            mb_advantages = _shard(mb_advantages)
 
         agent = self.agent
         opt_state = self.opt_state
-        aux_accum = {}
+        last_aux = {}
         nan_skip_total = 0
-        n_updates = 0
+        for i in range(mb_count):
+            batch = (
+                mb_tokens[i], mb_actions[i],
+                mb_op[i], mb_i[i], mb_j[i], mb_f[i], mb_q[i],
+                mb_vmask[i],
+                mb_log_probs[i], mb_returns[i], mb_advantages[i],
+            )
+            key, mb_key = jrand.split(key)
+            agent, opt_state, aux = self._update_step(
+                agent, opt_state, batch,
+                self._current_op_mask_j, self._current_factor_mask_j,
+                self._current_quant_mask_j, mb_key,
+            )
+            nan_skip_total += int(aux.pop("nan_skip", 0))
+            last_aux = {k: float(v) for k, v in aux.items()}
 
-        # Entropy coefficient annealing: linear decay from init to final.
-        total_episodes = max(int(getattr(self.args, "episodes", 500)), 1)
-        progress = min(self._episode_counter / total_episodes, 1.0)
-        self.entropy_coef = (
-            self.entropy_coef_init
-            + (self.entropy_coef_final - self.entropy_coef_init) * progress
-        )
-        ent_coef_j = jnp.array(self.entropy_coef, dtype=jnp.float32)
-
-        for _epoch in range(self.ppo_epochs):
-            # Per-epoch reshuffle + z-score renormalization.
-            key, perm_key = jrand.split(key)
-            perm = jrand.permutation(perm_key, total)
-
-            def _permute_and_mb(flat, extra=()):
-                return flat[perm].reshape((mb_count, mb_size, *extra))
-
-            mb_tokens = _permute_and_mb(flat_tokens, (MAX_TOKENS,))
-            mb_actions = _permute_and_mb(flat_actions)
-            mb_op = _permute_and_mb(flat_op)
-            mb_i = _permute_and_mb(flat_i)
-            mb_j = _permute_and_mb(flat_j)
-            mb_f = _permute_and_mb(flat_f)
-            mb_q = _permute_and_mb(flat_q)
-            mb_vmask = _permute_and_mb(flat_vmask)
-            mb_log_probs = _permute_and_mb(flat_log_probs)
-            mb_returns = _permute_and_mb(flat_returns)
-            # Per-epoch advantage z-score so normalization stays fresh.
-            epoch_adv = flat_advantages[perm]
-            adv_mean = jnp.mean(epoch_adv)
-            adv_std = jnp.std(epoch_adv) + 1e-8
-            epoch_adv = (epoch_adv - adv_mean) / adv_std
-            mb_advantages = epoch_adv.reshape((mb_count, mb_size))
-
-            if mb_sharded:
-                _shard = lambda x: jax.device_put(x, self.scan_data_sharding)
-                mb_tokens = _shard(mb_tokens)
-                mb_actions = _shard(mb_actions)
-                mb_op = _shard(mb_op)
-                mb_i = _shard(mb_i)
-                mb_j = _shard(mb_j)
-                mb_f = _shard(mb_f)
-                mb_q = _shard(mb_q)
-                mb_vmask = _shard(mb_vmask)
-                mb_log_probs = _shard(mb_log_probs)
-                mb_returns = _shard(mb_returns)
-                mb_advantages = _shard(mb_advantages)
-
-            for i in range(mb_count):
-                batch = (
-                    mb_tokens[i], mb_actions[i],
-                    mb_op[i], mb_i[i], mb_j[i], mb_f[i], mb_q[i],
-                    mb_vmask[i],
-                    mb_log_probs[i], mb_returns[i], mb_advantages[i],
-                )
-                key, mb_key = jrand.split(key)
-                agent, opt_state, aux = self._update_step(
-                    agent, opt_state, batch,
-                    self._current_op_mask_j, self._current_factor_mask_j,
-                    self._current_quant_mask_j, mb_key, ent_coef_j,
-                )
-                nan_skip_total += int(aux.pop("nan_skip", 0))
-                for k, v in aux.items():
-                    aux_accum[k] = aux_accum.get(k, 0.0) + float(v)
-                n_updates += 1
-
-        last_aux = {k: v / max(n_updates, 1) for k, v in aux_accum.items()}
-        last_aux["entropy_coef"] = float(self.entropy_coef)
         self.agent = agent
         self.opt_state = opt_state
         self._episode_counter += 1
-
-        violation_stats: dict = {}
-        reward_condition_stats: dict = {}
-
-        if (
-            not self._cost_phase_full
-            and self._cost_cutover_ep > 0
-            and self._episode_counter >= self._cost_cutover_ep
-        ):
-            import ray
-            try:
-                refs = [
-                    a.set_cost_mode_full.remote()
-                    for a in self.cpu_workers
-                ]
-                _ = ray.get(refs, timeout=60.0)
-                self._cost_phase_full = True
-                last_aux["phase/cutover_ep"] = int(self._episode_counter)
-                last_aux["phase/cost_mode_full"] = 1
-                print(
-                    f"[ppo_ray] phase cutover: episode "
-                    f"{self._episode_counter} — swapped {len(self.cpu_workers)} "
-                    f"CPU actors from cheap to full cost mode",
-                    flush=True,
-                )
-            except Exception as exc:
-                print(
-                    f"[ppo_ray] phase cutover FAILED at ep "
-                    f"{self._episode_counter}: {exc}; continuing in cheap mode",
-                    flush=True,
-                )
 
         # Best / mean return computed from the RAW per-channel buffer +
         # the (calibration-aware) reward weights — NOT from the

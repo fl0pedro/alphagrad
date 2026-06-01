@@ -348,7 +348,9 @@ def main():
     xs = get_args(args.example, args_key, dataset=dataset_for_call)
     gen = data_gen(args.example, dataset=dataset_for_call, dataset_size=args.dataset_size)
     closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
-    env_target_fun = target_fn if "acc" in args.rewards else None
+    # Always pass target_fun so flops/bytes_accessed/latency_ns/peak_memory
+    # populate every step (see cpu_approx_worker.py for the full rationale).
+    env_target_fun = target_fn
     argnums = infer_argnums(args.example)
 
     measure_latency = args.measure_latency or args.cmp_type == "latency"
@@ -363,6 +365,7 @@ def main():
         mem_type=args.mem_type,
         exec_on_gpu=False,
         measure_latency=measure_latency,
+        latency_samples=int(getattr(args, "latency_samples", 1)),
         terminal_rewards_only=args.terminal_rewards_only,
     )
 

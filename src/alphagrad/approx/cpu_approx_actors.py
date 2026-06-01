@@ -89,6 +89,15 @@ class CpuApproximationActor:
     def ready(self) -> bool:
         return self._impl.ready()
 
+    def set_cost_mode_full(self) -> bool:
+        """Phase-2 cutover: swap target_fun=None → target_fun=target_fn
+        so subsequent ``evaluate`` calls run the full cost-channel path
+        (XLA cost_analysis + ResourceMonitor + compiled_exact at terminal).
+
+        Idempotent. See CpuApproximationServer.set_cost_mode_full for
+        implementation details — this is the Ray-remote wrapper."""
+        return bool(self._impl.set_cost_mode_full())
+
     def compile_approximations(self) -> dict:
         """Pool warm-up handshake.
 
