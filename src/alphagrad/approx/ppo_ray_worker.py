@@ -57,7 +57,7 @@ from alphagrad.approx.common import (
     init_linear_weights,
     vertex_avail_at_step,
 )
-from alphagrad.approx.common.gae import get_advantages, reward_normalization_fn
+from alphagrad.approx.common.gae import get_advantages
 from alphagrad.utils import symlog
 from alphagrad.approx.env import (
     MAX_AXES_PER_VERTEX,
@@ -79,37 +79,6 @@ from graphax.sparse.micro_actions import NUM_QUANT_DTYPES
 # bounded to [0, 1], so symlog'ing it would only complicate the
 # threshold semantics. Mirrored from ppo._NO_SYMLOG_REWARD_INDICES.
 _NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (REWARD_INDEX["cosine_sim"],)
-
-
-def _parse_lagrangian_constraints(specs: list) -> list[tuple[int, float, int]]:
-    """Parse ``--lagrangian-constraint`` strings to (idx, threshold, sign).
-
-    * ``NAME>=THRESH`` → sign=+1, violation when reward < threshold
-    * ``NAME<=THRESH`` → sign=−1, violation when reward > threshold
-
-    Duplicates ``ppo.parse_lagrangian_constraints`` (kept local so this
-    file doesn't pull in the 6k-line single-process ppo module).
-    """
-    parsed: list[tuple[int, float, int]] = []
-    for s in specs or []:
-        if ">=" in s:
-            op, sign = ">=", 1
-        elif "<=" in s:
-            op, sign = "<=", -1
-        else:
-            raise ValueError(
-                f"--lagrangian-constraint must be NAME>=THRESH or NAME<=THRESH, "
-                f"got {s!r}"
-            )
-        name, thresh_s = s.split(op, 1)
-        name = name.strip()
-        if name not in REWARD_INDEX:
-            raise ValueError(
-                f"Unknown reward name {name!r} in {s!r}; "
-                f"valid names: {list(REWARD_INDEX.keys())}"
-            )
-        parsed.append((REWARD_INDEX[name], float(thresh_s.strip()), sign))
-    return parsed
 
 
 def _args_from_dict(args_dict: dict) -> SimpleNamespace:
@@ -451,19 +420,9 @@ class PPORayWorker:
         self.entropy_coef_init = float(getattr(self.args, "entropy_coef", 0.05))
         self.entropy_coef_final = float(getattr(self.args, "entropy_coef_final", 0.001))
         self.entropy_coef = self.entropy_coef_init
-        # Option-A scalarization: per-channel reward EMA in **symlog
-        # space** (K-vectors). Each reward channel is first compressed
-        # via symlog (crushes the ~13-decade gap between flops ~1e13
-        # and frob ~1), then divided by its per-channel running σ to
-        # bring channels to comparable scale before the priority-
-        # weighted sum. The priority-weighted sum is then averaged
-        # across active channels so the scalar target stays O(1)
-        # regardless of how many channels are active. Dreamer-V3
-        # pattern; σ-only divide preserves symlog(0)=0 so masked
-        # entries stay 0. Decay comes from --value-norm-decay (0.99).
-        self._ret_norm_decay = float(getattr(self.args, "value_norm_decay", 0.99))
-        self._reward_mean = np.zeros(NUM_REWARDS, dtype=np.float32)
-        self._reward_var = np.ones(NUM_REWARDS, dtype=np.float32)
+        # Reward scalarization is static: symlog per channel, then a fixed
+        # priority-weighted sum (the per-channel "lambda" weights). No dynamic
+        # per-channel σ normalization — so no reward-EMA state is kept.
         self.gae_lambda = float(getattr(self.args, "gae_lambda", 0.95))
         self.discount = float(getattr(self.args, "discount", 0.99))
         self.reward_weights_np = _build_reward_weights(self.args)
@@ -595,81 +554,20 @@ class PPORayWorker:
         )
         self._sparse_terminal_idx_set = set(_SPARSE_TI)
 
-        # Stage F Lagrangian state. Stored as numpy because the multipliers
-        # update with simple dual-ascent steps after each episode — no
-        # need to keep them on the device. Empty config = no constraints
-        # (the violation path becomes a no-op).
-        # ``--anti-degeneracy`` is desugared here so the corridor bounds
-        # used by ``corridor/*_band_fraction`` instrumentation match the
-        # constraints the trainer enforces (single source of truth).
+        # Anti-degeneracy corridor bounds for the corridor/* instrumentation
+        # (build_unified_reward_log_dict reads self._corridor_low/_high). The
+        # Lagrangian constraint machinery was removed — the reward is a static
+        # priority-weighted scalar — so only the corridor bounds are derived
+        # here, from --anti-degeneracy / --cosine-*-bound.
         from alphagrad.approx.common.anti_degeneracy import (
             desugar_anti_degeneracy,
         )
-        constraint_strs, self._corridor_low, self._corridor_high = (
-            desugar_anti_degeneracy(
-                list(getattr(self.args, "lagrangian_constraint", []) or []),
-                getattr(self.args, "anti_degeneracy", "none"),
-                float(getattr(self.args, "anti_degeneracy_delta", 0.01)),
-                float(getattr(self.args, "cosine_lower_bound", 0.8)),
-                float(getattr(self.args, "cosine_upper_bound", 0.9)),
-            )
-        )
-        constraint_specs = _parse_lagrangian_constraints(constraint_strs)
-        if constraint_specs:
-            self.constraint_indices_np = np.array(
-                [c[0] for c in constraint_specs], dtype=np.int32,
-            )
-            self.constraint_thresholds_np = np.array(
-                [c[1] for c in constraint_specs], dtype=np.float32,
-            )
-            self.constraint_signs_np = np.array(
-                [c[2] for c in constraint_specs], dtype=np.float32,
-            )
-            self.constraint_names = [
-                REWARD_NAMES[c[0]] + (">=" if c[2] > 0 else "<=") + str(c[1])
-                for c in constraint_specs
-            ]
-            # No-symlog mask gathered per-constraint, so we can skip the
-            # symlog transform on the cosine-sim channel (and anything
-            # else flagged in _NO_SYMLOG_REWARD_INDICES).
-            self.constraint_no_symlog_np = np.array(
-                [c[0] in _NO_SYMLOG_REWARD_INDICES for c in constraint_specs],
-                dtype=np.bool_,
-            )
-            # Sparse-terminal mask: channels whose value is meaningful
-            # only at the terminal elimination step. Used below to
-            # zero out violations on non-terminal steps for those
-            # channels (otherwise ``threshold - 0`` looks like a full
-            # violation on every intermediate step and floods the
-            # Lagrangian penalty term).
-            from alphagrad.approx.common.reward_scaling import (
-                SPARSE_TERMINAL_INDICES as _SPARSE_TERMINAL_INDICES,
-            )
-            self.constraint_is_sparse_np = np.array(
-                [c[0] in _SPARSE_TERMINAL_INDICES for c in constraint_specs],
-                dtype=np.bool_,
-            )
-        else:
-            self.constraint_indices_np = np.zeros((0,), dtype=np.int32)
-            self.constraint_thresholds_np = np.zeros((0,), dtype=np.float32)
-            self.constraint_signs_np = np.zeros((0,), dtype=np.float32)
-            self.constraint_names = []
-            self.constraint_no_symlog_np = np.zeros((0,), dtype=np.bool_)
-            self.constraint_is_sparse_np = np.zeros((0,), dtype=np.bool_)
-        self.multipliers_np = np.zeros(
-            (self.constraint_indices_np.shape[0],), dtype=np.float32,
-        )
-        self.lagrangian_lr = float(getattr(self.args, "lagrangian_lr", 1e-3))
-        # Phase 5: bound multiplier growth and warm up before applying.
-        # See the unification plan for why this is necessary — the prior
-        # behaviour drove cosine_sim>=0.5 multipliers into the tens
-        # within 100 episodes, killing exploration via overwhelming
-        # penalty.
-        self.lagrangian_multiplier_max = float(
-            getattr(self.args, "lagrangian_multiplier_max", 1.0)
-        )
-        self.lagrangian_warmup_eps = int(
-            getattr(self.args, "lagrangian_warmup_eps", 0)
+        _, self._corridor_low, self._corridor_high = desugar_anti_degeneracy(
+            [],
+            getattr(self.args, "anti_degeneracy", "none"),
+            float(getattr(self.args, "anti_degeneracy_delta", 0.01)),
+            float(getattr(self.args, "cosine_lower_bound", 0.8)),
+            float(getattr(self.args, "cosine_upper_bound", 0.9)),
         )
 
         # Agent + optimizer.
@@ -823,8 +721,6 @@ class PPORayWorker:
                     if restored["reward_weights"] is not None:
                         self.reward_weights_np = restored["reward_weights"].astype(np.float32)
                         self.reward_weights = jnp.asarray(self.reward_weights_np, dtype=jnp.float32)
-                    if restored["multipliers"] is not None and self.constraint_indices_np.shape[0] > 0:
-                        self.multipliers_np = restored["multipliers"].astype(np.float32)
                     print(
                         f"[ppo_ray_worker] resumed from {self._checkpoint_path} "
                         f"at episode {self._episode_counter}"
@@ -1153,10 +1049,9 @@ class PPORayWorker:
                     pred_scalar = jnp.sum(value * priority_weights_j)
                     target_scalar = jnp.sum(ret * priority_weights_j)
                 else:
-                    # Option-A: rewards are already symlog'd + per-
-                    # channel σ-normalized upstream, so the priority-
-                    # weighted scalar `ret` is the target directly —
-                    # no further standardization.
+                    # Scalar path: rewards are symlog'd and the per-channel
+                    # balance is set by the static priority weights, so the
+                    # priority-weighted scalar `ret` is the target directly.
                     pred_scalar = jnp.sum(value * priority_weights_j)
                     target_scalar = ret
                     value_loss = (pred_scalar - target_scalar) ** 2
@@ -1452,9 +1347,8 @@ class PPORayWorker:
         )
         discounts_b = jnp.full_like(dones_b, self.discount)
 
-        # GAE in per-channel normalized space. Inverse transform is
-        # identity — the value head learns to output normalized values
-        # directly (rewards are pre-divided by σ_k upstream).
+        # Per-channel GAE on the symlog'd rewards (identity inverse transform;
+        # the static priority weights set the per-channel balance at the sum).
         from alphagrad.approx.common.gae import get_advantages_running_norm
         identity_mean = jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
         identity_std = jnp.ones(NUM_REWARDS, dtype=jnp.float32)
@@ -2174,10 +2068,6 @@ class PPORayWorker:
                 opt_state=self.opt_state,
                 episode_counter=self._episode_counter,
                 reward_weights=self.reward_weights_np,
-                multipliers=getattr(self, "multipliers_np", None),
-                extras={
-                    "lagrangian_warmup_eps": int(getattr(self, "lagrangian_warmup_eps", 0)),
-                },
             )
         except Exception as exc:
             print(f"[ppo_ray_worker] checkpoint save failed: {exc}")
