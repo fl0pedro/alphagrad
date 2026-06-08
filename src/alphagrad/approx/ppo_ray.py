@@ -96,6 +96,7 @@ def _run(args) -> int:
     args_dict = vars(args)
     wandb.init(
         project=args.wandb_project,
+        entity=getattr(args, "wandb_entity", None) or None,
         name=args.name,
         config=args_dict,
         mode="disabled" if args.wandb == "disabled" else args.wandb,
@@ -119,6 +120,11 @@ def _run(args) -> int:
         if k.startswith("ALPHAGRAD_") or k.startswith("JAX_COMPILATION_"):
             actor_env[k] = v
     actor_kwargs = {
+        # GPU-bound trainer: reserve 0 CPU slots so the GPU node can be
+        # declared --num-cpus=0, which physically excludes the num_cpus=1
+        # measurement actors from it -> all measurement lands on the single
+        # CPU node (consistent cores = clean latency reward, no node-mix).
+        "num_cpus": 0,
         "num_gpus": args.actor_num_gpus,
         "runtime_env": {"env_vars": actor_env},
     } if args.actor_num_gpus > 0 else {
@@ -142,8 +148,16 @@ def _run(args) -> int:
     # via the same factory pattern after a timeout. Keep these in sync
     # with the .options(...) below.
     cpu_actor_env = {
-        "JAX_PLATFORMS": "cpu",
+        # GPU measurement (--exec-on-gpu) needs the actor to SEE cuda;
+        # otherwise pin to CPU JAX so measurement runs on the CPU pool.
+        "JAX_PLATFORMS": "cuda" if getattr(args, "exec_on_gpu", False) else "cpu",
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+        # NOTE: do NOT force single-thread here. The approx-Jacobian exec
+        # scales ~linearly with cores (0.45s@64-core → ~80s@1-core), so
+        # single-thread starves it. Each actor is pinned to a disjoint
+        # core SLICE (see CpuApproximationActor.__init__) sized to
+        # cores//num_workers, giving multi-core execs without cross-actor
+        # oversubscription. Profiled 2026-06-06.
     }
     # Pass ALPHAGRAD_* / JAX_COMPILATION_* debug toggles through to the
     # CPU actor processes — same rationale as ``actor_env`` above.
@@ -152,9 +166,18 @@ def _run(args) -> int:
             cpu_actor_env[k] = v
     cpu_actor_options = {
         "num_cpus": 1,
-        "num_gpus": 0,
+        "num_gpus": float(getattr(args, "cpu_actor_num_gpus", 0.0) or 0.0),
         "runtime_env": {"env_vars": cpu_actor_env},
     }
+    # SPREAD the measurement actors across ALL nodes in the cluster
+    # (e.g. the 2-node pooled setup: GPU node's CPUs + cpu1's CPUs)
+    # rather than letting Ray bin-pack them onto a single node. Combined
+    # with the per-node core allocator (--cpu-cores-shared), this uses
+    # every core across both nodes for measurement. Opt-in via
+    # ``--spread-cpu-actors`` so single-node runs keep the default
+    # (locality-friendly) packing.
+    if getattr(args, "spread_cpu_actors", False):
+        cpu_actor_options["scheduling_strategy"] = "SPREAD"
     cpu_workers = [
         CpuApproximationActor.options(**cpu_actor_options).remote(
             args_dict, variant=None, actor_id=i,
@@ -363,6 +386,27 @@ def _run(args) -> int:
             raw = state["best_global_rewards"][name]
             wt = state["best_global_weighted_split"].get(name, 0.0)
             tqdm.write(f"    {name:<18s}  raw={raw:+.4g}   weighted={wt:+.4g}")
+    # Loud CPU-pool-sentinel summary. If ``total_timeouts == 0`` across a
+    # full training run, the sentinel-callback path in
+    # ``ppo_ray_worker._fan_out_tokenize`` is dead code and can be
+    # deleted (see CpuApproxPool.fetch_timeout_delta docstring). We log
+    # the running total here as the canonical "did the sentinel fire
+    # this run" signal so the cleanup decision is one line away.
+    try:
+        pool_stats = ray.get(actor.pool_stats.remote()) if hasattr(actor, "pool_stats") else None
+    except Exception:
+        pool_stats = None
+    if pool_stats is not None:
+        n_t = int(pool_stats.get("timeouts", 0))
+        n_c = int(pool_stats.get("calls", 0))
+        tag = "(sentinel path is dead code — can be dropped)" if n_t == 0 else ""
+        tqdm.write(f"  cpu-pool timeouts total: {n_t} / {n_c} calls  {tag}")
+        final_payload_extra = {
+            "final/cpu_pool_timeouts_total": n_t,
+            "final/cpu_pool_calls_total": n_c,
+        }
+    else:
+        final_payload_extra = {}
     # Final JSON + wandb dump of the running bests. The JSON file is
     # the canonical record (durable, easy to diff across runs); the
     # wandb Table is a UI nicety so the bests show up in the run page
@@ -375,6 +419,16 @@ def _run(args) -> int:
     )
     final_payload["final/best_return"] = state["best_global_return"]
     final_payload["final/best_ep"] = state["best_global_ep"]
+    final_payload.update(final_payload_extra)
+    if final_path:
+        try:
+            from alphagrad.approx.common.render_sequence import (
+                render_best_sequences_json,
+            )
+            for k, v in render_best_sequences_json(final_path).items():
+                final_payload[f"final/{k}/repr"] = v
+        except Exception as exc:
+            tqdm.write(f"  [render] best-sequence repr failed: {exc}")
     # The Table goes through wandb's artifact upload path which on some
     # wandb configurations (`base_url='redacted'` in
     # ~/.config/wandb/settings) hits a pydantic-v2 URL validation
@@ -433,6 +487,20 @@ def main() -> int:
     import ray
     init_kwargs = {"address": args.ray_address} if args.ray_address else {}
     os.environ.setdefault("RAY_DISABLE_IMPORT_WARNING", "1")
+    # Cap Ray's LOGICAL cpu count for a local cluster. Ray prestarts one
+    # python worker per logical CPU; on a high-core node (e.g. the
+    # 384-core pgi15-cpu nodes) the default auto-detect spawns hundreds
+    # of workers — a fork storm that hangs init (profiled 2026-06-06:
+    # do_wait block + num_prestart_python_workers=384). We only need
+    # enough logical CPUs to schedule the driver + num_cpu_workers actors
+    # (+ headroom). The PHYSICAL cores stay fully available to the actors
+    # via sched_setaffinity (set in CpuApproximationActor.__init__) — Ray
+    # logical CPUs are a scheduling abstraction, not a core binding. Only
+    # applied for a locally-started cluster (not when joining via
+    # --ray-address, where the cluster sized itself).
+    if not args.ray_address:
+        ray_cpus = int(getattr(args, "num_cpu_workers", 4)) + 8
+        init_kwargs["num_cpus"] = ray_cpus
     ray.init(**init_kwargs, ignore_reinit_error=True)
 
     rc = _run(args)

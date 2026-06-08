@@ -85,8 +85,14 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lambda-frob", type=float, default=1.0)
     p.add_argument(
         "--measure-latency", action="store_true",
-        help="Run the compiled approx fn 10x per env step to populate "
-             "the latency reward component.",
+        help="Time the compiled approx fn N times per env step to "
+             "populate the latency reward component (N = --latency-samples).",
+    )
+    p.add_argument(
+        "--latency-samples", type=int, default=1,
+        help="Per-step latency sample count when --measure-latency is on. "
+        "Default 1 (single noisy point, denoised by per-episode averaging "
+        "over ~12*num_envs calls). >=8 enables top-quartile-mean smoothing.",
     )
     p.add_argument(
         "--terminal-rewards-only", action="store_true",
@@ -340,6 +346,17 @@ def make_argparser() -> argparse.ArgumentParser:
         default=0.9,
         help="Ceiling on cosine_sim enforced via a Lagrangian multiplier. "
              "Pass 1.0 to disable.",
+    )
+    p.add_argument(
+        "--anti-degeneracy",
+        choices=("none", "delta_ceiling", "corridor"),
+        default="none",
+        help="High-level mechanism to prevent the policy from collapsing "
+             "to cossim=1.0. See ppo_args.py for full description.",
+    )
+    p.add_argument(
+        "--anti-degeneracy-delta", type=float, default=0.01,
+        help="δ for ``--anti-degeneracy delta_ceiling``.",
     )
 
     # Stage G calibration

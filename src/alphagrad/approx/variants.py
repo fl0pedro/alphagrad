@@ -75,6 +75,27 @@ VARIANT_PRESETS: dict[str, dict] = {
         "max_rules": 1,
         "pin_rules_to_exact": False,
     },
+    # PAIR family — two DIFFICULT operators legal simultaneously. The
+    # factor table is the union of the constituent variants (DIAG needs
+    # its full factor table; COMPRESS / QUANT only need -1). max_rules
+    # stays at 1 because the action space is "pick one op per vertex"
+    # — the pair just widens the op_type choice from {one op, END} to
+    # {two ops, END}.
+    "diag_compress": {
+        "factors": "-1,2,3,4,8,16",
+        "max_rules": 1,
+        "pin_rules_to_exact": False,
+    },
+    "diag_quant": {
+        "factors": "-1,2,3,4,8,16",
+        "max_rules": 1,
+        "pin_rules_to_exact": False,
+    },
+    "compress_quant": {
+        "factors": "-1",
+        "max_rules": 1,
+        "pin_rules_to_exact": False,
+    },
     "full": {
         "factors": "-1,2,3,4,8,16",
         "max_rules": MAX_RULES_PER_VERTEX,
@@ -337,6 +358,17 @@ def compute_ppo_variant_masks(
     elif variant == "quantize":
         op_mask[_OP_DIAG] = False
         op_mask[_OP_COMPRESS] = False
+    elif variant == "diag_compress":
+        # DIAG ∪ COMPRESS legal — only disable QUANT. Factor + quant
+        # masks stay all-True (DIAG uses factors; COMPRESS doesn't —
+        # the op-type gate in the worker handles that).
+        op_mask[_OP_QUANT] = False
+    elif variant == "diag_quant":
+        # DIAG ∪ QUANT legal — only disable COMPRESS.
+        op_mask[_OP_COMPRESS] = False
+    elif variant == "compress_quant":
+        # COMPRESS ∪ QUANT legal — only disable DIAG.
+        op_mask[_OP_DIAG] = False
     elif variant in ("full", "full_curriculum", "custom"):
         pass  # no restriction
     else:

@@ -124,6 +124,7 @@ def _run_one_variant(args, variant: str) -> None:
     args_dict = vars(variant_args)
     wandb.init(
         project=args.wandb_project,
+        entity=getattr(args, "wandb_entity", None) or None,
         name=f"{args.name}-{variant}",
         config=args_dict,
         mode="disabled" if args.wandb == "disabled" else args.wandb,
@@ -445,6 +446,14 @@ def _run_one_variant(args, variant: str) -> None:
     _final_path = _dump_best_sequences_json(_final_state, _best_seq_path)
     if _final_path:
         tqdm.write(f"  best-sequences JSON written: {_final_path}")
+        try:
+            from alphagrad.approx.common.render_sequence import (
+                render_best_sequences_json,
+            )
+            for k, v in render_best_sequences_json(_final_path).items():
+                summary[f"final/{k}/repr"] = v
+        except Exception as exc:
+            tqdm.write(f"  [render] best-sequence repr failed: {exc}")
     # The Table goes through wandb's artifact-upload path which on
     # some wandb configs (e.g. ``base_url='redacted'`` in
     # ~/.config/wandb/settings) hits pydantic-v2 URL validation and

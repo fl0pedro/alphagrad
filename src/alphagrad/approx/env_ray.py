@@ -638,18 +638,22 @@ def _callback(
             .compile()
         )
 
+        # Exact reference Jacobian is order-invariant → use jax.jacrev
+        # (native, order-free, XLA-optimised) instead of jacve with the
+        # policy's (often catastrophic) dense order. Identical value,
+        # ~0s vs ~125s. See env.py for the full investigation. NOTE:
+        # env_ray.py is currently unused; kept consistent with env.py.
+        if config.has_aux:
+            def _exact_with_aux(*a):
+                jac, aux = jax.jacrev(
+                    config.target_fun, argnums=config.argnums, has_aux=True,
+                )(*a)
+                return (aux, jac)
+            _exact_fn = _exact_with_aux
+        else:
+            _exact_fn = jax.jacrev(config.target_fun, argnums=config.argnums)
         compiled_exact = (
-            jax.jit(
-                jacve(
-                    config.target_fun,
-                    list(o_list),
-                    argnums=config.argnums,
-                    has_aux=config.has_aux,
-                    sparse_representation=config.sparse,
-                    transforms=None,
-                ),
-                keep_unused=True,
-            )
+            jax.jit(_exact_fn, keep_unused=True)
             .lower(*args_for_lower)
             .compile()
         )

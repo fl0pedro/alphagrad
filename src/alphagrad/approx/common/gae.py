@@ -84,6 +84,44 @@ def make_get_advantages(use_symlog: bool):
 get_advantages = make_get_advantages(True)
 
 
+@partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, None, None, None))
+def _get_advantages_running_norm(
+    rewards, dones, values, next_values, discounts, gae_lambda, ret_mean, ret_std,
+):
+    """GAE variant for Option-A (running-std) scalarization.
+
+    Network value outputs are interpreted as **standardized** predictions
+    (``z = (raw - μ) / σ``). The inverse is the affine ``raw = μ + σ·z``,
+    replacing the ``symexp`` of the legacy symlog GAE. The rewards and
+    discounts stay in raw scale; ``ret_mean`` and ``ret_std`` are the
+    rollout-wide EMA stats tracked on the worker.
+    """
+    def loop_fn(carry, traj):
+        episodic_return, lastgaelam = carry
+        reward, done, value, next_value, discount = traj
+
+        mask = 1.0 - done
+        episodic_return = reward + discount * episodic_return * mask
+
+        value_raw = ret_mean + ret_std * value
+        next_value_raw = ret_mean + ret_std * next_value
+
+        delta = reward + next_value_raw * discount * mask - value_raw
+        advantage = delta + discount * gae_lambda * lastgaelam * mask
+
+        estim_return = advantage + value_raw
+        return (episodic_return, advantage), (episodic_return, estim_return, advantage)
+
+    inputs = (rewards, dones, values, next_values, discounts)
+    rev_inputs = jax.tree.map(lambda x: x[::-1], inputs)
+    init_val = jnp.zeros_like(rewards[0])
+    _, output = lax.scan(loop_fn, (init_val, init_val), rev_inputs)
+    return jax.tree.map(lambda x: x[::-1], output)
+
+
+get_advantages_running_norm = jax.jit(_get_advantages_running_norm)
+
+
 def get_num_clipping_triggers(ratio, eps):
     """Approximate count of how many ratios fell into the PPO clip region."""
     _ratio = jnp.where(ratio <= 1.0 + eps, ratio, 0.0)

@@ -126,7 +126,12 @@ class CpuApproximationServer:
         seed: int = 0,
     ) -> "CpuApproximationServer":
         env = _build_env_from_args(args_dict, variant, seed=seed)
-        return cls(env)
+        server = cls(env)
+        # Stash for set_cost_mode_full — we need to rebuild target_fn
+        # without shipping a Callable through Ray, so reconstruct from
+        # the example name at swap time.
+        server._args_dict = dict(args_dict)
+        return server
 
     # ------------------------------------------------------------------
     # Core evaluation API
@@ -139,6 +144,7 @@ class CpuApproximationServer:
         *,
         eval_samples: Sequence | None = None,
         init: bool = False,
+        point_idx: int = -1,
     ):
         """Run the per-step reward pipeline once.
 
@@ -190,6 +196,7 @@ class CpuApproximationServer:
                 int(step),
                 *es,
                 init=bool(init),
+                point_idx=int(point_idx),
             )
             self._n_calls += 1
             if self._leak_profile is not None:
@@ -273,6 +280,35 @@ class CpuApproximationServer:
     def ready(self) -> bool:
         return True
 
+    def set_cost_mode_full(self) -> bool:
+        """Switch from phase-1 cheap (target_fun=None) to phase-2 full
+        (target_fun=target_fn). Idempotent — calling when already in full
+        mode is a no-op.
+
+        Implementation: rebuild the target_fn from the cached args_dict
+        (cheaper than shipping a Callable through Ray), swap the env's
+        ``config.target_fun`` via ``eqx.tree_at``, and replace this
+        server's stored env with the new one. JAX compile caches are
+        keyed by (order, specs, shape) and survive the swap.
+        """
+        if self._config.target_fun is not None:
+            return True  # already in full mode
+        import equinox as eqx
+        from alphagrad.approx.common import get_fn
+        from alphagrad.approx.env import EnvConfig
+
+        # Rebuild target_fn locally — Ray actor holds the args_dict from
+        # construction.
+        args_dict = getattr(self, "_args_dict", None)
+        if args_dict is None:
+            return False  # paranoid; nothing to rebuild from
+        target_fn = get_fn(args_dict["example"])
+        new_config = self._config._replace(target_fun=target_fn)
+        # Swap on the env via eqx.tree_at so the JAX-side state survives.
+        self._env = eqx.tree_at(lambda e: e.config, self._env, new_config)
+        self._config = new_config
+        return True
+
     def _maybe_init_leak_profile(self) -> None:
         """Activate the per-actor RSS / tracemalloc profiler on first
         ``evaluate`` if ``ALPHAGRAD_LEAK_PROFILE=1`` is set."""
@@ -336,11 +372,36 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
     closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
     argnums = infer_argnums(args.example)
 
-    env_target_fun = target_fn if "acc" in args.rewards else None
+    # Always pass target_fun so env._callback runs the JIT-compile +
+    # cost_analysis + ResourceMonitor path on every step — this is what
+    # populates flops, bytes_accessed, latency_ns, peak_memory. Previously
+    # this was gated on ``"acc" in args.rewards`` (skip exec when only
+    # symbolic counters are needed) but that left 4 of 6 cost channels at
+    # 0 in best_sequences.json / wandb, which broke downstream comparison.
+    # The cossim/frob comparison work (the *expensive* part beyond bare
+    # exec) is still skipped on non-terminal steps via the ``is_terminal``
+    # guard inside _callback, so the per-step extra cost is bounded by
+    # one JIT-exec (or 10× with --measure-latency).
+    #
+    # 2-phase schedule (``--cost-pipeline-schedule cheap_first``): start
+    # with target_fun=None (cheap-only — graphax symbolic counts only,
+    # no JIT-exec). The actor's ``set_cost_mode_full`` method swaps it
+    # to ``target_fn`` after the policy stabilises (KL-or-ep cutover).
+    schedule = str(getattr(args, "cost_pipeline_schedule", "always_full"))
+    env_target_fun = None if schedule == "cheap_first" else target_fn
     measure_latency = bool(
         getattr(args, "measure_latency", False)
         or getattr(args, "cmp_type", "") == "latency"
     )
+    # ``--terminal-rewards-only`` was renamed to ``--intermediate-rewards``
+    # (BooleanOptionalAction, default False). The trainer's args_dict now
+    # carries ``intermediate_rewards``; derive terminal_rewards_only the
+    # same way the PPO worker does. Fall back to the legacy key for any
+    # caller that still sets it directly.
+    if hasattr(args, "intermediate_rewards"):
+        terminal_rewards_only = not bool(args.intermediate_rewards)
+    else:
+        terminal_rewards_only = bool(getattr(args, "terminal_rewards_only", False))
     env = VertexEliminationEnv.from_jaxpr(
         closed_jaxpr,
         args=xs,
@@ -352,7 +413,18 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         mem_type=args.mem_type,
         exec_on_gpu=getattr(args, "exec_on_gpu", False),
         measure_latency=measure_latency,
-        terminal_rewards_only=getattr(args, "terminal_rewards_only", False),
+        latency_samples=int(getattr(args, "latency_samples", 1)),
+        # New noisy-channel measurement params — must mirror the trainer's
+        # CLI, otherwise the CPU actor (which does the actual measurement)
+        # silently falls back to the EnvConfig defaults (5×4=20 measures).
+        num_data_points=int(getattr(args, "num_data_points", 5)),
+        reps_per_point=int(getattr(args, "reps_per_point", 4)),
+        percentile_keep=float(getattr(args, "percentile_keep", 0.60)),
+        slow_exec_cutoff_seconds=float(
+            getattr(args, "slow_exec_cutoff_seconds", 15.0)
+        ),
+        flop_gate_threshold=float(getattr(args, "flop_gate_threshold", 0.0)),
+        terminal_rewards_only=terminal_rewards_only,
     )
 
     num_eval = int(getattr(args, "num_eval_samples", 10) or 10)

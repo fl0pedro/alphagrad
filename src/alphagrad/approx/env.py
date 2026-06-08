@@ -338,10 +338,55 @@ class EnvConfig(NamedTuple):
     target_fun: Callable | None = None
     data_gen: Callable | None = None
     exec_on_gpu: bool = False
-    # Latency requires running the compiled fn 10x per step, which roughly 10xs
-    # rollout-to-reward time. Off by default; flip on when the latency component
-    # of the reward is actually being weighted.
+    # Latency requires running the compiled fn N times per step (1× for a
+    # single noisy sample; >=8 for the top-quartile-mean smoothing). With
+    # ``--rewards cmp`` we always compute latency now (to populate the
+    # full 6-cost-channel vector), so the default went from N=10 to N=1 —
+    # per-call latency is noisier but the per-episode mean across ~192
+    # calls/ep is dominated by mean(noise)=0 anyway. Use
+    # ``latency_samples`` to crank back up if per-step denoised latency
+    # matters for your policy.
     measure_latency: bool = False
+    latency_samples: int = 1
+    # Robust noisy-channel aggregation: when `num_data_points >= 1` and
+    # `reps_per_point >= 1`, the reward loop runs `num_data_points *
+    # reps_per_point` total measurements (5 × 4 = 20 by default — five
+    # data points sampled per episode, each replayed four times). Noisy
+    # channels (latency_ns, peak_memory, frob_residual, cosine_sim) are
+    # aggregated by the **P-`percentile_keep`** percentile across the
+    # full pool: e.g. `percentile_keep=0.60` returns the 60th percentile
+    # of the pool, which is "slowest 60% latency / highest 60% memory /
+    # worst 60% frob" in the user's notation. Deterministic channels
+    # (muls_adds_fmas, max_io_sum, flops, bytes_accessed) are computed
+    # exactly once and reused.
+    num_data_points: int = 5
+    reps_per_point: int = 4
+    percentile_keep: float = 0.60
+    # Per-exec slow-order cutoff (seconds). During early training the
+    # policy samples catastrophic elimination orders whose approx-
+    # Jacobian execution is ~10-40× a good order's (the 500× FLOP
+    # blowup, profiled 2026-06-05); running all `num_data_points *
+    # reps_per_point` measurements on one costs ~15 min/terminal-step.
+    # We don't need 20 reps to learn an order is slow — one execution
+    # does. If any single measured exec exceeds this threshold, the
+    # order is pathological: we keep the samples gathered so far and
+    # stop. A good order's exec (~4.5s) never trips it and gets the full
+    # 5×4 pool; a bad order (~44s) trips on the first exec and is capped
+    # at one. 0 disables the cutoff (measure everything). Chosen just
+    # above the good-order exec regime (~4.5s) and well below the
+    # moderate/bad regimes (~12s / ~44-82s) so anything non-cheap caps
+    # at its first sample while good orders keep the full 5×4 pool.
+    slow_exec_cutoff_seconds: float = 8.0
+    # FLOP-gate: XLA cost_analysis gives each order's FLOP count for FREE
+    # (no execution). Pathological elimination orders (the 500× blowup
+    # common early in training) have huge FLOP counts AND a ~50s/exec
+    # latency on CPU — and that 50s exec can't be interrupted once
+    # started, so the slow-exec cutoff can't save it. When flops exceed
+    # this threshold we SKIP the expensive measurement entirely and
+    # assign FLOP/bytes-derived cost surrogates + a worst-case quality
+    # penalty, so the policy is pushed away from the order without ever
+    # paying the exec. 0 disables. Profiled 2026-06-06.
+    flop_gate_threshold: float = 0.0
     # Skip the expensive jacve-compile/exec branch on every step EXCEPT the
     # terminal one. Tokens/eqn_ids are still produced (the agent needs them as
     # the next observation), but the reward vector is zero on intermediate
@@ -885,6 +930,13 @@ def _quality_metrics(jac_exact, jac_approx):
     exact_norm = jnp.linalg.norm(flat_exact)
     resid_norm = jnp.linalg.norm(flat_exact - flat_approx)
     rel_frob = resid_norm / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
+    # A NaN/inf-producing approximation (e.g. quant overflow -> non-finite
+    # Jacobian) is a FAILED approximation, not a missing measurement. Clamp to
+    # worst-case FINITE quality (cos=0, frob=1) so a single bad config can't
+    # poison reward-normalisation (symlog), GAE, or the Lagrangian dual-ascent
+    # downstream (which has no NaN guard and would otherwise latch lambda=NaN).
+    cos = jnp.where(jnp.isfinite(cos), cos, jnp.float32(0.0))
+    rel_frob = jnp.where(jnp.isfinite(rel_frob), rel_frob, jnp.float32(1.0))
 
     if os.environ.get("ALPHAGRAD_DEBUG_QUALITY", "0") == "1":
         approx_norm = float(jnp.linalg.norm(flat_approx))
@@ -918,6 +970,20 @@ def _aggregate_samples(values, want_top_quartile: bool):
     return stack.mean()
 
 
+def _percentile_pool(values, q: float) -> float:
+    """Return the `q`-percentile of a pool of measurements (q in [0, 1]).
+
+    Used for the noisy-channel aggregation under the 5×4 design:
+    `q=0.60` → the slowest 60% latency / highest 60% memory / worst
+    60% frob, in the user's notation. Falls back to 0.0 on an empty
+    pool.
+    """
+    if not values:
+        return 0.0
+    arr = jnp.asarray(values, dtype=jnp.float32)
+    return float(jnp.percentile(arr, float(q) * 100.0))
+
+
 # Compile cache: the original in-process LRU thrashed (2-11% hit rate)
 # because Ray's round-robin dispatch sent the same (order, specs) tuple
 # to different actors. Sticky routing was tried next and lifted hit rate
@@ -942,6 +1008,8 @@ def _callback(
     stop,
     *eval_samples,
     init: bool = False,
+    point_idx: int = -1,
+    raw_sink: dict | None = None,
 ):
     """Stage A reward harness: returns `(tokens, rewards)` where `rewards` is
     the canonical `(NUM_REWARDS,)` float32 vector documented at the top of this
@@ -1149,11 +1217,20 @@ def _callback(
 
     # If no `target_fun` is supplied, we can't compile/execute. Skip every
     # execution-derived metric and return a partial reward vector.
+    #
+    # cossim=0.0 (NOT 1.0 as in earlier revisions): the early-return path
+    # signifies "this channel is unmeasured", not "perfect fidelity". A 1.0
+    # value would (a) tank the scalar reward through the cossim weight,
+    # (b) falsely trigger anti-degeneracy ``cossim<=1-δ`` constraints
+    # whose entire point is to prevent the policy collapsing to cossim=1.
+    # 0.0 leaves the policy under no quality pressure during the cheap
+    # phase, which is what 2-phase schedules (--cost-pipeline-schedule
+    # cheap_first) want — measurement comes online at phase cutover.
     if config.target_fun is None:
         rewards = jnp.array(
             [
                 -muls_adds_fmas, 0.0, 0.0, -max_io_sum,
-                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 0.0,
             ],
             dtype=jnp.float32,
         )
@@ -1213,6 +1290,20 @@ def _callback(
             h.update(repr(a.dtype).encode())
     cache_key = h.digest()
 
+    # Exact-Jacobian cache key — SHAPE-ONLY (no order/specs/stop). The
+    # exact reference is order-invariant and computed via jax.jacrev, so
+    # one compiled executable per (arg-shape, has_aux) is reused across
+    # every terminal step of every episode — a permanent cache hit after
+    # the first compile, instead of a per-episode recompile.
+    he = hashlib.blake2b(digest_size=16)
+    he.update(b"jacrev-exact")
+    he.update(b"aux1" if config.has_aux else b"aux0")
+    for a in args_for_lower:
+        if hasattr(a, "shape") and hasattr(a, "dtype"):
+            he.update(repr(a.shape).encode())
+            he.update(repr(a.dtype).encode())
+    exact_cache_key = he.digest()
+
     def _do_compile_approx():
         return (
             jax.jit(
@@ -1231,22 +1322,39 @@ def _callback(
         )
 
     def _do_compile_exact():
-        return (
-            jax.jit(
-                jacve(
-                    config.target_fun,
-                    list(o_list),
-                    argnums=config.argnums,
-                    has_aux=config.has_aux,
-                    sparse_representation=config.sparse,
-                ),
-                keep_unused=True,
-            )
-            .lower(*args_for_lower)
-            .compile()
-        )
+        # The exact reference Jacobian is ORDER-INVARIANT: vertex
+        # elimination yields the same Jacobian for any order, only the
+        # FLOP cost differs. The previous implementation compiled
+        # ``jacve(..., list(o_list))`` with the *policy's* terminal
+        # order — and run dense (no transforms) that order is often a
+        # catastrophic high-FLOP path during early training, costing
+        # ~125s per terminal step (95% of episode wall-clock, profiled
+        # via ALPHAGRAD_DBG_TIMING). ``jax.jacrev`` computes the
+        # identical Jacobian (verified rel-err 1e-7 vs jacve) via
+        # native reverse-mode AD — order-free and XLA-optimised, ~0s.
+        # See env-timing investigation 2026-06-05.
+        if config.has_aux:
+            # jacve(has_aux) returns ``(primal, jac)`` and the caller
+            # reads ``out_exact[1]``. Match that ordering so the
+            # quality-metric indexing stays correct.
+            def _exact_with_aux(*a):
+                jac, aux = jax.jacrev(
+                    config.target_fun, argnums=config.argnums, has_aux=True,
+                )(*a)
+                return (aux, jac)
+            fn = _exact_with_aux
+        else:
+            fn = jax.jacrev(config.target_fun, argnums=config.argnums)
+        return jax.jit(fn, keep_unused=True).lower(*args_for_lower).compile()
 
+    _dbg_t = os.environ.get("ALPHAGRAD_DBG_TIMING", "0") == "1"
+    if _dbg_t:
+        import time as _time
+        _t0 = _time.time()
     compiled_approx = cached_compile(b"approx:" + cache_key, _do_compile_approx)
+    if _dbg_t:
+        print(f"[DBG-env] term={is_terminal} approx_compile={_time.time()-_t0:.1f}s", flush=True)
+        _t0 = _time.time()
     # ``compiled_exact`` is ONLY needed for the quality metrics
     # (cosine_sim, frob_residual). Those are meaningful only when the
     # elimination order is complete — graphax's ``jacve`` returns a
@@ -1255,7 +1363,10 @@ def _callback(
     # the compile + execute when the step is non-terminal; the cache
     # entry would never be re-used productively anyway.
     if is_terminal:
-        compiled_exact = cached_compile(b"exact:" + cache_key, _do_compile_exact)
+        compiled_exact = cached_compile(b"exact:" + exact_cache_key, _do_compile_exact)
+        if _dbg_t:
+            print(f"[DBG-env] exact_compile={_time.time()-_t0:.1f}s", flush=True)
+            _t0 = _time.time()
     else:
         compiled_exact = None
 
@@ -1277,13 +1388,100 @@ def _callback(
         cost_analysis = compiled_approx.cost_analysis() or {}
         flops = float(cost_analysis.get("flops", 0))
         bytes_accessed = float(cost_analysis.get("bytes accessed", 0))
+    if _dbg_t:
+        print(
+            f"[DBG-env] cost_analysis={_time.time()-_t0:.1f}s "
+            f"flops={flops:.3g} bytes={bytes_accessed:.3g} "
+            f"muls_adds_fmas={muls_adds_fmas:.3g} max_io={max_io_sum:.3g}",
+            flush=True,
+        )
+        _t0 = _time.time()
+
+    # ------------------------------------------------------------------
+    # FLOP-gate (see EnvConfig.flop_gate_threshold). A pathological order
+    # would cost ~50s/exec to measure; its FLOP count (free, above) flags
+    # it first. Short-circuit the whole measurement with FLOP/bytes-
+    # derived cost surrogates + a worst-case quality penalty so the
+    # policy still gets a strong "avoid this" gradient at ~zero cost.
+    # Only meaningful on the terminal step (where the full path runs).
+    _flop_gate = float(getattr(config, "flop_gate_threshold", 0.0) or 0.0)
+    if _flop_gate > 0.0 and flops > _flop_gate:
+        if _dbg_t:
+            print(
+                f"[DBG-env] FLOP-GATE: flops={flops:.3g} > {_flop_gate:.3g} "
+                "— skipping measurement, using cost surrogates",
+                flush=True,
+            )
+        # Cost surrogates: the cmp/mem channels read the (free) symbolic
+        # counts directly. latency_ns ← flops, peak_memory ← bytes — same
+        # "lower is better" direction, and after the per-channel
+        # symlog+EMA norm downstream these land in the bad tail. Quality
+        # is set to worst-case (cossim 0, frob 1.0 = 100% error) since we
+        # did not measure it and the order is being rejected.
+        rewards = jnp.array(
+            [
+                -muls_adds_fmas,
+                -flops,
+                -float(flops),          # latency_ns surrogate
+                -max_io_sum,
+                -bytes_accessed,
+                -float(bytes_accessed),  # peak_memory surrogate
+                0.0,                     # cosine_sim (worst)
+                -1.0,                    # frob_residual = 1.0 (100% error)
+            ],
+            dtype=jnp.float32,
+        )
+        return tokens, eqn_ids, rewards
 
     # ------------------------------------------------------------------
     # Execution loop — runs once for peak_memory + quality, or 10x when
     # `measure_latency` is on (the latency reading is noisy enough that the
     # top-quartile-mean smoothing from the original code is worth keeping).
     # ------------------------------------------------------------------
-    n_samples = 10 if config.measure_latency else 1
+    # Per-step latency sample count. The legacy default was hard-coded
+    # 10 (and 1 when measure_latency=False). Now driven by
+    # ``EnvConfig.latency_samples``; preserves the "1 sample, latency=0"
+    # behaviour when measure_latency is off so non-latency runs keep
+    # the same speed as before.
+    #
+    # IMPORTANT: ``compiled_approx`` (and ``compiled_exact``) were
+    # populated once above via ``cached_compile`` — the cluster-wide
+    # ObjectRef cache means only ONE actor in the pool compiles per
+    # unique (order, specs, shape) key, and all other actors fetch +
+    # ``deserialize_and_load`` from the shared blob. The for-loop below
+    # invokes the SAME compiled object n_samples times — there is no
+    # per-iteration recompile. So raising latency_samples is linear in
+    # exec cost only (no compile blow-up); the cache makes the per-step
+    # compile cost essentially zero after the first call per unique
+    # (order, transforms).
+    # Noisy-channel measurement plan: ``num_data_points`` distinct
+    # rollout-sampled args × ``reps_per_point`` reruns each. When
+    # ``measure_latency`` is off we collapse to a single run (deterministic
+    # channels are all we'd be measuring; reps and extra points are wasted
+    # compute). When the eval_samples bank is smaller than ``num_data_points``
+    # we cap to whatever's available.
+    n_points = max(int(getattr(config, "num_data_points", 1)), 1)
+    reps = max(int(getattr(config, "reps_per_point", 1)), 1)
+    if not config.measure_latency:
+        n_points = 1
+        reps = 1
+    if eval_samples:
+        bank_size = int(eval_samples[0].shape[0])
+        n_points = min(n_points, max(bank_size, 1))
+    # Per-point dispatch (global measurement queue): when point_idx >= 0,
+    # this call measures EXACTLY ONE data point (R reps) instead of the
+    # full n_points sweep. The driver fans 16 envs × n_points such calls
+    # across the actor pool (ray.util.ActorPool) so an env's points run
+    # in parallel and gated/cheap tasks free workers for stragglers —
+    # full core utilisation. The driver then P60-aggregates each env's
+    # per-point reward vectors. See ppo_ray_worker._fan_out_terminal_queue.
+    if point_idx >= 0 and eval_samples:
+        _pi = point_idx if point_idx < int(eval_samples[0].shape[0]) else 0
+        _point_iter = [_pi]
+        n_samples = reps
+    else:
+        _point_iter = list(range(n_points))
+        n_samples = n_points * reps
 
     # Match the monitor to whichever device the compiled JIT actually runs
     # on. Without --exec-on-gpu the args arrive as CpuDevice JAX arrays
@@ -1305,60 +1503,125 @@ def _callback(
     latency_samples: list[float] = []
     peak_mem_samples: list[float] = []
 
-    for i in range(n_samples):
+    # Iteration order: data-point outer, rep inner. Same compiled fn
+    # invoked `reps` times on each of `n_points` distinct args sets.
+    #
+    # Two DISTINCT sample populations come out of this loop:
+    #   * latency_ns / peak_memory  — one entry per (data-point, rep),
+    #     i.e. ``n_points * reps`` noisy timing/memory samples. Reps
+    #     exist to denoise these.
+    #   * quality (cosine_sim / frob_residual) — the Jacobian VALUES are
+    #     deterministic given a data point, so reps would only duplicate
+    #     identical (approx, exact) pairs. We therefore collect the
+    #     quality pair ONCE per data point (first rep). This keeps the
+    #     expensive exact-Jacobian execution + ~600 MB flatten/compare
+    #     at ``n_points`` invocations instead of ``n_points * reps`` —
+    #     the difference between a 5× and a 20× quality cost at the
+    #     default 5×4 design.
+    # Deterministic channels (muls_adds_fmas, max_io_sum, flops,
+    # bytes_accessed) were already computed once above.
+    #
+    # Slow-order cutoff (see EnvConfig.slow_exec_cutoff_seconds): if any
+    # single approx exec exceeds the cutoff, the elimination order is
+    # pathologically expensive — keep the samples gathered so far and
+    # stop, instead of repeating a 40s exec 20×.
+    import time as _measure_time
+    _slow_cutoff = float(getattr(config, "slow_exec_cutoff_seconds", 0.0) or 0.0)
+    _budget_hit = False
+    for d in _point_iter:
+        if _budget_hit:
+            break
         if eval_samples:
-            eval_args_i = [arg[i] for arg in eval_samples]
+            eval_args_i = [arg[d] for arg in eval_samples]
         else:
             eval_args_i = list(args)
         if callback_device is not None:
-            eval_args_i = [jax.device_put(d, callback_device) for d in eval_args_i]
-
-        # ResourceMonitor already runs ``jax.effects_barrier()`` in
-        # ``__enter__`` / ``__exit__``, so we don't need an extra
-        # ``block_until_ready`` on the result — the barriers drain the
-        # device queue both for the timer and the memory tracker.
-        #
-        # ``ALPHAGRAD_BYPASS_RESOURCE_MONITOR=1`` skips the construction +
-        # context manager entirely (vs. the lighter
-        # ``ALPHAGRAD_DISABLE_RESOURCE_MONITOR`` which only swapped the
-        # class to a no-op). This is the strongest cut available short
-        # of patching the import: no monitor object is created, no
-        # ``__enter__`` / ``__exit__`` runs, no ``stats`` dict is read.
-        # Used to isolate whether the per-call Python lifecycle around
-        # ``ResourceMonitor`` (not its C++ tracker) leaks. peak_memory +
-        # latency_ns are zero for the run.
-        if os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1":
-            out_approx = compiled_approx(*eval_args_i)
-            latency_samples.append(0.0)
-            peak_mem_samples.append(0.0)
-        else:
-            with ResourceMonitor(devices=unique_devices) as monitor:
+            eval_args_i = [jax.device_put(x, callback_device) for x in eval_args_i]
+        for r in range(reps):
+            if _budget_hit:
+                break
+            # ResourceMonitor already runs ``jax.effects_barrier()`` in
+            # ``__enter__`` / ``__exit__``, so we don't need an extra
+            # ``block_until_ready`` on the result — the barriers drain the
+            # device queue both for the timer and the memory tracker.
+            #
+            # ``ALPHAGRAD_BYPASS_RESOURCE_MONITOR=1`` skips the construction +
+            # context manager entirely (vs. the lighter
+            # ``ALPHAGRAD_DISABLE_RESOURCE_MONITOR`` which only swapped the
+            # class to a no-op). This is the strongest cut available short
+            # of patching the import: no monitor object is created, no
+            # ``__enter__`` / ``__exit__`` runs, no ``stats`` dict is read.
+            # Used to isolate whether the per-call Python lifecycle around
+            # ``ResourceMonitor`` (not its C++ tracker) leaks. peak_memory +
+            # latency_ns are zero for the run.
+            _exec_wall0 = _measure_time.time()
+            if os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1":
                 out_approx = compiled_approx(*eval_args_i)
-            # Key by name instead of unpacking ``.values()`` so this
-            # stays robust to dict-order / API tweaks in
-            # jax_memory_monitor.
-            latency_s = float(monitor.stats.get("time", 0.0))
-            peak_bytes = float(monitor.stats.get("memory", 0.0))
-            latency_samples.append(latency_s * 1e9)  # → ns
-            peak_mem_samples.append(peak_bytes)
+                jax.block_until_ready(out_approx)
+                latency_samples.append(0.0)
+                peak_mem_samples.append(0.0)
+            else:
+                with ResourceMonitor(devices=unique_devices) as monitor:
+                    out_approx = compiled_approx(*eval_args_i)
+                # Key by name instead of unpacking ``.values()`` so this
+                # stays robust to dict-order / API tweaks in
+                # jax_memory_monitor.
+                latency_s = float(monitor.stats.get("time", 0.0))
+                peak_bytes = float(monitor.stats.get("memory", 0.0))
+                latency_samples.append(latency_s * 1e9)  # → ns
+                peak_mem_samples.append(peak_bytes)
+            # Force the approx result so _exec_wall (the slow-order cutoff
+            # signal) reflects the full materialization, not just async
+            # dispatch. The monitor's effects_barrier covers most of this
+            # but the output array can still resolve lazily downstream.
+            jax.block_until_ready(out_approx)
+            _exec_wall = _measure_time.time() - _exec_wall0
 
-        out_approxs.append(out_approx)
-        # ``compiled_exact`` is only executed at the terminal step
-        # (see the ``is_terminal`` guard around its compile, above).
-        # For non-terminal steps we still loop n_samples times for
-        # ``compiled_approx`` (peak_memory + latency need it), but
-        # we skip the gold-standard execution that the quality
-        # comparison would otherwise consume.
-        if compiled_exact is not None:
-            out_exact = compiled_exact(*eval_args_i)
-            out_exacts.append(out_exact)
+            # Quality pair: collect once per data point (first rep only).
+            # ``compiled_exact`` is non-None only at the terminal step.
+            # Force-materialize the exact result HERE so its execution
+            # cost is attributed to this point's measurement (and to the
+            # quality phase intent) rather than leaking, lazily, into the
+            # NEXT iteration's ResourceMonitor barrier — which previously
+            # mis-attributed exact-compute time to the approx latency
+            # reading and hid it from the slow-order cutoff.
+            if compiled_exact is not None and r == 0:
+                out_approxs.append(out_approx)
+                _oe = compiled_exact(*eval_args_i)
+                jax.block_until_ready(_oe)
+                out_exacts.append(_oe)
 
+            # Slow-order cutoff: if this single exec exceeded the cutoff,
+            # the order is pathologically expensive — one sample is
+            # enough to know it's slow. Keep what we have and stop.
+            # ResourceMonitor (or block_until_ready on the bypass path)
+            # already forced device completion, so _exec_wall is real.
+            if _slow_cutoff > 0.0 and _exec_wall > _slow_cutoff:
+                _budget_hit = True
+                if _dbg_t:
+                    print(
+                        f"[DBG-env] slow-order cutoff at d={d + 1}/{n_points} "
+                        f"r={r + 1}/{reps}: exec={_exec_wall:.1f}s > "
+                        f"{_slow_cutoff:.0f}s — capping samples",
+                        flush=True,
+                    )
+                break
+
+    # Noisy-channel aggregation: P-``percentile_keep`` over the full
+    # pool of ``n_points * reps`` measurements (default P60 of 20).
+    # Replaces the legacy top-quartile-mean (latency) and max
+    # (peak_memory). Higher percentile → more conservative / worse-case
+    # estimate. See EnvConfig.percentile_keep.
+    if _dbg_t:
+        print(f"[DBG-env] exec_loop(n={n_samples})={_time.time()-_t0:.1f}s", flush=True)
+        _t0 = _time.time()
+    pk = float(getattr(config, "percentile_keep", 0.60))
     latency_ns = (
-        float(_aggregate_samples(latency_samples, want_top_quartile=True))
+        _percentile_pool(latency_samples, pk)
         if config.measure_latency
         else 0.0
     )
-    peak_memory = float(max(peak_mem_samples)) if peak_mem_samples else 0.0
+    peak_memory = _percentile_pool(peak_mem_samples, pk)
 
     # ------------------------------------------------------------------
     # Quality family — cosine similarity + relative Frobenius residual.
@@ -1373,17 +1636,58 @@ def _callback(
     if is_terminal and out_exacts:
         cosines: list = []
         frobs: list = []
+        _t_approx = _t_exact = _t_metric = 0.0
         for out_approx, out_exact in zip(out_approxs, out_exacts):
             jac_approx = out_approx[1] if config.has_aux else out_approx
             jac_exact = out_exact[1] if config.has_aux else out_exact
+            if _dbg_t:
+                _tt = _time.time()
+                jax.block_until_ready(jac_approx); _t_approx += _time.time() - _tt
+                _tt = _time.time()
+                jax.block_until_ready(jac_exact); _t_exact += _time.time() - _tt
+                _tt = _time.time()
             cos, rel_frob = _quality_metrics(jac_exact, jac_approx)
+            if _dbg_t:
+                jax.block_until_ready((cos, rel_frob)); _t_metric += _time.time() - _tt
             cosines.append(cos)
             frobs.append(rel_frob)
-        cosine_sim = float(_aggregate_samples(cosines, want_top_quartile=True))
-        frob_residual = float(_aggregate_samples(frobs, want_top_quartile=True))
+        if _dbg_t:
+            print(f"[DBG-env] quality_split approx_block={_t_approx:.1f}s exact_block={_t_exact:.1f}s metric={_t_metric:.1f}s npairs={len(out_exacts)}", flush=True)
+        # cosine_sim is "measure but don't reward" per the current
+        # scalarization design — kept for diagnostic logging, weight
+        # stays 0 in build_reward_weights for --rewards cmp/mem. Use
+        # the same P-`percentile_keep` aggregation as the cost channels
+        # for consistency; flip direction below.
+        # frob_residual: P60 = worst-60% of the pool (higher = worse).
+        cosine_sim = _percentile_pool(cosines, pk)
+        frob_residual = _percentile_pool(frobs, pk)
     else:
         cosine_sim = 0.0
         frob_residual = 0.0
+    if _dbg_t and is_terminal:
+        print(f"[DBG-env] quality={_time.time()-_t0:.1f}s", flush=True)
+
+    # Raw-measurement sink: when a caller passes ``raw_sink={}`` it gets the
+    # per-sample/per-point distributions (the "10x8" the sampler records)
+    # instead of only the percentile-aggregated reward vector. Deterministic
+    # channels are scalars; latency/peak are per-rep sample lists; cosine/frob
+    # are per-point lists (terminal only). The ternary guards mean cosines/
+    # frobs are only referenced when they were actually computed.
+    if raw_sink is not None:
+        raw_sink["muls_adds_fmas"] = float(muls_adds_fmas)
+        raw_sink["max_io_sum"] = float(max_io_sum)
+        raw_sink["flops"] = float(flops)
+        raw_sink["bytes_accessed"] = float(bytes_accessed)
+        raw_sink["latency_ns_samples"] = (
+            [float(x) for x in latency_samples] if config.measure_latency else []
+        )
+        raw_sink["peak_memory_samples"] = [float(x) for x in peak_mem_samples]
+        raw_sink["cosine_sim_per_point"] = (
+            [float(x) for x in cosines] if (is_terminal and out_exacts) else []
+        )
+        raw_sink["frob_residual_per_point"] = (
+            [float(x) for x in frobs] if (is_terminal and out_exacts) else []
+        )
 
     rewards = jnp.array(
         [
@@ -1492,6 +1796,12 @@ class VertexEliminationEnv:
         mem_type: str = "peak_memory",
         exec_on_gpu: bool = False,
         measure_latency: bool = False,
+        latency_samples: int = 1,
+        num_data_points: int = 5,
+        reps_per_point: int = 4,
+        percentile_keep: float = 0.60,
+        slow_exec_cutoff_seconds: float = 15.0,
+        flop_gate_threshold: float = 0.0,
         terminal_rewards_only: bool = False,
     ):
         assert (argnums is None and args is None) or not (args is None or args is None)
@@ -1508,6 +1818,12 @@ class VertexEliminationEnv:
             data_gen=data_gen,
             exec_on_gpu=exec_on_gpu,
             measure_latency=measure_latency,
+            latency_samples=latency_samples,
+            num_data_points=num_data_points,
+            reps_per_point=reps_per_point,
+            percentile_keep=percentile_keep,
+            slow_exec_cutoff_seconds=slow_exec_cutoff_seconds,
+            flop_gate_threshold=flop_gate_threshold,
             terminal_rewards_only=terminal_rewards_only,
         )
         return cls(

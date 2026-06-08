@@ -33,6 +33,51 @@ import numpy as np
 import ray
 
 
+@ray.remote(num_cpus=0)
+class _CoreAllocator:
+    """Cluster-wide, per-node disjoint CPU-core dispenser.
+
+    With multiple PPO jobs sharing one Ray cluster (the 2-node
+    pooled-measurement setup), each job's CpuApproximationActors would
+    otherwise independently compute the SAME affinity slice
+    (actor_id 0 → cores 0..k) and collide — N-fold oversubscription, the
+    exact pathology the affinity pinning exists to prevent. This named
+    actor (lifetime=detached, one per cluster) tracks how many cores are
+    already claimed PER NODE and hands the next disjoint slice to whoever
+    asks — independent of which job the requester belongs to. Robust to
+    any number of concurrent jobs/actors.
+    """
+
+    def __init__(self):
+        self._claimed: dict[str, int] = {}  # node_id -> next free core index
+
+    def claim(self, node_id: str, ncores_total: int, n: int) -> list[int]:
+        """Claim ``n`` consecutive core indices on ``node_id``. Wraps
+        modulo ``ncores_total`` if the node is over-subscribed (more
+        actors than cores/n) — degrades to sharing rather than erroring."""
+        start = self._claimed.get(node_id, 0)
+        cores = [(start + k) % ncores_total for k in range(n)]
+        self._claimed[node_id] = (start + n) % ncores_total
+        return cores
+
+    def reset(self) -> None:
+        self._claimed.clear()
+
+
+def _get_core_allocator():
+    """Fetch-or-create the cluster's core allocator named actor."""
+    try:
+        return ray.get_actor("dsnn_core_allocator")
+    except Exception:
+        try:
+            return _CoreAllocator.options(
+                name="dsnn_core_allocator", lifetime="detached",
+                get_if_exists=True,
+            ).remote()
+        except Exception:
+            return None
+
+
 @ray.remote
 class CpuApproximationActor:
     """Owns one `CpuApproximationServer` per Ray actor.
@@ -54,15 +99,68 @@ class CpuApproximationActor:
         actor_id: int = 0,
         seed: int = 0,
     ):
+        self._actor_id = int(actor_id)
+
+        # CPU-affinity pinning to a disjoint core SLICE per actor. The
+        # approx-Jacobian exec scales ~linearly with cores, so each actor
+        # needs MANY cores — but N actors each defaulting to all 64 cores
+        # oversubscribe catastrophically (~48s/exec vs 0.45s). Pinning
+        # each actor to ``cores // n_workers`` disjoint cores *before* the
+        # jax import sizes its Eigen pool to that slice: multi-core execs,
+        # no cross-actor oversubscription, full utilisation. Profiled
+        # 2026-06-06. (Setting affinity before the deferred jax import is
+        # what makes XLA size the pool to the slice rather than all cores.)
+        # Best-effort: skipped on platforms without sched_setaffinity.
+        try:
+            import os as _os
+            n_workers = max(int(args_dict.get("num_cpu_workers", 1) or 1), 1)
+            avail = sorted(_os.sched_getaffinity(0))
+            ncores = len(avail)
+            reserved = int(args_dict.get("reserved_driver_cores", 0) or 0)
+            reserved = max(0, min(reserved, ncores - n_workers))
+            pool = avail[reserved:] if reserved < ncores else avail
+            npool = len(pool)
+            per = max(1, npool // n_workers)
+            # Disjoint slice. When multiple jobs share the cluster
+            # (--cpu-cores-shared), claim from the per-node allocator so
+            # the 4 jobs' actors don't collide on the same cores. Else
+            # use the single-job static slice (actor_id * per).
+            base = (self._actor_id * per) % npool
+            if args_dict.get("cpu_cores_shared", False):
+                try:
+                    import socket
+                    node_id = socket.gethostname()
+                    alloc = _get_core_allocator()
+                    if alloc is not None:
+                        base = int(
+                            ray.get(alloc.claim.remote(node_id, npool, per))[0]
+                        )
+                except Exception:
+                    pass  # fall back to the static base
+            if 0 < per < ncores:
+                cores = {pool[(base + k) % npool] for k in range(per)}
+                _os.sched_setaffinity(0, cores)
+        except (AttributeError, OSError, ValueError):
+            pass
+
         # Deferred import — keeps the driver process JAX-free until a
         # worker actor actually starts. Mirrors the
         # `mu0_ray_actors.SPMDActor` pattern.
         from alphagrad.approx.cpu_approx_worker import CpuApproximationServer
 
-        self._actor_id = int(actor_id)
         self._impl = CpuApproximationServer.from_args_dict(
             args_dict, variant=variant, seed=seed,
         )
+        # Node/GPU tracking: log where this measurement actor landed.
+        try:
+            import socket as _sock, os as _os2, jax as _jax
+            print(
+                f"[measure-actor {self._actor_id}] host={_sock.gethostname()} "
+                f"CUDA_VISIBLE_DEVICES={_os2.environ.get('CUDA_VISIBLE_DEVICES', '')} "
+                f"jax_devices={_jax.devices()}", flush=True,
+            )
+        except Exception:
+            pass
 
     def evaluate(
         self,
@@ -71,10 +169,11 @@ class CpuApproximationActor:
         step: int,
         eval_samples: Sequence | None = None,
         init: bool = False,
+        point_idx: int = -1,
     ):
         return self._impl.evaluate(
             order, sparsity_specs, step,
-            eval_samples=eval_samples, init=init,
+            eval_samples=eval_samples, init=init, point_idx=point_idx,
         )
 
     def evaluate_batch(self, batch: Sequence[tuple]):
@@ -88,6 +187,15 @@ class CpuApproximationActor:
 
     def ready(self) -> bool:
         return self._impl.ready()
+
+    def set_cost_mode_full(self) -> bool:
+        """Phase-2 cutover: swap target_fun=None → target_fun=target_fn
+        so subsequent ``evaluate`` calls run the full cost-channel path
+        (XLA cost_analysis + ResourceMonitor + compiled_exact at terminal).
+
+        Idempotent. See CpuApproximationServer.set_cost_mode_full for
+        implementation details — this is the Ray-remote wrapper."""
+        return bool(self._impl.set_cost_mode_full())
 
     def compile_approximations(self) -> dict:
         """Pool warm-up handshake.

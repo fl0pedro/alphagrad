@@ -360,7 +360,9 @@ class PPORayWorker:
         )
         closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
         argnums = infer_argnums(self.args.example)
-        env_target_fun = target_fn if "acc" in self.args.rewards else None
+        # Always pass target_fun so flops/bytes_accessed/latency_ns/peak_memory
+        # populate every step (see cpu_approx_worker.py for the full rationale).
+        env_target_fun = target_fn
         measure_latency = bool(
             getattr(self.args, "measure_latency", False)
             or self.args.cmp_type == "latency"
@@ -376,12 +378,28 @@ class PPORayWorker:
             mem_type=self.args.mem_type,
             exec_on_gpu=getattr(self.args, "exec_on_gpu", False),
             measure_latency=measure_latency,
-            terminal_rewards_only=getattr(
-                self.args, "terminal_rewards_only", False,
+            latency_samples=int(getattr(self.args, "latency_samples", 1)),
+            num_data_points=int(getattr(self.args, "num_data_points", 5)),
+            reps_per_point=int(getattr(self.args, "reps_per_point", 4)),
+            percentile_keep=float(getattr(self.args, "percentile_keep", 0.60)),
+            slow_exec_cutoff_seconds=float(
+                getattr(self.args, "slow_exec_cutoff_seconds", 15.0)
             ),
+            flop_gate_threshold=float(
+                getattr(self.args, "flop_gate_threshold", 0.0)
+            ),
+            terminal_rewards_only=not bool(getattr(
+                self.args, "intermediate_rewards", False,
+            )),
         )
+        # Per-rollout resampling stores the bank size here so we can
+        # refresh the same way each episode (see run_rollout_and_train).
+        self._eval_sample_count = int(getattr(
+            self.args, "num_data_points",
+            int(self.args.num_eval_samples),
+        ))
         eval_samples = generate_eval_samples(
-            env, eval_key, int(self.args.num_eval_samples),
+            env, eval_key, self._eval_sample_count,
         )
         self.env = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
 
@@ -427,15 +445,99 @@ class PPORayWorker:
         else:
             self.num_envs = max(requested_envs, self.num_devices)
         self.minibatches = max(int(getattr(self.args, "minibatches", 1)), 1)
+        self.ppo_epochs = max(int(getattr(self.args, "ppo_epochs", 4)), 1)
         self.ppo_eps = float(getattr(self.args, "ppo_eps", 0.2))
         self.value_coef = float(getattr(self.args, "value_coef", 0.5))
-        self.entropy_coef = float(getattr(self.args, "entropy_coef", 0.01))
+        self.entropy_coef_init = float(getattr(self.args, "entropy_coef", 0.05))
+        self.entropy_coef_final = float(getattr(self.args, "entropy_coef_final", 0.001))
+        self.entropy_coef = self.entropy_coef_init
+        # Option-A scalarization: per-channel reward EMA in **symlog
+        # space** (K-vectors). Each reward channel is first compressed
+        # via symlog (crushes the ~13-decade gap between flops ~1e13
+        # and frob ~1), then divided by its per-channel running σ to
+        # bring channels to comparable scale before the priority-
+        # weighted sum. The priority-weighted sum is then averaged
+        # across active channels so the scalar target stays O(1)
+        # regardless of how many channels are active. Dreamer-V3
+        # pattern; σ-only divide preserves symlog(0)=0 so masked
+        # entries stay 0. Decay comes from --value-norm-decay (0.99).
+        self._ret_norm_decay = float(getattr(self.args, "value_norm_decay", 0.99))
+        self._reward_mean = np.zeros(NUM_REWARDS, dtype=np.float32)
+        self._reward_var = np.ones(NUM_REWARDS, dtype=np.float32)
         self.gae_lambda = float(getattr(self.args, "gae_lambda", 0.95))
         self.discount = float(getattr(self.args, "discount", 0.99))
         self.reward_weights_np = _build_reward_weights(self.args)
         self.reward_weights = jnp.asarray(
             self.reward_weights_np, dtype=jnp.float32,
         )
+
+        # RQ8 / Pitch A — reward pipeline. When --reward-pipeline pca2,
+        # the 6 cost channels (indices 0-5) get z-scored + PCA-2
+        # compressed into 2 latents inline, replacing buf_reward_vec
+        # contents at indices 0-1 with the latents and zeroing indices
+        # 2-5. The lambdas for the 6 cost channels are re-derived so
+        # only indices 0, 1 (the latents) carry non-zero weight; the
+        # weight of the original primary-cost channel (whichever
+        # --cmp-type pointed to) is summed onto index 0 and the
+        # original primary-mem onto index 1, so the scalar reward
+        # magnitude stays comparable to the legacy pipeline.
+        self.reward_pipeline = str(
+            getattr(self.args, "reward_pipeline", "legacy")
+        )
+        self._pca2_state = None
+        if self.reward_pipeline == "pca2":
+            from alphagrad.approx.common.reward_pca import PCA2State
+
+            self._pca2_state = PCA2State.create(
+                num_cost_channels=6,
+                refit_every=int(getattr(self.args, "pca_refit_every", 100)),
+                warmup_episodes=int(
+                    getattr(self.args, "pca_warmup_episodes", 50)
+                ),
+            )
+            # Reroute cost-channel weight onto the two PCA latents.
+            # Sum the existing cost-channel weights so the latent-sum
+            # scalar reward stays on the original cost magnitude
+            # baseline; clear indices 2-5 to avoid double-counting.
+            cost_w_sum = float(np.sum(self.reward_weights_np[:6]))
+            if cost_w_sum == 0.0:
+                cost_w_sum = 1.0  # fall back to unit weight on each latent
+            self.reward_weights_np = self.reward_weights_np.copy()
+            # Half the cost weight goes on each latent (sum stays
+            # invariant; latents are unit-variance after whitening so
+            # this means each contributes roughly 50/50 by magnitude).
+            self.reward_weights_np[0] = 0.5 * cost_w_sum
+            self.reward_weights_np[1] = 0.5 * cost_w_sum
+            self.reward_weights_np[2:6] = 0.0
+            self.reward_weights = jnp.asarray(
+                self.reward_weights_np, dtype=jnp.float32,
+            )
+
+        # RQ8 / Pitch A bonus — telescoping max-over-vertices reduction
+        # for channels like peak_memory / max_io_sum that are
+        # conceptually "rollout-wide max" rather than additive cost
+        # streams. ``--running-max-channels peak_memory,max_io_sum``
+        # converts those channels' per-step values to telescoping
+        # increments (cumsum == rollout-wide max) BEFORE GAE — keeps
+        # GAE's additivity assumption intact while making the
+        # per-channel sum equal the true rollout peak.
+        self._running_max_indices: list[int] = []
+        running_max_spec = str(
+            getattr(self.args, "running_max_channels", "") or ""
+        )
+        if running_max_spec:
+            from alphagrad.approx.env import REWARD_INDEX
+            for name in running_max_spec.split(","):
+                name = name.strip()
+                if not name:
+                    continue
+                if name not in REWARD_INDEX:
+                    print(
+                        f"[ppo_ray] --running-max-channels: unknown "
+                        f"channel {name!r}; ignoring"
+                    )
+                    continue
+                self._running_max_indices.append(int(REWARD_INDEX[name]))
 
         # Advantage-normalisation strategy. ``gdpo`` activates the
         # per-channel z-score → priority-weighted sum → batch-norm
@@ -497,9 +599,22 @@ class PPORayWorker:
         # update with simple dual-ascent steps after each episode — no
         # need to keep them on the device. Empty config = no constraints
         # (the violation path becomes a no-op).
-        constraint_specs = _parse_lagrangian_constraints(
-            getattr(self.args, "lagrangian_constraint", []) or []
+        # ``--anti-degeneracy`` is desugared here so the corridor bounds
+        # used by ``corridor/*_band_fraction`` instrumentation match the
+        # constraints the trainer enforces (single source of truth).
+        from alphagrad.approx.common.anti_degeneracy import (
+            desugar_anti_degeneracy,
         )
+        constraint_strs, self._corridor_low, self._corridor_high = (
+            desugar_anti_degeneracy(
+                list(getattr(self.args, "lagrangian_constraint", []) or []),
+                getattr(self.args, "anti_degeneracy", "none"),
+                float(getattr(self.args, "anti_degeneracy_delta", 0.01)),
+                float(getattr(self.args, "cosine_lower_bound", 0.8)),
+                float(getattr(self.args, "cosine_upper_bound", 0.9)),
+            )
+        )
+        constraint_specs = _parse_lagrangian_constraints(constraint_strs)
         if constraint_specs:
             self.constraint_indices_np = np.array(
                 [c[0] for c in constraint_specs], dtype=np.int32,
@@ -632,7 +747,7 @@ class PPORayWorker:
 
         schedule = optax.cosine_decay_schedule(
             float(self.args.lr),
-            int(self.args.episodes) * self.minibatches,
+            int(self.args.episodes) * self.minibatches * self.ppo_epochs,
             float(getattr(self.args, "lr_decay_min_mult", 0.1)),
         )
         self.optimizer = optax.chain(
@@ -663,6 +778,19 @@ class PPORayWorker:
         )
 
         self._episode_counter = 0
+
+        # 2-phase cost pipeline state. ``always_full`` is the default
+        # (legacy behaviour, all channels every step). ``cheap_first``
+        # starts with the cheap path (target_fun=None, no JIT-exec) and
+        # swaps to the full path at the configured cutover. Wandb event
+        # ``phase/cutover_ep`` records when the swap fires.
+        self._cost_schedule = str(getattr(
+            self.args, "cost_pipeline_schedule", "always_full",
+        ))
+        self._cost_phase_full = (self._cost_schedule == "always_full")
+        self._cost_cutover_ep = int(getattr(
+            self.args, "phase_cutover_ep", 0,
+        ))
 
         # Trainer-side leak profile (mirror of the per-actor profiler in
         # cpu_approx_worker). Lets the user diff trainer-process RSS
@@ -900,7 +1028,6 @@ class PPORayWorker:
     def _make_update_step(self):
         clip_eps = self.ppo_eps
         value_coef = self.value_coef
-        entropy_coef = self.entropy_coef
         dynamic = self.dynamic_substeps
         # Mode-aware capture so the closure switches on the right path
         # without recompiling per call.
@@ -920,13 +1047,10 @@ class PPORayWorker:
         # is a cheap re-import.
         from alphagrad.approx.common.gae import gdpo_normalise_advantages
 
-        def loss_fn(agent, batch, op_mask, factor_mask, quant_mask, key):
-            """``op_mask`` / ``factor_mask`` / ``quant_mask`` are the
-            curriculum masks for the CURRENT stage. They must match
-            the masks used at rollout time (in ``act_step``) —
-            otherwise the PPO log-prob ratio is computed against a
-            different distribution from the one that produced the
-            samples, breaking the on-policy assumption."""
+        def loss_fn(
+            agent, batch, op_mask, factor_mask, quant_mask,
+            key, entropy_coef,
+        ):
             (
                 tokens, actions, op_a, i_a, j_a, f_a, q_a,
                 vertex_idx_for_mask,
@@ -1026,12 +1150,19 @@ class PPORayWorker:
                     value_loss = jnp.sum(
                         per_channel_se / (normaliser ** 2) * channel_mask_j
                     ) / active_count
+                    pred_scalar = jnp.sum(value * priority_weights_j)
+                    target_scalar = jnp.sum(ret * priority_weights_j)
                 else:
-                    value_scalar = jnp.sum(value * priority_weights_j)
-                    value_loss = (value_scalar - symlog(ret)) ** 2
-                return policy_loss, value_loss, entropy, per_head
+                    # Option-A: rewards are already symlog'd + per-
+                    # channel σ-normalized upstream, so the priority-
+                    # weighted scalar `ret` is the target directly —
+                    # no further standardization.
+                    pred_scalar = jnp.sum(value * priority_weights_j)
+                    target_scalar = ret
+                    value_loss = (pred_scalar - target_scalar) ** 2
+                return policy_loss, value_loss, entropy, per_head, pred_scalar, target_scalar
 
-            p_l, v_l, ent, per_head_ent = jax.vmap(per_sample)(
+            p_l, v_l, ent, per_head_ent, v_pred, v_target = jax.vmap(per_sample)(
                 tokens, actions, op_a, i_a, j_a, f_a, q_a,
                 vertex_idx_for_mask,
                 old_log_probs, returns, adv_scalar, keys,
@@ -1040,6 +1171,16 @@ class PPORayWorker:
             value_loss = jnp.mean(v_l)
             entropy_loss = -jnp.mean(ent)
             total = ppo_loss + value_coef * value_loss + entropy_coef * entropy_loss
+            # explained_variance = 1 - Var(target - pred) / Var(target). Near 0
+            # means the value head is just predicting the mean; near 1 means it
+            # captures per-state structure. Falls back to 0 when targets are
+            # constant (e.g. terminal-only rewards + tiny symlog'd spread).
+            var_target = jnp.var(v_target)
+            explained_var = jnp.where(
+                var_target > 1e-12,
+                1.0 - jnp.var(v_target - v_pred) / (var_target + 1e-12),
+                0.0,
+            )
             # Per-head entropy means: useful for diagnosing which
             # categorical head is collapsing (vertex / op_type / i /
             # j / factor / quant). Mean over the batch axis.
@@ -1047,6 +1188,7 @@ class PPORayWorker:
             aux = {
                 "ppo_loss": ppo_loss,
                 "value_loss": value_loss,
+                "explained_variance": explained_var,
                 "entropy": jnp.mean(ent),
                 "entropy/vertex": head_means[0],
                 "entropy/op_type": head_means[1],
@@ -1061,10 +1203,14 @@ class PPORayWorker:
         grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=True)
 
         @eqx.filter_jit
-        def update_step(agent, opt_state, batch,
-                        op_mask, factor_mask, quant_mask, key):
+        def update_step(
+            agent, opt_state, batch,
+            op_mask, factor_mask, quant_mask, key,
+            entropy_coef,
+        ):
             (loss, aux), grads = grad_fn(
                 agent, batch, op_mask, factor_mask, quant_mask, key,
+                entropy_coef,
             )
             # NaN-skip guard: if loss is non-finite (sentinel
             # poisoning, cold-cache compile-error fallback, etc.),
@@ -1108,11 +1254,33 @@ class PPORayWorker:
             self._assemble = self._make_assemble_fn()
             self._update_step = self._make_update_step()
 
+        # Coarse per-phase profiling (gated on ALPHAGRAD_DBG_TIMING). Each
+        # phase accumulator is printed at the end of the episode so we can
+        # see where the per-ep wall-clock actually goes: rollout act_step
+        # (GPU policy) vs fan_out_tokenize (Ray → CPU actors, incl. the
+        # terminal measurement) vs GAE vs the PPO update.
+        import time as _pt
+        _prof = os.environ.get("ALPHAGRAD_DBG_TIMING", "0") == "1"
+        _ph = {
+            "reset": 0.0, "act_step": 0.0, "fan_out": 0.0,
+            "fan_out_terminal": 0.0, "assemble": 0.0,
+            "bootstrap_gae": 0.0, "update": 0.0, "stats": 0.0,
+        }
+        _ep_t0 = _pt.time()
+
         key = jrand.PRNGKey(int(rng_seed))
-        key, reset_key = jrand.split(key)
+        key, reset_key, sample_key = jrand.split(key, 3)
+
+        # Per-rollout eval-sample refresh — DISABLED to isolate hang in
+        # first run_rollout_and_train call. The init-time eval_samples
+        # bank is reused across all episodes (matches RQ1 behaviour).
+        # TODO: re-enable once we understand the hang interaction with
+        # data_gen + Ray actors + JAX vmap.
+        _ = sample_key  # silence unused warning
 
         # Fresh on-policy episode: reset state for every env. Preserve
         # the sharded layout (data-parallel along the env axis).
+        _t = _pt.time()
         env_states = jax.vmap(lambda _: self.env.reset())(
             jnp.arange(self.num_envs),
         )
@@ -1121,6 +1289,9 @@ class PPORayWorker:
             if eqx.is_array(x) else x,
             env_states,
         )
+        if _prof:
+            jax.block_until_ready(self.env_states.tokens)
+            _ph["reset"] += _pt.time() - _t
 
         # Rollout buffers — numpy is fine; we re-stage to JAX once for
         # the update step.
@@ -1164,6 +1335,7 @@ class PPORayWorker:
         state = self.env_states
         for t in range(T):
             key, sub = jrand.split(key)
+            _t = _pt.time()
             avail = self._vertex_avail(state)
             (
                 actions, op_a, i_a, j_a, f_a, q_a,
@@ -1179,10 +1351,33 @@ class PPORayWorker:
             order_np = np.asarray(order)
             specs_np = np.asarray(specs)
             step_np = np.asarray(step)
+            if _prof:
+                _ph["act_step"] += _pt.time() - _t
+                _t = _pt.time()
 
-            tokens_np, eqn_ids_np, reward_np, sentinel_mask = (
-                self._fan_out_tokenize(order_np, specs_np, step_np)
-            )
+            # Terminal step + --measure-queue: use the global per-point
+            # measurement queue (full core utilisation). Non-terminal
+            # steps stay on the cheap tokenize-only batch path.
+            if (
+                t == T - 1
+                and getattr(self.args, "measure_queue", False)
+                and not bool(getattr(self.args, "intermediate_rewards", False))
+            ):
+                tokens_np, eqn_ids_np, reward_np, sentinel_mask = (
+                    self._fan_out_terminal_queue(order_np, specs_np, step_np)
+                )
+            else:
+                tokens_np, eqn_ids_np, reward_np, sentinel_mask = (
+                    self._fan_out_tokenize(order_np, specs_np, step_np)
+                )
+            if _prof:
+                _dt = _pt.time() - _t
+                # Last rollout step = terminal (the measurement burst).
+                if t == T - 1:
+                    _ph["fan_out_terminal"] += _dt
+                else:
+                    _ph["fan_out"] += _dt
+                _t = _pt.time()
             buf_sentinel[t] = sentinel_mask
 
             # Shard the Ray-returned numpy back to the env axis so the
@@ -1198,6 +1393,9 @@ class PPORayWorker:
                 jnp.asarray(reward_np, dtype=jnp.float32), self.data_sharding,
             )
             state = self._assemble(state, partial, tokens_j, eqn_ids_j, reward_j)
+            if _prof:
+                jax.block_until_ready(state.tokens)
+                _ph["assemble"] += _pt.time() - _t
 
             # Record. We store the *post-step* tokens so the next-step
             # policy gradient targets see the same obs the policy used.
@@ -1214,6 +1412,7 @@ class PPORayWorker:
             buf_reward_vec[t] = reward_np
             buf_dones[t] = np.asarray(state.terminated).astype(np.float32)
 
+        _t = _pt.time()
         # Bootstrap value at the final state (for the GAE next_value
         # term on the last timestep). The value head emits K=NUM_REWARDS
         # heads; the bootstrap is shape ``(N, NUM_REWARDS)``.
@@ -1225,220 +1424,55 @@ class PPORayWorker:
             jax.vmap(lambda s, k: self.agent.value(s.tokens, key=k))(state, boot_keys),
         )  # (N, NUM_REWARDS)
 
-        # Phase 3 (b): mask sentinel transitions. Zero the per-channel
-        # reward vector AND force dones=1 so GAE treats sentinel
-        # timesteps as terminal and the value head bootstraps cleanly
-        # at the next state. Per-channel zero (vs the legacy scalar
-        # zero-out) means the gdpo path also sees zero reward on
-        # those steps.
+        # Mask sentinel transitions (CPU pool timeouts).
         if buf_sentinel.any():
             buf_reward_vec = np.where(
                 buf_sentinel[..., None], 0.0, buf_reward_vec,
             )
             buf_dones = np.where(buf_sentinel, 1.0, buf_dones)
-            n_sentinels = int(buf_sentinel.sum())
-            print(
-                f"[ppo_ray] {n_sentinels}/{T*N} sentinel transitions "
-                f"this episode (CPU pool timeouts); zeroing rewards "
-                f"and forcing dones."
-            )
 
-        # Phase D: apply conditioned-reward gates. For each spec
-        # ``(easier, harder, op, threshold)``, zero the easier channel
-        # at any (t, n) where the harder channel doesn't satisfy
-        # ``op(harder, threshold)``. Threshold comparison happens in
-        # symlog space for cost channels (so the user can write
-        # ``flops>=1e9`` without thinking about the squashing) and in
-        # raw space for bounded channels (cosine_sim).
-        reward_condition_stats: dict = {}
-        if self._reward_conditions:
-            for easier_idx, harder_idx, op, thresh in self._reward_conditions:
-                harder_val = buf_reward_vec[..., harder_idx]  # (T, N)
-                if harder_idx in _NO_SYMLOG_REWARD_INDICES:
-                    h_compare = harder_val
-                    t_compare = np.float32(thresh)
-                else:
-                    h_compare = np.sign(harder_val) * np.log1p(np.abs(harder_val))
-                    t_compare = (
-                        np.sign(np.float32(thresh))
-                        * np.log1p(np.abs(np.float32(thresh)))
-                    )
-                if op == ">=":
-                    gate = (h_compare >= t_compare).astype(np.float32)
-                else:
-                    gate = (h_compare <= t_compare).astype(np.float32)
-                # Sparse-terminal harder channels carry signal only at
-                # the terminal step. Force the gate True on
-                # intermediate steps to avoid zeroing the easier
-                # channel everywhere when the policy hasn't reached
-                # the terminal step yet.
-                if harder_idx in self._sparse_terminal_idx_set:
-                    gate[:-1, :] = 1.0
-                # ``buf_reward_vec`` is the canonical reward buffer; we
-                # rebuild a writable copy because the sentinel path
-                # above may have produced a view.
-                buf_reward_vec = np.array(buf_reward_vec, copy=True)
-                buf_reward_vec[..., easier_idx] = (
-                    buf_reward_vec[..., easier_idx] * gate
-                )
-                gated_fraction = float(1.0 - gate.mean())
-                easier_name = REWARD_NAMES[easier_idx]
-                harder_name = REWARD_NAMES[harder_idx]
-                reward_condition_stats[
-                    f"reward_condition/{easier_name}_gated_fraction"
-                ] = gated_fraction
-                reward_condition_stats[
-                    f"reward_condition/{harder_name}_threshold_{op}"
-                ] = float(thresh)
-
-        # GAE over the rollout. Both modes use the same per-channel
-        # tensor contract — the difference is whether symlog squashing
-        # is applied inside GAE (scalar mode keeps it; gdpo mode drops
-        # it because the per-mb z-score handles magnitude). The
-        # factory caches the jit'd variant per mode.
-        if self._use_symlog_in_gae:
-            _gae = get_advantages  # legacy with symlog
-        else:
-            _gae = self._gae_no_symlog
-        # rewards_b shape: (N, T, K). dones / discounts broadcast over K.
-        rewards_b = jnp.asarray(np.transpose(buf_reward_vec, (1, 0, 2)))
-        dones_b = jnp.asarray(buf_dones.T)             # (N, T)
-        values_b = jnp.asarray(np.transpose(buf_values, (1, 0, 2)))  # (N, T, K)
+        # ----- per-channel reward normalization (Option-A layer 1) -----
+        # Two-stage Dreamer-V3 style: symlog crushes the per-channel
+        # dynamic range (~13 decades between flops and frob), then EMA-
+        # tracked σ in symlog space brings each channel to ~N(0, 1).
+        # STATIC scalarization: symlog only, NO dynamic per-channel σ-divide.
+        # The per-channel balancing is done by FIXED reward weights (static
+        # lambdas chosen offline from the sampler's channel scales so each
+        # rewarded channel contributes ~unit after symlog·λ) applied at the
+        # weighted-sum below — not by an EMA of the running variance. This
+        # replaces the old dynamic reweighting with a frozen, inspectable one.
+        rewards_b_raw = jnp.asarray(
+            np.transpose(buf_reward_vec, (1, 0, 2)),
+        )  # (N, T, K)
+        rewards_b_normalized = symlog(rewards_b_raw)
+        dones_b = jnp.asarray(buf_dones.T)
+        values_b = jnp.asarray(np.transpose(buf_values, (1, 0, 2)))
         next_values_b = jnp.concatenate(
             [values_b[:, 1:, :], jnp.asarray(bootstrap)[:, None, :]], axis=1,
-        )  # (N, T, K)
-        discounts_b = jnp.full_like(dones_b, self.discount)  # (N, T)
-        _episodic_return, returns_b, advantages_b = _gae(
-            rewards_b, dones_b, values_b, next_values_b, discounts_b,
-            self.gae_lambda,
         )
-        # returns_b / advantages_b shape: (N, T, K) in gdpo mode.
-        # In scalar mode we still ran per-channel GAE above; collapse
-        # to scalar via the priority-weighted dot product so the
-        # downstream legacy path (global z-score, scalar value loss)
-        # receives (N, T) tensors.
-        if self.advantage_norm == "scalar":
-            weights_j = self.reward_weights
-            returns_b = jnp.sum(returns_b * weights_j, axis=-1)      # (N, T)
-            advantages_b = jnp.sum(advantages_b * weights_j, axis=-1)  # (N, T)
+        discounts_b = jnp.full_like(dones_b, self.discount)
 
-        # Stage F Lagrangian: penalise the advantage by the per-step
-        # constraint violation, weighted by the current multipliers.
-        # The violation is `max(0, sign * (threshold - reward))` —
-        # zero when the constraint is satisfied. After applying the
-        # penalty we update each multiplier by gradient ascent on the
-        # mean violation (clamped >= 0). Empty-constraint case is a
-        # no-op (the gather has zero columns).
-        violation_stats: dict = {}
-        if self.constraint_indices_np.shape[0] > 0:
-            # Pull the constrained channels across the rollout buffer.
-            # (T, N, C) where C = #constraints. Reshape to match the (N, T)
-            # advantages layout used by GAE.
-            picked = buf_reward_vec[:, :, self.constraint_indices_np]  # (T, N, C)
-            picked = np.transpose(picked, (1, 0, 2))  # (N, T, C)
-            # Symlog cost-family channels so the multipliers don't have to
-            # bridge ~10⁹× channel-scale gaps; leave cosine_sim raw.
-            no_symlog = self.constraint_no_symlog_np[None, None, :]  # (1,1,C)
-            picked_sl = np.where(
-                no_symlog, picked, np.sign(picked) * np.log1p(np.abs(picked)),
-            )
-            thresh_sl = np.where(
-                self.constraint_no_symlog_np,
-                self.constraint_thresholds_np,
-                np.sign(self.constraint_thresholds_np)
-                * np.log1p(np.abs(self.constraint_thresholds_np)),
-            )  # (C,)
-            # Per-constraint normalisation so the same `lagrangian_lr`
-            # works for both `cosine_sim>=0.5` (small magnitudes) and
-            # `peak_memory<=1e8` (symlog'd to ~18). Without this the
-            # cosine_sim multiplier accumulated ~50× faster than other
-            # channels and dominated the objective by ep ~100.
-            thresh_scale = np.maximum(np.abs(thresh_sl), 1e-3)  # (C,)
-            signed = (
-                self.constraint_signs_np
-                * (thresh_sl[None, None, :] - picked_sl)
-                / thresh_scale[None, None, :]
-            )
-            violations = np.maximum(0.0, signed)  # (N, T, C)
-            # Sparse-terminal mask: for constraints on sparse channels
-            # (cosine_sim, frob_residual), only the terminal step
-            # carries a real value — graphax's ``jacve`` returns a
-            # zero-norm Jacobian for any partial elimination order, so
-            # ``reward[cos_idx] = 0`` at intermediate steps. Without
-            # this mask the Lagrangian sees a ``threshold - 0`` full
-            # violation on every non-terminal step (T-1 spurious
-            # violations per env per episode), accumulating spurious
-            # penalty and floor-flooding the dual multipliers.
-            if self.constraint_is_sparse_np.any():
-                # Last step (t = T-1) is the terminal vertex elimination.
-                # ``violations`` shape: (N, T, C).
-                is_terminal_step = np.zeros((N, T), dtype=np.float32)
-                is_terminal_step[:, -1] = 1.0
-                sparse_step_mask = np.where(
-                    self.constraint_is_sparse_np[None, None, :],  # (1,1,C)
-                    is_terminal_step[:, :, None],                  # (N,T,1)
-                    1.0,                                           # dense: keep
-                )
-                violations = violations * sparse_step_mask
-            # Phase 5: gate penalty + multiplier update on warm-up.
-            # During the first --lagrangian-warmup-eps episodes we still
-            # compute violations (for logging) but don't shape the
-            # advantage and don't ascend the multipliers — gives the
-            # policy a chance to learn the scalar reward before the
-            # constraint mechanic kicks in.
-            in_warmup = self._episode_counter < self.lagrangian_warmup_eps
-            if not in_warmup:
-                penalty = np.sum(
-                    violations * self.multipliers_np[None, None, :], axis=-1,
-                )  # (N, T)
-                # Broadcast the scalar penalty over the channel axis in
-                # gdpo mode so the per-channel z-score sees the same
-                # violation pressure on every active channel. In scalar
-                # mode advantages_b is already (N, T) and the broadcast
-                # is a no-op.
-                penalty_j = jnp.asarray(penalty)
-                if advantages_b.ndim == 3:
-                    penalty_j = penalty_j[..., None]
-                advantages_b = advantages_b - penalty_j
-                mean_violations = violations.mean(axis=(0, 1))  # (C,)
-                # Dual ascent with multiplier cap. Without the cap a
-                # structurally hard constraint sees the multiplier grow
-                # unbounded and overwhelm the rest of the objective.
-                self.multipliers_np = np.clip(
-                    self.multipliers_np
-                    + self.lagrangian_lr * mean_violations,
-                    0.0,
-                    self.lagrangian_multiplier_max,
-                )
-            else:
-                mean_violations = violations.mean(axis=(0, 1))
-            for j, name in enumerate(self.constraint_names):
-                violation_stats[f"lagrangian/{name}_lambda"] = float(
-                    self.multipliers_np[j]
-                )
-                violation_stats[f"lagrangian/{name}_violation"] = float(
-                    mean_violations[j]
-                )
-            violation_stats["lagrangian/warmup_active"] = int(in_warmup)
+        # GAE in per-channel normalized space. Inverse transform is
+        # identity — the value head learns to output normalized values
+        # directly (rewards are pre-divided by σ_k upstream).
+        from alphagrad.approx.common.gae import get_advantages_running_norm
+        identity_mean = jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
+        identity_std = jnp.ones(NUM_REWARDS, dtype=jnp.float32)
+        _episodic_return, returns_b, advantages_b = get_advantages_running_norm(
+            rewards_b_normalized, dones_b, values_b, next_values_b, discounts_b,
+            self.gae_lambda, identity_mean, identity_std,
+        )
+        # Priority-weighted sum across channels. After the symlog + per-
+        # channel σ pre-norm, every channel is ~N(0, 1), so a plain
+        # weighted sum mixes them fairly already.
+        weights_j = self.reward_weights
+        returns_b = jnp.sum(returns_b * weights_j, axis=-1)
+        advantages_b = jnp.sum(advantages_b * weights_j, axis=-1)
 
-        # Normalise advantages — scalar mode keeps the legacy
-        # rollout-wide z-score (mean 0, std 1, +1e-8 floor) applied AFTER
-        # the Lagrangian penalty. gdpo mode skips the global z-score
-        # entirely — per-channel z-scoring runs per-minibatch in the
-        # update step (see gdpo_normalise_advantages) so the global pass
-        # would double-normalise and wash out cross-minibatch signal.
-        if self.advantage_norm == "scalar":
-            adv_flat = advantages_b.reshape(-1)
-            adv_mean = jnp.mean(adv_flat)
-            adv_std = jnp.std(adv_flat) + 1e-8
-            advantages_b = (advantages_b - adv_mean) / adv_std
+        # (Lagrangian dual-ascent / cosine-constraint penalty removed: the
+        # reward is now a purely static-weighted scalar — no constraint.)
 
-        # Stage for the update. Flatten (N, T) -> (N*T,) along the env
-        # axis (each transition is independent for PPO). Returns and
-        # advantages carry a trailing K axis in gdpo mode (per-channel
-        # values flow into the per-mb gdpo normalisation inside the
-        # loss); scalar mode collapsed them above and they're already
-        # 1D here.
+        # Flatten (N, T) -> (N*T,) for minibatch slicing.
         flat_tokens = jnp.asarray(buf_tokens.transpose(1, 0, 2).reshape(N * T, MAX_TOKENS))
         flat_actions = jnp.asarray(buf_actions.T.reshape(N * T))
         flat_op = jnp.asarray(buf_op.T.reshape(N * T))
@@ -1448,29 +1482,8 @@ class PPORayWorker:
         flat_q = jnp.asarray(buf_q.T.reshape(N * T))
         flat_vmask = jnp.asarray(buf_vertex_for_loss.T.reshape(N * T))
         flat_log_probs = jnp.asarray(buf_log_probs.T.reshape(N * T))
-        if self.advantage_norm == "gdpo":
-            flat_returns = returns_b.reshape(N * T, NUM_REWARDS)
-            flat_advantages = advantages_b.reshape(N * T, NUM_REWARDS)
-        else:
-            flat_returns = returns_b.reshape(N * T)
-            flat_advantages = advantages_b.reshape(N * T)
-
-        # Single epoch × `minibatches` mini-batches. We rotate the batch
-        # split by a deterministic permutation so each episode's first
-        # minibatch isn't always envs 0..k-1.
-        perm_key = jrand.fold_in(key, int(self._episode_counter))
-        perm = jrand.permutation(perm_key, N * T)
-        flat_tokens = flat_tokens[perm]
-        flat_actions = flat_actions[perm]
-        flat_op = flat_op[perm]
-        flat_i = flat_i[perm]
-        flat_j = flat_j[perm]
-        flat_f = flat_f[perm]
-        flat_q = flat_q[perm]
-        flat_vmask = flat_vmask[perm]
-        flat_log_probs = flat_log_probs[perm]
-        flat_returns = flat_returns[perm]
-        flat_advantages = flat_advantages[perm]
+        flat_returns = returns_b.reshape(N * T)
+        flat_advantages = advantages_b.reshape(N * T)
 
         total = N * T
         mb_size = total // self.minibatches
@@ -1479,85 +1492,156 @@ class PPORayWorker:
             mb_count = 1
         else:
             mb_count = self.minibatches
-        # The data-parallel axis (mb_size) must be evenly splittable
-        # across devices for the SPMD shard. If it isn't, fall back to
-        # a single un-sharded minibatch — the user will see the warning
-        # and can pick --minibatches accordingly.
-        if mb_size % self.num_devices != 0:
-            print(
-                f"[ppo_ray] mb_size={mb_size} is not divisible by "
-                f"num_devices={self.num_devices}; update_step will run "
-                f"un-sharded (likely host-bound + may OOM). Pick a "
-                f"--minibatches such that (num_envs*rollout_length)/"
-                f"minibatches is a multiple of {self.num_devices}.",
-            )
-            mb_sharded = False
-        else:
-            mb_sharded = True
+        mb_sharded = (mb_size % self.num_devices == 0)
 
-        # Reshape to ``(mb_count, mb_size, ...)`` so we can shard the
-        # data axis (axis 1) across devices. Each minibatch index `i`
-        # then yields a per-mb tensor that already lives in the
-        # data-parallel layout — the loss vmap's leading axis is the
-        # sharded one, and XLA distributes the work without a gather.
-        def _reshape_mb(flat, mb_extra_shape=()):
-            return flat.reshape((mb_count, mb_size, *mb_extra_shape))
-
-        mb_tokens = _reshape_mb(flat_tokens, (MAX_TOKENS,))
-        mb_actions = _reshape_mb(flat_actions)
-        mb_op = _reshape_mb(flat_op)
-        mb_i = _reshape_mb(flat_i)
-        mb_j = _reshape_mb(flat_j)
-        mb_f = _reshape_mb(flat_f)
-        mb_q = _reshape_mb(flat_q)
-        mb_vmask = _reshape_mb(flat_vmask)
-        mb_log_probs = _reshape_mb(flat_log_probs)
-        # Returns + advantages carry a trailing K=NUM_REWARDS axis in
-        # gdpo mode and are scalar (no trailing axis) in scalar mode.
-        if self.advantage_norm == "gdpo":
-            mb_returns = _reshape_mb(flat_returns, (NUM_REWARDS,))
-            mb_advantages = _reshape_mb(flat_advantages, (NUM_REWARDS,))
-        else:
-            mb_returns = _reshape_mb(flat_returns)
-            mb_advantages = _reshape_mb(flat_advantages)
-
-        if mb_sharded:
-            _shard = lambda x: jax.device_put(x, self.scan_data_sharding)
-            mb_tokens = _shard(mb_tokens)
-            mb_actions = _shard(mb_actions)
-            mb_op = _shard(mb_op)
-            mb_i = _shard(mb_i)
-            mb_j = _shard(mb_j)
-            mb_f = _shard(mb_f)
-            mb_q = _shard(mb_q)
-            mb_vmask = _shard(mb_vmask)
-            mb_log_probs = _shard(mb_log_probs)
-            mb_returns = _shard(mb_returns)
-            mb_advantages = _shard(mb_advantages)
+        if _prof:
+            jax.block_until_ready((flat_returns, flat_advantages))
+            _ph["bootstrap_gae"] += _pt.time() - _t
+            _t = _pt.time()
 
         agent = self.agent
         opt_state = self.opt_state
-        last_aux = {}
+        aux_accum = {}
         nan_skip_total = 0
-        for i in range(mb_count):
-            batch = (
-                mb_tokens[i], mb_actions[i],
-                mb_op[i], mb_i[i], mb_j[i], mb_f[i], mb_q[i],
-                mb_vmask[i],
-                mb_log_probs[i], mb_returns[i], mb_advantages[i],
-            )
-            key, mb_key = jrand.split(key)
-            agent, opt_state, aux = self._update_step(
-                agent, opt_state, batch,
-                self._current_op_mask_j, self._current_factor_mask_j,
-                self._current_quant_mask_j, mb_key,
-            )
-            nan_skip_total += int(aux.pop("nan_skip", 0))
-            last_aux = {k: float(v) for k, v in aux.items()}
+        n_updates = 0
 
+        # Entropy coefficient annealing: linear decay from init to final.
+        total_episodes = max(int(getattr(self.args, "episodes", 500)), 1)
+        progress = min(self._episode_counter / total_episodes, 1.0)
+        self.entropy_coef = (
+            self.entropy_coef_init
+            + (self.entropy_coef_final - self.entropy_coef_init) * progress
+        )
+        ent_coef_j = jnp.array(self.entropy_coef, dtype=jnp.float32)
+
+        for _epoch in range(self.ppo_epochs):
+            # Per-epoch reshuffle + z-score renormalization.
+            key, perm_key = jrand.split(key)
+            perm = jrand.permutation(perm_key, total)
+
+            def _permute_and_mb(flat, extra=()):
+                return flat[perm].reshape((mb_count, mb_size, *extra))
+
+            mb_tokens = _permute_and_mb(flat_tokens, (MAX_TOKENS,))
+            mb_actions = _permute_and_mb(flat_actions)
+            mb_op = _permute_and_mb(flat_op)
+            mb_i = _permute_and_mb(flat_i)
+            mb_j = _permute_and_mb(flat_j)
+            mb_f = _permute_and_mb(flat_f)
+            mb_q = _permute_and_mb(flat_q)
+            mb_vmask = _permute_and_mb(flat_vmask)
+            mb_log_probs = _permute_and_mb(flat_log_probs)
+            mb_returns = _permute_and_mb(flat_returns)
+            # Per-epoch advantage z-score so normalization stays fresh.
+            # Per-epoch advantage z-score (standard PPO scalar-advantage
+            # normalization; this is NOT the per-channel reward reweighting).
+            epoch_adv = flat_advantages[perm]
+            adv_mean = jnp.mean(epoch_adv)
+            adv_std = jnp.std(epoch_adv) + 1e-8
+            epoch_adv = (epoch_adv - adv_mean) / adv_std
+            mb_advantages = epoch_adv.reshape((mb_count, mb_size))
+
+            if mb_sharded:
+                _shard = lambda x: jax.device_put(x, self.scan_data_sharding)
+                mb_tokens = _shard(mb_tokens)
+                mb_actions = _shard(mb_actions)
+                mb_op = _shard(mb_op)
+                mb_i = _shard(mb_i)
+                mb_j = _shard(mb_j)
+                mb_f = _shard(mb_f)
+                mb_q = _shard(mb_q)
+                mb_vmask = _shard(mb_vmask)
+                mb_log_probs = _shard(mb_log_probs)
+                mb_returns = _shard(mb_returns)
+                mb_advantages = _shard(mb_advantages)
+
+            for i in range(mb_count):
+                batch = (
+                    mb_tokens[i], mb_actions[i],
+                    mb_op[i], mb_i[i], mb_j[i], mb_f[i], mb_q[i],
+                    mb_vmask[i],
+                    mb_log_probs[i], mb_returns[i], mb_advantages[i],
+                )
+                key, mb_key = jrand.split(key)
+                agent, opt_state, aux = self._update_step(
+                    agent, opt_state, batch,
+                    self._current_op_mask_j, self._current_factor_mask_j,
+                    self._current_quant_mask_j, mb_key,
+                    ent_coef_j,
+                )
+                nan_skip_total += int(aux.pop("nan_skip", 0))
+                for k, v in aux.items():
+                    aux_accum[k] = aux_accum.get(k, 0.0) + float(v)
+                n_updates += 1
+
+        if _prof:
+            _ph["update"] += _pt.time() - _t
+            _ep_total = _pt.time() - _ep_t0
+            _acct = sum(_ph.values())
+            print(
+                "[DBG-prof] ep=%d total=%.1fs | reset=%.1f act_step=%.1f "
+                "fan_out_rollout=%.1f fan_out_TERMINAL=%.1f assemble=%.1f "
+                "boot_gae=%.1f update=%.1f | unaccounted=%.1f"
+                % (
+                    self._episode_counter, _ep_total, _ph["reset"],
+                    _ph["act_step"], _ph["fan_out"], _ph["fan_out_terminal"],
+                    _ph["assemble"], _ph["bootstrap_gae"], _ph["update"],
+                    _ep_total - _acct,
+                ),
+                flush=True,
+            )
+
+        last_aux = {k: v / max(n_updates, 1) for k, v in aux_accum.items()}
+        last_aux["entropy_coef"] = float(self.entropy_coef)
+        # (reward_norm_symlog/* and lagrangian/* logging removed along with the
+        # dynamic σ-reweighting and the Lagrangian constraint.)
+        # Per-channel rollout means: raw, weighted (static λ), and terminal-only.
+        _rv_nt = np.transpose(buf_reward_vec, (1, 0, 2))  # (N, T, K)
+        _term_mask = buf_dones.T.astype(bool)             # (N, T)
+        _wj = np.asarray(self.reward_weights)
+        _has_term = bool(_term_mask.any())
+        for _k, _name in enumerate(REWARD_NAMES):
+            _raw = float(_rv_nt[..., _k].mean())
+            last_aux[f"reward_mean/{_name}_raw"] = _raw
+            last_aux[f"reward_mean/{_name}_weighted"] = _raw * float(_wj[_k])
+            if _has_term:
+                last_aux[f"reward_mean/{_name}_terminal"] = float(
+                    _rv_nt[_term_mask, _k].mean(),
+                )
         self.agent = agent
         self.opt_state = opt_state
         self._episode_counter += 1
+
+        violation_stats: dict = {}
+        reward_condition_stats: dict = {}
+
+        if (
+            not self._cost_phase_full
+            and self._cost_cutover_ep > 0
+            and self._episode_counter >= self._cost_cutover_ep
+        ):
+            import ray
+            try:
+                refs = [
+                    a.set_cost_mode_full.remote()
+                    for a in self.cpu_workers
+                ]
+                _ = ray.get(refs, timeout=60.0)
+                self._cost_phase_full = True
+                last_aux["phase/cutover_ep"] = int(self._episode_counter)
+                last_aux["phase/cost_mode_full"] = 1
+                print(
+                    f"[ppo_ray] phase cutover: episode "
+                    f"{self._episode_counter} — swapped {len(self.cpu_workers)} "
+                    f"CPU actors from cheap to full cost mode",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"[ppo_ray] phase cutover FAILED at ep "
+                    f"{self._episode_counter}: {exc}; continuing in cheap mode",
+                    flush=True,
+                )
 
         # Best / mean return computed from the RAW per-channel buffer +
         # the (calibration-aware) reward weights — NOT from the
@@ -1609,12 +1693,15 @@ class PPORayWorker:
 
         # Per-channel best / mean / overall — same shape as MuZero's
         # `mu0_ray_worker` returns so the driver can use the shared
-        # logging helpers.
+        # logging helpers. ``dones_mask`` (T, N) splits the per-step
+        # mean into per_step / terminal so the sparse-terminal quality
+        # channels (cossim / frob) report a non-diluted value.
         ch_stats = aggregate_per_channel_stats(
             buf_reward_vec.astype(np.float32),
             self.reward_weights_np.astype(np.float32),
             sentinel=SENTINEL_REWARD_VALUE,
             action_seq=per_env_actions,
+            dones_mask=buf_dones.astype(bool),
         )
 
         last_aux.update({
@@ -1637,6 +1724,35 @@ class PPORayWorker:
         last_aux["best_per_reward"] = ch_stats["best_per_reward"]
         last_aux["best_overall_rewards"] = ch_stats["best_overall_rewards"]
         last_aux["best_overall_weighted"] = ch_stats["best_overall_weighted"]
+        # Per-channel 5-number summary over the rollout envs (distribution
+        # tracker, per-episode). Numeric stats -> wandb via reward_dist/;
+        # the quantile sequences ride along to best_sequences.json through
+        # update_running_bests (dropped from wandb by the prefix whitelist).
+        for _name, _q in ch_stats.get("reward_quantiles", {}).items():
+            for _lab, _v in _q.items():
+                last_aux[f"reward_dist/{_name}/{_lab}"] = float(_v)
+        last_aux["quantile_sequences"] = ch_stats.get("quantile_sequences", {})
+        # Unified `reward/{cost,quality}/{per_step,terminal,best_terminal}/<name>`
+        # keys + corridor instrumentation. The legacy `reward_mean/*`
+        # keys above remain for backward compat with existing dashboards.
+        from alphagrad.approx.common.reward_scaling import (
+            COSINE_SIM_IDX,
+            build_unified_reward_log_dict,
+        )
+        terminal_mask_np = buf_dones.astype(bool)
+        terminal_cs = (
+            buf_reward_vec[terminal_mask_np, COSINE_SIM_IDX]
+            if terminal_mask_np.any()
+            else np.zeros((0,), dtype=np.float32)
+        )
+        last_aux.update(
+            build_unified_reward_log_dict(
+                ch_stats,
+                corridor_low=getattr(self, "_corridor_low", None),
+                corridor_high=getattr(self, "_corridor_high", None),
+                terminal_cossims=terminal_cs,
+            )
+        )
         # ``best_seq`` is the canonical key the driver's
         # ``update_running_bests`` reads to populate
         # ``state["best_global_seq"]``. Pass through the overall-best
@@ -1658,6 +1774,17 @@ class PPORayWorker:
             last_aux.update(
                 {f"pool/{k}": v for k, v in self._cpu_pool.stats().items()}
             )
+            # Per-episode timeout delta — the cumulative ``pool/timeouts``
+            # is monotonic so the running total alone hides episode-level
+            # spikes. We log the delta so a wandb time-series shows when
+            # (if ever) sentinel-replacement fires. Mirrors the dead-code
+            # decision check at end-of-run (see ``training_summary`` log).
+            try:
+                last_aux["pool/timeouts_this_episode"] = (
+                    self._cpu_pool.fetch_timeout_delta()
+                )
+            except Exception:
+                last_aux["pool/timeouts_this_episode"] = 0
             # Aggregate the per-actor tokenization-truncation telemetry.
             # All values are PER-EPISODE (the pool's
             # ``consume_*`` reset is invoked once per rollout). Mirrors
@@ -1949,6 +2076,81 @@ class PPORayWorker:
         rewards = np.stack([r[2] for r in out])
         sentinel_mask = np.zeros((N,), dtype=bool)
         return tokens, eqn_ids, rewards, sentinel_mask
+
+    def _fan_out_terminal_queue(self, order_np, specs_np, step_np):
+        """Global measurement queue for the TERMINAL step.
+
+        Instead of N env-tasks each measuring n_points data points
+        SEQUENTIALLY on one actor's fixed core slice (which leaves
+        gated/cheap envs' cores idle while a straggler grinds), decompose
+        into ``N × n_points`` per-(env, data-point) tasks and dispatch
+        them through ``ray.util.ActorPool``. Free actors pull the next
+        task, so an env's points run in parallel and gated tasks
+        immediately free workers for stragglers — full core utilisation.
+        Each task measures ONE data point (R reps) on a fixed core slice,
+        so the per-reading latency stays consistent. The driver then
+        P60-aggregates each env's n_points reward vectors per channel.
+
+        Returns the same ``(tokens, eqn_ids, rewards, sentinel_mask)``
+        contract as ``_fan_out_tokenize``.
+        """
+        import ray
+        from ray.util import ActorPool
+
+        N = order_np.shape[0]
+        n_points = max(int(getattr(self.args, "num_data_points", 5)), 1)
+        pk = float(getattr(self.args, "percentile_keep", 0.60))
+
+        actors = None
+        if self._cpu_pool is not None:
+            actors = self._cpu_pool.live_actors()
+        elif self.cpu_workers:
+            actors = list(self.cpu_workers)
+        if not actors:
+            # No Ray pool (in-proc tests) — fall back to the per-env path.
+            return self._fan_out_tokenize(order_np, specs_np, step_np)
+
+        # Build (env, point) task list, env-major so results[env*n_points+p].
+        tasks = [
+            (int(e), int(p), order_np[e], specs_np[e], int(step_np[e]))
+            for e in range(N)
+            for p in range(n_points)
+        ]
+        pool = ActorPool(actors)
+        results = list(
+            pool.map(
+                lambda a, t: a.evaluate.remote(
+                    t[2], t[3], t[4], point_idx=t[1],
+                ),
+                tasks,
+            )
+        )  # preserves task order
+
+        tokens_out = np.zeros((N, MAX_TOKENS), dtype=np.int32)
+        eqn_ids_out = np.zeros((N, MAX_TOKENS), dtype=np.int32)
+        rewards_out = np.zeros((N, NUM_REWARDS), dtype=np.float32)
+        for e in range(N):
+            base = e * n_points
+            # Per-point reward vectors for this env (each already P60'd
+            # over its R reps inside _callback).
+            pr = np.stack([results[base + p][2] for p in range(n_points)])  # (P, K)
+            # Aggregate across points with the same "keep worst pk" rule
+            # the single-call path uses. Cost channels are stored negated
+            # (reward = -cost), so the worst-pk cost = -percentile(-reward).
+            # cosine_sim (index COSINE) is "higher better" + weight 0 — use
+            # the mean; everything else is a cost channel.
+            agg = np.empty((NUM_REWARDS,), dtype=np.float32)
+            _cos_idx = REWARD_INDEX["cosine_sim"]
+            for k in range(NUM_REWARDS):
+                if k == _cos_idx:
+                    agg[k] = float(np.mean(pr[:, k]))
+                else:
+                    agg[k] = -float(np.percentile(-pr[:, k], pk * 100.0))
+            rewards_out[e] = agg
+            tokens_out[e] = results[base][0]
+            eqn_ids_out[e] = results[base][1]
+        sentinel_mask = np.zeros((N,), dtype=bool)
+        return tokens_out, eqn_ids_out, rewards_out, sentinel_mask
 
     # ------------------------------------------------------------------
     # Lifecycle helpers used by the driver

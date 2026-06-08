@@ -112,6 +112,14 @@ def build_reward_weights(args) -> np.ndarray:
     Always returns a non-zero vector — if `--rewards` ends up empty,
     falls back to weighting `muls_adds_fmas` (the original PPO-ray
     fallback at `ppo_ray_worker.py:159-160`).
+
+    RQ8 / Pitch A: if `--reward-as-constraints LIST` names any of the
+    channels (typical: ``cosine_sim,frob_residual``), their lambdas are
+    forced to 0 here so they don't enter the scalar reward. They still
+    influence the policy via the Lagrangian dual-ascent path
+    (``ppo_ray_worker._apply_lagrangian_penalty`` / equivalents) — that's
+    the constrained-MDP formulation (RCPO; Tessler et al. 2018) the
+    pipeline doc describes.
     """
     w = np.zeros(NUM_REWARDS, dtype=np.float32)
     if "cmp" in args.rewards:
@@ -125,6 +133,24 @@ def build_reward_weights(args) -> np.ndarray:
     lam_frob = float(getattr(args, "lambda_frob", 0.0))
     if lam_frob != 0.0:
         w[FROB_RESIDUAL_IDX] = lam_frob
+
+    # RQ8 Stage 5: zero lambdas for channels declared as Lagrangian
+    # constraints. They still appear in the per-channel reward vector
+    # (so logging / cossim-best-tracking continues) but contribute 0
+    # to the scalar sum — keeps the constrained-MDP semantics clean.
+    as_constraints = str(getattr(args, "reward_as_constraints", "") or "")
+    if as_constraints:
+        for name in as_constraints.split(","):
+            name = name.strip()
+            if not name:
+                continue
+            if name not in REWARD_INDEX:
+                # Silent skip on unknown name — match the rest of this
+                # file's tolerant parsing; trainer-side will log a
+                # warning at startup so this isn't invisible.
+                continue
+            w[REWARD_INDEX[name]] = 0.0
+
     if not np.any(w):
         w[REWARD_INDEX["muls_adds_fmas"]] = 1.0
     return w
@@ -236,6 +262,7 @@ def aggregate_per_channel_stats(
     *,
     sentinel: float,
     action_seq: Sequence[Any] | None = None,
+    dones_mask: np.ndarray | None = None,
 ) -> dict:
     """Compute the per-channel stats dict the driver expects.
 
@@ -250,12 +277,30 @@ def aggregate_per_channel_stats(
             ``best_overall_seq`` carry the action sequence of the env
             that argmaxes that channel / the overall scalar. When None
             the seq entries are empty lists.
+        dones_mask: optional shape (T, N) bool mask flagging terminal
+            transitions. When supplied the result dict additionally
+            carries ``terminal_means`` and ``best_terminal`` keyed by
+            channel name. cossim / frob_residual are
+            :data:`SPARSE_TERMINAL_INDICES` — their per-step mean over
+            all timesteps is heavily diluted by intermediate zero-reward
+            steps; ``terminal_means`` reports the honest signal.
 
     Returns:
         dict with keys:
 
         * ``per_reward_means``: `{name: float}` — mean over (T, N), with
-          sentinel rows masked out.
+          sentinel rows masked out. This is the per-STEP mean; for
+          sparse-terminal channels (cossim/frob) it is diluted by the
+          many intermediate zero-reward steps. Use ``terminal_means``
+          instead for those.
+        * ``terminal_means``: `{name: float}` — mean over (T, N)
+          timesteps where ``dones_mask`` is True. Only populated when
+          ``dones_mask`` is supplied. Equals ``per_reward_means`` for
+          cost channels when every rollout has the same length; differs
+          significantly for sparse-terminal quality channels.
+        * ``best_terminal``: `{name: float}` — max over terminal
+          timesteps for each channel. Only populated when ``dones_mask``
+          is supplied.
         * ``best_per_reward``: `{name: {"raw_value", "weighted_value",
           "weighted_total", "env_idx", "seq", "all_raw",
           "all_weighted"}}` — argmax over envs of the per-env
@@ -276,6 +321,9 @@ def aggregate_per_channel_stats(
     valid_mask = filter_sentinel_mask(buf_reward_vec_np, sentinel)  # (T, N)
 
     # per_reward_means: average each channel over the non-sentinel transitions.
+    # Sparse-terminal channels (cosine_sim, frob_residual) are overwritten
+    # below with the terminal-step-only mean so they aren't diluted by the
+    # T-1 zero intermediate steps.
     per_reward_means: dict[str, float] = {}
     flat_mask = valid_mask.reshape(-1)
     flat_rewards = buf_reward_vec_np.reshape(-1, R)
@@ -285,6 +333,32 @@ def aggregate_per_channel_stats(
         masked_mean = np.zeros((R,), dtype=np.float32)
     for j, name in enumerate(REWARD_NAMES):
         per_reward_means[name] = float(masked_mean[j])
+
+    # Terminal-only stats — the honest per-episode signal for the
+    # sparse-terminal quality channels (cossim / frob_residual).
+    terminal_means: dict[str, float] = {}
+    best_terminal: dict[str, float] = {}
+    if dones_mask is not None:
+        dones_b = np.asarray(dones_mask).astype(bool)
+        if dones_b.shape != (T, N):
+            raise ValueError(
+                f"dones_mask shape {dones_b.shape} != (T, N) = {(T, N)}"
+            )
+        term_and_valid = dones_b & valid_mask
+        flat_term = term_and_valid.reshape(-1)
+        if flat_term.any():
+            term_rewards = flat_rewards[flat_term]  # (n_term, R)
+            term_mean = term_rewards.mean(axis=0)
+            term_max = term_rewards.max(axis=0)
+        else:
+            term_mean = np.zeros((R,), dtype=np.float32)
+            term_max = np.zeros((R,), dtype=np.float32)
+        for j, name in enumerate(REWARD_NAMES):
+            terminal_means[name] = float(term_mean[j])
+            best_terminal[name] = float(term_max[j])
+        for idx in SPARSE_TERMINAL_INDICES:
+            name = REWARD_NAMES[idx]
+            per_reward_means[name] = terminal_means[name]
 
     # Per-env per-channel sum (zero-out sentinel rows so a single timeout
     # doesn't poison the env's running per-channel total).
@@ -333,15 +407,125 @@ def aggregate_per_channel_stats(
             "all_weighted": all_weighted,
         }
 
+    # Per-channel order statistics over this episode's N rollout envs, plus
+    # the representative env sequence at each quantile (nearest-rank). Lets
+    # downstream analysis pull e.g. the median-cosine order (a non-degenerate
+    # approximation) instead of only the raw-return-best (often degenerate /
+    # exact). Computed for ALL channels (incl. weight-0 ones like cosine_sim).
+    n_env = int(r_per_env.shape[0])
+    _QLABELS = (("min", 0.0), ("q1", 0.25), ("median", 0.5), ("q3", 0.75), ("max", 1.0))
+    reward_quantiles: dict[str, dict] = {}
+    quantile_sequences: dict[str, dict] = {}
+    for j, name in enumerate(REWARD_NAMES):
+        # Sanitize non-finite values: np.argsort sorts NaN to the end, which
+        # would make the 'max' (and possibly median/q3) quantile select a NaN
+        # env and report NaN for reward_dist/<chan>/max + the dumped sequence.
+        # Treat non-finite as 0 (purely a diagnostic channel).
+        col = np.nan_to_num(
+            r_per_env[:, j].astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0,
+        )
+        order = np.argsort(col, kind="stable")  # ascending by raw value
+        qstat: dict[str, float] = {}
+        qseq: dict[str, dict] = {}
+        for label, q in _QLABELS:
+            env_i = int(order[int(round(q * (n_env - 1)))])
+            qstat[label] = float(col[env_i])
+            qseq[label] = {
+                "env_idx": env_i,
+                "raw_value": float(col[env_i]),
+                "all_raw": {
+                    REWARD_NAMES[k]: float(r_per_env[env_i, k])
+                    for k in range(NUM_REWARDS)
+                },
+                "seq": _seq_for(env_i),
+            }
+        reward_quantiles[name] = qstat
+        quantile_sequences[name] = qseq
+
     return {
         "per_reward_means": per_reward_means,
+        "terminal_means": terminal_means,
+        "best_terminal": best_terminal,
         "best_per_reward": best_per_reward,
         "best_overall_rewards": best_overall_rewards,
         "best_overall_weighted": best_overall_weighted,
         "best_overall_env": best_overall_env,
         "best_overall_weighted_total": float(per_env_tot[best_overall_env]),
         "best_overall_seq": _seq_for(best_overall_env),
+        "reward_quantiles": reward_quantiles,
+        "quantile_sequences": quantile_sequences,
     }
+
+
+# ---------------------------------------------------------------------------
+# Grouping helpers for the unified wandb panel layout
+# ---------------------------------------------------------------------------
+
+def _reward_group(name: str) -> str:
+    """Return ``"cost"`` or ``"quality"`` per REWARD_NAMES layout.
+
+    Cost channels: muls_adds_fmas, flops, latency_ns, max_io_sum,
+    bytes_accessed, peak_memory. Quality channels: cosine_sim,
+    frob_residual.
+    """
+    if REWARD_INDEX[name] in (COSINE_SIM_IDX, FROB_RESIDUAL_IDX):
+        return "quality"
+    return "cost"
+
+
+def build_unified_reward_log_dict(
+    ch_stats: dict,
+    *,
+    corridor_low: float | None = None,
+    corridor_high: float | None = None,
+    terminal_cossims: np.ndarray | None = None,
+) -> dict:
+    """Build the unified ``reward/{cost,quality}/{per_step,terminal,best_terminal}/<name>``
+    key dict that PPO / MuZero / GFN all emit.
+
+    Args:
+        ch_stats: the dict returned by :func:`aggregate_per_channel_stats`.
+        corridor_low / corridor_high: optional corridor bounds for the
+            cosine_sim channel. When both are supplied, also emit
+            ``corridor/{in,below,above}_band_fraction``. Pass
+            ``corridor_low=None`` (no floor) with a finite ``corridor_high``
+            to track only the ceiling (``--anti-degeneracy delta_ceiling``).
+        terminal_cossims: optional 1-D array of terminal cossim values
+            across the batch — required when corridor metrics are
+            requested. If None, corridor keys are omitted.
+
+    Returns:
+        dict mapping the new key names to scalar floats / bools, ready
+        for ``wandb.log``.
+    """
+    out: dict[str, Any] = {}
+    per_step = ch_stats.get("per_reward_means", {})
+    terminal = ch_stats.get("terminal_means", {})
+    best_terminal = ch_stats.get("best_terminal", {})
+    for name in REWARD_NAMES:
+        grp = _reward_group(name)
+        if name in per_step:
+            out[f"reward/{grp}/per_step/{name}"] = float(per_step[name])
+        if name in terminal:
+            out[f"reward/{grp}/terminal/{name}"] = float(terminal[name])
+        if name in best_terminal:
+            out[f"reward/{grp}/best_terminal/{name}"] = float(best_terminal[name])
+    out["reward/cost/symlog_applied"] = True
+    out["reward/quality/symlog_applied"] = False
+
+    if terminal_cossims is not None and len(terminal_cossims) > 0:
+        cs = np.asarray(terminal_cossims, dtype=np.float32)
+        if corridor_high is not None:
+            below_mask = cs < (corridor_low if corridor_low is not None else -np.inf)
+            above_mask = cs > corridor_high
+            in_mask = ~(below_mask | above_mask)
+            out["corridor/in_band_fraction"] = float(in_mask.mean())
+            out["corridor/below_band_fraction"] = float(below_mask.mean())
+            out["corridor/above_band_fraction"] = float(above_mask.mean())
+            if corridor_low is not None:
+                out["corridor/low"] = float(corridor_low)
+            out["corridor/high"] = float(corridor_high)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +587,10 @@ def update_running_bests(state: dict, stats: dict, ep: int) -> dict:
             # ``all_weighted`` / ``seq``) so the JSON dump has the
             # cross-channel tuple for every per-channel best.
             state["best_per_reward"][name] = {**info, "ep": ep}
+    # Latest-episode per-channel quantile sequences (overwritten each step;
+    # the numeric distribution time-series lives in wandb under reward_dist/).
+    if "quantile_sequences" in stats:
+        state["quantile_sequences"] = stats["quantile_sequences"]
     return state
 
 
@@ -417,7 +605,18 @@ def best_sequences_snapshot(state: dict) -> dict:
     cross-channel rewards in ``all_raw`` / ``all_weighted`` plus the
     full action sequence in ``seq``. The overall best (scalar) entry is
     the cross-section of the env that won the scalar weighted sum.
+
+    The ``seq`` field is normalised through
+    :func:`alphagrad.approx.common.seq_replay.to_typed_records` so the
+    on-disk format carries typed dicts (``{"vertex": v, "ops":
+    [{"op": "Diag", "i": ..., "j": ..., "factor": ...}, ...]}``) rather
+    than the legacy int-array-with-sentinels representation. The
+    decoder accepts both shapes; new runs emit only the typed form.
     """
+    # Late import to avoid a circular dep on alphagrad.approx.env via
+    # graphax.sparse.micro_actions (seq_replay imports those at module load).
+    from alphagrad.approx.common.seq_replay import to_typed_records
+
     def _coerce(v: Any) -> Any:
         # Already-python types pass through; numpy scalars are unwrapped
         # so json.dump doesn't choke on `np.float32`/`np.int64`.
@@ -430,12 +629,23 @@ def best_sequences_snapshot(state: dict) -> dict:
     def _coerce_dict(d: dict) -> dict:
         return {k: _coerce(v) for k, v in d.items()}
 
+    def _seq(raw):
+        if raw is None:
+            return None
+        try:
+            return to_typed_records(raw)
+        except Exception:
+            # Never let a snapshot conversion crash the trainer — fall
+            # back to the raw payload so the run still produces a valid
+            # (if legacy-format) best_sequences.json.
+            return raw
+
     overall = {
         "return": _coerce(state.get("best_global_return", float("nan"))),
         "ep": _coerce(state.get("best_global_ep", -1)),
         "rewards_raw": _coerce_dict(state.get("best_global_rewards", {})),
         "rewards_weighted": _coerce_dict(state.get("best_global_weighted_split", {})),
-        "seq": state.get("best_global_seq"),
+        "seq": _seq(state.get("best_global_seq")),
     }
     per_channel: dict[str, dict] = {}
     for name, info in state.get("best_per_reward", {}).items():
@@ -447,11 +657,25 @@ def best_sequences_snapshot(state: dict) -> dict:
             "weighted_total": _coerce(info.get("weighted_total", float("nan"))),
             "all_raw": _coerce_dict(info.get("all_raw", {})),
             "all_weighted": _coerce_dict(info.get("all_weighted", {})),
-            "seq": info.get("seq", []),
+            "seq": _seq(info.get("seq", [])),
+        }
+    # Per-channel quantile sequences (latest episode): min/q1/median/q3/max
+    # env order for every channel, typed-converted like the bests above.
+    quantile_sequences: dict[str, dict] = {}
+    for name, qd in state.get("quantile_sequences", {}).items():
+        quantile_sequences[name] = {
+            label: {
+                "env_idx": _coerce(e.get("env_idx", -1)),
+                "raw_value": _coerce(e.get("raw_value", float("nan"))),
+                "all_raw": _coerce_dict(e.get("all_raw", {})),
+                "seq": _seq(e.get("seq", [])),
+            }
+            for label, e in qd.items()
         }
     return {
         "best_overall": overall,
         "best_per_channel": per_channel,
+        "quantile_sequences": quantile_sequences,
     }
 
 
@@ -643,15 +867,19 @@ def build_wandb_log_dict(stats: dict, state: dict, ep: int) -> dict:
         "best_return_this_ep": ep_best,
         "mean_return": stats.get("mean_return", float("nan")),
         "entropy_mean": stats.get("entropy_mean", stats.get("entropy", float("nan"))),
-        "entropy_root": stats.get("entropy_root", float("nan")),
         "policy_loss": stats.get("policy_loss", stats.get("ppo_loss", float("nan"))),
         "value_loss": stats.get("value_loss", float("nan")),
-        "reward_loss": stats.get("reward_loss", float("nan")),
+        "explained_variance": stats.get("explained_variance", float("nan")),
         "total_loss": stats.get("total_loss", float("nan")),
-        "buffer_size": stats.get("buffer_size", 0),
         "train_step": stats.get("train_step", 0),
         "nan_skip_count": stats.get("nan_skip_count", 0),
     }
+    if "entropy_root" in stats:
+        log_dict["entropy_root"] = stats["entropy_root"]
+    if "reward_loss" in stats:
+        log_dict["reward_loss"] = stats["reward_loss"]
+    if "buffer_size" in stats:
+        log_dict["buffer_size"] = stats["buffer_size"]
     for name, val in stats.get("per_reward_means", {}).items():
         log_dict[f"reward_mean/{name}"] = val
     for name, info in state["best_per_reward"].items():
@@ -664,6 +892,10 @@ def build_wandb_log_dict(stats: dict, state: dict, ep: int) -> dict:
     # Pass through any extra namespaced keys the worker chose to emit
     # (e.g. `lagrangian/multipliers/cosine_sim`).
     for k, v in stats.items():
-        if k.startswith("lagrangian/") or k.startswith("reward_mean/"):
+        if (
+            k.startswith("lagrangian/")
+            or k.startswith("reward_mean/")
+            or k.startswith("reward_dist/")
+        ):
             log_dict[k] = v
     return log_dict

@@ -91,6 +91,14 @@ def add_common_ray_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="wandb project name.",
     )
     _maybe_add(
+        p, "--wandb-entity",
+        type=str,
+        default="",
+        help="wandb entity (team / user namespace). Empty = wandb default "
+             "(your personal namespace). Set to e.g. 'dll-streetview' to "
+             "land the run in a team's project.",
+    )
+    _maybe_add(
         p, "--cpu-callback-timeout",
         type=float,
         default=600.0,
@@ -134,12 +142,15 @@ def add_common_ray_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     _maybe_add(
         p, "--calibrate-steps",
         type=int,
-        default=16,
+        default=0,
         help="Pre-training reward-scale calibration: run K rollouts of "
              "the un-trained agent with zero preference, measure mean "
              "|symlog(reward)| per channel (sentinels filtered), and "
              "rescale reward_weights by 1/mean_abs so wide-magnitude "
-             "channels contribute on a comparable scale. 0 disables.",
+             "channels contribute on a comparable scale. 0 disables "
+             "(default — the per-rollout per-channel reward EMA in "
+             "ppo_ray_worker.py covers the same need without the "
+             "16-rollout up-front cost).",
     )
     _maybe_add(
         p, "--quant-dtypes",

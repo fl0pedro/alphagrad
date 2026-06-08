@@ -385,7 +385,9 @@ def main():
 
     closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
     measure_latency = args.measure_latency or args.cmp_type == "latency"
-    env_target_fun = target_fn if "acc" in args.rewards else None
+    # Always pass target_fun so flops/bytes_accessed/latency_ns/peak_memory
+    # populate every step (see cpu_approx_worker.py for the full rationale).
+    env_target_fun = target_fn
     env = VertexEliminationEnv.from_jaxpr(
         closed_jaxpr,
         args=xs,
@@ -397,6 +399,7 @@ def main():
         mem_type=args.mem_type,
         exec_on_gpu=args.exec_on_gpu,
         measure_latency=measure_latency,
+        latency_samples=int(getattr(args, "latency_samples", 1)),
         terminal_rewards_only=args.terminal_rewards_only,
     )
 

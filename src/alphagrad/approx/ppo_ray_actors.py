@@ -84,3 +84,14 @@ class PPOActor:
         if self._impl is None:
             return False
         return self._impl.ready()
+
+    def pool_stats(self) -> dict:
+        """Cumulative CPU-pool counters (calls / timeouts / errors).
+
+        Used by the driver's end-of-run summary to emit the loud
+        ``timeouts total: N (dead code if 0)`` line. Returns ``{}`` when
+        the worker / pool aren't initialised so the driver can fall back
+        cleanly."""
+        if self._impl is None or getattr(self._impl, "_cpu_pool", None) is None:
+            return {}
+        return self._impl._cpu_pool.stats()
