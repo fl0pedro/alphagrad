@@ -88,6 +88,48 @@ def make_argparser() -> argparse.ArgumentParser:
         "over ~12*num_envs calls). >=8 enables top-quartile-mean smoothing.",
     )
     p.add_argument(
+        "--num-data-points", type=int, default=5,
+        help="Distinct MNIST data points sampled per latency/quality "
+        "measurement (pool size = num-data-points × reps-per-point).",
+    )
+    p.add_argument(
+        "--reps-per-point", type=int, default=4,
+        help="Reruns of the compiled approx-fn per data point.",
+    )
+    p.add_argument(
+        "--percentile-keep", type=float, default=0.60,
+        help="Percentile in [0,1] for noisy-channel aggregation (legacy "
+        "path; superseded for latency by --latency-winsor).",
+    )
+    # --- Latency-measurement noise control (see env.py EnvConfig) ----------
+    p.add_argument(
+        "--latency-inner-reps", type=int, default=1,
+        help="Time each latency reading over a tight inner loop of N "
+        "back-to-back executions (perf_counter, one barrier, /N). Amortizes "
+        "dispatch overhead — the dominant sub-ms-kernel noise. Try 10-20.",
+    )
+    p.add_argument(
+        "--latency-warmup", type=int, default=0,
+        help="Discard the first K executions per data point before timing.",
+    )
+    p.add_argument(
+        "--latency-winsor", type=float, default=0.0,
+        help="If >0, aggregate the latency pool with a symmetric winsorized "
+        "mean at this trim fraction (e.g. 0.2) — the most reproducible "
+        "latency estimator.",
+    )
+    p.add_argument(
+        "--slow-exec-cutoff-seconds", type=float, default=8.0,
+        help="Per-exec wall-time cutoff: if one approx-Jacobian exec exceeds "
+        "this, cap the measurement pool for that order. 0 disables (set 0 for "
+        "single-core measurement where legit execs are slow).",
+    )
+    p.add_argument(
+        "--flop-gate-threshold", type=float, default=0.0,
+        help="Skip the expensive measurement entirely above this FLOP count "
+        "(0 disables).",
+    )
+    p.add_argument(
         "--terminal-rewards-only",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -360,6 +402,17 @@ def make_argparser() -> argparse.ArgumentParser:
         default=0.99,
         help="EMA decay for the per-channel running stats. Higher = "
              "slower adaptation (more stable but slower to track shifts).",
+    )
+    p.add_argument(
+        "--scalarization",
+        type=str,
+        choices=["ws", "wl", "wt"],
+        default="ws",
+        help="MOGFN-PC scalarization of the (normalized) per-objective rewards "
+             "z_k (Jain et al. 2023). ``ws`` (Weighted-Sum, paper default/best): "
+             "R(x|ω)=Σ_k w_k R̃_k ⇒ log R=β·logsumexp(z_k+log w_k). ``wl`` "
+             "(Weighted-log-sum / geometric): log R=β·Σ_k w_k z_k. ``wt`` "
+             "(Weighted-Tchebycheff): log R=-β·max_k w_k (z*_k - z_k).",
     )
 
     # ------------------------------------------------------------------

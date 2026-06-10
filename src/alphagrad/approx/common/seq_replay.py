@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Sequence, Union
 
@@ -35,6 +36,32 @@ OP_QUANT = 2
 OP_END = 3
 
 MicroAction = Union[Diag, Compress, Quant]
+
+
+_CALL_DIAG = re.compile(r"diag\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(-?\d+)\s*\)")
+_CALL_COMPRESS = re.compile(r"compress\(\s*'([^']+)'\s*,\s*(\d+)\s*\)")
+_CALL_QUANT = re.compile(r"quant\(\s*'([^']+)'\s*\)")
+
+
+def _parse_call_string(s: str) -> dict[str, Any] | None:
+    """Parse one dynamic-substeps call string into a typed op dict.
+
+    Grammar (must stay in sync with
+    :func:`alphagrad.approx.ppo._action_to_pylist_dynamic`):
+    ``diag(i, j, factor)`` / ``compress('kind', axis)`` / ``quant('dtype')``.
+    Returns ``None`` for an unrecognised string (e.g. a bare ``op7(...)``
+    fallback) so it's skipped rather than mis-decoded.
+    """
+    m = _CALL_DIAG.fullmatch(s.strip())
+    if m:
+        return {"op": "Diag", "i": int(m[1]), "j": int(m[2]), "factor": int(m[3])}
+    m = _CALL_COMPRESS.fullmatch(s.strip())
+    if m:
+        return {"op": "Compress", "axes": [int(m[2])], "kind": m[1]}
+    m = _CALL_QUANT.fullmatch(s.strip())
+    if m:
+        return {"op": "Quant", "dtype": m[1]}
+    return None
 
 
 def _row_to_typed_record(row: Any) -> dict[str, Any]:
@@ -105,13 +132,24 @@ def _row_to_typed_record(row: Any) -> dict[str, Any]:
         return {"vertex": v, "ops": []}  # unknown op_type
 
     if len(row) == 2:
-        # MuZero / GFN 2-tuple (vertex, [(bi1, bi2, factor), ...]).
+        # Two distinct 2-tuple shapes share this branch:
+        #   * MuZero / GFN legacy: (vertex, [(bi1, bi2, factor), ...]) —
+        #     numeric DIAG triples.
+        #   * Dynamic-substeps: (vertex, ["diag(i, j, factor)",
+        #     "compress('kind', axis)", "quant('dtype')", ...]) — the
+        #     human-readable call strings emitted by
+        #     ``ppo._action_to_pylist_dynamic`` (cmorl / gfn / ppo with
+        #     --dynamic-substeps). These carry COMPRESS/QUANT, not just DIAG.
         v = int(row[0])
-        triples = row[1] or []
-        ops_out = []
-        for trip in triples:
-            if len(trip) >= 3:
-                bi1, bi2, factor = (int(x) for x in trip[:3])
+        ops_in = row[1] or []
+        ops_out: list[dict[str, Any]] = []
+        for op in ops_in:
+            if isinstance(op, str):
+                parsed = _parse_call_string(op)
+                if parsed is not None:
+                    ops_out.append(parsed)
+            elif len(op) >= 3:
+                bi1, bi2, factor = (int(x) for x in op[:3])
                 ops_out.append({
                     "op": "Diag", "i": bi1, "j": bi2, "factor": factor,
                 })
@@ -316,6 +354,25 @@ def parse_recorded_seq(
     if seq and isinstance(seq[0], dict):
         return _parse_typed_records(
             seq, axis_sizes=axis_sizes,
+            skip_low_precision_quant=skip_low_precision_quant,
+        )
+
+    # Dynamic-substeps raw format: rows are (vertex, ["diag(...)",
+    # "compress('k', a)", "quant('d')", ...]) with 1-indexed vertices
+    # (ppo._action_to_pylist_dynamic). Normalise via to_typed_records — which
+    # understands the call-string grammar — then decode. Without this the loop
+    # below would hit ``len(row) < 6`` and treat every such row as OP_END,
+    # silently stripping ALL approximations. (Production writes these through
+    # to_typed_records already, so best_sequences.json arrives as dicts above;
+    # this covers a raw seq handed straight to the reader.)
+    if seq and any(
+        isinstance(r, (list, tuple)) and len(r) == 2
+        and isinstance(r[1], (list, tuple))
+        and any(isinstance(x, str) for x in r[1])
+        for r in seq
+    ):
+        return _parse_typed_records(
+            to_typed_records(seq), axis_sizes=axis_sizes,
             skip_low_precision_quant=skip_low_precision_quant,
         )
 

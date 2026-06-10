@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import os
 import sys
 import time
@@ -100,6 +101,18 @@ def _extend_argparser(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action="store_true",
         help="Disable auto-tuning of num_envs / minibatches for GPU divisibility.",
     )
+    p.add_argument(
+        "--cpu-cores-shared", action="store_true",
+        help="Claim disjoint CPU-core slices from the cluster-wide allocator so "
+             "this run's measurement actors don't oversubscribe cores shared "
+             "with another job on the same CPU node (mirrors ppo_ray).",
+    )
+    p.add_argument(
+        "--cpu-cores-per-actor", type=int, default=0,
+        help="Force each CpuApproximationActor to pin to exactly N cores. "
+             "1 = single-core-per-actor (cleanest latency CV, single-threaded "
+             "exec — set --num-cpu-workers ≈ #cores). 0 = auto slice.",
+    )
     return p
 
 
@@ -110,6 +123,59 @@ def _ensure_curriculum_for_variant(args, variant: str) -> None:
         total = sum(n for _, n in stages)
         args.episodes = total
         print(f"  [{variant}] auto-curriculum: {args.curriculum} (total {total} episodes)")
+
+
+# ---------------------------------------------------------------------------
+# Pareto-front helpers (host-side, numpy) — same routines as cmorl_ray so the
+# MOGFN front is recorded in the identical format for comparison.
+# ---------------------------------------------------------------------------
+def _pareto_mask(points):
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] == 0:
+        return np.zeros((pts.shape[0],), dtype=bool)
+    ge = np.all(pts[:, None, :] >= pts[None, :, :], axis=-1)
+    gt = np.any(pts[:, None, :] > pts[None, :, :], axis=-1)
+    return ~np.any(ge & gt, axis=0)
+
+
+def _hv2d_min(pts, ref):
+    pts = pts[np.argsort(pts[:, 0])]
+    rx, ry = ref
+    hv = (ry - pts[0, 1]) * (rx - pts[0, 0])
+    for i in range(1, pts.shape[0]):
+        hv += (pts[i - 1, 1] - pts[i, 1]) * (rx - pts[i, 0])
+    return float(hv)
+
+
+def _hv3d_min(pts, ref):
+    pts = pts[np.argsort(pts[:, 2])]
+    rx, ry, rz = ref
+    vol, active, i, n = 0.0, [], 0, pts.shape[0]
+    while i < n:
+        z = pts[i, 2]
+        while i < n and pts[i, 2] == z:
+            active.append(pts[i, :2])
+            i += 1
+        z_next = pts[i, 2] if i < n else rz
+        vol += _hv2d_min(np.asarray(active), (rx, ry)) * (z_next - z)
+    return float(vol)
+
+
+def _hypervolume(points, ref):
+    pts = np.asarray(points, dtype=np.float64)
+    ref = np.asarray(ref, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] == 0:
+        return 0.0
+    m = pts.shape[1]
+    if m not in (2, 3):
+        return float("nan")
+    pts = pts[_pareto_mask(pts)]
+    pts = pts[np.all(pts > ref, axis=1)]
+    if pts.shape[0] == 0:
+        return 0.0
+    if m == 2:
+        return _hv2d_min(-pts, (-ref[0], -ref[1]))
+    return _hv3d_min(-pts, (-ref[0], -ref[1], -ref[2]))
 
 
 def _run_one_variant(args, variant: str) -> None:
@@ -149,7 +215,11 @@ def _run_one_variant(args, variant: str) -> None:
         if k.startswith("ALPHAGRAD_") or k.startswith("JAX_COMPILATION_"):
             spmd_env_vars[k] = v
     spmd_kwargs = (
-        {"num_gpus": args.spmd_gpus, "runtime_env": {"env_vars": spmd_env_vars}}
+        # num_cpus=0 so the GPU trainer reserves no CPU slots — lets a
+        # --num-cpus=0 GPU node physically exclude the num_cpus=1 measurement
+        # actors, forcing all measurement onto the CPU node (mirrors ppo_ray).
+        {"num_cpus": 0, "num_gpus": args.spmd_gpus,
+         "runtime_env": {"env_vars": spmd_env_vars}}
         if args.spmd_gpus > 0
         else {"runtime_env": {"env_vars": spmd_env_vars}}
     )
@@ -235,6 +305,71 @@ def _run_one_variant(args, variant: str) -> None:
             _best_seq_path = os.path.abspath(f"best_sequences-{variant}.json")
     _best_seq_every = int(getattr(variant_args, "best_sequences_every", 0) or 0)
 
+    # ------------------------------------------------------------------
+    # MOGFN Pareto archive: non-dominated set of sampled terminal solutions
+    # over the preference-channel objectives, each kept with the (vertex, pair,
+    # factor) sequence that produced it. Dumped to mogfn_pareto_front.json so
+    # the front is recoverable in the same format as cmorl_pareto_front.json.
+    # ------------------------------------------------------------------
+    from alphagrad.approx.common.reward_scaling import REWARD_INDEX as _RIDX
+    _obj_names = [
+        s.strip()
+        for s in str(getattr(variant_args, "preference_channels", "")).split(",")
+        if s.strip()
+    ]
+    _obj_idx = [_RIDX[n] for n in _obj_names]
+    _arch_pts: list = []
+    _arch_seqs: list = []
+    _pareto_json = os.path.join(
+        os.path.dirname(_best_seq_path) or os.getcwd(),
+        f"mogfn_pareto_front.{variant}.json",
+    )
+
+    def _arch_add(sols) -> None:
+        added = False
+        for sol in sols or []:
+            vec = sol.get("obj")
+            g = np.array([vec[i] for i in _obj_idx], dtype=np.float64)
+            if not np.all(np.isfinite(g)):
+                continue
+            if any(np.allclose(g, p) for p in _arch_pts):
+                continue
+            _arch_pts.append(g)
+            _arch_seqs.append(sol.get("seq"))
+            added = True
+        if added:
+            keep = set(int(i) for i in np.where(_pareto_mask(np.stack(_arch_pts)))[0])
+            _arch_pts[:] = [_arch_pts[i] for i in range(len(_arch_pts)) if i in keep]
+            _arch_seqs[:] = [_arch_seqs[i] for i in range(len(_arch_seqs)) if i in keep]
+
+    def _arch_hv() -> float:
+        if not _arch_pts:
+            return 0.0
+        pts = np.stack(_arch_pts)
+        return _hypervolume(pts, pts.min(axis=0) - 1.0)
+
+    def _dump_pareto() -> None:
+        payload = {
+            "objectives": _obj_names,
+            "hypervolume": _arch_hv(),
+            "num_points": len(_arch_pts),
+            "seq_format": (
+                "[vertex, [<call>, ...]] per eliminated vertex, where <call> "
+                "is one of diag(i, j, factor) / compress('kind', axis) / "
+                "quant('dtype') — the full typed micro-action sub-episode"
+            ),
+            "front": [
+                {"obj": {n: float(v) for n, v in zip(_obj_names, pt)}, "seq": seq}
+                for pt, seq in zip(_arch_pts, _arch_seqs)
+            ],
+        }
+        try:
+            os.makedirs(os.path.dirname(_pareto_json) or ".", exist_ok=True)
+            with open(_pareto_json, "w") as _f:
+                json.dump(payload, _f, indent=2)
+        except Exception as _exc:
+            tqdm.write(f"  [MOGFN] pareto dump failed: {_exc}")
+
     def _build_state() -> dict:
         return {
             "best_global_return": best_global_return,
@@ -284,6 +419,10 @@ def _run_one_variant(args, variant: str) -> None:
             prev = best_per_reward.get(name)
             if prev is None or info["raw_value"] > prev["raw_value"]:
                 best_per_reward[name] = {**info, "ep": ep}
+
+        # Update + persist the MOGFN Pareto front (points + sequences).
+        _arch_add(stats.get("terminal_solutions", []))
+        _dump_pareto()
 
         # ---- Progress bar (one line, updated in place) ----
         pbar.update(1)
@@ -368,9 +507,14 @@ def _run_one_variant(args, variant: str) -> None:
             wandb.log(_build_best_seq_wandb_payload(_state_now, ep=ep))
 
     pbar.close()
+    _dump_pareto()
 
     # ---- Final per-variant summary -----------------------------------
     tqdm.write(f"\n========== [{variant}] FINAL ==========")
+    tqdm.write(
+        f"  MOGFN Pareto front: {len(_arch_pts)} points, hv={_arch_hv():.6g} "
+        f"-> {_pareto_json}"
+    )
     tqdm.write(f"  overall best weighted return: {best_global_return:+.6g}  (found at ep {best_global_ep})")
     if best_global_rewards:
         tqdm.write(f"  best-overall-trajectory per-channel rewards (raw):")

@@ -420,6 +420,13 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         num_data_points=int(getattr(args, "num_data_points", 5)),
         reps_per_point=int(getattr(args, "reps_per_point", 4)),
         percentile_keep=float(getattr(args, "percentile_keep", 0.60)),
+        # Latency-measurement knobs — THIS env (inside the CpuApproximationActor)
+        # does the actual pooled measurement, so the flags must be forwarded
+        # here or --latency-winsor/--latency-inner-reps/--latency-warmup are
+        # silently inert in every pooled Ray run.
+        latency_inner_reps=int(getattr(args, "latency_inner_reps", 1)),
+        latency_warmup=int(getattr(args, "latency_warmup", 0)),
+        latency_winsor=float(getattr(args, "latency_winsor", 0.0)),
         slow_exec_cutoff_seconds=float(
             getattr(args, "slow_exec_cutoff_seconds", 15.0)
         ),

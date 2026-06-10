@@ -394,6 +394,27 @@ class EnvConfig(NamedTuple):
     # paper-native form for AlphaZero / GDPO / GFlowNet and works fine for PPO
     # / MuZero (just yields a sparse reward signal).
     terminal_rewards_only: bool = False
+    # --- Latency-measurement noise control (2026-06-10) ---------------------
+    # Timing is done with ``time.perf_counter`` around a tight inner loop of
+    # ``latency_inner_reps`` back-to-back executions with a single
+    # ``block_until_ready`` barrier, divided by the rep count. This amortizes
+    # per-call dispatch/barrier overhead (the dominant noise for sub-ms
+    # kernels) and replaces the old ResourceMonitor wall-timer, whose
+    # ``stop()`` fired BEFORE the closing effects-barrier drained the async
+    # device queue (systematic under-measure + a fake "0 ns" reading on
+    # failure). ``latency_warmup`` discards the first K executions per data
+    # point (first-touch / cache warm-up). ResourceMonitor is still used for
+    # the peak-memory channel only. See the latency-noise investigation.
+    latency_inner_reps: int = 1
+    latency_warmup: int = 0
+    # Aggregation of the latency pool: ``latency_winsor > 0`` uses a symmetric
+    # winsorized mean (clamp the lowest/highest ``frac`` of samples, then
+    # average) — empirically the most reproducible + discriminative estimator
+    # (winsor-20% ≈ +80% discriminability vs the P60 percentile). 0.0 keeps
+    # the legacy ``percentile_keep`` percentile path. Non-positive latency
+    # readings (failed measurements) are dropped before aggregation; if none
+    # survive the channel is marked sentinel so it is filtered downstream.
+    latency_winsor: float = 0.0
 
 
 def _get_partials(order, sparsity_specs, stop):
@@ -984,6 +1005,27 @@ def _percentile_pool(values, q: float) -> float:
     return float(jnp.percentile(arr, float(q) * 100.0))
 
 
+def _winsorized_mean(values, frac: float) -> float:
+    """Symmetric winsorized mean: clamp the lowest/highest ``frac`` fraction
+    of samples to the corresponding quantiles, then average.
+
+    Empirically the most reproducible + discriminative latency aggregator on
+    this measurement harness (≈ +80% discriminability vs the P60 percentile,
+    and far better than the noisy minimum). ``frac`` in [0, 0.5). Falls back
+    to the plain mean for tiny pools where trimming would remove everything.
+    """
+    if not values:
+        return 0.0
+    a = np.sort(np.asarray(values, dtype=np.float64))
+    n = a.size
+    k = int(n * float(frac))
+    if k > 0 and n - 2 * k >= 1:
+        a = a.copy()
+        a[:k] = a[k]
+        a[n - k:] = a[n - k - 1]
+    return float(a.mean())
+
+
 # Compile cache: the original in-process LRU thrashed (2-11% hit rate)
 # because Ray's round-robin dispatch sent the same (order, specs) tuple
 # to different actors. Sticky routing was tried next and lifted hit rate
@@ -1527,6 +1569,14 @@ def _callback(
     # stop, instead of repeating a 40s exec 20×.
     import time as _measure_time
     _slow_cutoff = float(getattr(config, "slow_exec_cutoff_seconds", 0.0) or 0.0)
+    _inner = max(int(getattr(config, "latency_inner_reps", 1) or 1), 1)
+    _warmup = max(int(getattr(config, "latency_warmup", 0) or 0), 0)
+    if not config.measure_latency:
+        # Latency is discarded (hard-set to 0.0 below) — don't pay the
+        # inner-loop / warmup executions for a reading nobody reads.
+        _inner = 1
+        _warmup = 0
+    _bypass_rm = os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1"
     _budget_hit = False
     for d in _point_iter:
         if _budget_hit:
@@ -1537,45 +1587,70 @@ def _callback(
             eval_args_i = list(args)
         if callback_device is not None:
             eval_args_i = [jax.device_put(x, callback_device) for x in eval_args_i]
+        # Per-data-point warmup: discard the first ``_warmup`` executions so
+        # first-touch / cache / allocation effects don't pollute the timed
+        # readings (see EnvConfig.latency_warmup). Each warmup exec is itself
+        # checked against the slow-order cutoff so a pathological order bails
+        # after one ~cutoff-second exec instead of running the full warmup +
+        # inner loop first. The LAST warmup exec doubles as the peak-memory
+        # read (it's discarded for timing anyway) — avoids a separate extra
+        # execution per data point when warmup is enabled. ``None`` ⇒ not yet
+        # captured, fall back to the dedicated r==0 monitor below.
+        _peak_captured = None
+        for _w in range(_warmup):
+            _ws = _measure_time.perf_counter()
+            if (not _bypass_rm) and _w == _warmup - 1:
+                with ResourceMonitor(devices=unique_devices) as _wmon:
+                    _wout = compiled_approx(*eval_args_i)
+                jax.block_until_ready(_wout)
+                _peak_captured = float(_wmon.stats.get("memory", 0.0))
+            else:
+                jax.block_until_ready(compiled_approx(*eval_args_i))
+            if _slow_cutoff > 0.0 and (
+                _measure_time.perf_counter() - _ws
+            ) > _slow_cutoff:
+                _budget_hit = True
+                break
         for r in range(reps):
             if _budget_hit:
                 break
-            # ResourceMonitor already runs ``jax.effects_barrier()`` in
-            # ``__enter__`` / ``__exit__``, so we don't need an extra
-            # ``block_until_ready`` on the result — the barriers drain the
-            # device queue both for the timer and the memory tracker.
-            #
-            # ``ALPHAGRAD_BYPASS_RESOURCE_MONITOR=1`` skips the construction +
-            # context manager entirely (vs. the lighter
-            # ``ALPHAGRAD_DISABLE_RESOURCE_MONITOR`` which only swapped the
-            # class to a no-op). This is the strongest cut available short
-            # of patching the import: no monitor object is created, no
-            # ``__enter__`` / ``__exit__`` runs, no ``stats`` dict is read.
-            # Used to isolate whether the per-call Python lifecycle around
-            # ``ResourceMonitor`` (not its C++ tracker) leaks. peak_memory +
-            # latency_ns are zero for the run.
+            # Latency: time a tight inner loop of ``_inner`` back-to-back
+            # executions with a SINGLE closing ``block_until_ready`` barrier,
+            # using ``perf_counter``, then divide by the rep count. This
+            # amortizes per-call dispatch/barrier overhead (the dominant noise
+            # for sub-ms kernels) and — unlike the old ResourceMonitor wall
+            # timer, whose ``stop()`` fired before its barrier drained the
+            # async queue — measures the true end-to-end latency with a stable
+            # absolute value. ResourceMonitor is now used for the peak-memory
+            # channel ONLY (one call per data point; peak is deterministic).
             _exec_wall0 = _measure_time.time()
-            if os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1":
+            _t0 = _measure_time.perf_counter()
+            for _ in range(_inner):
                 out_approx = compiled_approx(*eval_args_i)
-                jax.block_until_ready(out_approx)
-                latency_samples.append(0.0)
-                peak_mem_samples.append(0.0)
-            else:
-                with ResourceMonitor(devices=unique_devices) as monitor:
-                    out_approx = compiled_approx(*eval_args_i)
-                # Key by name instead of unpacking ``.values()`` so this
-                # stays robust to dict-order / API tweaks in
-                # jax_memory_monitor.
-                latency_s = float(monitor.stats.get("time", 0.0))
-                peak_bytes = float(monitor.stats.get("memory", 0.0))
-                latency_samples.append(latency_s * 1e9)  # → ns
-                peak_mem_samples.append(peak_bytes)
-            # Force the approx result so _exec_wall (the slow-order cutoff
-            # signal) reflects the full materialization, not just async
-            # dispatch. The monitor's effects_barrier covers most of this
-            # but the output array can still resolve lazily downstream.
             jax.block_until_ready(out_approx)
+            _lat_ns = (_measure_time.perf_counter() - _t0) / _inner * 1e9
+            latency_samples.append(_lat_ns)
+            # Peak memory once per data point (first rep). Reuse the warmup
+            # monitor read when available (no extra exec); else take a
+            # dedicated monitored exec. Skipped under bypass.
+            if r == 0:
+                if _peak_captured is not None:
+                    peak_mem_samples.append(_peak_captured)
+                elif _bypass_rm:
+                    peak_mem_samples.append(0.0)
+                else:
+                    with ResourceMonitor(devices=unique_devices) as monitor:
+                        _mout = compiled_approx(*eval_args_i)
+                    jax.block_until_ready(_mout)
+                    peak_mem_samples.append(
+                        float(monitor.stats.get("memory", 0.0))
+                    )
             _exec_wall = _measure_time.time() - _exec_wall0
+            # Per-EXEC time for the cutoff (the inner loop runs _inner execs;
+            # _exec_wall spans the whole loop + the r==0 peak-memory exec, so
+            # comparing it directly to the per-exec cutoff would trip on
+            # healthy orders once _inner>1). Use the amortized per-exec time.
+            _per_exec_s = _lat_ns / 1e9
 
             # Quality pair: collect once per data point (first rep only).
             # ``compiled_exact`` is non-None only at the terminal step.
@@ -1591,17 +1666,15 @@ def _callback(
                 jax.block_until_ready(_oe)
                 out_exacts.append(_oe)
 
-            # Slow-order cutoff: if this single exec exceeded the cutoff,
-            # the order is pathologically expensive — one sample is
-            # enough to know it's slow. Keep what we have and stop.
-            # ResourceMonitor (or block_until_ready on the bypass path)
-            # already forced device completion, so _exec_wall is real.
-            if _slow_cutoff > 0.0 and _exec_wall > _slow_cutoff:
+            # Slow-order cutoff: if a single exec exceeded the cutoff, the
+            # order is pathologically expensive — one sample is enough to know
+            # it's slow. Keep what we have and stop.
+            if _slow_cutoff > 0.0 and _per_exec_s > _slow_cutoff:
                 _budget_hit = True
                 if _dbg_t:
                     print(
                         f"[DBG-env] slow-order cutoff at d={d + 1}/{n_points} "
-                        f"r={r + 1}/{reps}: exec={_exec_wall:.1f}s > "
+                        f"r={r + 1}/{reps}: per_exec={_per_exec_s:.1f}s > "
                         f"{_slow_cutoff:.0f}s — capping samples",
                         flush=True,
                     )
@@ -1616,11 +1689,27 @@ def _callback(
         print(f"[DBG-env] exec_loop(n={n_samples})={_time.time()-_t0:.1f}s", flush=True)
         _t0 = _time.time()
     pk = float(getattr(config, "percentile_keep", 0.60))
-    latency_ns = (
-        _percentile_pool(latency_samples, pk)
-        if config.measure_latency
-        else 0.0
-    )
+    _winsor = float(getattr(config, "latency_winsor", 0.0) or 0.0)
+    if not config.measure_latency:
+        latency_ns = 0.0
+    else:
+        # Drop non-positive readings (failed measurements). With perf_counter
+        # timing a genuine reading is always > 0; a 0 only appears on failure.
+        _lat_valid = [x for x in latency_samples if x > 0.0 and np.isfinite(x)]
+        if not _lat_valid:
+            # No usable latency reading → mark sentinel so the (negated)
+            # reward equals SENTINEL_REWARD_VALUE and the point is filtered
+            # out of best-tracking / the Pareto archive downstream (exact-
+            # match comparison), instead of leaking in as a fake
+            # "0 ns = fastest" solution. Import the constant — the filter
+            # uses exact float equality, so a drifting literal would
+            # silently disable the filtering.
+            from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+            latency_ns = -SENTINEL_REWARD_VALUE
+        elif _winsor > 0.0:
+            latency_ns = _winsorized_mean(_lat_valid, _winsor)
+        else:
+            latency_ns = _percentile_pool(_lat_valid, pk)
     peak_memory = _percentile_pool(peak_mem_samples, pk)
 
     # ------------------------------------------------------------------
@@ -1800,9 +1889,15 @@ class VertexEliminationEnv:
         num_data_points: int = 5,
         reps_per_point: int = 4,
         percentile_keep: float = 0.60,
-        slow_exec_cutoff_seconds: float = 15.0,
+        # Match the EnvConfig field default (8.0) so the cutoff behaviour is
+        # the same whether the env is built via from_jaxpr or constructed
+        # directly (tests) — they previously diverged 15.0 vs 8.0.
+        slow_exec_cutoff_seconds: float = 8.0,
         flop_gate_threshold: float = 0.0,
         terminal_rewards_only: bool = False,
+        latency_inner_reps: int = 1,
+        latency_warmup: int = 0,
+        latency_winsor: float = 0.0,
     ):
         assert (argnums is None and args is None) or not (args is None or args is None)
         config = EnvConfig(
@@ -1825,6 +1920,9 @@ class VertexEliminationEnv:
             slow_exec_cutoff_seconds=slow_exec_cutoff_seconds,
             flop_gate_threshold=flop_gate_threshold,
             terminal_rewards_only=terminal_rewards_only,
+            latency_inner_reps=latency_inner_reps,
+            latency_warmup=latency_warmup,
+            latency_winsor=latency_winsor,
         )
         return cls(
             config,

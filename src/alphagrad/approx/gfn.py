@@ -77,6 +77,7 @@ from alphagrad.approx.env import (
 from alphagrad.approx.ppo import (
     Agent,
     NUM_PAIR_CHOICES,
+    NUM_VALUE_HEADS,
     PAIR_STOP,
     _action_to_pylist,
     _build_agent,
@@ -91,6 +92,7 @@ from alphagrad.approx.ppo import (
     _setup_jax_compile_cache,
     _variant_label,
 )
+from alphagrad.transformer import MLP
 from alphagrad.utils import symlog
 
 
@@ -100,20 +102,38 @@ from alphagrad.utils import symlog
 
 
 class GFNAgent(eqx.Module):
-    """Wraps a PPO :class:`Agent` and adds the learnable Trajectory-Balance ``logZ``.
+    """Wraps a PPO :class:`Agent` and adds the **preference-conditioned**
+    Trajectory-Balance log-partition ``log Z_θ(ω)``.
 
     All policy / encode / value logic is delegated to ``base_agent``. The
     value head is unused here (TB doesn't need a critic) but we leave it
     constructed so the agent can be initialised, scaled, and optimised by
     the same helpers PPO uses.
+
+    MOGFN-PC (Jain et al. 2023) requires the partition function to be a learned
+    function of the preference ``ω`` — ``Z(c)=Σ_x R(x|c)``. We therefore replace
+    the old scalar ``logZ`` with ``logZ_head``: a small MLP ``ω → scalar``. The
+    head's last bias is initialised to ``logZ_init`` so that at ω≈0 / start of
+    training it reproduces the old scalar behaviour (and degrades gracefully to
+    a constant when preference-conditioning is disabled and ω is constant).
     """
 
     base_agent: Agent
-    logZ: jax.Array
+    logZ_head: MLP
 
-    def __init__(self, base_agent: Agent, logZ_init: float = 0.0):
+    def __init__(self, base_agent: Agent, logZ_init: float = 0.0, key=None):
+        # ``logZ_init`` is accepted for call-site compatibility; the conditional
+        # head learns its own constant under the fast logZ LR, so no explicit
+        # bias offset is needed.
+        del logZ_init
         self.base_agent = base_agent
-        self.logZ = jnp.asarray(logZ_init, dtype=jnp.float32)
+        k = jrand.PRNGKey(0) if key is None else key
+        self.logZ_head = MLP(NUM_VALUE_HEADS, 1, [64, 64], key=k)
+
+    def log_Z(self, w):
+        """Conditional log-partition ``log Z_θ(ω)`` for a single preference ``w``
+        (shape ``(NUM_VALUE_HEADS,)``); returns a scalar."""
+        return self.logZ_head(w)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +149,18 @@ class GFNTrajectory(NamedTuple):
     vertex_idx: jax.Array
     pair_seq: jax.Array
     factor_seq: jax.Array
+    # Dynamic-substeps (full micro-action) sequence: up to ``max_substeps``
+    # typed (DIAG/COMPRESS/QUANT) rules per vertex with unique arguments. The
+    # TB loss recomputes log P_F from these via ``evaluate_action_dynamic`` (no
+    # old-policy dists need storing). Zero-filled on the legacy (pair,factor)
+    # path so the NamedTuple shape is stable.
+    micro_op_seq: jax.Array
+    micro_i_seq: jax.Array
+    micro_j_seq: jax.Array
+    micro_exp_seq: jax.Array
+    micro_factor_seq: jax.Array
+    micro_kind_seq: jax.Array
+    micro_quant_seq: jax.Array
     vertex_avail_mask: jax.Array
     reward: jax.Array     # (T, NUM_REWARDS) per-step env reward vector
     done: jax.Array       # (T,) float32; 1.0 only at the terminating step
@@ -299,15 +331,17 @@ def _build_gfn_agent(
     max_rules: int,
     key,
 ) -> GFNAgent:
+    base_key, logz_key = jrand.split(key)
     base_agent = _build_agent(
-        use_pointer, use_autoreg, args, total_v, num_factors, max_rules, key,
+        use_pointer, use_autoreg, args, total_v, num_factors, max_rules, base_key,
     )
-    return GFNAgent(base_agent=base_agent, logZ_init=args.logZ_init)
+    return GFNAgent(base_agent=base_agent, logZ_init=args.logZ_init, key=logz_key)
 
 
 def _logZ_mask(gfn_agent: GFNAgent):
     """Scalar-bool pytree aligned with ``eqx.filter(gfn_agent, eqx.is_inexact_array)``
-    where the lone True leaf is the ``logZ`` scalar.
+    where the True leaves are the conditional ``logZ_head`` (the MLP that maps a
+    preference ``ω`` to ``log Z_θ(ω)``) — these ride the faster ``--logZ-lr``.
 
     ``optax.masked`` requires scalar Python bools at each leaf (it tests the
     leaf with a plain ``if`` to decide whether to substitute ``MaskedNode``),
@@ -316,7 +350,7 @@ def _logZ_mask(gfn_agent: GFNAgent):
     params = eqx.filter(gfn_agent, eqx.is_inexact_array)
     leaves_with_path, treedef = jax.tree_util.tree_flatten_with_path(params)
     return treedef.unflatten([
-        jax.tree_util.keystr(path).endswith(".logZ")
+        ".logZ_head" in jax.tree_util.keystr(path)
         for path, _ in leaves_with_path
     ])
 
@@ -607,7 +641,12 @@ def main():
         weighted_terminal = jnp.sum(terminal_rewards * reward_weights, axis=-1)  # (E,)
         log_R = beta * symlog(weighted_terminal)
 
-        tb_residual = gfn_agent.logZ + sum_log_pf - sum_log_pb - log_R
+        # Conditional log Z_θ(ω): per-env preference (constant over the
+        # trajectory, so take t=0) → scalar partition (MOGFN-PC).
+        w_pref = traj.preference[:, 0, :]                         # (E, NUM_VALUE_HEADS)
+        log_Z_w = jax.vmap(gfn_agent.log_Z)(w_pref)              # (E,)
+
+        tb_residual = log_Z_w + sum_log_pf - sum_log_pb - log_R
         tb_loss = jnp.mean(tb_residual ** 2)
         entropy_term = jnp.mean(jnp.sum(ent, axis=-1))
 
@@ -615,7 +654,7 @@ def main():
 
         metrics = (
             tb_loss,
-            gfn_agent.logZ,
+            jnp.mean(log_Z_w),
             jnp.mean(sum_log_pf),
             jnp.mean(sum_log_pb),
             jnp.mean(log_R),

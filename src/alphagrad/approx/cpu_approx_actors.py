@@ -50,18 +50,33 @@ class _CoreAllocator:
 
     def __init__(self):
         self._claimed: dict[str, int] = {}  # node_id -> next free core index
+        self._by_key: dict[str, list[int]] = {}  # claim_key -> cores (idempotent)
 
-    def claim(self, node_id: str, ncores_total: int, n: int) -> list[int]:
+    def claim(
+        self, node_id: str, ncores_total: int, n: int, claim_key: str | None = None,
+    ) -> list[int]:
         """Claim ``n`` consecutive core indices on ``node_id``. Wraps
         modulo ``ncores_total`` if the node is over-subscribed (more
-        actors than cores/n) — degrades to sharing rather than erroring."""
+        actors than cores/n) — degrades to sharing rather than erroring.
+
+        ``claim_key`` makes the claim IDEMPOTENT: a re-claim with the same
+        key (e.g. the same logical actor respawned after a recycle/timeout
+        kill) returns its existing slice instead of advancing the per-node
+        counter — otherwise respawns leak slots forever and eventually wrap
+        onto cores still pinned by live actors.
+        """
+        if claim_key is not None and claim_key in self._by_key:
+            return self._by_key[claim_key]
         start = self._claimed.get(node_id, 0)
         cores = [(start + k) % ncores_total for k in range(n)]
         self._claimed[node_id] = (start + n) % ncores_total
+        if claim_key is not None:
+            self._by_key[claim_key] = cores
         return cores
 
     def reset(self) -> None:
         self._claimed.clear()
+        self._by_key.clear()
 
 
 def _get_core_allocator():
@@ -120,7 +135,14 @@ class CpuApproximationActor:
             reserved = max(0, min(reserved, ncores - n_workers))
             pool = avail[reserved:] if reserved < ncores else avail
             npool = len(pool)
-            per = max(1, npool // n_workers)
+            # ``cpu_cores_per_actor > 0`` forces an exact slice width (e.g. 1
+            # for single-core-per-actor measurement: cleanest per-reading CV,
+            # at the cost of single-threaded exec — pair with
+            # num_cpu_workers ≈ #cores so every core hosts one actor and total
+            # throughput is recovered by cross-actor parallelism). 0 = the
+            # legacy auto slice ``npool // n_workers``.
+            _cpa = int(args_dict.get("cpu_cores_per_actor", 0) or 0)
+            per = _cpa if _cpa > 0 else max(1, npool // n_workers)
             # Disjoint slice. When multiple jobs share the cluster
             # (--cpu-cores-shared), claim from the per-node allocator so
             # the 4 jobs' actors don't collide on the same cores. Else
@@ -132,11 +154,20 @@ class CpuApproximationActor:
                     node_id = socket.gethostname()
                     alloc = _get_core_allocator()
                     if alloc is not None:
-                        base = int(
-                            ray.get(alloc.claim.remote(node_id, npool, per))[0]
-                        )
-                except Exception:
-                    pass  # fall back to the static base
+                        # Idempotent per (run, actor) so a respawn reuses its
+                        # slice instead of leaking a fresh one.
+                        claim_key = f"{args_dict.get('name', '')}:{self._actor_id}"
+                        base = int(ray.get(
+                            alloc.claim.remote(node_id, npool, per, claim_key)
+                        )[0])
+                except Exception as _exc:
+                    # Falling back to the static base risks the cross-job
+                    # collision the allocator exists to prevent — surface it.
+                    print(
+                        f"[measure-actor {self._actor_id}] core-allocator "
+                        f"claim failed ({_exc}); using static slice base={base}",
+                        flush=True,
+                    )
             if 0 < per < ncores:
                 cores = {pool[(base + k) % npool] for k in range(per)}
                 _os.sched_setaffinity(0, cores)

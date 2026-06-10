@@ -81,11 +81,13 @@ from alphagrad.approx.gfn import (
     _build_gfn_agent,
     _logZ_mask,
 )
+from alphagrad.approx.heads import MicroAction, precompute_factor_tables
 from alphagrad.approx.ppo import (
     NUM_PAIR_CHOICES,
     NUM_VALUE_HEADS,
     PAIR_STOP,
     _action_to_pylist,
+    _action_to_pylist_dynamic,
     _build_factor_table,
     _build_reward_weights,
     _cmp_reward_index,
@@ -174,6 +176,16 @@ def _build_actor_state(
         exec_on_gpu=args.exec_on_gpu,
         measure_latency=measure_latency,
         latency_samples=int(getattr(args, "latency_samples", 1)),
+        num_data_points=int(getattr(args, "num_data_points", 5)),
+        reps_per_point=int(getattr(args, "reps_per_point", 4)),
+        percentile_keep=float(getattr(args, "percentile_keep", 0.60)),
+        latency_inner_reps=int(getattr(args, "latency_inner_reps", 1)),
+        latency_warmup=int(getattr(args, "latency_warmup", 0)),
+        latency_winsor=float(getattr(args, "latency_winsor", 0.0)),
+        slow_exec_cutoff_seconds=float(
+            getattr(args, "slow_exec_cutoff_seconds", 8.0)
+        ),
+        flop_gate_threshold=float(getattr(args, "flop_gate_threshold", 0.0)),
         terminal_rewards_only=args.terminal_rewards_only,
     )
 
@@ -202,6 +214,18 @@ def _build_actor_state(
     pair_factor_mask = jnp.ones(
         (total_v, NUM_PAIR_CHOICES, num_factors), dtype=jnp.float32,
     )
+
+    # Full micro-action scheme (DIAG/COMPRESS/QUANT, up to max_substeps rules
+    # per vertex). The MicroActionPolicy consumes the env's STATIC per-vertex
+    # axis structure (same arrays ppo.py's own dynamic loss uses) + a prime/
+    # exponent factor table. ``op_legality_j`` is all-ones for --variant full
+    # (every op type legal); the env still gates COMPRESS/QUANT to the final
+    # vertex internally.
+    factor_tables = precompute_factor_tables(int(getattr(args, "max_axis_size", 1024)))
+    axis_state_static = env.axis_state_static
+    axis_valid_static = env.axis_valid_static
+    op_legality_j = jnp.ones((4,), dtype=jnp.float32)
+    max_substeps = int(getattr(args, "max_substeps", 16))
 
     num_envs = _resolve_num_envs(args.num_envs, args.example)
     rollout_length = num_valid
@@ -382,18 +406,23 @@ def _build_actor_state(
             )
             (
                 vertex_idx,
-                pair_seq,
-                factor_seq,
+                actions,
                 _vertex_dist,
-                _pair_dists,
-                _factor_dists,
+                _op_dists,
+                _i_dists,
+                _j_dists,
+                _exp_dists,
+                _kind_dists,
+                _quant_dists,
                 _value,
                 v_context,
-            ) = gfn_agent_local.base_agent.sample_action(
+            ) = gfn_agent_local.base_agent.sample_action_dynamic(
                 state.tokens,
                 vertex_avail_mask,
-                pair_valid_mask,
-                pair_factor_mask,
+                axis_state_static,
+                axis_valid_static,
+                factor_tables,
+                op_legality_j,
                 sample_key,
                 eqn_ids=state.eqn_ids,
                 vertex_features=vertex_features_local,
@@ -401,8 +430,8 @@ def _build_actor_state(
                 cached_encoding=cached_encoding,
                 preference=preference,
             )
-            env_action = gfn_agent_local.base_agent.to_env_action(
-                vertex_idx, pair_seq, factor_seq, factor_table_j,
+            env_action = gfn_agent_local.base_agent.to_env_action_dynamic(
+                vertex_idx, actions, axis_state_static,
             )
             env_out = env_obj.step(state, env_action)
             new_residual = gfn_agent_local.base_agent.update_residual(
@@ -414,8 +443,15 @@ def _build_actor_state(
                 eqn_ids=state.eqn_ids.astype(jnp.int32),
                 residual_state=residual_state,
                 vertex_idx=jnp.asarray(vertex_idx, dtype=jnp.int32),
-                pair_seq=jnp.asarray(pair_seq, dtype=jnp.int32),
-                factor_seq=jnp.asarray(factor_seq, dtype=jnp.int32),
+                pair_seq=jnp.zeros((max_rules,), dtype=jnp.int32),
+                factor_seq=jnp.zeros((max_rules,), dtype=jnp.int32),
+                micro_op_seq=actions.op_type.astype(jnp.int32),
+                micro_i_seq=actions.i.astype(jnp.int32),
+                micro_j_seq=actions.j.astype(jnp.int32),
+                micro_exp_seq=actions.exponents.astype(jnp.int32),
+                micro_factor_seq=actions.factor.astype(jnp.int32),
+                micro_kind_seq=actions.compress_kind.astype(jnp.int32),
+                micro_quant_seq=actions.quant_dtype.astype(jnp.int32),
                 vertex_avail_mask=vertex_avail_mask,
                 reward=jnp.atleast_1d(env_out.reward),
                 done=env_out.terminated.astype(jnp.float32),
@@ -458,29 +494,37 @@ def _build_actor_state(
         )
         eval_keys = jrand.split(eval_key, E * T)
 
-        def _eval_one(toks, eids, rs, vidx, pseq, fseq, vmask, pref, cached, kk):
-            return gfn_agent_local.base_agent.evaluate_action(
-                toks, vidx, pseq, fseq, vmask,
-                pair_valid_mask, pair_factor_mask, kk,
-                eqn_ids=eids, vertex_features=vertex_features_local,
-                residual_state=rs, cached_encoding=cached,
-                preference=pref,
+        def _eval_one(toks, eids, rs, vidx, mo, mi, mj, me, mf, mk, mq, vmask, pref, cached, kk):
+            actions = MicroAction(
+                op_type=mo, i=mi, j=mj, exponents=me,
+                factor=mf, compress_kind=mk, quant_dtype=mq,
             )
+            out = gfn_agent_local.base_agent.evaluate_action_dynamic(
+                toks, vidx, actions, vmask,
+                axis_state_static, axis_valid_static, factor_tables, kk,
+                eqn_ids=eids, vertex_features=vertex_features_local,
+                residual_state=rs, cached_encoding=cached, preference=pref,
+            )
+            return out[0], out[1]  # (total_log_p, total_entropy)
 
+        _mfields = (
+            flat.micro_op_seq, flat.micro_i_seq, flat.micro_j_seq,
+            flat.micro_exp_seq, flat.micro_factor_seq,
+            flat.micro_kind_seq, flat.micro_quant_seq,
+        )
         if cached_flat is None:
-            log_p, ent, _v, _vd, _pd, _fd = jax.vmap(
-                lambda toks, eids, rs, vidx, pseq, fseq, vmask, pref, kk:
-                    _eval_one(toks, eids, rs, vidx, pseq, fseq, vmask, pref, None, kk),
+            log_p, ent = jax.vmap(
+                lambda toks, eids, rs, vidx, mo, mi, mj, me, mf, mk, mq, vmask, pref, kk:
+                    _eval_one(toks, eids, rs, vidx, mo, mi, mj, me, mf, mk, mq,
+                              vmask, pref, None, kk),
             )(
-                flat.tokens, flat.eqn_ids, flat.residual_state,
-                flat.vertex_idx, flat.pair_seq, flat.factor_seq,
-                flat.vertex_avail_mask, flat.preference, eval_keys,
+                flat.tokens, flat.eqn_ids, flat.residual_state, flat.vertex_idx,
+                *_mfields, flat.vertex_avail_mask, flat.preference, eval_keys,
             )
         else:
-            log_p, ent, _v, _vd, _pd, _fd = jax.vmap(_eval_one)(
-                flat.tokens, flat.eqn_ids, flat.residual_state,
-                flat.vertex_idx, flat.pair_seq, flat.factor_seq,
-                flat.vertex_avail_mask, flat.preference, cached_flat, eval_keys,
+            log_p, ent = jax.vmap(_eval_one)(
+                flat.tokens, flat.eqn_ids, flat.residual_state, flat.vertex_idx,
+                *_mfields, flat.vertex_avail_mask, flat.preference, cached_flat, eval_keys,
             )
         log_p = log_p.reshape(E, T)
         ent = ent.reshape(E, T)
@@ -497,41 +541,50 @@ def _build_actor_state(
         # stays comparable across runs.
         weighted_terminal = jnp.sum(terminal_rewards * reward_weights, axis=-1)
 
+        # Conditional log-partition log Z_θ(ω) (MOGFN-PC, Jain et al. 2023):
+        # the partition function is a learned function of the preference, not a
+        # scalar. ``traj.preference`` is (E, T, NUM_VALUE_HEADS), constant over
+        # T, so take t=0.
+        w_pref = traj.preference[:, 0, :]                       # (E, NUM_VALUE_HEADS)
+        log_Z_w = jax.vmap(gfn_agent_local.log_Z)(w_pref)       # (E,)
+
         if args.mogfn_pc:
-            # MOGFN-PC log-space scalarization with per-channel
-            # normalization. Recipe (Jain et al. 2023, log-space variant):
-            #   log r̃_k = (symlog(r_k) - μ_k) / σ_k   if --reward-normalization=zscore
-            #             symlog(r_k)                  if --reward-normalization=none
-            #   log R(x|w) = β · Σ_k w_k · log r̃_{ch_k}(x)
-            # where w is the Dirichlet-sampled per-env preference and
-            # ch_k indexes the 3 user-selected reward channels.
+            # Per-channel normalized log-reward components z_k:
+            #   z_k = (symlog(r_k) - μ_k) / σ_k   (zscore)  |  symlog(r_k) (none)
+            # The env's rewards span ~1e8 (latency) … 1e-7 (frob), so the
+            # normalization keeps the scalarization well-conditioned. R̃_k =
+            # exp(z_k) > 0 is then a positive per-objective reward, which the
+            # paper's scalarizations require.
             terminal_symlog = jnp.sign(terminal_rewards) * jnp.log1p(
                 jnp.abs(terminal_rewards),
             )
             if args.reward_normalization == "zscore":
-                # Broadcast-safe; reward_stats_var has a 1e-6 floor so
-                # the denominator is bounded even with cold stats.
                 std = jnp.sqrt(reward_stats_var + 1e-6)
                 terminal_normalized = (terminal_symlog - reward_stats_mean) / std
             else:
                 terminal_normalized = terminal_symlog
-            # Project to preference subspace: (E, NUM_REWARDS) → (E, NUM_PREF_DIM=3)
-            terminal_pref_subspace = terminal_normalized[:, pref_indices_j]
-            # Per-env preference w. ``traj.preference`` is (E, T, NUM_VALUE_HEADS);
-            # MOGFN-PC sampled it once per episode and broadcast across T,
-            # so we just take t=0.
-            w = traj.preference[:, 0, :]   # (E, NUM_PREF_DIM)
-            # Optionally re-normalize w to the simplex in case the
-            # caller passed an un-normalized vector (Dirichlet already
-            # sums to 1, but a defensive divide costs nothing and
-            # protects the legacy --preference-conditioned path).
-            w = w / jnp.maximum(jnp.sum(w, axis=-1, keepdims=True), 1e-8)
-            log_R = beta * jnp.sum(w * terminal_pref_subspace, axis=-1)   # (E,)
+            z = terminal_normalized[:, pref_indices_j]          # (E, n_pref)
+            w = w_pref / jnp.maximum(jnp.sum(w_pref, axis=-1, keepdims=True), 1e-8)
+            scal = getattr(args, "scalarization", "ws")
+            if scal == "ws":
+                # Weighted-Sum (paper default/best): R(x|ω)=Σ_k w_k R̃_k used
+                # directly as the GFN reward ⇒ log R = β·log Σ_k w_k exp(z_k)
+                #                                    = β·logsumexp(z_k + log w_k).
+                log_R = beta * jax.nn.logsumexp(
+                    z + jnp.log(w + 1e-8), axis=-1,
+                )                                               # (E,)
+            elif scal == "wt":
+                # Weighted-Tchebycheff: R = -max_k w_k (z*_k - z_k); z* = batch max.
+                zstar = jnp.max(z, axis=0, keepdims=True)
+                g = jnp.max(w * (zstar - z), axis=-1)
+                log_R = -beta * g
+            else:  # "wl" — Weighted-log-sum (geometric): log R = β·Σ_k w_k z_k
+                log_R = beta * jnp.sum(w * z, axis=-1)
         else:
             # Legacy: scalar weighted sum, then symlog. Kept for ablation.
             log_R = beta * _symlog(weighted_terminal)
 
-        tb_residual = gfn_agent_local.logZ + sum_log_pf - sum_log_pb - log_R
+        tb_residual = log_Z_w + sum_log_pf - sum_log_pb - log_R
         tb_loss = jnp.mean(tb_residual ** 2)
         entropy_term = jnp.mean(jnp.sum(ent, axis=-1))
 
@@ -539,7 +592,7 @@ def _build_actor_state(
 
         metrics = (
             tb_loss,
-            gfn_agent_local.logZ,
+            jnp.mean(log_Z_w),
             jnp.mean(sum_log_pf),
             jnp.mean(sum_log_pb),
             jnp.mean(log_R),
@@ -619,6 +672,7 @@ def _build_actor_state(
         "vertex_features": vertex_features,
         "factor_table_np": factor_table_np,
         "max_rules": max_rules,
+        "max_substeps": max_substeps,
         "num_envs": num_envs,
         "rollout_length": rollout_length,
         "total_v": total_v,
@@ -960,10 +1014,21 @@ class GFNServerWorker:
         reward_stats_var_j = jnp.asarray(self.reward_stats.var, dtype=jnp.float32)
 
         v_np = np.asarray(fresh_traj.vertex_idx)
-        p_np = np.asarray(fresh_traj.pair_seq)
-        f_np = np.asarray(fresh_traj.factor_seq)
-        ftab = self.state["factor_table_np"]
-        max_rules = self.state["max_rules"]
+        # Typed micro-action sequences (DIAG/COMPRESS/QUANT, up to max_substeps
+        # rules per vertex) → decode each env's full per-vertex rule list.
+        mop_np = np.asarray(fresh_traj.micro_op_seq)
+        mi_np = np.asarray(fresh_traj.micro_i_seq)
+        mj_np = np.asarray(fresh_traj.micro_j_seq)
+        mf_np = np.asarray(fresh_traj.micro_factor_seq)
+        mk_np = np.asarray(fresh_traj.micro_kind_seq)
+        mq_np = np.asarray(fresh_traj.micro_quant_seq)
+        _max_substeps = int(self.state["max_substeps"])
+
+        def _decode_seq(idx: int):
+            return _action_to_pylist_dynamic(
+                v_np[idx], mop_np[idx], mi_np[idx], mj_np[idx],
+                mf_np[idx], mk_np[idx], mq_np[idx], _max_substeps,
+            )
 
         best_per_reward: dict[str, dict] = {}
         for j in range(NUM_REWARDS):
@@ -983,9 +1048,7 @@ class GFNServerWorker:
                 "weighted_value": float(weighted_per_env[bidx, j]),
                 "weighted_total": float(per_env_tot[bidx]),
                 "env_idx": bidx,
-                "seq": _action_to_pylist(
-                    v_np[bidx], p_np[bidx], f_np[bidx], max_rules, ftab,
-                ),
+                "seq": _decode_seq(bidx),
                 "all_raw": all_raw,
                 "all_weighted": all_weighted,
             }
@@ -1013,13 +1076,26 @@ class GFNServerWorker:
         }
         terminal_cs = per_env_terminal[:, REWARD_INDEX["cosine_sim"]]
 
+        # MOGFN Pareto-archive input: each (non-sentinel) sampled terminal's
+        # objective vector PAIRED with the full typed micro-action sequence
+        # that produced it (mirrors the C-MORL Pareto front). Sentinel
+        # filtering semantics live in the shared helper — see its docstring
+        # for why exact equality (not a magnitude threshold) is required.
+        from alphagrad.approx.common.cache import (
+            SENTINEL_REWARD_VALUE as _SENTINEL,
+        )
+        from alphagrad.approx.common.reward_scaling import (
+            build_terminal_solutions as _build_terminal_solutions,
+        )
+        terminal_solutions = _build_terminal_solutions(
+            per_env_terminal, _decode_seq, _SENTINEL,
+        )
+
         stats: dict = {
             "best_return": float(per_env_tot[best_idx]),
             "mean_return": float(per_env_tot.mean()),
-            "best_seq": _action_to_pylist(
-                v_np[best_idx], p_np[best_idx], f_np[best_idx],
-                max_rules, ftab,
-            ),
+            "terminal_solutions": terminal_solutions,
+            "best_seq": _decode_seq(best_idx),
             "best_overall_rewards": best_overall_rewards,
             "best_overall_weighted": best_overall_weighted,
             "per_reward_means": per_reward_means,

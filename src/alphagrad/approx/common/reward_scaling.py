@@ -252,6 +252,40 @@ def filter_sentinel_mask(reward_vec_np: np.ndarray, sentinel: float) -> np.ndarr
     return ~is_sentinel_any
 
 
+def build_terminal_solutions(
+    per_env_terminal: np.ndarray,
+    per_env_seqs,
+    sentinel: float,
+) -> list:
+    """Pareto-archive input rows: each NON-sentinel env's terminal objective
+    vector paired with the action sequence that produced it.
+
+    Sentinel filtering uses :func:`filter_sentinel_mask` — i.e. EXACT float
+    equality against ``sentinel`` over the cost channels, NOT a magnitude
+    threshold. Legitimate raw cost rewards routinely exceed 1e9 in magnitude
+    (muls_adds_fmas ≈ -7e12), so a ``<= -1e9``-style threshold flags every
+    env as a sentinel and leaves the archive permanently empty (a bug this
+    helper exists to centralise the fix for).
+
+    Args:
+        per_env_terminal: ``(N, NUM_REWARDS)`` raw terminal reward vectors.
+        per_env_seqs: callable ``idx -> seq`` OR an indexable of length N.
+        sentinel: the exact sentinel reward value (cache.SENTINEL_REWARD_VALUE).
+    """
+    keep = np.atleast_1d(filter_sentinel_mask(per_env_terminal, sentinel))
+    get_seq = (
+        per_env_seqs if callable(per_env_seqs) else (lambda n: per_env_seqs[n])
+    )
+    return [
+        {
+            "obj": [float(v) for v in per_env_terminal[n]],
+            "seq": get_seq(n),
+        }
+        for n in range(per_env_terminal.shape[0])
+        if bool(keep[n])
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Per-channel aggregation (replicates mu0_ray_worker.py:783-816)
 # ---------------------------------------------------------------------------

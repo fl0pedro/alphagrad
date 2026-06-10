@@ -106,6 +106,25 @@ def make_argparser() -> argparse.ArgumentParser:
         "reward signal. Applies to latency_ns, peak_memory, "
         "frob_residual, cosine_sim.",
     )
+    # --- Latency-measurement noise control (see env.py EnvConfig) ----------
+    p.add_argument(
+        "--latency-inner-reps", type=int, default=1,
+        help="Time each latency reading over a tight inner loop of N "
+        "back-to-back executions (one barrier, divided by N), via "
+        "perf_counter. Amortizes per-call dispatch overhead — the dominant "
+        "noise for sub-ms kernels. 1 = single call. Try 10-20.",
+    )
+    p.add_argument(
+        "--latency-warmup", type=int, default=0,
+        help="Discard the first K executions per data point before timing "
+        "(first-touch / cache warm-up). Try 3.",
+    )
+    p.add_argument(
+        "--latency-winsor", type=float, default=0.0,
+        help="If >0, aggregate the latency pool with a symmetric winsorized "
+        "mean at this trim fraction (e.g. 0.2) instead of --percentile-keep. "
+        "Empirically the most reproducible/discriminative latency estimator.",
+    )
     p.add_argument(
         "--spread-cpu-actors", action="store_true",
         help="Ray SPREAD scheduling for the CpuApproximationActors so "
@@ -120,6 +139,37 @@ def make_argparser() -> argparse.ArgumentParser:
         "slices from a per-node allocator (a cluster named actor) instead "
         "of the single-job static slice, so the concurrent jobs' actors "
         "don't collide on the same cores.",
+    )
+    # --- Off-policy replay (C-MORL V-trace actor-critic) -------------------
+    # When >0, store each episode's per-env trajectories in a circular replay
+    # buffer and train on minibatches SAMPLED from it (fresh + past episodes),
+    # with V-trace value targets + clipped-IS (the PPO ratio) — i.e. genuine
+    # off-policy actor-critic instead of on-policy PPO on the fresh rollout.
+    p.add_argument(
+        "--replay-buffer-size", type=int, default=0,
+        help="Replay-buffer capacity in TRAJECTORIES (per-env episodes). "
+        "0 = on-policy PPO on the fresh rollout (legacy). >0 = off-policy "
+        "V-trace actor-critic sampling from the buffer.",
+    )
+    p.add_argument(
+        "--replay-sample-trajs", type=int, default=0,
+        help="Trajectories sampled from the buffer per update (0 = num_envs).",
+    )
+    p.add_argument(
+        "--vtrace-rho-bar", type=float, default=1.0,
+        help="V-trace ρ̄ clip on the policy IS weight (rewards correction).",
+    )
+    p.add_argument(
+        "--vtrace-c-bar", type=float, default=1.0,
+        help="V-trace c̄ clip on the trace IS weight (value propagation).",
+    )
+    p.add_argument(
+        "--cpu-cores-per-actor", type=int, default=0,
+        help="Force each CpuApproximationActor to pin to exactly N CPU cores. "
+        "1 = single-core-per-actor (cleanest per-reading latency CV, ~25-30× "
+        "tighter, but single-threaded exec — set --num-cpu-workers ≈ #cores so "
+        "every core hosts one actor and throughput is recovered by cross-actor "
+        "parallelism). 0 = legacy auto slice (#cores // num_cpu_workers).",
     )
     p.add_argument(
         "--measure-queue", action="store_true",
@@ -451,7 +501,14 @@ def make_argparser() -> argparse.ArgumentParser:
     # substep (sequence) support is a follow-up.
     p.add_argument(
         "--dynamic-substeps", action="store_true",
-        help="Enable the typed micro-action policy (1 substep per vertex).",
+        help="Enable the typed micro-action policy (full multi-substep "
+        "DIAG/COMPRESS/QUANT sub-episode per vertex).",
+    )
+    p.add_argument(
+        "--max-substeps", type=int, default=16,
+        help="Maximum number of typed micro-actions (DIAG/COMPRESS/QUANT) "
+        "the policy may emit per vertex in the full dynamic-substeps scheme. "
+        "Must be <= env.MAX_RULES_PER_VERTEX (16) to avoid silent truncation.",
     )
     p.add_argument(
         "--factors", type=str, default="-1,2,3,4",

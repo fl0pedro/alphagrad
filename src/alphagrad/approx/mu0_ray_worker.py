@@ -191,6 +191,15 @@ def _build_actor_state(
         exec_on_gpu=args.exec_on_gpu,
         measure_latency=measure_latency,
         latency_samples=int(getattr(args, "latency_samples", 1)),
+        # Measurement-pool + latency-estimator knobs (getattr defaults so this
+        # is a no-op until mu0_args defines the flags — the exec loop now sizes
+        # the pool from num_data_points×reps_per_point, not latency_samples).
+        num_data_points=int(getattr(args, "num_data_points", 5)),
+        reps_per_point=int(getattr(args, "reps_per_point", 4)),
+        percentile_keep=float(getattr(args, "percentile_keep", 0.60)),
+        latency_inner_reps=int(getattr(args, "latency_inner_reps", 1)),
+        latency_warmup=int(getattr(args, "latency_warmup", 0)),
+        latency_winsor=float(getattr(args, "latency_winsor", 0.0)),
         terminal_rewards_only=args.terminal_rewards_only,
     )
 
