@@ -42,6 +42,10 @@ REWARD_NAMES: tuple[str, ...] = (
     "peak_memory",
     "cosine_sim",
     "frob_residual",
+    # index 8: deterministic XLA-analysis peak (temp+output+args). Keep in EXACT
+    # sync with env.REWARD_NAMES. peak_memory (5) = real measured peak (GPU);
+    # xla_peak_memory (8) = compile-time estimate (reliable on CPU).
+    "xla_peak_memory",
 )
 NUM_REWARDS: int = len(REWARD_NAMES)
 REWARD_INDEX: dict[str, int] = {n: i for i, n in enumerate(REWARD_NAMES)}

@@ -39,7 +39,12 @@ NUM_ENVS="${NUM_ENVS:-4}"
 SEED="${SEED:-42}"
 WANDB="${WANDB:-offline}"
 BETA="${BETA:-16}"
-OBJ="${OBJECTIVES:-latency_ns,peak_memory,cosine_sim}"
+# This launcher measures on the node's CPUs, where the RM peak is a sampled
+# high-water mark that misses sub-ms gradient allocations. Use the deterministic
+# XLA-analysis peak (xla_peak_memory: temp+output+args, order-discriminating) as
+# the memory objective. For GPU-MEASURED runs use the real measured peak_memory
+# instead (RM exact on GPU): OBJECTIVES=latency_ns,peak_memory,cosine_sim.
+OBJ="${OBJECTIVES:-latency_ns,xla_peak_memory,cosine_sim}"
 # Measure value_and_grad of the scalar training loss (the gradient that hits the
 # optimizer) instead of the full Jacobian — quality = cosine(approx grad, exact
 # grad). MEASURE_GRAD=0 reverts to Jacobian measurement.
