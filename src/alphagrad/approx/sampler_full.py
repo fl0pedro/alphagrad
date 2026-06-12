@@ -329,10 +329,22 @@ def make_actor_cls():
                 raw["reward_vec"] = [float(x) for x in np.asarray(reward)]
                 raw["invalid"] = False
             except Exception as exc:
+                # Keep failed sequences IN the database with all measurements
+                # marked NaN (uniform schema with valid rows) + the error, so
+                # failure modes can be analysed (group by `err`). A chunk of the
+                # full action space is invalid (int4/float8 QUANT into a matmul,
+                # DIAG factors that don't divide an axis, COMPRESS mid-order).
+                from alphagrad.approx.env import NUM_REWARDS
+                nan = float("nan")
                 raw = {
                     "idx": int(idx), "pass": int(pass_id), "invalid": True,
                     "err": f"{type(exc).__name__}: {str(exc)[:200]}",
                     "wall_s": round(time.time() - t0, 3),
+                    "reward_vec": [nan] * NUM_REWARDS,
+                    "muls_adds_fmas": nan, "max_io_sum": nan, "flops": nan,
+                    "bytes_accessed": nan, "xla_peak_memory": nan,
+                    "latency_ns_samples": [], "peak_memory_samples": [],
+                    "cosine_sim_per_point": [], "frob_residual_per_point": [],
                 }
             return raw
 
