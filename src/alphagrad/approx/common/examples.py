@@ -170,6 +170,20 @@ def get_fn(fn_str: str):
     return fn
 
 
+def scalar_loss_fn(fn):
+    """Wrap an example function into a SCALAR training loss by averaging its
+    outputs. Required for graphax ``grad`` / ``value_and_grad`` (which need a
+    scalar output) when measuring the GRADIENT instead of the full Jacobian.
+    The NeuralNetwork examples already return per-element squared errors, so the
+    mean is the MSE loss — the gradient that would hit the optimizer. Shared by
+    every measurement site (rollout worker + CPU measure-actor + gfn worker) so
+    the jaxpr/order/transforms all operate on the SAME scalar-loss graph."""
+    def _loss(*a):
+        return jnp.mean(fn(*a))
+
+    return _loss
+
+
 def infer_argnums(fn_str: str) -> tuple[int, ...]:
     """Default `argnums` (which input slots are differentiated through) per example name."""
     if fn_str.endswith("NeuralNetwork"):
