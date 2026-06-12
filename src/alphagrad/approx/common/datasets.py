@@ -22,7 +22,7 @@ import numpy as np
 
 # Default hidden / vmap sizes for the synthetic NeuralNetwork example. Kept here
 # so trainers and data-generators agree on the shapes.
-NN_HIDDEN_DIM = 128
+NN_HIDDEN_DIM = 256  # matrix+sampler at 256 (was 128)
 NN_VMAP_BATCH = 16
 
 _DATASET_CACHE: dict = {}
@@ -34,6 +34,8 @@ _MNIST_MIRROR = "https://storage.googleapis.com/cvdf-datasets/mnist"
 _MNIST_FILES = {
     "train_images": "train-images-idx3-ubyte.gz",
     "train_labels": "train-labels-idx1-ubyte.gz",
+    "test_images": "t10k-images-idx3-ubyte.gz",
+    "test_labels": "t10k-labels-idx1-ubyte.gz",
 }
 
 
@@ -75,12 +77,14 @@ def _read_idx_labels(path: Path) -> np.ndarray:
         return np.frombuffer(f.read(), dtype=np.uint8)
 
 
-def _load_mnist_native() -> tuple[np.ndarray, np.ndarray]:
-    """Train split of MNIST as ``(x_uint8 [N, 28, 28], y_uint8 [N])``."""
+def _load_mnist_native(subset: str = "train") -> tuple[np.ndarray, np.ndarray]:
+    """Train or test split of MNIST as ``(x_uint8 [N, 28, 28], y_uint8 [N])``."""
+    if subset not in ("train", "test"):
+        raise ValueError(f"subset must be 'train' or 'test', got {subset!r}")
     cache = _mnist_cache_dir()
     _download_mnist(cache)
-    x = _read_idx_images(cache / _MNIST_FILES["train_images"])
-    y = _read_idx_labels(cache / _MNIST_FILES["train_labels"])
+    x = _read_idx_images(cache / _MNIST_FILES[f"{subset}_images"])
+    y = _read_idx_labels(cache / _MNIST_FILES[f"{subset}_labels"])
     return x, y
 
 
@@ -91,18 +95,19 @@ def dataset_dims(name: str) -> tuple[int, int]:
     raise ValueError(f"Unknown dataset '{name}'")
 
 
-def load_dataset(name: str, dataset_size: int | None):
+def load_dataset(name: str, dataset_size: int | None, subset: str = "train"):
     """Load a dataset (cached) and return a `(x, y)` tuple of jnp arrays.
 
     `dataset_size` truncates the cached arrays when > 0; `None` or `<= 0` keeps
-    the full set.
+    the full set. `subset` selects the MNIST split (``"train"`` or ``"test"``).
+    Other datasets currently ignore ``subset`` (only ``"train"`` is supported).
     """
-    cache_key = (name, dataset_size)
+    cache_key = (name, dataset_size, subset)
     if cache_key in _DATASET_CACHE:
         return _DATASET_CACHE[cache_key]
 
     if name == "mnist":
-        x_np, y_np = _load_mnist_native()
+        x_np, y_np = _load_mnist_native(subset=subset)
         x_np = x_np.reshape(x_np.shape[0], -1).astype(np.float32) / 255.0
         y_np = np.eye(10, dtype=np.float32)[y_np]
         if dataset_size is not None and dataset_size > 0:
@@ -110,6 +115,10 @@ def load_dataset(name: str, dataset_size: int | None):
             y_np = y_np[:dataset_size]
         result = (jnp.asarray(x_np), jnp.asarray(y_np))
     else:
+        if subset != "train":
+            raise ValueError(
+                f"subset={subset!r} is only supported for MNIST"
+            )
         raise ValueError(f"Unknown dataset '{name}'")
 
     _DATASET_CACHE[cache_key] = result

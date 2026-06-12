@@ -14,9 +14,10 @@ import jax.numpy as jnp
 import jax.random as jrand
 import optax
 
-from alphagrad.approx.env import MAX_TOKENS, NUM_REWARDS
+from alphagrad.approx.env import MAX_TOKENS
 from alphagrad.approx.ppo import (
     NUM_PAIR_CHOICES,
+    NUM_VALUE_HEADS,
     PAIR_STOP,
     TrainBatch,
     _build_agent,
@@ -68,7 +69,7 @@ def build_one(no_ptr, not_autoreg, total_v=6, batch_size=8, seed=0):
     return _variant_label(use_pointer, use_autoreg), agent, factor_table, max_rules, num_factors, batch_key
 
 
-def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, num_rewards, key):
+def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, num_value_heads, key):
     keys = jrand.split(key, 10)
     tokens = jrand.randint(keys[0], (batch_size, MAX_TOKENS), 1, 256, dtype=jnp.int32)
     tokens = tokens.at[:, 100:].set(0)
@@ -86,13 +87,50 @@ def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, nu
     old_p = jnp.ones((batch_size, max_rules, num_pair_choices)) / num_pair_choices
     old_f = jnp.ones((batch_size, max_rules, num_factors)) / num_factors
 
-    estim_returns = jrand.normal(keys[4], (batch_size, num_rewards))
+    estim_returns = jrand.normal(keys[4], (batch_size, num_value_heads))
     norm_adv = jrand.normal(keys[5], (batch_size,))
     vertex_avail = jnp.ones((batch_size, total_v))
     # B.4 residual state — zero-init mirrors the rollout's first-step value.
     residual_state = jnp.zeros((batch_size, total_v, 32), dtype=jnp.float32)
-    # F preference vector — uniform 1/N as a stand-in for the per-env Dirichlet sample.
-    preference = jnp.full((batch_size, num_rewards), 1.0 / num_rewards, dtype=jnp.float32)
+    # F preference vector — uniform 1/K as a stand-in for the per-env Dirichlet sample.
+    preference = jnp.full(
+        (batch_size, num_value_heads), 1.0 / num_value_heads, dtype=jnp.float32,
+    )
+    # Dynamic-substeps fields — zero-filled because this synthetic test
+    # exercises the legacy rule head only. Shapes mirror the production
+    # rollout_fn placeholders (see _dyn_zero_* in ppo.main).
+    max_substeps = max_rules  # use the same bound for the test
+    max_primes = 9
+    max_axes_per_vertex = 8
+    # Op-type vocabulary: DIAG / COMPRESS / QUANT / END = 4.
+    num_ops = 4
+    max_exponent = 30
+    num_compress_kinds = 6
+    num_quant_dtypes = 28
+    micro_op_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
+    micro_i_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
+    micro_j_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
+    micro_exp_seq = jnp.zeros((batch_size, max_substeps, max_primes), dtype=jnp.int32)
+    micro_factor_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
+    micro_compress_kind_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
+    micro_quant_dtype_seq = jnp.zeros((batch_size, max_substeps), dtype=jnp.int32)
+    micro_op_dists = jnp.zeros((batch_size, max_substeps, num_ops), dtype=jnp.float32)
+    micro_i_dists = jnp.zeros(
+        (batch_size, max_substeps, max_axes_per_vertex), dtype=jnp.float32,
+    )
+    micro_j_dists = jnp.zeros(
+        (batch_size, max_substeps, max_axes_per_vertex), dtype=jnp.float32,
+    )
+    micro_exp_dists = jnp.zeros(
+        (batch_size, max_substeps, max_primes, max_exponent + 1),
+        dtype=jnp.float32,
+    )
+    micro_kind_dists = jnp.zeros(
+        (batch_size, max_substeps, num_compress_kinds), dtype=jnp.float32,
+    )
+    micro_quant_dists = jnp.zeros(
+        (batch_size, max_substeps, num_quant_dtypes), dtype=jnp.float32,
+    )
     return TrainBatch(
         tokens=tokens,
         eqn_ids=eqn_ids,
@@ -101,9 +139,22 @@ def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, nu
         vertex_idx=vertex_idx,
         pair_seq=pair_seq,
         factor_seq=factor_seq,
+        micro_op_seq=micro_op_seq,
+        micro_i_seq=micro_i_seq,
+        micro_j_seq=micro_j_seq,
+        micro_exp_seq=micro_exp_seq,
+        micro_factor_seq=micro_factor_seq,
+        micro_compress_kind_seq=micro_compress_kind_seq,
+        micro_quant_dtype_seq=micro_quant_dtype_seq,
         old_vertex_dist=old_v,
         old_pair_dists=old_p,
         old_factor_dists=old_f,
+        old_micro_op_dists=micro_op_dists,
+        old_micro_i_dists=micro_i_dists,
+        old_micro_j_dists=micro_j_dists,
+        old_micro_exp_dists=micro_exp_dists,
+        old_micro_kind_dists=micro_kind_dists,
+        old_micro_quant_dists=micro_quant_dists,
         estim_returns=estim_returns,
         norm_adv=norm_adv,
         vertex_avail_mask=vertex_avail,
@@ -158,7 +209,7 @@ def test_variant(no_ptr, not_autoreg):
 
     batch = fake_batch(
         batch_size, total_v, max_rules, num_factors, NUM_PAIR_CHOICES,
-        num_rewards=NUM_REWARDS, key=batch_key,
+        num_value_heads=NUM_VALUE_HEADS, key=batch_key,
     )
     pair_valid = jnp.ones((total_v, NUM_PAIR_CHOICES))
     pair_factor = jnp.ones((total_v, NUM_PAIR_CHOICES, num_factors))

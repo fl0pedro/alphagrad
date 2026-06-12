@@ -32,12 +32,21 @@ import jax.random as jrand
 
 from alphagrad.approx.env import (
     MAX_RULES_PER_VERTEX,
+    COMPRESS_SENTINEL,
     MAX_TOKENS,
     EnvConfig,
     StepAction,
     VertexEliminationEnv,
+    _apply_rules_to_axis_state,
     _callback,
     cossim,
+)
+from alphagrad.approx.env import (
+    _AXIS_FEAT_GROUP_ID,
+    _AXIS_FEAT_IS_COMPRESSED,
+    _AXIS_FEAT_IS_OUTPUT,
+    _AXIS_FEAT_SIZE,
+    AXIS_FEATURE_DIM,
 )
 
 
@@ -48,13 +57,16 @@ from alphagrad.approx.env import (
 
 def _tiny_jaxpr():
     """Build a closed jaxpr for `(x @ W).sum()` — the smallest thing whose
-    `_callback` produces a non-trivial sparsity_map."""
+    `_callback` produces a non-trivial transforms sequence. We use square
+    (4, 4) operands so multiple Diag rules on disjoint (out, primal) axis
+    pairs can share the divisor 4, which the env-side translator
+    accepts."""
 
     def fn(x, W):
         return jnp.sum(x @ W)
 
-    x = jnp.ones((4, 3), dtype=jnp.float32)
-    W = jnp.ones((3, 4), dtype=jnp.float32)
+    x = jnp.ones((4, 4), dtype=jnp.float32)
+    W = jnp.ones((4, 4), dtype=jnp.float32)
     return jax.make_jaxpr(fn)(x, W), (x, W)
 
 
@@ -122,30 +134,35 @@ def _build_callback_state(jaxpr_closed, total_v):
     return initial_order, initial_specs
 
 
-def _spy_extract_jaxpr_to_record_sparsity_map():
-    """Patch out the heavy graphax call so we just record the sparsity_map
-    that `_callback` would forward, without paying the matmul cost."""
+def _spy_extract_jaxpr_to_record_transforms():
+    """Patch out the heavy graphax call so we just record the
+    `transforms` sequence that `_callback` would forward, without paying
+    the matmul cost. With the typed-transform migration the kwarg is
+    `transforms=[(v, (Diag, Compress, ...)), ...]` (was `sparsity_map`
+    before)."""
 
-    captured = {"sparsity_map": None}
+    captured = {"transforms": None}
 
     class _StubVE:
         def tokenized(self):
             return jnp.zeros((MAX_TOKENS,), dtype=jnp.int32)
 
-    def fake_extract_jaxpr(*args, sparsity_map=None, **kwargs):
-        captured["sparsity_map"] = sparsity_map
+    def fake_extract_jaxpr(*args, transforms=None, **kwargs):
+        captured["transforms"] = transforms
         return _StubVE()
 
     return captured, fake_extract_jaxpr
 
 
-def test_callback_forwards_arbitrary_factors_unchanged():
-    """The env now relies on the autoreg policy's per-(vertex, pair, factor)
-    mask + the rewritten `apply_dynamic_sparsity` to make every factor safe.
-    `_callback` therefore forwards whatever factor the agent picked
-    verbatim — no coercion to ``-1``. This pins that contract."""
+def test_callback_forwards_arbitrary_factors_as_diag():
+    """`_callback` translates each EnvState.sparsity_specs row into a typed
+    `Diag(i, j, factor)` and forwards them via the new `transforms=...`
+    kwarg. Positive divisors pass through with the same factor value; the
+    -1 sentinel is resolved to `math.gcd(d1, d2)` (since apply_diag rejects
+    sentinels). This pins both behaviours."""
+    from graphax.sparse.micro_actions import Diag
 
-    print("\n[env] _callback forwards factors verbatim (no env-side coercion)")
+    print("\n[env] _callback emits Diag transforms with explicit factors")
     closed_jaxpr, args = _tiny_jaxpr()
     total_v = len(closed_jaxpr.jaxpr.eqns)
 
@@ -161,10 +178,9 @@ def test_callback_forwards_arbitrary_factors_unchanged():
     )
 
     initial_order, initial_specs = _build_callback_state(closed_jaxpr, total_v)
-    # Plant rules with non-(-1) factors. We use distinct (bi1, bi2) on the
-    # SAME vertex to test multi-rule forwarding rather than multiple
-    # vertices (downstream eqns are scalar reductions that have no
-    # (idx1, idx2) pair the callback would forward).
+    # Plant rules with non-(-1) factors on disjoint logical axis pairs:
+    # pair (0, 0) → idx1=0, idx2=2; pair (1, 1) → idx1=1, idx2=3. Both
+    # have axis sizes (4, 4) so divisors 2 and 4 are both legal.
     sparsity_specs = (
         initial_specs
         .at[0, 0].set(jnp.array([0, 0, 2], jnp.int32))
@@ -172,7 +188,7 @@ def test_callback_forwards_arbitrary_factors_unchanged():
     )
     stop = jnp.asarray(total_v, dtype=jnp.int32)
 
-    captured, fake_extract = _spy_extract_jaxpr_to_record_sparsity_map()
+    captured, fake_extract = _spy_extract_jaxpr_to_record_transforms()
     with mock.patch("alphagrad.approx.env.extract_jaxpr", fake_extract):
         _callback(
             config,
@@ -184,29 +200,31 @@ def test_callback_forwards_arbitrary_factors_unchanged():
             init=True,
         )
 
-    sm = captured["sparsity_map"]
-    assert sm is not None and len(sm) > 0, (
-        f"_callback didn't forward any sparsity rules; got {sm!r}"
+    transforms = captured["transforms"]
+    assert transforms is not None and len(transforms) > 0, (
+        f"_callback didn't forward any transforms; got {transforms!r}"
     )
-    forwarded_factors = [factor for _v, rules in sm for (_i1, _i2, factor) in rules]
-    # The two factors we planted (2 and 4) must survive — this is the
-    # contract that graphax's `apply_dynamic_sparsity` is responsible for.
+    forwarded_factors = [
+        t.factor for _v, ts in transforms for t in ts if isinstance(t, Diag)
+    ]
     assert 2 in forwarded_factors, (
-        f"factor=2 was stripped; got {forwarded_factors}. The env should "
-        "no longer coerce factors — graphax handles them now."
+        f"factor=2 was stripped; got {forwarded_factors}."
     )
     assert 4 in forwarded_factors, (
         f"factor=4 was stripped; got {forwarded_factors}."
     )
-    print(f"  forwarded sparsity_map = {sm}")
-    print(f"  all forwarded factors = {forwarded_factors}")
+    print(f"  forwarded transforms = {transforms}")
+    print(f"  Diag factors = {forwarded_factors}")
 
 
-def test_callback_keeps_minus_one_factors_unchanged():
-    """The legitimate factor=-1 path must still go through unchanged: that's
-    the only factor the rest of graphax handles correctly today."""
+def test_callback_resolves_minus_one_factor_to_gcd():
+    """The legacy factor=-1 sentinel meant "gcd-collapse". With the typed
+    transform API, apply_diag rejects sentinels, so `_callback` resolves
+    -1 to the actual gcd(d1, d2) integer before emitting the Diag.
+    """
+    from graphax.sparse.micro_actions import Diag
 
-    print("\n[env] _callback keeps factor=-1 rules verbatim")
+    print("\n[env] _callback resolves factor=-1 to explicit gcd")
     closed_jaxpr, args = _tiny_jaxpr()
     total_v = len(closed_jaxpr.jaxpr.eqns)
 
@@ -224,16 +242,252 @@ def test_callback_keeps_minus_one_factors_unchanged():
     sparsity_specs = initial_specs.at[0, 0].set(jnp.array([0, 0, -1], jnp.int32))
     stop = jnp.asarray(total_v, dtype=jnp.int32)
 
-    captured, fake_extract = _spy_extract_jaxpr_to_record_sparsity_map()
+    captured, fake_extract = _spy_extract_jaxpr_to_record_transforms()
     with mock.patch("alphagrad.approx.env.extract_jaxpr", fake_extract):
         _callback(
             config, args, closed_jaxpr.literals,
             initial_order, sparsity_specs, stop, init=True,
         )
 
-    sm = captured["sparsity_map"]
-    assert sm and sm[0][1][0][2] == -1, f"expected factor=-1 to survive, got {sm}"
-    print(f"  sparsity_map = {sm}")
+    transforms = captured["transforms"]
+    assert transforms is not None and len(transforms) > 0, (
+        "expected at least one Diag transform after -1 → gcd resolution"
+    )
+    first_diag = transforms[0][1][0]
+    assert isinstance(first_diag, Diag) and first_diag.factor > 0, (
+        f"expected -1 to resolve to a positive divisor, got {first_diag}"
+    )
+    print(f"  transforms = {transforms}")
+
+
+# ---------------------------------------------------------------------------
+# Multi-invar invariant: rules that don't fit every invar must be dropped
+# ---------------------------------------------------------------------------
+
+
+def test_callback_drops_rules_that_dont_fit_every_invar():
+    """graphax's `_eliminate_vertex` applies each transform to every
+    incoming edge of the vertex; if a vertex has heterogeneous-rank
+    invars (e.g. ``div((4,), ())``), a Diag with ``j`` past the scalar
+    edge's primal dims raises inside ``apply_diag``. Caught the
+    `Diag.j = 1 out of range [0, 1); out_dims=1, primal_dims=0` crash
+    in the PPO smoke test on Helmholtz.
+
+    The env-side translator must therefore validate the rule against
+    EVERY non-literal invar and silently drop it when any one of them
+    can't host the chosen ``(bi1, bi2)`` pair.
+    """
+    from graphax import examples
+    from graphax.sparse.micro_actions import Diag
+
+    print("\n[env] _callback drops rules that don't fit every invar")
+    target_fn = examples.Helmholtz
+    x = jnp.array([0.05, 0.15, 0.25, 0.35], dtype=jnp.float32)
+    closed_jaxpr = jax.make_jaxpr(target_fn)(x)
+    jaxpr = closed_jaxpr.jaxpr
+    total_v = len(jaxpr.eqns)
+
+    # Find the div vertex; its second invar is the scalar denominator,
+    # which is exactly the multi-invar shape mismatch we want to test.
+    div_idx = next(
+        i for i, e in enumerate(jaxpr.eqns) if e.primitive.name == "div"
+    )
+
+    config = EnvConfig(
+        jaxpr=jaxpr,
+        argnums=(0,),
+        has_aux=False,
+        sparse=False,
+        cmp_type="graphax",
+        mem_type="graphax",
+        target_fun=None,
+        data_gen=None,
+    )
+    initial_order, initial_specs = _build_callback_state(closed_jaxpr, total_v)
+    # Plant (0, 0, -1) on the div vertex — fits the (4,) numerator but
+    # not the () denominator. The translator must reject it.
+    sparsity_specs = initial_specs.at[div_idx, 0].set(
+        jnp.array([0, 0, -1], jnp.int32)
+    )
+    stop = jnp.asarray(total_v, dtype=jnp.int32)
+
+    captured, fake_extract = _spy_extract_jaxpr_to_record_transforms()
+    with mock.patch("alphagrad.approx.env.extract_jaxpr", fake_extract):
+        _callback(
+            config, (x,), closed_jaxpr.literals,
+            initial_order, sparsity_specs, stop, init=True,
+        )
+
+    transforms = captured["transforms"] or []
+    div_v = div_idx + 1
+    div_entry = next((t for t in transforms if t[0] == div_v), None)
+    assert div_entry is None, (
+        f"rule on div (scalar-invar) leaked through: {div_entry}. "
+        "The translator must validate against EVERY invar, not just invars[0]."
+    )
+    print(f"  div vertex correctly excluded from transforms = {transforms}")
+
+
+# ---------------------------------------------------------------------------
+# COMPRESS sentinel: env-side emits `graphax.Compress` per slot
+# ---------------------------------------------------------------------------
+
+
+def test_callback_emits_compress_for_sentinel_rows():
+    """A `[COMPRESS_SENTINEL, axis, 0]` row in `sparsity_specs` must
+    become a `graphax.sparse.micro_actions.Compress(axes=(axis,))` in
+    the forwarded transforms — that's the bridge that lets the typed
+    micro-action policy's COMPRESS sub-step actually reduce the val.
+    """
+    from graphax.sparse.micro_actions import Compress, Diag
+
+    print("\n[env] _callback emits Compress for COMPRESS_SENTINEL rows")
+    closed_jaxpr, args = _tiny_jaxpr()
+    total_v = len(closed_jaxpr.jaxpr.eqns)
+
+    config = EnvConfig(
+        jaxpr=closed_jaxpr.jaxpr,
+        argnums=(0, 1),
+        has_aux=False,
+        sparse=False,
+        cmp_type="graphax",
+        mem_type="graphax",
+        target_fun=None,
+        data_gen=None,
+    )
+    initial_order, initial_specs = _build_callback_state(closed_jaxpr, total_v)
+    # Vertex 0 (matmul) has out_shape=(4, 4), primal_shape=(4, 4) →
+    # out_len=2, physical axes 0..3 are valid. Plant one COMPRESS on
+    # axis 0 (an output axis) and one DIAG on the remaining pair.
+    sparsity_specs = (
+        initial_specs
+        .at[0, 0].set(jnp.array([COMPRESS_SENTINEL, 0, 0], jnp.int32))
+        .at[0, 1].set(jnp.array([1, 1, -1], jnp.int32))
+    )
+    stop = jnp.asarray(total_v, dtype=jnp.int32)
+
+    captured, fake_extract = _spy_extract_jaxpr_to_record_transforms()
+    with mock.patch("alphagrad.approx.env.extract_jaxpr", fake_extract):
+        _callback(
+            config, args, closed_jaxpr.literals,
+            initial_order, sparsity_specs, stop, init=True,
+        )
+
+    transforms = captured["transforms"]
+    assert transforms is not None and len(transforms) > 0, (
+        f"_callback emitted no transforms; got {transforms!r}"
+    )
+    # The vertex 1 (vertex_id, not index) entry should contain both a
+    # Compress and a Diag.
+    flat = [t for _v, ts in transforms for t in ts]
+    types = {type(t).__name__ for t in flat}
+    assert "Compress" in types, f"no Compress emitted; got {flat}"
+    assert "Diag" in types, f"no Diag emitted (DIAG slot dropped); got {flat}"
+    compress = next(t for t in flat if isinstance(t, Compress))
+    assert compress.axes == (0,), (
+        f"unexpected Compress.axes={compress.axes}, expected (0,)"
+    )
+    print(f"  forwarded transforms = {transforms}")
+
+
+def test_callback_compress_drops_out_of_range_axes():
+    """COMPRESS axes outside every invar's edge rank must be dropped at
+    the env-side translator. Helmholtz's `v4 = div((4,), ())` has a
+    scalar denominator: a COMPRESS on physical axis 1 fits the (4,)
+    edge but not the () edge, so apply_compress would crash. The
+    translator drops it.
+    """
+    from graphax import examples
+    from graphax.sparse.micro_actions import Compress
+
+    print("\n[env] _callback drops out-of-range COMPRESS axes")
+    target_fn = examples.Helmholtz
+    x = jnp.array([0.05, 0.15, 0.25, 0.35], dtype=jnp.float32)
+    closed_jaxpr = jax.make_jaxpr(target_fn)(x)
+    jaxpr = closed_jaxpr.jaxpr
+    total_v = len(jaxpr.eqns)
+    div_idx = next(
+        i for i, e in enumerate(jaxpr.eqns) if e.primitive.name == "div"
+    )
+
+    config = EnvConfig(
+        jaxpr=jaxpr, argnums=(0,), has_aux=False, sparse=False,
+        cmp_type="graphax", mem_type="graphax",
+        target_fun=None, data_gen=None,
+    )
+    initial_order, initial_specs = _build_callback_state(closed_jaxpr, total_v)
+    # axis 1 is the primal-side first axis. For div((4,), ()), the
+    # scalar invar has primal_dims=0, so primal_pos=0 is out of range.
+    sparsity_specs = initial_specs.at[div_idx, 0].set(
+        jnp.array([COMPRESS_SENTINEL, 1, 0], jnp.int32),
+    )
+    stop = jnp.asarray(total_v, dtype=jnp.int32)
+
+    captured, fake_extract = _spy_extract_jaxpr_to_record_transforms()
+    with mock.patch("alphagrad.approx.env.extract_jaxpr", fake_extract):
+        _callback(
+            config, (x,), closed_jaxpr.literals,
+            initial_order, sparsity_specs, stop, init=True,
+        )
+
+    transforms = captured["transforms"] or []
+    div_v = div_idx + 1
+    div_entry = next((t for t in transforms if t[0] == div_v), None)
+    assert div_entry is None, (
+        f"COMPRESS on the div's scalar-edge axis leaked through: {div_entry}. "
+        "The translator must validate against every invar's edge rank."
+    )
+    print(f"  div vertex correctly excluded from transforms = {transforms}")
+
+
+# ---------------------------------------------------------------------------
+# Per-vertex axis_state mutation reflects DIAG + COMPRESS rules
+# ---------------------------------------------------------------------------
+
+
+def test_apply_rules_to_axis_state_diag_and_compress():
+    """`_apply_rules_to_axis_state` should update size / group_id /
+    is_compressed on the affected slots and leave everything else alone.
+    The function is JAX-traceable and runs inside the jitted env.step,
+    so we exercise it via jax.jit here too — catches type errors that
+    only surface under tracing.
+    """
+    print("\n[env] _apply_rules_to_axis_state mutates touched axes only")
+    # Vertex with 2 output axes (size 4, 4) and 2 primal axes (size 4, 4).
+    axis_state_v = jnp.zeros((6, AXIS_FEATURE_DIM), dtype=jnp.int32)
+    axis_state_v = (
+        axis_state_v
+        .at[:, _AXIS_FEAT_GROUP_ID].set(-1)
+        .at[0, _AXIS_FEAT_SIZE].set(4).at[0, _AXIS_FEAT_IS_OUTPUT].set(1)
+        .at[1, _AXIS_FEAT_SIZE].set(4).at[1, _AXIS_FEAT_IS_OUTPUT].set(1)
+        .at[2, _AXIS_FEAT_SIZE].set(4).at[2, _AXIS_FEAT_IS_OUTPUT].set(0)
+        .at[3, _AXIS_FEAT_SIZE].set(4).at[3, _AXIS_FEAT_IS_OUTPUT].set(0)
+    )
+    # Slot 0: DIAG bi1=0, bi2=0, factor=2 → pair (out 0, primal 0) at gid=0, sizes 4→2.
+    # Slot 1: COMPRESS axis=3 → mark primal axis 1 (token idx 3) compressed, size→1.
+    # Slot 2: end sentinel.
+    rule_specs = jnp.array([
+        [0, 0, 2],
+        [COMPRESS_SENTINEL, 3, 0],
+        [-1, -1, 0],
+        [-1, -1, 0],
+    ], dtype=jnp.int32)
+
+    out = jax.jit(_apply_rules_to_axis_state)(axis_state_v, rule_specs)
+
+    # DIAG effects
+    assert int(out[0, _AXIS_FEAT_GROUP_ID]) == 0
+    assert int(out[2, _AXIS_FEAT_GROUP_ID]) == 0  # primal at token n_out + bi2 = 2 + 0 = 2
+    assert int(out[0, _AXIS_FEAT_SIZE]) == 2
+    assert int(out[2, _AXIS_FEAT_SIZE]) == 2
+    # COMPRESS effects on token 3 (primal axis 1)
+    assert int(out[3, _AXIS_FEAT_IS_COMPRESSED]) == 1
+    assert int(out[3, _AXIS_FEAT_SIZE]) == 1
+    # Untouched: output axis 1 (token 1)
+    assert int(out[1, _AXIS_FEAT_GROUP_ID]) == -1
+    assert int(out[1, _AXIS_FEAT_SIZE]) == 4
+    assert int(out[1, _AXIS_FEAT_IS_COMPRESSED]) == 0
+    print(f"  out axis_state[0..3] = {out[:4].tolist()}")
 
 
 # ---------------------------------------------------------------------------
@@ -281,8 +535,12 @@ def main():
     print("=== env._callback regression tests ===")
     test_cossim_aggregation_single_sample_is_not_nan()
     test_cossim_aggregation_full_quartile_path_unchanged()
-    test_callback_forwards_arbitrary_factors_unchanged()
-    test_callback_keeps_minus_one_factors_unchanged()
+    test_callback_forwards_arbitrary_factors_as_diag()
+    test_callback_resolves_minus_one_factor_to_gcd()
+    test_callback_drops_rules_that_dont_fit_every_invar()
+    test_callback_emits_compress_for_sentinel_rows()
+    test_callback_compress_drops_out_of_range_axes()
+    test_apply_rules_to_axis_state_diag_and_compress()
     test_env_step_roundtrip_on_helmholtz()
     print("\nALL ENV CALLBACK TESTS OK")
 
