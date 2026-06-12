@@ -1878,6 +1878,9 @@ def _callback(
             [float(x) for x in latency_samples] if config.measure_latency else []
         )
         raw_sink["peak_memory_samples"] = [float(x) for x in peak_mem_samples]
+        # Deterministic XLA-analysis peak (temp+output+args) — the reliable
+        # peak channel on CPU where the RM sampled peak misses sub-ms allocs.
+        raw_sink["xla_peak_memory"] = float(xla_peak_memory)
         raw_sink["cosine_sim_per_point"] = (
             [float(x) for x in cosines] if (is_terminal and out_exacts) else []
         )

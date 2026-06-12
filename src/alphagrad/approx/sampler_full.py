@@ -107,6 +107,15 @@ def parse_args():
     p.add_argument("--actor-num-gpus", type=float, default=0.0,
                    help="GPUs reserved per measurement actor (1.0 with --exec-on-gpu)")
     p.add_argument("--ray-address", default=None)
+    p.add_argument("--measure-grad", action="store_true",
+                   help="measure value_and_grad of the scalar loss (the gradient "
+                        "computation) instead of the full Jacobian; records the "
+                        "grad-cosine quality + the deterministic xla_peak_memory "
+                        "channel — matches the MORL trainers' measurement.")
+    p.add_argument("--latency-timer", default="perf_counter",
+                   choices=["perf_counter", "rm"],
+                   help="latency timer: perf_counter (default) or rm (fixed "
+                        "ResourceMonitor).")
     return p.parse_args()
 
 
@@ -132,6 +141,10 @@ def make_args_dict(a) -> dict:
         intermediate_rewards=False,  # terminal-only
         cost_pipeline_schedule="always_full",
         seed=int(a.seed),
+        # Grad-mode measurement + deterministic xla_peak_memory channel — mirrors
+        # the MORL trainers so the sampled space matches what they optimize.
+        measure_grad=bool(getattr(a, "measure_grad", False)),
+        latency_timer=str(getattr(a, "latency_timer", "perf_counter")),
     )
 
 
