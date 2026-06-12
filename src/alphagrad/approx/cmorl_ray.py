@@ -103,55 +103,14 @@ def _sample_preference(rng, n_obj, alpha, sampler, offset):
     return rng.dirichlet(np.full(n_obj, alpha)).astype(np.float32)
 
 
-def _pareto_mask(points):
-    """Boolean mask of non-dominated rows (maximization)."""
-    pts = np.asarray(points, dtype=np.float64)
-    if pts.ndim != 2 or pts.shape[0] == 0:
-        return np.zeros((pts.shape[0],), dtype=bool)
-    ge = np.all(pts[:, None, :] >= pts[None, :, :], axis=-1)
-    gt = np.any(pts[:, None, :] > pts[None, :, :], axis=-1)
-    return ~np.any(ge & gt, axis=0)
-
-
-def _hv2d_min(pts, ref):
-    pts = pts[np.argsort(pts[:, 0])]
-    rx, ry = ref
-    hv = (ry - pts[0, 1]) * (rx - pts[0, 0])
-    for i in range(1, pts.shape[0]):
-        hv += (pts[i - 1, 1] - pts[i, 1]) * (rx - pts[i, 0])
-    return float(hv)
-
-
-def _hv3d_min(pts, ref):
-    pts = pts[np.argsort(pts[:, 2])]
-    rx, ry, rz = ref
-    vol, active, i, n = 0.0, [], 0, pts.shape[0]
-    while i < n:
-        z = pts[i, 2]
-        while i < n and pts[i, 2] == z:
-            active.append(pts[i, :2])
-            i += 1
-        z_next = pts[i, 2] if i < n else rz
-        vol += _hv2d_min(np.asarray(active), (rx, ry)) * (z_next - z)
-    return float(vol)
-
-
-def _hypervolume(points, ref):
-    """Hypervolume dominated by `points` (maximization) above nadir `ref`."""
-    pts = np.asarray(points, dtype=np.float64)
-    ref = np.asarray(ref, dtype=np.float64)
-    if pts.ndim != 2 or pts.shape[0] == 0:
-        return 0.0
-    m = pts.shape[1]
-    if m not in (2, 3):
-        return float("nan")
-    pts = pts[_pareto_mask(pts)]
-    pts = pts[np.all(pts > ref, axis=1)]
-    if pts.shape[0] == 0:
-        return 0.0
-    if m == 2:
-        return _hv2d_min(-pts, (-ref[0], -ref[1]))
-    return _hv3d_min(-pts, (-ref[0], -ref[1], -ref[2]))
+# Pareto-front / hypervolume math is shared with ppo_ray + gfn_ray via the
+# single source in common.pareto_archive (avoids the 3-way drift the reviewer
+# caught — e.g. a missing maximization negation in one copy).
+from alphagrad.approx.common.pareto_archive import (  # noqa: E402
+    ParetoArchive,
+    pareto_mask as _pareto_mask,
+    hypervolume as _hypervolume,
+)
 
 
 def _extend_argparser(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -389,66 +348,51 @@ def _run(args) -> int:
     obj_names, obj_idx = _resolve_objectives(args.objectives)
     n_obj = len(obj_idx)
     rng = np.random.default_rng(int(args.seed))
-    archive_pts: list = []   # per-solution objective vectors (maximize)
-    archive_seqs: list = []  # the elimination sequence that produced each point
-
-    def _archive_add(solutions) -> None:
-        added = False
-        for sol in solutions or []:
-            # sol = {"obj": full-reward-vector, "seq": elimination sequence}
-            vec = sol["obj"] if isinstance(sol, dict) else sol
-            seq = sol.get("seq") if isinstance(sol, dict) else None
-            g = np.array([vec[obj_idx[k]] for k in range(n_obj)], dtype=np.float64)
-            if not np.all(np.isfinite(g)):
-                continue
-            if any(np.allclose(g, p) for p in archive_pts):  # skip duplicates
-                continue
-            archive_pts.append(g)
-            archive_seqs.append(seq)
-            added = True
-        if added:
-            keep = np.where(_pareto_mask(np.stack(archive_pts)))[0]
-            keep_set = set(int(i) for i in keep)
-            archive_pts[:] = [archive_pts[i] for i in range(len(archive_pts)) if i in keep_set]
-            archive_seqs[:] = [archive_seqs[i] for i in range(len(archive_seqs)) if i in keep_set]
-
-    def _archive_hv() -> float:
-        if not archive_pts:
-            return 0.0
-        pts = np.stack(archive_pts)
-        return _hypervolume(pts, pts.min(axis=0) - 1.0)
-
-    import json as _json
+    # Shared Pareto-front archive (front + all-time candidate record + HV) —
+    # single implementation in common.pareto_archive, reused by ppo_ray/gfn_ray.
+    archive = ParetoArchive(obj_names, obj_idx)
+    _ep_box = [0]  # current global episode, updated by the per-episode logger
+    _pareto_extra = {
+        "dynamic_substeps": bool(getattr(args, "dynamic_substeps", False)),
+        "seq_format": (
+            "[vertex, [<call>, ...]] per eliminated vertex, where <call> "
+            "is one of diag(i, j, factor) / compress('kind', axis) / "
+            "quant('dtype') — the full typed micro-action sub-episode"
+            if getattr(args, "dynamic_substeps", False)
+            else "[vertex] per step"
+        ),
+    }
     pareto_path = os.path.join(
         os.path.dirname(best_seq_json_path) or os.getcwd(), "cmorl_pareto_front.json"
     )
+    all_cand_path = os.path.join(
+        os.path.dirname(best_seq_json_path) or os.getcwd(),
+        "cmorl_all_front_candidates.json",
+    )
+
+    def _archive_add(solutions) -> None:
+        # sol = {"obj": full-reward-vector, "seq": seq} (or a bare reward vector)
+        archive.add_many(
+            [((sol["obj"] if isinstance(sol, dict) else sol),
+              (sol.get("seq") if isinstance(sol, dict) else None))
+             for sol in (solutions or [])],
+            _ep_box[0],
+        )
+
+    def _archive_hv() -> float:
+        return archive.hypervolume()
 
     def _dump_pareto() -> None:
-        """Persist the full Pareto archive — each point's objective vector AND
-        the elimination sequence that produced it — so the frontier is
-        recoverable (not just the front extremes in best_sequences.json)."""
-        payload = {
-            "objectives": list(obj_names),
-            "hypervolume": _archive_hv(),
-            "num_points": len(archive_pts),
-            "dynamic_substeps": bool(getattr(args, "dynamic_substeps", False)),
-            "seq_format": (
-                "[vertex, [<call>, ...]] per eliminated vertex, where <call> "
-                "is one of diag(i, j, factor) / compress('kind', axis) / "
-                "quant('dtype') — the full typed micro-action sub-episode"
-                if getattr(args, "dynamic_substeps", False)
-                else "[vertex] per step"
-            ),
-            "front": [
-                {"obj": {nm: float(v) for nm, v in zip(obj_names, pt)}, "seq": seq}
-                for pt, seq in zip(archive_pts, archive_seqs)
-            ],
-        }
         try:
-            with open(pareto_path, "w") as _f:
-                _json.dump(payload, _f, indent=2)
+            archive.dump_front(pareto_path, extra=_pareto_extra)
         except Exception as _exc:
             tqdm.write(f"  [C-MORL] pareto dump failed: {_exc}")
+
+    def _dump_all_candidates() -> None:
+        try:
+            archive.dump_all_candidates(all_cand_path)
+        except Exception as _exc:
+            tqdm.write(f"  [C-MORL] all-candidate dump failed: {_exc}")
 
     # Preference population: objective corners (unit vectors) + interior samples.
     prefs = [np.eye(n_obj, dtype=np.float32)[k] for k in range(n_obj)]
@@ -470,6 +414,24 @@ def _run(args) -> int:
     pbar = tqdm(total=total_episodes, desc="cmorl_ray", leave=True, ncols=180)
     global_ep = 0
 
+    import time as _time_mod
+    _t_train_start = _time_mod.time()
+    _max_wall = float(getattr(args, "max_wall_seconds", 0.0) or 0.0)
+    # Wall-clock budget: when elapsed training time exceeds --max-wall-seconds
+    # (0 = unlimited), _episode flips this and the stage loops break out, falling
+    # through to the final archive dump with everything explored preserved.
+    _stop_box = [False]
+
+    def _wall_budget_hit() -> bool:
+        if _max_wall > 0 and (_time_mod.time() - _t_train_start) > _max_wall:
+            if not _stop_box[0]:
+                tqdm.write(
+                    f"  [C-MORL] wall-clock budget ({_max_wall:.0f}s) reached "
+                    "— stopping after this episode; dumping final archive."
+                )
+            _stop_box[0] = True
+        return _stop_box[0]
+
     def _episode(w_full, stage_tag: str, target=None):
         nonlocal seed_counter, global_ep
         seed_counter += 1
@@ -482,7 +444,7 @@ def _run(args) -> int:
         ent = stats.get("entropy", float("nan"))
         pbar.update(1)
         pbar.set_description(
-            f"cmorl[{stage_tag}] hv:{hv:.3g} arch:{len(archive_pts)} "
+            f"cmorl[{stage_tag}] hv:{hv:.3g} arch:{len(archive.pts)} "
             f"best:{state['best_global_return']:+.3g} mean:{ep_mean:+.3g} "
             f"ent:{ent:.3f} nan:{int(stats.get('nan_skip_count', 0))}"
         )
@@ -494,7 +456,7 @@ def _run(args) -> int:
         log_dict.setdefault("entropy", ent)
         log_dict["cmorl/stage"] = 1 if stage_tag == "init" else 2
         log_dict["cmorl/hypervolume"] = hv
-        log_dict["cmorl/archive_size"] = len(archive_pts)
+        log_dict["cmorl/archive_size"] = len(archive.pts)
         for k, nm in enumerate(obj_names):
             log_dict[f"cmorl/pref/{nm}"] = float(w_full[obj_idx[k]])
         if target is not None:
@@ -503,7 +465,9 @@ def _run(args) -> int:
         if best_seq_every > 0 and (global_ep + 1) % best_seq_every == 0:
             dump_best_sequences_json(state, best_seq_json_path)
             wandb.log(build_best_sequences_wandb_payload(state, ep=global_ep))
+        _ep_box[0] = global_ep
         _dump_pareto()  # keep the Pareto front (points+sequences) JSON current
+        _dump_all_candidates()  # keep the all-time front-candidate record current
         global_ep += 1
         return stats
 
@@ -515,10 +479,14 @@ def _run(args) -> int:
     ray.get(actor.set_extension.remote(-1))  # no extension during Stage 1
     policy_records = []  # (ckpt_path, w_np, obj_vec_np)
     for k, w in enumerate(prefs):
+        if _stop_box[0]:
+            break
         ray.get(actor.reset_agent.remote(int(args.seed) + 1000 + k))
         w_full = _pref_to_full_weights(w, obj_idx)
         last_stats = None
         for _ in range(eps_per_policy):
+            if _wall_budget_hit():
+                break
             last_stats = _episode(w_full, "init")
         tvec = last_stats.get("terminal_reward_vec", {}) if last_stats else {}
         obj_vec = np.array([tvec.get(n, np.nan) for n in obj_names], dtype=np.float64)
@@ -531,7 +499,7 @@ def _run(args) -> int:
         )
 
     # ---- Stage 2: IPO Pareto extension ----
-    if do_stage2:
+    if do_stage2 and not _stop_box[0]:
         beta = float(args.extension_beta)
         ipo_t = float(args.ipo_t)
         feasible = [r for r in policy_records if np.all(np.isfinite(r[2]))]
@@ -543,6 +511,8 @@ def _run(args) -> int:
                 f"{args.extension_episodes} eps (beta={beta}, ipo_t={ipo_t})"
             )
             for step in range(int(args.extension_steps)):
+                if _wall_budget_hit():
+                    break
                 m = step % n_obj
                 # extend the front extreme on m: the policy that already does best on m
                 ckpt, _w_sel, obj_vec = max(feasible, key=lambda r: r[2][m])
@@ -572,20 +542,27 @@ def _run(args) -> int:
                     np.eye(n_obj, dtype=np.float32)[m], obj_idx
                 )
                 for _ in range(int(args.extension_episodes)):
+                    if _wall_budget_hit():
+                        break
                     _episode(w_full, "extend", target=m)
             ray.get(actor.set_extension.remote(-1))  # clear extension
 
     pbar.close()
     tqdm.write(
-        f"  [C-MORL] final Pareto archive: {len(archive_pts)} points, "
+        f"  [C-MORL] final Pareto archive: {len(archive.pts)} points, "
         f"hypervolume={_archive_hv():.6g}"
     )
-    for _pt in archive_pts:
+    for _pt in archive.pts:
         tqdm.write(
             "    " + ", ".join(f"{nm}={v:.4g}" for nm, v in zip(obj_names, _pt))
         )
     _dump_pareto()
+    _dump_all_candidates()
     tqdm.write(f"  [C-MORL] Pareto front (points+sequences) -> {pareto_path}")
+    tqdm.write(
+        f"  [C-MORL] all-time front candidates ({len(archive.all_candidates)}) "
+        f"-> {all_cand_path}"
+    )
 
     tqdm.write("\n========== FINAL ==========")
     tqdm.write(

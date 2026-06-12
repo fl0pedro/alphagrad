@@ -129,53 +129,13 @@ def _ensure_curriculum_for_variant(args, variant: str) -> None:
 # Pareto-front helpers (host-side, numpy) — same routines as cmorl_ray so the
 # MOGFN front is recorded in the identical format for comparison.
 # ---------------------------------------------------------------------------
-def _pareto_mask(points):
-    pts = np.asarray(points, dtype=np.float64)
-    if pts.ndim != 2 or pts.shape[0] == 0:
-        return np.zeros((pts.shape[0],), dtype=bool)
-    ge = np.all(pts[:, None, :] >= pts[None, :, :], axis=-1)
-    gt = np.any(pts[:, None, :] > pts[None, :, :], axis=-1)
-    return ~np.any(ge & gt, axis=0)
-
-
-def _hv2d_min(pts, ref):
-    pts = pts[np.argsort(pts[:, 0])]
-    rx, ry = ref
-    hv = (ry - pts[0, 1]) * (rx - pts[0, 0])
-    for i in range(1, pts.shape[0]):
-        hv += (pts[i - 1, 1] - pts[i, 1]) * (rx - pts[i, 0])
-    return float(hv)
-
-
-def _hv3d_min(pts, ref):
-    pts = pts[np.argsort(pts[:, 2])]
-    rx, ry, rz = ref
-    vol, active, i, n = 0.0, [], 0, pts.shape[0]
-    while i < n:
-        z = pts[i, 2]
-        while i < n and pts[i, 2] == z:
-            active.append(pts[i, :2])
-            i += 1
-        z_next = pts[i, 2] if i < n else rz
-        vol += _hv2d_min(np.asarray(active), (rx, ry)) * (z_next - z)
-    return float(vol)
-
-
-def _hypervolume(points, ref):
-    pts = np.asarray(points, dtype=np.float64)
-    ref = np.asarray(ref, dtype=np.float64)
-    if pts.ndim != 2 or pts.shape[0] == 0:
-        return 0.0
-    m = pts.shape[1]
-    if m not in (2, 3):
-        return float("nan")
-    pts = pts[_pareto_mask(pts)]
-    pts = pts[np.all(pts > ref, axis=1)]
-    if pts.shape[0] == 0:
-        return 0.0
-    if m == 2:
-        return _hv2d_min(-pts, (-ref[0], -ref[1]))
-    return _hv3d_min(-pts, (-ref[0], -ref[1], -ref[2]))
+# Shared single source for Pareto/HV math (see common.pareto_archive) — keeps
+# gfn_ray, cmorl_ray and ppo_ray from drifting (the reviewer's 3-copy finding).
+from alphagrad.approx.common.pareto_archive import (  # noqa: E402
+    ParetoArchive,
+    pareto_mask as _pareto_mask,
+    hypervolume as _hypervolume,
+)
 
 
 def _run_one_variant(args, variant: str) -> None:
@@ -318,57 +278,48 @@ def _run_one_variant(args, variant: str) -> None:
         if s.strip()
     ]
     _obj_idx = [_RIDX[n] for n in _obj_names]
-    _arch_pts: list = []
-    _arch_seqs: list = []
+    # Shared Pareto-front archive (single implementation in common.pareto_archive,
+    # reused by cmorl_ray/ppo_ray).
+    _archive = ParetoArchive(_obj_names, _obj_idx)
+    _ep_box = [0]
+    _pareto_extra = {
+        "seq_format": (
+            "[vertex, [<call>, ...]] per eliminated vertex, where <call> "
+            "is one of diag(i, j, factor) / compress('kind', axis) / "
+            "quant('dtype') — the full typed micro-action sub-episode"
+        ),
+    }
     _pareto_json = os.path.join(
         os.path.dirname(_best_seq_path) or os.getcwd(),
         f"mogfn_pareto_front.{variant}.json",
     )
+    _all_cand_json = os.path.join(
+        os.path.dirname(_best_seq_path) or os.getcwd(),
+        f"mogfn_all_front_candidates.{variant}.json",
+    )
 
     def _arch_add(sols) -> None:
-        added = False
-        for sol in sols or []:
-            vec = sol.get("obj")
-            g = np.array([vec[i] for i in _obj_idx], dtype=np.float64)
-            if not np.all(np.isfinite(g)):
-                continue
-            if any(np.allclose(g, p) for p in _arch_pts):
-                continue
-            _arch_pts.append(g)
-            _arch_seqs.append(sol.get("seq"))
-            added = True
-        if added:
-            keep = set(int(i) for i in np.where(_pareto_mask(np.stack(_arch_pts)))[0])
-            _arch_pts[:] = [_arch_pts[i] for i in range(len(_arch_pts)) if i in keep]
-            _arch_seqs[:] = [_arch_seqs[i] for i in range(len(_arch_seqs)) if i in keep]
+        _archive.add_many(
+            [(sol.get("obj"), sol.get("seq")) for sol in (sols or [])],
+            _ep_box[0],
+        )
 
     def _arch_hv() -> float:
-        if not _arch_pts:
-            return 0.0
-        pts = np.stack(_arch_pts)
-        return _hypervolume(pts, pts.min(axis=0) - 1.0)
+        return _archive.hypervolume()
 
     def _dump_pareto() -> None:
-        payload = {
-            "objectives": _obj_names,
-            "hypervolume": _arch_hv(),
-            "num_points": len(_arch_pts),
-            "seq_format": (
-                "[vertex, [<call>, ...]] per eliminated vertex, where <call> "
-                "is one of diag(i, j, factor) / compress('kind', axis) / "
-                "quant('dtype') — the full typed micro-action sub-episode"
-            ),
-            "front": [
-                {"obj": {n: float(v) for n, v in zip(_obj_names, pt)}, "seq": seq}
-                for pt, seq in zip(_arch_pts, _arch_seqs)
-            ],
-        }
         try:
             os.makedirs(os.path.dirname(_pareto_json) or ".", exist_ok=True)
-            with open(_pareto_json, "w") as _f:
-                json.dump(payload, _f, indent=2)
+            _archive.dump_front(_pareto_json, extra=_pareto_extra)
         except Exception as _exc:
             tqdm.write(f"  [MOGFN] pareto dump failed: {_exc}")
+
+    def _dump_all_candidates() -> None:
+        try:
+            os.makedirs(os.path.dirname(_all_cand_json) or ".", exist_ok=True)
+            _archive.dump_all_candidates(_all_cand_json)
+        except Exception as _exc:
+            tqdm.write(f"  [MOGFN] all-candidate dump failed: {_exc}")
 
     def _build_state() -> dict:
         return {
@@ -388,7 +339,18 @@ def _run_one_variant(args, variant: str) -> None:
         ncols=180,
     )
 
+    import time as _time_mod
+    _t_train_start = _time_mod.time()
+    _max_wall = float(getattr(args, "max_wall_seconds", 0.0) or 0.0)
     for ep in range(variant_args.episodes):
+        # Wall-clock budget (--max-wall-seconds, 0 = unlimited): stop cleanly;
+        # the final + per-episode dumps preserve everything explored so far.
+        if _max_wall > 0 and (_time_mod.time() - _t_train_start) > _max_wall:
+            tqdm.write(
+                f"  [MOGFN] wall-clock budget ({_max_wall:.0f}s) reached at "
+                f"ep {ep} — stopping; dumping final archive."
+            )
+            break
         seed_counter += 1
         stats = ray.get(
             spmd_actor.run_rollout_and_train.remote(
@@ -421,8 +383,10 @@ def _run_one_variant(args, variant: str) -> None:
                 best_per_reward[name] = {**info, "ep": ep}
 
         # Update + persist the MOGFN Pareto front (points + sequences).
+        _ep_box[0] = ep
         _arch_add(stats.get("terminal_solutions", []))
         _dump_pareto()
+        _dump_all_candidates()
 
         # ---- Progress bar (one line, updated in place) ----
         pbar.update(1)
@@ -508,12 +472,17 @@ def _run_one_variant(args, variant: str) -> None:
 
     pbar.close()
     _dump_pareto()
+    _dump_all_candidates()
 
     # ---- Final per-variant summary -----------------------------------
     tqdm.write(f"\n========== [{variant}] FINAL ==========")
     tqdm.write(
-        f"  MOGFN Pareto front: {len(_arch_pts)} points, hv={_arch_hv():.6g} "
+        f"  MOGFN Pareto front: {len(_archive.pts)} points, hv={_arch_hv():.6g} "
         f"-> {_pareto_json}"
+    )
+    tqdm.write(
+        f"  MOGFN all-time front candidates: {len(_archive.all_candidates)} "
+        f"-> {_all_cand_json}"
     )
     tqdm.write(f"  overall best weighted return: {best_global_return:+.6g}  (found at ep {best_global_ep})")
     if best_global_rewards:

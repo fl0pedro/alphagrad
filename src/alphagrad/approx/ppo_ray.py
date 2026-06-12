@@ -26,6 +26,7 @@ import os
 import sys
 import time
 
+import numpy as np
 from tqdm import tqdm
 
 # Plain threading lock so tqdm doesn't leak a named POSIX semaphore on
@@ -45,14 +46,17 @@ from alphagrad.approx.common.ray_runtime import (  # noqa: E402
     add_common_ray_args,
 )
 from alphagrad.approx.common.reward_scaling import (  # noqa: E402
+    REWARD_NAMES,
     build_best_sequences_wandb_payload,
     build_best_sequences_wandb_table,
+    build_reward_weights,
     build_wandb_log_dict,
     dump_best_sequences_json,
     format_milestone_line,
     init_running_bests,
     update_running_bests,
 )
+from alphagrad.approx.common.pareto_archive import ParetoArchive  # noqa: E402
 
 
 def _extend_argparser(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -288,6 +292,55 @@ def _run(args) -> int:
             best_seq_json_path = os.path.abspath("best_sequences.json")
     best_seq_every = int(getattr(args, "best_sequences_every", 0) or 0)
 
+    # Pareto archive — the multi-objective frontier this single-objective run
+    # sweeps through. Objectives = the channels with nonzero scalarising weight
+    # (i.e. exactly what --rewards/--cmp-type/--mem-type select; on CPU the mem
+    # channel is the deterministic xla_peak_memory — see build_reward_weights).
+    _rw = build_reward_weights(args)
+    _obj_idx = [int(i) for i in np.nonzero(_rw)[0]]
+    _obj_names = [REWARD_NAMES[i] for i in _obj_idx]
+    pareto = ParetoArchive(_obj_names, _obj_idx) if _obj_idx else None
+    _arch_dir = os.path.dirname(best_seq_json_path) or os.getcwd()
+    pareto_front_path = os.path.join(_arch_dir, "ppo_pareto_front.json")
+    pareto_all_path = os.path.join(_arch_dir, "ppo_all_front_candidates.json")
+    _arch_extra = {"dynamic_substeps": bool(getattr(args, "dynamic_substeps", False))}
+
+    def _feed_pareto(stats: dict, ep: int) -> None:
+        """Admit this episode's candidate terminals (overall-best env + each
+        per-channel best env) to the Pareto archive — each carries its full
+        reward_vec (dict name->raw) and elimination sequence."""
+        if pareto is None:
+            return
+
+        def _vec(d):  # name->value dict -> full reward_vec (NaN-filled)
+            return [float(d.get(REWARD_NAMES[i], float("nan"))) for i in range(len(REWARD_NAMES))]
+
+        sols = []
+        bor = stats.get("best_overall_rewards")
+        # ``is not None`` (not truthiness): an empty seq is a valid pure-VE
+        # terminal — don't silently drop the scalar-best from the archive.
+        if isinstance(bor, dict) and stats.get("best_seq") is not None:
+            sols.append((_vec(bor), stats["best_seq"]))
+        for entry in (stats.get("best_per_reward") or {}).values():
+            if isinstance(entry, dict) and entry.get("all_raw") is not None and entry.get("seq") is not None:
+                sols.append((_vec(entry["all_raw"]), entry["seq"]))
+        pareto.add_many(sols, ep)
+
+    def _dump_pareto() -> None:
+        if pareto is None:
+            return
+        try:
+            pareto.dump_front(pareto_front_path, extra=_arch_extra)
+            pareto.dump_all_candidates(pareto_all_path, extra=_arch_extra)
+        except Exception as _exc:
+            tqdm.write(f"  [ppo_ray] pareto dump failed: {_exc}")
+
+    # Wall-clock budget: stop cleanly after the current episode once elapsed
+    # training time exceeds --max-wall-seconds (0 = unbounded), so a long run
+    # still flushes its best-sequences + Pareto archive on exit.
+    _max_wall = float(getattr(args, "max_wall_seconds", 0.0) or 0.0)
+    _t_train_start = time.time()
+
     pbar = tqdm(
         total=args.episodes,
         desc="ppo_ray",
@@ -297,6 +350,12 @@ def _run(args) -> int:
     )
 
     for ep in range(args.episodes):
+        if _max_wall > 0 and (time.time() - _t_train_start) > _max_wall:
+            tqdm.write(
+                f"  [ppo_ray] wall-clock budget ({_max_wall:.0f}s) reached "
+                f"at episode {ep} — stopping; dumping final archives."
+            )
+            break
         seed_counter += 1
 
         # Curriculum stage / variant transition. ``compute_variant_at_episode``
@@ -337,6 +396,7 @@ def _run(args) -> int:
         ent = stats.get("entropy", float("nan"))
 
         update_running_bests(state, stats, ep)
+        _feed_pareto(stats, ep)
 
         pbar.update(1)
         pbar.set_description(
@@ -369,6 +429,7 @@ def _run(args) -> int:
             (ep + 1) % best_seq_every == 0 or ep == args.episodes - 1
         ):
             dump_best_sequences_json(state, best_seq_json_path)
+            _dump_pareto()
             wandb.log(
                 build_best_sequences_wandb_payload(state, ep=ep)
             )
@@ -414,6 +475,13 @@ def _run(args) -> int:
     final_path = dump_best_sequences_json(state, best_seq_json_path)
     if final_path:
         tqdm.write(f"  best-sequences JSON written: {final_path}")
+    _dump_pareto()
+    if pareto is not None:
+        tqdm.write(
+            f"  pareto archive: {len(pareto.pts)} front pts / "
+            f"{len(pareto.all_candidates)} candidates over "
+            f"{_obj_names} -> {pareto_front_path}"
+        )
     final_payload = build_best_sequences_wandb_payload(
         state, ep=args.episodes - 1
     )
