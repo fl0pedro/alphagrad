@@ -207,7 +207,7 @@ _AXIS_FEAT_GROUP_ID = 3
 #   6 cosine_sim       — cosine similarity between flattened approximated and
 #                        exact Jacobians, averaged over the calibration samples.
 #   7 frob_residual    — relative Frobenius residual ||J_e - J_a||_F / ||J_e||_F.
-NUM_REWARDS = 8
+NUM_REWARDS = 9
 REWARD_NAMES: tuple[str, ...] = (
     "muls_adds_fmas",
     "flops",
@@ -217,9 +217,15 @@ REWARD_NAMES: tuple[str, ...] = (
     "peak_memory",
     "cosine_sim",
     "frob_residual",
+    # index 8: DETERMINISTIC XLA peak (memory_analysis temp+output+args).
+    # ``peak_memory`` (index 5) is the REAL measured peak (exact on GPU, sampled
+    # & unreliable for sub-ms execs on CPU); this channel is the compile-time
+    # XLA estimate — reliable + order-discriminating on CPU. Use peak_memory for
+    # GPU-measured runs, xla_peak_memory for CPU-measured runs.
+    "xla_peak_memory",
 )
 REWARD_INDEX = {name: i for i, name in enumerate(REWARD_NAMES)}
-COMPUTE_REWARD_INDICES = tuple(range(0, 6))  # cost components
+COMPUTE_REWARD_INDICES = (0, 1, 2, 3, 4, 5, 8)  # cost components (incl. xla peak)
 QUALITY_REWARD_INDICES = (6, 7)             # cosine, frobenius
 
 # Sentinel reward returned when a per-vertex transform sequence matches an
@@ -1299,6 +1305,7 @@ def _callback(
             [
                 -muls_adds_fmas, 0.0, 0.0, -max_io_sum,
                 0.0, 0.0, 0.0, 0.0,
+                0.0,  # xla_peak_memory (no compiled fn on the cheap path)
             ],
             dtype=jnp.float32,
         )
@@ -1528,6 +1535,7 @@ def _callback(
                 -float(bytes_accessed),  # peak_memory surrogate
                 0.0,                     # cosine_sim (worst)
                 -1.0,                    # frob_residual = 1.0 (100% error)
+                -float(bytes_accessed),  # xla_peak_memory surrogate (rejected)
             ],
             dtype=jnp.float32,
         )
@@ -1663,7 +1671,7 @@ def _callback(
         _peak_captured = None
         for _w in range(_warmup):
             _ws = _measure_time.perf_counter()
-            if (not _bypass_rm) and _det_peak is None and _w == _warmup - 1:
+            if (not _bypass_rm) and _w == _warmup - 1:
                 with ResourceMonitor(devices=unique_devices) as _wmon:
                     _wout = compiled_approx(*eval_args_i)
                 jax.block_until_ready(_wout)
@@ -1693,9 +1701,7 @@ def _callback(
                 # context (duration = true device time, validated ≈ perf_counter)
                 # and reads peak memory from the SAME pass on the first rep — one
                 # execution serves both the latency and peak-memory channels.
-                _want_peak = (
-                    r == 0 and _peak_captured is None and _det_peak is None
-                )
+                _want_peak = (r == 0 and _peak_captured is None)
                 with ResourceMonitor(
                     devices=unique_devices, time=True, peak=_want_peak,
                 ) as _tmon:
@@ -1703,7 +1709,7 @@ def _callback(
                         out_approx = compiled_approx(*eval_args_i)
                     jax.block_until_ready(out_approx)
                 _lat_ns = _tmon.duration / _inner * 1e9
-                if r == 0 and _det_peak is None:
+                if r == 0:
                     peak_mem_samples.append(
                         _peak_captured if _peak_captured is not None
                         else float(_tmon.stats.get("memory", 0.0))
@@ -1716,7 +1722,7 @@ def _callback(
                     out_approx = compiled_approx(*eval_args_i)
                 jax.block_until_ready(out_approx)
                 _lat_ns = (_measure_time.perf_counter() - _t0) / _inner * 1e9
-                if r == 0 and _det_peak is None:
+                if r == 0:
                     if _peak_captured is not None:
                         peak_mem_samples.append(_peak_captured)
                     elif _bypass_rm:
@@ -1800,12 +1806,14 @@ def _callback(
                 latency_ns = _percentile_pool(_lat_valid, pk)
             if latency_ns < _LAT_FLOOR_NS:
                 latency_ns = -SENTINEL_REWARD_VALUE
-    # Deterministic XLA peak (temp+output+args) when available; else the
-    # RM-sampled high-water-mark pool (unreliable for sub-ms CPU execs).
-    if _det_peak is not None:
-        peak_memory = _det_peak
-    else:
-        peak_memory = _percentile_pool(peak_mem_samples, pk)
+    # peak_memory = REAL measured peak (RM): exact on GPU (clear_memory_stats +
+    # peak_bytes_in_use), a sampled high-water mark on CPU. The deterministic
+    # XLA-analysis peak is reported SEPARATELY as the ``xla_peak_memory`` channel
+    # (reliable on CPU where RM polling misses sub-ms grad allocs).
+    peak_memory = _percentile_pool(peak_mem_samples, pk)
+    # XLA-analysis peak (temp+output+args). Falls back to the measured peak only
+    # if memory_analysis was unavailable (so it's never a false 0).
+    xla_peak_memory = _det_peak if _det_peak is not None else float(peak_memory)
 
     # ------------------------------------------------------------------
     # Quality family — cosine similarity + relative Frobenius residual.
@@ -1887,6 +1895,7 @@ def _callback(
             -peak_memory,
             cosine_sim,
             -frob_residual,
+            -xla_peak_memory,
         ],
         dtype=jnp.float32,
     )
