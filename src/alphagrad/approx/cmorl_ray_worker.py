@@ -398,6 +398,11 @@ class PPORayWorker:
             dataset=dataset_for_call,
             dataset_size=self.args.dataset_size,
         )
+        # Gradient mode: measure value_and_grad of the SCALAR training loss so
+        # the env target / jaxpr / order / micro-action transforms all operate
+        # on the same scalar-loss graph. Shared wrap — see ``maybe_scalar_loss``.
+        from alphagrad.approx.common import maybe_scalar_loss
+        target_fn, measure_grad = maybe_scalar_loss(self.args, target_fn)
         closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
         argnums = infer_argnums(self.args.example)
         # Always pass target_fun so flops/bytes_accessed/latency_ns/peak_memory
@@ -434,6 +439,8 @@ class PPORayWorker:
             latency_inner_reps=int(getattr(self.args, "latency_inner_reps", 1)),
             latency_warmup=int(getattr(self.args, "latency_warmup", 0)),
             latency_winsor=float(getattr(self.args, "latency_winsor", 0.0)),
+            measure_grad=measure_grad,
+            latency_timer=str(getattr(self.args, "latency_timer", "perf_counter")),
         )
         # Per-rollout resampling stores the bank size here so we can
         # refresh the same way each episode (see run_rollout_and_train).
@@ -2489,7 +2496,9 @@ class PPORayWorker:
         contract as ``_fan_out_tokenize``.
         """
         import ray
-        from ray.util import ActorPool
+        from ray.exceptions import RayActorError, GetTimeoutError
+        from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+        from alphagrad.approx.common.reward_scaling import filter_sentinel_mask
 
         N = order_np.shape[0]
         n_points = max(int(getattr(self.args, "num_data_points", 5)), 1)
@@ -2510,18 +2519,35 @@ class PPORayWorker:
             for e in range(N)
             for p in range(n_points)
         ]
-        pool = ActorPool(actors)
-        results = list(
-            pool.map(
-                lambda a, t: a.evaluate.remote(
-                    t[2], t[3], t[4], point_idx=t[1],
-                ),
-                tasks,
-            )
-        )  # preserves task order
-
-        from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
-        from alphagrad.approx.common.reward_scaling import filter_sentinel_mask
+        # RESILIENT dispatch (replaces ray.util.ActorPool.map, which raises
+        # ActorDiedError and kills the whole run if ANY worker dies mid-task).
+        # Round-robin submit to live actors, then ray.get each future guarded:
+        # a worker that dies (OOM/SIGSEGV) or hangs (timeout) degrades that
+        # (env,point) task to a SENTINEL reward — filtered downstream — instead
+        # of crashing the episode. With single-core actors this is also OOM-
+        # resilient over long runs (a killed worker just costs one data point).
+        _sentinel_result = (
+            np.zeros(MAX_TOKENS, dtype=np.int32),
+            np.zeros(MAX_TOKENS, dtype=np.int32),
+            np.full(NUM_REWARDS, SENTINEL_REWARD_VALUE, dtype=np.float32),
+        )
+        _t_out = float(getattr(self.args, "cpu_callback_timeout", 0.0) or 0.0)
+        _t_out = _t_out if _t_out > 0 else None
+        submitted = [
+            (ti, actors[ti % len(actors)].evaluate.remote(
+                t[2], t[3], t[4], point_idx=t[1]))
+            for ti, t in enumerate(tasks)
+        ]
+        results = [None] * len(tasks)
+        for ti, fut in submitted:
+            try:
+                results[ti] = ray.get(fut, timeout=_t_out)
+            except (RayActorError, GetTimeoutError, Exception):
+                try:
+                    ray.cancel(fut, force=True)
+                except Exception:
+                    pass
+                results[ti] = _sentinel_result
 
         tokens_out = np.zeros((N, MAX_TOKENS), dtype=np.int32)
         eqn_ids_out = np.zeros((N, MAX_TOKENS), dtype=np.int32)
@@ -2533,8 +2559,6 @@ class PPORayWorker:
             # Per-point reward vectors for this env (each already P60'd
             # over its R reps inside _callback).
             pr = np.stack([results[base + p][2] for p in range(n_points)])  # (P, K)
-            tokens_out[e] = results[base][0]
-            eqn_ids_out[e] = results[base][1]
             # Drop per-point SENTINEL rows (timeout / failed measurement)
             # BEFORE the percentile. Interpolating a -1e10 sentinel against
             # real costs would fabricate a finite ~-4e9 "measurement" that
@@ -2544,8 +2568,15 @@ class PPORayWorker:
             keep = np.atleast_1d(filter_sentinel_mask(pr, SENTINEL_REWARD_VALUE))
             if not keep.any():
                 rewards_out[e] = pr[0]          # the sentinel vector itself
+                tokens_out[e] = results[base][0]
+                eqn_ids_out[e] = results[base][1]
                 sentinel_mask[e] = True
                 continue
+            # Source the env's obs tokens from a SURVIVING point (point 0 may
+            # have been the dead/timed-out task → zeroed tokens otherwise).
+            first_kept = int(np.argmax(keep))
+            tokens_out[e] = results[base + first_kept][0]
+            eqn_ids_out[e] = results[base + first_kept][1]
             pr_valid = pr[keep]
             # Aggregate across the surviving points with the same "keep worst
             # pk" rule the single-call path uses. Cost channels are stored

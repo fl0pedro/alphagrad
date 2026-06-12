@@ -303,6 +303,10 @@ class CpuApproximationServer:
         if args_dict is None:
             return False  # paranoid; nothing to rebuild from
         target_fn = get_fn(args_dict["example"])
+        # Match the grad-mode scalar-loss wrapping used at env-build time so the
+        # swapped-in target stays the same scalar-loss graph (shared wrap).
+        from alphagrad.approx.common import maybe_scalar_loss
+        target_fn, _ = maybe_scalar_loss(args_dict, target_fn)
         new_config = self._config._replace(target_fun=target_fn)
         # Swap on the env via eqx.tree_at so the JAX-side state survives.
         self._env = eqx.tree_at(lambda e: e.config, self._env, new_config)
@@ -369,6 +373,11 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
     )
+    # Gradient mode: THIS env (inside the CpuApproximationActor) does the actual
+    # pooled measurement, so the scalar-loss wrapping + jaxpr must mirror the
+    # trainer exactly, or grad-mode runs would silently measure the Jacobian.
+    from alphagrad.approx.common import maybe_scalar_loss
+    target_fn, measure_grad = maybe_scalar_loss(args, target_fn)
     closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
     argnums = infer_argnums(args.example)
 
@@ -427,6 +436,8 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         latency_inner_reps=int(getattr(args, "latency_inner_reps", 1)),
         latency_warmup=int(getattr(args, "latency_warmup", 0)),
         latency_winsor=float(getattr(args, "latency_winsor", 0.0)),
+        measure_grad=measure_grad,
+        latency_timer=str(getattr(args, "latency_timer", "perf_counter")),
         slow_exec_cutoff_seconds=float(
             getattr(args, "slow_exec_cutoff_seconds", 15.0)
         ),

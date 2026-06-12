@@ -157,6 +157,10 @@ def _build_actor_state(
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
     )
+    # Gradient mode: measure value_and_grad of the scalar loss — build the
+    # jaxpr + env target from the reduced scalar (shared wrap).
+    from alphagrad.approx.common import maybe_scalar_loss
+    target_fn, measure_grad = maybe_scalar_loss(args, target_fn)
     closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
     argnums = infer_argnums(args.example)
 
@@ -182,6 +186,8 @@ def _build_actor_state(
         latency_inner_reps=int(getattr(args, "latency_inner_reps", 1)),
         latency_warmup=int(getattr(args, "latency_warmup", 0)),
         latency_winsor=float(getattr(args, "latency_winsor", 0.0)),
+        measure_grad=measure_grad,
+        latency_timer=str(getattr(args, "latency_timer", "perf_counter")),
         slow_exec_cutoff_seconds=float(
             getattr(args, "slow_exec_cutoff_seconds", 8.0)
         ),

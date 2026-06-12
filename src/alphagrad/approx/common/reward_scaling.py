@@ -42,6 +42,10 @@ REWARD_NAMES: tuple[str, ...] = (
     "peak_memory",
     "cosine_sim",
     "frob_residual",
+    # index 8: deterministic XLA-analysis peak (temp+output+args). Keep in EXACT
+    # sync with env.REWARD_NAMES. peak_memory (5) = real measured peak (GPU);
+    # xla_peak_memory (8) = compile-time estimate (reliable on CPU).
+    "xla_peak_memory",
 )
 NUM_REWARDS: int = len(REWARD_NAMES)
 REWARD_INDEX: dict[str, int] = {n: i for i, n in enumerate(REWARD_NAMES)}
@@ -273,6 +277,15 @@ def build_terminal_solutions(
         sentinel: the exact sentinel reward value (cache.SENTINEL_REWARD_VALUE).
     """
     keep = np.atleast_1d(filter_sentinel_mask(per_env_terminal, sentinel))
+    # Also drop ALL-ZERO reward vectors. A real terminal always has nonzero
+    # deterministic cost channels (muls_adds_fmas / flops > 0 for any real
+    # graph), so an all-zero vector is a SENTINEL that was zeroed upstream
+    # (run_rollout_and_train zeroes sentinel transitions for GAE stability)
+    # BEFORE this exact -1e10 filter ran — so the == sentinel test misses it.
+    # Such a point reads (latency 0, mem 0, frob 0) and Pareto-dominates every
+    # real solution, collapsing the archive to it. Reject it.
+    nonzero = np.any(np.abs(np.asarray(per_env_terminal)) > 1e-9, axis=-1)
+    keep = np.asarray(keep) & np.atleast_1d(nonzero)
     get_seq = (
         per_env_seqs if callable(per_env_seqs) else (lambda n: per_env_seqs[n])
     )

@@ -92,6 +92,8 @@ _LAZY: dict[str, tuple[str, str]] = {
     "data_gen": ("alphagrad.approx.common.examples", "data_gen"),
     "get_args": ("alphagrad.approx.common.examples", "get_args"),
     "get_fn": ("alphagrad.approx.common.examples", "get_fn"),
+    "scalar_loss_fn": ("alphagrad.approx.common.examples", "scalar_loss_fn"),
+    "maybe_scalar_loss": ("alphagrad.approx.common.examples", "maybe_scalar_loss"),
     "infer_argnums": ("alphagrad.approx.common.examples", "infer_argnums"),
     # gae
     "get_advantages": ("alphagrad.approx.common.gae", "get_advantages"),

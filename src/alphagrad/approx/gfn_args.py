@@ -119,6 +119,23 @@ def make_argparser() -> argparse.ArgumentParser:
         "latency estimator.",
     )
     p.add_argument(
+        "--measure-grad", action="store_true",
+        help="Measure value_and_grad of the SCALAR training loss (the gradient "
+        "that hits the optimizer) via graphax.value_and_grad instead of the "
+        "full Jacobian. Quality channels compare the approx vs exact gradient.",
+    )
+    p.add_argument(
+        "--latency-timer", type=str, default="perf_counter",
+        choices=["perf_counter", "rm"],
+        help="Latency timer: 'perf_counter' (default) or 'rm' (fixed "
+        "ResourceMonitor — latency + peak memory from one execution pass).",
+    )
+    p.add_argument(
+        "--max-wall-seconds", type=float, default=0.0,
+        help="Stop training cleanly after this many wall-clock seconds (final "
+        "archives dumped). 0 = unlimited (run to --episodes).",
+    )
+    p.add_argument(
         "--slow-exec-cutoff-seconds", type=float, default=8.0,
         help="Per-exec wall-time cutoff: if one approx-Jacobian exec exceeds "
         "this, cap the measurement pool for that order. 0 disables (set 0 for "

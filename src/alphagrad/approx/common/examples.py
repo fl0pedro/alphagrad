@@ -170,6 +170,39 @@ def get_fn(fn_str: str):
     return fn
 
 
+def scalar_loss_fn(fn):
+    """Wrap an example function into a SCALAR training loss by averaging its
+    outputs. Required for graphax ``grad`` / ``value_and_grad`` (which need a
+    scalar output) when measuring the GRADIENT instead of the full Jacobian.
+    The NeuralNetwork examples already return per-element squared errors, so the
+    mean is the MSE loss — the gradient that would hit the optimizer. Shared by
+    every measurement site (rollout worker + CPU measure-actor + gfn worker) so
+    the jaxpr/order/transforms all operate on the SAME scalar-loss graph."""
+    def _loss(*a):
+        return jnp.mean(fn(*a))
+
+    return _loss
+
+
+def maybe_scalar_loss(args, target_fn):
+    """Apply the grad-mode wrap consistently across every measurement site.
+
+    Returns ``(target_fn, measure_grad)``. When ``args.measure_grad`` is set,
+    ``target_fn`` is wrapped in :func:`scalar_loss_fn` so the jaxpr/order/
+    transforms — and thus the policy's vertex/action space — operate on the
+    SAME scalar-loss graph in the rollout worker, the CPU measure-actor, and
+    the gfn worker. Centralised here so the five call sites can't drift (a
+    site that forgot the wrap would build a different graph than its peers).
+    """
+    if isinstance(args, dict):
+        measure_grad = bool(args.get("measure_grad", False))
+    else:
+        measure_grad = bool(getattr(args, "measure_grad", False))
+    if measure_grad:
+        target_fn = scalar_loss_fn(target_fn)
+    return target_fn, measure_grad
+
+
 def infer_argnums(fn_str: str) -> tuple[int, ...]:
     """Default `argnums` (which input slots are differentiated through) per example name."""
     if fn_str.endswith("NeuralNetwork"):

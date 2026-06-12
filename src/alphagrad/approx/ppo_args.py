@@ -126,6 +126,29 @@ def make_argparser() -> argparse.ArgumentParser:
         "Empirically the most reproducible/discriminative latency estimator.",
     )
     p.add_argument(
+        "--measure-grad", action="store_true",
+        help="Measure value_and_grad of the SCALAR training loss (the gradient "
+        "that hits the optimizer) via graphax.value_and_grad instead of the "
+        "full Jacobian via jacve. Quality channels (cosine_sim/frob_residual) "
+        "then compare the approx gradient vs the exact gradient — a more "
+        "faithful gradient-accuracy signal. Requires a loss-like example.",
+    )
+    p.add_argument(
+        "--latency-timer", type=str, default="perf_counter",
+        choices=["perf_counter", "rm"],
+        help="Latency timer. 'perf_counter' (default): time an inner loop + one "
+        "block_until_ready. 'rm': time via the fixed ResourceMonitor (barrier "
+        "drains before stop; block inside the context) — yields latency AND "
+        "peak memory from a single execution pass.",
+    )
+    p.add_argument(
+        "--max-wall-seconds", type=float, default=0.0,
+        help="Stop training cleanly once this many seconds of wall-clock have "
+        "elapsed (final Pareto + all-time-candidate archives are dumped). 0 = "
+        "unlimited (run to --episodes). Use with a larger SLURM --time so the "
+        "run ends on the budget, not a hard kill.",
+    )
+    p.add_argument(
         "--spread-cpu-actors", action="store_true",
         help="Ray SPREAD scheduling for the CpuApproximationActors so "
         "they distribute across ALL cluster nodes (use every core on "

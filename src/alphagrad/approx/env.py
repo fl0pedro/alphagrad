@@ -207,7 +207,7 @@ _AXIS_FEAT_GROUP_ID = 3
 #   6 cosine_sim       — cosine similarity between flattened approximated and
 #                        exact Jacobians, averaged over the calibration samples.
 #   7 frob_residual    — relative Frobenius residual ||J_e - J_a||_F / ||J_e||_F.
-NUM_REWARDS = 8
+NUM_REWARDS = 9
 REWARD_NAMES: tuple[str, ...] = (
     "muls_adds_fmas",
     "flops",
@@ -217,9 +217,15 @@ REWARD_NAMES: tuple[str, ...] = (
     "peak_memory",
     "cosine_sim",
     "frob_residual",
+    # index 8: DETERMINISTIC XLA peak (memory_analysis temp+output+args).
+    # ``peak_memory`` (index 5) is the REAL measured peak (exact on GPU, sampled
+    # & unreliable for sub-ms execs on CPU); this channel is the compile-time
+    # XLA estimate — reliable + order-discriminating on CPU. Use peak_memory for
+    # GPU-measured runs, xla_peak_memory for CPU-measured runs.
+    "xla_peak_memory",
 )
 REWARD_INDEX = {name: i for i, name in enumerate(REWARD_NAMES)}
-COMPUTE_REWARD_INDICES = tuple(range(0, 6))  # cost components
+COMPUTE_REWARD_INDICES = (0, 1, 2, 3, 4, 5, 8)  # cost components (incl. xla peak)
 QUALITY_REWARD_INDICES = (6, 7)             # cosine, frobenius
 
 # Sentinel reward returned when a per-vertex transform sequence matches an
@@ -415,6 +421,26 @@ class EnvConfig(NamedTuple):
     # readings (failed measurements) are dropped before aggregation; if none
     # survive the channel is marked sentinel so it is filtered downstream.
     latency_winsor: float = 0.0
+    # Measurement target. ``False`` (default): measure the full JACOBIAN of
+    # ``target_fun`` (approx via ``graphax.jacve`` with the policy's order +
+    # micro-action transforms, exact via ``jax.jacrev``). ``True``: measure the
+    # GRADIENT of a SCALAR-output ``target_fun`` (a training loss) — approx via
+    # ``graphax.value_and_grad`` (rides jacve's has_aux path, returns
+    # ``(value, grads)``), exact via ``jax.value_and_grad`` — and the quality
+    # channels compare the approx gradient vs the exact gradient. This matches
+    # how the elimination plan would actually be used in a training step (the
+    # gradient that hits the optimizer), so it's the more faithful accuracy
+    # signal. The caller MUST pass a scalar-output ``target_fun`` + matching
+    # scalar ``jaxpr`` when this is set (see the workers' grad-mode wrapping).
+    measure_grad: bool = False
+    # Latency timer. ``"perf_counter"`` (default): time a tight inner loop with
+    # ``time.perf_counter`` + one closing ``block_until_ready`` (peak memory via
+    # a separate ResourceMonitor pass). ``"rm"``: time via the (fixed)
+    # ``ResourceMonitor`` — ``effects_barrier`` now drains BEFORE ``stop()`` and
+    # we ``block_until_ready`` INSIDE the context, so the duration is the true
+    # device time, and peak memory comes from the SAME pass (one execution for
+    # both channels instead of two). Validated RM≈perf_counter (ratio 0.95).
+    latency_timer: str = "perf_counter"
 
 
 def _get_partials(order, sparsity_specs, stop):
@@ -942,10 +968,16 @@ def _quality_metrics(jac_exact, jac_approx):
     """
     flat_exact = _flatten_jacobians(jac_exact)
     flat_approx = _flatten_jacobians(jac_approx)
+    # A degenerate / incomparable approx Jacobian (no leaves, mismatched shape,
+    # or zero size) is a FAILED approximation, NOT a perfect one. Returning
+    # (cos=1, frob=0) "perfect" lets an over-compressed plan whose Jacobian
+    # collapsed to a different shape (compresses drop axes) score perfect
+    # quality and — combined with its ~0 latency/memory — Pareto-dominate every
+    # real solution, emptying the archive. Score it worst-case (cos=0, frob=1).
     if flat_exact is None or flat_approx is None:
-        return jnp.array(1.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32)
+        return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
     if flat_approx.shape != flat_exact.shape or flat_approx.size == 0:
-        return jnp.array(1.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32)
+        return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
 
     cos = cossim(flat_exact, flat_approx)
     exact_norm = jnp.linalg.norm(flat_exact)
@@ -1273,6 +1305,7 @@ def _callback(
             [
                 -muls_adds_fmas, 0.0, 0.0, -max_io_sum,
                 0.0, 0.0, 0.0, 0.0,
+                0.0,  # xla_peak_memory (no compiled fn on the cheap path)
             ],
             dtype=jnp.float32,
         )
@@ -1347,21 +1380,27 @@ def _callback(
     exact_cache_key = he.digest()
 
     def _do_compile_approx():
-        return (
-            jax.jit(
-                jacve(
-                    config.target_fun,
-                    list(o_list),
-                    argnums=config.argnums,
-                    has_aux=config.has_aux,
-                    sparse_representation=config.sparse,
-                    transforms=transforms,
-                ),
-                keep_unused=True,
+        if config.measure_grad:
+            # Gradient mode: measure ``graphax.value_and_grad`` of the scalar
+            # loss along the policy's order + micro-action transforms. Returns
+            # ``(value, grads)``; the order/transforms ride jacve internally.
+            from graphax import value_and_grad as _gx_value_and_grad
+            fn = _gx_value_and_grad(
+                config.target_fun,
+                list(o_list),
+                argnums=config.argnums,
+                transforms=transforms,
             )
-            .lower(*args_for_lower)
-            .compile()
-        )
+        else:
+            fn = jacve(
+                config.target_fun,
+                list(o_list),
+                argnums=config.argnums,
+                has_aux=config.has_aux,
+                sparse_representation=config.sparse,
+                transforms=transforms,
+            )
+        return jax.jit(fn, keep_unused=True).lower(*args_for_lower).compile()
 
     def _do_compile_exact():
         # The exact reference Jacobian is ORDER-INVARIANT: vertex
@@ -1375,7 +1414,12 @@ def _callback(
         # identical Jacobian (verified rel-err 1e-7 vs jacve) via
         # native reverse-mode AD — order-free and XLA-optimised, ~0s.
         # See env-timing investigation 2026-06-05.
-        if config.has_aux:
+        if config.measure_grad:
+            # Gradient mode: exact reference is native ``jax.value_and_grad``
+            # (order-free reverse-mode AD) → ``(value, grads)``; the quality
+            # block reads ``out_exact[1]`` (grads), mirroring the approx path.
+            fn = jax.value_and_grad(config.target_fun, argnums=config.argnums)
+        elif config.has_aux:
             # jacve(has_aux) returns ``(primal, jac)`` and the caller
             # reads ``out_exact[1]``. Match that ordering so the
             # quality-metric indexing stays correct.
@@ -1397,6 +1441,27 @@ def _callback(
     if _dbg_t:
         print(f"[DBG-env] term={is_terminal} approx_compile={_time.time()-_t0:.1f}s", flush=True)
         _t0 = _time.time()
+    # DETERMINISTIC peak memory from the compiled executable's XLA memory
+    # analysis (no execution, no polling). The ResourceMonitor's CPU peak is a
+    # SAMPLED high-water mark polled at ~1ms — for a sub-ms gradient exec the
+    # transient allocation is freed between polls, so RM reads ~0 (or only the
+    # ~constant output once). ``memory_analysis`` gives the true working set:
+    # temp (XLA scratch — strongly ORDER-dependent, e.g. fwd 0.97MB vs rev
+    # 13MB) + output (the gradient) + arguments. This is the reliable,
+    # order-discriminating peak_memory signal; RM-sampled peak stays as a
+    # fallback only when memory_analysis is unavailable.
+    _det_peak = None
+    try:
+        _ma = compiled_approx.memory_analysis()
+        _det_peak = float(
+            int(getattr(_ma, "temp_size_in_bytes", 0) or 0)
+            + int(getattr(_ma, "output_size_in_bytes", 0) or 0)
+            + int(getattr(_ma, "argument_size_in_bytes", 0) or 0)
+        )
+        if _det_peak <= 0.0:
+            _det_peak = None
+    except Exception:
+        _det_peak = None
     # ``compiled_exact`` is ONLY needed for the quality metrics
     # (cosine_sim, frob_residual). Those are meaningful only when the
     # elimination order is complete — graphax's ``jacve`` returns a
@@ -1470,6 +1535,7 @@ def _callback(
                 -float(bytes_accessed),  # peak_memory surrogate
                 0.0,                     # cosine_sim (worst)
                 -1.0,                    # frob_residual = 1.0 (100% error)
+                -float(bytes_accessed),  # xla_peak_memory surrogate (rejected)
             ],
             dtype=jnp.float32,
         )
@@ -1577,6 +1643,12 @@ def _callback(
         _inner = 1
         _warmup = 0
     _bypass_rm = os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1"
+    # Time via the (fixed) ResourceMonitor instead of perf_counter when asked —
+    # it gives latency AND peak memory from a single execution pass.
+    _use_rm_timer = (
+        str(getattr(config, "latency_timer", "perf_counter")) == "rm"
+        and not _bypass_rm
+    )
     _budget_hit = False
     for d in _point_iter:
         if _budget_hit:
@@ -1624,27 +1696,45 @@ def _callback(
             # absolute value. ResourceMonitor is now used for the peak-memory
             # channel ONLY (one call per data point; peak is deterministic).
             _exec_wall0 = _measure_time.time()
-            _t0 = _measure_time.perf_counter()
-            for _ in range(_inner):
-                out_approx = compiled_approx(*eval_args_i)
-            jax.block_until_ready(out_approx)
-            _lat_ns = (_measure_time.perf_counter() - _t0) / _inner * 1e9
-            latency_samples.append(_lat_ns)
-            # Peak memory once per data point (first rep). Reuse the warmup
-            # monitor read when available (no extra exec); else take a
-            # dedicated monitored exec. Skipped under bypass.
-            if r == 0:
-                if _peak_captured is not None:
-                    peak_mem_samples.append(_peak_captured)
-                elif _bypass_rm:
-                    peak_mem_samples.append(0.0)
-                else:
-                    with ResourceMonitor(devices=unique_devices) as monitor:
-                        _mout = compiled_approx(*eval_args_i)
-                    jax.block_until_ready(_mout)
+            if _use_rm_timer:
+                # RM times the inner loop with ``block_until_ready`` INSIDE the
+                # context (duration = true device time, validated ≈ perf_counter)
+                # and reads peak memory from the SAME pass on the first rep — one
+                # execution serves both the latency and peak-memory channels.
+                _want_peak = (r == 0 and _peak_captured is None)
+                with ResourceMonitor(
+                    devices=unique_devices, time=True, peak=_want_peak,
+                ) as _tmon:
+                    for _ in range(_inner):
+                        out_approx = compiled_approx(*eval_args_i)
+                    jax.block_until_ready(out_approx)
+                _lat_ns = _tmon.duration / _inner * 1e9
+                if r == 0:
                     peak_mem_samples.append(
-                        float(monitor.stats.get("memory", 0.0))
+                        _peak_captured if _peak_captured is not None
+                        else float(_tmon.stats.get("memory", 0.0))
                     )
+            else:
+                # perf_counter inner loop + a separate ResourceMonitor pass for
+                # peak memory (once per data point, first rep).
+                _t0 = _measure_time.perf_counter()
+                for _ in range(_inner):
+                    out_approx = compiled_approx(*eval_args_i)
+                jax.block_until_ready(out_approx)
+                _lat_ns = (_measure_time.perf_counter() - _t0) / _inner * 1e9
+                if r == 0:
+                    if _peak_captured is not None:
+                        peak_mem_samples.append(_peak_captured)
+                    elif _bypass_rm:
+                        peak_mem_samples.append(0.0)
+                    else:
+                        with ResourceMonitor(devices=unique_devices) as monitor:
+                            _mout = compiled_approx(*eval_args_i)
+                        jax.block_until_ready(_mout)
+                        peak_mem_samples.append(
+                            float(monitor.stats.get("memory", 0.0))
+                        )
+            latency_samples.append(_lat_ns)
             _exec_wall = _measure_time.time() - _exec_wall0
             # Per-EXEC time for the cutoff (the inner loop runs _inner execs;
             # _exec_wall spans the whole loop + the r==0 peak-memory exec, so
@@ -1696,21 +1786,46 @@ def _callback(
         # Drop non-positive readings (failed measurements). With perf_counter
         # timing a genuine reading is always > 0; a 0 only appears on failure.
         _lat_valid = [x for x in latency_samples if x > 0.0 and np.isfinite(x)]
+        from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+        # Degenerate-plan floor: a real elimination Jacobian never executes in
+        # under ~1 microsecond. A sub-µs reading means the plan over-compressed
+        # the computation into a near-noop (collapsed Jacobian) — a FAILED
+        # approximation that would otherwise read as ~0 latency / ~0 memory /
+        # (with the _quality_metrics fix) frob=1 and pollute the speed corner
+        # of the Pareto front. Sentinel it so it's filtered like a failed
+        # measurement.
+        _LAT_FLOOR_NS = 1_000.0  # 1 µs
         if not _lat_valid:
-            # No usable latency reading → mark sentinel so the (negated)
-            # reward equals SENTINEL_REWARD_VALUE and the point is filtered
-            # out of best-tracking / the Pareto archive downstream (exact-
-            # match comparison), instead of leaking in as a fake
-            # "0 ns = fastest" solution. Import the constant — the filter
-            # uses exact float equality, so a drifting literal would
-            # silently disable the filtering.
-            from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+            # No usable latency reading → sentinel (negated reward ==
+            # SENTINEL_REWARD_VALUE; downstream filter uses exact equality).
             latency_ns = -SENTINEL_REWARD_VALUE
-        elif _winsor > 0.0:
-            latency_ns = _winsorized_mean(_lat_valid, _winsor)
         else:
-            latency_ns = _percentile_pool(_lat_valid, pk)
-    peak_memory = _percentile_pool(peak_mem_samples, pk)
+            if _winsor > 0.0:
+                latency_ns = _winsorized_mean(_lat_valid, _winsor)
+            else:
+                latency_ns = _percentile_pool(_lat_valid, pk)
+            # Clamp an implausibly-small (but positive) reading UP to the floor
+            # rather than sentinelling the whole terminal: the row's other
+            # channels (mem / quality / flops) are still valid. A genuine
+            # measurement failure produces no positive readings and is already
+            # sentinelled by the ``not _lat_valid`` branch above. (The original
+            # 0-ns fake-fast artifact is excluded by the x>0 filter on
+            # ``_lat_valid`` + the perf_counter/RM-timer fix.)
+            latency_ns = max(latency_ns, _LAT_FLOOR_NS)
+    # RM-sampled peak: exact on GPU (clear_memory_stats + peak_bytes_in_use),
+    # a sampled high-water mark on CPU (misses sub-ms grad allocs → unreliable).
+    _rm_peak = float(_percentile_pool(peak_mem_samples, pk))
+    # XLA-analysis peak (temp+output+args). Falls back to the RM peak only if
+    # memory_analysis was unavailable (so it's never a false 0). Always exposed
+    # as the separate ``xla_peak_memory`` channel for diagnostics.
+    xla_peak_memory = _det_peak if _det_peak is not None else _rm_peak
+    # ``peak_memory`` channel (index 5) = the RELIABLE, device-appropriate peak:
+    # the exact RM high-water mark on GPU, the deterministic XLA estimate on CPU
+    # (where RM polling misses sub-ms allocs). Fixing it HERE — at the single
+    # measurement source — means every reward / Lagrangian-constraint / PCA /
+    # running-max / Pareto consumer that selects the peak_memory channel gets the
+    # trustworthy signal on CPU without each having to special-case the device.
+    peak_memory = _rm_peak if config.exec_on_gpu else xla_peak_memory
 
     # ------------------------------------------------------------------
     # Quality family — cosine similarity + relative Frobenius residual.
@@ -1726,9 +1841,13 @@ def _callback(
         cosines: list = []
         frobs: list = []
         _t_approx = _t_exact = _t_metric = 0.0
+        # Grad mode: ``value_and_grad`` returns ``(value, grads)`` for both the
+        # approx and exact paths, so the gradient pytree is at ``[1]`` — same
+        # slot as jacve's has_aux ``(primal, jac)``. Compare the GRADIENTS.
+        _take_second = config.has_aux or config.measure_grad
         for out_approx, out_exact in zip(out_approxs, out_exacts):
-            jac_approx = out_approx[1] if config.has_aux else out_approx
-            jac_exact = out_exact[1] if config.has_aux else out_exact
+            jac_approx = out_approx[1] if _take_second else out_approx
+            jac_exact = out_exact[1] if _take_second else out_exact
             if _dbg_t:
                 _tt = _time.time()
                 jax.block_until_ready(jac_approx); _t_approx += _time.time() - _tt
@@ -1771,6 +1890,9 @@ def _callback(
             [float(x) for x in latency_samples] if config.measure_latency else []
         )
         raw_sink["peak_memory_samples"] = [float(x) for x in peak_mem_samples]
+        # Deterministic XLA-analysis peak (temp+output+args) — the reliable
+        # peak channel on CPU where the RM sampled peak misses sub-ms allocs.
+        raw_sink["xla_peak_memory"] = float(xla_peak_memory)
         raw_sink["cosine_sim_per_point"] = (
             [float(x) for x in cosines] if (is_terminal and out_exacts) else []
         )
@@ -1788,6 +1910,7 @@ def _callback(
             -peak_memory,
             cosine_sim,
             -frob_residual,
+            -xla_peak_memory,
         ],
         dtype=jnp.float32,
     )
@@ -1898,6 +2021,8 @@ class VertexEliminationEnv:
         latency_inner_reps: int = 1,
         latency_warmup: int = 0,
         latency_winsor: float = 0.0,
+        measure_grad: bool = False,
+        latency_timer: str = "perf_counter",
     ):
         assert (argnums is None and args is None) or not (args is None or args is None)
         config = EnvConfig(
@@ -1923,6 +2048,8 @@ class VertexEliminationEnv:
             latency_inner_reps=latency_inner_reps,
             latency_warmup=latency_warmup,
             latency_winsor=latency_winsor,
+            measure_grad=measure_grad,
+            latency_timer=latency_timer,
         )
         return cls(
             config,
