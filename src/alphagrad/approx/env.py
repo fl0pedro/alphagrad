@@ -1434,6 +1434,27 @@ def _callback(
     if _dbg_t:
         print(f"[DBG-env] term={is_terminal} approx_compile={_time.time()-_t0:.1f}s", flush=True)
         _t0 = _time.time()
+    # DETERMINISTIC peak memory from the compiled executable's XLA memory
+    # analysis (no execution, no polling). The ResourceMonitor's CPU peak is a
+    # SAMPLED high-water mark polled at ~1ms — for a sub-ms gradient exec the
+    # transient allocation is freed between polls, so RM reads ~0 (or only the
+    # ~constant output once). ``memory_analysis`` gives the true working set:
+    # temp (XLA scratch — strongly ORDER-dependent, e.g. fwd 0.97MB vs rev
+    # 13MB) + output (the gradient) + arguments. This is the reliable,
+    # order-discriminating peak_memory signal; RM-sampled peak stays as a
+    # fallback only when memory_analysis is unavailable.
+    _det_peak = None
+    try:
+        _ma = compiled_approx.memory_analysis()
+        _det_peak = float(
+            int(getattr(_ma, "temp_size_in_bytes", 0) or 0)
+            + int(getattr(_ma, "output_size_in_bytes", 0) or 0)
+            + int(getattr(_ma, "argument_size_in_bytes", 0) or 0)
+        )
+        if _det_peak <= 0.0:
+            _det_peak = None
+    except Exception:
+        _det_peak = None
     # ``compiled_exact`` is ONLY needed for the quality metrics
     # (cosine_sim, frob_residual). Those are meaningful only when the
     # elimination order is complete — graphax's ``jacve`` returns a
@@ -1642,7 +1663,7 @@ def _callback(
         _peak_captured = None
         for _w in range(_warmup):
             _ws = _measure_time.perf_counter()
-            if (not _bypass_rm) and _w == _warmup - 1:
+            if (not _bypass_rm) and _det_peak is None and _w == _warmup - 1:
                 with ResourceMonitor(devices=unique_devices) as _wmon:
                     _wout = compiled_approx(*eval_args_i)
                 jax.block_until_ready(_wout)
@@ -1672,7 +1693,9 @@ def _callback(
                 # context (duration = true device time, validated ≈ perf_counter)
                 # and reads peak memory from the SAME pass on the first rep — one
                 # execution serves both the latency and peak-memory channels.
-                _want_peak = (r == 0 and _peak_captured is None)
+                _want_peak = (
+                    r == 0 and _peak_captured is None and _det_peak is None
+                )
                 with ResourceMonitor(
                     devices=unique_devices, time=True, peak=_want_peak,
                 ) as _tmon:
@@ -1680,7 +1703,7 @@ def _callback(
                         out_approx = compiled_approx(*eval_args_i)
                     jax.block_until_ready(out_approx)
                 _lat_ns = _tmon.duration / _inner * 1e9
-                if r == 0:
+                if r == 0 and _det_peak is None:
                     peak_mem_samples.append(
                         _peak_captured if _peak_captured is not None
                         else float(_tmon.stats.get("memory", 0.0))
@@ -1693,7 +1716,7 @@ def _callback(
                     out_approx = compiled_approx(*eval_args_i)
                 jax.block_until_ready(out_approx)
                 _lat_ns = (_measure_time.perf_counter() - _t0) / _inner * 1e9
-                if r == 0:
+                if r == 0 and _det_peak is None:
                     if _peak_captured is not None:
                         peak_mem_samples.append(_peak_captured)
                     elif _bypass_rm:
@@ -1777,7 +1800,12 @@ def _callback(
                 latency_ns = _percentile_pool(_lat_valid, pk)
             if latency_ns < _LAT_FLOOR_NS:
                 latency_ns = -SENTINEL_REWARD_VALUE
-    peak_memory = _percentile_pool(peak_mem_samples, pk)
+    # Deterministic XLA peak (temp+output+args) when available; else the
+    # RM-sampled high-water-mark pool (unreliable for sub-ms CPU execs).
+    if _det_peak is not None:
+        peak_memory = _det_peak
+    else:
+        peak_memory = _percentile_pool(peak_mem_samples, pk)
 
     # ------------------------------------------------------------------
     # Quality family — cosine similarity + relative Frobenius residual.
