@@ -475,8 +475,11 @@ def _run_one_variant(args, variant: str) -> None:
         # Update + persist the MOGFN Pareto front (points + sequences).
         _ep_box[0] = ep
         _arch_add(stats.get("terminal_solutions", []))
-        _dump_pareto()
-        _dump_all_candidates()
+        _dump_pareto()  # current front (small) — cheap to keep fresh
+        # All-time record grows monotonically; full rewrite every episode is
+        # O(N^2). Snapshot every 25 eps; final dump after the loop is complete.
+        if (ep + 1) % 25 == 0:
+            _dump_all_candidates()
 
         # ---- Progress bar (one line, updated in place) ----
         pbar.update(1)
