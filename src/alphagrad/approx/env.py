@@ -225,15 +225,25 @@ REWARD_NAMES: tuple[str, ...] = (
     "xla_peak_memory",
 )
 REWARD_INDEX = {name: i for i, name in enumerate(REWARD_NAMES)}
-COMPUTE_REWARD_INDICES = (0, 1, 2, 3, 4, 5, 8)  # cost components (incl. xla peak)
-QUALITY_REWARD_INDICES = (6, 7)             # cosine, frobenius
+QUALITY_REWARD_INDICES = (
+    REWARD_INDEX["cosine_sim"], REWARD_INDEX["frob_residual"],
+)
+# Cost = every non-quality channel — DERIVED (not hardcoded) so adding a channel
+# (e.g. xla_peak_memory at idx 8) is picked up automatically, like
+# reward_scaling.COST_REWARD_INDICES.
+COMPUTE_REWARD_INDICES = tuple(
+    i for i in range(NUM_REWARDS) if i not in QUALITY_REWARD_INDICES
+)
 
 # Sentinel reward returned when a per-vertex transform sequence matches an
 # entry in the in-file blacklist (used during exploration to penalise
 # pathological configurations). The blacklist is no longer wired up after
 # the typed-transform migration; the array is kept for potential reuse.
+# Worst-case sentinel reward (blacklist path). NUM_REWARDS-aware so it can't
+# rot out of sync when channels are added: every channel is -1e10 except
+# cosine_sim, whose worst value is -1.0.
 _SENTINEL_BAD_REWARD = jnp.array(
-    [-1e10, -1e10, -1e10, -1e10, -1e10, -1e10, -1.0, -1e10],
+    [-1.0 if i == REWARD_INDEX["cosine_sim"] else -1e10 for i in range(NUM_REWARDS)],
     dtype=jnp.float32,
 )
 

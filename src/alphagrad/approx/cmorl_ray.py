@@ -534,6 +534,10 @@ def _run(args) -> int:
 
     def _episode(w_full, stage_tag: str, target=None):
         nonlocal seed_counter, global_ep
+        # Stamp the current episode BEFORE _archive_add so all-time candidates
+        # admitted this episode are labelled with THIS episode (was set at the
+        # end → every candidate's `episode` was one behind).
+        _ep_box[0] = global_ep
         seed_counter += 1
         ray.get(actor.set_reward_weights.remote(w_full))
         stats = ray.get(actor.run_rollout_and_train.remote(seed_counter))
@@ -565,9 +569,12 @@ def _run(args) -> int:
         if best_seq_every > 0 and (global_ep + 1) % best_seq_every == 0:
             dump_best_sequences_json(state, best_seq_json_path)
             wandb.log(build_best_sequences_wandb_payload(state, ep=global_ep))
-        _ep_box[0] = global_ep
-        _dump_pareto()  # keep the Pareto front (points+sequences) JSON current
-        _dump_all_candidates()  # keep the all-time front-candidate record current
+        _dump_pareto()  # current Pareto front (small) — cheap to keep fresh
+        # The all-time candidate record grows monotonically; rewriting the whole
+        # file every episode is O(N^2) I/O over a long run. Snapshot every 25
+        # episodes; the final dump after the loop captures the complete set.
+        if (global_ep + 1) % 25 == 0:
+            _dump_all_candidates()
         global_ep += 1
         return stats
 
