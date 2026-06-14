@@ -36,8 +36,17 @@ def load_source(src):
     return rows, rev
 
 
-def lat_us(r):  # latency in µs
-    return r["lat_ns_mean"] / 1e3
+# Reverse-mode grad latency measured under the SAME 1-core-affinity mechanism the
+# front used (the experiment's own re-measured latency used a ~5x-slower thread-cap
+# mechanism, so we use the front's affinity latency for rules and these for reverse).
+_rl = os.path.expanduser("~/dsnn/train_exp/rev_lat.json")
+REV_LAT_US = json.load(open(_rl)) if os.path.exists(_rl) else {"cmorl": None, "mogfn": None}
+
+
+def lat_us(r):  # affinity latency (µs): front rules carry the front's (negated) cost
+    if "front_obj" in r:
+        return -r["front_obj"]["latency_ns"] / 1e3
+    return r["lat_ns_mean"] / 1e3  # fallback (reverse handled via REV_LAT_US)
 
 
 def cos(r):
@@ -60,7 +69,7 @@ def plot_source(src, color):
     mems = np.array([mem_mb(r) for r in rows])
     n = len(rows)
     rev_acc = rev["acc_mean"] if rev else None
-    rev_lat = lat_us(rev) if rev else None
+    rev_lat = REV_LAT_US.get(src)
     tag = src.upper()
 
     # 1) accuracy per rule (sorted by front cosine) with std
