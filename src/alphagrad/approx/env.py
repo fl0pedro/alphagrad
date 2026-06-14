@@ -963,6 +963,27 @@ def _flatten_jacobians(jac):
     return jnp.concatenate(flats)
 
 
+def _align_jac(jac_approx, jac_exact):
+    """Align each approx-Jacobian/grad leaf to its exact leaf's LAYOUT before
+    comparison. graphax ``value_and_grad``/``jacve`` returns some weight grads in
+    the transposed (∂L/∂Wᵀ) layout for certain elimination orders; flattening
+    them as-is makes a (256,784) vs (784,256) ravel near-orthogonal, so the
+    cosine/frob become a layout ARTIFACT that badly underestimates true gradient
+    quality (empirically lifts Spearman-vs-trainability 0.67→0.79). Transpose a
+    2-D leaf back when its shape is the exact leaf's reverse; leave other
+    mismatches for the size/shape guard downstream."""
+    def _al(a, e):
+        if getattr(a, "shape", None) == getattr(e, "shape", None):
+            return a
+        if getattr(a, "ndim", 0) == 2 and a.shape == e.shape[::-1]:
+            return a.T
+        return a
+    try:
+        return jax.tree_util.tree_map(_al, jac_approx, jac_exact)
+    except Exception:
+        return jac_approx
+
+
 def _quality_metrics(jac_exact, jac_approx):
     """`(cosine_sim, relative_frobenius)` of `jac_approx` against `jac_exact`.
 
@@ -976,6 +997,9 @@ def _quality_metrics(jac_exact, jac_approx):
     on the PPO dynamic-substeps path. The print fires only when the
     formula would have produced a meaningful value but didn't.
     """
+    # Layout-align the approx leaves to the exact layout (transpose-back) so the
+    # cosine/frob compare the SAME entries, not a transposed-layout artifact.
+    jac_approx = _align_jac(jac_approx, jac_exact)
     flat_exact = _flatten_jacobians(jac_exact)
     flat_approx = _flatten_jacobians(jac_approx)
     # A degenerate / incomparable approx Jacobian (no leaves, mismatched shape,
