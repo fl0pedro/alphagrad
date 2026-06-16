@@ -1014,6 +1014,11 @@ def _quality_metrics(jac_exact, jac_approx):
         return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
 
     cos = cossim(flat_exact, flat_approx)
+    # Some approximations (certain quant/compress combos) yield a complex-valued
+    # flattened Jacobian, making cossim complex. Use the real part — it matches the
+    # reward path's existing real cast (the source of the ComplexWarning) and unblocks
+    # the per-point float emission in raw_sink that otherwise crashes on complex.
+    cos = jnp.real(cos)
     exact_norm = jnp.linalg.norm(flat_exact)
     resid_norm = jnp.linalg.norm(flat_exact - flat_approx)
     rel_frob = resid_norm / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
