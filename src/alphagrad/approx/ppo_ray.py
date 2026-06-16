@@ -314,6 +314,17 @@ def _run(args) -> int:
     for ep in range(args.episodes):
         seed_counter += 1
 
+        # Wall-clock budget: stop cleanly once --max-wall-seconds has elapsed
+        # (the final Pareto + best-sequence archives are dumped after the loop).
+        # 0 = run to --episodes. Granularity = one episode.
+        _mw = float(getattr(args, "max_wall_seconds", 0.0) or 0.0)
+        if _mw > 0.0 and (time.time() - args.t_start) > _mw:
+            tqdm.write(
+                f"  [max-wall] {_mw:.0f}s budget reached at ep={ep} "
+                f"(elapsed {time.time() - args.t_start:.0f}s) — stopping."
+            )
+            break
+
         # Curriculum stage / variant transition. ``compute_variant_at_episode``
         # returns the current stage + the concrete variant for this
         # episode (rotation stages cycle through their slots per
