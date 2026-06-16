@@ -1715,9 +1715,13 @@ class PPORayWorker:
         ent_coef_j = jnp.array(self.entropy_coef, dtype=jnp.float32)
 
         for _epoch in range(self.ppo_epochs):
-            # Per-epoch reshuffle + z-score renormalization.
+            # Per-epoch reshuffle + z-score renormalization. Truncate to a whole
+            # number of minibatches: when total (n_traj*T) isn't divisible by
+            # --minibatches the remainder (< minibatches samples) is dropped, so
+            # the (mb_count, mb_size) reshape is exact. (Standard PPO drop-last;
+            # MoE's odd vertex count made total=180 vs minibatches=8 -> 176.)
             key, perm_key = jrand.split(key)
-            perm = jrand.permutation(perm_key, total)
+            perm = jrand.permutation(perm_key, total)[: mb_count * mb_size]
 
             def _permute_and_mb(flat, extra=()):
                 return flat[perm].reshape((mb_count, mb_size, *extra))
