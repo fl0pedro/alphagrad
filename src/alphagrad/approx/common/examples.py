@@ -27,6 +27,24 @@ def _neural_network(x, y, W1, b1, W2, b2):
     return 0.5 * (jnp.tanh(a1 @ W2.T + b2) - y) ** 2
 
 
+# graphax core-v2 vision MNIST models: each takes (x_flat784, y_onehot10, *weights)
+# and returns a per-element squared error — same convention as _neural_network,
+# so they slot into the Vmapped/dataset harness. Weights come from the matching
+# graphax initializer.
+_VISION_MODELS = {
+    "ConvNet": "conv_weights",
+    "MoE": "moe_weights",
+    "ViT": "vit_weights",
+}
+
+
+def _vision_base(fn_str):
+    """Return the bare vision-model name (handling the ``Vmapped`` prefix) if
+    ``fn_str`` names one of the graphax vision models, else ``None``."""
+    base = fn_str[len("Vmapped"):] if fn_str.startswith("Vmapped") else fn_str
+    return base if base in _VISION_MODELS else None
+
+
 def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None = -1):
     """Return a `keys -> data` jit-able function used to refresh dataset args.
 
@@ -42,7 +60,9 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
 
         return fn
 
-    if fn_str.endswith("NeuralNetwork"):
+    # NeuralNetwork and the graphax vision models all consume MNIST as
+    # (flat-784 image, onehot-10 label), so they share the dataset sampler.
+    if fn_str.endswith("NeuralNetwork") or _vision_base(fn_str) is not None:
         if dataset is not None:
             x_data, y_data = load_dataset(dataset, dataset_size)
             n_samples = int(x_data.shape[0])
@@ -57,6 +77,10 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
                 return x_data[idx], y_data[idx]
 
             return fn
+
+        # vision models require a dataset (no synthetic fallback)
+        if _vision_base(fn_str) is not None:
+            return None
 
         @jax.jit
         def fn(keys):
@@ -137,6 +161,17 @@ def get_args(fn_str: str, key, dataset: str | None = None):
         shapes = [(4, 4)] * 13 + [(4,)] * 8
     elif "Encoder" in fn_str:
         shapes = [(4, 4)] * 10 + [(4,)] * 6
+    elif _vision_base(fn_str) is not None:
+        # x = flat MNIST (784,), y = onehot (10,); weights from the graphax
+        # initializer (correct per-model shapes). Vmapped batches x and y only.
+        vbase = _vision_base(fn_str)
+        bx = (NN_VMAP_BATCH,) if fn_str.startswith("Vmapped") else ()
+        kx, ky, kw = jax.random.split(key, 3)
+        x = jax.random.normal(kx, (*bx, 784))
+        y = jax.random.normal(ky, (*bx, 10))
+        ws = getattr(examples, _VISION_MODELS[vbase])(kw)
+        ws = list(ws) if isinstance(ws, (tuple, list)) else [ws]
+        return [x, y, *ws]
     else:
         return _BASIC_ARGS[fn_str]
 
@@ -151,18 +186,22 @@ def get_args(fn_str: str, key, dataset: str | None = None):
 
 def get_fn(fn_str: str):
     """Resolve `fn_str` to a Python callable, applying `jax.vmap` for Vmapped variants."""
-    if fn_str.endswith("NeuralNetwork"):
+    base = fn_str[len("Vmapped"):] if fn_str.startswith("Vmapped") else fn_str
+    if base.endswith("NeuralNetwork"):
         fn = _neural_network
-    elif fn_str.endswith("Perceptron"):
+    elif base == "Perceptron":
         fn = examples.Perceptron
     else:
-        fn = getattr(examples, fn_str, None)
+        # strip the Vmapped prefix so graphax models (ConvNet/MoE/ViT/Encoder/...)
+        # resolve by their bare name.
+        fn = getattr(examples, base, None)
         if fn is None:
-            raise ValueError(f"Target function '{fn_str}' not found in examples.")
+            raise ValueError(f"Target function '{fn_str}' (base '{base}') not found in examples.")
 
     if fn_str.startswith("Vmapped"):
         num_args = len(inspect.signature(fn).parameters)
-        has_y = "Encoder" in fn_str or fn_str.endswith(("NeuralNetwork", "Perceptron"))
+        has_y = ("Encoder" in base or base.endswith(("NeuralNetwork", "Perceptron"))
+                 or base in _VISION_MODELS)
         mapped_axes = (0, 0) if has_y else (0,)
         static_axes = (None,) * (num_args - len(mapped_axes))
         fn = jax.vmap(fn, in_axes=mapped_axes + static_axes)
@@ -190,4 +229,9 @@ def infer_argnums(fn_str: str) -> tuple[int, ...]:
         return (2, 3, 4, 5)
     if fn_str.endswith("Perceptron"):
         return (2, 3, 4, 5, 6, 7)
+    vbase = _vision_base(fn_str)
+    if vbase is not None:
+        # differentiate w.r.t. every weight arg (everything after x, y)
+        n = len(inspect.signature(getattr(examples, vbase)).parameters)
+        return tuple(range(2, n))
     return (0,)
