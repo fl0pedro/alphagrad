@@ -441,6 +441,7 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         latency_winsor=float(getattr(args, "latency_winsor", 0.0)),
         measure_grad=measure_grad,
         latency_timer=str(getattr(args, "latency_timer", "perf_counter")),
+        quant_once=bool(getattr(args, "quant_once", False)),
         slow_exec_cutoff_seconds=float(
             getattr(args, "slow_exec_cutoff_seconds", 15.0)
         ),

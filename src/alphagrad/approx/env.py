@@ -451,6 +451,10 @@ class EnvConfig(NamedTuple):
     # device time, and peak memory comes from the SAME pass (one execution for
     # both channels instead of two). Validated RM≈perf_counter (ratio 0.95).
     latency_timer: str = "perf_counter"
+    # Search-space simplification: when True, only the FIRST Quant emitted in an
+    # episode takes effect (later Quant ops dropped) — one global quantization
+    # choice (a single dtype, or none) instead of per-vertex repeated quant.
+    quant_once: bool = False
 
 
 def _get_partials(order, sparsity_specs, stop):
@@ -1154,6 +1158,11 @@ def _callback(
     # with j=1 only fits the first).
     transforms: list[tuple[int, tuple]] = []
     last_v_idx = len(o_list) - 1
+    # quant-once: only the FIRST Quant across the whole episode (vertex x slot
+    # order) survives; later Quant rows are dropped → one global quantization
+    # choice (a dtype, or none) instead of per-vertex repeated quant.
+    _quant_once = bool(getattr(config, "quant_once", False))
+    _quant_used = False
     for v_idx, v in enumerate(o_list):
         eqn = config.jaxpr.eqns[v - 1]
         if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
@@ -1183,10 +1192,13 @@ def _callback(
                 # shape-preservation issue with downstream eliminations).
                 # Out-of-range dtype indices silently fall back to the
                 # first catalog entry rather than crashing the callback.
+                if _quant_once and _quant_used:
+                    continue  # quant-once: a quantization was already chosen
                 dtype_idx = bi2
                 if not (0 <= dtype_idx < len(QUANT_DTYPES)):
                     dtype_idx = 0
                 rules.append(Quant(dtype=QUANT_DTYPES[dtype_idx]))
+                _quant_used = True
                 continue
             if bi1 == COMPRESS_SENTINEL:
                 # COMPRESS slot: row[1] is the *physical* axis index in the
@@ -2050,6 +2062,7 @@ class VertexEliminationEnv:
         latency_winsor: float = 0.0,
         measure_grad: bool = False,
         latency_timer: str = "perf_counter",
+        quant_once: bool = False,
     ):
         assert (argnums is None and args is None) or not (args is None or args is None)
         config = EnvConfig(
@@ -2077,6 +2090,7 @@ class VertexEliminationEnv:
             latency_winsor=latency_winsor,
             measure_grad=measure_grad,
             latency_timer=latency_timer,
+            quant_once=quant_once,
         )
         return cls(
             config,

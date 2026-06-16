@@ -358,6 +358,12 @@ class PPORayWorker:
             dataset=dataset_for_call,
             dataset_size=self.args.dataset_size,
         )
+        # Grad-mode: wrap to the SCALAR loss so the rollout worker's env operates
+        # on the SAME scalar-loss graph as the CPU measure-actors — else the
+        # policy's vertex/action space wouldn't match the graph the pool
+        # eliminates on. Shared wrap (see maybe_scalar_loss).
+        from alphagrad.approx.common import maybe_scalar_loss
+        target_fn, measure_grad = maybe_scalar_loss(self.args, target_fn)
         closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
         argnums = infer_argnums(self.args.example)
         # Always pass target_fun so flops/bytes_accessed/latency_ns/peak_memory
@@ -394,6 +400,9 @@ class PPORayWorker:
             terminal_rewards_only=not bool(getattr(
                 self.args, "intermediate_rewards", False,
             )),
+            measure_grad=measure_grad,
+            latency_timer=str(getattr(self.args, "latency_timer", "perf_counter")),
+            quant_once=bool(getattr(self.args, "quant_once", False)),
         )
         # Per-rollout resampling stores the bank size here so we can
         # refresh the same way each episode (see run_rollout_and_train).

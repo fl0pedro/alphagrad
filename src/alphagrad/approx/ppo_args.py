@@ -134,6 +134,12 @@ def make_argparser() -> argparse.ArgumentParser:
         "faithful gradient-accuracy signal. Requires a loss-like example.",
     )
     p.add_argument(
+        "--quant-once", action="store_true",
+        help="Simplify the search space: only the FIRST Quant emitted per episode "
+        "takes effect (later Quant ops dropped) — one global quantization choice "
+        "(a single dtype, or none) instead of per-vertex repeated quant.",
+    )
+    p.add_argument(
         "--latency-timer", type=str, default="perf_counter",
         choices=["perf_counter", "rm"],
         help="Latency timer. 'perf_counter' (default): time an inner loop + one "
