@@ -58,6 +58,11 @@ from alphagrad.approx.common import (
     vertex_avail_at_step,
 )
 from alphagrad.approx.common.gae import get_advantages, reward_normalization_fn
+from alphagrad.approx.common.replay import (
+    init_replay_buffer,
+    replay_add_batch,
+    replay_sample,
+)
 from alphagrad.utils import symlog
 from alphagrad.approx.env import (
     MAX_AXES_PER_VERTEX,
@@ -1258,8 +1263,127 @@ class PPORayWorker:
     # ------------------------------------------------------------------
     # Driver entry — one episode (rollout + train)
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Off-policy V-trace targets (replay-buffer path)
+    # ------------------------------------------------------------------
+    def _make_offpolicy_fn(self):
+        """Build the jitted fn that turns a batch of REPLAYED trajectories into
+        scalarized V-trace value targets + advantages under the CURRENT policy.
+
+        Mirrors the C-MORL actor-critic (cmorl_ray_worker._make_offpolicy_fn)
+        but scalarizes with the STATIC ``reward_weights`` instead of a member
+        preference. The IS ratio ρ_t = π/μ (current vs the STORED behaviour
+        log-prob) drives V-trace value targets ``vs`` (Espeholt et al. 2018);
+        the advantage carries NO ρ — the PPO clipped ratio in ``update_step``
+        supplies the residual importance weight (off-policy PPO + V-trace).
+        Transitions are recomputed SEQUENTIALLY (lax.map): a vmap over all B*T
+        would materialize the encoder's O(L²) attention for every transition at
+        once (f32[M, MAX_TOKENS, MAX_TOKENS] -> OOM)."""
+        dynamic = self.dynamic_substeps
+        gamma = float(self.discount)
+        lam = float(self.gae_lambda)
+        rho_bar = float(getattr(self.args, "vtrace_rho_bar", 1.0))
+        c_bar = float(getattr(self.args, "vtrace_c_bar", 1.0))
+        weights_j = self.reward_weights
+        axis_valid_static_j = jnp.asarray(
+            self.env.axis_valid_static, dtype=jnp.float32,
+        )
+
+        def _recompute(agent, tok, v_act, op, i_s, j_s, f_s, q_s, v_for_mask,
+                       op_mask, factor_mask, quant_mask, k):
+            # Recompute value (K,) + new log-prob under the CURRENT policy,
+            # applying the SAME curriculum masks as the rollout / loss path
+            # so the IS ratio compares matched distributions.
+            logits, value, op_l, i_l, j_l, f_l, q_l = agent.all_logits(tok, key=k)
+            lp_v = jax.nn.log_softmax(logits)[v_act]
+            if dynamic:
+                axis_valid = axis_valid_static_j[v_for_mask - 1]
+                i_l_m = jnp.where(axis_valid > 0.5, i_l, -1e9)
+                j_l_m = jnp.where(axis_valid > 0.5, j_l, -1e9)
+                op_l_c = jnp.where(op_mask > 0.5, op_l, -1e9)
+                f_l_c = jnp.where(factor_mask > 0.5, f_l, -1e9)
+                q_l_c = jnp.where(quant_mask > 0.5, q_l, -1e9)
+                new_lp = (
+                    lp_v
+                    + jax.nn.log_softmax(op_l_c)[op]
+                    + jax.nn.log_softmax(i_l_m)[i_s]
+                    + jax.nn.log_softmax(j_l_m)[j_s]
+                    + jax.nn.log_softmax(f_l_c)[f_s]
+                    + jax.nn.log_softmax(q_l_c)[q_s]
+                )
+            else:
+                new_lp = lp_v
+            return value, new_lp
+
+        def _vtrace_traj(rewards, values, dones, rho, c):
+            # rewards/values (T,K); dones/rho/c (T,). vs, adv -> (T,K).
+            not_done = 1.0 - dones
+            v_next = jnp.concatenate(
+                [values[1:], jnp.zeros((1, values.shape[1]), values.dtype)], 0,
+            ) * not_done[:, None]
+            delta = rho[:, None] * (rewards + gamma * v_next - values)
+
+            def scan_fn(A_next, inp):
+                d_t, c_t, nd_t = inp
+                A_t = d_t + gamma * nd_t * c_t * A_next
+                return A_t, A_t
+
+            A0 = jnp.zeros((values.shape[1],), values.dtype)
+            _, A_rev = jax.lax.scan(
+                scan_fn, A0, (delta[::-1], c[::-1], not_done[::-1]),
+            )
+            A = A_rev[::-1]
+            vs = values + A
+            vs_next = jnp.concatenate(
+                [vs[1:], jnp.zeros((1, vs.shape[1]), vs.dtype)], 0,
+            ) * not_done[:, None]
+            # Advantage carries NO ρ — the PPO clipped ratio supplies the IS
+            # weight in the loss (off-policy PPO with V-trace value targets).
+            adv = rewards + gamma * vs_next - values
+            return vs, adv
+
+        @eqx.filter_jit
+        def offpolicy(agent, traj, op_mask, factor_mask, quant_mask, key):
+            tok = traj["tokens"]                      # (B,T,L)
+            B, T = tok.shape[0], tok.shape[1]
+            M = B * T
+            flat = lambda x: x.reshape((M,) + x.shape[2:])
+            keys = jrand.split(key, M)
+            xs = (
+                flat(tok), flat(traj["v_act"]), flat(traj["op"]),
+                flat(traj["i"]), flat(traj["j"]), flat(traj["f"]),
+                flat(traj["q"]), flat(traj["vmask"]), keys,
+            )
+            values_f, new_lp_f = jax.lax.map(
+                lambda x: _recompute(
+                    agent, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7],
+                    op_mask, factor_mask, quant_mask, x[8],
+                ),
+                xs,
+            )
+            K = values_f.shape[-1]
+            values = values_f.reshape(B, T, K)
+            new_lp = new_lp_f.reshape(B, T)
+            log_ratio = new_lp - traj["old_lp"]
+            rho = jnp.minimum(rho_bar, jnp.exp(log_ratio))
+            c = lam * jnp.minimum(c_bar, rho)
+            # symlog the per-channel rewards to match the on-policy value space
+            # (the value head learns symlog'd normalized values upstream).
+            rewards = symlog(traj["reward_vec"])
+            vs, adv = jax.vmap(_vtrace_traj)(
+                rewards, values, traj["dones"], rho, c,
+            )
+            returns_s = jnp.sum(vs * weights_j, axis=-1)      # (B,T)
+            adv_s = jnp.sum(adv * weights_j, axis=-1)         # (B,T)
+            return returns_s, adv_s
+
+        return offpolicy
+
     def run_rollout_and_train(self, rng_seed: int) -> dict:
-        """One on-policy rollout + ppo-epochs * minibatches gradient steps.
+        """One rollout + ppo-epochs * minibatches gradient steps.
+
+        On-policy by default; off-policy V-trace on the replay buffer when
+        ``--replay-buffer-size > 0``.
 
         Returns a metrics dict ready to log to wandb.
         """
@@ -1267,6 +1391,11 @@ class PPORayWorker:
             self._act_step = self._make_act_step_fn()
             self._assemble = self._make_assemble_fn()
             self._update_step = self._make_update_step()
+            if int(getattr(self.args, "replay_buffer_size", 0) or 0) > 0:
+                self._offpolicy_fn = self._make_offpolicy_fn()
+        if not hasattr(self, "replay_buffer"):
+            self.replay_buffer = None
+            self._replay_buf_size = 0
 
         # Coarse per-phase profiling (gated on ALPHAGRAD_DBG_TIMING). Each
         # phase accumulator is printed at the end of the episode so we can
@@ -1499,7 +1628,64 @@ class PPORayWorker:
         flat_returns = returns_b.reshape(N * T)
         flat_advantages = advantages_b.reshape(N * T)
 
-        total = N * T
+        # ---- Off-policy V-trace (replay buffer) -------------------------
+        # --replay-buffer-size>0: push this episode's per-env trajectories to
+        # a circular buffer and SAMPLE a (fresh + past) batch, then recompute
+        # V-trace value targets + advantages under the CURRENT policy. This
+        # reuses the EXPENSIVE CPU measurements across many updates (the GPU
+        # trainer was otherwise idle waiting on the measure pool). The
+        # minibatch/update loop below is unchanged — we only swap the flat_*
+        # tensors it consumes for the sampled-trajectory + V-trace versions.
+        replay_cap = int(getattr(self.args, "replay_buffer_size", 0) or 0)
+        n_traj = N
+        if replay_cap > 0:
+            # (N, T, ...) trajectory pytree from the rollout buffers, which are
+            # already sentinel-masked (reward->0, done->1) just above.
+            traj = {
+                "tokens": jnp.asarray(buf_tokens.transpose(1, 0, 2)),  # (N,T,L)
+                "v_act": jnp.asarray(buf_actions.T),                   # (N,T)
+                "op": jnp.asarray(buf_op.T),
+                "i": jnp.asarray(buf_i.T),
+                "j": jnp.asarray(buf_j.T),
+                "f": jnp.asarray(buf_f.T),
+                "q": jnp.asarray(buf_q.T),
+                "vmask": jnp.asarray(buf_vertex_for_loss.T),
+                "old_lp": jnp.asarray(buf_log_probs.T),                # (N,T)
+                "reward_vec": jnp.asarray(
+                    np.transpose(buf_reward_vec, (1, 0, 2)),
+                ),                                                     # (N,T,K)
+                "dones": dones_b,                                      # (N,T)
+            }
+            if self.replay_buffer is None:
+                sample0 = jax.tree_util.tree_map(lambda x: x[0], traj)
+                self.replay_buffer = init_replay_buffer(sample0, replay_cap)
+            self.replay_buffer = replay_add_batch(self.replay_buffer, traj)
+            self._replay_buf_size = int(self.replay_buffer.size)
+            # Sample B trajectories (default B=N; uniform, alpha=0).
+            key, sample_rk = jrand.split(key)
+            B = int(getattr(self.args, "replay_sample_trajs", 0) or 0) or N
+            sampled = replay_sample(self.replay_buffer, B, sample_rk, alpha=0.0)
+            key, off_key = jrand.split(key)
+            returns_s, adv_s = self._offpolicy_fn(
+                self.agent, sampled,
+                self._current_op_mask_j, self._current_factor_mask_j,
+                self._current_quant_mask_j, off_key,
+            )
+            n_traj = B
+            _fl = lambda x: x.reshape((B * T,) + x.shape[2:])
+            flat_tokens = _fl(sampled["tokens"])
+            flat_actions = _fl(sampled["v_act"])
+            flat_op = _fl(sampled["op"])
+            flat_i = _fl(sampled["i"])
+            flat_j = _fl(sampled["j"])
+            flat_f = _fl(sampled["f"])
+            flat_q = _fl(sampled["q"])
+            flat_vmask = _fl(sampled["vmask"])
+            flat_log_probs = _fl(sampled["old_lp"])
+            flat_returns = returns_s.reshape(B * T)
+            flat_advantages = adv_s.reshape(B * T)
+
+        total = n_traj * T
         mb_size = total // self.minibatches
         if mb_size == 0:
             mb_size = total
@@ -1607,6 +1793,7 @@ class PPORayWorker:
 
         last_aux = {k: v / max(n_updates, 1) for k, v in aux_accum.items()}
         last_aux["entropy_coef"] = float(self.entropy_coef)
+        last_aux["replay_buffer_size"] = int(getattr(self, "_replay_buf_size", 0))
         # (reward_norm_symlog/* and lagrangian/* logging removed along with the
         # dynamic σ-reweighting and the Lagrangian constraint.)
         # Per-channel rollout means: raw, weighted (static λ), and terminal-only.
