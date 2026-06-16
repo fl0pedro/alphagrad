@@ -64,7 +64,12 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--mem-type", type=str, default="peak_memory",
-        choices=["graphax", "bytes_accessed", "peak_memory"],
+        choices=["graphax", "bytes_accessed", "peak_memory", "xla_peak_memory"],
+        help="Which measured channel drives the memory reward. "
+        "'peak_memory' = ResourceMonitor high-water mark (idx 5; exact on GPU, "
+        "sampled on CPU). 'xla_peak_memory' = deterministic XLA memory_analysis "
+        "(idx 8; preferred on CPU). All channels are measured/logged regardless; "
+        "this only selects the reward driver.",
     )
     p.add_argument(
         "--rewards", nargs="+", type=str,

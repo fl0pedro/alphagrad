@@ -88,7 +88,10 @@ _CMP_TYPE_TO_REWARD: dict[str, str] = {
 _MEM_TYPE_TO_REWARD: dict[str, str] = {
     "graphax": "max_io_sum",
     "bytes_accessed": "bytes_accessed",
-    "peak_memory": "peak_memory",
+    "peak_memory": "peak_memory",          # RM-sampled peak (idx 5)
+    "xla_peak_memory": "xla_peak_memory",  # deterministic XLA peak (idx 8) —
+                                           # preferred CPU memory reward; the RM
+                                           # peak is still measured/logged at idx 5
 }
 
 

@@ -350,7 +350,7 @@ class EnvConfig(NamedTuple):
     # New callers should ignore them and pick the desired component from the
     # reward vector explicitly via REWARD_INDEX.
     cmp_type: Literal["graphax", "flops", "latency"]
-    mem_type: Literal["graphax", "bytes_accessed", "peak_memory"]
+    mem_type: Literal["graphax", "bytes_accessed", "peak_memory", "xla_peak_memory"]
     target_fun: Callable | None = None
     data_gen: Callable | None = None
     exec_on_gpu: bool = False
@@ -1863,13 +1863,14 @@ def _callback(
     # XLA-analysis peak (temp+output+args); always emitted as its own channel.
     # Falls back to the RM peak only if memory_analysis was unavailable.
     xla_peak_memory = _det_peak if _det_peak is not None else _rm_peak
-    # ``peak_memory`` channel = the RELIABLE device-appropriate peak: the exact
-    # RM high-water mark on GPU, the deterministic XLA estimate on CPU (where RM
-    # polling misses sub-ms allocs). Fixing it at this single measurement source
-    # means every consumer that selects peak_memory (reward weight / PCA cost /
-    # Lagrangian constraint / running-max / Pareto objective) gets the
-    # trustworthy CPU signal without each having to special-case the device.
-    peak_memory = _rm_peak if config.exec_on_gpu else xla_peak_memory
+    # ``peak_memory`` (idx 5) ALWAYS carries the ResourceMonitor measurement —
+    # exact on GPU, a sampled high-water mark on CPU — so the RM signal is
+    # recorded on every run regardless of device. The deterministic XLA
+    # estimate lives in its own ``xla_peak_memory`` channel (idx 8). To use the
+    # XLA peak as the CPU memory REWARD, select ``--mem-type xla_peak_memory``
+    # (routes the mem weight to idx 8 in build_reward_weights) — that keeps the
+    # reward deterministic while still measuring/logging the RM peak at idx 5.
+    peak_memory = _rm_peak
 
     # ------------------------------------------------------------------
     # Quality family — cosine similarity + relative Frobenius residual.
