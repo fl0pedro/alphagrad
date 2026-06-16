@@ -361,9 +361,11 @@ class PPORayWorker:
         # Grad-mode: wrap to the SCALAR loss so the rollout worker's env operates
         # on the SAME scalar-loss graph as the CPU measure-actors — else the
         # policy's vertex/action space wouldn't match the graph the pool
-        # eliminates on. Shared wrap (see maybe_scalar_loss).
-        from alphagrad.approx.common import maybe_scalar_loss
-        target_fn, measure_grad = maybe_scalar_loss(self.args, target_fn)
+        # eliminates on. Mirrors cpu_approx_worker / gfn_ray_worker.
+        measure_grad = bool(getattr(self.args, "measure_grad", False))
+        if measure_grad:
+            from alphagrad.approx.common import scalar_loss_fn
+            target_fn = scalar_loss_fn(target_fn)
         closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
         argnums = infer_argnums(self.args.example)
         # Always pass target_fun so flops/bytes_accessed/latency_ns/peak_memory
