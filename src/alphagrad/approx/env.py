@@ -1857,14 +1857,19 @@ def _callback(
                 latency_ns = _percentile_pool(_lat_valid, pk)
             if latency_ns < _LAT_FLOOR_NS:
                 latency_ns = -SENTINEL_REWARD_VALUE
-    # peak_memory = REAL measured peak (RM): exact on GPU (clear_memory_stats +
-    # peak_bytes_in_use), a sampled high-water mark on CPU. The deterministic
-    # XLA-analysis peak is reported SEPARATELY as the ``xla_peak_memory`` channel
-    # (reliable on CPU where RM polling misses sub-ms grad allocs).
-    peak_memory = _percentile_pool(peak_mem_samples, pk)
-    # XLA-analysis peak (temp+output+args). Falls back to the measured peak only
-    # if memory_analysis was unavailable (so it's never a false 0).
-    xla_peak_memory = _det_peak if _det_peak is not None else float(peak_memory)
+    # RM-sampled peak: exact on GPU (clear_memory_stats + peak_bytes_in_use),
+    # a sampled high-water mark on CPU (misses sub-ms grad allocs → unreliable).
+    _rm_peak = float(_percentile_pool(peak_mem_samples, pk))
+    # XLA-analysis peak (temp+output+args); always emitted as its own channel.
+    # Falls back to the RM peak only if memory_analysis was unavailable.
+    xla_peak_memory = _det_peak if _det_peak is not None else _rm_peak
+    # ``peak_memory`` channel = the RELIABLE device-appropriate peak: the exact
+    # RM high-water mark on GPU, the deterministic XLA estimate on CPU (where RM
+    # polling misses sub-ms allocs). Fixing it at this single measurement source
+    # means every consumer that selects peak_memory (reward weight / PCA cost /
+    # Lagrangian constraint / running-max / Pareto objective) gets the
+    # trustworthy CPU signal without each having to special-case the device.
+    peak_memory = _rm_peak if config.exec_on_gpu else xla_peak_memory
 
     # ------------------------------------------------------------------
     # Quality family — cosine similarity + relative Frobenius residual.
