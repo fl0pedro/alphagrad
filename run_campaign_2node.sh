@@ -58,10 +58,10 @@ mkdir -p "$CAMP/logs"
 WAVES="${WAVES:-8}"                       # 8 = full staggered campaign
 EPISODES="${EPISODES:-60}"
 MAX_WALL="${MAX_WALL:-5400}"              # per-run wall cap (s); 0 = run to EPISODES
-NUM_CPU_WORKERS="${NUM_CPU_WORKERS:-80}"  # per run; 4*this <= 384
+NUM_CPU_WORKERS="${NUM_CPU_WORKERS:-24}"  # per run; 4*this <= 384
 REPLAY_CAP="${REPLAY_CAP:-128}"
 RAY_PORT="${RAY_PORT:-6379}"
-RAY_CPUS_GPUNODE="${RAY_CPUS_GPUNODE:-2}"          # tiny -> measure spills to cpu1
+RAY_CPUS_GPUNODE="${RAY_CPUS_GPUNODE:-0}"          # tiny -> measure spills to cpu1
 RAY_CPUS_CPUNODE="${RAY_CPUS_CPUNODE:-$((4 * NUM_CPU_WORKERS + 16))}"
 
 MODELS=(VmappedNeuralNetwork VmappedConvNet VmappedMoE VmappedViT)
