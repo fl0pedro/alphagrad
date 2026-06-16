@@ -164,6 +164,21 @@ def _run(args) -> int:
     for k, v in os.environ.items():
         if k.startswith("ALPHAGRAD_") or k.startswith("JAX_COMPILATION_"):
             cpu_actor_env[k] = v
+    # Single-core measurement (--cpu-cores-per-actor 1): also kill the math-lib
+    # and XLA-Eigen threadpools so the pinned core runs TRULY single-threaded
+    # (no intra-op threads contending on one core) — cleanest per-reading CV for
+    # the CPU reward signal. The legacy "don't single-thread" note above was for
+    # the full Jacobian (~80s single-core); in grad-mode the gradient exec is
+    # ~160x cheaper, so single-thread no longer starves it.
+    if int(getattr(args, "cpu_cores_per_actor", 0) or 0) == 1:
+        cpu_actor_env.update({
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "XLA_FLAGS": (os.environ.get("XLA_FLAGS", "")
+                         + " --xla_cpu_multi_thread_eigen=false").strip(),
+        })
     cpu_actor_options = {
         "num_cpus": 1,
         "num_gpus": float(getattr(args, "cpu_actor_num_gpus", 0.0) or 0.0),
