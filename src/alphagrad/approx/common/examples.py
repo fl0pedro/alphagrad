@@ -223,6 +223,85 @@ def scalar_loss_fn(fn):
     return _loss
 
 
+def seed_loss_fn(fn, argnums):
+    """Both-seed (tangent + adjoint) scalar loss with the SEEDS AS EXPLICIT
+    GRAPH VERTICES (graphax.seed_vertices). Returns ``g(*primals, t)`` where:
+
+      g(*primals, t) = < ones/N , fn( p + t * dir ) >      # == mean(fn) at any t
+
+    ``dir`` is the tangent-seed direction: ones on the DIFFERENTIATED args
+    (``argnums`` — the weights) and zero elsewhere (x / y stay fixed), and the
+    scalar tangent seed ``t`` is appended LAST so existing arg indices (and the
+    data_gen / weight slots) are unchanged. The ``<ones/N, ·>`` is the adjoint
+    seed contraction (an explicit elementwise mul + sum) — same value as
+    ``scalar_loss_fn`` (mean), but the tangent injection and adjoint contraction
+    show up in ``_build_graph`` as ORDINARY eliminable vertices. Differentiated
+    w.r.t. ``argnums + (t,)`` the learned order then chooses forward / reverse /
+    cross-country seed timing. The trainer + every CPU measure-actor MUST build
+    the SAME wrap + appended ``t`` + shifted argnums (see ``grad_target_setup``)."""
+    from graphax.seed_vertices import with_tangent_seed
+    argset = {int(a) for a in argnums}
+
+    def g(*primals_and_t):
+        *primals, t = primals_and_t
+        tangent = tuple(
+            jnp.ones_like(p) if i in argset else jnp.zeros_like(p)
+            for i, p in enumerate(primals)
+        )
+        out = with_tangent_seed(fn, tangent)(t, *primals)  # tangent seed vertex
+        leaves = jax.tree_util.tree_leaves(out)
+        N = 0
+        for leaf in leaves:
+            n = 1
+            for d in jnp.shape(leaf):
+                n *= int(d)
+            N += n
+        N = N or 1
+        # adjoint seed vertex: <ones/N, out> as an explicit elementwise mul + sum
+        return sum(jnp.sum((jnp.ones_like(leaf) / N) * leaf) for leaf in leaves)
+
+    return g
+
+
+def grad_target_setup(args_like, base_fn, xs, example):
+    """Shared grad-mode target builder — returns ``(target_fn, xs, argnums)``.
+
+    Honors ``--measure-grad`` and ``--seed-vertices``. Called identically by the
+    trainer (ppo_ray_worker) and the CPU measure-actor (cpu_approx_worker) so
+    both build the IDENTICAL graph (jaxpr / vertex+action space / argnums).
+    ``args_like`` may be an argparse Namespace or the actor's args dict."""
+    def _flag(name):
+        if isinstance(args_like, dict):
+            return bool(args_like.get(name, False))
+        return bool(getattr(args_like, name, False))
+
+    base_argnums = infer_argnums(example)
+    if not _flag("measure_grad"):
+        return base_fn, tuple(xs), base_argnums
+    if _flag("seed_vertices"):
+        return (
+            seed_loss_fn(base_fn, base_argnums),
+            tuple(xs) + (jnp.zeros(()),),                 # append tangent seed t=0
+            tuple(base_argnums) + (len(xs),),             # differentiate weights + t
+        )
+    return scalar_loss_fn(base_fn), tuple(xs), base_argnums
+
+
+def grad_target_fn(args_like, base_fn, example):
+    """Wrap-only variant of ``grad_target_setup`` for sites that re-swap just the
+    target function (the env's args/argnums were fixed at build time)."""
+    def _flag(name):
+        if isinstance(args_like, dict):
+            return bool(args_like.get(name, False))
+        return bool(getattr(args_like, name, False))
+
+    if not _flag("measure_grad"):
+        return base_fn
+    if _flag("seed_vertices"):
+        return seed_loss_fn(base_fn, infer_argnums(example))
+    return scalar_loss_fn(base_fn)
+
+
 def infer_argnums(fn_str: str) -> tuple[int, ...]:
     """Default `argnums` (which input slots are differentiated through) per example name."""
     if fn_str.endswith("NeuralNetwork"):

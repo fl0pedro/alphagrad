@@ -145,6 +145,15 @@ def make_argparser() -> argparse.ArgumentParser:
         "(a single dtype, or none) instead of per-vertex repeated quant.",
     )
     p.add_argument(
+        "--seed-vertices", action="store_true",
+        help="Grad-mode only: treat the tangent + adjoint SEEDS as their own graph "
+        "vertices (graphax.seed_vertices). The scalar loss becomes "
+        "<ones/N, fn(p + t*dir)> with the tangent seed t appended as the LAST arg "
+        "and the adjoint contraction explicit, so the elimination order chooses "
+        "forward / reverse / cross-country seed timing. Same value/gradient as the "
+        "plain scalar loss; only the action space (and graph) grows.",
+    )
+    p.add_argument(
         "--latency-timer", type=str, default="perf_counter",
         choices=["perf_counter", "rm"],
         help="Latency timer. 'perf_counter' (default): time an inner loop + one "

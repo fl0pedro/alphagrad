@@ -303,11 +303,11 @@ class CpuApproximationServer:
         if args_dict is None:
             return False  # paranoid; nothing to rebuild from
         target_fn = get_fn(args_dict["example"])
-        if bool(args_dict.get("measure_grad", False)):
-            # Match the grad-mode scalar-loss wrapping used at env-build time
-            # so the swapped-in target stays the same scalar-loss graph.
-            from alphagrad.approx.common import scalar_loss_fn
-            target_fn = scalar_loss_fn(target_fn)
+        # Match the grad-mode wrapping used at env-build time (incl.
+        # --seed-vertices) so the swapped-in target stays the same graph. The
+        # env's args/argnums were fixed at build time, so only the fn is re-wrapped.
+        from alphagrad.approx.common import grad_target_fn
+        target_fn = grad_target_fn(args_dict, target_fn, args_dict["example"])
         new_config = self._config._replace(target_fun=target_fn)
         # Swap on the env via eqx.tree_at so the JAX-side state survives.
         self._env = eqx.tree_at(lambda e: e.config, self._env, new_config)
@@ -375,14 +375,14 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
     )
     # Gradient mode: THIS env (inside the CpuApproximationActor) does the actual
-    # pooled measurement, so the scalar-loss wrapping + jaxpr must mirror the
-    # trainer exactly, or grad-mode runs would silently measure the Jacobian.
+    # pooled measurement, so the grad-mode wrapping + jaxpr + argnums must mirror
+    # the trainer exactly, or grad-mode runs would silently measure the Jacobian.
+    # Shared helper (same as ppo_ray_worker) builds the IDENTICAL graph; honors
+    # --seed-vertices (tangent+adjoint seed vertices + appended seed arg t).
     measure_grad = bool(getattr(args, "measure_grad", False))
-    if measure_grad:
-        from alphagrad.approx.common import scalar_loss_fn
-        target_fn = scalar_loss_fn(target_fn)
+    from alphagrad.approx.common import grad_target_setup
+    target_fn, xs, argnums = grad_target_setup(args, target_fn, xs, args.example)
     closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
-    argnums = infer_argnums(args.example)
 
     # Always pass target_fun so env._callback runs the JIT-compile +
     # cost_analysis + ResourceMonitor path on every step — this is what

@@ -56,7 +56,9 @@ mkdir -p "$CAMP/logs"
 
 # ---- tunables (env-overridable for smoke) --------------------------------
 WAVES="${WAVES:-8}"                       # 8 = full staggered campaign
-EPISODES="${EPISODES:-60}"
+EPISODES="${EPISODES:-500}"
+WANDB="${WANDB:-online}"
+WANDB_PROJECT="${WANDB_PROJECT:-dsnn-qsig-cvar-seed}"
 MAX_WALL="${MAX_WALL:-5400}"              # per-run wall cap (s); 0 = run to EPISODES
 NUM_CPU_WORKERS="${NUM_CPU_WORKERS:-24}"  # per run; 4*this <= 384
 REPLAY_CAP="${REPLAY_CAP:-128}"
@@ -65,8 +67,10 @@ RAY_CPUS_GPUNODE="${RAY_CPUS_GPUNODE:-0}"          # tiny -> measure spills to c
 RAY_CPUS_CPUNODE="${RAY_CPUS_CPUNODE:-$((4 * NUM_CPU_WORKERS + 16))}"
 
 MODELS=(VmappedNeuralNetwork VmappedConvNet VmappedMoE VmappedViT)
-ENVS=(8 8 4 4)
-MBS=(4 4 8 16)
+# --seed-vertices ~doubles the graph (NN 15->36 eqns etc.), enlarging the policy's
+# relational attention; envs=4 + higher minibatches keeps jit_update_step in 80GB.
+ENVS=(4 4 4 4)
+MBS=(8 8 8 16)
 
 # Raise fd / process limits: the measure pool puts 4*NUM_CPU_WORKERS actors on
 # cpu1; each holds plasma-store fds. The default soft limit (1024) makes the
@@ -114,7 +118,7 @@ run_wave() {
        uv run --no-sync $PPO --name camp_${M}_w${WAVE} --variant full --seed $SEED \
          --example $M --dataset mnist \
          --rewards cmp mem acc --cmp-type latency --mem-type xla_peak_memory \
-         --measure-grad --measure-latency --quant-once \
+         --measure-grad --measure-latency --quant-once --seed-vertices \
          --latency-timer perf_counter --latency-inner-reps 5 --latency-warmup 2 --latency-winsor 0.2 \
          --cpu-cores-per-actor 1 --cpu-cores-shared --num-cpu-workers $NUM_CPU_WORKERS \
          --actor-num-gpus 1 --ray-address $HEAD_IP:$RAY_PORT \
@@ -125,7 +129,7 @@ run_wave() {
          --max-wall-seconds $MAX_WALL \
          --num-data-points 5 --reps-per-point 2 \
          --best-sequences-json $OUT/best.json --best-sequences-every 5 \
-         --calibrate-steps 0 --wandb disabled > $LOG 2>&1
+         --calibrate-steps 0 --wandb $WANDB --wandb-project $WANDB_PROJECT > $LOG 2>&1
        rc=\$?; echo \"EXIT=\$rc model=$M wave=$WAVE seed=$SEED\" >> $LOG
        if [ \$rc -eq 0 ] && [ -s $OUT/best.json ]; then touch $OUT/.done; fi
        exit \$rc" &
