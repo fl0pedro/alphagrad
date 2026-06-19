@@ -61,14 +61,19 @@ WANDB="${WANDB:-online}"
 WANDB_PROJECT="${WANDB_PROJECT:-dsnn-qsig-cvar-seed}"
 MAX_WALL="${MAX_WALL:-0}"                 # per-run wall cap (s); 0 = run to EPISODES (no cap)
 NUM_CPU_WORKERS="${NUM_CPU_WORKERS:-24}"  # per run; 4*this <= 384
-# Static reward lambdas = 1 / (measured |symlog| scale of each channel), so every
-# reward enters the weighted sum normalized to ~1e0 (the scalar reward symlog's
-# each channel first; measured scales NN+MoE: latency 18.5, xla_mem 18.6,
-# cosine 0.69). frob OFF — the 3 rewards PPO listens to are latency [cmp],
-# xla_peak_memory [mem], cosine [acc], each ~equally weighted after normalization.
-LAMBDA_CMP="${LAMBDA_CMP:-0.054}"
-LAMBDA_MEM="${LAMBDA_MEM:-0.054}"
-LAMBDA_ACC="${LAMBDA_ACC:-1.45}"
+# Static reward lambdas = 1 / (measured |symlog| scale of each channel) so each
+# COST reward enters normalized to ~1e0. The scalar reward symlog's every channel
+# first, which ALSO absorbs the 150x cross-model raw-scale spread (NN latency
+# 2e7 .. ConvNet 3e9) into a narrow symlog band (~17..22), so a single static
+# lambda normalizes all four models. Measured |symlog| means over 4 models:
+# latency 20.2, xla_peak_memory 20.3 (they coincide because ns and bytes happen
+# to share a ~1e9 magnitude here). cosine is ALREADY in [0,1] (quant only
+# degrades it toward 0, never negative) so it needs NO rescale -> lambda 1.0.
+# frob OFF. The 3 rewards PPO listens to: latency [cmp], xla_peak_memory [mem],
+# cosine [acc].
+LAMBDA_CMP="${LAMBDA_CMP:-0.050}"
+LAMBDA_MEM="${LAMBDA_MEM:-0.049}"
+LAMBDA_ACC="${LAMBDA_ACC:-1.0}"
 LAMBDA_FROB="${LAMBDA_FROB:-0.0}"
 MAXJOBS="${MAXJOBS:-4}"                    # concurrent runs (slots); 4*NUM_CPU_WORKERS<=384
 REPLAY_CAP="${REPLAY_CAP:-128}"
