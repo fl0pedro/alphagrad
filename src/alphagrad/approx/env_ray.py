@@ -55,7 +55,7 @@ import math as _math
 
 _TOKEN_VOCAB, _, _ = _graphax_get_vocab()
 
-MAX_TOKENS = 4096
+MAX_TOKENS = 8192
 MAX_RULES_PER_VERTEX = 16
 NUM_AXIS_PAIRS = 4
 MAX_AXES_PER_VERTEX = 8

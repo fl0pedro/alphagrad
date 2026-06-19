@@ -37,6 +37,17 @@ _VISION_MODELS = {
     "ViT": "vit_weights",
 }
 
+# Equalized model dims so all 4 learning-rule-search models have ~50k params
+# (so the search is comparable across models). Params scale: NN ~795*h,
+# ViT ~11*d^2, MoE ~16*d^2 (E=4), ConvNet ~5760*Cout. Verified counts ~46-52k.
+#   NN h=63 -> 50095 | ViT d=65 -> ~50k | MoE d=54 -> ~50k | ConvNet Cout=9 -> ~52k
+_EQ_NN_HIDDEN = 63
+_EQ_VISION_KW = {
+    "ConvNet": {"Cout": 9},
+    "MoE": {"d": 54},
+    "ViT": {"d": 65},
+}
+
 
 def _vision_base(fn_str):
     """Return the bare vision-model name (handling the ``Vmapped`` prefix) if
@@ -147,7 +158,7 @@ def get_args(fn_str: str, key, dataset: str | None = None):
     if fn_str.endswith("NeuralNetwork"):
         if dataset is not None:
             in_dim, out_dim = dataset_dims(dataset)
-            h = NN_HIDDEN_DIM
+            h = _EQ_NN_HIDDEN   # equalized ~50k params (was NN_HIDDEN_DIM=256)
             shapes = [
                 (in_dim,), (out_dim,),
                 (h, in_dim), (h,),
@@ -169,7 +180,7 @@ def get_args(fn_str: str, key, dataset: str | None = None):
         kx, ky, kw = jax.random.split(key, 3)
         x = jax.random.normal(kx, (*bx, 784))
         y = jax.random.normal(ky, (*bx, 10))
-        ws = getattr(examples, _VISION_MODELS[vbase])(kw)
+        ws = getattr(examples, _VISION_MODELS[vbase])(kw, **_EQ_VISION_KW[vbase])
         ws = list(ws) if isinstance(ws, (tuple, list)) else [ws]
         return [x, y, *ws]
     else:
