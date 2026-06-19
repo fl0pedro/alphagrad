@@ -136,7 +136,11 @@ def build_reward_weights(args) -> np.ndarray:
         mem_name = _MEM_TYPE_TO_REWARD[args.mem_type]
         w[REWARD_INDEX[mem_name]] = float(getattr(args, "lambda_mem", 1.0))
     if "acc" in args.rewards:
-        w[COSINE_SIM_IDX] = 1.0
+        # cosine_sim is symlog'd alongside the cost channels in the scalar
+        # reward, so its raw [0,1] range (symlog(1)~=0.69) is dwarfed by
+        # latency/peak-memory (symlog~=17-20). --lambda-acc (~25) rescales it to
+        # a comparable magnitude so it isn't effectively ignored.
+        w[COSINE_SIM_IDX] = float(getattr(args, "lambda_acc", 1.0))
     lam_frob = float(getattr(args, "lambda_frob", 0.0))
     if lam_frob != 0.0:
         w[FROB_RESIDUAL_IDX] = lam_frob

@@ -77,6 +77,14 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--lambda-cmp", type=float, default=1.0)
     p.add_argument("--lambda-mem", type=float, default=1.0)
+    p.add_argument(
+        "--lambda-acc", type=float, default=1.0,
+        help="Static weight on the cosine_sim (accuracy) reward channel. The "
+        "scalar reward symlog's every channel, so cosine (symlog(1)~=0.69) is "
+        "dwarfed by latency/peak-memory (symlog~=17-20) at the old hard-coded "
+        "weight of 1.0 — set ~25 to bring cosine to a COMPARABLE magnitude so "
+        "PPO actually trades accuracy against cost.",
+    )
     # Both quality channels (cosine_sim direction + frob magnitude) are
     # now active rewards by default. cossim is gated by ``acc`` in
     # ``--rewards`` (weight = 1.0 when present). frob has its own
