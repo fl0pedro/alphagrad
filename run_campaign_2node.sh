@@ -71,10 +71,8 @@ NUM_CPU_WORKERS="${NUM_CPU_WORKERS:-24}"  # per run; 4*this <= 384
 # degrades it toward 0, never negative) so it needs NO rescale -> lambda 1.0.
 # frob OFF. The 3 rewards PPO listens to: latency [cmp], xla_peak_memory [mem],
 # cosine [acc].
-LAMBDA_CMP="${LAMBDA_CMP:-0.050}"
-LAMBDA_MEM="${LAMBDA_MEM:-0.049}"
-LAMBDA_ACC="${LAMBDA_ACC:-1.0}"
-LAMBDA_FROB="${LAMBDA_FROB:-0.0}"
+LAMBDA_ACC="${LAMBDA_ACC:-1.0}"          # cosine already in [0,1] -> no rescale
+LAMBDA_FROB="${LAMBDA_FROB:-0.0}"        # frob OFF
 MAXJOBS="${MAXJOBS:-4}"                    # concurrent runs (slots); 4*NUM_CPU_WORKERS<=384
 REPLAY_CAP="${REPLAY_CAP:-128}"
 RAY_PORT="${RAY_PORT:-6379}"
@@ -86,6 +84,13 @@ MODELS=(VmappedNeuralNetwork VmappedConvNet VmappedMoE VmappedViT)
 # relational attention; envs=4 + higher minibatches keeps jit_update_step in 80GB.
 ENVS=(4 4 4 4)
 MBS=(8 8 8 16)
+# PER-MODEL (per-run) cost-reward lambdas = 1/(that model's measured |symlog| scale)
+# so each model's latency/xla_mem reward is normalized to ~1e0 on ITS OWN scale —
+# the raw scale varies 150x across models (NN ~2e7, Conv ~3e9), so one shared
+# lambda can't normalize all four. Measured |symlog| per model (latency, xla_mem):
+#   NN 16.8/17.5  Conv 21.9/22.0  MoE 20.2/20.3  ViT 21.8/21.4
+LAMBDA_CMP_ARR=(0.060 0.046 0.050 0.046)   # 1/latency_symlog per NN/Conv/MoE/ViT
+LAMBDA_MEM_ARR=(0.057 0.045 0.049 0.047)   # 1/xla_mem_symlog per NN/Conv/MoE/ViT
 
 # Raise fd / process limits: the measure pool puts 4*NUM_CPU_WORKERS actors on
 # cpu1; each holds plasma-store fds. The default soft limit (1024) makes the
@@ -124,6 +129,7 @@ launch_one() {
     local WAVE=$1 SLOT=$2
     local MIDX=$(( (WAVE + SLOT) % 4 ))
     local M=${MODELS[$MIDX]} NE=${ENVS[$MIDX]} MB=${MBS[$MIDX]}
+    local LCMP=${LAMBDA_CMP_ARR[$MIDX]} LMEM=${LAMBDA_MEM_ARR[$MIDX]}   # per-model
     local SEED=$(( 1000 + MIDX*100 + WAVE ))
     local OUT=$CAMP/${M}/run${WAVE}
     local LOG=$CAMP/logs/${M}_w${WAVE}.log
@@ -136,7 +142,7 @@ launch_one() {
     uv run --no-sync $PPO --name camp_${M}_w${WAVE} --variant full --seed $SEED \
       --example $M --dataset mnist \
       --rewards cmp mem acc --cmp-type latency --mem-type xla_peak_memory \
-      --lambda-cmp $LAMBDA_CMP --lambda-mem $LAMBDA_MEM --lambda-acc $LAMBDA_ACC --lambda-frob $LAMBDA_FROB \
+      --lambda-cmp $LCMP --lambda-mem $LMEM --lambda-acc $LAMBDA_ACC --lambda-frob $LAMBDA_FROB \
       --measure-grad --measure-latency --quant-once --seed-vertices \
       --latency-timer perf_counter --latency-inner-reps 5 --latency-warmup 2 --latency-winsor 0.2 \
       --cpu-cores-per-actor 1 --cpu-cores-shared --num-cpu-workers $NUM_CPU_WORKERS \

@@ -1015,6 +1015,17 @@ def _quality_metrics(jac_exact, jac_approx):
     if flat_exact is None or flat_approx is None:
         return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
     if flat_approx.shape != flat_exact.shape or flat_approx.size == 0:
+        if os.environ.get("ALPHAGRAD_DEBUG_QUALITY", "0") == "1":
+            _ea = jax.tree_util.tree_leaves(jac_exact)
+            _aa = jax.tree_util.tree_leaves(jac_approx)
+            print(
+                "[quality-debug] SHAPE-MISMATCH -> cos=0 | "
+                f"exact_leaves={[tuple(jnp.shape(x)) for x in _ea]} "
+                f"approx_leaves(aligned)={[tuple(jnp.shape(x)) for x in _aa]} "
+                f"flat_exact={None if flat_exact is None else flat_exact.shape} "
+                f"flat_approx={None if flat_approx is None else flat_approx.shape}",
+                flush=True,
+            )
         return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
 
     cos = cossim(flat_exact, flat_approx)
