@@ -45,13 +45,14 @@ _VISION_MODELS = {
 # sizes, and deterministic memory_analysis is ~0; the blowup is the approx
 # substep jacve + GPU conv-autotuner workspace, which scales with conv size).
 # Shrinking to FLOP-match shrinks that workspace. Target = NN(h=63) reverse-
-# grad flops 3.23e6 (seeds off): ConvNet Cout=2 -> 1.09x, MoE d=8 -> 1.19x.
-# ViT d=65 left as-is = 28x NN (NOT FLOP-matched — will be the heaviest).
+# grad flops 3.23e6 (seeds off): ConvNet Cout=2 -> 1.09x, MoE d=8 -> 1.19x,
+# ViT d=8 -> 1.00x (was d=65 = 28x NN: 410 s/it + 137 contraction-mismatch
+# sentinels — FLOP-matching it down is the single biggest pace win).
 _EQ_NN_HIDDEN = 63
 _EQ_VISION_KW = {
     "ConvNet": {"Cout": 2},
     "MoE": {"d": 8},
-    "ViT": {"d": 65},
+    "ViT": {"d": 8},
 }
 
 
