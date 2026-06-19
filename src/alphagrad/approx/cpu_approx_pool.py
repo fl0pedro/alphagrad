@@ -683,7 +683,11 @@ class CpuApproxPool:
         import ray
         with self._lock:
             actors = list(self._alive)
-        empty = {"count": 0, "max_observed_len": 0, "overflow_sum": 0}
+        empty = {
+            "count": 0, "max_observed_len": 0, "overflow_sum": 0,
+            "raw_len_sum": 0, "raw_len_count": 0,
+            "raw_len_max": 0, "raw_len_min": 0,
+        }
         if not actors:
             return empty
         futures = [
@@ -703,6 +707,10 @@ class CpuApproxPool:
         total = 0
         max_len = 0
         overflow_sum = 0
+        rl_sum = 0
+        rl_count = 0
+        rl_max = 0
+        rl_min = 0
         for r in results:
             if not r:
                 continue
@@ -711,10 +719,22 @@ class CpuApproxPool:
             if ml > max_len:
                 max_len = ml
             overflow_sum += int(r.get("overflow_sum", 0))
+            rl_sum += int(r.get("raw_len_sum", 0))
+            rl_count += int(r.get("raw_len_count", 0))
+            rlm = int(r.get("raw_len_max", 0))
+            if rlm > rl_max:
+                rl_max = rlm
+            rlmin = int(r.get("raw_len_min", 0))
+            if rlmin > 0 and (rl_min == 0 or rlmin < rl_min):
+                rl_min = rlmin
         return {
             "count": total,
             "max_observed_len": max_len,
             "overflow_sum": overflow_sum,
+            "raw_len_sum": rl_sum,
+            "raw_len_count": rl_count,
+            "raw_len_max": rl_max,
+            "raw_len_min": rl_min,
         }
 
     def recycle_one(self) -> int:

@@ -78,7 +78,7 @@ import math as _math
 # rebuilding it on every callback is pure overhead.
 _TOKEN_VOCAB, _, _ = _graphax_get_vocab()
 
-MAX_TOKENS = 8192
+MAX_TOKENS = 2048
 
 # Per-process tokenization-truncation telemetry. ``_callback`` writes
 # here whenever the un-truncated jaxpr token sequence exceeds
@@ -104,6 +104,16 @@ _TOKENIZATION_TRUNCATION_MAX_LEN: list[int] = [0]
 _TOKENIZATION_TRUNCATION_OVERFLOW_SUM: list[int] = [0]
 _TOKENIZATION_TRUNCATION_WARNED: list[bool] = [False]
 
+# Always-on raw_len telemetry — tracks EVERY tokenization (not just the ones
+# exceeding MAX_TOKENS), so the per-episode mean/max/min jaxpr token length is
+# visible in wandb regardless of truncation. This is what reveals how much the
+# dynamic-substep expansion inflates the sequence and how low --max-substeps
+# must go. Reset each poll by ``consume_tokenization_truncation_stats``.
+_RAW_LEN_SUM: list[int] = [0]
+_RAW_LEN_COUNT: list[int] = [0]
+_RAW_LEN_MAX: list[int] = [0]
+_RAW_LEN_MIN: list[int] = [0]   # 0 = unset (first sample initializes it)
+
 
 def _record_tokenization_truncation(raw_len: int) -> None:
     """Bump the per-process truncation counter and emit a one-time
@@ -111,6 +121,13 @@ def _record_tokenization_truncation(raw_len: int) -> None:
     increment + one branch. The warning carries the actual raw token
     length so the user can see how much headroom they need.
     """
+    # Always-on raw_len stats (every tokenization, truncated or not).
+    _RAW_LEN_SUM[0] += raw_len
+    _RAW_LEN_COUNT[0] += 1
+    if raw_len > _RAW_LEN_MAX[0]:
+        _RAW_LEN_MAX[0] = raw_len
+    if _RAW_LEN_MIN[0] == 0 or raw_len < _RAW_LEN_MIN[0]:
+        _RAW_LEN_MIN[0] = raw_len
     if raw_len <= MAX_TOKENS:
         return
     overflow = raw_len - MAX_TOKENS
@@ -154,10 +171,21 @@ def consume_tokenization_truncation_stats() -> dict:
     _TOKENIZATION_TRUNCATION_COUNT[0] = 0
     _TOKENIZATION_TRUNCATION_MAX_LEN[0] = 0
     _TOKENIZATION_TRUNCATION_OVERFLOW_SUM[0] = 0
+    rl_sum, rl_cnt = _RAW_LEN_SUM[0], _RAW_LEN_COUNT[0]
+    rl_max, rl_min = _RAW_LEN_MAX[0], _RAW_LEN_MIN[0]
+    _RAW_LEN_SUM[0] = 0
+    _RAW_LEN_COUNT[0] = 0
+    _RAW_LEN_MAX[0] = 0
+    _RAW_LEN_MIN[0] = 0
     return {
         "count": int(count),
         "max_observed_len": int(max_len),
         "overflow_sum": int(overflow_sum),
+        # Always-on raw_len (all tokenizations this period).
+        "raw_len_sum": int(rl_sum),
+        "raw_len_count": int(rl_cnt),
+        "raw_len_max": int(rl_max),
+        "raw_len_min": int(rl_min),
     }
 # Upper bound on rule_specs rows per vertex. In dynamic-substeps mode this
 # also bounds the number of typed micro-actions per vertex that survive

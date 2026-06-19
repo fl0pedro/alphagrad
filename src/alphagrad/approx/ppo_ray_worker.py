@@ -2130,16 +2130,29 @@ class PPORayWorker:
                 count = int(trunc.get("count", 0))
                 overflow_sum = int(trunc.get("overflow_sum", 0))
                 max_len = int(trunc.get("max_observed_len", 0))
+                rl_sum = int(trunc.get("raw_len_sum", 0))
+                rl_count = int(trunc.get("raw_len_count", 0))
+                rl_max = int(trunc.get("raw_len_max", 0))
+                rl_min = int(trunc.get("raw_len_min", 0))
             except Exception:
                 count = 0
                 overflow_sum = 0
                 max_len = 0
+                rl_sum = rl_count = rl_max = rl_min = 0
             last_aux["tokenization/truncated_count"] = count
             last_aux["tokenization/overflow_sum_this_ep"] = overflow_sum
             last_aux["tokenization/mean_overflow_per_trunc"] = (
                 float(overflow_sum / count) if count > 0 else 0.0
             )
             last_aux["tokenization/max_observed_len"] = max_len
+            # Always-on raw_len (EVERY tokenization, not just truncated) — the
+            # honest per-episode sequence-length distribution vs MAX_TOKENS.
+            last_aux["tokenization/raw_len_mean"] = (
+                float(rl_sum / rl_count) if rl_count > 0 else 0.0
+            )
+            last_aux["tokenization/raw_len_max"] = rl_max
+            last_aux["tokenization/raw_len_min"] = rl_min
+            last_aux["tokenization/raw_len_count"] = rl_count
             recycle_every = getattr(self, "_cpu_pool_recycle_every", 0)
             if recycle_every > 0:
                 # Cascading recycle: kill ONE actor every
