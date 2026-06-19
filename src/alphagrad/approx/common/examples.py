@@ -37,14 +37,20 @@ _VISION_MODELS = {
     "ViT": "vit_weights",
 }
 
-# Equalized model dims so all 4 learning-rule-search models have ~50k params
-# (so the search is comparable across models). Params scale: NN ~795*h,
-# ViT ~11*d^2, MoE ~16*d^2 (E=4), ConvNet ~5760*Cout. Verified counts ~46-52k.
-#   NN h=63 -> 50095 | ViT d=65 -> ~50k | MoE d=54 -> ~50k | ConvNet Cout=9 -> ~52k
+# Model dims matched by REVERSE-MODE GRAD FLOPs (not params). Param-matching
+# badly mismatched grad COMPUTE — conv/attention reuse each weight over many
+# sites, so at ~50k params ConvNet/MoE/ViT had 4.6x / 26x / 28x NN's
+# value_and_grad flops. ConvNet then OOM'd the GPU measure actor at 25-51 GiB
+# (NOT the base grad — exact value_and_grad exec peak is 0.126 GiB for ALL
+# sizes, and deterministic memory_analysis is ~0; the blowup is the approx
+# substep jacve + GPU conv-autotuner workspace, which scales with conv size).
+# Shrinking to FLOP-match shrinks that workspace. Target = NN(h=63) reverse-
+# grad flops 3.23e6 (seeds off): ConvNet Cout=2 -> 1.09x, MoE d=8 -> 1.19x.
+# ViT d=65 left as-is = 28x NN (NOT FLOP-matched — will be the heaviest).
 _EQ_NN_HIDDEN = 63
 _EQ_VISION_KW = {
-    "ConvNet": {"Cout": 9},
-    "MoE": {"d": 54},
+    "ConvNet": {"Cout": 2},
+    "MoE": {"d": 8},
     "ViT": {"d": 65},
 }
 
