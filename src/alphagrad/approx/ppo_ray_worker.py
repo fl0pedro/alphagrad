@@ -2153,6 +2153,17 @@ class PPORayWorker:
             last_aux["tokenization/raw_len_max"] = rl_max
             last_aux["tokenization/raw_len_min"] = rl_min
             last_aux["tokenization/raw_len_count"] = rl_count
+            # How much we are truncating (we accept it, but track it):
+            #  * truncated_fraction — fraction of tokenizations that exceeded
+            #    MAX_TOKENS this episode (frequency).
+            #  * truncated_token_fraction — fraction of TOKENS thrown away
+            #    (overflow_sum / total raw tokens) — magnitude of info loss.
+            last_aux["tokenization/truncated_fraction"] = (
+                float(count / rl_count) if rl_count > 0 else 0.0
+            )
+            last_aux["tokenization/truncated_token_fraction"] = (
+                float(overflow_sum / rl_sum) if rl_sum > 0 else 0.0
+            )
             recycle_every = getattr(self, "_cpu_pool_recycle_every", 0)
             if recycle_every > 0:
                 # Cascading recycle: kill ONE actor every

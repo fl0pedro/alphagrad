@@ -78,7 +78,7 @@ import math as _math
 # rebuilding it on every callback is pure overhead.
 _TOKEN_VOCAB, _, _ = _graphax_get_vocab()
 
-MAX_TOKENS = 2048
+MAX_TOKENS = 4096
 
 # Per-process tokenization-truncation telemetry. ``_callback`` writes
 # here whenever the un-truncated jaxpr token sequence exceeds
