@@ -66,6 +66,14 @@ def _extend_argparser(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "when SPMD sharding lands).",
     )
     p.add_argument(
+        "--use-placement-group", action="store_true",
+        help="Reserve a Ray placement group per run: one {GPU: actor_num_gpus} "
+        "bundle for the (same-node) SPMD PPO trainer + one {GPU: "
+        "cpu_actor_num_gpus, CPU:1} bundle per measure actor, PACK strategy. "
+        "Makes N concurrent multi-GPU runs tile deterministically across mixed "
+        "GPU nodes (e.g. 4+8) instead of Ray's greedy placement stranding GPUs.",
+    )
+    p.add_argument(
         "--lagrangian-warmup-eps",
         type=int,
         default=20,
@@ -119,6 +127,24 @@ def _run(args) -> int:
     for k, v in os.environ.items():
         if k.startswith("ALPHAGRAD_") or k.startswith("JAX_COMPILATION_"):
             actor_env[k] = v
+    # Optional per-run placement group: one bundle of {GPU: actor_num_gpus}
+    # for the PPO trainer (a single bundle => same node, required for the SPMD
+    # mesh / NCCL) + one {CPU:1, GPU: cpu_actor_num_gpus} bundle per measure
+    # actor. PACK co-locates the run's GPUs and lets N runs tile mixed GPU
+    # nodes deterministically (no greedy fragmentation stranding GPUs).
+    _pg = None
+    if getattr(args, "use_placement_group", False):
+        from ray.util.placement_group import placement_group
+        _gg = float(getattr(args, "cpu_actor_num_gpus", 0.0) or 0.0)
+        _bundles = [{"GPU": float(args.actor_num_gpus)}]
+        for _ in range(int(args.num_cpu_workers)):
+            _b = {"CPU": 1.0}
+            if _gg > 0:
+                _b["GPU"] = _gg
+            _bundles.append(_b)
+        _pg = placement_group(_bundles, strategy="PACK")
+        ray.get(_pg.ready())
+
     actor_kwargs = {
         # GPU-bound trainer: reserve 0 CPU slots so the GPU node can be
         # declared --num-cpus=0, which physically excludes the num_cpus=1
@@ -130,6 +156,11 @@ def _run(args) -> int:
     } if args.actor_num_gpus > 0 else {
         "runtime_env": {"env_vars": actor_env},
     }
+    if _pg is not None:
+        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+        actor_kwargs["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+            _pg, placement_group_bundle_index=0,
+        )
 
     # Cluster-wide shared compile cache. Spawned BEFORE any CPU worker
     # so when those workers' env._callback runs cached_compile() on
@@ -191,14 +222,23 @@ def _run(args) -> int:
     # every core across both nodes for measurement. Opt-in via
     # ``--spread-cpu-actors`` so single-node runs keep the default
     # (locality-friendly) packing.
-    if getattr(args, "spread_cpu_actors", False):
+    if getattr(args, "spread_cpu_actors", False) and _pg is None:
         cpu_actor_options["scheduling_strategy"] = "SPREAD"
-    cpu_workers = [
-        CpuApproximationActor.options(**cpu_actor_options).remote(
-            args_dict, variant=None, actor_id=i,
+    cpu_workers = []
+    for i in range(args.num_cpu_workers):
+        _opts = dict(cpu_actor_options)
+        if _pg is not None:
+            # Bundle i+1 (bundle 0 is the PPO trainer). Co-locates this measure
+            # actor with the run's reserved GPU.
+            from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+            _opts["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                _pg, placement_group_bundle_index=1 + i,
+            )
+        cpu_workers.append(
+            CpuApproximationActor.options(**_opts).remote(
+                args_dict, variant=None, actor_id=i,
+            )
         )
-        for i in range(args.num_cpu_workers)
-    ]
 
     # Construct the timeout-bounded pool. `init_server` also internally
     # calls `init_worker` if the worker hasn't been built yet, so we

@@ -1384,11 +1384,16 @@ def _callback(
     callback_device = None
     if config.exec_on_gpu:
         gpu_devices = jax.devices("gpu")
-        if len(gpu_devices) < 2:
+        if len(gpu_devices) < 1:
             raise RuntimeError(
-                "--exec-on-gpu requires at least two GPUs (one for the "
-                f"trainer, one for the env callback); got {len(gpu_devices)}."
+                "--exec-on-gpu needs a GPU visible to the measurement process; "
+                f"got {len(gpu_devices)}."
             )
+        # The measurement runs on the LAST visible GPU. In the legacy
+        # single-process layout that was a 2nd GPU distinct from the trainer's;
+        # in the separate-measure-actor layout (cpu_actor_num_gpus=1) the actor
+        # owns its own 1 GPU (Ray gives it a device disjoint from the trainer),
+        # so a single visible GPU is correct.
         callback_device = gpu_devices[-1]
 
     args_for_lower = (
