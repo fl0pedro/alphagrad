@@ -217,6 +217,20 @@ class CpuApproximationServer:
             # `last_eval_error` is updated atomically (just Python reference
             # assignment).
             self.last_eval_error = (type(exc).__name__, str(exc)[:200])
+            # Log EVERY sentinel fire (cause + whether it was a terminal
+            # measurement) so the rate/causes are visible per model in the run
+            # log (grep '[SENTINEL]'). Previously only stashed in
+            # last_eval_error and never surfaced anywhere.
+            try:
+                _olen = int(order.shape[0]) if hasattr(order, "shape") else len(order)
+            except Exception:
+                _olen = -1
+            print(
+                f"[SENTINEL] measure-exception step={int(step)} order_len={_olen} "
+                f"terminal={int(step) >= _olen}: "
+                f"{type(exc).__name__}: {str(exc)[:180]}",
+                flush=True,
+            )
             sentinel_tokens = np.zeros((MAX_TOKENS,), dtype=np.int32)
             sentinel_eqn_ids = np.zeros((MAX_TOKENS,), dtype=np.int32)
             sentinel_reward = np.full((NUM_REWARDS,), -1e10, dtype=np.float32)

@@ -336,6 +336,7 @@ class CpuApproxPool:
             # landed yet, or pool is closed). Return sentinel rather
             # than block — the rollout will continue with this step
             # treated as a "bad action".
+            print(f"[SENTINEL] pool-drained (no actor) step={int(step)}", flush=True)
             return _sentinel_callback_output(
                 self._max_tokens,
                 self._num_rewards,
@@ -382,6 +383,11 @@ class CpuApproxPool:
             )
         except GetTimeoutError:
             self._n_timeouts += 1
+            print(
+                f"[SENTINEL] pool-timeout after {timeout:.0f}s step={int(step)} "
+                f"(n_timeouts={self._n_timeouts})",
+                flush=True,
+            )
             self._poison(actor, future=future)
             return _sentinel_callback_output(
                 self._max_tokens,
@@ -391,6 +397,11 @@ class CpuApproxPool:
             )
         except RayActorError:
             self._n_actor_errors += 1
+            print(
+                f"[SENTINEL] pool-actor-error RayActorError step={int(step)} "
+                f"(n_actor_errors={self._n_actor_errors})",
+                flush=True,
+            )
             self._poison(actor, future=future)
             return _sentinel_callback_output(
                 self._max_tokens,
@@ -398,13 +409,19 @@ class CpuApproxPool:
                 self._cosine_sim_idx,
                 self._frob_residual_idx,
             )
-        except Exception:
+        except Exception as _exc:
             # Catch-all: anything else (serialization issue, malformed
             # return, etc.) is treated like a transient actor failure.
             # We don't ``raise`` because the io_callback caller can't
             # do anything useful with an exception and JAX would
             # propagate it as a NaN-poisoned trajectory.
             self._n_other_errors += 1
+            print(
+                f"[SENTINEL] pool-other-error step={int(step)}: "
+                f"{type(_exc).__name__}: {str(_exc)[:120]} "
+                f"(n_other_errors={self._n_other_errors})",
+                flush=True,
+            )
             self._poison(actor, future=future)
             return _sentinel_callback_output(
                 self._max_tokens,
@@ -472,6 +489,11 @@ class CpuApproxPool:
         for i, actor in enumerate(actors):
             if actor is None:
                 # Slot couldn't get an actor — sentinel this row now.
+                print(
+                    f"[SENTINEL] batch pool-drained slot={i} "
+                    f"step={int(step_batch[i])}",
+                    flush=True,
+                )
                 tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
                     _sentinel_callback_output(
                         self._max_tokens,
@@ -493,8 +515,14 @@ class CpuApproxPool:
                     init=bool(init),
                 )
                 timeouts.append(self._timeout_for(actor))
-            except Exception:
+            except Exception as _exc:
                 self._n_other_errors += 1
+                print(
+                    f"[SENTINEL] batch dispatch-error slot={i} "
+                    f"step={int(step_batch[i])}: {type(_exc).__name__}: "
+                    f"{str(_exc)[:120]} (n_other_errors={self._n_other_errors})",
+                    flush=True,
+                )
                 self._poison(actor, future=None)
                 actors[i] = None
                 tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
@@ -552,6 +580,11 @@ class CpuApproxPool:
                 rewards_out[i] = np.asarray(reward, dtype=np.float32)
             except GetTimeoutError:
                 self._n_timeouts += 1
+                print(
+                    f"[SENTINEL] batch timeout slot={i} step={int(step_batch[i])} "
+                    f"after {timeouts[i]:.0f}s (n_timeouts={self._n_timeouts})",
+                    flush=True,
+                )
                 self._poison(actor, future=future)
                 tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
                     _sentinel_callback_output(
@@ -564,6 +597,11 @@ class CpuApproxPool:
                 sentinel_mask[i] = True
             except RayActorError:
                 self._n_actor_errors += 1
+                print(
+                    f"[SENTINEL] batch actor-error slot={i} "
+                    f"step={int(step_batch[i])} (n_actor_errors={self._n_actor_errors})",
+                    flush=True,
+                )
                 self._poison(actor, future=future)
                 tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
                     _sentinel_callback_output(
@@ -574,8 +612,14 @@ class CpuApproxPool:
                     )
                 )
                 sentinel_mask[i] = True
-            except Exception:
+            except Exception as _exc:
                 self._n_other_errors += 1
+                print(
+                    f"[SENTINEL] batch other-error slot={i} "
+                    f"step={int(step_batch[i])}: {type(_exc).__name__}: "
+                    f"{str(_exc)[:120]} (n_other_errors={self._n_other_errors})",
+                    flush=True,
+                )
                 self._poison(actor, future=future)
                 tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
                     _sentinel_callback_output(
