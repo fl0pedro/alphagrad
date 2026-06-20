@@ -1363,6 +1363,19 @@ def _callback(
     if config.terminal_rewards_only and not is_terminal:
         return tokens, eqn_ids, jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
 
+    # GATE 1 (pre-compile size gate): if the eliminated jaxpr is too big, skip
+    # the compile+exec entirely — they are the OOM/host-leak/timeout-prone part
+    # that was OOM-killing the measure actor. raw_tokens.shape[0] (= the
+    # tokenized jacve graph length) is the graph-size proxy. We RAISE so the
+    # worker's existing handler turns it into a logged [SENTINEL] (excluded from
+    # the loss) instead of attempting a measurement that could kill the actor.
+    _max_measure_tokens = int(os.environ.get("ALPHAGRAD_MAX_MEASURE_TOKENS", "0") or 0)
+    if _max_measure_tokens > 0 and int(raw_tokens.shape[0]) > _max_measure_tokens:
+        raise RuntimeError(
+            f"size-gate: jaxpr raw_len={int(raw_tokens.shape[0])} > "
+            f"ALPHAGRAD_MAX_MEASURE_TOKENS={_max_measure_tokens} — skip measure"
+        )
+
     # ------------------------------------------------------------------
     # Compute family — graphax counters (always) → muls_adds_fmas, max_io_sum.
     # ------------------------------------------------------------------
@@ -1557,6 +1570,22 @@ def _callback(
             _det_peak = None
     except Exception:
         _det_peak = None
+    # GATE 2 (post-compile memory gate): compiled, but before we EXECUTE, check
+    # the deterministic peak (temp+output+args from memory_analysis). If it
+    # would need more than the budget, skip the exec (the OOM-prone step) and
+    # RAISE -> logged [SENTINEL] (excluded from loss). NB memory_analysis can
+    # under-report GPU exec/autotuner workspace, so this is a backstop on top of
+    # GATE 1; primary protection is the size gate. 0 / unset = disabled.
+    _max_measure_mem_gib = float(os.environ.get("ALPHAGRAD_MAX_MEASURE_MEM_GIB", "0") or 0)
+    if (
+        _max_measure_mem_gib > 0
+        and _det_peak is not None
+        and _det_peak > _max_measure_mem_gib * (1024 ** 3)
+    ):
+        raise RuntimeError(
+            f"mem-gate: det_peak={_det_peak / 1024 ** 3:.2f}GiB > "
+            f"ALPHAGRAD_MAX_MEASURE_MEM_GIB={_max_measure_mem_gib} — skip exec"
+        )
     # ``compiled_exact`` is ONLY needed for the quality metrics
     # (cosine_sim, frob_residual). Those are meaningful only when the
     # elimination order is complete — graphax's ``jacve`` returns a
