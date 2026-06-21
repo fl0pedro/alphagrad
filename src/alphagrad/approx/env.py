@@ -1437,9 +1437,79 @@ def _callback(
         # so a single visible GPU is correct.
         callback_device = gpu_devices[-1]
 
+    # --- Data-parallel sharding of the on-GPU measurement (opt-in) -----------
+    # ``ALPHAGRAD_SHARD_MEASURE=1`` shards the batched (vmap) axis of the
+    # measurement's grad/jacobian exec across ALL of the measure actor's
+    # visible GPUs, so a model whose single-device peak exceeds one GPU (e.g.
+    # the 16-substep VmappedConvNet) splits ~1/N memory per GPU instead of
+    # OOM-ing GPU_0 while the others sit idle. The Vmapped* models are vmapped
+    # over the data batch with ``in_axes=(0, 0, None, ...)`` — the DATA args
+    # (the non-``argnums`` positional leaves x, y) carry the batch axis on
+    # axis 0; the WEIGHTS (``argnums``) are replicated. We build a 1-D mesh
+    # over ``gpu_devices[:N]``, ``device_put`` the batched data leaves with
+    # ``NamedSharding(P('batch'))`` and the rest replicated, and let XLA's
+    # GSPMD partitioner shard the computation (in/out shardings are taken from
+    # the committed input arrays). OFF (default) is byte-for-byte the legacy
+    # single-device path. Falls back to single-device when <2 GPUs, batch size
+    # is unknown, or the batch is not divisible by N (so a wrong/uneven shard
+    # can never silently corrupt the reward).
+    _shard_measure = (
+        os.environ.get("ALPHAGRAD_SHARD_MEASURE", "0") == "1"
+        and config.exec_on_gpu
+        and callback_device is not None
+        and len(gpu_devices) > 1
+    )
+    _shard_mesh = None
+    _shard_devices = None
+    if _shard_measure:
+        import numpy as _np_shard
+        from jax.sharding import (
+            Mesh as _Mesh,
+            NamedSharding as _NS,
+            PartitionSpec as _PSpec,
+        )
+        _shard_devices = list(gpu_devices)
+        _N = len(_shard_devices)
+        # Batch size = leading dim of the batched DATA leaves (the positional
+        # args NOT in argnums that are >=1-D). All such leaves must share the
+        # same leading dim and be divisible by N; otherwise fall back.
+        _argnums_set = set(config.argnums or ())
+        _batch_dims = {
+            int(a.shape[0])
+            for i, a in enumerate(args)
+            if i not in _argnums_set and getattr(a, "ndim", 0) >= 1
+        }
+        if len(_batch_dims) == 1 and next(iter(_batch_dims)) % _N == 0:
+            _shard_mesh = _Mesh(_np_shard.array(_shard_devices), axis_names=("batch",))
+        else:
+            # Indivisible / ambiguous batch — stay single-device.
+            _shard_measure = False
+            _shard_mesh = None
+
+    def _put_measure(leaves):
+        """device_put a positional-arg list onto the measure device(s).
+
+        When sharding is active: batched data leaves (non-argnums, >=1-D) get
+        ``P('batch')`` (split on axis 0), everything else is replicated
+        (``P()``). When off: the legacy single ``callback_device`` put."""
+        if _shard_mesh is not None:
+            from jax.sharding import NamedSharding as _NS, PartitionSpec as _PSpec
+            _argnums_set = set(config.argnums or ())
+            out = []
+            for i, a in enumerate(leaves):
+                if i not in _argnums_set and getattr(a, "ndim", 0) >= 1:
+                    sh = _NS(_shard_mesh, _PSpec("batch"))
+                else:
+                    sh = _NS(_shard_mesh, _PSpec())
+                out.append(jax.device_put(a, sh))
+            return out
+        if callback_device is not None:
+            return [jax.device_put(a, callback_device) for a in leaves]
+        return list(leaves)
+
     args_for_lower = (
-        jax.device_put(args, callback_device)
-        if callback_device is not None
+        _put_measure(list(args))
+        if (callback_device is not None or _shard_mesh is not None)
         else args
     )
 
@@ -1471,6 +1541,11 @@ def _callback(
         if hasattr(a, "shape") and hasattr(a, "dtype"):
             h.update(repr(a.shape).encode())
             h.update(repr(a.dtype).encode())
+    if _shard_mesh is not None:
+        # Sharded vs single-device produce DIFFERENT executables (different
+        # in/out shardings + GSPMD partition); keep their cache entries
+        # distinct so a single-device blob is never loaded for a sharded run.
+        h.update(b"shard:" + str(len(_shard_devices)).encode())
     cache_key = h.digest()
 
     # Exact-Jacobian cache key — SHAPE-ONLY (no order/specs/stop). The
@@ -1781,8 +1856,8 @@ def _callback(
             eval_args_i = [arg[d] for arg in eval_samples]
         else:
             eval_args_i = list(args)
-        if callback_device is not None:
-            eval_args_i = [jax.device_put(x, callback_device) for x in eval_args_i]
+        if callback_device is not None or _shard_mesh is not None:
+            eval_args_i = _put_measure(eval_args_i)
         # Per-data-point warmup: discard the first ``_warmup`` executions so
         # first-touch / cache / allocation effects don't pollute the timed
         # readings (see EnvConfig.latency_warmup). Each warmup exec is itself
