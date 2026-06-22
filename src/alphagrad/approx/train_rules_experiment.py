@@ -84,7 +84,7 @@ def capture_gfn(env, eval_samples, order, specs):
     return cap.get("fn")
 
 
-def init_weights(seed, in_dim=784, hid=256, out=10):
+def init_weights(seed, in_dim=784, hid=63, out=10):  # hid MUST match env NN (_EQ_NN_HIDDEN=63); the AOT approx gfn is compiled for this shape
     k = jax.random.PRNGKey(seed)
     k1, k2 = jax.random.split(k)
     s1 = 1.0 / np.sqrt(in_dim); s2 = 1.0 / np.sqrt(hid)
