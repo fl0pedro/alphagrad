@@ -481,22 +481,26 @@ def _run(args) -> int:
         # Carry over the legacy `entropy` key for plot continuity with
         # earlier runs (build_wandb_log_dict uses `entropy_mean`).
         log_dict.setdefault("entropy", ent)
-        wandb.log(log_dict)
 
         # Periodic JSON snapshot + wandb scalar payload of the
         # running per-channel + overall bests. The full
         # ``wandb.Table`` lands once at run-end (logging tables
         # every-N-eps clutters the run UI). ``best_seq_every == 0``
         # disables the periodic write — final snapshot still happens
-        # in the FINAL block below.
+        # in the FINAL block below. MERGE the periodic best-seq scalars
+        # into the SAME per-episode ``wandb.log`` payload (one log call
+        # == one wandb _step): a separate ``wandb.log`` here advanced
+        # wandb's global step on every Nth episode, landing on a step
+        # that carries no ``mean_return`` / ``reward_mean/*`` — which
+        # made those per-episode metrics look sparse/absent in the UI.
         if best_seq_every > 0 and (
             (ep + 1) % best_seq_every == 0 or ep == args.episodes - 1
         ):
             dump_best_sequences_json(state, best_seq_json_path)
             _dump_pareto()
-            wandb.log(
-                build_best_sequences_wandb_payload(state, ep=ep)
-            )
+            log_dict.update(build_best_sequences_wandb_payload(state, ep=ep))
+
+        wandb.log(log_dict)
 
     pbar.close()
 
