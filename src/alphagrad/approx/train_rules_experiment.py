@@ -6,8 +6,18 @@ Run one (source, gpu-shard) per process:
   CUDA_VISIBLE_DEVICES=k uv run train_rules_experiment.py \
       --source cmorl --front ~/dsnn/morl_fronts/cmorl_front.json \
       --shard k --nshards 4 --out ~/dsnn/train_exp/cmorl_shard{k}.json
+
+INSTRUMENTED PARALLEL MODE: pass --rule-index I to run EXACTLY one rule per
+process (I>=0 => front[I]; I==-2 => reverse_mode baseline). Each process then
+writes its own out JSON. This lets a single sbatch fan out 33 taskset-pinned
+processes over disjoint core sets. Extra instrumentation captured per rule:
+  * learning_curve: [(step, test_acc, wall_s)] at each --eval-every
+  * lat_ns_samples: full raw per-step latency sample list
+  * ru_maxrss_mb: peak RSS of this process (true memory for the whole run)
+  * xla_peak_memory: deterministic per-grad XLA peak (cross-check)
+  * rec_cosine (recorded) + replay_cosine (replayed/true) per seq
 """
-import os, re, sys, json, time, argparse
+import os, re, sys, json, time, argparse, resource
 import numpy as np
 
 argp = argparse.ArgumentParser()
@@ -16,7 +26,12 @@ argp.add_argument("--front", required=True)
 argp.add_argument("--out", required=True)
 argp.add_argument("--shard", type=int, default=0)
 argp.add_argument("--nshards", type=int, default=1)
+argp.add_argument("--rule-index", type=int, default=-1,
+                  help=">=0: run only front[I]; -2: run only reverse_mode; -1: legacy shard mode")
 argp.add_argument("--seeds", type=int, default=20)
+argp.add_argument("--seed-offset", type=int, default=0,
+                  help="seed index of the FIRST seed (seeds run 1000+offset .. 1000+offset+seeds-1); "
+                       "lets a parallel sbatch run 1 seed per process with a distinct init/data order")
 argp.add_argument("--batch", type=int, default=16)
 argp.add_argument("--lr", type=float, default=1e-3)
 argp.add_argument("--max-steps", type=int, default=5000)
@@ -66,8 +81,10 @@ def build_env():
 
 
 def capture_gfn(env, eval_samples, order, specs):
-    """Run _callback once, capturing the compiled value_and_grad executable."""
+    """Run _callback once, capturing the compiled value_and_grad executable
+    AND the raw_sink (replayed cosine + deterministic xla_peak_memory)."""
     cap = {}
+    raw_sink = {}
     orig = ccmod.cached_compile
     def cc(key, fn):
         out = orig(key, fn)
@@ -78,10 +95,10 @@ def capture_gfn(env, eval_samples, order, specs):
     try:
         _callback(env.config, env.args, env.consts,
                   jnp.asarray(order), jnp.asarray(specs), len(order),
-                  *eval_samples)
+                  *eval_samples, raw_sink=raw_sink)
     finally:
         ccmod.cached_compile = orig
-    return cap.get("fn")
+    return cap.get("fn"), raw_sink
 
 
 def init_weights(seed, in_dim=784, hid=63, out=10):  # hid MUST match env NN (_EQ_NN_HIDDEN=63); the AOT approx gfn is compiled for this shape
@@ -133,9 +150,10 @@ def _align_grads(grads, W):
     return tuple(out)
 
 
-def train_one(gfn, seed, xtr, ytr, xte, yte):
+def train_one(gfn, seed, xtr, ytr, xte, yte, t0=None, learning_curve=None):
     """Train with the (approx) grad fn until train-loss early-stops; return
-    final test accuracy + steps taken."""
+    final test accuracy + steps taken. If learning_curve is not None, append
+    (step, test_acc, wall_s) at every eval (uses t0 for wall clock)."""
     W = init_weights(seed)
     opt = optax.adam(a.lr)
     ostate = opt.init(W)
@@ -154,6 +172,10 @@ def train_one(gfn, seed, xtr, ytr, xte, yte):
         step += 1
         if step % a.eval_every == 0:
             cur = float(val)
+            if learning_curve is not None:
+                acc_now = accuracy(W, xte, yte)
+                wall = (time.time() - t0) if t0 is not None else 0.0
+                learning_curve.append([int(step), float(acc_now), float(wall)])
             if cur < best - 1e-4:
                 best, bad = cur, 0
             else:
@@ -175,23 +197,72 @@ def measure_latency(gfn, xb, yb, W):
     ts = np.array(ts)
     lo, hi = np.percentile(ts, [10, 90])
     w = ts[(ts >= lo) & (ts <= hi)]
-    return float(np.mean(w)), float(np.std(ts))
+    return float(np.mean(w)), float(np.std(ts)), [float(x) for x in ts]
 
 
 def run_rule(label, gfn, xtr, ytr, xte, yte, seeds):
     accs, steps = [], []
-    for s in range(seeds):
-        acc, st = train_one(gfn, 1000 + s, xtr, ytr, xte, yte)
+    learning_curves = []  # per-seed [(step, test_acc, wall_s)] for std bands
+    seed_ids = []
+    for s in range(a.seed_offset, a.seed_offset + seeds):
+        t0 = time.time()
+        lc = []
+        acc, st = train_one(gfn, 1000 + s, xtr, ytr, xte, yte, t0=t0, learning_curve=lc)
         accs.append(acc); steps.append(st)
+        learning_curves.append(lc); seed_ids.append(1000 + s)
+    learning_curve = learning_curves[0] if learning_curves else []  # back-compat: first-seed curve
     W0 = init_weights(0)
-    lat_mean, lat_std = measure_latency(gfn, xtr[:a.batch], ytr[:a.batch], W0)
+    lat_mean, lat_std, lat_samples = measure_latency(gfn, xtr[:a.batch], ytr[:a.batch], W0)
+    ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0  # Linux KB -> MB
     return {
         "label": label,
         "acc_mean": float(np.mean(accs)), "acc_std": float(np.std(accs)),
         "accs": [float(x) for x in accs],
+        "seed_ids": seed_ids,
         "steps_mean": float(np.mean(steps)),
         "lat_ns_mean": lat_mean, "lat_ns_std": lat_std,
+        "lat_ns_samples": lat_samples,
+        "learning_curve": learning_curve,
+        "learning_curves": learning_curves,
+        "ru_maxrss_mb": float(ru),
     }
+
+
+def run_reverse(xtr, ytr, xte, yte):
+    loss_fn = scalar_loss_fn(get_fn("VmappedNeuralNetwork"))
+    rev = jax.jit(jax.value_and_grad(loss_fn, argnums=ARGN))
+    print("[reverse-mode] training baseline...", flush=True)
+    r = run_rule("reverse_mode", rev, xtr, ytr, xte, yte, a.seeds)
+    print("  reverse:", r["acc_mean"], r["lat_ns_mean"], flush=True)
+    return r
+
+
+def run_front_index(i, p, env, eval_samples, xtr, ytr, xte, yte):
+    seq = p["seq"]
+    order, specs, nr = build_order_specs(seq, env)
+    t0 = time.time()
+    try:
+        gfn, raw_sink = capture_gfn(env, eval_samples, order, specs)
+        if gfn is None:
+            raise RuntimeError("no compiled fn captured")
+        r = run_rule(f"{a.source}#{i}", gfn, xtr, ytr, xte, yte, a.seeds)
+        replay_cos = raw_sink.get("cosine_sim_per_point") or []
+        r["replay_cosine"] = float(replay_cos[0]) if replay_cos else None
+        r["replay_cosine_per_point"] = replay_cos
+        r["xla_peak_memory"] = float(raw_sink.get("xla_peak_memory", 0.0))
+        r["replay_frob"] = (raw_sink.get("frob_residual_per_point") or [None])[0]
+    except Exception as exc:
+        r = {"label": f"{a.source}#{i}", "error": f"{type(exc).__name__}: {exc}"[:200]}
+    r["idx"] = i
+    r["front_obj"] = p["obj"]
+    r["seq_label"] = p.get("label")
+    r["rec_cosine"] = p.get("rec_cosine")
+    r["rec_latency_ns"] = p.get("rec_latency_ns")
+    r["rec_xla_peak"] = p.get("rec_xla_peak")
+    r["wall_s"] = round(time.time() - t0, 1)
+    print(f"  [{i}] {r.get('acc_mean','ERR')} acc  lat={r.get('lat_ns_mean',0)/1e3:.0f}us  "
+          f"rec_cos={r.get('rec_cosine')} replay_cos={r.get('replay_cosine')}  ({r['wall_s']}s)", flush=True)
+    return r
 
 
 def main():
@@ -200,39 +271,30 @@ def main():
     xtr, ytr, xte, yte = (jnp.asarray(z) for z in (xtr, ytr, xte, yte))
     print(f"[data] train {xtr.shape} test {xte.shape}", flush=True)
 
-    env, eval_samples = build_env()
     d = json.load(open(os.path.expanduser(a.front)))
     front = d["front"]
     results = []
 
-    # Reverse-mode baseline (exact) only on shard 0.
-    if a.shard == 0:
-        loss_fn = scalar_loss_fn(get_fn("VmappedNeuralNetwork"))
-        rev = jax.jit(jax.value_and_grad(loss_fn, argnums=ARGN))
-        print("[reverse-mode] training baseline...", flush=True)
-        results.append(run_rule("reverse_mode", rev, xtr, ytr, xte, yte, a.seeds))
-        print("  reverse:", results[-1]["acc_mean"], results[-1]["lat_ns_mean"], flush=True)
+    # --- single-rule mode (parallel fan-out) ---
+    if a.rule_index == -2:
+        results.append(run_reverse(xtr, ytr, xte, yte))
+    elif a.rule_index >= 0:
+        env, eval_samples = build_env()
+        i = a.rule_index
+        results.append(run_front_index(i, front[i], env, eval_samples, xtr, ytr, xte, yte))
+    else:
+        # --- legacy shard mode ---
+        env, eval_samples = build_env()
+        if a.shard == 0:
+            results.append(run_reverse(xtr, ytr, xte, yte))
+        mine = [(i, p) for i, p in enumerate(front) if i % a.nshards == a.shard]
+        for i, p in mine:
+            results.append(run_front_index(i, p, env, eval_samples, xtr, ytr, xte, yte))
 
-    mine = [(i, p) for i, p in enumerate(front) if i % a.nshards == a.shard]
-    for i, p in mine:
-        seq = p["seq"]
-        order, specs, nr = build_order_specs(seq, env)
-        t0 = time.time()
-        try:
-            gfn = capture_gfn(env, eval_samples, order, specs)
-            if gfn is None:
-                raise RuntimeError("no compiled fn captured")
-            r = run_rule(f"{a.source}#{i}", gfn, xtr, ytr, xte, yte, a.seeds)
-        except Exception as exc:
-            r = {"label": f"{a.source}#{i}", "error": f"{type(exc).__name__}: {exc}"[:200]}
-        r["idx"] = i
-        r["front_obj"] = p["obj"]
-        r["wall_s"] = round(time.time() - t0, 1)
-        results.append(r)
-        print(f"  [{i}] {r.get('acc_mean','ERR')} acc  lat={r.get('lat_ns_mean',0)/1e3:.0f}µs  ({r['wall_s']}s)", flush=True)
-        os.makedirs(os.path.dirname(os.path.expanduser(a.out)), exist_ok=True)
-        json.dump({"source": a.source, "shard": a.shard, "results": results},
-                  open(os.path.expanduser(a.out), "w"), indent=2)
+    os.makedirs(os.path.dirname(os.path.expanduser(a.out)), exist_ok=True)
+    json.dump({"source": a.source, "shard": a.shard, "rule_index": a.rule_index,
+               "results": results},
+              open(os.path.expanduser(a.out), "w"), indent=2)
     print(f"[done] {len(results)} results -> {a.out}", flush=True)
 
 
