@@ -336,6 +336,7 @@ class CpuApproxPool:
             # landed yet, or pool is closed). Return sentinel rather
             # than block — the rollout will continue with this step
             # treated as a "bad action".
+            print(f"[SENTINEL] pool-drained (no actor) step={int(step)}", flush=True)
             return _sentinel_callback_output(
                 self._max_tokens,
                 self._num_rewards,
@@ -382,6 +383,11 @@ class CpuApproxPool:
             )
         except GetTimeoutError:
             self._n_timeouts += 1
+            print(
+                f"[SENTINEL] pool-timeout after {timeout:.0f}s step={int(step)} "
+                f"(n_timeouts={self._n_timeouts})",
+                flush=True,
+            )
             self._poison(actor, future=future)
             return _sentinel_callback_output(
                 self._max_tokens,
@@ -391,6 +397,11 @@ class CpuApproxPool:
             )
         except RayActorError:
             self._n_actor_errors += 1
+            print(
+                f"[SENTINEL] pool-actor-error RayActorError step={int(step)} "
+                f"(n_actor_errors={self._n_actor_errors})",
+                flush=True,
+            )
             self._poison(actor, future=future)
             return _sentinel_callback_output(
                 self._max_tokens,
@@ -398,13 +409,19 @@ class CpuApproxPool:
                 self._cosine_sim_idx,
                 self._frob_residual_idx,
             )
-        except Exception:
+        except Exception as _exc:
             # Catch-all: anything else (serialization issue, malformed
             # return, etc.) is treated like a transient actor failure.
             # We don't ``raise`` because the io_callback caller can't
             # do anything useful with an exception and JAX would
             # propagate it as a NaN-poisoned trajectory.
             self._n_other_errors += 1
+            print(
+                f"[SENTINEL] pool-other-error step={int(step)}: "
+                f"{type(_exc).__name__}: {str(_exc)[:120]} "
+                f"(n_other_errors={self._n_other_errors})",
+                flush=True,
+            )
             self._poison(actor, future=future)
             return _sentinel_callback_output(
                 self._max_tokens,
@@ -463,129 +480,138 @@ class CpuApproxPool:
                 tuple(eval_samples) if eval_samples is not None else None
             )
 
-        actors: list[Any | None] = []
-        for i in range(N):
-            actors.append(self._pick())
+        def _sentinel_slot(i):
+            tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
+                _sentinel_callback_output(
+                    self._max_tokens, self._num_rewards,
+                    self._cosine_sim_idx, self._frob_residual_idx,
+                )
+            )
+            sentinel_mask[i] = True
 
-        futures: list[Any | None] = [None] * N
-        timeouts: list[float] = []
-        for i, actor in enumerate(actors):
-            if actor is None:
-                # Slot couldn't get an actor — sentinel this row now.
-                tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
-                    _sentinel_callback_output(
-                        self._max_tokens,
-                        self._num_rewards,
-                        self._cosine_sim_idx,
-                        self._frob_residual_idx,
-                    )
-                )
-                sentinel_mask[i] = True
-                timeouts.append(0.0)
-                continue
-            self._n_calls += 1
-            try:
-                futures[i] = actor.evaluate.remote(
-                    np.asarray(order_batch[i]),
-                    np.asarray(specs_batch[i]),
-                    int(step_batch[i]),
-                    eval_samples=samples_arg,
-                    init=bool(init),
-                )
-                timeouts.append(self._timeout_for(actor))
-            except Exception:
-                self._n_other_errors += 1
-                self._poison(actor, future=None)
-                actors[i] = None
-                tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
-                    _sentinel_callback_output(
-                        self._max_tokens,
-                        self._num_rewards,
-                        self._cosine_sim_idx,
-                        self._frob_residual_idx,
-                    )
-                )
-                sentinel_mask[i] = True
-                timeouts.append(0.0)
+        # Acquire as many actors as the pool has, up to N, then serve the N
+        # slots in WAVES of size M = len(held). With fewer actors than slots
+        # (e.g. one GPU measure actor for num_envs=4) each actor handles
+        # multiple slots SEQUENTIALLY across waves, instead of leaving the
+        # surplus slots "pool-drained" — the old per-slot _pick() sentineled
+        # 3 of every 4 envs every step. When the pool has >= N actors this is
+        # a single wave == the previous all-concurrent behavior. Slots only
+        # sentinel when the pool is genuinely empty or an actor dies.
+        held: list[Any] = []
+        for _ in range(N):
+            a = self._pick()
+            if a is None:
+                break
+            held.append(a)
+        M = len(held)
 
-        # Single deadline for ``ray.wait`` — block up to the largest
-        # per-actor timeout for ALL futures to be ready. We then make
-        # per-future ``ray.get`` calls with the remaining budget to
-        # enforce per-actor timeouts individually. When the user
-        # disabled timeouts entirely (``--cpu-callback-timeout 0``),
-        # all entries in ``timeouts`` are 0.0, so we skip the
-        # ``ray.wait`` deadline and the per-future ``ray.get`` below
-        # uses an unbounded blocking get.
-        max_timeout = max((t for t in timeouts if t > 0.0), default=0.0)
-        no_timeout = max_timeout <= 0.0
-        live_futures = [f for f in futures if f is not None]
-        if live_futures and not no_timeout:
-            try:
-                ray.wait(
-                    live_futures,
-                    num_returns=len(live_futures),
-                    timeout=max_timeout,
+        if M == 0:
+            for i in range(N):
+                print(
+                    f"[SENTINEL] batch pool-drained slot={i} "
+                    f"step={int(step_batch[i])} (pool empty)",
+                    flush=True,
                 )
-            except Exception:
-                pass
+                _sentinel_slot(i)
+            return tokens_out, eqn_ids_out, rewards_out, sentinel_mask
 
-        for i in range(N):
-            if sentinel_mask[i]:
-                continue
-            actor = actors[i]
-            future = futures[i]
-            try:
-                if no_timeout:
-                    # Block until the actor returns — slow compiles
-                    # are tolerated; only crashes / explicit
-                    # ``ray.kill`` produce sentinels.
-                    tokens, eqn_ids, reward = ray.get(future)
-                else:
-                    # ``timeout=0`` returns immediately if the future
-                    # is ready; otherwise raises GetTimeoutError
-                    # which we treat as a soft per-actor timeout.
-                    tokens, eqn_ids, reward = ray.get(future, timeout=0)
-                self._mark_call(actor)
-                self._put_back(actor)
-                tokens_out[i] = np.asarray(tokens, dtype=np.int32)
-                eqn_ids_out[i] = np.asarray(eqn_ids, dtype=np.int32)
-                rewards_out[i] = np.asarray(reward, dtype=np.float32)
-            except GetTimeoutError:
-                self._n_timeouts += 1
-                self._poison(actor, future=future)
-                tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
-                    _sentinel_callback_output(
-                        self._max_tokens,
-                        self._num_rewards,
-                        self._cosine_sim_idx,
-                        self._frob_residual_idx,
+        # held[j] is reused across waves; set to None when poisoned (dead).
+        for wave_start in range(0, N, M):
+            wave = list(range(wave_start, min(wave_start + M, N)))
+            futures: dict[int, Any] = {}
+            f_timeouts: dict[int, float] = {}
+            for j, i in enumerate(wave):
+                actor = held[j]
+                if actor is None:
+                    print(
+                        f"[SENTINEL] batch pool-drained slot={i} "
+                        f"step={int(step_batch[i])} (actor died)",
+                        flush=True,
                     )
-                )
-                sentinel_mask[i] = True
-            except RayActorError:
-                self._n_actor_errors += 1
-                self._poison(actor, future=future)
-                tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
-                    _sentinel_callback_output(
-                        self._max_tokens,
-                        self._num_rewards,
-                        self._cosine_sim_idx,
-                        self._frob_residual_idx,
+                    _sentinel_slot(i)
+                    continue
+                self._n_calls += 1
+                try:
+                    futures[i] = actor.evaluate.remote(
+                        np.asarray(order_batch[i]),
+                        np.asarray(specs_batch[i]),
+                        int(step_batch[i]),
+                        eval_samples=samples_arg,
+                        init=bool(init),
                     )
-                )
-                sentinel_mask[i] = True
-            except Exception:
-                self._n_other_errors += 1
-                self._poison(actor, future=future)
-                tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
-                    _sentinel_callback_output(
-                        self._max_tokens,
-                        self._num_rewards,
-                        self._cosine_sim_idx,
-                        self._frob_residual_idx,
+                    f_timeouts[i] = self._timeout_for(actor)
+                except Exception as _exc:
+                    self._n_other_errors += 1
+                    print(
+                        f"[SENTINEL] batch dispatch-error slot={i} "
+                        f"step={int(step_batch[i])}: {type(_exc).__name__}: "
+                        f"{str(_exc)[:120]} (n_other_errors={self._n_other_errors})",
+                        flush=True,
                     )
-                )
-                sentinel_mask[i] = True
+                    self._poison(actor, future=None)
+                    held[j] = None
+                    _sentinel_slot(i)
+
+            # Per-wave wall clock = max per-actor timeout in this wave.
+            wave_to = max((t for t in f_timeouts.values() if t > 0.0), default=0.0)
+            wave_no_timeout = wave_to <= 0.0
+            live = list(futures.values())
+            if live and not wave_no_timeout:
+                try:
+                    ray.wait(live, num_returns=len(live), timeout=wave_to)
+                except Exception:
+                    pass
+
+            for j, i in enumerate(wave):
+                if sentinel_mask[i] or i not in futures:
+                    continue
+                actor = held[j]
+                future = futures[i]
+                try:
+                    if wave_no_timeout:
+                        tokens, eqn_ids, reward = ray.get(future)
+                    else:
+                        tokens, eqn_ids, reward = ray.get(future, timeout=0)
+                    self._mark_call(actor)
+                    tokens_out[i] = np.asarray(tokens, dtype=np.int32)
+                    eqn_ids_out[i] = np.asarray(eqn_ids, dtype=np.int32)
+                    rewards_out[i] = np.asarray(reward, dtype=np.float32)
+                except GetTimeoutError:
+                    self._n_timeouts += 1
+                    print(
+                        f"[SENTINEL] batch timeout slot={i} step={int(step_batch[i])} "
+                        f"after {f_timeouts.get(i, 0.0):.0f}s (n_timeouts={self._n_timeouts})",
+                        flush=True,
+                    )
+                    self._poison(actor, future=future)
+                    held[j] = None
+                    _sentinel_slot(i)
+                except RayActorError:
+                    self._n_actor_errors += 1
+                    print(
+                        f"[SENTINEL] batch actor-error slot={i} "
+                        f"step={int(step_batch[i])} (n_actor_errors={self._n_actor_errors})",
+                        flush=True,
+                    )
+                    self._poison(actor, future=future)
+                    held[j] = None
+                    _sentinel_slot(i)
+                except Exception as _exc:
+                    self._n_other_errors += 1
+                    print(
+                        f"[SENTINEL] batch other-error slot={i} "
+                        f"step={int(step_batch[i])}: {type(_exc).__name__}: "
+                        f"{str(_exc)[:120]} (n_other_errors={self._n_other_errors})",
+                        flush=True,
+                    )
+                    self._poison(actor, future=future)
+                    held[j] = None
+                    _sentinel_slot(i)
+
+        # Return still-alive actors to the pool.
+        for a in held:
+            if a is not None:
+                self._put_back(a)
 
         return tokens_out, eqn_ids_out, rewards_out, sentinel_mask
 
@@ -657,7 +683,11 @@ class CpuApproxPool:
         import ray
         with self._lock:
             actors = list(self._alive)
-        empty = {"count": 0, "max_observed_len": 0, "overflow_sum": 0}
+        empty = {
+            "count": 0, "max_observed_len": 0, "overflow_sum": 0,
+            "raw_len_sum": 0, "raw_len_count": 0,
+            "raw_len_max": 0, "raw_len_min": 0,
+        }
         if not actors:
             return empty
         futures = [
@@ -677,6 +707,10 @@ class CpuApproxPool:
         total = 0
         max_len = 0
         overflow_sum = 0
+        rl_sum = 0
+        rl_count = 0
+        rl_max = 0
+        rl_min = 0
         for r in results:
             if not r:
                 continue
@@ -685,10 +719,22 @@ class CpuApproxPool:
             if ml > max_len:
                 max_len = ml
             overflow_sum += int(r.get("overflow_sum", 0))
+            rl_sum += int(r.get("raw_len_sum", 0))
+            rl_count += int(r.get("raw_len_count", 0))
+            rlm = int(r.get("raw_len_max", 0))
+            if rlm > rl_max:
+                rl_max = rlm
+            rlmin = int(r.get("raw_len_min", 0))
+            if rlmin > 0 and (rl_min == 0 or rlmin < rl_min):
+                rl_min = rlmin
         return {
             "count": total,
             "max_observed_len": max_len,
             "overflow_sum": overflow_sum,
+            "raw_len_sum": rl_sum,
+            "raw_len_count": rl_count,
+            "raw_len_max": rl_max,
+            "raw_len_min": rl_min,
         }
 
     def recycle_one(self) -> int:

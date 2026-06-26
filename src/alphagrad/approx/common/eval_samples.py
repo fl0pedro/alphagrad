@@ -30,6 +30,14 @@ def generate_eval_samples(env_obj, key, num_samples: int = 10):
                 if config.data_gen is not None and arg_idx < len(data):
                     continue
                 curr_val = e_args[arg_idx]
+                # Seed-vertex tangent seed (a 0-d scalar appended as the last
+                # differentiated arg by seed_loss_fn) must stay at its injected
+                # value t=0 — the gradient/JVP is the linearization at t=0.
+                # Randomizing it to N(0,1) shifts every weight by t*ones, which
+                # saturates the net into a dead-gradient region (||grad||=0 ->
+                # cosine 0/0 -> 0). Leave 0-d argnums untouched.
+                if getattr(curr_val, "ndim", 0) == 0:
+                    continue
                 e_args[arg_idx] = jrand.normal(
                     w_keys[i], curr_val.shape, curr_val.dtype
                 )

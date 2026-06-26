@@ -55,22 +55,32 @@ def parse_calls(calls):
 
 
 def build_order_specs(seq, env):
-    order = [int(v) for v, _ in seq]
+    # The recorded ``seq`` vertex is the agent's 0-based ACTION INDEX into
+    # ``env.valid_vertices`` (see ppo_ray_worker: ``act_step`` returns the raw
+    # ``vertex_action`` and the env applies ``vertex_id = vertex_action + 1``).
+    # The env's elimination order + ``axis_state_static`` are keyed by the
+    # 1-indexed jaxpr vertex id, so resolve each action index through
+    # ``valid_vertices`` before use. Passing the raw 0-based index straight
+    # through (the old behaviour) shifts the whole order by one, drops the
+    # real last vertex, and indexes ``axis_static[-1]`` for vertex 0 -> the
+    # measured Jacobian is garbage (frob_residual=-1, cosine_sim=0).
+    valid = np.asarray(env.valid_vertices, dtype=np.int32)
+    resolved = [int(valid[int(v)]) for v, _ in seq]
     axis_static = np.asarray(env.axis_state_static)
-    specs = np.full((len(order), MAX_RULES_PER_VERTEX, 3), -1, dtype=np.int32)
+    specs = np.full((len(resolved), MAX_RULES_PER_VERTEX, 3), -1, dtype=np.int32)
     specs[:, :, 2] = 0
     n_rules = 0
-    for k, (v, calls) in enumerate(seq):
+    for k, ((_, calls), vid) in enumerate(zip(seq, resolved)):
         if not calls:
             continue
         op, i, j, fac, kind, quant = parse_calls(calls)
         n_rules += len(op)
         specs[k] = micro_actions_to_rule_specs(
             np.array(op), np.array(i), np.array(j), np.array(fac),
-            axis_state_for_vertex=axis_static[int(v) - 1],
+            axis_state_for_vertex=axis_static[vid - 1],
             compress_kinds=np.array(kind), quant_dtypes=np.array(quant),
         )
-    return np.array(order, dtype=np.int32), specs, n_rules
+    return np.array(resolved, dtype=np.int32), specs, n_rules
 
 
 # ---------------------------------------------------------------- env (matches trainer)

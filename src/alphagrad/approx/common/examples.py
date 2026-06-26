@@ -27,6 +27,42 @@ def _neural_network(x, y, W1, b1, W2, b2):
     return 0.5 * (jnp.tanh(a1 @ W2.T + b2) - y) ** 2
 
 
+# graphax core-v2 vision MNIST models: each takes (x_flat784, y_onehot10, *weights)
+# and returns a per-element squared error — same convention as _neural_network,
+# so they slot into the Vmapped/dataset harness. Weights come from the matching
+# graphax initializer.
+_VISION_MODELS = {
+    "ConvNet": "conv_weights",
+    "MoE": "moe_weights",
+    "ViT": "vit_weights",
+}
+
+# Model dims matched by REVERSE-MODE GRAD FLOPs (not params). Param-matching
+# badly mismatched grad COMPUTE — conv/attention reuse each weight over many
+# sites, so at ~50k params ConvNet/MoE/ViT had 4.6x / 26x / 28x NN's
+# value_and_grad flops. ConvNet then OOM'd the GPU measure actor at 25-51 GiB
+# (NOT the base grad — exact value_and_grad exec peak is 0.126 GiB for ALL
+# sizes, and deterministic memory_analysis is ~0; the blowup is the approx
+# substep jacve + GPU conv-autotuner workspace, which scales with conv size).
+# Shrinking to FLOP-match shrinks that workspace. Target = NN(h=63) reverse-
+# grad flops 3.23e6 (seeds off): ConvNet Cout=2 -> 1.09x, MoE d=8 -> 1.19x,
+# ViT d=8 -> 1.00x (was d=65 = 28x NN: 410 s/it + 137 contraction-mismatch
+# sentinels — FLOP-matching it down is the single biggest pace win).
+_EQ_NN_HIDDEN = 63
+_EQ_VISION_KW = {
+    "ConvNet": {"Cout": 2},
+    "MoE": {"d": 8},
+    "ViT": {"d": 8},
+}
+
+
+def _vision_base(fn_str):
+    """Return the bare vision-model name (handling the ``Vmapped`` prefix) if
+    ``fn_str`` names one of the graphax vision models, else ``None``."""
+    base = fn_str[len("Vmapped"):] if fn_str.startswith("Vmapped") else fn_str
+    return base if base in _VISION_MODELS else None
+
+
 def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None = -1):
     """Return a `keys -> data` jit-able function used to refresh dataset args.
 
@@ -42,7 +78,9 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
 
         return fn
 
-    if fn_str.endswith("NeuralNetwork"):
+    # NeuralNetwork and the graphax vision models all consume MNIST as
+    # (flat-784 image, onehot-10 label), so they share the dataset sampler.
+    if fn_str.endswith("NeuralNetwork") or _vision_base(fn_str) is not None:
         if dataset is not None:
             x_data, y_data = load_dataset(dataset, dataset_size)
             n_samples = int(x_data.shape[0])
@@ -57,6 +95,10 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
                 return x_data[idx], y_data[idx]
 
             return fn
+
+        # vision models require a dataset (no synthetic fallback)
+        if _vision_base(fn_str) is not None:
+            return None
 
         @jax.jit
         def fn(keys):
@@ -123,7 +165,7 @@ def get_args(fn_str: str, key, dataset: str | None = None):
     if fn_str.endswith("NeuralNetwork"):
         if dataset is not None:
             in_dim, out_dim = dataset_dims(dataset)
-            h = NN_HIDDEN_DIM
+            h = _EQ_NN_HIDDEN   # equalized ~50k params (was NN_HIDDEN_DIM=256)
             shapes = [
                 (in_dim,), (out_dim,),
                 (h, in_dim), (h,),
@@ -137,6 +179,17 @@ def get_args(fn_str: str, key, dataset: str | None = None):
         shapes = [(4, 4)] * 13 + [(4,)] * 8
     elif "Encoder" in fn_str:
         shapes = [(4, 4)] * 10 + [(4,)] * 6
+    elif _vision_base(fn_str) is not None:
+        # x = flat MNIST (784,), y = onehot (10,); weights from the graphax
+        # initializer (correct per-model shapes). Vmapped batches x and y only.
+        vbase = _vision_base(fn_str)
+        bx = (NN_VMAP_BATCH,) if fn_str.startswith("Vmapped") else ()
+        kx, ky, kw = jax.random.split(key, 3)
+        x = jax.random.normal(kx, (*bx, 784))
+        y = jax.random.normal(ky, (*bx, 10))
+        ws = getattr(examples, _VISION_MODELS[vbase])(kw, **_EQ_VISION_KW[vbase])
+        ws = list(ws) if isinstance(ws, (tuple, list)) else [ws]
+        return [x, y, *ws]
     else:
         return _BASIC_ARGS[fn_str]
 
@@ -151,18 +204,22 @@ def get_args(fn_str: str, key, dataset: str | None = None):
 
 def get_fn(fn_str: str):
     """Resolve `fn_str` to a Python callable, applying `jax.vmap` for Vmapped variants."""
-    if fn_str.endswith("NeuralNetwork"):
+    base = fn_str[len("Vmapped"):] if fn_str.startswith("Vmapped") else fn_str
+    if base.endswith("NeuralNetwork"):
         fn = _neural_network
-    elif fn_str.endswith("Perceptron"):
+    elif base == "Perceptron":
         fn = examples.Perceptron
     else:
-        fn = getattr(examples, fn_str, None)
+        # strip the Vmapped prefix so graphax models (ConvNet/MoE/ViT/Encoder/...)
+        # resolve by their bare name.
+        fn = getattr(examples, base, None)
         if fn is None:
-            raise ValueError(f"Target function '{fn_str}' not found in examples.")
+            raise ValueError(f"Target function '{fn_str}' (base '{base}') not found in examples.")
 
     if fn_str.startswith("Vmapped"):
         num_args = len(inspect.signature(fn).parameters)
-        has_y = "Encoder" in fn_str or fn_str.endswith(("NeuralNetwork", "Perceptron"))
+        has_y = ("Encoder" in base or base.endswith(("NeuralNetwork", "Perceptron"))
+                 or base in _VISION_MODELS)
         mapped_axes = (0, 0) if has_y else (0,)
         static_axes = (None,) * (num_args - len(mapped_axes))
         fn = jax.vmap(fn, in_axes=mapped_axes + static_axes)
@@ -184,23 +241,83 @@ def scalar_loss_fn(fn):
     return _loss
 
 
-def maybe_scalar_loss(args, target_fn):
-    """Apply the grad-mode wrap consistently across every measurement site.
+def seed_loss_fn(fn, argnums):
+    """Both-seed (tangent + adjoint) scalar loss with the SEEDS AS EXPLICIT
+    GRAPH VERTICES (graphax.seed_vertices). Returns ``g(*primals, t)`` where:
 
-    Returns ``(target_fn, measure_grad)``. When ``args.measure_grad`` is set,
-    ``target_fn`` is wrapped in :func:`scalar_loss_fn` so the jaxpr/order/
-    transforms — and thus the policy's vertex/action space — operate on the
-    SAME scalar-loss graph in the rollout worker, the CPU measure-actor, and
-    the gfn worker. Centralised here so the five call sites can't drift (a
-    site that forgot the wrap would build a different graph than its peers).
-    """
-    if isinstance(args, dict):
-        measure_grad = bool(args.get("measure_grad", False))
-    else:
-        measure_grad = bool(getattr(args, "measure_grad", False))
-    if measure_grad:
-        target_fn = scalar_loss_fn(target_fn)
-    return target_fn, measure_grad
+      g(*primals, t) = < ones/N , fn( p + t * dir ) >      # == mean(fn) at any t
+
+    ``dir`` is the tangent-seed direction: ones on the DIFFERENTIATED args
+    (``argnums`` — the weights) and zero elsewhere (x / y stay fixed), and the
+    scalar tangent seed ``t`` is appended LAST so existing arg indices (and the
+    data_gen / weight slots) are unchanged. The ``<ones/N, ·>`` is the adjoint
+    seed contraction (an explicit elementwise mul + sum) — same value as
+    ``scalar_loss_fn`` (mean), but the tangent injection and adjoint contraction
+    show up in ``_build_graph`` as ORDINARY eliminable vertices. Differentiated
+    w.r.t. ``argnums + (t,)`` the learned order then chooses forward / reverse /
+    cross-country seed timing. The trainer + every CPU measure-actor MUST build
+    the SAME wrap + appended ``t`` + shifted argnums (see ``grad_target_setup``)."""
+    from graphax.seed_vertices import with_tangent_seed
+    argset = {int(a) for a in argnums}
+
+    def g(*primals_and_t):
+        *primals, t = primals_and_t
+        tangent = tuple(
+            jnp.ones_like(p) if i in argset else jnp.zeros_like(p)
+            for i, p in enumerate(primals)
+        )
+        out = with_tangent_seed(fn, tangent)(t, *primals)  # tangent seed vertex
+        leaves = jax.tree_util.tree_leaves(out)
+        N = 0
+        for leaf in leaves:
+            n = 1
+            for d in jnp.shape(leaf):
+                n *= int(d)
+            N += n
+        N = N or 1
+        # adjoint seed vertex: <ones/N, out> as an explicit elementwise mul + sum
+        return sum(jnp.sum((jnp.ones_like(leaf) / N) * leaf) for leaf in leaves)
+
+    return g
+
+
+def grad_target_setup(args_like, base_fn, xs, example):
+    """Shared grad-mode target builder — returns ``(target_fn, xs, argnums)``.
+
+    Honors ``--measure-grad`` and ``--seed-vertices``. Called identically by the
+    trainer (ppo_ray_worker) and the CPU measure-actor (cpu_approx_worker) so
+    both build the IDENTICAL graph (jaxpr / vertex+action space / argnums).
+    ``args_like`` may be an argparse Namespace or the actor's args dict."""
+    def _flag(name):
+        if isinstance(args_like, dict):
+            return bool(args_like.get(name, False))
+        return bool(getattr(args_like, name, False))
+
+    base_argnums = infer_argnums(example)
+    if not _flag("measure_grad"):
+        return base_fn, tuple(xs), base_argnums
+    if _flag("seed_vertices"):
+        return (
+            seed_loss_fn(base_fn, base_argnums),
+            tuple(xs) + (jnp.zeros(()),),                 # append tangent seed t=0
+            tuple(base_argnums) + (len(xs),),             # differentiate weights + t
+        )
+    return scalar_loss_fn(base_fn), tuple(xs), base_argnums
+
+
+def grad_target_fn(args_like, base_fn, example):
+    """Wrap-only variant of ``grad_target_setup`` for sites that re-swap just the
+    target function (the env's args/argnums were fixed at build time)."""
+    def _flag(name):
+        if isinstance(args_like, dict):
+            return bool(args_like.get(name, False))
+        return bool(getattr(args_like, name, False))
+
+    if not _flag("measure_grad"):
+        return base_fn
+    if _flag("seed_vertices"):
+        return seed_loss_fn(base_fn, infer_argnums(example))
+    return scalar_loss_fn(base_fn)
 
 
 def infer_argnums(fn_str: str) -> tuple[int, ...]:
@@ -209,4 +326,9 @@ def infer_argnums(fn_str: str) -> tuple[int, ...]:
         return (2, 3, 4, 5)
     if fn_str.endswith("Perceptron"):
         return (2, 3, 4, 5, 6, 7)
+    vbase = _vision_base(fn_str)
+    if vbase is not None:
+        # differentiate w.r.t. every weight arg (everything after x, y)
+        n = len(inspect.signature(getattr(examples, vbase)).parameters)
+        return tuple(range(2, n))
     return (0,)

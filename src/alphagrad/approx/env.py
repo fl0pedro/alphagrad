@@ -104,6 +104,16 @@ _TOKENIZATION_TRUNCATION_MAX_LEN: list[int] = [0]
 _TOKENIZATION_TRUNCATION_OVERFLOW_SUM: list[int] = [0]
 _TOKENIZATION_TRUNCATION_WARNED: list[bool] = [False]
 
+# Always-on raw_len telemetry — tracks EVERY tokenization (not just the ones
+# exceeding MAX_TOKENS), so the per-episode mean/max/min jaxpr token length is
+# visible in wandb regardless of truncation. This is what reveals how much the
+# dynamic-substep expansion inflates the sequence and how low --max-substeps
+# must go. Reset each poll by ``consume_tokenization_truncation_stats``.
+_RAW_LEN_SUM: list[int] = [0]
+_RAW_LEN_COUNT: list[int] = [0]
+_RAW_LEN_MAX: list[int] = [0]
+_RAW_LEN_MIN: list[int] = [0]   # 0 = unset (first sample initializes it)
+
 
 def _record_tokenization_truncation(raw_len: int) -> None:
     """Bump the per-process truncation counter and emit a one-time
@@ -111,6 +121,13 @@ def _record_tokenization_truncation(raw_len: int) -> None:
     increment + one branch. The warning carries the actual raw token
     length so the user can see how much headroom they need.
     """
+    # Always-on raw_len stats (every tokenization, truncated or not).
+    _RAW_LEN_SUM[0] += raw_len
+    _RAW_LEN_COUNT[0] += 1
+    if raw_len > _RAW_LEN_MAX[0]:
+        _RAW_LEN_MAX[0] = raw_len
+    if _RAW_LEN_MIN[0] == 0 or raw_len < _RAW_LEN_MIN[0]:
+        _RAW_LEN_MIN[0] = raw_len
     if raw_len <= MAX_TOKENS:
         return
     overflow = raw_len - MAX_TOKENS
@@ -154,10 +171,21 @@ def consume_tokenization_truncation_stats() -> dict:
     _TOKENIZATION_TRUNCATION_COUNT[0] = 0
     _TOKENIZATION_TRUNCATION_MAX_LEN[0] = 0
     _TOKENIZATION_TRUNCATION_OVERFLOW_SUM[0] = 0
+    rl_sum, rl_cnt = _RAW_LEN_SUM[0], _RAW_LEN_COUNT[0]
+    rl_max, rl_min = _RAW_LEN_MAX[0], _RAW_LEN_MIN[0]
+    _RAW_LEN_SUM[0] = 0
+    _RAW_LEN_COUNT[0] = 0
+    _RAW_LEN_MAX[0] = 0
+    _RAW_LEN_MIN[0] = 0
     return {
         "count": int(count),
         "max_observed_len": int(max_len),
         "overflow_sum": int(overflow_sum),
+        # Always-on raw_len (all tokenizations this period).
+        "raw_len_sum": int(rl_sum),
+        "raw_len_count": int(rl_cnt),
+        "raw_len_max": int(rl_max),
+        "raw_len_min": int(rl_min),
     }
 # Upper bound on rule_specs rows per vertex. In dynamic-substeps mode this
 # also bounds the number of typed micro-actions per vertex that survive
@@ -225,15 +253,25 @@ REWARD_NAMES: tuple[str, ...] = (
     "xla_peak_memory",
 )
 REWARD_INDEX = {name: i for i, name in enumerate(REWARD_NAMES)}
-COMPUTE_REWARD_INDICES = (0, 1, 2, 3, 4, 5, 8)  # cost components (incl. xla peak)
-QUALITY_REWARD_INDICES = (6, 7)             # cosine, frobenius
+QUALITY_REWARD_INDICES = (
+    REWARD_INDEX["cosine_sim"], REWARD_INDEX["frob_residual"],
+)
+# Cost = every non-quality channel — DERIVED (not hardcoded) so adding a channel
+# (e.g. xla_peak_memory at idx 8) is picked up automatically, like
+# reward_scaling.COST_REWARD_INDICES.
+COMPUTE_REWARD_INDICES = tuple(
+    i for i in range(NUM_REWARDS) if i not in QUALITY_REWARD_INDICES
+)
 
 # Sentinel reward returned when a per-vertex transform sequence matches an
 # entry in the in-file blacklist (used during exploration to penalise
 # pathological configurations). The blacklist is no longer wired up after
 # the typed-transform migration; the array is kept for potential reuse.
+# Worst-case sentinel reward (blacklist path). NUM_REWARDS-aware so it can't
+# rot out of sync when channels are added: every channel is -1e10 except
+# cosine_sim, whose worst value is -1.0.
 _SENTINEL_BAD_REWARD = jnp.array(
-    [-1e10, -1e10, -1e10, -1e10, -1e10, -1e10, -1.0, -1e10],
+    [-1.0 if i == REWARD_INDEX["cosine_sim"] else -1e10 for i in range(NUM_REWARDS)],
     dtype=jnp.float32,
 )
 
@@ -340,7 +378,7 @@ class EnvConfig(NamedTuple):
     # New callers should ignore them and pick the desired component from the
     # reward vector explicitly via REWARD_INDEX.
     cmp_type: Literal["graphax", "flops", "latency"]
-    mem_type: Literal["graphax", "bytes_accessed", "peak_memory"]
+    mem_type: Literal["graphax", "bytes_accessed", "peak_memory", "xla_peak_memory"]
     target_fun: Callable | None = None
     data_gen: Callable | None = None
     exec_on_gpu: bool = False
@@ -441,6 +479,10 @@ class EnvConfig(NamedTuple):
     # device time, and peak memory comes from the SAME pass (one execution for
     # both channels instead of two). Validated RM≈perf_counter (ratio 0.95).
     latency_timer: str = "perf_counter"
+    # Search-space simplification: when True, only the FIRST Quant emitted in an
+    # episode takes effect (later Quant ops dropped) — one global quantization
+    # choice (a single dtype, or none) instead of per-vertex repeated quant.
+    quant_once: bool = False
 
 
 def _get_partials(order, sparsity_specs, stop):
@@ -953,6 +995,27 @@ def _flatten_jacobians(jac):
     return jnp.concatenate(flats)
 
 
+def _align_jac(jac_approx, jac_exact):
+    """Align each approx-Jacobian/grad leaf to its exact leaf's LAYOUT before
+    comparison. graphax ``value_and_grad``/``jacve`` returns some weight grads in
+    the transposed (∂L/∂Wᵀ) layout for certain elimination orders; flattening
+    them as-is makes a (256,784) vs (784,256) ravel near-orthogonal, so the
+    cosine/frob become a layout ARTIFACT that badly underestimates true gradient
+    quality (empirically lifts Spearman-vs-trainability 0.67→0.79). Transpose a
+    2-D leaf back when its shape is the exact leaf's reverse; leave other
+    mismatches for the size/shape guard downstream."""
+    def _al(a, e):
+        if getattr(a, "shape", None) == getattr(e, "shape", None):
+            return a
+        if getattr(a, "ndim", 0) == 2 and a.shape == e.shape[::-1]:
+            return a.T
+        return a
+    try:
+        return jax.tree_util.tree_map(_al, jac_approx, jac_exact)
+    except Exception:
+        return jac_approx
+
+
 def _quality_metrics(jac_exact, jac_approx):
     """`(cosine_sim, relative_frobenius)` of `jac_approx` against `jac_exact`.
 
@@ -966,6 +1029,9 @@ def _quality_metrics(jac_exact, jac_approx):
     on the PPO dynamic-substeps path. The print fires only when the
     formula would have produced a meaningful value but didn't.
     """
+    # Layout-align the approx leaves to the exact layout (transpose-back) so the
+    # cosine/frob compare the SAME entries, not a transposed-layout artifact.
+    jac_approx = _align_jac(jac_approx, jac_exact)
     flat_exact = _flatten_jacobians(jac_exact)
     flat_approx = _flatten_jacobians(jac_approx)
     # A degenerate / incomparable approx Jacobian (no leaves, mismatched shape,
@@ -977,9 +1043,25 @@ def _quality_metrics(jac_exact, jac_approx):
     if flat_exact is None or flat_approx is None:
         return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
     if flat_approx.shape != flat_exact.shape or flat_approx.size == 0:
+        if os.environ.get("ALPHAGRAD_DEBUG_QUALITY", "0") == "1":
+            _ea = jax.tree_util.tree_leaves(jac_exact)
+            _aa = jax.tree_util.tree_leaves(jac_approx)
+            print(
+                "[quality-debug] SHAPE-MISMATCH -> cos=0 | "
+                f"exact_leaves={[tuple(jnp.shape(x)) for x in _ea]} "
+                f"approx_leaves(aligned)={[tuple(jnp.shape(x)) for x in _aa]} "
+                f"flat_exact={None if flat_exact is None else flat_exact.shape} "
+                f"flat_approx={None if flat_approx is None else flat_approx.shape}",
+                flush=True,
+            )
         return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
 
     cos = cossim(flat_exact, flat_approx)
+    # Some approximations (certain quant/compress combos) yield a complex-valued
+    # flattened Jacobian, making cossim complex. Use the real part — it matches the
+    # reward path's existing real cast (the source of the ComplexWarning) and unblocks
+    # the per-point float emission in raw_sink that otherwise crashes on complex.
+    cos = jnp.real(cos)
     exact_norm = jnp.linalg.norm(flat_exact)
     resid_norm = jnp.linalg.norm(flat_exact - flat_approx)
     rel_frob = resid_norm / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
@@ -1115,6 +1197,11 @@ def _callback(
     # with j=1 only fits the first).
     transforms: list[tuple[int, tuple]] = []
     last_v_idx = len(o_list) - 1
+    # quant-once: only the FIRST Quant across the whole episode (vertex x slot
+    # order) survives; later Quant rows are dropped → one global quantization
+    # choice (a dtype, or none) instead of per-vertex repeated quant.
+    _quant_once = bool(getattr(config, "quant_once", False))
+    _quant_used = False
     for v_idx, v in enumerate(o_list):
         eqn = config.jaxpr.eqns[v - 1]
         if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
@@ -1144,10 +1231,13 @@ def _callback(
                 # shape-preservation issue with downstream eliminations).
                 # Out-of-range dtype indices silently fall back to the
                 # first catalog entry rather than crashing the callback.
+                if _quant_once and _quant_used:
+                    continue  # quant-once: a quantization was already chosen
                 dtype_idx = bi2
                 if not (0 <= dtype_idx < len(QUANT_DTYPES)):
                     dtype_idx = 0
                 rules.append(Quant(dtype=QUANT_DTYPES[dtype_idx]))
+                _quant_used = True
                 continue
             if bi1 == COMPRESS_SENTINEL:
                 # COMPRESS slot: row[1] is the *physical* axis index in the
@@ -1237,6 +1327,123 @@ def _callback(
         if rules:
             transforms.append((int(v), tuple(rules)))
 
+    # ------------------------------------------------------------------
+    # PREVALIDATE-BEFORE-MEASURE (opt-in via ALPHAGRAD_PREVALIDATE_MEASURE=1)
+    # ------------------------------------------------------------------
+    # graphax's typed micro-action transforms (DIAG/COMPRESS) can produce
+    # logically-misaligned sparse edges that only fail deep inside the host
+    # shape algebra (``_eliminate_vertex`` -> sparse matmul / ``_normalize_
+    # approx_edge``): an edge-shape AssertionError, a matmul "Contraction
+    # size mismatch" ValueError, a broadcast/transpose TypeError. For ViT
+    # (seed-free Jacobian) EVERY terminal order in a rollout tripped one of
+    # these, so the reward was all-[SENTINEL] and PPO learned nothing.
+    #
+    # The fix runs a HOST-SIDE dry-run BEFORE committing to the order's
+    # measurement, reusing graphax's OWN shape algebra as the oracle (no
+    # re-implementation, drift-proof): ``vertex_elimination_jaxpr(...,
+    # count_ops=True)`` walks the identical ``_eliminate_vertex`` ->
+    # matmul-topology -> ``_normalize_approx_edge`` path on the SparseTensor
+    # dim/logical_size metadata and raises the EXACT same error classes — it
+    # does NOT need ``extract_jaxpr``'s output (they are sibling calls that
+    # both build their graph from ``config.jaxpr``/``args``/``consts``), so
+    # it is a faithful, cheap probe we can run first.
+    #
+    # On a clean dry-run we proceed with the sampled transforms unchanged.
+    # On failure we apply a SAFE-SUBSET prune ladder, re-dry-running after
+    # each step until it traces clean, and measure with the FIRST clean
+    # subset:
+    #   (a) drop all COMPRESS rows,
+    #   (b) then also drop DIAG rows on every non-terminal vertex,
+    #   (c) then transforms=[] (plain exact elimination — a provably valid
+    #       floor that always passes).
+    #
+    # Flag OFF (unset / != "1"): this whole block is skipped, so the path
+    # is byte-identical to the prior behaviour.
+    _prevalidate = os.environ.get("ALPHAGRAD_PREVALIDATE_MEASURE", "0") == "1"
+    # The REALIZED per-vertex specs after pruning, mirroring the input
+    # ``specs_list`` row layout (-1 in col 0 = unused slot). Off-policy
+    # bookkeeping consumes this; see the worker return-path note. When the
+    # flag is off (or no pruning happens) it stays None (no behaviour change).
+    realized_specs = None
+    if _prevalidate and transforms:
+        # Terminal vertex of THIS partial order — the only vertex with no
+        # downstream elimination within this callback (COMPRESS is already
+        # restricted to it above; DIAG on it is the safest to keep).
+        _terminal_vid = int(o_list[-1]) if o_list else None
+
+        def _probe(_t):
+            # Faithful oracle: the count_ops shape-pass raises the SAME
+            # AssertionError / ValueError / TypeError classes that would
+            # otherwise surface inside ``extract_jaxpr`` at measure time.
+            vertex_elimination_jaxpr(
+                config.jaxpr,
+                o_list,
+                consts,
+                *args,
+                argnums=config.argnums,
+                count_ops=True,
+                sparse_representation=config.sparse,
+                transforms=_t,
+            )
+
+        def _drop_compress(_t):
+            out = []
+            for _v, _rs in _t:
+                _kept = tuple(r for r in _rs if not isinstance(r, Compress))
+                if _kept:
+                    out.append((_v, _kept))
+            return out
+
+        def _terminal_only(_t):
+            # Keep transforms ONLY on the terminal vertex (drops every
+            # non-terminal DIAG/COMPRESS row).
+            return [
+                (_v, _rs) for _v, _rs in _t if _v == _terminal_vid
+            ]
+
+        _ladder = [
+            ("compress", _drop_compress(transforms)),
+            ("diag", _terminal_only(_drop_compress(transforms))),
+            ("empty", []),
+        ]
+        _pruned_level = None
+        try:
+            _probe(transforms)
+        except (AssertionError, ValueError, TypeError):
+            _n_before = sum(len(_rs) for _, _rs in transforms)
+            for _lvl, _cand in _ladder:
+                try:
+                    if _cand:
+                        _probe(_cand)
+                    transforms = _cand
+                    _pruned_level = _lvl
+                    break
+                except (AssertionError, ValueError, TypeError):
+                    continue
+            else:
+                transforms = []
+                _pruned_level = "empty"
+            _n_after = sum(len(_rs) for _, _rs in transforms)
+            print(
+                f"[PREVALIDATE] pruned {_n_before - _n_after} transforms "
+                f"(lvl={_pruned_level})",
+                flush=True,
+            )
+            # --- Off-policy bookkeeping: rebuild the REALIZED specs ---------
+            # The executed action (pruned transforms) != the sampled action.
+            # Reconstruct the per-vertex specs that correspond to the pruned
+            # transforms so the reward can be attributed to the action the
+            # env actually measured. NOTE: the Ray io_callback return
+            # signature is fixed to (tokens, eqn_ids, reward); threading
+            # ``realized_specs`` back into the PPO rollout buffer is a
+            # separate, bounded follow-up (see report). We compute it here so
+            # the plumbing has a single, correct source of truth to consume.
+            _kept_vids = {int(_v) for _v, _ in transforms}
+            realized_specs = np.array(specs_list, dtype=np.int32).copy()
+            for _vi, _vid in enumerate(o_list):
+                if int(_vid) not in _kept_vids:
+                    realized_specs[_vi, :, 0] = -1  # mark all slots unused
+
     ve = extract_jaxpr(
         config.jaxpr,
         config.argnums,
@@ -1272,6 +1479,19 @@ def _callback(
     # last step. PPO sees a sparse-reward MDP, which GAE handles natively.
     if config.terminal_rewards_only and not is_terminal:
         return tokens, eqn_ids, jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
+
+    # GATE 1 (pre-compile size gate): if the eliminated jaxpr is too big, skip
+    # the compile+exec entirely — they are the OOM/host-leak/timeout-prone part
+    # that was OOM-killing the measure actor. raw_tokens.shape[0] (= the
+    # tokenized jacve graph length) is the graph-size proxy. We RAISE so the
+    # worker's existing handler turns it into a logged [SENTINEL] (excluded from
+    # the loss) instead of attempting a measurement that could kill the actor.
+    _max_measure_tokens = int(os.environ.get("ALPHAGRAD_MAX_MEASURE_TOKENS", "0") or 0)
+    if _max_measure_tokens > 0 and int(raw_tokens.shape[0]) > _max_measure_tokens:
+        raise RuntimeError(
+            f"size-gate: jaxpr raw_len={int(raw_tokens.shape[0])} > "
+            f"ALPHAGRAD_MAX_MEASURE_TOKENS={_max_measure_tokens} — skip measure"
+        )
 
     # ------------------------------------------------------------------
     # Compute family — graphax counters (always) → muls_adds_fmas, max_io_sum.
@@ -1322,16 +1542,91 @@ def _callback(
     callback_device = None
     if config.exec_on_gpu:
         gpu_devices = jax.devices("gpu")
-        if len(gpu_devices) < 2:
+        if len(gpu_devices) < 1:
             raise RuntimeError(
-                "--exec-on-gpu requires at least two GPUs (one for the "
-                f"trainer, one for the env callback); got {len(gpu_devices)}."
+                "--exec-on-gpu needs a GPU visible to the measurement process; "
+                f"got {len(gpu_devices)}."
             )
+        # The measurement runs on the LAST visible GPU. In the legacy
+        # single-process layout that was a 2nd GPU distinct from the trainer's;
+        # in the separate-measure-actor layout (cpu_actor_num_gpus=1) the actor
+        # owns its own 1 GPU (Ray gives it a device disjoint from the trainer),
+        # so a single visible GPU is correct.
         callback_device = gpu_devices[-1]
 
+    # --- Data-parallel sharding of the on-GPU measurement (opt-in) -----------
+    # ``ALPHAGRAD_SHARD_MEASURE=1`` shards the batched (vmap) axis of the
+    # measurement's grad/jacobian exec across ALL of the measure actor's
+    # visible GPUs, so a model whose single-device peak exceeds one GPU (e.g.
+    # the 16-substep VmappedConvNet) splits ~1/N memory per GPU instead of
+    # OOM-ing GPU_0 while the others sit idle. The Vmapped* models are vmapped
+    # over the data batch with ``in_axes=(0, 0, None, ...)`` — the DATA args
+    # (the non-``argnums`` positional leaves x, y) carry the batch axis on
+    # axis 0; the WEIGHTS (``argnums``) are replicated. We build a 1-D mesh
+    # over ``gpu_devices[:N]``, ``device_put`` the batched data leaves with
+    # ``NamedSharding(P('batch'))`` and the rest replicated, and let XLA's
+    # GSPMD partitioner shard the computation (in/out shardings are taken from
+    # the committed input arrays). OFF (default) is byte-for-byte the legacy
+    # single-device path. Falls back to single-device when <2 GPUs, batch size
+    # is unknown, or the batch is not divisible by N (so a wrong/uneven shard
+    # can never silently corrupt the reward).
+    _shard_measure = (
+        os.environ.get("ALPHAGRAD_SHARD_MEASURE", "0") == "1"
+        and config.exec_on_gpu
+        and callback_device is not None
+        and len(gpu_devices) > 1
+    )
+    _shard_mesh = None
+    _shard_devices = None
+    if _shard_measure:
+        import numpy as _np_shard
+        from jax.sharding import (
+            Mesh as _Mesh,
+            NamedSharding as _NS,
+            PartitionSpec as _PSpec,
+        )
+        _shard_devices = list(gpu_devices)
+        _N = len(_shard_devices)
+        # Batch size = leading dim of the batched DATA leaves (the positional
+        # args NOT in argnums that are >=1-D). All such leaves must share the
+        # same leading dim and be divisible by N; otherwise fall back.
+        _argnums_set = set(config.argnums or ())
+        _batch_dims = {
+            int(a.shape[0])
+            for i, a in enumerate(args)
+            if i not in _argnums_set and getattr(a, "ndim", 0) >= 1
+        }
+        if len(_batch_dims) == 1 and next(iter(_batch_dims)) % _N == 0:
+            _shard_mesh = _Mesh(_np_shard.array(_shard_devices), axis_names=("batch",))
+        else:
+            # Indivisible / ambiguous batch — stay single-device.
+            _shard_measure = False
+            _shard_mesh = None
+
+    def _put_measure(leaves):
+        """device_put a positional-arg list onto the measure device(s).
+
+        When sharding is active: batched data leaves (non-argnums, >=1-D) get
+        ``P('batch')`` (split on axis 0), everything else is replicated
+        (``P()``). When off: the legacy single ``callback_device`` put."""
+        if _shard_mesh is not None:
+            from jax.sharding import NamedSharding as _NS, PartitionSpec as _PSpec
+            _argnums_set = set(config.argnums or ())
+            out = []
+            for i, a in enumerate(leaves):
+                if i not in _argnums_set and getattr(a, "ndim", 0) >= 1:
+                    sh = _NS(_shard_mesh, _PSpec("batch"))
+                else:
+                    sh = _NS(_shard_mesh, _PSpec())
+                out.append(jax.device_put(a, sh))
+            return out
+        if callback_device is not None:
+            return [jax.device_put(a, callback_device) for a in leaves]
+        return list(leaves)
+
     args_for_lower = (
-        jax.device_put(args, callback_device)
-        if callback_device is not None
+        _put_measure(list(args))
+        if (callback_device is not None or _shard_mesh is not None)
         else args
     )
 
@@ -1363,6 +1658,11 @@ def _callback(
         if hasattr(a, "shape") and hasattr(a, "dtype"):
             h.update(repr(a.shape).encode())
             h.update(repr(a.dtype).encode())
+    if _shard_mesh is not None:
+        # Sharded vs single-device produce DIFFERENT executables (different
+        # in/out shardings + GSPMD partition); keep their cache entries
+        # distinct so a single-device blob is never loaded for a sharded run.
+        h.update(b"shard:" + str(len(_shard_devices)).encode())
     cache_key = h.digest()
 
     # Exact-Jacobian cache key — SHAPE-ONLY (no order/specs/stop). The
@@ -1462,6 +1762,141 @@ def _callback(
             _det_peak = None
     except Exception:
         _det_peak = None
+
+    # GATE 2 (post-compile per-device memory gate): compiled, but BEFORE we
+    # EXECUTE, decide whether the exec can fit on the measure device(s); if not,
+    # skip it (RAISE -> logged ``[SENTINEL] mem-gate``, excluded from loss).
+    # This is the ONLY reliable guard against the measure-GPU OOM: under
+    # ``ALPHAGRAD_SHARD_MEASURE`` an OOM happens INSIDE the NCCL collective ->
+    # ``rendezvous ... waiting`` -> an UNCATCHABLE hang (the job deadlocks), so
+    # it MUST be caught pre-exec.
+    #
+    # WHY A PER-ORDER PEAK ESTIMATE ALONE IS INSUFFICIENT (diagnosed on ConvNet
+    # seed-free Jacobian, 2-GPU sharded, gpu16): every single order's
+    # memory_analysis peak is tiny (<=0.7GiB/device) yet the actor still OOMs —
+    # the GPU's live use climbs (resident executables + replicated weights) and
+    # the XLA exec / conv-autotuner WORKSPACE (~2.5GiB transient, NOT in
+    # memory_analysis) is what trips the BFC allocator. So the gate combines a
+    # per-order estimate with LIVE free-memory checks, the decisive one being an
+    # absolute FLOOR on the remaining free: once free drops below the floor,
+    # EVERY further exec is skipped -> the collective is never entered without
+    # headroom for the (unpredicted) workspace -> no OOM, no hang.
+    #
+    # DETERMINISM: the sharded measure runs in ONE process that dispatches a
+    # single GSPMD executable across both GPUs, so this gate is evaluated ONCE
+    # per (order, specs) before the collective — there is no cross-process race.
+    # Even read as independent ranks, every input is identical across ranks: the
+    # estimate comes only from ``compiled_approx`` (byte-identical per cache key)
+    # and the live readings are the SAME physical per-device values regardless
+    # of which rank queries them (we take the MIN over the shared
+    # ``_shard_devices`` list). So all ranks reach the SAME skip decision and the
+    # collective is never half-skipped.
+    #
+    # KNOBS (all per-device):
+    #   ALPHAGRAD_MAX_MEASURE_MEM_GIB  static cap; 0/"auto" -> FRAC*bytes_limit;
+    #                                  negative -> gate fully disabled.
+    #   ALPHAGRAD_MEASURE_MEM_FRAC     (0.85) auto static-cap fraction of limit.
+    #   ALPHAGRAD_MEASURE_MEM_SAFETY   (2.0)  multiplier on the per-order estimate.
+    #   ALPHAGRAD_MEASURE_MEM_HEADROOM (0.90) estimate must fit 90% of live free.
+    #   ALPHAGRAD_MEASURE_MEM_FLOOR_GIB(8.0)  skip if live free < this floor —
+    #                                  covers the autotuner workspace the
+    #                                  estimate can't see. 0 disables the floor.
+    _gate_raw = (os.environ.get("ALPHAGRAD_MAX_MEASURE_MEM_GIB", "0") or "").strip().lower()
+    _gate_disabled = False
+    _gate_auto = _gate_raw in ("", "0", "0.0", "auto")
+    _max_measure_mem_gib = 0.0
+    if not _gate_auto:
+        try:
+            _max_measure_mem_gib = float(_gate_raw)
+        except ValueError:
+            _max_measure_mem_gib = 0.0
+        if _max_measure_mem_gib < 0:
+            _gate_disabled = True
+    _mem_safety = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_SAFETY", "2.0") or 2.0)
+    _mem_frac = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_FRAC", "0.85") or 0.85)
+    _mem_headroom = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_HEADROOM", "0.90") or 0.90)
+    _mem_floor = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_FLOOR_GIB", "8.0") or 8.0) * (1024 ** 3)
+
+    # Measure device(s) — the SAME list on every rank.
+    _gate_devices = []
+    if _shard_devices:
+        _gate_devices = list(_shard_devices)
+    elif callback_device is not None:
+        _gate_devices = [callback_device]
+
+    if (not _gate_disabled) and _gate_devices:
+        # Per-order conservative estimate (only when memory_analysis worked;
+        # else estimate stays None and only the live-free floor can fire).
+        _gate_est = None
+        if _det_peak is not None:
+            _ca_bytes = 0.0
+            if os.environ.get("ALPHAGRAD_SKIP_COST_ANALYSIS", "0") != "1":
+                try:
+                    _ca_probe = compiled_approx.cost_analysis() or {}
+                    if isinstance(_ca_probe, (list, tuple)):
+                        _ca_probe = _ca_probe[0] if _ca_probe else {}
+                    _ca_bytes = float(_ca_probe.get("bytes accessed", 0) or 0)
+                except Exception:
+                    _ca_bytes = 0.0
+            _gate_est = max(_det_peak, _ca_bytes) * _mem_safety
+
+        _static_budget = None
+        _live_free = None
+        try:
+            _stats0 = _gate_devices[0].memory_stats() or {}
+            _blim = int(_stats0.get("bytes_limit", 0) or 0)
+            if _max_measure_mem_gib > 0:
+                _static_budget = _max_measure_mem_gib * (1024 ** 3)
+            elif _blim > 0:
+                _static_budget = _mem_frac * _blim
+            _frees = []
+            for _d in _gate_devices:
+                _st = _d.memory_stats() or {}
+                _lim = int(_st.get("bytes_limit", 0) or 0)
+                # Conservative "used": the BFC allocator can hold large
+                # FREED-but-RESERVED regions (fragmentation) that a fresh exec
+                # allocation cannot reuse, so bytes_in_use ALONE under-counts
+                # OOM risk. Take the max of the live, peak, and any
+                # reserved/pool field exposed by memory_stats so the gate sees
+                # the true pressure on the device.
+                # NB do NOT include pool_bytes/peak_pool_bytes here — those
+                # report the BFC POOL SIZE (== bytes_limit once the pool has
+                # grown), not occupancy, so they would force free->0 and skip
+                # EVERY order. peak_bytes_in_use is the right fragmentation
+                # proxy: once a heavy order has peaked, the high-water stays up
+                # so subsequent execs see little free and skip — but it tracks
+                # real occupancy, not the pool ceiling.
+                _use = max(
+                    int(_st.get("bytes_in_use", 0) or 0),
+                    int(_st.get("peak_bytes_in_use", 0) or 0),
+                    int(_st.get("bytes_reserved", 0) or 0),
+                    int(_st.get("peak_bytes_reserved", 0) or 0),
+                )
+                if _lim > 0:
+                    _frees.append(_lim - _use)
+            if _frees:
+                _live_free = min(_frees)
+        except Exception:
+            pass
+
+        _why = []
+        if _gate_est is not None and _static_budget is not None and _gate_est > _static_budget:
+            _why.append(f"est {_gate_est / 1024 ** 3:.2f}G>static {_static_budget / 1024 ** 3:.1f}G")
+        if _gate_est is not None and _live_free is not None and _gate_est > _mem_headroom * _live_free:
+            _why.append(
+                f"est {_gate_est / 1024 ** 3:.2f}G>{_mem_headroom:g}*free {_live_free / 1024 ** 3:.1f}G"
+            )
+        if _mem_floor > 0 and _live_free is not None and _live_free < _mem_floor:
+            _why.append(f"free {_live_free / 1024 ** 3:.1f}G<floor {_mem_floor / 1024 ** 3:.1f}G")
+        if _why:
+            print(
+                f"[SENTINEL] mem-gate: per-device "
+                f"({'; '.join(_why)}) sharded={_shard_mesh is not None} — skip exec",
+                flush=True,
+            )
+            raise RuntimeError(
+                f"mem-gate: per-device limit reached ({'; '.join(_why)}) — skip exec"
+            )
     # ``compiled_exact`` is ONLY needed for the quality metrics
     # (cosine_sim, frob_residual). Those are meaningful only when the
     # elimination order is complete — graphax's ``jacve`` returns a
@@ -1657,8 +2092,8 @@ def _callback(
             eval_args_i = [arg[d] for arg in eval_samples]
         else:
             eval_args_i = list(args)
-        if callback_device is not None:
-            eval_args_i = [jax.device_put(x, callback_device) for x in eval_args_i]
+        if callback_device is not None or _shard_mesh is not None:
+            eval_args_i = _put_measure(eval_args_i)
         # Per-data-point warmup: discard the first ``_warmup`` executions so
         # first-touch / cache / allocation effects don't pollute the timed
         # readings (see EnvConfig.latency_warmup). Each warmup exec is itself
@@ -1804,28 +2239,22 @@ def _callback(
                 latency_ns = _winsorized_mean(_lat_valid, _winsor)
             else:
                 latency_ns = _percentile_pool(_lat_valid, pk)
-            # Clamp an implausibly-small (but positive) reading UP to the floor
-            # rather than sentinelling the whole terminal: the row's other
-            # channels (mem / quality / flops) are still valid. A genuine
-            # measurement failure produces no positive readings and is already
-            # sentinelled by the ``not _lat_valid`` branch above. (The original
-            # 0-ns fake-fast artifact is excluded by the x>0 filter on
-            # ``_lat_valid`` + the perf_counter/RM-timer fix.)
-            latency_ns = max(latency_ns, _LAT_FLOOR_NS)
+            if latency_ns < _LAT_FLOOR_NS:
+                latency_ns = -SENTINEL_REWARD_VALUE
     # RM-sampled peak: exact on GPU (clear_memory_stats + peak_bytes_in_use),
     # a sampled high-water mark on CPU (misses sub-ms grad allocs → unreliable).
     _rm_peak = float(_percentile_pool(peak_mem_samples, pk))
-    # XLA-analysis peak (temp+output+args). Falls back to the RM peak only if
-    # memory_analysis was unavailable (so it's never a false 0). Always exposed
-    # as the separate ``xla_peak_memory`` channel for diagnostics.
+    # XLA-analysis peak (temp+output+args); always emitted as its own channel.
+    # Falls back to the RM peak only if memory_analysis was unavailable.
     xla_peak_memory = _det_peak if _det_peak is not None else _rm_peak
-    # ``peak_memory`` channel (index 5) = the RELIABLE, device-appropriate peak:
-    # the exact RM high-water mark on GPU, the deterministic XLA estimate on CPU
-    # (where RM polling misses sub-ms allocs). Fixing it HERE — at the single
-    # measurement source — means every reward / Lagrangian-constraint / PCA /
-    # running-max / Pareto consumer that selects the peak_memory channel gets the
-    # trustworthy signal on CPU without each having to special-case the device.
-    peak_memory = _rm_peak if config.exec_on_gpu else xla_peak_memory
+    # ``peak_memory`` (idx 5) ALWAYS carries the ResourceMonitor measurement —
+    # exact on GPU, a sampled high-water mark on CPU — so the RM signal is
+    # recorded on every run regardless of device. The deterministic XLA
+    # estimate lives in its own ``xla_peak_memory`` channel (idx 8). To use the
+    # XLA peak as the CPU memory REWARD, select ``--mem-type xla_peak_memory``
+    # (routes the mem weight to idx 8 in build_reward_weights) — that keeps the
+    # reward deterministic while still measuring/logging the RM peak at idx 5.
+    peak_memory = _rm_peak
 
     # ------------------------------------------------------------------
     # Quality family — cosine similarity + relative Frobenius residual.
@@ -2023,6 +2452,7 @@ class VertexEliminationEnv:
         latency_winsor: float = 0.0,
         measure_grad: bool = False,
         latency_timer: str = "perf_counter",
+        quant_once: bool = False,
     ):
         assert (argnums is None and args is None) or not (args is None or args is None)
         config = EnvConfig(
@@ -2050,6 +2480,7 @@ class VertexEliminationEnv:
             latency_winsor=latency_winsor,
             measure_grad=measure_grad,
             latency_timer=latency_timer,
+            quant_once=quant_once,
         )
         return cls(
             config,

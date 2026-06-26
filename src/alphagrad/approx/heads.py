@@ -64,8 +64,59 @@ import jax.nn as jnn
 import jax.numpy as jnp
 import jax.random as jrand
 import numpy as np
+import os
 
 from graphax.sparse.micro_actions import NUM_QUANT_DTYPES, QUANT_DTYPES
+
+# When ALPHAGRAD_SUBSTEP_NO_END=1, END is illegal in the op-type head, so every
+# eliminated vertex emits exactly one real micro-action (with --max-substeps 1:
+# one of {DIAG, COMPRESS, QUANT} — "always quant, else one of the other two";
+# no exact/no-op vertices). Scoped via env var so the cmorl/mogfn stacks (which
+# share heads.py) keep END legal by default.
+# IMPORTANT: these two policy switches are read LAZILY (first use, at jit-trace
+# time) — NOT at module import. In a Ray PPOActor the ALPHAGRAD_* env vars are
+# delivered via runtime_env / set by init_worker AFTER this module is already
+# imported, so an import-time read saw stock env and silently no-op'd (the bug
+# that left the policy sampling all 28 quant dtypes + END enabled). Reading at
+# first __call__ guarantees the actor's env is in place. Cached after first read.
+_SUBSTEP_NO_END_CACHE = None
+
+
+def _substep_no_end() -> bool:
+    """ALPHAGRAD_SUBSTEP_NO_END=1 -> END illegal in the op-type head (every
+    vertex emits exactly one real micro-action). Read lazily; see note above."""
+    global _SUBSTEP_NO_END_CACHE
+    if _SUBSTEP_NO_END_CACHE is None:
+        _SUBSTEP_NO_END_CACHE = (
+            os.environ.get("ALPHAGRAD_SUBSTEP_NO_END", "0") == "1"
+        )
+    return _SUBSTEP_NO_END_CACHE
+
+
+# Restrict the QUANT dtype head to a configurable subset. ALPHAGRAD_QUANT_ALLOWED
+# is a comma-list of QUANT_DTYPES names; disallowed dtypes are masked to -inf
+# before the softmax (in sample AND log_prob, so PPO ratios stay consistent).
+# Default (unset) = all dtypes legal. Used to drop dtypes JAX can't promote/cast
+# (sub-byte int2/4, uint2/4, float4, exotic float8 *fnuz/e3m4/e8m0, complex) and
+# no-op/unscaled ones (float32/64, plain int*) that otherwise crash or waste the
+# forced per-vertex QUANT under the substeps=1 scheme. Read lazily (see note).
+_QUANT_DTYPE_MASK_CACHE = None
+
+
+def _quant_dtype_mask():
+    """(NUM_QUANT_DTYPES,) float32 mask, 1.0 for allowed dtypes. Lazy; cached."""
+    global _QUANT_DTYPE_MASK_CACHE
+    if _QUANT_DTYPE_MASK_CACHE is None:
+        _env = os.environ.get("ALPHAGRAD_QUANT_ALLOWED", "").strip()
+        if _env:
+            _allowed = {s.strip() for s in _env.split(",") if s.strip()}
+            _QUANT_DTYPE_MASK_CACHE = jnp.asarray(
+                np.array([1.0 if d in _allowed else 0.0 for d in QUANT_DTYPES],
+                         dtype=np.float32)
+            )
+        else:
+            _QUANT_DTYPE_MASK_CACHE = jnp.ones(NUM_QUANT_DTYPES, dtype=jnp.float32)
+    return _QUANT_DTYPE_MASK_CACHE
 
 
 # ---------------------------------------------------------------------------
@@ -697,7 +748,10 @@ def _compute_op_legality(features: AxisTokenFeatures) -> jax.Array:
     # SparseTensor has ``val is None`` at apply time, ``apply_quant`` returns
     # the tensor unchanged, so an emitted QUANT can't crash the env.
     quant_legal = jnp.array(1.0, dtype=jnp.float32)
-    end_legal = jnp.array(1.0, dtype=jnp.float32)
+    # END disabled under the substeps=1 "always-approximate" scheme: force one
+    # real op (DIAG/COMPRESS/QUANT) per vertex. QUANT is always legal so there
+    # is always >=1 legal op even when both structural ops are illegal.
+    end_legal = jnp.array(0.0 if _substep_no_end() else 1.0, dtype=jnp.float32)
     return jnp.stack([diag_legal, compress_legal, quant_legal, end_legal])
 
 
@@ -803,6 +857,9 @@ class QuantDtypeHead(eqx.Module):
 
     def __call__(self, summary: jax.Array) -> jax.Array:
         logits = self.proj(summary)
+        # Mask disallowed quant dtypes to -inf (see _QUANT_DTYPE_MASK); applied
+        # identically here for sampling and log-prob so PPO ratios are exact.
+        logits = jnp.where(_quant_dtype_mask() > 0.5, logits, -1e9)
         return jnn.softmax(logits, axis=-1)
 
 

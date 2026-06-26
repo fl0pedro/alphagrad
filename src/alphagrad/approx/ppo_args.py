@@ -64,7 +64,12 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--mem-type", type=str, default="peak_memory",
-        choices=["graphax", "bytes_accessed", "peak_memory"],
+        choices=["graphax", "bytes_accessed", "peak_memory", "xla_peak_memory"],
+        help="Which measured channel drives the memory reward. "
+        "'peak_memory' = ResourceMonitor high-water mark (idx 5; exact on GPU, "
+        "sampled on CPU). 'xla_peak_memory' = deterministic XLA memory_analysis "
+        "(idx 8; preferred on CPU). All channels are measured/logged regardless; "
+        "this only selects the reward driver.",
     )
     p.add_argument(
         "--rewards", nargs="+", type=str,
@@ -72,6 +77,14 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--lambda-cmp", type=float, default=1.0)
     p.add_argument("--lambda-mem", type=float, default=1.0)
+    p.add_argument(
+        "--lambda-acc", type=float, default=1.0,
+        help="Static weight on the cosine_sim (accuracy) reward channel. The "
+        "scalar reward symlog's every channel, so cosine (symlog(1)~=0.69) is "
+        "dwarfed by latency/peak-memory (symlog~=17-20) at the old hard-coded "
+        "weight of 1.0 — set ~25 to bring cosine to a COMPARABLE magnitude so "
+        "PPO actually trades accuracy against cost.",
+    )
     # Both quality channels (cosine_sim direction + frob magnitude) are
     # now active rewards by default. cossim is gated by ``acc`` in
     # ``--rewards`` (weight = 1.0 when present). frob has its own
@@ -132,6 +145,21 @@ def make_argparser() -> argparse.ArgumentParser:
         "full Jacobian via jacve. Quality channels (cosine_sim/frob_residual) "
         "then compare the approx gradient vs the exact gradient — a more "
         "faithful gradient-accuracy signal. Requires a loss-like example.",
+    )
+    p.add_argument(
+        "--quant-once", action="store_true",
+        help="Simplify the search space: only the FIRST Quant emitted per episode "
+        "takes effect (later Quant ops dropped) — one global quantization choice "
+        "(a single dtype, or none) instead of per-vertex repeated quant.",
+    )
+    p.add_argument(
+        "--seed-vertices", action="store_true",
+        help="Grad-mode only: treat the tangent + adjoint SEEDS as their own graph "
+        "vertices (graphax.seed_vertices). The scalar loss becomes "
+        "<ones/N, fn(p + t*dir)> with the tangent seed t appended as the LAST arg "
+        "and the adjoint contraction explicit, so the elimination order chooses "
+        "forward / reverse / cross-country seed timing. Same value/gradient as the "
+        "plain scalar loss; only the action space (and graph) grows.",
     )
     p.add_argument(
         "--latency-timer", type=str, default="perf_counter",

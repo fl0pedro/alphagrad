@@ -217,6 +217,85 @@ class CpuApproximationServer:
             # `last_eval_error` is updated atomically (just Python reference
             # assignment).
             self.last_eval_error = (type(exc).__name__, str(exc)[:200])
+            # Log EVERY sentinel fire (cause + whether it was a terminal
+            # measurement) so the rate/causes are visible per model in the run
+            # log (grep '[SENTINEL]'). Previously only stashed in
+            # last_eval_error and never surfaced anywhere.
+            try:
+                _olen = int(order.shape[0]) if hasattr(order, "shape") else len(order)
+            except Exception:
+                _olen = -1
+            print(
+                f"[SENTINEL] measure-exception step={int(step)} order_len={_olen} "
+                f"terminal={int(step) >= _olen}: "
+                f"{type(exc).__name__}: {str(exc)[:180]}",
+                flush=True,
+            )
+            # ---- EXTREMELY VERBOSE sentinel diagnostics (logging only) ----
+            # Dump everything needed to reproduce/understand which order +
+            # micro-action + dtype tripped graphax: full (untruncated) message,
+            # full traceback, the elimination order, and the DECODED per-vertex
+            # micro-action sequence (DIAG/COMPRESS/QUANT with dtype names).
+            try:
+                import traceback as _tb
+                from graphax.sparse.micro_actions import (
+                    QUANT_DTYPES as _QD,
+                    COMPRESS_KINDS as _CK,
+                )
+                from alphagrad.approx.env import (
+                    COMPRESS_SENTINEL as _CS,
+                    QUANT_SENTINEL as _QS,
+                )
+
+                _order_np = np.asarray(order).reshape(-1).tolist()
+                _specs_np = np.asarray(sparsity_specs)
+                _lines = []
+                _nv = min(_specs_np.shape[0], len(_order_np)) if _specs_np.ndim == 3 else 0
+                for _v in range(_nv):
+                    _rules = []
+                    for _slot in range(_specs_np.shape[1]):
+                        _r0 = int(_specs_np[_v, _slot, 0])
+                        _r1 = int(_specs_np[_v, _slot, 1])
+                        _r2 = int(_specs_np[_v, _slot, 2])
+                        if _r0 == -1:
+                            break  # end-of-sequence
+                        if _r0 >= 0:
+                            _rules.append(f"DIAG(bi1={_r0},bi2={_r1},factor={_r2})")
+                        elif _r0 == _CS:
+                            _kind = _CK[_r2] if 0 <= _r2 < len(_CK) else f"?{_r2}"
+                            _rules.append(f"COMPRESS(axis={_r1},kind={_kind})")
+                        elif _r0 == _QS:
+                            _dt = _QD[_r1] if 0 <= _r1 < len(_QD) else f"?{_r1}"
+                            _rules.append(f"QUANT(dtype={_dt})")
+                        else:
+                            _rules.append(f"UNKNOWN(row=[{_r0},{_r1},{_r2}])")
+                    if _rules:
+                        _lines.append(
+                            f"    v{_v}(vertex_id={_order_np[_v]}): "
+                            + " -> ".join(_rules)
+                        )
+                _decoded = "\n".join(_lines) if _lines else "    (no active micro-action rules)"
+                print(
+                    f"[SENTINEL-VERBOSE] ==================================================\n"
+                    f"[SENTINEL-VERBOSE] step={int(step)} order_len={_olen} "
+                    f"terminal={int(step) >= _olen} init={bool(init)} "
+                    f"point_idx={int(point_idx)}\n"
+                    f"[SENTINEL-VERBOSE] EXC {type(exc).__name__}: {exc!s}\n"
+                    f"[SENTINEL-VERBOSE] ORDER ({len(_order_np)}): {_order_np}\n"
+                    f"[SENTINEL-VERBOSE] MICRO-ACTIONS (per vertex, in elimination order):\n"
+                    f"{_decoded}\n"
+                    f"[SENTINEL-VERBOSE] TRACEBACK:\n{_tb.format_exc()}"
+                    f"[SENTINEL-VERBOSE] ==================================================",
+                    flush=True,
+                )
+            except Exception as _verbose_exc:
+                # Never let diagnostics logging mask the original sentinel.
+                print(
+                    f"[SENTINEL-VERBOSE] (diagnostics dump failed: "
+                    f"{type(_verbose_exc).__name__}: {_verbose_exc})",
+                    flush=True,
+                )
+            # ---- end verbose diagnostics ----
             sentinel_tokens = np.zeros((MAX_TOKENS,), dtype=np.int32)
             sentinel_eqn_ids = np.zeros((MAX_TOKENS,), dtype=np.int32)
             sentinel_reward = np.full((NUM_REWARDS,), -1e10, dtype=np.float32)
@@ -303,10 +382,11 @@ class CpuApproximationServer:
         if args_dict is None:
             return False  # paranoid; nothing to rebuild from
         target_fn = get_fn(args_dict["example"])
-        # Match the grad-mode scalar-loss wrapping used at env-build time so the
-        # swapped-in target stays the same scalar-loss graph (shared wrap).
-        from alphagrad.approx.common import maybe_scalar_loss
-        target_fn, _ = maybe_scalar_loss(args_dict, target_fn)
+        # Match the grad-mode wrapping used at env-build time (incl.
+        # --seed-vertices) so the swapped-in target stays the same graph. The
+        # env's args/argnums were fixed at build time, so only the fn is re-wrapped.
+        from alphagrad.approx.common import grad_target_fn
+        target_fn = grad_target_fn(args_dict, target_fn, args_dict["example"])
         new_config = self._config._replace(target_fun=target_fn)
         # Swap on the env via eqx.tree_at so the JAX-side state survives.
         self._env = eqx.tree_at(lambda e: e.config, self._env, new_config)
@@ -374,12 +454,14 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
     )
     # Gradient mode: THIS env (inside the CpuApproximationActor) does the actual
-    # pooled measurement, so the scalar-loss wrapping + jaxpr must mirror the
-    # trainer exactly, or grad-mode runs would silently measure the Jacobian.
-    from alphagrad.approx.common import maybe_scalar_loss
-    target_fn, measure_grad = maybe_scalar_loss(args, target_fn)
+    # pooled measurement, so the grad-mode wrapping + jaxpr + argnums must mirror
+    # the trainer exactly, or grad-mode runs would silently measure the Jacobian.
+    # Shared helper (same as ppo_ray_worker) builds the IDENTICAL graph; honors
+    # --seed-vertices (tangent+adjoint seed vertices + appended seed arg t).
+    measure_grad = bool(getattr(args, "measure_grad", False))
+    from alphagrad.approx.common import grad_target_setup
+    target_fn, xs, argnums = grad_target_setup(args, target_fn, xs, args.example)
     closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
-    argnums = infer_argnums(args.example)
 
     # Always pass target_fun so env._callback runs the JIT-compile +
     # cost_analysis + ResourceMonitor path on every step — this is what
@@ -438,6 +520,7 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         latency_winsor=float(getattr(args, "latency_winsor", 0.0)),
         measure_grad=measure_grad,
         latency_timer=str(getattr(args, "latency_timer", "perf_counter")),
+        quant_once=bool(getattr(args, "quant_once", False)),
         slow_exec_cutoff_seconds=float(
             getattr(args, "slow_exec_cutoff_seconds", 15.0)
         ),

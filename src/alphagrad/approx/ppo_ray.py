@@ -27,6 +27,7 @@ import sys
 import time
 
 import numpy as np
+
 from tqdm import tqdm
 
 # Plain threading lock so tqdm doesn't leak a named POSIX semaphore on
@@ -70,6 +71,14 @@ def _extend_argparser(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "when SPMD sharding lands).",
     )
     p.add_argument(
+        "--use-placement-group", action="store_true",
+        help="Reserve a Ray placement group per run: one {GPU: actor_num_gpus} "
+        "bundle for the (same-node) SPMD PPO trainer + one {GPU: "
+        "cpu_actor_num_gpus, CPU:1} bundle per measure actor, PACK strategy. "
+        "Makes N concurrent multi-GPU runs tile deterministically across mixed "
+        "GPU nodes (e.g. 4+8) instead of Ray's greedy placement stranding GPUs.",
+    )
+    p.add_argument(
         "--lagrangian-warmup-eps",
         type=int,
         default=20,
@@ -98,6 +107,15 @@ def _run(args) -> int:
     from alphagrad.approx.cpu_approx_actors import CpuApproximationActor
 
     args_dict = vars(args)
+    # Thread ALPHAGRAD_* policy switches (e.g. ALPHAGRAD_QUANT_ALLOWED,
+    # ALPHAGRAD_SUBSTEP_NO_END) to the PPOActor explicitly via args_dict, which
+    # Ray serializes reliably. runtime_env env_vars do NOT reliably reach the
+    # actor's heads module at the time it samples the policy, so the import/lazy
+    # env read saw stock env and the switches silently no-op'd. init_worker
+    # re-applies these to os.environ before the policy is built.
+    args_dict["_alphagrad_env"] = {
+        k: v for k, v in os.environ.items() if k.startswith("ALPHAGRAD_")
+    }
     wandb.init(
         project=args.wandb_project,
         entity=getattr(args, "wandb_entity", None) or None,
@@ -123,6 +141,24 @@ def _run(args) -> int:
     for k, v in os.environ.items():
         if k.startswith("ALPHAGRAD_") or k.startswith("JAX_COMPILATION_"):
             actor_env[k] = v
+    # Optional per-run placement group: one bundle of {GPU: actor_num_gpus}
+    # for the PPO trainer (a single bundle => same node, required for the SPMD
+    # mesh / NCCL) + one {CPU:1, GPU: cpu_actor_num_gpus} bundle per measure
+    # actor. PACK co-locates the run's GPUs and lets N runs tile mixed GPU
+    # nodes deterministically (no greedy fragmentation stranding GPUs).
+    _pg = None
+    if getattr(args, "use_placement_group", False):
+        from ray.util.placement_group import placement_group
+        _gg = float(getattr(args, "cpu_actor_num_gpus", 0.0) or 0.0)
+        _bundles = [{"GPU": float(args.actor_num_gpus)}]
+        for _ in range(int(args.num_cpu_workers)):
+            _b = {"CPU": 1.0}
+            if _gg > 0:
+                _b["GPU"] = _gg
+            _bundles.append(_b)
+        _pg = placement_group(_bundles, strategy="PACK")
+        ray.get(_pg.ready())
+
     actor_kwargs = {
         # GPU-bound trainer: reserve 0 CPU slots so the GPU node can be
         # declared --num-cpus=0, which physically excludes the num_cpus=1
@@ -134,6 +170,11 @@ def _run(args) -> int:
     } if args.actor_num_gpus > 0 else {
         "runtime_env": {"env_vars": actor_env},
     }
+    if _pg is not None:
+        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+        actor_kwargs["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+            _pg, placement_group_bundle_index=0,
+        )
 
     # Cluster-wide shared compile cache. Spawned BEFORE any CPU worker
     # so when those workers' env._callback runs cached_compile() on
@@ -168,6 +209,21 @@ def _run(args) -> int:
     for k, v in os.environ.items():
         if k.startswith("ALPHAGRAD_") or k.startswith("JAX_COMPILATION_"):
             cpu_actor_env[k] = v
+    # Single-core measurement (--cpu-cores-per-actor 1): also kill the math-lib
+    # and XLA-Eigen threadpools so the pinned core runs TRULY single-threaded
+    # (no intra-op threads contending on one core) — cleanest per-reading CV for
+    # the CPU reward signal. The legacy "don't single-thread" note above was for
+    # the full Jacobian (~80s single-core); in grad-mode the gradient exec is
+    # ~160x cheaper, so single-thread no longer starves it.
+    if int(getattr(args, "cpu_cores_per_actor", 0) or 0) == 1:
+        cpu_actor_env.update({
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "XLA_FLAGS": (os.environ.get("XLA_FLAGS", "")
+                         + " --xla_cpu_multi_thread_eigen=false").strip(),
+        })
     cpu_actor_options = {
         "num_cpus": 1,
         "num_gpus": float(getattr(args, "cpu_actor_num_gpus", 0.0) or 0.0),
@@ -180,14 +236,23 @@ def _run(args) -> int:
     # every core across both nodes for measurement. Opt-in via
     # ``--spread-cpu-actors`` so single-node runs keep the default
     # (locality-friendly) packing.
-    if getattr(args, "spread_cpu_actors", False):
+    if getattr(args, "spread_cpu_actors", False) and _pg is None:
         cpu_actor_options["scheduling_strategy"] = "SPREAD"
-    cpu_workers = [
-        CpuApproximationActor.options(**cpu_actor_options).remote(
-            args_dict, variant=None, actor_id=i,
+    cpu_workers = []
+    for i in range(args.num_cpu_workers):
+        _opts = dict(cpu_actor_options)
+        if _pg is not None:
+            # Bundle i+1 (bundle 0 is the PPO trainer). Co-locates this measure
+            # actor with the run's reserved GPU.
+            from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+            _opts["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                _pg, placement_group_bundle_index=1 + i,
+            )
+        cpu_workers.append(
+            CpuApproximationActor.options(**_opts).remote(
+                args_dict, variant=None, actor_id=i,
+            )
         )
-        for i in range(args.num_cpu_workers)
-    ]
 
     # Construct the timeout-bounded pool. `init_server` also internally
     # calls `init_worker` if the worker hasn't been built yet, so we
@@ -335,12 +400,6 @@ def _run(args) -> int:
         except Exception as _exc:
             tqdm.write(f"  [ppo_ray] pareto dump failed: {_exc}")
 
-    # Wall-clock budget: stop cleanly after the current episode once elapsed
-    # training time exceeds --max-wall-seconds (0 = unbounded), so a long run
-    # still flushes its best-sequences + Pareto archive on exit.
-    _max_wall = float(getattr(args, "max_wall_seconds", 0.0) or 0.0)
-    _t_train_start = time.time()
-
     pbar = tqdm(
         total=args.episodes,
         desc="ppo_ray",
@@ -350,13 +409,18 @@ def _run(args) -> int:
     )
 
     for ep in range(args.episodes):
-        if _max_wall > 0 and (time.time() - _t_train_start) > _max_wall:
+        seed_counter += 1
+
+        # Wall-clock budget: stop cleanly once --max-wall-seconds has elapsed
+        # (the final Pareto + best-sequence archives are dumped after the loop).
+        # 0 = run to --episodes. Granularity = one episode.
+        _mw = float(getattr(args, "max_wall_seconds", 0.0) or 0.0)
+        if _mw > 0.0 and (time.time() - args.t_start) > _mw:
             tqdm.write(
-                f"  [ppo_ray] wall-clock budget ({_max_wall:.0f}s) reached "
-                f"at episode {ep} — stopping; dumping final archives."
+                f"  [max-wall] {_mw:.0f}s budget reached at ep={ep} "
+                f"(elapsed {time.time() - args.t_start:.0f}s) — stopping."
             )
             break
-        seed_counter += 1
 
         # Curriculum stage / variant transition. ``compute_variant_at_episode``
         # returns the current stage + the concrete variant for this

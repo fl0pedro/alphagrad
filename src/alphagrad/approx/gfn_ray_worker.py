@@ -157,10 +157,12 @@ def _build_actor_state(
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
     )
-    # Gradient mode: measure value_and_grad of the scalar loss — build the
-    # jaxpr + env target from the reduced scalar (shared wrap).
-    from alphagrad.approx.common import maybe_scalar_loss
-    target_fn, measure_grad = maybe_scalar_loss(args, target_fn)
+    # Gradient mode: measure value_and_grad of the scalar loss (see
+    # scalar_loss_fn) — build the jaxpr + env target from the reduced scalar.
+    measure_grad = bool(getattr(args, "measure_grad", False))
+    if measure_grad:
+        from alphagrad.approx.common import scalar_loss_fn
+        target_fn = scalar_loss_fn(target_fn)
     closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
     argnums = infer_argnums(args.example)
 

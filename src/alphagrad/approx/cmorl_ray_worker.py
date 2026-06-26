@@ -398,11 +398,15 @@ class PPORayWorker:
             dataset=dataset_for_call,
             dataset_size=self.args.dataset_size,
         )
-        # Gradient mode: measure value_and_grad of the SCALAR training loss so
-        # the env target / jaxpr / order / micro-action transforms all operate
-        # on the same scalar-loss graph. Shared wrap — see ``maybe_scalar_loss``.
-        from alphagrad.approx.common import maybe_scalar_loss
-        target_fn, measure_grad = maybe_scalar_loss(self.args, target_fn)
+        measure_grad = bool(getattr(self.args, "measure_grad", False))
+        if measure_grad:
+            # Gradient mode: measure value_and_grad of the SCALAR training loss
+            # (the gradient that would actually hit the optimizer) — see
+            # ``scalar_loss_fn``. Build the jaxpr + env target from the reduced
+            # scalar so graphax.value_and_grad's order + micro-action transforms
+            # operate on the same (scalar-loss) graph.
+            from alphagrad.approx.common import scalar_loss_fn
+            target_fn = scalar_loss_fn(target_fn)
         closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
         argnums = infer_argnums(self.args.example)
         # Always pass target_fun so flops/bytes_accessed/latency_ns/peak_memory

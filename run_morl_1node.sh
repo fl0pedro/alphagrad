@@ -10,7 +10,7 @@
 # Override: EPISODES=300 SEED=7 sbatch --nodelist=pgi15-gpu12 run_morl_1node.sh cmorl
 #
 #SBATCH --job-name=morl1n
-#SBATCH --time=2-00:00:00
+#SBATCH --time=7-00:00:00
 #SBATCH --output=slurm/%x_%j.out
 #SBATCH --error=slurm/%x_%j.err
 #SBATCH --partition=pgi15
@@ -27,7 +27,11 @@ export PYTHONUNBUFFERED=1
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 
 METHOD="${1:-cmorl}"
-EPISODES="${EPISODES:-500}"
+# Large episode cap — the run is bounded by MAX_WALL (wall-clock), not episodes.
+# SLURM --time is a week; the trainer stops itself at MAX_WALL (4 days default)
+# and dumps the final + all-time-candidate archives cleanly.
+EPISODES="${EPISODES:-1000000}"
+MAX_WALL="${MAX_WALL:-345600}"          # 4 days in seconds (the actual run length)
 # 4 envs is the proven default: the full micro-action agent CUDA-OOMs XLA
 # autotuning at 16 envs on the 4×4090 nodes (every production launch overrides
 # to 4 anyway — make the default match reality).
@@ -35,7 +39,20 @@ NUM_ENVS="${NUM_ENVS:-4}"
 SEED="${SEED:-42}"
 WANDB="${WANDB:-offline}"
 BETA="${BETA:-16}"
-OBJ="${OBJECTIVES:-latency_ns,peak_memory,frob_residual}"
+# This launcher measures on the node's CPUs, where the RM peak is a sampled
+# high-water mark that misses sub-ms gradient allocations. Use the deterministic
+# XLA-analysis peak (xla_peak_memory: temp+output+args, order-discriminating) as
+# the memory objective. For GPU-MEASURED runs use the real measured peak_memory
+# instead (RM exact on GPU): OBJECTIVES=latency_ns,peak_memory,cosine_sim.
+OBJ="${OBJECTIVES:-latency_ns,xla_peak_memory,cosine_sim}"
+# Measure value_and_grad of the scalar training loss (the gradient that hits the
+# optimizer) instead of the full Jacobian — quality = cosine(approx grad, exact
+# grad). MEASURE_GRAD=0 reverts to Jacobian measurement.
+MEASURE_GRAD="${MEASURE_GRAD:-1}"
+# Time latency with the fixed ResourceMonitor (latency + peak memory in one
+# pass). LATENCY_TIMER=perf_counter reverts to the perf_counter inner loop.
+LAT_TIMER="${LATENCY_TIMER:-rm}"
+GRAD_FLAG=""; [ "$MEASURE_GRAD" = "1" ] && GRAD_FLAG="--measure-grad"
 # Latency-measurement noise control (2026-06-10 overhaul). Each reading is a
 # perf_counter inner-loop of INNER_REPS executions (amortizes dispatch noise;
 # replaces the buggy ResourceMonitor wall-timer), latency aggregated by a
@@ -86,6 +103,7 @@ if [ "$METHOD" = "cmorl" ]; then
         --cmp-type latency --mem-type peak_memory --advantage-norm scalar \
         --num-data-points "$NUM_DATA_POINTS" --reps-per-point "$REPS_PER_POINT" --percentile-keep 0.60 \
         --latency-inner-reps "$INNER_REPS" --latency-warmup "$LAT_WARMUP" --latency-winsor "$LAT_WINSOR" \
+        --latency-timer "$LAT_TIMER" $GRAD_FLAG --max-wall-seconds "$MAX_WALL" \
         --slow-exec-cutoff-seconds 0 --flop-gate-threshold 0 --measure-latency \
         --dynamic-substeps --max-substeps 16 --variant full \
         --calibrate-steps 0 --wandb "$WANDB" \
@@ -103,6 +121,7 @@ elif [ "$METHOD" = "mogfn" ]; then
         --slow-exec-cutoff-seconds 0 --flop-gate-threshold 0 \
         --num-data-points "$NUM_DATA_POINTS" --reps-per-point "$REPS_PER_POINT" --percentile-keep 0.60 \
         --latency-inner-reps "$INNER_REPS" --latency-warmup "$LAT_WARMUP" --latency-winsor "$LAT_WINSOR" \
+        --latency-timer "$LAT_TIMER" $GRAD_FLAG --max-wall-seconds "$MAX_WALL" \
         --dynamic-substeps --max-substeps 16 --variant full --variant-sweep full \
         --calibrate-steps 0 --wandb "$WANDB" \
         2>&1 | tee "$LOG_DIR/mogfn_${HOST}_s${SEED}.out"

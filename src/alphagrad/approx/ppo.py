@@ -2978,12 +2978,28 @@ def _build_agent(
     encoder_keys = jrand.split(key, 14)
     embedding = eqx.nn.Embedding(args.vocab_size, args.embd_dim, key=encoder_keys[0])
     pos_enc = PositionalEncoder(args.embd_dim, MAX_TOKENS)
+    # Flag-gated token-mixer for the policy backbone. Default "transformer"
+    # keeps behaviour byte-identical; ALPHAGRAD_POLICY=palimpsa swaps the
+    # encoder self-attention for the verified Palimpsa linear-attention kernel.
+    _policy = os.environ.get("ALPHAGRAD_POLICY", "transformer").strip().lower()
+    if _policy not in ("transformer", "palimpsa", "palimpsa_bi"):
+        raise ValueError(
+            "ALPHAGRAD_POLICY must be 'transformer', 'palimpsa' or "
+            f"'palimpsa_bi', got {_policy!r}"
+        )
+    if _policy == "palimpsa":
+        print("[alphagrad] policy backbone: PALIMPSA (unidirectional/causal) "
+              "linear-attention encoder", flush=True)
+    elif _policy == "palimpsa_bi":
+        print("[alphagrad] policy backbone: PALIMPSA_BI (bidirectional + "
+              "relational-gate) linear-attention encoder", flush=True)
     encoder = Encoder(
         args.num_layers,
         args.num_heads,
         args.embd_dim,
         args.hidden_dim,
         key=encoder_keys[1],
+        policy=_policy,
     )
     if use_pointer:
         vertex_policy = PointerVertexPolicy(

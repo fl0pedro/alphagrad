@@ -358,8 +358,19 @@ class PPORayWorker:
             dataset=dataset_for_call,
             dataset_size=self.args.dataset_size,
         )
+        # Grad-mode wrapping MUST mirror cpu_approx_worker exactly: when
+        # ``--num-cpu-workers 0`` the in-process measure fallback
+        # (CpuApproximationServer.from_env(self.env)) measures THIS env, so
+        # an un-wrapped Jacobian env would silently measure the Jacobian
+        # instead of the gradient under --measure-grad. Honors --seed-vertices
+        # too. No-op (returns base_fn / xs / base_argnums) when --measure-grad
+        # is off, so the pooled path is byte-for-byte unchanged.
+        from alphagrad.approx.common import grad_target_setup
+        _measure_grad = bool(getattr(self.args, "measure_grad", False))
+        target_fn, xs, argnums = grad_target_setup(
+            self.args, target_fn, xs, self.args.example,
+        )
         closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
-        argnums = infer_argnums(self.args.example)
         # Always pass target_fun so flops/bytes_accessed/latency_ns/peak_memory
         # populate every step (see cpu_approx_worker.py for the full rationale).
         env_target_fun = target_fn
@@ -374,6 +385,7 @@ class PPORayWorker:
             num_envs=0,
             data_gen=gen,
             target_fun=env_target_fun,
+            measure_grad=_measure_grad,
             cmp_type=self.args.cmp_type,
             mem_type=self.args.mem_type,
             exec_on_gpu=getattr(self.args, "exec_on_gpu", False),

@@ -1,13 +1,18 @@
 #!/bin/bash
 # Search-space sampler for the "full" variant, on cpu2 (no GPU needed —
 # CPU-latency measurement). Generates N reproducible random full-variant
-# configs, then measures all 6 cost channels + quality over a FIXED 8
+# configs, then measures all cost channels + quality over a FIXED 8
 # MNIST points x 10 reps each, RAW (every measurement stored). Gates OFF
 # (no flop-gate, no slow-exec trim). Reproducible & resumable: bump
 # --num-samples to extend; already-measured samples are skipped.
 #
-#   sbatch run_sampler_cpu2.sh                 # 10k samples, seed 12345
+#   sbatch run_sampler_cpu2.sh                 # 10k samples, seed 12345 (Jacobian)
 #   NUM_SAMPLES=100000 sbatch run_sampler_cpu2.sh   # extends to 100k
+#   # GRAD-MODE rerun (value_and_grad + deterministic xla_peak_memory),
+#   # SAME configs (same seed) into a SEPARATE dir so the old Jacobian data is
+#   # preserved:
+#   MEASURE_GRAD=1 LATENCY_TIMER=rm OUT_DIR=~/dsnn/search_space_full_grad \
+#       sbatch run_sampler_cpu2.sh
 
 #SBATCH --job-name=ssfull
 #SBATCH --time=5-00:00:00
@@ -40,8 +45,15 @@ SEED="${SEED:-12345}"
 NUM_WORKERS="${NUM_WORKERS:-48}"
 OUT_DIR="${OUT_DIR:-$HOME/dsnn/search_space_full}"
 HIDDEN_DIM="${HIDDEN_DIM:-256}"   # network hidden width (sampler-only override)
+# Grad-mode measurement (value_and_grad of the scalar loss) + deterministic
+# xla_peak_memory channel — matches the MORL trainers. MEASURE_GRAD=0 keeps the
+# legacy Jacobian measurement. Use a SEPARATE OUT_DIR for grad runs so the two
+# paradigms' jsonl files don't mix.
+MEASURE_GRAD="${MEASURE_GRAD:-0}"
+LAT_TIMER="${LATENCY_TIMER:-perf_counter}"
+GRAD_FLAGS=""; [ "$MEASURE_GRAD" = "1" ] && GRAD_FLAGS="--measure-grad"
 
-echo "==== sampler start $(date): N=$NUM_SAMPLES seed=$SEED workers=$NUM_WORKERS hidden=$HIDDEN_DIM ===="
+echo "==== sampler start $(date): N=$NUM_SAMPLES seed=$SEED workers=$NUM_WORKERS hidden=$HIDDEN_DIM grad=$MEASURE_GRAD timer=$LAT_TIMER out=$OUT_DIR ===="
 uv run --no-sync "$SAMPLER" \
     --num-samples "$NUM_SAMPLES" \
     --seed "$SEED" \
@@ -53,5 +65,6 @@ uv run --no-sync "$SAMPLER" \
     --num-passes 10 \
     --num-eval-samples 8 \
     --max-exec-seconds 0 \
-    --hidden-dim "$HIDDEN_DIM"
+    --hidden-dim "$HIDDEN_DIM" \
+    --latency-timer "$LAT_TIMER" $GRAD_FLAGS
 echo "==== sampler done $(date) ===="
