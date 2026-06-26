@@ -41,8 +41,11 @@ run_variant() {
     shift 2
     local logfile="$LOG_DIR/${tag}.out"
     echo "[${tag}] CUDA_VISIBLE_DEVICES=$gpu -> $logfile"
+    # --no-sync: the cluster venv is built by-hand (jax_memory_monitor, jax
+    # cuda wheels, etc. installed with `uv pip install -e ...`); pyproject.toml
+    # is intentionally a partial spec, so let `uv run` skip the sync step.
     CUDA_VISIBLE_DEVICES="$gpu" \
-        uv run "$PPO" --name "smoke_mnist_${tag}" "${COMMON[@]}" "$@" \
+        uv run --no-sync "$PPO" --name "smoke_mnist_${tag}" "${COMMON[@]}" "$@" \
         > "$logfile" 2>&1 &
     PIDS+=("$!:${tag}")
 }

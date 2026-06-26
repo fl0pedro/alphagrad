@@ -111,8 +111,11 @@ def build_job(exp: Experiment, args: argparse.Namespace, *, episodes: int,
               extra_override: list[str] | None,
               lambdas: tuple[float, float] | None,
               collect_stats: bool) -> Job:
+    # --no-sync: the cluster venv is built by-hand (custom jax cuda wheels,
+    # editable jax_memory_monitor, etc.) so pyproject.toml doesn't fully
+    # describe the env; `uv run` would otherwise try to reconcile and break.
     cmd = [
-        "uv", "run", str(PPO_SCRIPT),
+        "uv", "run", "--no-sync", str(PPO_SCRIPT),
         "--name", f"{args.name_prefix}_{exp.tag}_{label}",
         "--top-n", str(args.top_n),
         "--episodes", str(episodes),
