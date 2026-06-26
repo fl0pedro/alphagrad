@@ -1327,6 +1327,123 @@ def _callback(
         if rules:
             transforms.append((int(v), tuple(rules)))
 
+    # ------------------------------------------------------------------
+    # PREVALIDATE-BEFORE-MEASURE (opt-in via ALPHAGRAD_PREVALIDATE_MEASURE=1)
+    # ------------------------------------------------------------------
+    # graphax's typed micro-action transforms (DIAG/COMPRESS) can produce
+    # logically-misaligned sparse edges that only fail deep inside the host
+    # shape algebra (``_eliminate_vertex`` -> sparse matmul / ``_normalize_
+    # approx_edge``): an edge-shape AssertionError, a matmul "Contraction
+    # size mismatch" ValueError, a broadcast/transpose TypeError. For ViT
+    # (seed-free Jacobian) EVERY terminal order in a rollout tripped one of
+    # these, so the reward was all-[SENTINEL] and PPO learned nothing.
+    #
+    # The fix runs a HOST-SIDE dry-run BEFORE committing to the order's
+    # measurement, reusing graphax's OWN shape algebra as the oracle (no
+    # re-implementation, drift-proof): ``vertex_elimination_jaxpr(...,
+    # count_ops=True)`` walks the identical ``_eliminate_vertex`` ->
+    # matmul-topology -> ``_normalize_approx_edge`` path on the SparseTensor
+    # dim/logical_size metadata and raises the EXACT same error classes — it
+    # does NOT need ``extract_jaxpr``'s output (they are sibling calls that
+    # both build their graph from ``config.jaxpr``/``args``/``consts``), so
+    # it is a faithful, cheap probe we can run first.
+    #
+    # On a clean dry-run we proceed with the sampled transforms unchanged.
+    # On failure we apply a SAFE-SUBSET prune ladder, re-dry-running after
+    # each step until it traces clean, and measure with the FIRST clean
+    # subset:
+    #   (a) drop all COMPRESS rows,
+    #   (b) then also drop DIAG rows on every non-terminal vertex,
+    #   (c) then transforms=[] (plain exact elimination — a provably valid
+    #       floor that always passes).
+    #
+    # Flag OFF (unset / != "1"): this whole block is skipped, so the path
+    # is byte-identical to the prior behaviour.
+    _prevalidate = os.environ.get("ALPHAGRAD_PREVALIDATE_MEASURE", "0") == "1"
+    # The REALIZED per-vertex specs after pruning, mirroring the input
+    # ``specs_list`` row layout (-1 in col 0 = unused slot). Off-policy
+    # bookkeeping consumes this; see the worker return-path note. When the
+    # flag is off (or no pruning happens) it stays None (no behaviour change).
+    realized_specs = None
+    if _prevalidate and transforms:
+        # Terminal vertex of THIS partial order — the only vertex with no
+        # downstream elimination within this callback (COMPRESS is already
+        # restricted to it above; DIAG on it is the safest to keep).
+        _terminal_vid = int(o_list[-1]) if o_list else None
+
+        def _probe(_t):
+            # Faithful oracle: the count_ops shape-pass raises the SAME
+            # AssertionError / ValueError / TypeError classes that would
+            # otherwise surface inside ``extract_jaxpr`` at measure time.
+            vertex_elimination_jaxpr(
+                config.jaxpr,
+                o_list,
+                consts,
+                *args,
+                argnums=config.argnums,
+                count_ops=True,
+                sparse_representation=config.sparse,
+                transforms=_t,
+            )
+
+        def _drop_compress(_t):
+            out = []
+            for _v, _rs in _t:
+                _kept = tuple(r for r in _rs if not isinstance(r, Compress))
+                if _kept:
+                    out.append((_v, _kept))
+            return out
+
+        def _terminal_only(_t):
+            # Keep transforms ONLY on the terminal vertex (drops every
+            # non-terminal DIAG/COMPRESS row).
+            return [
+                (_v, _rs) for _v, _rs in _t if _v == _terminal_vid
+            ]
+
+        _ladder = [
+            ("compress", _drop_compress(transforms)),
+            ("diag", _terminal_only(_drop_compress(transforms))),
+            ("empty", []),
+        ]
+        _pruned_level = None
+        try:
+            _probe(transforms)
+        except (AssertionError, ValueError, TypeError):
+            _n_before = sum(len(_rs) for _, _rs in transforms)
+            for _lvl, _cand in _ladder:
+                try:
+                    if _cand:
+                        _probe(_cand)
+                    transforms = _cand
+                    _pruned_level = _lvl
+                    break
+                except (AssertionError, ValueError, TypeError):
+                    continue
+            else:
+                transforms = []
+                _pruned_level = "empty"
+            _n_after = sum(len(_rs) for _, _rs in transforms)
+            print(
+                f"[PREVALIDATE] pruned {_n_before - _n_after} transforms "
+                f"(lvl={_pruned_level})",
+                flush=True,
+            )
+            # --- Off-policy bookkeeping: rebuild the REALIZED specs ---------
+            # The executed action (pruned transforms) != the sampled action.
+            # Reconstruct the per-vertex specs that correspond to the pruned
+            # transforms so the reward can be attributed to the action the
+            # env actually measured. NOTE: the Ray io_callback return
+            # signature is fixed to (tokens, eqn_ids, reward); threading
+            # ``realized_specs`` back into the PPO rollout buffer is a
+            # separate, bounded follow-up (see report). We compute it here so
+            # the plumbing has a single, correct source of truth to consume.
+            _kept_vids = {int(_v) for _v, _ in transforms}
+            realized_specs = np.array(specs_list, dtype=np.int32).copy()
+            for _vi, _vid in enumerate(o_list):
+                if int(_vid) not in _kept_vids:
+                    realized_specs[_vi, :, 0] = -1  # mark all slots unused
+
     ve = extract_jaxpr(
         config.jaxpr,
         config.argnums,
@@ -1645,22 +1762,141 @@ def _callback(
             _det_peak = None
     except Exception:
         _det_peak = None
-    # GATE 2 (post-compile memory gate): compiled, but before we EXECUTE, check
-    # the deterministic peak (temp+output+args from memory_analysis). If it
-    # would need more than the budget, skip the exec (the OOM-prone step) and
-    # RAISE -> logged [SENTINEL] (excluded from loss). NB memory_analysis can
-    # under-report GPU exec/autotuner workspace, so this is a backstop on top of
-    # GATE 1; primary protection is the size gate. 0 / unset = disabled.
-    _max_measure_mem_gib = float(os.environ.get("ALPHAGRAD_MAX_MEASURE_MEM_GIB", "0") or 0)
-    if (
-        _max_measure_mem_gib > 0
-        and _det_peak is not None
-        and _det_peak > _max_measure_mem_gib * (1024 ** 3)
-    ):
-        raise RuntimeError(
-            f"mem-gate: det_peak={_det_peak / 1024 ** 3:.2f}GiB > "
-            f"ALPHAGRAD_MAX_MEASURE_MEM_GIB={_max_measure_mem_gib} — skip exec"
-        )
+
+    # GATE 2 (post-compile per-device memory gate): compiled, but BEFORE we
+    # EXECUTE, decide whether the exec can fit on the measure device(s); if not,
+    # skip it (RAISE -> logged ``[SENTINEL] mem-gate``, excluded from loss).
+    # This is the ONLY reliable guard against the measure-GPU OOM: under
+    # ``ALPHAGRAD_SHARD_MEASURE`` an OOM happens INSIDE the NCCL collective ->
+    # ``rendezvous ... waiting`` -> an UNCATCHABLE hang (the job deadlocks), so
+    # it MUST be caught pre-exec.
+    #
+    # WHY A PER-ORDER PEAK ESTIMATE ALONE IS INSUFFICIENT (diagnosed on ConvNet
+    # seed-free Jacobian, 2-GPU sharded, gpu16): every single order's
+    # memory_analysis peak is tiny (<=0.7GiB/device) yet the actor still OOMs —
+    # the GPU's live use climbs (resident executables + replicated weights) and
+    # the XLA exec / conv-autotuner WORKSPACE (~2.5GiB transient, NOT in
+    # memory_analysis) is what trips the BFC allocator. So the gate combines a
+    # per-order estimate with LIVE free-memory checks, the decisive one being an
+    # absolute FLOOR on the remaining free: once free drops below the floor,
+    # EVERY further exec is skipped -> the collective is never entered without
+    # headroom for the (unpredicted) workspace -> no OOM, no hang.
+    #
+    # DETERMINISM: the sharded measure runs in ONE process that dispatches a
+    # single GSPMD executable across both GPUs, so this gate is evaluated ONCE
+    # per (order, specs) before the collective — there is no cross-process race.
+    # Even read as independent ranks, every input is identical across ranks: the
+    # estimate comes only from ``compiled_approx`` (byte-identical per cache key)
+    # and the live readings are the SAME physical per-device values regardless
+    # of which rank queries them (we take the MIN over the shared
+    # ``_shard_devices`` list). So all ranks reach the SAME skip decision and the
+    # collective is never half-skipped.
+    #
+    # KNOBS (all per-device):
+    #   ALPHAGRAD_MAX_MEASURE_MEM_GIB  static cap; 0/"auto" -> FRAC*bytes_limit;
+    #                                  negative -> gate fully disabled.
+    #   ALPHAGRAD_MEASURE_MEM_FRAC     (0.85) auto static-cap fraction of limit.
+    #   ALPHAGRAD_MEASURE_MEM_SAFETY   (2.0)  multiplier on the per-order estimate.
+    #   ALPHAGRAD_MEASURE_MEM_HEADROOM (0.90) estimate must fit 90% of live free.
+    #   ALPHAGRAD_MEASURE_MEM_FLOOR_GIB(8.0)  skip if live free < this floor —
+    #                                  covers the autotuner workspace the
+    #                                  estimate can't see. 0 disables the floor.
+    _gate_raw = (os.environ.get("ALPHAGRAD_MAX_MEASURE_MEM_GIB", "0") or "").strip().lower()
+    _gate_disabled = False
+    _gate_auto = _gate_raw in ("", "0", "0.0", "auto")
+    _max_measure_mem_gib = 0.0
+    if not _gate_auto:
+        try:
+            _max_measure_mem_gib = float(_gate_raw)
+        except ValueError:
+            _max_measure_mem_gib = 0.0
+        if _max_measure_mem_gib < 0:
+            _gate_disabled = True
+    _mem_safety = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_SAFETY", "2.0") or 2.0)
+    _mem_frac = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_FRAC", "0.85") or 0.85)
+    _mem_headroom = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_HEADROOM", "0.90") or 0.90)
+    _mem_floor = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_FLOOR_GIB", "8.0") or 8.0) * (1024 ** 3)
+
+    # Measure device(s) — the SAME list on every rank.
+    _gate_devices = []
+    if _shard_devices:
+        _gate_devices = list(_shard_devices)
+    elif callback_device is not None:
+        _gate_devices = [callback_device]
+
+    if (not _gate_disabled) and _gate_devices:
+        # Per-order conservative estimate (only when memory_analysis worked;
+        # else estimate stays None and only the live-free floor can fire).
+        _gate_est = None
+        if _det_peak is not None:
+            _ca_bytes = 0.0
+            if os.environ.get("ALPHAGRAD_SKIP_COST_ANALYSIS", "0") != "1":
+                try:
+                    _ca_probe = compiled_approx.cost_analysis() or {}
+                    if isinstance(_ca_probe, (list, tuple)):
+                        _ca_probe = _ca_probe[0] if _ca_probe else {}
+                    _ca_bytes = float(_ca_probe.get("bytes accessed", 0) or 0)
+                except Exception:
+                    _ca_bytes = 0.0
+            _gate_est = max(_det_peak, _ca_bytes) * _mem_safety
+
+        _static_budget = None
+        _live_free = None
+        try:
+            _stats0 = _gate_devices[0].memory_stats() or {}
+            _blim = int(_stats0.get("bytes_limit", 0) or 0)
+            if _max_measure_mem_gib > 0:
+                _static_budget = _max_measure_mem_gib * (1024 ** 3)
+            elif _blim > 0:
+                _static_budget = _mem_frac * _blim
+            _frees = []
+            for _d in _gate_devices:
+                _st = _d.memory_stats() or {}
+                _lim = int(_st.get("bytes_limit", 0) or 0)
+                # Conservative "used": the BFC allocator can hold large
+                # FREED-but-RESERVED regions (fragmentation) that a fresh exec
+                # allocation cannot reuse, so bytes_in_use ALONE under-counts
+                # OOM risk. Take the max of the live, peak, and any
+                # reserved/pool field exposed by memory_stats so the gate sees
+                # the true pressure on the device.
+                # NB do NOT include pool_bytes/peak_pool_bytes here — those
+                # report the BFC POOL SIZE (== bytes_limit once the pool has
+                # grown), not occupancy, so they would force free->0 and skip
+                # EVERY order. peak_bytes_in_use is the right fragmentation
+                # proxy: once a heavy order has peaked, the high-water stays up
+                # so subsequent execs see little free and skip — but it tracks
+                # real occupancy, not the pool ceiling.
+                _use = max(
+                    int(_st.get("bytes_in_use", 0) or 0),
+                    int(_st.get("peak_bytes_in_use", 0) or 0),
+                    int(_st.get("bytes_reserved", 0) or 0),
+                    int(_st.get("peak_bytes_reserved", 0) or 0),
+                )
+                if _lim > 0:
+                    _frees.append(_lim - _use)
+            if _frees:
+                _live_free = min(_frees)
+        except Exception:
+            pass
+
+        _why = []
+        if _gate_est is not None and _static_budget is not None and _gate_est > _static_budget:
+            _why.append(f"est {_gate_est / 1024 ** 3:.2f}G>static {_static_budget / 1024 ** 3:.1f}G")
+        if _gate_est is not None and _live_free is not None and _gate_est > _mem_headroom * _live_free:
+            _why.append(
+                f"est {_gate_est / 1024 ** 3:.2f}G>{_mem_headroom:g}*free {_live_free / 1024 ** 3:.1f}G"
+            )
+        if _mem_floor > 0 and _live_free is not None and _live_free < _mem_floor:
+            _why.append(f"free {_live_free / 1024 ** 3:.1f}G<floor {_mem_floor / 1024 ** 3:.1f}G")
+        if _why:
+            print(
+                f"[SENTINEL] mem-gate: per-device "
+                f"({'; '.join(_why)}) sharded={_shard_mesh is not None} — skip exec",
+                flush=True,
+            )
+            raise RuntimeError(
+                f"mem-gate: per-device limit reached ({'; '.join(_why)}) — skip exec"
+            )
     # ``compiled_exact`` is ONLY needed for the quality metrics
     # (cosine_sim, frob_residual). Those are meaningful only when the
     # elimination order is complete — graphax's ``jacve`` returns a

@@ -23,6 +23,12 @@ class PPOActor:
         self._impl = None  # built when `init_worker` is called with cpu_workers
 
     def init_worker(self, cpu_workers: list | None = None) -> bool:
+        # Apply ALPHAGRAD_* policy switches threaded via args_dict BEFORE the
+        # policy module (heads) is imported/traced, so ALPHAGRAD_QUANT_ALLOWED /
+        # ALPHAGRAD_SUBSTEP_NO_END actually take effect in this actor (runtime_env
+        # delivery is unreliable at heads-import time). heads also reads lazily.
+        import os
+        os.environ.update(self.args_dict.get("_alphagrad_env", {}) or {})
         from alphagrad.approx.ppo_ray_worker import PPORayWorker
 
         self._impl = PPORayWorker(

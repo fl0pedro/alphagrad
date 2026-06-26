@@ -231,6 +231,71 @@ class CpuApproximationServer:
                 f"{type(exc).__name__}: {str(exc)[:180]}",
                 flush=True,
             )
+            # ---- EXTREMELY VERBOSE sentinel diagnostics (logging only) ----
+            # Dump everything needed to reproduce/understand which order +
+            # micro-action + dtype tripped graphax: full (untruncated) message,
+            # full traceback, the elimination order, and the DECODED per-vertex
+            # micro-action sequence (DIAG/COMPRESS/QUANT with dtype names).
+            try:
+                import traceback as _tb
+                from graphax.sparse.micro_actions import (
+                    QUANT_DTYPES as _QD,
+                    COMPRESS_KINDS as _CK,
+                )
+                from alphagrad.approx.env import (
+                    COMPRESS_SENTINEL as _CS,
+                    QUANT_SENTINEL as _QS,
+                )
+
+                _order_np = np.asarray(order).reshape(-1).tolist()
+                _specs_np = np.asarray(sparsity_specs)
+                _lines = []
+                _nv = min(_specs_np.shape[0], len(_order_np)) if _specs_np.ndim == 3 else 0
+                for _v in range(_nv):
+                    _rules = []
+                    for _slot in range(_specs_np.shape[1]):
+                        _r0 = int(_specs_np[_v, _slot, 0])
+                        _r1 = int(_specs_np[_v, _slot, 1])
+                        _r2 = int(_specs_np[_v, _slot, 2])
+                        if _r0 == -1:
+                            break  # end-of-sequence
+                        if _r0 >= 0:
+                            _rules.append(f"DIAG(bi1={_r0},bi2={_r1},factor={_r2})")
+                        elif _r0 == _CS:
+                            _kind = _CK[_r2] if 0 <= _r2 < len(_CK) else f"?{_r2}"
+                            _rules.append(f"COMPRESS(axis={_r1},kind={_kind})")
+                        elif _r0 == _QS:
+                            _dt = _QD[_r1] if 0 <= _r1 < len(_QD) else f"?{_r1}"
+                            _rules.append(f"QUANT(dtype={_dt})")
+                        else:
+                            _rules.append(f"UNKNOWN(row=[{_r0},{_r1},{_r2}])")
+                    if _rules:
+                        _lines.append(
+                            f"    v{_v}(vertex_id={_order_np[_v]}): "
+                            + " -> ".join(_rules)
+                        )
+                _decoded = "\n".join(_lines) if _lines else "    (no active micro-action rules)"
+                print(
+                    f"[SENTINEL-VERBOSE] ==================================================\n"
+                    f"[SENTINEL-VERBOSE] step={int(step)} order_len={_olen} "
+                    f"terminal={int(step) >= _olen} init={bool(init)} "
+                    f"point_idx={int(point_idx)}\n"
+                    f"[SENTINEL-VERBOSE] EXC {type(exc).__name__}: {exc!s}\n"
+                    f"[SENTINEL-VERBOSE] ORDER ({len(_order_np)}): {_order_np}\n"
+                    f"[SENTINEL-VERBOSE] MICRO-ACTIONS (per vertex, in elimination order):\n"
+                    f"{_decoded}\n"
+                    f"[SENTINEL-VERBOSE] TRACEBACK:\n{_tb.format_exc()}"
+                    f"[SENTINEL-VERBOSE] ==================================================",
+                    flush=True,
+                )
+            except Exception as _verbose_exc:
+                # Never let diagnostics logging mask the original sentinel.
+                print(
+                    f"[SENTINEL-VERBOSE] (diagnostics dump failed: "
+                    f"{type(_verbose_exc).__name__}: {_verbose_exc})",
+                    flush=True,
+                )
+            # ---- end verbose diagnostics ----
             sentinel_tokens = np.zeros((MAX_TOKENS,), dtype=np.int32)
             sentinel_eqn_ids = np.zeros((MAX_TOKENS,), dtype=np.int32)
             sentinel_reward = np.full((NUM_REWARDS,), -1e10, dtype=np.float32)
