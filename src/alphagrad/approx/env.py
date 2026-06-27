@@ -1365,7 +1365,11 @@ def _callback(
     # bookkeeping consumes this; see the worker return-path note. When the
     # flag is off (or no pruning happens) it stays None (no behaviour change).
     realized_specs = None
-    if _prevalidate and transforms:
+    # GATE: prevalidate runs the costly count_ops dry-run + prune-ladder
+    # ONLY on the terminal step. Non-terminal steps return early (below)
+    # without ever measuring, so the dry-run there was 100% waste
+    # (~1.9s/call on the GPU host). is_terminal is defined above (~L1179).
+    if _prevalidate and transforms and is_terminal:
         # Terminal vertex of THIS partial order — the only vertex with no
         # downstream elimination within this callback (COMPRESS is already
         # restricted to it above; DIAG on it is the safest to keep).
