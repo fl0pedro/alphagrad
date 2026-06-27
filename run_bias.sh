@@ -60,6 +60,7 @@ RAY_PORT="${RAY_PORT:-6385}"
 LAMBDA_ACC="${LAMBDA_ACC:-1.0}"
 LAMBDA_FROB="${LAMBDA_FROB:-0.0}"
 NDP="${NDP:-8}"                            # >= 8 for a trustworthy cross-sample mean
+MAXWALL="${MAXWALL:-0}"                     # >0 = stop after this many wall seconds
 
 MODELS_STR="${MODELS_STR:-VmappedNeuralNetwork}"
 read -r -a MODELS <<< "$MODELS_STR"
@@ -111,6 +112,7 @@ launch_one() {
       --advantage-norm scalar --ppo-epochs 4 --anti-degeneracy none \
       --cosine-lower-bound 0.0 --cosine-upper-bound 1.0 \
       --episodes $EPISODES --num-envs $NUM_ENVS --minibatches $MBS \
+      --max-wall-seconds $MAXWALL \
       --num-data-points $NDP --reps-per-point 2 \
       --best-sequences-json $OUT/best.json --best-sequences-every 5 \
       --calibrate-steps 0 --wandb $WANDB --wandb-project $WANDB_PROJECT > "$LOG" 2>&1
