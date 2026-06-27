@@ -1634,6 +1634,7 @@ class PPORayWorker:
             self.reward_weights_np.astype(np.float32),
             sentinel=SENTINEL_REWARD_VALUE,
             action_seq=per_env_actions,
+            dones_mask=buf_dones.astype(bool),
         )
 
         last_aux.update({
@@ -1652,7 +1653,16 @@ class PPORayWorker:
         # back-compat wandb log dict.
         for name, val in ch_stats["per_reward_means"].items():
             last_aux[f"reward_mean/{name}"] = float(val)
+        # Per-channel terminal-step means — the honest per-episode signal
+        # for the sparse-terminal quality channels (cossim / frob), which
+        # the per-step `reward_mean/<name>` dilutes with intermediate
+        # zero-reward steps. Restored to match the pre-merge PPO behaviour
+        # (and the C-MORL `reward_mean/<name>_terminal` definition):
+        # mean over the dones-masked terminal transitions.
+        for name, val in ch_stats.get("terminal_means", {}).items():
+            last_aux[f"reward_mean/{name}_terminal"] = float(val)
         last_aux["per_reward_means"] = ch_stats["per_reward_means"]
+        last_aux["per_reward_means_terminal"] = ch_stats.get("terminal_means", {})
         last_aux["best_per_reward"] = ch_stats["best_per_reward"]
         last_aux["best_overall_rewards"] = ch_stats["best_overall_rewards"]
         last_aux["best_overall_weighted"] = ch_stats["best_overall_weighted"]
