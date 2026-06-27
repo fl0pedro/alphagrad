@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=jactraj
-#SBATCH --time=04:00:00
+#SBATCH --time=02:45:00
 #SBATCH --output=/Users/assmuth/dsnn/jactraj_%j.out
 #SBATCH --partition=pgi15
 #SBATCH --nodes=1
