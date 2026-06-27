@@ -80,6 +80,10 @@ from graphax.sparse.micro_actions import NUM_QUANT_DTYPES
 # threshold semantics. Mirrored from ppo._NO_SYMLOG_REWARD_INDICES.
 _NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (REWARD_INDEX["cosine_sim"],)
 
+# Channel-index aliases used by the multiplicative cosine-gate reward.
+COSINE_SIM_IDX: int = REWARD_INDEX["cosine_sim"]
+FROB_RESIDUAL_IDX: int = REWARD_INDEX["frob_residual"]
+
 
 def _parse_lagrangian_constraints(specs: list) -> list[tuple[int, float, int]]:
     """Parse ``--lagrangian-constraint`` strings to (idx, threshold, sign).
@@ -458,6 +462,88 @@ class PPORayWorker:
         self.gae_lambda = float(getattr(self.args, "gae_lambda", 0.95))
         self.discount = float(getattr(self.args, "discount", 0.99))
         self.reward_weights_np = _build_reward_weights(self.args)
+
+        # --------------------------------------------------------------
+        # Multiplicative cosine-gate reward (ALPHAGRAD_REWARD_MODE=mult).
+        # --------------------------------------------------------------
+        # The default ("additive") path is byte-identical to the legacy
+        # behaviour: the scalar reward is sum(reward_vec * weights), with
+        # the cost channels stored negated (r = -cost, so cost->0 => r->0
+        # = its max) and cosine_sim in [0,1] * lambda_acc. That additive
+        # form is reward-hackable: a degenerate order can drive cost->0 and
+        # cosine->0 and still beat a faithful order, because the cost term
+        # alone reaches its maximum (0) while a faithful order pays cost.
+        #
+        # "mult" mode replaces the additive scalar with a FIDELITY-GATED
+        # CHEAPNESS product computed in ``_apply_mult_reward_gate``:
+        #     reward = g(cosine) * max(cheapness, 0)
+        # where g(cosine) in [0,1] -> 0 as cosine -> 0, and ``cheapness``
+        # is POSITIVE-oriented (larger = cheaper). cosine -> 0 => g -> 0 =>
+        # reward -> ~0 regardless of how cheap the order is, so the
+        # degenerate order can no longer be the reward-max.
+        #
+        # Implementation: the gated scalar is written into the cosine_sim
+        # channel of the reward buffer and the scalarising weights are
+        # collapsed to a one-hot on cosine_sim (weight 1.0). Every
+        # downstream consumer that scalarises via ``reward_weights``
+        # (per-channel GAE -> dot product, the scalar value-loss
+        # ``priority_weights`` dot product, and the milestone best/mean
+        # return) then picks out exactly the gated scalar. The RAW
+        # per-channel buffer is preserved untouched for per-channel
+        # logging (cosine_sim/cost means still report measured values).
+        self.reward_mode = str(
+            os.environ.get("ALPHAGRAD_REWARD_MODE", "additive")
+        ).strip().lower()
+        if self.reward_mode not in ("additive", "mult"):
+            raise ValueError(
+                f"ALPHAGRAD_REWARD_MODE must be 'additive' or 'mult', got "
+                f"{self.reward_mode!r}",
+            )
+        # Gate hyperparameters (only consulted in mult mode).
+        #   tau: fidelity floor; cosine <= tau => g = 0.
+        #   W:   cheapness offset; cheapness = W - sum_c |w_c|*symlog(cost_c).
+        #        Pick W >= typical max weighted symlog(cost) so faithful
+        #        orders keep cheapness > 0 (cheaper => larger). Clamped to
+        #        >= 0 so an unusually expensive order floors at 0 rather
+        #        than flipping sign (which would invert the incentive).
+        self.reward_gate_tau = float(
+            os.environ.get("ALPHAGRAD_REWARD_GATE_TAU", "0.5")
+        )
+        self.reward_gate_w = float(
+            os.environ.get("ALPHAGRAD_REWARD_GATE_W", "5.0")
+        )
+        # In mult mode the gated scalar lives entirely on the cosine_sim
+        # channel; collapse the scalarising weights to a one-hot so the
+        # GAE / value / milestone dot products recover it exactly. The
+        # gate already folds in the cost lambdas via ``cheapness``, so the
+        # raw cost weights would double-count if left in the dot product.
+        if self.reward_mode == "mult":
+            # Preserve the user's full weight vector for per-channel
+            # telemetry (the canonical weights collapse to one-hot below,
+            # which would otherwise zero the cost columns in the
+            # per-channel logging).
+            self._logging_weights_np = self.reward_weights_np.astype(np.float32).copy()
+            # Remember the user lambdas (|weight| per active cost channel)
+            # BEFORE collapsing — the gate uses them to weight per-channel
+            # symlog(cost) in ``cheapness``.
+            self._mult_cost_weights_np = np.abs(
+                self.reward_weights_np.astype(np.float32)
+            )
+            self._mult_cost_weights_np[COSINE_SIM_IDX] = 0.0
+            self._mult_cost_weights_np[FROB_RESIDUAL_IDX] = 0.0
+            collapsed = np.zeros_like(self.reward_weights_np)
+            collapsed[COSINE_SIM_IDX] = 1.0
+            self.reward_weights_np = collapsed.astype(np.float32)
+            print(
+                f"[ppo_ray] REWARD_MODE=mult: cosine-gate reward active "
+                f"(tau={self.reward_gate_tau}, W={self.reward_gate_w}); "
+                f"cost weights {self._mult_cost_weights_np.tolist()} folded "
+                f"into cheapness; scalarising weight = one-hot[cosine_sim]."
+            )
+        else:
+            self._mult_cost_weights_np = np.zeros_like(self.reward_weights_np)
+            self._logging_weights_np = self.reward_weights_np.astype(np.float32).copy()
+
         self.reward_weights = jnp.asarray(
             self.reward_weights_np, dtype=jnp.float32,
         )
@@ -772,6 +858,58 @@ class PPORayWorker:
         the per-component weight vector. Symlog is applied downstream
         by `get_advantages` (per the gae.py contract)."""
         return jnp.sum(reward_vec * self.reward_weights, axis=-1)
+
+    def _apply_mult_reward_gate(self, buf_reward_vec: np.ndarray) -> np.ndarray:
+        """Transform the raw per-channel reward buffer into the gated
+        representation used by the multiplicative cosine-gate reward.
+
+        ``buf_reward_vec`` is ``(T, N, NUM_REWARDS)`` of RAW per-channel
+        rewards: cost channels stored NEGATED (r = -cost, more negative =
+        worse), cosine_sim in [0,1]. Returns a NEW buffer (the caller
+        keeps the original for per-channel logging).
+
+        Gate::
+
+            g(cos)    = clip((cos - tau) / (1 - tau), 0, 1)      # fidelity
+            cheapness = max(0, W - sum_c |w_c| * symlog(cost_c))  # >0 = cheap
+            reward    = g(cos) * cheapness
+
+        where ``cost_c = -r_c`` (cost is the negated stored reward) and
+        symlog(cost_c) = symlog(-r_c) grows with cost, so a CHEAP order
+        (small cost) yields a LARGE positive cheapness. The gated scalar
+        is written into the cosine_sim channel and every other channel is
+        zeroed; the scalarising weights (one-hot[cosine_sim], set in
+        ``__init__``) then recover it exactly downstream.
+
+        SIGN: ``cheapness`` is built from the POSITIVE cost magnitude
+        (``-r_c``), NOT the negative stored reward, so it is never
+        multiplied by g while carrying a negative sign — a low-cosine
+        order (g -> 0) yields reward -> 0, never a spuriously-large
+        less-negative value. cosine -> 0 => reward -> ~0 regardless of
+        cheapness, which kills the cost->0/cosine->0 hack.
+        """
+        out = np.array(buf_reward_vec, dtype=np.float32, copy=True)
+        cos = out[..., COSINE_SIM_IDX]                       # (T, N), in [0,1]
+        tau = np.float32(self.reward_gate_tau)
+        denom = np.maximum(np.float32(1.0) - tau, np.float32(1e-6))
+        g = np.clip((cos - tau) / denom, 0.0, 1.0)           # (T, N)
+
+        # Per-channel positive cost magnitude = -stored_reward; symlog and
+        # weight by the user's |lambda| for each active cost channel. Only
+        # cost channels carry nonzero weight here (cosine/frob zeroed in
+        # __init__), so this never picks up the quality channels.
+        cost_mag = -out                                      # (T, N, R)
+        cost_sl = np.sign(cost_mag) * np.log1p(np.abs(cost_mag))
+        w = self._mult_cost_weights_np.astype(np.float32)    # (R,)
+        weighted_cost = (cost_sl * w[None, None, :]).sum(axis=-1)  # (T, N)
+        cheapness = np.maximum(
+            0.0, np.float32(self.reward_gate_w) - weighted_cost,
+        )                                                    # (T, N)
+
+        gated = (g * cheapness).astype(np.float32)           # (T, N)
+        out[...] = 0.0
+        out[..., COSINE_SIM_IDX] = gated
+        return out
 
     # ------------------------------------------------------------------
     # JIT'd per-step act + JIT-side env update
@@ -1345,6 +1483,23 @@ class PPORayWorker:
                     f"reward_condition/{harder_name}_threshold_{op}"
                 ] = float(thresh)
 
+        # Keep the RAW per-channel buffer for per-channel logging
+        # (cosine_sim / cost means) — the mult-gate below overwrites
+        # the canonical buffer with the gated scalar, which must not
+        # corrupt the measured-channel telemetry.
+        buf_reward_vec_raw = np.array(buf_reward_vec, dtype=np.float32, copy=True)
+
+        # Multiplicative cosine-gate reward (ALPHAGRAD_REWARD_MODE=mult).
+        # Collapse the per-channel buffer into the fidelity-gated cheapness
+        # scalar on the cosine_sim channel BEFORE GAE/scalarisation. The
+        # one-hot[cosine_sim] weights set in __init__ then make every
+        # downstream dot product (GAE scalarise, scalar value loss, the
+        # milestone best/mean return) pick out exactly the gated scalar.
+        # ``additive`` mode leaves the buffer untouched (byte-identical to
+        # the legacy path).
+        if self.reward_mode == "mult":
+            buf_reward_vec = self._apply_mult_reward_gate(buf_reward_vec)
+
         # GAE over the rollout. Both modes use the same per-channel
         # tensor contract — the difference is whether symlog squashing
         # is applied inside GAE (scalar mode keeps it; gdpo mode drops
@@ -1388,7 +1543,12 @@ class PPORayWorker:
             # Pull the constrained channels across the rollout buffer.
             # (T, N, C) where C = #constraints. Reshape to match the (N, T)
             # advantages layout used by GAE.
-            picked = buf_reward_vec[:, :, self.constraint_indices_np]  # (T, N, C)
+            # Use the RAW per-channel buffer: the Lagrangian thresholds
+            # are expressed in measured-channel units (e.g. cosine_sim>=0.5,
+            # peak_memory<=1e8), so they must see the raw channels, not the
+            # mult-gate's collapsed cosine scalar. (`_raw` == canonical in
+            # additive mode.)
+            picked = buf_reward_vec_raw[:, :, self.constraint_indices_np]  # (T, N, C)
             picked = np.transpose(picked, (1, 0, 2))  # (N, T, C)
             # Symlog cost-family channels so the multipliers don't have to
             # bridge ~10⁹× channel-scale gaps; leave cosine_sim raw.
@@ -1669,9 +1829,16 @@ class PPORayWorker:
         # Per-channel best / mean / overall — same shape as MuZero's
         # `mu0_ray_worker` returns so the driver can use the shared
         # logging helpers.
+        # Per-channel telemetry uses the RAW measured buffer + the user's
+        # full weight vector. In mult mode the canonical ``buf_reward_vec``
+        # has been collapsed to the gated scalar on the cosine channel and
+        # ``reward_weights_np`` is one-hot, so feeding those here would
+        # zero out cost-channel reporting and overstate cosine. ``_raw``
+        # and ``_logging_weights_np`` are byte-identical to the canonical
+        # ones in additive mode.
         ch_stats = aggregate_per_channel_stats(
-            buf_reward_vec.astype(np.float32),
-            self.reward_weights_np.astype(np.float32),
+            buf_reward_vec_raw.astype(np.float32),
+            self._logging_weights_np.astype(np.float32),
             sentinel=SENTINEL_REWARD_VALUE,
             action_seq=per_env_actions,
             dones_mask=buf_dones.astype(bool),
