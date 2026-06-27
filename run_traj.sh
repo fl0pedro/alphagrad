@@ -46,6 +46,9 @@ EPISODES="${EPISODES:-1000}"
 WANDB="${WANDB:-offline}"
 WANDB_PROJECT="${WANDB_PROJECT:-dsnn-jac-gpu}"
 CAMP="${CAMP:-campaign_traj}"
+MEASURE_GRAD="${MEASURE_GRAD:-0}"   # 1 -> add --measure-grad (grad-mode; trajectory steps along scalar-loss gradient)
+GRAD_FLAG=""
+if [ "$MEASURE_GRAD" = "1" ]; then GRAD_FLAG="--measure-grad"; fi
 PPO_GPUS="${PPO_GPUS:-1}"
 RAY_PORT="${RAY_PORT:-6385}"
 LAMBDA_ACC="${LAMBDA_ACC:-1.0}"
@@ -90,7 +93,7 @@ launch_one() {
       --example $M --dataset mnist \
       --rewards cmp mem acc --cmp-type latency --mem-type peak_memory \
       --lambda-cmp $LCMP --lambda-mem $LMEM --lambda-acc $LAMBDA_ACC --lambda-frob $LAMBDA_FROB \
-      --measure-latency --dynamic-substeps --max-substeps 16 \
+      --measure-latency $GRAD_FLAG --dynamic-substeps --max-substeps 16 \
       --actor-num-gpus $PPO_GPUS --cpu-actor-num-gpus 1 --exec-on-gpu --num-cpu-workers 3 --cpu-cores-per-actor 8 --cpu-cores-shared \
       --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \
       --cpu-worker-recycle-every 0 \
