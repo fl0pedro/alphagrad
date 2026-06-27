@@ -62,6 +62,7 @@ MODELS_STR="${MODELS_STR:-VmappedNeuralNetwork}"
 read -r -a MODELS <<< "$MODELS_STR"
 NUM_ENVS="${NUM_ENVS:-4}"
 MBS="${MBS:-32}"
+MAX_SUBSTEPS="${MAX_SUBSTEPS:-16}"
 
 ULIM='ulimit -n $(ulimit -Hn) 2>/dev/null || ulimit -n 262144 2>/dev/null; ulimit -u $(ulimit -Hu) 2>/dev/null || true;'
 eval "$ULIM"
@@ -98,7 +99,7 @@ launch_one() {
       --measure-grad \
       --rewards cmp mem acc --cmp-type latency --mem-type peak_memory \
       --lambda-cmp $LCMP --lambda-mem $LMEM --lambda-acc $LAMBDA_ACC --lambda-frob $LAMBDA_FROB \
-      --measure-latency --dynamic-substeps --max-substeps 16 \
+      --measure-latency --dynamic-substeps --max-substeps $MAX_SUBSTEPS \
       --actor-num-gpus $PPO_GPUS --cpu-actor-num-gpus 1 --exec-on-gpu --num-cpu-workers 3 --cpu-cores-per-actor 8 --cpu-cores-shared \
       --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \
       --cpu-worker-recycle-every 0 \
