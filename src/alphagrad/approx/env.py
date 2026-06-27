@@ -2059,6 +2059,7 @@ def _callback(
 
     out_approxs: list = []
     out_exacts: list = []
+    out_args: list = []  # eval_args per quality point (trajectory proxy)
     latency_samples: list[float] = []
     peak_mem_samples: list[float] = []
 
@@ -2206,6 +2207,7 @@ def _callback(
                 _oe = compiled_exact(*eval_args_i)
                 jax.block_until_ready(_oe)
                 out_exacts.append(_oe)
+                out_args.append(list(eval_args_i))
 
             # Slow-order cutoff: if a single exec exceeded the cutoff, the
             # order is pathologically expensive — one sample is enough to know
@@ -2314,6 +2316,61 @@ def _callback(
         # frob_residual: P60 = worst-60% of the pool (higher = worse).
         cosine_sim = _percentile_pool(cosines, pk)
         frob_residual = _percentile_pool(frobs, pk)
+        # ---- Trajectory / multi-step cosine proxy (flag-gated) ----------
+        # ALPHAGRAD_QUALITY_PROXY=trajectory REPLACES the single-point
+        # cosine_sim with the mean approx-vs-exact cosine over K+1 points
+        # obtained by taking K small SGD steps ALONG THE EXACT GRADIENT
+        # (the cleaner signal) from the rollout-sampled theta0. Measures
+        # whether fidelity HOLDS as params move — the cheap surrogate of
+        # B_kstep. Reuses compiled_approx/compiled_exact (static shapes ->
+        # re-execute, no recompile). Terminal-only; value stays in [0,1]
+        # so the multiplicative cosine-gate (REWARD_MODE=mult) is unchanged.
+        if os.environ.get("ALPHAGRAD_QUALITY_PROXY", "") == "trajectory":
+            _K = int(os.environ.get("ALPHAGRAD_TRAJ_STEPS", "3"))
+            _lr = float(os.environ.get("ALPHAGRAD_TRAJ_LR", "0.1"))
+            _argnums = tuple(config.argnums or ())
+            _take2 = config.has_aux or config.measure_grad
+            _traj_cos: list = list(cosines)  # base point already measured
+            if _K > 0 and _argnums and out_args:
+                for _pt_args, _oe0 in zip(out_args, out_exacts):
+                    _cur = list(_pt_args)
+                    # exact grads at theta0 (tuple over argnums) live at [1]
+                    _g = _oe0[1] if _take2 else _oe0
+                    _g_leaves = _g if isinstance(_g, (tuple, list)) else (_g,)
+                    for _ks in range(_K):
+                        # SGD step along the EXACT gradient on each argnum leaf
+                        for _ai, _an in enumerate(_argnums):
+                            try:
+                                _cur[_an] = _cur[_an] - _lr * _g_leaves[_ai]
+                            except Exception:
+                                pass
+                        try:
+                            _oa_s = compiled_approx(*_cur)
+                            _oe_s = compiled_exact(*_cur)
+                            jax.block_until_ready((_oa_s, _oe_s))
+                        except Exception as _e:
+                            if os.environ.get("ALPHAGRAD_DEBUG_QUALITY", "0") == "1":
+                                print(f"[traj-proxy] step exec failed: {_e}", flush=True)
+                            break
+                        _ja = _oa_s[1] if _take2 else _oa_s
+                        _je = _oe_s[1] if _take2 else _oe_s
+                        _c_s, _ = _quality_metrics(_je, _ja)
+                        _traj_cos.append(_c_s)
+                        # next step uses EXACT grads at the NEW theta
+                        _g = _je
+                        _g_leaves = _g if isinstance(_g, (tuple, list)) else (_g,)
+                # Mean over all K+1 points; clamp to [0,1] like the gate path.
+                _tc = [float(x) for x in _traj_cos if np.isfinite(float(x))]
+                if _tc:
+                    _traj_val = float(np.mean(_tc))
+                    cosine_sim = max(0.0, min(1.0, _traj_val))
+                if os.environ.get("ALPHAGRAD_DEBUG_QUALITY", "0") == "1":
+                    print(
+                        f"[traj-proxy] K={_K} lr={_lr} npts={len(out_args)} "
+                        f"base_cos={_percentile_pool(cosines, pk):.4f} "
+                        f"traj_cos={cosine_sim:.4f} nvals={len(_tc)}",
+                        flush=True,
+                    )
     else:
         cosine_sim = 0.0
         frob_residual = 0.0
