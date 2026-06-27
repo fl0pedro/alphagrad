@@ -60,7 +60,7 @@ ULIM='ulimit -n $(ulimit -Hn) 2>/dev/null || ulimit -n 262144 2>/dev/null; ulimi
 eval "$ULIM"
 
 NODE0=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n 1p)
-HEAD_IP=$(srun --nodes=1 --nodelist=$NODE0 hostname -i | awk '{print $1}')
+HEAD_IP=$(hostname -i | awk '{print $1}')  # batch script already runs on NODE0; avoid srun-step contention
 echo "########## JACTRAJ $(date) | head=$NODE0 eps=$EPISODES models=${MODELS[*]} PROXY=trajectory K=$ALPHAGRAD_TRAJ_STEPS lr=$ALPHAGRAD_TRAJ_LR MODE=mult ##########"
 echo "==== BANNER: env import path check ===="
 uv run --no-sync python -c "import alphagrad.approx.env as e; print('ENV_IMPORT:', e.__file__)"
