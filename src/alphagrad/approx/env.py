@@ -1090,6 +1090,64 @@ def _quality_metrics(jac_exact, jac_approx):
     return cos, rel_frob
 
 
+def _estimator_bias(out_exacts, out_approxs, take_second):
+    """Estimator-bias quality proxy (bias half of the gradient-error
+    bias/variance decomposition).
+
+    Forms the CROSS-SAMPLE MEAN of the raw per-sample gradient pytrees on
+    BOTH the exact and approx side (after layout-aligning each approx leaf to
+    its exact leaf via ``_align_jac``), flattens both means, and returns
+
+        bias = || mean_s(g_approx) - mean_s(g_exact) || / max(|| mean_s(g_exact) ||, eps)
+
+    This is fundamentally different from the per-sample cosine: a SYSTEMATIC
+    tilt that is consistent across samples survives the average (high bias →
+    converged-to-wrong-optimum), whereas zero-mean per-sample noise averages
+    out (low bias → unbiased-but-noisy, trains fine). The single-call
+    all-points path (``point_idx=-1``) is what makes the mean formable — every
+    per-sample (approx, exact) pytree lands in ``out_*`` together.
+
+    Returns ``(bias, quality)`` where ``quality = exp(-bias) in (0,1]`` so the
+    multiplicative gate (REWARD_MODE=mult) treats 0 bias as quality 1.0 and a
+    large systematic bias as quality -> 0. A degenerate/incomparable set
+    (no pairs, shape mismatch, or non-finite) scores worst-case
+    ``(bias=1.0, quality=0.0)`` — mirroring ``_quality_metrics``.
+    """
+    n = len(out_exacts)
+    if n == 0:
+        return 1.0, 0.0
+    sum_exact = None
+    sum_approx = None
+    for out_approx, out_exact in zip(out_approxs, out_exacts):
+        jac_approx = out_approx[1] if take_second else out_approx
+        jac_exact = out_exact[1] if take_second else out_exact
+        # Layout-align approx leaves to exact layout (transpose-back) so the
+        # per-leaf means accumulate the SAME entries, not a transposed artifact.
+        jac_approx = _align_jac(jac_approx, jac_exact)
+        if sum_exact is None:
+            sum_exact = jac_exact
+            sum_approx = jac_approx
+        else:
+            sum_exact = jax.tree_util.tree_map(jnp.add, sum_exact, jac_exact)
+            sum_approx = jax.tree_util.tree_map(jnp.add, sum_approx, jac_approx)
+    inv = 1.0 / float(n)
+    mean_exact = jax.tree_util.tree_map(lambda x: x * inv, sum_exact)
+    mean_approx = jax.tree_util.tree_map(lambda x: x * inv, sum_approx)
+    flat_exact = _flatten_jacobians(mean_exact)
+    flat_approx = _flatten_jacobians(mean_approx)
+    if flat_exact is None or flat_approx is None:
+        return 1.0, 0.0
+    if flat_approx.shape != flat_exact.shape or flat_approx.size == 0:
+        return 1.0, 0.0
+    flat_exact = jnp.real(flat_exact)
+    flat_approx = jnp.real(flat_approx)
+    exact_norm = jnp.linalg.norm(flat_exact)
+    diff_norm = jnp.linalg.norm(flat_exact - flat_approx)
+    bias = diff_norm / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
+    bias = float(jnp.where(jnp.isfinite(bias), bias, jnp.float32(1.0)))
+    quality = float(np.exp(-bias))
+    return bias, quality
+
 def _aggregate_samples(values, want_top_quartile: bool):
     """Reduce a list of per-sample scalars to a single jnp scalar.
 
@@ -2314,6 +2372,23 @@ def _callback(
         # frob_residual: P60 = worst-60% of the pool (higher = worse).
         cosine_sim = _percentile_pool(cosines, pk)
         frob_residual = _percentile_pool(frobs, pk)
+        # Estimator-bias quality proxy (ALPHAGRAD_QUALITY_PROXY=bias):
+        # overwrite the cosine_sim channel with exp(-bias), where bias is the
+        # norm of (mean approx grad - mean exact grad) over all data points,
+        # relative to the mean exact-grad norm. Requires the cross-sample mean,
+        # which is formable here only because the single-call all-points path
+        # (point_idx=-1) collected every per-sample pytree into out_*. Default
+        # (proxy != "bias") leaves cosine_sim untouched => byte-identical.
+        if os.environ.get("ALPHAGRAD_QUALITY_PROXY", "cosine") == "bias":
+            _bias, _bias_q = _estimator_bias(out_exacts, out_approxs, _take_second)
+            cosine_sim = _bias_q
+            if os.environ.get("ALPHAGRAD_DEBUG_QUALITY", "0") == "1":
+                print(
+                    f"[quality-debug] estimator_bias bias={_bias:+.4f} "
+                    f"quality=exp(-bias)={_bias_q:.4f} npairs={len(out_exacts)} "
+                    f"(per-sample cosine P{int(pk*100)}={_percentile_pool(cosines, pk):+.4f})",
+                    flush=True,
+                )
     else:
         cosine_sim = 0.0
         frob_residual = 0.0
