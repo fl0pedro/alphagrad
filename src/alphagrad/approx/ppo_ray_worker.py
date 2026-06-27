@@ -328,6 +328,33 @@ class PPORayWorker:
         # API). When None, `_fan_out_tokenize` falls back to the naive
         # per-actor `ray.get` path (no timeout — original behaviour).
         self._cpu_pool = None
+        # ALPHAGRAD_LOCAL_TOKENIZE=1: compute non-terminal state-tokens
+        # in-process on the trainer (skip the per-step Ray round-trip).
+        # Default OFF -> byte-identical to the all-Ray path. Only valid
+        # under ``terminal_rewards_only`` (non-terminal rewards zeroed,
+        # tokens a pure deterministic fn of (order, specs, step)).
+        self._local_tokenize_enabled = (
+            os.environ.get("ALPHAGRAD_LOCAL_TOKENIZE", "0") == "1"
+        )
+        # Process-local in-proc server for the local-tokenize path.
+        # Built once in ``init_server`` (and lazily on first use as a
+        # fallback). Reuses the same ``env._callback`` the CPU pool runs.
+        self._in_proc_server = None
+        # ``--terminal-rewards-only`` was renamed to
+        # ``--intermediate-rewards`` (BooleanOptionalAction, default
+        # False). Derive terminal_rewards_only the same way the CPU
+        # actor does (cpu_approx_worker._build_env_from_args), so the
+        # trainer's own env (and the in-proc server built from it) agree
+        # with the pool on whether non-terminal steps skip the heavy
+        # jacve compile/exec. Fall back to the legacy key.
+        if hasattr(self.args, "intermediate_rewards"):
+            self._terminal_rewards_only = not bool(
+                self.args.intermediate_rewards
+            )
+        else:
+            self._terminal_rewards_only = bool(
+                getattr(self.args, "terminal_rewards_only", False)
+            )
         # Checkpoint path is captured here; loading happens after the
         # agent + opt_state templates are constructed (so eqx has
         # something to fill the leaves into).
@@ -376,9 +403,7 @@ class PPORayWorker:
             mem_type=self.args.mem_type,
             exec_on_gpu=getattr(self.args, "exec_on_gpu", False),
             measure_latency=measure_latency,
-            terminal_rewards_only=getattr(
-                self.args, "terminal_rewards_only", False,
-            ),
+            terminal_rewards_only=self._terminal_rewards_only,
         )
         eval_samples = generate_eval_samples(
             env, eval_key, int(self.args.num_eval_samples),
@@ -1185,13 +1210,28 @@ class PPORayWorker:
             # steps stay on the cheap tokenize-only batch path. Grafted
             # from the approx branch — additive, gated entirely on the
             # ``--measure-queue`` flag (default off keeps theirs' path).
+            _is_terminal_step = t == T - 1
+            _local_tokenize = (
+                not _is_terminal_step
+                and self._local_tokenize_enabled
+                and self._terminal_rewards_only
+            )
             if (
-                t == T - 1
+                _is_terminal_step
                 and getattr(self.args, "measure_queue", False)
-                and getattr(self.args, "terminal_rewards_only", False)
+                and self._terminal_rewards_only
             ):
                 tokens_np, eqn_ids_np, reward_np, sentinel_mask = (
                     self._fan_out_terminal_queue(order_np, specs_np, step_np)
+                )
+            elif _local_tokenize:
+                # Non-terminal step under ``terminal_rewards_only`` with
+                # ALPHAGRAD_LOCAL_TOKENIZE=1: the reward is zeroed
+                # (env.py early-return) and the tokens are a pure
+                # deterministic fn of (order, specs, step), so compute
+                # them in-process and skip the ~2 s/step Ray round-trip.
+                tokens_np, eqn_ids_np, reward_np, sentinel_mask = (
+                    self._tokenize_local(order_np, specs_np, step_np)
                 )
             else:
                 tokens_np, eqn_ids_np, reward_np, sentinel_mask = (
@@ -1926,6 +1966,68 @@ class PPORayWorker:
             (self.reward_weights_np != 0.0).astype(np.float32)
         )
 
+    def _ensure_in_proc_server(self):
+        """Lazily build the process-local ``CpuApproximationServer``.
+
+        Reuses the already-constructed env so the in-proc path runs the
+        exact same ``env._callback`` the CPU pool's actors run — the
+        tokenizer output is therefore byte-identical to the pool path
+        for the (deterministic) non-terminal steps.
+        """
+        if self._in_proc_server is None:
+            from alphagrad.approx.cpu_approx_worker import (
+                CpuApproximationServer,
+            )
+            self._in_proc_server = CpuApproximationServer.from_env(self.env)
+            # Pin the non-terminal tokenize to a CPU device. The
+            # tokenizer is pure symbolic/graph work (graphax
+            # _build_graph) — it does NOT need the GPU, and running it
+            # on the PPOActor's GPU (device 0) steals memory from
+            # ``jit_update_step`` and OOMs the PPO weight update. The CPU
+            # pool actors run on CPU devices too, so this also keeps the
+            # local path byte-identical to the pool path.
+            try:
+                self._tokenize_device = jax.devices("cpu")[0]
+            except Exception:
+                self._tokenize_device = None
+        return self._in_proc_server
+
+    def _tokenize_local(self, order_np, specs_np, step_np):
+        """Compute non-terminal state-tokens IN-PROCESS (no Ray).
+
+        For the NON-TERMINAL steps under ``terminal_rewards_only`` the
+        reward is zeroed (``env._callback`` early-returns before any
+        jacve compile / cost_analysis) and the tokens are a pure
+        deterministic fn of ``(order, specs, step)``. So we run the same
+        ``env._callback`` locally via the in-proc server, skipping the
+        ~2 s/step Ray round-trip (~99% of which is Ray overhead).
+
+        Returns the same ``(tokens, eqn_ids, rewards, sentinel_mask)``
+        contract as ``_fan_out_tokenize`` — ``rewards`` is all-zero and
+        ``sentinel_mask`` is all-False (the local path never times out;
+        a callback exception still raises, surfacing the bug rather than
+        masking it on the cheap deterministic path).
+        """
+        server = self._ensure_in_proc_server()
+        N = order_np.shape[0]
+        dev = getattr(self, "_tokenize_device", None)
+        if dev is not None:
+            with jax.default_device(dev):
+                out = [
+                    server.evaluate(order_np[i], specs_np[i], int(step_np[i]))
+                    for i in range(N)
+                ]
+        else:
+            out = [
+                server.evaluate(order_np[i], specs_np[i], int(step_np[i]))
+                for i in range(N)
+            ]
+        tokens = np.stack([r[0] for r in out])
+        eqn_ids = np.stack([r[1] for r in out])
+        rewards = np.zeros((N, NUM_REWARDS), dtype=np.float32)
+        sentinel_mask = np.zeros((N,), dtype=bool)
+        return tokens, eqn_ids, rewards, sentinel_mask
+
     def _fan_out_tokenize(self, order_np, specs_np, step_np):
         """Ship the (order, specs, step) triple for each env to a CPU
         actor and collect (tokens, eqn_ids, reward) back.
@@ -1952,13 +2054,9 @@ class PPORayWorker:
         if not self.cpu_workers:
             # In-process fallback — useful for local smoke tests where
             # we don't want to spin up a Ray cluster.
-            if not hasattr(self, "_in_proc_server"):
-                from alphagrad.approx.cpu_approx_worker import (
-                    CpuApproximationServer,
-                )
-                self._in_proc_server = CpuApproximationServer.from_env(self.env)
+            server = self._ensure_in_proc_server()
             out = [
-                self._in_proc_server.evaluate(
+                server.evaluate(
                     order_np[i], specs_np[i], int(step_np[i]),
                 )
                 for i in range(N)
@@ -2138,4 +2236,9 @@ class PPORayWorker:
             frob_residual_idx=int(_REWARD_INDEX["frob_residual"]),
         )
         self._cpu_pool_recycle_every = int(recycle_every)
+        # Build the process-local in-proc server up front when the
+        # local-tokenize path is enabled, so the first non-terminal step
+        # doesn't pay the env-reuse setup cost mid-rollout.
+        if self._local_tokenize_enabled:
+            self._ensure_in_proc_server()
         return True
