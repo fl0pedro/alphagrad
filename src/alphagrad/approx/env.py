@@ -1444,6 +1444,18 @@ def _callback(
                 if int(_vid) not in _kept_vids:
                     realized_specs[_vi, :, 0] = -1  # mark all slots unused
 
+    # STATE-TOKENIZER integration (GRAPHAX_STATE_TOKENS=1, palimpsapprox-
+    # statetok branch): graphax's gated state-tokenizer path keys off the
+    # ``o_list`` (elimination order) + ``transforms`` (per-vertex DIAG/
+    # COMPRESS/QUANT micro-actions) we already pass here, emitting an
+    # append-only, ~order-of-magnitude-shorter token stream
+    #     <original-graph tokens> | <order ; per-vertex micro-actions>
+    # instead of re-tracing the fused Jacobian every step. That stream is a
+    # lossless sufficient statistic for the APPROXIMATED policy STATE (it is
+    # only the policy's state encoding -- the measured computation below still
+    # runs the untouched jacve/AD path). When the env var is unset this call
+    # is byte-identical to the legacy re-traced tokenizer. No change to the
+    # call itself is needed: the gate lives in graphax.extract_jaxpr.
     ve = extract_jaxpr(
         config.jaxpr,
         config.argnums,
