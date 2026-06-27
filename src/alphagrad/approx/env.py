@@ -1090,6 +1090,80 @@ def _quality_metrics(jac_exact, jac_approx):
     return cos, rel_frob
 
 
+def _bkstep_score(
+    compiled_approx,
+    compiled_exact,
+    eval_args_list,
+    argnums,
+    K: int = 3,
+    lr: float = 0.1,
+    eps: float = 1e-8,
+):
+    """B_kstep-light QUALITY proxy.
+
+    For each data-point arg-set in ``eval_args_list`` (the S "seeds"), take K
+    SGD steps on the env's small proxy model using (a) the APPROX gradient
+    (``compiled_approx`` -> ``(scalar_loss, grads)``) and (b) the EXACT gradient
+    (``compiled_exact``). Both compiled fns are reused as-is (NO new compile):
+    in grad mode they return ``(value, grads)`` where ``value`` IS the scalar
+    training loss and ``grads`` is a tuple aligned with ``argnums``.
+
+    Score (terminal-only, in [0,1]):
+        score = clip( mean_s(drop_a_s) / max(mean_s(drop_e_s), eps), 0, 1 )
+    where ``drop = loss_initial - loss_after_K_SGD_steps`` along that path.
+
+    A faithful approx grad descends ~as well as exact -> drop_a≈drop_e -> ~1.
+    A degenerate/garbage approx grad fails to descend (or ascends) -> drop_a≈0
+    or <0 -> score≈0. Discriminative by construction.
+    """
+    argnums = tuple(int(a) for a in argnums)
+
+    def _apply_grads(args_list, grads):
+        # grads is a tuple aligned with argnums (value_and_grad ordering).
+        new = list(args_list)
+        for slot, g in zip(argnums, grads):
+            new[slot] = new[slot] - lr * g
+        return new
+
+    def _path_drop(compiled, args0):
+        # Initial loss + first grad from one call.
+        out0 = compiled(*args0)
+        loss0 = jnp.real(jnp.asarray(out0[0], dtype=jnp.float32))
+        grads = out0[1]
+        args = list(args0)
+        loss_last = loss0
+        for _ in range(int(K)):
+            args = _apply_grads(args, grads)
+            out = compiled(*args)
+            loss_last = jnp.real(jnp.asarray(out[0], dtype=jnp.float32))
+            grads = out[1]
+        return loss0 - loss_last  # positive = the path reduced the loss
+
+    drops_a = []
+    drops_e = []
+    for args_i in eval_args_list:
+        try:
+            da = float(_path_drop(compiled_approx, args_i))
+            de = float(_path_drop(compiled_exact, args_i))
+        except Exception:
+            # A degenerate plan whose grad pytree mismatches the params (shape
+            # collapse) cannot SGD-step -> failed approximation -> worst score.
+            return 0.0
+        if not (np.isfinite(da) and np.isfinite(de)):
+            return 0.0
+        drops_a.append(da)
+        drops_e.append(de)
+
+    if not drops_e:
+        return 0.0
+    mean_a = float(np.mean(drops_a))
+    mean_e = float(np.mean(drops_e))
+    score = mean_a / max(mean_e, eps)
+    if not np.isfinite(score):
+        return 0.0
+    return float(min(max(score, 0.0), 1.0))
+
+
 def _aggregate_samples(values, want_top_quartile: bool):
     """Reduce a list of per-sample scalars to a single jnp scalar.
 
@@ -2314,6 +2388,44 @@ def _callback(
         # frob_residual: P60 = worst-60% of the pool (higher = worse).
         cosine_sim = _percentile_pool(cosines, pk)
         frob_residual = _percentile_pool(frobs, pk)
+        # ---- B_kstep-light quality proxy (flag-gated) -----------------
+        # ALPHAGRAD_QUALITY_PROXY=bkstep REPLACES the cosine_sim quality
+        # value (channel 6) with a K-step SGD true-loss-drop ratio in
+        # [0,1], so the multiplicative cosine-gate reward gates on the
+        # learning-rule's actual descent fidelity instead of single-point
+        # Jacobian cosine. Terminal-only; reuses compiled_approx/
+        # compiled_exact (no new compile). Requires grad mode (the
+        # compiled fns must return (scalar_loss, grads)); otherwise we
+        # keep the cosine value byte-identical to the default path.
+        if os.environ.get('ALPHAGRAD_QUALITY_PROXY', '') == 'bkstep':
+            _bk_ok = (config.measure_grad or config.has_aux) and compiled_exact is not None
+            if _bk_ok:
+                try:
+                    _bk_K = int(os.environ.get('ALPHAGRAD_BKSTEP_K', '3'))
+                    _bk_S = int(os.environ.get('ALPHAGRAD_BKSTEP_S', '2'))
+                    _bk_lr = float(os.environ.get('ALPHAGRAD_BKSTEP_LR', '0.1'))
+                    # Reconstruct the per-data-point arg-sets exactly as the
+                    # exec loop did; take the first _bk_S of them as seeds.
+                    _bk_args = []
+                    for _bd in _point_iter[:max(_bk_S, 1)]:
+                        if eval_samples:
+                            _bk_ai = [arg[_bd] for arg in eval_samples]
+                        else:
+                            _bk_ai = list(args)
+                        if callback_device is not None or _shard_mesh is not None:
+                            _bk_ai = _put_measure(_bk_ai)
+                        _bk_args.append(_bk_ai)
+                    cosine_sim = _bkstep_score(
+                        compiled_approx, compiled_exact, _bk_args,
+                        config.argnums, K=_bk_K, lr=_bk_lr,
+                    )
+                    if os.environ.get('ALPHAGRAD_DEBUG_QUALITY', '0') == '1':
+                        print(f'[bkstep] score={cosine_sim:.4f} cos_orig='
+                              f'{_percentile_pool(cosines, pk):.4f} '
+                              f'K={_bk_K} S={len(_bk_args)} lr={_bk_lr}', flush=True)
+                except Exception as _bk_e:
+                    if os.environ.get('ALPHAGRAD_DEBUG_QUALITY', '0') == '1':
+                        print(f'[bkstep] FAILED ({_bk_e!r}) -> cosine fallback', flush=True)
     else:
         cosine_sim = 0.0
         frob_residual = 0.0
