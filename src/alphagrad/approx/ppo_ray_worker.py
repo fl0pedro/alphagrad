@@ -907,6 +907,50 @@ class PPORayWorker:
         )                                                    # (T, N)
 
         gated = (g * cheapness).astype(np.float32)           # (T, N)
+
+        # --------------------------------------------------------------
+        # ANTI-BLIND fidelity-pull (ALPHAGRAD_GATE_FIDELITY_PULL, default
+        # ON). The legacy gate g(cos)=clip((cos-tau)/(1-tau),0,1) returns
+        # EXACTLY 0 for every rule with quality (cos) <= tau. In a
+        # degenerate basin (e.g. the int-Quant collapse where every sampled
+        # rule has ||approx||=0 -> quality 0) the whole reward buffer is 0,
+        # so PPO sees zero advantage variance and the policy drifts, never
+        # escaping (this is exactly how B_kstep collapsed). The pull adds a
+        # SMALL, monotone-in-quality term so a low-but-nonzero-quality rule
+        # gets a POSITIVE reward and a gradient toward fidelity, restoring
+        # early traction. ``cos`` here is the EFFECTIVE quality already
+        # floored by the env-side cosine-direction floor
+        # (ALPHAGRAD_GATE_COS_FLOOR), so a direction-preserving int-Quant
+        # rule has cos>0 -> a positive pull, while a degenerate ||approx||=0
+        # rule has direction-cosine 0 -> effective quality 0 -> pull 0,
+        # so the ANTI-HACK property (degenerate cheap rule -> reward ~0) is
+        # preserved: the pull is multiplied by quality, which is 0 for the
+        # degenerate rule regardless of how cheap it is.
+        if os.environ.get("ALPHAGRAD_GATE_FIDELITY_PULL", "1") == "1":
+            eps = np.float32(
+                float(os.environ.get("ALPHAGRAD_GATE_PULL_EPS", "0.25"))
+            )
+            # Quality threshold below which the pull is forced to 0 — keeps
+            # a strictly-degenerate (quality==0) rule at reward 0. Any rule
+            # with quality > q_min (the direction floor already lifts
+            # direction-preserving rules above 0) earns the pull.
+            q_min = np.float32(
+                float(os.environ.get("ALPHAGRAD_GATE_PULL_QMIN", "1e-4"))
+            )
+            quality = np.clip(cos, 0.0, 1.0)                 # (T, N)
+            active = (quality > q_min).astype(np.float32)    # (T, N)
+            # Scale the pull by cheapness so it stays commensurate with the
+            # gated term (same units) and a faithful+cheap rule still
+            # dominates a faithful+expensive one. Floor cheapness at a small
+            # positive value ONLY for the pull, so a cheap faithful rule
+            # whose cheapness clamped to 0 still gets the fidelity gradient
+            # (the gated term g*cheapness is unaffected).
+            pull_cheap = np.maximum(
+                cheapness, np.float32(self.reward_gate_w) * np.float32(0.1),
+            )
+            pull = (eps * quality * active * pull_cheap).astype(np.float32)
+            gated = (gated + pull).astype(np.float32)
+
         out[...] = 0.0
         out[..., COSINE_SIM_IDX] = gated
         return out
