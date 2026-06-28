@@ -2371,6 +2371,40 @@ def _callback(
                         f"traj_cos={cosine_sim:.4f} nvals={len(_tc)}",
                         flush=True,
                     )
+        # ----------------------------------------------------------
+        # ANTI-BLIND cosine-direction floor (ALPHAGRAD_GATE_COS_FLOOR,
+        # default ON). The active quality proxy (trajectory / bias /
+        # bkstep) OVERWRITES cosine_sim above; in a degenerate basin
+        # the proxy quality can be 0 for every sampled rule even when the
+        # rule still preserves gradient DIRECTION (a non-descent but
+        # direction-faithful int-Quant rule). That blinds the
+        # multiplicative gate (reward exactly 0 -> no PPO advantage). The
+        # base single-point approx-vs-exact cosine (_base_cos =
+        # _percentile_pool(cosines, pk), computed above before the proxy
+        # overwrite) is a DENSE direction signal: 0 for a ||approx||=0
+        # degenerate rule (cossim of a zero vector is 0, so ANTI-HACK is
+        # preserved) but >0 for a direction-preserving rule. Blend it in
+        # as a small floor so such rules get partial credit and the gate
+        # keeps a gradient toward fidelity -- exactly what let the
+        # trajectory proxy escape the basin and what B_kstep needs.
+        if os.environ.get('ALPHAGRAD_GATE_COS_FLOOR', '1') == '1':
+            try:
+                _floor_lambda = float(
+                    os.environ.get('ALPHAGRAD_GATE_COS_FLOOR_LAMBDA', '0.3')
+                )
+                _base_cos = float(_percentile_pool(cosines, pk))
+                _base_cos = max(0.0, min(1.0, _base_cos))
+                _eff_q = max(float(cosine_sim), _floor_lambda * _base_cos)
+                cosine_sim = max(0.0, min(1.0, _eff_q))
+                if os.environ.get('ALPHAGRAD_DEBUG_QUALITY', '0') == '1':
+                    print(
+                        f'[cos-floor] lambda={_floor_lambda} '
+                        f'base_cos={_base_cos:.4f} -> eff_quality='
+                        f'{cosine_sim:.4f}', flush=True,
+                    )
+            except Exception as _cf_e:
+                if os.environ.get('ALPHAGRAD_DEBUG_QUALITY', '0') == '1':
+                    print(f'[cos-floor] skipped ({_cf_e!r})', flush=True)
     else:
         cosine_sim = 0.0
         frob_residual = 0.0
