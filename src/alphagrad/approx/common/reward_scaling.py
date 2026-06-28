@@ -421,6 +421,23 @@ def aggregate_per_channel_stats(
     weighted_per_env = r_per_env * reward_weights_np  # (N, NUM_REWARDS)
     per_env_tot = weighted_per_env.sum(axis=-1)  # (N,)
 
+    # ANTI-DEGEN best_overall guard. An env whose every (valid) transition
+    # was a sentinel — i.e. ``valid_mask`` is False for ALL of its
+    # timesteps — contributes an ALL-ZERO ``r_per_env`` row and so a
+    # ``per_env_tot`` of 0. With cost channels stored negated (valid rules
+    # carry NEGATIVE cost contributions), that spurious zero can OUTRANK
+    # every genuine rule and be crowned best_overall — exactly the
+    # "failed/degenerate measure reads as free perfect" corruption. Mark
+    # fully-sentinel envs with ``-inf`` so they can never be the argmax.
+    # When the caller stamps degenerate-terminal rows with the sentinel
+    # value (the anti-degen path in ppo_ray_worker), those envs become
+    # fully-sentinel here and are excluded too. Guard against the
+    # all-excluded edge case (keep at least the original argmax).
+    env_all_sentinel = ~valid_mask.any(axis=0)  # (N,)
+    per_env_tot_for_best = per_env_tot.copy()
+    if env_all_sentinel.any() and not env_all_sentinel.all():
+        per_env_tot_for_best[env_all_sentinel] = -np.inf
+
     def _seq_for(env_idx: int) -> Any:
         if action_seq is None:
             return []
@@ -429,7 +446,7 @@ def aggregate_per_channel_stats(
         except (IndexError, TypeError):
             return []
 
-    best_overall_env = int(per_env_tot.argmax())
+    best_overall_env = int(per_env_tot_for_best.argmax())
     best_overall_rewards: dict[str, float] = {}
     best_overall_weighted: dict[str, float] = {}
     for j, name in enumerate(REWARD_NAMES):
