@@ -512,6 +512,54 @@ class PPORayWorker:
         self.reward_gate_w = float(
             os.environ.get("ALPHAGRAD_REWARD_GATE_W", "5.0")
         )
+        # ------------------------------------------------------------------
+        # ANTI-DEGENERACY PENALTY (ALPHAGRAD_ANTI_DEGEN, default ON).
+        # ------------------------------------------------------------------
+        # The bare mult-gate makes the degenerate basin FLAT-ZERO: a
+        # terminal rule with cosine_sim < tau drives g(cos)->0, so
+        # gated = g*cheapness -> 0 REGARDLESS of how cheap it is. That
+        # stops the policy from *being rewarded* for cossim->0 (good, no
+        # hacking) but it does NOT *punish* it — the whole cossim<tau
+        # region is a 0-gradient plateau the policy drifts into and can
+        # never climb out of (every direction reads 0). Compounded: a
+        # skipped (mem-gate) / sentineled (shape-storm) / exceptioned
+        # measurement returns ZEROED cost channels which ``cheapness``
+        # reads as "free perfect" (cheapness = W - symlog(0) = W), and a
+        # cossim=0 zeroed row would also collapse to gated=0 — so the
+        # degenerate and the failed-measure cases share the same flat-0
+        # plateau and can corrupt best_overall as "free" rules.
+        #
+        # FIX: any TERMINAL transition that is degenerate (cosine_sim <
+        # tau_deg, which also captures ||approx||~=0 since the env emits
+        # cosine_sim=0 for a collapsed/failed Jacobian) OR a
+        # failed/skipped measure gets a strictly NEGATIVE gated reward
+        # -P, making the basin a penalised region with a gradient OUT
+        # toward higher cosine. P is set strictly worse than the worst
+        # VALID rule (cheapness floors at 0 -> worst valid gated == 0),
+        # so -P < 0 <= any valid gated, i.e. degenerate/failed rules are
+        # always the argmin and never the argmax / never best_overall.
+        self.anti_degen = (
+            os.environ.get("ALPHAGRAD_ANTI_DEGEN", "1").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        # Degeneracy fidelity floor: terminal cosine_sim below this is
+        # treated as degenerate. Default 0.1 (well below the gate tau so
+        # genuinely low-but-real fidelity rules still earn the small
+        # positive g*cheapness rather than the penalty).
+        self.anti_degen_tau = float(
+            os.environ.get("ALPHAGRAD_ANTI_DEGEN_TAU", "0.1")
+        )
+        # Penalty magnitude. Default 2*W so a degenerate rule (gated=-P)
+        # is strictly worse than the cheapest possible VALID rule
+        # (gated -> g*W <= W). Tunable; clamped to be > 0.
+        self.anti_degen_penalty = float(
+            os.environ.get(
+                "ALPHAGRAD_ANTI_DEGEN_PENALTY",
+                str(2.0 * self.reward_gate_w),
+            )
+        )
+        if self.anti_degen_penalty <= 0.0:
+            self.anti_degen_penalty = 2.0 * self.reward_gate_w
         # In mult mode the gated scalar lives entirely on the cosine_sim
         # channel; collapse the scalarising weights to a one-hot so the
         # GAE / value / milestone dot products recover it exactly. The
@@ -540,6 +588,14 @@ class PPORayWorker:
                 f"cost weights {self._mult_cost_weights_np.tolist()} folded "
                 f"into cheapness; scalarising weight = one-hot[cosine_sim]."
             )
+            if self.anti_degen:
+                print(
+                    f"[ppo_ray] ANTI_DEGEN active: terminal cosine_sim < "
+                    f"{self.anti_degen_tau} (or failed/sentinel measure) -> "
+                    f"gated reward = -{self.anti_degen_penalty} (strictly "
+                    f"worse than the cheapest valid rule; excluded from "
+                    f"best_overall)."
+                )
         else:
             self._mult_cost_weights_np = np.zeros_like(self.reward_weights_np)
             self._logging_weights_np = self.reward_weights_np.astype(np.float32).copy()
@@ -859,7 +915,12 @@ class PPORayWorker:
         by `get_advantages` (per the gae.py contract)."""
         return jnp.sum(reward_vec * self.reward_weights, axis=-1)
 
-    def _apply_mult_reward_gate(self, buf_reward_vec: np.ndarray) -> np.ndarray:
+    def _apply_mult_reward_gate(
+        self,
+        buf_reward_vec: np.ndarray,
+        terminal_mask: np.ndarray | None = None,
+        failed_mask: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Transform the raw per-channel reward buffer into the gated
         representation used by the multiplicative cosine-gate reward.
 
@@ -887,6 +948,21 @@ class PPORayWorker:
         order (g -> 0) yields reward -> 0, never a spuriously-large
         less-negative value. cosine -> 0 => reward -> ~0 regardless of
         cheapness, which kills the cost->0/cosine->0 hack.
+
+        ANTI-DEGENERACY (``self.anti_degen``): the bare gate above makes
+        the cossim<tau region a flat-0 plateau (no *punishment* for
+        cossim->0, just no reward) — the policy can drift in and never
+        climb out. When enabled, any TERMINAL transition that is
+        degenerate (cosine_sim < ``anti_degen_tau``, capturing
+        ||approx||~=0 since the env emits cosine_sim=0 for a
+        collapsed/failed Jacobian) OR a failed/skipped/sentineled
+        measurement (``failed_mask``) gets a strictly NEGATIVE gated
+        reward ``-anti_degen_penalty``. With cheapness floored at 0 the
+        worst VALID gated reward is 0, so the penalty makes degenerate /
+        failed rules strictly the argmin (never best_overall) and turns
+        the flat plateau into a penalised slope with a gradient toward
+        higher cosine. ``terminal_mask`` / ``failed_mask`` are ``(T, N)``
+        bool; when both are None the penalty is skipped (back-compat).
         """
         out = np.array(buf_reward_vec, dtype=np.float32, copy=True)
         cos = out[..., COSINE_SIM_IDX]                       # (T, N), in [0,1]
@@ -907,6 +983,27 @@ class PPORayWorker:
         )                                                    # (T, N)
 
         gated = (g * cheapness).astype(np.float32)           # (T, N)
+
+        # Anti-degeneracy penalty: replace the flat-0 plateau with a
+        # strictly-negative reward for degenerate / failed TERMINAL
+        # transitions so the policy gets a gradient out of the basin.
+        if self.anti_degen:
+            P = np.float32(self.anti_degen_penalty)
+            degen = cos < np.float32(self.anti_degen_tau)     # (T, N)
+            if failed_mask is not None:
+                degen = degen | np.asarray(failed_mask, dtype=bool)
+            # Only penalise terminal transitions — intermediate steps
+            # legitimately carry cosine_sim=0 (sparse-terminal channel)
+            # and must stay at the gated value (0) so GAE isn't poisoned
+            # with -P on every non-terminal step.
+            if terminal_mask is not None:
+                degen = degen & np.asarray(terminal_mask, dtype=bool)
+            gated = np.where(degen, -P, gated).astype(np.float32)
+            # Record for telemetry / caller (best_overall exclusion).
+            self._last_degen_mask = degen
+        else:
+            self._last_degen_mask = np.zeros_like(gated, dtype=bool)
+
         out[...] = 0.0
         out[..., COSINE_SIM_IDX] = gated
         return out
@@ -1417,22 +1514,57 @@ class PPORayWorker:
             jax.vmap(lambda s, k: self.agent.value(s.tokens, key=k))(state, boot_keys),
         )  # (N, NUM_REWARDS)
 
+        # ANTI-DEGEN / failed-measure mask. A measurement is "failed"
+        # when EITHER the CPU pool timed out / errored (``buf_sentinel``)
+        # OR the env returned a sentinel reward vector (mem-gate skip /
+        # shape-storm / exception path: cost channels == -1e10). Both
+        # currently get their reward channels ZEROED below for GAE
+        # stability — but a zeroed cost row reads as "free perfect"
+        # (cheapness = W - symlog(0) = W) in the mult-gate and would
+        # corrupt best_overall, while a zeroed cossim=0 row collapses to
+        # gated=0 (the flat plateau). We capture the mask HERE, before
+        # zeroing, so the mult-gate can stamp these with -P (anti-degen
+        # penalty) and best_overall can exclude them — never zero.
+        from alphagrad.approx.common.cache import (
+            SENTINEL_REWARD_VALUE as _SENTINEL_RV,
+        )
+        # Env-side sentinel: any COST channel exactly == SENTINEL value.
+        _cost_idx = [
+            i for i in range(buf_reward_vec.shape[-1])
+            if i not in (COSINE_SIM_IDX, FROB_RESIDUAL_IDX)
+        ]
+        _env_sentinel = np.any(
+            buf_reward_vec[..., _cost_idx] == np.float32(_SENTINEL_RV),
+            axis=-1,
+        )  # (T, N)
+        buf_failed = buf_sentinel | _env_sentinel  # (T, N)
+
         # Phase 3 (b): mask sentinel transitions. Zero the per-channel
         # reward vector AND force dones=1 so GAE treats sentinel
         # timesteps as terminal and the value head bootstraps cleanly
         # at the next state. Per-channel zero (vs the legacy scalar
         # zero-out) means the gdpo path also sees zero reward on
-        # those steps.
-        if buf_sentinel.any():
+        # those steps. NB: in mult+anti_degen mode the gate stamps the
+        # cosine channel of these rows with -P AFTER this zeroing, so the
+        # net effect is a strictly-negative gated reward (a gradient out),
+        # NOT the misleading "free" zero — the zeroing here only clears the
+        # raw -1e10 cost channels that would otherwise blow up symlog/GAE.
+        if buf_failed.any():
             buf_reward_vec = np.where(
-                buf_sentinel[..., None], 0.0, buf_reward_vec,
+                buf_failed[..., None], 0.0, buf_reward_vec,
             )
-            buf_dones = np.where(buf_sentinel, 1.0, buf_dones)
-            n_sentinels = int(buf_sentinel.sum())
+            buf_dones = np.where(buf_failed, 1.0, buf_dones)
+            n_sentinels = int(buf_failed.sum())
             print(
-                f"[ppo_ray] {n_sentinels}/{T*N} sentinel transitions "
-                f"this episode (CPU pool timeouts); zeroing rewards "
-                f"and forcing dones."
+                f"[ppo_ray] {n_sentinels}/{T*N} failed/sentinel transitions "
+                f"this episode (pool timeout / mem-gate / shape-storm); "
+                f"zeroing raw rewards, forcing dones"
+                + (
+                    f", anti-degen penalty -{self.anti_degen_penalty} applied"
+                    if (self.anti_degen and self.reward_mode == 'mult')
+                    else ""
+                )
+                + "."
             )
 
         # Phase D: apply conditioned-reward gates. For each spec
@@ -1498,7 +1630,12 @@ class PPORayWorker:
         # ``additive`` mode leaves the buffer untouched (byte-identical to
         # the legacy path).
         if self.reward_mode == "mult":
-            buf_reward_vec = self._apply_mult_reward_gate(buf_reward_vec)
+            _term_mask = buf_dones.astype(bool)              # (T, N)
+            buf_reward_vec = self._apply_mult_reward_gate(
+                buf_reward_vec,
+                terminal_mask=_term_mask,
+                failed_mask=buf_failed,
+            )
 
         # GAE over the rollout. Both modes use the same per-channel
         # tensor contract — the difference is whether symlog squashing
@@ -1836,8 +1973,45 @@ class PPORayWorker:
         # zero out cost-channel reporting and overstate cosine. ``_raw``
         # and ``_logging_weights_np`` are byte-identical to the canonical
         # ones in additive mode.
+        # ANTI-DEGEN best_overall exclusion. The failed-measure zeroing
+        # above turns a sentinel/mem-gate/shape-storm terminal into an
+        # ALL-ZERO raw row, which ``aggregate_per_channel_stats`` would
+        # read as "free perfect" (cost=0) and could crown as best_overall
+        # — corrupting the milestone best. Likewise a genuinely degenerate
+        # terminal (cosine_sim < anti_degen_tau) must never be best. Stamp
+        # the cost channels of these envs' TERMINAL rows in the
+        # aggregation copy with the SENTINEL value so the built-in
+        # ``filter_sentinel_mask`` drops them from every per-channel mean,
+        # the per-env sum, and the best_overall argmax. (The canonical
+        # ``buf_reward_vec`` already carries -P on these via the gate, so
+        # ``best_return`` from the gated buffer is correct independently.)
+        buf_raw_for_agg = buf_reward_vec_raw.astype(np.float32)
+        if self.anti_degen and self.reward_mode == "mult":
+            _term = buf_dones.astype(bool)                    # (T, N)
+            _degen_terminal = (
+                (buf_reward_vec_raw[..., COSINE_SIM_IDX]
+                 < np.float32(self.anti_degen_tau))
+                | buf_failed
+            ) & _term                                        # (T, N)
+            if _degen_terminal.any():
+                buf_raw_for_agg = buf_raw_for_agg.copy()
+                _cost_idx_arr = np.array(_cost_idx, dtype=np.int64)
+                # Mark every cost channel of the degenerate terminal rows
+                # as SENTINEL so filter_sentinel_mask excludes them.
+                for _ci in _cost_idx_arr:
+                    buf_raw_for_agg[..., int(_ci)] = np.where(
+                        _degen_terminal,
+                        np.float32(SENTINEL_REWARD_VALUE),
+                        buf_raw_for_agg[..., int(_ci)],
+                    )
+                print(
+                    f"[ppo_ray] anti-degen: excluded "
+                    f"{int(_degen_terminal.sum())} degenerate/failed terminal "
+                    f"env(s) from best_overall."
+                )
+
         ch_stats = aggregate_per_channel_stats(
-            buf_reward_vec_raw.astype(np.float32),
+            buf_raw_for_agg,
             self._logging_weights_np.astype(np.float32),
             sentinel=SENTINEL_REWARD_VALUE,
             action_seq=per_env_actions,
