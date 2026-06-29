@@ -473,6 +473,15 @@ def _callback(
 
         rules: list = []  # mixed list[Diag | Compress | Quant]
         used_axes: set[int] = set()
+        # FULL-REDUCTION COMPRESS CAP (mirrors env.py): never drop the last
+        # remaining physical axis -- that folds the edge to val=None
+        # (uniform grid) which cossim-collapses the reward and trips the
+        # measure device tracker. Non-terminal COMPRESS is otherwise allowed
+        # (graphax core-v2 implicit-dim algebra + per-edge try/except).
+        _edge_phys_axes = out_len + max(
+            (len(ps) for ps in primal_shapes), default=0
+        )
+        _n_compressed = 0
         for slot in range(MAX_RULES_PER_VERTEX):
             row = specs_list[v_idx][slot]
             bi1 = int(row[0])
@@ -487,8 +496,6 @@ def _callback(
                 rules.append(Quant(dtype=QUANT_DTYPES[dtype_idx]))
                 continue
             if bi1 == COMPRESS_SENTINEL:
-                if v_idx != last_v_idx:
-                    continue
                 axis_idx = bi2
                 kind_idx = factor
                 fits_all = True
@@ -503,9 +510,13 @@ def _callback(
                     continue
                 if axis_idx in used_axes:
                     continue
+                # CAP: never drop the last remaining physical axis.
+                if _n_compressed + 1 >= _edge_phys_axes:
+                    continue
                 if not (0 <= kind_idx < len(COMPRESS_KINDS)):
                     kind_idx = 0
                 used_axes.add(axis_idx)
+                _n_compressed += 1
                 rules.append(Compress(axes=(axis_idx,), kind=COMPRESS_KINDS[kind_idx]))
                 continue
             if bi1 < 0:

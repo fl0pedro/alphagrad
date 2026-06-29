@@ -365,22 +365,24 @@ axis_pair_idx_to_base = {0: (0, 0), 1: (0, 1), 2: (1, 0), 3: (1, 1)}
 # recognise the slot as "not a DIAG", and `_callback` dispatches on the
 # specific sentinel value.
 #
-# Caveat — COMPRESS through the vertex elimination DAG is only partial:
-# `_callback` emits the correct `graphax.sparse.micro_actions.Compress`,
-# but graphax's `_eliminate_vertex` assumes every edge keeps its nominal
-# `(out_dims, primal_dims)` shape. Compress is lossy and reduces
-# `val.ndim`, so a Compress applied to a vertex whose edge feeds into a
-# subsequent elimination step trips the shape-preservation assertion at
-# `core.py:417`. Practical implications:
-#   * COMPRESS works end-to-end when it lands on the LAST vertex of the
-#     elimination order (no downstream edge to matmul against).
-#   * Earlier vertices in the order will assert. Hold off on
-#     ``--allow-compress`` unless you've ordered the agent to only emit
-#     COMPRESS on the final vertex, or are prepared to do the graphax
-#     pre_transforms / shape-bookkeeping work.
-# The reverse direction — graphax silently dropping a transform whose
-# axes don't fit `val.ndim` at all (e.g. axis 1 on a 1-D val) — has been
-# fixed (graphax commit `fa0a088`).
+# COMPRESS through the vertex elimination DAG is now supported on ANY
+# vertex (not just the last). graphax core-v2 owns the implicit-
+# (compressed-)dim algebra: `apply_compress` drops the physical `val`
+# axis and marks the logical dim `axis=None`, and produce_compress.py
+# defines how that implicit dim CONTRACTS / combines downstream WITHOUT
+# materializing the dropped axis (closed in {Dense, Block-diag}). A
+# Compress whose reduced edge feeds a subsequent `_eliminate_vertex` is
+# therefore handled, not asserted. The two genuine validity constraints
+# remain enforced below:
+#   * the FULL-REDUCTION CAP — never drop the last remaining physical
+#     axis (that folds the edge to `val=None` / uniform grid, which both
+#     cossim-collapses the reward and trips the measure device tracker);
+#   * the axis-fit / kind-range checks (apply_compress would ValueError
+#     on a mis-fitting axis otherwise).
+# Any residual per-edge geometry miss is caught by graphax core.py's
+# per-edge try/except (apply_compress raises ValueError -> that edge's
+# transform is skipped, the edge densified back to nominal form), so a
+# non-terminal COMPRESS degrades gracefully instead of crashing.
 COMPRESS_SENTINEL = -2
 
 # Sentinel used in `sparsity_specs[v, slot, 0]` to flag a QUANT sub-step
@@ -1342,16 +1344,13 @@ def _callback(
                 # graphax's apply_compress will validate too, but raising
                 # would crash the io_callback.
                 #
-                # COMPRESS reduces ``val.ndim``, which trips graphax's
-                # shape-preservation assertion in ``_eliminate_vertex``
-                # when the compressed edge feeds into a subsequent
-                # elimination. Until graphax learns to propagate the
-                # reduced shape, restrict COMPRESS rows to the **last**
-                # vertex of the partial elimination order — the only
-                # vertex with no downstream elimination step within this
-                # callback.
-                if v_idx != last_v_idx:
-                    continue
+                # NON-TERMINAL COMPRESS IS ALLOWED. graphax core-v2's
+                # implicit-dim algebra (produce_compress.py) propagates a
+                # compressed (axis=None) edge through downstream
+                # ``_eliminate_vertex`` steps without materializing the
+                # dropped axis, and core.py's per-edge try/except skips any
+                # genuinely-mis-fitting edge (densifying it back to nominal
+                # form). The FULL-REDUCTION CAP below is still enforced.
                 axis_idx = bi2
                 kind_idx = factor  # row[2] reused as kind index for COMPRESS
                 fits_all = True
