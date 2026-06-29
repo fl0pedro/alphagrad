@@ -499,6 +499,27 @@ class PPORayWorker:
                 f"ALPHAGRAD_REWARD_MODE must be 'additive' or 'mult', got "
                 f"{self.reward_mode!r}",
             )
+        # ADDITIVE COST-SYMLOG (opt-in, default OFF = plain weighted sum).
+        # The additive scalar reward is ``sum(reward_vec * weights)`` over the
+        # RAW per-channel buffer: cost channels are stored as ``-cost`` in their
+        # native units (latency_ns ~1e6, peak_memory ~1e8), so a plain weighted
+        # sum is dominated by the largest raw cost and is reward-hackable (a
+        # degenerate cost->0/cossim->0 rule scores 0, beating a faithful rule's
+        # huge negative cost). ``ALPHAGRAD_ADDITIVE_SYMLOG_COST=1`` symlog's the
+        # COST channels (NOT cosine_sim / frob_residual) BEFORE the weighted sum
+        # so the scalar becomes
+        #     lam_cmp*(-symlog(latency)) + lam_mem*(-symlog(peak_mem))
+        #         + lam_acc*cosine_sim
+        # i.e. costs land in the ~14-21 symlog band, comparable to an O(10-30)
+        # lam_acc*cosine term, so O(1)-O(30) lambdas balance the objective and a
+        # large-enough lam_acc makes the cossim term strictly dominate the cost
+        # gain (degenerate can never be the argmax). buf_reward_vec_raw stays RAW
+        # for Lagrangian / per-channel telemetry. No effect in mult mode (the
+        # gate already symlog's cost in ``cheapness``).
+        self.additive_symlog_cost = (
+            os.environ.get("ALPHAGRAD_ADDITIVE_SYMLOG_COST", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
         # Gate hyperparameters (only consulted in mult mode).
         #   tau: fidelity floor; cosine <= tau => g = 0.
         #   W:   cheapness offset; cheapness = W - sum_c |w_c|*symlog(cost_c).
@@ -1640,6 +1661,27 @@ class PPORayWorker:
         # the canonical buffer with the gated scalar, which must not
         # corrupt the measured-channel telemetry.
         buf_reward_vec_raw = np.array(buf_reward_vec, dtype=np.float32, copy=True)
+
+        # ADDITIVE COST-SYMLOG (ALPHAGRAD_ADDITIVE_SYMLOG_COST=1). Squash the
+        # COST channels of the canonical buffer into symlog space so the plain
+        # weighted sum below is magnitude-balanced (cost ~symlog 14-21 vs the
+        # O(10-30) lam_acc*cosine term) instead of raw-cost dominated. Only the
+        # cost channels are transformed; cosine_sim / frob_residual (the quality
+        # signals, already O(1)) are left raw. ``buf_reward_vec_raw`` above keeps
+        # the untransformed values for the Lagrangian / per-channel telemetry.
+        # Sign-preserving: stored cost is negative (-cost), symlog keeps the sign
+        # so a cheaper (smaller |cost|) order still scores a smaller-magnitude
+        # negative term. No-op in mult mode (cheapness already symlog's cost).
+        if self.reward_mode == "additive" and self.additive_symlog_cost:
+            _cost_idx_sl = [
+                i for i in range(buf_reward_vec.shape[-1])
+                if i not in (COSINE_SIM_IDX, FROB_RESIDUAL_IDX)
+            ]
+            buf_reward_vec = np.array(buf_reward_vec, copy=True)
+            _c = buf_reward_vec[..., _cost_idx_sl]
+            buf_reward_vec[..., _cost_idx_sl] = (
+                np.sign(_c) * np.log1p(np.abs(_c))
+            )
 
         # Multiplicative cosine-gate reward (ALPHAGRAD_REWARD_MODE=mult).
         # Collapse the per-channel buffer into the fidelity-gated cheapness
