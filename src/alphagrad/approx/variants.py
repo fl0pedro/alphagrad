@@ -259,6 +259,40 @@ _OP_QUANT = 2
 _OP_END = 3
 
 
+def _quant_allowed_mask(num_quant_dtypes: int):
+    """(num_quant_dtypes,) bool mask of dtypes permitted by
+    ``ALPHAGRAD_QUANT_ALLOWED`` (comma-list of QUANT_DTYPES names).
+
+    Mirrors ``heads._quant_dtype_mask`` so the curriculum action-mask
+    honours the same env-var restriction as the policy head. Unset env
+    var → all-True (no restriction). Names not in QUANT_DTYPES are
+    ignored. Returns None if QUANT_DTYPES cannot be imported (JAX-free
+    fallback: caller leaves the mask unchanged).
+    """
+    import os
+    import numpy as _np
+
+    _env = os.environ.get("ALPHAGRAD_QUANT_ALLOWED", "").strip()
+    if not _env:
+        return None
+    try:
+        from graphax.sparse.micro_actions import QUANT_DTYPES as _QUANT_DTYPES
+    except ImportError:
+        return None
+    _allowed = {s.strip() for s in _env.split(",") if s.strip()}
+    mask = _np.array(
+        [d in _allowed for d in _QUANT_DTYPES], dtype=_np.bool_
+    )
+    # Guard against a head/dtype-list size mismatch: pad/truncate to the
+    # curriculum mask length so the intersection is always well-formed.
+    if mask.shape[0] != num_quant_dtypes:
+        out = _np.zeros((num_quant_dtypes,), dtype=_np.bool_)
+        n = min(mask.shape[0], num_quant_dtypes)
+        out[:n] = mask[:n]
+        mask = out
+    return mask
+
+
 def compute_ppo_variant_masks(
     variant: str,
     full_factor_table: tuple[int, ...] | list[int],
@@ -376,6 +410,15 @@ def compute_ppo_variant_masks(
             f"Unknown PPO variant '{variant}'. Valid: "
             f"{list(VARIANT_PRESETS)}"
         )
+
+    # Intersect the curriculum quant mask with ALPHAGRAD_QUANT_ALLOWED so
+    # int/uint/bool/complex/exotic-float dtypes (which zero the gradient ->
+    # cossim 0) are unsampleable in BOTH the policy head (heads._quant_dtype_mask)
+    # AND the curriculum action mask. Closes the `full`-variant bypass where
+    # the curriculum quant mask was all-True regardless of the env var.
+    _allowed = _quant_allowed_mask(quant_dtype_mask.shape[0])
+    if _allowed is not None:
+        quant_dtype_mask &= _allowed
 
     # Defensive: must have at least one legal op_type / factor / quant
     # entry, otherwise the policy can't sample any valid action.
@@ -636,6 +679,12 @@ def compute_union_variant_masks(
             op_mask |= m["op_type_mask"]
             factor_mask |= m["factor_mask"]
             quant_mask |= m["quant_dtype_mask"]
+    # Members already intersected with ALPHAGRAD_QUANT_ALLOWED in
+    # compute_ppo_variant_masks; re-intersect defensively (idempotent) so the
+    # union can never re-admit a disallowed int/exotic dtype.
+    _allowed = _quant_allowed_mask(quant_mask.shape[0])
+    if _allowed is not None:
+        quant_mask &= _allowed
     return {
         "op_type_mask": op_mask,
         "factor_mask": factor_mask,

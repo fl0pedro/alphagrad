@@ -590,11 +590,14 @@ class PPORayWorker:
             )
             if self.anti_degen:
                 print(
-                    f"[ppo_ray] ANTI_DEGEN active: terminal cosine_sim < "
-                    f"{self.anti_degen_tau} (or failed/sentinel measure) -> "
-                    f"gated reward = -{self.anti_degen_penalty} (strictly "
-                    f"worse than the cheapest valid rule; excluded from "
-                    f"best_overall)."
+                    f"[ppo_ray] ANTI_DEGEN active (SHAPED): terminal "
+                    f"cosine_sim < {self.anti_degen_tau} -> gated reward ramps "
+                    f"linearly from -{self.anti_degen_penalty} (cos=0) up to "
+                    f"-{self.anti_degen_penalty * (1.0 - self.anti_degen_tau):.4g} "
+                    f"(cos=tau); failed/sentinel measure -> "
+                    f"-{self.anti_degen_penalty}. Positive d/dcos gives a "
+                    f"gradient OUT of the cossim-0 basin; still strictly worse "
+                    f"than the cheapest valid rule (excluded from best_overall)."
                 )
         else:
             self._mult_cost_weights_np = np.zeros_like(self.reward_weights_np)
@@ -989,16 +992,33 @@ class PPORayWorker:
         # transitions so the policy gets a gradient out of the basin.
         if self.anti_degen:
             P = np.float32(self.anti_degen_penalty)
-            degen = cos < np.float32(self.anti_degen_tau)     # (T, N)
+            tau = np.float32(self.anti_degen_tau)
+            degen = cos < tau                                  # (T, N)
+            fail = None
             if failed_mask is not None:
-                degen = degen | np.asarray(failed_mask, dtype=bool)
+                fail = np.asarray(failed_mask, dtype=bool)
+                degen = degen | fail
             # Only penalise terminal transitions — intermediate steps
             # legitimately carry cosine_sim=0 (sparse-terminal channel)
             # and must stay at the gated value (0) so GAE isn't poisoned
             # with -P on every non-terminal step.
             if terminal_mask is not None:
                 degen = degen & np.asarray(terminal_mask, dtype=bool)
-            gated = np.where(degen, -P, gated).astype(np.float32)
+            # SHAPED penalty: instead of a FLAT -P (zero advantage inside the
+            # whole basin -> value collapse, the cossim-0 absorbing attractor),
+            # give the penalty a positive slope in cos so the policy gets a
+            # gradient pointing OUT of the basin. Linear ramp on cos in [0, tau]:
+            #   cos=0   -> -P
+            #   cos=tau -> -P*(1-tau)   (still strictly < 0 for tau in (0,1))
+            # which stays <= 0 <= the worst VALID gated reward (cheapness>=0 =>
+            # gated>=0 for a valid rule), so best_overall ordering and the
+            # anti-hack guarantee are preserved. Failed/sentinel measures have
+            # no meaningful cos -> pinned to the floor -P.
+            cos_basin = np.clip(cos, 0.0, tau).astype(np.float32)
+            shaped = (-(P - cos_basin * P)).astype(np.float32)   # (T, N)
+            if fail is not None:
+                shaped = np.where(fail, -P, shaped).astype(np.float32)
+            gated = np.where(degen, shaped, gated).astype(np.float32)
             # Record for telemetry / caller (best_overall exclusion).
             self._last_degen_mask = degen
         else:
