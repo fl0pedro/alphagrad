@@ -192,9 +192,15 @@ def _build_gradient_fn(
             )
         run_dir, channel = rest.split(":", 1)
         seq = load_best_sequence(run_dir, channel)
-        # Resolve gcd factors using the model's jaxpr shapes when possible.
+        # Resolve gcd factors using the model's jaxpr shapes when possible,
+        # and pass the jaxpr through so parse_recorded_seq applies the SAME
+        # per-vertex filtering the env's _callback uses (COMPRESS-on-terminal,
+        # axis-fit, factor-divisibility) — making the replayed rule identical
+        # to the rule the env actually executed.
+        replay_jaxpr = None
         try:
             jaxpr = jax.make_jaxpr(target_fn)(*sample_args)
+            replay_jaxpr = jaxpr.jaxpr
             axis_sizes: list[int] = []
             for eqn in jaxpr.jaxpr.eqns:
                 for out in eqn.outvars:
@@ -206,6 +212,7 @@ def _build_gradient_fn(
             seq,
             axis_sizes=axis_sizes,
             skip_low_precision_quant=True,
+            jaxpr=replay_jaxpr,
         )
         dropped = sum(
             1 for r in seq

@@ -216,27 +216,96 @@ _LOW_PRECISION_QUANT_DTYPES = frozenset(
 )
 
 
+def _vertex_edge_shapes(jaxpr, vid_1indexed: int):
+    """Return ``(out_len, primal_shapes)`` for the eqn at 1-indexed vertex
+    ``vid_1indexed`` — the SAME shape metadata the env's
+    :func:`alphagrad.approx.env._callback` reads to validate a row.
+
+    ``out_len`` is the rank of the eqn's primary output; ``primal_shapes``
+    is the list of input shapes (non-literal invars only). Returns
+    ``(None, None)`` when the vertex is out of range or carries no usable
+    output/input aval (the env skips such vertices for transforms).
+    """
+    eqns = jaxpr.eqns
+    idx = vid_1indexed - 1
+    if not (0 <= idx < len(eqns)):
+        return None, None
+    eqn = eqns[idx]
+    if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
+        return None, None
+    out_shape = eqn.outvars[0].aval.shape
+    primal_shapes = [iv.aval.shape for iv in eqn.invars if hasattr(iv, "aval")]
+    if not primal_shapes:
+        return None, None
+    return len(out_shape), [out_shape, *primal_shapes]
+
+
 def _parse_typed_records(
     seq: Sequence[dict[str, Any]],
     *,
     axis_sizes: Sequence[int] | None,
     skip_low_precision_quant: bool,
+    one_indexed: bool = True,
+    jaxpr: Any | None = None,
 ) -> tuple[list[int], list[tuple[int, tuple[MicroAction, ...]]]]:
     """Decode the typed-dict format into ``(order, transforms)``.
 
-    Records are ``{"vertex": v, "ops": [{"op": "Diag", ...}, ...]}`` with
-    1-indexed vertex ids and resolved op fields. Vertices appear in
-    ``order`` in the listed sequence; pure-VE vertices have an empty
-    ``ops`` list and contribute to ``order`` only.
+    Records are ``{"vertex": v, "ops": [{"op": "Diag", ...}, ...]}`` whose
+    ``vertex`` field is the 0-indexed agent action the trainers write to
+    ``best_sequences.json`` (``vertex_action = jrand.categorical(...)`` in
+    ``ppo_ray_worker.py``; the env applies ``+1`` only when it feeds the
+    action into jacve). ``one_indexed=True`` (default) replays the same
+    ``+1`` so the returned ``order`` / vertex keys match the 1-indexed
+    convention ``graphax.jacve`` consumes — WITHOUT it the whole order is
+    shifted by one, the real last vertex is dropped, and the replayed
+    Jacobian is garbage (‖grad‖→0, cosine→nan); see the historical bug in
+    the module docstring.
+
+    When ``jaxpr`` is provided, the SAME per-vertex filtering the env's
+    ``_callback`` applies is mirrored so the replayed rule == the rule the
+    env actually executed:
+
+    * **COMPRESS only on the terminal vertex** of ``order`` (the env
+      restricts ``Compress`` to the last vertex because a reduced
+      ``val.ndim`` trips graphax's shape-preservation assertion in any
+      downstream elimination).
+    * **Full-reduction COMPRESS cap** — never drop the last remaining
+      physical axis of an edge (would canonicalize it to ``val=None``).
+    * **Axis-fit / divisibility** — drop Diag/Compress rows whose axis
+      indices don't fit every invar edge, and Diag factors that don't
+      divide the relevant axis sizes, exactly as ``apply_diag`` requires.
+    * **used_axes dedup** — at most one transform per logical axis.
+
+    Vertices appear in ``order`` in the listed sequence; pure-VE vertices
+    (and vertices whose every op was filtered) have an empty ``ops`` list
+    and contribute to ``order`` only.
     """
+    offset = 1 if one_indexed else 0
     order: list[int] = []
     transforms_by_vertex: dict[int, list[MicroAction]] = {}
     seen: set[int] = set()
-    for rec in seq:
-        v = int(rec.get("vertex", 0))
+    # Per-record vertex ids (already offset) so we can identify the terminal
+    # vertex for the env's COMPRESS-on-last-vertex restriction.
+    rec_vertices = [int(rec.get("vertex", 0)) + offset for rec in seq]
+    # The env keys COMPRESS to the LAST vertex of the (deduplicated) order;
+    # mirror that — the terminal vertex is the last distinct one.
+    terminal_vertex = None
+    for v in rec_vertices:
+        terminal_vertex = v  # last wins; distinctness handled by `order` below
+
+    for rec, v in zip(seq, rec_vertices):
         if v not in seen:
             order.append(v)
             seen.add(v)
+        out_len = primal_shapes = None
+        if jaxpr is not None:
+            out_len, primal_shapes = _vertex_edge_shapes(jaxpr, v)
+        used_axes: set[int] = set()
+        n_compressed = 0
+        edge_phys_axes = (
+            max((len(ps) for ps in primal_shapes), default=0)
+            if primal_shapes is not None else 0
+        )
         for op in rec.get("ops", []) or []:
             kind = op.get("op")
             if kind == "Diag":
@@ -245,7 +314,25 @@ def _parse_typed_records(
                 if i == j:
                     continue
                 factor = int(op.get("factor", 0))
-                if axis_sizes is not None:
+                if jaxpr is not None:
+                    # Mirror _callback: i/j are logical edge axes; both must
+                    # fit every invar edge, and factor must divide each axis.
+                    if i in used_axes or j in used_axes:
+                        continue
+                    if primal_shapes is None:
+                        continue
+                    n_i = _logical_axis_size(i, out_len, primal_shapes)
+                    n_j = _logical_axis_size(j, out_len, primal_shapes)
+                    if n_i is None or n_j is None:
+                        continue
+                    if factor == -1:
+                        factor = math.gcd(n_i, n_j)
+                    if factor <= 1 or n_i % factor != 0 or n_j % factor != 0:
+                        continue
+                    used_axes.add(i)
+                    used_axes.add(j)
+                    f = factor
+                elif axis_sizes is not None:
                     f = _resolve_diag_factor(factor, i, j, axis_sizes)
                     if f is None:
                         continue
@@ -263,6 +350,22 @@ def _parse_typed_records(
                 kind_name = str(op.get("kind", COMPRESS_KINDS[0]))
                 if kind_name not in COMPRESS_KINDS:
                     kind_name = COMPRESS_KINDS[0]
+                if jaxpr is not None:
+                    # Env restriction: COMPRESS only on the terminal vertex.
+                    if v != terminal_vertex:
+                        continue
+                    axis_idx = int(axes_in[0])
+                    if axis_idx in used_axes:
+                        continue
+                    if primal_shapes is None:
+                        continue
+                    if _logical_axis_size(axis_idx, out_len, primal_shapes) is None:
+                        continue
+                    # Full-reduction cap: keep >=1 physical axis.
+                    if n_compressed + 1 >= edge_phys_axes:
+                        continue
+                    used_axes.add(axis_idx)
+                    n_compressed += 1
                 transforms_by_vertex.setdefault(v, []).append(
                     Compress(axes=tuple(int(a) for a in axes_in), kind=kind_name)
                 )
@@ -286,12 +389,43 @@ def _parse_typed_records(
     return order, transforms
 
 
+def _logical_axis_size(
+    axis_idx: int, out_len: int | None, primal_shapes: Sequence[Sequence[int]]
+) -> int | None:
+    """Resolve a logical edge-axis index to its size, requiring it to fit
+    EVERY invar edge (mirrors the env's ``fits_all`` check).
+
+    ``primal_shapes[0]`` is the output shape; ``primal_shapes[1:]`` are the
+    input shapes. A logical axis ``< out_len`` is an output-side axis (always
+    present); ``>= out_len`` indexes ``axis - out_len`` into each primal.
+    Returns the (consistent) size, or ``None`` when it doesn't fit.
+    """
+    if axis_idx < 0 or out_len is None:
+        return None
+    out_shape = primal_shapes[0]
+    inputs = primal_shapes[1:]
+    if axis_idx < out_len:
+        if axis_idx >= len(out_shape):
+            return None
+        return int(out_shape[axis_idx])
+    primal_pos = axis_idx - out_len
+    sizes = set()
+    for ps in inputs:
+        if primal_pos >= len(ps):
+            return None
+        sizes.add(int(ps[primal_pos]))
+    if len(sizes) != 1:
+        return None
+    return sizes.pop()
+
+
 def parse_recorded_seq(
     seq: Sequence[Any],
     *,
     axis_sizes: Sequence[int] | None = None,
     one_indexed: bool = True,
     skip_low_precision_quant: bool = False,
+    jaxpr: Any | None = None,
 ) -> tuple[list[int], list[tuple[int, tuple[MicroAction, ...]]]]:
     """Convert a recorded best-sequence into ``(order, transforms)``.
 
@@ -300,6 +434,13 @@ def parse_recorded_seq(
             written by the trainers. Legacy single-int rows ``[vertex]``
             (non-dynamic-substeps recording) are accepted and treated
             as ``OP_END`` at that vertex (pure VE).
+        jaxpr: optional ``jax.core.Jaxpr`` (``make_jaxpr(target_fn).jaxpr``)
+            for the model whose gradient is being replayed. When provided,
+            the typed-record path mirrors the env's ``_callback`` per-vertex
+            filtering exactly (COMPRESS restricted to the terminal vertex,
+            axis-fit / factor-divisibility checks, full-reduction cap, axis
+            dedup) so the replayed rule == the rule the env executed. When
+            ``None``, only the looser ``axis_sizes`` checks apply (legacy).
         axis_sizes: optional flat list of axis sizes used to resolve
             ``factor=-1`` (gcd-auto). When ``None``, gcd-auto Diag rows
             are dropped (the elimination still happens at that vertex,
@@ -348,13 +489,15 @@ def parse_recorded_seq(
     seen: set[int] = set()
 
     # Detect typed-record format (post-2026-05 writer; see :func:`to_typed_records`).
-    # When the first row is a dict, decode via the typed branch — vertices are
-    # already 1-indexed, ops carry resolved factor / kind / dtype as strings, no
-    # COMPRESS_SENTINEL / QUANT_SENTINEL involved.
+    # When the first row is a dict, decode via the typed branch. The dict
+    # ``vertex`` is the trainers' 0-indexed agent action (NOT pre-+1'd); the
+    # typed decoder applies the same ``one_indexed`` offset as the legacy path
+    # below, so both wire shapes 1-index identically for jacve.
     if seq and isinstance(seq[0], dict):
         return _parse_typed_records(
             seq, axis_sizes=axis_sizes,
             skip_low_precision_quant=skip_low_precision_quant,
+            one_indexed=one_indexed, jaxpr=jaxpr,
         )
 
     # Dynamic-substeps raw format: rows are (vertex, ["diag(...)",
@@ -371,9 +514,14 @@ def parse_recorded_seq(
         and any(isinstance(x, str) for x in r[1])
         for r in seq
     ):
+        # NOTE: these call-string rows already carry 1-indexed vertices
+        # (``ppo._action_to_pylist_dynamic``), so do NOT re-apply the +1
+        # offset here — pass one_indexed=False to keep them as-is. jaxpr
+        # filtering is still threaded through for env parity.
         return _parse_typed_records(
             to_typed_records(seq), axis_sizes=axis_sizes,
             skip_low_precision_quant=skip_low_precision_quant,
+            one_indexed=False, jaxpr=jaxpr,
         )
 
     for row in seq:
