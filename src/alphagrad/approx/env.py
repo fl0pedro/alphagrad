@@ -65,10 +65,91 @@ class _NoopResourceMonitor:
         return {"time": 0.0, "memory": 0.0}
 
 
+class _SafeResourceMonitor:
+    """Wrap the real ``ResourceMonitor`` so a tracker failure degrades to a
+    no-op reading instead of escalating to a SENTINEL (zeroed reward).
+
+    A genuinely-degenerate edge can densify to a ``val=None`` SparseTensor
+    (the uniform-grid canonical form, graphax 69e55fb): a tensor that is
+    everywhere ``scalar_mult`` with no stored ``val`` array. When such a
+    tensor (or any other uniform/empty-stat case) reaches the C++
+    ``MemoryTracker.start()``, the native code subscripts a per-device
+    stats entry that comes back ``None`` and raises
+    ``TypeError: 'NoneType' object is not subscriptable`` -- which the
+    callback turns into a SENTINEL, zeroing the whole reward (the
+    51034/51040 collapse path). The COMPRESS cap upstream now makes the
+    full-reduction-to-uniform edge unreachable, but a ``val=None`` tensor
+    can arise from anywhere, so make the measure path itself robust: if the
+    tracker raises on enter, fall back to NO memory tracking for THIS
+    measurement (peak/stats report 0) and let the perf_counter timer still
+    produce a valid latency -- the call measures instead of crashing.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._inner = None
+        self._failed = False
+        try:
+            self._inner = _RealResourceMonitor(*args, **kwargs)
+        except Exception:
+            self._failed = True
+
+    def __enter__(self):
+        if self._inner is not None:
+            try:
+                self._inner.__enter__()
+            except Exception:
+                # Tracker start failed (e.g. val=None / uniform tensor with
+                # None device stats). Drop memory tracking for this measure
+                # rather than aborting -> SENTINEL.
+                self._failed = True
+                try:
+                    self._inner.__exit__(None, None, None)
+                except Exception:
+                    pass
+                self._inner = None
+        return self
+
+    def __exit__(self, *a):
+        if self._inner is not None:
+            try:
+                return self._inner.__exit__(*a)
+            except Exception:
+                self._failed = True
+                self._inner = None
+        return False
+
+    @property
+    def peak(self) -> int:
+        if self._inner is None:
+            return 0
+        try:
+            return self._inner.peak
+        except Exception:
+            return 0
+
+    @property
+    def duration(self) -> float:
+        if self._inner is None:
+            return 0.0
+        try:
+            return self._inner.duration
+        except Exception:
+            return 0.0
+
+    @property
+    def stats(self) -> dict:
+        if self._inner is None:
+            return {"time": 0.0, "memory": 0.0}
+        try:
+            return self._inner.stats
+        except Exception:
+            return {"time": 0.0, "memory": 0.0}
+
+
 ResourceMonitor = (
     _NoopResourceMonitor
     if os.environ.get("ALPHAGRAD_DISABLE_RESOURCE_MONITOR", "0") == "1"
-    else _RealResourceMonitor
+    else _SafeResourceMonitor
 )
 
 import math as _math
@@ -1217,6 +1298,19 @@ def _callback(
 
         rules: list = []  # mixed list[Diag | Compress | Quant]
         used_axes: set[int] = set()
+        # FULL-REDUCTION COMPRESS CAP. A COMPRESS removes one physical
+        # axis from the edge val (ndim == out_len + primal_dims). When the
+        # LAST physical axis is dropped graphax canonicalizes the edge to
+        # val=None (uniform grid, see micro_actions.apply_compress 69e55fb)
+        # -- a genuinely-degenerate ~zero-mean tensor that both
+        # cossim-collapses the reward AND crashes the measure path device
+        # tracker (NoneType not subscriptable). Forbid the final-axis
+        # COMPRESS so >=1 physical axis always remains; partial COMPRESS
+        # (leaving >=1 axis) stays allowed.
+        _edge_phys_axes = out_len + max(
+            (len(ps) for ps in primal_shapes), default=0
+        )
+        _n_compressed = 0
         for slot in range(MAX_RULES_PER_VERTEX):
             row = specs_list[v_idx][slot]
             bi1 = int(row[0])
@@ -1272,12 +1366,17 @@ def _callback(
                     continue
                 if axis_idx in used_axes:
                     continue
+                # CAP: never drop the last remaining physical axis -- that
+                # canonicalizes the edge to val=None (uniform/degenerate).
+                if _n_compressed + 1 >= _edge_phys_axes:
+                    continue
                 if not (0 <= kind_idx < len(COMPRESS_KINDS)):
                     # Unknown kind — fall back to the default "mean" rather
                     # than dropping the row, since the axis-removal effect is
                     # the dominant signal.
                     kind_idx = 0
                 used_axes.add(axis_idx)
+                _n_compressed += 1
                 rules.append(
                     Compress(axes=(axis_idx,), kind=COMPRESS_KINDS[kind_idx])
                 )
