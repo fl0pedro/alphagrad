@@ -48,7 +48,7 @@ _VISION_MODELS = {
 # grad flops 3.23e6 (seeds off): ConvNet Cout=2 -> 1.09x, MoE d=8 -> 1.19x,
 # ViT d=8 -> 1.00x (was d=65 = 28x NN: 410 s/it + 137 contraction-mismatch
 # sentinels — FLOP-matching it down is the single biggest pace win).
-_EQ_NN_HIDDEN = 63
+_EQ_NN_HIDDEN = int(__import__("os").environ.get("ALPHAGRAD_NN_HIDDEN", "63"))
 _EQ_VISION_KW = {
     "ConvNet": {"Cout": 2},
     "MoE": {"d": 8},
