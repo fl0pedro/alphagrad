@@ -787,11 +787,25 @@ class VertexEliminationEnv:
             _, _, _, vo_vertices = _build_graph(
                 config.jaxpr, args, consts, config.argnums
             )
-            valid = []
-            for i, eqn in enumerate(config.jaxpr.eqns, 1):
-                if eqn.outvars[0] not in config.jaxpr.outvars or i in vo_vertices:
-                    valid.append(i)
-            valid_vertices = tuple(valid)
+            # GRAD MODE (--measure-grad): graphax value_and_grad accumulates
+            # the gradient via a FULL reverse elimination pass that MUST include
+            # the output / loss-reduction vertices — the cotangent flows from the
+            # scalar loss back to the weights THROUGH them. Excluding them (the
+            # Jacobian-path rule below) leaves the policy emitting an order over a
+            # SUBSET of vertices; graphax then never propagates past the missing
+            # output vertices and the gradient pytree is STRUCTURALLY ZERO (primal
+            # value still correct) -> cossim==0 for every rule. So in grad mode
+            # EVERY equation is an eliminable vertex. The Jacobian path (default)
+            # keeps the original rule: output vertices are not eliminated (their
+            # edges become the Jacobian), which tolerates a partial order.
+            if bool(getattr(config, "measure_grad", False)):
+                valid_vertices = tuple(range(1, len(config.jaxpr.eqns) + 1))
+            else:
+                valid = []
+                for i, eqn in enumerate(config.jaxpr.eqns, 1):
+                    if eqn.outvars[0] not in config.jaxpr.outvars or i in vo_vertices:
+                        valid.append(i)
+                valid_vertices = tuple(valid)
         object.__setattr__(self, "valid_vertices", valid_vertices)
 
         if axis_state_static is None or axis_valid_static is None:

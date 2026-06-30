@@ -53,6 +53,7 @@ from alphagrad.approx.common import (
     generate_eval_samples,
     get_args,
     get_fn,
+    grad_target_setup,
     infer_argnums,
     init_linear_weights,
     vertex_avail_at_step,
@@ -389,8 +390,18 @@ class PPORayWorker:
             dataset=dataset_for_call,
             dataset_size=self.args.dataset_size,
         )
+        # GRAD MODE (--measure-grad): wrap into the scalar-loss (+ optional
+        # seed-vertex) graph and shift argnums, IDENTICALLY to the measure
+        # actor (cpu_approx_worker._build_env_from_args). This makes the POLICY
+        # env's jaxpr / valid_vertices / argnums match the graph the actor
+        # actually differentiates, so the policy emits a COMPLETE elimination
+        # order over the grad graph (incl. the output / loss-reduction
+        # vertices). A Jacobian-graph order is incomplete for the grad graph
+        # and graphax value_and_grad then returns a structurally-zero gradient.
+        target_fn, xs, argnums = grad_target_setup(
+            self.args, target_fn, xs, self.args.example
+        )
         closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
-        argnums = infer_argnums(self.args.example)
         env_target_fun = target_fn if "acc" in self.args.rewards else None
         measure_latency = bool(
             getattr(self.args, "measure_latency", False)
@@ -408,6 +419,7 @@ class PPORayWorker:
             exec_on_gpu=getattr(self.args, "exec_on_gpu", False),
             measure_latency=measure_latency,
             terminal_rewards_only=self._terminal_rewards_only,
+            measure_grad=bool(getattr(self.args, "measure_grad", False)),
         )
         eval_samples = generate_eval_samples(
             env, eval_key, int(self.args.num_eval_samples),
