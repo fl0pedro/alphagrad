@@ -1259,42 +1259,81 @@ def _bkstep_align_grads(ga, ge):
     return tuple(out)
 
 
+@jax.jit
+def _bkstep_eval_mse(x, y, W1, b1, W2, b2):
+    """True mean-squared-error eval loss with the exact tanh-tanh forward.
+
+    Mirrors examples._neural_network's per-element 0.5*(pred-y)**2, meaned —
+    the honest trainability loss, computed on a held-out eval batch with the
+    real (non-approx) forward so the signal reflects what Adam actually did to
+    the weights, not the noisy per-batch approx-path value.
+    """
+    a1 = jnp.tanh(x @ W1.T + b1)
+    pred = jnp.tanh(a1 @ W2.T + b2)
+    return jnp.mean(0.5 * (pred - y) ** 2)
+
+
+def _bkstep_eval_loss(W, x, y):
+    """Batched eval MSE over a (possibly large) eval subset."""
+    tot, n = 0.0, 0
+    for i in range(0, x.shape[0], 2000):
+        xb, yb = x[i:i + 2000], y[i:i + 2000]
+        tot += float(_bkstep_eval_mse(xb, yb, *W)) * xb.shape[0]
+        n += xb.shape[0]
+    return tot / max(n, 1)
+
+
 def _bkstep_probe(approx_grad_fn, weights, argnums, n_steps=40, seeds=(0, 1),
                   ep=None):
-    """K-step closed-loop MNIST trainability accuracy in [0, 1].
+    """K-step closed-loop MNIST trainability signal in [0, 1], higher=better.
 
     ``approx_grad_fn(x, y, *weights) -> (loss_value, approx_grads)`` is the
     policy's compiled ``measure_grad`` fn. For each seed: re-init the 2-layer
     MLP weights, run ``n_steps`` Adam updates on random MNIST minibatches using
-    the APPROX gradient, then read MNIST test accuracy. Returns the mean over
+    the APPROX gradient, then read a CONTINUOUS trainability signal derived from
+    the true (exact-forward) eval MSE-loss trajectory. Returns the mean over
     seeds. Only the weight args (``argnums``) are updated; x/y are fed per step.
 
-    The training minibatches AND the eval subset are drawn from a per-episode
-    rng (``ep``, defaulting to a monotonic per-process probe-call counter) so
-    successive calls see DIFFERENT data — reproducible given ``(ep, seed)``.
-    The init-seed loop still re-inits weights from ``seeds`` alone (variance
-    reduction over fixed inits), only the DATA rotates per episode.
+    Continuous signal (edge-resolved, replaces the old thresholded argmax-acc so
+    the cliff at cos≈0.02-0.25 has a usable gradient). Selected by
+    ``ALPHAGRAD_BKSTEP_SIGNAL``:
+
+      * ``fracred`` (default): 1 - L_final/L_init, clamped [0,1] — fractional
+        eval-loss reduction. Degenerate (no descent / divergence) -> ~0, full
+        descent -> ~1. Smooth across the cliff because eval-loss keeps moving
+        even where argmax-accuracy is pinned.
+      * ``auc``: mean over the recorded trajectory of (1 - L_t/L_init), clamped
+        [0,1] — rewards fast AND sustained descent (integral of the loss-drop
+        curve), sharper early-step resolution.
+      * ``expneg``: exp(-L_final / L_init) mapped so no-descent->~1/e, blowup->0
+        (relative, unit-free).
+      * ``invloss``: 1/(1 + L_final) — absolute, saturates once loss is small.
+
+    The training minibatches AND the eval subset rotate per episode (``ep``,
+    default = monotonic probe-call counter); the init-seed loop re-inits weights
+    from ``seeds`` (variance reduction). Reproducible given ``(ep, seed)``.
     """
     import optax
     if ep is None:
         _BKSTEP_EP_COUNTER[0] += 1
         ep = _BKSTEP_EP_COUNTER[0]
     ep = int(ep)
+    signal = os.environ.get("ALPHAGRAD_BKSTEP_SIGNAL", "fracred").strip().lower()
     xtr, ytr, xte, yte = _bkstep_mnist()
     # Weight leaves in argnums order = the approx-grad pytree order.
     w0 = [jnp.asarray(weights[a]) for a in argnums]
     n_tr = int(xtr.shape[0])
     n_te = int(xte.shape[0])
-    accs = []
-    # Per-episode eval subset (rotates with ``ep``): a fixed-size random slice
-    # of the test set rather than the static first 5000.
+    # Per-episode eval subset (rotates with ``ep``).
     eval_rng = np.random.default_rng([ep, 0xE7A1])
     n_eval = min(5000, n_te)
     eval_idx = eval_rng.choice(n_te, size=n_eval, replace=False)
     xte_eval, yte_eval = xte[eval_idx], yte[eval_idx]
+    # How often to sample the eval-loss trajectory for AUC (init + every k).
+    _rec_every = max(1, int(os.environ.get("ALPHAGRAD_BKSTEP_REC_EVERY", "4")))
+    _eps = 1e-8
+    sigs = []
     for s in seeds:
-        # Re-init weights (fresh seed) matching each leaf's shape, He-ish scale
-        # for the 2D layers so training is non-degenerate.
         keys = jax.random.split(jax.random.PRNGKey(int(s)), len(w0))
         W = []
         for k, w in zip(keys, w0):
@@ -1306,9 +1345,10 @@ def _bkstep_probe(approx_grad_fn, weights, argnums, n_steps=40, seeds=(0, 1),
         W = tuple(W)
         opt = optax.adam(1e-3)
         ost = opt.init(W)
-        # DATA rng keyed on (episode, init-seed): different minibatches every
-        # episode, reproducible given the pair.
         rng = np.random.default_rng([ep, int(s)])
+        # Init eval loss (before any update) — the trajectory baseline.
+        L0 = _bkstep_eval_loss(W, xte_eval, yte_eval)
+        traj = [L0]  # eval loss recorded at init + every _rec_every steps
         for _t in range(n_steps):
             idx = rng.integers(0, n_tr, 16)
             xb, yb = xtr[idx], ytr[idx]
@@ -1316,8 +1356,23 @@ def _bkstep_probe(approx_grad_fn, weights, argnums, n_steps=40, seeds=(0, 1),
             ga = _bkstep_align_grads(ga, W)
             upd, ost = opt.update(ga, ost, W)
             W = optax.apply_updates(W, upd)
-        accs.append(_bkstep_accuracy(W, xte_eval, yte_eval))
-    return float(np.mean(accs))
+            if (_t + 1) % _rec_every == 0:
+                traj.append(_bkstep_eval_loss(W, xte_eval, yte_eval))
+        Lf = traj[-1]
+        L0s = max(L0, _eps)
+        if signal == "auc":
+            # Mean fractional loss-drop over the recorded trajectory (skip the
+            # init point which is 0 by construction) -> integral of descent.
+            drops = [1.0 - (Lt / L0s) for Lt in traj[1:]] or [0.0]
+            sig = float(np.clip(np.mean(drops), 0.0, 1.0))
+        elif signal == "expneg":
+            sig = float(np.exp(-(Lf / L0s)))
+        elif signal == "invloss":
+            sig = float(1.0 / (1.0 + Lf))
+        else:  # fracred (default)
+            sig = float(np.clip(1.0 - (Lf / L0s), 0.0, 1.0))
+        sigs.append(sig)
+    return float(np.mean(sigs))
 
 
 def _aggregate_samples(values, want_top_quartile: bool):
