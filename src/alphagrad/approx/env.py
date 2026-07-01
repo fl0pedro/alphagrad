@@ -159,7 +159,7 @@ import math as _math
 # rebuilding it on every callback is pure overhead.
 _TOKEN_VOCAB, _, _ = _graphax_get_vocab()
 
-MAX_TOKENS = 4096
+MAX_TOKENS = 12288  # 256-hidden NN full-variant grad graph peaks ~8199 tokens; headroom above observed raw_len_max
 
 # Per-process tokenization-truncation telemetry. ``_callback`` writes
 # here whenever the un-truncated jaxpr token sequence exceeds
