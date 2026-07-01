@@ -2343,7 +2343,14 @@ def _callback(
         # (with the _quality_metrics fix) frob=1 and pollute the speed corner
         # of the Pareto front. Sentinel it so it's filtered like a failed
         # measurement.
-        _LAT_FLOOR_NS = 1_000.0  # 1 µs
+        _on_gpu = any(
+            getattr(_d, "platform", "cpu") == "gpu" for _d in unique_devices
+        )
+        # Device-calibrated floor: on CPU a real Jacobian never execs sub-us
+        # (<1us => over-compressed/failed); a GPU small kernel CAN be sub-us,
+        # so the CPU 1us floor mis-flags real GPU plans -- relax it there
+        # (cossim/frob catch true degenerates on GPU).
+        _LAT_FLOOR_NS = 1.0 if _on_gpu else 1_000.0  # 1 us (CPU)
         if not _lat_valid:
             # No usable latency reading → sentinel (negated reward ==
             # SENTINEL_REWARD_VALUE; downstream filter uses exact equality).
