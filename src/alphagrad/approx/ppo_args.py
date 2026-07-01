@@ -464,8 +464,8 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--entropy-coef-final", type=float, default=0.001,
                    help="Final entropy coefficient after linear annealing.")
-    p.add_argument("--gae-lambda", type=float, default=0.95)
-    p.add_argument("--discount", type=float, default=0.99)
+    p.add_argument("--gae-lambda", type=float, default=1.0)
+    p.add_argument("--discount", type=float, default=1.0)
 
     # Lagrangian (Stage F)
     p.add_argument(
