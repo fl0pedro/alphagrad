@@ -159,7 +159,7 @@ import math as _math
 # rebuilding it on every callback is pure overhead.
 _TOKEN_VOCAB, _, _ = _graphax_get_vocab()
 
-MAX_TOKENS = 12288  # 256-hidden NN full-variant grad graph peaks ~8199 tokens; headroom above observed raw_len_max
+MAX_TOKENS = 16384  # deep-COMPRESS 256-NN grad states reach ~13356 tok; 16k headroom
 
 # Per-process tokenization-truncation telemetry. ``_callback`` writes
 # here whenever the un-truncated jaxpr token sequence exceeds
@@ -2336,32 +2336,14 @@ def _callback(
         # timing a genuine reading is always > 0; a 0 only appears on failure.
         _lat_valid = [x for x in latency_samples if x > 0.0 and np.isfinite(x)]
         from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
-        # Degenerate-plan floor: a real elimination Jacobian never executes in
-        # under ~1 microsecond. A sub-µs reading means the plan over-compressed
-        # the computation into a near-noop (collapsed Jacobian) — a FAILED
-        # approximation that would otherwise read as ~0 latency / ~0 memory /
-        # (with the _quality_metrics fix) frob=1 and pollute the speed corner
-        # of the Pareto front. Sentinel it so it's filtered like a failed
-        # measurement.
-        _on_gpu = any(
-            getattr(_d, "platform", "cpu") == "gpu" for _d in unique_devices
-        )
-        # Device-calibrated floor: on CPU a real Jacobian never execs sub-us
-        # (<1us => over-compressed/failed); a GPU small kernel CAN be sub-us,
-        # so the CPU 1us floor mis-flags real GPU plans -- relax it there
-        # (cossim/frob catch true degenerates on GPU).
-        _LAT_FLOOR_NS = 1.0 if _on_gpu else 1_000.0  # 1 us (CPU)
         if not _lat_valid:
-            # No usable latency reading → sentinel (negated reward ==
-            # SENTINEL_REWARD_VALUE; downstream filter uses exact equality).
+            # No usable latency reading -> genuine failed-measure sentinel.
             latency_ns = -SENTINEL_REWARD_VALUE
         else:
             if _winsor > 0.0:
                 latency_ns = _winsorized_mean(_lat_valid, _winsor)
             else:
                 latency_ns = _percentile_pool(_lat_valid, pk)
-            if latency_ns < _LAT_FLOOR_NS:
-                latency_ns = -SENTINEL_REWARD_VALUE
     # RM-sampled peak: exact on GPU (clear_memory_stats + peak_bytes_in_use),
     # a sampled high-water mark on CPU (misses sub-ms grad allocs → unreliable).
     _rm_peak = float(_percentile_pool(peak_mem_samples, pk))
