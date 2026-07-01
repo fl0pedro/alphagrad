@@ -85,6 +85,24 @@ _NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (REWARD_INDEX["cosine_sim"],)
 COSINE_SIM_IDX: int = REWARD_INDEX["cosine_sim"]
 FROB_RESIDUAL_IDX: int = REWARD_INDEX["frob_residual"]
 
+# ADDITIVE_SYMLOG_COST: when ALPHAGRAD_ADDITIVE_SYMLOG_COST=1 (additive mode),
+# symlog-compress the COST channels in the reward buffer before the scalar
+# weighted sum + GAE. Without this the raw cost magnitudes (peak_memory ~1.7e6,
+# latency ~2.4e4) dominate the scalar reward by 4-6 orders of magnitude over
+# the [0,1] quality channels (cosine_sim / bkstep_acc), so bkstep(fracred) and
+# the capped-cossim guide can never influence the advantage direction — the
+# "flat-zero-basin" is really a scale-domination basin. Symlog brings
+# latency->~10, peak_memory->~14 so lambda_cmp/lambda_mem (~0.005) put them on
+# ~0.05-0.07 footing, commensurate with lambda_acc*bkstep (~0.5) and the guide.
+# Mirrors ppo._symlog_rewards. cosine_sim + bkstep_acc are [0,1] quality
+# channels and stay RAW (excluded from the mask).
+_COST_SYMLOG_INDICES: tuple[int, ...] = tuple(
+    i for i in range(NUM_REWARDS)
+    if REWARD_NAMES[i] not in ("cosine_sim", "bkstep_acc")
+)
+_COST_SYMLOG_MASK_NP: np.ndarray = np.zeros((NUM_REWARDS,), dtype=bool)
+_COST_SYMLOG_MASK_NP[list(_COST_SYMLOG_INDICES)] = True
+
 
 def _parse_lagrangian_constraints(specs: list) -> list[tuple[int, float, int]]:
     """Parse ``--lagrangian-constraint`` strings to (idx, threshold, sign).
@@ -638,6 +656,13 @@ class PPORayWorker:
 
         self.reward_weights = jnp.asarray(
             self.reward_weights_np, dtype=jnp.float32,
+        )
+        # ADDITIVE_SYMLOG_COST: symlog-compress cost channels in the reward
+        # buffer before the scalar sum (see _COST_SYMLOG_MASK_NP). additive
+        # mode only — mult mode does its own cost handling. Default off.
+        self._additive_symlog_cost = (
+            self.reward_mode == "additive"
+            and os.environ.get("ALPHAGRAD_ADDITIVE_SYMLOG_COST", "0") == "1"
         )
 
         # Advantage-normalisation strategy. ``gdpo`` activates the
@@ -1619,6 +1644,19 @@ class PPORayWorker:
                 )
                 + "."
             )
+
+        # ADDITIVE_SYMLOG_COST: symlog-compress the cost channels so the raw
+        # ~1e6 cost magnitudes don't dwarf the [0,1] quality channels in the
+        # scalar weighted sum (see _COST_SYMLOG_MASK_NP). Applied AFTER sentinel
+        # zeroing (symlog(0)==0, so zeroed rows stay 0) and BEFORE reward
+        # conditions / GAE. additive mode only.
+        if self._additive_symlog_cost:
+            _m = _COST_SYMLOG_MASK_NP[None, None, :]  # (1,1,NUM_REWARDS)
+            buf_reward_vec = np.where(
+                _m,
+                np.sign(buf_reward_vec) * np.log1p(np.abs(buf_reward_vec)),
+                buf_reward_vec,
+            ).astype(np.float32)
 
         # Phase D: apply conditioned-reward gates. For each spec
         # ``(easier, harder, op, threshold)``, zero the easier channel

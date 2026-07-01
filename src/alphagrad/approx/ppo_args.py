@@ -92,6 +92,17 @@ def make_argparser() -> argparse.ArgumentParser:
     # magnitude contributes to the gradient alongside cossim. The
     # Lagrangian range constraint stays on cossim only.
     p.add_argument("--lambda-frob", type=float, default=1.0)
+    p.add_argument(
+        "--lambda-cossim-guide", type=float, default=0.0,
+        help="Weight on the CAPPED-cossim GUIDE term added to the reward: "
+        "reward += lambda_cossim_guide * min(cossim, C), where C is set via "
+        "ALPHAGRAD_COSSIM_GUIDE_CAP (the trainability edge). Anti flat-zero-"
+        "basin: when the acc channel is B_kstep(fracred) (ALPHAGRAD_ACC_PROXY="
+        "bkstep) and the untrained policy sits at cos<=0, fracred has no "
+        "gradient; this monotonic term (min, NOT clip-at-0) pulls the policy "
+        "up to the edge, then the capped term goes constant and B_kstep "
+        "dominates. 0 = off. Routes onto the cosine_sim channel weight.",
+    )
     p.add_argument("--measure-latency", action="store_true")
     p.add_argument(
         "--latency-samples", type=int, default=1,

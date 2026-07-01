@@ -46,17 +46,21 @@ REWARD_NAMES: tuple[str, ...] = (
     # sync with env.REWARD_NAMES. peak_memory (5) = real measured peak (GPU);
     # xla_peak_memory (8) = compile-time estimate (reliable on CPU).
     "xla_peak_memory",
+    # index 9: B_kstep closed-loop trainability accuracy in [0, 1]. Alternative
+    # "acc" reward channel (ALPHAGRAD_ACC_PROXY=bkstep) — see env.REWARD_NAMES.
+    "bkstep_acc",
 )
 NUM_REWARDS: int = len(REWARD_NAMES)
 REWARD_INDEX: dict[str, int] = {n: i for i, n in enumerate(REWARD_NAMES)}
 COSINE_SIM_IDX: int = REWARD_INDEX["cosine_sim"]
 FROB_RESIDUAL_IDX: int = REWARD_INDEX["frob_residual"]
+BKSTEP_ACC_IDX: int = REWARD_INDEX["bkstep_acc"]
 
 # Channels whose values are bounded / quality-signal, NOT raw cost — they
 # bypass symlog wherever a symlog transform would otherwise apply (Lagrangian
 # thresholds, calibration scaling). Mirrored from mu0.py:155 and
 # ppo_ray_worker.py:80.
-NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (COSINE_SIM_IDX,)
+NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (COSINE_SIM_IDX, BKSTEP_ACC_IDX)
 NO_SYMLOG_MASK_NP: np.ndarray = np.zeros((NUM_REWARDS,), dtype=bool)
 NO_SYMLOG_MASK_NP[list(NO_SYMLOG_REWARD_INDICES)] = True
 
@@ -68,14 +72,21 @@ NO_SYMLOG_MASK_NP[list(NO_SYMLOG_REWARD_INDICES)] = True
 # steps when these channels participate in violation / aggregation
 # computations — see :func:`aggregate_per_channel_stats` and the
 # PPO Lagrangian mask in ``ppo_ray_worker.py``.
-SPARSE_TERMINAL_INDICES: tuple[int, ...] = (COSINE_SIM_IDX, FROB_RESIDUAL_IDX)
+SPARSE_TERMINAL_INDICES: tuple[int, ...] = (
+    COSINE_SIM_IDX, FROB_RESIDUAL_IDX, BKSTEP_ACC_IDX,
+)
 SPARSE_TERMINAL_MASK_NP: np.ndarray = np.zeros((NUM_REWARDS,), dtype=bool)
 SPARSE_TERMINAL_MASK_NP[list(SPARSE_TERMINAL_INDICES)] = True
 
-# Cost vs quality channels — the first six are negative costs (more negative =
-# worse) and the last two are quality signals where higher is better.
+# Cost vs quality channels — the cost channels are stored as negative costs
+# (more negative = worse); the quality channels (cosine_sim, frob_residual,
+# bkstep_acc) are the positive "higher is better" signals. bkstep_acc must be
+# excluded here so it is NOT symlog'd/negated like a cost.
+_QUALITY_REWARD_INDICES: tuple[int, ...] = (
+    COSINE_SIM_IDX, FROB_RESIDUAL_IDX, BKSTEP_ACC_IDX,
+)
 COST_REWARD_INDICES: tuple[int, ...] = tuple(
-    i for i in range(NUM_REWARDS) if i not in (COSINE_SIM_IDX, FROB_RESIDUAL_IDX)
+    i for i in range(NUM_REWARDS) if i not in _QUALITY_REWARD_INDICES
 )
 
 
@@ -136,14 +147,38 @@ def build_reward_weights(args) -> np.ndarray:
         mem_name = _MEM_TYPE_TO_REWARD[args.mem_type]
         w[REWARD_INDEX[mem_name]] = float(getattr(args, "lambda_mem", 1.0))
     if "acc" in args.rewards:
-        # cosine_sim is symlog'd alongside the cost channels in the scalar
-        # reward, so its raw [0,1] range (symlog(1)~=0.69) is dwarfed by
-        # latency/peak-memory (symlog~=17-20). --lambda-acc (~25) rescales it to
-        # a comparable magnitude so it isn't effectively ignored.
-        w[COSINE_SIM_IDX] = float(getattr(args, "lambda_acc", 1.0))
+        # The accuracy/quality channel. Default = cosine_sim (Jacobian fidelity);
+        # ALPHAGRAD_ACC_PROXY=bkstep routes the acc weight to the B_kstep
+        # closed-loop trainability accuracy channel instead (idx 9). Both are
+        # symlog-bypassed [0,1] quality signals, so --lambda-acc weights them on
+        # the same footing as the cost channels' symlog magnitude. bkstep-acc is
+        # in [0,1] so --lambda-acc 1.0 keeps it commensurate with the small
+        # (0.005) symlog cost weights per the additive-reward design.
+        import os as _os
+        _acc_proxy = _os.environ.get("ALPHAGRAD_ACC_PROXY", "cosine").strip().lower()
+        _acc_idx = BKSTEP_ACC_IDX if _acc_proxy == "bkstep" else COSINE_SIM_IDX
+        w[_acc_idx] = float(getattr(args, "lambda_acc", 1.0))
     lam_frob = float(getattr(args, "lambda_frob", 0.0))
     if lam_frob != 0.0:
         w[FROB_RESIDUAL_IDX] = lam_frob
+
+    # Capped-cossim GUIDE weight (anti flat-zero-basin). When the acc channel
+    # is routed to B_kstep (ALPHAGRAD_ACC_PROXY=bkstep), cosine_sim (idx 6) is
+    # free to carry a small additive climb term: reward += lambda_guide *
+    # min(cossim, C), with the cap C applied in env._callback via
+    # ALPHAGRAD_COSSIM_GUIDE_CAP. Below the trainability edge (bkstep==0, flat)
+    # this term is the only gradient, so it pulls the untrained policy up to
+    # the edge; above C it is constant, so B_kstep takes over. lambda_guide is
+    # read from --lambda-cossim-guide or the env var ALPHAGRAD_LAMBDA_COSSIM_GUIDE.
+    import os as _os2
+    _lam_guide = float(getattr(
+        args, "lambda_cossim_guide",
+        _os2.environ.get("ALPHAGRAD_LAMBDA_COSSIM_GUIDE", 0.0) or 0.0,
+    ))
+    if _lam_guide != 0.0:
+        # Additive: if acc is on cosine (default), fold the guide onto the
+        # same channel; if acc routed to bkstep, cosine_sim is otherwise 0.
+        w[COSINE_SIM_IDX] = float(w[COSINE_SIM_IDX]) + _lam_guide
 
     # RQ8 Stage 5: zero lambdas for channels declared as Lagrangian
     # constraints. They still appear in the per-channel reward vector
@@ -967,6 +1002,7 @@ def build_wandb_log_dict(stats: dict, state: dict, ep: int) -> dict:
             k.startswith("lagrangian/")
             or k.startswith("reward_mean/")
             or k.startswith("reward_dist/")
+            or k.startswith("bkstep/")
         ):
             log_dict[k] = v
     return log_dict

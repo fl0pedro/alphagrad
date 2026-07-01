@@ -2667,6 +2667,25 @@ def _callback(
         )
         raw_sink["bkstep_acc"] = float(bkstep_acc)
 
+    # ------------------------------------------------------------------
+    # Capped-cossim GUIDE (anti flat-zero-basin). When
+    # ``ALPHAGRAD_COSSIM_GUIDE_CAP`` is set to a float C, the cosine_sim
+    # channel emitted to the scalar reward is capped at C via ``min`` (NOT
+    # clip-at-0): so it stays a MONOTONIC climb signal even from NEGATIVE
+    # cossim up to C. Below the trainability edge (where B_kstep(fracred)==0
+    # has no gradient) this lets a small cosine weight (--lambda-cossim-guide)
+    # pull the untrained policy up toward the edge; above C the term is a
+    # constant so B_kstep(fracred) resolves the compute/mem/fidelity tradeoff.
+    # The raw (uncapped) cosine stays in raw_sink for honest logging.
+    _guide_cap_raw = os.environ.get("ALPHAGRAD_COSSIM_GUIDE_CAP", "").strip()
+    cosine_channel = cosine_sim
+    if _guide_cap_raw:
+        try:
+            _C = float(_guide_cap_raw)
+            cosine_channel = float(min(cosine_sim, _C))
+        except ValueError:
+            cosine_channel = cosine_sim
+
     rewards = jnp.array(
         [
             -muls_adds_fmas,
@@ -2675,7 +2694,7 @@ def _callback(
             -max_io_sum,
             -bytes_accessed,
             -peak_memory,
-            cosine_sim,
+            cosine_channel,  # capped-cossim guide when GUIDE_CAP set, else raw
             -frob_residual,
             -xla_peak_memory,
             bkstep_acc,  # positive quality channel (trainability accuracy)
