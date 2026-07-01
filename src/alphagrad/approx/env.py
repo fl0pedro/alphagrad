@@ -316,7 +316,7 @@ _AXIS_FEAT_GROUP_ID = 3
 #   6 cosine_sim       — cosine similarity between flattened approximated and
 #                        exact Jacobians, averaged over the calibration samples.
 #   7 frob_residual    — relative Frobenius residual ||J_e - J_a||_F / ||J_e||_F.
-NUM_REWARDS = 9
+NUM_REWARDS = 10
 REWARD_NAMES: tuple[str, ...] = (
     "muls_adds_fmas",
     "flops",
@@ -332,10 +332,20 @@ REWARD_NAMES: tuple[str, ...] = (
     # XLA estimate — reliable + order-discriminating on CPU. Use peak_memory for
     # GPU-measured runs, xla_peak_memory for CPU-measured runs.
     "xla_peak_memory",
+    # index 9: B_kstep closed-loop TRAINABILITY accuracy in [0, 1]. Runs a short
+    # real training (K Adam steps, S seeds) with the rule's OWN approximate
+    # gradient (from the ``measure_grad`` compiled fn) on real MNIST batches,
+    # then reads the resulting MNIST test accuracy. Directly answers "would
+    # training with this learning rule work" — the trainability proxy from the
+    # qsig_B_kstep bake-off. Only populated (terminal step, measure_grad) when
+    # ``ALPHAGRAD_BKSTEP=1``; else stays 0.0. Higher = better, so it is a
+    # QUALITY channel (not stored negated).
+    "bkstep_acc",
 )
 REWARD_INDEX = {name: i for i, name in enumerate(REWARD_NAMES)}
 QUALITY_REWARD_INDICES = (
     REWARD_INDEX["cosine_sim"], REWARD_INDEX["frob_residual"],
+    REWARD_INDEX["bkstep_acc"],
 )
 # Cost = every non-quality channel — DERIVED (not hardcoded) so adding a channel
 # (e.g. xla_peak_memory at idx 8) is picked up automatically, like
@@ -352,7 +362,12 @@ COMPUTE_REWARD_INDICES = tuple(
 # rot out of sync when channels are added: every channel is -1e10 except
 # cosine_sim, whose worst value is -1.0.
 _SENTINEL_BAD_REWARD = jnp.array(
-    [-1.0 if i == REWARD_INDEX["cosine_sim"] else -1e10 for i in range(NUM_REWARDS)],
+    [
+        -1.0 if i == REWARD_INDEX["cosine_sim"]
+        else 0.0 if i == REWARD_INDEX["bkstep_acc"]  # worst trainability = 0 acc
+        else -1e10
+        for i in range(NUM_REWARDS)
+    ],
     dtype=jnp.float32,
 )
 
@@ -1173,6 +1188,138 @@ def _quality_metrics(jac_exact, jac_approx):
     return cos, rel_frob
 
 
+# ---------------------------------------------------------------------------
+# Signal B_kstep — closed-loop TRAINABILITY probe (the "acc" reward channel
+# when ``ALPHAGRAD_ACC_PROXY=bkstep``). Runs a short REAL MNIST training using
+# the rule's OWN approximate gradient (the ``measure_grad`` compiled fn), then
+# reads the resulting MNIST test accuracy. Ported from the qsig_B_kstep
+# bake-off (sigB) so it runs inline inside ``_callback`` — self-contained here
+# (no ``qsig_common`` import, which would be circular: qsig_common imports env).
+# ---------------------------------------------------------------------------
+_BKSTEP_MNIST: dict = {}
+# Monotonic per-process probe-call counter. Each _bkstep_probe call is one
+# terminal-step trainability measurement (~one episode's acc reward); mixing
+# this ordinal into the DATA rng rotates the minibatches + eval subset per
+# episode (fixing the old fixed-seed bug where every episode saw identical
+# data), while the init-seed averaging stays for variance reduction. List so
+# it can be rebound inside the function.
+_BKSTEP_EP_COUNTER: list = [0]
+
+
+def _bkstep_mnist():
+    """Lazily load + cache MNIST (train/test) tensors for the B_kstep probe.
+
+    Cheap after first call (module-level cache). Kept in float32 device arrays.
+    """
+    if not _BKSTEP_MNIST:
+        from alphagrad.approx.common.datasets import load_dataset
+        xtr, ytr = load_dataset("mnist", None, "train")
+        xte, yte = load_dataset("mnist", None, "test")
+        _BKSTEP_MNIST.update(
+            xtr=jnp.asarray(xtr), ytr=jnp.asarray(ytr),
+            xte=jnp.asarray(xte), yte=jnp.asarray(yte),
+        )
+    return (
+        _BKSTEP_MNIST["xtr"], _BKSTEP_MNIST["ytr"],
+        _BKSTEP_MNIST["xte"], _BKSTEP_MNIST["yte"],
+    )
+
+
+@jax.jit
+def _bkstep_predict(x, W1, b1, W2, b2):
+    # Mirror examples._neural_network's forward pass (tanh-tanh MLP).
+    a1 = jnp.tanh(x @ W1.T + b1)
+    return jnp.tanh(a1 @ W2.T + b2)
+
+
+def _bkstep_accuracy(W, x, y):
+    preds = []
+    for i in range(0, x.shape[0], 2000):
+        preds.append(jnp.argmax(_bkstep_predict(x[i:i + 2000], *W), -1))
+    return float(jnp.mean(jnp.concatenate(preds) == jnp.argmax(y, -1)))
+
+
+def _bkstep_align_grads(ga, ge):
+    """Layout-align each approx grad leaf to its exact-weight leaf.
+
+    graphax's reverse pass can emit a W-grad transposed vs the weight layout
+    (the known W1/W2 grad-transpose artifact). Transpose back so the Adam
+    update lands correctly; zero-out an un-alignable leaf so a broken shape
+    can't crash the training loop (it just contributes no update that step).
+    """
+    out = []
+    for a, e in zip(ga, ge):
+        a = jnp.asarray(a)
+        if a.shape == e.shape:
+            out.append(a)
+        elif a.ndim == 2 and a.shape == e.shape[::-1]:
+            out.append(a.T)
+        else:
+            out.append(jnp.zeros_like(e))
+    return tuple(out)
+
+
+def _bkstep_probe(approx_grad_fn, weights, argnums, n_steps=40, seeds=(0, 1),
+                  ep=None):
+    """K-step closed-loop MNIST trainability accuracy in [0, 1].
+
+    ``approx_grad_fn(x, y, *weights) -> (loss_value, approx_grads)`` is the
+    policy's compiled ``measure_grad`` fn. For each seed: re-init the 2-layer
+    MLP weights, run ``n_steps`` Adam updates on random MNIST minibatches using
+    the APPROX gradient, then read MNIST test accuracy. Returns the mean over
+    seeds. Only the weight args (``argnums``) are updated; x/y are fed per step.
+
+    The training minibatches AND the eval subset are drawn from a per-episode
+    rng (``ep``, defaulting to a monotonic per-process probe-call counter) so
+    successive calls see DIFFERENT data — reproducible given ``(ep, seed)``.
+    The init-seed loop still re-inits weights from ``seeds`` alone (variance
+    reduction over fixed inits), only the DATA rotates per episode.
+    """
+    import optax
+    if ep is None:
+        _BKSTEP_EP_COUNTER[0] += 1
+        ep = _BKSTEP_EP_COUNTER[0]
+    ep = int(ep)
+    xtr, ytr, xte, yte = _bkstep_mnist()
+    # Weight leaves in argnums order = the approx-grad pytree order.
+    w0 = [jnp.asarray(weights[a]) for a in argnums]
+    n_tr = int(xtr.shape[0])
+    n_te = int(xte.shape[0])
+    accs = []
+    # Per-episode eval subset (rotates with ``ep``): a fixed-size random slice
+    # of the test set rather than the static first 5000.
+    eval_rng = np.random.default_rng([ep, 0xE7A1])
+    n_eval = min(5000, n_te)
+    eval_idx = eval_rng.choice(n_te, size=n_eval, replace=False)
+    xte_eval, yte_eval = xte[eval_idx], yte[eval_idx]
+    for s in seeds:
+        # Re-init weights (fresh seed) matching each leaf's shape, He-ish scale
+        # for the 2D layers so training is non-degenerate.
+        keys = jax.random.split(jax.random.PRNGKey(int(s)), len(w0))
+        W = []
+        for k, w in zip(keys, w0):
+            if w.ndim == 2:
+                fan_in = w.shape[1]
+                W.append(jax.random.normal(k, w.shape) / jnp.sqrt(fan_in))
+            else:
+                W.append(jnp.zeros_like(w))
+        W = tuple(W)
+        opt = optax.adam(1e-3)
+        ost = opt.init(W)
+        # DATA rng keyed on (episode, init-seed): different minibatches every
+        # episode, reproducible given the pair.
+        rng = np.random.default_rng([ep, int(s)])
+        for _t in range(n_steps):
+            idx = rng.integers(0, n_tr, 16)
+            xb, yb = xtr[idx], ytr[idx]
+            _val, ga = approx_grad_fn(xb, yb, *W)
+            ga = _bkstep_align_grads(ga, W)
+            upd, ost = opt.update(ga, ost, W)
+            W = optax.apply_updates(W, upd)
+        accs.append(_bkstep_accuracy(W, xte_eval, yte_eval))
+    return float(np.mean(accs))
+
+
 def _aggregate_samples(values, want_top_quartile: bool):
     """Reduce a list of per-sample scalars to a single jnp scalar.
 
@@ -1640,6 +1787,7 @@ def _callback(
                 -muls_adds_fmas, 0.0, 0.0, -max_io_sum,
                 0.0, 0.0, 0.0, 0.0,
                 0.0,  # xla_peak_memory (no compiled fn on the cheap path)
+                0.0,  # bkstep_acc (no compiled fn on the cheap path)
             ],
             dtype=jnp.float32,
         )
@@ -2085,6 +2233,7 @@ def _callback(
                 0.0,                     # cosine_sim (worst)
                 -1.0,                    # frob_residual = 1.0 (100% error)
                 -float(bytes_accessed),  # xla_peak_memory surrogate (rejected)
+                0.0,                     # bkstep_acc (worst trainability = 0)
             ],
             dtype=jnp.float32,
         )
@@ -2407,6 +2556,36 @@ def _callback(
     if _dbg_t and is_terminal:
         print(f"[DBG-env] quality={_time.time()-_t0:.1f}s", flush=True)
 
+    # ------------------------------------------------------------------
+    # B_kstep — closed-loop trainability accuracy (the "acc" reward channel
+    # under ALPHAGRAD_ACC_PROXY=bkstep). Terminal + measure_grad only: it needs
+    # the policy's approx-GRADIENT fn (compiled_approx returns (value, grads)).
+    # Runs K Adam steps × S seeds of REAL MNIST training with the approx grad,
+    # then reads test accuracy. Gated behind ALPHAGRAD_BKSTEP=1 so cosine-only
+    # runs pay nothing. Any failure -> 0.0 (worst trainability), never a crash.
+    # ------------------------------------------------------------------
+    bkstep_acc = 0.0
+    _bkstep_on = os.environ.get("ALPHAGRAD_BKSTEP", "0") == "1"
+    if _bkstep_on and is_terminal and config.measure_grad:
+        try:
+            _bk_k = int(os.environ.get("ALPHAGRAD_BKSTEP_K", "40") or "40")
+            _bk_ns = int(os.environ.get("ALPHAGRAD_BKSTEP_SEEDS", "2") or "2")
+            _bk_seeds = tuple(range(max(_bk_ns, 1)))
+            if _dbg_t:
+                _tbk = _time.time()
+            bkstep_acc = _bkstep_probe(
+                compiled_approx, args, config.argnums,
+                n_steps=max(_bk_k, 1), seeds=_bk_seeds,
+            )
+            if _dbg_t:
+                print(
+                    f"[DBG-env] bkstep acc={bkstep_acc:.4f} K={_bk_k} "
+                    f"seeds={_bk_ns} t={_time.time()-_tbk:.1f}s", flush=True,
+                )
+        except Exception as _bk_e:  # pragma: no cover - defensive
+            print(f"[bkstep] probe failed -> acc=0.0 | {_bk_e}", flush=True)
+            bkstep_acc = 0.0
+
     # Raw-measurement sink: when a caller passes ``raw_sink={}`` it gets the
     # per-sample/per-point distributions (the "10x8" the sampler records)
     # instead of only the percentile-aggregated reward vector. Deterministic
@@ -2431,6 +2610,7 @@ def _callback(
         raw_sink["frob_residual_per_point"] = (
             [float(x) for x in frobs] if (is_terminal and out_exacts) else []
         )
+        raw_sink["bkstep_acc"] = float(bkstep_acc)
 
     rewards = jnp.array(
         [
@@ -2443,6 +2623,7 @@ def _callback(
             cosine_sim,
             -frob_residual,
             -xla_peak_memory,
+            bkstep_acc,  # positive quality channel (trainability accuracy)
         ],
         dtype=jnp.float32,
     )
