@@ -103,6 +103,14 @@ _COST_SYMLOG_INDICES: tuple[int, ...] = tuple(
 _COST_SYMLOG_MASK_NP: np.ndarray = np.zeros((NUM_REWARDS,), dtype=bool)
 _COST_SYMLOG_MASK_NP[list(_COST_SYMLOG_INDICES)] = True
 
+# Fix 1 (v2): NON-symlog quality channels (cosine_sim, bkstep_acc). The
+# additive failed-penalty is stamped on one of these so no symlog pass
+# reshapes it (the second additive-symlog pass symlog's bkstep_acc, so we
+# must stamp AFTER it -- see run_rollout_and_train).
+from alphagrad.approx.common.reward_scaling import (
+    NO_SYMLOG_MASK_NP as _NO_SYMLOG_MASK_FP,
+)
+
 
 def _parse_lagrangian_constraints(specs: list) -> list[tuple[int, float, int]]:
     """Parse ``--lagrangian-constraint`` strings to (idx, threshold, sign).
@@ -677,6 +685,34 @@ class PPORayWorker:
             self.reward_mode == "additive"
             and os.environ.get("ALPHAGRAD_ADDITIVE_SYMLOG_COST", "0") == "1"
         )
+
+        # Fix 1 (v2 -- REPLACES the failed-row MASK): bounded-NEGATIVE
+        # penalty for failed/sentinel transitions in additive mode. The
+        # old mask zeroed failed rows out of the loss, which makes an
+        # ALL-failed batch a zero-gradient NO-OP -- so once the policy
+        # drifts into the all-failing region (COMPRESS/QUANT measure
+        # failures) it is STRANDED (return exactly 0, flat). Instead we
+        # stamp the failed row's SCALAR reward with a bounded negative
+        # value and INCLUDE it in the advantage z-score + loss, so a
+        # failed row is a negative advantage the policy is pushed AWAY
+        # from (there is always a gradient out). The value must be
+        # STRICTLY WORSE than the worst VALID rule (valid rewards run
+        # ~[-1.5 (neg-cossim via the 1.5*min(cos,C) guide) .. +0.65]),
+        # so failing is always the least-preferred outcome; NOT the
+        # -1e10 sentinel (that dominates), NOT 0 (the trap). Default
+        # -2.0 (< the worst valid ~-1.5).
+        self.failed_penalty = float(
+            os.environ.get("ALPHAGRAD_FAILED_PENALTY", "-2.0")
+        )
+        if self.failed_penalty >= 0.0:
+            self.failed_penalty = -2.0
+        if self.reward_mode == 'additive':
+            print(
+                f"[ppo_ray] ADDITIVE failed/sentinel penalty = "
+                f"{self.failed_penalty} (bounded-negative, INCLUDED in "
+                f"advantage+loss -- replaces the failed-row mask; failed "
+                f"rows are repulsive, never a zero-gradient no-op)."
+            )
 
         # Advantage-normalisation strategy. ``gdpo`` activates the
         # per-channel z-score → priority-weighted sum → batch-norm
@@ -1398,28 +1434,25 @@ class PPORayWorker:
                 vertex_idx_for_mask,
                 old_log_probs, returns, adv_scalar, keys,
             )
-            # Fix 1: valid-masked batch means. Failed/sentinel rows (valid=0)
-            # contribute NOTHING to any loss term; the denominator is the
-            # valid-row count (floored at 1) so a batch that is half-sentinel
-            # still produces a full-magnitude gradient from its good rows
-            # rather than a halved-then-diluted one. When every row is valid
-            # (valid all-ones) this is byte-identical to the old jnp.mean.
-            _vsum = jnp.maximum(jnp.sum(valid), jnp.float32(1.0))
-            _mmean = lambda x: jnp.sum(x * valid) / _vsum
-            ppo_loss = _mmean(p_l)
-            value_loss = _mmean(v_l)
-            entropy_loss = -_mmean(ent)
+            # Fix 1 (v2): INCLUDE failed rows in the loss (no mask). The
+            # bounded-negative penalty stamped upstream gives failed rows
+            # a negative advantage after z-scoring, so plain means push
+            # the policy AWAY from the failing region -- an all-failed
+            # batch is now a repulsive (non-zero) gradient, not a no-op.
+            # ``valid`` is kept threaded for telemetry but no longer masks.
+            del valid  # retained in the batch tuple for compat; unused
+            ppo_loss = jnp.mean(p_l)
+            value_loss = jnp.mean(v_l)
+            entropy_loss = -jnp.mean(ent)
             total = ppo_loss + value_coef * value_loss + entropy_coef * entropy_loss
             # Per-head entropy means: useful for diagnosing which
             # categorical head is collapsing (vertex / op_type / i /
-            # j / factor / quant). Mean over the batch axis (valid rows only).
-            head_means = (
-                jnp.sum(per_head_ent * valid[:, None], axis=0) / _vsum
-            )  # (6,)
+            # j / factor / quant). Mean over the batch axis.
+            head_means = jnp.mean(per_head_ent, axis=0)  # (6,)
             aux = {
                 "ppo_loss": ppo_loss,
                 "value_loss": value_loss,
-                "entropy": _mmean(ent),
+                "entropy": jnp.mean(ent),
                 "entropy_coef": entropy_coef,
                 "entropy/vertex": head_means[0],
                 "entropy/op_type": head_means[1],
@@ -1770,6 +1803,35 @@ class PPORayWorker:
                 np.sign(_c) * np.log1p(np.abs(_c))
             )
 
+        # Fix 1 (v2): ADDITIVE bounded-negative FAILED penalty. Stamped
+        # HERE -- AFTER both symlog passes and the reward-condition gates,
+        # BEFORE GAE -- so the value is exact (no later transform reshapes
+        # it). Failed rows had every channel zeroed in the sentinel block
+        # above; we now write the penalty onto the highest-|weight|
+        # NON-symlog channel (bkstep_acc / cosine_sim) so the GAE
+        # weighted-sum scalarisation recovers EXACTLY self.failed_penalty
+        # (all other channels of a failed row are 0). With
+        # discount=gae-lambda=1.0 (Monte-Carlo) a terminal-step penalty
+        # flows back unchanged as the episode return. Included normally in
+        # the advantage z-score + loss => failed rows get a negative
+        # advantage (repulsive gradient), never a zero-gradient no-op.
+        if self.reward_mode == 'additive' and buf_failed.any():
+            _w = self.reward_weights_np.astype(np.float32)
+            _cand = _w.copy()
+            _cand[~_NO_SYMLOG_MASK_FP] = 0.0  # keep only non-symlog cols
+            if np.any(_cand != 0.0):
+                _pidx = int(np.argmax(np.abs(_cand)))
+            else:
+                _pidx = int(np.argmax(np.abs(_w)))
+            _pw = float(_w[_pidx])
+            if _pw == 0.0:
+                _pw = 1.0
+            buf_reward_vec = np.array(buf_reward_vec, copy=True)
+            _fill = np.float32(self.failed_penalty / _pw)
+            buf_reward_vec[..., _pidx] = np.where(
+                buf_failed, _fill, buf_reward_vec[..., _pidx],
+            )
+
         # Multiplicative cosine-gate reward (ALPHAGRAD_REWARD_MODE=mult).
         # Collapse the per-channel buffer into the fidelity-gated cheapness
         # scalar on the cosine_sim channel BEFORE GAE/scalarisation. The
@@ -1928,24 +1990,16 @@ class PPORayWorker:
         # update step (see gdpo_normalise_advantages) so the global pass
         # would double-normalise and wash out cross-minibatch signal.
         if self.advantage_norm == "scalar":
-            # Fix 1: z-score over VALID transitions only. Failed/sentinel rows
-            # carry a zeroed reward → their advantage is a spurious ~0 that,
-            # if included, drags the batch mean toward 0 and inflates the std
-            # — washing out the real signal from the surviving good rules. We
-            # compute (mean, std) over the valid mask, then normalise the whole
-            # tensor with those valid-only statistics (invalid rows are dropped
-            # from the loss downstream via the per-sample ``valid`` mask, so
-            # their post-norm value is irrelevant). ``buf_failed`` is (T, N);
-            # advantages_b is (N, T) → transpose the mask to match.
-            _valid_b = jnp.asarray(
-                (~buf_failed).astype(np.float32).T
-            )  # (N, T)
-            _vcnt = jnp.maximum(jnp.sum(_valid_b), jnp.float32(1.0))
-            adv_mean = jnp.sum(advantages_b * _valid_b) / _vcnt
-            adv_var = (
-                jnp.sum(((advantages_b - adv_mean) ** 2) * _valid_b) / _vcnt
-            )
-            adv_std = jnp.sqrt(adv_var) + 1e-8
+            # Fix 1 (v2): z-score over ALL transitions (failed rows
+            # INCLUDED). Failed rows now carry the bounded-negative
+            # penalty (not a spurious 0), so including them in the
+            # (mean, std) makes their post-norm advantage strongly
+            # negative -> the policy is driven away from the failing
+            # region. Valid rows keep their RELATIVE signal (advantage
+            # is relative), so there is no dilution.
+            adv_flat = advantages_b.reshape(-1)
+            adv_mean = jnp.mean(adv_flat)
+            adv_std = jnp.std(adv_flat) + 1e-8
             advantages_b = (advantages_b - adv_mean) / adv_std
 
         # Stage for the update. Flatten (N, T) -> (N*T,) along the env
@@ -2120,25 +2174,16 @@ class PPORayWorker:
         per_env_weighted_sum = (
             buf_reward_vec * self.reward_weights_np
         ).sum(axis=(0, 2))  # (N,) — raw weighted per-env return
-        # Fix 1: the logged mean_return must exclude envs whose measure
-        # FAILED. This is a sparse-terminal reward (the signal lands only on
-        # the last step), so an env's episode is "failed" when its TERMINAL
-        # transition was sentineled — its per-env sum is then a spurious ~0
-        # that, if averaged in, craters mean_return toward 0 even when the
-        # surviving envs scored well. Mean over the VALID envs only (fall back
-        # to all envs if every env failed, to avoid a nan). ``best_return``
-        # is a max so failed 0-rows can only under-count it — but exclude
-        # them too for symmetry / correctness.
-        _env_valid = ~buf_failed[-1, :]  # (N,) — terminal step ok
+        # Fix 1 (v2): mean_return now INCLUDES all envs. Failed envs carry
+        # the bounded-negative penalty as their return (not a spurious 0),
+        # so averaging them in is the honest metric -- a mean that DROPS
+        # when the policy samples failing rules is exactly the signal we
+        # want to watch (does it climb back out?). ``best_return`` is the
+        # max over all envs (the penalty can only under-count it).
+        _env_valid = ~buf_failed[-1, :]  # (N,) -- terminal step ok
         _n_valid_env = int(_env_valid.sum())
-        if _n_valid_env > 0:
-            _valid_sums = per_env_weighted_sum[_env_valid]
-            episode_return = float(_valid_sums.mean())
-            best_return = float(_valid_sums.max())
-        else:
-            # Whole batch failed — report the (all-zero) mean rather than nan.
-            episode_return = float(per_env_weighted_sum.mean())
-            best_return = float(per_env_weighted_sum.max())
+        episode_return = float(per_env_weighted_sum.mean())
+        best_return = float(per_env_weighted_sum.max())
         last_aux_env_valid_frac = float(_n_valid_env) / max(int(N), 1)
 
         # Per-env action sequence — what landed in the env at each
