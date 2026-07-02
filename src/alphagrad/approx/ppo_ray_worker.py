@@ -246,6 +246,7 @@ class SimplePPOAgent(eqx.Module):
     dynamic_substeps: bool = eqx.field(static=True)
     num_factors: int = eqx.field(static=True)
     num_quant_dtypes: int = eqx.field(static=True)
+    policy: str = eqx.field(static=True)
 
     def __init__(
         self,
@@ -314,6 +315,7 @@ class SimplePPOAgent(eqx.Module):
         self.dynamic_substeps = dynamic_substeps
         self.num_factors = num_factors
         self.num_quant_dtypes = NUM_QUANT_DTYPES
+        self.policy = policy
 
     def encode(self, tokens, key, eqn_ids=None):
         """Return token-pooled context vector ``(embd_dim,)``.
@@ -326,10 +328,20 @@ class SimplePPOAgent(eqx.Module):
         """
         x = jax.vmap(self.embedding)(tokens)
         x = self.pos_enc(x)
-        x = self.encoder(x, eqn_ids=eqn_ids, key=key)
-        # Mean-pool over non-pad tokens. tokens==0 is the pad token in the
-        # graphax tokenizer; the mask is 1 for real tokens, 0 for pad.
-        mask = (tokens > 0).astype(x.dtype)[:, None]
+        # Pad mask threaded into the encoder so the palimpsa recurrence does NOT
+        # accumulate the ~16k padded positions — without it the linear-attention
+        # scan over MAX_TOKENS overflows (grads ~1e25 -> nan), nan-skipping every
+        # PPO update. BiPalimpsaMixer accepts a 1-D per-token mask (O(seq), keeps
+        # the linear scaling) and zeroes v/b/gt on pad positions. The transformer
+        # backbone instead wants a 2-D (S,S) attention mask, so we only pass the
+        # 1-D mask on the palimpsa paths (materialising a 16384^2 mask would
+        # defeat the O(seq) design and OOM); the transformer path is unchanged
+        # (mask=None, same as before this fix).
+        pad_tok = (tokens > 0)
+        enc_mask = pad_tok if self.policy in ("palimpsa", "palimpsa_bi") else None
+        x = self.encoder(x, eqn_ids=eqn_ids, mask=enc_mask, key=key)
+        # Mean-pool over non-pad tokens.
+        mask = pad_tok.astype(x.dtype)[:, None]
         denom = jnp.maximum(jnp.sum(mask), 1.0)
         return jnp.sum(x * mask, axis=0) / denom
 
