@@ -2403,126 +2403,149 @@ def _callback(
         and not _bypass_rm
     )
     _budget_hit = False
-    for d in _point_iter:
-        if _budget_hit:
-            break
-        if eval_samples:
-            eval_args_i = [arg[d] for arg in eval_samples]
-        else:
-            eval_args_i = list(args)
-        if callback_device is not None or _shard_mesh is not None:
-            eval_args_i = _put_measure(eval_args_i)
-        # Per-data-point warmup: discard the first ``_warmup`` executions so
-        # first-touch / cache / allocation effects don't pollute the timed
-        # readings (see EnvConfig.latency_warmup). Each warmup exec is itself
-        # checked against the slow-order cutoff so a pathological order bails
-        # after one ~cutoff-second exec instead of running the full warmup +
-        # inner loop first. The LAST warmup exec doubles as the peak-memory
-        # read (it's discarded for timing anyway) — avoids a separate extra
-        # execution per data point when warmup is enabled. ``None`` ⇒ not yet
-        # captured, fall back to the dedicated r==0 monitor below.
-        _peak_captured = None
-        for _w in range(_warmup):
-            _ws = _measure_time.perf_counter()
-            if (not _bypass_rm) and _w == _warmup - 1:
-                with ResourceMonitor(devices=unique_devices) as _wmon:
-                    _wout = compiled_approx(*eval_args_i)
-                jax.block_until_ready(_wout)
-                _peak_captured = float(_wmon.stats.get("memory", 0.0))
-            else:
-                jax.block_until_ready(compiled_approx(*eval_args_i))
-            if _slow_cutoff > 0.0 and (
-                _measure_time.perf_counter() - _ws
-            ) > _slow_cutoff:
-                _budget_hit = True
-                break
-        for r in range(reps):
+    # Fix 2(b): guard the whole exec loop against a GPU OOM / RESOURCE_
+    # EXHAUSTED (a too-big COMPRESS densification exceeding the mem-gate's
+    # headroom). Convert it to a RuntimeError so the pool's existing
+    # handler turns it into a clean [SENTINEL] (bounded, excluded from the
+    # loss by Fix 1) instead of crashing / hanging the measure actor.
+    try:
+        for d in _point_iter:
             if _budget_hit:
                 break
-            # Latency: time a tight inner loop of ``_inner`` back-to-back
-            # executions with a SINGLE closing ``block_until_ready`` barrier,
-            # using ``perf_counter``, then divide by the rep count. This
-            # amortizes per-call dispatch/barrier overhead (the dominant noise
-            # for sub-ms kernels) and — unlike the old ResourceMonitor wall
-            # timer, whose ``stop()`` fired before its barrier drained the
-            # async queue — measures the true end-to-end latency with a stable
-            # absolute value. ResourceMonitor is now used for the peak-memory
-            # channel ONLY (one call per data point; peak is deterministic).
-            _exec_wall0 = _measure_time.time()
-            if _use_rm_timer:
-                # RM times the inner loop with ``block_until_ready`` INSIDE the
-                # context (duration = true device time, validated ≈ perf_counter)
-                # and reads peak memory from the SAME pass on the first rep — one
-                # execution serves both the latency and peak-memory channels.
-                _want_peak = (r == 0 and _peak_captured is None)
-                with ResourceMonitor(
-                    devices=unique_devices, time=True, peak=_want_peak,
-                ) as _tmon:
+            if eval_samples:
+                eval_args_i = [arg[d] for arg in eval_samples]
+            else:
+                eval_args_i = list(args)
+            if callback_device is not None or _shard_mesh is not None:
+                eval_args_i = _put_measure(eval_args_i)
+            # Per-data-point warmup: discard the first ``_warmup`` executions so
+            # first-touch / cache / allocation effects don't pollute the timed
+            # readings (see EnvConfig.latency_warmup). Each warmup exec is itself
+            # checked against the slow-order cutoff so a pathological order bails
+            # after one ~cutoff-second exec instead of running the full warmup +
+            # inner loop first. The LAST warmup exec doubles as the peak-memory
+            # read (it's discarded for timing anyway) — avoids a separate extra
+            # execution per data point when warmup is enabled. ``None`` ⇒ not yet
+            # captured, fall back to the dedicated r==0 monitor below.
+            _peak_captured = None
+            for _w in range(_warmup):
+                _ws = _measure_time.perf_counter()
+                if (not _bypass_rm) and _w == _warmup - 1:
+                    with ResourceMonitor(devices=unique_devices) as _wmon:
+                        _wout = compiled_approx(*eval_args_i)
+                    jax.block_until_ready(_wout)
+                    _peak_captured = float(_wmon.stats.get("memory", 0.0))
+                else:
+                    jax.block_until_ready(compiled_approx(*eval_args_i))
+                if _slow_cutoff > 0.0 and (
+                    _measure_time.perf_counter() - _ws
+                ) > _slow_cutoff:
+                    _budget_hit = True
+                    break
+            for r in range(reps):
+                if _budget_hit:
+                    break
+                # Latency: time a tight inner loop of ``_inner`` back-to-back
+                # executions with a SINGLE closing ``block_until_ready`` barrier,
+                # using ``perf_counter``, then divide by the rep count. This
+                # amortizes per-call dispatch/barrier overhead (the dominant noise
+                # for sub-ms kernels) and — unlike the old ResourceMonitor wall
+                # timer, whose ``stop()`` fired before its barrier drained the
+                # async queue — measures the true end-to-end latency with a stable
+                # absolute value. ResourceMonitor is now used for the peak-memory
+                # channel ONLY (one call per data point; peak is deterministic).
+                _exec_wall0 = _measure_time.time()
+                if _use_rm_timer:
+                    # RM times the inner loop with ``block_until_ready`` INSIDE the
+                    # context (duration = true device time, validated ≈ perf_counter)
+                    # and reads peak memory from the SAME pass on the first rep — one
+                    # execution serves both the latency and peak-memory channels.
+                    _want_peak = (r == 0 and _peak_captured is None)
+                    with ResourceMonitor(
+                        devices=unique_devices, time=True, peak=_want_peak,
+                    ) as _tmon:
+                        for _ in range(_inner):
+                            out_approx = compiled_approx(*eval_args_i)
+                        jax.block_until_ready(out_approx)
+                    _lat_ns = _tmon.duration / _inner * 1e9
+                    if r == 0:
+                        peak_mem_samples.append(
+                            _peak_captured if _peak_captured is not None
+                            else float(_tmon.stats.get("memory", 0.0))
+                        )
+                else:
+                    # perf_counter inner loop + a separate ResourceMonitor pass for
+                    # peak memory (once per data point, first rep).
+                    _t0 = _measure_time.perf_counter()
                     for _ in range(_inner):
                         out_approx = compiled_approx(*eval_args_i)
                     jax.block_until_ready(out_approx)
-                _lat_ns = _tmon.duration / _inner * 1e9
-                if r == 0:
-                    peak_mem_samples.append(
-                        _peak_captured if _peak_captured is not None
-                        else float(_tmon.stats.get("memory", 0.0))
-                    )
-            else:
-                # perf_counter inner loop + a separate ResourceMonitor pass for
-                # peak memory (once per data point, first rep).
-                _t0 = _measure_time.perf_counter()
-                for _ in range(_inner):
-                    out_approx = compiled_approx(*eval_args_i)
-                jax.block_until_ready(out_approx)
-                _lat_ns = (_measure_time.perf_counter() - _t0) / _inner * 1e9
-                if r == 0:
-                    if _peak_captured is not None:
-                        peak_mem_samples.append(_peak_captured)
-                    elif _bypass_rm:
-                        peak_mem_samples.append(0.0)
-                    else:
-                        with ResourceMonitor(devices=unique_devices) as monitor:
-                            _mout = compiled_approx(*eval_args_i)
-                        jax.block_until_ready(_mout)
-                        peak_mem_samples.append(
-                            float(monitor.stats.get("memory", 0.0))
+                    _lat_ns = (_measure_time.perf_counter() - _t0) / _inner * 1e9
+                    if r == 0:
+                        if _peak_captured is not None:
+                            peak_mem_samples.append(_peak_captured)
+                        elif _bypass_rm:
+                            peak_mem_samples.append(0.0)
+                        else:
+                            with ResourceMonitor(devices=unique_devices) as monitor:
+                                _mout = compiled_approx(*eval_args_i)
+                            jax.block_until_ready(_mout)
+                            peak_mem_samples.append(
+                                float(monitor.stats.get("memory", 0.0))
+                            )
+                latency_samples.append(_lat_ns)
+                _exec_wall = _measure_time.time() - _exec_wall0
+                # Per-EXEC time for the cutoff (the inner loop runs _inner execs;
+                # _exec_wall spans the whole loop + the r==0 peak-memory exec, so
+                # comparing it directly to the per-exec cutoff would trip on
+                # healthy orders once _inner>1). Use the amortized per-exec time.
+                _per_exec_s = _lat_ns / 1e9
+
+                # Quality pair: collect once per data point (first rep only).
+                # ``compiled_exact`` is non-None only at the terminal step.
+                # Force-materialize the exact result HERE so its execution
+                # cost is attributed to this point's measurement (and to the
+                # quality phase intent) rather than leaking, lazily, into the
+                # NEXT iteration's ResourceMonitor barrier — which previously
+                # mis-attributed exact-compute time to the approx latency
+                # reading and hid it from the slow-order cutoff.
+                if compiled_exact is not None and r == 0:
+                    out_approxs.append(out_approx)
+                    _oe = compiled_exact(*eval_args_i)
+                    jax.block_until_ready(_oe)
+                    out_exacts.append(_oe)
+
+                # Slow-order cutoff: if a single exec exceeded the cutoff, the
+                # order is pathologically expensive — one sample is enough to know
+                # it's slow. Keep what we have and stop.
+                if _slow_cutoff > 0.0 and _per_exec_s > _slow_cutoff:
+                    _budget_hit = True
+                    if _dbg_t:
+                        print(
+                            f"[DBG-env] slow-order cutoff at d={d + 1}/{n_points} "
+                            f"r={r + 1}/{reps}: per_exec={_per_exec_s:.1f}s > "
+                            f"{_slow_cutoff:.0f}s — capping samples",
+                            flush=True,
                         )
-            latency_samples.append(_lat_ns)
-            _exec_wall = _measure_time.time() - _exec_wall0
-            # Per-EXEC time for the cutoff (the inner loop runs _inner execs;
-            # _exec_wall spans the whole loop + the r==0 peak-memory exec, so
-            # comparing it directly to the per-exec cutoff would trip on
-            # healthy orders once _inner>1). Use the amortized per-exec time.
-            _per_exec_s = _lat_ns / 1e9
+                    break
 
-            # Quality pair: collect once per data point (first rep only).
-            # ``compiled_exact`` is non-None only at the terminal step.
-            # Force-materialize the exact result HERE so its execution
-            # cost is attributed to this point's measurement (and to the
-            # quality phase intent) rather than leaking, lazily, into the
-            # NEXT iteration's ResourceMonitor barrier — which previously
-            # mis-attributed exact-compute time to the approx latency
-            # reading and hid it from the slow-order cutoff.
-            if compiled_exact is not None and r == 0:
-                out_approxs.append(out_approx)
-                _oe = compiled_exact(*eval_args_i)
-                jax.block_until_ready(_oe)
-                out_exacts.append(_oe)
-
-            # Slow-order cutoff: if a single exec exceeded the cutoff, the
-            # order is pathologically expensive — one sample is enough to know
-            # it's slow. Keep what we have and stop.
-            if _slow_cutoff > 0.0 and _per_exec_s > _slow_cutoff:
-                _budget_hit = True
-                if _dbg_t:
-                    print(
-                        f"[DBG-env] slow-order cutoff at d={d + 1}/{n_points} "
-                        f"r={r + 1}/{reps}: per_exec={_per_exec_s:.1f}s > "
-                        f"{_slow_cutoff:.0f}s — capping samples",
-                        flush=True,
-                    )
-                break
-
+    except (MemoryError, RuntimeError) as _oom_e:
+        _m = str(_oom_e)
+        if 'mem-gate' in _m:
+            raise
+        print(f'[SENTINEL] measure-oom during exec: {_m[:160]}', flush=True)
+        raise RuntimeError(f'measure-oom: {_m[:200]}')
+    except Exception as _xla_e:
+        # jaxlib XlaRuntimeError (RESOURCE_EXHAUSTED / OOM) is not a
+        # subclass of the above; catch by name so a device OOM never
+        # crashes the actor — it becomes a bounded sentinel.
+        _n = type(_xla_e).__name__
+        _m = str(_xla_e)
+        if ('XlaRuntimeError' in _n or 'RESOURCE_EXHAUSTED' in _m
+                or 'out of memory' in _m.lower() or 'RESOURCE_EXHAUSTED' in _n):
+            print(f'[SENTINEL] measure-oom (xla) during exec: {_m[:160]}', flush=True)
+            raise RuntimeError(f'measure-oom: {_m[:200]}')
+        raise
     # Noisy-channel aggregation: P-``percentile_keep`` over the full
     # pool of ``n_points * reps`` measurements (default P60 of 20).
     # Replaces the legacy top-quartile-mean (latency) and max
