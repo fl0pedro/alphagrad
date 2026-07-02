@@ -488,7 +488,20 @@ class PPORayWorker:
         self.minibatches = max(int(getattr(self.args, "minibatches", 1)), 1)
         self.ppo_eps = float(getattr(self.args, "ppo_eps", 0.2))
         self.value_coef = float(getattr(self.args, "value_coef", 0.5))
-        self.entropy_coef = float(getattr(self.args, "entropy_coef", 0.01))
+        # Entropy-coef annealing (Fix 3). The coefficient is decayed
+        # linearly from ``entropy_coef`` (init) to ``entropy_coef_final``
+        # (floor) over the run's episodes so the policy explores early
+        # then COMMITS to the best rule. ``self.entropy_coef`` is the LIVE
+        # (annealed) value, recomputed every episode in
+        # ``run_rollout_and_train`` and PASSED AS A RUNTIME ARG into the
+        # jit'd update step — NOT captured in the loss closure (the old
+        # capture-once path is why annealing was dead code and entropy
+        # stayed pinned ~1.99).
+        self.entropy_coef_init = float(getattr(self.args, "entropy_coef", 0.01))
+        self.entropy_coef_final = float(
+            getattr(self.args, "entropy_coef_final", 0.001)
+        )
+        self.entropy_coef = self.entropy_coef_init
         self.gae_lambda = float(getattr(self.args, "gae_lambda", 0.95))
         self.discount = float(getattr(self.args, "discount", 0.99))
         self.reward_weights_np = _build_reward_weights(self.args)
@@ -1238,7 +1251,10 @@ class PPORayWorker:
     def _make_update_step(self):
         clip_eps = self.ppo_eps
         value_coef = self.value_coef
-        entropy_coef = self.entropy_coef
+        # NB: entropy_coef is NOT captured here — it is threaded through as a
+        # runtime arg (``entropy_coef``) into loss_fn / update_step so the
+        # per-episode anneal (Fix 3) actually reaches the loss. Capturing it
+        # in this closure (the old behaviour) froze it at the ctor value.
         dynamic = self.dynamic_substeps
         # Mode-aware capture so the closure switches on the right path
         # without recompiling per call.
@@ -1258,7 +1274,8 @@ class PPORayWorker:
         # is a cheap re-import.
         from alphagrad.approx.common.gae import gdpo_normalise_advantages
 
-        def loss_fn(agent, batch, op_mask, factor_mask, quant_mask, key):
+        def loss_fn(agent, batch, op_mask, factor_mask, quant_mask, key,
+                    entropy_coef):
             """``op_mask`` / ``factor_mask`` / ``quant_mask`` are the
             curriculum masks for the CURRENT stage. They must match
             the masks used at rollout time (in ``act_step``) —
@@ -1386,6 +1403,7 @@ class PPORayWorker:
                 "ppo_loss": ppo_loss,
                 "value_loss": value_loss,
                 "entropy": jnp.mean(ent),
+                "entropy_coef": entropy_coef,
                 "entropy/vertex": head_means[0],
                 "entropy/op_type": head_means[1],
                 "entropy/axis_i": head_means[2],
@@ -1400,9 +1418,11 @@ class PPORayWorker:
 
         @eqx.filter_jit
         def update_step(agent, opt_state, batch,
-                        op_mask, factor_mask, quant_mask, key):
+                        op_mask, factor_mask, quant_mask, key,
+                        entropy_coef):
             (loss, aux), grads = grad_fn(
                 agent, batch, op_mask, factor_mask, quant_mask, key,
+                entropy_coef,
             )
             # NaN-skip guard: if loss is non-finite (sentinel
             # poisoning, cold-cache compile-error fallback, etc.),
@@ -2007,6 +2027,18 @@ class PPORayWorker:
         opt_state = self.opt_state
         last_aux = {}
         nan_skip_total = 0
+
+        # Fix 3: linear entropy-coef anneal from init → final over the run.
+        # Recomputed EVERY episode and passed as a runtime arg into the jit'd
+        # update step (NOT captured in the loss closure), so the decay
+        # actually reaches the loss — the policy explores early then commits.
+        _total_eps = max(int(getattr(self.args, "episodes", 1000)), 1)
+        _progress = min(self._episode_counter / _total_eps, 1.0)
+        self.entropy_coef = (
+            self.entropy_coef_init
+            + (self.entropy_coef_final - self.entropy_coef_init) * _progress
+        )
+        _ent_coef_j = jnp.asarray(self.entropy_coef, dtype=jnp.float32)
         for i in range(mb_count):
             batch = (
                 mb_tokens[i], mb_actions[i],
@@ -2019,6 +2051,7 @@ class PPORayWorker:
                 agent, opt_state, batch,
                 self._current_op_mask_j, self._current_factor_mask_j,
                 self._current_quant_mask_j, mb_key,
+                _ent_coef_j,
             )
             nan_skip_total += int(aux.pop("nan_skip", 0))
             last_aux = {k: float(v) for k, v in aux.items()}
@@ -2139,6 +2172,8 @@ class PPORayWorker:
             "num_envs": N,
             "nan_skip_count": int(nan_skip_total),
             "train_step": int(self._episode_counter),
+            # Fix 3 telemetry: the LIVE annealed entropy coefficient.
+            "entropy_coef": float(self.entropy_coef),
         })
         # Per-channel raw-reward means — same key namespace MuZero
         # uses. Already part of `per_reward_means` in `ch_stats` but
