@@ -261,13 +261,23 @@ class SimplePPOAgent(eqx.Module):
         key,
         dynamic_substeps: bool = False,
         num_factors: int = 4,
+        policy: str = "transformer",
     ):
         from alphagrad.transformer import MLP, Encoder, PositionalEncoder
 
         keys = jrand.split(key, 9)
         self.embedding = eqx.nn.Embedding(vocab_size, embd_dim, key=keys[0])
         self.pos_enc = PositionalEncoder(embd_dim, MAX_TOKENS)
-        self.encoder = Encoder(num_layers, num_heads, embd_dim, hidden_dim, key=keys[1])
+        # Thread the token-mixer policy (ALPHAGRAD_POLICY) into the encoder,
+        # mirroring ppo.py::Agent (ppo.py:2996 `Encoder(..., policy=_policy)`).
+        # Without this the worker's encoder silently defaulted to the plain
+        # O(seq^2) transformer even under ALPHAGRAD_POLICY=palimpsa_bi — no
+        # BiPalimpsaMixer, no relational DAG gate. `eqn_ids` is threaded into
+        # ``encode`` below so the palimpsa_bi relational gate is actually fed.
+        self.encoder = Encoder(
+            num_layers, num_heads, embd_dim, hidden_dim,
+            key=keys[1], policy=policy,
+        )
         self.vertex_logits_head = MLP(
             embd_dim, num_vertices, policy_dims, key=keys[2],
         )
@@ -305,42 +315,49 @@ class SimplePPOAgent(eqx.Module):
         self.num_factors = num_factors
         self.num_quant_dtypes = NUM_QUANT_DTYPES
 
-    def encode(self, tokens, key):
-        """Return token-pooled context vector ``(embd_dim,)``."""
+    def encode(self, tokens, key, eqn_ids=None):
+        """Return token-pooled context vector ``(embd_dim,)``.
+
+        ``eqn_ids`` (per-token equation id, -1 for pad/non-eqn) is passed
+        straight into the encoder so the relational DAG-degree gate is active
+        under ``policy=palimpsa_bi`` (and the pairwise relational bias under
+        the plain transformer). Mirrors ppo.py::Agent.encode_once
+        (ppo.py:1470 `self.encoder(x, eqn_ids=eqn_ids, key=...)`).
+        """
         x = jax.vmap(self.embedding)(tokens)
         x = self.pos_enc(x)
-        x = self.encoder(x, key=key)
+        x = self.encoder(x, eqn_ids=eqn_ids, key=key)
         # Mean-pool over non-pad tokens. tokens==0 is the pad token in the
         # graphax tokenizer; the mask is 1 for real tokens, 0 for pad.
         mask = (tokens > 0).astype(x.dtype)[:, None]
         denom = jnp.maximum(jnp.sum(mask), 1.0)
         return jnp.sum(x * mask, axis=0) / denom
 
-    def policy_logits(self, tokens, key):
-        ctx = self.encode(tokens, key=key)
+    def policy_logits(self, tokens, key, eqn_ids=None):
+        ctx = self.encode(tokens, key=key, eqn_ids=eqn_ids)
         return self.vertex_logits_head(ctx)
 
-    def value(self, tokens, key):
+    def value(self, tokens, key, eqn_ids=None):
         # Per-channel value: returns shape ``(NUM_REWARDS,)``. Legacy
         # callers expecting a scalar must collapse via dot-product with
         # reward weights — see ``_scalar_value`` on the worker.
-        ctx = self.encode(tokens, key=key)
+        ctx = self.encode(tokens, key=key, eqn_ids=eqn_ids)
         return self.value_head(ctx)
 
-    def policy_and_value(self, tokens, key):
-        ctx = self.encode(tokens, key=key)
+    def policy_and_value(self, tokens, key, eqn_ids=None):
+        ctx = self.encode(tokens, key=key, eqn_ids=eqn_ids)
         logits = self.vertex_logits_head(ctx)
         value = self.value_head(ctx)  # (NUM_REWARDS,)
         return logits, value
 
-    def micro_action_logits(self, tokens, key):
+    def micro_action_logits(self, tokens, key, eqn_ids=None):
         """Return ``(op_logits, i_logits, j_logits, factor_logits, quant_logits)``.
 
         Each one is a flat categorical over its component's choice set.
         Only callable when ``dynamic_substeps`` is on; the caller is
         responsible for not invoking this on a non-dynamic agent.
         """
-        ctx = self.encode(tokens, key=key)
+        ctx = self.encode(tokens, key=key, eqn_ids=eqn_ids)
         return (
             self.op_type_head(ctx),
             self.i_head(ctx),
@@ -349,7 +366,7 @@ class SimplePPOAgent(eqx.Module):
             self.quant_dtype_head(ctx),
         )
 
-    def all_logits(self, tokens, key):
+    def all_logits(self, tokens, key, eqn_ids=None):
         """Single-encode variant returning
         ``(vertex_logits, value, op, i, j, factor, quant)``.
 
@@ -365,7 +382,7 @@ class SimplePPOAgent(eqx.Module):
         returned slots are placeholder zero arrays so the caller's
         downstream unpacking stays uniform.
         """
-        ctx = self.encode(tokens, key=key)
+        ctx = self.encode(tokens, key=key, eqn_ids=eqn_ids)
         vertex_logits = self.vertex_logits_head(ctx)
         value = self.value_head(ctx)  # (NUM_REWARDS,)
         if self.dynamic_substeps:
@@ -956,6 +973,26 @@ class PPORayWorker:
             masks["quant_dtype_mask"].astype(np.float32),
         )
         self.num_factors = len(self.factor_table)
+        # Resolve the token-mixer policy exactly as ppo.py::make_agent does
+        # (ppo.py:2984): env override first, then ALPHAGRAD_POLICY, default
+        # "transformer". Prior to this the worker built a plain transformer
+        # regardless of ALPHAGRAD_POLICY — palimpsa_bi was inert on the
+        # ACTUAL Ray rollout path (only ppo.py::Agent honoured it).
+        _policy = getattr(self.args, "policy", None) or os.environ.get(
+            "ALPHAGRAD_POLICY", "transformer"
+        )
+        _policy = str(_policy).strip().lower()
+        if _policy not in ("transformer", "palimpsa", "palimpsa_bi"):
+            raise ValueError(
+                "ALPHAGRAD_POLICY must be 'transformer', 'palimpsa' or "
+                f"'palimpsa_bi', got {_policy!r}"
+            )
+        self._policy = _policy
+        print(
+            f"[ppo_ray_worker] policy backbone: {_policy.upper()} "
+            f"(SimplePPOAgent encoder; eqn_ids threaded)",
+            flush=True,
+        )
         self.agent = SimplePPOAgent(
             vocab_size=int(self.args.vocab_size),
             embd_dim=int(self.args.embd_dim),
@@ -968,7 +1005,25 @@ class PPORayWorker:
             key=agent_key,
             dynamic_substeps=self.dynamic_substeps,
             num_factors=self.num_factors,
+            policy=_policy,
         )
+        # One-time assertion that the palimpsa_bi backbone was actually
+        # instantiated on the worker path (guards against silent
+        # transformer fallback regressions). Cheap: inspects a static field.
+        if _policy == "palimpsa_bi":
+            from alphagrad.transformer.encoder import BiPalimpsaMixer
+            _layer0 = self.agent.encoder.layers[0]
+            _mixer = getattr(_layer0, "attn_layer", None)
+            assert isinstance(_mixer, BiPalimpsaMixer), (
+                "ALPHAGRAD_POLICY=palimpsa_bi but SimplePPOAgent encoder "
+                f"layer 0 mixer is {type(_mixer).__name__}, not "
+                "BiPalimpsaMixer — policy did not reach the Ray rollout path."
+            )
+            print(
+                "[ppo_ray_worker] VERIFIED BiPalimpsaMixer active on "
+                f"encoder ({self.agent.encoder.num_layers} layers)",
+                flush=True,
+            )
         self.agent = init_linear_weights(self.agent, init_key)
         # Replicate the agent across all devices — under SPMD this is
         # cheap (params are < 100 MB) and lets `act_step` / loss path
@@ -1235,7 +1290,7 @@ class PPORayWorker:
                 # is off, the five micro slots are placeholders that
                 # the `if dynamic:` branch below never reads.
                 logits, value, op_l, i_l, j_l, f_l, q_l = agent.all_logits(
-                    state_i.tokens, key=k_enc,
+                    state_i.tokens, key=k_enc, eqn_ids=state_i.eqn_ids,
                 )
                 masked = jnp.where(avail_i > 0.5, logits, -1e9)
                 log_probs_v = jax.nn.log_softmax(masked)
@@ -1387,7 +1442,7 @@ class PPORayWorker:
             different distribution from the one that produced the
             samples, breaking the on-policy assumption."""
             (
-                tokens, actions, op_a, i_a, j_a, f_a, q_a,
+                tokens, eqn_ids, actions, op_a, i_a, j_a, f_a, q_a,
                 vertex_idx_for_mask,
                 old_log_probs, returns, advantages, valid,
             ) = batch
@@ -1411,15 +1466,17 @@ class PPORayWorker:
                 adv_scalar = advantages
             keys = jrand.split(key, tokens.shape[0])
 
-            def per_sample(tok, v_act, op, i_s, j_s, f_s, q_s, v_for_mask,
+            def per_sample(tok, eqn, v_act, op, i_s, j_s, f_s, q_s, v_for_mask,
                             olp, ret, adv, k):
                 # Single encoder forward for both the vertex/value
                 # heads and the micro-action heads; mirrors the
                 # equivalent share in `act_step`. When dynamic is off
                 # the (op_l, i_l, j_l, f_l, q_l) slots are placeholders
                 # and the `if dynamic:` branch below skips them.
+                # ``eqn`` (per-token eqn_ids) feeds the relational gate so
+                # the loss-time encoding matches the rollout encoding.
                 logits, value, op_l, i_l, j_l, f_l, q_l = agent.all_logits(
-                    tok, key=k,
+                    tok, key=k, eqn_ids=eqn,
                 )
                 log_probs = jax.nn.log_softmax(logits)
                 lp_v = log_probs[v_act]
@@ -1498,7 +1555,7 @@ class PPORayWorker:
                 return policy_loss, value_loss, entropy, per_head
 
             p_l, v_l, ent, per_head_ent = jax.vmap(per_sample)(
-                tokens, actions, op_a, i_a, j_a, f_a, q_a,
+                tokens, eqn_ids, actions, op_a, i_a, j_a, f_a, q_a,
                 vertex_idx_for_mask,
                 old_log_probs, returns, adv_scalar, keys,
             )
@@ -1603,6 +1660,12 @@ class PPORayWorker:
         T = int(self.rollout_length)
         N = int(self.num_envs)
         buf_tokens = np.zeros((T, N, MAX_TOKENS), dtype=np.int32)
+        # Per-token equation ids for the relational gate (palimpsa_bi) /
+        # relational bias (transformer). Recorded alongside tokens so the
+        # loss path re-encodes with the SAME relational structure the
+        # rollout policy used (mirrors ppo.py which carries state.eqn_ids
+        # into the loss batch). Pad/non-eqn tokens are -1.
+        buf_eqn_ids = np.zeros((T, N, MAX_TOKENS), dtype=np.int32)
         buf_actions = np.zeros((T, N), dtype=np.int32)
         # Per-head action samples — only meaningful when dynamic_substeps
         # is on. When off they stay zero and the loss treats them as
@@ -1707,6 +1770,7 @@ class PPORayWorker:
             # Record. We store the *post-step* tokens so the next-step
             # policy gradient targets see the same obs the policy used.
             buf_tokens[t] = np.asarray(state.tokens)
+            buf_eqn_ids[t] = np.asarray(state.eqn_ids)
             buf_actions[t] = np.asarray(actions)
             buf_op[t] = np.asarray(op_a)
             buf_i[t] = np.asarray(i_a)
@@ -1727,7 +1791,7 @@ class PPORayWorker:
             jrand.split(boot_key, N), self.data_sharding,
         )
         bootstrap = np.asarray(
-            jax.vmap(lambda s, k: self.agent.value(s.tokens, key=k))(state, boot_keys),
+            jax.vmap(lambda s, k: self.agent.value(s.tokens, key=k, eqn_ids=s.eqn_ids))(state, boot_keys),
         )  # (N, NUM_REWARDS)
 
         # ANTI-DEGEN / failed-measure mask. A measurement is "failed"
@@ -2074,6 +2138,7 @@ class PPORayWorker:
         # loss); scalar mode collapsed them above and they're already
         # 1D here.
         flat_tokens = jnp.asarray(buf_tokens.transpose(1, 0, 2).reshape(N * T, MAX_TOKENS))
+        flat_eqn_ids = jnp.asarray(buf_eqn_ids.transpose(1, 0, 2).reshape(N * T, MAX_TOKENS))
         flat_actions = jnp.asarray(buf_actions.T.reshape(N * T))
         flat_op = jnp.asarray(buf_op.T.reshape(N * T))
         flat_i = jnp.asarray(buf_i.T.reshape(N * T))
@@ -2102,6 +2167,7 @@ class PPORayWorker:
         perm_key = jrand.fold_in(key, int(self._episode_counter))
         perm = jrand.permutation(perm_key, N * T)
         flat_tokens = flat_tokens[perm]
+        flat_eqn_ids = flat_eqn_ids[perm]
         flat_actions = flat_actions[perm]
         flat_op = flat_op[perm]
         flat_i = flat_i[perm]
@@ -2129,6 +2195,7 @@ class PPORayWorker:
         if valid_total < total:
             print(f"[ppo_ray] truncating batch from {total} to {valid_total} to ensure mb_size={mb_size} is a multiple of {self.num_devices}")
             flat_tokens = flat_tokens[:valid_total]
+            flat_eqn_ids = flat_eqn_ids[:valid_total]
             flat_actions = flat_actions[:valid_total]
             flat_op = flat_op[:valid_total]
             flat_i = flat_i[:valid_total]
@@ -2152,6 +2219,7 @@ class PPORayWorker:
             return flat.reshape((mb_count, mb_size, *mb_extra_shape))
 
         mb_tokens = _reshape_mb(flat_tokens, (MAX_TOKENS,))
+        mb_eqn_ids = _reshape_mb(flat_eqn_ids, (MAX_TOKENS,))
         mb_actions = _reshape_mb(flat_actions)
         mb_op = _reshape_mb(flat_op)
         mb_i = _reshape_mb(flat_i)
@@ -2173,6 +2241,7 @@ class PPORayWorker:
         if mb_sharded:
             _shard = lambda x: jax.device_put(x, self.scan_data_sharding)
             mb_tokens = _shard(mb_tokens)
+            mb_eqn_ids = _shard(mb_eqn_ids)
             mb_actions = _shard(mb_actions)
             mb_op = _shard(mb_op)
             mb_i = _shard(mb_i)
@@ -2203,7 +2272,7 @@ class PPORayWorker:
         _ent_coef_j = jnp.asarray(self.entropy_coef, dtype=jnp.float32)
         for i in range(mb_count):
             batch = (
-                mb_tokens[i], mb_actions[i],
+                mb_tokens[i], mb_eqn_ids[i], mb_actions[i],
                 mb_op[i], mb_i[i], mb_j[i], mb_f[i], mb_q[i],
                 mb_vmask[i],
                 mb_log_probs[i], mb_returns[i], mb_advantages[i],
