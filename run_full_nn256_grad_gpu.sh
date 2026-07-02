@@ -67,6 +67,17 @@ export ALPHAGRAD_QUANT_ALLOWED="int8,int16,float8_e4m3fn,float8_e5m2,bfloat16,fl
 export ALPHAGRAD_NN_HIDDEN=256
 export ALPHAGRAD_REWARD_MODE=additive
 export ALPHAGRAD_ADDITIVE_SYMLOG_COST=1
+# >>> COST SENSITIVITY: lambda INSIDE the symlog (symlog(lambda_inner*raw)) <<<
+# The cost term was lambda_outer*symlog(raw): huge raw costs (latency ~1.13e5 ns,
+# peak_memory ~1.30e8 B from ep-20 best.json) saturate symlog's log regime, so
+# a 2x-cheaper order barely moved the reward (~few-e-4) — cost was rank-blind.
+# Fix: per-channel lambda_inner ~ 1/typical_raw_cost puts a typical cost in the
+# LINEAR regime (|lambda_inner*cost|~1) so order-of-magnitude differences are
+# PRESERVED (sensitive), outliers still log-bounded. Then a SMALL outer weight
+# (lambda_cmp/lambda_mem=0.06 below) keeps the cost a minor nudge (~0.08 typical
+# combined) vs bkstep (~0.5). w_outer*symlog(lambda_inner*raw).
+export ALPHAGRAD_INNER_LAMBDA_LATENCY_NS="${ALPHAGRAD_INNER_LAMBDA_LATENCY_NS:-9e-6}"   # 1/1.13e5
+export ALPHAGRAD_INNER_LAMBDA_PEAK_MEMORY="${ALPHAGRAD_INNER_LAMBDA_PEAK_MEMORY:-7.7e-9}" # 1/1.30e8
 # Bidirectional Palimpsa (gated linear-attention, O(seq)) policy backbone —
 # efficient over the now-unclipped ~8.2k-token grad graph (MAX_TOKENS=16384).
 export ALPHAGRAD_POLICY=palimpsa_bi
@@ -107,8 +118,13 @@ SEED="${SEED:-2000}"
 NUM_ENVS="${NUM_ENVS:-4}"
 MBS="${MBS:-32}"
 LAMBDA_ACC="${LAMBDA_ACC:-1.0}"
-LAMBDA_CMP="${LAMBDA_CMP:-0.001}"
-LAMBDA_MEM="${LAMBDA_MEM:-0.001}"
+# w_outer for the cost channels. lambda is now INSIDE the symlog (per-channel
+# ALPHAGRAD_INNER_LAMBDA_* above); this OUTER weight just scales the whole
+# symlog'd term. w_outer=0.06 -> typical combined cost term ~0.08 (symlog(~1)~
+# 0.69 per channel), a minor nudge vs bkstep(~0.5); 2x-cheaper vs typical moves
+# reward by ~0.035 (was ~0.0014 with the old lambda*symlog(raw) at 0.001).
+LAMBDA_CMP="${LAMBDA_CMP:-0.06}"   # w_outer (latency); lambda_inner is 1/typical_raw
+LAMBDA_MEM="${LAMBDA_MEM:-0.06}"   # w_outer (peak_memory)
 # Fix 3: entropy-coef anneal range. Start high (0.05) so the 6-head action
 # space explores early, decay linearly to a small floor (0.002) by the end of
 # the run so the policy COMMITS to the best rule (entropy was pinned ~1.99 =

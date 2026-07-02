@@ -103,6 +103,53 @@ _COST_SYMLOG_INDICES: tuple[int, ...] = tuple(
 _COST_SYMLOG_MASK_NP: np.ndarray = np.zeros((NUM_REWARDS,), dtype=bool)
 _COST_SYMLOG_MASK_NP[list(_COST_SYMLOG_INDICES)] = True
 
+# INNER-LAMBDA (per cost channel). The additive cost term was
+# ``lambda_outer * symlog(raw_cost)``: because raw costs are HUGE (latency
+# ~1.1e5 ns, peak_memory ~1.3e8 B) they saturate symlog's log regime, so a
+# 2x-cheaper order moves the term by only ~symlog(2x)-symlog(1x) ~ log(2)/raw
+# -> a few-e-4 delta once multiplied by lambda_outer. The cost channel was
+# effectively CONSTANT (rank-blind). Fix: move the lambda INSIDE the symlog and
+# make it a PER-CHANNEL RESCALE ~ 1/typical_raw_cost, so a typical cost lands in
+# symlog's LINEAR regime (|lambda_inner*cost| ~ 1); order-of-magnitude cost
+# differences are then PRESERVED (sensitive/rankable) while 10-100x outliers
+# still get log-bounded. The scalar cost contribution becomes
+#     w_outer * symlog(lambda_inner_c * raw_cost)
+# with a SMALL w_outer so the whole cost term stays a minor nudge (~0.05-0.1)
+# vs the bkstep quality term (~0.5). Defaults sized from the ep-20 best.json of
+# job 51325 (raw latency ~1.13e5 ns, raw peak_memory ~1.30e8 B). Per-channel
+# override via ALPHAGRAD_INNER_LAMBDA_<CHANNELNAME> (e.g.
+# ALPHAGRAD_INNER_LAMBDA_LATENCY_NS). Any cost channel without an override
+# defaults to 1.0 (i.e. legacy plain symlog(raw)); the two REWARDED cost
+# channels (latency_ns, peak_memory) get calibrated defaults below.
+_INNER_LAMBDA_DEFAULTS: dict[str, float] = {
+    "latency_ns": 9e-6,     # 1/1.13e5  -> typical latency -> symlog arg ~1.0
+    "peak_memory": 7.7e-9,  # 1/1.30e8  -> typical peak_mem -> symlog arg ~1.0
+}
+
+
+def _build_inner_lambda_vec() -> np.ndarray:
+    """Per-channel INNER lambda applied INSIDE symlog for cost channels.
+
+    ``symlog(lambda_inner_c * raw_cost)`` instead of ``symlog(raw_cost)``.
+    Defaults from :data:`_INNER_LAMBDA_DEFAULTS` (calibrated for the rewarded
+    cost channels), 1.0 elsewhere, overridable per-channel via
+    ``ALPHAGRAD_INNER_LAMBDA_<UPPER_CHANNEL_NAME>``. Quality channels
+    (cosine_sim, bkstep_acc — masked out of the symlog pass) always keep 1.0.
+    """
+    vec = np.ones((NUM_REWARDS,), dtype=np.float64)
+    for i in range(NUM_REWARDS):
+        name = REWARD_NAMES[i]
+        default = _INNER_LAMBDA_DEFAULTS.get(name, 1.0)
+        env_key = "ALPHAGRAD_INNER_LAMBDA_" + name.upper()
+        val = os.environ.get(env_key)
+        if val is not None and val.strip() != "":
+            try:
+                default = float(val)
+            except ValueError:
+                pass
+        vec[i] = default
+    return vec.astype(np.float32)
+
 # Fix 1 (v2): NON-symlog quality channels (cosine_sim, bkstep_acc). The
 # additive failed-penalty is stamped on one of these so no symlog pass
 # reshapes it (the second additive-symlog pass symlog's bkstep_acc, so we
@@ -685,6 +732,27 @@ class PPORayWorker:
             self.reward_mode == "additive"
             and os.environ.get("ALPHAGRAD_ADDITIVE_SYMLOG_COST", "0") == "1"
         )
+        # Per-channel INNER lambda: cost channels are transformed as
+        # ``symlog(lambda_inner_c * raw)`` (lambda MOVED INSIDE the symlog) so
+        # the cost signal is sensitive/rankable instead of over-compressed.
+        # See _build_inner_lambda_vec / _INNER_LAMBDA_DEFAULTS. The scalarising
+        # OUTER weight (lambda_cmp/lambda_mem, set small ~0.06 in the launcher)
+        # then keeps the term a minor nudge:  w_outer * symlog(lam_inner*raw).
+        self._inner_lambda_np = _build_inner_lambda_vec()
+        self._inner_lambda_j = jnp.asarray(self._inner_lambda_np, dtype=jnp.float32)
+        if self._additive_symlog_cost:
+            _il = {
+                REWARD_NAMES[i]: float(self._inner_lambda_np[i])
+                for i in range(NUM_REWARDS)
+                if _COST_SYMLOG_MASK_NP[i] and self.reward_weights_np[i] != 0.0
+            }
+            print(
+                f"[ppo_ray] ADDITIVE_SYMLOG_COST: cost term = "
+                f"w_outer * symlog(lambda_inner * raw) (lambda INSIDE symlog). "
+                f"Rewarded cost channels' lambda_inner = {_il}; outer weights "
+                f"(lambda_cmp/lambda_mem) = "
+                f"{[float(self.reward_weights_np[i]) for i in range(NUM_REWARDS) if _COST_SYMLOG_MASK_NP[i] and self.reward_weights_np[i] != 0.0]}."
+            )
 
         # Fix 1 (v2 -- REPLACES the failed-row MASK): bounded-NEGATIVE
         # penalty for failed/sentinel transitions in additive mode. The
@@ -1722,9 +1790,16 @@ class PPORayWorker:
         # conditions / GAE. additive mode only.
         if self._additive_symlog_cost:
             _m = _COST_SYMLOG_MASK_NP[None, None, :]  # (1,1,NUM_REWARDS)
+            # lambda INSIDE the symlog: symlog(lambda_inner_c * raw_cost).
+            # lambda_inner ~ 1/typical_raw_cost puts a typical cost near the
+            # LINEAR regime so order-of-magnitude differences are preserved
+            # (sensitive), while outliers still log-bound. Sign-preserving
+            # (stored cost is -raw). Quality channels (cosine_sim, bkstep_acc)
+            # are masked out (lambda_inner=1 for them anyway).
+            _scaled = buf_reward_vec * self._inner_lambda_np[None, None, :]
             buf_reward_vec = np.where(
                 _m,
-                np.sign(buf_reward_vec) * np.log1p(np.abs(buf_reward_vec)),
+                np.sign(_scaled) * np.log1p(np.abs(_scaled)),
                 buf_reward_vec,
             ).astype(np.float32)
 
@@ -1782,26 +1857,16 @@ class PPORayWorker:
         # corrupt the measured-channel telemetry.
         buf_reward_vec_raw = np.array(buf_reward_vec, dtype=np.float32, copy=True)
 
-        # ADDITIVE COST-SYMLOG (ALPHAGRAD_ADDITIVE_SYMLOG_COST=1). Squash the
-        # COST channels of the canonical buffer into symlog space so the plain
-        # weighted sum below is magnitude-balanced (cost ~symlog 14-21 vs the
-        # O(10-30) lam_acc*cosine term) instead of raw-cost dominated. Only the
-        # cost channels are transformed; cosine_sim / frob_residual (the quality
-        # signals, already O(1)) are left raw. ``buf_reward_vec_raw`` above keeps
-        # the untransformed values for the Lagrangian / per-channel telemetry.
-        # Sign-preserving: stored cost is negative (-cost), symlog keeps the sign
-        # so a cheaper (smaller |cost|) order still scores a smaller-magnitude
-        # negative term. No-op in mult mode (cheapness already symlog's cost).
-        if self.reward_mode == "additive" and self.additive_symlog_cost:
-            _cost_idx_sl = [
-                i for i in range(buf_reward_vec.shape[-1])
-                if i not in (COSINE_SIM_IDX, FROB_RESIDUAL_IDX)
-            ]
-            buf_reward_vec = np.array(buf_reward_vec, copy=True)
-            _c = buf_reward_vec[..., _cost_idx_sl]
-            buf_reward_vec[..., _cost_idx_sl] = (
-                np.sign(_c) * np.log1p(np.abs(_c))
-            )
+        # (Removed) The second additive cost-symlog pass used to live here. It
+        # double-symlog'd the canonical buffer's cost channels (the pass above
+        # already symlog'd them into buf_reward_vec, captured into
+        # buf_reward_vec_raw), crushing e.g. symlog(latency)~11.6 -> ~2.5 and
+        # rendering the GAE/return cost term rank-blind; it also excluded only
+        # cosine_sim/frob_residual, so it wrongly symlog'd the [0,1] bkstep_acc
+        # quality channel. The single lambda-inside-symlog pass above
+        # (symlog(lambda_inner*raw), masked to true cost channels) is now the
+        # ONLY cost transform. ``self.additive_symlog_cost`` retained for
+        # compatibility but no longer drives a transform here.
 
         # Fix 1 (v2): ADDITIVE bounded-negative FAILED penalty. Stamped
         # HERE -- AFTER both symlog passes and the reward-condition gates,
