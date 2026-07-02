@@ -1285,8 +1285,15 @@ class PPORayWorker:
             (
                 tokens, actions, op_a, i_a, j_a, f_a, q_a,
                 vertex_idx_for_mask,
-                old_log_probs, returns, advantages,
+                old_log_probs, returns, advantages, valid,
             ) = batch
+            # Fix 1: ``valid`` is a (B,) float mask — 0.0 for failed/sentinel
+            # transitions (measure OOM / mem-gate skip / shape-storm / pool
+            # timeout), 1.0 otherwise. Failed rows carry zeroed rewards +
+            # forced dones, so their policy/value targets are meaningless;
+            # masking them out of the loss means a partially-failed batch is
+            # driven ONLY by its surviving good rules (instead of the zeros
+            # diluting every mean → gradient craters to 0).
             # GDPO path: advantages enter as (B, K), normalise to scalar
             # (B,) via per-channel z-score → priority sum → batch-norm.
             # Scalar path: advantages enter as (B,) already z-scored
@@ -1391,18 +1398,28 @@ class PPORayWorker:
                 vertex_idx_for_mask,
                 old_log_probs, returns, adv_scalar, keys,
             )
-            ppo_loss = jnp.mean(p_l)
-            value_loss = jnp.mean(v_l)
-            entropy_loss = -jnp.mean(ent)
+            # Fix 1: valid-masked batch means. Failed/sentinel rows (valid=0)
+            # contribute NOTHING to any loss term; the denominator is the
+            # valid-row count (floored at 1) so a batch that is half-sentinel
+            # still produces a full-magnitude gradient from its good rows
+            # rather than a halved-then-diluted one. When every row is valid
+            # (valid all-ones) this is byte-identical to the old jnp.mean.
+            _vsum = jnp.maximum(jnp.sum(valid), jnp.float32(1.0))
+            _mmean = lambda x: jnp.sum(x * valid) / _vsum
+            ppo_loss = _mmean(p_l)
+            value_loss = _mmean(v_l)
+            entropy_loss = -_mmean(ent)
             total = ppo_loss + value_coef * value_loss + entropy_coef * entropy_loss
             # Per-head entropy means: useful for diagnosing which
             # categorical head is collapsing (vertex / op_type / i /
-            # j / factor / quant). Mean over the batch axis.
-            head_means = jnp.mean(per_head_ent, axis=0)  # (6,)
+            # j / factor / quant). Mean over the batch axis (valid rows only).
+            head_means = (
+                jnp.sum(per_head_ent * valid[:, None], axis=0) / _vsum
+            )  # (6,)
             aux = {
                 "ppo_loss": ppo_loss,
                 "value_loss": value_loss,
-                "entropy": jnp.mean(ent),
+                "entropy": _mmean(ent),
                 "entropy_coef": entropy_coef,
                 "entropy/vertex": head_means[0],
                 "entropy/op_type": head_means[1],
@@ -1911,9 +1928,24 @@ class PPORayWorker:
         # update step (see gdpo_normalise_advantages) so the global pass
         # would double-normalise and wash out cross-minibatch signal.
         if self.advantage_norm == "scalar":
-            adv_flat = advantages_b.reshape(-1)
-            adv_mean = jnp.mean(adv_flat)
-            adv_std = jnp.std(adv_flat) + 1e-8
+            # Fix 1: z-score over VALID transitions only. Failed/sentinel rows
+            # carry a zeroed reward → their advantage is a spurious ~0 that,
+            # if included, drags the batch mean toward 0 and inflates the std
+            # — washing out the real signal from the surviving good rules. We
+            # compute (mean, std) over the valid mask, then normalise the whole
+            # tensor with those valid-only statistics (invalid rows are dropped
+            # from the loss downstream via the per-sample ``valid`` mask, so
+            # their post-norm value is irrelevant). ``buf_failed`` is (T, N);
+            # advantages_b is (N, T) → transpose the mask to match.
+            _valid_b = jnp.asarray(
+                (~buf_failed).astype(np.float32).T
+            )  # (N, T)
+            _vcnt = jnp.maximum(jnp.sum(_valid_b), jnp.float32(1.0))
+            adv_mean = jnp.sum(advantages_b * _valid_b) / _vcnt
+            adv_var = (
+                jnp.sum(((advantages_b - adv_mean) ** 2) * _valid_b) / _vcnt
+            )
+            adv_std = jnp.sqrt(adv_var) + 1e-8
             advantages_b = (advantages_b - adv_mean) / adv_std
 
         # Stage for the update. Flatten (N, T) -> (N*T,) along the env
@@ -1931,6 +1963,13 @@ class PPORayWorker:
         flat_q = jnp.asarray(buf_q.T.reshape(N * T))
         flat_vmask = jnp.asarray(buf_vertex_for_loss.T.reshape(N * T))
         flat_log_probs = jnp.asarray(buf_log_probs.T.reshape(N * T))
+        # Fix 1: per-transition valid mask (1.0 = good measure, 0.0 =
+        # failed/sentinel). Flows into every minibatch so the loss can drop
+        # failed rows (see loss_fn's ``valid`` arg). Same (T, N) → (N*T,)
+        # layout as the buffers above.
+        flat_valid = jnp.asarray(
+            (~buf_failed).astype(np.float32).T.reshape(N * T)
+        )
         if self.advantage_norm == "gdpo":
             flat_returns = returns_b.reshape(N * T, NUM_REWARDS)
             flat_advantages = advantages_b.reshape(N * T, NUM_REWARDS)
@@ -1952,6 +1991,7 @@ class PPORayWorker:
         flat_q = flat_q[perm]
         flat_vmask = flat_vmask[perm]
         flat_log_probs = flat_log_probs[perm]
+        flat_valid = flat_valid[perm]
         flat_returns = flat_returns[perm]
         flat_advantages = flat_advantages[perm]
 
@@ -1978,9 +2018,10 @@ class PPORayWorker:
             flat_q = flat_q[:valid_total]
             flat_vmask = flat_vmask[:valid_total]
             flat_log_probs = flat_log_probs[:valid_total]
+            flat_valid = flat_valid[:valid_total]
             flat_returns = flat_returns[:valid_total]
             flat_advantages = flat_advantages[:valid_total]
-            
+
         mb_sharded = True
 
         # Reshape to ``(mb_count, mb_size, ...)`` so we can shard the
@@ -2000,6 +2041,7 @@ class PPORayWorker:
         mb_q = _reshape_mb(flat_q)
         mb_vmask = _reshape_mb(flat_vmask)
         mb_log_probs = _reshape_mb(flat_log_probs)
+        mb_valid = _reshape_mb(flat_valid)
         # Returns + advantages carry a trailing K=NUM_REWARDS axis in
         # gdpo mode and are scalar (no trailing axis) in scalar mode.
         if self.advantage_norm == "gdpo":
@@ -2020,6 +2062,7 @@ class PPORayWorker:
             mb_q = _shard(mb_q)
             mb_vmask = _shard(mb_vmask)
             mb_log_probs = _shard(mb_log_probs)
+            mb_valid = _shard(mb_valid)
             mb_returns = _shard(mb_returns)
             mb_advantages = _shard(mb_advantages)
 
@@ -2045,6 +2088,7 @@ class PPORayWorker:
                 mb_op[i], mb_i[i], mb_j[i], mb_f[i], mb_q[i],
                 mb_vmask[i],
                 mb_log_probs[i], mb_returns[i], mb_advantages[i],
+                mb_valid[i],
             )
             key, mb_key = jrand.split(key)
             agent, opt_state, aux = self._update_step(
@@ -2076,8 +2120,26 @@ class PPORayWorker:
         per_env_weighted_sum = (
             buf_reward_vec * self.reward_weights_np
         ).sum(axis=(0, 2))  # (N,) — raw weighted per-env return
-        episode_return = float(per_env_weighted_sum.mean())
-        best_return = float(per_env_weighted_sum.max())
+        # Fix 1: the logged mean_return must exclude envs whose measure
+        # FAILED. This is a sparse-terminal reward (the signal lands only on
+        # the last step), so an env's episode is "failed" when its TERMINAL
+        # transition was sentineled — its per-env sum is then a spurious ~0
+        # that, if averaged in, craters mean_return toward 0 even when the
+        # surviving envs scored well. Mean over the VALID envs only (fall back
+        # to all envs if every env failed, to avoid a nan). ``best_return``
+        # is a max so failed 0-rows can only under-count it — but exclude
+        # them too for symmetry / correctness.
+        _env_valid = ~buf_failed[-1, :]  # (N,) — terminal step ok
+        _n_valid_env = int(_env_valid.sum())
+        if _n_valid_env > 0:
+            _valid_sums = per_env_weighted_sum[_env_valid]
+            episode_return = float(_valid_sums.mean())
+            best_return = float(_valid_sums.max())
+        else:
+            # Whole batch failed — report the (all-zero) mean rather than nan.
+            episode_return = float(per_env_weighted_sum.mean())
+            best_return = float(per_env_weighted_sum.max())
+        last_aux_env_valid_frac = float(_n_valid_env) / max(int(N), 1)
 
         # Per-env action sequence — what landed in the env at each
         # step. For the simple policy each entry is just the vertex
@@ -2172,6 +2234,12 @@ class PPORayWorker:
             "num_envs": N,
             "nan_skip_count": int(nan_skip_total),
             "train_step": int(self._episode_counter),
+            # Fix 1 telemetry: how much of the batch survived measurement.
+            "sentinel/failed_transitions": int(buf_failed.sum()),
+            "sentinel/failed_fraction": float(
+                buf_failed.sum() / max(int(T * N), 1)
+            ),
+            "sentinel/valid_env_fraction": last_aux_env_valid_frac,
             # Fix 3 telemetry: the LIVE annealed entropy coefficient.
             "entropy_coef": float(self.entropy_coef),
         })
