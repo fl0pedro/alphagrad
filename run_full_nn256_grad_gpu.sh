@@ -80,7 +80,7 @@ export ALPHAGRAD_INNER_LAMBDA_LATENCY_NS="${ALPHAGRAD_INNER_LAMBDA_LATENCY_NS:-9
 export ALPHAGRAD_INNER_LAMBDA_PEAK_MEMORY="${ALPHAGRAD_INNER_LAMBDA_PEAK_MEMORY:-7.7e-9}" # 1/1.30e8
 # Bidirectional Palimpsa (gated linear-attention, O(seq)) policy backbone —
 # efficient over the now-unclipped ~8.2k-token grad graph (MAX_TOKENS=16384).
-export ALPHAGRAD_POLICY=palimpsa_bi
+export ALPHAGRAD_POLICY=palimpsa
 
 # >>> B_kstep TRAINABILITY as the acc reward channel <<<
 # ALPHAGRAD_ACC_PROXY=bkstep routes the --rewards acc weight to the B_kstep
