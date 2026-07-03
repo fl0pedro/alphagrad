@@ -261,7 +261,16 @@ class PalimpsaMixer(eqx.Module):
         q = jax.vmap(self.query_proj)(x).reshape(S, H, d)
         k = jax.vmap(self.key_proj)(x).reshape(S, H, d)
         v = jax.vmap(self.value_proj)(x).reshape(S, H, d)
-        b = jax.vmap(self.bias_proj)(x).reshape(S, H, d)
+        # b is the PRECISION NUMERATOR of the kernel's posterior update:
+        #   I_t = b_t * k_t^2 + (1 - decay) * Ip + decay * I_{t-1};  mu = M / I.
+        # The recurrence is only well-posed for b >= 0 (I stays > 0 since
+        # I_0 = Ip > 0 and every increment is then non-negative). Feeding the
+        # RAW signed linear output lets a negative b_t * k^2 drive I through
+        # zero -> mu = M/0 -> inf/nan on data-dependent inputs (observed as
+        # ~15%% of rollout forwards emitting non-finite values on the larger
+        # residual graphs). softplus enforces the positivity the Bayesian
+        # precision semantics require.
+        b = jnn.softplus(jax.vmap(self.bias_proj)(x)).reshape(S, H, d)
         # Relational structural prior folded into the forget gate (mirrors
         # BiPalimpsaMixer, but injected PRE-softplus — the cleaner form the
         # bi docstring itself notes — so a zero gate_mod is an EXACT no-op:
