@@ -78,6 +78,20 @@ export ALPHAGRAD_ADDITIVE_SYMLOG_COST=1
 # combined) vs bkstep (~0.5). w_outer*symlog(lambda_inner*raw).
 export ALPHAGRAD_INNER_LAMBDA_LATENCY_NS="${ALPHAGRAD_INNER_LAMBDA_LATENCY_NS:-9e-6}"   # 1/1.13e5
 export ALPHAGRAD_INNER_LAMBDA_PEAK_MEMORY="${ALPHAGRAD_INNER_LAMBDA_PEAK_MEMORY:-7.7e-9}" # 1/1.30e8
+# >>> V2 ANTI-HACK (pf7ityh6 post-mortem) <<<
+# 1) COST_SYMLOG_CAP: clip symlog(lambda_inner*raw) to +/-1.25. The untrained
+#    micro policy starts at ~20x-typical cost (latency symlog ~3.1), which gave
+#    the cost term ~0.23 of scalar leverage (designed ~0.09) — the policy hacked
+#    cost (COMPRESS/QUANT spam) while bkstep decayed 0.22->0.16. With the cap,
+#    beyond ~2.4x typical the cost term SATURATES: no reward for making the
+#    graph cheaper by making it worse; max combined cost term = 0.06*1.25*2 =
+#    0.15 << quality (~0.8) at a good operating point.
+export ALPHAGRAD_COST_SYMLOG_CAP="${ALPHAGRAD_COST_SYMLOG_CAP:-1.25}"
+# 2) FAILED_ADV_STAMP: the -2.0 failed penalty is z-scored; an ALL-fail rollout
+#    (constant -2) normalises to advantage ~0 => the basin is ABSORBING (pf7ityh6
+#    pinned at mean_return -2/-16 for 80+ eps). Post-z-score overwrite of failed
+#    rows' advantage with -1.0 keeps a repulsive gradient in all-fail batches.
+export ALPHAGRAD_FAILED_ADV_STAMP="${ALPHAGRAD_FAILED_ADV_STAMP:-1.0}"
 # Unidirectional Palimpsa (gated linear-attention, O(seq)) policy backbone —
 # efficient over the now-unclipped ~8.2k-token grad graph (MAX_TOKENS=16384).
 # V2: the uni mixer now carries the zero-init eqn_ids relational DAG-degree

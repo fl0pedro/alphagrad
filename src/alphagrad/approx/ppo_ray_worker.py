@@ -994,6 +994,43 @@ class PPORayWorker:
                 f"advantage+loss -- replaces the failed-row mask; failed "
                 f"rows are repulsive, never a zero-gradient no-op)."
             )
+        # V2 anti-hack fix 1 (ALL-FAIL BASIN IS ABSORBING): the -2.0
+        # penalty above is z-scored together with everything else, so a
+        # rollout where EVERY transition failed normalises a CONSTANT
+        # reward to advantage ~0 -- the "gradient out" vanishes exactly
+        # when it is needed most and the basin absorbs the run (observed
+        # pf7ityh6: 4/60 -> 32/60 sentinels, mean_return pinned -2/-16
+        # for 80+ eps, zero recovery). Fix: AFTER the scalar-mode
+        # z-score, OVERWRITE failed rows' advantage with -|stamp| so a
+        # failed action always carries an on-scale (~1 sigma) repulsive
+        # gradient, all-fail batches included. 0 disables.
+        self.failed_adv_stamp = float(
+            os.environ.get("ALPHAGRAD_FAILED_ADV_STAMP", "1.0")
+        )
+        # V2 anti-hack fix 2 (COST-CHANNEL LEVERAGE): lambda_inner was
+        # calibrated so TYPICAL costs land at symlog ~0.7 (term ~0.06*0.7
+        # *2ch ~ 0.09, the designed ~8x-below-quality nudge). But the
+        # untrained micro policy's graphs start ~20x typical (latency
+        # symlog ~3.1), handing the cost term ~0.23 of scalar leverage --
+        # cost-cutting via COMPRESS/QUANT spam then rivals/beats the
+        # quality term and the policy hacks cost while bkstep decays
+        # (pf7ityh6 ep0->36: mean_return 0.068->0.19 with bkstep
+        # 0.22->0.16). Fix: clip the symlog'd cost channels to +/-CAP so
+        # beyond ~2x typical the cost term SATURATES (zero gradient for
+        # making the graph cheaper by making it worse) and quality keeps
+        # the designed dominance at every operating point. 0 disables.
+        self._cost_symlog_cap = float(
+            os.environ.get("ALPHAGRAD_COST_SYMLOG_CAP", "0.0")
+        )
+        if self.reward_mode == "additive" and (
+            self.failed_adv_stamp > 0 or self._cost_symlog_cap > 0
+        ):
+            print(
+                f"[ppo_ray] V2 anti-hack: failed_adv_stamp="
+                f"{self.failed_adv_stamp} (post-z-score advantage overwrite "
+                f"on failed rows), cost_symlog_cap={self._cost_symlog_cap} "
+                f"(symlog'd cost channels clipped to +/-cap)."
+            )
 
         # Advantage-normalisation strategy. ``gdpo`` activates the
         # per-channel z-score → priority-weighted sum → batch-norm
@@ -2512,9 +2549,20 @@ class PPORayWorker:
             # (stored cost is -raw). Quality channels (cosine_sim, bkstep_acc)
             # are masked out (lambda_inner=1 for them anyway).
             _scaled = buf_reward_vec * self._inner_lambda_np[None, None, :]
+            _sl = np.sign(_scaled) * np.log1p(np.abs(_scaled))
+            # V2 anti-hack fix 2: saturate the symlog'd cost channels at
+            # +/-cap -- beyond ~2x-typical cost the term is CONSTANT, so
+            # there is no reward for making an already-expensive graph
+            # cheaper by making it WORSE (see __init__ for the pf7ityh6
+            # post-mortem). Quality channels are outside ``_m`` and
+            # untouched.
+            if self._cost_symlog_cap > 0.0:
+                _sl = np.clip(
+                    _sl, -self._cost_symlog_cap, self._cost_symlog_cap,
+                )
             buf_reward_vec = np.where(
                 _m,
-                np.sign(_scaled) * np.log1p(np.abs(_scaled)),
+                _sl,
                 buf_reward_vec,
             ).astype(np.float32)
 
@@ -2793,6 +2841,22 @@ class PPORayWorker:
             adv_mean = jnp.mean(adv_flat)
             adv_std = jnp.std(adv_flat) + 1e-8
             advantages_b = (advantages_b - adv_mean) / adv_std
+            # V2 anti-hack fix 1: the z-score above maps a CONSTANT batch
+            # (every row failed -> uniform -2 penalty) to advantage ~0,
+            # deleting the repulsive gradient exactly in the all-fail
+            # basin. Overwrite failed rows' advantage POST-normalisation
+            # with a fixed on-scale negative so failed actions are always
+            # pushed down -- including when the whole rollout failed.
+            if (
+                self.reward_mode == "additive"
+                and self.failed_adv_stamp > 0.0
+                and buf_failed.any()
+            ):
+                advantages_b = jnp.where(
+                    jnp.asarray(buf_failed.T),            # (N, T)
+                    jnp.float32(-abs(self.failed_adv_stamp)),
+                    advantages_b,
+                )
 
         # Stage for the update. Flatten (T, N, ...) -> (N*T, ...) along the
         # env axis (each transition is independent for PPO). Returns and
@@ -3068,6 +3132,27 @@ class PPORayWorker:
             action_seq=per_env_actions,
             dones_mask=buf_dones.astype(bool),
         )
+
+        # V2 anti-hack telemetry: per-channel decomposition of the scalar
+        # the GAE actually consumes (weight x transformed reward) at VALID
+        # terminal rows -- quality (cosine guide + bkstep) vs cost
+        # (everything else). This is the direct "is quality dominating the
+        # scalar?" probe; quality_term should sit ~8x cost_term at a good
+        # operating point (bkstep ~0.65 + guide ~0.15 vs cost ~-0.09).
+        _bkstep_idx = REWARD_INDEX["bkstep_acc"]
+        _valid_term = buf_dones.astype(bool) & ~buf_failed  # (T, N)
+        if _valid_term.any():
+            _tvec = buf_reward_vec_raw[_valid_term]        # (M, K)
+            _contrib = (_tvec * self.reward_weights_np).mean(axis=0)  # (K,)
+            _decomp_quality = float(
+                _contrib[COSINE_SIM_IDX] + _contrib[_bkstep_idx]
+            )
+            _decomp_cost = float(_contrib.sum()) - _decomp_quality
+        else:
+            _decomp_quality = 0.0
+            _decomp_cost = 0.0
+        last_aux["decomp/quality_term"] = _decomp_quality
+        last_aux["decomp/cost_term"] = _decomp_cost
 
         last_aux.update({
             "episode_return_mean": episode_return,

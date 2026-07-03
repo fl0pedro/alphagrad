@@ -1003,6 +1003,9 @@ def build_wandb_log_dict(stats: dict, state: dict, ep: int) -> dict:
             or k.startswith("reward_mean/")
             or k.startswith("reward_dist/")
             or k.startswith("bkstep/")
+            or k.startswith("decomp/")
+            or k.startswith("sentinel/")
+            or k.startswith("entropy/")
         ):
             log_dict[k] = v
     return log_dict
