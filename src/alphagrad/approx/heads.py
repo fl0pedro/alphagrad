@@ -104,18 +104,24 @@ _QUANT_DTYPE_MASK_CACHE = None
 
 
 def _quant_dtype_mask():
-    """(NUM_QUANT_DTYPES,) float32 mask, 1.0 for allowed dtypes. Lazy; cached."""
+    """(NUM_QUANT_DTYPES,) float32 mask, 1.0 for allowed dtypes. Lazy; cached.
+
+    Cached as NUMPY, not jnp: a jnp constant materialised during the FIRST
+    jit trace (e.g. the rollout act_step) is a DynamicJaxprTracer of that
+    trace — caching it and reusing it inside a LATER trace (the loss) raises
+    UnexpectedTracerError. A numpy array is a fresh constant in every trace.
+    """
     global _QUANT_DTYPE_MASK_CACHE
     if _QUANT_DTYPE_MASK_CACHE is None:
         _env = os.environ.get("ALPHAGRAD_QUANT_ALLOWED", "").strip()
         if _env:
             _allowed = {s.strip() for s in _env.split(",") if s.strip()}
-            _QUANT_DTYPE_MASK_CACHE = jnp.asarray(
-                np.array([1.0 if d in _allowed else 0.0 for d in QUANT_DTYPES],
-                         dtype=np.float32)
+            _QUANT_DTYPE_MASK_CACHE = np.array(
+                [1.0 if d in _allowed else 0.0 for d in QUANT_DTYPES],
+                dtype=np.float32,
             )
         else:
-            _QUANT_DTYPE_MASK_CACHE = jnp.ones(NUM_QUANT_DTYPES, dtype=jnp.float32)
+            _QUANT_DTYPE_MASK_CACHE = np.ones(NUM_QUANT_DTYPES, dtype=np.float32)
     return _QUANT_DTYPE_MASK_CACHE
 
 
