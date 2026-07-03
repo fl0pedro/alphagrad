@@ -456,6 +456,7 @@ class MicroPPOAgent(eqx.Module):
     embedding: eqx.nn.Embedding
     pos_enc: Any
     encoder: Any
+    final_norm: eqx.nn.LayerNorm
     vertex_policy: Any        # ppo.PointerVertexPolicy
     value_pool_query: jax.Array
     value_head: Any           # MLP value-pooled -> (NUM_REWARDS,)
@@ -491,6 +492,15 @@ class MicroPPOAgent(eqx.Module):
             num_layers, num_heads, embd_dim, hidden_dim,
             key=keys[1], policy=policy,
         )
+        # Final LayerNorm over the residual stream. The encoder blocks are
+        # pre-LN (norm INSIDE each block, residual outside), so the stream's
+        # scale grows unbounded across layers — under the palimpsa mixers
+        # (whose recurrence output isn't softmax-bounded) the per-token
+        # embeddings reach ~1e6 at init, saturating every downstream head
+        # (deterministic op/vertex sampling, entropy ~= 0, log(1e-8)
+        # log-probs). Standard pre-LN closing norm; O(1) inputs for the
+        # pointer / value-pool / micro heads.
+        self.final_norm = eqx.nn.LayerNorm(embd_dim)
         self.vertex_policy = PointerVertexPolicy(
             num_vertices=num_vertices, embd_dim=embd_dim,
             num_heads=num_heads, key=keys[2],
@@ -519,6 +529,7 @@ class MicroPPOAgent(eqx.Module):
         pad_tok = tokens > 0
         enc_mask = pad_tok if self.policy in ("palimpsa", "palimpsa_bi") else None
         enc_x = self.encoder(x, eqn_ids=eqn_ids, mask=enc_mask, key=key)
+        enc_x = jax.vmap(self.final_norm)(enc_x)
         return enc_x, pad_tok
 
     def value_from_encoding(self, enc_x, token_mask):
@@ -541,6 +552,32 @@ class MicroPPOAgent(eqx.Module):
         """Bootstrap-path value — same signature as SimplePPOAgent.value."""
         enc_x, token_mask = self.encode_tokens(tokens, key=key, eqn_ids=eqn_ids)
         return self.value_from_encoding(enc_x, token_mask)
+
+
+def _scale_micro_policy_heads(agent, scale: float):
+    """Scale the V2 policy-head output weights for a near-uniform initial
+    policy (ppo.py's ``--head-init-scale`` pattern, default 0.1).
+
+    Without this the freshly orthogonal-initialised categorical projections
+    ride on the un-normalised AxisSetEncoder summary and saturate — at init
+    P(END) ~ 1e-8, so every sub-episode runs to the hard cap and the op head
+    sees near-zero gradients (softmax saturated). Scaled heads start
+    near-uniform, so END / DIAG / COMPRESS / QUANT all stay explorable.
+    Value heads are left untouched (mirrors ppo._scale_output_heads).
+    """
+    from alphagrad.approx.common.init import scale_module_weight
+    getters = [
+        lambda a: a.vertex_policy.pointer_proj.weight,
+        lambda a: a.micro_action_policy.head.op_head.proj.weight,
+        lambda a: a.micro_action_policy.head.axis_i_head.query_proj.weight,
+        lambda a: a.micro_action_policy.head.axis_j_head.query_proj.weight,
+        lambda a: a.micro_action_policy.head.factor_head.head_proj.weight,
+        lambda a: a.micro_action_policy.head.compress_kind_head.proj.weight,
+        lambda a: a.micro_action_policy.head.quant_dtype_head.proj.weight,
+    ]
+    for g in getters:
+        agent = scale_module_weight(agent, g, scale)
+    return agent
 
 
 def _rezero_encoder_rel_gates(agent):
@@ -1255,6 +1292,13 @@ class PPORayWorker:
             # including the palimpsa mixers' zero-init relational gate —
             # restore the zeros so the eqn_ids gate starts as a no-op.
             self.agent = _rezero_encoder_rel_gates(self.agent)
+            # Near-uniform initial policy over all V2 heads (ppo.py's
+            # head-init-scale pattern; keeps END/DIAG/COMPRESS/QUANT and the
+            # vertex pointer explorable instead of softmax-saturated).
+            _his = float(getattr(self.args, "head_init_scale", 0.1))
+            self.agent = _scale_micro_policy_heads(self.agent, _his)
+            print(f"[ppo_ray_worker] V2 policy heads scaled by {_his} "
+                  f"(near-uniform initial policy).")
         # Replicate the agent across all devices — under SPMD this is
         # cheap (params are < 100 MB) and lets `act_step` / loss path
         # run sharded without the trainer having to think about it.
