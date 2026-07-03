@@ -61,6 +61,7 @@ from alphagrad.approx.common import (
 from alphagrad.approx.common.gae import get_advantages, reward_normalization_fn
 from alphagrad.utils import symlog
 from alphagrad.approx.env import (
+    AXIS_FEATURE_DIM,
     MAX_AXES_PER_VERTEX,
     MAX_RULES_PER_VERTEX,
     MAX_TOKENS,
@@ -70,8 +71,18 @@ from alphagrad.approx.env import (
     StepAction,
     VertexEliminationEnv,
     micro_actions_to_rule_specs_jax,
+    _AXIS_FEAT_SIZE,
 )
-from alphagrad.approx.heads import OP_COMPRESS, OP_DIAG, OP_END, OP_QUANT
+from alphagrad.approx.heads import (
+    MAX_PRIMES,
+    MicroAction,
+    MicroActionPolicy,
+    OP_COMPRESS,
+    OP_DIAG,
+    OP_END,
+    OP_QUANT,
+    precompute_factor_tables,
+)
 from graphax.sparse.micro_actions import NUM_QUANT_DTYPES
 
 
@@ -418,6 +429,142 @@ class SimplePPOAgent(eqx.Module):
             vertex_logits, value,
             zero_op, zero_axes, zero_axes, zero_factor, zero_quant,
         )
+
+
+# ---------------------------------------------------------------------------
+# Policy-V2 agent (ALPHAGRAD_RAY_MICROPOLICY=1): the rich head stack from
+# heads.py / ppo.py wired onto the Ray PPO path.
+#
+#   * Vertex selection: `ppo.PointerVertexPolicy` — per-vertex learned queries
+#     cross-attend over the PER-TOKEN encoder embeddings (not a mean-pool MLP);
+#     the cross-attended per-vertex representation is the context that
+#     conditions the micro-action sub-episode, exactly as in ppo.py::Agent.
+#   * Rule head: `heads.MicroActionPolicy` — the autoregressive typed
+#     sub-episode (op-type -> axis-i (op-conditional mask) -> axis-j | i ->
+#     prime-exponent factor -> compress-kind | i -> quant-dtype), scanned to
+#     `--max-substeps` with sticky END + the 2x-num-axes hard cap. Joint
+#     log-prob / entropy are GATED per component (END contributes only lp_op),
+#     killing the off-policy-heads issue of the flat SimplePPOAgent heads.
+#   * Value: 10-channel (NUM_REWARDS) head fed from its OWN learned
+#     attention pool over the per-token embeddings — policy and value no
+#     longer share one 128-d mean-pool bottleneck.
+#
+# The encoder is identical to SimplePPOAgent's (ALPHAGRAD_POLICY backbone,
+# eqn_ids + pad-mask threading for the palimpsa recurrence).
+# ---------------------------------------------------------------------------
+class MicroPPOAgent(eqx.Module):
+    embedding: eqx.nn.Embedding
+    pos_enc: Any
+    encoder: Any
+    vertex_policy: Any        # ppo.PointerVertexPolicy
+    value_pool_query: jax.Array
+    value_head: Any           # MLP value-pooled -> (NUM_REWARDS,)
+    micro_action_policy: Any  # heads.MicroActionPolicy
+
+    embd_dim: int = eqx.field(static=True)
+    num_vertices: int = eqx.field(static=True)
+    max_substeps: int = eqx.field(static=True)
+    policy: str = eqx.field(static=True)
+
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        embd_dim: int,
+        num_layers: int,
+        num_heads: int,
+        hidden_dim: int,
+        num_vertices: int,
+        value_dims: tuple[int, ...],
+        key,
+        max_substeps: int = 16,
+        policy: str = "transformer",
+    ):
+        from alphagrad.transformer import MLP, Encoder, PositionalEncoder
+        # Lazy: only the micro-policy path pays for the 6k-line ppo module.
+        from alphagrad.approx.ppo import PointerVertexPolicy
+
+        keys = jrand.split(key, 6)
+        self.embedding = eqx.nn.Embedding(vocab_size, embd_dim, key=keys[0])
+        self.pos_enc = PositionalEncoder(embd_dim, MAX_TOKENS)
+        self.encoder = Encoder(
+            num_layers, num_heads, embd_dim, hidden_dim,
+            key=keys[1], policy=policy,
+        )
+        self.vertex_policy = PointerVertexPolicy(
+            num_vertices=num_vertices, embd_dim=embd_dim,
+            num_heads=num_heads, key=keys[2],
+        )
+        self.value_pool_query = jrand.normal(keys[3], (embd_dim,)) * 0.02
+        self.value_head = MLP(embd_dim, NUM_REWARDS, value_dims, key=keys[4])
+        self.micro_action_policy = MicroActionPolicy(
+            embd_dim=embd_dim, num_heads=num_heads,
+            max_substeps=max_substeps, key=keys[5],
+        )
+        self.embd_dim = embd_dim
+        self.num_vertices = num_vertices
+        self.max_substeps = max_substeps
+        self.policy = policy
+
+    def encode_tokens(self, tokens, key, eqn_ids=None):
+        """Per-token encoder pass. Returns ``(enc_x (S, E), token_mask (S,))``.
+
+        Same eqn_ids + pad-mask threading as SimplePPOAgent.encode (the
+        palimpsa recurrence must not accumulate the ~16k pad positions),
+        but WITHOUT the mean-pool — the pointer / value heads consume the
+        per-token embeddings directly.
+        """
+        x = jax.vmap(self.embedding)(tokens)
+        x = self.pos_enc(x)
+        pad_tok = tokens > 0
+        enc_mask = pad_tok if self.policy in ("palimpsa", "palimpsa_bi") else None
+        enc_x = self.encoder(x, eqn_ids=eqn_ids, mask=enc_mask, key=key)
+        return enc_x, pad_tok
+
+    def value_from_encoding(self, enc_x, token_mask):
+        """10-channel value from the value head's OWN attention pool."""
+        scores = (enc_x @ self.value_pool_query) / jnp.sqrt(
+            jnp.float32(self.embd_dim)
+        )
+        scores = jnp.where(token_mask, scores, -1e9)
+        attn = jax.nn.softmax(scores, axis=-1)
+        pooled = jnp.sum(attn[:, None] * enc_x, axis=0)
+        return self.value_head(pooled)  # (NUM_REWARDS,)
+
+    def policy_value_from_encoding(self, enc_x, token_mask):
+        """``(vertex_logits (V,), vertex_contexts (V, E), value (K,))``."""
+        vertex_logits, vertex_contexts = self.vertex_policy(enc_x, token_mask)
+        value = self.value_from_encoding(enc_x, token_mask)
+        return vertex_logits, vertex_contexts, value
+
+    def value(self, tokens, key, eqn_ids=None):
+        """Bootstrap-path value — same signature as SimplePPOAgent.value."""
+        enc_x, token_mask = self.encode_tokens(tokens, key=key, eqn_ids=eqn_ids)
+        return self.value_from_encoding(enc_x, token_mask)
+
+
+def _rezero_encoder_rel_gates(agent):
+    """Re-zero the encoder mixers' ``rel_gate`` after init_linear_weights.
+
+    ``init_linear_weights`` orthogonally re-initialises EVERY ``eqx.nn.Linear``
+    in the agent — including the Palimpsa mixers' relational DAG-degree gate
+    ``rel_gate``, whose ZERO init is load-bearing (the mixer must start as
+    pure paper-Palimpsa and only deviate once the structural modulation
+    learns to). Restore the zeros here.
+    """
+    for li in range(len(agent.encoder.layers)):
+        mixer = agent.encoder.layers[li].attn_layer
+        rg = getattr(mixer, "rel_gate", None)
+        if rg is None:
+            continue
+        zeroed = eqx.tree_at(lambda l: l.weight, rg, jnp.zeros_like(rg.weight))
+        zeroed = eqx.tree_at(lambda l: l.bias, zeroed, jnp.zeros_like(rg.bias))
+        agent = eqx.tree_at(
+            lambda a, _li=li: a.encoder.layers[_li].attn_layer.rel_gate,
+            agent,
+            zeroed,
+        )
+    return agent
 
 
 # ---------------------------------------------------------------------------
@@ -937,6 +1084,22 @@ class PPORayWorker:
         self.dynamic_substeps = bool(
             getattr(self.args, "dynamic_substeps", False)
         )
+        # ------------------------------------------------------------------
+        # Policy V2 (ALPHAGRAD_RAY_MICROPOLICY=1): swap the stripped
+        # SimplePPOAgent for MicroPPOAgent (pointer vertex head +
+        # autoregressive MicroActionPolicy sub-episodes + separate value
+        # pool). Default OFF -> byte-identical legacy behaviour.
+        # ------------------------------------------------------------------
+        self.use_micro_policy = (
+            os.environ.get("ALPHAGRAD_RAY_MICROPOLICY", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        if self.use_micro_policy and not self.dynamic_substeps:
+            print(
+                "[ppo_ray_worker] ALPHAGRAD_RAY_MICROPOLICY=1 implies "
+                "--dynamic-substeps; forcing it on."
+            )
+            self.dynamic_substeps = True
         # Variant / curriculum support. When ``--variant`` is anything
         # other than ``custom``, we build the agent with the UNION
         # factor table (so curriculum stage transitions can mask via
@@ -1000,25 +1163,75 @@ class PPORayWorker:
                 f"'palimpsa_bi', got {_policy!r}"
             )
         self._policy = _policy
-        print(
-            f"[ppo_ray_worker] policy backbone: {_policy.upper()} "
-            f"(SimplePPOAgent encoder; eqn_ids threaded)",
-            flush=True,
-        )
-        self.agent = SimplePPOAgent(
-            vocab_size=int(self.args.vocab_size),
-            embd_dim=int(self.args.embd_dim),
-            num_layers=int(self.args.num_layers),
-            num_heads=int(self.args.num_heads),
-            hidden_dim=int(self.args.hidden_dim),
-            num_vertices=self.total_v,
-            policy_dims=policy_dims,
-            value_dims=value_dims,
-            key=agent_key,
-            dynamic_substeps=self.dynamic_substeps,
-            num_factors=self.num_factors,
-            policy=_policy,
-        )
+        if self.use_micro_policy:
+            # Policy V2 static inputs: substep budget + prime/gcd factor
+            # tables sized from the env's static axis structure.
+            self.max_substeps = int(getattr(self.args, "max_substeps", 16))
+            if self.max_substeps > MAX_RULES_PER_VERTEX:
+                print(
+                    f"[ppo_ray_worker] --max-substeps {self.max_substeps} > "
+                    f"MAX_RULES_PER_VERTEX {MAX_RULES_PER_VERTEX}; clamping "
+                    f"(the env rule_specs row capacity would silently drop "
+                    f"the excess)."
+                )
+                self.max_substeps = int(MAX_RULES_PER_VERTEX)
+            _axis_sizes_np = np.asarray(self.env.axis_state_static)[
+                ..., _AXIS_FEAT_SIZE
+            ]
+            _observed_max_axis = int(_axis_sizes_np.max()) if _axis_sizes_np.size else 1
+            _table_size = max(
+                64,
+                int(getattr(self.args, "max_axis_size", 0) or 0),
+                _observed_max_axis,
+            )
+            if _table_size > 4096:
+                print(
+                    f"[ppo_ray_worker] max axis size {_table_size} exceeds the "
+                    f"factor-table cap 4096; clamping (gcd gathers clamp to "
+                    f"the table edge for larger axes)."
+                )
+                _table_size = 4096
+            self.factor_tables = precompute_factor_tables(_table_size)
+            print(
+                f"[ppo_ray_worker] POLICY V2 ACTIVE (ALPHAGRAD_RAY_MICROPOLICY): "
+                f"MicroPPOAgent = {_policy.upper()} backbone + PointerVertexPolicy "
+                f"+ MicroActionPolicy(max_substeps={self.max_substeps}) + separate "
+                f"value pool; factor tables up to axis size {_table_size} "
+                f"(observed max {_observed_max_axis}).",
+                flush=True,
+            )
+            self.agent = MicroPPOAgent(
+                vocab_size=int(self.args.vocab_size),
+                embd_dim=int(self.args.embd_dim),
+                num_layers=int(self.args.num_layers),
+                num_heads=int(self.args.num_heads),
+                hidden_dim=int(self.args.hidden_dim),
+                num_vertices=self.total_v,
+                value_dims=value_dims,
+                key=agent_key,
+                max_substeps=self.max_substeps,
+                policy=_policy,
+            )
+        else:
+            print(
+                f"[ppo_ray_worker] policy backbone: {_policy.upper()} "
+                f"(SimplePPOAgent encoder; eqn_ids threaded)",
+                flush=True,
+            )
+            self.agent = SimplePPOAgent(
+                vocab_size=int(self.args.vocab_size),
+                embd_dim=int(self.args.embd_dim),
+                num_layers=int(self.args.num_layers),
+                num_heads=int(self.args.num_heads),
+                hidden_dim=int(self.args.hidden_dim),
+                num_vertices=self.total_v,
+                policy_dims=policy_dims,
+                value_dims=value_dims,
+                key=agent_key,
+                dynamic_substeps=self.dynamic_substeps,
+                num_factors=self.num_factors,
+                policy=_policy,
+            )
         # One-time assertion that the palimpsa_bi backbone was actually
         # instantiated on the worker path (guards against silent
         # transformer fallback regressions). Cheap: inspects a static field.
@@ -1037,6 +1250,11 @@ class PPORayWorker:
                 flush=True,
             )
         self.agent = init_linear_weights(self.agent, init_key)
+        if self.use_micro_policy:
+            # init_linear_weights orthogonally re-inits every Linear,
+            # including the palimpsa mixers' zero-init relational gate —
+            # restore the zeros so the eqn_ids gate starts as a no-op.
+            self.agent = _rezero_encoder_rel_gates(self.agent)
         # Replicate the agent across all devices — under SPMD this is
         # cheap (params are < 100 MB) and lets `act_step` / loss path
         # run sharded without the trainer having to think about it.
@@ -1274,6 +1492,8 @@ class PPORayWorker:
     # JIT'd per-step act + JIT-side env update
     # ------------------------------------------------------------------
     def _make_act_step_fn(self):
+        if self.use_micro_policy:
+            return self._make_act_step_fn_micro()
         env = self.env
         dynamic = self.dynamic_substeps
         factor_table = self.factor_table_j
@@ -1403,6 +1623,115 @@ class PPORayWorker:
 
         return act_step
 
+    def _make_act_step_fn_micro(self):
+        """Policy-V2 act step: pointer vertex head + MicroActionPolicy
+        sub-episode over the chosen vertex's LIVE per-axis features.
+
+        Mirrors cmorl_ray_worker's micro act path, plus: eqn_ids threading
+        into the encoder, the pointer per-vertex context feeding the
+        sub-episode, and the LIVE (EnvState) axis features (returned to the
+        rollout loop so the loss re-evaluates against the exact features the
+        sample saw).
+        """
+        env = self.env
+        factor_tables = self.factor_tables
+        from alphagrad.approx.ppo import _axis_features_from_state
+
+        @eqx.filter_jit
+        def act_step(agent, state_batch, vert_avail_batch,
+                     op_mask, factor_mask, quant_mask, key):
+            """``op_mask`` (4,) gates op-types per variant/curriculum stage
+            (order DIAG/COMPRESS/QUANT/END): any disallowed sampled op_type is
+            rewritten to END (ppo-style op_legality_override) so restricted
+            variants restrict the action space. ``factor_mask`` /
+            ``quant_mask`` are accepted for signature stability but unused —
+            the factor / dtype choice sets are governed by the heads (QUANT
+            additionally by ALPHAGRAD_QUANT_ALLOWED inside heads.py)."""
+            keys = jrand.split(key, self.num_envs)
+
+            def per_env(state_i, avail_i, k_i):
+                k_enc, k_v, k_micro = jrand.split(k_i, 3)
+                enc_x, token_mask = agent.encode_tokens(
+                    state_i.tokens, key=k_enc, eqn_ids=state_i.eqn_ids,
+                )
+                vertex_logits, vertex_contexts, value = (
+                    agent.policy_value_from_encoding(enc_x, token_mask)
+                )
+                masked = jnp.where(avail_i > 0.5, vertex_logits, -1e9)
+                log_probs_v = jax.nn.log_softmax(masked)
+                vertex_action = jrand.categorical(k_v, masked)
+                log_prob_v = log_probs_v[vertex_action]
+                vertex_id = vertex_action + 1  # env vertex IDs are 1-indexed
+
+                # LIVE per-axis features of the chosen vertex (EnvState is
+                # updated as rules land, unlike the cmorl static tables).
+                axis_state_v = state_i.axis_state[vertex_action]
+                axis_valid_v = state_i.axis_valid_mask[vertex_action]
+                v_context = vertex_contexts[vertex_action]
+                features = _axis_features_from_state(axis_state_v, axis_valid_v)
+
+                (
+                    actions, micro_lp, micro_ent, micro_arity,
+                    *_dists,
+                ) = agent.micro_action_policy.sample(
+                    v_context, features, factor_tables, k_micro,
+                )
+                op_seq = actions.op_type.astype(jnp.int32)
+                i_seq = actions.i.astype(jnp.int32)
+                j_seq = actions.j.astype(jnp.int32)
+                exp_seq = actions.exponents.astype(jnp.int32)
+                f_seq = actions.factor.astype(jnp.int32)
+                kind_seq = actions.compress_kind.astype(jnp.int32)
+                q_seq = actions.quant_dtype.astype(jnp.int32)
+                # Variant/curriculum gating (mirrors ppo/cmorl's
+                # op_legality_override): rewrite disallowed op_types to END
+                # and zero their stale args. NO-OP when op_mask is all-ones
+                # (variant=full). The stored (rewritten) action is what the
+                # loss re-evaluates, keeping rollout/loss consistent.
+                _disallowed = (
+                    ((op_seq == OP_DIAG) & (op_mask[OP_DIAG] <= 0.5))
+                    | ((op_seq == OP_COMPRESS) & (op_mask[OP_COMPRESS] <= 0.5))
+                    | ((op_seq == OP_QUANT) & (op_mask[OP_QUANT] <= 0.5))
+                )
+                op_seq = jnp.where(_disallowed, jnp.int32(OP_END), op_seq)
+                i_seq = jnp.where(_disallowed, 0, i_seq)
+                j_seq = jnp.where(_disallowed, 0, j_seq)
+                exp_seq = jnp.where(_disallowed[:, None], 0, exp_seq)
+                f_seq = jnp.where(_disallowed, 0, f_seq)
+                kind_seq = jnp.where(_disallowed, 0, kind_seq)
+                q_seq = jnp.where(_disallowed, 0, q_seq)
+                rule_specs = micro_actions_to_rule_specs_jax(
+                    op_seq, i_seq, j_seq, f_seq,
+                    axis_state_v,
+                    compress_kinds=kind_seq,
+                    quant_dtypes=q_seq,
+                )
+                # Joint log-prob = vertex + the sub-episode's GATED
+                # autoregressive log-prob (already summed over the real
+                # prefix; per-component contributions past END / for
+                # non-participating heads are zero inside heads.py).
+                log_prob_total = log_prob_v + micro_lp
+
+                env_action = StepAction(
+                    target_vertex=jnp.asarray(vertex_id, dtype=jnp.int32),
+                    rule_specs=rule_specs,
+                )
+                partial, order, specs, step = env.step_external_jax_part(
+                    state_i, env_action,
+                )
+                return (
+                    vertex_action,
+                    op_seq, i_seq, j_seq, exp_seq, f_seq, kind_seq, q_seq,
+                    axis_state_v, axis_valid_v,
+                    log_prob_total,
+                    value,
+                    partial, order, specs, step,
+                )
+
+            return jax.vmap(per_env)(state_batch, vert_avail_batch, keys)
+
+        return act_step
+
     def _make_assemble_fn(self):
         env = self.env
 
@@ -1420,6 +1749,8 @@ class PPORayWorker:
     # PPO loss + minibatch update
     # ------------------------------------------------------------------
     def _make_update_step(self):
+        if self.use_micro_policy:
+            return self._make_update_step_micro()
         clip_eps = self.ppo_eps
         value_coef = self.value_coef
         # NB: entropy_coef is NOT captured here — it is threaded through as a
@@ -1640,6 +1971,159 @@ class PPORayWorker:
 
         return update_step
 
+    def _make_update_step_micro(self):
+        """Policy-V2 loss: pointer vertex head + MicroActionPolicy.evaluate
+        over the stored typed sub-episode.
+
+        Differences vs the legacy loss:
+          * the batch carries per-substep action SEQUENCES (S = max_substeps
+            per transition) plus the axis features + vertex-avail mask the
+            rollout actually used, so the PPO ratio is exactly 1 at epoch 0;
+          * the joint log-prob / entropy come from heads.py's GATED
+            per-component sums (op=END => no i/j/factor/kind/quant
+            contribution) instead of the always-on flat-head sums;
+          * the sub-episode entropy is arity-normalised (ppo.py pattern) so a
+            16-substep vertex doesn't get a ~16x larger entropy bonus.
+        Value loss / gdpo-vs-scalar branches / nan-skip guard are identical
+        to the legacy update step.
+        """
+        clip_eps = self.ppo_eps
+        value_coef = self.value_coef
+        is_gdpo = self.advantage_norm == "gdpo"
+        channel_mask_j = self._channel_mask_j        # (NUM_REWARDS,)
+        sparse_mask_j = self._sparse_mask_j          # (NUM_REWARDS,)
+        priority_weights_j = self.reward_weights     # (NUM_REWARDS,)
+        active_count = jnp.maximum(jnp.sum(channel_mask_j), jnp.float32(1.0))
+        factor_tables = self.factor_tables
+        from alphagrad.approx.ppo import _axis_features_from_state
+        from alphagrad.approx.common.gae import gdpo_normalise_advantages
+
+        def loss_fn(agent, batch, op_mask, factor_mask, quant_mask, key,
+                    entropy_coef):
+            """``op_mask``/``factor_mask``/``quant_mask`` are threaded for
+            signature parity with the legacy loss; the micro path applies
+            variant gating at SAMPLE time (op rewrite in act_step), so the
+            stored actions are already the gated ones."""
+            (
+                tokens, eqn_ids, avail,
+                actions, op_a, i_a, j_a, exp_a, f_a, kind_a, q_a,
+                axis_state_a, axis_valid_a,
+                old_log_probs, returns, advantages, valid,
+            ) = batch
+            if is_gdpo:
+                adv_scalar = gdpo_normalise_advantages(
+                    advantages, channel_mask_j, sparse_mask_j,
+                    priority_weights_j,
+                )  # (B,)
+            else:
+                adv_scalar = advantages
+            keys = jrand.split(key, tokens.shape[0])
+
+            def per_sample(tok, eqn, av, v_act, op, i_s, j_s, exp_s, f_s,
+                           kind_s, q_s, ax_st, ax_va, olp, ret, adv, k):
+                enc_x, token_mask = agent.encode_tokens(
+                    tok, key=k, eqn_ids=eqn,
+                )
+                vertex_logits, vertex_contexts, value = (
+                    agent.policy_value_from_encoding(enc_x, token_mask)
+                )
+                # Same avail mask the rollout sampled under, so the vertex
+                # log-prob ratio is exact (legacy loss skipped this).
+                masked_v = jnp.where(av > 0.5, vertex_logits, -1e9)
+                log_probs = jax.nn.log_softmax(masked_v)
+                lp_v = log_probs[v_act]
+                p = jax.nn.softmax(masked_v)
+                ent_v = -jnp.sum(p * log_probs)
+
+                v_context = vertex_contexts[v_act]
+                features = _axis_features_from_state(ax_st, ax_va)
+                action = MicroAction(
+                    op_type=op, i=i_s, j=j_s, exponents=exp_s,
+                    factor=f_s, compress_kind=kind_s, quant_dtype=q_s,
+                )
+                (
+                    micro_lp, micro_ent, micro_arity, *_dists,
+                ) = agent.micro_action_policy.evaluate(
+                    v_context, features, factor_tables, action,
+                )
+                new_log_prob = lp_v + micro_lp
+                # Arity-normalised sub-episode entropy (ppo.py / cmorl
+                # pattern) so entropy_coef stays on the single-head scale.
+                micro_ent_norm = micro_ent / jnp.maximum(micro_arity, 1.0)
+                entropy = ent_v + micro_ent_norm
+                z = jnp.float32(0.0)
+                per_head = jnp.stack([ent_v, micro_ent_norm, z, z, z, z])
+
+                ratio = jnp.exp(new_log_prob - olp)
+                surr1 = ratio * adv
+                surr2 = jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps) * adv
+                policy_loss = -jnp.minimum(surr1, surr2)
+                if is_gdpo:
+                    per_channel_se = (value - ret) ** 2           # (K,)
+                    normaliser = jnp.maximum(jnp.abs(ret), 1.0)   # (K,)
+                    value_loss = jnp.sum(
+                        per_channel_se / (normaliser ** 2) * channel_mask_j
+                    ) / active_count
+                else:
+                    value_scalar = jnp.sum(value * priority_weights_j)
+                    value_loss = (value_scalar - symlog(ret)) ** 2
+                return policy_loss, value_loss, entropy, per_head
+
+            p_l, v_l, ent, per_head_ent = jax.vmap(per_sample)(
+                tokens, eqn_ids, avail,
+                actions, op_a, i_a, j_a, exp_a, f_a, kind_a, q_a,
+                axis_state_a, axis_valid_a,
+                old_log_probs, returns, adv_scalar, keys,
+            )
+            # Failed rows stay INCLUDED (bounded-negative penalty upstream
+            # gives them a repulsive advantage) — same as the legacy loss.
+            del valid
+            ppo_loss = jnp.mean(p_l)
+            value_loss = jnp.mean(v_l)
+            entropy_loss = -jnp.mean(ent)
+            total = ppo_loss + value_coef * value_loss + entropy_coef * entropy_loss
+            head_means = jnp.mean(per_head_ent, axis=0)  # (6,)
+            aux = {
+                "ppo_loss": ppo_loss,
+                "value_loss": value_loss,
+                "entropy": jnp.mean(ent),
+                "entropy_coef": entropy_coef,
+                "entropy/vertex": head_means[0],
+                "entropy/micro": head_means[1],
+                "total_loss": total,
+            }
+            return total, aux
+
+        grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=True)
+
+        @eqx.filter_jit
+        def update_step(agent, opt_state, batch,
+                        op_mask, factor_mask, quant_mask, key,
+                        entropy_coef):
+            (loss, aux), grads = grad_fn(
+                agent, batch, op_mask, factor_mask, quant_mask, key,
+                entropy_coef,
+            )
+            # NaN-skip guard — identical to the legacy update step.
+            loss_finite = jnp.isfinite(loss)
+            zero_grads = jax.tree.map(jnp.zeros_like, grads)
+            safe_grads = jax.tree.map(
+                lambda g, z: jnp.where(loss_finite, g, z), grads, zero_grads,
+            )
+            updates, new_opt_state = self.optimizer.update(
+                safe_grads, opt_state, agent,
+            )
+            new_agent = eqx.apply_updates(agent, updates)
+            new_opt_state = jax.tree.map(
+                lambda new, old: jnp.where(loss_finite, new, old),
+                new_opt_state, opt_state,
+            )
+            aux = dict(aux)
+            aux["nan_skip"] = jnp.where(loss_finite, 0, 1).astype(jnp.int32)
+            return new_agent, new_opt_state, aux
+
+        return update_step
+
     # ------------------------------------------------------------------
     # Driver entry — one episode (rollout + train)
     # ------------------------------------------------------------------
@@ -1679,14 +2163,38 @@ class PPORayWorker:
         # into the loss batch). Pad/non-eqn tokens are -1.
         buf_eqn_ids = np.zeros((T, N, MAX_TOKENS), dtype=np.int32)
         buf_actions = np.zeros((T, N), dtype=np.int32)
-        # Per-head action samples — only meaningful when dynamic_substeps
-        # is on. When off they stay zero and the loss treats them as
-        # log_prob = 0 (ratio = 1, no policy contribution).
-        buf_op = np.zeros((T, N), dtype=np.int32)
-        buf_i = np.zeros((T, N), dtype=np.int32)
-        buf_j = np.zeros((T, N), dtype=np.int32)
-        buf_f = np.zeros((T, N), dtype=np.int32)
-        buf_q = np.zeros((T, N), dtype=np.int32)
+        micro = bool(self.use_micro_policy)
+        if micro:
+            # Policy V2: full typed sub-episode buffers — one sequence of up
+            # to ``S = max_substeps`` DIAG/COMPRESS/QUANT micro-actions per
+            # (step, env), plus the LIVE axis features + vertex-avail mask
+            # the sample was drawn under (the loss re-evaluates against
+            # exactly these, so the PPO ratio is 1 at epoch 0).
+            S = int(self.max_substeps)
+            P = int(MAX_PRIMES)
+            buf_op = np.zeros((T, N, S), dtype=np.int32)
+            buf_i = np.zeros((T, N, S), dtype=np.int32)
+            buf_j = np.zeros((T, N, S), dtype=np.int32)
+            buf_exp = np.zeros((T, N, S, P), dtype=np.int32)
+            buf_f = np.zeros((T, N, S), dtype=np.int32)
+            buf_kind = np.zeros((T, N, S), dtype=np.int32)
+            buf_q = np.zeros((T, N, S), dtype=np.int32)
+            buf_axis_state = np.zeros(
+                (T, N, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM), dtype=np.int32,
+            )
+            buf_axis_valid = np.zeros(
+                (T, N, MAX_AXES_PER_VERTEX), dtype=np.float32,
+            )
+            buf_avail = np.zeros((T, N, int(self.total_v)), dtype=np.float32)
+        else:
+            # Per-head action samples — only meaningful when dynamic_substeps
+            # is on. When off they stay zero and the loss treats them as
+            # log_prob = 0 (ratio = 1, no policy contribution).
+            buf_op = np.zeros((T, N), dtype=np.int32)
+            buf_i = np.zeros((T, N), dtype=np.int32)
+            buf_j = np.zeros((T, N), dtype=np.int32)
+            buf_f = np.zeros((T, N), dtype=np.int32)
+            buf_q = np.zeros((T, N), dtype=np.int32)
         # Vertex-id ↦ axis_state[v] gather slot. Stored so the loss path
         # can re-mask i / j logits identically to the rollout (the
         # axis_valid_mask is static per env across the episode, so we
@@ -1716,15 +2224,34 @@ class PPORayWorker:
         for t in range(T):
             key, sub = jrand.split(key)
             avail = self._vertex_avail(state)
-            (
-                actions, op_a, i_a, j_a, f_a, q_a,
-                log_probs, values,
-                partial, order, specs, step,
-            ) = self._act_step(
-                self.agent, state, avail,
-                self._current_op_mask_j, self._current_factor_mask_j,
-                self._current_quant_mask_j, sub,
-            )
+            if micro:
+                # Observation the policy ACTS ON this step (pre-elimination).
+                # The micro loss re-evaluates log-probs against these tokens
+                # (storing post-assemble tokens would pair a_t with s_{t+1},
+                # making the PPO ratio != 1 even at epoch 0 — cmorl/ppo.py
+                # convention).
+                pre_tokens = np.asarray(state.tokens)
+                pre_eqn_ids = np.asarray(state.eqn_ids)
+                (
+                    actions, op_a, i_a, j_a, exp_a, f_a, kind_a, q_a,
+                    ax_st_a, ax_va_a,
+                    log_probs, values,
+                    partial, order, specs, step,
+                ) = self._act_step(
+                    self.agent, state, avail,
+                    self._current_op_mask_j, self._current_factor_mask_j,
+                    self._current_quant_mask_j, sub,
+                )
+            else:
+                (
+                    actions, op_a, i_a, j_a, f_a, q_a,
+                    log_probs, values,
+                    partial, order, specs, step,
+                ) = self._act_step(
+                    self.agent, state, avail,
+                    self._current_op_mask_j, self._current_factor_mask_j,
+                    self._current_quant_mask_j, sub,
+                )
 
             # Convert to numpy for Ray fan-out.
             order_np = np.asarray(order)
@@ -1779,10 +2306,22 @@ class PPORayWorker:
             )
             state = self._assemble(state, partial, tokens_j, eqn_ids_j, reward_j)
 
-            # Record. We store the *post-step* tokens so the next-step
-            # policy gradient targets see the same obs the policy used.
-            buf_tokens[t] = np.asarray(state.tokens)
-            buf_eqn_ids[t] = np.asarray(state.eqn_ids)
+            if micro:
+                # Record the PRE-step obs (the one a_t was sampled from) plus
+                # the sub-episode sequences + the axis features / avail mask
+                # the sample used.
+                buf_tokens[t] = pre_tokens
+                buf_eqn_ids[t] = pre_eqn_ids
+                buf_avail[t] = np.asarray(avail)
+                buf_exp[t] = np.asarray(exp_a)
+                buf_kind[t] = np.asarray(kind_a)
+                buf_axis_state[t] = np.asarray(ax_st_a)
+                buf_axis_valid[t] = np.asarray(ax_va_a)
+            else:
+                # Record. We store the *post-step* tokens so the next-step
+                # policy gradient targets see the same obs the policy used.
+                buf_tokens[t] = np.asarray(state.tokens)
+                buf_eqn_ids[t] = np.asarray(state.eqn_ids)
             buf_actions[t] = np.asarray(actions)
             buf_op[t] = np.asarray(op_a)
             buf_i[t] = np.asarray(i_a)
@@ -2143,128 +2682,98 @@ class PPORayWorker:
             adv_std = jnp.std(adv_flat) + 1e-8
             advantages_b = (advantages_b - adv_mean) / adv_std
 
-        # Stage for the update. Flatten (N, T) -> (N*T,) along the env
-        # axis (each transition is independent for PPO). Returns and
+        # Stage for the update. Flatten (T, N, ...) -> (N*T, ...) along the
+        # env axis (each transition is independent for PPO). Returns and
         # advantages carry a trailing K axis in gdpo mode (per-channel
         # values flow into the per-mb gdpo normalisation inside the
         # loss); scalar mode collapsed them above and they're already
-        # 1D here.
-        flat_tokens = jnp.asarray(buf_tokens.transpose(1, 0, 2).reshape(N * T, MAX_TOKENS))
-        flat_eqn_ids = jnp.asarray(buf_eqn_ids.transpose(1, 0, 2).reshape(N * T, MAX_TOKENS))
-        flat_actions = jnp.asarray(buf_actions.T.reshape(N * T))
-        flat_op = jnp.asarray(buf_op.T.reshape(N * T))
-        flat_i = jnp.asarray(buf_i.T.reshape(N * T))
-        flat_j = jnp.asarray(buf_j.T.reshape(N * T))
-        flat_f = jnp.asarray(buf_f.T.reshape(N * T))
-        flat_q = jnp.asarray(buf_q.T.reshape(N * T))
-        flat_vmask = jnp.asarray(buf_vertex_for_loss.T.reshape(N * T))
-        flat_log_probs = jnp.asarray(buf_log_probs.T.reshape(N * T))
+        # 1D here. Dict-driven so the micro path (per-substep sequences +
+        # axis features + avail mask) and the legacy path share one
+        # perm/truncate/reshape/shard pipeline.
+        def _flat(buf, extra=()):
+            arr = np.asarray(buf)
+            axes = (1, 0) + tuple(range(2, arr.ndim))
+            return jnp.asarray(
+                arr.transpose(axes).reshape((N * T,) + tuple(extra))
+            )
+
+        parts: dict[str, tuple] = {}
+        parts["tokens"] = (_flat(buf_tokens, (MAX_TOKENS,)), (MAX_TOKENS,))
+        parts["eqn_ids"] = (_flat(buf_eqn_ids, (MAX_TOKENS,)), (MAX_TOKENS,))
+        parts["actions"] = (_flat(buf_actions), ())
+        if micro:
+            _V = int(self.total_v)
+            parts["avail"] = (_flat(buf_avail, (_V,)), (_V,))
+            parts["op"] = (_flat(buf_op, (S,)), (S,))
+            parts["i"] = (_flat(buf_i, (S,)), (S,))
+            parts["j"] = (_flat(buf_j, (S,)), (S,))
+            parts["exp"] = (_flat(buf_exp, (S, P)), (S, P))
+            parts["f"] = (_flat(buf_f, (S,)), (S,))
+            parts["kind"] = (_flat(buf_kind, (S,)), (S,))
+            parts["q"] = (_flat(buf_q, (S,)), (S,))
+            parts["axis_state"] = (
+                _flat(buf_axis_state, (MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM)),
+                (MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM),
+            )
+            parts["axis_valid"] = (
+                _flat(buf_axis_valid, (MAX_AXES_PER_VERTEX,)),
+                (MAX_AXES_PER_VERTEX,),
+            )
+        else:
+            parts["op"] = (_flat(buf_op), ())
+            parts["i"] = (_flat(buf_i), ())
+            parts["j"] = (_flat(buf_j), ())
+            parts["f"] = (_flat(buf_f), ())
+            parts["q"] = (_flat(buf_q), ())
+            parts["vmask"] = (_flat(buf_vertex_for_loss), ())
+        parts["log_probs"] = (_flat(buf_log_probs), ())
         # Fix 1: per-transition valid mask (1.0 = good measure, 0.0 =
         # failed/sentinel). Flows into every minibatch so the loss can drop
-        # failed rows (see loss_fn's ``valid`` arg). Same (T, N) → (N*T,)
-        # layout as the buffers above.
-        flat_valid = jnp.asarray(
-            (~buf_failed).astype(np.float32).T.reshape(N * T)
-        )
+        # failed rows (see loss_fn's ``valid`` arg).
+        parts["valid"] = (_flat((~buf_failed).astype(np.float32)), ())
         if self.advantage_norm == "gdpo":
-            flat_returns = returns_b.reshape(N * T, NUM_REWARDS)
-            flat_advantages = advantages_b.reshape(N * T, NUM_REWARDS)
+            parts["returns"] = (
+                returns_b.reshape(N * T, NUM_REWARDS), (NUM_REWARDS,),
+            )
+            parts["advantages"] = (
+                advantages_b.reshape(N * T, NUM_REWARDS), (NUM_REWARDS,),
+            )
         else:
-            flat_returns = returns_b.reshape(N * T)
-            flat_advantages = advantages_b.reshape(N * T)
+            parts["returns"] = (returns_b.reshape(N * T), ())
+            parts["advantages"] = (advantages_b.reshape(N * T), ())
 
         # Single epoch × `minibatches` mini-batches. We rotate the batch
         # split by a deterministic permutation so each episode's first
         # minibatch isn't always envs 0..k-1.
         perm_key = jrand.fold_in(key, int(self._episode_counter))
         perm = jrand.permutation(perm_key, N * T)
-        flat_tokens = flat_tokens[perm]
-        flat_eqn_ids = flat_eqn_ids[perm]
-        flat_actions = flat_actions[perm]
-        flat_op = flat_op[perm]
-        flat_i = flat_i[perm]
-        flat_j = flat_j[perm]
-        flat_f = flat_f[perm]
-        flat_q = flat_q[perm]
-        flat_vmask = flat_vmask[perm]
-        flat_log_probs = flat_log_probs[perm]
-        flat_valid = flat_valid[perm]
-        flat_returns = flat_returns[perm]
-        flat_advantages = flat_advantages[perm]
+        parts = {k: (v[perm], ex) for k, (v, ex) in parts.items()}
 
         total = N * T
         mb_size = total // self.minibatches
         if mb_size == 0:
             mb_size = total
-            
+
         # Guarantee that mb_size is a multiple of num_devices so we can always shard
         if mb_size % self.num_devices != 0:
             mb_size = max(self.num_devices, (mb_size // self.num_devices) * self.num_devices)
-            
+
         mb_count = total // mb_size
         valid_total = mb_count * mb_size
-        
+
         if valid_total < total:
             print(f"[ppo_ray] truncating batch from {total} to {valid_total} to ensure mb_size={mb_size} is a multiple of {self.num_devices}")
-            flat_tokens = flat_tokens[:valid_total]
-            flat_eqn_ids = flat_eqn_ids[:valid_total]
-            flat_actions = flat_actions[:valid_total]
-            flat_op = flat_op[:valid_total]
-            flat_i = flat_i[:valid_total]
-            flat_j = flat_j[:valid_total]
-            flat_f = flat_f[:valid_total]
-            flat_q = flat_q[:valid_total]
-            flat_vmask = flat_vmask[:valid_total]
-            flat_log_probs = flat_log_probs[:valid_total]
-            flat_valid = flat_valid[:valid_total]
-            flat_returns = flat_returns[:valid_total]
-            flat_advantages = flat_advantages[:valid_total]
-
-        mb_sharded = True
+            parts = {k: (v[:valid_total], ex) for k, (v, ex) in parts.items()}
 
         # Reshape to ``(mb_count, mb_size, ...)`` so we can shard the
         # data axis (axis 1) across devices. Each minibatch index `i`
         # then yields a per-mb tensor that already lives in the
         # data-parallel layout — the loss vmap's leading axis is the
         # sharded one, and XLA distributes the work without a gather.
-        def _reshape_mb(flat, mb_extra_shape=()):
-            return flat.reshape((mb_count, mb_size, *mb_extra_shape))
-
-        mb_tokens = _reshape_mb(flat_tokens, (MAX_TOKENS,))
-        mb_eqn_ids = _reshape_mb(flat_eqn_ids, (MAX_TOKENS,))
-        mb_actions = _reshape_mb(flat_actions)
-        mb_op = _reshape_mb(flat_op)
-        mb_i = _reshape_mb(flat_i)
-        mb_j = _reshape_mb(flat_j)
-        mb_f = _reshape_mb(flat_f)
-        mb_q = _reshape_mb(flat_q)
-        mb_vmask = _reshape_mb(flat_vmask)
-        mb_log_probs = _reshape_mb(flat_log_probs)
-        mb_valid = _reshape_mb(flat_valid)
-        # Returns + advantages carry a trailing K=NUM_REWARDS axis in
-        # gdpo mode and are scalar (no trailing axis) in scalar mode.
-        if self.advantage_norm == "gdpo":
-            mb_returns = _reshape_mb(flat_returns, (NUM_REWARDS,))
-            mb_advantages = _reshape_mb(flat_advantages, (NUM_REWARDS,))
-        else:
-            mb_returns = _reshape_mb(flat_returns)
-            mb_advantages = _reshape_mb(flat_advantages)
-
-        if mb_sharded:
-            _shard = lambda x: jax.device_put(x, self.scan_data_sharding)
-            mb_tokens = _shard(mb_tokens)
-            mb_eqn_ids = _shard(mb_eqn_ids)
-            mb_actions = _shard(mb_actions)
-            mb_op = _shard(mb_op)
-            mb_i = _shard(mb_i)
-            mb_j = _shard(mb_j)
-            mb_f = _shard(mb_f)
-            mb_q = _shard(mb_q)
-            mb_vmask = _shard(mb_vmask)
-            mb_log_probs = _shard(mb_log_probs)
-            mb_valid = _shard(mb_valid)
-            mb_returns = _shard(mb_returns)
-            mb_advantages = _shard(mb_advantages)
+        mb = {}
+        for _name, (_v, _ex) in parts.items():
+            arr = _v.reshape((mb_count, mb_size, *_ex))
+            mb[_name] = jax.device_put(arr, self.scan_data_sharding)
 
         agent = self.agent
         opt_state = self.opt_state
@@ -2283,13 +2792,24 @@ class PPORayWorker:
         )
         _ent_coef_j = jnp.asarray(self.entropy_coef, dtype=jnp.float32)
         for i in range(mb_count):
-            batch = (
-                mb_tokens[i], mb_eqn_ids[i], mb_actions[i],
-                mb_op[i], mb_i[i], mb_j[i], mb_f[i], mb_q[i],
-                mb_vmask[i],
-                mb_log_probs[i], mb_returns[i], mb_advantages[i],
-                mb_valid[i],
-            )
+            if micro:
+                batch = (
+                    mb["tokens"][i], mb["eqn_ids"][i], mb["avail"][i],
+                    mb["actions"][i],
+                    mb["op"][i], mb["i"][i], mb["j"][i], mb["exp"][i],
+                    mb["f"][i], mb["kind"][i], mb["q"][i],
+                    mb["axis_state"][i], mb["axis_valid"][i],
+                    mb["log_probs"][i], mb["returns"][i], mb["advantages"][i],
+                    mb["valid"][i],
+                )
+            else:
+                batch = (
+                    mb["tokens"][i], mb["eqn_ids"][i], mb["actions"][i],
+                    mb["op"][i], mb["i"][i], mb["j"][i], mb["f"][i], mb["q"][i],
+                    mb["vmask"][i],
+                    mb["log_probs"][i], mb["returns"][i], mb["advantages"][i],
+                    mb["valid"][i],
+                )
             key, mb_key = jrand.split(key)
             agent, opt_state, aux = self._update_step(
                 agent, opt_state, batch,
@@ -2340,7 +2860,28 @@ class PPORayWorker:
         # channel. ``buf_*`` are shape ``(T, N)``; transpose so the
         # outer dimension is per-env (N) and the inner is per-step (T).
         per_env_actions: list[list]
-        if self.dynamic_substeps:
+        if micro:
+            # Decode each env's full typed sub-episode sequence into
+            # copy-pastable ``(vertex, [diag(...)/compress(...)/quant(...)])``
+            # rows — same human-readable form cmorl/mogfn dump; the
+            # best-sequences JSON writer's ``to_typed_records`` accepts this
+            # 2-tuple string shape natively. ``buf_*`` are ``(T, N, S)``;
+            # slice per env (column n) → ``(T, S)``.
+            from alphagrad.approx.ppo import _action_to_pylist_dynamic
+            per_env_actions = [
+                _action_to_pylist_dynamic(
+                    buf_actions[:, n],
+                    buf_op[:, n],
+                    buf_i[:, n],
+                    buf_j[:, n],
+                    buf_f[:, n],
+                    buf_kind[:, n],
+                    buf_q[:, n],
+                    int(self.max_substeps),
+                )
+                for n in range(N)
+            ]
+        elif self.dynamic_substeps:
             per_env_actions = [
                 [
                     [
