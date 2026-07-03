@@ -2403,6 +2403,62 @@ class PPORayWorker:
         from alphagrad.approx.common.cache import (
             SENTINEL_REWARD_VALUE as _SENTINEL_RV,
         )
+        # NON-FINITE REWARD SCRUB. A single nan/inf ANYWHERE in the (T, N, K)
+        # reward buffer poisons the ENTIRE episode's update: scalar-mode GAE
+        # runs per-channel then dot-products with the weights (0 * nan = nan,
+        # so even a ZERO-weight diagnostics channel leaks through), and the
+        # rollout-wide advantage z-score then smears that one nan over every
+        # transition -> loss non-finite on all minibatches -> nan_skip ==
+        # mb_count and the episode trains NOTHING (observed as the permanent
+        # ``loss(p/v):nan nan_skip:60`` signature).
+        #   * non-finite in a ZERO-weight channel  -> zero the entry (it only
+        #     feeds telemetry; the row stays a valid training sample);
+        #   * non-finite in a REWARDED channel     -> the measurement is
+        #     garbage: mark the transition failed so the existing sentinel
+        #     machinery (zero + bounded penalty + best-exclusion) handles it.
+        _nonfinite_rew = ~np.isfinite(buf_reward_vec)          # (T, N, K)
+        if _nonfinite_rew.any():
+            _w_nz = self.reward_weights_np != 0.0              # (K,)
+            _bad_rewarded = (
+                _nonfinite_rew & _w_nz[None, None, :]
+            ).any(axis=-1)                                     # (T, N)
+            print(
+                f"[ppo_ray] non-finite reward scrub: "
+                f"{int(_nonfinite_rew.sum())} entries "
+                f"({int((_nonfinite_rew & ~_w_nz[None, None, :]).sum())} in "
+                f"zero-weight channels zeroed; "
+                f"{int(_bad_rewarded.sum())} transitions with non-finite "
+                f"REWARDED channels -> failed)."
+            )
+            buf_reward_vec = np.where(
+                _nonfinite_rew, 0.0, buf_reward_vec,
+            ).astype(np.float32)
+        else:
+            _bad_rewarded = np.zeros((T, N), dtype=bool)
+        # Same guard for the rollout value estimates + bootstrap (a nan value
+        # poisons GAE identically).
+        _nf_val = int((~np.isfinite(buf_values)).sum())
+        _nf_boot = int((~np.isfinite(bootstrap)).sum())
+        if _nf_val or _nf_boot:
+            print(
+                f"[ppo_ray] non-finite VALUE scrub: {_nf_val} rollout value "
+                f"entries, {_nf_boot} bootstrap entries -> zeroed."
+            )
+            buf_values = np.nan_to_num(
+                buf_values, nan=0.0, posinf=0.0, neginf=0.0,
+            )
+            bootstrap = np.nan_to_num(
+                bootstrap, nan=0.0, posinf=0.0, neginf=0.0,
+            )
+        _nf_lp = int((~np.isfinite(buf_log_probs)).sum())
+        if _nf_lp:
+            print(
+                f"[ppo_ray] non-finite rollout LOG-PROB scrub: {_nf_lp} "
+                f"entries -> zeroed (ratio falls back to exp(new_lp))."
+            )
+            buf_log_probs = np.nan_to_num(
+                buf_log_probs, nan=0.0, posinf=0.0, neginf=0.0,
+            )
         # Env-side sentinel: any COST channel exactly == SENTINEL value.
         _cost_idx = [
             i for i in range(buf_reward_vec.shape[-1])
@@ -2412,7 +2468,7 @@ class PPORayWorker:
             buf_reward_vec[..., _cost_idx] == np.float32(_SENTINEL_RV),
             axis=-1,
         )  # (T, N)
-        buf_failed = buf_sentinel | _env_sentinel  # (T, N)
+        buf_failed = buf_sentinel | _env_sentinel | _bad_rewarded  # (T, N)
 
         # Phase 3 (b): mask sentinel transitions. Zero the per-channel
         # reward vector AND force dones=1 so GAE treats sentinel
@@ -2602,6 +2658,18 @@ class PPORayWorker:
             weights_j = self.reward_weights
             returns_b = jnp.sum(returns_b * weights_j, axis=-1)      # (N, T)
             advantages_b = jnp.sum(advantages_b * weights_j, axis=-1)  # (N, T)
+
+        if micro:
+            # V2 telemetry: any non-finite count here means the scrubs above
+            # missed a contamination path — the update would nan-skip.
+            _nf_ret = int((~np.isfinite(np.asarray(returns_b))).sum())
+            _nf_adv = int((~np.isfinite(np.asarray(advantages_b))).sum())
+            if _nf_ret or _nf_adv:
+                print(
+                    f"[ppo_ray][v2-diag] POST-GAE non-finite: "
+                    f"returns={_nf_ret} advantages={_nf_adv} "
+                    f"(update will nan-skip these minibatches)."
+                )
 
         # Stage F Lagrangian: penalise the advantage by the per-step
         # constraint violation, weighted by the current multipliers.
