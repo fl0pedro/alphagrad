@@ -262,14 +262,15 @@ class PalimpsaMixer(eqx.Module):
         k = jax.vmap(self.key_proj)(x).reshape(S, H, d)
         v = jax.vmap(self.value_proj)(x).reshape(S, H, d)
         b = jax.vmap(self.bias_proj)(x).reshape(S, H, d)
-        # forget magnitude >= 0 so decay = exp(-gt*g) in (0, 1].
-        gt = jnn.softplus(jax.vmap(self.gate_proj)(x))      # (S, H)
-
         # Relational structural prior folded into the forget gate (mirrors
-        # BiPalimpsaMixer): zero at init, so pure paper-Palimpsa at start.
+        # BiPalimpsaMixer, but injected PRE-softplus — the cleaner form the
+        # bi docstring itself notes — so a zero gate_mod is an EXACT no-op:
+        # softplus(raw + 0) == softplus(raw), pure paper-Palimpsa at init).
+        gt_raw = jax.vmap(self.gate_proj)(x)                # (S, H)
         if eqn_ids is not None:
-            gate_mod = self._relational_gate_mod(eqn_ids, S)  # (S, H)
-            gt = jnn.softplus(gt + gate_mod)                  # keep gt >= 0
+            gt_raw = gt_raw + self._relational_gate_mod(eqn_ids, S)
+        # forget magnitude >= 0 so decay = exp(-gt*g) in (0, 1].
+        gt = jnn.softplus(gt_raw)                            # (S, H)
 
         if mask is not None:
             # mask is (H, S, T) replicated; reduce to per-(key)token validity:
