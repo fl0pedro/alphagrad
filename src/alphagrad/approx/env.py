@@ -2133,6 +2133,20 @@ def _callback(
     _mem_frac = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_FRAC", "0.85") or 0.85)
     _mem_headroom = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_HEADROOM", "0.90") or 0.90)
     _mem_floor = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_FLOOR_GIB", "8.0") or 8.0) * (1024 ** 3)
+    # ALPHAGRAD_MEMGATE_USE_CURRENT (default ON): compute _live_free from CURRENT
+    # occupancy (bytes_in_use / bytes_reserved) and DROP the latched high-water
+    # peaks (peak_bytes_in_use / peak_bytes_reserved). CONFIRMED BUG: under
+    # XLA_PYTHON_CLIENT_PREALLOCATE=false the BFC pool GROWS on a transient peak
+    # (e.g. a heavy COMPRESS densification) and peak_bytes_in_use LATCHES that
+    # high-water mark forever, so _live_free = bytes_limit - peak reads ~0 for
+    # the rest of the run even though the memory was freed and nvidia-smi shows
+    # 23-31G actually free -> every subsequent 0.32G grad-measure spuriously
+    # gates ("free 0.0G < floor 8.0G") -> sentinels / failed_transitions (the
+    # basin signal). bytes_limit is the process's STATIC XLA fraction ceiling
+    # (~71G of a 96G Blackwell, verified), NOT the grown pool, so subtracting
+    # CURRENT usage yields true per-process headroom. Set to 0 to restore the
+    # old latched (peak-inclusive) behaviour.
+    _memgate_use_current = os.environ.get("ALPHAGRAD_MEMGATE_USE_CURRENT", "1") != "0"
 
     # Measure device(s) — the SAME list on every rank.
     _gate_devices = []
@@ -2179,16 +2193,30 @@ def _callback(
                 # NB do NOT include pool_bytes/peak_pool_bytes here — those
                 # report the BFC POOL SIZE (== bytes_limit once the pool has
                 # grown), not occupancy, so they would force free->0 and skip
-                # EVERY order. peak_bytes_in_use is the right fragmentation
-                # proxy: once a heavy order has peaked, the high-water stays up
-                # so subsequent execs see little free and skip — but it tracks
-                # real occupancy, not the pool ceiling.
-                _use = max(
-                    int(_st.get("bytes_in_use", 0) or 0),
-                    int(_st.get("peak_bytes_in_use", 0) or 0),
-                    int(_st.get("bytes_reserved", 0) or 0),
-                    int(_st.get("peak_bytes_reserved", 0) or 0),
-                )
+                # EVERY order.
+                #
+                # DEFAULT (ALPHAGRAD_MEMGATE_USE_CURRENT=1): use CURRENT
+                # occupancy only. The peak_* fields LATCH a transient
+                # high-water mark that never decays under a growable BFC pool,
+                # so once any heavy order peaks, _live_free = limit - peak reads
+                # ~0 for the whole run and gates every later 0.32G measure even
+                # though 23-31G is truly free. bytes_in_use/bytes_reserved
+                # reflect the memory the next allocation actually has to fit
+                # around, which is the correct headroom signal.
+                if _memgate_use_current:
+                    _use = max(
+                        int(_st.get("bytes_in_use", 0) or 0),
+                        int(_st.get("bytes_reserved", 0) or 0),
+                    )
+                else:
+                    # Legacy latched behaviour (peak-inclusive fragmentation
+                    # proxy) — revertible via env for A/B comparison.
+                    _use = max(
+                        int(_st.get("bytes_in_use", 0) or 0),
+                        int(_st.get("peak_bytes_in_use", 0) or 0),
+                        int(_st.get("bytes_reserved", 0) or 0),
+                        int(_st.get("peak_bytes_reserved", 0) or 0),
+                    )
                 if _lim > 0:
                     _frees.append(_lim - _use)
             if _frees:
