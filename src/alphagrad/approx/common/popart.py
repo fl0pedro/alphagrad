@@ -50,12 +50,26 @@ class PopArtStats:
         self,
         num_channels: int,
         beta: float = 1e-2,
-        sigma_min: float = 0.1,
+        sigma_min=0.1,
         sigma_max: float = 1e6,
     ) -> None:
         self.num_channels = int(num_channels)
         self.beta = float(beta)
-        self.sigma_min = float(sigma_min)
+        # Fix 4: sigma_min may be a scalar OR a per-channel array. A
+        # near-homogeneous channel (bkstep/cosine at convergence) drives
+        # var->0 and clamps to the floor; too small a floor (0.1) lets the
+        # A_k/sigma_k advantage over-amplify when the batch goes uniform.
+        # Per-channel floors let bkstep(9)/cosine(6) sit higher (~0.2)
+        # without over-flattening the wide-dynamic-range cost channels.
+        _sm = np.asarray(sigma_min, dtype=np.float64)
+        if _sm.ndim == 0:
+            _sm = np.full(self.num_channels, float(_sm), dtype=np.float64)
+        if _sm.shape != (self.num_channels,):
+            raise ValueError(
+                f"sigma_min must be scalar or ({self.num_channels},), got "
+                f"{_sm.shape}",
+            )
+        self.sigma_min = _sm
         self.sigma_max = float(sigma_max)
         # Debiased EMA accumulators (float64 — the raw cost channels span
         # ~9 decades and the second moment squares that).

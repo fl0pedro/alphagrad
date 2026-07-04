@@ -172,6 +172,11 @@ VALUE_NORM="${VALUE_NORM:-baseline}"
 # blowup directly. Env-gated / revertible (ADV_CLIP=0 disables).
 export ALPHAGRAD_ADV_STD_FLOOR="${ALPHAGRAD_ADV_STD_FLOOR:-0.5}"
 export ALPHAGRAD_ADV_CLIP="${ALPHAGRAD_ADV_CLIP:-8.0}"
+# Fix 4: per-channel PopArt sigma floor. Global floor 0.1 over-amplified the
+# near-homogeneous bkstep(9)+cosine(6) channels (var->0 -> A_k/sigma_k inflated).
+# Floor those quality channels higher (0.2); cost channels keep base 0.1.
+export ALPHAGRAD_POPART_SIGMA_MIN="${ALPHAGRAD_POPART_SIGMA_MIN:-0.1}"
+export ALPHAGRAD_POPART_SIGMA_MIN_QUALITY="${ALPHAGRAD_POPART_SIGMA_MIN_QUALITY:-0.2}"
 NAME="full_nn256_v2${VARIANT:+_$VARIANT}$([ "$VALUE_NORM" = popart ] && echo _popart)_s${SEED}"
 
 echo "########## FULL_NN256_V2 $(date) | head=$NODE0 eps=$EPISODES NN_HIDDEN=256 variant=${VARIANT:-full} value_norm=$VALUE_NORM measure-grad ##########"

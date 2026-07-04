@@ -1107,18 +1107,35 @@ class PPORayWorker:
             # before the GAE deltas.
             self._use_symlog_in_gae = False
             from alphagrad.approx.common.popart import PopArtStats
+            # Fix 4: per-channel sigma floor. The global default 0.1
+            # over-amplified the near-homogeneous bkstep channel (idx 9,
+            # returns ~0.64 everywhere at convergence -> var->0 -> floored
+            # sigma -> A/sigma inflated). Floor bkstep(9) + cosine(6)
+            # higher (ALPHAGRAD_POPART_SIGMA_MIN_QUALITY, default 0.2);
+            # everything else keeps the base floor
+            # (ALPHAGRAD_POPART_SIGMA_MIN, default 0.1). Both env-tunable
+            # so the change is fully revertible (set the quality floor
+            # equal to the base to restore the old scalar behaviour).
+            _sig_min_base = float(
+                os.environ.get("ALPHAGRAD_POPART_SIGMA_MIN", "0.1")
+            )
+            _sig_min_qual = float(
+                os.environ.get("ALPHAGRAD_POPART_SIGMA_MIN_QUALITY", "0.2")
+            )
+            _sig_min_vec = np.full(NUM_REWARDS, _sig_min_base, dtype=np.float64)
+            for _qi in (6, 9):  # cosine_sim, bkstep_acc
+                _sig_min_vec[_qi] = max(_sig_min_base, _sig_min_qual)
             self.popart = PopArtStats(
                 NUM_REWARDS,
                 beta=float(os.environ.get("ALPHAGRAD_POPART_BETA", "0.01")),
-                sigma_min=float(
-                    os.environ.get("ALPHAGRAD_POPART_SIGMA_MIN", "0.1")
-                ),
+                sigma_min=_sig_min_vec,
             )
             print(
                 f"[ppo_ray] PopArt value norm ON: beta={self.popart.beta} "
-                f"sigma_min={self.popart.sigma_min} — replaces the rollout "
-                f"advantage z-score; failed rows get a plain constant -1.0 "
-                f"advantage (no normaliser interaction).",
+                f"sigma_min(base={_sig_min_base}, quality[6,9]="
+                f"{_sig_min_qual}) — replaces the rollout advantage "
+                f"z-score; failed rows get a plain constant -1.0 advantage "
+                f"(no normaliser interaction).",
                 flush=True,
             )
 
