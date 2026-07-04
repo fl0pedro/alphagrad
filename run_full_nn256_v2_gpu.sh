@@ -56,7 +56,19 @@ export ALPHAGRAD_MEASURE_MEM_SAFETY=1.3  # was 1.0 — margin so OOMs are rare (
 # est*safety > headroom*free (COMPRESS/ViT densify still gated); the floor is
 # just a small absolute minimum so we never measure into a near-empty device.
 export ALPHAGRAD_MEASURE_MEM_FLOOR_GIB=1.0  # was 8.0 (fixed) — now a min, not the gate
+export ALPHAGRAD_SENTINEL_K=0.0  # mu neutral sentinel (no -2sigma penalty; unknown != bad)
 export ALPHAGRAD_PREVALIDATE_MEASURE=1
+# MEASURE-GPU LEAK BOUND. Each measure = a DISTINCT per-(order,micro-action)
+# jax.jit(jacve()).compile() executable on the measure GPU (exec_on_gpu). Orders
+# vary per-step -> unbounded distinct executables; under PREALLOCATE=false PJRT
+# holds each loaded executable + buffers, so the measure GPU fills over thousands
+# of measures and even a KiB alloc OOMs (RESOURCE_EXHAUSTED at non-terminal steps,
+# count CLIMBING across episodes — masked before by the old 8G mem-floor). The
+# CpuApproximationServer calls jax.clear_caches()+gc every N evaluate calls (and
+# always on an OOM sentinel) so XLA releases those executables; the on-disk
+# compile cache survives -> recurring configs reload cheap. Keeps measure-GPU
+# memory FLAT instead of monotonically growing.
+export ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY=64
 
 # >>> Fix 2(a): QUANT dtype restriction (drop the TypePromotionError dtypes) <<<
 # graphax's mixed-precision shim (dtype_compute._NARROW_PROMOTION_REP) covers

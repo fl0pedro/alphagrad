@@ -94,6 +94,28 @@ class CpuApproximationServer:
         # production runs aren't taxed.
         self._n_calls = 0
         self._leak_profile = None  # set by `_maybe_init_leak_profile`
+        # ------------------------------------------------------------------
+        # GPU-executable leak bound. Each ``evaluate`` runs one (or more)
+        # per-config ``jax.jit(jacve(...)).lower().compile()`` — a DISTINCT
+        # XLA executable per (order, micro-action specs) — via ``env._callback``.
+        # Orders/specs vary per-step per-episode, so the population of distinct
+        # executables is effectively UNBOUNDED. Under ``exec_on_gpu`` with
+        # ``XLA_PYTHON_CLIENT_PREALLOCATE=false`` the PJRT/BFC pool holds each
+        # loaded executable + its device buffers; over thousands of measures the
+        # measure-GPU fills and even a KiB allocation OOMs (RESOURCE_EXHAUSTED at
+        # non-terminal steps), with the failure count CLIMBING across episodes.
+        # ``jax.clear_caches()`` drops JAX's in-process jit/compilation caches so
+        # XLA can release those executables + buffers back to the device; the
+        # persistent ON-DISK compile cache survives, so recurring configs stay
+        # cheap to reload. Gated by ``ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY`` (0 =
+        # off) — cleared every N evaluate calls to bound device memory (flat, not
+        # climbing) at the cost of an occasional recompile.
+        try:
+            self._cache_clear_every = int(
+                os.environ.get("ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY", "0") or "0"
+            )
+        except ValueError:
+            self._cache_clear_every = 0
         # One-shot env-var banner: prints which ALPHAGRAD_* /
         # JAX_COMPILATION_* keys the actor's runtime_env actually
         # received. Lets us catch driver-side passthrough bugs (e.g.
@@ -201,7 +223,11 @@ class CpuApproximationServer:
             self._n_calls += 1
             if self._leak_profile is not None:
                 self._leak_profile.record_call(self._n_calls)
-            return np.asarray(tokens), np.asarray(eqn_ids), np.asarray(reward)
+            out = np.asarray(tokens), np.asarray(eqn_ids), np.asarray(reward)
+            # Results are now host-side numpy — safe to drop the per-config
+            # XLA executables that env._callback compiled onto the measure GPU.
+            self._maybe_clear_compile_caches()
+            return out
         except Exception as exc:
             # graphax can raise on transforms that produce shape-incompatible
             # edges (e.g. a DIAG whose factor doesn't divide some primal axis,
@@ -304,6 +330,12 @@ class CpuApproximationServer:
             from alphagrad.approx.env import REWARD_INDEX
             sentinel_reward[REWARD_INDEX["cosine_sim"]] = 0.0
             sentinel_reward[REWARD_INDEX["frob_residual"]] = -1e10
+            # A sentinel often IS an OOM (RESOURCE_EXHAUSTED) — the device is
+            # full. Count it toward the clear cadence and clear on the boundary
+            # so a run of failures actively reclaims memory rather than piling
+            # more partially-compiled executables on the saturated GPU.
+            self._n_calls += 1
+            self._maybe_clear_compile_caches(force_on_oom=str(exc))
             return sentinel_tokens, sentinel_eqn_ids, sentinel_reward
 
     def evaluate_batch(self, batch: Sequence[tuple]):
@@ -392,6 +424,54 @@ class CpuApproximationServer:
         self._env = eqx.tree_at(lambda e: e.config, self._env, new_config)
         self._config = new_config
         return True
+
+    def _maybe_clear_compile_caches(self, *, force_on_oom: str | None = None) -> None:
+        """Periodically drop JAX's in-process compilation caches so XLA
+        releases the accumulated per-config executables + their measure-GPU
+        device buffers. Bounds the otherwise-unbounded distinct-executable
+        growth that fills the measure GPU (RESOURCE_EXHAUSTED). No-op unless
+        ``ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY`` > 0, except that a genuine OOM
+        (``force_on_oom`` carries the exception text) always clears — a full
+        device must be reclaimed immediately regardless of cadence.
+
+        The persistent ON-DISK compile cache is untouched, so a config we
+        re-encounter after a clear reloads from disk instead of a full HLO
+        recompile — the reclaim costs at most an occasional executable reload.
+        """
+        every = self._cache_clear_every
+        is_oom = bool(
+            force_on_oom
+            and (
+                "RESOURCE_EXHAUSTED" in force_on_oom
+                or "Out of memory" in force_on_oom
+                or "out of memory" in force_on_oom
+            )
+        )
+        if every <= 0 and not is_oom:
+            return
+        due = is_oom or (every > 0 and (self._n_calls % every == 0))
+        if not due:
+            return
+        try:
+            import gc
+            import jax
+            jax.clear_caches()
+            gc.collect()
+            if is_oom or self._n_calls <= every or (self._n_calls % (every * 8) == 0):
+                # Log the first few clears + every 8th cadence-clear + every OOM
+                # clear, so the reclaim is visible without spamming the log.
+                print(
+                    f"[cpu_approx_worker pid={os.getpid()}] jax.clear_caches() "
+                    f"@ call={self._n_calls} "
+                    f"(every={every}, oom={is_oom})",
+                    flush=True,
+                )
+        except Exception as _clear_exc:  # pragma: no cover - defensive
+            print(
+                f"[cpu_approx_worker pid={os.getpid()}] clear_caches failed: "
+                f"{type(_clear_exc).__name__}: {_clear_exc}",
+                flush=True,
+            )
 
     def _maybe_init_leak_profile(self) -> None:
         """Activate the per-actor RSS / tracemalloc profiler on first
