@@ -167,6 +167,11 @@ HEAD_IP=$(srun --nodes=1 --nodelist=$NODE0 hostname -i | awk '{print $1}')
 # baseline = byte-identical legacy path (symlog value loss + rollout
 # advantage z-score). Set VALUE_NORM=popart (or ALPHAGRAD_POPART=1).
 VALUE_NORM="${VALUE_NORM:-baseline}"
+# ep49-collapse Fix 1 (job 51516): scale-only advantage bound (no mean-subtract)
+# + hard clip backstop on the PopArt scalar advantage path — caps the std-13
+# blowup directly. Env-gated / revertible (ADV_CLIP=0 disables).
+export ALPHAGRAD_ADV_STD_FLOOR="${ALPHAGRAD_ADV_STD_FLOOR:-0.5}"
+export ALPHAGRAD_ADV_CLIP="${ALPHAGRAD_ADV_CLIP:-8.0}"
 NAME="full_nn256_v2${VARIANT:+_$VARIANT}$([ "$VALUE_NORM" = popart ] && echo _popart)_s${SEED}"
 
 echo "########## FULL_NN256_V2 $(date) | head=$NODE0 eps=$EPISODES NN_HIDDEN=256 variant=${VARIANT:-full} value_norm=$VALUE_NORM measure-grad ##########"

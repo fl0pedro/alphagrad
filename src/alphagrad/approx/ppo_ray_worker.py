@@ -3015,6 +3015,41 @@ class PPORayWorker:
             # a per-batch std). Failed rows keep the V2 stamp, now as a
             # PLAIN CONSTANT -1.0 advantage — repulsive, on-scale, zero
             # normaliser interaction.
+            # Fix 1 (PRIMARY collapse fix): even with the sigma floor, a
+            # catastrophic policy flip can drive the per-channel residual
+            # A_k/sigma_k to O(10) when a channel error spikes while its
+            # sigma sits at the floor (ep49: bkstep error ~1.3 / sigma 0.1
+            # -> weighted-sum std ~13, which the scalar path deliberately
+            # does NOT re-normalise -> the bad basin locks in). Apply a
+            # SCALE-ONLY normalisation (divide by max(std, FLOOR), NO
+            # mean-subtraction -- preserve sign and PopArt's relative
+            # per-channel signal; the z-score's mean-coupling is exactly
+            # the all-fail-zeroing / sign-flip artifact we are avoiding),
+            # then a hard symmetric clip as a backstop. Applied BEFORE the
+            # failed-row stamp so the stamp lands cleanly inside the clip
+            # range (+-1 << CLIP). Env knobs, both revertible:
+            #   ALPHAGRAD_ADV_STD_FLOOR (default 0.5) -- floor so the
+            #     divisor can never shrink and AMPLIFY as returns homogenise;
+            #   ALPHAGRAD_ADV_CLIP (default 8.0) -- hard backstop, roomy
+            #     for the +-1 stamp. Set 0 to disable the whole bound.
+            _adv_std_floor = float(
+                os.environ.get("ALPHAGRAD_ADV_STD_FLOOR", "0.5")
+            )
+            _adv_clip = float(os.environ.get("ALPHAGRAD_ADV_CLIP", "8.0"))
+            _adv_np_pre = np.asarray(advantages_b, dtype=np.float64)
+            _adv_std_pre = float(_adv_np_pre.std())
+            _adv_absmax_pre = float(np.abs(_adv_np_pre).max())
+            if _adv_clip > 0.0:
+                _adv_scale = jnp.maximum(
+                    jnp.std(advantages_b), jnp.float32(_adv_std_floor)
+                )
+                advantages_b = advantages_b / _adv_scale     # scale-only
+                advantages_b = jnp.clip(
+                    advantages_b, -_adv_clip, _adv_clip
+                )
+                _popart_log["popart/adv_std_pre_bound"] = _adv_std_pre
+                _popart_log["popart/adv_absmax_pre_bound"] = _adv_absmax_pre
+                _popart_log["popart/adv_scale"] = float(_adv_scale)
             if self.reward_mode == "additive" and buf_failed.any():
                 advantages_b = jnp.where(
                     jnp.asarray(buf_failed.T),            # (N, T)
