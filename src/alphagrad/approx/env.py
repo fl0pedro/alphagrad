@@ -2115,9 +2115,18 @@ def _callback(
     #   ALPHAGRAD_MEASURE_MEM_FRAC     (0.85) auto static-cap fraction of limit.
     #   ALPHAGRAD_MEASURE_MEM_SAFETY   (2.0)  multiplier on the per-order estimate.
     #   ALPHAGRAD_MEASURE_MEM_HEADROOM (0.90) estimate must fit 90% of live free.
-    #   ALPHAGRAD_MEASURE_MEM_FLOOR_GIB(8.0)  skip if live free < this floor —
-    #                                  covers the autotuner workspace the
-    #                                  estimate can't see. 0 disables the floor.
+    #   ALPHAGRAD_MEASURE_MEM_FLOOR_GIB(1.0)  ESTIMATE-BASED gate: the real
+    #                                  protection is est*safety > headroom*free
+    #                                  (above); genuine big configs still gate.
+    #                                  This floor is now only a small ABSOLUTE
+    #                                  minimum so we never measure into a
+    #                                  near-empty device; it must NOT dominate.
+    #                                  Was 8.0G (fixed) which spuriously skipped
+    #                                  a 0.32G diag measure whenever free<8G even
+    #                                  with tens of GiB truly free -> sentinels/
+    #                                  failed_transitions under moderate load
+    #                                  (51557 ep235/236 + ep362->363 spike).
+    #                                  0 disables the floor.
     _gate_raw = (os.environ.get("ALPHAGRAD_MAX_MEASURE_MEM_GIB", "0") or "").strip().lower()
     _gate_disabled = False
     _gate_auto = _gate_raw in ("", "0", "0.0", "auto")
@@ -2132,7 +2141,7 @@ def _callback(
     _mem_safety = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_SAFETY", "2.0") or 2.0)
     _mem_frac = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_FRAC", "0.85") or 0.85)
     _mem_headroom = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_HEADROOM", "0.90") or 0.90)
-    _mem_floor = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_FLOOR_GIB", "8.0") or 8.0) * (1024 ** 3)
+    _mem_floor = float(os.environ.get("ALPHAGRAD_MEASURE_MEM_FLOOR_GIB", "1.0") or 1.0) * (1024 ** 3)
     # ALPHAGRAD_MEMGATE_USE_CURRENT (default ON): compute _live_free from CURRENT
     # occupancy (bytes_in_use / bytes_reserved) and DROP the latched high-water
     # peaks (peak_bytes_in_use / peak_bytes_reserved). CONFIRMED BUG: under

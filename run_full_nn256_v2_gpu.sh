@@ -49,6 +49,13 @@ export ALPHAGRAD_MAX_MEASURE_TOKENS=0
 # see. Genuine COMPRESS up to ~46G real still runs; only the OOM-prone ones skip.
 export ALPHAGRAD_MAX_MEASURE_MEM_GIB=60  # was 72 — 36G headroom absorbs COMPRESS densify workspace under-count
 export ALPHAGRAD_MEASURE_MEM_SAFETY=1.3  # was 1.0 — margin so OOMs are rare (gate fires before exec, not after)
+# ESTIMATE-BASED mem-gate (was fixed 8G floor). The old default floor skipped
+# a ~0.32G diag measure whenever live free < 8G even with tens of GiB truly
+# free -> spurious sentinels/failed_transitions under moderate node load
+# (51557 ep235/236 + ep362->363 spike). Now the real protection is
+# est*safety > headroom*free (COMPRESS/ViT densify still gated); the floor is
+# just a small absolute minimum so we never measure into a near-empty device.
+export ALPHAGRAD_MEASURE_MEM_FLOOR_GIB=1.0  # was 8.0 (fixed) — now a min, not the gate
 export ALPHAGRAD_PREVALIDATE_MEASURE=1
 
 # >>> Fix 2(a): QUANT dtype restriction (drop the TypePromotionError dtypes) <<<
@@ -167,6 +174,7 @@ HEAD_IP=$(srun --nodes=1 --nodelist=$NODE0 hostname -i | awk '{print $1}')
 # baseline = byte-identical legacy path (symlog value loss + rollout
 # advantage z-score). Set VALUE_NORM=popart (or ALPHAGRAD_POPART=1).
 VALUE_NORM="${VALUE_NORM:-baseline}"
+MAX_SUBSTEPS="${MAX_SUBSTEPS:-16}"
 # ep49-collapse Fix 1 (job 51516): scale-only advantage bound (no mean-subtract)
 # + hard clip backstop on the PopArt scalar advantage path — caps the std-13
 # blowup directly. Env-gated / revertible (ADV_CLIP=0 disables).
@@ -179,7 +187,7 @@ export ALPHAGRAD_POPART_SIGMA_MIN="${ALPHAGRAD_POPART_SIGMA_MIN:-0.1}"
 export ALPHAGRAD_POPART_SIGMA_MIN_QUALITY="${ALPHAGRAD_POPART_SIGMA_MIN_QUALITY:-0.2}"
 # Fix 2: PPO KL early-stop (reject a catastrophic ep49-type update). 0 disables.
 export ALPHAGRAD_PPO_TARGET_KL="${ALPHAGRAD_PPO_TARGET_KL:-0.15}"
-NAME="full_nn256_v2${VARIANT:+_$VARIANT}$([ "$VALUE_NORM" = popart ] && echo _popart)_s${SEED}"
+NAME="full_nn256_v2${VARIANT:+_$VARIANT}$([ "$VALUE_NORM" = popart ] && echo _popart)_s${SEED}_ss${MAX_SUBSTEPS}"
 
 echo "########## FULL_NN256_V2 $(date) | head=$NODE0 eps=$EPISODES NN_HIDDEN=256 variant=${VARIANT:-full} value_norm=$VALUE_NORM measure-grad ##########"
 
@@ -200,7 +208,7 @@ uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --lambda-cmp $LAMBDA_CMP --lambda-mem $LAMBDA_MEM --lambda-acc $LAMBDA_ACC --lambda-frob 0.0 \
   --lambda-cossim-guide $LAMBDA_COSSIM_GUIDE \
   --entropy-coef $ENTROPY_COEF --entropy-coef-final $ENTROPY_COEF_FINAL \
-  --dynamic-substeps --max-substeps 16 \
+  --dynamic-substeps --max-substeps ${MAX_SUBSTEPS} \
   --actor-num-gpus 1 --cpu-actor-num-gpus 1 --num-cpu-workers 3 \
   --cpu-cores-per-actor 8 --cpu-cores-shared \
   --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \
