@@ -87,7 +87,14 @@ class CpuApproximationServer:
         # ``~/.cache/jax-compile`` by default. JAX's hashing keys on
         # the lowered HLO, so unrelated workers' caches don't poison
         # each other.
-        _setup_jax_compile_cache()
+        # ALPHAGRAD_DISABLE_JIT_DISK_CACHE=1 skips the persistent on-disk
+        # compile cache (Phase-2 memory-mitigation probe #3): lets us measure
+        # the disk cache's throughput contribution in isolation. Default OFF
+        # (cache ON) — this is the shipped behaviour.
+        if os.environ.get("ALPHAGRAD_DISABLE_JIT_DISK_CACHE", "0") != "1":
+            _setup_jax_compile_cache()
+        else:
+            print(f"[cpu_approx_worker pid={os.getpid()}] JIT disk cache DISABLED (ALPHAGRAD_DISABLE_JIT_DISK_CACHE=1)", flush=True)
         # Per-actor leak profiler. Lazy-initialised on first call to
         # ``evaluate`` so we don't pay the import cost when profiling
         # is disabled. Gated by env-var ``ALPHAGRAD_LEAK_PROFILE`` so
