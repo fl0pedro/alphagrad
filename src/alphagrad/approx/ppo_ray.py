@@ -197,6 +197,19 @@ def _run(args) -> int:
         # otherwise pin to CPU JAX so measurement runs on the CPU pool.
         "JAX_PLATFORMS": "cuda" if getattr(args, "exec_on_gpu", False) else "cpu",
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+        # Phase-2 memory-mitigation probe #6: hard-cap the measure actor's
+        # per-process device memory to a fraction of the GPU via
+        # XLA_PYTHON_CLIENT_MEM_FRACTION. Bounds the BFC pool so runaway
+        # per-config executable growth hits a fraction ceiling instead of the
+        # whole device. Watch for fails-fast-into-sentinels rather than a
+        # graceful bound. Gated by ALPHAGRAD_MEASURE_MEM_FRACTION (unset/empty
+        # = OFF = default, no cap). Only applied under --exec-on-gpu.
+        **(
+            {"XLA_PYTHON_CLIENT_MEM_FRACTION": os.environ["ALPHAGRAD_MEASURE_MEM_FRACTION"]}
+            if getattr(args, "exec_on_gpu", False)
+            and os.environ.get("ALPHAGRAD_MEASURE_MEM_FRACTION", "").strip()
+            else {}
+        ),
         # NOTE: do NOT force single-thread here. The approx-Jacobian exec
         # scales ~linearly with cores (0.45s@64-core → ~80s@1-core), so
         # single-thread starves it. Each actor is pinned to a disjoint
