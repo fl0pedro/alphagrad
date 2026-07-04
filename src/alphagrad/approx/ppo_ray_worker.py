@@ -1139,6 +1139,77 @@ class PPORayWorker:
                 flush=True,
             )
 
+        # ------------------------------------------------------------------
+        # DYNAMIC SENTINEL (bridge-cse). Replace the catastrophic -1e10
+        # sentinel reward with a bounded, distribution-aware substitute:
+        # per-channel ``mu_c - K*sigma_c`` over the running distribution of
+        # REAL (non-failed) terminal reward vectors. Keeps failed rows a
+        # *repulsive* (mildly-negative) signal without the -1e10 blow-up that
+        # distorts every downstream mean / z-score / log. The boolean
+        # ``buf_failed`` mask (value-independent) still drives every
+        # failed_transitions count and PopArt exclusion — we change the
+        # REWARD, never the event bookkeeping.
+        #
+        # Stats source: a DEDICATED per-channel EMA (mu, sigma) of the RAW
+        # terminal reward vectors — NOT PopArt (which normalises RETURNS, not
+        # per-step rewards, and whose mu/sigma live in a different, discounted
+        # space). EMA of x and x^2 -> mu = E[x], sigma = sqrt(max(E[x^2]-mu^2,
+        # eps)). beta is the per-rollout mixing rate.
+        self.dynamic_sentinel = (
+            os.environ.get("ALPHAGRAD_DYNAMIC_SENTINEL", "1") == "1"
+        )
+        self.sentinel_k = float(
+            os.environ.get("ALPHAGRAD_SENTINEL_K", "2.0")
+        )
+        self._sent_ema_beta = float(
+            os.environ.get("ALPHAGRAD_SENTINEL_EMA_BETA", "0.01")
+        )
+        # EMA state (per-channel). ``_sent_ema_n`` counts how many rollouts
+        # have fed the EMA — until the first real update we have no
+        # distribution, so the sentinel value falls back to the legacy
+        # bounded penalty (failed_penalty) rather than a meaningless 0-K*0=0.
+        self._sent_ema_mean = np.zeros(NUM_REWARDS, dtype=np.float64)
+        self._sent_ema_sq = np.zeros(NUM_REWARDS, dtype=np.float64)
+        self._sent_ema_n = 0
+        if self.dynamic_sentinel:
+            print(
+                f"[ppo_ray] DYNAMIC SENTINEL ON: failed/sentinel terminals "
+                f"get per-channel mu_c - {self.sentinel_k}*sigma_c "
+                f"(EMA beta={self._sent_ema_beta}) instead of -1e10. "
+                f"The additive failed_penalty stamp AND the post-z-score "
+                f"failed_adv_stamp are DISABLED (dynamic value supersedes "
+                f"them); failed_transitions logging + PopArt exclusion "
+                f"unchanged.",
+                flush=True,
+            )
+
+        # RAW full-range cosine_sim threading (bridge-cse). The env used to
+        # apply the ALPHAGRAD_COSSIM_GUIDE_CAP ``min(cossim, C)`` guide cap in
+        # env._callback, so idx6 arrived already clamped to [.., C] and the
+        # full-range cossim never reached the worker for honest logging /
+        # EMA. When ON, the env emits RAW cossim in idx6 and the guide cap is
+        # applied HERE — only into the reward/GAE buffer, leaving
+        # buf_reward_vec_raw carrying the full-range value for
+        # ``reward/cosine_sim_raw`` + the dynamic-sentinel EMA.
+        self.raw_cossim_thread = (
+            os.environ.get("ALPHAGRAD_RAW_COSSIM_THREAD", "1") == "1"
+        )
+        _gc = os.environ.get("ALPHAGRAD_COSSIM_GUIDE_CAP", "").strip()
+        self._cossim_guide_cap = None
+        if _gc:
+            try:
+                self._cossim_guide_cap = float(_gc)
+            except ValueError:
+                self._cossim_guide_cap = None
+        if self.raw_cossim_thread:
+            print(
+                f"[ppo_ray] RAW COSSIM THREAD ON: env emits full-range "
+                f"cosine_sim in idx6; worker applies guide cap="
+                f"{self._cossim_guide_cap} into the GAE buffer only, logs "
+                f"reward/cosine_sim_raw from the uncapped value.",
+                flush=True,
+            )
+
         # Phase D — conditioned-reward gates. The user-supplied
         # ``--reward-condition`` specs are parsed once at init; the
         # rollout loop walks the list and zeroes the easier reward at
@@ -2623,16 +2694,94 @@ class PPORayWorker:
         # net effect is a strictly-negative gated reward (a gradient out),
         # NOT the misleading "free" zero — the zeroing here only clears the
         # raw -1e10 cost channels that would otherwise blow up symlog/GAE.
+        # DYNAMIC SENTINEL (bridge-cse). Update the per-channel EMA from the
+        # RAW, non-failed TERMINAL reward vectors FIRST (buf_reward_vec is
+        # still the raw measured buffer here — cost channels raw-negative,
+        # cosine_sim full-range now that the env defers the guide cap), so
+        # substituted sentinel values NEVER feed back into the stats. Then
+        # replace each failed row's whole reward vector with the bounded
+        # ``mu_c - K*sigma_c`` (finite, != any value filter_sentinel_mask
+        # keys on) instead of the legacy per-channel ZERO. Falls back to the
+        # legacy zero until the EMA has seen at least one real rollout.
+        _dyn_scalar = float("nan")
+        if self.dynamic_sentinel:
+            _term_ok = buf_dones.astype(bool) & ~buf_failed        # (T, N)
+            if _term_ok.any():
+                _real = buf_reward_vec[_term_ok].astype(np.float64)  # (M, K)
+                _b = self._sent_ema_beta
+                _bm = _real.mean(axis=0)
+                _bs = (_real * _real).mean(axis=0)
+                if self._sent_ema_n == 0:
+                    self._sent_ema_mean = _bm
+                    self._sent_ema_sq = _bs
+                else:
+                    self._sent_ema_mean = (
+                        (1.0 - _b) * self._sent_ema_mean + _b * _bm
+                    )
+                    self._sent_ema_sq = (
+                        (1.0 - _b) * self._sent_ema_sq + _b * _bs
+                    )
+                self._sent_ema_n += 1
         if buf_failed.any():
-            buf_reward_vec = np.where(
-                buf_failed[..., None], 0.0, buf_reward_vec,
-            )
+            _use_dyn = self.dynamic_sentinel and self._sent_ema_n > 0
+            if _use_dyn:
+                _mu = self._sent_ema_mean
+                _sig = np.sqrt(
+                    np.maximum(self._sent_ema_sq - _mu * _mu, 1e-12)
+                )
+                _dyn_vec = (_mu - self.sentinel_k * _sig).astype(np.float32)  # (K,)
+                buf_reward_vec = np.where(
+                    buf_failed[..., None],
+                    _dyn_vec[None, None, :],
+                    buf_reward_vec,
+                ).astype(np.float32)
+                # ``_dyn_vec`` is in RAW reward space (cost channels ~ -1e6).
+                # The reward the GAE eventually consumes runs the SAME
+                # symlog(lambda_inner*cost) + cap pass over these rows as
+                # over real measurements (below), so report the logged scalar
+                # in that post-transform space — otherwise the raw cost EMA
+                # dominates and the metric reads ~-1e5 instead of the ~mildly
+                # -ve scalar the policy actually sees.
+                _dv_scalarised = _dyn_vec.astype(np.float64).copy()
+                if self._additive_symlog_cost:
+                    _mm = _COST_SYMLOG_MASK_NP
+                    _sc = _dv_scalarised * self._inner_lambda_np
+                    _slv = np.sign(_sc) * np.log1p(np.abs(_sc))
+                    if self._cost_symlog_cap > 0.0:
+                        _slv = np.clip(
+                            _slv, -self._cost_symlog_cap, self._cost_symlog_cap,
+                        )
+                    _dv_scalarised = np.where(_mm, _slv, _dv_scalarised)
+                # Cossim channel is guide-capped in the reward path too.
+                if (
+                    self.raw_cossim_thread
+                    and self._cossim_guide_cap is not None
+                ):
+                    _dv_scalarised[COSINE_SIM_IDX] = min(
+                        _dv_scalarised[COSINE_SIM_IDX],
+                        float(self._cossim_guide_cap),
+                    )
+                _dyn_scalar = float(
+                    np.dot(_dv_scalarised, self.reward_weights_np)
+                )
+            else:
+                # Legacy path (dynamic off, or EMA not warmed yet): zero the
+                # per-channel reward vector (the additive failed_penalty /
+                # failed_adv_stamp below then carry the repulsive signal).
+                buf_reward_vec = np.where(
+                    buf_failed[..., None], 0.0, buf_reward_vec,
+                )
             buf_dones = np.where(buf_failed, 1.0, buf_dones)
             n_sentinels = int(buf_failed.sum())
             print(
                 f"[ppo_ray] {n_sentinels}/{T*N} failed/sentinel transitions "
                 f"this episode (pool timeout / mem-gate / shape-storm); "
-                f"zeroing raw rewards, forcing dones"
+                + (
+                    f"dynamic sentinel mu-{self.sentinel_k}*sigma "
+                    f"(scalar={_dyn_scalar:+.4g}), forcing dones"
+                    if _use_dyn
+                    else "zeroing raw rewards, forcing dones"
+                )
                 + (
                     f", anti-degen penalty -{self.anti_degen_penalty} applied"
                     if (self.anti_degen and self.reward_mode == 'mult')
@@ -2640,6 +2789,9 @@ class PPORayWorker:
                 )
                 + "."
             )
+        # Stash for wandb (surfaced in last_aux below). NaN when no sentinel
+        # fired this rollout OR dynamic sentinel is off/unwarmed.
+        self._last_dyn_sentinel_scalar = _dyn_scalar
 
         # ADDITIVE_SYMLOG_COST: symlog-compress the cost channels so the raw
         # ~1e6 cost magnitudes don't dwarf the [0,1] quality channels in the
@@ -2726,6 +2878,23 @@ class PPORayWorker:
         # corrupt the measured-channel telemetry.
         buf_reward_vec_raw = np.array(buf_reward_vec, dtype=np.float32, copy=True)
 
+        # RAW COSSIM THREAD (bridge-cse): apply the cosine_sim GUIDE CAP HERE
+        # — into the GAE/reward buffer ONLY — so ``buf_reward_vec_raw`` above
+        # retains the full-range cosine_sim for honest ``reward/cosine_sim_raw``
+        # logging + the dynamic-sentinel EMA, while the reward the policy is
+        # optimised against still sees the bounded ``min(cossim, C)`` climb
+        # guide. (Previously the cap was baked in env._callback so the full
+        # range never reached the worker.) Failed rows already carry the
+        # dynamic-sentinel value in idx6, which is < C, so min() leaves them
+        # unchanged. Cosine_sim is a non-symlog quality channel, untouched by
+        # the cost transforms above.
+        if self.raw_cossim_thread and self._cossim_guide_cap is not None:
+            buf_reward_vec = np.array(buf_reward_vec, copy=True)
+            buf_reward_vec[..., COSINE_SIM_IDX] = np.minimum(
+                buf_reward_vec[..., COSINE_SIM_IDX],
+                np.float32(self._cossim_guide_cap),
+            )
+
         # (Removed) The second additive cost-symlog pass used to live here. It
         # double-symlog'd the canonical buffer's cost channels (the pass above
         # already symlog'd them into buf_reward_vec, captured into
@@ -2749,7 +2918,19 @@ class PPORayWorker:
         # flows back unchanged as the episode return. Included normally in
         # the advantage z-score + loss => failed rows get a negative
         # advantage (repulsive gradient), never a zero-gradient no-op.
-        if self.reward_mode == 'additive' and buf_failed.any():
+        #
+        # DYNAMIC SENTINEL supersede (bridge-cse): when the dynamic sentinel
+        # actually stamped failed rows this rollout (``_dyn_scalar`` finite),
+        # those rows already carry the bounded ``mu-K*sigma`` reward vector —
+        # overwriting idx with the flat failed_penalty would DISCARD the
+        # distribution-aware signal. Skip the stamp then. (It still runs on
+        # the first, un-warmed rollout where failed rows were zeroed.)
+        _dyn_applied = self.dynamic_sentinel and np.isfinite(_dyn_scalar)
+        if (
+            self.reward_mode == 'additive'
+            and buf_failed.any()
+            and not _dyn_applied
+        ):
             _w = self.reward_weights_np.astype(np.float32)
             _cand = _w.copy()
             _cand[~_NO_SYMLOG_MASK_FP] = 0.0  # keep only non-symlog cols
@@ -3123,10 +3304,19 @@ class PPORayWorker:
             # basin. Overwrite failed rows' advantage POST-normalisation
             # with a fixed on-scale negative so failed actions are always
             # pushed down -- including when the whole rollout failed.
+            # DYNAMIC SENTINEL supersede (bridge-cse): skip the flat
+            # post-z-score failed-row advantage override when the dynamic
+            # sentinel carried the signal at the REWARD level this rollout —
+            # the mu-K*sigma reward already produces a proportionate negative
+            # advantage through GAE, and stamping a constant here would
+            # flatten that distribution-aware gradient. Falls through on the
+            # first, un-warmed rollout (failed rows zeroed) so the all-fail
+            # basin is still handled.
             if (
                 self.reward_mode == "additive"
                 and self.failed_adv_stamp > 0.0
                 and buf_failed.any()
+                and not (self.dynamic_sentinel and np.isfinite(_dyn_scalar))
             ):
                 advantages_b = jnp.where(
                     jnp.asarray(buf_failed.T),            # (N, T)
@@ -3476,6 +3666,41 @@ class PPORayWorker:
             _decomp_cost = 0.0
         last_aux["decomp/quality_term"] = _decomp_quality
         last_aux["decomp/cost_term"] = _decomp_cost
+
+        # RAW full-range cosine_sim + bkstep logging (bridge-cse). Over VALID
+        # terminal rows ONLY (failed/sentinel rows carry the mu-K*sigma
+        # substitute or a zero, neither of which is a measured cossim). Since
+        # the env now emits the UNCAPPED cossim in idx6 and the guide cap is
+        # deferred into the GAE buffer, ``buf_reward_vec_raw[..., 6]`` is the
+        # honest full-range [-1, 1] value (NOT clamped to [.., C]). bkstep_acc
+        # (idx9) is already raw accuracy in [0, 1] — logged from the same raw
+        # buffer so it is the real measured value, never the sentinel 0.
+        if _valid_term.any():
+            _rawcos = buf_reward_vec_raw[_valid_term][:, COSINE_SIM_IDX]
+            _rawbk = buf_reward_vec_raw[_valid_term][:, _bkstep_idx]
+            last_aux["reward/cosine_sim_raw"] = float(np.mean(_rawcos))
+            last_aux["reward/cosine_sim_raw_max"] = float(np.max(_rawcos))
+            last_aux["reward/cosine_sim_raw_min"] = float(np.min(_rawcos))
+            last_aux["reward/bkstep_acc_raw"] = float(np.mean(_rawbk))
+        else:
+            last_aux["reward/cosine_sim_raw"] = float("nan")
+            last_aux["reward/cosine_sim_raw_max"] = float("nan")
+            last_aux["reward/cosine_sim_raw_min"] = float("nan")
+            last_aux["reward/bkstep_acc_raw"] = float("nan")
+        # Dynamic-sentinel diagnostics: the collapsed mu-K*sigma scalar a
+        # sentinel row now yields this rollout (NaN if none fired / dynamic
+        # off / EMA un-warmed), plus the per-channel EMA mu the substitution
+        # is built from.
+        last_aux["sentinel/dynamic_value_scalar"] = float(
+            getattr(self, "_last_dyn_sentinel_scalar", float("nan"))
+        )
+        if self.dynamic_sentinel and self._sent_ema_n > 0:
+            last_aux["sentinel/ema_mu_cosine_sim"] = float(
+                self._sent_ema_mean[COSINE_SIM_IDX]
+            )
+            last_aux["sentinel/ema_mu_bkstep_acc"] = float(
+                self._sent_ema_mean[_bkstep_idx]
+            )
         # Fix 3: surface approx_kl + grad_norm each episode (mean + max over
         # the minibatches run).
         last_aux["ppo/approx_kl"] = (
