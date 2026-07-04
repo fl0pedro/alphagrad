@@ -177,6 +177,8 @@ export ALPHAGRAD_ADV_CLIP="${ALPHAGRAD_ADV_CLIP:-8.0}"
 # Floor those quality channels higher (0.2); cost channels keep base 0.1.
 export ALPHAGRAD_POPART_SIGMA_MIN="${ALPHAGRAD_POPART_SIGMA_MIN:-0.1}"
 export ALPHAGRAD_POPART_SIGMA_MIN_QUALITY="${ALPHAGRAD_POPART_SIGMA_MIN_QUALITY:-0.2}"
+# Fix 2: PPO KL early-stop (reject a catastrophic ep49-type update). 0 disables.
+export ALPHAGRAD_PPO_TARGET_KL="${ALPHAGRAD_PPO_TARGET_KL:-0.15}"
 NAME="full_nn256_v2${VARIANT:+_$VARIANT}$([ "$VALUE_NORM" = popart ] && echo _popart)_s${SEED}"
 
 echo "########## FULL_NN256_V2 $(date) | head=$NODE0 eps=$EPISODES NN_HIDDEN=256 variant=${VARIANT:-full} value_norm=$VALUE_NORM measure-grad ##########"

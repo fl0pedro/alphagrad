@@ -3245,6 +3245,13 @@ class PPORayWorker:
         _kl_running = []
         _gradnorm_running = []
         _mb_done = 0
+        # Fix 2: PPO KL early-stop. The update loop is a single pass over
+        # ``mb_count`` minibatches; treat it as the ppo epoch and stop
+        # taking further steps once the running-mean approx_kl crosses the
+        # target, so a catastrophic ep49-type update can't land in full.
+        # ALPHAGRAD_PPO_TARGET_KL=0 disables (revertible no-op).
+        _target_kl = float(os.environ.get("ALPHAGRAD_PPO_TARGET_KL", "0.15"))
+        _kl_stopped = False
 
         # Fix 3: linear entropy-coef anneal from init → final over the run.
         # Recomputed EVERY episode and passed as a runtime arg into the jit'd
@@ -3292,6 +3299,25 @@ class PPORayWorker:
                 _kl_running.append(float(_kl))
             last_aux = {k: float(v) for k, v in aux.items()}
             _mb_done += 1
+            # Fix 2: early-stop the remaining minibatches once the running
+            # mean approx_kl exceeds the target. The current minibatch's
+            # step has already been applied (standard PPO checks AFTER the
+            # step); we simply take no further steps this episode.
+            if (
+                _target_kl > 0.0
+                and _kl is not None
+                and np.isfinite(float(_kl))
+                and float(np.mean(_kl_running)) > _target_kl
+            ):
+                _kl_stopped = True
+                print(
+                    f"[ppo_ray][kl-stop] ep={self._episode_counter} "
+                    f"approx_kl(mean)={float(np.mean(_kl_running)):.4f} > "
+                    f"target {_target_kl} after mb {_mb_done}/{mb_count} "
+                    f"-- stopping remaining updates.",
+                    flush=True,
+                )
+                break
 
         self.agent = agent
         self.opt_state = opt_state
@@ -3467,6 +3493,7 @@ class PPORayWorker:
             if _gradnorm_running else float("nan")
         )
         last_aux["ppo/minibatches_run"] = int(_mb_done)
+        last_aux["ppo/kl_early_stopped"] = int(_kl_stopped)
 
         last_aux.update({
             "episode_return_mean": episode_return,
