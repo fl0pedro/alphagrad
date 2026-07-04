@@ -2216,7 +2216,8 @@ class PPORayWorker:
                 z = jnp.float32(0.0)
                 per_head = jnp.stack([ent_v, micro_ent_norm, z, z, z, z])
 
-                ratio = jnp.exp(new_log_prob - olp)
+                logratio = new_log_prob - olp
+                ratio = jnp.exp(logratio)
                 surr1 = ratio * adv
                 surr2 = jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps) * adv
                 policy_loss = -jnp.minimum(surr1, surr2)
@@ -2238,9 +2239,9 @@ class PPORayWorker:
                 else:
                     value_scalar = jnp.sum(value * priority_weights_j)
                     value_loss = (value_scalar - symlog(ret)) ** 2
-                return policy_loss, value_loss, entropy, per_head
+                return policy_loss, value_loss, entropy, per_head, logratio
 
-            p_l, v_l, ent, per_head_ent = jax.vmap(per_sample)(
+            p_l, v_l, ent, per_head_ent, logratio = jax.vmap(per_sample)(
                 tokens, eqn_ids, avail,
                 actions, op_a, i_a, j_a, exp_a, f_a, kind_a, q_a,
                 axis_state_a, axis_valid_a,
@@ -2254,9 +2255,14 @@ class PPORayWorker:
             entropy_loss = -jnp.mean(ent)
             total = ppo_loss + value_coef * value_loss + entropy_coef * entropy_loss
             head_means = jnp.mean(per_head_ent, axis=0)  # (6,)
+            # Fix 3: approx_kl for logging + Fix 2 KL early-stop. Schulman
+            # low-variance non-negative estimator mean((r-1) - logratio).
+            _ratio_kl = jnp.exp(logratio)
+            approx_kl = jnp.mean((_ratio_kl - 1.0) - logratio)
             aux = {
                 "ppo_loss": ppo_loss,
                 "value_loss": value_loss,
+                "approx_kl": approx_kl,
                 "entropy": jnp.mean(ent),
                 "entropy_coef": entropy_coef,
                 "entropy/vertex": head_means[0],
@@ -2275,6 +2281,16 @@ class PPORayWorker:
                 agent, batch, op_mask, factor_mask, quant_mask, key,
                 entropy_coef,
             )
+            # Fix 3: global grad norm BEFORE the optax clip/update — the
+            # raw signal a catastrophic update is landing (previously
+            # invisible in wandb).
+            _gsq = jax.tree_util.tree_reduce(
+                lambda acc, g: acc + jnp.sum(jnp.square(g)),
+                eqx.filter(grads, eqx.is_inexact_array),
+                jnp.float32(0.0),
+            )
+            aux = dict(aux)
+            aux["grad_norm"] = jnp.sqrt(_gsq)
             # NaN-skip guard — identical to the legacy update step.
             loss_finite = jnp.isfinite(loss)
             zero_grads = jax.tree.map(jnp.zeros_like, grads)
@@ -3223,6 +3239,12 @@ class PPORayWorker:
         opt_state = self.opt_state
         last_aux = {}
         nan_skip_total = 0
+        # Fix 3: per-episode approx_kl + grad_norm telemetry (previously
+        # this collapse class was invisible in wandb). Accumulate over the
+        # minibatches actually run.
+        _kl_running = []
+        _gradnorm_running = []
+        _mb_done = 0
 
         # Fix 3: linear entropy-coef anneal from init → final over the run.
         # Recomputed EVERY episode and passed as a runtime arg into the jit'd
@@ -3262,7 +3284,14 @@ class PPORayWorker:
                 _ent_coef_j,
             )
             nan_skip_total += int(aux.pop("nan_skip", 0))
+            _gn = aux.pop("grad_norm", None)
+            _kl = aux.pop("approx_kl", None)
+            if _gn is not None and np.isfinite(float(_gn)):
+                _gradnorm_running.append(float(_gn))
+            if _kl is not None and np.isfinite(float(_kl)):
+                _kl_running.append(float(_kl))
             last_aux = {k: float(v) for k, v in aux.items()}
+            _mb_done += 1
 
         self.agent = agent
         self.opt_state = opt_state
@@ -3421,6 +3450,23 @@ class PPORayWorker:
             _decomp_cost = 0.0
         last_aux["decomp/quality_term"] = _decomp_quality
         last_aux["decomp/cost_term"] = _decomp_cost
+        # Fix 3: surface approx_kl + grad_norm each episode (mean + max over
+        # the minibatches run).
+        last_aux["ppo/approx_kl"] = (
+            float(np.mean(_kl_running)) if _kl_running else float("nan")
+        )
+        last_aux["ppo/approx_kl_max"] = (
+            float(np.max(_kl_running)) if _kl_running else float("nan")
+        )
+        last_aux["ppo/grad_norm"] = (
+            float(np.mean(_gradnorm_running))
+            if _gradnorm_running else float("nan")
+        )
+        last_aux["ppo/grad_norm_max"] = (
+            float(np.max(_gradnorm_running))
+            if _gradnorm_running else float("nan")
+        )
+        last_aux["ppo/minibatches_run"] = int(_mb_done)
 
         last_aux.update({
             "episode_return_mean": episode_return,
