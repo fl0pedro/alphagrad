@@ -163,7 +163,13 @@ eval "$ULIM"
 
 NODE0=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n 1p)
 HEAD_IP=$(srun --nodes=1 --nodelist=$NODE0 hostname -i | awk '{print $1}')
-echo "########## FULL_NN256_V2 $(date) | head=$NODE0 eps=$EPISODES NN_HIDDEN=256 variant=full measure-grad ##########"
+# PopArt value normalisation (--value-norm popart): flag-gated, default
+# baseline = byte-identical legacy path (symlog value loss + rollout
+# advantage z-score). Set VALUE_NORM=popart (or ALPHAGRAD_POPART=1).
+VALUE_NORM="${VALUE_NORM:-baseline}"
+NAME="full_nn256_v2${VARIANT:+_$VARIANT}$([ "$VALUE_NORM" = popart ] && echo _popart)_s${SEED}"
+
+echo "########## FULL_NN256_V2 $(date) | head=$NODE0 eps=$EPISODES NN_HIDDEN=256 variant=${VARIANT:-full} value_norm=$VALUE_NORM measure-grad ##########"
 
 ( cd ~/dsnn && uv run --no-sync ray start --head --node-ip-address=$HEAD_IP \
     --port=$RAY_PORT --num-gpus=4 --num-cpus=64 --block ) &
@@ -175,7 +181,7 @@ OUT=$CAMP/nn256
 LOG=$CAMP/logs/nn256.log
 rm -rf "$OUT"; mkdir -p "$OUT" "$CAMP/logs"
 
-uv run --no-sync $PPO --name full_nn256_v2_s${SEED} --variant full --seed $SEED \
+uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --example VmappedNeuralNetwork --dataset mnist \
   --rewards cmp mem acc --cmp-type latency --mem-type peak_memory \
   --measure-grad --exec-on-gpu --measure-latency --latency-inner-reps 50 \
@@ -188,7 +194,7 @@ uv run --no-sync $PPO --name full_nn256_v2_s${SEED} --variant full --seed $SEED 
   --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \
   --cpu-worker-recycle-every 0 \
   --ray-address $HEAD_IP:$RAY_PORT \
-  --advantage-norm scalar --ppo-epochs 4 --anti-degeneracy none \
+  --advantage-norm scalar --value-norm $VALUE_NORM --ppo-epochs 4 --anti-degeneracy none \
   --cosine-lower-bound 0.0 --cosine-upper-bound 1.0 \
   --episodes $EPISODES --num-envs $NUM_ENVS --minibatches $MBS \
   --num-data-points 5 --reps-per-point 2 \

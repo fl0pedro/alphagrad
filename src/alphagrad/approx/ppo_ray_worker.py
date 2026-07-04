@@ -1069,6 +1069,59 @@ class PPORayWorker:
         )
         self._gae_no_symlog = _make_get_advantages(use_symlog=False)
 
+        # PopArt value-target normalisation (--value-norm popart /
+        # ALPHAGRAD_POPART=1; van Hasselt 2016, multi-channel as in
+        # IMPALA). REPLACES the scalar path's rollout-wide advantage
+        # z-score — the suspected collapse driver: batch z-scoring
+        # AMPLIFIES noise as returns homogenise at convergence (divide
+        # by a shrinking batch std), washes an all-fail batch to ~0,
+        # and can sign-flip good samples around the batch mean. With
+        # PopArt the critic learns per-channel NORMALISED values
+        # v_hat = (v - mu_k)/sigma_k against quasi-static EMA stats of
+        # the GAE returns (beta ~1e-2/update, sigma FLOORED at 0.1 so
+        # it can never amplify); the value head's final linear layer is
+        # rescaled output-preservingly on every stats step (the "Art");
+        # advantages are formed per-channel in normalised space
+        # (A_k/sigma_k == (G_k - mu_k)/sigma_k - v_hat_k) and collapsed
+        # via reward_weights — O(1) WITHOUT batch coupling. Default
+        # 'baseline' keeps every existing path byte-identical.
+        _vn = str(getattr(self.args, "value_norm", "baseline"))
+        if os.environ.get("ALPHAGRAD_POPART", "0") == "1":
+            _vn = "popart"
+        if _vn not in ("baseline", "popart"):
+            raise ValueError(
+                f"--value-norm must be 'baseline' or 'popart', got {_vn!r}",
+            )
+        self.use_popart = _vn == "popart"
+        self.popart = None
+        if self.use_popart:
+            if self.advantage_norm != "scalar":
+                raise ValueError(
+                    "--value-norm popart requires --advantage-norm scalar "
+                    "(the gdpo path carries its own per-minibatch "
+                    "normalisation).",
+                )
+            # The critic now predicts PopArt-normalised values — the
+            # legacy symlog encoding inside GAE no longer applies; raw
+            # values are recovered affinely (v = sigma*v_hat + mu)
+            # before the GAE deltas.
+            self._use_symlog_in_gae = False
+            from alphagrad.approx.common.popart import PopArtStats
+            self.popart = PopArtStats(
+                NUM_REWARDS,
+                beta=float(os.environ.get("ALPHAGRAD_POPART_BETA", "0.01")),
+                sigma_min=float(
+                    os.environ.get("ALPHAGRAD_POPART_SIGMA_MIN", "0.1")
+                ),
+            )
+            print(
+                f"[ppo_ray] PopArt value norm ON: beta={self.popart.beta} "
+                f"sigma_min={self.popart.sigma_min} — replaces the rollout "
+                f"advantage z-score; failed rows get a plain constant -1.0 "
+                f"advantage (no normaliser interaction).",
+                flush=True,
+            )
+
         # Phase D — conditioned-reward gates. The user-supplied
         # ``--reward-condition`` specs are parsed once at init; the
         # rollout loop walks the list and zeroes the easier reward at
@@ -1842,6 +1895,7 @@ class PPORayWorker:
         # Mode-aware capture so the closure switches on the right path
         # without recompiling per call.
         is_gdpo = self.advantage_norm == "gdpo"
+        is_popart = self.use_popart
         channel_mask_j = self._channel_mask_j        # (NUM_REWARDS,)
         sparse_mask_j = self._sparse_mask_j          # (NUM_REWARDS,)
         priority_weights_j = self.reward_weights     # (NUM_REWARDS,)
@@ -1973,6 +2027,15 @@ class PPORayWorker:
                     value_loss = jnp.sum(
                         per_channel_se / (normaliser ** 2) * channel_mask_j
                     ) / active_count
+                elif is_popart:
+                    # PopArt: ``ret`` is the (K,) PER-CHANNEL NORMALISED
+                    # target (G_k - mu_k)/sigma_k staged upstream; ``value``
+                    # is the critic's normalised prediction v_hat. Plain
+                    # MSE over the active channels.
+                    per_channel_se = (value - ret) ** 2           # (K,)
+                    value_loss = jnp.sum(
+                        per_channel_se * channel_mask_j
+                    ) / active_count
                 else:
                     value_scalar = jnp.sum(value * priority_weights_j)
                     value_loss = (value_scalar - symlog(ret)) ** 2
@@ -2071,6 +2134,7 @@ class PPORayWorker:
         clip_eps = self.ppo_eps
         value_coef = self.value_coef
         is_gdpo = self.advantage_norm == "gdpo"
+        is_popart = self.use_popart
         channel_mask_j = self._channel_mask_j        # (NUM_REWARDS,)
         sparse_mask_j = self._sparse_mask_j          # (NUM_REWARDS,)
         priority_weights_j = self.reward_weights     # (NUM_REWARDS,)
@@ -2144,6 +2208,15 @@ class PPORayWorker:
                     normaliser = jnp.maximum(jnp.abs(ret), 1.0)   # (K,)
                     value_loss = jnp.sum(
                         per_channel_se / (normaliser ** 2) * channel_mask_j
+                    ) / active_count
+                elif is_popart:
+                    # PopArt: ``ret`` is the (K,) PER-CHANNEL NORMALISED
+                    # target (G_k - mu_k)/sigma_k staged upstream; ``value``
+                    # is the critic's normalised prediction v_hat. Plain
+                    # MSE over the active channels.
+                    per_channel_se = (value - ret) ** 2           # (K,)
+                    value_loss = jnp.sum(
+                        per_channel_se * channel_mask_j
                     ) / active_count
                 else:
                     value_scalar = jnp.sum(value * priority_weights_j)
@@ -2681,6 +2754,7 @@ class PPORayWorker:
         # is applied inside GAE (scalar mode keeps it; gdpo mode drops
         # it because the per-mb z-score handles magnitude). The
         # factory caches the jit'd variant per mode.
+        _popart_log: dict = {}
         if self._use_symlog_in_gae:
             _gae = get_advantages  # legacy with symlog
         else:
@@ -2689,6 +2763,17 @@ class PPORayWorker:
         rewards_b = jnp.asarray(np.transpose(buf_reward_vec, (1, 0, 2)))
         dones_b = jnp.asarray(buf_dones.T)             # (N, T)
         values_b = jnp.asarray(np.transpose(buf_values, (1, 0, 2)))  # (N, T, K)
+        if self.use_popart:
+            # The critic emits PopArt-NORMALISED values v_hat; GAE needs
+            # raw values. De-normalise affinely with the CURRENT
+            # (pre-update) stats — the frame the rollout head was
+            # trained in.
+            _pa_mu = jnp.asarray(self.popart.mu, dtype=jnp.float32)
+            _pa_sig = jnp.asarray(self.popart.sigma, dtype=jnp.float32)
+            values_b = _pa_mu + _pa_sig * values_b
+            bootstrap = (
+                self.popart.mu + self.popart.sigma * np.asarray(bootstrap)
+            ).astype(np.float32)
         next_values_b = jnp.concatenate(
             [values_b[:, 1:, :], jnp.asarray(bootstrap)[:, None, :]], axis=1,
         )  # (N, T, K)
@@ -2702,7 +2787,99 @@ class PPORayWorker:
         # to scalar via the priority-weighted dot product so the
         # downstream legacy path (global z-score, scalar value loss)
         # receives (N, T) tensors.
-        if self.advantage_norm == "scalar":
+        if self.advantage_norm == "scalar" and self.use_popart:
+            # ---- PopArt (van Hasselt 2016; multi-channel as in IMPALA).
+            # DESIGN CHOICE: per-channel PopArt on the K return channels,
+            # collapsed to the scalar advantage via reward_weights — NOT
+            # scalar-space PopArt on the weighted return. The existing
+            # scalar collapse is per-channel GAE followed by a weighted
+            # dot product and the value head is already K-wide, so
+            # per-channel stats slot into that contract without touching
+            # the head shape, and the lambda weights keep expressing pure
+            # PRIORITY over O(1)-normalised channels.
+            weights_j = self.reward_weights
+            returns_raw_b = returns_b                      # (N, T, K) raw
+            adv_raw_np = np.asarray(advantages_b, dtype=np.float64)
+            ret_raw_np = np.asarray(returns_raw_b, dtype=np.float64)
+            # (1) EMA stats over the VALUE TARGETS (per-channel returns).
+            # Envs with ANY failed/sentinel transition are excluded so the
+            # failed-row machinery never interacts with the normaliser
+            # (their returns carry the stamped penalty, not a measured
+            # value). All-fail rollout => stats simply hold (quasi-static
+            # anyway), advantages get the constant stamp below.
+            _env_ok = ~buf_failed.any(axis=0)              # (N,)
+            _upd_rows = ret_raw_np[_env_ok].reshape(-1, NUM_REWARDS)
+            if _upd_rows.shape[0] > 0 and np.isfinite(_upd_rows).all():
+                _o_mu, _o_sig, _n_mu, _n_sig = self.popart.update(_upd_rows)
+                # (2) The "Art": output-preserving rescale of the value
+                # head's final linear layer under mu->mu', sigma->sigma'
+                # — the raw predictions are numerically unchanged, so the
+                # stats step is invisible to the critic's gradients. (The
+                # Adam moments of that layer keep their old scale — the
+                # standard PopArt simplification; beta is quasi-static so
+                # per-step rescales are ~1.)
+                from alphagrad.approx.common.popart import (
+                    popart_rescale_mlp_head,
+                )
+                self.agent = eqx.tree_at(
+                    lambda a: a.value_head,
+                    self.agent,
+                    popart_rescale_mlp_head(
+                        self.agent.value_head, _o_mu, _o_sig, _n_mu, _n_sig,
+                    ),
+                )
+            _pa_mu = jnp.asarray(self.popart.mu, dtype=jnp.float32)
+            _pa_sig = jnp.asarray(self.popart.sigma, dtype=jnp.float32)
+            # (3) NORMALISED value targets for the critic loss (per
+            # channel, staged as (B, K) below)…
+            returns_b = (returns_raw_b - _pa_mu) / _pa_sig  # (N, T, K)
+            # …and NORMALISED per-channel advantages. GAE constructs
+            # estim_return = advantage + value_raw identically, so
+            # A_k/sigma_k == (G_k - mu_k)/sigma_k - v_hat_k exactly.
+            # sigma >= sigma_min => this can NEVER amplify noise.
+            advantages_b = jnp.sum(
+                (advantages_b / _pa_sig) * weights_j, axis=-1,
+            )  # (N, T) scalar advantage
+            # Telemetry: per-channel mu/sigma + explained variance over
+            # the non-failed rows. GAE constructs estim_return =
+            # advantage + value_raw identically, so A_k/sigma_k is the
+            # normalised residual. The HEADLINE metric is the POOLED EV
+            # (all active channels concatenated in normalised space,
+            # standard multi-task form): a channel whose per-episode
+            # returns went homogeneous (Var(G)~0 — exactly the
+            # convergence regime this fix targets) contributes ~nothing
+            # to either variance instead of blowing the mean up with a
+            # -1e2 spike, as the per-channel 1 - Var(A_k)/Var(G_k)
+            # otherwise does. Per-channel EVs stay logged as auxiliaries
+            # (variance-floored in normalised space).
+            _row_ok = ~buf_failed.T                        # (N, T)
+            _act_idx = np.where(self.reward_weights_np != 0.0)[0]
+            _mu64 = self.popart.mu.astype(np.float64)
+            _sig64 = self.popart.sigma.astype(np.float64)
+            _t_pool, _r_pool = [], []
+            for _k in range(NUM_REWARDS):
+                _name = REWARD_NAMES[_k]
+                _popart_log[f"popart/mu_{_name}"] = float(self.popart.mu[_k])
+                _popart_log[f"popart/sigma_{_name}"] = float(
+                    self.popart.sigma[_k]
+                )
+                if _k in _act_idx and _row_ok.any():
+                    _tn = (
+                        ret_raw_np[_row_ok][:, _k] - _mu64[_k]
+                    ) / _sig64[_k]
+                    _rn = adv_raw_np[_row_ok][:, _k] / _sig64[_k]
+                    _t_pool.append(_tn)
+                    _r_pool.append(_rn)
+                    _popart_log[f"popart/ev_{_name}"] = float(
+                        1.0 - np.var(_rn) / max(np.var(_tn), 1e-6)
+                    )
+            if _t_pool:
+                _tp = np.concatenate(_t_pool)
+                _rp = np.concatenate(_r_pool)
+                _popart_log["explained_variance"] = float(
+                    1.0 - np.var(_rp) / max(np.var(_tp), 1e-8)
+                )
+        elif self.advantage_norm == "scalar":
             weights_j = self.reward_weights
             returns_b = jnp.sum(returns_b * weights_j, axis=-1)      # (N, T)
             advantages_b = jnp.sum(advantages_b * weights_j, axis=-1)  # (N, T)
@@ -2829,7 +3006,38 @@ class PPORayWorker:
         # entirely — per-channel z-scoring runs per-minibatch in the
         # update step (see gdpo_normalise_advantages) so the global pass
         # would double-normalise and wash out cross-minibatch signal.
-        if self.advantage_norm == "scalar":
+        if self.advantage_norm == "scalar" and self.use_popart:
+            # PopArt REPLACES the rollout-wide z-score entirely: the
+            # advantages are already O(1) in normalised space with NO
+            # batch coupling — an all-fail batch cannot be washed to 0,
+            # and a homogeneous-good batch cannot have its residual noise
+            # inflated to +-1 (sigma is a slow EMA with a hard floor, not
+            # a per-batch std). Failed rows keep the V2 stamp, now as a
+            # PLAIN CONSTANT -1.0 advantage — repulsive, on-scale, zero
+            # normaliser interaction.
+            if self.reward_mode == "additive" and buf_failed.any():
+                advantages_b = jnp.where(
+                    jnp.asarray(buf_failed.T),            # (N, T)
+                    jnp.float32(-1.0),
+                    advantages_b,
+                )
+            _af = np.asarray(advantages_b, dtype=np.float64).reshape(-1)
+            _popart_log["popart/adv_mean"] = float(_af.mean())
+            _popart_log["popart/adv_std"] = float(_af.std())
+            _popart_log["popart/adv_absmax"] = float(np.abs(_af).max())
+            print(
+                f"[ppo_ray][popart] ep={self._episode_counter} "
+                f"ev={_popart_log.get('explained_variance', float('nan')):+.3f} "
+                f"adv(mean/std/absmax)="
+                f"{_af.mean():+.3f}/{_af.std():.3f}/{np.abs(_af).max():.3f} "
+                + " ".join(
+                    f"{REWARD_NAMES[k]}: mu={self.popart.mu[k]:+.3g} "
+                    f"sig={self.popart.sigma[k]:.3g}"
+                    for k in np.where(self.reward_weights_np != 0.0)[0]
+                ),
+                flush=True,
+            )
+        elif self.advantage_norm == "scalar":
             # Fix 1 (v2): z-score over ALL transitions (failed rows
             # INCLUDED). Failed rows now carry the bounded-negative
             # penalty (not a spurious 0), so including them in the
@@ -2914,6 +3122,14 @@ class PPORayWorker:
             parts["advantages"] = (
                 advantages_b.reshape(N * T, NUM_REWARDS), (NUM_REWARDS,),
             )
+        elif self.use_popart:
+            # PopArt: PER-CHANNEL normalised value targets (B, K) for the
+            # per-channel critic MSE; the advantage is already the scalar
+            # weighted sum of normalised channels.
+            parts["returns"] = (
+                returns_b.reshape(N * T, NUM_REWARDS), (NUM_REWARDS,),
+            )
+            parts["advantages"] = (advantages_b.reshape(N * T), ())
         else:
             parts["returns"] = (returns_b.reshape(N * T), ())
             parts["advantages"] = (advantages_b.reshape(N * T), ())
@@ -3172,6 +3388,10 @@ class PPORayWorker:
             # Fix 3 telemetry: the LIVE annealed entropy coefficient.
             "entropy_coef": float(self.entropy_coef),
         })
+        # PopArt telemetry (per-channel mu/sigma, explained_variance —
+        # the critic-health metric — and the advantage-scale probes).
+        # Empty dict when --value-norm baseline.
+        last_aux.update(_popart_log)
         # Per-channel raw-reward means — same key namespace MuZero
         # uses. Already part of `per_reward_means` in `ch_stats` but
         # re-emit as flat `reward_mean/...` keys for the driver's

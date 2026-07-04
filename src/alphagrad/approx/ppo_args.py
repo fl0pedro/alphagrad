@@ -442,6 +442,25 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--ppo-eps", type=float, default=0.2)
     p.add_argument("--value-coef", type=float, default=0.5)
     p.add_argument(
+        "--value-norm",
+        type=str,
+        default="baseline",
+        choices=["baseline", "popart"],
+        help="Critic-target normalisation on the Ray PPO path. "
+             "'baseline' (default): current behaviour — scalar mode uses "
+             "the symlog value loss + rollout-wide advantage z-score. "
+             "'popart' (van Hasselt 2016, multi-channel as in IMPALA): "
+             "the K-channel critic learns normalised values against "
+             "quasi-static per-channel EMA stats of the GAE returns "
+             "(sigma floored at 0.1), the final value layer is rescaled "
+             "output-preservingly on every stats update, and advantages "
+             "are formed per-channel in normalised space then "
+             "priority-weight-summed — REPLACES the rollout z-score. "
+             "Requires --advantage-norm scalar. Env override: "
+             "ALPHAGRAD_POPART=1 (knobs: ALPHAGRAD_POPART_BETA, "
+             "ALPHAGRAD_POPART_SIGMA_MIN).",
+    )
+    p.add_argument(
         "--value-norm-decay",
         type=float,
         default=0.99,
