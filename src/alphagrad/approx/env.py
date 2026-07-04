@@ -2709,6 +2709,27 @@ def _callback(
     else:
         cosine_sim = 0.0
         frob_residual = 0.0
+    # Phase-2 memory-mitigation probe #7: explicitly delete the measure I/O
+    # arrays once the quality metrics have consumed them. ``.delete()`` drops
+    # each buffer's device allocation immediately instead of waiting for Python
+    # GC + the next XLA sweep, so per-measure input/output buffers don't
+    # accumulate on the measure GPU. Flag ALPHAGRAD_MEASURE_DELETE_BUFFERS=1;
+    # default OFF. NOTE: frees BUFFERS only (not the compiled executables), so a
+    # partial ceiling effect is expected. block_until_ready first so we never
+    # delete a buffer with async work still outstanding.
+    if os.environ.get("ALPHAGRAD_MEASURE_DELETE_BUFFERS", "0") == "1":
+        try:
+            for _buf_list in (out_approxs, out_exacts):
+                for _o in _buf_list:
+                    for _leaf in jax.tree_util.tree_leaves(_o):
+                        if hasattr(_leaf, "is_deleted") and not _leaf.is_deleted():
+                            jax.block_until_ready(_leaf)
+                            _leaf.delete()
+            out_approxs.clear()
+            out_exacts.clear()
+        except Exception as _del_e:  # pragma: no cover - defensive
+            if _dbg_t:
+                print(f"[DBG-env] delete-buffers skipped: {type(_del_e).__name__}: {_del_e}", flush=True)
     if _dbg_t and is_terminal:
         print(f"[DBG-env] quality={_time.time()-_t0:.1f}s", flush=True)
 
