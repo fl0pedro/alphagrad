@@ -33,6 +33,7 @@ the user-facing knobs.
 from __future__ import annotations
 
 import collections
+import os
 import threading
 import time
 from typing import Any, Callable, Sequence
@@ -438,6 +439,72 @@ class CpuApproxPool:
     # using ``evaluate`` directly.
     # ------------------------------------------------------------------
     def evaluate_batch(
+        self,
+        order_batch: Sequence[Any],
+        specs_batch: Sequence[Any],
+        step_batch: Sequence[int],
+        *,
+        eval_samples: Any = None,
+        init: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Phase-2 memory-mitigation probe #8: optional batch dedup.
+
+        When ``ALPHAGRAD_MEASURE_DEDUP_BATCH=1`` and the batch contains
+        duplicate ``(order, specs, step)`` requests, each UNIQUE config is
+        measured once and its result is broadcast to the duplicate slots — so
+        identical configs never compile/execute (or accumulate a distinct
+        executable) twice in one step. Default OFF delegates straight to the
+        full-fan-out impl (byte-identical legacy path). Payoff is small unless
+        the policy emits repeated identical specs within a rollout batch.
+        """
+        if os.environ.get("ALPHAGRAD_MEASURE_DEDUP_BATCH", "0") != "1":
+            return self._evaluate_batch_impl(
+                order_batch, specs_batch, step_batch,
+                eval_samples=eval_samples, init=init,
+            )
+        N = len(order_batch)
+        # Build canonical key per slot; first-seen slot is the representative.
+        rep_of: dict = {}
+        uniq_idx: list = []
+        slot_to_rep: list = [0] * N
+        for i in range(N):
+            key = (
+                np.asarray(order_batch[i], dtype=np.int32).tobytes(),
+                np.asarray(specs_batch[i], dtype=np.int32).tobytes(),
+                int(step_batch[i]),
+            )
+            if key in rep_of:
+                slot_to_rep[i] = rep_of[key]
+            else:
+                rep_of[key] = i
+                slot_to_rep[i] = i
+                uniq_idx.append(i)
+        if len(uniq_idx) == N:
+            # No duplicates — nothing to save; run the plain impl.
+            return self._evaluate_batch_impl(
+                order_batch, specs_batch, step_batch,
+                eval_samples=eval_samples, init=init,
+            )
+        t_u, e_u, r_u, s_u = self._evaluate_batch_impl(
+            [order_batch[i] for i in uniq_idx],
+            [specs_batch[i] for i in uniq_idx],
+            [step_batch[i] for i in uniq_idx],
+            eval_samples=eval_samples, init=init,
+        )
+        pos = {orig: k for k, orig in enumerate(uniq_idx)}
+        tokens_out = np.zeros((N, self._max_tokens), dtype=np.int32)
+        eqn_ids_out = np.zeros((N, self._max_tokens), dtype=np.int32)
+        rewards_out = np.zeros((N, self._num_rewards), dtype=np.float32)
+        sentinel_mask = np.zeros((N,), dtype=bool)
+        for i in range(N):
+            k = pos[slot_to_rep[i]]
+            tokens_out[i] = t_u[k]
+            eqn_ids_out[i] = e_u[k]
+            rewards_out[i] = r_u[k]
+            sentinel_mask[i] = s_u[k]
+        return tokens_out, eqn_ids_out, rewards_out, sentinel_mask
+
+    def _evaluate_batch_impl(
         self,
         order_batch: Sequence[Any],
         specs_batch: Sequence[Any],
