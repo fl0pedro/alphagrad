@@ -1002,6 +1002,9 @@ def build_wandb_log_dict(stats: dict, state: dict, ep: int) -> dict:
             k.startswith("lagrangian/")
             or k.startswith("reward_mean/")
             or k.startswith("reward_dist/")
+            # bridge-cse: full-range raw cosine_sim / bkstep telemetry
+            # (reward/cosine_sim_raw{,_max,_min}, reward/bkstep_acc_raw).
+            or k.startswith("reward/")
             or k.startswith("bkstep/")
             or k.startswith("decomp/")
             or k.startswith("sentinel/")
