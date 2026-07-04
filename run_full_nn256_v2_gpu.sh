@@ -68,7 +68,7 @@ export ALPHAGRAD_PREVALIDATE_MEASURE=1
 # always on an OOM sentinel) so XLA releases those executables; the on-disk
 # compile cache survives -> recurring configs reload cheap. Keeps measure-GPU
 # memory FLAT instead of monotonically growing.
-export ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY=64
+export ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY=${ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY:-64}
 
 # >>> Fix 2(a): QUANT dtype restriction (drop the TypePromotionError dtypes) <<<
 # graphax's mixed-precision shim (dtype_compute._NARROW_PROMOTION_REP) covers
