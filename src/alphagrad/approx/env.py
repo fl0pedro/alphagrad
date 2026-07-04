@@ -2728,9 +2728,16 @@ def _callback(
     # pull the untrained policy up toward the edge; above C the term is a
     # constant so B_kstep(fracred) resolves the compute/mem/fidelity tradeoff.
     # The raw (uncapped) cosine stays in raw_sink for honest logging.
+    # RAW full-range cossim threading (bridge-cse). When
+    # ALPHAGRAD_RAW_COSSIM_THREAD=1 the env emits the RAW (uncapped,
+    # full-range) cosine_sim in idx6 and the guide cap is deferred to the
+    # PPO worker (applied into the GAE buffer only), so the worker can log
+    # ``reward/cosine_sim_raw`` and feed the dynamic-sentinel EMA with the
+    # honest full-range value. When 0 (legacy) the cap is applied here.
+    _raw_thread = os.environ.get("ALPHAGRAD_RAW_COSSIM_THREAD", "1") == "1"
     _guide_cap_raw = os.environ.get("ALPHAGRAD_COSSIM_GUIDE_CAP", "").strip()
     cosine_channel = cosine_sim
-    if _guide_cap_raw:
+    if _guide_cap_raw and not _raw_thread:
         try:
             _C = float(_guide_cap_raw)
             cosine_channel = float(min(cosine_sim, _C))
