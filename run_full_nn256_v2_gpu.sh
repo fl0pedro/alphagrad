@@ -224,7 +224,7 @@ uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --actor-num-gpus 1 --cpu-actor-num-gpus 1 --num-cpu-workers 3 \
   --cpu-cores-per-actor 8 --cpu-cores-shared \
   --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \
-  --cpu-worker-recycle-every ${CPU_WORKER_RECYCLE_EVERY:-20} \
+  --cpu-worker-recycle-every ${CPU_WORKER_RECYCLE_EVERY:-12} \
   --ray-address $HEAD_IP:$RAY_PORT \
   --advantage-norm scalar --value-norm $VALUE_NORM --ppo-epochs 4 --anti-degeneracy none \
   --cosine-lower-bound 0.0 --cosine-upper-bound 1.0 \
