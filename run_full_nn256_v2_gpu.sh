@@ -68,7 +68,15 @@ export ALPHAGRAD_PREVALIDATE_MEASURE=1
 # always on an OOM sentinel) so XLA releases those executables; the on-disk
 # compile cache survives -> recurring configs reload cheap. Keeps measure-GPU
 # memory FLAT instead of monotonically growing.
-export ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY=${ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY:-64}
+# >>> C2 (Phase-2 sweep WINNER): in-proc LRU + on-disk compile cache + buffer-delete <<<
+# Chosen over the recycle-based C1 default. Method #4 (keep-frequent LRU, verified
+# .delete frees device mem) + method #7 (block+delete measure I/O buffers) + the
+# JIT on-disk compile cache (default on; ALPHAGRAD_DISABLE_JIT_DISK_CACHE unset).
+# The LRU replaces clear_caches AND per-actor recycle: set both OFF so they do not
+# ALSO fire (clear_caches=0, recycle=0). Flat ~8.8 GiB measure ceiling, 0 OOM.
+export ALPHAGRAD_MEASURE_INPROC_LRU=${ALPHAGRAD_MEASURE_INPROC_LRU:-128}
+export ALPHAGRAD_MEASURE_DELETE_BUFFERS=${ALPHAGRAD_MEASURE_DELETE_BUFFERS:-1}
+export ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY=${ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY:-0}
 
 # >>> Fix 2(a): QUANT dtype restriction (drop the TypePromotionError dtypes) <<<
 # graphax's mixed-precision shim (dtype_compute._NARROW_PROMOTION_REP) covers
@@ -224,7 +232,7 @@ uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --actor-num-gpus 1 --cpu-actor-num-gpus 1 --num-cpu-workers 3 \
   --cpu-cores-per-actor 8 --cpu-cores-shared \
   --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \
-  --cpu-worker-recycle-every ${CPU_WORKER_RECYCLE_EVERY:-12} \
+  --cpu-worker-recycle-every ${CPU_WORKER_RECYCLE_EVERY:-0} \
   --ray-address $HEAD_IP:$RAY_PORT \
   --advantage-norm scalar --value-norm $VALUE_NORM --ppo-epochs 4 --anti-degeneracy none \
   --cosine-lower-bound 0.0 --cosine-upper-bound 1.0 \
