@@ -216,7 +216,7 @@ rm -rf "$OUT"; mkdir -p "$OUT" "$CAMP/logs"
 uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --example VmappedNeuralNetwork --dataset mnist \
   --rewards cmp mem acc --cmp-type latency --mem-type peak_memory \
-  --measure-grad --exec-on-gpu --measure-latency --latency-inner-reps 50 \
+  --measure-grad ${EXEC_ON_GPU_FLAG:---exec-on-gpu} --measure-latency --latency-inner-reps 50 \
   --lambda-cmp $LAMBDA_CMP --lambda-mem $LAMBDA_MEM --lambda-acc $LAMBDA_ACC --lambda-frob 0.0 \
   --lambda-cossim-guide $LAMBDA_COSSIM_GUIDE \
   --entropy-coef $ENTROPY_COEF --entropy-coef-final $ENTROPY_COEF_FINAL \
@@ -224,7 +224,7 @@ uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --actor-num-gpus 1 --cpu-actor-num-gpus 1 --num-cpu-workers 3 \
   --cpu-cores-per-actor 8 --cpu-cores-shared \
   --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \
-  --cpu-worker-recycle-every 0 \
+  --cpu-worker-recycle-every ${CPU_WORKER_RECYCLE_EVERY:-0} \
   --ray-address $HEAD_IP:$RAY_PORT \
   --advantage-norm scalar --value-norm $VALUE_NORM --ppo-epochs 4 --anti-degeneracy none \
   --cosine-lower-bound 0.0 --cosine-upper-bound 1.0 \
