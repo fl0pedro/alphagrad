@@ -154,6 +154,47 @@ ResourceMonitor = (
 
 import math as _math
 
+# ---------------------------------------------------------------------------
+# Phase-2 memory-mitigation probe #4: in-process compiled-executable LRU.
+# ``ALPHAGRAD_MEASURE_INPROC_LRU=M`` (M>0) wraps the two per-measure
+# ``cached_compile`` results in a module-level ``OrderedDict`` bounded to M
+# entries keyed on the callback cache_key. On overflow the oldest entry is
+# popped and explicitly ``del``'d so the deserialized ``jax.stages.Compiled``
+# (and, we hope, the XLA/PJRT executable + device buffers it references) can be
+# released back to the measure GPU under the platform allocator. Default OFF
+# (M=0) is byte-identical to the legacy uncached-in-proc path. NOTE: whether the
+# ``del`` actually frees DEVICE memory must be confirmed empirically via
+# nvidia-smi — if XLA retains the executable internally the ceiling won't move.
+from collections import OrderedDict as _OrderedDict
+
+try:
+    _MEASURE_INPROC_LRU_MAX = int(os.environ.get("ALPHAGRAD_MEASURE_INPROC_LRU", "0") or "0")
+except ValueError:
+    _MEASURE_INPROC_LRU_MAX = 0
+_MEASURE_INPROC_LRU: "_OrderedDict" = _OrderedDict()
+
+
+def _inproc_lru_cached_compile(key: bytes, compile_fn):
+    """LRU wrapper around the shared ``cached_compile``. When the in-proc LRU
+    is enabled (M>0), retain the compiled executable in a bounded OrderedDict
+    and evict+``del`` the oldest on overflow. When disabled, delegate straight
+    through (no retention)."""
+    from alphagrad.approx.common.compile_cache import cached_compile as _cc
+    if _MEASURE_INPROC_LRU_MAX <= 0:
+        return _cc(key, compile_fn)
+    hit = _MEASURE_INPROC_LRU.get(key)
+    if hit is not None:
+        _MEASURE_INPROC_LRU.move_to_end(key)
+        return hit
+    compiled = _cc(key, compile_fn)
+    _MEASURE_INPROC_LRU[key] = compiled
+    _MEASURE_INPROC_LRU.move_to_end(key)
+    while len(_MEASURE_INPROC_LRU) > _MEASURE_INPROC_LRU_MAX:
+        _old_key, _old_val = _MEASURE_INPROC_LRU.popitem(last=False)
+        del _old_val
+    return compiled
+
+
 # Cache the graphax vocabulary used by `compute_eqn_ids_from_tokens` — the
 # tokenizer always uses the same digit_base, so the vocab is constant and
 # rebuilding it on every callback is pure overhead.
@@ -2054,7 +2095,7 @@ def _callback(
     if _dbg_t:
         import time as _time
         _t0 = _time.time()
-    compiled_approx = cached_compile(b"approx:" + cache_key, _do_compile_approx)
+    compiled_approx = _inproc_lru_cached_compile(b"approx:" + cache_key, _do_compile_approx)
     if _dbg_t:
         print(f"[DBG-env] term={is_terminal} approx_compile={_time.time()-_t0:.1f}s", flush=True)
         _t0 = _time.time()
@@ -2259,7 +2300,7 @@ def _callback(
     # the compile + execute when the step is non-terminal; the cache
     # entry would never be re-used productively anyway.
     if is_terminal:
-        compiled_exact = cached_compile(b"exact:" + exact_cache_key, _do_compile_exact)
+        compiled_exact = _inproc_lru_cached_compile(b"exact:" + exact_cache_key, _do_compile_exact)
         if _dbg_t:
             print(f"[DBG-env] exact_compile={_time.time()-_t0:.1f}s", flush=True)
             _t0 = _time.time()
