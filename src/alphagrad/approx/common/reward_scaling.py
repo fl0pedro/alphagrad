@@ -1005,6 +1005,9 @@ def build_wandb_log_dict(stats: dict, state: dict, ep: int) -> dict:
             # bridge-cse: full-range raw cosine_sim / bkstep telemetry
             # (reward/cosine_sim_raw{,_max,_min}, reward/bkstep_acc_raw).
             or k.startswith("reward/")
+            # bridge-cse: ALL 10 measurement channels (incl. zero-weight
+            # ones) at their raw terminal-mean — measure/<name>.
+            or k.startswith("measure/")
             or k.startswith("bkstep/")
             or k.startswith("decomp/")
             or k.startswith("sentinel/")

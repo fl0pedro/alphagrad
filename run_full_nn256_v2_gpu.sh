@@ -169,19 +169,22 @@ export ALPHAGRAD_BKSTEP=1
 export ALPHAGRAD_BKSTEP_K="${ALPHAGRAD_BKSTEP_K:-40}"
 export ALPHAGRAD_BKSTEP_SEEDS="${ALPHAGRAD_BKSTEP_SEEDS:-2}"
 
-# >>> CAPPED-COSSIM GUIDE (anti flat-zero-basin) <<<
-# The untrained policy sits at cos<=0 (all-COMPRESS -> degenerate Jacobian ->
-# cos clamped 0), where B_kstep(fracred) has NO gradient (measured: fracred~0
-# for cos<=0, lifting to ~0.30 by cos~0.1). ALPHAGRAD_COSSIM_GUIDE_CAP=C makes
-# env._callback emit min(cossim, C) on the cosine_sim channel (min, NOT
-# clip-at-0 -> monotonic climb from NEGATIVE cos up to C). --lambda-cossim-guide
-# weights that channel: below the edge it dominates the (now symlog'd) cost so
-# the policy climbs; above C it is constant -> B_kstep resolves the tradeoff.
-# C=0.1 = the measured trainability edge (fracred liftoff ~cos 0.03->0.1, prior
-# sweep 0.10-0.15). lambda_guide=1.5 -> below-edge swing ~1.5*0.4=0.6 >> cost
-# ~0.12; above-edge cap 1.5*0.1=0.15 < lambda_acc*bkstep(~0.5-0.66).
-export ALPHAGRAD_COSSIM_GUIDE_CAP="${ALPHAGRAD_COSSIM_GUIDE_CAP:-0.1}"
-LAMBDA_COSSIM_GUIDE="${LAMBDA_COSSIM_GUIDE:-1.5}"
+# >>> UN-SCALED COSSIM (user request, bridge-cse) <<<
+# The cosine_sim channel now enters the reward in its REGULAR RAW RANGE,
+# UNSCALARIZED except for PopArt's per-channel normalisation:
+#   (a) WEIGHT = 1.0  (LAMBDA_COSSIM_GUIDE 1.5 -> 1.0): the ×1.5 boost is gone,
+#       so cosine_sim carries the same natural weight as the bkstep quality
+#       channel instead of an artificial 1.5× guide weight.
+#   (b) GUIDE CAP DISABLED (ALPHAGRAD_COSSIM_GUIDE_CAP 0.1 -> 0): the old
+#       min(cossim, 0.1) clamp is removed, so the FULL cosine range reaches the
+#       reward/GAE buffer. ALPHAGRAD_COSSIM_GUIDE_CAP=0 (any <=0) means "no cap"
+#       (a strictly-positive value would re-install a cap). PopArt then
+#       normalises the raw cosine_sim channel like every other channel.
+# Net: cosine_sim reward = raw cosine value (full range), weight 1.0, PopArt-
+# normalised. (bkstep is already raw + weight 1.0 (lambda_acc) with no cap —
+# unchanged.)
+export ALPHAGRAD_COSSIM_GUIDE_CAP="${ALPHAGRAD_COSSIM_GUIDE_CAP:-0}"
+LAMBDA_COSSIM_GUIDE="${LAMBDA_COSSIM_GUIDE:-1.0}"
 
 PPO=alphagrad/src/alphagrad/approx/ppo_ray.py
 
@@ -201,13 +204,14 @@ LAMBDA_ACC="${LAMBDA_ACC:-1.0}"
 # reward by ~0.035 (was ~0.0014 with the old lambda*symlog(raw) at 0.001).
 LAMBDA_CMP="${LAMBDA_CMP:-0.06}"   # w_outer (latency); lambda_inner is 1/typical_raw
 LAMBDA_MEM="${LAMBDA_MEM:-0.06}"   # w_outer (peak_memory)
-# Fix 3: entropy-coef anneal range. Start high (0.05) so the 6-head action
-# space explores early, decay linearly to a small floor (0.002) by the end of
-# the run so the policy COMMITS to the best rule (entropy was pinned ~1.99 =
-# never converging because the coef was frozen). Wired into the per-episode
-# anneal in ppo_ray_worker.run_rollout_and_train.
+# ENTROPY-COEF ANNEAL DISABLED (user request, bridge-cse). The linear decay
+# init->final (commit 2701cce, wired in ppo_ray_worker.run_rollout_and_train)
+# is turned OFF by setting FINAL == INIT: the per-episode anneal formula
+# ``init + (final-init)*progress`` is then CONSTANT for all episodes. Entropy
+# coefficient is held FIXED at 0.05 (no decay). To re-enable annealing, set
+# ENTROPY_COEF_FINAL to a value below ENTROPY_COEF.
 ENTROPY_COEF="${ENTROPY_COEF:-0.05}"
-ENTROPY_COEF_FINAL="${ENTROPY_COEF_FINAL:-0.002}"
+ENTROPY_COEF_FINAL="${ENTROPY_COEF_FINAL:-0.05}"  # == ENTROPY_COEF -> constant (anneal disabled)
 
 ULIM='ulimit -n $(ulimit -Hn) 2>/dev/null || ulimit -n 262144 2>/dev/null; ulimit -u $(ulimit -Hu) 2>/dev/null || true;'
 eval "$ULIM"

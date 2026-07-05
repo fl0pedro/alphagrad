@@ -1187,6 +1187,15 @@ class PPORayWorker:
         self._sentinel_neutral_mu = (
             os.environ.get("ALPHAGRAD_SENTINEL_NEUTRAL_MU", "1") == "1"
         )
+        # KILL THE -2 FLOOR (bridge-cse). Extend the truly-neutral-mu handling
+        # to the FIRST / un-warmed rollout (``_sent_ema_n == 0``): use
+        # ``popart.mu`` (neutral) instead of falling through to the additive
+        # -2.0 ``failed_penalty`` stamp that floored mean_return/best_return at
+        # -2 before the EMA warmed. PopArt-only (mu is the neutral frame). Set 0
+        # to revert to the legacy -2-on-un-warmed behaviour.
+        self._neutral_unwarmed = (
+            os.environ.get("ALPHAGRAD_NEUTRAL_UNWARMED", "1") == "1"
+        )
         self._sent_ema_scalar = 0.0
         self._sent_ema_scalar_n = 0
         if self.dynamic_sentinel:
@@ -1212,11 +1221,19 @@ class PPORayWorker:
         self.raw_cossim_thread = (
             os.environ.get("ALPHAGRAD_RAW_COSSIM_THREAD", "1") == "1"
         )
+        # UN-SCALE COSSIM (bridge-cse). ``ALPHAGRAD_COSSIM_GUIDE_CAP=0`` (or any
+        # value <= 0, or empty/unset) DISABLES the ``min(cossim, C)`` guide cap
+        # entirely so the cosine_sim channel enters the reward at its FULL RAW
+        # range (PopArt then normalises it) instead of being clamped into
+        # [.., 0.1]. Only a strictly-positive C installs a cap. Previously "0"
+        # parsed to a literal ``min(cossim, 0.0)`` clamp — the un-scale is a
+        # <=0 sentinel for "no cap".
         _gc = os.environ.get("ALPHAGRAD_COSSIM_GUIDE_CAP", "").strip()
         self._cossim_guide_cap = None
         if _gc:
             try:
-                self._cossim_guide_cap = float(_gc)
+                _gc_val = float(_gc)
+                self._cossim_guide_cap = _gc_val if _gc_val > 0.0 else None
             except ValueError:
                 self._cossim_guide_cap = None
         if self.raw_cossim_thread:
@@ -2702,6 +2719,18 @@ class PPORayWorker:
         )  # (T, N)
         buf_failed = buf_sentinel | _env_sentinel | _bad_rewarded  # (T, N)
 
+        # LOG ALL MEASUREMENT CHANNELS (bridge-cse). Snapshot the RAW measured
+        # per-channel reward vector HERE — before any sentinel substitution,
+        # symlog compression, guide cap or gate — so every one of the 10
+        # REWARD_NAMES (incl. the ZERO-WEIGHT measured-but-not-rewarded channels
+        # flops / max_io_sum / bytes_accessed / peak_memory / frob_residual /
+        # xla_peak_memory) can be logged in its NATURAL raw units at
+        # ``measure/<name>`` below. Cost channels are stored negated (env
+        # convention); logged as-measured.
+        buf_reward_vec_measured_raw = np.array(
+            buf_reward_vec, dtype=np.float32, copy=True
+        )
+
         # Phase 3 (b): mask sentinel transitions. Zero the per-channel
         # reward vector AND force dones=1 so GAE treats sentinel
         # timesteps as terminal and the value head bootstraps cleanly
@@ -2863,6 +2892,39 @@ class PPORayWorker:
                                 self.reward_weights_np,
                             )
                         )
+            elif (
+                self._sentinel_neutral_mu
+                and self.use_popart
+                and self._neutral_unwarmed
+            ):
+                # KILL THE -2 FLOOR ON THE FIRST / UN-WARMED ROLLOUT (bridge-cse).
+                # Before the sentinel EMA has warmed (``_sent_ema_n == 0``, i.e.
+                # the very first rollout, or any rollout whose every env failed
+                # before a real terminal ever landed) the legacy path zeroed the
+                # failed rows and the additive ``failed_penalty=-2.0`` stamp
+                # below then floored ``mean_return`` / ``best_return`` at -2.
+                # That is exactly the -2 the user still saw. Under PopArt +
+                # neutral-mu the truly-neutral substitute (``popart.mu``, which
+                # is well-defined — zeros — from rollout 0) makes the failed
+                # row's per-channel PopArt advantage ``(G_k - mu_k)/sigma_k``
+                # EXACTLY 0 and its weighted return ``dot(mu, w)`` (0 at rollout
+                # 0), so a failed / un-warmed row is neither rewarded nor
+                # punished on the FIRST rollout too — no -2 floor, uniform
+                # neutral handling. Set ``_dyn_scalar`` finite so the
+                # ``failed_penalty`` stamp below is skipped, zero the raw buffer
+                # (the post-transform override at the ``_neutral_post_vec`` block
+                # then writes ``popart.mu``). Flag ALPHAGRAD_NEUTRAL_UNWARMED
+                # (default 1) reverts to the -2 legacy path when 0.
+                buf_reward_vec = np.where(
+                    buf_failed[..., None], 0.0, buf_reward_vec,
+                )
+                _neutral_post_vec = self.popart.mu.astype(np.float32).copy()
+                _dyn_scalar = float(
+                    np.dot(
+                        _neutral_post_vec.astype(np.float64),
+                        self.reward_weights_np.astype(np.float64),
+                    )
+                )
             else:
                 # Legacy path (dynamic off, or EMA not warmed yet): zero the
                 # per-channel reward vector (the additive failed_penalty /
@@ -3935,6 +3997,20 @@ class PPORayWorker:
         # mean over the dones-masked terminal transitions.
         for name, val in ch_stats.get("terminal_means", {}).items():
             last_aux[f"reward_mean/{name}_terminal"] = float(val)
+        # LOG ALL MEASUREMENT CHANNELS (bridge-cse). Emit the terminal-step
+        # mean (over VALID = non-failed terminal rows) of the RAW measured
+        # value for EVERY one of the 10 REWARD_NAMES — including the channels
+        # with ZERO reward weight (flops, max_io_sum, bytes_accessed,
+        # peak_memory, frob_residual, xla_peak_memory) that never enter the
+        # reward and so were invisible in wandb. Namespace ``measure/<name>``
+        # (raw units, cost channels negated per env convention). Distinct from
+        # the reward-space ``reward_mean/<name>`` keys — no double-count.
+        _valid_term_meas = buf_dones.astype(bool) & ~buf_failed   # (T, N)
+        if _valid_term_meas.any():
+            _meas = buf_reward_vec_measured_raw[_valid_term_meas]  # (M, K)
+            _meas_mean = _meas.mean(axis=0)
+            for _mi, _mname in enumerate(REWARD_NAMES):
+                last_aux[f"measure/{_mname}"] = float(_meas_mean[_mi])
         last_aux["per_reward_means"] = ch_stats["per_reward_means"]
         last_aux["per_reward_means_terminal"] = ch_stats.get("terminal_means", {})
         last_aux["best_per_reward"] = ch_stats["best_per_reward"]
