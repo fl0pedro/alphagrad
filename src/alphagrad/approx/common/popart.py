@@ -52,9 +52,24 @@ class PopArtStats:
         beta: float = 1e-2,
         sigma_min=0.1,
         sigma_max: float = 1e6,
+        robust_std: bool = False,
+        winsor_k: float = 5.0,
     ) -> None:
         self.num_channels = int(num_channels)
         self.beta = float(beta)
+        # ROBUST STD (bridge-cse). When ``robust_std`` is on, each channel's
+        # value targets are WINSORIZED to ``mu +/- winsor_k*sigma`` (current
+        # running stats) BEFORE the EMA update, so a single extreme cost
+        # outlier (raw, un-symlog'd cost now feeds PopArt) cannot spike the
+        # per-channel sigma and crush the other channels' relative advantage.
+        # Winsorize (clip) rather than drop so the batch shape / mean are
+        # preserved. Output-preserving: only the stats-tracking sees the
+        # clipped batch; the returned old/new (mu,sigma) still drive the head
+        # rescale. Chosen over a streaming median/MAD (P2 estimator) because
+        # clip-to-mu±kσ is O(1) state, exact under the existing debiased-EMA
+        # machinery, and needs no extra per-channel quantile trackers.
+        self.robust_std = bool(robust_std)
+        self.winsor_k = float(winsor_k)
         # Fix 4: sigma_min may be a scalar OR a per-channel array. A
         # near-homogeneous channel (bkstep/cosine at convergence) drives
         # var->0 and clamps to the floor; too small a floor (0.1) lets the
@@ -99,6 +114,26 @@ class PopArtStats:
         old_mu = self.mu.copy()
         old_sigma = self.sigma.copy()
         b = self.beta
+        # ROBUST STD: winsorize each channel's targets to a ROBUST per-BATCH
+        # band ``median +/- k * (1.4826*MAD)`` before they enter the EMA. Using
+        # the BATCH's own median/MAD (not the running mu/sigma) makes it
+        # correctly scaled from the FIRST update — critical for the raw cost
+        # channels (~1e9), which the (0,1) init would otherwise clip to +/-k
+        # and destroy. MAD (median absolute deviation) is the standard robust
+        # spread estimate; 1.4826*MAD == sigma for a Gaussian. An extreme
+        # outlier sits far outside median +/- k*robustsigma and is pulled to
+        # the edge, so it can neither move the batch mean much nor inflate the
+        # second moment / sigma EMA. Degenerate MAD==0 (all-equal channel, e.g.
+        # a converged quality channel) => band collapses to the median, which
+        # is exactly the (correct) constant, and the sigma_min floor downstream
+        # keeps the normaliser well-conditioned. Skipped when robust_std is off.
+        if self.robust_std:
+            _med = np.median(targets, axis=0)                    # (K,)
+            _mad = np.median(np.abs(targets - _med[None, :]), axis=0)  # (K,)
+            _rsig = 1.4826 * _mad                                 # robust sigma
+            _lo = _med - self.winsor_k * _rsig
+            _hi = _med + self.winsor_k * _rsig
+            targets = np.clip(targets, _lo[None, :], _hi[None, :])
         self._mu_acc = (1.0 - b) * self._mu_acc + b * targets.mean(axis=0)
         self._nu_acc = (1.0 - b) * self._nu_acc + b * (targets ** 2).mean(axis=0)
         self._w = (1.0 - b) * self._w + b

@@ -1155,17 +1155,41 @@ class PPORayWorker:
             _sig_min_vec = np.full(NUM_REWARDS, _sig_min_base, dtype=np.float64)
             for _qi in (6, 9):  # cosine_sim, bkstep_acc
                 _sig_min_vec[_qi] = max(_sig_min_base, _sig_min_qual)
+            # sigma_max must admit the RAW cost scale (bridge-cse): now that
+            # cost channels enter PopArt raw (no symlog), peak_memory returns
+            # span ~1e9 with a true std >> the legacy 1e6 cap. A too-small
+            # sigma_max CLAMPS sigma below the true scale and UNDER-normalises
+            # the cost channel -> O(100) advantage (observed ep1-4). Raise the
+            # cap to 1e12 so raw-cost sigma can reach its true magnitude.
+            _sig_max = float(os.environ.get("ALPHAGRAD_POPART_SIGMA_MAX", "1e12"))
+            # ROBUST STD (bridge-cse, USER-DIRECTED). Raw cost -> a single 100x
+            # outlier would spike the per-channel sigma EMA and crush the other
+            # channels' relative signal. WINSORIZE each channel's value targets
+            # to mu +/- k*sigma (current running stats) BEFORE the EMA update so
+            # an outlier cannot inflate sigma; output-preserving (only the
+            # stats-tracking sees the winsorized batch, the returned old/new
+            # mu,sigma still drive the head rescale). Flag ALPHAGRAD_POPART_
+            # ROBUST_STD (default 1); k via ALPHAGRAD_POPART_WINSOR_K (default
+            # 5.0). See PopArtStats.update.
+            _robust = os.environ.get("ALPHAGRAD_POPART_ROBUST_STD", "1") == "1"
+            _winsor_k = float(
+                os.environ.get("ALPHAGRAD_POPART_WINSOR_K", "5.0")
+            )
             self.popart = PopArtStats(
                 NUM_REWARDS,
                 beta=float(os.environ.get("ALPHAGRAD_POPART_BETA", "0.01")),
                 sigma_min=_sig_min_vec,
+                sigma_max=_sig_max,
+                robust_std=_robust,
+                winsor_k=_winsor_k,
             )
             print(
                 f"[ppo_ray] PopArt value norm ON: beta={self.popart.beta} "
                 f"sigma_min(base={_sig_min_base}, quality[6,9]="
-                f"{_sig_min_qual}) — replaces the rollout advantage "
-                f"z-score; failed rows get a plain constant -1.0 advantage "
-                f"(no normaliser interaction).",
+                f"{_sig_min_qual}) sigma_max={_sig_max:g} "
+                f"robust_std={_robust} (winsor k={_winsor_k}) — replaces the "
+                f"rollout advantage z-score; under pure-PopArt advantage a "
+                f"failed row is truly-neutral (A==0), no constant stamp.",
                 flush=True,
             )
 
@@ -2387,6 +2411,18 @@ class PPORayWorker:
                 surr1 = ratio * adv
                 surr2 = jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps) * adv
                 policy_loss = -jnp.minimum(surr1, surr2)
+                # PER-COMPONENT KL (bridge-cse). The joint action log-prob is a
+                # SUM over its active components: 1 vertex-selection head +
+                # ``micro_arity`` active micro-action components (the same
+                # active mask the gated ``micro_lp`` sums over). So the joint
+                # logratio is a SUM of per-component logratios, and the joint
+                # approx_kl is ~ (n_components)x a single-action KL — which is
+                # why target_kl=0.15 trips after ~1 minibatch. Expose the
+                # per-sample active-component count so the early-stop can use
+                # the MEAN-per-component KL (standard PPO threshold semantics).
+                n_components = jnp.float32(1.0) + jnp.maximum(
+                    micro_arity, jnp.float32(0.0)
+                )
                 if is_gdpo:
                     per_channel_se = (value - ret) ** 2           # (K,)
                     normaliser = jnp.maximum(jnp.abs(ret), 1.0)   # (K,)
@@ -2405,9 +2441,12 @@ class PPORayWorker:
                 else:
                     value_scalar = jnp.sum(value * priority_weights_j)
                     value_loss = (value_scalar - symlog(ret)) ** 2
-                return policy_loss, value_loss, entropy, per_head, logratio
+                return (policy_loss, value_loss, entropy, per_head, logratio,
+                        n_components)
 
-            p_l, v_l, ent, per_head_ent, logratio = jax.vmap(per_sample)(
+            p_l, v_l, ent, per_head_ent, logratio, n_comp = jax.vmap(
+                per_sample
+            )(
                 tokens, eqn_ids, avail,
                 actions, op_a, i_a, j_a, exp_a, f_a, kind_a, q_a,
                 axis_state_a, axis_valid_a,
@@ -2423,12 +2462,30 @@ class PPORayWorker:
             head_means = jnp.mean(per_head_ent, axis=0)  # (6,)
             # Fix 3: approx_kl for logging + Fix 2 KL early-stop. Schulman
             # low-variance non-negative estimator mean((r-1) - logratio).
+            #   * approx_kl        = JOINT KL (SUM over action components; the
+            #                        legacy quantity — ~n_components x a single-
+            #                        action KL).
+            #   * approx_kl_percomp = PER-ACTIVE-COMPONENT KL: the joint
+            #                        Schulman estimator DIVIDED by the number of
+            #                        active components (1 vertex + micro_arity),
+            #                        per sample, then averaged. This is a proper
+            #                        single-action-scale KL so target_kl=0.15 is
+            #                        a standard-PPO per-component threshold
+            #                        rather than a joint-sum one (which tripped
+            #                        after ~1 minibatch). The early-stop uses
+            #                        THIS when ALPHAGRAD_KL_PER_COMPONENT=1
+            #                        (default); both are logged.
             _ratio_kl = jnp.exp(logratio)
-            approx_kl = jnp.mean((_ratio_kl - 1.0) - logratio)
+            _kl_per_sample = (_ratio_kl - 1.0) - logratio        # (B,)
+            approx_kl = jnp.mean(_kl_per_sample)                  # joint (sum)
+            approx_kl_percomp = jnp.mean(
+                _kl_per_sample / jnp.maximum(n_comp, jnp.float32(1.0))
+            )
             aux = {
                 "ppo_loss": ppo_loss,
                 "value_loss": value_loss,
                 "approx_kl": approx_kl,
+                "approx_kl_percomp": approx_kl_percomp,
                 "entropy": jnp.mean(ent),
                 "entropy_coef": entropy_coef,
                 "entropy/vertex": head_means[0],
@@ -3686,7 +3743,8 @@ class PPORayWorker:
         # Fix 3: per-episode approx_kl + grad_norm telemetry (previously
         # this collapse class was invisible in wandb). Accumulate over the
         # minibatches actually run.
-        _kl_running = []
+        _kl_running = []          # JOINT KL (legacy sum-over-components)
+        _kl_pc_running = []       # PER-COMPONENT KL (mean-over-components)
         _gradnorm_running = []
         _mb_done = 0
         # Fix 2: PPO KL early-stop. The update loop is a single pass over
@@ -3695,6 +3753,17 @@ class PPORayWorker:
         # target, so a catastrophic ep49-type update can't land in full.
         # ALPHAGRAD_PPO_TARGET_KL=0 disables (revertible no-op).
         _target_kl = float(os.environ.get("ALPHAGRAD_PPO_TARGET_KL", "0.15"))
+        # PER-COMPONENT KL EARLY-STOP (bridge-cse, USER-DIRECTED). The joint
+        # approx_kl is a SUM over ~n_components action components, so it is
+        # ~10-50x a single-action KL and trips target_kl=0.15 after ~1
+        # minibatch (over-throttling). ALPHAGRAD_KL_PER_COMPONENT=1 (default)
+        # switches the early-stop CHECK to the MEAN-per-active-component KL
+        # (approx_kl_percomp) so target_kl is a proper standard-PPO
+        # per-component threshold and more minibatches run. Both KLs are always
+        # logged. Set 0 to revert to the legacy joint-sum check.
+        _kl_per_component = (
+            os.environ.get("ALPHAGRAD_KL_PER_COMPONENT", "1") == "1"
+        )
         _kl_stopped = False
 
         # Fix 3: linear entropy-coef anneal from init → final over the run.
@@ -3737,27 +3806,42 @@ class PPORayWorker:
             nan_skip_total += int(aux.pop("nan_skip", 0))
             _gn = aux.pop("grad_norm", None)
             _kl = aux.pop("approx_kl", None)
+            _kl_pc = aux.pop("approx_kl_percomp", None)
             if _gn is not None and np.isfinite(float(_gn)):
                 _gradnorm_running.append(float(_gn))
             if _kl is not None and np.isfinite(float(_kl)):
                 _kl_running.append(float(_kl))
+            if _kl_pc is not None and np.isfinite(float(_kl_pc)):
+                _kl_pc_running.append(float(_kl_pc))
             last_aux = {k: float(v) for k, v in aux.items()}
             _mb_done += 1
             # Fix 2: early-stop the remaining minibatches once the running
             # mean approx_kl exceeds the target. The current minibatch's
             # step has already been applied (standard PPO checks AFTER the
-            # step); we simply take no further steps this episode.
+            # step); we simply take no further steps this episode. The CHECK
+            # KL is the per-component mean (default) or the legacy joint sum
+            # (ALPHAGRAD_KL_PER_COMPONENT=0).
+            if _kl_per_component and _kl_pc_running:
+                _kl_check = _kl_pc
+                _kl_check_running = _kl_pc_running
+                _kl_label = "approx_kl_percomp"
+            else:
+                _kl_check = _kl
+                _kl_check_running = _kl_running
+                _kl_label = "approx_kl(joint)"
             if (
                 _target_kl > 0.0
-                and _kl is not None
-                and np.isfinite(float(_kl))
-                and float(np.mean(_kl_running)) > _target_kl
+                and _kl_check is not None
+                and np.isfinite(float(_kl_check))
+                and float(np.mean(_kl_check_running)) > _target_kl
             ):
                 _kl_stopped = True
                 print(
                     f"[ppo_ray][kl-stop] ep={self._episode_counter} "
-                    f"approx_kl(mean)={float(np.mean(_kl_running)):.4f} > "
-                    f"target {_target_kl} after mb {_mb_done}/{mb_count} "
+                    f"{_kl_label}(mean)={float(np.mean(_kl_check_running)):.4f} "
+                    f"> target {_target_kl} after mb {_mb_done}/{mb_count} "
+                    f"(joint_kl mean="
+                    f"{float(np.mean(_kl_running)) if _kl_running else float('nan'):.3f}) "
                     f"-- stopping remaining updates.",
                     flush=True,
                 )
@@ -4009,6 +4093,15 @@ class PPORayWorker:
         )
         last_aux["ppo/approx_kl_max"] = (
             float(np.max(_kl_running)) if _kl_running else float("nan")
+        )
+        # PER-COMPONENT KL telemetry (bridge-cse) — the quantity the early-stop
+        # checks by default; compare against ppo/approx_kl (joint sum) to see
+        # the ~n_components scaling and the extra minibatches it unlocks.
+        last_aux["ppo/approx_kl_percomp"] = (
+            float(np.mean(_kl_pc_running)) if _kl_pc_running else float("nan")
+        )
+        last_aux["ppo/approx_kl_percomp_max"] = (
+            float(np.max(_kl_pc_running)) if _kl_pc_running else float("nan")
         )
         last_aux["ppo/grad_norm"] = (
             float(np.mean(_gradnorm_running))

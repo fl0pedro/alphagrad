@@ -240,6 +240,17 @@ export ALPHAGRAD_POPART_SIGMA_MIN="${ALPHAGRAD_POPART_SIGMA_MIN:-0.1}"
 export ALPHAGRAD_POPART_SIGMA_MIN_QUALITY="${ALPHAGRAD_POPART_SIGMA_MIN_QUALITY:-0.2}"
 # Fix 2: PPO KL early-stop (reject a catastrophic ep49-type update). 0 disables.
 export ALPHAGRAD_PPO_TARGET_KL="${ALPHAGRAD_PPO_TARGET_KL:-0.15}"
+# PER-COMPONENT KL (bridge-cse): the early-stop checks the MEAN-per-active-
+# component KL (joint KL / n_active_components), so target_kl=0.15 is a proper
+# single-action PPO threshold instead of a joint-sum one (which tripped after
+# ~1 minibatch). Both joint + per-component KL are logged. 0 = legacy joint.
+export ALPHAGRAD_KL_PER_COMPONENT="${ALPHAGRAD_KL_PER_COMPONENT:-1}"
+# ROBUST PopArt sigma (bridge-cse): winsorize value targets to
+# median +/- k*(1.4826*MAD) per channel before the EMA so a raw-cost outlier
+# can't spike sigma. sigma_max raised to admit the raw cost scale (~1e9).
+export ALPHAGRAD_POPART_ROBUST_STD="${ALPHAGRAD_POPART_ROBUST_STD:-1}"
+export ALPHAGRAD_POPART_WINSOR_K="${ALPHAGRAD_POPART_WINSOR_K:-5.0}"
+export ALPHAGRAD_POPART_SIGMA_MAX="${ALPHAGRAD_POPART_SIGMA_MAX:-1e12}"
 NAME="full_nn256_v2${VARIANT:+_$VARIANT}$([ "$VALUE_NORM" = popart ] && echo _popart)_s${SEED}_ss${MAX_SUBSTEPS}"
 
 echo "########## FULL_NN256_V2 $(date) | head=$NODE0 eps=$EPISODES NN_HIDDEN=256 variant=${VARIANT:-full} value_norm=$VALUE_NORM measure-grad ##########"
@@ -267,7 +278,7 @@ uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \
   --cpu-worker-recycle-every ${CPU_WORKER_RECYCLE_EVERY:-6} \
   --ray-address $HEAD_IP:$RAY_PORT \
-  --advantage-norm scalar --value-norm $VALUE_NORM --ppo-epochs 4 --anti-degeneracy none \
+  --advantage-norm scalar --value-norm $VALUE_NORM --ppo-epochs 4 \
   --cosine-lower-bound 0.0 --cosine-upper-bound 1.0 \
   --episodes $EPISODES --num-envs $NUM_ENVS --minibatches $MBS \
   --num-data-points 5 --reps-per-point 2 \
