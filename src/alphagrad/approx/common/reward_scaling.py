@@ -982,6 +982,11 @@ def build_wandb_log_dict(stats: dict, state: dict, ep: int) -> dict:
     }
     if "entropy_root" in stats:
         log_dict["entropy_root"] = stats["entropy_root"]
+    # bridge-cse: the LIVE entropy coefficient (now held constant — anneal
+    # disabled). Surfaced so the "entropy coef constant" invariant is
+    # verifiable in wandb.
+    if "entropy_coef" in stats:
+        log_dict["entropy_coef"] = stats["entropy_coef"]
     if "reward_loss" in stats:
         log_dict["reward_loss"] = stats["reward_loss"]
     if "buffer_size" in stats:
