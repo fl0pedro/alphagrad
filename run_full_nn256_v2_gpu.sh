@@ -68,13 +68,23 @@ export ALPHAGRAD_PREVALIDATE_MEASURE=1
 # always on an OOM sentinel) so XLA releases those executables; the on-disk
 # compile cache survives -> recurring configs reload cheap. Keeps measure-GPU
 # memory FLAT instead of monotonically growing.
-# >>> C2 (Phase-2 sweep WINNER): in-proc LRU + on-disk compile cache + buffer-delete <<<
-# Chosen over the recycle-based C1 default. Method #4 (keep-frequent LRU, verified
-# .delete frees device mem) + method #7 (block+delete measure I/O buffers) + the
-# JIT on-disk compile cache (default on; ALPHAGRAD_DISABLE_JIT_DISK_CACHE unset).
-# The LRU replaces clear_caches AND per-actor recycle: set both OFF so they do not
-# ALSO fire (clear_caches=0, recycle=0). Flat ~8.8 GiB measure ceiling, 0 OOM.
-export ALPHAGRAD_MEASURE_INPROC_LRU=${ALPHAGRAD_MEASURE_INPROC_LRU:-128}
+# >>> C2 "winner" DISPROVEN AT SCALE (long-validation job 51621/51622/51623, 2026-07) <<<
+# The claimed "flat ~8.8 GiB, 0 OOM" for LRU=128+delbuf was a SHORT-PROBE
+# ARTIFACT. Long standalone-harness validation (CpuApproximationServer.evaluate
+# over the live diag_gcd/256-NN grad measure, hundreds of measures) proved:
+#   * LRU 16 == 32 == 128 -> IDENTICAL 34345 MiB monotonic climb (no plateau):
+#     the OrderedDict eviction .delete() does NOT reclaim device memory.
+#   * jax.clear_caches() at every=16 AND every=1 -> SAME climb + recompile tax:
+#     does NOT reclaim either. The retention is XLA/PJRT-INTERNAL, below any
+#     Python/JAX API. => NO in-process method bounds the leak.
+# On the live run this fills 66-73 GiB (the ~71 GiB PJRT cap) WITHIN episode 1
+# (seed7 51613 reached call=7543 still in ep1 -> 6237 RESOURCE_EXHAUSTED). Only
+# PROCESS TEARDOWN (recycle) frees the memory, but per-EPISODE recycle cannot
+# bound a single episode's thousands of measures. MEMORY CONFIG ALONE CANNOT
+# reach sentinels->0 at scale -> measurement-surrogate heads are required (see
+# thesis/ scope note). Until then: LRU OFF (it only wastes RAM), tight process
+# recycle = least-bad partial bound (frees cross-episode; NOT within-episode).
+export ALPHAGRAD_MEASURE_INPROC_LRU=${ALPHAGRAD_MEASURE_INPROC_LRU:-0}
 export ALPHAGRAD_MEASURE_DELETE_BUFFERS=${ALPHAGRAD_MEASURE_DELETE_BUFFERS:-1}
 export ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY=${ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY:-0}
 
@@ -232,7 +242,7 @@ uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --actor-num-gpus 1 --cpu-actor-num-gpus 1 --num-cpu-workers 3 \
   --cpu-cores-per-actor 8 --cpu-cores-shared \
   --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \
-  --cpu-worker-recycle-every ${CPU_WORKER_RECYCLE_EVERY:-0} \
+  --cpu-worker-recycle-every ${CPU_WORKER_RECYCLE_EVERY:-6} \
   --ray-address $HEAD_IP:$RAY_PORT \
   --advantage-norm scalar --value-norm $VALUE_NORM --ppo-epochs 4 --anti-degeneracy none \
   --cosine-lower-bound 0.0 --cosine-upper-bound 1.0 \
