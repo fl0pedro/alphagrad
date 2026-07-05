@@ -1417,6 +1417,30 @@ class PPORayWorker:
             jax.vmap(lambda s, k: self.agent.value(s.tokens, key=k))(state, boot_keys),
         )  # (N, NUM_REWARDS)
 
+        # Value-based sentinel fold-in (ALPHAGRAD_VALUE_SENTINEL_MASK=1,
+        # default on): the pool ``sentinel_mask`` only flags TIMEOUTS. The
+        # env itself emits -1e10 in a cost channel for other rejects
+        # (latency-floor, graphax graceful-sentinel), and every fan-out path
+        # returns ``sentinel_mask=False`` for those rows. Left un-zeroed they
+        # leak into the reward buffer: mean_return/best_return (worker) and
+        # GAE read ``buf_reward_vec`` WITHOUT any sentinel filter, so a cost
+        # channel's -1e10 times its NEGATIVE weight becomes a huge POSITIVE
+        # spike — the policy learns "sentinels are good." (aggregate_per_channel
+        # _stats already drops these via filter_sentinel_mask, which is why the
+        # per-channel terminal quality means spike while costs drop — the mean
+        # over the surviving envs rises when the worst env is filtered out.)
+        # Fold the value-detected rows into buf_sentinel so the zero+done
+        # treatment below is applied uniformly across mean_return / best_return
+        # / GAE, matching the quality-stats filter.
+        if os.environ.get("ALPHAGRAD_VALUE_SENTINEL_MASK", "1") == "1":
+            from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+            from alphagrad.approx.common.reward_scaling import filter_sentinel_mask
+            _value_sentinel = ~filter_sentinel_mask(
+                buf_reward_vec, SENTINEL_REWARD_VALUE,
+            )  # (T, N) True where any cost channel == -1e10
+            if _value_sentinel.any():
+                buf_sentinel = buf_sentinel | _value_sentinel
+
         # Phase 3 (b): mask sentinel transitions. Zero the per-channel
         # reward vector AND force dones=1 so GAE treats sentinel
         # timesteps as terminal and the value head bootstraps cleanly
@@ -1431,8 +1455,8 @@ class PPORayWorker:
             n_sentinels = int(buf_sentinel.sum())
             print(
                 f"[ppo_ray] {n_sentinels}/{T*N} sentinel transitions "
-                f"this episode (CPU pool timeouts); zeroing rewards "
-                f"and forcing dones."
+                f"this episode (CPU pool timeouts + value-detected -1e10 "
+                f"rejects); zeroing rewards and forcing dones."
             )
 
         # Phase D: apply conditioned-reward gates. For each spec
