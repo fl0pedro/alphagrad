@@ -1171,6 +1171,24 @@ class PPORayWorker:
         self._sent_ema_mean = np.zeros(NUM_REWARDS, dtype=np.float64)
         self._sent_ema_sq = np.zeros(NUM_REWARDS, dtype=np.float64)
         self._sent_ema_n = 0
+        # TRULY-NEUTRAL SENTINEL (bridge-cse). EMA of the REAL per-env
+        # post-transform WEIGHTED scalar return (the exact quantity GAE
+        # scalarises + mean_return averages). With SENTINEL_K=0 the raw
+        # per-channel substitute ``_dyn_vec=mu`` reads as average-quality
+        # (quality channels are non-symlog, keeping mu~0.65-0.7) + near-free
+        # cost (cost channels symlog-compressed to ~0) => a net-POSITIVE
+        # ~+0.71 scalar that SPIKES mean_return and injects a spurious
+        # POSITIVE GAE advantage on failed rows. When enabled, a failed
+        # row's scalarised return is forced to THIS running mean so the row
+        # is truly neutral: it neither rewards nor punishes (mean_return is
+        # unmoved; GAE advantage ~= return - value ~= 0 since the critic
+        # tracks the same mean). Flag-guarded (default on), revertible via
+        # ALPHAGRAD_SENTINEL_NEUTRAL_MU=0 (falls back to raw mu-K*sigma).
+        self._sentinel_neutral_mu = (
+            os.environ.get("ALPHAGRAD_SENTINEL_NEUTRAL_MU", "1") == "1"
+        )
+        self._sent_ema_scalar = 0.0
+        self._sent_ema_scalar_n = 0
         if self.dynamic_sentinel:
             print(
                 f"[ppo_ray] DYNAMIC SENTINEL ON: failed/sentinel terminals "
@@ -2704,6 +2722,11 @@ class PPORayWorker:
         # keys on) instead of the legacy per-channel ZERO. Falls back to the
         # legacy zero until the EMA has seen at least one real rollout.
         _dyn_scalar = float("nan")
+        # TRULY-NEUTRAL SENTINEL (bridge-cse). Post-transform per-channel
+        # override applied to failed rows AFTER the cost-symlog pass; set in
+        # the sentinel block below when PopArt + neutral-mu are on. None = no
+        # override (leave the raw-mu substitute in place).
+        _neutral_post_vec = None
         if self.dynamic_sentinel:
             _term_ok = buf_dones.astype(bool) & ~buf_failed        # (T, N)
             if _term_ok.any():
@@ -2730,6 +2753,34 @@ class PPORayWorker:
                     np.maximum(self._sent_ema_sq - _mu * _mu, 1e-12)
                 )
                 _dyn_vec = (_mu - self.sentinel_k * _sig).astype(np.float32)  # (K,)
+
+                # Helper: scalarise a RAW per-channel reward vector through the
+                # EXACT transform the GAE reward consumes (cost symlog+cap,
+                # cossim guide cap), then weighted-dot. Reused for the neutral
+                # shift below AND the logged scalar.
+                def _scalarise_dyn(_vec):
+                    _s = np.asarray(_vec, dtype=np.float64).copy()
+                    if self._additive_symlog_cost:
+                        _mm = _COST_SYMLOG_MASK_NP
+                        _sc = _s * self._inner_lambda_np
+                        _slv = np.sign(_sc) * np.log1p(np.abs(_sc))
+                        if self._cost_symlog_cap > 0.0:
+                            _slv = np.clip(
+                                _slv,
+                                -self._cost_symlog_cap,
+                                self._cost_symlog_cap,
+                            )
+                        _s = np.where(_mm, _slv, _s)
+                    if (
+                        self.raw_cossim_thread
+                        and self._cossim_guide_cap is not None
+                    ):
+                        _s[COSINE_SIM_IDX] = min(
+                            _s[COSINE_SIM_IDX],
+                            float(self._cossim_guide_cap),
+                        )
+                    return _s
+
                 buf_reward_vec = np.where(
                     buf_failed[..., None],
                     _dyn_vec[None, None, :],
@@ -2742,28 +2793,76 @@ class PPORayWorker:
                 # in that post-transform space — otherwise the raw cost EMA
                 # dominates and the metric reads ~-1e5 instead of the ~mildly
                 # -ve scalar the policy actually sees.
-                _dv_scalarised = _dyn_vec.astype(np.float64).copy()
-                if self._additive_symlog_cost:
-                    _mm = _COST_SYMLOG_MASK_NP
-                    _sc = _dv_scalarised * self._inner_lambda_np
-                    _slv = np.sign(_sc) * np.log1p(np.abs(_sc))
-                    if self._cost_symlog_cap > 0.0:
-                        _slv = np.clip(
-                            _slv, -self._cost_symlog_cap, self._cost_symlog_cap,
-                        )
-                    _dv_scalarised = np.where(_mm, _slv, _dv_scalarised)
-                # Cossim channel is guide-capped in the reward path too.
-                if (
-                    self.raw_cossim_thread
-                    and self._cossim_guide_cap is not None
-                ):
-                    _dv_scalarised[COSINE_SIM_IDX] = min(
-                        _dv_scalarised[COSINE_SIM_IDX],
-                        float(self._cossim_guide_cap),
-                    )
+                _dv_scalarised = _scalarise_dyn(_dyn_vec)
                 _dyn_scalar = float(
                     np.dot(_dv_scalarised, self.reward_weights_np)
                 )
+                # TRULY-NEUTRAL SENTINEL (bridge-cse). With SENTINEL_K=0 the
+                # substitute above is the raw EMA mu: quality channels (non-
+                # symlog) keep mu~0.65-0.7 while cost channels symlog-compress
+                # to ~0, so the failed row's post-transform return reads as an
+                # average-quality, near-free-cost row => a net-POSITIVE ~+0.71
+                # scalar that SPIKES mean_return AND injects a spurious POSITIVE
+                # GAE advantage. USER CHOICE "truly-neutral mu": a failed row
+                # must not steer the policy either way. When enabled we OVERRIDE
+                # each failed row's POST-TRANSFORM per-channel return to the
+                # value the critic already predicts for an average state, so the
+                # PER-CHANNEL PopArt advantage ``(G_k - mu_k)/sigma_k`` is
+                # EXACTLY 0 on every channel (not merely scalar-matched, which a
+                # per-channel-normalised advantage does NOT zero) and the value
+                # target ``(G_k - mu_k)/sigma_k`` is 0 too. The override lands
+                # AFTER the cost-symlog pass (below) since ``popart.mu`` lives
+                # in POST-transform return space; we STASH the target here and
+                # apply it there. Flag ALPHAGRAD_SENTINEL_NEUTRAL_MU (default 1).
+                #   * PopArt ON  -> popart.mu (per-channel return mean the
+                #     critic is normalised against; pre-update = rollout frame).
+                #   * PopArt OFF -> the raw mu-K*sigma substitute is kept, but
+                #     the scalar is shifted onto the slow real-scalar EMA on the
+                #     top quality channel so mean_return stays neutral.
+                if self._sentinel_neutral_mu and self.use_popart:
+                    _neutral_post_vec = self.popart.mu.astype(np.float32).copy()
+                    _dyn_scalar = float(
+                        np.dot(
+                            _neutral_post_vec.astype(np.float64),
+                            self.reward_weights_np.astype(np.float64),
+                        )
+                    )
+                elif (
+                    self._sentinel_neutral_mu
+                    and self._sent_ema_scalar_n > 0
+                ):
+                    # PopArt OFF: shift the raw-mu substitute so its
+                    # post-transform weighted scalar equals the slow real
+                    # scalar EMA. The shift lands on the highest-|weight|
+                    # NON-SYMLOG quality channel (linear, so a delta d moves
+                    # the scalar by exactly w_p*d). This neutralises
+                    # mean_return + the scalar-normalised advantage in the
+                    # non-PopArt z-score path.
+                    _w = self.reward_weights_np.astype(np.float64)
+                    _qcand = _w.copy()
+                    _qcand[~_NO_SYMLOG_MASK_FP] = 0.0
+                    if np.any(_qcand != 0.0):
+                        _pidx = int(np.argmax(np.abs(_qcand)))
+                    else:
+                        _pidx = int(np.argmax(np.abs(_w)))
+                    _pw = float(_w[_pidx])
+                    if _pw != 0.0:
+                        _delta = (self._sent_ema_scalar - _dyn_scalar) / _pw
+                        _dyn_vec2 = _dyn_vec.astype(np.float32).copy()
+                        _dyn_vec2[_pidx] = np.float32(
+                            float(_dyn_vec2[_pidx]) + _delta
+                        )
+                        buf_reward_vec = np.where(
+                            buf_failed[..., None],
+                            _dyn_vec2[None, None, :],
+                            buf_reward_vec,
+                        ).astype(np.float32)
+                        _dyn_scalar = float(
+                            np.dot(
+                                _scalarise_dyn(_dyn_vec2),
+                                self.reward_weights_np,
+                            )
+                        )
             else:
                 # Legacy path (dynamic off, or EMA not warmed yet): zero the
                 # per-channel reward vector (the additive failed_penalty /
@@ -2821,6 +2920,25 @@ class PPORayWorker:
             buf_reward_vec = np.where(
                 _m,
                 _sl,
+                buf_reward_vec,
+            ).astype(np.float32)
+
+        # TRULY-NEUTRAL SENTINEL (bridge-cse) — POST-TRANSFORM override. Now
+        # that the cost channels are in symlog space, write each failed row's
+        # per-channel return to ``popart.mu`` (the per-channel mean the critic
+        # is normalised against, captured PRE this rollout's PopArt update =
+        # the frame the rollout head was trained in). Under PopArt the
+        # collapsed advantage is ``sum_k (G_k - mu_k)/sigma_k * w_k`` and the
+        # value target is ``(G_k - mu_k)/sigma_k``; placing G_k == mu_k makes
+        # BOTH EXACTLY 0 on every channel — a failed row is truly neutral in
+        # advantage AND in mean_return (it reads as an average episode), never
+        # the spurious +0.71 the raw-mu-with-K=0 substitute produced. Skipped
+        # when the override is disabled or PopArt is off (``_neutral_post_vec``
+        # is None), leaving the raw-mu substitute + non-PopArt shift in place.
+        if _neutral_post_vec is not None and buf_failed.any():
+            buf_reward_vec = np.where(
+                buf_failed[..., None],
+                _neutral_post_vec[None, None, :],
                 buf_reward_vec,
             ).astype(np.float32)
 
@@ -3264,7 +3382,21 @@ class PPORayWorker:
                 _popart_log["popart/adv_std_pre_bound"] = _adv_std_pre
                 _popart_log["popart/adv_absmax_pre_bound"] = _adv_absmax_pre
                 _popart_log["popart/adv_scale"] = float(_adv_scale)
-            if self.reward_mode == "additive" and buf_failed.any():
+            # DYNAMIC SENTINEL supersede (bridge-cse). This PopArt-path
+            # failed-row advantage overwrite (constant -1.0) was NOT guarded by
+            # the dynamic sentinel, unlike the non-PopArt post-z-score stamp
+            # below (~3382). When the dynamic sentinel actually stamped the
+            # failed rows this rollout (``_dyn_scalar`` finite), those rows
+            # already carry the truly-neutral mu-based return -> their GAE
+            # advantage is ~0. Overwriting with a constant -1.0 here would turn
+            # a NEUTRAL failed row into a spuriously REPULSIVE one, steering the
+            # policy in ADVANTAGE space even though the reward was neutral. Guard
+            # it so a failed row is neutral in advantage too.
+            if (
+                self.reward_mode == "additive"
+                and buf_failed.any()
+                and not (self.dynamic_sentinel and np.isfinite(_dyn_scalar))
+            ):
                 advantages_b = jnp.where(
                     jnp.asarray(buf_failed.T),            # (N, T)
                     jnp.float32(-1.0),
@@ -3614,29 +3746,50 @@ class PPORayWorker:
         # ``buf_reward_vec`` already carries -P on these via the gate, so
         # ``best_return`` from the gated buffer is correct independently.)
         buf_raw_for_agg = buf_reward_vec_raw.astype(np.float32)
+        # SENTINEL AGG EXCLUSION (bridge-cse). A failed/sentinel row must be
+        # EXCLUDED from every terminal aggregate regardless of reward_mode.
+        # Previously this exclusion was gated ``anti_degen and mult``, so in
+        # additive mode the dynamic-sentinel substitute (raw quality mu ~0.65
+        # on the non-symlog channels + symlog-compressed ~0 cost) survived
+        # ``filter_sentinel_mask`` (mu != -1e10) and was wrongly RETAINED in
+        # ``terminal_means`` / ``per_reward_means`` / ``per_env_tot_for_best``
+        # / ``best_overall`` — reading as an average-quality, near-free-cost
+        # row that both spiked the means and could crown best_overall. Stamp
+        # the cost channels of EVERY failed terminal row with SENTINEL so
+        # filter_sentinel_mask drops them. Flag-guarded (default on),
+        # revertible via ALPHAGRAD_EXCLUDE_FAILED_AGG=0.
+        _term = buf_dones.astype(bool)                        # (T, N)
+        _exclude_failed_agg = (
+            os.environ.get("ALPHAGRAD_EXCLUDE_FAILED_AGG", "1") == "1"
+        )
+        _failed_terminal = buf_failed & _term if _exclude_failed_agg else (
+            np.zeros_like(_term)
+        )
         if self.anti_degen and self.reward_mode == "mult":
-            _term = buf_dones.astype(bool)                    # (T, N)
             _degen_terminal = (
                 (buf_reward_vec_raw[..., COSINE_SIM_IDX]
                  < np.float32(self.anti_degen_tau))
                 | buf_failed
             ) & _term                                        # (T, N)
-            if _degen_terminal.any():
-                buf_raw_for_agg = buf_raw_for_agg.copy()
-                _cost_idx_arr = np.array(_cost_idx, dtype=np.int64)
-                # Mark every cost channel of the degenerate terminal rows
-                # as SENTINEL so filter_sentinel_mask excludes them.
-                for _ci in _cost_idx_arr:
-                    buf_raw_for_agg[..., int(_ci)] = np.where(
-                        _degen_terminal,
-                        np.float32(SENTINEL_REWARD_VALUE),
-                        buf_raw_for_agg[..., int(_ci)],
-                    )
-                print(
-                    f"[ppo_ray] anti-degen: excluded "
-                    f"{int(_degen_terminal.sum())} degenerate/failed terminal "
-                    f"env(s) from best_overall."
+            _degen_terminal = _degen_terminal | _failed_terminal
+        else:
+            _degen_terminal = _failed_terminal
+        if _degen_terminal.any():
+            buf_raw_for_agg = buf_raw_for_agg.copy()
+            _cost_idx_arr = np.array(_cost_idx, dtype=np.int64)
+            # Mark every cost channel of the degenerate terminal rows
+            # as SENTINEL so filter_sentinel_mask excludes them.
+            for _ci in _cost_idx_arr:
+                buf_raw_for_agg[..., int(_ci)] = np.where(
+                    _degen_terminal,
+                    np.float32(SENTINEL_REWARD_VALUE),
+                    buf_raw_for_agg[..., int(_ci)],
                 )
+            print(
+                f"[ppo_ray] anti-degen: excluded "
+                f"{int(_degen_terminal.sum())} degenerate/failed terminal "
+                f"env(s) from best_overall."
+            )
 
         ch_stats = aggregate_per_channel_stats(
             buf_raw_for_agg,
@@ -3666,6 +3819,32 @@ class PPORayWorker:
             _decomp_cost = 0.0
         last_aux["decomp/quality_term"] = _decomp_quality
         last_aux["decomp/cost_term"] = _decomp_cost
+
+        # TRULY-NEUTRAL SENTINEL (bridge-cse). Update the EMA of the REAL
+        # per-env post-transform WEIGHTED scalar return from this rollout's
+        # VALID terminal rows. ``buf_reward_vec_raw`` already carries the
+        # cost symlog+cap transform; apply the cossim guide cap here so the
+        # tracked scalar matches EXACTLY what the GAE reward consumes for a
+        # real row. NEXT rollout's failed rows are shifted to this mean so
+        # they land on the running-average return => neutral advantage.
+        # (One-rollout lag by construction, same as the per-channel EMA.)
+        if self._sentinel_neutral_mu and _valid_term.any():
+            _rvec = buf_reward_vec_raw[_valid_term].astype(np.float64).copy()
+            if self.raw_cossim_thread and self._cossim_guide_cap is not None:
+                _rvec[:, COSINE_SIM_IDX] = np.minimum(
+                    _rvec[:, COSINE_SIM_IDX], float(self._cossim_guide_cap)
+                )
+            _real_scalars = _rvec @ self.reward_weights_np.astype(np.float64)
+            _bm_s = float(_real_scalars.mean())
+            _b_s = self._sent_ema_beta
+            if self._sent_ema_scalar_n == 0:
+                self._sent_ema_scalar = _bm_s
+            else:
+                self._sent_ema_scalar = (
+                    (1.0 - _b_s) * self._sent_ema_scalar + _b_s * _bm_s
+                )
+            self._sent_ema_scalar_n += 1
+        last_aux["sentinel/neutral_mu_scalar"] = float(self._sent_ema_scalar)
 
         # RAW full-range cosine_sim + bkstep logging (bridge-cse). Over VALID
         # terminal rows ONLY (failed/sentinel rows carry the mu-K*sigma
