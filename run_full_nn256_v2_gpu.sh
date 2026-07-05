@@ -117,32 +117,38 @@ export ALPHAGRAD_QUANT_ALLOWED="int8,int16,float8_e4m3fn,float8_e5m2,bfloat16,fl
 # >>> SCALE-UP + REWARD KNOBS <<<
 export ALPHAGRAD_NN_HIDDEN=256
 export ALPHAGRAD_REWARD_MODE=additive
-export ALPHAGRAD_ADDITIVE_SYMLOG_COST=1
-# >>> COST SENSITIVITY: lambda INSIDE the symlog (symlog(lambda_inner*raw)) <<<
-# The cost term was lambda_outer*symlog(raw): huge raw costs (latency ~1.13e5 ns,
-# peak_memory ~1.30e8 B from ep-20 best.json) saturate symlog's log regime, so
-# a 2x-cheaper order barely moved the reward (~few-e-4) — cost was rank-blind.
-# Fix: per-channel lambda_inner ~ 1/typical_raw_cost puts a typical cost in the
-# LINEAR regime (|lambda_inner*cost|~1) so order-of-magnitude differences are
-# PRESERVED (sensitive), outliers still log-bounded. Then a SMALL outer weight
-# (lambda_cmp/lambda_mem=0.06 below) keeps the cost a minor nudge (~0.08 typical
-# combined) vs bkstep (~0.5). w_outer*symlog(lambda_inner*raw).
-export ALPHAGRAD_INNER_LAMBDA_LATENCY_NS="${ALPHAGRAD_INNER_LAMBDA_LATENCY_NS:-9e-6}"   # 1/1.13e5
-export ALPHAGRAD_INNER_LAMBDA_PEAK_MEMORY="${ALPHAGRAD_INNER_LAMBDA_PEAK_MEMORY:-7.7e-9}" # 1/1.30e8
-# >>> V2 ANTI-HACK (pf7ityh6 post-mortem) <<<
-# 1) COST_SYMLOG_CAP: clip symlog(lambda_inner*raw) to +/-1.25. The untrained
-#    micro policy starts at ~20x-typical cost (latency symlog ~3.1), which gave
-#    the cost term ~0.23 of scalar leverage (designed ~0.09) — the policy hacked
-#    cost (COMPRESS/QUANT spam) while bkstep decayed 0.22->0.16. With the cap,
-#    beyond ~2.4x typical the cost term SATURATES: no reward for making the
-#    graph cheaper by making it worse; max combined cost term = 0.06*1.25*2 =
-#    0.15 << quality (~0.8) at a good operating point.
-export ALPHAGRAD_COST_SYMLOG_CAP="${ALPHAGRAD_COST_SYMLOG_CAP:-1.25}"
-# 2) FAILED_ADV_STAMP: the -2.0 failed penalty is z-scored; an ALL-fail rollout
-#    (constant -2) normalises to advantage ~0 => the basin is ABSORBING (pf7ityh6
-#    pinned at mean_return -2/-16 for 80+ eps). Post-z-score overwrite of failed
-#    rows' advantage with -1.0 keeps a repulsive gradient in all-fail batches.
-export ALPHAGRAD_FAILED_ADV_STAMP="${ALPHAGRAD_FAILED_ADV_STAMP:-1.0}"
+# >>> RAW COST INTO POPART (bridge-cse, USER-DIRECTED) <<<
+# PopArt now does ALL the magnitude normalisation. The cost channels
+# (latency_ns, peak_memory) enter the reward as RAW (negated) values — NO
+# symlog, NO INNER_LAMBDA rescale, NO symlog cap — so PopArt's per-channel
+# (G_k - mu_k)/sigma_k normalises them exactly like the quality channels.
+#   * ALPHAGRAD_ADDITIVE_SYMLOG_COST=0 disables the whole
+#     symlog(lambda_inner*raw)+cap pass in ppo_ray_worker (the pass is gated
+#     behind this flag, and lambda_inner is ONLY applied inside that pass, so
+#     turning it off ALSO stops lambda_inner from being applied).
+#   * ALPHAGRAD_COST_SYMLOG_CAP=0 removes the +/-1.25 latency/peak_mem cap.
+# CAVEAT: raw cost -> PopArt sigma is OUTLIER-SENSITIVE (a single 100x-latency
+# outlier inflates the per-channel sigma EMA and can transiently shrink the
+# cost advantage). Mitigated by the SLOW PopArt beta (quasi-static EMA, so one
+# outlier barely moves sigma) and the SMALL outer cost weights
+# (lambda_cmp/lambda_mem=0.06) that keep the cost term a minor nudge regardless
+# of scale. If sigma proves too jumpy, options are: raise POPART_SIGMA_MIN for
+# the cost channels, or a soft (percentile) cost clip — NOT the symlog cap.
+export ALPHAGRAD_ADDITIVE_SYMLOG_COST=0   # was 1 — cost now RAW into PopArt (no symlog / no lambda_inner)
+# INNER_LAMBDA_* kept exported for documentation, but INERT while symlog is
+# off (only applied inside the symlog pass). Harmless if left set.
+export ALPHAGRAD_INNER_LAMBDA_LATENCY_NS="${ALPHAGRAD_INNER_LAMBDA_LATENCY_NS:-9e-6}"   # INERT (symlog off)
+export ALPHAGRAD_INNER_LAMBDA_PEAK_MEMORY="${ALPHAGRAD_INNER_LAMBDA_PEAK_MEMORY:-7.7e-9}" # INERT (symlog off)
+export ALPHAGRAD_COST_SYMLOG_CAP=0   # was 1.25 — RETIRED (no cost cap; PopArt handles scale)
+# >>> PURE-POPART ADVANTAGE (bridge-cse, USER-DIRECTED) <<<
+# The advantage is EXACTLY the per-channel PopArt-normalised residual
+# collapsed by the weights, sum_k (A_k/sigma_k)*w_k — NO extra rollout z-score,
+# NO ADV_STD_FLOOR, NO ADV_CLIP, NO failed-row stamp (double normalisation).
+# KL early-stop (PPO_TARGET_KL below) is the blow-up guard instead of the clip.
+export ALPHAGRAD_POPART_PURE_ADV="${ALPHAGRAD_POPART_PURE_ADV:-1}"
+# RETIRED exports (bridge-cse): ALPHAGRAD_FAILED_ADV_STAMP, ALPHAGRAD_ADV_STD_FLOOR,
+# ALPHAGRAD_ADV_CLIP, ALPHAGRAD_FAILED_PENALTY — all inert under neutral-mu +
+# pure-PopArt advantage (a failed row is already A==0). No longer exported.
 # Unidirectional Palimpsa (gated linear-attention, O(seq)) policy backbone —
 # efficient over the now-unclipped ~8.2k-token grad graph (MAX_TOKENS=16384).
 # V2: the uni mixer now carries the zero-init eqn_ids relational DAG-degree
@@ -223,11 +229,10 @@ HEAD_IP=$(srun --nodes=1 --nodelist=$NODE0 hostname -i | awk '{print $1}')
 # advantage z-score). Set VALUE_NORM=popart (or ALPHAGRAD_POPART=1).
 VALUE_NORM="${VALUE_NORM:-baseline}"
 MAX_SUBSTEPS="${MAX_SUBSTEPS:-16}"
-# ep49-collapse Fix 1 (job 51516): scale-only advantage bound (no mean-subtract)
-# + hard clip backstop on the PopArt scalar advantage path — caps the std-13
-# blowup directly. Env-gated / revertible (ADV_CLIP=0 disables).
-export ALPHAGRAD_ADV_STD_FLOOR="${ALPHAGRAD_ADV_STD_FLOOR:-0.5}"
-export ALPHAGRAD_ADV_CLIP="${ALPHAGRAD_ADV_CLIP:-8.0}"
+# RETIRED (bridge-cse): the scale-only advantage bound + hard clip
+# (ALPHAGRAD_ADV_STD_FLOOR / ALPHAGRAD_ADV_CLIP) were the double-normalisation
+# on top of PopArt. Dropped — the advantage is now pure PopArt (see
+# ALPHAGRAD_POPART_PURE_ADV above); KL early-stop is the blow-up guard.
 # Fix 4: per-channel PopArt sigma floor. Global floor 0.1 over-amplified the
 # near-homogeneous bkstep(9)+cosine(6) channels (var->0 -> A_k/sigma_k inflated).
 # Floor those quality channels higher (0.2); cost channels keep base 0.1.

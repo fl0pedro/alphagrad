@@ -770,6 +770,16 @@ class PPORayWorker:
             getattr(self.args, "entropy_coef_final", 0.001)
         )
         self.entropy_coef = self.entropy_coef_init
+        # MONTE-CARLO CREDIT (KEEP AS-IS, bridge-cse). The shipped launcher
+        # runs --discount 1.0 --gae-lambda 1.0, i.e. a pure Monte-Carlo return
+        # with terminal-only reward (the measured {latency, peak_mem, quality}
+        # vector lands on the last step; intermediate steps carry 0). A single
+        # episode can be LONG — up to ~|V| x max_substeps steps (|V| vertex
+        # eliminations, each an autoregressive micro sub-episode of up to
+        # max_substeps=16 typed actions) — so the value head must learn a
+        # LONG-HORIZON return: with lambda=discount=1.0 the terminal reward
+        # flows back UNDISCOUNTED to every earlier step, and V must predict it
+        # from states many steps before the reward is revealed.
         self.gae_lambda = float(getattr(self.args, "gae_lambda", 0.95))
         self.discount = float(getattr(self.args, "discount", 0.99))
         self.reward_weights_np = _build_reward_weights(self.args)
@@ -982,6 +992,16 @@ class PPORayWorker:
         # so failing is always the least-preferred outcome; NOT the
         # -1e10 sentinel (that dominates), NOT 0 (the trap). Default
         # -2.0 (< the worst valid ~-1.5).
+        #
+        # RETIRED (bridge-cse, USER-DIRECTED): ALPHAGRAD_FAILED_PENALTY is
+        # INERT under the shipped neutral-mu sentinel (SENTINEL_K=0 +
+        # SENTINEL_NEUTRAL_MU=1). A failed row's per-channel return is
+        # overwritten with popart.mu (truly neutral), so ``_dyn_scalar`` is
+        # always finite and the ``not _dyn_applied`` guard below skips this
+        # penalty stamp entirely — a failed row is neither rewarded nor
+        # punished (unknown != bad). The read/var is kept only so the LEGACY
+        # non-PopArt / dynamic-sentinel-off path still functions; the launcher
+        # no longer exports it.
         self.failed_penalty = float(
             os.environ.get("ALPHAGRAD_FAILED_PENALTY", "-2.0")
         )
@@ -1004,6 +1024,16 @@ class PPORayWorker:
         # z-score, OVERWRITE failed rows' advantage with -|stamp| so a
         # failed action always carries an on-scale (~1 sigma) repulsive
         # gradient, all-fail batches included. 0 disables.
+        #
+        # RETIRED (bridge-cse, USER-DIRECTED): ALPHAGRAD_FAILED_ADV_STAMP is
+        # INERT under the shipped stack. It only ever fired in (a) the
+        # non-PopArt scalar z-score path, and (b) the PopArt scale/clip block
+        # (constant -1.0) — BOTH now guarded off: (a) is skipped by the
+        # neutral-mu ``not _dyn_applied`` guard, and (b) lives inside the
+        # ALPHAGRAD_POPART_PURE_ADV legacy branch which the default (=1) does
+        # not take. Under neutral-mu a failed row is already A==0 (truly
+        # neutral). Kept as a var for the legacy revert path; not exported by
+        # the launcher.
         self.failed_adv_stamp = float(
             os.environ.get("ALPHAGRAD_FAILED_ADV_STAMP", "1.0")
         )
@@ -1171,6 +1201,36 @@ class PPORayWorker:
         self._sent_ema_mean = np.zeros(NUM_REWARDS, dtype=np.float64)
         self._sent_ema_sq = np.zeros(NUM_REWARDS, dtype=np.float64)
         self._sent_ema_n = 0
+        # ------------------------------------------------------------------
+        # SENTINEL DESIGN — CURRENT CHOICE + TWO FUTURE ALTERNATIVES
+        # ------------------------------------------------------------------
+        # A "failed/sentinel" transition is one whose measurement never
+        # produced a usable value (CPU-pool timeout, mem-gate skip, shape
+        # storm, exec exception). We must substitute SOMETHING for its
+        # per-channel return before GAE/PopArt see it. THE CURRENT CHOICE is
+        # NEUTRAL-MU (below): overwrite the failed row's per-channel return
+        # with ``popart.mu`` so its PopArt advantage (G_k - mu_k)/sigma_k == 0
+        # on every channel and its value target == 0 — the row is TRULY
+        # NEUTRAL (unknown != bad; it neither rewards nor punishes, and
+        # mean_return is unmoved). K=0 (no mu - K*sigma penalty).
+        #
+        # TWO ALTERNATIVES worth trying if neutral-mu proves insufficient
+        # (documented here for future reference — NOT implemented):
+        #   (a) MASKING — drop failed transitions ENTIRELY from the update
+        #       (exclude them from the policy loss / value loss / advantage
+        #       batch; NO substitute value at all), so a failed row contributes
+        #       zero gradient rather than a neutral one. Risk: an ALL-failed
+        #       rollout becomes a no-op (no gradient to escape the failing
+        #       region) — the historical trap this neutral-mu path replaced.
+        #   (b) SURROGATE MEASUREMENT HEAD + EMA — train a cheap regression
+        #       head to PREDICT the expensive channels {latency_ns, peak_memory}
+        #       from the cheap-to-compute {flops, bytes, xla_peak_memory}
+        #       features, and use an EMA of {cosine_sim / bkstep_acc} for the
+        #       quality channels on a sentinel. A failed row then gets a
+        #       *predicted* (not neutral, not measured) return so the policy
+        #       still receives a plausible learning signal without paying the
+        #       measurement cost.
+        # ------------------------------------------------------------------
         # TRULY-NEUTRAL SENTINEL (bridge-cse). EMA of the REAL per-env
         # post-transform WEIGHTED scalar return (the exact quantity GAE
         # scalarises + mean_return averages). With SENTINEL_K=0 the raw
@@ -3401,69 +3461,69 @@ class PPORayWorker:
         # update step (see gdpo_normalise_advantages) so the global pass
         # would double-normalise and wash out cross-minibatch signal.
         if self.advantage_norm == "scalar" and self.use_popart:
-            # PopArt REPLACES the rollout-wide z-score entirely: the
-            # advantages are already O(1) in normalised space with NO
-            # batch coupling — an all-fail batch cannot be washed to 0,
-            # and a homogeneous-good batch cannot have its residual noise
-            # inflated to +-1 (sigma is a slow EMA with a hard floor, not
-            # a per-batch std). Failed rows keep the V2 stamp, now as a
-            # PLAIN CONSTANT -1.0 advantage — repulsive, on-scale, zero
-            # normaliser interaction.
-            # Fix 1 (PRIMARY collapse fix): even with the sigma floor, a
-            # catastrophic policy flip can drive the per-channel residual
-            # A_k/sigma_k to O(10) when a channel error spikes while its
-            # sigma sits at the floor (ep49: bkstep error ~1.3 / sigma 0.1
-            # -> weighted-sum std ~13, which the scalar path deliberately
-            # does NOT re-normalise -> the bad basin locks in). Apply a
-            # SCALE-ONLY normalisation (divide by max(std, FLOOR), NO
-            # mean-subtraction -- preserve sign and PopArt's relative
-            # per-channel signal; the z-score's mean-coupling is exactly
-            # the all-fail-zeroing / sign-flip artifact we are avoiding),
-            # then a hard symmetric clip as a backstop. Applied BEFORE the
-            # failed-row stamp so the stamp lands cleanly inside the clip
-            # range (+-1 << CLIP). Env knobs, both revertible:
-            #   ALPHAGRAD_ADV_STD_FLOOR (default 0.5) -- floor so the
-            #     divisor can never shrink and AMPLIFY as returns homogenise;
-            #   ALPHAGRAD_ADV_CLIP (default 8.0) -- hard backstop, roomy
-            #     for the +-1 stamp. Set 0 to disable the whole bound.
-            _adv_std_floor = float(
-                os.environ.get("ALPHAGRAD_ADV_STD_FLOOR", "0.5")
+            # PURE-POPART ADVANTAGE (bridge-cse, USER-DIRECTED). The advantage
+            # entering the update is EXACTLY the per-channel PopArt-normalised
+            # residual collapsed by the priority weights,
+            #     A = sum_k (A_k / sigma_k) * w_k
+            # constructed above (line ~3234). PopArt's slow-EMA per-channel
+            # (G_k - mu_k)/sigma_k IS the normalisation — it is already O(1)
+            # and finite (sigma has a hard floor), so we do NOT apply any
+            # additional rollout-wide z-score, scale-only divisor, std-floor,
+            # hard clip, OR failed-row advantage stamp on top. Layering a
+            # second (rollout-batch) normaliser over PopArt is DOUBLE
+            # NORMALISATION: it re-couples the advantage to per-batch
+            # statistics (the exact all-fail-zeroing / homogeneous-inflation
+            # artifact PopArt was chosen to avoid) and throws away PopArt's
+            # cross-rollout scale. KL early-stop (target_kl, below) remains the
+            # blow-up guard instead of the clip.
+            #
+            # RETIRED here (were the double-normalisation): the SCALE-ONLY
+            # divide-by-max(std, ADV_STD_FLOOR), the ADV_CLIP hard clip, and the
+            # constant -1.0 failed-row advantage overwrite. All three are
+            # skipped when ALPHAGRAD_POPART_PURE_ADV=1 (default). Failed rows
+            # are already truly-neutral in advantage under the neutral-mu
+            # sentinel (their per-channel return == popart.mu => A_k == 0 on
+            # every channel), so no stamp is needed. Set
+            # ALPHAGRAD_POPART_PURE_ADV=0 to restore the legacy
+            # scale/clip/stamp path (kept below for revert / A-B).
+            _pure_adv = (
+                os.environ.get("ALPHAGRAD_POPART_PURE_ADV", "1") == "1"
             )
-            _adv_clip = float(os.environ.get("ALPHAGRAD_ADV_CLIP", "8.0"))
-            _adv_np_pre = np.asarray(advantages_b, dtype=np.float64)
-            _adv_std_pre = float(_adv_np_pre.std())
-            _adv_absmax_pre = float(np.abs(_adv_np_pre).max())
-            if _adv_clip > 0.0:
-                _adv_scale = jnp.maximum(
-                    jnp.std(advantages_b), jnp.float32(_adv_std_floor)
+            if not _pure_adv:
+                # LEGACY (retired) double-normalisation path. Env knobs:
+                #   ALPHAGRAD_ADV_STD_FLOOR (default 0.5), ALPHAGRAD_ADV_CLIP
+                #   (default 8.0). Set ADV_CLIP=0 to disable the bound.
+                _adv_std_floor = float(
+                    os.environ.get("ALPHAGRAD_ADV_STD_FLOOR", "0.5")
                 )
-                advantages_b = advantages_b / _adv_scale     # scale-only
-                advantages_b = jnp.clip(
-                    advantages_b, -_adv_clip, _adv_clip
-                )
-                _popart_log["popart/adv_std_pre_bound"] = _adv_std_pre
-                _popart_log["popart/adv_absmax_pre_bound"] = _adv_absmax_pre
-                _popart_log["popart/adv_scale"] = float(_adv_scale)
-            # DYNAMIC SENTINEL supersede (bridge-cse). This PopArt-path
-            # failed-row advantage overwrite (constant -1.0) was NOT guarded by
-            # the dynamic sentinel, unlike the non-PopArt post-z-score stamp
-            # below (~3382). When the dynamic sentinel actually stamped the
-            # failed rows this rollout (``_dyn_scalar`` finite), those rows
-            # already carry the truly-neutral mu-based return -> their GAE
-            # advantage is ~0. Overwriting with a constant -1.0 here would turn
-            # a NEUTRAL failed row into a spuriously REPULSIVE one, steering the
-            # policy in ADVANTAGE space even though the reward was neutral. Guard
-            # it so a failed row is neutral in advantage too.
-            if (
-                self.reward_mode == "additive"
-                and buf_failed.any()
-                and not (self.dynamic_sentinel and np.isfinite(_dyn_scalar))
-            ):
-                advantages_b = jnp.where(
-                    jnp.asarray(buf_failed.T),            # (N, T)
-                    jnp.float32(-1.0),
-                    advantages_b,
-                )
+                _adv_clip = float(os.environ.get("ALPHAGRAD_ADV_CLIP", "8.0"))
+                _adv_np_pre = np.asarray(advantages_b, dtype=np.float64)
+                _adv_std_pre = float(_adv_np_pre.std())
+                _adv_absmax_pre = float(np.abs(_adv_np_pre).max())
+                if _adv_clip > 0.0:
+                    _adv_scale = jnp.maximum(
+                        jnp.std(advantages_b), jnp.float32(_adv_std_floor)
+                    )
+                    advantages_b = advantages_b / _adv_scale     # scale-only
+                    advantages_b = jnp.clip(
+                        advantages_b, -_adv_clip, _adv_clip
+                    )
+                    _popart_log["popart/adv_std_pre_bound"] = _adv_std_pre
+                    _popart_log["popart/adv_absmax_pre_bound"] = _adv_absmax_pre
+                    _popart_log["popart/adv_scale"] = float(_adv_scale)
+                # RETIRED failed-row advantage overwrite (constant -1.0),
+                # guarded by the dynamic sentinel. Inert under neutral-mu
+                # (failed rows already A==0). Only runs in the legacy path.
+                if (
+                    self.reward_mode == "additive"
+                    and buf_failed.any()
+                    and not (self.dynamic_sentinel and np.isfinite(_dyn_scalar))
+                ):
+                    advantages_b = jnp.where(
+                        jnp.asarray(buf_failed.T),            # (N, T)
+                        jnp.float32(-1.0),
+                        advantages_b,
+                    )
             _af = np.asarray(advantages_b, dtype=np.float64).reshape(-1)
             _popart_log["popart/adv_mean"] = float(_af.mean())
             _popart_log["popart/adv_std"] = float(_af.std())
