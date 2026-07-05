@@ -101,6 +101,18 @@ class CpuApproximationServer:
         # production runs aren't taxed.
         self._n_calls = 0
         self._leak_profile = None  # set by `_maybe_init_leak_profile`
+        # Recycle+retry-on-OOM bookkeeping (see CpuApproxPool). The
+        # env._callback path converts a measure-GPU OOM into a
+        # RuntimeError("measure-oom: ...") which ``evaluate`` catches and
+        # turns into a bounded sentinel — so the OOM never crosses the Ray
+        # RPC as an exception and the pool cannot see it. Instead we STASH
+        # a one-shot flag the pool queries (``pop_oom_flag``) right after it
+        # observes a sentinel row: True means "that sentinel was a device
+        # OOM; recycling this actor (process teardown) will free the leaked
+        # XLA executables", False means "benign graphax shape error; a
+        # retry would just re-sentinel — do not recycle".
+        self._last_was_oom = False
+        self._n_oom = 0
         # ------------------------------------------------------------------
         # GPU-executable leak bound. Each ``evaluate`` runs one (or more)
         # per-config ``jax.jit(jacve(...)).lower().compile()`` — a DISTINCT
@@ -250,6 +262,20 @@ class CpuApproximationServer:
             # `last_eval_error` is updated atomically (just Python reference
             # assignment).
             self.last_eval_error = (type(exc).__name__, str(exc)[:200])
+            # Classify OOM vs benign. env._callback re-raises device OOMs as
+            # RuntimeError("measure-oom: ..."); also match raw XLA/CUDA OOM
+            # text in case an OOM slips past that wrapper. This one-shot flag
+            # is consumed by CpuApproxPool.pop_oom_flag to drive recycle+retry.
+            _exc_txt = f"{type(exc).__name__}: {exc!s}"
+            _is_oom = (
+                "measure-oom" in _exc_txt
+                or "RESOURCE_EXHAUSTED" in _exc_txt
+                or "out of memory" in _exc_txt.lower()
+                or "XlaRuntimeError" in type(exc).__name__
+            )
+            if _is_oom:
+                self._last_was_oom = True
+                self._n_oom += 1
             # Log EVERY sentinel fire (cause + whether it was a terminal
             # measurement) so the rate/causes are visible per model in the run
             # log (grep '[SENTINEL]'). Previously only stashed in
@@ -397,6 +423,25 @@ class CpuApproximationServer:
 
     def ready(self) -> bool:
         return True
+
+    def pop_oom_flag(self) -> bool:
+        """Return-and-reset whether the most recent ``evaluate`` failed
+        with a device OOM (RESOURCE_EXHAUSTED / measure-oom), as opposed to
+        a benign graphax shape error.
+
+        The pool calls this immediately after it observes a sentinel row for
+        this actor. A True result means the sentinel was caused by the
+        un-freeable per-measure XLA compile leak filling the measure GPU, so
+        the ONLY remedy is to recycle (process teardown) this actor and retry
+        the measure on a fresh one. False means a retry would just re-sentinel
+        (bad action / shape mismatch), so the pool leaves the actor alive.
+
+        One-shot: reads and clears the flag so a single OOM triggers exactly
+        one recycle. Cheap (no JAX) — safe to call on the RPC hot path.
+        """
+        was = bool(getattr(self, "_last_was_oom", False))
+        self._last_was_oom = False
+        return was
 
     def set_cost_mode_full(self) -> bool:
         """Switch from phase-1 cheap (target_fun=None) to phase-2 full

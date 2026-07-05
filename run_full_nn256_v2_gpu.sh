@@ -87,6 +87,20 @@ export ALPHAGRAD_PREVALIDATE_MEASURE=1
 export ALPHAGRAD_MEASURE_INPROC_LRU=${ALPHAGRAD_MEASURE_INPROC_LRU:-0}
 export ALPHAGRAD_MEASURE_DELETE_BUFFERS=${ALPHAGRAD_MEASURE_DELETE_BUFFERS:-1}
 export ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY=${ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY:-0}
+# >>> PRIMARY LEAK FIX: recycle+retry-on-OOM (revertible) <<<
+# Memory config PROVEN unable to bound the per-measure XLA compile leak; only
+# PROCESS TEARDOWN frees the XLA-internal executable retention. When a measure
+# OOMs, CpuApproxPool RECYCLES that measure actor (kill+respawn -> fresh
+# process -> memory freed) and RETRIES the measure ONCE on the fresh actor, so
+# the run keeps progressing with REAL measurements instead of hanging /
+# sentinel-storming at the ~71 GiB PJRT cap. Exactly one recycle+retry per
+# OOMd measure; a retry that also OOMs keeps the (neutral) sentinel. Set to 0
+# to revert to the old bounded-sentinel-on-OOM behaviour.
+export ALPHAGRAD_RECYCLE_RETRY_ON_OOM=${ALPHAGRAD_RECYCLE_RETRY_ON_OOM:-1}
+# Optional PROACTIVE recycle (A/B alternative): recycle a measure actor after
+# it has served N measures, BEFORE it reaches the OOM point. 0 = off
+# (reactive-on-OOM only, the shipped default).
+export ALPHAGRAD_PROACTIVE_RECYCLE_EVERY=${ALPHAGRAD_PROACTIVE_RECYCLE_EVERY:-0}
 
 # >>> Fix 2(a): QUANT dtype restriction (drop the TypePromotionError dtypes) <<<
 # graphax's mixed-precision shim (dtype_compute._NARROW_PROMOTION_REP) covers

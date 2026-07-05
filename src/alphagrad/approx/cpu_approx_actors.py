@@ -213,6 +213,12 @@ class CpuApproximationActor:
     def reset_caches(self) -> dict:
         return self._impl.reset_caches()
 
+    def pop_oom_flag(self) -> bool:
+        """Return-and-reset whether the most recent ``evaluate`` OOM-ed.
+        Ray-remote wrapper; see CpuApproximationServer.pop_oom_flag. Drives
+        CpuApproxPool's recycle+retry-on-OOM path."""
+        return bool(self._impl.pop_oom_flag())
+
     def actor_id(self) -> int:
         return self._actor_id
 
