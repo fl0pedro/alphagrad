@@ -125,6 +125,34 @@ def _quant_dtype_mask():
     return _QUANT_DTYPE_MASK_CACHE
 
 
+# When ALPHAGRAD_MICRO_PAIR_MASKS=1, the DIAG axis-pair heads enforce the two
+# block-diagonal legality rules (mirrored on the graphax execution side):
+#   (1) FACTOR-DIVIDES-BLOCK: a further DIAG on an already-diagonalised axis may
+#       only subdivide its CURRENT block size. The factor head already gathers
+#       primes of gcd(current_size_i, current_size_j) — and `features.size` is
+#       set to the block size `factor` after a DIAG — so any sampled factor is a
+#       divisor of the current block size by construction. This flag additionally
+#       ALLOWS re-diagonalisation of a coupled axis (default masks forbid it), so
+#       that rule (2) can force the partner and rule (1) further-subdivides.
+#   (2) AXIS-PAIR CONFLICT: an already-coupled axis i forces j == partner(i)
+#       (j-head fast-skipped, its log-prob/entropy gated out of the PPO ratio);
+#       a free axis i may only pair with another free axis.
+# Default (unset) keeps the legacy behaviour: coupled axes are excluded from DIAG
+# entirely and the j-head always contributes. Read lazily (see note above).
+_MICRO_PAIR_MASKS_CACHE = None
+
+
+def _micro_pair_masks() -> bool:
+    """ALPHAGRAD_MICRO_PAIR_MASKS=1 -> enforce the DIAG block-structure pair
+    masks (forced partner + free-only pairing + coupled re-diag). Lazy; cached."""
+    global _MICRO_PAIR_MASKS_CACHE
+    if _MICRO_PAIR_MASKS_CACHE is None:
+        _MICRO_PAIR_MASKS_CACHE = (
+            os.environ.get("ALPHAGRAD_MICRO_PAIR_MASKS", "0") == "1"
+        )
+    return _MICRO_PAIR_MASKS_CACHE
+
+
 # ---------------------------------------------------------------------------
 # Constants and shape primitives
 # ---------------------------------------------------------------------------
@@ -761,27 +789,84 @@ def _compute_op_legality(features: AxisTokenFeatures) -> jax.Array:
     return jnp.stack([diag_legal, compress_legal, quant_legal, end_legal])
 
 
+def _compute_partner(features: AxisTokenFeatures) -> jax.Array:
+    """Resolve, per axis, the index of its coupled DIAG partner (or -1).
+
+    Two axes are partners iff they share a non-negative ``group_id`` (the
+    id stamped by :func:`_features_after_diag` when they were block-
+    diagonalised together). For an axis ``i`` with ``group_id[i] >= 0``
+    the partner is the (unique) other valid axis ``k != i`` with
+    ``group_id[k] == group_id[i]``. Free / ungrouped / compressed axes get
+    partner ``-1``. Returned as ``(N,)`` int32.
+    """
+    gid = features.group_id
+    valid = features.valid_mask > 0.5
+    grouped = (gid >= 0) & valid                       # (N,)
+    same_group = gid[:, None] == gid[None, :]          # (N, N)
+    N = gid.shape[0]
+    not_self = ~jnp.eye(N, dtype=jnp.bool_)
+    # Candidate partners for i: valid, grouped, same gid, not i itself.
+    cand = same_group & not_self & grouped[None, :] & grouped[:, None]
+    # First matching column index per row; -1 if none.
+    idx = jnp.arange(N)
+    has_partner = jnp.any(cand, axis=-1)
+    first = jnp.argmax(cand.astype(jnp.int32), axis=-1)
+    return jnp.where(has_partner, first, -1).astype(jnp.int32)
+
+
 def _compute_axis_masks(
     features: AxisTokenFeatures,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Per-step axis legality: ``(i_mask_diag, i_mask_compress, j_mask_for_i_diag)``.
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Per-step axis legality.
+
+    Returns ``(i_mask_diag, i_mask_compress, j_mask_for_i_diag, i_coupled)``.
 
     ``j_mask_for_i_diag[i]`` is the legal ``j`` set when DIAG is chosen
-    with that particular ``i``; it's ``i_mask_diag`` with the ``i``-th
-    slot zeroed so the bipartite ``i != j`` constraint is enforced.
+    with that particular ``i``; it enforces ``i != j`` and — under
+    :func:`_micro_pair_masks` — the block-structure pairing rules
+    (rule #2): a coupled ``i`` forces ``j == partner(i)`` (its row is a
+    single one-hot), a free ``i`` may only pair with another free axis.
+    ``i_coupled[i]`` is 1.0 iff axis ``i`` already has a DIAG partner; the
+    head uses it to fast-skip (gate out) the j-head when ``i`` is coupled.
     """
     is_compressed = features.tag_bits[:, TAG_IS_COMPRESSED] > 0.5
     in_diag = features.tag_bits[:, TAG_IN_DIAG_GROUP] > 0.5
     valid = features.valid_mask > 0.5
 
-    diag_eligible = (valid & ~is_compressed & ~in_diag).astype(jnp.float32)
     compress_eligible = (valid & ~is_compressed).astype(jnp.float32)
-
-    N = diag_eligible.shape[0]
+    N = valid.shape[0]
     eye = jnp.eye(N, dtype=jnp.float32)
-    j_mask_for_i = diag_eligible[None, :] * (1.0 - eye)
 
-    return diag_eligible, compress_eligible, j_mask_for_i
+    if not _micro_pair_masks():
+        # Legacy behaviour: coupled axes are excluded from DIAG entirely and
+        # the j-head always contributes (i_coupled all-zero).
+        diag_eligible = (valid & ~is_compressed & ~in_diag).astype(jnp.float32)
+        j_mask_for_i = diag_eligible[None, :] * (1.0 - eye)
+        i_coupled = jnp.zeros(N, dtype=jnp.float32)
+        return diag_eligible, compress_eligible, j_mask_for_i, i_coupled
+
+    # --- Rule #2: coupled-vs-free pairing --------------------------------
+    partner = _compute_partner(features)               # (N,) int32, -1 = free
+    i_coupled = (partner >= 0).astype(jnp.float32)     # (N,)
+
+    free = (valid & ~is_compressed & ~in_diag)         # uncoupled, DIAG-able
+    free_f = free.astype(jnp.float32)
+
+    # i may DIAG if it is a free axis (needs another free partner) OR it is
+    # already coupled (re-diagonalise, forced partner + rule #1 subdivide).
+    diag_i_eligible = (free | (partner >= 0)).astype(jnp.float32)
+
+    # j-mask when i is FREE: only other free axes (never a coupled one).
+    j_free = free_f[None, :] * (1.0 - eye)             # (N, N)
+    # j-mask when i is COUPLED: the single forced partner (one-hot).
+    partner_clip = jnp.clip(partner, 0, N - 1)
+    partner_onehot = jnn.one_hot(partner_clip, N, dtype=jnp.float32)  # (N, N)
+    partner_onehot = partner_onehot * i_coupled[:, None]
+
+    j_mask_for_i = jnp.where(
+        i_coupled[:, None] > 0.5, partner_onehot, j_free,
+    )
+    return diag_i_eligible, compress_eligible, j_mask_for_i, i_coupled
 
 
 # ---------------------------------------------------------------------------
@@ -924,6 +1009,7 @@ class MicroActionHead(eqx.Module):
         j_mask_for_i_diag: jax.Array,   # (N, N) — valid `j` given `i`, DIAG only
         tables: FactorTables,           # precomputed gcd / prime tables
         key,
+        i_coupled: jax.Array | None = None,  # (N,) — 1.0 if axis is coupled
     ):
         """Sample one micro-action.
 
@@ -962,6 +1048,18 @@ class MicroActionHead(eqx.Module):
         j_context = summary + axis_tokens[i_idx]
         j_dist = self.axis_j_head(j_context, axis_tokens, j_mask)
         j_idx = distrax.Categorical(probs=j_dist).sample(seed=k_j)
+
+        # Rule #2 fast-skip: when the chosen `i` is already coupled, `j` is
+        # DETERMINISTIC — the forced partner. `j_mask` above is already the
+        # partner one-hot for a coupled `i`, so the sampled `j_idx` equals
+        # the partner regardless of the RNG; we still overwrite it with the
+        # explicit argmax so replay/telemetry is unambiguous. Its log-prob is
+        # gated out of the joint (see `log_prob_step`), so this head makes no
+        # PPO-ratio contribution for a coupled `i`.
+        if i_coupled is not None:
+            i_is_coupled = i_coupled[i_idx] > 0.5
+            forced_j = jnp.argmax(j_mask).astype(j_idx.dtype)
+            j_idx = jnp.where(i_is_coupled, forced_j, j_idx)
 
         # Per-pair prime-table gather. `axis_sizes` carries the current
         # logical sizes; `tables.gcd[N_i, N_j]` resolves the gcd at trace
@@ -1031,6 +1129,7 @@ class MicroActionHead(eqx.Module):
         i_mask_compress: jax.Array,
         j_mask_for_i_diag: jax.Array,
         tables: FactorTables,
+        i_coupled: jax.Array | None = None,  # (N,) — 1.0 if axis is coupled
     ):
         """Joint log-prob + entropy + arity for one sub-step, plus the
         per-component distributions used downstream for KL tracking.
@@ -1061,13 +1160,21 @@ class MicroActionHead(eqx.Module):
         ent_i = -jnp.sum(i_dist * jnp.log(i_dist + 1e-8))
         i_active = (is_diag | is_compress).astype(jnp.float32)
 
-        # j: emitted only for DIAG.
+        # j: emitted only for DIAG. Under rule #2 the j-head is FAST-SKIPPED
+        # (gated out of the joint log-prob AND entropy) when the chosen `i`
+        # is already coupled — its `j` is the deterministic forced partner,
+        # so it must not contribute to the PPO ratio, exactly like the other
+        # inactive heads. `j_active` drops to 0 in that case.
         j_mask = j_mask_for_i_diag[action.i]
         j_context = summary + axis_tokens[action.i]
         j_dist = self.axis_j_head(j_context, axis_tokens, j_mask)
         log_p_j = jnp.log(j_dist[action.j] + 1e-8)
         ent_j = -jnp.sum(j_dist * jnp.log(j_dist + 1e-8))
-        j_active = is_diag.astype(jnp.float32)
+        if i_coupled is not None:
+            j_free = 1.0 - (i_coupled[action.i] > 0.5).astype(jnp.float32)
+        else:
+            j_free = 1.0
+        j_active = is_diag.astype(jnp.float32) * j_free
 
         # Prime exponents: emitted only for DIAG. Tables gathered at the
         # stored (i, j); for non-DIAG actions the gather still runs but
@@ -1210,14 +1317,14 @@ class MicroActionPolicy(eqx.Module):
             jnp.array([0.0, 0.0, 0.0, 1.0], dtype=op_legal.dtype),
             op_legal,
         )
-        i_diag, i_compress, j_diag = _compute_axis_masks(features)
+        i_diag, i_compress, j_diag, i_coupled = _compute_axis_masks(features)
 
         (
             action, factor, op_d, i_d, j_d, exp_d, kind_d, quant_d,
         ) = self.head.sample_step(
             summary, axis_tokens, features.size,
             op_legal, i_diag, i_compress, j_diag,
-            tables, key,
+            tables, key, i_coupled=i_coupled,
         )
 
         # log_prob_step recomputes the dists internally but we discard
@@ -1227,6 +1334,7 @@ class MicroActionPolicy(eqx.Module):
         log_p, ent, arity, *_ = self.head.log_prob_step(
             action, summary, axis_tokens, features.size,
             op_legal, i_diag, i_compress, j_diag, tables,
+            i_coupled=i_coupled,
         )
         # Past-END contributions are zeroed so the joint log-prob /
         # entropy / arity reflect only the real sub-episode prefix.
@@ -1339,7 +1447,7 @@ class MicroActionPolicy(eqx.Module):
             jnp.array([0.0, 0.0, 0.0, 1.0], dtype=op_legal.dtype),
             op_legal,
         )
-        i_diag, i_compress, j_diag = _compute_axis_masks(features)
+        i_diag, i_compress, j_diag, i_coupled = _compute_axis_masks(features)
 
         (
             log_p, ent, arity,
@@ -1347,6 +1455,7 @@ class MicroActionPolicy(eqx.Module):
         ) = self.head.log_prob_step(
             action, summary, axis_tokens, features.size,
             op_legal, i_diag, i_compress, j_diag, tables,
+            i_coupled=i_coupled,
         )
         active = (1.0 - ended.astype(jnp.float32))
         log_p = log_p * active
