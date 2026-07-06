@@ -1325,15 +1325,25 @@ def _bkstep_eval_loss(W, x, y):
 
 
 def _bkstep_probe(approx_grad_fn, weights, argnums, n_steps=40, seeds=(0, 1),
-                  ep=None):
+                  ep=None, loss_fn=None, data_argnums=(0, 1)):
     """K-step closed-loop MNIST trainability signal in [0, 1], higher=better.
 
+    DYNAMIC over ANY differentiable example (NN, ViT, ConvNet, MoE, ...): the
+    weight args are whatever ``argnums`` names (2 for the 4-arg NN, 16 for the
+    18-arg ViT, ...), the data args are ``data_argnums`` (x=0, y=1 by the
+    ``get_args`` convention), and the eval loss is the example's OWN scalar-MSE
+    ``loss_fn`` (= ``config.target_fun``, ``mean(base_fn(*args))``) rather than a
+    hardcoded 2-layer-MLP forward. Falls back to the legacy hardcoded NN
+    ``_bkstep_eval_loss`` only when ``loss_fn`` is None (never on the real run).
+
     ``approx_grad_fn(x, y, *weights) -> (loss_value, approx_grads)`` is the
-    policy's compiled ``measure_grad`` fn. For each seed: re-init the 2-layer
-    MLP weights, run ``n_steps`` Adam updates on random MNIST minibatches using
-    the APPROX gradient, then read a CONTINUOUS trainability signal derived from
-    the true (exact-forward) eval MSE-loss trajectory. Returns the mean over
-    seeds. Only the weight args (``argnums``) are updated; x/y are fed per step.
+    policy's compiled ``measure_grad`` fn. For each seed: re-init the weights
+    (example's own init + per-seed noise, so bias/layernorm/glorot structure is
+    preserved for any model), run ``n_steps`` Adam updates on random MNIST
+    minibatches using the APPROX gradient, then read a CONTINUOUS trainability
+    signal derived from the true (exact-forward) eval MSE-loss trajectory.
+    Returns the mean over seeds. Only the weight args (``argnums``) are updated;
+    x/y are fed per step at ``data_argnums``.
 
     Continuous signal (edge-resolved, replaces the old thresholded argmax-acc so
     the cliff at cos≈0.02-0.25 has a usable gradient). Selected by
@@ -1361,14 +1371,48 @@ def _bkstep_probe(approx_grad_fn, weights, argnums, n_steps=40, seeds=(0, 1),
     ep = int(ep)
     signal = os.environ.get("ALPHAGRAD_BKSTEP_SIGNAL", "fracred").strip().lower()
     xtr, ytr, xte, yte = _bkstep_mnist()
-    # Weight leaves in argnums order = the approx-grad pytree order.
+    # Weight leaves in argnums order = the approx-grad pytree order (the
+    # example's OWN initialized weights, correct per-tensor for any model).
     w0 = [jnp.asarray(weights[a]) for a in argnums]
+    # Fixed (non-differentiated, non-data) args, kept at their original slot so
+    # the full positional call to ``loss_fn`` / ``approx_grad_fn`` matches the
+    # example signature regardless of arity (NN=4, ViT=18, ...).
+    _argset = set(int(a) for a in argnums)
+    _dataset_idx = set(int(a) for a in data_argnums)
     n_tr = int(xtr.shape[0])
     n_te = int(xte.shape[0])
-    # Per-episode eval subset (rotates with ``ep``).
+    # Generic eval loss: the example's OWN scalar-MSE ``loss_fn`` (config.
+    # target_fun) evaluated with the trained weights re-inserted at ``argnums``
+    # and the eval batch at ``data_argnums``. Falls back to the hardcoded NN
+    # forward only when no loss_fn was threaded through (legacy / tests).
+    def _assemble(Wtuple, xb, yb):
+        a = list(weights)
+        for a_i, w_i in zip(argnums, Wtuple):
+            a[int(a_i)] = w_i
+        di = sorted(_dataset_idx)
+        if len(di) >= 1:
+            a[di[0]] = xb
+        if len(di) >= 2:
+            a[di[1]] = yb
+        return a
+
+    # JIT the example loss once (single fixed eval batch shape -> one compile,
+    # reused every eval; avoids a re-trace per K-step call). Argnum-batched eval
+    # keeps x/y at the SAME shape the approx grad fn already saw (batch=B_eval)
+    # so no extra recompile of the vmapped ViT.
+    _jit_loss = jax.jit(loss_fn) if loss_fn is not None else None
+
+    def _eval_loss(Wtuple):
+        if _jit_loss is None:
+            return _bkstep_eval_loss(Wtuple, xte_eval, yte_eval)
+        return float(_jit_loss(*_assemble(Wtuple, xte_eval, yte_eval)))
+
+    # Per-episode eval subset (rotates with ``ep``). A single fixed-size batch
+    # (default 512) — big enough to be a stable trainability signal, small
+    # enough that the vmapped-ViT eval forward compiles/execs once and cheaply.
+    _n_eval = min(int(os.environ.get("ALPHAGRAD_BKSTEP_EVAL_BATCH", "512")), n_te)
     eval_rng = np.random.default_rng([ep, 0xE7A1])
-    n_eval = min(5000, n_te)
-    eval_idx = eval_rng.choice(n_te, size=n_eval, replace=False)
+    eval_idx = eval_rng.choice(n_te, size=_n_eval, replace=False)
     xte_eval, yte_eval = xte[eval_idx], yte[eval_idx]
     # How often to sample the eval-loss trajectory for AUC (init + every k).
     _rec_every = max(1, int(os.environ.get("ALPHAGRAD_BKSTEP_REC_EVERY", "4")))
@@ -1376,29 +1420,50 @@ def _bkstep_probe(approx_grad_fn, weights, argnums, n_steps=40, seeds=(0, 1),
     sigs = []
     for s in seeds:
         keys = jax.random.split(jax.random.PRNGKey(int(s)), len(w0))
+        # Generic per-seed re-init that reproduces the legacy NN probe EXACTLY
+        # while staying correct for any model:
+        #   * true weight MATRIX (2D, cols > 1)  -> glorot ``normal / sqrt(fan_in)``
+        #     — the OLD ``ndim==2`` rule; gives NN its low-loss trainable start
+        #     (validated: fracred≈0.66, matching the live run) instead of the
+        #     unit-scale example weights (fracred≈0.01).
+        #   * COLUMN vector (2D, cols == 1: ViT's (d,1) biases / cls / layernorm
+        #     gains) -> KEEP the example's OWN init (bias≈0, gain≈1, small cls),
+        #     which the naive ``glorot(fan_in=1)`` rule would blow up.
+        #   * 1D leaf (NN biases) -> zeros (the OLD rule).
+        # Per-seed variation: seed 0 = this canonical init, seed>0 adds Gaussian
+        # noise scaled to each leaf's RMS so the trainability signal averages
+        # over inits (variance reduction) without changing the seed-0 baseline.
+        _noise = 0.0 if int(s) == 0 else float(
+            os.environ.get("ALPHAGRAD_BKSTEP_INIT_NOISE", "0.1"))
         W = []
         for k, w in zip(keys, w0):
-            if w.ndim == 2:
-                fan_in = w.shape[1]
-                W.append(jax.random.normal(k, w.shape) / jnp.sqrt(fan_in))
+            kb, kn = jax.random.split(k)
+            if w.ndim == 2 and w.shape[1] > 1:
+                base = jax.random.normal(kb, w.shape) / jnp.sqrt(w.shape[1])
+            elif w.ndim == 2:
+                base = jnp.asarray(w)          # (·,1) column: keep model init
             else:
-                W.append(jnp.zeros_like(w))
+                base = jnp.zeros_like(w)        # 1D bias
+            if _noise > 0.0:
+                rms = jnp.sqrt(jnp.mean(base ** 2)) + 1e-3
+                base = base + _noise * rms * jax.random.normal(kn, w.shape)
+            W.append(base)
         W = tuple(W)
         opt = optax.adam(1e-3)
         ost = opt.init(W)
         rng = np.random.default_rng([ep, int(s)])
         # Init eval loss (before any update) — the trajectory baseline.
-        L0 = _bkstep_eval_loss(W, xte_eval, yte_eval)
+        L0 = _eval_loss(W)
         traj = [L0]  # eval loss recorded at init + every _rec_every steps
         for _t in range(n_steps):
             idx = rng.integers(0, n_tr, 16)
             xb, yb = xtr[idx], ytr[idx]
-            _val, ga = approx_grad_fn(xb, yb, *W)
+            _val, ga = approx_grad_fn(*_assemble(W, xb, yb))
             ga = _bkstep_align_grads(ga, W)
             upd, ost = opt.update(ga, ost, W)
             W = optax.apply_updates(W, upd)
             if (_t + 1) % _rec_every == 0:
-                traj.append(_bkstep_eval_loss(W, xte_eval, yte_eval))
+                traj.append(_eval_loss(W))
         Lf = traj[-1]
         L0s = max(L0, _eps)
         if signal == "auc":
@@ -2750,9 +2815,18 @@ def _callback(
             _bk_seeds = tuple(range(max(_bk_ns, 1)))
             if _dbg_t:
                 _tbk = _time.time()
+            # Dynamic over any example: the eval loss is the env's OWN
+            # scalar-MSE target (``config.target_fun`` == mean(base_fn(*args))
+            # under --measure-grad), and the data slots are every non-weight
+            # arg before ``argnums`` (x=0, y=1 by the get_args convention). No
+            # hardcoded NN forward -> works for ViT's 18-arg / argnums(2..18).
+            _data_argnums = tuple(
+                i for i in range(len(args)) if i not in set(config.argnums)
+            )
             bkstep_acc = _bkstep_probe(
                 compiled_approx, args, config.argnums,
                 n_steps=max(_bk_k, 1), seeds=_bk_seeds,
+                loss_fn=config.target_fun, data_argnums=_data_argnums,
             )
             if _dbg_t:
                 print(
