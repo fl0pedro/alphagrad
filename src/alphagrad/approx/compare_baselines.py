@@ -28,6 +28,8 @@ Usage:
 
 from __future__ import annotations
 
+import os
+
 import argparse
 import csv
 import json
@@ -211,8 +213,12 @@ def _build_replay_fn(
                     axis_sizes.extend(int(s) for s in out.aval.shape)
     except Exception:
         axis_sizes = []
+    # See downstream_train: graphax core-v2 replays narrow QUANT dtypes,
+    # so execute low-precision quant actions by default; set
+    # ALPHAGRAD_SKIP_LOW_PRECISION_QUANT=1 to restore the old drop.
+    _skip_lpq = os.getenv("ALPHAGRAD_SKIP_LOW_PRECISION_QUANT", "0") == "1"
     order, transforms = parse_recorded_seq(
-        seq, axis_sizes=axis_sizes, skip_low_precision_quant=True,
+        seq, axis_sizes=axis_sizes, skip_low_precision_quant=_skip_lpq,
     )
     fn = jacve(
         target_fn, order=order, transforms=transforms,

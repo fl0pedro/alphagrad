@@ -39,6 +39,8 @@ Usage:
 
 from __future__ import annotations
 
+import os
+
 import argparse
 import csv
 import time
@@ -208,10 +210,16 @@ def _build_gradient_fn(
                         axis_sizes.extend(int(s) for s in out.aval.shape)
         except Exception:
             axis_sizes = []
+        # graphax core-v2 dtype_compute (3611de1/1d67af0/3c9f5d3) replays
+        # narrow QUANT dtypes (float8/float4/sub-byte int) end-to-end with
+        # no TypePromotionError, so by default EXECUTE the RL's low-precision
+        # quant actions instead of dropping them. Set
+        # ALPHAGRAD_SKIP_LOW_PRECISION_QUANT=1 to restore the old drop.
+        _skip_lpq = os.getenv("ALPHAGRAD_SKIP_LOW_PRECISION_QUANT", "0") == "1"
         order, transforms = parse_recorded_seq(
             seq,
             axis_sizes=axis_sizes,
-            skip_low_precision_quant=True,
+            skip_low_precision_quant=_skip_lpq,
             jaxpr=replay_jaxpr,
         )
         dropped = sum(
