@@ -57,6 +57,10 @@ class _NoopResourceMonitor:
         return 0
 
     @property
+    def baseline(self) -> int:
+        return 0
+
+    @property
     def duration(self) -> float:
         return 0.0
 
@@ -137,6 +141,18 @@ class _SafeResourceMonitor:
             return 0.0
 
     @property
+    def baseline(self) -> int:
+        # Per-device resident bytes captured at __enter__ (summed). Needed for
+        # the absolute peak_memory reading (baseline + peak). 0 when the tracker
+        # failed / peak tracking was disabled.
+        if self._inner is None:
+            return 0
+        try:
+            return self._inner.baseline
+        except Exception:
+            return 0
+
+    @property
     def stats(self) -> dict:
         if self._inner is None:
             return {"time": 0.0, "memory": 0.0}
@@ -151,6 +167,43 @@ ResourceMonitor = (
     if os.environ.get("ALPHAGRAD_DISABLE_RESOURCE_MONITOR", "0") == "1"
     else _SafeResourceMonitor
 )
+
+
+def _rm_peak_bytes(monitor) -> float:
+    """Peak device-memory reading for the ``peak_memory`` reward channel.
+
+    ROOT CAUSE of the ``peak_memory≈0`` symptom: ``ResourceMonitor.peak`` (and
+    ``stats["memory"]``) is the high-water mark ABOVE the per-device baseline
+    captured at ``__enter__`` — i.e. only the memory *newly* allocated inside
+    the monitored region. On the GPU measure actors the compiled ``measure_grad``
+    executable and ALL its input/const/output buffers are already resident when
+    the monitor enters (compiled + warmed on a prior exec, cache-reloaded), so
+    the single re-execution allocates only a tiny transient workspace — the
+    real ~62 kB delta seen on the NN run, and 0 on ViT where every exec is a
+    shape-storm sentinel (no successful exec at all). The delta is genuine but
+    negligible vs the reward scale, so the channel reads ≈0 and ``peak=+0``.
+
+    Fix (flag-gated ``ALPHAGRAD_PEAK_MEMORY_ABSOLUTE=1``, default ON): report the
+    ABSOLUTE allocator high-water mark ``baseline + peak`` = the true
+    ``peak_bytes_in_use`` during the exec — the resident working set, which is
+    large, non-zero and order-discriminating. Set the flag to 0 to revert to the
+    legacy delta-above-baseline reading.
+    """
+    _absolute = os.environ.get("ALPHAGRAD_PEAK_MEMORY_ABSOLUTE", "1") == "1"
+    try:
+        delta = float(monitor.stats.get("memory", 0.0))
+    except Exception:
+        delta = 0.0
+    if not _absolute:
+        return delta
+    # Absolute peak = baseline (resident at __enter__) + delta (peak above it).
+    # ``baseline`` may be missing on the noop/failed monitor or a CPU device;
+    # fall back to the delta so the channel is never worse than before.
+    try:
+        base = float(getattr(monitor, "baseline", 0.0) or 0.0)
+    except Exception:
+        base = 0.0
+    return base + delta
 
 import math as _math
 
@@ -2577,7 +2630,7 @@ def _callback(
                     with ResourceMonitor(devices=unique_devices) as _wmon:
                         _wout = compiled_approx(*eval_args_i)
                     jax.block_until_ready(_wout)
-                    _peak_captured = float(_wmon.stats.get("memory", 0.0))
+                    _peak_captured = _rm_peak_bytes(_wmon)
                 else:
                     jax.block_until_ready(compiled_approx(*eval_args_i))
                 if _slow_cutoff > 0.0 and (
@@ -2614,7 +2667,7 @@ def _callback(
                     if r == 0:
                         peak_mem_samples.append(
                             _peak_captured if _peak_captured is not None
-                            else float(_tmon.stats.get("memory", 0.0))
+                            else _rm_peak_bytes(_tmon)
                         )
                 else:
                     # perf_counter inner loop + a separate ResourceMonitor pass for
@@ -2633,9 +2686,7 @@ def _callback(
                             with ResourceMonitor(devices=unique_devices) as monitor:
                                 _mout = compiled_approx(*eval_args_i)
                             jax.block_until_ready(_mout)
-                            peak_mem_samples.append(
-                                float(monitor.stats.get("memory", 0.0))
-                            )
+                            peak_mem_samples.append(_rm_peak_bytes(monitor))
                 latency_samples.append(_lat_ns)
                 _exec_wall = _measure_time.time() - _exec_wall0
                 # Per-EXEC time for the cutoff (the inner loop runs _inner execs;
