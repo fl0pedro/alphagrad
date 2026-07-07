@@ -1601,11 +1601,17 @@ class PPORayWorker:
         # run sharded without the trainer having to think about it.
         self.agent = self._replicate(self.agent)
 
-        schedule = optax.cosine_decay_schedule(
-            float(self.args.lr),
-            int(self.args.episodes) * self.minibatches,
-            float(getattr(self.args, "lr_decay_min_mult", 0.1)),
-        )
+        _lr = float(self.args.lr)
+        _decay = int(self.args.episodes) * self.minibatches
+        _min_mult = float(getattr(self.args, "lr_decay_min_mult", 0.1))
+        _warmup = int(os.environ.get("ALPHAGRAD_LR_WARMUP_STEPS", "0") or "0")
+        if _warmup > 0:
+            schedule = optax.warmup_cosine_decay_schedule(
+                init_value=0.0, peak_value=_lr, warmup_steps=_warmup,
+                decay_steps=max(_decay, _warmup + 1), end_value=_lr * _min_mult,
+            )
+        else:
+            schedule = optax.cosine_decay_schedule(_lr, _decay, _min_mult)
         self.optimizer = optax.chain(
             optax.clip_by_global_norm(float(self.args.max_grad_norm)),
             optax.adamw(schedule, eps=float(self.args.adam_eps)),
