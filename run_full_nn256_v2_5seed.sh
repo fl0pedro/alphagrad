@@ -310,9 +310,25 @@ EXEC_ON_GPU_FLAG=$([ "${EXEC_ON_GPU:-1}" = 1 ] && echo --exec-on-gpu)
 SEED_VERTICES_FLAG=$([ "${SEED_VERTICES:-0}" = 1 ] && [ "$MEASURE_GRAD" = 1 ] && echo --seed-vertices)
 REWARDS_FLAG=$([ "${ALPHAGRAD_REWARD_ALL_CHANNELS:-0}" = 1 ] && echo all || echo "cmp mem acc")
 
+# >>> P3O (Fakoor et al. 2020) off-policy option (bridge-cse) <<<
+# P3O=1 enables the combined on-policy + off-policy(replay) PG + KL objective
+# (--p3o). Requires a replay buffer (REPLAY_BUFFER_SIZE>0). P3O=0 (default) =
+# on-policy PPO (unchanged). V-trace clips reuse --vtrace-rho-bar/c-bar; the KL
+# coefficient lambda = P3O_KL_COEF.
+P3O="${P3O:-0}"
+REPLAY_BUFFER_SIZE="${REPLAY_BUFFER_SIZE:-0}"
+REPLAY_SAMPLE_TRAJS="${REPLAY_SAMPLE_TRAJS:-0}"
+VTRACE_RHO_BAR="${VTRACE_RHO_BAR:-1.0}"
+VTRACE_C_BAR="${VTRACE_C_BAR:-1.0}"
+P3O_KL_COEF="${P3O_KL_COEF:-1.0}"
+P3O_FLAG=$([ "$P3O" = 1 ] && echo "--p3o")
+REPLAY_FLAGS=""
+[ "$REPLAY_BUFFER_SIZE" -gt 0 ] 2>/dev/null && REPLAY_FLAGS="--replay-buffer-size $REPLAY_BUFFER_SIZE --replay-sample-trajs $REPLAY_SAMPLE_TRAJS --vtrace-rho-bar $VTRACE_RHO_BAR --vtrace-c-bar $VTRACE_C_BAR --p3o-kl-coef $P3O_KL_COEF"
+
 uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --example VmappedNeuralNetwork --dataset mnist \
   --rewards $REWARDS_FLAG --cmp-type $CMP_TYPE --mem-type peak_memory \
+  $P3O_FLAG $REPLAY_FLAGS \
   $MEASURE_GRAD_FLAG $EXEC_ON_GPU_FLAG --measure-latency --latency-inner-reps 50 \
   --lambda-cmp $LAMBDA_CMP --lambda-mem $LAMBDA_MEM --lambda-acc $LAMBDA_ACC --lambda-frob 0.0 \
   --lambda-cossim-guide $LAMBDA_COSSIM_GUIDE \
