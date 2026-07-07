@@ -205,6 +205,55 @@ def _rm_peak_bytes(monitor) -> float:
         base = 0.0
     return base + delta
 
+
+def _device_clear_peaks(devices) -> bool:
+    """Reset the XLA allocator peak high-water on every device that supports it.
+
+    Returns True iff EVERY device exposes ``clear_memory_stats`` (so the caller
+    can trust a subsequent ``peak_bytes_in_use`` read as an EXACT per-measure
+    absolute peak). GPU/TPU devices under jaxlib >=0.10 expose it; CPU devices
+    do not — there we return False so the caller falls back to the analytic
+    ``xla_peak_memory`` estimate. Confirmed on cluster (jaxlib
+    0.10.1.dev0+selfbuilt): ``clear_memory_stats()`` zeroes both
+    ``peak_bytes_in_use`` and ``bytes_in_use``.
+    """
+    _all = True
+    for _d in devices or ():
+        _fn = getattr(_d, "clear_memory_stats", None)
+        if _fn is None:
+            _all = False
+            continue
+        try:
+            _fn()
+        except Exception:
+            _all = False
+    return _all
+
+
+def _device_peak_in_use(devices) -> float:
+    """Sum the XLA allocator's synchronous ``peak_bytes_in_use`` over ``devices``.
+
+    Unlike the ``ResourceMonitor`` reading (a ~1ms-polled time-sampled
+    high-water mark that MISSES sub-millisecond executions once the compiled
+    ``measure_grad`` executable is cached on disk), ``peak_bytes_in_use`` is
+    updated by the BFC allocator on EVERY allocation, so it captures the true
+    working-set peak of even a fast cached exec. Paired with
+    ``_device_clear_peaks`` (reset before the exec loop) this yields the EXACT
+    absolute per-measure peak — baseline INCLUDED — with no analytic estimate.
+    Returns 0.0 cleanly on CPU/noop devices that don't expose ``memory_stats``.
+    """
+    total = 0.0
+    for _d in devices or ():
+        try:
+            _st = _d.memory_stats() or {}
+        except Exception:
+            continue
+        try:
+            total += float(_st.get("peak_bytes_in_use", 0) or 0)
+        except Exception:
+            continue
+    return total
+
 import math as _math
 
 # ---------------------------------------------------------------------------
@@ -2599,6 +2648,55 @@ def _callback(
         and not _bypass_rm
     )
     _budget_hit = False
+    # ------------------------------------------------------------------
+    # peak_memory SYNC fix (ALPHAGRAD_PEAK_MEMORY_SYNC=1, default ON).
+    #
+    # ROOT CAUSE of the "peak_memory reads real for ep0-3 then collapses to
+    # ~0 from ep4" symptom: the jax_memory_monitor ``ResourceMonitor`` (backing
+    # ``_rm_peak_bytes``) reports peak as bytes ABOVE the per-device baseline
+    # captured at ``__enter__`` (its own docstring:  "peak is reported as bytes
+    # above the per-device baseline"). Episodes 0-3 recompile the measure_grad
+    # executable (fresh buffers allocated above baseline, so the delta is
+    # large); from ep4 the executable is served from the on-disk JAX cache and
+    # its input/const/output buffers are already resident/donated, so a cached
+    # exec allocates almost nothing NEW above baseline -> delta -> ~0 ->
+    # peak_memory collapses (the PopArt EMA then decays chasing it). It is a
+    # DELTA-vs-ABSOLUTE bug, not a time-sampling bug: the tracker already uses
+    # the exact allocator (clear_memory_stats + peak_bytes_in_use), it just
+    # subtracts the baseline.
+    #
+    # FIX (exact, no analytic estimate): reset the allocator peak with
+    # ``device.clear_memory_stats()`` immediately BEFORE the measured exec, run
+    # the loop, then read the ABSOLUTE ``peak_bytes_in_use`` AFTER (summed over
+    # the measure devices). That is the exact absolute peak DURING the exec —
+    # baseline INCLUDED — and is allocator-latched (not time-sampled), so it is
+    # robust to sub-ms cached execs. Confirmed on cluster (jaxlib 0.10.x,
+    # clear_memory_stats present on GPU): twice-run same order both read the
+    # SAME non-zero exact peak; two orders discriminate. The analytic
+    # ``xla_peak_memory`` (``_det_peak``) is kept ONLY as a last-resort fallback
+    # for devices lacking clear_memory_stats (e.g. CPU) or if the exact read
+    # comes back 0. Set ALPHAGRAD_PEAK_MEMORY_SYNC=0 to revert to the legacy
+    # baseline-delta ResourceMonitor reading.
+    _peak_sync = os.environ.get("ALPHAGRAD_PEAK_MEMORY_SYNC", "1") == "1"
+    # Whether every measure device supports the exact reset (probe once).
+    _peak_sync_exact = _peak_sync and _device_clear_peaks(unique_devices)
+    _peak_sync_floor = float(_det_peak) if _det_peak is not None else 0.0
+
+    def _sync_peak_reset() -> None:
+        """Zero the allocator peak high-water right before a measured exec."""
+        if _peak_sync_exact:
+            _device_clear_peaks(unique_devices)
+
+    def _sync_peak_read() -> float:
+        """Exact absolute per-exec peak (clear_memory_stats + peak_bytes_in_use).
+
+        Falls back to the analytic ``xla_peak_memory`` estimate only when the
+        exact device read is unavailable (CPU / no clear_memory_stats) or
+        returns 0 — so the channel is EXACT on GPU and never spuriously zero.
+        """
+        _exact = _device_peak_in_use(unique_devices) if _peak_sync_exact else 0.0
+        return _exact if _exact > 0.0 else _peak_sync_floor
+
     # Fix 2(b): guard the whole exec loop against a GPU OOM / RESOURCE_
     # EXHAUSTED (a too-big COMPRESS densification exceeding the mem-gate's
     # headroom). Convert it to a RuntimeError so the pool's existing
@@ -2626,7 +2724,17 @@ def _callback(
             _peak_captured = None
             for _w in range(_warmup):
                 _ws = _measure_time.perf_counter()
-                if (not _bypass_rm) and _w == _warmup - 1:
+                if _peak_sync and _w == _warmup - 1:
+                    # Exact sync peak: reset the allocator peak, run one full
+                    # exec, read the absolute peak_bytes_in_use after its barrier
+                    # (baseline-inclusive, allocator-latched -> robust to sub-ms
+                    # cached execs; identical working set to every other exec of
+                    # this order so a single exec's peak is the per-exec peak).
+                    _sync_peak_reset()
+                    _wout = compiled_approx(*eval_args_i)
+                    jax.block_until_ready(_wout)
+                    _peak_captured = _sync_peak_read()
+                elif (not _bypass_rm) and _w == _warmup - 1:
                     with ResourceMonitor(devices=unique_devices) as _wmon:
                         _wout = compiled_approx(*eval_args_i)
                     jax.block_until_ready(_wout)
@@ -2656,7 +2764,19 @@ def _callback(
                     # context (duration = true device time, validated ≈ perf_counter)
                     # and reads peak memory from the SAME pass on the first rep — one
                     # execution serves both the latency and peak-memory channels.
-                    _want_peak = (r == 0 and _peak_captured is None)
+                    # With sync-peak on we don't need the RM to sample the peak
+                    # (the allocator stat is read after the barrier below); still
+                    # use RM for its timer duration.
+                    _want_peak = (
+                        (not _peak_sync) and r == 0 and _peak_captured is None
+                    )
+                    # Exact sync peak: reset the allocator peak right before the
+                    # timed inner loop; read the absolute peak_bytes_in_use after
+                    # its closing barrier below (the inner execs share one working
+                    # set, so their peak == the per-exec peak). RM peak sampling
+                    # is disabled (peak=_want_peak=False) — RM is timer-only here.
+                    if _peak_sync and r == 0 and _peak_captured is None:
+                        _sync_peak_reset()
                     with ResourceMonitor(
                         devices=unique_devices, time=True, peak=_want_peak,
                     ) as _tmon:
@@ -2665,13 +2785,20 @@ def _callback(
                         jax.block_until_ready(out_approx)
                     _lat_ns = _tmon.duration / _inner * 1e9
                     if r == 0:
-                        peak_mem_samples.append(
-                            _peak_captured if _peak_captured is not None
-                            else _rm_peak_bytes(_tmon)
-                        )
+                        if _peak_captured is not None:
+                            peak_mem_samples.append(_peak_captured)
+                        elif _peak_sync:
+                            peak_mem_samples.append(_sync_peak_read())
+                        else:
+                            peak_mem_samples.append(_rm_peak_bytes(_tmon))
                 else:
                     # perf_counter inner loop + a separate ResourceMonitor pass for
                     # peak memory (once per data point, first rep).
+                    # Exact sync peak: reset the allocator peak right before the
+                    # inner loop so the post-barrier read below is this order's
+                    # exact absolute peak (no extra exec needed).
+                    if _peak_sync and r == 0 and _peak_captured is None:
+                        _sync_peak_reset()
                     _t0 = _measure_time.perf_counter()
                     for _ in range(_inner):
                         out_approx = compiled_approx(*eval_args_i)
@@ -2680,6 +2807,11 @@ def _callback(
                     if r == 0:
                         if _peak_captured is not None:
                             peak_mem_samples.append(_peak_captured)
+                        elif _peak_sync:
+                            # Exact absolute peak read after the inner loop's
+                            # barrier above — allocator-latched, catches sub-ms
+                            # cached execs; no extra exec needed.
+                            peak_mem_samples.append(_sync_peak_read())
                         elif _bypass_rm:
                             peak_mem_samples.append(0.0)
                         else:
