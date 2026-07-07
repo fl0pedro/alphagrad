@@ -158,28 +158,52 @@ def build_reward_weights(args) -> np.ndarray:
 
     # EXPLICIT CHANNEL-LIST selector (bridge-cse, USER-DIRECTED). When
     # ALPHAGRAD_REWARD_CHANNELS names a comma-separated set of channel keys, put
-    # weight = ALPHAGRAD_ALL_CHANNEL_W (default 1.0) on EXACTLY those channels
-    # and 0 on all others — a CURATED subset (e.g. the 5-channel
-    # flops,xla_peak_memory,peak_memory,latency_ns,bkstep_acc set) instead of
-    # the noisy all-10. Same sign machinery as the all-channel branch: the env
-    # reward vector emits costs NEGATED and bkstep_acc POSITIVE, so a single
-    # POSITIVE weight per named channel is correct (reward low-cost + high
-    # bkstep). PopArt normalises each named channel. Every name is validated
-    # against REWARD_INDEX (env.py REWARD_NAMES) so a typo errors CLEARLY.
+    # a non-zero weight on EXACTLY those channels and 0 on all others — a CURATED
+    # subset (e.g. the 5-channel flops,xla_peak_memory,peak_memory,latency_ns,
+    # bkstep_acc set) instead of the noisy all-10.
+    #
+    # PER-CHANNEL WEIGHTS: each entry may be either ``name`` (weight defaults to
+    # ALPHAGRAD_ALL_CHANNEL_W, default 1.0) OR ``name:weight`` (explicit float),
+    # so a quality-dominant scheme is expressible directly, e.g.
+    #   flops:0.06,latency_ns:0.06,xla_peak_memory:0.06,peak_memory:0.06,bkstep_acc:1.0
+    # (bkstep_acc dominates; cost channels a minor nudge).
+    #
+    # Same sign machinery as the all-channel branch: the env reward vector emits
+    # costs NEGATED and bkstep_acc POSITIVE, so a single POSITIVE weight per
+    # named channel is correct (reward low-cost + high bkstep). PopArt normalises
+    # each named channel. Every name is validated against REWARD_INDEX (env.py
+    # REWARD_NAMES) so a typo errors CLEARLY; a non-float weight also errors.
     # PRECEDENCE: REWARD_CHANNELS (explicit list) > REWARD_ALL_CHANNELS=1 >
     # the legacy cmp/mem/acc slots.
     _rc_raw = str(_osac.environ.get("ALPHAGRAD_REWARD_CHANNELS", "") or "").strip()
     if _rc_raw:
-        _w_named = float(_osac.environ.get("ALPHAGRAD_ALL_CHANNEL_W", "1.0") or 1.0)
-        _names_req = [n.strip() for n in _rc_raw.split(",") if n.strip()]
-        _bad = [n for n in _names_req if n not in REWARD_INDEX]
+        _w_default = float(_osac.environ.get("ALPHAGRAD_ALL_CHANNEL_W", "1.0") or 1.0)
+        _pairs: list[tuple[str, float]] = []
+        for _entry in _rc_raw.split(","):
+            _entry = _entry.strip()
+            if not _entry:
+                continue
+            if ":" in _entry:
+                _nm, _wraw = _entry.split(":", 1)
+                _nm = _nm.strip()
+                try:
+                    _wv = float(_wraw.strip())
+                except ValueError:
+                    raise ValueError(
+                        f"ALPHAGRAD_REWARD_CHANNELS entry {_entry!r} has a "
+                        f"non-float weight {_wraw!r}"
+                    )
+            else:
+                _nm, _wv = _entry, _w_default
+            _pairs.append((_nm, _wv))
+        _bad = [nm for nm, _ in _pairs if nm not in REWARD_INDEX]
         if _bad:
             raise ValueError(
                 f"ALPHAGRAD_REWARD_CHANNELS names unknown channel(s) {_bad}; "
                 f"valid keys: {sorted(REWARD_INDEX)}"
             )
-        for _nm in _names_req:
-            w[REWARD_INDEX[_nm]] = _w_named
+        for _nm, _wv in _pairs:
+            w[REWARD_INDEX[_nm]] = _wv
         # Honour Lagrangian-constraint zeroing even in explicit-list mode.
         _asc = str(getattr(args, "reward_as_constraints", "") or "")
         if _asc:
