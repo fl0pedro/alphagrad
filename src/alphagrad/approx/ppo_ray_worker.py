@@ -4719,16 +4719,18 @@ class PPORayWorker:
         _arrays = eqx.filter(self.agent, eqx.is_inexact_array)
         return jax.tree_util.tree_map(lambda x: np.asarray(x), _arrays)
 
-    def set_weights(self, weights_np) -> int:
+    def set_weights(self, weights_np, learner_step: int = 0) -> int:
         """Overwrite ``self.agent``'s array leaves from a host-numpy pytree
         (mirrors ``get_weights``). Re-replicates to the actor's sharding so
-        the JIT'd act-step sees device arrays. Returns the new local policy
-        version (monotonic; the driver stamps trajectories with it so the
-        learner can log actor↔learner staleness)."""
+        the JIT'd act-step sees device arrays. ``learner_step`` is the LEARNER's
+        update count at broadcast time — stored so collect_traj can stamp it and
+        the learner can compute a MEANINGFUL actor↔learner staleness (learner
+        updates elapsed since this policy was synced). Returns the local version."""
         _w = jax.tree_util.tree_map(lambda x: jnp.asarray(x), weights_np)
         self.agent = eqx.combine(_w, self.agent)
         self.agent = self._replicate(self.agent)
         self._policy_version = int(getattr(self, "_policy_version", 0)) + 1
+        self._synced_learner_step = int(learner_step)
         return self._policy_version
 
     def _collect_rollout_buffers(self, key):
@@ -4867,17 +4869,21 @@ class PPORayWorker:
         _wsum = (bufs["reward_vec"] * self.reward_weights_np).sum(axis=(0, 2))
         telemetry = {
             "policy_version": int(getattr(self, "_policy_version", 0)),
+            # The learner update-count this policy was last synced to — the
+            # learner computes staleness = (its current update count) - this.
+            "synced_learner_step": int(getattr(self, "_synced_learner_step", 0)),
             "mean_return": float(np.mean(_wsum)),
             "sentinel_frac": float(np.mean(bufs["sentinel"])),
         }
         return traj_np, telemetry
 
-    def train_on_trajs(self, trajs, sampler_versions, n_updates: int = 1):
+    def train_on_trajs(self, trajs, synced_learner_steps, n_updates: int = 1):
         """LEARNER entry: ingest sampler trajectories into the replay buffer,
-        run ``n_updates`` P3O gradient steps sampling from it, and return
-        (stats, learner_policy_version). ``sampler_versions`` are the policy
-        versions the trajectories were collected under — logged as the
-        actor↔learner STALENESS (learner_version - sampler_version)."""
+        run ``n_updates`` P3O gradient steps sampling from it, and return the
+        stats. ``synced_learner_steps`` = the learner update-count each traj's
+        collecting policy was last synced to; STALENESS = (learner's CURRENT
+        update count) - that, i.e. how many learner updates the sampler's policy
+        lags behind (P3O's IS ratio + KL keep this correctable)."""
         if not hasattr(self, "_p3o_update_step"):
             self._p3o_update_step = self._make_p3o_update_step()
         agent = self.agent
@@ -4895,8 +4901,8 @@ class PPORayWorker:
         self._replay_buf_size = int(self.replay_buffer.size)
         key = jrand.PRNGKey(
             int(getattr(self, "_async_step", 0)) * 100003 + 7)
-        _lv = int(getattr(self, "_policy_version", 0))
-        _stale = [max(_lv - int(v), 0) for v in sampler_versions] or [0]
+        _lv = int(getattr(self, "_async_step", 0))   # learner's update count
+        _stale = [max(_lv - int(s), 0) for s in synced_learner_steps] or [0]
         _ent = jnp.asarray(self.entropy_coef, dtype=jnp.float32)
         last = {}
         _nan = 0

@@ -74,15 +74,15 @@ class PPOActor:
     def get_weights(self):
         return self._impl.get_weights()
 
-    def set_weights(self, weights_np) -> int:
-        return int(self._impl.set_weights(weights_np))
+    def set_weights(self, weights_np, learner_step: int = 0) -> int:
+        return int(self._impl.set_weights(weights_np, int(learner_step)))
 
     def collect_traj(self, rng_seed: int):
         return self._impl.collect_traj(int(rng_seed))
 
-    def train_on_trajs(self, trajs, sampler_versions, n_updates: int = 1):
+    def train_on_trajs(self, trajs, synced_learner_steps, n_updates: int = 1):
         return self._impl.train_on_trajs(
-            list(trajs), list(sampler_versions), int(n_updates),
+            list(trajs), list(synced_learner_steps), int(n_updates),
         )
 
     def reward_vec_means(self, rng_seed: int, num_rollouts: int) -> dict:

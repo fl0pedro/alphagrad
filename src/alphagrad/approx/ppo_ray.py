@@ -466,9 +466,10 @@ def _run(args) -> int:
             starting_actor_id=int(args.num_cpu_workers) + 100,
         ))
         ray.get(sampler.ready.remote())
-        # Initial weight sync learner->sampler so they start aligned.
+        # Initial weight sync learner->sampler so they start aligned (learner
+        # update-count 0 at this point).
         _wref = ray.put(ray.get(actor.get_weights.remote()))
-        ray.get(sampler.set_weights.remote(_wref))
+        ray.get(sampler.set_weights.remote(_wref, 0))
         _sync_every = max(int(getattr(args, "async_weight_sync_every", 1)), 1)
         _upd_per = max(int(getattr(args, "async_updates_per_step", 1)), 1)
         _warmup = max(int(getattr(args, "async_warmup_trajs", 2)), 1)
@@ -485,7 +486,8 @@ def _run(args) -> int:
         # ---- WARM-UP: fill the buffer before the learner starts.
         for _ in range(_warmup):
             _traj, _tel = ray.get(_collect)
-            _warm_trajs.append(_traj); _warm_vers.append(_tel["policy_version"])
+            _warm_trajs.append(_traj)
+            _warm_vers.append(_tel.get("synced_learner_step", 0))
             _n_measures += 1
             _collect = sampler.collect_traj.remote(_seed); _seed += 1
         _stats = ray.get(actor.train_on_trajs.remote(
@@ -507,12 +509,15 @@ def _run(args) -> int:
             _n_measures += 1
             _collect = sampler.collect_traj.remote(_seed); _seed += 1
             _stats = ray.get(actor.train_on_trajs.remote(
-                [_traj], [_tel["policy_version"]], _upd_per))
+                [_traj], [_tel.get("synced_learner_step", 0)], _upd_per))
             _n_updates += _upd_per
             _step += 1
             if _step % _sync_every == 0:
                 _wref = ray.put(ray.get(actor.get_weights.remote()))
-                ray.get(sampler.set_weights.remote(_wref))
+                # Stamp the sampler's synced policy with the learner's CURRENT
+                # update count so staleness = (learner updates) - (this) is real.
+                ray.get(sampler.set_weights.remote(
+                    _wref, int(_stats.get("async/updates_done", _n_updates))))
             if _step % 5 == 0 or _step == 1:
                 _el = time.time() - _t0
                 print(
