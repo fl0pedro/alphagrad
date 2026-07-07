@@ -107,6 +107,18 @@ def _run(args) -> int:
     from alphagrad.approx.cpu_approx_actors import CpuApproximationActor
 
     args_dict = vars(args)
+    # ASYNC PIPELINE GPU split (bridge-cse): the learner + sampler co-reside on
+    # GPU0 (light policy inference), the 3 measure actors keep GPU1-3. With
+    # actor_num_gpus=1 the 4 GPUs are fully claimed and the sampler can't be
+    # scheduled — so under --async-pipeline (no placement group) halve the
+    # learner's GPU reservation to 0.5, leaving 0.5 of GPU0 for the sampler.
+    if (getattr(args, "async_pipeline", False)
+            and not getattr(args, "use_placement_group", False)
+            and float(getattr(args, "actor_num_gpus", 0) or 0) >= 1.0):
+        args.actor_num_gpus = float(
+            os.environ.get("ALPHAGRAD_ASYNC_LEARNER_GPUS", "0.5"))
+        print(f"[async] learner GPU share set to {args.actor_num_gpus} "
+              f"(co-resident with sampler on GPU0)", flush=True)
     # Thread ALPHAGRAD_* policy switches (e.g. ALPHAGRAD_QUANT_ALLOWED,
     # ALPHAGRAD_SUBSTEP_NO_END) to the PPOActor explicitly via args_dict, which
     # Ray serializes reliably. runtime_env env_vars do NOT reliably reach the
@@ -412,6 +424,131 @@ def _run(args) -> int:
             pareto.dump_all_candidates(pareto_all_path, extra=_arch_extra)
         except Exception as _exc:
             tqdm.write(f"  [ppo_ray] pareto dump failed: {_exc}")
+
+    # ==================================================================
+    # ASYNC PIPELINE (Stage 1, bridge-cse). measure(ep N+1) overlaps
+    # learn(ep N): a SAMPLER PPOActor collects rollouts + measures into the
+    # shared replay buffer while the LEARNER runs P3O updates concurrently,
+    # syncing weights every N steps. Gated on --async-pipeline (+ --p3o +
+    # replay). Returns after its own loop; the sync loop below is skipped.
+    # ==================================================================
+    if getattr(args, "async_pipeline", False):
+        if not getattr(args, "p3o", False) or int(
+                getattr(args, "replay_buffer_size", 0) or 0) <= 0:
+            raise SystemExit(
+                "--async-pipeline requires --p3o and --replay-buffer-size>0")
+        _wandb_on = args.wandb != "disabled"
+        # Spawn a SAMPLER PPOActor sharing the SAME measure pool + args. The
+        # learner (GPU0) + the 3 measure actors (GPU1-3) already claim all 4
+        # GPUs, so the sampler reserves num_gpus=0 by default (Ray won't block
+        # on a non-existent free GPU) — it co-resides on GPU0 with the learner
+        # and JAX sees the device via inherited CUDA_VISIBLE_DEVICES. Policy
+        # inference is light; the heavy MEASURE work is on GPU1-3 (the shared
+        # pool). Override with ALPHAGRAD_ASYNC_SAMPLER_GPUS (e.g. 0.5) only if
+        # you've freed GPU fraction (fewer/fractional measure actors).
+        _samp_kwargs = dict(actor_kwargs)
+        _samp_kwargs.pop("scheduling_strategy", None)
+        # Sampler gets the other 0.5 of GPU0 (the learner was halved above).
+        _samp_gpus = float(os.environ.get("ALPHAGRAD_ASYNC_SAMPLER_GPUS", "0.5"))
+        if _samp_gpus > 0:
+            _samp_kwargs["num_gpus"] = _samp_gpus
+        else:
+            _samp_kwargs.pop("num_gpus", None)
+        sampler = PPOActor.options(**_samp_kwargs).remote(
+            args_dict, int(args.seed) + 101)
+        ray.get(sampler.init_server.remote(
+            cpu_workers,
+            callback_timeout_s=float(args.cpu_callback_timeout),
+            initial_timeout_s=float(args.cpu_callback_initial_timeout),
+            warm_after=int(args.cpu_callback_warm_after),
+            recycle_every=int(args.cpu_worker_recycle_every),
+            cpu_actor_options=cpu_actor_options,
+            starting_actor_id=int(args.num_cpu_workers) + 100,
+        ))
+        ray.get(sampler.ready.remote())
+        # Initial weight sync learner->sampler so they start aligned.
+        _wref = ray.put(ray.get(actor.get_weights.remote()))
+        ray.get(sampler.set_weights.remote(_wref))
+        _sync_every = max(int(getattr(args, "async_weight_sync_every", 1)), 1)
+        _upd_per = max(int(getattr(args, "async_updates_per_step", 1)), 1)
+        _warmup = max(int(getattr(args, "async_warmup_trajs", 2)), 1)
+        _t0 = time.time()
+        _seed = int(args.seed)
+        _collect = sampler.collect_traj.remote(_seed); _seed += 1
+        _n_measures = 0
+        _n_updates = 0
+        _warm_trajs, _warm_vers = [], []
+        print(
+            f"[async] pipeline start: sampler_gpus={_samp_kwargs.get('num_gpus','-')} "
+            f"warmup={_warmup} upd/step={_upd_per} sync_every={_sync_every}",
+            flush=True)
+        # ---- WARM-UP: fill the buffer before the learner starts.
+        for _ in range(_warmup):
+            _traj, _tel = ray.get(_collect)
+            _warm_trajs.append(_traj); _warm_vers.append(_tel["policy_version"])
+            _n_measures += 1
+            _collect = sampler.collect_traj.remote(_seed); _seed += 1
+        _stats = ray.get(actor.train_on_trajs.remote(
+            _warm_trajs, _warm_vers, _upd_per))
+        _n_updates += _upd_per
+        print(f"[async] warmup done: {_n_measures} trajs measured, "
+              f"{_n_updates} learner updates. Entering pipeline.", flush=True)
+        # ---- MAIN PIPELINE: collect(N+1) ∥ train(N), sync weights.
+        _mw = float(getattr(args, "max_wall_seconds", 0.0) or 0.0)
+        _step = 0
+        while _n_updates < args.episodes * _upd_per:
+            if _mw > 0.0 and (time.time() - args.t_start) > _mw:
+                print(f"[async] max-wall {_mw:.0f}s reached — stopping.",
+                      flush=True)
+                break
+            # The learner update on the traj just collected runs WHILE the next
+            # collection is already in flight (the measure∥learn overlap).
+            _traj, _tel = ray.get(_collect)
+            _n_measures += 1
+            _collect = sampler.collect_traj.remote(_seed); _seed += 1
+            _stats = ray.get(actor.train_on_trajs.remote(
+                [_traj], [_tel["policy_version"]], _upd_per))
+            _n_updates += _upd_per
+            _step += 1
+            if _step % _sync_every == 0:
+                _wref = ray.put(ray.get(actor.get_weights.remote()))
+                ray.get(sampler.set_weights.remote(_wref))
+            if _step % 5 == 0 or _step == 1:
+                _el = time.time() - _t0
+                print(
+                    f"[async] step={_step} updates={_n_updates} measures={_n_measures} "
+                    f"| meas/s={_n_measures/max(_el,1e-6):.3f} upd/s={_n_updates/max(_el,1e-6):.3f} "
+                    f"| on_pg={_stats.get('p3o/on_pg',float('nan')):.3f} "
+                    f"off_pg={_stats.get('p3o/off_pg',float('nan')):.3f} "
+                    f"kl={_stats.get('p3o/kl',float('nan')):.3f} "
+                    f"stale={_stats.get('async/staleness_mean',float('nan')):.1f} "
+                    f"buf={_stats.get('p3o/replay_buf_size',0)} "
+                    f"nan_skip={_stats.get('nan_skip_count',0)} "
+                    f"samp_ret={_tel.get('mean_return',float('nan')):+.3g}",
+                    flush=True)
+            if _wandb_on:
+                _wlog = {(f"async/{k.split('/')[-1]}" if k.startswith("p3o/")
+                          else k): v for k, v in _stats.items()
+                         if isinstance(v, (int, float))}
+                _el = time.time() - _t0
+                _wlog.update({
+                    "async/measures": _n_measures, "async/updates": _n_updates,
+                    "async/measures_per_s": _n_measures / max(_el, 1e-6),
+                    "async/updates_per_s": _n_updates / max(_el, 1e-6),
+                    "async/sampler_mean_return": _tel.get("mean_return", float("nan")),
+                })
+                wandb.log(_wlog)
+        _el = time.time() - _t0
+        print(
+            f"[async] DONE: {_n_updates} updates, {_n_measures} measures in "
+            f"{_el:.1f}s | meas/s={_n_measures/max(_el,1e-6):.3f} "
+            f"upd/s={_n_updates/max(_el,1e-6):.3f} "
+            f"eps-equiv/hr={_n_measures/max(_el,1e-6)*3600:.1f}", flush=True)
+        try:
+            _dump_pareto()
+        except Exception:
+            pass
+        return 0
 
     pbar = tqdm(
         total=args.episodes,

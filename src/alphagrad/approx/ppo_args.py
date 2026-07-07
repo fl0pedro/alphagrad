@@ -258,6 +258,37 @@ def make_argparser() -> argparse.ArgumentParser:
         "lambda keeps pi closer to the replay behaviour mu. Default 1.0 (fixed; "
         "the paper's adaptive/ESS lambda is a possible follow-up).",
     )
+    # --- ASYNC PIPELINE (Stage 1, IMPALA-style decoupling) -----------------
+    # Runs a SAMPLER actor (rollout + measurement -> push trajectories to the
+    # shared replay buffer) CONCURRENTLY with the LEARNER actor (P3O updates
+    # from the buffer + weight broadcast). measure(ep N+1) overlaps learn(ep N)
+    # so the GPUs stay busy measuring while the learner updates. Requires --p3o
+    # + --replay-buffer-size>0 (the off-policy IS/KL make the actor/learner lag
+    # valid). OFF (default) = the synchronous run_rollout_and_train path.
+    p.add_argument(
+        "--async-pipeline", action="store_true",
+        help="Enable the Stage-1 async pipeline: a sampler collects rollouts "
+        "+ measures into the replay buffer while the learner runs P3O updates "
+        "concurrently, syncing weights every --async-weight-sync-every "
+        "updates. Requires --p3o and --replay-buffer-size>0. Off = sync.",
+    )
+    p.add_argument(
+        "--async-updates-per-step", type=int, default=1,
+        help="Learner P3O updates per pipeline step (per sampler traj). "
+        "Higher = the learner drains the buffer faster relative to sampling.",
+    )
+    p.add_argument(
+        "--async-weight-sync-every", type=int, default=1,
+        help="Broadcast the learner's weights to the sampler every N pipeline "
+        "steps. 1 = every step (tightest actor/learner lag). Larger = more "
+        "off-policy staleness (bounded + corrected by P3O's IS ratio + KL).",
+    )
+    p.add_argument(
+        "--async-warmup-trajs", type=int, default=2,
+        help="Fill the replay buffer with this many sampler trajectories "
+        "BEFORE the learner starts, so it never trains on an empty/tiny "
+        "buffer. Default 2.",
+    )
     p.add_argument(
         "--cpu-cores-per-actor", type=int, default=0,
         help="Force each CpuApproximationActor to pin to exactly N CPU cores. "

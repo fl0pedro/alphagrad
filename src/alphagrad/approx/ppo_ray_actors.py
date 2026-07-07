@@ -70,6 +70,21 @@ class PPOActor:
     def run_rollout_and_train(self, rng_seed: int) -> dict:
         return self._impl.run_rollout_and_train(int(rng_seed))
 
+    # ---- Async pipeline (Stage 1) Ray entrypoints ----
+    def get_weights(self):
+        return self._impl.get_weights()
+
+    def set_weights(self, weights_np) -> int:
+        return int(self._impl.set_weights(weights_np))
+
+    def collect_traj(self, rng_seed: int):
+        return self._impl.collect_traj(int(rng_seed))
+
+    def train_on_trajs(self, trajs, sampler_versions, n_updates: int = 1):
+        return self._impl.train_on_trajs(
+            list(trajs), list(sampler_versions), int(n_updates),
+        )
+
     def reward_vec_means(self, rng_seed: int, num_rollouts: int) -> dict:
         """Calibration entry point — see PPORayWorker.reward_vec_means
         for the returned per-channel stats dict schema (mean / median /

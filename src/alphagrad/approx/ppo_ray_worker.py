@@ -4694,6 +4694,254 @@ class PPORayWorker:
 
         return last_aux
 
+    # ==================================================================
+    # ASYNC PIPELINE (Stage 1, bridge-cse) — IMPALA-style decoupling of
+    # rollout+MEASUREMENT (samplers, GPU1-3 + the measure pool) from the
+    # P3O LEARNER (GPU0). All flag-gated behind --async-pipeline; the
+    # synchronous run_rollout_and_train path above is UNTOUCHED.
+    #
+    #   get_weights / set_weights : broadcast the learner's policy to the
+    #       samplers (eqx array-leaf pytree; ray.put'd by the driver).
+    #   collect_traj              : ONE rollout + measurement, returns the
+    #       replay trajectory (numpy, Ray-serialisable) + telemetry. No
+    #       gradient update — the sampler just fills the buffer.
+    #   train_on_trajs            : ingest external trajectories into the
+    #       replay buffer + run P3O update(s), return stats + the (small)
+    #       policy-version counter. Only the LEARNER calls this.
+    # ==================================================================
+    def get_weights(self):
+        """Return the policy's array-leaf pytree (host numpy) for broadcast.
+
+        Only the inexact-array leaves of ``self.agent`` (the eqx.Module) —
+        the static structure is reconstructed via ``set_weights`` against the
+        actor's own template. Numpy so it round-trips the Ray object store
+        without device placement surprises."""
+        _arrays = eqx.filter(self.agent, eqx.is_inexact_array)
+        return jax.tree_util.tree_map(lambda x: np.asarray(x), _arrays)
+
+    def set_weights(self, weights_np) -> int:
+        """Overwrite ``self.agent``'s array leaves from a host-numpy pytree
+        (mirrors ``get_weights``). Re-replicates to the actor's sharding so
+        the JIT'd act-step sees device arrays. Returns the new local policy
+        version (monotonic; the driver stamps trajectories with it so the
+        learner can log actor↔learner staleness)."""
+        _w = jax.tree_util.tree_map(lambda x: jnp.asarray(x), weights_np)
+        self.agent = eqx.combine(_w, self.agent)
+        self.agent = self._replicate(self.agent)
+        self._policy_version = int(getattr(self, "_policy_version", 0)) + 1
+        return self._policy_version
+
+    def _collect_rollout_buffers(self, key):
+        """Run ONE rollout+measurement pass with the CURRENT ``self.agent``
+        and return the raw ``buf_*`` numpy arrays. This is the rollout half of
+        ``run_rollout_and_train`` (act-step loop + measure fan-out), factored
+        out for the async samplers. The synchronous path keeps its own inline
+        copy (untouched)."""
+        env_states = jax.vmap(lambda _: self.env.reset())(
+            jnp.arange(self.num_envs),
+        )
+        self.env_states = jax.tree_util.tree_map(
+            lambda x: jax.device_put(x, self.data_sharding)
+            if eqx.is_array(x) else x,
+            env_states,
+        )
+        T = int(self.rollout_length)
+        N = int(self.num_envs)
+        S = int(self.max_substeps)
+        P = int(MAX_PRIMES)
+        buf_tokens = np.zeros((T, N, MAX_TOKENS), dtype=np.int32)
+        buf_eqn_ids = np.zeros((T, N, MAX_TOKENS), dtype=np.int32)
+        buf_actions = np.zeros((T, N), dtype=np.int32)
+        buf_op = np.zeros((T, N, S), dtype=np.int32)
+        buf_i = np.zeros((T, N, S), dtype=np.int32)
+        buf_j = np.zeros((T, N, S), dtype=np.int32)
+        buf_exp = np.zeros((T, N, S, P), dtype=np.int32)
+        buf_f = np.zeros((T, N, S), dtype=np.int32)
+        buf_kind = np.zeros((T, N, S), dtype=np.int32)
+        buf_q = np.zeros((T, N, S), dtype=np.int32)
+        buf_axis_state = np.zeros(
+            (T, N, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM), dtype=np.int32)
+        buf_axis_valid = np.zeros((T, N, MAX_AXES_PER_VERTEX), dtype=np.float32)
+        buf_avail = np.zeros((T, N, int(self.total_v)), dtype=np.float32)
+        buf_log_probs = np.zeros((T, N), dtype=np.float32)
+        buf_values = np.zeros((T, N, NUM_REWARDS), dtype=np.float32)
+        buf_reward_vec = np.zeros((T, N, NUM_REWARDS), dtype=np.float32)
+        buf_dones = np.zeros((T, N), dtype=np.float32)
+        buf_sentinel = np.zeros((T, N), dtype=bool)
+        state = self.env_states
+        for t in range(T):
+            key, sub = jrand.split(key)
+            avail = self._vertex_avail(state)
+            (
+                actions, op_a, i_a, j_a, exp_a, f_a, kind_a, q_a,
+                ax_st_a, ax_va_a, log_probs, values,
+                partial, order, specs, step,
+            ) = self._act_step(
+                self.agent, state, avail,
+                self._current_op_mask_j, self._current_factor_mask_j,
+                self._current_quant_mask_j, sub,
+            )
+            pre_tokens = np.asarray(state.tokens)
+            pre_eqn_ids = np.asarray(state.eqn_ids)
+            order_np = np.asarray(order)
+            specs_np = np.asarray(specs)
+            step_np = np.asarray(step)
+            _is_terminal_step = t == T - 1
+            _local_tokenize = (
+                not _is_terminal_step and self._local_tokenize_enabled
+                and self._terminal_rewards_only
+            )
+            if (_is_terminal_step
+                    and getattr(self.args, "measure_queue", False)
+                    and self._terminal_rewards_only):
+                tokens_np, eqn_ids_np, reward_np, sentinel_mask = (
+                    self._fan_out_terminal_queue(order_np, specs_np, step_np))
+            elif _local_tokenize:
+                tokens_np, eqn_ids_np, reward_np, sentinel_mask = (
+                    self._tokenize_local(order_np, specs_np, step_np))
+            else:
+                tokens_np, eqn_ids_np, reward_np, sentinel_mask = (
+                    self._fan_out_tokenize(order_np, specs_np, step_np))
+            buf_sentinel[t] = sentinel_mask
+            tokens_j = jax.device_put(
+                jnp.asarray(tokens_np, dtype=jnp.int32), self.data_sharding)
+            eqn_ids_j = jax.device_put(
+                jnp.asarray(eqn_ids_np, dtype=jnp.int32), self.data_sharding)
+            reward_j = jax.device_put(
+                jnp.asarray(reward_np, dtype=jnp.float32), self.data_sharding)
+            state = self._assemble(state, partial, tokens_j, eqn_ids_j, reward_j)
+            buf_tokens[t] = pre_tokens
+            buf_eqn_ids[t] = pre_eqn_ids
+            buf_avail[t] = np.asarray(avail)
+            buf_exp[t] = np.asarray(exp_a)
+            buf_kind[t] = np.asarray(kind_a)
+            buf_axis_state[t] = np.asarray(ax_st_a)
+            buf_axis_valid[t] = np.asarray(ax_va_a)
+            buf_actions[t] = np.asarray(actions)
+            buf_op[t] = np.asarray(op_a)
+            buf_i[t] = np.asarray(i_a)
+            buf_j[t] = np.asarray(j_a)
+            buf_f[t] = np.asarray(f_a)
+            buf_q[t] = np.asarray(q_a)
+            buf_log_probs[t] = np.asarray(log_probs)
+            buf_values[t] = np.asarray(values)
+            buf_reward_vec[t] = reward_np
+            buf_dones[t] = np.asarray(state.terminated).astype(np.float32)
+        # Non-finite reward scrub (mirror the sync path's guard).
+        buf_reward_vec = np.nan_to_num(
+            buf_reward_vec, nan=0.0, posinf=0.0, neginf=0.0)
+        buf_log_probs = np.nan_to_num(
+            buf_log_probs, nan=0.0, posinf=0.0, neginf=0.0)
+        return dict(
+            tokens=buf_tokens, eqn_ids=buf_eqn_ids, avail=buf_avail,
+            actions=buf_actions, op=buf_op, i=buf_i, j=buf_j, exp=buf_exp,
+            f=buf_f, kind=buf_kind, q=buf_q, axis_state=buf_axis_state,
+            axis_valid=buf_axis_valid, log_probs=buf_log_probs,
+            reward_vec=buf_reward_vec, dones=buf_dones, sentinel=buf_sentinel,
+        )
+
+    def collect_traj(self, rng_seed: int):
+        """SAMPLER entry: one rollout+measurement with the last-synced policy.
+        Returns a Ray-serialisable ``(traj_np, telemetry)`` where ``traj_np``
+        is the (N,T,...) replay trajectory (numpy) ready for the buffer, and
+        telemetry carries the policy version + measured mean return so the
+        driver can watch staleness + progress. No gradient step here."""
+        if not hasattr(self, "_act_step"):
+            self._act_step = self._make_act_step_fn()
+            self._assemble = self._make_assemble_fn()
+        key = jrand.PRNGKey(int(rng_seed))
+        bufs = self._collect_rollout_buffers(key)
+        _tp3 = lambda a: np.transpose(a, (1, 0) + tuple(range(2, a.ndim)))
+        traj_np = {
+            "tokens": _tp3(bufs["tokens"]), "eqn_ids": _tp3(bufs["eqn_ids"]),
+            "avail": _tp3(bufs["avail"]), "v_act": bufs["actions"].T,
+            "op": _tp3(bufs["op"]), "i": _tp3(bufs["i"]), "j": _tp3(bufs["j"]),
+            "exp": _tp3(bufs["exp"]), "f": _tp3(bufs["f"]),
+            "kind": _tp3(bufs["kind"]), "q": _tp3(bufs["q"]),
+            "axis_state": _tp3(bufs["axis_state"]),
+            "axis_valid": _tp3(bufs["axis_valid"]),
+            "old_lp": bufs["log_probs"].T,
+            "reward_vec": _tp3(bufs["reward_vec"]),
+            "dones": bufs["dones"].T,
+        }
+        _wsum = (bufs["reward_vec"] * self.reward_weights_np).sum(axis=(0, 2))
+        telemetry = {
+            "policy_version": int(getattr(self, "_policy_version", 0)),
+            "mean_return": float(np.mean(_wsum)),
+            "sentinel_frac": float(np.mean(bufs["sentinel"])),
+        }
+        return traj_np, telemetry
+
+    def train_on_trajs(self, trajs, sampler_versions, n_updates: int = 1):
+        """LEARNER entry: ingest sampler trajectories into the replay buffer,
+        run ``n_updates`` P3O gradient steps sampling from it, and return
+        (stats, learner_policy_version). ``sampler_versions`` are the policy
+        versions the trajectories were collected under — logged as the
+        actor↔learner STALENESS (learner_version - sampler_version)."""
+        if not hasattr(self, "_p3o_update_step"):
+            self._p3o_update_step = self._make_p3o_update_step()
+        agent = self.agent
+        opt_state = self.opt_state
+        N = int(self.num_envs)
+        T = int(self.rollout_length)
+        # ---- ingest each sampler traj into the shared replay buffer.
+        for tr in trajs:
+            traj = {k: jnp.asarray(v) for k, v in tr.items()}
+            traj["reward_vec"] = symlog(traj["reward_vec"])
+            if self.replay_buffer is None:
+                _s0 = jax.tree_util.tree_map(lambda x: x[0], traj)
+                self.replay_buffer = init_replay_buffer(_s0, self._replay_cap)
+            self.replay_buffer = replay_add_batch(self.replay_buffer, traj)
+        self._replay_buf_size = int(self.replay_buffer.size)
+        key = jrand.PRNGKey(
+            int(getattr(self, "_async_step", 0)) * 100003 + 7)
+        _lv = int(getattr(self, "_policy_version", 0))
+        _stale = [max(_lv - int(v), 0) for v in sampler_versions] or [0]
+        _ent = jnp.asarray(self.entropy_coef, dtype=jnp.float32)
+        last = {}
+        _nan = 0
+        _B = int(getattr(self.args, "replay_sample_trajs", 0) or 0) or N
+        for _u in range(max(int(n_updates), 1)):
+            key, sk, vk, mk = jrand.split(key, 4)
+            sampled = replay_sample(self.replay_buffer, _B, sk, alpha=0.0)
+            _Tr = int(sampled["tokens"].shape[1])
+            _M = _B * _Tr
+            _rho, _adv, _vs, _vs_s = self._p3o_vtrace(agent, sampled, vk)
+            _fl = lambda k: sampled[k].reshape((_M,) + sampled[k].shape[2:])
+            off_batch = (
+                _fl("tokens"), _fl("eqn_ids"), _fl("avail"), _fl("v_act"),
+                _fl("op"), _fl("i"), _fl("j"), _fl("exp"), _fl("f"),
+                _fl("kind"), _fl("q"), _fl("axis_state"), _fl("axis_valid"),
+                _fl("old_lp"),
+            )
+            # ON-policy minibatch = the freshest sampled transitions (flat).
+            fresh = (
+                _fl("tokens"), _fl("eqn_ids"), _fl("avail"), _fl("v_act"),
+                _fl("op"), _fl("i"), _fl("j"), _fl("exp"), _fl("f"),
+                _fl("kind"), _fl("q"), _fl("axis_state"), _fl("axis_valid"),
+                _fl("old_lp"),
+                # returns/advantages for the on-policy term = V-trace targets
+                # (async is fully off-policy; the fresh clipped-IS term uses the
+                # same V-trace advantage — the IS ratio in the loss corrects it).
+                _vs, _adv, jnp.ones((_M,), jnp.float32),
+            )
+            agent, opt_state, aux = self._p3o_update_step(
+                agent, opt_state, fresh, off_batch, _rho, _adv, _vs, _vs_s,
+                mk, _ent,
+            )
+            _nan += int(aux.pop("nan_skip", 0))
+            last = {k: float(v) for k, v in aux.items()}
+        self.agent = agent
+        self.opt_state = opt_state
+        self._async_step = int(getattr(self, "_async_step", 0)) + 1
+        last["p3o/replay_buf_size"] = int(self._replay_buf_size)
+        last["nan_skip_count"] = int(_nan)
+        last["async/staleness_mean"] = float(np.mean(_stale))
+        last["async/staleness_max"] = float(np.max(_stale))
+        last["async/learner_version"] = _lv
+        last["async/updates_done"] = int(self._async_step)
+        return last
+
     # ------------------------------------------------------------------
     # Calibration support — methods called by
     # `alphagrad.approx.common.calibration.run_calibration`.
