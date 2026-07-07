@@ -210,6 +210,12 @@ class CpuApproximationActor:
     def evaluate_batch(self, batch: Sequence[tuple]):
         return self._impl.evaluate_batch(batch)
 
+    def precompile(self, order, sparsity_specs, step: int) -> bool:
+        """STAGE-2 async compile-actor entrypoint — warm the shared cache for
+        this order (compile-only, no measure). See
+        ``CpuApproximationServer.precompile``."""
+        return bool(self._impl.precompile(order, sparsity_specs, int(step)))
+
     def reset_caches(self) -> dict:
         return self._impl.reset_caches()
 

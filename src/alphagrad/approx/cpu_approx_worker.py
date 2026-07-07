@@ -371,6 +371,35 @@ class CpuApproximationServer:
             self._maybe_clear_compile_caches(force_on_oom=str(exc))
             return sentinel_tokens, sentinel_eqn_ids, sentinel_reward
 
+    def precompile(self, order: Any, sparsity_specs: Any, step: int) -> bool:
+        """STAGE-2 async: compile-only warm of the shared cluster cache.
+
+        Runs ``_callback(..., precompile_only=True)`` which builds the o_list +
+        transforms and triggers the jacve ``jax.jit(...).compile()`` — that call,
+        via ``cached_compile``, REGISTERS the serialised executable with the
+        cluster-wide CompileCacheCoordinator — then returns immediately WITHOUT
+        the noisy exec/measure loop. A dedicated compile-actor calls this AHEAD
+        of the measure actors so their ``_callback`` gets a ~10ms coordinator
+        HIT instead of a ~1.9s inline compile. Returns True on success (the
+        cache is now warm for this order), False on any compile error (the
+        measure actor will just fall back to inline compile — still correct)."""
+        import jax.numpy as jnp
+        from alphagrad.approx.env import _callback
+        try:
+            _callback(
+                self._config, self._args, self._consts,
+                jnp.asarray(order, dtype=jnp.int32),
+                jnp.asarray(sparsity_specs, dtype=jnp.int32),
+                int(step),
+                *self._eval_samples,
+                precompile_only=True,
+            )
+            self._maybe_clear_compile_caches()
+            return True
+        except Exception as exc:  # pragma: no cover - defensive
+            self.last_eval_error = (type(exc).__name__, str(exc)[:200])
+            return False
+
     def evaluate_batch(self, batch: Sequence[tuple]):
         """Sequential fallback for callers that want to ship multiple
         (order, specs, step) requests in one Ray roundtrip.

@@ -4719,6 +4719,13 @@ class PPORayWorker:
         _arrays = eqx.filter(self.agent, eqx.is_inexact_array)
         return jax.tree_util.tree_map(lambda x: np.asarray(x), _arrays)
 
+    def set_compile_actor(self, compile_actor) -> bool:
+        """STAGE-2: register the dedicated compile-actor handle. When set, the
+        sampler PRE-compiles its terminal orders on this actor (into the shared
+        cluster cache) before the measure fan-out — so measures exec-only."""
+        self._compile_actor = compile_actor
+        return True
+
     def set_weights(self, weights_np, learner_step: int = 0) -> int:
         """Overwrite ``self.agent``'s array leaves from a host-numpy pytree
         (mirrors ``get_weights``). Re-replicates to the actor's sharding so
@@ -4796,6 +4803,27 @@ class PPORayWorker:
             if (_is_terminal_step
                     and getattr(self.args, "measure_queue", False)
                     and self._terminal_rewards_only):
+                # STAGE-2: PRE-COMPILE the terminal orders on the dedicated
+                # compile-actor BEFORE the measure fan-out, so the measure
+                # actors get a coordinator HIT (~10ms load) instead of the
+                # ~1.9s inline jacve compile. Only the DISTINCT orders (one per
+                # env) need compiling — n_points measure the SAME order per env.
+                # We WAIT for the precompiles so the fan-out is a pure exec.
+                _ca = getattr(self, "_compile_actor", None)
+                if _ca is not None:
+                    import ray as _ray
+                    _futs = [
+                        _ca.precompile.remote(
+                            order_np[_e], specs_np[_e], int(step_np[_e]))
+                        for _e in range(order_np.shape[0])
+                    ]
+                    try:
+                        _ok = _ray.get(_futs)
+                        self._precompile_ok = int(sum(bool(x) for x in _ok))
+                        self._precompile_tot = int(len(_ok))
+                    except Exception:
+                        self._precompile_ok = 0
+                        self._precompile_tot = int(order_np.shape[0])
                 tokens_np, eqn_ids_np, reward_np, sentinel_mask = (
                     self._fan_out_terminal_queue(order_np, specs_np, step_np))
             elif _local_tokenize:
@@ -4874,7 +4902,24 @@ class PPORayWorker:
             "synced_learner_step": int(getattr(self, "_synced_learner_step", 0)),
             "mean_return": float(np.mean(_wsum)),
             "sentinel_frac": float(np.mean(bufs["sentinel"])),
+            "precompile_ok": int(getattr(self, "_precompile_ok", 0)),
+            "precompile_tot": int(getattr(self, "_precompile_tot", 0)),
         }
+        # STAGE-2 compile-cache HIT/MISS rate from the CLUSTER coordinator (the
+        # global executable cache all measure actors consult): the measure
+        # actors' inline compiles are MISSES; the compile-actor's precompiles
+        # turn subsequent measures into HITS. Reported so we can see the
+        # cluster hit-rate rise under --async-compile-split.
+        try:
+            import ray as _ray
+            _coord = _ray.get_actor("alphagrad_compile_cache_coordinator")
+            _cs = _ray.get(_coord.stats.remote())
+            telemetry["cache_hits"] = int(_cs.get("hits", 0))
+            telemetry["cache_misses"] = int(_cs.get("misses", 0))
+            telemetry["cache_hit_rate"] = float(_cs.get("hit_rate", 0.0))
+            telemetry["cache_size"] = int(_cs.get("size", 0))
+        except Exception:
+            pass
         return traj_np, telemetry
 
     def train_on_trajs(self, trajs, synced_learner_steps, n_updates: int = 1):

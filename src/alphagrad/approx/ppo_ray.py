@@ -115,10 +115,15 @@ def _run(args) -> int:
     if (getattr(args, "async_pipeline", False)
             and not getattr(args, "use_placement_group", False)
             and float(getattr(args, "actor_num_gpus", 0) or 0) >= 1.0):
+        # Under --async-compile-split GPU0 hosts THREE fractional actors
+        # (learner + sampler + compile-actor), so shrink the learner further
+        # to leave room; plain --async-pipeline is the 0.5/0.5 two-way split.
+        _dflt = "0.4" if getattr(args, "async_compile_split", False) else "0.5"
         args.actor_num_gpus = float(
-            os.environ.get("ALPHAGRAD_ASYNC_LEARNER_GPUS", "0.5"))
+            os.environ.get("ALPHAGRAD_ASYNC_LEARNER_GPUS", _dflt))
         print(f"[async] learner GPU share set to {args.actor_num_gpus} "
-              f"(co-resident with sampler on GPU0)", flush=True)
+              f"(co-resident with sampler{'+compile-actor' if getattr(args, 'async_compile_split', False) else ''} on GPU0)",
+              flush=True)
     # Thread ALPHAGRAD_* policy switches (e.g. ALPHAGRAD_QUANT_ALLOWED,
     # ALPHAGRAD_SUBSTEP_NO_END) to the PPOActor explicitly via args_dict, which
     # Ray serializes reliably. runtime_env env_vars do NOT reliably reach the
@@ -448,8 +453,10 @@ def _run(args) -> int:
         # you've freed GPU fraction (fewer/fractional measure actors).
         _samp_kwargs = dict(actor_kwargs)
         _samp_kwargs.pop("scheduling_strategy", None)
-        # Sampler gets the other 0.5 of GPU0 (the learner was halved above).
-        _samp_gpus = float(os.environ.get("ALPHAGRAD_ASYNC_SAMPLER_GPUS", "0.5"))
+        # Sampler shares GPU0. Plain split: 0.5 (learner 0.5 + sampler 0.5).
+        # Compile-split: 0.35 (learner 0.4 + sampler 0.35 + compile 0.25 = 1.0).
+        _samp_dflt = "0.35" if getattr(args, "async_compile_split", False) else "0.5"
+        _samp_gpus = float(os.environ.get("ALPHAGRAD_ASYNC_SAMPLER_GPUS", _samp_dflt))
         if _samp_gpus > 0:
             _samp_kwargs["num_gpus"] = _samp_gpus
         else:
@@ -466,6 +473,36 @@ def _run(args) -> int:
             starting_actor_id=int(args.num_cpu_workers) + 100,
         ))
         ray.get(sampler.ready.remote())
+        # ---- STAGE 2: dedicated COMPILE-ACTOR (--async-compile-split). A
+        # CpuApproximationActor (co-resident on a measure GPU: CPU-bound
+        # compile, ~0% GPU compute, autotune off) that PRE-compiles the
+        # sampler's terminal orders into the shared cluster CompileCache
+        # coordinator, so the measure actors LOAD (~10ms) instead of compiling
+        # inline (~1.9s). Registered on the sampler; it precompiles before its
+        # measure fan-out. The measure actors already consult the coordinator
+        # (env._callback -> cached_compile), so no measure-side change needed.
+        _compile_actor = None
+        if getattr(args, "async_compile_split", False):
+            _ca_opts = dict(cpu_actor_options)
+            # Give it a GPU share so the CUDA backend registers (required to
+            # emit a GPU executable — a CPU-only actor cannot, per the gating
+            # test). The compile is CPU-bound so this steals ~0 GPU compute.
+            _ca_opts["num_gpus"] = float(
+                os.environ.get("ALPHAGRAD_COMPILE_ACTOR_GPUS", "0.25"))
+            _compile_actor = CpuApproximationActor.options(**_ca_opts).remote(
+                args_dict, variant=None,
+                actor_id=int(args.num_cpu_workers) + 200)
+            ray.get(_compile_actor.ready.remote())
+            # Warm the compile-actor's own base kernels once (the ~11.7s
+            # 14-entry build) so its per-order precompiles are the cheap ~1.9s.
+            try:
+                ray.get(_compile_actor.compile_approximations.remote())
+            except Exception as _cae:
+                print(f"[async] compile-actor warm skipped: {_cae}", flush=True)
+            ray.get(sampler.set_compile_actor.remote(_compile_actor))
+            print("[async] STAGE-2 compile-split ON: dedicated compile-actor "
+                  f"gpus={_ca_opts['num_gpus']} pre-compiles orders -> "
+                  "measure actors exec-only.", flush=True)
         # Initial weight sync learner->sampler so they start aligned (learner
         # update-count 0 at this point).
         _wref = ray.put(ray.get(actor.get_weights.remote()))
@@ -529,7 +566,10 @@ def _run(args) -> int:
                     f"stale={_stats.get('async/staleness_mean',float('nan')):.1f} "
                     f"buf={_stats.get('p3o/replay_buf_size',0)} "
                     f"nan_skip={_stats.get('nan_skip_count',0)} "
-                    f"samp_ret={_tel.get('mean_return',float('nan')):+.3g}",
+                    f"samp_ret={_tel.get('mean_return',float('nan')):+.3g} "
+                    f"| cache_hitrate={_tel.get('cache_hit_rate',float('nan')):.2f} "
+                    f"cache_sz={_tel.get('cache_size',0)} "
+                    f"precomp={_tel.get('precompile_ok',0)}/{_tel.get('precompile_tot',0)}",
                     flush=True)
             if _wandb_on:
                 _wlog = {(f"async/{k.split('/')[-1]}" if k.startswith("p3o/")

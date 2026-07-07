@@ -77,6 +77,9 @@ class PPOActor:
     def set_weights(self, weights_np, learner_step: int = 0) -> int:
         return int(self._impl.set_weights(weights_np, int(learner_step)))
 
+    def set_compile_actor(self, compile_actor) -> bool:
+        return bool(self._impl.set_compile_actor(compile_actor))
+
     def collect_traj(self, rng_seed: int):
         return self._impl.collect_traj(int(rng_seed))
 

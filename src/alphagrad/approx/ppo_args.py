@@ -289,6 +289,21 @@ def make_argparser() -> argparse.ArgumentParser:
         "BEFORE the learner starts, so it never trains on an empty/tiny "
         "buffer. Default 2.",
     )
+    # --- STAGE 2: compile/execute split via a dedicated compile-actor -------
+    # Pulls the ~1.9s inline jacve compile OFF the measure critical path. A
+    # compile-actor (co-resident on a measure GPU, CPU-bound compile, 0% GPU
+    # compute) PRE-compiles the sampler's terminal orders into the shared
+    # cluster CompileCacheCoordinator; the measure actors then LOAD the
+    # executable (~10ms) instead of compiling inline. On a not-yet-compiled
+    # order the measure falls back to inline compile (correctness) + counts the
+    # miss. Requires --async-pipeline. OFF = Stage-1 (measure actors compile
+    # inline).
+    p.add_argument(
+        "--async-compile-split", action="store_true",
+        help="STAGE 2: dedicated compile-actor pre-compiles orders into the "
+        "shared cache so measure actors exec-only (load+run, no inline "
+        "compile). Requires --async-pipeline. Off = Stage 1.",
+    )
     p.add_argument(
         "--cpu-cores-per-actor", type=int, default=0,
         help="Force each CpuApproximationActor to pin to exactly N CPU cores. "

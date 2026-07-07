@@ -1698,6 +1698,7 @@ def _callback(
     init: bool = False,
     point_idx: int = -1,
     raw_sink: dict | None = None,
+    precompile_only: bool = False,
 ):
     """Stage A reward harness: returns `(tokens, rewards)` where `rewards` is
     the canonical `(NUM_REWARDS,)` float32 vector documented at the top of this
@@ -2521,6 +2522,17 @@ def _callback(
         compiled_exact = None
         if _dbg_t and is_terminal and not _want_exact:
             print("[DBG-env] exact_compile SKIPPED (quality not rewarded)", flush=True)
+
+    # PRECOMPILE-ONLY (Stage-2 async, bridge-cse): the compile-actor calls
+    # _callback with precompile_only=True — the ~1.9s jacve compile above has
+    # now run and (via cached_compile) REGISTERED the executable with the
+    # cluster-wide CompileCacheCoordinator. Return immediately, skipping the
+    # cost-analysis + noisy exec/measure loop: the point is only to WARM the
+    # shared cache so the real measure actor gets a ~10ms load HIT instead of
+    # compiling inline. Returns a trivial (tokens, eqn_ids, zero-reward) tuple.
+    if precompile_only:
+        _zt = jnp.zeros((MAX_TOKENS,), dtype=jnp.int32)
+        return _zt, _zt, jnp.zeros((NUM_REWARDS,), dtype=jnp.float32)
 
     # XLA cost analysis — flops + bytes accessed. Falls back to 0 when the
     # backend doesn't expose them (CPU sometimes returns an empty dict).
