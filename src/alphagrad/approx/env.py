@@ -1227,6 +1227,37 @@ sp_type_to_map = {1: (0, 0), 2: (0, 1), 3: (1, 0), 4: (1, 1)}
 # other = {log, no log} x {div, no div}
 
 
+def _scalarize_jac_to_grad(jac, args, argnums):
+    """Contract an OUTPUT JACOBIAN into the SCALAR-LOSS GRADIENT (bridge-cse).
+
+    In Jacobian mode (measure_grad=False) ``jacve`` returns the output Jacobian
+    ``J[w] = d output / d w`` (output = the example's per-element squared errors,
+    shape ``(out_dims..., *w_shape)``). The env's scalar training loss is
+    ``L = mean(output)`` (== ``scalar_loss_fn``), so its output-cotangent is
+    ``(1/N)*ones`` (N = output.size) and the loss gradient is that Jacobian
+    contracted over the LEADING OUTPUT AXES:  ``grad_w L = sum_over_out(J[w]) / N``.
+    Each leaf's number of leading output axes = ``J_leaf.ndim - w.ndim`` (the
+    trailing axes are the weight-parameter layout, kept intact so the downstream
+    transpose-alignment (_align_jac / _bkstep_align_grads) still applies). This is
+    the SAME contraction the bkstep wrapper uses — verified GRAD-vs-Jacobian
+    cosine ~1.0 — so cosine/frob and bkstep both score the meaningful GRAD object,
+    not the strict full output Jacobian. Returns a tuple of grad leaves in
+    ``argnums`` order."""
+    _leaves = jac if isinstance(jac, (tuple, list)) else (jac,)
+    grads = []
+    for _lf, _a in zip(_leaves, argnums):
+        _lf = jnp.asarray(_lf)
+        _wn = int(jnp.ndim(args[int(_a)]))          # weight ndim (trailing axes)
+        _od = max(int(_lf.ndim) - _wn, 0)            # leading output axes
+        _N = 1
+        for _d in _lf.shape[:_od]:
+            _N *= int(_d)
+        _N = max(_N, 1)
+        _sum_axes = tuple(range(_od))
+        grads.append(jnp.sum(_lf, axis=_sum_axes) / _N if _sum_axes else _lf / _N)
+    return tuple(grads)
+
+
 def _flatten_jacobians(jac):
     """Concatenate all leaves of a (possibly nested) jacobian pytree to a flat 1-d array."""
     leaves = jax.tree_util.tree_leaves(jac)
@@ -2606,6 +2637,7 @@ def _callback(
 
     out_approxs: list = []
     out_exacts: list = []
+    out_argsets: list = []  # per-point eval args (for Jacobian->grad contraction)
     latency_samples: list[float] = []
     peak_mem_samples: list[float] = []
 
@@ -2840,6 +2872,7 @@ def _callback(
                     _oe = compiled_exact(*eval_args_i)
                     jax.block_until_ready(_oe)
                     out_exacts.append(_oe)
+                    out_argsets.append(eval_args_i)
 
                 # Slow-order cutoff: if a single exec exceeded the cutoff, the
                 # order is pathologically expensive — one sample is enough to know
@@ -2926,13 +2959,28 @@ def _callback(
         cosines: list = []
         frobs: list = []
         _t_approx = _t_exact = _t_metric = 0.0
-        # Grad mode: ``value_and_grad`` returns ``(value, grads)`` for both the
-        # approx and exact paths, so the gradient pytree is at ``[1]`` — same
-        # slot as jacve's has_aux ``(primal, jac)``. Compare the GRADIENTS.
+        # QUALITY IS ALWAYS A GRAD COMPARISON (bridge-cse, "compare the grad not
+        # the Jacobian"):
+        #   * GRAD mode (value_and_grad): grads are at ``[1]`` for both paths —
+        #     same slot as jacve's has_aux ``(primal, jac)``. Compare directly.
+        #   * JACOBIAN mode (measure_grad=False): out_* are the RAW output
+        #     Jacobians. Comparing the full Jacobian (all output rows) is overly
+        #     strict and reads a spuriously LOW cosine. Instead contract BOTH the
+        #     approx and exact Jacobians with the loss output-cotangent (the SAME
+        #     (1/N)*ones the bkstep wrapper uses, since scalar loss = mean(output))
+        #     to the loss GRADIENT, then compare the GRADS — the meaningful,
+        #     downstream-relevant fidelity signal (verified GRAD-vs-Jacobian
+        #     cosine ~1.0 for the dense order).
         _take_second = config.has_aux or config.measure_grad
-        for out_approx, out_exact in zip(out_approxs, out_exacts):
-            jac_approx = out_approx[1] if _take_second else out_approx
-            jac_exact = out_exact[1] if _take_second else out_exact
+        _jac_quality = not config.measure_grad and not config.has_aux
+        for _qi, (out_approx, out_exact) in enumerate(zip(out_approxs, out_exacts)):
+            if _jac_quality:
+                _qargs = out_argsets[_qi] if _qi < len(out_argsets) else list(args)
+                jac_approx = _scalarize_jac_to_grad(out_approx, _qargs, config.argnums)
+                jac_exact = _scalarize_jac_to_grad(out_exact, _qargs, config.argnums)
+            else:
+                jac_approx = out_approx[1] if _take_second else out_approx
+                jac_exact = out_exact[1] if _take_second else out_exact
             if _dbg_t:
                 _tt = _time.time()
                 jax.block_until_ready(jac_approx); _t_approx += _time.time() - _tt
@@ -3028,30 +3076,16 @@ def _callback(
                 _probe_loss_fn = _base_fn
             else:
                 # OUTPUT-JACOBIAN path: contract J with the scalar-loss
-                # output-cotangent (1/N * ones) to recover the loss gradient.
-                _jac_argnums = tuple(int(a) for a in config.argnums)
-
-                def _probe_grad_fn(*call_args, _fn=_base_fn,
-                                   _jac=compiled_approx, _an=_jac_argnums):
-                    _out = _fn(*call_args)          # (batch, out_dim...) sq-errs
-                    _N = max(int(_out.size), 1)
-                    _loss = jnp.sum(_out) / _N       # scalar mean loss
-                    _J = _jac(*call_args)            # tuple over argnums
-                    _leaves = _J if isinstance(_J, (tuple, list)) else (_J,)
-                    _od = int(jnp.ndim(_out))        # # leading output axes
-                    _grads = []
-                    for _lf, _a in zip(_leaves, _an):
-                        _lf = jnp.asarray(_lf)
-                        # J[a] leads with the output axes (out_dims...) then the
-                        # weight-parameter axes (native jacve layout, possibly
-                        # transposed — _bkstep_align_grads fixes that). Contract
-                        # ONLY the leading output axes with the (1/N)*ones
-                        # cotangent (== mean over outputs) -> d loss / d w, with
-                        # the parameter layout preserved for align_grads.
-                        _sum_axes = tuple(range(min(_od, _lf.ndim)))
-                        _g = jnp.sum(_lf, axis=_sum_axes) / _N
-                        _grads.append(_g)
-                    return _loss, tuple(_grads)
+                # output-cotangent (1/N * ones) to recover the loss gradient —
+                # via the SHARED _scalarize_jac_to_grad (same contraction the
+                # cosine/frob quality block uses, verified GRAD-vs-Jacobian
+                # cosine ~1.0).
+                def _probe_grad_fn(*call_args, _fn=_base_fn, _jac=compiled_approx,
+                                   _an=tuple(config.argnums)):
+                    _out = _fn(*call_args)
+                    _loss = jnp.mean(_out)           # scalar mean loss
+                    _grads = _scalarize_jac_to_grad(_jac(*call_args), call_args, _an)
+                    return _loss, _grads
 
                 def _probe_loss_fn(*call_args, _fn=_base_fn):
                     return jnp.mean(_fn(*call_args))
