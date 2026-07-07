@@ -155,6 +155,42 @@ def build_reward_weights(args) -> np.ndarray:
     # --measure-latency, bkstep without ALPHAGRAD_BKSTEP=1) never enters the
     # sum. flops (order-discriminating) + muls_adds are always in the set.
     import os as _osac
+
+    # EXPLICIT CHANNEL-LIST selector (bridge-cse, USER-DIRECTED). When
+    # ALPHAGRAD_REWARD_CHANNELS names a comma-separated set of channel keys, put
+    # weight = ALPHAGRAD_ALL_CHANNEL_W (default 1.0) on EXACTLY those channels
+    # and 0 on all others — a CURATED subset (e.g. the 5-channel
+    # flops,xla_peak_memory,peak_memory,latency_ns,bkstep_acc set) instead of
+    # the noisy all-10. Same sign machinery as the all-channel branch: the env
+    # reward vector emits costs NEGATED and bkstep_acc POSITIVE, so a single
+    # POSITIVE weight per named channel is correct (reward low-cost + high
+    # bkstep). PopArt normalises each named channel. Every name is validated
+    # against REWARD_INDEX (env.py REWARD_NAMES) so a typo errors CLEARLY.
+    # PRECEDENCE: REWARD_CHANNELS (explicit list) > REWARD_ALL_CHANNELS=1 >
+    # the legacy cmp/mem/acc slots.
+    _rc_raw = str(_osac.environ.get("ALPHAGRAD_REWARD_CHANNELS", "") or "").strip()
+    if _rc_raw:
+        _w_named = float(_osac.environ.get("ALPHAGRAD_ALL_CHANNEL_W", "1.0") or 1.0)
+        _names_req = [n.strip() for n in _rc_raw.split(",") if n.strip()]
+        _bad = [n for n in _names_req if n not in REWARD_INDEX]
+        if _bad:
+            raise ValueError(
+                f"ALPHAGRAD_REWARD_CHANNELS names unknown channel(s) {_bad}; "
+                f"valid keys: {sorted(REWARD_INDEX)}"
+            )
+        for _nm in _names_req:
+            w[REWARD_INDEX[_nm]] = _w_named
+        # Honour Lagrangian-constraint zeroing even in explicit-list mode.
+        _asc = str(getattr(args, "reward_as_constraints", "") or "")
+        if _asc:
+            for _cn in _asc.split(","):
+                _cn = _cn.strip()
+                if _cn in REWARD_INDEX:
+                    w[REWARD_INDEX[_cn]] = 0.0
+        if not np.any(w):
+            w[REWARD_INDEX["muls_adds_fmas"]] = 1.0
+        return w
+
     _all_ch = (
         _osac.environ.get("ALPHAGRAD_REWARD_ALL_CHANNELS", "0") == "1"
         or "all" in getattr(args, "rewards", [])
