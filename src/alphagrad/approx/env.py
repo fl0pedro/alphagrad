@@ -724,6 +724,14 @@ class EnvConfig(NamedTuple):
     # episode takes effect (later Quant ops dropped) — one global quantization
     # choice (a single dtype, or none) instead of per-vertex repeated quant.
     quant_once: bool = False
+    # Perf: whether the QUALITY channels (cosine_sim / frob_residual) carry any
+    # reward weight. When BOTH are zero-weighted (e.g. the 5-channel reward
+    # flops,xla_peak_memory,peak_memory,latency_ns,bkstep_acc), the EXACT
+    # reference Jacobian (``compiled_exact``) is never consumed — so we skip its
+    # compile+exec entirely (a full jacrev per terminal step). Default True =
+    # legacy behaviour (always compute the exact Jacobian). The workers set it
+    # from ``build_reward_weights`` (cosine_sim==0 and frob_residual==0 -> False).
+    quality_rewarded: bool = True
 
 
 def _get_partials(order, sparsity_specs, stop):
@@ -2497,13 +2505,22 @@ def _callback(
     # exact mid-rollout yields ``(cos=0, frob=0)`` regardless. Skip
     # the compile + execute when the step is non-terminal; the cache
     # entry would never be re-used productively anyway.
-    if is_terminal:
+    # PERF (bridge-cse): skip the exact reference Jacobian ENTIRELY when neither
+    # cosine_sim nor frob_residual is rewarded (config.quality_rewarded False).
+    # ``compiled_exact`` only feeds those quality channels; with a cost-only
+    # reward (e.g. the 5-channel flops/mem/latency/bkstep set) it is dead work —
+    # a full jacrev compile+exec per terminal step. Gating it here removes the
+    # single biggest per-terminal cost. cosine_sim/frob_residual then log 0.
+    _want_exact = bool(getattr(config, "quality_rewarded", True))
+    if is_terminal and _want_exact:
         compiled_exact = _inproc_lru_cached_compile(b"exact:" + exact_cache_key, _do_compile_exact)
         if _dbg_t:
             print(f"[DBG-env] exact_compile={_time.time()-_t0:.1f}s", flush=True)
             _t0 = _time.time()
     else:
         compiled_exact = None
+        if _dbg_t and is_terminal and not _want_exact:
+            print("[DBG-env] exact_compile SKIPPED (quality not rewarded)", flush=True)
 
     # XLA cost analysis — flops + bytes accessed. Falls back to 0 when the
     # backend doesn't expose them (CPU sometimes returns an empty dict).
@@ -3296,6 +3313,7 @@ class VertexEliminationEnv:
         measure_grad: bool = False,
         latency_timer: str = "perf_counter",
         quant_once: bool = False,
+        quality_rewarded: bool = True,
     ):
         assert (argnums is None and args is None) or not (args is None or args is None)
         config = EnvConfig(
@@ -3324,6 +3342,7 @@ class VertexEliminationEnv:
             measure_grad=measure_grad,
             latency_timer=latency_timer,
             quant_once=quant_once,
+            quality_rewarded=quality_rewarded,
         )
         return cls(
             config,

@@ -540,6 +540,24 @@ class CpuApproximationServer:
 # sharding). Kept private — callers should use the `from_args_dict`
 # classmethod above.
 # ---------------------------------------------------------------------------
+def _quality_is_rewarded(args) -> bool:
+    """True iff cosine_sim OR frob_residual carries a non-zero reward weight.
+
+    Same derivation as ppo_ray_worker._quality_is_rewarded — from
+    build_reward_weights (reads ALPHAGRAD_REWARD_CHANNELS too). When False the
+    env skips the exact reference Jacobian. Any failure -> True (safe)."""
+    try:
+        from alphagrad.approx.common.reward_scaling import build_reward_weights
+        from alphagrad.approx.env import REWARD_INDEX
+        w = build_reward_weights(args)
+        return bool(
+            w[REWARD_INDEX["cosine_sim"]] != 0.0
+            or w[REWARD_INDEX["frob_residual"]] != 0.0
+        )
+    except Exception:
+        return True
+
+
 def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0):
     """Rebuild a `VertexEliminationEnv` from a serialisable args_dict.
 
@@ -658,6 +676,12 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         ),
         flop_gate_threshold=float(getattr(args, "flop_gate_threshold", 0.0)),
         terminal_rewards_only=terminal_rewards_only,
+        # PERF (bridge-cse): THIS env (inside the CpuApproximationActor) runs the
+        # actual _callback measurement, so it must know whether to skip the exact
+        # reference Jacobian. Skip it when neither cosine_sim nor frob_residual is
+        # rewarded — derived from build_reward_weights (same vector the reward
+        # uses; reads ALPHAGRAD_REWARD_CHANNELS too). Any failure -> True (safe).
+        quality_rewarded=_quality_is_rewarded(args),
     )
 
     num_eval = int(getattr(args, "num_eval_samples", 10) or 10)

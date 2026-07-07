@@ -221,6 +221,25 @@ def _build_reward_weights(args) -> np.ndarray:
     return build_reward_weights(args)
 
 
+def _quality_is_rewarded(args) -> bool:
+    """True iff cosine_sim OR frob_residual carries a non-zero reward weight.
+
+    Derived from the SAME ``build_reward_weights`` the reward uses, so the
+    env's exact-Jacobian skip (config.quality_rewarded) can never diverge from
+    the actual reward. When False the env skips the exact reference Jacobian
+    (a full jacrev per terminal step). Any failure -> True (safe: compute it)."""
+    try:
+        from alphagrad.approx.common.reward_scaling import build_reward_weights
+        from alphagrad.approx.env import REWARD_INDEX
+        w = build_reward_weights(args)
+        return bool(
+            w[REWARD_INDEX["cosine_sim"]] != 0.0
+            or w[REWARD_INDEX["frob_residual"]] != 0.0
+        )
+    except Exception:
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Minimal Agent — small footprint by design.
 #
@@ -706,6 +725,10 @@ class PPORayWorker:
             measure_latency=measure_latency,
             terminal_rewards_only=self._terminal_rewards_only,
             measure_grad=bool(getattr(self.args, "measure_grad", False)),
+            # PERF (bridge-cse): skip the exact reference Jacobian when neither
+            # cosine_sim nor frob_residual is rewarded — derived from the SAME
+            # weight vector the reward uses, so it can never diverge.
+            quality_rewarded=_quality_is_rewarded(self.args),
         )
         eval_samples = generate_eval_samples(
             env, eval_key, int(self.args.num_eval_samples),
