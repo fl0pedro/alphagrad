@@ -140,6 +140,52 @@ def build_reward_weights(args) -> np.ndarray:
     pipeline doc describes.
     """
     w = np.zeros(NUM_REWARDS, dtype=np.float32)
+
+    # ALL-CHANNEL PopArt reward (bridge-cse, USER-DIRECTED). When
+    # ALPHAGRAD_REWARD_ALL_CHANNELS=1 (or --rewards contains ``all``), put a
+    # NON-ZERO weight on EVERY applicable measured channel and let PopArt
+    # normalise each ((G_k - mu_k)/sigma_k) before the weighted sum. The env's
+    # reward vector already stores costs NEGATED (r = -cost) and the quality
+    # channels (cosine_sim, bkstep_acc) POSITIVE, so a single POSITIVE weight
+    # per channel gives the correct sign (reward low-cost + high-fidelity).
+    # frob_residual is emitted as -residual (negated) so it too takes a
+    # positive weight. Uniform weight (default 1.0, ALPHAGRAD_ALL_CHANNEL_W)
+    # since PopArt handles the disparate raw scales. Channels that are not
+    # actually populated are left at 0 so a dead channel (e.g. latency without
+    # --measure-latency, bkstep without ALPHAGRAD_BKSTEP=1) never enters the
+    # sum. flops (order-discriminating) + muls_adds are always in the set.
+    import os as _osac
+    _all_ch = (
+        _osac.environ.get("ALPHAGRAD_REWARD_ALL_CHANNELS", "0") == "1"
+        or "all" in getattr(args, "rewards", [])
+    )
+    if _all_ch:
+        _w_all = float(_osac.environ.get("ALPHAGRAD_ALL_CHANNEL_W", "1.0") or 1.0)
+        # Cost + quality channels that graphax/XLA measure for the output
+        # Jacobian. latency_ns only meaningful with --measure-latency;
+        # bkstep_acc only when the closed-loop probe is on.
+        _names = [
+            "flops", "muls_adds_fmas", "max_io_sum", "bytes_accessed",
+            "peak_memory", "xla_peak_memory", "cosine_sim", "frob_residual",
+        ]
+        if bool(getattr(args, "measure_latency", False)) or \
+                getattr(args, "cmp_type", "") == "latency":
+            _names.append("latency_ns")
+        if _osac.environ.get("ALPHAGRAD_BKSTEP", "0") == "1":
+            _names.append("bkstep_acc")
+        for _nm in _names:
+            w[REWARD_INDEX[_nm]] = _w_all
+        # Honour Lagrangian-constraint zeroing even in all-channel mode.
+        _asc = str(getattr(args, "reward_as_constraints", "") or "")
+        if _asc:
+            for _cn in _asc.split(","):
+                _cn = _cn.strip()
+                if _cn in REWARD_INDEX:
+                    w[REWARD_INDEX[_cn]] = 0.0
+        if not np.any(w):
+            w[REWARD_INDEX["muls_adds_fmas"]] = 1.0
+        return w
+
     if "cmp" in args.rewards:
         cmp_name = _CMP_TYPE_TO_REWARD[args.cmp_type]
         w[REWARD_INDEX[cmp_name]] = float(getattr(args, "lambda_cmp", 1.0))

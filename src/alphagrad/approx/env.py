@@ -2983,38 +2983,89 @@ def _callback(
 
     # ------------------------------------------------------------------
     # B_kstep — closed-loop trainability accuracy (the "acc" reward channel
-    # under ALPHAGRAD_ACC_PROXY=bkstep). Terminal + measure_grad only: it needs
-    # the policy's approx-GRADIENT fn (compiled_approx returns (value, grads)).
-    # Runs K Adam steps × S seeds of REAL MNIST training with the approx grad,
-    # then reads test accuracy. Gated behind ALPHAGRAD_BKSTEP=1 so cosine-only
+    # under ALPHAGRAD_ACC_PROXY=bkstep). Terminal only. It runs K Adam steps ×
+    # S seeds of REAL MNIST training with the rule's OWN approx gradient, then
+    # reads a trainability signal. Gated behind ALPHAGRAD_BKSTEP=1 so cheap
     # runs pay nothing. Any failure -> 0.0 (worst trainability), never a crash.
+    #
+    # TWO MODES (bridge-cse): the _bkstep_probe contract is
+    # ``approx_grad_fn(*args) -> (loss_value, approx_grads)`` + a SCALAR
+    # ``loss_fn``. We supply both regardless of measure_grad:
+    #   * GRAD mode (measure_grad=True): compiled_approx already IS
+    #     value_and_grad -> (value, grads); config.target_fun is the scalar
+    #     loss. Pass them straight through (legacy path).
+    #   * JACOBIAN mode (measure_grad=False): compiled_approx returns the
+    #     OUTPUT JACOBIAN J = d output / d weights (the NN example's output is
+    #     per-element squared errors, so J is d(sq_err)/d w). The loss GRADIENT
+    #     is the Jacobian contracted with the loss's output-cotangent: for the
+    #     scalar loss L = mean(output) that cotangent is (1/N)*ones, so
+    #     grad_w L = sum over the output axes of J[w] / N. We wrap J into
+    #     (loss_value, grads) with exactly that contraction, and wrap the
+    #     forward config.target_fun into the scalar mean() for the eval loss.
+    #     (loss GRADIENT == output JACOBIAN contracted with d loss / d output —
+    #     so bkstep stays a valid Jacobian-trainability signal.)
     # ------------------------------------------------------------------
     bkstep_acc = 0.0
     _bkstep_on = os.environ.get("ALPHAGRAD_BKSTEP", "0") == "1"
-    if _bkstep_on and is_terminal and config.measure_grad:
+    if _bkstep_on and is_terminal and config.target_fun is not None:
         try:
             _bk_k = int(os.environ.get("ALPHAGRAD_BKSTEP_K", "40") or "40")
             _bk_ns = int(os.environ.get("ALPHAGRAD_BKSTEP_SEEDS", "2") or "2")
             _bk_seeds = tuple(range(max(_bk_ns, 1)))
             if _dbg_t:
                 _tbk = _time.time()
-            # Dynamic over any example: the eval loss is the env's OWN
-            # scalar-MSE target (``config.target_fun`` == mean(base_fn(*args))
-            # under --measure-grad), and the data slots are every non-weight
-            # arg before ``argnums`` (x=0, y=1 by the get_args convention). No
-            # hardcoded NN forward -> works for ViT's 18-arg / argnums(2..18).
+            # Dynamic over any example: the data slots are every non-weight
+            # arg (x=0, y=1 by the get_args convention). No hardcoded NN
+            # forward -> works for ViT's 18-arg / argnums(2..18).
             _data_argnums = tuple(
                 i for i in range(len(args)) if i not in set(config.argnums)
             )
+            _base_fn = config.target_fun
+            if config.measure_grad:
+                # value_and_grad path: compiled_approx -> (value, grads);
+                # target_fun is already the scalar loss.
+                _probe_grad_fn = compiled_approx
+                _probe_loss_fn = _base_fn
+            else:
+                # OUTPUT-JACOBIAN path: contract J with the scalar-loss
+                # output-cotangent (1/N * ones) to recover the loss gradient.
+                _jac_argnums = tuple(int(a) for a in config.argnums)
+
+                def _probe_grad_fn(*call_args, _fn=_base_fn,
+                                   _jac=compiled_approx, _an=_jac_argnums):
+                    _out = _fn(*call_args)          # (batch, out_dim...) sq-errs
+                    _N = max(int(_out.size), 1)
+                    _loss = jnp.sum(_out) / _N       # scalar mean loss
+                    _J = _jac(*call_args)            # tuple over argnums
+                    _leaves = _J if isinstance(_J, (tuple, list)) else (_J,)
+                    _od = int(jnp.ndim(_out))        # # leading output axes
+                    _grads = []
+                    for _lf, _a in zip(_leaves, _an):
+                        _lf = jnp.asarray(_lf)
+                        # J[a] leads with the output axes (out_dims...) then the
+                        # weight-parameter axes (native jacve layout, possibly
+                        # transposed — _bkstep_align_grads fixes that). Contract
+                        # ONLY the leading output axes with the (1/N)*ones
+                        # cotangent (== mean over outputs) -> d loss / d w, with
+                        # the parameter layout preserved for align_grads.
+                        _sum_axes = tuple(range(min(_od, _lf.ndim)))
+                        _g = jnp.sum(_lf, axis=_sum_axes) / _N
+                        _grads.append(_g)
+                    return _loss, tuple(_grads)
+
+                def _probe_loss_fn(*call_args, _fn=_base_fn):
+                    return jnp.mean(_fn(*call_args))
+
             bkstep_acc = _bkstep_probe(
-                compiled_approx, args, config.argnums,
+                _probe_grad_fn, args, config.argnums,
                 n_steps=max(_bk_k, 1), seeds=_bk_seeds,
-                loss_fn=config.target_fun, data_argnums=_data_argnums,
+                loss_fn=_probe_loss_fn, data_argnums=_data_argnums,
             )
             if _dbg_t:
                 print(
                     f"[DBG-env] bkstep acc={bkstep_acc:.4f} K={_bk_k} "
-                    f"seeds={_bk_ns} t={_time.time()-_tbk:.1f}s", flush=True,
+                    f"seeds={_bk_ns} mgrad={config.measure_grad} "
+                    f"t={_time.time()-_tbk:.1f}s", flush=True,
                 )
         except Exception as _bk_e:  # pragma: no cover - defensive
             print(f"[bkstep] probe failed -> acc=0.0 | {_bk_e}", flush=True)

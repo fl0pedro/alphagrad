@@ -73,7 +73,15 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--rewards", nargs="+", type=str,
-        default=["cmp", "mem", "acc"], choices=["cmp", "mem", "acc"],
+        default=["cmp", "mem", "acc"], choices=["cmp", "mem", "acc", "all"],
+        help="Reward channels. cmp/mem/acc = the 3 weighted slots (driver "
+        "channel picked by --cmp-type/--mem-type/ALPHAGRAD_ACC_PROXY). ``all`` "
+        "(or ALPHAGRAD_REWARD_ALL_CHANNELS=1) puts a uniform positive weight on "
+        "EVERY applicable measured channel (flops, muls_adds, latency_ns, "
+        "max_io, bytes, peak_memory, xla_peak_memory, cosine_sim, frob_residual "
+        "+ bkstep_acc when ALPHAGRAD_BKSTEP=1); PopArt normalises each and the "
+        "env's stored signs (costs negated, quality positive) make the single "
+        "positive weight reward low-cost + high-fidelity.",
     )
     p.add_argument("--lambda-cmp", type=float, default=1.0)
     p.add_argument("--lambda-mem", type=float, default=1.0)
