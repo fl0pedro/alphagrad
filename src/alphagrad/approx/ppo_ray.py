@@ -394,7 +394,13 @@ def _run(args) -> int:
     _rw = build_reward_weights(args)
     _obj_idx = [int(i) for i in np.nonzero(_rw)[0]]
     _obj_names = [REWARD_NAMES[i] for i in _obj_idx]
-    pareto = ParetoArchive(_obj_names, _obj_idx) if _obj_idx else None
+    # ALPHAGRAD_PARETO_LOG (default ON): pure Pareto-front TELEMETRY over the
+    # active objective channels. OFF -> pareto=None -> _feed_pareto/_dump_pareto
+    # are no-ops and no pareto/* keys are logged => byte-identical to a run
+    # without the archive. This NEVER touches reward/advantage/value/PopArt.
+    _pareto_log_on = os.environ.get("ALPHAGRAD_PARETO_LOG", "1").strip().lower() \
+        in ("1", "true", "yes", "on")
+    pareto = ParetoArchive(_obj_names, _obj_idx) if (_obj_idx and _pareto_log_on) else None
     _arch_dir = os.path.dirname(best_seq_json_path) or os.getcwd()
     pareto_front_path = os.path.join(_arch_dir, "ppo_pareto_front.json")
     pareto_all_path = os.path.join(_arch_dir, "ppo_all_front_candidates.json")
@@ -694,6 +700,25 @@ def _run(args) -> int:
             dump_best_sequences_json(state, best_seq_json_path)
             _dump_pareto()
             log_dict.update(build_best_sequences_wandb_payload(state, ep=ep))
+
+        # Pareto-front TELEMETRY into the SAME log payload (one wandb.log ==
+        # one _step). READS the already-fed archive only; no reward path.
+        if pareto is not None:
+            try:
+                # hypervolume() is exact for <=3 objectives and a finite
+                # normalized Monte-Carlo estimate for >=4 (common.pareto_archive)
+                # -> always a finite float here.
+                _hv = pareto.hypervolume()
+                log_dict["pareto/hypervolume"] = (
+                    float(_hv) if np.isfinite(_hv) else 0.0
+                )
+                log_dict["pareto/archive_size"] = int(len(pareto.pts))
+                if pareto.pts:
+                    _front = np.stack(pareto.pts)  # (n_pts, n_obj), maximize
+                    for _k, _nm in enumerate(pareto.obj_names):
+                        log_dict[f"pareto/best/{_nm}"] = float(_front[:, _k].max())
+            except Exception as _pexc:
+                tqdm.write(f"  [ppo_ray] pareto log failed: {_pexc}")
 
         wandb.log(log_dict)
 

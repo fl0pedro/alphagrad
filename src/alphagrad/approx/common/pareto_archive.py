@@ -17,6 +17,12 @@ from __future__ import annotations
 import json
 import numpy as np
 
+# Exact-match sentinel signature shared with the reward plumbing
+# (common.cache.SENTINEL_REWARD_VALUE). A failed/skipped measure stamps this
+# on cost channels; a zeroed-reward no-op reads as all-zeros. Neither is a
+# real Pareto point, so the archive rejects both (exact match, not <=).
+_SENTINEL_OBJ_VALUE = -1e10
+
 
 def pareto_mask(points) -> np.ndarray:
     """Boolean mask of non-dominated rows (maximization)."""
@@ -51,16 +57,64 @@ def _hv3d_min(pts, ref):
     return float(vol)
 
 
+def _hv_mc_normalized(pts, ref, *, n_samples: int = 100_000, seed: int = 0) -> float:
+    """Monte-Carlo hypervolume for D>=4 objectives (no cheap exact formula).
+
+    MAXIMIZATION front ``pts`` (P x D) above nadir ``ref`` (D,). Because our
+    channels span wildly different magnitudes (peak_memory ~1e9, latency ~1e5,
+    flops ~1e9, cosine ~1), the volume is computed in per-axis MIN-MAX
+    NORMALIZED space over ``front union ref`` so no single 1e9 axis dominates and
+    the result is a scale-free fraction in ~[0, 1] comparable across
+    episodes/runs. Deterministic (fixed ``seed``); degenerate zero-width axes are
+    skipped (they contribute no volume).
+
+    HV_frac = mean_s [ some front point dominates sample s (>= in every dim) ]
+    over N uniform samples in the normalized box [0, 1]^D_eff; the reported value
+    IS that fraction (already the box-volume-normalized dominated volume, since
+    the normalized box has unit volume on the kept axes).
+    """
+    pts = np.asarray(pts, dtype=np.float64)
+    ref = np.asarray(ref, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] == 0:
+        return 0.0
+    # per-axis min/max over front + nadir -> normalization span
+    lo = np.minimum(pts.min(axis=0), ref)
+    hi = pts.max(axis=0)
+    span = hi - lo
+    keep = span > 0.0            # drop zero-width axes (no volume along them)
+    if not np.any(keep):
+        return 0.0
+    ptsn = (pts[:, keep] - lo[keep]) / span[keep]     # front in [0,1]^Dk
+    refn = (ref[keep] - lo[keep]) / span[keep]        # nadir in [0,1]^Dk (>=0)
+    rng = np.random.default_rng(seed)
+    # sample uniformly in the box [refn, 1]^Dk (region that CAN be dominated
+    # above the nadir); scale the fraction back by that box's volume so the
+    # result is the dominated volume as a fraction of the FULL [0,1]^Dk unit box.
+    hicorner = np.ones_like(refn)
+    box_span = hicorner - refn
+    if np.any(box_span <= 0.0):
+        return 0.0
+    S = rng.random((int(n_samples), ptsn.shape[1]))
+    samp = refn + S * box_span
+    # dominated iff some front point >= sample in ALL kept dims
+    dom = np.any(np.all(ptsn[:, None, :] >= samp[None, :, :], axis=2), axis=0)
+    box_vol = float(np.prod(box_span))
+    return float(dom.mean() * box_vol)
+
+
 def hypervolume(points, ref) -> float:
     """Hypervolume dominated by ``points`` (maximization) above nadir ``ref``.
-    Returns NaN for >3 objectives (no cheap exact formula wired)."""
+    Exact for 2/3 objectives; a finite normalized Monte-Carlo estimate for
+    >=4 objectives (see _hv_mc_normalized)."""
     pts = np.asarray(points, dtype=np.float64)
     ref = np.asarray(ref, dtype=np.float64)
     if pts.ndim != 2 or pts.shape[0] == 0:
         return 0.0
     m = pts.shape[1]
     if m not in (2, 3):
-        return float("nan")
+        # D>=4: no cheap exact HV -> deterministic normalized Monte-Carlo
+        # estimate (finite, scale-free ~[0,1]). <=3 keeps the exact sweep.
+        return _hv_mc_normalized(pts[pareto_mask(pts)], ref)
     pts = pts[pareto_mask(pts)]
     pts = pts[np.all(pts > ref, axis=1)]
     if pts.shape[0] == 0:
@@ -96,6 +150,12 @@ class ParetoArchive:
         than being silently swallowed, so channel/width drift surfaces loudly)."""
         g = np.array([float(reward_vec[i]) for i in self.obj_idx], dtype=np.float64)
         if not np.all(np.isfinite(g)):
+            return False
+        # Reject sentinel / failed-measure candidates (never real Pareto
+        # points): any objective at the exact sentinel value, OR the
+        # all-objective-exactly-zero no-op (zeroed reward reads as best-cost
+        # and would spuriously dominate the front + inflate the HV box).
+        if np.any(g == _SENTINEL_OBJ_VALUE) or not np.any(g != 0.0):
             return False
         for p in self.pts:
             # dominated by, or objective-identical to, an existing front point
