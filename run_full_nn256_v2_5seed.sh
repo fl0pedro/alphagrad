@@ -290,8 +290,17 @@ NAME="full_nn256_v2${VARIANT:+_$VARIANT}$([ "$VALUE_NORM" = popart ] && echo _po
 
 echo "########## FULL_NN256_V2 $(date) | head=$NODE0 eps=$EPISODES NN_HIDDEN=256 variant=${VARIANT:-full} value_norm=$VALUE_NORM measure-grad ##########"
 
+# Ray head sizing. Defaults = 4-GPU/64-core Blackwell (shipped). For the 8-GPU
+# H100 node (pgi15-gpu14): set RAY_NUM_GPUS=8 RAY_NUM_CPUS=128 (NOT 256 — that
+# overloads the raylet worker-prestart and SIGABRTs it, exit -6) and
+# RAY_memory_monitor_refresh_ms=0 (the H100 node's 1.5 TB-RAM memory monitor
+# mis-fires and aborts the raylet). Both verified on gpu14 (Stage-1b H100 sweep).
+export RAY_memory_monitor_refresh_ms="${RAY_memory_monitor_refresh_ms:-0}"
+RAY_NUM_GPUS="${RAY_NUM_GPUS:-4}"
+RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 ( cd ~/dsnn && uv run --no-sync ray start --head --node-ip-address=$HEAD_IP \
-    --port=$RAY_PORT --num-gpus=4 --num-cpus=64 --block ) &
+    --port=$RAY_PORT --num-gpus=$RAY_NUM_GPUS --num-cpus=$RAY_NUM_CPUS \
+    --object-store-memory=8000000000 --block ) &
 disown
 sleep 25
 echo "==== Ray up (4 GPU $NODE0) $(date) ===="
