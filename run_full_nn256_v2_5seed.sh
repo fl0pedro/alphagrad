@@ -325,6 +325,30 @@ P3O_FLAG=$([ "$P3O" = 1 ] && echo "--p3o")
 REPLAY_FLAGS=""
 [ "$REPLAY_BUFFER_SIZE" -gt 0 ] 2>/dev/null && REPLAY_FLAGS="--replay-buffer-size $REPLAY_BUFFER_SIZE --replay-sample-trajs $REPLAY_SAMPLE_TRAJS --vtrace-rho-bar $VTRACE_RHO_BAR --vtrace-c-bar $VTRACE_C_BAR --p3o-kl-coef $P3O_KL_COEF"
 
+# >>> ASYNC PIPELINE (Stage 1) + MEASURE-ACTOR SCALING (Stage 1b, bridge-cse) <<<
+# ASYNC=1 enables the Stage-1 async pipeline (--async-pipeline): sampler
+# collects+measures into the replay buffer WHILE the learner runs P3O updates
+# concurrently (measure ∥ learn). Requires P3O=1 + REPLAY_BUFFER_SIZE>0. ASYNC=0
+# (default) = the synchronous per-episode loop (unchanged).
+# MEASURE-ACTOR SCALING (Stage-1b sweep result): MORE measure actors sharing
+# GPU1-3 parallelizes the CPU-bound ~1.9s/order compile. Sweep on a 4-GPU
+# 64-core Blackwell node found N=12 actors × 4 cores × 0.25 GPU = the sweet spot
+# (0.126 meas/s, 2.5x over sync, 1.83x over the 3-actor async baseline; 0 OOM,
+# nan_skip=0). N=9 with 0.33-GPU is a BROKEN config (hung warmup) — avoid it.
+# Defaults keep the shipped 3-actor / 1-GPU / 8-core layout; set NUM_CPU_WORKERS
+# + CPU_ACTOR_NUM_GPUS + CPU_CORES_PER_ACTOR together for the scaled config.
+ASYNC="${ASYNC:-0}"
+ASYNC_WARMUP_TRAJS="${ASYNC_WARMUP_TRAJS:-2}"
+ASYNC_UPDATES_PER_STEP="${ASYNC_UPDATES_PER_STEP:-1}"
+ASYNC_WEIGHT_SYNC_EVERY="${ASYNC_WEIGHT_SYNC_EVERY:-4}"
+ASYNC_FLAG=""
+[ "$ASYNC" = 1 ] && ASYNC_FLAG="--async-pipeline --async-warmup-trajs $ASYNC_WARMUP_TRAJS --async-updates-per-step $ASYNC_UPDATES_PER_STEP --async-weight-sync-every $ASYNC_WEIGHT_SYNC_EVERY"
+# Measure-actor layout (defaults = shipped 3×1GPU×8core; recommended scaled
+# async config: NUM_CPU_WORKERS=12 CPU_ACTOR_NUM_GPUS=0.25 CPU_CORES_PER_ACTOR=4).
+NUM_CPU_WORKERS="${NUM_CPU_WORKERS:-3}"
+CPU_ACTOR_NUM_GPUS="${CPU_ACTOR_NUM_GPUS:-1}"
+CPU_CORES_PER_ACTOR="${CPU_CORES_PER_ACTOR:-8}"
+
 uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --example VmappedNeuralNetwork --dataset mnist \
   --rewards $REWARDS_FLAG --cmp-type $CMP_TYPE --mem-type peak_memory \
@@ -334,8 +358,9 @@ uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --lambda-cossim-guide $LAMBDA_COSSIM_GUIDE \
   --entropy-coef $ENTROPY_COEF --entropy-coef-final $ENTROPY_COEF_FINAL \
   --dynamic-substeps --max-substeps ${MAX_SUBSTEPS} \
-  --actor-num-gpus 1 --cpu-actor-num-gpus 1 --num-cpu-workers 3 \
-  --cpu-cores-per-actor 8 --cpu-cores-shared \
+  $ASYNC_FLAG \
+  --actor-num-gpus 1 --cpu-actor-num-gpus $CPU_ACTOR_NUM_GPUS --num-cpu-workers $NUM_CPU_WORKERS \
+  --cpu-cores-per-actor $CPU_CORES_PER_ACTOR --cpu-cores-shared \
   --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \
   --cpu-worker-recycle-every ${CPU_WORKER_RECYCLE_EVERY:-6} \
   --ray-address $HEAD_IP:$RAY_PORT \
