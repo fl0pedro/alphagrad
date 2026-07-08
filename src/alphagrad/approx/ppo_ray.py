@@ -609,8 +609,50 @@ def _run(args) -> int:
         ncols=180,
     )
 
+    # SUBSTEP-BUDGET CURRICULUM (bridge-cse). Ramp the per-vertex micro-action
+    # budget 0 -> CEIL in equal levels of STEP episodes: budget(ep) =
+    # min(CEIL, ep // STEP). Level 0 (budget=0) = pure exact elimination
+    # (order only, NO micro-actions) so the policy learns the ORDER first,
+    # then approximation opens up gradually. Applied as a RUNTIME cap in the
+    # worker (positions >= budget -> OP_END), traced -> no recompile on step.
+    # Flag-guarded: OFF => setter never called => byte-identical.
+    _subcur_on = (
+        os.environ.get("ALPHAGRAD_SUBSTEP_CURRICULUM", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+        or bool(getattr(args, "substep_curriculum", False))
+    )
+    _subcur_step = int(os.environ.get("ALPHAGRAD_SUBSTEP_CURRICULUM_STEP", "40") or 40)
+    _subcur_ceil = int(
+        os.environ.get("ALPHAGRAD_SUBSTEP_CURRICULUM_CEIL",
+                       str(int(getattr(args, "max_substeps", 16)))) or 16
+    )
+    _subcur_step = max(1, _subcur_step)
+    _subcur_last = -1
+    def _substep_budget_at(_ep):
+        return int(min(_subcur_ceil, _ep // _subcur_step))
+    if _subcur_on:
+        _n_levels = _subcur_ceil + 1
+        tqdm.write(
+            f"  [substep-curriculum] ON: budget(ep)=min({_subcur_ceil}, "
+            f"ep//{_subcur_step}); {_n_levels} levels x {_subcur_step} eps = "
+            f"{_n_levels * _subcur_step} eps to reach full; ep0 budget="
+            f"{_substep_budget_at(0)} (pure elimination), steps to 1 at ep="
+            f"{_subcur_step}."
+        )
+
     for ep in range(args.episodes):
         seed_counter += 1
+        # Push this episode's substep budget to the worker (only when it
+        # CHANGES -> at most CEIL+1 remote calls over the whole run).
+        if _subcur_on:
+            _bud = _substep_budget_at(ep)
+            if _bud != _subcur_last:
+                _applied = ray.get(actor.set_substep_budget.remote(_bud))
+                tqdm.write(
+                    f"  [substep-curriculum] ep={ep}: budget -> {_applied}"
+                    + (" (pure exact elimination)" if _applied == 0 else "")
+                )
+                _subcur_last = _bud
 
         # Wall-clock budget: stop cleanly once --max-wall-seconds has elapsed
         # (the final Pareto + best-sequence archives are dumped after the loop).
@@ -682,6 +724,8 @@ def _run(args) -> int:
         # Carry over the legacy `entropy` key for plot continuity with
         # earlier runs (build_wandb_log_dict uses `entropy_mean`).
         log_dict.setdefault("entropy", ent)
+        if _subcur_on:
+            log_dict["curriculum/substep_budget"] = int(_substep_budget_at(ep))
 
         # Periodic JSON snapshot + wandb scalar payload of the
         # running per-channel + overall bests. The full

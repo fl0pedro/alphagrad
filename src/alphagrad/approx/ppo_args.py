@@ -671,6 +671,15 @@ def make_argparser() -> argparse.ArgumentParser:
         "Must be <= env.MAX_RULES_PER_VERTEX (16) to avoid silent truncation.",
     )
     p.add_argument(
+        "--substep-curriculum", action="store_true",
+        help="Ramp the per-vertex micro-action budget 0->CEIL in equal "
+        "levels of STEP episodes: budget(ep)=min(CEIL, ep//STEP). Level 0 "
+        "(budget=0) = pure exact elimination (order only). Runtime cap (no "
+        "recompile). STEP=ALPHAGRAD_SUBSTEP_CURRICULUM_STEP (default 40), "
+        "CEIL=ALPHAGRAD_SUBSTEP_CURRICULUM_CEIL (default --max-substeps). "
+        "Also ALPHAGRAD_SUBSTEP_CURRICULUM=1. OFF = current behaviour.",
+    )
+    p.add_argument(
         "--factors", type=str, default="-1,2,3,4",
         help="Comma-separated DIAG factor choices the policy picks from. "
         "``-1`` resolves to ``gcd(n_i, n_j)`` per env edge; everything "

@@ -104,6 +104,13 @@ class PPOActor:
         calls this between episodes when ``--curriculum`` is set."""
         return self._impl.set_variant_masks(str(variant))
 
+    def set_substep_budget(self, budget) -> int:
+        """Substep-budget curriculum — forward to
+        ``PPORayWorker.set_substep_budget``. Exposing it on the Ray ACTOR
+        class (not just the inner worker) is what makes the
+        ``actor.set_substep_budget.remote(...)`` round-trip work."""
+        return self._impl.set_substep_budget(int(budget))
+
     def ready(self) -> bool:
         if self._impl is None:
             return False

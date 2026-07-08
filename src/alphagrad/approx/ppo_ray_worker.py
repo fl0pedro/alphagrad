@@ -1538,6 +1538,11 @@ class PPORayWorker:
             # Policy V2 static inputs: substep budget + prime/gcd factor
             # tables sized from the env's static axis structure.
             self.max_substeps = int(getattr(self.args, "max_substeps", 16))
+            # SUBSTEP-BUDGET CURRICULUM (bridge-cse): per-episode RUNTIME cap
+            # on micro-action slots. Traced jnp scalar -> stepping it does NOT
+            # recompile act_step. Default = MAX_RULES_PER_VERTEX (no cap) so
+            # the curriculum-OFF path is byte-identical.
+            self._substep_budget_j = jnp.int32(MAX_RULES_PER_VERTEX)
             if self.max_substeps > MAX_RULES_PER_VERTEX:
                 print(
                     f"[ppo_ray_worker] --max-substeps {self.max_substeps} > "
@@ -1884,7 +1889,8 @@ class PPORayWorker:
 
         @eqx.filter_jit
         def act_step(agent, state_batch, vert_avail_batch,
-                     op_mask, factor_mask, quant_mask, key):
+                     op_mask, factor_mask, quant_mask, key,
+                     substep_budget=jnp.int32(MAX_RULES_PER_VERTEX)):
             """``op_mask``, ``factor_mask``, ``quant_mask`` are per-stage
             curriculum masks (shapes ``(4,)``, ``(F,)``, ``(NUM_QUANT_DTYPES,)``,
             1.0 for allowed, 0.0 otherwise). Passed as traced inputs so
@@ -2023,7 +2029,8 @@ class PPORayWorker:
 
         @eqx.filter_jit
         def act_step(agent, state_batch, vert_avail_batch,
-                     op_mask, factor_mask, quant_mask, key):
+                     op_mask, factor_mask, quant_mask, key,
+                     substep_budget=jnp.int32(MAX_RULES_PER_VERTEX)):
             """``op_mask`` (4,) gates op-types per variant/curriculum stage
             (order DIAG/COMPRESS/QUANT/END): any disallowed sampled op_type is
             rewritten to END (ppo-style op_legality_override) so restricted
@@ -2084,6 +2091,21 @@ class PPORayWorker:
                 f_seq = jnp.where(_disallowed, 0, f_seq)
                 kind_seq = jnp.where(_disallowed, 0, kind_seq)
                 q_seq = jnp.where(_disallowed, 0, q_seq)
+                # SUBSTEP-BUDGET CURRICULUM: cap the sub-episode at
+                # ``substep_budget`` slots; positions >= budget -> OP_END
+                # (no-op) + args zeroed (mirrors the _disallowed override,
+                # so the stored rewritten action == what the loss
+                # re-evaluates). budget=0 => every slot END => pure exact
+                # elimination (order only).
+                _pos = jnp.arange(op_seq.shape[0], dtype=jnp.int32)
+                _over = _pos >= substep_budget
+                op_seq = jnp.where(_over, jnp.int32(OP_END), op_seq)
+                i_seq = jnp.where(_over, 0, i_seq)
+                j_seq = jnp.where(_over, 0, j_seq)
+                exp_seq = jnp.where(_over[:, None], 0, exp_seq)
+                f_seq = jnp.where(_over, 0, f_seq)
+                kind_seq = jnp.where(_over, 0, kind_seq)
+                q_seq = jnp.where(_over, 0, q_seq)
                 rule_specs = micro_actions_to_rule_specs_jax(
                     op_seq, i_seq, j_seq, f_seq,
                     axis_state_v,
@@ -2992,6 +3014,7 @@ class PPORayWorker:
                     self.agent, state, avail,
                     self._current_op_mask_j, self._current_factor_mask_j,
                     self._current_quant_mask_j, sub,
+                    self._substep_budget_j,
                 )
             else:
                 (
@@ -3002,6 +3025,7 @@ class PPORayWorker:
                     self.agent, state, avail,
                     self._current_op_mask_j, self._current_factor_mask_j,
                     self._current_quant_mask_j, sub,
+                    self._substep_budget_j,
                 )
 
             # Convert to numpy for Ray fan-out.
@@ -4789,6 +4813,7 @@ class PPORayWorker:
                 self.agent, state, avail,
                 self._current_op_mask_j, self._current_factor_mask_j,
                 self._current_quant_mask_j, sub,
+                self._substep_budget_j,
             )
             pre_tokens = np.asarray(state.tokens)
             pre_eqn_ids = np.asarray(state.eqn_ids)
@@ -5053,6 +5078,7 @@ class PPORayWorker:
                     self.agent, state, avail,
                     self._current_op_mask_j, self._current_factor_mask_j,
                     self._current_quant_mask_j, sub,
+                    self._substep_budget_j,
                 )
                 partial = act_out[-4]
                 order = act_out[-3]
@@ -5098,6 +5124,14 @@ class PPORayWorker:
             "q75_symlog": np.quantile(samples_sl, 0.75, axis=0).astype(np.float32),
             "count": int(samples.shape[0]),
         }
+
+    def set_substep_budget(self, budget: int) -> int:
+        """Set the per-episode RUNTIME micro-action substep budget cap
+        (curriculum). budget=0 => pure exact elimination. Traced jnp scalar
+        so stepping it never recompiles act_step."""
+        b = int(max(0, min(int(budget), int(MAX_RULES_PER_VERTEX))))
+        self._substep_budget_j = jnp.int32(b)
+        return b
 
     def set_variant_masks(self, variant: str) -> dict:
         """Switch to a different curriculum stage by updating the
