@@ -100,7 +100,7 @@ export ALPHAGRAD_RAY_MICROPOLICY=${ALPHAGRAD_RAY_MICROPOLICY:-1}
 #   flops      : 0.06 / SIGMA_FLOPS  (CALIBRATED, injected below)
 #   cosine_sim : 1.0
 FLOPS_WEIGHT="${FLOPS_WEIGHT:-1.167e-9}"   # 0.06 / calibrated sigma_flops
-export ALPHAGRAD_REWARD_CHANNELS="peak_memory:1.04e-9,latency_ns:7.36e-8,flops:${FLOPS_WEIGHT},cosine_sim:1.0"
+export ALPHAGRAD_REWARD_CHANNELS="peak_memory:0.06,latency_ns:0.06,flops:0.06,cosine_sim:1.0"
 
 PPO=alphagrad/src/alphagrad/approx/ppo_ray.py
 EPISODES="${EPISODES:-500}"
@@ -114,7 +114,7 @@ MBS="${MBS:-4}"
 MAX_SUBSTEPS="${MAX_SUBSTEPS:-16}"
 ENTROPY_COEF="${ENTROPY_COEF:-0.05}"
 ENTROPY_COEF_FINAL="${ENTROPY_COEF_FINAL:-0.05}"
-VALUE_NORM="${VALUE_NORM:-baseline}"   # PopArt OFF
+VALUE_NORM="${VALUE_NORM:-popart}"    # PopArt ON (per-channel normalization; overridable)
 LR="${LR:-1e-4}"
 
 # EVEN H100 layout: 1 trainer GPU + 7 measure GPUs; 32 cores each.
