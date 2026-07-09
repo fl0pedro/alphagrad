@@ -38,6 +38,25 @@ from scipy.stats import spearmanr
 if AZ_INCREMENTAL:
     jax.config.update("jax_default_matmul_precision", "highest")
 from alphagrad.approx import incremental_encoder as _ie
+from alphagrad.approx.append_only_jaxpr import ProposerTokenizer
+# GENUINE append-only jaxpr proposer state (ALPHAGRAD_APPEND_ONLY_JAXPR=1):
+# the search STATE is the literal per-action jaxpr stream (base value jaxpr +
+# reserved Jacobian outputs + eliminate/COMPRESS/QUANT blocks), tokenized by
+# our append_only_jaxpr tokenizer and fed to the CAUSAL palimpsa incremental
+# encoder -- recompile-free by construction (pure-Python emission, 0 jit(_loss)).
+APPEND_ONLY_JAXPR = os.environ.get("ALPHAGRAD_APPEND_ONLY_JAXPR", "0") == "1"
+# Append-only jaxpr streams are VARIABLE length (per order) -> pad every
+# batched token stream to a FIXED cap (pad id 0; encoder masks tok>0, CE masks
+# illegal actions) so np.stack is uniform AND jit sees a STABLE shape (no
+# recompiles from a varying batch-max). Cap >> longest full-order stream.
+AOJ_TOK_CAP = int(os.environ.get("ALPHAGRAD_AOJ_TOK_CAP", "1024"))
+def _pad_tok_1d(a, cap=None):
+    import numpy as _np
+    cap = AOJ_TOK_CAP if cap is None else cap
+    a = _np.asarray(a).reshape(-1)
+    if a.shape[0] >= cap:
+        return a[:cap].astype(_np.int32)
+    return _np.pad(a.astype(_np.int32), (0, cap - a.shape[0]))
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--nn-hidden", type=int, default=256)
@@ -115,6 +134,14 @@ VALID = list(np.asarray(env.valid_vertices, dtype=np.int32)); NV = len(VALID)
 jaxpr = closed.jaxpr
 _eg, GRAPH0, TG0, VO = _build_graph(jaxpr, xs, closed.literals, ARGN); _prune_graph(GRAPH0, TG0, jaxpr, ARGN)
 print(f"[loop] NV={NV} valid={VALID}", flush=True)
+_AOJ_TK = None
+if APPEND_ONLY_JAXPR:
+    _AOJ_TK = ProposerTokenizer(LOSS, xs, ARGN, VALID)
+    print(f"[loop] APPEND-ONLY JAXPR proposer ON: base_tokens="
+          f"{len(_AOJ_TK.base_token_ids)} vocab0={_AOJ_TK.vocab.size}", flush=True)
+    _demo_ids = _AOJ_TK.order_tokens([VALID.index(v) for v in reversed(VALID)][:3])
+    print("[loop] APPEND-ONLY JAXPR stream (base + 3 blocks, strings):", flush=True)
+    print("   " + " ".join(_demo_ids[:120]), flush=True)
 def copy_g(g): return {kk: dict(vv) for kk, vv in g.items()}
 def outvar(i): return jaxpr.eqns[i - 1].outvars[0]
 def legal_set(graph): return [i for i in VALID if outvar(i) in graph]
@@ -177,16 +204,21 @@ _IE_STATIC = {"state": None, "n": 0}
 def _init_incremental_prefix():
     """Encode the empty-order (static-graph) token prefix once, snapshot the
     per-layer palimpsa carry. Returns nothing; fills _IE_STATIC."""
-    tok, _eqn, _ = _callback(env.config, env.args, env.consts,
-                             np.zeros((0,), np.int32),
-                             np.zeros((0, MAX_RULES, 3), np.int32), 0, *ev, init=True)
-    tok = np.asarray(tok)
-    real = tok[tok > 0]
+    if APPEND_ONLY_JAXPR:
+        # append-only jaxpr BASE = value jaxpr + reserved Jacobian outputs,
+        # encoded ONCE into the causal palimpsa carry.
+        real = list(_AOJ_TK.base_token_ids)
+    else:
+        tok, _eqn, _ = _callback(env.config, env.args, env.consts,
+                                 np.zeros((0,), np.int32),
+                                 np.zeros((0, MAX_RULES, 3), np.int32), 0, *ev, init=True)
+        tok = np.asarray(tok)
+        real = [int(t) for t in tok[tok > 0]]
     st = _ie.init_state(policy_agent)
     _ie.extend(policy_agent, st, [int(t) for t in real])
     _IE_STATIC["state"] = st
-    _IE_STATIC["n"] = int(real.shape[0])
-    print(f"[loop] incremental static-prefix real_tokens={int(real.shape[0])}", flush=True)
+    _IE_STATIC["n"] = int(len(real))
+    print(f"[loop] incremental static-prefix real_tokens={int(len(real))}", flush=True)
 
 
 def _incremental_full_tokens(chosen_a):
@@ -219,13 +251,24 @@ def policy_prior_logits(chosen_a, legal_vids):
     _dbg = os.environ.get("ALPHAGRAD_IE_DEBUG", "0") == "1"
     if _dbg:
         print(f"[ppl] START ndecided={len(chosen_a)} nlegal={len(legal_vids)}", flush=True)
-    tok, eqn = _incremental_full_tokens(chosen_a)
+    if APPEND_ONLY_JAXPR:
+        # GENUINE append-only jaxpr state: base (already in the static carry) +
+        # one literal jaxpr block per eliminated vertex. The delta appended to
+        # the causal encoder is exactly the concatenation of the chosen blocks.
+        base_ids, block_deltas = _AOJ_TK.block_token_ids(chosen_a)
+        _full_ids = list(base_ids)
+        for _d in block_deltas:
+            _full_ids += _d
+        tok = np.asarray(_full_ids, dtype=np.int32)
+        eqn = np.zeros_like(tok)  # eqn_ids unused on the causal (eqn_ids=None) path
+    else:
+        tok, eqn = _incremental_full_tokens(chosen_a)
     if _dbg:
-        print(f"[ppl] callback tokens done nreal={int((tok>0).sum())}", flush=True)
+        print(f"[ppl] tokens done nreal={int((tok>0).sum())}", flush=True)
     if AZ_INCREMENTAL:
-        real = tok[tok > 0]
+        real = tok[tok > 0] if not APPEND_ONLY_JAXPR else tok
         st = _IE_STATIC["state"].copy()
-        # append only the NEW real tokens past the static prefix.
+        # append only the NEW tokens past the static (base) prefix.
         delta = [int(t) for t in real[_IE_STATIC["n"]:]]
         if _dbg:
             print(f"[ppl] delta_tokens={len(delta)} calling extend", flush=True)
@@ -290,6 +333,14 @@ def order_ctx(order_ids, micro_budget=0, rng=None):
     _cv = _ctx_cache.get(_ck)
     if _cv is not None:
         return _cv
+    if APPEND_ONLY_JAXPR:
+        # cost-head input = the append-only jaxpr token stream for this order.
+        ids = _AOJ_TK.order_token_ids(list(order_ids))
+        _tok = jnp.asarray(ids, dtype=jnp.int32)
+        _eqn = jnp.zeros_like(_tok)
+        _res = np.asarray(_encode(_tok, _eqn))
+        _ctx_cache[_ck] = _res
+        return _res
     seq = _seq_from_order(order_ids, micro_budget, rng)
     order, specs, _ = build_order_specs(seq, env)
     for _attempt in range(2):
@@ -572,8 +623,11 @@ def train_policy(targets, epochs):
         _sel = _np.random.default_rng(A.seed + len(bufX)).choice(
             len(targets), _AZ_MAX_STATES, replace=False)
         targets = [targets[int(i)] for i in _sel]
-    toks = _np.stack([t[0] for t in targets])
-    eqns = _np.stack([t[1] for t in targets])
+    # pad each (possibly variable-length, append-only) token/eqn stream to a
+    # FIXED cap before stacking -> uniform shape + stable jit shape.
+    _cap = AOJ_TOK_CAP if APPEND_ONLY_JAXPR else int(max(len(_np.asarray(t[0]).reshape(-1)) for t in targets))
+    toks = _np.stack([_pad_tok_1d(t[0], _cap) for t in targets])
+    eqns = _np.stack([_pad_tok_1d(t[1], _cap) for t in targets])
     # legal masks + target over the full num_vertices space (0 on illegal).
     NVv = len(jaxpr.eqns)
     tgt_full = _np.zeros((len(targets), NVv), dtype=_np.float32)

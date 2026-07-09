@@ -344,7 +344,14 @@ class AppendOnlyStream:
     function (semantic-correctness check).
     """
 
-    def __init__(self, fun: Callable, args: Sequence[Any], argnums=(0,)):
+    def __init__(self, fun: Callable, args: Sequence[Any], argnums=(0,),
+                 tokens_only: bool = False):
+        # ``tokens_only``: skip densifying every edge to a concrete array
+        # (``SparseTensor.dense()``) -- the proposer needs only the token
+        # STREAM (op/fn/structure + edge SHAPES), not numeric ``build_numeric``.
+        # Shapes come straight from the index sizes, so this avoids the O(E)
+        # dense-materialization that dominates per-candidate construction.
+        self._tokens_only = tokens_only
         self.vocab = Vocabulary()
         self.vars = VarRegistry()
         self.fns = FnRegistry()
@@ -417,16 +424,22 @@ class AppendOnlyStream:
         for sv in graph:
             for dv in graph[sv]:
                 st = _force(graph[sv][dv])
-                dense = np.asarray(st.dense())
                 n_out = len(st.out_dims)
                 n_prim = len(st.primal_dims)
                 # edge constant leaf var
                 ename = self.vars.name(("edge", id(sv), id(dv)))
-                self._consts[ename] = dense
+                if self._tokens_only:
+                    # shapes from the index sizes -- no dense materialization.
+                    out_sizes = tuple(int(ix.size) for ix in st.out_dims)
+                    prim_sizes = tuple(int(ix.size) for ix in st.primal_dims)
+                else:
+                    dense = np.asarray(st.dense())
+                    self._consts[ename] = dense
+                    out_sizes = tuple(dense.shape[:n_out])
+                    prim_sizes = tuple(dense.shape[n_out:])
                 self._edges[(id(sv), id(dv))] = EdgeInfo(
                     var_name=ename, n_out=n_out, n_prim=n_prim,
-                    out_sizes=tuple(dense.shape[:n_out]),
-                    prim_sizes=tuple(dense.shape[n_out:]),
+                    out_sizes=out_sizes, prim_sizes=prim_sizes,
                 )
         # adjacency by graph var object id -> the actual Var objects
         self._var_by_id = {}
@@ -450,6 +463,47 @@ class AppendOnlyStream:
         self._compress_ops: Dict[str, Tuple] = {}
         self._quant_ops: Dict[str, Tuple] = {}
         self._computed: Dict[str, Tuple] = {}
+        # pristine snapshot (post-init, no blocks) for fast per-order reuse.
+        self._pristine = None
+        self._snapshot_pristine()
+
+    # ---- fast reuse (proposer): snapshot/restore instead of re-tracing ----
+    def _snapshot_pristine(self):
+        """Record the post-init mutable state so many orders can be tokenized
+        off ONE traced base (avoids re-``make_jaxpr`` + ``_build_graph`` per
+        candidate). Immutable state (jaxpr / graph / adjacency template / dense
+        consts) is shared; only the small per-order registries are copied."""
+        import copy as _copy
+        self._pristine = dict(
+            base_tokens=list(self._base_tokens),
+            vars_name=dict(self.vars._name), vars_order=list(self.vars._order),
+            vars_counter=self.vars._counter,
+            fns_by_key=dict(self.fns._by_key), fns_defs=list(self.fns._defs),
+            fns_inline=dict(self.fns._inline), fns_counter=self.fns._counter,
+            vocab_id=dict(self.vocab._id), vocab_next=self.vocab._next,
+            edges={k: v for k, v in self._edges.items()},
+            succ={k: set(v) for k, v in self._succ.items()},
+            pred={k: set(v) for k, v in self._pred.items()},
+        )
+
+    def reset_to_base(self):
+        """Restore the pristine post-init state (clears appended blocks) so the
+        SAME stream object can tokenize another order without re-tracing."""
+        p = self._pristine
+        self.blocks = []
+        self._base_tokens = list(p["base_tokens"])
+        self.vars._name = dict(p["vars_name"]); self.vars._order = list(p["vars_order"])
+        self.vars._counter = p["vars_counter"]
+        self.fns._by_key = dict(p["fns_by_key"]); self.fns._defs = list(p["fns_defs"])
+        self.fns._inline = dict(p["fns_inline"]); self.fns._counter = p["fns_counter"]
+        self.vocab._id = dict(p["vocab_id"]); self.vocab._next = p["vocab_next"]
+        self._edges = {k: v for k, v in p["edges"].items()}
+        self._succ = {k: set(v) for k, v in p["succ"].items()}
+        self._pred = {k: set(v) for k, v in p["pred"].items()}
+        self._jac_edge_of = {}
+        self._compress_ops = {}
+        self._quant_ops = {}
+        self._computed = {}
 
     # ---- token / text views ------------------------------------------
     def token_text(self) -> List[str]:
@@ -821,3 +875,93 @@ def _apply_op(op: str, params: Dict[str, Any], args: List[Any]):
     if op == "exp":
         return jnp.exp(args[0])
     raise NotImplementedError(f"emitted op not interpretable: {op}")
+
+
+# ---------------------------------------------------------------------------
+# Proposer integration: append-only jaxpr tokens as the search STATE.
+# ---------------------------------------------------------------------------
+
+
+class ProposerTokenizer:
+    """Append-only jaxpr tokenizer for the autoscheduler proposer.
+
+    Wraps :class:`AppendOnlyStream` for repeated per-order tokenization in the
+    search loop, with ONE PERSISTENT vocabulary so structural / op / fn tokens
+    map to STABLE ids across every candidate order (a fresh-init policy embeds
+    ``vocab_size`` slots; the append-only vocabulary is small and bounded for a
+    fixed graph). Var-reference names are consistent per token STRING (the same
+    string always gets the same id) though the string a given graph var is
+    assigned can differ by elimination order (the intermediate emit counter) --
+    this is the semantic-faithful jaxpr stream (op / fn-def / structure tokens
+    are what carry the jaxpr meaning; var refs are positional).
+
+    Usage (proposer):
+        tk = ProposerTokenizer(loss_fn, args, argnums, valid_vertices)
+        ids = tk.order_token_ids([a0, a1, ...])   # 0-based action idxs
+        # -> feed ids to the causal incremental encoder (extend per block).
+
+    ``base_token_ids`` / ``block_token_ids`` expose the base once + the per-
+    action delta blocks, so the caller can encode the base ONCE and ``extend``
+    the incremental palimpsa encoder by each appended block (recompile-free).
+    """
+
+    def __init__(self, fun, args, argnums, valid_vertices):
+        self.fun = fun
+        self.args = list(args)
+        self.argnums = tuple(argnums) if hasattr(argnums, "__iter__") else (argnums,)
+        self.valid = [int(v) for v in valid_vertices]  # 0-based action idx -> 1-based vertex id
+        self.vocab = Vocabulary()                       # ONE persistent vocab
+        # ONE reusable template stream (tokens_only: no dense edge arrays). The
+        # heavy jaxpr trace + _build_graph happen ONCE here; per-order tokenize
+        # just reset_to_base() + eliminate() (pure Python, no re-trace).
+        self._template = AppendOnlyStream(fun, self.args, argnums=self.argnums,
+                                          tokens_only=True)
+        self._base_toks = list(self._template._base_tokens)
+        # warm the persistent vocab with the base tokens (stable low ids first)
+        self.vocab.encode(self._base_toks)
+
+    @property
+    def base_token_ids(self):
+        return self.vocab.encode(self._base_toks)
+
+    def _stream_for(self, action_idxs):
+        # Reuse the ONE template (no re-trace): reset to base, then eliminate.
+        s = self._template
+        s.reset_to_base()
+        for a in action_idxs:
+            v = self.valid[int(a)]           # action idx -> 1-based vertex id
+            s.eliminate(int(v), symbolic=True)
+        return s
+
+    def order_tokens(self, action_idxs):
+        """Full append-only token STRINGS for the partial/complete order."""
+        return self._stream_for(action_idxs).tokens()
+
+    def order_token_ids(self, action_idxs):
+        """Full append-only token IDS (persistent vocab) for the order."""
+        return self.vocab.encode(self.order_tokens(action_idxs))
+
+    def block_token_ids(self, action_idxs):
+        """Return (base_ids, [per-block delta ids...]) for incremental encode.
+
+        base_ids encodes the value jaxpr + reserved Jacobian outputs ONCE; each
+        delta is the token ids of one appended action block (``;`` separator +
+        new fn-defs + equations) -- fed to ``incremental_encoder.extend`` in
+        sequence so the causal palimpsa state is built recompile-free.
+        """
+        s = self._stream_for(action_idxs)
+        base_ids = self.vocab.encode(list(s._base_tokens))
+        deltas = []
+        for b in s.blocks:
+            toks = [";"]
+            for d in b.new_fndefs:
+                toks += [d.name, "=", d.op + "[" +
+                         ",".join(f"{k}={v}" for k, v in d.params) + "]"]
+            for e in b.eqns:
+                toks += [e.out, "=", e.fn.name, "("]
+                for a in e.args:
+                    toks.append("const" if (isinstance(a, tuple) and a and a[0] == "const")
+                                else str(a))
+                toks.append(")")
+            deltas.append(self.vocab.encode(toks))
+        return base_ids, deltas
