@@ -41,6 +41,13 @@ ap.add_argument("--micro-budget", type=int, default=0)   # 0 = pure order; 1-2 =
 ap.add_argument("--full-search", action="store_true")    # per-step cost-head lookahead (slow)
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--out", default=os.path.expanduser("~/dsnn/autoscheduler_out"))
+ap.add_argument("--total-measurements", type=int, default=0)  # if >0, rounds = ceil(total/topk)
+ap.add_argument("--measure-workers", type=int, default=0)     # >0 = parallel measure over N GPUs
+ap.add_argument("--measure-gpu-base", type=int, default=1)    # first GPU idx for measure workers
+ap.add_argument("--clear-caches-every", type=int, default=1)  # jax.clear_caches every N rounds
+ap.add_argument("--policy-prior", default="markowitz", choices=["markowitz", "trained"])
+ap.add_argument("--policy-epochs", type=int, default=200)   # policy CE epochs/round
+ap.add_argument("--az-sigma-scale", type=float, default=1.0)  # sigma(Q) scale (Danihelka c_scale)
 ap.add_argument("--wandb", action="store_true")           # live per-round logging
 ap.add_argument("--wandb-project", default="dsnn-jac-gpu")
 ap.add_argument("--wandb-entity", default="dll-streetview")
@@ -49,8 +56,12 @@ A = ap.parse_args()
 os.environ["ALPHAGRAD_NN_HIDDEN"] = str(A.nn_hidden)
 os.makedirs(A.out, exist_ok=True)
 node = os.environ.get("SLURMD_NODENAME", "?")
+if A.total_measurements > 0:
+    import math as _m
+    A.rounds = int(_m.ceil(A.total_measurements / max(A.topk, 1)))
 print(f"[loop] node={node} device={jax.devices()[0]} nn_hidden={A.nn_hidden} "
-      f"rounds={A.rounds} pool={A.pool} topk={A.topk} micro_budget={A.micro_budget}", flush=True)
+      f"rounds={A.rounds} pool={A.pool} topk={A.topk} micro_budget={A.micro_budget} "
+      f"measure_workers={A.measure_workers} total_meas={A.total_measurements}", flush=True)
 _wb_run = None
 if A.wandb:
     try:
@@ -107,6 +118,69 @@ agent = MicroPPOAgent(vocab_size=512, embd_dim=EMBD, num_layers=4, num_heads=4,
 cost_pool_query = jax.random.normal(kC, (EMBD,)) * 0.02
 cost_head = MLP(EMBD, NUM_REWARDS, (128, 128), key=jax.random.split(kC)[0])
 
+# ----- AlphaZero POLICY (fresh-init, separate from the cost encoder) -----
+import optax as _optax
+_USE_TRAINED_PRIOR = (A.policy_prior == "trained")
+if _USE_TRAINED_PRIOR:
+    _kp = jax.random.split(jax.random.PRNGKey(A.seed + 777), 1)[0]
+    policy_agent = MicroPPOAgent(vocab_size=512, embd_dim=EMBD, num_layers=4,
+                                 num_heads=4, hidden_dim=256,
+                                 num_vertices=len(jaxpr.eqns), value_dims=(128, 128),
+                                 key=_kp, max_substeps=16, policy="palimpsa")
+    _pol_opt = _optax.adam(3e-4)
+    _pol_ostate = _pol_opt.init(eqx.filter(policy_agent, eqx.is_array))
+    print("[loop] POLICY PRIOR = TRAINED (fresh-init AlphaZero policy agent)", flush=True)
+else:
+    policy_agent = None
+    print("[loop] POLICY PRIOR = markowitz (heuristic)", flush=True)
+
+@eqx.filter_jit
+def _policy_vertex_logits(agent, tokens_j, eqn_ids_j):
+    """(num_vertices,) prior logits from the policy over the partial-order
+    state tokens. Indexing matches the vertex/action-idx space."""
+    enc_x, tok_mask = agent.encode_tokens(tokens_j, key=jax.random.PRNGKey(0), eqn_ids=eqn_ids_j)
+    vlogits, _vctx = agent.vertex_policy(enc_x, tok_mask)
+    return vlogits  # (num_vertices,)
+
+def policy_prior_logits(chosen_a, legal_vids):
+    """Policy prior logits over the LEGAL vertices for the current partial
+    order (chosen_a = 0-based action idxs already eliminated). Returns a np
+    array aligned to legal_vids (1-based vertex ids). Also returns the
+    (tokens, eqn_ids, legal_action_idxs) needed to reconstruct the state for
+    the AZ training target."""
+    seq = _seq_from_order(chosen_a, 0)  # prior is over ORDER; encode pure prefix
+    order, specs, _ = build_order_specs(seq, env) if chosen_a else (
+        np.zeros((0,), np.int32), np.zeros((0, MAX_RULES, 3), np.int32), 0)
+    if len(chosen_a) == 0:
+        # empty prefix: encode a single dummy stop to get the initial state
+        tok, eqn, _ = _callback(env.config, env.args, env.consts,
+                                jnp.asarray([VALID[0]], dtype=jnp.int32),
+                                jnp.full((1, MAX_RULES, 3), -1, dtype=jnp.int32),
+                                0, *ev)
+    else:
+        tok, eqn, _ = _callback(env.config, env.args, env.consts,
+                                jnp.asarray(order), jnp.asarray(specs), len(order), *ev)
+    vlog = np.asarray(_policy_vertex_logits(policy_agent, jnp.asarray(tok), jnp.asarray(eqn)))
+    legal_aidx = [VALID.index(v) for v in legal_vids]
+    prior = vlog[legal_aidx]  # logits over legal, aligned to legal_vids
+    return prior, (np.asarray(tok), np.asarray(eqn), legal_aidx)
+
+def az_improved_target(prior_logits, child_Q):
+    """Gumbel-AZ improved policy over legal actions (Danihelka 2022):
+    improved = softmax(prior_logits + sigma(completed_Q)), where completed_Q
+    are the cost-model values of the legal children (higher=better) and sigma
+    is a monotone scale. We standardize Q (so the 1e6-scale scalar doesnt
+    saturate softmax) then scale by --az-sigma-scale. Uses the child VALUES
+    (cost-model evaluations), NOT visit counts."""
+    q = np.asarray(child_Q, dtype=np.float64)
+    qz = (q - q.mean()) / (q.std() + 1e-8)
+    logits = np.asarray(prior_logits, dtype=np.float64) + A.az_sigma_scale * qz
+    logits -= logits.max()
+    e = np.exp(logits)
+    return e / e.sum()  # improved policy over legal actions
+
+_az_targets = []  # list of (tokens, eqn_ids, legal_aidx, improved_target) per round
+
 @eqx.filter_jit
 def _encode(tokens_j, eqn_ids_j):
     enc_x, tm = agent.encode_tokens(tokens_j, key=jax.random.PRNGKey(0), eqn_ids=eqn_ids_j)
@@ -131,14 +205,21 @@ def _seq_from_order(order_ids, micro_budget, rng=None):
     return seq
 
 _ctx_fallback = np.zeros((EMBD,), dtype=np.float64)
+_ctx_cache = {}
 def order_ctx(order_ids, micro_budget=0, rng=None):
+    _ck = (tuple(int(x) for x in order_ids), int(micro_budget))
+    _cv = _ctx_cache.get(_ck)
+    if _cv is not None:
+        return _cv
     seq = _seq_from_order(order_ids, micro_budget, rng)
     order, specs, _ = build_order_specs(seq, env)
     for _attempt in range(2):
         try:
             tok, eqn, _ = _callback(env.config, env.args, env.consts,
                                     jnp.asarray(order), jnp.asarray(specs), len(order), *ev)
-            return np.asarray(_encode(jnp.asarray(tok), jnp.asarray(eqn)))  # (EMBD,)
+            _res = np.asarray(_encode(jnp.asarray(tok), jnp.asarray(eqn)))
+            _ctx_cache[_ck] = _res
+            return _res  # (EMBD,)
         except RuntimeError as _e:
             if ("mem-gate" in str(_e) or "RESOURCE" in str(_e)) and _attempt == 0:
                 jax.clear_caches(); import gc; gc.collect()
@@ -308,24 +389,40 @@ def propose_pool(head, stds, n_pool, micro_budget, temp, rng):
             if len(legal) == 1:
                 v = legal[0]
             else:
-                mk = markowitz(graph, tg, legal)
-                logits = np.array([-float(mk[i]) / max(temp, 1e-3) for i in legal])
-                logits -= logits.max()
+                # PRIOR: trained policy logits (AlphaZero) or -Markowitz.
+                if _USE_TRAINED_PRIOR:
+                    prior_np, _state_info = policy_prior_logits(chosen_a, legal)
+                    logits = np.asarray(prior_np, dtype=np.float64) / max(temp, 1e-3)
+                else:
+                    mk = markowitz(graph, tg, legal)
+                    logits = np.array([-float(mk[i]) / max(temp, 1e-3) for i in legal])
+                    _state_info = None
+                logits = logits - logits.max()
                 m = min(A.n_candidates, len(legal))
                 g = r.gumbel(size=len(legal))
                 cand = [legal[t] for t in np.argsort(-(logits + g))[:m]]
-                # sequential halving by cost-head value of the partial order
-                # (chosen so far + candidate), in 0-based action-idx space.
+                # Evaluate EACH candidate child's cost-model Q ONCE (needed for
+                # both the sequential-halving pick AND the AZ improved target).
+                qmap = {}
+                for vv in cand:
+                    partial_a = chosen_a + [VALID.index(vv)]
+                    ctx = order_ctx(partial_a, micro_budget)
+                    qmap[vv] = _pred_scalar_np(head, ctx[None], xmu, xsd, ymu, ysd)[0]
+                # AZ improved-policy TARGET over the LEGAL set (trained prior
+                # only): improved = softmax(prior + sigma(completed_Q)); legal
+                # actions not in `cand` keep completed_Q = mean(evaluated Q)
+                # (Danihelka completed-Q: unvisited -> the value estimate).
+                if _USE_TRAINED_PRIOR and _state_info is not None:
+                    _qmean = float(np.mean(list(qmap.values())))
+                    child_Q = np.array([qmap.get(lv, _qmean) for lv in legal], dtype=np.float64)
+                    _improved = az_improved_target(prior_np, child_Q)
+                    _tok, _eqn, _legal_aidx = _state_info
+                    _az_targets.append((_tok, _eqn, _legal_aidx, _improved))
+                # sequential halving pick using the (already-computed) Q.
                 surv = list(cand)
                 while len(surv) > 1:
-                    scored = []
-                    for vv in surv:
-                        partial_a = chosen_a + [VALID.index(vv)]
-                        ctx = order_ctx(partial_a, micro_budget)
-                        ps = _pred_scalar_np(head, ctx[None], xmu, xsd, ymu, ysd)[0]
-                        scored.append((ps, vv))
-                    scored.sort(reverse=True)
-                    surv = [vv for _, vv in scored[:max(1, len(surv) // 2)]]
+                    surv.sort(key=lambda vv: -qmap[vv])
+                    surv = surv[:max(1, len(surv) // 2)]
                 v = surv[0]
             chosen_v.append(v); chosen_a.append(VALID.index(v))
             _eliminate_vertex(v, jaxpr, graph, tg, VO, count_ops=False, transforms=())
@@ -337,6 +434,94 @@ def propose_pool(head, stds, n_pool, micro_budget, temp, rng):
     return [(list(k), v) for k, v in pool.items()]
 
 # --------------------------------------------------------------- THE LOOP
+import subprocess as _sp, tempfile as _tf
+_WORKER = os.path.join(os.path.dirname(__file__), "measure_worker.py")
+def measure_topk_parallel(order_list, micro_budget, seed, n_workers, gpu_base):
+    """Measure a list of orders across n_workers GPU subprocesses (each pinned
+    to a distinct GPU, builds env once, measures its chunk, EXITS -> frees the
+    measure-GPU leak). Returns list of [lat,peak,flops,cos] or None, aligned."""
+    import numpy as _np
+    n = len(order_list)
+    if n == 0:
+        return []
+    chunks = [order_list[i::n_workers] for i in range(n_workers)]
+    idx_of = [list(range(i, n, n_workers)) for i in range(n_workers)]
+    procs, outs = [], []
+    _d = _tf.mkdtemp(prefix="mw_")
+    for w, ch in enumerate(chunks):
+        if not ch:
+            procs.append(None); outs.append(None); continue
+        jf = os.path.join(_d, f"job{w}.json"); of = os.path.join(_d, f"out{w}.json")
+        json.dump({"orders": [list(map(int, o)) for o in ch],
+                   "micro_budget": int(micro_budget), "seed": int(seed)}, open(jf, "w"))
+        env2 = dict(os.environ)
+        env2["CUDA_VISIBLE_DEVICES"] = str(gpu_base + w)
+        p = _sp.Popen([sys.executable, _WORKER, jf, of, str(A.nn_hidden),
+                       str(A.ndata), str(A.latency_inner_reps)], env=env2,
+                      stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        procs.append(p); outs.append(of)
+    results = [None] * n
+    for w, p in enumerate(procs):
+        if p is None:
+            continue
+        p.wait()
+        try:
+            rr = json.load(open(outs[w]))["results"]
+            for k2, ridx in enumerate(idx_of[w]):
+                results[ridx] = (_np.array(rr[k2], dtype=_np.float64)
+                                 if rr[k2] is not None else None)
+        except Exception:
+            pass
+    import shutil as _sh; _sh.rmtree(_d, ignore_errors=True)
+    return results
+
+def train_policy(targets, epochs):
+    """Train the fresh policy agent by cross-entropy to the AZ improved
+    targets over legal actions. targets = list of (tokens, eqn_ids,
+    legal_aidx, improved_prob). Returns (policy_ce, policy_entropy)."""
+    global policy_agent, _pol_ostate
+    if not targets:
+        return float('nan'), float('nan')
+    # group by legal-length so we can batch same-shaped states (the pointer
+    # head returns all num_vertices logits; we gather legal per sample).
+    import numpy as _np
+    toks = _np.stack([t[0] for t in targets])
+    eqns = _np.stack([t[1] for t in targets])
+    # legal masks + target over the full num_vertices space (0 on illegal).
+    NVv = len(jaxpr.eqns)
+    tgt_full = _np.zeros((len(targets), NVv), dtype=_np.float32)
+    legal_mask = _np.zeros((len(targets), NVv), dtype=_np.float32)
+    for i, (_, _, laidx, imp) in enumerate(targets):
+        for k2, ai in enumerate(laidx):
+            tgt_full[i, ai] = imp[k2]; legal_mask[i, ai] = 1.0
+    toks_j = jnp.asarray(toks); eqns_j = jnp.asarray(eqns)
+    tgt_j = jnp.asarray(tgt_full); mask_j = jnp.asarray(legal_mask)
+    def _ce(agent, tj, ej, tg_, mk_):
+        def per(t, e, tgt, mk):
+            enc_x, tm = agent.encode_tokens(t, key=jax.random.PRNGKey(0), eqn_ids=e)
+            vlog, _ = agent.vertex_policy(enc_x, tm)
+            vlog = jnp.where(mk > 0.5, vlog, -1e9)
+            logp = jax.nn.log_softmax(vlog)
+            ce = -jnp.sum(tgt * logp)                  # CE over legal
+            p = jnp.exp(logp) * mk
+            ent = -jnp.sum(jnp.where(mk > 0.5, p * logp, 0.0))
+            return ce, ent
+        ce, ent = jax.vmap(per)(tj, ej, tg_, mk_)
+        return jnp.mean(ce), jnp.mean(ent)
+    def _loss(agent, tj, ej, tg_, mk_):
+        ce, ent = _ce(agent, tj, ej, tg_, mk_); return ce
+    @eqx.filter_jit
+    def _step(agent, ost, tj, ej, tg_, mk_):
+        l, gr = eqx.filter_value_and_grad(_loss)(agent, tj, ej, tg_, mk_)
+        up, ost = _pol_opt.update(gr, ost, eqx.filter(agent, eqx.is_array))
+        return eqx.apply_updates(agent, up), ost, l
+    last_ce = float('nan')
+    for _e in range(epochs):
+        policy_agent, _pol_ostate, last_ce = _step(policy_agent, _pol_ostate,
+                                                   toks_j, eqns_j, tgt_j, mask_j)
+    _ce_v, _ent_v = _ce(policy_agent, toks_j, eqns_j, tgt_j, mask_j)
+    return float(_ce_v), float(_ent_v)
+
 stds = None
 # warm-start the head with a quick ranking fit on the seed buffer
 cost_head, stds = train_ranking(cost_head, np.array(bufX), np.array(bufS), A.retrain_epochs)
@@ -346,23 +531,35 @@ rows = []
 rng = np.random.default_rng(A.seed)
 for rnd in range(A.rounds):
     t0 = time.time()
-    # Bound the measure-GPU executable leak (each _callback compiles a distinct
-    # retained XLA executable) so the loop survives all rounds on a 24GB device.
-    jax.clear_caches()
-    import gc as _gc; _gc.collect()
+    # Bound the leak on the MAIN process (encoding). The parallel measure
+    # workers free their own leak by process teardown each round.
+    if rnd % max(A.clear_caches_every, 1) == 0:
+        jax.clear_caches()
+        import gc as _gc; _gc.collect()
     temp = max(0.3, 1.0 - rnd * 0.05)   # anneal exploration temperature
-    _proposer = propose_pool if A.full_search else propose_pool_fast
+    if _USE_TRAINED_PRIOR:
+        _az_targets.clear()
+    # trained prior needs the per-step lookahead search (records AZ targets);
+    # force the full search when the policy is on.
+    _proposer = propose_pool if (A.full_search or _USE_TRAINED_PRIOR) else propose_pool_fast
     pool = _proposer(cost_head, stds, A.pool, A.micro_budget, temp, rng)
     pool.sort(key=lambda x: -x[1])       # rank by predicted scalar (higher=better)
     topk = pool[:A.topk]
     # MEASURE top-k for real
     meas_raw, pred_scalar, meas_scalar = [], [], []
-    for order_ids, ps in topk:
-        r = np.random.default_rng(A.seed + rnd * 100 + len(order_ids))
-        raw = measure_order(order_ids, A.micro_budget, r)
-        if not np.all(np.isfinite(raw)):
+    _orders_topk = [o for o, _ in topk]
+    if A.measure_workers > 0:
+        _raws = measure_topk_parallel(_orders_topk, A.micro_budget, A.seed + rnd,
+                                      A.measure_workers, A.measure_gpu_base)
+    else:
+        _raws = [measure_order(o, A.micro_budget,
+                               np.random.default_rng(A.seed + rnd * 100 + len(o)))
+                 for o in _orders_topk]
+    for (order_ids, ps), raw in zip(topk, _raws):
+        if raw is None or not np.all(np.isfinite(raw)):
             continue
-        ctx = order_ctx(order_ids, A.micro_budget, r)
+        ctx = order_ctx(order_ids, A.micro_budget,
+                        np.random.default_rng(A.seed + rnd * 100 + len(order_ids)))
         ms = scalarize(raw)
         meas_raw.append(raw); pred_scalar.append(ps); meas_scalar.append(ms)
         bufX.append(ctx); bufY.append(raw); bufS.append(ms)
@@ -371,6 +568,9 @@ for rnd in range(A.rounds):
             best_real = {"scalar": ms, "raw": raw.tolist(), "order": list(map(int, order_ids)), "round": rnd}
     # RETRAIN on the growing buffer (ranking loss)
     cost_head, stds = train_ranking(cost_head, np.array(bufX), np.array(bufS), A.retrain_epochs)
+    # TRAIN the AZ policy on this round's improved targets (from-scratch).
+    _pol_ce, _pol_ent = (train_policy(list(_az_targets), A.policy_epochs)
+                         if _USE_TRAINED_PRIOR else (float('nan'), float('nan')))
     # LOG: ranking Spearman on held-out (seed) set + on the accumulated measured set
     ho_pred = _pred_scalar_np(cost_head, HOX, *stds)
     sp_ho = float(spearmanr(ho_pred, HOS).correlation)
@@ -395,6 +595,9 @@ for rnd in range(A.rounds):
                best_peak_MB=(br[1] / 1e6 if br else float("nan")),
                best_scalar=best_real["scalar"], n_measured=len(meas_raw), temp=temp,
                secs=time.time() - t0)
+    row["policy_ce"] = _pol_ce if _USE_TRAINED_PRIOR else float('nan')
+    row["policy_entropy"] = _pol_ent if _USE_TRAINED_PRIOR else float('nan')
+    row["n_az_targets"] = len(_az_targets) if _USE_TRAINED_PRIOR else 0
     rows.append(row)
     if _wb_run is not None:
         try:
@@ -406,13 +609,17 @@ for rnd in range(A.rounds):
                 "best_cos": (best_real["raw"][3] if best_real["raw"] else float("nan")),
                 "best_scalar": best_real["scalar"], "n_measured": len(meas_raw),
                 "temp": temp,
+                "policy_ce": row["policy_ce"], "policy_entropy": row["policy_entropy"],
+                "n_az_targets": row["n_az_targets"],
             })
         except Exception:
             pass
     print(f"[ROUND {rnd:2d}] buf={len(bufX)} sp_ho={sp_ho:+.3f} sp_meas={sp_meas:+.3f} "
           f"gap_mag={gap_mag:+.4g} gap_rank={gap_rank:+.3f} "
           f"best_real=(lat={row['best_lat_us']:.1f}us,peak={row['best_peak_MB']:.2f}MB) "
-          f"n_meas={len(meas_raw)} temp={temp:.2f} ({row['secs']:.0f}s)", flush=True)
+          f"n_meas={len(meas_raw)} temp={temp:.2f}"
+          + (f" pol_ce={_pol_ce:.3f} pol_ent={_pol_ent:.3f}" if _USE_TRAINED_PRIOR else "")
+          + f" ({row['secs']:.0f}s)", flush=True)
     json.dump({"rows": rows, "best_real": best_real}, open(os.path.join(A.out, f"loop_micro{A.micro_budget}.json"), "w"), indent=2, default=float)
 
 # --------------------------------------------------------------- final benchmark
