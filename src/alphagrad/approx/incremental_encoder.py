@@ -21,6 +21,7 @@ pointer logits are identical too. Incrementality holds at the ENCODER level.
 import jax
 import jax.numpy as jnp
 import jax.nn as jnn
+import equinox as eqx
 
 
 def _palimpsa_step(mixer, y_t, carry):
@@ -77,6 +78,46 @@ def _init_carry(mixer):
 _layer_step_j = jax.jit(_layer_step)
 
 
+# --- SCAN-based batched extend --------------------------------------------
+# The per-token Python loop (embed -> L layer_steps -> final_norm, one tiny
+# jitted call PER TOKEN PER LAYER) dispatched an unbounded storm of ~O(delta*L)
+# micro-executables per decision. Across a proposer round (pool * decisions *
+# candidates) that pegs the host CPU on JAX dispatch/tracing and the round never
+# completes (the "hang" — process CPU-busy, not deadlocked). Folding the whole
+# delta into ONE lax.scan makes ``extend`` dispatch a SINGLE program per call
+# (compiled once per distinct delta-length; <= num_vertices distinct lengths,
+# each cheap+cached). The scan body is byte-identical math to _layer_step +
+# final_norm, so the proven equivalence is preserved.
+def _extend_block(agent, carries, tokens, positions):
+    """Process ``tokens`` (int32 (D,)) at ``positions`` (int32 (D,)) starting
+    from ``carries`` (list of L (M,I) pairs) via a single lax.scan. Returns
+    (new_carries, rows) where rows is (D, E) final_norm'd. Same math as the
+    per-token loop, one XLA program."""
+    layers = agent.encoder.layers
+    embedding = agent.embedding
+    pe = agent.pos_enc.pe
+    final_norm = agent.final_norm
+
+    def _step(carry_list, tp):
+        tok, pos = tp
+        x_t = embedding(tok.astype(jnp.int32)) + pe[pos, :]
+        new_carry = []
+        for li, layer in enumerate(layers):
+            x_t, c = _layer_step(layer, x_t, carry_list[li])
+            new_carry.append(c)
+        return new_carry, final_norm(x_t)
+
+    carry_in = [tuple(c) for c in carries]
+    new_carry, rows = jax.lax.scan(_step, carry_in, (tokens, positions))
+    return new_carry, rows
+
+
+# eqx.filter_jit partitions the agent's static (non-array) leaves so the whole
+# MicroPPOAgent can be passed through jit safely (plain jax.jit would choke on
+# its int/str static fields).
+_extend_block_j = eqx.filter_jit(_extend_block)
+
+
 class IncrementalEncoderState:
     """Mutable-ish snapshot of the incremental encode.
 
@@ -110,19 +151,28 @@ def extend(agent, state, new_tokens):
     ``new_tokens`` = iterable of int token ids (real, non-pad, >0). Returns the
     same (mutated) state. Positions continue from ``state.pos``.
     """
-    layers = agent.encoder.layers
-    embedding = agent.embedding
-    pe = agent.pos_enc.pe
-    final_norm = agent.final_norm
-    carries = state.carries
-    pos = state.pos
-    for tok in new_tokens:
-        x_t = embedding(jnp.asarray(tok, dtype=jnp.int32)) + pe[pos, :]
-        for li, layer in enumerate(layers):
-            x_t, carries[li] = _layer_step_j(layer, x_t, carries[li])
-        state.rows.append(final_norm(x_t))
-        pos += 1
-    state.pos = pos
+    import os as _os, time as _t
+    _dbg = _os.environ.get("ALPHAGRAD_IE_DEBUG", "0") == "1"
+    toks = list(new_tokens)
+    pos0 = state.pos
+    n = len(toks)
+    if _dbg:
+        print(f"[ie.extend] START ntokens={n} pos0={pos0}", flush=True)
+    if n == 0:
+        return state
+    _ts = _t.time()
+    tok_arr = jnp.asarray(toks, dtype=jnp.int32)
+    pos_arr = jnp.arange(pos0, pos0 + n, dtype=jnp.int32)
+    new_carry, rows = _extend_block_j(agent, state.carries, tok_arr, pos_arr)
+    # carry: list of tuples -> keep as list-of-tuples (matches state.carries).
+    state.carries = [tuple(c) for c in new_carry]
+    # rows is (n, E); split into per-row (E,) to preserve the append-only API.
+    for i in range(n):
+        state.rows.append(rows[i])
+    state.pos = pos0 + n
+    if _dbg:
+        jax.block_until_ready(rows)
+        print(f"[ie.extend] DONE pos={state.pos} ({n} toks in {_t.time()-_ts:.3f}s)", flush=True)
     return state
 
 

@@ -216,16 +216,28 @@ def policy_prior_logits(chosen_a, legal_vids):
     head with eqn_ids=None. FULL path (ALPHAGRAD_AZ_INCREMENTAL=0): re-encode.
     The returned (tok, eqn) are always the FULL _callback stream so the AZ
     training target is byte-identical to legacy."""
+    _dbg = os.environ.get("ALPHAGRAD_IE_DEBUG", "0") == "1"
+    if _dbg:
+        print(f"[ppl] START ndecided={len(chosen_a)} nlegal={len(legal_vids)}", flush=True)
     tok, eqn = _incremental_full_tokens(chosen_a)
+    if _dbg:
+        print(f"[ppl] callback tokens done nreal={int((tok>0).sum())}", flush=True)
     if AZ_INCREMENTAL:
         real = tok[tok > 0]
         st = _IE_STATIC["state"].copy()
         # append only the NEW real tokens past the static prefix.
         delta = [int(t) for t in real[_IE_STATIC["n"]:]]
+        if _dbg:
+            print(f"[ppl] delta_tokens={len(delta)} calling extend", flush=True)
         _ie.extend(policy_agent, st, delta)
         enc_x = _ie.enc_x(st)                        # (S_real, E)
         tok_mask = jnp.ones((enc_x.shape[0],), dtype=bool)
+        if _dbg:
+            print(f"[ppl] extend done enc_x={enc_x.shape} -> vertex_policy", flush=True)
+            import time as _tt; _vt = _tt.time()
         vlog = np.asarray(_vertex_policy_from_enc(policy_agent, enc_x, tok_mask))
+        if _dbg:
+            print(f"[ppl] vertex_policy done in {_tt.time()-_vt:.3f}s", flush=True)
     else:
         vlog = np.asarray(_policy_vertex_logits(policy_agent, jnp.asarray(tok), jnp.asarray(eqn)))
     legal_aidx = [VALID.index(v) for v in legal_vids]
@@ -650,7 +662,9 @@ for rnd in range(A.rounds):
     # trained prior needs the per-step lookahead search (records AZ targets);
     # force the full search when the policy is on.
     _proposer = propose_pool if (A.full_search or _USE_TRAINED_PRIOR) else propose_pool_fast
+    print(f"[loop] round {rnd} START temp={temp:.3f} calling proposer={_proposer.__name__}", flush=True)
     pool = _proposer(cost_head, stds, A.pool, A.micro_budget, temp, rng)
+    print(f"[loop] round {rnd} proposer done pool={len(pool)}", flush=True)
     pool.sort(key=lambda x: -x[1])       # rank by predicted scalar (higher=better)
     topk = pool[:A.topk]
     # MEASURE top-k for real
