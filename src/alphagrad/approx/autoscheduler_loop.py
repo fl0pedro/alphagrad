@@ -515,11 +515,24 @@ def train_policy(targets, epochs):
         l, gr = eqx.filter_value_and_grad(_loss)(agent, tj, ej, tg_, mk_)
         up, ost = _pol_opt.update(gr, ost, eqx.filter(agent, eqx.is_array))
         return eqx.apply_updates(agent, up), ost, l
+    # MINIBATCH the states (each is a MAX_TOKENS encoder pass; vmapping ALL
+    # of them at once OOMs — a full round has ~pool*|V| states). Chunk of
+    # _POL_MB states per step.
+    _POL_MB = 4
+    _N = toks_j.shape[0]
     last_ce = float('nan')
+    _rngp = np.random.default_rng(A.seed + len(bufX))
     for _e in range(epochs):
-        policy_agent, _pol_ostate, last_ce = _step(policy_agent, _pol_ostate,
-                                                   toks_j, eqns_j, tgt_j, mask_j)
-    _ce_v, _ent_v = _ce(policy_agent, toks_j, eqns_j, tgt_j, mask_j)
+        _perm = _rngp.permutation(_N)
+        for _i in range(0, _N, _POL_MB):
+            _ix = _perm[_i:_i + _POL_MB]
+            policy_agent, _pol_ostate, last_ce = _step(
+                policy_agent, _pol_ostate,
+                toks_j[_ix], eqns_j[_ix], tgt_j[_ix], mask_j[_ix])
+    # eval CE/entropy on a small held slice (avoid the full-batch OOM).
+    _ev_ix = jnp.asarray(np.arange(min(_N, 8)))
+    _ce_v, _ent_v = _ce(policy_agent, toks_j[_ev_ix], eqns_j[_ev_ix],
+                        tgt_j[_ev_ix], mask_j[_ev_ix])
     return float(_ce_v), float(_ent_v)
 
 stds = None
