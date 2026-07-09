@@ -55,6 +55,15 @@ def _is_literal(v) -> bool:
     return isinstance(v, jax_core.Literal)
 
 
+def _significant_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop vestigial ``None``-valued params so ops that carry only ``None``
+    metadata (jax ``mul[out_dtype=None]`` / ``tanh[accuracy=None]`` /
+    ``dot_general[..., out_sharding=None]``) are treated as parameterless and
+    written INLINE. A param with a real value (``integer_pow[y=2]``,
+    ``dimension_numbers=...``) is kept and drives a fndef."""
+    return {k: v for k, v in params.items() if v is not None}
+
+
 # ---------------------------------------------------------------------------
 # Token vocabulary
 # ---------------------------------------------------------------------------
@@ -64,15 +73,12 @@ def _is_literal(v) -> bool:
 # integer literals are pooled append-only above the structural range.
 
 _STRUCTURAL = [
-    "<pad>", "<base>", "<block>", "<end>",
-    "inputs:", "output:", "fndef:", "eqn:",
-    "=", "(", ")", ",", "->", ":",
-    # primitive op names emitted by the block emitter / base tokenizer
-    "integer_pow", "dot_general", "add", "mul", "sub", "tanh", "exp", "log",
-    "sin", "cos", "reduce_sum", "reduce_mean", "broadcast", "convert",
-    "transpose", "reshape", "neg", "div", "sqrt", "identity", "const",
-    # dtype tokens for QUANT
-    "f32", "f16", "bf16", "f8", "i8", "i4",
+    # minimal structural markers: section heads + `;` block separator + syntax.
+    "<pad>", "inputs:", "eqns:", "output:", "jac:", ";",
+    "=", "(", ")", "const",
+    # parameterless primitive op names (written INLINE, 1 token each)
+    "add", "mul", "sub", "neg", "div", "tanh", "exp", "log",
+    "sin", "cos", "sqrt", "identity",
 ]
 _STRUCT_ID = {t: i for i, t in enumerate(_STRUCTURAL)}
 _N_STRUCT = len(_STRUCTURAL)
@@ -163,6 +169,11 @@ class FnDef:
     op: str
     params: Tuple[Tuple[str, Any], ...]  # sorted (k, repr(v)) for hashing
 
+    @property
+    def is_inline(self) -> bool:
+        """Parameterless ops are written inline (name == op), never defined."""
+        return not self.params
+
     def text(self) -> str:
         if self.params:
             ps = ", ".join(f"{k}={v}" for k, v in self.params)
@@ -183,6 +194,7 @@ class FnRegistry:
     def __init__(self) -> None:
         self._by_key: Dict[Tuple[str, Tuple], str] = {}
         self._defs: List[FnDef] = []
+        self._inline: Dict[Tuple[str, Tuple], FnDef] = {}
         self._counter = 0
 
     def _fresh(self) -> str:
@@ -194,11 +206,28 @@ class FnRegistry:
                       ) -> Tuple[str, Optional[FnDef]]:
         """Return ``(fn_name, new_fndef_or_None)``.
 
-        ``new_fndef`` is non-None ONLY the first time this (op, params) is seen
-        -- the block that first uses it appends that def; all later uses append
-        nothing (they just reference the name).
+        Refinement 1 (token minimization): only PARAMETERIZED ops get a fndef.
+        A parameterless op (``mul``, ``add``, ``sin``, ``neg``, ...) is 1 token
+        inline; a fndef is >=3 tokens. So define-once-reference only pays off for
+        the verbose parameterized ops. A params-empty op is written INLINE by its
+        op name (``fn_name == op``, no def line), never registered.
+
+        Parameterized ops keep the append-only registry: DEFINED the first time
+        a distinct (op, params) is seen, REFERENCED thereafter (fn set only ever
+        grows). ``new_fndef`` is non-None only on that first sight.
         """
-        params = params or {}
+        params = _significant_params(params)
+        # parameterless -> inline op-name, no registration, no fndef.
+        # ``_significant_params`` drops vestigial None-valued params (e.g. jax
+        # ``mul[out_dtype=None]`` / ``tanh[accuracy=None]``) so such ops stay
+        # inline, matching the intent that mul/add/... are parameterless.
+        if not params:
+            key = (op, ())
+            fn = self._inline.get(key)
+            if fn is None:
+                fn = FnDef(name=op, op=op, params=())  # inline sentinel
+                self._inline[key] = fn
+            return op, None
         key = (op, tuple(sorted((k, repr(v)) for k, v in params.items())))
         name = self._by_key.get(key)
         if name is not None:
@@ -208,6 +237,15 @@ class FnRegistry:
         self._by_key[key] = name
         self._defs.append(fndef)
         return name, fndef
+
+    def resolve(self, op: str, params: Optional[Dict[str, Any]] = None) -> "FnDef":
+        """Return the canonical FnDef for (op, params) -- inline or registered."""
+        params = _significant_params(params or {})
+        if not params:
+            return self._inline[(op, ())]
+        key = (op, tuple(sorted((k, repr(v)) for k, v in params.items())))
+        name = self._by_key[key]
+        return next(d for d in self._defs if d.name == name)
 
 
 # ---------------------------------------------------------------------------
@@ -232,10 +270,12 @@ class Eqn:
         parts = []
         for a in self.args:
             if isinstance(a, tuple) and a and a[0] == "const":
-                parts.append(f"<const {tuple(a[1].shape)}>")
+                arr = np.asarray(a[1])
+                parts.append(str(arr.item()) if arr.ndim == 0
+                             else f"const{tuple(arr.shape)}")
             else:
                 parts.append(str(a))
-        return f"eqn: {self.out} = {self.fn.name}({', '.join(parts)})"
+        return f"{self.out} = {self.fn.name}({', '.join(parts)})"
 
 
 @dataclass
@@ -256,14 +296,13 @@ class Block:
     header: str = ""
 
     def text_lines(self) -> List[str]:
-        lines = [f"--- block: {self.tag}"]
+        lines = [f"; {self.tag}"]
         for d in self.new_fndefs:
-            lines.append("    " + d.text())
+            lines.append("  " + d.text())
         for e in self.eqns:
-            lines.append("    " + e.text())
+            lines.append("  " + e.text())
         if self.reserved_out is not None:
-            lines.append(f"    <fills output: {self.reserved_out}>")
-        lines.append("    <end>")
+            lines.append(f"  -> fills jac {self.reserved_out}")
         return lines
 
 
@@ -313,6 +352,7 @@ class AppendOnlyStream:
         self._base_tokens: List[str] = []
 
         flat_args = list(args)
+        self._flat_args = flat_args
         cj = jax.make_jaxpr(fun)(*flat_args)
         self.jaxpr = cj.jaxpr
         self.consts = cj.literals
@@ -325,39 +365,47 @@ class AppendOnlyStream:
         self.tgraph = tgraph
 
         # -- Base tokens: value jaxpr, Jacobian output vars PRE-ALLOCATED --
-        toks: List[str] = ["<base>", "inputs:"]
-        # differentiable inputs
+        # Minimal terse style (refinement 2): sections inputs / eqns / output /
+        # jac; direct equations ``out = op(args)`` (op inline if parameterless,
+        # a defined name F# if parameterized); no per-eqn markers, no `,` spam.
+        # A parameterized op's fndef is emitted inline the first time it appears
+        # (``F0 = integer_pow[y=2]``) then referenced by name -- append-only.
+        toks: List[str] = ["inputs:"]
         self._input_vars = [self.jaxpr.invars[i] for i in self.argnums]
+        # seed input-var names AND all invar names (so symbolic partials that
+        # reference a primal input resolve numerically in build_numeric).
+        self._primal_name: Dict[str, Any] = {}
+        for i, v in enumerate(self.jaxpr.invars):
+            nm = self.vars.name(v)
+            self._primal_name[nm] = flat_args[i] if i < len(flat_args) else None
         for v in self._input_vars:
-            toks += [self.vars.name(v), ","]
-        # value equations (the primal computation) -- define-all-functions
-        toks.append("eqn:")
+            toks.append(self.vars.name(v))
+        # value equations (the primal computation)
+        toks.append("eqns:")
         for eqn in self.jaxpr.eqns:
             op = eqn.primitive.name
             fn_name, fndef = self.fns.get_or_define(op, dict(eqn.params))
-            if fndef is not None:
-                toks += ["fndef:", fndef.name, "=", op]
+            if fndef is not None:               # parameterized: define once inline
+                toks += [fndef.name, "=", op + "[" +
+                         ",".join(f"{k}={v}" for k, v in fndef.params) + "]"]
             out_name = self.vars.name(eqn.outvars[0])
             toks += [out_name, "=", fn_name, "("]
             for iv in eqn.invars:
-                if _is_literal(iv):
-                    toks += ["const", ","]
-                else:
-                    toks += [self.vars.name(iv), ","]
+                toks.append("const" if _is_literal(iv) else self.vars.name(iv))
             toks.append(")")
         # outputs + RESERVED Jacobian output vars
         toks.append("output:")
         for v in self.jaxpr.outvars:
-            toks += [self.vars.name(v), ","]
+            toks.append(self.vars.name(v))
         # reserve one Jacobian output var per (output, differentiable-input)
         self._reserved: Dict[Tuple[Any, Any], str] = {}
-        toks.append("Jacobians-reserved:")
+        toks.append("jac:")
         for ov in self.jaxpr.outvars:
             for iv in self._input_vars:
                 key = ("J", id(ov), id(iv))
                 nm = self.vars.reserve(key)
                 self._reserved[(id(ov), id(iv))] = nm
-                toks += [nm, ","]
+                toks.append(nm)
         self._base_tokens = toks
 
         # -- numeric emit bookkeeping --
@@ -405,27 +453,29 @@ class AppendOnlyStream:
 
     # ---- token / text views ------------------------------------------
     def token_text(self) -> List[str]:
-        lines = ["=== BASE ==="]
-        lines.append(" ".join(self._base_tokens))
+        lines = [" ".join(self._base_tokens)]
         for b in self.blocks:
             lines += b.text_lines()
         return lines
 
     def tokens(self) -> List[str]:
+        """Terse append-only token stream: base tokens, then per-block a `;`
+        separator, each new PARAMETERIZED fndef (inline, once), then the direct
+        equations ``out = fn(args)`` -- parameterless ops inline by op name."""
         toks = list(self._base_tokens)
         for b in self.blocks:
-            toks.append("<block>")
-            for d in b.new_fndefs:
-                toks += ["fndef:", d.name, "=", d.op]
+            toks.append(";")
+            for d in b.new_fndefs:              # parameterized ops only
+                toks += [d.name, "=", d.op + "[" +
+                         ",".join(f"{k}={v}" for k, v in d.params) + "]"]
             for e in b.eqns:
-                toks += ["eqn:", e.out, "=", e.fn.name, "("]
+                toks += [e.out, "=", e.fn.name, "("]
                 for a in e.args:
                     if isinstance(a, tuple) and a and a[0] == "const":
-                        toks += ["const", ","]
+                        toks.append("const")
                     else:
-                        toks += [str(a), ","]
+                        toks.append(str(a))
                 toks.append(")")
-            toks.append("<end>")
         return toks
 
     def token_ids(self) -> List[int]:
@@ -434,11 +484,10 @@ class AppendOnlyStream:
     # ---- block emitters ----------------------------------------------
     def _emit_eqn(self, block: Block, op: str, params: Dict[str, Any],
                   args: Tuple[Any, ...], out_name: str) -> None:
-        fn_name, fndef = self.fns.get_or_define(op, params)
-        if fndef is not None:
+        _, fndef = self.fns.get_or_define(op, params)
+        if fndef is not None:            # only PARAMETERIZED ops append a def
             block.new_fndefs.append(fndef)
-        # resolve fndef object for the eqn (get the canonical one)
-        canonical = next(d for d in self.fns._defs if d.name == fn_name)
+        canonical = self.fns.resolve(op, params)
         block.eqns.append(Eqn(out=out_name, fn=canonical, args=args))
 
     # symbolic elementary partials for the direct input->output edge case
@@ -665,8 +714,15 @@ class AppendOnlyStream:
         Jacobian, this equals graphax's jacve / jax.jacrev to float tolerance.
         """
         vals: Dict[str, Any] = {}
+        # seed edge constant leaves ...
         for name, arr in self._consts.items():
             vals[name] = jnp.asarray(arr)
+        # ... AND the primal input vars, so symbolic elementary partials that
+        # reference an input (e.g. ``c = 2*a`` for f(x)=x**2) resolve. (Fixes
+        # the KeyError('a') on the direct-input symbolic path.)
+        for name, arr in self._primal_name.items():
+            if arr is not None and name not in vals:
+                vals[name] = jnp.asarray(arr)
         for block in self.blocks:
             for e in block.eqns:
                 args = []
@@ -691,12 +747,15 @@ class AppendOnlyStream:
         """
         edge_names = list(self._consts.keys())
         edge_vals = [jnp.asarray(self._consts[n]) for n in edge_names]
+        primal = {n: jnp.asarray(a) for n, a in self._primal_name.items()
+                  if a is not None}
         eqns = [(e.out, e.fn.op, dict(e.fn.params), e.args)
                 for b in self.blocks for e in b.eqns]
         jac_out = dict(self._jac_edge_of)
 
         def fn(consts):
             vals = dict(zip(edge_names, consts))
+            vals.update(primal)
             for out, op, params, args in eqns:
                 a = []
                 for x in args:
