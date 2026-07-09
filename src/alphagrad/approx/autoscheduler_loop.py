@@ -21,11 +21,23 @@ os.environ.setdefault("ALPHAGRAD_PEAK_MEMORY_SYNC", "1")
 os.environ.setdefault("ALPHAGRAD_BKSTEP", "0")
 os.environ.setdefault("ALPHAGRAD_QUANT_ALLOWED", "int8,int16,bfloat16,float16")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+# INCREMENTAL causal palimpsa encode for the AZ policy prior. The
+# append-only token stream (static graph prefix | order ; micro-actions)
+# is ONLY append-only when graphax's state-tokenizer is on, so force it.
+os.environ.setdefault("GRAPHAX_STATE_TOKENS", "1")
+# Default ON; ALPHAGRAD_AZ_INCREMENTAL=0 restores legacy full-reencode.
+AZ_INCREMENTAL = os.environ.get("ALPHAGRAD_AZ_INCREMENTAL", "1") == "1"
 
 import numpy as np
 import jax, jax.numpy as jnp, equinox as eqx
 import optax
 from scipy.stats import spearmanr
+# Force true-float32 matmul accumulation so the INCREMENTAL (unbatched
+# matvec) and FULL (batched GEMM) encode paths match bit-for-bit on
+# Blackwell tensor-cores (proven in incremental_encoder_test.py).
+if AZ_INCREMENTAL:
+    jax.config.update("jax_default_matmul_precision", "highest")
+from alphagrad.approx import incremental_encoder as _ie
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--nn-hidden", type=int, default=256)
@@ -146,25 +158,76 @@ def _policy_vertex_logits(agent, tokens_j, eqn_ids_j):
     vlogits, _vctx = agent.vertex_policy(enc_x, tok_mask)
     return vlogits  # (num_vertices,)
 
+
+@eqx.filter_jit
+def _vertex_policy_from_enc(agent, enc_x, tok_mask):
+    """Pointer logits from a PRE-COMPUTED (S,E) enc_x + (S,) mask. Used by the
+    incremental path (enc_x built causally, eqn_ids=None)."""
+    vlogits, _vctx = agent.vertex_policy(enc_x, tok_mask)
+    return vlogits
+
+
+# --- INCREMENTAL encoder state: static-graph prefix is encoded ONCE at init.
+#     eqn_ids=None throughout the AZ policy encode (relational gate OFF =>
+#     exactly causal, so appending the order-delta tokens reproduces the full
+#     re-encode). The vertex pointer head cross-attends over the whole enc_x
+#     sequence, but enc_x is reproduced bit-for-bit, so the logits match.
+_IE_STATIC = {"state": None, "n": 0}
+
+def _init_incremental_prefix():
+    """Encode the empty-order (static-graph) token prefix once, snapshot the
+    per-layer palimpsa carry. Returns nothing; fills _IE_STATIC."""
+    tok, _eqn, _ = _callback(env.config, env.args, env.consts,
+                             np.zeros((0,), np.int32),
+                             np.zeros((0, MAX_RULES, 3), np.int32), 0, *ev)
+    tok = np.asarray(tok)
+    real = tok[tok > 0]
+    st = _ie.init_state(policy_agent)
+    _ie.extend(policy_agent, st, [int(t) for t in real])
+    _IE_STATIC["state"] = st
+    _IE_STATIC["n"] = int(real.shape[0])
+    print(f"[loop] incremental static-prefix real_tokens={int(real.shape[0])}", flush=True)
+
+
+def _incremental_full_tokens(chosen_a):
+    """Full REAL (non-pad) token stream for the given order via _callback."""
+    if len(chosen_a) == 0:
+        tok, eqn, _ = _callback(env.config, env.args, env.consts,
+                                np.zeros((0,), np.int32),
+                                np.zeros((0, MAX_RULES, 3), np.int32), 0, *ev)
+    else:
+        seq = _seq_from_order(chosen_a, 0)
+        order, specs, _ = build_order_specs(seq, env)
+        tok, eqn, _ = _callback(env.config, env.args, env.consts,
+                                jnp.asarray(order), jnp.asarray(specs), len(order), *ev)
+    tok = np.asarray(tok); eqn = np.asarray(eqn)
+    return tok, eqn
+
+
 def policy_prior_logits(chosen_a, legal_vids):
     """Policy prior logits over the LEGAL vertices for the current partial
     order (chosen_a = 0-based action idxs already eliminated). Returns a np
     array aligned to legal_vids (1-based vertex ids). Also returns the
     (tokens, eqn_ids, legal_action_idxs) needed to reconstruct the state for
-    the AZ training target."""
-    seq = _seq_from_order(chosen_a, 0)  # prior is over ORDER; encode pure prefix
-    order, specs, _ = build_order_specs(seq, env) if chosen_a else (
-        np.zeros((0,), np.int32), np.zeros((0, MAX_RULES, 3), np.int32), 0)
-    if len(chosen_a) == 0:
-        # empty prefix: encode a single dummy stop to get the initial state
-        tok, eqn, _ = _callback(env.config, env.args, env.consts,
-                                jnp.asarray([VALID[0]], dtype=jnp.int32),
-                                jnp.full((1, MAX_RULES, 3), -1, dtype=jnp.int32),
-                                0, *ev)
+    the AZ training target.
+
+    INCREMENTAL path (default): extend the static-prefix palimpsa carry by the
+    order-delta REAL tokens (O(delta)), build enc_x causally, run the pointer
+    head with eqn_ids=None. FULL path (ALPHAGRAD_AZ_INCREMENTAL=0): re-encode.
+    The returned (tok, eqn) are always the FULL _callback stream so the AZ
+    training target is byte-identical to legacy."""
+    tok, eqn = _incremental_full_tokens(chosen_a)
+    if AZ_INCREMENTAL:
+        real = tok[tok > 0]
+        st = _IE_STATIC["state"].copy()
+        # append only the NEW real tokens past the static prefix.
+        delta = [int(t) for t in real[_IE_STATIC["n"]:]]
+        _ie.extend(policy_agent, st, delta)
+        enc_x = _ie.enc_x(st)                        # (S_real, E)
+        tok_mask = jnp.ones((enc_x.shape[0],), dtype=bool)
+        vlog = np.asarray(_vertex_policy_from_enc(policy_agent, enc_x, tok_mask))
     else:
-        tok, eqn, _ = _callback(env.config, env.args, env.consts,
-                                jnp.asarray(order), jnp.asarray(specs), len(order), *ev)
-    vlog = np.asarray(_policy_vertex_logits(policy_agent, jnp.asarray(tok), jnp.asarray(eqn)))
+        vlog = np.asarray(_policy_vertex_logits(policy_agent, jnp.asarray(tok), jnp.asarray(eqn)))
     legal_aidx = [VALID.index(v) for v in legal_vids]
     prior = vlog[legal_aidx]  # logits over legal, aligned to legal_vids
     return prior, (np.asarray(tok), np.asarray(eqn), legal_aidx)
@@ -407,11 +470,14 @@ def propose_pool(head, stds, n_pool, micro_budget, temp, rng):
                 cand = [legal[t] for t in np.argsort(-(logits + g))[:m]]
                 # Evaluate EACH candidate child's cost-model Q ONCE (needed for
                 # both the sequential-halving pick AND the AZ improved target).
-                qmap = {}
-                for vv in cand:
-                    partial_a = chosen_a + [VALID.index(vv)]
-                    ctx = order_ctx(partial_a, micro_budget)
-                    qmap[vv] = _pred_scalar_np(head, ctx[None], xmu, xsd, ymu, ysd)[0]
+                # VMAP child scoring: build the (K, EMBD) context batch (one
+                # order_ctx encode per candidate -- distinct tokens) then run
+                # the cost head ONCE over the whole batch (jax.vmap inside
+                # _pred_scalar_np) instead of K serial (1,EMBD) head calls.
+                _cand_ctx = np.stack([order_ctx(chosen_a + [VALID.index(vv)], micro_budget)
+                                      for vv in cand], axis=0)   # (K, EMBD)
+                _cand_q = _pred_scalar_np(head, _cand_ctx, xmu, xsd, ymu, ysd)  # (K,)
+                qmap = {vv: float(_cand_q[i]) for i, vv in enumerate(cand)}
                 # AZ improved-policy TARGET over the LEGAL set (trained prior
                 # only): improved = softmax(prior + sigma(completed_Q)); legal
                 # actions not in `cand` keep completed_Q = mean(evaluated Q)
@@ -547,7 +613,27 @@ def train_policy(targets, epochs):
 stds = None
 # warm-start the head with a quick ranking fit on the seed buffer
 cost_head, stds = train_ranking(cost_head, np.array(bufX), np.array(bufS), A.retrain_epochs)
+# Encode the static-graph token prefix ONCE (incremental AZ policy prior).
+if _USE_TRAINED_PRIOR and AZ_INCREMENTAL:
+    _init_incremental_prefix()  # static-prefix carry snapshot
 best_real = {"scalar": -1e18, "raw": None, "order": None, "round": -1}
+# ---- Pareto-front archive (like ppo_ray, ParetoArchive) over the 4 measured
+# channels. maximize-oriented vector = [-lat, -peak, -flops, +cos].
+from alphagrad.approx.common.pareto_archive import ParetoArchive
+_pareto = ParetoArchive(["neg_latency_ns", "neg_xla_peak", "neg_flops", "cosine_sim"],
+                        [0, 1, 2, 3])
+_pareto_path = os.path.join(A.out, "ppo_pareto_front.json")
+def _pareto_vec(raw4):
+    # raw4 = [lat, peak, flops, cos] -> maximize orientation.
+    return [-float(raw4[0]), -float(raw4[1]), -float(raw4[2]), float(raw4[3])]
+def _feed_pareto(order_ids, raw4, rnd):
+    # drop sentinels / all-zero (failed measures) — a real measure has
+    # nonzero lat/peak/flops.
+    if raw4 is None or (not np.all(np.isfinite(raw4))):
+        return
+    if not np.any(np.asarray(raw4[:3]) != 0.0):
+        return
+    _pareto.add_many([(_pareto_vec(raw4), [int(v) for v in order_ids])], rnd)
 measured_hist = []   # (ctx, meas, scalar) accumulated this session for held-out Spearman
 rows = []
 rng = np.random.default_rng(A.seed)
@@ -585,6 +671,7 @@ for rnd in range(A.rounds):
         ms = scalarize(raw)
         meas_raw.append(raw); pred_scalar.append(ps); meas_scalar.append(ms)
         bufX.append(ctx); bufY.append(raw); bufS.append(ms)
+        _feed_pareto(order_ids, raw, rnd)
         measured_hist.append((ctx, raw, ms))
         if ms > best_real["scalar"]:
             best_real = {"scalar": ms, "raw": raw.tolist(), "order": list(map(int, order_ids)), "round": rnd}
@@ -620,7 +707,18 @@ for rnd in range(A.rounds):
     row["policy_ce"] = _pol_ce if _USE_TRAINED_PRIOR else float('nan')
     row["policy_entropy"] = _pol_ent if _USE_TRAINED_PRIOR else float('nan')
     row["n_az_targets"] = len(_az_targets) if _USE_TRAINED_PRIOR else 0
+    row["round_sec"] = float(time.time() - t0)
     rows.append(row)
+    # dump the Pareto front each round (ppo_pareto_front.json style) + metrics.
+    try:
+        _hv = _pareto.hypervolume()
+        _pareto.dump_front(_pareto_path, extra={"round": rnd,
+                           "hypervolume": (float(_hv) if np.isfinite(_hv) else None)})
+        row["pareto_hypervolume"] = float(_hv) if np.isfinite(_hv) else float("nan")
+        row["pareto_archive_size"] = int(len(_pareto.pts))
+    except Exception as _pe:
+        row["pareto_hypervolume"] = float("nan"); row["pareto_archive_size"] = 0
+        print(f"[loop] pareto dump failed: {_pe}", flush=True)
     if _wb_run is not None:
         try:
             _wb_run.log({
@@ -633,6 +731,9 @@ for rnd in range(A.rounds):
                 "temp": temp,
                 "policy_ce": row["policy_ce"], "policy_entropy": row["policy_entropy"],
                 "n_az_targets": row["n_az_targets"],
+                "round_sec": row["round_sec"],
+                "pareto/hypervolume": row.get("pareto_hypervolume", float("nan")),
+                "pareto/archive_size": row.get("pareto_archive_size", 0),
             })
         except Exception:
             pass
