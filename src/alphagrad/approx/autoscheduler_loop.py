@@ -179,7 +179,7 @@ def _init_incremental_prefix():
     per-layer palimpsa carry. Returns nothing; fills _IE_STATIC."""
     tok, _eqn, _ = _callback(env.config, env.args, env.consts,
                              np.zeros((0,), np.int32),
-                             np.zeros((0, MAX_RULES, 3), np.int32), 0, *ev)
+                             np.zeros((0, MAX_RULES, 3), np.int32), 0, *ev, init=True)
     tok = np.asarray(tok)
     real = tok[tok > 0]
     st = _ie.init_state(policy_agent)
@@ -194,12 +194,12 @@ def _incremental_full_tokens(chosen_a):
     if len(chosen_a) == 0:
         tok, eqn, _ = _callback(env.config, env.args, env.consts,
                                 np.zeros((0,), np.int32),
-                                np.zeros((0, MAX_RULES, 3), np.int32), 0, *ev)
+                                np.zeros((0, MAX_RULES, 3), np.int32), 0, *ev, init=True)
     else:
         seq = _seq_from_order(chosen_a, 0)
         order, specs, _ = build_order_specs(seq, env)
         tok, eqn, _ = _callback(env.config, env.args, env.consts,
-                                jnp.asarray(order), jnp.asarray(specs), len(order), *ev)
+                                jnp.asarray(order), jnp.asarray(specs), len(order), *ev, init=True)
     tok = np.asarray(tok); eqn = np.asarray(eqn)
     return tok, eqn
 
@@ -295,7 +295,7 @@ def order_ctx(order_ids, micro_budget=0, rng=None):
     for _attempt in range(2):
         try:
             tok, eqn, _ = _callback(env.config, env.args, env.consts,
-                                    jnp.asarray(order), jnp.asarray(specs), len(order), *ev)
+                                    jnp.asarray(order), jnp.asarray(specs), len(order), *ev, init=True)
             _res = np.asarray(_encode(jnp.asarray(tok), jnp.asarray(eqn)))
             _ctx_cache[_ck] = _res
             return _res  # (EMBD,)
