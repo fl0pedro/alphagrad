@@ -78,7 +78,7 @@ from alphagrad.approx.env import VertexEliminationEnv, _callback, REWARD_INDEX, 
 from alphagrad.approx.common.examples import get_fn, get_args, data_gen, infer_argnums, scalar_loss_fn
 from alphagrad.approx.common.eval_samples import generate_eval_samples
 from alphagrad.approx.verify_pareto_solution import build_order_specs
-from alphagrad.approx.ppo_ray_worker import MicroPPOAgent, NUM_REWARDS
+from alphagrad.approx.ppo_ray_worker import MicroPPOAgent, NUM_REWARDS, _scale_micro_policy_heads, _rezero_encoder_rel_gates
 from alphagrad.transformer import MLP
 from graphax.core import _build_graph, _prune_graph, _eliminate_vertex
 MAX_RULES = 16
@@ -127,6 +127,10 @@ if _USE_TRAINED_PRIOR:
                                  num_heads=4, hidden_dim=256,
                                  num_vertices=len(jaxpr.eqns), value_dims=(128, 128),
                                  key=_kp, max_substeps=16, policy="palimpsa")
+    # palimpsa init details (match the PPO policy): near-uniform initial
+    # policy via head-init-scale 0.1 + re-zeroed encoder rel-gates.
+    policy_agent = _scale_micro_policy_heads(policy_agent, 0.1)
+    policy_agent = _rezero_encoder_rel_gates(policy_agent)
     _pol_opt = _optax.adam(3e-4)
     _pol_ostate = _pol_opt.init(eqx.filter(policy_agent, eqx.is_array))
     print("[loop] POLICY PRIOR = TRAINED (fresh-init AlphaZero policy agent)", flush=True)
@@ -485,6 +489,11 @@ def train_policy(targets, epochs):
     # group by legal-length so we can batch same-shaped states (the pointer
     # head returns all num_vertices logits; we gather legal per sample).
     import numpy as _np
+    _AZ_MAX_STATES = 64
+    if len(targets) > _AZ_MAX_STATES:
+        _sel = _np.random.default_rng(A.seed + len(bufX)).choice(
+            len(targets), _AZ_MAX_STATES, replace=False)
+        targets = [targets[int(i)] for i in _sel]
     toks = _np.stack([t[0] for t in targets])
     eqns = _np.stack([t[1] for t in targets])
     # legal masks + target over the full num_vertices space (0 on illegal).
