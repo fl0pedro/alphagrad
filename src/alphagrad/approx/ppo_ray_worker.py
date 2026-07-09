@@ -675,6 +675,19 @@ class PPORayWorker:
         # something to fill the leaves into).
         self._checkpoint_path = getattr(self.args, "checkpoint_path", "") or ""
         self._checkpoint_every = int(getattr(self.args, "checkpoint_every", 0))
+        # Env-var aliases (bridge-cse): ALPHAGRAD_CHECKPOINT_PATH /
+        # ALPHAGRAD_CHECKPOINT_EVERY let a launcher enable periodic agent.eqx
+        # saves without the CLI flags. Only OVERRIDE when the CLI left them
+        # unset (path empty), so an explicit --checkpoint-path always wins and
+        # the unset/no-env case stays byte-identical (checkpointing OFF).
+        import os as _os_ck
+        if not self._checkpoint_path:
+            _env_path = str(_os_ck.environ.get("ALPHAGRAD_CHECKPOINT_PATH", "") or "").strip()
+            if _env_path:
+                self._checkpoint_path = _env_path
+        _env_every = str(_os_ck.environ.get("ALPHAGRAD_CHECKPOINT_EVERY", "") or "").strip()
+        if _env_every:
+            self._checkpoint_every = int(_env_every)
         if self.args.no_jit:
             jax.config.update("jax_disable_jit", True)
         os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
