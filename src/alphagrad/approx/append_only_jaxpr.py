@@ -345,12 +345,15 @@ class AppendOnlyStream:
     """
 
     def __init__(self, fun: Callable, args: Sequence[Any], argnums=(0,),
-                 tokens_only: bool = False):
+                 tokens_only: bool = False, closed_jaxpr=None):
         # ``tokens_only``: skip densifying every edge to a concrete array
         # (``SparseTensor.dense()``) -- the proposer needs only the token
         # STREAM (op/fn/structure + edge SHAPES), not numeric ``build_numeric``.
         # Shapes come straight from the index sizes, so this avoids the O(E)
         # dense-materialization that dominates per-candidate construction.
+        # ``closed_jaxpr``: optional ``(jaxpr, consts)`` pair -- skip the
+        # ``jax.make_jaxpr(fun)`` re-trace when the caller (the env _callback
+        # hook) already holds the traced jaxpr; ``fun`` may then be None.
         self._tokens_only = tokens_only
         self.vocab = Vocabulary()
         self.vars = VarRegistry()
@@ -360,9 +363,12 @@ class AppendOnlyStream:
 
         flat_args = list(args)
         self._flat_args = flat_args
-        cj = jax.make_jaxpr(fun)(*flat_args)
-        self.jaxpr = cj.jaxpr
-        self.consts = cj.literals
+        if closed_jaxpr is not None:
+            self.jaxpr, self.consts = closed_jaxpr
+        else:
+            cj = jax.make_jaxpr(fun)(*flat_args)
+            self.jaxpr = cj.jaxpr
+            self.consts = cj.literals
         self.argnums = tuple(argnums)
 
         # numeric graph (edges carry dense partial-derivative tensors)
@@ -751,6 +757,48 @@ class AppendOnlyStream:
                                      info.out_sizes, info.prim_sizes)
         self.blocks.append(block)
         return block
+
+    def emit_micro_blocks(self, edge_keys, rules) -> None:
+        """Append the literal jaxpr blocks for a vertex's micro-actions.
+
+        ``edge_keys`` = the edges CREATED by eliminating the vertex (graphax
+        applies each per-vertex transform to every ``edge_outval``); ``rules``
+        = the vertex's graphax Diag/Compress/Quant sequence, applied IN ORDER.
+        Emitted as real jaxpr per the spec:
+          * Quant    -> ``convert[new_dtype=...]`` (cast round-trip)
+          * Compress -> ``reduce_<kind>[axes]`` + ``broadcast`` per valid axis
+          * Diag     -> elementwise ``mul(edge, const)`` with the block-diag
+                        0/1 mask as a const leaf. (The i/j/factor geometry
+                        lives in the mask VALUES, which token streams render
+                        as ``const`` -- a known representational limit.)
+        Tokens-only: axes beyond the edge's nominal rank are skipped (the
+        physical val frame can differ; the MEASUREMENT path is untouched).
+        """
+        from graphax.sparse.micro_actions import Diag as _D, Compress as _C, Quant as _Q
+        for rule in rules:
+            for ek in edge_keys:
+                info = self._edges.get(ek)
+                if info is None:
+                    continue
+                shape = info.out_sizes + info.prim_sizes
+                if isinstance(rule, _Q):
+                    self.quant(ek, dtype=rule.dtype)
+                elif isinstance(rule, _C):
+                    kind = getattr(rule, "kind", "mean")
+                    for ax in rule.axes:
+                        if 0 <= int(ax) < len(shape):
+                            self.compress(ek, axis=int(ax), kind=kind)
+                elif isinstance(rule, _D):
+                    block = Block(tag=f"DIAG edge i={rule.i} j={rule.j} "
+                                      f"factor={rule.factor}")
+                    d_name = self.vars.name(("diagm", ek, rule.i, rule.j,
+                                             rule.factor, len(self.blocks)))
+                    self._emit_eqn(block, "mul", {},
+                                   (info.var_name,
+                                    ("const", np.float32(1.0))), d_name)
+                    self._edges[ek] = EdgeInfo(d_name, info.n_out, info.n_prim,
+                                               info.out_sizes, info.prim_sizes)
+                    self.blocks.append(block)
 
     # book-keeping helpers -------------------------------------------------
     def _record_computed(self, name, out_sizes, prim_sizes):
