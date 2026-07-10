@@ -606,6 +606,9 @@ def measure_topk_parallel(order_list, micro_budget, seed, n_workers, gpu_base):
         except Exception:
             pass
     import shutil as _sh; _sh.rmtree(_d, ignore_errors=True)
+    _ok = sum(1 for r in results if r is not None)
+    print(f"[measure] parallel {_ok}/{n} measured across {sum(1 for c in chunks if c)} "
+          f"GPU workers (base={gpu_base})", flush=True)
     return results
 
 def train_policy(targets, epochs):
