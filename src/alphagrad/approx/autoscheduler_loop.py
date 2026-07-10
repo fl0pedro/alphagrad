@@ -21,6 +21,12 @@ os.environ.setdefault("ALPHAGRAD_PEAK_MEMORY_SYNC", "1")
 os.environ.setdefault("ALPHAGRAD_BKSTEP", "0")
 os.environ.setdefault("ALPHAGRAD_QUANT_ALLOWED", "int8,int16,bfloat16,float16")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+# Ray measure-actor backend (--measure-backend ray): disable uv-run working-dir
+# upload (~/dsnn 8.5GB > Ray 512MB cap) + keep Ray from clobbering our manual
+# per-actor CUDA_VISIBLE_DEVICES pinning. Must precede any import ray.
+os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
+os.environ.setdefault("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
+os.environ.setdefault("RAY_DISABLE_IMPORT_WARNING", "1")
 # INCREMENTAL causal palimpsa encode for the AZ policy prior. The
 # append-only token stream (static graph prefix | order ; micro-actions)
 # is ONLY append-only when graphax's state-tokenizer is on, so force it.
@@ -75,6 +81,8 @@ ap.add_argument("--out", default=os.path.expanduser("~/dsnn/autoscheduler_out"))
 ap.add_argument("--total-measurements", type=int, default=0)  # if >0, rounds = ceil(total/topk)
 ap.add_argument("--measure-workers", type=int, default=0)     # >0 = parallel measure over N GPUs
 ap.add_argument("--measure-gpu-base", type=int, default=1)    # first GPU idx for measure workers
+ap.add_argument("--measure-backend", default="serial", choices=["serial", "subprocess", "ray"])
+ap.add_argument("--num-measure-actors", type=int, default=7)
 ap.add_argument("--clear-caches-every", type=int, default=1)  # jax.clear_caches every N rounds
 ap.add_argument("--policy-prior", default="markowitz", choices=["markowitz", "trained"])
 ap.add_argument("--policy-epochs", type=int, default=200)   # policy CE epochs/round
@@ -703,9 +711,96 @@ def _feed_pareto(order_ids, raw4, rnd):
     if not np.any(np.asarray(raw4[:3]) != 0.0):
         return
     _pareto.add_many([(_pareto_vec(raw4), [int(v) for v in order_ids])], rnd)
+# ---- RAY measure-actor pool (--measure-backend ray) -----------------------
+# Each top-k candidate is measured in its OWN isolated Ray CpuApproximationActor
+# (the SAME actor class PPO uses), pinned to its own GPU -> fair, contention-free
+# per-measurement grad-measure distributed across GPUs {base..base+N-1}. The
+# main-process trainer keeps GPU 0. Reuses env._callback inside each actor; the
+# raw 4-tuple [lat, xla_peak, flops, cos] is recovered from the negated reward
+# vector (byte-consistent with measure_order: peak/flops/cos exact, lat in noise).
+_RAY_ACTORS = None
+_RAY_EV = None
+def _init_ray_measure():
+    global _RAY_ACTORS, _RAY_EV
+    import ray
+    ray.init(num_cpus=A.num_measure_actors + 8, ignore_reinit_error=True,
+             include_dashboard=False, _temp_dir=f"/tmp/rayaz{os.getpid()}")
+    from alphagrad.approx.cpu_approx_actors import CpuApproximationActor
+    # args_dict that _build_env_from_args reads -> builds the IDENTICAL grad
+    # graph (grad_target_setup(measure_grad=True) == scalar_loss_fn, argnums
+    # (2,3,4,5)) + measure knobs matching the loop's own env.
+    args_dict = dict(
+        example="VmappedNeuralNetwork", dataset="mnist", dataset_size=128,
+        seed=A.seed, measure_grad=True, seed_vertices=False,
+        cmp_type="latency", mem_type="peak_memory", exec_on_gpu=True,
+        measure_latency=True, latency_samples=1, num_data_points=A.ndata,
+        reps_per_point=1, percentile_keep=0.60,
+        latency_inner_reps=A.latency_inner_reps, latency_warmup=0,
+        latency_winsor=0.0, latency_timer="perf_counter", quant_once=False,
+        slow_exec_cutoff_seconds=0.0, flop_gate_threshold=0.0,
+        intermediate_rewards=True, num_eval_samples=A.ndata,
+        cost_pipeline_schedule="always_full", rewards="latency",
+        num_cpu_workers=A.num_measure_actors, cpu_cores_per_actor=0,
+    )
+    base_env = {
+        "JAX_PLATFORMS": "cuda", "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+        "ALPHAGRAD_NN_HIDDEN": str(A.nn_hidden),
+        # cosine_sim rewarded -> actor computes the EXACT reference Jacobian
+        # (else cos channel = 0). Only affects the (unused) scalar-reward weight.
+        "ALPHAGRAD_REWARD_CHANNELS": "latency_ns,xla_peak_memory,flops,cosine_sim",
+    }
+    acts = []
+    for i in range(A.num_measure_actors):
+        aenv = dict(base_env)
+        aenv["CUDA_VISIBLE_DEVICES"] = str(A.measure_gpu_base + i)
+        opts = {"num_cpus": 1, "num_gpus": 0, "runtime_env": {"env_vars": aenv}}
+        acts.append(CpuApproximationActor.options(**opts).remote(
+            args_dict, variant=None, actor_id=i))
+    _RAY_ACTORS = acts
+    _RAY_EV = [np.asarray(x) for x in ev]
+    print(f"[loop] RAY measure pool: {len(acts)} actors on GPUs "
+          f"{A.measure_gpu_base}..{A.measure_gpu_base + A.num_measure_actors - 1} "
+          f"(trainer GPU0)", flush=True)
+
+def measure_topk_ray(order_list, micro_budget, rng=None):
+    """Measure order_list across the Ray actor pool (one per GPU, concurrent).
+    Returns [lat, peak, flops, cos] or None per order, aligned."""
+    import ray
+    from alphagrad.approx.env import REWARD_INDEX
+    LAT = REWARD_INDEX["latency_ns"]; XP = REWARD_INDEX["xla_peak_memory"]
+    FL = REWARD_INDEX["flops"]; CO = REWARD_INDEX["cosine_sim"]
+    futs = []
+    for i, o in enumerate(order_list):
+        seq = _seq_from_order(o, micro_budget, rng)
+        order, specs, _ = build_order_specs(seq, env)
+        a = _RAY_ACTORS[i % len(_RAY_ACTORS)]
+        futs.append(a.evaluate.remote(
+            np.asarray(order, np.int32), np.asarray(specs, np.int32),
+            len(order), eval_samples=_RAY_EV, init=False))
+    out = []
+    for f in futs:
+        try:
+            _tok, _eqn, reward = ray.get(f, timeout=1200)
+            r = np.asarray(reward)
+            # sentinel (failed measure) = all -1e10 cost channels
+            if float(r[FL]) <= -1e9 or not np.all(np.isfinite(r)):
+                out.append(None)
+            else:
+                out.append(np.array([-r[LAT], -r[XP], -r[FL], r[CO]],
+                                    dtype=np.float64))
+        except Exception as _e:
+            print(f"[measure-ray] get failed: {type(_e).__name__}: {_e}", flush=True)
+            out.append(None)
+    _ok = sum(1 for x in out if x is not None)
+    print(f"[measure] ray {_ok}/{len(out)} measured across "
+          f"{len(_RAY_ACTORS)} GPU actors", flush=True)
+    return out
+
 measured_hist = []   # (ctx, meas, scalar) accumulated this session for held-out Spearman
 rows = []
 rng = np.random.default_rng(A.seed)
+if A.measure_backend == "ray":
+    _init_ray_measure()
 for rnd in range(A.rounds):
     t0 = time.time()
     # Bound the leak on the MAIN process (encoding). The parallel measure
@@ -727,7 +822,10 @@ for rnd in range(A.rounds):
     # MEASURE top-k for real
     meas_raw, pred_scalar, meas_scalar = [], [], []
     _orders_topk = [o for o, _ in topk]
-    if A.measure_workers > 0:
+    if A.measure_backend == "ray":
+        _raws = measure_topk_ray(_orders_topk, A.micro_budget,
+                                 np.random.default_rng(A.seed + rnd))
+    elif A.measure_workers > 0:
         _raws = measure_topk_parallel(_orders_topk, A.micro_budget, A.seed + rnd,
                                       A.measure_workers, A.measure_gpu_base)
     else:
