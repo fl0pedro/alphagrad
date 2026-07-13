@@ -430,6 +430,8 @@ class AppendOnlyStream:
         for sv in graph:
             for dv in graph[sv]:
                 st = _force(graph[sv][dv])
+                if st is None:
+                    continue  # no-Jacobian edge (e.g. stop_gradient); skip (mirrors _eliminate_vertex None-edge skip)
                 n_out = len(st.out_dims)
                 n_prim = len(st.primal_dims)
                 # edge constant leaf var
