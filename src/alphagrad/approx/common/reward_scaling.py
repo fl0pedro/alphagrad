@@ -57,7 +57,7 @@ FROB_RESIDUAL_IDX: int = REWARD_INDEX["frob_residual"]
 BKSTEP_ACC_IDX: int = REWARD_INDEX["bkstep_acc"]
 
 # Channels whose values are bounded / quality-signal, NOT raw cost — they
-# bypass symlog wherever a symlog transform would otherwise apply (Lagrangian
+# bypass symlog wherever a symlog transform would otherwise apply (gate
 # thresholds, calibration scaling). Mirrored from mu0.py:155 and
 # ppo_ray_worker.py:80.
 NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (COSINE_SIM_IDX, BKSTEP_ACC_IDX)
@@ -69,9 +69,8 @@ NO_SYMLOG_MASK_NP[list(NO_SYMLOG_REWARD_INDICES)] = True
 # (graphax's ``jacve`` returns a zero-norm Jacobian for any partial
 # order, so the cosine_sim / frob_residual comparison is mathematically
 # trivial mid-rollout). Downstream consumers must mask intermediate
-# steps when these channels participate in violation / aggregation
-# computations — see :func:`aggregate_per_channel_stats` and the
-# PPO Lagrangian mask in ``ppo_ray_worker.py``.
+# steps when these channels participate in aggregation computations —
+# see :func:`aggregate_per_channel_stats`.
 SPARSE_TERMINAL_INDICES: tuple[int, ...] = (
     COSINE_SIM_IDX, FROB_RESIDUAL_IDX, BKSTEP_ACC_IDX,
 )
@@ -131,13 +130,6 @@ def build_reward_weights(args) -> np.ndarray:
     falls back to weighting `muls_adds_fmas` (the original PPO-ray
     fallback at `ppo_ray_worker.py:159-160`).
 
-    RQ8 / Pitch A: if `--reward-as-constraints LIST` names any of the
-    channels (typical: ``cosine_sim,frob_residual``), their lambdas are
-    forced to 0 here so they don't enter the scalar reward. They still
-    influence the policy via the Lagrangian dual-ascent path
-    (``ppo_ray_worker._apply_lagrangian_penalty`` / equivalents) — that's
-    the constrained-MDP formulation (RCPO; Tessler et al. 2018) the
-    pipeline doc describes.
     """
     w = np.zeros(NUM_REWARDS, dtype=np.float32)
 
@@ -204,13 +196,6 @@ def build_reward_weights(args) -> np.ndarray:
             )
         for _nm, _wv in _pairs:
             w[REWARD_INDEX[_nm]] = _wv
-        # Honour Lagrangian-constraint zeroing even in explicit-list mode.
-        _asc = str(getattr(args, "reward_as_constraints", "") or "")
-        if _asc:
-            for _cn in _asc.split(","):
-                _cn = _cn.strip()
-                if _cn in REWARD_INDEX:
-                    w[REWARD_INDEX[_cn]] = 0.0
         if not np.any(w):
             w[REWARD_INDEX["muls_adds_fmas"]] = 1.0
         return w
@@ -235,13 +220,6 @@ def build_reward_weights(args) -> np.ndarray:
             _names.append("bkstep_acc")
         for _nm in _names:
             w[REWARD_INDEX[_nm]] = _w_all
-        # Honour Lagrangian-constraint zeroing even in all-channel mode.
-        _asc = str(getattr(args, "reward_as_constraints", "") or "")
-        if _asc:
-            for _cn in _asc.split(","):
-                _cn = _cn.strip()
-                if _cn in REWARD_INDEX:
-                    w[REWARD_INDEX[_cn]] = 0.0
         if not np.any(w):
             w[REWARD_INDEX["muls_adds_fmas"]] = 1.0
         return w
@@ -286,23 +264,6 @@ def build_reward_weights(args) -> np.ndarray:
         # same channel; if acc routed to bkstep, cosine_sim is otherwise 0.
         w[COSINE_SIM_IDX] = float(w[COSINE_SIM_IDX]) + _lam_guide
 
-    # RQ8 Stage 5: zero lambdas for channels declared as Lagrangian
-    # constraints. They still appear in the per-channel reward vector
-    # (so logging / cossim-best-tracking continues) but contribute 0
-    # to the scalar sum — keeps the constrained-MDP semantics clean.
-    as_constraints = str(getattr(args, "reward_as_constraints", "") or "")
-    if as_constraints:
-        for name in as_constraints.split(","):
-            name = name.strip()
-            if not name:
-                continue
-            if name not in REWARD_INDEX:
-                # Silent skip on unknown name — match the rest of this
-                # file's tolerant parsing; trainer-side will log a
-                # warning at startup so this isn't invisible.
-                continue
-            w[REWARD_INDEX[name]] = 0.0
-
     if not np.any(w):
         w[REWARD_INDEX["muls_adds_fmas"]] = 1.0
     return w
@@ -324,16 +285,13 @@ def parse_reward_conditions(
 
     Semantics: at every transition where ``op(harder_reward, thresh)``
     is False, the easier channel's reward is zeroed for that step.
-    Acts as a hard alternative to the Lagrangian penalty for cases
+    Acts as a hard gate for cases
     where the user wants to gate one reward on another instead of
     paying a soft cost. The check happens in the worker, BEFORE the
     per-channel GAE / advantage stack — so the easier channel's
     advantage is recomputed cleanly from the gated reward, not gated
     after the fact.
 
-    Mirrors the validation style of
-    :func:`alphagrad.approx.ppo_ray_worker._parse_lagrangian_constraints`
-    so the two flags accept structurally similar syntax.
     """
     out: list[tuple[int, int, str, float]] = []
     if not specs:
@@ -701,7 +659,7 @@ def build_unified_reward_log_dict(
             cosine_sim channel. When both are supplied, also emit
             ``corridor/{in,below,above}_band_fraction``. Pass
             ``corridor_low=None`` (no floor) with a finite ``corridor_high``
-            to track only the ceiling (``--anti-degeneracy delta_ceiling``).
+            to track only the ceiling.
         terminal_cossims: optional 1-D array of terminal cossim values
             across the batch — required when corridor metrics are
             requested. If None, corridor keys are omitted.
@@ -1107,11 +1065,10 @@ def build_wandb_log_dict(stats: dict, state: dict, ep: int) -> dict:
     for name, v in state["best_global_weighted_split"].items():
         log_dict[f"best_overall_weighted/{name}"] = v
     # Pass through any extra namespaced keys the worker chose to emit
-    # (e.g. `lagrangian/multipliers/cosine_sim`).
+    # (e.g. `popart/sigma_cosine_sim`).
     for k, v in stats.items():
         if (
-            k.startswith("lagrangian/")
-            or k.startswith("reward_mean/")
+            k.startswith("reward_mean/")
             or k.startswith("reward_dist/")
             # bridge-cse: full-range raw cosine_sim / bkstep telemetry
             # (reward/cosine_sim_raw{,_max,_min}, reward/bkstep_acc_raw).

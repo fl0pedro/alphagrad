@@ -54,10 +54,6 @@ COMMON_ARGS=(
     --lambda-cmp 1.0
     --lambda-mem 1.0
     --lambda-frob 1.0
-    --anti-degeneracy delta_ceiling
-    --anti-degeneracy-delta "$RQ5_BEST_DELTA"
-    --cosine-lower-bound 0.0
-    --cosine-upper-bound 1.0
     --episodes "$EPISODES"
     --num-envs "$NUM_ENVS"
     --num-cpu-workers "$NUM_ENVS"
@@ -123,7 +119,7 @@ for arm in "${ARMS[@]}"; do
             --seed "$sd"
         )
         if [[ -n "$as_constraints" ]]; then
-            extra_args+=(--reward-as-constraints "$as_constraints")
+            extra_args+=()
         fi
         run_variant "$tag" "${extra_args[@]}" || FAIL=$((FAIL + 1))
     done

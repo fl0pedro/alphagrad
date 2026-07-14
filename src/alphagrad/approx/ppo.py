@@ -153,8 +153,8 @@ _HEAD_REWARD_INDICES_ARR = jnp.asarray(HEAD_REWARD_INDICES, dtype=jnp.int32)
 #      each weighted channel contributes on a comparable scale.
 # cosine_sim is intentionally excluded from both: it is already bounded
 # to [0, 1] and ~order 1, so symlog is a near-identity that only complicates
-# the Lagrangian threshold semantics, and the user's CLI lambda for cosine
-# is already in usable units (reward per unit of cosine similarity).
+# the threshold semantics, and the user's CLI lambda for cosine is already
+# in usable units (reward per unit of cosine similarity).
 _NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (REWARD_INDEX["cosine_sim"],)
 _NO_SYMLOG_MASK: "jax.Array" = (
     jnp.zeros((NUM_REWARDS,), dtype=jnp.bool_)
@@ -2495,46 +2495,6 @@ def make_argparser() -> argparse.ArgumentParser:
         "only.",
     )
     p.add_argument(
-        "--lagrangian-constraint",
-        action="append",
-        default=[],
-        metavar="NAME>=THRESH",
-        help="Stage F hard-constraint deployment. Each occurrence adds a "
-        "constraint of the form `<reward_name>>=<threshold>` (rewards "
-        "are 'higher is better'; e.g. cosine_sim>=0.8, or for cost "
-        "components flops>=-1e10 to cap FLOPs at 1e10). The trainer "
-        "augments the per-step advantage with -λ_i · max(0, t_i - r_i) "
-        "and updates λ_i ≥ 0 by dual ascent on the mean violation. "
-        "May be repeated; default no constraints (= unconstrained PPO).",
-    )
-    p.add_argument(
-        "--lagrangian-lr",
-        type=float,
-        default=1e-2,
-        help="Dual-ascent step size on the Lagrangian multipliers, applied "
-        "once per episode against the mean per-step violation.",
-    )
-    # Cosine-similarity band: keep cosine_sim in [lower, upper] via the
-    # Lagrangian. Lower nudges the policy away from collapsing accuracy to
-    # zero; upper prevents it from saturating at perfect agreement and
-    # spending the remaining compute on quality nobody can spend. Set
-    # ``--cosine-lower-bound <= 0`` or ``--cosine-upper-bound >= 1`` to
-    # disable either side.
-    p.add_argument(
-        "--cosine-lower-bound",
-        type=float,
-        default=0.8,
-        help="Floor on cosine_sim enforced via a Lagrangian multiplier. "
-        "Default 0.8. Pass 0.0 to disable.",
-    )
-    p.add_argument(
-        "--cosine-upper-bound",
-        type=float,
-        default=0.9,
-        help="Ceiling on cosine_sim enforced via a Lagrangian multiplier. "
-        "Default 0.9. Pass 1.0 to disable.",
-    )
-    p.add_argument(
         "--calibrate-steps",
         type=int,
         default=0,
@@ -3343,44 +3303,6 @@ def _cmp_reward_index(cmp_type: str) -> int:
 def _mem_reward_index(mem_type: str) -> int:
     return REWARD_INDEX[_MEM_TYPE_TO_REWARD[mem_type]]
 
-
-def parse_lagrangian_constraints(specs: list[str]) -> list[tuple[int, float, int]]:
-    """Parse ``--lagrangian-constraint`` strings to ``(idx, threshold, sign)`` triples.
-
-    Supported forms:
-
-    * ``<reward_name>>=<threshold>``  → ``reward[idx] ≥ threshold``
-      (sign +1; violation when reward dips below the floor).
-    * ``<reward_name><=<threshold>``  → ``reward[idx] ≤ threshold``
-      (sign −1; violation when reward exceeds the ceiling — useful for
-      bounding quality terms like ``cosine_sim<=0.9`` so the policy is
-      pushed to leave compute / memory headroom rather than maxing out
-      perfect agreement).
-
-    Rewards are higher-is-better (cost components are stored negated).
-    """
-    parsed: list[tuple[int, float, int]] = []
-    for s in specs:
-        if ">=" in s:
-            op = ">="
-            sign = 1
-        elif "<=" in s:
-            op = "<="
-            sign = -1
-        else:
-            raise ValueError(
-                f"--lagrangian-constraint must be of the form NAME>=THRESH "
-                f"or NAME<=THRESH, got {s!r}"
-            )
-        name, thresh_s = s.split(op, 1)
-        name = name.strip()
-        if name not in REWARD_INDEX:
-            raise ValueError(
-                f"Unknown reward name {name!r} in constraint {s!r}; "
-                f"valid names: {list(REWARD_INDEX.keys())}"
-            )
-        parsed.append((REWARD_INDEX[name], float(thresh_s.strip()), sign))
-    return parsed
 
 
 def _build_reward_weights(args) -> np.ndarray:
@@ -5099,10 +5021,6 @@ def main():
         global_step,
         key,
         freeze_mask,
-        multipliers,
-        constraint_indices,
-        constraint_thresholds,
-        constraint_signs,
         op_legality_override_arg,
         vertex_mult_arg,
         pin_rules_to_exact_arg,
@@ -5221,49 +5139,6 @@ def main():
                 )
             else:
                 norm_adv = jnp.sum(norm_adv_components * traj.preference, axis=-1)
-
-        # Stage F Lagrangian: per-step constraint violations and multiplier
-        # update. ``constraint_indices`` / ``constraint_thresholds`` /
-        # ``constraint_signs`` are static-shape arrays (length 0 means no
-        # constraints, in which case the gather is a no-op). For ``>=``
-        # constraints (sign = +1) the violation is ``max(0, threshold -
-        # reward)``; for ``<=`` constraints (sign = -1) it's
-        # ``max(0, reward - threshold)``. Both collapse to
-        # ``max(0, sign * (threshold - reward))``. The advantage is
-        # penalized by ``-λ_i · violation_i`` so the policy is pushed away
-        # from constraint-violating regions, and ``λ_i`` rises by dual
-        # ascent on the mean violation.
-        if constraint_indices.shape[0] > 0:
-            # Project picked rewards + thresholds through symlog for
-            # symlog'd channels, leave cosine_sim raw. This keeps the
-            # constraint penalty in the same units the policy gradient
-            # sees (symlog-space for flops / peak_memory / frob, raw for
-            # cosine), so the Lagrangian multiplier ``λ`` lives on a
-            # single scale instead of trying to bridge 10¹⁰× gaps.
-            is_no_symlog = jnp.take(_NO_SYMLOG_MASK, constraint_indices)  # (C,)
-            picked_raw = traj.reward[..., constraint_indices]  # (E, T, C)
-            picked = jnp.where(
-                is_no_symlog,
-                picked_raw,
-                reward_normalization_fn(picked_raw),
-            )
-            thresholds = jnp.where(
-                is_no_symlog,
-                constraint_thresholds,
-                reward_normalization_fn(constraint_thresholds),
-            )
-            signed = constraint_signs * (thresholds - picked)
-            violations = jnp.maximum(0.0, signed)  # (E, T, C)
-            penalty = jnp.sum(violations * multipliers, axis=-1)  # (E, T)
-            norm_adv = norm_adv - penalty
-            mean_violations = jnp.mean(violations, axis=(0, 1))  # (C,)
-            new_multipliers = jnp.maximum(
-                0.0,
-                multipliers + args.lagrangian_lr * mean_violations,
-            )
-        else:
-            mean_violations = multipliers  # zero-length sentinel
-            new_multipliers = multipliers
 
         # `old_*_dists` are the dynamic-mode equivalent of the legacy
         # old_{vertex,pair,factor}_dists fields — but TrainBatch only
@@ -5438,7 +5313,6 @@ def main():
             jnp.mean(traj.pair_dists, axis=(0, 1, 2)),
             jnp.mean(traj.factor_dists, axis=(0, 1, 2)),
             jnp.mean(traj.preference, axis=(0, 1)),
-            mean_violations,
             p_stop_slot0,
             op_marginals,
             mean_sub_episode_length,
@@ -5451,7 +5325,6 @@ def main():
             total_rewards_full,
             actions_pack,
             final_step,
-            new_multipliers,
             diag_pack,
         )
 
@@ -5527,7 +5400,7 @@ def main():
             wandb.log({f"Top N {name}": table})
 
     def host_log(
-        ep, all_rets, actions_pack, mean_r, mets, diag_pack=None, multipliers_arr=None
+        ep, all_rets, actions_pack, mean_r, mets, diag_pack=None
     ):
         ep = int(ep)
         all_rets = np.array(all_rets)  # (num_envs, NUM_REWARDS)
@@ -5654,7 +5527,6 @@ def main():
                 pair_marg,
                 factor_marg,
                 pref_mean,
-                mean_viol,
                 p_stop_slot0,
                 op_marginals,
                 mean_sub_episode_length,
@@ -5671,14 +5543,6 @@ def main():
             for j, op_name in enumerate(("diag", "compress", "end")):
                 log_dict[f"op_marginal/{op_name}"] = float(op_marginals[j])
             log_dict["sub_episode_length"] = float(mean_sub_episode_length)
-            if multipliers_arr is not None and np.size(multipliers_arr) > 0:
-                lam = np.asarray(multipliers_arr)
-                viol = np.asarray(mean_viol)
-                for j, (idx, t, sign) in enumerate(constraint_specs):
-                    op_str = ">=" if sign > 0 else "<="
-                    name = f"{REWARD_NAMES[idx]}{op_str}{t:g}"
-                    log_dict[f"lagrangian/{name}_lambda"] = float(lam[j])
-                    log_dict[f"lagrangian/{name}_violation"] = float(viol[j])
         wandb.log(log_dict)
 
         # Per-episode memory + JIT-cache diagnostic. Off by default; flip on
@@ -5796,53 +5660,6 @@ def main():
     # Stage D global step counter — increments by ppo_epochs * minibatches per
     # episode and feeds the per-head LR ramp from §3.2.
     global_step = jnp.array(0, dtype=jnp.int32)
-
-    # Stage F Lagrangian state. Constraint indices / thresholds / signs are
-    # static-shape arrays (length-C jax arrays). Multipliers are dynamic
-    # (length-C, ≥ 0, updated by dual ascent each episode). C == 0 → empty
-    # arrays, in which case the augmentation in train_episode is a no-op.
-    # ``--anti-degeneracy`` is desugared into the constraint list here;
-    # the legacy ``--cosine-lower-bound`` / ``--cosine-upper-bound`` flags
-    # are honoured (for back-compat with existing dispatch scripts) when
-    # ``--anti-degeneracy`` is left at its default "none".
-    from alphagrad.approx.common.anti_degeneracy import (
-        desugar_anti_degeneracy,
-    )
-    user_constraints, _, _ = desugar_anti_degeneracy(
-        list(args.lagrangian_constraint),
-        getattr(args, "anti_degeneracy", "none"),
-        float(getattr(args, "anti_degeneracy_delta", 0.01)),
-        float(getattr(args, "cosine_lower_bound", 0.8)),
-        float(getattr(args, "cosine_upper_bound", 0.9)),
-    )
-    if getattr(args, "anti_degeneracy", "none") == "none":
-        if args.cosine_lower_bound > 0.0:
-            user_constraints.append(f"cosine_sim>={args.cosine_lower_bound}")
-        if args.cosine_upper_bound < 1.0:
-            user_constraints.append(f"cosine_sim<={args.cosine_upper_bound}")
-    constraint_specs = parse_lagrangian_constraints(user_constraints)
-    if constraint_specs:
-        ops_for_print = {1: ">=", -1: "<="}
-        print(
-            f"Stage F Lagrangian: {len(constraint_specs)} constraints — "
-            + ", ".join(
-                f"{REWARD_NAMES[idx]}{ops_for_print[sign]}{t:g}"
-                for idx, t, sign in constraint_specs
-            )
-        )
-    constraint_indices = jnp.asarray(
-        [idx for idx, _, _ in constraint_specs],
-        dtype=jnp.int32,
-    )
-    constraint_thresholds = jnp.asarray(
-        [t for _, t, _ in constraint_specs],
-        dtype=jnp.float32,
-    )
-    constraint_signs = jnp.asarray(
-        [float(sign) for _, _, sign in constraint_specs],
-        dtype=jnp.float32,
-    )
-    multipliers = jnp.zeros(len(constraint_specs), dtype=jnp.float32)
 
     # ------------------------------------------------------------------
     # Pre-training reward-scale calibration.
@@ -6169,7 +5986,6 @@ def main():
             total_rewards_full,
             actions_pack,
             global_step,
-            multipliers,
             diag_pack,
         ) = train_episode(
             agent,
@@ -6181,10 +5997,6 @@ def main():
             global_step,
             ep_key,
             default_freeze_mask,
-            multipliers,
-            constraint_indices,
-            constraint_thresholds,
-            constraint_signs,
             stage_override,
             stage_vertex_mult,
             stage_pin_rules,
@@ -6197,7 +6009,6 @@ def main():
             jnp.mean(total_rewards_full, axis=0),
             metrics,
             diag_pack,
-            multipliers,
         )
         # Mid-training top-N snapshot. Skips the wandb table log so we
         # don't pollute the offline run with duplicate tables — only the

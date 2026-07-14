@@ -13,7 +13,7 @@ First cut of the Phase-3+5 PPO Ray version from the migration plan:
 
 * PPO update is a deliberately simple clip-loss + value-MSE + entropy.
   We do NOT replicate every feature of the single-process `ppo.py`
-  trainer here (no curriculum / Lagrangian / dynamic-substeps /
+  trainer here (no curriculum / dynamic-substeps /
   preference Dirichlet / replay buffer — those will land as follow-ups
   if the basic path proves out). The trainer scalarises the env's
   8-dim reward vector to a single scalar via a fixed weight vector
@@ -58,7 +58,7 @@ from alphagrad.approx.common import (
     init_linear_weights,
     vertex_avail_at_step,
 )
-from alphagrad.approx.common.gae import get_advantages, reward_normalization_fn
+from alphagrad.approx.common.gae import reward_normalization_fn
 from alphagrad.utils import symlog
 from alphagrad.approx.env import (
     AXIS_FEATURE_DIM,
@@ -86,9 +86,9 @@ from alphagrad.approx.heads import (
 from graphax.sparse.micro_actions import NUM_QUANT_DTYPES
 
 
-# Stage F: which reward channels skip symlog when used in the
-# Lagrangian comparison. Currently just cosine_sim — it's already
-# bounded to [0, 1], so symlog'ing it would only complicate the
+# Which reward channels skip symlog when compared against a threshold
+# (the --reward-condition gates). Currently just cosine_sim — it's
+# already bounded to [0, 1], so symlog'ing it would only complicate the
 # threshold semantics. Mirrored from ppo._NO_SYMLOG_REWARD_INDICES.
 _NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (REWARD_INDEX["cosine_sim"],)
 
@@ -169,36 +169,6 @@ from alphagrad.approx.common.reward_scaling import (
     NO_SYMLOG_MASK_NP as _NO_SYMLOG_MASK_FP,
 )
 
-
-def _parse_lagrangian_constraints(specs: list) -> list[tuple[int, float, int]]:
-    """Parse ``--lagrangian-constraint`` strings to (idx, threshold, sign).
-
-    * ``NAME>=THRESH`` → sign=+1, violation when reward < threshold
-    * ``NAME<=THRESH`` → sign=−1, violation when reward > threshold
-
-    Duplicates ``ppo.parse_lagrangian_constraints`` (kept local so this
-    file doesn't pull in the 6k-line single-process ppo module).
-    """
-    parsed: list[tuple[int, float, int]] = []
-    for s in specs or []:
-        if ">=" in s:
-            op, sign = ">=", 1
-        elif "<=" in s:
-            op, sign = "<=", -1
-        else:
-            raise ValueError(
-                f"--lagrangian-constraint must be NAME>=THRESH or NAME<=THRESH, "
-                f"got {s!r}"
-            )
-        name, thresh_s = s.split(op, 1)
-        name = name.strip()
-        if name not in REWARD_INDEX:
-            raise ValueError(
-                f"Unknown reward name {name!r} in {s!r}; "
-                f"valid names: {list(REWARD_INDEX.keys())}"
-            )
-        parsed.append((REWARD_INDEX[name], float(thresh_s.strip()), sign))
-    return parsed
 
 
 def _args_from_dict(args_dict: dict) -> SimpleNamespace:
@@ -695,7 +665,7 @@ class PPORayWorker:
         # lam_acc*cosine term, so O(1)-O(30) lambdas balance the objective and a
         # large-enough lam_acc makes the cossim term strictly dominate the cost
         # gain (degenerate can never be the argmax). buf_reward_vec_raw stays RAW
-        # for Lagrangian / per-channel telemetry. No effect in mult mode (the
+        # for per-channel telemetry. No effect in mult mode (the
         # gate already symlog's cost in ``cheapness``).
         self.additive_symlog_cost = (
             os.environ.get("ALPHAGRAD_ADDITIVE_SYMLOG_COST", "0").strip().lower()
@@ -922,17 +892,16 @@ class PPORayWorker:
                 f"(symlog'd cost channels clipped to +/-cap)."
             )
 
-        # Advantage-normalisation strategy. ``gdpo`` activates the
-        # per-channel z-score → priority-weighted sum → batch-norm
-        # pipeline from arXiv:2601.05242. ``scalar`` preserves the
-        # legacy scalarise-then-normalise behaviour for A/B comparison.
-        self.advantage_norm = str(getattr(self.args, "advantage_norm", "gdpo"))
+        # Advantage-normalisation strategy. ``scalar`` is the only mode
+        # this trainer supports — PopArt (below, unconditional) carries the
+        # per-channel normalisation and rejects ``gdpo``, which would
+        # double-normalise with its own per-minibatch z-score.
+        self.advantage_norm = str(getattr(self.args, "advantage_norm", "scalar"))
         if self.advantage_norm not in ("gdpo", "scalar"):
             raise ValueError(
                 f"--advantage-norm must be 'gdpo' or 'scalar', got "
                 f"{self.advantage_norm!r}",
             )
-        self._use_symlog_in_gae = self.advantage_norm == "scalar"
         # Channel masks used by ``gdpo_normalise_advantages``. The
         # channel mask is 1 only for reward channels with non-zero
         # weight (user opted in via --rewards / --lambda-*). The sparse
@@ -949,109 +918,93 @@ class PPORayWorker:
         self._sparse_mask_j = jnp.asarray(
             _SPARSE_TERMINAL_MASK_NP.astype(np.float32)
         )
-        # Cache the no-symlog GAE variant for the gdpo path. ``get_advantages``
-        # (imported at module scope) is the legacy symlog'd variant used by
-        # the scalar path. The two are jit'd independently — building both
-        # up-front keeps the rollout loop free of import / construction
-        # cost on every call.
+        # The no-symlog GAE variant — the only one used now that the
+        # critic learns PopArt-normalised values. Built up-front so the
+        # rollout loop is free of import / construction cost per call.
         from alphagrad.approx.common.gae import (
             make_get_advantages as _make_get_advantages,
         )
         self._gae_no_symlog = _make_get_advantages(use_symlog=False)
 
-        # PopArt value-target normalisation (--value-norm popart /
-        # ALPHAGRAD_POPART=1; van Hasselt 2016, multi-channel as in
-        # IMPALA). REPLACES the scalar path's rollout-wide advantage
-        # z-score — the suspected collapse driver: batch z-scoring
-        # AMPLIFIES noise as returns homogenise at convergence (divide
-        # by a shrinking batch std), washes an all-fail batch to ~0,
-        # and can sign-flip good samples around the batch mean. With
-        # PopArt the critic learns per-channel NORMALISED values
-        # v_hat = (v - mu_k)/sigma_k against quasi-static EMA stats of
-        # the GAE returns (beta ~1e-2/update, sigma FLOORED at 0.1 so
-        # it can never amplify); the value head's final linear layer is
-        # rescaled output-preservingly on every stats step (the "Art");
-        # advantages are formed per-channel in normalised space
+        # PopArt value-target normalisation (van Hasselt 2016,
+        # multi-channel as in IMPALA). ALWAYS ON — it REPLACES the former
+        # rollout-wide advantage z-score, the suspected collapse driver:
+        # batch z-scoring AMPLIFIES noise as returns homogenise at
+        # convergence (divide by a shrinking batch std), washes an
+        # all-fail batch to ~0, and can sign-flip good samples around the
+        # batch mean. The critic learns per-channel NORMALISED values
+        # v_hat = (v - mu_k)/sigma_k against quasi-static EMA stats of the
+        # GAE returns (beta ~1e-2/update, sigma FLOORED so it can never
+        # amplify); the value head's final linear layer is rescaled
+        # output-preservingly on every stats step (the "Art"); advantages
+        # are formed per-channel in normalised space
         # (A_k/sigma_k == (G_k - mu_k)/sigma_k - v_hat_k) and collapsed
-        # via reward_weights — O(1) WITHOUT batch coupling. Default
-        # 'baseline' keeps every existing path byte-identical.
-        _vn = str(getattr(self.args, "value_norm", "baseline"))
-        if os.environ.get("ALPHAGRAD_POPART", "0") == "1":
-            _vn = "popart"
-        if _vn not in ("baseline", "popart"):
+        # via reward_weights — O(1) WITHOUT batch coupling.
+        if self.advantage_norm != "scalar":
             raise ValueError(
-                f"--value-norm must be 'baseline' or 'popart', got {_vn!r}",
+                "PopArt value normalisation (always on) requires "
+                "--advantage-norm scalar (the gdpo path carries its own "
+                "per-minibatch normalisation).",
             )
-        self.use_popart = _vn == "popart"
-        self.popart = None
-        if self.use_popart:
-            if self.advantage_norm != "scalar":
-                raise ValueError(
-                    "--value-norm popart requires --advantage-norm scalar "
-                    "(the gdpo path carries its own per-minibatch "
-                    "normalisation).",
-                )
-            # The critic now predicts PopArt-normalised values — the
-            # legacy symlog encoding inside GAE no longer applies; raw
-            # values are recovered affinely (v = sigma*v_hat + mu)
-            # before the GAE deltas.
-            self._use_symlog_in_gae = False
-            from alphagrad.approx.common.popart import PopArtStats
-            # Fix 4: per-channel sigma floor. The global default 0.1
-            # over-amplified the near-homogeneous bkstep channel (idx 9,
-            # returns ~0.64 everywhere at convergence -> var->0 -> floored
-            # sigma -> A/sigma inflated). Floor bkstep(9) + cosine(6)
-            # higher (ALPHAGRAD_POPART_SIGMA_MIN_QUALITY, default 0.2);
-            # everything else keeps the base floor
-            # (ALPHAGRAD_POPART_SIGMA_MIN, default 0.1). Both env-tunable
-            # so the change is fully revertible (set the quality floor
-            # equal to the base to restore the old scalar behaviour).
-            _sig_min_base = float(
-                os.environ.get("ALPHAGRAD_POPART_SIGMA_MIN", "0.1")
-            )
-            _sig_min_qual = float(
-                os.environ.get("ALPHAGRAD_POPART_SIGMA_MIN_QUALITY", "0.2")
-            )
-            _sig_min_vec = np.full(NUM_REWARDS, _sig_min_base, dtype=np.float64)
-            for _qi in (6, 9):  # cosine_sim, bkstep_acc
-                _sig_min_vec[_qi] = max(_sig_min_base, _sig_min_qual)
-            # sigma_max must admit the RAW cost scale (bridge-cse): now that
-            # cost channels enter PopArt raw (no symlog), peak_memory returns
-            # span ~1e9 with a true std >> the legacy 1e6 cap. A too-small
-            # sigma_max CLAMPS sigma below the true scale and UNDER-normalises
-            # the cost channel -> O(100) advantage (observed ep1-4). Raise the
-            # cap to 1e12 so raw-cost sigma can reach its true magnitude.
-            _sig_max = float(os.environ.get("ALPHAGRAD_POPART_SIGMA_MAX", "1e12"))
-            # ROBUST STD (bridge-cse, USER-DIRECTED). Raw cost -> a single 100x
-            # outlier would spike the per-channel sigma EMA and crush the other
-            # channels' relative signal. WINSORIZE each channel's value targets
-            # to mu +/- k*sigma (current running stats) BEFORE the EMA update so
-            # an outlier cannot inflate sigma; output-preserving (only the
-            # stats-tracking sees the winsorized batch, the returned old/new
-            # mu,sigma still drive the head rescale). Flag ALPHAGRAD_POPART_
-            # ROBUST_STD (default 1); k via ALPHAGRAD_POPART_WINSOR_K (default
-            # 5.0). See PopArtStats.update.
-            _robust = os.environ.get("ALPHAGRAD_POPART_ROBUST_STD", "1") == "1"
-            _winsor_k = float(
-                os.environ.get("ALPHAGRAD_POPART_WINSOR_K", "5.0")
-            )
-            self.popart = PopArtStats(
-                NUM_REWARDS,
-                beta=float(os.environ.get("ALPHAGRAD_POPART_BETA", "0.01")),
-                sigma_min=_sig_min_vec,
-                sigma_max=_sig_max,
-                robust_std=_robust,
-                winsor_k=_winsor_k,
-            )
-            print(
-                f"[ppo_ray] PopArt value norm ON: beta={self.popart.beta} "
-                f"sigma_min(base={_sig_min_base}, quality[6,9]="
-                f"{_sig_min_qual}) sigma_max={_sig_max:g} "
-                f"robust_std={_robust} (winsor k={_winsor_k}) — replaces the "
-                f"rollout advantage z-score; under pure-PopArt advantage a "
-                f"failed row is truly-neutral (A==0), no constant stamp.",
-                flush=True,
-            )
+        # The critic predicts PopArt-NORMALISED values, so the legacy
+        # symlog encoding inside GAE never applies; raw values are
+        # recovered affinely (v = sigma*v_hat + mu) before the GAE deltas.
+        from alphagrad.approx.common.popart import PopArtStats
+        # Fix 4: per-channel sigma floor. The global default 0.1
+        # over-amplified the near-homogeneous bkstep channel (idx 9,
+        # returns ~0.64 everywhere at convergence -> var->0 -> floored
+        # sigma -> A/sigma inflated). Floor bkstep(9) + cosine(6)
+        # higher (ALPHAGRAD_POPART_SIGMA_MIN_QUALITY, default 0.2);
+        # everything else keeps the base floor
+        # (ALPHAGRAD_POPART_SIGMA_MIN, default 0.1). Both env-tunable
+        # so the change is fully revertible (set the quality floor
+        # equal to the base to restore the old scalar behaviour).
+        _sig_min_base = float(
+            os.environ.get("ALPHAGRAD_POPART_SIGMA_MIN", "0.1")
+        )
+        _sig_min_qual = float(
+            os.environ.get("ALPHAGRAD_POPART_SIGMA_MIN_QUALITY", "0.2")
+        )
+        _sig_min_vec = np.full(NUM_REWARDS, _sig_min_base, dtype=np.float64)
+        for _qi in (6, 9):  # cosine_sim, bkstep_acc
+            _sig_min_vec[_qi] = max(_sig_min_base, _sig_min_qual)
+        # sigma_max must admit the RAW cost scale (bridge-cse): now that
+        # cost channels enter PopArt raw (no symlog), peak_memory returns
+        # span ~1e9 with a true std >> the legacy 1e6 cap. A too-small
+        # sigma_max CLAMPS sigma below the true scale and UNDER-normalises
+        # the cost channel -> O(100) advantage (observed ep1-4). Raise the
+        # cap to 1e12 so raw-cost sigma can reach its true magnitude.
+        _sig_max = float(os.environ.get("ALPHAGRAD_POPART_SIGMA_MAX", "1e12"))
+        # ROBUST STD (bridge-cse, USER-DIRECTED). Raw cost -> a single 100x
+        # outlier would spike the per-channel sigma EMA and crush the other
+        # channels' relative signal. WINSORIZE each channel's value targets
+        # to mu +/- k*sigma (current running stats) BEFORE the EMA update so
+        # an outlier cannot inflate sigma; output-preserving (only the
+        # stats-tracking sees the winsorized batch, the returned old/new
+        # mu,sigma still drive the head rescale). Flag ALPHAGRAD_POPART_
+        # ROBUST_STD (default 1); k via ALPHAGRAD_POPART_WINSOR_K (default
+        # 5.0). See PopArtStats.update.
+        _robust = os.environ.get("ALPHAGRAD_POPART_ROBUST_STD", "1") == "1"
+        _winsor_k = float(
+            os.environ.get("ALPHAGRAD_POPART_WINSOR_K", "5.0")
+        )
+        self.popart = PopArtStats(
+            NUM_REWARDS,
+            beta=float(os.environ.get("ALPHAGRAD_POPART_BETA", "0.01")),
+            sigma_min=_sig_min_vec,
+            sigma_max=_sig_max,
+            robust_std=_robust,
+            winsor_k=_winsor_k,
+        )
+        print(
+            f"[ppo_ray] PopArt value norm ON: beta={self.popart.beta} "
+            f"sigma_min(base={_sig_min_base}, quality[6,9]="
+            f"{_sig_min_qual}) sigma_max={_sig_max:g} "
+            f"robust_std={_robust} (winsor k={_winsor_k}) — replaces the "
+            f"rollout advantage z-score; under pure-PopArt advantage a "
+            f"failed row is truly-neutral (A==0), no constant stamp.",
+            flush=True,
+        )
 
         # ------------------------------------------------------------------
         # DYNAMIC SENTINEL (bridge-cse). Replace the catastrophic -1e10
@@ -1208,69 +1161,6 @@ class PPORayWorker:
         )
         self._sparse_terminal_idx_set = set(_SPARSE_TI)
 
-        # Stage F Lagrangian state. Stored as numpy because the multipliers
-        # update with simple dual-ascent steps after each episode — no
-        # need to keep them on the device. Empty config = no constraints
-        # (the violation path becomes a no-op).
-        constraint_specs = _parse_lagrangian_constraints(
-            getattr(self.args, "lagrangian_constraint", []) or []
-        )
-        if constraint_specs:
-            self.constraint_indices_np = np.array(
-                [c[0] for c in constraint_specs], dtype=np.int32,
-            )
-            self.constraint_thresholds_np = np.array(
-                [c[1] for c in constraint_specs], dtype=np.float32,
-            )
-            self.constraint_signs_np = np.array(
-                [c[2] for c in constraint_specs], dtype=np.float32,
-            )
-            self.constraint_names = [
-                REWARD_NAMES[c[0]] + (">=" if c[2] > 0 else "<=") + str(c[1])
-                for c in constraint_specs
-            ]
-            # No-symlog mask gathered per-constraint, so we can skip the
-            # symlog transform on the cosine-sim channel (and anything
-            # else flagged in _NO_SYMLOG_REWARD_INDICES).
-            self.constraint_no_symlog_np = np.array(
-                [c[0] in _NO_SYMLOG_REWARD_INDICES for c in constraint_specs],
-                dtype=np.bool_,
-            )
-            # Sparse-terminal mask: channels whose value is meaningful
-            # only at the terminal elimination step. Used below to
-            # zero out violations on non-terminal steps for those
-            # channels (otherwise ``threshold - 0`` looks like a full
-            # violation on every intermediate step and floods the
-            # Lagrangian penalty term).
-            from alphagrad.approx.common.reward_scaling import (
-                SPARSE_TERMINAL_INDICES as _SPARSE_TERMINAL_INDICES,
-            )
-            self.constraint_is_sparse_np = np.array(
-                [c[0] in _SPARSE_TERMINAL_INDICES for c in constraint_specs],
-                dtype=np.bool_,
-            )
-        else:
-            self.constraint_indices_np = np.zeros((0,), dtype=np.int32)
-            self.constraint_thresholds_np = np.zeros((0,), dtype=np.float32)
-            self.constraint_signs_np = np.zeros((0,), dtype=np.float32)
-            self.constraint_names = []
-            self.constraint_no_symlog_np = np.zeros((0,), dtype=np.bool_)
-            self.constraint_is_sparse_np = np.zeros((0,), dtype=np.bool_)
-        self.multipliers_np = np.zeros(
-            (self.constraint_indices_np.shape[0],), dtype=np.float32,
-        )
-        self.lagrangian_lr = float(getattr(self.args, "lagrangian_lr", 1e-3))
-        # Phase 5: bound multiplier growth and warm up before applying.
-        # See the unification plan for why this is necessary — the prior
-        # behaviour drove cosine_sim>=0.5 multipliers into the tens
-        # within 100 episodes, killing exploration via overwhelming
-        # penalty.
-        self.lagrangian_multiplier_max = float(
-            getattr(self.args, "lagrangian_multiplier_max", 1.0)
-        )
-        self.lagrangian_warmup_eps = int(
-            getattr(self.args, "lagrangian_warmup_eps", 0)
-        )
 
         # Agent + optimizer.
         policy_dims = self._parse_int_list(self.args.policy_dims)
@@ -1508,8 +1398,6 @@ class PPORayWorker:
                     if restored["reward_weights"] is not None:
                         self.reward_weights_np = restored["reward_weights"].astype(np.float32)
                         self.reward_weights = jnp.asarray(self.reward_weights_np, dtype=jnp.float32)
-                    if restored["multipliers"] is not None and self.constraint_indices_np.shape[0] > 0:
-                        self.multipliers_np = restored["multipliers"].astype(np.float32)
                     print(
                         f"[ppo_ray_worker] resumed from {self._checkpoint_path} "
                         f"at episode {self._episode_counter}"
@@ -1834,7 +1722,6 @@ class PPORayWorker:
         clip_eps = self.ppo_eps
         value_coef = self.value_coef
         is_gdpo = self.advantage_norm == "gdpo"
-        is_popart = self.use_popart
         channel_mask_j = self._channel_mask_j        # (NUM_REWARDS,)
         sparse_mask_j = self._sparse_mask_j          # (NUM_REWARDS,)
         priority_weights_j = self.reward_weights     # (NUM_REWARDS,)
@@ -1943,18 +1830,15 @@ class PPORayWorker:
                     value_loss = jnp.sum(
                         per_channel_se / (normaliser ** 2) * channel_mask_j
                     ) / active_count
-                elif is_popart:
-                    # PopArt: ``ret`` is the (K,) PER-CHANNEL NORMALISED
-                    # target (G_k - mu_k)/sigma_k staged upstream; ``value``
-                    # is the critic's normalised prediction v_hat. Plain
-                    # MSE over the active channels.
+                else:
+                    # PopArt (always on): ``ret`` is the (K,) PER-CHANNEL
+                    # NORMALISED target (G_k - mu_k)/sigma_k staged upstream;
+                    # ``value`` is the critic's normalised prediction v_hat.
+                    # Plain MSE over the active channels.
                     per_channel_se = (value - ret) ** 2           # (K,)
                     value_loss = jnp.sum(
                         per_channel_se * channel_mask_j
                     ) / active_count
-                else:
-                    value_scalar = jnp.sum(value * priority_weights_j)
-                    value_loss = (value_scalar - symlog(ret)) ** 2
                 # AUX cost loss for THIS sample: Huber(cost_pred, symlog(target))
                 # over the 4 target channels, gated by cost_valid (terminal &
                 # non-failed). symlog matches the Phase-1 probe target space.
@@ -2133,10 +2017,9 @@ class PPORayWorker:
         # collection, the gdpo-mode path keeps the K-vector through
         # GAE and the advantage stack.
         buf_values = np.zeros((T, N, NUM_REWARDS), dtype=np.float32)
-        # Raw 8-vec reward per step — Lagrangian violations and per-channel
-        # diagnostics read from this buffer. The scalar reward (legacy
-        # scalar-mode path) is derived from this buffer + ``reward_weights``
-        # after the rollout loop terminates.
+        # Raw 8-vec reward per step — the per-channel diagnostics read from
+        # this buffer. The scalar reward is derived from this buffer +
+        # ``reward_weights`` after the rollout loop terminates.
         buf_reward_vec = np.zeros((T, N, NUM_REWARDS), dtype=np.float32)
         buf_dones = np.zeros((T, N), dtype=np.float32)
         # Phase 3 (b): per-step sentinel mask. True when the CPU pool
@@ -2459,12 +2342,10 @@ class PPORayWorker:
                 # AFTER the cost-symlog pass (below) since ``popart.mu`` lives
                 # in POST-transform return space; we STASH the target here and
                 # apply it there. Flag ALPHAGRAD_SENTINEL_NEUTRAL_MU (default 1).
-                #   * PopArt ON  -> popart.mu (per-channel return mean the
-                #     critic is normalised against; pre-update = rollout frame).
-                #   * PopArt OFF -> the raw mu-K*sigma substitute is kept, but
-                #     the scalar is shifted onto the slow real-scalar EMA on the
-                #     top quality channel so mean_return stays neutral.
-                if self._sentinel_neutral_mu and self.use_popart:
+                # The target is ``popart.mu`` — the per-channel return mean
+                # the critic is normalised against (pre-update = the rollout
+                # frame), so a failed row's per-channel advantage is exactly 0.
+                if self._sentinel_neutral_mu:
                     _neutral_post_vec = self.popart.mu.astype(np.float32).copy()
                     _dyn_scalar = float(
                         np.dot(
@@ -2472,45 +2353,8 @@ class PPORayWorker:
                             self.reward_weights_np.astype(np.float64),
                         )
                     )
-                elif (
-                    self._sentinel_neutral_mu
-                    and self._sent_ema_scalar_n > 0
-                ):
-                    # PopArt OFF: shift the raw-mu substitute so its
-                    # post-transform weighted scalar equals the slow real
-                    # scalar EMA. The shift lands on the highest-|weight|
-                    # NON-SYMLOG quality channel (linear, so a delta d moves
-                    # the scalar by exactly w_p*d). This neutralises
-                    # mean_return + the scalar-normalised advantage in the
-                    # non-PopArt z-score path.
-                    _w = self.reward_weights_np.astype(np.float64)
-                    _qcand = _w.copy()
-                    _qcand[~_NO_SYMLOG_MASK_FP] = 0.0
-                    if np.any(_qcand != 0.0):
-                        _pidx = int(np.argmax(np.abs(_qcand)))
-                    else:
-                        _pidx = int(np.argmax(np.abs(_w)))
-                    _pw = float(_w[_pidx])
-                    if _pw != 0.0:
-                        _delta = (self._sent_ema_scalar - _dyn_scalar) / _pw
-                        _dyn_vec2 = _dyn_vec.astype(np.float32).copy()
-                        _dyn_vec2[_pidx] = np.float32(
-                            float(_dyn_vec2[_pidx]) + _delta
-                        )
-                        buf_reward_vec = np.where(
-                            buf_failed[..., None],
-                            _dyn_vec2[None, None, :],
-                            buf_reward_vec,
-                        ).astype(np.float32)
-                        _dyn_scalar = float(
-                            np.dot(
-                                _scalarise_dyn(_dyn_vec2),
-                                self.reward_weights_np,
-                            )
-                        )
             elif (
                 self._sentinel_neutral_mu
-                and self.use_popart
                 and self._neutral_unwarmed
             ):
                 # KILL THE -2 FLOOR ON THE FIRST / UN-WARMED ROLLOUT (bridge-cse).
@@ -2759,31 +2603,24 @@ class PPORayWorker:
                 failed_mask=buf_failed,
             )
 
-        # GAE over the rollout. Both modes use the same per-channel
-        # tensor contract — the difference is whether symlog squashing
-        # is applied inside GAE (scalar mode keeps it; gdpo mode drops
-        # it because the per-mb z-score handles magnitude). The
-        # factory caches the jit'd variant per mode.
+        # GAE over the rollout. The critic learns PopArt-normalised
+        # values, so symlog squashing inside GAE never applies — PopArt's
+        # per-channel (mu, sigma) handles magnitude.
         _popart_log: dict = {}
-        if self._use_symlog_in_gae:
-            _gae = get_advantages  # legacy with symlog
-        else:
-            _gae = self._gae_no_symlog
+        _gae = self._gae_no_symlog
         # rewards_b shape: (N, T, K). dones / discounts broadcast over K.
         rewards_b = jnp.asarray(np.transpose(buf_reward_vec, (1, 0, 2)))
         dones_b = jnp.asarray(buf_dones.T)             # (N, T)
         values_b = jnp.asarray(np.transpose(buf_values, (1, 0, 2)))  # (N, T, K)
-        if self.use_popart:
-            # The critic emits PopArt-NORMALISED values v_hat; GAE needs
-            # raw values. De-normalise affinely with the CURRENT
-            # (pre-update) stats — the frame the rollout head was
-            # trained in.
-            _pa_mu = jnp.asarray(self.popart.mu, dtype=jnp.float32)
-            _pa_sig = jnp.asarray(self.popart.sigma, dtype=jnp.float32)
-            values_b = _pa_mu + _pa_sig * values_b
-            bootstrap = (
-                self.popart.mu + self.popart.sigma * np.asarray(bootstrap)
-            ).astype(np.float32)
+        # The critic emits PopArt-NORMALISED values v_hat; GAE needs raw
+        # values. De-normalise affinely with the CURRENT (pre-update)
+        # stats — the frame the rollout head was trained in.
+        _pa_mu = jnp.asarray(self.popart.mu, dtype=jnp.float32)
+        _pa_sig = jnp.asarray(self.popart.sigma, dtype=jnp.float32)
+        values_b = _pa_mu + _pa_sig * values_b
+        bootstrap = (
+            self.popart.mu + self.popart.sigma * np.asarray(bootstrap)
+        ).astype(np.float32)
         next_values_b = jnp.concatenate(
             [values_b[:, 1:, :], jnp.asarray(bootstrap)[:, None, :]], axis=1,
         )  # (N, T, K)
@@ -2797,7 +2634,7 @@ class PPORayWorker:
         # to scalar via the priority-weighted dot product so the
         # downstream legacy path (global z-score, scalar value loss)
         # receives (N, T) tensors.
-        if self.advantage_norm == "scalar" and self.use_popart:
+        if self.advantage_norm == "scalar":
             # ---- PopArt (van Hasselt 2016; multi-channel as in IMPALA).
             # DESIGN CHOICE: per-channel PopArt on the K return channels,
             # collapsed to the scalar advantage via reward_weights — NOT
@@ -2905,117 +2742,10 @@ class PPORayWorker:
                 f"(update will nan-skip these minibatches)."
             )
 
-        # Stage F Lagrangian: penalise the advantage by the per-step
-        # constraint violation, weighted by the current multipliers.
-        # The violation is `max(0, sign * (threshold - reward))` —
-        # zero when the constraint is satisfied. After applying the
-        # penalty we update each multiplier by gradient ascent on the
-        # mean violation (clamped >= 0). Empty-constraint case is a
-        # no-op (the gather has zero columns).
-        violation_stats: dict = {}
-        if self.constraint_indices_np.shape[0] > 0:
-            # Pull the constrained channels across the rollout buffer.
-            # (T, N, C) where C = #constraints. Reshape to match the (N, T)
-            # advantages layout used by GAE.
-            # Use the RAW per-channel buffer: the Lagrangian thresholds
-            # are expressed in measured-channel units (e.g. cosine_sim>=0.5,
-            # peak_memory<=1e8), so they must see the raw channels, not the
-            # mult-gate's collapsed cosine scalar. (`_raw` == canonical in
-            # additive mode.)
-            picked = buf_reward_vec_raw[:, :, self.constraint_indices_np]  # (T, N, C)
-            picked = np.transpose(picked, (1, 0, 2))  # (N, T, C)
-            # Symlog cost-family channels so the multipliers don't have to
-            # bridge ~10⁹× channel-scale gaps; leave cosine_sim raw.
-            no_symlog = self.constraint_no_symlog_np[None, None, :]  # (1,1,C)
-            picked_sl = np.where(
-                no_symlog, picked, np.sign(picked) * np.log1p(np.abs(picked)),
-            )
-            thresh_sl = np.where(
-                self.constraint_no_symlog_np,
-                self.constraint_thresholds_np,
-                np.sign(self.constraint_thresholds_np)
-                * np.log1p(np.abs(self.constraint_thresholds_np)),
-            )  # (C,)
-            # Per-constraint normalisation so the same `lagrangian_lr`
-            # works for both `cosine_sim>=0.5` (small magnitudes) and
-            # `peak_memory<=1e8` (symlog'd to ~18). Without this the
-            # cosine_sim multiplier accumulated ~50× faster than other
-            # channels and dominated the objective by ep ~100.
-            thresh_scale = np.maximum(np.abs(thresh_sl), 1e-3)  # (C,)
-            signed = (
-                self.constraint_signs_np
-                * (thresh_sl[None, None, :] - picked_sl)
-                / thresh_scale[None, None, :]
-            )
-            violations = np.maximum(0.0, signed)  # (N, T, C)
-            # Sparse-terminal mask: for constraints on sparse channels
-            # (cosine_sim, frob_residual), only the terminal step
-            # carries a real value — graphax's ``jacve`` returns a
-            # zero-norm Jacobian for any partial elimination order, so
-            # ``reward[cos_idx] = 0`` at intermediate steps. Without
-            # this mask the Lagrangian sees a ``threshold - 0`` full
-            # violation on every non-terminal step (T-1 spurious
-            # violations per env per episode), accumulating spurious
-            # penalty and floor-flooding the dual multipliers.
-            if self.constraint_is_sparse_np.any():
-                # Last step (t = T-1) is the terminal vertex elimination.
-                # ``violations`` shape: (N, T, C).
-                is_terminal_step = np.zeros((N, T), dtype=np.float32)
-                is_terminal_step[:, -1] = 1.0
-                sparse_step_mask = np.where(
-                    self.constraint_is_sparse_np[None, None, :],  # (1,1,C)
-                    is_terminal_step[:, :, None],                  # (N,T,1)
-                    1.0,                                           # dense: keep
-                )
-                violations = violations * sparse_step_mask
-            # Phase 5: gate penalty + multiplier update on warm-up.
-            # During the first --lagrangian-warmup-eps episodes we still
-            # compute violations (for logging) but don't shape the
-            # advantage and don't ascend the multipliers — gives the
-            # policy a chance to learn the scalar reward before the
-            # constraint mechanic kicks in.
-            in_warmup = self._episode_counter < self.lagrangian_warmup_eps
-            if not in_warmup:
-                penalty = np.sum(
-                    violations * self.multipliers_np[None, None, :], axis=-1,
-                )  # (N, T)
-                # Broadcast the scalar penalty over the channel axis in
-                # gdpo mode so the per-channel z-score sees the same
-                # violation pressure on every active channel. In scalar
-                # mode advantages_b is already (N, T) and the broadcast
-                # is a no-op.
-                penalty_j = jnp.asarray(penalty)
-                if advantages_b.ndim == 3:
-                    penalty_j = penalty_j[..., None]
-                advantages_b = advantages_b - penalty_j
-                mean_violations = violations.mean(axis=(0, 1))  # (C,)
-                # Dual ascent with multiplier cap. Without the cap a
-                # structurally hard constraint sees the multiplier grow
-                # unbounded and overwhelm the rest of the objective.
-                self.multipliers_np = np.clip(
-                    self.multipliers_np
-                    + self.lagrangian_lr * mean_violations,
-                    0.0,
-                    self.lagrangian_multiplier_max,
-                )
-            else:
-                mean_violations = violations.mean(axis=(0, 1))
-            for j, name in enumerate(self.constraint_names):
-                violation_stats[f"lagrangian/{name}_lambda"] = float(
-                    self.multipliers_np[j]
-                )
-                violation_stats[f"lagrangian/{name}_violation"] = float(
-                    mean_violations[j]
-                )
-            violation_stats["lagrangian/warmup_active"] = int(in_warmup)
-
-        # Normalise advantages — scalar mode keeps the legacy
-        # rollout-wide z-score (mean 0, std 1, +1e-8 floor) applied AFTER
-        # the Lagrangian penalty. gdpo mode skips the global z-score
-        # entirely — per-channel z-scoring runs per-minibatch in the
-        # update step (see gdpo_normalise_advantages) so the global pass
-        # would double-normalise and wash out cross-minibatch signal.
-        if self.advantage_norm == "scalar" and self.use_popart:
+        # Advantage normalisation. Under PopArt the per-channel
+        # (G_k - mu_k)/sigma_k IS the normalisation, so no rollout-wide
+        # z-score is layered on top (see below).
+        if self.advantage_norm == "scalar":
             # PURE-POPART ADVANTAGE (bridge-cse, USER-DIRECTED). The advantage
             # entering the update is EXACTLY the per-channel PopArt-normalised
             # residual collapsed by the priority weights,
@@ -3191,16 +2921,13 @@ class PPORayWorker:
             parts["advantages"] = (
                 advantages_b.reshape(N * T, NUM_REWARDS), (NUM_REWARDS,),
             )
-        elif self.use_popart:
-            # PopArt: PER-CHANNEL normalised value targets (B, K) for the
-            # per-channel critic MSE; the advantage is already the scalar
-            # weighted sum of normalised channels.
+        else:
+            # PopArt (always on): PER-CHANNEL normalised value targets (B, K)
+            # for the per-channel critic MSE; the advantage is already the
+            # scalar weighted sum of normalised channels.
             parts["returns"] = (
                 returns_b.reshape(N * T, NUM_REWARDS), (NUM_REWARDS,),
             )
-            parts["advantages"] = (advantages_b.reshape(N * T), ())
-        else:
-            parts["returns"] = (returns_b.reshape(N * T), ())
             parts["advantages"] = (advantages_b.reshape(N * T), ())
 
         # Single epoch × `minibatches` mini-batches. We rotate the batch
@@ -3606,7 +3333,6 @@ class PPORayWorker:
         })
         # PopArt telemetry (per-channel mu/sigma, explained_variance —
         # the critic-health metric — and the advantage-scale probes).
-        # Empty dict when --value-norm baseline.
         last_aux.update(_popart_log)
         # Per-channel raw-reward means — same key namespace MuZero
         # uses. Already part of `per_reward_means` in `ch_stats` but
@@ -3648,7 +3374,6 @@ class PPORayWorker:
         # ``(a_i, b_i, c_i, r_i)`` AND the sequence that produced it.
         last_aux["best_seq"] = ch_stats.get("best_overall_seq", [])
         last_aux["best_overall_env"] = ch_stats.get("best_overall_env", -1)
-        last_aux.update(violation_stats)
         last_aux.update(reward_condition_stats)
 
         # Phase 3 follow-up: periodic CPU-pool recycle (matches the
@@ -4347,10 +4072,6 @@ class PPORayWorker:
                 opt_state=self.opt_state,
                 episode_counter=self._episode_counter,
                 reward_weights=self.reward_weights_np,
-                multipliers=getattr(self, "multipliers_np", None),
-                extras={
-                    "lagrangian_warmup_eps": int(getattr(self, "lagrangian_warmup_eps", 0)),
-                },
             )
         except Exception as exc:
             print(f"[ppo_ray_worker] checkpoint save failed: {exc}")

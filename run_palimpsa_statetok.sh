@@ -94,8 +94,7 @@ launch_one() {
       --cpu-worker-recycle-every 0 \
       --latency-timer perf_counter --latency-inner-reps 5 --latency-warmup 2 --latency-winsor 0.2 \
       --ray-address $HEAD_IP:$RAY_PORT \
-      --advantage-norm scalar --ppo-epochs 4 --anti-degeneracy none \
-      --cosine-lower-bound 0.0 --cosine-upper-bound 1.0 \
+      --advantage-norm scalar --ppo-epochs 4 \
       --episodes $EPISODES --num-envs $NUM_ENVS --minibatches $MBS \
       --num-data-points 5 --reps-per-point 2 \
       --best-sequences-json $OUT/best.json --best-sequences-every 5 \

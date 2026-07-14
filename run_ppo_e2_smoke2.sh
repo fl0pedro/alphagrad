@@ -238,10 +238,9 @@ eval "$ULIM"
 
 NODE0=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n 1p)
 HEAD_IP=$(srun --nodes=1 --nodelist=$NODE0 hostname -i | awk '{print $1}')
-# PopArt value normalisation (--value-norm popart): flag-gated, default
-# baseline = byte-identical legacy path (symlog value loss + rollout
-# advantage z-score). Set VALUE_NORM=popart (or ALPHAGRAD_POPART=1).
-VALUE_NORM="${VALUE_NORM:-baseline}"
+# PopArt value normalisation is ALWAYS ON (per-channel EMA normalisation
+# of the value targets). Knobs: ALPHAGRAD_POPART_BETA,
+# ALPHAGRAD_POPART_SIGMA_MIN.
 MAX_SUBSTEPS="${MAX_SUBSTEPS:-16}"
 # RETIRED (bridge-cse): the scale-only advantage bound + hard clip
 # (ALPHAGRAD_ADV_STD_FLOOR / ALPHAGRAD_ADV_CLIP) were the double-normalisation
@@ -265,9 +264,9 @@ export ALPHAGRAD_KL_PER_COMPONENT="${ALPHAGRAD_KL_PER_COMPONENT:-1}"
 export ALPHAGRAD_POPART_ROBUST_STD="${ALPHAGRAD_POPART_ROBUST_STD:-1}"
 export ALPHAGRAD_POPART_WINSOR_K="${ALPHAGRAD_POPART_WINSOR_K:-5.0}"
 export ALPHAGRAD_POPART_SIGMA_MAX="${ALPHAGRAD_POPART_SIGMA_MAX:-1e12}"
-NAME="ppo_e2_smoke2${VARIANT:+_$VARIANT}$([ "$VALUE_NORM" = popart ] && echo _popart)_s${SEED}_ss${MAX_SUBSTEPS}"
+NAME="ppo_e2_smoke2${VARIANT:+_$VARIANT}_s${SEED}_ss${MAX_SUBSTEPS}"
 
-echo "########## FULL_NN256_V2 $(date) | head=$NODE0 eps=$EPISODES NN_HIDDEN=256 variant=${VARIANT:-full} value_norm=$VALUE_NORM measure-grad ##########"
+echo "########## FULL_NN256_V2 $(date) | head=$NODE0 eps=$EPISODES NN_HIDDEN=256 variant=${VARIANT:-full} measure-grad ##########"
 
 ( cd ~/dsnn && uv run --no-sync ray start --head --node-ip-address=$HEAD_IP \
     --port=$RAY_PORT --num-gpus=4 --num-cpus=64 --block ) &
@@ -292,8 +291,7 @@ uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \
   --cpu-worker-recycle-every ${CPU_WORKER_RECYCLE_EVERY:-6} \
   --ray-address $HEAD_IP:$RAY_PORT \
-  --advantage-norm scalar --value-norm $VALUE_NORM --ppo-epochs 4 \
-  --cosine-lower-bound 0.0 --cosine-upper-bound 1.0 \
+  --advantage-norm scalar --ppo-epochs 4 \
   --episodes $EPISODES --num-envs $NUM_ENVS --minibatches $MBS \
   --num-data-points 5 --reps-per-point 2 \
   --best-sequences-json $OUT/best.json --best-sequences-every 5 \

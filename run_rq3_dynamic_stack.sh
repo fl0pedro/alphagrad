@@ -50,9 +50,6 @@ COMMON_ARGS=(
     --lambda-mem 1.0
     --lambda-frob 1.0
     # No anti-degeneracy — see RQ2 sbatch for rationale.
-    --anti-degeneracy none
-    --cosine-lower-bound 0.0
-    --cosine-upper-bound 1.0
     --episodes "$EPISODES"
     --num-envs "$NUM_ENVS"
     # CPU pool 1:1 with envs (see run_rq1_ve_only.sh comment).

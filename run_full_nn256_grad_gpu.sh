@@ -163,8 +163,7 @@ uv run --no-sync $PPO --name full_nn256_grad_s${SEED} --variant full --seed $SEE
   --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \
   --cpu-worker-recycle-every 0 \
   --ray-address $HEAD_IP:$RAY_PORT \
-  --advantage-norm scalar --ppo-epochs 4 --anti-degeneracy none \
-  --cosine-lower-bound 0.0 --cosine-upper-bound 1.0 \
+  --advantage-norm scalar --ppo-epochs 4 \
   --episodes $EPISODES --num-envs $NUM_ENVS --minibatches $MBS \
   --num-data-points 5 --reps-per-point 2 \
   --best-sequences-json $OUT/best.json --best-sequences-every 5 \

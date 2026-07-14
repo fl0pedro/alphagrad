@@ -92,7 +92,6 @@ MBS="${MBS:-8}"
 MAX_SUBSTEPS="${MAX_SUBSTEPS:-16}"
 ENTROPY_COEF="${ENTROPY_COEF:-0.05}"
 ENTROPY_COEF_FINAL="${ENTROPY_COEF_FINAL:-0.05}"
-VALUE_NORM="${VALUE_NORM:-popart}"    # PopArt ON (per-channel normalization; overridable)
 LR="${LR:-1e-4}"
 # ViT grad exec is ms-scale -> far fewer inner reps still stable (see CV sweep).
 LATENCY_INNER_REPS="${LATENCY_INNER_REPS:-20}"
@@ -109,7 +108,7 @@ NODE0=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n 1p)
 HEAD_IP=$(srun --nodes=1 --nodelist=$NODE0 hostname -i | awk '{print $1}')
 NAME="gradmode_vit_cse_s${SEED}_ss${MAX_SUBSTEPS}"
 
-echo "########## GRADMODE_VIT_CSE $(date) | head=$NODE0 eps=$EPISODES seed=$SEED value_norm=$VALUE_NORM lr=$LR inner_reps=$LATENCY_INNER_REPS channels=$ALPHAGRAD_REWARD_CHANNELS ##########"
+echo "########## GRADMODE_VIT_CSE $(date) | head=$NODE0 eps=$EPISODES seed=$SEED lr=$LR inner_reps=$LATENCY_INNER_REPS channels=$ALPHAGRAD_REWARD_CHANNELS ##########"
 
 ( cd ~/dsnn && uv run --no-sync ray start --head --node-ip-address=$HEAD_IP \
     --port=$RAY_PORT --num-gpus=$RAY_NUM_GPUS --num-cpus=$RAY_NUM_CPUS --block ) &
@@ -133,9 +132,8 @@ uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \
   --cpu-worker-recycle-every ${CPU_WORKER_RECYCLE_EVERY:-6} \
   --ray-address $HEAD_IP:$RAY_PORT \
-  --advantage-norm scalar --value-norm $VALUE_NORM --ppo-epochs 4 \
+  --advantage-norm scalar --ppo-epochs 4 \
   --lr $LR --lr-decay-min-mult 1.0 \
-  --cosine-lower-bound 0.0 --cosine-upper-bound 1.0 \
   --episodes $EPISODES --num-envs $NUM_ENVS --minibatches $MBS \
   --num-data-points 5 --reps-per-point 2 \
   --best-sequences-json $OUT/best.json --best-sequences-every 1 \

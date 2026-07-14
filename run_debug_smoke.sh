@@ -42,9 +42,6 @@ uv run --no-sync "$PPO" \
     --cmp-type latency \
     --advantage-norm scalar \
     --ppo-epochs 4 \
-    --anti-degeneracy none \
-    --cosine-lower-bound 0.0 \
-    --cosine-upper-bound 1.0 \
     --episodes "$EPISODES" \
     --num-envs 16 \
     --num-cpu-workers 16 \

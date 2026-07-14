@@ -5,7 +5,7 @@ A checkpoint bundles four files in a directory:
 * ``agent.eqx`` — equinox tree-leaves of the agent (params + buffers)
 * ``opt_state.pkl`` — optax opt_state, pickled (it's a pytree of arrays)
 * ``meta.json`` — small JSON header with the episode counter, RNG seed,
-  reward weights, multipliers, best-so-far state. Human-readable so a
+  reward weights, best-so-far state. Human-readable so a
   failed resume is easy to diagnose.
 * ``replay.pkl`` (optional, MuZero only) — replay buffer pickled
 
@@ -43,7 +43,6 @@ def save_state(
     opt_state,
     episode_counter: int,
     reward_weights: Any = None,
-    multipliers: Any = None,
     best_state: dict | None = None,
     extras: dict | None = None,
     replay_buffer: Any = None,
@@ -79,9 +78,6 @@ def save_state(
         "episode_counter": int(episode_counter),
         "reward_weights": (
             np.asarray(reward_weights).tolist() if reward_weights is not None else None
-        ),
-        "multipliers": (
-            np.asarray(multipliers).tolist() if multipliers is not None else None
         ),
         "best_state": best_state or {},
         "extras": extras or {},
@@ -125,7 +121,7 @@ def load_state(
 
     Returns:
         dict with keys ``agent``, ``opt_state``, ``episode_counter``,
-        ``reward_weights``, ``multipliers``, ``best_state``,
+        ``reward_weights``, ``best_state``,
         ``extras``, ``replay_path``. Missing pieces are ``None``.
     """
     if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
@@ -145,7 +141,6 @@ def load_state(
         "opt_state": None,
         "episode_counter": 0,
         "reward_weights": None,
-        "multipliers": None,
         "best_state": {},
         "extras": {},
         "replay_path": replay_path if os.path.exists(replay_path) else None,
@@ -168,9 +163,6 @@ def load_state(
         rw = meta.get("reward_weights")
         if rw is not None:
             out["reward_weights"] = np.asarray(rw, dtype=np.float32)
-        mu = meta.get("multipliers")
-        if mu is not None:
-            out["multipliers"] = np.asarray(mu, dtype=np.float32)
         out["best_state"] = meta.get("best_state", {}) or {}
         out["extras"] = meta.get("extras", {}) or {}
     except Exception as exc:

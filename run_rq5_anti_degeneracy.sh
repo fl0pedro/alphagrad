@@ -93,8 +93,6 @@ for cfg in "${CONFIGS[@]}"; do
     IFS=':' read -r tag mode delta <<< "$cfg"
     for sd in "${SEEDS[@]}"; do
         run_variant "${tag}_seed${sd}" \
-            --anti-degeneracy "$mode" \
-            --anti-degeneracy-delta "$delta" \
             --seed "$sd" || FAIL=$((FAIL + 1))
     done
 done

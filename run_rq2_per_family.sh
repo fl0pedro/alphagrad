@@ -61,9 +61,6 @@ COMMON_ARGS=(
     # specifically studies whether a constraint is needed and at what
     # threshold; until then we want to SEE the unconstrained dynamics
     # (incl. potential cossim=1 collapse) cleanly, without confound.
-    --anti-degeneracy none
-    --cosine-lower-bound 0.0
-    --cosine-upper-bound 1.0
     --episodes "$EPISODES"
     --num-envs "$NUM_ENVS"
     # CPU pool 1:1 with envs (see run_rq1_ve_only.sh comment).

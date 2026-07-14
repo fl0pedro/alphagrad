@@ -78,25 +78,6 @@ def _extend_argparser(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "Makes N concurrent multi-GPU runs tile deterministically across mixed "
         "GPU nodes (e.g. 4+8) instead of Ray's greedy placement stranding GPUs.",
     )
-    p.add_argument(
-        "--lagrangian-warmup-eps",
-        type=int,
-        default=20,
-        help="Episodes at the start of training where the Lagrangian "
-             "violations are computed for logging but the penalty does NOT "
-             "flow into the advantage and the multipliers are not updated. "
-             "Without this warm-up, a cold cosine_sim constraint (mean ~0.05) "
-             "with a 0.5 threshold pushes the multiplier into the tens within "
-             "100 episodes, killing exploration via overwhelming penalty.",
-    )
-    p.add_argument(
-        "--lagrangian-multiplier-max",
-        type=float,
-        default=1.0,
-        help="Upper clip on each Lagrangian multiplier. Stops dual ascent "
-             "from dominating the PPO objective when a constraint is "
-             "structurally hard to satisfy in the early policy.",
-    )
     return p
 
 

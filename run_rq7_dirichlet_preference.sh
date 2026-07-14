@@ -57,10 +57,6 @@ COMMON_ARGS=(
     --lambda-cmp 1.0
     --lambda-mem 1.0
     --lambda-frob 1.0
-    --anti-degeneracy delta_ceiling
-    --anti-degeneracy-delta "$RQ5_BEST_DELTA"
-    --cosine-lower-bound 0.0
-    --cosine-upper-bound 1.0
     --episodes "$EPISODES"
     --num-envs "$NUM_ENVS"
     # CPU pool 1:1 with envs (see run_rq1_ve_only.sh comment).

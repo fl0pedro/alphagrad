@@ -97,8 +97,7 @@ def make_argparser() -> argparse.ArgumentParser:
     # now active rewards by default. cossim is gated by ``acc`` in
     # ``--rewards`` (weight = 1.0 when present). frob has its own
     # lambda; bumped from the prior 0.0 default so the Jacobian-error
-    # magnitude contributes to the gradient alongside cossim. The
-    # Lagrangian range constraint stays on cossim only.
+    # magnitude contributes to the gradient alongside cossim.
     p.add_argument("--lambda-frob", type=float, default=1.0)
     p.add_argument(
         "--lambda-cossim-guide", type=float, default=0.0,
@@ -373,8 +372,7 @@ def make_argparser() -> argparse.ArgumentParser:
              "current weighted-sum of 8 channels via --lambda-cmp/mem/frob. "
              "``pca2``: PCA-2 compresses the 6 cost channels into 2 "
              "decorrelated unit-variance latents, sums them; cossim/frob "
-             "still enter via --lambda-frob unless --reward-as-constraints "
-             "moves them to dual-ascent (RCPO).",
+             "still enter via --lambda-frob.",
     )
     p.add_argument(
         "--pca-refit-every", type=int, default=100,
@@ -387,14 +385,6 @@ def make_argparser() -> argparse.ArgumentParser:
         help="(--reward-pipeline pca2) Episodes of EMA-stats warmup before "
              "the first PCA refit. Until then, projection falls back to "
              "first-two-z-scored-channels.",
-    )
-    p.add_argument(
-        "--reward-as-constraints", type=str, default="",
-        help="Comma-separated channel names whose --lambda contribution is "
-             "ZEROED in the scalar reward; they only enter via the "
-             "Lagrangian dual-ascent path (RCPO). Typical: "
-             "``cosine_sim,frob_residual`` for the fidelity-as-constraint "
-             "formulation. Channel names match REWARD_NAMES in env.py.",
     )
     p.add_argument(
         "--running-max-channels", type=str, default="",
@@ -458,17 +448,17 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--ppo-epochs", type=int, default=4,
                    help="Number of passes over the rollout buffer per episode.")
 
-    # Advantage normalisation strategy. Default `gdpo` implements the
-    # per-channel z-score → priority-weighted sum → batch-norm pipeline
-    # from the NVIDIA GDPO paper (arXiv:2601.05242). The legacy `scalar`
-    # path keeps the previous behaviour: scalarise per-channel rewards
-    # into a single stream, apply symlog inside GAE, then global
-    # advantage normalisation. Calibration is auto-skipped under
-    # `gdpo` because per-minibatch z-scoring subsumes magnitude
-    # rescaling. Keep `scalar` reachable for one cycle so we can A/B
-    # against the pre-refactor baseline on the same rollout buffer.
+    # Advantage normalisation strategy. `scalar` is the only path the Ray
+    # trainer supports: PopArt value normalisation is unconditional there
+    # and carries its own per-channel (mu, sigma), so it rejects `gdpo`
+    # (which brings its own per-minibatch z-score — layering the two would
+    # double-normalise). `gdpo` implements the per-channel z-score →
+    # priority-weighted sum → batch-norm pipeline from the NVIDIA GDPO
+    # paper (arXiv:2601.05242); it is retained for the single-process
+    # ppo.py trainer only. Calibration is auto-skipped under `gdpo`
+    # because per-minibatch z-scoring subsumes magnitude rescaling.
     p.add_argument(
-        "--advantage-norm", type=str, default="gdpo",
+        "--advantage-norm", type=str, default="scalar",
         choices=["gdpo", "scalar"],
         help="Advantage normalisation pipeline. `gdpo` (default): "
              "per-channel GAE + per-minibatch z-score per channel + "
@@ -496,34 +486,6 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--ppo-eps", type=float, default=0.2)
     p.add_argument("--value-coef", type=float, default=0.5)
     p.add_argument(
-        "--value-norm",
-        type=str,
-        default="baseline",
-        choices=["baseline", "popart"],
-        help="Critic-target normalisation on the Ray PPO path. "
-             "'baseline' (default): current behaviour — scalar mode uses "
-             "the symlog value loss + rollout-wide advantage z-score. "
-             "'popart' (van Hasselt 2016, multi-channel as in IMPALA): "
-             "the K-channel critic learns normalised values against "
-             "quasi-static per-channel EMA stats of the GAE returns "
-             "(sigma floored at 0.1), the final value layer is rescaled "
-             "output-preservingly on every stats update, and advantages "
-             "are formed per-channel in normalised space then "
-             "priority-weight-summed — REPLACES the rollout z-score. "
-             "Requires --advantage-norm scalar. Env override: "
-             "ALPHAGRAD_POPART=1 (knobs: ALPHAGRAD_POPART_BETA, "
-             "ALPHAGRAD_POPART_SIGMA_MIN).",
-    )
-    p.add_argument(
-        "--value-norm-decay",
-        type=float,
-        default=0.99,
-        help="EMA decay for the running (mean, var) of priority-weighted "
-             "returns used to standardize the value-loss target "
-             "(Option-A scalarization, replacing the legacy symlog). "
-             "0.99 matches the cleanrl/sb3 RunningMeanStd convention.",
-    )
-    p.add_argument(
         "--entropy-coef",
         type=float,
         default=0.05,
@@ -540,72 +502,10 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--gae-lambda", type=float, default=1.0)
     p.add_argument("--discount", type=float, default=1.0)
 
-    # Lagrangian (Stage F)
-    p.add_argument(
-        "--lagrangian-constraint", action="append", default=[],
-        metavar="NAME>=THRESH",
-        help="Inequality constraints of the form NAME>=THRESH or "
-        "NAME<=THRESH, where NAME is one of the env reward channel "
-        "names (muls_adds_fmas / flops / latency_ns / max_io_sum / "
-        "bytes_accessed / peak_memory / cosine_sim / frob_residual). "
-        "Mean per-step violations push the policy via dual-ascent on "
-        "per-constraint multipliers. Symlog-friendly: cost-family "
-        "constraints (everything except cosine_sim) are evaluated in "
-        "symlog space so multipliers live on a single scale. "
-        "Repeat the flag to add multiple constraints.",
-    )
-    p.add_argument(
-        "--lagrangian-lr", type=float, default=1e-3,
-        help="Dual-ascent step size on the Lagrangian multipliers.",
-    )
-    # Anti-degeneracy sugar — high-level CLI knob that desugars to one or
-    # two ``--lagrangian-constraint`` entries against ``cosine_sim``.
-    # Prevents the policy from collapsing to pure vertex-elim
-    # (``cossim=1.0``), which is the documented failure mode of runs
-    # without any quality constraint. Choose one of:
-    #   - ``none``           — no extra constraints (the trainer's
-    #                          ``args.lagrangian_constraint`` flows
-    #                          through unchanged).
-    #   - ``delta_ceiling``  — single soft ceiling
-    #                          ``cosine_sim <= 1 - --anti-degeneracy-delta``.
-    #                          Default ``delta=0.01`` (i.e. ``<=0.99``).
-    #   - ``corridor``       — both floor (``--cosine-lower-bound``,
-    #                          default 0.8) and ceiling
-    #                          (``--cosine-upper-bound``, default 0.9).
-    p.add_argument(
-        "--anti-degeneracy",
-        choices=("none", "delta_ceiling", "corridor"),
-        default="none",
-        help="High-level mechanism to prevent the policy from collapsing "
-        "to cossim=1.0 (the no-approximation degenerate solution). "
-        "``delta_ceiling`` adds a single soft ceiling ``cosine_sim <= 1 - δ``; "
-        "``corridor`` adds both a floor and a ceiling using "
-        "``--cosine-lower-bound`` / ``--cosine-upper-bound``. The "
-        "desugared constraints are appended to ``--lagrangian-constraint``.",
-    )
-    p.add_argument(
-        "--anti-degeneracy-delta", type=float, default=0.01,
-        help="δ for ``--anti-degeneracy delta_ceiling`` (the ceiling is "
-        "``cosine_sim <= 1 - δ``). Default 0.01. RQ5 sweeps "
-        "δ ∈ {0.01, 0.05, 0.1}.",
-    )
-    p.add_argument(
-        "--cosine-lower-bound", type=float, default=0.8,
-        help="Floor used by ``--anti-degeneracy corridor``. "
-        "Pass 0.0 to omit the floor.",
-    )
-    p.add_argument(
-        "--cosine-upper-bound", type=float, default=0.9,
-        help="Ceiling used by ``--anti-degeneracy corridor``. "
-        "Pass 1.0 to omit the ceiling.",
-    )
-
     # Conditioned-reward gating (the GDPO paper's "easy reward on hard
-    # reward" trick). Hard alternative to the Lagrangian penalty: when
-    # the gate fails the easier channel is zeroed for that transition,
-    # so the policy can't hill-climb the easy signal without first
-    # satisfying the harder one. Complementary to the Lagrangian, NOT
-    # a replacement.
+    # reward" trick). When the gate fails the easier channel is zeroed
+    # for that transition, so the policy can't hill-climb the easy
+    # signal without first satisfying the harder one.
     p.add_argument(
         "--reward-condition", nargs="*", type=str, default=[],
         help="Conditioned-reward gates of the form "

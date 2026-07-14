@@ -55,9 +55,6 @@ COMMON_ARGS=(
     --rewards cmp
     --advantage-norm scalar
     --ppo-epochs 4
-    --anti-degeneracy none
-    --cosine-lower-bound 0.0
-    --cosine-upper-bound 1.0
     --episodes "$EPISODES"
     --num-envs "$NUM_ENVS"
     # CPU pool must be 1:1 with env count, otherwise the rollout

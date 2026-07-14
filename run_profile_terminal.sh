@@ -42,9 +42,6 @@ uv run --no-sync "$PPO" \
     --mem-type peak_memory \
     --advantage-norm scalar \
     --ppo-epochs 4 \
-    --anti-degeneracy none \
-    --cosine-lower-bound 0.0 \
-    --cosine-upper-bound 1.0 \
     --episodes 3 \
     --num-envs 1 \
     --num-cpu-workers 1 \

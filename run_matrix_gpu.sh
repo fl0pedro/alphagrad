@@ -50,7 +50,7 @@ echo "==== ray up. $(date) ===="
 COMMON_ARGS=(
     --example VmappedNeuralNetwork --dataset mnist
     --rewards cmp mem --cmp-type latency --mem-type peak_memory
-    --advantage-norm scalar --ppo-epochs 4 --anti-degeneracy none
+    --advantage-norm scalar --ppo-epochs 4
     # minibatches=32 (not 4): the policy's attention is f32[heads*mb, 4096,
     # 4096]; a big minibatch (minibatches=4 -> mb~283) wants ~76GB and OOMs a
     # shared H100. 32 -> mb~35 -> ~9GB, fits alongside the measurement actor.
@@ -60,8 +60,6 @@ COMMON_ARGS=(
     # GPU measurement: trainer 0.5 GPU + measurement actor 0.5 GPU = 1 GPU/variant.
     --exec-on-gpu --actor-num-gpus 0.5 --cpu-actor-num-gpus 0.5
     # CEILING constraint that forces approximation (dual-ascent enforces it).
-    --lagrangian-constraint "cosine_sim<=${COSINE_MAX}"
-    --lagrangian-lr 1e-2 --lagrangian-warmup-eps 20
     --running-max-channels peak_memory,max_io_sum
     --calibrate-steps 0 --cpu-callback-timeout 0 --cpu-callback-initial-timeout 0
     --ray-address "$HEAD_IP:$RAY_PORT" --wandb offline

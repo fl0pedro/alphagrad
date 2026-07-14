@@ -61,10 +61,6 @@ COMMON_ARGS=(
     --lambda-cmp 1.0
     --lambda-mem 1.0
     --lambda-frob 1.0
-    --anti-degeneracy delta_ceiling
-    --anti-degeneracy-delta "$RQ5_BEST_DELTA"
-    --cosine-lower-bound 0.0
-    --cosine-upper-bound 1.0
     --episodes "$EPISODES"
     --num-envs "$NUM_ENVS"
     --num-cpu-workers "$NUM_ENVS"
@@ -76,7 +72,6 @@ COMMON_ARGS=(
     --preference-dirichlet-alpha 1.0
     --dirichlet-mix-ratio 0.5
     --reward-pipeline "${RQ8_WINNING_PIPELINE/pca2_rcpo/pca2}"
-    --reward-as-constraints cosine_sim,frob_residual
     --wandb "$WANDB_MODE"
     --wandb-project "$WANDB_PROJECT_RL"
     --wandb-entity "$WANDB_ENTITY"

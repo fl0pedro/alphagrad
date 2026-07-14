@@ -2,7 +2,7 @@
 
 Verifies save → load roundtrip on a tiny equinox module + optax state
 plus the meta fields the trainers care about (episode counter,
-reward weights, multipliers).
+reward weights).
 """
 
 from __future__ import annotations
@@ -42,7 +42,6 @@ def test_save_and_load_roundtrip(tmp_path):
     )
 
     rw = np.array([1.0, 0.5, 0.0, 0.0, 0.0, 0.25, 0.0, 0.0], dtype=np.float32)
-    mults = np.array([0.3, 0.7], dtype=np.float32)
     ckpt_dir = str(tmp_path / "ckpt")
 
     save_state(
@@ -51,7 +50,6 @@ def test_save_and_load_roundtrip(tmp_path):
         opt_state=opt_state,
         episode_counter=42,
         reward_weights=rw,
-        multipliers=mults,
         best_state={"best_global_return": -1.23e6, "best_global_ep": 7},
         extras={"variant": "full"},
     )
@@ -70,7 +68,6 @@ def test_save_and_load_roundtrip(tmp_path):
     assert restored is not None
     assert restored["episode_counter"] == 42
     np.testing.assert_allclose(restored["reward_weights"], rw)
-    np.testing.assert_allclose(restored["multipliers"], mults)
     assert restored["best_state"]["best_global_ep"] == 7
     assert restored["extras"]["variant"] == "full"
     # Agent params actually match the SAVED (altered) state — i.e. the

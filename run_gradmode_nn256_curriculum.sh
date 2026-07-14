@@ -14,7 +14,7 @@
 #   MODIFICATIONS vs nskom9jd:
 #     * GRAD MODE (--measure-grad): latency, peak_memory AND flops measured on
 #       the GRADIENT executable (graphax value_and_grad). NOT Jacobian mode.
-#     * PopArt OFF (--value-norm baseline): no per-channel EMA normalisation.
+#     * PopArt ON (always): per-channel EMA value-target normalisation.
 #     * bkstep OFF (ALPHAGRAD_BKSTEP=0): no closed-loop trainability probe.
 #     * QUALITY = cosine_sim ON THE GRAD (grad-vs-exact-grad cosine, weight 1.0).
 #       In grad mode env compares out_approx[1] vs out_exact[1] (the grads).
@@ -121,7 +121,6 @@ MBS="${MBS:-4}"
 MAX_SUBSTEPS="${MAX_SUBSTEPS:-16}"
 ENTROPY_COEF="${ENTROPY_COEF:-0.05}"
 ENTROPY_COEF_FINAL="${ENTROPY_COEF_FINAL:-0.05}"
-VALUE_NORM="${VALUE_NORM:-popart}"    # PopArt ON (per-channel normalization; overridable)
 LR="${LR:-1e-4}"
 
 # EVEN H100 layout: 1 trainer GPU + 7 measure GPUs; 32 cores each.
@@ -137,7 +136,7 @@ NODE0=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n 1p)
 HEAD_IP=$(srun --nodes=1 --nodelist=$NODE0 hostname -i | awk '{print $1}')
 NAME="gradmode_nn256_cse_s${SEED}_ss${MAX_SUBSTEPS}"
 
-echo "########## GRADMODE_NN256_CSE $(date) | head=$NODE0 eps=$EPISODES seed=$SEED value_norm=$VALUE_NORM lr=$LR channels=$ALPHAGRAD_REWARD_CHANNELS ##########"
+echo "########## GRADMODE_NN256_CSE $(date) | head=$NODE0 eps=$EPISODES seed=$SEED lr=$LR channels=$ALPHAGRAD_REWARD_CHANNELS ##########"
 
 ( cd ~/dsnn && uv run --no-sync ray start --head --node-ip-address=$HEAD_IP \
     --port=$RAY_PORT --num-gpus=$RAY_NUM_GPUS --num-cpus=$RAY_NUM_CPUS --block ) &
@@ -161,9 +160,8 @@ uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \
   --cpu-worker-recycle-every ${CPU_WORKER_RECYCLE_EVERY:-6} \
   --ray-address $HEAD_IP:$RAY_PORT \
-  --advantage-norm scalar --value-norm $VALUE_NORM --ppo-epochs 4 \
+  --advantage-norm scalar --ppo-epochs 4 \
   --lr $LR --lr-decay-min-mult 1.0 \
-  --cosine-lower-bound 0.0 --cosine-upper-bound 1.0 \
   --episodes $EPISODES --num-envs $NUM_ENVS --minibatches $MBS \
   --num-data-points 5 --reps-per-point 2 \
   --best-sequences-json $OUT/best.json --best-sequences-every 1 \

@@ -148,8 +148,7 @@ launch_one() {
       --cpu-cores-per-actor 1 --cpu-cores-shared --num-cpu-workers $NUM_CPU_WORKERS \
       --actor-num-gpus 1 --ray-address $HEAD_IP:$RAY_PORT \
       --replay-buffer-size $REPLAY_CAP --vtrace-rho-bar 1.0 --vtrace-c-bar 1.0 \
-      --advantage-norm scalar --ppo-epochs 4 --anti-degeneracy none \
-      --cosine-lower-bound 0.0 --cosine-upper-bound 1.0 \
+      --advantage-norm scalar --ppo-epochs 4 \
       --episodes $EPISODES --num-envs $NE --minibatches $MB \
       --max-wall-seconds $MAX_WALL \
       --num-data-points 5 --reps-per-point 2 \

@@ -243,7 +243,7 @@ def test_build_unified_reward_log_dict_emits_grouped_keys():
 
 
 def test_build_unified_reward_log_dict_ceiling_only_corridor():
-    """`--anti-degeneracy delta_ceiling` passes corridor_low=None."""
+    """A ceiling-only corridor passes corridor_low=None."""
     import numpy as np
     from alphagrad.approx.common.reward_scaling import (
         REWARD_NAMES,
