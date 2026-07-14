@@ -47,6 +47,7 @@ from alphagrad.approx.env import (
     StepAction,
     VertexEliminationEnv,
 )
+from alphagrad.utils import symlog as _symlog
 from alphagrad.approx.mu0 import (
     _NO_SYMLOG_MASK_NP,
     _PAIR_TO_BASE,
@@ -81,7 +82,10 @@ from alphagrad.approx.variants import (
 
 
 def _args_from_dict(args_dict: dict) -> SimpleNamespace:
-    return SimpleNamespace(**args_dict)
+    """Back-compat re-export of
+    :func:`alphagrad.approx.common.ray_runtime._args_from_dict`."""
+    from alphagrad.approx.common.ray_runtime import _args_from_dict as _impl
+    return _impl(args_dict)
 
 
 # Per-channel "do not discount" mask. ``cosine_sim`` and ``frob_residual``
@@ -112,7 +116,15 @@ def _per_channel_discounted_returns(
     over time (reversed) so the cost is the same as the original
     single-channel ``_discounted_returns`` (one scan + a final sum)
     regardless of how many channels are involved.
+
+    Phase 4a: clamp raw rewards to ``±(SENTINEL - 1)`` before weighting
+    so any pool sentinel that slipped past the cpu_approx_pool's mask
+    can't blow up the value loss. ``peak_memory ≈ 1e9`` is real, so we
+    only bound at ``1e10 - 1`` (just below the sentinel magnitude).
     """
+    from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+    bound = jnp.float32(abs(SENTINEL_REWARD_VALUE) - 1.0)
+    reward_vec = jnp.clip(reward_vec, -bound, bound)
     weighted = reward_vec * weights  # (T, NUM_REWARDS)
     gammas = jnp.where(
         _NO_DISCOUNT_MASK,
@@ -589,10 +601,21 @@ def _build_actor_state(
                 for d in range(DECISION_DEPTH):
                     logits, value = agent_local.prediction(latent)
                     l_pi += -jnp.sum(w.mcts_visits[k][d] * jnn.log_softmax(logits))
-                    l_v += 0.5 * jnp.square(value - w.target_value[k])
+                    # Symlog the target value + reward (Pohlen squashing
+                    # analogue) before the squared-error loss. Without
+                    # this the cost-family rewards (~1e10 raw) blow the
+                    # value head up: ``(value - target)^2 ≈ 1e20``
+                    # observed in wandb run gtpk5xiz before this fix.
+                    # PPO does the same on its legacy scalar path; this
+                    # brings MuZero in line. The value / dynamics outputs
+                    # are interpreted as symlog'd predictions everywhere
+                    # downstream (MCTS uses them as comparable scalars
+                    # under the monotone symlog, so the relative order
+                    # of children is preserved).
+                    l_v += 0.5 * jnp.square(value - _symlog(w.target_value[k]))
                     if not ((k == args.unroll_steps) and (d == DECISION_DEPTH - 1)):
                         latent, pred_r = agent_local.dynamics(latent, act_seq[d])
-                        l_r += 0.5 * jnp.square(pred_r - rew_seq[d])
+                        l_r += 0.5 * jnp.square(pred_r - _symlog(rew_seq[d]))
                         if d == DECISION_DEPTH - 1:
                             latent = 0.5 * latent + 0.5 * lax.stop_gradient(latent)
             return (
@@ -615,21 +638,40 @@ def _build_actor_state(
             (loss_val, parts), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
                 agent_c, batch_i
             )
+            # Phase 4e: NaN-skip — if loss isn't finite (calibration
+            # poisoning, cold-cache compile error, or any value-head
+            # blowup that grad clipping at max_grad_norm couldn't
+            # rescue), keep agent + opt_state unchanged so a single bad
+            # batch doesn't propagate through the rest of the minibatch
+            # scan. Increments a per-call counter the driver can log.
+            loss_finite = jnp.isfinite(loss_val)
+            zero_grads = jax.tree.map(jnp.zeros_like, grads)
+            safe_grads = jax.tree.map(
+                lambda g, z: jnp.where(loss_finite, g, z), grads, zero_grads,
+            )
             updates, opt_state_new = optimizer.update(
-                grads, opt_state_c, eqx.filter(agent_c, eqx.is_inexact_array)
+                safe_grads, opt_state_c, eqx.filter(agent_c, eqx.is_inexact_array)
+            )
+            opt_state_new = jax.tree.map(
+                lambda new, old: jnp.where(loss_finite, new, old),
+                opt_state_new, opt_state_c,
             )
 
             new_agent = eqx.apply_updates(agent_c, updates)
             new_dyn_carry, _ = eqx.partition((new_agent, opt_state_new), eqx.is_array)
 
-            return new_dyn_carry, (loss_val, parts)
+            return new_dyn_carry, (loss_val, parts, jnp.where(loss_finite, 0, 1).astype(jnp.int32))
 
-        final_dyn_carry, (losses, parts) = lax.scan(
+        final_dyn_carry, (losses, parts, nan_flags) = lax.scan(
             scan_body, dynamic_carry, all_batches
         )
         final_agent, final_opt = eqx.combine(final_dyn_carry, static_carry)
 
-        return final_agent, final_opt, jnp.mean(losses), jax.tree.map(jnp.mean, parts)
+        return (
+            final_agent, final_opt,
+            jnp.mean(losses), jax.tree.map(jnp.mean, parts),
+            jnp.sum(nan_flags),
+        )
 
     return {
         "args": args,
@@ -664,7 +706,9 @@ class SPMDServerWorker:
         seed: int = 0,
         cpu_workers: list = None,
         *,
-        callback_timeout_s: float = 60.0,
+        callback_timeout_s: float = 120.0,
+        initial_timeout_s: float | None = None,
+        warm_after: int = 3,
         recycle_every: int = 50,
         cpu_actor_options: dict | None = None,
         starting_actor_id: int = 1000,
@@ -706,6 +750,8 @@ class SPMDServerWorker:
             pool = CpuApproxPool(
                 cpu_workers,
                 timeout_s=callback_timeout_s,
+                initial_timeout_s=initial_timeout_s,
+                warm_after=warm_after,
                 respawn_factory=_respawn_factory,
                 max_tokens=_MAX_TOKENS,
                 num_rewards=_NUM_REWARDS,
@@ -729,6 +775,41 @@ class SPMDServerWorker:
         self._pin_rules_default = _pin_rules_for_variant(variant)
         self.replay_buffer = None
         self.train_step_counter = 0
+        self._checkpoint_path = getattr(self.args, "checkpoint_path", "") or ""
+        self._checkpoint_every = int(getattr(self.args, "checkpoint_every", 0))
+
+        # Optional resume from a previously-written checkpoint. Same
+        # contract as the PPO worker (see ppo_ray_worker.py):
+        # eqx.tree_deserialise_leaves needs templates from the freshly-
+        # built agent + opt_state, so we restore right after the state
+        # dict is constructed.
+        if self._checkpoint_path:
+            try:
+                from alphagrad.approx.common.checkpoint import (
+                    install_sigterm_handler, load_state,
+                )
+                restored = load_state(
+                    self._checkpoint_path,
+                    template_agent=self.state["agent"],
+                    template_opt_state=self.state["opt_state"],
+                )
+                if restored is not None:
+                    if restored["agent"] is not None:
+                        self.state["agent"] = restored["agent"]
+                    if restored["opt_state"] is not None:
+                        self.state["opt_state"] = restored["opt_state"]
+                    self.train_step_counter = int(restored["episode_counter"])
+                    if restored["reward_weights"] is not None:
+                        self.state["reward_weights"] = jnp.asarray(
+                            restored["reward_weights"], dtype=jnp.float32,
+                        )
+                    print(
+                        f"[mu0_ray_worker] resumed from {self._checkpoint_path} "
+                        f"at train_step {self.train_step_counter}"
+                    )
+                install_sigterm_handler(self._save_checkpoint_safe)
+            except Exception as exc:
+                print(f"[mu0_ray_worker] checkpoint resume failed: {exc}")
 
     def run_rollout_and_train(
         self,
@@ -783,11 +864,23 @@ class SPMDServerWorker:
 
         rw_np = np.asarray(self.state["reward_weights"])
         r_vec_np = np.asarray(traj.reward_vec)
-        # Per-env per-channel raw episode return (sum over timesteps).
-        # Rewards are stored "higher is better" (costs are negated), so the
-        # ``argmax`` over the env axis gives the trajectory that scored
-        # best on a given channel.
-        r_per_env = r_vec_np.sum(axis=1)  # (num_envs, NUM_REWARDS)
+        # Sentinel-aware per-env per-channel return: any transition
+        # whose cost channel == SENTINEL_REWARD_VALUE (the -1e10
+        # cpu_approx_pool timeout marker) is zeroed out of the sum so
+        # the running per-channel "best" doesn't latch onto a sentinel
+        # trajectory and report `flop=-1e+10` as if it were a real
+        # value. Mirrors the PPO worker's aggregate_per_channel_stats
+        # path (alphagrad/src/alphagrad/approx/ppo_ray_worker.py).
+        from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+        from alphagrad.approx.common.reward_scaling import (
+            filter_sentinel_mask as _filter_sentinel_mask,
+        )
+
+        # r_vec_np shape: (num_envs, T, NUM_REWARDS). Mask is per
+        # (env, t); zeroed rows don't contribute to the per-env sum.
+        valid_mask = _filter_sentinel_mask(r_vec_np, SENTINEL_REWARD_VALUE)
+        masked_r_vec = np.where(valid_mask[:, :, None], r_vec_np, 0.0)
+        r_per_env = masked_r_vec.sum(axis=1)  # (num_envs, NUM_REWARDS)
         weighted_per_env = r_per_env * rw_np  # (num_envs, NUM_REWARDS)
         per_env_tot = weighted_per_env.sum(axis=-1)  # (num_envs,)
         best_idx = int(per_env_tot.argmax())
@@ -807,12 +900,26 @@ class SPMDServerWorker:
             if float(rw_np[j]) == 0.0:
                 continue
             bidx = int(r_per_env[:, j].argmax())
+            # Full 8-channel snapshot of the env that won this channel
+            # — mirrors PPO's aggregate_per_channel_stats output so the
+            # shared JSON dump (best_sequences_snapshot) records
+            # ``(a_i, b_i, c_i, r_i)`` for every per-channel best.
+            all_raw = {
+                REWARD_NAMES[k]: float(r_per_env[bidx, k])
+                for k in range(NUM_REWARDS)
+            }
+            all_weighted = {
+                REWARD_NAMES[k]: float(weighted_per_env[bidx, k])
+                for k in range(NUM_REWARDS)
+            }
             best_per_reward[REWARD_NAMES[j]] = {
                 "raw_value": float(r_per_env[bidx, j]),
                 "weighted_value": float(weighted_per_env[bidx, j]),
                 "weighted_total": float(per_env_tot[bidx]),
                 "env_idx": bidx,
                 "seq": _action_to_pylist(v_np[bidx], p_np[bidx], f_np[bidx], ftab),
+                "all_raw": all_raw,
+                "all_weighted": all_weighted,
             }
 
         # Mean MCTS visit-distribution entropy. ``mcts_visits`` has shape
@@ -860,10 +967,16 @@ class SPMDServerWorker:
             ),
             "best_overall_rewards": best_overall_rewards,
             "best_overall_weighted": best_overall_weighted,
-            "per_reward_means": {
-                REWARD_NAMES[j]: float(r_vec_np[..., j].mean())
-                for j in range(NUM_REWARDS)
-            },
+            "per_reward_means": (
+                {
+                    REWARD_NAMES[j]: float(
+                        r_vec_np[..., j][valid_mask].mean()
+                    )
+                    for j in range(NUM_REWARDS)
+                }
+                if valid_mask.any()
+                else {REWARD_NAMES[j]: 0.0 for j in range(NUM_REWARDS)}
+            ),
             "best_per_reward": best_per_reward,
             "entropy_mean": mean_entropy,
             "entropy_root": root_entropy,
@@ -972,6 +1085,7 @@ class SPMDServerWorker:
                         self.state["opt_state"],
                         last_loss,
                         last_parts,
+                        nan_skip_count,
                     ) = self.state["train_minibatches"](
                         self.state["agent"],
                         self.state["opt_state"],
@@ -985,6 +1099,7 @@ class SPMDServerWorker:
                             "value_loss": float(last_parts[1]),
                             "reward_loss": float(last_parts[2]),
                             "total_loss": float(last_loss),
+                            "nan_skip_count": int(nan_skip_count),
                         }
                     )
 
@@ -1004,14 +1119,55 @@ class SPMDServerWorker:
         # of calls ≈ GB-scale residual per ep). Recycle bounds it.
         if self._pool is not None:
             stats.update({f"pool/{k}": v for k, v in self._pool.stats().items()})
-            self._episodes_since_recycle += 1
-            if (
-                self._recycle_every > 0
-                and self._episodes_since_recycle >= self._recycle_every
-            ):
-                n_new = self._pool.recycle()
-                stats["pool/recycled"] = n_new
-                self._episodes_since_recycle = 0
+            # Mirror PPO: pop per-rollout jaxpr-tokenization truncation
+            # counters from each CPU actor's per-process state. All
+            # values are PER-EPISODE (the actor counters reset on
+            # consume). Best-effort — a Ray hiccup contributes zero.
+            try:
+                trunc = self._pool.fetch_tokenization_truncation_stats()
+                count = int(trunc.get("count", 0))
+                overflow_sum = int(trunc.get("overflow_sum", 0))
+                max_len = int(trunc.get("max_observed_len", 0))
+            except Exception:
+                count = 0
+                overflow_sum = 0
+                max_len = 0
+            stats["tokenization/truncated_count"] = count
+            stats["tokenization/overflow_sum_this_ep"] = overflow_sum
+            stats["tokenization/mean_overflow_per_trunc"] = (
+                float(overflow_sum / count) if count > 0 else 0.0
+            )
+            stats["tokenization/max_observed_len"] = max_len
+            if self._recycle_every > 0:
+                # Cascading recycle (mirror of PPO worker): kill ONE
+                # actor every ``recycle_every / N`` episodes so the
+                # pool rotates over the full ``recycle_every`` window
+                # but the memory spike is smeared. Mathematically
+                # equivalent to the old all-at-once ``recycle()`` for
+                # per-actor lifetime; just quieter at the system
+                # level.
+                n_pool = max(self._pool.size(), 1)
+                interval = max(1, self._recycle_every // n_pool)
+                if (
+                    self.train_step_counter > 0
+                    and (self.train_step_counter // max(self.args.minibatches, 1))
+                    % interval == 0
+                ):
+                    new_size = self._pool.recycle_one()
+                    stats["pool/recycled_at_step"] = self.train_step_counter
+                    stats["pool/size_after_recycle"] = new_size
+
+        # Periodic checkpoint (PPO mirror). The SIGTERM hook installed
+        # at __init__ also fires a final save on slurm timeout — this
+        # one bounds the progress lost on a non-clean exit.
+        if (
+            self._checkpoint_path
+            and self._checkpoint_every > 0
+            and self.train_step_counter > 0
+            and self.train_step_counter // max(self.args.minibatches, 1) % self._checkpoint_every == 0
+        ):
+            self._save_checkpoint_safe()
+            stats["checkpoint/saved_at_step"] = self.train_step_counter
 
         return stats
 
@@ -1022,8 +1178,30 @@ class SPMDServerWorker:
             return {}
         return self._pool.stats()
 
-    def reward_vec_means(self, rng_seed: int, num_rollouts: int) -> np.ndarray:
-        sum_vec = np.zeros((NUM_REWARDS,), dtype=np.float32)
+    def reward_vec_means(self, rng_seed: int, num_rollouts: int) -> dict:
+        """Per-channel calibration statistics over `num_rollouts`
+        zero-pref rollouts, with sentinel transitions filtered out.
+
+        Returns a dict with per-channel arrays (shape ``(NUM_REWARDS,)``):
+          * ``mean`` — per-channel mean (legacy ``mean_abs(symlog)`` path)
+          * ``median``, ``q25``, ``q75`` — raw-space quartiles
+          * ``median_symlog``, ``q25_symlog``, ``q75_symlog`` — symlog-space
+            quartiles so the driver can compute IQR-on-symlog
+          * ``count`` — number of valid samples (scalar)
+
+        Phase 4b: previously this averaged across ALL transitions and
+        a single cold-cache timeout could drag the per-channel mean
+        way down. Sentinel filtering protects against that; switching
+        to a robust statistic (IQR) on top further insulates the
+        calibration from outliers.
+        """
+        from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+        from alphagrad.approx.common.reward_scaling import (
+            filter_sentinel_mask,
+            symlog_np,
+        )
+
+        all_rows: list[np.ndarray] = []
         ds = self.state.get("data_sharding")
         mesh = self.state.get("mesh")
         num_devs = len(jax.devices()) if ds is not None else 1
@@ -1063,11 +1241,30 @@ class SPMDServerWorker:
                     self.state["reward_weights"],
                     jnp.asarray(self._pin_rules_default, dtype=jnp.bool_),
                 )
-                sum_vec += np.asarray(traj.reward_vec).sum(axis=(0, 1))
-        return sum_vec / max(
-            float(num_rollouts * self.state["num_envs"] * self.state["rollout_length"]),
-            1.0,
-        )
+                rv = np.asarray(traj.reward_vec)  # (N, T, NUM_REWARDS)
+                flat = rv.reshape(-1, NUM_REWARDS)
+                mask = filter_sentinel_mask(flat, SENTINEL_REWARD_VALUE)
+                if mask.any():
+                    all_rows.append(flat[mask])
+        if not all_rows:
+            zeros = np.zeros((NUM_REWARDS,), dtype=np.float32)
+            return {
+                "mean": zeros, "median": zeros, "q25": zeros, "q75": zeros,
+                "median_symlog": zeros, "q25_symlog": zeros, "q75_symlog": zeros,
+                "count": 0,
+            }
+        samples = np.concatenate(all_rows, axis=0).astype(np.float32)
+        samples_sl = symlog_np(samples).astype(np.float32)
+        return {
+            "mean": samples.mean(axis=0).astype(np.float32),
+            "median": np.median(samples, axis=0).astype(np.float32),
+            "q25": np.quantile(samples, 0.25, axis=0).astype(np.float32),
+            "q75": np.quantile(samples, 0.75, axis=0).astype(np.float32),
+            "median_symlog": np.median(samples_sl, axis=0).astype(np.float32),
+            "q25_symlog": np.quantile(samples_sl, 0.25, axis=0).astype(np.float32),
+            "q75_symlog": np.quantile(samples_sl, 0.75, axis=0).astype(np.float32),
+            "count": int(samples.shape[0]),
+        }
 
     def set_reward_weights(self, weights_np: np.ndarray) -> None:
         self.state["reward_weights"] = jnp.asarray(weights_np, dtype=jnp.float32)
@@ -1075,6 +1272,27 @@ class SPMDServerWorker:
     def checkpoint_replay(self, path: str) -> None:
         if self.replay_buffer is not None and path:
             save_replay_buffer(self.replay_buffer, path)
+
+    def _save_checkpoint_safe(self) -> None:
+        """Wrapped `save_state` that never raises. Used by the periodic
+        save below and the SIGTERM handler installed at __init__.
+        """
+        if not self._checkpoint_path:
+            return
+        try:
+            from alphagrad.approx.common.checkpoint import save_state
+            save_state(
+                self._checkpoint_path,
+                agent=self.state["agent"],
+                opt_state=self.state["opt_state"],
+                episode_counter=self.train_step_counter,
+                reward_weights=np.asarray(self.state["reward_weights"]),
+                multipliers=None,
+                replay_buffer=self.replay_buffer,
+                extras={"variant": str(self.variant)},
+            )
+        except Exception as exc:
+            print(f"[mu0_ray_worker] checkpoint save failed: {exc}")
 
     def ready(self) -> bool:
         return True

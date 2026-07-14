@@ -19,7 +19,9 @@ import numpy as np
 from alphagrad.approx.common.relations import compute_eqn_ids_from_tokens
 from graphax.core import _build_graph, extract_jaxpr, jacve, vertex_elimination_jaxpr
 from graphax.jaxpr import get_vocab as _graphax_get_vocab
-from graphax.sparse.micro_actions import COMPRESS_KINDS, Compress, Diag
+from graphax.sparse.micro_actions import (
+    COMPRESS_KINDS, QUANT_DTYPES, Compress, Diag, Quant,
+)
 from jax_memory_monitor import ResourceMonitor as _RealResourceMonitor
 
 
@@ -77,6 +79,86 @@ import math as _math
 _TOKEN_VOCAB, _, _ = _graphax_get_vocab()
 
 MAX_TOKENS = 4096
+
+# Per-process tokenization-truncation telemetry. ``_callback`` writes
+# here whenever the un-truncated jaxpr token sequence exceeds
+# ``MAX_TOKENS`` (so the slice on the next line is lossy). The first
+# occurrence inside a process emits a ``warnings.warn`` so the user
+# notices in stderr; subsequent occurrences are silent but counted.
+#
+# Three quantities are tracked because each answers a different
+# question:
+#   * ``count``           — HOW OFTEN was the clip lossy this period?
+#   * ``max_observed_len``— HOW BIG was the largest jaxpr, in tokens?
+#   * ``overflow_sum``    — HOW MUCH info did we throw away this
+#                           period? (= sum of ``raw_len - MAX_TOKENS``)
+#
+# ``consume_tokenization_truncation_stats`` returns these as a
+# delta-since-last-poll and resets them. Drivers poll once per rollout
+# so the wandb values land as PER-EPISODE numbers (not cumulative
+# across the run — wandb itself does the time-series aggregation).
+# Lists (not bare ints) because Python rebinding inside ``_callback``
+# would shadow a module-level int.
+_TOKENIZATION_TRUNCATION_COUNT: list[int] = [0]
+_TOKENIZATION_TRUNCATION_MAX_LEN: list[int] = [0]
+_TOKENIZATION_TRUNCATION_OVERFLOW_SUM: list[int] = [0]
+_TOKENIZATION_TRUNCATION_WARNED: list[bool] = [False]
+
+
+def _record_tokenization_truncation(raw_len: int) -> None:
+    """Bump the per-process truncation counter and emit a one-time
+    ``warnings.warn`` on the first observation. Cheap: a counter
+    increment + one branch. The warning carries the actual raw token
+    length so the user can see how much headroom they need.
+    """
+    if raw_len <= MAX_TOKENS:
+        return
+    overflow = raw_len - MAX_TOKENS
+    _TOKENIZATION_TRUNCATION_COUNT[0] += 1
+    _TOKENIZATION_TRUNCATION_OVERFLOW_SUM[0] += overflow
+    if raw_len > _TOKENIZATION_TRUNCATION_MAX_LEN[0]:
+        _TOKENIZATION_TRUNCATION_MAX_LEN[0] = raw_len
+    if not _TOKENIZATION_TRUNCATION_WARNED[0]:
+        import warnings
+        warnings.warn(
+            f"[alphagrad.approx.env] jaxpr tokenization truncated: "
+            f"raw_len={raw_len} > MAX_TOKENS={MAX_TOKENS} "
+            f"(overflow={overflow}). The policy will see a clipped "
+            f"observation for this step. Subsequent truncations are "
+            f"silent but counted "
+            f"(see ``tokenization/{{truncated_count, "
+            f"overflow_sum_this_ep}}`` in the wandb log).",
+            stacklevel=2,
+        )
+        _TOKENIZATION_TRUNCATION_WARNED[0] = True
+
+
+def consume_tokenization_truncation_stats() -> dict:
+    """Pop the per-episode (= per-poll) truncation telemetry.
+
+    Drivers call this once per rollout, so the returned numbers are
+    "since the last rollout" — not cumulative across the run. ``warned``
+    stays sticky so the warning never re-fires within the same process.
+
+    Returns:
+        Dict with:
+          * ``count`` — number of truncations this period.
+          * ``max_observed_len`` — largest raw token length this period.
+          * ``overflow_sum`` — sum of ``(raw_len - MAX_TOKENS)`` across
+            this period's truncations; per-episode information loss
+            (in tokens).
+    """
+    count = _TOKENIZATION_TRUNCATION_COUNT[0]
+    max_len = _TOKENIZATION_TRUNCATION_MAX_LEN[0]
+    overflow_sum = _TOKENIZATION_TRUNCATION_OVERFLOW_SUM[0]
+    _TOKENIZATION_TRUNCATION_COUNT[0] = 0
+    _TOKENIZATION_TRUNCATION_MAX_LEN[0] = 0
+    _TOKENIZATION_TRUNCATION_OVERFLOW_SUM[0] = 0
+    return {
+        "count": int(count),
+        "max_observed_len": int(max_len),
+        "overflow_sum": int(overflow_sum),
+    }
 # Upper bound on rule_specs rows per vertex. In dynamic-substeps mode this
 # also bounds the number of typed micro-actions per vertex that survive
 # :func:`micro_actions_to_rule_specs_jax` — set it to the same scale as
@@ -176,6 +258,17 @@ axis_pair_idx_to_base = {0: (0, 0), 1: (0, 1), 2: (1, 0), 3: (1, 1)}
 # fixed (graphax commit `fa0a088`).
 COMPRESS_SENTINEL = -2
 
+# Sentinel used in `sparsity_specs[v, slot, 0]` to flag a QUANT sub-step
+# (val.astype to a chosen JAX dtype). Row layout for a QUANT slot is
+# ``[QUANT_SENTINEL, dtype_idx, 0]`` where ``dtype_idx`` indexes
+# :data:`graphax.sparse.micro_actions.QUANT_DTYPES`. Sequential semantics:
+# multiple QUANT slots on the same vertex chain through ``val.astype(...)``
+# in order, last one wins (the SparseTensor's val dtype reflects the final
+# Quant in the slot sequence). QUANT only mutates ``val.dtype`` — axis
+# state stays untouched, so per-vertex `axis_state` updates ignore the
+# sentinel.
+QUANT_SENTINEL = -3
+
 
 class EnvState(NamedTuple):
     order: Array
@@ -188,7 +281,11 @@ class EnvState(NamedTuple):
     #   row[0] == COMPRESS_SENTINEL: COMPRESS with axis `row[1]` (physical
     #                                index into the SparseTensor edge:
     #                                out axes 0..out_len-1, then primal
-    #                                axes out_len.. ). row[2] unused.
+    #                                axes out_len.. ) and `row[2]` indexes
+    #                                :data:`COMPRESS_KINDS`.
+    #   row[0] == QUANT_SENTINEL:    QUANT with `row[1]` indexing
+    #                                :data:`QUANT_DTYPES`. `row[2]` is
+    #                                unused (kept at 0).
     #   row[0] == -1:                end-of-sequence sentinel; every slot
     #                                past it is treated as unused.
     sparsity_specs: Array
@@ -431,12 +528,13 @@ def micro_actions_to_rule_specs(
     *,
     axis_state_for_vertex,
     compress_kinds=None,
+    quant_dtypes=None,
 ):
     """Translate a sub-episode's typed micro-actions into legacy rule_specs.
 
     Args:
         op_types: (S,) int32 — per-sub-step op type (heads.py OP_DIAG /
-            OP_COMPRESS / OP_END).
+            OP_COMPRESS / OP_QUANT / OP_END).
         i_indices: (S,) int32 — axis-token index for `i` (DIAG and COMPRESS).
         j_indices: (S,) int32 — axis-token index for `j` (DIAG only).
         factors: (S,) int32 — explicit positive factor (DIAG only),
@@ -448,12 +546,19 @@ def micro_actions_to_rule_specs(
             axis token (column ``_AXIS_FEAT_IS_OUTPUT``) determines which
             side of the pair it lands on; the relative position is the
             running count of output-or-primal axes encountered before it.
+        compress_kinds: optional (S,) int32 — index into
+            :data:`COMPRESS_KINDS` per sub-step (only meaningful for
+            COMPRESS rows; zeros default to ``"mean"``).
+        quant_dtypes: optional (S,) int32 — index into
+            :data:`QUANT_DTYPES` per sub-step (only meaningful for QUANT
+            rows; zeros default to the first catalog entry).
 
     Returns:
         rule_specs: ``(MAX_RULES_PER_VERTEX, 3)`` int32 — same layout
         the env consumes. DIAG rows are ``[bi1, bi2, factor]``;
-        COMPRESS rows are ``[COMPRESS_SENTINEL, physical_axis, kind_idx]``
-        where ``kind_idx`` indexes :data:`COMPRESS_KINDS`.
+        COMPRESS rows are ``[COMPRESS_SENTINEL, physical_axis, kind_idx]``;
+        QUANT rows are ``[QUANT_SENTINEL, dtype_idx, 0]`` where
+        ``dtype_idx`` indexes :data:`QUANT_DTYPES`.
         Slots past the first ``OP_END`` (or past ``MAX_RULES_PER_VERTEX``,
         whichever comes first) are filled with the unused sentinel
         ``[-1, -1, 0]``.
@@ -461,7 +566,7 @@ def micro_actions_to_rule_specs(
     # Lazy import to avoid circular dependency at module import time —
     # heads.py imports nothing from env.py but env.py only needs the
     # heads.py constants when this translator is actually invoked.
-    from alphagrad.approx.heads import OP_COMPRESS, OP_DIAG, OP_END
+    from alphagrad.approx.heads import OP_COMPRESS, OP_DIAG, OP_END, OP_QUANT
 
     op_types_arr = np.asarray(op_types)
     i_arr = np.asarray(i_indices)
@@ -471,6 +576,10 @@ def micro_actions_to_rule_specs(
         k_arr = np.zeros_like(op_types_arr)
     else:
         k_arr = np.asarray(compress_kinds)
+    if quant_dtypes is None:
+        q_arr = np.zeros_like(op_types_arr)
+    else:
+        q_arr = np.asarray(quant_dtypes)
     axis_state_np = np.asarray(axis_state_for_vertex)
 
     n_out = int(np.sum(axis_state_np[:, _AXIS_FEAT_IS_OUTPUT]))
@@ -504,6 +613,18 @@ def micro_actions_to_rule_specs(
             specs[slot, 0] = COMPRESS_SENTINEL
             specs[slot, 1] = physical_axis
             specs[slot, 2] = int(k_arr[s_idx])
+            slot += 1
+            continue
+        if op == OP_QUANT:
+            # QUANT casts SparseTensor.val to QUANT_DTYPES[dtype_idx]. Stored
+            # as `(QUANT_SENTINEL, dtype_idx, 0)`; `_callback` emits
+            # `Quant(dtype=QUANT_DTYPES[dtype_idx])`. The third column is
+            # reserved (kept at 0) — Quant carries no axis or factor state.
+            if slot >= MAX_RULES_PER_VERTEX:
+                break
+            specs[slot, 0] = QUANT_SENTINEL
+            specs[slot, 1] = int(q_arr[s_idx])
+            specs[slot, 2] = 0
             slot += 1
             continue
         if op != OP_DIAG:
@@ -545,8 +666,9 @@ def micro_actions_to_rule_specs_jax(
     factors,
     axis_state_for_vertex,
     compress_kinds=None,
+    quant_dtypes=None,
 ):
-    """JAX-traceable MicroAction → rule_specs (DIAG and COMPRESS).
+    """JAX-traceable MicroAction → rule_specs (DIAG, COMPRESS, and QUANT).
 
     Differs from :func:`micro_actions_to_rule_specs` in that the entire
     transform is JAX-tracer-friendly — no Python loops over sub-steps,
@@ -565,13 +687,19 @@ def micro_actions_to_rule_specs_jax(
       indexes :data:`graphax.sparse.micro_actions.COMPRESS_KINDS`. The
       env's `_callback` recognises the sentinel and emits a graphax
       `Compress(axes=(axis,), kind=COMPRESS_KINDS[kind_idx])`.
+    * Each QUANT sub-step writes a `[QUANT_SENTINEL, dtype_idx, 0]` row
+      where ``dtype_idx`` indexes
+      :data:`graphax.sparse.micro_actions.QUANT_DTYPES`. The env's
+      ``_callback`` emits a graphax
+      ``Quant(dtype=QUANT_DTYPES[dtype_idx])``.
     * `op_type == OP_END` and every sub-step after the first END are
       marked unused.
     * The output is truncated to ``MAX_RULES_PER_VERTEX`` rows; trailing
       sub-steps beyond the legacy capacity are dropped. The policy's
       ``max_substeps`` should be ≤ ``MAX_RULES_PER_VERTEX`` to avoid
       silent truncation, or the trainer should accept the truncation
-      (the dropped DIAGs become no-ops from the env's perspective).
+      (the dropped DIAGs / COMPRESSes / QUANTs become no-ops from the
+      env's perspective).
 
     Args:
         op_types: (max_substeps,) int32 — heads.py OP_* values.
@@ -581,6 +709,10 @@ def micro_actions_to_rule_specs_jax(
             by the prime-exponent head (already collapsed from exponents).
         axis_state_for_vertex: ``(MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM)``
             int32 — per-vertex axis features from EnvState.
+        compress_kinds: optional (max_substeps,) int32 — index into
+            :data:`COMPRESS_KINDS` per sub-step (only used for COMPRESS).
+        quant_dtypes: optional (max_substeps,) int32 — index into
+            :data:`QUANT_DTYPES` per sub-step (only used for QUANT).
 
     Returns:
         rule_specs: ``(MAX_RULES_PER_VERTEX, 3)`` int32 in the legacy
@@ -589,13 +721,15 @@ def micro_actions_to_rule_specs_jax(
     """
     # Lazy import — heads.py imports nothing from env.py, but env.py
     # only needs the heads.py constants when this translator runs.
-    from alphagrad.approx.heads import OP_COMPRESS, OP_DIAG, OP_END
+    from alphagrad.approx.heads import OP_COMPRESS, OP_DIAG, OP_END, OP_QUANT
 
     is_output = axis_state_for_vertex[:, _AXIS_FEAT_IS_OUTPUT].astype(jnp.int32)
     n_out = jnp.sum(is_output)
 
     if compress_kinds is None:
         compress_kinds = jnp.zeros_like(op_types)
+    if quant_dtypes is None:
+        quant_dtypes = jnp.zeros_like(op_types)
 
     is_end_per = (op_types == OP_END)
     prior_ends = (
@@ -604,6 +738,7 @@ def micro_actions_to_rule_specs_jax(
     active = (prior_ends == 0)
     is_diag = (op_types == OP_DIAG)
     is_compress = (op_types == OP_COMPRESS)
+    is_quant = (op_types == OP_QUANT)
 
     def _row(s_idx):
         i = i_indices[s_idx]
@@ -632,22 +767,38 @@ def micro_actions_to_rule_specs_jax(
         compress_bi1 = jnp.asarray(COMPRESS_SENTINEL, dtype=jnp.int32)
         compress_bi2 = i.astype(jnp.int32)
 
-        # Compose the row. Priority: COMPRESS over DIAG over unused
-        # (these branches are mutually exclusive because is_compress and
-        # is_diag look at the same op_type slot). For DIAG the third
-        # column carries the integer factor; for COMPRESS it carries the
-        # `compress_kind` index into :data:`COMPRESS_KINDS`.
+        # QUANT spec: bi1 = QUANT_SENTINEL (-3), bi2 = dtype index into
+        # :data:`QUANT_DTYPES`. The third column is unused for QUANT (kept
+        # at 0). ``_callback`` emits ``Quant(dtype=QUANT_DTYPES[bi2])`` and
+        # graphax's apply_quant casts ``val`` only.
+        quant_used = active[s_idx] & is_quant[s_idx]
+        quant_bi1 = jnp.asarray(QUANT_SENTINEL, dtype=jnp.int32)
+        quant_bi2 = quant_dtypes[s_idx].astype(jnp.int32)
+
+        # Compose the row. Priority: QUANT > COMPRESS > DIAG > unused —
+        # the *_used flags are mutually exclusive because they each gate
+        # on the same op_type slot, so order is just for readability.
+        # Third column: DIAG → factor; COMPRESS → kind index; QUANT → 0.
         bi1 = jnp.where(
-            compress_used, compress_bi1,
-            jnp.where(diag_used, diag_bi1, -1),
+            quant_used, quant_bi1,
+            jnp.where(
+                compress_used, compress_bi1,
+                jnp.where(diag_used, diag_bi1, -1),
+            ),
         ).astype(jnp.int32)
         bi2 = jnp.where(
-            compress_used, compress_bi2,
-            jnp.where(diag_used, diag_bi2, -1),
+            quant_used, quant_bi2,
+            jnp.where(
+                compress_used, compress_bi2,
+                jnp.where(diag_used, diag_bi2, -1),
+            ),
         ).astype(jnp.int32)
         f = jnp.where(
-            compress_used, compress_kinds[s_idx],
-            jnp.where(diag_used, factors[s_idx], 0),
+            quant_used, jnp.asarray(0, dtype=jnp.int32),
+            jnp.where(
+                compress_used, compress_kinds[s_idx],
+                jnp.where(diag_used, factors[s_idx], 0),
+            ),
         ).astype(jnp.int32)
         return jnp.stack([bi1, bi2, f])
 
@@ -716,6 +867,12 @@ def _quality_metrics(jac_exact, jac_approx):
     Returns the trivial `(1.0, 0.0)` (perfect agreement) when either side has
     no leaves, mismatched shapes, or zero size, mirroring the original `error`
     fallback so a degenerate plan can't poison downstream normalisation.
+
+    ``ALPHAGRAD_DEBUG_QUALITY=1`` enables a one-line diagnostic print
+    when cosine_sim collapses to ~0 with non-zero norms — used to
+    investigate the persistent ``reward_mean/cosine_sim=0`` we see
+    on the PPO dynamic-substeps path. The print fires only when the
+    formula would have produced a meaningful value but didn't.
     """
     flat_exact = _flatten_jacobians(jac_exact)
     flat_approx = _flatten_jacobians(jac_approx)
@@ -723,10 +880,26 @@ def _quality_metrics(jac_exact, jac_approx):
         return jnp.array(1.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32)
     if flat_approx.shape != flat_exact.shape or flat_approx.size == 0:
         return jnp.array(1.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32)
+
     cos = cossim(flat_exact, flat_approx)
     exact_norm = jnp.linalg.norm(flat_exact)
     resid_norm = jnp.linalg.norm(flat_exact - flat_approx)
     rel_frob = resid_norm / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
+
+    if os.environ.get("ALPHAGRAD_DEBUG_QUALITY", "0") == "1":
+        approx_norm = float(jnp.linalg.norm(flat_approx))
+        e_norm = float(exact_norm)
+        # Now that ``_callback`` only invokes ``_quality_metrics`` on
+        # the terminal step (partial-order zero-Jacobian case is
+        # short-circuited upstream), every line here represents a
+        # real terminal evaluation. ``flush=True`` because Ray actor
+        # stdout is line-buffered.
+        print(
+            f"[quality-debug] cos={float(cos):+.4f} frob={float(rel_frob):+.4f} "
+            f"||exact||={e_norm:.3g} ||approx||={approx_norm:.3g} "
+            f"size={flat_exact.size}",
+            flush=True,
+        )
     return cos, rel_frob
 
 
@@ -745,16 +918,19 @@ def _aggregate_samples(values, want_top_quartile: bool):
     return stack.mean()
 
 
-# The in-process LRU around `jit(jacve(...)).lower().compile()` that lived
-# here was thrashing under the actual rollout distribution: hit rate stayed
-# at ~2 % at startup and only climbed to ~11 % after ~15 episodes, meaning
-# we paid the full Executable allocation on virtually every call AND held
-# 64 stale entries on the side. Dropping the cache is a net win — the host
-# allocator's behaviour without the side-table is no worse than with the
-# thrashing LRU, and removing it eliminates the second source of
-# accumulated `HloModule` references hanging off OrderedDict slots.
-# See cpu_approx_worker.py for the Ray-actor path that bounds the
-# remaining `cost_analysis()` C++ leak by recycling workers.
+# Compile cache: the original in-process LRU thrashed (2-11% hit rate)
+# because Ray's round-robin dispatch sent the same (order, specs) tuple
+# to different actors. Sticky routing was tried next and lifted hit rate
+# to ~15%, but the per-actor cache memory offset the savings — wall-time
+# was ~20% faster, leak rate basically unchanged.
+#
+# The current strategy lives in ``alphagrad.approx.common.compile_cache``:
+# a single Ray named-actor (``CompileCacheCoordinator``) owns a
+# ``key -> ObjectRef`` table. Any actor that compiles serialises via
+# ``jax.experimental.serialize_executable`` and ``ray.put``s the blob;
+# subsequent calls (from ANY actor) fetch the blob and
+# ``deserialize_and_load`` locally. Hit rate becomes cluster-wide
+# rather than per-actor, multiplying effective coverage.
 
 
 def _callback(
@@ -810,7 +986,7 @@ def _callback(
         if not primal_shapes:
             continue  # no non-literal inputs → no edges to transform
 
-        rules: list = []  # mixed list[Diag | Compress]
+        rules: list = []  # mixed list[Diag | Compress | Quant]
         used_axes: set[int] = set()
         for slot in range(MAX_RULES_PER_VERTEX):
             row = specs_list[v_idx][slot]
@@ -819,6 +995,18 @@ def _callback(
             factor = int(row[2])
             if bi1 == -1:
                 break  # end-of-sequence sentinel
+            if bi1 == QUANT_SENTINEL:
+                # QUANT slot: row[1] is the dtype index into QUANT_DTYPES,
+                # row[2] is unused. Unlike Compress, Quant doesn't touch
+                # axes or `val.ndim`, so it's safe on any vertex (no
+                # shape-preservation issue with downstream eliminations).
+                # Out-of-range dtype indices silently fall back to the
+                # first catalog entry rather than crashing the callback.
+                dtype_idx = bi2
+                if not (0 <= dtype_idx < len(QUANT_DTYPES)):
+                    dtype_idx = 0
+                rules.append(Quant(dtype=QUANT_DTYPES[dtype_idx]))
+                continue
             if bi1 == COMPRESS_SENTINEL:
                 # COMPRESS slot: row[1] is the *physical* axis index in the
                 # SparseTensor edge (same layout as Diag's idx: out axes 0..
@@ -916,7 +1104,12 @@ def _callback(
         consts,
         transforms=transforms,
     )
-    tokens = ve.tokenized()[:MAX_TOKENS]
+    # Measure the raw token length before slicing so we can detect
+    # truncation. ``_record_tokenization_truncation`` is a no-op for
+    # short sequences (the common case) and is cheap otherwise.
+    raw_tokens = ve.tokenized()
+    _record_tokenization_truncation(int(raw_tokens.shape[0]))
+    tokens = raw_tokens[:MAX_TOKENS]
     tokens = jnp.pad(tokens, (0, MAX_TOKENS - tokens.shape[0]))
 
     # Compute per-token equation IDs once for the relational-bias encoder
@@ -990,41 +1183,81 @@ def _callback(
         else args
     )
 
-    # Per-call jit + lower + compile. The previous LRU around this didn't
-    # pay off (~2 % hit at startup, only ~11 % after 15 eps); the trainer
-    # is host-bound on the Executable allocation either way, so the
-    # cleanest thing is to not hold them on the side. The Ray-actor pool
-    # in `cpu_approx_worker` is where we'll bound the residual
-    # `cost_analysis()` C++ allocation, via periodic actor recycling.
-    compiled_approx = (
-        jax.jit(
-            jacve(
-                config.target_fun,
-                list(o_list),
-                argnums=config.argnums,
-                has_aux=config.has_aux,
-                sparse_representation=config.sparse,
-                transforms=transforms,
-            ),
-            keep_unused=True,
+    # Per-call jit + lower + compile, wrapped by the cluster-wide
+    # cache in ``alphagrad.approx.common.compile_cache``. The
+    # coordinator named-actor holds ``key -> ObjectRef`` to a
+    # serialised executable (StableHLO + pytree metadata, pickled).
+    # On a hit, the calling actor ``ray.get``\\s the blob and
+    # ``deserialize_and_load``\\s it locally — no fresh compile, no
+    # XLA Executable allocation, no JAX-tracing residue. On a miss,
+    # the actor compiles, ``ray.put``\\s the serialised form, and
+    # registers the ref so the next actor that needs it skips
+    # compilation entirely.
+    #
+    # The (approx, exact) pair share a compile target almost always
+    # (same o_list, same args), so we cache both as a 2-tuple under
+    # a single key. The shape signature is part of the key because
+    # ``jacve`` produces a different traced function per shape.
+    from alphagrad.approx.common.compile_cache import cached_compile
+    import hashlib
+    h = hashlib.blake2b(digest_size=16)
+    h.update(np.asarray(order, dtype=np.int32).tobytes())
+    h.update(np.asarray(sparsity_specs, dtype=np.int32).tobytes())
+    h.update(int(stop).to_bytes(4, "little", signed=False))
+    # Include the shape signature of args_for_lower so we don't
+    # collide across rollouts that share (order, specs) but differ
+    # in batch shape.
+    for a in args_for_lower:
+        if hasattr(a, "shape") and hasattr(a, "dtype"):
+            h.update(repr(a.shape).encode())
+            h.update(repr(a.dtype).encode())
+    cache_key = h.digest()
+
+    def _do_compile_approx():
+        return (
+            jax.jit(
+                jacve(
+                    config.target_fun,
+                    list(o_list),
+                    argnums=config.argnums,
+                    has_aux=config.has_aux,
+                    sparse_representation=config.sparse,
+                    transforms=transforms,
+                ),
+                keep_unused=True,
+            )
+            .lower(*args_for_lower)
+            .compile()
         )
-        .lower(*args_for_lower)
-        .compile()
-    )
-    compiled_exact = (
-        jax.jit(
-            jacve(
-                config.target_fun,
-                list(o_list),
-                argnums=config.argnums,
-                has_aux=config.has_aux,
-                sparse_representation=config.sparse,
-            ),
-            keep_unused=True,
+
+    def _do_compile_exact():
+        return (
+            jax.jit(
+                jacve(
+                    config.target_fun,
+                    list(o_list),
+                    argnums=config.argnums,
+                    has_aux=config.has_aux,
+                    sparse_representation=config.sparse,
+                ),
+                keep_unused=True,
+            )
+            .lower(*args_for_lower)
+            .compile()
         )
-        .lower(*args_for_lower)
-        .compile()
-    )
+
+    compiled_approx = cached_compile(b"approx:" + cache_key, _do_compile_approx)
+    # ``compiled_exact`` is ONLY needed for the quality metrics
+    # (cosine_sim, frob_residual). Those are meaningful only when the
+    # elimination order is complete — graphax's ``jacve`` returns a
+    # zero-norm Jacobian for any partial order, so comparing approx vs
+    # exact mid-rollout yields ``(cos=0, frob=0)`` regardless. Skip
+    # the compile + execute when the step is non-terminal; the cache
+    # entry would never be re-used productively anyway.
+    if is_terminal:
+        compiled_exact = cached_compile(b"exact:" + cache_key, _do_compile_exact)
+    else:
+        compiled_exact = None
 
     # XLA cost analysis — flops + bytes accessed. Falls back to 0 when the
     # backend doesn't expose them (CPU sometimes returns an empty dict).
@@ -1109,9 +1342,16 @@ def _callback(
             latency_samples.append(latency_s * 1e9)  # → ns
             peak_mem_samples.append(peak_bytes)
 
-        out_exact = compiled_exact(*eval_args_i)
         out_approxs.append(out_approx)
-        out_exacts.append(out_exact)
+        # ``compiled_exact`` is only executed at the terminal step
+        # (see the ``is_terminal`` guard around its compile, above).
+        # For non-terminal steps we still loop n_samples times for
+        # ``compiled_approx`` (peak_memory + latency need it), but
+        # we skip the gold-standard execution that the quality
+        # comparison would otherwise consume.
+        if compiled_exact is not None:
+            out_exact = compiled_exact(*eval_args_i)
+            out_exacts.append(out_exact)
 
     latency_ns = (
         float(_aggregate_samples(latency_samples, want_top_quartile=True))
@@ -1123,17 +1363,27 @@ def _callback(
     # ------------------------------------------------------------------
     # Quality family — cosine similarity + relative Frobenius residual.
     # ------------------------------------------------------------------
-    cosines: list = []
-    frobs: list = []
-    for out_approx, out_exact in zip(out_approxs, out_exacts):
-        jac_approx = out_approx[1] if config.has_aux else out_approx
-        jac_exact = out_exact[1] if config.has_aux else out_exact
-        cos, rel_frob = _quality_metrics(jac_exact, jac_approx)
-        cosines.append(cos)
-        frobs.append(rel_frob)
-
-    cosine_sim = float(_aggregate_samples(cosines, want_top_quartile=True))
-    frob_residual = float(_aggregate_samples(frobs, want_top_quartile=True))
+    # Sparse-terminal channels: only computed on the terminal step
+    # of the rollout. Partial elimination orders produce
+    # ``||jac||=0`` for both ``compiled_approx`` and ``compiled_exact``
+    # (verified empirically against graphax.jacve), so the
+    # comparison is meaningless mid-rollout. Skip the work entirely
+    # — the cost channels above (muls/io/flops/peak_memory) still
+    # compute per step, only quality is sparse.
+    if is_terminal and out_exacts:
+        cosines: list = []
+        frobs: list = []
+        for out_approx, out_exact in zip(out_approxs, out_exacts):
+            jac_approx = out_approx[1] if config.has_aux else out_approx
+            jac_exact = out_exact[1] if config.has_aux else out_exact
+            cos, rel_frob = _quality_metrics(jac_exact, jac_approx)
+            cosines.append(cos)
+            frobs.append(rel_frob)
+        cosine_sim = float(_aggregate_samples(cosines, want_top_quartile=True))
+        frob_residual = float(_aggregate_samples(frobs, want_top_quartile=True))
+    else:
+        cosine_sim = 0.0
+        frob_residual = 0.0
 
     rewards = jnp.array(
         [
