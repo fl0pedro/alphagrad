@@ -430,6 +430,8 @@ class AppendOnlyStream:
         for sv in graph:
             for dv in graph[sv]:
                 st = _force(graph[sv][dv])
+                if st is None:
+                    continue  # no-Jacobian edge (e.g. stop_gradient); skip (mirrors _eliminate_vertex None-edge skip)
                 n_out = len(st.out_dims)
                 n_prim = len(st.primal_dims)
                 # edge constant leaf var
@@ -988,6 +990,24 @@ class ProposerTokenizer:
     def order_token_ids(self, action_idxs):
         """Full append-only token IDS (persistent vocab) for the order."""
         return self.vocab.encode(self.order_tokens(action_idxs))
+
+    def order_token_ids_micro(self, actions):
+        """Append-only token IDS for a MICRO-bearing partial order.
+
+        ``actions`` = [(action_idx, rules)] with ``rules`` a tuple of graphax
+        Diag/Compress/Quant objects (or None/()). Mirrors env._callback's
+        append-only path: eliminate, diff the edge set, emit micro blocks for
+        the newly created edges. Pure Python — no re-trace.
+        """
+        s = self._template
+        s.reset_to_base()
+        for a, rules in actions:
+            pre = set(s._edges.keys())
+            s.eliminate(int(self.valid[int(a)]), symbolic=True)
+            if rules:
+                new_edges = [k for k in s._edges.keys() if k not in pre]
+                s.emit_micro_blocks(new_edges, tuple(rules))
+        return self.vocab.encode(s.tokens())
 
     def block_token_ids(self, action_idxs):
         """Return (base_ids, [per-block delta ids...]) for incremental encode.

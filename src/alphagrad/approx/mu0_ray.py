@@ -144,6 +144,10 @@ def _run_one_variant(args, variant: str) -> None:
     # Propagate ALPHAGRAD_* / JAX_COMPILATION_* debug switches so a
     # single ``sbatch --export`` reaches the SPMD actor too. Without
     # this the actor inherits stock env and the toggles silently no-op.
+    # Forward XLA_FLAGS (e.g. --xla_gpu_autotune_level=0) so the SPMD actor
+    # does NOT segfault in the XLA autotuner on Blackwell during mctx compile.
+    if os.environ.get("XLA_FLAGS"):
+        spmd_env_vars["XLA_FLAGS"] = os.environ["XLA_FLAGS"]
     for k, v in os.environ.items():
         if k.startswith("ALPHAGRAD_") or k.startswith("JAX_COMPILATION_"):
             spmd_env_vars[k] = v

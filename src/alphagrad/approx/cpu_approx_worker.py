@@ -676,6 +676,7 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         closed_jaxpr,
         args=xs,
         argnums=argnums,
+        sparse=(os.environ.get("ALPHAGRAD_SPARSE", "0") == "1"),
         num_envs=0,
         data_gen=gen,
         target_fun=env_target_fun,

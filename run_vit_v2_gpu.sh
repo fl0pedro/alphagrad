@@ -175,6 +175,18 @@ export ALPHAGRAD_BKSTEP=1
 export ALPHAGRAD_BKSTEP_K="${ALPHAGRAD_BKSTEP_K:-40}"
 export ALPHAGRAD_BKSTEP_SEEDS="${ALPHAGRAD_BKSTEP_SEEDS:-2}"
 
+# >>> ViT MEASURABILITY FIX STACK (bridge-cse) <<<
+# (1) POW2 ViT internal dims: pad the token sequence 17->32 so every internal
+#     weight tensor is a power of two — kills the non-pow2 ``slice
+#     limit_indices`` graphax shape-storm (166 dim-17 -> 2 in the jaxpr). MNIST
+#     input(784)/output(10) untouched. Revert with ALPHAGRAD_VIT_POW2=0.
+export ALPHAGRAD_VIT_POW2="${ALPHAGRAD_VIT_POW2:-1}"
+# (2) peak_memory reward reads the ABSOLUTE device high-water mark (baseline+peak)
+#     rather than the near-zero entry-delta of a cached executable, so the
+#     channel carries a real non-zero GPU peak. Revert with =0.
+export ALPHAGRAD_PEAK_MEMORY_ABSOLUTE="${ALPHAGRAD_PEAK_MEMORY_ABSOLUTE:-1}"
+# (3) B_kstep probe is now dynamic over the 18-arg ViT (no env flag needed).
+
 # >>> UN-SCALED COSSIM (user request, bridge-cse) <<<
 # The cosine_sim channel now enters the reward in its REGULAR RAW RANGE,
 # UNSCALARIZED except for PopArt's per-channel normalisation:

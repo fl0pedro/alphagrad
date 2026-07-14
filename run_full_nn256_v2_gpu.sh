@@ -201,7 +201,7 @@ CAMP="${CAMP:-campaign_full_nn256_v2}"
 RAY_PORT="${RAY_PORT:-6384}"
 SEED="${SEED:-2000}"
 NUM_ENVS="${NUM_ENVS:-4}"
-MBS="${MBS:-32}"
+MBS="${MBS:-4}"
 LAMBDA_ACC="${LAMBDA_ACC:-1.0}"
 # w_outer for the cost channels. lambda is now INSIDE the symlog (per-channel
 # ALPHAGRAD_INNER_LAMBDA_* above); this OUTER weight just scales the whole

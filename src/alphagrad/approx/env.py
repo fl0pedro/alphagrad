@@ -1221,11 +1221,11 @@ def _legacy_sp_to_specs(sp_type: Array) -> Array:
 
 @jax.jit
 def cossim(target, preds):
-    target = target / jnp.maximum(
-        jnp.linalg.norm(target, keepdims=True), jnp.sqrt(1e-7)
-    )
-    preds = preds / jnp.maximum(jnp.linalg.norm(preds, keepdims=True), jnp.sqrt(1e-7))
-    return jnp.sum(target * preds)
+    # Floor the PRODUCT of norms at a tiny eps (not each vector by sqrt(1e-7)).
+    # The old per-vector floor made cos(v,v) = ||v||^2/1e-7 < 1 for a tiny (but
+    # IDENTICAL) gradient -> exact/pure-order solutions wrongly scored cos~0.02.
+    denom = jnp.maximum(jnp.linalg.norm(target) * jnp.linalg.norm(preds), 1e-30)
+    return jnp.sum(target * preds) / denom
 
 
 sp_type_to_map = {1: (0, 0), 2: (0, 1), 3: (1, 0), 4: (1, 1)}
@@ -3198,6 +3198,11 @@ def _callback(
     if raw_sink is not None:
         raw_sink["muls_adds_fmas"] = float(muls_adds_fmas)
         raw_sink["max_io_sum"] = float(max_io_sum)
+        # Separate graphax op-counts (log-only; summed into muls_adds_fmas
+        # above). ``aux`` is the count_ops=True dict already in scope.
+        raw_sink["adds"] = float(aux["adds"])
+        raw_sink["muls"] = float(aux["muls"])
+        raw_sink["fmas"] = float(aux["fmas"])
         raw_sink["flops"] = float(flops)
         raw_sink["bytes_accessed"] = float(bytes_accessed)
         raw_sink["latency_ns_samples"] = (
