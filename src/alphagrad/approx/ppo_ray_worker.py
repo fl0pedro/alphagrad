@@ -504,7 +504,7 @@ class MicroPPOAgent(eqx.Module):
         max_substeps: int = 16,
         policy: str = "transformer",
     ):
-        from alphagrad.transformer import MLP, Encoder, PositionalEncoder
+        from alphagrad.transformer import MLP, Encoder, PositionalEncoder, make_encoder
         # Lazy: only the micro-policy path pays for the 6k-line ppo module.
         from alphagrad.approx.ppo import PointerVertexPolicy
 

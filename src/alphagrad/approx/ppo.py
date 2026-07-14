@@ -2374,14 +2374,6 @@ def make_argparser() -> argparse.ArgumentParser:
         help="Multiplier applied to output-head weights at startup for a near-uniform initial policy.",
     )
     p.add_argument(
-        "--pretrained-encoder",
-        type=str,
-        default=None,
-        help="Path to a `PretrainModel` saved by `alphagrad.approx.pretrain` "
-        "(Stage B.5). When set, the embedding/pos_enc/encoder modules "
-        "of the freshly-built agent are replaced with the pretrained ones.",
-    )
-    p.add_argument(
         "--cache-encoding",
         action="store_true",
         help="Stage B.4.next: encode the residual jaxpr once at the start "
@@ -4188,12 +4180,6 @@ def main():
     )
     agent = init_linear_weights(agent, init_key)
     agent = _scale_output_heads(agent, args.head_init_scale, use_pointer, use_autoreg)
-    if args.pretrained_encoder:
-        from alphagrad.approx.pretrain import load_pretrained_encoder
-
-        agent = load_pretrained_encoder(args.pretrained_encoder, agent)
-        print(f"Loaded pretrained encoder from {args.pretrained_encoder}")
-
     # Stage D: build per-head boolean parameter masks once. Used inside
     # train_minibatch to scale gradients by the head-specific LR multiplier
     # (warm-up ramp from §3.2). Masks are pytree leaves aligned with the

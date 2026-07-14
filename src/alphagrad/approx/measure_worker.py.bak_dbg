@@ -70,12 +70,8 @@ for order_ids in orders:
         cos_pp = rs.get("cosine_sim_per_point", [])
         cos = float(np.mean(cos_pp)) if cos_pp else float("nan")
         r = [lat, peak, flops, cos]
-        if not all(np.isfinite(x) for x in r):
-            print(f"[mw-nan] lat={lat} peak={peak} flops={flops} cos={cos} "
-                  f"lat_n={len(lat_s)} cos_n={len(cos_pp)} keys={sorted(rs.keys())}", file=sys.stderr, flush=True)
         results.append(r if all(np.isfinite(x) for x in r) else None)
     except Exception as e:
-        import traceback; traceback.print_exc(file=sys.stderr); sys.stderr.flush()
         results.append(None)
 json.dump({"results": results}, open(out_path, "w"))
 print(f"[mw] measured {sum(1 for r in results if r)}/{len(orders)} on {os.environ.get('CUDA_VISIBLE_DEVICES','?')}", flush=True)
