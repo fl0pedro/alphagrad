@@ -157,15 +157,6 @@ export ALPHAGRAD_POPART_PURE_ADV="${ALPHAGRAD_POPART_PURE_ADV:-1}"
 # forget-gate modulation (same construction as palimpsa_bi).
 export ALPHAGRAD_POLICY=palimpsa
 
-# >>> POLICY V2 (this launcher's whole point) <<<
-# ALPHAGRAD_RAY_MICROPOLICY=1 swaps SimplePPOAgent for MicroPPOAgent on the
-# Ray PPO path: PointerVertexPolicy (per-vertex queries cross-attending the
-# per-token encoder embeddings) + heads.MicroActionPolicy (autoregressive
-# typed sub-episodes, REAL --max-substeps with sticky END + hard cap, gated
-# joint log-prob/entropy) + a separate attention pool for the 10-channel
-# value head. Reward stack / stabilisation fixes are untouched.
-export ALPHAGRAD_RAY_MICROPOLICY="${ALPHAGRAD_RAY_MICROPOLICY:-1}"
-
 # >>> B_kstep TRAINABILITY as the acc reward channel <<<
 # ALPHAGRAD_ACC_PROXY=bkstep routes the --rewards acc weight to the B_kstep
 # channel (idx 9) instead of cosine_sim; ALPHAGRAD_BKSTEP=1 turns on the probe
@@ -319,20 +310,15 @@ EXEC_ON_GPU_FLAG=$([ "${EXEC_ON_GPU:-1}" = 1 ] && echo --exec-on-gpu)
 SEED_VERTICES_FLAG=$([ "${SEED_VERTICES:-0}" = 1 ] && [ "$MEASURE_GRAD" = 1 ] && echo --seed-vertices)
 REWARDS_FLAG=$([ "${ALPHAGRAD_REWARD_ALL_CHANNELS:-0}" = 1 ] && echo all || echo "cmp mem acc")
 
-# >>> P3O (Fakoor et al. 2020) off-policy option (bridge-cse) <<<
-# P3O=1 enables the combined on-policy + off-policy(replay) PG + KL objective
-# (--p3o). Requires a replay buffer (REPLAY_BUFFER_SIZE>0). P3O=0 (default) =
-# on-policy PPO (unchanged). V-trace clips reuse --vtrace-rho-bar/c-bar; the KL
-# coefficient lambda = P3O_KL_COEF.
-P3O="${P3O:-0}"
+# >>> REPLAY / V-trace flags <<<
+# NOTE: the P3O off-policy path was removed; these args are still accepted by
+# the parser but no longer consumed by the PPO worker (on-policy PPO only).
 REPLAY_BUFFER_SIZE="${REPLAY_BUFFER_SIZE:-0}"
 REPLAY_SAMPLE_TRAJS="${REPLAY_SAMPLE_TRAJS:-0}"
 VTRACE_RHO_BAR="${VTRACE_RHO_BAR:-1.0}"
 VTRACE_C_BAR="${VTRACE_C_BAR:-1.0}"
-P3O_KL_COEF="${P3O_KL_COEF:-1.0}"
-P3O_FLAG=$([ "$P3O" = 1 ] && echo "--p3o")
 REPLAY_FLAGS=""
-[ "$REPLAY_BUFFER_SIZE" -gt 0 ] 2>/dev/null && REPLAY_FLAGS="--replay-buffer-size $REPLAY_BUFFER_SIZE --replay-sample-trajs $REPLAY_SAMPLE_TRAJS --vtrace-rho-bar $VTRACE_RHO_BAR --vtrace-c-bar $VTRACE_C_BAR --p3o-kl-coef $P3O_KL_COEF"
+[ "$REPLAY_BUFFER_SIZE" -gt 0 ] 2>/dev/null && REPLAY_FLAGS="--replay-buffer-size $REPLAY_BUFFER_SIZE --replay-sample-trajs $REPLAY_SAMPLE_TRAJS --vtrace-rho-bar $VTRACE_RHO_BAR --vtrace-c-bar $VTRACE_C_BAR"
 
 # >>> ASYNC PIPELINE (Stage 1) + MEASURE-ACTOR SCALING (Stage 1b, bridge-cse) <<<
 # ASYNC=1 enables the Stage-1 async pipeline (--async-pipeline): sampler
@@ -361,7 +347,7 @@ CPU_CORES_PER_ACTOR="${CPU_CORES_PER_ACTOR:-8}"
 uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --example VmappedNeuralNetwork --dataset mnist \
   --rewards $REWARDS_FLAG --cmp-type $CMP_TYPE --mem-type peak_memory \
-  $P3O_FLAG $REPLAY_FLAGS \
+  $REPLAY_FLAGS \
   $MEASURE_GRAD_FLAG $EXEC_ON_GPU_FLAG --measure-latency --latency-inner-reps 50 \
   --lambda-cmp $LAMBDA_CMP --lambda-mem $LAMBDA_MEM --lambda-acc $LAMBDA_ACC --lambda-frob 0.0 \
   --lambda-cossim-guide $LAMBDA_COSSIM_GUIDE \

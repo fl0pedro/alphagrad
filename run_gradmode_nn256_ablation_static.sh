@@ -94,7 +94,6 @@ export ALPHAGRAD_RAW_COSSIM_THREAD=1
 
 # >>> POLICY V2 (same backbone as nskom9jd) <<<
 export ALPHAGRAD_POLICY=palimpsa
-export ALPHAGRAD_RAY_MICROPOLICY=${ALPHAGRAD_RAY_MICROPOLICY:-1}
 
 # >>> 4 REWARD CHANNELS via the per-channel selector (commit 5172fcb) <<<
 # name:weight pairs -> build_reward_weights writes w[REWARD_INDEX[name]]=weight

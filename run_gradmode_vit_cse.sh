@@ -65,7 +65,6 @@ export ALPHAGRAD_COSSIM_GUIDE_CAP=${ALPHAGRAD_COSSIM_GUIDE_CAP:-0}
 export ALPHAGRAD_RAW_COSSIM_THREAD=1
 
 export ALPHAGRAD_POLICY=palimpsa
-export ALPHAGRAD_RAY_MICROPOLICY=${ALPHAGRAD_RAY_MICROPOLICY:-1}
 
 # >>> 4 REWARD CHANNELS (per-channel selector, commit 5172fcb) <<<
 # ViT weights = 0.06 / sigma_vit_channel (CALIBRATED), cosine_sim:1.0.

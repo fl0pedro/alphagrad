@@ -233,31 +233,6 @@ def make_argparser() -> argparse.ArgumentParser:
         "--vtrace-c-bar", type=float, default=1.0,
         help="V-trace c̄ clip on the trace IS weight (value propagation).",
     )
-    # --- P3O: Policy-on Policy-off Policy Optimization (Fakoor et al. 2020) --
-    # A single objective mixing the ON-policy clipped-IS PG on the FRESH rollout
-    # with an OFF-policy IS-corrected PG on REPLAY samples, plus a KL penalty
-    # keeping the off-policy gradient trustworthy (pi close to the replay
-    # behaviour mu). Requires --replay-buffer-size>0 (the replay stores the
-    # behaviour log-probs mu needed for both the IS ratio rho=pi/mu and the KL).
-    #   combined loss = -(on_pg + off_pg) + p3o_kl_coef * KL(mu || pi_theta)
-    #                   + value_coef*value_loss - entropy_coef*entropy
-    # off_pg uses V-trace advantages (recomputed under the current policy) with
-    # the IS ratio clipped by --vtrace-rho-bar; KL is the Schulman non-negative
-    # estimator E_replay[ rho - 1 - log rho ] (rho=pi/mu), minimised at pi==mu.
-    p.add_argument(
-        "--p3o", action="store_true",
-        help="Enable P3O (Fakoor et al. 2020): combined on-policy + off-policy "
-        "(replay) policy gradient with a KL penalty. Requires "
-        "--replay-buffer-size>0. Off = current on-policy PPO (unchanged).",
-    )
-    p.add_argument(
-        "--p3o-kl-coef", type=float, default=1.0,
-        help="P3O KL-penalty coefficient lambda: weight on "
-        "E_replay[KL(mu||pi_theta)] (the Schulman rho-1-log(rho) estimator). "
-        "Controls how much the off-policy replay gradient is trusted — larger "
-        "lambda keeps pi closer to the replay behaviour mu. Default 1.0 (fixed; "
-        "the paper's adaptive/ESS lambda is a possible follow-up).",
-    )
     # --- ASYNC PIPELINE (Stage 1, IMPALA-style decoupling) -----------------
     # Runs a SAMPLER actor (rollout + measurement -> push trajectories to the
     # shared replay buffer) CONCURRENTLY with the LEARNER actor (P3O updates

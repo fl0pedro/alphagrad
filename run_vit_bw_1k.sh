@@ -154,15 +154,6 @@ export ALPHAGRAD_POPART_PURE_ADV="${ALPHAGRAD_POPART_PURE_ADV:-1}"
 # forget-gate modulation (same construction as palimpsa_bi).
 export ALPHAGRAD_POLICY=palimpsa
 
-# >>> POLICY V2 (this launcher's whole point) <<<
-# ALPHAGRAD_RAY_MICROPOLICY=1 swaps SimplePPOAgent for MicroPPOAgent on the
-# Ray PPO path: PointerVertexPolicy (per-vertex queries cross-attending the
-# per-token encoder embeddings) + heads.MicroActionPolicy (autoregressive
-# typed sub-episodes, REAL --max-substeps with sticky END + hard cap, gated
-# joint log-prob/entropy) + a separate attention pool for the 10-channel
-# value head. Reward stack / stabilisation fixes are untouched.
-export ALPHAGRAD_RAY_MICROPOLICY="${ALPHAGRAD_RAY_MICROPOLICY:-1}"
-
 # >>> B_kstep TRAINABILITY as the acc reward channel <<<
 # ALPHAGRAD_ACC_PROXY=bkstep routes the --rewards acc weight to the B_kstep
 # channel (idx 9) instead of cosine_sim; ALPHAGRAD_BKSTEP=1 turns on the probe
