@@ -299,20 +299,17 @@ class SimplePPOAgent(eqx.Module):
         num_factors: int = 4,
         policy: str = "transformer",
     ):
-        from alphagrad.transformer import MLP, Encoder, PositionalEncoder
+        from alphagrad.transformer import MLP, Encoder, PositionalEncoder, make_encoder
 
         keys = jrand.split(key, 9)
         self.embedding = eqx.nn.Embedding(vocab_size, embd_dim, key=keys[0])
         self.pos_enc = PositionalEncoder(embd_dim, MAX_TOKENS)
-        # Thread the token-mixer policy (ALPHAGRAD_POLICY) into the encoder,
-        # mirroring ppo.py::Agent (ppo.py:2996 `Encoder(..., policy=_policy)`).
-        # Without this the worker's encoder silently defaulted to the plain
-        # O(seq^2) transformer even under ALPHAGRAD_POLICY=palimpsa_bi — no
-        # BiPalimpsaMixer, no relational DAG gate. `eqn_ids` is threaded into
-        # ``encode`` below so the palimpsa_bi relational gate is actually fed.
-        self.encoder = Encoder(
-            num_layers, num_heads, embd_dim, hidden_dim,
-            key=keys[1], policy=policy,
+        # Token mixer is chosen by class via make_encoder (ALPHAGRAD_POLICY),
+        # mirroring ppo.py::Agent. `eqn_ids` is threaded into ``encode`` below
+        # so the palimpsa_bi relational gate is actually fed.
+        self.encoder = make_encoder(
+            policy, num_layers, num_heads, embd_dim, hidden_dim,
+            key=keys[1],
         )
         self.vertex_logits_head = MLP(
             embd_dim, num_vertices, policy_dims, key=keys[2],
@@ -514,9 +511,9 @@ class MicroPPOAgent(eqx.Module):
         keys = jrand.split(key, 8)
         self.embedding = eqx.nn.Embedding(vocab_size, embd_dim, key=keys[0])
         self.pos_enc = PositionalEncoder(embd_dim, MAX_TOKENS)
-        self.encoder = Encoder(
-            num_layers, num_heads, embd_dim, hidden_dim,
-            key=keys[1], policy=policy,
+        self.encoder = make_encoder(
+            policy, num_layers, num_heads, embd_dim, hidden_dim,
+            key=keys[1],
         )
         # Final LayerNorm over the residual stream. The encoder blocks are
         # pre-LN (norm INSIDE each block, residual outside), so the stream's

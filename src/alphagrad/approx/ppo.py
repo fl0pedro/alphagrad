@@ -110,7 +110,7 @@ from alphagrad.approx.heads import (
     MicroActionPolicy,
     precompute_factor_tables,
 )
-from alphagrad.transformer import MLP, Encoder, PositionalEncoder
+from alphagrad.transformer import MLP, Encoder, PositionalEncoder, make_encoder
 from alphagrad.transformer.encoder import RelationalMultiheadAttention
 from alphagrad.utils import entropy, explained_variance
 
@@ -2993,13 +2993,13 @@ def _build_agent(
     elif _policy == "palimpsa_bi":
         print("[alphagrad] policy backbone: PALIMPSA_BI (bidirectional + "
               "relational-gate) linear-attention encoder", flush=True)
-    encoder = Encoder(
+    encoder = make_encoder(
+        _policy,
         args.num_layers,
         args.num_heads,
         args.embd_dim,
         args.hidden_dim,
         key=encoder_keys[1],
-        policy=_policy,
     )
     if use_pointer:
         vertex_policy = PointerVertexPolicy(
