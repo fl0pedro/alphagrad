@@ -65,7 +65,7 @@ from alphagrad.approx.common.examples import (
     get_fn, get_args, data_gen, infer_argnums, scalar_loss_fn)
 from alphagrad.approx.common.eval_samples import generate_eval_samples
 from alphagrad.approx.common.order_specs import build_order_specs
-from alphagrad.approx.ppo_ray_worker import MicroPPOAgent, NUM_REWARDS
+from alphagrad.approx.policy import build_policy, NUM_REWARDS
 from graphax.core import _build_graph, _prune_graph, _eliminate_vertex
 from graphax.sparse.micro_actions import COMPRESS_KINDS
 
@@ -249,7 +249,7 @@ def measure(state):
 # ---------------------------------------------------------------- agent (PPO components)
 EMBD = 128
 kA = jax.random.PRNGKey(A.seed)
-agent = MicroPPOAgent(vocab_size=512, embd_dim=EMBD, num_layers=4, num_heads=4,
+agent = build_policy(vocab_size=512, embd_dim=EMBD, num_layers=4, num_heads=4,
                       hidden_dim=256, num_vertices=len(jaxpr.eqns),
                       value_dims=(128, 128), key=kA, max_substeps=1,
                       policy="palimpsa")
