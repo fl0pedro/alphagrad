@@ -14,7 +14,7 @@ import jax.random as jrand
 import equinox as eqx
 
 from alphagrad.approx.common.relations import NUM_RELATIONS
-from alphagrad.transformer.palimpsa_pallas import palimpsa_attention
+from alphagrad.transformer.palimpsa_pallas import palimpsa
 from alphagrad.transformer.encoder import SwiGLU
 
 Array = jax.Array
@@ -207,7 +207,7 @@ class PalimpsaMixer(eqx.Module):
         Ip = jnn.softplus(self.Ip_raw)                       # (H,)
 
         # Add leading batch axis B=1 for the kernel, then drop it.
-        out = palimpsa_attention(
+        out = palimpsa(
             q[None], k[None], v[None], b[None], gt[None], g, Ip,
             scale=None, chunk_size=self.chunk_size,
         )                                                    # (1, S, H, d)
@@ -413,7 +413,7 @@ class BiPalimpsaMixer(eqx.Module):
         Ip_r = jnn.softplus(self.Ip_raw_rev)
 
         # Forward pass (causal left->right).
-        out_fwd = palimpsa_attention(
+        out_fwd = palimpsa(
             q[None], k[None], v[None], b[None], gt[None], g_f, Ip_f,
             scale=None, chunk_size=self.chunk_size,
         )[0]                                                   # (S, H, d)
@@ -423,7 +423,7 @@ class BiPalimpsaMixer(eqx.Module):
         qr = jnp.flip(q, axis=0); kr = jnp.flip(k, axis=0)
         vr = jnp.flip(v, axis=0); br = jnp.flip(b, axis=0)
         gtr = jnp.flip(gt, axis=0)
-        out_rev = palimpsa_attention(
+        out_rev = palimpsa(
             qr[None], kr[None], vr[None], br[None], gtr[None], g_r, Ip_r,
             scale=None, chunk_size=self.chunk_size,
         )[0]

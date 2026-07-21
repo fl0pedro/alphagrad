@@ -379,3 +379,17 @@ def _bwd(scale, chunk_size, res, do):
 
 
 palimpsa_attention.defvjp(_fwd, _bwd)
+
+
+def palimpsa(q, k, v, b, gt, g, Ip, scale=None, chunk_size=16):
+    """Backend dispatcher: the Pallas-Triton kernel on GPU, the verified
+    pure-JAX reference on CPU. The kernel is GPU-only ('Only interpret mode is
+    supported on CPU backend'); palimpsa_ref is numerically the kernel's
+    ground-truth oracle, so this lets the palimpsa policy be constructed AND
+    run a forward/backward pass on a CPU-only host (head-node smoke tests)
+    without changing GPU numerics. chunk_size only affects the kernel's
+    residual frequency, so it is dropped on the ref path."""
+    if jax.default_backend() == 'cpu':
+        return palimpsa_ref(q, k, v, b, gt, g, Ip, scale)
+    return palimpsa_attention(q, k, v, b, gt, g, Ip, scale, chunk_size)
+
