@@ -6,7 +6,10 @@ CLEAN implementation (ignores autoscheduler_loop's surrogate-Gumbel search and m
   * Value + prior = the PPO MicroPPOAgent (palimpsa encoder + PointerVertexPolicy +
     per-channel value head). Leaf evaluation = value net; simulations NEVER measure.
   * GUMBEL (Danihelka 2022): root Gumbel-top-m without replacement over the prior
-    logits, SEQUENTIAL HALVING of the simulation budget, action chosen by
+    logits, candidate-set halving with PROGRESSIVE DEEPENING (survivors get a
+    2x deeper lockstep rollout each phase; total work ~= n_candidates x
+    rollout_depth x ceil(log2 m) — there is no separate simulation budget
+    knob), action chosen by
     argmax(g + logits + sigma(q)), policy trained by CE to the COMPLETED-Q improved
     target softmax(logits + sigma(completed_q)) over the legal set.
   * SAMPLED (Hubert 2021, pragmatic): with ALPHAGRAD_GAZ_MICRO=1 each root candidate
@@ -32,7 +35,6 @@ ap.add_argument("--task", default="VmappedNeuralNetwork")   # e.g. VmappedViT
 ap.add_argument("--dataset", default="mnist")
 ap.add_argument("--total-measurements", type=int, default=150)
 ap.add_argument("--n-candidates", type=int, default=8)      # Gumbel top-m at the root
-ap.add_argument("--num-simulations", type=int, default=16)  # sequential-halving budget
 ap.add_argument("--rollout-depth", type=int, default=3)     # greedy descent depth per sim
 ap.add_argument("--train-epochs", type=int, default=4)
 ap.add_argument("--replay-episodes", type=int, default=16)
@@ -347,10 +349,20 @@ def lockstep_rollout_values(entries, depth):
             out.append(None)                               # terminal reached in-search
     return out
 
-def sigma(q, cs=float(os.environ.get("ALPHAGRAD_GAZ_CSCALE", "1.0"))):
+CVISIT = float(os.environ.get("ALPHAGRAD_GAZ_CVISIT", "50.0"))
+
+def sigma(q, max_n=1, cs=float(os.environ.get("ALPHAGRAD_GAZ_CSCALE", "1.0"))):
+    """Danihelka et al. 2022 monotone Q-transform (mctx qtransform form):
+    min-max-normalize Q over the candidate set, then scale by
+    (c_visit + max_N) * c_scale, so evaluated Q outweighs the prior+Gumbel
+    and increasingly so as the search deepens. max_N = evaluation rounds of
+    the most-evaluated candidate (progressive-deepening analogue of the
+    paper's max visit count). Replaces a per-set z-score that capped every
+    Q-gap at ~1 sigma and erased magnitudes (2026-07-16 review, Fix 1)."""
     q = np.asarray(q, dtype=np.float64)
-    s = q.std() + 1e-8
-    return cs * (q - q.mean()) / s
+    lo, hi = float(q.min()), float(q.max())
+    qn = (q - lo) / max(hi - lo, 1e-8)
+    return (CVISIT + float(max_n)) * cs * qn
 
 # ---------------------------------------------------------------- Gumbel root search
 def gumbel_search(state, graph, tg, rng):
@@ -390,7 +402,8 @@ def gumbel_search(state, graph, tg, rng):
         if len(surv) <= 1:
             break
         qbar = np.array([np.mean(c["q"]) for c in surv])
-        sc = np.array([c["g"] + c["logit"] for c in surv]) + sigma(qbar)
+        sc = np.array([c["g"] + c["logit"] for c in surv]) + sigma(
+            qbar, max_n=max(len(c["q"]) for c in surv))
         keep = np.argsort(-sc)[:max(1, len(surv) // 2)]
         surv = [surv[i] for i in keep]
         depth = min(depth * 2, NV)                         # deepen survivors
@@ -406,7 +419,7 @@ def gumbel_search(state, graph, tg, rng):
             if c["li"] not in _seen or qv > comp_q[c["li"]]:
                 comp_q[c["li"]] = qv
             _seen.add(c["li"])
-    pi = logits + sigma(comp_q)
+    pi = logits + sigma(comp_q, max_n=max([len(c["q"]) for c in cands] + [1]))
     pi = np.exp(pi - pi.max()); pi = pi / pi.sum()
     return chosen, pi, la, legal
 
@@ -446,7 +459,7 @@ if A.wandb:
     except Exception:
         wb = None
 print(f"[gaz] NV={NV} budget={A.total_measurements} m={A.n_candidates} "
-      f"sims={A.num_simulations} depth={A.rollout_depth} micro={GAZ_MICRO}", flush=True)
+      f"depth={A.rollout_depth} micro={GAZ_MICRO}", flush=True)
 
 MAXTOK = 0
 while n_meas < A.total_measurements:
