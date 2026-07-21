@@ -1636,7 +1636,7 @@ class PPORayWorker:
                 f_seq = jnp.where(_disallowed, 0, f_seq)
                 kind_seq = jnp.where(_disallowed, 0, kind_seq)
                 q_seq = jnp.where(_disallowed, 0, q_seq)
-                # SUBSTEP-BUDGET CURRICULUM: cap the sub-episode at
+                # SUBSTEP BUDGET: cap the sub-episode at
                 # ``substep_budget`` slots; positions >= budget -> OP_END
                 # (no-op) + args zeroed (mirrors the _disallowed override,
                 # so the stored rewritten action == what the loss
