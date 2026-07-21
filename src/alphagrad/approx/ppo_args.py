@@ -412,22 +412,6 @@ def make_argparser() -> argparse.ArgumentParser:
              "common/preferences.kronecker_preferences.",
     )
     p.add_argument(
-        "--scalarization", type=str, default="linear",
-        choices=["linear", "tchebycheff"],
-        help="Per-channel-reward → scalar reduction. ``linear`` (default): "
-             "``sum_k w_k * r_k`` — current behavior, reaches only the "
-             "convex hull of the Pareto front. ``tchebycheff``: augmented "
-             "Tchebycheff ``-(max_k w_k * |r_k - z*|) - rho * sum|r_k - z*|`` "
-             "— reaches concave regions per Miettinen 1999 §3.4.3. See "
-             "common/scalarization.apply_scalarization.",
-    )
-    p.add_argument(
-        "--tchebycheff-rho", type=float, default=0.05,
-        help="(--scalarization tchebycheff) Augmentation weight on the "
-             "``sum_k |r_k - z*|`` term. Rules out weakly-Pareto-optimal "
-             "points; 0.05 per Steuer 1986.",
-    )
-    p.add_argument(
         "--intermediate-rewards",
         action=argparse.BooleanOptionalAction,
         default=False,
