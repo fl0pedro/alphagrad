@@ -36,7 +36,6 @@ import threading as _threading
 tqdm.set_lock(_threading.RLock())
 
 from alphagrad.approx.ppo_args import make_argparser  # noqa: E402
-from alphagrad.approx.common.calibration import run_calibration  # noqa: E402
 from alphagrad.approx.common.compile_cache import (  # noqa: E402
     kill_coordinator as _kill_compile_cache,
     spawn_coordinator as _spawn_compile_cache,
@@ -281,79 +280,17 @@ def _run(args) -> int:
     ray.get(
         [actor.ready.remote()] + [c.ready.remote() for c in cpu_workers]
     )
-    # Phase 4c: warm the CPU pool BEFORE calibration so the zero-pref
-    # rollouts don't time out and poison `reward_vec_means`. Same
-    # ordering as `mu0_ray.py` post-refactor.
+    # Phase 4c: warm the CPU pool so first rollouts don't hit
+    # cold-cache compile timeouts. Same ordering as `mu0_ray.py`
+    # post-refactor.
     if cpu_workers:
         ray.get([c.compile_approximations.remote() for c in cpu_workers])
     print(
         f"  actors spawned + JIT-warm in {time.time() - args.t_start:.1f}s"
     )
 
-    # Calibration is the pre-training pass that computed
-    # ``1/|symlog(mean)|`` per-channel scaling weights from a random-
-    # policy rollout. With ``--advantage-norm gdpo`` (the new default),
-    # per-minibatch z-scoring inside the loss subsumes this magnitude
-    # rescaling, so calibration is a no-op — skip it to save the
-    # warm-up time. The legacy ``--advantage-norm scalar`` path still
-    # benefits from calibrated weights (its global advantage z-score
-    # operates on the weighted-sum reward, which depends on
-    # cross-channel magnitude).
-    if (
-        getattr(args, "advantage_norm", "gdpo") == "scalar"
-        and getattr(args, "calibrate_steps", 0) > 0
-    ):
-        run_calibration(actor, args, args.calibrate_steps, after_warmup=True)
-    elif getattr(args, "calibrate_steps", 0) > 0:
-        print(
-            "  [calibration] skipped under --advantage-norm gdpo "
-            "(per-channel z-scoring is self-calibrating)."
-        )
-
     seed_counter = int(args.seed) + 100
     state = init_running_bests()
-
-    # Curriculum sequencing. ``--variant full_curriculum`` with empty
-    # ``--curriculum`` auto-expands into the 7-stage schedule
-    # ``compute_seven_stage_curriculum`` returns:
-    #   ve_only → rot1_simple → rot2_simple → all_simple →
-    #   rot1_difficult → rot2_difficult → full
-    # with geometric pacing (1:2:4:8:16:32:256 × N) and per-trainer
-    # floors. See CURRICULUM.md for the full design.
-    #
-    # Manual ``--curriculum stage1:N1,...`` specs override the
-    # auto-expansion (back-compat with the legacy 3-stage default and
-    # any custom schedule).
-    #
-    # Per-episode round-robin: rotation stages (rot1_*, rot2_*) emit a
-    # different concrete variant per episode (cycling through their
-    # rotation slots). Non-rotation stages emit the same variant for
-    # all their episodes.
-    from alphagrad.approx.variants import (
-        _parse_curriculum,
-        compute_seven_stage_curriculum,
-        compute_variant_at_episode,
-    )
-    curriculum_spec = getattr(args, "curriculum", "") or ""
-    variant_name = getattr(args, "variant", "custom")
-    if variant_name == "full_curriculum" and not curriculum_spec.strip():
-        _stages = compute_seven_stage_curriculum(args.episodes, "ppo")
-        curriculum_spec = ",".join(f"{n}:{k}" for n, k in _stages)
-        print(
-            f"  [curriculum] auto-expanded full_curriculum (7-stage): "
-            f"{curriculum_spec}"
-        )
-    curriculum_stages = _parse_curriculum(curriculum_spec)
-    if curriculum_stages:
-        total_stage_eps = sum(n for _, n in curriculum_stages)
-        if total_stage_eps != args.episodes:
-            print(
-                f"  [curriculum] WARNING: sum of stage episodes "
-                f"({total_stage_eps}) != --episodes ({args.episodes}); "
-                f"final stage will absorb the remainder."
-            )
-    current_variant_name: str | None = None
-    current_stage_name: str | None = None
 
     # Resolve the best-sequences JSON path. Empty (default) → place it
     # next to the wandb run files so a single run dir holds both the
@@ -590,51 +527,8 @@ def _run(args) -> int:
         ncols=180,
     )
 
-    # SUBSTEP-BUDGET CURRICULUM (bridge-cse). Ramp the per-vertex micro-action
-    # budget 0 -> CEIL in equal levels of STEP episodes: budget(ep) =
-    # min(CEIL, ep // STEP). Level 0 (budget=0) = pure exact elimination
-    # (order only, NO micro-actions) so the policy learns the ORDER first,
-    # then approximation opens up gradually. Applied as a RUNTIME cap in the
-    # worker (positions >= budget -> OP_END), traced -> no recompile on step.
-    # Flag-guarded: OFF => setter never called => byte-identical.
-    _subcur_on = (
-        os.environ.get("ALPHAGRAD_SUBSTEP_CURRICULUM", "0").strip().lower()
-        in ("1", "true", "yes", "on")
-        or bool(getattr(args, "substep_curriculum", False))
-    )
-    _subcur_step = int(os.environ.get("ALPHAGRAD_SUBSTEP_CURRICULUM_STEP", "40") or 40)
-    _subcur_ceil = int(
-        os.environ.get("ALPHAGRAD_SUBSTEP_CURRICULUM_CEIL",
-                       str(int(getattr(args, "max_substeps", 16)))) or 16
-    )
-    _subcur_step = max(1, _subcur_step)
-    _subcur_last = -1
-    def _substep_budget_at(_ep):
-        return int(min(_subcur_ceil, _ep // _subcur_step))
-    if _subcur_on:
-        _n_levels = _subcur_ceil + 1
-        tqdm.write(
-            f"  [substep-curriculum] ON: budget(ep)=min({_subcur_ceil}, "
-            f"ep//{_subcur_step}); {_n_levels} levels x {_subcur_step} eps = "
-            f"{_n_levels * _subcur_step} eps to reach full; ep0 budget="
-            f"{_substep_budget_at(0)} (pure elimination), steps to 1 at ep="
-            f"{_subcur_step}."
-        )
-
     for ep in range(args.episodes):
         seed_counter += 1
-        # Push this episode's substep budget to the worker (only when it
-        # CHANGES -> at most CEIL+1 remote calls over the whole run).
-        if _subcur_on:
-            _bud = _substep_budget_at(ep)
-            if _bud != _subcur_last:
-                _applied = ray.get(actor.set_substep_budget.remote(_bud))
-                tqdm.write(
-                    f"  [substep-curriculum] ep={ep}: budget -> {_applied}"
-                    + (" (pure exact elimination)" if _applied == 0 else "")
-                )
-                _subcur_last = _bud
-
         # Wall-clock budget: stop cleanly once --max-wall-seconds has elapsed
         # (the final Pareto + best-sequence archives are dumped after the loop).
         # 0 = run to --episodes. Granularity = one episode.
@@ -645,34 +539,6 @@ def _run(args) -> int:
                 f"(elapsed {time.time() - args.t_start:.0f}s) — stopping."
             )
             break
-
-        # Curriculum stage / variant transition. ``compute_variant_at_episode``
-        # returns the current stage + the concrete variant for this
-        # episode (rotation stages cycle through their slots per
-        # episode). When EITHER the stage OR the variant changes we
-        # tell the worker to update its masks. The agent weights
-        # survive transitions (only masks change).
-        if curriculum_stages:
-            stage_now, variant_now, _within = compute_variant_at_episode(
-                ep, curriculum_stages,
-            )
-            if stage_now != current_stage_name:
-                tqdm.write(
-                    f"  [curriculum] ep={ep + 1}: entering stage "
-                    f"'{stage_now}'"
-                )
-                current_stage_name = stage_now
-            if variant_now != current_variant_name:
-                stage_info = ray.get(
-                    actor.set_variant_masks.remote(variant_now)
-                )
-                tqdm.write(
-                    f"  [curriculum]   ep={ep + 1} variant='{variant_now}' "
-                    f"op={stage_info['op_type_legal_count']}/4 "
-                    f"factor={stage_info['factor_legal_count']}/{len(stage_info)} "
-                    f"quant={stage_info.get('quant_dtype_legal_count', '-')}"
-                )
-                current_variant_name = variant_now
 
         stats = ray.get(actor.run_rollout_and_train.remote(seed_counter))
 
@@ -705,8 +571,6 @@ def _run(args) -> int:
         # Carry over the legacy `entropy` key for plot continuity with
         # earlier runs (build_wandb_log_dict uses `entropy_mean`).
         log_dict.setdefault("entropy", ent)
-        if _subcur_on:
-            log_dict["curriculum/substep_budget"] = int(_substep_budget_at(ep))
 
         # Periodic JSON snapshot + wandb scalar payload of the
         # running per-channel + overall bests. The full

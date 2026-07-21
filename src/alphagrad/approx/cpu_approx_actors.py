@@ -247,8 +247,8 @@ class CpuApproximationActor:
         ``__init__`` (env build + JAX cache wiring), so this is mostly a
         handshake — but we expose it for parity with the MuZero pool
         (`mu0_ray_worker.CPUApproximationWorker.compile_approximations`)
-        so the shared `run_calibration` helper can `ray.get` a warm-up
-        future on either trainer before issuing zero-pref rollouts.
+        so either trainer's driver can `ray.get` a warm-up future
+        before issuing the first rollouts.
         """
         return {"status": "ready", "actor_id": self._actor_id}
 

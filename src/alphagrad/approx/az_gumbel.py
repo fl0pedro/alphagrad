@@ -64,7 +64,7 @@ from alphagrad.approx.env import VertexEliminationEnv, _callback, REWARD_INDEX
 from alphagrad.approx.common.examples import (
     get_fn, get_args, data_gen, infer_argnums, scalar_loss_fn)
 from alphagrad.approx.common.eval_samples import generate_eval_samples
-from alphagrad.approx.verify_pareto_solution import build_order_specs
+from alphagrad.approx.common.order_specs import build_order_specs
 from alphagrad.approx.ppo_ray_worker import MicroPPOAgent, NUM_REWARDS
 from graphax.core import _build_graph, _prune_graph, _eliminate_vertex
 from graphax.sparse.micro_actions import COMPRESS_KINDS
@@ -148,31 +148,33 @@ def seq_of(state):
     """state = list of (action_idx, micro-or-None) -> build_order_specs seq."""
     return [(int(a), micro_str(m)) for a, m in state]
 
-# ---- tokenization optimizations (ported from the surrogate-search + PPO work) ----
-#  * ALPHAGRAD_GAZ_AOJ=1 (default): append-only jaxpr tokens (ProposerTokenizer —
-#    tokens-only template, persistent vocab, NO Python re-trace per child, ~17x
-#    shorter stream). Pure-order states only; micro states fall back to _callback.
+# ---- tokenization: graphax append-only STATE tokenizer ----
+# VEJaxpr(base_jaxpr, elim_order, transforms) emits
+#     <original-graph tokens> | <vertex [: micro-actions] ;> ...
+# pure Python over the UNTRACED base jaxpr — no re-trace, no XLA compile, no
+# executable leak. The base block is invariant and the suffix grows a few
+# tokens per action, so streams stay short and prefix-stable step-to-step.
 #  * fixed-cap PADDING (ALPHAGRAD_GAZ_TOKCAP): every stream padded to one length
 #    (pad id 0 = masked via tok>0 downstream) -> the encoder compiles ONCE.
-AOJ = os.environ.get("ALPHAGRAD_GAZ_AOJ", "1") == "1"
-_TK = None
-if AOJ:
-    from alphagrad.approx.append_only_jaxpr import ProposerTokenizer
-    _TK = ProposerTokenizer(LOSS, xs, ARGN, VALID)
-    _full_len = len(_TK.order_token_ids(list(range(NV))[::-1]))
-    # MICRO-AWARE cap: micro blocks add ~10-15 tokens/vertex (compress-all on
-    # NN-256 measures 490 vs 268 order-only) — size the cap from the measured
-    # worst single-micro-per-vertex stream, else micro-heavy states TRUNCATE.
-    _cap_src = _full_len
-    if GAZ_MICRO:
-        from graphax.sparse.micro_actions import Compress as _Cw
-        _worst = [(a, (_Cw(axes=(0,), kind="mean"),)) for a in list(range(NV))[::-1]]
-        _cap_src = max(_cap_src, len(_TK.order_token_ids_micro(_worst)))
-    TOKCAP = int(os.environ.get("ALPHAGRAD_GAZ_TOKCAP", str(int(_cap_src * 1.3) + 8)))
-    print(f"[gaz] AOJ tokenizer ON: base={len(_TK.base_token_ids)} "
-          f"full_order={_full_len} worst_micro={_cap_src} TOKCAP={TOKCAP}", flush=True)
-else:
-    TOKCAP = int(os.environ.get("ALPHAGRAD_GAZ_TOKCAP", "16384"))
+from graphax.jaxpr import VEJaxpr
+
+def _state_ids(vertices, transforms=()):
+    """(1-based vertex order, ((vertex, rules), ...)) -> token id list."""
+    ve = VEJaxpr(jaxpr, elim_order=list(vertices), transforms=tuple(transforms))
+    return [int(t) for t in ve.tokenized()]
+
+_full_order = [int(VALID[a]) for a in range(NV)][::-1]
+_full_len = len(_state_ids(_full_order))
+# MICRO-AWARE cap: micro sub-blocks add a few tokens per vertex — size the cap
+# from the worst single-micro-per-vertex stream, else micro states TRUNCATE.
+_cap_src = _full_len
+if GAZ_MICRO:
+    from graphax.sparse.micro_actions import Compress as _Cw
+    _worst = tuple((v, (_Cw(axes=(0,), kind="mean"),)) for v in _full_order)
+    _cap_src = max(_cap_src, len(_state_ids(_full_order, _worst)))
+TOKCAP = int(os.environ.get("ALPHAGRAD_GAZ_TOKCAP", str(int(_cap_src * 1.3) + 8)))
+print(f"[gaz] graphax state tokenizer: base={len(_state_ids([]))} "
+      f"full_order={_full_len} worst_micro={_cap_src} TOKCAP={TOKCAP}", flush=True)
 
 def _padcap(ids):
     if len(ids) > TOKCAP:
@@ -185,34 +187,20 @@ def _padcap(ids):
 
 _tok_cache = {}
 _tok_miss = [0]
-# AOJ=0 tokenizes via _callback(init=True), which LEAKS an XLA executable per
-# distinct (order,specs) — the documented measure-actor leak (~16MB/state on ViT,
-# fills a 24GB card by ~decision 25). Periodic clear_caches()+gc bounds it. Only
-# needed on the _callback path (AOJ off); the append-only tokenizer never leaks.
-_TOK_CLEAR_EVERY = int(os.environ.get("ALPHAGRAD_GAZ_TOK_CLEAR_EVERY",
-                                      "0" if AOJ else "40"))
+# Retained as an escape hatch; the VEJaxpr state tokenizer never touches XLA,
+# so cache clearing is off by default.
+_TOK_CLEAR_EVERY = int(os.environ.get("ALPHAGRAD_GAZ_TOK_CLEAR_EVERY", "0"))
 def tokens_of(state):
     key = tuple((int(a), tuple(m) if m else None) for a, m in state)
     hit = _tok_cache.get(key)
     if hit is not None:
         return hit
-    if AOJ and all(m is None for _, m in state):
-        ids = _TK.order_token_ids([int(a) for a, _ in state])
-        tok = _padcap(ids)
-        eqn = np.zeros_like(tok)
-    elif AOJ:
-        # MICRO-bearing state: append-only micro blocks (env 0dfe7ef pattern) —
-        # still pure Python, no re-trace.
-        ids = _TK.order_token_ids_micro(
-            [(int(a), _rules_of(m)) for a, m in state])
-        tok = _padcap(ids)
-        eqn = np.zeros_like(tok)
-    else:
-        order, specs, _ = build_order_specs(seq_of(state), env)
-        tok_r, eqn_r, _ = _callback(env.config, env.args, env.consts,
-                                    jnp.asarray(order), jnp.asarray(specs),
-                                    len(order), *ev, init=True)
-        tok = _padcap(np.asarray(tok_r)); eqn = _padcap(np.asarray(eqn_r))
+    vertices = [int(VALID[int(a)]) for a, _ in state]
+    transforms = tuple((int(VALID[int(a)]), _rules_of(m))
+                       for a, m in state if m is not None)
+    ids = _state_ids(vertices, transforms)
+    tok = _padcap(ids)
+    eqn = np.zeros_like(tok)
     # cache on the HOST (numpy). Caching jnp (device) arrays leaked ~16MB of GPU
     # per distinct ViT state (the array + its referenced XLA buffer stayed live),
     # growing linearly with the search until _net_fwd_b OOMs. Host arrays are

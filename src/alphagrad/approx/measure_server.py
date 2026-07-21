@@ -24,7 +24,7 @@ from alphagrad.approx.env import VertexEliminationEnv, _callback
 from alphagrad.approx.common.examples import (
     get_fn, get_args, data_gen, infer_argnums, scalar_loss_fn)
 from alphagrad.approx.common.eval_samples import generate_eval_samples
-from alphagrad.approx.verify_pareto_solution import build_order_specs
+from alphagrad.approx.common.order_specs import build_order_specs
 
 NDATA = int(os.environ.get("ALPHAGRAD_MS_NDATA", "5"))
 REPS = int(os.environ.get("ALPHAGRAD_MS_INNER_REPS", "50"))

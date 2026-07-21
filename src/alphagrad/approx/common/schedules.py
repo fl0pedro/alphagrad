@@ -13,15 +13,13 @@ Three shapes are exposed:
 Pure Python (no JAX) — the resolved scalar is fed to the rollout function as
 a leaf jnp.array, so a host-side compute is fine.
 
-Curriculum LR helper
+Per-period LR helper
 --------------------
-``cosine_warmup_exp_decay_lr`` is a JAX-compatible per-step LR schedule used
-by the curriculum scheduler. Each stage gets a fresh cosine warm-up followed
-by exponential decay over the stage's ``period`` — heads introduced in the
-stage start at the bottom of the warm-up, climb to full LR by the warm-up
-end, then anneal toward ``end_mult`` over the rest of the stage. Existing
-heads from earlier stages run at a reduced flat multiplier (set by the
-curriculum code, not this function).
+``cosine_warmup_exp_decay_lr`` is a JAX-compatible per-step LR schedule.
+Each period gets a fresh cosine warm-up followed by exponential decay over
+``period`` steps — the multiplier starts at the bottom of the warm-up,
+climbs to full LR by the warm-up end, then anneals toward ``end_mult``
+over the rest of the period.
 """
 
 from __future__ import annotations
@@ -66,9 +64,9 @@ def cosine_warmup_exp_decay_lr(
     ``[warmup_steps, period)`` it decays exponentially back toward
     ``end_mult`` with rate ``decay_strength / (period - warmup_steps)`` —
     larger ``decay_strength`` makes the tail shorter. ``step`` is reduced
-    modulo ``period`` so successive curriculum stages each get a fresh hill;
-    the curriculum scheduler resets ``step`` (or simply increments without
-    reset and lets the modulo wrap) for each stage transition.
+    modulo ``period`` so successive periods each get a fresh hill; the
+    caller resets ``step`` (or simply increments without reset and lets
+    the modulo wrap) at each period boundary.
 
     JAX-friendly: all ops are jnp, ``step`` may be a tracer.
     """

@@ -1688,49 +1688,6 @@ def _winsorized_mean(values, frac: float) -> float:
 
 
 
-# ---------------------------------------------------------------------------
-# APPEND-ONLY JAXPR state tokens (ALPHAGRAD_APPEND_ONLY_JAXPR=1, bridge-cse).
-# Replaces the graphax state-tokenizer STREAM with the literal append-only
-# jaxpr representation (base value-jaxpr + reserved Jacobian outputs + one
-# real-jaxpr block per eliminated vertex + micro-action blocks), emitted by
-# alphagrad.approx.append_only_jaxpr. POLICY-STATE ENCODING ONLY -- the
-# measurement below still runs the untouched jacve/AD path. A fresh per-call
-# vocabulary (warmed with the base tokens) makes the encoding a DETERMINISTIC
-# function of (jaxpr, order, transforms), so the trainer and every Ray measure
-# actor encode the identical state identically.
-_AOJ_STATE_CACHE: dict = {}
-import threading as _aoj_threading
-_AOJ_LOCK = _aoj_threading.Lock()
-
-
-def _append_only_state_tokens(config, args, consts, o_list, transforms):
-    from alphagrad.approx.append_only_jaxpr import AppendOnlyStream, Vocabulary
-    key = id(config.jaxpr)
-    with _AOJ_LOCK:
-        stream = _AOJ_STATE_CACHE.get(key)
-        if stream is None:
-            stream = AppendOnlyStream(
-                None, list(args), argnums=tuple(config.argnums),
-                tokens_only=True, closed_jaxpr=(config.jaxpr, list(consts)),
-            )
-            _AOJ_STATE_CACHE[key] = stream
-        stream.reset_to_base()
-        tmap = {}
-        for _v, _rules in (transforms or []):
-            tmap[int(_v)] = _rules
-        for v in o_list:
-            pre = set(stream._edges.keys())
-            stream.eliminate(int(v), symbolic=True)
-            rules = tmap.get(int(v), ())
-            if rules:
-                new_edges = [k for k in stream._edges.keys() if k not in pre]
-                stream.emit_micro_blocks(new_edges, rules)
-        vocab = Vocabulary()
-        vocab.encode(stream._base_tokens)
-        ids = vocab.encode(stream.tokens())
-    return jnp.asarray(ids, dtype=jnp.int32)
-
-
 def _callback(
     config: EnvConfig,
     args,
@@ -2049,28 +2006,21 @@ def _callback(
     # instead of re-tracing the fused Jacobian every step. That stream is a
     # lossless sufficient statistic for the APPROXIMATED policy STATE (it is
     # only the policy's state encoding -- the measured computation below still
-    # runs the untouched jacve/AD path). When the env var is unset this call
-    # is byte-identical to the legacy re-traced tokenizer. No change to the
-    # call itself is needed: the gate lives in graphax.extract_jaxpr.
-    _aoj_on = os.environ.get("ALPHAGRAD_APPEND_ONLY_JAXPR", "0") == "1"
-    if _aoj_on:
-        # APPEND-ONLY JAXPR state tokens (policy encoding only; see helper).
-        raw_tokens = _append_only_state_tokens(
-            config, args, consts, o_list, transforms)
-    else:
-        ve = extract_jaxpr(
-            config.jaxpr,
-            config.argnums,
-            o_list,
-            config.sparse,
-            args,
-            consts,
-            transforms=transforms,
-        )
-        # Measure the raw token length before slicing so we can detect
-        # truncation. ``_record_tokenization_truncation`` is a no-op for
-        # short sequences (the common case) and is cheap otherwise.
-        raw_tokens = ve.tokenized()
+    # runs the untouched jacve/AD path). No change to the call itself is
+    # needed: the gate lives in graphax.extract_jaxpr.
+    ve = extract_jaxpr(
+        config.jaxpr,
+        config.argnums,
+        o_list,
+        config.sparse,
+        args,
+        consts,
+        transforms=transforms,
+    )
+    # Measure the raw token length before slicing so we can detect
+    # truncation. ``_record_tokenization_truncation`` is a no-op for
+    # short sequences (the common case) and is cheap otherwise.
+    raw_tokens = ve.tokenized()
     _record_tokenization_truncation(int(raw_tokens.shape[0]))
     tokens = raw_tokens[:MAX_TOKENS]
     tokens = jnp.pad(tokens, (0, MAX_TOKENS - tokens.shape[0]))
@@ -2078,14 +2028,9 @@ def _callback(
     # Compute per-token equation IDs once for the relational-bias encoder
     # (Stage B.1). Cheap (single Python scan over a length-≤4096 numpy array)
     # and adds (MAX_TOKENS,) int32 to EnvState.
-    if _aoj_on:
-        # append-only jaxpr tokens: the graphax-vocab eqn-id parser does not
-        # apply; the causal palimpsa path runs with eqn_ids inert (zeros).
-        eqn_ids = jnp.zeros_like(tokens)
-    else:
-        tokens_np = np.asarray(tokens)
-        eqn_ids_np = compute_eqn_ids_from_tokens(tokens_np, _TOKEN_VOCAB)
-        eqn_ids = jnp.asarray(eqn_ids_np, dtype=jnp.int32)
+    tokens_np = np.asarray(tokens)
+    eqn_ids_np = compute_eqn_ids_from_tokens(tokens_np, _TOKEN_VOCAB)
+    eqn_ids = jnp.asarray(eqn_ids_np, dtype=jnp.int32)
 
     if init:
         return tokens, eqn_ids, jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
@@ -3005,7 +2950,7 @@ def _callback(
         # Drop non-positive readings (failed measurements). With perf_counter
         # timing a genuine reading is always > 0; a 0 only appears on failure.
         _lat_valid = [x for x in latency_samples if x > 0.0 and np.isfinite(x)]
-        from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+        from alphagrad.approx.common.compile_cache import SENTINEL_REWARD_VALUE
         if not _lat_valid:
             # No usable latency reading -> genuine failed-measure sentinel.
             latency_ns = -SENTINEL_REWARD_VALUE

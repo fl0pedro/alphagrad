@@ -455,8 +455,7 @@ def make_argparser() -> argparse.ArgumentParser:
     # double-normalise). `gdpo` implements the per-channel z-score →
     # priority-weighted sum → batch-norm pipeline from the NVIDIA GDPO
     # paper (arXiv:2601.05242); it is retained for the single-process
-    # ppo.py trainer only. Calibration is auto-skipped under `gdpo`
-    # because per-minibatch z-scoring subsumes magnitude rescaling.
+    # ppo.py trainer only.
     p.add_argument(
         "--advantage-norm", type=str, default="scalar",
         choices=["gdpo", "scalar"],
@@ -464,22 +463,7 @@ def make_argparser() -> argparse.ArgumentParser:
              "per-channel GAE + per-minibatch z-score per channel + "
              "priority-weighted sum + batch-norm. `scalar` (legacy): "
              "scalarise rewards via weights, symlog inside GAE, global "
-             "advantage z-score over the whole rollout. Under `gdpo` "
-             "the calibration phase is skipped (z-scoring is "
-             "self-calibrating).",
-    )
-    p.add_argument(
-        "--calibration-statistic", type=str, default="iqr",
-        choices=["iqr", "mean_abs", "std"],
-        help="Per-channel dispersion statistic used by the pre-training "
-             "calibration phase to rescale reward weights. `iqr` "
-             "(default, recommended): symlog-space IQR / 1.349 — robust "
-             "to heavy-tail outliers. `mean_abs` (legacy): "
-             "``|symlog(mean)|`` — normalises by the channel BIAS rather "
-             "than its spread; kept for A/B regression. `std`: "
-             "symlog-space std via the IQR proxy. Only relevant when "
-             "calibration runs (advantage-norm=scalar AND "
-             "calibrate-steps>0).",
+             "advantage z-score over the whole rollout.",
     )
 
     # PPO hyperparameters
@@ -546,32 +530,19 @@ def make_argparser() -> argparse.ArgumentParser:
         "Must be <= env.MAX_RULES_PER_VERTEX (16) to avoid silent truncation.",
     )
     p.add_argument(
-        "--substep-curriculum", action="store_true",
-        help="Ramp the per-vertex micro-action budget 0->CEIL in equal "
-        "levels of STEP episodes: budget(ep)=min(CEIL, ep//STEP). Level 0 "
-        "(budget=0) = pure exact elimination (order only). Runtime cap (no "
-        "recompile). STEP=ALPHAGRAD_SUBSTEP_CURRICULUM_STEP (default 40), "
-        "CEIL=ALPHAGRAD_SUBSTEP_CURRICULUM_CEIL (default --max-substeps). "
-        "Also ALPHAGRAD_SUBSTEP_CURRICULUM=1. OFF = current behaviour.",
-    )
-    p.add_argument(
         "--factors", type=str, default="-1,2,3,4",
         help="Comma-separated DIAG factor choices the policy picks from. "
         "``-1`` resolves to ``gcd(n_i, n_j)`` per env edge; everything "
         "else is a literal divisor. When --variant is set, this is "
         "OVERRIDDEN by the variant's factor table at init (the agent is "
-        "always built with the union factor table so curriculum stage "
-        "transitions can mask via the policy logits rather than "
-        "rebuilding the agent).",
+        "always built with the union factor table so variant masks apply "
+        "via the policy logits rather than rebuilding the agent).",
     )
 
-    # Variant / curriculum (mirrors mu0_args.py). PPO builds the agent
-    # with the FULL action footprint (op_type ∈ {DIAG, COMPRESS, QUANT,
-    # END}, full factor table) and masks per-stage in the act_step +
-    # loss_fn — same trick MuZero uses for its prior-gating curriculum
-    # so the policy weights survive stage transitions. ``full_curriculum``
-    # is the recommended default: it auto-expands an empty --curriculum
-    # to ``diag_gcd:N/3, diag_factor:N/3, full:N/3``.
+    # Variant. PPO builds the agent with the FULL action footprint
+    # (op_type ∈ {DIAG, COMPRESS, QUANT, END}, full factor table) and
+    # masks per-variant in the act_step + loss_fn so the policy weights
+    # survive if the variant restriction changes.
     p.add_argument(
         "--variant",
         type=str,
@@ -582,7 +553,7 @@ def make_argparser() -> argparse.ArgumentParser:
             "compress", "compress_scalar",
             "quantize", "quant_smallest_float",
             "diag_compress", "diag_quant", "compress_quant",
-            "full", "full_curriculum",
+            "full",
         ],
         help="Pre-canned action-space restriction. ``custom`` honours "
              "--factors / --dynamic-substeps directly. ``ve_only`` "
@@ -590,18 +561,7 @@ def make_argparser() -> argparse.ArgumentParser:
              "``diag_gcd`` allows DIAG with factor=-1 only. "
              "``diag_factor`` adds factors 2,3,4,8,16. ``compress`` / "
              "``quantize`` enable those op_types alongside DIAG. "
-             "``full`` opens everything. ``full_curriculum`` is sugar "
-             "for ``full`` plus the default 3-stage curriculum.",
-    )
-    p.add_argument(
-        "--curriculum",
-        type=str,
-        default="",
-        help="Curriculum of variants in sequence. Format: "
-             "``stage1:N1,stage2:N2,...``. Empty = single training run "
-             "on --variant (or the default 3-stage curriculum when "
-             "--variant=full_curriculum and --curriculum is empty). "
-             "Total episodes across stages must equal --episodes.",
+             "``full`` opens everything.",
     )
 
     # Model

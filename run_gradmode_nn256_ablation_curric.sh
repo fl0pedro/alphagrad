@@ -64,7 +64,7 @@ export ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY=${ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY
 # >>> COST-HEAD AUXILIARY TASK (bridge-cse) <<<
 # cost_head predicts the terminal MEASURED 4-tuple (symlog); aux Huber loss
 # into the shared encoder (weight 0.3). Held CONSTANT across both ablation
-# arms so the curriculum comparison stays clean.
+# arms so the comparison stays clean.
 export ALPHAGRAD_COST_HEAD_AUX=${ALPHAGRAD_COST_HEAD_AUX:-1}
 export ALPHAGRAD_COST_HEAD_AUX_WEIGHT=${ALPHAGRAD_COST_HEAD_AUX_WEIGHT:-0.3}
 export ALPHAGRAD_RECYCLE_RETRY_ON_OOM=${ALPHAGRAD_RECYCLE_RETRY_ON_OOM:-1}
@@ -76,14 +76,6 @@ export ALPHAGRAD_PEAK_MEMORY_ABSOLUTE=1
 
 # >>> SCALE-UP <<<
 export ALPHAGRAD_NN_HIDDEN=256
-# >>> SUBSTEP-BUDGET CURRICULUM (bridge-cse) <<<
-# budget(ep)=min(16, ep//200): 17 levels x 200 eps = 3400 eps (ablation).
-# Level 0 (ep 0-199) budget=0 = PURE exact elimination (order only);
-# ramps 1 slot every 200 eps, reaches full 16 at ep~3200.
-# Runtime OP_END cap (no recompile). ABLATION Run A (vs static Run B).
-export ALPHAGRAD_SUBSTEP_CURRICULUM=${ALPHAGRAD_SUBSTEP_CURRICULUM:-1}
-export ALPHAGRAD_SUBSTEP_CURRICULUM_STEP=${ALPHAGRAD_SUBSTEP_CURRICULUM_STEP:-200}
-export ALPHAGRAD_SUBSTEP_CURRICULUM_CEIL=${ALPHAGRAD_SUBSTEP_CURRICULUM_CEIL:-16}
 
 # >>> bkstep OFF (USER-DIRECTED) <<<
 export ALPHAGRAD_BKSTEP=0
@@ -160,7 +152,6 @@ uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --measure-grad --exec-on-gpu --measure-latency --latency-inner-reps 50 \
   --entropy-coef $ENTROPY_COEF --entropy-coef-final $ENTROPY_COEF_FINAL \
   --dynamic-substeps --max-substeps ${MAX_SUBSTEPS} \
-  --substep-curriculum \
   --actor-num-gpus 1 --cpu-actor-num-gpus 1 --num-cpu-workers $NUM_CPU_WORKERS \
   --cpu-cores-per-actor $CPU_CORES_PER_ACTOR --cpu-cores-shared \
   --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \

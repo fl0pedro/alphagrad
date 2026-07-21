@@ -13,7 +13,7 @@ First cut of the Phase-3+5 PPO Ray version from the migration plan:
 
 * PPO update is a deliberately simple clip-loss + value-MSE + entropy.
   We do NOT replicate every feature of the single-process `ppo.py`
-  trainer here (no curriculum / dynamic-substeps /
+  trainer here (no dynamic-substeps /
   preference Dirichlet / replay buffer — those will land as follow-ups
   if the basic path proves out). The trainer scalarises the env's
   8-dim reward vector to a single scalar via a fixed weight vector
@@ -179,8 +179,8 @@ def _args_from_dict(args_dict: dict) -> SimpleNamespace:
 
 def _setup_jax_compile_cache() -> None:
     """Back-compat wrapper around
-    :func:`alphagrad.approx.common.cache.setup_jax_compile_cache`."""
-    from alphagrad.approx.common.cache import setup_jax_compile_cache
+    :func:`alphagrad.approx.common.compile_cache.setup_jax_compile_cache`."""
+    from alphagrad.approx.common.compile_cache import setup_jax_compile_cache
     setup_jax_compile_cache()
 
 
@@ -1177,11 +1177,9 @@ class PPORayWorker:
                 "forcing it on."
             )
             self.dynamic_substeps = True
-        # Variant / curriculum support. When ``--variant`` is anything
-        # other than ``custom``, we build the agent with the UNION
-        # factor table (so curriculum stage transitions can mask via
-        # the policy logits rather than rebuilding the agent) and
-        # restrict the action space per stage via mask flags below.
+        # Variant support. When ``--variant`` is anything other than
+        # ``custom``, we build the agent with the UNION factor table
+        # and restrict the action space via the mask flags below.
         # ``custom`` falls back to the legacy ``--factors`` value.
         from alphagrad.approx.variants import (
             compute_ppo_variant_masks,
@@ -1197,12 +1195,11 @@ class PPORayWorker:
         else:
             self.factor_table = ppo_full_factor_table()
         self.factor_table_j = jnp.asarray(self.factor_table, dtype=jnp.int32)
-        # Initial action masks from the starting variant. For custom
-        # there's no restriction (all-True). For curriculum-aware
-        # variants the mask is the stage-specific allowed set.
-        # ``compute_union_variant_masks`` accepts both single variants
-        # and the compound "A+B" / "all_simple" strings the 7-stage
-        # curriculum's rotation slots emit.
+        # Initial action masks from the ``--variant`` setting. For custom
+        # there's no restriction (all-True); other variants restrict to
+        # the variant's allowed set. ``compute_union_variant_masks``
+        # accepts both single variants and compound "A+B" / "all_simple"
+        # strings.
         from alphagrad.approx.variants import (
             compute_union_variant_masks as _compute_union_variant_masks,
         )
@@ -1243,10 +1240,9 @@ class PPORayWorker:
         # Policy V2 static inputs: substep budget + prime/gcd factor
         # tables sized from the env's static axis structure.
         self.max_substeps = int(getattr(self.args, "max_substeps", 16))
-        # SUBSTEP-BUDGET CURRICULUM (bridge-cse): per-episode RUNTIME cap
-        # on micro-action slots. Traced jnp scalar -> stepping it does NOT
-        # recompile act_step. Default = MAX_RULES_PER_VERTEX (no cap) so
-        # the curriculum-OFF path is byte-identical.
+        # Per-vertex RUNTIME cap on micro-action slots. Traced jnp scalar
+        # so it never recompiles act_step. Fixed at MAX_RULES_PER_VERTEX
+        # (no cap).
         self._substep_budget_j = jnp.int32(MAX_RULES_PER_VERTEX)
         if self.max_substeps > MAX_RULES_PER_VERTEX:
             print(
@@ -1580,7 +1576,7 @@ class PPORayWorker:
         def act_step(agent, state_batch, vert_avail_batch,
                      op_mask, factor_mask, quant_mask, key,
                      substep_budget=jnp.int32(MAX_RULES_PER_VERTEX)):
-            """``op_mask`` (4,) gates op-types per variant/curriculum stage
+            """``op_mask`` (4,) gates op-types per variant
             (order DIAG/COMPRESS/QUANT/END): any disallowed sampled op_type is
             rewritten to END (ppo-style op_legality_override) so restricted
             variants restrict the action space. ``factor_mask`` /
@@ -1623,7 +1619,7 @@ class PPORayWorker:
                 f_seq = actions.factor.astype(jnp.int32)
                 kind_seq = actions.compress_kind.astype(jnp.int32)
                 q_seq = actions.quant_dtype.astype(jnp.int32)
-                # Variant/curriculum gating (mirrors ppo/cmorl's
+                # Variant gating (mirrors ppo/cmorl's
                 # op_legality_override): rewrite disallowed op_types to END
                 # and zero their stale args. NO-OP when op_mask is all-ones
                 # (variant=full). The stored (rewritten) action is what the
@@ -2148,7 +2144,7 @@ class PPORayWorker:
         # gated=0 (the flat plateau). We capture the mask HERE, before
         # zeroing, so the mult-gate can stamp these with -P (anti-degen
         # penalty) and best_overall can exclude them — never zero.
-        from alphagrad.approx.common.cache import (
+        from alphagrad.approx.common.compile_cache import (
             SENTINEL_REWARD_VALUE as _SENTINEL_RV,
         )
         # NON-FINITE REWARD SCRUB. A single nan/inf ANYWHERE in the (T, N, K)
@@ -3078,7 +3074,7 @@ class PPORayWorker:
         # pre-refactor calc at this site is why PPO's best stayed at
         # ep 0 in the wandb log run-vsh0bv2c — `jnp.sum(rewards_b,
         # axis=1).max()` was comparing symlog'd sums.
-        from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+        from alphagrad.approx.common.compile_cache import SENTINEL_REWARD_VALUE
         from alphagrad.approx.common.reward_scaling import (
             aggregate_per_channel_stats,
             REWARD_NAMES as _RS_REWARD_NAMES,
@@ -3694,8 +3690,7 @@ class PPORayWorker:
         return traj_np, telemetry
 
     # ------------------------------------------------------------------
-    # Calibration support — methods called by
-    # `alphagrad.approx.common.calibration.run_calibration`.
+    # Reward-vector statistics + weight-setting helpers (driver-callable).
     # ------------------------------------------------------------------
     def reward_vec_means(self, rng_seed: int, num_rollouts: int) -> dict:
         """Run `num_rollouts` zero-pref rollouts of the un-trained
@@ -3715,11 +3710,11 @@ class PPORayWorker:
         MuZero sibling for why naive averaging breaks under sentinel
         contamination.
 
-        Used by :func:`alphagrad.approx.common.calibration.run_calibration`,
-        which picks the statistic (mean_abs / iqr / std) to derive the
-        per-channel weight rescale from this dict.
+        Reward-vector statistics helper — a driver-side caller can pick
+        a statistic (mean_abs / iqr / std) from this dict to derive a
+        per-channel weight rescale.
         """
-        from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+        from alphagrad.approx.common.compile_cache import SENTINEL_REWARD_VALUE
         from alphagrad.approx.common.reward_scaling import (
             NUM_REWARDS as _NUM_REWARDS_RS,
             filter_sentinel_mask,
@@ -3800,55 +3795,9 @@ class PPORayWorker:
             "count": int(samples.shape[0]),
         }
 
-    def set_substep_budget(self, budget: int) -> int:
-        """Set the per-episode RUNTIME micro-action substep budget cap
-        (curriculum). budget=0 => pure exact elimination. Traced jnp scalar
-        so stepping it never recompiles act_step."""
-        b = int(max(0, min(int(budget), int(MAX_RULES_PER_VERTEX))))
-        self._substep_budget_j = jnp.int32(b)
-        return b
-
-    def set_variant_masks(self, variant: str) -> dict:
-        """Switch to a different curriculum stage by updating the
-        per-stage op_type / factor / quant masks. Called by the driver
-        between episodes when ``--curriculum`` is set. The agent itself
-        is not rebuilt — only the masks change, so the existing policy
-        weights carry over across stages.
-
-        Accepts both single-variant strings (``"diag_gcd"``) and the
-        compound strings the 7-stage round-robin curriculum emits
-        (``"diag_gcd+compress_scalar"`` or ``"all_simple"``); union
-        masks are computed via
-        :func:`alphagrad.approx.variants.compute_union_variant_masks`.
-
-        Returns the new mask shapes for confirmation logging.
-        """
-        from alphagrad.approx.variants import compute_union_variant_masks
-        masks = compute_union_variant_masks(
-            variant,
-            tuple(self.factor_table),
-            self._num_quant_dtypes_for_mask,
-        )
-        self.current_variant = variant
-        self._current_op_mask_j = jnp.asarray(
-            masks["op_type_mask"].astype(np.float32),
-        )
-        self._current_factor_mask_j = jnp.asarray(
-            masks["factor_mask"].astype(np.float32),
-        )
-        self._current_quant_mask_j = jnp.asarray(
-            masks["quant_dtype_mask"].astype(np.float32),
-        )
-        return {
-            "variant": variant,
-            "op_type_legal_count": int(masks["op_type_mask"].sum()),
-            "factor_legal_count": int(masks["factor_mask"].sum()),
-            "quant_dtype_legal_count": int(masks["quant_dtype_mask"].sum()),
-        }
-
     def set_reward_weights(self, weights_np) -> None:
-        """Replace the scalarising weight vector in-place. Called by
-        `run_calibration` after it computes the per-channel scaling.
+        """Weight-setting helper — replace the scalarising weight
+        vector in-place from a driver-side caller.
         """
         weights_np = np.asarray(weights_np, dtype=np.float32)
         assert weights_np.shape == self.reward_weights_np.shape, (

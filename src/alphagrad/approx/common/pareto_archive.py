@@ -18,7 +18,7 @@ import json
 import numpy as np
 
 # Exact-match sentinel signature shared with the reward plumbing
-# (common.cache.SENTINEL_REWARD_VALUE). A failed/skipped measure stamps this
+# (common.compile_cache.SENTINEL_REWARD_VALUE). A failed/skipped measure stamps this
 # on cost channels; a zeroed-reward no-op reads as all-zeros. Neither is a
 # real Pareto point, so the archive rejects both (exact match, not <=).
 _SENTINEL_OBJ_VALUE = -1e10
@@ -141,6 +141,9 @@ class ParetoArchive:
         self.seqs: list = []                     # parallel sequences
         self.all_candidates: list[dict] = []     # every admitted point
         self._seen: set = set()
+        # Fixed HV reference captured on first non-empty call; class has
+        # no save/load, so process lifetime bounds the reference lifetime.
+        self._hv_ref: np.ndarray | None = None
 
     def add(self, reward_vec, seq, episode: int) -> bool:
         """Admit one (reward_vec, seq) to the front. Returns True if it was
@@ -188,7 +191,14 @@ class ParetoArchive:
         if not self.pts:
             return 0.0
         pts = np.stack(self.pts)
-        return hypervolume(pts, pts.min(axis=0) - 1.0)
+        # Capture the reference point once, on the first non-empty call.
+        # Recomputing ``pts.min(axis=0) - 1.0`` per call is a moving
+        # reference: a 1-point front then always scores 1.0 regardless of
+        # where the point sits, and HV values are incomparable across
+        # calls. A fixed reference keeps the metric monotone over time.
+        if self._hv_ref is None:
+            self._hv_ref = pts.min(axis=0) - 1.0
+        return hypervolume(pts, self._hv_ref)
 
     def dump_front(self, path: str, extra: dict | None = None) -> None:
         _hv = self.hypervolume()

@@ -36,7 +36,7 @@ from alphagrad.approx.env import VertexEliminationEnv, _callback, MAX_TOKENS
 from alphagrad.approx.common.examples import (
     get_fn, get_args, data_gen, infer_argnums, scalar_loss_fn)
 from alphagrad.approx.common.eval_samples import generate_eval_samples
-from alphagrad.approx.verify_pareto_solution import build_order_specs
+from alphagrad.approx.common.order_specs import build_order_specs
 from alphagrad.approx.ppo_ray_worker import (
     MicroPPOAgent, NUM_REWARDS, _scale_micro_policy_heads, _rezero_encoder_rel_gates)
 from alphagrad.transformer import MLP

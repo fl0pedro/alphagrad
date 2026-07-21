@@ -1,6 +1,6 @@
 """Pin that every cost channel populates on a successful env step.
 
-The callback in `env._callback` carries an 8-channel reward vector:
+The callback in `env._callback` carries a 10-channel reward vector:
 
     [0] muls_adds_fmas   — graphax symbolic op count
     [1] flops            — XLA cost_analysis
@@ -10,6 +10,8 @@ The callback in `env._callback` carries an 8-channel reward vector:
     [5] peak_memory      — ResourceMonitor peak HBM
     [6] cosine_sim       — only at terminal
     [7] frob_residual    — only at terminal
+    [8] xla_peak_memory  — deterministic XLA memory_analysis peak estimate
+    [9] bkstep_acc       — B_kstep trainability accuracy, only at terminal
 
 The user explicitly asked us to test that ALL SIX cost channels (0..5)
 populate when measure_latency=True — so downstream comparison and wandb

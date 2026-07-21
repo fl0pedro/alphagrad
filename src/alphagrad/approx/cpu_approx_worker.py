@@ -34,12 +34,12 @@ from typing import Any, Sequence
 def _setup_jax_compile_cache() -> None:
     """Thin back-compat wrapper around the canonical helper.
 
-    The real implementation lives in :func:`alphagrad.approx.common.cache.setup_jax_compile_cache`
+    The real implementation lives in :func:`alphagrad.approx.common.compile_cache.setup_jax_compile_cache`
     so every trainer (single-process ppo/mu0, Ray PPO worker, CPU
     approx worker) hits the same per-SLURM-job, per-node cache and
     we can fix the cross-node AOT-loader contamination in one place.
     """
-    from alphagrad.approx.common.cache import setup_jax_compile_cache
+    from alphagrad.approx.common.compile_cache import setup_jax_compile_cache
 
     setup_jax_compile_cache()
 

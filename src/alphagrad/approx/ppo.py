@@ -1353,8 +1353,8 @@ class Agent(eqx.Module):
     # Optional: present iff `--dynamic-substeps` is on. When non-None, the
     # rollout / loss path routes through `sample_action_dynamic` and
     # `evaluate_action_dynamic` instead of the legacy `rule_policy` heads.
-    # The two paths coexist on the same Agent so curriculum stages can
-    # swap between them without rebuilding the whole module.
+    # The two paths coexist on the same Agent so the active one can be
+    # selected without rebuilding the whole module.
     micro_action_policy: MicroActionPolicy | None
     value_head_flops: MLP
     value_head_mem: MLP
@@ -1630,8 +1630,8 @@ class Agent(eqx.Module):
         # by `pin_rules_to_exact` via jnp.where. This is the JAX-traced
         # equivalent of the original Python-level branch — accepts both
         # a static Python bool (fast path: jnp.where folds at trace time)
-        # and a traced 0/1 scalar (used by the curriculum runner to swap
-        # ve_only ↔ full without forcing a recompile). The 2x rule-head
+        # and a traced 0/1 scalar (to swap ve_only ↔ full without
+        # forcing a recompile). The 2x rule-head
         # compute is negligible next to the encoder.
         ps_pinned, fs_pinned, pd_pinned, fd_pinned = self._pinned_rule_outputs()
         ps_sampled, fs_sampled, pd_sampled, fd_sampled = self.rule_policy.sample(
@@ -1870,7 +1870,7 @@ class Agent(eqx.Module):
         # MicroActionPolicy.sample doesn't take the override directly —
         # it computes legality from axis-state (always allowing DIAG /
         # COMPRESS / QUANT when applicable). The override is how the
-        # curriculum runner forces `ve_only` (no DIAG / COMPRESS / QUANT)
+        # `--variant` setting forces `ve_only` (no DIAG / COMPRESS / QUANT)
         # or `compress` (no DIAG) or similar variants at sampling time.
         diag_allowed = op_legality_override[OP_DIAG] > 0.5
         compress_allowed = op_legality_override[OP_COMPRESS] > 0.5
@@ -2135,9 +2135,7 @@ def make_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Compute the env's reward vector only at the final elimination step; "
         "intermediate steps return zeros. Skips per-step jacve compile/exec — the "
-        "dominant rollout cost. PPO+GAE handles sparse rewards natively; the only "
-        "knob to consider is reducing --potential-shaping (which assumes per-step "
-        "value differences).",
+        "dominant rollout cost. PPO+GAE handles sparse rewards natively.",
     )
     p.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "none"])
     p.add_argument("--dataset-size", type=int, default=-1)
@@ -2265,7 +2263,6 @@ def make_argparser() -> argparse.ArgumentParser:
             "quantize",
             "quant_smallest_float",
             "full",
-            "full_curriculum",
         ],
         help=(
             "Pre-canned configuration mapping to --factors / --max-rules / "
@@ -2277,44 +2274,6 @@ def make_argparser() -> argparse.ArgumentParser:
             "`compress` is currently unwired (depends on the heads.py / "
             "atomic-compress rewrite — see graphax.sparse.micro_actions). "
             "`full` enables the existing multi-rule DIAG path."
-        ),
-    )
-
-    # Curriculum: train through multiple variants with the same model. New
-    # heads added in each stage warm up via cosine; existing heads from
-    # earlier stages run at a reduced flat multiplier so their learned
-    # weights aren't blown away but can still adapt to the new objective.
-    p.add_argument(
-        "--curriculum",
-        type=str,
-        default="",
-        help=(
-            "Curriculum of variants to run in sequence. Format: "
-            "`stage1:N1,stage2:N2,...` where each stage names a --variant "
-            "and an episode count. Single optimizer carries across stages; "
-            "per-head LR uses cosine_warmup_exp_decay_lr with period = N_i "
-            "so the period matches the head-warmup window. Empty = single "
-            "training run on --variant."
-        ),
-    )
-    p.add_argument(
-        "--curriculum-warmup-frac",
-        type=float,
-        default=0.3,
-        help=(
-            "Fraction of each curriculum stage's episodes spent in the "
-            "cosine LR warm-up before the exponential-decay phase. 0.3 = "
-            "first 30%% of the stage warms up, remaining 70%% decays."
-        ),
-    )
-    p.add_argument(
-        "--curriculum-existing-head-mult",
-        type=float,
-        default=0.3,
-        help=(
-            "Flat LR multiplier applied to heads introduced in an earlier "
-            "curriculum stage. Keeps previously-learned concepts from being "
-            "discarded but lets them adapt. Default 0.3."
         ),
     )
 
@@ -2407,7 +2366,7 @@ def make_argparser() -> argparse.ArgumentParser:
         "--axis-warmup-steps",
         type=int,
         default=0,
-        help="Stage D head curriculum (§3.2): linearly ramp the "
+        help="Stage D head LR warmup (§3.2): linearly ramp the "
         "axis-pair head's LR multiplier from 1/3 → 1 over the "
         "first N optimizer steps after which point it stays at 1. "
         "0 = ramp disabled, full LR from step 0. The vertex and "
@@ -2417,7 +2376,7 @@ def make_argparser() -> argparse.ArgumentParser:
         "--factor-warmup-steps",
         type=int,
         default=0,
-        help="Stage E head curriculum: same ramp, applied to the "
+        help="Stage E head LR warmup: same ramp, applied to the "
         "factor head. 0 = no ramp.",
     )
     p.add_argument(
@@ -2493,37 +2452,6 @@ def make_argparser() -> argparse.ArgumentParser:
         "uniform component). 0.5 ≈ even mixture (spec "
         "recommendation); 1.0 = corners only; 0.0 = uniform "
         "only.",
-    )
-    p.add_argument(
-        "--calibrate-steps",
-        type=int,
-        default=0,
-        help="Stage G: after the main training loop, run this many "
-        "few-shot calibration episodes against the env's "
-        "calibration samples. Only the factor head and Set "
-        "Transformer aggregator update; all other modules are "
-        "frozen via gradient masking. Reward weights for these "
-        "episodes are quality-focused (cosine + Frob) so the "
-        "calibration signal matches what the spec calls for.",
-    )
-    p.add_argument(
-        "--calibrate-lr",
-        type=float,
-        default=1e-3,
-        help="Adam learning rate for the calibration optimizer. "
-        "Independent of the main optimizer's state, since "
-        "the calibration signal is a different objective.",
-    )
-    p.add_argument(
-        "--potential-shaping",
-        type=float,
-        default=0.0,
-        help="Stage C: scale on potential-based reward shaping. "
-        "Augments per-step reward with `c · (γ V_ψ(s') - V_ψ(s))` "
-        "(values stop-gradient'd) so long-horizon vertex-elim "
-        "rollouts get a denser per-step learning signal "
-        "without biasing the optimum (Ng et al. 1999). "
-        "0.0 disables; spec recommends starting around 0.1.",
     )
     p.add_argument(
         "--bc-warmstart-steps",
@@ -2699,10 +2627,10 @@ VARIANT_PRESETS: dict[str, dict] = {
 def _apply_variant_preset(args, variant: str | None = None):
     """In-place apply a `--variant` preset to ``args``.
 
-    `variant` overrides ``args.variant`` if given (used by the curriculum
-    scheduler when stepping through stages). Raises if the preset is not
-    yet wired (currently ``compress``, which depends on the atomic-COMPRESS
-    action — see graphax.sparse.micro_actions and the heads.py rewrite).
+    `variant` overrides ``args.variant`` if given. Raises if the preset is
+    not yet wired (currently ``compress``, which depends on the
+    atomic-COMPRESS action — see graphax.sparse.micro_actions and the
+    heads.py rewrite).
     """
     name = variant if variant is not None else getattr(args, "variant", "custom")
     if name not in VARIANT_PRESETS:
@@ -2718,106 +2646,6 @@ def _apply_variant_preset(args, variant: str | None = None):
         )
     for k, v in preset.items():
         setattr(args, k, v)
-
-
-def make_curriculum_schedule(args, curriculum_stages):
-    """Build an optax-compatible LR schedule for a curriculum run.
-
-    Each stage gets its own ``cosine_warmup_exp_decay_lr`` hill whose
-    ``period`` equals the stage's optimizer-step budget
-    (``stage_episodes × ppo_epochs × minibatches``). Warm-up takes the
-    first ``args.curriculum_warmup_frac`` of the stage; exponential
-    decay covers the rest, ending at ``args.lr_decay_min_mult * lr``.
-    Returns a JAX-traceable callable ``schedule(step) -> lr`` consumable
-    by ``optax.adam(schedule)``.
-
-    Boundaries are pre-computed at Python time so per-stage warmup
-    counts are concrete inside the inner ``cosine_warmup_exp_decay_lr``
-    calls (which read them with ``int(...)``).
-    """
-    steps_per_episode = args.ppo_epochs * args.minibatches
-    stage_step_counts = [max(n * steps_per_episode, 1) for _, n in curriculum_stages]
-    boundaries: list[int] = [0]
-    for s in stage_step_counts:
-        boundaries.append(boundaries[-1] + s)
-    warmup_frac = float(args.curriculum_warmup_frac)
-
-    def schedule(step):
-        step_f = jnp.asarray(step, dtype=jnp.float32)
-        # Default LR (used when step falls outside any stage — shouldn't
-        # happen but the optimizer will keep stepping after the last
-        # episode if the trainer over-runs).
-        lr = jnp.asarray(
-            args.lr * args.lr_decay_min_mult,
-            dtype=jnp.float32,
-        )
-        for i, stage_steps in enumerate(stage_step_counts):
-            lo = boundaries[i]
-            hi = boundaries[i + 1]
-            warmup_steps = max(int(stage_steps * warmup_frac), 1)
-            local_step = step_f - float(lo)
-            stage_lr = cosine_warmup_exp_decay_lr(
-                local_step,
-                args.lr,
-                stage_steps,
-                warmup_steps,
-                end_mult=args.lr_decay_min_mult,
-            )
-            in_stage = (step_f >= float(lo)) & (step_f < float(hi))
-            lr = jnp.where(in_stage, stage_lr, lr)
-        return lr
-
-    return schedule
-
-
-def _current_stage_at(
-    stages: list[tuple[str, int]],
-    ep: int,
-) -> str:
-    """Map an episode index to the variant of the stage it falls into.
-
-    Used by the curriculum runner to print a stage-transition message
-    once per boundary. Returns the last stage's name if ``ep`` exceeds
-    the total budget (shouldn't happen — total_episodes is set to the
-    sum of stage counts — but harmless).
-    """
-    cumulative = 0
-    for name, n in stages:
-        if ep < cumulative + n:
-            return name
-        cumulative += n
-    return stages[-1][0] if stages else ""
-
-
-def _micro_introduction_stage(
-    curriculum_stages: list[tuple[str, int]],
-    allow_compress: bool,
-) -> int:
-    """First stage index where the dynamic head sees gradient signal.
-
-    The micro_action_policy heads only carry useful signal when at least
-    one of DIAG / COMPRESS / QUANT is legal — ``ve_only`` forces END every
-    sub-step, so the head's outputs are masked to 0 entropy / 0 log-prob
-    contributions and gradients vanish. Returns ``len(stages)`` if the
-    head is never introduced (i.e., all stages are ve_only) so the
-    "past introduction" check stays well-defined.
-    """
-    for stage_idx, (variant, _) in enumerate(curriculum_stages):
-        legal = _op_legality_for_variant(variant, allow_compress)
-        # Indices 0/1/2 correspond to OP_DIAG / OP_COMPRESS / OP_QUANT.
-        if any(float(legal[k]) > 0.5 for k in (0, 1, 2)):
-            return stage_idx
-    return len(curriculum_stages)
-
-
-def _pin_rules_for_variant(variant: str) -> bool:
-    """Per-variant `pin_rules_to_exact` flag for the legacy rule head.
-
-    Only ``ve_only`` requires the pinned (no-rules) output; every other
-    variant lets the rule head sample normally. The dynamic-substeps
-    path uses :func:`_op_legality_for_variant` instead.
-    """
-    return variant == "ve_only"
 
 
 def _op_legality_for_variant(
@@ -2866,45 +2694,6 @@ def _op_legality_for_variant(
     # `custom` and `full` (and anything else) get the unrestricted mask
     # gated by the allow flags.
     return jnp.array([diag, compress, quant, end], dtype=jnp.float32)
-
-
-def _parse_curriculum(spec: str) -> list[tuple[str, int]]:
-    """Parse `stage1:N1,stage2:N2,...` into a list of (variant, episodes) pairs.
-
-    Empty string -> empty list (no curriculum). Whitespace tolerated.
-    Validates every variant name against ``VARIANT_PRESETS`` and every
-    episode count is a positive integer.
-    """
-    if not spec.strip():
-        return []
-    stages: list[tuple[str, int]] = []
-    for chunk in spec.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        if ":" not in chunk:
-            raise ValueError(
-                f"Curriculum stage '{chunk}' missing ':'. Expected "
-                "`variant:episode_count`."
-            )
-        name, n_str = chunk.split(":", 1)
-        name = name.strip()
-        if name not in VARIANT_PRESETS:
-            raise ValueError(
-                f"Curriculum stage variant '{name}' unknown. Valid: "
-                f"{list(VARIANT_PRESETS)}."
-            )
-        try:
-            n_episodes = int(n_str.strip())
-        except ValueError as e:
-            raise ValueError(
-                f"Curriculum stage '{chunk}': episode count '{n_str}' is "
-                "not an integer."
-            ) from e
-        if n_episodes <= 0:
-            raise ValueError(f"Curriculum stage '{chunk}': episode count must be > 0.")
-        stages.append((name, n_episodes))
-    return stages
 
 
 def _select_variant(args) -> tuple[bool, bool]:
@@ -3400,10 +3189,9 @@ def _build_head_masks(agent):
     net (``vertex_policy.*``). `micro_mask` selects every parameter of
     the dynamic-substeps head (``micro_action_policy.*``) — both the
     AxisSetEncoder and the three sub-heads (op_type / axis pointers /
-    prime-exponent). The curriculum runner uses them to apply
-    introduction-stage-aware LR scaling: a head's gradient runs at
-    full LR in the first stage where it sees signal, then drops to
-    ``--curriculum-existing-head-mult`` in subsequent stages.
+    prime-exponent). They are used by :func:`_scale_grads` to apply
+    per-head LR multipliers (the axis / factor warm-up ramp; the vertex
+    and micro heads run at the base LR).
 
     For agents without a dynamic head (``--dynamic-substeps`` off,
     ``micro_action_policy is None``), the micro_mask is empty since
@@ -3414,15 +3202,6 @@ def _build_head_masks(agent):
         _build_param_mask(agent, lambda p: _path_in(p, "factor")),
         _build_param_mask(agent, lambda p: "vertex_policy" in p),
         _build_param_mask(agent, lambda p: "micro_action_policy" in p),
-    )
-
-
-def _build_calibration_mask(agent):
-    """Stage G: True = trainable during calibration (factor head + aggregator),
-    False = frozen (encoder, vertex head, axis-pair head, value heads, …)."""
-    return _build_param_mask(
-        agent,
-        lambda p: _path_in(p, "factor") or _path_in(p, "aggregator"),
     )
 
 
@@ -3452,9 +3231,9 @@ def _scale_grads(
 ):
     """Single fused per-leaf gradient scaling.
 
-    Combines the Stage D head-LR ramp (per-head multiplier on axis / factor
-    params), the curriculum existing-head multipliers on vertex_policy
-    and micro_action_policy, and the Stage G freeze mask (zero gradient
+    Combines the Stage D/E head-LR ramp (per-head multiplier on axis / factor
+    params), the vertex_policy / micro_action_policy head multipliers,
+    and the Stage G freeze mask (zero gradient
     for non-trainable params during calibration) into one pass through
     the pytree. Mask precedence (first match wins):
 
@@ -3488,130 +3267,6 @@ def _scale_grads(
     )
 
 
-def run_calibration_phase(
-    agent,
-    opt_state,
-    env,
-    env_episode_template_args,
-    *,
-    train_episode,
-    reset_envs,
-    num_envs,
-    args,
-    global_step,
-    key,
-):
-    """Stage G: few-shot calibration loop.
-
-    Freezes everything except the factor head + Set Transformer aggregator
-    (via ``cal_mask``), forces a quality-focused preference vector, and
-    runs ``args.calibrate_steps`` extra episodes through the same
-    ``train_episode`` JIT'd path used during PPO. Reuses the main
-    optimizer state so no JIT recompile fires.
-
-    ``env_episode_template_args = (closed_jaxpr, base_args, argnums)``
-    captures the jaxpr details needed to recompute per-vertex features each
-    episode without pulling all of `main`'s closure into the call site.
-    """
-    closed_jaxpr, base_args, argnums = env_episode_template_args
-
-    cal_mask = _build_calibration_mask(agent)
-    leaves = jax.tree_util.tree_leaves(cal_mask)
-    n_cal = sum(int(jnp.sum(l.astype(jnp.int32))) for l in leaves)
-    n_total = sum(int(l.size) for l in leaves)
-    print(
-        f"\nStage G: calibrating for {args.calibrate_steps} episodes; "
-        f"{n_cal}/{n_total} param leaves are trainable "
-        f"(factor head + set_transformer_agg). All other modules frozen."
-    )
-
-    # Quality-focused preference: only the acc head (frob_residual) carries
-    # the learning signal during calibration. flops and peak_memory weights
-    # are 0 so the advantage scalarization is purely quality-driven, matching
-    # the spec's "supervised against the Frobenius quality signal". cosine_sim
-    # is no longer a value head under the 3-head split; its host-side display
-    # is preserved via the 8-vec `traj.reward`.
-    cal_pref = jnp.broadcast_to(
-        jnp.zeros(NUM_VALUE_HEADS, dtype=jnp.float32).at[2].set(1.0),
-        (num_envs, NUM_VALUE_HEADS),
-    )
-
-    # Stage G never enforces hard constraints — calibration is a supervised
-    # quality nudge, not a constraint-satisfaction problem. Pass empty
-    # constraint arrays so the augmentation in train_episode is a no-op.
-    no_idx = jnp.zeros((0,), dtype=jnp.int32)
-    no_thr = jnp.zeros((0,), dtype=jnp.float32)
-    no_sign = jnp.zeros((0,), dtype=jnp.float32)
-    no_lam = jnp.zeros((0,), dtype=jnp.float32)
-
-    for step_idx in range(args.calibrate_steps):
-        ep_key, key = jrand.split(key)
-        ep_eval_key, ep_key = jrand.split(ep_key)
-        eval_samples = generate_eval_samples(env, ep_eval_key, args.num_eval_samples)
-        env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
-        vertex_features = _episode_vertex_features(
-            args,
-            closed_jaxpr.jaxpr,
-            tuple(closed_jaxpr.literals),
-            base_args,
-            eval_samples=eval_samples,
-            argnums=argnums,
-        )
-        env_states = reset_envs(env_episode)
-        # Calibration uses the env's current op-legality (no per-stage
-        # override). For dynamic-substeps calibration the caller will
-        # provide the active override via args.
-        if args.dynamic_substeps:
-            # Order: DIAG, COMPRESS, QUANT, END — calibration uses the env's
-            # current op-legality. Compress is gated by --allow-compress;
-            # QUANT is always enabled at calibration time (any per-stage
-            # override is applied separately by the trainer).
-            cal_override = jnp.array(
-                [1.0, 1.0 if args.allow_compress else 0.0, 1.0, 1.0],
-                dtype=jnp.float32,
-            )
-        else:
-            cal_override = jnp.ones((NUM_OPS,), dtype=jnp.float32)
-        (
-            agent,
-            opt_state,
-            _,
-            _metrics,
-            totals,
-            _actions,
-            global_step,
-            _new_lam,
-            _diag_pack,
-        ) = train_episode(
-            agent,
-            opt_state,
-            env_states,
-            env_episode,
-            vertex_features,
-            cal_pref,
-            global_step,
-            ep_key,
-            cal_mask,
-            no_lam,
-            no_idx,
-            no_thr,
-            no_sign,
-            cal_override,
-            jnp.array(1.0, dtype=jnp.float32),  # calibration: no curriculum scaling
-            # Calibration runs with the env's static pin_rules_to_exact:
-            # we honour args.pin_rules_to_exact (Python bool) by lifting it
-            # into a JAX scalar so the per-call API stays uniform.
-            jnp.asarray(args.pin_rules_to_exact, dtype=jnp.bool_),
-            jnp.array(1.0, dtype=jnp.float32),  # calibration: no micro scaling
-        )
-        cosine = float(jnp.mean(totals[:, REWARD_INDEX["cosine_sim"]]))
-        neg_frob = float(jnp.mean(totals[:, REWARD_INDEX["frob_residual"]]))
-        print(
-            f"  cal step {step_idx:3d}/{args.calibrate_steps}  "
-            f"cosine_sim={cosine:.4f}  frob_residual={-neg_frob:.4f}"
-        )
-
-    return agent, global_step, key
 
 
 def _episode_vertex_features(
@@ -3626,8 +3281,8 @@ def _episode_vertex_features(
 
     Switches between mean-aggregated (Stage B.2.A) and per-sample (Stage B.3
     Set Transformer aggregator) features based on ``--set-transformer-agg``;
-    used by the main training loop, the BC warm-start, and the calibration
-    phase. Returns a `jnp.float32` array.
+    used by the main training loop and the BC warm-start. Returns a
+    `jnp.float32` array.
     """
     fn = (
         compute_per_sample_vertex_features
@@ -3788,14 +3443,14 @@ def run_bc_warmstart(
 
 def _setup_jax_compile_cache() -> None:
     """Back-compat wrapper around
-    :func:`alphagrad.approx.common.cache.setup_jax_compile_cache`.
+    :func:`alphagrad.approx.common.compile_cache.setup_jax_compile_cache`.
 
     The default now points at a per-SLURM-job, per-node `/tmp/dsnn-jax-cache-...`
     directory (previously: shared NFS ``~/.cache/jax-compilation-cache/<host>``).
     Sbatch scripts that need cross-job reuse can set
     ``DSNN_JAX_CACHE_REUSE=1`` before invocation.
     """
-    from alphagrad.approx.common.cache import setup_jax_compile_cache
+    from alphagrad.approx.common.compile_cache import setup_jax_compile_cache
     setup_jax_compile_cache()
 
 
@@ -3831,61 +3486,6 @@ def main():
             f"--variant={args.variant} applied: factors={args.factors!r}, "
             f"max_rules={args.max_rules}, "
             f"pin_rules_to_exact={args.pin_rules_to_exact}"
-        )
-
-    # Parse the curriculum spec early so misspelled stages fail fast. The
-    # full runner (which would toggle pin_rules_to_exact across stages and
-    # ramp per-head LR via cosine_warmup_exp_decay_lr) needs the heads.py
-    # refactor: today's rollout_fn / loss_fn capture pin_rules_to_exact and
-    # the factor table at JIT-compile time, so cross-stage transitions
-    # require either re-jitting (acceptable but unimplemented) or threading
-    # those values in as explicit per-call arguments (preferred — coming
-    # with heads.py). For now we parse + validate the spec so the CLI
-    # surface is stable, and raise a clear error if a non-empty curriculum
-    # is requested.
-    curriculum_stages = _parse_curriculum(args.curriculum)
-    if curriculum_stages:
-        # Both dynamic-substeps and legacy curricula are wired now —
-        # stage transitions toggle (op_legality_override, vertex_mult,
-        # pin_rules_to_exact) per call without forcing a recompile.
-        # Legacy curricula still need to share the SAME --factors and
-        # --max-rules across stages: the agent's rule head is sized at
-        # build time and isn't rebuilt mid-run. Validate that here so
-        # mis-specified stages fail fast rather than silently producing
-        # wrong-shape rule outputs.
-        if not args.dynamic_substeps:
-            from collections import Counter
-
-            stage_factors = []
-            stage_max_rules = []
-            for stage_name, _ in curriculum_stages:
-                preset = VARIANT_PRESETS.get(stage_name)
-                if preset is None:
-                    raise NotImplementedError(
-                        f"Curriculum stage '{stage_name}' is not yet wired "
-                        "(blocked on the heads.py rewrite or atomic COMPRESS "
-                        "in graphax)."
-                    )
-                stage_factors.append(preset.get("factors", args.factors))
-                stage_max_rules.append(preset.get("max_rules", args.max_rules))
-            f_counts = Counter(stage_factors)
-            r_counts = Counter(stage_max_rules)
-            if len(f_counts) > 1 or len(r_counts) > 1:
-                raise NotImplementedError(
-                    "Legacy-mode curriculum requires every stage to share "
-                    "--factors and --max-rules (the rule head's output dim "
-                    "is fixed at agent-build time). Got per-stage factors "
-                    f"{stage_factors!r}, max_rules {stage_max_rules!r}. "
-                    "Add --dynamic-substeps for the heads.py path that "
-                    "doesn't have this restriction, or unify the stages' "
-                    "factor table."
-                )
-        args.episodes = sum(n for _, n in curriculum_stages)
-        mode_label = "dynamic-substeps" if args.dynamic_substeps else "legacy"
-        print(
-            "curriculum: "
-            + " → ".join(f"{name}:{n}" for name, n in curriculum_stages)
-            + f"  (total {args.episodes} episodes, {mode_label} mode)"
         )
 
     use_pointer, use_autoreg = _select_variant(args)
@@ -4154,28 +3754,12 @@ def main():
             agent,
         )
 
-    # Optimiser. Default = single cosine decay across the whole run.
-    # When --curriculum is set, swap in a piecewise schedule that gives
-    # each stage its own cosine-warmup + exp-decay hill so newly-
-    # introduced variants ramp up gently and existing-variant heads
-    # don't get blown out at stage boundaries.
-    if curriculum_stages:
-        schedule = make_curriculum_schedule(args, curriculum_stages)
-        print(
-            "curriculum LR: piecewise cosine_warmup_exp_decay across "
-            + " → ".join(
-                f"{name}({n * args.ppo_epochs * args.minibatches}st)"
-                for name, n in curriculum_stages
-            )
-            + f" (warmup_frac={args.curriculum_warmup_frac}, "
-            f"end_mult={args.lr_decay_min_mult})"
-        )
-    else:
-        schedule = optax.cosine_decay_schedule(
-            args.lr,
-            args.episodes * args.ppo_epochs * args.minibatches,
-            args.lr_decay_min_mult,
-        )
+    # Optimiser: single cosine decay across the whole run.
+    schedule = optax.cosine_decay_schedule(
+        args.lr,
+        args.episodes * args.ppo_epochs * args.minibatches,
+        args.lr_decay_min_mult,
+    )
     optimizer = optax.chain(
         optax.clip_by_global_norm(args.max_grad_norm),
         optax.adam(schedule, b1=args.adam_b1, eps=args.adam_eps),
@@ -4401,20 +3985,6 @@ def main():
                 )
             )
 
-            if args.potential_shaping != 0.0:
-                v_raw = inverse_reward_normalization_fn(
-                    lax.stop_gradient(value),
-                )
-                v_next_raw = inverse_reward_normalization_fn(
-                    lax.stop_gradient(next_value),
-                )
-                # F_t = γ Φ(s_{t+1}) - Φ(s_t), with Φ(s_{T+1}) ≡ 0 at the
-                # terminal step. The (1 - done) gate zeros only the bootstrap
-                # term so the per-episode total reduces to the constant
-                # -Φ(s_0) (Ng et al. 1999) — preserves the optimum exactly.
-                shaping = args.discount * v_next_raw * (1.0 - done) - v_raw
-                rewards = rewards + args.potential_shaping * shaping
-
             # In cache-encoding mode the trajectory's tokens/eqn_ids fields
             # carry the *initial* episode tokens (constant across the
             # rollout) so the loss path can encode_once + decode_from_cache
@@ -4618,7 +4188,7 @@ def main():
                 ** 2
             )
             explained_var = explained_variance(
-                batch.norm_adv, batch.estim_returns[..., 0]
+                values[..., 0], batch.estim_returns[..., 0]
             )
         else:
             value_loss = jnp.mean(
@@ -4628,7 +4198,7 @@ def main():
                 )
             )
             explained_var = explained_variance(
-                batch.norm_adv, jnp.sum(batch.estim_returns, axis=-1)
+                jnp.sum(values, axis=-1), jnp.sum(batch.estim_returns, axis=-1)
             )
 
         vertex_kl = jnp.mean(
@@ -4853,7 +4423,7 @@ def main():
                 ** 2
             )
             explained_var = explained_variance(
-                batch.norm_adv, batch.estim_returns[..., 0]
+                values[..., 0], batch.estim_returns[..., 0]
             )
         else:
             value_loss = jnp.mean(
@@ -4863,7 +4433,7 @@ def main():
                 )
             )
             explained_var = explained_variance(
-                batch.norm_adv,
+                jnp.sum(values, axis=-1),
                 jnp.sum(batch.estim_returns, axis=-1),
             )
 
@@ -5106,39 +4676,8 @@ def main():
         else:
             # Always use the per-step preference for advantage weighting. In
             # the unconditioned (Stage A–E) path it's broadcast from the static
-            # CLI --lambda-* weights; in Stage F it's the Dirichlet sample; in
-            # Stage G calibration it's the quality-focused override.
-            #
-            # RQ9 / Pitch B: ``--scalarization tchebycheff`` swaps the
-            # linear ``sum_k w_k * r_k`` for augmented Tchebycheff,
-            # which reaches concave Pareto regions a linear sum cannot
-            # (Miettinen 1999 §3.4.3). Ideal-point ``z*`` is the
-            # per-channel running max within this minibatch — for a
-            # stable EMA estimate at long-horizon training, refactor to
-            # carry z* in the training state (note in
-            # docs/experiments/pareto_front_tchebycheff.md).
-            scalarization = getattr(args, "scalarization", "linear")
-            if scalarization == "tchebycheff":
-                from alphagrad.approx.common.scalarization import (
-                    apply_scalarization,
-                )
-                # ideal point: per-channel running best in this batch
-                # (positive-orientation; advantages are oriented so
-                # higher = better). Per-batch is a reasonable proxy for
-                # the EMA-tracked ideal until the full state-carrying
-                # impl lands.
-                z_star = jnp.max(norm_adv_components, axis=tuple(
-                    range(norm_adv_components.ndim - 1),
-                ))
-                norm_adv = apply_scalarization(
-                    norm_adv_components,
-                    traj.preference,
-                    kind="tchebycheff",
-                    ideal_point=z_star,
-                    rho=float(getattr(args, "tchebycheff_rho", 0.05)),
-                )
-            else:
-                norm_adv = jnp.sum(norm_adv_components * traj.preference, axis=-1)
+            # CLI --lambda-* weights; in Stage F it's the Dirichlet sample.
+            norm_adv = jnp.sum(norm_adv_components * traj.preference, axis=-1)
 
         # `old_*_dists` are the dynamic-mode equivalent of the legacy
         # old_{vertex,pair,factor}_dists fields — but TrainBatch only
@@ -5185,7 +4724,7 @@ def main():
 
         dynamic_carry, static_carry = eqx.partition((agent, opt_state), eqx.is_array)
 
-        # Stage D head curriculum: thread a step counter through both scans
+        # Stage D head LR warmup: thread a step counter through both scans
         # (epoch × minibatch) so the per-head LR multiplier ramps continuously
         # across episodes. The optimizer also has its own internal count
         # (cosine-decay schedule reads it) but we want a separate, explicit
@@ -5661,137 +5200,6 @@ def main():
     # episode and feeds the per-head LR ramp from §3.2.
     global_step = jnp.array(0, dtype=jnp.int32)
 
-    # ------------------------------------------------------------------
-    # Pre-training reward-scale calibration.
-    #
-    # Reward channels span ~10¹⁰ in flops vs ~1 in cosine_sim. Without
-    # per-channel normalisation the flops gradient drowns out everything
-    # else, the policy collapses to whatever action minimises raw flops
-    # (typically pure COMPRESS) and ignores quality. We run K rollouts of
-    # the un-trained agent (no gradient updates), accumulate
-    # ``mean_abs(symlog(reward))`` per channel, and rescale
-    # ``reward_weights`` / ``head_reward_weights`` by the inverse so each
-    # weighted channel contributes on a comparable scale. cosine_sim is
-    # excluded (already bounded to ~order 1; the user's CLI lambda is
-    # already a usable unit). The rescaled weights are picked up on the
-    # first call to ``train_episode`` via Python's lazy closure lookup.
-    # Skipping the block (``--calibrate-steps 0``) leaves the user's raw
-    # lambdas in place; the per-step symlog (applied unconditionally
-    # inside ``train_episode``) still compresses the dynamic range.
-    # ------------------------------------------------------------------
-    if args.calibrate_steps > 0:
-        print(
-            f"\nPre-training scale calibration: {args.calibrate_steps} rollouts "
-            "(measuring |symlog(reward)| per channel under the initial policy)",
-            flush=True,
-        )
-        # Uniform-preference rollouts: preference doesn't affect the env's
-        # reward emission (the full 8-vec is always computed), only the
-        # policy's behaviour — which is uninformative anyway with random
-        # weights. Uniform 1/K so we don't pre-bias the trajectory mix.
-        cal_uniform_pref = jnp.broadcast_to(
-            jnp.full((NUM_VALUE_HEADS,), 1.0 / NUM_VALUE_HEADS, dtype=jnp.float32),
-            (num_envs, NUM_VALUE_HEADS),
-        )
-        cal_pin_rules = jnp.asarray(args.pin_rules_to_exact, dtype=jnp.bool_)
-        abs_sum = np.zeros((NUM_REWARDS,), dtype=np.float32)
-        for step_idx in range(args.calibrate_steps):
-            cal_key, key = jrand.split(key)
-            cal_eval_key, cal_key = jrand.split(cal_key)
-            cal_rollout_keys = jrand.split(cal_key, num_envs)
-            cal_eval_samples = generate_eval_samples(
-                env, cal_eval_key, args.num_eval_samples
-            )
-            cal_env = eqx.tree_at(
-                lambda e: e.eval_args_samples, env, cal_eval_samples
-            )
-            cal_vfeat = _episode_vertex_features(
-                args,
-                closed_jaxpr.jaxpr,
-                tuple(closed_jaxpr.literals),
-                tuple(xs),
-                eval_samples=cal_eval_samples,
-                argnums=tuple(argnums),
-            )
-            cal_env_states = reset_envs(cal_env)
-            _, cal_traj, _cal_totals = rollout_fn(
-                agent,
-                cal_env,
-                num_valid,
-                cal_env_states,
-                cal_rollout_keys,
-                cal_vfeat,
-                cal_uniform_pref,
-                op_legality_override,
-                cal_pin_rules,
-            )
-            # ``cal_traj.reward`` is the per-step reward stream — shape
-            # ``(num_envs, T, NUM_REWARDS)``. That's the exact tensor the
-            # loss path will pass through ``_symlog_rewards`` and weight
-            # per channel, so calibrating against its per-step magnitudes
-            # gives the correct scale (using only the per-episode total
-            # would underweight flops by ~T× when rewards are dense, and
-            # produces the wrong scale when ``--terminal-rewards-only``
-            # makes rewards sparse).
-            sl_per_step = _symlog_rewards(cal_traj.reward)
-            mean_abs = np.asarray(jnp.mean(jnp.abs(sl_per_step), axis=(0, 1)))
-            abs_sum = abs_sum + mean_abs
-            # Show every channel that the env actually emits (i.e. has a
-            # non-trivial magnitude) — even ones with zero user weight,
-            # because the head-reward-weights pick up the scale for the
-            # multi-head path regardless of the scalar-mode user lambda.
-            # In particular ``frob_residual`` defaults to ``lambda=0`` but
-            # is one of the 3 value heads (``HEAD_REWARD_INDICES[2]``), so
-            # its scale must be visible and applied.
-            print(
-                f"  scale cal step {step_idx:3d}/{args.calibrate_steps}  "
-                + "  ".join(
-                    f"{REWARD_NAMES[i]}={mean_abs[i]:.2e}"
-                    for i in range(NUM_REWARDS)
-                    if mean_abs[i] > 0.0
-                    or reward_weights_np[i] != 0.0
-                    or i in HEAD_REWARD_INDICES
-                ),
-                flush=True,
-            )
-        mean_abs_final = abs_sum / args.calibrate_steps
-        # ``1/mean_abs`` for symlog channels, ``1.0`` for cosine_sim. The
-        # ``+ 1e-3`` floor handles zero-magnitude channels (e.g. when a
-        # reward family is disabled or the env reports zero in this run).
-        reward_scales_np = np.where(
-            _NO_SYMLOG_MASK_NP, 1.0, 1.0 / (mean_abs_final + 1e-3)
-        ).astype(np.float32)
-        reward_weights_np = (reward_weights_np * reward_scales_np).astype(np.float32)
-        head_reward_weights_np = (
-            head_reward_weights_np * reward_scales_np[list(HEAD_REWARD_INDICES)]
-        ).astype(np.float32)
-        # Rebind the jax-array versions; ``train_episode``'s closure
-        # picks these up via name lookup at first-call trace time.
-        reward_weights = jnp.asarray(reward_weights_np, dtype=jnp.float32)
-        head_reward_weights = jnp.asarray(head_reward_weights_np, dtype=jnp.float32)
-        print(
-            "calibrated reward_weights: "
-            + ", ".join(
-                f"{REWARD_NAMES[i]}={reward_weights_np[i]:+.3g}"
-                for i in range(NUM_REWARDS)
-                if reward_weights_np[i] != 0.0
-            ),
-            flush=True,
-        )
-        # Per-head weights drive the multi-head value targets. Head 2
-        # ("acc") is the frob_residual head — printing the underlying
-        # reward name avoids the "acc/frob" ambiguity for users who set
-        # ``--lambda-frob`` directly.
-        print(
-            "calibrated head_reward_weights: "
-            + ", ".join(
-                f"{HEAD_NAMES[i]}({REWARD_NAMES[HEAD_REWARD_INDICES[i]]})="
-                f"{head_reward_weights_np[i]:+.3g}"
-                for i in range(NUM_VALUE_HEADS)
-                if head_reward_weights_np[i] != 0.0
-            ),
-            flush=True,
-        )
 
     # Stage F: per-env preference sampling over the 3-head simplex (flops /
     # peak_memory / frob_residual). Uses a Dirichlet with the configured
@@ -5800,22 +5208,6 @@ def main():
     # `head_reward_weights` so all downstream code sees a consistent
     # `(num_envs, NUM_VALUE_HEADS)` shape.
     static_pref = jnp.broadcast_to(head_reward_weights, (num_envs, NUM_VALUE_HEADS))
-
-    # Per-head introduction-stage for the curriculum runner. Static
-    # (depends on the curriculum spec, not on the current episode) so
-    # compute once before the loop.
-    if curriculum_stages:
-        micro_intro_stage = _micro_introduction_stage(
-            curriculum_stages,
-            args.allow_compress,
-        )
-        print(
-            f"curriculum: micro_action_policy first sees signal in stage "
-            f"{micro_intro_stage}/{len(curriculum_stages)}"
-            + (" (never)" if micro_intro_stage >= len(curriculum_stages) else "")
-        )
-    else:
-        micro_intro_stage = 0  # unused outside curriculum runs
 
     # JAX profiler hook. ``ALPHAGRAD_JAX_TRACE_DIR=/path`` enables a
     # per-episode trace: starts on the episode index given by
@@ -5850,57 +5242,40 @@ def main():
         ep_key, key = jrand.split(key)
         ep_eval_key, ep_key = jrand.split(ep_key)
         if args.preference_conditioned:
-            sampler = getattr(args, "preference_sampler", "dirichlet")
-            if sampler == "kronecker":
-                # RQ9 / Pitch B: golden-ratio (K=2) / R_d (K>=3) Kronecker
-                # sequence on the simplex — O(log N / N) discrepancy vs
-                # O(N^-0.5) for Dirichlet, recovering more uniform front
-                # coverage. ``offset`` walks the sequence across episodes
-                # so successive rollouts cover fresh simplex points
-                # rather than re-drawing the first num_envs each time.
-                from alphagrad.approx.common.preferences import (
-                    kronecker_preferences,
-                )
-                preferences_per_env = kronecker_preferences(
-                    NUM_VALUE_HEADS,
-                    num_envs,
-                    offset=int(ep) * int(num_envs),
-                )
-            else:
-                # Stage F mixture: each env independently draws its preference
-                # from either the corner Dirichlet (α<1) or the uniform Dirichlet
-                # (α=1). With ``--dirichlet-mix-ratio=0.5`` the trainer sees a
-                # balanced supply of pure-corner / interior preferences so the
-                # conditioned policy covers the whole Pareto front.
-                corner_key, uniform_key, choice_key, ep_key = jrand.split(ep_key, 4)
-                alpha_corner = jnp.full(
-                    (NUM_VALUE_HEADS,),
-                    args.dirichlet_alpha,
-                    dtype=jnp.float32,
-                )
-                alpha_uniform = jnp.full(
-                    (NUM_VALUE_HEADS,),
-                    args.dirichlet_alpha_uniform,
-                    dtype=jnp.float32,
-                )
-                corner_samples = jrand.dirichlet(
-                    corner_key,
-                    alpha_corner,
-                    shape=(num_envs,),
-                )
-                uniform_samples = jrand.dirichlet(
-                    uniform_key,
-                    alpha_uniform,
-                    shape=(num_envs,),
-                )
-                use_corner = (
-                    jrand.uniform(choice_key, (num_envs, 1)) < args.dirichlet_mix_ratio
-                )
-                preferences_per_env = jnp.where(
-                    use_corner,
-                    corner_samples,
-                    uniform_samples,
-                )
+            # Stage F mixture: each env independently draws its preference
+            # from either the corner Dirichlet (α<1) or the uniform Dirichlet
+            # (α=1). With ``--dirichlet-mix-ratio=0.5`` the trainer sees a
+            # balanced supply of pure-corner / interior preferences so the
+            # conditioned policy covers the whole Pareto front.
+            corner_key, uniform_key, choice_key, ep_key = jrand.split(ep_key, 4)
+            alpha_corner = jnp.full(
+                (NUM_VALUE_HEADS,),
+                args.dirichlet_alpha,
+                dtype=jnp.float32,
+            )
+            alpha_uniform = jnp.full(
+                (NUM_VALUE_HEADS,),
+                args.dirichlet_alpha_uniform,
+                dtype=jnp.float32,
+            )
+            corner_samples = jrand.dirichlet(
+                corner_key,
+                alpha_corner,
+                shape=(num_envs,),
+            )
+            uniform_samples = jrand.dirichlet(
+                uniform_key,
+                alpha_uniform,
+                shape=(num_envs,),
+            )
+            use_corner = (
+                jrand.uniform(choice_key, (num_envs, 1)) < args.dirichlet_mix_ratio
+            )
+            preferences_per_env = jnp.where(
+                use_corner,
+                corner_samples,
+                uniform_samples,
+            )
         else:
             preferences_per_env = static_pref
 
@@ -5921,63 +5296,15 @@ def main():
         )
 
         env_states = reset_envs(env_episode)
-        # Curriculum stage resolution: figure out which stage `ep` falls
-        # into and derive the per-call overrides from the stage's variant.
-        # Empty curriculum (the default) uses the main-level values set at
-        # startup.
-        if curriculum_stages:
-            cumulative = 0
-            current_stage_name = curriculum_stages[-1][0]
-            current_stage_idx = len(curriculum_stages) - 1
-            for stage_idx, (stage_name, stage_n) in enumerate(curriculum_stages):
-                if ep < cumulative + stage_n:
-                    current_stage_name = stage_name
-                    current_stage_idx = stage_idx
-                    break
-                cumulative += stage_n
-            stage_override = _op_legality_for_variant(
-                current_stage_name,
-                args.allow_compress,
-            )
-            stage_pin_rules = jnp.asarray(
-                _pin_rules_for_variant(current_stage_name),
-                dtype=jnp.bool_,
-            )
-            # Per-head LR multipliers: each head runs at full LR in the
-            # first stage where it sees signal, then drops to
-            # --curriculum-existing-head-mult in subsequent stages.
-            # vertex_policy is introduced at stage 0 (always); the
-            # dynamic head's introduction is the first stage where DIAG
-            # or COMPRESS is legal (see _micro_introduction_stage).
-            stage_vertex_mult = jnp.array(
-                1.0 if current_stage_idx == 0 else args.curriculum_existing_head_mult,
-                dtype=jnp.float32,
-            )
-            stage_micro_mult = jnp.array(
-                1.0
-                if current_stage_idx <= micro_intro_stage
-                else args.curriculum_existing_head_mult,
-                dtype=jnp.float32,
-            )
-            # Log the stage boundary on transition (cheap host-side check).
-            if ep == 0 or (
-                ep > 0
-                and _current_stage_at(curriculum_stages, ep - 1) != current_stage_name
-            ):
-                print(
-                    f"[ep {ep}] curriculum stage → {current_stage_name}"
-                    f"  (vertex_mult={float(stage_vertex_mult):.2f}, "
-                    f"micro_mult={float(stage_micro_mult):.2f}, "
-                    f"pin_rules={bool(stage_pin_rules)})"
-                )
-        else:
-            stage_override = op_legality_override
-            stage_vertex_mult = jnp.array(1.0, dtype=jnp.float32)
-            stage_micro_mult = jnp.array(1.0, dtype=jnp.float32)
-            stage_pin_rules = jnp.asarray(
-                args.pin_rules_to_exact,
-                dtype=jnp.bool_,
-            )
+        # Per-call head overrides — static for the whole run (the
+        # ``--variant`` masks were resolved once at startup).
+        stage_override = op_legality_override
+        stage_vertex_mult = jnp.array(1.0, dtype=jnp.float32)
+        stage_micro_mult = jnp.array(1.0, dtype=jnp.float32)
+        stage_pin_rules = jnp.asarray(
+            args.pin_rules_to_exact,
+            dtype=jnp.bool_,
+        )
         (
             agent,
             opt_state,
@@ -6039,27 +5366,6 @@ def main():
         tqdm.write(
             "[profiler] jax.profiler.stop_trace (post-loop safe-stop)",
             file=sys.stderr,
-        )
-
-    # ------------------------------------------------------------------
-    # Stage G: few-shot calibration
-    # ------------------------------------------------------------------
-    if args.calibrate_steps > 0:
-        agent, global_step, key = run_calibration_phase(
-            agent,
-            opt_state,
-            env,
-            env_episode_template_args=(
-                closed_jaxpr,
-                tuple(xs),
-                tuple(argnums),
-            ),
-            train_episode=train_episode,
-            reset_envs=reset_envs,
-            num_envs=num_envs,
-            args=args,
-            global_step=global_step,
-            key=key,
         )
 
     print_top_n("Total Reward", host_state["top_n_total"])

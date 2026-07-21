@@ -9,13 +9,13 @@ actually specific to the RL algorithm.
 **JAX hygiene.** The Ray-driver entry points in ``ppo_ray.py`` and ``mu0_ray.py``
 must stay JAX-free until Ray spawns the GPU actors (otherwise the driver
 process hogs CUDA memory the actors need). Earlier this ``__init__`` eagerly
-imported the JAX-using helpers (``batching``, ``mcts``, ``masks``, …) — which
-meant ``from alphagrad.approx.common.cache import ...`` from the driver
+imported the JAX-using helpers (``batching``, ``masks``, …) — which
+meant ``from alphagrad.approx.common.compile_cache import ...`` from the driver
 also pulled JAX in via the parent package's ``__init__``, breaking the
 ``_assert_jax_free`` guard at PPO startup. The fix below moves the JAX-using
 re-exports behind a PEP 562 ``__getattr__`` so they're loaded lazily; the
-JAX-free helpers (``cache``, ``ray_runtime``, ``reward_scaling``,
-``calibration``, ``checkpoint``) are still imported eagerly so callers
+JAX-free helpers (``compile_cache``, ``ray_runtime``, ``reward_scaling``,
+``checkpoint``) are still imported eagerly so callers
 get a useful ``from alphagrad.approx.common import build_reward_weights``
 even from JAX-free contexts.
 """
@@ -28,11 +28,10 @@ from __future__ import annotations
 # (which assert no JAX module is present) rely on these working without
 # triggering the lazy imports below.
 # ---------------------------------------------------------------------------
-from alphagrad.approx.common.cache import (
+from alphagrad.approx.common.compile_cache import (
     SENTINEL_REWARD_VALUE,
     setup_jax_compile_cache,
 )
-from alphagrad.approx.common.calibration import run_calibration
 from alphagrad.approx.common.ray_runtime import (
     _args_from_dict,
     _assert_jax_free,
@@ -149,10 +148,6 @@ _LAZY: dict[str, tuple[str, str]] = {
     "RELATION_NAMES": ("alphagrad.approx.common.relations", "RELATION_NAMES"),
     "compute_eqn_ids_from_tokens": (
         "alphagrad.approx.common.relations", "compute_eqn_ids_from_tokens",
-    ),
-    # mcts
-    "extract_path_visits": (
-        "alphagrad.approx.common.mcts", "extract_path_visits",
     ),
     # preferences
     "sample_preferences": (

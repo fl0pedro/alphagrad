@@ -135,5 +135,5 @@ fi
 
 echo "[downstream-all] done. CSVs in ${OUT_DIR}."
 echo "Plot via:"
-echo "  uv run alphagrad/src/alphagrad/approx/plot_downstream.py \\"
+echo "  uv run alphagrad/plots/plot_downstream.py \\"
 echo "    --csv-glob '${OUT_DIR}/*_seed*.csv' --output-dir ${OUT_DIR}/plots"

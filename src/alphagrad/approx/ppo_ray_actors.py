@@ -98,19 +98,6 @@ class PPOActor:
         """Calibration sink — push rescaled weights back into the worker."""
         return self._impl.set_reward_weights(weights_np)
 
-    def set_variant_masks(self, variant: str) -> dict:
-        """Curriculum stage transition — see
-        ``PPORayWorker.set_variant_masks`` for the contract. Driver
-        calls this between episodes when ``--curriculum`` is set."""
-        return self._impl.set_variant_masks(str(variant))
-
-    def set_substep_budget(self, budget) -> int:
-        """Substep-budget curriculum — forward to
-        ``PPORayWorker.set_substep_budget``. Exposing it on the Ray ACTOR
-        class (not just the inner worker) is what makes the
-        ``actor.set_substep_budget.remote(...)`` round-trip work."""
-        return self._impl.set_substep_budget(int(budget))
-
     def ready(self) -> bool:
         if self._impl is None:
             return False

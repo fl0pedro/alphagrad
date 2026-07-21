@@ -53,13 +53,6 @@ export ALPHAGRAD_PEAK_MEMORY_ABSOLUTE=1
 
 # >>> ViT measurability stack <<<
 export ALPHAGRAD_VIT_POW2=1
-# >>> SUBSTEP-BUDGET CURRICULUM (bridge-cse) <<<
-# budget(ep)=min(16, ep//40): 17 levels x 40 eps = 680 eps to reach full.
-# Level 0 (ep 0-39) budget=0 = PURE exact elimination (order only, no micro-
-# actions); opens up 1 slot every 40 eps. Runtime OP_END cap (no recompile).
-export ALPHAGRAD_SUBSTEP_CURRICULUM=${ALPHAGRAD_SUBSTEP_CURRICULUM:-1}
-export ALPHAGRAD_SUBSTEP_CURRICULUM_STEP=${ALPHAGRAD_SUBSTEP_CURRICULUM_STEP:-40}
-export ALPHAGRAD_SUBSTEP_CURRICULUM_CEIL=${ALPHAGRAD_SUBSTEP_CURRICULUM_CEIL:-16}
 
 # >>> bkstep OFF <<<
 export ALPHAGRAD_BKSTEP=0
@@ -126,7 +119,6 @@ uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --measure-grad --exec-on-gpu --measure-latency --latency-inner-reps $LATENCY_INNER_REPS \
   --entropy-coef $ENTROPY_COEF --entropy-coef-final $ENTROPY_COEF_FINAL \
   --dynamic-substeps --max-substeps ${MAX_SUBSTEPS} \
-  --substep-curriculum \
   --actor-num-gpus 1 --cpu-actor-num-gpus 1 --num-cpu-workers $NUM_CPU_WORKERS \
   --cpu-cores-per-actor $CPU_CORES_PER_ACTOR --cpu-cores-shared \
   --cpu-callback-timeout 1800 --cpu-callback-initial-timeout 1800 \

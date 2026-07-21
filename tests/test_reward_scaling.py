@@ -42,7 +42,7 @@ def test_build_reward_weights_default_three_channels():
     )
 
     w = build_reward_weights(_make_args())
-    assert w.shape == (8,)
+    assert w.shape == (10,)
     assert w[REWARD_INDEX["flops"]] == 1.0
     assert w[REWARD_INDEX["peak_memory"]] == 1.0
     assert w[REWARD_INDEX["cosine_sim"]] == 1.0
@@ -95,7 +95,7 @@ def test_symlog_sign_and_magnitude():
 # ---------------------------------------------------------------------------
 
 def test_filter_sentinel_mask_detects_any_cost_channel():
-    from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+    from alphagrad.approx.common.compile_cache import SENTINEL_REWARD_VALUE
     from alphagrad.approx.common.reward_scaling import (
         NUM_REWARDS, REWARD_INDEX, filter_sentinel_mask,
     )
@@ -121,7 +121,7 @@ def test_filter_sentinel_mask_detects_any_cost_channel():
 # ---------------------------------------------------------------------------
 
 def test_aggregate_per_channel_stats_shape_and_keys():
-    from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+    from alphagrad.approx.common.compile_cache import SENTINEL_REWARD_VALUE
     from alphagrad.approx.common.reward_scaling import (
         NUM_REWARDS, REWARD_INDEX, REWARD_NAMES,
         aggregate_per_channel_stats,
@@ -177,7 +177,7 @@ def test_aggregate_with_dones_mask_distinguishes_per_step_from_terminal():
         REWARD_INDEX,
         aggregate_per_channel_stats,
     )
-    from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+    from alphagrad.approx.common.compile_cache import SENTINEL_REWARD_VALUE
 
     T, N = 5, 4
     rv = np.zeros((T, N, NUM_REWARDS), dtype=np.float32)
@@ -207,7 +207,7 @@ def test_build_unified_reward_log_dict_emits_grouped_keys():
         aggregate_per_channel_stats,
         build_unified_reward_log_dict,
     )
-    from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+    from alphagrad.approx.common.compile_cache import SENTINEL_REWARD_VALUE
 
     T, N = 3, 2
     rv = np.zeros((T, N, NUM_REWARDS), dtype=np.float32)
@@ -269,7 +269,7 @@ def test_build_unified_reward_log_dict_ceiling_only_corridor():
 
 
 def test_aggregate_filters_sentinels_from_per_channel_means():
-    from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+    from alphagrad.approx.common.compile_cache import SENTINEL_REWARD_VALUE
     from alphagrad.approx.common.reward_scaling import (
         NUM_REWARDS, REWARD_INDEX, aggregate_per_channel_stats,
     )

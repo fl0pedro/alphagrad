@@ -64,7 +64,7 @@ export ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY=${ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY
 # >>> COST-HEAD AUXILIARY TASK (bridge-cse) <<<
 # cost_head predicts the terminal MEASURED 4-tuple (symlog); aux Huber loss
 # into the shared encoder (weight 0.3). Held CONSTANT across both ablation
-# arms so the curriculum comparison stays clean.
+# arms so the comparison stays clean.
 export ALPHAGRAD_COST_HEAD_AUX=${ALPHAGRAD_COST_HEAD_AUX:-1}
 export ALPHAGRAD_COST_HEAD_AUX_WEIGHT=${ALPHAGRAD_COST_HEAD_AUX_WEIGHT:-0.3}
 export ALPHAGRAD_RECYCLE_RETRY_ON_OOM=${ALPHAGRAD_RECYCLE_RETRY_ON_OOM:-1}

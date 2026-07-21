@@ -1,4 +1,4 @@
-"""Unit tests for ``alphagrad.approx.common.cache.setup_jax_compile_cache``.
+"""Unit tests for ``alphagrad.approx.common.compile_cache.setup_jax_compile_cache``.
 
 The helper is the single source of truth for the JAX persistent disk
 cache across `ppo.py`, `mu0.py`, the Ray PPO worker, and the CPU
@@ -39,7 +39,7 @@ def test_default_path_uses_slurm_job_id(monkeypatch):
     ``/tmp/dsnn-jax-cache-${SLURM_JOB_ID}-${hostname}/``."""
     monkeypatch.setenv("SLURM_JOB_ID", "12345")
 
-    from alphagrad.approx.common.cache import setup_jax_compile_cache
+    from alphagrad.approx.common.compile_cache import setup_jax_compile_cache
 
     host = socket.gethostname().split(".", 1)[0]
     expected = f"/tmp/dsnn-jax-cache-12345-{host}"
@@ -65,7 +65,7 @@ def test_env_var_takes_precedence(monkeypatch, tmp_path):
     monkeypatch.setenv("JAX_COMPILATION_CACHE_DIR", custom)
     monkeypatch.setenv("SLURM_JOB_ID", "67890")
 
-    from alphagrad.approx.common.cache import setup_jax_compile_cache
+    from alphagrad.approx.common.compile_cache import setup_jax_compile_cache
 
     got = setup_jax_compile_cache()
     assert got == custom
@@ -79,7 +79,7 @@ def test_reuse_flag_uses_shared_path(monkeypatch, tmp_path):
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setenv("SLURM_JOB_ID", "99999")
 
-    from alphagrad.approx.common.cache import setup_jax_compile_cache
+    from alphagrad.approx.common.compile_cache import setup_jax_compile_cache
 
     got = setup_jax_compile_cache()
     host = socket.gethostname().split(".", 1)[0]
@@ -92,7 +92,7 @@ def test_idempotent(monkeypatch, tmp_path):
     """Re-calling in the same process should be a no-op (env-var sticks)."""
     monkeypatch.setenv("JAX_COMPILATION_CACHE_DIR", str(tmp_path / "fixed"))
 
-    from alphagrad.approx.common.cache import setup_jax_compile_cache
+    from alphagrad.approx.common.compile_cache import setup_jax_compile_cache
 
     a = setup_jax_compile_cache()
     b = setup_jax_compile_cache()
@@ -102,5 +102,5 @@ def test_idempotent(monkeypatch, tmp_path):
 def test_sentinel_value_constant():
     """The sentinel value is exposed for downstream filtering and must
     match the ``cpu_approx_pool.py`` magic."""
-    from alphagrad.approx.common.cache import SENTINEL_REWARD_VALUE
+    from alphagrad.approx.common.compile_cache import SENTINEL_REWARD_VALUE
     assert SENTINEL_REWARD_VALUE == -1e10

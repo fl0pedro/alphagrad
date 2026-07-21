@@ -3,7 +3,7 @@
 Covers the post-refactor additions to
 ``alphagrad.approx.common.reward_scaling``:
 
-* ``aggregate_per_channel_stats`` now records the full 8-channel
+* ``aggregate_per_channel_stats`` now records the full 10-channel
   ``(a_i, b_i, c_i, r_i)`` tuple for every per-channel best (via
   ``all_raw`` / ``all_weighted``) plus the overall winning env's seq.
 * ``update_running_bests`` preserves those tuples across episodes.
@@ -31,7 +31,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def test_aggregate_records_full_reward_tuple_per_channel():
-    """The env that wins each channel must have its FULL 8-channel
+    """The env that wins each channel must have its FULL 10-channel
     raw + weighted vector recorded under ``all_raw`` / ``all_weighted``
     so the JSON dump can report ``(a_i, b_i, c_i, r_i)`` for every
     per-channel best — not just the winning channel's value."""

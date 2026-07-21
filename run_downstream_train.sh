@@ -98,4 +98,4 @@ fi
 
 echo "All variants finished cleanly. CSVs in ${OUT_DIR}."
 echo "Plot with:"
-echo "  uv run alphagrad/src/alphagrad/approx/plot_downstream.py --csv-glob '${OUT_DIR}/*_seed*.csv' --output-dir ${OUT_DIR}/plots"
+echo "  uv run alphagrad/plots/plot_downstream.py --csv-glob '${OUT_DIR}/*_seed*.csv' --output-dir ${OUT_DIR}/plots"
