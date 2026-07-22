@@ -29,25 +29,8 @@ os.environ.setdefault("ALPHAGRAD_PREVALIDATE_MEASURE", "1")
 os.environ.setdefault("ALPHAGRAD_BKSTEP", "0")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-ap = argparse.ArgumentParser()
-ap.add_argument("--seed", type=int, default=7)
-ap.add_argument("--task", default="VmappedNeuralNetwork")   # e.g. VmappedViT
-ap.add_argument("--dataset", default="mnist")
-ap.add_argument("--total-measurements", type=int, default=150)
-ap.add_argument("--n-candidates", type=int, default=8)      # Gumbel top-m at the root
-ap.add_argument("--rollout-depth", type=int, default=3)     # greedy descent depth per sim
-ap.add_argument("--train-epochs", type=int, default=4)
-ap.add_argument("--replay-episodes", type=int, default=16)
-ap.add_argument("--lr", type=float, default=3e-4)
-ap.add_argument("--nn-hidden", type=int, default=256)
-ap.add_argument("--ndata", type=int, default=5)
-ap.add_argument("--latency-inner-reps", type=int, default=50)
-ap.add_argument("--out", default=os.path.expanduser("~/dsnn/az_gumbel_out"))
-ap.add_argument("--wandb", action="store_true")
-ap.add_argument("--wandb-name", default="az_gumbel")
-ap.add_argument("--wandb-project", default="dsnn-jac-gpu")
-ap.add_argument("--wandb-entity", default="dll-streetview")
-A = ap.parse_args()
+from alphagrad.approx.az_args import make_argparser  # noqa: E402
+A = make_argparser().parse_args()
 os.environ["ALPHAGRAD_NN_HIDDEN"] = str(A.nn_hidden)
 # propagate task to the measure-server child (inherits our env at spawn)
 os.environ["ALPHAGRAD_MS_TASK"] = A.task
@@ -71,7 +54,7 @@ from alphagrad.approx.common.pareto_archive import ParetoArchive
 from graphax.core import _build_graph, _prune_graph, _eliminate_vertex
 from graphax.sparse.micro_actions import COMPRESS_KINDS
 
-# ---------------------------------------------------------------- env (measure_worker pattern)
+# ------------------------------------------------------- 1. config/env (measure_worker pattern)
 TASK = A.task; DSET = A.dataset
 LOSS = scalar_loss_fn(get_fn(TASK))
 ARGN = infer_argnums(TASK)
@@ -96,7 +79,7 @@ def copy_g(g): return {kk: dict(vv) for kk, vv in g.items()}
 def outvar(i): return jaxpr.eqns[i - 1].outvars[0]
 def legal_set(graph): return [i for i in VALID if outvar(i) in graph]
 
-# ---------------------------------------------------------------- objective (matches campaign)
+# --------------------------- 4. normalisation (PopArt) + Pareto archive / objective (campaign)
 CH = ["latency_ns", "xla_peak_memory", "flops", "cosine_sim"]
 TIDX = np.array([REWARD_INDEX[c] for c in CH], dtype=np.int32)
 W4 = np.array([-1.0, -1.0, 0.0, 1.0], dtype=np.float64)   # equal-weight, flops dropped
@@ -286,13 +269,15 @@ def measure(state):
     r = np.array([lat, peak, flops, cos])
     return r if np.all(np.isfinite(r)) else None
 
-# ---------------------------------------------------------------- agent (PPO components)
+# ------------------------------------------- 2. policy (build_policy) — the PPO components
 EMBD = 128
 kA = jax.random.PRNGKey(A.seed)
 agent = build_policy(vocab_size=512, embd_dim=EMBD, num_layers=4, num_heads=4,
                       hidden_dim=256, num_vertices=len(jaxpr.eqns),
                       value_dims=(128, 128), key=kA, max_substeps=1,
                       policy="palimpsa")
+
+# ------------------------------------------------------------------ 3. optimizer
 opt = optax.adam(A.lr)
 opt_state = opt.init(eqx.filter(agent, eqx.is_array))
 
@@ -471,27 +456,56 @@ def train_step(agent, opt_state, batch):
     up, opt_state = opt.update(gr, opt_state, eqx.filter(agent, eqx.is_array))
     return eqx.apply_updates(agent, up), opt_state, l
 
-# ---------------------------------------------------------------- main loop
-if __name__ == "__main__":
-    os.makedirs(A.out, exist_ok=True)
-    rng = np.random.default_rng(A.seed)
+# ---------------------------------------------------------------- 5.-6. main loop
+def _run(args) -> int:
+    """The training loop: search -> measure -> PopArt -> Pareto -> train.
+
+    Mirrors `ppo_ray._run`, with one deliberate asymmetry: az's SETUP (env,
+    agent, opt, popart, _pareto and the TASK/VALID/NV/TIDX/W4 constants) stays
+    at MODULE level, because the search functions (`gumbel_search`, `net_eval`,
+    `batch_eval`, `measure`, `scalarize`) read it through module globals —
+    moving it into a function would silently turn those reads stale. For the
+    same reason `gumbel_search` still reads `A.n_candidates` / `A.rollout_depth`
+    off the module-level `A`, not off `args` (same values; see `main`).
+
+    `global agent, opt_state` is LOAD-BEARING, not decoration: this loop REBINDS
+    `agent` (PopArt head rescale, then `train_step`) and `batch_eval` must see
+    the rebound agent. Without it both names would become `_run` locals and the
+    net would either go stale in the search or raise UnboundLocalError.
+    """
+    global agent, opt_state
+    # Phase map, shared with `ppo_ray._run` so the two trainers read in the same
+    # order. Phases 1-4 run at IMPORT time here (see the banners above), so only
+    # 5 and 6 are in this function:
+    #   1. config/env                      -> module level, "1. config/env"
+    #   2. policy (build_policy)           -> module level, "2. policy"
+    #   3. optimizer                       -> module level, "3. optimizer"
+    #   4. normalisation (PopArt) + Pareto -> module level, "4. normalisation"
+    #   5. loop / 6. logging+dump          -> below
+    # (module order is 1, 4, 2, 3 — the objective constants sit next to PopArt,
+    #  which reads them; nothing else depends on that ordering.)
+
+    # --- 1. config/env (run-local tail: out dir, rng, replay, wandb) ---
+    os.makedirs(args.out, exist_ok=True)
+    rng = np.random.default_rng(args.seed)
     replay = []                                    # episodes of (tok, eqn, la, pi) + ztarget
     _solutions = []                                # every (raw4, state, n) — re-ranked under current norm
     best = {"scalar": -1e18, "raw": None, "state": None, "at": 0}
     n_meas = 0; ep = 0
     wb = None
-    if A.wandb:
+    if args.wandb:
         try:
             import wandb
-            wb = wandb.init(project=A.wandb_project, entity=A.wandb_entity,
-                            name=A.wandb_name, config=vars(A))
+            wb = wandb.init(project=args.wandb_project, entity=args.wandb_entity,
+                            name=args.wandb_name, config=vars(args))
         except Exception:
             wb = None
-    print(f"[gaz] NV={NV} budget={A.total_measurements} m={A.n_candidates} "
-          f"depth={A.rollout_depth} micro={GAZ_MICRO}", flush=True)
+    print(f"[gaz] NV={NV} budget={args.total_measurements} m={args.n_candidates} "
+          f"depth={args.rollout_depth} micro={GAZ_MICRO}", flush=True)
 
     MAXTOK = 0
-    while n_meas < A.total_measurements:
+    # --- 5. loop: act/search -> measure -> popart -> pareto -> train ---
+    while n_meas < args.total_measurements:
         ep += 1
         state = []; graph, tg = copy_g(GRAPH0), copy_g(TG0)
         steps = []
@@ -546,7 +560,7 @@ if __name__ == "__main__":
         for s in steps:
             s["raw4"] = raw.copy()                 # store RAW; z-normalize at TRAIN time
         replay.append(steps)
-        replay = replay[-A.replay_episodes:]
+        replay = replay[-args.replay_episodes:]
         # ---- train on the replay (only once the normalizer is warm: raw latency/peak
         # magnitudes ~1e4-1e6 would explode the value loss before MU/SD are set) ----
         flat = [s for epi in replay for s in epi]
@@ -566,32 +580,32 @@ if __name__ == "__main__":
             vm = jnp.asarray(np.broadcast_to(np.abs(W4) > 0, (len(flat), 4)).astype(np.float32))
             idx = rng.permutation(len(flat))[:64]
             batch = tuple(x[jnp.asarray(idx)] for x in (toks, eqns, la_p, la_m, pi_p, vt, vm))
-            for _ in range(A.train_epochs):
+            for _ in range(args.train_epochs):
                 agent, opt_state, L = train_step(agent, opt_state, batch)
             L = float(L)
             _eval_cache.clear()          # net changed -> cached (prior, value) stale
         else:
             L = float("nan")
         b = best["raw"]
-        print(f"[gaz] ep={ep} n={n_meas}/{A.total_measurements} this(lat={raw[0]/1e3:.1f}us "
+        print(f"[gaz] ep={ep} n={n_meas}/{args.total_measurements} this(lat={raw[0]/1e3:.1f}us "
               f"cos={raw[3]:+.3f}) best(lat={b[0]/1e3:.1f}us peak={b[1]/1e6:.2f}MB "
               f"cos={b[3]:+.4f} at={best['at']}) loss={L:.4f}", flush=True)
         # persist EVERY measured solution each episode (crash-safe): the per-run
         # PARETO FRONT over {lat, xla_peak, cos} is computed offline from this —
         # any weighting re-analyzable without re-running.
-        json.dump({"best": best, "n_measured": n_meas, "config": vars(A),
+        json.dump({"best": best, "n_measured": n_meas, "config": vars(args),
                    "micro": GAZ_MICRO,
                    "solutions": [{"n": nn, "raw": r.tolist(), "state": st}
                                  for r, st, nn in _solutions]},
-                  open(os.path.join(A.out, "gaz_result.json"), "w"),
+                  open(os.path.join(args.out, "gaz_result.json"), "w"),
                   indent=1, default=float)
         # Pareto frontier (crash-safe each episode; mirrors ppo_ray): live front +
         # every admitted candidate, plus hypervolume vs a fixed nadir (3-obj exact).
         try:
-            _pex = {"episode": ep, "n_measured": n_meas, "task": A.task, "seed": A.seed}
-            _pareto.dump_front(os.path.join(A.out, "gaz_pareto_front.json"), extra=_pex)
+            _pex = {"episode": ep, "n_measured": n_meas, "task": args.task, "seed": args.seed}
+            _pareto.dump_front(os.path.join(args.out, "gaz_pareto_front.json"), extra=_pex)
             _pareto.dump_all_candidates(
-                os.path.join(A.out, "gaz_all_front_candidates.json"), extra=_pex)
+                os.path.join(args.out, "gaz_all_front_candidates.json"), extra=_pex)
         except Exception as _pexc:
             print(f"[gaz] pareto dump failed: {_pexc}", flush=True)
         if wb is not None:
@@ -603,14 +617,15 @@ if __name__ == "__main__":
             except Exception:
                 pass
 
-    json.dump({"best": best, "n_measured": n_meas, "config": vars(A),
-               "micro": GAZ_MICRO}, open(os.path.join(A.out, "gaz_result.json"), "w"),
+    # --- 6. logging/dump ---
+    json.dump({"best": best, "n_measured": n_meas, "config": vars(args),
+               "micro": GAZ_MICRO}, open(os.path.join(args.out, "gaz_result.json"), "w"),
               indent=2, default=float)
     try:
-        _pex = {"episode": ep, "n_measured": n_meas, "task": A.task, "seed": A.seed}
-        _pareto.dump_front(os.path.join(A.out, "gaz_pareto_front.json"), extra=_pex)
+        _pex = {"episode": ep, "n_measured": n_meas, "task": args.task, "seed": args.seed}
+        _pareto.dump_front(os.path.join(args.out, "gaz_pareto_front.json"), extra=_pex)
         _pareto.dump_all_candidates(
-            os.path.join(A.out, "gaz_all_front_candidates.json"), extra=_pex)
+            os.path.join(args.out, "gaz_all_front_candidates.json"), extra=_pex)
         print(f"[gaz] pareto: {len(_pareto.pts)} front pts / "
               f"{len(_pareto.all_candidates)} candidates, HV={_pareto.hypervolume():.4g}",
               flush=True)
@@ -620,3 +635,21 @@ if __name__ == "__main__":
     if wb is not None:
         try: wb.finish()
         except Exception: pass
+    return 0
+
+
+def main() -> int:
+    """Entry point, mirroring `ppo_ray.main`.
+
+    NOTE the asymmetry vs ppo_ray: az_gumbel ALSO parses at import time (the
+    module-level `A`), because the module-level setup above needs the config
+    before any search function is defined. This parse re-reads the same
+    `sys.argv`, so `args` is value-identical to `A`; it exists so that `main`
+    reads like `ppo_ray.main` and `_run` takes its config as an argument.
+    """
+    args = make_argparser().parse_args()
+    return _run(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

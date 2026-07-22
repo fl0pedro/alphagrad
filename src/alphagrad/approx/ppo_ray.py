@@ -86,6 +86,13 @@ def _run(args) -> int:
     from alphagrad.approx.ppo_ray_actors import PPOActor
     from alphagrad.approx.cpu_approx_actors import CpuApproximationActor
 
+    # Phase map, shared with `az_gumbel.py` so the two trainers read in the
+    # same order: 1. config/env  2. policy  3. optimizer  4. normalisation
+    # (PopArt) + Pareto archive  5. loop  6. logging/dump. In THIS file 2 and 3
+    # happen inside the Ray actor, so they are marked at the call that builds
+    # it; az_gumbel does 1-4 at module import (see the banners in that file).
+
+    # --- 1. config/env ---
     args_dict = vars(args)
     # ASYNC PIPELINE GPU split (bridge-cse): the learner + sampler co-reside on
     # GPU0 (light policy inference), the 3 measure actors keep GPU1-3. With
@@ -181,6 +188,8 @@ def _run(args) -> int:
         max_size=int(getattr(args, "compile_cache_size", 512)),
     )
 
+    # --- 2. policy (build_policy) --- actor-side: PPOActor.init_worker calls
+    # `policy.build_policy(...)` on its GPU. az_gumbel calls it inline.
     actor = PPOActor.options(**actor_kwargs).remote(
         args_dict, int(args.seed),
     )
@@ -264,6 +273,9 @@ def _run(args) -> int:
             )
         )
 
+    # --- 3. optimizer --- also actor-side: the optax chain is built by
+    # `init_worker`, which this call triggers (az_gumbel builds it inline).
+    #
     # Construct the timeout-bounded pool. `init_server` also internally
     # calls `init_worker` if the worker hasn't been built yet, so we
     # don't need a separate `init_worker` call. The pool kicks in
@@ -289,6 +301,9 @@ def _run(args) -> int:
         f"  actors spawned + JIT-warm in {time.time() - args.t_start:.1f}s"
     )
 
+    # --- 4. normalisation (PopArt) + Pareto archive --- PopArt itself is
+    # actor-side (`ppo_ray_worker`); the driver owns the running bests and the
+    # RAW-unit Pareto archive. az_gumbel keeps both at module level.
     seed_counter = int(args.seed) + 100
     state = init_running_bests()
 
@@ -354,6 +369,9 @@ def _run(args) -> int:
         except Exception as _exc:
             tqdm.write(f"  [ppo_ray] pareto dump failed: {_exc}")
 
+    # --- 5. loop: act/search -> measure -> popart -> pareto -> train ---
+    # Two implementations of the same phase: the async pipeline below (returns
+    # from inside it) and the synchronous episode loop after it.
     # ==================================================================
     # ASYNC PIPELINE (Stage 1, bridge-cse). measure(ep N+1) overlaps
     # learn(ep N): a SAMPLER PPOActor collects rollouts + measures into the
@@ -613,6 +631,7 @@ def _run(args) -> int:
 
     pbar.close()
 
+    # --- 6. logging/dump ---
     tqdm.write("\n========== FINAL ==========")
     tqdm.write(
         f"  best return: {state['best_global_return']:+.6g}  "
