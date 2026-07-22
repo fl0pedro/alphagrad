@@ -66,6 +66,8 @@ from alphagrad.approx.common.examples import (
 from alphagrad.approx.common.eval_samples import generate_eval_samples
 from alphagrad.approx.common.order_specs import build_order_specs
 from alphagrad.approx.policy import build_policy, NUM_REWARDS
+from alphagrad.approx.common.popart import PopArtStats, popart_rescale_mlp_head
+from alphagrad.approx.common.pareto_archive import ParetoArchive
 from graphax.core import _build_graph, _prune_graph, _eliminate_vertex
 from graphax.sparse.micro_actions import COMPRESS_KINDS
 
@@ -98,16 +100,54 @@ def legal_set(graph): return [i for i in VALID if outvar(i) in graph]
 CH = ["latency_ns", "xla_peak_memory", "flops", "cosine_sim"]
 TIDX = np.array([REWARD_INDEX[c] for c in CH], dtype=np.int32)
 W4 = np.array([-1.0, -1.0, 0.0, 1.0], dtype=np.float64)   # equal-weight, flops dropped
-MU4 = np.zeros(4); SD4 = np.ones(4)
-_measured = []
-def _refresh_norm():
-    global MU4, SD4
-    Y = np.asarray(_measured, dtype=np.float64)
-    if Y.ndim == 2 and len(Y) >= 8:
-        MU4, SD4 = Y.mean(0), Y.std(0) + 1e-8
+# PopArt value-target normalisation over the TIDX focus channels (van Hasselt
+# 2016; multi-channel IMPALA form) replaces the batch mean/std z-score: a slow
+# debiased-EMA per-channel (mu, sigma) that a homogeneous batch cannot amplify
+# (sigma is floored), PLUS the "Art" -- an OUTPUT-PRESERVING rescale of the
+# value head's final linear layer on every stats step (applied in the measure
+# loop). K = len(TIDX) = the 4 channels the value head is read out at [lat,
+# peak, flops, cos]; flops has W4=0 so it is inert in every scalarization,
+# tracked only so (mu, sigma) line up 1:1 with v10[TIDX] and the head rows.
+# PopArt config MIRRORS ppo_ray_worker (verified): raw cost channels span
+# ~1e9, so sigma_max MUST admit the true scale -- the default 1e6 CLAMPS sigma
+# and O(100)-under-normalises the cost advantage (ppo observed this ep1-4).
+# cosine_sim is a QUALITY channel that converges to ~const (var->0), so it
+# gets a higher sigma floor. az feeds M=1 per update, so the robust winsor
+# pass is inert here, but the config is kept at parity with ppo_ray_worker.
+_sig_min_base = float(os.environ.get("ALPHAGRAD_POPART_SIGMA_MIN", "0.1"))
+_sig_min_qual = float(os.environ.get("ALPHAGRAD_POPART_SIGMA_MIN_QUALITY", "0.2"))
+_sig_min_vec = np.full(len(TIDX), _sig_min_base, dtype=np.float64)
+for _qi, _c in enumerate(CH):
+    if _c in ("cosine_sim", "bkstep_acc", "frob_residual"):
+        _sig_min_vec[_qi] = max(_sig_min_base, _sig_min_qual)
+popart = PopArtStats(
+    len(TIDX),
+    beta=float(os.environ.get("ALPHAGRAD_POPART_BETA", "0.01")),
+    sigma_min=_sig_min_vec,
+    sigma_max=float(os.environ.get("ALPHAGRAD_POPART_SIGMA_MAX", "1e12")),
+    robust_std=os.environ.get("ALPHAGRAD_POPART_ROBUST_STD", "1") == "1",
+    winsor_k=float(os.environ.get("ALPHAGRAD_POPART_WINSOR_K", "5.0")),
+)
+def _popart10(mu, sigma):
+    """Scatter a len(TIDX) stats vector into NUM_REWARDS-long (mu, sigma) that
+    are IDENTITY (mu=0, sigma=1 -> ratio 1, bias unchanged) on every non-focus
+    row, so popart_rescale_mlp_head rescales EXACTLY the TIDX rows of the value
+    head and provably leaves the other rows untouched."""
+    m = np.zeros(NUM_REWARDS, dtype=np.float32); m[TIDX] = np.asarray(mu, np.float32)
+    s = np.ones(NUM_REWARDS, dtype=np.float32); s[TIDX] = np.asarray(sigma, np.float32)
+    return m, s
 def scalarize(raw4):
     r = np.asarray(raw4, dtype=np.float64)
-    return float(np.sum(W4 * (r - MU4) / SD4))
+    return float(np.sum(W4 * (r - popart.mu) / popart.sigma))
+
+# Pareto archive over the 3 focus OBJECTIVES {latency, xla_peak, cosine} in RAW
+# native units (kept SEPARATE from PopArt -- never the normalized values). The
+# archive MAXIMISES, so feed a sign-oriented raw vector (negate the cost
+# channels, keep cosine) and select the lat/peak/cos slots via obj_idx (flops
+# excluded). Exactly 3 objectives => hypervolume() uses the exact 2/3-D sweep,
+# not the >=4-D normalized Monte-Carlo estimate.
+_PSGN = np.array([-1.0, -1.0, -1.0, 1.0], dtype=np.float64)   # over [lat,peak,flops,cos]
+_pareto = ParetoArchive(["latency_ns", "xla_peak_memory", "cosine_sim"], [0, 1, 3])
 
 # ---------------------------------------------------------------- state <-> tokens
 QD = [d for d in os.environ.get(
@@ -432,117 +472,151 @@ def train_step(agent, opt_state, batch):
     return eqx.apply_updates(agent, up), opt_state, l
 
 # ---------------------------------------------------------------- main loop
-os.makedirs(A.out, exist_ok=True)
-rng = np.random.default_rng(A.seed)
-replay = []                                    # episodes of (tok, eqn, la, pi) + ztarget
-_solutions = []                                # every (raw4, state, n) — re-ranked under current norm
-best = {"scalar": -1e18, "raw": None, "state": None, "at": 0}
-n_meas = 0; ep = 0
-wb = None
-if A.wandb:
-    try:
-        import wandb
-        wb = wandb.init(project=A.wandb_project, entity=A.wandb_entity,
-                        name=A.wandb_name, config=vars(A))
-    except Exception:
-        wb = None
-print(f"[gaz] NV={NV} budget={A.total_measurements} m={A.n_candidates} "
-      f"depth={A.rollout_depth} micro={GAZ_MICRO}", flush=True)
+if __name__ == "__main__":
+    os.makedirs(A.out, exist_ok=True)
+    rng = np.random.default_rng(A.seed)
+    replay = []                                    # episodes of (tok, eqn, la, pi) + ztarget
+    _solutions = []                                # every (raw4, state, n) — re-ranked under current norm
+    best = {"scalar": -1e18, "raw": None, "state": None, "at": 0}
+    n_meas = 0; ep = 0
+    wb = None
+    if A.wandb:
+        try:
+            import wandb
+            wb = wandb.init(project=A.wandb_project, entity=A.wandb_entity,
+                            name=A.wandb_name, config=vars(A))
+        except Exception:
+            wb = None
+    print(f"[gaz] NV={NV} budget={A.total_measurements} m={A.n_candidates} "
+          f"depth={A.rollout_depth} micro={GAZ_MICRO}", flush=True)
 
-MAXTOK = 0
-while n_meas < A.total_measurements:
-    ep += 1
-    state = []; graph, tg = copy_g(GRAPH0), copy_g(TG0)
-    steps = []
-    _memlog = os.environ.get("ALPHAGRAD_GAZ_MEMLOG", "0") == "1"
-    _dstep = 0
-    while True:
-        legal = legal_set(graph)
-        if not legal:
-            break
-        chosen, pi, la, legal = gumbel_search(state, graph, tg, rng)
-        tok, eqn = tokens_of(state)
-        steps.append({"tok": np.asarray(tok), "eqn": np.asarray(eqn),
-                      "la": la.copy(), "pi": pi.copy()})
-        step_state(graph, tg, state, chosen["v"], chosen["micro"])
-        _dstep += 1
-        if _memlog and _dstep % 5 == 0:
+    MAXTOK = 0
+    while n_meas < A.total_measurements:
+        ep += 1
+        state = []; graph, tg = copy_g(GRAPH0), copy_g(TG0)
+        steps = []
+        _memlog = os.environ.get("ALPHAGRAD_GAZ_MEMLOG", "0") == "1"
+        _dstep = 0
+        while True:
+            legal = legal_set(graph)
+            if not legal:
+                break
+            chosen, pi, la, legal = gumbel_search(state, graph, tg, rng)
+            tok, eqn = tokens_of(state)
+            steps.append({"tok": np.asarray(tok), "eqn": np.asarray(eqn),
+                          "la": la.copy(), "pi": pi.copy()})
+            step_state(graph, tg, state, chosen["v"], chosen["micro"])
+            _dstep += 1
+            if _memlog and _dstep % 5 == 0:
+                try:
+                    ms = jax.devices()[0].memory_stats()
+                    print(f"[gaz][mem] ep={ep} decision={_dstep}/{len(legal)+_dstep} "
+                          f"peak={ms.get('peak_bytes_in_use',0)/1e9:.2f}GB "
+                          f"curr={ms.get('bytes_in_use',0)/1e9:.2f}GB "
+                          f"tokcache={len(_tok_cache)} evalcache={len(_eval_cache)}", flush=True)
+                except Exception:
+                    pass
+        raw = measure(state)
+        n_meas += 1
+        if raw is None:
+            print(f"[gaz] ep={ep} measure FAILED (n={n_meas})", flush=True)
+            continue
+        # PopArt: one debiased-EMA step on the measured focus channels, then the
+        # output-preserving rescale of the value head's TIDX rows (identity on the
+        # rest); the critic keeps predicting PopArt-normalised values and its
+        # existing predictions stay consistent across the stats jump.
+        _o_mu, _o_sig, _n_mu, _n_sig = popart.update(raw[None, :])
+        agent = eqx.tree_at(
+            lambda a: a.value_head, agent,
+            popart_rescale_mlp_head(agent.value_head,
+                                    *_popart10(_o_mu, _o_sig), *_popart10(_n_mu, _n_sig)))
+        _eval_cache.clear()          # value head rescaled -> cached (prior, value) stale
+        # Pareto front over RAW {lat, xla_peak, cos} (sign-oriented; archive maximises)
+        _pareto.add(_PSGN * raw,
+                    [(int(a), list(m) if m else None) for a, m in state], ep)
+        # best-tracker: scores from different normalizer epochs are NOT comparable
+        # (pre-warmup raw-scale ~-1e6 vs z-scored O(1) let a worse order overwrite a
+        # better one at n=8). Keep every (raw, state) and re-argmax under the CURRENT
+        # normalizer each episode.
+        _solutions.append((raw.copy(),
+                           [(int(a), list(m) if m else None) for a, m in state], n_meas))
+        bi = int(np.argmax([scalarize(r) for r, _, _ in _solutions]))
+        braw, bstate, bat = _solutions[bi]
+        best.update(scalar=scalarize(braw), raw=braw.tolist(), state=bstate, at=bat)
+        for s in steps:
+            s["raw4"] = raw.copy()                 # store RAW; z-normalize at TRAIN time
+        replay.append(steps)
+        replay = replay[-A.replay_episodes:]
+        # ---- train on the replay (only once the normalizer is warm: raw latency/peak
+        # magnitudes ~1e4-1e6 would explode the value loss before MU/SD are set) ----
+        flat = [s for epi in replay for s in epi]
+        if len(flat) >= 8 and popart.n_updates >= 8:
+            # fixed shapes (tok already TOKCAP-padded; legal set <= NV) -> train_step
+            # compiles ONCE instead of re-jitting as episode lengths vary
+            MAXTOK = TOKCAP
+            MAXLA = NV
+            def pad(x, n, v=0):
+                return np.pad(x, (0, n - len(x)), constant_values=v)
+            toks = jnp.asarray([pad(s["tok"], MAXTOK) for s in flat])
+            eqns = jnp.asarray([pad(s["eqn"], MAXTOK) for s in flat])
+            la_p = jnp.asarray([pad(s["la"], MAXLA) for s in flat])
+            la_m = jnp.asarray([pad(np.ones(len(s["la"])), MAXLA) for s in flat])
+            pi_p = jnp.asarray([pad(s["pi"], MAXLA) for s in flat])
+            vt = jnp.asarray([(s["raw4"] - popart.mu) / popart.sigma for s in flat])  # PopArt-normalised
+            vm = jnp.asarray(np.broadcast_to(np.abs(W4) > 0, (len(flat), 4)).astype(np.float32))
+            idx = rng.permutation(len(flat))[:64]
+            batch = tuple(x[jnp.asarray(idx)] for x in (toks, eqns, la_p, la_m, pi_p, vt, vm))
+            for _ in range(A.train_epochs):
+                agent, opt_state, L = train_step(agent, opt_state, batch)
+            L = float(L)
+            _eval_cache.clear()          # net changed -> cached (prior, value) stale
+        else:
+            L = float("nan")
+        b = best["raw"]
+        print(f"[gaz] ep={ep} n={n_meas}/{A.total_measurements} this(lat={raw[0]/1e3:.1f}us "
+              f"cos={raw[3]:+.3f}) best(lat={b[0]/1e3:.1f}us peak={b[1]/1e6:.2f}MB "
+              f"cos={b[3]:+.4f} at={best['at']}) loss={L:.4f}", flush=True)
+        # persist EVERY measured solution each episode (crash-safe): the per-run
+        # PARETO FRONT over {lat, xla_peak, cos} is computed offline from this —
+        # any weighting re-analyzable without re-running.
+        json.dump({"best": best, "n_measured": n_meas, "config": vars(A),
+                   "micro": GAZ_MICRO,
+                   "solutions": [{"n": nn, "raw": r.tolist(), "state": st}
+                                 for r, st, nn in _solutions]},
+                  open(os.path.join(A.out, "gaz_result.json"), "w"),
+                  indent=1, default=float)
+        # Pareto frontier (crash-safe each episode; mirrors ppo_ray): live front +
+        # every admitted candidate, plus hypervolume vs a fixed nadir (3-obj exact).
+        try:
+            _pex = {"episode": ep, "n_measured": n_meas, "task": A.task, "seed": A.seed}
+            _pareto.dump_front(os.path.join(A.out, "gaz_pareto_front.json"), extra=_pex)
+            _pareto.dump_all_candidates(
+                os.path.join(A.out, "gaz_all_front_candidates.json"), extra=_pex)
+        except Exception as _pexc:
+            print(f"[gaz] pareto dump failed: {_pexc}", flush=True)
+        if wb is not None:
             try:
-                ms = jax.devices()[0].memory_stats()
-                print(f"[gaz][mem] ep={ep} decision={_dstep}/{len(legal)+_dstep} "
-                      f"peak={ms.get('peak_bytes_in_use',0)/1e9:.2f}GB "
-                      f"curr={ms.get('bytes_in_use',0)/1e9:.2f}GB "
-                      f"tokcache={len(_tok_cache)} evalcache={len(_eval_cache)}", flush=True)
+                wb.log({"ep": ep, "n_meas": n_meas, "loss": L, "best_scalar": best["scalar"],
+                        "best_lat_us": b[0] / 1e3, "best_cos": b[3], "this_lat_us": raw[0] / 1e3,
+                        "pareto/hypervolume": _pareto.hypervolume(),
+                        "pareto/size": len(_pareto.pts)})
             except Exception:
                 pass
-    raw = measure(state)
-    n_meas += 1
-    if raw is None:
-        print(f"[gaz] ep={ep} measure FAILED (n={n_meas})", flush=True)
-        continue
-    _measured.append(raw); _refresh_norm()
-    # best-tracker: scores from different normalizer epochs are NOT comparable
-    # (pre-warmup raw-scale ~-1e6 vs z-scored O(1) let a worse order overwrite a
-    # better one at n=8). Keep every (raw, state) and re-argmax under the CURRENT
-    # normalizer each episode.
-    _solutions.append((raw.copy(),
-                       [(int(a), list(m) if m else None) for a, m in state], n_meas))
-    bi = int(np.argmax([scalarize(r) for r, _, _ in _solutions]))
-    braw, bstate, bat = _solutions[bi]
-    best.update(scalar=scalarize(braw), raw=braw.tolist(), state=bstate, at=bat)
-    for s in steps:
-        s["raw4"] = raw.copy()                 # store RAW; z-normalize at TRAIN time
-    replay.append(steps)
-    replay = replay[-A.replay_episodes:]
-    # ---- train on the replay (only once the normalizer is warm: raw latency/peak
-    # magnitudes ~1e4-1e6 would explode the value loss before MU/SD are set) ----
-    flat = [s for epi in replay for s in epi]
-    if len(flat) >= 8 and len(_measured) >= 8:
-        # fixed shapes (tok already TOKCAP-padded; legal set <= NV) -> train_step
-        # compiles ONCE instead of re-jitting as episode lengths vary
-        MAXTOK = TOKCAP
-        MAXLA = NV
-        def pad(x, n, v=0):
-            return np.pad(x, (0, n - len(x)), constant_values=v)
-        toks = jnp.asarray([pad(s["tok"], MAXTOK) for s in flat])
-        eqns = jnp.asarray([pad(s["eqn"], MAXTOK) for s in flat])
-        la_p = jnp.asarray([pad(s["la"], MAXLA) for s in flat])
-        la_m = jnp.asarray([pad(np.ones(len(s["la"])), MAXLA) for s in flat])
-        pi_p = jnp.asarray([pad(s["pi"], MAXLA) for s in flat])
-        vt = jnp.asarray([(s["raw4"] - MU4) / SD4 for s in flat])  # CURRENT normalizer
-        vm = jnp.asarray(np.broadcast_to(np.abs(W4) > 0, (len(flat), 4)).astype(np.float32))
-        idx = rng.permutation(len(flat))[:64]
-        batch = tuple(x[jnp.asarray(idx)] for x in (toks, eqns, la_p, la_m, pi_p, vt, vm))
-        for _ in range(A.train_epochs):
-            agent, opt_state, L = train_step(agent, opt_state, batch)
-        L = float(L)
-        _eval_cache.clear()          # net changed -> cached (prior, value) stale
-    else:
-        L = float("nan")
-    b = best["raw"]
-    print(f"[gaz] ep={ep} n={n_meas}/{A.total_measurements} this(lat={raw[0]/1e3:.1f}us "
-          f"cos={raw[3]:+.3f}) best(lat={b[0]/1e3:.1f}us peak={b[1]/1e6:.2f}MB "
-          f"cos={b[3]:+.4f} at={best['at']}) loss={L:.4f}", flush=True)
-    # persist EVERY measured solution each episode (crash-safe): the per-run
-    # PARETO FRONT over {lat, xla_peak, cos} is computed offline from this —
-    # any weighting re-analyzable without re-running.
-    json.dump({"best": best, "n_measured": n_meas, "config": vars(A),
-               "micro": GAZ_MICRO,
-               "solutions": [{"n": nn, "raw": r.tolist(), "state": st}
-                             for r, st, nn in _solutions]},
-              open(os.path.join(A.out, "gaz_result.json"), "w"),
-              indent=1, default=float)
-    if wb is not None:
-        try:
-            wb.log({"ep": ep, "n_meas": n_meas, "loss": L, "best_scalar": best["scalar"],
-                    "best_lat_us": b[0] / 1e3, "best_cos": b[3], "this_lat_us": raw[0] / 1e3})
-        except Exception:
-            pass
 
-json.dump({"best": best, "n_measured": n_meas, "config": vars(A),
-           "micro": GAZ_MICRO}, open(os.path.join(A.out, "gaz_result.json"), "w"),
-          indent=2, default=float)
-print(f"[gaz] DONE best={best['raw']} at n={best['at']}", flush=True)
-if wb is not None:
-    try: wb.finish()
-    except Exception: pass
+    json.dump({"best": best, "n_measured": n_meas, "config": vars(A),
+               "micro": GAZ_MICRO}, open(os.path.join(A.out, "gaz_result.json"), "w"),
+              indent=2, default=float)
+    try:
+        _pex = {"episode": ep, "n_measured": n_meas, "task": A.task, "seed": A.seed}
+        _pareto.dump_front(os.path.join(A.out, "gaz_pareto_front.json"), extra=_pex)
+        _pareto.dump_all_candidates(
+            os.path.join(A.out, "gaz_all_front_candidates.json"), extra=_pex)
+        print(f"[gaz] pareto: {len(_pareto.pts)} front pts / "
+              f"{len(_pareto.all_candidates)} candidates, HV={_pareto.hypervolume():.4g}",
+              flush=True)
+    except Exception as _pexc:
+        print(f"[gaz] final pareto dump failed: {_pexc}", flush=True)
+    print(f"[gaz] DONE best={best['raw']} at n={best['at']}", flush=True)
+    if wb is not None:
+        try: wb.finish()
+        except Exception: pass
