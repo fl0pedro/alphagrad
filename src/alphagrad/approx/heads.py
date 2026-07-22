@@ -136,32 +136,22 @@ def _quant_dtype_mask():
     return _QUANT_DTYPE_MASK_CACHE
 
 
-# When ALPHAGRAD_MICRO_PAIR_MASKS=1, the DIAG axis-pair heads enforce the two
-# block-diagonal legality rules (mirrored on the graphax execution side):
+# The DIAG axis-pair heads ALWAYS enforce the two block-diagonal legality rules
+# (mirrored on the graphax execution side, whose GRAPHAX_KEEP_BLOCKDIAG is
+# likewise on by default):
 #   (1) FACTOR-DIVIDES-BLOCK: a further DIAG on an already-diagonalised axis may
-#       only subdivide its CURRENT block size. The factor head already gathers
-#       primes of gcd(current_size_i, current_size_j) — and `features.size` is
-#       set to the block size `factor` after a DIAG — so any sampled factor is a
-#       divisor of the current block size by construction. This flag additionally
-#       ALLOWS re-diagonalisation of a coupled axis (default masks forbid it), so
-#       that rule (2) can force the partner and rule (1) further-subdivides.
+#       only SUBDIVIDE its current block size -- the factor must be a multiple of
+#       the current meta count that still divides both logical sizes. See
+#       common.masks.diag_pair_factor_space, which returns exactly that space.
 #   (2) AXIS-PAIR CONFLICT: an already-coupled axis i forces j == partner(i)
 #       (j-head fast-skipped, its log-prob/entropy gated out of the PPO ratio);
 #       a free axis i may only pair with another free axis.
-# Default (unset) keeps the legacy behaviour: coupled axes are excluded from DIAG
-# entirely and the j-head always contributes. Read lazily (see note above).
-_MICRO_PAIR_MASKS_CACHE = None
-
-
-def _micro_pair_masks() -> bool:
-    """ALPHAGRAD_MICRO_PAIR_MASKS=1 -> enforce the DIAG block-structure pair
-    masks (forced partner + free-only pairing + coupled re-diag). Lazy; cached."""
-    global _MICRO_PAIR_MASKS_CACHE
-    if _MICRO_PAIR_MASKS_CACHE is None:
-        _MICRO_PAIR_MASKS_CACHE = (
-            os.environ.get("ALPHAGRAD_MICRO_PAIR_MASKS", "0") == "1"
-        )
-    return _MICRO_PAIR_MASKS_CACHE
+# These were once behind ALPHAGRAD_MICRO_PAIR_MASKS, defaulting OFF, which meant
+# the shipped default silently disagreed with the executor: coupled axes were
+# excluded from DIAG entirely, so re-diagonalisation -- which graphax supports
+# out of the box -- was unreachable, and i_coupled was pinned to zero so the
+# j-head contributed log-prob for a choice it never really had. There is no
+# reason to run without the rules the executor enforces, so the flag is gone.
 
 
 # ---------------------------------------------------------------------------
@@ -849,9 +839,8 @@ def _compute_axis_masks(
     Returns ``(i_mask_diag, i_mask_compress, j_mask_for_i_diag, i_coupled)``.
 
     ``j_mask_for_i_diag[i]`` is the legal ``j`` set when DIAG is chosen
-    with that particular ``i``; it enforces ``i != j`` and — under
-    :func:`_micro_pair_masks` — the block-structure pairing rules
-    (rule #2): a coupled ``i`` forces ``j == partner(i)`` (its row is a
+    with that particular ``i``; it enforces ``i != j`` and the
+    block-structure pairing rules (rule #2): a coupled ``i`` forces ``j == partner(i)`` (its row is a
     single one-hot), a free ``i`` may only pair with another free axis.
     ``i_coupled[i]`` is 1.0 iff axis ``i`` already has a DIAG partner; the
     head uses it to fast-skip (gate out) the j-head when ``i`` is coupled.
@@ -871,15 +860,6 @@ def _compute_axis_masks(
     compress_eligible = (valid & ~is_compressed).astype(jnp.float32)
     N = valid.shape[0]
     eye = jnp.eye(N, dtype=jnp.float32)
-
-    if not _micro_pair_masks():
-        # Legacy behaviour: coupled axes are excluded from DIAG entirely and
-        # the j-head always contributes (i_coupled all-zero).
-        diag_eligible = (valid & ~is_compressed & ~in_diag).astype(jnp.float32)
-        j_mask_for_i = diag_eligible[None, :] * (1.0 - eye)
-        i_coupled = jnp.zeros(N, dtype=jnp.float32)
-        return _finalise_axis_masks(diag_eligible, compress_eligible,
-                                    j_mask_for_i, i_coupled, pair_valid)
 
     # --- Rule #2: coupled-vs-free pairing --------------------------------
     partner = _compute_partner(features)               # (N,) int32, -1 = free

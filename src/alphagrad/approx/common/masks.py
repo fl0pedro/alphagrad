@@ -236,9 +236,9 @@ def diag_pair_gcd(st, i: int, j: int) -> int:
     prime-exponent factor head in ``heads.py`` enumerates. Returns ``0`` for an
     out-of-range pair.
 
-    Note: under ``GRAPHAX_KEEP_BLOCKDIAG`` an already-coupled pair may only be
-    RE-masked to a multiple of its current meta count (finer sub-blocks); that
-    extra constraint is a factor-level rule on top of this gcd.
+    This is the FREE-pair answer. An already-coupled pair carries the extra
+    constraint that the new factor must be a multiple of its current meta
+    count; use :func:`diag_pair_factor_space`, which folds both rules together.
     """
     dims = tuple(st.out_dims) + tuple(st.primal_dims)
     if not (0 <= i < len(dims) and 0 <= j < len(dims)):
@@ -266,3 +266,41 @@ def compress_valid_mask(st, max_axes: int) -> np.ndarray:
     if ndim > 0:
         mask[: min(ndim, max_axes)] = True
     return mask
+
+
+def diag_pair_factor_space(st, i: int, j: int) -> tuple[int, int]:
+    """``(base, span)`` describing the legal ``Diag.factor`` set for ``(i, j)``.
+
+    The legal factors are exactly ``base * d`` for every divisor ``d`` of
+    ``span`` -- a shape the prime-exponent factor head can enumerate directly,
+    since it already works by picking a divisor of a single integer.
+
+    Two regimes, both enforced by graphax:
+
+    * **free pair** -- ``base = 1``, ``span = gcd(N_i, N_j)``. Any divisor of
+      the gcd divides both logical sizes, which is the whole requirement.
+    * **already-coupled pair** -- ``base = m``, the current meta count, and
+      ``span = gcd(N_i, N_j) // m``. A further Diag on a coupled pair may only
+      SUBDIVIDE it: graphax accepts ``factor == m`` as a no-op and
+      ``factor = m*k`` when it still divides both logical sizes, but rejects a
+      coarser or non-nesting re-mask outright rather than silently applying a
+      lighter approximation than asked for.
+
+    Returns ``(0, 0)`` for an out-of-range pair.
+    """
+    dims = tuple(st.out_dims) + tuple(st.primal_dims)
+    if not (0 <= i < len(dims) and 0 <= j < len(dims)):
+        return 0, 0
+    di, dj = dims[i], dims[j]
+    g = math.gcd(int(di.logical_size), int(dj.logical_size))
+    coupled = (
+        di.is_sparse and dj.is_sparse
+        and di.other_id == dj.id and dj.other_id == di.id
+        and di.size == dj.size
+    )
+    if not coupled:
+        return 1, g
+    m = int(di.size)
+    if m <= 0 or g % m != 0:
+        return 0, 0
+    return m, g // m

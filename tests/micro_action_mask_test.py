@@ -180,3 +180,102 @@ def test_env_pair_mask_is_authoritative():
     diag_i, _, j_mask, _ = _compute_axis_masks(feats, pair_valid=pair_valid)
     assert float(j_mask[0].sum()) == 0.0, "axis 0 lost its only partner"
     assert diag_i.tolist() == [0., 1., 0., 0.], "and so is no longer selectable"
+
+
+# ---------------------------------------------------------------------------
+# Factor space: which `factor` values are legal for a given legal pair
+# ---------------------------------------------------------------------------
+
+from alphagrad.approx.common.masks import diag_pair_factor_space  # noqa: E402
+
+
+def _divisors(n):
+    return [d for d in range(1, n + 1) if n % d == 0]
+
+
+def _factors_graphax_accepts(st, i, j, max_f=9):
+    out = set()
+    for f in range(1, max_f + 1):
+        try:
+            apply_diag(st, Diag(i, j, f))
+            out.add(f)
+        except Exception:
+            pass
+    return out
+
+
+def _square():
+    return SparseTensor([DenseIndex(0, 4, 0), DenseIndex(1, 4, 1)],
+                        [DenseIndex(2, 4, 2), DenseIndex(3, 4, 3)],
+                        jnp.ones((4, 4, 4, 4)))
+
+
+def test_free_pair_factor_space_is_the_divisors_of_the_gcd():
+    st = _square()
+    base, span = diag_pair_factor_space(st, 0, 2)
+    assert base == 1 and span == diag_pair_gcd(st, 0, 2)
+    predicted = {base * d for d in _divisors(span)}
+    assert predicted == _factors_graphax_accepts(st, 0, 2)
+
+
+def test_coupled_pair_may_only_subdivide_never_coarsen():
+    """A second DIAG on an already-coupled pair must be a MULTIPLE of the
+    current meta count. diag_pair_gcd alone would still offer factor=1 here,
+    which graphax rejects -- that is what diag_pair_factor_space exists for."""
+    st = apply_diag(_square(), Diag(0, 2, 2))
+    assert st.out_dims[0].size == 2, "meta count after the first Diag"
+
+    base, span = diag_pair_factor_space(st, 0, 2)
+    assert base == 2, "the current meta count is the floor, not 1"
+    predicted = {base * d for d in _divisors(span)}
+    accepted = _factors_graphax_accepts(st, 0, 2)
+    assert predicted == accepted
+    assert 1 not in accepted, "coarsening a coupled pair is rejected"
+    assert 1 in _divisors(diag_pair_gcd(st, 0, 2)), (
+        "and the plain gcd WOULD have offered it -- the reason this helper exists")
+
+
+def test_untouched_pair_stays_free_after_a_diag_elsewhere():
+    st = apply_diag(_square(), Diag(0, 2, 2))
+    assert diag_pair_factor_space(st, 1, 3) == (1, 4)
+
+
+def test_factor_space_rejects_out_of_range():
+    assert diag_pair_factor_space(_square(), 0, 99) == (0, 0)
+
+
+def test_pair_rules_are_unconditional():
+    """The block-structure pair rules used to sit behind
+    ALPHAGRAD_MICRO_PAIR_MASKS, defaulting OFF -- so the shipped default
+    disagreed with the executor: coupled axes were barred from DIAG entirely
+    (no re-diagonalisation, which graphax supports out of the box) and
+    i_coupled was pinned to zero, so the j-head contributed log-prob for a
+    choice it never really had. No env var now; the rules always apply.
+
+    Note -1 is the ungrouped sentinel (env.py stamps it); group 0 is a REAL
+    group, so free axes must carry -1, not 0.
+    """
+    n = 4
+    tb = jnp.zeros((n, AXIS_TAG_BITS)).at[:, 2].set(jnp.array([1., 1., 0., 0.]))
+    feats = AxisTokenFeatures(
+        size=jnp.ones(n) * 4, log_size=jnp.log(jnp.ones(n) * 4), tag_bits=tb,
+        group_id=jnp.array([0, 0, -1, -1], dtype=jnp.int32),
+        valid_mask=jnp.ones(n))
+    diag_i, _, j_mask, i_coupled = _compute_axis_masks(feats)
+
+    assert i_coupled.tolist() == [1., 1., 0., 0.], "only the real group is coupled"
+    assert diag_i.tolist() == [1., 1., 1., 1.], "coupled axes may re-diagonalise"
+    assert j_mask[0].tolist() == [0., 1., 0., 0.], "a coupled i is forced to its partner"
+    assert j_mask[2].tolist() == [0., 0., 0., 1.], "a free i may only take a free j"
+
+
+def test_group_zero_is_a_real_group_not_the_ungrouped_sentinel():
+    """Guards the trap: -1 means ungrouped, 0 is the FIRST allocated group
+    (env.py derives it as max(gid) + 1 from the -1 default)."""
+    n = 2
+    tb = jnp.zeros((n, AXIS_TAG_BITS)).at[:, 2].set(jnp.ones(n))
+    feats = AxisTokenFeatures(
+        size=jnp.ones(n) * 4, log_size=jnp.log(jnp.ones(n) * 4), tag_bits=tb,
+        group_id=jnp.zeros(n, dtype=jnp.int32), valid_mask=jnp.ones(n))
+    _, _, _, i_coupled = _compute_axis_masks(feats)
+    assert i_coupled.tolist() == [1., 1.], "two axes in group 0 ARE partners"
