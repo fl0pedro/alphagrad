@@ -1199,6 +1199,329 @@ def micro_actions_to_rule_specs_jax(
     return rows_truncated
 
 
+# ---------------------------------------------------------------------------
+# PER-LOCAL-PATH (per-face) APPROXIMATION
+# ---------------------------------------------------------------------------
+#
+# The per-vertex ``transforms`` the callback above builds are applied
+# UNIFORMLY to every local path (face) of a vertex. graphax now exposes the
+# per-path surface:
+#
+#     faces_of(graph, transpose_graph, vertex, jaxpr)
+#         -> [(vidx[in_edge], vidx[out_edge]), ...]   in ELIMINATION ORDER
+#     IncrementalJacobian.eliminate(vertex, face_transforms={key: (lhs, rhs, res)})
+#
+# so a policy can approximate one path and leave its neighbour exact. This
+# block is the env side of that: enumerate -> feature-ize -> (policy) ->
+# ``{face_key: (lhs, rhs, res)}`` -> a single ``eliminate`` call.
+#
+# FLAG: ``ALPHAGRAD_PER_FACE_APPROX=1``. Default OFF, and the gate lives in
+# :func:`eliminate_order_per_face` — with the flag unset that driver calls
+# ``incr.eliminate(vertex)`` with NO ``face_transforms``, which is the exact
+# per-vertex call graphax made before, and none of the code below runs at all
+# on the legacy ``_callback`` / ``jacve`` path (nothing above imports it). So
+# "flag off" is byte-identical by construction, not by careful matching.
+#
+# NOTE ON REACH: ``face_transforms`` is plumbed through ``_eliminate_vertex``
+# and ``IncrementalJacobian.eliminate`` ONLY — ``jacve`` and
+# ``vertex_elimination_jaxpr`` (what ``_callback`` measures with) still take
+# the per-vertex ``transforms`` sequence and have no per-face parameter. The
+# per-face path therefore builds its Jacobian through ``IncrementalJacobian``;
+# routing the reward harness through it is a separate, larger change.
+_PER_FACE_APPROX_CACHE = None
+
+
+def per_face_approx_enabled() -> bool:
+    """``ALPHAGRAD_PER_FACE_APPROX=1`` -> per-local-path approximation is on.
+
+    Read LAZILY and cached, matching ``heads.py``'s policy switches: in a Ray
+    actor the ``ALPHAGRAD_*`` env vars are delivered via ``runtime_env`` AFTER
+    this module is imported, so an import-time read would see stock env and
+    silently no-op.
+    """
+    global _PER_FACE_APPROX_CACHE
+    if _PER_FACE_APPROX_CACHE is None:
+        _PER_FACE_APPROX_CACHE = (
+            os.environ.get("ALPHAGRAD_PER_FACE_APPROX", "0") == "1"
+        )
+    return _PER_FACE_APPROX_CACHE
+
+
+# Static cap on the per-vertex face loop. The real face count is
+# data-dependent (``len(in_edges) x len(out_edges)`` per output var) but the
+# policy's loop is statically unrolled, so faces past the cap are DROPPED
+# (they stay exact) and faces past the real count are padding. Overridable
+# via ``ALPHAGRAD_MAX_FACES``; read lazily for the same reason as above.
+_MAX_FACES_CACHE = None
+DEFAULT_MAX_FACES_PER_VERTEX = 32
+
+
+def max_faces_per_vertex() -> int:
+    """Static per-vertex face-loop cap (``ALPHAGRAD_MAX_FACES``)."""
+    global _MAX_FACES_CACHE
+    if _MAX_FACES_CACHE is None:
+        try:
+            _MAX_FACES_CACHE = max(
+                1,
+                int(os.environ.get(
+                    "ALPHAGRAD_MAX_FACES", DEFAULT_MAX_FACES_PER_VERTEX,
+                )),
+            )
+        except ValueError:
+            _MAX_FACES_CACHE = DEFAULT_MAX_FACES_PER_VERTEX
+    return _MAX_FACES_CACHE
+
+
+def _var_index_map(jaxpr):
+    """``{stable var index -> Var}`` for ``jaxpr``.
+
+    graphax keys faces by ``_stable_var_index(jaxpr)``; to describe a face
+    numerically we need the Var back (for its aval). Built with graphax's OWN
+    index so the two can never drift. Returns ``({}, {})`` if the private
+    helper ever moves — the feature block then degrades to zeros rather than
+    breaking the elimination.
+    """
+    try:
+        from graphax.core import _stable_var_index
+    except ImportError:  # pragma: no cover - defensive
+        return {}, {}
+    vidx = _stable_var_index(jaxpr)
+    inv = {}
+    for var, idx in vidx.items():
+        inv.setdefault(int(idx), var)
+    return vidx, inv
+
+
+def _aval_size_ndim(var) -> tuple[float, float]:
+    """``(#elements, ndim)`` of a jaxpr Var, ``(0, 0)`` if it has no aval."""
+    aval = getattr(var, "aval", None)
+    shape = getattr(aval, "shape", None)
+    if shape is None:
+        return 0.0, 0.0
+    n = 1
+    for d in shape:
+        try:
+            n *= int(d)
+        except TypeError:  # polymorphic dim
+            return 0.0, float(len(shape))
+    return float(n), float(len(shape))
+
+
+def enumerate_faces(incr, vertex: int) -> list[tuple[int, int]]:
+    """This vertex's local paths, in the order ``eliminate`` will visit them.
+
+    Thin wrapper over ``IncrementalJacobian.faces`` (itself
+    ``graphax.faces_of``). MUST be called immediately before eliminating
+    ``vertex``: every elimination rewires the graph, so keys enumerated
+    earlier describe a graph that no longer exists.
+    """
+    return list(incr.faces(int(vertex)))
+
+
+def build_face_features(incr, vertex: int, max_faces: int | None = None):
+    """``(FaceFeatures, face_keys)`` for ``vertex``, padded to ``max_faces``.
+
+    ``face_keys`` is the RAW ordered list from :func:`enumerate_faces` (not
+    padded) — the env needs it to rebuild the ``face_transforms`` dict keys.
+    The returned :class:`~alphagrad.approx.heads.FaceFeatures` is padded /
+    truncated to exactly ``max_faces`` rows, with ``valid_mask`` marking the
+    real ones; the policy's face loop is statically unrolled over that cap and
+    contributes nothing for a padded row.
+
+    Feature layout is documented on ``heads.FACE_FEAT_DIM`` — keep the two in
+    sync.
+    """
+    # Lazy import: heads.py imports nothing from env.py, and env.py only needs
+    # the per-face constants when this path is actually used.
+    from alphagrad.approx.heads import FACE_FEAT_DIM, FaceFeatures
+
+    if max_faces is None:
+        max_faces = max_faces_per_vertex()
+    max_faces = int(max_faces)
+
+    keys = enumerate_faces(incr, vertex)
+    _, inv = _var_index_map(incr.jaxpr)
+    invars = {id(v) for v in incr.jaxpr.invars}
+    outvars = {id(v) for v in incr.jaxpr.outvars}
+
+    in_idx = np.zeros((max_faces,), dtype=np.int32)
+    out_idx = np.zeros((max_faces,), dtype=np.int32)
+    feats = np.zeros((max_faces, FACE_FEAT_DIM), dtype=np.float32)
+    valid = np.zeros((max_faces,), dtype=np.float32)
+
+    for f, (a, b) in enumerate(keys[:max_faces]):
+        in_var = inv.get(int(a)) if a is not None else None
+        out_var = inv.get(int(b)) if b is not None else None
+        n_in, d_in = _aval_size_ndim(in_var)
+        n_out, d_out = _aval_size_ndim(out_var)
+        in_idx[f] = -1 if a is None else int(a)
+        out_idx[f] = -1 if b is None else int(b)
+        feats[f, 0] = _math.log1p(n_in)
+        feats[f, 1] = _math.log1p(n_out)
+        feats[f, 2] = d_in
+        feats[f, 3] = d_out
+        feats[f, 4] = _math.log1p(n_in * n_out)
+        feats[f, 5] = f / float(max_faces)
+        feats[f, 6] = 1.0 if (in_var is not None and id(in_var) in invars) else 0.0
+        feats[f, 7] = 1.0 if (out_var is not None and id(out_var) in outvars) else 0.0
+        valid[f] = 1.0
+
+    return (
+        FaceFeatures(
+            in_edge=jnp.asarray(in_idx),
+            out_edge=jnp.asarray(out_idx),
+            feats=jnp.asarray(feats),
+            valid_mask=jnp.asarray(valid),
+        ),
+        keys,
+    )
+
+
+def _slot_to_transform(op, i, j, factor, kind_idx, dtype_idx):
+    """One slot's :class:`~alphagrad.approx.heads.MicroAction` -> a graphax
+    transform (``Diag`` / ``Compress`` / ``Quant``) or ``None``.
+
+    ``i`` / ``j`` are PHYSICAL axis indices into the slot's edge SparseTensor:
+    the policy's axis tokens are laid out ``(out axes..., primal axes...)``,
+    which is exactly the SparseTensor's physical layout, so — unlike the
+    legacy ``micro_actions_to_rule_specs`` path, which has to re-derive the
+    ``(out_position, primal_position)`` pair for the rule_specs row format —
+    they pass straight through.
+
+    Degenerate emissions map to ``None`` (no transform) rather than raising:
+    graphax's per-face dispatch treats a ``ValueError`` as a best-effort miss
+    and skips the transform, but a structurally-nonsensical rule is cheaper to
+    drop here.
+    """
+    from alphagrad.approx.heads import OP_COMPRESS, OP_DIAG, OP_END, OP_QUANT
+
+    op = int(op)
+    if op == OP_END:
+        return None
+    if op == OP_DIAG:
+        i, j, factor = int(i), int(j), int(factor)
+        if factor <= 1 or i == j or i < 0 or j < 0:
+            return None
+        return Diag(i=i, j=j, factor=factor)
+    if op == OP_COMPRESS:
+        i = int(i)
+        if i < 0:
+            return None
+        k = int(kind_idx)
+        if not (0 <= k < len(COMPRESS_KINDS)):
+            k = 0
+        return Compress(axes=(i,), kind=COMPRESS_KINDS[k])
+    if op == OP_QUANT:
+        d = int(dtype_idx)
+        if not (0 <= d < len(QUANT_DTYPES)):
+            d = 0
+        return Quant(dtype=QUANT_DTYPES[d])
+    return None
+
+
+def build_face_transforms(face_keys, action, max_faces: int | None = None):
+    """``{face_key: (lhs, rhs, res)}`` from one vertex's per-path action.
+
+    ``face_keys`` is the ordered list :func:`enumerate_faces` returned;
+    ``action`` is the :class:`~alphagrad.approx.heads.FacePathAction` the
+    policy emitted for the SAME vertex (row ``f`` of the action describes
+    ``face_keys[f]`` — the policy loop and the enumeration share one order,
+    which is what makes the correspondence safe).
+
+    A face the policy chose to SKIP maps to ``(None, None, None)``: the entry
+    is kept rather than dropped so the returned dict is a faithful, complete
+    record of the decision for every enumerated path, and graphax treats a
+    ``None`` slot as "leave this operand alone".
+
+    Faces past the policy's static cap are not represented at all — they stay
+    exact, which is the safe direction.
+    """
+    from alphagrad.approx.heads import FACE_SKIP, NUM_FACE_SLOTS
+
+    if max_faces is None:
+        max_faces = int(np.asarray(action.skip).shape[0])
+
+    skip = np.asarray(action.skip)
+    slots = action.slots
+    op_types = np.asarray(slots.op_type)
+    i_arr = np.asarray(slots.i)
+    j_arr = np.asarray(slots.j)
+    f_arr = np.asarray(slots.factor)
+    k_arr = np.asarray(slots.compress_kind)
+    q_arr = np.asarray(slots.quant_dtype)
+
+    face_transforms: dict[tuple[int, int], tuple] = {}
+    for f, key in enumerate(face_keys[:max_faces]):
+        if int(skip[f]) == FACE_SKIP:
+            face_transforms[tuple(key)] = (None, None, None)
+            continue
+        face_transforms[tuple(key)] = tuple(
+            _slot_to_transform(
+                op_types[f, s], i_arr[f, s], j_arr[f, s], f_arr[f, s],
+                k_arr[f, s], q_arr[f, s],
+            )
+            for s in range(NUM_FACE_SLOTS)
+        )
+    return face_transforms
+
+
+def eliminate_vertex_per_face(incr, vertex: int, sample_fn, max_faces=None):
+    """Eliminate ONE vertex under per-local-path control.
+
+    ``sample_fn(vertex, face_features, face_keys) -> FacePathAction`` is the
+    policy hook — env.py deliberately does not import the agent, so the caller
+    supplies the closure that runs :meth:`FacePathPolicy.sample` with whatever
+    vertex context / axis features / factor tables it already has.
+
+    Order of operations is load-bearing: ``faces_of`` must run against the
+    CURRENT graph (immediately before the elimination that rewires it), the
+    policy sees exactly those faces, and the resulting dict is handed to a
+    SINGLE ``eliminate`` call — the per-path decisions are not interleaved
+    with partial eliminations, because ``eliminate`` is atomic per vertex.
+
+    Returns ``(new_eqns, face_transforms, face_keys)``.
+    """
+    if max_faces is None:
+        max_faces = max_faces_per_vertex()
+    face_features, face_keys = build_face_features(
+        incr, vertex, max_faces=max_faces,
+    )
+    action = sample_fn(int(vertex), face_features, face_keys)
+    face_transforms = build_face_transforms(
+        face_keys, action, max_faces=max_faces,
+    )
+    new_eqns = incr.eliminate(int(vertex), face_transforms=face_transforms)
+    return new_eqns, face_transforms, face_keys
+
+
+def eliminate_order_per_face(incr, order, sample_fn, max_faces=None,
+                             force: bool | None = None):
+    """Run a whole elimination ``order`` with per-local-path approximation.
+
+    THE FLAG GATE. When ``ALPHAGRAD_PER_FACE_APPROX`` is off (the default)
+    and ``force`` is not set, this calls ``incr.eliminate(v)`` with no
+    ``face_transforms`` at all — the identical call the per-vertex path
+    makes, so the produced jaxpr is byte-identical to HEAD's. ``force=True``
+    turns the per-face path on for a single call (used by the tests so they
+    do not depend on process env).
+
+    Returns the list of per-vertex ``face_transforms`` dicts (``None`` for a
+    vertex eliminated on the legacy path).
+    """
+    enabled = per_face_approx_enabled() if force is None else bool(force)
+    out = []
+    for v in order:
+        if not enabled:
+            incr.eliminate(int(v))
+            out.append(None)
+            continue
+        _, ft, _ = eliminate_vertex_per_face(
+            incr, int(v), sample_fn, max_faces=max_faces,
+        )
+        out.append(ft)
+    return out
+
+
 # Lookup row used to convert a legacy scalar sp_type ∈ {0..4} into a single-rule (MAX_RULES, 3) spec.
 _LEGACY_SP_TO_RULE_ROW = jnp.array(
     [

@@ -45,6 +45,17 @@ The micro-action sequence is mapped to graphax's
 :func:`micro_actions_from_policy_emissions` and applied with
 ``apply_micro_actions`` inside the env callback.
 
+Per-local-path (per-face) control
+---------------------------------
+Everything above is PER VERTEX: its rules apply uniformly to every local
+path the elimination contracts. :class:`FacePathPolicy` (bottom of this
+module) is the per-PATH layer built on top — for each face graphax's
+``faces_of`` enumerates, it emits a SKIP decision and then, if the path is
+to be approximated, one micro-action for each of the three slots
+``lhs -> rhs -> res``, reusing the same head factorization. See the
+"Per-LOCAL-PATH (per-face) approximation" banner there, in particular the
+MIRROR INVARIANT note.
+
 This module is intentionally standalone: it does not import from
 ``ppo.py`` so it can be tested in isolation. The Agent class will need
 to be extended (separate change) to construct a :class:`MicroActionHead`
@@ -1548,6 +1559,499 @@ class MicroActionPolicy(eqx.Module):
         )
 
 
+# ---------------------------------------------------------------------------
+# Per-LOCAL-PATH (per-face) approximation
+# ---------------------------------------------------------------------------
+#
+# A vertex elimination contracts one FACE (local path) per
+# ``in_edge -> central_var -> out_edge`` triple. The per-vertex micro-action
+# sub-episode above applies its rules UNIFORMLY to every face of the vertex,
+# which is exactly what a policy that wants to approximate one path and leave
+# another exact cannot express.
+#
+# ``graphax.faces_of(graph, transpose_graph, vertex, jaxpr)`` returns the face
+# keys ``(vidx[in_edge], vidx[out_edge])`` in the order the elimination will
+# visit them, computable BEFORE the vertex is eliminated. The head group below
+# consumes that ordered list and emits, PER FACE:
+#
+#   1. a SKIP decision (2 logits). ``skip == FACE_SKIP`` -> the path stays
+#      EXACT: the env emits ``(None, None, None)`` for it and the three slot
+#      heads are masked out of the joint log-prob, the entropy AND the arity.
+#   2. otherwise three slot decisions in the order ``lhs -> rhs -> res``
+#      (the local path is ``res = op(lhs, rhs)``: ``lhs`` transforms the
+#      in-edge Jacobian, ``rhs`` the out-edge Jacobian, ``res`` the
+#      contraction result). Each slot is ONE micro-action emitted by the
+#      EXISTING :class:`MicroActionHead` — the deliberate
+#      OpType/AxisPointer/PrimeExponent/CompressKind/QuantDtype factorization
+#      is reused verbatim, not re-invented — and is autoregressive on the
+#      previous slot's decision via :func:`_slot_descriptor`.
+#
+# The face loop is STATICALLY UNROLLED to ``max_faces`` with no early
+# termination: faces past the real count are padding, flagged by
+# ``FaceFeatures.valid_mask``, and contribute zero to log-prob / entropy /
+# arity.
+#
+# MIRROR INVARIANT (the PPO ratio-correctness property)
+# -----------------------------------------------------
+# :meth:`FacePathPolicy.sample` and :meth:`FacePathPolicy.evaluate` are the
+# SAME code path — :meth:`FacePathPolicy._run` — parameterised by a PYTHON
+# bool ``sampling`` that is resolved at trace time. The masks, the gating, the
+# conditioning contexts and the emission order are therefore identical by
+# construction rather than by convention. Two further details make the two
+# paths agree to floating-point identity, not merely to within a tolerance:
+#
+#   * every decision is CANONICALIZED (pad face -> FACE_SKIP; skipped /
+#     padded slot -> the null OP_END micro-action) BEFORE its log-prob is
+#     computed, so sample time scores exactly the action that evaluate later
+#     reads back from the trajectory;
+#   * the autoregressive descriptor fed to the next slot is derived from that
+#     same canonical action, so the conditioning context cannot drift either.
+#
+# A mismatch here silently biases the PPO ratio — it is the exact bug class
+# that made the legacy path unusable — so any change to one branch MUST be a
+# change to the shared body, never to one side of the ``if sampling``.
+
+# Slots of one local path, in emission order. ``res = op(lhs, rhs)``.
+FACE_SLOT_LHS = 0
+FACE_SLOT_RHS = 1
+FACE_SLOT_RES = 2
+NUM_FACE_SLOTS = 3
+FACE_SLOT_NAMES: tuple[str, ...] = ("lhs", "rhs", "res")
+
+# SKIP head outcomes.
+FACE_APPROX = 0   # approximate this local path (the three slot heads fire)
+FACE_SKIP = 1     # leave this local path EXACT -> (None, None, None)
+NUM_FACE_DECISIONS = 2
+
+# Width of the per-face numeric feature block the env supplies. Layout (kept
+# in sync with ``alphagrad.approx.env.build_face_features``):
+#   0  log1p(#elements of the in-edge Jacobian)
+#   1  log1p(#elements of the out-edge Jacobian)
+#   2  in-edge ndim
+#   3  out-edge ndim
+#   4  log1p(#elements in  x  #elements out)  — contraction-cost proxy
+#   5  face position / max_faces              — the elimination visit order
+#   6  1.0 if the in-edge var is a jaxpr invar
+#   7  1.0 if the out-edge var is a jaxpr outvar
+FACE_FEAT_DIM = 8
+
+# Width of the autoregressive descriptor summarising one emitted slot.
+FACE_SLOT_DESC_DIM = NUM_OPS + NUM_COMPRESS_KINDS + NUM_QUANT_DTYPES + 3
+
+
+class FaceFeatures(NamedTuple):
+    """The vertex's enumerated local paths, padded to a static cap.
+
+    One row per face, in the order ``graphax.faces_of`` returns (which is the
+    order the elimination visits them). ``in_edge`` / ``out_edge`` carry the
+    stable var indices that form the graphax face key
+    ``(vidx[in_edge], vidx[out_edge])``; they are passed through the policy
+    untouched so the env can rebuild the ``face_transforms`` dict keys.
+    """
+
+    in_edge: jax.Array       # (F,) int32 — stable var index of the in-edge
+    out_edge: jax.Array      # (F,) int32 — stable var index of the out-edge
+    feats: jax.Array         # (F, FACE_FEAT_DIM) float32
+    valid_mask: jax.Array    # (F,) float32 — 1.0 for a real face, 0.0 for pad
+
+
+class FacePathAction(NamedTuple):
+    """One vertex's full per-local-path action.
+
+    ``skip`` is ``(F,)`` int32 over ``{FACE_APPROX, FACE_SKIP}``. ``slots``
+    is a :class:`MicroAction` whose every field carries a leading
+    ``(F, NUM_FACE_SLOTS)`` — one micro-action per (face, slot) pair, in the
+    order lhs, rhs, res. Slots of a skipped or padded face are canonicalized
+    to the null ``OP_END`` action.
+    """
+
+    skip: jax.Array          # (F,) int32
+    slots: MicroAction       # fields (F, NUM_FACE_SLOTS, ...)
+
+
+class FaceSkipHead(eqx.Module):
+    """Binary categorical: approximate this local path, or keep it EXACT.
+
+    Fires once per enumerated face, before the slot heads, conditioned on the
+    pooled axis-set summary (which already carries the encoder's vertex
+    context) plus the face's own embedded features. Padded faces are forced to
+    :data:`FACE_SKIP` and gated out of the joint entirely, so the head is left
+    unmasked — adding a mask here would be a second place for the sample and
+    evaluate paths to drift.
+    """
+
+    proj: eqx.nn.Linear
+
+    def __init__(self, embd_dim: int, *, key):
+        self.proj = eqx.nn.Linear(embd_dim, NUM_FACE_DECISIONS, key=key)
+
+    def __call__(self, context: jax.Array) -> jax.Array:
+        return jnn.softmax(self.proj(context), axis=-1)
+
+
+def _null_micro_action_like(action: MicroAction) -> MicroAction:
+    """The canonical "this slot emits nothing" micro-action.
+
+    ``op_type = OP_END`` (not 0 — that is ``OP_DIAG`` and would read as a real
+    approximation in a stored trajectory), every payload field zeroed. Under
+    ``ALPHAGRAD_SUBSTEP_NO_END`` END is an ILLEGAL op, so its masked
+    probability is ~0 and its log-prob ~``log(1e-8)`` — finite, and multiplied
+    by the zero gate in both the sample and the evaluate path, so it can
+    neither NaN nor leak into the PPO ratio.
+    """
+    return MicroAction(
+        op_type=jnp.full_like(action.op_type, OP_END),
+        i=jnp.zeros_like(action.i),
+        j=jnp.zeros_like(action.j),
+        exponents=jnp.zeros_like(action.exponents),
+        factor=jnp.zeros_like(action.factor),
+        compress_kind=jnp.zeros_like(action.compress_kind),
+        quant_dtype=jnp.zeros_like(action.quant_dtype),
+    )
+
+
+def _select_micro_action(
+    emit: jax.Array, action: MicroAction, null: MicroAction,
+) -> MicroAction:
+    """``action`` where ``emit`` else ``null``, field by field."""
+    return MicroAction(
+        *(jnp.where(emit, a, n) for a, n in zip(action, null))
+    )
+
+
+def _slot_descriptor(action: MicroAction, num_axes: int) -> jax.Array:
+    """``(FACE_SLOT_DESC_DIM,)`` summary of one emitted slot.
+
+    Feeds the NEXT slot's conditioning context so ``rhs`` sees what ``lhs``
+    did and ``res`` sees both. Derived from the CANONICAL action (post
+    skip/pad canonicalization) so the sample and evaluate paths build the
+    identical context. ``num_axes`` is static (the axis-token count), used
+    only to normalise the pointer indices into [0, 1].
+    """
+    denom = float(max(int(num_axes), 1))
+    scalars = jnp.stack([
+        jnp.log1p(jnp.maximum(action.factor, 0).astype(jnp.float32)),
+        action.i.astype(jnp.float32) / denom,
+        action.j.astype(jnp.float32) / denom,
+    ])
+    return jnp.concatenate([
+        jnn.one_hot(action.op_type, NUM_OPS, dtype=jnp.float32),
+        jnn.one_hot(action.compress_kind, NUM_COMPRESS_KINDS, dtype=jnp.float32),
+        jnn.one_hot(action.quant_dtype, NUM_QUANT_DTYPES, dtype=jnp.float32),
+        scalars,
+    ])
+
+
+class FacePathHead(eqx.Module):
+    """The per-face head group: SKIP + three autoregressive slot emitters.
+
+    Deliberately thin — it owns only the face/slot CONDITIONING (projecting
+    the face features, embedding the slot identity, projecting the previous
+    slot's descriptor) and the SKIP categorical. The actual approximation
+    choice for each of lhs / rhs / res is emitted by the shared
+    :class:`MicroActionHead`, so the prime-exponent trick and every legality
+    mask carry over unchanged.
+
+    One ``MicroActionHead`` is shared across the three slots rather than three
+    separate copies: the slots differ in WHICH tensor they transform, not in
+    the space of transforms available, and the slot embedding gives the shared
+    head that distinction with ``3 * embd_dim`` parameters instead of three
+    full head stacks.
+    """
+
+    face_proj: eqx.nn.Linear
+    slot_embedding: eqx.nn.Embedding
+    prev_proj: eqx.nn.Linear
+    skip_head: FaceSkipHead
+    micro: MicroActionHead
+
+    embd_dim: int = eqx.field(static=True)
+
+    def __init__(self, embd_dim: int, *, key):
+        self.embd_dim = embd_dim
+        keys = jrand.split(key, 5)
+        self.face_proj = eqx.nn.Linear(FACE_FEAT_DIM, embd_dim, key=keys[0])
+        self.slot_embedding = eqx.nn.Embedding(
+            NUM_FACE_SLOTS, embd_dim, key=keys[1],
+        )
+        self.prev_proj = eqx.nn.Linear(
+            FACE_SLOT_DESC_DIM, embd_dim, key=keys[2],
+        )
+        self.skip_head = FaceSkipHead(embd_dim, key=keys[3])
+        self.micro = MicroActionHead(embd_dim, key=keys[4])
+
+
+class FacePathPolicy(eqx.Module):
+    """Per-local-path policy over one vertex's faces.
+
+    Usage (env side, after the pointer net picked ``vertex``)::
+
+        keys  = graphax.faces_of(graph, tgraph, vertex, jaxpr)
+        feats = build_face_features(...)          # padded to max_faces
+        act, logp, ent, arity, *dists = policy.sample(
+            vertex_context, axis_features, feats, tables, key)
+        ft = build_face_transforms(keys, act)     # {face_key: (lhs, rhs, res)}
+        incr.eliminate(vertex, face_transforms=ft)
+
+    The axis-token encoder runs ONCE per vertex, outside the face loop: the
+    axis features do not evolve between faces (each face transforms a
+    DIFFERENT pair of edge Jacobians, not a single tensor being refined), so
+    a per-face re-encode of the same input would be pure cost. See the
+    module note on the per-path re-encode that is NOT done here.
+
+    Axis-index convention: the ``i`` / ``j`` a slot's micro-action emits are
+    PHYSICAL axis indices into that slot's edge SparseTensor, under the same
+    ``(out axes..., primal axes...)`` layout the per-vertex axis tokens
+    already use — so the env passes them straight through to
+    ``Diag(i, j, factor)`` / ``Compress(axes=(i,))`` with no remapping.
+    """
+
+    encoder: AxisSetEncoder
+    head: FacePathHead
+
+    max_faces: int = eqx.field(static=True)
+    embd_dim: int = eqx.field(static=True)
+
+    def __init__(
+        self, embd_dim: int, num_heads: int, max_faces: int,
+        num_encoder_layers: int = 1, max_groups: int = 16, *, key,
+        use_group_embedding: bool = False,
+    ):
+        self.embd_dim = embd_dim
+        self.max_faces = int(max_faces)
+        keys = jrand.split(key, 2)
+        self.encoder = AxisSetEncoder(
+            embd_dim, num_heads, num_layers=num_encoder_layers,
+            max_groups=max_groups, key=keys[0],
+            use_group_embedding=use_group_embedding,
+        )
+        self.head = FacePathHead(embd_dim, key=keys[1])
+
+    # -- one slot (lhs / rhs / res) of one face ---------------------------
+
+    def _slot_step(
+        self, carry, slot_input, *,
+        axis_tokens, summary, face_emb, features, masks, tables, emit,
+        sampling: bool,
+    ):
+        """One slot. ``sampling`` is a PYTHON bool — the branch is resolved at
+        trace time, so sampling and evaluation share every other line."""
+        prev_desc, slot_idx = carry
+        op_legal, i_diag, i_compress, j_diag, i_coupled = masks
+
+        ctx = (
+            summary
+            + face_emb
+            + self.head.slot_embedding(slot_idx)
+            + self.head.prev_proj(prev_desc)
+        )
+
+        if sampling:
+            sampled = self.head.micro.sample_step(
+                ctx, axis_tokens, features.size,
+                op_legal, i_diag, i_compress, j_diag,
+                tables, slot_input, i_coupled=i_coupled,
+            )[0]
+            # Canonicalize BEFORE scoring: a skipped / padded slot records the
+            # null action, and it is that action whose log-prob we accumulate,
+            # so evaluate (which reads the null back) scores the same thing.
+            action = _select_micro_action(
+                emit, sampled, _null_micro_action_like(sampled),
+            )
+        else:
+            action = slot_input
+
+        (
+            log_p, ent, arity,
+            op_dist, i_dist, j_dist, exp_dists, kind_dist, quant_dist,
+        ) = self.head.micro.log_prob_step(
+            action, ctx, axis_tokens, features.size,
+            op_legal, i_diag, i_compress, j_diag, tables,
+            i_coupled=i_coupled,
+        )
+
+        new_desc = _slot_descriptor(action, features.size.shape[0])
+        return (
+            (new_desc, slot_idx + 1),
+            (
+                action, log_p, ent, arity,
+                op_dist, i_dist, j_dist, exp_dists, kind_dist, quant_dist,
+            ),
+        )
+
+    # -- one face (SKIP + three slots) ------------------------------------
+
+    def _face_step(
+        self, carry, face_input, *,
+        axis_tokens, summary, features, masks, tables, sampling: bool,
+    ):
+        f_idx = carry
+        feat_row, valid, extra = face_input
+
+        face_emb = self.head.face_proj(feat_row)
+        skip_dist = self.head.skip_head(summary + face_emb)
+
+        if sampling:
+            k_skip, k_slots = jrand.split(extra)
+            sampled_skip = distrax.Categorical(probs=skip_dist).sample(
+                seed=k_skip,
+            ).astype(jnp.int32)
+            # A padded face is canonically SKIP, decided before scoring so the
+            # recorded action and its log-prob agree with evaluate's readback.
+            skip = jnp.where(
+                valid > 0.5, sampled_skip, jnp.int32(FACE_SKIP),
+            ).astype(jnp.int32)
+            slot_inputs = jrand.split(k_slots, NUM_FACE_SLOTS)
+        else:
+            skip = extra.skip.astype(jnp.int32)
+            slot_inputs = extra.slots
+
+        log_p_skip = jnp.log(skip_dist[skip] + 1e-8)
+        ent_skip = -jnp.sum(skip_dist * jnp.log(skip_dist + 1e-8))
+
+        # The slot heads fire iff this face is real AND the policy chose to
+        # approximate it. Same expression on both paths.
+        emit = (skip == FACE_APPROX) & (valid > 0.5)
+
+        def slot_fn(c, si):
+            return self._slot_step(
+                c, si,
+                axis_tokens=axis_tokens, summary=summary, face_emb=face_emb,
+                features=features, masks=masks, tables=tables, emit=emit,
+                sampling=sampling,
+            )
+
+        (
+            _,
+            (
+                slot_actions, slot_logps, slot_ents, slot_arities,
+                op_dists, i_dists, j_dists, exp_dists, kind_dists, quant_dists,
+            ),
+        ) = lax.scan(
+            slot_fn,
+            (jnp.zeros(FACE_SLOT_DESC_DIM, dtype=jnp.float32),
+             jnp.array(0, dtype=jnp.int32)),
+            slot_inputs,
+        )
+
+        face_active = (valid > 0.5).astype(jnp.float32)
+        emit_f = emit.astype(jnp.float32)
+
+        log_p = log_p_skip * face_active + jnp.sum(slot_logps) * emit_f
+        entropy = ent_skip * face_active + jnp.sum(slot_ents) * emit_f
+        # ARITY: the number of categoricals this face actually emitted. The
+        # SKIP decision counts 1 for every REAL face (it is emitted whether or
+        # not the path is then approximated); the three slots contribute their
+        # own arities — which already count op + i + j + one per real prime +
+        # kind + dtype — only when they fire. Without folding SKIP and the
+        # slots in here, a face that approximates would collect a larger
+        # entropy bonus than one that skips purely for emitting more
+        # categoricals, and a vertex with more local paths would out-earn a
+        # smaller one for the same reason.
+        arity = face_active + jnp.sum(slot_arities) * emit_f
+
+        action = FacePathAction(skip=skip, slots=slot_actions)
+        return (
+            f_idx + 1,
+            (
+                action, log_p, entropy, arity,
+                skip_dist, op_dists, i_dists, j_dists, exp_dists,
+                kind_dists, quant_dists,
+            ),
+        )
+
+    # -- shared driver -----------------------------------------------------
+
+    def _run(
+        self, vertex_context, features: AxisTokenFeatures,
+        face_features: FaceFeatures, tables: FactorTables,
+        *, key=None, actions: FacePathAction | None = None,
+    ):
+        """THE single implementation behind :meth:`sample` and
+        :meth:`evaluate`. See the module-level MIRROR INVARIANT note."""
+        sampling = actions is None
+        if sampling and key is None:
+            raise ValueError("sample() requires a PRNG key.")
+        if not sampling and key is not None:
+            raise ValueError("evaluate() must not be given a PRNG key.")
+        if face_features.valid_mask.shape[0] != self.max_faces:
+            raise ValueError(
+                f"face_features has {face_features.valid_mask.shape[0]} rows "
+                f"but this policy is built for max_faces={self.max_faces}; "
+                "the face loop is statically unrolled, so the caller must pad "
+                "to exactly that many rows."
+            )
+
+        # ONE encode per vertex — the axis features are constant across the
+        # face loop (see the class docstring / the re-encode caveat).
+        axis_tokens, summary = self.encoder(features, vertex_context)
+        masks = (
+            _compute_op_legality(features),
+            *_compute_axis_masks(features),
+        )
+
+        if sampling:
+            extra = jrand.split(key, self.max_faces)
+        else:
+            extra = actions
+        xs = (face_features.feats, face_features.valid_mask, extra)
+
+        def step_fn(carry, x):
+            return self._face_step(
+                carry, x,
+                axis_tokens=axis_tokens, summary=summary, features=features,
+                masks=masks, tables=tables, sampling=sampling,
+            )
+
+        _, out = lax.scan(step_fn, jnp.array(0, dtype=jnp.int32), xs)
+        (
+            face_actions, logps, ents, arities,
+            skip_dists, op_dists, i_dists, j_dists, exp_dists,
+            kind_dists, quant_dists,
+        ) = out
+        return (
+            face_actions,
+            jnp.sum(logps), jnp.sum(ents), jnp.sum(arities),
+            skip_dists, op_dists, i_dists, j_dists, exp_dists,
+            kind_dists, quant_dists,
+        )
+
+    def sample(
+        self, vertex_context, init_features: AxisTokenFeatures,
+        face_features: FaceFeatures, tables: FactorTables, key,
+    ):
+        """Emit a full per-local-path action for one vertex.
+
+        Returns ``(action, log_prob, entropy, arity, skip_dists, op_dists,
+        i_dists, j_dists, exp_dists, kind_dists, quant_dists)``. The dists are
+        the rollout-time ("old") policy snapshot for the PPO ratio / KL, with
+        a leading ``(max_faces,)`` and — for the slot heads — a second
+        ``(NUM_FACE_SLOTS,)``.
+        """
+        return self._run(
+            vertex_context, init_features, face_features, tables, key=key,
+        )
+
+    def evaluate(
+        self, vertex_context, init_features: AxisTokenFeatures,
+        face_features: FaceFeatures, tables: FactorTables,
+        actions: FacePathAction,
+    ):
+        """Re-score a stored :class:`FacePathAction` under the CURRENT policy.
+
+        Returns ``(log_prob, entropy, arity, skip_dists, op_dists, i_dists,
+        j_dists, exp_dists, kind_dists, quant_dists)`` — the same quantities
+        :meth:`sample` returns, minus the action. For an unchanged policy the
+        log-prob is bit-identical to the one ``sample`` returned; that
+        equality is what the PPO ratio is built on.
+        """
+        _, log_p, ent, arity, *dists = self._run(
+            vertex_context, init_features, face_features, tables,
+            actions=actions,
+        )
+        return (log_p, ent, arity, *dists)
+
+
 __all__ = [
     "OP_DIAG", "OP_COMPRESS", "OP_QUANT", "OP_END", "NUM_OPS",
     "MAX_PRIMES", "MAX_EXPONENT",
@@ -1568,4 +2072,14 @@ __all__ = [
     "MicroActionPolicy",
     "factorize",
     "exponents_to_factor",
+    # per-local-path (per-face) approximation
+    "FACE_SLOT_LHS", "FACE_SLOT_RHS", "FACE_SLOT_RES",
+    "NUM_FACE_SLOTS", "FACE_SLOT_NAMES",
+    "FACE_APPROX", "FACE_SKIP", "NUM_FACE_DECISIONS",
+    "FACE_FEAT_DIM", "FACE_SLOT_DESC_DIM",
+    "FaceFeatures",
+    "FacePathAction",
+    "FaceSkipHead",
+    "FacePathHead",
+    "FacePathPolicy",
 ]
