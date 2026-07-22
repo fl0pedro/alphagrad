@@ -326,3 +326,68 @@ def diag_pair_factor_space(st, i: int, j: int) -> tuple[int, int]:
     if m <= 0 or g % m != 0:
         return 0, 0
     return m, g // m
+
+
+# ---------------------------------------------------------------------------
+# Concrete legal actions, and the per-slot chooser graphax calls
+# ---------------------------------------------------------------------------
+# The lhs / rhs / res slots of a face are JOIN INTERMEDIATES -- lhs is the fresh
+# contraction product, rhs the edge accumulated so far, res their sum -- so none
+# of them exists before `eliminate` runs. A policy therefore cannot be handed a
+# precomputed per-face mask: the operand's index structure is not knowable until
+# the moment the transform is applied.
+#
+# graphax closes this by letting a slot hold a CALLABLE. Handed the live
+# operand, it returns the micro-action it chose, which graphax then applies and
+# records exactly as it would a literal one. These helpers build that callable
+# so the choice is made against an accurate mask.
+
+
+def _divisors_above_one(n: int):
+    return [d for d in range(2, int(n) + 1) if n % d == 0]
+
+
+def legal_diag_actions(st, max_dims: int = 8) -> list:
+    """Every ``Diag`` graphax will accept on ``st``, as concrete actions."""
+    from graphax.sparse.micro_actions import Diag
+
+    mask = diag_valid_mask(st, max_dims)
+    out = []
+    for i in range(max_dims):
+        for j in range(max_dims):
+            if not mask[i, j]:
+                continue
+            base, span = diag_pair_factor_space(st, i, j)
+            out.extend(Diag(i, j, base * d) for d in _divisors_above_one(span))
+    return out
+
+
+def legal_compress_actions(st, max_axes: int = 8,
+                           kinds: tuple = ("mean",)) -> list:
+    """Every single-axis ``Compress`` graphax will accept on ``st``."""
+    from graphax.sparse.micro_actions import Compress
+
+    mask = compress_valid_mask(st, max_axes)
+    return [Compress(axes=(a,), kind=k)
+            for a in range(max_axes) if mask[a] for k in kinds]
+
+
+def masked_micro_chooser(pick, max_dims: int = 8, max_axes: int = 8,
+                         kinds: tuple = ("mean",)):
+    """Wrap ``pick`` into the slot callable graphax invokes per face slot.
+
+    ``pick(tensor, actions)`` receives the live operand and the list of actions
+    that are legal ON THAT OPERAND, and returns one of them (or ``None`` to
+    leave the operand exact). Because the list is enumerated from the tensor
+    itself, an illegal action is not merely unlikely -- it is unrepresentable.
+
+    Returning the chosen action rather than a transformed tensor is what keeps
+    it visible to the AOJ's transform log; a callable that returns a tensor is
+    applied but never recorded.
+    """
+    def _chooser(st):
+        actions = (legal_diag_actions(st, max_dims)
+                   + legal_compress_actions(st, max_axes, kinds))
+        return pick(st, actions)
+
+    return _chooser
