@@ -45,6 +45,7 @@ Pallas-mapping caveats (also see report):
 """
 from __future__ import annotations
 import functools
+import os
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -389,7 +390,15 @@ def palimpsa(q, k, v, b, gt, g, Ip, scale=None, chunk_size=16):
     run a forward/backward pass on a CPU-only host (head-node smoke tests)
     without changing GPU numerics. chunk_size only affects the kernel's
     residual frequency, so it is dropped on the ref path."""
-    if jax.default_backend() == 'cpu':
+    if (os.environ.get("GRAPHAX_PALIMPSA_REF", "0") == "1"
+            or jax.default_backend() == "cpu"):
+        # GRAPHAX_PALIMPSA_REF=1 forces the reference path even on GPU.
+        # Needed when the installed jaxlib's Triton disagrees with the IR
+        # Pallas emits (jax/jaxlib 0.9.0.1 alongside a 0.10.1 cuda plugin
+        # -> 'Failed to parse Triton module: expected CacheModifierAttr').
+        # Numerically the same as the kernel (palimpsa_ref is its verified
+        # oracle), just slower -- lets the palimpsa policy train while the
+        # env mismatch is fixed separately.
         return palimpsa_ref(q, k, v, b, gt, g, Ip, scale)
     return palimpsa_attention(q, k, v, b, gt, g, Ip, scale, chunk_size)
 
