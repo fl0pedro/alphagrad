@@ -181,7 +181,7 @@ def vertex_avail_at_step(state, vertex_valid_static, total_v: int, num_valid: in
 # read the SparseTensor's own index structure, so they are exact per edge.
 
 
-def diag_valid_mask(st, max_dims: int) -> np.ndarray:
+def diag_valid_mask(st, max_dims: int) -> np.ndarray:  # noqa: F821 (uses diag_pair_factor_space, defined below)
     """``(max_dims, max_dims)`` bool mask of legal ``Diag(i, j)`` on edge ``st``.
 
     ``i`` and ``j`` index the CONCATENATED ``out_dims + primal_dims`` list --
@@ -223,6 +223,13 @@ def diag_valid_mask(st, max_dims: int) -> np.ndarray:
             if di.is_sparse and di.other_id != dj.id:
                 continue
             if dj.is_sparse and dj.other_id != di.id:
+                continue
+            # A pair that affords only the no-op is not an action. Without
+            # this the factor head would be handed an all-masked support and
+            # its softmax -- uniform over illegal factors -- would look like a
+            # confident choice. Costs one gcd per surviving pair.
+            _base, span = diag_pair_factor_space(st, i, j)
+            if span <= 1:
                 continue
             mask[i, j] = True
     return mask
@@ -272,8 +279,23 @@ def diag_pair_factor_space(st, i: int, j: int) -> tuple[int, int]:
     """``(base, span)`` describing the legal ``Diag.factor`` set for ``(i, j)``.
 
     The legal factors are exactly ``base * d`` for every divisor ``d`` of
-    ``span`` -- a shape the prime-exponent factor head can enumerate directly,
-    since it already works by picking a divisor of a single integer.
+    ``span`` **with ``d > 1``** -- a shape the prime-exponent factor head can
+    enumerate directly, since it already works by picking a divisor of a single
+    integer.
+
+    ``d`` is the RELATIVE subdivision: how many times finer the blocks get.
+    ``Diag.factor`` itself is ABSOLUTE -- it is the resulting meta count (the
+    number of diagonal blocks), and the block sizes come out as
+    ``(N_i // factor, N_j // factor)``. So halving the blocks of an existing
+    meta-2 pair is ``d = 2``, i.e. ``factor = 4``, not ``factor = 2``.
+
+    ``d = 1`` is excluded because it is a pure no-op: for a free pair
+    ``factor = 1`` leaves the tensor untouched (``apply_diag`` returns the very
+    same object), and for a coupled pair ``factor == meta`` is likewise
+    defined as a no-op. Spending a micro-action slot to do nothing is never
+    what the policy wants, so ``span == 1`` means the pair affords NO legal
+    action at all -- which is why :func:`diag_valid_mask` masks such a pair
+    out entirely rather than leaving the factor head with empty support.
 
     Two regimes, both enforced by graphax:
 

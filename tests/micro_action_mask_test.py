@@ -80,7 +80,12 @@ def test_diag_mask_is_tight_when_all_dims_are_physical(name, st):
         pytest.skip("tightness is only claimed for all-physical tensors")
     mask = diag_valid_mask(st, MAX_DIMS)
     for i, j in itertools.product(range(len(dims)), range(len(dims))):
-        assert bool(mask[i, j]) == _diag_applies(st, i, j), (
+        # graphax ACCEPTS the no-op (factor=1, or factor==meta on a coupled
+        # pair); the mask deliberately does not offer a pair whose only
+        # available factor is that no-op.
+        _base, span = diag_pair_factor_space(st, i, j)
+        expected = _diag_applies(st, i, j) and span > 1
+        assert bool(mask[i, j]) == expected, (
             f"{name}: mask disagrees with graphax on Diag({i},{j})")
 
 
@@ -109,9 +114,11 @@ def test_diag_requires_the_out_primal_split():
 
 
 def test_sparse_dim_may_only_pair_with_its_partner():
-    st = SparseTensor([DiagonalIndex(0, 4, 0, 2), DenseIndex(1, 6, 1)],
-                      [DiagonalIndex(2, 4, 0, 0), DenseIndex(3, 6, 2)],
-                      jnp.ones((4, 6, 6)))
+    # Build the coupled pair the way the pipeline does -- one Diag on a dense
+    # tensor -- rather than hand-rolling indexes, which is easy to get subtly
+    # wrong (val layout, contiguous ids) and graphax rightly rejects.
+    # meta 2 x block 2 = logical 4, so this pair can still be halved.
+    st = apply_diag(_square(), Diag(0, 2, 2))
     mask = diag_valid_mask(st, MAX_DIMS)
     assert mask[0, 2], "an already-paired dim keeps its own partner"
     assert not mask[0, 3], "a paired dim may not take a different partner"
@@ -214,8 +221,10 @@ def test_free_pair_factor_space_is_the_divisors_of_the_gcd():
     st = _square()
     base, span = diag_pair_factor_space(st, 0, 2)
     assert base == 1 and span == diag_pair_gcd(st, 0, 2)
-    predicted = {base * d for d in _divisors(span)}
-    assert predicted == _factors_graphax_accepts(st, 0, 2)
+    predicted = {base * d for d in _divisors(span) if d > 1}
+    accepted = _factors_graphax_accepts(st, 0, 2)
+    assert predicted == accepted - {1}, "every real factor, and only those"
+    assert 1 not in predicted, "factor=1 is a pure no-op and is never offered"
 
 
 def test_coupled_pair_may_only_subdivide_never_coarsen():
@@ -227,12 +236,13 @@ def test_coupled_pair_may_only_subdivide_never_coarsen():
 
     base, span = diag_pair_factor_space(st, 0, 2)
     assert base == 2, "the current meta count is the floor, not 1"
-    predicted = {base * d for d in _divisors(span)}
+    predicted = {base * d for d in _divisors(span) if d > 1}
     accepted = _factors_graphax_accepts(st, 0, 2)
-    assert predicted == accepted
-    assert 1 not in accepted, "coarsening a coupled pair is rejected"
+    assert predicted == accepted - {base}, "strictly finer only"
+    assert 1 not in accepted, "coarsening a coupled pair is rejected outright"
+    assert base not in predicted, "factor == meta is the no-op, never offered"
     assert 1 in _divisors(diag_pair_gcd(st, 0, 2)), (
-        "and the plain gcd WOULD have offered it -- the reason this helper exists")
+        "and the plain gcd WOULD have offered factor=1 -- why this helper exists")
 
 
 def test_untouched_pair_stays_free_after_a_diag_elsewhere():
@@ -279,3 +289,50 @@ def test_group_zero_is_a_real_group_not_the_ungrouped_sentinel():
         group_id=jnp.zeros(n, dtype=jnp.int32), valid_mask=jnp.ones(n))
     _, _, _, i_coupled = _compute_axis_masks(feats)
     assert i_coupled.tolist() == [1., 1.], "two axes in group 0 ARE partners"
+
+
+def test_factor_is_the_absolute_meta_count_not_a_relative_step():
+    """Worked example on logical sizes (4, 8).
+
+    factor=2 -> 2 diagonal blocks of (2, 4); factor=4 -> 4 blocks of (1, 2).
+    So `Diag.factor` is the ABSOLUTE resulting meta count, while the `d` in
+    diag_pair_factor_space's `base * d` is the RELATIVE subdivision. Halving
+    the blocks of an existing meta-2 pair is d=2, i.e. factor=4.
+    """
+    st = SparseTensor([DenseIndex(0, 4, 0), DenseIndex(1, 8, 1)],
+                      [DenseIndex(2, 4, 2), DenseIndex(3, 8, 3)],
+                      jnp.ones((4, 8, 4, 8)))
+    r2 = apply_diag(st, Diag(0, 3, 2))
+    assert r2.out_dims[0].size == 2
+    assert (r2.out_dims[0].block_size, r2.primal_dims[1].block_size) == (2, 4)
+
+    r4 = apply_diag(st, Diag(0, 3, 4))
+    assert r4.out_dims[0].size == 4
+    # a block_size of 1 is stored implicitly as None
+    assert ((r4.out_dims[0].block_size or 1),
+            (r4.primal_dims[1].block_size or 1)) == (1, 2)
+
+    # free pair: base 1, so the offered factors are the >1 divisors of gcd(4,8)
+    assert diag_pair_factor_space(st, 0, 3) == (1, 4)
+    # after meta=2, only d=2 remains -> absolute factor 4, the (1,2) blocking
+    base, span = diag_pair_factor_space(r2, 0, 3)
+    assert (base, span) == (2, 2)
+    assert {base * d for d in _divisors(span) if d > 1} == {4}
+
+
+def test_a_pair_with_no_real_factor_is_not_offered_at_all():
+    """gcd(3, 4) == 1, so the only factor is the no-op. The pair must be masked
+    out rather than leaving the factor head with empty support."""
+    st = SparseTensor([DenseIndex(0, 3, 0)], [DenseIndex(1, 4, 1)],
+                      jnp.ones((3, 4)))
+    assert diag_pair_factor_space(st, 0, 1) == (1, 1)
+    assert not diag_valid_mask(st, MAX_DIMS).any()
+
+
+def test_a_fully_diagonal_pair_cannot_be_subdivided_further():
+    """meta == logical size means blocks of size 1: nothing left to split."""
+    st = apply_diag(_square(), Diag(0, 2, 4))   # meta 4 == logical size 4
+    assert diag_pair_factor_space(st, 0, 2) == (4, 1)
+    mask = diag_valid_mask(st, MAX_DIMS)
+    assert not mask[0, 2] and not mask[2, 0], "no finer blocking exists"
+    assert mask[1, 3], "the untouched free pair is unaffected"
