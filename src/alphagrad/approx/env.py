@@ -1522,6 +1522,372 @@ def eliminate_order_per_face(incr, order, sample_fn, max_faces=None,
     return out
 
 
+# ---------------------------------------------------------------------------
+# MEASURE VIA THE ACCUMULATED-JACOBIAN BUILDER (``ALPHAGRAD_MEASURE_VIA_AOJ``)
+# ---------------------------------------------------------------------------
+#
+# THE PROBLEM THIS SOLVES. ``_callback`` measures latency / flops /
+# xla_peak_memory / cosine_sim on an executable built with
+#
+#     jacve(target_fun, order, argnums=..., transforms=<PER-VERTEX>)
+#
+# and ``jacve`` has NO per-face parameter. So the per-local-path choices
+# ``ALPHAGRAD_PER_FACE_APPROX`` lets a policy make (see the block above) are
+# INVISIBLE to the reward: the policy can approximate one face and leave its
+# neighbour exact, and every measured channel comes out identical. The reward
+# is therefore blind to exactly the decision the per-face head is learning.
+#
+# THE FIX. ``IncrementalJacobian`` (graphax.incremental) DOES take
+# ``face_transforms`` per ``eliminate`` call, and its ``current_jaxpr()`` hands
+# back a closed jaxpr that can be wrapped in a plain callable, jitted, lowered
+# and compiled EXACTLY like the jacve one — so every downstream consumer
+# (ResourceMonitor, ``cost_analysis``, ``memory_analysis``, ``_align_jac``,
+# ``_quality_metrics``) keeps working on an unchanged ``Compiled`` object.
+#
+# FLAG: ``ALPHAGRAD_MEASURE_VIA_AOJ=1``. Default OFF -> ``_callback`` builds the
+# measured executable with ``jacve`` exactly as before (byte-identical, by
+# construction: the AOJ branch is simply not taken).
+#
+# INTERACTION WITH ``ALPHAGRAD_PER_FACE_APPROX``:
+#
+#   PER_FACE_APPROX  MEASURE_VIA_AOJ   effect on the REWARD
+#   ---------------  ---------------   ---------------------------------------
+#   0                0                 legacy. per-vertex transforms only.
+#   1                0                 per-face choices are made and recorded
+#                                      but DO NOT REACH THE REWARD (jacve
+#                                      cannot see them). This is HEAD's
+#                                      behaviour and the bug being fixed.
+#   0                1                 AOJ-built executable, per-vertex
+#                                      transforms only -> numerically the same
+#                                      measurement as legacy (verified).
+#   1                1                 per-face choices reach the reward.
+#
+# i.e. per-face choices only influence the measured reward when BOTH are on.
+# ``MEASURE_VIA_AOJ`` is what routes the harness through the builder that can
+# see them; ``PER_FACE_APPROX`` is what makes the policy emit them.
+_MEASURE_VIA_AOJ_CACHE = None
+
+
+def measure_via_aoj_enabled() -> bool:
+    """``ALPHAGRAD_MEASURE_VIA_AOJ=1`` -> build the MEASURED executable with
+    ``IncrementalJacobian`` instead of ``jacve``.
+
+    Read lazily + cached for the same reason as
+    :func:`per_face_approx_enabled`: in a Ray actor the ``ALPHAGRAD_*`` vars
+    arrive via ``runtime_env`` after this module is imported.
+    """
+    global _MEASURE_VIA_AOJ_CACHE
+    if _MEASURE_VIA_AOJ_CACHE is None:
+        _MEASURE_VIA_AOJ_CACHE = (
+            os.environ.get("ALPHAGRAD_MEASURE_VIA_AOJ", "0") == "1"
+        )
+    return _MEASURE_VIA_AOJ_CACHE
+
+
+# --- per-face transform source -------------------------------------------
+#
+# ``_callback``'s signature is fixed (it rides an ``io_callback`` with a pinned
+# return signature), so the per-face decisions cannot be threaded in as an
+# argument. They arrive through this process-local registry instead, which the
+# policy / actor sets before stepping the env. Two shapes are accepted:
+#
+#   * a MAPPING ``{vertex: {face_key: (lhs, rhs, res)}}`` — precomputed;
+#   * a CALLABLE ``src(incr, vertex, face_keys) -> dict | None`` — the live
+#     policy hook (``face_keys`` is enumerated against the CURRENT graph, right
+#     before the elimination that rewires it, exactly as
+#     :func:`eliminate_vertex_per_face` requires).
+#
+# ``key`` is folded into the compile-cache key: two different per-face plans
+# for the same (order, specs, shapes) MUST NOT share a cached executable. It
+# defaults to a monotonically increasing counter, so merely re-registering a
+# source invalidates the cache even if we cannot digest its contents.
+_FACE_TRANSFORM_SOURCE = None
+_FACE_TRANSFORM_SOURCE_KEY = b"aoj-face:none"
+_FACE_TRANSFORM_EPOCH = [0]
+
+
+def set_face_transform_source(source, key: bytes | str | None = None) -> None:
+    """Register the per-face transform source used by the AOJ measurement.
+
+    Has NO effect unless ``ALPHAGRAD_MEASURE_VIA_AOJ=1`` — with the flag off
+    the measured executable comes from ``jacve``, which cannot see faces.
+    """
+    global _FACE_TRANSFORM_SOURCE, _FACE_TRANSFORM_SOURCE_KEY
+    _FACE_TRANSFORM_SOURCE = source
+    _FACE_TRANSFORM_EPOCH[0] += 1
+    if key is None:
+        key = f"aoj-face:epoch{_FACE_TRANSFORM_EPOCH[0]}"
+    _FACE_TRANSFORM_SOURCE_KEY = (
+        key if isinstance(key, bytes) else str(key).encode()
+    )
+
+
+def clear_face_transform_source() -> None:
+    """Drop the registered per-face source (back to per-vertex transforms)."""
+    global _FACE_TRANSFORM_SOURCE, _FACE_TRANSFORM_SOURCE_KEY
+    _FACE_TRANSFORM_SOURCE = None
+    _FACE_TRANSFORM_EPOCH[0] += 1
+    _FACE_TRANSFORM_SOURCE_KEY = b"aoj-face:none"
+
+
+def get_face_transform_source():
+    """The currently registered per-face transform source (or ``None``)."""
+    return _FACE_TRANSFORM_SOURCE
+
+
+def face_transform_source_key() -> bytes:
+    """Compile-cache discriminator for the registered per-face source."""
+    return _FACE_TRANSFORM_SOURCE_KEY
+
+
+def _resolve_face_transforms(source, incr, vertex: int):
+    """``{face_key: (lhs, rhs, res)}`` for ``vertex`` from ``source``.
+
+    Returns ``None`` (= exact, no per-face transform) when the source has
+    nothing for this vertex. Face keys are enumerated HERE, immediately before
+    the caller's ``eliminate``, because every elimination rewires the graph.
+    """
+    if source is None:
+        return None
+    if callable(source):
+        try:
+            keys = list(incr.faces(int(vertex)))
+        except Exception:                       # pragma: no cover - defensive
+            keys = []
+        ft = source(incr, int(vertex), keys)
+    else:
+        ft = source.get(int(vertex))
+    if not ft:
+        return None
+    return {tuple(k): tuple(v) for k, v in dict(ft).items()}
+
+
+# --- unsupported modes ----------------------------------------------------
+#
+# The AOJ recipe is VERIFIED for the plain Jacobian case only (no aux, dense,
+# not grad mode). The other three modes each need output structure the AOJ does
+# not currently materialise, and a SILENTLY DIFFERENT output would corrupt every
+# reward channel — far worse than not having the feature. So they fall back to
+# ``jacve`` with a logged reason.
+_AOJ_FALLBACK_LOGGED: set = set()
+
+
+def aoj_unsupported_reason(config) -> str | None:
+    """Why the AOJ path cannot measure ``config`` (``None`` = it can).
+
+    * ``measure_grad`` — the measured object is ``graphax.value_and_grad``'s
+      ``(value, grads)``; the AOJ materialises output Jacobians, not the
+      reverse-mode contraction against a scalar loss.
+    * ``has_aux`` — jacve returns ``(primal_out, jac)`` and callers read
+      ``out[1]``; ``IncrementalJacobian.current_jaxpr`` outputs the Jacobian
+      tensors ONLY, so the primal half would have to be pulled out of the
+      persistent trace (private ``trace.to_jaxpr`` surgery, unverified).
+    * ``sparse_representation`` — jacve returns ``SparseTensor`` objects;
+      the AOJ densifies (``.dense()``) on the way out.
+    """
+    if bool(getattr(config, "measure_grad", False)):
+        return "measure_grad=True (value_and_grad output not materialised by the AOJ)"
+    if bool(getattr(config, "has_aux", False)):
+        return "has_aux=True (primal half of (primal, jac) not materialised by the AOJ)"
+    if bool(getattr(config, "sparse", False)):
+        return "sparse_representation=True (the AOJ densifies its output edges)"
+    return None
+
+
+def _log_aoj_fallback(reason: str) -> None:
+    """One line per distinct reason per process — never silent, never spammy."""
+    if reason in _AOJ_FALLBACK_LOGGED:
+        return
+    _AOJ_FALLBACK_LOGGED.add(reason)
+    print(
+        "[AOJ] ALPHAGRAD_MEASURE_VIA_AOJ=1 but this config is unsupported — "
+        f"falling back to jacve for the measured executable. reason: {reason}",
+        flush=True,
+    )
+
+
+def _aoj_collect_outputs(incr, jaxpr, argnums):
+    """``(outs, labels)`` — the AOJ's input->output Jacobian edges, DRAINED.
+
+    Mirrors ``graphax.core.vertex_elimination_jaxpr``'s output collection
+    rather than calling ``IncrementalJacobian.jacobian_outputs`` directly,
+    for ONE reason: ``vertex_elimination_jaxpr`` runs
+    ``_drain_transforms(tensor.copy(), post_first=False)`` on every final
+    output edge before densifying, and ``jacobian_outputs`` does not. With
+    per-vertex/per-face transforms in play an output edge can still carry a
+    queued pre/post transform, and skipping the drain would silently produce a
+    DIFFERENT Jacobian from jacve's — i.e. a wrong reward. On an edge with no
+    queued transforms the drain is a no-op, so the exact-mode equivalence the
+    probe established is preserved.
+
+    Falls back to ``incr.jacobian_outputs()`` (no drain) only if the graphax
+    private helpers move; that is logged, not silent.
+    """
+    try:
+        from jax._src import core as _jcore
+        from graphax.core import _drain_transforms as _drain, _force as _frc
+    except ImportError:                          # pragma: no cover - defensive
+        _log_aoj_fallback(
+            "graphax.core._drain_transforms/_force unavailable — output edges "
+            "collected WITHOUT the final drain"
+        )
+        return incr.jacobian_outputs()
+
+    outs, labels = [], []
+    with _jcore.set_current_trace(incr.trace):
+        for ov in jaxpr.outvars:
+            for ii in argnums:
+                iv = jaxpr.invars[int(ii)]
+                inner = incr.graph.get(iv)
+                edge = inner.get(ov) if inner is not None else None
+                t = _frc(edge) if edge is not None else None
+                if t is None:
+                    continue
+                t = _drain(t.copy(), post_first=False)
+                outs.append(t.dense())
+                labels.append((ov, int(ii)))
+    return outs, labels
+
+
+def build_aoj_jacobian_fn(jaxpr, argnums, consts, args, order,
+                          transforms=None, face_source=None):
+    """A plain callable ``f(*args)`` computing the SAME Jacobian pytree
+    ``jacve(fun, order, argnums, transforms=transforms)`` returns — built with
+    :class:`graphax.incremental.IncrementalJacobian` so per-FACE transforms can
+    be applied.
+
+    ``transforms`` is the per-vertex ``[(vertex, [rule, ...]), ...]`` sequence
+    ``_callback`` already builds (handed to ``eliminate(..., rules=...)``, which
+    is byte-for-byte what ``IncrementalJacobian.eliminate_order`` does).
+    ``face_source`` is the per-face registry value (see
+    :func:`set_face_transform_source`); ``None`` means "per-vertex only", and in
+    that case ``faces()`` is never even enumerated, so the build is exactly the
+    plain recipe verified bit-identical to jacve.
+
+    OUTPUT STRUCTURE — assembled from ``current_jaxpr()``'s ``labels`` so it
+    matches jacve leaf-for-leaf:
+
+    * ``labels`` is a list of ``(outvar, input-argnum)`` in the order the AOJ
+      emitted its tensors: ``for outvar in jaxpr.outvars: for ii in argnums``,
+      SKIPPING pairs whose edge is ``None`` (a structurally-zero block).
+    * ``graphax.core.vertex_elimination_jaxpr`` uses the SAME nested loop but
+      over ``jaxpr_invars = [v for i, v in enumerate(jaxpr.invars) if i in
+      argnums]`` (ascending invar index) and emits
+      ``zeros_like(outvar, invar)`` for the missing pairs instead of skipping
+      them. So we walk ``labels`` in lockstep with that nested loop to build a
+      PLAN of ``(label index | zero-fill)`` slots, keyed by output POSITION
+      (not identity, so a repeated outvar cannot alias).
+    * The plan is then folded exactly as graphax folds it: with
+      ``n = len(argnums) > 1`` the flat list is regrouped into one ``n``-tuple
+      per output; ``jacve`` then returns ``out[0]`` when the function has a
+      single output and more than one argument, else
+      ``tree_unflatten(tree_structure(tuple(jaxpr.outvars)), out)``.
+    """
+    from graphax.incremental import IncrementalJacobian
+    from graphax.sparse.utils import zeros_like as _zeros_like
+    import jax.tree_util as _jtu
+
+    argnums = tuple(int(a) for a in argnums)
+    incr = IncrementalJacobian(
+        jaxpr, argnums=argnums, consts=list(consts), args=list(args),
+    )
+
+    tmap = {int(v): tuple(rules) for v, rules in (transforms or ())}
+    applied: list = []
+    for v in order:
+        v = int(v)
+        ft = _resolve_face_transforms(face_source, incr, v)
+        incr.eliminate(v, rules=tmap.get(v, ()), face_transforms=ft)
+        applied.append(ft)
+
+    # STRICT FULL-ORDER GUARD — the same audit ``vertex_elimination_jaxpr``
+    # runs (and honours the same ``GRAPHAX_ALLOW_PARTIAL_ORDER`` escape).
+    # WITHOUT it the AOJ silently drops every Jacobian path through a live
+    # intermediate vertex where jacve REFUSES to build at all: measured on
+    # ``lambda a, b: (sin(a*b), cos(a) + sin(a*b))`` with an order that misses
+    # one eqn, jacve raises while the unguarded AOJ returned a Jacobian
+    # 0.639 away from ``jax.jacrev``. In ``_callback`` this is unreachable
+    # (the ``vertex_elimination_jaxpr`` op-count call runs first with the SAME
+    # order and raises), but ``build_aoj_jacobian_fn`` is callable on its own
+    # and a wrong reward is worse than a loud failure.
+    if os.environ.get("GRAPHAX_ALLOW_PARTIAL_ORDER", "0") == "0":
+        _intermediates = {
+            ov for eqn in jaxpr.eqns for ov in eqn.outvars
+            if isinstance(ov, core.Var)
+        }
+        _live = [
+            v for v in incr.graph.keys()
+            if v in _intermediates and len(incr.graph[v]) > 0
+        ]
+        if _live:
+            raise ValueError(
+                "AOJ: the elimination order left "
+                f"{len(_live)} intermediate vertex/vertices with live edges "
+                "un-eliminated — the dense Jacobian would silently drop every "
+                "path through them. Pass a full order or set "
+                "GRAPHAX_ALLOW_PARTIAL_ORDER=1 (mirrors the jacve guard)."
+            )
+
+    outs, labels = _aoj_collect_outputs(incr, jaxpr, argnums)
+    res = incr.trace.to_jaxpr(outs, incr.dbg, incr.si)
+    jx, cs = res[0], res[1]
+
+    # --- structure plan (see docstring) ---
+    # graphax's canonical operand order = ascending invar index, not the order
+    # the caller wrote argnums in.
+    _an = set(argnums)
+    canonical = [i for i in range(len(jaxpr.invars)) if i in _an]
+    # Lockstep walk over the AOJ emission order to map (out position, argnum)
+    # -> index into ``outs``.
+    slot: dict[tuple[int, int], int] = {}
+    li = 0
+    for oi, ov in enumerate(jaxpr.outvars):
+        for ii in argnums:
+            if li < len(labels) and labels[li][0] is ov and int(labels[li][1]) == int(ii):
+                slot[(oi, int(ii))] = li
+                li += 1
+    if li != len(labels):                        # pragma: no cover - defensive
+        raise RuntimeError(
+            f"AOJ label walk desynchronised ({li} != {len(labels)}) — refusing "
+            "to assemble a possibly-misordered Jacobian"
+        )
+
+    plan: list = []                              # (label_idx | None, outvar, invar)
+    for oi, ov in enumerate(jaxpr.outvars):
+        for i in canonical:
+            plan.append((slot.get((oi, i)), ov, jaxpr.invars[i]))
+
+    n = len(canonical)
+    out_tree = _jtu.tree_structure(tuple(jaxpr.outvars))
+    single_out_many_in = (
+        len(jaxpr.outvars) == 1 and len(jaxpr.invars) > 1
+    )
+
+    try:
+        _eval_jaxpr = jax.core.eval_jaxpr
+    except AttributeError:                       # pragma: no cover - defensive
+        from jax._src.core import eval_jaxpr as _eval_jaxpr
+
+    def aoj_jacobian(*call_args):
+        vals = _eval_jaxpr(jx, cs, *call_args)
+        flat = [
+            vals[k] if k is not None else _zeros_like(ov, iv)
+            for (k, ov, iv) in plan
+        ]
+        if n > 1:
+            ratio = len(flat) // n
+            jac_vals = [tuple(flat[i * n: i * n + n]) for i in range(ratio)]
+        else:
+            jac_vals = flat
+        if single_out_many_in:
+            return jac_vals[0]
+        return _jtu.tree_unflatten(out_tree, jac_vals)
+
+    aoj_jacobian.aoj_face_transforms = applied   # introspection / tests
+    aoj_jacobian.aoj_labels = labels
+    return aoj_jacobian
+
+
 # Lookup row used to convert a legacy scalar sp_type ∈ {0..4} into a single-rule (MAX_RULES, 3) spec.
 _LEGACY_SP_TO_RULE_ROW = jnp.array(
     [
@@ -2551,6 +2917,22 @@ def _callback(
         # in/out shardings + GSPMD partition); keep their cache entries
         # distinct so a single-device blob is never loaded for a sharded run.
         h.update(b"shard:" + str(len(_shard_devices)).encode())
+
+    # --- AOJ measurement gate (ALPHAGRAD_MEASURE_VIA_AOJ) -------------------
+    # Decide HERE, before the cache key is closed: an AOJ-built executable and
+    # a jacve-built one are different objects for the same (order, specs,
+    # shapes), and — once a per-face source is registered — two different
+    # per-face plans are different again. Both discriminators go into the key
+    # so a cached executable can never be served for a different measurement
+    # recipe. With the flag off nothing is added and the key is byte-identical
+    # to HEAD's.
+    _aoj_reason = aoj_unsupported_reason(config) if measure_via_aoj_enabled() else None
+    _aoj_active = measure_via_aoj_enabled() and _aoj_reason is None
+    if _aoj_reason is not None:
+        _log_aoj_fallback(_aoj_reason)
+    if _aoj_active:
+        h.update(b"aoj:1")
+        h.update(face_transform_source_key())
     cache_key = h.digest()
 
     # Exact-Jacobian cache key — SHAPE-ONLY (no order/specs/stop). The
@@ -2568,6 +2950,24 @@ def _callback(
     exact_cache_key = he.digest()
 
     def _do_compile_approx():
+        if _aoj_active:
+            # ALPHAGRAD_MEASURE_VIA_AOJ: build the measured callable with
+            # IncrementalJacobian so the policy's PER-FACE transforms are part
+            # of the measured computation (jacve takes per-vertex transforms
+            # only, which is why per-face choices never moved the reward). The
+            # jit/lower/compile below is the SAME call the jacve branch makes,
+            # so ResourceMonitor, cost_analysis, memory_analysis, _align_jac
+            # and _quality_metrics all consume an unchanged ``Compiled``.
+            fn = build_aoj_jacobian_fn(
+                config.jaxpr,
+                config.argnums,
+                consts,
+                args_for_lower,
+                o_list,
+                transforms=transforms,
+                face_source=get_face_transform_source(),
+            )
+            return jax.jit(fn, keep_unused=True).lower(*args_for_lower).compile()
         if config.measure_grad:
             # Gradient mode: measure ``graphax.value_and_grad`` of the scalar
             # loss along the policy's order + micro-action transforms. Returns
