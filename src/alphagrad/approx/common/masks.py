@@ -9,6 +9,8 @@ convenience builders for the most common mask layouts.
 
 from __future__ import annotations
 
+import math
+
 import jax.numpy as jnp
 import numpy as np
 
@@ -162,3 +164,105 @@ def vertex_avail_at_step(state, vertex_valid_static, total_v: int, num_valid: in
         jnp.zeros(total_v, dtype=jnp.float32).at[chosen - 1].add(active)
     )
     return vertex_valid_static * (1.0 - jnp.clip(already_chosen, 0.0, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# Per-EDGE micro-action validity (Diag / Compress)
+# ---------------------------------------------------------------------------
+# graphax's typed transform API fails LOUDLY when a micro-action does not fit
+# the edge it lands on ("TRANSFORM DID NOT FIT ... Mask invalid actions up
+# front instead of discovering them by throwing"). These helpers are that
+# mask, and they live here rather than in graphax because the action space is
+# the env's concern, not the AD kernel's.
+#
+# `build_pair_valid_mask` above is per-VERTEX and infers legality from jaxpr
+# eqn ndims. That is too coarse for the per-face policy: the lhs / rhs / res
+# slots of a single face carry three DIFFERENT geometries. The helpers below
+# read the SparseTensor's own index structure, so they are exact per edge.
+
+
+def diag_valid_mask(st, max_dims: int) -> np.ndarray:
+    """``(max_dims, max_dims)`` bool mask of legal ``Diag(i, j)`` on edge ``st``.
+
+    ``i`` and ``j`` index the CONCATENATED ``out_dims + primal_dims`` list --
+    the numbering :class:`graphax.sparse.micro_actions.Diag` uses. A pair is
+    legal iff all of:
+
+    * both lie in ``[0, len(out_dims) + len(primal_dims))`` and ``i != j``;
+    * the pair is **split across the bipartite boundary** -- a Jacobian
+      diagonal ties one OUT axis to one PRIMAL axis, so out<->out and
+      primal<->primal pairs are meaningless and graphax rejects them;
+    * **neither side is already spoken for** -- a dim with ``is_sparse`` is
+      already paired through ``other_id``, so its only legal partner is that
+      partner. Two dense (free) dims may always be paired;
+    * **neither side is implicit** (``axis is None``) -- such a dim has no
+      physical axis to diagonalise, either because it was never materialised
+      or because an earlier ``Compress`` in the same sub-episode dropped it.
+
+    Entries past the tensor's real rank stay ``False``, so the mask can be
+    emitted at a fixed ``max_dims`` for a statically-shaped policy head.
+    """
+    mask = np.zeros((max_dims, max_dims), dtype=bool)
+    dims = tuple(st.out_dims) + tuple(st.primal_dims)
+    n_out = len(st.out_dims)
+    n = min(len(dims), max_dims)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if (i < n_out) == (j < n_out):
+                continue  # both out, or both primal -> not a diagonal
+            di, dj = dims[i], dims[j]
+            # An IMPLICIT dim (axis is None) has no physical axis to
+            # block-diagonalise -- it was never materialised, or a prior
+            # Compress in this same sub-episode dropped it. graphax rejects
+            # such a pair outright, so it must be masked out here.
+            if di.axis is None or dj.axis is None:
+                continue
+            # A sparse dim is already half of a pair; only its partner is legal.
+            if di.is_sparse and di.other_id != dj.id:
+                continue
+            if dj.is_sparse and dj.other_id != di.id:
+                continue
+            mask[i, j] = True
+    return mask
+
+
+def diag_pair_gcd(st, i: int, j: int) -> int:
+    """Largest legal ``Diag.factor`` for pair ``(i, j)`` on ``st``.
+
+    ``factor`` must be a positive divisor of BOTH logical sizes, so the legal
+    factors are exactly the divisors of this gcd -- which is what the
+    prime-exponent factor head in ``heads.py`` enumerates. Returns ``0`` for an
+    out-of-range pair.
+
+    Note: under ``GRAPHAX_KEEP_BLOCKDIAG`` an already-coupled pair may only be
+    RE-masked to a multiple of its current meta count (finer sub-blocks); that
+    extra constraint is a factor-level rule on top of this gcd.
+    """
+    dims = tuple(st.out_dims) + tuple(st.primal_dims)
+    if not (0 <= i < len(dims) and 0 <= j < len(dims)):
+        return 0
+    return math.gcd(int(dims[i].logical_size), int(dims[j].logical_size))
+
+
+def compress_valid_mask(st, max_axes: int) -> np.ndarray:
+    """``(max_axes,)`` bool mask of legal ``Compress`` axes on edge ``st``.
+
+    ``Compress.axes`` are PHYSICAL positions into ``st.val``, so the legal
+    range is ``[0, val.ndim)`` -- ``val.ndim - 1`` is the highest axis, from 0
+    up. An edge with no materialised ``val`` (a pure-structure Jacobian, e.g.
+    a constant ``-1``) masks to all-``False``: graphax *accepts* a Compress
+    there, but it is a guaranteed no-op, and spending one of the sub-episode's
+    micro-actions on a no-op is never what the policy wants. The mask is
+    therefore deliberately stricter than ``apply_compress`` in this one case --
+    strictness is safe, looseness would crash.
+    """
+    mask = np.zeros(max_axes, dtype=bool)
+    val = getattr(st, "val", None)
+    if val is None:
+        return mask
+    ndim = int(getattr(val, "ndim", 0))
+    if ndim > 0:
+        mask[: min(ndim, max_axes)] = True
+    return mask
