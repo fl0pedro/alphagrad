@@ -336,3 +336,49 @@ def test_a_fully_diagonal_pair_cannot_be_subdivided_further():
     mask = diag_valid_mask(st, MAX_DIMS)
     assert not mask[0, 2] and not mask[2, 0], "no finer blocking exists"
     assert mask[1, 3], "the untouched free pair is unaffected"
+
+
+# ---------------------------------------------------------------------------
+# Op-type legality must agree with the axis masks
+# ---------------------------------------------------------------------------
+
+from alphagrad.approx.heads import (  # noqa: E402
+    OP_COMPRESS, OP_DIAG, OP_QUANT, _compute_op_legality)
+
+
+def _op_feats(n, in_diag, gid, compressed=None):
+    tb = (jnp.zeros((n, AXIS_TAG_BITS))
+          .at[:, 1].set(jnp.array(compressed or [0.] * n))
+          .at[:, 2].set(jnp.array(in_diag)))
+    return AxisTokenFeatures(
+        size=jnp.ones(n) * 4, log_size=jnp.log(jnp.ones(n) * 4), tag_bits=tb,
+        group_id=jnp.array(gid, dtype=jnp.int32), valid_mask=jnp.ones(n))
+
+
+def test_compress_is_illegal_when_the_edge_has_no_val():
+    """A pure-structure Jacobian has nothing to compress. graphax accepts the
+    Compress as a no-op, so nothing crashes -- but the op must not be offered,
+    or the policy spends a micro-action slot achieving nothing."""
+    feats = _op_feats(3, [0., 0., 0.], [-1, -1, -1])
+    assert _compute_op_legality(feats)[OP_COMPRESS] == 1.0
+
+    no_val = jnp.zeros(3)   # what compress_valid_mask returns for val is None
+    legal = _compute_op_legality(feats, compress_valid=no_val)
+    assert legal[OP_COMPRESS] == 0.0, "no val -> COMPRESS must not be offered"
+    assert legal[OP_QUANT] == 1.0, (
+        "QUANT stays legal on purpose: it is the fallback that guarantees at "
+        "least one legal op, and END is disabled under substeps=1")
+
+
+def test_op_legality_does_not_veto_re_diagonalisation():
+    """With only a coupled pair left, the axis masks allow a subdividing DIAG.
+    Op legality is derived from those masks, so it must agree. Its old private
+    copy of the rules kept `& ~in_diag` and reported DIAG illegal here."""
+    feats = _op_feats(2, [1., 1.], [0, 0])
+    assert _compute_op_legality(feats)[OP_DIAG] == 1.0
+
+
+def test_op_legality_vetoes_diag_when_no_pair_survives():
+    feats = _op_feats(2, [0., 0.], [-1, -1])
+    forbid_all = jnp.zeros((2, 2))
+    assert _compute_op_legality(feats, pair_valid=forbid_all)[OP_DIAG] == 0.0

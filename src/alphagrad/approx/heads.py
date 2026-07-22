@@ -766,19 +766,29 @@ def _features_after_compress(
     )
 
 
-def _compute_op_legality(features: AxisTokenFeatures) -> jax.Array:
-    """Op-type legality (NUM_OPS,) — DIAG / COMPRESS / QUANT / END."""
-    is_compressed = features.tag_bits[:, TAG_IS_COMPRESSED] > 0.5
-    in_diag = features.tag_bits[:, TAG_IN_DIAG_GROUP] > 0.5
-    valid = features.valid_mask > 0.5
+def _compute_op_legality(
+    features: AxisTokenFeatures,
+    pair_valid: jax.Array | None = None,
+    compress_valid: jax.Array | None = None,
+) -> jax.Array:
+    """Op-type legality (NUM_OPS,) — DIAG / COMPRESS / QUANT / END.
 
-    diag_eligible = valid & ~is_compressed & ~in_diag
-    compress_eligible = valid & ~is_compressed
+    Derived from :func:`_compute_axis_masks` rather than recomputed, so an op
+    can never be advertised as legal while every concrete action under it is
+    masked out. This used to be recomputed with its own copy of the rules, and
+    the copy went stale: it kept the old ``& ~in_diag`` term, which declared
+    DIAG illegal precisely when only coupled axes remained -- exactly the case
+    re-diagonalisation exists to serve -- so the op mask would have vetoed the
+    action the axis masks had just made reachable.
+    """
+    _diag_i, compress_eligible, j_mask_for_i, _coupled = _compute_axis_masks(
+        features, pair_valid=pair_valid, compress_valid=compress_valid)
 
-    diag_legal = (jnp.sum(diag_eligible.astype(jnp.int32)) >= 2).astype(jnp.float32)
-    compress_legal = (jnp.sum(compress_eligible.astype(jnp.int32)) >= 1).astype(
-        jnp.float32
-    )
+    # DIAG is legal iff at least one (i, j) pair survives -- strictly sharper
+    # than "at least 2 eligible axes", which counted axes that could not
+    # actually pair with each other.
+    diag_legal = (jnp.sum(j_mask_for_i) > 0.0).astype(jnp.float32)
+    compress_legal = (jnp.sum(compress_eligible) > 0.0).astype(jnp.float32)
     # QUANT is per-tensor, not per-axis — always legal at this layer. If the
     # SparseTensor has ``val is None`` at apply time, ``apply_quant`` returns
     # the tensor unchanged, so an emitted QUANT can't crash the env.
@@ -816,10 +826,12 @@ def _compute_partner(features: AxisTokenFeatures) -> jax.Array:
 
 
 def _finalise_axis_masks(diag_i_eligible, compress_eligible, j_mask_for_i,
-                         i_coupled, pair_valid):
-    """Shared tail of :func:`_compute_axis_masks` for both mask regimes."""
+                         i_coupled, pair_valid, compress_valid=None):
+    """Shared tail of :func:`_compute_axis_masks`."""
     if pair_valid is not None:
         j_mask_for_i = j_mask_for_i * pair_valid
+    if compress_valid is not None:
+        compress_eligible = compress_eligible * compress_valid
     # An `i` whose entire j-row is masked would hand the j-head an all -1e9
     # logit vector, whose softmax is UNIFORM over illegal axes -- so a
     # perfectly legal-looking sample lands on an illegal pair. (This bites
@@ -833,6 +845,7 @@ def _finalise_axis_masks(diag_i_eligible, compress_eligible, j_mask_for_i,
 def _compute_axis_masks(
     features: AxisTokenFeatures,
     pair_valid: jax.Array | None = None,
+    compress_valid: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Per-step axis legality.
 
@@ -852,6 +865,12 @@ def _compute_axis_masks(
     ``in_diag_group`` but NOT which side of the out/primal split an axis sits
     on, and a Diag must tie one OUT axis to one PRIMAL axis. When the env
     supplies ``pair_valid`` it is authoritative and is AND-ed in.
+
+    ``compress_valid`` is the matching ``(N,)`` mask from
+    :func:`~alphagrad.approx.common.masks.compress_valid_mask`. The tag bits
+    cannot see ``val`` at all, so they cannot tell that an edge carrying no
+    materialised ``val`` (a pure-structure Jacobian) has nothing to compress:
+    graphax accepts the Compress but it is a guaranteed no-op.
     """
     is_compressed = features.tag_bits[:, TAG_IS_COMPRESSED] > 0.5
     in_diag = features.tag_bits[:, TAG_IN_DIAG_GROUP] > 0.5
@@ -883,7 +902,8 @@ def _compute_axis_masks(
         i_coupled[:, None] > 0.5, partner_onehot, j_free,
     )
     return _finalise_axis_masks(diag_i_eligible, compress_eligible,
-                                j_mask_for_i, i_coupled, pair_valid)
+                                j_mask_for_i, i_coupled, pair_valid,
+                                compress_valid)
 
 
 # ---------------------------------------------------------------------------
