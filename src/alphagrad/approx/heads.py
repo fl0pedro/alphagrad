@@ -825,8 +825,24 @@ def _compute_partner(features: AxisTokenFeatures) -> jax.Array:
     return jnp.where(has_partner, first, -1).astype(jnp.int32)
 
 
+def _finalise_axis_masks(diag_i_eligible, compress_eligible, j_mask_for_i,
+                         i_coupled, pair_valid):
+    """Shared tail of :func:`_compute_axis_masks` for both mask regimes."""
+    if pair_valid is not None:
+        j_mask_for_i = j_mask_for_i * pair_valid
+    # An `i` whose entire j-row is masked would hand the j-head an all -1e9
+    # logit vector, whose softmax is UNIFORM over illegal axes -- so a
+    # perfectly legal-looking sample lands on an illegal pair. (This bites
+    # without pair_valid too: when exactly one axis is diag-eligible its own
+    # row is empty after the i != j term.) Such an `i` must not be selectable.
+    has_partner = (jnp.sum(j_mask_for_i, axis=-1) > 0.0).astype(jnp.float32)
+    return (diag_i_eligible * has_partner, compress_eligible, j_mask_for_i,
+            i_coupled)
+
+
 def _compute_axis_masks(
     features: AxisTokenFeatures,
+    pair_valid: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Per-step axis legality.
 
@@ -839,6 +855,14 @@ def _compute_axis_masks(
     single one-hot), a free ``i`` may only pair with another free axis.
     ``i_coupled[i]`` is 1.0 iff axis ``i`` already has a DIAG partner; the
     head uses it to fast-skip (gate out) the j-head when ``i`` is coupled.
+
+    ``pair_valid`` is the OPTIONAL ``(N, N)`` per-edge legality mask computed
+    by the env from the actual SparseTensor
+    (:func:`alphagrad.approx.common.masks.diag_valid_mask`). The tag-bit
+    reconstruction here is a proxy: it can see ``is_compressed`` and
+    ``in_diag_group`` but NOT which side of the out/primal split an axis sits
+    on, and a Diag must tie one OUT axis to one PRIMAL axis. When the env
+    supplies ``pair_valid`` it is authoritative and is AND-ed in.
     """
     is_compressed = features.tag_bits[:, TAG_IS_COMPRESSED] > 0.5
     in_diag = features.tag_bits[:, TAG_IN_DIAG_GROUP] > 0.5
@@ -854,7 +878,8 @@ def _compute_axis_masks(
         diag_eligible = (valid & ~is_compressed & ~in_diag).astype(jnp.float32)
         j_mask_for_i = diag_eligible[None, :] * (1.0 - eye)
         i_coupled = jnp.zeros(N, dtype=jnp.float32)
-        return diag_eligible, compress_eligible, j_mask_for_i, i_coupled
+        return _finalise_axis_masks(diag_eligible, compress_eligible,
+                                    j_mask_for_i, i_coupled, pair_valid)
 
     # --- Rule #2: coupled-vs-free pairing --------------------------------
     partner = _compute_partner(features)               # (N,) int32, -1 = free
@@ -877,7 +902,8 @@ def _compute_axis_masks(
     j_mask_for_i = jnp.where(
         i_coupled[:, None] > 0.5, partner_onehot, j_free,
     )
-    return diag_i_eligible, compress_eligible, j_mask_for_i, i_coupled
+    return _finalise_axis_masks(diag_i_eligible, compress_eligible,
+                                j_mask_for_i, i_coupled, pair_valid)
 
 
 # ---------------------------------------------------------------------------

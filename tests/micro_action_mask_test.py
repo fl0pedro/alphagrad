@@ -136,3 +136,47 @@ def test_diag_pair_gcd_bounds_the_factor():
     assert diag_pair_gcd(st, 0, 2) == 4      # 4 vs 4
     assert diag_pair_gcd(st, 0, 3) == 2      # gcd(4, 6)
     assert diag_pair_gcd(st, 0, 99) == 0     # out of range
+
+
+# ---------------------------------------------------------------------------
+# Head-side consumption of the mask
+# ---------------------------------------------------------------------------
+
+from alphagrad.approx.heads import (  # noqa: E402
+    AXIS_TAG_BITS, AxisTokenFeatures, _compute_axis_masks)
+
+
+def _feats(n, valid, compressed=None, in_diag=None):
+    tb = (jnp.zeros((n, AXIS_TAG_BITS))
+          .at[:, 1].set(jnp.array(compressed or [0.0] * n))
+          .at[:, 2].set(jnp.array(in_diag or [0.0] * n)))
+    return AxisTokenFeatures(
+        size=jnp.ones(n) * 4, log_size=jnp.log(jnp.ones(n) * 4), tag_bits=tb,
+        group_id=jnp.zeros(n, dtype=jnp.int32), valid_mask=jnp.array(valid))
+
+
+def test_an_axis_with_no_legal_partner_is_not_diag_selectable():
+    """A lone eligible axis has no partner once ``i != j`` is applied. If it
+    stayed selectable the j-head would receive an all -1e9 logit vector, whose
+    softmax is UNIFORM over illegal axes -- so a legal-looking sample lands on
+    an illegal pair instead of being rejected."""
+    diag_i, _, j_mask, _ = _compute_axis_masks(_feats(4, [1., 0., 0., 0.]))
+    assert float(j_mask[0].sum()) == 0.0, "the lone axis has no partner"
+    assert not bool((diag_i > 0).any()), "so it must not be DIAG-selectable"
+
+
+def test_two_free_axes_point_at_each_other():
+    diag_i, _, j_mask, _ = _compute_axis_masks(_feats(4, [1., 1., 0., 0.]))
+    assert diag_i.tolist() == [1., 1., 0., 0.]
+    assert j_mask[0].tolist() == [0., 1., 0., 0.], "i != j, partner is axis 1"
+
+
+def test_env_pair_mask_is_authoritative():
+    """The tag-bit reconstruction cannot see the out/primal split, so when the
+    env supplies the exact per-edge mask it must win -- including removing an
+    axis's last partner, which then removes the axis itself."""
+    feats = _feats(4, [1., 1., 0., 0.])
+    pair_valid = jnp.ones((4, 4)).at[0, 1].set(0.0)
+    diag_i, _, j_mask, _ = _compute_axis_masks(feats, pair_valid=pair_valid)
+    assert float(j_mask[0].sum()) == 0.0, "axis 0 lost its only partner"
+    assert diag_i.tolist() == [0., 1., 0., 0.], "and so is no longer selectable"
