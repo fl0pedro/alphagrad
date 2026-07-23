@@ -2422,12 +2422,136 @@ def _maybe_log_per_face_stats() -> None:
           f"skipped={skipped} applied_frac={frac:.3f}", flush=True)
 
 
+# ALPHAGRAD_FACE_TRANSFORMS=1 -> route the measurement through graphax's
+# PER-FACE face_transforms ({vertex: {face_key: (lhs, rhs, res)}}) instead of
+# the per-vertex transforms list. The per-vertex list is one rule set shared by
+# every face of a vertex and applied only to the contraction result, so it
+# cannot express "approximate pre1 differently from pre2", cannot treat
+# pre/post/new differently, and cannot skip a single path. Default ON: with the
+# default slot placement it is a pure reroute (everything lands on `res`, the
+# same operand as before), so it is safe before the policy emits per-slot
+# choices -- and the moment it does, only the placement callable changes.
+_FACE_TF_CACHE = None
+
+
+def face_transforms_enabled() -> bool:
+    global _FACE_TF_CACHE
+    if _FACE_TF_CACHE is None:
+        _FACE_TF_CACHE = os.environ.get("ALPHAGRAD_FACE_TRANSFORMS", "1") != "0"
+    return _FACE_TF_CACHE
+
+
+_FACE_TF_FALLBACKS: dict = {}
+
+
+def _record_face_transform_fallback(reason: str) -> None:
+    """Count silent fallbacks to the per-vertex path.
+
+    Without this an enumeration failure would quietly downgrade every episode
+    to per-vertex approximation while still reporting a healthy run.
+    """
+    _FACE_TF_FALLBACKS[reason] = _FACE_TF_FALLBACKS.get(reason, 0) + 1
+    if _FACE_TF_FALLBACKS[reason] in (1, 10, 100, 1000):
+        print(f"[face-tf] FALLBACK to per-vertex transforms ({reason}) "
+              f"x{_FACE_TF_FALLBACKS[reason]}", flush=True)
+
+
+def face_transform_fallbacks() -> dict:
+    return dict(_FACE_TF_FALLBACKS)
+
+
+def enumerate_faces_for_order(jaxpr, argnums, consts, args, order):
+    """``{vertex: [face_key, ...]}`` enumerated at the RIGHT graph state.
+
+    Face keys are ``(in_edge_vid, out_edge_vid)`` and they are NOT stable across
+    the episode: every elimination rewires the graph, so a key list taken from
+    the fresh graph silently matches nothing once earlier vertices are gone (a
+    no-op, not an error -- easy to mistake for "the transforms did nothing").
+    The only correct enumeration is immediately before eliminating each vertex,
+    which means replaying the order structurally.
+    """
+    from graphax import IncrementalJaxpr
+
+    incr = IncrementalJaxpr(jaxpr, argnums=tuple(argnums), consts=consts,
+                            args=args)
+    keys_by_vertex: dict[int, list] = {}
+    for v in order:
+        v = int(v)
+        try:
+            keys_by_vertex[v] = list(incr.faces(v))
+            incr.eliminate(v)
+        except Exception:
+            # A vertex we cannot replay contributes no faces; the measurement
+            # then simply leaves it exact rather than failing the episode.
+            keys_by_vertex.setdefault(v, [])
+            break
+    return keys_by_vertex
+
+
+def rule_specs_to_face_transforms(
+    jaxpr,
+    o_list,
+    specs_list,
+    keys_by_vertex,
+    *,
+    quant_once: bool = False,
+    slot_of=None,
+    stats: dict | None = None,
+):
+    """Policy rows -> graphax ``face_transforms``: ``{v: {face: (lhs, rhs, res)}}``.
+
+    Reuses :func:`rule_specs_to_transforms` to decode the rows (one decoder, so
+    the mask oracle and the measurement cannot drift), then PLACES the rules
+    into per-face slots.
+
+    ``slot_of(vertex, face_key, rules) -> (lhs_rules, rhs_rules, res_rules)``
+    controls the placement. The default sends everything to ``res`` -- the same
+    operand the per-vertex ``transforms`` list would have hit -- so this is a
+    pure reroute until the policy actually emits per-slot choices. Once it does,
+    only this callable changes.
+    """
+    from alphagrad.approx.common.masks import masked_face_transforms
+
+    # RAW rules: the per-vertex path may already wrap them in a masked hook,
+    # and re-wrapping a hook makes rule_is_legal reject it outright (a function
+    # is not a Diag/Compress/Quant) -- which silently skips every rule and
+    # measures the exact Jacobian while still looking healthy.
+    per_vertex = dict(rule_specs_to_transforms(
+        jaxpr, o_list, specs_list, quant_once=quant_once, wrap_hooks=False))
+
+    def _default_slot(_v, _k, rules):
+        return ((), (), tuple(rules))
+
+    place = slot_of or _default_slot
+    face_transforms: dict[int, dict] = {}
+    for v, rules in per_vertex.items():
+        keys = keys_by_vertex.get(int(v)) or []
+        if not keys or not rules:
+            continue
+        pre, post, res = {}, {}, {}
+        for k in keys:
+            l, r, s_ = place(int(v), k, rules)
+            if l:
+                pre[k[0]] = tuple(l)
+            if r:
+                post[k[1]] = tuple(r)
+            if s_:
+                res[k] = tuple(s_)
+        ft = masked_face_transforms(keys, pre=pre, post=post, res=res,
+                                    stats=stats)
+        ft = {k: t for k, t in ft.items() if any(x is not None for x in t)}
+        if ft:
+            face_transforms[int(v)] = ft
+    return face_transforms
+
+
 def rule_specs_to_transforms(
     jaxpr,
     o_list,
     specs_list,
     *,
     quant_once: bool = False,
+    wrap_hooks: bool = True,
 ) -> list[tuple[int, tuple]]:
     """``sparsity_specs`` rows -> graphax's per-vertex ``transforms`` sequence.
 
@@ -2595,7 +2719,7 @@ def rule_specs_to_transforms(
             rules.append(Diag(i=idx1, j=idx2, factor=factor))
         if rules:
             _maybe_log_per_face_stats()
-            if _per_face_mvp():
+            if wrap_hooks and _per_face_mvp():
                 # PER-FACE MVP: hand graphax a CALLABLE instead of literal
                 # actions. graphax invokes it once per FACE with that face's
                 # accumulated contraction, so the same policy row is masked
@@ -2659,6 +2783,24 @@ def _callback(
         config.jaxpr, o_list, specs_list,
         quant_once=bool(getattr(config, "quant_once", False)),
     )
+
+    # PER-FACE routing. Built alongside (not instead of) the per-vertex list so
+    # the two stay comparable for an A/B; jacve is handed whichever is active.
+    face_transforms = None
+    if face_transforms_enabled():
+        try:
+            _keys = enumerate_faces_for_order(
+                config.jaxpr, config.argnums, consts, args, o_list)
+            face_transforms = rule_specs_to_face_transforms(
+                config.jaxpr, o_list, specs_list, _keys,
+                quant_once=bool(getattr(config, "quant_once", False)),
+                stats=_PER_FACE_STATS,
+            ) or None
+            if face_transforms is not None:
+                transforms = None   # face slots own the approximation now
+        except Exception as _e:      # keep the episode alive; fall back
+            _record_face_transform_fallback(type(_e).__name__)
+            face_transforms = None
 
     # ------------------------------------------------------------------
     # PREVALIDATE-BEFORE-MEASURE (opt-in via ALPHAGRAD_PREVALIDATE_MEASURE=1)
@@ -3082,6 +3224,7 @@ def _callback(
                 has_aux=config.has_aux,
                 sparse_representation=config.sparse,
                 transforms=transforms,
+                face_transforms=face_transforms,
             )
         return jax.jit(fn, keep_unused=True).lower(*args_for_lower).compile()
 
