@@ -190,3 +190,96 @@ and are not connected to the live rollout.
 
 So the policy is **not** fed incrementally today, and per-face approximation does
 not reach the reward. Both are wiring jobs on existing pieces, not new builds.
+
+---
+
+# MVP: per-face approximation through `jacve`
+
+## How to run it
+
+```bash
+sbatch aoj_perpath_nn256.sbatch
+```
+
+That sets:
+
+```bash
+export ALPHAGRAD_MEASURE_VIA_AOJ=0   # measure with jacve (AOJ value+jac still in dev)
+export ALPHAGRAD_POLICY=palimpsa     # NOT palimpsa_bi, NOT transformer
+export ALPHAGRAD_PER_FACE_MVP=1      # per-face masked approximation  <-- the MVP
+export GRAPHAX_ALLOW_PARTIAL_ORDER=1 # the env measures partial/initial orders
+export GRAPHAX_PRUNE=0               # let the policy see the whole graph
+```
+
+Set `ALPHAGRAD_PER_FACE_MVP=0` to fall back to the old literal-action path for
+an A/B.
+
+## What it does, and why it is small
+
+`jacve`'s per-vertex `transforms` entry accepts a **callable**, and graphax
+invokes that callable **once per FACE**, handing it that face's accumulated
+contraction. Verified directly: a callable registered on one vertex of
+`tanh(x@y)*sin(x@y)` fires twice, with live layouts `out_axes=(0,1)` and
+`(1,0)`.
+
+That is the whole trick — per-path approximation does **not** require the AOJ
+measurement path. It needs one function and one branch:
+
+* `common/masks.make_live_masked_hook(rules)` wraps the policy's rule list into
+  that callable. Per face it checks each rule against the **live** operand
+  (`rule_is_legal` → `diag_valid_mask` / `diag_pair_factor_space` /
+  `compress_valid_mask` / `quant_chain_ok`) and applies it only where legal.
+* `env.rule_specs_to_transforms` emits that callable instead of literal actions
+  when `ALPHAGRAD_PER_FACE_MVP=1` — a single branch at one `append` site.
+
+Because an illegal rule is skipped rather than attempted, this **cannot** raise
+`TRANSFORM DID NOT FIT`, and a face where nothing is legal is simply left exact
+— the correct behaviour when the action is fully masked.
+
+`env.per_face_stats()` returns `{applied, skipped}` so a run can report how much
+of the policy's intent survived masking, instead of silently approximating
+nothing.
+
+### Measured
+
+```
+exact (no approx)      stats={}                          |J|=130.523701
+diag+compress @v2      stats={'skipped':2,'applied':2}   |J|=130.523701
+quant bf16 @v2         stats={'applied':2}               |J|=130.523689
+compress@v2 + f8@v3    stats={'applied':4}               |J|=128.985188
+```
+
+The second row is the point: **the same rule list was legal on some faces and
+masked on others** (`skipped=2, applied=2`). Rows 3 and 4 confirm per-face
+choices actually move the Jacobian, i.e. reach the reward.
+
+## Shortcuts taken (this is an MVP)
+
+Be aware of these before drawing conclusions from a run:
+
+1. **The policy still emits one rule list per vertex.** The MVP *projects* that
+   list onto each face's legal set; it does not yet let the policy choose a
+   different action per face, nor per `lhs`/`rhs`/`res` slot. So this gives
+   per-face **legality and application**, not yet per-face **decisions**. The
+   `FacePathPolicy` + `masked_micro_chooser` + `eliminate_order_per_face` route
+   is what makes the decision itself per-slot; it is still unwired.
+2. **Tokenization is still one-shot.** `extract_jaxpr(...).tokenized()` over the
+   whole jaxpr, not `IncrementalPathTokenizer` emitting a block per decision. The
+   policy therefore does not yet see the incremental AOJ state.
+3. **Measurement is jacve.** Deliberate — the AOJ's value+Jacobian is still in
+   development and the two are equivalent for a given sequence.
+4. **`set_approx_active` parity is still unfixed** (see Known issues). It does
+   not affect this path, which goes through `vertex_elimination_jaxpr`, and that
+   *does* set the flag.
+5. Row 2 above applied two rules with no change to `|J|`. Not investigated —
+   plausibly a lossless application (e.g. compress on a uniform axis), the same
+   way symmetric int8 quantisation of a constant `-1` edge is bit-exact. Worth
+   confirming before reading `applied>0` as "the approximation did something".
+
+## Quant chain rule
+
+Measured on device across the whole catalog: every dtype casts fine from
+float32; the only illegal chains are **narrow float → integer**
+(`float8_*` / `float4_*` → `int*` / `uint*` / `bool`), which raise
+`TypePromotionError`. `quant_chain_ok` encodes exactly that. `scalar_mult` stays
+at the default float dtype, so it remains safe to carry the compensating scale.

@@ -2377,6 +2377,27 @@ def diag_row_to_pair(jaxpr, vertex: int, bi1: int, bi2: int) -> tuple[int, int]:
     return int(bi1), out_len + int(bi2)
 
 
+# ALPHAGRAD_PER_FACE_MVP=1 -> per-vertex transform entries become callables
+# that mask against the LIVE per-face operand (see
+# common.masks.make_live_masked_hook). Default ON: the literal-action path can
+# only emit one rule list that must fit every face of a vertex simultaneously,
+# which on nn256 leaves ~0.11 legal DIAG entries per vertex.
+_PER_FACE_MVP_CACHE = None
+_PER_FACE_STATS: dict = {}
+
+
+def _per_face_mvp() -> bool:
+    global _PER_FACE_MVP_CACHE
+    if _PER_FACE_MVP_CACHE is None:
+        _PER_FACE_MVP_CACHE = os.environ.get("ALPHAGRAD_PER_FACE_MVP", "1") != "0"
+    return _PER_FACE_MVP_CACHE
+
+
+def per_face_stats() -> dict:
+    """Applied / skipped counts accumulated by the per-face hooks."""
+    return dict(_PER_FACE_STATS)
+
+
 def rule_specs_to_transforms(
     jaxpr,
     o_list,
@@ -2549,7 +2570,20 @@ def rule_specs_to_transforms(
             used_axes.add(idx2)
             rules.append(Diag(i=idx1, j=idx2, factor=factor))
         if rules:
-            transforms.append((int(v), tuple(rules)))
+            if _per_face_mvp():
+                # PER-FACE MVP: hand graphax a CALLABLE instead of literal
+                # actions. graphax invokes it once per FACE with that face's
+                # accumulated contraction, so the same policy row is masked
+                # against each face's real index structure and applied only
+                # where legal -- which is what makes the approximation
+                # per-path, and why this cannot raise TRANSFORM DID NOT FIT.
+                from alphagrad.approx.common.masks import make_live_masked_hook
+                transforms.append(
+                    (int(v), (make_live_masked_hook(list(rules),
+                                                    stats=_PER_FACE_STATS),))
+                )
+            else:
+                transforms.append((int(v), tuple(rules)))
     return transforms
 
 

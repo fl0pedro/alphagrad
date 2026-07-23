@@ -704,3 +704,108 @@ def masked_micro_chooser(pick, max_dims: int = 8, max_axes: int = 8,
         return pick(st, actions)
 
     return _chooser
+
+
+# ---------------------------------------------------------------------------
+# PER-FACE approximation through jacve (the MVP path)
+# ---------------------------------------------------------------------------
+# graphax's per-vertex ``transforms`` entry accepts a CALLABLE, and invokes it
+# ONCE PER FACE, handing it that face's accumulated contraction -- verified:
+# a callable registered on one vertex of `tanh(x@y)*sin(x@y)` fires twice with
+# different live layouts. So per-path approximation does NOT need the AOJ
+# measurement path: jacve already provides the granularity, and the callable is
+# the only place the operand's real index structure is known.
+#
+# NOTE the per-vertex callable protocol differs from the per-face slot one:
+# here the return value IS the tensor, so "leave exact" means returning the
+# operand unchanged. Returning None crashes graphax's consistency assert.
+
+
+def quant_chain_ok(st, dtype_name: str) -> bool:
+    """Is quantising ``st`` to ``dtype_name`` a legal CHAIN?
+
+    Measured on device over the full catalog: every dtype casts fine from
+    float32, and the only failing chains are narrow-float -> integer
+    (``float8_*`` / ``float4_*`` -> ``int*``/``uint*``/``bool``), which raise
+    ``TypePromotionError`` inside ``apply_quant``. Everything else composes.
+    """
+    val = getattr(st, "val", None)
+    if val is None:
+        return True
+    cur = str(getattr(val, "dtype", ""))
+    narrow_float = cur.startswith("float8") or cur.startswith("float4")
+    to_integral = (dtype_name.startswith("int") or dtype_name.startswith("uint")
+                   or dtype_name == "bool")
+    return not (narrow_float and to_integral)
+
+
+def rule_is_legal(st, rule, *, max_dims: int = 8, max_axes: int = 8) -> bool:
+    """Is ``rule`` legal on the LIVE tensor ``st``?"""
+    from graphax.sparse.micro_actions import Compress, Diag, Quant
+
+    if isinstance(rule, Diag):
+        if not (0 <= rule.i < max_dims and 0 <= rule.j < max_dims):
+            return False
+        if not diag_valid_mask(st, max_dims)[rule.i, rule.j]:
+            return False
+        base, span = diag_pair_factor_space(st, rule.i, rule.j)
+        if span <= 1 or base <= 0 or rule.factor % base:
+            return False
+        d = rule.factor // base
+        return d > 1 and span % d == 0
+    if isinstance(rule, Compress):
+        mask = compress_valid_mask(st, max_axes)
+        axes = rule.axes if isinstance(rule.axes, tuple) else (rule.axes,)
+        return bool(axes) and all(0 <= a < max_axes and mask[a] for a in axes)
+    if isinstance(rule, Quant):
+        return quant_chain_ok(st, rule.dtype)
+    return False
+
+
+def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
+                          stats: dict | None = None):
+    """Wrap ``rules`` into the per-vertex callable graphax applies PER FACE.
+
+    Each requested rule is applied iff it is legal on *this* face's operand;
+    otherwise it is skipped and the operand passes through untouched. A face on
+    which nothing is legal is therefore left exact -- which is the correct
+    behaviour when the action is fully masked, and is why this cannot raise
+    TRANSFORM DID NOT FIT.
+
+    ``stats`` (optional dict) accumulates ``applied`` / ``skipped`` counts so a
+    run can report how much of the policy's intent actually survived masking
+    rather than silently approximating nothing.
+    """
+    from graphax.sparse.micro_actions import (
+        apply_compress, apply_diag, apply_quant, Compress, Diag, Quant)
+
+    def _bump(key):
+        if stats is not None:
+            stats[key] = stats.get(key, 0) + 1
+
+    def _hook(st):
+        cur = st
+        for rule in rules:
+            if not rule_is_legal(cur, rule, max_dims=max_dims,
+                                 max_axes=max_axes):
+                _bump("skipped")
+                continue
+            try:
+                if isinstance(rule, Diag):
+                    cur = apply_diag(cur, rule)
+                elif isinstance(rule, Compress):
+                    cur = apply_compress(cur, rule)
+                elif isinstance(rule, Quant):
+                    cur = apply_quant(cur, rule)
+                else:
+                    _bump("skipped")
+                    continue
+                _bump("applied")
+            except ValueError:
+                # The mask is meant to make this unreachable; if a case slips
+                # through, leaving the operand exact is strictly better than
+                # killing the episode's measurement.
+                _bump("skipped_raised")
+        return cur
+
+    return _hook
