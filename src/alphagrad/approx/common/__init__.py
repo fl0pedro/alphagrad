@@ -22,6 +22,59 @@ even from JAX-free contexts.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+# ---------------------------------------------------------------------------
+# Static visibility for the lazy re-exports defined further down.
+#
+# The ``_LAZY`` / ``__getattr__`` pair is load-bearing and must stay: the Ray
+# driver has to remain JAX-free until Ray spawns the GPU actors, or it hogs GPU
+# memory the actors need and breaks the no-preallocate contract (ppo_ray.py
+# enforces this with ``_assert_jax_free``). These therefore cannot become real
+# runtime imports.
+#
+# What they CAN have is static visibility. A bare ``__getattr__`` table is
+# invisible to every static tool, IDE and reader: "which submodule is actually
+# used?" is unanswerable without running the code, and import-graph sweeps
+# report these submodules as dead when they are not. ``TYPE_CHECKING`` gives
+# both -- type checkers and import-graph tools follow the block, while at
+# runtime it never executes and imports nothing.
+# ---------------------------------------------------------------------------
+if TYPE_CHECKING:  # pragma: no cover - never executed at runtime
+    from alphagrad.approx.common.batching import (  # noqa: F401
+        shuffle_and_batch, shuffle_and_batch_by_trajectory,
+    )
+    from alphagrad.approx.common.eval_samples import (  # noqa: F401
+        generate_eval_samples,
+    )
+    from alphagrad.approx.common.examples import (  # noqa: F401
+        data_gen, get_args, get_fn, grad_target_fn, grad_target_setup, infer_argnums, scalar_loss_fn, seed_loss_fn,
+    )
+    from alphagrad.approx.common.gae import (  # noqa: F401
+        get_advantages, get_num_clipping_triggers, inverse_reward_normalization_fn, reward_normalization_fn,
+    )
+    from alphagrad.approx.common.init import (  # noqa: F401
+        init_linear_weights, scale_module_weight,
+    )
+    from alphagrad.approx.common.instrumentation import (  # noqa: F401
+        NUM_VERTEX_FEATURES, OP_TYPE_VOCAB_SIZE, VERTEX_FEATURE_NAMES, compute_per_sample_vertex_features, compute_vertex_features,
+    )
+    from alphagrad.approx.common.masks import (  # noqa: F401
+        build_legacy_sp_valid_mask, build_pair_valid_mask, build_vertex_valid_static, vertex_avail_at_step, vertex_axis_dims,
+    )
+    from alphagrad.approx.common.preferences import (  # noqa: F401
+        sample_preferences,
+    )
+    from alphagrad.approx.common.relations import (  # noqa: F401
+        NUM_RELATIONS, RELATION_NAMES, compute_eqn_ids_from_tokens,
+    )
+    from alphagrad.approx.common.replay import (  # noqa: F401
+        ReplayBuffer, init_replay_buffer, load_replay_buffer, replay_add_batch, replay_sample, save_replay_buffer,
+    )
+    from alphagrad.approx.common.schedules import (  # noqa: F401
+        SCHEDULES, schedule_at,
+    )
+
 
 # ---------------------------------------------------------------------------
 # JAX-free re-exports — safe to load at package import. Driver processes
