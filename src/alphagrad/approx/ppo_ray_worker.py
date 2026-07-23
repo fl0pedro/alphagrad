@@ -1250,8 +1250,15 @@ class PPORayWorker:
         # "transformer". Prior to this the worker built a plain transformer
         # regardless of ALPHAGRAD_POLICY — palimpsa_bi was inert on the
         # ACTUAL Ray rollout path (only ppo.py::Agent honoured it).
+        # Palimpsa, not the quadratic transformer. policy.py has documented
+        # palimpsa as the default all along, but this path defaulted to
+        # "transformer" -- and that is not a small difference at these sizes:
+        # full attention materialises an (heads, T, T) score matrix, which for
+        # the tokenized jaxpr came out as f32[16, 16384, 16384] = 16 GiB and
+        # OOMd the GPU during autotuning. Palimpsas gated linear attention is
+        # O(T) and never forms that matrix.
         _policy = getattr(self.args, "policy", None) or os.environ.get(
-            "ALPHAGRAD_POLICY", "transformer"
+            "ALPHAGRAD_POLICY", "palimpsa"
         )
         _policy = str(_policy).strip().lower()
         if _policy not in ("transformer", "palimpsa", "palimpsa_bi"):
