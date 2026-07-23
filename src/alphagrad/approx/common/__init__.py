@@ -60,7 +60,7 @@ if TYPE_CHECKING:  # pragma: no cover - never executed at runtime
         NUM_VERTEX_FEATURES, OP_TYPE_VOCAB_SIZE, VERTEX_FEATURE_NAMES, compute_per_sample_vertex_features, compute_vertex_features,
     )
     from alphagrad.approx.common.masks import (  # noqa: F401
-        build_legacy_sp_valid_mask, build_pair_valid_mask, build_vertex_valid_static, vertex_avail_at_step, vertex_axis_dims,
+        LiveVertexMaskOracle, build_legacy_sp_valid_mask, build_pair_valid_mask, build_vertex_valid_static, vertex_avail_at_step, vertex_axis_dims,
     )
     from alphagrad.approx.common.preferences import (  # noqa: F401
         sample_preferences,
@@ -172,6 +172,9 @@ _LAZY: dict[str, tuple[str, str]] = {
     ),
     "build_vertex_valid_static": (
         "alphagrad.approx.common.masks", "build_vertex_valid_static",
+    ),
+    "LiveVertexMaskOracle": (
+        "alphagrad.approx.common.masks", "LiveVertexMaskOracle",
     ),
     "vertex_avail_at_step": (
         "alphagrad.approx.common.masks", "vertex_avail_at_step",

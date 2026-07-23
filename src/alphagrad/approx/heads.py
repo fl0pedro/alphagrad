@@ -766,6 +766,41 @@ def _features_after_compress(
     )
 
 
+def _gate_repeat_ops(op_legal, structural_used, quant_used,
+                     pair_valid, compress_valid):
+    """One DIAG-or-COMPRESS and one QUANT per vertex, once exactly masked.
+
+    The live-edge masks (``pair_valid`` / ``compress_valid``) describe the
+    tensor as it stands BEFORE the sub-episode runs, and graphax applies a
+    vertex's rules IN SEQUENCE to that same edge -- so rule #2 lands on
+    whatever rule #1 produced. A Compress renumbers every physical axis below
+    it and turns one dim implicit, which is exactly how a second Compress ends
+    up out of range ("Compress.axes entry 2 out of range for val.ndim = 2" on
+    an edge whose first Compress already dropped an axis); a second Quant lands
+    on an already-narrowed ``val`` and trips ``TypePromotionError`` between two
+    incompatible 8-bit floats. Re-probing between sub-steps is impossible --
+    the choice is made inside a ``lax.scan``.
+
+    So when the caller supplies exact masks, the guarantee is made
+    unconditional at the op-type head: each bucket fires at most once per
+    vertex. END becomes legal as soon as one real op has landed -- that is the
+    entire invariant ``_substep_no_end`` protects ("always approximate") -- and
+    is the fallback if nothing else survives, so the op softmax is never handed
+    an all-illegal support. With ``max_substeps == 1`` (the production config)
+    this is a no-op, and without masks nothing changes at all.
+    """
+    if pair_valid is None and compress_valid is None:
+        return op_legal
+    dt = op_legal.dtype
+    s = structural_used.astype(dt)
+    q = quant_used.astype(dt)
+    gated = op_legal * jnp.stack([1.0 - s, 1.0 - s, 1.0 - q, jnp.ones((), dt)])
+    any_op = jnp.maximum(s, q)
+    gated = gated.at[OP_END].set(jnp.maximum(gated[OP_END], any_op))
+    end_only = jnp.array([0.0, 0.0, 0.0, 1.0], dtype=dt)
+    return jnp.where(jnp.sum(gated) > 0.0, gated, end_only)
+
+
 def _compute_op_legality(
     features: AxisTokenFeatures,
     pair_valid: jax.Array | None = None,
@@ -1337,12 +1372,18 @@ class MicroActionPolicy(eqx.Module):
         vertex_context: jax.Array,
         tables: FactorTables,
         cap: jax.Array,
+        pair_valid=None,
+        compress_valid=None,
     ):
-        features, ended, next_gid, step_idx = carry
+        features, ended, next_gid, step_idx, structural_used, quant_used = carry
         key = step_input
 
         axis_tokens, summary = self.encoder(features, vertex_context)
-        op_legal = _compute_op_legality(features)
+        op_legal = _compute_op_legality(
+            features, pair_valid=pair_valid, compress_valid=compress_valid)
+        op_legal = _gate_repeat_ops(
+            op_legal, structural_used, quant_used,
+            pair_valid, compress_valid)
         # Force END once the sub-episode has ended (sticky termination) or
         # the per-vertex hard cap (2 × num_axes) is reached — the latter is
         # a length bound, not a structural constraint.
@@ -1354,7 +1395,8 @@ class MicroActionPolicy(eqx.Module):
             jnp.array([0.0, 0.0, 0.0, 1.0], dtype=op_legal.dtype),
             op_legal,
         )
-        i_diag, i_compress, j_diag, i_coupled = _compute_axis_masks(features)
+        i_diag, i_compress, j_diag, i_coupled = _compute_axis_masks(
+            features, pair_valid=pair_valid, compress_valid=compress_valid)
 
         (
             action, factor, op_d, i_d, j_d, exp_d, kind_d, quant_d,
@@ -1409,7 +1451,9 @@ class MicroActionPolicy(eqx.Module):
         new_ended = ended | (action.op_type == OP_END)
 
         return (
-            (new_features, new_ended, new_gid, step_idx + 1),
+            (new_features, new_ended, new_gid, step_idx + 1,
+             structural_used | is_diag | is_compress,
+             quant_used | ((action.op_type == OP_QUANT) & ~ended)),
             (action, log_p, ent, arity, op_d, i_d, j_d, exp_d, kind_d, quant_d),
         )
 
@@ -1419,6 +1463,8 @@ class MicroActionPolicy(eqx.Module):
         init_features: AxisTokenFeatures,
         tables: FactorTables,
         key,
+        pair_valid=None,
+        compress_valid=None,
     ):
         """Run the sub-episode autoregressively.
 
@@ -1426,6 +1472,16 @@ class MicroActionPolicy(eqx.Module):
         ``max_substeps``) plus the joint log-prob, entropy, and total
         emitted-component count (used by the PPO loss to normalize the
         entropy bonus across variable-arity sub-episodes).
+
+        ``pair_valid`` / ``compress_valid`` are the EXACT per-edge legality
+        masks for this vertex, read off the live edges by
+        :class:`~alphagrad.approx.common.masks.LiveVertexMaskOracle`. Pass them
+        whenever they are available: the tag-bit reconstruction they override
+        models the vertex's nominal dense Jacobian, and the tensor the
+        micro-action actually lands on is the per-face contraction, whose
+        rank / sizes / diagonal pairings are generally different. ``None``
+        keeps the (unsound) tag-bit-only behaviour. The SAME masks must be
+        handed to :meth:`evaluate` or the PPO ratio is not 1 at epoch 0.
         """
         keys = jrand.split(key, self.max_substeps)
         # Per-vertex hard cap: 2 × number of real axes. The scan runs
@@ -1438,12 +1494,15 @@ class MicroActionPolicy(eqx.Module):
             jnp.array(False, dtype=jnp.bool_),
             jnp.array(0, dtype=jnp.int32),
             jnp.array(0, dtype=jnp.int32),
+            jnp.array(False, dtype=jnp.bool_),
+            jnp.array(False, dtype=jnp.bool_),
         )
 
         def step_fn(carry, k):
             return self._step_sample(
                 carry, k,
                 vertex_context=vertex_context, tables=tables, cap=cap,
+                pair_valid=pair_valid, compress_valid=compress_valid,
             )
 
         (
@@ -1472,19 +1531,26 @@ class MicroActionPolicy(eqx.Module):
         vertex_context: jax.Array,
         tables: FactorTables,
         cap: jax.Array,
+        pair_valid=None,
+        compress_valid=None,
     ):
-        features, ended, next_gid, step_idx = carry
+        features, ended, next_gid, step_idx, structural_used, quant_used = carry
         action: MicroAction = step_input
 
         axis_tokens, summary = self.encoder(features, vertex_context)
-        op_legal = _compute_op_legality(features)
+        op_legal = _compute_op_legality(
+            features, pair_valid=pair_valid, compress_valid=compress_valid)
+        op_legal = _gate_repeat_ops(
+            op_legal, structural_used, quant_used,
+            pair_valid, compress_valid)
         force_end = ended | (step_idx >= cap)
         op_legal = jnp.where(
             force_end,
             jnp.array([0.0, 0.0, 0.0, 1.0], dtype=op_legal.dtype),
             op_legal,
         )
-        i_diag, i_compress, j_diag, i_coupled = _compute_axis_masks(features)
+        i_diag, i_compress, j_diag, i_coupled = _compute_axis_masks(
+            features, pair_valid=pair_valid, compress_valid=compress_valid)
 
         (
             log_p, ent, arity,
@@ -1532,7 +1598,9 @@ class MicroActionPolicy(eqx.Module):
         new_ended = ended | (action.op_type == OP_END)
 
         return (
-            (new_features, new_ended, new_gid, step_idx + 1),
+            (new_features, new_ended, new_gid, step_idx + 1,
+             structural_used | is_diag | is_compress,
+             quant_used | ((action.op_type == OP_QUANT) & ~ended)),
             (
                 log_p, ent, arity,
                 op_dist, i_dist, j_dist, exp_dists, kind_dist, quant_dist,
@@ -1545,6 +1613,8 @@ class MicroActionPolicy(eqx.Module):
         init_features: AxisTokenFeatures,
         tables: FactorTables,
         actions: MicroAction,
+        pair_valid=None,
+        compress_valid=None,
     ):
         """Recompute joint log-prob / entropy / arity for a stored sequence,
         plus per-step distributions for KL tracking.
@@ -1557,6 +1627,9 @@ class MicroActionPolicy(eqx.Module):
         per-step distributions under the *current* policy, with shape
         ``(max_substeps, ...)``. Pair these with the stored old-policy
         dists in the trajectory to compute per-component KL.
+
+        ``pair_valid`` / ``compress_valid`` MUST be the masks the rollout
+        sampled under (buffer them alongside the action) — see :meth:`sample`.
         """
         cap = 2 * jnp.sum(init_features.valid_mask.astype(jnp.int32))
         init_carry = (
@@ -1564,12 +1637,15 @@ class MicroActionPolicy(eqx.Module):
             jnp.array(False, dtype=jnp.bool_),
             jnp.array(0, dtype=jnp.int32),
             jnp.array(0, dtype=jnp.int32),
+            jnp.array(False, dtype=jnp.bool_),
+            jnp.array(False, dtype=jnp.bool_),
         )
 
         def step_fn(carry, action_step):
             return self._step_evaluate(
                 carry, action_step,
                 vertex_context=vertex_context, tables=tables, cap=cap,
+                pair_valid=pair_valid, compress_valid=compress_valid,
             )
 
         (

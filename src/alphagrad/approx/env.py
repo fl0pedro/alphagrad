@@ -2361,6 +2361,198 @@ def _winsorized_mean(values, frac: float) -> float:
     return float(a.mean())
 
 
+def diag_row_to_pair(jaxpr, vertex: int, bi1: int, bi2: int) -> tuple[int, int]:
+    """``(i, j)`` the ``[bi1, bi2, factor]`` DIAG row addresses on ``vertex``.
+
+    The single place the wire format's out-relative / primal-relative split is
+    resolved back to the CONCATENATED ``out_dims + primal_dims`` numbering
+    :class:`graphax.sparse.micro_actions.Diag` uses. Shared by
+    :func:`rule_specs_to_transforms` (which emits the transform) and
+    :class:`~alphagrad.approx.common.masks.LiveVertexMaskOracle` (which decides
+    whether that transform is legal), so the mask can never be computed for a
+    different pair than the one the env goes on to apply.
+    """
+    eqn = jaxpr.eqns[int(vertex) - 1]
+    out_len = len(eqn.outvars[0].aval.shape)
+    return int(bi1), out_len + int(bi2)
+
+
+def rule_specs_to_transforms(
+    jaxpr,
+    o_list,
+    specs_list,
+    *,
+    quant_once: bool = False,
+) -> list[tuple[int, tuple]]:
+    """``sparsity_specs`` rows -> graphax's per-vertex ``transforms`` sequence.
+
+    Each row in ``sparsity_specs`` is ``[base_idx1, base_idx2, factor]``; we
+    resolve the logical axis indices and the legacy -1 (gcd) / 0 (drop) / 1
+    (no-op) sentinels into explicit ``Diag(i, j, factor)`` entries with a
+    strictly positive integer factor — the only form graphax's ``apply_diag``
+    accepts. Slots with factor=0 (legacy drop-axes) or factor=1 (legacy no-op)
+    are silently skipped: drop has no replacement under the new API, and no-op
+    is dead weight.
+
+    The NOMINAL-SHAPE screens below (``bi2`` in range for every invar,
+    ``factor | n1`` and ``factor | n2``) are necessary but NOT sufficient: they
+    describe the vertex's own dense Jacobian signature, while the tensor
+    graphax hands the micro-action is the accumulated per-face CONTRACTION,
+    whose index structure (diagonal pairings, implicit dims, physical
+    ``val.ndim``) is generally different — see
+    :class:`~alphagrad.approx.common.masks.LiveVertexMaskOracle`, which is what
+    actually keeps the policy from proposing a rejected action. Kept here
+    because callers without the oracle (replay / top-N / the legacy trainers)
+    still rely on them.
+
+    Extracted verbatim from ``_callback`` so the policy-side mask oracle and
+    the measurement decode the same rows the same way.
+    """
+    transforms: list[tuple[int, tuple]] = []
+    # quant-once: only the FIRST Quant across the whole episode (vertex x slot
+    # order) survives; later Quant rows are dropped → one global quantization
+    # choice (a dtype, or none) instead of per-vertex repeated quant.
+    _quant_used = False
+    for v_idx, v in enumerate(o_list):
+        eqn = jaxpr.eqns[v - 1]
+        if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
+            continue
+
+        out_shape = eqn.outvars[0].aval.shape
+        out_len = len(out_shape)
+        primal_shapes = [
+            iv.aval.shape for iv in eqn.invars if hasattr(iv, "aval")
+        ]
+        if not primal_shapes:
+            continue  # no non-literal inputs → no edges to transform
+
+        rules: list = []  # mixed list[Diag | Compress | Quant]
+        used_axes: set[int] = set()
+        # FULL-REDUCTION COMPRESS CAP. A COMPRESS removes one physical
+        # axis from the edge val (ndim == out_len + primal_dims). When the
+        # LAST physical axis is dropped graphax canonicalizes the edge to
+        # val=None (uniform grid, see micro_actions.apply_compress 69e55fb)
+        # -- a genuinely-degenerate ~zero-mean tensor that both
+        # cossim-collapses the reward AND crashes the measure path device
+        # tracker (NoneType not subscriptable). Forbid the final-axis
+        # COMPRESS so >=1 physical axis always remains; partial COMPRESS
+        # (leaving >=1 axis) stays allowed.
+        _edge_phys_axes = out_len + max(
+            (len(ps) for ps in primal_shapes), default=0
+        )
+        _n_compressed = 0
+        for slot in range(MAX_RULES_PER_VERTEX):
+            row = specs_list[v_idx][slot]
+            bi1 = int(row[0])
+            bi2 = int(row[1])
+            factor = int(row[2])
+            if bi1 == -1:
+                break  # end-of-sequence sentinel
+            if bi1 == QUANT_SENTINEL:
+                # QUANT slot: row[1] is the dtype index into QUANT_DTYPES,
+                # row[2] is unused. Unlike Compress, Quant doesn't touch
+                # axes or `val.ndim`, so it's safe on any vertex (no
+                # shape-preservation issue with downstream eliminations).
+                # Out-of-range dtype indices silently fall back to the
+                # first catalog entry rather than crashing the callback.
+                if quant_once and _quant_used:
+                    continue  # quant-once: a quantization was already chosen
+                dtype_idx = bi2
+                if not (0 <= dtype_idx < len(QUANT_DTYPES)):
+                    dtype_idx = 0
+                rules.append(Quant(dtype=QUANT_DTYPES[dtype_idx]))
+                _quant_used = True
+                continue
+            if bi1 == COMPRESS_SENTINEL:
+                # COMPRESS slot: row[1] is the *physical* axis index in the
+                # SparseTensor edge (same layout as Diag's idx: out axes 0..
+                # out_len-1, primal axes out_len..out_len+primal_dims-1).
+                # row[2] is the kind index into COMPRESS_KINDS. Skip the
+                # slot if the axis index doesn't fit every invar's edge —
+                # graphax's apply_compress will validate too, but raising
+                # would crash the io_callback.
+                #
+                # NON-TERMINAL COMPRESS IS ALLOWED. graphax core-v2's
+                # implicit-dim algebra (produce_compress.py) propagates a
+                # compressed (axis=None) edge through downstream
+                # ``_eliminate_vertex`` steps without materializing the
+                # dropped axis. The FULL-REDUCTION CAP below is still
+                # enforced.
+                axis_idx = bi2
+                kind_idx = factor  # row[2] reused as kind index for COMPRESS
+                fits_all = True
+                if axis_idx < 0:
+                    fits_all = False
+                elif axis_idx < out_len:
+                    pass  # output-side axis, always present
+                else:
+                    primal_pos = axis_idx - out_len
+                    fits_all = all(primal_pos < len(ps) for ps in primal_shapes)
+                if not fits_all:
+                    continue
+                if axis_idx in used_axes:
+                    continue
+                # CAP: never drop the last remaining physical axis -- that
+                # canonicalizes the edge to val=None (uniform/degenerate).
+                if _n_compressed + 1 >= _edge_phys_axes:
+                    continue
+                if not (0 <= kind_idx < len(COMPRESS_KINDS)):
+                    # Unknown kind — fall back to the default "mean" rather
+                    # than dropping the row, since the axis-removal effect is
+                    # the dominant signal.
+                    kind_idx = 0
+                used_axes.add(axis_idx)
+                _n_compressed += 1
+                rules.append(
+                    Compress(axes=(axis_idx,), kind=COMPRESS_KINDS[kind_idx])
+                )
+                continue
+            if bi1 < 0:
+                # Any other negative bi1 is reserved for future sentinels;
+                # skip without aborting the sequence so a new sentinel
+                # introduced upstream doesn't silently break older specs.
+                continue
+            idx1, idx2 = diag_row_to_pair(jaxpr, v, bi1, bi2)
+            # Skip rules that would reuse an axis (graphax expected bipartite
+            # disjoint pairs; the legacy translator filtered them, do it here
+            # so apply_diag's stricter checks don't crash).
+            if idx1 in used_axes or idx2 in used_axes or idx1 == idx2:
+                continue
+            if not (0 <= bi1 < out_len):
+                continue
+            n1 = int(out_shape[bi1])
+            # The rule must fit every primal edge of this vertex.
+            n2_list: list[int] = []
+            fits_all = True
+            for ps in primal_shapes:
+                if not (0 <= bi2 < len(ps)):
+                    fits_all = False
+                    break
+                n2_list.append(int(ps[bi2]))
+            if not fits_all:
+                continue
+            if factor == 0 or factor == 1:
+                continue  # drop-axes and no-op have no equivalent in the new API
+            if factor == -1:
+                # Joint gcd across the out axis and every primal axis.
+                from functools import reduce as _reduce
+                factor = _reduce(_math.gcd, [n1] + n2_list)
+            # apply_diag requires factor | gcd(n_i, n_j) on every edge it
+            # touches. Silently skip mismatches rather than crash.
+            if (
+                factor <= 0
+                or n1 % factor != 0
+                or any(n2 % factor != 0 for n2 in n2_list)
+            ):
+                continue
+            used_axes.add(idx1)
+            used_axes.add(idx2)
+            rules.append(Diag(i=idx1, j=idx2, factor=factor))
+        if rules:
+            transforms.append((int(v), tuple(rules)))
+    return transforms
+
+
 # Compile cache: the original in-process LRU thrashed (2-11% hit rate)
 # because Ray's round-robin dispatch sent the same (order, specs) tuple
 # to different actors. Sticky routing was tried next and lifted hit rate
@@ -2404,166 +2596,10 @@ def _callback(
     o_list = [int(x) for x in partial_order.tolist()]
     specs_list = partial_specs.tolist()  # list of MAX_RULES x 3 lists
 
-    # Build the per-vertex `transforms` sequence consumed by graphax's
-    # typed-transform API. Each row in `sparsity_specs` is
-    # ``[base_idx1, base_idx2, factor]``; we resolve the logical axis
-    # indices and the legacy -1 (gcd) / 0 (drop) / 1 (no-op) sentinels
-    # into explicit Diag(i, j, factor) entries with a strictly positive
-    # integer factor — the only form graphax's apply_diag accepts. Slots
-    # with factor=0 (legacy drop-axes) or factor=1 (legacy no-op) are
-    # silently skipped: drop has no replacement under the new API, and
-    # no-op is dead weight. The rule must also fit **every** non-literal
-    # invar of the eqn: graphax's `_eliminate_vertex` applies each
-    # transform to every incoming edge, and apply_diag raises if the
-    # primal axis index is out of range for any of them (e.g. a div by
-    # a scalar denominator has one (n,) edge and one () edge — a Diag
-    # with j=1 only fits the first).
-    transforms: list[tuple[int, tuple]] = []
-    last_v_idx = len(o_list) - 1
-    # quant-once: only the FIRST Quant across the whole episode (vertex x slot
-    # order) survives; later Quant rows are dropped → one global quantization
-    # choice (a dtype, or none) instead of per-vertex repeated quant.
-    _quant_once = bool(getattr(config, "quant_once", False))
-    _quant_used = False
-    for v_idx, v in enumerate(o_list):
-        eqn = config.jaxpr.eqns[v - 1]
-        if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
-            continue
-
-        out_shape = eqn.outvars[0].aval.shape
-        out_len = len(out_shape)
-        primal_shapes = [
-            iv.aval.shape for iv in eqn.invars if hasattr(iv, "aval")
-        ]
-        if not primal_shapes:
-            continue  # no non-literal inputs → no edges to transform
-
-        rules: list = []  # mixed list[Diag | Compress | Quant]
-        used_axes: set[int] = set()
-        # FULL-REDUCTION COMPRESS CAP. A COMPRESS removes one physical
-        # axis from the edge val (ndim == out_len + primal_dims). When the
-        # LAST physical axis is dropped graphax canonicalizes the edge to
-        # val=None (uniform grid, see micro_actions.apply_compress 69e55fb)
-        # -- a genuinely-degenerate ~zero-mean tensor that both
-        # cossim-collapses the reward AND crashes the measure path device
-        # tracker (NoneType not subscriptable). Forbid the final-axis
-        # COMPRESS so >=1 physical axis always remains; partial COMPRESS
-        # (leaving >=1 axis) stays allowed.
-        _edge_phys_axes = out_len + max(
-            (len(ps) for ps in primal_shapes), default=0
-        )
-        _n_compressed = 0
-        for slot in range(MAX_RULES_PER_VERTEX):
-            row = specs_list[v_idx][slot]
-            bi1 = int(row[0])
-            bi2 = int(row[1])
-            factor = int(row[2])
-            if bi1 == -1:
-                break  # end-of-sequence sentinel
-            if bi1 == QUANT_SENTINEL:
-                # QUANT slot: row[1] is the dtype index into QUANT_DTYPES,
-                # row[2] is unused. Unlike Compress, Quant doesn't touch
-                # axes or `val.ndim`, so it's safe on any vertex (no
-                # shape-preservation issue with downstream eliminations).
-                # Out-of-range dtype indices silently fall back to the
-                # first catalog entry rather than crashing the callback.
-                if _quant_once and _quant_used:
-                    continue  # quant-once: a quantization was already chosen
-                dtype_idx = bi2
-                if not (0 <= dtype_idx < len(QUANT_DTYPES)):
-                    dtype_idx = 0
-                rules.append(Quant(dtype=QUANT_DTYPES[dtype_idx]))
-                _quant_used = True
-                continue
-            if bi1 == COMPRESS_SENTINEL:
-                # COMPRESS slot: row[1] is the *physical* axis index in the
-                # SparseTensor edge (same layout as Diag's idx: out axes 0..
-                # out_len-1, primal axes out_len..out_len+primal_dims-1).
-                # row[2] is the kind index into COMPRESS_KINDS. Skip the
-                # slot if the axis index doesn't fit every invar's edge —
-                # graphax's apply_compress will validate too, but raising
-                # would crash the io_callback.
-                #
-                # NON-TERMINAL COMPRESS IS ALLOWED. graphax core-v2's
-                # implicit-dim algebra (produce_compress.py) propagates a
-                # compressed (axis=None) edge through downstream
-                # ``_eliminate_vertex`` steps without materializing the
-                # dropped axis, and core.py's per-edge try/except skips any
-                # genuinely-mis-fitting edge (densifying it back to nominal
-                # form). The FULL-REDUCTION CAP below is still enforced.
-                axis_idx = bi2
-                kind_idx = factor  # row[2] reused as kind index for COMPRESS
-                fits_all = True
-                if axis_idx < 0:
-                    fits_all = False
-                elif axis_idx < out_len:
-                    pass  # output-side axis, always present
-                else:
-                    primal_pos = axis_idx - out_len
-                    fits_all = all(primal_pos < len(ps) for ps in primal_shapes)
-                if not fits_all:
-                    continue
-                if axis_idx in used_axes:
-                    continue
-                # CAP: never drop the last remaining physical axis -- that
-                # canonicalizes the edge to val=None (uniform/degenerate).
-                if _n_compressed + 1 >= _edge_phys_axes:
-                    continue
-                if not (0 <= kind_idx < len(COMPRESS_KINDS)):
-                    # Unknown kind — fall back to the default "mean" rather
-                    # than dropping the row, since the axis-removal effect is
-                    # the dominant signal.
-                    kind_idx = 0
-                used_axes.add(axis_idx)
-                _n_compressed += 1
-                rules.append(
-                    Compress(axes=(axis_idx,), kind=COMPRESS_KINDS[kind_idx])
-                )
-                continue
-            if bi1 < 0:
-                # Any other negative bi1 is reserved for future sentinels;
-                # skip without aborting the sequence so a new sentinel
-                # introduced upstream doesn't silently break older specs.
-                continue
-            idx1 = bi1            # logical output-side axis
-            idx2 = out_len + bi2  # logical primal-side axis
-            # Skip rules that would reuse an axis (graphax expected bipartite
-            # disjoint pairs; the legacy translator filtered them, do it here
-            # so apply_diag's stricter checks don't crash).
-            if idx1 in used_axes or idx2 in used_axes or idx1 == idx2:
-                continue
-            if not (0 <= bi1 < out_len):
-                continue
-            n1 = int(out_shape[bi1])
-            # The rule must fit every primal edge of this vertex.
-            n2_list: list[int] = []
-            fits_all = True
-            for ps in primal_shapes:
-                if not (0 <= bi2 < len(ps)):
-                    fits_all = False
-                    break
-                n2_list.append(int(ps[bi2]))
-            if not fits_all:
-                continue
-            if factor == 0 or factor == 1:
-                continue  # drop-axes and no-op have no equivalent in the new API
-            if factor == -1:
-                # Joint gcd across the out axis and every primal axis.
-                from functools import reduce as _reduce
-                factor = _reduce(_math.gcd, [n1] + n2_list)
-            # apply_diag requires factor | gcd(n_i, n_j) on every edge it
-            # touches. Silently skip mismatches rather than crash.
-            if (
-                factor <= 0
-                or n1 % factor != 0
-                or any(n2 % factor != 0 for n2 in n2_list)
-            ):
-                continue
-            used_axes.add(idx1)
-            used_axes.add(idx2)
-            rules.append(Diag(i=idx1, j=idx2, factor=factor))
-        if rules:
-            transforms.append((int(v), tuple(rules)))
+    transforms = rule_specs_to_transforms(
+        config.jaxpr, o_list, specs_list,
+        quant_once=bool(getattr(config, "quant_once", False)),
+    )
 
     # ------------------------------------------------------------------
     # PREVALIDATE-BEFORE-MEASURE (opt-in via ALPHAGRAD_PREVALIDATE_MEASURE=1)

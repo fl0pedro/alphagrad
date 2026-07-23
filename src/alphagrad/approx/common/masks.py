@@ -372,6 +372,319 @@ def legal_compress_actions(st, max_axes: int = 8,
             for a in range(max_axes) if mask[a] for k in kinds]
 
 
+# ---------------------------------------------------------------------------
+# LIVE per-VERTEX masks (the per-vertex ``transforms`` path)
+# ---------------------------------------------------------------------------
+# WHAT THE PER-VERTEX SITE ACTUALLY TRANSFORMS
+# --------------------------------------------
+# It is tempting to think the per-vertex ``transforms`` list acts on the
+# vertex's OWN elemental Jacobian -- a tensor that exists before the vertex is
+# eliminated and whose geometry is readable straight off the jaxpr equation.
+# It does not. ``graphax.core._eliminate_vertex`` applies the list to
+# ``edge_outval``, which at that point is
+#
+#     edge_outval = (out-edge Jacobian) @ (in-edge Jacobian)   [+ the existing
+#                   parallel edge, then drained]
+#
+# for EACH face ``(in_edge -> vertex -> out_edge)`` -- literally the same site
+# as the per-face ``res`` slot, which is applied on the next line. So it is a
+# JOIN INTERMEDIATE just like ``lhs`` / ``rhs`` / ``res``: it does not exist
+# until the vertex is eliminated, its logical rank is the rank of a DIFFERENT
+# pair of graph variables (out_dims = the out-edge var's shape, primal_dims =
+# the in-edge var's shape), and its index structure depends on the whole
+# elimination prefix. Measured on the nn256 graph: vertex 5 is ``tanh`` with
+# nominal ``out=(16,63) primal=(16,63)``, but under the forward order the
+# tensor its per-vertex transform receives is ``out=(16,10) primal=(63,)`` --
+# a different rank, different sizes, different everything.
+#
+# Consequently the nominal ``(out_shape ++ primal_shape)`` model the env uses
+# for its axis tokens CANNOT decide legality, and the two failure families the
+# PPO runs emit are exactly its two blind spots:
+#
+#   * ``Diag`` on a pair that is ALREADY a coupled diagonal (every elementwise
+#     vertex's edge is), where graphax only accepts a factor that is a multiple
+#     of the current meta count;
+#   * ``Compress`` on a physical axis past the LIVE ``val.ndim`` (a diagonal
+#     pair stores two logical dims in one physical axis).
+#
+# The only sound way to decide is to look at the live tensor. This oracle does
+# that WITHOUT committing: it keeps a structural elimination in step with the
+# episode and, for each candidate vertex, replays that one vertex on a COPY of
+# the graph with a recording no-op transform in the per-vertex slot -- the same
+# slot, the same tensor, zero side effects.
+
+
+def _shallow_copy_graph(graph):
+    """Two-level copy of a ``{src: {dst: SparseTensor}}`` elimination graph.
+
+    ``_eliminate_vertex`` REPLACES entries (``_set_inner`` / ``_del_inner``)
+    rather than mutating the tensors in place, so copying the two dict levels
+    is enough to leave the original untouched.
+    """
+    return {k: dict(v) for k, v in graph.items()}
+
+
+class LiveVertexMaskOracle:
+    """Exact per-vertex ``Diag`` / ``Compress`` legality, read off LIVE edges.
+
+    Usage mirrors the episode::
+
+        oracle = LiveVertexMaskOracle(jaxpr, consts, args, argnums)
+        for step in episode:
+            pair_valid, compress_valid = oracle.masks(candidate_vertices)
+            v, rules = policy(...)          # masked with the above
+            oracle.advance(v, rules)        # keep in step with the env
+
+    ``masks`` returns ``(V+1, N, N)`` / ``(V+1, N)`` float32 arrays indexed by
+    1-based vertex id (row 0 is unused padding) so a policy can gather the row
+    for whichever vertex it sampled inside a jit.
+
+    CLOSED LOOP OVER THE WIRE FORMAT. The policy does not hand graphax a
+    ``Diag`` directly -- it emits axis-token indices which
+    :func:`~alphagrad.approx.env.micro_actions_to_rule_specs_jax` packs into a
+    ``[bi1, bi2, factor]`` row and
+    :func:`~alphagrad.approx.env.rule_specs_to_transforms` unpacks again. This
+    oracle asks the question that actually matters -- "if the policy picks
+    token pair (i, j), is the transform the env WILL EMIT legal on every face
+    of this vertex?" -- so it screens the round trip, not an idealised action.
+
+    NO ARGUMENT DATA IS USED. The builder runs on fresh jaxpr tracers, and only
+    ``SparseTensor`` index metadata and ``val.shape`` are read; the throwaway
+    equations the probes trace are discarded. Cost is ~4 ms per candidate
+    vertex on the nn256 graph (two probes, see ``_DISPATCH_MODES``).
+    """
+
+    def __init__(self, jaxpr, consts, args, argnums, *, max_axes: int = 8):
+        from graphax.incremental import IncrementalJaxpr
+
+        self.jaxpr = jaxpr
+        self.max_axes = int(max_axes)
+        self.total_v = len(jaxpr.eqns)
+        self._argnums = tuple(int(a) for a in argnums)
+        self._consts = list(consts)
+        self._args = list(args)
+        self._IncrementalJaxpr = IncrementalJaxpr
+        self.reset()
+
+    # -- episode bookkeeping ------------------------------------------------
+    # TWO graphs, one per elemental-dispatch setting. ``_callback`` runs the
+    # SAME order through ``vertex_elimination_jaxpr`` (which sets
+    # ``dispatch.approx_active``) for the op counts and, under
+    # ALPHAGRAD_MEASURE_VIA_AOJ=1, through ``IncrementalJaxpr`` (which does
+    # not) for the measured executable. The flag gates the elemental
+    # composition layer inside ``sparse_matmul``, so the two paths build
+    # STRUCTURALLY DIFFERENT edges from the same order (measured on nn256
+    # vertex 7: ``val=(16,10,63)`` vs ``val=(10,63)`` with an implicit pair).
+    # An action has to be legal on both or the first one to run sentinels the
+    # measurement, so the oracle tracks both and intersects.
+    _DISPATCH_MODES = (True, False)
+
+    def reset(self):
+        """Rewind to the un-eliminated graph (call at env reset)."""
+        self._incrs = {
+            m: self._IncrementalJaxpr(
+                self.jaxpr, self._argnums, list(self._consts),
+                list(self._args),
+            )
+            for m in self._DISPATCH_MODES
+        }
+        self._eliminated: set[int] = set()
+
+    def advance(self, vertex: int, rules=()):
+        """Commit one elimination so later masks see the post-step graph.
+
+        ``rules`` must be the transforms the env ACTUALLY applied at this
+        vertex (``rule_specs_to_transforms``' output for it) -- an earlier
+        approximation changes the structure of every downstream edge, so a mask
+        computed against an exact-elimination replay would be wrong.
+        """
+        from graphax.sparse.elemental.dispatch import (
+            approx_active, set_approx_active,
+        )
+
+        vertex = int(vertex)
+        prev = approx_active()
+        try:
+            for mode, incr in self._incrs.items():
+                set_approx_active(mode)
+                incr.eliminate(vertex, rules=tuple(rules))
+        finally:
+            set_approx_active(prev)
+        self._eliminated.add(vertex)
+
+    @property
+    def eliminated(self):
+        return frozenset(self._eliminated)
+
+    # -- the probe ----------------------------------------------------------
+    def probe_faces(self, vertex: int, approx: bool = True):
+        """The live tensors this vertex's per-vertex transforms would receive.
+
+        One entry per face, in the order ``_eliminate_vertex`` visits them.
+        Runs on a copy of the graph and drops the equations it traced, so the
+        oracle's own state is unchanged and the caller may probe every
+        candidate before choosing one.
+
+        ``approx`` selects the ``graphax.sparse.elemental.dispatch``
+        ``approx_active`` flag. It is NOT cosmetic: the flag gates the elemental
+        composition layer inside ``sparse_matmul``, so the two settings produce
+        contractions with genuinely different index structure (measured on
+        nn256 vertex 7: ``val=(16,10,63)`` with the flag on vs ``val=(10,63)``
+        with a compressed-away implicit pair with it off). ``_callback``
+        exercises BOTH — ``vertex_elimination_jaxpr`` sets the flag for its
+        op-count pass, the AOJ builder (``ALPHAGRAD_MEASURE_VIA_AOJ=1``) never
+        does — so :meth:`vertex_mask` intersects over both.
+        """
+        from jax._src import core as _jcore
+        from graphax.core import _eliminate_vertex
+        from graphax.sparse.elemental.dispatch import (
+            approx_active, set_approx_active,
+        )
+
+        seen: list = []
+
+        def _record(st):
+            seen.append(st)
+            return st
+
+        incr = self._incrs[bool(approx)]
+        graph = _shallow_copy_graph(incr.graph)
+        tgraph = _shallow_copy_graph(incr.tgraph)
+        n_eqns0 = len(incr.trace.frame.tracing_eqns)
+        # The probe transform is a CALLABLE, which is what puts core.py on its
+        # approx code path -- the same path the real run takes.
+        prev = approx_active()
+        set_approx_active(bool(approx))
+        try:
+            with _jcore.set_current_trace(incr.trace):
+                _eliminate_vertex(
+                    int(vertex), incr.jaxpr, graph, tgraph, incr.vo, False,
+                    transforms=(_record,), face_transforms=None,
+                )
+        finally:
+            set_approx_active(prev)
+            # Throw away the equations the probe traced; nothing ever
+            # materialises this builder's jaxpr, but the list would grow
+            # without bound over an episode.
+            del incr.trace.frame.tracing_eqns[n_eqns0:]
+        return seen
+
+    # -- the masks ----------------------------------------------------------
+    def vertex_mask(self, vertex: int):
+        """``(pair_valid (N, N), compress_valid (N,))`` bool for one vertex.
+
+        A token pair / axis is admitted only when the transform the env would
+        emit for it is legal on EVERY face -- the per-vertex list is applied
+        uniformly to all of them, so anything less is a crash waiting for the
+        second face.
+        """
+        from alphagrad.approx.env import diag_row_to_pair
+
+        N = self.max_axes
+        pair = np.zeros((N, N), dtype=bool)
+        comp = np.zeros((N,), dtype=bool)
+        vertex = int(vertex)
+        if not (1 <= vertex <= self.total_v) or vertex in self._eliminated:
+            return pair, comp
+
+        eqn = self.jaxpr.eqns[vertex - 1]
+        if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
+            return pair, comp
+        out_shape = tuple(eqn.outvars[0].aval.shape)
+        out_len = len(out_shape)
+        primal_shapes = [
+            tuple(iv.aval.shape) for iv in eqn.invars if hasattr(iv, "aval")
+        ]
+        if not primal_shapes:
+            return pair, comp
+
+        # Intersect over BOTH elemental-dispatch settings (see _DISPATCH_MODES).
+        faces = []
+        for mode in self._DISPATCH_MODES:
+            faces += self.probe_faces(vertex, approx=mode)
+        if not faces:
+            return pair, comp
+
+        # --- COMPRESS: the emitted axis is the token index verbatim ---------
+        # Env screens (rule_specs_to_transforms): the axis must exist on every
+        # invar, and the FULL-REDUCTION CAP forbids dropping the edge's last
+        # physical axis. Both are nominal; the live ``val.ndim`` test on top of
+        # them is what actually keeps apply_compress from raising.
+        edge_phys_axes = out_len + max(
+            (len(ps) for ps in primal_shapes), default=0
+        )
+        if edge_phys_axes > 1:
+            face_comp = [compress_valid_mask(st, N) for st in faces]
+            for a in range(N):
+                if a >= out_len and any(
+                    a - out_len >= len(ps) for ps in primal_shapes
+                ):
+                    continue
+                if all(m[a] for m in face_comp):
+                    comp[a] = True
+
+        # --- DIAG: token pair -> the (i, j) the env will emit ---------------
+        # The policy's primal tokens come from the FIRST invar
+        # (``compute_static_axis_state``'s primal proxy) while the env screens
+        # ``bi2`` against EVERY invar, so the reachable ``bi2`` range is the
+        # narrowest of them.
+        face_diag = [diag_valid_mask(st, N) for st in faces]
+        n_primal = min(len(ps) for ps in primal_shapes)
+        for bi1 in range(out_len):
+            n1 = int(out_shape[bi1])
+            for bi2 in range(n_primal):
+                i, j = diag_row_to_pair(self.jaxpr, vertex, bi1, bi2)
+                if i == j or i >= N or j >= N:
+                    continue
+                # Every factor the prime-exponent head can emit is a divisor of
+                # gcd(size_i, size_j) over the sizes the policy SEES, and the
+                # env additionally screens ``factor | ps[bi2]`` for every
+                # invar. Admitting the pair therefore promises that EVERY
+                # divisor > 1 of that joint gcd is live-legal.
+                g_nom = n1
+                for ps in primal_shapes:
+                    g_nom = math.gcd(g_nom, int(ps[bi2]))
+                if g_nom <= 1:
+                    continue  # only factor 1 reachable -> a guaranteed no-op
+                ok = True
+                for st, dm in zip(faces, face_diag):
+                    if not dm[i, j]:
+                        ok = False
+                        break
+                    base, span = diag_pair_factor_space(st, i, j)
+                    # base > 1 is an already-coupled pair: its legal factors are
+                    # base*d, which the head (emitting bare divisors) cannot
+                    # express. g_nom | span makes every emittable divisor legal.
+                    if base != 1 or span % g_nom != 0:
+                        ok = False
+                        break
+                if ok:
+                    pair[i, j] = True
+                    pair[j, i] = True  # the row format canonicalises the order
+        return pair, comp
+
+    def masks(self, candidates=None):
+        """``(pair_valid, compress_valid)`` for every vertex, 1-based rows.
+
+        Shapes ``(total_v + 1, N, N)`` and ``(total_v + 1, N)``, float32 so
+        they drop straight into the policy's masked softmaxes. ``candidates``
+        restricts the probing to the vertices still available (everything else
+        stays all-zero); ``None`` probes every un-eliminated vertex.
+        """
+        N = self.max_axes
+        pair = np.zeros((self.total_v + 1, N, N), dtype=np.float32)
+        comp = np.zeros((self.total_v + 1, N), dtype=np.float32)
+        if candidates is None:
+            candidates = [v for v in range(1, self.total_v + 1)
+                          if v not in self._eliminated]
+        for v in candidates:
+            v = int(v)
+            p, c = self.vertex_mask(v)
+            pair[v] = p.astype(np.float32)
+            comp[v] = c.astype(np.float32)
+        return pair, comp
+
+
 def masked_micro_chooser(pick, max_dims: int = 8, max_axes: int = 8,
                          kinds: tuple = ("mean",)):
     """Wrap ``pick`` into the slot callable graphax invokes per face slot.

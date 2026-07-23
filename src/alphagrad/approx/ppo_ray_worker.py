@@ -34,6 +34,7 @@ in `ppo_ray.py` can drop in identically):
 from __future__ import annotations
 
 import os
+import time as _time
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
@@ -570,6 +571,23 @@ class PPORayWorker:
         self.vertex_valid_static = build_vertex_valid_static(
             env.valid_vertices, self.total_v,
         )
+        # EXACT per-vertex micro-action legality (one oracle per rollout env).
+        # The tag-bit reconstruction inside heads.py models the vertex's
+        # nominal dense Jacobian; the tensor a per-vertex Diag/Compress
+        # actually lands on is the per-face CONTRACTION, whose rank / sizes /
+        # diagonal pairings differ. Without these masks the policy proposes
+        # actions graphax rejects ("TRANSFORM DID NOT FIT"), every one of which
+        # sentinels the whole measurement. ALPHAGRAD_LIVE_MASKS=0 disables
+        # them (restores the pre-fix behaviour for A/B measurement).
+        self._live_masks_enabled = (
+            os.environ.get("ALPHAGRAD_LIVE_MASKS", "1") != "0"
+        )
+        self._mask_jaxpr = closed_jaxpr.jaxpr
+        self._mask_consts = list(closed_jaxpr.literals)
+        self._mask_args = list(xs)
+        self._mask_argnums = tuple(int(a) for a in argnums)
+        self._mask_oracles = None
+        self._mask_probe_seconds = 0.0
         self.rollout_length = self.num_valid
         # SPMD mesh — replicate agent / opt_state across all visible
         # devices, shard env_states along the env axis. When there's only
@@ -1469,6 +1487,81 @@ class PPORayWorker:
             ),
         )(state)
 
+    def _reset_mask_oracles(self):
+        """One :class:`LiveVertexMaskOracle` per env, rewound to step 0.
+
+        Each env walks its own elimination order, so each needs its own live
+        graph. Built lazily (and rebuilt every episode) because the oracle
+        carries a jax trace whose equation list would otherwise grow across
+        episodes.
+        """
+        if not self._live_masks_enabled:
+            self._mask_oracles = None
+            return
+        from alphagrad.approx.common.masks import LiveVertexMaskOracle
+
+        self._mask_oracles = [
+            LiveVertexMaskOracle(
+                self._mask_jaxpr, self._mask_consts, self._mask_args,
+                self._mask_argnums, max_axes=MAX_AXES_PER_VERTEX,
+            )
+            for _ in range(self.num_envs)
+        ]
+
+    def _live_masks(self, avail_np):
+        """``(pair_valid, compress_valid)`` for every env x vertex, this step.
+
+        Shapes ``(num_envs, total_v + 1, N, N)`` / ``(num_envs, total_v + 1,
+        N)``; row ``v`` is the mask for the 1-indexed vertex id, so the policy
+        can gather with ``vertex_action + 1`` inside the jit. All-ones when the
+        oracle is disabled, which reproduces the unmasked behaviour exactly.
+        """
+        N = MAX_AXES_PER_VERTEX
+        shape_p = (self.num_envs, self.total_v + 1, N, N)
+        shape_c = (self.num_envs, self.total_v + 1, N)
+        if not self._live_masks_enabled:
+            return np.ones(shape_p, np.float32), np.ones(shape_c, np.float32)
+        if self._mask_oracles is None:
+            self._reset_mask_oracles()
+        t0 = _time.time()
+        pair = np.zeros(shape_p, np.float32)
+        comp = np.zeros(shape_c, np.float32)
+        for e, oracle in enumerate(self._mask_oracles):
+            cands = [v for v in range(1, self.total_v + 1)
+                     if avail_np[e, v - 1] > 0.5]
+            pair[e], comp[e] = oracle.masks(cands)
+        self._mask_probe_seconds += _time.time() - t0
+        return pair, comp
+
+    def _advance_mask_oracles(self, order_np, step_np, specs_np):
+        """Commit the vertex each env just eliminated, with ITS rules.
+
+        The transforms applied at a vertex change the structure of every
+        downstream edge, so the oracle has to replay the same approximation the
+        measurement will, not a plain exact elimination — hence the shared
+        ``rule_specs_to_transforms`` decode.
+        """
+        if not self._live_masks_enabled or self._mask_oracles is None:
+            return
+        from alphagrad.approx.env import rule_specs_to_transforms
+
+        t0 = _time.time()
+        for e, oracle in enumerate(self._mask_oracles):
+            stop = int(step_np[e])
+            if stop <= 0:
+                continue
+            v = int(order_np[e][stop - 1])
+            o_list = [int(x) for x in order_np[e][:stop]]
+            specs_list = np.asarray(specs_np[e][:stop]).tolist()
+            tmap = dict(
+                rule_specs_to_transforms(
+                    self._mask_jaxpr, o_list, specs_list,
+                    quant_once=bool(getattr(self.args, "quant_once", False)),
+                )
+            )
+            oracle.advance(v, tmap.get(v, ()))
+        self._mask_probe_seconds += _time.time() - t0
+
     def _scalar_reward(self, reward_vec):
         """Reduce the env's 8-component reward vector to a scalar via
         the per-component weight vector. Symlog is applied downstream
@@ -1605,7 +1698,8 @@ class PPORayWorker:
         @eqx.filter_jit
         def act_step(agent, state_batch, vert_avail_batch,
                      op_mask, factor_mask, quant_mask, key,
-                     substep_budget=jnp.int32(MAX_RULES_PER_VERTEX)):
+                     substep_budget=jnp.int32(MAX_RULES_PER_VERTEX),
+                     pair_valid_batch=None, compress_valid_batch=None):
             """``op_mask`` (4,) gates op-types per variant
             (order DIAG/COMPRESS/QUANT/END): any disallowed sampled op_type is
             rewritten to END (ppo-style op_legality_override) so restricted
@@ -1615,7 +1709,7 @@ class PPORayWorker:
             additionally by ALPHAGRAD_QUANT_ALLOWED inside heads.py)."""
             keys = jrand.split(key, self.num_envs)
 
-            def per_env(state_i, avail_i, k_i):
+            def per_env(state_i, avail_i, pv_i, cv_i, k_i):
                 k_enc, k_v, k_micro = jrand.split(k_i, 3)
                 enc_x, token_mask = agent.encode_tokens(
                     state_i.tokens, key=k_enc, eqn_ids=state_i.eqn_ids,
@@ -1635,12 +1729,18 @@ class PPORayWorker:
                 axis_valid_v = state_i.axis_valid_mask[vertex_action]
                 v_context = vertex_contexts[vertex_action]
                 features = _axis_features_from_state(axis_state_v, axis_valid_v)
+                # EXACT live-edge legality for the vertex just sampled. Rows
+                # are 1-indexed by vertex id (row 0 is padding), matching
+                # ``LiveVertexMaskOracle.masks``.
+                pv_v = pv_i[vertex_id]
+                cv_v = cv_i[vertex_id]
 
                 (
                     actions, micro_lp, micro_ent, micro_arity,
                     *_dists,
                 ) = agent.micro_action_policy.sample(
                     v_context, features, factor_tables, k_micro,
+                    pair_valid=pv_v, compress_valid=cv_v,
                 )
                 op_seq = actions.op_type.astype(jnp.int32)
                 i_seq = actions.i.astype(jnp.int32)
@@ -1703,13 +1803,16 @@ class PPORayWorker:
                 return (
                     vertex_action,
                     op_seq, i_seq, j_seq, exp_seq, f_seq, kind_seq, q_seq,
-                    axis_state_v, axis_valid_v,
+                    axis_state_v, axis_valid_v, pv_v, cv_v,
                     log_prob_total,
                     value,
                     partial, order, specs, step,
                 )
 
-            return jax.vmap(per_env)(state_batch, vert_avail_batch, keys)
+            return jax.vmap(per_env)(
+                state_batch, vert_avail_batch,
+                pair_valid_batch, compress_valid_batch, keys,
+            )
 
         return act_step
 
@@ -1778,7 +1881,7 @@ class PPORayWorker:
             (
                 tokens, eqn_ids, avail,
                 actions, op_a, i_a, j_a, exp_a, f_a, kind_a, q_a,
-                axis_state_a, axis_valid_a,
+                axis_state_a, axis_valid_a, pair_valid_a, compress_valid_a,
                 old_log_probs, returns, advantages, valid,
                 cost_target, cost_valid,
             ) = batch
@@ -1792,7 +1895,8 @@ class PPORayWorker:
             keys = jrand.split(key, tokens.shape[0])
 
             def per_sample(tok, eqn, av, v_act, op, i_s, j_s, exp_s, f_s,
-                           kind_s, q_s, ax_st, ax_va, olp, ret, adv, k,
+                           kind_s, q_s, ax_st, ax_va, pv_s, cv_s,
+                           olp, ret, adv, k,
                            cost_target, cost_valid):
                 enc_x, token_mask = agent.encode_tokens(
                     tok, key=k, eqn_ids=eqn,
@@ -1824,6 +1928,7 @@ class PPORayWorker:
                     micro_lp, micro_ent, micro_arity, *_dists,
                 ) = agent.micro_action_policy.evaluate(
                     v_context, features, factor_tables, action,
+                    pair_valid=pv_s, compress_valid=cv_s,
                 )
                 new_log_prob = lp_v + micro_lp
                 # Arity-normalised sub-episode entropy (ppo.py / cmorl
@@ -1881,7 +1986,7 @@ class PPORayWorker:
             )(
                 tokens, eqn_ids, avail,
                 actions, op_a, i_a, j_a, exp_a, f_a, kind_a, q_a,
-                axis_state_a, axis_valid_a,
+                axis_state_a, axis_valid_a, pair_valid_a, compress_valid_a,
                 old_log_probs, returns, adv_scalar, keys,
                 cost_target, cost_valid,
             )
@@ -2002,6 +2107,8 @@ class PPORayWorker:
             if eqx.is_array(x) else x,
             env_states,
         )
+        self._reset_mask_oracles()
+        self._mask_probe_seconds = 0.0
 
         # Rollout buffers — numpy is fine; we re-stage to JAX once for
         # the update step.
@@ -2035,6 +2142,16 @@ class PPORayWorker:
         buf_axis_valid = np.zeros(
             (T, N, MAX_AXES_PER_VERTEX), dtype=np.float32,
         )
+        # The EXACT live-edge masks the sample was drawn under. Buffered rather
+        # than recomputed in the loss: the loss re-scores a stored action
+        # against a graph state that no longer exists, and the PPO ratio is
+        # only 1 at epoch 0 if both sides mask identically.
+        buf_pair_valid = np.zeros(
+            (T, N, MAX_AXES_PER_VERTEX, MAX_AXES_PER_VERTEX), dtype=np.float32,
+        )
+        buf_compress_valid = np.zeros(
+            (T, N, MAX_AXES_PER_VERTEX), dtype=np.float32,
+        )
         buf_avail = np.zeros((T, N, int(self.total_v)), dtype=np.float32)
         buf_log_probs = np.zeros((T, N), dtype=np.float32)
         # Per-channel value buffer (post-refactor). The value head is
@@ -2059,6 +2176,13 @@ class PPORayWorker:
         for t in range(T):
             key, sub = jrand.split(key)
             avail = self._vertex_avail(state)
+            # EXACT per-vertex micro-action legality, probed off the LIVE edges
+            # of every still-available vertex (see LiveVertexMaskOracle). This
+            # is what stops the policy proposing a Diag/Compress graphax will
+            # reject -- each rejection sentinels the whole measurement.
+            pv_np, cv_np = self._live_masks(np.asarray(avail))
+            pv_j = jax.device_put(jnp.asarray(pv_np), self.data_sharding)
+            cv_j = jax.device_put(jnp.asarray(cv_np), self.data_sharding)
             # Observation the policy ACTS ON this step (pre-elimination). BOTH
             # loss paths re-evaluate log-probs against these tokens: storing the
             # post-assemble tokens pairs a_t with s_{t+1}, which makes the PPO
@@ -2068,14 +2192,14 @@ class PPORayWorker:
             pre_eqn_ids = np.asarray(state.eqn_ids)
             (
                 actions, op_a, i_a, j_a, exp_a, f_a, kind_a, q_a,
-                ax_st_a, ax_va_a,
+                ax_st_a, ax_va_a, pv_a, cv_a,
                 log_probs, values,
                 partial, order, specs, step,
             ) = self._act_step(
                 self.agent, state, avail,
                 self._current_op_mask_j, self._current_factor_mask_j,
                 self._current_quant_mask_j, sub,
-                self._substep_budget_j,
+                self._substep_budget_j, pv_j, cv_j,
             )
 
             # Convert to numpy for Ray fan-out.
@@ -2130,6 +2254,10 @@ class PPORayWorker:
                 jnp.asarray(reward_np, dtype=jnp.float32), self.data_sharding,
             )
             state = self._assemble(state, partial, tokens_j, eqn_ids_j, reward_j)
+            # Keep the mask oracles in lockstep with the env: commit the vertex
+            # each env just eliminated, WITH the rules that landed on it (an
+            # approximation changes every downstream edge's structure).
+            self._advance_mask_oracles(order_np, step_np, specs_np)
 
             # Record the PRE-step obs (the one a_t was sampled from) plus
             # the sub-episode sequences + the axis features / avail mask
@@ -2141,6 +2269,8 @@ class PPORayWorker:
             buf_kind[t] = np.asarray(kind_a)
             buf_axis_state[t] = np.asarray(ax_st_a)
             buf_axis_valid[t] = np.asarray(ax_va_a)
+            buf_pair_valid[t] = np.asarray(pv_a)
+            buf_compress_valid[t] = np.asarray(cv_a)
             buf_actions[t] = np.asarray(actions)
             buf_op[t] = np.asarray(op_a)
             buf_i[t] = np.asarray(i_a)
@@ -2925,6 +3055,15 @@ class PPORayWorker:
             _flat(buf_axis_valid, (MAX_AXES_PER_VERTEX,)),
             (MAX_AXES_PER_VERTEX,),
         )
+        parts["pair_valid"] = (
+            _flat(buf_pair_valid,
+                  (MAX_AXES_PER_VERTEX, MAX_AXES_PER_VERTEX)),
+            (MAX_AXES_PER_VERTEX, MAX_AXES_PER_VERTEX),
+        )
+        parts["compress_valid"] = (
+            _flat(buf_compress_valid, (MAX_AXES_PER_VERTEX,)),
+            (MAX_AXES_PER_VERTEX,),
+        )
         parts["log_probs"] = (_flat(buf_log_probs), ())
         # Fix 1: per-transition valid mask (1.0 = good measure, 0.0 =
         # failed/sentinel). Flows into every minibatch so the loss can drop
@@ -3038,6 +3177,7 @@ class PPORayWorker:
                 mb["op"][i], mb["i"][i], mb["j"][i], mb["exp"][i],
                 mb["f"][i], mb["kind"][i], mb["q"][i],
                 mb["axis_state"][i], mb["axis_valid"][i],
+                mb["pair_valid"][i], mb["compress_valid"][i],
                 mb["log_probs"][i], mb["returns"][i], mb["advantages"][i],
                 mb["valid"][i],
                 mb["cost_target"][i], mb["cost_valid"][i],
@@ -3356,6 +3496,11 @@ class PPORayWorker:
             "sentinel/valid_env_fraction": last_aux_env_valid_frac,
             # Fix 3 telemetry: the LIVE annealed entropy coefficient.
             "entropy_coef": float(self.entropy_coef),
+            # Live-edge mask oracle: seconds spent probing this episode, and
+            # how much of the micro-action space survived the exact masks.
+            "mask/probe_seconds": float(self._mask_probe_seconds),
+            "mask/compress_axes_mean": float(np.mean(buf_compress_valid)),
+            "mask/diag_pairs_mean": float(np.mean(buf_pair_valid)),
         })
         # PopArt telemetry (per-channel mu/sigma, explained_variance —
         # the critic-health metric — and the advantage-scale probes).
@@ -3550,6 +3695,7 @@ class PPORayWorker:
             if eqx.is_array(x) else x,
             env_states,
         )
+        self._reset_mask_oracles()
         T = int(self.rollout_length)
         N = int(self.num_envs)
         S = int(self.max_substeps)
@@ -3567,6 +3713,10 @@ class PPORayWorker:
         buf_axis_state = np.zeros(
             (T, N, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM), dtype=np.int32)
         buf_axis_valid = np.zeros((T, N, MAX_AXES_PER_VERTEX), dtype=np.float32)
+        buf_pair_valid = np.zeros(
+            (T, N, MAX_AXES_PER_VERTEX, MAX_AXES_PER_VERTEX), dtype=np.float32)
+        buf_compress_valid = np.zeros(
+            (T, N, MAX_AXES_PER_VERTEX), dtype=np.float32)
         buf_avail = np.zeros((T, N, int(self.total_v)), dtype=np.float32)
         buf_log_probs = np.zeros((T, N), dtype=np.float32)
         buf_values = np.zeros((T, N, NUM_REWARDS), dtype=np.float32)
@@ -3577,15 +3727,18 @@ class PPORayWorker:
         for t in range(T):
             key, sub = jrand.split(key)
             avail = self._vertex_avail(state)
+            pv_np, cv_np = self._live_masks(np.asarray(avail))
+            pv_j = jnp.asarray(pv_np)
+            cv_j = jnp.asarray(cv_np)
             (
                 actions, op_a, i_a, j_a, exp_a, f_a, kind_a, q_a,
-                ax_st_a, ax_va_a, log_probs, values,
+                ax_st_a, ax_va_a, pv_a, cv_a, log_probs, values,
                 partial, order, specs, step,
             ) = self._act_step(
                 self.agent, state, avail,
                 self._current_op_mask_j, self._current_factor_mask_j,
                 self._current_quant_mask_j, sub,
-                self._substep_budget_j,
+                self._substep_budget_j, pv_j, cv_j,
             )
             pre_tokens = np.asarray(state.tokens)
             pre_eqn_ids = np.asarray(state.eqn_ids)
@@ -3644,6 +3797,8 @@ class PPORayWorker:
             buf_kind[t] = np.asarray(kind_a)
             buf_axis_state[t] = np.asarray(ax_st_a)
             buf_axis_valid[t] = np.asarray(ax_va_a)
+            buf_pair_valid[t] = np.asarray(pv_a)
+            buf_compress_valid[t] = np.asarray(cv_a)
             buf_actions[t] = np.asarray(actions)
             buf_op[t] = np.asarray(op_a)
             buf_i[t] = np.asarray(i_a)
@@ -3663,7 +3818,8 @@ class PPORayWorker:
             tokens=buf_tokens, eqn_ids=buf_eqn_ids, avail=buf_avail,
             actions=buf_actions, op=buf_op, i=buf_i, j=buf_j, exp=buf_exp,
             f=buf_f, kind=buf_kind, q=buf_q, axis_state=buf_axis_state,
-            axis_valid=buf_axis_valid, log_probs=buf_log_probs,
+            axis_valid=buf_axis_valid, pair_valid=buf_pair_valid,
+            compress_valid=buf_compress_valid, log_probs=buf_log_probs,
             reward_vec=buf_reward_vec, dones=buf_dones, sentinel=buf_sentinel,
         )
 
@@ -3687,6 +3843,8 @@ class PPORayWorker:
             "kind": _tp3(bufs["kind"]), "q": _tp3(bufs["q"]),
             "axis_state": _tp3(bufs["axis_state"]),
             "axis_valid": _tp3(bufs["axis_valid"]),
+            "pair_valid": _tp3(bufs["pair_valid"]),
+            "compress_valid": _tp3(bufs["compress_valid"]),
             "old_lp": bufs["log_probs"].T,
             "reward_vec": _tp3(bufs["reward_vec"]),
             "dones": bufs["dones"].T,
@@ -3770,15 +3928,18 @@ class PPORayWorker:
                 if eqx.is_array(x) else x,
                 env_states,
             )
+            self._reset_mask_oracles()
             buf_reward_vec = np.zeros((T, N, _NUM_REWARDS_RS), dtype=np.float32)
             for t in range(T):
                 key, sub = jrand.split(key)
                 avail = self._vertex_avail(state)
+                pv_np, cv_np = self._live_masks(np.asarray(avail))
                 act_out = self._act_step(
                     self.agent, state, avail,
                     self._current_op_mask_j, self._current_factor_mask_j,
                     self._current_quant_mask_j, sub,
                     self._substep_budget_j,
+                    jnp.asarray(pv_np), jnp.asarray(cv_np),
                 )
                 partial = act_out[-4]
                 order = act_out[-3]
