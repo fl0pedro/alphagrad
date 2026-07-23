@@ -2398,6 +2398,30 @@ def per_face_stats() -> dict:
     return dict(_PER_FACE_STATS)
 
 
+# Zero TRANSFORM-DID-NOT-FIT is necessary but NOT sufficient: a run in which
+# every rule is masked out would look identical to a healthy one, while
+# actually measuring plain exact AD. Emit the applied/skipped tally
+# periodically so "the approximations are firing" is observable rather than
+# assumed.
+_PER_FACE_LOG_EVERY = int(os.environ.get("ALPHAGRAD_PER_FACE_LOG_EVERY", "200"))
+_PER_FACE_CALLS = [0]
+
+
+def _maybe_log_per_face_stats() -> None:
+    if _PER_FACE_LOG_EVERY <= 0:
+        return
+    _PER_FACE_CALLS[0] += 1
+    if _PER_FACE_CALLS[0] % _PER_FACE_LOG_EVERY:
+        return
+    st = per_face_stats()
+    applied = st.get("applied", 0)
+    skipped = st.get("skipped", 0) + st.get("skipped_raised", 0)
+    total = applied + skipped
+    frac = (applied / total) if total else 0.0
+    print(f"[per-face] builds={_PER_FACE_CALLS[0]} applied={applied} "
+          f"skipped={skipped} applied_frac={frac:.3f}", flush=True)
+
+
 def rule_specs_to_transforms(
     jaxpr,
     o_list,
@@ -2570,6 +2594,7 @@ def rule_specs_to_transforms(
             used_axes.add(idx2)
             rules.append(Diag(i=idx1, j=idx2, factor=factor))
         if rules:
+            _maybe_log_per_face_stats()
             if _per_face_mvp():
                 # PER-FACE MVP: hand graphax a CALLABLE instead of literal
                 # actions. graphax invokes it once per FACE with that face's
