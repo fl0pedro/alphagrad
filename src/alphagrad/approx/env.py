@@ -2533,6 +2533,70 @@ def incremental_tokens_enabled() -> bool:
     return _INCR_TOK_CACHE
 
 
+def incremental_token_blocks(jaxpr, argnums, consts, args, order,
+                             vocab_size=None):
+    """``(base, [delta_per_vertex])`` -- the APPEND-ONLY stream as deltas.
+
+    ``capture_stream`` rebuilds the whole sequence on every call, which throws
+    away the one property that makes palimpsa the right encoder: it is a linear
+    attention model, so it can consume each new block recurrently and carry
+    state, instead of re-encoding thousands of tokens per action. This returns
+    the base jaxpr block plus ONE delta per elimination, so a consumer can feed
+    only what changed.
+
+    ``base + concat(deltas)`` is exactly ``capture_stream(order)`` -- pinned by
+    a test, since a silent divergence would mean the policy conditioned on a
+    different history than the reward came from.
+    """
+    from graphax import IncrementalPathTokenizer
+
+    # capture_stream emits base -> _emit_outputs -> face blocks. The output
+    # ("jac") section names the RESERVED Jacobian variables and belongs at the
+    # front, but the tokenizer can only resolve them after the elimination has
+    # run. So: one scratch pass to resolve them, then emit header + deltas.
+    # Without this the delta stream is 23 tokens short of capture_stream and
+    # the policy conditions on a different history than the reward came from.
+    vs = int(vocab_size) if vocab_size else DEFAULT_TOKEN_VOCAB
+    scratch = IncrementalPathTokenizer(jaxpr, tuple(argnums), consts, args,
+                                       vocab_size=vs)
+    scratch.ij.eliminate_order([int(v) for v in order])
+    scratch._jac_vars = scratch._collect_jac_vars(list(scratch.ij.all_eqns()))
+    header = list(scratch.base_tokens())
+    scratch._emit_outputs(header)
+
+    tk = IncrementalPathTokenizer(jaxpr, tuple(argnums), consts, args,
+                                  vocab_size=vs)
+    tk._jac_vars = scratch._jac_vars
+    base_only = list(tk.base_tokens())
+    base = jnp.asarray(header, dtype=jnp.int32)   # base + reserved jac vars
+    blocks = []
+    for v in order:
+        blocks.append(jnp.asarray(list(tk.eliminate(int(v))), dtype=jnp.int32))
+    _check_vocab_bound(scratch, vs)
+    _check_vocab_bound(tk, vs)
+    return base, blocks
+
+
+DEFAULT_TOKEN_VOCAB = 512
+
+
+def _check_vocab_bound(tk, vocab_size) -> None:
+    """Cheap assert that the bounded alphabet did its job.
+
+    This used to RAISE when max_token_id exceeded vocab_size, which was the
+    wrong fix: names are positional sequences over an alphabet, so bounding the
+    ALPHABET keeps every id in range by construction and a long graph simply
+    spends more tokens per name. With graphax sized from vocab_size this can
+    only fire on a real bug.
+    """
+    if vocab_size is None:
+        return
+    top = int(tk.max_token_id())
+    assert top < int(vocab_size), (
+        f"bounded tokenizer still emitted max_token_id={top} >= "
+        f"vocab_size={vocab_size}")
+
+
 def incremental_tokens(jaxpr, argnums, consts, args, order, vocab_size=None):
     """Append-only token stream for ``order`` (base jaxpr + one block per step).
 
@@ -2541,19 +2605,25 @@ def incremental_tokens(jaxpr, argnums, consts, args, order, vocab_size=None):
     out-of-bounds embedding gather is CLAMPED by JAX rather than raising -- the
     policy would silently read the wrong row for every oversized id.
     """
-    from graphax import IncrementalPathTokenizer
+    # Built from the DELTA path so there is exactly one emission code path;
+    # a flat consumer just concatenates.
+    base, blocks = incremental_token_blocks(
+        jaxpr, argnums, consts, args, order, vocab_size=vocab_size)
+    return jnp.concatenate([base, *blocks]) if blocks else base
 
-    tk = IncrementalPathTokenizer(jaxpr, tuple(argnums), consts, args)
-    toks = list(tk.capture_stream([int(v) for v in order]))
-    if vocab_size is not None:
-        top = int(tk.max_token_id())
-        if top >= int(vocab_size):
-            raise ValueError(
-                f"IncrementalPathTokenizer max_token_id={top} >= vocab_size="
-                f"{int(vocab_size)}; the embedding would clamp out-of-range ids "
-                "and silently return the wrong row. Raise --vocab-size."
-            )
-    return jnp.asarray(toks, dtype=jnp.int32)
+
+# ALPHAGRAD_EXACT_ONLY=1 -> emit NO approximation at all. The pointer policy
+# still chooses the elimination order, but every edge stays exact, so the reward
+# isolates order quality from approximation quality. Used for the exact-order
+# baselines.
+_EXACT_ONLY_CACHE = None
+
+
+def exact_only_enabled() -> bool:
+    global _EXACT_ONLY_CACHE
+    if _EXACT_ONLY_CACHE is None:
+        _EXACT_ONLY_CACHE = os.environ.get("ALPHAGRAD_EXACT_ONLY", "0") == "1"
+    return _EXACT_ONLY_CACHE
 
 
 def enumerate_faces_for_order(jaxpr, argnums, consts, args, order):
@@ -2883,7 +2953,9 @@ def _callback(
     # PER-FACE routing. Built alongside (not instead of) the per-vertex list so
     # the two stay comparable for an A/B; jacve is handed whichever is active.
     face_transforms = None
-    if face_transforms_enabled():
+    if exact_only_enabled():
+        transforms = None            # exact AD; order quality only
+    elif face_transforms_enabled():
         try:
             _keys = enumerate_faces_for_order(
                 config.jaxpr, config.argnums, consts, args, o_list)
