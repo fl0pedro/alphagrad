@@ -165,6 +165,32 @@ _NO_SYMLOG_MASK_NP: np.ndarray = np.zeros((NUM_REWARDS,), dtype=np.bool_)
 _NO_SYMLOG_MASK_NP[list(_NO_SYMLOG_REWARD_INDICES)] = True
 
 
+
+def _traced_inlined(target_fn, xs):
+    """``jax.make_jaxpr(target_fn)(*xs)``, numbered on the form that is actually
+    eliminated.
+
+    jacve and the AOJ splice jit/pjit bodies into the parent jaxpr before
+    eliminating, which ADDS equations. Numbering vertices from the raw trace
+    therefore addresses a different graph -- the order misses every spliced-in
+    vertex, and the elimination refuses ("the elimination order left N
+    intermediate vertices with live edges un-eliminated") rather than quietly
+    returning a Jacobian with those paths dropped.
+    """
+    import jax
+    from graphax import inline_call_primitives
+
+    cj = jax.make_jaxpr(target_fn)(*xs)
+    jx, consts = inline_call_primitives(cj.jaxpr, cj.literals)
+    if jx is cj.jaxpr:
+        return cj                      # nothing to inline -- keep the original
+    try:                                   # jax >= 0.4.31
+        from jax.extend.core import ClosedJaxpr
+    except ImportError:                    # older / internal layout
+        from jax._src.core import ClosedJaxpr
+    return ClosedJaxpr(jx, consts)
+
+
 def _symlog_rewards(reward_vec: "jax.Array") -> "jax.Array":
     """Apply symlog elementwise on the last axis, leaving cosine_sim raw.
 
@@ -3524,7 +3550,7 @@ def main():
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
     )
-    closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
+    closed_jaxpr = _traced_inlined(target_fn, xs)
     # Always pass target_fun so flops/bytes_accessed/latency_ns/peak_memory
     # populate every step (see cpu_approx_worker.py for the full rationale).
     env_target_fun = target_fn
