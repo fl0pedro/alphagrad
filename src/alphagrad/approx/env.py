@@ -2516,6 +2516,46 @@ def policy_face_transforms(jaxpr, argnums, consts, args, order, sample_fn,
     return out
 
 
+# ALPHAGRAD_INCREMENTAL_TOKENS=1 -> feed the policy graphax's APPEND-ONLY
+# IncrementalPathTokenizer instead of the one-shot whole-jaxpr tokenizer.
+# graphax marks the incremental one PRIMARY and the one-shot "retained only for
+# existing consumers"; the append-only stream is also what the per-path policy
+# actually wants, since each decision extends the history rather than rewriting
+# it. Default OFF: it changes the observation the policy sees, so it should be
+# turned on deliberately (and the embedding re-sized -- see the assert below).
+_INCR_TOK_CACHE = None
+
+
+def incremental_tokens_enabled() -> bool:
+    global _INCR_TOK_CACHE
+    if _INCR_TOK_CACHE is None:
+        _INCR_TOK_CACHE = os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "0") == "1"
+    return _INCR_TOK_CACHE
+
+
+def incremental_tokens(jaxpr, argnums, consts, args, order, vocab_size=None):
+    """Append-only token stream for ``order`` (base jaxpr + one block per step).
+
+    Returns a 1-D int32 array. Raises if the tokenizer's ``max_token_id``
+    exceeds ``vocab_size``: this tokenizer does NOT cap the id space, and an
+    out-of-bounds embedding gather is CLAMPED by JAX rather than raising -- the
+    policy would silently read the wrong row for every oversized id.
+    """
+    from graphax import IncrementalPathTokenizer
+
+    tk = IncrementalPathTokenizer(jaxpr, tuple(argnums), consts, args)
+    toks = list(tk.capture_stream([int(v) for v in order]))
+    if vocab_size is not None:
+        top = int(tk.max_token_id())
+        if top >= int(vocab_size):
+            raise ValueError(
+                f"IncrementalPathTokenizer max_token_id={top} >= vocab_size="
+                f"{int(vocab_size)}; the embedding would clamp out-of-range ids "
+                "and silently return the wrong row. Raise --vocab-size."
+            )
+    return jnp.asarray(toks, dtype=jnp.int32)
+
+
 def enumerate_faces_for_order(jaxpr, argnums, consts, args, order):
     """``{vertex: [face_key, ...]}`` enumerated at the RIGHT graph state.
 
@@ -3002,7 +3042,16 @@ def _callback(
     # Measure the raw token length before slicing so we can detect
     # truncation. ``_record_tokenization_truncation`` is a no-op for
     # short sequences (the common case) and is cheap otherwise.
-    raw_tokens = ve.tokenized()
+    if incremental_tokens_enabled():
+        try:
+            raw_tokens = incremental_tokens(
+                config.jaxpr, config.argnums, consts, args, o_list,
+                vocab_size=getattr(config, "vocab_size", None))
+        except Exception as _e:
+            _record_face_transform_fallback(f"tokens:{type(_e).__name__}")
+            raw_tokens = ve.tokenized()
+    else:
+        raw_tokens = ve.tokenized()
     _record_tokenization_truncation(int(raw_tokens.shape[0]))
     tokens = raw_tokens[:MAX_TOKENS]
     tokens = jnp.pad(tokens, (0, MAX_TOKENS - tokens.shape[0]))

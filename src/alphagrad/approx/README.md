@@ -335,3 +335,50 @@ head. `FacePathPolicy` / `FaceSkipHead` / `FacePathHead` exist in `heads.py` and
 are referenced **nowhere outside it** (one docstring in `env.py:1473` mentions a
 closure nobody constructs). So the capability above is reachable from code, not
 from the agent, until `sample_fn` is backed by `FacePathPolicy`.
+
+---
+
+# MVP status: A (policy), B (measurement), C (tokens)
+
+All three are wired. Flags, in the order the data flows:
+
+```bash
+export ALPHAGRAD_INCREMENTAL_TOKENS=1  # C: append-only AOJ tokens -> palimpsa (default 0)
+export ALPHAGRAD_POLICY=palimpsa       # encoder (never palimpsa_bi, never transformer)
+export ALPHAGRAD_FACE_TRANSFORMS=1     # B: measure via per-face slots (default 1)
+export GRAPHAX_ALLOW_PARTIAL_ORDER=1
+export GRAPHAX_PRUNE=0
+```
+
+**B — measurement is per-face.** `rule_specs_to_face_transforms` +
+`enumerate_faces_for_order`. Verified as an exact reroute first
+(per-vertex 12.88503492 vs face 12.88503492) so the change was provably
+behaviour-preserving before anything else moved.
+
+**A — the policy decides per path and per slot.** `policy_face_transforms`
+replays the order, asks `FacePathPolicy` for a `FacePathAction` per vertex, and
+returns `{vertex: {face_key: (lhs, rhs, res)}}`. Three seeds on a 2-pre x 2-post
+graph give 12.080 / 11.578 / 11.890 against an exact 12.882 — distinct policies,
+distinct Jacobians, `skipped` counts proving the mask is live, zero fit failures.
+
+**C — append-only tokens.** `incremental_tokens(...)` wraps
+`IncrementalPathTokenizer`: base jaxpr, then one block per elimination. Stream
+length is monotone in the order prefix (`75 -> 300 -> ... -> 2662`).
+
+## The vocab-size trap (read this before turning C on)
+
+`IncrementalPathTokenizer` does **not** cap its id space. On a small test graph
+`max_token_id()` is already **652**. If the policy's `--vocab-size` is smaller
+than that, an embedding gather goes out of bounds — and JAX **clamps** rather
+than raising, so the policy silently reads the wrong row for every oversized id
+and nothing in the log looks wrong. `incremental_tokens()` therefore raises up
+front, and there are graphax tests pinning `max(ids) <= max_token_id()`.
+
+## Still not done
+
+* The face action's **log-prob / entropy are not in the PPO loss**, so the face
+  policy *acts* but does not yet *learn* from those decisions. The per-vertex
+  path has the pattern to copy (sample/evaluate mirror + mask buffering).
+* `set_approx_active` parity between `vertex_elimination_jaxpr` and
+  `IncrementalJaxpr.eliminate` is still unfixed.
+* `Quant` chains are masked only by dtype (narrow-float to integer).
