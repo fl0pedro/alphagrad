@@ -283,3 +283,55 @@ float32; the only illegal chains are **narrow float → integer**
 (`float8_*` / `float4_*` → `int*` / `uint*` / `bool`), which raise
 `TypePromotionError`. `quant_chain_ok` encodes exactly that. `scalar_mult` stays
 at the default float dtype, so it remains safe to carry the compensating scale.
+
+---
+
+# Per-path / per-slot / per-edge approximation (expanded MVP)
+
+`jacve` now takes `face_transforms={vertex: {face_key: (lhs, rhs, res)}}`
+(core-v2 `f7cc774` — the parameter already existed on `_eliminate_vertex`, it
+was just unreachable from `jacve`). A face key is `(in_edge_vid, out_edge_vid)`,
+and the three slots are:
+
+    lhs -> pre_val   (the in_edge  Jacobian)  |  both BEFORE the contraction
+    rhs -> post_val  (the out_edge Jacobian)  |
+    res -> the contraction result             |  after
+
+Build the dict with `common/masks.py`:
+
+* `face_transforms_from_edges(keys, pre=…, post=…, res=…)` — `pre` keyed by
+  in_edge vid, `post` by out_edge vid, `res` by full face key. **Absent = that
+  slot stays exact**, so skipping a path is just omitting it.
+* `masked_face_transforms(...)` — same, but each slot's rules are wrapped in a
+  live-masked hook, so illegal rules are skipped per slot rather than raising.
+
+**Face keys are graph-state dependent.** Every elimination rewires the graph, so
+enumerate with `incr.faces(v)` *immediately* before eliminating `v` — keys taken
+from a fresh graph will silently match nothing.
+
+### Verified
+
+On a 2-pre × 2-post vertex (4 local paths), 12 hooks fire — exactly one per
+(face, slot) — and the results are numerically independent:
+
+```
+exact                          12.88236201
+face0.lhs (pre1)               12.97390759     pre1 only        13.06914389
+face0.rhs (post1)              12.78747809     pre2 only        12.82853806
+face1.lhs (different path)     12.85598183     post1 only       12.76556242
+face0.lhs=f8 + face1.res=f4    13.28174424     post2 only       12.64937460
+                                               pre1 + post2     12.71636498
+```
+
+5/5 distinct per-path/per-slot, 6/6 distinct per-edge. So `pre1` can be
+approximated differently from `pre2`, `lhs` differently from `rhs` on the same
+path, `new1..new4` each differently, and any path skipped outright.
+
+## Not yet true
+
+The **policy** does not yet make these choices. `ppo_ray`'s `MicroPPOAgent` is
+`PALIMPSA` + `PointerVertexPolicy` + **`MicroActionPolicy`** — the per-vertex
+head. `FacePathPolicy` / `FaceSkipHead` / `FacePathHead` exist in `heads.py` and
+are referenced **nowhere outside it** (one docstring in `env.py:1473` mentions a
+closure nobody constructs). So the capability above is reachable from code, not
+from the agent, until `sample_fn` is backed by `FacePathPolicy`.

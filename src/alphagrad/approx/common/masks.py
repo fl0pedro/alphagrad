@@ -809,3 +809,57 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
         return cur
 
     return _hook
+
+
+# ---------------------------------------------------------------------------
+# Per-PATH / per-SLOT / per-EDGE addressing
+# ---------------------------------------------------------------------------
+# A face key is ``(in_edge_vid, out_edge_vid)``. With pre1/pre2 and post1/post2
+# a vertex has four local paths, and graphax's face_transforms gives each of
+# them three independently addressable slots:
+#
+#     lhs -> pre_val   (the in_edge  Jacobian)  | both BEFORE the contraction
+#     rhs -> post_val  (the out_edge Jacobian)  |
+#     res -> the contraction result             | after
+#
+# Two levels of addressing are therefore useful, and both are exact:
+#   * PER PATH  -- key on the whole face; new1..new4 can each differ.
+#   * PER EDGE  -- key on the in/out vid; "approximate pre1" means every face
+#                  whose in_edge is pre1. This is the natural handle when the
+#                  policy reasons about the edge Jacobians themselves.
+#
+# Verified numerically on a 2-pre x 2-post vertex: exact / pre1 / pre2 / post1 /
+# post2 / (pre1+post2) all produce DIFFERENT Jacobians (6/6 distinct), and a
+# ``None`` slot leaves that operand exact -- which is the per-path skip.
+
+
+def face_transforms_from_edges(face_keys, *, pre=None, post=None, res=None):
+    """Per-EDGE / per-PATH choices -> the ``{face_key: (lhs, rhs, res)}`` dict.
+
+    ``pre`` is keyed by in_edge vid, ``post`` by out_edge vid, ``res`` by the
+    full face key. Anything absent stays ``None``, i.e. that slot is left exact
+    -- so skipping a path is simply omitting it.
+    """
+    pre, post, res = pre or {}, post or {}, res or {}
+    return {k: (pre.get(k[0]), post.get(k[1]), res.get(k)) for k in face_keys}
+
+
+def masked_face_transforms(face_keys, *, pre=None, post=None, res=None,
+                           max_dims: int = 8, max_axes: int = 8,
+                           stats: dict | None = None):
+    """Same, but every entry is a rule LIST wrapped in a live-masked hook.
+
+    Each slot's rules are checked against that slot's own operand at apply
+    time, so an illegal rule is skipped rather than raising -- and because the
+    three slots see three different tensors, they mask independently.
+    """
+    def _wrap(rules):
+        if not rules:
+            return None
+        return make_live_masked_hook(list(rules), max_dims=max_dims,
+                                     max_axes=max_axes, stats=stats)
+
+    pre = {k: _wrap(v) for k, v in (pre or {}).items()}
+    post = {k: _wrap(v) for k, v in (post or {}).items()}
+    res = {k: _wrap(v) for k, v in (res or {}).items()}
+    return face_transforms_from_edges(face_keys, pre=pre, post=post, res=res)
