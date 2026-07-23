@@ -138,6 +138,29 @@ _INNER_LAMBDA_DEFAULTS: dict[str, float] = {
 }
 
 
+
+def _traced_inlined(target_fn, xs):
+    """``jax.make_jaxpr(target_fn)(*xs)``, numbered on the form that is actually
+    eliminated -- see the twin in ``cpu_approx_worker`` / ``ppo``.
+
+    jacve and the AOJ splice jit/pjit bodies in before eliminating, which ADDS
+    equations; numbering vertices from the raw trace addresses a different graph
+    and leaves the spliced-in vertices un-eliminated.
+    """
+    import jax
+    from graphax import inline_call_primitives
+
+    cj = jax.make_jaxpr(target_fn)(*xs)
+    jx, consts = inline_call_primitives(cj.jaxpr, cj.literals)
+    if jx is cj.jaxpr:
+        return cj
+    try:                                   # jax >= 0.4.31
+        from jax.extend.core import ClosedJaxpr
+    except ImportError:                    # older / internal layout
+        from jax._src.core import ClosedJaxpr
+    return ClosedJaxpr(jx, consts)
+
+
 def _build_inner_lambda_vec() -> np.ndarray:
     """Per-channel INNER lambda applied INSIDE symlog for cost channels.
 
@@ -513,7 +536,7 @@ class PPORayWorker:
         target_fn, xs, argnums = grad_target_setup(
             self.args, target_fn, xs, self.args.example
         )
-        closed_jaxpr = jax.make_jaxpr(target_fn)(*xs)
+        closed_jaxpr = _traced_inlined(target_fn, xs)
         env_target_fun = target_fn if "acc" in self.args.rewards else None
         measure_latency = bool(
             getattr(self.args, "measure_latency", False)
