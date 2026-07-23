@@ -1419,7 +1419,8 @@ def _slot_to_transform(op, i, j, factor, kind_idx, dtype_idx):
     return None
 
 
-def build_face_transforms(face_keys, action, max_faces: int | None = None):
+def build_face_transforms(face_keys, action, max_faces: int | None = None,
+                          *, mask: bool = True, stats: dict | None = None):
     """``{face_key: (lhs, rhs, res)}`` from one vertex's per-path action.
 
     ``face_keys`` is the ordered list :func:`enumerate_faces` returned;
@@ -1437,6 +1438,17 @@ def build_face_transforms(face_keys, action, max_faces: int | None = None):
     exact, which is the safe direction.
     """
     from alphagrad.approx.heads import FACE_SKIP, NUM_FACE_SLOTS
+    from alphagrad.approx.common.masks import make_live_masked_hook
+
+    def _maybe_mask(t):
+        # ``_slot_to_transform`` emits a LITERAL Diag/Compress/Quant, which
+        # graphax will reject outright if it does not fit that slot's operand.
+        # Wrapping it in the live-masked hook makes an unfittable choice a
+        # no-op for that slot instead of killing the episode -- the same
+        # discipline the per-vertex path uses.
+        if t is None or not mask:
+            return t
+        return make_live_masked_hook([t], stats=stats)
 
     if max_faces is None:
         max_faces = int(np.asarray(action.skip).shape[0])
@@ -1456,10 +1468,10 @@ def build_face_transforms(face_keys, action, max_faces: int | None = None):
             face_transforms[tuple(key)] = (None, None, None)
             continue
         face_transforms[tuple(key)] = tuple(
-            _slot_to_transform(
+            _maybe_mask(_slot_to_transform(
                 op_types[f, s], i_arr[f, s], j_arr[f, s], f_arr[f, s],
                 k_arr[f, s], q_arr[f, s],
-            )
+            ))
             for s in range(NUM_FACE_SLOTS)
         )
     return face_transforms
@@ -2458,6 +2470,50 @@ def _record_face_transform_fallback(reason: str) -> None:
 
 def face_transform_fallbacks() -> dict:
     return dict(_FACE_TF_FALLBACKS)
+
+
+def policy_face_transforms(jaxpr, argnums, consts, args, order, sample_fn,
+                           max_faces: int, stats: dict | None = None):
+    """``{vertex: {face_key: (lhs, rhs, res)}}`` chosen by a PER-PATH policy.
+
+    Replays the order structurally (face keys are only valid immediately before
+    their vertex is eliminated) and, for each vertex with faces, hands the
+    policy that vertex's face features and keys. ``sample_fn(vertex, feats,
+    keys)`` returns a :class:`~alphagrad.approx.heads.FacePathAction` or
+    ``None`` to leave the whole vertex exact.
+
+    Reuses the pieces that already existed for this -- ``build_face_features``,
+    ``build_face_transforms`` and ``FacePathPolicy`` -- rather than adding a
+    parallel path; the only thing that was ever missing is this loop.
+    """
+    from graphax import IncrementalJaxpr
+
+    incr = IncrementalJaxpr(jaxpr, argnums=tuple(argnums), consts=consts,
+                            args=args)
+    out: dict[int, dict] = {}
+    for v in order:
+        v = int(v)
+        try:
+            keys = list(incr.faces(v))
+            if keys:
+                # build_face_features returns (FaceFeatures, raw_keys); the
+                # padded features go to the policy, the raw keys index the dict.
+                feats, raw_keys = build_face_features(incr, v, max_faces)
+                keys = list(raw_keys) or keys
+                action = sample_fn(v, feats, keys)
+                if action is not None:
+                    ft = build_face_transforms(keys, action,
+                                               max_faces=max_faces,
+                                               mask=True, stats=stats)
+                    ft = {k: t for k, t in ft.items()
+                          if any(x is not None for x in t)}
+                    if ft:
+                        out[v] = ft
+            incr.eliminate(v)
+        except Exception as _e:
+            _record_face_transform_fallback(f"policy:{type(_e).__name__}")
+            break
+    return out
 
 
 def enumerate_faces_for_order(jaxpr, argnums, consts, args, order):
