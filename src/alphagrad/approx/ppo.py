@@ -2115,6 +2115,11 @@ def make_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Pin training to GPU 0 and the env eval callback to GPU 1.",
     )
+    p.add_argument(
+        "--exact",
+        action="store_true",
+        help="Bypass all micro actions (Vertex Elimination only)",
+    )
 
     # Environment / reward
     p.add_argument("--example", type=str, default="Helmholtz")
@@ -2658,6 +2663,9 @@ def _apply_variant_preset(args, variant: str | None = None):
     atomic-COMPRESS action — see graphax.sparse.micro_actions and the
     heads.py rewrite).
     """
+    if getattr(args, "exact", False):
+        variant = "ve_only"
+        
     name = variant if variant is not None else getattr(args, "variant", "custom")
     if name not in VARIANT_PRESETS:
         raise ValueError(f"Unknown --variant '{name}'. Valid: {list(VARIANT_PRESETS)}.")
