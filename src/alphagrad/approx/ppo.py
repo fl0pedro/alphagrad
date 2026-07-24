@@ -1884,6 +1884,11 @@ class Agent(eqx.Module):
             exp_dists,
             kind_dists,
             quant_dists,
+        # NOTE: pair_valid/compress_valid/quant_legality_mask default to None
+        # here — the tag-bit fallback and all-dtypes QUANT. Threading the
+        # oracle's authoritative per-edge masks (build_pair_valid_mask, already
+        # wired in the static path) into this dynamic path is the immediate
+        # follow-up now that the heads accept them.
         ) = self.micro_action_policy.sample(
             v_context,
             features,
@@ -2013,6 +2018,8 @@ class Agent(eqx.Module):
             new_exp_dists,
             new_kind_dists,
             new_quant_dists,
+        # Masks must match sample_action_dynamic (None → tag-bit fallback,
+        # all-dtypes QUANT) or the PPO ratio is not 1 at epoch 0.
         ) = self.micro_action_policy.evaluate(
             v_context,
             features,

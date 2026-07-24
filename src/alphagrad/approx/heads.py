@@ -706,62 +706,138 @@ def _features_after_compress(
 
 def _compute_op_legality(
     features: AxisTokenFeatures,
-    quant_legality_mask: jax.Array,
-    tables: FactorTables,
+    pair_valid: jax.Array | None = None,
+    compress_valid: jax.Array | None = None,
+    quant_legality_mask: jax.Array | None = None,
 ) -> jax.Array:
-    """Op-type legality (NUM_OPS,) — DIAG / COMPRESS / QUANT / END."""
-    is_compressed = features.tag_bits[:, TAG_IS_COMPRESSED] > 0.5
-    in_diag = features.tag_bits[:, TAG_IN_DIAG_GROUP] > 0.5
-    valid = features.valid_mask > 0.5
+    """Op-type legality (NUM_OPS,) — DIAG / COMPRESS / QUANT / END.
 
-    diag_eligible = valid & ~is_compressed & ~in_diag
-    compress_eligible = valid & ~is_compressed
+    Derived from :func:`_compute_axis_masks` rather than recomputed, so an op
+    can never be advertised as legal while every concrete action under it is
+    masked out. This used to be recomputed with its own copy of the rules, and
+    the copy went stale: it kept an ``& ~in_diag`` term, which declared DIAG
+    illegal precisely when only coupled axes remained — exactly the case
+    re-diagonalisation exists to serve.
 
-    # Valid DIAG requires at least two distinct axes with GCD > 1.
-    size = features.size
-    gcd_matrix = tables.gcd[size[:, None], size[None, :]]
-    N = diag_eligible.shape[0]
-    eye = jnp.eye(N, dtype=jnp.bool_)
-    valid_diag_pairs = diag_eligible[:, None] & diag_eligible[None, :] & ~eye & (gcd_matrix > 1)
-    diag_legal = (jnp.sum(valid_diag_pairs) > 0).astype(jnp.float32)
-    compress_legal = (jnp.sum(compress_eligible.astype(jnp.int32)) >= 1).astype(
-        jnp.float32
-    )
-    # QUANT is legal if there's at least one valid dtype available.
-    quant_legal = (jnp.sum(quant_legality_mask) > 0.5).astype(jnp.float32)
+    ``pair_valid`` / ``compress_valid`` are the OPTIONAL exact per-edge masks
+    from :class:`~alphagrad.approx.common.masks.LiveVertexMaskOracle`. They are
+    authoritative when supplied: the tag-bit reconstruction cannot see which
+    side of the out/primal split an axis sits on (a DIAG must tie one OUT axis
+    to one PRIMAL axis), nor whether the edge carries a materialised ``val``
+    (a pure-structure Jacobian has nothing to compress). ``quant_legality_mask``
+    is the ``(NUM_QUANT_DTYPES,)`` hardware/dtype mask; QUANT is legal iff it
+    leaves at least one dtype (or is absent, in which case QUANT is per-tensor
+    and always legal).
+    """
+    _diag_i, compress_eligible, j_mask_for_i, _coupled = _compute_axis_masks(
+        features, pair_valid=pair_valid, compress_valid=compress_valid)
+
+    # DIAG is legal iff at least one (i, j) pair survives — strictly sharper
+    # than "at least 2 eligible axes", which counted axes that could not
+    # actually pair with each other.
+    diag_legal = (jnp.sum(j_mask_for_i) > 0.0).astype(jnp.float32)
+    compress_legal = (jnp.sum(compress_eligible) > 0.0).astype(jnp.float32)
+    if quant_legality_mask is None:
+        quant_legal = jnp.array(1.0, dtype=jnp.float32)
+    else:
+        quant_legal = (jnp.sum(quant_legality_mask) > 0.5).astype(jnp.float32)
     end_legal = jnp.array(1.0, dtype=jnp.float32)
     return jnp.stack([diag_legal, compress_legal, quant_legal, end_legal])
 
 
+def _compute_partner(features: AxisTokenFeatures) -> jax.Array:
+    """Resolve, per axis, the index of its coupled DIAG partner (or -1).
+
+    Two axes are partners iff they share a non-negative ``group_id`` (the id
+    stamped by :func:`_features_after_diag` when they were block-diagonalised
+    together). Free / ungrouped / compressed axes get partner ``-1``. Returned
+    as ``(N,)`` int32.
+    """
+    gid = features.group_id
+    valid = features.valid_mask > 0.5
+    grouped = (gid >= 0) & valid                       # (N,)
+    same_group = gid[:, None] == gid[None, :]          # (N, N)
+    N = gid.shape[0]
+    not_self = ~jnp.eye(N, dtype=jnp.bool_)
+    cand = same_group & not_self & grouped[None, :] & grouped[:, None]
+    has_partner = jnp.any(cand, axis=-1)
+    first = jnp.argmax(cand.astype(jnp.int32), axis=-1)
+    return jnp.where(has_partner, first, -1).astype(jnp.int32)
+
+
+def _finalise_axis_masks(diag_i_eligible, compress_eligible, j_mask_for_i,
+                         i_coupled, pair_valid, compress_valid=None):
+    """Shared tail of :func:`_compute_axis_masks`: apply the authoritative
+    env masks, then drop any ``i`` whose entire ``j`` row is now empty.
+
+    An ``i`` with an all-masked ``j`` row would hand the j-head an all -1e9
+    logit vector, whose softmax is UNIFORM over illegal axes — so a
+    legal-looking sample lands on an illegal pair. Such an ``i`` must not be
+    selectable. (This bites without ``pair_valid`` too: a lone diag-eligible
+    axis has an empty row after the ``i != j`` term.)
+    """
+    if pair_valid is not None:
+        j_mask_for_i = j_mask_for_i * pair_valid
+    if compress_valid is not None:
+        compress_eligible = compress_eligible * compress_valid
+    has_partner = (jnp.sum(j_mask_for_i, axis=-1) > 0.0).astype(jnp.float32)
+    return (diag_i_eligible * has_partner, compress_eligible, j_mask_for_i,
+            i_coupled)
+
+
 def _compute_axis_masks(
     features: AxisTokenFeatures,
-    tables: FactorTables,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Per-step axis legality: ``(i_mask_diag, i_mask_compress, j_mask_for_i_diag)``.
+    pair_valid: jax.Array | None = None,
+    compress_valid: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Per-step axis legality.
 
-    ``j_mask_for_i_diag[i]`` is the legal ``j`` set when DIAG is chosen
-    with that particular ``i``; it's ``i_mask_diag`` with the ``i``-th
-    slot zeroed so the bipartite ``i != j`` constraint is enforced,
-    AND where the GCD of their sizes is strictly greater than 1.
+    Returns ``(i_mask_diag, i_mask_compress, j_mask_for_i_diag, i_coupled)``.
+
+    ``j_mask_for_i_diag[i]`` is the legal ``j`` set when DIAG is chosen with
+    that ``i``; it enforces ``i != j`` and the block-structure pairing rules: a
+    coupled ``i`` forces ``j == partner(i)`` (its row is a single one-hot), a
+    free ``i`` may only pair with another free axis. ``i_coupled[i]`` is 1.0 iff
+    axis ``i`` already has a DIAG partner.
+
+    Structural pairing lives here; the out/primal split and the factor-space
+    (gcd) tightening are delegated to the env's ``pair_valid`` (see
+    :func:`~alphagrad.approx.common.masks.diag_valid_mask`), AND-ed in by
+    :func:`_finalise_axis_masks`. When ``pair_valid`` is ``None`` this falls
+    back to the (unsound-for-out/primal) tag-bit-only proxy.
     """
     is_compressed = features.tag_bits[:, TAG_IS_COMPRESSED] > 0.5
     in_diag = features.tag_bits[:, TAG_IN_DIAG_GROUP] > 0.5
     valid = features.valid_mask > 0.5
 
-    diag_eligible = (valid & ~is_compressed & ~in_diag).astype(jnp.float32)
     compress_eligible = (valid & ~is_compressed).astype(jnp.float32)
-
-    N = diag_eligible.shape[0]
+    N = valid.shape[0]
     eye = jnp.eye(N, dtype=jnp.float32)
-    j_mask_for_i = diag_eligible[None, :] * (1.0 - eye)
-    
-    # Mask out j options where GCD(size_i, size_j) == 1
-    size = features.size
-    gcd_matrix = tables.gcd[size[:, None], size[None, :]]
-    gcd_mask = (gcd_matrix > 1).astype(jnp.float32)
-    j_mask_for_i = j_mask_for_i * gcd_mask
 
-    return diag_eligible, compress_eligible, j_mask_for_i
+    # Rule #2: coupled-vs-free pairing.
+    partner = _compute_partner(features)               # (N,) int32, -1 = free
+    i_coupled = (partner >= 0).astype(jnp.float32)     # (N,)
+
+    free = (valid & ~is_compressed & ~in_diag)         # uncoupled, DIAG-able
+    free_f = free.astype(jnp.float32)
+
+    # i may DIAG if it is free (needs another free partner) OR already coupled
+    # (re-diagonalise, forced partner + subdivide).
+    diag_i_eligible = (free | (partner >= 0)).astype(jnp.float32)
+
+    # j-mask when i is FREE: only other free axes. When i is COUPLED: the single
+    # forced partner (one-hot).
+    j_free = free_f[None, :] * (1.0 - eye)             # (N, N)
+    partner_clip = jnp.clip(partner, 0, N - 1)
+    partner_onehot = jnn.one_hot(partner_clip, N, dtype=jnp.float32)  # (N, N)
+    partner_onehot = partner_onehot * i_coupled[:, None]
+
+    j_mask_for_i = jnp.where(
+        i_coupled[:, None] > 0.5, partner_onehot, j_free,
+    )
+    return _finalise_axis_masks(diag_i_eligible, compress_eligible,
+                                j_mask_for_i, i_coupled, pair_valid,
+                                compress_valid)
 
 
 # ---------------------------------------------------------------------------
@@ -1029,6 +1105,17 @@ class MicroActionHead(eqx.Module):
         op_dist = self.op_head(summary, op_legality_mask)
         log_p_op = jnp.log(op_dist[action.op_type] + 1e-8)
         ent_op = -jnp.sum(op_dist * jnp.log(op_dist + 1e-8))
+        # Head-skipping (the ≥2-options rule): a head contributes to the joint
+        # log-prob, entropy AND arity only when it faced a real choice — its
+        # legality mask left ≥ 2 options. A head with exactly 1 legal option is
+        # FORCED (its masked softmax is a point mass carrying no information and
+        # no gradient); one with 0 is empty. Both are skipped, both here and —
+        # identically — at sample time, so the PPO ratio stays consistent. This
+        # subsumes the coupled-`i` → forced-`j` case (a coupled `i` has a
+        # one-hot `j` mask → skip) and yields the "only one legal dtype → forced
+        # QUANT" skip for free. `op` is gated the same way: when only END is
+        # legal (exact / ve_only mode) the op head carries no decision.
+        op_active = (jnp.sum(op_legality_mask > 0.5) >= 2).astype(jnp.float32)
 
         is_diag = action.op_type == OP_DIAG
         is_compress = action.op_type == OP_COMPRESS
@@ -1039,15 +1126,18 @@ class MicroActionHead(eqx.Module):
         i_dist = self.axis_i_head(summary, axis_tokens, i_mask)
         log_p_i = jnp.log(i_dist[action.i] + 1e-8)
         ent_i = -jnp.sum(i_dist * jnp.log(i_dist + 1e-8))
-        i_active = (is_diag | is_compress).astype(jnp.float32)
+        i_has_choice = (jnp.sum(i_mask > 0.5) >= 2).astype(jnp.float32)
+        i_active = (is_diag | is_compress).astype(jnp.float32) * i_has_choice
 
-        # j: emitted only for DIAG.
+        # j: emitted only for DIAG, and only when >1 partner is legal (a coupled
+        # or lone-partner `i` forces `j`, so the j-head is skipped).
         j_mask = j_mask_for_i_diag[action.i]
         j_context = summary + axis_tokens[action.i]
         j_dist = self.axis_j_head(j_context, axis_tokens, j_mask)
         log_p_j = jnp.log(j_dist[action.j] + 1e-8)
         ent_j = -jnp.sum(j_dist * jnp.log(j_dist + 1e-8))
-        j_active = is_diag.astype(jnp.float32)
+        j_has_choice = (jnp.sum(j_mask > 0.5) >= 2).astype(jnp.float32)
+        j_active = is_diag.astype(jnp.float32) * j_has_choice
 
         # Prime exponents: emitted only for DIAG. Tables gathered at the
         # stored (i, j); for non-DIAG actions the gather still runs but
@@ -1079,29 +1169,32 @@ class MicroActionHead(eqx.Module):
         quant_dist = self.quant_dtype_head(summary, quant_legality_mask)
         log_p_quant = jnp.log(quant_dist[action.quant_dtype] + 1e-8)
         ent_quant = -jnp.sum(quant_dist * jnp.log(quant_dist + 1e-8))
-        quant_active = is_quant.astype(jnp.float32)
+        quant_has_choice = (
+            jnp.sum(quant_legality_mask > 0.5) >= 2).astype(jnp.float32)
+        quant_active = is_quant.astype(jnp.float32) * quant_has_choice
 
         log_p = (
-            log_p_op + log_p_i * i_active + log_p_j * j_active
+            log_p_op * op_active + log_p_i * i_active + log_p_j * j_active
             + log_p_f * f_active + log_p_kind * kind_active
             + log_p_quant * quant_active
         )
         entropy = (
-            ent_op + ent_i * i_active + ent_j * j_active
+            ent_op * op_active + ent_i * i_active + ent_j * j_active
             + ent_f * f_active + ent_kind * kind_active
             + ent_quant * quant_active
         )
 
-        # Arity counts the *components* actually emitted: 1 (op_type) + i +
-        # j + the prime sub-loop + compress_kind + quant_dtype. The prime
-        # sub-loop's contribution scales with the number of real primes in g;
-        # we use ``prime_mask.sum()`` so DIAG sub-steps with more primes count
-        # for more (matching the entropy term that already weights by
-        # prime_mask). COMPRESS adds 1 for the kind categorical; QUANT adds
-        # 1 for the dtype categorical.
+        # Arity counts the *components* actually emitted, under the SAME
+        # ≥2-options gate: a forced op / i / j / quant carried no decision, so
+        # it must not inflate the entropy-normalisation denominator. The prime
+        # sub-loop self-gates via ``prime_mask`` (padded primes = 1 option =
+        # skipped), so ``prime_arity`` already counts only real primes. In fully
+        # forced steps (e.g. exact mode: op → END) the arity is 0; the entropy
+        # loss guards that with ``max(sub_length, 1)`` downstream.
         prime_arity = jnp.sum(prime_mask) * f_active
         arity = (
-            1.0 + i_active + j_active + prime_arity + kind_active + quant_active
+            op_active + i_active + j_active + prime_arity
+            + kind_active + quant_active
         )
         return (
             log_p, entropy, arity,
@@ -1174,12 +1267,17 @@ class MicroActionPolicy(eqx.Module):
         quant_legality_mask: jax.Array,
         tables: FactorTables,
         cap: jax.Array,
+        pair_valid: jax.Array | None = None,
+        compress_valid: jax.Array | None = None,
     ):
         features, ended, next_gid, step_idx = carry
         key = step_input
 
         axis_tokens, summary = self.encoder(features, vertex_context)
-        op_legal = _compute_op_legality(features, quant_legality_mask, tables)
+        op_legal = _compute_op_legality(
+            features, pair_valid=pair_valid, compress_valid=compress_valid,
+            quant_legality_mask=quant_legality_mask,
+        )
         # Force END once the sub-episode has ended (sticky termination) or
         # the per-vertex hard cap (2 × num_axes) is reached — the latter is
         # a length bound, not a structural constraint.
@@ -1191,7 +1289,9 @@ class MicroActionPolicy(eqx.Module):
             jnp.array([0.0, 0.0, 0.0, 1.0], dtype=op_legal.dtype),
             op_legal,
         )
-        i_diag, i_compress, j_diag = _compute_axis_masks(features, tables)
+        i_diag, i_compress, j_diag, _coupled = _compute_axis_masks(
+            features, pair_valid=pair_valid, compress_valid=compress_valid,
+        )
 
         (
             action, factor, op_d, i_d, j_d, exp_d, kind_d, quant_d,
@@ -1253,9 +1353,11 @@ class MicroActionPolicy(eqx.Module):
         self,
         vertex_context: jax.Array,
         init_features: AxisTokenFeatures,
-        quant_legality_mask: jax.Array,
         tables: FactorTables,
         key,
+        pair_valid: jax.Array | None = None,
+        compress_valid: jax.Array | None = None,
+        quant_legality_mask: jax.Array | None = None,
     ):
         """Run the sub-episode autoregressively.
 
@@ -1263,7 +1365,19 @@ class MicroActionPolicy(eqx.Module):
         ``max_substeps``) plus the joint log-prob, entropy, and total
         emitted-component count (used by the PPO loss to normalize the
         entropy bonus across variable-arity sub-episodes).
+
+        ``pair_valid`` / ``compress_valid`` are the OPTIONAL exact per-edge
+        masks for this vertex, read off the live edges by
+        :class:`~alphagrad.approx.common.masks.LiveVertexMaskOracle`. Pass them
+        whenever available — the tag-bit reconstruction they override models the
+        vertex's nominal dense Jacobian, not the per-face contraction the
+        micro-action actually lands on. ``quant_legality_mask`` is the OPTIONAL
+        ``(NUM_QUANT_DTYPES,)`` dtype mask (defaults to all-valid = unmasked).
+        The SAME masks must be handed to :meth:`evaluate` or the PPO ratio is
+        not 1 at epoch 0.
         """
+        if quant_legality_mask is None:
+            quant_legality_mask = jnp.ones(NUM_QUANT_DTYPES, dtype=jnp.float32)
         keys = jrand.split(key, self.max_substeps)
         # Per-vertex hard cap: 2 × number of real axes. The scan runs
         # `max_substeps` iterations regardless (JAX-static shape); once
@@ -1280,7 +1394,10 @@ class MicroActionPolicy(eqx.Module):
         def step_fn(carry, k):
             return self._step_sample(
                 carry, k,
-                vertex_context=vertex_context, tables=tables, cap=cap,
+                vertex_context=vertex_context,
+                quant_legality_mask=quant_legality_mask,
+                tables=tables, cap=cap,
+                pair_valid=pair_valid, compress_valid=compress_valid,
             )
 
         (
@@ -1310,19 +1427,26 @@ class MicroActionPolicy(eqx.Module):
         quant_legality_mask: jax.Array,
         tables: FactorTables,
         cap: jax.Array,
+        pair_valid: jax.Array | None = None,
+        compress_valid: jax.Array | None = None,
     ):
         features, ended, next_gid, step_idx = carry
         action: MicroAction = step_input
 
         axis_tokens, summary = self.encoder(features, vertex_context)
-        op_legal = _compute_op_legality(features, quant_legality_mask, tables)
+        op_legal = _compute_op_legality(
+            features, pair_valid=pair_valid, compress_valid=compress_valid,
+            quant_legality_mask=quant_legality_mask,
+        )
         force_end = ended | (step_idx >= cap)
         op_legal = jnp.where(
             force_end,
             jnp.array([0.0, 0.0, 0.0, 1.0], dtype=op_legal.dtype),
             op_legal,
         )
-        i_diag, i_compress, j_diag = _compute_axis_masks(features, tables)
+        i_diag, i_compress, j_diag, _coupled = _compute_axis_masks(
+            features, pair_valid=pair_valid, compress_valid=compress_valid,
+        )
 
         (
             log_p, ent, arity,
@@ -1380,9 +1504,11 @@ class MicroActionPolicy(eqx.Module):
         self,
         vertex_context: jax.Array,
         init_features: AxisTokenFeatures,
-        quant_legality_mask: jax.Array,
         tables: FactorTables,
         actions: MicroAction,
+        pair_valid: jax.Array | None = None,
+        compress_valid: jax.Array | None = None,
+        quant_legality_mask: jax.Array | None = None,
     ):
         """Recompute joint log-prob / entropy / arity for a stored sequence,
         plus per-step distributions for KL tracking.
@@ -1395,7 +1521,13 @@ class MicroActionPolicy(eqx.Module):
         per-step distributions under the *current* policy, with shape
         ``(max_substeps, ...)``. Pair these with the stored old-policy
         dists in the trajectory to compute per-component KL.
+
+        ``pair_valid`` / ``compress_valid`` / ``quant_legality_mask`` MUST match
+        the masks passed to :meth:`sample` for this trajectory, or the PPO ratio
+        is not 1 at epoch 0.
         """
+        if quant_legality_mask is None:
+            quant_legality_mask = jnp.ones(NUM_QUANT_DTYPES, dtype=jnp.float32)
         cap = 2 * jnp.sum(init_features.valid_mask.astype(jnp.int32))
         init_carry = (
             init_features,
@@ -1407,10 +1539,11 @@ class MicroActionPolicy(eqx.Module):
         def step_fn(carry, action_step):
             return self._step_evaluate(
                 carry, action_step,
-                vertex_context=vertex_context, 
+                vertex_context=vertex_context,
                 quant_legality_mask=quant_legality_mask,
-                tables=tables, 
+                tables=tables,
                 cap=cap,
+                pair_valid=pair_valid, compress_valid=compress_valid,
             )
 
         (

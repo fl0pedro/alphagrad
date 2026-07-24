@@ -520,6 +520,21 @@ def compute_static_axis_state(jaxpr, total_v: int) -> tuple[np.ndarray, np.ndarr
 # graphax's per-vertex transform list — straightforward but not yet wired).
 
 
+def diag_row_to_pair(jaxpr, vertex: int, bi1: int, bi2: int) -> tuple[int, int]:
+    """``(i, j)`` the ``[bi1, bi2, factor]`` DIAG row addresses on ``vertex``.
+
+    The single place the wire format's out-relative / primal-relative split is
+    resolved back to the CONCATENATED ``out_dims + primal_dims`` numbering
+    :class:`graphax.sparse.micro_actions.Diag` uses. Shared by the rule-spec
+    translation and :class:`~alphagrad.approx.common.masks.LiveVertexMaskOracle`
+    (which decides whether that transform is legal), so the mask can never be
+    computed for a different pair than the one the env goes on to apply.
+    """
+    eqn = jaxpr.eqns[int(vertex) - 1]
+    out_len = len(eqn.outvars[0].aval.shape)
+    return int(bi1), out_len + int(bi2)
+
+
 def micro_actions_to_rule_specs(
     op_types,
     i_indices,
