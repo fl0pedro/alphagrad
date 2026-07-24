@@ -45,17 +45,6 @@ The micro-action sequence is mapped to graphax's
 :func:`micro_actions_from_policy_emissions` and applied with
 ``apply_micro_actions`` inside the env callback.
 
-Per-local-path (per-face) control
----------------------------------
-Everything above is PER VERTEX: its rules apply uniformly to every local
-path the elimination contracts. :class:`FacePathPolicy` (bottom of this
-module) is the per-PATH layer built on top — for each face graphax's
-``faces_of`` enumerates, it emits a SKIP decision and then, if the path is
-to be approximated, one micro-action for each of the three slots
-``lhs -> rhs -> res``, reusing the same head factorization. See the
-"Per-LOCAL-PATH (per-face) approximation" banner there, in particular the
-MIRROR INVARIANT note.
-
 This module is intentionally standalone: it does not import from
 ``ppo.py`` so it can be tested in isolation. The Agent class will need
 to be extended (separate change) to construct a :class:`MicroActionHead`
@@ -75,83 +64,8 @@ import jax.nn as jnn
 import jax.numpy as jnp
 import jax.random as jrand
 import numpy as np
-import os
 
 from graphax.sparse.micro_actions import NUM_QUANT_DTYPES, QUANT_DTYPES
-
-# When ALPHAGRAD_SUBSTEP_NO_END=1, END is illegal in the op-type head, so every
-# eliminated vertex emits exactly one real micro-action (with --max-substeps 1:
-# one of {DIAG, COMPRESS, QUANT} — "always quant, else one of the other two";
-# no exact/no-op vertices). Scoped via env var so the cmorl/mogfn stacks (which
-# share heads.py) keep END legal by default.
-# IMPORTANT: these two policy switches are read LAZILY (first use, at jit-trace
-# time) — NOT at module import. In a Ray PPOActor the ALPHAGRAD_* env vars are
-# delivered via runtime_env / set by init_worker AFTER this module is already
-# imported, so an import-time read saw stock env and silently no-op'd (the bug
-# that left the policy sampling all 28 quant dtypes + END enabled). Reading at
-# first __call__ guarantees the actor's env is in place. Cached after first read.
-_SUBSTEP_NO_END_CACHE = None
-
-
-def _substep_no_end() -> bool:
-    """ALPHAGRAD_SUBSTEP_NO_END=1 -> END illegal in the op-type head (every
-    vertex emits exactly one real micro-action). Read lazily; see note above."""
-    global _SUBSTEP_NO_END_CACHE
-    if _SUBSTEP_NO_END_CACHE is None:
-        _SUBSTEP_NO_END_CACHE = (
-            os.environ.get("ALPHAGRAD_SUBSTEP_NO_END", "0") == "1"
-        )
-    return _SUBSTEP_NO_END_CACHE
-
-
-# Restrict the QUANT dtype head to a configurable subset. ALPHAGRAD_QUANT_ALLOWED
-# is a comma-list of QUANT_DTYPES names; disallowed dtypes are masked to -inf
-# before the softmax (in sample AND log_prob, so PPO ratios stay consistent).
-# Default (unset) = all dtypes legal. Used to drop dtypes JAX can't promote/cast
-# (sub-byte int2/4, uint2/4, float4, exotic float8 *fnuz/e3m4/e8m0, complex) and
-# no-op/unscaled ones (float32/64, plain int*) that otherwise crash or waste the
-# forced per-vertex QUANT under the substeps=1 scheme. Read lazily (see note).
-_QUANT_DTYPE_MASK_CACHE = None
-
-
-def _quant_dtype_mask():
-    """(NUM_QUANT_DTYPES,) float32 mask, 1.0 for allowed dtypes. Lazy; cached.
-
-    Cached as NUMPY, not jnp: a jnp constant materialised during the FIRST
-    jit trace (e.g. the rollout act_step) is a DynamicJaxprTracer of that
-    trace — caching it and reusing it inside a LATER trace (the loss) raises
-    UnexpectedTracerError. A numpy array is a fresh constant in every trace.
-    """
-    global _QUANT_DTYPE_MASK_CACHE
-    if _QUANT_DTYPE_MASK_CACHE is None:
-        _env = os.environ.get("ALPHAGRAD_QUANT_ALLOWED", "").strip()
-        if _env:
-            _allowed = {s.strip() for s in _env.split(",") if s.strip()}
-            _QUANT_DTYPE_MASK_CACHE = np.array(
-                [1.0 if d in _allowed else 0.0 for d in QUANT_DTYPES],
-                dtype=np.float32,
-            )
-        else:
-            _QUANT_DTYPE_MASK_CACHE = np.ones(NUM_QUANT_DTYPES, dtype=np.float32)
-    return _QUANT_DTYPE_MASK_CACHE
-
-
-# The DIAG axis-pair heads ALWAYS enforce the two block-diagonal legality rules
-# (mirrored on the graphax execution side, whose GRAPHAX_KEEP_BLOCKDIAG is
-# likewise on by default):
-#   (1) FACTOR-DIVIDES-BLOCK: a further DIAG on an already-diagonalised axis may
-#       only SUBDIVIDE its current block size -- the factor must be a multiple of
-#       the current meta count that still divides both logical sizes. See
-#       common.masks.diag_pair_factor_space, which returns exactly that space.
-#   (2) AXIS-PAIR CONFLICT: an already-coupled axis i forces j == partner(i)
-#       (j-head fast-skipped, its log-prob/entropy gated out of the PPO ratio);
-#       a free axis i may only pair with another free axis.
-# These were once behind ALPHAGRAD_MICRO_PAIR_MASKS, defaulting OFF, which meant
-# the shipped default silently disagreed with the executor: coupled axes were
-# excluded from DIAG entirely, so re-diagonalisation -- which graphax supports
-# out of the box -- was unreachable, and i_coupled was pinned to zero so the
-# j-head contributed log-prob for a choice it never really had. There is no
-# reason to run without the rules the executor enforces, so the flag is gone.
 
 
 # ---------------------------------------------------------------------------
@@ -581,11 +495,21 @@ class PrimeExponentHead(eqx.Module):
         log_Nj = jnp.log(jnp.maximum(N_j.astype(jnp.float32), 1.0))
         keys = jrand.split(key, MAX_PRIMES)
 
+        is_available = max_exps > 0
+        last_avail_idx = jnp.max(jnp.where(is_available, jnp.arange(MAX_PRIMES), -1))
+        is_last_available_prime = (jnp.arange(MAX_PRIMES) == last_avail_idx)
+
         def step(carry, inputs):
-            hidden, log_partial = carry
-            prime, max_exp, mask, k = inputs
+            hidden, log_partial, partial_factor = carry
+            prime, max_exp, mask, k, is_last = inputs
             new_hidden, logits = self._step_logits(
                 hidden, prime, max_exp, log_g, log_Ni, log_Nj, log_partial,
+            )
+            force_positive_exp = is_last & (partial_factor == 1) & (max_exp > 0)
+            logits = jnp.where(
+                force_positive_exp & (jnp.arange(self.max_exponent + 1) == 0),
+                -1e9,
+                logits
             )
             dist = jnn.softmax(logits, axis=-1)
             exponent = distrax.Categorical(probs=dist).sample(seed=k)
@@ -597,11 +521,13 @@ class PrimeExponentHead(eqx.Module):
             )
             new_log_partial = log_partial + log_inc * mask
             hidden_eff = jnp.where(mask > 0.5, new_hidden, hidden)
-            return (hidden_eff, new_log_partial), (exponent_eff, dist)
+            factor_inc = prime ** exponent_eff
+            new_partial_factor = partial_factor * factor_inc
+            return (hidden_eff, new_log_partial, new_partial_factor), (exponent_eff, dist)
 
-        init_carry = (init_hidden, jnp.array(0.0, dtype=jnp.float32))
+        init_carry = (init_hidden, jnp.array(0.0, dtype=jnp.float32), jnp.array(1, dtype=jnp.int32))
         _, (exponents, dists) = lax.scan(
-            step, init_carry, (primes, max_exps, prime_mask, keys),
+            step, init_carry, (primes, max_exps, prime_mask, keys, is_last_available_prime),
         )
         return exponents, dists
 
@@ -621,11 +547,21 @@ class PrimeExponentHead(eqx.Module):
         log_Ni = jnp.log(jnp.maximum(N_i.astype(jnp.float32), 1.0))
         log_Nj = jnp.log(jnp.maximum(N_j.astype(jnp.float32), 1.0))
 
+        is_available = max_exps > 0
+        last_avail_idx = jnp.max(jnp.where(is_available, jnp.arange(MAX_PRIMES), -1))
+        is_last_available_prime = (jnp.arange(MAX_PRIMES) == last_avail_idx)
+
         def step(carry, inputs):
-            hidden, log_partial = carry
-            prime, max_exp, mask, chosen = inputs
+            hidden, log_partial, partial_factor = carry
+            prime, max_exp, mask, chosen, is_last = inputs
             new_hidden, logits = self._step_logits(
                 hidden, prime, max_exp, log_g, log_Ni, log_Nj, log_partial,
+            )
+            force_positive_exp = is_last & (partial_factor == 1) & (max_exp > 0)
+            logits = jnp.where(
+                force_positive_exp & (jnp.arange(self.max_exponent + 1) == 0),
+                -1e9,
+                logits
             )
             dist = jnn.softmax(logits, axis=-1)
             log_p = jnp.log(dist[chosen] + 1e-8) * mask
@@ -636,12 +572,14 @@ class PrimeExponentHead(eqx.Module):
             )
             new_log_partial = log_partial + log_inc * mask
             hidden_eff = jnp.where(mask > 0.5, new_hidden, hidden)
-            return (hidden_eff, new_log_partial), (log_p, ent, dist)
+            factor_inc = prime ** chosen
+            new_partial_factor = partial_factor * factor_inc
+            return (hidden_eff, new_log_partial, new_partial_factor), (log_p, ent, dist)
 
-        init_carry = (init_hidden, jnp.array(0.0, dtype=jnp.float32))
+        init_carry = (init_hidden, jnp.array(0.0, dtype=jnp.float32), jnp.array(1, dtype=jnp.int32))
         _, (log_ps, ents, dists) = lax.scan(
             step, init_carry,
-            (primes, max_exps, prime_mask, chosen_exponents.astype(jnp.int32)),
+            (primes, max_exps, prime_mask, chosen_exponents.astype(jnp.int32), is_last_available_prime),
         )
         return jnp.sum(log_ps), jnp.sum(ents), dists
 
@@ -766,179 +704,64 @@ def _features_after_compress(
     )
 
 
-def _gate_repeat_ops(op_legal, structural_used, quant_used,
-                     pair_valid, compress_valid):
-    """One DIAG-or-COMPRESS and one QUANT per vertex, once exactly masked.
-
-    The live-edge masks (``pair_valid`` / ``compress_valid``) describe the
-    tensor as it stands BEFORE the sub-episode runs, and graphax applies a
-    vertex's rules IN SEQUENCE to that same edge -- so rule #2 lands on
-    whatever rule #1 produced. A Compress renumbers every physical axis below
-    it and turns one dim implicit, which is exactly how a second Compress ends
-    up out of range ("Compress.axes entry 2 out of range for val.ndim = 2" on
-    an edge whose first Compress already dropped an axis); a second Quant lands
-    on an already-narrowed ``val`` and trips ``TypePromotionError`` between two
-    incompatible 8-bit floats. Re-probing between sub-steps is impossible --
-    the choice is made inside a ``lax.scan``.
-
-    So when the caller supplies exact masks, the guarantee is made
-    unconditional at the op-type head: each bucket fires at most once per
-    vertex. END becomes legal as soon as one real op has landed -- that is the
-    entire invariant ``_substep_no_end`` protects ("always approximate") -- and
-    is the fallback if nothing else survives, so the op softmax is never handed
-    an all-illegal support. With ``max_substeps == 1`` (the production config)
-    this is a no-op, and without masks nothing changes at all.
-    """
-    if pair_valid is None and compress_valid is None:
-        return op_legal
-    dt = op_legal.dtype
-    s = structural_used.astype(dt)
-    q = quant_used.astype(dt)
-    gated = op_legal * jnp.stack([1.0 - s, 1.0 - s, 1.0 - q, jnp.ones((), dt)])
-    any_op = jnp.maximum(s, q)
-    gated = gated.at[OP_END].set(jnp.maximum(gated[OP_END], any_op))
-    end_only = jnp.array([0.0, 0.0, 0.0, 1.0], dtype=dt)
-    return jnp.where(jnp.sum(gated) > 0.0, gated, end_only)
-
-
 def _compute_op_legality(
     features: AxisTokenFeatures,
-    pair_valid: jax.Array | None = None,
-    compress_valid: jax.Array | None = None,
+    quant_legality_mask: jax.Array,
+    tables: FactorTables,
 ) -> jax.Array:
-    """Op-type legality (NUM_OPS,) — DIAG / COMPRESS / QUANT / END.
-
-    Derived from :func:`_compute_axis_masks` rather than recomputed, so an op
-    can never be advertised as legal while every concrete action under it is
-    masked out. This used to be recomputed with its own copy of the rules, and
-    the copy went stale: it kept the old ``& ~in_diag`` term, which declared
-    DIAG illegal precisely when only coupled axes remained -- exactly the case
-    re-diagonalisation exists to serve -- so the op mask would have vetoed the
-    action the axis masks had just made reachable.
-    """
-    _diag_i, compress_eligible, j_mask_for_i, _coupled = _compute_axis_masks(
-        features, pair_valid=pair_valid, compress_valid=compress_valid)
-
-    # DIAG is legal iff at least one (i, j) pair survives -- strictly sharper
-    # than "at least 2 eligible axes", which counted axes that could not
-    # actually pair with each other.
-    diag_legal = (jnp.sum(j_mask_for_i) > 0.0).astype(jnp.float32)
-    compress_legal = (jnp.sum(compress_eligible) > 0.0).astype(jnp.float32)
-    # QUANT is per-tensor, not per-axis — always legal at this layer. If the
-    # SparseTensor has ``val is None`` at apply time, ``apply_quant`` returns
-    # the tensor unchanged, so an emitted QUANT can't crash the env.
-    quant_legal = jnp.array(1.0, dtype=jnp.float32)
-    # END disabled under the substeps=1 "always-approximate" scheme: force one
-    # real op (DIAG/COMPRESS/QUANT) per vertex. QUANT is always legal so there
-    # is always >=1 legal op even when both structural ops are illegal.
-    end_legal = jnp.array(0.0 if _substep_no_end() else 1.0, dtype=jnp.float32)
-    return jnp.stack([diag_legal, compress_legal, quant_legal, end_legal])
-
-
-def _compute_partner(features: AxisTokenFeatures) -> jax.Array:
-    """Resolve, per axis, the index of its coupled DIAG partner (or -1).
-
-    Two axes are partners iff they share a non-negative ``group_id`` (the
-    id stamped by :func:`_features_after_diag` when they were block-
-    diagonalised together). For an axis ``i`` with ``group_id[i] >= 0``
-    the partner is the (unique) other valid axis ``k != i`` with
-    ``group_id[k] == group_id[i]``. Free / ungrouped / compressed axes get
-    partner ``-1``. Returned as ``(N,)`` int32.
-    """
-    gid = features.group_id
+    """Op-type legality (NUM_OPS,) — DIAG / COMPRESS / QUANT / END."""
+    is_compressed = features.tag_bits[:, TAG_IS_COMPRESSED] > 0.5
+    in_diag = features.tag_bits[:, TAG_IN_DIAG_GROUP] > 0.5
     valid = features.valid_mask > 0.5
-    grouped = (gid >= 0) & valid                       # (N,)
-    same_group = gid[:, None] == gid[None, :]          # (N, N)
-    N = gid.shape[0]
-    not_self = ~jnp.eye(N, dtype=jnp.bool_)
-    # Candidate partners for i: valid, grouped, same gid, not i itself.
-    cand = same_group & not_self & grouped[None, :] & grouped[:, None]
-    # First matching column index per row; -1 if none.
-    idx = jnp.arange(N)
-    has_partner = jnp.any(cand, axis=-1)
-    first = jnp.argmax(cand.astype(jnp.int32), axis=-1)
-    return jnp.where(has_partner, first, -1).astype(jnp.int32)
 
+    diag_eligible = valid & ~is_compressed & ~in_diag
+    compress_eligible = valid & ~is_compressed
 
-def _finalise_axis_masks(diag_i_eligible, compress_eligible, j_mask_for_i,
-                         i_coupled, pair_valid, compress_valid=None):
-    """Shared tail of :func:`_compute_axis_masks`."""
-    if pair_valid is not None:
-        j_mask_for_i = j_mask_for_i * pair_valid
-    if compress_valid is not None:
-        compress_eligible = compress_eligible * compress_valid
-    # An `i` whose entire j-row is masked would hand the j-head an all -1e9
-    # logit vector, whose softmax is UNIFORM over illegal axes -- so a
-    # perfectly legal-looking sample lands on an illegal pair. (This bites
-    # without pair_valid too: when exactly one axis is diag-eligible its own
-    # row is empty after the i != j term.) Such an `i` must not be selectable.
-    has_partner = (jnp.sum(j_mask_for_i, axis=-1) > 0.0).astype(jnp.float32)
-    return (diag_i_eligible * has_partner, compress_eligible, j_mask_for_i,
-            i_coupled)
+    # Valid DIAG requires at least two distinct axes with GCD > 1.
+    size = features.size
+    gcd_matrix = tables.gcd[size[:, None], size[None, :]]
+    N = diag_eligible.shape[0]
+    eye = jnp.eye(N, dtype=jnp.bool_)
+    valid_diag_pairs = diag_eligible[:, None] & diag_eligible[None, :] & ~eye & (gcd_matrix > 1)
+    diag_legal = (jnp.sum(valid_diag_pairs) > 0).astype(jnp.float32)
+    compress_legal = (jnp.sum(compress_eligible.astype(jnp.int32)) >= 1).astype(
+        jnp.float32
+    )
+    # QUANT is legal if there's at least one valid dtype available.
+    quant_legal = (jnp.sum(quant_legality_mask) > 0.5).astype(jnp.float32)
+    end_legal = jnp.array(1.0, dtype=jnp.float32)
+    return jnp.stack([diag_legal, compress_legal, quant_legal, end_legal])
 
 
 def _compute_axis_masks(
     features: AxisTokenFeatures,
-    pair_valid: jax.Array | None = None,
-    compress_valid: jax.Array | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Per-step axis legality.
-
-    Returns ``(i_mask_diag, i_mask_compress, j_mask_for_i_diag, i_coupled)``.
+    tables: FactorTables,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Per-step axis legality: ``(i_mask_diag, i_mask_compress, j_mask_for_i_diag)``.
 
     ``j_mask_for_i_diag[i]`` is the legal ``j`` set when DIAG is chosen
-    with that particular ``i``; it enforces ``i != j`` and the
-    block-structure pairing rules (rule #2): a coupled ``i`` forces ``j == partner(i)`` (its row is a
-    single one-hot), a free ``i`` may only pair with another free axis.
-    ``i_coupled[i]`` is 1.0 iff axis ``i`` already has a DIAG partner; the
-    head uses it to fast-skip (gate out) the j-head when ``i`` is coupled.
-
-    ``pair_valid`` is the OPTIONAL ``(N, N)`` per-edge legality mask computed
-    by the env from the actual SparseTensor
-    (:func:`alphagrad.approx.common.masks.diag_valid_mask`). The tag-bit
-    reconstruction here is a proxy: it can see ``is_compressed`` and
-    ``in_diag_group`` but NOT which side of the out/primal split an axis sits
-    on, and a Diag must tie one OUT axis to one PRIMAL axis. When the env
-    supplies ``pair_valid`` it is authoritative and is AND-ed in.
-
-    ``compress_valid`` is the matching ``(N,)`` mask from
-    :func:`~alphagrad.approx.common.masks.compress_valid_mask`. The tag bits
-    cannot see ``val`` at all, so they cannot tell that an edge carrying no
-    materialised ``val`` (a pure-structure Jacobian) has nothing to compress:
-    graphax accepts the Compress but it is a guaranteed no-op.
+    with that particular ``i``; it's ``i_mask_diag`` with the ``i``-th
+    slot zeroed so the bipartite ``i != j`` constraint is enforced,
+    AND where the GCD of their sizes is strictly greater than 1.
     """
     is_compressed = features.tag_bits[:, TAG_IS_COMPRESSED] > 0.5
     in_diag = features.tag_bits[:, TAG_IN_DIAG_GROUP] > 0.5
     valid = features.valid_mask > 0.5
 
+    diag_eligible = (valid & ~is_compressed & ~in_diag).astype(jnp.float32)
     compress_eligible = (valid & ~is_compressed).astype(jnp.float32)
-    N = valid.shape[0]
+
+    N = diag_eligible.shape[0]
     eye = jnp.eye(N, dtype=jnp.float32)
+    j_mask_for_i = diag_eligible[None, :] * (1.0 - eye)
+    
+    # Mask out j options where GCD(size_i, size_j) == 1
+    size = features.size
+    gcd_matrix = tables.gcd[size[:, None], size[None, :]]
+    gcd_mask = (gcd_matrix > 1).astype(jnp.float32)
+    j_mask_for_i = j_mask_for_i * gcd_mask
 
-    # --- Rule #2: coupled-vs-free pairing --------------------------------
-    partner = _compute_partner(features)               # (N,) int32, -1 = free
-    i_coupled = (partner >= 0).astype(jnp.float32)     # (N,)
-
-    free = (valid & ~is_compressed & ~in_diag)         # uncoupled, DIAG-able
-    free_f = free.astype(jnp.float32)
-
-    # i may DIAG if it is a free axis (needs another free partner) OR it is
-    # already coupled (re-diagonalise, forced partner + rule #1 subdivide).
-    diag_i_eligible = (free | (partner >= 0)).astype(jnp.float32)
-
-    # j-mask when i is FREE: only other free axes (never a coupled one).
-    j_free = free_f[None, :] * (1.0 - eye)             # (N, N)
-    # j-mask when i is COUPLED: the single forced partner (one-hot).
-    partner_clip = jnp.clip(partner, 0, N - 1)
-    partner_onehot = jnn.one_hot(partner_clip, N, dtype=jnp.float32)  # (N, N)
-    partner_onehot = partner_onehot * i_coupled[:, None]
-
-    j_mask_for_i = jnp.where(
-        i_coupled[:, None] > 0.5, partner_onehot, j_free,
-    )
-    return _finalise_axis_masks(diag_i_eligible, compress_eligible,
-                                j_mask_for_i, i_coupled, pair_valid,
-                                compress_valid)
+    return diag_eligible, compress_eligible, j_mask_for_i
 
 
 # ---------------------------------------------------------------------------
@@ -1018,12 +841,10 @@ class QuantDtypeHead(eqx.Module):
     def __init__(self, embd_dim: int, *, key):
         self.proj = eqx.nn.Linear(embd_dim, NUM_QUANT_DTYPES, key=key)
 
-    def __call__(self, summary: jax.Array) -> jax.Array:
+    def __call__(self, summary: jax.Array, quant_legality_mask: jax.Array) -> jax.Array:
         logits = self.proj(summary)
-        # Mask disallowed quant dtypes to -inf (see _QUANT_DTYPE_MASK); applied
-        # identically here for sampling and log-prob so PPO ratios are exact.
-        logits = jnp.where(_quant_dtype_mask() > 0.5, logits, -1e9)
-        return jnn.softmax(logits, axis=-1)
+        masked_logits = jnp.where(quant_legality_mask > 0.5, logits, -1e9)
+        return jnn.softmax(masked_logits, axis=-1)
 
 
 class MicroActionHead(eqx.Module):
@@ -1079,9 +900,9 @@ class MicroActionHead(eqx.Module):
         i_mask_diag: jax.Array,         # (N,) — valid `i` for DIAG
         i_mask_compress: jax.Array,     # (N,) — valid `i` for COMPRESS
         j_mask_for_i_diag: jax.Array,   # (N, N) — valid `j` given `i`, DIAG only
+        quant_legality_mask: jax.Array, # (NUM_QUANT_DTYPES,)
         tables: FactorTables,           # precomputed gcd / prime tables
         key,
-        i_coupled: jax.Array | None = None,  # (N,) — 1.0 if axis is coupled
     ):
         """Sample one micro-action.
 
@@ -1121,18 +942,6 @@ class MicroActionHead(eqx.Module):
         j_dist = self.axis_j_head(j_context, axis_tokens, j_mask)
         j_idx = distrax.Categorical(probs=j_dist).sample(seed=k_j)
 
-        # Rule #2 fast-skip: when the chosen `i` is already coupled, `j` is
-        # DETERMINISTIC — the forced partner. `j_mask` above is already the
-        # partner one-hot for a coupled `i`, so the sampled `j_idx` equals
-        # the partner regardless of the RNG; we still overwrite it with the
-        # explicit argmax so replay/telemetry is unambiguous. Its log-prob is
-        # gated out of the joint (see `log_prob_step`), so this head makes no
-        # PPO-ratio contribution for a coupled `i`.
-        if i_coupled is not None:
-            i_is_coupled = i_coupled[i_idx] > 0.5
-            forced_j = jnp.argmax(j_mask).astype(j_idx.dtype)
-            j_idx = jnp.where(i_is_coupled, forced_j, j_idx)
-
         # Per-pair prime-table gather. `axis_sizes` carries the current
         # logical sizes; `tables.gcd[N_i, N_j]` resolves the gcd at trace
         # time without a JAX-side trial division.
@@ -1167,7 +976,7 @@ class MicroActionHead(eqx.Module):
         # Quant-dtype head: categorical over the JAX dtype catalog. Per-tensor
         # (no axis-token conditioning). Run unconditionally and mask out the
         # contribution for non-QUANT steps in log_prob_step.
-        quant_dist = self.quant_dtype_head(summary)
+        quant_dist = self.quant_dtype_head(summary, quant_legality_mask)
         quant_idx = distrax.Categorical(probs=quant_dist).sample(seed=k_quant)
 
         # Force i/j/exponents/kind/quant to canonical values for non-emitting
@@ -1200,8 +1009,8 @@ class MicroActionHead(eqx.Module):
         i_mask_diag: jax.Array,
         i_mask_compress: jax.Array,
         j_mask_for_i_diag: jax.Array,
+        quant_legality_mask: jax.Array,
         tables: FactorTables,
-        i_coupled: jax.Array | None = None,  # (N,) — 1.0 if axis is coupled
     ):
         """Joint log-prob + entropy + arity for one sub-step, plus the
         per-component distributions used downstream for KL tracking.
@@ -1232,21 +1041,13 @@ class MicroActionHead(eqx.Module):
         ent_i = -jnp.sum(i_dist * jnp.log(i_dist + 1e-8))
         i_active = (is_diag | is_compress).astype(jnp.float32)
 
-        # j: emitted only for DIAG. Under rule #2 the j-head is FAST-SKIPPED
-        # (gated out of the joint log-prob AND entropy) when the chosen `i`
-        # is already coupled — its `j` is the deterministic forced partner,
-        # so it must not contribute to the PPO ratio, exactly like the other
-        # inactive heads. `j_active` drops to 0 in that case.
+        # j: emitted only for DIAG.
         j_mask = j_mask_for_i_diag[action.i]
         j_context = summary + axis_tokens[action.i]
         j_dist = self.axis_j_head(j_context, axis_tokens, j_mask)
         log_p_j = jnp.log(j_dist[action.j] + 1e-8)
         ent_j = -jnp.sum(j_dist * jnp.log(j_dist + 1e-8))
-        if i_coupled is not None:
-            j_free = 1.0 - (i_coupled[action.i] > 0.5).astype(jnp.float32)
-        else:
-            j_free = 1.0
-        j_active = is_diag.astype(jnp.float32) * j_free
+        j_active = is_diag.astype(jnp.float32)
 
         # Prime exponents: emitted only for DIAG. Tables gathered at the
         # stored (i, j); for non-DIAG actions the gather still runs but
@@ -1275,7 +1076,7 @@ class MicroActionHead(eqx.Module):
 
         # Quant-dtype: emitted only for QUANT. Per-tensor; no axis-token
         # conditioning at sample time, so none here either.
-        quant_dist = self.quant_dtype_head(summary)
+        quant_dist = self.quant_dtype_head(summary, quant_legality_mask)
         log_p_quant = jnp.log(quant_dist[action.quant_dtype] + 1e-8)
         ent_quant = -jnp.sum(quant_dist * jnp.log(quant_dist + 1e-8))
         quant_active = is_quant.astype(jnp.float32)
@@ -1370,20 +1171,15 @@ class MicroActionPolicy(eqx.Module):
         step_input,
         *,
         vertex_context: jax.Array,
+        quant_legality_mask: jax.Array,
         tables: FactorTables,
         cap: jax.Array,
-        pair_valid=None,
-        compress_valid=None,
     ):
-        features, ended, next_gid, step_idx, structural_used, quant_used = carry
+        features, ended, next_gid, step_idx = carry
         key = step_input
 
         axis_tokens, summary = self.encoder(features, vertex_context)
-        op_legal = _compute_op_legality(
-            features, pair_valid=pair_valid, compress_valid=compress_valid)
-        op_legal = _gate_repeat_ops(
-            op_legal, structural_used, quant_used,
-            pair_valid, compress_valid)
+        op_legal = _compute_op_legality(features, quant_legality_mask, tables)
         # Force END once the sub-episode has ended (sticky termination) or
         # the per-vertex hard cap (2 × num_axes) is reached — the latter is
         # a length bound, not a structural constraint.
@@ -1395,15 +1191,14 @@ class MicroActionPolicy(eqx.Module):
             jnp.array([0.0, 0.0, 0.0, 1.0], dtype=op_legal.dtype),
             op_legal,
         )
-        i_diag, i_compress, j_diag, i_coupled = _compute_axis_masks(
-            features, pair_valid=pair_valid, compress_valid=compress_valid)
+        i_diag, i_compress, j_diag = _compute_axis_masks(features, tables)
 
         (
             action, factor, op_d, i_d, j_d, exp_d, kind_d, quant_d,
         ) = self.head.sample_step(
             summary, axis_tokens, features.size,
-            op_legal, i_diag, i_compress, j_diag,
-            tables, key, i_coupled=i_coupled,
+            op_legal, i_diag, i_compress, j_diag, quant_legality_mask,
+            tables, key,
         )
 
         # log_prob_step recomputes the dists internally but we discard
@@ -1412,8 +1207,7 @@ class MicroActionPolicy(eqx.Module):
         # is exactly what the trajectory needs.
         log_p, ent, arity, *_ = self.head.log_prob_step(
             action, summary, axis_tokens, features.size,
-            op_legal, i_diag, i_compress, j_diag, tables,
-            i_coupled=i_coupled,
+            op_legal, i_diag, i_compress, j_diag, quant_legality_mask, tables,
         )
         # Past-END contributions are zeroed so the joint log-prob /
         # entropy / arity reflect only the real sub-episode prefix.
@@ -1451,9 +1245,7 @@ class MicroActionPolicy(eqx.Module):
         new_ended = ended | (action.op_type == OP_END)
 
         return (
-            (new_features, new_ended, new_gid, step_idx + 1,
-             structural_used | is_diag | is_compress,
-             quant_used | ((action.op_type == OP_QUANT) & ~ended)),
+            (new_features, new_ended, new_gid, step_idx + 1),
             (action, log_p, ent, arity, op_d, i_d, j_d, exp_d, kind_d, quant_d),
         )
 
@@ -1461,10 +1253,9 @@ class MicroActionPolicy(eqx.Module):
         self,
         vertex_context: jax.Array,
         init_features: AxisTokenFeatures,
+        quant_legality_mask: jax.Array,
         tables: FactorTables,
         key,
-        pair_valid=None,
-        compress_valid=None,
     ):
         """Run the sub-episode autoregressively.
 
@@ -1472,16 +1263,6 @@ class MicroActionPolicy(eqx.Module):
         ``max_substeps``) plus the joint log-prob, entropy, and total
         emitted-component count (used by the PPO loss to normalize the
         entropy bonus across variable-arity sub-episodes).
-
-        ``pair_valid`` / ``compress_valid`` are the EXACT per-edge legality
-        masks for this vertex, read off the live edges by
-        :class:`~alphagrad.approx.common.masks.LiveVertexMaskOracle`. Pass them
-        whenever they are available: the tag-bit reconstruction they override
-        models the vertex's nominal dense Jacobian, and the tensor the
-        micro-action actually lands on is the per-face contraction, whose
-        rank / sizes / diagonal pairings are generally different. ``None``
-        keeps the (unsound) tag-bit-only behaviour. The SAME masks must be
-        handed to :meth:`evaluate` or the PPO ratio is not 1 at epoch 0.
         """
         keys = jrand.split(key, self.max_substeps)
         # Per-vertex hard cap: 2 × number of real axes. The scan runs
@@ -1494,15 +1275,12 @@ class MicroActionPolicy(eqx.Module):
             jnp.array(False, dtype=jnp.bool_),
             jnp.array(0, dtype=jnp.int32),
             jnp.array(0, dtype=jnp.int32),
-            jnp.array(False, dtype=jnp.bool_),
-            jnp.array(False, dtype=jnp.bool_),
         )
 
         def step_fn(carry, k):
             return self._step_sample(
                 carry, k,
                 vertex_context=vertex_context, tables=tables, cap=cap,
-                pair_valid=pair_valid, compress_valid=compress_valid,
             )
 
         (
@@ -1529,36 +1307,29 @@ class MicroActionPolicy(eqx.Module):
         step_input,
         *,
         vertex_context: jax.Array,
+        quant_legality_mask: jax.Array,
         tables: FactorTables,
         cap: jax.Array,
-        pair_valid=None,
-        compress_valid=None,
     ):
-        features, ended, next_gid, step_idx, structural_used, quant_used = carry
+        features, ended, next_gid, step_idx = carry
         action: MicroAction = step_input
 
         axis_tokens, summary = self.encoder(features, vertex_context)
-        op_legal = _compute_op_legality(
-            features, pair_valid=pair_valid, compress_valid=compress_valid)
-        op_legal = _gate_repeat_ops(
-            op_legal, structural_used, quant_used,
-            pair_valid, compress_valid)
+        op_legal = _compute_op_legality(features, quant_legality_mask, tables)
         force_end = ended | (step_idx >= cap)
         op_legal = jnp.where(
             force_end,
             jnp.array([0.0, 0.0, 0.0, 1.0], dtype=op_legal.dtype),
             op_legal,
         )
-        i_diag, i_compress, j_diag, i_coupled = _compute_axis_masks(
-            features, pair_valid=pair_valid, compress_valid=compress_valid)
+        i_diag, i_compress, j_diag = _compute_axis_masks(features, tables)
 
         (
             log_p, ent, arity,
             op_dist, i_dist, j_dist, exp_dists, kind_dist, quant_dist,
         ) = self.head.log_prob_step(
             action, summary, axis_tokens, features.size,
-            op_legal, i_diag, i_compress, j_diag, tables,
-            i_coupled=i_coupled,
+            op_legal, i_diag, i_compress, j_diag, quant_legality_mask, tables,
         )
         active = (1.0 - ended.astype(jnp.float32))
         log_p = log_p * active
@@ -1598,9 +1369,7 @@ class MicroActionPolicy(eqx.Module):
         new_ended = ended | (action.op_type == OP_END)
 
         return (
-            (new_features, new_ended, new_gid, step_idx + 1,
-             structural_used | is_diag | is_compress,
-             quant_used | ((action.op_type == OP_QUANT) & ~ended)),
+            (new_features, new_ended, new_gid, step_idx + 1),
             (
                 log_p, ent, arity,
                 op_dist, i_dist, j_dist, exp_dists, kind_dist, quant_dist,
@@ -1611,10 +1380,9 @@ class MicroActionPolicy(eqx.Module):
         self,
         vertex_context: jax.Array,
         init_features: AxisTokenFeatures,
+        quant_legality_mask: jax.Array,
         tables: FactorTables,
         actions: MicroAction,
-        pair_valid=None,
-        compress_valid=None,
     ):
         """Recompute joint log-prob / entropy / arity for a stored sequence,
         plus per-step distributions for KL tracking.
@@ -1627,9 +1395,6 @@ class MicroActionPolicy(eqx.Module):
         per-step distributions under the *current* policy, with shape
         ``(max_substeps, ...)``. Pair these with the stored old-policy
         dists in the trajectory to compute per-component KL.
-
-        ``pair_valid`` / ``compress_valid`` MUST be the masks the rollout
-        sampled under (buffer them alongside the action) — see :meth:`sample`.
         """
         cap = 2 * jnp.sum(init_features.valid_mask.astype(jnp.int32))
         init_carry = (
@@ -1637,15 +1402,15 @@ class MicroActionPolicy(eqx.Module):
             jnp.array(False, dtype=jnp.bool_),
             jnp.array(0, dtype=jnp.int32),
             jnp.array(0, dtype=jnp.int32),
-            jnp.array(False, dtype=jnp.bool_),
-            jnp.array(False, dtype=jnp.bool_),
         )
 
         def step_fn(carry, action_step):
             return self._step_evaluate(
                 carry, action_step,
-                vertex_context=vertex_context, tables=tables, cap=cap,
-                pair_valid=pair_valid, compress_valid=compress_valid,
+                vertex_context=vertex_context, 
+                quant_legality_mask=quant_legality_mask,
+                tables=tables, 
+                cap=cap,
             )
 
         (
@@ -1659,499 +1424,6 @@ class MicroActionPolicy(eqx.Module):
             jnp.sum(logps), jnp.sum(ents), jnp.sum(arities),
             op_dists, i_dists, j_dists, exp_dists, kind_dists, quant_dists,
         )
-
-
-# ---------------------------------------------------------------------------
-# Per-LOCAL-PATH (per-face) approximation
-# ---------------------------------------------------------------------------
-#
-# A vertex elimination contracts one FACE (local path) per
-# ``in_edge -> central_var -> out_edge`` triple. The per-vertex micro-action
-# sub-episode above applies its rules UNIFORMLY to every face of the vertex,
-# which is exactly what a policy that wants to approximate one path and leave
-# another exact cannot express.
-#
-# ``graphax.faces_of(graph, transpose_graph, vertex, jaxpr)`` returns the face
-# keys ``(vidx[in_edge], vidx[out_edge])`` in the order the elimination will
-# visit them, computable BEFORE the vertex is eliminated. The head group below
-# consumes that ordered list and emits, PER FACE:
-#
-#   1. a SKIP decision (2 logits). ``skip == FACE_SKIP`` -> the path stays
-#      EXACT: the env emits ``(None, None, None)`` for it and the three slot
-#      heads are masked out of the joint log-prob, the entropy AND the arity.
-#   2. otherwise three slot decisions in the order ``lhs -> rhs -> res``
-#      (the local path is ``res = op(lhs, rhs)``: ``lhs`` transforms the
-#      in-edge Jacobian, ``rhs`` the out-edge Jacobian, ``res`` the
-#      contraction result). Each slot is ONE micro-action emitted by the
-#      EXISTING :class:`MicroActionHead` — the deliberate
-#      OpType/AxisPointer/PrimeExponent/CompressKind/QuantDtype factorization
-#      is reused verbatim, not re-invented — and is autoregressive on the
-#      previous slot's decision via :func:`_slot_descriptor`.
-#
-# The face loop is STATICALLY UNROLLED to ``max_faces`` with no early
-# termination: faces past the real count are padding, flagged by
-# ``FaceFeatures.valid_mask``, and contribute zero to log-prob / entropy /
-# arity.
-#
-# MIRROR INVARIANT (the PPO ratio-correctness property)
-# -----------------------------------------------------
-# :meth:`FacePathPolicy.sample` and :meth:`FacePathPolicy.evaluate` are the
-# SAME code path — :meth:`FacePathPolicy._run` — parameterised by a PYTHON
-# bool ``sampling`` that is resolved at trace time. The masks, the gating, the
-# conditioning contexts and the emission order are therefore identical by
-# construction rather than by convention. Two further details make the two
-# paths agree to floating-point identity, not merely to within a tolerance:
-#
-#   * every decision is CANONICALIZED (pad face -> FACE_SKIP; skipped /
-#     padded slot -> the null OP_END micro-action) BEFORE its log-prob is
-#     computed, so sample time scores exactly the action that evaluate later
-#     reads back from the trajectory;
-#   * the autoregressive descriptor fed to the next slot is derived from that
-#     same canonical action, so the conditioning context cannot drift either.
-#
-# A mismatch here silently biases the PPO ratio — it is the exact bug class
-# that made the legacy path unusable — so any change to one branch MUST be a
-# change to the shared body, never to one side of the ``if sampling``.
-
-# Slots of one local path, in emission order. ``res = op(lhs, rhs)``.
-FACE_SLOT_LHS = 0
-FACE_SLOT_RHS = 1
-FACE_SLOT_RES = 2
-NUM_FACE_SLOTS = 3
-FACE_SLOT_NAMES: tuple[str, ...] = ("lhs", "rhs", "res")
-
-# SKIP head outcomes.
-FACE_APPROX = 0   # approximate this local path (the three slot heads fire)
-FACE_SKIP = 1     # leave this local path EXACT -> (None, None, None)
-NUM_FACE_DECISIONS = 2
-
-# Width of the per-face numeric feature block the env supplies. Layout (kept
-# in sync with ``alphagrad.approx.env.build_face_features``):
-#   0  log1p(#elements of the in-edge Jacobian)
-#   1  log1p(#elements of the out-edge Jacobian)
-#   2  in-edge ndim
-#   3  out-edge ndim
-#   4  log1p(#elements in  x  #elements out)  — contraction-cost proxy
-#   5  face position / max_faces              — the elimination visit order
-#   6  1.0 if the in-edge var is a jaxpr invar
-#   7  1.0 if the out-edge var is a jaxpr outvar
-FACE_FEAT_DIM = 8
-
-# Width of the autoregressive descriptor summarising one emitted slot.
-FACE_SLOT_DESC_DIM = NUM_OPS + NUM_COMPRESS_KINDS + NUM_QUANT_DTYPES + 3
-
-
-class FaceFeatures(NamedTuple):
-    """The vertex's enumerated local paths, padded to a static cap.
-
-    One row per face, in the order ``graphax.faces_of`` returns (which is the
-    order the elimination visits them). ``in_edge`` / ``out_edge`` carry the
-    stable var indices that form the graphax face key
-    ``(vidx[in_edge], vidx[out_edge])``; they are passed through the policy
-    untouched so the env can rebuild the ``face_transforms`` dict keys.
-    """
-
-    in_edge: jax.Array       # (F,) int32 — stable var index of the in-edge
-    out_edge: jax.Array      # (F,) int32 — stable var index of the out-edge
-    feats: jax.Array         # (F, FACE_FEAT_DIM) float32
-    valid_mask: jax.Array    # (F,) float32 — 1.0 for a real face, 0.0 for pad
-
-
-class FacePathAction(NamedTuple):
-    """One vertex's full per-local-path action.
-
-    ``skip`` is ``(F,)`` int32 over ``{FACE_APPROX, FACE_SKIP}``. ``slots``
-    is a :class:`MicroAction` whose every field carries a leading
-    ``(F, NUM_FACE_SLOTS)`` — one micro-action per (face, slot) pair, in the
-    order lhs, rhs, res. Slots of a skipped or padded face are canonicalized
-    to the null ``OP_END`` action.
-    """
-
-    skip: jax.Array          # (F,) int32
-    slots: MicroAction       # fields (F, NUM_FACE_SLOTS, ...)
-
-
-class FaceSkipHead(eqx.Module):
-    """Binary categorical: approximate this local path, or keep it EXACT.
-
-    Fires once per enumerated face, before the slot heads, conditioned on the
-    pooled axis-set summary (which already carries the encoder's vertex
-    context) plus the face's own embedded features. Padded faces are forced to
-    :data:`FACE_SKIP` and gated out of the joint entirely, so the head is left
-    unmasked — adding a mask here would be a second place for the sample and
-    evaluate paths to drift.
-    """
-
-    proj: eqx.nn.Linear
-
-    def __init__(self, embd_dim: int, *, key):
-        self.proj = eqx.nn.Linear(embd_dim, NUM_FACE_DECISIONS, key=key)
-
-    def __call__(self, context: jax.Array) -> jax.Array:
-        return jnn.softmax(self.proj(context), axis=-1)
-
-
-def _null_micro_action_like(action: MicroAction) -> MicroAction:
-    """The canonical "this slot emits nothing" micro-action.
-
-    ``op_type = OP_END`` (not 0 — that is ``OP_DIAG`` and would read as a real
-    approximation in a stored trajectory), every payload field zeroed. Under
-    ``ALPHAGRAD_SUBSTEP_NO_END`` END is an ILLEGAL op, so its masked
-    probability is ~0 and its log-prob ~``log(1e-8)`` — finite, and multiplied
-    by the zero gate in both the sample and the evaluate path, so it can
-    neither NaN nor leak into the PPO ratio.
-    """
-    return MicroAction(
-        op_type=jnp.full_like(action.op_type, OP_END),
-        i=jnp.zeros_like(action.i),
-        j=jnp.zeros_like(action.j),
-        exponents=jnp.zeros_like(action.exponents),
-        factor=jnp.zeros_like(action.factor),
-        compress_kind=jnp.zeros_like(action.compress_kind),
-        quant_dtype=jnp.zeros_like(action.quant_dtype),
-    )
-
-
-def _select_micro_action(
-    emit: jax.Array, action: MicroAction, null: MicroAction,
-) -> MicroAction:
-    """``action`` where ``emit`` else ``null``, field by field."""
-    return MicroAction(
-        *(jnp.where(emit, a, n) for a, n in zip(action, null))
-    )
-
-
-def _slot_descriptor(action: MicroAction, num_axes: int) -> jax.Array:
-    """``(FACE_SLOT_DESC_DIM,)`` summary of one emitted slot.
-
-    Feeds the NEXT slot's conditioning context so ``rhs`` sees what ``lhs``
-    did and ``res`` sees both. Derived from the CANONICAL action (post
-    skip/pad canonicalization) so the sample and evaluate paths build the
-    identical context. ``num_axes`` is static (the axis-token count), used
-    only to normalise the pointer indices into [0, 1].
-    """
-    denom = float(max(int(num_axes), 1))
-    scalars = jnp.stack([
-        jnp.log1p(jnp.maximum(action.factor, 0).astype(jnp.float32)),
-        action.i.astype(jnp.float32) / denom,
-        action.j.astype(jnp.float32) / denom,
-    ])
-    return jnp.concatenate([
-        jnn.one_hot(action.op_type, NUM_OPS, dtype=jnp.float32),
-        jnn.one_hot(action.compress_kind, NUM_COMPRESS_KINDS, dtype=jnp.float32),
-        jnn.one_hot(action.quant_dtype, NUM_QUANT_DTYPES, dtype=jnp.float32),
-        scalars,
-    ])
-
-
-class FacePathHead(eqx.Module):
-    """The per-face head group: SKIP + three autoregressive slot emitters.
-
-    Deliberately thin — it owns only the face/slot CONDITIONING (projecting
-    the face features, embedding the slot identity, projecting the previous
-    slot's descriptor) and the SKIP categorical. The actual approximation
-    choice for each of lhs / rhs / res is emitted by the shared
-    :class:`MicroActionHead`, so the prime-exponent trick and every legality
-    mask carry over unchanged.
-
-    One ``MicroActionHead`` is shared across the three slots rather than three
-    separate copies: the slots differ in WHICH tensor they transform, not in
-    the space of transforms available, and the slot embedding gives the shared
-    head that distinction with ``3 * embd_dim`` parameters instead of three
-    full head stacks.
-    """
-
-    face_proj: eqx.nn.Linear
-    slot_embedding: eqx.nn.Embedding
-    prev_proj: eqx.nn.Linear
-    skip_head: FaceSkipHead
-    micro: MicroActionHead
-
-    embd_dim: int = eqx.field(static=True)
-
-    def __init__(self, embd_dim: int, *, key):
-        self.embd_dim = embd_dim
-        keys = jrand.split(key, 5)
-        self.face_proj = eqx.nn.Linear(FACE_FEAT_DIM, embd_dim, key=keys[0])
-        self.slot_embedding = eqx.nn.Embedding(
-            NUM_FACE_SLOTS, embd_dim, key=keys[1],
-        )
-        self.prev_proj = eqx.nn.Linear(
-            FACE_SLOT_DESC_DIM, embd_dim, key=keys[2],
-        )
-        self.skip_head = FaceSkipHead(embd_dim, key=keys[3])
-        self.micro = MicroActionHead(embd_dim, key=keys[4])
-
-
-class FacePathPolicy(eqx.Module):
-    """Per-local-path policy over one vertex's faces.
-
-    Usage (env side, after the pointer net picked ``vertex``)::
-
-        keys  = graphax.faces_of(graph, tgraph, vertex, jaxpr)
-        feats = build_face_features(...)          # padded to max_faces
-        act, logp, ent, arity, *dists = policy.sample(
-            vertex_context, axis_features, feats, tables, key)
-        ft = build_face_transforms(keys, act)     # {face_key: (lhs, rhs, res)}
-        incr.eliminate(vertex, face_transforms=ft)
-
-    The axis-token encoder runs ONCE per vertex, outside the face loop: the
-    axis features do not evolve between faces (each face transforms a
-    DIFFERENT pair of edge Jacobians, not a single tensor being refined), so
-    a per-face re-encode of the same input would be pure cost. See the
-    module note on the per-path re-encode that is NOT done here.
-
-    Axis-index convention: the ``i`` / ``j`` a slot's micro-action emits are
-    PHYSICAL axis indices into that slot's edge SparseTensor, under the same
-    ``(out axes..., primal axes...)`` layout the per-vertex axis tokens
-    already use — so the env passes them straight through to
-    ``Diag(i, j, factor)`` / ``Compress(axes=(i,))`` with no remapping.
-    """
-
-    encoder: AxisSetEncoder
-    head: FacePathHead
-
-    max_faces: int = eqx.field(static=True)
-    embd_dim: int = eqx.field(static=True)
-
-    def __init__(
-        self, embd_dim: int, num_heads: int, max_faces: int,
-        num_encoder_layers: int = 1, max_groups: int = 16, *, key,
-        use_group_embedding: bool = False,
-    ):
-        self.embd_dim = embd_dim
-        self.max_faces = int(max_faces)
-        keys = jrand.split(key, 2)
-        self.encoder = AxisSetEncoder(
-            embd_dim, num_heads, num_layers=num_encoder_layers,
-            max_groups=max_groups, key=keys[0],
-            use_group_embedding=use_group_embedding,
-        )
-        self.head = FacePathHead(embd_dim, key=keys[1])
-
-    # -- one slot (lhs / rhs / res) of one face ---------------------------
-
-    def _slot_step(
-        self, carry, slot_input, *,
-        axis_tokens, summary, face_emb, features, masks, tables, emit,
-        sampling: bool,
-    ):
-        """One slot. ``sampling`` is a PYTHON bool — the branch is resolved at
-        trace time, so sampling and evaluation share every other line."""
-        prev_desc, slot_idx = carry
-        op_legal, i_diag, i_compress, j_diag, i_coupled = masks
-
-        ctx = (
-            summary
-            + face_emb
-            + self.head.slot_embedding(slot_idx)
-            + self.head.prev_proj(prev_desc)
-        )
-
-        if sampling:
-            sampled = self.head.micro.sample_step(
-                ctx, axis_tokens, features.size,
-                op_legal, i_diag, i_compress, j_diag,
-                tables, slot_input, i_coupled=i_coupled,
-            )[0]
-            # Canonicalize BEFORE scoring: a skipped / padded slot records the
-            # null action, and it is that action whose log-prob we accumulate,
-            # so evaluate (which reads the null back) scores the same thing.
-            action = _select_micro_action(
-                emit, sampled, _null_micro_action_like(sampled),
-            )
-        else:
-            action = slot_input
-
-        (
-            log_p, ent, arity,
-            op_dist, i_dist, j_dist, exp_dists, kind_dist, quant_dist,
-        ) = self.head.micro.log_prob_step(
-            action, ctx, axis_tokens, features.size,
-            op_legal, i_diag, i_compress, j_diag, tables,
-            i_coupled=i_coupled,
-        )
-
-        new_desc = _slot_descriptor(action, features.size.shape[0])
-        return (
-            (new_desc, slot_idx + 1),
-            (
-                action, log_p, ent, arity,
-                op_dist, i_dist, j_dist, exp_dists, kind_dist, quant_dist,
-            ),
-        )
-
-    # -- one face (SKIP + three slots) ------------------------------------
-
-    def _face_step(
-        self, carry, face_input, *,
-        axis_tokens, summary, features, masks, tables, sampling: bool,
-    ):
-        f_idx = carry
-        feat_row, valid, extra = face_input
-
-        face_emb = self.head.face_proj(feat_row)
-        skip_dist = self.head.skip_head(summary + face_emb)
-
-        if sampling:
-            k_skip, k_slots = jrand.split(extra)
-            sampled_skip = distrax.Categorical(probs=skip_dist).sample(
-                seed=k_skip,
-            ).astype(jnp.int32)
-            # A padded face is canonically SKIP, decided before scoring so the
-            # recorded action and its log-prob agree with evaluate's readback.
-            skip = jnp.where(
-                valid > 0.5, sampled_skip, jnp.int32(FACE_SKIP),
-            ).astype(jnp.int32)
-            slot_inputs = jrand.split(k_slots, NUM_FACE_SLOTS)
-        else:
-            skip = extra.skip.astype(jnp.int32)
-            slot_inputs = extra.slots
-
-        log_p_skip = jnp.log(skip_dist[skip] + 1e-8)
-        ent_skip = -jnp.sum(skip_dist * jnp.log(skip_dist + 1e-8))
-
-        # The slot heads fire iff this face is real AND the policy chose to
-        # approximate it. Same expression on both paths.
-        emit = (skip == FACE_APPROX) & (valid > 0.5)
-
-        def slot_fn(c, si):
-            return self._slot_step(
-                c, si,
-                axis_tokens=axis_tokens, summary=summary, face_emb=face_emb,
-                features=features, masks=masks, tables=tables, emit=emit,
-                sampling=sampling,
-            )
-
-        (
-            _,
-            (
-                slot_actions, slot_logps, slot_ents, slot_arities,
-                op_dists, i_dists, j_dists, exp_dists, kind_dists, quant_dists,
-            ),
-        ) = lax.scan(
-            slot_fn,
-            (jnp.zeros(FACE_SLOT_DESC_DIM, dtype=jnp.float32),
-             jnp.array(0, dtype=jnp.int32)),
-            slot_inputs,
-        )
-
-        face_active = (valid > 0.5).astype(jnp.float32)
-        emit_f = emit.astype(jnp.float32)
-
-        log_p = log_p_skip * face_active + jnp.sum(slot_logps) * emit_f
-        entropy = ent_skip * face_active + jnp.sum(slot_ents) * emit_f
-        # ARITY: the number of categoricals this face actually emitted. The
-        # SKIP decision counts 1 for every REAL face (it is emitted whether or
-        # not the path is then approximated); the three slots contribute their
-        # own arities — which already count op + i + j + one per real prime +
-        # kind + dtype — only when they fire. Without folding SKIP and the
-        # slots in here, a face that approximates would collect a larger
-        # entropy bonus than one that skips purely for emitting more
-        # categoricals, and a vertex with more local paths would out-earn a
-        # smaller one for the same reason.
-        arity = face_active + jnp.sum(slot_arities) * emit_f
-
-        action = FacePathAction(skip=skip, slots=slot_actions)
-        return (
-            f_idx + 1,
-            (
-                action, log_p, entropy, arity,
-                skip_dist, op_dists, i_dists, j_dists, exp_dists,
-                kind_dists, quant_dists,
-            ),
-        )
-
-    # -- shared driver -----------------------------------------------------
-
-    def _run(
-        self, vertex_context, features: AxisTokenFeatures,
-        face_features: FaceFeatures, tables: FactorTables,
-        *, key=None, actions: FacePathAction | None = None,
-    ):
-        """THE single implementation behind :meth:`sample` and
-        :meth:`evaluate`. See the module-level MIRROR INVARIANT note."""
-        sampling = actions is None
-        if sampling and key is None:
-            raise ValueError("sample() requires a PRNG key.")
-        if not sampling and key is not None:
-            raise ValueError("evaluate() must not be given a PRNG key.")
-        if face_features.valid_mask.shape[0] != self.max_faces:
-            raise ValueError(
-                f"face_features has {face_features.valid_mask.shape[0]} rows "
-                f"but this policy is built for max_faces={self.max_faces}; "
-                "the face loop is statically unrolled, so the caller must pad "
-                "to exactly that many rows."
-            )
-
-        # ONE encode per vertex — the axis features are constant across the
-        # face loop (see the class docstring / the re-encode caveat).
-        axis_tokens, summary = self.encoder(features, vertex_context)
-        masks = (
-            _compute_op_legality(features),
-            *_compute_axis_masks(features),
-        )
-
-        if sampling:
-            extra = jrand.split(key, self.max_faces)
-        else:
-            extra = actions
-        xs = (face_features.feats, face_features.valid_mask, extra)
-
-        def step_fn(carry, x):
-            return self._face_step(
-                carry, x,
-                axis_tokens=axis_tokens, summary=summary, features=features,
-                masks=masks, tables=tables, sampling=sampling,
-            )
-
-        _, out = lax.scan(step_fn, jnp.array(0, dtype=jnp.int32), xs)
-        (
-            face_actions, logps, ents, arities,
-            skip_dists, op_dists, i_dists, j_dists, exp_dists,
-            kind_dists, quant_dists,
-        ) = out
-        return (
-            face_actions,
-            jnp.sum(logps), jnp.sum(ents), jnp.sum(arities),
-            skip_dists, op_dists, i_dists, j_dists, exp_dists,
-            kind_dists, quant_dists,
-        )
-
-    def sample(
-        self, vertex_context, init_features: AxisTokenFeatures,
-        face_features: FaceFeatures, tables: FactorTables, key,
-    ):
-        """Emit a full per-local-path action for one vertex.
-
-        Returns ``(action, log_prob, entropy, arity, skip_dists, op_dists,
-        i_dists, j_dists, exp_dists, kind_dists, quant_dists)``. The dists are
-        the rollout-time ("old") policy snapshot for the PPO ratio / KL, with
-        a leading ``(max_faces,)`` and — for the slot heads — a second
-        ``(NUM_FACE_SLOTS,)``.
-        """
-        return self._run(
-            vertex_context, init_features, face_features, tables, key=key,
-        )
-
-    def evaluate(
-        self, vertex_context, init_features: AxisTokenFeatures,
-        face_features: FaceFeatures, tables: FactorTables,
-        actions: FacePathAction,
-    ):
-        """Re-score a stored :class:`FacePathAction` under the CURRENT policy.
-
-        Returns ``(log_prob, entropy, arity, skip_dists, op_dists, i_dists,
-        j_dists, exp_dists, kind_dists, quant_dists)`` — the same quantities
-        :meth:`sample` returns, minus the action. For an unchanged policy the
-        log-prob is bit-identical to the one ``sample`` returned; that
-        equality is what the PPO ratio is built on.
-        """
-        _, log_p, ent, arity, *dists = self._run(
-            vertex_context, init_features, face_features, tables,
-            actions=actions,
-        )
-        return (log_p, ent, arity, *dists)
 
 
 __all__ = [
@@ -2174,14 +1446,4 @@ __all__ = [
     "MicroActionPolicy",
     "factorize",
     "exponents_to_factor",
-    # per-local-path (per-face) approximation
-    "FACE_SLOT_LHS", "FACE_SLOT_RHS", "FACE_SLOT_RES",
-    "NUM_FACE_SLOTS", "FACE_SLOT_NAMES",
-    "FACE_APPROX", "FACE_SKIP", "NUM_FACE_DECISIONS",
-    "FACE_FEAT_DIM", "FACE_SLOT_DESC_DIM",
-    "FaceFeatures",
-    "FacePathAction",
-    "FaceSkipHead",
-    "FacePathHead",
-    "FacePathPolicy",
 ]
