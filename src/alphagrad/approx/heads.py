@@ -65,7 +65,8 @@ import jax.numpy as jnp
 import jax.random as jrand
 import numpy as np
 
-from graphax.sparse.micro_actions import NUM_QUANT_DTYPES, QUANT_DTYPES
+from graphax.sparse.micro_actions import (
+    NUM_QUANT_DTYPES, QUANT_DTYPES, quant_hardware_masks)
 
 
 # ---------------------------------------------------------------------------
@@ -1257,6 +1258,10 @@ class MicroActionPolicy(eqx.Module):
             use_group_embedding=use_group_embedding,
         )
         self.head = MicroActionHead(embd_dim, key=keys[1])
+        # Run the one-time hardware dtype scan now (eagerly, at build) so its
+        # jnp.dot probes never execute under a rollout trace; the memoized
+        # avail_mask then becomes the default quant legality everywhere.
+        quant_hardware_masks()
 
     def _step_sample(
         self,
@@ -1377,7 +1382,9 @@ class MicroActionPolicy(eqx.Module):
         not 1 at epoch 0.
         """
         if quant_legality_mask is None:
-            quant_legality_mask = jnp.ones(NUM_QUANT_DTYPES, dtype=jnp.float32)
+            # Scan-driven default: only dtypes this backend can store + contract
+            # (unsupported ones are masked out of the head, never selectable).
+            quant_legality_mask = quant_hardware_masks()[0]
         keys = jrand.split(key, self.max_substeps)
         # Per-vertex hard cap: 2 × number of real axes. The scan runs
         # `max_substeps` iterations regardless (JAX-static shape); once
@@ -1527,7 +1534,9 @@ class MicroActionPolicy(eqx.Module):
         is not 1 at epoch 0.
         """
         if quant_legality_mask is None:
-            quant_legality_mask = jnp.ones(NUM_QUANT_DTYPES, dtype=jnp.float32)
+            # Scan-driven default: only dtypes this backend can store + contract
+            # (unsupported ones are masked out of the head, never selectable).
+            quant_legality_mask = quant_hardware_masks()[0]
         cap = 2 * jnp.sum(init_features.valid_mask.astype(jnp.int32))
         init_carry = (
             init_features,
