@@ -262,6 +262,10 @@ class Trajectory(NamedTuple):
     micro_exp_dists: jax.Array  # (max_substeps, MAX_PRIMES, MAX_EXPONENT+1) float32
     micro_kind_dists: jax.Array  # (max_substeps, NUM_COMPRESS_KINDS) float32
     micro_quant_logp: jax.Array  # (max_substeps,) float32 — RAW factored-quant log-prob
+    # Live oracle DIAG/COMPRESS masks for the CHOSEN vertex, stored so the loss
+    # re-masks identically to the rollout (keeps the PPO ratio 1 at epoch 0).
+    micro_pair_valid: jax.Array  # (MAX_AXES_PER_VERTEX, MAX_AXES_PER_VERTEX) float32
+    micro_compress_valid: jax.Array  # (MAX_AXES_PER_VERTEX,) float32
     discount: jax.Array
     vertex_avail_mask: jax.Array
 
@@ -291,6 +295,8 @@ class TrainBatch(NamedTuple):
     old_micro_exp_dists: jax.Array
     old_micro_kind_dists: jax.Array
     old_micro_quant_logp: jax.Array  # (max_substeps,) RAW factored-quant log-prob
+    micro_pair_valid: jax.Array  # (MAX_AXES_PER_VERTEX, MAX_AXES_PER_VERTEX)
+    micro_compress_valid: jax.Array  # (MAX_AXES_PER_VERTEX,)
     estim_returns: jax.Array
     norm_adv: jax.Array
     vertex_avail_mask: jax.Array
@@ -1815,6 +1821,8 @@ class Agent(eqx.Module):
         cached_encoding=None,
         preference=None,
         vertex_temperature=None,
+        oracle_pair_all=None,     # (total_v+1, N, N) live per-vertex DIAG mask
+        oracle_comp_all=None,     # (total_v+1, N) live per-vertex COMPRESS mask
     ):
         """Same as :meth:`sample_action` but routes the rule head through
         :class:`MicroActionPolicy`. ``axis_state`` and ``axis_valid_mask``
@@ -1860,6 +1868,20 @@ class Agent(eqx.Module):
             axis_valid_mask[vertex_idx],
         )
 
+        # Live per-vertex DIAG/COMPRESS masks for the CHOSEN vertex (oracle rows
+        # are 1-based; vertex_idx is 0-based). These are the authoritative masks
+        # that keep the micro DIAG head from proposing a per-face-invalid pair;
+        # stored (v_pair/v_comp) so the loss re-masks identically -> ratio 1.
+        if oracle_pair_all is not None:
+            v_pair = oracle_pair_all[vertex_idx + 1]
+            v_comp = oracle_comp_all[vertex_idx + 1]
+            _sample_pair, _sample_comp = v_pair, v_comp
+        else:
+            _N = MAX_AXES_PER_VERTEX
+            v_pair = jnp.zeros((_N, _N), jnp.float32)
+            v_comp = jnp.zeros((_N,), jnp.float32)
+            _sample_pair, _sample_comp = None, None  # tag-bit fallback
+
         # The policy doesn't itself know about the override mask; we
         # wrap by zeroing COMPRESS legality on the features' tag_bits
         # *before* the encoder sees them. Simpler: apply the override
@@ -1896,6 +1918,8 @@ class Agent(eqx.Module):
             features,
             factor_tables,
             micro_key,
+            pair_valid=_sample_pair,
+            compress_valid=_sample_comp,
         )
 
         # Apply the op-legality override post-hoc to DIAG / COMPRESS /
@@ -1953,6 +1977,8 @@ class Agent(eqx.Module):
             exp_dists,
             kind_dists,
             quant_logp,
+            v_pair,
+            v_comp,
             value,
             v_context,
         )
@@ -1972,6 +1998,8 @@ class Agent(eqx.Module):
         residual_state=None,
         cached_encoding=None,
         preference=None,
+        pair_valid=None,       # stored live DIAG mask for the chosen vertex
+        compress_valid=None,   # stored live COMPRESS mask
     ):
         """Joint log-prob / entropy for a stored typed action sequence.
 
@@ -2022,13 +2050,15 @@ class Agent(eqx.Module):
             new_exp_dists,
             new_kind_dists,
             new_quant_logp,
-        # Masks must match sample_action_dynamic (None → tag-bit fallback,
+        # Masks MUST match sample_action_dynamic (the stored live oracle masks;
         # all-dtypes QUANT) or the PPO ratio is not 1 at epoch 0.
         ) = self.micro_action_policy.evaluate(
             v_context,
             features,
             factor_tables,
             actions,
+            pair_valid=pair_valid,
+            compress_valid=compress_valid,
         )
 
         total_log_p = log_p_vertex + log_p_sub
@@ -3595,6 +3625,44 @@ def main():
         terminal_rewards_only=args.terminal_rewards_only,
     )
 
+    # DIAG per-face masking. The dynamic policy's DIAG head must be masked by the
+    # LIVE per-vertex pair / compress validity — the nominal tag-bit mask admits
+    # per-face-invalid DIAGs and graphax then throws "TRANSFORM DID NOT FIT".
+    # ppo.py's rollout is jitted + vmapped, so we bridge to the host-side
+    # LiveVertexMaskOracle with a `pure_callback` that replays it (STRUCTURALLY,
+    # rules=()) from the elimination prefix each step and returns per-vertex
+    # masks. Cost is O(steps) replay per call; fine for the small vertex graphs.
+    from alphagrad.approx.common.masks import LiveVertexMaskOracle as _LVMO
+    _oracle_jaxpr = closed_jaxpr.jaxpr
+    _oracle_consts = list(closed_jaxpr.literals)
+    _oracle_args = list(xs)
+    _oracle_argnums = tuple(int(a) for a in argnums)
+    _oracle_N = MAX_AXES_PER_VERTEX
+    _oracle_total_v = len(_oracle_jaxpr.eqns)
+
+    def _oracle_masks_host(elim_order, step_count):
+        eo = np.asarray(elim_order).reshape(-1)
+        n = int(np.asarray(step_count))
+        o = _LVMO(_oracle_jaxpr, _oracle_consts, _oracle_args, _oracle_argnums,
+                  max_axes=_oracle_N)
+        for k in range(n):
+            try:
+                o.advance(int(eo[k]) + 1, rules=())  # vertex_idx is 0-based; oracle 1-based
+            except Exception:
+                break
+        pair, comp = o.masks()
+        return np.asarray(pair, np.float32), np.asarray(comp, np.float32)
+
+    def _oracle_masks(elim_order, step_count):
+        """(pair (total_v+1, N, N), comp (total_v+1, N)) for the current graph."""
+        return jax.pure_callback(
+            _oracle_masks_host,
+            (jax.ShapeDtypeStruct((_oracle_total_v + 1, _oracle_N, _oracle_N),
+                                  jnp.float32),
+             jax.ShapeDtypeStruct((_oracle_total_v + 1, _oracle_N), jnp.float32)),
+            elim_order, step_count, vmap_method="sequential",
+        )
+
     total_v = len(closed_jaxpr.jaxpr.eqns)
     num_valid = len(env.valid_vertices)
     print(
@@ -3899,13 +3967,17 @@ def main():
         _dyn_zero_quant_logp = jnp.zeros((args.max_substeps,), dtype=jnp.float32)
 
         def step_fn(carry, k):
-            state, residual_state = carry
+            state, residual_state, elim_order = carry
             sample_key, next_net_key = jrand.split(k, 2)
             vertex_avail_mask = vertex_avail_at_step(
                 state, vertex_valid_static, total_v, num_valid
             )
 
             if args.dynamic_substeps:
+                # Live per-vertex DIAG/COMPRESS masks for the current graph
+                # (replayed from the elimination prefix so far).
+                oracle_pair_all, oracle_comp_all = _oracle_masks(
+                    elim_order, state.step_count)
                 (
                     vertex_idx,
                     micro_actions,
@@ -3916,6 +3988,8 @@ def main():
                     micro_exp_dists,
                     micro_kind_dists,
                     micro_quant_logp,
+                    micro_pair_valid,
+                    micro_compress_valid,
                     value,
                     v_context,
                 ) = agent.sample_action_dynamic(
@@ -3931,7 +4005,13 @@ def main():
                     residual_state=residual_state,
                     cached_encoding=cached_encoding,
                     preference=preference if args.preference_conditioned else None,
+                    oracle_pair_all=oracle_pair_all,
+                    oracle_comp_all=oracle_comp_all,
                 )
+                # Record this vertex in the elimination prefix for the next
+                # step's oracle replay.
+                elim_order = elim_order.at[state.step_count].set(
+                    vertex_idx.astype(elim_order.dtype))
                 env_action = agent.to_env_action_dynamic(
                     vertex_idx,
                     micro_actions,
@@ -3992,6 +4072,10 @@ def main():
                 micro_exp_dists = _dyn_zero_exp_dists
                 micro_kind_dists = _dyn_zero_kind_dists
                 micro_quant_logp = _dyn_zero_quant_logp
+                micro_pair_valid = jnp.zeros(
+                    (MAX_AXES_PER_VERTEX, MAX_AXES_PER_VERTEX), dtype=jnp.float32)
+                micro_compress_valid = jnp.zeros(
+                    (MAX_AXES_PER_VERTEX,), dtype=jnp.float32)
             env_out = env_obj.step(state, env_action)
             next_state = env_out.state
             raw_rewards = env_out.reward
@@ -4072,14 +4156,16 @@ def main():
                 micro_exp_dists=micro_exp_dists,
                 micro_kind_dists=micro_kind_dists,
                 micro_quant_logp=micro_quant_logp,
+                micro_pair_valid=micro_pair_valid,
+                micro_compress_valid=micro_compress_valid,
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
             )
-            return (next_state, new_residual), (transition, raw_rewards)
+            return (next_state, new_residual, elim_order), (transition, raw_rewards)
 
-        (final_state, _), (traj, all_raw_rewards) = lax.scan(
+        (final_state, _, _), (traj, all_raw_rewards) = lax.scan(
             step_fn,
-            (env_state, init_residual),
+            (env_state, init_residual, jnp.zeros((total_v,), dtype=jnp.int32)),
             keys,
         )
         return final_state, traj, all_raw_rewards[-1]
@@ -4361,7 +4447,7 @@ def main():
             quant_scale_sign=batch.micro_quant_scale_sign_seq,
         )
 
-        def _eval_dyn(toks, eids, rs, pref, vidx, action, vmask, cached, k):
+        def _eval_dyn(toks, eids, rs, pref, vidx, action, vmask, cached, k, pv, cv):
             return agent.evaluate_action_dynamic(
                 toks,
                 vidx,
@@ -4376,6 +4462,8 @@ def main():
                 residual_state=rs,
                 cached_encoding=cached,
                 preference=pref_or_none(pref),
+                pair_valid=pv,
+                compress_valid=cv,
             )
 
         if cached_flat is None:
@@ -4392,8 +4480,9 @@ def main():
                 new_kind_dists,
                 new_quant_logp,
             ) = jax.vmap(
-                lambda toks, eids, rs, pref, vidx, action, vmask, k: _eval_dyn(
-                    toks, eids, rs, pref, vidx, action, vmask, None, k
+                lambda toks, eids, rs, pref, vidx, action, vmask, k, pv, cv:
+                _eval_dyn(
+                    toks, eids, rs, pref, vidx, action, vmask, None, k, pv, cv
                 )
             )(
                 batch.tokens,
@@ -4404,6 +4493,8 @@ def main():
                 actions,
                 batch.vertex_avail_mask,
                 keys,
+                batch.micro_pair_valid,
+                batch.micro_compress_valid,
             )
         else:
             (
@@ -4428,6 +4519,8 @@ def main():
                 batch.vertex_avail_mask,
                 cached_flat,
                 keys,
+                batch.micro_pair_valid,
+                batch.micro_compress_valid,
             )
 
         old_log_probs = jax.vmap(old_micro_log_prob_for_action)(
@@ -4766,6 +4859,8 @@ def main():
             old_micro_exp_dists=traj.micro_exp_dists,
             old_micro_kind_dists=traj.micro_kind_dists,
             old_micro_quant_logp=traj.micro_quant_logp,
+            micro_pair_valid=traj.micro_pair_valid,
+            micro_compress_valid=traj.micro_compress_valid,
             estim_returns=estim_returns,
             norm_adv=norm_adv,
             vertex_avail_mask=traj.vertex_avail_mask,
