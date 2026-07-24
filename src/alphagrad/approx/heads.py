@@ -67,6 +67,9 @@ import numpy as np
 
 from graphax.sparse.micro_actions import (
     NUM_QUANT_DTYPES, QUANT_DTYPES, quant_hardware_masks)
+from alphagrad.approx.quant_factoring import (
+    NUM_FACTORS, NUM_SCALE_SIGNS, factor_legal_mask, picks_for_global,
+    quant_factor_tables, resolve_global)
 
 
 # ---------------------------------------------------------------------------
@@ -922,6 +925,98 @@ class QuantDtypeHead(eqx.Module):
         logits = self.proj(summary)
         masked_logits = jnp.where(quant_legality_mask > 0.5, logits, -1e9)
         return jnn.softmax(masked_logits, axis=-1)
+
+
+class FactoredQuantHead(eqx.Module):
+    """Semantic, factored quantization head (replaces :class:`QuantDtypeHead`).
+
+    Instead of one softmax over the whole dtype catalog, the policy picks a
+    dtype by its parts: a ``scale_sign`` (±1) plus, in order, ``(kind, bits,
+    exp, mantissa, bias, finite, unsigned_zero)``. Each factor is masked to the
+    values that keep a real, hardware-usable dtype reachable given the earlier
+    picks (:mod:`alphagrad.approx.quant_factoring`), and the completed tuple
+    resolves to exactly one catalog dtype.
+
+    A factor with a single legal value is FORCED: its masked softmax is a point
+    mass, and the ≥2-options rule drops it from the joint log-prob / entropy /
+    arity — so an integer dtype's exp/mantissa/bias/finite/uz heads cost no
+    decision, and once ``bias`` is chosen the ``fnuz`` correlates collapse too.
+    ``scale_sign`` is a genuine 2-way choice kept for EVERY kind (it folds into
+    ``scalar_mult`` and rescales the value — a no-op for signed/float, the
+    arm-selector for unsigned).
+
+    Reads only the pooled axis-set summary — Quant is per-tensor, not per-axis.
+    """
+
+    sign_head: eqx.nn.Linear
+    factor_heads: tuple
+    vocab_sizes: tuple = eqx.field(static=True)
+
+    def __init__(self, embd_dim: int, *, key):
+        vocab_sizes = quant_factor_tables().vocab_sizes
+        self.vocab_sizes = vocab_sizes
+        keys = jrand.split(key, NUM_FACTORS + 1)
+        self.sign_head = eqx.nn.Linear(embd_dim, NUM_SCALE_SIGNS, key=keys[0])
+        self.factor_heads = tuple(
+            eqx.nn.Linear(embd_dim, vf, key=keys[i + 1])
+            for i, vf in enumerate(vocab_sizes)
+        )
+
+    def _factor_dist(self, f: int, summary, picks):
+        """Masked softmax + legal mask for factor ``f`` given ``picks[:f]``."""
+        logits = self.factor_heads[f](summary)
+        legal = factor_legal_mask(quant_factor_tables(), picks, f)
+        masked = jnp.where(legal > 0.5, logits, -1e9)
+        return jnn.softmax(masked, axis=-1), legal
+
+    def _sign_dist(self, summary):
+        return jnn.softmax(self.sign_head(summary), axis=-1)
+
+    def sample(self, summary, key):
+        """Sample a dtype factor-by-factor. Returns ``(dtype_idx, scale_sign)``:
+        the QUANT_DTYPES global index and ±1."""
+        tables = quant_factor_tables()
+        keys = jrand.split(key, NUM_FACTORS + 1)
+        picks = jnp.zeros(NUM_FACTORS, dtype=jnp.int32)
+        for f in range(NUM_FACTORS):
+            dist, _ = self._factor_dist(f, summary, picks)
+            pick = distrax.Categorical(probs=dist).sample(seed=keys[f])
+            picks = picks.at[f].set(pick.astype(jnp.int32))
+        dtype_idx = resolve_global(tables, picks).astype(jnp.int32)
+        sign_idx = distrax.Categorical(probs=self._sign_dist(summary)).sample(
+            seed=keys[NUM_FACTORS])
+        scale_sign = jnp.where(sign_idx == 0, 1, -1).astype(jnp.int32)
+        return dtype_idx, scale_sign
+
+    def log_prob(self, summary, dtype_idx, scale_sign):
+        """Joint log-prob + entropy + arity for a stored ``(dtype, sign)``.
+
+        The factor picks are re-derived from the stored dtype so the per-factor
+        categoricals are re-scored under the current policy — identical masking
+        to sample time, so the PPO ratio is 1 at epoch 0. Each factor counts
+        only when it had ≥2 legal options (forced factors skipped); ``sign``
+        always counts.
+        """
+        tables = quant_factor_tables()
+        picks = picks_for_global(tables, dtype_idx)          # (7,)
+        log_p = jnp.array(0.0, jnp.float32)
+        entropy = jnp.array(0.0, jnp.float32)
+        arity = jnp.array(0.0, jnp.float32)
+        for f in range(NUM_FACTORS):
+            dist, legal = self._factor_dist(f, summary, picks)
+            lp = jnp.log(dist[picks[f]] + 1e-8)
+            ent = -jnp.sum(dist * jnp.log(dist + 1e-8))
+            active = (jnp.sum(legal > 0.5) >= 2).astype(jnp.float32)
+            log_p = log_p + lp * active
+            entropy = entropy + ent * active
+            arity = arity + active
+        # scale_sign: always a real 2-way choice -> always counts.
+        sign_dist = self._sign_dist(summary)
+        sign_idx = (scale_sign < 0).astype(jnp.int32)        # +1->0, -1->1
+        log_p = log_p + jnp.log(sign_dist[sign_idx] + 1e-8)
+        entropy = entropy - jnp.sum(sign_dist * jnp.log(sign_dist + 1e-8))
+        arity = arity + 1.0
+        return log_p, entropy, arity
 
 
 class MicroActionHead(eqx.Module):
