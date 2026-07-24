@@ -34,6 +34,7 @@ def _action(op, i=0, j=0, quant=0):
         factor=jnp.array(0, jnp.int32),
         compress_kind=jnp.array(0, jnp.int32),
         quant_dtype=jnp.array(quant, jnp.int32),
+        quant_scale_sign=jnp.array(1, jnp.int32),
     )
 
 
@@ -54,22 +55,19 @@ def test_forced_end_op_contributes_nothing():
     assert a == 0.0, "a forced-END sub-step must contribute 0 to the arity"
 
 
-def test_forced_quant_dtype_is_skipped_but_op_still_counts():
-    """QUANT with exactly one legal dtype is forced — the dtype head is skipped
-    (this is the int4-style 'only one legal quantization' case). The op head
-    still counts because DIAG/QUANT/END gave it a real choice."""
+def test_quant_op_arity_comes_from_the_factored_head_not_the_flat_mask():
+    """The flat quant_legality_mask is retired: a QUANT sub-step's arity is
+    op(1 — a real DIAG/QUANT/END choice) + the FactoredQuantHead's own arity,
+    and is INDEPENDENT of the (now-ignored) quant_legality_mask."""
     head, tables, s, at, sz = _bits()
     op_mask = jnp.array([0., 0., 1., 1.])          # QUANT + END -> op is a real choice
     z, zz = jnp.zeros(N), jnp.zeros((N, N))
-    one_dtype = jnp.zeros(NUM_QUANT_DTYPES).at[0].set(1.)
-    two_dtypes = jnp.zeros(NUM_QUANT_DTYPES).at[:2].set(1.)
-    forced = _arity(head, tables, s, at, sz, _action(OP_QUANT, quant=0),
-                    op_mask, z, z, zz, one_dtype)
-    free = _arity(head, tables, s, at, sz, _action(OP_QUANT, quant=0),
-                  op_mask, z, z, zz, two_dtypes)
-    assert forced == 1.0, "only the op head counts when the dtype is forced"
-    assert free == 2.0, "op + dtype count when >1 dtype is legal"
-    assert free - forced == 1.0
+    a1 = _arity(head, tables, s, at, sz, _action(OP_QUANT, quant=0),
+                op_mask, z, z, zz, jnp.zeros(NUM_QUANT_DTYPES).at[0].set(1.))
+    a2 = _arity(head, tables, s, at, sz, _action(OP_QUANT, quant=0),
+                op_mask, z, z, zz, jnp.ones(NUM_QUANT_DTYPES))
+    assert a1 == a2, "quant arity must not depend on the retired flat mask"
+    assert a1 > 1.0, "op + factored-quant (≥ sign) both contribute"
 
 
 def test_forced_j_partner_is_skipped():

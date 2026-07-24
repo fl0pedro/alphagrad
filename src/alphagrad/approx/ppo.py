@@ -247,6 +247,7 @@ class Trajectory(NamedTuple):
     micro_factor_seq: jax.Array  # (max_substeps,) int32
     micro_compress_kind_seq: jax.Array  # (max_substeps,) int32
     micro_quant_dtype_seq: jax.Array  # (max_substeps,) int32
+    micro_quant_scale_sign_seq: jax.Array  # (max_substeps,) int32 — ±1
     reward: jax.Array  # (NUM_REWARDS,) — full env emission, kept for host logging
     done: jax.Array
     value: jax.Array  # (NUM_VALUE_HEADS,) per-head value prediction
@@ -260,7 +261,7 @@ class Trajectory(NamedTuple):
     micro_j_dists: jax.Array  # (max_substeps, MAX_AXES_PER_VERTEX) float32
     micro_exp_dists: jax.Array  # (max_substeps, MAX_PRIMES, MAX_EXPONENT+1) float32
     micro_kind_dists: jax.Array  # (max_substeps, NUM_COMPRESS_KINDS) float32
-    micro_quant_dists: jax.Array  # (max_substeps, NUM_QUANT_DTYPES) float32
+    micro_quant_logp: jax.Array  # (max_substeps,) float32 — RAW factored-quant log-prob
     discount: jax.Array
     vertex_avail_mask: jax.Array
 
@@ -280,6 +281,7 @@ class TrainBatch(NamedTuple):
     micro_factor_seq: jax.Array
     micro_compress_kind_seq: jax.Array
     micro_quant_dtype_seq: jax.Array
+    micro_quant_scale_sign_seq: jax.Array
     old_vertex_dist: jax.Array
     old_pair_dists: jax.Array
     old_factor_dists: jax.Array
@@ -288,7 +290,7 @@ class TrainBatch(NamedTuple):
     old_micro_j_dists: jax.Array
     old_micro_exp_dists: jax.Array
     old_micro_kind_dists: jax.Array
-    old_micro_quant_dists: jax.Array
+    old_micro_quant_logp: jax.Array  # (max_substeps,) RAW factored-quant log-prob
     estim_returns: jax.Array
     norm_adv: jax.Array
     vertex_avail_mask: jax.Array
@@ -393,7 +395,7 @@ def old_micro_log_prob_for_action(
     j_dists,
     exp_dists,
     kind_dists,
-    quant_dists,
+    quant_logp,
 ):
     """Joint log-prob of a typed micro-action sequence under stored dists.
 
@@ -451,9 +453,9 @@ def old_micro_log_prob_for_action(
     )
     log_p_exp = jnp.sum(log_p_per_prime, axis=-1) * active * is_diag
     log_p_kind = jnp.log(kind_dists[arange_s, kind_seq] + 1e-8) * active * is_compress
-    log_p_quant = (
-        jnp.log(quant_dists[arange_s, quant_seq] + 1e-8) * active * is_quant
-    )
+    # The factored quant head has no flat dtype dist to gather from; its RAW
+    # per-step log-prob (dtype factors + scale_sign) was stored at rollout.
+    log_p_quant = quant_logp * active * is_quant
 
     return log_p_v + jnp.sum(
         log_p_op + log_p_i + log_p_j + log_p_exp + log_p_kind + log_p_quant
@@ -1883,7 +1885,7 @@ class Agent(eqx.Module):
             j_dists,
             exp_dists,
             kind_dists,
-            quant_dists,
+            quant_logp,
         # NOTE: pair_valid/compress_valid/quant_legality_mask default to None
         # here — the tag-bit fallback and all-dtypes QUANT. Threading the
         # oracle's authoritative per-edge masks (build_pair_valid_mask, already
@@ -1929,6 +1931,7 @@ class Agent(eqx.Module):
         zeros_f = jnp.zeros_like(actions.factor)
         zeros_k = jnp.zeros_like(actions.compress_kind)
         zeros_q = jnp.zeros_like(actions.quant_dtype)
+        ones_qs = jnp.ones_like(actions.quant_scale_sign)
         actions = MicroAction(
             op_type=rewritten_op,
             i=jnp.where(disallowed, zeros_i, actions.i),
@@ -1937,6 +1940,7 @@ class Agent(eqx.Module):
             factor=jnp.where(disallowed, zeros_f, actions.factor),
             compress_kind=jnp.where(disallowed, zeros_k, actions.compress_kind),
             quant_dtype=jnp.where(disallowed, zeros_q, actions.quant_dtype),
+            quant_scale_sign=jnp.where(disallowed, ones_qs, actions.quant_scale_sign),
         )
 
         return (
@@ -1948,7 +1952,7 @@ class Agent(eqx.Module):
             j_dists,
             exp_dists,
             kind_dists,
-            quant_dists,
+            quant_logp,
             value,
             v_context,
         )
@@ -2017,7 +2021,7 @@ class Agent(eqx.Module):
             new_j_dists,
             new_exp_dists,
             new_kind_dists,
-            new_quant_dists,
+            new_quant_logp,
         # Masks must match sample_action_dynamic (None → tag-bit fallback,
         # all-dtypes QUANT) or the PPO ratio is not 1 at epoch 0.
         ) = self.micro_action_policy.evaluate(
@@ -2029,8 +2033,9 @@ class Agent(eqx.Module):
 
         total_log_p = log_p_vertex + log_p_sub
         total_entropy = vertex_ent + ent_sub
-        # Per-step dists are forwarded for KL tracking against the
-        # rollout-time old-policy snapshots stored in the trajectory.
+        # Per-step dists are forwarded for KL tracking against the rollout-time
+        # old-policy snapshots; ``new_quant_logp`` is the factored-quant log-prob
+        # (no flat dist), forwarded for parity with the trajectory schema.
         return (
             total_log_p,
             total_entropy,
@@ -2042,7 +2047,7 @@ class Agent(eqx.Module):
             new_j_dists,
             new_exp_dists,
             new_kind_dists,
-            new_quant_dists,
+            new_quant_logp,
         )
 
     def to_env_action_dynamic(
@@ -3890,10 +3895,8 @@ def main():
             dtype=jnp.float32,
         )
         _dyn_zero_quant_seq = jnp.zeros((args.max_substeps,), dtype=jnp.int32)
-        _dyn_zero_quant_dists = jnp.zeros(
-            (args.max_substeps, NUM_QUANT_DTYPES),
-            dtype=jnp.float32,
-        )
+        _dyn_zero_quant_sign = jnp.ones((args.max_substeps,), dtype=jnp.int32)
+        _dyn_zero_quant_logp = jnp.zeros((args.max_substeps,), dtype=jnp.float32)
 
         def step_fn(carry, k):
             state, residual_state = carry
@@ -3912,7 +3915,7 @@ def main():
                     micro_j_dists,
                     micro_exp_dists,
                     micro_kind_dists,
-                    micro_quant_dists,
+                    micro_quant_logp,
                     value,
                     v_context,
                 ) = agent.sample_action_dynamic(
@@ -3946,6 +3949,7 @@ def main():
                 micro_factor_seq = micro_actions.factor
                 micro_compress_kind_seq = micro_actions.compress_kind
                 micro_quant_dtype_seq = micro_actions.quant_dtype
+                micro_quant_scale_sign_seq = micro_actions.quant_scale_sign
             else:
                 (
                     vertex_idx,
@@ -3981,12 +3985,13 @@ def main():
                 micro_factor_seq = _dyn_zero_factor_seq
                 micro_compress_kind_seq = _dyn_zero_kind_seq
                 micro_quant_dtype_seq = _dyn_zero_quant_seq
+                micro_quant_scale_sign_seq = _dyn_zero_quant_sign
                 micro_op_dists = _dyn_zero_op_dists
                 micro_i_dists = _dyn_zero_i_dists
                 micro_j_dists = _dyn_zero_j_dists
                 micro_exp_dists = _dyn_zero_exp_dists
                 micro_kind_dists = _dyn_zero_kind_dists
-                micro_quant_dists = _dyn_zero_quant_dists
+                micro_quant_logp = _dyn_zero_quant_logp
             env_out = env_obj.step(state, env_action)
             next_state = env_out.state
             raw_rewards = env_out.reward
@@ -4053,6 +4058,7 @@ def main():
                 micro_factor_seq=micro_factor_seq,
                 micro_compress_kind_seq=micro_compress_kind_seq,
                 micro_quant_dtype_seq=micro_quant_dtype_seq,
+                micro_quant_scale_sign_seq=micro_quant_scale_sign_seq,
                 reward=jnp.atleast_1d(rewards),
                 done=jnp.array(done, dtype=jnp.float32),
                 value=jnp.atleast_1d(value),
@@ -4065,7 +4071,7 @@ def main():
                 micro_j_dists=micro_j_dists,
                 micro_exp_dists=micro_exp_dists,
                 micro_kind_dists=micro_kind_dists,
-                micro_quant_dists=micro_quant_dists,
+                micro_quant_logp=micro_quant_logp,
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
             )
@@ -4352,6 +4358,7 @@ def main():
             factor=batch.micro_factor_seq,
             compress_kind=batch.micro_compress_kind_seq,
             quant_dtype=batch.micro_quant_dtype_seq,
+            quant_scale_sign=batch.micro_quant_scale_sign_seq,
         )
 
         def _eval_dyn(toks, eids, rs, pref, vidx, action, vmask, cached, k):
@@ -4383,7 +4390,7 @@ def main():
                 new_j_dists,
                 new_exp_dists,
                 new_kind_dists,
-                new_quant_dists,
+                new_quant_logp,
             ) = jax.vmap(
                 lambda toks, eids, rs, pref, vidx, action, vmask, k: _eval_dyn(
                     toks, eids, rs, pref, vidx, action, vmask, None, k
@@ -4410,7 +4417,7 @@ def main():
                 new_j_dists,
                 new_exp_dists,
                 new_kind_dists,
-                new_quant_dists,
+                new_quant_logp,
             ) = jax.vmap(_eval_dyn)(
                 batch.tokens,
                 batch.eqn_ids,
@@ -4437,7 +4444,7 @@ def main():
             batch.old_micro_j_dists,
             batch.old_micro_exp_dists,
             batch.old_micro_kind_dists,
-            batch.old_micro_quant_dists,
+            batch.old_micro_quant_logp,
         )
 
         ratio = jnp.exp(log_probs - old_log_probs)
@@ -4540,11 +4547,11 @@ def main():
             batch.old_micro_kind_dists,
             active_steps * is_compress_step,
         )
-        kl_quant = _per_step_kl(
-            new_quant_dists,
-            batch.old_micro_quant_dists,
-            active_steps * is_quant_step,
-        )
+        # The factored quant head has no single dtype dist, so its per-component
+        # KL diagnostic is dropped (the joint log-prob still drives the ratio;
+        # the joint entropy still carries its exploration signal). TODO: surface
+        # the factored quant entropy/KL separately for logging.
+        kl_quant = jnp.zeros_like(kl_kind)
         kl_div = kl_vertex + kl_op + kl_i + kl_j + kl_exp + kl_kind + kl_quant
         # Stash per-component KLs so they can be logged separately — they're
         # the most useful single signal for debugging the dynamic head
@@ -4572,7 +4579,7 @@ def main():
         # exponent axis, then sum over the (padded) prime axis.
         exp_ent_per = jnp.sum(_step_entropy(new_exp_dists), axis=-1)  # (B, S)
         kind_ent_per = _step_entropy(new_kind_dists)  # (B, S)
-        quant_ent_per = _step_entropy(new_quant_dists)  # (B, S)
+        quant_ent_per = jnp.zeros_like(kind_ent_per)  # factored quant: see kl_quant note
 
         ent_vertex = jnp.mean(_step_entropy(new_vertex_dist))
         ent_op = jnp.mean(jnp.sum(op_ent_per * active_steps, axis=-1) / denom)
@@ -4749,6 +4756,7 @@ def main():
             micro_factor_seq=traj.micro_factor_seq,
             micro_compress_kind_seq=traj.micro_compress_kind_seq,
             micro_quant_dtype_seq=traj.micro_quant_dtype_seq,
+            micro_quant_scale_sign_seq=traj.micro_quant_scale_sign_seq,
             old_vertex_dist=traj.vertex_dist,
             old_pair_dists=traj.pair_dists,
             old_factor_dists=traj.factor_dists,
@@ -4757,7 +4765,7 @@ def main():
             old_micro_j_dists=traj.micro_j_dists,
             old_micro_exp_dists=traj.micro_exp_dists,
             old_micro_kind_dists=traj.micro_kind_dists,
-            old_micro_quant_dists=traj.micro_quant_dists,
+            old_micro_quant_logp=traj.micro_quant_logp,
             estim_returns=estim_returns,
             norm_adv=norm_adv,
             vertex_avail_mask=traj.vertex_avail_mask,

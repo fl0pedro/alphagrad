@@ -884,6 +884,7 @@ class MicroAction(NamedTuple):
     factor: jax.Array
     compress_kind: jax.Array
     quant_dtype: jax.Array
+    quant_scale_sign: jax.Array  # ±1 — the FactoredQuantHead's scale-sign pick
 
 
 class CompressKindHead(eqx.Module):
@@ -1045,7 +1046,7 @@ class MicroActionHead(eqx.Module):
     axis_j_head: AxisPointerHead
     factor_head: PrimeExponentHead
     compress_kind_head: CompressKindHead
-    quant_dtype_head: QuantDtypeHead
+    quant_head: FactoredQuantHead
 
     embd_dim: int = eqx.field(static=True)
 
@@ -1057,7 +1058,7 @@ class MicroActionHead(eqx.Module):
         self.axis_j_head = AxisPointerHead(embd_dim, key=keys[2])
         self.factor_head = PrimeExponentHead(embd_dim, key=keys[3])
         self.compress_kind_head = CompressKindHead(embd_dim, key=keys[4])
-        self.quant_dtype_head = QuantDtypeHead(embd_dim, key=keys[5])
+        self.quant_head = FactoredQuantHead(embd_dim, key=keys[5])
 
     # The sample / evaluate methods take per-sub-step state. They return
     # *flat* (single sub-step) outputs; the surrounding scan in
@@ -1145,11 +1146,11 @@ class MicroActionHead(eqx.Module):
         kind_dist = self.compress_kind_head(summary, axis_tokens[i_idx])
         kind_idx = distrax.Categorical(probs=kind_dist).sample(seed=k_kind)
 
-        # Quant-dtype head: categorical over the JAX dtype catalog. Per-tensor
-        # (no axis-token conditioning). Run unconditionally and mask out the
-        # contribution for non-QUANT steps in log_prob_step.
-        quant_dist = self.quant_dtype_head(summary, quant_legality_mask)
-        quant_idx = distrax.Categorical(probs=quant_dist).sample(seed=k_quant)
+        # Factored quant head: sample a dtype by parts (kind / bits / exp /
+        # mantissa / bias / finite / uz) plus a scale_sign, each masked to keep
+        # a real dtype reachable. Runs unconditionally; masked out for non-QUANT
+        # steps in log_prob_step.
+        quant_dtype_idx, quant_scale_sign = self.quant_head.sample(summary, k_quant)
 
         # Force i/j/exponents/kind/quant to canonical values for non-emitting
         # ops so the recorded action is unambiguous. The masking in
@@ -1159,16 +1160,17 @@ class MicroActionHead(eqx.Module):
         exp_out = jnp.where(is_diag, exponents, jnp.zeros_like(exponents))
         factor_out = jnp.where(is_diag, factor, jnp.array(0, dtype=jnp.int32))
         kind_out = jnp.where(is_compress, kind_idx, 0).astype(jnp.int32)
-        quant_out = jnp.where(is_quant, quant_idx, 0).astype(jnp.int32)
+        quant_out = jnp.where(is_quant, quant_dtype_idx, 0).astype(jnp.int32)
+        quant_sign_out = jnp.where(is_quant, quant_scale_sign, 1).astype(jnp.int32)
 
         action = MicroAction(
             op_type=op_type.astype(jnp.int32),
             i=i_out, j=j_out, exponents=exp_out, factor=factor_out,
             compress_kind=kind_out, quant_dtype=quant_out,
+            quant_scale_sign=quant_sign_out,
         )
         return (
-            action, factor_out, op_dist, i_dist, j_dist, exp_dists,
-            kind_dist, quant_dist,
+            action, factor_out, op_dist, i_dist, j_dist, exp_dists, kind_dist,
         )
 
     def log_prob_step(
@@ -1260,19 +1262,20 @@ class MicroActionHead(eqx.Module):
         ent_kind = -jnp.sum(kind_dist * jnp.log(kind_dist + 1e-8))
         kind_active = is_compress.astype(jnp.float32)
 
-        # Quant-dtype: emitted only for QUANT. Per-tensor; no axis-token
-        # conditioning at sample time, so none here either.
-        quant_dist = self.quant_dtype_head(summary, quant_legality_mask)
-        log_p_quant = jnp.log(quant_dist[action.quant_dtype] + 1e-8)
-        ent_quant = -jnp.sum(quant_dist * jnp.log(quant_dist + 1e-8))
-        quant_has_choice = (
-            jnp.sum(quant_legality_mask > 0.5) >= 2).astype(jnp.float32)
-        quant_active = is_quant.astype(jnp.float32) * quant_has_choice
+        # Quant: emitted only for QUANT. The factored head scores (dtype, sign)
+        # with its OWN ≥2-options gate per factor and returns (log_p, entropy,
+        # arity); ``is_quant`` op-gates the whole contribution. The RAW factored
+        # log-prob (ungated) is returned as the last element so the rollout can
+        # store it and old_micro_log_prob_for_action can reuse it directly —
+        # there is no flat dtype dist to store.
+        lp_quant, ent_quant, arity_quant = self.quant_head.log_prob(
+            summary, action.quant_dtype, action.quant_scale_sign)
+        quant_active = is_quant.astype(jnp.float32)
 
         log_p = (
             log_p_op * op_active + log_p_i * i_active + log_p_j * j_active
             + log_p_f * f_active + log_p_kind * kind_active
-            + log_p_quant * quant_active
+            + lp_quant * quant_active
         )
         entropy = (
             ent_op * op_active + ent_i * i_active + ent_j * j_active
@@ -1281,20 +1284,19 @@ class MicroActionHead(eqx.Module):
         )
 
         # Arity counts the *components* actually emitted, under the SAME
-        # ≥2-options gate: a forced op / i / j / quant carried no decision, so
-        # it must not inflate the entropy-normalisation denominator. The prime
-        # sub-loop self-gates via ``prime_mask`` (padded primes = 1 option =
-        # skipped), so ``prime_arity`` already counts only real primes. In fully
-        # forced steps (e.g. exact mode: op → END) the arity is 0; the entropy
-        # loss guards that with ``max(sub_length, 1)`` downstream.
+        # ≥2-options gate: a forced op / i / j carried no decision. The prime
+        # sub-loop self-gates via ``prime_mask``; the factored quant head returns
+        # its own arity (live factors + sign). In fully forced steps (e.g. exact
+        # mode: op → END) the arity is 0; the entropy loss guards that with
+        # ``max(sub_length, 1)`` downstream.
         prime_arity = jnp.sum(prime_mask) * f_active
         arity = (
             op_active + i_active + j_active + prime_arity
-            + kind_active + quant_active
+            + kind_active + arity_quant * quant_active
         )
         return (
             log_p, entropy, arity,
-            op_dist, i_dist, j_dist, exp_dists, kind_dist, quant_dist,
+            op_dist, i_dist, j_dist, exp_dists, kind_dist, lp_quant,
         )
 
 
@@ -1394,21 +1396,23 @@ class MicroActionPolicy(eqx.Module):
         )
 
         (
-            action, factor, op_d, i_d, j_d, exp_d, kind_d, quant_d,
+            action, factor, op_d, i_d, j_d, exp_d, kind_d,
         ) = self.head.sample_step(
             summary, axis_tokens, features.size,
             op_legal, i_diag, i_compress, j_diag, quant_legality_mask,
             tables, key,
         )
 
-        # log_prob_step recomputes the dists internally but we discard
-        # them here — the sample_step return values are the dists at the
-        # rollout-time policy snapshot (the "old" dists for PPO), which
-        # is exactly what the trajectory needs.
-        log_p, ent, arity, *_ = self.head.log_prob_step(
+        # log_prob_step recomputes op/i/j/kind dists internally but we discard
+        # them here — the sample_step return values are those dists at the
+        # rollout-time policy snapshot (the "old" dists for PPO). We DO keep its
+        # last return, the raw factored-quant log-prob (``lp_quant``), which the
+        # trajectory stores in place of a flat quant dist.
+        log_p, ent, arity, *_rest = self.head.log_prob_step(
             action, summary, axis_tokens, features.size,
             op_legal, i_diag, i_compress, j_diag, quant_legality_mask, tables,
         )
+        lp_quant = _rest[-1]
         # Past-END contributions are zeroed so the joint log-prob /
         # entropy / arity reflect only the real sub-episode prefix.
         active = (1.0 - ended.astype(jnp.float32))
@@ -1446,7 +1450,7 @@ class MicroActionPolicy(eqx.Module):
 
         return (
             (new_features, new_ended, new_gid, step_idx + 1),
-            (action, log_p, ent, arity, op_d, i_d, j_d, exp_d, kind_d, quant_d),
+            (action, log_p, ent, arity, op_d, i_d, j_d, exp_d, kind_d, lp_quant),
         )
 
     def sample(
@@ -1505,8 +1509,10 @@ class MicroActionPolicy(eqx.Module):
         (
             _,
             (actions, logps, ents, arities, op_dists, i_dists, j_dists,
-             exp_dists, kind_dists, quant_dists),
+             exp_dists, kind_dists, quant_logps),
         ) = lax.scan(step_fn, init_carry, keys)
+        # ``quant_logps`` is the per-step RAW factored-quant log-prob (the last
+        # slot used to be a flat dtype dist); everything else is a per-step dist.
         return (
             actions,
             jnp.sum(logps),
@@ -1517,7 +1523,7 @@ class MicroActionPolicy(eqx.Module):
             j_dists,
             exp_dists,
             kind_dists,
-            quant_dists,
+            quant_logps,
         )
 
     def _step_evaluate(
@@ -1552,7 +1558,7 @@ class MicroActionPolicy(eqx.Module):
 
         (
             log_p, ent, arity,
-            op_dist, i_dist, j_dist, exp_dists, kind_dist, quant_dist,
+            op_dist, i_dist, j_dist, exp_dists, kind_dist, lp_quant,
         ) = self.head.log_prob_step(
             action, summary, axis_tokens, features.size,
             op_legal, i_diag, i_compress, j_diag, quant_legality_mask, tables,
@@ -1598,7 +1604,7 @@ class MicroActionPolicy(eqx.Module):
             (new_features, new_ended, new_gid, step_idx + 1),
             (
                 log_p, ent, arity,
-                op_dist, i_dist, j_dist, exp_dists, kind_dist, quant_dist,
+                op_dist, i_dist, j_dist, exp_dists, kind_dist, lp_quant,
             ),
         )
 
@@ -1654,12 +1660,13 @@ class MicroActionPolicy(eqx.Module):
             _,
             (
                 logps, ents, arities,
-                op_dists, i_dists, j_dists, exp_dists, kind_dists, quant_dists,
+                op_dists, i_dists, j_dists, exp_dists, kind_dists, quant_logps,
             ),
         ) = lax.scan(step_fn, init_carry, actions)
+        # ``quant_logps`` — per-step RAW factored-quant log-prob (not a dist).
         return (
             jnp.sum(logps), jnp.sum(ents), jnp.sum(arities),
-            op_dists, i_dists, j_dists, exp_dists, kind_dists, quant_dists,
+            op_dists, i_dists, j_dists, exp_dists, kind_dists, quant_logps,
         )
 
 

@@ -1508,7 +1508,17 @@ class VertexEliminationEnv:
         exec_on_gpu: bool = False,
         measure_latency: bool = False,
         terminal_rewards_only: bool = False,
+        latency_samples: int = 1,
+        measure_grad: bool = False,
+        quality_rewarded=None,
+        **_compat,
     ):
+        # ``latency_samples`` / ``quality_rewarded`` / ``**_compat`` are accepted
+        # for caller compatibility (the winsorized-measurement wiring is a
+        # separate item; the measurement path uses its own sampling for now).
+        if measure_grad:
+            raise NotImplementedError(
+                "measure_grad=True is not supported in this env build.")
         assert (argnums is None and args is None) or not (args is None or args is None)
         config = EnvConfig(
             jaxpr=jaxpr.jaxpr,
