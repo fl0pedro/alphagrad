@@ -663,6 +663,100 @@ class LiveVertexMaskOracle:
                     pair[j, i] = True  # the row format canonicalises the order
         return pair, comp
 
+    def face_masks(self, vertex: int, max_faces: int = 8):
+        """PER-FACE ``(pair_valid (F, N, N), compress_valid (F, N), n_faces)``.
+
+        The per-face counterpart of :meth:`vertex_mask`. Same env screens (wire
+        format, full-reduction cap, "every emittable divisor is legal"), but the
+        per-face masks are kept SEPARATE instead of AND-ed together.
+
+        That difference is the point of per-face approximation: a per-vertex rule
+        list is applied uniformly to every face, so a pair is admissible only if
+        it fits ALL of them -- which is why per-vertex DIAG is structurally
+        almost always illegal. A per-face slot only has to fit ITS OWN operand,
+        so the per-face masks are a strict superset of the intersected one.
+
+        Faces are index-aligned across ``_DISPATCH_MODES`` (``probe_faces``
+        returns them in ``_eliminate_vertex`` visit order, the same for both), so
+        face ``k`` is intersected only with face ``k`` of the other mode -- an
+        action must still be legal on BOTH dispatch paths, just not on other
+        faces. Rows ``>= n_faces`` stay all-zero padding.
+
+        Deliberately a separate method rather than a refactor of
+        :meth:`vertex_mask`: that one is on the live per-vertex training path and
+        must not be perturbed.
+        """
+        from alphagrad.approx.env import diag_row_to_pair
+
+        N = self.max_axes
+        F = int(max_faces)
+        pair = np.zeros((F, N, N), dtype=bool)
+        comp = np.zeros((F, N), dtype=bool)
+        vertex = int(vertex)
+        if not (1 <= vertex <= self.total_v) or vertex in self._eliminated:
+            return pair, comp, 0
+
+        eqn = self.jaxpr.eqns[vertex - 1]
+        if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
+            return pair, comp, 0
+        out_shape = tuple(eqn.outvars[0].aval.shape)
+        out_len = len(out_shape)
+        primal_shapes = [
+            tuple(iv.aval.shape) for iv in eqn.invars if hasattr(iv, "aval")
+        ]
+        if not primal_shapes:
+            return pair, comp, 0
+
+        per_mode = [self.probe_faces(vertex, approx=m) for m in self._DISPATCH_MODES]
+        per_mode = [fs for fs in per_mode if fs]
+        if not per_mode:
+            return pair, comp, 0
+        n_faces = min(min(len(fs) for fs in per_mode), F)
+
+        edge_phys_axes = out_len + max((len(ps) for ps in primal_shapes), default=0)
+        n_primal = min(len(ps) for ps in primal_shapes)
+
+        for k in range(n_faces):
+            faces_k = [fs[k] for fs in per_mode]
+
+            # --- COMPRESS: vertex_mask's screens, this face only ------------
+            if edge_phys_axes > 1:
+                face_comp = [compress_valid_mask(st, N) for st in faces_k]
+                for a in range(N):
+                    if a >= out_len and any(
+                        a - out_len >= len(ps) for ps in primal_shapes
+                    ):
+                        continue
+                    if all(m[a] for m in face_comp):
+                        comp[k, a] = True
+
+            # --- DIAG: vertex_mask's screens, this face only -----------------
+            face_diag = [diag_valid_mask(st, N) for st in faces_k]
+            for bi1 in range(out_len):
+                n1 = int(out_shape[bi1])
+                for bi2 in range(n_primal):
+                    i, j = diag_row_to_pair(self.jaxpr, vertex, bi1, bi2)
+                    if i == j or i >= N or j >= N:
+                        continue
+                    g_nom = n1
+                    for ps in primal_shapes:
+                        g_nom = math.gcd(g_nom, int(ps[bi2]))
+                    if g_nom <= 1:
+                        continue
+                    ok = True
+                    for st, dm in zip(faces_k, face_diag):
+                        if not dm[i, j]:
+                            ok = False
+                            break
+                        base, span = diag_pair_factor_space(st, i, j)
+                        if base != 1 or span % g_nom != 0:
+                            ok = False
+                            break
+                    if ok:
+                        pair[k, i, j] = True
+                        pair[k, j, i] = True
+        return pair, comp, n_faces
+
     def masks(self, candidates=None):
         """``(pair_valid, compress_valid)`` for every vertex, 1-based rows.
 
