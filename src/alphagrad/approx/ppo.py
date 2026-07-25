@@ -2722,6 +2722,13 @@ def _apply_variant_preset(args, variant: str | None = None):
         )
     for k, v in preset.items():
         setattr(args, k, v)
+    # Make the resolved preset name stick to args.variant. The dynamic-substeps
+    # op_legality_override is built from args.variant (not this local `name`), so
+    # without this --exact set a local ve_only + pin_rules_to_exact=True but left
+    # args.variant at its default — the micro-action policy then ran fully
+    # unrestricted (int4 quant + compress) despite --exact, making the "exact"
+    # baseline secretly approximate. Keep them in sync.
+    args.variant = name
 
 
 def _op_legality_for_variant(
