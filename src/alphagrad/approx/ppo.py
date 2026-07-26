@@ -92,6 +92,7 @@ from alphagrad.approx.env import (
     NUM_REWARDS,
     REWARD_INDEX,
     REWARD_NAMES,
+    SENTINEL_COST,
     StepAction,
     VertexEliminationEnv,
     micro_actions_to_rule_specs_jax,
@@ -2632,6 +2633,15 @@ def main():
     # Reward-vector column order: top-N / progress-bar dumps print eight
     # floats per episode without per-column labels, so name the order
     # once here.
+    # PRIOR SCAN: probe every dtype and every contraction pair on THIS
+    # hardware, in BOTH operand orders, before a single episode runs — so
+    # the catalog is visible up front instead of being discovered by a
+    # TypePromotionError 200 episodes in.
+    try:
+        from graphax.sparse.micro_actions import report_hardware_scan
+        report_hardware_scan()
+    except Exception as _e:
+        print(f"[quant-scan] unavailable: {_e!r}")
     print(f"reward order: {', '.join(REWARD_NAMES)}")
     # Catch the "20-samples-into-32-minibatches → 0-elem minibatch → silent NaN
     # loss" pitfall as early as possible. `shuffle_and_batch` does integer
@@ -3349,6 +3359,20 @@ def main():
             args.gae_lambda,
         )
 
+        # DEGENERATE STEPS ARE NEUTRAL, NOT CATASTROPHIC.
+        # The env sentinels a plan that computed nothing (every cost = −1e10).
+        # Letting that flow into the advantage would inject an enormous
+        # artificial gradient and drag PopArt's per-channel sigma with it — the
+        # cure would be worse than the collapse. Instead reuse the VALUE NET's
+        # own prediction for those steps: set the advantage to 0 (the critic is
+        # taken as correct there, so the TD error vanishes) and drop them from
+        # the value target, so nothing trains ON the sentinel. The row is still
+        # sentinelled everywhere it is RANKED (top-N, best_global, Pareto), so
+        # a degenerate plan can never be crowned — it simply teaches nothing.
+        _is_degen = jnp.any(traj.reward <= (SENTINEL_COST * 0.5), axis=-1)  # (E,T)
+        _live = (~_is_degen).astype(jnp.float32)[..., None]                # (E,T,1)
+        advantages = advantages * _live
+
         if use_popart:
             new_m1, new_m2, new_w = _popart_update(
                 popart_m1, popart_m2, popart_w, estim_returns,
@@ -3365,7 +3389,11 @@ def main():
             # and the [0,1] cosine channel on a comparable footing WITHOUT the
             # batch z-score's collapse ratchet (a uniformly-degenerate batch
             # drives std->0 and makes the opposing channel vanish).
-            estim_returns = (estim_returns - new_mu) / new_sigma
+            # Neutral target on degenerate steps: substitute the value net's
+            # own (normalized) prediction so the value loss for that step is
+            # ~0 and the critic is not dragged toward the sentinel.
+            estim_returns = jnp.where(
+                _live > 0.5, (estim_returns - new_mu) / new_sigma, traj.value)
             norm_adv_components = advantages / new_sigma
         else:
             new_m1, new_m2, new_w = popart_m1, popart_m2, popart_w

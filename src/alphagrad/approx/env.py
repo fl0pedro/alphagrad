@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import os
 import time
 from dataclasses import dataclass
@@ -1170,6 +1171,20 @@ def _winsorized_mean(stack, lo_q: float = 0.25, hi_q: float = 0.75):
     return jnp.clip(stack, lo, hi).mean()
 
 
+_MEASURE_TURN = itertools.count()
+
+
+def _next_measure_device(devices):
+    """Round-robin over the measurement GPUs (everything but the trainer's).
+
+    A plain global counter is correct here: the callback is invoked serially
+    from the host inside `jax.pure_callback(vmap_method="sequential")`, so
+    there is no concurrent reader to race with.
+    """
+    devices = list(devices)
+    return devices[next(_MEASURE_TURN) % len(devices)]
+
+
 def _aggregate_samples(values, want_top_quartile: bool):
     """Reduce a list of per-sample scalars to a single jnp scalar.
 
@@ -1456,7 +1471,18 @@ def _callback(
                 "--exec-on-gpu requires at least two GPUs (one for the "
                 f"trainer, one for the env callback); got {len(gpu_devices)}."
             )
-        callback_device = gpu_devices[-1]
+        # GPU 0 is the TRAINER's. Every other GPU is a MEASUREMENT device,
+        # and consecutive measurements rotate through them.
+        #
+        # The rotation is not about throughput — the callback is
+        # `vmap_method="sequential"`, so measurements are serial either way.
+        # It is about the reading being CLEAN. Peak memory and latency are
+        # both contaminated by whatever the previous plan left in the
+        # allocator, and by the trainer's own outstanding work. Rotating over
+        # k devices gives each measurement k-1 measurements' worth of time for
+        # its device to drain before it is read again, and keeps all of it off
+        # the device that is running the policy update.
+        callback_device = _next_measure_device(gpu_devices[1:])
 
     args_for_lower = (
         jax.device_put(args, callback_device)
@@ -1492,6 +1518,11 @@ def _callback(
         if hasattr(a, "shape") and hasattr(a, "dtype"):
             h.update(repr(a.shape).encode())
             h.update(repr(a.dtype).encode())
+    # The device is part of the key: `.lower(*args).compile()` bakes the
+    # device assignment into the executable, so an entry compiled for GPU 1
+    # cannot be replayed on GPU 2.
+    if callback_device is not None:
+        h.update(repr(callback_device).encode())
     cache_key = h.digest()
 
     def _do_compile_approx():
