@@ -122,23 +122,32 @@ from alphagrad.utils import entropy, explained_variance
 NUM_PAIR_CHOICES = NUM_AXIS_PAIRS + 1
 PAIR_STOP = NUM_AXIS_PAIRS
 
-# Three-head value/advantage configuration. The value head emits one scalar
-# per training reward — (V_flops, V_mem, V_acc) — and the per-episode
-# preference vector `w` (stored on Trajectory.preference) weights these three
+# Four-head value/advantage configuration. The value head emits one scalar
+# per training reward — (V_flops, V_mem, V_cos, V_frob) — and the per-episode
+# preference vector `w` (stored on Trajectory.preference) weights these
 # advantages when scalarizing for the PPO loss. The mapping into the env's
 # 8-component reward vector is fixed:
 #   head 0  flops          (REWARD_INDEX["flops"])
 #   head 1  peak_memory    (REWARD_INDEX["peak_memory"])
-#   head 2  frob_residual  (REWARD_INDEX["frob_residual"])
-# The remaining 5 env-reward components are still emitted for host-side
+#   head 2  cosine_sim     (REWARD_INDEX["cosine_sim"])
+#   head 3  frob_residual  (REWARD_INDEX["frob_residual"])
+# HISTORY: this used to be 3 heads (flops, mem, frob) with the frob head
+# LABELED "acc" — cosine similarity, the accuracy metric everyone watches,
+# never entered the training signal at all. Combined with the bounded frob
+# penalty, zeroing the computation maximized 2 of 3 trained channels and the
+# policy collapsed to flops=0/cos=0 (run 55403). cosine_sim is now a real
+# trained head; "acc" in --rewards weights IT, and frob keeps its own
+# --lambda-frob weight.
+# The remaining env-reward components are still emitted for host-side
 # logging / top-N heaps but do not enter the value head or advantage path.
 HEAD_REWARD_INDICES: tuple[int, ...] = (
     REWARD_INDEX["flops"],
     REWARD_INDEX["peak_memory"],
+    REWARD_INDEX["cosine_sim"],
     REWARD_INDEX["frob_residual"],
 )
 NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
-HEAD_NAMES: tuple[str, ...] = ("flops", "mem", "acc")
+HEAD_NAMES: tuple[str, ...] = ("flops", "mem", "cos", "frob")
 _HEAD_REWARD_INDICES_ARR = jnp.asarray(HEAD_REWARD_INDICES, dtype=jnp.int32)
 
 # Cross-channel scale handling. Reward channels span ~10¹⁰ in flops, ~10⁹
@@ -203,6 +212,58 @@ def _symlog_rewards(reward_vec: "jax.Array") -> "jax.Array":
         reward_normalization_fn(reward_vec),
     )
 
+
+def _apply_mult_gate(
+    rewards: "jax.Array",
+    cost_weights: "jax.Array",
+    gate_tau: float,
+    gate_w: float,
+    anti_degen_penalty: float,
+    anti_degen_tau: float,
+) -> "jax.Array":
+    """Multiplicative cosine-gate reward (``--reward-mode mult``).
+
+    Ported from the ray worker's ``_apply_mult_reward_gate`` (the structural
+    anti-collapse design), jnp-ified for the in-jit reward path::
+
+        g(cos)    = clip((cos - tau) / (1 - tau), 0, 1)        # fidelity gate
+        cheapness = max(0, W - sum_c w_c * symlog(cost_c))     # >0 == cheap
+        reward    = g(cos) * cheapness
+
+    ``rewards`` is ``(E, T, NUM_REWARDS)`` raw env emission (costs stored
+    negated, cosine in [0, 1]). The gated scalar lands in the cosine channel
+    and every other channel is zeroed — with a one-hot-cosine preference the
+    scalarization recovers it exactly. cosine→0 ⇒ reward→0 regardless of
+    cheapness, which structurally kills the cost→0/cos→0 hack.
+
+    ANTI-DEGENERACY: a flat-0 plateau below tau would let the policy drift
+    into the basin and never climb out, so degenerate TERMINAL transitions
+    (cos < ``anti_degen_tau``) get a strictly negative SHAPED penalty with a
+    positive slope in cos (−P at cos=0 ramping toward −P·(1−tau_d)), giving a
+    gradient pointing out of the basin while staying below every valid gated
+    reward (which is ≥ 0). Non-terminal steps legitimately carry cos=0
+    (sparse-terminal quality) and stay at the gated 0.
+    """
+    cos = rewards[..., REWARD_INDEX["cosine_sim"]]              # (E, T)
+    denom = jnp.maximum(1.0 - gate_tau, 1e-6)
+    g = jnp.clip((cos - gate_tau) / denom, 0.0, 1.0)
+
+    cost_mag = -rewards                                          # (E, T, R)
+    cost_sl = jnp.sign(cost_mag) * jnp.log1p(jnp.abs(cost_mag))
+    weighted_cost = jnp.sum(cost_sl * cost_weights, axis=-1)     # (E, T)
+    cheapness = jnp.maximum(0.0, gate_w - weighted_cost)
+    gated = g * cheapness
+
+    # Shaped anti-degeneracy penalty on the TERMINAL step only.
+    terminal = jnp.zeros(rewards.shape[:2], dtype=bool).at[:, -1].set(True)
+    degen = (cos < anti_degen_tau) & terminal
+    cos_basin = jnp.clip(cos, 0.0, anti_degen_tau)
+    shaped = -(anti_degen_penalty - cos_basin * anti_degen_penalty)
+    gated = jnp.where(degen, shaped, gated)
+
+    out = jnp.zeros_like(rewards)
+    return out.at[..., REWARD_INDEX["cosine_sim"]].set(gated)
+
 # Mapping from pair index 0..NUM_AXIS_PAIRS-1 -> (base_idx1, base_idx2). STOP is unused.
 _PAIR_TO_BASE = jnp.array(
     [
@@ -232,7 +293,7 @@ class Trajectory(NamedTuple):
     tokens: jax.Array
     eqn_ids: jax.Array
     residual_state: jax.Array  # (V, embd_dim) at the start of this step
-    preference: jax.Array  # (NUM_VALUE_HEADS,) — weights V_flops/V_mem/V_acc
+    preference: jax.Array  # (NUM_VALUE_HEADS,) — weights V_flops/V_mem/V_cos/V_frob
     vertex_idx: jax.Array
     # Legacy rule-head action — zero-filled in --dynamic-substeps mode.
     pair_seq: jax.Array
@@ -1360,14 +1421,14 @@ def _axis_features_from_state(
 
 
 class Agent(eqx.Module):
-    """Encoder + composable (vertex policy, rule policy) + three value heads.
+    """Encoder + composable (vertex policy, rule policy) + four value heads.
 
-    The value head is split into three single-output MLPs, one per training
-    reward: ``value_head_flops``, ``value_head_mem``, ``value_head_acc``.
-    Their concatenation is the (NUM_VALUE_HEADS,) = (3,) value vector the
-    trainer consumes; the per-head split keeps gradient scales sane across
-    the qualitatively different reward families and matches the per-head
-    GAE / preference-scalarization in ``train_episode``.
+    The value head is split into four single-output MLPs, one per training
+    reward: ``value_head_flops``, ``value_head_mem``, ``value_head_cos``,
+    ``value_head_frob``. Their concatenation is the (NUM_VALUE_HEADS,) = (4,)
+    value vector the trainer consumes; the per-head split keeps gradient
+    scales sane across the qualitatively different reward families and
+    matches the per-head GAE / preference-scalarization in ``train_episode``.
 
     Stage B.2.A adds a data-dependent path: when `vertex_features` are
     supplied, the agent embeds the per-vertex op-type id and projects the
@@ -1392,7 +1453,8 @@ class Agent(eqx.Module):
     micro_action_policy: MicroActionPolicy | None
     value_head_flops: MLP
     value_head_mem: MLP
-    value_head_acc: MLP
+    value_head_cos: MLP
+    value_head_frob: MLP
     op_embedding: eqx.nn.Embedding
     vertex_feature_proj: eqx.nn.Linear
     # B.3: Set Transformer aggregator over calibration samples. Always
@@ -1429,7 +1491,8 @@ class Agent(eqx.Module):
         rule_policy,
         value_head_flops,
         value_head_mem,
-        value_head_acc,
+        value_head_cos,
+        value_head_frob,
         op_embedding,
         vertex_feature_proj,
         set_transformer_agg,
@@ -1453,7 +1516,8 @@ class Agent(eqx.Module):
         self.micro_action_policy = micro_action_policy
         self.value_head_flops = value_head_flops
         self.value_head_mem = value_head_mem
-        self.value_head_acc = value_head_acc
+        self.value_head_cos = value_head_cos
+        self.value_head_frob = value_head_frob
         self.op_embedding = op_embedding
         self.vertex_feature_proj = vertex_feature_proj
         self.set_transformer_agg = set_transformer_agg
@@ -1538,8 +1602,9 @@ class Agent(eqx.Module):
             summary_eff = summary_eff + pref_emb
         v_flops = self.value_head_flops(summary_eff)
         v_mem = self.value_head_mem(summary_eff)
-        v_acc = self.value_head_acc(summary_eff)
-        value = jnp.concatenate([v_flops, v_mem, v_acc], axis=-1)
+        v_cos = self.value_head_cos(summary_eff)
+        v_frob = self.value_head_frob(summary_eff)
+        value = jnp.concatenate([v_flops, v_mem, v_cos, v_frob], axis=-1)
         return vertex_logits, vertex_contexts, value
 
     def encode(
@@ -1589,8 +1654,9 @@ class Agent(eqx.Module):
             summary = summary + pref_emb
         v_flops = self.value_head_flops(summary)
         v_mem = self.value_head_mem(summary)
-        v_acc = self.value_head_acc(summary)
-        value = jnp.concatenate([v_flops, v_mem, v_acc], axis=-1)
+        v_cos = self.value_head_cos(summary)
+        v_frob = self.value_head_frob(summary)
+        value = jnp.concatenate([v_flops, v_mem, v_cos, v_frob], axis=-1)
         return vertex_logits, vertex_contexts, value
 
     def value_for(
@@ -1828,7 +1894,7 @@ class Agent(eqx.Module):
         :class:`MicroActionPolicy`. ``axis_state`` and ``axis_valid_mask``
         come straight from :class:`EnvState`; the per-vertex slice for
         the chosen vertex is converted to :class:`AxisTokenFeatures` and
-        scanned by the policy. ``op_legality_override`` is a (3,) mask
+        scanned by the policy. ``op_legality_override`` is a (NUM_OPS,) = (4,) mask
         multiplied into the per-step op legality — used by
         ``--allow-compress=False`` to keep the policy from emitting
         COMPRESS micro-actions until the graphax wiring lands.
@@ -2192,10 +2258,41 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lambda-cmp", type=float, default=1.0)
     p.add_argument("--lambda-mem", type=float, default=1.0)
     p.add_argument(
+        "--lambda-acc",
+        type=float,
+        default=2.0,
+        help="Weight on the cosine-similarity value head (trained signal). "
+        "Default 2.0 so quality balances the two cost heads' combined vote — "
+        "at 1.0 the z-scored advantage vote is 2-vs-1 for compute-zeroing.",
+    )
+    p.add_argument(
         "--lambda-frob",
         type=float,
         default=0.0,
-        help="Weight on the Frobenius-residual reward component (idx 7). Default 0.",
+        help="Weight on the Frobenius-residual value head. Default 0.",
+    )
+    p.add_argument("--gate-tau", type=float, default=0.5,
+                   help="mult mode: cosine gate threshold tau (g=0 below it).")
+    p.add_argument("--gate-w", type=float, default=40.0,
+                   help="mult mode: cheapness budget W in symlog-cost units "
+                   "(cheapness = max(0, W - sum w_c*symlog(cost_c))).")
+    p.add_argument("--anti-degen-penalty", type=float, default=2.0,
+                   help="mult mode: penalty floor P for degenerate terminals "
+                   "(shaped ramp -P -> -P*(1-tau_d) over cos in [0, tau_d]).")
+    p.add_argument("--anti-degen-tau", type=float, default=0.05,
+                   help="mult mode: cosine threshold below which a TERMINAL "
+                   "transition counts as degenerate.")
+    p.add_argument(
+        "--reward-mode",
+        type=str,
+        default="additive",
+        choices=["additive", "mult"],
+        help="additive: per-head advantages scalarized by the preference "
+        "weights (default). mult: multiplicative cosine gate — the scalar "
+        "reward is g(cos)·max(0, W − Σ w_c·symlog(cost_c)) with an "
+        "anti-degeneracy penalty, written into the cosine head with a "
+        "one-hot preference (ported from the ray worker's "
+        "ALPHAGRAD_REWARD_MODE=mult; the structural anti-collapse option).",
     )
     p.add_argument(
         "--measure-latency",
@@ -2799,7 +2896,7 @@ def _build_agent(
     max_rules: int,
     key,
 ):
-    encoder_keys = jrand.split(key, 14)
+    encoder_keys = jrand.split(key, 15)
     embedding = eqx.nn.Embedding(args.vocab_size, args.embd_dim, key=encoder_keys[0])
     pos_enc = PositionalEncoder(args.embd_dim, MAX_TOKENS)
     # Flag-gated token-mixer for the policy backbone. Default "transformer"
@@ -2878,13 +2975,14 @@ def _build_agent(
             key=encoder_keys[3],
         )
     # One single-output MLP per training reward (flops / peak_memory /
-    # frob_residual). Per-head split keeps gradient scales sane across the
-    # qualitatively different reward families and matches the per-head GAE
-    # and preference-vector scalarization in `train_episode`.
+    # cosine_sim / frob_residual). Per-head split keeps gradient scales sane
+    # across the qualitatively different reward families and matches the
+    # per-head GAE and preference-vector scalarization in `train_episode`.
     value_dims = _parse_int_list(args.value_dims)
     value_head_flops = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[4])
     value_head_mem = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[5])
-    value_head_acc = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[12])
+    value_head_cos = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[12])
+    value_head_frob = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[14])
     op_embedding = eqx.nn.Embedding(
         OP_TYPE_VOCAB_SIZE,
         args.op_embd_dim,
@@ -2943,7 +3041,8 @@ def _build_agent(
         rule_policy=rule_policy,
         value_head_flops=value_head_flops,
         value_head_mem=value_head_mem,
-        value_head_acc=value_head_acc,
+        value_head_cos=value_head_cos,
+        value_head_frob=value_head_frob,
         op_embedding=op_embedding,
         vertex_feature_proj=vertex_feature_proj,
         set_transformer_agg=set_transformer_agg,
@@ -3202,21 +3301,24 @@ def _build_reward_weights(args) -> np.ndarray:
 
 
 def _build_head_weights(args) -> np.ndarray:
-    """Build the (NUM_VALUE_HEADS,) = (3,) static preference vector.
+    """Build the (NUM_VALUE_HEADS,) = (4,) static preference vector.
 
-    Indexes the three training rewards (flops / peak_memory / frob_residual)
-    -- the value head and advantage path operate on exactly these three.
-    The `--cmp-type` and `--mem-type` flags only affect host-side display:
-    training always learns flops + peak_memory + frob_residual regardless
-    of those settings.
+    Indexes the four training rewards (flops / peak_memory / cosine_sim /
+    frob_residual) — the value head and advantage path operate on exactly
+    these. ``"acc" in --rewards`` weights the COSINE head (this used to
+    silently weight frob while cosine never trained — the root cause of the
+    zero-compute collapse); frob keeps its own ``--lambda-frob``.
+    The `--cmp-type` and `--mem-type` flags only affect host-side display.
     """
     weights = np.zeros(NUM_VALUE_HEADS, dtype=np.float32)
     if "cmp" in args.rewards:
         weights[0] = args.lambda_cmp
     if "mem" in args.rewards:
         weights[1] = args.lambda_mem
-    if "acc" in args.rewards or args.lambda_frob != 0.0:
-        weights[2] = args.lambda_frob if args.lambda_frob != 0.0 else 1.0
+    if "acc" in args.rewards:
+        weights[2] = args.lambda_acc
+    if args.lambda_frob != 0.0:
+        weights[3] = args.lambda_frob
     return weights
 
 
@@ -3714,8 +3816,9 @@ def main():
     num_envs = _resolve_num_envs(args.num_envs, args.example)
     # 8-component reward vector is still emitted by the env and used for
     # host-side display (top-N heaps, per-component means). Training-side
-    # value / advantage path operates on the 3-vec (flops / peak_memory /
-    # frob_residual); see HEAD_REWARD_INDICES and `_build_head_weights`.
+    # value / advantage path operates on the 4-vec (flops / peak_memory /
+    # cosine_sim / frob_residual); see HEAD_REWARD_INDICES and
+    # `_build_head_weights`.
     reward_weights_np = _build_reward_weights(args)
     reward_weights = jnp.asarray(reward_weights_np, dtype=jnp.float32)
     head_reward_weights_np = _build_head_weights(args)
@@ -3724,6 +3827,18 @@ def main():
     mem_idx = _mem_reward_index(args.mem_type)
     cosine_idx = REWARD_INDEX["cosine_sim"]
     frob_idx = REWARD_INDEX["frob_residual"]
+    # ``--reward-mode mult``: cost weights for the cheapness term = the display
+    # weights with the quality channels zeroed (the gate multiplies fidelity
+    # back in); the preference collapses to one-hot on the cosine head so the
+    # scalarization recovers the gated scalar exactly.
+    mult_cost_weights_np = reward_weights_np.copy()
+    mult_cost_weights_np[cosine_idx] = 0.0
+    mult_cost_weights_np[frob_idx] = 0.0
+    mult_cost_weights = jnp.asarray(mult_cost_weights_np, dtype=jnp.float32)
+    if args.reward_mode == "mult":
+        head_reward_weights_np = np.zeros(NUM_VALUE_HEADS, dtype=np.float32)
+        head_reward_weights_np[HEAD_NAMES.index("cos")] = 1.0
+        head_reward_weights = jnp.asarray(head_reward_weights_np, dtype=jnp.float32)
 
     # Per-(vertex, pair, factor) validity mask. The legacy mask filtered
     # out factors that didn't divide the relevant axis sizes. With
@@ -3740,7 +3855,7 @@ def main():
     # Dynamic-substeps state: only constructed when the flag is on, but
     # always referenced by the rollout closure so it must be defined.
     # FactorTables is an env-static FactorTables NamedTuple (pytree of
-    # int32 / float32 lookup arrays); op_legality_override is a (3,)
+    # int32 / float32 lookup arrays); op_legality_override is a (NUM_OPS,)=(4,)
     # float32 mask gating COMPRESS via --allow-compress.
     if args.dynamic_substeps:
         factor_tables = precompute_factor_tables(args.max_axis_size)
@@ -4783,19 +4898,36 @@ def main():
         # passed through unchanged — see ``_NO_SYMLOG_MASK``). This
         # compresses the ~10¹⁰ dynamic range across flops / peak_memory /
         # frob_residual / … so the per-channel weighted sum is no longer
-        # dominated by flops by 10 orders of magnitude. ``reward_weights``
-        # / ``head_reward_weights`` have already been rescaled by the
-        # pre-training calibration (lines ~5545–5640) so each weighted
-        # channel contributes on a comparable scale.
-        sl_reward = _symlog_rewards(traj.reward)  # (E, T, NUM_REWARDS)
+        # dominated by flops by 10 orders of magnitude. (NOTE: the
+        # "pre-training calibration" older comments referenced never
+        # existed — cross-channel balance comes from symlog + the
+        # per-channel advantage z-score + the preference weights.)
+        # ``--reward-mode mult`` replaces the additive channels entirely
+        # with the cosine-gated scalar (see _apply_mult_gate) BEFORE
+        # symlog: the gate output lives in the cosine channel, which
+        # symlog passes through raw.
+        traj_reward = traj.reward
+        if args.reward_mode == "mult":
+            traj_reward = _apply_mult_gate(
+                traj_reward,
+                mult_cost_weights,
+                args.gate_tau,
+                args.gate_w,
+                args.anti_degen_penalty,
+                args.anti_degen_tau,
+            )
+        sl_reward = _symlog_rewards(traj_reward)  # (E, T, NUM_REWARDS)
         if args.loss_mode == "scalar":
             scalar_reward = jnp.sum(sl_reward * reward_weights, axis=-1)  # (E, T)
             zeros = jnp.zeros_like(scalar_reward)
-            head_rewards = jnp.stack([scalar_reward, zeros, zeros], axis=-1)
+            head_rewards = jnp.stack(
+                [scalar_reward] + [zeros] * (NUM_VALUE_HEADS - 1), axis=-1
+            )
         else:
             # ``HEAD_REWARD_INDICES`` selects (flops, peak_memory,
-            # frob_residual) — none of these are cosine_sim, so all three
-            # are symlog'd. The value head still learns the symlog of
+            # cosine_sim, frob_residual). cosine passes through symlog
+            # unchanged (bounded [0,1] already); the cost channels are
+            # symlog'd. The value head still learns the symlog of
             # estim_returns in the value loss; the GAE math in ``gae.py``
             # treats values as symlog'd (symexp back to "raw" — but with
             # the rewards now in symlog space, "raw" here is the symlog
@@ -5147,8 +5279,26 @@ def main():
         entropy_components = np.asarray(mets[10])
 
         weights = reward_weights_np
+        n_collapsed_this_ep = 0
         for i in range(all_rets.shape[0]):
             rets = all_rets[i]
+            # COLLAPSE GUARD (spec: "Don't allow collapsed values to count as
+            # best"). A terminal reward row is degenerate when the plan zeroed
+            # the computation (flops cost 0 / peak-memory cost 0), reported an
+            # unmeasurably-fast latency while latency was actually measured,
+            # or produced a near-zero cosine (destroyed Jacobian — after the
+            # env fix a broken comparison also reads cosine 0). Such rows
+            # still train (the reward fix handles that side) but must never
+            # be crowned "best" or enter the top-N tables.
+            collapsed = bool(
+                rets[cmp_idx] >= 0.0
+                or rets[mem_idx] >= 0.0
+                or rets[cosine_idx] <= 1e-6
+                or (measure_latency and rets[REWARD_INDEX["latency_ns"]] >= 0.0)
+            )
+            if collapsed:
+                n_collapsed_this_ep += 1
+                continue
             decoded = _decode(i)
             total_ret = float(np.sum(rets * weights))
             # Per-family heap keys: cmp uses the canonical compute index,
@@ -5175,16 +5325,41 @@ def main():
                 else:
                     heapq.heappushpop(heap, payload)
 
+        host_state["collapsed_total"] = (
+            host_state.get("collapsed_total", 0) + n_collapsed_this_ep
+        )
+        # best_global over NON-collapsed envs only. -inf when every env in the
+        # episode collapsed (nothing eligible).
         weighted_sums = np.sum(all_rets * weights, axis=-1)
-        best_idx = int(np.argmax(weighted_sums))
-        best_ret = float(weighted_sums[best_idx])
-        if best_ret > host_state["best_global_return"]:
-            host_state["best_global_return"] = best_ret
-            host_state["best_global_act_seq"] = _decode(best_idx)
+        eligible = np.array(
+            [
+                not (
+                    all_rets[i][cmp_idx] >= 0.0
+                    or all_rets[i][mem_idx] >= 0.0
+                    or all_rets[i][cosine_idx] <= 1e-6
+                    or (
+                        measure_latency
+                        and all_rets[i][REWARD_INDEX["latency_ns"]] >= 0.0
+                    )
+                )
+                for i in range(all_rets.shape[0])
+            ],
+            dtype=bool,
+        )
+        if eligible.any():
+            masked = np.where(eligible, weighted_sums, -np.inf)
+            best_idx = int(np.argmax(masked))
+            best_ret = float(masked[best_idx])
+            if best_ret > host_state["best_global_return"]:
+                host_state["best_global_return"] = best_ret
+                host_state["best_global_act_seq"] = _decode(best_idx)
 
         log_dict = {
             "best_return": host_state["best_global_return"],
             "mean_return": float(np.sum(mean_r * weights)),
+            "collapse/count_this_ep": n_collapsed_this_ep,
+            "collapse/count_total": host_state["collapsed_total"],
+            "collapse/fraction_this_ep": n_collapsed_this_ep / max(1, all_rets.shape[0]),
             "KL divergence": kl_div,
             "entropy evolution": policy_entropy,
             "explained variance": explained_var,
