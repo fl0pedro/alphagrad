@@ -63,6 +63,7 @@ from alphagrad.approx.common import (
     data_gen,
     generate_eval_samples,
     get_advantages,
+    make_get_advantages,
     get_args,
     get_fn,
     get_num_clipping_triggers,
@@ -157,6 +158,11 @@ HEAD_NAMES: tuple[str, ...] = ("flops", "mem", "cos", "frob")
 # Print every loss component the moment the total goes non-finite. Off by
 # default because it forces a host callback inside the jitted update.
 _DEBUG_NAN = os.environ.get("ALPHAGRAD_DEBUG_NAN", "0") == "1"
+
+# PopArt decodes the value head itself (value * sigma + mu), so GAE must
+# NOT symexp on top of that. See the call site for why this only bites on
+# the second update.
+_GAE_POPART = make_get_advantages(use_symlog=False)
 _HEAD_REWARD_INDICES_ARR = jnp.asarray(HEAD_REWARD_INDICES, dtype=jnp.int32)
 
 # Cross-channel scale handling. Reward channels span ~10¹⁰ in flops, ~10⁹
@@ -3381,7 +3387,24 @@ def main():
             popart_m1, popart_m2, popart_w, args.popart_sigma_min, 1e12)
         v_raw = traj.value * popart_sigma + popart_mu
         nv_raw = traj.next_value * popart_sigma + popart_mu
-        _, estim_returns, advantages = get_advantages(
+        # ONE value encoding, not two.
+        #
+        # `get_advantages` is make_get_advantages(use_symlog=True), so its scan
+        # does `value_raw = symexp(value)`. That is correct ONLY when the value
+        # head's output is symlog-encoded. Under PopArt it is not: the head
+        # emits a z-score, and the affine `value * sigma + mu` above has already
+        # decoded it. Feeding that to the symlog variant EXPONENTIATES an
+        # already-decoded value.
+        #
+        # It survives exactly one update, which is why this looked like a slow
+        # collapse rather than a type error. Round 1 PopArt is cold (sigma=1,
+        # mu=0) so v_raw stays ~1.7 and symexp(1.7)~4.3 is harmless. Round 2 it
+        # is warm (sigma=42, mu=92), v_raw reaches ~89, and symexp(89)~6e38
+        # overflows float32 — the trace showed `advantages` pinned at 3.403e38,
+        # FLT_MAX, with estim_returns already NaN and every finite advantage
+        # crushed to 0 by the resulting sigma.
+        _gae = _GAE_POPART if use_popart else get_advantages
+        _, estim_returns, advantages = _gae(
             head_rewards,
             traj.done,
             v_raw if use_popart else traj.value,
