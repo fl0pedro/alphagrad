@@ -876,12 +876,36 @@ def _flatten_jacobians(jac):
     return jnp.concatenate(flats)
 
 
+def _align_jac(jac_approx, jac_exact):
+    """Align each approx-Jacobian/grad leaf to its exact leaf's LAYOUT before
+    comparison. graphax ``jacve`` returns some weight grads in the transposed
+    (dL/dW^T) layout for certain elimination orders; flattening them as-is makes
+    a (256,784) vs (784,256) ravel near-orthogonal, so cosine/frob become a
+    layout ARTIFACT that badly underestimates true gradient quality. Transpose a
+    2-D leaf back when its shape is the exact leaf's reverse; leave other
+    mismatches for the size/shape guard downstream. (Ported from the fat-line
+    stash — the fix that lifted Spearman-vs-trainability 0.67 -> 0.79.)"""
+    def _al(a, e):
+        if getattr(a, "shape", None) == getattr(e, "shape", None):
+            return a
+        if getattr(a, "ndim", 0) == 2 and a.shape == e.shape[::-1]:
+            return a.T
+        return a
+    try:
+        return jax.tree_util.tree_map(_al, jac_approx, jac_exact)
+    except Exception:
+        return jac_approx
+
+
 def _quality_metrics(jac_exact, jac_approx):
     """`(cosine_sim, relative_frobenius)` of `jac_approx` against `jac_exact`.
 
-    Returns the trivial `(1.0, 0.0)` (perfect agreement) when either side has
-    no leaves, mismatched shapes, or zero size, mirroring the original `error`
-    fallback so a degenerate plan can't poison downstream normalisation.
+    Returns the WORST score `(0.0, 1.0)` when either side has no leaves,
+    mismatched shapes, or zero size. The old fallback returned (1.0, 0.0) —
+    "perfect" — which as a REWARD is a degeneracy backdoor: a plan that
+    destroys the Jacobian's shape (e.g. a terminal COMPRESS) out-scored every
+    honest approximation on all quality channels. A broken comparison is
+    evidence of a broken plan, so it must score as such.
 
     ``ALPHAGRAD_DEBUG_QUALITY=1`` enables a one-line diagnostic print
     when cosine_sim collapses to ~0 with non-zero norms — used to
@@ -889,14 +913,21 @@ def _quality_metrics(jac_exact, jac_approx):
     on the PPO dynamic-substeps path. The print fires only when the
     formula would have produced a meaningful value but didn't.
     """
+    # Layout-align the approx leaves to the exact layout (transpose-back) so
+    # cosine/frob compare the SAME entries, not a transposed-layout artifact.
+    jac_approx = _align_jac(jac_approx, jac_exact)
     flat_exact = _flatten_jacobians(jac_exact)
     flat_approx = _flatten_jacobians(jac_approx)
     if flat_exact is None or flat_approx is None:
-        return jnp.array(1.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32)
+        return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
     if flat_approx.shape != flat_exact.shape or flat_approx.size == 0:
-        return jnp.array(1.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32)
+        return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
 
     cos = cossim(flat_exact, flat_approx)
+    # Certain quant/compress combos yield a complex-valued flattened Jacobian,
+    # making cossim complex. Use the real part — matches the reward path's
+    # existing real cast and keeps downstream float emission from crashing.
+    cos = jnp.real(cos)
     exact_norm = jnp.linalg.norm(flat_exact)
     resid_norm = jnp.linalg.norm(flat_exact - flat_approx)
     rel_frob = resid_norm / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
@@ -918,18 +949,38 @@ def _quality_metrics(jac_exact, jac_approx):
     return cos, rel_frob
 
 
+# Smallest latency reading we accept as a real measurement. Sub-100ns for a
+# compiled grad executable is physically implausible (a fake-fast artifact of
+# timer bypass / zero-work executables); clamp UP so a degenerate plan can't
+# report an unbeatable latency. 0.0 (= "not measured") passes through.
+_LAT_FLOOR_NS = 100.0
+
+
+def _winsorized_mean(stack, lo_q: float = 0.25, hi_q: float = 0.75):
+    """Winsorized mean: clip to the [lo_q, hi_q] quantile band, then mean.
+
+    The robust estimator the measurement spec asks for — insensitive to the
+    occasional scheduler hiccup (high outlier) AND to fake-fast readings (low
+    outlier), unlike the old ``sort()[6:8]`` band which was only correct for
+    exactly 8 samples and mislabeled "top-quartile".
+    """
+    lo = jnp.quantile(stack, lo_q)
+    hi = jnp.quantile(stack, hi_q)
+    return jnp.clip(stack, lo, hi).mean()
+
+
 def _aggregate_samples(values, want_top_quartile: bool):
     """Reduce a list of per-sample scalars to a single jnp scalar.
 
-    With ≥8 samples and `want_top_quartile`, takes the top-quartile mean
-    (matching legacy behaviour for latency); otherwise falls back to a plain
-    mean. Handles the empty-list case by returning `0.0`.
+    With ≥4 samples and `want_top_quartile` (the latency/quality path), takes a
+    winsorized mean over the interquartile band; otherwise a plain mean.
+    Handles the empty-list case by returning `0.0`.
     """
     if not values:
         return jnp.array(0.0, dtype=jnp.float32)
     stack = jnp.stack([jnp.asarray(v, dtype=jnp.float32) for v in values])
-    if want_top_quartile and stack.shape[0] >= 8:
-        return stack.sort()[6:8].mean()
+    if want_top_quartile and stack.shape[0] >= 4:
+        return _winsorized_mean(stack)
     return stack.mean()
 
 
@@ -1373,6 +1424,11 @@ def _callback(
         if config.measure_latency
         else 0.0
     )
+    # Fake-fast guard: a positive-but-implausibly-small reading is clamped UP
+    # to the floor rather than trusted — a degenerate (zero-work) plan must
+    # not report an unbeatable latency. 0.0 stays 0.0 (= "not measured").
+    if 0.0 < latency_ns < _LAT_FLOOR_NS:
+        latency_ns = _LAT_FLOOR_NS
     peak_memory = float(max(peak_mem_samples)) if peak_mem_samples else 0.0
 
     # ------------------------------------------------------------------
