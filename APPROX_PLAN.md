@@ -399,3 +399,29 @@ the 3 pgi15 graphax files then discard.
 - Ratio invariant: sample == evaluate ⇒ PPO ratio 1.
 - End-to-end: exact vs approx on nn256/MNIST, wandb online, 0 `DID NOT FIT`,
   0 sentinel measure-exceptions, and both runs reaching 1000 episodes.
+
+---
+
+## 6. Per-path loop — clarified semantics (2026-07-26, from the author)
+
+The face/path sub-episode, once wired, is:
+
+1. Path tokens (the local pass through the eliminated vertex) are emitted and
+   encoded.
+2. **One SKIP decision, at the start of the path only.** Skipping means the
+   contraction of this path is not performed; emit `approx SKIP` and move to
+   the next path. There is NO per-substep skip.
+3. If not skipped, loop **`dynamic-substeps` times**: approximate PRE, then
+   POST, then NEW — three head invocations in sequence with **no encoder call
+   between the three** — then emit `approx: {diag,compress,quant}(*args)` plus
+   the updated path accumulation and re-encode before the next substep.
+
+Deltas against the existing (dormant) `face_stream.AutoregressiveFaceDriver`:
+
+* it currently offers skip-or-approximate at EVERY substep — must become a
+  single gate at path start;
+* it currently calls `encoder.extend` once per SLOT (pre/post/new) — must
+  batch the triple and extend once per substep;
+* its SKIP comment says "the edge is deleted" — wrong on both counts today
+  (the driver leaves the contraction to proceed); under the clarified
+  semantics SKIP must actually suppress the contraction of that path.
