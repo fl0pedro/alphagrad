@@ -3249,11 +3249,14 @@ def main():
                 _bad,
                 lambda: jax.debug.print(
                     "[nan] ppo={p} value={v} entropy={e} kl={k} expvar={x} "
-                    "adv_absmax={a} ret_absmax={r}",
+                    "adv_nan={an} adv_absmax={a} ret_nan={rn} ret_absmax={r}",
                     p=ppo_loss, v=value_loss, e=entropy_loss, k=kl_div,
                     x=explained_var,
-                    a=jnp.max(jnp.abs(jnp.nan_to_num(advantages, nan=jnp.inf))),
-                    r=jnp.max(jnp.abs(jnp.nan_to_num(estim_returns, nan=jnp.inf))),
+                    an=jnp.sum(jnp.logical_not(jnp.isfinite(batch.norm_adv))),
+                    a=jnp.max(jnp.abs(jnp.nan_to_num(batch.norm_adv))),
+                    rn=jnp.sum(
+                        jnp.logical_not(jnp.isfinite(batch.estim_returns))),
+                    r=jnp.max(jnp.abs(jnp.nan_to_num(batch.estim_returns))),
                 ),
                 lambda: None,
             )
@@ -3545,6 +3548,24 @@ def main():
                     vertex_mult_arg,
                     micro_mult_arg,
                 )
+                # The other half of the NaN fork: a FINITE loss whose gradient
+                # is NaN (sqrt/norm/abs differentiated at exactly 0). The loss
+                # localizer above cannot see this — by the time it fires the
+                # params are already poisoned. Reported as a count so a single
+                # bad leaf is visible against thousands of good ones.
+                if _DEBUG_NAN:
+                    _gl = [g for g in jax.tree_util.tree_leaves(grads)
+                           if eqx.is_array(g)]
+                    _gbad = sum(
+                        jnp.sum(jnp.logical_not(jnp.isfinite(g))) for g in _gl)
+                    jax.lax.cond(
+                        _gbad > 0,
+                        lambda: jax.debug.print(
+                            "[nan] GRADIENT non-finite: {n} entries across "
+                            "{k} leaves (loss itself was finite)",
+                            n=_gbad, k=len(_gl)),
+                        lambda: None,
+                    )
                 updates, new_opt_state = optimizer.update(
                     grads, comb_opt_state, comb_agent
                 )
