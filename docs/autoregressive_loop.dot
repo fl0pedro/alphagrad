@@ -1,0 +1,91 @@
+// TARGET structure: hierarchical AND autoregressive.
+//
+// Every action — macro (vertex elimination) and micro (approx / skip) — must
+// trigger the tokenizer to emit, and that emission must be absorbed by palimpsa
+// BEFORE the next decision. Palimpsa is a linear-attention RECURRENCE, so it
+// absorbs only the delta; nothing is re-read.
+//
+// LEGEND
+//   solid black : implemented today
+//   red dashed  : MISSING — the loop-back edges. Today the encode happens ONCE
+//                 per env step, so the flow is hierarchical only.
+//
+// Emission contract (per the spec):
+//   * vertex elimination needs no special token — the path header
+//     `path <central>, <pred>, <succ>` already names the eliminated vertex.
+//   * every approximation decision emits `approx: {skip|quant|compress|diag}`.
+//   * if NOT skip -> the head is followed by the NEW accumulation (post-approx).
+//   * if skip     -> no accumulation is emitted; that path's edge is deleted.
+//
+// Render:  dot -Tsvg autoregressive_loop.dot -o autoregressive_loop.svg
+
+digraph autoregressive_loop {
+  rankdir=TB;
+  bgcolor="transparent";
+  splines=spline;
+  nodesep=0.32;
+  ranksep=0.40;
+  node [shape=box, style="rounded,filled", fillcolor="#f4f4f2",
+        color="#d0cfca", fontname="Helvetica", fontsize=11,
+        margin="0.14,0.09"];
+  edge [color="#6a6a68", arrowsize=0.7, fontname="Helvetica", fontsize=9];
+
+  base [label="base function tokenized  (ONCE)\nIncrementalPathTokenizer.base_tokens()",
+        fillcolor="#eceaf5", color="#6b5bd6"];
+
+  pal  [label="palimpsa  ·  incremental_encoder.extend(state, NEW tokens only)\nlinear-attention carry — O(delta), never re-reads the stream",
+        fillcolor="#eceaf5", color="#6b5bd6"];
+
+  macro [label="MACRO ACTION\nvertex elimination  (pointer head)\nno special token needed"];
+
+  tokpath [label="tokenize local path / face accumulation\npath <central>, <pred>, <succ>  { contraction+join eqns }",
+           fillcolor="#ffffff"];
+
+  skipq [label="skip this path?", shape=diamond, fillcolor="#ffffff",
+         color="#6b5bd6", fontsize=10];
+
+  tokskip [label="emit  approx: skip\nNO new accumulation\n(the edge is deleted)", fillcolor="#ffffff"];
+
+  micro [label="MICRO ACTION\napprox head: {quant | compress | diag}(args)\n+ i / j / factor / kind / dtype sub-heads"];
+
+  tokapprox [label="emit  approx: {quant|compress|diag}(args)\n+ the NEW accumulation (post-approx)", fillcolor="#ffffff"];
+
+  moreapprox [label="another approx on this path?\n(n < dynamic substeps)", shape=diamond,
+              fillcolor="#ffffff", color="#6b5bd6", fontsize=10];
+  morepaths  [label="another path (face) for this vertex?\nm < M", shape=diamond,
+              fillcolor="#ffffff", color="#6b5bd6", fontsize=10];
+  moreverts  [label="another vertex?\n|V| eliminations total", shape=diamond,
+              fillcolor="#ffffff", color="#6b5bd6", fontsize=10];
+
+  done [label="measure  →  8 reward channels", fillcolor="#eceaf5", color="#6b5bd6"];
+
+  // ---- implemented spine ----
+  base   -> pal;
+  pal    -> macro;
+  macro  -> tokpath;
+  tokpath-> skipq   [label=" after re-encode"];
+  skipq  -> tokskip [label="yes"];
+  skipq  -> micro   [label="no"];
+  micro  -> tokapprox;
+  tokapprox -> moreapprox;
+  tokskip   -> morepaths;
+  moreapprox -> morepaths [label="no"];
+  morepaths  -> moreverts [label="no"];
+  moreverts  -> done      [label="no"];
+
+  // ---- THE MISSING EDGES: every emission must re-enter palimpsa ----
+  tokpath   -> pal [color="#c0392b", style=dashed, constraint=false,
+                    label=" MISSING", fontcolor="#c0392b"];
+  tokskip   -> pal [color="#c0392b", style=dashed, constraint=false,
+                    label=" MISSING", fontcolor="#c0392b"];
+  tokapprox -> pal [color="#c0392b", style=dashed, constraint=false,
+                    label=" MISSING", fontcolor="#c0392b"];
+
+  moreapprox -> micro     [label="yes", color="#c0392b", style=dashed, constraint=false, fontcolor="#c0392b"];
+  morepaths  -> tokpath   [label="yes", color="#c0392b", style=dashed, constraint=false, fontcolor="#c0392b"];
+  moreverts  -> macro     [label="yes", color="#c0392b", style=dashed, constraint=false, fontcolor="#c0392b"];
+
+  gap [label="WHY IT IS MISSING\nAgent.encode() runs ONCE per env step, then the whole\nmicro sub-episode is a lax.scan over cached contexts.\nIncrementalJaxpr has no per-face eliminate — only\neliminate(vertex, rules, face_transforms) — so the only\nmid-elimination hook is the face_transforms CALLABLE.\nface_stream.InterleavedFaceDriver uses that hook but emits\nSYNTHETIC shape tokens and never calls extend().",
+       shape=note, fillcolor="#ffffff", color="#c0392b", fontcolor="#c0392b",
+       fontsize=10];
+}
