@@ -51,7 +51,7 @@ if TYPE_CHECKING:  # pragma: no cover - never executed at runtime
         data_gen, get_args, get_fn, grad_target_fn, grad_target_setup, infer_argnums, scalar_loss_fn, seed_loss_fn,
     )
     from alphagrad.approx.common.gae import (  # noqa: F401
-        get_advantages, get_num_clipping_triggers, inverse_reward_normalization_fn, reward_normalization_fn,
+        get_advantages, make_get_advantages, get_num_clipping_triggers, inverse_reward_normalization_fn, reward_normalization_fn,
     )
     from alphagrad.approx.common.init import (  # noqa: F401
         init_linear_weights, scale_module_weight,
@@ -151,6 +151,8 @@ _LAZY: dict[str, tuple[str, str]] = {
     "infer_argnums": ("alphagrad.approx.common.examples", "infer_argnums"),
     # gae
     "get_advantages": ("alphagrad.approx.common.gae", "get_advantages"),
+    "make_get_advantages": ("alphagrad.approx.common.gae",
+                            "make_get_advantages"),
     "get_num_clipping_triggers": (
         "alphagrad.approx.common.gae", "get_num_clipping_triggers",
     ),
