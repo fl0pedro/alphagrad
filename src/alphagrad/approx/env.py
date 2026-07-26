@@ -78,7 +78,15 @@ import math as _math
 # rebuilding it on every callback is pure overhead.
 _TOKEN_VOCAB, _, _ = _graphax_get_vocab()
 
-MAX_TOKENS = 4096
+# Observation token budget. The jaxpr token stream is clipped to this and
+# zero-padded, so a graph whose stream is LONGER is only partially visible to
+# the policy — nn256 emits ~4657 tokens, so the historical 4096 silently hid
+# the tail of every observation. Settable via ALPHAGRAD_MAX_TOKENS (it sizes
+# the io_callback's static output shape, so it must be fixed before the env is
+# built, not per-call). Raise it until tokenization/truncated_count logs 0.
+MAX_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_TOKENS", "4096"))
+if MAX_TOKENS < 256:
+    raise ValueError(f"ALPHAGRAD_MAX_TOKENS must be >= 256, got {MAX_TOKENS}")
 
 # Per-process tokenization-truncation telemetry. ``_callback`` writes
 # here whenever the un-truncated jaxpr token sequence exceeds
@@ -159,6 +167,90 @@ def consume_tokenization_truncation_stats() -> dict:
         "max_observed_len": int(max_len),
         "overflow_sum": int(overflow_sum),
     }
+
+
+# ---------------------------------------------------------------------------
+# APPEND-ONLY tokenization (the palimpsa-native observation).
+# ---------------------------------------------------------------------------
+# The default path re-tokenizes the WHOLE jaxpr every step and hands the policy
+# a fixed MAX_TOKENS buffer, so the encoder re-reads the entire stream each time
+# and any graph longer than the budget is silently clipped. That throws away the
+# reason palimpsa (linear attention) was chosen: its state is a RECURRENCE, so
+# it can absorb only what is NEW.
+#
+# The append-only form: tokenize the base function ONCE, then emit just the
+# tokens produced by each elimination (its local paths / faces and the
+# approximations applied to them). `graphax.IncrementalPathTokenizer` is the
+# producer (`base_tokens()` then `eliminate(v)`); `approx.incremental_encoder`
+# (`init_state` / `extend` / `enc_x`) is the consumer that carries the palimpsa
+# state — already proven to match a full re-encode to 1e-4 for arbitrary splits
+# (tests/incremental_encoder_equivalence_test.py). This function is the bridge:
+# it turns an elimination prefix into that step's token DELTA.
+#
+# Deltas are cached by order prefix, so sibling envs that share a prefix share
+# the replay, and extending a prefix by one vertex is one `eliminate` call
+# rather than a full re-tokenize.
+MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "1024"))
+
+_INCR_TOK_CACHE: dict = {}
+_INCR_TOK_CACHE_CAP = 512
+
+
+def incremental_token_delta(jaxpr, argnums, consts, args, order_prefix,
+                            vocab_size: int = 512):
+    """Tokens ADDED by the last vertex of ``order_prefix`` (1-based ids).
+
+    ``order_prefix`` == () returns the base-function tokens. Returns a python
+    list of ints; the caller pads it to ``MAX_DELTA_TOKENS`` for the callback's
+    static output shape. Raises if a delta exceeds that budget — silently
+    clipping a delta would desync the encoder's recurrence from the stream,
+    which is much worse than clipping a re-read buffer.
+    """
+    from graphax import IncrementalPathTokenizer
+
+    key = (id(jaxpr), tuple(argnums), tuple(int(v) for v in order_prefix))
+    hit = _INCR_TOK_CACHE.get(key)
+    if hit is not None:
+        return hit[1]
+
+    prefix = tuple(int(v) for v in order_prefix)
+    if not prefix:
+        tk = IncrementalPathTokenizer(jaxpr, tuple(argnums), list(consts),
+                                      list(args), vocab_size=vocab_size)
+        delta = [int(t) for t in tk.base_tokens()]
+    else:
+        parent = _INCR_TOK_CACHE.get(
+            (id(jaxpr), tuple(argnums), prefix[:-1]))
+        if parent is None:
+            # Cold prefix: replay from the base once, then extend.
+            tk = IncrementalPathTokenizer(jaxpr, tuple(argnums), list(consts),
+                                          list(args), vocab_size=vocab_size)
+            list(tk.base_tokens())
+            for v in prefix[:-1]:
+                list(tk.eliminate(int(v)))
+        else:
+            tk = parent[0].__class__.__new__(parent[0].__class__)
+            # The tokenizer is stateful and has no cheap clone, so a cold
+            # replay is the honest fallback rather than aliasing the parent
+            # (which would corrupt a sibling branch's stream).
+            tk = IncrementalPathTokenizer(jaxpr, tuple(argnums), list(consts),
+                                          list(args), vocab_size=vocab_size)
+            list(tk.base_tokens())
+            for v in prefix[:-1]:
+                list(tk.eliminate(int(v)))
+        delta = [int(t) for t in tk.eliminate(int(prefix[-1]))]
+
+    if len(delta) > MAX_DELTA_TOKENS:
+        raise ValueError(
+            f"token delta for prefix {prefix} is {len(delta)} > "
+            f"MAX_DELTA_TOKENS={MAX_DELTA_TOKENS}. Raise "
+            f"ALPHAGRAD_MAX_DELTA_TOKENS — clipping a delta would desync the "
+            f"incremental encoder's recurrence from the token stream."
+        )
+    if len(_INCR_TOK_CACHE) > _INCR_TOK_CACHE_CAP:
+        _INCR_TOK_CACHE.clear()
+    _INCR_TOK_CACHE[key] = (tk, delta)
+    return delta
 
 
 # Per-face application telemetry: how much of the policy's intent actually

@@ -136,3 +136,35 @@ def test_env_exposes_the_per_face_switch():
     a = make_argparser().parse_args(["--example", "X", "--per-face"])
     assert a.per_face is True
     assert "applied_fraction" in consume_per_face_stats()
+
+
+# --------------------------------------------------------------------------- #
+# Observation token budget (the nn256 truncation)
+# --------------------------------------------------------------------------- #
+
+def test_max_tokens_is_configurable_and_sizes_the_positional_encoder():
+    """nn256 emits ~4657 tokens against a 4096 budget, so the tail of every
+    observation was silently clipped. MAX_TOKENS must be raisable, and the
+    positional encoder must follow it (otherwise raising it just moves the
+    failure into the encoder)."""
+    import os
+    import subprocess
+    import sys
+
+    src = (
+        "from alphagrad.approx.env import MAX_TOKENS;"
+        "from alphagrad.transformer.utils import PositionalEncoder;"
+        "import jax.numpy as jnp;"
+        "pe = PositionalEncoder(8, MAX_TOKENS);"
+        "x = jnp.zeros((MAX_TOKENS, 8));"
+        "print(MAX_TOKENS, pe(x).shape[0])"
+    )
+    env = dict(os.environ)
+    env["ALPHAGRAD_MAX_TOKENS"] = "8192"
+    env["ALPHAGRAD_DISABLE_RESOURCE_MONITOR"] = "1"
+    out = subprocess.run([sys.executable, "-c", src], capture_output=True,
+                         text=True, env=env, timeout=300)
+    assert out.returncode == 0, out.stderr[-600:]
+    budget, pe_len = out.stdout.strip().split()[-2:]
+    assert int(budget) == 8192
+    assert int(pe_len) == 8192, "positional encoder must span the whole budget"
