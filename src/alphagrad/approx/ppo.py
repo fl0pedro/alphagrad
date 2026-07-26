@@ -149,13 +149,17 @@ PAIR_STOP = NUM_AXIS_PAIRS
 # The remaining env-reward components are still emitted for host-side
 # logging / top-N heaps but do not enter the value head or advantage path.
 HEAD_REWARD_INDICES: tuple[int, ...] = (
-    REWARD_INDEX["flops"],
+    # Spec: the reward is measured latency + peak memory + cossim. flops
+    # (XLA cost analysis) used to sit in this slot as a latency proxy — the
+    # policy then optimized analyzed flops while measured latency drifted
+    # free. Requires --measure-latency (the channel is 0 without it).
+    REWARD_INDEX["latency_ns"],
     REWARD_INDEX["peak_memory"],
     REWARD_INDEX["cosine_sim"],
     REWARD_INDEX["frob_residual"],
 )
 NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
-HEAD_NAMES: tuple[str, ...] = ("flops", "mem", "cos", "frob")
+HEAD_NAMES: tuple[str, ...] = ("latency", "mem", "cos", "frob")
 
 # Print every loss component the moment the total goes non-finite. Off by
 # default because it forces a host callback inside the jitted update.
@@ -3435,7 +3439,7 @@ def main():
                 [scalar_reward] + [zeros] * (NUM_VALUE_HEADS - 1), axis=-1
             )
         else:
-            # ``HEAD_REWARD_INDICES`` selects (flops, peak_memory,
+            # ``HEAD_REWARD_INDICES`` selects (latency_ns, peak_memory,
             # cosine_sim, frob_residual). cosine passes through symlog
             # unchanged (bounded [0,1] already); the cost channels are
             # symlog'd. The value head still learns the symlog of
