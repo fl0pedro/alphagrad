@@ -3446,6 +3446,27 @@ def main():
             # CLI --lambda-* weights; in Stage F it's the Dirichlet sample.
             norm_adv = jnp.sum(norm_adv_components * traj.preference, axis=-1)
 
+        # Stage-by-stage NaN trace through the advantage/return path. The loss
+        # localizer proved the NaN is ALREADY in norm_adv / estim_returns when
+        # the batch is built, with every finite advantage exactly 0 and returns
+        # still at raw op-count scale (1e11) rather than symlog scale (~25).
+        # These prints say which stage first breaks that chain.
+        if _DEBUG_NAN:
+            def _st(name, x):
+                return jax.debug.print(
+                    "[trace] {n:<16} nan={b:<5} absmax={m:.4g}",
+                    n=name,
+                    b=jnp.sum(jnp.logical_not(jnp.isfinite(x))),
+                    m=jnp.max(jnp.abs(jnp.nan_to_num(x))))
+            _st("head_rewards", head_rewards)
+            _st("traj.value", traj.value)
+            _st("popart_mu", popart_mu)
+            _st("popart_sigma", popart_sigma)
+            _st("v_raw", v_raw)
+            _st("estim_returns", estim_returns)
+            _st("advantages", advantages)
+            _st("norm_adv", norm_adv)
+
         # `old_*_dists` are the dynamic-mode equivalent of the legacy
         # old_{vertex,pair,factor}_dists fields — but TrainBatch only
         # carries the legacy ones plus the typed action sequence. The
