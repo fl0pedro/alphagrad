@@ -298,9 +298,20 @@ own module), not deleting.
       OOM-killed at ep 65 sharing `--mem=200G`; exact solo then got requeued.
 - [~] **Exact-vs-approx comparison IN FLIGHT** — jobs 55445 (exact, pgi15-gpu16)
       and 55449 (approx `--per-face`, pgi14-gpu12), plus 55450 (ADALIF-SNN).
-      NOTE: 55447 (approx WITHOUT `--per-face`) FAILED with `TRANSFORM DID NOT
-      FIT` — a Diag the per-vertex mask admitted did not fit the live edge —
-      which is exactly the failure class `--per-face` removes by construction.
+      Run history (each failure real, each found only by running):
+      * 55447 approx WITHOUT `--per-face` -> `TRANSFORM DID NOT FIT` (a Diag the
+        per-vertex mask admitted did not fit the live edge) — exactly the class
+        `--per-face` removes by construction.
+      * 55449 approx WITH `--per-face` -> `TypePromotionError (float4_e2m1fn,
+        float32)`: the quant hardware scan only probed same-dtype `dot`, so
+        narrow types passed and then died against an un-quantized float32
+        partner. Fixed in graphax 4715c00 (scan now probes float32 mixing;
+        narrow types masked out unless GRAPHAX_QUANT_ALLOW_NARROW=1, which
+        needs the partner-cast).
+      * 55450 ADALIF-SNN -> `ptxas exited with error code 139` (compiler
+        segfault, register spilling). TOOLCHAIN issue, not our code; needs XLA
+        flags or a smaller SNN before it can be re-tried.
+      * 55452 approx `--per-face` on the fixed graphax — in flight.
 
 ### P1 — spec compliance (action space + measurement)
 - [x] **Per-path/per-face approximation.** `--per-face` wraps each vertex's
