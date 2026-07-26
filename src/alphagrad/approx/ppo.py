@@ -421,6 +421,12 @@ class Trajectory(NamedTuple):
     # re-masks identically to the rollout (keeps the PPO ratio 1 at epoch 0).
     micro_pair_valid: jax.Array  # (MAX_AXES_PER_VERTEX, MAX_AXES_PER_VERTEX) float32
     micro_compress_valid: jax.Array  # (MAX_AXES_PER_VERTEX,) float32
+    # Live axis features at sample time (pre-step state). The loss must
+    # evaluate against these, not env.axis_state_static: once a DIAG/COMPRESS
+    # lands, the static copy diverges from what the rollout sampled under and
+    # the PPO ratio silently leaves 1 at epoch 0.
+    axis_state: jax.Array  # (total_v, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM) int32
+    axis_valid_mask: jax.Array  # (total_v, MAX_AXES_PER_VERTEX)
     discount: jax.Array
     vertex_avail_mask: jax.Array
 
@@ -452,6 +458,8 @@ class TrainBatch(NamedTuple):
     old_micro_quant_logp: jax.Array  # (max_substeps,) RAW factored-quant log-prob
     micro_pair_valid: jax.Array  # (MAX_AXES_PER_VERTEX, MAX_AXES_PER_VERTEX)
     micro_compress_valid: jax.Array  # (MAX_AXES_PER_VERTEX,)
+    axis_state: jax.Array  # (total_v, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM) int32
+    axis_valid_mask: jax.Array  # (total_v, MAX_AXES_PER_VERTEX)
     estim_returns: jax.Array
     norm_adv: jax.Array
     vertex_avail_mask: jax.Array
@@ -2974,6 +2982,8 @@ def main():
                 micro_quant_logp=micro_quant_logp,
                 micro_pair_valid=micro_pair_valid,
                 micro_compress_valid=micro_compress_valid,
+                axis_state=state.axis_state,
+                axis_valid_mask=state.axis_valid_mask,
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
             )
@@ -3033,14 +3043,15 @@ def main():
             quant_scale_sign=batch.micro_quant_scale_sign_seq,
         )
 
-        def _eval_dyn(toks, eids, rs, pref, vidx, action, vmask, cached, k, pv, cv):
+        def _eval_dyn(toks, eids, rs, pref, vidx, action, vmask, ax_st, ax_vm,
+                      cached, k, pv, cv):
             return agent.evaluate_action_dynamic(
                 toks,
                 vidx,
                 action,
                 vmask,
-                env.axis_state_static,
-                env.axis_valid_static,
+                ax_st,
+                ax_vm,
                 factor_tables,
                 k,
                 eqn_ids=eids,
@@ -3066,9 +3077,11 @@ def main():
                 new_kind_dists,
                 new_quant_logp,
             ) = jax.vmap(
-                lambda toks, eids, rs, pref, vidx, action, vmask, k, pv, cv:
+                lambda toks, eids, rs, pref, vidx, action, vmask, ax_st, ax_vm,
+                k, pv, cv:
                 _eval_dyn(
-                    toks, eids, rs, pref, vidx, action, vmask, None, k, pv, cv
+                    toks, eids, rs, pref, vidx, action, vmask, ax_st, ax_vm,
+                    None, k, pv, cv
                 )
             )(
                 batch.tokens,
@@ -3078,6 +3091,8 @@ def main():
                 batch.vertex_idx,
                 actions,
                 batch.vertex_avail_mask,
+                batch.axis_state,
+                batch.axis_valid_mask,
                 keys,
                 batch.micro_pair_valid,
                 batch.micro_compress_valid,
@@ -3103,6 +3118,8 @@ def main():
                 batch.vertex_idx,
                 actions,
                 batch.vertex_avail_mask,
+                batch.axis_state,
+                batch.axis_valid_mask,
                 cached_flat,
                 keys,
                 batch.micro_pair_valid,
@@ -3580,6 +3597,8 @@ def main():
             old_micro_quant_logp=traj.micro_quant_logp,
             micro_pair_valid=traj.micro_pair_valid,
             micro_compress_valid=traj.micro_compress_valid,
+            axis_state=traj.axis_state,
+            axis_valid_mask=traj.axis_valid_mask,
             estim_returns=estim_returns,
             norm_adv=norm_adv,
             vertex_avail_mask=traj.vertex_avail_mask,
