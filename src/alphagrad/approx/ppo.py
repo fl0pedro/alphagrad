@@ -3738,10 +3738,15 @@ def main():
     # LIVE per-vertex pair / compress validity — the nominal tag-bit mask admits
     # per-face-invalid DIAGs and graphax then throws "TRANSFORM DID NOT FIT".
     # ppo.py's rollout is jitted + vmapped, so we bridge to the host-side
-    # LiveVertexMaskOracle with a `pure_callback` that replays it (STRUCTURALLY,
-    # rules=()) from the elimination prefix each step and returns per-vertex
-    # masks. Cost is O(steps) replay per call; fine for the small vertex graphs.
+    # LiveVertexMaskOracle with a `pure_callback` that replays the elimination
+    # prefix each step WITH THE ACTUALLY-APPLIED RULES (decoded from the env's
+    # own sparsity_specs history via decode_vertex_rule_specs — the same
+    # translation _callback uses for the measurement). advance()'s contract
+    # demands the applied transforms; the old structural rules=() replay went
+    # stale after the first landed approximation. Cost is O(steps) replay per
+    # call; fine for the small vertex graphs.
     from alphagrad.approx.common.masks import LiveVertexMaskOracle as _LVMO
+    from alphagrad.approx.env import decode_vertex_rule_specs as _decode_specs
     _oracle_jaxpr = closed_jaxpr.jaxpr
     _oracle_consts = list(closed_jaxpr.literals)
     _oracle_args = list(xs)
@@ -3749,27 +3754,35 @@ def main():
     _oracle_N = MAX_AXES_PER_VERTEX
     _oracle_total_v = len(_oracle_jaxpr.eqns)
 
-    def _oracle_masks_host(elim_order, step_count):
-        eo = np.asarray(elim_order).reshape(-1)
+    def _oracle_masks_host(order, spec_hist, step_count):
+        eo = np.asarray(order).reshape(-1)
+        specs = np.asarray(spec_hist)
         n = int(np.asarray(step_count))
         o = _LVMO(_oracle_jaxpr, _oracle_consts, _oracle_args, _oracle_argnums,
                   max_axes=_oracle_N)
         for k in range(n):
+            v = int(eo[k])  # env order is 1-based already
             try:
-                o.advance(int(eo[k]) + 1, rules=())  # vertex_idx is 0-based; oracle 1-based
+                rules = _decode_specs(
+                    _oracle_jaxpr, v, specs[k], is_last=(k == n - 1)
+                )
+            except Exception:
+                rules = ()
+            try:
+                o.advance(v, rules=rules)
             except Exception:
                 break
         pair, comp = o.masks()
         return np.asarray(pair, np.float32), np.asarray(comp, np.float32)
 
-    def _oracle_masks(elim_order, step_count):
+    def _oracle_masks(order, spec_hist, step_count):
         """(pair (total_v+1, N, N), comp (total_v+1, N)) for the current graph."""
         return jax.pure_callback(
             _oracle_masks_host,
             (jax.ShapeDtypeStruct((_oracle_total_v + 1, _oracle_N, _oracle_N),
                                   jnp.float32),
              jax.ShapeDtypeStruct((_oracle_total_v + 1, _oracle_N), jnp.float32)),
-            elim_order, step_count, vmap_method="sequential",
+            order, spec_hist, step_count, vmap_method="sequential",
         )
 
     total_v = len(closed_jaxpr.jaxpr.eqns)
@@ -4099,7 +4112,7 @@ def main():
                 # Live per-vertex DIAG/COMPRESS masks for the current graph
                 # (replayed from the elimination prefix so far).
                 oracle_pair_all, oracle_comp_all = _oracle_masks(
-                    elim_order, state.step_count)
+                    state.order, state.sparsity_specs, state.step_count)
                 (
                     vertex_idx,
                     micro_actions,
