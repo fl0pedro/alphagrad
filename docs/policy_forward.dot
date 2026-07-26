@@ -1,0 +1,123 @@
+// Policy forward pass for ONE env step (nn256 / PPO / --dynamic-substeps).
+//
+// Traced from source, not prose:
+//   Agent fields + Agent.encode          -> approx/ppo.py  (class Agent)
+//   Agent.sample_action_dynamic          -> approx/ppo.py:917
+//   MicroActionPolicy / MicroActionHead  -> approx/heads.py
+//   MicroActionHead.sample_step          -> approx/heads.py (head call order)
+//   FACTOR_ORDER                         -> approx/quant_factoring.py:37
+//   MAX_AXES_PER_VERTEX=8, AXIS_FEATURE_DIM=4 -> approx/env.py:359-360
+//   NUM_OPS=4, MAX_PRIMES=9, COMPRESS_KINDS   -> approx/heads.py:83,97,89
+//
+// Render:  dot -Tsvg policy_forward.dot -o policy_forward.svg
+
+digraph policy_forward {
+  rankdir=TB;
+  bgcolor="transparent";
+  compound=true;
+  splines=spline;
+  nodesep=0.35;
+  ranksep=0.45;
+  node [shape=box, style="rounded,filled", fillcolor="#f4f4f2",
+        color="#d0cfca", fontname="Helvetica", fontsize=11,
+        margin="0.14,0.09"];
+  edge [color="#6a6a68", arrowsize=0.7, fontname="Helvetica", fontsize=9];
+
+  // ---------------- observation + trunk ----------------
+  subgraph cluster_trunk {
+    label="TRUNK  (Agent.encode)";
+    labeljust="l"; fontname="Helvetica-Bold"; fontsize=10; fontcolor="#6a6a68";
+    color="#d0cfca"; style="rounded";
+
+    tokens   [label="tokens (MAX_TOKENS,)\n+ eqn_ids", fillcolor="#ffffff"];
+    embed    [label="embedding + pos_enc\nEmbedding(vocab, E) · PositionalEncoder"];
+    encoder  [label="palimpsa Encoder\nlinear attention → enc_x (S,E)",
+              fillcolor="#eceaf5", color="#6b5bd6"];
+    vfeat    [label="vertex_feature_proj ⊕ op_embedding\n(+ set_transformer_agg over samples)"];
+    resid    [label="residual_state\n→ residual_to_summary"];
+    ctx      [label="vertex_contexts (V,E)  +  summary (E,)"];
+
+    tokens -> embed -> encoder -> ctx;
+    vfeat  -> ctx [style=dashed, label="added"];
+    resid  -> ctx [style=dashed, label="added"];
+  }
+
+  // ---------------- value ----------------
+  subgraph cluster_value {
+    label="VALUE  (4 heads, concat)";
+    labeljust="l"; fontname="Helvetica-Bold"; fontsize=10; fontcolor="#6a6a68";
+    color="#d0cfca"; style="rounded";
+    vhead [label="value_head_flops | _mem | _cos | _frob\nMLP(E→1) each  →  value (4,)",
+           fillcolor="#eceaf5", color="#6b5bd6"];
+  }
+  ctx -> vhead [label="summary"];
+
+  // ---------------- macro action ----------------
+  subgraph cluster_macro {
+    label="MACRO ACTION  —  one vertex per env step";
+    labeljust="l"; fontname="Helvetica-Bold"; fontsize=10; fontcolor="#6a6a68";
+    color="#d0cfca"; style="rounded";
+
+    vpol  [label="PointerVertexPolicy\nvertex_logits (V,)"];
+    vmask [label="vertex_avail_mask\nwhere(mask>0.5, logits, −1e9)",
+           shape=note, fillcolor="#ffffff", color="#6b5bd6", fontcolor="#6b5bd6"];
+    vsamp [label="softmax → Categorical.sample\n→ vertex_idx"];
+
+    vpol -> vsamp;
+    vmask -> vsamp [color="#6b5bd6", style=dashed];
+  }
+  ctx -> vpol [label="vertex_contexts"];
+
+  // ---------------- per-vertex features + live masks ----------------
+  axfeat [label="_axis_features_from_state(\n  axis_state[vertex_idx] (8,4),\n  axis_valid_mask[vertex_idx] )\n→ AxisTokenFeatures"];
+  oracle [label="LiveVertexMaskOracle  (host, jax.pure_callback)\nreplayed with the APPLIED rules\npair_valid[v+1] (8,8) · compress_valid[v+1] (8,)",
+          shape=note, fillcolor="#ffffff", color="#6b5bd6", fontcolor="#6b5bd6"];
+
+  vsamp -> axfeat [label="vertex_idx"];
+  vsamp -> oracle [label="index v+1", color="#6b5bd6", style=dashed];
+
+  // ---------------- micro sub-episode ----------------
+  subgraph cluster_micro {
+    label="MICRO SUB-EPISODE  —  lax.scan, ≤ max_substeps, per chosen vertex";
+    labeljust="l"; fontname="Helvetica-Bold"; fontsize=10; fontcolor="#6a6a68";
+    color="#6b5bd6"; style="rounded";
+
+    aenc [label="AxisSetEncoder\nself-attention over ≤8 axis tokens\n→ axis_tokens (N,E) + summary (E,)",
+          fillcolor="#eceaf5", color="#6b5bd6"];
+
+    ophd [label="OpTypeHead\nmasked softmax over NUM_OPS=4\nDIAG · COMPRESS · QUANT · END"];
+    ihd  [label="AxisPointerHead  (i)\nmask = diag | compress"];
+    jhd  [label="AxisPointerHead  (j)\nj_context = summary + axis_tokens[i]\nj_mask = j_mask_for_i_diag[i]"];
+    fhd  [label="PrimeExponentHead\nexponents over MAX_PRIMES=9\n→ factor (not a flat categorical)"];
+    khd  [label="CompressKindHead\nmean min max median\nabs_min abs_max"];
+    qhd  [label="FactoredQuantHead\nsign_head (±1)  +  7 factor_heads\nkind bits exp mantissa bias finite uz\n→ tuple-match → catalog dtype"];
+
+    aenc -> ophd;
+    ophd -> ihd  [label="if DIAG|COMPRESS"];
+    ihd  -> jhd  [label="if DIAG  (autoregressive)"];
+    jhd  -> fhd  [label="if DIAG"];
+    ophd -> khd  [label="if COMPRESS"];
+    ophd -> qhd  [label="if QUANT"];
+  }
+
+  axfeat -> aenc;
+  oracle -> ihd [color="#6b5bd6", style=dashed, label="−1e9 on illegal"];
+  oracle -> jhd [color="#6b5bd6", style=dashed];
+
+  gate [label="≥2-options rule (head skipping)\n1 option → forced, 0 logp / 0 entropy / arity 0\n0 options → head dropped entirely",
+        shape=note, fillcolor="#ffffff", color="#6b5bd6", fontcolor="#6b5bd6"];
+  ophd -> gate [style=dashed, color="#6b5bd6", dir=none];
+
+  // ---------------- action out ----------------
+  act [label="MicroAction\nop_type · i · j · exponents · factor\ncompress_kind · quant_dtype · quant_scale_sign",
+       fillcolor="#eceaf5", color="#6b5bd6"];
+  fhd -> act; khd -> act; qhd -> act; ophd -> act [label="END → stop"];
+
+  env [label="micro_actions_to_rule_specs_jax → StepAction\nenv.step  (io_callback → _callback)\ngraphax jacve(order, transforms | face_transforms)"];
+  act -> env;
+
+  rew [label="8 reward channels  (costs stored NEGATED, cosine ∈ [0,1])\nmuls flops latency max_io bytes peak_mem · cosine frob",
+       fillcolor="#eceaf5", color="#6b5bd6"];
+  env -> rew;
+
+}

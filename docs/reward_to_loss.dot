@@ -1,0 +1,71 @@
+// Reward -> advantage -> PPO loss, with the guards that make the signal honest.
+//
+// Traced from source, not prose:
+//   8 channels + convention        -> approx/env.py:210  (REWARD_NAMES)
+//   degenerate-plan sentinel       -> approx/env.py      (_SENTINEL_BAD_REWARD, wired in _callback)
+//   HEAD_REWARD_INDICES            -> approx/ppo.py:135
+//   _symlog_rewards                -> approx/ppo.py:205
+//   GAE                            -> approx/common/gae.py (make_get_advantages)
+//   _popart_derive / _popart_update-> approx/ppo.py
+//   loss terms                     -> approx/ppo.py:3064-3069, 3074, 3217-3220
+//   mult gate                      -> approx/ppo.py:218  (_apply_mult_gate)
+//
+// Render:  dot -Tsvg reward_to_loss.dot -o reward_to_loss.svg
+
+digraph reward_to_loss {
+  rankdir=TB;
+  bgcolor="transparent";
+  splines=spline;
+  nodesep=0.35;
+  ranksep=0.42;
+  node [shape=box, style="rounded,filled", fillcolor="#f4f4f2",
+        color="#d0cfca", fontname="Helvetica", fontsize=11,
+        margin="0.14,0.09"];
+  edge [color="#6a6a68", arrowsize=0.7, fontname="Helvetica", fontsize=9];
+
+  meas [label="env._callback  (terminal step)\n8 channels, higher-is-better\ncosts NEGATED · cosine ∈[0,1] · frob = −residual",
+        fillcolor="#eceaf5", color="#6b5bd6"];
+
+  g1 [label="GUARD 1 — degenerate-plan sentinel\nif (muls≤0 and flops≤0) or cosine≤1e-6:\n  every cost := −1e10   (NOT 0)\na zero-work plan is INVALID, not cheap",
+      shape=note, fillcolor="#ffffff", color="#c0392b", fontcolor="#c0392b"];
+  meas -> g1 [color="#c0392b", style=dashed, dir=none];
+
+  sel [label="HEAD_REWARD_INDICES → 4 of 8\nflops · peak_memory · cosine_sim · frob_residual",
+       fillcolor="#eceaf5", color="#6b5bd6"];
+  meas -> sel;
+
+  g2 [label="GUARD 2 — quality is actually trained\ncosine_sim IS a value head (--lambda-acc 2.0)\npreviously the head labelled \"acc\" was fed frob,\nso cosine never entered the gradient at all",
+      shape=note, fillcolor="#ffffff", color="#c0392b", fontcolor="#c0392b"];
+  sel -> g2 [color="#c0392b", style=dashed, dir=none];
+
+  sym  [label="_symlog_rewards\nsymlog every channel EXCEPT cosine\n(cosine already bounded [0,1])"];
+  gae  [label="GAE per channel\nshared γ=0.99, λ=0.95  (no per-channel discount)"];
+  sel -> sym -> gae;
+
+  pop [label="PopArt  (--advantage-norm popart, default)\nstate = RAW accumulators (m1, m2, w)\nμ,σ = debiased(m1,m2,w)   per channel\ntargets (G−μ)/σ · advantages A/σ\n+ output-preserving value-head rescale",
+       fillcolor="#eceaf5", color="#6b5bd6"];
+  gae -> pop;
+
+  g3 [label="GUARD 3 — replaces the z-score ratchet\nbatch z-score: once the batch is uniformly degenerate\nstd→0, so the ONE opposing channel vanishes\n→ one-way ratchet into collapse",
+      shape=note, fillcolor="#ffffff", color="#c0392b", fontcolor="#c0392b"];
+  pop -> g3 [color="#c0392b", style=dashed, dir=none];
+
+  scal [label="scalarize:  Σ_k  adv_k · preference_k\npreference = (flops 1, mem 1, cos 2, frob 0)"];
+  pop -> scal;
+
+  ratio [label="ratio-1 invariant\nstored & re-fed at loss time:\nvertex_avail_mask · oracle pair/compress masks\n· raw factored-quant log-prob",
+         shape=note, fillcolor="#ffffff", color="#6b5bd6", fontcolor="#6b5bd6"];
+
+  loss [label="PPO loss\nppo   = mean(−min(ratio·A, clip(ratio,1±ε)·A))\nvalue = value_weight · MSE(V, symlog(G))\nent   = entropy_weight · mean(H / max(sub_lengths,1))\ntotal = ppo + value − ent",
+        fillcolor="#eceaf5", color="#6b5bd6"];
+  scal  -> loss;
+  ratio -> loss [color="#6b5bd6", style=dashed];
+
+  alt [label="ALTERNATIVE  --reward-mode mult\ng(cos) = clip((cos−τ)/(1−τ), 0, 1)\ncheap  = max(0, W − Σ w_c·symlog(cost_c))\nreward = g(cos)·cheap  + shaped anti-degeneracy penalty\n⇒ cos→0 gives reward→0 no matter how cheap"];
+  meas -> alt [style=dashed, label="instead of the additive path"];
+
+  host [label="host-side guards (never enter the gradient)\ntop-N / best_global exclude collapsed rows\ncollapse/degenerate_plans_this_ep logged",
+        shape=note, fillcolor="#ffffff", color="#6b5bd6", fontcolor="#6b5bd6"];
+  meas -> host [color="#6b5bd6", style=dashed];
+
+}
