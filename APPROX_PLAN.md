@@ -213,6 +213,29 @@ A5. Re-run approx (exact 55409 stays valid — VE-only has no degenerate route;
 
 ---
 
+## 1d. Trim (2026-07-26) — ppo.py 5718 -> 3949 lines
+
+The audits' dead-code findings were acted on rather than filed. Removed with
+44 local tests green before and after (commit `1e891bb`):
+the whole legacy rule-policy family (RuleDecoder / AutoregRulePolicy /
+SparsityRatio* / SingleRulePolicy, ~890 lines) plus its loss body, rollout
+branch and Agent methods; BC warm-start; the cache-encoding path;
+MLPVertexPolicy; 8 orphaned CLI flags and the use_pointer/use_autoreg
+plumbing. `_HEAD_PATH_MARKERS` was repointed from the deleted `rule_policy.*`
+paths to the live micro-action heads (the per-head LR ramp and freeze masks
+had been matching parameters that no longer existed — a silent no-op).
+
+**Why it was 5.7k:** three generations of experiment (rule-decoder ->
+sparsity-ratio -> micro-actions) layered without deletion. The essential
+algorithm is ~3-4k: it is genuinely ~2x the simple `alphagrad/ppo` example
+because it adds a per-vertex sub-episode of typed approximation actions,
+live-structure masking via a host oracle, a factored 7-way quant head, and
+an 8-channel measured reward with a 4-head value function. Further real
+reduction means MOVING code out (argparser -> args_ppo.py, logging -> its
+own module), not deleting.
+
+---
+
 ## 2. What is already DONE
 
 ### Core loop
