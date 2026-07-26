@@ -161,6 +161,20 @@ def consume_tokenization_truncation_stats() -> dict:
     }
 
 
+# Per-face application telemetry: how much of the policy's intent actually
+# survived per-face masking. ``applied`` / ``skipped`` / ``skipped_raised``.
+_PER_FACE_STATS: dict = {}
+
+
+def consume_per_face_stats() -> dict:
+    """Pop the per-period per-face apply counts (mirrors the other pollers)."""
+    out = dict(_PER_FACE_STATS)
+    _PER_FACE_STATS.clear()
+    total = sum(out.values()) or 1
+    out["applied_fraction"] = out.get("applied", 0) / total
+    return out
+
+
 # ---------------------------------------------------------------------------
 # XLA-analysis side-channel. The reward vector's shape is baked into the jit
 # (NUM_REWARDS), so the extra diagnostics the logging spec asks for —
@@ -413,6 +427,14 @@ class EnvConfig(NamedTuple):
     # timing noise, so when latency isn't measured we collapse to 1 rep.
     num_data_points: int = 5
     reps_per_point: int = 4
+    # PER-FACE application. Off: the vertex's rule list is handed to graphax
+    # literally and applied uniformly to EVERY face (so a rule must fit all of
+    # them or it raises / is masked away). On: the rules are wrapped in a
+    # per-face callable that applies each one only where it is legal on THAT
+    # face's live operand — the per-path granularity the spec asks for, and
+    # the per-path SKIP falls out of it (a face where nothing is legal is
+    # left exact).
+    per_face: bool = False
 
 
 def _get_partials(order, sparsity_specs, stop):
@@ -1227,7 +1249,18 @@ def _callback(
             is_last=(v_idx == last_v_idx),
         )
         if rules:
-            transforms.append((int(v), tuple(rules)))
+            if getattr(config, "per_face", False):
+                # graphax invokes a CALLABLE transform once per face, handing
+                # it that face's live operand — so this is where per-path
+                # legality is decided. Rules that don't fit a given face are
+                # skipped for that face only (not for the whole vertex).
+                from alphagrad.approx.common.masks import make_live_masked_hook
+                _face_stats = _PER_FACE_STATS
+                transforms.append(
+                    (int(v), (make_live_masked_hook(rules, stats=_face_stats),))
+                )
+            else:
+                transforms.append((int(v), tuple(rules)))
     ve = extract_jaxpr(
         config.jaxpr,
         config.argnums,
@@ -1655,6 +1688,7 @@ class VertexEliminationEnv:
         latency_samples: int = 1,
         num_data_points: int = 5,
         reps_per_point: int = 4,
+        per_face: bool = False,
         measure_grad: bool = False,
         quality_rewarded=None,
         **_compat,
@@ -1680,6 +1714,7 @@ class VertexEliminationEnv:
             mem_type=mem_type,
             num_data_points=int(num_data_points),
             reps_per_point=int(reps_per_point),
+            per_face=bool(per_face),
             target_fun=target_fun,
             data_gen=data_gen,
             exec_on_gpu=exec_on_gpu,

@@ -78,6 +78,7 @@ from alphagrad.approx.common import (
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
     _AXIS_FEAT_GROUP_ID,
+    consume_per_face_stats,
     consume_tokenization_truncation_stats,
     consume_xla_memory_stats,
     _AXIS_FEAT_IS_COMPRESSED,
@@ -1319,6 +1320,14 @@ def make_argparser() -> argparse.ArgumentParser:
         "ALPHAGRAD_REWARD_MODE=mult; the structural anti-collapse option).",
     )
     p.add_argument(
+        "--per-face", action="store_true",
+        help="Apply each vertex's approximation rules PER FACE (per local "
+        "path) instead of uniformly to every face: a rule lands only where "
+        "it is legal on that face's live operand, and a face where nothing "
+        "is legal is left exact (the per-path skip). This is the O(|E|^2) "
+        "action granularity the spec asks for.",
+    )
+    p.add_argument(
         "--advantage-norm", type=str, default="popart",
         choices=["popart", "zscore"],
         help="popart (default): per-channel debiased-EMA normalisation of "
@@ -2436,6 +2445,7 @@ def main():
         measure_latency=measure_latency,
         num_data_points=int(args.num_data_points),
         reps_per_point=int(args.reps_per_point),
+        per_face=bool(args.per_face),
         terminal_rewards_only=args.terminal_rewards_only,
     )
 
@@ -3865,6 +3875,15 @@ def main():
             for j, nm in enumerate(HEAD_NAMES):
                 log_dict[f"popart/mu_{nm}"] = float(_mu[j])
                 log_dict[f"popart/sigma_{nm}"] = float(_sig[j])
+
+        # ---- per-face apply telemetry ---------------------------------------
+        if args.per_face:
+            pf = consume_per_face_stats()
+            if pf.get("applied", 0) or pf.get("skipped", 0):
+                log_dict["per_face/applied"] = pf.get("applied", 0)
+                log_dict["per_face/skipped"] = pf.get("skipped", 0)
+                log_dict["per_face/skipped_raised"] = pf.get("skipped_raised", 0)
+                log_dict["per_face/applied_fraction"] = pf["applied_fraction"]
 
         # ---- XLA side-channel: xla_peak_memory + compression ratio ----------
         xla_stats = consume_xla_memory_stats()

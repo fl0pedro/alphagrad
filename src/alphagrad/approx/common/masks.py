@@ -856,6 +856,40 @@ def rule_is_legal(st, rule, *, max_dims: int = 8, max_axes: int = 8) -> bool:
     return False
 
 
+def couple_quant_rules(rules, applied_dtype=None):
+    """Quant contraction coupling: **one quantization per turn**, and the
+    second operand of a contraction INHERITS the first's dtype.
+
+    The hardware compat matrix is largely self-only (int4 only dots with int4),
+    so letting the policy pick an independent dtype for the post operand mostly
+    produces an illegal contraction. Rather than mask that choice away, the
+    spec's resolution is to make it automatic: the first Quant in a turn is the
+    policy's decision, and any later Quant in the same turn is REWRITTEN to the
+    same dtype (the "inherit") — leaving the genuinely-new choice for the
+    result edge on the next turn.
+
+    Returns ``(coupled_rules, dtype_in_force)``. ``applied_dtype`` carries the
+    dtype already in force from earlier in the same turn (None = free choice).
+    """
+    from graphax.sparse.micro_actions import Quant
+
+    out, in_force = [], applied_dtype
+    for r in rules:
+        if isinstance(r, Quant):
+            if in_force is None:
+                in_force = r.dtype
+                out.append(r)
+            elif r.dtype == in_force:
+                out.append(r)            # already consistent
+            else:
+                # inherit: same dtype, keep the policy's sign choice
+                out.append(Quant(dtype=in_force,
+                                 scale_sign=getattr(r, "scale_sign", 1)))
+        else:
+            out.append(r)
+    return tuple(out), in_force
+
+
 def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
                           stats: dict | None = None):
     """Wrap ``rules`` into the per-vertex callable graphax applies PER FACE.
@@ -877,9 +911,11 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
         if stats is not None:
             stats[key] = stats.get(key, 0) + 1
 
+    coupled, _ = couple_quant_rules(rules)
+
     def _hook(st):
         cur = st
-        for rule in rules:
+        for rule in coupled:
             if not rule_is_legal(cur, rule, max_dims=max_dims,
                                  max_axes=max_axes):
                 _bump("skipped")
