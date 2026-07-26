@@ -266,6 +266,83 @@ def _apply_mult_gate(
     out = jnp.zeros_like(rewards)
     return out.at[..., REWARD_INDEX["cosine_sim"]].set(gated)
 
+
+def _popart_derive(m1, m2, w, sigma_min, sigma_max):
+    """Debiased (mu, sigma) from the raw EMA accumulators.
+
+    The state carried across episodes is the RAW accumulators (m1, m2, w);
+    debiasing happens only at point of use. Returning the debiased value and
+    feeding it back as the accumulator double-counts and the scale explodes
+    (mu ran 1e7 -> 5e8 in two updates before this split).
+    """
+    wc = jnp.maximum(w, 1e-8)
+    mu = m1 / wc
+    var = m2 / wc - jnp.square(mu)
+    sigma = jnp.clip(jnp.sqrt(jnp.maximum(var, 1e-12)), sigma_min, sigma_max)
+    # Before the first update (w == 0) fall back to the identity transform so
+    # de/re-normalisation is a no-op rather than a divide-by-noise.
+    warm = w > 1e-8
+    return jnp.where(warm, mu, 0.0), jnp.where(warm, sigma, 1.0)
+
+
+def _popart_update(m1, m2, w, returns, beta, sigma_min, sigma_max, winsor_k):
+    """One debiased-EMA PopArt step on the RAW accumulators, jax-native so it
+    runs inside the jit.
+
+    ``returns`` is ``(E, T, K)`` raw per-channel value targets. Mirrors
+    ``common.popart.PopArtStats`` (numpy/host-side, hence unusable inside
+    ``train_episode``): winsorize each channel to ``mu +/- winsor_k*sigma``
+    so one extreme cost outlier can't spike a channel's sigma and crush the
+    others' relative advantage; debias with the Adam-style ``w`` accumulator
+    so the FIRST update adopts the batch stats exactly instead of crawling
+    away from the (0, 1) init.
+
+    Returns the new ``(m1, m2, w)``.
+    """
+    mu, sigma = _popart_derive(m1, m2, w, sigma_min, sigma_max)
+    flat = returns.reshape(-1, returns.shape[-1])                 # (B, K)
+    # Winsorize against the current stats — but only once they mean something.
+    # On the first update the stats are the arbitrary (0, 1) init, so clipping
+    # would crush a 1e7-scale channel to +/-5 and debiasing could never
+    # recover the true scale.
+    warm = w > 1e-8
+    lo, hi = mu - winsor_k * sigma, mu + winsor_k * sigma
+    flat = jnp.where(warm, jnp.clip(flat, lo, hi), flat)
+    batch_m1 = jnp.mean(flat, axis=0)
+    batch_m2 = jnp.mean(jnp.square(flat), axis=0)
+    new_m1 = m1 * (1.0 - beta) + batch_m1 * beta
+    new_m2 = m2 * (1.0 - beta) + batch_m2 * beta
+    new_w = w + beta * (1.0 - w)
+    return new_m1, new_m2, new_w
+
+
+def _popart_rescale_heads(agent, old_mu, old_sigma, new_mu, new_sigma):
+    """Output-preserving rescale of the four single-output value heads.
+
+    ``sigma'*head'(x) + mu' == sigma*head(x) + mu`` for every x, so shifting
+    the normalisation does not perturb the critic's predictions (the "ART" in
+    PopArt). ``common.popart.popart_rescale_mlp_head`` assumes ONE head with K
+    output rows; ours are K separate 1-row MLPs, so apply it per head.
+    """
+    heads = ("value_head_flops", "value_head_mem", "value_head_cos",
+             "value_head_frob")
+    for k, name in enumerate(heads):
+        mlp = getattr(agent, name)
+        seq = mlp.layers.layers
+        li = max(i for i, l in enumerate(seq) if isinstance(l, eqx.nn.Linear))
+        lin = seq[li]
+        ratio = (old_sigma[k] / new_sigma[k]).astype(lin.weight.dtype)
+        new_w = lin.weight * ratio
+        new_b = ((old_sigma[k] * lin.bias + old_mu[k] - new_mu[k])
+                 / new_sigma[k]).astype(lin.bias.dtype)
+        mlp = eqx.tree_at(
+            lambda m, _li=li: (m.layers.layers[_li].weight,
+                               m.layers.layers[_li].bias),
+            mlp, (new_w, new_b),
+        )
+        agent = eqx.tree_at(lambda a, _n=name: getattr(a, _n), agent, mlp)
+    return agent
+
 # Mapping from pair index 0..NUM_AXIS_PAIRS-1 -> (base_idx1, base_idx2). STOP is unused.
 _PAIR_TO_BASE = jnp.array(
     [
@@ -1240,6 +1317,32 @@ def make_argparser() -> argparse.ArgumentParser:
         "anti-degeneracy penalty, written into the cosine head with a "
         "one-hot preference (ported from the ray worker's "
         "ALPHAGRAD_REWARD_MODE=mult; the structural anti-collapse option).",
+    )
+    p.add_argument(
+        "--advantage-norm", type=str, default="popart",
+        choices=["popart", "zscore"],
+        help="popart (default): per-channel debiased-EMA normalisation of "
+        "value targets + sigma-scaled advantages, with an output-preserving "
+        "head rescale. zscore: the legacy per-batch z-score, which has a "
+        "collapse ratchet (a uniformly-degenerate batch drives std->0 so the "
+        "opposing channel vanishes).",
+    )
+    p.add_argument("--popart-beta", type=float, default=1e-2,
+                   help="PopArt EMA rate per update.")
+    p.add_argument("--popart-sigma-min", type=float, default=0.1,
+                   help="Per-channel sigma floor (stops advantage blow-up "
+                   "when a channel goes uniform).")
+    p.add_argument(
+        "--num-data-points", type=int, default=5,
+        help="Measurement protocol: distinct eval samples measured per "
+        "reward (spec default 5). Quality is computed once per point and "
+        "winsorized across points.",
+    )
+    p.add_argument(
+        "--reps-per-point", type=int, default=4,
+        help="Measurement protocol: timing repetitions per data point "
+        "(spec default 4, so 5x4=20). Only used with --measure-latency; "
+        "quality/memory don't need repeats.",
     )
     p.add_argument(
         "--measure-latency",
@@ -2331,7 +2434,8 @@ def main():
         mem_type=args.mem_type,
         exec_on_gpu=args.exec_on_gpu,
         measure_latency=measure_latency,
-        latency_samples=int(getattr(args, "latency_samples", 1)),
+        num_data_points=int(args.num_data_points),
+        reps_per_point=int(args.reps_per_point),
         terminal_rewards_only=args.terminal_rewards_only,
     )
 
@@ -3138,6 +3242,9 @@ def main():
         vertex_mult_arg,
         pin_rules_to_exact_arg,
         micro_mult_arg,
+        popart_m1,
+        popart_m2,
+        popart_w,
     ):
         subkey, key = jrand.split(key)
         rollout_key, key = jrand.split(key)
@@ -3213,21 +3320,51 @@ def main():
             # the rewards now in symlog space, "raw" here is the symlog
             # scale, which is stable in the 10²-ish range).
             head_rewards = sl_reward[..., _HEAD_REWARD_INDICES_ARR]
+        # PopArt: the value head emits NORMALIZED values, so de-normalize
+        # before GAE (which works in raw reward units), then re-normalize the
+        # resulting targets. With --advantage-norm zscore this is the identity
+        # (mu=0, sigma=1 carried unchanged).
+        use_popart = args.advantage_norm == "popart"
+        popart_mu, popart_sigma = _popart_derive(
+            popart_m1, popart_m2, popart_w, args.popart_sigma_min, 1e12)
+        v_raw = traj.value * popart_sigma + popart_mu
+        nv_raw = traj.next_value * popart_sigma + popart_mu
         _, estim_returns, advantages = get_advantages(
             head_rewards,
             traj.done,
-            traj.value,
-            traj.next_value,
+            v_raw if use_popart else traj.value,
+            nv_raw if use_popart else traj.next_value,
             traj.discount,
             args.gae_lambda,
         )
 
-        def normalize(x):
-            return (x - jnp.mean(x)) / (jnp.std(x) + 1e-7)
+        if use_popart:
+            new_m1, new_m2, new_w = _popart_update(
+                popart_m1, popart_m2, popart_w, estim_returns,
+                args.popart_beta, args.popart_sigma_min, 1e12, 5.0,
+            )
+            new_mu, new_sigma = _popart_derive(
+                new_m1, new_m2, new_w, args.popart_sigma_min, 1e12)
+            # ART: output-preserving head rescale so the critic's predictions
+            # survive the stats shift.
+            agent = _popart_rescale_heads(
+                agent, popart_mu, popart_sigma, new_mu, new_sigma)
+            # POP: normalized critic targets + sigma-scaled advantages. The
+            # per-channel sigma division is what puts the ~1e10 flops channel
+            # and the [0,1] cosine channel on a comparable footing WITHOUT the
+            # batch z-score's collapse ratchet (a uniformly-degenerate batch
+            # drives std->0 and makes the opposing channel vanish).
+            estim_returns = (estim_returns - new_mu) / new_sigma
+            norm_adv_components = advantages / new_sigma
+        else:
+            new_m1, new_m2, new_w = popart_m1, popart_m2, popart_w
 
-        norm_adv_components = jax.vmap(normalize, in_axes=-1, out_axes=-1)(
-            advantages.reshape(-1, advantages.shape[-1])
-        ).reshape(advantages.shape)
+            def normalize(x):
+                return (x - jnp.mean(x)) / (jnp.std(x) + 1e-7)
+
+            norm_adv_components = jax.vmap(normalize, in_axes=-1, out_axes=-1)(
+                advantages.reshape(-1, advantages.shape[-1])
+            ).reshape(advantages.shape)
         if args.loss_mode == "scalar":
             # Single-channel path: only slot 0 carries signal — skip the
             # preference scalarization entirely so we don't multiply the
@@ -3428,6 +3565,9 @@ def main():
             actions_pack,
             final_step,
             diag_pack,
+            new_m1,
+            new_m2,
+            new_w,
         )
 
     if not args.no_jit:
@@ -3446,6 +3586,12 @@ def main():
     # Pareto front over the three objectives the spec plots: compute cost,
     # memory, accuracy. All are stored "higher is better", matching the
     # archive's maximisation convention.
+    # PopArt running stats, carried across episodes (identity under
+    # --advantage-norm zscore).
+    popart_m1 = jnp.zeros((NUM_VALUE_HEADS,), dtype=jnp.float32)
+    popart_m2 = jnp.zeros((NUM_VALUE_HEADS,), dtype=jnp.float32)
+    popart_w = jnp.zeros((NUM_VALUE_HEADS,), dtype=jnp.float32)
+
     from alphagrad.approx.common.pareto_archive import ParetoArchive
     pareto_archive = ParetoArchive(
         obj_names=(args.cmp_type, args.mem_type, "cosine_sim"),
@@ -3512,7 +3658,8 @@ def main():
             wandb.log({f"Top N {name}": table})
 
     def host_log(
-        ep, all_rets, actions_pack, mean_r, mets, diag_pack=None
+        ep, all_rets, actions_pack, mean_r, mets, diag_pack=None,
+        popart_stats=None,
     ):
         ep = int(ep)
         all_rets = np.array(all_rets)  # (num_envs, NUM_REWARDS)
@@ -3711,6 +3858,13 @@ def main():
             log_dict[f"measure/{name}/worst_alltime"] = a["worst"]
             log_dict[f"measure/{name}/mean_alltime"] = a["sum"] / max(1, a["n"])
             log_dict[f"measure/{name}/median_alltime"] = float(np.median(a["vals"]))
+
+        # ---- PopArt / normalization stats (spec P2) -------------------------
+        if popart_stats is not None:
+            _mu, _sig = popart_stats
+            for j, nm in enumerate(HEAD_NAMES):
+                log_dict[f"popart/mu_{nm}"] = float(_mu[j])
+                log_dict[f"popart/sigma_{nm}"] = float(_sig[j])
 
         # ---- XLA side-channel: xla_peak_memory + compression ratio ----------
         xla_stats = consume_xla_memory_stats()
@@ -4017,6 +4171,9 @@ def main():
             actions_pack,
             global_step,
             diag_pack,
+            popart_m1,
+            popart_m2,
+            popart_w,
         ) = train_episode(
             agent,
             opt_state,
@@ -4031,6 +4188,9 @@ def main():
             stage_vertex_mult,
             stage_pin_rules,
             stage_micro_mult,
+            popart_m1,
+            popart_m2,
+            popart_w,
         )
         host_log(
             ep,
@@ -4039,6 +4199,9 @@ def main():
             jnp.mean(total_rewards_full, axis=0),
             metrics,
             diag_pack,
+            popart_stats=_popart_derive(
+                popart_m1, popart_m2, popart_w,
+                args.popart_sigma_min, 1e12),
         )
         # Mid-training top-N snapshot. Skips the wandb table log so we
         # don't pollute the offline run with duplicate tables — only the

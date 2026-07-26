@@ -407,6 +407,12 @@ class EnvConfig(NamedTuple):
     # paper-native form for AlphaZero / GDPO / GFlowNet and works fine for PPO
     # / MuZero (just yields a sparse reward signal).
     terminal_rewards_only: bool = False
+    # Measurement protocol (spec): `num_data_points` distinct eval samples x
+    # `reps_per_point` repetitions each = the sample budget per measurement,
+    # reduced by a winsorized mean. Defaults 5 x 4 = 20. Reps only matter for
+    # timing noise, so when latency isn't measured we collapse to 1 rep.
+    num_data_points: int = 5
+    reps_per_point: int = 4
 
 
 def _get_partials(order, sparsity_specs, stop):
@@ -1410,7 +1416,15 @@ def _callback(
     # `measure_latency` is on (the latency reading is noisy enough that the
     # top-quartile-mean smoothing from the original code is worth keeping).
     # ------------------------------------------------------------------
-    n_samples = 10 if config.measure_latency else 1
+    # Measurement budget: `num_data_points` distinct eval samples x
+    # `reps_per_point` timing repetitions. Reps exist only to average timer
+    # noise, so without --measure-latency we take 1 rep per point. Quality is
+    # deterministic in the input, so it is computed ONCE PER POINT (not per
+    # rep) and winsorized across points — the old code used point 0 only.
+    n_points = max(1, int(getattr(config, "num_data_points", 5)))
+    if eval_samples:
+        n_points = min(n_points, len(eval_samples[0]))
+    n_reps = max(1, int(getattr(config, "reps_per_point", 4))) if config.measure_latency else 1
 
     # Match the monitor to whichever device the compiled JIT actually runs
     # on. Without --exec-on-gpu the args arrive as CpuDevice JAX arrays
@@ -1432,7 +1446,7 @@ def _callback(
     latency_samples: list[float] = []
     peak_mem_samples: list[float] = []
 
-    for i in range(n_samples):
+    for i in range(n_points):
         if eval_samples:
             eval_args_i = [arg[i] for arg in eval_samples]
         else:
@@ -1454,20 +1468,21 @@ def _callback(
         # Used to isolate whether the per-call Python lifecycle around
         # ``ResourceMonitor`` (not its C++ tracker) leaks. peak_memory +
         # latency_ns are zero for the run.
-        if os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1":
-            out_approx = compiled_approx(*eval_args_i)
-            latency_samples.append(0.0)
-            peak_mem_samples.append(0.0)
-        else:
-            with ResourceMonitor(devices=unique_devices) as monitor:
+        for _rep in range(n_reps):
+            if os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1":
                 out_approx = compiled_approx(*eval_args_i)
-            # Key by name instead of unpacking ``.values()`` so this
-            # stays robust to dict-order / API tweaks in
-            # jax_memory_monitor.
-            latency_s = float(monitor.stats.get("time", 0.0))
-            peak_bytes = float(monitor.stats.get("memory", 0.0))
-            latency_samples.append(latency_s * 1e9)  # → ns
-            peak_mem_samples.append(peak_bytes)
+                latency_samples.append(0.0)
+                peak_mem_samples.append(0.0)
+            else:
+                with ResourceMonitor(devices=unique_devices) as monitor:
+                    out_approx = compiled_approx(*eval_args_i)
+                # Key by name instead of unpacking ``.values()`` so this
+                # stays robust to dict-order / API tweaks in
+                # jax_memory_monitor.
+                latency_s = float(monitor.stats.get("time", 0.0))
+                peak_bytes = float(monitor.stats.get("memory", 0.0))
+                latency_samples.append(latency_s * 1e9)  # → ns
+                peak_mem_samples.append(peak_bytes)
 
         out_approxs.append(out_approx)
         # ``compiled_exact`` is only executed at the terminal step
@@ -1638,13 +1653,18 @@ class VertexEliminationEnv:
         measure_latency: bool = False,
         terminal_rewards_only: bool = False,
         latency_samples: int = 1,
+        num_data_points: int = 5,
+        reps_per_point: int = 4,
         measure_grad: bool = False,
         quality_rewarded=None,
         **_compat,
     ):
-        # ``latency_samples`` / ``quality_rewarded`` / ``**_compat`` are accepted
-        # for caller compatibility (the winsorized-measurement wiring is a
-        # separate item; the measurement path uses its own sampling for now).
+        # ``num_data_points`` / ``reps_per_point`` ARE wired (see EnvConfig and
+        # the execution loop in ``_callback``). ``latency_samples`` is the
+        # legacy spelling: when a caller passes it explicitly we honour it as
+        # the total budget so old scripts keep working.
+        if latency_samples and latency_samples > 1:
+            reps_per_point = max(1, int(latency_samples) // max(1, num_data_points))
         if measure_grad:
             raise NotImplementedError(
                 "measure_grad=True is not supported in this env build.")
@@ -1658,6 +1678,8 @@ class VertexEliminationEnv:
             sparse=sparse,
             cmp_type=cmp_type,
             mem_type=mem_type,
+            num_data_points=int(num_data_points),
+            reps_per_point=int(reps_per_point),
             target_fun=target_fun,
             data_gen=data_gen,
             exec_on_gpu=exec_on_gpu,
