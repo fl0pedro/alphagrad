@@ -78,6 +78,8 @@ from alphagrad.approx.common import (
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
     _AXIS_FEAT_GROUP_ID,
+    consume_tokenization_truncation_stats,
+    consume_xla_memory_stats,
     _AXIS_FEAT_IS_COMPRESSED,
     _AXIS_FEAT_IS_OUTPUT,
     _AXIS_FEAT_SIZE,
@@ -2195,6 +2197,37 @@ def _episode_vertex_features(
 # ---------------------------------------------------------------------------
 
 
+def _repo_commits() -> dict:
+    """Short SHAs of the repos this process is actually running from.
+
+    Resolved from each module's own file location (not a hardcoded ~/dsnn),
+    so a run launched from a worktree logs that worktree's HEAD rather than
+    some other checkout's — run provenance that can't silently lie.
+    """
+    import subprocess
+    from pathlib import Path
+
+    out = {}
+    try:
+        import graphax as _gx
+        roots = {
+            "alphagrad": Path(__file__).resolve(),
+            "graphax": Path(_gx.__file__).resolve(),
+        }
+    except Exception:
+        roots = {"alphagrad": Path(__file__).resolve()}
+    for name, path in roots.items():
+        try:
+            sha = subprocess.run(
+                ["git", "-C", str(path.parent), "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+            out[f"commit/{name}"] = sha or "unknown"
+        except Exception:
+            out[f"commit/{name}"] = "unknown"
+    return out
+
+
 def _setup_jax_compile_cache() -> None:
     """Back-compat wrapper around
     :func:`alphagrad.approx.common.compile_cache.setup_jax_compile_cache`.
@@ -3401,12 +3434,22 @@ def main():
         train_episode = eqx.filter_jit(train_episode)
 
     # Reporting.
+    _wandb_config = dict(vars(args))
+    _wandb_config.update(_repo_commits())
     wandb.init(
         project=getattr(args, "wandb_project", None) or "dsnn-vertex",
         entity=getattr(args, "wandb_entity", None) or None,
         name=args.name,
-        config=vars(args),
+        config=_wandb_config,
         mode="disabled" if args.wandb == "disabled" else args.wandb,
+    )
+    # Pareto front over the three objectives the spec plots: compute cost,
+    # memory, accuracy. All are stored "higher is better", matching the
+    # archive's maximisation convention.
+    from alphagrad.approx.common.pareto_archive import ParetoArchive
+    pareto_archive = ParetoArchive(
+        obj_names=(args.cmp_type, args.mem_type, "cosine_sim"),
+        obj_idx=(cmp_idx, mem_idx, cosine_idx),
     )
     elim_order_table = wandb.Table(columns=["episode", "return", "elimination order"])
     pbar = tqdm(total=args.episodes)
@@ -3625,8 +3668,84 @@ def main():
             for j, nm in enumerate(names):
                 log_dict[f"kl/{nm}"] = float(kl_components[j])
                 log_dict[f"ent/{nm}"] = float(entropy_components[j])
+            if args.dynamic_substeps:
+                # Spec P2 entropy split: MACRO = the vertex-elimination
+                # (pointer) head; MICRO = the approximation sub-episode heads
+                # (op / i / j / exp) averaged. `entropy evolution` above is
+                # the overall mean.
+                log_dict["entropy/macro_vertex"] = float(entropy_components[0])
+                log_dict["entropy/micro_approx"] = float(
+                    np.mean(entropy_components[1:5])
+                )
         for j, name in enumerate(REWARD_NAMES):
             log_dict[f"mean_{name}"] = float(mean_r[j]) if j < len(mean_r) else 0.0
+
+        # ---- per-channel measurement stats (spec P2) ------------------------
+        # best / mean / median / worst per channel, for THIS episode and
+        # ALL-TIME, computed over the collapse-guarded (eligible) envs only so
+        # a zero-compute plan can never own a "best". Channels are stored
+        # "higher is better" (costs negated), so best = max, worst = min.
+        elig_rets = all_rets[eligible] if eligible.any() else all_rets[:0]
+        alltime = host_state.setdefault("channel_alltime", {})
+        for j, name in enumerate(REWARD_NAMES):
+            if elig_rets.shape[0] == 0:
+                continue
+            col = elig_rets[:, j].astype(np.float64)
+            b, w = float(col.max()), float(col.min())
+            log_dict[f"measure/{name}/best_ep"] = b
+            log_dict[f"measure/{name}/mean_ep"] = float(col.mean())
+            log_dict[f"measure/{name}/median_ep"] = float(np.median(col))
+            log_dict[f"measure/{name}/worst_ep"] = w
+            prev = alltime.get(name)
+            if prev is None:
+                alltime[name] = {"best": b, "worst": w, "sum": float(col.sum()),
+                                 "n": int(col.size), "vals": [float(np.median(col))]}
+            else:
+                prev["best"] = max(prev["best"], b)
+                prev["worst"] = min(prev["worst"], w)
+                prev["sum"] += float(col.sum())
+                prev["n"] += int(col.size)
+                prev["vals"].append(float(np.median(col)))
+            a = alltime[name]
+            log_dict[f"measure/{name}/best_alltime"] = a["best"]
+            log_dict[f"measure/{name}/worst_alltime"] = a["worst"]
+            log_dict[f"measure/{name}/mean_alltime"] = a["sum"] / max(1, a["n"])
+            log_dict[f"measure/{name}/median_alltime"] = float(np.median(a["vals"]))
+
+        # ---- XLA side-channel: xla_peak_memory + compression ratio ----------
+        xla_stats = consume_xla_memory_stats()
+        if xla_stats["count"]:
+            log_dict["measure/xla_peak_memory"] = xla_stats["xla_peak_memory"]
+            log_dict["measure/compression_ratio"] = xla_stats["compression_ratio"]
+
+        # ---- tokenization truncation (was computed but never logged) --------
+        trunc = consume_tokenization_truncation_stats()
+        log_dict["tokenization/truncated_count"] = trunc["count"]
+        log_dict["tokenization/max_observed_len"] = trunc["max_observed_len"]
+        log_dict["tokenization/overflow_sum_this_ep"] = trunc["overflow_sum"]
+
+        # ---- Pareto front + hypervolume (spec P2) ---------------------------
+        # Objectives are logged in "higher is better" form, so the archive's
+        # maximisation convention applies directly.
+        if pareto_archive is not None and elig_rets.shape[0]:
+            elig_idx = [i for i in range(all_rets.shape[0]) if eligible[i]]
+            pareto_archive.add_many(
+                ((all_rets[i], _decode(i)) for i in elig_idx), ep
+            )
+            log_dict["pareto/hypervolume"] = float(pareto_archive.hypervolume())
+            log_dict["pareto/archive_size"] = len(pareto_archive.pts)
+            if pareto_archive.pts:
+                fx = np.stack(pareto_archive.pts).astype(np.float64)
+                # 3 scatter tables: (latency|cmp x cos), (mem x cos), (cmp x mem)
+                for key, (a, b) in {
+                    "pareto/cmp_vs_cos": (0, 2),
+                    "pareto/mem_vs_cos": (1, 2),
+                    "pareto/cmp_vs_mem": (0, 1),
+                }.items():
+                    tbl = wandb.Table(columns=["x", "y", "episode"])
+                    for row in fx:
+                        tbl.add_data(float(row[a]), float(row[b]), ep)
+                    log_dict[key] = tbl
 
         # Stage D/E/F marginals — pair-index distribution (axis-pair head),
         # factor-index distribution (Stage E ρ-collapse early-warning), and
@@ -3647,11 +3766,25 @@ def main():
             for j, name in enumerate(HEAD_NAMES):
                 log_dict[f"preference/{name}"] = float(pref_mean[j])
             log_dict["p_stop_slot0"] = float(p_stop_slot0)
-            # Dynamic-substeps op-type marginals — DIAG / COMPRESS / END.
-            # Zero in legacy mode (filled with zeros by train_episode).
-            for j, op_name in enumerate(("diag", "compress", "end")):
-                log_dict[f"op_marginal/{op_name}"] = float(op_marginals[j])
+            # Dynamic-substeps op-type marginals. Names MUST match
+            # heads.py's op order (DIAG=0, COMPRESS=1, QUANT=2, END=3) —
+            # this used to label index 2 "end", so the plotted "end" curve
+            # was really QUANT and the true END mass was never logged, which
+            # hid exactly the END-collapse mode the diagnostic exists for.
+            for j, op_name in enumerate(("diag", "compress", "quant", "end")):
+                if j < op_marginals.shape[0]:
+                    log_dict[f"op_marginal/{op_name}"] = float(op_marginals[j])
             log_dict["sub_episode_length"] = float(mean_sub_episode_length)
+        # Populate the elimination-order table (it used to be created and
+        # logged empty). Bounded: one row per episode for the best eligible
+        # env, so the table stays small over a 1000-episode run.
+        if eligible.any():
+            try:
+                elim_order_table.add_data(
+                    ep, float(masked[best_idx]), repr(_decode(best_idx))
+                )
+            except Exception:
+                pass
         wandb.log(log_dict)
 
         # Per-episode memory + JIT-cache diagnostic. Off by default; flip on
