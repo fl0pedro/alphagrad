@@ -114,6 +114,56 @@ _TOKENIZATION_TRUNCATION_OVERFLOW_SUM: list[int] = [0]
 _TOKENIZATION_TRUNCATION_WARNED: list[bool] = [False]
 
 
+# Token-length telemetry for EVERY step, not just the truncating ones. The
+# truncation counters answer "did we lose information?"; these answer "how big
+# is one palimpsa call?", which is what sizes the batched kernel's static
+# buffer. Kept as running sum/max/count so the per-episode mean is exact
+# without holding every sample.
+_TOKLEN_SUM: list[int] = [0]
+_TOKLEN_MAX: list[int] = [0]
+_TOKLEN_COUNT: list[int] = [0]
+_DELTALEN_SUM: list[int] = [0]
+_DELTALEN_MAX: list[int] = [0]
+_DELTALEN_COUNT: list[int] = [0]
+
+
+def _record_token_length(raw_len: int) -> None:
+    """Record one full-stream tokenization length."""
+    _TOKLEN_SUM[0] += int(raw_len)
+    _TOKLEN_COUNT[0] += 1
+    if raw_len > _TOKLEN_MAX[0]:
+        _TOKLEN_MAX[0] = int(raw_len)
+
+
+def _record_delta_length(delta_len: int) -> None:
+    """Record one per-elimination DELTA length = one palimpsa call's width."""
+    _DELTALEN_SUM[0] += int(delta_len)
+    _DELTALEN_COUNT[0] += 1
+    if delta_len > _DELTALEN_MAX[0]:
+        _DELTALEN_MAX[0] = int(delta_len)
+
+
+def consume_token_length_stats() -> dict:
+    """Pop per-episode token-size telemetry (mean/max for stream and delta).
+
+    ``delta_*`` is the quantity that should size ALPHAGRAD_MAX_DELTA_TOKENS;
+    ``stream_*`` is what MAX_TOKENS must cover while the full-buffer path is
+    still in use. Both reset on read so wandb sees per-episode values.
+    """
+    n, dn = _TOKLEN_COUNT[0], _DELTALEN_COUNT[0]
+    out = {
+        "stream_mean": (_TOKLEN_SUM[0] / n) if n else 0.0,
+        "stream_max": _TOKLEN_MAX[0],
+        "stream_count": n,
+        "delta_mean": (_DELTALEN_SUM[0] / dn) if dn else 0.0,
+        "delta_max": _DELTALEN_MAX[0],
+        "delta_count": dn,
+    }
+    _TOKLEN_SUM[0] = _TOKLEN_MAX[0] = _TOKLEN_COUNT[0] = 0
+    _DELTALEN_SUM[0] = _DELTALEN_MAX[0] = _DELTALEN_COUNT[0] = 0
+    return out
+
+
 def _record_tokenization_truncation(raw_len: int) -> None:
     """Bump the per-process truncation counter and emit a one-time
     ``warnings.warn`` on the first observation. Cheap: a counter
@@ -248,6 +298,7 @@ def incremental_token_delta(jaxpr, argnums, consts, args, order_prefix,
             f"ALPHAGRAD_MAX_DELTA_TOKENS — clipping a delta would desync the "
             f"incremental encoder's recurrence from the token stream."
         )
+    _record_delta_length(len(delta))
     if len(_INCR_TOK_CACHE) > _INCR_TOK_CACHE_CAP:
         _INCR_TOK_CACHE.clear()
     _INCR_TOK_CACHE[key] = (tk, delta)
@@ -1404,6 +1455,7 @@ def _callback(
     # truncation. ``_record_tokenization_truncation`` is a no-op for
     # short sequences (the common case) and is cheap otherwise.
     raw_tokens = ve.tokenized()
+    _record_token_length(int(raw_tokens.shape[0]))
     _record_tokenization_truncation(int(raw_tokens.shape[0]))
     tokens = raw_tokens[:MAX_TOKENS]
     tokens = jnp.pad(tokens, (0, MAX_TOKENS - tokens.shape[0]))

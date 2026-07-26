@@ -95,12 +95,20 @@ def _extend_block(agent, carries, tokens, positions):
     per-token loop, one XLA program."""
     layers = agent.encoder.layers
     embedding = agent.embedding
-    pe = agent.pos_enc.pe
-    final_norm = agent.final_norm
+    pe = agent.pos_enc.pe if agent.pos_enc is not None else None
+    # The trainer's Agent has NO final_norm and PalimpsaEncoder.__call__
+    # applies none — it just stacks layers and returns. MicroPPOAgent (the
+    # deprecated Ray line this module was written against) DOES have one, so
+    # applying it unconditionally would add a normalization the full encode
+    # never performs and silently break the equivalence this module exists to
+    # guarantee. Identity when absent.
+    final_norm = getattr(agent, "final_norm", None) or (lambda z: z)
 
     def _step(carry_list, tp):
         tok, pos = tp
-        x_t = embedding(tok.astype(jnp.int32)) + pe[pos, :]
+        x_t = embedding(tok.astype(jnp.int32))
+        if pe is not None:
+            x_t = x_t + pe[pos, :]
         new_carry = []
         for li, layer in enumerate(layers):
             x_t, c = _layer_step(layer, x_t, carry_list[li])
@@ -137,16 +145,23 @@ def _extend_block_masked(agent, carries, tokens, positions, valid):
     """
     layers = agent.encoder.layers
     embedding = agent.embedding
-    pe = agent.pos_enc.pe
-    final_norm = agent.final_norm
-    n_pos = pe.shape[0]
+    pe = agent.pos_enc.pe if agent.pos_enc is not None else None
+    # The trainer's Agent has NO final_norm and PalimpsaEncoder.__call__
+    # applies none — it just stacks layers and returns. MicroPPOAgent (the
+    # deprecated Ray line this module was written against) DOES have one, so
+    # applying it unconditionally would add a normalization the full encode
+    # never performs and silently break the equivalence this module exists to
+    # guarantee. Identity when absent.
+    final_norm = getattr(agent, "final_norm", None) or (lambda z: z)
+    n_pos = pe.shape[0] if pe is not None else 0
 
     def _step(carry_list, tpv):
         tok, pos, ok = tpv
-        # Clamp: an invalid step's position is never used, but it must not
-        # index out of the table before the select discards it.
-        safe_pos = jnp.clip(pos, 0, n_pos - 1)
-        x_t = embedding(tok.astype(jnp.int32)) + pe[safe_pos, :]
+        x_t = embedding(tok.astype(jnp.int32))
+        if pe is not None:
+            # Clamp: an invalid step's position is never used, but it must not
+            # index out of the table before the select discards it.
+            x_t = x_t + pe[jnp.clip(pos, 0, n_pos - 1), :]
         new_carry = []
         for li, layer in enumerate(layers):
             x_t, c = _layer_step(layer, x_t, carry_list[li])

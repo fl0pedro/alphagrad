@@ -89,6 +89,8 @@ from alphagrad.approx.env import (
     MAX_AXES_PER_VERTEX,
     MAX_RULES_PER_VERTEX,
     MAX_TOKENS,
+    MAX_DELTA_TOKENS,
+    consume_token_length_stats,
     NUM_AXIS_PAIRS,
     NUM_REWARDS,
     REWARD_INDEX,
@@ -862,7 +864,10 @@ class Agent(eqx.Module):
         token_mask = tokens != 0
         mask = token_mask[..., None]
         x = jax.vmap(self.embedding)(tokens)
-        x = self.pos_enc(x)
+        # pos_enc is None under a recurrent backbone (see _build_agent): the
+        # palimpsa carry already encodes relative position via its decay.
+        if self.pos_enc is not None:
+            x = self.pos_enc(x)
         enc_key = key if key is not None else jrand.PRNGKey(0)
         # Stage B.1: when `eqn_ids` is provided, the encoder layers add
         # learned per-relation biases derived from it. When None, the encoder
@@ -1837,16 +1842,40 @@ def _build_agent(
 ):
     encoder_keys = jrand.split(key, 15)
     embedding = eqx.nn.Embedding(args.vocab_size, args.embd_dim, key=encoder_keys[0])
-    pos_enc = PositionalEncoder(args.embd_dim, MAX_TOKENS)
-    # Flag-gated token-mixer for the policy backbone. Default "transformer"
-    # keeps behaviour byte-identical; ALPHAGRAD_POLICY=palimpsa swaps the
-    # encoder self-attention for the verified Palimpsa linear-attention kernel.
+    # Flag-gated token-mixer for the policy backbone. Resolved FIRST because
+    # whether the model needs a positional encoding follows from it.
     _policy = os.environ.get("ALPHAGRAD_POLICY", "transformer").strip().lower()
     if _policy not in ("transformer", "palimpsa", "palimpsa_bi"):
         raise ValueError(
             "ALPHAGRAD_POLICY must be 'transformer', 'palimpsa' or "
             f"'palimpsa_bi', got {_policy!r}"
         )
+    # POSITIONAL ENCODING IS A TRANSFORMER REQUIREMENT, NOT A PALIMPSA ONE.
+    #
+    # Self-attention is permutation-equivariant, so the transformer backbone
+    # cannot see order without an explicit signal. Palimpsa can: its carry is a
+    # GATED EXPONENTIAL-DECAY accumulation (M = outer + decay*M_prev, decay =
+    # exp(-softplus(gate(y_t)) * softplus(g))), so a token k steps back is
+    # attenuated by prod(decay) — learned, relative, input-dependent position
+    # information. Same reason RWKV / RetNet / Mamba carry no absolute PE.
+    #
+    # Under append-only it is worse than redundant. `pe` is FIXED SINUSOIDAL
+    # ABSOLUTE position, and absolute position in an append-only stream is
+    # arbitrary: whether a path lands at token 3000 or 3500 depends on how many
+    # tokens earlier eliminations happened to emit, which is a function of the
+    # elimination order, not of the content. The sinusoid then gives identical
+    # local content different representations for no reason.
+    #
+    # It is also the ONLY thing that indexes an absolute position into a fixed
+    # table, i.e. the only hard MAX_TOKENS bound in the model itself.
+    #
+    # ALPHAGRAD_POS_ENC=1 forces it back on for an A/B.
+    _force_pe = os.environ.get("ALPHAGRAD_POS_ENC", "auto").strip().lower()
+    _use_pe = (_policy == "transformer") if _force_pe == "auto" else (
+        _force_pe in ("1", "true", "yes"))
+    pos_enc = PositionalEncoder(args.embd_dim, MAX_TOKENS) if _use_pe else None
+    print(f"[alphagrad] positional encoding: {'ON' if _use_pe else 'OFF'} "
+          f"(backbone={_policy})", flush=True)
     if _policy == "palimpsa":
         print("[alphagrad] policy backbone: PALIMPSA (unidirectional/causal) "
               "linear-attention encoder", flush=True)
@@ -4022,6 +4051,20 @@ def main():
         log_dict["tokenization/truncated_count"] = trunc["count"]
         log_dict["tokenization/max_observed_len"] = trunc["max_observed_len"]
         log_dict["tokenization/overflow_sum_this_ep"] = trunc["overflow_sum"]
+        # Token SIZE telemetry (not just loss). `delta_*` is one palimpsa
+        # call's width in the append-only path and is what should size
+        # ALPHAGRAD_MAX_DELTA_TOKENS; `stream_*` is the full re-read length
+        # that MAX_TOKENS has to cover while the full-buffer path is in use.
+        # Watch delta_max: incremental_token_delta RAISES rather than clips,
+        # because silently truncating a delta would desync the recurrence.
+        _tl = consume_token_length_stats()
+        log_dict["tokens/stream_mean"] = _tl["stream_mean"]
+        log_dict["tokens/stream_max"] = _tl["stream_max"]
+        log_dict["tokens/delta_mean"] = _tl["delta_mean"]
+        log_dict["tokens/delta_max"] = _tl["delta_max"]
+        log_dict["tokens/delta_count"] = _tl["delta_count"]
+        log_dict["tokens/delta_budget"] = MAX_DELTA_TOKENS
+        log_dict["tokens/delta_headroom"] = MAX_DELTA_TOKENS - _tl["delta_max"]
 
         # ---- Pareto front + hypervolume (spec P2) ---------------------------
         # Objectives are logged in "higher is better" form, so the archive's

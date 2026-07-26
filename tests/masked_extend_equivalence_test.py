@@ -6,6 +6,9 @@ epoch; a 1e-7 drift in enc_x becomes a ratio != 1 and a spurious first-epoch
 gradient. So these assert bitwise equality on the valid prefix, and that pad
 steps leave the palimpsa carry untouched.
 """
+import os
+from types import SimpleNamespace
+
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -15,14 +18,32 @@ from alphagrad.approx.incremental_encoder import (
     _extend_block_masked,
     init_state,
 )
-from alphagrad.approx.ppo_ray_worker import MicroPPOAgent
+from alphagrad.approx.ppo import _build_agent
 
 
-def _agent(seed=0):
-    return MicroPPOAgent(vocab_size=512, embd_dim=32, num_layers=2,
-                         num_heads=2, hidden_dim=64, num_vertices=16,
-                         value_dims=[32], key=jr.PRNGKey(seed),
-                         max_substeps=1, policy="palimpsa")
+def _agent(seed=0, policy="palimpsa"):
+    """The trainer's REAL Agent, on the palimpsa backbone.
+
+    Deliberately not MicroPPOAgent from ppo_ray_worker: that module is the
+    deprecated Ray line and does not even import (syntax error at line 51),
+    which is why the older incremental-encoder equivalence test cannot be
+    collected. Building the real thing keeps this test honest about the
+    object the trainer actually uses.
+    """
+    prev = os.environ.get("ALPHAGRAD_POLICY")
+    os.environ["ALPHAGRAD_POLICY"] = policy
+    try:
+        args = SimpleNamespace(
+            vocab_size=512, embd_dim=32, num_layers=2, num_heads=2,
+            hidden_dim=64, value_dims="32", op_embd_dim=8, max_substeps=1,
+        )
+        return _build_agent(args, total_v=16, num_factors=4, max_rules=4,
+                            key=jr.PRNGKey(seed))
+    finally:
+        if prev is None:
+            os.environ.pop("ALPHAGRAD_POLICY", None)
+        else:
+            os.environ["ALPHAGRAD_POLICY"] = prev
 
 
 def _carries(agent):
@@ -103,3 +124,14 @@ def test_chained_deltas_match_one_long_encode():
     for (rm, ri), (gm, gi) in zip(ref_carry, carry):
         np.testing.assert_array_equal(np.asarray(rm), np.asarray(gm))
         np.testing.assert_array_equal(np.asarray(ri), np.asarray(gi))
+
+
+def test_palimpsa_agent_has_no_positional_encoding():
+    """The recurrence encodes relative position itself; absolute PE is both
+    redundant and, in an append-only stream, arbitrary."""
+    assert _agent(policy="palimpsa").pos_enc is None
+
+
+def test_transformer_agent_keeps_positional_encoding():
+    """Self-attention is permutation-equivariant — it cannot do without."""
+    assert _agent(policy="transformer").pos_enc is not None
