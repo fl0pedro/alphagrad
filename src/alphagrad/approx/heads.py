@@ -713,6 +713,7 @@ def _compute_op_legality(
     pair_valid: jax.Array | None = None,
     compress_valid: jax.Array | None = None,
     quant_legality_mask: jax.Array | None = None,
+    op_override: jax.Array | None = None,
 ) -> jax.Array:
     """Op-type legality (NUM_OPS,) — DIAG / COMPRESS / QUANT / END.
 
@@ -746,7 +747,17 @@ def _compute_op_legality(
     else:
         quant_legal = (jnp.sum(quant_legality_mask) > 0.5).astype(jnp.float32)
     end_legal = jnp.array(1.0, dtype=jnp.float32)
-    return jnp.stack([diag_legal, compress_legal, quant_legal, end_legal])
+    legality = jnp.stack([diag_legal, compress_legal, quant_legal, end_legal])
+    if op_override is not None:
+        # Variant/curriculum override ((NUM_OPS,), e.g. --exact zeroes
+        # DIAG/COMPRESS/QUANT). Masking here — inside the distribution — is
+        # what lets the >=2-options rule drop the op head entirely when only
+        # END survives; the old post-hoc END rewrite sampled from the
+        # UNRESTRICTED head, so --exact still trained it and counted its
+        # entropy. END is never maskable: the sub-episode must always be
+        # terminable.
+        legality = legality * op_override.astype(jnp.float32).at[OP_END].set(1.0)
+    return legality
 
 
 def _compute_partner(features: AxisTokenFeatures) -> jax.Array:
@@ -1371,6 +1382,7 @@ class MicroActionPolicy(eqx.Module):
         cap: jax.Array,
         pair_valid: jax.Array | None = None,
         compress_valid: jax.Array | None = None,
+        op_override: jax.Array | None = None,
     ):
         features, ended, next_gid, step_idx = carry
         key = step_input
@@ -1378,7 +1390,7 @@ class MicroActionPolicy(eqx.Module):
         axis_tokens, summary = self.encoder(features, vertex_context)
         op_legal = _compute_op_legality(
             features, pair_valid=pair_valid, compress_valid=compress_valid,
-            quant_legality_mask=quant_legality_mask,
+            quant_legality_mask=quant_legality_mask, op_override=op_override,
         )
         # Force END once the sub-episode has ended (sticky termination) or
         # the per-vertex hard cap (2 × num_axes) is reached — the latter is
@@ -1462,6 +1474,7 @@ class MicroActionPolicy(eqx.Module):
         pair_valid: jax.Array | None = None,
         compress_valid: jax.Array | None = None,
         quant_legality_mask: jax.Array | None = None,
+        op_legality_override: jax.Array | None = None,
     ):
         """Run the sub-episode autoregressively.
 
@@ -1504,6 +1517,7 @@ class MicroActionPolicy(eqx.Module):
                 quant_legality_mask=quant_legality_mask,
                 tables=tables, cap=cap,
                 pair_valid=pair_valid, compress_valid=compress_valid,
+                op_override=op_legality_override,
             )
 
         (
@@ -1537,6 +1551,7 @@ class MicroActionPolicy(eqx.Module):
         cap: jax.Array,
         pair_valid: jax.Array | None = None,
         compress_valid: jax.Array | None = None,
+        op_override: jax.Array | None = None,
     ):
         features, ended, next_gid, step_idx = carry
         action: MicroAction = step_input
@@ -1544,7 +1559,7 @@ class MicroActionPolicy(eqx.Module):
         axis_tokens, summary = self.encoder(features, vertex_context)
         op_legal = _compute_op_legality(
             features, pair_valid=pair_valid, compress_valid=compress_valid,
-            quant_legality_mask=quant_legality_mask,
+            quant_legality_mask=quant_legality_mask, op_override=op_override,
         )
         force_end = ended | (step_idx >= cap)
         op_legal = jnp.where(
@@ -1617,6 +1632,7 @@ class MicroActionPolicy(eqx.Module):
         pair_valid: jax.Array | None = None,
         compress_valid: jax.Array | None = None,
         quant_legality_mask: jax.Array | None = None,
+        op_legality_override: jax.Array | None = None,
     ):
         """Recompute joint log-prob / entropy / arity for a stored sequence,
         plus per-step distributions for KL tracking.
@@ -1654,6 +1670,7 @@ class MicroActionPolicy(eqx.Module):
                 tables=tables,
                 cap=cap,
                 pair_valid=pair_valid, compress_valid=compress_valid,
+                op_override=op_legality_override,
             )
 
         (

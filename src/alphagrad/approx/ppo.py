@@ -905,7 +905,14 @@ class Agent(eqx.Module):
         # learned per-relation biases derived from it. When None, the encoder
         # falls back to vanilla self-attention so the path is preserved for
         # callers that haven't been wired yet.
-        enc_x = self.encoder(x, eqn_ids=eqn_ids, key=enc_key)
+        # Pad-mask threading (same as ppo_ray_worker.encode_tokens): the
+        # palimpsa recurrence must not accumulate the ~16k pad positions —
+        # harmless for the causal variant only because trailing pads sit
+        # after every real row; a hard bug under palimpsa_bi. pos_enc is
+        # None exactly for the recurrent backbones (see _build_agent); the
+        # transformer keeps mask=None so its path stays byte-identical.
+        enc_mask = None if self.pos_enc is not None else token_mask
+        enc_x = self.encoder(x, eqn_ids=eqn_ids, mask=enc_mask, key=enc_key)
 
         vertex_logits, vertex_contexts = self.vertex_policy(enc_x, token_mask)
 
@@ -1030,21 +1037,12 @@ class Agent(eqx.Module):
             v_comp = jnp.zeros((_N,), jnp.float32)
             _sample_pair, _sample_comp = None, None  # tag-bit fallback
 
-        # The policy doesn't itself know about the override mask; we
-        # wrap by zeroing COMPRESS legality on the features' tag_bits
-        # *before* the encoder sees them. Simpler: apply the override
-        # to the per-step op_legality after the policy computes it.
-        # We do that by patching the head's `op_head` at call time —
-        # but that's awkward. Instead, since op_legality is computed
-        # inside MicroActionPolicy._step_sample, the override is
-        # threaded through by post-multiplying the op_dist's logits.
-        # For the MVP we mask op_legality at construction time using a
-        # boolean wrapper: zero COMPRESS legality everywhere by setting
-        # `tag_bits[..., TAG_IS_COMPRESSED] = 1` on every axis (so
-        # `compress_eligible` is empty). That's heavy-handed; instead
-        # we just rely on the trainer's `--allow-compress` gating:
-        # below we filter the returned action sequence and force every
-        # COMPRESS to END if the override says so.
+        # The variant/curriculum override is masked into the op distribution
+        # itself (heads._compute_op_legality): a disallowed op is
+        # unrepresentable rather than sampled-then-rewritten-to-END, so under
+        # --exact the op head is a forced single-option head (no log-prob, no
+        # entropy, no gradient) and the recorded log-prob IS the behaviour
+        # policy's. evaluate_action_dynamic must receive the SAME override.
         (
             actions,
             joint_logp,
@@ -1056,11 +1054,8 @@ class Agent(eqx.Module):
             exp_dists,
             kind_dists,
             quant_logp,
-        # NOTE: pair_valid/compress_valid/quant_legality_mask default to None
-        # here — the tag-bit fallback and all-dtypes QUANT. Threading the
-        # oracle's authoritative per-edge masks (build_pair_valid_mask, already
-        # wired in the static path) into this dynamic path is the immediate
-        # follow-up now that the heads accept them.
+        # NOTE: quant_legality_mask defaults to None here — the scan-driven
+        # hardware mask inside the policy.
         ) = self.micro_action_policy.sample(
             v_context,
             features,
@@ -1068,51 +1063,7 @@ class Agent(eqx.Module):
             micro_key,
             pair_valid=_sample_pair,
             compress_valid=_sample_comp,
-        )
-
-        # Apply the op-legality override post-hoc to DIAG / COMPRESS /
-        # QUANT: any disallowed op_type is rewritten to END. The
-        # MicroActionPolicy.sample doesn't take the override directly —
-        # it computes legality from axis-state (always allowing DIAG /
-        # COMPRESS / QUANT when applicable). The override is how the
-        # `--variant` setting forces `ve_only` (no DIAG / COMPRESS / QUANT)
-        # or `compress` (no DIAG) or similar variants at sampling time.
-        diag_allowed = op_legality_override[OP_DIAG] > 0.5
-        compress_allowed = op_legality_override[OP_COMPRESS] > 0.5
-        quant_allowed = op_legality_override[OP_QUANT] > 0.5
-        is_diag = actions.op_type == OP_DIAG
-        is_compress = actions.op_type == OP_COMPRESS
-        is_quant = actions.op_type == OP_QUANT
-        disallowed = (
-            (is_diag & ~diag_allowed)
-            | (is_compress & ~compress_allowed)
-            | (is_quant & ~quant_allowed)
-        )
-        rewritten_op = jnp.where(
-            disallowed,
-            jnp.full_like(actions.op_type, OP_END),
-            actions.op_type,
-        )
-        # When op_type is rewritten to END the sampled i / j / exponents /
-        # factor / kind / quant_dtype are stale. Zero them so the recorded
-        # action is canonical (matches what sample_step produces for genuine
-        # END outputs).
-        zeros_i = jnp.zeros_like(actions.i)
-        zeros_j = jnp.zeros_like(actions.j)
-        zeros_exp = jnp.zeros_like(actions.exponents)
-        zeros_f = jnp.zeros_like(actions.factor)
-        zeros_k = jnp.zeros_like(actions.compress_kind)
-        zeros_q = jnp.zeros_like(actions.quant_dtype)
-        ones_qs = jnp.ones_like(actions.quant_scale_sign)
-        actions = MicroAction(
-            op_type=rewritten_op,
-            i=jnp.where(disallowed, zeros_i, actions.i),
-            j=jnp.where(disallowed, zeros_j, actions.j),
-            exponents=jnp.where(disallowed[..., None], zeros_exp, actions.exponents),
-            factor=jnp.where(disallowed, zeros_f, actions.factor),
-            compress_kind=jnp.where(disallowed, zeros_k, actions.compress_kind),
-            quant_dtype=jnp.where(disallowed, zeros_q, actions.quant_dtype),
-            quant_scale_sign=jnp.where(disallowed, ones_qs, actions.quant_scale_sign),
+            op_legality_override=op_legality_override,
         )
 
         return (
@@ -1148,6 +1099,7 @@ class Agent(eqx.Module):
         preference=None,
         pair_valid=None,       # stored live DIAG mask for the chosen vertex
         compress_valid=None,   # stored live COMPRESS mask
+        op_legality_override=None,  # (NUM_OPS,) variant mask — MUST match sample
     ):
         """Joint log-prob / entropy for a stored typed action sequence.
 
@@ -1199,6 +1151,7 @@ class Agent(eqx.Module):
             actions,
             pair_valid=pair_valid,
             compress_valid=compress_valid,
+            op_legality_override=op_legality_override,
         )
 
         total_log_p = log_p_vertex + log_p_sub
@@ -1401,6 +1354,22 @@ def make_argparser() -> argparse.ArgumentParser:
         help="Measurement protocol: timing repetitions per data point "
         "(spec default 4, so 5x4=20). Only used with --measure-latency; "
         "quality/memory don't need repeats.",
+    )
+    p.add_argument(
+        "--latency-inner-reps", type=int, default=1,
+        help="Measurement protocol: executions per timed rep inside one "
+        "monitor window; elapsed time is divided by this, amortizing "
+        "dispatch/timer overhead (spec default 50; CLI default 1 keeps "
+        "existing campaigns' readings comparable).",
+    )
+    p.add_argument(
+        "--measure-grad",
+        action="store_true",
+        help="Measure the GRADIENT pipeline instead of the raw Jacobian: the "
+        "example is wrapped in scalar_loss_fn (mean -> MSE for the NN "
+        "examples) BEFORE tracing, so the policy graph, mask oracle, and "
+        "measured executable all live on the same scalar-loss graph and "
+        "jacve of it yields the gradients the spec asks to time.",
     )
     p.add_argument(
         "--measure-latency",
@@ -2491,6 +2460,13 @@ def main():
     dataset_for_call = dataset_arg if use_dataset else None
 
     target_fn = get_fn(args.example)
+    if args.measure_grad:
+        # Wrap BEFORE tracing: closed_jaxpr, the mask oracle, and the env's
+        # measured executable must all address the SAME scalar-loss graph —
+        # wrapping only at measurement time is the graph-mismatch that
+        # produced the old stack's zero-gradient bug.
+        from alphagrad.approx.common import scalar_loss_fn as _scalar_loss_fn
+        target_fn = _scalar_loss_fn(target_fn)
     xs = get_args(args.example, args_key, dataset=dataset_for_call)
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
@@ -2518,7 +2494,9 @@ def main():
         measure_latency=measure_latency,
         num_data_points=int(args.num_data_points),
         reps_per_point=int(args.reps_per_point),
+        latency_inner_reps=int(args.latency_inner_reps),
         per_face=bool(args.per_face),
+        measure_grad=bool(args.measure_grad),
         terminal_rewards_only=args.terminal_rewards_only,
     )
 
@@ -3006,6 +2984,7 @@ def main():
         vertex_features,
         key,
         pin_rules_to_exact_jax,
+        op_legality_override,
     ):
         # Dynamic-substeps path branches off here so the legacy path
         # stays exactly as written. `_dynamic_loss_fn` lives below and
@@ -3014,8 +2993,12 @@ def main():
         # path was taken. (The dynamic path doesn't use pin_rules_to_exact;
         # the JAX-traced arg is ignored there.)
         if args.dynamic_substeps:
-            return _dynamic_loss_fn(agent, batch, vertex_features, key)
-    def _dynamic_loss_fn(agent, batch: TrainBatch, vertex_features, key):
+            return _dynamic_loss_fn(
+                agent, batch, vertex_features, key, op_legality_override
+            )
+    def _dynamic_loss_fn(
+        agent, batch: TrainBatch, vertex_features, key, op_legality_override
+    ):
         """Dynamic-substeps loss: routes through MicroActionPolicy.evaluate.
 
         Mirrors :func:`loss_fn`'s legacy structure (same cached/no-cache
@@ -3065,6 +3048,9 @@ def main():
                 preference=pref_or_none(pref),
                 pair_valid=pv,
                 compress_valid=cv,
+                # Static per-call variant mask, identical for every sample in
+                # the batch (closed over, not vmapped) — must match sampling.
+                op_legality_override=op_legality_override,
             )
 
         if cached_flat is None:
@@ -3646,6 +3632,7 @@ def main():
                     vertex_features,
                     t_key,
                     pin_rules_to_exact_arg,
+                    op_legality_override_arg,
                 )
                 # Single fused per-leaf gradient scaling: combines the
                 # Stage D head-LR ramp and the Stage G freeze mask. With an

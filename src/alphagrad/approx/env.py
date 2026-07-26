@@ -594,6 +594,12 @@ class EnvConfig(NamedTuple):
     # timing noise, so when latency isn't measured we collapse to 1 rep.
     num_data_points: int = 5
     reps_per_point: int = 4
+    # Spec's accumulation loop: each timed rep executes the compiled fn this
+    # many times inside ONE ResourceMonitor window and divides the elapsed
+    # time, amortizing dispatch/timer overhead (spec default 50; kept at 1
+    # here so existing campaigns measure identically until a launcher opts in
+    # via --latency-inner-reps).
+    latency_inner_reps: int = 1
     # PER-FACE application. Off: the vertex's rule list is handed to graphax
     # literally and applied uniformly to EVERY face (so a rule must fit all of
     # them or it raises / is masked away). On: the rules are wrapped in a
@@ -1699,6 +1705,7 @@ def _callback(
         # Used to isolate whether the per-call Python lifecycle around
         # ``ResourceMonitor`` (not its C++ tracker) leaks. peak_memory +
         # latency_ns are zero for the run.
+        inner = max(1, int(getattr(config, "latency_inner_reps", 1)))
         for _rep in range(n_reps):
             if os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1":
                 out_approx = compiled_approx(*eval_args_i)
@@ -1706,11 +1713,18 @@ def _callback(
                 peak_mem_samples.append(0.0)
             else:
                 with ResourceMonitor(devices=unique_devices) as monitor:
-                    out_approx = compiled_approx(*eval_args_i)
+                    # Accumulation loop (spec, default 50 when opted in): the
+                    # executions queue back-to-back inside one monitor window
+                    # and the exit barrier drains them all, so time/inner is a
+                    # per-execution latency with dispatch + timer overhead
+                    # amortized. Peak memory is unaffected (same executable,
+                    # same buffers each pass).
+                    for _k in range(inner):
+                        out_approx = compiled_approx(*eval_args_i)
                 # Key by name instead of unpacking ``.values()`` so this
                 # stays robust to dict-order / API tweaks in
                 # jax_memory_monitor.
-                latency_s = float(monitor.stats.get("time", 0.0))
+                latency_s = float(monitor.stats.get("time", 0.0)) / inner
                 peak_bytes = float(monitor.stats.get("memory", 0.0))
                 latency_samples.append(latency_s * 1e9)  # → ns
                 peak_mem_samples.append(peak_bytes)
@@ -1736,7 +1750,14 @@ def _callback(
     # not report an unbeatable latency. 0.0 stays 0.0 (= "not measured").
     if 0.0 < latency_ns < _LAT_FLOOR_NS:
         latency_ns = _LAT_FLOOR_NS
-    peak_memory = float(max(peak_mem_samples)) if peak_mem_samples else 0.0
+    # Winsorized like latency (spec: one robust mean over the 5x4 budget); a
+    # plain max let a single outlier reading own the channel. Identical to max
+    # whenever the readings are constant — the common case today.
+    peak_memory = (
+        float(_aggregate_samples(peak_mem_samples, want_top_quartile=True))
+        if peak_mem_samples
+        else 0.0
+    )
 
     # ------------------------------------------------------------------
     # Quality family — cosine similarity + relative Frobenius residual.
@@ -1905,6 +1926,7 @@ class VertexEliminationEnv:
         latency_samples: int = 1,
         num_data_points: int = 5,
         reps_per_point: int = 4,
+        latency_inner_reps: int = 1,
         per_face: bool = False,
         measure_grad: bool = False,
         quality_rewarded=None,
@@ -1952,6 +1974,7 @@ class VertexEliminationEnv:
             mem_type=mem_type,
             num_data_points=int(num_data_points),
             reps_per_point=int(reps_per_point),
+            latency_inner_reps=int(latency_inner_reps),
             per_face=bool(per_face),
             target_fun=target_fun,
             data_gen=data_gen,
