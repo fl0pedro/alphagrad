@@ -1,123 +1,116 @@
-// Policy net — current state after this cycle's fixes (nn256 / PPO).
+// Policy net — current state, with the LOOP-BACK edges drawn explicitly.
+//
+// The two arrows that matter are:
+//     MACRO action -> tokenize path/accumulation -> palimpsa
+//     MICRO action -> tokenize approx + new accumulation -> palimpsa
+// Every action must re-enter the encoder before the next decision. palimpsa is
+// a linear-attention RECURRENCE, so each re-entry costs only the new tokens.
 //
 // Traced from source:
-//   Agent fields, Agent.encode, sample_action_dynamic -> approx/ppo.py
-//   MicroActionHead.sample_step head order            -> approx/heads.py
-//   FACTOR_ORDER (7 quant factors)                    -> approx/quant_factoring.py:37
-//   AutoregressiveFaceDriver                          -> approx/face_stream.py
-//   decode_vertex_rule_specs (oracle replay)          -> approx/env.py:1060
-//   _SENTINEL_BAD_REWARD (degenerate guard)           -> approx/env.py
-//   MAX_AXES_PER_VERTEX=8, NUM_OPS=4, MAX_PRIMES=9    -> approx/env.py:359, heads.py:83,97
+//   Agent.encode / sample_action_dynamic  -> approx/ppo.py
+//   MicroActionHead.sample_step           -> approx/heads.py
+//   AutoregressiveFaceDriver              -> approx/face_stream.py
+//   incremental_encoder.extend            -> approx/incremental_encoder.py:148
+//   IncrementalPathTokenizer              -> graphax/jaxpr.py:969
 //
 // LEGEND
-//   green = added / fixed this cycle
-//   red   = the one remaining gap (module exists + tested, not driving training)
+//   green solid  = loop closed by AutoregressiveFaceDriver (built, 8/8 tests)
+//   red   dashed = still open in the TRAINER (lax.scan over cached contexts)
 //
 // Render:  dot -Tsvg policy_forward.dot -o policy_forward.svg
 
 digraph policy_net {
   rankdir=TB;
   bgcolor="transparent";
-  compound=true;
   splines=spline;
-  nodesep=0.30;
-  ranksep=0.38;
+  nodesep=0.34;
+  ranksep=0.42;
   node [shape=box, style="rounded,filled", fillcolor="#f4f4f2",
         color="#d0cfca", fontname="Helvetica", fontsize=11,
         margin="0.13,0.08"];
   edge [color="#6a6a68", arrowsize=0.7, fontname="Helvetica", fontsize=9];
 
-  // ------------------------------------------------ trunk
-  subgraph cluster_trunk {
-    label="TRUNK  ·  Agent.encode()";
-    labeljust="l"; fontname="Helvetica-Bold"; fontsize=10; fontcolor="#6a6a68";
-    color="#d0cfca"; style="rounded";
+  base [label="base function tokenized  (ONCE)\nIncrementalPathTokenizer.base_tokens()"];
 
-    tok [label="tokens (MAX_TOKENS,) + eqn_ids\nALPHAGRAD_MAX_TOKENS now configurable",
+  // ---- THE RECURRENCE: everything loops back here ----
+  pal [label="◆  palimpsa  ◆\nincremental_encoder.extend(state, NEW tokens only)\nlinear-attention carry — O(delta), never re-reads\n→ vertex_contexts (V,E) + summary (E,)",
+       shape=box, style="rounded,filled", fillcolor="#eceaf5", color="#6b5bd6",
+       penwidth=2.2, fontsize=12];
+
+  base -> pal;
+
+  vhead [label="VALUE — 4 heads\nflops · peak_memory · cosine_sim · frob_residual\ncosine is TRAINED now",
          fillcolor="#e8f5e9", color="#2e7d32"];
-    emb [label="embedding + pos_enc\nPositionalEncoder sized from MAX_TOKENS",
-         fillcolor="#e8f5e9", color="#2e7d32"];
-    enc [label="palimpsa Encoder\nlinear attention → enc_x (S,E)",
-         fillcolor="#eceaf5", color="#6b5bd6"];
-    ctx [label="vertex_contexts (V,E) + summary (E,)\n(+ vertex_feature_proj, residual_state, pref_proj)"];
-    tok -> emb -> enc -> ctx;
-  }
+  pal -> vhead [label=" summary"];
 
-  // ------------------------------------------------ value
-  vhead [label="VALUE — 4 heads (was 3)\nflops · peak_memory · cosine_sim · frob_residual\ncosine is TRAINED now (--lambda-acc 2.0)",
-         fillcolor="#e8f5e9", color="#2e7d32"];
-  ctx -> vhead [label="summary"];
+  // ---------------- MACRO ----------------
+  macro [label="MACRO ACTION\nPointerVertexPolicy → mask(−1e9) → Categorical\n→ vertex_idx   (no special token needed:\nthe path header already names the vertex)"];
+  pal -> macro [label=" vertex_contexts"];
 
-  // ------------------------------------------------ macro
-  subgraph cluster_macro {
-    label="MACRO ACTION  ·  one vertex per env step";
-    labeljust="l"; fontname="Helvetica-Bold"; fontsize=10; fontcolor="#6a6a68";
-    color="#d0cfca"; style="rounded";
-    vpol [label="PointerVertexPolicy → vertex_logits (V,)"];
-    vsam [label="where(avail>0.5, logits, −1e9)\nsoftmax → Categorical → vertex_idx"];
-    vpol -> vsam;
-  }
-  ctx -> vpol;
+  tok_path [label="tokenize LOCAL PATH / face accumulation\npath < d0 * d1 * … >",
+            fillcolor="#ffffff", color="#2e7d32"];
+  macro -> tok_path [color="#2e7d32", penwidth=1.6];
 
-  oracle [label="LiveVertexMaskOracle  (host, jax.pure_callback)\nreplayed with the ACTUALLY-APPLIED rules\n(decode_vertex_rule_specs — was rules=())\n→ pair_valid (8,8) · compress_valid (8,)",
-          shape=note, fillcolor="#e8f5e9", color="#2e7d32", fontcolor="#2e7d32"];
-  vsam -> oracle [style=dashed, color="#2e7d32"];
+  // >>> LOOP-BACK 1 <<<
+  tok_path -> pal [color="#2e7d32", penwidth=2.0, constraint=false,
+                   label="  LOOP 1\n  re-encode before deciding",
+                   fontcolor="#2e7d32", fontsize=10];
 
-  // ------------------------------------------------ micro heads
-  subgraph cluster_micro {
-    label="MICRO SUB-EPISODE  ·  ≤ max_substeps on the chosen vertex";
-    labeljust="l"; fontname="Helvetica-Bold"; fontsize=10; fontcolor="#6a6a68";
-    color="#6b5bd6"; style="rounded";
+  // ---------------- SKIP? ----------------
+  skipq [label="skip this path?", shape=diamond, fillcolor="#ffffff",
+         color="#6b5bd6", fontsize=10];
+  tok_path -> skipq;
 
-    aenc [label="AxisSetEncoder\nself-attn over ≤8 axis tokens\n→ axis_tokens (N,E) + summary",
-          fillcolor="#eceaf5", color="#6b5bd6"];
-    ophd [label="OpTypeHead — masked softmax, NUM_OPS=4\nDIAG · COMPRESS · QUANT · END"];
-    ihd  [label="AxisPointerHead (i)"];
-    jhd  [label="AxisPointerHead (j)\nj_context = summary + axis_tokens[i]\nj_mask = j_mask_for_i_diag[i]   ← autoregressive"];
-    fhd  [label="PrimeExponentHead\nexponents over MAX_PRIMES=9"];
-    khd  [label="CompressKindHead\nmean min max median abs_min abs_max"];
-    qhd  [label="FactoredQuantHead\nsign(±) + 7 factors: kind bits exp\nmantissa bias finite unsigned0\n→ tuple-match → catalog dtype"];
+  tok_skip [label="emit  approx SKIP\nNO new accumulation (edge deleted)",
+            fillcolor="#ffffff", color="#2e7d32"];
+  skipq -> tok_skip [label="yes"];
+  tok_skip -> pal [color="#2e7d32", penwidth=2.0, constraint=false,
+                   label="  LOOP 2", fontcolor="#2e7d32", fontsize=10];
 
-    aenc -> ophd;
-    ophd -> ihd [label="DIAG|COMPRESS"];
-    ihd  -> jhd [label="DIAG"];
-    jhd  -> fhd;
-    ophd -> khd [label="COMPRESS"];
-    ophd -> qhd [label="QUANT"];
-  }
-  vsam   -> aenc [label="axis_state[v]"];
-  oracle -> ihd  [style=dashed, color="#2e7d32", label="−1e9"];
-  oracle -> jhd  [style=dashed, color="#2e7d32"];
+  // ---------------- MICRO ----------------
+  micro [label="MICRO ACTION  (heads, on the live operand)\nOpTypeHead → AxisPointer i → j (j_context =\nsummary + axis_tokens[i]) → PrimeExponent |\nCompressKind | FactoredQuant (sign + 7 factors)"];
+  skipq -> micro [label="no"];
 
-  gate [label="≥2-options rule\n1 option → forced (0 logp, 0 entropy, arity 0)\n0 → head dropped;  entropy is arity-normalised",
-        shape=note, fillcolor="#ffffff", color="#6b5bd6", fontcolor="#6b5bd6"];
-  ophd -> gate [style=dashed, color="#6b5bd6", dir=none];
+  tok_approx [label="emit  approx <DIAG|COMPRESS|QUANT> <args>\n+ the NEW post-approx accumulation",
+              fillcolor="#ffffff", color="#2e7d32"];
+  micro -> tok_approx [color="#2e7d32", penwidth=1.6];
 
-  // ------------------------------------------------ two consumers of the heads
-  scan [label="TRAINS TODAY:  lax.scan over CACHED contexts\nencode() runs ONCE per env step\n→ decisions NOT conditioned on their own tokens",
-        fillcolor="#ffffff", color="#c0392b", fontcolor="#c0392b"];
+  // >>> LOOP-BACK 3 <<<
+  tok_approx -> pal [color="#2e7d32", penwidth=2.0, constraint=false,
+                     label="  LOOP 3\n  next decision sees this",
+                     fontcolor="#2e7d32", fontsize=10];
 
-  loop [label="AutoregressiveFaceDriver  (face_stream.py)\nper face:  emit path/accumulation → extend(carry)\n→ decide → emit  approx <SKIP|DIAG|COMPRESS|QUANT>\n+ NEW accumulation (none if SKIP) → extend → repeat\nreal tokenizer vocabulary · 8/8 tests",
-        fillcolor="#e8f5e9", color="#2e7d32"];
+  // ---------------- repeat arcs ----------------
+  more_a [label="another approx on this path?", shape=diamond,
+          fillcolor="#ffffff", color="#6b5bd6", fontsize=10];
+  more_p [label="another path (face)?", shape=diamond,
+          fillcolor="#ffffff", color="#6b5bd6", fontsize=10];
+  more_v [label="another vertex?", shape=diamond,
+          fillcolor="#ffffff", color="#6b5bd6", fontsize=10];
 
-  gapnote [label="GAP — implemented + tested, NOT wired into the trainer.\nWiring it moves the micro loop host-side (into the\nface_transforms callable, the only mid-elimination hook\nIncrementalJaxpr offers) and reshapes the PPO trajectory.",
-           shape=note, fillcolor="#ffffff", color="#c0392b", fontcolor="#c0392b", fontsize=10];
-  loop -> gapnote [style=dashed, color="#c0392b", dir=none];
+  tok_approx -> more_a;
+  tok_skip   -> more_p;
+  more_a -> micro    [label="yes", color="#2e7d32", constraint=false];
+  more_a -> more_p   [label="no"];
+  more_p -> tok_path [label="yes", color="#2e7d32", constraint=false];
+  more_p -> more_v   [label="no"];
+  more_v -> macro    [label="yes", color="#2e7d32", constraint=false];
 
-  fhd -> scan; khd -> scan; qhd -> scan;
-  fhd -> loop [style=dashed, color="#2e7d32"];
+  // ---------------- env / reward ----------------
+  env [label="env.step → graphax jacve\ntransforms | face_transforms (--per-face)"];
+  more_v -> env [label="no — order complete"];
 
-  // ------------------------------------------------ env + reward
-  env [label="micro_actions → rule_specs → StepAction\nenv.step (io_callback) → graphax jacve\ntransforms | face_transforms (--per-face)",
-       fillcolor="#e8f5e9", color="#2e7d32"];
-  scan -> env;
-  loop -> env [style=dashed, color="#2e7d32"];
-
-  sent [label="DEGENERATE-PLAN SENTINEL\nno work (muls≤0 & flops≤0) or no Jacobian (cos≤1e-6)\n→ every cost := −1e10, NOT 0\n(a zero-work plan is INVALID, not cheap)",
+  sent [label="DEGENERATE-PLAN SENTINEL\nno work or no Jacobian → every cost := −1e10, NOT 0",
         fillcolor="#e8f5e9", color="#2e7d32"];
   env -> sent;
 
-  rew [label="8 reward channels → symlog → GAE\n→ PopArt (per-channel μ,σ) → preference → PPO",
+  rew [label="8 channels → symlog → GAE → PopArt\n→ preference → PPO",
        fillcolor="#e8f5e9", color="#2e7d32"];
   sent -> rew;
+
+  // ---------------- the honest caveat ----------------
+  gap [label="STATUS OF THESE THREE LOOPS\nCLOSED in AutoregressiveFaceDriver (face_stream.py, 8/8 tests):\nemissions use the tokenizer's real vocabulary and each one calls\nincremental_encoder.extend() before the next decision.\n\nSTILL OPEN in the TRAINER: ppo.py calls Agent.encode() ONCE per env\nstep and runs the micro sub-episode as a lax.scan over CACHED\nvertex_contexts — so in training these three arrows do not yet fire.",
+       shape=note, fillcolor="#ffffff", color="#c0392b", fontcolor="#c0392b",
+       fontsize=10];
+  pal -> gap [style=dashed, color="#c0392b", dir=none, constraint=false];
 }
