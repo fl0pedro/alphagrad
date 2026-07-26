@@ -296,11 +296,13 @@ own module), not deleting.
 - [ ] **No completed exact-vs-approx comparison yet.**
 
 ### P1 — spec compliance (action space + measurement)
-- [ ] **Per-path/per-face approximation.** Mechanism exists on both sides
-      (graphax `face_transforms` + `masked_micro_chooser`); policy wiring is
-      stage 1 of 5. Today approximations are still applied **per vertex**.
-- [ ] **Skip operation** (skip a path's contraction) — `OP_SKIP` / `skip_path`:
-      **0 hits, not implemented.**
+- [x] **Per-path/per-face approximation.** `--per-face` wraps each vertex's
+      rules in the per-face callable graphax invokes with that face's LIVE
+      operand, so a rule lands only where legal on that path. Commit 02a4fd4.
+- [x] **Skip operation** — implemented as the natural consequence of
+      per-face application: a face on which no rule is legal is left
+      exact. Pinned by a test (an all-illegal rule set is a byte-identical
+      no-op, not a raise). Commit 02a4fd4.
 - [ ] **Incremental tokenization into the encoder** — the spec wants the jaxpr
       re-emitted per path/approximation; today it is one-shot and **truncated at
       `MAX_TOKENS=4096` while nn256 needs ~4657**, so the policy cannot see the
@@ -332,8 +334,11 @@ own module), not deleting.
 
 ### P3 — scope
 - [ ] GAZ brought to parity / actually exercised
-- [ ] Transformer target; ALIF-SNN target (scan unrolled **and** not unrolled)
-- [ ] Contraction-coupling: post inherits pre's forced quant, one quant per turn
+- [~] Transformer target; ALIF-SNN target (scan unrolled **and** not
+      unrolled) — the EXAMPLES now exist and resolve
+      (ADALIF_SNN / ADALIF_SNN_SEQ / EncoderDecoder, commit c8da4f6);
+      training runs on them are not done.
+- [x] Contraction-coupling: post inherits pre's forced quant, one quant per turn (`couple_quant_rules`, 02a4fd4)
 - [ ] Consolidate the 49-file / 20k-LOC folder; retire or merge `ppo_ray.py`
 
 ---
