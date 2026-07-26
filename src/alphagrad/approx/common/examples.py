@@ -22,6 +22,25 @@ from alphagrad.approx.common.datasets import (
 )
 
 
+def example_width(default: int | None = None):
+    """ALPHAGRAD_EXAMPLE_WIDTH -> common hidden/model width for the synthetic
+    examples (MLP / Encoder / EncoderDecoder / LIF_SNN).
+
+    The examples ship at wildly different scales -- MLP 4->8->4, EncoderDecoder
+    square dim 4, LIF_SNN 16 -- so comparing architectures across them measures
+    SIZE as much as structure. Setting one width makes the comparison
+    apples-to-apples. Unset keeps each example's native shape.
+    """
+    import os as _o
+    v = _o.environ.get("ALPHAGRAD_EXAMPLE_WIDTH", "")
+    if not v:
+        return default
+    w = int(v)
+    if w < 2:
+        raise ValueError(f"ALPHAGRAD_EXAMPLE_WIDTH must be >= 2, got {w}")
+    return w
+
+
 def _neural_network(x, y, W1, b1, W2, b2):
     a1 = jnp.tanh(x @ W1.T + b1)
     return 0.5 * (jnp.tanh(a1 @ W2.T + b2) - y) ** 2
@@ -100,6 +119,21 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
         if _vision_base(fn_str) is not None:
             return None
 
+        # The synthetic signal below is a fixed 4-feature (r, theta) pair. When
+        # ALPHAGRAD_EXAMPLE_WIDTH widens the model, get_args() compiles for the
+        # wider input while this generator still produced 4 features, and the
+        # AOT-compiled measurement then failed with "Argument 'x' compiled with
+        # float32[16,64] and called with float32[16,4]" -- every terminal
+        # measurement fell back to the sentinel, so every reward read as zero.
+        # Tile the base signal up to the model width instead.
+        _w = example_width()
+
+        def _widen(v):
+            if not _w or v.shape[-1] == _w:
+                return v
+            reps = -(-_w // v.shape[-1])          # ceil-div
+            return jnp.concatenate([v] * reps, axis=-1)[..., :_w]
+
         @jax.jit
         def fn(keys):
             shape = (NN_VMAP_BATCH,) if fn_str.startswith("Vmapped") else ()
@@ -118,7 +152,7 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
                 axis=-1,
             )
             y += 0.05 * jrand.normal(keys[4], y.shape)
-            return x, y
+            return _widen(x), _widen(y)
 
         return fn
 
@@ -146,7 +180,7 @@ def _lif_snn_args():
     """Small LIF_SNN arg tuple (n_in = n_out = h = 16) matching
     LIF_SNN(S_in, S_target, U1, U2, U3, I1, I2, I3, W1, W2, W3, alpha, beta, thresh).
     Weight args W1/W2/W3 are indices 8/9/10 (pass --argnums 8,9,10)."""
-    n_in = n_out = h = 16
+    n_in = n_out = h = example_width(16)
     shapes = [
         (n_in,), (n_out,),              # S_in, S_target
         (h,), (h,), (n_out,),           # U1, U2, U3
@@ -156,6 +190,54 @@ def _lif_snn_args():
     ]
     keys = jax.random.split(jax.random.PRNGKey(0), len(shapes))
     return tuple(jax.random.normal(kk, s) for kk, s in zip(keys, shapes))
+
+
+def _adalif_snn_args():
+    """ADALIF_SNN arg tuple, same 3-layer shape as :func:`_lif_snn_args`.
+
+    ADALIF_SNN(S_in, S_target, U1, U2, U3, a1, a2, a3, W1, W2, W3,
+               alpha, beta, rho, thresh)
+
+    Adaptive LIF swaps the synaptic-current state (I1..I3) for an adaptation
+    state (a1..a3) plus an extra decay ``rho``, so it is one arg longer than
+    LIF. Weights stay at indices 8/9/10, so --argnums 8,9,10 is unchanged.
+    """
+    n_in = n_out = h = example_width(16)
+    shapes = [
+        (n_in,), (n_out,),              # S_in, S_target
+        (h,), (h,), (n_out,),           # U1, U2, U3
+        (h,), (h,), (n_out,),           # a1, a2, a3  (adaptation state)
+        (h, n_in), (h, h), (n_out, h),  # W1, W2, W3
+        (), (), (), (),                 # alpha, beta, rho, thresh
+    ]
+    keys = jax.random.split(jax.random.PRNGKey(0), len(shapes))
+    return tuple(jax.random.normal(kk, s) for kk, s in zip(keys, shapes))
+
+
+def _adalif_seq_args():
+    """ADALIF_SNN_SEQ args. ``ALPHAGRAD_SNN_STEPS`` (default 1) sets N.
+
+    N=1 is the single-step ("one loop") case and N=T the fully-unrolled
+    ("multi loop / state") case. Both use the SAME function, so the only thing
+    that differs between those two runs is the number of unrolled steps --
+    which is the point: ADALIF_SNN is single-timestep and ignores
+    ALPHAGRAD_SNN_TRUNC entirely, so configuring a one-loop vs multi-loop pair
+    through that variable would have produced two identical runs.
+    """
+    import os as _o
+    n_in = n_out = h = example_width(16)
+    steps = int(_o.environ.get("ALPHAGRAD_SNN_STEPS", "1"))
+    if steps < 1:
+        raise ValueError(f"ALPHAGRAD_SNN_STEPS must be >= 1, got {steps}")
+    shapes = [
+        (steps, n_in), (n_out,),        # S_in_seq, S_target
+        (h,), (h,), (n_out,),           # U1, U2, U3
+        (h,), (h,), (n_out,),           # a1, a2, a3
+        (h, n_in), (h, h), (n_out, h),  # W1, W2, W3
+        (), (), (), (),                 # alpha, beta, rho, thresh
+    ]
+    keys = jax.random.split(jax.random.PRNGKey(0), len(shapes))
+    return tuple(jax.random.normal(kk, sh) for kk, sh in zip(keys, shapes))
 
 
 def _lif_shd_args():
@@ -197,6 +279,8 @@ def _lif_shd_args():
 
 _BASIC_ARGS = {
     "LIF_SNN": _lif_snn_args(),
+    "ADALIF_SNN": _adalif_snn_args(),
+    "ADALIF_SNN_SEQ": _adalif_seq_args(),
     "LIF_SNN_SHD": _lif_shd_args(),
     "Simple": (5.0, 7.0),
     "Lighthouse": (0.02,) * 4,
@@ -227,13 +311,19 @@ def get_args(fn_str: str, key, dataset: str | None = None):
                 (out_dim, h), (out_dim,),
             ]
         else:
-            shapes = [(4,), (4,), (8, 4), (8,), (4, 8), (4,)]
+            _w = example_width()
+            if _w:
+                shapes = [(_w,), (_w,), (_w, _w), (_w,), (_w, _w), (_w,)]
+            else:
+                shapes = [(4,), (4,), (8, 4), (8,), (4, 8), (4,)]
     elif fn_str.endswith("Perceptron"):
         shapes = [(4,), (4,), (8, 4), (8,), (4, 8), (4,), (8,), (8,)]
     elif "EncoderDecoder" in fn_str:
-        shapes = [(4, 4)] * 13 + [(4,)] * 8
+        _w = example_width(4)
+        shapes = [(_w, _w)] * 13 + [(_w,)] * 8
     elif "Encoder" in fn_str:
-        shapes = [(4, 4)] * 10 + [(4,)] * 6
+        _w = example_width(4)
+        shapes = [(_w, _w)] * 10 + [(_w,)] * 6
     elif _vision_base(fn_str) is not None:
         # x = flat MNIST (784,), y = onehot (10,); weights from the graphax
         # initializer (correct per-model shapes). Vmapped batches x and y only.
@@ -377,8 +467,17 @@ def grad_target_fn(args_like, base_fn, example):
 
 def infer_argnums(fn_str: str) -> tuple[int, ...]:
     """Default `argnums` (which input slots are differentiated through) per example name."""
-    if fn_str in ("LIF_SNN", "LIF_SNN_SHD"):
+    # Every SNN in this family keeps its weights at 8/9/10 -- LIF and ADALIF
+    # alike (ADALIF swaps the synaptic current I1..I3 for the adaptation state
+    # a1..a3, which does not move the weight slots). Without the ADALIF names
+    # here they fell through to (0,), i.e. differentiating w.r.t. the INPUT
+    # SPIKES rather than the weights -- a silently different problem.
+    if fn_str in ("LIF_SNN", "LIF_SNN_SHD", "ADALIF_SNN", "ADALIF_SNN_SEQ"):
         return (8, 9, 10)
+    if "Encoder" in fn_str or "Decoder" in fn_str:
+        # (x, y, *weights) -> every weight arg, matching the vision models
+        n = len(inspect.signature(getattr(examples, fn_str)).parameters)
+        return tuple(range(2, n))
     if fn_str.endswith("NeuralNetwork"):
         return (2, 3, 4, 5)
     if fn_str.endswith("Perceptron"):

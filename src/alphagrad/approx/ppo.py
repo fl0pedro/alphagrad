@@ -4045,7 +4045,13 @@ def main():
                 )
 
         pbar.update(1)
-        b_ret_unnorm = np.abs(all_rets[best_idx])
+        # The progress bar shows the best ELIGIBLE env; when every env in the
+        # episode collapsed there is no eligible row (best_idx is unset), so
+        # fall back to the raw argmax purely for display. (Found by the
+        # end-to-end smoke: episode 0 collapsed in all envs and this raised
+        # UnboundLocalError.)
+        _disp_idx = best_idx if eligible.any() else int(np.argmax(weighted_sums))
+        b_ret_unnorm = np.abs(all_rets[_disp_idx])
         means_str = ", ".join(f"{float(x):.2e}" for x in np.abs(mean_r))
         b_ret_desc = ", ".join(f"{float(x):.2e}" for x in b_ret_unnorm)
         pbar.set_description(
