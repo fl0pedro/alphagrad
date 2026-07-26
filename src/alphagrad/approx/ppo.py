@@ -78,6 +78,7 @@ from alphagrad.approx.common import (
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
     _AXIS_FEAT_GROUP_ID,
+    consume_degenerate_plan_count,
     consume_per_face_stats,
     consume_tokenization_truncation_stats,
     consume_xla_memory_stats,
@@ -3884,6 +3885,10 @@ def main():
                 log_dict["per_face/skipped"] = pf.get("skipped", 0)
                 log_dict["per_face/skipped_raised"] = pf.get("skipped_raised", 0)
                 log_dict["per_face/applied_fraction"] = pf["applied_fraction"]
+
+        # ---- degenerate plans sentinelled by the env ------------------------
+        _degen = consume_degenerate_plan_count()
+        log_dict["collapse/degenerate_plans_this_ep"] = _degen
 
         # ---- XLA side-channel: xla_peak_memory + compression ratio ----------
         xla_stats = consume_xla_memory_stats()

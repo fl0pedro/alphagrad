@@ -253,6 +253,21 @@ def incremental_token_delta(jaxpr, argnums, consts, args, order_prefix,
     return delta
 
 
+_DEGENERATE_PLANS = [0]
+
+
+def _record_degenerate_plan() -> None:
+    _DEGENERATE_PLANS[0] += 1
+
+
+def consume_degenerate_plan_count() -> int:
+    """Pop the count of terminal plans that computed nothing and were
+    sentinelled (see the degenerate-plan guard in ``_callback``)."""
+    n = _DEGENERATE_PLANS[0]
+    _DEGENERATE_PLANS[0] = 0
+    return n
+
+
 # Per-face application telemetry: how much of the policy's intent actually
 # survived per-face masking. ``applied`` / ``skipped`` / ``skipped_raised``.
 _PER_FACE_STATS: dict = {}
@@ -390,8 +405,16 @@ QUALITY_REWARD_INDICES = (6, 7)             # cosine, frobenius
 # entry in the in-file blacklist (used during exploration to penalise
 # pathological configurations). The blacklist is no longer wired up after
 # the typed-transform migration; the array is kept for potential reuse.
+# Worst-possible reward: every cost channel at the sentinel and the quality
+# channels at their floor. Derived from REWARD_INDEX so adding a channel can't
+# leave a stale hand-written row behind.
+SENTINEL_COST = -1e10
 _SENTINEL_BAD_REWARD = jnp.array(
-    [-1e10, -1e10, -1e10, -1e10, -1e10, -1e10, -1.0, -1e10],
+    [
+        0.0 if i == REWARD_INDEX["cosine_sim"]
+        else (-1.0 if i == REWARD_INDEX["frob_residual"] else SENTINEL_COST)
+        for i in range(NUM_REWARDS)
+    ],
     dtype=jnp.float32,
 )
 
@@ -1682,6 +1705,25 @@ def _callback(
         ],
         dtype=jnp.float32,
     )
+
+    # DEGENERATE-PLAN GUARD. A terminal elimination that computes NOTHING —
+    # zero symbolic work and a zero/incomparable Jacobian — reports every cost
+    # channel as 0, i.e. the BEST possible cost. That is the reward-hacking
+    # optimum: the policy gets max reward on every cost channel for destroying
+    # the computation, and only the single quality channel objects. It is
+    # reachable even under `--exact` (where no approximation is possible at
+    # all) via an order that leaves paths un-eliminated — silently permitted by
+    # GRAPHAX_ALLOW_PARTIAL_ORDER, which the cluster runs set.
+    #
+    # Such a plan is not cheap, it is INVALID, so it is scored worst in every
+    # channel instead of best-in-cost. This is what `_SENTINEL_BAD_REWARD` was
+    # always for; it had never been wired up.
+    if is_terminal:
+        _no_work = (muls_adds_fmas <= 0.0) and (flops <= 0.0)
+        _no_jac = float(cosine_sim) <= 1e-6
+        if _no_work or _no_jac:
+            _record_degenerate_plan()
+            return tokens, eqn_ids, _SENTINEL_BAD_REWARD
 
     return tokens, eqn_ids, rewards
 

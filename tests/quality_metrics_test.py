@@ -69,3 +69,51 @@ def test_winsorized_mean_kills_both_tails():
 
 def test_latency_floor_constant_sane():
     assert _LAT_FLOOR_NS > 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Degenerate-plan guard (the exact-run collapse)
+# --------------------------------------------------------------------------- #
+
+def test_degenerate_plan_scores_worst_not_best():
+    """A terminal elimination that computes NOTHING reports every cost channel
+    as 0 — i.e. the BEST possible cost — so the reward-hacking optimum is to
+    destroy the computation. Observed live: the `--exact` run (where NO
+    approximation is even possible) drifted from muls=5.3e10/flops=1.4e7/
+    cosine=1.00 at episode 0 to all-zeros by episode 227.
+
+    Such a plan is invalid, not cheap, so it must be sentinelled to worst.
+    """
+    import numpy as np
+    from alphagrad.approx.env import (
+        NUM_REWARDS,
+        REWARD_INDEX,
+        SENTINEL_COST,
+        _SENTINEL_BAD_REWARD,
+    )
+
+    v = np.asarray(_SENTINEL_BAD_REWARD)
+    assert v.shape == (NUM_REWARDS,)
+    assert v[REWARD_INDEX["cosine_sim"]] == 0.0
+    assert v[REWARD_INDEX["frob_residual"]] == -1.0
+    for name in ("flops", "peak_memory", "muls_adds_fmas", "latency_ns"):
+        assert v[REWARD_INDEX[name]] == SENTINEL_COST, name
+
+    # ... and it must lose to a real (expensive but honest) plan.
+    real = np.zeros(NUM_REWARDS)
+    real[REWARD_INDEX["flops"]] = -1.8e8
+    real[REWARD_INDEX["peak_memory"]] = -1.0e8
+    real[REWARD_INDEX["cosine_sim"]] = 0.37
+    w = np.zeros(NUM_REWARDS)
+    for name in ("flops", "peak_memory", "cosine_sim"):
+        w[REWARD_INDEX[name]] = 1.0
+    assert float(v @ w) < float(real @ w), (
+        "a zero-work plan outranked a real one — the collapse is still reachable"
+    )
+
+
+def test_degenerate_plan_counter_is_pollable():
+    from alphagrad.approx.env import consume_degenerate_plan_count
+    n = consume_degenerate_plan_count()
+    assert isinstance(n, int) and n >= 0
+    assert consume_degenerate_plan_count() == 0, "counter must reset on poll"
