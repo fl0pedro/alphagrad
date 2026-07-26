@@ -159,6 +159,64 @@ def consume_tokenization_truncation_stats() -> dict:
         "max_observed_len": int(max_len),
         "overflow_sum": int(overflow_sum),
     }
+
+
+# ---------------------------------------------------------------------------
+# XLA-analysis side-channel. The reward vector's shape is baked into the jit
+# (NUM_REWARDS), so the extra diagnostics the logging spec asks for —
+# xla_peak_memory (deterministic memory_analysis estimate) and the
+# approx/exact memory COMPRESSION ratio — travel host-side like the
+# tokenization stats: `_callback` records at each TERMINAL measurement, the
+# driver polls once per episode via `consume_xla_memory_stats`.
+# ---------------------------------------------------------------------------
+_XLA_MEM_APPROX: list = []   # bytes per terminal measurement this period
+_XLA_MEM_EXACT: list = []    # bytes; aligned with _XLA_MEM_APPROX where known
+
+
+def _record_xla_memory(approx_bytes: float, exact_bytes: float | None) -> None:
+    _XLA_MEM_APPROX.append(float(approx_bytes))
+    _XLA_MEM_EXACT.append(float(exact_bytes) if exact_bytes is not None else 0.0)
+
+
+def _memory_analysis_bytes(compiled) -> float | None:
+    """Deterministic XLA peak estimate (temp + output + argument bytes) for a
+    compiled executable; None when memory_analysis is unavailable."""
+    try:
+        ma = compiled.memory_analysis()
+        if ma is None:
+            return None
+        return float(
+            getattr(ma, "temp_size_in_bytes", 0)
+            + getattr(ma, "output_size_in_bytes", 0)
+            + getattr(ma, "argument_size_in_bytes", 0)
+        )
+    except Exception:
+        return None
+
+
+def consume_xla_memory_stats() -> dict:
+    """Pop the per-period XLA-memory telemetry (mirrors the truncation poll).
+
+    Returns ``xla_peak_memory`` (mean approx bytes over the period's terminal
+    measurements), and ``compression_ratio`` = mean(exact/approx) over
+    measurements where both sides were analyzable — >1 means the approximated
+    executable is smaller than the exact one (the observable sparsity /
+    compression proxy under the dense measurement pipeline).
+    """
+    if not _XLA_MEM_APPROX:
+        return {"xla_peak_memory": 0.0, "compression_ratio": 0.0, "count": 0}
+    approx = np.asarray(_XLA_MEM_APPROX, dtype=np.float64)
+    exact = np.asarray(_XLA_MEM_EXACT, dtype=np.float64)
+    both = (approx > 0) & (exact > 0)
+    ratio = float(np.mean(exact[both] / approx[both])) if both.any() else 0.0
+    out = {
+        "xla_peak_memory": float(approx.mean()),
+        "compression_ratio": ratio,
+        "count": int(approx.size),
+    }
+    _XLA_MEM_APPROX.clear()
+    _XLA_MEM_EXACT.clear()
+    return out
 # Upper bound on rule_specs rows per vertex. In dynamic-substeps mode this
 # also bounds the number of typed micro-actions per vertex that survive
 # :func:`micro_actions_to_rule_specs_jax` — set it to the same scale as
@@ -1455,6 +1513,18 @@ def _callback(
             frobs.append(rel_frob)
         cosine_sim = float(_aggregate_samples(cosines, want_top_quartile=True))
         frob_residual = float(_aggregate_samples(frobs, want_top_quartile=True))
+        # XLA-analysis side-channel: deterministic peak estimate for the
+        # approx executable + the exact/approx compression ratio (see
+        # consume_xla_memory_stats). Terminal-only — one record per episode
+        # per env, negligible cost against the exact compile above.
+        _approx_bytes = _memory_analysis_bytes(compiled_approx)
+        _exact_bytes = (
+            _memory_analysis_bytes(compiled_exact)
+            if compiled_exact is not None
+            else None
+        )
+        if _approx_bytes is not None:
+            _record_xla_memory(_approx_bytes, _exact_bytes)
     else:
         cosine_sim = 0.0
         frob_residual = 0.0
