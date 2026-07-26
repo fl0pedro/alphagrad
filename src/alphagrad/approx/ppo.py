@@ -568,6 +568,26 @@ class PointerVertexPolicy(eqx.Module):
         vertex_logits = jax.vmap(self.pointer_proj)(vertex_reprs).squeeze(-1)
         return vertex_logits, vertex_reprs
 
+    def from_vertex_memory(self, vmem, vmask):
+        """Same head, cross-attending over a per-vertex MEMORY (V+1, E).
+
+        Identical weights and identical math to ``__call__`` — only the
+        key/value set changes, from S token rows to V+1 pooled slots. That
+        drops the pointer head's cost from O(V*S) to O(V^2) (V=13 on nn256,
+        S~7000) and, more importantly, removes the last reason to keep the
+        raw (S, E) sequence around once the positional encoding is gone.
+
+        Queries stay the V real vertices, so the trailing global slot
+        (structural tokens) can be ATTENDED but never SELECTED.
+        """
+        v_q = jax.vmap(self.vertex_embedding)(jnp.arange(self.num_vertices))
+        attn_mask = jnp.broadcast_to(
+            vmask[None, :], (self.num_vertices, vmem.shape[0])
+        )
+        vertex_reprs = self.cross_attn(v_q, vmem, vmem, mask=attn_mask)
+        vertex_logits = jax.vmap(self.pointer_proj)(vertex_reprs).squeeze(-1)
+        return vertex_logits, vertex_reprs
+
 
 class SetTransformerAggregator(eqx.Module):
     """Stage B.3 — permutation-invariant aggregator over calibration samples.
