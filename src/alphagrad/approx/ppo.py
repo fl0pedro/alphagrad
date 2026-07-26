@@ -153,6 +153,10 @@ HEAD_REWARD_INDICES: tuple[int, ...] = (
 )
 NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
 HEAD_NAMES: tuple[str, ...] = ("flops", "mem", "cos", "frob")
+
+# Print every loss component the moment the total goes non-finite. Off by
+# default because it forces a host callback inside the jitted update.
+_DEBUG_NAN = os.environ.get("ALPHAGRAD_DEBUG_NAN", "0") == "1"
 _HEAD_REWARD_INDICES_ARR = jnp.asarray(HEAD_REWARD_INDICES, dtype=jnp.int32)
 
 # Cross-channel scale handling. Reward channels span ~10¹⁰ in flops, ~10⁹
@@ -3229,6 +3233,30 @@ def main():
             + args.value_weight * value_loss
             - args.entropy_weight * entropy_loss
         )
+
+        # NaN LOCALIZER (ALPHAGRAD_DEBUG_NAN=1).
+        # `ent:nan` in the progress bar means the params are ALREADY NaN, which
+        # is one update too late to say why. This prints each loss component
+        # the moment any of them goes non-finite, which splits the two cases
+        # that need completely different fixes:
+        #   * a component is NaN  -> the data/masking is bad (0/0, all-masked
+        #     head, empty minibatch)
+        #   * all finite but the param update still NaNs -> the GRADIENT is
+        #     the problem (sqrt/norm/abs evaluated at exactly 0)
+        if _DEBUG_NAN:
+            _bad = jnp.logical_not(jnp.isfinite(total_loss))
+            jax.lax.cond(
+                _bad,
+                lambda: jax.debug.print(
+                    "[nan] ppo={p} value={v} entropy={e} kl={k} expvar={x} "
+                    "adv_absmax={a} ret_absmax={r}",
+                    p=ppo_loss, v=value_loss, e=entropy_loss, k=kl_div,
+                    x=explained_var,
+                    a=jnp.max(jnp.abs(jnp.nan_to_num(advantages, nan=jnp.inf))),
+                    r=jnp.max(jnp.abs(jnp.nan_to_num(estim_returns, nan=jnp.inf))),
+                ),
+                lambda: None,
+            )
         return total_loss, (
             kl_div,
             entropy_loss,
