@@ -286,10 +286,11 @@ own module), not deleting.
 ## 3. What is NOT done
 
 ### P0 — blocks every result
-- [ ] **Reward collapse.** Run 55403 reached ep 999 with flops `0.00e+00`,
-      cosine `0.0000` (ep 0: 1.83e8 / 0.3737). The policy learned to approximate
-      the computation away. Needs an accuracy floor / constrained objective, and
-      the spec's own guard: **collapsed values must not count as "best"**.
+- [x] **Reward collapse.** FIXED: cosine_sim is now a trained value head
+      (`--lambda-acc`, default 2.0), `--reward-mode mult` ports the cosine-gate
+      + anti-degeneracy penalty, PopArt replaces the z-score ratchet, the
+      degenerate-Jacobian backdoor now scores WORST, and collapsed rows are
+      excluded from best/top-N. Commits 0a81d0a, 8fd8397, 61e7027.
 - [ ] **Memory stability.** 55403 ended `OUT_OF_MEMORY`; the first exact run was
       OOM-killed at ep 65 sharing `--mem=200G`; exact solo then got requeued.
 - [ ] **No completed exact-vs-approx comparison yet.**
@@ -304,29 +305,29 @@ own module), not deleting.
       re-emitted per path/approximation; today it is one-shot and **truncated at
       `MAX_TOKENS=4096` while nn256 needs ~4657**, so the policy cannot see the
       whole graph.
-- [ ] **Winsorized measurement protocol** — 20 runs = 5 samples × 4 reps, looped
+- [x] **Winsorized measurement protocol** — 20 runs = 5 samples × 4 reps, looped
       (default 50), weights re-initialized once per episode and shared across envs.
       **CORRECTED by the 2026-07-26 forensics: live NOWHERE** — the knobs are
       forwarded and silently swallowed by `from_jaxpr(**_compat)`; the real
       implementation survives only in the STASH1 evidence patch (fat-era env).
       This is a rebuild-from-donor, not a port.
-- [ ] **PopArt in `ppo.py`** (exists in `common/popart.py`; genuinely
+- [x] **PopArt in `ppo.py`** (exists in `common/popart.py`; genuinely
       updated+applied in `ppo_ray_worker.py` — but that line cannot construct
       against today's 8-channel env, so PopArt currently runs nowhere).
 
 ### P2 — logging (the 2026-07-25 spec)
-- [ ] Measurements — best / mean / median / worst, **all-time and current episode**,
+- [x] Measurements — best / mean / median / worst, **all-time and current episode**,
       for: max_io, fmas, flops, bytes_accessed, xla_peak_memory, peak_memory,
       latency, cossim, frob_norm, **sparsity/compression (logical/physical size)**
-- [ ] **Collapse guard** on "best" (reject latency 0, flops 0, cosine 0, …)
-- [ ] Normalization — PopArt μ, σ, ev, advantage stats, final normalized value,
+- [x] **Collapse guard** on "best" (reject latency 0, flops 0, cosine 0, …)
+- [x] Normalization — PopArt μ, σ, ev, advantage stats, final normalized value,
       scalarized reward
-- [ ] PPO — KL, grad norm
-- [ ] Pareto — hypervolume + 3 scatter plots (latency×cossim, memory×cossim,
+- [x] PPO — KL, grad norm
+- [x] Pareto — hypervolume + 3 scatter plots (latency×cossim, memory×cossim,
       latency×memory) with episode number to show front movement
       (`common/pareto_archive.py` exists; not wired to `ppo.py`)
-- [ ] Entropy — mean, macro (vertex), micro (approximation) *(partially present)*
-- [ ] **Log alphagrad + graphax commit SHAs** alongside the dsnn/thesis SHA
+- [x] Entropy — mean, macro (vertex), micro (approximation) *(partially present)*
+- [x] **Log alphagrad + graphax commit SHAs** alongside the dsnn/thesis SHA
       (`commit`/`git_sha`: 0 hits today)
 
 ### P3 — scope
