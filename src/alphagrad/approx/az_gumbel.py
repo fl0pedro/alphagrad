@@ -80,7 +80,21 @@ def outvar(i): return jaxpr.eqns[i - 1].outvars[0]
 def legal_set(graph): return [i for i in VALID if outvar(i) in graph]
 
 # --------------------------- 4. normalisation (PopArt) + Pareto archive / objective (campaign)
+# Objective channels. ``xla_peak_memory`` was a 10-channel-era name; this env
+# emits 8 and reports the deterministic XLA estimate through the host-side
+# side-channel (env.consume_xla_memory_stats) instead of as a reward slot, so
+# the measured RM peak is the right stand-in here. Resolve by name with an
+# explicit alias table and fail loudly (listing what IS available) rather than
+# dying on a bare KeyError deep in module import.
+_CH_ALIASES = {"xla_peak_memory": "peak_memory", "bkstep_acc": "cosine_sim"}
 CH = ["latency_ns", "xla_peak_memory", "flops", "cosine_sim"]
+CH = [_CH_ALIASES.get(c, c) if c not in REWARD_INDEX else c for c in CH]
+_missing = [c for c in CH if c not in REWARD_INDEX]
+if _missing:
+    raise KeyError(
+        f"az_gumbel objective channels {_missing} are not emitted by this env. "
+        f"Available: {sorted(REWARD_INDEX)}"
+    )
 TIDX = np.array([REWARD_INDEX[c] for c in CH], dtype=np.int32)
 W4 = np.array([-1.0, -1.0, 0.0, 1.0], dtype=np.float64)   # equal-weight, flops dropped
 # PopArt value-target normalisation over the TIDX focus channels (van Hasselt

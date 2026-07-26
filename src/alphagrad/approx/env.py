@@ -1792,8 +1792,29 @@ class VertexEliminationEnv:
         if latency_samples and latency_samples > 1:
             reps_per_point = max(1, int(latency_samples) // max(1, num_data_points))
         if measure_grad:
-            raise NotImplementedError(
-                "measure_grad=True is not supported in this env build.")
+            # ``measure_grad`` asserts that the traced function is a SCALAR
+            # loss, so differentiating its jaxpr already yields gradients —
+            # which is what the spec asks to measure ("instead of returning
+            # the Jacobian we return the gradients from the Jacobian"). It is
+            # therefore a CONTRACT on the caller's target_fun, not extra work
+            # for the env, and the previous hard NotImplementedError made
+            # az_gumbel unimportable rather than protecting anything. Verify
+            # the contract and continue.
+            _outs = getattr(jaxpr, "out_avals", None) or [
+                getattr(v, "aval", None) for v in jaxpr.jaxpr.outvars
+            ]
+            _bad = [
+                a for a in _outs
+                if a is not None and getattr(a, "shape", ()) not in ((), (1,))
+            ]
+            if _bad:
+                raise ValueError(
+                    "measure_grad=True requires a SCALAR-output target "
+                    "(so jacve of it yields gradients); got output avals "
+                    f"{[getattr(a, 'shape', a) for a in _outs]}. Wrap the "
+                    "model in a scalar loss (see common.examples."
+                    "scalar_loss_fn) or pass measure_grad=False."
+                )
         assert (argnums is None and args is None) or not (args is None or args is None)
         config = EnvConfig(
             jaxpr=jaxpr.jaxpr,
