@@ -1,3 +1,20 @@
+"""DEPRECATED — DOES NOT RUN against this tree.
+
+Verified by two independent audits (2026-07-26): the Ray line dies before the
+first update with at least five independent failures — the 8-vs-10 reward
+channel skew (PPORayWorker.__init__ indexes channel 9 of an 8-vector), the
+unported FactoredQuantHead (`quant_dtype_head.proj` no longer exists; MicroAction
+needs `quant_scale_sign`), and 100% sentinel measurements (`_callback` does not
+accept the `point_idx=` this line always passes, so every measurement is
+swallowed into -1e10). The advertised async pipeline cannot start at all
+(no `--p3o` flag; its learner `train_on_trajs` was removed but is still called).
+
+KEPT AS A DESIGN REFERENCE ONLY. The parts worth reading are catalogued in
+alphagrad/COMPONENTS.md; the ones worth having have been ported to ppo.py
+(PopArt, Pareto + hypervolume, the multiplicative cosine gate, per-component KL).
+Use `ppo.py`.
+"""
+
 """Ray-remote wrappers around :class:`PPORayWorker`.
 
 Mirrors the `mu0_ray_actors.SPMDActor` shape so the driver in

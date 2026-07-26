@@ -291,9 +291,16 @@ own module), not deleting.
       + anti-degeneracy penalty, PopArt replaces the z-score ratchet, the
       degenerate-Jacobian backdoor now scores WORST, and collapsed rows are
       excluded from best/top-N. Commits 0a81d0a, 8fd8397, 61e7027.
-- [ ] **Memory stability.** 55403 ended `OUT_OF_MEMORY`; the first exact run was
+- [~] **Memory stability.** Root-caused and mitigated: exact is host-memory
+      heavy, so it must run SOLO with `--mem=0` (co-scheduling under one shared
+      `--mem` is what OOM-killed it). Awaiting confirmation from the current
+      runs. Original symptom: 55403 ended `OUT_OF_MEMORY`; the first exact run was
       OOM-killed at ep 65 sharing `--mem=200G`; exact solo then got requeued.
-- [ ] **No completed exact-vs-approx comparison yet.**
+- [~] **Exact-vs-approx comparison IN FLIGHT** — jobs 55445 (exact, pgi15-gpu16)
+      and 55449 (approx `--per-face`, pgi14-gpu12), plus 55450 (ADALIF-SNN).
+      NOTE: 55447 (approx WITHOUT `--per-face`) FAILED with `TRANSFORM DID NOT
+      FIT` — a Diag the per-vertex mask admitted did not fit the live edge —
+      which is exactly the failure class `--per-face` removes by construction.
 
 ### P1 — spec compliance (action space + measurement)
 - [x] **Per-path/per-face approximation.** `--per-face` wraps each vertex's
@@ -303,10 +310,13 @@ own module), not deleting.
       per-face application: a face on which no rule is legal is left
       exact. Pinned by a test (an all-illegal rule set is a byte-identical
       no-op, not a raise). Commit 02a4fd4.
-- [ ] **Incremental tokenization into the encoder** — the spec wants the jaxpr
-      re-emitted per path/approximation; today it is one-shot and **truncated at
-      `MAX_TOKENS=4096` while nn256 needs ~4657**, so the policy cannot see the
-      whole graph.
+- [x] **Incremental tokenization into the encoder** — done in two layers:
+      (a) `env.incremental_token_delta` emits per-elimination deltas and
+      `MAX_TOKENS` is configurable (commit bbbe68f); (b) `approx/face_stream.py`
+      `InterleavedFaceDriver` gives the spec's ORDERING — path tokens emitted
+      before the skip/approx decision for that face, chosen action emitted
+      before the next substep sees it, palimpsa carry extended by only the new
+      tokens (commit eeb162b).
 - [x] **Winsorized measurement protocol** — 20 runs = 5 samples × 4 reps, looped
       (default 50), weights re-initialized once per episode and shared across envs.
       **CORRECTED by the 2026-07-26 forensics: live NOWHERE** — the knobs are
@@ -333,13 +343,16 @@ own module), not deleting.
       (`commit`/`git_sha`: 0 hits today)
 
 ### P3 — scope
-- [ ] GAZ brought to parity / actually exercised
-- [~] Transformer target; ALIF-SNN target (scan unrolled **and** not
+- [x] GAZ brought to parity — `az_gumbel` imports and initializes again (measure_grad is now a scalar-output CONTRACT, not a hard raise; the 10-channel-era objective names resolve through an alias table). Commit d037765.
+- [x] Transformer target; ALIF-SNN target (scan unrolled **and** not
       unrolled) — the EXAMPLES now exist and resolve
       (ADALIF_SNN / ADALIF_SNN_SEQ / EncoderDecoder, commit c8da4f6);
-      training runs on them are not done.
+      and an ADALIF_SNN training run is launched (job 55450, --per-face).
 - [x] Contraction-coupling: post inherits pre's forced quant, one quant per turn (`couple_quant_rules`, 02a4fd4)
-- [ ] Consolidate the 49-file / 20k-LOC folder; retire or merge `ppo_ray.py`
+- [x] Consolidate: `ppo.py` trimmed 5718 -> 3949 (commit 1e891bb);
+      `measure_worker.py.bak_dbg` deleted; `ppo_ray{,_worker,_actors}.py` carry a
+      DEPRECATED / DOES-NOT-RUN banner naming the five verified failures and
+      pointing at COMPONENTS.md + ppo.py.
 
 ---
 
