@@ -118,6 +118,54 @@ def _extend_block(agent, carries, tokens, positions):
 _extend_block_j = eqx.filter_jit(_extend_block)
 
 
+def _extend_block_masked(agent, carries, tokens, positions, valid):
+    """Fixed-shape ``_extend_block``: pad steps FREEZE the carry.
+
+    ``_extend_block`` scans a variable-length delta, so it recompiles per
+    length and cannot live in a jitted rollout whose shapes must be static.
+    This variant takes a fixed ``(D,)`` buffer plus a ``valid`` mask and is
+    therefore compiled ONCE, which is what lets the palimpsa carry ride in a
+    ``lax.scan`` carry alongside the env state.
+
+    The valid prefix is BITWISE identical to ``_extend_block`` over the same
+    tokens: an invalid step runs the same arithmetic but its result is
+    discarded by a select, so no value that survives is computed differently.
+    That matters more than it sounds — the PPO ratio-1 invariant needs the
+    rollout encode and the loss-time re-encode to agree exactly, not closely.
+
+    Returns ``(new_carries, rows)`` with ``rows`` zeroed on invalid steps.
+    """
+    layers = agent.encoder.layers
+    embedding = agent.embedding
+    pe = agent.pos_enc.pe
+    final_norm = agent.final_norm
+    n_pos = pe.shape[0]
+
+    def _step(carry_list, tpv):
+        tok, pos, ok = tpv
+        # Clamp: an invalid step's position is never used, but it must not
+        # index out of the table before the select discards it.
+        safe_pos = jnp.clip(pos, 0, n_pos - 1)
+        x_t = embedding(tok.astype(jnp.int32)) + pe[safe_pos, :]
+        new_carry = []
+        for li, layer in enumerate(layers):
+            x_t, c = _layer_step(layer, x_t, carry_list[li])
+            old = carry_list[li]
+            new_carry.append(tuple(
+                jnp.where(ok, new_leaf, old_leaf)
+                for new_leaf, old_leaf in zip(c, old)))
+        row = final_norm(x_t)
+        return new_carry, jnp.where(ok, row, jnp.zeros_like(row))
+
+    carry_in = [tuple(c) for c in carries]
+    new_carry, rows = jax.lax.scan(
+        _step, carry_in, (tokens, positions, valid))
+    return new_carry, rows
+
+
+_extend_block_masked_j = eqx.filter_jit(_extend_block_masked)
+
+
 class IncrementalEncoderState:
     """Mutable-ish snapshot of the incremental encode.
 
