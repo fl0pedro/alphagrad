@@ -308,6 +308,26 @@ def incremental_token_delta(jaxpr, argnums, consts, args, order_prefix,
 _INCR_STREAM_CACHE: dict = {}
 _INCR_STREAM_CACHE_CAP = 64
 
+# One ResourceMonitor per device-set, reused for every measurement.
+# Constructing a fresh monitor per call leaks its C++ MemoryTracker/
+# TimeTracker (~18 MB/call, the documented landmine): at h=256 that is
+# 20 lifecycles/step x 12 steps -> the 756 GB RSS that thrashed v10exact
+# (job 55508) into a D-state stall at ep 86. The monitor re-baselines in
+# __enter__ (start() resets the trackers), so reuse is the intended
+# lifecycle; ALPHAGRAD_MONITOR_REUSE=0 restores per-call construction.
+_MONITOR_CACHE: dict = {}
+
+
+def _get_resource_monitor(unique_devices):
+    if os.environ.get("ALPHAGRAD_MONITOR_REUSE", "1") == "0":
+        return ResourceMonitor(devices=unique_devices)
+    key = tuple(sorted(id(d) for d in unique_devices))
+    mon = _MONITOR_CACHE.get(key)
+    if mon is None:
+        mon = ResourceMonitor(devices=unique_devices)
+        _MONITOR_CACHE[key] = mon
+    return mon
+
 
 def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
                                tok_rules_by_v):
@@ -1801,7 +1821,7 @@ def _callback(
                 latency_samples.append(0.0)
                 peak_mem_samples.append(0.0)
             else:
-                with ResourceMonitor(devices=unique_devices) as monitor:
+                with _get_resource_monitor(unique_devices) as monitor:
                     # Accumulation loop (spec, default 50 when opted in): the
                     # executions queue back-to-back inside one monitor window
                     # and the exit barrier drains them all, so time/inner is a

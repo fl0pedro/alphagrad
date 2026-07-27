@@ -4192,6 +4192,15 @@ def main():
         if _clear_every > 0 and (ep + 1) % _clear_every == 0:
             try:
                 jax.clear_caches()
+                # The cache flush drops the PYTHON refs; without a forced
+                # collection the orphaned executables/cost-analysis dicts sit
+                # in gen-2 until CPython gets around to them — on the leak-
+                # prone measurement host that lag is real memory (the old
+                # stack's facf622 fix paired clear_caches with gc for the
+                # same reason).
+                import gc as _gc
+
+                _gc.collect()
                 tqdm.write(
                     f"[experiment] jax.clear_caches() called at ep={ep}",
                     file=sys.stderr,
