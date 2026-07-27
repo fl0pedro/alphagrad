@@ -404,6 +404,27 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
     return stream, seg_ids
 
 
+# ---------------------------------------------------------------------------
+# Host-phase profiling (always accumulated — a perf_counter pair per phase is
+# noise — printed per episode by ppo.py when ALPHAGRAD_PROFILE=1). Answers
+# "where does the episode actually go": tokenizer replay vs face-key
+# enumeration vs count pass vs XLA compile vs execution vs the policy-side
+# oracle replays (ppo adds its own keys into the same sink).
+# ---------------------------------------------------------------------------
+_PROF: dict = {}
+
+
+def _prof_add(key: str, dt: float) -> None:
+    _PROF[key] = _PROF.get(key, 0.0) + float(dt)
+
+
+def consume_profile() -> dict:
+    """Pop the accumulated per-phase host seconds since the last call."""
+    out = dict(_PROF)
+    _PROF.clear()
+    return out
+
+
 _DEGENERATE_PLANS = [0]
 
 
@@ -1624,6 +1645,13 @@ def _callback(
     only — every reward component is zeroed so the heavy jacve compile/exec
     is skipped entirely until the elimination order is complete.
     """
+    _pf_last = [time.perf_counter()]
+
+    def _pf(key):
+        now = time.perf_counter()
+        _prof_add(key, now - _pf_last[0])
+        _pf_last[0] = now
+
     partial_order, partial_specs = _get_partials(order, sparsity_specs, stop)
     is_terminal = int(stop) >= len(order)
 
@@ -1685,6 +1713,7 @@ def _callback(
                 transforms.append((int(v), tuple(rules)))
                 tok_rules_by_v[int(v)] = tuple(rules)
 
+    _pf("cb.decode+face_enum")
     if os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "0") == "1":
         # Append-only observation (spec): the stream grows by one block per
         # elimination and the whole extract_jaxpr re-trace of the Jacobian is
@@ -1732,6 +1761,7 @@ def _callback(
         eqn_ids_np = compute_eqn_ids_from_tokens(tokens_np, _TOKEN_VOCAB)
         eqn_ids = jnp.asarray(eqn_ids_np, dtype=jnp.int32)
 
+    _pf("cb.tokenize")
     if init:
         return tokens, eqn_ids, jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
 
@@ -1742,6 +1772,7 @@ def _callback(
     # (gdpo) collapse to the terminal reward; gfn already reads only the
     # last step. PPO sees a sparse-reward MDP, which GAE handles natively.
     if config.terminal_rewards_only and not is_terminal:
+        _pf("cb.nonterm_tail")
         return tokens, eqn_ids, jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
 
     # ------------------------------------------------------------------
@@ -1768,6 +1799,7 @@ def _callback(
     )
     muls_adds_fmas = float(aux["adds"] + aux["muls"] + aux["fmas"])
     max_io_sum = float(aux["mem"])
+    _pf("cb.count_pass")
 
     # WEDGE GUARD (v15 post-mortem): with the cos-sentinel gone, genuinely
     # huge approximated graphs go all the way to XLA — one episode-6 plan
@@ -1921,6 +1953,7 @@ def _callback(
         compiled_exact = cached_compile(b"exact:" + cache_key, _do_compile_exact)
     else:
         compiled_exact = None
+    _pf("cb.xla_compile")
 
     # XLA cost analysis — flops + bytes accessed. Falls back to 0 when the
     # backend doesn't expose them (CPU sometimes returns an empty dict).
@@ -2058,6 +2091,7 @@ def _callback(
             out_exact = compiled_exact(*eval_args_i)
             out_exacts.append(out_exact)
 
+    _pf("cb.exec_measure")
     latency_ns = (
         float(_aggregate_samples(latency_samples, want_top_quartile=True))
         if config.measure_latency
@@ -2114,6 +2148,7 @@ def _callback(
         cosine_sim = 0.0
         frob_residual = 0.0
 
+    _pf("cb.quality")
     rewards = jnp.array(
         [
             -muls_adds_fmas,

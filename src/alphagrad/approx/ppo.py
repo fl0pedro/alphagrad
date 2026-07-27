@@ -2962,7 +2962,21 @@ def main():
     _oracle_N = MAX_AXES_PER_VERTEX
     _oracle_total_v = len(_oracle_jaxpr.eqns)
 
+    # Host-phase profiling: the oracle replays are prime slow-suspects (a
+    # full LVMO elimination replay per CALL, per step). Accumulated into the
+    # env module's shared sink; printed per episode under ALPHAGRAD_PROFILE=1.
+    from alphagrad.approx.env import _prof_add as _env_prof_add
+    from alphagrad.approx.env import consume_profile as _consume_profile
+    import time as _prof_time
+
     def _oracle_masks_host(order, spec_hist, step_count):
+        _pt0 = _prof_time.perf_counter()
+        try:
+            return _oracle_masks_host_inner(order, spec_hist, step_count)
+        finally:
+            _env_prof_add("oracle.vertex_masks", _prof_time.perf_counter() - _pt0)
+
+    def _oracle_masks_host_inner(order, spec_hist, step_count):
         eo = np.asarray(order).reshape(-1)
         specs = np.asarray(spec_hist)
         n = int(np.asarray(step_count))
@@ -2999,6 +3013,13 @@ def main():
     _F_FACES = ENV_MAX_FACES
 
     def _oracle_face_masks_host(order, spec_hist, step_count):
+        _pt0 = _prof_time.perf_counter()
+        try:
+            return _oracle_face_masks_host_inner(order, spec_hist, step_count)
+        finally:
+            _env_prof_add("oracle.face_masks", _prof_time.perf_counter() - _pt0)
+
+    def _oracle_face_masks_host_inner(order, spec_hist, step_count):
         eo = np.asarray(order).reshape(-1)
         specs = np.asarray(spec_hist)
         n = int(np.asarray(step_count))
@@ -5046,6 +5067,26 @@ def main():
                     f"[mem ep={ep}] probe failed: {_exc!r}",
                     file=sys.stderr,
                 )
+
+        # Host-phase profile: where the episode's HOST seconds went (callback
+        # phases from env.py + the policy-side oracle replays). The residual
+        # vs the episode wall-clock is jit compute (rollout + PPO update) —
+        # everything the host timers can't see.
+        if os.environ.get("ALPHAGRAD_PROFILE", "0") == "1":
+            try:
+                _prof = _consume_profile()
+                if _prof:
+                    _items = sorted(
+                        _prof.items(), key=lambda kv: -kv[1]
+                    )
+                    _tot = sum(v for _, v in _items)
+                    tqdm.write(
+                        f"[prof ep={ep:3d}] host_total={_tot:6.1f}s  "
+                        + "  ".join(f"{k}={v:.1f}s" for k, v in _items),
+                        file=sys.stderr,
+                    )
+            except Exception as _exc:
+                tqdm.write(f"[prof ep={ep}] failed: {_exc!r}", file=sys.stderr)
 
         # Per-episode tracemalloc diff. Top-K Python lines by allocated
         # bytes since the previous snapshot. ``host_state["_tm_prev"]``
