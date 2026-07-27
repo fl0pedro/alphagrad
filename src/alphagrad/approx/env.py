@@ -305,6 +305,73 @@ def incremental_token_delta(jaxpr, argnums, consts, args, order_prefix,
     return delta
 
 
+_INCR_STREAM_CACHE: dict = {}
+_INCR_STREAM_CACHE_CAP = 64
+
+
+def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
+                               tok_rules_by_v):
+    """Full append-only observation stream for the prefix ``o_list``
+    (ALPHAGRAD_INCREMENTAL_TOKENS=1): base tokens + one block per elimination
+    (path tokens + ``approx`` echoes), from graphax's IncrementalPathTokenizer
+    driven with the SAME transforms the measurement applies — the stream
+    describes the approximated graph, not the intent.
+
+    The stream for a prefix is a byte-wise prefix of the stream for any
+    extension, so the cache extends the episode's tokenizer by ONE elimination
+    per env step instead of re-tracing the whole Jacobian (``extract_jaxpr``)
+    every step. Extending MUTATES the tokenizer, so the parent entry is POPPED
+    before extension — a sibling chain that misses takes the honest cold
+    replay (same policy as ``incremental_token_delta``).
+    """
+    from graphax import IncrementalPathTokenizer
+
+    # 229 reserved tokens + 10 digits leave `vocab - 239` symbols for the name
+    # alphabet (the tokenizer needs >= 2). 248 fits under the default 256-row
+    # policy embedding with a 9-symbol alphabet.
+    vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "248"))
+    steps = []
+    for v_idx, v in enumerate(o_list):
+        rows = tuple(tuple(int(x) for x in row)
+                     for row in np.asarray(specs_list[v_idx]).reshape(-1, 3))
+        steps.append((int(v), rows))
+    base_key = (id(config.jaxpr), tuple(config.argnums))
+    key = base_key + (tuple(steps),)
+
+    hit = _INCR_STREAM_CACHE.get(key)
+    if hit is not None:
+        return hit[1]
+
+    tk, stream, done = None, None, 0
+    for cut in range(len(steps) - 1, 0, -1):
+        parent = _INCR_STREAM_CACHE.pop(base_key + (tuple(steps[:cut]),), None)
+        if parent is not None:
+            tk, stream, done = parent[0], list(parent[1]), cut
+            break
+    if tk is None:
+        tk = IncrementalPathTokenizer(
+            config.jaxpr, tuple(config.argnums), list(consts), list(args),
+            vocab_size=vocab,
+        )
+        stream = [int(t) for t in tk.base_tokens()]
+        guard = os.environ.get("ALPHAGRAD_VOCAB_SIZE")
+        if guard is not None and tk.max_token_id() >= int(guard):
+            raise ValueError(
+                f"incremental token ids reach {tk.max_token_id()} but the "
+                f"policy embedding has only {guard} rows — raise --vocab-size "
+                f"or lower ALPHAGRAD_INCR_TOKEN_VOCAB. (JAX CLAMPS an "
+                f"out-of-range gather, silently reading the wrong row.)"
+            )
+    for v, _rows in steps[done:]:
+        stream += [int(t) for t in tk.eliminate(int(v),
+                                                tok_rules_by_v.get(int(v), ()))]
+
+    if len(_INCR_STREAM_CACHE) > _INCR_STREAM_CACHE_CAP:
+        _INCR_STREAM_CACHE.clear()
+    _INCR_STREAM_CACHE[key] = (tk, stream)
+    return stream
+
+
 _DEGENERATE_PLANS = [0]
 
 
@@ -1429,6 +1496,7 @@ def _callback(
     # a scalar denominator has one (n,) edge and one () edge — a Diag
     # with j=1 only fits the first).
     transforms: list[tuple[int, tuple]] = []
+    tok_rules_by_v: dict[int, tuple] = {}
     last_v_idx = len(o_list) - 1
     for v_idx, v in enumerate(o_list):
         rules = decode_vertex_rule_specs(
@@ -1446,32 +1514,53 @@ def _callback(
                 transforms.append(
                     (int(v), (make_live_masked_hook(rules, stats=_face_stats),))
                 )
+                # The tokenizer eliminates its OWN graph copy with equivalent
+                # hooks but no stats sink — the measured graph's hooks own the
+                # applied/skipped counters.
+                tok_rules_by_v[int(v)] = (make_live_masked_hook(rules),)
             else:
                 transforms.append((int(v), tuple(rules)))
-    ve = extract_jaxpr(
-        config.jaxpr,
-        config.argnums,
-        o_list,
-        config.sparse,
-        args,
-        consts,
-        transforms=transforms,
-    )
-    # Measure the raw token length before slicing so we can detect
-    # truncation. ``_record_tokenization_truncation`` is a no-op for
-    # short sequences (the common case) and is cheap otherwise.
-    raw_tokens = ve.tokenized()
-    _record_token_length(int(raw_tokens.shape[0]))
-    _record_tokenization_truncation(int(raw_tokens.shape[0]))
-    tokens = raw_tokens[:MAX_TOKENS]
-    tokens = jnp.pad(tokens, (0, MAX_TOKENS - tokens.shape[0]))
+                tok_rules_by_v[int(v)] = tuple(rules)
 
-    # Compute per-token equation IDs once for the relational-bias encoder
-    # (Stage B.1). Cheap (single Python scan over a length-≤4096 numpy array)
-    # and adds (MAX_TOKENS,) int32 to EnvState.
-    tokens_np = np.asarray(tokens)
-    eqn_ids_np = compute_eqn_ids_from_tokens(tokens_np, _TOKEN_VOCAB)
-    eqn_ids = jnp.asarray(eqn_ids_np, dtype=jnp.int32)
+    if os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "0") == "1":
+        # Append-only observation (spec): the stream grows by one block per
+        # elimination and the whole extract_jaxpr re-trace of the Jacobian is
+        # skipped. eqn_ids are zeros for now — the legacy per-token eqn
+        # segmentation is tied to the VEJaxpr vocab; the incremental stream's
+        # segmentation (IncrementalJaxpr step ranges) is the follow-up.
+        stream = _incremental_stream_tokens(
+            config, consts, args, o_list, specs_list, tok_rules_by_v
+        )
+        _record_token_length(len(stream))
+        _record_tokenization_truncation(len(stream))
+        tokens = jnp.asarray(stream[:MAX_TOKENS], dtype=jnp.int32)
+        tokens = jnp.pad(tokens, (0, MAX_TOKENS - tokens.shape[0]))
+        eqn_ids = jnp.zeros((MAX_TOKENS,), dtype=jnp.int32)
+    else:
+        ve = extract_jaxpr(
+            config.jaxpr,
+            config.argnums,
+            o_list,
+            config.sparse,
+            args,
+            consts,
+            transforms=transforms,
+        )
+        # Measure the raw token length before slicing so we can detect
+        # truncation. ``_record_tokenization_truncation`` is a no-op for
+        # short sequences (the common case) and is cheap otherwise.
+        raw_tokens = ve.tokenized()
+        _record_token_length(int(raw_tokens.shape[0]))
+        _record_tokenization_truncation(int(raw_tokens.shape[0]))
+        tokens = raw_tokens[:MAX_TOKENS]
+        tokens = jnp.pad(tokens, (0, MAX_TOKENS - tokens.shape[0]))
+
+        # Compute per-token equation IDs once for the relational-bias encoder
+        # (Stage B.1). Cheap (single Python scan over a length-≤4096 numpy
+        # array) and adds (MAX_TOKENS,) int32 to EnvState.
+        tokens_np = np.asarray(tokens)
+        eqn_ids_np = compute_eqn_ids_from_tokens(tokens_np, _TOKEN_VOCAB)
+        eqn_ids = jnp.asarray(eqn_ids_np, dtype=jnp.int32)
 
     if init:
         return tokens, eqn_ids, jnp.zeros(NUM_REWARDS, dtype=jnp.float32)

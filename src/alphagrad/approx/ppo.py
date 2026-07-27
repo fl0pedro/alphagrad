@@ -2481,6 +2481,10 @@ def main():
     # measurement when the user has selected it as their primary compute metric
     # so the reward isn't silently zeroed out.
     measure_latency = args.measure_latency or args.cmp_type == "latency"
+    # Under ALPHAGRAD_INCREMENTAL_TOKENS=1 the env's tokenizer guards its id
+    # space against this embedding size (an out-of-range gather CLAMPS
+    # silently); publish it where the host callback can see it.
+    os.environ["ALPHAGRAD_VOCAB_SIZE"] = str(int(args.vocab_size))
     env = VertexEliminationEnv.from_jaxpr(
         closed_jaxpr,
         args=xs,
