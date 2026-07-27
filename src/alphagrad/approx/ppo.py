@@ -1206,10 +1206,17 @@ class Agent(eqx.Module):
             row = jnp.where(ok, x, jnp.zeros_like(x))
             return (jnp.stack(new_M), jnp.stack(new_I), cumhist2, nvalid2), row
 
+        # unroll: the per-token body is a handful of small matvecs — a
+        # sequential 16k-iteration scan of those is GPU launch-latency bound
+        # (v15e profile: jit compute ~85% of the episode). Unrolling batches
+        # K bodies per loop iteration into one fused kernel; values are
+        # step-identical (unrolling never reassociates), so rollout/loss
+        # parity is untouched.
         (M2, I2, ch2, nv2), rows = lax.scan(
             _step,
             (carry.M, carry.I, carry.cumhist, carry.nvalid),
             (toks, eqns, valid),
+            unroll=int(os.environ.get("ALPHAGRAD_EXTEND_UNROLL", "8")),
         )
         new_carry = EncCarry(M=M2, I=I2, cumhist=ch2, nvalid=nv2,
                              pos=carry.pos + count)
