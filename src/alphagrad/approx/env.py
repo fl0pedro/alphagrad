@@ -2086,6 +2086,28 @@ def _callback(
         _no_jac = float(cosine_sim) <= 1e-6
         if _no_work or _no_jac:
             _record_degenerate_plan()
+            if os.environ.get("ALPHAGRAD_DEBUG_DEGEN", "0") == "1":
+                # Name the culprit: which condition fired, the raw channel
+                # values, and the plan's action mix — the aggregate counter
+                # says "16/16 degenerate" without ever saying WHY.
+                _n_skips = int(np.sum(_skips_np == 1)) if len(o_list) else 0
+                _spec_rows = np.asarray(partial_specs)
+                _n_quant = int(np.sum(_spec_rows[..., 0] == QUANT_SENTINEL))
+                _n_comp = int(np.sum(_spec_rows[..., 0] == COMPRESS_SENTINEL))
+                _n_diag = int(np.sum(_spec_rows[..., 0] >= 0))
+                _fr = np.asarray(face_specs)[: len(o_list)]
+                _fq = int(np.sum(_fr[..., 0] == QUANT_SENTINEL))
+                _fc = int(np.sum(_fr[..., 0] == COMPRESS_SENTINEL))
+                _fd = int(np.sum(_fr[..., 0] >= 0))
+                print(
+                    f"[degen] no_work={_no_work} (muls={muls_adds_fmas:.3g} "
+                    f"flops={flops:.3g}) no_jac={_no_jac} "
+                    f"(cos={cosine_sim:.3e} frob={frob_residual:.3e}) "
+                    f"vertex_rules(d/c/q)={_n_diag}/{_n_comp}/{_n_quant} "
+                    f"face_rules(d/c/q)={_fd}/{_fc}/{_fq} skips={_n_skips} "
+                    f"order={o_list}",
+                    flush=True,
+                )
             return tokens, eqn_ids, _SENTINEL_BAD_REWARD
 
     return tokens, eqn_ids, rewards
