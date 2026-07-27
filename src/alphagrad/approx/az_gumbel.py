@@ -50,8 +50,7 @@ from alphagrad.approx.common.examples import (
     get_fn, get_args, data_gen, infer_argnums, scalar_loss_fn)
 from alphagrad.approx.common.eval_samples import generate_eval_samples
 from alphagrad.approx.common.order_specs import build_order_specs
-from alphagrad.approx.policy import build_policy, NUM_REWARDS
-from alphagrad.approx.common.popart import PopArtStats, popart_rescale_mlp_head
+from alphagrad.approx.common.popart import PopArtStats
 from alphagrad.approx.common.pareto_archive import ParetoArchive
 from graphax.core import _build_graph, _prune_graph, _eliminate_vertex
 from graphax.sparse.micro_actions import COMPRESS_KINDS
@@ -131,14 +130,6 @@ popart = PopArtStats(
     robust_std=os.environ.get("ALPHAGRAD_POPART_ROBUST_STD", "1") == "1",
     winsor_k=float(os.environ.get("ALPHAGRAD_POPART_WINSOR_K", "5.0")),
 )
-def _popart10(mu, sigma):
-    """Scatter a len(TIDX) stats vector into NUM_REWARDS-long (mu, sigma) that
-    are IDENTITY (mu=0, sigma=1 -> ratio 1, bias unchanged) on every non-focus
-    row, so popart_rescale_mlp_head rescales EXACTLY the TIDX rows of the value
-    head and provably leaves the other rows untouched."""
-    m = np.zeros(NUM_REWARDS, dtype=np.float32); m[TIDX] = np.asarray(mu, np.float32)
-    s = np.ones(NUM_REWARDS, dtype=np.float32); s[TIDX] = np.asarray(sigma, np.float32)
-    return m, s
 def scalarize(raw4):
     r = np.asarray(raw4, dtype=np.float64)
     return float(np.sum(W4 * (r - popart.mu) / popart.sigma))
@@ -300,13 +291,39 @@ def measure(state):
     r = np.array([lat, peak, flops, cos])
     return r if np.all(np.isfinite(r)) else None
 
-# ------------------------------------------- 2. policy (build_policy) — the PPO components
+# --------------------- 2. policy — ppo.py's MAINLINE Agent (stage-2 parity)
+# The prior + value come from the same architecture PPO trains: palimpsa
+# encoder (ALPHAGRAD_POLICY), PointerVertexPolicy, and the FOUR single-output
+# value heads (latency, mem, cos, frob). MicroPPOAgent (the deprecated Ray
+# line's policy) is gone from this file. Head<->objective mapping: GAZ's CH
+# order is [latency, peak, flops, cos]; Agent heads are [lat, mem, cos, frob]
+# — flops has W4 == 0 (never scalarized) and no head, frob is unused here.
+from alphagrad.approx.ppo import (
+    _build_agent as _ppo_build_agent,
+    _build_factor_table as _ppo_build_factor_table,
+    _popart_rescale_heads as _ppo_popart_rescale_heads,
+    make_argparser as _ppo_make_argparser,
+)
+
 EMBD = 128
+_HEAD_PICK = np.array([0, 1, 2], dtype=np.int32)   # heads for CH [lat, peak, cos]
+_CH_ACTIVE = jnp.array([1.0, 1.0, 0.0, 1.0])       # flops row inert (no head)
 kA = jax.random.PRNGKey(A.seed)
-agent = build_policy(vocab_size=512, embd_dim=EMBD, num_layers=4, num_heads=4,
-                      hidden_dim=256, num_vertices=len(jaxpr.eqns),
-                      value_dims=(128, 128), key=kA, max_substeps=1,
-                      policy="palimpsa")
+_ns = _ppo_make_argparser().parse_args([])
+_ns.vocab_size = 512
+_ns.embd_dim = EMBD
+_ns.num_heads = 4
+_ns.hidden_dim = 256
+_ns.max_substeps = 1
+_ft_table, _ft_py, _n_factors, _max_rules = _ppo_build_factor_table(_ns)
+agent = _ppo_build_agent(_ns, len(jaxpr.eqns), _n_factors, _max_rules, kA)
+
+
+def _agent_fwd(agent, tok, eqn):
+    """(masked-later vertex logits, per-head value (4,)) from the mainline
+    Agent's single encode pass."""
+    vlog, _ctx, v4 = agent.encode(tok, eqn_ids=eqn, key=jax.random.PRNGKey(0))
+    return vlog, v4
 
 # ------------------------------------------------------------------ 3. optimizer
 opt = optax.adam(A.lr)
@@ -317,12 +334,7 @@ def _net_fwd_b(agent, toks, eqns):
     """BATCHED fixed-shape forward: vmap over a stack of TOKCAP-padded states.
     One GPU dispatch evaluates every candidate/rollout frontier at once; only a
     handful of batch sizes occur (<= n_candidates) so compiles are bounded."""
-    def one(tok, eqn):
-        enc_x, tm = agent.encode_tokens(tok, key=jax.random.PRNGKey(0), eqn_ids=eqn)
-        vlog, _ = agent.vertex_policy(enc_x, tm)
-        v10 = agent.value_from_encoding(enc_x, tm)
-        return vlog, v10
-    return jax.vmap(one)(toks, eqns)
+    return jax.vmap(lambda tok, eqn: _agent_fwd(agent, tok, eqn))(toks, eqns)
 
 _eval_cache = {}                       # state-key -> (vlog, v10); cleared on net update
 def _skey(state):
@@ -349,10 +361,12 @@ def batch_eval(states):
 
 def net_eval(agent, state, legal):
     """(prior logits over legal action idxs, scalar value in z-space)."""
-    vlog, v10 = batch_eval([state])[0]
+    vlog, v4 = batch_eval([state])[0]
     la = np.array([VALID.index(v) for v in legal], dtype=np.int32)
     logits = vlog[la] - vlog[la].max()
-    vz = float(np.sum(W4 * v10[TIDX]))     # value head trained in z-space -> scalarize
+    # Heads [lat, mem, cos] scalarized with the CH weights (flops has no head
+    # and W4[2] == 0); trained in PopArt-normalised space like the targets.
+    vz = float(W4[0] * v4[0] + W4[1] * v4[1] + W4[3] * v4[2])
     return logits, vz, la
 
 # ---------------------------------------------------------------- known dynamics
@@ -388,7 +402,8 @@ def lockstep_rollout_values(entries, depth):
     out = []
     for i, e in enumerate(live):
         if i in vmap_:
-            out.append(float(np.sum(W4 * vmap_[i][1][TIDX])))
+            v4 = vmap_[i][1]  # mainline Agent heads [lat, mem, cos, frob]
+            out.append(float(W4[0] * v4[0] + W4[1] * v4[1] + W4[3] * v4[2]))
         else:
             out.append(None)                               # terminal reached in-search
     return out
@@ -470,14 +485,15 @@ def gumbel_search(state, graph, tg, rng):
 # ---------------------------------------------------------------- training
 def loss_fn(agent, toks, eqns, la_pad, la_mask, pi_pad, vtgt, vmask):
     def per(tok, eqn, la, lam, pi, vt, vm):
-        enc_x, tm = agent.encode_tokens(tok, key=jax.random.PRNGKey(0), eqn_ids=eqn)
-        vlog, _ = agent.vertex_policy(enc_x, tm)
+        vlog, v4 = _agent_fwd(agent, tok, eqn)
         lg = vlog[la]
         lg = jnp.where(lam > 0.5, lg, -1e9)
         logp = jax.nn.log_softmax(lg)
         ce = -jnp.sum(jnp.where(lam > 0.5, pi * logp, 0.0))
-        v10 = agent.value_from_encoding(enc_x, tm)
-        vl = jnp.sum(vm * (v10[jnp.asarray(TIDX)] - vt) ** 2)
+        # Predicted CH vector from the 4 heads: [lat, mem, 0 (flops: no
+        # head, _CH_ACTIVE masks it), cos]; targets vt are PopArt-normalised.
+        pred = jnp.stack([v4[0], v4[1], jnp.zeros_like(v4[0]), v4[2]])
+        vl = jnp.sum(vm * _CH_ACTIVE * (pred - vt) ** 2)
         return ce + 0.5 * vl
     return jnp.mean(jax.vmap(per)(toks, eqns, la_pad, la_mask, pi_pad, vtgt, vmask))
 
@@ -571,10 +587,16 @@ def _run(args) -> int:
         # rest); the critic keeps predicting PopArt-normalised values and its
         # existing predictions stay consistent across the stats jump.
         _o_mu, _o_sig, _n_mu, _n_sig = popart.update(raw[None, :])
-        agent = eqx.tree_at(
-            lambda a: a.value_head, agent,
-            popart_rescale_mlp_head(agent.value_head,
-                                    *_popart10(_o_mu, _o_sig), *_popart10(_n_mu, _n_sig)))
+        # Mainline Agent: four single-output heads; rescale EXACTLY the three
+        # CH-mapped ones ([lat, mem, cos] <- CH rows 0, 1, 3), identity on frob.
+        def _stats4(mu, sig):
+            m = np.zeros(4, dtype=np.float32)
+            s = np.ones(4, dtype=np.float32)
+            m[[0, 1, 2]] = np.asarray(mu, np.float32)[[0, 1, 3]]
+            s[[0, 1, 2]] = np.asarray(sig, np.float32)[[0, 1, 3]]
+            return m, s
+        agent = _ppo_popart_rescale_heads(
+            agent, *_stats4(_o_mu, _o_sig), *_stats4(_n_mu, _n_sig))
         _eval_cache.clear()          # value head rescaled -> cached (prior, value) stale
         # Pareto front over RAW {lat, xla_peak, cos} (sign-oriented; archive maximises)
         _pareto.add(_PSGN * raw,
