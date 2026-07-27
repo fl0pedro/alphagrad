@@ -390,3 +390,75 @@ def compute_union_variant_masks(
         "factor_mask": factor_mask,
         "quant_dtype_mask": quant_mask,
     }
+
+
+# ---------------------------------------------------------------------------
+# Curriculum helpers — restored for mu0.py (dropped from the ppo line in the
+# 9cdd258 trim). Identical to the pre-trim implementations except the deleted
+# seven-stage rotation names are no longer valid stage names: stages must be
+# VARIANT_PRESETS keys.
+# ---------------------------------------------------------------------------
+
+
+def _parse_curriculum(spec: str) -> list[tuple[str, int]]:
+    """Parse ``stage1:N1,stage2:N2,...`` into ``[(stage_name, episodes), ...]``."""
+    if not spec.strip():
+        return []
+    stages: list[tuple[str, int]] = []
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            raise ValueError(
+                f"Curriculum stage '{chunk}' missing ':'. Expected "
+                "`stage:episode_count`."
+            )
+        name, n_str = chunk.split(":", 1)
+        name = name.strip()
+        if name not in VARIANT_PRESETS:
+            raise ValueError(
+                f"Curriculum stage '{name}' unknown. Valid stage names: "
+                f"{sorted(VARIANT_PRESETS)}."
+            )
+        try:
+            n_episodes = int(n_str.strip())
+        except ValueError as e:
+            raise ValueError(
+                f"Curriculum stage '{chunk}': episode count '{n_str}' is "
+                "not an integer."
+            ) from e
+        if n_episodes <= 0:
+            raise ValueError(
+                f"Curriculum stage '{chunk}': episode count must be > 0."
+            )
+        stages.append((name, n_episodes))
+    return stages
+
+
+def _default_full_curriculum(total_episodes: int) -> list[tuple[str, int]]:
+    """Split ``total_episodes`` across diag_gcd → diag_factor → full."""
+    base = max(total_episodes // 3, 1)
+    return [
+        ("diag_gcd", base),
+        ("diag_factor", base),
+        ("full", max(total_episodes - 2 * base, 1)),
+    ]
+
+
+def _current_stage_at(stages: list[tuple[str, int]], ep: int) -> str:
+    cumulative = 0
+    for name, n in stages:
+        if ep < cumulative + n:
+            return name
+        cumulative += n
+    return stages[-1][0] if stages else ""
+
+
+def _current_stage_index(stages: list[tuple[str, int]], ep: int) -> int:
+    cumulative = 0
+    for idx, (_, n) in enumerate(stages):
+        if ep < cumulative + n:
+            return idx
+        cumulative += n
+    return len(stages) - 1
