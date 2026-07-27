@@ -1687,6 +1687,248 @@ class MicroActionPolicy(eqx.Module):
         )
 
 
+# ---------------------------------------------------------------------------
+# Per-path (face) decisions — P1b (APPROX_PLAN §7)
+# ---------------------------------------------------------------------------
+
+
+class FaceAction(NamedTuple):
+    """Per-face decisions for ONE vertex elimination, padded to MAX_FACES.
+
+    ``skip[f] == 1`` ⇒ that face's contraction is dropped (graphax.SKIP_FACE)
+    and its slot fields are canonical END/zeros. Slot fields are indexed
+    ``[face, slot]`` with slot order (pre, post, new); ``op_type == OP_END``
+    means "no approximation for that slot"."""
+
+    skip: jax.Array              # (F,) int32
+    op_type: jax.Array           # (F, S) int32
+    i: jax.Array                 # (F, S) int32
+    j: jax.Array                 # (F, S) int32
+    exponents: jax.Array         # (F, S, MAX_PRIMES) int32
+    factor: jax.Array            # (F, S) int32
+    compress_kind: jax.Array     # (F, S) int32
+    quant_dtype: jax.Array       # (F, S) int32
+    quant_scale_sign: jax.Array  # (F, S) int32
+
+
+class FacePathPolicy(eqx.Module):
+    """One SKIP gate per face, then one micro decision per (face, slot).
+
+    The spec's per-path sub-episode with dynamic-substeps = 1: for every local
+    path of the chosen vertex, decide ONCE at the start whether to skip the
+    contraction outright; if kept, pick an approximation (or END = none) for
+    the pre, post, and new operands. Owns its OWN AxisSetEncoder /
+    MicroActionHead (sharing the vertex path's modules would duplicate their
+    parameters in the agent pytree, not tie them).
+
+    Masks: the caller passes the oracle's ``face_masks`` output — per-face
+    pair/compress validity probed on each face's live contraction, index-
+    aligned with the canonical ``faces_of`` order the env applies actions in.
+    The SAME (F,N,N)/(F,N)/(F,) masks MUST be handed to :meth:`evaluate` or
+    the PPO ratio is not 1 at epoch 0. Sample and evaluate share every gate:
+    a padding face (``face_valid == 0``) and every slot behind ``skip == 1``
+    are forced to canonical no-ops and contribute zero log-prob / entropy /
+    arity, mirroring the ≥2-options rule.
+    """
+
+    encoder: AxisSetEncoder
+    head: MicroActionHead
+    face_embedding: eqx.nn.Embedding
+    slot_embedding: eqx.nn.Embedding
+    skip_head: eqx.nn.MLP
+
+    max_faces: int = eqx.field(static=True)
+    num_slots: int = eqx.field(static=True)
+    embd_dim: int = eqx.field(static=True)
+
+    def __init__(self, embd_dim: int, num_heads: int, max_faces: int = 8,
+                 num_slots: int = 3, num_encoder_layers: int = 1,
+                 max_groups: int = 16, *, key,
+                 use_group_embedding: bool = False):
+        self.embd_dim = embd_dim
+        self.max_faces = max_faces
+        self.num_slots = num_slots
+        keys = jrand.split(key, 5)
+        self.encoder = AxisSetEncoder(
+            embd_dim, num_heads, num_layers=num_encoder_layers,
+            max_groups=max_groups, key=keys[0],
+            use_group_embedding=use_group_embedding,
+        )
+        self.head = MicroActionHead(embd_dim, key=keys[1])
+        self.face_embedding = eqx.nn.Embedding(max_faces, embd_dim, key=keys[2])
+        self.slot_embedding = eqx.nn.Embedding(num_slots, embd_dim, key=keys[3])
+        self.skip_head = eqx.nn.MLP(
+            embd_dim, 1, width_size=embd_dim, depth=1, key=keys[4]
+        )
+        quant_hardware_masks()
+
+    # -- shared per-slot decision core (sample and evaluate keep IDENTICAL
+    #    masking so the ratio stays 1) --------------------------------------
+    def _slot_masks(self, features, pair_valid_f, comp_valid_f,
+                    quant_legality_mask, op_override, active):
+        op_legal = _compute_op_legality(
+            features, pair_valid=pair_valid_f, compress_valid=comp_valid_f,
+            quant_legality_mask=quant_legality_mask, op_override=op_override,
+        )
+        # Inactive slot (padding face or skipped path): END only — the head
+        # is a forced single-option head and contributes nothing.
+        op_legal = jnp.where(
+            active,
+            op_legal,
+            jnp.array([0.0, 0.0, 0.0, 1.0], dtype=op_legal.dtype),
+        )
+        i_diag, i_compress, j_diag, _ = _compute_axis_masks(
+            features, pair_valid=pair_valid_f, compress_valid=comp_valid_f,
+        )
+        return op_legal, i_diag, i_compress, j_diag
+
+    def sample(self, vertex_context, features: AxisTokenFeatures,
+               tables: FactorTables, key, face_pair_valid, face_comp_valid,
+               face_valid, quant_legality_mask=None,
+               op_legality_override=None):
+        """Returns ``(FaceAction, joint_logp, joint_entropy, arity,
+        skip_probs (F,), op_dists (F, S, NUM_OPS), quant_logps (F, S))``."""
+        if quant_legality_mask is None:
+            quant_legality_mask = quant_hardware_masks()[0]
+        F, S = self.max_faces, self.num_slots
+        keys = jrand.split(key, F * (S + 1)).reshape(F, S + 1, 2)
+
+        logp = jnp.array(0.0)
+        ent = jnp.array(0.0)
+        arity = jnp.array(0.0)
+        skips, skip_probs = [], []
+        slot_actions, op_dists, quant_logps = [], [], []
+        for f in range(F):
+            fv = face_valid[f] > 0.5
+            ctx_f = vertex_context + self.face_embedding(jnp.array(f))
+            _, summary_f = self.encoder(features, ctx_f)
+            s_logit = self.skip_head(summary_f)[0]
+            p_skip = jnn.sigmoid(s_logit)
+            u = jrand.uniform(keys[f, 0])
+            skip = jnp.where(fv & (u < p_skip), 1, 0).astype(jnp.int32)
+            lp_skip = jnp.where(
+                skip == 1, jnn.log_sigmoid(s_logit), jnn.log_sigmoid(-s_logit)
+            )
+            e_skip = -(
+                p_skip * jnn.log_sigmoid(s_logit)
+                + (1.0 - p_skip) * jnn.log_sigmoid(-s_logit)
+            )
+            gate_f = fv.astype(jnp.float32)
+            logp = logp + lp_skip * gate_f
+            ent = ent + e_skip * gate_f
+            arity = arity + gate_f
+            skips.append(skip)
+            skip_probs.append(p_skip)
+
+            active = fv & (skip == 0)
+            for s in range(S):
+                ctx_fs = ctx_f + self.slot_embedding(jnp.array(s))
+                axis_tokens, summary = self.encoder(features, ctx_fs)
+                op_legal, i_diag, i_comp, j_diag = self._slot_masks(
+                    features, face_pair_valid[f], face_comp_valid[f],
+                    quant_legality_mask, op_legality_override, active,
+                )
+                action, factor, op_d, _i_d, _j_d, _e_d, _k_d = (
+                    self.head.sample_step(
+                        summary, axis_tokens, features.size, op_legal,
+                        i_diag, i_comp, j_diag, quant_legality_mask,
+                        tables, keys[f, s + 1],
+                    )
+                )
+                lp, e, ar, *_rest = self.head.log_prob_step(
+                    action, summary, axis_tokens, features.size, op_legal,
+                    i_diag, i_comp, j_diag, quant_legality_mask, tables,
+                )
+                gate = active.astype(jnp.float32)
+                logp = logp + lp * gate
+                ent = ent + e * gate
+                arity = arity + ar * gate
+                slot_actions.append(action._replace(factor=factor))
+                op_dists.append(op_d)
+                quant_logps.append(_rest[-1] * gate)
+
+        def _stack(field):
+            return jnp.stack(
+                [getattr(a, field) for a in slot_actions]
+            ).reshape(F, S, *jnp.shape(getattr(slot_actions[0], field)))
+
+        fa = FaceAction(
+            skip=jnp.stack(skips),
+            op_type=_stack("op_type"), i=_stack("i"), j=_stack("j"),
+            exponents=_stack("exponents"), factor=_stack("factor"),
+            compress_kind=_stack("compress_kind"),
+            quant_dtype=_stack("quant_dtype"),
+            quant_scale_sign=_stack("quant_scale_sign"),
+        )
+        return (fa, logp, ent, arity, jnp.stack(skip_probs),
+                jnp.stack(op_dists).reshape(F, S, -1),
+                jnp.stack(quant_logps).reshape(F, S))
+
+    def evaluate(self, vertex_context, features: AxisTokenFeatures,
+                 tables: FactorTables, fa: FaceAction, face_pair_valid,
+                 face_comp_valid, face_valid, quant_legality_mask=None,
+                 op_legality_override=None):
+        """Log-prob / entropy / arity of a stored :class:`FaceAction` under the
+        CURRENT parameters, with the STORED masks. Mirrors :meth:`sample`."""
+        if quant_legality_mask is None:
+            quant_legality_mask = quant_hardware_masks()[0]
+        F, S = self.max_faces, self.num_slots
+
+        logp = jnp.array(0.0)
+        ent = jnp.array(0.0)
+        arity = jnp.array(0.0)
+        skip_probs, op_dists, quant_logps = [], [], []
+        for f in range(F):
+            fv = face_valid[f] > 0.5
+            ctx_f = vertex_context + self.face_embedding(jnp.array(f))
+            _, summary_f = self.encoder(features, ctx_f)
+            s_logit = self.skip_head(summary_f)[0]
+            p_skip = jnn.sigmoid(s_logit)
+            skip = fa.skip[f]
+            lp_skip = jnp.where(
+                skip == 1, jnn.log_sigmoid(s_logit), jnn.log_sigmoid(-s_logit)
+            )
+            e_skip = -(
+                p_skip * jnn.log_sigmoid(s_logit)
+                + (1.0 - p_skip) * jnn.log_sigmoid(-s_logit)
+            )
+            gate_f = fv.astype(jnp.float32)
+            logp = logp + lp_skip * gate_f
+            ent = ent + e_skip * gate_f
+            arity = arity + gate_f
+            skip_probs.append(p_skip)
+
+            active = fv & (skip == 0)
+            for s in range(S):
+                ctx_fs = ctx_f + self.slot_embedding(jnp.array(s))
+                axis_tokens, summary = self.encoder(features, ctx_fs)
+                op_legal, i_diag, i_comp, j_diag = self._slot_masks(
+                    features, face_pair_valid[f], face_comp_valid[f],
+                    quant_legality_mask, op_legality_override, active,
+                )
+                action = MicroAction(
+                    op_type=fa.op_type[f, s], i=fa.i[f, s], j=fa.j[f, s],
+                    exponents=fa.exponents[f, s], factor=fa.factor[f, s],
+                    compress_kind=fa.compress_kind[f, s],
+                    quant_dtype=fa.quant_dtype[f, s],
+                    quant_scale_sign=fa.quant_scale_sign[f, s],
+                )
+                lp, e, ar, op_d, *_rest = self.head.log_prob_step(
+                    action, summary, axis_tokens, features.size, op_legal,
+                    i_diag, i_comp, j_diag, quant_legality_mask, tables,
+                )
+                gate = active.astype(jnp.float32)
+                logp = logp + lp * gate
+                ent = ent + e * gate
+                arity = arity + ar * gate
+                op_dists.append(op_d)
+                quant_logps.append(_rest[-1] * gate)
+
+        return (logp, ent, arity, jnp.stack(skip_probs),
+                jnp.stack(op_dists).reshape(F, S, -1),
+                jnp.stack(quant_logps).reshape(F, S))
+
+
 __all__ = [
     "OP_DIAG", "OP_COMPRESS", "OP_QUANT", "OP_END", "NUM_OPS",
     "MAX_PRIMES", "MAX_EXPONENT",
@@ -1694,6 +1936,8 @@ __all__ = [
     "QUANT_DTYPES", "NUM_QUANT_DTYPES",
     "AXIS_TAG_BITS", "TAG_IS_LOGICAL", "TAG_IS_COMPRESSED", "TAG_IN_DIAG_GROUP",
     "AxisTokenFeatures",
+    "FaceAction",
+    "FacePathPolicy",
     "FactorTables",
     "precompute_factor_tables",
     "AxisSetEncoder",
