@@ -363,9 +363,9 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
 
     hit = _INCR_STREAM_CACHE.get(key)
     if hit is not None:
-        return hit[1]
+        return hit[1], hit[2]
 
-    tk, stream, done = None, None, 0
+    tk, stream, seg_ids, done = None, None, None, 0
     # Ancestor extension only in per-vertex mode: with face actions the
     # parent's face_key is a different byte-slice, so take the cold replay
     # (correctness over speed; the cache still dedups exact repeats).
@@ -374,7 +374,8 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
             parent = _INCR_STREAM_CACHE.pop(
                 base_key + (tuple(steps[:cut]), None), None)
             if parent is not None:
-                tk, stream, done = parent[0], list(parent[1]), cut
+                tk, stream, seg_ids, done = (
+                    parent[0], list(parent[1]), list(parent[2]), cut)
                 break
     if tk is None:
         tk = IncrementalPathTokenizer(
@@ -382,6 +383,7 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
             vocab_size=vocab,
         )
         stream = [int(t) for t in tk.base_tokens()]
+        seg_ids = [int(g) for g in tk.last_eqn_ids()]
         guard = os.environ.get("ALPHAGRAD_VOCAB_SIZE")
         if guard is not None and tk.max_token_id() >= int(guard):
             raise ValueError(
@@ -394,11 +396,12 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
         stream += [int(t) for t in tk.eliminate(
             int(v), tok_rules_by_v.get(int(v), ()),
             (ft_by_vertex or {}).get(int(v)))]
+        seg_ids += [int(g) for g in tk.last_eqn_ids()]
 
     if len(_INCR_STREAM_CACHE) > _INCR_STREAM_CACHE_CAP:
         _INCR_STREAM_CACHE.clear()
-    _INCR_STREAM_CACHE[key] = (tk, stream)
-    return stream
+    _INCR_STREAM_CACHE[key] = (tk, stream, seg_ids)
+    return stream, seg_ids
 
 
 _DEGENERATE_PLANS = [0]
@@ -1644,10 +1647,11 @@ def _callback(
     if os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "0") == "1":
         # Append-only observation (spec): the stream grows by one block per
         # elimination and the whole extract_jaxpr re-trace of the Jacobian is
-        # skipped. eqn_ids are zeros for now — the legacy per-token eqn
-        # segmentation is tied to the VEJaxpr vocab; the incremental stream's
-        # segmentation (IncrementalJaxpr step ranges) is the follow-up.
-        stream = _incremental_stream_tokens(
+        # skipped. eqn_ids come from the tokenizer's own segment record —
+        # one stream-global id per contraction/approx group, -1 elsewhere —
+        # which is exactly the relational-gate contract (same/earlier/later
+        # comparisons, no embedding-table bound).
+        stream, seg_ids = _incremental_stream_tokens(
             config, consts, args, o_list, specs_list, tok_rules_by_v,
             ft_by_vertex=ft_by_vertex,
             face_key=(_faces_np.tobytes(), _skips_np.tobytes())
@@ -1657,7 +1661,10 @@ def _callback(
         _record_tokenization_truncation(len(stream))
         tokens = jnp.asarray(stream[:MAX_TOKENS], dtype=jnp.int32)
         tokens = jnp.pad(tokens, (0, MAX_TOKENS - tokens.shape[0]))
-        eqn_ids = jnp.zeros((MAX_TOKENS,), dtype=jnp.int32)
+        _ids = np.full((MAX_TOKENS,), -1, dtype=np.int32)
+        _n_ids = min(len(seg_ids), MAX_TOKENS)
+        _ids[:_n_ids] = np.asarray(seg_ids[:_n_ids], dtype=np.int32)
+        eqn_ids = jnp.asarray(_ids)
     else:
         ve = extract_jaxpr(
             config.jaxpr,
