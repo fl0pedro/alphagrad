@@ -70,6 +70,10 @@ env = VertexEliminationEnv.from_jaxpr(
     # GPU by default; ALPHAGRAD_GAZ_EXEC_ON_GPU=0 for CPU smokes (the GPU
     # path requires >= 2 devices for the measure rotation).
     exec_on_gpu=os.environ.get("ALPHAGRAD_GAZ_EXEC_ON_GPU", "1") == "1",
+    # Per-face application (parity with PPO's --per-face): a proposed rule
+    # lands only where it is legal on that face's live operand instead of
+    # raising TRANSFORM DID NOT FIT and voiding the whole measurement.
+    per_face=os.environ.get("ALPHAGRAD_GAZ_PER_FACE", "1") == "1",
     measure_latency=True,
     num_data_points=A.ndata, reps_per_point=1, percentile_keep=0.60,
     slow_exec_cutoff_seconds=0.0, flop_gate_threshold=0.0, measure_grad=True,
@@ -325,6 +329,100 @@ def _agent_fwd(agent, tok, eqn):
     vlog, _ctx, v4 = agent.encode(tok, eqn_ids=eqn, key=jax.random.PRNGKey(0))
     return vlog, v4
 
+
+# ---------------- stage-3: LEARNED Sampled-AZ micro proposals ----------------
+# Root candidate micros drawn from the mainline MicroActionPolicy under the
+# LIVE oracle masks (per-state replay), instead of rand_micro's blind
+# explicit-range draw — proposals are legal-by-construction on the vertex's
+# live edge, and improve as the heads train. ALPHAGRAD_GAZ_MICRO_LEARNED=0
+# restores the blind draw.
+GAZ_MICRO_LEARNED = os.environ.get("ALPHAGRAD_GAZ_MICRO_LEARNED", "1") == "1"
+from alphagrad.approx.common.masks import LiveVertexMaskOracle as _LVMO
+from alphagrad.approx.heads import precompute_factor_tables as _pft
+from alphagrad.approx.env import (
+    decode_vertex_rule_specs as _decode_rows,
+    micro_actions_to_rule_specs_jax as _micro_to_rows,
+)
+from alphagrad.approx.ppo import (
+    _axis_features_from_state as _axis_feats,
+)
+from graphax.sparse.micro_actions import Compress as _GxC, Diag as _GxD, Quant as _GxQ
+
+_LM_TABLES = None
+_lm_oracle_cache: dict = {}
+
+
+@eqx.filter_jit
+def _ctx_fwd(agent, tok, eqn):
+    _vlog, ctxs, _v4 = agent.encode(tok, eqn_ids=eqn, key=jax.random.PRNGKey(0))
+    return ctxs
+
+
+def _rule_to_tuple(rule):
+    if isinstance(rule, _GxD):
+        return ("d", int(rule.i), int(rule.j), int(rule.factor))
+    if isinstance(rule, _GxC):
+        kind = rule.kind if isinstance(rule.kind, str) else str(rule.kind)
+        return ("c", int(rule.axes[0]), COMPRESS_KINDS.index(kind))
+    if isinstance(rule, _GxQ):
+        try:
+            name = np.dtype(rule.dtype).name
+        except Exception:
+            name = str(rule.dtype)
+        return ("q", name)
+    return None
+
+
+def learned_micro(state, vertex, key):
+    """One masked draw from the mainline micro policy for ``vertex`` at the
+    graph produced by ``state``; None on END or any mask/replay failure (the
+    candidate then enters plain, exactly like rand_micro's None)."""
+    global _LM_TABLES
+    if agent.micro_action_policy is None:
+        return None
+    N = int(env.axis_state_static.shape[1])
+    if _LM_TABLES is None:
+        _LM_TABLES = _pft(max(8, int(np.asarray(env.axis_state_static)[..., 0].max())))
+    k = ("lm",) + _skey(state)
+    o = _lm_oracle_cache.get(k)
+    if o is None:
+        try:
+            o = _LVMO(jaxpr, list(closed.literals), list(xs), tuple(ARGN),
+                      max_axes=N)
+            for a, m in state:
+                o.advance(VALID[int(a)], rules=_rules_of(m))
+        except Exception:
+            return None
+        if len(_lm_oracle_cache) > 256:
+            _lm_oracle_cache.clear()
+        _lm_oracle_cache[k] = o
+    try:
+        pair, comp = o.vertex_mask(int(vertex))
+    except Exception:
+        return None
+    tok, eqn = tokens_of(state)
+    ctxs = _ctx_fwd(agent, jnp.asarray(tok), jnp.asarray(eqn))
+    v_idx = int(vertex) - 1
+    feats = _axis_feats(env.axis_state_static[v_idx], env.axis_valid_static[v_idx])
+    acts, *_r = agent.micro_action_policy.sample(
+        ctxs[v_idx], feats, _LM_TABLES, key,
+        pair_valid=jnp.asarray(pair, jnp.float32),
+        compress_valid=jnp.asarray(comp, jnp.float32),
+    )
+    rows = _micro_to_rows(
+        acts.op_type, acts.i, acts.j, acts.factor,
+        env.axis_state_static[v_idx],
+        compress_kinds=acts.compress_kind, quant_dtypes=acts.quant_dtype,
+    )
+    try:
+        rules = _decode_rows(jaxpr, int(vertex), np.asarray(rows).tolist(),
+                             is_last=(len(state) == NV - 1))
+    except Exception:
+        return None
+    if not rules:
+        return None
+    return _rule_to_tuple(rules[0])
+
 # ------------------------------------------------------------------ 3. optimizer
 opt = optax.adam(A.lr)
 opt_state = opt.init(eqx.filter(agent, eqx.is_array))
@@ -435,10 +533,18 @@ def gumbel_search(state, graph, tg, rng):
     # vertex's (g + logit); the search Q decides which variant survives halving.
     K_MICRO = int(os.environ.get("ALPHAGRAD_GAZ_K_MICRO", "2"))
     cands = []
+    _lm_key = jax.random.PRNGKey(int(rng.integers(2**31)))
     for ci in order_idx:
         variants = [None]
         if GAZ_MICRO:
-            variants += [rand_micro(rng, force=True) for _ in range(K_MICRO)]
+            n_rand = K_MICRO
+            if GAZ_MICRO_LEARNED:
+                lm = learned_micro(state, legal[int(ci)],
+                                   jax.random.fold_in(_lm_key, int(ci)))
+                if lm is not None:
+                    variants.append(lm)
+                    n_rand = max(0, K_MICRO - 1)
+            variants += [rand_micro(rng, force=True) for _ in range(n_rand)]
         for micro in variants:
             cands.append({"li": int(ci), "v": legal[int(ci)], "micro": micro,
                           "q": [], "g": float(g[int(ci)]),
