@@ -425,3 +425,63 @@ Deltas against the existing (dormant) `face_stream.AutoregressiveFaceDriver`:
 * its SKIP comment says "the edge is deleted" — wrong on both counts today
   (the driver leaves the contraction to proceed); under the clarified
   semantics SKIP must actually suppress the contraction of that path.
+
+---
+
+## 7. Per-path decisions — P1 design (2026-07-27)
+
+Engine prerequisites are DONE: `graphax.SKIP_FACE` (true path-skip: contraction
+dropped, `approx SKIP` tokenized, all-skip ⇒ zeros-with-structure via jacve,
+gxf 00a60fa) and the face_transforms prefix-cache guard (same commit). The
+learned face heads described in the 07-22 README do NOT exist in this tree —
+P1 is a build, not a wiring job.
+
+### Scope (dynamic-substeps = 1, per the spec's "for now we only do this once")
+
+Per chosen vertex, for each face k < MAX_FACES (masked by `k < n_faces`):
+1. ONE skip gate at path start (APPROX_PLAN §6). Skip ⇒ the env installs
+   `SKIP_FACE` for that face key.
+2. Else THREE slot decisions (pre / post / new), each a single micro action
+   (op ∈ {DIAG, COMPRESS, QUANT, END=no-approx}) sampled from the existing
+   head zoo under the face's oracle masks.
+
+### Masking / ratio-1 contract
+
+* Sampling masks: `LiveVertexMaskOracle.face_masks(v, MAX_FACES)` —
+  (F,N,N) pair + (F,N) compress, probed on each face's live contraction in
+  canonical visit order (same order `faces_of` / the env enumerate). The SAME
+  masks serve all three slots at sample time — an approximation of slot-level
+  legality (lhs/rhs are join intermediates, unknowable pre-elimination).
+* Apply-time truth: each non-skip slot's rule is wrapped in
+  `make_live_masked_hook`, so a rule illegal on ITS operand is skipped there
+  (never raises), counted in per_face_stats.
+* Ratio-1 needs only that the loss re-masks with the STORED sampling masks —
+  store (face_pair_valid, face_comp_valid, face_valid) in the trajectory,
+  exactly like the vertex path stores its oracle masks.
+
+### Wire format
+
+`StepAction` grows `face_rows (MAX_FACES, 3, 3) int32` (slot-major spec rows,
+same encoding as `sparsity_specs` rows: DIAG/COMPRESS_SENTINEL/QUANT_SENTINEL/
+-1=none) + `face_skip (MAX_FACES,) int32`. `EnvState.face_specs_hist` mirrors
+it per step for oracle replay + incremental-token reproduction. `_callback`
+builds `face_transforms={key_k: SKIP_FACE | (hook(pre), hook(post), hook(new))}`
+with keys enumerated at elimination time (`faces_of` order == oracle order).
+
+### Build order
+
+P1a. env: wire format + `_callback` application + hand-built-action test
+     (no policy). Flag: `--face-actions` (default off, campaign-neutral).
+P1b. heads: `FaceSkipHead` (binary, from v_context + face mask-summary
+     features) + per-slot single-step decision reusing OpType/Axis/Prime/
+     Kind/FactoredQuant heads; sample/evaluate mirror.
+P1c. ppo: rollout sampling (face_masks via the existing pure_callback oracle
+     bridge, extended to return face masks), trajectory fields, loss
+     log-prob/entropy, per-face KL later.
+P1d. smoke: exact arm unaffected (flag off); approx smoke with --face-actions
+     on Helmholtz; verify per_face_stats applied>0, SKIP tokens in stream,
+     ratio finite, distinct rewards across seeds.
+
+Phase 3b (autoregressive re-encode between faces via incremental extend +
+vertex memory) layers ON TOP of P1 — P1 decides all faces from the
+pre-elimination encoding.
