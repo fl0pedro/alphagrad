@@ -1536,8 +1536,13 @@ def _face_transforms_for_order(config, consts, args, o_list, specs_list,
                 continue
             slots = []
             for s in range(FACE_SLOTS):
+                # The decoder walks all MAX_RULES slots — pad the single face
+                # row with end-sentinels.
+                one_row = [list(rows_f[f][s])] + [
+                    [-1, -1, 0]
+                ] * (MAX_RULES_PER_VERTEX - 1)
                 rules = decode_vertex_rule_specs(
-                    config.jaxpr, v, [list(rows_f[f][s])],
+                    config.jaxpr, v, one_row,
                     is_last=(k == last),
                 )
                 slots.append(

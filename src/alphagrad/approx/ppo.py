@@ -86,7 +86,9 @@ from alphagrad.approx.env import (
     _AXIS_FEAT_IS_COMPRESSED,
     _AXIS_FEAT_IS_OUTPUT,
     _AXIS_FEAT_SIZE,
+    FACE_SLOTS,
     MAX_AXES_PER_VERTEX,
+    MAX_FACES as ENV_MAX_FACES,
     MAX_RULES_PER_VERTEX,
     MAX_TOKENS,
     MAX_DELTA_TOKENS,
@@ -113,6 +115,8 @@ from alphagrad.approx.heads import (
     OP_QUANT,
     QUANT_DTYPES,
     AxisTokenFeatures,
+    FaceAction,
+    FacePathPolicy,
     FactorTables,
     MicroAction,
     MicroActionPolicy,
@@ -387,6 +391,20 @@ _SP_TYPE_TO_PAIR = jnp.array([PAIR_STOP, 0, 1, 2, 3], dtype=jnp.int32)
 # ---------------------------------------------------------------------------
 
 
+def _zero_face_action():
+    """Canonical inactive FaceAction (padding faces: no skip, END slots)."""
+    F, S = ENV_MAX_FACES, FACE_SLOTS
+    z2 = jnp.zeros((F, S), jnp.int32)
+    return FaceAction(
+        skip=jnp.zeros((F,), jnp.int32),
+        op_type=jnp.full((F, S), OP_END, dtype=jnp.int32),
+        i=z2, j=z2,
+        exponents=jnp.zeros((F, S, MAX_PRIMES), jnp.int32),
+        factor=z2, compress_kind=z2, quant_dtype=z2,
+        quant_scale_sign=jnp.ones((F, S), jnp.int32),
+    )
+
+
 class Trajectory(NamedTuple):
     tokens: jax.Array
     eqn_ids: jax.Array
@@ -431,6 +449,23 @@ class Trajectory(NamedTuple):
     # the PPO ratio silently leaves 1 at epoch 0.
     axis_state: jax.Array  # (total_v, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM) int32
     axis_valid_mask: jax.Array  # (total_v, MAX_AXES_PER_VERTEX)
+    # P1c per-path decisions (--face-actions; zero-filled otherwise). The
+    # stored face masks are the loss's re-masking source (ratio-1), and
+    # face_old_logp is the behaviour policy's joint face log-prob (skip gates
+    # + slot heads) captured at sample time.
+    face_skip: jax.Array          # (MAX_FACES,) int32
+    face_op_type: jax.Array       # (MAX_FACES, FACE_SLOTS) int32
+    face_i: jax.Array             # (MAX_FACES, FACE_SLOTS) int32
+    face_j: jax.Array             # (MAX_FACES, FACE_SLOTS) int32
+    face_exponents: jax.Array     # (MAX_FACES, FACE_SLOTS, MAX_PRIMES) int32
+    face_factor: jax.Array        # (MAX_FACES, FACE_SLOTS) int32
+    face_compress_kind: jax.Array # (MAX_FACES, FACE_SLOTS) int32
+    face_quant_dtype: jax.Array   # (MAX_FACES, FACE_SLOTS) int32
+    face_quant_scale_sign: jax.Array  # (MAX_FACES, FACE_SLOTS) int32
+    face_pair_valid: jax.Array    # (MAX_FACES, N, N) float32
+    face_comp_valid: jax.Array    # (MAX_FACES, N) float32
+    face_valid: jax.Array         # (MAX_FACES,) float32
+    face_old_logp: jax.Array      # () float32
     discount: jax.Array
     vertex_avail_mask: jax.Array
 
@@ -464,6 +499,19 @@ class TrainBatch(NamedTuple):
     micro_compress_valid: jax.Array  # (MAX_AXES_PER_VERTEX,)
     axis_state: jax.Array  # (total_v, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM) int32
     axis_valid_mask: jax.Array  # (total_v, MAX_AXES_PER_VERTEX)
+    face_skip: jax.Array
+    face_op_type: jax.Array
+    face_i: jax.Array
+    face_j: jax.Array
+    face_exponents: jax.Array
+    face_factor: jax.Array
+    face_compress_kind: jax.Array
+    face_quant_dtype: jax.Array
+    face_quant_scale_sign: jax.Array
+    face_pair_valid: jax.Array
+    face_comp_valid: jax.Array
+    face_valid: jax.Array
+    face_old_logp: jax.Array
     estim_returns: jax.Array
     norm_adv: jax.Array
     vertex_avail_mask: jax.Array
@@ -785,6 +833,8 @@ class Agent(eqx.Module):
     # approximation actions (DIAG / COMPRESS / QUANT / END) per eliminated
     # vertex. Optional only so a bare Agent can be constructed in tests.
     micro_action_policy: MicroActionPolicy | None
+    # P1c: per-path decisions (--face-actions). None ⇒ per-vertex mode.
+    face_path_policy: FacePathPolicy | None
     value_head_flops: MLP
     value_head_mem: MLP
     value_head_cos: MLP
@@ -840,12 +890,14 @@ class Agent(eqx.Module):
         embd_dim,
         op_embd_dim,
         micro_action_policy=None,
+        face_path_policy=None,
     ):
         self.embedding = embedding
         self.pos_enc = pos_enc
         self.encoder = encoder
         self.vertex_policy = vertex_policy
         self.micro_action_policy = micro_action_policy
+        self.face_path_policy = face_path_policy
         self.value_head_flops = value_head_flops
         self.value_head_mem = value_head_mem
         self.value_head_cos = value_head_cos
@@ -986,6 +1038,7 @@ class Agent(eqx.Module):
         vertex_temperature=None,
         oracle_pair_all=None,     # (total_v+1, N, N) live per-vertex DIAG mask
         oracle_comp_all=None,     # (total_v+1, N) live per-vertex COMPRESS mask
+        face_masks_all=None,      # P1c: (fpair (V+1,F,N,N), fcomp (V+1,F,N), fvalid (V+1,F))
     ):
         """Same as :meth:`sample_action` but routes the rule head through
         :class:`MicroActionPolicy`. ``axis_state`` and ``axis_valid_mask``
@@ -1066,6 +1119,24 @@ class Agent(eqx.Module):
             op_legality_override=op_legality_override,
         )
 
+        # P1c: per-path decisions for the chosen vertex, from the SAME
+        # v_context/features the micro path used (no extra full encode).
+        face_out = None
+        if face_masks_all is not None and self.face_path_policy is not None:
+            _fp_all, _fc_all, _fv_all = face_masks_all
+            f_pair = _fp_all[vertex_idx + 1]
+            f_comp = _fc_all[vertex_idx + 1]
+            f_valid = _fv_all[vertex_idx + 1]
+            face_key = jrand.fold_in(micro_key, 7)
+            fa, face_logp, face_ent, _far, _skp, _fod, _fql = (
+                self.face_path_policy.sample(
+                    v_context, features, factor_tables, face_key,
+                    f_pair, f_comp, f_valid,
+                    op_legality_override=op_legality_override,
+                )
+            )
+            face_out = (fa, face_logp, face_ent, f_pair, f_comp, f_valid)
+
         return (
             vertex_idx,
             actions,
@@ -1078,6 +1149,7 @@ class Agent(eqx.Module):
             quant_logp,
             v_pair,
             v_comp,
+            face_out,
             value,
             v_context,
         )
@@ -1100,6 +1172,10 @@ class Agent(eqx.Module):
         pair_valid=None,       # stored live DIAG mask for the chosen vertex
         compress_valid=None,   # stored live COMPRESS mask
         op_legality_override=None,  # (NUM_OPS,) variant mask — MUST match sample
+        face_action: FaceAction | None = None,  # P1c stored per-path actions
+        face_pair_valid=None,  # stored (F,N,N) sampling mask
+        face_comp_valid=None,  # stored (F,N)
+        face_valid=None,       # stored (F,)
     ):
         """Joint log-prob / entropy for a stored typed action sequence.
 
@@ -1156,6 +1232,17 @@ class Agent(eqx.Module):
 
         total_log_p = log_p_vertex + log_p_sub
         total_entropy = vertex_ent + ent_sub
+        # P1c: fold the face decisions' log-prob/entropy into the totals so
+        # the PPO ratio covers them (evaluated with the STORED masks, same
+        # gates as sampling — see FacePathPolicy).
+        if face_action is not None and self.face_path_policy is not None:
+            f_logp, f_ent, _f_ar, _sp, _od, _ql = self.face_path_policy.evaluate(
+                v_context, features, factor_tables, face_action,
+                face_pair_valid, face_comp_valid, face_valid,
+                op_legality_override=op_legality_override,
+            )
+            total_log_p = total_log_p + f_logp
+            total_entropy = total_entropy + f_ent
         # Per-step dists are forwarded for KL tracking against the rollout-time
         # old-policy snapshots; ``new_quant_logp`` is the factored-quant log-prob
         # (no flat dist), forwarded for parity with the trajectory schema.
@@ -1178,6 +1265,7 @@ class Agent(eqx.Module):
         vertex_idx,
         actions: MicroAction,
         axis_state,
+        face_action: FaceAction | None = None,
     ):
         """Convert a sampled :class:`MicroAction` sequence into a legacy
         :class:`StepAction` the env can consume.
@@ -1204,9 +1292,31 @@ class Agent(eqx.Module):
             compress_kinds=actions.compress_kind,
             quant_dtypes=actions.quant_dtype,
         )
+        if face_action is None:
+            return StepAction(
+                target_vertex=jnp.asarray(vertex_idx + 1, dtype=jnp.int32),
+                rule_specs=rule_specs,
+            )
+
+        # P1c: one spec row per (face, slot) — the same translator, run on
+        # length-1 sequences; END translates to the all-(-1) unused row.
+        def _one(op, i, j, factor, kind, dtype):
+            rows = micro_actions_to_rule_specs_jax(
+                op[None], i[None], j[None], factor[None], axis_state_v,
+                compress_kinds=kind[None], quant_dtypes=dtype[None],
+            )
+            return rows[0]
+
+        face_rows = jax.vmap(jax.vmap(_one))(
+            face_action.op_type, face_action.i, face_action.j,
+            face_action.factor, face_action.compress_kind,
+            face_action.quant_dtype,
+        )
         return StepAction(
             target_vertex=jnp.asarray(vertex_idx + 1, dtype=jnp.int32),
             rule_specs=rule_specs,
+            face_rows=face_rows.astype(jnp.int32),
+            face_skip=face_action.skip.astype(jnp.int32),
         )
 
 
@@ -1328,6 +1438,15 @@ def make_argparser() -> argparse.ArgumentParser:
         "it is legal on that face's live operand, and a face where nothing "
         "is legal is left exact (the per-path skip). This is the O(|E|^2) "
         "action granularity the spec asks for.",
+    )
+    p.add_argument(
+        "--face-actions", action="store_true",
+        help="P1 per-path DECISIONS: the FacePathPolicy chooses, per face of "
+        "the eliminated vertex, one SKIP gate (drops that path's contraction "
+        "via graphax.SKIP_FACE) and one approximation per pre/post/new slot. "
+        "Face log-probs enter the PPO loss; masks come from the oracle's "
+        "face_masks and are stored for ratio-1. Subsumes --per-face's "
+        "projection of a single per-vertex rule list.",
     )
     p.add_argument(
         "--advantage-norm", type=str, default="popart",
@@ -1956,6 +2075,19 @@ def _build_agent(
         )
     else:
         micro_action_policy = None
+    if getattr(args, "face_actions", False):
+        face_path_policy = FacePathPolicy(
+            embd_dim=args.embd_dim,
+            num_heads=args.num_heads,
+            max_faces=ENV_MAX_FACES,
+            num_slots=FACE_SLOTS,
+            num_encoder_layers=1,
+            max_groups=max(args.max_substeps, 16),
+            key=encoder_keys[14],
+            use_group_embedding=getattr(args, "axis_group_embedding", False),
+        )
+    else:
+        face_path_policy = None
     return Agent(
         embedding=embedding,
         pos_enc=pos_enc,
@@ -1979,6 +2111,7 @@ def _build_agent(
         embd_dim=args.embd_dim,
         op_embd_dim=args.op_embd_dim,
         micro_action_policy=micro_action_policy,
+        face_path_policy=face_path_policy,
     )
 
 
@@ -2555,6 +2688,57 @@ def main():
             order, spec_hist, step_count, vmap_method="sequential",
         )
 
+    # P1c: per-FACE masks for every candidate vertex (1-based rows like the
+    # per-vertex masks). Only used under --face-actions; the extra probing
+    # (face_masks per candidate) roughly doubles the oracle's host cost.
+    _F_FACES = ENV_MAX_FACES
+
+    def _oracle_face_masks_host(order, spec_hist, step_count):
+        eo = np.asarray(order).reshape(-1)
+        specs = np.asarray(spec_hist)
+        n = int(np.asarray(step_count))
+        o = _LVMO(_oracle_jaxpr, _oracle_consts, _oracle_args, _oracle_argnums,
+                  max_axes=_oracle_N)
+        for k in range(n):
+            v = int(eo[k])
+            try:
+                rules = _decode_specs(
+                    _oracle_jaxpr, v, specs[k], is_last=(k == n - 1)
+                )
+            except Exception:
+                rules = ()
+            try:
+                o.advance(v, rules=rules)
+            except Exception:
+                break
+        pair, comp = o.masks()
+        V, F, N = _oracle_total_v, _F_FACES, _oracle_N
+        fpair = np.zeros((V + 1, F, N, N), np.float32)
+        fcomp = np.zeros((V + 1, F, N), np.float32)
+        fvalid = np.zeros((V + 1, F), np.float32)
+        for v in range(1, V + 1):
+            try:
+                fp, fc, nf = o.face_masks(v, F)
+            except Exception:
+                continue
+            fpair[v] = np.asarray(fp, np.float32)
+            fcomp[v] = np.asarray(fc, np.float32)
+            fvalid[v, : int(nf)] = 1.0
+        return (np.asarray(pair, np.float32), np.asarray(comp, np.float32),
+                fpair, fcomp, fvalid)
+
+    def _oracle_face_masks(order, spec_hist, step_count):
+        V, F, N = _oracle_total_v, _F_FACES, _oracle_N
+        return jax.pure_callback(
+            _oracle_face_masks_host,
+            (jax.ShapeDtypeStruct((V + 1, N, N), jnp.float32),
+             jax.ShapeDtypeStruct((V + 1, N), jnp.float32),
+             jax.ShapeDtypeStruct((V + 1, F, N, N), jnp.float32),
+             jax.ShapeDtypeStruct((V + 1, F, N), jnp.float32),
+             jax.ShapeDtypeStruct((V + 1, F), jnp.float32)),
+            order, spec_hist, step_count, vmap_method="sequential",
+        )
+
     total_v = len(closed_jaxpr.jaxpr.eqns)
     num_valid = len(env.valid_vertices)
     print(
@@ -2841,9 +3025,18 @@ def main():
 
             if args.dynamic_substeps:
                 # Live per-vertex DIAG/COMPRESS masks for the current graph
-                # (replayed from the elimination prefix so far).
-                oracle_pair_all, oracle_comp_all = _oracle_masks(
-                    state.order, state.sparsity_specs, state.step_count)
+                # (replayed from the elimination prefix so far). Under
+                # --face-actions the same host replay also returns the
+                # PER-FACE masks for every candidate vertex.
+                if args.face_actions:
+                    (oracle_pair_all, oracle_comp_all, _fp_all, _fc_all,
+                     _fv_all) = _oracle_face_masks(
+                        state.order, state.sparsity_specs, state.step_count)
+                    face_masks_all = (_fp_all, _fc_all, _fv_all)
+                else:
+                    oracle_pair_all, oracle_comp_all = _oracle_masks(
+                        state.order, state.sparsity_specs, state.step_count)
+                    face_masks_all = None
                 (
                     vertex_idx,
                     micro_actions,
@@ -2856,6 +3049,7 @@ def main():
                     micro_quant_logp,
                     micro_pair_valid,
                     micro_compress_valid,
+                    face_out,
                     value,
                     v_context,
                 ) = agent.sample_action_dynamic(
@@ -2872,15 +3066,29 @@ def main():
                     preference=preference if args.preference_conditioned else None,
                     oracle_pair_all=oracle_pair_all,
                     oracle_comp_all=oracle_comp_all,
+                    face_masks_all=face_masks_all,
                 )
                 # Record this vertex in the elimination prefix for the next
                 # step's oracle replay.
                 elim_order = elim_order.at[state.step_count].set(
                     vertex_idx.astype(elim_order.dtype))
+                if face_out is not None:
+                    (face_action, face_old_logp, _face_ent, face_pair_v,
+                     face_comp_v, face_valid_v) = face_out
+                else:
+                    face_action = _zero_face_action()
+                    face_old_logp = jnp.array(0.0)
+                    face_pair_v = jnp.zeros(
+                        (ENV_MAX_FACES, MAX_AXES_PER_VERTEX,
+                         MAX_AXES_PER_VERTEX), jnp.float32)
+                    face_comp_v = jnp.zeros(
+                        (ENV_MAX_FACES, MAX_AXES_PER_VERTEX), jnp.float32)
+                    face_valid_v = jnp.zeros((ENV_MAX_FACES,), jnp.float32)
                 env_action = agent.to_env_action_dynamic(
                     vertex_idx,
                     micro_actions,
                     state.axis_state,
+                    face_action=face_action if face_out is not None else None,
                 )
                 # Legacy fields zero-filled; dynamic fields populated.
                 pair_seq = _legacy_zero_pair_seq
@@ -2970,6 +3178,19 @@ def main():
                 micro_compress_valid=micro_compress_valid,
                 axis_state=state.axis_state,
                 axis_valid_mask=state.axis_valid_mask,
+                face_skip=face_action.skip,
+                face_op_type=face_action.op_type,
+                face_i=face_action.i,
+                face_j=face_action.j,
+                face_exponents=face_action.exponents,
+                face_factor=face_action.factor,
+                face_compress_kind=face_action.compress_kind,
+                face_quant_dtype=face_action.quant_dtype,
+                face_quant_scale_sign=face_action.quant_scale_sign,
+                face_pair_valid=face_pair_v,
+                face_comp_valid=face_comp_v,
+                face_valid=face_valid_v,
+                face_old_logp=jnp.asarray(face_old_logp, jnp.float32),
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
             )
@@ -3033,9 +3254,26 @@ def main():
             quant_dtype=batch.micro_quant_dtype_seq,
             quant_scale_sign=batch.micro_quant_scale_sign_seq,
         )
+        # P1c: the stored per-path decisions, as one vmapped pytree. None when
+        # --face-actions is off (static) — evaluate then skips the face pass.
+        face_actions_b = (
+            FaceAction(
+                skip=batch.face_skip,
+                op_type=batch.face_op_type,
+                i=batch.face_i,
+                j=batch.face_j,
+                exponents=batch.face_exponents,
+                factor=batch.face_factor,
+                compress_kind=batch.face_compress_kind,
+                quant_dtype=batch.face_quant_dtype,
+                quant_scale_sign=batch.face_quant_scale_sign,
+            )
+            if args.face_actions
+            else None
+        )
 
         def _eval_dyn(toks, eids, rs, pref, vidx, action, vmask, ax_st, ax_vm,
-                      cached, k, pv, cv):
+                      cached, k, pv, cv, fa=None, fpv=None, fcv=None, fv=None):
             return agent.evaluate_action_dynamic(
                 toks,
                 vidx,
@@ -3055,6 +3293,10 @@ def main():
                 # Static per-call variant mask, identical for every sample in
                 # the batch (closed over, not vmapped) — must match sampling.
                 op_legality_override=op_legality_override,
+                face_action=fa,
+                face_pair_valid=fpv,
+                face_comp_valid=fcv,
+                face_valid=fv,
             )
 
         if cached_flat is None:
@@ -3070,26 +3312,54 @@ def main():
                 new_exp_dists,
                 new_kind_dists,
                 new_quant_logp,
-            ) = jax.vmap(
-                lambda toks, eids, rs, pref, vidx, action, vmask, ax_st, ax_vm,
-                k, pv, cv:
-                _eval_dyn(
-                    toks, eids, rs, pref, vidx, action, vmask, ax_st, ax_vm,
-                    None, k, pv, cv
+            ) = (
+                jax.vmap(
+                    lambda toks, eids, rs, pref, vidx, action, vmask, ax_st,
+                    ax_vm, k, pv, cv, fa, fpv, fcv, fv:
+                    _eval_dyn(
+                        toks, eids, rs, pref, vidx, action, vmask, ax_st,
+                        ax_vm, None, k, pv, cv, fa, fpv, fcv, fv
+                    )
+                )(
+                    batch.tokens,
+                    batch.eqn_ids,
+                    batch.residual_state,
+                    batch.preference,
+                    batch.vertex_idx,
+                    actions,
+                    batch.vertex_avail_mask,
+                    batch.axis_state,
+                    batch.axis_valid_mask,
+                    keys,
+                    batch.micro_pair_valid,
+                    batch.micro_compress_valid,
+                    face_actions_b,
+                    batch.face_pair_valid,
+                    batch.face_comp_valid,
+                    batch.face_valid,
                 )
-            )(
-                batch.tokens,
-                batch.eqn_ids,
-                batch.residual_state,
-                batch.preference,
-                batch.vertex_idx,
-                actions,
-                batch.vertex_avail_mask,
-                batch.axis_state,
-                batch.axis_valid_mask,
-                keys,
-                batch.micro_pair_valid,
-                batch.micro_compress_valid,
+                if args.face_actions
+                else jax.vmap(
+                    lambda toks, eids, rs, pref, vidx, action, vmask, ax_st,
+                    ax_vm, k, pv, cv:
+                    _eval_dyn(
+                        toks, eids, rs, pref, vidx, action, vmask, ax_st,
+                        ax_vm, None, k, pv, cv
+                    )
+                )(
+                    batch.tokens,
+                    batch.eqn_ids,
+                    batch.residual_state,
+                    batch.preference,
+                    batch.vertex_idx,
+                    actions,
+                    batch.vertex_avail_mask,
+                    batch.axis_state,
+                    batch.axis_valid_mask,
+                    keys,
+                    batch.micro_pair_valid,
+                    batch.micro_compress_valid,
+                )
             )
         else:
             (
@@ -3136,6 +3406,12 @@ def main():
             batch.old_micro_kind_dists,
             batch.old_micro_quant_logp,
         )
+        if args.face_actions:
+            # The behaviour policy's face log-prob was captured as a scalar at
+            # sample time (FacePathPolicy sample == evaluate parity is unit-
+            # pinned); the new side lives inside `log_probs` via
+            # evaluate_action_dynamic's face pass.
+            old_log_probs = old_log_probs + batch.face_old_logp
 
         ratio = jnp.exp(log_probs - old_log_probs)
         num_triggers = get_num_clipping_triggers(ratio, args.ppo_clip_eps)
@@ -3593,6 +3869,19 @@ def main():
             micro_compress_valid=traj.micro_compress_valid,
             axis_state=traj.axis_state,
             axis_valid_mask=traj.axis_valid_mask,
+            face_skip=traj.face_skip,
+            face_op_type=traj.face_op_type,
+            face_i=traj.face_i,
+            face_j=traj.face_j,
+            face_exponents=traj.face_exponents,
+            face_factor=traj.face_factor,
+            face_compress_kind=traj.face_compress_kind,
+            face_quant_dtype=traj.face_quant_dtype,
+            face_quant_scale_sign=traj.face_quant_scale_sign,
+            face_pair_valid=traj.face_pair_valid,
+            face_comp_valid=traj.face_comp_valid,
+            face_valid=traj.face_valid,
+            face_old_logp=traj.face_old_logp,
             estim_returns=estim_returns,
             norm_adv=norm_adv,
             vertex_avail_mask=traj.vertex_avail_mask,
