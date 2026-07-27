@@ -485,3 +485,20 @@ P1d. smoke: exact arm unaffected (flag off); approx smoke with --face-actions
 Phase 3b (autoregressive re-encode between faces via incremental extend +
 vertex memory) layers ON TOP of P1 — P1 decides all faces from the
 pre-elimination encoding.
+
+### 7b. Phase 3b design — autoregressive re-encode (carry-storage route)
+
+The palimpsa recurrent state is small enough to STORE PER STEP
+(layers x heads x d x d for M and I ≈ ~128 KB at embd 128 → ~24 MB per
+16-env x 12-step rollout), which dissolves the loss-side reconstruction
+problem: the trajectory stores each step's PRE-step carry, the loss extends
+it by that step's DELTA tokens only — same stored-context ratio-1 pattern as
+the oracle masks and axis_state. Build order: (1) expose (init_state,
+extend) on the mainline PalimpsaEncoder (port from incremental_encoder.py,
+which is written against the deprecated MicroPPOAgent); (2) env returns
+per-step delta tokens + length (the incremental stream cache already knows
+them); (3) rollout carries (palimpsa state, vertex memory) through the scan,
+pointer/value read from vertex_memory (from_vertex_memory — written, tested,
+unwired); (4) FacePathPolicy conditions on the carry AFTER each face's
+emission (APPROX_PLAN §6 ordering: one extend per substep, none between the
+pre/post/new triple).
