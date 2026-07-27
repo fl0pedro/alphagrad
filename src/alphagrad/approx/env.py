@@ -330,7 +330,8 @@ def _get_resource_monitor(unique_devices):
 
 
 def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
-                               tok_rules_by_v):
+                               tok_rules_by_v, ft_by_vertex=None,
+                               face_key=None):
     """Full append-only observation stream for the prefix ``o_list``
     (ALPHAGRAD_INCREMENTAL_TOKENS=1): base tokens + one block per elimination
     (path tokens + ``approx`` echoes), from graphax's IncrementalPathTokenizer
@@ -356,18 +357,25 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
                      for row in np.asarray(specs_list[v_idx]).reshape(-1, 3))
         steps.append((int(v), rows))
     base_key = (id(config.jaxpr), tuple(config.argnums))
-    key = base_key + (tuple(steps),)
+    # Face actions change the stream (approx/SKIP blocks + downstream path
+    # structure) — they must be part of the cache identity.
+    key = base_key + (tuple(steps), face_key)
 
     hit = _INCR_STREAM_CACHE.get(key)
     if hit is not None:
         return hit[1]
 
     tk, stream, done = None, None, 0
-    for cut in range(len(steps) - 1, 0, -1):
-        parent = _INCR_STREAM_CACHE.pop(base_key + (tuple(steps[:cut]),), None)
-        if parent is not None:
-            tk, stream, done = parent[0], list(parent[1]), cut
-            break
+    # Ancestor extension only in per-vertex mode: with face actions the
+    # parent's face_key is a different byte-slice, so take the cold replay
+    # (correctness over speed; the cache still dedups exact repeats).
+    if face_key is None:
+        for cut in range(len(steps) - 1, 0, -1):
+            parent = _INCR_STREAM_CACHE.pop(
+                base_key + (tuple(steps[:cut]), None), None)
+            if parent is not None:
+                tk, stream, done = parent[0], list(parent[1]), cut
+                break
     if tk is None:
         tk = IncrementalPathTokenizer(
             config.jaxpr, tuple(config.argnums), list(consts), list(args),
@@ -383,8 +391,9 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
                 f"out-of-range gather, silently reading the wrong row.)"
             )
     for v, _rows in steps[done:]:
-        stream += [int(t) for t in tk.eliminate(int(v),
-                                                tok_rules_by_v.get(int(v), ()))]
+        stream += [int(t) for t in tk.eliminate(
+            int(v), tok_rules_by_v.get(int(v), ()),
+            (ft_by_vertex or {}).get(int(v)))]
 
     if len(_INCR_STREAM_CACHE) > _INCR_STREAM_CACHE_CAP:
         _INCR_STREAM_CACHE.clear()
@@ -484,6 +493,14 @@ def consume_xla_memory_stats() -> dict:
 # translator doesn't silently truncate DIAG / COMPRESS rows the policy
 # emitted. Memory cost is O(total_v × MAX_RULES_PER_VERTEX × 3) int32.
 MAX_RULES_PER_VERTEX = 16
+
+# P1 per-path action space: per chosen vertex, up to MAX_FACES local paths
+# (|fan-in| x |fan-out| faces, padded), each with one skip gate and one spec
+# row per slot (pre / post / new). Must match the oracle's
+# ``face_masks(v, max_faces)`` budget — both enumerate faces in the SAME
+# canonical visit order (``faces_of``).
+MAX_FACES = int(os.environ.get("ALPHAGRAD_MAX_FACES", "8"))
+FACE_SLOTS = 3  # pre (lhs), post (rhs), new (res)
 NUM_AXIS_PAIRS = 4
 
 # Per-vertex axis-state observation surface. The policy's dynamic action
@@ -615,6 +632,13 @@ class EnvState(NamedTuple):
     #   row[0] == -1:                end-of-sequence sentinel; every slot
     #                                past it is treated as unused.
     sparsity_specs: Array
+    # P1 per-path action history, index-aligned with ``order`` like
+    # ``sparsity_specs``. ``face_specs`` rows use the SAME wire format as
+    # sparsity_specs rows; row[0] == -1 ⇒ no approximation for that slot.
+    # ``face_skips[k, f] == 1`` ⇒ face f of the k-th eliminated vertex is
+    # SKIPPED (graphax.SKIP_FACE — the path's contraction never happens).
+    face_specs: Array  # (N, MAX_FACES, FACE_SLOTS, 3) int32
+    face_skips: Array  # (N, MAX_FACES) int32
     tokens: Array
     eqn_ids: Array  # (MAX_TOKENS,) int32; per-token equation ID, -1 for non-eqn tokens
     # Per-vertex axis state — observation surface for the dynamic action
@@ -647,6 +671,9 @@ class EnvOut(NamedTuple):
 class StepAction(NamedTuple):
     target_vertex: Array  # scalar int32
     rule_specs: Array  # (MAX_RULES_PER_VERTEX, 3) int32; row [base_idx1, base_idx2, factor]; base_idx1 < 0 marks unused
+    # P1 per-path actions. None ⇒ per-vertex mode, byte-identical to before.
+    face_rows: Array | None = None  # (MAX_FACES, FACE_SLOTS, 3) int32 spec rows
+    face_skip: Array | None = None  # (MAX_FACES,) int32; 1 ⇒ SKIP_FACE
 
 
 class EnvConfig(NamedTuple):
@@ -1477,12 +1504,65 @@ def decode_vertex_rule_specs(jaxpr, vertex, spec_rows, is_last: bool) -> tuple:
     return tuple(rules)
 
 
+def _face_transforms_for_order(config, consts, args, o_list, specs_list,
+                               face_rows_list, face_skips_list):
+    """Per-vertex ``face_transforms`` dicts for graphax, from the wire arrays.
+
+    Face KEYS are graph-state dependent, so enumerate with ``faces_of`` on a
+    structural replay that applies the SAME per-vertex rules and face
+    transforms the measurement will — the k-th vertex's keys are only valid on
+    the graph produced by the first k-1 (transformed) eliminations. Slots wrap
+    their decoded rules in ``make_live_masked_hook`` (no stats sink here — a
+    rule illegal on ITS operand is skipped per-slot, never raises);
+    ``face_skips`` rows become ``graphax.SKIP_FACE``.
+    """
+    from graphax import SKIP_FACE, faces_of
+    from graphax.incremental import IncrementalJaxpr
+    from alphagrad.approx.common.masks import make_live_masked_hook
+
+    ij = IncrementalJaxpr(config.jaxpr, tuple(config.argnums), list(consts),
+                          list(args), track_faces=False)
+    out: dict[int, dict] = {}
+    last = len(o_list) - 1
+    for k, v in enumerate(o_list):
+        v = int(v)
+        keys = faces_of(ij.graph, ij.tgraph, v, config.jaxpr)
+        per_face: dict = {}
+        rows_f = face_rows_list[k]
+        skips_f = face_skips_list[k]
+        for f, key in enumerate(keys[:MAX_FACES]):
+            if int(skips_f[f]) == 1:
+                per_face[key] = SKIP_FACE
+                continue
+            slots = []
+            for s in range(FACE_SLOTS):
+                rules = decode_vertex_rule_specs(
+                    config.jaxpr, v, [list(rows_f[f][s])],
+                    is_last=(k == last),
+                )
+                slots.append(
+                    make_live_masked_hook(tuple(rules)) if rules else None
+                )
+            if any(sl is not None for sl in slots):
+                per_face[key] = tuple(slots)
+        if per_face:
+            out[v] = per_face
+        vertex_rules = decode_vertex_rule_specs(
+            config.jaxpr, v, specs_list[k], is_last=(k == last)
+        )
+        ij.eliminate(v, tuple(vertex_rules) if vertex_rules else (),
+                     out.get(v))
+    return out
+
+
 def _callback(
     config: EnvConfig,
     args,
     consts,
     order,
     sparsity_specs,
+    face_specs,
+    face_skips,
     stop,
     *eval_samples,
     init: bool = False,
@@ -1500,6 +1580,20 @@ def _callback(
 
     o_list = [int(x) for x in partial_order.tolist()]
     specs_list = partial_specs.tolist()  # list of MAX_RULES x 3 lists
+
+    # P1 per-path actions: build graphax's {vertex: {face_key: slots|SKIP}}
+    # only when any face action is present in the prefix (all -1 / all 0 is
+    # the per-vertex mode and must stay byte-identical to it).
+    _faces_np = np.asarray(face_specs)[: len(o_list)]
+    _skips_np = np.asarray(face_skips)[: len(o_list)]
+    ft_by_vertex = None
+    if len(o_list) and (np.any(_skips_np == 1) or np.any(_faces_np[..., 0] >= 0)
+                        or np.any(_faces_np[..., 0] == COMPRESS_SENTINEL)
+                        or np.any(_faces_np[..., 0] == QUANT_SENTINEL)):
+        ft_by_vertex = _face_transforms_for_order(
+            config, consts, args, o_list, specs_list,
+            _faces_np.tolist(), _skips_np.tolist(),
+        )
 
     # Build the per-vertex `transforms` sequence consumed by graphax's
     # typed-transform API. Each row in `sparsity_specs` is
@@ -1549,7 +1643,10 @@ def _callback(
         # segmentation is tied to the VEJaxpr vocab; the incremental stream's
         # segmentation (IncrementalJaxpr step ranges) is the follow-up.
         stream = _incremental_stream_tokens(
-            config, consts, args, o_list, specs_list, tok_rules_by_v
+            config, consts, args, o_list, specs_list, tok_rules_by_v,
+            ft_by_vertex=ft_by_vertex,
+            face_key=(_faces_np.tobytes(), _skips_np.tobytes())
+            if ft_by_vertex else None,
         )
         _record_token_length(len(stream))
         _record_tokenization_truncation(len(stream))
@@ -1606,6 +1703,7 @@ def _callback(
         count_ops=True,
         sparse_representation=config.sparse,
         transforms=transforms,
+        face_transforms=ft_by_vertex,
     )
     muls_adds_fmas = float(aux["adds"] + aux["muls"] + aux["fmas"])
     max_io_sum = float(aux["mem"])
@@ -1677,6 +1775,11 @@ def _callback(
     h = hashlib.blake2b(digest_size=16)
     h.update(np.asarray(order, dtype=np.int32).tobytes())
     h.update(np.asarray(sparsity_specs, dtype=np.int32).tobytes())
+    # Face actions produce a different executable for the same (order, specs)
+    # — they MUST be in the key or a per-vertex compile would be replayed for
+    # a face-actioned plan (and vice versa).
+    h.update(np.asarray(face_specs, dtype=np.int32).tobytes())
+    h.update(np.asarray(face_skips, dtype=np.int32).tobytes())
     h.update(int(stop).to_bytes(4, "little", signed=False))
     # Include the shape signature of args_for_lower so we don't
     # collide across rollouts that share (order, specs) but differ
@@ -1702,6 +1805,7 @@ def _callback(
                     has_aux=config.has_aux,
                     sparse_representation=config.sparse,
                     transforms=transforms,
+                    face_transforms=ft_by_vertex,
                 ),
                 keep_unused=True,
             )
@@ -2188,7 +2292,10 @@ class VertexEliminationEnv:
         # bound args) and re-packages ``eval_samples`` as a tuple.
         pool = self._remote_pool
 
-        def _remote_callback(args, consts, order, specs, step, *eval_samples):
+        def _remote_callback(args, consts, order, specs, face_specs,
+                             face_skips, step, *eval_samples):
+            # The Ray pool path predates face actions (DEPRECATED line) —
+            # they are dropped here; the pool's own env measures per-vertex.
             eval_samples_t = tuple(eval_samples) if eval_samples else None
             tokens, eqn_ids, reward = pool.evaluate(
                 order, specs, int(step),
@@ -2218,6 +2325,13 @@ class VertexEliminationEnv:
             dtype=jnp.int32,
         )
         initial_specs = initial_specs.at[..., 2].set(0)  # factor=0 default for unused rows
+        initial_face_specs = jnp.full(
+            (initial_order.shape[0], MAX_FACES, FACE_SLOTS, 3), -1,
+            dtype=jnp.int32,
+        )
+        initial_face_skips = jnp.zeros(
+            (initial_order.shape[0], MAX_FACES), dtype=jnp.int32
+        )
 
         tokens, eqn_ids, _ = io_callback(
             self.tokenize(init=True),
@@ -2226,6 +2340,8 @@ class VertexEliminationEnv:
             self.consts,
             initial_order,
             initial_specs,
+            initial_face_specs,
+            initial_face_skips,
             0,
             *(self.eval_args_samples if self.eval_args_samples is not None else ()),
         )
@@ -2239,6 +2355,8 @@ class VertexEliminationEnv:
         state = EnvState(
             order=initial_order,
             sparsity_specs=initial_specs,
+            face_specs=initial_face_specs,
+            face_skips=initial_face_skips,
             tokens=tokens,
             eqn_ids=eqn_ids,
             axis_state=self.axis_state_static,
@@ -2263,11 +2381,21 @@ class VertexEliminationEnv:
         if isinstance(action, StepAction):
             target_vertex = jnp.asarray(action.target_vertex, dtype=jnp.int32)
             rule_specs = jnp.asarray(action.rule_specs, dtype=jnp.int32)
+            if action.face_rows is not None:
+                face_rows = jnp.asarray(action.face_rows, dtype=jnp.int32)
+                face_skip = jnp.asarray(action.face_skip, dtype=jnp.int32)
+            else:
+                face_rows = jnp.full(
+                    (MAX_FACES, FACE_SLOTS, 3), -1, dtype=jnp.int32
+                )
+                face_skip = jnp.zeros((MAX_FACES,), dtype=jnp.int32)
         else:
             action = jnp.asarray(action, dtype=jnp.int32)
             sp_type = action // MAX_TOKENS
             target_vertex = action % MAX_TOKENS
             rule_specs = _legacy_sp_to_specs(sp_type)
+            face_rows = jnp.full((MAX_FACES, FACE_SLOTS, 3), -1, dtype=jnp.int32)
+            face_skip = jnp.zeros((MAX_FACES,), dtype=jnp.int32)
 
         idx = state.step_count
         new_step = idx + 1
@@ -2281,6 +2409,12 @@ class VertexEliminationEnv:
 
         new_order = curr_order[shifted.astype(jnp.int32)].at[idx].set(target_vertex)
         new_specs = curr_specs[shifted.astype(jnp.int32)].at[idx].set(rule_specs)
+        new_face_specs = (
+            state.face_specs[shifted.astype(jnp.int32)].at[idx].set(face_rows)
+        )
+        new_face_skips = (
+            state.face_skips[shifted.astype(jnp.int32)].at[idx].set(face_skip)
+        )
 
         tokens, eqn_ids, reward = io_callback(
             self.tokenize(),
@@ -2289,6 +2423,8 @@ class VertexEliminationEnv:
             self.consts,
             new_order,
             new_specs,
+            new_face_specs,
+            new_face_skips,
             new_step,
             *(self.eval_args_samples if self.eval_args_samples is not None else ()),
         )
@@ -2310,6 +2446,8 @@ class VertexEliminationEnv:
         new_state = EnvState(
             order=new_order,
             sparsity_specs=new_specs,
+            face_specs=new_face_specs,
+            face_skips=new_face_skips,
             tokens=tokens,
             eqn_ids=eqn_ids,
             axis_state=new_axis_state,
@@ -2407,6 +2545,10 @@ class VertexEliminationEnv:
         partial_state = EnvState(
             order=new_order,
             sparsity_specs=new_specs,
+            # External (Ray) split predates face actions: carry the histories
+            # through the same reorder so the state stays well-formed.
+            face_specs=state.face_specs[shifted.astype(jnp.int32)],
+            face_skips=state.face_skips[shifted.astype(jnp.int32)],
             tokens=jnp.zeros_like(state.tokens),
             eqn_ids=jnp.zeros_like(state.eqn_ids),
             axis_state=new_axis_state,
@@ -2480,6 +2622,13 @@ class VertexEliminationEnv:
         partial_state = EnvState(
             order=initial_order,
             sparsity_specs=initial_specs,
+            face_specs=jnp.full(
+                (initial_order.shape[0], MAX_FACES, FACE_SLOTS, 3), -1,
+                dtype=jnp.int32,
+            ),
+            face_skips=jnp.zeros(
+                (initial_order.shape[0], MAX_FACES), dtype=jnp.int32
+            ),
             tokens=jnp.zeros((MAX_TOKENS,), dtype=jnp.int32),
             eqn_ids=jnp.zeros((MAX_TOKENS,), dtype=jnp.int32),
             axis_state=self.axis_state_static,

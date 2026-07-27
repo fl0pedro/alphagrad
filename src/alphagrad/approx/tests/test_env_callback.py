@@ -31,6 +31,8 @@ import jax.numpy as jnp
 import jax.random as jrand
 
 from alphagrad.approx.env import (
+    FACE_SLOTS,
+    MAX_FACES,
     MAX_RULES_PER_VERTEX,
     COMPRESS_SENTINEL,
     MAX_TOKENS,
@@ -48,6 +50,15 @@ from alphagrad.approx.env import (
     _AXIS_FEAT_SIZE,
     AXIS_FEATURE_DIM,
 )
+
+
+def _zero_faces(order):
+    """Inactive P1 face-action arrays for direct ``_callback`` calls."""
+    n = len(jnp.asarray(order))
+    return (
+        jnp.full((n, MAX_FACES, FACE_SLOTS, 3), -1, dtype=jnp.int32),
+        jnp.zeros((n, MAX_FACES), dtype=jnp.int32),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +207,7 @@ def test_callback_forwards_arbitrary_factors_as_diag():
             closed_jaxpr.literals,
             initial_order,
             sparsity_specs,
+            *_zero_faces(initial_order),
             stop,
             init=True,
         )
@@ -246,7 +258,8 @@ def test_callback_resolves_minus_one_factor_to_gcd():
     with mock.patch("alphagrad.approx.env.extract_jaxpr", fake_extract):
         _callback(
             config, args, closed_jaxpr.literals,
-            initial_order, sparsity_specs, stop, init=True,
+            initial_order, sparsity_specs, *_zero_faces(initial_order),
+            stop, init=True,
         )
 
     transforms = captured["transforms"]
@@ -315,7 +328,8 @@ def test_callback_drops_rules_that_dont_fit_every_invar():
     with mock.patch("alphagrad.approx.env.extract_jaxpr", fake_extract):
         _callback(
             config, (x,), closed_jaxpr.literals,
-            initial_order, sparsity_specs, stop, init=True,
+            initial_order, sparsity_specs, *_zero_faces(initial_order),
+            stop, init=True,
         )
 
     transforms = captured["transforms"] or []
@@ -370,7 +384,8 @@ def test_callback_emits_compress_for_sentinel_rows():
     with mock.patch("alphagrad.approx.env.extract_jaxpr", fake_extract):
         _callback(
             config, args, closed_jaxpr.literals,
-            initial_order, sparsity_specs, stop, init=True,
+            initial_order, sparsity_specs, *_zero_faces(initial_order),
+            stop, init=True,
         )
 
     transforms = captured["transforms"]
@@ -427,7 +442,8 @@ def test_callback_compress_drops_out_of_range_axes():
     with mock.patch("alphagrad.approx.env.extract_jaxpr", fake_extract):
         _callback(
             config, (x,), closed_jaxpr.literals,
-            initial_order, sparsity_specs, stop, init=True,
+            initial_order, sparsity_specs, *_zero_faces(initial_order),
+            stop, init=True,
         )
 
     transforms = captured["transforms"] or []
