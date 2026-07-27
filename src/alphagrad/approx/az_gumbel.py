@@ -43,7 +43,9 @@ import jax, jax.numpy as jnp
 import equinox as eqx
 import optax
 
-from alphagrad.approx.env import VertexEliminationEnv, _callback, REWARD_INDEX
+from alphagrad.approx.env import (
+    FACE_SLOTS, MAX_FACES as ENV_MAX_FACES, SENTINEL_COST,
+    VertexEliminationEnv, _callback, REWARD_INDEX)
 from alphagrad.approx.common.examples import (
     get_fn, get_args, data_gen, infer_argnums, scalar_loss_fn)
 from alphagrad.approx.common.eval_samples import generate_eval_samples
@@ -65,7 +67,11 @@ closed = jax.make_jaxpr(LOSS)(*xs)
 env = VertexEliminationEnv.from_jaxpr(
     closed, args=xs, argnums=ARGN, num_envs=0, data_gen=gen, target_fun=LOSS,
     sparse=(os.environ.get("ALPHAGRAD_SPARSE", "0") == "1"),
-    cmp_type="latency", mem_type="peak_memory", exec_on_gpu=True, measure_latency=True,
+    cmp_type="latency", mem_type="peak_memory",
+    # GPU by default; ALPHAGRAD_GAZ_EXEC_ON_GPU=0 for CPU smokes (the GPU
+    # path requires >= 2 devices for the measure rotation).
+    exec_on_gpu=os.environ.get("ALPHAGRAD_GAZ_EXEC_ON_GPU", "1") == "1",
+    measure_latency=True,
     num_data_points=A.ndata, reps_per_point=1, percentile_keep=0.60,
     slow_exec_cutoff_seconds=0.0, flop_gate_threshold=0.0, measure_grad=True,
     latency_inner_reps=A.latency_inner_reps, latency_timer="perf_counter")
@@ -265,21 +271,32 @@ def measure(state):
         return _ms_client.measure_seq(seq_of(state))
     try:
         order, specs, _ = build_order_specs(seq_of(state), env)
-        rs = {}
-        _callback(env.config, env.args, env.consts, jnp.asarray(order),
-                  jnp.asarray(specs), len(order), *ev, raw_sink=rs)
+        # Current 8-channel _callback: no raw_sink (that was the 9-channel-era
+        # API — passing it raised TypeError, the blanket except returned None,
+        # and every "measurement" silently failed). The reward VECTOR carries
+        # the winsorized aggregates; costs are stored NEGATED (higher=better).
+        n = len(order)
+        _zface = (
+            jnp.full((n, ENV_MAX_FACES, FACE_SLOTS, 3), -1, dtype=jnp.int32),
+            jnp.zeros((n, ENV_MAX_FACES), dtype=jnp.int32),
+        )
+        _, _, reward = _callback(
+            env.config, env.args, env.consts, jnp.asarray(order),
+            jnp.asarray(specs), *_zface, n, *ev,
+        )
+        reward = np.asarray(reward, dtype=np.float64)
     except BaseException:
         try:
             jax.clear_caches(); import gc; gc.collect()
         except Exception:
             pass
         return None
-    lat_s = [x for x in rs.get("latency_ns_samples", []) if x > 0 and np.isfinite(x)]
-    lat = float(np.mean(lat_s)) if lat_s else float("nan")
-    peak = float(rs.get("xla_peak_memory", float("nan")))
-    flops = float(rs.get("flops", float("nan")))
-    cos_pp = rs.get("cosine_sim_per_point", [])
-    cos = float(np.mean(cos_pp)) if cos_pp else float("nan")
+    if reward[REWARD_INDEX["latency_ns"]] <= SENTINEL_COST + 1.0:
+        return None  # sentinelled measurement
+    lat = -float(reward[REWARD_INDEX["latency_ns"]])
+    peak = -float(reward[REWARD_INDEX["peak_memory"]])
+    flops = -float(reward[REWARD_INDEX["flops"]])
+    cos = float(reward[REWARD_INDEX["cosine_sim"]])
     r = np.array([lat, peak, flops, cos])
     return r if np.all(np.isfinite(r)) else None
 

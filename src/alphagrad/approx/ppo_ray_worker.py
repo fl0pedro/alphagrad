@@ -13,9 +13,14 @@ KEPT AS A DESIGN REFERENCE ONLY. The parts worth reading are catalogued in
 alphagrad/COMPONENTS.md; the ones worth having have been ported to ppo.py
 (PopArt, Pareto + hypervolume, the multiplicative cosine gate, per-component KL).
 Use `ppo.py`.
-"""
 
-"""Ray-actor host of PPO training using the external-tokenizer path.
+----------------------------------------------------------------------------
+(The banner above was inserted as a SECOND string literal, which made the
+`from __future__` import below a SyntaxError — the whole module, and through
+`policy.py` every GAZ entry point, failed to import. Merged into one
+docstring.)
+
+Ray-actor host of PPO training using the external-tokenizer path.
 
 First cut of the Phase-3+5 PPO Ray version from the migration plan:
 
