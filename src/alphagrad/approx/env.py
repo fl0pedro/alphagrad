@@ -1815,11 +1815,36 @@ def _callback(
         # ``ResourceMonitor`` (not its C++ tracker) leaks. peak_memory +
         # latency_ns are zero for the run.
         inner = max(1, int(getattr(config, "latency_inner_reps", 1)))
+        _direct = os.environ.get("ALPHAGRAD_DIRECT_MEASURE", "0") == "1"
         for _rep in range(n_reps):
             if os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1":
                 out_approx = compiled_approx(*eval_args_i)
                 latency_samples.append(0.0)
                 peak_mem_samples.append(0.0)
+            elif _direct:
+                # Spec-native primitives, no jax_memory_monitor object at all
+                # (its per-call C++ trackers are the leak that killed v10):
+                # clear_memory_stats() resets the high-water mark, the inner
+                # loop is timed with perf_counter around a drained queue, and
+                # peak_bytes_in_use is read per device afterwards. NOTE: this
+                # reports the ABSOLUTE allocator peak (spec formulation), not
+                # ResourceMonitor's above-baseline delta — don't flip the flag
+                # mid-campaign.
+                for _d in unique_devices:
+                    if hasattr(_d, "clear_memory_stats"):
+                        _d.clear_memory_stats()
+                jax.effects_barrier()
+                _t0 = time.perf_counter()
+                for _k in range(inner):
+                    out_approx = compiled_approx(*eval_args_i)
+                jax.block_until_ready(out_approx)
+                _t1 = time.perf_counter()
+                _peak = 0.0
+                for _d in unique_devices:
+                    _stats = _d.memory_stats() or {}
+                    _peak = max(_peak, float(_stats.get("peak_bytes_in_use", 0.0)))
+                latency_samples.append((_t1 - _t0) / inner * 1e9)  # → ns
+                peak_mem_samples.append(_peak)
             else:
                 with _get_resource_monitor(unique_devices) as monitor:
                     # Accumulation loop (spec, default 50 when opted in): the
