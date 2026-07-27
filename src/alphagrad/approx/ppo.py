@@ -123,6 +123,7 @@ from alphagrad.approx.heads import (
     precompute_factor_tables,
 )
 from alphagrad.transformer import MLP, Encoder, PositionalEncoder, make_encoder
+from alphagrad.approx import vertex_memory as _vmem
 from alphagrad.transformer.encoder import RelationalMultiheadAttention
 from alphagrad.utils import entropy, explained_variance
 
@@ -405,6 +406,52 @@ def _zero_face_action():
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase 3b — incremental autoregressive encode (--incremental-encode).
+#
+# The palimpsa recurrence is causal, so the encoder state after consuming the
+# append-only stream up to step t is a small carry: per-layer (M, I) plus the
+# causal relational-gate histogram. The rollout extends the carry by each
+# step's DELTA tokens only (O(delta) instead of O(S) re-encode), folds the new
+# rows into the per-vertex memory (vertex_memory.py), and the pointer/value
+# heads read from that memory. The trajectory stores each step's PRE-step
+# carry so the loss re-derives the encoding by the SAME delta extension —
+# the stored-context ratio-1 pattern (gradient truncates at the stored
+# carry, i.e. flows through the last delta only; accepted by design).
+#
+# MAX_EQNS bounds the causal relational-gate histogram (eqn ids at or above
+# it share the top bucket — an approximation only in overflow, identical on
+# both rollout and loss so ratio-1 is unaffected).
+# ---------------------------------------------------------------------------
+MAX_EQNS = int(os.environ.get("ALPHAGRAD_MAX_EQNS", "4096"))
+
+
+class EncCarry(NamedTuple):
+    M: jax.Array        # (L, H, d, d) float32 — per-layer palimpsa numerator
+    I: jax.Array        # (L, H, d, d) float32 — per-layer palimpsa precision
+    cumhist: jax.Array  # (MAX_EQNS,) float32 — cumulative eqn-id counts (<= id)
+    nvalid: jax.Array   # () float32 — valid (eqn_id >= 0) tokens consumed
+    pos: jax.Array      # () int32 — stream position consumed so far
+
+
+def _stream_len(tokens):
+    """Number of real tokens in an append-only buffer (pad id is 0)."""
+    return jnp.sum((tokens != 0).astype(jnp.int32))
+
+
+def _zero_enc_carry_fields():
+    """Degenerate (0,)-shaped stand-ins for the incremental-encode trajectory
+    fields when the mode is off — zero memory, uniform pytree structure."""
+    z = jnp.zeros((0,), jnp.float32)
+    return dict(
+        enc_M=z, enc_I=z, enc_cumhist=z,
+        enc_nvalid=jnp.zeros((), jnp.float32),
+        enc_pos=jnp.zeros((), jnp.int32),
+        vmem_sums=z, vmem_counts=z,
+        delta_owner=jnp.zeros((), jnp.int32),
+    )
+
+
 class Trajectory(NamedTuple):
     tokens: jax.Array
     eqn_ids: jax.Array
@@ -466,6 +513,18 @@ class Trajectory(NamedTuple):
     face_comp_valid: jax.Array    # (MAX_FACES, N) float32
     face_valid: jax.Array         # (MAX_FACES,) float32
     face_old_logp: jax.Array      # () float32
+    # Phase 3b (--incremental-encode; degenerate (0,) shapes otherwise). The
+    # PRE-step encoder carry + vertex memory, and the delta's owner vertex —
+    # everything the loss needs to re-derive this step's encoding by
+    # extending with the delta tokens only.
+    enc_M: jax.Array        # (L, H, d, d)
+    enc_I: jax.Array        # (L, H, d, d)
+    enc_cumhist: jax.Array  # (MAX_EQNS,)
+    enc_nvalid: jax.Array   # ()
+    enc_pos: jax.Array      # () int32
+    vmem_sums: jax.Array    # (V+1, E)
+    vmem_counts: jax.Array  # (V+1,)
+    delta_owner: jax.Array  # () int32 — vertex whose elimination emitted the delta
     discount: jax.Array
     vertex_avail_mask: jax.Array
 
@@ -512,6 +571,14 @@ class TrainBatch(NamedTuple):
     face_comp_valid: jax.Array
     face_valid: jax.Array
     face_old_logp: jax.Array
+    enc_M: jax.Array
+    enc_I: jax.Array
+    enc_cumhist: jax.Array
+    enc_nvalid: jax.Array
+    enc_pos: jax.Array
+    vmem_sums: jax.Array
+    vmem_counts: jax.Array
+    delta_owner: jax.Array
     estim_returns: jax.Array
     norm_adv: jax.Array
     vertex_avail_mask: jax.Array
@@ -1021,6 +1088,146 @@ class Agent(eqx.Module):
         """Apply the per-slot recurrent update to ``residual_state``."""
         return self.residual_update(residual_state, vertex_idx, vertex_repr)
 
+    # -- Phase 3b: incremental autoregressive encode ------------------------
+
+    def carry_init(self):
+        """Empty :class:`EncCarry` (M0 = 0, I0 = broadcast Ip — the palimpsa
+        recurrence's t=0 state, matching ``palimpsa_ref``)."""
+        layers = self.encoder.layers
+        L = len(layers)
+        H = layers[0].attn_layer.num_heads
+        d = layers[0].attn_layer.head_dim
+        M0 = jnp.zeros((L, H, d, d), jnp.float32)
+        I0 = jnp.stack([
+            jnp.broadcast_to(
+                jnn.softplus(l.attn_layer.Ip_raw)[:, None, None], (H, d, d)
+            ).astype(jnp.float32)
+            for l in layers
+        ])
+        return EncCarry(
+            M=M0, I=I0,
+            cumhist=jnp.zeros((MAX_EQNS,), jnp.float32),
+            nvalid=jnp.zeros((), jnp.float32),
+            pos=jnp.zeros((), jnp.int32),
+        )
+
+    def encode_extend(self, carry, tokens_buf, eqn_ids_buf, count, *, window):
+        """Extend the palimpsa carry by ``count`` tokens read from
+        ``tokens_buf`` at ``carry.pos`` (fixed static ``window``; pad steps
+        freeze the carry, so the valid prefix is bitwise-independent of the
+        window size). Returns ``(new_carry, rows, valid, eqn_window)`` with
+        ``rows`` (window, E) zeroed on invalid steps.
+
+        Byte-identical math to the PalimpsaMixer/EncoderLayer stack with ONE
+        deliberate exception: the relational forget-gate features are CAUSAL
+        prefix counts from the carried histogram — the full path's whole-
+        stream counts are acausal and cannot ride a recurrence. Rollout and
+        loss share this exact computation, which is what ratio-1 needs.
+        """
+        if self.pos_enc is not None:
+            raise RuntimeError(
+                "encode_extend requires the palimpsa backbone "
+                "(ALPHAGRAD_POLICY=palimpsa; pos_enc must be None)."
+            )
+        layers = self.encoder.layers
+        count = jnp.clip(count, 0, window).astype(jnp.int32)
+        idx = carry.pos + jnp.arange(window, dtype=jnp.int32)
+        toks = jnp.take(tokens_buf, idx, mode="fill", fill_value=0).astype(jnp.int32)
+        eqns = jnp.take(eqn_ids_buf, idx, mode="fill", fill_value=-1).astype(jnp.int32)
+        valid = jnp.arange(window, dtype=jnp.int32) < count
+        eq_arange = jnp.arange(MAX_EQNS, dtype=jnp.int32)
+
+        def _step(c, tev):
+            M, I, cumhist, nvalid = c
+            tok, eid, ok = tev
+            tokvalid = ok & (eid >= 0)
+            tvf = tokvalid.astype(jnp.float32)
+            e = jnp.clip(eid, 0, MAX_EQNS - 1)
+            # Causal same/earlier/later counts incl. this token (the full
+            # path's counts include self too), normalized by the running
+            # valid-token count. Structural/pad tokens contribute zero
+            # features but still see rel_gate's bias — matching the full
+            # path, which zeroes feats yet applies the (learned) bias.
+            cumhist2 = cumhist + tvf * (eq_arange >= e).astype(jnp.float32)
+            nvalid2 = nvalid + tvf
+            at = cumhist2[e]
+            below = jnp.where(e > 0, cumhist2[jnp.maximum(e - 1, 0)], 0.0)
+            denom = jnp.maximum(nvalid2, 1.0)
+            feats = jnp.stack([at - below, below, nvalid2 - at]) / denom * tvf
+
+            x = self.embedding(tok)
+            new_M, new_I = [], []
+            for li, layer in enumerate(layers):
+                mixer = layer.attn_layer
+                H = mixer.num_heads
+                d = mixer.head_dim
+                y = layer.attn_norm(x)
+                q = mixer.query_proj(y).reshape(H, d)
+                kk = mixer.key_proj(y).reshape(H, d)
+                v = mixer.value_proj(y).reshape(H, d)
+                b = jnn.softplus(mixer.bias_proj(y)).reshape(H, d)
+                gt = jnn.softplus(mixer.gate_proj(y) + mixer.rel_gate(feats))
+                g = jnn.softplus(mixer.g_raw)
+                Ip = jnn.softplus(mixer.Ip_raw)
+                decay = jnp.exp(-gt[:, None, None] * g[:, None, None])
+                M_l = v[:, :, None] * kk[:, None, :] + decay * M[li]
+                I_l = (b[:, :, None] * (kk[:, None, :] ** 2)
+                       + (1.0 - decay) * Ip[:, None, None] + decay * I[li])
+                mu = M_l / I_l
+                out = jnp.einsum("hdn,hn->hd", mu, q * (d ** -0.5)).reshape(H * d)
+                x = x + mixer.output_proj(out)
+                y2 = layer.mlp_norm(x)
+                x = x + layer.mlp(y2)
+                new_M.append(jnp.where(ok, M_l, M[li]))
+                new_I.append(jnp.where(ok, I_l, I[li]))
+            row = jnp.where(ok, x, jnp.zeros_like(x))
+            return (jnp.stack(new_M), jnp.stack(new_I), cumhist2, nvalid2), row
+
+        (M2, I2, ch2, nv2), rows = lax.scan(
+            _step,
+            (carry.M, carry.I, carry.cumhist, carry.nvalid),
+            (toks, eqns, valid),
+        )
+        new_carry = EncCarry(M=M2, I=I2, cumhist=ch2, nvalid=nv2,
+                             pos=carry.pos + count)
+        return new_carry, rows, valid, eqns
+
+    def heads_from_memory(
+        self,
+        vmem_sums,
+        vmem_counts,
+        vertex_features=None,
+        residual_state=None,
+        preference=None,
+    ):
+        """The ``encode()`` head block, fed from the per-vertex memory instead
+        of the raw (S, E) sequence: pointer via ``from_vertex_memory`` (same
+        weights, keys/values = the V+1 pooled slots), value summary via the
+        token-count-weighted slot mean (identical to the full path's masked
+        token mean by associativity). Returns the same
+        ``(vertex_logits, vertex_contexts, value)`` triple.
+        """
+        vmem_rows = _vmem.read(vmem_sums, vmem_counts)
+        vmask = _vmem.occupancy(vmem_counts)
+        vertex_logits, vertex_contexts = self.vertex_policy.from_vertex_memory(
+            vmem_rows, vmask
+        )
+        if vertex_features is not None:
+            vertex_contexts = vertex_contexts + self._data_embedding(vertex_features)
+        if residual_state is not None:
+            vertex_contexts = vertex_contexts + residual_state
+        summary = _vmem.summary(vmem_sums, vmem_counts)
+        if preference is not None:
+            pref_emb = self.pref_proj(preference)
+            vertex_contexts = vertex_contexts + pref_emb[None, :]
+            summary = summary + pref_emb
+        v_flops = self.value_head_flops(summary)
+        v_mem = self.value_head_mem(summary)
+        v_cos = self.value_head_cos(summary)
+        v_frob = self.value_head_frob(summary)
+        value = jnp.concatenate([v_flops, v_mem, v_cos, v_frob], axis=-1)
+        return vertex_logits, vertex_contexts, value
+
     def sample_action_dynamic(
         self,
         tokens,
@@ -1039,6 +1246,7 @@ class Agent(eqx.Module):
         oracle_pair_all=None,     # (total_v+1, N, N) live per-vertex DIAG mask
         oracle_comp_all=None,     # (total_v+1, N) live per-vertex COMPRESS mask
         face_masks_all=None,      # P1c: (fpair (V+1,F,N,N), fcomp (V+1,F,N), fvalid (V+1,F))
+        precomputed=None,         # 3b: (vertex_logits, vertex_contexts, value) from the carry path
     ):
         """Same as :meth:`sample_action` but routes the rule head through
         :class:`MicroActionPolicy`. ``axis_state`` and ``axis_valid_mask``
@@ -1055,14 +1263,20 @@ class Agent(eqx.Module):
                 "None — agent was built without --dynamic-substeps."
             )
         net_key, vertex_key, micro_key = jrand.split(key, 3)
-        vertex_logits, vertex_contexts, value = self.encode(
-            tokens,
-            eqn_ids=eqn_ids,
-            vertex_features=vertex_features,
-            residual_state=residual_state,
-            preference=preference,
-            key=net_key,
-        )
+        if precomputed is not None:
+            # 3b incremental-encode path: the caller already ran the carry
+            # extension + vertex-memory heads; everything downstream (micro
+            # + face policies) conditions on that carry via vertex_contexts.
+            vertex_logits, vertex_contexts, value = precomputed
+        else:
+            vertex_logits, vertex_contexts, value = self.encode(
+                tokens,
+                eqn_ids=eqn_ids,
+                vertex_features=vertex_features,
+                residual_state=residual_state,
+                preference=preference,
+                key=net_key,
+            )
 
         masked_v_logits = jnp.where(vertex_avail_mask > 0.5, vertex_logits, -1e9)
         if vertex_temperature is not None:
@@ -1176,6 +1390,7 @@ class Agent(eqx.Module):
         face_pair_valid=None,  # stored (F,N,N) sampling mask
         face_comp_valid=None,  # stored (F,N)
         face_valid=None,       # stored (F,)
+        precomputed=None,      # 3b: (vertex_logits, vertex_contexts, value) from the carry path
     ):
         """Joint log-prob / entropy for a stored typed action sequence.
 
@@ -1188,14 +1403,19 @@ class Agent(eqx.Module):
             raise RuntimeError(
                 "evaluate_action_dynamic called but micro_action_policy is None."
             )
-        vertex_logits, vertex_contexts, value = self.encode(
-            tokens,
-            eqn_ids=eqn_ids,
-            vertex_features=vertex_features,
-            residual_state=residual_state,
-            preference=preference,
-            key=key,
-        )
+        if precomputed is not None:
+            # 3b: same carry-derived triple the rollout sampled under (the
+            # loss re-derives it from the stored pre-step carry + delta).
+            vertex_logits, vertex_contexts, value = precomputed
+        else:
+            vertex_logits, vertex_contexts, value = self.encode(
+                tokens,
+                eqn_ids=eqn_ids,
+                vertex_features=vertex_features,
+                residual_state=residual_state,
+                preference=preference,
+                key=key,
+            )
 
         masked_v_logits = jnp.where(vertex_avail_mask > 0.5, vertex_logits, -1e9)
         vertex_dist = jnn.softmax(masked_v_logits, axis=-1)
@@ -1447,6 +1667,17 @@ def make_argparser() -> argparse.ArgumentParser:
         "Face log-probs enter the PPO loss; masks come from the oracle's "
         "face_masks and are stored for ratio-1. Subsumes --per-face's "
         "projection of a single per-vertex rule list.",
+    )
+    p.add_argument(
+        "--incremental-encode", action="store_true",
+        help="Phase 3b: autoregressive O(delta) encoding. The palimpsa carry "
+        "rides the rollout scan (base stream consumed once, each step extends "
+        "by its delta tokens only); pointer/value heads read from the "
+        "per-vertex memory; the loss extends each sample's stored PRE-step "
+        "carry (ratio-1 by construction, gradient truncates at the carry). "
+        "Requires ALPHAGRAD_POLICY=palimpsa (causal, no pos-enc), "
+        "ALPHAGRAD_INCREMENTAL_TOKENS=1 (append-only stream) and "
+        "--dynamic-substeps.",
     )
     p.add_argument(
         "--advantage-norm", type=str, default="popart",
@@ -2564,6 +2795,36 @@ def main():
 
     variant_label = "pointer+micro-actions"
 
+    # 3b mode preconditions — fail fast, not 20 minutes into a compile. The
+    # carry is a CAUSAL recurrence: it needs the unidirectional palimpsa
+    # backbone (no pos-enc, no bidirectional second pass) and the append-only
+    # token stream (a re-traced stream has no prefix property to extend).
+    if getattr(args, "incremental_encode", False):
+        _pol = os.environ.get("ALPHAGRAD_POLICY", "transformer").strip().lower()
+        if _pol != "palimpsa":
+            raise ValueError(
+                "--incremental-encode requires ALPHAGRAD_POLICY=palimpsa "
+                f"(causal); got {_pol!r} (palimpsa_bi's reverse pass cannot "
+                "ride a causal carry, and the transformer needs absolute "
+                "positions)."
+            )
+        if os.environ.get("ALPHAGRAD_POS_ENC", "auto").strip().lower() in (
+            "1", "true", "yes"
+        ):
+            raise ValueError(
+                "--incremental-encode is incompatible with ALPHAGRAD_POS_ENC=1 "
+                "(absolute positions have no incremental analogue)."
+            )
+        if os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "0") != "1":
+            raise ValueError(
+                "--incremental-encode requires ALPHAGRAD_INCREMENTAL_TOKENS=1 "
+                "(the append-only stream is what the carry extends)."
+            )
+        if not args.dynamic_substeps:
+            raise ValueError(
+                "--incremental-encode is only wired for --dynamic-substeps."
+            )
+
     main_device = _resolve_main_device(args)
     if args.no_jit:
         jax.config.update("jax_disable_jit", True)
@@ -2632,7 +2893,13 @@ def main():
         num_data_points=int(args.num_data_points),
         reps_per_point=int(args.reps_per_point),
         latency_inner_reps=int(args.latency_inner_reps),
-        per_face=bool(args.per_face),
+        # --face-actions IMPLIES per-face legality masking for the per-vertex
+        # micro rules too: face slots are already live-mask-hooked, but a raw
+        # per-vertex rule that doesn't fit one face's operand would hit the
+        # strict TRANSFORM-DID-NOT-FIT guard and kill the episode's
+        # tokenization (found by the 3b smoke: Compress on an implicit-dim
+        # edge, legal by the logical-axis oracle, unappliable on the 1-D val).
+        per_face=bool(args.per_face or args.face_actions),
         measure_grad=bool(args.measure_grad),
         terminal_rewards_only=args.terminal_rewards_only,
     )
@@ -3016,12 +3283,62 @@ def main():
         _dyn_zero_quant_sign = jnp.ones((args.max_substeps,), dtype=jnp.int32)
         _dyn_zero_quant_logp = jnp.zeros((args.max_substeps,), dtype=jnp.float32)
 
+        # 3b: consume the initial base stream ONCE (window = MAX_TOKENS),
+        # fold its rows into the per-vertex memory (base eqn ids map to
+        # vertex slots positionally; structural/overflow → global slot),
+        # then each scan step extends by that step's delta only.
+        if getattr(args, "incremental_encode", False):
+            _enc0 = agent.carry_init()
+            _base_count = _stream_len(env_state.tokens)
+            _enc1, _rows0, _valid0, _eqns0 = agent.encode_extend(
+                _enc0, env_state.tokens, env_state.eqn_ids, _base_count,
+                window=MAX_TOKENS,
+            )
+            _base_ids = jnp.where(
+                (_eqns0 >= 0) & (_eqns0 < total_v), _eqns0, -1
+            )
+            _vs0 = jnp.zeros((total_v + 1, args.embd_dim), jnp.float32)
+            _vc0 = jnp.zeros((total_v + 1,), jnp.float32)
+            _vs0, _vc0 = _vmem.update_ids(_vs0, _vc0, _rows0, _base_ids, _valid0)
+            init_enc_state = (_enc1, _vs0, _vc0)
+        else:
+            init_enc_state = None
+
         def step_fn(carry, k):
-            state, residual_state, elim_order = carry
+            state, residual_state, elim_order, enc_state = carry
             sample_key, next_net_key = jrand.split(k, 2)
             vertex_avail_mask = vertex_avail_at_step(
                 state, vertex_valid_static, total_v, num_valid
             )
+
+            precomputed = None
+            if args.incremental_encode:
+                enc_carry, vmem_s, vmem_c = enc_state
+                # The delta appended since the carry's pos was emitted by the
+                # PREVIOUS step's elimination (empty at step 0 — the base
+                # stream is already consumed).
+                delta_count = _stream_len(state.tokens) - enc_carry.pos
+                delta_owner = jnp.where(
+                    state.step_count > 0,
+                    elim_order[jnp.maximum(state.step_count - 1, 0)],
+                    jnp.array(-1, jnp.int32),
+                ).astype(jnp.int32)
+                enc_carry2, d_rows, d_valid, d_eqns = agent.encode_extend(
+                    enc_carry, state.tokens, state.eqn_ids, delta_count,
+                    window=MAX_DELTA_TOKENS,
+                )
+                d_ids = jnp.where(d_eqns >= 0, delta_owner, -1)
+                vmem_s2, vmem_c2 = _vmem.update_ids(
+                    vmem_s, vmem_c, d_rows, d_ids, d_valid
+                )
+                precomputed = agent.heads_from_memory(
+                    vmem_s2, vmem_c2,
+                    vertex_features=vertex_features,
+                    residual_state=residual_state,
+                    preference=(
+                        preference if args.preference_conditioned else None
+                    ),
+                )
 
             if args.dynamic_substeps:
                 # Live per-vertex DIAG/COMPRESS masks for the current graph
@@ -3067,6 +3384,7 @@ def main():
                     oracle_pair_all=oracle_pair_all,
                     oracle_comp_all=oracle_comp_all,
                     face_masks_all=face_masks_all,
+                    precomputed=precomputed,
                 )
                 # Record this vertex in the elimination prefix for the next
                 # step's oracle replay.
@@ -3122,16 +3440,39 @@ def main():
             )
 
             pref_arg = preference if args.preference_conditioned else None
-            next_value = (
-                agent.value_for(
-                    next_state.tokens,
-                    eqn_ids=next_state.eqn_ids,
+            if args.incremental_encode:
+                # Bootstrap value at next_state: extend the post-decision
+                # carry by the delta the JUST-CHOSEN elimination emitted.
+                # This extension is recomputed by the next scan iteration
+                # (kept self-contained rather than threading heads across
+                # iterations); deltas are O(hundreds) of tokens, so the
+                # duplicate extend is cheap next to a full re-encode.
+                nv_count = _stream_len(next_state.tokens) - enc_carry2.pos
+                _, nv_rows, nv_valid, nv_eqns = agent.encode_extend(
+                    enc_carry2, next_state.tokens, next_state.eqn_ids,
+                    nv_count, window=MAX_DELTA_TOKENS,
+                )
+                nv_ids = jnp.where(nv_eqns >= 0, vertex_idx.astype(jnp.int32), -1)
+                nv_s, nv_c = _vmem.update_ids(
+                    vmem_s2, vmem_c2, nv_rows, nv_ids, nv_valid
+                )
+                _, _, next_value = agent.heads_from_memory(
+                    nv_s, nv_c,
                     vertex_features=vertex_features,
                     residual_state=new_residual,
                     preference=pref_arg,
-                    key=next_net_key,
                 )
-            )
+            else:
+                next_value = (
+                    agent.value_for(
+                        next_state.tokens,
+                        eqn_ids=next_state.eqn_ids,
+                        vertex_features=vertex_features,
+                        residual_state=new_residual,
+                        preference=pref_arg,
+                        key=next_net_key,
+                    )
+                )
 
             # In cache-encoding mode the trajectory's tokens/eqn_ids fields
             # carry the *initial* episode tokens (constant across the
@@ -3144,6 +3485,20 @@ def main():
             traj_eqn_ids = (
                 state.eqn_ids
             ).astype(jnp.int32)
+
+            if args.incremental_encode:
+                # PRE-step snapshots (§7b): the carry/memory synced to the
+                # PREVIOUS step's stream — the loss re-derives this step's
+                # encoding by the same delta extension.
+                _enc_fields = dict(
+                    enc_M=enc_carry.M, enc_I=enc_carry.I,
+                    enc_cumhist=enc_carry.cumhist,
+                    enc_nvalid=enc_carry.nvalid, enc_pos=enc_carry.pos,
+                    vmem_sums=vmem_s, vmem_counts=vmem_c,
+                    delta_owner=delta_owner,
+                )
+            else:
+                _enc_fields = _zero_enc_carry_fields()
 
             transition = Trajectory(
                 tokens=traj_tokens,
@@ -3191,14 +3546,24 @@ def main():
                 face_comp_valid=face_comp_v,
                 face_valid=face_valid_v,
                 face_old_logp=jnp.asarray(face_old_logp, jnp.float32),
+                **_enc_fields,
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
             )
-            return (next_state, new_residual, elim_order), (transition, raw_rewards)
+            next_enc_state = (
+                (enc_carry2, vmem_s2, vmem_c2)
+                if args.incremental_encode
+                else enc_state
+            )
+            return (
+                (next_state, new_residual, elim_order, next_enc_state),
+                (transition, raw_rewards),
+            )
 
-        (final_state, _, _), (traj, all_raw_rewards) = lax.scan(
+        (final_state, _, _, _), (traj, all_raw_rewards) = lax.scan(
             step_fn,
-            (env_state, init_residual, jnp.zeros((total_v,), dtype=jnp.int32)),
+            (env_state, init_residual, jnp.zeros((total_v,), dtype=jnp.int32),
+             init_enc_state),
             keys,
         )
         return final_state, traj, all_raw_rewards[-1]
@@ -3273,7 +3638,8 @@ def main():
         )
 
         def _eval_dyn(toks, eids, rs, pref, vidx, action, vmask, ax_st, ax_vm,
-                      cached, k, pv, cv, fa=None, fpv=None, fcv=None, fv=None):
+                      cached, k, pv, cv, fa=None, fpv=None, fcv=None, fv=None,
+                      pc3=None):
             return agent.evaluate_action_dynamic(
                 toks,
                 vidx,
@@ -3297,9 +3663,105 @@ def main():
                 face_pair_valid=fpv,
                 face_comp_valid=fcv,
                 face_valid=fv,
+                precomputed=pc3,
             )
 
-        if cached_flat is None:
+        if args.incremental_encode:
+            # 3b: re-derive each sample's encoding by extending its stored
+            # PRE-step carry with the delta tokens (gather-sliced from the
+            # stored stream at the carried pos), fold into the stored vertex
+            # memory, and run the heads — the exact computation the rollout
+            # sampled under, through CURRENT params (ratio 1 at epoch 0;
+            # gradient flows through the delta + heads, truncating at the
+            # stored carry by design).
+            def _carry_heads(toks, eids, M, I, ch, nv, pos, owner, vs, vc,
+                             rs, pref):
+                carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
+                count = _stream_len(toks) - pos
+                _, rows, valid, eqw = agent.encode_extend(
+                    carry, toks, eids, count, window=MAX_DELTA_TOKENS
+                )
+                ids = jnp.where(eqw >= 0, owner, -1)
+                vs2, vc2 = _vmem.update_ids(vs, vc, rows, ids, valid)
+                return agent.heads_from_memory(
+                    vs2, vc2,
+                    vertex_features=vertex_features,
+                    residual_state=rs,
+                    preference=pref_or_none(pref),
+                )
+
+            pc_logits, pc_ctx, pc_value = jax.vmap(_carry_heads)(
+                batch.tokens, batch.eqn_ids,
+                batch.enc_M, batch.enc_I, batch.enc_cumhist,
+                batch.enc_nvalid, batch.enc_pos, batch.delta_owner,
+                batch.vmem_sums, batch.vmem_counts,
+                batch.residual_state, batch.preference,
+            )
+            (
+                log_probs,
+                entropies,
+                values,
+                new_vertex_dist,
+                sub_lengths,
+                new_op_dists,
+                new_i_dists,
+                new_j_dists,
+                new_exp_dists,
+                new_kind_dists,
+                new_quant_logp,
+            ) = (
+                jax.vmap(
+                    lambda toks, eids, rs, pref, vidx, action, vmask, ax_st,
+                    ax_vm, k, pv, cv, fa, fpv, fcv, fv, pl, pc, pvl:
+                    _eval_dyn(
+                        toks, eids, rs, pref, vidx, action, vmask, ax_st,
+                        ax_vm, None, k, pv, cv, fa, fpv, fcv, fv,
+                        pc3=(pl, pc, pvl)
+                    )
+                )(
+                    batch.tokens,
+                    batch.eqn_ids,
+                    batch.residual_state,
+                    batch.preference,
+                    batch.vertex_idx,
+                    actions,
+                    batch.vertex_avail_mask,
+                    batch.axis_state,
+                    batch.axis_valid_mask,
+                    keys,
+                    batch.micro_pair_valid,
+                    batch.micro_compress_valid,
+                    face_actions_b,
+                    batch.face_pair_valid,
+                    batch.face_comp_valid,
+                    batch.face_valid,
+                    pc_logits, pc_ctx, pc_value,
+                )
+                if args.face_actions
+                else jax.vmap(
+                    lambda toks, eids, rs, pref, vidx, action, vmask, ax_st,
+                    ax_vm, k, pv, cv, pl, pc, pvl:
+                    _eval_dyn(
+                        toks, eids, rs, pref, vidx, action, vmask, ax_st,
+                        ax_vm, None, k, pv, cv, pc3=(pl, pc, pvl)
+                    )
+                )(
+                    batch.tokens,
+                    batch.eqn_ids,
+                    batch.residual_state,
+                    batch.preference,
+                    batch.vertex_idx,
+                    actions,
+                    batch.vertex_avail_mask,
+                    batch.axis_state,
+                    batch.axis_valid_mask,
+                    keys,
+                    batch.micro_pair_valid,
+                    batch.micro_compress_valid,
+                    pc_logits, pc_ctx, pc_value,
+                )
+            )
+        elif cached_flat is None:
             (
                 log_probs,
                 entropies,
@@ -3882,6 +4344,14 @@ def main():
             face_comp_valid=traj.face_comp_valid,
             face_valid=traj.face_valid,
             face_old_logp=traj.face_old_logp,
+            enc_M=traj.enc_M,
+            enc_I=traj.enc_I,
+            enc_cumhist=traj.enc_cumhist,
+            enc_nvalid=traj.enc_nvalid,
+            enc_pos=traj.enc_pos,
+            vmem_sums=traj.vmem_sums,
+            vmem_counts=traj.vmem_counts,
+            delta_owner=traj.delta_owner,
             estim_returns=estim_returns,
             norm_adv=norm_adv,
             vertex_avail_mask=traj.vertex_avail_mask,
@@ -4351,7 +4821,7 @@ def main():
                 log_dict[f"popart/sigma_{nm}"] = float(_sig[j])
 
         # ---- per-face apply telemetry ---------------------------------------
-        if args.per_face:
+        if args.per_face or args.face_actions:
             pf = consume_per_face_stats()
             if pf.get("applied", 0) or pf.get("skipped", 0):
                 log_dict["per_face/applied"] = pf.get("applied", 0)

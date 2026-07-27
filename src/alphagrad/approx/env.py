@@ -1558,8 +1558,17 @@ def _face_transforms_for_order(config, consts, args, o_list, specs_list,
         vertex_rules = decode_vertex_rule_specs(
             config.jaxpr, v, specs_list[k], is_last=(k == last)
         )
-        ij.eliminate(v, tuple(vertex_rules) if vertex_rules else (),
-                     out.get(v))
+        # Hook-wrap like the measurement/tokenizer paths do under per_face:
+        # a raw rule that doesn't fit one face's operand would hit the strict
+        # TRANSFORM-DID-NOT-FIT guard here — DURING KEY ENUMERATION — and
+        # kill the callback before measurement even starts (3b smoke: a
+        # policy-proposed Compress legal by the logical-axis oracle but
+        # unappliable on an implicit-dim edge's 1-D val).
+        ij.eliminate(
+            v,
+            (make_live_masked_hook(tuple(vertex_rules)),) if vertex_rules else (),
+            out.get(v),
+        )
     return out
 
 

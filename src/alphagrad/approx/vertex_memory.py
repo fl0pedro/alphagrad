@@ -69,6 +69,31 @@ def update(sums, counts, rows, eqn_ids, valid=None):
     return sums, counts
 
 
+def update_ids(sums, counts, rows, ids, valid=None):
+    """Fold ``rows`` (D, E) into the memory by EXPLICIT slot ids (D,).
+
+    Unlike :func:`update`, ``ids`` are already per-VERTEX slot indices
+    (``-1`` ⇒ the global slot), not per-token eqn ids. The incremental
+    encoder uses this: base-stream tokens map eqn→vertex positionally,
+    while a delta block's tokens all belong to the vertex whose
+    elimination emitted them — a mapping only the caller knows.
+    Same associativity guarantees as :func:`update`.
+    """
+    n_slots = sums.shape[0]
+    gid = n_slots - 1
+    slot = jnp.where(ids < 0, gid, jnp.minimum(ids, gid - 1)).astype(jnp.int32)
+
+    if valid is not None:
+        w = valid.astype(jnp.float32)
+        rows = rows * w[:, None]
+    else:
+        w = jnp.ones(rows.shape[0], jnp.float32)
+
+    sums = sums + jax.ops.segment_sum(rows, slot, num_segments=n_slots)
+    counts = counts + jax.ops.segment_sum(w, slot, num_segments=n_slots)
+    return sums, counts
+
+
 def read(sums, counts):
     """Per-slot mean, ``(V+1, E)``. Empty slots read as zeros."""
     return sums / jnp.maximum(counts, 1.0)[:, None]

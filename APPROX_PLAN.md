@@ -502,3 +502,35 @@ pointer/value read from vertex_memory (from_vertex_memory — written, tested,
 unwired); (4) FacePathPolicy conditions on the carry AFTER each face's
 emission (APPROX_PLAN §6 ordering: one extend per substep, none between the
 pre/post/new triple).
+
+STATUS: BUILT (--incremental-encode, default OFF). Deviations from the
+sketch, discovered during the build:
+
+* (2) needed NO env changes: pad id 0 never occurs in a real stream, so
+  stream length is `sum(tokens != 0)` and the delta window is gather-sliced
+  (`jnp.take` mode="fill") from the already-stored append-only buffer at
+  the carried `pos`. Delta ownership is the rollout's own `elim_order` —
+  the delta visible at step t was emitted by step t-1's elimination.
+* The mainline PalimpsaMixer's relational forget-gate counts same/earlier/
+  later over the WHOLE stream — acausal, unrepresentable in a carry. The
+  incremental path redefines the features CAUSALLY from a carried
+  cumulative eqn-id histogram (MAX_EQNS buckets, ALPHAGRAD_MAX_EQNS=4096).
+  Rollout and loss share the computation exactly; ratio-1 is between those
+  two, never against the full path (which stays byte-identical when the
+  flag is off).
+* Vertex-memory ids: base-stream eqn ids map to vertex slots positionally
+  (`eqn < total_v`, else global slot); delta rows land in the owner
+  vertex's slot; structural (eqn -1) rows in the global slot
+  (vertex_memory.update_ids).
+* Gradient truncates at the stored pre-step carry (flows through the last
+  delta + heads only) — the accepted cost of the carry-storage route.
+* next_value does a second extend per step (kept self-contained instead of
+  threading heads across scan iterations; deltas are O(hundreds) tokens).
+* (4) holds trivially at max_substeps=1: the face heads consume
+  vertex_contexts from the carry-derived heads_from_memory, and the step's
+  emission lands in the NEXT step's delta. Multi-substep re-extends are
+  still future work, gated on max_substeps>1 becoming real.
+
+Tests: tests/incremental_encode_test.py (chunked-extend bitwise, prefix
+property under nonzero rel_gate, vmem associativity, precomputed-hook
+sample/evaluate parity).
