@@ -1747,6 +1747,14 @@ def _callback(
     # ------------------------------------------------------------------
     # Compute family — graphax counters (always) → muls_adds_fmas, max_io_sum.
     # ------------------------------------------------------------------
+    # Phase breadcrumb (ALPHAGRAD_DEBUG_MEASURE=1): printed BEFORE the two
+    # heavy host phases (count pass here, XLA compile below) so a wedged
+    # process's log names the phase AND the plan. v15 post-mortem (job
+    # 55814): 234 GB RSS, GPUs idle, zero log output — undiagnosable.
+    _dbg_measure = os.environ.get("ALPHAGRAD_DEBUG_MEASURE", "0") == "1"
+    if _dbg_measure:
+        print(f"[measure] count-pass step={int(stop)} order={o_list}",
+              flush=True)
     _, aux = vertex_elimination_jaxpr(
         config.jaxpr,
         o_list,
@@ -1760,6 +1768,22 @@ def _callback(
     )
     muls_adds_fmas = float(aux["adds"] + aux["muls"] + aux["fmas"])
     max_io_sum = float(aux["mem"])
+
+    # WEDGE GUARD (v15 post-mortem): with the cos-sentinel gone, genuinely
+    # huge approximated graphs go all the way to XLA — one episode-6 plan
+    # wedged the host at 234 GB RSS with all GPUs idle (multi-thread compile
+    # spin, the v10-style stall). The count pass has already run here, so a
+    # symbolic-op ceiling refuses the monster BEFORE the compile. Healthy
+    # v15 plans measured ~4e12 muls; the default cap only fires on true
+    # blowups. Scored worst-in-every-channel like the degenerate guard.
+    _muls_cap = float(os.environ.get("ALPHAGRAD_MULS_SENTINEL_CAP", "5e13"))
+    if muls_adds_fmas > _muls_cap:
+        _record_degenerate_plan()
+        if _dbg_measure or os.environ.get("ALPHAGRAD_DEBUG_DEGEN", "0") == "1":
+            print(f"[degen] MULS-CAP muls={muls_adds_fmas:.3g} > "
+                  f"{_muls_cap:.3g} step={int(stop)} order={o_list}",
+                  flush=True)
+        return tokens, eqn_ids, _SENTINEL_BAD_REWARD
 
     # If no `target_fun` is supplied, we can't compile/execute. Skip every
     # execution-derived metric and return a partial reward vector.
@@ -1776,6 +1800,9 @@ def _callback(
     # ------------------------------------------------------------------
     # Compile both the approximated and exact jacobian functions once.
     # ------------------------------------------------------------------
+    if _dbg_measure:
+        print(f"[measure] compile step={int(stop)} "
+              f"muls={muls_adds_fmas:.3g}", flush=True)
     # ``--exec-on-gpu`` pins the reward harness to a GPU distinct from the
     # one the trainer (the main process) is loaded on — otherwise the
     # callback's compile/exec would deadlock against the main program's
