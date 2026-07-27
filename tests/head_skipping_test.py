@@ -35,6 +35,7 @@ def _action(op, i=0, j=0, quant=0):
         compress_kind=jnp.array(0, jnp.int32),
         quant_dtype=jnp.array(quant, jnp.int32),
         quant_scale_sign=jnp.array(1, jnp.int32),
+        quant_scale_frac=jnp.array(0.5, jnp.float32),
     )
 
 

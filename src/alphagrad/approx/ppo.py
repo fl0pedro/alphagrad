@@ -246,6 +246,7 @@ def _apply_mult_gate(
     gate_w: float,
     anti_degen_penalty: float,
     anti_degen_tau: float,
+    gate_fidelity: str = "frob",
 ) -> "jax.Array":
     """Multiplicative cosine-gate reward (``--reward-mode mult``).
 
@@ -270,9 +271,24 @@ def _apply_mult_gate(
     reward (which is ≥ 0). Non-terminal steps legitimately carry cos=0
     (sparse-terminal quality) and stay at the gated 0.
     """
-    cos = rewards[..., REWARD_INDEX["cosine_sim"]]              # (E, T)
+    # Fidelity source (user-directed 2026-07-27): default = 1 − frob_residual.
+    # cos is FLAT ZERO for every heavily-degraded plan (an all-zero Jacobian
+    # and a half-destroyed one both read ~0), so the gate and the anti-degen
+    # slope had no gradient exactly where training needs it. The relative
+    # Frobenius residual is 1.0 for an all-zero J_a and falls CONTINUOUSLY as
+    # the plan degrades less — fid = clip(1 − frob, 0, 1) makes "less zeroed"
+    # strictly better everywhere. frob is stored NEGATED in the reward vector,
+    # and only the TERMINAL step carries a real value (sparse-terminal
+    # quality), so fidelity is masked to the terminal step — mid-rollout
+    # frob=0 must not read as fid=1.
+    terminal = jnp.zeros(rewards.shape[:2], dtype=bool).at[:, -1].set(True)
+    if gate_fidelity == "frob":
+        fid_raw = 1.0 + rewards[..., REWARD_INDEX["frob_residual"]]
+    else:
+        fid_raw = rewards[..., REWARD_INDEX["cosine_sim"]]
+    fid = jnp.where(terminal, jnp.clip(fid_raw, 0.0, 1.0), 0.0)  # (E, T)
     denom = jnp.maximum(1.0 - gate_tau, 1e-6)
-    g = jnp.clip((cos - gate_tau) / denom, 0.0, 1.0)
+    g = jnp.clip((fid - gate_tau) / denom, 0.0, 1.0)
 
     cost_mag = -rewards                                          # (E, T, R)
     cost_sl = jnp.sign(cost_mag) * jnp.log1p(jnp.abs(cost_mag))
@@ -280,11 +296,13 @@ def _apply_mult_gate(
     cheapness = jnp.maximum(0.0, gate_w - weighted_cost)
     gated = g * cheapness
 
-    # Shaped anti-degeneracy penalty on the TERMINAL step only.
-    terminal = jnp.zeros(rewards.shape[:2], dtype=bool).at[:, -1].set(True)
-    degen = (cos < anti_degen_tau) & terminal
-    cos_basin = jnp.clip(cos, 0.0, anti_degen_tau)
-    shaped = -(anti_degen_penalty - cos_basin * anti_degen_penalty)
+    # Shaped anti-degeneracy penalty on the TERMINAL step only, keyed on the
+    # same fidelity as the gate — under frob fidelity the basin itself has a
+    # continuous slope (every marginally-less-destroyed Jacobian scores
+    # strictly better), which is what lets plans train OUT of all-zeros.
+    degen = (fid < anti_degen_tau) & terminal
+    fid_basin = jnp.clip(fid, 0.0, anti_degen_tau)
+    shaped = -(anti_degen_penalty - fid_basin * anti_degen_penalty)
     gated = jnp.where(degen, shaped, gated)
 
     out = jnp.zeros_like(rewards)
@@ -403,6 +421,7 @@ def _zero_face_action():
         exponents=jnp.zeros((F, S, MAX_PRIMES), jnp.int32),
         factor=z2, compress_kind=z2, quant_dtype=z2,
         quant_scale_sign=jnp.ones((F, S), jnp.int32),
+        quant_scale_frac=jnp.zeros((F, S), jnp.float32),
     )
 
 
@@ -472,6 +491,7 @@ class Trajectory(NamedTuple):
     micro_compress_kind_seq: jax.Array  # (max_substeps,) int32
     micro_quant_dtype_seq: jax.Array  # (max_substeps,) int32
     micro_quant_scale_sign_seq: jax.Array  # (max_substeps,) int32 — ±1
+    micro_quant_scale_frac_seq: jax.Array  # (max_substeps,) float32 — scale head u
     reward: jax.Array  # (NUM_REWARDS,) — full env emission, kept for host logging
     done: jax.Array
     value: jax.Array  # (NUM_VALUE_HEADS,) per-head value prediction
@@ -509,6 +529,7 @@ class Trajectory(NamedTuple):
     face_compress_kind: jax.Array # (MAX_FACES, FACE_SLOTS) int32
     face_quant_dtype: jax.Array   # (MAX_FACES, FACE_SLOTS) int32
     face_quant_scale_sign: jax.Array  # (MAX_FACES, FACE_SLOTS) int32
+    face_quant_scale_frac: jax.Array  # (MAX_FACES, FACE_SLOTS) float32
     face_pair_valid: jax.Array    # (MAX_FACES, N, N) float32
     face_comp_valid: jax.Array    # (MAX_FACES, N) float32
     face_valid: jax.Array         # (MAX_FACES,) float32
@@ -545,6 +566,7 @@ class TrainBatch(NamedTuple):
     micro_compress_kind_seq: jax.Array
     micro_quant_dtype_seq: jax.Array
     micro_quant_scale_sign_seq: jax.Array
+    micro_quant_scale_frac_seq: jax.Array
     old_vertex_dist: jax.Array
     old_pair_dists: jax.Array
     old_factor_dists: jax.Array
@@ -567,6 +589,7 @@ class TrainBatch(NamedTuple):
     face_compress_kind: jax.Array
     face_quant_dtype: jax.Array
     face_quant_scale_sign: jax.Array
+    face_quant_scale_frac: jax.Array
     face_pair_valid: jax.Array
     face_comp_valid: jax.Array
     face_valid: jax.Array
@@ -1511,6 +1534,8 @@ class Agent(eqx.Module):
             axis_state_v,
             compress_kinds=actions.compress_kind,
             quant_dtypes=actions.quant_dtype,
+            quant_scale_signs=actions.quant_scale_sign,
+            quant_scale_fracs=actions.quant_scale_frac,
         )
         if face_action is None:
             return StepAction(
@@ -1520,17 +1545,19 @@ class Agent(eqx.Module):
 
         # P1c: one spec row per (face, slot) — the same translator, run on
         # length-1 sequences; END translates to the all-(-1) unused row.
-        def _one(op, i, j, factor, kind, dtype):
+        def _one(op, i, j, factor, kind, dtype, qsign, qfrac):
             rows = micro_actions_to_rule_specs_jax(
                 op[None], i[None], j[None], factor[None], axis_state_v,
                 compress_kinds=kind[None], quant_dtypes=dtype[None],
+                quant_scale_signs=qsign[None], quant_scale_fracs=qfrac[None],
             )
             return rows[0]
 
         face_rows = jax.vmap(jax.vmap(_one))(
             face_action.op_type, face_action.i, face_action.j,
             face_action.factor, face_action.compress_kind,
-            face_action.quant_dtype,
+            face_action.quant_dtype, face_action.quant_scale_sign,
+            face_action.quant_scale_frac,
         )
         return StepAction(
             target_vertex=jnp.asarray(vertex_idx + 1, dtype=jnp.int32),
@@ -1639,6 +1666,17 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--anti-degen-tau", type=float, default=0.05,
                    help="mult mode: cosine threshold below which a TERMINAL "
                    "transition counts as degenerate.")
+    p.add_argument(
+        "--gate-fidelity",
+        type=str,
+        default="frob",
+        choices=["frob", "cos"],
+        help="mult mode's fidelity source. frob (default): 1 − frob_residual "
+        "— continuous through the heavy-degradation regime (an all-zero "
+        "Jacobian reads fid=0, every less-zeroed plan strictly higher), so "
+        "the gate and anti-degen slope train plans OUT of zeros. cos: the "
+        "legacy cosine gate (flat 0 across the degraded regime).",
+    )
     p.add_argument(
         "--reward-mode",
         type=str,
@@ -3421,6 +3459,7 @@ def main():
                 micro_compress_kind_seq = micro_actions.compress_kind
                 micro_quant_dtype_seq = micro_actions.quant_dtype
                 micro_quant_scale_sign_seq = micro_actions.quant_scale_sign
+                micro_quant_scale_frac_seq = micro_actions.quant_scale_frac
             env_out = env_obj.step(state, env_action)
             next_state = env_out.state
             raw_rewards = env_out.reward
@@ -3516,6 +3555,7 @@ def main():
                 micro_compress_kind_seq=micro_compress_kind_seq,
                 micro_quant_dtype_seq=micro_quant_dtype_seq,
                 micro_quant_scale_sign_seq=micro_quant_scale_sign_seq,
+                micro_quant_scale_frac_seq=micro_quant_scale_frac_seq,
                 reward=jnp.atleast_1d(rewards),
                 done=jnp.array(done, dtype=jnp.float32),
                 value=jnp.atleast_1d(value),
@@ -3542,6 +3582,7 @@ def main():
                 face_compress_kind=face_action.compress_kind,
                 face_quant_dtype=face_action.quant_dtype,
                 face_quant_scale_sign=face_action.quant_scale_sign,
+                face_quant_scale_frac=face_action.quant_scale_frac,
                 face_pair_valid=face_pair_v,
                 face_comp_valid=face_comp_v,
                 face_valid=face_valid_v,
@@ -3618,6 +3659,7 @@ def main():
             compress_kind=batch.micro_compress_kind_seq,
             quant_dtype=batch.micro_quant_dtype_seq,
             quant_scale_sign=batch.micro_quant_scale_sign_seq,
+            quant_scale_frac=batch.micro_quant_scale_frac_seq,
         )
         # P1c: the stored per-path decisions, as one vmapped pytree. None when
         # --face-actions is off (static) — evaluate then skips the face pass.
@@ -3632,6 +3674,7 @@ def main():
                 compress_kind=batch.face_compress_kind,
                 quant_dtype=batch.face_quant_dtype,
                 quant_scale_sign=batch.face_quant_scale_sign,
+                quant_scale_frac=batch.face_quant_scale_frac,
             )
             if args.face_actions
             else None
@@ -4158,6 +4201,7 @@ def main():
                 args.gate_w,
                 args.anti_degen_penalty,
                 args.anti_degen_tau,
+                gate_fidelity=args.gate_fidelity,
             )
         sl_reward = _symlog_rewards(traj_reward)  # (E, T, NUM_REWARDS)
         if args.loss_mode == "scalar":
@@ -4318,6 +4362,7 @@ def main():
             micro_compress_kind_seq=traj.micro_compress_kind_seq,
             micro_quant_dtype_seq=traj.micro_quant_dtype_seq,
             micro_quant_scale_sign_seq=traj.micro_quant_scale_sign_seq,
+            micro_quant_scale_frac_seq=traj.micro_quant_scale_frac_seq,
             old_vertex_dist=traj.vertex_dist,
             old_pair_dists=traj.pair_dists,
             old_factor_dists=traj.factor_dists,
@@ -4340,6 +4385,7 @@ def main():
             face_compress_kind=traj.face_compress_kind,
             face_quant_dtype=traj.face_quant_dtype,
             face_quant_scale_sign=traj.face_quant_scale_sign,
+            face_quant_scale_frac=traj.face_quant_scale_frac,
             face_pair_valid=traj.face_pair_valid,
             face_comp_valid=traj.face_comp_valid,
             face_valid=traj.face_valid,

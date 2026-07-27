@@ -1058,6 +1058,8 @@ def micro_actions_to_rule_specs_jax(
     axis_state_for_vertex,
     compress_kinds=None,
     quant_dtypes=None,
+    quant_scale_signs=None,   # (S,) int32 ±1 — negate head (arm select)
+    quant_scale_fracs=None,   # (S,) float32 [0,1] — scale head; <0 ⇒ legacy
 ):
     """JAX-traceable MicroAction → rule_specs (DIAG, COMPRESS, and QUANT).
 
@@ -1121,6 +1123,10 @@ def micro_actions_to_rule_specs_jax(
         compress_kinds = jnp.zeros_like(op_types)
     if quant_dtypes is None:
         quant_dtypes = jnp.zeros_like(op_types)
+    if quant_scale_signs is None:
+        quant_scale_signs = jnp.ones_like(op_types)
+    if quant_scale_fracs is None:
+        quant_scale_fracs = jnp.full(op_types.shape, -1.0, jnp.float32)
 
     is_end_per = (op_types == OP_END)
     prior_ends = (
@@ -1159,12 +1165,26 @@ def micro_actions_to_rule_specs_jax(
         compress_bi2 = i.astype(jnp.int32)
 
         # QUANT spec: bi1 = QUANT_SENTINEL (-3), bi2 = dtype index into
-        # :data:`QUANT_DTYPES`. The third column is unused for QUANT (kept
-        # at 0). ``_callback`` emits ``Quant(dtype=QUANT_DTYPES[bi2])`` and
-        # graphax's apply_quant casts ``val`` only.
+        # :data:`QUANT_DTYPES`. The third column carries the negate + scale
+        # heads: ``sign * (round(u*1e6) + 1)`` (0 = legacy auto-scale; see
+        # decode_vertex_rule_specs). ``_callback`` emits
+        # ``Quant(dtype, scale_sign, scale_frac)``.
         quant_used = active[s_idx] & is_quant[s_idx]
         quant_bi1 = jnp.asarray(QUANT_SENTINEL, dtype=jnp.int32)
         quant_bi2 = quant_dtypes[s_idx].astype(jnp.int32)
+        quant_enc = (
+            quant_scale_signs[s_idx].astype(jnp.int32)
+            * (
+                jnp.round(
+                    jnp.clip(quant_scale_fracs[s_idx], 0.0, 1.0) * 1e6
+                ).astype(jnp.int32)
+                + 1
+            )
+        )
+        # frac < 0 = "no scale head" sentinel → legacy row (enc 0).
+        quant_enc = jnp.where(
+            quant_scale_fracs[s_idx] >= 0.0, quant_enc, 0
+        ).astype(jnp.int32)
 
         # Compose the row. Priority: QUANT > COMPRESS > DIAG > unused —
         # the *_used flags are mutually exclusive because they each gate
@@ -1185,7 +1205,7 @@ def micro_actions_to_rule_specs_jax(
             ),
         ).astype(jnp.int32)
         f = jnp.where(
-            quant_used, jnp.asarray(0, dtype=jnp.int32),
+            quant_used, quant_enc,
             jnp.where(
                 compress_used, compress_kinds[s_idx],
                 jnp.where(diag_used, factors[s_idx], 0),
@@ -1433,13 +1453,25 @@ def decode_vertex_rule_specs(jaxpr, vertex, spec_rows, is_last: bool) -> tuple:
         if bi1 == -1:
             break  # end-of-sequence sentinel
         if bi1 == QUANT_SENTINEL:
-            # QUANT: row[1] indexes QUANT_DTYPES; row[2] unused. Quant doesn't
-            # touch axes or val.ndim, so it's safe on any vertex. Out-of-range
-            # dtype indices fall back to the first catalog entry.
+            # QUANT: row[1] indexes QUANT_DTYPES; row[2] carries the NEGATE +
+            # SCALE heads' choices as ``sign * (round(u * 1e6) + 1)``:
+            #   0        → legacy (sign +1, data-dependent absmax auto-scale)
+            #   ±(k+1)   → scale_sign = sign(row[2]), scale_frac = k / 1e6
+            # (the +1 keeps u=0 distinguishable from the legacy 0; the sign
+            # head's arm-select was previously TRAINED BUT DROPPED here —
+            # row[2] was written as 0 — so the engine always quantized the
+            # +1 arm regardless of the policy's pick.)
             dtype_idx = bi2
             if not (0 <= dtype_idx < len(QUANT_DTYPES)):
                 dtype_idx = 0
-            rules.append(Quant(dtype=QUANT_DTYPES[dtype_idx]))
+            enc = factor
+            if enc == 0:
+                rules.append(Quant(dtype=QUANT_DTYPES[dtype_idx]))
+            else:
+                _sign = 1 if enc > 0 else -1
+                _u = min(max((abs(enc) - 1) / 1e6, 0.0), 1.0)
+                rules.append(Quant(dtype=QUANT_DTYPES[dtype_idx],
+                                   scale_sign=_sign, scale_frac=_u))
             continue
         if bi1 == COMPRESS_SENTINEL:
             # COMPRESS: physical axis row[1], kind row[2]. Only honored on the
@@ -2083,7 +2115,14 @@ def _callback(
     # always for; it had never been wired up.
     if is_terminal:
         _no_work = (muls_adds_fmas <= 0.0) and (flops <= 0.0)
-        _no_jac = float(cosine_sim) <= 1e-6
+        # cos≈0 is NO LONGER sentinelled (user-directed): a destroyed
+        # Jacobian now reports its REAL measurements, and the quality
+        # gradient comes from frob_residual — ||J_e−J_a||_F/||J_e||_F is
+        # exactly 1.0 for an all-zero J_a and falls continuously as the
+        # plan degrades less, so "hard degrading" plans train instead of
+        # vanishing into a flat sentinel basin. Only the zero-WORK plan
+        # (fake-best costs, the reward hack) still sentinels.
+        _no_jac = False
         if _no_work or _no_jac:
             _record_degenerate_plan()
             if os.environ.get("ALPHAGRAD_DEBUG_DEGEN", "0") == "1":

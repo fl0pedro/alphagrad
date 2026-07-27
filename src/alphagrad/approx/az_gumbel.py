@@ -413,6 +413,8 @@ def learned_micro(state, vertex, key):
         acts.op_type, acts.i, acts.j, acts.factor,
         env.axis_state_static[v_idx],
         compress_kinds=acts.compress_kind, quant_dtypes=acts.quant_dtype,
+        quant_scale_signs=acts.quant_scale_sign,
+        quant_scale_fracs=acts.quant_scale_frac,
     )
     try:
         rules = _decode_rows(jaxpr, int(vertex), np.asarray(rows).tolist(),

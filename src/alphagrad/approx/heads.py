@@ -895,7 +895,11 @@ class MicroAction(NamedTuple):
     factor: jax.Array
     compress_kind: jax.Array
     quant_dtype: jax.Array
-    quant_scale_sign: jax.Array  # ±1 — the FactoredQuantHead's scale-sign pick
+    quant_scale_sign: jax.Array  # ±1 — the negate head's arm-select pick
+    # Scale head: u ∈ [0,1] → pre-round multiplier dtype_max**u (log-ramp
+    # between 1 and the target's max), inverse folded into scalar_mult.
+    # 0.0 for non-QUANT steps.
+    quant_scale_frac: jax.Array  # float32
 
 
 class CompressKindHead(eqx.Module):
@@ -962,17 +966,23 @@ class FactoredQuantHead(eqx.Module):
 
     sign_head: eqx.nn.Linear
     factor_heads: tuple
+    # Continuous scale head: (embd,) → Beta(α, β) concentrations over u∈(0,1).
+    # α,β = 1 + softplus(raw) keeps the density unimodal and finite at the
+    # (clipped) boundaries, so sample- and evaluate-time log-probs match on
+    # the stored u exactly (ratio-1).
+    scale_head: eqx.nn.Linear
     vocab_sizes: tuple = eqx.field(static=True)
 
     def __init__(self, embd_dim: int, *, key):
         vocab_sizes = quant_factor_tables().vocab_sizes
         self.vocab_sizes = vocab_sizes
-        keys = jrand.split(key, NUM_FACTORS + 1)
+        keys = jrand.split(key, NUM_FACTORS + 2)
         self.sign_head = eqx.nn.Linear(embd_dim, NUM_SCALE_SIGNS, key=keys[0])
         self.factor_heads = tuple(
             eqx.nn.Linear(embd_dim, vf, key=keys[i + 1])
             for i, vf in enumerate(vocab_sizes)
         )
+        self.scale_head = eqx.nn.Linear(embd_dim, 2, key=keys[NUM_FACTORS + 1])
 
     def _factor_dist(self, f: int, summary, picks):
         """Masked softmax + legal mask for factor ``f`` given ``picks[:f]``."""
@@ -984,11 +994,20 @@ class FactoredQuantHead(eqx.Module):
     def _sign_dist(self, summary):
         return jnn.softmax(self.sign_head(summary), axis=-1)
 
+    def _scale_beta(self, summary):
+        raw = self.scale_head(summary)
+        alpha = 1.0 + jnn.softplus(raw[0])
+        beta = 1.0 + jnn.softplus(raw[1])
+        return distrax.Beta(alpha, beta)
+
     def sample(self, summary, key):
-        """Sample a dtype factor-by-factor. Returns ``(dtype_idx, scale_sign)``:
-        the QUANT_DTYPES global index and ±1."""
+        """Sample a dtype factor-by-factor. Returns
+        ``(dtype_idx, scale_sign, scale_frac)``: the QUANT_DTYPES global
+        index, the negate head's ±1 arm pick, and the scale head's
+        continuous u ∈ (0,1) (clipped off the boundaries so the Beta
+        log-prob stays finite when re-scored at evaluate time)."""
         tables = quant_factor_tables()
-        keys = jrand.split(key, NUM_FACTORS + 1)
+        keys = jrand.split(key, NUM_FACTORS + 2)
         picks = jnp.zeros(NUM_FACTORS, dtype=jnp.int32)
         for f in range(NUM_FACTORS):
             dist, _ = self._factor_dist(f, summary, picks)
@@ -998,9 +1017,13 @@ class FactoredQuantHead(eqx.Module):
         sign_idx = distrax.Categorical(probs=self._sign_dist(summary)).sample(
             seed=keys[NUM_FACTORS])
         scale_sign = jnp.where(sign_idx == 0, 1, -1).astype(jnp.int32)
-        return dtype_idx, scale_sign
+        scale_frac = jnp.clip(
+            self._scale_beta(summary).sample(seed=keys[NUM_FACTORS + 1]),
+            1e-4, 1.0 - 1e-4,
+        ).astype(jnp.float32)
+        return dtype_idx, scale_sign, scale_frac
 
-    def log_prob(self, summary, dtype_idx, scale_sign):
+    def log_prob(self, summary, dtype_idx, scale_sign, scale_frac):
         """Joint log-prob + entropy + arity for a stored ``(dtype, sign)``.
 
         The factor picks are re-derived from the stored dtype so the per-factor
@@ -1027,6 +1050,14 @@ class FactoredQuantHead(eqx.Module):
         sign_idx = (scale_sign < 0).astype(jnp.int32)        # +1->0, -1->1
         log_p = log_p + jnp.log(sign_dist[sign_idx] + 1e-8)
         entropy = entropy - jnp.sum(sign_dist * jnp.log(sign_dist + 1e-8))
+        arity = arity + 1.0
+        # scale head: Beta log-density of the stored u — identical clip as
+        # sample time so re-scoring the stored value is exact. (Differential
+        # entropy — can be negative; fine for the entropy bonus.)
+        sb = self._scale_beta(summary)
+        u = jnp.clip(scale_frac.astype(jnp.float32), 1e-4, 1.0 - 1e-4)
+        log_p = log_p + sb.log_prob(u)
+        entropy = entropy + sb.entropy()
         arity = arity + 1.0
         return log_p, entropy, arity
 
@@ -1161,7 +1192,8 @@ class MicroActionHead(eqx.Module):
         # mantissa / bias / finite / uz) plus a scale_sign, each masked to keep
         # a real dtype reachable. Runs unconditionally; masked out for non-QUANT
         # steps in log_prob_step.
-        quant_dtype_idx, quant_scale_sign = self.quant_head.sample(summary, k_quant)
+        quant_dtype_idx, quant_scale_sign, quant_scale_frac = (
+            self.quant_head.sample(summary, k_quant))
 
         # Force i/j/exponents/kind/quant to canonical values for non-emitting
         # ops so the recorded action is unambiguous. The masking in
@@ -1173,12 +1205,16 @@ class MicroActionHead(eqx.Module):
         kind_out = jnp.where(is_compress, kind_idx, 0).astype(jnp.int32)
         quant_out = jnp.where(is_quant, quant_dtype_idx, 0).astype(jnp.int32)
         quant_sign_out = jnp.where(is_quant, quant_scale_sign, 1).astype(jnp.int32)
+        quant_frac_out = jnp.where(
+            is_quant, quant_scale_frac, 0.0
+        ).astype(jnp.float32)
 
         action = MicroAction(
             op_type=op_type.astype(jnp.int32),
             i=i_out, j=j_out, exponents=exp_out, factor=factor_out,
             compress_kind=kind_out, quant_dtype=quant_out,
             quant_scale_sign=quant_sign_out,
+            quant_scale_frac=quant_frac_out,
         )
         return (
             action, factor_out, op_dist, i_dist, j_dist, exp_dists, kind_dist,
@@ -1280,7 +1316,8 @@ class MicroActionHead(eqx.Module):
         # store it and old_micro_log_prob_for_action can reuse it directly —
         # there is no flat dtype dist to store.
         lp_quant, ent_quant, arity_quant = self.quant_head.log_prob(
-            summary, action.quant_dtype, action.quant_scale_sign)
+            summary, action.quant_dtype, action.quant_scale_sign,
+            action.quant_scale_frac)
         quant_active = is_quant.astype(jnp.float32)
 
         log_p = (
@@ -1709,6 +1746,7 @@ class FaceAction(NamedTuple):
     compress_kind: jax.Array     # (F, S) int32
     quant_dtype: jax.Array       # (F, S) int32
     quant_scale_sign: jax.Array  # (F, S) int32
+    quant_scale_frac: jax.Array  # (F, S) float32 — scale head's u ∈ [0,1]
 
 
 class FacePathPolicy(eqx.Module):
@@ -1859,6 +1897,7 @@ class FacePathPolicy(eqx.Module):
             compress_kind=_stack("compress_kind"),
             quant_dtype=_stack("quant_dtype"),
             quant_scale_sign=_stack("quant_scale_sign"),
+            quant_scale_frac=_stack("quant_scale_frac"),
         )
         return (fa, logp, ent, arity, jnp.stack(skip_probs),
                 jnp.stack(op_dists).reshape(F, S, -1),
@@ -1912,6 +1951,7 @@ class FacePathPolicy(eqx.Module):
                     compress_kind=fa.compress_kind[f, s],
                     quant_dtype=fa.quant_dtype[f, s],
                     quant_scale_sign=fa.quant_scale_sign[f, s],
+                    quant_scale_frac=fa.quant_scale_frac[f, s],
                 )
                 lp, e, ar, op_d, *_rest = self.head.log_prob_step(
                     action, summary, axis_tokens, features.size, op_legal,
