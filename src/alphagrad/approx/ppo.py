@@ -93,6 +93,7 @@ from alphagrad.approx.env import (
     MAX_TOKENS,
     MAX_DELTA_TOKENS,
     consume_token_length_stats,
+    COMPUTE_REWARD_INDICES,
     NUM_AXIS_PAIRS,
     NUM_REWARDS,
     REWARD_INDEX,
@@ -4296,7 +4297,28 @@ def main():
         # the value target, so nothing trains ON the sentinel. The row is still
         # sentinelled everywhere it is RANKED (top-N, best_global, Pareto), so
         # a degenerate plan can never be crowned — it simply teaches nothing.
-        _is_degen = jnp.any(traj.reward <= (SENTINEL_COST * 0.5), axis=-1)  # (E,T)
+        # DEGENERACY DETECTION — must identify the SENTINEL, not "a big number".
+        #
+        # THE ep-39 CLIFF BUG (v16 post-mortem, found from the observation that
+        # the PPO loss stayed smooth while muls_adds_fmas spiked): this read
+        #     jnp.any(traj.reward <= SENTINEL_COST * 0.5)   # any channel <= -5e9
+        # over ALL EIGHT channels. Channel 0 is -muls_adds_fmas and channel 3
+        # is -max_io_sum — RAW SYMBOLIC COUNTS, legitimately ~4e12 on nn256.
+        # So every plan doing more than 5e9 ops tripped the test, was declared
+        # "degenerate", and had its advantage multiplied by zero. The ONLY
+        # transitions that kept a policy gradient were the ones with tiny op
+        # counts — i.e. the near-zero-work plans. The trainer was therefore
+        # reinforcing degeneracy by construction, and the loss looked healthy
+        # the whole time precisely BECAUSE almost every advantage was 0.
+        #
+        # The sentinel is an exact vector: -1e10 in all six cost channels
+        # (cosine 0.0, frob -1.0). Require ALL cost channels at it — no real
+        # plan is simultaneously 10 s slow, 10 GB, and 1e10-op in one row —
+        # and use a tight bound so a merely expensive plan can never qualify.
+        _SENT_CH = jnp.asarray(COMPUTE_REWARD_INDICES, dtype=jnp.int32)
+        _is_degen = jnp.all(
+            traj.reward[..., _SENT_CH] <= (SENTINEL_COST * 0.99), axis=-1
+        )  # (E,T)
         _live = (~_is_degen).astype(jnp.float32)[..., None]                # (E,T,1)
         advantages = advantages * _live
 

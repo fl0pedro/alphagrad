@@ -1801,13 +1801,41 @@ def _callback(
     max_io_sum = float(aux["mem"])
     _pf("cb.count_pass")
 
+    # SOFT SENTINEL (v16 post-mortem, ep-39 cliff). The hard ±1e10 sentinel
+    # plus the trainer's "degenerate steps are NEUTRAL (advantage 0)" rule
+    # created an absorbing basin: once the value baseline rises, a measured-
+    # but-mediocre plan earns a NEGATIVE advantage while a degenerate plan
+    # earns exactly 0 — degeneracy becomes the safe haven and the policy
+    # ratchets into zero-work compress/quant spam (observed: all-16 plans
+    # no_work, frob=1, ~78 quants + ~14 compresses, WITHOUT PopArt, so not
+    # a normaliser artifact). A refused plan now reports FINITE, realistic-
+    # worst channel values — strictly worse than any real plan (100 ms
+    # latency, 2 GB peak, frob 1) yet only a bounded symlog step below the
+    # measured population, so it takes an ORDINARY negative advantage and
+    # trains the policy AWAY instead of sheltering it. The magnitudes stay
+    # far under the trainer's sentinel-detection threshold (|5e9|), so the
+    # advantage-neutralisation branch never fires for them.
+    # ALPHAGRAD_DEGEN_SOFT=0 restores the hard sentinel.
+    def _degen_reward():
+        if os.environ.get("ALPHAGRAD_DEGEN_SOFT", "1") != "1":
+            return _SENTINEL_BAD_REWARD
+        lat_w = float(os.environ.get("ALPHAGRAD_DEGEN_LAT_NS", "1e8"))
+        mem_w = float(os.environ.get("ALPHAGRAD_DEGEN_MEM_B", "2e9"))
+        return jnp.array(
+            [
+                -muls_adds_fmas, 0.0, -lat_w, -max_io_sum,
+                0.0, -mem_w, 0.0, -1.0,
+            ],
+            dtype=jnp.float32,
+        )
+
     # WEDGE GUARD (v15 post-mortem): with the cos-sentinel gone, genuinely
     # huge approximated graphs go all the way to XLA — one episode-6 plan
     # wedged the host at 234 GB RSS with all GPUs idle (multi-thread compile
     # spin, the v10-style stall). The count pass has already run here, so a
     # symbolic-op ceiling refuses the monster BEFORE the compile. Healthy
     # v15 plans measured ~4e12 muls; the default cap only fires on true
-    # blowups. Scored worst-in-every-channel like the degenerate guard.
+    # blowups.
     _muls_cap = float(os.environ.get("ALPHAGRAD_MULS_SENTINEL_CAP", "5e13"))
     if muls_adds_fmas > _muls_cap:
         _record_degenerate_plan()
@@ -1815,7 +1843,7 @@ def _callback(
             print(f"[degen] MULS-CAP muls={muls_adds_fmas:.3g} > "
                   f"{_muls_cap:.3g} step={int(stop)} order={o_list}",
                   flush=True)
-        return tokens, eqn_ids, _SENTINEL_BAD_REWARD
+        return tokens, eqn_ids, _degen_reward()
 
     # If no `target_fun` is supplied, we can't compile/execute. Skip every
     # execution-derived metric and return a partial reward vector.
@@ -2185,7 +2213,7 @@ def _callback(
         # vanishing into a flat sentinel basin. Only the zero-WORK plan
         # (fake-best costs, the reward hack) still sentinels.
         _no_jac = False
-        if _no_work or _no_jac:
+        if _no_work:
             _record_degenerate_plan()
             if os.environ.get("ALPHAGRAD_DEBUG_DEGEN", "0") == "1":
                 # Name the culprit: which condition fired, the raw channel
@@ -2209,7 +2237,10 @@ def _callback(
                     f"order={o_list}",
                     flush=True,
                 )
-            return tokens, eqn_ids, _SENTINEL_BAD_REWARD
+            # Soft-worst, NOT the measured values: a zero-work plan measures
+            # fake-fast (floor latency, tiny peak), which is exactly the
+            # reward hack this guard exists to block.
+            return tokens, eqn_ids, _degen_reward()
 
     return tokens, eqn_ids, rewards
 
