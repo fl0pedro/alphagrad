@@ -1969,6 +1969,22 @@ def _callback(
             .compile()
         )
 
+    # The EXACT compile ignores `transforms` / `face_transforms` entirely (see
+    # _do_compile_exact above — it only takes o_list + config + arg shapes), so
+    # keying it on the approximation specs makes two envs that picked the SAME
+    # ORDER with different approximations compile a byte-identical executable
+    # twice. Narrow the exact key to what the exact executable actually depends
+    # on. Bit-identical result, strictly more cache-friendly.
+    h_ex = hashlib.blake2b(digest_size=16)
+    h_ex.update(np.asarray(partial_order, dtype=np.int32).tobytes())
+    for a in args_for_lower:
+        if hasattr(a, "shape") and hasattr(a, "dtype"):
+            h_ex.update(repr(a.shape).encode())
+            h_ex.update(repr(a.dtype).encode())
+    if callback_device is not None:
+        h_ex.update(repr(callback_device).encode())
+    exact_cache_key = h_ex.digest()
+
     compiled_approx = cached_compile(b"approx:" + cache_key, _do_compile_approx)
     # ``compiled_exact`` is ONLY needed for the quality metrics
     # (cosine_sim, frob_residual). Those are meaningful only when the
@@ -1978,7 +1994,8 @@ def _callback(
     # the compile + execute when the step is non-terminal; the cache
     # entry would never be re-used productively anyway.
     if is_terminal:
-        compiled_exact = cached_compile(b"exact:" + cache_key, _do_compile_exact)
+        compiled_exact = cached_compile(
+            b"exact:" + exact_cache_key, _do_compile_exact)
     else:
         compiled_exact = None
     _pf("cb.xla_compile")

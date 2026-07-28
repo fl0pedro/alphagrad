@@ -1278,6 +1278,7 @@ class Agent(eqx.Module):
         oracle_comp_all=None,     # (total_v+1, N) live per-vertex COMPRESS mask
         face_masks_all=None,      # P1c: (fpair (V+1,F,N,N), fcomp (V+1,F,N), fvalid (V+1,F))
         precomputed=None,         # 3b: (vertex_logits, vertex_contexts, value) from the carry path
+        oracle_fn=None,           # perf: called with the SAMPLED vertex, returns that vertex's masks only
     ):
         """Same as :meth:`sample_action` but routes the rule head through
         :class:`MicroActionPolicy`. ``axis_state`` and ``axis_valid_mask``
@@ -1325,7 +1326,17 @@ class Agent(eqx.Module):
         # are 1-based; vertex_idx is 0-based). These are the authoritative masks
         # that keep the micro DIAG head from proposing a per-face-invalid pair;
         # stored (v_pair/v_comp) so the loss re-masks identically -> ratio 1.
-        if oracle_pair_all is not None:
+        # Per-vertex legality masks. `oracle_fn` (perf path) probes ONLY the
+        # vertex just sampled and returns its rows directly; the all-vertex
+        # arrays are the equivalent legacy path (row `vertex_idx + 1` — the
+        # oracle is 1-based). Values are identical either way.
+        _face_from_fn = None
+        if oracle_fn is not None:
+            _o = oracle_fn(vertex_idx)
+            v_pair, v_comp = _o[0], _o[1]
+            _sample_pair, _sample_comp = v_pair, v_comp
+            _face_from_fn = (_o[2], _o[3], _o[4])
+        elif oracle_pair_all is not None:
             v_pair = oracle_pair_all[vertex_idx + 1]
             v_comp = oracle_comp_all[vertex_idx + 1]
             _sample_pair, _sample_comp = v_pair, v_comp
@@ -1367,11 +1378,15 @@ class Agent(eqx.Module):
         # P1c: per-path decisions for the chosen vertex, from the SAME
         # v_context/features the micro path used (no extra full encode).
         face_out = None
-        if face_masks_all is not None and self.face_path_policy is not None:
-            _fp_all, _fc_all, _fv_all = face_masks_all
-            f_pair = _fp_all[vertex_idx + 1]
-            f_comp = _fc_all[vertex_idx + 1]
-            f_valid = _fv_all[vertex_idx + 1]
+        _have_faces = (_face_from_fn is not None) or (face_masks_all is not None)
+        if _have_faces and self.face_path_policy is not None:
+            if _face_from_fn is not None:
+                f_pair, f_comp, f_valid = _face_from_fn
+            else:
+                _fp_all, _fc_all, _fv_all = face_masks_all
+                f_pair = _fp_all[vertex_idx + 1]
+                f_comp = _fc_all[vertex_idx + 1]
+                f_valid = _fv_all[vertex_idx + 1]
             face_key = jrand.fold_in(micro_key, 7)
             fa, face_logp, face_ent, _far, _skp, _fod, _fql = (
                 self.face_path_policy.sample(
@@ -3076,6 +3091,75 @@ def main():
             order, spec_hist, step_count, vmap_method="sequential",
         )
 
+    # ---- single-vertex oracle (ALPHAGRAD_ORACLE_ONE_VERTEX=1, default) ----
+    # The all-vertex variants above probe every one of the ~13 vertices —
+    # 4 tracing probes each — but the policy reads exactly ONE row
+    # (`oracle_*_all[vertex_idx + 1]`). The vertex distribution provably does
+    # NOT depend on the oracle (it is softmax(vertex_logits) masked by
+    # vertex_avail_mask only), so the callback can run AFTER the vertex is
+    # sampled and probe just that vertex: 4x(13-k) probes/step -> 4.
+    # Values are bit-identical (same LVMO, same prefix replay, same
+    # face_masks(chosen_v)); only the discarded rows disappear. The stored
+    # masks the loss re-reads are unchanged, so ratio-1 is untouched.
+    def _oracle_replay(eo, specs, n):
+        o = _LVMO(_oracle_jaxpr, _oracle_consts, _oracle_args, _oracle_argnums,
+                  max_axes=_oracle_N)
+        for k in range(n):
+            v = int(eo[k])
+            try:
+                rules = _decode_specs(
+                    _oracle_jaxpr, v, specs[k], is_last=(k == n - 1)
+                )
+            except Exception:
+                rules = ()
+            try:
+                o.advance(v, rules=rules)
+            except Exception:
+                break
+        return o
+
+    def _oracle_one_host(order, spec_hist, step_count, vertex_idx):
+        _pt0 = _prof_time.perf_counter()
+        try:
+            eo = np.asarray(order).reshape(-1)
+            specs = np.asarray(spec_hist)
+            n = int(np.asarray(step_count))
+            v = int(np.asarray(vertex_idx)) + 1   # policy 0-based -> oracle 1-based
+            F, N = _F_FACES, _oracle_N
+            o = _oracle_replay(eo, specs, n)
+            pair, comp = o.masks(candidates=[v])
+            fp_arr = np.zeros((F, N, N), np.float32)
+            fc_arr = np.zeros((F, N), np.float32)
+            fv_arr = np.zeros((F,), np.float32)
+            try:
+                fp, fc, nf = o.face_masks(v, F)
+                fp_arr[:] = np.asarray(fp, np.float32)
+                fc_arr[:] = np.asarray(fc, np.float32)
+                fv_arr[: int(nf)] = 1.0
+            except Exception:
+                pass
+            return (np.asarray(pair[v], np.float32),
+                    np.asarray(comp[v], np.float32), fp_arr, fc_arr, fv_arr)
+        finally:
+            _env_prof_add("oracle.one_vertex",
+                          _prof_time.perf_counter() - _pt0)
+
+    def _oracle_one(order, spec_hist, step_count, vertex_idx):
+        F, N = _F_FACES, _oracle_N
+        return jax.pure_callback(
+            _oracle_one_host,
+            (jax.ShapeDtypeStruct((N, N), jnp.float32),
+             jax.ShapeDtypeStruct((N,), jnp.float32),
+             jax.ShapeDtypeStruct((F, N, N), jnp.float32),
+             jax.ShapeDtypeStruct((F, N), jnp.float32),
+             jax.ShapeDtypeStruct((F,), jnp.float32)),
+            order, spec_hist, step_count, vertex_idx,
+            vmap_method="sequential",
+        )
+
+    _ORACLE_ONE_VERTEX = os.environ.get(
+        "ALPHAGRAD_ORACLE_ONE_VERTEX", "1") == "1"
+
     total_v = len(closed_jaxpr.jaxpr.eqns)
     num_valid = len(env.valid_vertices)
     print(
@@ -3415,7 +3499,19 @@ def main():
                 # (replayed from the elimination prefix so far). Under
                 # --face-actions the same host replay also returns the
                 # PER-FACE masks for every candidate vertex.
-                if args.face_actions:
+                oracle_one_fn = None
+                if _ORACLE_ONE_VERTEX:
+                    # Perf path: defer the probe until the vertex is known,
+                    # then probe ONLY that vertex (see _oracle_one).
+                    _st_o, _st_s, _st_k = (
+                        state.order, state.sparsity_specs, state.step_count)
+
+                    def oracle_one_fn(_v, _o=_st_o, _s=_st_s, _k=_st_k):
+                        return _oracle_one(_o, _s, _k, _v)
+
+                    oracle_pair_all = oracle_comp_all = None
+                    face_masks_all = None
+                elif args.face_actions:
                     (oracle_pair_all, oracle_comp_all, _fp_all, _fc_all,
                      _fv_all) = _oracle_face_masks(
                         state.order, state.sparsity_specs, state.step_count)
@@ -3455,6 +3551,7 @@ def main():
                     oracle_comp_all=oracle_comp_all,
                     face_masks_all=face_masks_all,
                     precomputed=precomputed,
+                    oracle_fn=oracle_one_fn,
                 )
                 # Record this vertex in the elimination prefix for the next
                 # step's oracle replay.
