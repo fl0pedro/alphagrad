@@ -1726,12 +1726,15 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--advantage-norm", type=str, default="popart",
-        choices=["popart", "zscore"],
+        choices=["popart", "zscore", "none"],
         help="popart (default): per-channel debiased-EMA normalisation of "
         "value targets + sigma-scaled advantages, with an output-preserving "
         "head rescale. zscore: the legacy per-batch z-score, which has a "
         "collapse ratchet (a uniformly-degenerate batch drives std->0 so the "
-        "opposing channel vanishes).",
+        "opposing channel vanishes). none: NO adaptive normalisation — "
+        "advantages stay in raw symlog units and the CLI --lambda-* weights "
+        "are the ONLY scaling (manual-weight mode; reward semantics are "
+        "stationary across the whole run).",
     )
     p.add_argument("--popart-beta", type=float, default=1e-2,
                    help="PopArt EMA rate per update.")
@@ -4319,6 +4322,23 @@ def main():
             estim_returns = jnp.where(
                 _live > 0.5, (estim_returns - new_mu) / new_sigma, traj.value)
             norm_adv_components = advantages / new_sigma
+        elif args.advantage_norm == "none":
+            new_m1, new_m2, new_w = popart_m1, popart_m2, popart_w
+            # MANUAL-WEIGHT MODE (user-directed): no adaptive statistics
+            # anywhere. The symlog channel compression is the only implicit
+            # scaling; the --lambda-* weights (via traj.preference below) are
+            # the explicit one. Reward semantics are stationary — a given
+            # plan scores the same at ep 5 and ep 500, so "up and down then
+            # stays down" cannot be a normaliser drifting under the policy.
+            # Degenerate steps keep the PopArt-style neutral target: the
+            # value loss compares symlog(target) to the head's own output, so
+            # substituting symexp(value) makes that step's loss ~0.
+            norm_adv_components = advantages
+            estim_returns = jnp.where(
+                _live > 0.5,
+                estim_returns,
+                inverse_reward_normalization_fn(traj.value),
+            )
         else:
             new_m1, new_m2, new_w = popart_m1, popart_m2, popart_w
 
