@@ -125,17 +125,41 @@ def test_sparse_dim_may_only_pair_with_its_partner():
     assert mask[1, 3], "two free dense dims may always be paired"
 
 
-def test_compress_then_diag_drops_the_implicit_dim():
-    """The composed lhs/rhs/res case: once Compress drops a physical axis, no
-    Diag may touch that dim again."""
+def test_compress_then_diag_is_admitted_and_applies():
+    """COMPRESS -> DIAG IS LEGAL (inverted 2026-07-28).
+
+    This test used to assert the opposite — that an implicit dim must be
+    masked out of every Diag pair. That belief was wrong and load-bearing:
+    it made DIAG progressively illegal as COMPRESS fired, while QUANT is
+    never masked, so the only always-available operator was the annihilating
+    one and the environment ratcheted the policy toward destruction.
+
+    An implicit dim is broadcast-UNIFORM, not absent, so block-masking it is
+    a valid tightening needing no physical axis. Measured: dense() on the
+    result is bit-identical to the dense block-mask oracle, and end-to-end
+    jacve with [Compress, Diag] matches at cos = 1.0.
+
+    The contract now: every pair the mask admits must actually APPLY.
+    """
     st = apply_compress(_dense2x2(), Compress(axes=(1,), kind="mean"))
     dims = tuple(st.out_dims) + tuple(st.primal_dims)
     implicit = [k for k, d in enumerate(dims) if d.axis is None]
     assert implicit, "the Compress should have made a dim implicit"
+
     mask = diag_valid_mask(st, MAX_DIMS)
-    for k in implicit:
-        assert not mask[k].any() and not mask[:, k].any(), (
-            f"dim {k} is implicit and must be masked out of every Diag pair")
+    n = len(dims)
+    admitted = [(i, j) for i in range(n) for j in range(n) if mask[i, j]]
+    assert admitted, "no Diag pair admitted after Compress — the ratchet is back"
+    assert any(i in implicit or j in implicit for i, j in admitted), (
+        "no pair touching an implicit dim was admitted")
+
+    # Whatever the mask admits must actually APPLY — no mask/engine drift.
+    for (i, j) in admitted:
+        g = diag_pair_gcd(st, i, j)
+        for f in range(2, g + 1):
+            if g % f:
+                continue
+            apply_diag(st, Diag(i=i, j=j, factor=int(f)))  # must not raise
 
 
 def test_diag_pair_gcd_bounds_the_factor():

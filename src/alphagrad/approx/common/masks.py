@@ -195,9 +195,11 @@ def diag_valid_mask(st, max_dims: int) -> np.ndarray:  # noqa: F821 (uses diag_p
     * **neither side is already spoken for** -- a dim with ``is_sparse`` is
       already paired through ``other_id``, so its only legal partner is that
       partner. Two dense (free) dims may always be paired;
-    * **neither side is implicit** (``axis is None``) -- such a dim has no
-      physical axis to diagonalise, either because it was never materialised
-      or because an earlier ``Compress`` in the same sub-episode dropped it.
+    An IMPLICIT side (``axis is None``) is NO LONGER excluded: such a dim is
+    broadcast-constant, not absent, so block-masking it is a valid tightening
+    that needs no physical axis (measured bit-identical to the dense oracle).
+    The one implicit case that stays out -- an already-coupled pure diagonal --
+    is removed by the ``span <= 1`` no-op filter below.
 
     Entries past the tensor's real rank stay ``False``, so the mask can be
     emitted at a fixed ``max_dims`` for a statically-shaped policy head.
@@ -213,12 +215,26 @@ def diag_valid_mask(st, max_dims: int) -> np.ndarray:  # noqa: F821 (uses diag_p
             if (i < n_out) == (j < n_out):
                 continue  # both out, or both primal -> not a diagonal
             di, dj = dims[i], dims[j]
-            # An IMPLICIT dim (axis is None) has no physical axis to
-            # block-diagonalise -- it was never materialised, or a prior
-            # Compress in this same sub-episode dropped it. graphax rejects
-            # such a pair outright, so it must be masked out here.
-            if di.axis is None or dj.axis is None:
-                continue
+            # COMPRESS -> DIAG IS LEGAL (2026-07-28).
+            #
+            # This used to skip any pair with an implicit (axis=None) side,
+            # mirroring a graphax guard that has since been shown wrong by
+            # measurement: mixed and both-implicit-dense pairs densify
+            # bit-identically to the dense block-mask oracle, and end-to-end
+            # jacve with [Compress, Diag] matches at cos = 1.0. An implicit dim
+            # is UNIFORM (broadcast-constant), not absent, so block-masking it
+            # is a real tightening that costs no val axis.
+            #
+            # This mask mattered beyond correctness: COMPRESS made dims
+            # implicit, which made DIAG illegal, which eventually made DIAG
+            # globally illegal at a vertex -- while QUANT is never masked at
+            # all. So the only always-available operator was also the
+            # annihilating one, and the environment ratcheted the policy
+            # toward destruction. Admitting these pairs removes that ratchet.
+            #
+            # Still excluded, by the span<=1 no-op filter below rather than
+            # here: an already-COUPLED implicit pair is a pure diagonal (c*I);
+            # blocking it would widen its support.
             # A sparse dim is already half of a pair; only its partner is legal.
             if di.is_sparse and di.other_id != dj.id:
                 continue
