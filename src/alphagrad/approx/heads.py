@@ -54,6 +54,7 @@ and swap it in for ``rule_policy`` when ``--dynamic-substeps`` is set.
 from __future__ import annotations
 
 import math
+import os as _os
 from typing import NamedTuple, Sequence
 
 import distrax
@@ -317,7 +318,25 @@ class OpTypeHead(eqx.Module):
     proj: eqx.nn.Linear
 
     def __init__(self, embd_dim: int, *, key):
-        self.proj = eqx.nn.Linear(embd_dim, NUM_OPS, key=key)
+        proj = eqx.nn.Linear(embd_dim, NUM_OPS, key=key)
+        # UNIFORM AT INIT (ALPHAGRAD_OP_HEAD_UNIFORM=1, default).
+        #
+        # v17 started at p(END) ~= 0.76-0.97 and p(DIAG) ~= 1e-7: the ONLY
+        # structure-preserving operator was effectively absent from the
+        # action space before a single gradient step, and it later underflowed
+        # to exactly 0.0 (softmax gradients scale with p, so p~1e-30 cannot
+        # recover). Zeroing this head's weight+bias makes the masked softmax
+        # exactly uniform over the LEGAL ops, so DIAG / COMPRESS / QUANT / END
+        # all start at 1/4 and the run begins from an unbiased prior instead
+        # of an END-dominated one. Paired with FacePathPolicy's skip-gate
+        # init (p_skip = 1/5), the five outcomes {skip, diag, compress,
+        # quant, none} are equiprobable at step 0.
+        if _os.environ.get("ALPHAGRAD_OP_HEAD_UNIFORM", "1") == "1":
+            proj = eqx.tree_at(lambda m: m.weight, proj,
+                               jnp.zeros_like(proj.weight))
+            proj = eqx.tree_at(lambda m: m.bias, proj,
+                               jnp.zeros_like(proj.bias))
+        self.proj = proj
 
     def __call__(self, summary: jax.Array, op_legality_mask: jax.Array):
         logits = self.proj(summary)
@@ -1795,9 +1814,40 @@ class FacePathPolicy(eqx.Module):
         self.head = MicroActionHead(embd_dim, key=keys[1])
         self.face_embedding = eqx.nn.Embedding(max_faces, embd_dim, key=keys[2])
         self.slot_embedding = eqx.nn.Embedding(num_slots, embd_dim, key=keys[3])
-        self.skip_head = eqx.nn.MLP(
+        skip_head = eqx.nn.MLP(
             embd_dim, 1, width_size=embd_dim, depth=1, key=keys[4]
         )
+        # EQUIPROBABLE FIVE-WAY START (ALPHAGRAD_OP_HEAD_UNIFORM=1, default).
+        #
+        # The per-path decision is really a choice among FIVE outcomes:
+        #   skip the path, or keep it and apply {DIAG, COMPRESS, QUANT, none}.
+        # `skip` is this sigmoid gate; the other four are OpTypeHead's masked
+        # softmax (zero-initialised there => uniform 1/4 over legal ops).
+        # Setting the final bias to logit(1/5) = -ln(4) makes p_skip = 0.2, so
+        # the composite start is 0.2 for each of the five outcomes rather than
+        # the END-dominated prior v17 began from. Only the OUTPUT bias is
+        # touched, so the head still has its full learned capacity.
+        if _os.environ.get("ALPHAGRAD_OP_HEAD_UNIFORM", "1") == "1":
+            _p_skip = float(_os.environ.get("ALPHAGRAD_INIT_P_SKIP", "0.2"))
+            _p_skip = min(max(_p_skip, 1e-4), 1.0 - 1e-4)
+            _b = math.log(_p_skip / (1.0 - _p_skip))
+            # Zero the OUTPUT weight as well as setting the bias. The MLP has
+            # a hidden layer, so bias-only would leave W_out . relu(b_hidden)
+            # riding on top and p_skip would land somewhere near 0.2 rather
+            # than at it (measured: the bias-only version failed this test).
+            # Zeroing the last weight makes the gate input-independent at
+            # init — exactly the treatment OpTypeHead gets — so p_skip is
+            # EXACTLY the configured value and every hidden unit still has
+            # its random features to learn from.
+            skip_head = eqx.tree_at(
+                lambda m: m.layers[-1].weight, skip_head,
+                jnp.zeros_like(skip_head.layers[-1].weight),
+            )
+            skip_head = eqx.tree_at(
+                lambda m: m.layers[-1].bias, skip_head,
+                jnp.full_like(skip_head.layers[-1].bias, _b),
+            )
+        self.skip_head = skip_head
         quant_hardware_masks()
 
     # -- shared per-slot decision core (sample and evaluate keep IDENTICAL

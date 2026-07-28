@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -366,10 +367,27 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
         return hit[1], hit[2]
 
     tk, stream, seg_ids, done = None, None, None, 0
-    # Ancestor extension only in per-vertex mode: with face actions the
-    # parent's face_key is a different byte-slice, so take the cold replay
-    # (correctness over speed; the cache still dedups exact repeats).
-    if face_key is None:
+    # ANCESTOR EXTENSION IS ONLY SOUND WITHOUT COMPRESS IN THE PREFIX.
+    #
+    # Measured (tests/stream_prefix_property_test.py): the stream for a
+    # length-k prefix is NOT a byte-prefix of the length-k+1 stream when the
+    # prefix carries COMPRESS. `decode_vertex_rule_specs` emits Compress only
+    # when `is_last=True`, so vertex k-1 is tokenized WITH its Compress at
+    # length k and WITHOUT it at length k+1 — the streams diverge (token 681
+    # of 931 on the test graph). Extending a cached parent would then hand the
+    # policy a different observation than a cold replay, i.e. the observation
+    # would depend on cache state.
+    #
+    # The `face_key is None` clause was already here (its comment gave a
+    # different, weaker reason); the COMPRESS check is the one that actually
+    # makes this correct, and it also protects the per-vertex path that the
+    # original guard left exposed. Plans without COMPRESS still take the fast
+    # path. Remove both conditions only after the COMPRESS last-vertex
+    # restriction is lifted.
+    _prefix_has_compress = any(
+        any(int(r[0]) == COMPRESS_SENTINEL for r in rows) for _v, rows in steps
+    )
+    if face_key is None and not _prefix_has_compress:
         for cut in range(len(steps) - 1, 0, -1):
             parent = _INCR_STREAM_CACHE.pop(
                 base_key + (tuple(steps[:cut]), None), None)
@@ -1817,14 +1835,39 @@ def _callback(
     # advantage-neutralisation branch never fires for them.
     # ALPHAGRAD_DEGEN_SOFT=0 restores the hard sentinel.
     def _degen_reward():
+        """GRADED refusal reward — never a constant.
+
+        v17 post-mortem: the previous version returned a FIXED vector for
+        every refused plan. Once all 16 envs were refused (ep 42 onward) they
+        all scored identically, so the advantage was uniformly zero and NO
+        policy gradient existed in any direction — 22 episodes of a perfectly
+        flat plateau that the run could not leave. A refusal must still be
+        strictly worse than any measurable plan, but it must ORDER refused
+        plans among themselves so there is a slope pointing back out.
+
+        The gradable quantity is the graphax count pass, which runs BEFORE
+        any refusal and discriminates over ~8 decades even inside the dead
+        zone. ``frac`` in [0, 1] is how much symbolic work survived, on a log
+        scale; the penalty interpolates between the full worst-case (frac=0,
+        nothing computed) and half of it (frac=1, reference workload). The
+        half-floor keeps every refusal above the worst real measurement
+        (observed max ~2.5e7 ns / ~6.7e9 B), so refusal never out-scores a
+        plan that actually ran.
+        """
         if os.environ.get("ALPHAGRAD_DEGEN_SOFT", "1") != "1":
             return _SENTINEL_BAD_REWARD
         lat_w = float(os.environ.get("ALPHAGRAD_DEGEN_LAT_NS", "1e8"))
         mem_w = float(os.environ.get("ALPHAGRAD_DEGEN_MEM_B", "2e9"))
+        ref = float(os.environ.get("ALPHAGRAD_DEGEN_REF_MULS", "5e12"))
+        floor = float(os.environ.get("ALPHAGRAD_DEGEN_FLOOR_FRAC", "0.5"))
+        work = float(muls_adds_fmas) + float(max_io_sum)
+        frac = math.log1p(max(work, 0.0)) / max(math.log1p(ref), 1e-9)
+        frac = min(max(frac, 0.0), 1.0)
+        scale = 1.0 - (1.0 - floor) * frac      # 1.0 (no work) -> floor (ref)
         return jnp.array(
             [
-                -muls_adds_fmas, 0.0, -lat_w, -max_io_sum,
-                0.0, -mem_w, 0.0, -1.0,
+                -muls_adds_fmas, 0.0, -lat_w * scale, -max_io_sum,
+                0.0, -mem_w * scale, 0.0, -1.0,
             ],
             dtype=jnp.float32,
         )

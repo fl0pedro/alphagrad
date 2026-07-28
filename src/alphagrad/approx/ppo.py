@@ -1497,18 +1497,29 @@ class Agent(eqx.Module):
         )
 
         total_log_p = log_p_vertex + log_p_sub
-        total_entropy = vertex_ent + ent_sub
+        # PER-HEAD ENTROPY NORMALISATION.
+        #
+        # The bonus used to be (vertex_ent + micro_ent + face_ent) / micro_arity
+        # — three policies' entropy over ONE policy's action count. As QUANT
+        # spam lengthened sub-episodes (1.76 -> 8.4 actions in v17) the shared
+        # denominator grew, so the effective entropy weight FELL 0.028 -> 0.006:
+        # emitting more junk actions bought the policy LESS exploration
+        # pressure, which is exactly backwards and let DIAG underflow
+        # unopposed. Each policy is now divided by its own arity, so one head
+        # becoming chatty cannot silence the others. The vertex head emits
+        # exactly one action per step, hence arity 1.
+        total_entropy = vertex_ent + ent_sub / jnp.maximum(sub_episode_length, 1.0)
         # P1c: fold the face decisions' log-prob/entropy into the totals so
         # the PPO ratio covers them (evaluated with the STORED masks, same
         # gates as sampling — see FacePathPolicy).
         if face_action is not None and self.face_path_policy is not None:
-            f_logp, f_ent, _f_ar, _sp, _od, _ql = self.face_path_policy.evaluate(
+            f_logp, f_ent, f_arity, _sp, _od, _ql = self.face_path_policy.evaluate(
                 v_context, features, factor_tables, face_action,
                 face_pair_valid, face_comp_valid, face_valid,
                 op_legality_override=op_legality_override,
             )
             total_log_p = total_log_p + f_logp
-            total_entropy = total_entropy + f_ent
+            total_entropy = total_entropy + f_ent / jnp.maximum(f_arity, 1.0)
         # Per-step dists are forwarded for KL tracking against the rollout-time
         # old-policy snapshots; ``new_quant_logp`` is the factored-quant log-prob
         # (no flat dist), forwarded for parity with the trajectory schema.
@@ -4061,7 +4072,11 @@ def main():
         # Entropy normalized by per-sample sub-episode length (returned by
         # MicroActionPolicy.evaluate). Clamp to ≥ 1.0 to avoid divide-by-
         # zero on samples where the sub-episode was forced END at step 0.
-        entropy_loss = jnp.mean(entropies / jnp.maximum(sub_lengths, 1.0))
+        # Already per-head normalised inside evaluate_action_dynamic (each
+        # policy divided by its OWN arity), so this is a plain mean. Dividing
+        # again by sub_lengths here would re-introduce the shared-denominator
+        # bug from the other side.
+        entropy_loss = jnp.mean(entropies)
 
         # See the legacy loss path's value-mode switch for the rationale;
         # in scalar mode only slot 0 of (values, estim_returns) is alive.
@@ -4891,10 +4906,17 @@ def main():
             # env fix a broken comparison also reads cosine 0). Such rows
             # still train (the reward fix handles that side) but must never
             # be crowned "best" or enter the top-N tables.
+            # COSINE IS NOT A GATE (user-directed 2026-07-28). Requiring
+            # cos > 1e-6 marked EVERY row collapsed from the moment the policy
+            # stopped producing a non-trivial cosine (ep 25 of v17), which
+            # silently emptied best_return, every measure/* panel, both Pareto
+            # tables and all four top-N heaps for the entire run. Quality is
+            # carried by frob in the reward; the collapse guard's job is only
+            # to reject rows whose COSTS are degenerate (a zeroed computation
+            # reports zero cost and would otherwise be crowned "best").
             collapsed = bool(
                 rets[cmp_idx] >= 0.0
                 or rets[mem_idx] >= 0.0
-                or rets[cosine_idx] <= 1e-6
                 or (measure_latency and rets[REWARD_INDEX["latency_ns"]] >= 0.0)
             )
             if collapsed:
@@ -4937,7 +4959,6 @@ def main():
                 not (
                     all_rets[i][cmp_idx] >= 0.0
                     or all_rets[i][mem_idx] >= 0.0
-                    or all_rets[i][cosine_idx] <= 1e-6
                     or (
                         measure_latency
                         and all_rets[i][REWARD_INDEX["latency_ns"]] >= 0.0
@@ -5032,6 +5053,29 @@ def main():
             for j, nm in enumerate(HEAD_NAMES):
                 log_dict[f"popart/mu_{nm}"] = float(_mu[j])
                 log_dict[f"popart/sigma_{nm}"] = float(_sig[j])
+
+            # WEIGHTED (PopArt-lens) RETURN — Charts/ companion to mean_return.
+            #
+            # `mean_return` is a sum over RAW channels, so it is dominated by
+            # whichever channel has the largest magnitude (peak_memory in
+            # bytes, ~1e8): it tracked -peak_memory almost exactly and told us
+            # nothing about the objective the policy actually optimises.
+            # This is the same episode mean seen THROUGH PopArt — each trained
+            # head normalised by its own running (mu, sigma) before the
+            # preference-weighted sum, i.e. the units the advantage is
+            # actually computed in. Comparable across episodes and across
+            # channels, so a move here is a real move in the objective.
+            _hr = np.asarray(
+                [float(mean_r[k]) for k in HEAD_REWARD_INDICES], dtype=np.float64
+            )
+            _z = (_hr - np.asarray(_mu, np.float64)) / np.maximum(
+                np.asarray(_sig, np.float64), 1e-8
+            )
+            _hw = np.asarray(head_reward_weights_np, np.float64)
+            log_dict["weighted_mean_return"] = float(np.sum(_z * _hw))
+            for j, nm in enumerate(HEAD_NAMES):
+                if _hw[j] != 0.0:
+                    log_dict[f"weighted_return/{nm}"] = float(_z[j] * _hw[j])
 
         # ---- per-face apply telemetry ---------------------------------------
         if args.per_face or args.face_actions:
