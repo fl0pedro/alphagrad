@@ -80,6 +80,8 @@ from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
     _AXIS_FEAT_GROUP_ID,
     consume_degenerate_plan_count,
+    consume_truncated_plan_count,
+    consume_zero_work_plan_count,
     consume_per_face_stats,
     consume_tokenization_truncation_stats,
     consume_xla_memory_stats,
@@ -1763,6 +1765,30 @@ def make_argparser() -> argparse.ArgumentParser:
         "are the ONLY scaling (manual-weight mode; reward semantics are "
         "stationary across the whole run).",
     )
+    p.add_argument(
+        "--set-pointer", action="store_true",
+        help="Use SetPointerVertexPolicy: a CONTENT-based pointer over the "
+             "segment-pooled vertex memory with permutation-equivariant "
+             "Set-Transformer blocks, instead of PointerVertexPolicy whose "
+             "queries came from a fixed Embedding(num_vertices, embd_dim) "
+             "table indexed by vertex id. No parameter depends on V, so the "
+             "same weights transfer across graph sizes.")
+    p.add_argument(
+        "--set-pointer-blocks", type=int, default=2,
+        help="Number of Set-Transformer blocks used by --set-pointer.")
+    p.add_argument(
+        "--popart-init-episodes", type=int, default=0,
+        help="Warm-start PopArt (mu, sigma) from this many rollouts of RANDOM "
+             "but VALID plans before training. 0 disables. The rollouts use "
+             "the real legality masks and the real measurement path, so the "
+             "seeded scale is the true measurement scale; without this the "
+             "first gradient step defines the scale from whatever the "
+             "untrained policy produced.")
+    p.add_argument(
+        "--popart-init-temperature", type=float, default=10.0,
+        help="Softmax temperature applied to the VERTEX pointer during the "
+             "PopArt warm-start rollouts. Large => ~uniform over the legal "
+             "vertices. The micro heads are already uniform at init.")
     p.add_argument("--popart-beta", type=float, default=1e-2,
                    help="PopArt EMA rate per update.")
     p.add_argument("--popart-sigma-min", type=float, default=0.1,
@@ -1795,6 +1821,18 @@ def make_argparser() -> argparse.ArgumentParser:
         "examples) BEFORE tracing, so the policy graph, mask oracle, and "
         "measured executable all live on the same scalar-loss graph and "
         "jacve of it yields the gradients the spec asks to time.",
+    )
+    p.add_argument(
+        "--seed-vertices",
+        action="store_true",
+        help="With --measure-grad, use seed_loss_fn instead of scalar_loss_fn: "
+        "the tangent seed and the adjoint contraction enter the graph as "
+        "ORDINARY ELIMINABLE VERTICES, so the elimination/action space stays "
+        "the Jacobian graph (plus seed nodes) while the MEASURED object is the "
+        "gradient. The policy then learns WHEN to apply the seed — seeding "
+        "early is one VJP (gradient-cost), seeding late builds the full "
+        "Jacobian — i.e. forward/reverse/cross-country becomes part of the "
+        "search. Requires graphax >= 5c56105 (seed-vertex sentinel fix).",
     )
     p.add_argument(
         "--measure-latency",
@@ -2316,12 +2354,22 @@ def _build_agent(
         args.hidden_dim,
         key=encoder_keys[1],
     )
-    vertex_policy = PointerVertexPolicy(
-        num_vertices=total_v,
-        embd_dim=args.embd_dim,
-        num_heads=args.num_heads,
-        key=encoder_keys[2],
-    )
+    if getattr(args, "set_pointer", False):
+        from alphagrad.approx.set_pointer import SetPointerVertexPolicy
+        vertex_policy = SetPointerVertexPolicy(
+            num_vertices=total_v,
+            embd_dim=args.embd_dim,
+            num_heads=args.num_heads,
+            num_blocks=int(getattr(args, "set_pointer_blocks", 2)),
+            key=encoder_keys[2],
+        )
+    else:
+        vertex_policy = PointerVertexPolicy(
+            num_vertices=total_v,
+            embd_dim=args.embd_dim,
+            num_heads=args.num_heads,
+            key=encoder_keys[2],
+        )
     # One single-output MLP per training reward (flops / peak_memory /
     # cosine_sim / frob_residual). Per-head split keeps gradient scales sane
     # across the qualitatively different reward families and matches the
@@ -2934,17 +2982,39 @@ def main():
         # measured executable must all address the SAME scalar-loss graph —
         # wrapping only at measurement time is the graph-mismatch that
         # produced the old stack's zero-gradient bug.
-        from alphagrad.approx.common import scalar_loss_fn as _scalar_loss_fn
-        target_fn = _scalar_loss_fn(target_fn)
+        pass
     xs = get_args(args.example, args_key, dataset=dataset_for_call)
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
     )
+    # GRAD-TARGET SETUP — routed through the shared builder so the trainer and
+    # every measure-actor construct the IDENTICAL graph (jaxpr / vertex+action
+    # space / argnums). Three modes:
+    #
+    #   neither flag        -> raw Jacobian target (the historical default).
+    #   --measure-grad      -> scalar_loss_fn: mean BEFORE tracing. Measures the
+    #                          gradient, but the traced graph IS the loss graph,
+    #                          so the ACTION SPACE CHANGES (measured: 15 vertices
+    #                          vs 13 for the Jacobian graph).
+    #   + --seed-vertices   -> seed_loss_fn: the tangent seed `t` and the
+    #                          <ones/N, .> adjoint contraction become ORDINARY
+    #                          ELIMINABLE VERTICES. The graph stays the
+    #                          Jacobian-elimination graph (plus the seed nodes),
+    #                          and the policy chooses WHEN to apply the seed —
+    #                          i.e. forward / reverse / cross-country seeding is
+    #                          part of the search rather than hardcoded. Seeding
+    #                          early costs one VJP (gradient-like); seeding late
+    #                          builds the Jacobian. This is the "act in Jacobian
+    #                          space, measure in grad space" configuration.
+    #
+    # `xs` gains the appended tangent seed and `argnums` shifts accordingly, so
+    # both must come back from the builder rather than being recomputed.
+    from alphagrad.approx.common import grad_target_setup as _grad_target_setup
+    target_fn, xs, argnums = _grad_target_setup(args, target_fn, xs, args.example)
     closed_jaxpr = _traced_inlined(target_fn, xs)
     # Always pass target_fun so flops/bytes_accessed/latency_ns/peak_memory
     # populate every step (see cpu_approx_worker.py for the full rationale).
     env_target_fun = target_fn
-    argnums = infer_argnums(args.example)
 
     # Latency is the only optional component of the reward harness; auto-enable
     # measurement when the user has selected it as their primary compute metric
@@ -3380,7 +3450,9 @@ def main():
         return jax.vmap(lambda _: env_obj.reset())(jnp.arange(num_envs))
 
     @eqx.filter_jit
-    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None, 0, None, None))
+    # +1 entry for vertex_temperature (broadcast, not mapped): the PopArt
+    # warm-start flattens the vertex pointer to ~uniform over legal vertices.
+    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None, 0, None, None, None))
     def rollout_fn(
         agent,
         env_obj,
@@ -3391,6 +3463,7 @@ def main():
         preference,
         op_legality_override,
         pin_rules_to_exact_jax,
+        vertex_temperature=None,
     ):
         keys = jrand.split(key, rollout_length)
         # Stage B.4: per-vertex residual state, initialised to zero at episode
@@ -3561,6 +3634,7 @@ def main():
                     oracle_pair_all=oracle_pair_all,
                     oracle_comp_all=oracle_comp_all,
                     face_masks_all=face_masks_all,
+                    vertex_temperature=vertex_temperature,
                     precomputed=precomputed,
                     oracle_fn=oracle_one_fn,
                 )
@@ -4303,6 +4377,9 @@ def main():
             preferences_per_env,
             op_legality_override_arg,
             pin_rules_to_exact_arg,
+            # vertex_temperature: None in training (the vmap in_axes tuple is
+            # positional, so this must be passed explicitly).
+            None,
         )
 
         # GAE on the (E, T, NUM_VALUE_HEADS) reward tensor.
@@ -4979,6 +5056,12 @@ def main():
         log_dict = {
             "best_return": host_state["best_global_return"],
             "mean_return": float(np.sum(mean_r * weights)),
+            # TRUNCATED = refused by a resource limit (op cap / OOM) and
+            # EXCLUDED from the gradient — "Time Limits in RL". ZERO_WORK =
+            # computed nothing but was KEPT and punished by frob. They are
+            # opposite treatments, so they get separate counters.
+            "collapse/truncated_this_ep": consume_truncated_plan_count(),
+            "collapse/zero_work_this_ep": consume_zero_work_plan_count(),
             "collapse/count_this_ep": n_collapsed_this_ep,
             "collapse/count_total": host_state["collapsed_total"],
             "collapse/fraction_this_ep": n_collapsed_this_ep / max(1, all_rets.shape[0]),
@@ -5012,6 +5095,20 @@ def main():
                 log_dict["entropy/micro_approx"] = float(
                     np.mean(entropy_components[1:5])
                 )
+                # NORMALISED companions, in [0,1] = fraction of that head's
+                # MAXIMUM possible entropy. The raw nats are not comparable
+                # across heads: the vertex head picks among ~total_v vertices
+                # (ln 13 = 2.56) while the op head picks among 4 (ln 4 = 1.39),
+                # so macro sat at 1-1.6 and micro at 0-0.3 because of ALPHABET
+                # SIZE, not because the micro heads were more decided.
+                # Only these two get a normaliser: the i/j/exp heads have a
+                # DYNAMIC alphabet (the legal dim/factor set depends on the
+                # live tensor), so there is no static maximum to divide by and
+                # any fixed constant would be wrong.
+                log_dict["entropy/macro_vertex_norm"] = float(
+                    entropy_components[0] / np.log(max(int(total_v), 2)))
+                log_dict["entropy/op_norm"] = float(
+                    entropy_components[1] / np.log(max(int(NUM_OPS), 2)))
         for j, name in enumerate(REWARD_NAMES):
             log_dict[f"mean_{name}"] = float(mean_r[j]) if j < len(mean_r) else 0.0
 
@@ -5072,10 +5169,33 @@ def main():
                 np.asarray(_sig, np.float64), 1e-8
             )
             _hw = np.asarray(head_reward_weights_np, np.float64)
-            log_dict["weighted_mean_return"] = float(np.sum(_z * _hw))
+            # NORMALISE to [0,1] through PopArt rather than reporting a raw
+            # z-score. Phi(z) is the running-distribution percentile of this
+            # episode's channel value: 0.5 = exactly average for the run,
+            # ->1 = far better than the running mean, ->0 = far worse. Bounded,
+            # comparable across channels and across episodes.
+            from math import erf as _erf
+            _phi = np.array([0.5 * (1.0 + _erf(float(v) / np.sqrt(2.0)))
+                             for v in _z], dtype=np.float64)
+            _wsum = float(np.sum(np.abs(_hw)))
+            _wn = (np.abs(_hw) / _wsum) if _wsum > 0 else np.zeros_like(_hw)
+            # convex combination of [0,1] values -> itself in [0,1]
+            log_dict["Charts/weighted_mean_return"] = float(np.sum(_phi * _wn))
             for j, nm in enumerate(HEAD_NAMES):
                 if _hw[j] != 0.0:
-                    log_dict[f"weighted_return/{nm}"] = float(_z[j] * _hw[j])
+                    log_dict[f"Charts/weighted_mean_{nm}"] = float(_phi[j])
+
+        # ---- wall clock: lets the wandb x-axis be switched from episode to
+        # elapsed time, so a slowdown shows up as a flat stretch instead of
+        # being invisible against a uniform episode axis.
+        _now = _prof_time.perf_counter()
+        _t0 = host_state.setdefault("_wall_t0", _now)
+        _prev = host_state.get("_wall_prev", _t0)
+        log_dict["time/wall_seconds"] = float(_now - _t0)
+        log_dict["time/wall_minutes"] = float((_now - _t0) / 60.0)
+        log_dict["time/sec_per_episode"] = float(_now - _prev)
+        log_dict["time/episode"] = int(ep)
+        host_state["_wall_prev"] = _now
 
         # ---- per-face apply telemetry ---------------------------------------
         if args.per_face or args.face_actions:
@@ -5134,9 +5254,14 @@ def main():
                     "pareto/mem_vs_cos": (1, 2),
                     "pareto/cmp_vs_mem": (0, 1),
                 }.items():
+                    # Use the episode each point was ADMITTED at, not the
+                    # current one: stamping `ep` on every row made the whole
+                    # front look re-measured every episode.
+                    _peps = getattr(pareto_archive, "eps", None) or []
                     tbl = wandb.Table(columns=["x", "y", "episode"])
-                    for row in fx:
-                        tbl.add_data(float(row[a]), float(row[b]), ep)
+                    for _i, row in enumerate(fx):
+                        _e = int(_peps[_i]) if _i < len(_peps) else int(ep)
+                        tbl.add_data(float(row[a]), float(row[b]), _e)
                     log_dict[key] = tbl
 
         # Stage D/E/F marginals — pair-index distribution (axis-pair head),
@@ -5155,8 +5280,19 @@ def main():
                 log_dict[f"pair_marginal/{j}"] = float(p)
             for j, p in enumerate(factor_marg):
                 log_dict[f"factor_marginal/{j}"] = float(p)
-            for j, name in enumerate(HEAD_NAMES):
-                log_dict[f"preference/{name}"] = float(pref_mean[j])
+            # Preferences are STATIC for the run -> they belong in the run
+            # config, not in a time series that plots a flat line. Written
+            # once, on the first episode that has them.
+            if not host_state.get("_pref_logged"):
+                try:
+                    wandb.config.update(
+                        {f"preference_{nm}": float(pref_mean[j])
+                         for j, nm in enumerate(HEAD_NAMES)},
+                        allow_val_change=True,
+                    )
+                except Exception:
+                    pass
+                host_state["_pref_logged"] = True
             log_dict["p_stop_slot0"] = float(p_stop_slot0)
             # Dynamic-substeps op-type marginals. Names MUST match
             # heads.py's op order (DIAG=0, COMPRESS=1, QUANT=2, END=3) —
@@ -5435,6 +5571,58 @@ def main():
             args.pin_rules_to_exact,
             dtype=jnp.bool_,
         )
+        # ---- PopArt warm-start from RANDOM VALID plans -------------------
+        # Runs once, before the first gradient step. Uses the ordinary rollout
+        # so legality masking and measurement are identical to training; only
+        # the vertex pointer is flattened to ~uniform. Seeds the RAW
+        # accumulators to (w=1, m1=E[R], m2=E[R^2]) so `_popart_derive` yields
+        # mu=mean, sigma=std of the random-plan measurement distribution.
+        if ep == 0 and int(getattr(args, "popart_init_episodes", 0)) > 0:
+            _wt = jnp.asarray(
+                float(getattr(args, "popart_init_temperature", 10.0)),
+                dtype=jnp.float32)
+            _wrows = []
+            for _wi in range(int(args.popart_init_episodes)):
+                _wkey, key = jrand.split(key)
+                _wstates = reset_envs(env_episode)
+                _, _, _wrew = rollout_fn(
+                    agent, env_episode, num_valid, _wstates,
+                    jrand.split(_wkey, num_envs), vertex_features,
+                    preferences_per_env, stage_override, stage_pin_rules,
+                    _wt,   # positional: vmap in_axes is a positional tuple
+                )
+                _wrows.append(np.asarray(_wrew, dtype=np.float64))
+            _R = np.concatenate(_wrows, axis=0)
+            _R = _R[:, list(HEAD_REWARD_INDICES)]
+            # Drop sentinels / non-finite: a failed measurement must not define
+            # the scale every later advantage is divided by.
+            _ok = np.isfinite(_R).all(axis=1) & (
+                np.abs(_R) < abs(float(SENTINEL_COST)) * 0.99).all(axis=1)
+            _R = _R[_ok]
+            print(f"[popart-init] {int(args.popart_init_episodes)} random-plan "
+                  f"rollouts -> {_R.shape[0]}/{_ok.shape[0]} usable envs",
+                  flush=True)
+            if _R.shape[0] >= 2:
+                popart_m1 = jnp.asarray(_R.mean(axis=0), dtype=jnp.float32)
+                popart_m2 = jnp.asarray((_R ** 2).mean(axis=0), dtype=jnp.float32)
+                popart_w = jnp.ones((NUM_VALUE_HEADS,), dtype=jnp.float32)
+                _mu0 = _R.mean(axis=0)
+                _sd0 = _R.std(axis=0)
+                for _k, _nm in enumerate(HEAD_NAMES):
+                    print(f"[popart-init]   {_nm}: mu={_mu0[_k]:.6g} "
+                          f"sigma={_sd0[_k]:.6g}", flush=True)
+                try:
+                    wandb.config.update(
+                        {f"popart_init_mu_{_nm}": float(_mu0[_k])
+                         for _k, _nm in enumerate(HEAD_NAMES)},
+                        allow_val_change=True)
+                except Exception:
+                    pass
+            else:
+                print("[popart-init] too few usable envs; keeping zero init",
+                      flush=True)
+            env_states = reset_envs(env_episode)
+
         (
             agent,
             opt_state,

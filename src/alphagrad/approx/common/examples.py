@@ -387,41 +387,69 @@ def scalar_loss_fn(fn):
 
 
 def seed_loss_fn(fn, argnums):
-    """Both-seed (tangent + adjoint) scalar loss with the SEEDS AS EXPLICIT
-    GRAPH VERTICES (graphax.seed_vertices). Returns ``g(*primals, t)`` where:
+    """Scalar loss with the tangent + adjoint seeds as EXACTLY TWO vertices.
 
-      g(*primals, t) = < ones/N , fn( p + t * dir ) >      # == mean(fn) at any t
+    Target shape: ``N + 2`` eliminable vertices, where N is the model graph and
+    the +2 are one tangent seed and one adjoint seed. Measured on nn256/mnist:
+    13 -> 15.
 
-    ``dir`` is the tangent-seed direction: ones on the DIFFERENTIATED args
-    (``argnums`` — the weights) and zero elsewhere (x / y stay fixed), and the
-    scalar tangent seed ``t`` is appended LAST so existing arg indices (and the
-    data_gen / weight slots) are unchanged. The ``<ones/N, ·>`` is the adjoint
-    seed contraction (an explicit elementwise mul + sum) — same value as
-    ``scalar_loss_fn`` (mean), but the tangent injection and adjoint contraction
-    show up in ``_build_graph`` as ORDINARY eliminable vertices. Differentiated
-    w.r.t. ``argnums + (t,)`` the learned order then chooses forward / reverse /
-    cross-country seed timing. The trainer + every CPU measure-actor MUST build
-    the SAME wrap + appended ``t`` + shifted argnums (see ``grad_target_setup``)."""
-    from graphax.seed_vertices import with_tangent_seed
+    THE PREVIOUS VERSION COST +23, not +2, and the extra 21 were scaffolding:
+
+      * 6 ``broadcast_in_dim`` building ``ones_like``/``zeros_like`` tangent
+        DIRECTION constants — pure constants, no derivative content;
+      * 12 injection eqns, because ``with_tangent_seed`` emits ``p + t*x`` for
+        EVERY primal leaf. Four of those act on x and y (the DATA) whose
+        direction is ``zeros_like``, i.e. they computed ``x + t*0`` — an
+        IDENTITY on the two largest tensors in the graph ([16,784], [16,10]).
+        Those identity vertices carry big intermediate Jacobians that the
+        policy then has to eliminate, polluting the cost landscape;
+      * 5 for the adjoint contraction (``broadcast(ones)``, ``div``, ``mul``,
+        ``reduce_sum``, ``add``) where one reduction suffices.
+
+    The tight form:
+
+      TANGENT SEED (1 eqn) — ``p + t`` on the FIRST DIFFERENTIATED arg. ``t`` is
+        a scalar so it broadcasts inside the single ``add`` (scalar-tensor ops
+        do not emit a separate broadcast eqn). Direction ``ones`` is implicit:
+        ``p + t*1 == p + t``, so no constant tensor is built. Forward mode seeds
+        at the differentiated inputs, which is exactly this vertex.
+
+      ADJOINT SEED (1 eqn) — ``reduce_sum(out)``, i.e. ``<ones, out>``. The 1/N
+        of a mean is dropped deliberately: it is a constant scale, and every
+        quality metric we train on (frob residual, cosine) is scale-invariant,
+        so paying two extra eqns to divide would buy nothing.
+
+    SEMANTIC NARROWING, stated plainly: the tangent direction now covers the
+    first differentiated argument rather than all of them, so ``d/dt`` is the
+    directional derivative along that one parameter block instead of along the
+    all-ones direction over every block. The seed's PURPOSE — handing the
+    elimination order the freedom to propagate forward, reverse or
+    cross-country, and to choose seed timing — is unchanged, and it now costs
+    one vertex instead of eighteen. Set ALPHAGRAD_SEED_ALL_ARGS=1 to inject
+    into every differentiated arg (one ``add`` each: N + 1 + n_argnums).
+    """
+    import os as _os
+    from graphax.seed_vertices import with_tangent_seed  # noqa: F401 (API ref)
     argset = {int(a) for a in argnums}
+    seed_all = _os.environ.get("ALPHAGRAD_SEED_ALL_ARGS", "0") == "1"
 
     def g(*primals_and_t):
         *primals, t = primals_and_t
-        tangent = tuple(
-            jnp.ones_like(p) if i in argset else jnp.zeros_like(p)
-            for i, p in enumerate(primals)
-        )
-        out = with_tangent_seed(fn, tangent)(t, *primals)  # tangent seed vertex
+        # --- TANGENT SEED ------------------------------------------------
+        # `p + t` == `p + t*ones`, one `add` eqn per seeded arg, no constant.
+        seeded = list(primals)
+        targets = sorted(argset) if seed_all else sorted(argset)[:1]
+        for i in targets:
+            seeded[i] = seeded[i] + t
+        out = fn(*seeded)
+        # --- ADJOINT SEED ------------------------------------------------
+        # <ones, out> == reduce_sum(out): one eqn. Scale (1/N) omitted — frob
+        # and cosine are scale-invariant.
         leaves = jax.tree_util.tree_leaves(out)
-        N = 0
-        for leaf in leaves:
-            n = 1
-            for d in jnp.shape(leaf):
-                n *= int(d)
-            N += n
-        N = N or 1
-        # adjoint seed vertex: <ones/N, out> as an explicit elementwise mul + sum
-        return sum(jnp.sum((jnp.ones_like(leaf) / N) * leaf) for leaf in leaves)
+        acc = jnp.sum(leaves[0])
+        for leaf in leaves[1:]:
+            acc = acc + jnp.sum(leaf)
+        return acc
 
     return g
 

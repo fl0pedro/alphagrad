@@ -139,6 +139,11 @@ class ParetoArchive:
         self.obj_idx = [int(i) for i in obj_idx]
         self.pts: list[np.ndarray] = []          # live front objective vectors
         self.seqs: list = []                     # parallel sequences
+        # Episode at which each LIVE front point was admitted. Parallel to
+        # pts/seqs and pruned with them. Without this the plotting side had
+        # nothing to read and stamped the current episode onto every point,
+        # so the whole front looked like it was re-measured every episode.
+        self.eps: list[int] = []
         self.all_candidates: list[dict] = []     # every admitted point
         self._seen: set = set()
         # Fixed HV reference captured on first non-empty call; class has
@@ -166,11 +171,13 @@ class ParetoArchive:
                 return False
         # g is non-dominated → keep it, drop any existing points it dominates
         survivors = [
-            (p, s) for p, s in zip(self.pts, self.seqs)
+            (p, s, e) for p, s, e in zip(self.pts, self.seqs, self.eps)
             if not (np.all(g >= p) and np.any(g > p))
         ]
-        self.pts = [p for p, _ in survivors] + [g]
-        self.seqs = [s for _, s in survivors] + [seq]
+        self.pts = [p for p, _, _ in survivors] + [g]
+        self.seqs = [s for _, s, _ in survivors] + [seq]
+        # stamp the admitting episode ONCE; never rewritten afterwards
+        self.eps = [e for _, _, e in survivors] + [int(episode)]
         key = repr(seq)
         if key not in self._seen:
             self._seen.add(key)
