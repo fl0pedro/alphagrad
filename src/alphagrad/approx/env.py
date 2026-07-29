@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import itertools
 import math
 import os
@@ -443,11 +444,73 @@ def consume_profile() -> dict:
     return out
 
 
+# Skip the symbolic count pass entirely (see _callback). It feeds only the
+# log-only muls_adds_fmas / max_io_sum channels and the op-count cap; the
+# trained objective (latency, peak_memory, frob) never reads it, and it costs
+# more than the compile it guards once plans do real work.
+_SKIP_COUNT_OPS = os.environ.get("ALPHAGRAD_SKIP_COUNT_OPS", "0") == "1"
+
+# EXACT-JACOBIAN REUSE ACROSS ENVS (ALPHAGRAD_CACHE_EXACT=1, default on).
+#
+# The exact Jacobian is the quality REFERENCE for cos/frob, and it is
+# IDENTICAL for every env in an episode, for two reasons:
+#   * vertex elimination computes the same Jacobian for ANY order — the order
+#     changes the cost, not the value;
+#   * ppo.train_episode calls generate_eval_samples ONCE per episode and shares
+#     the result across all envs.
+# So the 16 envs were each executing a bit-identical exact Jacobian:
+# 16 x n_points executions per episode where n_points would do (cb.quality was
+# 31.1s/episode). Keyed on a content digest of that sample's eval args, so an
+# entry can only be reused for genuinely identical inputs; the whole cache is
+# dropped as soon as a new episode's samples appear.
+_EXACT_CACHE: dict = {}
+_CACHE_EXACT = os.environ.get("ALPHAGRAD_CACHE_EXACT", "1") == "1"
+
+
+def _eval_digest(eval_args_list) -> bytes:
+    """Content digest of one sample's eval arguments."""
+    import hashlib as _hl
+    h = _hl.blake2b(digest_size=16)
+    for a in eval_args_list:
+        arr = np.asarray(a)
+        h.update(repr(arr.shape).encode())
+        h.update(repr(arr.dtype).encode())
+        h.update(arr.tobytes())
+    return h.digest()
+
+
 _DEGENERATE_PLANS = [0]
+# Plans TRUNCATED for engineering reasons (resource limits: op-count cap,
+# OOM). Counted separately from zero-work plans because the two get opposite
+# treatment — see `_truncated_reward` and the RESOURCE-LIMIT block below.
+_TRUNCATED_PLANS = [0]
+# Zero-work plans are NO LONGER refused; this is pure telemetry.
+_ZERO_WORK_PLANS = [0]
 
 
 def _record_degenerate_plan() -> None:
     _DEGENERATE_PLANS[0] += 1
+
+
+def _record_truncated_plan() -> None:
+    _TRUNCATED_PLANS[0] += 1
+    _DEGENERATE_PLANS[0] += 1     # keep the legacy aggregate meaningful
+
+
+def _record_zero_work_plan() -> None:
+    _ZERO_WORK_PLANS[0] += 1
+
+
+def consume_truncated_plan_count() -> int:
+    n = _TRUNCATED_PLANS[0]
+    _TRUNCATED_PLANS[0] = 0
+    return n
+
+
+def consume_zero_work_plan_count() -> int:
+    n = _ZERO_WORK_PLANS[0]
+    _ZERO_WORK_PLANS[0] = 0
+    return n
 
 
 def consume_degenerate_plan_count() -> int:
@@ -1358,6 +1421,17 @@ def _quality_metrics(jac_exact, jac_approx):
     if flat_approx.shape != flat_exact.shape or flat_approx.size == 0:
         return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
 
+    # Measure GPUs rotate but the exact reference is cached, so the two can
+    # land on different devices -> jitted cossim raises "Received incompatible
+    # devices". Co-locate onto the reference's device (read-only, one transfer
+    # only when they differ). Also fixes the later flat_exact - flat_approx.
+    try:
+        _ed = next(iter(flat_exact.devices()))
+        if next(iter(flat_approx.devices())) is not _ed:
+            flat_approx = jax.device_put(flat_approx, _ed)
+    except Exception:
+        pass
+
     cos = cossim(flat_exact, flat_approx)
     # Certain quant/compress combos yield a complex-valued flattened Jacobian,
     # making cossim complex. Use the real part — matches the reward path's
@@ -1804,19 +1878,42 @@ def _callback(
     if _dbg_measure:
         print(f"[measure] count-pass step={int(stop)} order={o_list}",
               flush=True)
-    _, aux = vertex_elimination_jaxpr(
-        config.jaxpr,
-        o_list,
-        consts,
-        *args,
-        argnums=config.argnums,
-        count_ops=True,
-        sparse_representation=config.sparse,
-        transforms=transforms,
-        face_transforms=ft_by_vertex,
-    )
-    muls_adds_fmas = float(aux["adds"] + aux["muls"] + aux["fmas"])
-    max_io_sum = float(aux["mem"])
+    # THE COUNT PASS IS OPTIONAL (ALPHAGRAD_SKIP_COUNT_OPS=1).
+    #
+    # `vertex_elimination_jaxpr(count_ops=True)` symbolically REPLAYS the whole
+    # elimination just to total up adds/muls/fmas and max-IO. Its cost scales
+    # with how much the plan actually computes, so it is free while the policy
+    # is degenerate and ruinous once it is not: measured 0.2s/episode in v17
+    # (zero-work plans) versus 259s/episode in v18 (2.4e12 muls) — 73% of the
+    # entire episode, against a 16.6s XLA compile.
+    #
+    # It buys exactly two LOG-ONLY reward channels (muls_adds_fmas, max_io_sum)
+    # plus the op-count cap. The trained objective is latency + peak_memory +
+    # frob, none of which touch it, so with this flag we simply do not pay for
+    # it. The elimination still gets traced once by the compile below — this
+    # was the second, redundant walk of the same graph.
+    #
+    # CONSEQUENCE, stated plainly: the MULS cap goes inert (there is nothing to
+    # compare), so the pre-XLA guard against compile-monster plans is gone. The
+    # OOM handler still catches device exhaustion, but NOT the v15-style
+    # compile hang. Re-enable the count pass if that reappears.
+    if _SKIP_COUNT_OPS:
+        muls_adds_fmas = 0.0
+        max_io_sum = 0.0
+    else:
+        _, aux = vertex_elimination_jaxpr(
+            config.jaxpr,
+            o_list,
+            consts,
+            *args,
+            argnums=config.argnums,
+            count_ops=True,
+            sparse_representation=config.sparse,
+            transforms=transforms,
+            face_transforms=ft_by_vertex,
+        )
+        muls_adds_fmas = float(aux["adds"] + aux["muls"] + aux["fmas"])
+        max_io_sum = float(aux["mem"])
     _pf("cb.count_pass")
 
     # SOFT SENTINEL (v16 post-mortem, ep-39 cliff). The hard ±1e10 sentinel
@@ -1834,43 +1931,36 @@ def _callback(
     # far under the trainer's sentinel-detection threshold (|5e9|), so the
     # advantage-neutralisation branch never fires for them.
     # ALPHAGRAD_DEGEN_SOFT=0 restores the hard sentinel.
-    def _degen_reward():
-        """GRADED refusal reward — never a constant.
+    def _truncated_reward():
+        """Reward for a plan TRUNCATED BY A RESOURCE LIMIT (op-count cap, OOM).
 
-        v17 post-mortem: the previous version returned a FIXED vector for
-        every refused plan. Once all 16 envs were refused (ep 42 onward) they
-        all scored identically, so the advantage was uniformly zero and NO
-        policy gradient existed in any direction — 22 episodes of a perfectly
-        flat plateau that the run could not leave. A refusal must still be
-        strictly worse than any measurable plan, but it must ORDER refused
-        plans among themselves so there is a slope pointing back out.
+        This is the "Time Limits in Reinforcement Learning" (Pardo et al.,
+        2018) distinction, applied to resource limits instead of clocks.
 
-        The gradable quantity is the graphax count pass, which runs BEFORE
-        any refusal and discriminates over ~8 decades even inside the dead
-        zone. ``frac`` in [0, 1] is how much symbolic work survived, on a log
-        scale; the penalty interpolates between the full worst-case (frac=0,
-        nothing computed) and half of it (frac=1, reference workload). The
-        half-floor keeps every refusal above the worst real measurement
-        (observed max ~2.5e7 ns / ~6.7e9 B), so refusal never out-scores a
-        plan that actually ran.
+        An OOM or an op-count refusal is NOT an outcome of the MDP — it is the
+        experimental apparatus giving up. The plan might have been excellent;
+        we simply failed to evaluate it. Scoring it (well OR badly) teaches the
+        policy something we did not measure:
+
+          * score it BADLY  -> the policy learns to avoid a region for reasons
+            that have nothing to do with the objective. v16 did this: the cap
+            sat BELOW the cost of every exact plan, so "do the computation
+            correctly" was ranked the single worst action available.
+          * score it WELL   -> a free lunch: refuse to compute, collect reward.
+          * score it CONSTANT -> what I shipped yesterday; once every env is
+            refused they all score identically, the advantage is uniformly
+            zero, and the run freezes (v17, 22 episodes).
+
+        The correct treatment is to BOOTSTRAP: emit the exact sentinel vector,
+        which `train_episode`'s `_is_degen` recognises (all six cost channels
+        at SENTINEL_COST) and which causes the transition to be EXCLUDED from
+        the gradient — advantage forced to 0 and the value target replaced by
+        the critic's own prediction, so neither the actor nor the critic
+        trains on a number we never measured. That is partial-episode
+        bootstrapping: "we stopped here for our own reasons, assume the
+        critic's estimate."
         """
-        if os.environ.get("ALPHAGRAD_DEGEN_SOFT", "1") != "1":
-            return _SENTINEL_BAD_REWARD
-        lat_w = float(os.environ.get("ALPHAGRAD_DEGEN_LAT_NS", "1e8"))
-        mem_w = float(os.environ.get("ALPHAGRAD_DEGEN_MEM_B", "2e9"))
-        ref = float(os.environ.get("ALPHAGRAD_DEGEN_REF_MULS", "5e12"))
-        floor = float(os.environ.get("ALPHAGRAD_DEGEN_FLOOR_FRAC", "0.5"))
-        work = float(muls_adds_fmas) + float(max_io_sum)
-        frac = math.log1p(max(work, 0.0)) / max(math.log1p(ref), 1e-9)
-        frac = min(max(frac, 0.0), 1.0)
-        scale = 1.0 - (1.0 - floor) * frac      # 1.0 (no work) -> floor (ref)
-        return jnp.array(
-            [
-                -muls_adds_fmas, 0.0, -lat_w * scale, -max_io_sum,
-                0.0, -mem_w * scale, 0.0, -1.0,
-            ],
-            dtype=jnp.float32,
-        )
+        return _SENTINEL_BAD_REWARD
 
     # WEDGE GUARD (v15 post-mortem): with the cos-sentinel gone, genuinely
     # huge approximated graphs go all the way to XLA — one episode-6 plan
@@ -1880,13 +1970,13 @@ def _callback(
     # v15 plans measured ~4e12 muls; the default cap only fires on true
     # blowups.
     _muls_cap = float(os.environ.get("ALPHAGRAD_MULS_SENTINEL_CAP", "5e13"))
-    if muls_adds_fmas > _muls_cap:
-        _record_degenerate_plan()
+    if not _SKIP_COUNT_OPS and muls_adds_fmas > _muls_cap:
+        _record_truncated_plan()
         if _dbg_measure or os.environ.get("ALPHAGRAD_DEBUG_DEGEN", "0") == "1":
-            print(f"[degen] MULS-CAP muls={muls_adds_fmas:.3g} > "
-                  f"{_muls_cap:.3g} step={int(stop)} order={o_list}",
-                  flush=True)
-        return tokens, eqn_ids, _degen_reward()
+            print(f"[trunc] MULS-CAP muls={muls_adds_fmas:.3g} > "
+                  f"{_muls_cap:.3g} step={int(stop)} order={o_list} "
+                  f"(excluded from gradient)", flush=True)
+        return tokens, eqn_ids, _truncated_reward()
 
     # If no `target_fun` is supplied, we can't compile/execute. Skip every
     # execution-derived metric and return a partial reward vector.
@@ -2028,7 +2118,49 @@ def _callback(
         h_ex.update(repr(callback_device).encode())
     exact_cache_key = h_ex.digest()
 
-    compiled_approx = cached_compile(b"approx:" + cache_key, _do_compile_approx)
+    # RESOURCE-LIMIT TRUNCATION (OOM) — "Time Limits in RL" applied to memory.
+    #
+    # A big approximated graph can exhaust device memory during compile or
+    # execution. Before this, a RESOURCE_EXHAUSTED propagated out of the
+    # io_callback and killed the whole run — losing every episode already
+    # collected. But an OOM says nothing about the PLAN's quality: it is the
+    # apparatus failing, exactly like a time-limit truncation, so the correct
+    # response is to truncate this transition and EXCLUDE it from the gradient
+    # (see `_truncated_reward`) rather than to score it.
+    #
+    # Caught here (compile) and around execution below. `_is_oom` matches on
+    # the XLA error text because jaxlib raises a generic XlaRuntimeError for
+    # RESOURCE_EXHAUSTED rather than a dedicated class.
+    def _is_oom(exc: BaseException) -> bool:
+        if isinstance(exc, MemoryError):
+            return True
+        txt = f"{type(exc).__name__}: {exc}".upper()
+        return any(k in txt for k in (
+            "RESOURCE_EXHAUSTED", "OUT OF MEMORY", "OUT_OF_MEMORY",
+            "OOM WHEN ALLOCATING", "CUDA_ERROR_OUT_OF_MEMORY",
+        ))
+
+    def _oom_truncate(where: str, exc: BaseException):
+        _record_truncated_plan()
+        # Free whatever the failed attempt is still holding before returning,
+        # or the next callback inherits a poisoned allocator.
+        try:
+            jax.clear_caches()
+            gc.collect()
+        except Exception:
+            pass
+        print(f"[trunc] OOM during {where} step={int(stop)} order={o_list} "
+              f"(excluded from gradient): {type(exc).__name__}: "
+              f"{str(exc)[:160]}", flush=True)
+        return tokens, eqn_ids, _truncated_reward()
+
+    try:
+        compiled_approx = cached_compile(
+            b"approx:" + cache_key, _do_compile_approx)
+    except Exception as _exc:
+        if not _is_oom(_exc):
+            raise
+        return _oom_truncate("approx compile", _exc)
     # ``compiled_exact`` is ONLY needed for the quality metrics
     # (cosine_sim, frob_residual). Those are meaningful only when the
     # elimination order is complete — graphax's ``jacve`` returns a
@@ -2037,8 +2169,13 @@ def _callback(
     # the compile + execute when the step is non-terminal; the cache
     # entry would never be re-used productively anyway.
     if is_terminal:
-        compiled_exact = cached_compile(
-            b"exact:" + exact_cache_key, _do_compile_exact)
+        try:
+            compiled_exact = cached_compile(
+                b"exact:" + exact_cache_key, _do_compile_exact)
+        except Exception as _exc:
+            if not _is_oom(_exc):
+                raise
+            return _oom_truncate("exact compile", _exc)
     else:
         compiled_exact = None
     _pf("cb.xla_compile")
@@ -2097,88 +2234,127 @@ def _callback(
     latency_samples: list[float] = []
     peak_mem_samples: list[float] = []
 
-    for i in range(n_points):
-        if eval_samples:
-            eval_args_i = [arg[i] for arg in eval_samples]
-        else:
-            eval_args_i = list(args)
-        if callback_device is not None:
-            eval_args_i = [jax.device_put(d, callback_device) for d in eval_args_i]
-
-        # ResourceMonitor already runs ``jax.effects_barrier()`` in
-        # ``__enter__`` / ``__exit__``, so we don't need an extra
-        # ``block_until_ready`` on the result — the barriers drain the
-        # device queue both for the timer and the memory tracker.
-        #
-        # ``ALPHAGRAD_BYPASS_RESOURCE_MONITOR=1`` skips the construction +
-        # context manager entirely (vs. the lighter
-        # ``ALPHAGRAD_DISABLE_RESOURCE_MONITOR`` which only swapped the
-        # class to a no-op). This is the strongest cut available short
-        # of patching the import: no monitor object is created, no
-        # ``__enter__`` / ``__exit__`` runs, no ``stats`` dict is read.
-        # Used to isolate whether the per-call Python lifecycle around
-        # ``ResourceMonitor`` (not its C++ tracker) leaks. peak_memory +
-        # latency_ns are zero for the run.
-        inner = max(1, int(getattr(config, "latency_inner_reps", 1)))
-        _direct = os.environ.get("ALPHAGRAD_DIRECT_MEASURE", "0") == "1"
-        for _rep in range(n_reps):
-            if os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1":
-                out_approx = compiled_approx(*eval_args_i)
-                latency_samples.append(0.0)
-                peak_mem_samples.append(0.0)
-            elif _direct:
-                # Spec-native primitives, no jax_memory_monitor object at all
-                # (its per-call C++ trackers are the leak that killed v10):
-                # clear_memory_stats() resets the high-water mark, the inner
-                # loop is timed with perf_counter around a drained queue, and
-                # peak_bytes_in_use is read per device afterwards. NOTE: this
-                # reports the ABSOLUTE allocator peak (spec formulation), not
-                # ResourceMonitor's above-baseline delta — don't flip the flag
-                # mid-campaign.
-                for _d in unique_devices:
-                    if hasattr(_d, "clear_memory_stats"):
-                        _d.clear_memory_stats()
-                jax.effects_barrier()
-                _t0 = time.perf_counter()
-                for _k in range(inner):
-                    out_approx = compiled_approx(*eval_args_i)
-                jax.block_until_ready(out_approx)
-                _t1 = time.perf_counter()
-                _peak = 0.0
-                for _d in unique_devices:
-                    _stats = _d.memory_stats() or {}
-                    _peak = max(_peak, float(_stats.get("peak_bytes_in_use", 0.0)))
-                latency_samples.append((_t1 - _t0) / inner * 1e9)  # → ns
-                peak_mem_samples.append(_peak)
+    # OOM during EXECUTION is truncation too (see _oom_truncate): the
+    # measurement allocates the full approximated Jacobian, so a graph that
+    # compiled fine can still exhaust the device here. Excluded from the
+    # gradient rather than scored.
+    try:
+        for i in range(n_points):
+            if eval_samples:
+                eval_args_i = [arg[i] for arg in eval_samples]
             else:
-                with _get_resource_monitor(unique_devices) as monitor:
-                    # Accumulation loop (spec, default 50 when opted in): the
-                    # executions queue back-to-back inside one monitor window
-                    # and the exit barrier drains them all, so time/inner is a
-                    # per-execution latency with dispatch + timer overhead
-                    # amortized. Peak memory is unaffected (same executable,
-                    # same buffers each pass).
+                eval_args_i = list(args)
+            if callback_device is not None:
+                eval_args_i = [jax.device_put(d, callback_device) for d in eval_args_i]
+
+            # ResourceMonitor already runs ``jax.effects_barrier()`` in
+            # ``__enter__`` / ``__exit__``, so we don't need an extra
+            # ``block_until_ready`` on the result — the barriers drain the
+            # device queue both for the timer and the memory tracker.
+            #
+            # ``ALPHAGRAD_BYPASS_RESOURCE_MONITOR=1`` skips the construction +
+            # context manager entirely (vs. the lighter
+            # ``ALPHAGRAD_DISABLE_RESOURCE_MONITOR`` which only swapped the
+            # class to a no-op). This is the strongest cut available short
+            # of patching the import: no monitor object is created, no
+            # ``__enter__`` / ``__exit__`` runs, no ``stats`` dict is read.
+            # Used to isolate whether the per-call Python lifecycle around
+            # ``ResourceMonitor`` (not its C++ tracker) leaks. peak_memory +
+            # latency_ns are zero for the run.
+            inner = max(1, int(getattr(config, "latency_inner_reps", 1)))
+            _direct = os.environ.get("ALPHAGRAD_DIRECT_MEASURE", "0") == "1"
+            for _rep in range(n_reps):
+                if os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1":
+                    out_approx = compiled_approx(*eval_args_i)
+                    latency_samples.append(0.0)
+                    peak_mem_samples.append(0.0)
+                elif _direct:
+                    # Spec-native primitives, no jax_memory_monitor object at all
+                    # (its per-call C++ trackers are the leak that killed v10):
+                    # clear_memory_stats() resets the high-water mark, the inner
+                    # loop is timed with perf_counter around a drained queue, and
+                    # peak_bytes_in_use is read per device afterwards.
+                    #
+                    # ABOVE-BASELINE DELTA, not the absolute high-water mark.
+                    # peak_bytes_in_use is a DEVICE-WIDE ABSOLUTE counter, and
+                    # clear_memory_stats() resets the COUNTER but not the
+                    # resident baseline -- so an absolute reading is
+                    # (resident baseline + this call transient). Measured: a
+                    # dirty allocator made four very different approximations
+                    # all read ~281 MB when the true per-call cost was 1.6 MB.
+                    # A 9-method comparison ranked this delta first among
+                    # runtime methods: CV 0.0000% over 200 reps, byte-identical
+                    # across separate processes, 0 drift after a 3 GB
+                    # alloc/free or a real OOM. It is exactly what
+                    # ResourceMonitor computes internally.
+                    # CAVEAT: device-wide, so a co-resident actor allocating on
+                    # the same GPU inflates it (CV 49.7% under a noisy
+                    # neighbour) -- keep one measure process per device.
+                    for _d in unique_devices:
+                        if hasattr(_d, "clear_memory_stats"):
+                            _d.clear_memory_stats()
+                    jax.effects_barrier()
+                    _base = 0.0
+                    for _d in unique_devices:
+                        _bstats = _d.memory_stats() or {}
+                        _base += float(_bstats.get("bytes_in_use", 0.0))
+                    _t0 = time.perf_counter()
                     for _k in range(inner):
                         out_approx = compiled_approx(*eval_args_i)
-                # Key by name instead of unpacking ``.values()`` so this
-                # stays robust to dict-order / API tweaks in
-                # jax_memory_monitor.
-                latency_s = float(monitor.stats.get("time", 0.0)) / inner
-                peak_bytes = float(monitor.stats.get("memory", 0.0))
-                latency_samples.append(latency_s * 1e9)  # → ns
-                peak_mem_samples.append(peak_bytes)
+                    jax.block_until_ready(out_approx)
+                    _t1 = time.perf_counter()
+                    _peak_abs = 0.0
+                    for _d in unique_devices:
+                        _stats = _d.memory_stats() or {}
+                        _peak_abs += float(_stats.get("peak_bytes_in_use", 0.0))
+                    _peak = max(0.0, _peak_abs - _base)
+                    latency_samples.append((_t1 - _t0) / inner * 1e9)  # → ns
+                    peak_mem_samples.append(_peak)
+                else:
+                    with _get_resource_monitor(unique_devices) as monitor:
+                        # Accumulation loop (spec, default 50 when opted in): the
+                        # executions queue back-to-back inside one monitor window
+                        # and the exit barrier drains them all, so time/inner is a
+                        # per-execution latency with dispatch + timer overhead
+                        # amortized. Peak memory is unaffected (same executable,
+                        # same buffers each pass).
+                        for _k in range(inner):
+                            out_approx = compiled_approx(*eval_args_i)
+                    # Key by name instead of unpacking ``.values()`` so this
+                    # stays robust to dict-order / API tweaks in
+                    # jax_memory_monitor.
+                    latency_s = float(monitor.stats.get("time", 0.0)) / inner
+                    peak_bytes = float(monitor.stats.get("memory", 0.0))
+                    latency_samples.append(latency_s * 1e9)  # → ns
+                    peak_mem_samples.append(peak_bytes)
 
-        out_approxs.append(out_approx)
-        # ``compiled_exact`` is only executed at the terminal step
-        # (see the ``is_terminal`` guard around its compile, above).
-        # For non-terminal steps we still loop n_samples times for
-        # ``compiled_approx`` (peak_memory + latency need it), but
-        # we skip the gold-standard execution that the quality
-        # comparison would otherwise consume.
-        if compiled_exact is not None:
-            out_exact = compiled_exact(*eval_args_i)
-            out_exacts.append(out_exact)
+            out_approxs.append(out_approx)
+            # ``compiled_exact`` is only executed at the terminal step
+            # (see the ``is_terminal`` guard around its compile, above).
+            # For non-terminal steps we still loop n_samples times for
+            # ``compiled_approx`` (peak_memory + latency need it), but
+            # we skip the gold-standard execution that the quality
+            # comparison would otherwise consume.
+            if compiled_exact is not None:
+                _ex_key = _eval_digest(eval_args_i) if _CACHE_EXACT else None
+                _hit = _EXACT_CACHE.get(_ex_key) if _ex_key else None
+                if _hit is not None:
+                    out_exacts.append(_hit)
+                else:
+                    out_exact = compiled_exact(*eval_args_i)
+                    out_exacts.append(out_exact)
+                    if _ex_key is not None:
+                        # Bounded: one episode's worth of samples. A new
+                        # episode changes every digest, so the old entries are
+                        # dead weight and get dropped wholesale.
+                        if len(_EXACT_CACHE) >= max(n_points, 1):
+                            _EXACT_CACHE.clear()
+                        _EXACT_CACHE[_ex_key] = out_exact
 
+    except Exception as _exc:
+        if not _is_oom(_exc):
+            raise
+        return _oom_truncate('measurement', _exc)
     _pf("cb.exec_measure")
     latency_ns = (
         float(_aggregate_samples(latency_samples, want_top_quartile=True))
@@ -2215,23 +2391,30 @@ def _callback(
         for out_approx, out_exact in zip(out_approxs, out_exacts):
             jac_approx = out_approx[1] if config.has_aux else out_approx
             jac_exact = out_exact[1] if config.has_aux else out_exact
+            # Both come from one pass over the two Jacobians; frob is the
+            # trained channel, cos is log-only but essentially free once the
+            # tensors are here (the exact COMPILE above is the real cost, and
+            # frob needs it regardless).
             cos, rel_frob = _quality_metrics(jac_exact, jac_approx)
             cosines.append(cos)
             frobs.append(rel_frob)
         cosine_sim = float(_aggregate_samples(cosines, want_top_quartile=True))
         frob_residual = float(_aggregate_samples(frobs, want_top_quartile=True))
-        # XLA-analysis side-channel: deterministic peak estimate for the
-        # approx executable + the exact/approx compression ratio (see
-        # consume_xla_memory_stats). Terminal-only — one record per episode
-        # per env, negligible cost against the exact compile above.
-        _approx_bytes = _memory_analysis_bytes(compiled_approx)
-        _exact_bytes = (
-            _memory_analysis_bytes(compiled_exact)
-            if compiled_exact is not None
-            else None
-        )
-        if _approx_bytes is not None:
-            _record_xla_memory(_approx_bytes, _exact_bytes)
+        # XLA-analysis side-channel (log-only: xla_peak_memory + the
+        # exact/approx compression ratio). Nothing trains on it — the memory
+        # objective is the MEASURED peak_bytes_in_use, not this static
+        # estimate — so it rides the same skip flag as the count pass.
+        # memory_analysis() walks the compiled HLO, which is not free on the
+        # big graphs a working policy produces.
+        if not _SKIP_COUNT_OPS:
+            _approx_bytes = _memory_analysis_bytes(compiled_approx)
+            _exact_bytes = (
+                _memory_analysis_bytes(compiled_exact)
+                if compiled_exact is not None
+                else None
+            )
+            if _approx_bytes is not None:
+                _record_xla_memory(_approx_bytes, _exact_bytes)
     else:
         cosine_sim = 0.0
         frob_residual = 0.0
@@ -2251,56 +2434,38 @@ def _callback(
         dtype=jnp.float32,
     )
 
-    # DEGENERATE-PLAN GUARD. A terminal elimination that computes NOTHING —
-    # zero symbolic work and a zero/incomparable Jacobian — reports every cost
-    # channel as 0, i.e. the BEST possible cost. That is the reward-hacking
-    # optimum: the policy gets max reward on every cost channel for destroying
-    # the computation, and only the single quality channel objects. It is
-    # reachable even under `--exact` (where no approximation is possible at
-    # all) via an order that leaves paths un-eliminated — silently permitted by
-    # GRAPHAX_ALLOW_PARTIAL_ORDER, which the cluster runs set.
+    # ZERO-WORK PLANS ARE KEPT (user-directed 2026-07-28).
     #
-    # Such a plan is not cheap, it is INVALID, so it is scored worst in every
-    # channel instead of best-in-cost. This is what `_SENTINEL_BAD_REWARD` was
-    # always for; it had never been wired up.
-    if is_terminal:
-        _no_work = (muls_adds_fmas <= 0.0) and (flops <= 0.0)
-        # cos≈0 is NO LONGER sentinelled (user-directed): a destroyed
-        # Jacobian now reports its REAL measurements, and the quality
-        # gradient comes from frob_residual — ||J_e−J_a||_F/||J_e||_F is
-        # exactly 1.0 for an all-zero J_a and falls continuously as the
-        # plan degrades less, so "hard degrading" plans train instead of
-        # vanishing into a flat sentinel basin. Only the zero-WORK plan
-        # (fake-best costs, the reward hack) still sentinels.
-        _no_jac = False
-        if _no_work:
-            _record_degenerate_plan()
-            if os.environ.get("ALPHAGRAD_DEBUG_DEGEN", "0") == "1":
-                # Name the culprit: which condition fired, the raw channel
-                # values, and the plan's action mix — the aggregate counter
-                # says "16/16 degenerate" without ever saying WHY.
-                _n_skips = int(np.sum(_skips_np == 1)) if len(o_list) else 0
-                _spec_rows = np.asarray(partial_specs)
-                _n_quant = int(np.sum(_spec_rows[..., 0] == QUANT_SENTINEL))
-                _n_comp = int(np.sum(_spec_rows[..., 0] == COMPRESS_SENTINEL))
-                _n_diag = int(np.sum(_spec_rows[..., 0] >= 0))
-                _fr = np.asarray(face_specs)[: len(o_list)]
-                _fq = int(np.sum(_fr[..., 0] == QUANT_SENTINEL))
-                _fc = int(np.sum(_fr[..., 0] == COMPRESS_SENTINEL))
-                _fd = int(np.sum(_fr[..., 0] >= 0))
-                print(
-                    f"[degen] no_work={_no_work} (muls={muls_adds_fmas:.3g} "
-                    f"flops={flops:.3g}) no_jac={_no_jac} "
-                    f"(cos={cosine_sim:.3e} frob={frob_residual:.3e}) "
-                    f"vertex_rules(d/c/q)={_n_diag}/{_n_comp}/{_n_quant} "
-                    f"face_rules(d/c/q)={_fd}/{_fc}/{_fq} skips={_n_skips} "
-                    f"order={o_list}",
-                    flush=True,
-                )
-            # Soft-worst, NOT the measured values: a zero-work plan measures
-            # fake-fast (floor latency, tiny peak), which is exactly the
-            # reward hack this guard exists to block.
-            return tokens, eqn_ids, _degen_reward()
+    # A plan that computes nothing reports every COST channel at its best
+    # (fake-fast latency, tiny peak memory) — historically it was sentinelled
+    # because that is the classic reward hack. It is no longer refused:
+    #   * `frob_residual` is EXACTLY 1.0 for an all-zero Jacobian (the worst
+    #     attainable value), so the quality channel already punishes it;
+    #   * under PopArt each channel is normalised by its own running sigma, so
+    #     frob's [0, 1] range is rescaled to compete on equal terms with
+    #     nanoseconds and bytes — which is precisely the commensurability the
+    #     symlog+lambda scheme lacked (there, destroying the Jacobian paid 8.8x
+    #     better than computing it);
+    #   * and a refusal is a FLAT signal, which is what froze v17.
+    # So we let it measure, let frob punish it, and keep the gradient.
+    # This is telemetry only.
+    if (not _SKIP_COUNT_OPS and is_terminal
+            and (muls_adds_fmas <= 0.0) and (flops <= 0.0)):
+        _record_zero_work_plan()
+        if os.environ.get("ALPHAGRAD_DEBUG_DEGEN", "0") == "1":
+            _n_skips = int(np.sum(_skips_np == 1)) if len(o_list) else 0
+            _spec_rows = np.asarray(partial_specs)
+            _n_quant = int(np.sum(_spec_rows[..., 0] == QUANT_SENTINEL))
+            _n_comp = int(np.sum(_spec_rows[..., 0] == COMPRESS_SENTINEL))
+            _n_diag = int(np.sum(_spec_rows[..., 0] >= 0))
+            print(
+                f"[zero-work] KEPT (frob punishes): muls=0 "
+                f"lat={latency_ns:.3g} peak={peak_memory:.3g} "
+                f"cos={cosine_sim:.3e} frob={frob_residual:.3e} "
+                f"rules(d/c/q)={_n_diag}/{_n_comp}/{_n_quant} "
+                f"skips={_n_skips} order={o_list}",
+                flush=True,
+            )
 
     return tokens, eqn_ids, rewards
 
