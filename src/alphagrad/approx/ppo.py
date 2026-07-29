@@ -1766,6 +1766,17 @@ def make_argparser() -> argparse.ArgumentParser:
         "stationary across the whole run).",
     )
     p.add_argument(
+        "--unified-head", action="store_true",
+        help="Replace the autoregressive approximation sub-episode with ONE "
+             "64-output head per vertex (skip / op / i / j / prime-exponent "
+             "gates / reduce axes+fn / dtype). Exposed through "
+             "MicroActionPolicy's contract, so the env and loss are unchanged.")
+    p.add_argument(
+        "--force-pure-diag", action="store_true",
+        help="With --unified-head, force the block-diagonal factor to the "
+             "largest legal one (a pure diagonal IS the highest-factor "
+             "block-diagonal).")
+    p.add_argument(
         "--set-pointer", action="store_true",
         help="Use SetPointerVertexPolicy: a CONTENT-based pointer over the "
              "segment-pooled vertex memory with permutation-equivariant "
@@ -2417,7 +2428,18 @@ def _build_agent(
     # Dynamic-substeps head: only constructed when the flag is on so the
     # default agent stays leaner (one extra encoder + MicroActionHead is
     # non-trivial parameter cost).
-    if getattr(args, "dynamic_substeps", False):
+    if getattr(args, "dynamic_substeps", False) and getattr(args, "unified_head", False):
+        # ONE flat head per vertex instead of the autoregressive sub-episode.
+        # Presented through MicroActionPolicy's sample/evaluate contract so the
+        # env decoder, Trajectory and PPO loss are untouched.
+        from alphagrad.approx.unified_micro import UnifiedMicroPolicy
+        micro_action_policy = UnifiedMicroPolicy(
+            embd_dim=args.embd_dim,
+            max_substeps=args.max_substeps,
+            force_pure_diag=getattr(args, "force_pure_diag", False),
+            key=encoder_keys[13],
+        )
+    elif getattr(args, "dynamic_substeps", False):
         micro_action_policy = MicroActionPolicy(
             embd_dim=args.embd_dim,
             num_heads=args.num_heads,
@@ -2471,9 +2493,18 @@ def _build_agent(
 
 def _scale_output_heads(agent, scale: float):
     """Scale policy-head weights so the initial action distribution is near-uniform."""
-    agent = scale_module_weight(
-        agent, lambda a: a.vertex_policy.pointer_proj.weight, scale
-    )
+    # Vertex-head logit magnitude. PointerVertexPolicy scores through
+    # pointer_proj; SetPointerVertexPolicy scores through
+    # (k_proj(h) . q_proj(summary))/sqrt(E), so scaling k_proj scales
+    # the logits the same way and gives the same near-uniform init.
+    if hasattr(agent.vertex_policy, "pointer_proj"):
+        agent = scale_module_weight(
+            agent, lambda a: a.vertex_policy.pointer_proj.weight, scale
+        )
+    else:
+        agent = scale_module_weight(
+            agent, lambda a: a.vertex_policy.k_proj.weight, scale
+        )
     # Stage B.2.A: zero the data-feature projection's output so the initial
     # data embedding is `0` and the agent's behaviour at step 0 matches the
     # B.1 agent. Gradient still flows in normally once training starts.
@@ -2518,26 +2549,37 @@ def _scale_output_heads(agent, scale: float):
     # signal, so "near uniform" rather than "exactly uniform"; this is
     # the same trade-off the legacy rule-head scaling makes.
     if agent.micro_action_policy is not None:
-        agent = scale_module_weight(
-            agent,
-            lambda a: a.micro_action_policy.head.op_head.proj.weight,
-            scale,
-        )
-        agent = scale_module_weight(
-            agent,
-            lambda a: a.micro_action_policy.head.axis_i_head.key_proj.weight,
-            scale,
-        )
-        agent = scale_module_weight(
-            agent,
-            lambda a: a.micro_action_policy.head.axis_j_head.key_proj.weight,
-            scale,
-        )
-        agent = scale_module_weight(
-            agent,
-            lambda a: a.micro_action_policy.head.factor_head.head_proj.weight,
-            scale,
-        )
+        if hasattr(agent.micro_action_policy.head, "op_head"):
+            agent = scale_module_weight(
+                agent,
+                lambda a: a.micro_action_policy.head.op_head.proj.weight,
+                scale,
+            )
+            agent = scale_module_weight(
+                agent,
+                lambda a: a.micro_action_policy.head.axis_i_head.key_proj.weight,
+                scale,
+            )
+            agent = scale_module_weight(
+                agent,
+                lambda a: a.micro_action_policy.head.axis_j_head.key_proj.weight,
+                scale,
+            )
+            agent = scale_module_weight(
+                agent,
+                lambda a: a.micro_action_policy.head.factor_head.head_proj.weight,
+                scale,
+            )
+        else:
+            # UnifiedApproxHead: every field shares ONE output projection, so
+            # scaling its final Linear scales all 64 logits together and gives
+            # the same near-uniform initial distribution the four separate
+            # sub-head scalings gave the autoregressive head.
+            agent = scale_module_weight(
+                agent,
+                lambda a: a.micro_action_policy.head.proj.layers[-1].weight,
+                scale,
+            )
     return agent
 
 
