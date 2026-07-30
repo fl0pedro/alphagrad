@@ -442,11 +442,24 @@ def _quality_metrics(jac_exact, jac_approx):
 
 
 def _aggregate_samples(values, want_top_quartile: bool):
+    """Reduce a list of per-sample scalars to a single jnp scalar.
+
+    The central tendency is the MEDIAN. The winsorized mean it replaces still
+    averaged, so it still moved with every reading inside the interquartile
+    band; the median moves only with the middle one, which is what "a robust
+    summary of a noisy latency sample" actually means. Identical to the mean
+    whenever the readings are constant, and (unlike winsorizing) it needs no
+    quantile parameters and is correct at every sample count.
+
+    ``want_top_quartile`` is kept as the call-site's "this channel is noisy,
+    summarise it robustly" switch. Handles the empty-list case by returning
+    ``0.0``.
+    """
     if not values:
         return jnp.array(0.0, dtype=jnp.float32)
     stack = jnp.stack([jnp.asarray(v, dtype=jnp.float32) for v in values])
-    if want_top_quartile and stack.shape[0] >= 8:
-        return stack.sort()[6:8].mean()
+    if want_top_quartile and stack.shape[0] >= 2:
+        return jnp.median(stack)
     return stack.mean()
 
 

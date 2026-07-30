@@ -809,7 +809,7 @@ class EnvConfig(NamedTuple):
     terminal_rewards_only: bool = False
     # Measurement protocol (spec): `num_data_points` distinct eval samples x
     # `reps_per_point` repetitions each = the sample budget per measurement,
-    # reduced by a winsorized mean. Defaults 5 x 4 = 20. Reps only matter for
+    # reduced by a median. Defaults 5 x 4 = 20. Reps only matter for
     # timing noise, so when latency isn't measured we collapse to 1 rep.
     num_data_points: int = 5
     reps_per_point: int = 4
@@ -1465,19 +1465,6 @@ def _quality_metrics(jac_exact, jac_approx):
 _LAT_FLOOR_NS = 100.0
 
 
-def _winsorized_mean(stack, lo_q: float = 0.25, hi_q: float = 0.75):
-    """Winsorized mean: clip to the [lo_q, hi_q] quantile band, then mean.
-
-    The robust estimator the measurement spec asks for — insensitive to the
-    occasional scheduler hiccup (high outlier) AND to fake-fast readings (low
-    outlier), unlike the old ``sort()[6:8]`` band which was only correct for
-    exactly 8 samples and mislabeled "top-quartile".
-    """
-    lo = jnp.quantile(stack, lo_q)
-    hi = jnp.quantile(stack, hi_q)
-    return jnp.clip(stack, lo, hi).mean()
-
-
 _MEASURE_TURN = itertools.count()
 
 
@@ -1495,15 +1482,22 @@ def _next_measure_device(devices):
 def _aggregate_samples(values, want_top_quartile: bool):
     """Reduce a list of per-sample scalars to a single jnp scalar.
 
-    With ≥4 samples and `want_top_quartile` (the latency/quality path), takes a
-    winsorized mean over the interquartile band; otherwise a plain mean.
-    Handles the empty-list case by returning `0.0`.
+    The central tendency is the MEDIAN. The winsorized mean it replaces still
+    averaged, so it still moved with every reading inside the interquartile
+    band; the median moves only with the middle one, which is what "a robust
+    summary of a noisy latency sample" actually means. Identical to the mean
+    whenever the readings are constant, and (unlike winsorizing) it needs no
+    quantile parameters and is correct at every sample count.
+
+    ``want_top_quartile`` is kept as the call-site's "this channel is noisy,
+    summarise it robustly" switch. Handles the empty-list case by returning
+    ``0.0``.
     """
     if not values:
         return jnp.array(0.0, dtype=jnp.float32)
     stack = jnp.stack([jnp.asarray(v, dtype=jnp.float32) for v in values])
-    if want_top_quartile and stack.shape[0] >= 4:
-        return _winsorized_mean(stack)
+    if want_top_quartile and stack.shape[0] >= 2:
+        return jnp.median(stack)
     return stack.mean()
 
 
@@ -2202,13 +2196,13 @@ def _callback(
     # ------------------------------------------------------------------
     # Execution loop — runs once for peak_memory + quality, or 10x when
     # `measure_latency` is on (the latency reading is noisy enough that the
-    # top-quartile-mean smoothing from the original code is worth keeping).
+    # median smoothing from the original code is worth keeping).
     # ------------------------------------------------------------------
     # Measurement budget: `num_data_points` distinct eval samples x
     # `reps_per_point` timing repetitions. Reps exist only to average timer
     # noise, so without --measure-latency we take 1 rep per point. Quality is
     # deterministic in the input, so it is computed ONCE PER POINT (not per
-    # rep) and winsorized across points — the old code used point 0 only.
+    # rep) and medianed across points — the old code used point 0 only.
     n_points = max(1, int(getattr(config, "num_data_points", 5)))
     if eval_samples:
         n_points = min(n_points, len(eval_samples[0]))
@@ -2366,7 +2360,7 @@ def _callback(
     # not report an unbeatable latency. 0.0 stays 0.0 (= "not measured").
     if 0.0 < latency_ns < _LAT_FLOOR_NS:
         latency_ns = _LAT_FLOOR_NS
-    # Winsorized like latency (spec: one robust mean over the 5x4 budget); a
+    # Medianed like latency (spec: one robust summary over the 5x4 budget); a
     # plain max let a single outlier reading own the channel. Identical to max
     # whenever the readings are constant — the common case today.
     peak_memory = (
@@ -2391,15 +2385,15 @@ def _callback(
         for out_approx, out_exact in zip(out_approxs, out_exacts):
             jac_approx = out_approx[1] if config.has_aux else out_approx
             jac_exact = out_exact[1] if config.has_aux else out_exact
-            # Both come from one pass over the two Jacobians; frob is the
-            # trained channel, cos is log-only but essentially free once the
-            # tensors are here (the exact COMPILE above is the real cost, and
-            # frob needs it regardless).
-            cos, rel_frob = _quality_metrics(jac_exact, jac_approx)
+            # cos is the trained quality channel; the residual it returns
+            # alongside is discarded (frob was dropped as a channel).
+            cos, _rel_frob = _quality_metrics(jac_exact, jac_approx)
             cosines.append(cos)
-            frobs.append(rel_frob)
         cosine_sim = float(_aggregate_samples(cosines, want_top_quartile=True))
-        frob_residual = float(_aggregate_samples(frobs, want_top_quartile=True))
+        # frob is no longer a channel anything reads. The slot stays 0.0 for
+        # real plans; the SENTINEL writers still stamp it, and the Ray pool's
+        # sentinel test keys on that, so the wire format is unchanged.
+        frob_residual = 0.0
         # XLA-analysis side-channel (log-only: xla_peak_memory + the
         # exact/approx compression ratio). Nothing trains on it — the memory
         # objective is the MEASURED peak_bytes_in_use, not this static

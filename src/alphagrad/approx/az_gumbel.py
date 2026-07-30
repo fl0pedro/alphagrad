@@ -502,7 +502,7 @@ def lockstep_rollout_values(entries, depth):
     out = []
     for i, e in enumerate(live):
         if i in vmap_:
-            v4 = vmap_[i][1]  # mainline Agent heads [lat, mem, cos, frob]
+            v4 = vmap_[i][1]  # mainline Agent heads [lat, mem, cos]
             out.append(float(W4[0] * v4[0] + W4[1] * v4[1] + W4[3] * v4[2]))
         else:
             out.append(None)                               # terminal reached in-search
@@ -695,8 +695,8 @@ def _run(args) -> int:
         # rest); the critic keeps predicting PopArt-normalised values and its
         # existing predictions stay consistent across the stats jump.
         _o_mu, _o_sig, _n_mu, _n_sig = popart.update(raw[None, :])
-        # Mainline Agent: four single-output heads; rescale EXACTLY the three
-        # CH-mapped ones ([lat, mem, cos] <- CH rows 0, 1, 3), identity on frob.
+        # Mainline Agent: three single-output heads, all CH-mapped
+        # ([lat, mem, cos] <- CH rows 0, 1, 3).
         def _stats4(mu, sig):
             m = np.zeros(4, dtype=np.float32)
             s = np.ones(4, dtype=np.float32)
