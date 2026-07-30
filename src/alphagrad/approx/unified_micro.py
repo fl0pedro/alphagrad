@@ -158,9 +158,14 @@ class UnifiedMicroPolicy(eqx.Module):
         op_mask = op_mask.at[3].set(0.0)
         # No non-coprime pair anywhere -> BLOCKDIAG can only be a no-op.
         op_mask = op_mask.at[OP_BLOCKDIAG].mul(any_pair.astype(jnp.float32))
-        op_mask = jnp.where(jnp.sum(op_mask) > 0, op_mask,
-                            jnp.zeros((NUM_APPROX_OPS,)).at[OP_QUANT].set(1.0))
-        return op_mask, i_mask, j_mask, axis_mask, pair_ok
+        # If nothing is legal the categorical still needs a non-empty support
+        # (an all -1e9 softmax gives NaN), but the ACTION must be `skip`, not a
+        # substituted QUANT -- see module docstring.
+        no_op_legal = jnp.sum(op_mask) <= 0
+        op_mask = jnp.where(no_op_legal,
+                            jnp.zeros((NUM_APPROX_OPS,)).at[OP_QUANT].set(1.0),
+                            op_mask)
+        return op_mask, i_mask, j_mask, axis_mask, pair_ok, no_op_legal
 
     def _canonical_axes(self, z, axes, axis_mask):
         """The axis set that will actually be EMITTED, so score() sees it too.
@@ -265,7 +270,7 @@ class UnifiedMicroPolicy(eqx.Module):
     def sample(self, vertex_context, init_features, tables, key,
                pair_valid=None, compress_valid=None,
                quant_legality_mask=None, op_legality_override=None):
-        op_mask, i_mask, j_mask, axis_mask, pair_ok = self._masks(
+        op_mask, i_mask, j_mask, axis_mask, pair_ok, no_op_legal = self._masks(
             init_features, pair_valid, compress_valid, op_legality_override,
             tables)
         (z, skip, op, i_idx, j_idx, axes, rfn, dt) = self.head.sample_fields(
@@ -274,6 +279,7 @@ class UnifiedMicroPolicy(eqx.Module):
         # Canonicalise BEFORE scoring: the value scored must be the value
         # emitted, or sample and evaluate score different variables.
         axes = self._canonical_axes(z, axes, axis_mask)
+        skip = jnp.logical_or(skip, no_op_legal)
         lp, ent = self.head.score(
             z, skip, op, i_idx, j_idx, axes, rfn, dt,
             op_mask=op_mask, i_mask=i_mask, j_mask=j_mask,
@@ -289,7 +295,7 @@ class UnifiedMicroPolicy(eqx.Module):
     def evaluate(self, vertex_context, init_features, tables, actions,
                  pair_valid=None, compress_valid=None,
                  quant_legality_mask=None, op_legality_override=None):
-        op_mask, i_mask, j_mask, axis_mask, pair_ok = self._masks(
+        op_mask, i_mask, j_mask, axis_mask, pair_ok, _ = self._masks(
             init_features, pair_valid, compress_valid, op_legality_override,
             tables)
         z = self.head.logits(vertex_context)
