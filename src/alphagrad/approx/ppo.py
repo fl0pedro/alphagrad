@@ -5720,11 +5720,25 @@ def main():
                   f"rollouts -> {_R.shape[0]}/{_ok.shape[0]} usable "
                   f"(env, step) returns", flush=True)
             if _R.shape[0] >= 2:
-                popart_m1 = jnp.asarray(_R.mean(axis=0), dtype=jnp.float32)
-                popart_m2 = jnp.asarray((_R ** 2).mean(axis=0), dtype=jnp.float32)
-                popart_w = jnp.ones((NUM_VALUE_HEADS,), dtype=jnp.float32)
                 _mu0 = _R.mean(axis=0)
                 _sd0 = _R.std(axis=0)
+                # A CONSTANT channel is not seed-able and must stay COLD.
+                # Random plans routinely return cosine == 0 at EVERY step (an
+                # all-zero Jacobian and a half-destroyed one both read ~0), so
+                # that channel's sample has sigma exactly 0 and carries no
+                # scale information. Stamping w=1 on it anyway would claim the
+                # accumulator is already warm, and _popart_update's debiasing
+                # would then let the FIRST real measurement move mu by only
+                # beta instead of adopting the batch exactly -- the seed would
+                # actively slow down learning the one channel it knows nothing
+                # about. So w is per-channel: warm where the sample has spread,
+                # cold (w=0, the untouched init) where it does not.
+                _warm = _sd0 > 1e-12
+                popart_m1 = jnp.asarray(np.where(_warm, _mu0, 0.0),
+                                        dtype=jnp.float32)
+                popart_m2 = jnp.asarray(np.where(_warm, (_R ** 2).mean(axis=0),
+                                                 0.0), dtype=jnp.float32)
+                popart_w = jnp.asarray(_warm.astype(np.float32))
                 # Variance of the NORMALISED target the critic will see. It
                 # is 1.0 by construction UNLESS `--popart-sigma-min` floors the
                 # channel's sigma, in which case the channel is being SHRUNK
@@ -5734,7 +5748,12 @@ def main():
                 _sd_eff = np.maximum(_sd0, float(args.popart_sigma_min))
                 _zvar = (((_R - _mu0) / _sd_eff) ** 2).mean(axis=0)
                 for _k, _nm in enumerate(HEAD_NAMES):
-                    _fl = "  <-- sigma FLOORED" if _sd0[_k] < _sd_eff[_k] else ""
+                    if not _warm[_k]:
+                        _fl = "  <-- CONSTANT in the sample, left COLD"
+                    elif _sd0[_k] < _sd_eff[_k]:
+                        _fl = "  <-- sigma FLOORED by --popart-sigma-min"
+                    else:
+                        _fl = ""
                     print(f"[popart-init]   {_nm}: mu={_mu0[_k]:.6g} "
                           f"sigma={_sd0[_k]:.6g} norm_var={_zvar[_k]:.4f}{_fl}",
                           flush=True)
