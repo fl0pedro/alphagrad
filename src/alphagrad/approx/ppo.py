@@ -229,17 +229,42 @@ def _traced_inlined(target_fn, xs):
     return ClosedJaxpr(jx, consts)
 
 
+# Set once from --no-symlog BEFORE any jit tracing, so the traced graphs
+# capture the decision as a constant. A one-element list rather than a bare
+# global so the setter does not need `global` in every scope.
+_NO_SYMLOG_ALL: list = [False]
+
+
 def _symlog_rewards(reward_vec: "jax.Array") -> "jax.Array":
     """Apply symlog elementwise on the last axis, leaving cosine_sim raw.
 
     ``reward_vec`` has trailing dim ``NUM_REWARDS``. The mask is broadcast
     against any leading batch / time dims so the call is shape-agnostic.
+
+    Under ``--no-symlog`` this is the IDENTITY: PopArt already normalises each
+    channel by its own running sigma, which is the same job symlog was doing,
+    and stacking the two pushes the per-channel spread under ``sigma_min``
+    (measured: mem sigma 0.00694 vs a 0.1 floor) so the channel gets shrunk
+    instead of scaled.
     """
+    if _NO_SYMLOG_ALL[0]:
+        return reward_vec
     return jnp.where(
         _NO_SYMLOG_MASK,
         reward_vec,
         reward_normalization_fn(reward_vec),
     )
+
+
+def _value_target(x: "jax.Array") -> "jax.Array":
+    """The value head's regression target.
+
+    Under PopArt the returns are already built from whatever space the rewards
+    live in, so applying ``reward_normalization_fn`` here symlogs them A SECOND
+    TIME. Identity under --no-symlog; unchanged otherwise so the legacy path is
+    bit-identical.
+    """
+    return x if _NO_SYMLOG_ALL[0] else reward_normalization_fn(x)
 
 
 def _apply_mult_gate(
@@ -1765,6 +1790,15 @@ def make_argparser() -> argparse.ArgumentParser:
         "are the ONLY scaling (manual-weight mode; reward semantics are "
         "stationary across the whole run).",
     )
+    p.add_argument(
+        "--no-symlog", action="store_true",
+        help="Disable the symlog reward transform and let PopArt do the "
+             "per-channel scaling alone. Symlog and PopArt address the SAME "
+             "cross-channel dynamic range; stacking them squashes the "
+             "per-channel spread under --popart-sigma-min (measured: mem "
+             "sigma 0.00694 against a 0.1 floor) so the channel is shrunk "
+             "~14x instead of normalised. Only meaningful with "
+             "--advantage-norm popart.")
     p.add_argument(
         "--lean-logging", action="store_true",
         help="Log only aggregates (means, entropy, KL, collapse counts, "
@@ -4206,7 +4240,7 @@ def main():
         # in scalar mode only slot 0 of (values, estim_returns) is alive.
         if args.loss_mode == "scalar":
             value_loss = jnp.mean(
-                (values[..., 0] - reward_normalization_fn(batch.estim_returns[..., 0]))
+                (values[..., 0] - _value_target(batch.estim_returns[..., 0]))
                 ** 2
             )
             explained_var = explained_variance(
@@ -4215,7 +4249,7 @@ def main():
         else:
             value_loss = jnp.mean(
                 jnp.sum(
-                    (values - reward_normalization_fn(batch.estim_returns)) ** 2,
+                    (values - _value_target(batch.estim_returns)) ** 2,
                     axis=-1,
                 )
             )
@@ -4883,6 +4917,18 @@ def main():
         train_episode = eqx.filter_jit(train_episode)
 
     # Reporting.
+    # BEFORE any jit tracing: the transforms capture this as a constant.
+    if getattr(args, "no_symlog", False):
+        _NO_SYMLOG_ALL[0] = True
+        if args.advantage_norm != "popart":
+            print(
+                "[warn] --no-symlog without --advantage-norm popart leaves the "
+                "raw ~1e8 reward scale unnormalised; PopArt is what replaces "
+                "symlog's magnitude compression.", flush=True)
+        else:
+            print("[cfg] symlog DISABLED; PopArt alone scales the channels.",
+                  flush=True)
+
     _wandb_config = dict(vars(args))
     _wandb_config.update(_repo_commits())
     wandb.init(
@@ -5646,6 +5692,13 @@ def main():
                 )
                 _wrows.append(np.asarray(_wrew, dtype=np.float64))
             _R = np.concatenate(_wrows, axis=0)
+            # PopArt is updated with SYMLOG'd rewards (`sl_reward =
+            # _symlog_rewards(traj_reward)` in the loss), so the seed must be
+            # in symlog space too. Seeding raw put mu_mem at -1.43e8 where the
+            # symlog target is -18.8 and cost ~500 episodes of EMA correction.
+            # _symlog_rewards leaves cosine_sim raw (_NO_SYMLOG_MASK).
+            _R = np.asarray(_symlog_rewards(jnp.asarray(_R, dtype=jnp.float32)),
+                            dtype=np.float64)
             _R = _R[:, list(HEAD_REWARD_INDICES)]
             # Drop sentinels / non-finite: a failed measurement must not define
             # the scale every later advantage is divided by.
