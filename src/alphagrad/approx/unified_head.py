@@ -109,28 +109,9 @@ class UnifiedApproxHead(eqx.Module):
 
     proj: eqx.nn.MLP
 
-    # Output-bias init. See module docstring: a zero-bias head sits at p=0.5 on
-    # every gate, which approximates half the vertices and compresses ~4-5 of
-    # the 9 axes per REDUCE -- measured to give ||J_approx|| == 0 on every plan,
-    # i.e. a constant-zero cosine channel with no gradient anywhere.
-    INIT_SKIP_BIAS = 1.5      # p(skip) ~ 0.82
-    INIT_AXIS_BIAS = -2.0     # p(axis) ~ 0.12
-
     def __init__(self, embd_dim: int, *, hidden: int | None = None, key):
         self.proj = eqx.nn.MLP(embd_dim, HEAD_WIDTH, hidden or embd_dim,
                                depth=1, key=key)
-        # Bias the START of the search toward EXACT. Weights are untouched, so
-        # the head keeps its full range and full gradient; only the point it
-        # starts from moves.
-        layers = self.proj.layers
-        last = max(i for i, l in enumerate(layers)
-                   if isinstance(l, eqx.nn.Linear))
-        b = layers[last].bias
-        if b is not None:
-            b = b.at[O_SKIP].add(self.INIT_SKIP_BIAS)
-            b = b.at[O_AXES:O_RFN].add(self.INIT_AXIS_BIAS)
-            self.proj = eqx.tree_at(
-                lambda m: m.layers[last].bias, self.proj, b)
 
     def logits(self, ctx):
         return self.proj(ctx)
