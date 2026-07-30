@@ -1,0 +1,634 @@
+{
+  "best_overall": {
+    "return": -33059786.0,
+    "ep": 7,
+    "rewards_raw": {
+      "muls_adds_fmas": -110992408576.0,
+      "flops": -26297608.0,
+      "latency_ns": -742877.375,
+      "max_io_sum": -98253384.0,
+      "bytes_accessed": -32966532.0,
+      "peak_memory": -32316908.0,
+      "cosine_sim": 1.0,
+      "frob_residual": -0.00037619948852807283,
+      "xla_peak_memory": -32316908.0,
+      "bkstep_acc": 0.0
+    },
+    "rewards_weighted": {
+      "muls_adds_fmas": -0.0,
+      "flops": -0.0,
+      "latency_ns": -742877.375,
+      "max_io_sum": -0.0,
+      "bytes_accessed": -0.0,
+      "peak_memory": -32316908.0,
+      "cosine_sim": 0.0,
+      "frob_residual": -0.00037619948852807283,
+      "xla_peak_memory": -0.0,
+      "bkstep_acc": 0.0
+    },
+    "seq": [
+      {
+        "vertex": 10,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "max"
+          }
+        ]
+      },
+      {
+        "vertex": 8,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "int32"
+          }
+        ]
+      },
+      {
+        "vertex": 9,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "mean"
+          }
+        ]
+      },
+      {
+        "vertex": 3,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "uint8"
+          }
+        ]
+      },
+      {
+        "vertex": 6,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_min"
+          }
+        ]
+      },
+      {
+        "vertex": 2,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_min"
+          }
+        ]
+      },
+      {
+        "vertex": 4,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_min"
+          }
+        ]
+      },
+      {
+        "vertex": 1,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_min"
+          }
+        ]
+      },
+      {
+        "vertex": 11,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_min"
+          }
+        ]
+      },
+      {
+        "vertex": 5,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "mean"
+          }
+        ]
+      },
+      {
+        "vertex": 7,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_min"
+          }
+        ]
+      },
+      {
+        "vertex": 12,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "min"
+          }
+        ]
+      }
+    ]
+  },
+  "best_per_channel": {
+    "latency_ns": {
+      "ep": 0,
+      "env_idx": 2,
+      "raw_value": -42268.5859375,
+      "weighted_value": -42268.5859375,
+      "weighted_total": -565664512.0,
+      "all_raw": {
+        "muls_adds_fmas": -59426607104.0,
+        "flops": -10514616.0,
+        "latency_ns": -42268.5859375,
+        "max_io_sum": -35150784.0,
+        "bytes_accessed": -33044012.0,
+        "peak_memory": -565622272.0,
+        "cosine_sim": 1.0,
+        "frob_residual": -0.00037618406349793077,
+        "xla_peak_memory": -32317164.0,
+        "bkstep_acc": 0.0
+      },
+      "all_weighted": {
+        "muls_adds_fmas": -0.0,
+        "flops": -0.0,
+        "latency_ns": -42268.5859375,
+        "max_io_sum": -0.0,
+        "bytes_accessed": -0.0,
+        "peak_memory": -565622272.0,
+        "cosine_sim": 0.0,
+        "frob_residual": -0.00037618406349793077,
+        "xla_peak_memory": -0.0,
+        "bkstep_acc": 0.0
+      },
+      "seq": [
+        {
+          "vertex": 4,
+          "ops": []
+        },
+        {
+          "vertex": 2,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 9,
+          "ops": []
+        },
+        {
+          "vertex": 3,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 7,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                2
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 10,
+          "ops": []
+        },
+        {
+          "vertex": 6,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 11,
+          "ops": []
+        },
+        {
+          "vertex": 12,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "complex64"
+            }
+          ]
+        },
+        {
+          "vertex": 1,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 5,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 8,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "uint32"
+            }
+          ]
+        }
+      ]
+    },
+    "peak_memory": {
+      "ep": 5,
+      "env_idx": 1,
+      "raw_value": -32312668.0,
+      "weighted_value": -32312668.0,
+      "weighted_total": -33129180.0,
+      "all_raw": {
+        "muls_adds_fmas": -8439622144.0,
+        "flops": -9703496.0,
+        "latency_ns": -816512.5625,
+        "max_io_sum": -32023832.0,
+        "bytes_accessed": -32995628.0,
+        "peak_memory": -32312668.0,
+        "cosine_sim": 1.0,
+        "frob_residual": -0.00037622248055413365,
+        "xla_peak_memory": -32312668.0,
+        "bkstep_acc": 0.0
+      },
+      "all_weighted": {
+        "muls_adds_fmas": -0.0,
+        "flops": -0.0,
+        "latency_ns": -816512.5625,
+        "max_io_sum": -0.0,
+        "bytes_accessed": -0.0,
+        "peak_memory": -32312668.0,
+        "cosine_sim": 0.0,
+        "frob_residual": -0.00037622248055413365,
+        "xla_peak_memory": -0.0,
+        "bkstep_acc": 0.0
+      },
+      "seq": [
+        {
+          "vertex": 7,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "mean"
+            }
+          ]
+        },
+        {
+          "vertex": 5,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "mean"
+            }
+          ]
+        },
+        {
+          "vertex": 4,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "mean"
+            }
+          ]
+        },
+        {
+          "vertex": 11,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 9,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "mean"
+            }
+          ]
+        },
+        {
+          "vertex": 12,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 1,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "mean"
+            }
+          ]
+        },
+        {
+          "vertex": 3,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "mean"
+            }
+          ]
+        },
+        {
+          "vertex": 10,
+          "ops": []
+        },
+        {
+          "vertex": 2,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_min"
+            }
+          ]
+        },
+        {
+          "vertex": 6,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "mean"
+            }
+          ]
+        },
+        {
+          "vertex": 8,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        }
+      ]
+    },
+    "frob_residual": {
+      "ep": 0,
+      "env_idx": 0,
+      "raw_value": -0.0003761820844374597,
+      "weighted_value": -0.0003761820844374597,
+      "weighted_total": -597368064.0,
+      "all_raw": {
+        "muls_adds_fmas": -109751902208.0,
+        "flops": -18395528.0,
+        "latency_ns": -52901.4296875,
+        "max_io_sum": -66642500.0,
+        "bytes_accessed": -33046572.0,
+        "peak_memory": -597315136.0,
+        "cosine_sim": 1.0,
+        "frob_residual": -0.0003761820844374597,
+        "xla_peak_memory": -32317932.0,
+        "bkstep_acc": 0.0
+      },
+      "all_weighted": {
+        "muls_adds_fmas": -0.0,
+        "flops": -0.0,
+        "latency_ns": -52901.4296875,
+        "max_io_sum": -0.0,
+        "bytes_accessed": -0.0,
+        "peak_memory": -597315136.0,
+        "cosine_sim": 0.0,
+        "frob_residual": -0.0003761820844374597,
+        "xla_peak_memory": -0.0,
+        "bkstep_acc": 0.0
+      },
+      "seq": [
+        {
+          "vertex": 11,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 9,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 3,
+          "ops": []
+        },
+        {
+          "vertex": 7,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 2,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 4,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 1,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 12,
+          "ops": []
+        },
+        {
+          "vertex": 6,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 8,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 5,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 10,
+          "ops": []
+        }
+      ]
+    }
+  },
+  "quantile_sequences": {}
+}

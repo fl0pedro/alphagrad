@@ -1,35 +1,39 @@
-"""ONE approximation head, SIMPLIFIED. 16 outputs, one forward pass.
+"""ONE approximation head. 32 outputs, one forward pass, one sample.
 
-Was 64 outputs. The prime-exponent gates (32), the reduce-axis gates (9), the
-reduce-fn softmax (5) and the dtype gate (1) are all gone -- each replaced by a
-fixed rule, because the free parameter was not buying anything the search could
-use.
+The 64-output layout MINUS the 32 prime-exponent gates and the gcd /
+force-pure-diag option. Everything else is unchanged.
 
-LAYOUT (16 logits)
+LAYOUT (32 logits)
 ------------------
-    [ 0: 1)  skip   Bernoulli
-    [ 1: 4)  op     softmax {blockdiag, reduce, quant}
-    [ 4:10)  i      softmax over 1..6
-    [10:16)  j      softmax over 1..6
+    [ 0: 1)  skip            Bernoulli
+    [ 1: 5)  op              softmax {blockdiag, reduce, quant, none}
+    [ 5:11)  blockdiag i     softmax over 1..6
+    [11:17)  blockdiag j     softmax over 1..6
+    [17:26)  reduce axes     9 independent gates (axes 0..8)
+    [26:31)  reduce fn       softmax {mean, min, max, abs_min, abs_max}
+    [31:32)  dtype           Bernoulli {float32, bfloat16}
 
-FIXED RULES (no longer sampled)
--------------------------------
-* BLOCKDIAG. Block count is ``k = min(N_i, N_j)``, so:
-    - SQUARE pair (N x N)  -> k = N  -> blocks are 1x1 -> a PURE DIAGONAL.
-    - NON-SQUARE (2 x 8)   -> k = 2  -> blocks are 1x4, two of them.
-  This is the whole factor decision. It removes the prime-exponent machinery,
-  which sampled factors up to ~7e8 that OVERFLOWED int32 and were then clamped
-  to a legal divisor anyway -- the clamp was doing the real work.
-* REDUCE. Always ``axes=(0,)``, ``kind="mean"``: first axis, mean.
-* QUANT. Always ``bfloat16``.
+WHY THE FACTOR IS NO LONGER SAMPLED
+-----------------------------------
+The prime gates spanned ~7e8, OVERFLOWED int32, and were then clamped to a
+legal divisor of ``gcd(N_i, N_j)`` -- so the clamp, not the gates, decided the
+factor. 32 of the head's 64 outputs were spending gradient on a quantity the
+environment overrode. They are gone. Instead:
 
-Every remaining field is still branch-masked in log-prob and entropy: only what
-the chosen op CONSUMES contributes, so an unused head cannot collect gradient
-from a reward it had no part in.
+    factor = gcd(N_i, N_j)
 
-Because ``k`` is now a deterministic function of the operand shapes rather than
-a sampled quantity, there is no exponent to score, and therefore no
-Poisson-binomial term -- sample and evaluate agree trivially.
+which is the LARGEST legal factor, i.e. the SMALLEST blocks. A square pair
+(N x N) therefore gives a PURE DIAGONAL; a 2 x 8 pair gives two 1 x 4 blocks.
+
+and pairs whose sizes are COPRIME are MASKED OUT of the (i, j) choice: gcd = 1
+admits only factor 1, which is a no-op block-diagonal. Those pairs used to
+absorb probability mass for an action that could not change anything.
+
+BRANCH MASKING
+--------------
+Only the fields the chosen op actually CONSUMES contribute to log-prob and
+entropy. Otherwise unused sub-heads receive gradient from rewards they had no
+part in and drift -- the cause of the old incomparable per-head entropies.
 """
 from __future__ import annotations
 
@@ -40,24 +44,32 @@ import jax.numpy as jnp
 import jax.random as jrand
 from typing import NamedTuple
 
-# op codes -- deliberately aligned with heads.py's OP_DIAG/OP_COMPRESS/OP_QUANT
-OP_BLOCKDIAG, OP_REDUCE, OP_QUANT = 0, 1, 2
-NUM_APPROX_OPS = 3
+OP_BLOCKDIAG, OP_REDUCE, OP_QUANT, OP_NONE = 0, 1, 2, 3
+NUM_APPROX_OPS = 4
 
 MAX_PAIR_IDX = 6
+NUM_REDUCE_AXES = 9
+REDUCE_FNS = ("mean", "min", "max", "abs_min", "abs_max")
+NUM_REDUCE_FNS = len(REDUCE_FNS)
 
 O_SKIP = 0
 O_OP = 1
-O_I = O_OP + NUM_APPROX_OPS          # 4
-O_J = O_I + MAX_PAIR_IDX             # 10
-HEAD_WIDTH = O_J + MAX_PAIR_IDX      # 16
+O_I = O_OP + NUM_APPROX_OPS                 # 5
+O_J = O_I + MAX_PAIR_IDX                    # 11
+O_AXES = O_J + MAX_PAIR_IDX                 # 17
+O_RFN = O_AXES + NUM_REDUCE_AXES            # 26
+O_DTYPE = O_RFN + NUM_REDUCE_FNS            # 31
+HEAD_WIDTH = O_DTYPE + 1                    # 32
 
 
 class ApproxAction(NamedTuple):
     skip: jax.Array
     op: jax.Array
-    i: jax.Array          # 1..6
-    j: jax.Array          # 1..6
+    i: jax.Array             # 1..6
+    j: jax.Array             # 1..6
+    axes: jax.Array          # (9,) bool
+    reduce_fn: jax.Array
+    dtype_idx: jax.Array
     log_prob: jax.Array
     entropy: jax.Array
 
@@ -78,17 +90,22 @@ def _bern_logp_ent(logit, x):
     return jnp.where(x, lp1, lp0), ent
 
 
-def block_count(n_i, n_j):
-    """Blocks for a (n_i, n_j) pair: ``min(n_i, n_j)``.
+def j_mask_given_i(i_idx, j_mask, pair_ok=None):
+    """Legal ``j`` once ``i`` is fixed.
 
-    Square -> one block per row/col, i.e. a pure diagonal.
-    Non-square -> the short side sets the count, so 2x8 gives two 1x4 blocks.
+    Base mask, minus ``i`` itself, minus every partner that is COPRIME with it
+    (``pair_ok`` is the (6, 6) non-coprime table built by the adapter). Falls
+    back to the unrestricted mask if that would leave nothing selectable, so
+    the categorical is never fully -1e9.
     """
-    return jnp.maximum(jnp.minimum(n_i, n_j), 1).astype(jnp.int32)
+    m = j_mask * (1.0 - jnn.one_hot(i_idx, MAX_PAIR_IDX))
+    if pair_ok is not None:
+        m = m * pair_ok[i_idx]
+    return jnp.where(jnp.sum(m) > 0, m, j_mask)
 
 
 class UnifiedApproxHead(eqx.Module):
-    """embd_dim -> 16 logits -> skip / op / i / j."""
+    """embd_dim -> 32 logits -> one complete approximation decision."""
 
     proj: eqx.nn.MLP
 
@@ -99,57 +116,95 @@ class UnifiedApproxHead(eqx.Module):
     def logits(self, ctx):
         return self.proj(ctx)
 
-    def score(self, z, skip, op, i_idx, j_idx, *, op_mask, i_mask, j_mask):
-        """Branch-masked (log_prob, entropy) for a GIVEN assignment.
+    # ------------------------------------------------------------------ score
+    def score(self, z, skip, op, i_idx, j_idx, axes, rfn, dt,
+              *, op_mask, i_mask, j_mask, axis_mask, pair_ok=None):
+        """Branch-masked (log_prob, entropy) for a GIVEN field assignment.
 
-        Shared by sample and evaluate so the two can never score different
-        variables -- the PPO ratio is only meaningful if they agree.
+        Shared by sampling and evaluation so the two can never disagree --
+        the PPO ratio is only meaningful if both score the same variable.
         """
         lp_skip, ent_skip = _bern_logp_ent(z[O_SKIP], skip)
         lp_op, ent_op = _cat_logp_ent(z[O_OP:O_I], op_mask, op)
         lp_i, ent_i = _cat_logp_ent(z[O_I:O_J], i_mask, i_idx)
-        j_mask_eff = j_mask * (1.0 - jnn.one_hot(i_idx, MAX_PAIR_IDX))
-        j_mask_eff = jnp.where(jnp.sum(j_mask_eff) > 0, j_mask_eff, j_mask)
-        lp_j, ent_j = _cat_logp_ent(z[O_J:HEAD_WIDTH], j_mask_eff, j_idx)
+        lp_j, ent_j = _cat_logp_ent(z[O_J:O_AXES],
+                                    j_mask_given_i(i_idx, j_mask, pair_ok),
+                                    j_idx)
+
+        lp_ax, ent_ax = _bern_logp_ent(z[O_AXES:O_RFN], axes)
+        keep = (axis_mask > 0.5).astype(lp_ax.dtype)
+        lp_ax = jnp.sum(lp_ax * keep)
+        ent_ax = jnp.sum(ent_ax * keep)
+        lp_rf, ent_rf = _cat_logp_ent(z[O_RFN:O_DTYPE],
+                                      jnp.ones((NUM_REDUCE_FNS,)), rfn)
+        lp_dt, ent_dt = _bern_logp_ent(z[O_DTYPE], dt)
 
         act = (~skip).astype(jnp.float32)
-        # i / j are consumed by BLOCKDIAG only; REDUCE and QUANT are fully
-        # determined once chosen (first axis + mean, bfloat16).
         is_bd = act * (op == OP_BLOCKDIAG).astype(jnp.float32)
+        is_rd = act * (op == OP_REDUCE).astype(jnp.float32)
+        is_qt = act * (op == OP_QUANT).astype(jnp.float32)
 
-        lp = lp_skip + act * lp_op + is_bd * (lp_i + lp_j)
-        ent = ent_skip + act * ent_op + is_bd * (ent_i + ent_j)
+        lp = lp_skip + act * lp_op
+        lp = lp + is_bd * (lp_i + lp_j)
+        lp = lp + is_rd * (lp_ax + lp_rf)
+        lp = lp + is_qt * lp_dt
+
+        ent = ent_skip + act * ent_op
+        ent = ent + is_bd * (ent_i + ent_j)
+        ent = ent + is_rd * (ent_ax + ent_rf)
+        ent = ent + is_qt * ent_dt
         return lp.astype(jnp.float32), ent.astype(jnp.float32)
 
-    def sample_fields(self, ctx, key, *, op_mask=None, i_mask=None, j_mask=None):
+    # ---------------------------------------------------------- sample fields
+    def sample_fields(self, ctx, key, *, op_mask=None, i_mask=None,
+                      j_mask=None, axis_mask=None, pair_ok=None):
+        """Draw the raw fields WITHOUT scoring them.
+
+        Scoring stays with the caller so the adapter can score exactly what it
+        emits. (With the prime gates gone nothing is clamped any more, but the
+        split is what made the old 10.9-nat sample/evaluate mismatch
+        impossible to reintroduce, so it stays.)
+        """
         z = self.logits(ctx)
-        k_skip, k_op, k_i, k_j = jrand.split(key, 4)
+        k_skip, k_op, k_i, k_j, k_ax, k_rf, k_dt = jrand.split(key, 7)
         op_mask = jnp.ones((NUM_APPROX_OPS,)) if op_mask is None else op_mask
         i_mask = jnp.ones((MAX_PAIR_IDX,)) if i_mask is None else i_mask
         j_mask = jnp.ones((MAX_PAIR_IDX,)) if j_mask is None else j_mask
+        axis_mask = jnp.ones((NUM_REDUCE_AXES,)) if axis_mask is None else axis_mask
 
         skip = jrand.bernoulli(k_skip, jnn.sigmoid(z[O_SKIP]))
         op = jrand.categorical(k_op, jnp.where(op_mask > 0.5, z[O_OP:O_I], -1e9))
         i_idx = jrand.categorical(k_i, jnp.where(i_mask > 0.5, z[O_I:O_J], -1e9))
-        j_mask_eff = j_mask * (1.0 - jnn.one_hot(i_idx, MAX_PAIR_IDX))
-        j_mask_eff = jnp.where(jnp.sum(j_mask_eff) > 0, j_mask_eff, j_mask)
+        jm = j_mask_given_i(i_idx, j_mask, pair_ok)
         j_idx = jrand.categorical(
-            k_j, jnp.where(j_mask_eff > 0.5, z[O_J:HEAD_WIDTH], -1e9))
-        return z, skip, op, i_idx, j_idx
+            k_j, jnp.where(jm > 0.5, z[O_J:O_AXES], -1e9))
+        ax_logits = jnp.where(axis_mask > 0.5, z[O_AXES:O_RFN], -1e9)
+        axes = jrand.bernoulli(k_ax, jnn.sigmoid(ax_logits)) & (axis_mask > 0.5)
+        rfn = jrand.categorical(k_rf, z[O_RFN:O_DTYPE])
+        dt = jrand.bernoulli(k_dt, jnn.sigmoid(z[O_DTYPE]))
+        return z, skip, op, i_idx, j_idx, axes, rfn, dt
 
-    def __call__(self, ctx, key, *, op_mask=None, i_mask=None, j_mask=None):
-        z, skip, op, i_idx, j_idx = self.sample_fields(
-            ctx, key, op_mask=op_mask, i_mask=i_mask, j_mask=j_mask)
+    # ----------------------------------------------------------------- sample
+    def __call__(self, ctx, key, *, op_mask=None, i_mask=None, j_mask=None,
+                 axis_mask=None, pair_ok=None):
+        z, skip, op, i_idx, j_idx, axes, rfn, dt = self.sample_fields(
+            ctx, key, op_mask=op_mask, i_mask=i_mask, j_mask=j_mask,
+            axis_mask=axis_mask, pair_ok=pair_ok)
         op_mask = jnp.ones((NUM_APPROX_OPS,)) if op_mask is None else op_mask
         i_mask = jnp.ones((MAX_PAIR_IDX,)) if i_mask is None else i_mask
         j_mask = jnp.ones((MAX_PAIR_IDX,)) if j_mask is None else j_mask
-        lp, ent = self.score(z, skip, op, i_idx, j_idx,
-                             op_mask=op_mask, i_mask=i_mask, j_mask=j_mask)
+        axis_mask = jnp.ones((NUM_REDUCE_AXES,)) if axis_mask is None else axis_mask
+        lp, ent = self.score(z, skip, op, i_idx, j_idx, axes, rfn, dt,
+                             op_mask=op_mask, i_mask=i_mask, j_mask=j_mask,
+                             axis_mask=axis_mask, pair_ok=pair_ok)
         return ApproxAction(
             skip=skip,
-            op=op.astype(jnp.int32),
+            op=jnp.where(skip, OP_NONE, op).astype(jnp.int32),
             i=(i_idx + 1).astype(jnp.int32),
             j=(j_idx + 1).astype(jnp.int32),
+            axes=axes,
+            reduce_fn=rfn.astype(jnp.int32),
+            dtype_idx=dt.astype(jnp.int32),
             log_prob=lp,
             entropy=ent,
         )

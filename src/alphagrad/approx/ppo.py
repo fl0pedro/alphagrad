@@ -1810,14 +1810,17 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--unified-head", action="store_true",
         help="Replace the autoregressive approximation sub-episode with ONE "
-             "64-output head per vertex (skip / op / i / j / prime-exponent "
-             "gates / reduce axes+fn / dtype). Exposed through "
-             "MicroActionPolicy's contract, so the env and loss are unchanged.")
+             "32-output head per vertex (skip / op / i / j / reduce axes+fn / "
+             "dtype). The block-diagonal factor is NOT sampled: it is "
+             "gcd(N_i, N_j), the largest legal factor = the smallest blocks "
+             "(square pair -> pure diagonal), and coprime pairs are masked "
+             "out. Exposed through MicroActionPolicy's contract, so the env "
+             "and loss are unchanged.")
     p.add_argument(
         "--force-pure-diag", action="store_true",
-        help="With --unified-head, force the block-diagonal factor to the "
-             "largest legal one (a pure diagonal IS the highest-factor "
-             "block-diagonal).")
+        help="NO-OP, accepted for launcher compatibility. --unified-head now "
+             "ALWAYS uses the largest legal factor gcd(N_i, N_j), so a square "
+             "pair is already a pure diagonal.")
     p.add_argument(
         "--set-pointer", action="store_true",
         help="Use SetPointerVertexPolicy: a CONTENT-based pointer over the "
@@ -2478,7 +2481,6 @@ def _build_agent(
         micro_action_policy = UnifiedMicroPolicy(
             embd_dim=args.embd_dim,
             max_substeps=args.max_substeps,
-            force_pure_diag=getattr(args, "force_pure_diag", False),
             key=encoder_keys[13],
         )
     elif getattr(args, "dynamic_substeps", False):

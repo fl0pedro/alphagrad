@@ -1,0 +1,1378 @@
+=== node=pgi15-gpu19.iff.kfa-juelich.de gpu=NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition Thu Jul 23 04:18:33 PM UTC 2026 ===
+=== TAG=approx_encdec MODE=approx EXAMPLE=EncoderDecoder WIDTH=64 SNN_STEPS=unset ===
+=== graphax=30441f6 examples: ADALIF_SNN_SEQ, a fully-unrolled temporal adaptive-LIF ===
+=== alphagrad=81175a9 tools: ratio-based warmup for the CSV export ===
+=== PHASE lat_mem START Thu Jul 23 04:18:33 PM UTC 2026 ===
+2026-07-23 16:18:37,424	INFO worker.py:2012 -- Started a local Ray instance.
+/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+wandb: Loading settings from /Users/assmuth/.config/wandb/settings
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /Users/assmuth/.netrc.
+wandb: Currently logged in as: florian-assmuth (dll-streetview) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: setting up run 2jea9kts
+wandb: Tracking run with wandb version 0.25.0
+wandb: Run data is saved locally in /Users/assmuth/dsnn/alphagrad/wandb/run-20260723_161838-2jea9kts
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run approx_encdec_lat_mem
+wandb: ⭐️ View project at https://wandb.ai/dll-streetview/dsnn-vertex
+wandb: 🚀 View run at https://wandb.ai/dll-streetview/dsnn-vertex/runs/2jea9kts
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="2b1e9b61-a620-4bce-8c04-f4fe1da6af53", ...)
+[36m(CpuApproximationActor pid=2485714)[0m W0723 16:18:48.882864 2485714 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2485714)[0m W0723 16:18:48.882891 2485714 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2485714)[0m W0723 16:18:48.882896 2485714 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2485714)[0m W0723 16:18:48.882901 2485714 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2485714)[0m W0723 16:18:48.882910 2485714 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2485714)[0m W0723 16:18:48.882930 2485714 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2485714)[0m W0723 16:18:48.882965 2485714 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2485714)[0m W0723 16:18:48.883038 2485714 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2485714)[0m W0723 16:18:48.883170 2485714 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2485714)[0m [cpu_approx_worker pid=2485714] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_EXAMPLE_WIDTH=64 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55222-pgi15-gpu19
+[36m(CpuApproximationActor pid=2485714)[0m [measure-actor 1] host=pgi15-gpu19.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=2 jax_devices=[CudaDevice(id=0)]
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="2b1e9b61-a620-4bce-8c04-f4fe1da6af53", ...)
+[36m(PPOActor pid=2485712)[0m [ppo_ray] ADDITIVE failed/sentinel penalty = -2.0 (bounded-negative, INCLUDED in advantage+loss -- replaces the failed-row mask; failed rows are repulsive, never a zero-gradient no-op).
+[36m(PPOActor pid=2485712)[0m [ppo_ray] V2 anti-hack: failed_adv_stamp=1.0 (post-z-score advantage overwrite on failed rows), cost_symlog_cap=0.0 (symlog'd cost channels clipped to +/-cap).
+[36m(PPOActor pid=2485712)[0m [ppo_ray] PopArt value norm ON: beta=0.01 sigma_min(base=0.1, quality[6,9]=0.2) sigma_max=1e+12 robust_std=True (winsor k=5.0) — replaces the rollout advantage z-score; under pure-PopArt advantage a failed row is truly-neutral (A==0), no constant stamp.
+[36m(PPOActor pid=2485712)[0m [ppo_ray] DYNAMIC SENTINEL ON: failed/sentinel terminals get per-channel mu_c - 2.0*sigma_c (EMA beta=0.01) instead of -1e10. The additive failed_penalty stamp AND the post-z-score failed_adv_stamp are DISABLED (dynamic value supersedes them); failed_transitions logging + PopArt exclusion unchanged.
+[36m(PPOActor pid=2485712)[0m [ppo_ray] RAW COSSIM THREAD ON: env emits full-range cosine_sim in idx6; worker applies guide cap=None into the GAE buffer only, logs reward/cosine_sim_raw from the uncapped value.
+[36m(PPOActor pid=2485712)[0m [ppo_ray_worker] POLICY V2 ACTIVE: MicroPPOAgent = PALIMPSA backbone + PointerVertexPolicy + MicroActionPolicy(max_substeps=1) + separate value pool; factor tables up to axis size 64 (observed max 64).
+[36m(PPOActor pid=2485712)[0m [ppo_ray_worker] V2 policy heads scaled by 0.1 (near-uniform initial policy).
+[36m(CpuApproximationActor pid=2485713)[0m [cpu_approx_worker pid=2485713] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_EXAMPLE_WIDTH=64 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55222-pgi15-gpu19[32m [repeated 2x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+[36m(CpuApproximationActor pid=2485713)[0m [measure-actor 0] host=pgi15-gpu19.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=1 jax_devices=[CudaDevice(id=0)][32m [repeated 2x across cluster][0m
+  actors spawned + JIT-warm in 30.2s
+ppo_ray:   0%|                                                                                                                                             | 0/1000 [00:00<?, ?it/s][36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=200 applied=0 skipped=0 applied_frac=0.000
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m /Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:3137: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=16444 > MAX_TOKENS=16384 (overflow=60). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+[36m(CpuApproximationActor pid=2485713)[0m   _record_tokenization_truncation(int(raw_tokens.shape[0]))
+[36m(PPOActor pid=2485712)[0m W0723 16:18:49.996141 2485712 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"[32m [repeated 27x across cluster][0m
+[36m(CpuApproximationActor pid=2485714)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=2485714)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2485714)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=2485714)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2485714)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=2485714)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2485714)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=2485714)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2485714)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=2485714)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2485714)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=2485714)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2485714)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=2485714)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2485714)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=2485714)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2485714)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=2485714)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2485714)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=2485714)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2485714)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=2485714)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2485714)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=2485714)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2485714)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=2485714)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2485715)[0m [per-face] builds=400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(CpuApproximationActor pid=2485714)[0m   _record_tokenization_truncation(int(raw_tokens.shape[0]))
+[36m(CpuApproximationActor pid=2485714)[0m /Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:3137: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=17287 > MAX_TOKENS=16384 (overflow=903). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+[36m(CpuApproximationActor pid=2485715)[0m /Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:3137: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=16388 > MAX_TOKENS=16384 (overflow=4). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+[36m(CpuApproximationActor pid=2485715)[0m   _record_tokenization_truncation(int(raw_tokens.shape[0]))
+[36m(CpuApproximationActor pid=2485713)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=2485713)[0m   warnings.warn([32m [repeated 13x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=2485713)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=2485713)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=2485713)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=2485713)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=2485713)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=2485713)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=2485713)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=2485713)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=2485713)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=2485713)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=2485713)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=2485715)[0m [per-face] builds=600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=2485714)[0m [per-face] builds=800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2485715)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=2485715)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=2485715)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=2485715)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=2485715)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=2485715)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=2485715)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=2485715)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=2485715)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=2485715)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=2485715)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=2485715)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=2485715)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=2485715)[0m   warnings.warn([32m [repeated 13x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=1800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=2200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=2600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=3000 applied=418 skipped=0 applied_frac=1.000[32m [repeated 6x across cluster][0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=3400 applied=450 skipped=0 applied_frac=1.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2485714)[0m [per-face] builds=2000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2485714)[0m [per-face] builds=2200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2485714)[0m [per-face] builds=2400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=5000 applied=570 skipped=0 applied_frac=1.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=2485714)[0m [per-face] builds=2800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=5800 applied=642 skipped=0 applied_frac=1.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=2485715)[0m [per-face] builds=3200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 7x across cluster][0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=6800 applied=718 skipped=0 applied_frac=1.000[32m [repeated 8x across cluster][0m
+[36m(CpuApproximationActor pid=2485714)[0m [per-face] builds=3800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=2485715)[0m [per-face] builds=4000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 9x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=8200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=8600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=9000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2485714)[0m [per-face] builds=5000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(CpuApproximationActor pid=2485715)[0m [per-face] builds=5200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 9x across cluster][0m
+[36m(CpuApproximationActor pid=2485715)[0m [per-face] builds=5400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2485715)[0m [per-face] builds=5600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=11400 applied=1150 skipped=0 applied_frac=1.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=2485715)[0m [per-face] builds=6000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=11800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(CpuApproximationActor pid=2485715)[0m [per-face] builds=6400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=13000 applied=1464 skipped=0 applied_frac=1.000[32m [repeated 8x across cluster][0m
+[36m(CpuApproximationActor pid=2485715)[0m [per-face] builds=6800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=13400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 7x across cluster][0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=14000 applied=1688 skipped=0 applied_frac=1.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=14200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 8x across cluster][0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=14800 applied=1804 skipped=0 applied_frac=1.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=15000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 9x across cluster][0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=15800 applied=1982 skipped=0 applied_frac=1.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2485715)[0m [per-face] builds=8200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2485715)[0m loc("reduce.3494.1"): error: 'tt.dot' op expected the output shape to be the concatenation of the last dimension of the first operand and the last dimension of the second 
+[36m(CpuApproximationActor pid=2485715)[0m loc("reduce.3494.1"): error: 'tt.dot' op expected the output shape to be the concatenation of the last dimension of the first operand and the last dimension of the second 
+[36m(CpuApproximationActor pid=2485714)[0m [SENTINEL] measure-exception step=112 order_len=112 terminal=True: TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT 
+[36m(CpuApproximationActor pid=2485714)[0m [SENTINEL-VERBOSE] ==================================================
+[36m(CpuApproximationActor pid=2485714)[0m [SENTINEL-VERBOSE] step=112 order_len=112 terminal=True init=False point_idx=-1
+[36m(CpuApproximationActor pid=2485714)[0m [SENTINEL-VERBOSE] EXC TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT compiled? The mismatches are:
+[36m(CpuApproximationActor pid=2485714)[0m Argument 'x' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2485714)[0m Argument 'y' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2485714)[0m [SENTINEL-VERBOSE] ORDER (112): [1, 56, 91, 92, 65, 40, 35, 106, 62, 71, 63, 78, 49, 94, 13, 53, 26, 61, 37, 22, 69, 18, 6, 90, 45, 5, 109, 84, 11, 98, 110, 93, 24, 2, 103, 36, 14, 32, 42, 51, 17, 3, 8, 67, 108, 86, 48, 16, 102, 52, 73, 104, 68, 96, 75, 19, 27, 31, 83, 57, 66, 64, 105, 29, 9, 82, 44, 88, 77, 97, 25, 15, 34, 76, 74, 30, 99, 79, 20, 41, 10, 38, 80, 21, 39, 23, 85, 7, 107, 101, 28, 72, 47, 54, 4, 95, 46, 55, 50, 112, 100, 58, 70, 33, 59, 60, 87, 81, 43, 89, 111, 12]
+[36m(CpuApproximationActor pid=2485714)[0m [SENTINEL-VERBOSE] MICRO-ACTIONS (per vertex, in elimination order):
+[36m(CpuApproximationActor pid=2485714)[0m     v0(vertex_id=1): DIAG(bi1=1,bi2=0,factor=2)
+[36m(CpuApproximationActor pid=2485714)[0m     v2(vertex_id=91): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v3(vertex_id=92): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v4(vertex_id=65): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v5(vertex_id=40): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v7(vertex_id=106): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v8(vertex_id=62): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v14(vertex_id=13): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v15(vertex_id=53): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v16(vertex_id=26): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v17(vertex_id=61): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v18(vertex_id=37): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v19(vertex_id=22): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v20(vertex_id=69): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v22(vertex_id=6): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v25(vertex_id=5): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v26(vertex_id=109): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v27(vertex_id=84): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v28(vertex_id=11): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v29(vertex_id=98): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v30(vertex_id=110): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v32(vertex_id=24): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v33(vertex_id=2): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v34(vertex_id=103): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v35(vertex_id=36): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v36(vertex_id=14): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v37(vertex_id=32): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v38(vertex_id=42): DIAG(bi1=1,bi2=0,factor=16)
+[36m(CpuApproximationActor pid=2485714)[0m     v39(vertex_id=51): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v40(vertex_id=17): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v41(vertex_id=3): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v43(vertex_id=67): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v48(vertex_id=102): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v49(vertex_id=52): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v50(vertex_id=73): DIAG(bi1=1,bi2=1,factor=2)
+[36m(CpuApproximationActor pid=2485714)[0m     v53(vertex_id=96): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v54(vertex_id=75): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v57(vertex_id=31): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v58(vertex_id=83): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v59(vertex_id=57): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v60(vertex_id=66): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v61(vertex_id=64): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v62(vertex_id=105): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v63(vertex_id=29): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v65(vertex_id=82): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v66(vertex_id=44): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v69(vertex_id=97): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v70(vertex_id=25): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v71(vertex_id=15): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v73(vertex_id=76): QUANT(dtype=float8_e8m0fnu)
+[36m(CpuApproximationActor pid=2485714)[0m     v74(vertex_id=74): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v75(vertex_id=30): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v76(vertex_id=99): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v78(vertex_id=20): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v79(vertex_id=41): DIAG(bi1=0,bi2=0,factor=16)
+[36m(CpuApproximationActor pid=2485714)[0m     v80(vertex_id=10): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v81(vertex_id=38): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v82(vertex_id=80): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v83(vertex_id=21): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v84(vertex_id=39): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v85(vertex_id=23): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v86(vertex_id=85): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v88(vertex_id=107): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v89(vertex_id=101): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v90(vertex_id=28): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v93(vertex_id=54): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v94(vertex_id=4): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v95(vertex_id=95): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v98(vertex_id=50): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v99(vertex_id=112): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v100(vertex_id=100): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v101(vertex_id=58): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v102(vertex_id=70): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v105(vertex_id=60): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v107(vertex_id=81): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v108(vertex_id=43): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v109(vertex_id=89): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v110(vertex_id=111): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485714)[0m     v111(vertex_id=12): DIAG(bi1=0,bi2=1,factor=2)
+[36m(CpuApproximationActor pid=2485714)[0m [SENTINEL-VERBOSE] TRACEBACK:
+[36m(CpuApproximationActor pid=2485714)[0m Traceback (most recent call last):
+[36m(CpuApproximationActor pid=2485714)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/cpu_approx_worker.py", line 257, in evaluate
+[36m(CpuApproximationActor pid=2485714)[0m     tokens, eqn_ids, reward = _callback(
+[36m(CpuApproximationActor pid=2485714)[0m                               ~~~~~~~~~^
+[36m(CpuApproximationActor pid=2485714)[0m         self._config,
+[36m(CpuApproximationActor pid=2485714)[0m         ^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2485714)[0m     ...<7 lines>...
+[36m(CpuApproximationActor pid=2485714)[0m         point_idx=int(point_idx),
+[36m(CpuApproximationActor pid=2485714)[0m         ^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2485714)[0m     )
+[36m(CpuApproximationActor pid=2485714)[0m     ^
+[36m(CpuApproximationActor pid=2485714)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 4013, in _callback
+[36m(CpuApproximationActor pid=2485714)[0m     out_approx = compiled_approx(*eval_args_i)
+[36m(CpuApproximationActor pid=2485714)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/stages.py", line 884, in __call__
+[36m(CpuApproximationActor pid=2485714)[0m     return self._call(*args, **kwargs)
+[36m(CpuApproximationActor pid=2485714)[0m            ~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2485714)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1926, in aot_cache_miss
+[36m(CpuApproximationActor pid=2485714)[0m     outs, out_flat, args_flat = stages.Compiled.call(params, *args, **kwargs)
+[36m(CpuApproximationActor pid=2485714)[0m                                 ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2485714)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/stages.py", line 861, in call
+[36m(CpuApproximationActor pid=2485714)[0m     lo_outs = params.executable.call(*params.const_args, *args_flat)
+[36m(CpuApproximationActor pid=2485714)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1893, in call
+[36m(CpuApproximationActor pid=2485714)[0m     check_arg_avals_for_call(self._all_args_info.in_avals,
+[36m(CpuApproximationActor pid=2485714)[0m     ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2485714)[0m                              map(core.shaped_abstractify, args),
+[36m(CpuApproximationActor pid=2485714)[0m                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2485714)[0m                              self._all_args_info.debug_info)
+[36m(CpuApproximationActor pid=2485714)[0m                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2485714)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1998, in check_arg_avals_for_call
+[36m(CpuApproximationActor pid=2485714)[0m     raise TypeError(
+[36m(CpuApproximationActor pid=2485714)[0m     ...<3 lines>...
+[36m(CpuApproximationActor pid=2485714)[0m         f"{num_mismatch_str} mismatches are:\n{str_errors}")
+[36m(CpuApproximationActor pid=2485714)[0m TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT compiled? The mismatches are:
+[36m(CpuApproximationActor pid=2485714)[0m Argument 'x' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2485714)[0m Argument 'y' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2485714)[0m [SENTINEL-VERBOSE] ==================================================
+[36m(CpuApproximationActor pid=2485715)[0m [per-face] builds=8400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2485715)[0m     v2(vertex_id=14): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v3(vertex_id=111): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v4(vertex_id=54): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v6(vertex_id=91): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v8(vertex_id=27): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v9(vertex_id=70): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v10(vertex_id=38): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v11(vertex_id=25): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v15(vertex_id=61): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v16(vertex_id=32): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v17(vertex_id=13): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v19(vertex_id=40): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v20(vertex_id=108): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v21(vertex_id=33): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v22(vertex_id=97): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v23(vertex_id=57): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v24(vertex_id=41): COMPRESS(axis=3,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v25(vertex_id=36): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v27(vertex_id=21): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v30(vertex_id=84): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v31(vertex_id=12): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v33(vertex_id=100): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v34(vertex_id=45): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v35(vertex_id=51): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v36(vertex_id=2): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v37(vertex_id=77): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v41(vertex_id=99): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v42(vertex_id=55): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v43(vertex_id=83): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v45(vertex_id=65): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v47(vertex_id=96): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v48(vertex_id=1): DIAG(bi1=1,bi2=1,factor=16)
+[36m(CpuApproximationActor pid=2485715)[0m     v49(vertex_id=81): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v50(vertex_id=28): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v52(vertex_id=95): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v54(vertex_id=29): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v55(vertex_id=26): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v56(vertex_id=5): DIAG(bi1=0,bi2=0,factor=16)
+[36m(CpuApproximationActor pid=2485715)[0m     v58(vertex_id=67): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v59(vertex_id=46): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v60(vertex_id=66): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v61(vertex_id=39): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v62(vertex_id=24): QUANT(dtype=float8_e8m0fnu)
+[36m(CpuApproximationActor pid=2485715)[0m     v64(vertex_id=42): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v65(vertex_id=64): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v66(vertex_id=98): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v67(vertex_id=17): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v69(vertex_id=3): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v71(vertex_id=73): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v72(vertex_id=4): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v73(vertex_id=22): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v76(vertex_id=103): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v77(vertex_id=106): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v78(vertex_id=20): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v79(vertex_id=47): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v82(vertex_id=30): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v83(vertex_id=35): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v84(vertex_id=15): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v86(vertex_id=62): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v87(vertex_id=75): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v88(vertex_id=68): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v89(vertex_id=110): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v90(vertex_id=43): DIAG(bi1=1,bi2=1,factor=2)
+[36m(CpuApproximationActor pid=2485715)[0m     v91(vertex_id=37): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v94(vertex_id=87): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v95(vertex_id=109): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v97(vertex_id=94): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v100(vertex_id=92): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v102(vertex_id=52): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v105(vertex_id=82): DIAG(bi1=0,bi2=1,factor=16)
+[36m(CpuApproximationActor pid=2485715)[0m     v106(vertex_id=10): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v109(vertex_id=80): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v110(vertex_id=74): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485715)[0m     v111(vertex_id=11): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m loc("reduce.4962.1"): error: 'tt.dot' op expected the output shape to be the concatenation of the last dimension of the first operand and the last dimension of the second [32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m     v0(vertex_id=102): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v1(vertex_id=77): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v2(vertex_id=91): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v4(vertex_id=25): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v5(vertex_id=21): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v6(vertex_id=28): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v8(vertex_id=47): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v10(vertex_id=71): QUANT(dtype=float8_e8m0fnu)
+[36m(CpuApproximationActor pid=2485713)[0m     v16(vertex_id=85): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v17(vertex_id=111): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v20(vertex_id=60): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v21(vertex_id=97): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v22(vertex_id=11): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v23(vertex_id=40): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v24(vertex_id=109): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v25(vertex_id=57): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v26(vertex_id=44): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v29(vertex_id=112): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v31(vertex_id=36): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v32(vertex_id=90): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v33(vertex_id=96): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v34(vertex_id=67): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v35(vertex_id=84): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v36(vertex_id=50): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v37(vertex_id=53): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v39(vertex_id=110): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v41(vertex_id=17): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v45(vertex_id=20): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v46(vertex_id=15): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v49(vertex_id=74): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v52(vertex_id=51): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v53(vertex_id=5): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v54(vertex_id=66): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v55(vertex_id=73): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v56(vertex_id=42): DIAG(bi1=1,bi2=1,factor=16)
+[36m(CpuApproximationActor pid=2485713)[0m     v58(vertex_id=29): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v59(vertex_id=106): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v60(vertex_id=105): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v62(vertex_id=38): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v65(vertex_id=95): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v66(vertex_id=26): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v67(vertex_id=54): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v68(vertex_id=43): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v69(vertex_id=104): QUANT(dtype=float8_e8m0fnu)
+[36m(CpuApproximationActor pid=2485713)[0m     v70(vertex_id=39): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v71(vertex_id=62): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v72(vertex_id=100): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v73(vertex_id=27): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v78(vertex_id=45): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v79(vertex_id=80): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v80(vertex_id=107): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v81(vertex_id=4): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v82(vertex_id=68): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v83(vertex_id=101): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v84(vertex_id=99): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v85(vertex_id=32): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v90(vertex_id=16): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v93(vertex_id=81): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v94(vertex_id=33): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v96(vertex_id=69): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v97(vertex_id=14): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v98(vertex_id=89): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v100(vertex_id=41): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v101(vertex_id=37): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v102(vertex_id=92): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v103(vertex_id=13): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v104(vertex_id=1): DIAG(bi1=0,bi2=0,factor=2)
+[36m(CpuApproximationActor pid=2485713)[0m     v105(vertex_id=2): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v106(vertex_id=65): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v107(vertex_id=19): COMPRESS(axis=1,kind=max)
+[36m(CpuApproximationActor pid=2485713)[0m     v108(vertex_id=82): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v109(vertex_id=98): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v110(vertex_id=23): DIAG(bi1=0,bi2=0,factor=16)
+[36m(CpuApproximationActor pid=2485713)[0m     v111(vertex_id=70): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m [SENTINEL] measure-exception step=112 order_len=112 terminal=True: TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT [32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [SENTINEL-VERBOSE] ==================================================[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [SENTINEL-VERBOSE] step=112 order_len=112 terminal=True init=False point_idx=-1[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [SENTINEL-VERBOSE] EXC TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT compiled? The mismatches are:[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m Argument 'x' compiled with float32[64,64] and called with float32[4,4][32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m Argument 'y' compiled with float32[64,64] and called with float32[4,4][32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [SENTINEL-VERBOSE] ORDER (112): [102, 77, 91, 103, 25, 21, 28, 52, 47, 58, 71, 78, 24, 34, 31, 86, 85, 111, 93, 72, 60, 97, 11, 40, 109, 57, 44, 48, 88, 112, 8, 36, 90, 96, 67, 84, 50, 53, 18, 110, 94, 17, 6, 83, 76, 20, 15, 35, 64, 74, 56, 87, 51, 5, 66, 73, 42, 10, 29, 106, 105, 12, 38, 79, 22, 95, 26, 54, 43, 104, 39, 62, 100, 27, 55, 75, 108, 61, 45, 80, 107, 4, 68, 101, 99, 32, 49, 46, 7, 9, 16, 30, 63, 81, 33, 3, 69, 14, 89, 59, 41, 37, 92, 13, 1, 2, 65, 19, 82, 98, 23, 70][32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [SENTINEL-VERBOSE] MICRO-ACTIONS (per vertex, in elimination order):[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [SENTINEL-VERBOSE] TRACEBACK:[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m Traceback (most recent call last):[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/cpu_approx_worker.py", line 257, in evaluate[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m     tokens, eqn_ids, reward = _callback([32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m                               ~~~~~~~~~^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m         self._config,[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m         ^^^^^^^^^^^^^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m     ...<3 lines>...[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m         point_idx=int(point_idx),[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m         ^^^^^^^^^^^^^^^^^^^^^^^^^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m     )[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m     ^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 4013, in _callback[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m     out_approx = compiled_approx(*eval_args_i)[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/stages.py", line 884, in __call__[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m     return self._call(*args, **kwargs)[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m            ~~~~~~~~~~^^^^^^^^^^^^^^^^^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1926, in aot_cache_miss[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m     outs, out_flat, args_flat = stages.Compiled.call(params, *args, **kwargs)[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m                                 ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1893, in call[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m     lo_outs = params.executable.call(*params.const_args, *args_flat)[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m     check_arg_avals_for_call(self._all_args_info.in_avals,[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m     ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m                              map(core.shaped_abstractify, args),[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m                              self._all_args_info.debug_info)[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1998, in check_arg_avals_for_call[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m     raise TypeError([32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m         f"{num_mismatch_str} mismatches are:\n{str_errors}")[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT compiled? The mismatches are:[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=16200 applied=358 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=2485713)[0m loc("reduce.2888.1"): error: 'tt.dot' op expected the output shape to be the concatenation of the last dimension of the first operand and the last dimension of the second 
+[36m(CpuApproximationActor pid=2485713)[0m loc("reduce.2888.1"): error: 'tt.dot' op expected the output shape to be the concatenation of the last dimension of the first operand and the last dimension of the second 
+[36m(PPOActor pid=2485712)[0m [per-face] builds=16400 applied=2114 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=2485713)[0m [SENTINEL] measure-exception step=112 order_len=112 terminal=True: TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT 
+[36m(CpuApproximationActor pid=2485713)[0m [SENTINEL-VERBOSE] ==================================================
+[36m(CpuApproximationActor pid=2485713)[0m [SENTINEL-VERBOSE] step=112 order_len=112 terminal=True init=False point_idx=-1
+[36m(CpuApproximationActor pid=2485713)[0m [SENTINEL-VERBOSE] EXC TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT compiled? The mismatches are:
+[36m(CpuApproximationActor pid=2485713)[0m Argument 'x' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2485713)[0m Argument 'y' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2485713)[0m [SENTINEL-VERBOSE] ORDER (112): [38, 63, 62, 95, 7, 74, 31, 90, 33, 2, 87, 39, 40, 56, 48, 19, 9, 69, 70, 58, 99, 54, 44, 5, 42, 30, 107, 10, 29, 110, 77, 18, 88, 6, 105, 14, 41, 64, 11, 24, 16, 4, 36, 49, 80, 45, 47, 23, 79, 52, 100, 109, 84, 102, 91, 83, 101, 68, 27, 59, 15, 76, 96, 108, 65, 20, 98, 12, 61, 32, 111, 71, 82, 106, 104, 86, 3, 97, 73, 8, 92, 50, 34, 93, 94, 67, 17, 75, 37, 103, 1, 26, 22, 89, 28, 55, 43, 46, 53, 85, 112, 25, 78, 35, 72, 81, 13, 57, 60, 66, 21, 51]
+[36m(CpuApproximationActor pid=2485713)[0m [SENTINEL-VERBOSE] MICRO-ACTIONS (per vertex, in elimination order):
+[36m(CpuApproximationActor pid=2485713)[0m     v0(vertex_id=38): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v2(vertex_id=62): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v3(vertex_id=95): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v4(vertex_id=7): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v5(vertex_id=74): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v7(vertex_id=90): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v8(vertex_id=33): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v9(vertex_id=2): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v10(vertex_id=87): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v11(vertex_id=39): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v17(vertex_id=69): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v20(vertex_id=99): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v21(vertex_id=54): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v22(vertex_id=44): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v23(vertex_id=5): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v24(vertex_id=42): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v25(vertex_id=30): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v26(vertex_id=107): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v27(vertex_id=10): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v28(vertex_id=29): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v29(vertex_id=110): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v30(vertex_id=77): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v33(vertex_id=6): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v35(vertex_id=14): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v36(vertex_id=41): DIAG(bi1=0,bi2=0,factor=2)
+[36m(CpuApproximationActor pid=2485713)[0m     v38(vertex_id=11): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v41(vertex_id=4): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v42(vertex_id=36): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v44(vertex_id=80): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v45(vertex_id=45): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v49(vertex_id=52): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v50(vertex_id=100): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v51(vertex_id=109): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v52(vertex_id=84): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v53(vertex_id=102): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v54(vertex_id=91): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v55(vertex_id=83): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v57(vertex_id=68): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v58(vertex_id=27): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v61(vertex_id=76): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v62(vertex_id=96): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v63(vertex_id=108): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v64(vertex_id=65): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v65(vertex_id=20): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v66(vertex_id=98): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v68(vertex_id=61): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v69(vertex_id=32): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v72(vertex_id=82): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v73(vertex_id=106): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v74(vertex_id=104): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v76(vertex_id=3): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v77(vertex_id=97): COMPRESS(axis=1,kind=max)
+[36m(CpuApproximationActor pid=2485713)[0m     v78(vertex_id=73): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v81(vertex_id=50): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v84(vertex_id=94): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v85(vertex_id=67): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v86(vertex_id=17): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v87(vertex_id=75): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v88(vertex_id=37): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v89(vertex_id=103): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v90(vertex_id=1): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v91(vertex_id=26): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v92(vertex_id=22): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v96(vertex_id=43): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v98(vertex_id=53): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v99(vertex_id=85): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v101(vertex_id=25): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v103(vertex_id=35): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v104(vertex_id=72): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v105(vertex_id=81): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v106(vertex_id=13): COMPRESS(axis=1,kind=max)
+[36m(CpuApproximationActor pid=2485713)[0m     v107(vertex_id=57): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v108(vertex_id=60): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v109(vertex_id=66): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v110(vertex_id=21): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m     v111(vertex_id=51): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2485713)[0m [SENTINEL-VERBOSE] TRACEBACK:
+[36m(CpuApproximationActor pid=2485713)[0m Traceback (most recent call last):
+[36m(CpuApproximationActor pid=2485713)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/cpu_approx_worker.py", line 257, in evaluate
+[36m(CpuApproximationActor pid=2485713)[0m     tokens, eqn_ids, reward = _callback(
+[36m(CpuApproximationActor pid=2485713)[0m                               ~~~~~~~~~^
+[36m(CpuApproximationActor pid=2485713)[0m         self._config,
+[36m(CpuApproximationActor pid=2485713)[0m         ^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2485713)[0m     ...<7 lines>...
+[36m(CpuApproximationActor pid=2485713)[0m         point_idx=int(point_idx),
+[36m(CpuApproximationActor pid=2485713)[0m         ^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2485713)[0m     )
+[36m(CpuApproximationActor pid=2485713)[0m     ^
+[36m(CpuApproximationActor pid=2485713)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 4013, in _callback
+[36m(CpuApproximationActor pid=2485713)[0m     out_approx = compiled_approx(*eval_args_i)
+[36m(CpuApproximationActor pid=2485713)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/stages.py", line 884, in __call__
+[36m(CpuApproximationActor pid=2485713)[0m     return self._call(*args, **kwargs)
+[36m(CpuApproximationActor pid=2485713)[0m            ~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2485713)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1926, in aot_cache_miss
+[36m(CpuApproximationActor pid=2485713)[0m     outs, out_flat, args_flat = stages.Compiled.call(params, *args, **kwargs)
+[36m(CpuApproximationActor pid=2485713)[0m                                 ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2485713)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/stages.py", line 861, in call
+[36m(CpuApproximationActor pid=2485713)[0m     lo_outs = params.executable.call(*params.const_args, *args_flat)
+[36m(CpuApproximationActor pid=2485713)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1893, in call
+[36m(CpuApproximationActor pid=2485713)[0m     check_arg_avals_for_call(self._all_args_info.in_avals,
+[36m(CpuApproximationActor pid=2485713)[0m     ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2485713)[0m                              map(core.shaped_abstractify, args),
+[36m(CpuApproximationActor pid=2485713)[0m                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2485713)[0m                              self._all_args_info.debug_info)
+[36m(CpuApproximationActor pid=2485713)[0m                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2485713)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1998, in check_arg_avals_for_call
+[36m(CpuApproximationActor pid=2485713)[0m     raise TypeError(
+[36m(CpuApproximationActor pid=2485713)[0m     ...<3 lines>...
+[36m(CpuApproximationActor pid=2485713)[0m         f"{num_mismatch_str} mismatches are:\n{str_errors}")
+[36m(CpuApproximationActor pid=2485713)[0m TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT compiled? The mismatches are:
+[36m(CpuApproximationActor pid=2485713)[0m Argument 'x' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2485713)[0m Argument 'y' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2485713)[0m [SENTINEL-VERBOSE] ==================================================
+[36m(PPOActor pid=2485712)[0m [per-face] builds=16600 applied=2126 skipped=0 applied_frac=1.000
+[36m(PPOActor pid=2485712)[0m [ppo_ray] 4/448 failed/sentinel transitions this episode (pool timeout / mem-gate / shape-storm); zeroing raw rewards, forcing dones.
+[36m(PPOActor pid=2485712)[0m [ppo_ray][popart] ep=0 ev=-3169824.318 adv(mean/std/absmax)=+0.068/0.181/0.369 latency_ns: mu=+0 sig=1 peak_memory: mu=+0 sig=1 frob_residual: mu=+0 sig=1
+[36m(PPOActor pid=2485712)[0m W0723 16:26:36.899745 2485712 hlo_rematerialization.cc:3233] Can't reduce memory use below 72.13GiB (77444779574 bytes) by rematerialization; only reduced to 88.37GiB (94888439157 bytes), down from 107.71GiB (115656492325 bytes) originally
+ppo_ray:   0%|▏                                                                                                                               | 1/1000 [07:50<130:28:10, 470.16s/it]ppo_ray best:+0(ep0) mean:+0 loss(p/v):-0.061/0.0063 ent:4.024 nan_skip:0:   0%|                                                              | 1/1000 [07:50<130:28:10, 470.16s/it][36m(PPOActor pid=2485712)[0m [ppo_ray] anti-degen: excluded 4 degenerate/failed terminal env(s) from best_overall.
+[36m(PPOActor pid=2485712)[0m [per-face] builds=16800 applied=2208 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=2485715)[0m [per-face] builds=8600 applied=245 skipped=0 applied_frac=1.000[32m [repeated 3x across cluster][0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=17200 applied=2296 skipped=0 applied_frac=1.000[32m [repeated 3x across cluster][0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=17400 applied=2324 skipped=0 applied_frac=1.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2485714)[0m [per-face] builds=9200 applied=260 skipped=0 applied_frac=1.000[32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=17400 applied=562 skipped=0 applied_frac=1.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=17800 applied=562 skipped=0 applied_frac=1.000[32m [repeated 5x across cluster][0m
+[36m(CpuApproximationActor pid=2485714)[0m [per-face] builds=9600 applied=260 skipped=0 applied_frac=1.000[32m [repeated 5x across cluster][0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=19000 applied=2518 skipped=0 applied_frac=1.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=19000 applied=562 skipped=0 applied_frac=1.000[32m [repeated 6x across cluster][0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=19800 applied=2580 skipped=0 applied_frac=1.000[32m [repeated 7x across cluster][0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=20200 applied=2622 skipped=0 applied_frac=1.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2485713)[0m [per-face] builds=20400 applied=562 skipped=0 applied_frac=1.000[32m [repeated 7x across cluster][0m
+Traceback (most recent call last):
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 776, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 770, in main
+    rc = _run(args)
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 561, in _run
+    stats = ray.get(actor.run_rollout_and_train.remote(seed_counter))
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    return fn(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/client_mode_hook.py", line 107, in wrapper
+    return func(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 2980, in get
+    values, debugger_breakpoint = worker.get_objects(
+                                  ~~~~~~~~~~~~~~~~~~^
+        object_refs, timeout, use_object_store=_use_object_store
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 1023, in get_objects
+    raise value.as_instanceof_cause()
+ray.exceptions.RayTaskError(TypeError): [36mray::PPOActor.run_rollout_and_train()[39m (pid=2485712, ip=192.168.15.19, actor_id=e3cdc0ee828e20722887887a01000000, repr=<alphagrad.approx.ppo_ray_actors.PPOActor object at 0x7f6ff1935550>)
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_actors.py", line 71, in run_rollout_and_train
+    return self._impl.run_rollout_and_train(int(rng_seed))
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_worker.py", line 2183, in run_rollout_and_train
+    pv_np, cv_np = self._live_masks(np.asarray(avail))
+                   ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_worker.py", line 1532, in _live_masks
+    pair[e], comp[e] = oracle.masks(cands)
+                       ~~~~~~~~~~~~^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 682, in masks
+    p, c = self.vertex_mask(v)
+           ~~~~~~~~~~~~~~~~^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 604, in vertex_mask
+    faces += self.probe_faces(vertex, approx=mode)
+             ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 560, in probe_faces
+    _eliminate_vertex(
+    ~~~~~~~~~~~~~~~~~^
+        int(vertex), incr.jaxpr, graph, tgraph, incr.vo, False,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        transforms=(_record,), face_transforms=None,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/graphax/src/graphax/core.py", line 1512, in _eliminate_vertex
+    edge_outval = _post_val @ _pre_val
+                  ~~~~~~~~~~^~~~~~~~~~
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/tensor.py", line 69, in __matmul__
+    return matmul(self, other)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/ops/matmul.py", line 2534, in matmul
+    _elem = try_elemental_matmul(lhs, rhs, count=count)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/elemental/dispatch.py", line 279, in try_elemental_matmul
+    result = _dispatch_matmul(lhs_m, rhs_m, pairs, kinds)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/elemental/dispatch.py", line 321, in _dispatch_matmul
+    multiB = _try_multi_block_diagonal(lhs, rhs, kinds)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/elemental/dispatch.py", line 386, in _try_multi_block_diagonal
+    return contract_dense_multi_block_diagonal(lhs, rhs)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/elemental/contract_D_B.py", line 661, in contract_dense_multi_block_diagonal
+    return _multiB_einsum(
+        dense_arr=dense_arr,
+    ...<11 lines>...
+        rhs=rhs,
+    )
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/elemental/contract_D_B.py", line 744, in _multiB_einsum
+    dense_factor, dense_sub = _pack_dense_factor(
+                              ~~~~~~~~~~~~~~~~~~^
+        dense_arr, dense_st, dense_is_lhs,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        dout_syms, dother_syms, pair_syms, dctr_syms,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        struct_to_dense, out_dtype,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/elemental/contract_D_B.py", line 931, in _pack_dense_factor
+    arr = arr.reshape(tuple(new_shape))
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py", line 1507, in meth
+    return getattr(self.aval, name).fun(self, *args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py", line 375, in _reshape
+    newshape = _compute_newshape(self, args[0] if len(args) == 1 else args)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py", line 542, in _compute_newshape
+    raise TypeError(f"cannot reshape array of shape {arr.shape} (size {arr.size}) "
+                    f"into shape {orig_newshape} (size {math.prod(newshape)})")
+TypeError: cannot reshape array of shape (64, 64, 64, 64) (size 16777216) into shape (64, 64, 64, 1, 1) (size 262144)
+Traceback (most recent call last):
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 776, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 770, in main
+    rc = _run(args)
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 561, in _run
+    stats = ray.get(actor.run_rollout_and_train.remote(seed_counter))
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    return fn(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/client_mode_hook.py", line 107, in wrapper
+    return func(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 2980, in get
+    values, debugger_breakpoint = worker.get_objects(
+                                  ~~~~~~~~~~~~~~~~~~^
+        object_refs, timeout, use_object_store=_use_object_store
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 1023, in get_objects
+    raise value.as_instanceof_cause()
+ray.exceptions.RayTaskError(TypeError): [36mray::PPOActor.run_rollout_and_train()[39m (pid=2485712, ip=192.168.15.19, actor_id=e3cdc0ee828e20722887887a01000000, repr=<alphagrad.approx.ppo_ray_actors.PPOActor object at 0x7f6ff1935550>)
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_actors.py", line 71, in run_rollout_and_train
+    return self._impl.run_rollout_and_train(int(rng_seed))
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_worker.py", line 2183, in run_rollout_and_train
+    pv_np, cv_np = self._live_masks(np.asarray(avail))
+                   ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_worker.py", line 1532, in _live_masks
+    pair[e], comp[e] = oracle.masks(cands)
+                       ~~~~~~~~~~~~^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 682, in masks
+    p, c = self.vertex_mask(v)
+           ~~~~~~~~~~~~~~~~^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 604, in vertex_mask
+    faces += self.probe_faces(vertex, approx=mode)
+             ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 560, in probe_faces
+    _eliminate_vertex(
+    ~~~~~~~~~~~~~~~~~^
+        int(vertex), incr.jaxpr, graph, tgraph, incr.vo, False,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        transforms=(_record,), face_transforms=None,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/graphax/src/graphax/core.py", line 1512, in _eliminate_vertex
+    edge_outval = _post_val @ _pre_val
+                  ~~~~~~~~~~^~~~~~~~~~
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/tensor.py", line 69, in __matmul__
+    return matmul(self, other)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/ops/matmul.py", line 2534, in matmul
+    _elem = try_elemental_matmul(lhs, rhs, count=count)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/elemental/dispatch.py", line 279, in try_elemental_matmul
+    result = _dispatch_matmul(lhs_m, rhs_m, pairs, kinds)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/elemental/dispatch.py", line 321, in _dispatch_matmul
+    multiB = _try_multi_block_diagonal(lhs, rhs, kinds)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/elemental/dispatch.py", line 386, in _try_multi_block_diagonal
+    return contract_dense_multi_block_diagonal(lhs, rhs)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/elemental/contract_D_B.py", line 661, in contract_dense_multi_block_diagonal
+    return _multiB_einsum(
+        dense_arr=dense_arr,
+    ...<11 lines>...
+        rhs=rhs,
+    )
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/elemental/contract_D_B.py", line 744, in _multiB_einsum
+    dense_factor, dense_sub = _pack_dense_factor(
+                              ~~~~~~~~~~~~~~~~~~^
+        dense_arr, dense_st, dense_is_lhs,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        dout_syms, dother_syms, pair_syms, dctr_syms,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        struct_to_dense, out_dtype,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/elemental/contract_D_B.py", line 931, in _pack_dense_factor
+    arr = arr.reshape(tuple(new_shape))
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py", line 1507, in meth
+    return getattr(self.aval, name).fun(self, *args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py", line 375, in _reshape
+    newshape = _compute_newshape(self, args[0] if len(args) == 1 else args)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py", line 542, in _compute_newshape
+    raise TypeError(f"cannot reshape array of shape {arr.shape} (size {arr.size}) "
+                    f"into shape {orig_newshape} (size {math.prod(newshape)})")
+TypeError: cannot reshape array of shape (64, 64, 64, 64) (size 16777216) into shape (64, 64, 64, 1, 1) (size 262144)
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mapprox_encdec_lat_mem[0m at: [34mhttps://wandb.ai/dll-streetview/dsnn-vertex/runs/2jea9kts[0m
+[1;34mwandb[0m: Find logs at: [1;35mwandb/run-20260723_161838-2jea9kts/logs[0m
+[36m(PPOActor pid=2485712)[0m [per-face] builds=21000 applied=2710 skipped=0 applied_frac=1.000[32m [repeated 5x across cluster][0m
+=== PHASE lat_mem RC=1 Thu Jul 23 04:28:32 PM UTC 2026 ===
+[log_to_csv] campaign_exp/approx_encdec_lat_mem/run.log -> campaign_exp/approx_encdec_lat_mem/metrics.csv: 0 rows (of 1 episodes, warmup=50, drop_zeros=True), 1 columns
+=== PHASE flops START Thu Jul 23 04:28:32 PM UTC 2026 ===
+2026-07-23 16:28:35,261	INFO worker.py:2012 -- Started a local Ray instance.
+/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+wandb: Loading settings from /Users/assmuth/.config/wandb/settings
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /Users/assmuth/.netrc.
+wandb: Currently logged in as: florian-assmuth (dll-streetview) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: setting up run 70hd6kt7
+wandb: Tracking run with wandb version 0.25.0
+wandb: Run data is saved locally in /Users/assmuth/dsnn/alphagrad/wandb/run-20260723_162837-70hd6kt7
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run approx_encdec_flops
+wandb: ⭐️ View project at https://wandb.ai/dll-streetview/dsnn-vertex
+wandb: 🚀 View run at https://wandb.ai/dll-streetview/dsnn-vertex/runs/70hd6kt7
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="b800b515-4b71-42f8-a2f3-a3dbda163f01", ...)
+[36m(PPOActor pid=2538364)[0m W0723 16:28:42.864911 2538364 text_format.cc:393] Warning parsing text-format xla.AutotuneResult: 5:10 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2538367)[0m W0723 16:28:42.965709 2538367 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2538367)[0m W0723 16:28:42.965735 2538367 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2538367)[0m W0723 16:28:42.965739 2538367 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2538367)[0m W0723 16:28:42.965745 2538367 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2538367)[0m W0723 16:28:42.965754 2538367 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2538367)[0m W0723 16:28:42.965774 2538367 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2538367)[0m W0723 16:28:42.965809 2538367 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2538367)[0m W0723 16:28:42.965879 2538367 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=2538367)[0m W0723 16:28:42.966012 2538367 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(PPOActor pid=2538364)[0m [ppo_ray] ADDITIVE failed/sentinel penalty = -2.0 (bounded-negative, INCLUDED in advantage+loss -- replaces the failed-row mask; failed rows are repulsive, never a zero-gradient no-op).
+[36m(PPOActor pid=2538364)[0m [ppo_ray] V2 anti-hack: failed_adv_stamp=1.0 (post-z-score advantage overwrite on failed rows), cost_symlog_cap=0.0 (symlog'd cost channels clipped to +/-cap).
+[36m(PPOActor pid=2538364)[0m [ppo_ray] PopArt value norm ON: beta=0.01 sigma_min(base=0.1, quality[6,9]=0.2) sigma_max=1e+12 robust_std=True (winsor k=5.0) — replaces the rollout advantage z-score; under pure-PopArt advantage a failed row is truly-neutral (A==0), no constant stamp.
+[36m(PPOActor pid=2538364)[0m [ppo_ray] DYNAMIC SENTINEL ON: failed/sentinel terminals get per-channel mu_c - 2.0*sigma_c (EMA beta=0.01) instead of -1e10. The additive failed_penalty stamp AND the post-z-score failed_adv_stamp are DISABLED (dynamic value supersedes them); failed_transitions logging + PopArt exclusion unchanged.
+[36m(PPOActor pid=2538364)[0m [ppo_ray] RAW COSSIM THREAD ON: env emits full-range cosine_sim in idx6; worker applies guide cap=None into the GAE buffer only, logs reward/cosine_sim_raw from the uncapped value.
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="b800b515-4b71-42f8-a2f3-a3dbda163f01", ...)
+[36m(PPOActor pid=2538364)[0m [ppo_ray_worker] POLICY V2 ACTIVE: MicroPPOAgent = PALIMPSA backbone + PointerVertexPolicy + MicroActionPolicy(max_substeps=1) + separate value pool; factor tables up to axis size 64 (observed max 64).
+[36m(CpuApproximationActor pid=2538367)[0m [cpu_approx_worker pid=2538367] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_EXAMPLE_WIDTH=64 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55222-pgi15-gpu19
+[36m(CpuApproximationActor pid=2538367)[0m [measure-actor 0] host=pgi15-gpu19.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=1 jax_devices=[CudaDevice(id=0)]
+[36m(PPOActor pid=2538364)[0m [ppo_ray_worker] V2 policy heads scaled by 0.1 (near-uniform initial policy).
+[36m(CpuApproximationActor pid=2538366)[0m [cpu_approx_worker pid=2538366] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_EXAMPLE_WIDTH=64 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55222-pgi15-gpu19[32m [repeated 2x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+[36m(CpuApproximationActor pid=2538366)[0m [measure-actor 2] host=pgi15-gpu19.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=3 jax_devices=[CudaDevice(id=0)][32m [repeated 2x across cluster][0m
+  actors spawned + JIT-warm in 23.6s
+ppo_ray:   0%|                                                                                                                                             | 0/1000 [00:00<?, ?it/s][36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=200 applied=0 skipped=0 applied_frac=0.000
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m /Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:3137: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=16444 > MAX_TOKENS=16384 (overflow=60). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+[36m(CpuApproximationActor pid=2538367)[0m   _record_tokenization_truncation(int(raw_tokens.shape[0]))
+[36m(CpuApproximationActor pid=2538365)[0m W0723 16:28:43.020223 2538365 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"[32m [repeated 18x across cluster][0m
+[36m(CpuApproximationActor pid=2538365)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=2538365)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2538365)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=2538365)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2538365)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=2538365)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2538365)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=2538365)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2538365)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=2538365)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2538365)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=2538365)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2538365)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=2538365)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2538365)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=2538365)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2538365)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=2538365)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2538365)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=2538365)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2538365)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=2538365)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2538365)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=2538365)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2538365)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=2538365)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=2538366)[0m [per-face] builds=400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(CpuApproximationActor pid=2538365)[0m   _record_tokenization_truncation(int(raw_tokens.shape[0]))
+[36m(CpuApproximationActor pid=2538365)[0m /Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:3137: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=17286 > MAX_TOKENS=16384 (overflow=902). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+[36m(CpuApproximationActor pid=2538366)[0m /Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:3137: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=16388 > MAX_TOKENS=16384 (overflow=4). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+[36m(CpuApproximationActor pid=2538366)[0m   _record_tokenization_truncation(int(raw_tokens.shape[0]))
+[36m(CpuApproximationActor pid=2538367)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=2538367)[0m   warnings.warn([32m [repeated 13x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=2538367)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=2538367)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=2538367)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=2538367)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=2538367)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=2538367)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=2538367)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=2538367)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=2538367)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=2538367)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=2538367)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=2538365)[0m [per-face] builds=600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=2538365)[0m [per-face] builds=800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538366)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=2538366)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=2538366)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=2538366)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=2538366)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=2538366)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=2538366)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=2538366)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=2538366)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=2538366)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=2538366)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=2538366)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=2538366)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=2538366)[0m   warnings.warn([32m [repeated 13x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=1800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=2200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=2600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(PPOActor pid=2538364)[0m [per-face] builds=3000 applied=418 skipped=0 applied_frac=1.000[32m [repeated 6x across cluster][0m
+[36m(PPOActor pid=2538364)[0m [per-face] builds=3400 applied=450 skipped=0 applied_frac=1.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538365)[0m [per-face] builds=2000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538365)[0m [per-face] builds=2200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538365)[0m [per-face] builds=2400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(PPOActor pid=2538364)[0m [per-face] builds=5000 applied=570 skipped=0 applied_frac=1.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=2538365)[0m [per-face] builds=2800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(PPOActor pid=2538364)[0m [per-face] builds=5800 applied=642 skipped=0 applied_frac=1.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=2538366)[0m [per-face] builds=3200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=2538366)[0m [per-face] builds=3400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=7000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=7400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(PPOActor pid=2538364)[0m [per-face] builds=8000 applied=764 skipped=0 applied_frac=1.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=8200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=8600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=9000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=9400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=9800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=10200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=10600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(PPOActor pid=2538364)[0m [per-face] builds=11400 applied=1148 skipped=0 applied_frac=1.000[32m [repeated 9x across cluster][0m
+[36m(CpuApproximationActor pid=2538365)[0m [per-face] builds=6200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=11800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2538366)[0m [per-face] builds=6400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=12600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=12800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=13200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=13600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538365)[0m [per-face] builds=7600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=14400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=14800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=2538366)[0m [per-face] builds=8000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(PPOActor pid=2538364)[0m [per-face] builds=15800 applied=1948 skipped=0 applied_frac=1.000[32m [repeated 5x across cluster][0m
+[36m(CpuApproximationActor pid=2538365)[0m [per-face] builds=8600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=2538366)[0m [SENTINEL] measure-exception step=112 order_len=112 terminal=True: TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT 
+[36m(CpuApproximationActor pid=2538366)[0m [SENTINEL-VERBOSE] ==================================================
+[36m(CpuApproximationActor pid=2538366)[0m [SENTINEL-VERBOSE] step=112 order_len=112 terminal=True init=False point_idx=-1
+[36m(CpuApproximationActor pid=2538366)[0m [SENTINEL-VERBOSE] EXC TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT compiled? The mismatches are:
+[36m(CpuApproximationActor pid=2538366)[0m Argument 'x' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2538366)[0m Argument 'y' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2538366)[0m [SENTINEL-VERBOSE] ORDER (112): [19, 53, 14, 111, 54, 31, 91, 112, 27, 70, 38, 25, 88, 63, 105, 61, 32, 13, 71, 40, 108, 33, 97, 57, 41, 36, 58, 21, 86, 93, 84, 12, 18, 100, 45, 51, 2, 77, 8, 7, 44, 99, 55, 83, 9, 65, 104, 96, 1, 81, 28, 6, 95, 56, 29, 26, 5, 101, 67, 46, 66, 39, 24, 34, 42, 64, 98, 17, 69, 3, 89, 73, 4, 22, 23, 78, 103, 106, 20, 47, 60, 85, 30, 35, 15, 59, 62, 75, 68, 110, 43, 37, 72, 79, 87, 109, 102, 94, 90, 50, 92, 48, 52, 49, 107, 82, 10, 76, 16, 80, 74, 11]
+[36m(CpuApproximationActor pid=2538366)[0m [SENTINEL-VERBOSE] MICRO-ACTIONS (per vertex, in elimination order):
+[36m(CpuApproximationActor pid=2538366)[0m     v2(vertex_id=14): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v3(vertex_id=111): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v4(vertex_id=54): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v6(vertex_id=91): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v8(vertex_id=27): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v9(vertex_id=70): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v10(vertex_id=38): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v11(vertex_id=25): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v15(vertex_id=61): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v16(vertex_id=32): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v17(vertex_id=13): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v19(vertex_id=40): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v20(vertex_id=108): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v21(vertex_id=33): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v22(vertex_id=97): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v23(vertex_id=57): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v24(vertex_id=41): COMPRESS(axis=3,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v25(vertex_id=36): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v27(vertex_id=21): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v30(vertex_id=84): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v31(vertex_id=12): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v33(vertex_id=100): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v34(vertex_id=45): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v35(vertex_id=51): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v36(vertex_id=2): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v37(vertex_id=77): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v41(vertex_id=99): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v42(vertex_id=55): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v43(vertex_id=83): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v45(vertex_id=65): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v47(vertex_id=96): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v48(vertex_id=1): DIAG(bi1=1,bi2=1,factor=16)
+[36m(CpuApproximationActor pid=2538366)[0m     v49(vertex_id=81): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v50(vertex_id=28): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v52(vertex_id=95): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v54(vertex_id=29): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v55(vertex_id=26): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v56(vertex_id=5): DIAG(bi1=0,bi2=0,factor=16)
+[36m(CpuApproximationActor pid=2538366)[0m     v58(vertex_id=67): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v59(vertex_id=46): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v60(vertex_id=66): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v61(vertex_id=39): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v62(vertex_id=24): QUANT(dtype=float8_e8m0fnu)
+[36m(CpuApproximationActor pid=2538366)[0m     v64(vertex_id=42): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v65(vertex_id=64): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v66(vertex_id=98): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v67(vertex_id=17): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v69(vertex_id=3): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v71(vertex_id=73): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v72(vertex_id=4): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v73(vertex_id=22): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v76(vertex_id=103): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v77(vertex_id=106): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v78(vertex_id=20): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v79(vertex_id=47): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v82(vertex_id=30): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v83(vertex_id=35): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v84(vertex_id=15): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v86(vertex_id=62): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v87(vertex_id=75): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v88(vertex_id=68): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v89(vertex_id=110): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v90(vertex_id=43): DIAG(bi1=1,bi2=1,factor=2)
+[36m(CpuApproximationActor pid=2538366)[0m     v91(vertex_id=37): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v94(vertex_id=87): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v95(vertex_id=109): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v97(vertex_id=94): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v100(vertex_id=92): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v102(vertex_id=52): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v105(vertex_id=82): DIAG(bi1=0,bi2=1,factor=16)
+[36m(CpuApproximationActor pid=2538366)[0m     v106(vertex_id=10): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v109(vertex_id=80): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v110(vertex_id=74): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m     v111(vertex_id=11): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538366)[0m [SENTINEL-VERBOSE] TRACEBACK:
+[36m(CpuApproximationActor pid=2538366)[0m Traceback (most recent call last):
+[36m(CpuApproximationActor pid=2538366)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/cpu_approx_worker.py", line 257, in evaluate
+[36m(CpuApproximationActor pid=2538366)[0m     tokens, eqn_ids, reward = _callback(
+[36m(CpuApproximationActor pid=2538366)[0m                               ~~~~~~~~~^
+[36m(CpuApproximationActor pid=2538366)[0m         self._config,
+[36m(CpuApproximationActor pid=2538366)[0m         ^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2538366)[0m     ...<7 lines>...
+[36m(CpuApproximationActor pid=2538366)[0m         point_idx=int(point_idx),
+[36m(CpuApproximationActor pid=2538366)[0m         ^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2538366)[0m     )
+[36m(CpuApproximationActor pid=2538366)[0m     ^
+[36m(CpuApproximationActor pid=2538366)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 4013, in _callback
+[36m(CpuApproximationActor pid=2538366)[0m     out_approx = compiled_approx(*eval_args_i)
+[36m(CpuApproximationActor pid=2538366)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/stages.py", line 884, in __call__
+[36m(CpuApproximationActor pid=2538366)[0m     return self._call(*args, **kwargs)
+[36m(CpuApproximationActor pid=2538366)[0m            ~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2538366)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1926, in aot_cache_miss
+[36m(CpuApproximationActor pid=2538366)[0m     outs, out_flat, args_flat = stages.Compiled.call(params, *args, **kwargs)
+[36m(CpuApproximationActor pid=2538366)[0m                                 ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2538366)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/stages.py", line 861, in call
+[36m(CpuApproximationActor pid=2538366)[0m     lo_outs = params.executable.call(*params.const_args, *args_flat)
+[36m(CpuApproximationActor pid=2538366)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1893, in call
+[36m(CpuApproximationActor pid=2538366)[0m     check_arg_avals_for_call(self._all_args_info.in_avals,
+[36m(CpuApproximationActor pid=2538366)[0m     ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2538366)[0m                              map(core.shaped_abstractify, args),
+[36m(CpuApproximationActor pid=2538366)[0m                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2538366)[0m                              self._all_args_info.debug_info)
+[36m(CpuApproximationActor pid=2538366)[0m                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2538366)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1998, in check_arg_avals_for_call
+[36m(CpuApproximationActor pid=2538366)[0m     raise TypeError(
+[36m(CpuApproximationActor pid=2538366)[0m     ...<3 lines>...
+[36m(CpuApproximationActor pid=2538366)[0m         f"{num_mismatch_str} mismatches are:\n{str_errors}")
+[36m(CpuApproximationActor pid=2538366)[0m TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT compiled? The mismatches are:
+[36m(CpuApproximationActor pid=2538366)[0m Argument 'x' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2538366)[0m Argument 'y' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2538366)[0m [SENTINEL-VERBOSE] ==================================================
+[36m(CpuApproximationActor pid=2538366)[0m [per-face] builds=8400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538365)[0m     v0(vertex_id=1): DIAG(bi1=1,bi2=0,factor=2)
+[36m(CpuApproximationActor pid=2538365)[0m     v2(vertex_id=91): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v3(vertex_id=92): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v4(vertex_id=65): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v5(vertex_id=40): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v7(vertex_id=106): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v8(vertex_id=62): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v14(vertex_id=13): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v15(vertex_id=53): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v16(vertex_id=26): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v17(vertex_id=61): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v18(vertex_id=37): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v19(vertex_id=22): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v20(vertex_id=69): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v22(vertex_id=6): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v25(vertex_id=5): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v26(vertex_id=109): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v27(vertex_id=84): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v28(vertex_id=11): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v29(vertex_id=98): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v30(vertex_id=110): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v32(vertex_id=24): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v33(vertex_id=2): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v34(vertex_id=103): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v35(vertex_id=36): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v36(vertex_id=14): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v37(vertex_id=32): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v38(vertex_id=42): DIAG(bi1=1,bi2=0,factor=16)
+[36m(CpuApproximationActor pid=2538365)[0m     v39(vertex_id=51): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v40(vertex_id=17): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v41(vertex_id=3): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v43(vertex_id=67): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v48(vertex_id=102): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v49(vertex_id=52): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v50(vertex_id=73): DIAG(bi1=1,bi2=1,factor=2)
+[36m(CpuApproximationActor pid=2538365)[0m     v53(vertex_id=96): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v54(vertex_id=75): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v57(vertex_id=31): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v58(vertex_id=83): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v59(vertex_id=57): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v60(vertex_id=66): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v61(vertex_id=64): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v62(vertex_id=105): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v63(vertex_id=29): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v65(vertex_id=82): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v66(vertex_id=44): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v69(vertex_id=97): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v70(vertex_id=25): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v71(vertex_id=15): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v73(vertex_id=76): QUANT(dtype=float8_e8m0fnu)
+[36m(CpuApproximationActor pid=2538365)[0m     v74(vertex_id=74): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v75(vertex_id=30): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v76(vertex_id=99): COMPRESS(axis=0,kind=max)
+[36m(CpuApproximationActor pid=2538365)[0m     v78(vertex_id=20): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v79(vertex_id=41): DIAG(bi1=0,bi2=0,factor=16)
+[36m(CpuApproximationActor pid=2538365)[0m     v80(vertex_id=10): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v81(vertex_id=38): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v82(vertex_id=80): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v83(vertex_id=21): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v84(vertex_id=39): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v85(vertex_id=23): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v86(vertex_id=85): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v88(vertex_id=107): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v89(vertex_id=101): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v90(vertex_id=28): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v93(vertex_id=54): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v94(vertex_id=4): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v95(vertex_id=95): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v98(vertex_id=50): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v99(vertex_id=112): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v100(vertex_id=100): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v101(vertex_id=58): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v105(vertex_id=60): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v107(vertex_id=81): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v108(vertex_id=43): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v109(vertex_id=89): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v110(vertex_id=111): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538365)[0m     v111(vertex_id=12): DIAG(bi1=0,bi2=1,factor=2)
+[36m(CpuApproximationActor pid=2538367)[0m     v0(vertex_id=102): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v1(vertex_id=77): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v2(vertex_id=91): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v4(vertex_id=25): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v5(vertex_id=21): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v6(vertex_id=28): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v8(vertex_id=47): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v10(vertex_id=71): QUANT(dtype=float8_e8m0fnu)
+[36m(CpuApproximationActor pid=2538367)[0m     v16(vertex_id=85): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v17(vertex_id=111): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v20(vertex_id=60): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v21(vertex_id=97): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v22(vertex_id=11): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v23(vertex_id=40): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v24(vertex_id=109): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v25(vertex_id=57): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v26(vertex_id=44): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v29(vertex_id=112): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v31(vertex_id=36): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v32(vertex_id=90): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v33(vertex_id=96): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v34(vertex_id=67): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v35(vertex_id=84): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v36(vertex_id=50): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v37(vertex_id=53): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v39(vertex_id=110): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v41(vertex_id=17): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v45(vertex_id=20): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v46(vertex_id=15): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v49(vertex_id=74): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v52(vertex_id=51): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v53(vertex_id=5): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v54(vertex_id=66): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v55(vertex_id=73): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v56(vertex_id=99): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v58(vertex_id=29): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v59(vertex_id=106): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v60(vertex_id=105): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v62(vertex_id=38): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v65(vertex_id=95): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v66(vertex_id=26): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v67(vertex_id=54): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v68(vertex_id=43): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v69(vertex_id=104): QUANT(dtype=float8_e8m0fnu)
+[36m(CpuApproximationActor pid=2538367)[0m     v70(vertex_id=39): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v71(vertex_id=62): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v73(vertex_id=27): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v78(vertex_id=45): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v79(vertex_id=80): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v80(vertex_id=107): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v81(vertex_id=4): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v82(vertex_id=68): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v83(vertex_id=101): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v84(vertex_id=32): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v85(vertex_id=42): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v90(vertex_id=16): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v93(vertex_id=81): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v94(vertex_id=33): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v96(vertex_id=69): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v97(vertex_id=14): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v98(vertex_id=89): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v100(vertex_id=41): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v101(vertex_id=37): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v102(vertex_id=92): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v103(vertex_id=13): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v104(vertex_id=1): DIAG(bi1=0,bi2=0,factor=2)
+[36m(CpuApproximationActor pid=2538367)[0m     v105(vertex_id=2): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v106(vertex_id=65): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v107(vertex_id=19): COMPRESS(axis=1,kind=max)
+[36m(CpuApproximationActor pid=2538367)[0m     v108(vertex_id=82): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v109(vertex_id=98): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v110(vertex_id=23): DIAG(bi1=0,bi2=0,factor=16)
+[36m(CpuApproximationActor pid=2538367)[0m     v111(vertex_id=70): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m [SENTINEL] measure-exception step=112 order_len=112 terminal=True: TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT [32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [SENTINEL-VERBOSE] ==================================================[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [SENTINEL-VERBOSE] step=112 order_len=112 terminal=True init=False point_idx=-1[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [SENTINEL-VERBOSE] EXC TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT compiled? The mismatches are:[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m Argument 'x' compiled with float32[64,64] and called with float32[4,4][32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m Argument 'y' compiled with float32[64,64] and called with float32[4,4][32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [SENTINEL-VERBOSE] ORDER (112): [102, 77, 91, 103, 25, 21, 28, 52, 47, 58, 71, 78, 24, 34, 31, 86, 85, 111, 93, 72, 60, 97, 11, 40, 109, 57, 44, 48, 88, 112, 8, 36, 90, 96, 67, 84, 50, 53, 18, 110, 94, 17, 6, 83, 76, 20, 15, 35, 64, 74, 56, 87, 51, 5, 66, 73, 99, 10, 29, 106, 105, 12, 38, 79, 22, 95, 26, 54, 43, 104, 39, 62, 100, 27, 55, 75, 108, 61, 45, 80, 107, 4, 68, 101, 32, 42, 49, 46, 7, 9, 16, 30, 63, 81, 33, 3, 69, 14, 89, 59, 41, 37, 92, 13, 1, 2, 65, 19, 82, 98, 23, 70][32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [SENTINEL-VERBOSE] MICRO-ACTIONS (per vertex, in elimination order):[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [SENTINEL-VERBOSE] TRACEBACK:[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m Traceback (most recent call last):[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/cpu_approx_worker.py", line 257, in evaluate[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m     tokens, eqn_ids, reward = _callback([32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m                               ~~~~~~~~~^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m         self._config,[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m         ^^^^^^^^^^^^^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m     ...<3 lines>...[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m         point_idx=int(point_idx),[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m         ^^^^^^^^^^^^^^^^^^^^^^^^^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m     )[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m     ^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 4013, in _callback[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m     out_approx = compiled_approx(*eval_args_i)[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/stages.py", line 884, in __call__[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m     return self._call(*args, **kwargs)[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m            ~~~~~~~~~~^^^^^^^^^^^^^^^^^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1926, in aot_cache_miss[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m     outs, out_flat, args_flat = stages.Compiled.call(params, *args, **kwargs)[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m                                 ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1893, in call[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m     lo_outs = params.executable.call(*params.const_args, *args_flat)[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m     check_arg_avals_for_call(self._all_args_info.in_avals,[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m     ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m                              map(core.shaped_abstractify, args),[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m                              self._all_args_info.debug_info)[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1998, in check_arg_avals_for_call[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m     raise TypeError([32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m         f"{num_mismatch_str} mismatches are:\n{str_errors}")[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT compiled? The mismatches are:[32m [repeated 2x across cluster][0m
+[36m(PPOActor pid=2538364)[0m [per-face] builds=16400 applied=2076 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=2538367)[0m [SENTINEL] measure-exception step=112 order_len=112 terminal=True: TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT 
+[36m(CpuApproximationActor pid=2538367)[0m [SENTINEL-VERBOSE] ==================================================
+[36m(CpuApproximationActor pid=2538367)[0m [SENTINEL-VERBOSE] step=112 order_len=112 terminal=True init=False point_idx=-1
+[36m(CpuApproximationActor pid=2538367)[0m [SENTINEL-VERBOSE] EXC TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT compiled? The mismatches are:
+[36m(CpuApproximationActor pid=2538367)[0m Argument 'x' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2538367)[0m Argument 'y' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2538367)[0m [SENTINEL-VERBOSE] ORDER (112): [38, 63, 62, 95, 7, 74, 31, 90, 33, 2, 87, 39, 40, 56, 48, 19, 9, 69, 70, 58, 99, 54, 44, 5, 42, 30, 107, 10, 29, 110, 77, 18, 88, 6, 105, 14, 41, 64, 11, 24, 16, 4, 36, 49, 80, 45, 47, 23, 79, 52, 100, 109, 84, 102, 91, 83, 101, 68, 27, 59, 15, 76, 96, 108, 65, 20, 98, 12, 61, 32, 111, 71, 82, 106, 104, 86, 3, 97, 73, 8, 92, 50, 34, 93, 94, 67, 17, 75, 37, 103, 1, 26, 22, 89, 28, 55, 43, 46, 53, 85, 112, 25, 78, 35, 72, 81, 13, 57, 60, 66, 21, 51]
+[36m(CpuApproximationActor pid=2538367)[0m [SENTINEL-VERBOSE] MICRO-ACTIONS (per vertex, in elimination order):
+[36m(CpuApproximationActor pid=2538367)[0m     v0(vertex_id=38): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v2(vertex_id=62): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v3(vertex_id=95): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v4(vertex_id=7): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v5(vertex_id=74): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v7(vertex_id=90): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v8(vertex_id=33): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v9(vertex_id=2): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v10(vertex_id=87): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v11(vertex_id=39): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v17(vertex_id=69): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v20(vertex_id=99): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v21(vertex_id=54): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v22(vertex_id=44): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v23(vertex_id=5): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v24(vertex_id=42): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v25(vertex_id=30): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v26(vertex_id=107): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v27(vertex_id=10): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v28(vertex_id=29): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v29(vertex_id=110): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v30(vertex_id=77): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v33(vertex_id=6): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v35(vertex_id=14): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v36(vertex_id=41): DIAG(bi1=0,bi2=0,factor=2)
+[36m(CpuApproximationActor pid=2538367)[0m     v38(vertex_id=11): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v41(vertex_id=4): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v42(vertex_id=36): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v44(vertex_id=80): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v45(vertex_id=45): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v49(vertex_id=52): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v50(vertex_id=100): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v51(vertex_id=109): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v52(vertex_id=84): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v53(vertex_id=102): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v54(vertex_id=91): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v55(vertex_id=83): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v57(vertex_id=68): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v58(vertex_id=27): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v61(vertex_id=76): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v62(vertex_id=96): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v63(vertex_id=108): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v64(vertex_id=65): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v65(vertex_id=20): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v66(vertex_id=98): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v68(vertex_id=61): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v69(vertex_id=32): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v72(vertex_id=82): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v73(vertex_id=106): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v74(vertex_id=104): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v76(vertex_id=3): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v77(vertex_id=97): COMPRESS(axis=1,kind=max)
+[36m(CpuApproximationActor pid=2538367)[0m     v78(vertex_id=73): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v81(vertex_id=50): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v84(vertex_id=94): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v85(vertex_id=67): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v86(vertex_id=17): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v87(vertex_id=75): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v88(vertex_id=37): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v89(vertex_id=103): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v90(vertex_id=1): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v91(vertex_id=26): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v92(vertex_id=22): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v96(vertex_id=43): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v98(vertex_id=53): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v99(vertex_id=85): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v101(vertex_id=25): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v103(vertex_id=35): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v104(vertex_id=72): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v105(vertex_id=81): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v106(vertex_id=13): COMPRESS(axis=1,kind=max)
+[36m(CpuApproximationActor pid=2538367)[0m     v107(vertex_id=57): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v108(vertex_id=60): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v109(vertex_id=66): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v110(vertex_id=21): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m     v111(vertex_id=51): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=2538367)[0m [SENTINEL-VERBOSE] TRACEBACK:
+[36m(CpuApproximationActor pid=2538367)[0m Traceback (most recent call last):
+[36m(CpuApproximationActor pid=2538367)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/cpu_approx_worker.py", line 257, in evaluate
+[36m(CpuApproximationActor pid=2538367)[0m     tokens, eqn_ids, reward = _callback(
+[36m(CpuApproximationActor pid=2538367)[0m                               ~~~~~~~~~^
+[36m(CpuApproximationActor pid=2538367)[0m         self._config,
+[36m(CpuApproximationActor pid=2538367)[0m         ^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2538367)[0m     ...<7 lines>...
+[36m(CpuApproximationActor pid=2538367)[0m         point_idx=int(point_idx),
+[36m(CpuApproximationActor pid=2538367)[0m         ^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2538367)[0m     )
+[36m(CpuApproximationActor pid=2538367)[0m     ^
+[36m(CpuApproximationActor pid=2538367)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 4013, in _callback
+[36m(CpuApproximationActor pid=2538367)[0m     out_approx = compiled_approx(*eval_args_i)
+[36m(CpuApproximationActor pid=2538367)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/stages.py", line 884, in __call__
+[36m(CpuApproximationActor pid=2538367)[0m     return self._call(*args, **kwargs)
+[36m(CpuApproximationActor pid=2538367)[0m            ~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2538367)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1926, in aot_cache_miss
+[36m(CpuApproximationActor pid=2538367)[0m     outs, out_flat, args_flat = stages.Compiled.call(params, *args, **kwargs)
+[36m(CpuApproximationActor pid=2538367)[0m                                 ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2538367)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/stages.py", line 861, in call
+[36m(CpuApproximationActor pid=2538367)[0m     lo_outs = params.executable.call(*params.const_args, *args_flat)
+[36m(CpuApproximationActor pid=2538367)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1893, in call
+[36m(CpuApproximationActor pid=2538367)[0m     check_arg_avals_for_call(self._all_args_info.in_avals,
+[36m(CpuApproximationActor pid=2538367)[0m     ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2538367)[0m                              map(core.shaped_abstractify, args),
+[36m(CpuApproximationActor pid=2538367)[0m                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2538367)[0m                              self._all_args_info.debug_info)
+[36m(CpuApproximationActor pid=2538367)[0m                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=2538367)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1998, in check_arg_avals_for_call
+[36m(CpuApproximationActor pid=2538367)[0m     raise TypeError(
+[36m(CpuApproximationActor pid=2538367)[0m     ...<3 lines>...
+[36m(CpuApproximationActor pid=2538367)[0m         f"{num_mismatch_str} mismatches are:\n{str_errors}")
+[36m(CpuApproximationActor pid=2538367)[0m TypeError: Argument types differ from the types for which this computation was compiled. Perhaps you are calling the compiled executable with a different enable_x64 mode than when it was AOT compiled? The mismatches are:
+[36m(CpuApproximationActor pid=2538367)[0m Argument 'x' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2538367)[0m Argument 'y' compiled with float32[64,64] and called with float32[4,4]
+[36m(CpuApproximationActor pid=2538367)[0m [SENTINEL-VERBOSE] ==================================================
+[36m(PPOActor pid=2538364)[0m [per-face] builds=16600 applied=2092 skipped=0 applied_frac=1.000
+[36m(PPOActor pid=2538364)[0m W0723 16:34:09.352444 2538364 text_format.cc:393] Warning parsing text-format xla.AutotuneResult: 5:10 (N = 2): text format contains deprecated field "split_k"
+[36m(PPOActor pid=2538364)[0m W0723 16:34:09.998776 2538364 text_format.cc:393] Warning parsing text-format xla.AutotuneResult: 5:10 (N = 4): text format contains deprecated field "split_k"
+[36m(PPOActor pid=2538364)[0m [ppo_ray] 4/448 failed/sentinel transitions this episode (pool timeout / mem-gate / shape-storm); zeroing raw rewards, forcing dones.
+[36m(PPOActor pid=2538364)[0m [ppo_ray][popart] ep=0 ev=-258289.436 adv(mean/std/absmax)=-0.055/0.024/0.103 flops: mu=+0 sig=1 frob_residual: mu=+0 sig=1
+[36m(PPOActor pid=2538364)[0m W0723 16:34:16.360902 2538364 text_format.cc:393] Warning parsing text-format xla.AutotuneResult: 5:10 (N = 8): text format contains deprecated field "split_k"
+[36m(PPOActor pid=2538364)[0m W0723 16:34:16.361036 2538364 text_format.cc:393] Warning parsing text-format xla.AutotuneResult: 5:10 (N = 16): text format contains deprecated field "split_k"
+[36m(PPOActor pid=2538364)[0m W0723 16:34:16.361218 2538364 text_format.cc:393] Warning parsing text-format xla.AutotuneResult: 5:10 (N = 32): text format contains deprecated field "split_k"
+[36m(PPOActor pid=2538364)[0m W0723 16:34:16.361538 2538364 text_format.cc:393] Warning parsing text-format xla.AutotuneResult: 5:10 (N = 64): text format contains deprecated field "split_k"
+[36m(PPOActor pid=2538364)[0m W0723 16:34:22.138712 2538364 hlo_rematerialization.cc:3233] Can't reduce memory use below 72.13GiB (77444779574 bytes) by rematerialization; only reduced to 88.37GiB (94888439157 bytes), down from 107.71GiB (115656492325 bytes) originally
+ppo_ray:   0%|▏                                                                                                                                | 1/1000 [05:41<94:41:58, 341.26s/it]ppo_ray best:+0(ep0) mean:+0 loss(p/v):0.06/0.0054 ent:4.276 nan_skip:0:   0%|                                                                 | 1/1000 [05:41<94:41:58, 341.26s/it][36m(PPOActor pid=2538364)[0m [ppo_ray][kl-stop] ep=0 approx_kl_percomp(mean)=0.1671 > target 0.15 after mb 3/4 (joint_kl mean=0.605) -- stopping remaining updates.
+[36m(PPOActor pid=2538364)[0m [ppo_ray] anti-degen: excluded 4 degenerate/failed terminal env(s) from best_overall.
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=16200 applied=561 skipped=0 applied_frac=1.000
+[36m(PPOActor pid=2538364)[0m [per-face] builds=16800 applied=2194 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=2538365)[0m [per-face] builds=8800 applied=242 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=16600 applied=561 skipped=0 applied_frac=1.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=2538365)[0m [per-face] builds=9000 applied=242 skipped=0 applied_frac=1.000[32m [repeated 2x across cluster][0m
+[36m(PPOActor pid=2538364)[0m [per-face] builds=17400 applied=2294 skipped=0 applied_frac=1.000[32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=2538367)[0m [per-face] builds=17200 applied=561 skipped=0 applied_frac=1.000[32m [repeated 4x across cluster][0m

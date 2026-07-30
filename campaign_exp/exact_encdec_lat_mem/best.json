@@ -1,0 +1,4714 @@
+{
+  "best_overall": {
+    "return": 0.0,
+    "ep": 0,
+    "rewards_raw": {
+      "muls_adds_fmas": 0.0,
+      "flops": 0.0,
+      "latency_ns": 0.0,
+      "max_io_sum": 0.0,
+      "bytes_accessed": 0.0,
+      "peak_memory": 0.0,
+      "cosine_sim": 0.0,
+      "frob_residual": 0.0,
+      "xla_peak_memory": 0.0,
+      "bkstep_acc": 0.0
+    },
+    "rewards_weighted": {
+      "muls_adds_fmas": 0.0,
+      "flops": 0.0,
+      "latency_ns": 0.0,
+      "max_io_sum": 0.0,
+      "bytes_accessed": 0.0,
+      "peak_memory": 0.0,
+      "cosine_sim": 0.0,
+      "frob_residual": 0.0,
+      "xla_peak_memory": 0.0,
+      "bkstep_acc": 0.0
+    },
+    "seq": [
+      {
+        "vertex": 102,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 77,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 91,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 103,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 25,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 21,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 28,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 52,
+        "ops": []
+      },
+      {
+        "vertex": 47,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 58,
+        "ops": []
+      },
+      {
+        "vertex": 71,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e8m0fnu"
+          }
+        ]
+      },
+      {
+        "vertex": 78,
+        "ops": []
+      },
+      {
+        "vertex": 24,
+        "ops": []
+      },
+      {
+        "vertex": 34,
+        "ops": []
+      },
+      {
+        "vertex": 31,
+        "ops": []
+      },
+      {
+        "vertex": 86,
+        "ops": []
+      },
+      {
+        "vertex": 85,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 111,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 93,
+        "ops": []
+      },
+      {
+        "vertex": 72,
+        "ops": []
+      },
+      {
+        "vertex": 60,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 97,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 11,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 40,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 109,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 57,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 44,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 48,
+        "ops": []
+      },
+      {
+        "vertex": 88,
+        "ops": []
+      },
+      {
+        "vertex": 112,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 8,
+        "ops": []
+      },
+      {
+        "vertex": 36,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 90,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 96,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 67,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 84,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 50,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 53,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 18,
+        "ops": []
+      },
+      {
+        "vertex": 110,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 94,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 17,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 6,
+        "ops": []
+      },
+      {
+        "vertex": 83,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 76,
+        "ops": []
+      },
+      {
+        "vertex": 20,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 15,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 35,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 64,
+        "ops": []
+      },
+      {
+        "vertex": 74,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 56,
+        "ops": []
+      },
+      {
+        "vertex": 87,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 51,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 5,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 66,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 73,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 42,
+        "ops": [
+          {
+            "op": "Diag",
+            "i": 3,
+            "j": 0,
+            "factor": 16
+          }
+        ]
+      },
+      {
+        "vertex": 10,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 29,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 106,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 105,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 12,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 38,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 79,
+        "ops": []
+      },
+      {
+        "vertex": 22,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 95,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 26,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 54,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 43,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 104,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 39,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 62,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 100,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 27,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 55,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 75,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 108,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 61,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 45,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 80,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              2
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 107,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 4,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 68,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 101,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 99,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 32,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 49,
+        "ops": []
+      },
+      {
+        "vertex": 46,
+        "ops": []
+      },
+      {
+        "vertex": 7,
+        "ops": []
+      },
+      {
+        "vertex": 9,
+        "ops": []
+      },
+      {
+        "vertex": 16,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 30,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 63,
+        "ops": []
+      },
+      {
+        "vertex": 81,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 33,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 3,
+        "ops": [
+          {
+            "op": "Diag",
+            "i": 0,
+            "j": 2,
+            "factor": 2
+          }
+        ]
+      },
+      {
+        "vertex": 69,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 14,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 89,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 59,
+        "ops": []
+      },
+      {
+        "vertex": 41,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              2
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 37,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 92,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 13,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 1,
+        "ops": [
+          {
+            "op": "Diag",
+            "i": 2,
+            "j": 0,
+            "factor": 2
+          }
+        ]
+      },
+      {
+        "vertex": 2,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 65,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 19,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              1
+            ],
+            "kind": "max"
+          }
+        ]
+      },
+      {
+        "vertex": 82,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              2
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 98,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      },
+      {
+        "vertex": 23,
+        "ops": [
+          {
+            "op": "Diag",
+            "i": 0,
+            "j": 2,
+            "factor": 16
+          }
+        ]
+      },
+      {
+        "vertex": 70,
+        "ops": [
+          {
+            "op": "Compress",
+            "axes": [
+              0
+            ],
+            "kind": "abs_max"
+          }
+        ]
+      }
+    ]
+  },
+  "best_per_channel": {
+    "latency_ns": {
+      "ep": 0,
+      "env_idx": 0,
+      "raw_value": 0.0,
+      "weighted_value": 0.0,
+      "weighted_total": 0.0,
+      "all_raw": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "all_weighted": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "seq": [
+        {
+          "vertex": 102,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 77,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 91,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 103,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 25,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 21,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 28,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 52,
+          "ops": []
+        },
+        {
+          "vertex": 47,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 58,
+          "ops": []
+        },
+        {
+          "vertex": 71,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e8m0fnu"
+            }
+          ]
+        },
+        {
+          "vertex": 78,
+          "ops": []
+        },
+        {
+          "vertex": 24,
+          "ops": []
+        },
+        {
+          "vertex": 34,
+          "ops": []
+        },
+        {
+          "vertex": 31,
+          "ops": []
+        },
+        {
+          "vertex": 86,
+          "ops": []
+        },
+        {
+          "vertex": 85,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 111,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 93,
+          "ops": []
+        },
+        {
+          "vertex": 72,
+          "ops": []
+        },
+        {
+          "vertex": 60,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 97,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 11,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 40,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 109,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 57,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 44,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 48,
+          "ops": []
+        },
+        {
+          "vertex": 88,
+          "ops": []
+        },
+        {
+          "vertex": 112,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 8,
+          "ops": []
+        },
+        {
+          "vertex": 36,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 90,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 96,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 67,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 84,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 50,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 53,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 18,
+          "ops": []
+        },
+        {
+          "vertex": 110,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 94,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 17,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 6,
+          "ops": []
+        },
+        {
+          "vertex": 83,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 76,
+          "ops": []
+        },
+        {
+          "vertex": 20,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 15,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 35,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 64,
+          "ops": []
+        },
+        {
+          "vertex": 74,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 56,
+          "ops": []
+        },
+        {
+          "vertex": 87,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 51,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 5,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 66,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 73,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 42,
+          "ops": [
+            {
+              "op": "Diag",
+              "i": 3,
+              "j": 0,
+              "factor": 16
+            }
+          ]
+        },
+        {
+          "vertex": 10,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 29,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 106,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 105,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 12,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 38,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 79,
+          "ops": []
+        },
+        {
+          "vertex": 22,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 95,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 26,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 54,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 43,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 104,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 39,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 62,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 100,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 27,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 55,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 75,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 108,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 61,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 45,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 80,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                2
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 107,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 4,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 68,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 101,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 99,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 32,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 49,
+          "ops": []
+        },
+        {
+          "vertex": 46,
+          "ops": []
+        },
+        {
+          "vertex": 7,
+          "ops": []
+        },
+        {
+          "vertex": 9,
+          "ops": []
+        },
+        {
+          "vertex": 16,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 30,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 63,
+          "ops": []
+        },
+        {
+          "vertex": 81,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 33,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 3,
+          "ops": [
+            {
+              "op": "Diag",
+              "i": 0,
+              "j": 2,
+              "factor": 2
+            }
+          ]
+        },
+        {
+          "vertex": 69,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 14,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 89,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 59,
+          "ops": []
+        },
+        {
+          "vertex": 41,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                2
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 37,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 92,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 13,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 1,
+          "ops": [
+            {
+              "op": "Diag",
+              "i": 2,
+              "j": 0,
+              "factor": 2
+            }
+          ]
+        },
+        {
+          "vertex": 2,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 65,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 19,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 82,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                2
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 98,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 23,
+          "ops": [
+            {
+              "op": "Diag",
+              "i": 0,
+              "j": 2,
+              "factor": 16
+            }
+          ]
+        },
+        {
+          "vertex": 70,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        }
+      ]
+    },
+    "peak_memory": {
+      "ep": 0,
+      "env_idx": 0,
+      "raw_value": 0.0,
+      "weighted_value": 0.0,
+      "weighted_total": 0.0,
+      "all_raw": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "all_weighted": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "seq": [
+        {
+          "vertex": 102,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 77,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 91,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 103,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 25,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 21,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 28,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 52,
+          "ops": []
+        },
+        {
+          "vertex": 47,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 58,
+          "ops": []
+        },
+        {
+          "vertex": 71,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e8m0fnu"
+            }
+          ]
+        },
+        {
+          "vertex": 78,
+          "ops": []
+        },
+        {
+          "vertex": 24,
+          "ops": []
+        },
+        {
+          "vertex": 34,
+          "ops": []
+        },
+        {
+          "vertex": 31,
+          "ops": []
+        },
+        {
+          "vertex": 86,
+          "ops": []
+        },
+        {
+          "vertex": 85,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 111,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 93,
+          "ops": []
+        },
+        {
+          "vertex": 72,
+          "ops": []
+        },
+        {
+          "vertex": 60,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 97,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 11,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 40,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 109,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 57,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 44,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 48,
+          "ops": []
+        },
+        {
+          "vertex": 88,
+          "ops": []
+        },
+        {
+          "vertex": 112,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 8,
+          "ops": []
+        },
+        {
+          "vertex": 36,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 90,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 96,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 67,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 84,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 50,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 53,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 18,
+          "ops": []
+        },
+        {
+          "vertex": 110,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 94,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 17,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 6,
+          "ops": []
+        },
+        {
+          "vertex": 83,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 76,
+          "ops": []
+        },
+        {
+          "vertex": 20,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 15,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 35,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 64,
+          "ops": []
+        },
+        {
+          "vertex": 74,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 56,
+          "ops": []
+        },
+        {
+          "vertex": 87,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 51,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 5,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 66,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 73,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 42,
+          "ops": [
+            {
+              "op": "Diag",
+              "i": 3,
+              "j": 0,
+              "factor": 16
+            }
+          ]
+        },
+        {
+          "vertex": 10,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 29,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 106,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 105,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 12,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 38,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 79,
+          "ops": []
+        },
+        {
+          "vertex": 22,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 95,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 26,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 54,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 43,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 104,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 39,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 62,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 100,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 27,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 55,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 75,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 108,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 61,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 45,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 80,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                2
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 107,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 4,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 68,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 101,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 99,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 32,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 49,
+          "ops": []
+        },
+        {
+          "vertex": 46,
+          "ops": []
+        },
+        {
+          "vertex": 7,
+          "ops": []
+        },
+        {
+          "vertex": 9,
+          "ops": []
+        },
+        {
+          "vertex": 16,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 30,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 63,
+          "ops": []
+        },
+        {
+          "vertex": 81,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 33,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 3,
+          "ops": [
+            {
+              "op": "Diag",
+              "i": 0,
+              "j": 2,
+              "factor": 2
+            }
+          ]
+        },
+        {
+          "vertex": 69,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 14,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 89,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 59,
+          "ops": []
+        },
+        {
+          "vertex": 41,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                2
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 37,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 92,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 13,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 1,
+          "ops": [
+            {
+              "op": "Diag",
+              "i": 2,
+              "j": 0,
+              "factor": 2
+            }
+          ]
+        },
+        {
+          "vertex": 2,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 65,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 19,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 82,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                2
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 98,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 23,
+          "ops": [
+            {
+              "op": "Diag",
+              "i": 0,
+              "j": 2,
+              "factor": 16
+            }
+          ]
+        },
+        {
+          "vertex": 70,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        }
+      ]
+    },
+    "frob_residual": {
+      "ep": 0,
+      "env_idx": 0,
+      "raw_value": 0.0,
+      "weighted_value": 0.0,
+      "weighted_total": 0.0,
+      "all_raw": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "all_weighted": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "seq": [
+        {
+          "vertex": 102,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 77,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 91,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 103,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 25,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 21,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 28,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 52,
+          "ops": []
+        },
+        {
+          "vertex": 47,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 58,
+          "ops": []
+        },
+        {
+          "vertex": 71,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e8m0fnu"
+            }
+          ]
+        },
+        {
+          "vertex": 78,
+          "ops": []
+        },
+        {
+          "vertex": 24,
+          "ops": []
+        },
+        {
+          "vertex": 34,
+          "ops": []
+        },
+        {
+          "vertex": 31,
+          "ops": []
+        },
+        {
+          "vertex": 86,
+          "ops": []
+        },
+        {
+          "vertex": 85,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 111,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 93,
+          "ops": []
+        },
+        {
+          "vertex": 72,
+          "ops": []
+        },
+        {
+          "vertex": 60,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 97,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 11,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 40,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 109,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 57,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 44,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 48,
+          "ops": []
+        },
+        {
+          "vertex": 88,
+          "ops": []
+        },
+        {
+          "vertex": 112,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 8,
+          "ops": []
+        },
+        {
+          "vertex": 36,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 90,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 96,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 67,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 84,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 50,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 53,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 18,
+          "ops": []
+        },
+        {
+          "vertex": 110,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 94,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 17,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 6,
+          "ops": []
+        },
+        {
+          "vertex": 83,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 76,
+          "ops": []
+        },
+        {
+          "vertex": 20,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 15,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 35,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 64,
+          "ops": []
+        },
+        {
+          "vertex": 74,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 56,
+          "ops": []
+        },
+        {
+          "vertex": 87,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 51,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 5,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 66,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 73,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 42,
+          "ops": [
+            {
+              "op": "Diag",
+              "i": 3,
+              "j": 0,
+              "factor": 16
+            }
+          ]
+        },
+        {
+          "vertex": 10,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 29,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 106,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 105,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 12,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 38,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 79,
+          "ops": []
+        },
+        {
+          "vertex": 22,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 95,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 26,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 54,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 43,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 104,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 39,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 62,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 100,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 27,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 55,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 75,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 108,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 61,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 45,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 80,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                2
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 107,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 4,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 68,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 101,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 99,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 32,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 49,
+          "ops": []
+        },
+        {
+          "vertex": 46,
+          "ops": []
+        },
+        {
+          "vertex": 7,
+          "ops": []
+        },
+        {
+          "vertex": 9,
+          "ops": []
+        },
+        {
+          "vertex": 16,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 30,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 63,
+          "ops": []
+        },
+        {
+          "vertex": 81,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 33,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 3,
+          "ops": [
+            {
+              "op": "Diag",
+              "i": 0,
+              "j": 2,
+              "factor": 2
+            }
+          ]
+        },
+        {
+          "vertex": 69,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 14,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 89,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 59,
+          "ops": []
+        },
+        {
+          "vertex": 41,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                2
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 37,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 92,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 13,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 1,
+          "ops": [
+            {
+              "op": "Diag",
+              "i": 2,
+              "j": 0,
+              "factor": 2
+            }
+          ]
+        },
+        {
+          "vertex": 2,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 65,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 19,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 82,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                2
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 98,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        },
+        {
+          "vertex": 23,
+          "ops": [
+            {
+              "op": "Diag",
+              "i": 0,
+              "j": 2,
+              "factor": 16
+            }
+          ]
+        },
+        {
+          "vertex": 70,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                0
+              ],
+              "kind": "abs_max"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "quantile_sequences": {}
+}

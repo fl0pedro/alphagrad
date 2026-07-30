@@ -1,0 +1,281 @@
+=== node=pgi15-gpu7.iff.kfa-juelich.de Thu Jul 23 11:08:11 AM UTC 2026 ===
+=== AOJ=0 graphax=b7d243b core: GRAPHAX_PRUNE=0 to keep the full graph for the policy ===
+=== alphagrad=60d02c8 approx: README for the masking / measurement / wiring changes ===
+2026-07-23 11:08:15,204	INFO worker.py:2012 -- Started a local Ray instance.
+/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+wandb: Loading settings from /Users/assmuth/.config/wandb/settings
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /Users/assmuth/.netrc.
+wandb: Currently logged in as: florian-assmuth (dll-streetview) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: setting up run q32f062p
+wandb: Tracking run with wandb version 0.25.0
+wandb: Run data is saved locally in /Users/assmuth/dsnn/alphagrad/wandb/run-20260723_110816-q32f062p
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run nn256_aoj_sub1_s7
+wandb: ⭐️ View project at https://wandb.ai/dll-streetview/dsnn-aoj-perpath
+wandb: 🚀 View run at https://wandb.ai/dll-streetview/dsnn-aoj-perpath/runs/q32f062p
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="be964453-3499-4922-8919-ff9deee720b4", ...)
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:08:25.498064 1540928 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:08:25.498089 1540928 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:08:25.498096 1540928 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:08:25.498104 1540928 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:08:25.498117 1540928 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:08:25.498142 1540928 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:08:25.498186 1540928 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:08:25.498272 1540928 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:08:25.498434 1540928 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1540928)[0m [cpu_approx_worker pid=1540928] env: ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55149-pgi15-gpu7
+[36m(CpuApproximationActor pid=1540928)[0m [measure-actor 2] host=pgi15-gpu7.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=3 jax_devices=[CudaDevice(id=0)]
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="be964453-3499-4922-8919-ff9deee720b4", ...)
+[36m(PPOActor pid=1540925)[0m [ppo_ray] ADDITIVE failed/sentinel penalty = -2.0 (bounded-negative, INCLUDED in advantage+loss -- replaces the failed-row mask; failed rows are repulsive, never a zero-gradient no-op).
+[36m(PPOActor pid=1540925)[0m [ppo_ray] V2 anti-hack: failed_adv_stamp=1.0 (post-z-score advantage overwrite on failed rows), cost_symlog_cap=0.0 (symlog'd cost channels clipped to +/-cap).
+[36m(PPOActor pid=1540925)[0m [ppo_ray] PopArt value norm ON: beta=0.01 sigma_min(base=0.1, quality[6,9]=0.2) sigma_max=1e+12 robust_std=True (winsor k=5.0) — replaces the rollout advantage z-score; under pure-PopArt advantage a failed row is truly-neutral (A==0), no constant stamp.
+[36m(PPOActor pid=1540925)[0m [ppo_ray] DYNAMIC SENTINEL ON: failed/sentinel terminals get per-channel mu_c - 2.0*sigma_c (EMA beta=0.01) instead of -1e10. The additive failed_penalty stamp AND the post-z-score failed_adv_stamp are DISABLED (dynamic value supersedes them); failed_transitions logging + PopArt exclusion unchanged.
+[36m(PPOActor pid=1540925)[0m [ppo_ray] RAW COSSIM THREAD ON: env emits full-range cosine_sim in idx6; worker applies guide cap=None into the GAE buffer only, logs reward/cosine_sim_raw from the uncapped value.
+[36m(CpuApproximationActor pid=1540927)[0m [cpu_approx_worker pid=1540927] env: ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55149-pgi15-gpu7[32m [repeated 2x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+[36m(CpuApproximationActor pid=1540927)[0m [measure-actor 1] host=pgi15-gpu7.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=2 jax_devices=[CudaDevice(id=0)][32m [repeated 2x across cluster][0m
+[36m(PPOActor pid=1540925)[0m [ppo_ray_worker] POLICY V2 ACTIVE: MicroPPOAgent = PALIMPSA backbone + PointerVertexPolicy + MicroActionPolicy(max_substeps=1) + separate value pool; factor tables up to axis size 784 (observed max 784).
+[36m(PPOActor pid=1540925)[0m [ppo_ray_worker] V2 policy heads scaled by 0.1 (near-uniform initial policy).
+  actors spawned + JIT-warm in 40.5s
+ppo_ray:   0%|                                                                                                                                             | 0/3400 [00:00<?, ?it/s][36m(PPOActor pid=1540925)[0m [ppo_ray_worker] resumed from campaign_aoj_sub1/nn256/ckpt at episode 1100
+[36m(CpuApproximationActor pid=1540928)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=1540928)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1540928)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=1540928)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1540928)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=1540928)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1540928)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=1540928)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1540928)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=1540928)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1540928)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=1540928)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1540928)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=1540928)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1540928)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=1540928)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1540928)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=1540928)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1540928)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=1540928)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1540928)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=1540928)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1540928)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=1540928)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1540928)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=1540928)[0m   warnings.warn(
+[36m(PPOActor pid=1540925)[0m W0723 11:08:27.158805 1540925 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"[32m [repeated 27x across cluster][0m
+[36m(CpuApproximationActor pid=1540928)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured literal rendered as '?': '(1+0j)'
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:09:20.055995 1540927 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op 
+[36m(CpuApproximationActor pid=1540927)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. 
+[36m(CpuApproximationActor pid=1540927)[0m Current allocation summary follows.
+[36m(CpuApproximationActor pid=1540927)[0m Current allocation summary follows.
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:09:20.056294 1540927 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540927)[0m E0723 11:09:20.064643 1540927 gpu_hlo_schedule.cc:938] The byte size of input/output arguments (19516557316) exceeds the base limit (18980683776). This indicates an error in the calculation!
+[36m(CpuApproximationActor pid=1540927)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m   warnings.warn([32m [repeated 27x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:09:23.407369 1540928 bfc_allocator.cc:526] ******************************************************___________________________________________***
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:09:30.085477 1540927 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m Current allocation summary follows.[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:09:30.085741 1540927 bfc_allocator.cc:526] ********************************************************________________________________________****[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m E0723 11:09:30.099706 1540927 gpu_hlo_schedule.cc:938] The byte size of input/output arguments (21956126976) exceeds the base limit (18980683776). This indicates an error in the calculation![32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:09:33.435832 1540928 bfc_allocator.cc:526] ******************************************************___________________________________________***
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:09:40.390862 1541372 autotuner.cc:640] No reference output found even though buffer checking 
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:09:40.390538 1541372 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m Current allocation summary follows.[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:09:40.390827 1541372 bfc_allocator.cc:526] ********************************************************________________________________________****[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540928)[0m E0723 11:09:33.555761 1540928 gpu_hlo_schedule.cc:938] The byte size of input/output arguments (19516557312) exceeds the base limit (18980683776). This indicates an error in the calculation![32m [repeated 8x across cluster][0m
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:09:43.727276 1541356 bfc_allocator.cc:526] ******************************************************___________________________________________***
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:09:43.727311 1541356 autotuner.cc:640] No reference output found even though buffer checking [32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:09:50.391010 1541372 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m Current allocation summary follows.[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:09:50.391269 1541372 bfc_allocator.cc:526] ********************************************************________________________________________****[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:09:53.727753 1541356 bfc_allocator.cc:526] ******************************************************___________________________________________***
+[36m(CpuApproximationActor pid=1540927)[0m E0723 11:10:00.412477 1540927 autotuner.cc:460] Could not get config for HLO: %wrapped_transpose = f32[784,63,63,784]{3,2,1,0} fusion(%args_0_.1), kind=kInput, calls=
+[36m(CpuApproximationActor pid=1540927)[0m (param_0: f32[784,63,784,63]) -> f32[784,63,63,784] {
+[36m(CpuApproximationActor pid=1540927)[0m   %param_0 = f32[784,63,784,63]{3,2,1,0} parameter(0)
+[36m(CpuApproximationActor pid=1540927)[0m   ROOT %transpose.1.1 = f32[784,63,63,784]{3,2,1,0} transpose(%param_0), dimensions={0,1,3,2}, metadata={op_name="args[0]"}
+[36m(CpuApproximationActor pid=1540927)[0m }, metadata={op_name="args[0]"}. Status: INTERNAL: Autotuning failed for HLO: %wrapped_transpose = f32[784,63,63,784]{3,2,1,0} fusion(%args_0_.1), kind=kInput, calls=%wrapped_transpose_computation, metadata={op_name="args[0]"}. Failed to pick best config: All configs failed during profiling.
+[36m(CpuApproximationActor pid=1540927)[0m Failures (2):
+[36m(CpuApproximationActor pid=1540927)[0m EXECUTION FAILED: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 9.09GiB. [tf-allocator-allocation-error='']
+[36m(CpuApproximationActor pid=1540927)[0m EXECUTION FAILED: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 9.09GiB. [tf-allocator-allocation-error='']
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:10:00.412011 1541372 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m Current allocation summary follows.[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:10:00.412271 1541372 bfc_allocator.cc:526] ********************************************************________________________________________****[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:10:03.749196 1541356 bfc_allocator.cc:526] ******************************************************___________________________________________***
+[36m(CpuApproximationActor pid=1540928)[0m E0723 11:10:03.749410 1540928 autotuner.cc:460] Could not get config for HLO: %wrapped_transpose = f32[784,63,63,784]{3,2,1,0} fusion(%args_0_.1), kind=kInput, calls=[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540928)[0m (param_0: f32[784,63,784,63]) -> f32[784,63,63,784] {[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540928)[0m   %param_0 = f32[784,63,784,63]{3,2,1,0} parameter(0)[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540928)[0m   ROOT %transpose.1.1 = f32[784,63,63,784]{3,2,1,0} transpose(%param_0), dimensions={0,1,3,2}, metadata={op_name="args[0]"}[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540928)[0m }, metadata={op_name="args[0]"}. Status: INTERNAL: Autotuning failed for HLO: %wrapped_transpose = f32[784,63,63,784]{3,2,1,0} fusion(%args_0_.1), kind=kInput, calls=%wrapped_transpose_computation, metadata={op_name="args[0]"}. Failed to pick best config: All configs failed during profiling.[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540928)[0m Failures (2):[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540928)[0m EXECUTION FAILED: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 9.09GiB. [tf-allocator-allocation-error=''][32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:10:19.308812 1540926 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m Current allocation summary follows.[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:10:19.309307 1540926 bfc_allocator.cc:526] ********************************************************________________________________________****[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:10:29.309746 1540926 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op 
+[36m(CpuApproximationActor pid=1540926)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. 
+[36m(CpuApproximationActor pid=1540926)[0m Current allocation summary follows.[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:10:29.310124 1540926 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:10:39.520171 1541378 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op 
+[36m(CpuApproximationActor pid=1540926)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. 
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:10:39.520542 1541378 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:10:39.520579 1541378 autotuner.cc:640] No reference output found even though buffer checking 
+[36m(CpuApproximationActor pid=1540926)[0m Current allocation summary follows.[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:10:49.520726 1541378 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op 
+[36m(CpuApproximationActor pid=1540926)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. 
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:10:49.521109 1541378 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540926)[0m Current allocation summary follows.[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:10:59.541858 1541378 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op 
+[36m(CpuApproximationActor pid=1540926)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. 
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:10:59.542243 1541378 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540926)[0m E0723 11:10:59.542476 1540926 autotuner.cc:460] Could not get config for HLO: %wrapped_transpose = f32[784,63,63,784]{3,2,1,0} fusion(%args_0_.1), kind=kInput, calls=
+[36m(CpuApproximationActor pid=1540926)[0m (param_0: f32[784,63,784,63]) -> f32[784,63,63,784] {
+[36m(CpuApproximationActor pid=1540926)[0m   %param_0 = f32[784,63,784,63]{3,2,1,0} parameter(0)
+[36m(CpuApproximationActor pid=1540926)[0m   ROOT %transpose.1.1 = f32[784,63,63,784]{3,2,1,0} transpose(%param_0), dimensions={0,1,3,2}, metadata={op_name="args[0]"}
+[36m(CpuApproximationActor pid=1540926)[0m }, metadata={op_name="args[0]"}. Status: INTERNAL: Autotuning failed for HLO: %wrapped_transpose = f32[784,63,63,784]{3,2,1,0} fusion(%args_0_.1), kind=kInput, calls=%wrapped_transpose_computation, metadata={op_name="args[0]"}. Failed to pick best config: All configs failed during profiling.
+[36m(CpuApproximationActor pid=1540926)[0m Failures (2):
+[36m(CpuApproximationActor pid=1540926)[0m EXECUTION FAILED: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 9.09GiB. [tf-allocator-allocation-error='']
+[36m(CpuApproximationActor pid=1540926)[0m EXECUTION FAILED: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 9.09GiB. [tf-allocator-allocation-error='']
+[36m(CpuApproximationActor pid=1540926)[0m Current allocation summary follows.[32m [repeated 2x across cluster][0m
+[36m(PPOActor pid=1540925)[0m [ppo_ray][popart] ep=1100 ev=-2720.980 adv(mean/std/absmax)=-10647.010/158.839/10922.402 latency_ns: mu=-4.6e+04 sig=5.04e+03 cosine_sim: mu=+1 sig=0.2 frob_residual: mu=-0.0283 sig=0.1 xla_peak_memory: mu=-1.63e+07 sig=1.55e+03
+ppo_ray:   0%|                                                                                                                                | 1/3400 [02:59<169:52:25, 179.92s/it]ppo_ray best:-1.64e+07(ep0) mean:-1.65e+07 loss(p/v):1.1e+04/2.9e+07 ent:1.390 nan_skip:0:   0%|                                              | 1/3400 [02:59<169:52:25, 179.92s/it][36m(CpuApproximationActor pid=1540926)[0m W0723 11:12:07.286261 1540926 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op 
+[36m(CpuApproximationActor pid=1540926)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. 
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:12:07.286719 1540926 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540926)[0m Current allocation summary follows.[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:12:07.276670 1540928 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op 
+[36m(CpuApproximationActor pid=1540928)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. 
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:12:07.277085 1540928 bfc_allocator.cc:526] ******************************************************___________________________________________***
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:12:07.276443 1540927 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540926)[0m Current allocation summary follows.[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:12:17.286995 1540926 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op [32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. [32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:12:17.287396 1540926 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:12:17.277781 1540928 bfc_allocator.cc:526] ******************************************************___________________________________________***
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:12:17.277226 1540927 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:12:27.519154 1541373 autotuner.cc:640] No reference output found even though buffer checking 
+[36m(CpuApproximationActor pid=1540926)[0m Current allocation summary follows.[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:12:27.518706 1541373 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:12:27.519120 1541373 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:12:27.498917 1541356 bfc_allocator.cc:526] ******************************************************___________________________________________***
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:12:27.495764 1541370 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:12:27.495796 1541370 autotuner.cc:640] No reference output found even though buffer checking [32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m Current allocation summary follows.[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:12:37.519292 1541373 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:12:37.519639 1541373 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:12:37.499459 1541356 bfc_allocator.cc:526] ******************************************************___________________________________________***
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:12:37.496249 1541370 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540926)[0m E0723 11:12:47.546472 1540926 autotuner.cc:460] Could not get config for HLO: %wrapped_transpose = f32[784,63,63,784]{3,2,1,0} fusion(%args_0_.1), kind=kInput, calls=
+[36m(CpuApproximationActor pid=1540926)[0m (param_0: f32[784,63,784,63]) -> f32[784,63,63,784] {
+[36m(CpuApproximationActor pid=1540926)[0m   %param_0 = f32[784,63,784,63]{3,2,1,0} parameter(0)
+[36m(CpuApproximationActor pid=1540926)[0m   ROOT %transpose.1.1 = f32[784,63,63,784]{3,2,1,0} transpose(%param_0), dimensions={0,1,3,2}, metadata={op_name="args[0]"}
+[36m(CpuApproximationActor pid=1540926)[0m }, metadata={op_name="args[0]"}. Status: INTERNAL: Autotuning failed for HLO: %wrapped_transpose = f32[784,63,63,784]{3,2,1,0} fusion(%args_0_.1), kind=kInput, calls=%wrapped_transpose_computation, metadata={op_name="args[0]"}. Failed to pick best config: All configs failed during profiling.
+[36m(CpuApproximationActor pid=1540926)[0m Failures (2):
+[36m(CpuApproximationActor pid=1540926)[0m EXECUTION FAILED: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 9.09GiB. [tf-allocator-allocation-error='']
+[36m(CpuApproximationActor pid=1540926)[0m EXECUTION FAILED: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 9.09GiB. [tf-allocator-allocation-error='']
+[36m(CpuApproximationActor pid=1540926)[0m Current allocation summary follows.[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:12:47.545825 1541373 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:12:47.546248 1541373 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540928)[0m W0723 11:12:47.521335 1541356 bfc_allocator.cc:526] ******************************************************___________________________________________***
+[36m(CpuApproximationActor pid=1540927)[0m W0723 11:12:47.517702 1541370 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540927)[0m E0723 11:12:47.517916 1540927 autotuner.cc:460] Could not get config for HLO: %wrapped_transpose = f32[784,63,63,784]{3,2,1,0} fusion(%args_0_.1), kind=kInput, calls=[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m (param_0: f32[784,63,784,63]) -> f32[784,63,63,784] {[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m   %param_0 = f32[784,63,784,63]{3,2,1,0} parameter(0)[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m   ROOT %transpose.1.1 = f32[784,63,63,784]{3,2,1,0} transpose(%param_0), dimensions={0,1,3,2}, metadata={op_name="args[0]"}[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m }, metadata={op_name="args[0]"}. Status: INTERNAL: Autotuning failed for HLO: %wrapped_transpose = f32[784,63,63,784]{3,2,1,0} fusion(%args_0_.1), kind=kInput, calls=%wrapped_transpose_computation, metadata={op_name="args[0]"}. Failed to pick best config: All configs failed during profiling.[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m Failures (2):[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540927)[0m EXECUTION FAILED: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 9.09GiB. [tf-allocator-allocation-error=''][32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m Current allocation summary follows.[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:13:02.280029 1540926 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. [32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:13:02.280418 1540926 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:13:12.281147 1540926 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540926)[0m Current allocation summary follows.[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:13:12.280699 1540926 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op 
+[36m(CpuApproximationActor pid=1540926)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. 
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:13:22.482741 1541376 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op 
+[36m(CpuApproximationActor pid=1540926)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. 
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:13:22.483247 1541376 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:13:22.483286 1541376 autotuner.cc:640] No reference output found even though buffer checking 
+[36m(CpuApproximationActor pid=1540926)[0m Current allocation summary follows.[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:13:32.483498 1541376 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op 
+[36m(CpuApproximationActor pid=1540926)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. 
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:13:32.483920 1541376 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540926)[0m Current allocation summary follows.[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:13:42.504912 1541376 bfc_allocator.cc:515] Allocator (GPU_0_bfc) ran out of memory trying to allocate 9.09GiB (rounded to 9758278656)requested by op 
+[36m(CpuApproximationActor pid=1540926)[0m If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. 
+[36m(CpuApproximationActor pid=1540926)[0m W0723 11:13:42.505339 1541376 bfc_allocator.cc:526] ********************************************************________________________________________****
+[36m(CpuApproximationActor pid=1540926)[0m E0723 11:13:42.505549 1540926 autotuner.cc:460] Could not get config for HLO: %wrapped_transpose = f32[784,63,63,784]{3,2,1,0} fusion(%args_0_.1), kind=kInput, calls=
+[36m(CpuApproximationActor pid=1540926)[0m (param_0: f32[784,63,784,63]) -> f32[784,63,63,784] {
+[36m(CpuApproximationActor pid=1540926)[0m   %param_0 = f32[784,63,784,63]{3,2,1,0} parameter(0)
+[36m(CpuApproximationActor pid=1540926)[0m   ROOT %transpose.1.1 = f32[784,63,63,784]{3,2,1,0} transpose(%param_0), dimensions={0,1,3,2}, metadata={op_name="args[0]"}
+[36m(CpuApproximationActor pid=1540926)[0m }, metadata={op_name="args[0]"}. Status: INTERNAL: Autotuning failed for HLO: %wrapped_transpose = f32[784,63,63,784]{3,2,1,0} fusion(%args_0_.1), kind=kInput, calls=%wrapped_transpose_computation, metadata={op_name="args[0]"}. Failed to pick best config: All configs failed during profiling.
+[36m(CpuApproximationActor pid=1540926)[0m Failures (2):
+[36m(CpuApproximationActor pid=1540926)[0m EXECUTION FAILED: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 9.09GiB. [tf-allocator-allocation-error='']
+[36m(CpuApproximationActor pid=1540926)[0m EXECUTION FAILED: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 9.09GiB. [tf-allocator-allocation-error='']
+[36m(CpuApproximationActor pid=1540926)[0m Current allocation summary follows.[32m [repeated 2x across cluster][0m
+[36m(PPOActor pid=1540925)[0m [ppo_ray][popart] ep=1101 ev=-576.849 adv(mean/std/absmax)=-10651.927/345.101/11249.940 latency_ns: mu=-5.7e+04 sig=2.29e+04 cosine_sim: mu=+1 sig=0.2 frob_residual: mu=-0.0283 sig=0.1 xla_peak_memory: mu=-1.63e+07 sig=1.56e+03
+ppo_ray best:-1.64e+07(ep0) mean:-1.65e+07 loss(p/v):1.1e+04/2.9e+07 ent:1.390 nan_skip:0:   0%|                                              | 2/3400 [04:58<135:54:34, 143.99s/it]ppo_ray best:-1.64e+07(ep0) mean:-1.67e+07 loss(p/v):1.1e+04/2.9e+07 ent:1.955 nan_skip:0:   0%|                                              | 2/3400 [04:58<135:54:34, 143.99s/it][36m(CpuApproximationActor pid=1546220)[0m W0723 11:13:56.348564 1546220 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1546220)[0m W0723 11:13:56.348591 1546220 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1546220)[0m W0723 11:13:56.348598 1546220 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1546220)[0m W0723 11:13:56.348606 1546220 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1546220)[0m W0723 11:13:56.348618 1546220 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1546220)[0m W0723 11:13:56.348644 1546220 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1546220)[0m W0723 11:13:56.348687 1546220 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1546220)[0m W0723 11:13:56.348774 1546220 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1546220)[0m W0723 11:13:56.348935 1546220 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=1546220)[0m [cpu_approx_worker pid=1546220] env: ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55149-pgi15-gpu7
+[36m(CpuApproximationActor pid=1546220)[0m [measure-actor 4] host=pgi15-gpu7.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=1 jax_devices=[CudaDevice(id=0)]
+[36m(CpuApproximationActor pid=1540927)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype complex128 requested in astype is not available, and will be truncated to dtype complex64. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.
+[36m(CpuApproximationActor pid=1540927)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)
+[36m(CpuApproximationActor pid=1546220)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=1546220)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1546220)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=1546220)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1546220)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=1546220)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1546220)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=1546220)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1546220)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=1546220)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1546220)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=1546220)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1546220)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=1546220)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1546220)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=1546220)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1546220)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=1546220)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1546220)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=1546220)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1546220)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=1546220)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1546220)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=1546220)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1546220)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=1546220)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=1540927)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured literal rendered as '?': '(1+0j)'
+[36m(CpuApproximationActor pid=1546220)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'round'
+[36m(CpuApproximationActor pid=1546220)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'clip'
+slurmstepd: error: *** JOB 55149 ON pgi15-gpu7 CANCELLED AT 2026-07-23T11:14:05 ***

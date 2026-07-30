@@ -1,0 +1,43 @@
+=== node=pgi15-gpu11 gpu=NVIDIA GeForce RTX 4090 Fri Jul 24 07:10:43 AM UTC 2026 ===
+=== TAG=smoke_approx_mlp MODE=approx EXAMPLE=VmappedNeuralNetwork WIDTH=64 SNN_STEPS=unset ===
+=== graphax=eb6ad3e feat(sparse): implement verify_hardware_compat hook for dynamic quant masks ===
+=== alphagrad=1baa0c8 exp: exact/approx via --variant ve_only/full on the slimmed line ===
+=== PHASE lat_mem START Fri Jul 24 07:10:43 AM UTC 2026 ===
+2026-07-24 07:10:44,380	INFO worker.py:1814 -- Connecting to existing Ray cluster at address: 192.168.15.11:6391...
+Traceback (most recent call last):
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 776, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 768, in main
+    ray.init(**init_kwargs, ignore_reinit_error=True)
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/client_mode_hook.py", line 107, in wrapper
+    return func(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 1915, in init
+    raise ValueError(
+    ...<2 lines>...
+    )
+ValueError: When connecting to an existing cluster, num_cpus and num_gpus must not be provided.
+=== PHASE lat_mem RC=1 Fri Jul 24 07:10:44 AM UTC 2026 ===
+[log_to_csv] no ep= rows in campaign_exp/smoke_approx_mlp_lat_mem/run.log
+  (csv export failed)
+=== PHASE flops START Fri Jul 24 07:10:44 AM UTC 2026 ===
+2026-07-24 07:10:45,000	INFO worker.py:1814 -- Connecting to existing Ray cluster at address: 192.168.15.11:6391...
+Traceback (most recent call last):
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 776, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 768, in main
+    ray.init(**init_kwargs, ignore_reinit_error=True)
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/client_mode_hook.py", line 107, in wrapper
+    return func(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 1915, in init
+    raise ValueError(
+    ...<2 lines>...
+    )
+ValueError: When connecting to an existing cluster, num_cpus and num_gpus must not be provided.
+=== PHASE flops RC=1 Fri Jul 24 07:10:45 AM UTC 2026 ===
+[log_to_csv] no ep= rows in campaign_exp/smoke_approx_mlp_flops/run.log
+  (csv export failed)
+=== ALL PHASES DONE (FAILED=1) Fri Jul 24 07:10:45 AM UTC 2026 ===

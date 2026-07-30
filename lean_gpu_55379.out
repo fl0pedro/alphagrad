@@ -1,0 +1,84 @@
+=== node=pgi15-gpu10.iff.kfa-juelich.de gpus=2 ===
+/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jaxlib/plugin_support.py:92: RuntimeWarning: JAX plugin jax_cuda12_plugin version 0.10.1.dev0+selfbuilt is installed, but it is not compatible with the installed jaxlib version 0.11.0, so it will not be used.
+  warnings.warn(
+[train_lean] {'commit/alphagrad': 'e13ac89', 'commit/graphax': 'eb6ad3e', 'commit/dsnn': '4cf29af'}
+wandb: Loading settings from /Users/assmuth/.config/wandb/settings
+wandb: Tracking run with wandb version 0.25.0
+wandb: W&B syncing is set to `offline` in this directory. Run `wandb online` or set WANDB_MODE=online to enable cloud syncing.
+wandb: Run data is saved locally in /Users/assmuth/dsnn/alphagrad/wandb/offline-run-20260724_140536-os2jonhe
+[train_lean] backend: gpu-kernel
+W0724 14:05:37.883388 1824397 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+W0724 14:05:37.883408 1824397 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+W0724 14:05:37.883415 1824397 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+W0724 14:05:37.883424 1824397 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+W0724 14:05:37.883437 1824397 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+W0724 14:05:37.883464 1824397 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+W0724 14:05:37.883511 1824397 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+W0724 14:05:37.883611 1824397 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+W0724 14:05:37.883791 1824397 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:1111: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=4121 > MAX_TOKENS=4096 (overflow=25). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+  _record_tokenization_truncation(int(raw_tokens.shape[0]))
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+  warnings.warn(
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+  warnings.warn(
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+  warnings.warn(
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+  warnings.warn(
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+  warnings.warn(
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+  warnings.warn(
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+  warnings.warn(
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+  warnings.warn(
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'Inline.AUTO'
+  warnings.warn(
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+  warnings.warn(
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+  warnings.warn(
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+  warnings.warn(
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+  warnings.warn(
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+  warnings.warn(
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'diagonal'
+  warnings.warn(
+/Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'floor_divide'
+  warnings.warn(
+/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:1335: RuntimeWarning: Device 'cuda:1' lacks 'clear_memory_stats'. Peak memory will report a sampled high-water mark instead of the exact allocator peak.
+  with ResourceMonitor(devices=unique_devices) as monitor:
+[train_lean] ep=0 muls_adds_fmas=-3.692e+10 flops=-8.876e+09 latency_ns=-2.425e+05 max_io_sum=-3.854e+07 bytes_accessed=-9.664e+07 peak_memory=-3.408e+07 cosine_sim=0.5176 frob_residual=-0.8556
+[train_lean] ep=1 muls_adds_fmas=-2.397e+10 flops=-8.893e+09 latency_ns=-3.413e+05 max_io_sum=-2.073e+07 bytes_accessed=-1.329e+08 peak_memory=-3.408e+07 cosine_sim=0.06381 frob_residual=-0.998
+[train_lean] ep=2 muls_adds_fmas=-3.47e+10 flops=-1.031e+07 latency_ns=-2.271e+05 max_io_sum=-5.53e+06 bytes_accessed=-3.473e+07 peak_memory=-3.408e+07 cosine_sim=0.1238 frob_residual=-0.9923
+wandb: 
+wandb: Run history:
+wandb:               episode ▁▅█
+wandb: reward/bytes_accessed ▄▁█
+wandb:     reward/cosine_sim █▁▂
+wandb:          reward/flops ▁▁█
+wandb:  reward/frob_residual █▁▁
+wandb:     reward/latency_ns ▇▁█
+wandb:     reward/max_io_sum ▁▅█
+wandb: reward/muls_adds_fmas ▁█▂
+wandb:    reward/peak_memory ▁▁▁
+wandb: 
+wandb: Run summary:
+wandb:               episode 2
+wandb: reward/bytes_accessed -34734624.0
+wandb:     reward/cosine_sim 0.12376
+wandb:          reward/flops -10311936.0
+wandb:  reward/frob_residual -0.99231
+wandb:     reward/latency_ns -227073.5
+wandb:     reward/max_io_sum -5529600.0
+wandb: reward/muls_adds_fmas -34703671296.0
+wandb:    reward/peak_memory -34078720.0
+wandb: 
+wandb: You can sync this run to the cloud by running:
+wandb: wandb sync /Users/assmuth/dsnn/alphagrad/wandb/offline-run-20260724_140536-os2jonhe
+wandb: Find logs at: ./wandb/offline-run-20260724_140536-os2jonhe/logs
+=== RC=0 ===

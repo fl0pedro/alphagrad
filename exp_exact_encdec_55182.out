@@ -1,0 +1,727 @@
+=== node=pgi15-gpu13 gpu=NVIDIA GeForce RTX 4090 Thu Jul 23 02:53:33 PM UTC 2026 ===
+=== TAG=exact_encdec MODE=exact EXAMPLE=EncoderDecoder WIDTH=64 SNN_TRUNC=unset ===
+=== graphax=2410078 jaxpr: bound the tokenizer's name alphabet so token ids stay in range ===
+=== alphagrad=c34bbf7 exp: synthetic width-64 baselines (MLP / EncoderDecoder / ADALIF_SNN) ===
+=== PHASE lat_mem START Thu Jul 23 02:53:33 PM UTC 2026 ===
+2026-07-23 14:53:37,101	INFO worker.py:2012 -- Started a local Ray instance.
+/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+wandb: Loading settings from /Users/assmuth/.config/wandb/settings
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: Tracking run with wandb version 0.25.0
+wandb: W&B syncing is set to `offline` in this directory. Run `wandb online` or set WANDB_MODE=online to enable cloud syncing.
+wandb: Run data is saved locally in /Users/assmuth/dsnn/alphagrad/wandb/offline-run-20260723_145337-h8jaxedw
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="fbad9537-b0c9-464b-9daf-e7e7e3148835", ...)
+[36m(CpuApproximationActor pid=4189420)[0m W0723 14:53:44.149078 4189420 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=4189420)[0m W0723 14:53:44.149097 4189420 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=4189420)[0m W0723 14:53:44.149113 4189420 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=4189420)[0m W0723 14:53:44.149123 4189420 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=4189420)[0m W0723 14:53:44.149137 4189420 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=4189420)[0m W0723 14:53:44.149167 4189420 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=4189420)[0m W0723 14:53:44.149217 4189420 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=4189420)[0m W0723 14:53:44.149317 4189420 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=4189420)[0m W0723 14:53:44.149504 4189420 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=4189419)[0m [cpu_approx_worker pid=4189419] env: ALPHAGRAD_EXACT_ONLY=1 ALPHAGRAD_EXAMPLE_WIDTH=64 ALPHAGRAD_FACE_TRANSFORMS=0 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=0 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55182-pgi15-gpu13
+[36m(CpuApproximationActor pid=4189419)[0m [measure-actor 0] host=pgi15-gpu13 CUDA_VISIBLE_DEVICES=1 jax_devices=[CudaDevice(id=0)]
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="fbad9537-b0c9-464b-9daf-e7e7e3148835", ...)
+[36m(PPOActor pid=4189418)[0m [ppo_ray] ADDITIVE failed/sentinel penalty = -2.0 (bounded-negative, INCLUDED in advantage+loss -- replaces the failed-row mask; failed rows are repulsive, never a zero-gradient no-op).
+[36m(PPOActor pid=4189418)[0m [ppo_ray] V2 anti-hack: failed_adv_stamp=1.0 (post-z-score advantage overwrite on failed rows), cost_symlog_cap=0.0 (symlog'd cost channels clipped to +/-cap).
+[36m(PPOActor pid=4189418)[0m [ppo_ray] PopArt value norm ON: beta=0.01 sigma_min(base=0.1, quality[6,9]=0.2) sigma_max=1e+12 robust_std=True (winsor k=5.0) — replaces the rollout advantage z-score; under pure-PopArt advantage a failed row is truly-neutral (A==0), no constant stamp.
+[36m(PPOActor pid=4189418)[0m [ppo_ray] DYNAMIC SENTINEL ON: failed/sentinel terminals get per-channel mu_c - 2.0*sigma_c (EMA beta=0.01) instead of -1e10. The additive failed_penalty stamp AND the post-z-score failed_adv_stamp are DISABLED (dynamic value supersedes them); failed_transitions logging + PopArt exclusion unchanged.
+[36m(PPOActor pid=4189418)[0m [ppo_ray] RAW COSSIM THREAD ON: env emits full-range cosine_sim in idx6; worker applies guide cap=None into the GAE buffer only, logs reward/cosine_sim_raw from the uncapped value.
+[36m(PPOActor pid=4189418)[0m [ppo_ray_worker] POLICY V2 ACTIVE: MicroPPOAgent = PALIMPSA backbone + PointerVertexPolicy + MicroActionPolicy(max_substeps=1) + separate value pool; factor tables up to axis size 64 (observed max 64).
+[36m(PPOActor pid=4189418)[0m [ppo_ray_worker] V2 policy heads scaled by 0.1 (near-uniform initial policy).
+[36m(CpuApproximationActor pid=4189420)[0m [cpu_approx_worker pid=4189420] env: ALPHAGRAD_EXACT_ONLY=1 ALPHAGRAD_EXAMPLE_WIDTH=64 ALPHAGRAD_FACE_TRANSFORMS=0 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=0 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55182-pgi15-gpu13[32m [repeated 2x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+[36m(CpuApproximationActor pid=4189420)[0m [measure-actor 1] host=pgi15-gpu13 CUDA_VISIBLE_DEVICES=2 jax_devices=[CudaDevice(id=0)][32m [repeated 2x across cluster][0m
+  actors spawned + JIT-warm in 26.5s
+ppo_ray:   0%|                                                                                                                                             | 0/1000 [00:00<?, ?it/s][36m(PPOActor pid=4189418)[0m [per-face] builds=200 applied=0 skipped=0 applied_frac=0.000
+[36m(CpuApproximationActor pid=4189419)[0m [per-face] builds=200 applied=0 skipped=0 applied_frac=0.000
+[36m(PPOActor pid=4189418)[0m [per-face] builds=400 applied=0 skipped=0 applied_frac=0.000
+[36m(PPOActor pid=4189418)[0m [per-face] builds=600 applied=0 skipped=0 applied_frac=0.000
+[36m(CpuApproximationActor pid=4189420)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=4189420)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189420)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=4189420)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189420)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=4189420)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189420)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=4189420)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189420)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=4189420)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189420)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=4189420)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189420)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=4189420)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189420)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=4189420)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189420)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=4189420)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189420)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=4189420)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189420)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=4189420)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189420)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=4189420)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189420)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=4189420)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189419)[0m W0723 14:53:44.081924 4189419 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"[32m [repeated 27x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m [per-face] builds=400 applied=0 skipped=0 applied_frac=0.000
+[36m(CpuApproximationActor pid=4189420)[0m /Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:3127: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=16573 > MAX_TOKENS=16384 (overflow=189). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+[36m(CpuApproximationActor pid=4189420)[0m   _record_tokenization_truncation(int(raw_tokens.shape[0]))
+[36m(CpuApproximationActor pid=4189419)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=4189419)[0m   warnings.warn([32m [repeated 13x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=4189419)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=4189419)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=4189419)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=4189419)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=4189419)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=4189419)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=4189419)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=4189419)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=4189419)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=4189419)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=4189419)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=4189419)[0m [per-face] builds=600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(CpuApproximationActor pid=4189421)[0m   _record_tokenization_truncation(int(raw_tokens.shape[0]))
+[36m(CpuApproximationActor pid=4189421)[0m /Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:3127: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=16489 > MAX_TOKENS=16384 (overflow=105). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+[36m(CpuApproximationActor pid=4189419)[0m /Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:3127: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=16437 > MAX_TOKENS=16384 (overflow=53). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+[36m(CpuApproximationActor pid=4189419)[0m   _record_tokenization_truncation(int(raw_tokens.shape[0]))
+[36m(CpuApproximationActor pid=4189421)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=4189421)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189421)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=4189421)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189421)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=4189421)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189421)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=4189421)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189421)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=4189421)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189421)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=4189421)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189421)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=4189421)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189421)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=4189421)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189421)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=4189421)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189421)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=4189421)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189421)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=4189421)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189421)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=4189421)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189421)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=4189421)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=4189421)[0m [per-face] builds=400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m [per-face] builds=1000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m [per-face] builds=1200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(PPOActor pid=4189418)[0m [per-face] builds=3000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(PPOActor pid=4189418)[0m [per-face] builds=3600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(PPOActor pid=4189418)[0m [per-face] builds=4000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(PPOActor pid=4189418)[0m [per-face] builds=4400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m [per-face] builds=2400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(PPOActor pid=4189418)[0m [per-face] builds=5400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(PPOActor pid=4189418)[0m [per-face] builds=5800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=4189421)[0m [per-face] builds=1600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m [per-face] builds=3400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 5x across cluster][0m
+[36m(PPOActor pid=4189418)[0m [per-face] builds=7600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m [per-face] builds=4000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=4189421)[0m [per-face] builds=2200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=4189421)[0m [per-face] builds=2400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(PPOActor pid=4189418)[0m [per-face] builds=10000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m [per-face] builds=5200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m [per-face] builds=5600 applied=0 skipped=0 applied_frac=0.000[32m [repeated 8x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m [per-face] builds=6000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 7x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m [per-face] builds=6200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(CpuApproximationActor pid=4189421)[0m [per-face] builds=3400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(PPOActor pid=4189418)[0m [per-face] builds=13800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 6x across cluster][0m
+[36m(PPOActor pid=4189418)[0m [per-face] builds=14800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 9x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m [per-face] builds=7800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 11x across cluster][0m
+[36m(CpuApproximationActor pid=4189420)[0m loc("multiply.393.1"): error: 'tt.dot' op expected the last dimension of the first operand to be equal to the second-to-last dimension of the second operand
+[36m(CpuApproximationActor pid=4189420)[0m [SENTINEL] measure-exception step=112 order_len=112 terminal=True: JaxRuntimeError: INTERNAL: Failed to compile Triton kernel. Context: [Fusion: fusion.188 = (f32[64,64,64,64]{3,2,1,0}, f32[64,64,64]{2,1,0}) fusion(input_transpose_fusion.10, gamma0.1, gemm_fusion_
+[36m(PPOActor pid=4189418)[0m [per-face] builds=15800 applied=0 skipped=0 applied_frac=0.000
+[36m(CpuApproximationActor pid=4189420)[0m [SENTINEL-VERBOSE] ==================================================
+[36m(CpuApproximationActor pid=4189420)[0m [SENTINEL-VERBOSE] step=112 order_len=112 terminal=True init=False point_idx=-1
+[36m(CpuApproximationActor pid=4189420)[0m [SENTINEL-VERBOSE] EXC JaxRuntimeError: INTERNAL: Failed to compile Triton kernel. Context: [Fusion: fusion.188 = (f32[64,64,64,64]{3,2,1,0}, f32[64,64,64]{2,1,0}) fusion(input_transpose_fusion.10, gamma0.1, gemm_fusion_dot_general.223, get-tuple-element.12, gemm_fusion_dot.271, fusion.64, gemm_fusion_dot_general.222, get-tuple-element.27), kind=kCustom, calls=fused_computation.132, backend_config={"operation_queue_id":"0","fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"num_warps":"8","output_tiles":[{"sizes":["64","1","4","64"]},{"sizes":["1","4","64"]}],"num_ctas":1,"num_stages":1,"is_tma_allowed":false,"is_warp_specialization_allowed":false,"waves_per_eu":0}},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}Computation: fused_computation.132 {
+[36m(CpuApproximationActor pid=4189420)[0m   param_1.828 = f32[64]{0} parameter(1)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1235.1 = f32[64,64,64,64]{3,2,1,0} broadcast(param_1.828), dimensions={2}
+[36m(CpuApproximationActor pid=4189420)[0m   param_2.650 = f32[64,64]{1,0} parameter(2)
+[36m(CpuApproximationActor pid=4189420)[0m   constant_541 = f32[] constant(0)
+[36m(CpuApproximationActor pid=4189420)[0m   reduce_sum.192 = f32[64]{0} reduce(param_2.650, constant_541), dimensions={1}, to_apply=region_1.2.clone.3
+[36m(CpuApproximationActor pid=4189420)[0m   constant_540 = f32[] constant(0.015625)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1413 = f32[64]{0} broadcast(constant_540), dimensions={}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.475 = f32[64]{0} multiply(reduce_sum.192, broadcast.1413)
+[36m(CpuApproximationActor pid=4189420)[0m   sub.188 = f32[64,64]{1,0} broadcast(multiply.475), dimensions={0}
+[36m(CpuApproximationActor pid=4189420)[0m   sub.187 = f32[64,64]{1,0} subtract(param_2.650, sub.188)
+[36m(CpuApproximationActor pid=4189420)[0m   neg.15.9 = f32[64,64]{1,0} negate(sub.187)
+[36m(CpuApproximationActor pid=4189420)[0m   integer_pow.11.13 = f32[64,64]{1,0} multiply(sub.187, sub.187)
+[36m(CpuApproximationActor pid=4189420)[0m   reduce_sum.72.11 = f32[64]{0} reduce(integer_pow.11.13, constant_541), dimensions={1}, to_apply=region_1.2.clone.4
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.241.9 = f32[64]{0} multiply(reduce_sum.72.11, broadcast.1413)
+[36m(CpuApproximationActor pid=4189420)[0m   constant_49_3 = f32[] constant(1e-06)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.966.17 = f32[64]{0} broadcast(constant_49_3), dimensions={}
+[36m(CpuApproximationActor pid=4189420)[0m   add.233.9 = f32[64]{0} add(multiply.241.9, broadcast.966.17)
+[36m(CpuApproximationActor pid=4189420)[0m   sqrt.1.9 = f32[64]{0} sqrt(add.233.9)
+[36m(CpuApproximationActor pid=4189420)[0m   integer_pow.5.1 = f32[64]{0} multiply(sqrt.1.9, sqrt.1.9)
+[36m(CpuApproximationActor pid=4189420)[0m   div.139.7 = f32[64,64]{1,0} broadcast(integer_pow.5.1), dimensions={0}
+[36m(CpuApproximationActor pid=4189420)[0m   div.140.7 = f32[64,64]{1,0} divide(neg.15.9, div.139.7)
+[36m(CpuApproximationActor pid=4189420)[0m   constant_30_2 = f32[] constant(0.5)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1105.7 = f32[64]{0} broadcast(constant_30_2), dimensions={}
+[36m(CpuApproximationActor pid=4189420)[0m   div.7.5 = f32[64]{0} divide(broadcast.1105.7, sqrt.1.9)
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.327.3 = f32[64]{0} multiply(div.7.5, broadcast.1413)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1033.5 = f32[64,64]{1,0} broadcast(multiply.327.3), dimensions={0}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.286.5 = f32[64,64]{1,0} multiply(div.140.7, broadcast.1033.5)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.830.8 = f32[64,64,4096]{2,1,0} broadcast(multiply.286.5), dimensions={0,1}
+[36m(CpuApproximationActor pid=4189420)[0m   param_3.694 = f32[64,64,64]{2,1,0} parameter(3)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1243.3 = f32[64,64,64,64]{3,2,1,0} broadcast(param_3.694), dimensions={0,1,2}
+[36m(CpuApproximationActor pid=4189420)[0m   param_0.340 = f32[64,64]{1,0} parameter(0)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1244.10 = f32[64,64,64,64]{3,2,1,0} broadcast(param_0.340), dimensions={1,3}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.390.5 = f32[64,64,64,64]{3,2,1,0} multiply(broadcast.1243.3, broadcast.1244.10)
+[36m(CpuApproximationActor pid=4189420)[0m   reduce.211.3 = f32[64,64,64]{0,2,1} reduce(multiply.390.5, constant_541), dimensions={2}, to_apply=region_1.2.clone.25
+[36m(CpuApproximationActor pid=4189420)[0m   bitcast.189.3 = f32[64,4096]{1,0} bitcast(reduce.211.3)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.831.3 = f32[64,64,4096]{2,1,0} broadcast(bitcast.189.3), dimensions={0,2}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.254.5 = f32[64,64,4096]{2,1,0} multiply(broadcast.830.8, broadcast.831.3)
+[36m(CpuApproximationActor pid=4189420)[0m   bitcast.190.3 = f32[64,64,64,64]{3,2,1,0} bitcast(multiply.254.5)
+[36m(CpuApproximationActor pid=4189420)[0m   transpose.887.3 = f32[64,64,64,64]{3,2,1,0} transpose(bitcast.190.3), dimensions={3,0,1,2}
+[36m(CpuApproximationActor pid=4189420)[0m   constant_48_27 = f32[] constant(1)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1101.56 = f32[64]{0} broadcast(constant_48_27), dimensions={}
+[36m(CpuApproximationActor pid=4189420)[0m   div.8.5 = f32[64]{0} divide(broadcast.1101.56, sqrt.1.9)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1240.7 = f32[1,1,1,1,1,1,1,64,64,64]{9,8,7,6,5,4,3,2,1,0} broadcast(div.8.5), dimensions={7}
+[36m(CpuApproximationActor pid=4189420)[0m   constant_193_1 = f32[] constant(-0.015625)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1125.11 = f32[64,64]{1,0} broadcast(constant_193_1), dimensions={}
+[36m(CpuApproximationActor pid=4189420)[0m   param_7.283 = f32[64,64]{1,0} parameter(7)
+[36m(CpuApproximationActor pid=4189420)[0m   add.246.11 = f32[64,64]{1,0} add(broadcast.1125.11, param_7.283)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1236.14 = f32[1,1,1,1,1,1,1,64,64,64]{9,8,7,6,5,4,3,2,1,0} broadcast(add.246.11), dimensions={8,9}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.388.7 = f32[1,1,1,1,1,1,1,64,64,64]{9,8,7,6,5,4,3,2,1,0} multiply(broadcast.1240.7, broadcast.1236.14)
+[36m(CpuApproximationActor pid=4189420)[0m   param_5.380 = f32[64,64]{1,0} parameter(5)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1239.12 = f32[1,1,1,1,1,1,1,64,64,64]{9,8,7,6,5,4,3,2,1,0} broadcast(param_5.380), dimensions={7,9}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.391.5 = f32[1,1,1,1,1,1,1,64,64,64]{9,8,7,6,5,4,3,2,1,0} multiply(multiply.388.7, broadcast.1239.12)
+[36m(CpuApproximationActor pid=4189420)[0m   bitcast.2493.3 = f32[64,64,64]{2,1,0} bitcast(multiply.391.5)
+[36m(CpuApproximationActor pid=4189420)[0m   reduce.201.3 = f32[64,64]{1,0} reduce(bitcast.2493.3, constant_541), dimensions={2}, to_apply=region_1.2.clone.20
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.840.1.clone.1 = f32[64,64,64]{2,1,0} broadcast(reduce.201.3), dimensions={0,1}
+[36m(CpuApproximationActor pid=4189420)[0m   param_6.292 = f32[64,64]{1,0} parameter(6)
+[36m(CpuApproximationActor pid=4189420)[0m   constant_631 = f32[] constant(-inf)
+[36m(CpuApproximationActor pid=4189420)[0m   reduce_max.39 = f32[64]{0} reduce(param_6.292, constant_631), dimensions={1}, to_apply=region_0.1
+[36m(CpuApproximationActor pid=4189420)[0m   sub.252 = f32[64,64]{1,0} broadcast(reduce_max.39), dimensions={0}
+[36m(CpuApproximationActor pid=4189420)[0m   sub.251 = f32[64,64]{1,0} subtract(param_6.292, sub.252)
+[36m(CpuApproximationActor pid=4189420)[0m   exp.5.9 = f32[64,64]{1,0} exponential(sub.251)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.809.4.clone.1 = f32[64,64,64]{2,1,0} broadcast(exp.5.9), dimensions={0,2}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.256.3.clone.1 = f32[64,64,64]{2,1,0} multiply(broadcast.840.1.clone.1, broadcast.809.4.clone.1)
+[36m(CpuApproximationActor pid=4189420)[0m   param_4.527 = f32[64,128,64]{2,1,0} parameter(4)
+[36m(CpuApproximationActor pid=4189420)[0m   slice.37.1.clone.1 = f32[64,64,64]{2,1,0} slice(param_4.527), slice={[0:64], [64:128], [0:64]}
+[36m(CpuApproximationActor pid=4189420)[0m   add.226.1.clone.1 = f32[64,64,64]{2,1,0} add(multiply.256.3.clone.1, slice.37.1.clone.1)
+[36m(CpuApproximationActor pid=4189420)[0m   transpose.888.1 = f32[64,64,64]{2,1,0} transpose(add.226.1.clone.1), dimensions={2,0,1}
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1245.1 = f32[64,64,64,64]{3,2,1,0} broadcast(transpose.888.1), dimensions={0,1,2}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.392.5 = f32[64,64,64,64]{3,2,1,0} multiply(broadcast.1245.1, broadcast.1244.10)
+[36m(CpuApproximationActor pid=4189420)[0m   add.270.3 = f32[64,64,64,64]{3,2,1,0} add(transpose.887.3, multiply.392.5)
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.393.1 = f32[64,64,64,64]{3,2,1,0} multiply(broadcast.1235.1, add.270.3)
+[36m(CpuApproximationActor pid=4189420)[0m   ROOT tuple.3 = (f32[64,64,64,64]{3,2,1,0}, f32[64,64,64]{2,1,0}) tuple(multiply.393.1, add.226.1.clone.1)
+[36m(CpuApproximationActor pid=4189420)[0m }]
+[36m(CpuApproximationActor pid=4189420)[0m [SENTINEL-VERBOSE] ORDER (112): [1, 56, 91, 92, 65, 40, 35, 106, 62, 71, 63, 78, 49, 94, 13, 53, 26, 61, 37, 22, 69, 18, 6, 90, 45, 5, 109, 84, 11, 98, 110, 93, 24, 2, 103, 36, 14, 32, 42, 51, 17, 3, 8, 67, 108, 86, 48, 16, 102, 74, 73, 104, 68, 96, 75, 19, 27, 31, 83, 57, 66, 64, 105, 29, 9, 82, 44, 88, 77, 97, 25, 15, 34, 76, 20, 12, 99, 79, 10, 41, 52, 38, 80, 21, 39, 23, 85, 7, 72, 101, 28, 107, 47, 54, 4, 95, 46, 55, 50, 112, 100, 58, 70, 33, 59, 60, 87, 81, 30, 89, 43, 111]
+[36m(CpuApproximationActor pid=4189420)[0m [SENTINEL-VERBOSE] MICRO-ACTIONS (per vertex, in elimination order):
+[36m(CpuApproximationActor pid=4189420)[0m     v0(vertex_id=1): DIAG(bi1=1,bi2=1,factor=2)
+[36m(CpuApproximationActor pid=4189420)[0m     v2(vertex_id=91): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v3(vertex_id=92): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v4(vertex_id=65): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v5(vertex_id=40): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v7(vertex_id=106): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v8(vertex_id=62): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v14(vertex_id=13): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v15(vertex_id=53): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v16(vertex_id=26): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v17(vertex_id=61): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v18(vertex_id=37): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v19(vertex_id=22): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v22(vertex_id=6): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v25(vertex_id=5): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v26(vertex_id=109): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v27(vertex_id=84): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v28(vertex_id=11): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v29(vertex_id=98): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v30(vertex_id=110): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v32(vertex_id=24): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v33(vertex_id=2): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v34(vertex_id=103): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v35(vertex_id=36): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v36(vertex_id=14): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v37(vertex_id=32): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v38(vertex_id=42): DIAG(bi1=0,bi2=1,factor=16)
+[36m(CpuApproximationActor pid=4189420)[0m     v39(vertex_id=51): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v40(vertex_id=17): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v41(vertex_id=3): COMPRESS(axis=3,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v43(vertex_id=67): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v48(vertex_id=102): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v49(vertex_id=74): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v50(vertex_id=73): DIAG(bi1=1,bi2=1,factor=2)
+[36m(CpuApproximationActor pid=4189420)[0m     v51(vertex_id=104): QUANT(dtype=float8_e8m0fnu)
+[36m(CpuApproximationActor pid=4189420)[0m     v53(vertex_id=96): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v54(vertex_id=75): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v58(vertex_id=83): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v59(vertex_id=57): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v60(vertex_id=66): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v61(vertex_id=64): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v62(vertex_id=105): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v65(vertex_id=82): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v66(vertex_id=44): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v69(vertex_id=97): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v70(vertex_id=25): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v71(vertex_id=15): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v73(vertex_id=76): QUANT(dtype=float8_e8m0fnu)
+[36m(CpuApproximationActor pid=4189420)[0m     v74(vertex_id=20): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v75(vertex_id=12): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v78(vertex_id=10): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v79(vertex_id=41): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v80(vertex_id=52): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v81(vertex_id=38): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v82(vertex_id=80): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v83(vertex_id=21): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v84(vertex_id=39): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v85(vertex_id=23): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v86(vertex_id=85): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v90(vertex_id=28): DIAG(bi1=1,bi2=0,factor=16)
+[36m(CpuApproximationActor pid=4189420)[0m     v91(vertex_id=107): DIAG(bi1=0,bi2=0,factor=2)
+[36m(CpuApproximationActor pid=4189420)[0m     v93(vertex_id=54): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v94(vertex_id=4): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v95(vertex_id=95): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v98(vertex_id=50): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v99(vertex_id=112): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v100(vertex_id=100): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v101(vertex_id=58): DIAG(bi1=0,bi2=0,factor=2)
+[36m(CpuApproximationActor pid=4189420)[0m     v102(vertex_id=70): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v103(vertex_id=33): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v105(vertex_id=60): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v107(vertex_id=81): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v108(vertex_id=30): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v109(vertex_id=89): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v110(vertex_id=43): COMPRESS(axis=3,kind=abs_max)
+[36m(CpuApproximationActor pid=4189420)[0m     v111(vertex_id=111): DIAG(bi1=0,bi2=0,factor=2)
+[36m(CpuApproximationActor pid=4189420)[0m [SENTINEL-VERBOSE] TRACEBACK:
+[36m(CpuApproximationActor pid=4189420)[0m Traceback (most recent call last):
+[36m(CpuApproximationActor pid=4189420)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/cpu_approx_worker.py", line 257, in evaluate
+[36m(CpuApproximationActor pid=4189420)[0m     tokens, eqn_ids, reward = _callback(
+[36m(CpuApproximationActor pid=4189420)[0m                               ~~~~~~~~~^
+[36m(CpuApproximationActor pid=4189420)[0m         self._config,
+[36m(CpuApproximationActor pid=4189420)[0m         ^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=4189420)[0m     ...<7 lines>...
+[36m(CpuApproximationActor pid=4189420)[0m         point_idx=int(point_idx),
+[36m(CpuApproximationActor pid=4189420)[0m         ^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=4189420)[0m     )
+[36m(CpuApproximationActor pid=4189420)[0m     ^
+[36m(CpuApproximationActor pid=4189420)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 3443, in _callback
+[36m(CpuApproximationActor pid=4189420)[0m     compiled_approx = _inproc_lru_cached_compile(b"approx:" + cache_key, _do_compile_approx)
+[36m(CpuApproximationActor pid=4189420)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 286, in _inproc_lru_cached_compile
+[36m(CpuApproximationActor pid=4189420)[0m     return _cc(key, compile_fn)
+[36m(CpuApproximationActor pid=4189420)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/compile_cache.py", line 150, in cached_compile
+[36m(CpuApproximationActor pid=4189420)[0m     compiled = compile_fn()
+[36m(CpuApproximationActor pid=4189420)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 3406, in _do_compile_approx
+[36m(CpuApproximationActor pid=4189420)[0m     return jax.jit(fn, keep_unused=True).lower(*args_for_lower).compile()
+[36m(CpuApproximationActor pid=4189420)[0m            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+[36m(CpuApproximationActor pid=4189420)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/stages.py", line 586, in compile
+[36m(CpuApproximationActor pid=4189420)[0m     return Compiled(self._lowering.compile(**kw), self._lowering.const_args,
+[36m(CpuApproximationActor pid=4189420)[0m                     ~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+[36m(CpuApproximationActor pid=4189420)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1226, in compile
+[36m(CpuApproximationActor pid=4189420)[0m     executable = UnloadedMeshExecutable.from_hlo(
+[36m(CpuApproximationActor pid=4189420)[0m         self._name, self._hlo, **self.compile_args,
+[36m(CpuApproximationActor pid=4189420)[0m         compiler_options_kvs=compiler_options_kvs,
+[36m(CpuApproximationActor pid=4189420)[0m         device_list=compilation_device_list)
+[36m(CpuApproximationActor pid=4189420)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1724, in from_hlo
+[36m(CpuApproximationActor pid=4189420)[0m     xla_executable = _cached_compilation(
+[36m(CpuApproximationActor pid=4189420)[0m         hlo, name, tuple_args, allow_prop_to_inputs, allow_prop_to_outputs,
+[36m(CpuApproximationActor pid=4189420)[0m         tuple(host_callbacks), backend, device_list, compiler_options_kvs,
+[36m(CpuApproximationActor pid=4189420)[0m         pgle_profiler)
+[36m(CpuApproximationActor pid=4189420)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1507, in _cached_compilation
+[36m(CpuApproximationActor pid=4189420)[0m     xla_executable = compiler.compile_or_get_cached(
+[36m(CpuApproximationActor pid=4189420)[0m         backend, computation, dev, compile_options, host_callbacks,
+[36m(CpuApproximationActor pid=4189420)[0m         da, pgle_profiler)
+[36m(CpuApproximationActor pid=4189420)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/compiler.py", line 469, in compile_or_get_cached
+[36m(CpuApproximationActor pid=4189420)[0m     return _compile_and_write_cache(
+[36m(CpuApproximationActor pid=4189420)[0m         backend,
+[36m(CpuApproximationActor pid=4189420)[0m     ...<5 lines>...
+[36m(CpuApproximationActor pid=4189420)[0m         cache_key,
+[36m(CpuApproximationActor pid=4189420)[0m     )
+[36m(CpuApproximationActor pid=4189420)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/compiler.py", line 737, in _compile_and_write_cache
+[36m(CpuApproximationActor pid=4189420)[0m     executable = backend_compile_and_load(
+[36m(CpuApproximationActor pid=4189420)[0m         backend, computation, executable_devices, compile_options, host_callbacks
+[36m(CpuApproximationActor pid=4189420)[0m     )
+[36m(CpuApproximationActor pid=4189420)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/profiler.py", line 384, in wrapper
+[36m(CpuApproximationActor pid=4189420)[0m     return func(*args, **kwargs)
+[36m(CpuApproximationActor pid=4189420)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/compiler.py", line 363, in backend_compile_and_load
+[36m(CpuApproximationActor pid=4189420)[0m     raise e
+[36m(CpuApproximationActor pid=4189420)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/compiler.py", line 353, in backend_compile_and_load
+[36m(CpuApproximationActor pid=4189420)[0m     return backend.compile_and_load(
+[36m(CpuApproximationActor pid=4189420)[0m            ~~~~~~~~~~~~~~~~~~~~~~~~^
+[36m(CpuApproximationActor pid=4189420)[0m         module,
+[36m(CpuApproximationActor pid=4189420)[0m         ^^^^^^^
+[36m(CpuApproximationActor pid=4189420)[0m         executable_devices=executable_devices,
+[36m(CpuApproximationActor pid=4189420)[0m         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=4189420)[0m         compile_options=options,
+[36m(CpuApproximationActor pid=4189420)[0m         ^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=4189420)[0m     )
+[36m(CpuApproximationActor pid=4189420)[0m     ^
+[36m(CpuApproximationActor pid=4189420)[0m jax.errors.JaxRuntimeError: INTERNAL: Failed to compile Triton kernel. Context: [Fusion: fusion.188 = (f32[64,64,64,64]{3,2,1,0}, f32[64,64,64]{2,1,0}) fusion(input_transpose_fusion.10, gamma0.1, gemm_fusion_dot_general.223, get-tuple-element.12, gemm_fusion_dot.271, fusion.64, gemm_fusion_dot_general.222, get-tuple-element.27), kind=kCustom, calls=fused_computation.132, backend_config={"operation_queue_id":"0","fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"num_warps":"8","output_tiles":[{"sizes":["64","1","4","64"]},{"sizes":["1","4","64"]}],"num_ctas":1,"num_stages":1,"is_tma_allowed":false,"is_warp_specialization_allowed":false,"waves_per_eu":0}},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}Computation: fused_computation.132 {
+[36m(CpuApproximationActor pid=4189420)[0m   param_1.828 = f32[64]{0} parameter(1)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1235.1 = f32[64,64,64,64]{3,2,1,0} broadcast(param_1.828), dimensions={2}
+[36m(CpuApproximationActor pid=4189420)[0m   param_2.650 = f32[64,64]{1,0} parameter(2)
+[36m(CpuApproximationActor pid=4189420)[0m   constant_541 = f32[] constant(0)
+[36m(CpuApproximationActor pid=4189420)[0m   reduce_sum.192 = f32[64]{0} reduce(param_2.650, constant_541), dimensions={1}, to_apply=region_1.2.clone.3
+[36m(CpuApproximationActor pid=4189420)[0m   constant_540 = f32[] constant(0.015625)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1413 = f32[64]{0} broadcast(constant_540), dimensions={}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.475 = f32[64]{0} multiply(reduce_sum.192, broadcast.1413)
+[36m(CpuApproximationActor pid=4189420)[0m   sub.188 = f32[64,64]{1,0} broadcast(multiply.475), dimensions={0}
+[36m(CpuApproximationActor pid=4189420)[0m   sub.187 = f32[64,64]{1,0} subtract(param_2.650, sub.188)
+[36m(CpuApproximationActor pid=4189420)[0m   neg.15.9 = f32[64,64]{1,0} negate(sub.187)
+[36m(CpuApproximationActor pid=4189420)[0m   integer_pow.11.13 = f32[64,64]{1,0} multiply(sub.187, sub.187)
+[36m(CpuApproximationActor pid=4189420)[0m   reduce_sum.72.11 = f32[64]{0} reduce(integer_pow.11.13, constant_541), dimensions={1}, to_apply=region_1.2.clone.4
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.241.9 = f32[64]{0} multiply(reduce_sum.72.11, broadcast.1413)
+[36m(CpuApproximationActor pid=4189420)[0m   constant_49_3 = f32[] constant(1e-06)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.966.17 = f32[64]{0} broadcast(constant_49_3), dimensions={}
+[36m(CpuApproximationActor pid=4189420)[0m   add.233.9 = f32[64]{0} add(multiply.241.9, broadcast.966.17)
+[36m(CpuApproximationActor pid=4189420)[0m   sqrt.1.9 = f32[64]{0} sqrt(add.233.9)
+[36m(CpuApproximationActor pid=4189420)[0m   integer_pow.5.1 = f32[64]{0} multiply(sqrt.1.9, sqrt.1.9)
+[36m(CpuApproximationActor pid=4189420)[0m   div.139.7 = f32[64,64]{1,0} broadcast(integer_pow.5.1), dimensions={0}
+[36m(CpuApproximationActor pid=4189420)[0m   div.140.7 = f32[64,64]{1,0} divide(neg.15.9, div.139.7)
+[36m(CpuApproximationActor pid=4189420)[0m   constant_30_2 = f32[] constant(0.5)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1105.7 = f32[64]{0} broadcast(constant_30_2), dimensions={}
+[36m(CpuApproximationActor pid=4189420)[0m   div.7.5 = f32[64]{0} divide(broadcast.1105.7, sqrt.1.9)
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.327.3 = f32[64]{0} multiply(div.7.5, broadcast.1413)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1033.5 = f32[64,64]{1,0} broadcast(multiply.327.3), dimensions={0}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.286.5 = f32[64,64]{1,0} multiply(div.140.7, broadcast.1033.5)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.830.8 = f32[64,64,4096]{2,1,0} broadcast(multiply.286.5), dimensions={0,1}
+[36m(CpuApproximationActor pid=4189420)[0m   param_3.694 = f32[64,64,64]{2,1,0} parameter(3)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1243.3 = f32[64,64,64,64]{3,2,1,0} broadcast(param_3.694), dimensions={0,1,2}
+[36m(CpuApproximationActor pid=4189420)[0m   param_0.340 = f32[64,64]{1,0} parameter(0)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1244.10 = f32[64,64,64,64]{3,2,1,0} broadcast(param_0.340), dimensions={1,3}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.390.5 = f32[64,64,64,64]{3,2,1,0} multiply(broadcast.1243.3, broadcast.1244.10)
+[36m(CpuApproximationActor pid=4189420)[0m   reduce.211.3 = f32[64,64,64]{0,2,1} reduce(multiply.390.5, constant_541), dimensions={2}, to_apply=region_1.2.clone.25
+[36m(CpuApproximationActor pid=4189420)[0m   bitcast.189.3 = f32[64,4096]{1,0} bitcast(reduce.211.3)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.831.3 = f32[64,64,4096]{2,1,0} broadcast(bitcast.189.3), dimensions={0,2}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.254.5 = f32[64,64,4096]{2,1,0} multiply(broadcast.830.8, broadcast.831.3)
+[36m(CpuApproximationActor pid=4189420)[0m   bitcast.190.3 = f32[64,64,64,64]{3,2,1,0} bitcast(multiply.254.5)
+[36m(CpuApproximationActor pid=4189420)[0m   transpose.887.3 = f32[64,64,64,64]{3,2,1,0} transpose(bitcast.190.3), dimensions={3,0,1,2}
+[36m(CpuApproximationActor pid=4189420)[0m   constant_48_27 = f32[] constant(1)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1101.56 = f32[64]{0} broadcast(constant_48_27), dimensions={}
+[36m(CpuApproximationActor pid=4189420)[0m   div.8.5 = f32[64]{0} divide(broadcast.1101.56, sqrt.1.9)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1240.7 = f32[1,1,1,1,1,1,1,64,64,64]{9,8,7,6,5,4,3,2,1,0} broadcast(div.8.5), dimensions={7}
+[36m(CpuApproximationActor pid=4189420)[0m   constant_193_1 = f32[] constant(-0.015625)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1125.11 = f32[64,64]{1,0} broadcast(constant_193_1), dimensions={}
+[36m(CpuApproximationActor pid=4189420)[0m   param_7.283 = f32[64,64]{1,0} parameter(7)
+[36m(CpuApproximationActor pid=4189420)[0m   add.246.11 = f32[64,64]{1,0} add(broadcast.1125.11, param_7.283)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1236.14 = f32[1,1,1,1,1,1,1,64,64,64]{9,8,7,6,5,4,3,2,1,0} broadcast(add.246.11), dimensions={8,9}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.388.7 = f32[1,1,1,1,1,1,1,64,64,64]{9,8,7,6,5,4,3,2,1,0} multiply(broadcast.1240.7, broadcast.1236.14)
+[36m(CpuApproximationActor pid=4189420)[0m   param_5.380 = f32[64,64]{1,0} parameter(5)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1239.12 = f32[1,1,1,1,1,1,1,64,64,64]{9,8,7,6,5,4,3,2,1,0} broadcast(param_5.380), dimensions={7,9}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.391.5 = f32[1,1,1,1,1,1,1,64,64,64]{9,8,7,6,5,4,3,2,1,0} multiply(multiply.388.7, broadcast.1239.12)
+[36m(CpuApproximationActor pid=4189420)[0m   bitcast.2493.3 = f32[64,64,64]{2,1,0} bitcast(multiply.391.5)
+[36m(CpuApproximationActor pid=4189420)[0m   reduce.201.3 = f32[64,64]{1,0} reduce(bitcast.2493.3, constant_541), dimensions={2}, to_apply=region_1.2.clone.20
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.840.1.clone.1 = f32[64,64,64]{2,1,0} broadcast(reduce.201.3), dimensions={0,1}
+[36m(CpuApproximationActor pid=4189420)[0m   param_6.292 = f32[64,64]{1,0} parameter(6)
+[36m(CpuApproximationActor pid=4189420)[0m   constant_631 = f32[] constant(-inf)
+[36m(CpuApproximationActor pid=4189420)[0m   reduce_max.39 = f32[64]{0} reduce(param_6.292, constant_631), dimensions={1}, to_apply=region_0.1
+[36m(CpuApproximationActor pid=4189420)[0m   sub.252 = f32[64,64]{1,0} broadcast(reduce_max.39), dimensions={0}
+[36m(CpuApproximationActor pid=4189420)[0m   sub.251 = f32[64,64]{1,0} subtract(param_6.292, sub.252)
+[36m(CpuApproximationActor pid=4189420)[0m   exp.5.9 = f32[64,64]{1,0} exponential(sub.251)
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.809.4.clone.1 = f32[64,64,64]{2,1,0} broadcast(exp.5.9), dimensions={0,2}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.256.3.clone.1 = f32[64,64,64]{2,1,0} multiply(broadcast.840.1.clone.1, broadcast.809.4.clone.1)
+[36m(CpuApproximationActor pid=4189420)[0m   param_4.527 = f32[64,128,64]{2,1,0} parameter(4)
+[36m(CpuApproximationActor pid=4189420)[0m   slice.37.1.clone.1 = f32[64,64,64]{2,1,0} slice(param_4.527), slice={[0:64], [64:128], [0:64]}
+[36m(CpuApproximationActor pid=4189420)[0m   add.226.1.clone.1 = f32[64,64,64]{2,1,0} add(multiply.256.3.clone.1, slice.37.1.clone.1)
+[36m(CpuApproximationActor pid=4189420)[0m   transpose.888.1 = f32[64,64,64]{2,1,0} transpose(add.226.1.clone.1), dimensions={2,0,1}
+[36m(CpuApproximationActor pid=4189420)[0m   broadcast.1245.1 = f32[64,64,64,64]{3,2,1,0} broadcast(transpose.888.1), dimensions={0,1,2}
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.392.5 = f32[64,64,64,64]{3,2,1,0} multiply(broadcast.1245.1, broadcast.1244.10)
+[36m(CpuApproximationActor pid=4189420)[0m   add.270.3 = f32[64,64,64,64]{3,2,1,0} add(transpose.887.3, multiply.392.5)
+[36m(CpuApproximationActor pid=4189420)[0m   multiply.393.1 = f32[64,64,64,64]{3,2,1,0} multiply(broadcast.1235.1, add.270.3)
+[36m(CpuApproximationActor pid=4189420)[0m   ROOT tuple.3 = (f32[64,64,64,64]{3,2,1,0}, f32[64,64,64]{2,1,0}) tuple(multiply.393.1, add.226.1.clone.1)
+[36m(CpuApproximationActor pid=4189420)[0m }]
+[36m(CpuApproximationActor pid=4189420)[0m [SENTINEL-VERBOSE] ==================================================
+[36m(CpuApproximationActor pid=4189419)[0m [SENTINEL] measure-exception step=112 order_len=112 terminal=True: JaxRuntimeError: RESOURCE_EXHAUSTED: Shared memory size limit exceeded: requested 131072, available: 101376, context: [Fusion: fusion.72 = f32[64,64,64]{1,0,2} fusion(gemm_fusion_dot_general.300, g
+[36m(CpuApproximationActor pid=4189419)[0m [SENTINEL-VERBOSE] EXC JaxRuntimeError: RESOURCE_EXHAUSTED: Shared memory size limit exceeded: requested 131072, available: 101376, context: [Fusion: fusion.72 = f32[64,64,64]{1,0,2} fusion(gemm_fusion_dot_general.300, gemm_fusion_dot.375), kind=kCustom, calls=fused_computation.13, backend_config={"operation_queue_id":"0","fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"num_warps":"8","output_tiles":[{"sizes":["2","16","64"]}],"num_ctas":1,"num_stages":1,"is_tma_allowed":false,"is_warp_specialization_allowed":false,"waves_per_eu":0}},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}Computation: fused_computation.13 {
+[36m(CpuApproximationActor pid=4189419)[0m   iota.57 = s32[64,64]{1,0} iota(), iota_dimension=0
+[36m(CpuApproximationActor pid=4189419)[0m   iota.1.3 = s32[64,64]{1,0} iota(), iota_dimension=1
+[36m(CpuApproximationActor pid=4189419)[0m   eq.46.3 = pred[64,64]{1,0} compare(iota.57, iota.1.3), direction=EQ
+[36m(CpuApproximationActor pid=4189419)[0m     v0(vertex_id=102): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v1(vertex_id=77): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v2(vertex_id=91): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v3(vertex_id=103): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v4(vertex_id=25): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v5(vertex_id=21): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v6(vertex_id=28): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v8(vertex_id=47): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v10(vertex_id=71): QUANT(dtype=float8_e8m0fnu)
+[36m(CpuApproximationActor pid=4189419)[0m     v16(vertex_id=85): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v17(vertex_id=111): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v20(vertex_id=60): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v21(vertex_id=97): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v22(vertex_id=36): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v23(vertex_id=40): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v24(vertex_id=109): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v25(vertex_id=57): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v26(vertex_id=44): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v29(vertex_id=112): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v31(vertex_id=81): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v32(vertex_id=90): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v33(vertex_id=96): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v34(vertex_id=67): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v35(vertex_id=84): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v36(vertex_id=50): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v37(vertex_id=53): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v39(vertex_id=110): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v41(vertex_id=17): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v45(vertex_id=20): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v46(vertex_id=15): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v47(vertex_id=35): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v49(vertex_id=74): DIAG(bi1=0,bi2=1,factor=2)
+[36m(CpuApproximationActor pid=4189419)[0m     v52(vertex_id=51): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v53(vertex_id=5): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v54(vertex_id=66): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v55(vertex_id=73): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v56(vertex_id=42): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v57(vertex_id=10): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v59(vertex_id=106): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v60(vertex_id=105): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v61(vertex_id=12): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v62(vertex_id=38): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v65(vertex_id=95): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v66(vertex_id=26): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v67(vertex_id=54): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v68(vertex_id=43): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v69(vertex_id=104): QUANT(dtype=float8_e8m0fnu)
+[36m(CpuApproximationActor pid=4189419)[0m     v70(vertex_id=39): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v71(vertex_id=62): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v72(vertex_id=100): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v73(vertex_id=27): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v75(vertex_id=75): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v78(vertex_id=11): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v79(vertex_id=80): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v80(vertex_id=107): DIAG(bi1=0,bi2=0,factor=16)
+[36m(CpuApproximationActor pid=4189419)[0m     v81(vertex_id=4): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v82(vertex_id=68): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v85(vertex_id=32): DIAG(bi1=1,bi2=1,factor=2)
+[36m(CpuApproximationActor pid=4189419)[0m     v91(vertex_id=30): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v93(vertex_id=13): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v97(vertex_id=14): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v98(vertex_id=89): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v100(vertex_id=41): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v101(vertex_id=37): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v102(vertex_id=92): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v103(vertex_id=65): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v104(vertex_id=1): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v105(vertex_id=2): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v106(vertex_id=98): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v107(vertex_id=19): COMPRESS(axis=1,kind=max)
+[36m(CpuApproximationActor pid=4189419)[0m     v108(vertex_id=82): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v109(vertex_id=23): DIAG(bi1=0,bi2=0,factor=16)
+[36m(CpuApproximationActor pid=4189419)[0m     v110(vertex_id=70): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m     v111(vertex_id=45): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189419)[0m jax.errors.JaxRuntimeError: RESOURCE_EXHAUSTED: Shared memory size limit exceeded: requested 131072, available: 101376, context: [Fusion: fusion.72 = f32[64,64,64]{1,0,2} fusion(gemm_fusion_dot_general.300, gemm_fusion_dot.375), kind=kCustom, calls=fused_computation.13, backend_config={"operation_queue_id":"0","fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"num_warps":"8","output_tiles":[{"sizes":["2","16","64"]}],"num_ctas":1,"num_stages":1,"is_tma_allowed":false,"is_warp_specialization_allowed":false,"waves_per_eu":0}},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}Computation: fused_computation.13 {
+[36m(CpuApproximationActor pid=4189419)[0m   iota.57 = s32[64,64]{1,0} iota(), iota_dimension=0
+[36m(CpuApproximationActor pid=4189419)[0m   iota.1.3 = s32[64,64]{1,0} iota(), iota_dimension=1
+[36m(CpuApproximationActor pid=4189419)[0m   eq.46.3 = pred[64,64]{1,0} compare(iota.57, iota.1.3), direction=EQ
+[36m(CpuApproximationActor pid=4189419)[0m [SENTINEL-VERBOSE] ==================================================[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m [SENTINEL-VERBOSE] step=112 order_len=112 terminal=True init=False point_idx=-1
+[36m(CpuApproximationActor pid=4189419)[0m   bitcast.3606.1 = f32[64,64,64,64]{3,2,1,0} bitcast(multiply.561.3)[32m [repeated 94x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m   broadcast.1499.22 = f32[1,1,1,64,64,64,64]{6,5,4,3,2,1,0} broadcast(constant_48_17), dimensions={}[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m   constant_989 = f32[] constant(-inf)[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m   ROOT reduce.330.1 = f32[64,64,64]{1,0,2} reduce(bitcast.3606.1, constant_48_17), dimensions={1}, to_apply=region_1.2.clone.31[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m }][32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m [SENTINEL-VERBOSE] ORDER (112): [102, 77, 91, 103, 25, 21, 28, 52, 47, 58, 71, 78, 24, 34, 31, 86, 85, 111, 93, 72, 60, 97, 36, 40, 109, 57, 44, 48, 88, 112, 8, 81, 90, 96, 67, 84, 50, 53, 18, 110, 94, 17, 6, 83, 76, 20, 15, 35, 64, 74, 56, 87, 51, 5, 66, 73, 42, 10, 29, 106, 105, 12, 38, 79, 22, 95, 26, 54, 43, 104, 39, 62, 100, 27, 55, 75, 108, 61, 11, 80, 107, 4, 68, 101, 99, 32, 49, 46, 7, 9, 16, 30, 63, 13, 33, 3, 69, 14, 89, 59, 41, 37, 92, 65, 1, 2, 98, 19, 82, 23, 70, 45]
+[36m(CpuApproximationActor pid=4189419)[0m [SENTINEL-VERBOSE] MICRO-ACTIONS (per vertex, in elimination order):
+[36m(CpuApproximationActor pid=4189419)[0m [SENTINEL-VERBOSE] TRACEBACK:
+[36m(CpuApproximationActor pid=4189419)[0m Traceback (most recent call last):
+[36m(CpuApproximationActor pid=4189419)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/cpu_approx_worker.py", line 257, in evaluate
+[36m(CpuApproximationActor pid=4189419)[0m     tokens, eqn_ids, reward = _callback(
+[36m(CpuApproximationActor pid=4189419)[0m                               ~~~~~~~~~^
+[36m(CpuApproximationActor pid=4189419)[0m         self._config,
+[36m(CpuApproximationActor pid=4189419)[0m         ^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=4189419)[0m     ...<5 lines>...[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m         point_idx=int(point_idx),
+[36m(CpuApproximationActor pid=4189419)[0m         ^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=4189419)[0m     )[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m     ^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 3443, in _callback
+[36m(CpuApproximationActor pid=4189419)[0m     compiled_approx = _inproc_lru_cached_compile(b"approx:" + cache_key, _do_compile_approx)
+[36m(CpuApproximationActor pid=4189419)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 286, in _inproc_lru_cached_compile
+[36m(CpuApproximationActor pid=4189419)[0m     return _cc(key, compile_fn)
+[36m(CpuApproximationActor pid=4189419)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/compile_cache.py", line 150, in cached_compile
+[36m(CpuApproximationActor pid=4189419)[0m     compiled = compile_fn()
+[36m(CpuApproximationActor pid=4189419)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 3406, in _do_compile_approx
+[36m(CpuApproximationActor pid=4189419)[0m     return jax.jit(fn, keep_unused=True).lower(*args_for_lower).compile()
+[36m(CpuApproximationActor pid=4189419)[0m            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+[36m(CpuApproximationActor pid=4189419)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1226, in compile[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m     return Compiled(self._lowering.compile(**kw), self._lowering.const_args,
+[36m(CpuApproximationActor pid=4189419)[0m                     ~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+[36m(CpuApproximationActor pid=4189419)[0m     executable = UnloadedMeshExecutable.from_hlo(
+[36m(CpuApproximationActor pid=4189419)[0m         self._name, self._hlo, **self.compile_args,
+[36m(CpuApproximationActor pid=4189419)[0m         compiler_options_kvs=compiler_options_kvs,
+[36m(CpuApproximationActor pid=4189419)[0m         device_list=compilation_device_list)
+[36m(CpuApproximationActor pid=4189419)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1724, in from_hlo
+[36m(CpuApproximationActor pid=4189419)[0m     xla_executable = _cached_compilation(
+[36m(CpuApproximationActor pid=4189419)[0m         hlo, name, tuple_args, allow_prop_to_inputs, allow_prop_to_outputs,
+[36m(CpuApproximationActor pid=4189419)[0m         tuple(host_callbacks), backend, device_list, compiler_options_kvs,
+[36m(CpuApproximationActor pid=4189419)[0m         pgle_profiler)
+[36m(CpuApproximationActor pid=4189419)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1507, in _cached_compilation
+[36m(CpuApproximationActor pid=4189419)[0m     xla_executable = compiler.compile_or_get_cached(
+[36m(CpuApproximationActor pid=4189419)[0m         backend, computation, dev, compile_options, host_callbacks,
+[36m(CpuApproximationActor pid=4189419)[0m         da, pgle_profiler)
+[36m(CpuApproximationActor pid=4189419)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/compiler.py", line 469, in compile_or_get_cached
+[36m(CpuApproximationActor pid=4189419)[0m     return _compile_and_write_cache(
+[36m(CpuApproximationActor pid=4189419)[0m         backend,
+[36m(CpuApproximationActor pid=4189419)[0m         cache_key,
+[36m(CpuApproximationActor pid=4189419)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/compiler.py", line 737, in _compile_and_write_cache
+[36m(CpuApproximationActor pid=4189419)[0m     executable = backend_compile_and_load(
+[36m(CpuApproximationActor pid=4189419)[0m         backend, computation, executable_devices, compile_options, host_callbacks
+[36m(CpuApproximationActor pid=4189419)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/profiler.py", line 384, in wrapper
+[36m(CpuApproximationActor pid=4189419)[0m     return func(*args, **kwargs)
+[36m(CpuApproximationActor pid=4189419)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/compiler.py", line 353, in backend_compile_and_load[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m     raise e
+[36m(CpuApproximationActor pid=4189419)[0m     return backend.compile_and_load(
+[36m(CpuApproximationActor pid=4189419)[0m            ~~~~~~~~~~~~~~~~~~~~~~~~^
+[36m(CpuApproximationActor pid=4189419)[0m         module,
+[36m(CpuApproximationActor pid=4189419)[0m         ^^^^^^^
+[36m(CpuApproximationActor pid=4189419)[0m         executable_devices=executable_devices,
+[36m(CpuApproximationActor pid=4189419)[0m         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=4189419)[0m         compile_options=options,
+[36m(CpuApproximationActor pid=4189419)[0m         ^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=4189419)[0m [cpu_approx_worker pid=4189419] jax.clear_caches() @ call=223 (every=0, oom=True)
+[36m(CpuApproximationActor pid=4189421)[0m loc("add_any.26.1"): error: 'arith.subf' op requires the same type for all operands and results
+[36m(CpuApproximationActor pid=4189421)[0m [SENTINEL] measure-exception step=112 order_len=112 terminal=True: JaxRuntimeError: INTERNAL: Failed to compile Triton kernel. Context: [Fusion: fusion.77 = f32[4096,64,64]{2,1,0} fusion(gemm_fusion_dot, gamma2.1, gemm_fusion_dot_general.49, beta1.1, fusion.119, g
+[36m(CpuApproximationActor pid=4189421)[0m [SENTINEL-VERBOSE] step=112 order_len=112 terminal=True init=False point_idx=-1
+[36m(CpuApproximationActor pid=4189421)[0m [SENTINEL-VERBOSE] EXC JaxRuntimeError: INTERNAL: Failed to compile Triton kernel. Context: [Fusion: fusion.77 = f32[4096,64,64]{2,1,0} fusion(gemm_fusion_dot, gamma2.1, gemm_fusion_dot_general.49, beta1.1, fusion.119, gamma1.1), kind=kCustom, calls=fused_computation.33, backend_config={"operation_queue_id":"0","fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"num_warps":"8","output_tiles":[{"sizes":["16","16","64"]}],"num_ctas":1,"num_stages":1,"is_tma_allowed":false,"is_warp_specialization_allowed":false,"waves_per_eu":0}},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}Computation: fused_computation.33 {
+[36m(CpuApproximationActor pid=4189421)[0m [SENTINEL-VERBOSE] ORDER (112): [19, 53, 14, 111, 54, 31, 91, 112, 27, 70, 38, 25, 88, 63, 105, 61, 32, 13, 71, 40, 108, 33, 97, 57, 41, 36, 58, 21, 86, 93, 84, 12, 18, 100, 45, 51, 2, 77, 8, 7, 44, 99, 55, 83, 9, 65, 104, 96, 1, 81, 28, 6, 72, 56, 29, 26, 5, 101, 67, 46, 66, 39, 24, 34, 42, 64, 98, 17, 69, 3, 89, 73, 4, 22, 23, 78, 103, 106, 20, 47, 60, 85, 30, 35, 15, 59, 62, 75, 68, 110, 43, 37, 79, 48, 87, 109, 102, 94, 90, 50, 95, 82, 52, 49, 107, 74, 92, 76, 16, 80, 10, 11]
+[36m(CpuApproximationActor pid=4189421)[0m [SENTINEL-VERBOSE] MICRO-ACTIONS (per vertex, in elimination order):
+[36m(CpuApproximationActor pid=4189421)[0m     v2(vertex_id=14): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v3(vertex_id=111): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v4(vertex_id=54): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v6(vertex_id=91): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v8(vertex_id=27): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v9(vertex_id=70): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v10(vertex_id=38): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v11(vertex_id=25): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v15(vertex_id=61): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v16(vertex_id=32): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v17(vertex_id=13): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v19(vertex_id=40): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v20(vertex_id=108): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v21(vertex_id=33): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v22(vertex_id=97): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v23(vertex_id=57): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v24(vertex_id=41): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v25(vertex_id=36): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v27(vertex_id=21): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v30(vertex_id=84): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v31(vertex_id=12): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v33(vertex_id=100): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v34(vertex_id=45): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v35(vertex_id=51): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v36(vertex_id=2): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v37(vertex_id=77): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v42(vertex_id=55): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v43(vertex_id=83): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v45(vertex_id=65): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v47(vertex_id=96): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v48(vertex_id=1): DIAG(bi1=1,bi2=1,factor=16)
+[36m(CpuApproximationActor pid=4189421)[0m     v49(vertex_id=81): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v50(vertex_id=28): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v52(vertex_id=72): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v55(vertex_id=26): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v56(vertex_id=5): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v58(vertex_id=67): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v59(vertex_id=46): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v60(vertex_id=66): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v61(vertex_id=39): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v62(vertex_id=24): QUANT(dtype=float8_e8m0fnu)
+[36m(CpuApproximationActor pid=4189421)[0m     v64(vertex_id=42): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v65(vertex_id=64): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v66(vertex_id=98): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v67(vertex_id=17): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v69(vertex_id=3): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v71(vertex_id=73): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v72(vertex_id=4): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v73(vertex_id=22): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v76(vertex_id=103): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v77(vertex_id=106): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v78(vertex_id=20): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v79(vertex_id=47): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v82(vertex_id=30): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v83(vertex_id=35): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v84(vertex_id=15): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v86(vertex_id=62): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v87(vertex_id=75): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v88(vertex_id=68): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v89(vertex_id=110): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v90(vertex_id=43): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v91(vertex_id=37): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v94(vertex_id=87): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v95(vertex_id=109): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v96(vertex_id=102): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v100(vertex_id=95): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v101(vertex_id=82): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v102(vertex_id=52): COMPRESS(axis=1,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v105(vertex_id=74): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v106(vertex_id=92): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v109(vertex_id=80): COMPRESS(axis=0,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v110(vertex_id=10): COMPRESS(axis=3,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m     v111(vertex_id=11): COMPRESS(axis=2,kind=abs_max)
+[36m(CpuApproximationActor pid=4189421)[0m [SENTINEL-VERBOSE] TRACEBACK:
+[36m(CpuApproximationActor pid=4189421)[0m Traceback (most recent call last):
+[36m(CpuApproximationActor pid=4189421)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/cpu_approx_worker.py", line 257, in evaluate
+[36m(CpuApproximationActor pid=4189421)[0m     tokens, eqn_ids, reward = _callback(
+[36m(CpuApproximationActor pid=4189421)[0m                               ~~~~~~~~~^
+[36m(CpuApproximationActor pid=4189421)[0m         self._config,
+[36m(CpuApproximationActor pid=4189421)[0m         ^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=4189421)[0m         point_idx=int(point_idx),
+[36m(CpuApproximationActor pid=4189421)[0m         ^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=4189421)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 3655, in _callback
+[36m(CpuApproximationActor pid=4189421)[0m     compiled_exact = _inproc_lru_cached_compile(b"exact:" + exact_cache_key, _do_compile_exact)
+[36m(CpuApproximationActor pid=4189421)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 286, in _inproc_lru_cached_compile
+[36m(CpuApproximationActor pid=4189421)[0m     return _cc(key, compile_fn)
+[36m(CpuApproximationActor pid=4189421)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/compile_cache.py", line 150, in cached_compile
+[36m(CpuApproximationActor pid=4189421)[0m     compiled = compile_fn()
+[36m(CpuApproximationActor pid=4189421)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 3437, in _do_compile_exact
+[36m(CpuApproximationActor pid=4189421)[0m     return jax.jit(fn, keep_unused=True).lower(*args_for_lower).compile()
+[36m(CpuApproximationActor pid=4189421)[0m            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+[36m(CpuApproximationActor pid=4189421)[0m     return Compiled(self._lowering.compile(**kw), self._lowering.const_args,
+[36m(CpuApproximationActor pid=4189421)[0m                     ~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+[36m(CpuApproximationActor pid=4189421)[0m     executable = UnloadedMeshExecutable.from_hlo(
+[36m(CpuApproximationActor pid=4189421)[0m         self._name, self._hlo, **self.compile_args,
+[36m(CpuApproximationActor pid=4189421)[0m         compiler_options_kvs=compiler_options_kvs,
+[36m(CpuApproximationActor pid=4189421)[0m         device_list=compilation_device_list)
+[36m(CpuApproximationActor pid=4189421)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1724, in from_hlo
+[36m(CpuApproximationActor pid=4189421)[0m     xla_executable = _cached_compilation(
+[36m(CpuApproximationActor pid=4189421)[0m         hlo, name, tuple_args, allow_prop_to_inputs, allow_prop_to_outputs,
+[36m(CpuApproximationActor pid=4189421)[0m         tuple(host_callbacks), backend, device_list, compiler_options_kvs,
+[36m(CpuApproximationActor pid=4189421)[0m         pgle_profiler)
+[36m(CpuApproximationActor pid=4189421)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1507, in _cached_compilation
+[36m(CpuApproximationActor pid=4189421)[0m     xla_executable = compiler.compile_or_get_cached(
+[36m(CpuApproximationActor pid=4189421)[0m         backend, computation, dev, compile_options, host_callbacks,
+[36m(CpuApproximationActor pid=4189421)[0m         da, pgle_profiler)
+[36m(CpuApproximationActor pid=4189421)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/compiler.py", line 469, in compile_or_get_cached
+[36m(CpuApproximationActor pid=4189421)[0m     return _compile_and_write_cache(
+[36m(CpuApproximationActor pid=4189421)[0m         backend,
+[36m(CpuApproximationActor pid=4189421)[0m         cache_key,
+[36m(CpuApproximationActor pid=4189421)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/compiler.py", line 737, in _compile_and_write_cache
+[36m(CpuApproximationActor pid=4189421)[0m     executable = backend_compile_and_load(
+[36m(CpuApproximationActor pid=4189421)[0m         backend, computation, executable_devices, compile_options, host_callbacks
+[36m(CpuApproximationActor pid=4189421)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/profiler.py", line 384, in wrapper
+[36m(CpuApproximationActor pid=4189421)[0m     return func(*args, **kwargs)
+[36m(CpuApproximationActor pid=4189421)[0m     raise e
+[36m(CpuApproximationActor pid=4189421)[0m     return backend.compile_and_load(
+[36m(CpuApproximationActor pid=4189421)[0m            ~~~~~~~~~~~~~~~~~~~~~~~~^
+[36m(CpuApproximationActor pid=4189421)[0m         module,
+[36m(CpuApproximationActor pid=4189421)[0m         ^^^^^^^
+[36m(CpuApproximationActor pid=4189421)[0m         executable_devices=executable_devices,
+[36m(CpuApproximationActor pid=4189421)[0m         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=4189421)[0m         compile_options=options,
+[36m(CpuApproximationActor pid=4189421)[0m         ^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(CpuApproximationActor pid=4189421)[0m jax.errors.JaxRuntimeError: INTERNAL: Failed to compile Triton kernel. Context: [Fusion: fusion.77 = f32[4096,64,64]{2,1,0} fusion(gemm_fusion_dot, gamma2.1, gemm_fusion_dot_general.49, beta1.1, fusion.119, gamma1.1), kind=kCustom, calls=fused_computation.33, backend_config={"operation_queue_id":"0","fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"num_warps":"8","output_tiles":[{"sizes":["16","16","64"]}],"num_ctas":1,"num_stages":1,"is_tma_allowed":false,"is_warp_specialization_allowed":false,"waves_per_eu":0}},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}Computation: fused_computation.33 {
+[36m(CpuApproximationActor pid=4189421)[0m [SENTINEL-VERBOSE] ==================================================[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=4189421)[0m   broadcast_in_dim.100.1 = f32[4096,64,64]{2,1,0} broadcast(multiply.22.3), dimensions={0,1}[32m [repeated 118x across cluster][0m
+[36m(CpuApproximationActor pid=4189421)[0m   broadcast.12.2 = f32[64,64]{1,0} broadcast(constant_16_3), dimensions={}[32m [repeated 12x across cluster][0m
+[36m(CpuApproximationActor pid=4189421)[0m   ROOT add_any.26.1 = f32[4096,64,64]{2,1,0} add(add_any.24.3, broadcast_in_dim.100.1)[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=4189421)[0m }][32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=4189421)[0m     ...<5 lines>...[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=4189421)[0m     )[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=4189421)[0m     ^[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=4189421)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 1226, in compile[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=4189421)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/compiler.py", line 353, in backend_compile_and_load[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=4189419)[0m [per-face] builds=8000 applied=0 skipped=0 applied_frac=0.000
+slurmstepd: error: *** JOB 55182 ON pgi15-gpu13 CANCELLED AT 2026-07-23T15:01:23 ***

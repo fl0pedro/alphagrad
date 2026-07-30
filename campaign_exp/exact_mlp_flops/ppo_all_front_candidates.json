@@ -1,0 +1,648 @@
+{
+  "objectives": [
+    "flops",
+    "frob_residual"
+  ],
+  "num_candidates": 7,
+  "note": "every solution admitted to the non-dominated front at any point during training (including later-pruned ones); the full reward_vec is stored so any objective set can be re-scored offline.",
+  "candidates": [
+    {
+      "episode": 0,
+      "reward_vec": [
+        -32623296512.0,
+        -9393152.0,
+        -44050.40625,
+        -19435520.0,
+        -34226720.0,
+        -299335040.0,
+        1.0,
+        -0.0003403491573408246,
+        -34133024.0,
+        0.0
+      ],
+      "obj": {
+        "flops": -9393152.0,
+        "frob_residual": -0.0003403491573408246
+      },
+      "seq": [
+        [
+          4,
+          []
+        ],
+        [
+          2,
+          [
+            "diag(0, 2, 16)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          3,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('abs_max', 2)"
+          ]
+        ],
+        [
+          11,
+          []
+        ],
+        [
+          12,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          8,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ]
+      ]
+    },
+    {
+      "episode": 0,
+      "reward_vec": [
+        -34770780160.0,
+        -13389824.0,
+        -43059.40625,
+        -52457476.0,
+        -34226720.0,
+        -318326464.0,
+        1.0,
+        -0.00034033809788525105,
+        -34133024.0,
+        0.0
+      ],
+      "obj": {
+        "flops": -13389824.0,
+        "frob_residual": -0.00034033809788525105
+      },
+      "seq": [
+        [
+          1,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          9,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          7,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          10,
+          []
+        ],
+        [
+          12,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ]
+      ]
+    },
+    {
+      "episode": 1,
+      "reward_vec": [
+        -28127002624.0,
+        -9261056.0,
+        -48021.97265625,
+        -18395140.0,
+        -34226720.0,
+        -354299424.0,
+        1.0,
+        -0.0003403421142138541,
+        -34133024.0,
+        0.0
+      ],
+      "obj": {
+        "flops": -9261056.0,
+        "frob_residual": -0.0003403421142138541
+      },
+      "seq": [
+        [
+          7,
+          [
+            "compress('max', 1)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('max', 1)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('max', 1)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('max', 1)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('max', 1)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('max', 1)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('max', 1)"
+          ]
+        ],
+        [
+          8,
+          [
+            "compress('max', 1)"
+          ]
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          10,
+          [
+            "compress('max', 1)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('max', 2)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('max', 1)"
+          ]
+        ]
+      ]
+    },
+    {
+      "episode": 4,
+      "reward_vec": [
+        -20677918720.0,
+        -9064448.0,
+        -59799.734375,
+        -18137092.0,
+        -34202144.0,
+        -443752800.0,
+        1.0,
+        -0.00034034845884889364,
+        -34128928.0,
+        0.0
+      ],
+      "obj": {
+        "flops": -9064448.0,
+        "frob_residual": -0.00034034845884889364
+      },
+      "seq": [
+        [
+          4,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          6,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          7,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          10,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          5,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          11,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          12,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          9,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          2,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          1,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ]
+      ]
+    },
+    {
+      "episode": 4,
+      "reward_vec": [
+        -23832035328.0,
+        -9128960.0,
+        -835046.125,
+        -18374664.0,
+        -34210336.0,
+        -34128928.0,
+        1.0,
+        -0.00034034234704449773,
+        -34128928.0,
+        0.0
+      ],
+      "obj": {
+        "flops": -9128960.0,
+        "frob_residual": -0.00034034234704449773
+      },
+      "seq": [
+        [
+          3,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          11,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          10,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          1,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          9,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          6,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          7,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          12,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          2,
+          [
+            "diag(3, 0, 16)"
+          ]
+        ],
+        [
+          5,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          4,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ]
+      ]
+    },
+    {
+      "episode": 22,
+      "reward_vec": [
+        -31415336960.0,
+        -9196544.0,
+        -916939.5625,
+        -18403328.0,
+        -34202144.0,
+        -34128928.0,
+        1.0,
+        -0.0003403408918529749,
+        -34128928.0,
+        0.0
+      ],
+      "obj": {
+        "flops": -9196544.0,
+        "frob_residual": -0.0003403408918529749
+      },
+      "seq": [
+        [
+          2,
+          [
+            "diag(2, 0, 4)"
+          ]
+        ],
+        [
+          10,
+          [
+            "quant('float8_e4m3b11fnuz')"
+          ]
+        ],
+        [
+          1,
+          [
+            "quant('float8_e4m3b11fnuz')"
+          ]
+        ],
+        [
+          7,
+          [
+            "quant('float8_e4m3b11fnuz')"
+          ]
+        ],
+        [
+          11,
+          [
+            "quant('float8_e4m3b11fnuz')"
+          ]
+        ],
+        [
+          9,
+          [
+            "quant('float8_e4m3b11fnuz')"
+          ]
+        ],
+        [
+          4,
+          [
+            "quant('float8_e4m3b11fnuz')"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('complex128')"
+          ]
+        ],
+        [
+          12,
+          [
+            "quant('int8')"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('complex128')"
+          ]
+        ],
+        [
+          6,
+          [
+            "quant('float8_e4m3b11fnuz')"
+          ]
+        ],
+        [
+          5,
+          [
+            "diag(1, 2, 4)"
+          ]
+        ]
+      ]
+    },
+    {
+      "episode": 27,
+      "reward_vec": [
+        -22892511232.0,
+        -9070592.0,
+        -888005.875,
+        -17870848.0,
+        -34206240.0,
+        -34128672.0,
+        1.0,
+        -0.0003403408918529749,
+        -34128672.0,
+        0.0
+      ],
+      "obj": {
+        "flops": -9070592.0,
+        "frob_residual": -0.0003403408918529749
+      },
+      "seq": [
+        [
+          6,
+          [
+            "quant('int8')"
+          ]
+        ],
+        [
+          9,
+          [
+            "quant('float8_e5m2fnuz')"
+          ]
+        ],
+        [
+          2,
+          [
+            "diag(2, 0, 4)"
+          ]
+        ],
+        [
+          10,
+          []
+        ],
+        [
+          12,
+          [
+            "quant('float8_e4m3b11fnuz')"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('max', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "quant('int8')"
+          ]
+        ],
+        [
+          4,
+          [
+            "quant('float8_e5m2fnuz')"
+          ]
+        ],
+        [
+          7,
+          [
+            "quant('int8')"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('int8')"
+          ]
+        ],
+        [
+          5,
+          [
+            "diag(1, 2, 4)"
+          ]
+        ]
+      ]
+    }
+  ],
+  "dynamic_substeps": true
+}

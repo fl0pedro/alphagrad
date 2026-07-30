@@ -1,0 +1,1009 @@
+{
+  "objectives": [
+    "latency_ns",
+    "peak_memory",
+    "frob_residual"
+  ],
+  "hypervolume": 238764627182784.22,
+  "num_points": 13,
+  "front": [
+    {
+      "obj": {
+        "latency_ns": -69510.8359375,
+        "peak_memory": -597325376.0,
+        "frob_residual": -1826.03466796875
+      },
+      "seq": [
+        [
+          11,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          7,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          12,
+          []
+        ],
+        [
+          6,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          8,
+          [
+            "compress('max', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          10,
+          []
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -55646.2109375,
+        "peak_memory": -661918080.0,
+        "frob_residual": -30.569019317626953
+      },
+      "seq": [
+        [
+          12,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          10,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('float8_e3m4')"
+          ]
+        ],
+        [
+          11,
+          []
+        ],
+        [
+          6,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          4,
+          []
+        ],
+        [
+          2,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          9,
+          []
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -65334.9296875,
+        "peak_memory": -630233728.0,
+        "frob_residual": -22.894298553466797
+      },
+      "seq": [
+        [
+          1,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          9,
+          []
+        ],
+        [
+          6,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          5,
+          []
+        ],
+        [
+          7,
+          [
+            "compress('abs_max', 2)"
+          ]
+        ],
+        [
+          8,
+          [
+            "compress('max', 1)"
+          ]
+        ],
+        [
+          10,
+          []
+        ],
+        [
+          12,
+          []
+        ],
+        [
+          11,
+          []
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -94996.1875,
+        "peak_memory": -847807744.0,
+        "frob_residual": -1.0
+      },
+      "seq": [
+        [
+          10,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('bfloat16')"
+          ]
+        ],
+        [
+          3,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          6,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -66755.515625,
+        "peak_memory": -754880128.0,
+        "frob_residual": -1.2322192192077637
+      },
+      "seq": [
+        [
+          2,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          6,
+          [
+            "quant('float8_e3m4')"
+          ]
+        ],
+        [
+          3,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -60043.3984375,
+        "peak_memory": -851531072.0,
+        "frob_residual": -1.0
+      },
+      "seq": [
+        [
+          5,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          6,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          9,
+          [
+            "quant('int64')"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -785536.5,
+        "peak_memory": -32319980.0,
+        "frob_residual": -1.0
+      },
+      "seq": [
+        [
+          7,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_min', 2)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          9,
+          [
+            "quant('float8_e3m4')"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -853285.6875,
+        "peak_memory": -32320492.0,
+        "frob_residual": -0.9999814033508301
+      },
+      "seq": [
+        [
+          10,
+          [
+            "compress('mean', 1)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          12,
+          []
+        ],
+        [
+          9,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          4,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          3,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -791250.375,
+        "peak_memory": -32318444.0,
+        "frob_residual": -1.0
+      },
+      "seq": [
+        [
+          12,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 2)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('float8_e4m3fn')"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          6,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          9,
+          []
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -881776.0625,
+        "peak_memory": -32020732.0,
+        "frob_residual": -1.0
+      },
+      "seq": [
+        [
+          2,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('median', 1)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('median', 1)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          12,
+          [
+            "quant('int8')"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          6,
+          []
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -807892.25,
+        "peak_memory": -32316908.0,
+        "frob_residual": -1.0
+      },
+      "seq": [
+        [
+          8,
+          []
+        ],
+        [
+          10,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 2)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('median', 1)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          9,
+          []
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('uint2')"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -851337.6875,
+        "peak_memory": -32366572.0,
+        "frob_residual": -0.9999836683273315
+      },
+      "seq": [
+        [
+          12,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          11,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('median', 2)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('median', 1)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('median', 1)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('median', 1)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          2,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('median', 0)"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -900442.875,
+        "peak_memory": -32375028.0,
+        "frob_residual": -0.9999576210975647
+      },
+      "seq": [
+        [
+          1,
+          [
+            "compress('median', 1)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('median', 1)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('median', 1)"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('float8_e4m3')"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          8,
+          []
+        ]
+      ]
+    }
+  ],
+  "dynamic_substeps": true
+}

@@ -1,0 +1,22 @@
+########## FULL_NN256_V2 Sat Jul  4 09:06:17 PM UTC 2026 | head=pgi15-gpu15 eps=200 NN_HIDDEN=256 variant=diag_gcd value_norm=popart measure-grad ##########
+2026-07-04 21:06:18,012	INFO usage_lib.py:474 -- Usage stats collection is enabled by default without user confirmation because this terminal is detected to be non-interactive. To disable this, add `--disable-usage-stats` to the command that starts the cluster, or run the following command: `ray disable-usage-stats` before starting the cluster. See https://docs.ray.io/en/master/cluster/usage-stats.html for more details.
+2026-07-04 21:06:18,013	INFO scripts.py:940 -- Local node IP: 192.168.15.15
+2026-07-04 21:06:20,064	SUCC scripts.py:979 -- --------------------
+2026-07-04 21:06:20,064	SUCC scripts.py:980 -- Ray runtime started.
+2026-07-04 21:06:20,064	SUCC scripts.py:981 -- --------------------
+2026-07-04 21:06:20,064	INFO scripts.py:983 -- Next steps
+2026-07-04 21:06:20,064	INFO scripts.py:986 -- To add another node to this Ray cluster, run
+2026-07-04 21:06:20,064	INFO scripts.py:989 --   ray start --address='192.168.15.15:6384'
+2026-07-04 21:06:20,064	INFO scripts.py:1000 -- To connect to this Ray cluster:
+2026-07-04 21:06:20,064	INFO scripts.py:1002 -- import ray
+2026-07-04 21:06:20,064	INFO scripts.py:1003 -- ray.init(_node_ip_address='192.168.15.15')
+2026-07-04 21:06:20,064	INFO scripts.py:1036 -- To terminate the Ray runtime, run
+2026-07-04 21:06:20,065	INFO scripts.py:1037 --   ray stop
+2026-07-04 21:06:20,065	INFO scripts.py:1040 -- To view the status of the cluster, use
+2026-07-04 21:06:20,065	INFO scripts.py:1041 --   ray status
+2026-07-04 21:06:20,065	INFO scripts.py:1159 -- --block
+2026-07-04 21:06:20,065	INFO scripts.py:1160 -- This command will now block forever until terminated by a signal.
+2026-07-04 21:06:20,065	INFO scripts.py:1163 -- Running subprocesses are monitored and a message will be printed if any of them terminate unexpectedly. Subprocesses exit with SIGTERM will be treated as graceful, thus NOT reported.
+2026-07-04 21:06:20,065	INFO scripts.py:1168 -- Process exit logs will be saved to: /tmp/ray/session_2026-07-04_21-06-18_037009_3890063/logs/ray_process_exit.log
+==== Ray up (4 GPU pgi15-gpu15) Sat Jul  4 09:06:42 PM UTC 2026 ====
+slurmstepd: error: *** JOB 51601 ON pgi15-gpu15 CANCELLED AT 2026-07-04T21:07:03 ***

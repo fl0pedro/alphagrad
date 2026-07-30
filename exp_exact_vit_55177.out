@@ -1,0 +1,512 @@
+=== node=pgi15-gpu9.iff.kfa-juelich.de gpu=NVIDIA GeForce RTX 4090 Thu Jul 23 02:31:25 PM UTC 2026 ===
+=== MODE=exact EXAMPLE=ViT EXACT_ONLY=1 ===
+=== graphax=2410078 jaxpr: bound the tokenizer's name alphabet so token ids stay in range ===
+=== alphagrad=b44a5a6 approx: prove the incremental palimpsa encode == the full re-encode ===
+=== PHASE lat_mem START Thu Jul 23 02:31:25 PM UTC 2026 ===
+2026-07-23 14:31:29,098	INFO worker.py:2012 -- Started a local Ray instance.
+/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+wandb: Loading settings from /Users/assmuth/.config/wandb/settings
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: Tracking run with wandb version 0.25.0
+wandb: W&B syncing is set to `offline` in this directory. Run `wandb online` or set WANDB_MODE=online to enable cloud syncing.
+wandb: Run data is saved locally in /Users/assmuth/dsnn/alphagrad/wandb/offline-run-20260723_143129-7j5xsxgh
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="45e02d54-0e57-4fdd-a468-3231df16087d", ...)
+[36m(CpuApproximationActor pid=3381475)[0m W0723 14:31:37.472010 3381475 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3381475)[0m W0723 14:31:37.472034 3381475 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3381475)[0m W0723 14:31:37.472042 3381475 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3381475)[0m W0723 14:31:37.472051 3381475 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3381475)[0m W0723 14:31:37.472065 3381475 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3381475)[0m W0723 14:31:37.472095 3381475 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3381475)[0m W0723 14:31:37.472146 3381475 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3381475)[0m W0723 14:31:37.472246 3381475 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3381475)[0m W0723 14:31:37.472435 3381475 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3381475)[0m [cpu_approx_worker pid=3381475] env: ALPHAGRAD_EXACT_ONLY=1 ALPHAGRAD_FACE_TRANSFORMS=0 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=0 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55177-pgi15-gpu9
+[36m(CpuApproximationActor pid=3381475)[0m [measure-actor 0] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=1 jax_devices=[CudaDevice(id=0)]
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="45e02d54-0e57-4fdd-a468-3231df16087d", ...)
+[36m(PPOActor pid=3381473)[0m [ppo_ray] ADDITIVE failed/sentinel penalty = -2.0 (bounded-negative, INCLUDED in advantage+loss -- replaces the failed-row mask; failed rows are repulsive, never a zero-gradient no-op).
+[36m(PPOActor pid=3381473)[0m [ppo_ray] V2 anti-hack: failed_adv_stamp=1.0 (post-z-score advantage overwrite on failed rows), cost_symlog_cap=0.0 (symlog'd cost channels clipped to +/-cap).
+[36m(PPOActor pid=3381473)[0m [ppo_ray] PopArt value norm ON: beta=0.01 sigma_min(base=0.1, quality[6,9]=0.2) sigma_max=1e+12 robust_std=True (winsor k=5.0) — replaces the rollout advantage z-score; under pure-PopArt advantage a failed row is truly-neutral (A==0), no constant stamp.
+[36m(PPOActor pid=3381473)[0m [ppo_ray] DYNAMIC SENTINEL ON: failed/sentinel terminals get per-channel mu_c - 2.0*sigma_c (EMA beta=0.01) instead of -1e10. The additive failed_penalty stamp AND the post-z-score failed_adv_stamp are DISABLED (dynamic value supersedes them); failed_transitions logging + PopArt exclusion unchanged.
+[36m(PPOActor pid=3381473)[0m [ppo_ray] RAW COSSIM THREAD ON: env emits full-range cosine_sim in idx6; worker applies guide cap=None into the GAE buffer only, logs reward/cosine_sim_raw from the uncapped value.
+[36m(PPOActor pid=3381473)[0m [ppo_ray_worker] POLICY V2 ACTIVE: MicroPPOAgent = PALIMPSA backbone + PointerVertexPolicy + MicroActionPolicy(max_substeps=1) + separate value pool; factor tables up to axis size 784 (observed max 784).
+[36m(PPOActor pid=3381473)[0m [ppo_ray_worker] V2 policy heads scaled by 0.1 (near-uniform initial policy).
+[36m(CpuApproximationActor pid=3381476)[0m [cpu_approx_worker pid=3381476] env: ALPHAGRAD_EXACT_ONLY=1 ALPHAGRAD_FACE_TRANSFORMS=0 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=0 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55177-pgi15-gpu9[32m [repeated 2x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+[36m(CpuApproximationActor pid=3381476)[0m [measure-actor 2] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=3 jax_devices=[CudaDevice(id=0)][32m [repeated 2x across cluster][0m
+  actors spawned + JIT-warm in 30.6s
+ppo_ray:   0%|                                                                                                                                             | 0/1000 [00:00<?, ?it/s][36m(CpuApproximationActor pid=3381475)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3381475)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381475)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3381475)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381475)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3381475)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381475)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3381475)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381475)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3381475)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381475)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3381475)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381475)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3381475)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381475)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3381475)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381475)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3381475)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381475)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3381475)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381475)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3381475)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381475)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3381475)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381475)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3381475)[0m   warnings.warn(
+[36m(PPOActor pid=3381473)[0m W0723 14:31:37.767111 3381473 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"[32m [repeated 27x across cluster][0m
+[36m(CpuApproximationActor pid=3381474)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3381474)[0m   warnings.warn([32m [repeated 13x across cluster][0m
+[36m(CpuApproximationActor pid=3381474)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3381474)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3381474)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3381474)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3381474)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3381474)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3381474)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3381474)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3381474)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3381474)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3381474)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3381474)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(PPOActor pid=3381473)[0m [per-face] builds=200 applied=0 skipped=0 applied_frac=0.000
+[36m(PPOActor pid=3381473)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype float64 requested in astype is not available, and will be truncated to dtype float32. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.
+[36m(PPOActor pid=3381473)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)
+[36m(PPOActor pid=3381473)[0m [per-face] builds=400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3381475)[0m /Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:3127: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=16693 > MAX_TOKENS=16384 (overflow=309). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+[36m(CpuApproximationActor pid=3381475)[0m   _record_tokenization_truncation(int(raw_tokens.shape[0]))
+[36m(PPOActor pid=3381473)[0m [per-face] builds=600 applied=0 skipped=0 applied_frac=0.000
+[36m(CpuApproximationActor pid=3381475)[0m [per-face] builds=400 applied=0 skipped=0 applied_frac=0.000
+[36m(PPOActor pid=3381473)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype complex128 requested in astype is not available, and will be truncated to dtype complex64. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.
+[36m(PPOActor pid=3381473)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)
+[36m(CpuApproximationActor pid=3381474)[0m [per-face] builds=200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=3381476)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3381476)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381476)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3381476)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381476)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3381476)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381476)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3381476)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381476)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3381476)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381476)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3381476)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381476)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3381476)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381476)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3381476)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381476)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3381476)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381476)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3381476)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381476)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3381476)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381476)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3381476)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381476)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3381476)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3381476)[0m /Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:3127: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=20387 > MAX_TOKENS=16384 (overflow=4003). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+[36m(CpuApproximationActor pid=3381476)[0m   _record_tokenization_truncation(int(raw_tokens.shape[0]))
+[36m(CpuApproximationActor pid=3381474)[0m   _record_tokenization_truncation(int(raw_tokens.shape[0]))
+[36m(CpuApproximationActor pid=3381474)[0m /Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:3127: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=16401 > MAX_TOKENS=16384 (overflow=17). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+[36m(CpuApproximationActor pid=3381475)[0m [per-face] builds=800 applied=0 skipped=0 applied_frac=0.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=3381474)[0m [per-face] builds=400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 4x across cluster][0m
+Traceback (most recent call last):
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 776, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 770, in main
+    rc = _run(args)
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 561, in _run
+    stats = ray.get(actor.run_rollout_and_train.remote(seed_counter))
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    return fn(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/client_mode_hook.py", line 107, in wrapper
+    return func(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 2980, in get
+    values, debugger_breakpoint = worker.get_objects(
+                                  ~~~~~~~~~~~~~~~~~~^
+        object_refs, timeout, use_object_store=_use_object_store
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 1023, in get_objects
+    raise value.as_instanceof_cause()
+ray.exceptions.RayTaskError(ValueError): [36mray::PPOActor.run_rollout_and_train()[39m (pid=3381473, ip=192.168.15.9, actor_id=75498e437275c87cdf7fd1a701000000, repr=<alphagrad.approx.ppo_ray_actors.PPOActor object at 0x702a53f2d550>)
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_actors.py", line 71, in run_rollout_and_train
+    return self._impl.run_rollout_and_train(int(rng_seed))
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_worker.py", line 2183, in run_rollout_and_train
+    pv_np, cv_np = self._live_masks(np.asarray(avail))
+                   ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_worker.py", line 1532, in _live_masks
+    pair[e], comp[e] = oracle.masks(cands)
+                       ~~~~~~~~~~~~^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 682, in masks
+    p, c = self.vertex_mask(v)
+           ~~~~~~~~~~~~~~~~^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 604, in vertex_mask
+    faces += self.probe_faces(vertex, approx=mode)
+             ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 560, in probe_faces
+    _eliminate_vertex(
+    ~~~~~~~~~~~~~~~~~^
+        int(vertex), incr.jaxpr, graph, tgraph, incr.vo, False,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        transforms=(_record,), face_transforms=None,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/graphax/src/graphax/core.py", line 1512, in _eliminate_vertex
+    edge_outval = _post_val @ _pre_val
+                  ~~~~~~~~~~^~~~~~~~~~
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/tensor.py", line 69, in __matmul__
+    return matmul(self, other)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/ops/matmul.py", line 2578, in matmul
+    pairs = _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/ops/matmul.py", line 466, in _build_matmul_topology
+    meta, lhs_ids, rhs_ids = _resolve_contract_pair(
+                             ~~~~~~~~~~~~~~~~~~~~~~^
+        lp, ro, lhs_out_map, rhs_primal_map
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/ops/matmul.py", line 282, in _resolve_contract_pair
+    raise ValueError(
+        f"Contraction size mismatch: {lp.logical_size} vs {ro.logical_size}"
+    )
+ValueError: Contraction size mismatch: 16 vs 17
+Traceback (most recent call last):
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 776, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 770, in main
+    rc = _run(args)
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 561, in _run
+    stats = ray.get(actor.run_rollout_and_train.remote(seed_counter))
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    return fn(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/client_mode_hook.py", line 107, in wrapper
+    return func(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 2980, in get
+    values, debugger_breakpoint = worker.get_objects(
+                                  ~~~~~~~~~~~~~~~~~~^
+        object_refs, timeout, use_object_store=_use_object_store
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 1023, in get_objects
+    raise value.as_instanceof_cause()
+ray.exceptions.RayTaskError(ValueError): [36mray::PPOActor.run_rollout_and_train()[39m (pid=3381473, ip=192.168.15.9, actor_id=75498e437275c87cdf7fd1a701000000, repr=<alphagrad.approx.ppo_ray_actors.PPOActor object at 0x702a53f2d550>)
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_actors.py", line 71, in run_rollout_and_train
+    return self._impl.run_rollout_and_train(int(rng_seed))
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_worker.py", line 2183, in run_rollout_and_train
+    pv_np, cv_np = self._live_masks(np.asarray(avail))
+                   ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_worker.py", line 1532, in _live_masks
+    pair[e], comp[e] = oracle.masks(cands)
+                       ~~~~~~~~~~~~^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 682, in masks
+    p, c = self.vertex_mask(v)
+           ~~~~~~~~~~~~~~~~^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 604, in vertex_mask
+    faces += self.probe_faces(vertex, approx=mode)
+             ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 560, in probe_faces
+    _eliminate_vertex(
+    ~~~~~~~~~~~~~~~~~^
+        int(vertex), incr.jaxpr, graph, tgraph, incr.vo, False,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        transforms=(_record,), face_transforms=None,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/graphax/src/graphax/core.py", line 1512, in _eliminate_vertex
+    edge_outval = _post_val @ _pre_val
+                  ~~~~~~~~~~^~~~~~~~~~
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/tensor.py", line 69, in __matmul__
+    return matmul(self, other)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/ops/matmul.py", line 2578, in matmul
+    pairs = _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/ops/matmul.py", line 466, in _build_matmul_topology
+    meta, lhs_ids, rhs_ids = _resolve_contract_pair(
+                             ~~~~~~~~~~~~~~~~~~~~~~^
+        lp, ro, lhs_out_map, rhs_primal_map
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/ops/matmul.py", line 282, in _resolve_contract_pair
+    raise ValueError(
+        f"Contraction size mismatch: {lp.logical_size} vs {ro.logical_size}"
+    )
+ValueError: Contraction size mismatch: 16 vs 17
+[1;34mwandb[0m: 
+[1;34mwandb[0m: You can sync this run to the cloud by running:
+[1;34mwandb[0m: [1mwandb sync /Users/assmuth/dsnn/alphagrad/wandb/offline-run-20260723_143129-7j5xsxgh[0m
+[1;34mwandb[0m: Find logs at: [1;35mwandb/offline-run-20260723_143129-7j5xsxgh/logs[0m
+[36m(CpuApproximationActor pid=3381475)[0m [per-face] builds=1000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 2x across cluster][0m
+=== PHASE lat_mem RC=1 Thu Jul 23 02:33:07 PM UTC 2026 ===
+=== PHASE flops START Thu Jul 23 02:33:07 PM UTC 2026 ===
+2026-07-23 14:33:10,390	INFO worker.py:2012 -- Started a local Ray instance.
+/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+wandb: Loading settings from /Users/assmuth/.config/wandb/settings
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: Tracking run with wandb version 0.25.0
+wandb: W&B syncing is set to `offline` in this directory. Run `wandb online` or set WANDB_MODE=online to enable cloud syncing.
+wandb: Run data is saved locally in /Users/assmuth/dsnn/alphagrad/wandb/offline-run-20260723_143311-cslrlvg5
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="b3aaa016-4c4d-4e8c-9769-f0dc3eadaf4a", ...)
+[36m(CpuApproximationActor pid=3385665)[0m W0723 14:33:18.640656 3385665 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3385665)[0m W0723 14:33:18.640678 3385665 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3385665)[0m W0723 14:33:18.640684 3385665 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3385665)[0m W0723 14:33:18.640692 3385665 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3385665)[0m W0723 14:33:18.640706 3385665 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3385665)[0m W0723 14:33:18.640735 3385665 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3385665)[0m W0723 14:33:18.640785 3385665 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3385665)[0m W0723 14:33:18.640884 3385665 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3385665)[0m W0723 14:33:18.641080 3385665 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(PPOActor pid=3385662)[0m W0723 14:33:18.842462 3385662 text_format.cc:393] Warning parsing text-format xla.AutotuneResult: 5:10 (N = 1): text format contains deprecated field "split_k"
+[36m(PPOActor pid=3385662)[0m W0723 14:33:19.256005 3385662 text_format.cc:393] Warning parsing text-format xla.AutotuneResult: 5:10 (N = 2): text format contains deprecated field "split_k"
+[36m(PPOActor pid=3385662)[0m W0723 14:33:19.651534 3385662 text_format.cc:393] Warning parsing text-format xla.AutotuneResult: 5:10 (N = 4): text format contains deprecated field "split_k"
+[36m(PPOActor pid=3385662)[0m [ppo_ray] ADDITIVE failed/sentinel penalty = -2.0 (bounded-negative, INCLUDED in advantage+loss -- replaces the failed-row mask; failed rows are repulsive, never a zero-gradient no-op).
+[36m(PPOActor pid=3385662)[0m [ppo_ray] V2 anti-hack: failed_adv_stamp=1.0 (post-z-score advantage overwrite on failed rows), cost_symlog_cap=0.0 (symlog'd cost channels clipped to +/-cap).
+[36m(PPOActor pid=3385662)[0m [ppo_ray] PopArt value norm ON: beta=0.01 sigma_min(base=0.1, quality[6,9]=0.2) sigma_max=1e+12 robust_std=True (winsor k=5.0) — replaces the rollout advantage z-score; under pure-PopArt advantage a failed row is truly-neutral (A==0), no constant stamp.
+[36m(PPOActor pid=3385662)[0m [ppo_ray] DYNAMIC SENTINEL ON: failed/sentinel terminals get per-channel mu_c - 2.0*sigma_c (EMA beta=0.01) instead of -1e10. The additive failed_penalty stamp AND the post-z-score failed_adv_stamp are DISABLED (dynamic value supersedes them); failed_transitions logging + PopArt exclusion unchanged.
+[36m(PPOActor pid=3385662)[0m [ppo_ray] RAW COSSIM THREAD ON: env emits full-range cosine_sim in idx6; worker applies guide cap=None into the GAE buffer only, logs reward/cosine_sim_raw from the uncapped value.
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="b3aaa016-4c4d-4e8c-9769-f0dc3eadaf4a", ...)
+[36m(PPOActor pid=3385662)[0m [ppo_ray_worker] POLICY V2 ACTIVE: MicroPPOAgent = PALIMPSA backbone + PointerVertexPolicy + MicroActionPolicy(max_substeps=1) + separate value pool; factor tables up to axis size 784 (observed max 784).
+[36m(CpuApproximationActor pid=3385664)[0m [cpu_approx_worker pid=3385664] env: ALPHAGRAD_EXACT_ONLY=1 ALPHAGRAD_FACE_TRANSFORMS=0 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=0 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55177-pgi15-gpu9
+[36m(CpuApproximationActor pid=3385664)[0m [measure-actor 0] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=1 jax_devices=[CudaDevice(id=0)]
+[36m(PPOActor pid=3385662)[0m [ppo_ray_worker] V2 policy heads scaled by 0.1 (near-uniform initial policy).
+[36m(CpuApproximationActor pid=3385663)[0m [cpu_approx_worker pid=3385663] env: ALPHAGRAD_EXACT_ONLY=1 ALPHAGRAD_FACE_TRANSFORMS=0 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=0 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55177-pgi15-gpu9[32m [repeated 2x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+[36m(CpuApproximationActor pid=3385663)[0m [measure-actor 1] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=2 jax_devices=[CudaDevice(id=0)][32m [repeated 2x across cluster][0m
+  actors spawned + JIT-warm in 29.3s
+ppo_ray:   0%|                                                                                                                                             | 0/1000 [00:00<?, ?it/s][36m(CpuApproximationActor pid=3385664)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3385664)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385664)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3385664)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385664)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3385664)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385664)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3385664)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385664)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3385664)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385664)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3385664)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385664)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3385664)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385664)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3385664)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385664)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3385664)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385664)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3385664)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385664)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3385664)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385664)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3385664)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385664)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3385664)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385664)[0m W0723 14:33:18.597399 3385664 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"[32m [repeated 18x across cluster][0m
+[36m(CpuApproximationActor pid=3385663)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3385663)[0m   warnings.warn([32m [repeated 13x across cluster][0m
+[36m(CpuApproximationActor pid=3385663)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3385663)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3385663)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3385663)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3385663)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3385663)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3385663)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3385663)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3385663)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3385663)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3385663)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3385663)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(PPOActor pid=3385662)[0m [per-face] builds=200 applied=0 skipped=0 applied_frac=0.000
+[36m(PPOActor pid=3385662)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype float64 requested in astype is not available, and will be truncated to dtype float32. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.
+[36m(PPOActor pid=3385662)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)
+[36m(PPOActor pid=3385662)[0m [per-face] builds=400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3385664)[0m /Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:3127: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=16920 > MAX_TOKENS=16384 (overflow=536). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+[36m(CpuApproximationActor pid=3385664)[0m   _record_tokenization_truncation(int(raw_tokens.shape[0]))
+[36m(PPOActor pid=3385662)[0m [per-face] builds=600 applied=0 skipped=0 applied_frac=0.000
+[36m(CpuApproximationActor pid=3385664)[0m [per-face] builds=400 applied=0 skipped=0 applied_frac=0.000
+[36m(PPOActor pid=3385662)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype complex128 requested in astype is not available, and will be truncated to dtype complex64. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.
+[36m(PPOActor pid=3385662)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)
+[36m(CpuApproximationActor pid=3385663)[0m [per-face] builds=200 applied=0 skipped=0 applied_frac=0.000[32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=3385665)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3385665)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385665)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3385665)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385665)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3385665)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385665)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3385665)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385665)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3385665)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385665)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3385665)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385665)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3385665)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385665)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3385665)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385665)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3385665)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385665)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3385665)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385665)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3385665)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385665)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3385665)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385665)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3385665)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3385665)[0m /Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:3127: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=20387 > MAX_TOKENS=16384 (overflow=4003). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+[36m(CpuApproximationActor pid=3385665)[0m   _record_tokenization_truncation(int(raw_tokens.shape[0]))
+[36m(CpuApproximationActor pid=3385663)[0m   _record_tokenization_truncation(int(raw_tokens.shape[0]))
+[36m(CpuApproximationActor pid=3385663)[0m /Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py:3127: UserWarning: [alphagrad.approx.env] jaxpr tokenization truncated: raw_len=16401 > MAX_TOKENS=16384 (overflow=17). The policy will see a clipped observation for this step. Subsequent truncations are silent but counted (see ``tokenization/{truncated_count, overflow_sum_this_ep}`` in the wandb log).
+[36m(PPOActor pid=3385662)[0m [per-face] builds=1400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=3385663)[0m [per-face] builds=400 applied=0 skipped=0 applied_frac=0.000[32m [repeated 4x across cluster][0m
+Traceback (most recent call last):
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 776, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 770, in main
+    rc = _run(args)
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 561, in _run
+    stats = ray.get(actor.run_rollout_and_train.remote(seed_counter))
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    return fn(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/client_mode_hook.py", line 107, in wrapper
+    return func(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 2980, in get
+    values, debugger_breakpoint = worker.get_objects(
+                                  ~~~~~~~~~~~~~~~~~~^
+        object_refs, timeout, use_object_store=_use_object_store
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 1023, in get_objects
+    raise value.as_instanceof_cause()
+ray.exceptions.RayTaskError(ValueError): [36mray::PPOActor.run_rollout_and_train()[39m (pid=3385662, ip=192.168.15.9, actor_id=5d4c0a59046c3583b32874b401000000, repr=<alphagrad.approx.ppo_ray_actors.PPOActor object at 0x79b4f942d550>)
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_actors.py", line 71, in run_rollout_and_train
+    return self._impl.run_rollout_and_train(int(rng_seed))
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_worker.py", line 2183, in run_rollout_and_train
+    pv_np, cv_np = self._live_masks(np.asarray(avail))
+                   ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_worker.py", line 1532, in _live_masks
+    pair[e], comp[e] = oracle.masks(cands)
+                       ~~~~~~~~~~~~^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 682, in masks
+    p, c = self.vertex_mask(v)
+           ~~~~~~~~~~~~~~~~^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 604, in vertex_mask
+    faces += self.probe_faces(vertex, approx=mode)
+             ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 560, in probe_faces
+    _eliminate_vertex(
+    ~~~~~~~~~~~~~~~~~^
+        int(vertex), incr.jaxpr, graph, tgraph, incr.vo, False,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        transforms=(_record,), face_transforms=None,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/graphax/src/graphax/core.py", line 1512, in _eliminate_vertex
+    edge_outval = _post_val @ _pre_val
+                  ~~~~~~~~~~^~~~~~~~~~
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/tensor.py", line 69, in __matmul__
+    return matmul(self, other)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/ops/matmul.py", line 2578, in matmul
+    pairs = _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/ops/matmul.py", line 466, in _build_matmul_topology
+    meta, lhs_ids, rhs_ids = _resolve_contract_pair(
+                             ~~~~~~~~~~~~~~~~~~~~~~^
+        lp, ro, lhs_out_map, rhs_primal_map
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/ops/matmul.py", line 282, in _resolve_contract_pair
+    raise ValueError(
+        f"Contraction size mismatch: {lp.logical_size} vs {ro.logical_size}"
+    )
+ValueError: Contraction size mismatch: 16 vs 17
+Traceback (most recent call last):
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 776, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 770, in main
+    rc = _run(args)
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 561, in _run
+    stats = ray.get(actor.run_rollout_and_train.remote(seed_counter))
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    return fn(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/client_mode_hook.py", line 107, in wrapper
+    return func(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 2980, in get
+    values, debugger_breakpoint = worker.get_objects(
+                                  ~~~~~~~~~~~~~~~~~~^
+        object_refs, timeout, use_object_store=_use_object_store
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 1023, in get_objects
+    raise value.as_instanceof_cause()
+ray.exceptions.RayTaskError(ValueError): [36mray::PPOActor.run_rollout_and_train()[39m (pid=3385662, ip=192.168.15.9, actor_id=5d4c0a59046c3583b32874b401000000, repr=<alphagrad.approx.ppo_ray_actors.PPOActor object at 0x79b4f942d550>)
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_actors.py", line 71, in run_rollout_and_train
+    return self._impl.run_rollout_and_train(int(rng_seed))
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_worker.py", line 2183, in run_rollout_and_train
+    pv_np, cv_np = self._live_masks(np.asarray(avail))
+                   ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_worker.py", line 1532, in _live_masks
+    pair[e], comp[e] = oracle.masks(cands)
+                       ~~~~~~~~~~~~^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 682, in masks
+    p, c = self.vertex_mask(v)
+           ~~~~~~~~~~~~~~~~^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 604, in vertex_mask
+    faces += self.probe_faces(vertex, approx=mode)
+             ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/common/masks.py", line 560, in probe_faces
+    _eliminate_vertex(
+    ~~~~~~~~~~~~~~~~~^
+        int(vertex), incr.jaxpr, graph, tgraph, incr.vo, False,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        transforms=(_record,), face_transforms=None,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/graphax/src/graphax/core.py", line 1512, in _eliminate_vertex
+    edge_outval = _post_val @ _pre_val
+                  ~~~~~~~~~~^~~~~~~~~~
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/tensor.py", line 69, in __matmul__
+    return matmul(self, other)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/ops/matmul.py", line 2578, in matmul
+    pairs = _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset)
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/ops/matmul.py", line 466, in _build_matmul_topology
+    meta, lhs_ids, rhs_ids = _resolve_contract_pair(
+                             ~~~~~~~~~~~~~~~~~~~~~~^
+        lp, ro, lhs_out_map, rhs_primal_map
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/graphax/src/graphax/sparse/ops/matmul.py", line 282, in _resolve_contract_pair
+    raise ValueError(
+        f"Contraction size mismatch: {lp.logical_size} vs {ro.logical_size}"
+    )
+ValueError: Contraction size mismatch: 16 vs 17
+[1;34mwandb[0m: 
+[1;34mwandb[0m: You can sync this run to the cloud by running:
+[1;34mwandb[0m: [1mwandb sync /Users/assmuth/dsnn/alphagrad/wandb/offline-run-20260723_143311-cslrlvg5[0m
+[1;34mwandb[0m: Find logs at: [1;35mwandb/offline-run-20260723_143311-cslrlvg5/logs[0m
+[36m(CpuApproximationActor pid=3385664)[0m [per-face] builds=1000 applied=0 skipped=0 applied_frac=0.000[32m [repeated 2x across cluster][0m
+=== PHASE flops RC=1 Thu Jul 23 02:34:34 PM UTC 2026 ===
+=== ALL PHASES DONE Thu Jul 23 02:34:34 PM UTC 2026 ===

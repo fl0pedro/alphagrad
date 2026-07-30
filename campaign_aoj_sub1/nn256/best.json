@@ -1,0 +1,687 @@
+{
+  "best_overall": {
+    "return": -16353056.0,
+    "ep": 1,
+    "rewards_raw": {
+      "muls_adds_fmas": -58424532992.0,
+      "flops": -9839448.0,
+      "latency_ns": -35972.8046875,
+      "max_io_sum": -19155200.0,
+      "bytes_accessed": -16948268.0,
+      "peak_memory": -459418880.0,
+      "cosine_sim": 0.9996674060821533,
+      "frob_residual": -0.028401469811797142,
+      "xla_peak_memory": -16317084.0,
+      "bkstep_acc": 0.0
+    },
+    "rewards_weighted": {
+      "muls_adds_fmas": -0.0,
+      "flops": -0.0,
+      "latency_ns": -35972.8046875,
+      "max_io_sum": -0.0,
+      "bytes_accessed": -0.0,
+      "peak_memory": -0.0,
+      "cosine_sim": 0.9996674060821533,
+      "frob_residual": -0.028401469811797142,
+      "xla_peak_memory": -16317084.0,
+      "bkstep_acc": 0.0
+    },
+    "seq": [
+      {
+        "vertex": 1,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e4m3b11fnuz"
+          }
+        ]
+      },
+      {
+        "vertex": 12,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e4m3b11fnuz"
+          }
+        ]
+      },
+      {
+        "vertex": 3,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e4m3b11fnuz"
+          }
+        ]
+      },
+      {
+        "vertex": 6,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e4m3b11fnuz"
+          }
+        ]
+      },
+      {
+        "vertex": 11,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e5m2"
+          }
+        ]
+      },
+      {
+        "vertex": 2,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e4m3b11fnuz"
+          }
+        ]
+      },
+      {
+        "vertex": 5,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e4m3b11fnuz"
+          }
+        ]
+      },
+      {
+        "vertex": 10,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e4m3b11fnuz"
+          }
+        ]
+      },
+      {
+        "vertex": 7,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e4m3fnuz"
+          }
+        ]
+      },
+      {
+        "vertex": 8,
+        "ops": []
+      },
+      {
+        "vertex": 9,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e4m3fnuz"
+          }
+        ]
+      },
+      {
+        "vertex": 4,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e4m3b11fnuz"
+          }
+        ]
+      }
+    ]
+  },
+  "best_per_channel": {
+    "latency_ns": {
+      "ep": 3,
+      "env_idx": 0,
+      "raw_value": 0.0,
+      "weighted_value": 0.0,
+      "weighted_total": 0.0,
+      "all_raw": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "all_weighted": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "seq": [
+        {
+          "vertex": 12,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e3m4"
+            }
+          ]
+        },
+        {
+          "vertex": 5,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 1,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 2,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 3,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 10,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 6,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 8,
+          "ops": []
+        },
+        {
+          "vertex": 11,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 4,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 7,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 9,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3fnuz"
+            }
+          ]
+        }
+      ]
+    },
+    "cosine_sim": {
+      "ep": 111,
+      "env_idx": 0,
+      "raw_value": 1.0004909038543701,
+      "weighted_value": 1.0004909038543701,
+      "weighted_total": -16772573.0,
+      "all_raw": {
+        "muls_adds_fmas": -109751648256.0,
+        "flops": -19168436.0,
+        "latency_ns": -454578.25,
+        "max_io_sum": -38075040.0,
+        "bytes_accessed": -16934532.0,
+        "peak_memory": -16317996.0,
+        "cosine_sim": 1.0004909038543701,
+        "frob_residual": -0.00048438715748488903,
+        "xla_peak_memory": -16317996.0,
+        "bkstep_acc": 0.0
+      },
+      "all_weighted": {
+        "muls_adds_fmas": -0.0,
+        "flops": -0.0,
+        "latency_ns": -454578.25,
+        "max_io_sum": -0.0,
+        "bytes_accessed": -0.0,
+        "peak_memory": -0.0,
+        "cosine_sim": 1.0004909038543701,
+        "frob_residual": -0.00048438715748488903,
+        "xla_peak_memory": -16317996.0,
+        "bkstep_acc": 0.0
+      },
+      "seq": [
+        {
+          "vertex": 10,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e3m4"
+            }
+          ]
+        },
+        {
+          "vertex": 2,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 7,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float4_e2m1fn"
+            }
+          ]
+        },
+        {
+          "vertex": 3,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float4_e2m1fn"
+            }
+          ]
+        },
+        {
+          "vertex": 11,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3fn"
+            }
+          ]
+        },
+        {
+          "vertex": 8,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float16"
+            }
+          ]
+        },
+        {
+          "vertex": 12,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e3m4"
+            }
+          ]
+        },
+        {
+          "vertex": 4,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float4_e2m1fn"
+            }
+          ]
+        },
+        {
+          "vertex": 6,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float4_e2m1fn"
+            }
+          ]
+        },
+        {
+          "vertex": 1,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 5,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float4_e2m1fn"
+            }
+          ]
+        },
+        {
+          "vertex": 9,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float16"
+            }
+          ]
+        }
+      ]
+    },
+    "frob_residual": {
+      "ep": 3,
+      "env_idx": 0,
+      "raw_value": 0.0,
+      "weighted_value": 0.0,
+      "weighted_total": 0.0,
+      "all_raw": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "all_weighted": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "seq": [
+        {
+          "vertex": 12,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e3m4"
+            }
+          ]
+        },
+        {
+          "vertex": 5,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 1,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 2,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 3,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 10,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 6,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 8,
+          "ops": []
+        },
+        {
+          "vertex": 11,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 4,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 7,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 9,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3fnuz"
+            }
+          ]
+        }
+      ]
+    },
+    "xla_peak_memory": {
+      "ep": 3,
+      "env_idx": 0,
+      "raw_value": 0.0,
+      "weighted_value": 0.0,
+      "weighted_total": 0.0,
+      "all_raw": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "all_weighted": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "seq": [
+        {
+          "vertex": 12,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e3m4"
+            }
+          ]
+        },
+        {
+          "vertex": 5,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 1,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 2,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 3,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 10,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 6,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 8,
+          "ops": []
+        },
+        {
+          "vertex": 11,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 4,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3b11fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 7,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3fnuz"
+            }
+          ]
+        },
+        {
+          "vertex": 9,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e4m3fnuz"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "quantile_sequences": {}
+}

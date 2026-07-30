@@ -1,0 +1,43 @@
+=== node=pgi15-gpu12 gpu=NVIDIA GeForce RTX 4090 Thu Jul 23 03:35:23 PM UTC 2026 ===
+=== TAG=exact_adalif_oneloop MODE=exact EXAMPLE=ADALIF_SNN_SEQ WIDTH=64 SNN_STEPS=1 ===
+=== graphax=30441f6 examples: ADALIF_SNN_SEQ, a fully-unrolled temporal adaptive-LIF ===
+=== alphagrad=70b4686 fix: exact-only was not exact; ADALIF/EncoderDecoder argnums; surface failures ===
+=== PHASE lat_mem START Thu Jul 23 03:35:23 PM UTC 2026 ===
+2026-07-23 15:35:24,163	INFO worker.py:1814 -- Connecting to existing Ray cluster at address: 192.168.15.12:6384...
+Traceback (most recent call last):
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 776, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 768, in main
+    ray.init(**init_kwargs, ignore_reinit_error=True)
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/client_mode_hook.py", line 107, in wrapper
+    return func(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 1915, in init
+    raise ValueError(
+    ...<2 lines>...
+    )
+ValueError: When connecting to an existing cluster, num_cpus and num_gpus must not be provided.
+=== PHASE lat_mem RC=1 Thu Jul 23 03:35:24 PM UTC 2026 ===
+[log_to_csv] no ep= rows in campaign_exp/exact_adalif_oneloop_lat_mem/run.log
+  (csv export failed)
+=== PHASE flops START Thu Jul 23 03:35:24 PM UTC 2026 ===
+2026-07-23 15:35:24,727	INFO worker.py:1814 -- Connecting to existing Ray cluster at address: 192.168.15.12:6384...
+Traceback (most recent call last):
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 776, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 768, in main
+    ray.init(**init_kwargs, ignore_reinit_error=True)
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/client_mode_hook.py", line 107, in wrapper
+    return func(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 1915, in init
+    raise ValueError(
+    ...<2 lines>...
+    )
+ValueError: When connecting to an existing cluster, num_cpus and num_gpus must not be provided.
+=== PHASE flops RC=1 Thu Jul 23 03:35:24 PM UTC 2026 ===
+[log_to_csv] no ep= rows in campaign_exp/exact_adalif_oneloop_flops/run.log
+  (csv export failed)
+=== ALL PHASES DONE (FAILED=1) Thu Jul 23 03:35:24 PM UTC 2026 ===

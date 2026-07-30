@@ -1,0 +1,393 @@
+{
+  "objectives": [
+    "flops",
+    "frob_residual"
+  ],
+  "hypervolume": 8711872.996691274,
+  "num_points": 5,
+  "front": [
+    {
+      "obj": {
+        "flops": -18395528.0,
+        "frob_residual": -0.0003761820844374597
+      },
+      "seq": [
+        [
+          11,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          7,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          12,
+          []
+        ],
+        [
+          6,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          8,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          10,
+          []
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "flops": -9703496.0,
+        "frob_residual": -0.00037618872011080384
+      },
+      "seq": [
+        [
+          7,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          12,
+          [
+            "quant('float8_e5m2fnuz')"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 2)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          10,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          6,
+          []
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "flops": -17605256.0,
+        "frob_residual": -0.00037618319038301706
+      },
+      "seq": [
+        [
+          2,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          7,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          11,
+          [
+            "quant('int32')"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "flops": -9683656.0,
+        "frob_residual": -0.0003762001288123429
+      },
+      "seq": [
+        [
+          3,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('max', 1)"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('float8_e4m3')"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('mean', 1)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 2)"
+          ]
+        ],
+        [
+          12,
+          [
+            "quant('complex64')"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "flops": -10493768.0,
+        "frob_residual": -0.00037618406349793077
+      },
+      "seq": [
+        [
+          2,
+          [
+            "diag(0, 2, 2)"
+          ]
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('max', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          6,
+          [
+            "quant('float8_e3m4')"
+          ]
+        ],
+        [
+          3,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ]
+      ]
+    }
+  ],
+  "dynamic_substeps": true
+}

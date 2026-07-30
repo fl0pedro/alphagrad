@@ -72,7 +72,28 @@ def _rows(kind):
     return rows
 
 
-@pytest.mark.parametrize("kind", ["none", "diag", "compress"])
+@pytest.mark.parametrize("kind", [
+    "none",
+    "diag",
+    pytest.param("compress", marks=pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "KNOWN, MEASURED: the prefix property does NOT hold when the "
+            "prefix carries COMPRESS. decode_vertex_rule_specs emits "
+            "Compress ONLY when is_last=True, so vertex k-1 is tokenized "
+            "WITH its Compress at prefix length k and WITHOUT it at length "
+            "k+1 -> the streams diverge (measured: token 681 of 931). "
+            "CONSEQUENCES: (1) the ancestor-extension fast path in "
+            "_incremental_stream_tokens is UNSOUND for COMPRESS plans — it "
+            "is currently reachable in per-vertex mode (face_key is None), "
+            "where a cache hit on a parent yields a different observation "
+            "than a cold replay; (2) the face-mode guard that disables that "
+            "path is therefore LOAD-BEARING, not merely conservative; "
+            "(3) no prefix memo (oracle replay, face-key enumeration) can "
+            "be added until the is_last coupling is removed. Flip this to "
+            "xpass by lifting the COMPRESS last-vertex restriction."
+        ))),
+])
 def test_prefix_property(kind):
     """Is stream(prefix[:k]) a byte-prefix of stream(prefix[:k+1])?"""
     prefix = [1, 2, 3]

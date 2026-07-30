@@ -1,0 +1,636 @@
+{
+  "objectives": [
+    "latency_ns",
+    "peak_memory",
+    "frob_residual"
+  ],
+  "hypervolume": 336985281535.84375,
+  "num_points": 8,
+  "front": [
+    {
+      "obj": {
+        "latency_ns": -42268.5859375,
+        "peak_memory": -565622272.0,
+        "frob_residual": -0.00037618406349793077
+      },
+      "seq": [
+        [
+          4,
+          []
+        ],
+        [
+          2,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          9,
+          []
+        ],
+        [
+          3,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('abs_max', 2)"
+          ]
+        ],
+        [
+          10,
+          []
+        ],
+        [
+          6,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          11,
+          []
+        ],
+        [
+          12,
+          [
+            "quant('complex64')"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('uint32')"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -52901.4296875,
+        "peak_memory": -597315136.0,
+        "frob_residual": -0.0003761820844374597
+      },
+      "seq": [
+        [
+          11,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          7,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          12,
+          []
+        ],
+        [
+          6,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          8,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          10,
+          []
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -796390.5625,
+        "peak_memory": -32317932.0,
+        "frob_residual": -0.0003761820844374597
+      },
+      "seq": [
+        [
+          7,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          9,
+          []
+        ],
+        [
+          3,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('max', 1)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('int32')"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('abs_max', 0)"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -742877.375,
+        "peak_memory": -32316908.0,
+        "frob_residual": -0.00037619948852807283
+      },
+      "seq": [
+        [
+          10,
+          [
+            "compress('max', 0)"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('int32')"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('uint8')"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('mean', 1)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('min', 0)"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -791799.125,
+        "peak_memory": -32312668.0,
+        "frob_residual": -0.00037618365604430437
+      },
+      "seq": [
+        [
+          10,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          12,
+          []
+        ],
+        [
+          9,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('mean', 1)"
+          ]
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          4,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          3,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('abs_min', 1)"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -760187.5625,
+        "peak_memory": -32312668.0,
+        "frob_residual": -0.00037618872011080384
+      },
+      "seq": [
+        [
+          11,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          9,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('median', 1)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('median', 2)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('float64')"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('mean', 1)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('mean', 0)"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -761257.25,
+        "peak_memory": -32313580.0,
+        "frob_residual": -0.00037618319038301706
+      },
+      "seq": [
+        [
+          7,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('median', 1)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('max', 0)"
+          ]
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          3,
+          [
+            "quant('float64')"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "latency_ns": -759385.0,
+        "peak_memory": -32312668.0,
+        "frob_residual": -0.00037622248055413365
+      },
+      "seq": [
+        [
+          6,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('float64')"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('mean', 1)"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('float16')"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "quant('uint2')"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('mean', 1)"
+          ]
+        ]
+      ]
+    }
+  ],
+  "dynamic_substeps": true
+}

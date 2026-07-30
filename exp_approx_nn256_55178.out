@@ -1,0 +1,772 @@
+=== node=pgi15-gpu9.iff.kfa-juelich.de gpu=NVIDIA GeForce RTX 4090 Thu Jul 23 02:34:35 PM UTC 2026 ===
+=== MODE=approx EXAMPLE=VmappedNeuralNetwork EXACT_ONLY=0 ===
+=== graphax=2410078 jaxpr: bound the tokenizer's name alphabet so token ids stay in range ===
+=== alphagrad=b44a5a6 approx: prove the incremental palimpsa encode == the full re-encode ===
+=== PHASE lat_mem START Thu Jul 23 02:34:35 PM UTC 2026 ===
+2026-07-23 14:34:38,670	INFO worker.py:2012 -- Started a local Ray instance.
+/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+wandb: Loading settings from /Users/assmuth/.config/wandb/settings
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: Tracking run with wandb version 0.25.0
+wandb: W&B syncing is set to `offline` in this directory. Run `wandb online` or set WANDB_MODE=online to enable cloud syncing.
+wandb: Run data is saved locally in /Users/assmuth/dsnn/alphagrad/wandb/offline-run-20260723_143439-6kcxlr27
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="fbd66a64-d310-4739-b90c-c32eaa225b41", ...)
+[36m(PPOActor pid=3389302)[0m W0723 14:34:46.618840 3389302 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(PPOActor pid=3389302)[0m W0723 14:34:46.618864 3389302 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(PPOActor pid=3389302)[0m W0723 14:34:46.618871 3389302 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(PPOActor pid=3389302)[0m W0723 14:34:46.618880 3389302 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(PPOActor pid=3389302)[0m W0723 14:34:46.618895 3389302 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(PPOActor pid=3389302)[0m W0723 14:34:46.618925 3389302 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(PPOActor pid=3389302)[0m W0723 14:34:46.618975 3389302 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(PPOActor pid=3389302)[0m W0723 14:34:46.619083 3389302 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(PPOActor pid=3389302)[0m W0723 14:34:46.619272 3389302 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3389305)[0m [cpu_approx_worker pid=3389305] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3389305)[0m [measure-actor 1] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=2 jax_devices=[CudaDevice(id=0)]
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="fbd66a64-d310-4739-b90c-c32eaa225b41", ...)
+[36m(PPOActor pid=3389302)[0m [ppo_ray] ADDITIVE failed/sentinel penalty = -2.0 (bounded-negative, INCLUDED in advantage+loss -- replaces the failed-row mask; failed rows are repulsive, never a zero-gradient no-op).
+[36m(PPOActor pid=3389302)[0m [ppo_ray] V2 anti-hack: failed_adv_stamp=1.0 (post-z-score advantage overwrite on failed rows), cost_symlog_cap=0.0 (symlog'd cost channels clipped to +/-cap).
+[36m(PPOActor pid=3389302)[0m [ppo_ray] PopArt value norm ON: beta=0.01 sigma_min(base=0.1, quality[6,9]=0.2) sigma_max=1e+12 robust_std=True (winsor k=5.0) — replaces the rollout advantage z-score; under pure-PopArt advantage a failed row is truly-neutral (A==0), no constant stamp.
+[36m(PPOActor pid=3389302)[0m [ppo_ray] DYNAMIC SENTINEL ON: failed/sentinel terminals get per-channel mu_c - 2.0*sigma_c (EMA beta=0.01) instead of -1e10. The additive failed_penalty stamp AND the post-z-score failed_adv_stamp are DISABLED (dynamic value supersedes them); failed_transitions logging + PopArt exclusion unchanged.
+[36m(PPOActor pid=3389302)[0m [ppo_ray] RAW COSSIM THREAD ON: env emits full-range cosine_sim in idx6; worker applies guide cap=None into the GAE buffer only, logs reward/cosine_sim_raw from the uncapped value.
+[36m(CpuApproximationActor pid=3389304)[0m [cpu_approx_worker pid=3389304] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9[32m [repeated 2x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+[36m(CpuApproximationActor pid=3389304)[0m [measure-actor 2] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=3 jax_devices=[CudaDevice(id=0)][32m [repeated 2x across cluster][0m
+[36m(PPOActor pid=3389302)[0m [ppo_ray_worker] POLICY V2 ACTIVE: MicroPPOAgent = PALIMPSA backbone + PointerVertexPolicy + MicroActionPolicy(max_substeps=1) + separate value pool; factor tables up to axis size 784 (observed max 784).
+[36m(PPOActor pid=3389302)[0m [ppo_ray_worker] V2 policy heads scaled by 0.1 (near-uniform initial policy).
+  actors spawned + JIT-warm in 36.7s
+ppo_ray:   0%|                                                                                                                                             | 0/1000 [00:00<?, ?it/s][36m(CpuApproximationActor pid=3389304)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3389304)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3389304)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3389304)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3389304)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3389304)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3389304)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3389304)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3389304)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3389304)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3389304)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3389304)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3389304)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3389304)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3389304)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3389304)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3389304)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3389304)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3389304)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3389304)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3389304)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3389304)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3389304)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3389304)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3389304)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3389304)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3389304)[0m W0723 14:34:46.663621 3389304 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"[32m [repeated 27x across cluster][0m
+[36m(CpuApproximationActor pid=3389303)[0m [per-face] builds=200 applied=0 skipped=0 applied_frac=0.000
+[36m(PPOActor pid=3389302)[0m [per-face] builds=200 applied=84 skipped=0 applied_frac=1.000
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=0 ev=-0.338 adv(mean/std/absmax)=-22.370/7.668/35.232 latency_ns: mu=-7.19e+04 sig=1.54e+04 peak_memory: mu=-6.57e+08 sig=5.25e+07 frob_residual: mu=-96.8 sig=94.4
+ppo_ray:   0%|▏                                                                                                                                 | 1/1000 [01:20<22:24:28, 80.75s/it]ppo_ray best:-5.97e+08(ep0) mean:-6.57e+08 loss(p/v):18/77 ent:2.327 nan_skip:0:   0%|                                                          | 1/1000 [01:20<22:24:28, 80.75s/it][36m(PPOActor pid=3389302)[0m [ppo_ray][kl-stop] ep=0 approx_kl_percomp(mean)=0.2478 > target 0.15 after mb 3/4 (joint_kl mean=0.982) -- stopping remaining updates.
+[36m(CpuApproximationActor pid=3389303)[0m [per-face] builds=400 applied=22 skipped=0 applied_frac=1.000
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=1 ev=-10.219 adv(mean/std/absmax)=-16.046/2.109/18.970 latency_ns: mu=-7.44e+04 sig=1.35e+04 peak_memory: mu=-6.95e+08 sig=7.86e+07 frob_residual: mu=-345 sig=568
+[36m(CpuApproximationActor pid=3389305)[0m [per-face] builds=200 applied=9 skipped=0 applied_frac=1.000[32m [repeated 3x across cluster][0m
+[36m(PPOActor pid=3389302)[0m [ppo_ray][kl-stop] ep=1 approx_kl_percomp(mean)=0.1825 > target 0.15 after mb 2/4 (joint_kl mean=0.729) -- stopping remaining updates.
+ppo_ray best:-5.97e+08(ep0) mean:-6.57e+08 loss(p/v):18/77 ent:2.327 nan_skip:0:   0%|                                                          | 2/1000 [01:32<11:11:56, 40.40s/it]ppo_ray best:-5.97e+08(ep0) mean:-7.32e+08 loss(p/v):16/42 ent:2.405 nan_skip:0:   0%|                                                          | 2/1000 [01:32<11:11:56, 40.40s/it][36m(CpuApproximationActor pid=3389305)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3389305)[0m   warnings.warn([32m [repeated 26x across cluster][0m
+[36m(CpuApproximationActor pid=3389305)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3389305)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3389305)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3389305)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3389305)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3389305)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3389305)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3389305)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3389305)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3389305)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3389305)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3389305)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3394338)[0m W0723 14:36:50.956607 3394338 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"[32m [repeated 9x across cluster][0m
+[36m(CpuApproximationActor pid=3394338)[0m [cpu_approx_worker pid=3394338] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3394338)[0m [measure-actor 4] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=1 jax_devices=[CudaDevice(id=0)]
+[36m(PPOActor pid=3389302)[0m [per-face] builds=600 applied=292 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3394338)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3394338)[0m   warnings.warn([32m [repeated 13x across cluster][0m
+[36m(CpuApproximationActor pid=3394338)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3394338)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3394338)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3394338)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3394338)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3394338)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3394338)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3394338)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3394338)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3394338)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3394338)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3394338)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=2 ev=-0.036 adv(mean/std/absmax)=-12.575/8.579/27.294 latency_ns: mu=-8.43e+04 sig=3.41e+04 peak_memory: mu=-6.75e+08 sig=2.22e+08 frob_residual: mu=-1.19e+03 sig=1.73e+03
+[36m(CpuApproximationActor pid=3389305)[0m [per-face] builds=400 applied=27 skipped=0 applied_frac=1.000
+ppo_ray best:-5.97e+08(ep0) mean:-7.32e+08 loss(p/v):16/42 ent:2.405 nan_skip:0:   0%|▏                                                          | 3/1000 [02:00<9:32:50, 34.47s/it]ppo_ray best:-3.32e+07(ep2) mean:-6.37e+08 loss(p/v):13/61 ent:2.014 nan_skip:0:   0%|▏                                                          | 3/1000 [02:00<9:32:50, 34.47s/it][36m(PPOActor pid=3389302)[0m [per-face] builds=800 applied=394 skipped=0 applied_frac=1.000
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=3 ev=-0.097 adv(mean/std/absmax)=-8.619/6.131/19.125 latency_ns: mu=-9.16e+04 sig=4.39e+04 peak_memory: mu=-7e+08 sig=3.09e+08 frob_residual: mu=-901 sig=1.57e+03
+[36m(CpuApproximationActor pid=3389305)[0m [per-face] builds=800 applied=80 skipped=0 applied_frac=1.000[32m [repeated 5x across cluster][0m
+ppo_ray best:-3.32e+07(ep2) mean:-6.37e+08 loss(p/v):13/61 ent:2.014 nan_skip:0:   0%|▏                                                          | 4/1000 [02:12<7:06:21, 25.68s/it]ppo_ray best:-3.32e+07(ep3) mean:-7.75e+08 loss(p/v):15/34 ent:1.915 nan_skip:0:   0%|▏                                                          | 4/1000 [02:12<7:06:21, 25.68s/it][36m(PPOActor pid=3389302)[0m [ppo_ray][kl-stop] ep=3 approx_kl_percomp(mean)=0.3318 > target 0.15 after mb 4/4 (joint_kl mean=1.322) -- stopping remaining updates.
+[36m(CpuApproximationActor pid=3395129)[0m W0723 14:37:30.081550 3395129 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395129)[0m W0723 14:37:30.081574 3395129 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395129)[0m W0723 14:37:30.081580 3395129 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395129)[0m W0723 14:37:30.081589 3395129 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395129)[0m W0723 14:37:30.081602 3395129 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395129)[0m W0723 14:37:30.081631 3395129 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395129)[0m W0723 14:37:30.081680 3395129 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395129)[0m W0723 14:37:30.081779 3395129 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395129)[0m W0723 14:37:30.081965 3395129 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395129)[0m [cpu_approx_worker pid=3395129] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3395129)[0m [measure-actor 5] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=2 jax_devices=[CudaDevice(id=0)]
+[36m(CpuApproximationActor pid=3389304)[0m [per-face] builds=600 applied=54 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3395129)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3395129)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395129)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3395129)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395129)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3395129)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395129)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3395129)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395129)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3395129)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395129)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3395129)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395129)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3395129)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395129)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3395129)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395129)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3395129)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395129)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3395129)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395129)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3395129)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395129)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3395129)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395129)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3395129)[0m   warnings.warn(
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=4 ev=+0.052 adv(mean/std/absmax)=-3.122/0.608/3.809 latency_ns: mu=-1.66e+05 sig=2.31e+05 peak_memory: mu=-6.39e+08 sig=3.44e+08 frob_residual: mu=-718 sig=1.45e+03
+[36m(CpuApproximationActor pid=3394338)[0m [per-face] builds=400 applied=41 skipped=0 applied_frac=1.000[32m [repeated 2x across cluster][0m
+ppo_ray best:-3.32e+07(ep3) mean:-7.75e+08 loss(p/v):15/34 ent:1.915 nan_skip:0:   0%|▎                                                          | 5/1000 [02:37<7:02:46, 25.49s/it]ppo_ray best:-3.31e+07(ep4) mean:-4.02e+08 loss(p/v):3/2.8 ent:2.089 nan_skip:0:   0%|▎                                                          | 5/1000 [02:37<7:02:46, 25.49s/it]                                                                                                                                                                                      [ppo_ray] ep=   5/1000 best=-3.314e+07(ep4) mean=-4.019e+08 ent=2.089 buf=0 step=5
+            best-overall-traj-rewards: muls=-5.8e+10 flop=-1.9e+06 late=-8.3e+05 max_=-3.2e+07 byte=-3.3e+07 peak=-3.2e+07 cosi=-0.019 frob=-1.1 xla_=-3.2e+07
+            per-channel-best:          late=-5.6e+04 peak=-3.2e+07 frob=-1
+            mean-per-channel:          muls=-5e+09 flop=-5.6e+05 late=-3.8e+04 max_=-4.7e+06 byte=-2.8e+06 peak=-3.3e+07 cosi=+0.0062 frob=-9.4 xla_=-2.7e+06
+ppo_ray best:-3.31e+07(ep4) mean:-4.02e+08 loss(p/v):3/2.8 ent:2.089 nan_skip:0:   0%|▎                                                          | 5/1000 [02:37<7:02:46, 25.49s/it][36m(CpuApproximationActor pid=3389304)[0m [per-face] builds=1000 applied=92 skipped=0 applied_frac=1.000[32m [repeated 4x across cluster][0m
+[36m(CpuApproximationActor pid=3389304)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype int64 requested in astype is not available, and will be truncated to dtype int32. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.
+[36m(CpuApproximationActor pid=3389304)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=5 ev=-0.112 adv(mean/std/absmax)=-2.972/0.341/3.412 latency_ns: mu=-2.17e+05 sig=2.85e+05 peak_memory: mu=-6.17e+08 sig=3.75e+08 frob_residual: mu=-595 sig=1.35e+03
+[36m(CpuApproximationActor pid=3394338)[0m [per-face] builds=600 applied=62 skipped=0 applied_frac=1.000[32m [repeated 2x across cluster][0m
+ppo_ray best:-3.31e+07(ep4) mean:-4.02e+08 loss(p/v):3/2.8 ent:2.089 nan_skip:0:   1%|▎                                                          | 6/1000 [02:49<5:46:22, 20.91s/it]ppo_ray best:-3.31e+07(ep5) mean:-5.08e+08 loss(p/v):3/2.7 ent:1.840 nan_skip:0:   1%|▎                                                          | 6/1000 [02:49<5:46:22, 20.91s/it][36m(CpuApproximationActor pid=3395825)[0m W0723 14:38:07.551779 3395825 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395825)[0m W0723 14:38:07.551802 3395825 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395825)[0m W0723 14:38:07.551808 3395825 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395825)[0m W0723 14:38:07.551816 3395825 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395825)[0m W0723 14:38:07.551829 3395825 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395825)[0m W0723 14:38:07.551858 3395825 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395825)[0m W0723 14:38:07.551906 3395825 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395825)[0m W0723 14:38:07.552016 3395825 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3395825)[0m W0723 14:38:07.552203 3395825 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(PPOActor pid=3389302)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype int64 requested in astype is not available, and will be truncated to dtype int32. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.
+[36m(PPOActor pid=3389302)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)
+[36m(CpuApproximationActor pid=3395825)[0m [cpu_approx_worker pid=3395825] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3395825)[0m [measure-actor 6] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=3 jax_devices=[CudaDevice(id=0)]
+[36m(PPOActor pid=3389302)[0m [per-face] builds=1800 applied=886 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3395825)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3395825)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395825)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3395825)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395825)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3395825)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395825)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3395825)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395825)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3395825)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395825)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3395825)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395825)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3395825)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395825)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3395825)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395825)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3395825)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395825)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3395825)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395825)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3395825)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395825)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3395825)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3395825)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3395825)[0m   warnings.warn(
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=6 ev=+0.050 adv(mean/std/absmax)=-2.465/0.058/2.533 latency_ns: mu=-3.05e+05 sig=3.38e+05 peak_memory: mu=-5.31e+08 sig=4.03e+08 frob_residual: mu=-508 sig=1.26e+03
+[36m(CpuApproximationActor pid=3394338)[0m [per-face] builds=800 applied=81 skipped=0 applied_frac=1.000[32m [repeated 2x across cluster][0m
+ppo_ray best:-3.31e+07(ep5) mean:-5.08e+08 loss(p/v):3/2.7 ent:1.840 nan_skip:0:   1%|▍                                                          | 7/1000 [03:16<6:16:44, 22.76s/it]ppo_ray best:-3.31e+07(ep6) mean:-3.31e+07 loss(p/v):2.5/1.9 ent:2.004 nan_skip:0:   1%|▍                                                        | 7/1000 [03:16<6:16:44, 22.76s/it][36m(PPOActor pid=3389302)[0m [per-face] builds=2200 applied=1050 skipped=0 applied_frac=1.000[32m [repeated 4x across cluster][0m
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=7 ev=-0.190 adv(mean/std/absmax)=-2.375/0.037/2.432 latency_ns: mu=-3.75e+05 sig=3.63e+05 peak_memory: mu=-4.66e+08 sig=4.12e+08 frob_residual: mu=-442 sig=1.19e+03
+[36m(CpuApproximationActor pid=3395129)[0m [per-face] builds=600 applied=50 skipped=0 applied_frac=1.000
+ppo_ray best:-3.31e+07(ep6) mean:-3.31e+07 loss(p/v):2.5/1.9 ent:2.004 nan_skip:0:   1%|▍                                                        | 8/1000 [03:28<5:18:47, 19.28s/it]ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.4/1.8 ent:2.255 nan_skip:0:   1%|▍                                                        | 8/1000 [03:28<5:18:47, 19.28s/it][36m(CpuApproximationActor pid=3396557)[0m W0723 14:38:45.654859 3396557 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3396557)[0m W0723 14:38:45.654884 3396557 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3396557)[0m W0723 14:38:45.654891 3396557 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3396557)[0m W0723 14:38:45.654899 3396557 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3396557)[0m W0723 14:38:45.654912 3396557 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3396557)[0m W0723 14:38:45.654940 3396557 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3396557)[0m W0723 14:38:45.654997 3396557 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3396557)[0m W0723 14:38:45.655098 3396557 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3396557)[0m W0723 14:38:45.655280 3396557 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3396557)[0m [cpu_approx_worker pid=3396557] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3396557)[0m [measure-actor 7] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=1 jax_devices=[CudaDevice(id=0)]
+[36m(PPOActor pid=3389302)[0m [per-face] builds=2400 applied=1164 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3396557)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3396557)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3396557)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3396557)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3396557)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3396557)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3396557)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3396557)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3396557)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3396557)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3396557)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3396557)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3396557)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3396557)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3396557)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3396557)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3396557)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3396557)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3396557)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3396557)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3396557)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3396557)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3396557)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3396557)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3396557)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3396557)[0m   warnings.warn(
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=8 ev=-0.487 adv(mean/std/absmax)=-2.274/0.057/2.378 latency_ns: mu=-4.28e+05 sig=3.72e+05 peak_memory: mu=-4.16e+08 sig=4.11e+08 frob_residual: mu=-391 sig=1.13e+03
+[36m(CpuApproximationActor pid=3395129)[0m [per-face] builds=800 applied=68 skipped=0 applied_frac=1.000[32m [repeated 2x across cluster][0m
+ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.4/1.8 ent:2.255 nan_skip:0:   1%|▌                                                        | 9/1000 [03:54<5:53:22, 21.40s/it]ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.4/1.6 ent:2.013 nan_skip:0:   1%|▌                                                        | 9/1000 [03:54<5:53:22, 21.40s/it][36m(CpuApproximationActor pid=3395129)[0m [per-face] builds=1000 applied=101 skipped=0 applied_frac=1.000[32m [repeated 3x across cluster][0m
+[36m(PPOActor pid=3389302)[0m [per-face] builds=2800 applied=1324 skipped=0 applied_frac=1.000
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=9 ev=-0.803 adv(mean/std/absmax)=-2.289/0.109/2.501 latency_ns: mu=-4.69e+05 sig=3.72e+05 peak_memory: mu=-3.76e+08 sig=4.07e+08 frob_residual: mu=-352 sig=1.07e+03
+ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.4/1.6 ent:2.013 nan_skip:0:   1%|▌                                                       | 10/1000 [04:06<5:08:20, 18.69s/it]ppo_ray best:-3.31e+07(ep6) mean:-3.31e+07 loss(p/v):2.2/1.6 ent:1.654 nan_skip:0:   1%|▌                                                       | 10/1000 [04:06<5:08:20, 18.69s/it]                                                                                                                                                                                      [ppo_ray] ep=  10/1000 best=-3.311e+07(ep6) mean=-3.315e+07 ent=1.654 buf=0 step=10
+            best-overall-traj-rewards: muls=-6e+10 flop=-1.9e+06 late=-7.9e+05 max_=-6.3e+07 byte=-3.3e+07 peak=-3.2e+07 cosi=+0.0075 frob=-1 xla_=-3.2e+07
+            per-channel-best:          late=-5.6e+04 peak=-3.2e+07 frob=-1
+            mean-per-channel:          muls=-5e+09 flop=-1.8e+06 late=-6.9e+04 max_=-4.8e+06 byte=-2.8e+06 peak=-2.7e+06 cosi=+0.012 frob=-56 xla_=-2.7e+06
+ppo_ray best:-3.31e+07(ep6) mean:-3.31e+07 loss(p/v):2.2/1.6 ent:1.654 nan_skip:0:   1%|▌                                                       | 10/1000 [04:06<5:08:20, 18.69s/it][36m(CpuApproximationActor pid=3395825)[0m [per-face] builds=600 applied=69 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3397252)[0m W0723 14:39:24.678932 3397252 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397252)[0m W0723 14:39:24.678955 3397252 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397252)[0m W0723 14:39:24.678961 3397252 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397252)[0m W0723 14:39:24.678969 3397252 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397252)[0m W0723 14:39:24.678983 3397252 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397252)[0m W0723 14:39:24.679020 3397252 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397252)[0m W0723 14:39:24.679071 3397252 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397252)[0m W0723 14:39:24.679169 3397252 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397252)[0m W0723 14:39:24.679355 3397252 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397252)[0m [cpu_approx_worker pid=3397252] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3397252)[0m [measure-actor 8] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=2 jax_devices=[CudaDevice(id=0)]
+[36m(PPOActor pid=3389302)[0m [per-face] builds=3000 applied=1434 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3397252)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3397252)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397252)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3397252)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397252)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3397252)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397252)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3397252)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397252)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3397252)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397252)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3397252)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397252)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3397252)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397252)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3397252)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397252)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3397252)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397252)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3397252)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397252)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3397252)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397252)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3397252)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397252)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3397252)[0m   warnings.warn(
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=10 ev=-1.170 adv(mean/std/absmax)=-2.276/0.023/2.331 latency_ns: mu=-5.05e+05 sig=3.7e+05 peak_memory: mu=-3.43e+08 sig=4e+08 frob_residual: mu=-319 sig=1.03e+03
+[36m(CpuApproximationActor pid=3396557)[0m [per-face] builds=400 applied=34 skipped=0 applied_frac=1.000[32m [repeated 2x across cluster][0m
+ppo_ray best:-3.31e+07(ep6) mean:-3.31e+07 loss(p/v):2.2/1.6 ent:1.654 nan_skip:0:   1%|▌                                                       | 11/1000 [04:33<5:50:51, 21.29s/it]ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.4/1.6 ent:1.941 nan_skip:0:   1%|▌                                                       | 11/1000 [04:33<5:50:51, 21.29s/it][36m(PPOActor pid=3389302)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype uint64 requested in astype is not available, and will be truncated to dtype uint32. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.
+[36m(PPOActor pid=3389302)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)
+[36m(CpuApproximationActor pid=3395825)[0m [per-face] builds=1000 applied=104 skipped=0 applied_frac=1.000[32m [repeated 3x across cluster][0m
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=11 ev=-1.538 adv(mean/std/absmax)=-2.322/0.024/2.381 latency_ns: mu=-5.35e+05 sig=3.67e+05 peak_memory: mu=-3.16e+08 sig=3.92e+08 frob_residual: mu=-291 sig=984
+ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.4/1.6 ent:1.941 nan_skip:0:   1%|▋                                                       | 12/1000 [04:46<5:04:20, 18.48s/it]ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.3/1.7 ent:1.579 nan_skip:0:   1%|▋                                                       | 12/1000 [04:46<5:04:20, 18.48s/it][36m(CpuApproximationActor pid=3397993)[0m W0723 14:40:03.563649 3397993 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397993)[0m W0723 14:40:03.563672 3397993 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397993)[0m W0723 14:40:03.563678 3397993 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397993)[0m W0723 14:40:03.563686 3397993 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397993)[0m W0723 14:40:03.563699 3397993 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397993)[0m W0723 14:40:03.563727 3397993 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397993)[0m W0723 14:40:03.563775 3397993 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397993)[0m W0723 14:40:03.563872 3397993 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397993)[0m W0723 14:40:03.564060 3397993 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3397252)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype uint64 requested in astype is not available, and will be truncated to dtype uint32. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.
+[36m(CpuApproximationActor pid=3397252)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)
+[36m(CpuApproximationActor pid=3397993)[0m [cpu_approx_worker pid=3397993] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3397993)[0m [measure-actor 9] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=3 jax_devices=[CudaDevice(id=0)]
+[36m(CpuApproximationActor pid=3396557)[0m [per-face] builds=600 applied=65 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3397993)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3397993)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397993)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3397993)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397993)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3397993)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397993)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3397993)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397993)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3397993)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397993)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3397993)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397993)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3397993)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397993)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3397993)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397993)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3397993)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397993)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3397993)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397993)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3397993)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397993)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3397993)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3397993)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3397993)[0m   warnings.warn(
+[36m(PPOActor pid=3389302)[0m [per-face] builds=3600 applied=1720 skipped=0 applied_frac=1.000[32m [repeated 4x across cluster][0m
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=12 ev=-2.008 adv(mean/std/absmax)=-2.312/0.049/2.424 latency_ns: mu=-5.59e+05 sig=3.61e+05 peak_memory: mu=-2.93e+08 sig=3.83e+08 frob_residual: mu=-267 sig=947
+ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.3/1.7 ent:1.579 nan_skip:0:   1%|▋                                                       | 13/1000 [05:11<5:40:07, 20.68s/it]ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.3/1.7 ent:1.931 nan_skip:0:   1%|▋                                                       | 13/1000 [05:11<5:40:07, 20.68s/it][36m(CpuApproximationActor pid=3397993)[0m [per-face] builds=200 applied=17 skipped=0 applied_frac=1.000
+[36m(PPOActor pid=3389302)[0m [per-face] builds=3800 applied=1834 skipped=0 applied_frac=1.000
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=13 ev=-2.439 adv(mean/std/absmax)=-2.341/0.088/2.503 latency_ns: mu=-5.81e+05 sig=3.55e+05 peak_memory: mu=-2.73e+08 sig=3.75e+08 frob_residual: mu=-247 sig=912
+[36m(CpuApproximationActor pid=3396557)[0m [per-face] builds=1000 applied=102 skipped=0 applied_frac=1.000
+ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.3/1.7 ent:1.931 nan_skip:0:   1%|▊                                                       | 14/1000 [05:23<4:56:12, 18.02s/it]ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.2/1.7 ent:2.109 nan_skip:0:   1%|▊                                                       | 14/1000 [05:23<4:56:12, 18.02s/it][36m(CpuApproximationActor pid=3398627)[0m W0723 14:40:41.561603 3398627 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3398627)[0m W0723 14:40:41.561626 3398627 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3398627)[0m W0723 14:40:41.561632 3398627 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3398627)[0m W0723 14:40:41.561640 3398627 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3398627)[0m W0723 14:40:41.561653 3398627 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3398627)[0m W0723 14:40:41.561681 3398627 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3398627)[0m W0723 14:40:41.561730 3398627 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3398627)[0m W0723 14:40:41.561827 3398627 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3398627)[0m W0723 14:40:41.562021 3398627 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3398627)[0m [cpu_approx_worker pid=3398627] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3398627)[0m [measure-actor 10] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=1 jax_devices=[CudaDevice(id=0)]
+[36m(CpuApproximationActor pid=3397252)[0m [per-face] builds=600 applied=74 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3398627)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3398627)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3398627)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3398627)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3398627)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3398627)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3398627)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3398627)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3398627)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3398627)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3398627)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3398627)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3398627)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3398627)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3398627)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3398627)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3398627)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3398627)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3398627)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3398627)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3398627)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3398627)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3398627)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3398627)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3398627)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3398627)[0m   warnings.warn(
+[36m(PPOActor pid=3389302)[0m [per-face] builds=4200 applied=2010 skipped=0 applied_frac=1.000[32m [repeated 4x across cluster][0m
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=14 ev=-2.987 adv(mean/std/absmax)=-2.363/0.035/2.452 latency_ns: mu=-5.99e+05 sig=3.48e+05 peak_memory: mu=-2.56e+08 sig=3.67e+08 frob_residual: mu=-230 sig=882
+ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.2/1.7 ent:2.109 nan_skip:0:   2%|▊                                                       | 15/1000 [05:50<5:38:16, 20.61s/it]ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.5/1.8 ent:2.428 nan_skip:0:   2%|▊                                                       | 15/1000 [05:50<5:38:16, 20.61s/it]                                                                                                                                                                                      [ppo_ray] ep=  15/1000 best=-3.311e+07(ep6) mean=-3.317e+07 ent=2.428 buf=0 step=15
+            best-overall-traj-rewards: muls=-6e+10 flop=-1.9e+06 late=-7.9e+05 max_=-6.3e+07 byte=-3.3e+07 peak=-3.2e+07 cosi=+0.0075 frob=-1 xla_=-3.2e+07
+            per-channel-best:          late=-5.6e+04 peak=-3.2e+07 frob=-1
+            mean-per-channel:          muls=-4.9e+09 flop=-1.2e+06 late=-7e+04 max_=-4e+06 byte=-2.8e+06 peak=-2.7e+06 cosi=+0.0017 frob=-1 xla_=-2.7e+06
+ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.5/1.8 ent:2.428 nan_skip:0:   2%|▊                                                       | 15/1000 [05:50<5:38:16, 20.61s/it][36m(CpuApproximationActor pid=3398627)[0m [per-face] builds=200 applied=14 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3397252)[0m [per-face] builds=1000 applied=107 skipped=0 applied_frac=1.000
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=15 ev=-3.284 adv(mean/std/absmax)=-2.434/0.125/2.622 latency_ns: mu=-6.16e+05 sig=3.43e+05 peak_memory: mu=-2.41e+08 sig=3.58e+08 frob_residual: mu=-214 sig=853
+[36m(PPOActor pid=3389302)[0m [per-face] builds=4400 applied=2114 skipped=0 applied_frac=1.000
+ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.5/1.8 ent:2.428 nan_skip:0:   2%|▉                                                       | 16/1000 [06:02<4:54:43, 17.97s/it]ppo_ray best:-3.31e+07(ep6) mean:-3.33e+07 loss(p/v):2.7/2 ent:1.662 nan_skip:0:   2%|▉                                                         | 16/1000 [06:02<4:54:43, 17.97s/it][36m(CpuApproximationActor pid=3399337)[0m W0723 14:41:19.701052 3399337 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3399337)[0m W0723 14:41:19.701073 3399337 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3399337)[0m W0723 14:41:19.701080 3399337 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3399337)[0m W0723 14:41:19.701088 3399337 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3399337)[0m W0723 14:41:19.701102 3399337 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3399337)[0m W0723 14:41:19.701130 3399337 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3399337)[0m W0723 14:41:19.701180 3399337 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3399337)[0m W0723 14:41:19.701279 3399337 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3399337)[0m W0723 14:41:19.701466 3399337 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3399337)[0m [cpu_approx_worker pid=3399337] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3399337)[0m [measure-actor 11] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=2 jax_devices=[CudaDevice(id=0)]
+[36m(CpuApproximationActor pid=3397993)[0m [per-face] builds=600 applied=72 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3399337)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3399337)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3399337)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3399337)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3399337)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3399337)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3399337)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3399337)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3399337)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3399337)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3399337)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3399337)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3399337)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3399337)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3399337)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3399337)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3399337)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3399337)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3399337)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3399337)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3399337)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3399337)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3399337)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3399337)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3399337)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3399337)[0m   warnings.warn(
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=16 ev=-1.976 adv(mean/std/absmax)=-2.854/0.749/4.216 latency_ns: mu=-6.32e+05 sig=3.37e+05 peak_memory: mu=-2.27e+08 sig=3.5e+08 frob_residual: mu=-201 sig=827
+[36m(CpuApproximationActor pid=3397993)[0m [per-face] builds=800 applied=72 skipped=0 applied_frac=1.000[32m [repeated 2x across cluster][0m
+ppo_ray best:-3.31e+07(ep6) mean:-3.33e+07 loss(p/v):2.7/2 ent:1.662 nan_skip:0:   2%|▉                                                         | 17/1000 [06:29<5:41:46, 20.86s/it]ppo_ray best:-3.31e+07(ep6) mean:-4.12e+07 loss(p/v):2.8/2.5 ent:2.257 nan_skip:0:   2%|▉                                                       | 17/1000 [06:29<5:41:46, 20.86s/it][36m(PPOActor pid=3389302)[0m [per-face] builds=5000 applied=2392 skipped=0 applied_frac=1.000[32m [repeated 5x across cluster][0m
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=17 ev=-5.079 adv(mean/std/absmax)=-2.376/0.057/2.526 latency_ns: mu=-6.43e+05 sig=3.29e+05 peak_memory: mu=-2.16e+08 sig=3.43e+08 frob_residual: mu=-189 sig=803
+ppo_ray best:-3.31e+07(ep6) mean:-4.12e+07 loss(p/v):2.8/2.5 ent:2.257 nan_skip:0:   2%|█                                                       | 18/1000 [06:42<5:00:18, 18.35s/it]ppo_ray best:-3.31e+07(ep6) mean:-3.31e+07 loss(p/v):2.4/1.8 ent:1.561 nan_skip:0:   2%|█                                                       | 18/1000 [06:42<5:00:18, 18.35s/it][36m(CpuApproximationActor pid=3400063)[0m W0723 14:42:00.006957 3400063 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400063)[0m W0723 14:42:00.006986 3400063 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400063)[0m W0723 14:42:00.007007 3400063 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400063)[0m W0723 14:42:00.007016 3400063 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400063)[0m W0723 14:42:00.007030 3400063 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400063)[0m W0723 14:42:00.007059 3400063 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400063)[0m W0723 14:42:00.007109 3400063 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400063)[0m W0723 14:42:00.007217 3400063 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400063)[0m W0723 14:42:00.007401 3400063 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400063)[0m [cpu_approx_worker pid=3400063] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3400063)[0m [measure-actor 12] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=3 jax_devices=[CudaDevice(id=0)]
+[36m(PPOActor pid=3389302)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype float64 requested in astype is not available, and will be truncated to dtype float32. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.
+[36m(PPOActor pid=3389302)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)
+[36m(CpuApproximationActor pid=3398627)[0m [per-face] builds=600 applied=67 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3400063)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3400063)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400063)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3400063)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400063)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3400063)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400063)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3400063)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400063)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3400063)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400063)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3400063)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400063)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3400063)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400063)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3400063)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400063)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3400063)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400063)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3400063)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400063)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3400063)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400063)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3400063)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400063)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3400063)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3398627)[0m [per-face] builds=800 applied=86 skipped=0 applied_frac=1.000[32m [repeated 3x across cluster][0m
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=18 ev=-4.589 adv(mean/std/absmax)=-2.546/0.132/2.872 latency_ns: mu=-6.55e+05 sig=3.24e+05 peak_memory: mu=-2.05e+08 sig=3.36e+08 frob_residual: mu=-178 sig=781
+ppo_ray best:-3.31e+07(ep6) mean:-3.31e+07 loss(p/v):2.4/1.8 ent:1.561 nan_skip:0:   2%|█                                                       | 19/1000 [07:08<5:39:03, 20.74s/it]ppo_ray best:-3.31e+07(ep6) mean:-3.33e+07 loss(p/v):2.6/2.2 ent:2.019 nan_skip:0:   2%|█                                                       | 19/1000 [07:08<5:39:03, 20.74s/it][36m(PPOActor pid=3389302)[0m [per-face] builds=5400 applied=2620 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3400063)[0m [per-face] builds=200 applied=16 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3398627)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype float64 requested in astype is not available, and will be truncated to dtype float32. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.
+[36m(CpuApproximationActor pid=3398627)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)
+[36m(PPOActor pid=3389302)[0m [per-face] builds=5600 applied=2678 skipped=0 applied_frac=1.000[32m [repeated 2x across cluster][0m
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=19 ev=-5.886 adv(mean/std/absmax)=-2.504/0.060/2.665 latency_ns: mu=-6.65e+05 sig=3.18e+05 peak_memory: mu=-1.96e+08 sig=3.29e+08 frob_residual: mu=-168 sig=760
+ppo_ray best:-3.31e+07(ep6) mean:-3.33e+07 loss(p/v):2.6/2.2 ent:2.019 nan_skip:0:   2%|█                                                       | 20/1000 [07:19<4:53:02, 17.94s/it]ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):4/2.1 ent:2.246 nan_skip:0:   2%|█▏                                                        | 20/1000 [07:19<4:53:02, 17.94s/it]                                                                                                                                                                                      [ppo_ray] ep=  20/1000 best=-3.311e+07(ep6) mean=-3.316e+07 ent=2.246 buf=0 step=20
+            best-overall-traj-rewards: muls=-6e+10 flop=-1.9e+06 late=-7.9e+05 max_=-6.3e+07 byte=-3.3e+07 peak=-3.2e+07 cosi=+0.0075 frob=-1 xla_=-3.2e+07
+            per-channel-best:          late=-5.6e+04 peak=-3.2e+07 frob=-1
+            mean-per-channel:          muls=-5e+09 flop=-1e+06 late=-7e+04 max_=-4.8e+06 byte=-2.8e+06 peak=-2.7e+06 cosi=+0.013 frob=-1 xla_=-2.7e+06
+ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):4/2.1 ent:2.246 nan_skip:0:   2%|█▏                                                        | 20/1000 [07:19<4:53:02, 17.94s/it][36m(PPOActor pid=3389302)[0m [ppo_ray][kl-stop] ep=19 approx_kl_percomp(mean)=0.1782 > target 0.15 after mb 3/4 (joint_kl mean=0.713) -- stopping remaining updates.
+[36m(CpuApproximationActor pid=3400742)[0m W0723 14:42:37.441633 3400742 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400742)[0m W0723 14:42:37.441659 3400742 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400742)[0m W0723 14:42:37.441667 3400742 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400742)[0m W0723 14:42:37.441676 3400742 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400742)[0m W0723 14:42:37.441690 3400742 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400742)[0m W0723 14:42:37.441719 3400742 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400742)[0m W0723 14:42:37.441769 3400742 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400742)[0m W0723 14:42:37.441866 3400742 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400742)[0m W0723 14:42:37.442064 3400742 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3400742)[0m [cpu_approx_worker pid=3400742] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3400742)[0m [measure-actor 13] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=1 jax_devices=[CudaDevice(id=0)]
+[36m(CpuApproximationActor pid=3399337)[0m [per-face] builds=600 applied=66 skipped=0 applied_frac=1.000
+[36m(PPOActor pid=3389302)[0m [per-face] builds=5800 applied=2792 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3400742)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3400742)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400742)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3400742)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400742)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3400742)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400742)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3400742)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400742)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3400742)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400742)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3400742)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400742)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3400742)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400742)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3400742)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400742)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3400742)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400742)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3400742)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400742)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3400742)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400742)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3400742)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400742)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3400742)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3400742)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype float64 requested in astype is not available, and will be truncated to dtype float32. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.
+[36m(CpuApproximationActor pid=3400742)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=20 ev=-5.582 adv(mean/std/absmax)=-2.644/0.046/2.781 latency_ns: mu=-6.76e+05 sig=3.13e+05 peak_memory: mu=-1.87e+08 sig=3.22e+08 frob_residual: mu=-160 sig=741
+[36m(CpuApproximationActor pid=3400063)[0m [per-face] builds=400 applied=30 skipped=0 applied_frac=1.000[32m [repeated 2x across cluster][0m
+ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):4/2.1 ent:2.246 nan_skip:0:   2%|█▏                                                        | 21/1000 [07:46<5:37:05, 20.66s/it]ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.9/2.3 ent:2.167 nan_skip:0:   2%|█▏                                                      | 21/1000 [07:46<5:37:05, 20.66s/it][36m(CpuApproximationActor pid=3400742)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype uint64 requested in astype is not available, and will be truncated to dtype uint32. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.
+[36m(CpuApproximationActor pid=3400742)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=21 ev=-5.853 adv(mean/std/absmax)=-2.697/0.071/2.895 latency_ns: mu=-6.87e+05 sig=3.08e+05 peak_memory: mu=-1.79e+08 sig=3.16e+08 frob_residual: mu=-152 sig=723
+[36m(CpuApproximationActor pid=3399337)[0m [per-face] builds=1000 applied=104 skipped=0 applied_frac=1.000[32m [repeated 3x across cluster][0m
+ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.9/2.3 ent:2.167 nan_skip:0:   2%|█▏                                                      | 22/1000 [07:59<4:57:02, 18.22s/it]ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.5/2.3 ent:1.772 nan_skip:0:   2%|█▏                                                      | 22/1000 [07:59<4:57:02, 18.22s/it][36m(CpuApproximationActor pid=3401579)[0m W0723 14:43:17.386594 3401579 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3401579)[0m W0723 14:43:17.386620 3401579 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3401579)[0m W0723 14:43:17.386627 3401579 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3401579)[0m W0723 14:43:17.386636 3401579 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3401579)[0m W0723 14:43:17.386651 3401579 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3401579)[0m W0723 14:43:17.386680 3401579 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3401579)[0m W0723 14:43:17.386729 3401579 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3401579)[0m W0723 14:43:17.386826 3401579 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3401579)[0m W0723 14:43:17.387018 3401579 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3401579)[0m [cpu_approx_worker pid=3401579] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3401579)[0m [measure-actor 14] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=2 jax_devices=[CudaDevice(id=0)]
+[36m(PPOActor pid=3389302)[0m [per-face] builds=6200 applied=2962 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3401579)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3401579)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3401579)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3401579)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3401579)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3401579)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3401579)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3401579)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3401579)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3401579)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3401579)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3401579)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3401579)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3401579)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3401579)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3401579)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3401579)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3401579)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3401579)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3401579)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3401579)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3401579)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3401579)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3401579)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3401579)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3401579)[0m   warnings.warn(
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=22 ev=-5.019 adv(mean/std/absmax)=-2.820/0.273/3.413 latency_ns: mu=-6.99e+05 sig=3.06e+05 peak_memory: mu=-1.72e+08 sig=3.09e+08 frob_residual: mu=-144 sig=706
+[36m(PPOActor pid=3389302)[0m [per-face] builds=6400 applied=3066 skipped=0 applied_frac=1.000[32m [repeated 3x across cluster][0m
+ppo_ray best:-3.31e+07(ep6) mean:-3.32e+07 loss(p/v):2.5/2.3 ent:1.772 nan_skip:0:   2%|█▎                                                      | 23/1000 [08:25<5:36:38, 20.67s/it]ppo_ray best:-3.29e+07(ep22) mean:-3.4e+07 loss(p/v):10/2.5 ent:1.542 nan_skip:0:   2%|█▎                                                       | 23/1000 [08:25<5:36:38, 20.67s/it][36m(PPOActor pid=3389302)[0m [ppo_ray][kl-stop] ep=22 approx_kl_percomp(mean)=0.3885 > target 0.15 after mb 2/4 (joint_kl mean=1.554) -- stopping remaining updates.
+[36m(CpuApproximationActor pid=3400063)[0m [per-face] builds=1000 applied=90 skipped=0 applied_frac=1.000[32m [repeated 4x across cluster][0m
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=23 ev=-7.030 adv(mean/std/absmax)=-2.796/0.313/3.478 latency_ns: mu=-7.06e+05 sig=3e+05 peak_memory: mu=-1.66e+08 sig=3.04e+08 frob_residual: mu=-139 sig=690
+ppo_ray best:-3.29e+07(ep22) mean:-3.4e+07 loss(p/v):10/2.5 ent:1.542 nan_skip:0:   2%|█▎                                                       | 24/1000 [08:38<4:55:24, 18.16s/it]ppo_ray best:-3.29e+07(ep22) mean:-3.32e+07 loss(p/v):2.7/2.2 ent:1.737 nan_skip:0:   2%|█▎                                                     | 24/1000 [08:38<4:55:24, 18.16s/it][36m(CpuApproximationActor pid=3402410)[0m W0723 14:43:55.634564 3402410 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3402410)[0m W0723 14:43:55.634589 3402410 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3402410)[0m W0723 14:43:55.634596 3402410 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3402410)[0m W0723 14:43:55.634605 3402410 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3402410)[0m W0723 14:43:55.634619 3402410 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3402410)[0m W0723 14:43:55.634648 3402410 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3402410)[0m W0723 14:43:55.634698 3402410 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3402410)[0m W0723 14:43:55.634797 3402410 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3402410)[0m W0723 14:43:55.635004 3402410 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3402410)[0m [cpu_approx_worker pid=3402410] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3402410)[0m [measure-actor 15] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=3 jax_devices=[CudaDevice(id=0)]
+[36m(CpuApproximationActor pid=3400742)[0m [per-face] builds=600 applied=72 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3402410)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3402410)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3402410)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3402410)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3402410)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3402410)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3402410)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3402410)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3402410)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3402410)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3402410)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3402410)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3402410)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3402410)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3402410)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3402410)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3402410)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3402410)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3402410)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3402410)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3402410)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3402410)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3402410)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3402410)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3402410)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3402410)[0m   warnings.warn(
+[36m(PPOActor pid=3389302)[0m [per-face] builds=7000 applied=3350 skipped=0 applied_frac=1.000[32m [repeated 4x across cluster][0m
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=24 ev=-6.430 adv(mean/std/absmax)=-2.899/0.427/3.753 latency_ns: mu=-7.12e+05 sig=2.95e+05 peak_memory: mu=-1.6e+08 sig=2.98e+08 frob_residual: mu=-138 sig=675
+ppo_ray best:-3.29e+07(ep22) mean:-3.32e+07 loss(p/v):2.7/2.2 ent:1.737 nan_skip:0:   2%|█▍                                                     | 25/1000 [09:04<5:35:49, 20.67s/it]ppo_ray best:-3.29e+07(ep22) mean:-3.32e+07 loss(p/v):3/2.3 ent:1.380 nan_skip:0:   2%|█▍                                                       | 25/1000 [09:04<5:35:49, 20.67s/it]                                                                                                                                                                                      [ppo_ray] ep=  25/1000 best=-3.29e+07(ep22) mean=-3.316e+07 ent=1.380 buf=0 step=25
+            best-overall-traj-rewards: muls=-1.1e+11 flop=-1.8e+07 late=-8.8e+05 max_=-3.5e+07 byte=-3.3e+07 peak=-3.2e+07 frob=-1 xla_=-3.2e+07
+            per-channel-best:          late=-5.6e+04 peak=-3.2e+07 frob=-1
+            mean-per-channel:          muls=-3.9e+09 flop=-1.2e+06 late=-7e+04 max_=-3.4e+06 byte=-2.8e+06 peak=-2.7e+06 cosi=+0.023 frob=-2e+02 xla_=-2.7e+06
+ppo_ray best:-3.29e+07(ep22) mean:-3.32e+07 loss(p/v):3/2.3 ent:1.380 nan_skip:0:   2%|█▍                                                       | 25/1000 [09:04<5:35:49, 20.67s/it][36m(CpuApproximationActor pid=3400742)[0m [per-face] builds=1000 applied=109 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3402410)[0m [per-face] builds=200 applied=12 skipped=0 applied_frac=1.000
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=25 ev=-10.152 adv(mean/std/absmax)=-2.693/0.133/2.974 latency_ns: mu=-7.18e+05 sig=2.9e+05 peak_memory: mu=-1.54e+08 sig=2.93e+08 frob_residual: mu=-134 sig=660
+[36m(PPOActor pid=3389302)[0m [per-face] builds=7200 applied=3438 skipped=0 applied_frac=1.000
+ppo_ray best:-3.29e+07(ep22) mean:-3.32e+07 loss(p/v):3/2.3 ent:1.380 nan_skip:0:   3%|█▍                                                       | 26/1000 [09:15<4:48:05, 17.75s/it]ppo_ray best:-3.29e+07(ep22) mean:-3.32e+07 loss(p/v):2.9/2.4 ent:2.044 nan_skip:0:   3%|█▍                                                     | 26/1000 [09:15<4:48:05, 17.75s/it][36m(PPOActor pid=3389302)[0m [ppo_ray][kl-stop] ep=25 approx_kl_percomp(mean)=0.3776 > target 0.15 after mb 3/4 (joint_kl mean=1.508) -- stopping remaining updates.
+[36m(CpuApproximationActor pid=3403107)[0m W0723 14:44:33.446909 3403107 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403107)[0m W0723 14:44:33.446933 3403107 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403107)[0m W0723 14:44:33.446941 3403107 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403107)[0m W0723 14:44:33.446950 3403107 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403107)[0m W0723 14:44:33.446964 3403107 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403107)[0m W0723 14:44:33.447003 3403107 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403107)[0m W0723 14:44:33.447054 3403107 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403107)[0m W0723 14:44:33.447155 3403107 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403107)[0m W0723 14:44:33.447342 3403107 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403107)[0m [cpu_approx_worker pid=3403107] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3403107)[0m [measure-actor 16] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=1 jax_devices=[CudaDevice(id=0)]
+[36m(CpuApproximationActor pid=3401579)[0m [per-face] builds=600 applied=68 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3403107)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3403107)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403107)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3403107)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403107)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3403107)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403107)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3403107)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403107)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3403107)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403107)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3403107)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403107)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3403107)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403107)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3403107)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403107)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3403107)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403107)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3403107)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403107)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3403107)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403107)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3403107)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403107)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3403107)[0m   warnings.warn(
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=26 ev=-6.594 adv(mean/std/absmax)=-2.886/0.292/3.534 latency_ns: mu=-7.27e+05 sig=2.87e+05 peak_memory: mu=-1.49e+08 sig=2.87e+08 frob_residual: mu=-128 sig=647
+[36m(CpuApproximationActor pid=3402410)[0m [per-face] builds=400 applied=24 skipped=0 applied_frac=1.000[32m [repeated 3x across cluster][0m
+ppo_ray best:-3.29e+07(ep22) mean:-3.32e+07 loss(p/v):2.9/2.4 ent:2.044 nan_skip:0:   3%|█▍                                                     | 27/1000 [09:42<5:32:28, 20.50s/it]ppo_ray best:-3.29e+07(ep22) mean:-3.41e+07 loss(p/v):3.2/2.6 ent:1.627 nan_skip:0:   3%|█▍                                                     | 27/1000 [09:42<5:32:28, 20.50s/it][36m(CpuApproximationActor pid=3401579)[0m [per-face] builds=1000 applied=100 skipped=0 applied_frac=1.000[32m [repeated 3x across cluster][0m
+[36m(CpuApproximationActor pid=3403107)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype float64 requested in astype is not available, and will be truncated to dtype float32. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.
+[36m(CpuApproximationActor pid=3403107)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=27 ev=-9.822 adv(mean/std/absmax)=-2.732/0.079/2.990 latency_ns: mu=-7.33e+05 sig=2.83e+05 peak_memory: mu=-1.44e+08 sig=2.82e+08 frob_residual: mu=-123 sig=634
+[36m(PPOActor pid=3389302)[0m [per-face] builds=7800 applied=3718 skipped=0 applied_frac=1.000
+ppo_ray best:-3.29e+07(ep22) mean:-3.41e+07 loss(p/v):3.2/2.6 ent:1.627 nan_skip:0:   3%|█▌                                                     | 28/1000 [09:55<4:53:45, 18.13s/it]ppo_ray best:-3.29e+07(ep22) mean:-3.33e+07 loss(p/v):2.6/2.5 ent:2.158 nan_skip:0:   3%|█▌                                                     | 28/1000 [09:55<4:53:45, 18.13s/it][36m(CpuApproximationActor pid=3403906)[0m W0723 14:45:12.673670 3403906 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403906)[0m W0723 14:45:12.673694 3403906 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403906)[0m W0723 14:45:12.673700 3403906 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403906)[0m W0723 14:45:12.673708 3403906 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403906)[0m W0723 14:45:12.673722 3403906 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403906)[0m W0723 14:45:12.673750 3403906 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403906)[0m W0723 14:45:12.673800 3403906 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403906)[0m W0723 14:45:12.673900 3403906 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403906)[0m W0723 14:45:12.674096 3403906 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3403906)[0m [cpu_approx_worker pid=3403906] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3403906)[0m [measure-actor 17] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=2 jax_devices=[CudaDevice(id=0)]
+[36m(CpuApproximationActor pid=3402410)[0m [per-face] builds=600 applied=59 skipped=0 applied_frac=1.000
+[36m(CpuApproximationActor pid=3403906)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3403906)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403906)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3403906)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403906)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3403906)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403906)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3403906)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403906)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3403906)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403906)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3403906)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403906)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3403906)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403906)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3403906)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403906)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3403906)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403906)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3403906)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403906)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3403906)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403906)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3403906)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3403906)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3403906)[0m   warnings.warn(
+[36m(PPOActor pid=3389302)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype complex128 requested in astype is not available, and will be truncated to dtype complex64. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.
+[36m(PPOActor pid=3389302)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=28 ev=-3.288 adv(mean/std/absmax)=-3.287/0.873/5.001 latency_ns: mu=-7.42e+05 sig=2.81e+05 peak_memory: mu=-1.4e+08 sig=2.78e+08 frob_residual: mu=-118 sig=622
+[36m(CpuApproximationActor pid=3402410)[0m [per-face] builds=800 applied=59 skipped=0 applied_frac=1.000[32m [repeated 3x across cluster][0m
+ppo_ray best:-3.29e+07(ep22) mean:-3.33e+07 loss(p/v):2.6/2.5 ent:2.158 nan_skip:0:   3%|█▌                                                     | 29/1000 [10:22<5:38:15, 20.90s/it]ppo_ray best:-3.29e+07(ep22) mean:-4.14e+07 loss(p/v):4.2/5 ent:1.777 nan_skip:0:   3%|█▋                                                       | 29/1000 [10:22<5:38:15, 20.90s/it][36m(CpuApproximationActor pid=3403906)[0m [per-face] builds=200 applied=18 skipped=1 applied_frac=0.947[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3402410)[0m /Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/numpy/array_methods.py:125: UserWarning: Explicitly requested dtype complex128 requested in astype is not available, and will be truncated to dtype complex64. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/jax-ml/jax#current-gotchas for more.[32m [repeated 2x across cluster][0m
+[36m(CpuApproximationActor pid=3402410)[0m   return lax_numpy.astype(self, dtype, copy=copy, device=device)[32m [repeated 2x across cluster][0m
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=29 ev=-1.338 adv(mean/std/absmax)=-3.939/2.234/8.022 latency_ns: mu=-7.49e+05 sig=2.78e+05 peak_memory: mu=-1.36e+08 sig=2.73e+08 frob_residual: mu=-114 sig=610
+[36m(CpuApproximationActor pid=3402410)[0m [per-face] builds=1000 applied=95 skipped=0 applied_frac=1.000
+ppo_ray best:-3.29e+07(ep22) mean:-4.14e+07 loss(p/v):4.2/5 ent:1.777 nan_skip:0:   3%|█▋                                                       | 30/1000 [10:35<4:58:30, 18.46s/it]ppo_ray best:-3.29e+07(ep22) mean:-4.14e+07 loss(p/v):3.6/3.7 ent:2.027 nan_skip:0:   3%|█▋                                                     | 30/1000 [10:35<4:58:30, 18.46s/it]                                                                                                                                                                                      [ppo_ray] ep=  30/1000 best=-3.29e+07(ep22) mean=-4.135e+07 ent=2.027 buf=0 step=30
+            best-overall-traj-rewards: muls=-1.1e+11 flop=-1.8e+07 late=-8.8e+05 max_=-3.5e+07 byte=-3.3e+07 peak=-3.2e+07 frob=-1 xla_=-3.2e+07
+            per-channel-best:          late=-5.6e+04 peak=-3.2e+07 frob=-1
+            mean-per-channel:          muls=-1.8e+09 flop=-1.7e+05 late=-8.4e+04 max_=-4e+06 byte=-3.4e+06 peak=-3.4e+06 cosi=+0.0046 frob=-4.8e+02 xla_=-3.4e+06
+ppo_ray best:-3.29e+07(ep22) mean:-4.14e+07 loss(p/v):3.6/3.7 ent:2.027 nan_skip:0:   3%|█▋                                                     | 30/1000 [10:35<4:58:30, 18.46s/it][36m(CpuApproximationActor pid=3404706)[0m W0723 14:45:53.100893 3404706 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3404706)[0m W0723 14:45:53.100921 3404706 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3404706)[0m W0723 14:45:53.100928 3404706 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3404706)[0m W0723 14:45:53.100937 3404706 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3404706)[0m W0723 14:45:53.100951 3404706 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3404706)[0m W0723 14:45:53.100980 3404706 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3404706)[0m W0723 14:45:53.101047 3404706 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3404706)[0m W0723 14:45:53.101145 3404706 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3404706)[0m W0723 14:45:53.101326 3404706 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3404706)[0m [cpu_approx_worker pid=3404706] env: ALPHAGRAD_EXACT_ONLY=0 ALPHAGRAD_FACE_TRANSFORMS=1 ALPHAGRAD_MEASURE_VIA_AOJ=0 ALPHAGRAD_PER_FACE_MVP=1 ALPHAGRAD_POLICY=palimpsa JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55178-pgi15-gpu9
+[36m(CpuApproximationActor pid=3404706)[0m [measure-actor 18] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES=3 jax_devices=[CudaDevice(id=0)]
+[36m(PPOActor pid=3389302)[0m [per-face] builds=8400 applied=4024 skipped=2 applied_frac=1.000
+[36m(CpuApproximationActor pid=3404706)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'jit'
+[36m(CpuApproximationActor pid=3404706)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3404706)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'compiler_options_kvs'
+[36m(CpuApproximationActor pid=3404706)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3404706)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'donated_invars'
+[36m(CpuApproximationActor pid=3404706)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3404706)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_layouts'
+[36m(CpuApproximationActor pid=3404706)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3404706)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'None'
+[36m(CpuApproximationActor pid=3404706)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3404706)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'in_shardings'
+[36m(CpuApproximationActor pid=3404706)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3404706)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'UnspecifiedValue'
+[36m(CpuApproximationActor pid=3404706)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3404706)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'inline'
+[36m(CpuApproximationActor pid=3404706)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3404706)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'keep_unused'
+[36m(CpuApproximationActor pid=3404706)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3404706)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'name'
+[36m(CpuApproximationActor pid=3404706)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3404706)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': '_where'
+[36m(CpuApproximationActor pid=3404706)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3404706)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_layouts'
+[36m(CpuApproximationActor pid=3404706)[0m   warnings.warn(
+[36m(CpuApproximationActor pid=3404706)[0m /Users/assmuth/dsnn/graphax/src/graphax/jaxpr.py:779: UserWarning: jaxpr tokenizer: uncaptured value rendered as '?': 'out_shardings'
+[36m(CpuApproximationActor pid=3404706)[0m   warnings.warn(
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=30 ev=-0.156 adv(mean/std/absmax)=-4.913/1.758/7.139 latency_ns: mu=-7.53e+05 sig=2.74e+05 peak_memory: mu=-1.32e+08 sig=2.69e+08 frob_residual: mu=-170 sig=709
+[36m(CpuApproximationActor pid=3403107)[0m [per-face] builds=800 applied=69 skipped=0 applied_frac=1.000[32m [repeated 3x across cluster][0m
+ppo_ray best:-3.29e+07(ep22) mean:-4.14e+07 loss(p/v):3.6/3.7 ent:2.027 nan_skip:0:   3%|█▋                                                     | 31/1000 [11:01<5:36:42, 20.85s/it]ppo_ray best:-3.29e+07(ep22) mean:-3.33e+07 loss(p/v):5.2/4.9 ent:2.139 nan_skip:0:   3%|█▋                                                     | 31/1000 [11:01<5:36:42, 20.85s/it][36m(PPOActor pid=3389302)[0m [per-face] builds=8800 applied=4222 skipped=2 applied_frac=1.000[32m [repeated 3x across cluster][0m
+[36m(PPOActor pid=3389302)[0m [ppo_ray][popart] ep=31 ev=-4.515 adv(mean/std/absmax)=-3.036/0.615/4.288 latency_ns: mu=-7.56e+05 sig=2.7e+05 peak_memory: mu=-1.28e+08 sig=2.64e+08 frob_residual: mu=-178 sig=703
+[36m(CpuApproximationActor pid=3403107)[0m [per-face] builds=1000 applied=102 skipped=0 applied_frac=1.000
+ppo_ray best:-3.29e+07(ep22) mean:-3.33e+07 loss(p/v):5.2/4.9 ent:2.139 nan_skip:0:   3%|█▊                                                     | 32/1000 [11:13<4:52:21, 18.12s/it]ppo_ray best:-3.29e+07(ep22) mean:-3.32e+07 loss(p/v):3.1/2.4 ent:1.989 nan_skip:0:   3%|█▊                                                     | 32/1000 [11:13<4:52:21, 18.12s/it][36m(CpuApproximationActor pid=3405401)[0m W0723 14:46:30.964741 3405401 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3405401)[0m W0723 14:46:30.964766 3405401 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3405401)[0m W0723 14:46:30.964774 3405401 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3405401)[0m W0723 14:46:30.964783 3405401 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3405401)[0m W0723 14:46:30.964797 3405401 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3405401)[0m W0723 14:46:30.964826 3405401 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3405401)[0m W0723 14:46:30.964876 3405401 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3405401)[0m W0723 14:46:30.964974 3405401 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+[36m(CpuApproximationActor pid=3405401)[0m W0723 14:46:30.965173 3405401 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+slurmstepd: error: *** JOB 55178 ON pgi15-gpu9 CANCELLED AT 2026-07-23T14:46:35 ***

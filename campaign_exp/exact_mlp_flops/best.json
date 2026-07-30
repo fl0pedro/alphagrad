@@ -1,0 +1,479 @@
+{
+  "best_overall": {
+    "return": -9064448.0,
+    "ep": 4,
+    "rewards_raw": {
+      "muls_adds_fmas": -20677918720.0,
+      "flops": -9064448.0,
+      "latency_ns": -59799.734375,
+      "max_io_sum": -18137092.0,
+      "bytes_accessed": -34202144.0,
+      "peak_memory": -443752800.0,
+      "cosine_sim": 1.0,
+      "frob_residual": -0.00034034845884889364,
+      "xla_peak_memory": -34128928.0,
+      "bkstep_acc": 0.0
+    },
+    "rewards_weighted": {
+      "muls_adds_fmas": -0.0,
+      "flops": -9064448.0,
+      "latency_ns": -0.0,
+      "max_io_sum": -0.0,
+      "bytes_accessed": -0.0,
+      "peak_memory": -0.0,
+      "cosine_sim": 0.0,
+      "frob_residual": -0.00034034845884889364,
+      "xla_peak_memory": -0.0,
+      "bkstep_acc": 0.0
+    },
+    "seq": [
+      {
+        "vertex": 4,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e8m0fnu"
+          }
+        ]
+      },
+      {
+        "vertex": 8,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e8m0fnu"
+          }
+        ]
+      },
+      {
+        "vertex": 3,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e8m0fnu"
+          }
+        ]
+      },
+      {
+        "vertex": 6,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e8m0fnu"
+          }
+        ]
+      },
+      {
+        "vertex": 7,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e8m0fnu"
+          }
+        ]
+      },
+      {
+        "vertex": 10,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e8m0fnu"
+          }
+        ]
+      },
+      {
+        "vertex": 5,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e8m0fnu"
+          }
+        ]
+      },
+      {
+        "vertex": 11,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e8m0fnu"
+          }
+        ]
+      },
+      {
+        "vertex": 12,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e8m0fnu"
+          }
+        ]
+      },
+      {
+        "vertex": 9,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e8m0fnu"
+          }
+        ]
+      },
+      {
+        "vertex": 2,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e8m0fnu"
+          }
+        ]
+      },
+      {
+        "vertex": 1,
+        "ops": [
+          {
+            "op": "Quant",
+            "dtype": "float8_e8m0fnu"
+          }
+        ]
+      }
+    ]
+  },
+  "best_per_channel": {
+    "flops": {
+      "ep": 292,
+      "env_idx": 0,
+      "raw_value": 0.0,
+      "weighted_value": 0.0,
+      "weighted_total": 0.0,
+      "all_raw": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "all_weighted": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "seq": [
+        {
+          "vertex": 7,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 3,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "complex128"
+            }
+          ]
+        },
+        {
+          "vertex": 12,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 5,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e8m0fnu"
+            }
+          ]
+        },
+        {
+          "vertex": 9,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "complex128"
+            }
+          ]
+        },
+        {
+          "vertex": 1,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 6,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 11,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 2,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 10,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 4,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 8,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        }
+      ]
+    },
+    "frob_residual": {
+      "ep": 292,
+      "env_idx": 0,
+      "raw_value": 0.0,
+      "weighted_value": 0.0,
+      "weighted_total": 0.0,
+      "all_raw": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "all_weighted": {
+        "muls_adds_fmas": 0.0,
+        "flops": 0.0,
+        "latency_ns": 0.0,
+        "max_io_sum": 0.0,
+        "bytes_accessed": 0.0,
+        "peak_memory": 0.0,
+        "cosine_sim": 0.0,
+        "frob_residual": 0.0,
+        "xla_peak_memory": 0.0,
+        "bkstep_acc": 0.0
+      },
+      "seq": [
+        {
+          "vertex": 7,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 3,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "complex128"
+            }
+          ]
+        },
+        {
+          "vertex": 12,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 5,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "float8_e8m0fnu"
+            }
+          ]
+        },
+        {
+          "vertex": 9,
+          "ops": [
+            {
+              "op": "Quant",
+              "dtype": "complex128"
+            }
+          ]
+        },
+        {
+          "vertex": 1,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 6,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 11,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 2,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 10,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 4,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        },
+        {
+          "vertex": 8,
+          "ops": [
+            {
+              "op": "Compress",
+              "axes": [
+                1
+              ],
+              "kind": "max"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "quantile_sequences": {}
+}

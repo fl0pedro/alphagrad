@@ -1,0 +1,243 @@
+{
+  "objectives": [
+    "flops",
+    "frob_residual"
+  ],
+  "hypervolume": 4325377.035704862,
+  "num_points": 3,
+  "front": [
+    {
+      "obj": {
+        "flops": -13389824.0,
+        "frob_residual": -0.00034033809788525105
+      },
+      "seq": [
+        [
+          1,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          9,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          7,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          10,
+          []
+        ],
+        [
+          12,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('abs_max', 1)"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "flops": -9064448.0,
+        "frob_residual": -0.00034034845884889364
+      },
+      "seq": [
+        [
+          4,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          6,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          7,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          10,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          5,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          11,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          12,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          9,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          2,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          1,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "flops": -9070592.0,
+        "frob_residual": -0.0003403408918529749
+      },
+      "seq": [
+        [
+          6,
+          [
+            "quant('int8')"
+          ]
+        ],
+        [
+          9,
+          [
+            "quant('float8_e5m2fnuz')"
+          ]
+        ],
+        [
+          2,
+          [
+            "diag(2, 0, 4)"
+          ]
+        ],
+        [
+          10,
+          []
+        ],
+        [
+          12,
+          [
+            "quant('float8_e4m3b11fnuz')"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('max', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "quant('int8')"
+          ]
+        ],
+        [
+          4,
+          [
+            "quant('float8_e5m2fnuz')"
+          ]
+        ],
+        [
+          7,
+          [
+            "quant('int8')"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('float8_e8m0fnu')"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('int8')"
+          ]
+        ],
+        [
+          5,
+          [
+            "diag(1, 2, 4)"
+          ]
+        ]
+      ]
+    }
+  ],
+  "dynamic_substeps": true
+}

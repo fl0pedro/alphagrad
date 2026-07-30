@@ -1,0 +1,725 @@
+{
+  "objectives": [
+    "flops",
+    "frob_residual"
+  ],
+  "hypervolume": 67890700254.32264,
+  "num_points": 10,
+  "front": [
+    {
+      "obj": {
+        "flops": -431812.0,
+        "frob_residual": -1.0000063180923462
+      },
+      "seq": [
+        [
+          1,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('float8_e3m4')"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('float8_e5m2')"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "flops": -371138.0,
+        "frob_residual": -1.0000455379486084
+      },
+      "seq": [
+        [
+          3,
+          [
+            "quant('uint16')"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('float64')"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          9,
+          [
+            "quant('float8_e5m2fnuz')"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('mean', 0)"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "flops": -434326.0,
+        "frob_residual": -1.000006079673767
+      },
+      "seq": [
+        [
+          5,
+          [
+            "compress('mean', 2)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('int2')"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('float8_e3m4')"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('mean', 0)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('mean', 0)"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "flops": -4854730.0,
+        "frob_residual": -0.9999560117721558
+      },
+      "seq": [
+        [
+          9,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('max', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('max', 0)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('max', 0)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('max', 0)"
+          ]
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          5,
+          [
+            "compress('abs_min', 0)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('max', 0)"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('float8_e4m3b11fnuz')"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('max', 0)"
+          ]
+        ],
+        [
+          12,
+          []
+        ],
+        [
+          11,
+          [
+            "compress('max', 0)"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "flops": -9261056.0,
+        "frob_residual": -0.00034034589771181345
+      },
+      "seq": [
+        [
+          9,
+          []
+        ],
+        [
+          10,
+          []
+        ],
+        [
+          12,
+          []
+        ],
+        [
+          1,
+          []
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          7,
+          []
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          2,
+          []
+        ],
+        [
+          11,
+          []
+        ],
+        [
+          6,
+          []
+        ],
+        [
+          5,
+          []
+        ],
+        [
+          4,
+          []
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "flops": -13389824.0,
+        "frob_residual": -0.00034033809788525105
+      },
+      "seq": [
+        [
+          11,
+          []
+        ],
+        [
+          9,
+          []
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          5,
+          []
+        ],
+        [
+          7,
+          []
+        ],
+        [
+          12,
+          []
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          1,
+          []
+        ],
+        [
+          4,
+          []
+        ],
+        [
+          2,
+          []
+        ],
+        [
+          6,
+          []
+        ],
+        [
+          10,
+          []
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "flops": -9064448.0,
+        "frob_residual": -0.00034034845884889364
+      },
+      "seq": [
+        [
+          10,
+          []
+        ],
+        [
+          11,
+          []
+        ],
+        [
+          1,
+          []
+        ],
+        [
+          9,
+          []
+        ],
+        [
+          6,
+          []
+        ],
+        [
+          12,
+          []
+        ],
+        [
+          5,
+          []
+        ],
+        [
+          2,
+          []
+        ],
+        [
+          7,
+          []
+        ],
+        [
+          4,
+          []
+        ],
+        [
+          3,
+          []
+        ],
+        [
+          8,
+          []
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "flops": -448401.0,
+        "frob_residual": -1.0
+      },
+      "seq": [
+        [
+          7,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('median', 1)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          4,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          3,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('int8')"
+          ]
+        ],
+        [
+          9,
+          []
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "flops": -446228.0,
+        "frob_residual": -1.0000020265579224
+      },
+      "seq": [
+        [
+          4,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          3,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          12,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          7,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          8,
+          []
+        ],
+        [
+          5,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          6,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          10,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          1,
+          [
+            "compress('median', 1)"
+          ]
+        ],
+        [
+          9,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('median', 0)"
+          ]
+        ]
+      ]
+    },
+    {
+      "obj": {
+        "flops": -6311363.0,
+        "frob_residual": -0.9990656971931458
+      },
+      "seq": [
+        [
+          1,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          5,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          10,
+          []
+        ],
+        [
+          12,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          7,
+          []
+        ],
+        [
+          6,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          8,
+          [
+            "quant('float8_e3m4')"
+          ]
+        ],
+        [
+          2,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          11,
+          [
+            "compress('median', 0)"
+          ]
+        ],
+        [
+          3,
+          [
+            "quant('float8_e3m4')"
+          ]
+        ],
+        [
+          9,
+          []
+        ],
+        [
+          4,
+          [
+            "compress('median', 0)"
+          ]
+        ]
+      ]
+    }
+  ],
+  "dynamic_substeps": true
+}

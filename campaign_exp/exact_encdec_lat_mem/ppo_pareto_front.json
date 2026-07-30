@@ -1,0 +1,11 @@
+{
+  "objectives": [
+    "latency_ns",
+    "peak_memory",
+    "frob_residual"
+  ],
+  "hypervolume": 0.0,
+  "num_points": 0,
+  "front": [],
+  "dynamic_substeps": true
+}

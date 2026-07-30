@@ -1,0 +1,10 @@
+{
+  "objectives": [
+    "flops",
+    "frob_residual"
+  ],
+  "num_candidates": 0,
+  "note": "every solution admitted to the non-dominated front at any point during training (including later-pruned ones); the full reward_vec is stored so any objective set can be re-scored offline.",
+  "candidates": [],
+  "dynamic_substeps": true
+}

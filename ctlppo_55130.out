@@ -1,0 +1,189 @@
+=== node=pgi15-gpu9.iff.kfa-juelich.de Thu Jul 23 05:16:13 AM UTC 2026 AOJ=0 ===
+2026-07-23 05:16:16,691	INFO worker.py:2012 -- Started a local Ray instance.
+/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+wandb: Loading settings from /Users/assmuth/.config/wandb/settings
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="881305c9-3b22-4e71-bb95-ba47abaa2ab1", ...)
+[36m(CpuApproximationActor pid=2767392)[0m [cpu_approx_worker pid=2767392] env: ALPHAGRAD_MEASURE_VIA_AOJ=0 JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55130-pgi15-gpu9
+[36m(CpuApproximationActor pid=2767392)[0m [measure-actor 2] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES= jax_devices=[CpuDevice(id=0)]
+[36m(PPOActor pid=2767389)[0m [ppo_ray] ADDITIVE failed/sentinel penalty = -2.0 (bounded-negative, INCLUDED in advantage+loss -- replaces the failed-row mask; failed rows are repulsive, never a zero-gradient no-op).
+[36m(PPOActor pid=2767389)[0m [ppo_ray] V2 anti-hack: failed_adv_stamp=1.0 (post-z-score advantage overwrite on failed rows), cost_symlog_cap=0.0 (symlog'd cost channels clipped to +/-cap).
+[36m(PPOActor pid=2767389)[0m [ppo_ray] PopArt value norm ON: beta=0.01 sigma_min(base=0.1, quality[6,9]=0.2) sigma_max=1e+12 robust_std=True (winsor k=5.0) — replaces the rollout advantage z-score; under pure-PopArt advantage a failed row is truly-neutral (A==0), no constant stamp.
+[36m(PPOActor pid=2767389)[0m [ppo_ray] DYNAMIC SENTINEL ON: failed/sentinel terminals get per-channel mu_c - 2.0*sigma_c (EMA beta=0.01) instead of -1e10. The additive failed_penalty stamp AND the post-z-score failed_adv_stamp are DISABLED (dynamic value supersedes them); failed_transitions logging + PopArt exclusion unchanged.
+[36m(PPOActor pid=2767389)[0m [ppo_ray] RAW COSSIM THREAD ON: env emits full-range cosine_sim in idx6; worker applies guide cap=None into the GAE buffer only, logs reward/cosine_sim_raw from the uncapped value.
+[36m(PPOActor pid=2767389)[0m [ppo_ray_worker] MicroPPOAgent implies --dynamic-substeps; forcing it on.
+[36m(PPOActor pid=2767389)[0m [ppo_ray_worker] POLICY V2 ACTIVE: MicroPPOAgent = TRANSFORMER backbone + PointerVertexPolicy + MicroActionPolicy(max_substeps=16) + separate value pool; factor tables up to axis size 64 (observed max 4).
+[36m(PPOActor pid=2767389)[0m [ppo_ray_worker] V2 policy heads scaled by 0.1 (near-uniform initial policy).
+[36m(CpuApproximationActor pid=2767393)[0m [cpu_approx_worker pid=2767393] env: ALPHAGRAD_MEASURE_VIA_AOJ=0 JAX_COMPILATION_CACHE_DIR=/tmp/dsnn-jax-cache-55130-pgi15-gpu9[32m [repeated 3x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+[36m(CpuApproximationActor pid=2767393)[0m [measure-actor 3] host=pgi15-gpu9.iff.kfa-juelich.de CUDA_VISIBLE_DEVICES= jax_devices=[CpuDevice(id=0)][32m [repeated 3x across cluster][0m
+[36m(PPOActor pid=2767389)[0m jax.io_callback failed
+[36m(PPOActor pid=2767389)[0m Traceback (most recent call last):
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/callback.py", line 436, in io_callback_impl
+[36m(PPOActor pid=2767389)[0m     return tree_util.tree_map(np.asarray, callback(*args))
+[36m(PPOActor pid=2767389)[0m                                           ~~~~~~~~^^^^^^^
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/callback.py", line 70, in __call__
+[36m(PPOActor pid=2767389)[0m     return tree_util.tree_leaves(self.callback_func(*args, **kwargs))
+[36m(PPOActor pid=2767389)[0m                                  ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 2700, in _callback
+[36m(PPOActor pid=2767389)[0m     ve = extract_jaxpr(
+[36m(PPOActor pid=2767389)[0m         config.jaxpr,
+[36m(PPOActor pid=2767389)[0m     ...<5 lines>...
+[36m(PPOActor pid=2767389)[0m         transforms=transforms,
+[36m(PPOActor pid=2767389)[0m     )
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/graphax/src/graphax/core.py", line 2764, in extract_jaxpr
+[36m(PPOActor pid=2767389)[0m     closed = jax.make_jaxpr(eval_graph)(*dummy_args)
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/traceback_util.py", line 196, in reraise_with_filtered_traceback
+[36m(PPOActor pid=2767389)[0m     return fun(*args, **kwargs)
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/api.py", line 2028, in make_jaxpr_f
+[36m(PPOActor pid=2767389)[0m     traced = jit(fun, static_argnums=static_argnums).trace(*args, **kwargs)
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/traceback_util.py", line 196, in reraise_with_filtered_traceback
+[36m(PPOActor pid=2767389)[0m     return fun(*args, **kwargs)
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 292, in jit_trace
+[36m(PPOActor pid=2767389)[0m     p, args_flat = _infer_params(jit_func._fun, jit_func._jit_info, args, kwargs)
+[36m(PPOActor pid=2767389)[0m                    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 620, in _infer_params
+[36m(PPOActor pid=2767389)[0m     p = _trace_for_jit(fun, ji, ctx_mesh, dbg_fn(), avals, args, kwargs)
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 522, in _trace_for_jit
+[36m(PPOActor pid=2767389)[0m     jaxpr, out_avals = pe.trace_to_jaxpr(fun, in_type, dbg, qdd_token)
+[36m(PPOActor pid=2767389)[0m                        ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/partial_eval.py", line 2295, in trace_to_jaxpr
+[36m(PPOActor pid=2767389)[0m     ans_pytree = fun(*args, **kwargs)
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/graphax/src/graphax/core.py", line 2727, in eval_graph
+[36m(PPOActor pid=2767389)[0m     res = vertex_elimination_jaxpr(
+[36m(PPOActor pid=2767389)[0m         jaxpr,
+[36m(PPOActor pid=2767389)[0m     ...<5 lines>...
+[36m(PPOActor pid=2767389)[0m         transforms=_transforms,
+[36m(PPOActor pid=2767389)[0m     )
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/graphax/src/graphax/core.py", line 2553, in vertex_elimination_jaxpr
+[36m(PPOActor pid=2767389)[0m     raise ValueError(
+[36m(PPOActor pid=2767389)[0m     ...<8 lines>...
+[36m(PPOActor pid=2767389)[0m     )
+[36m(PPOActor pid=2767389)[0m ValueError: jacve: the elimination order left 5 intermediate vertex/vertices with live edges un-eliminated — the dense Jacobian would silently drop every path through them (this typically means the numeric order was built from the non-inlined jaxpr; jacve inlines jit/pjit/custom_jvp bodies, which adds equations). Pass a full order or set GRAPHAX_ALLOW_PARTIAL_ORDER=1 to accept a partial Jacobian.
+  actors spawned + JIT-warm in 22.6s
+ppo_ray:   0%|                                                                                                                                                | 0/3 [00:00<?, ?it/s][36m(PPOActor pid=2767389)[0m jax.io_callback failed
+[36m(PPOActor pid=2767389)[0m Traceback (most recent call last):
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/callback.py", line 436, in io_callback_impl
+[36m(PPOActor pid=2767389)[0m     return tree_util.tree_map(np.asarray, callback(*args))
+[36m(PPOActor pid=2767389)[0m                                           ~~~~~~~~^^^^^^^
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/callback.py", line 70, in __call__
+[36m(PPOActor pid=2767389)[0m     return tree_util.tree_leaves(self.callback_func(*args, **kwargs))
+[36m(PPOActor pid=2767389)[0m                                  ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 2700, in _callback
+[36m(PPOActor pid=2767389)[0m     ve = extract_jaxpr(
+[36m(PPOActor pid=2767389)[0m         config.jaxpr,
+[36m(PPOActor pid=2767389)[0m     ...<5 lines>...
+[36m(PPOActor pid=2767389)[0m         transforms=transforms,
+[36m(PPOActor pid=2767389)[0m     )
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/graphax/src/graphax/core.py", line 2764, in extract_jaxpr
+[36m(PPOActor pid=2767389)[0m     closed = jax.make_jaxpr(eval_graph)(*dummy_args)
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/traceback_util.py", line 196, in reraise_with_filtered_traceback
+[36m(PPOActor pid=2767389)[0m     return fun(*args, **kwargs)
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/api.py", line 2028, in make_jaxpr_f
+[36m(PPOActor pid=2767389)[0m     traced = jit(fun, static_argnums=static_argnums).trace(*args, **kwargs)
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/traceback_util.py", line 196, in reraise_with_filtered_traceback
+[36m(PPOActor pid=2767389)[0m     return fun(*args, **kwargs)
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 292, in jit_trace
+[36m(PPOActor pid=2767389)[0m     p, args_flat = _infer_params(jit_func._fun, jit_func._jit_info, args, kwargs)
+[36m(PPOActor pid=2767389)[0m                    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 620, in _infer_params
+[36m(PPOActor pid=2767389)[0m     p = _trace_for_jit(fun, ji, ctx_mesh, dbg_fn(), avals, args, kwargs)
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 522, in _trace_for_jit
+[36m(PPOActor pid=2767389)[0m     jaxpr, out_avals = pe.trace_to_jaxpr(fun, in_type, dbg, qdd_token)
+[36m(PPOActor pid=2767389)[0m                        ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/partial_eval.py", line 2295, in trace_to_jaxpr
+[36m(PPOActor pid=2767389)[0m     ans_pytree = fun(*args, **kwargs)
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/graphax/src/graphax/core.py", line 2727, in eval_graph
+[36m(PPOActor pid=2767389)[0m     res = vertex_elimination_jaxpr(
+[36m(PPOActor pid=2767389)[0m         jaxpr,
+[36m(PPOActor pid=2767389)[0m     ...<5 lines>...
+[36m(PPOActor pid=2767389)[0m         transforms=_transforms,
+[36m(PPOActor pid=2767389)[0m     )
+[36m(PPOActor pid=2767389)[0m   File "/Users/assmuth/dsnn/graphax/src/graphax/core.py", line 2553, in vertex_elimination_jaxpr
+[36m(PPOActor pid=2767389)[0m     raise ValueError(
+[36m(PPOActor pid=2767389)[0m     ...<8 lines>...
+[36m(PPOActor pid=2767389)[0m     )
+[36m(PPOActor pid=2767389)[0m ValueError: jacve: the elimination order left 5 intermediate vertex/vertices with live edges un-eliminated — the dense Jacobian would silently drop every path through them (this typically means the numeric order was built from the non-inlined jaxpr; jacve inlines jit/pjit/custom_jvp bodies, which adds equations). Pass a full order or set GRAPHAX_ALLOW_PARTIAL_ORDER=1 to accept a partial Jacobian.
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/run.py", line 159, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/run.py", line 153, in main
+    return int(getattr(module, algo.entry)())
+               ~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 770, in main
+    rc = _run(args)
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray.py", line 561, in _run
+    stats = ray.get(actor.run_rollout_and_train.remote(seed_counter))
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    return fn(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/client_mode_hook.py", line 107, in wrapper
+    return func(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 2980, in get
+    values, debugger_breakpoint = worker.get_objects(
+                                  ~~~~~~~~~~~~~~~~~~^
+        object_refs, timeout, use_object_store=_use_object_store
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/ray/_private/worker.py", line 1023, in get_objects
+    raise value.as_instanceof_cause()
+ray.exceptions.RayTaskError(JaxRuntimeError): [36mray::PPOActor.run_rollout_and_train()[39m (pid=2767389, ip=192.168.15.9, actor_id=25b9fefca3ee5a9f69c2e7fb01000000, repr=<alphagrad.approx.ppo_ray_actors.PPOActor object at 0x7da2067bd550>)
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_actors.py", line 71, in run_rollout_and_train
+    return self._impl.run_rollout_and_train(int(rng_seed))
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_worker.py", line 2037, in run_rollout_and_train
+    pre_tokens = np.asarray(state.tokens)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/array.py", line 414, in __array__
+    return np.asarray(self._value, dtype=dtype, **kwds)  # pyrefly: ignore[no-matching-overload]
+                      ^^^^^^^^^^^
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/profiler.py", line 384, in wrapper
+    return func(*args, **kwargs)
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/array.py", line 614, in _value
+    npy_value, did_copy = self._single_device_array_to_np_array_did_copy()
+                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+jax.errors.JaxRuntimeError: INTERNAL: CpuCallback error calling callback: Traceback (most recent call last):
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_actors.py", line 71, in run_rollout_and_train
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_worker.py", line 1967, in run_rollout_and_train
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/traceback_util.py", line 196, in reraise_with_filtered_traceback
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/api.py", line 1214, in vmap_f
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/linear_util.py", line 212, in call_wrapped
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/batching.py", line 343, in _batch_outer
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/batching.py", line 362, in _batch_inner
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/batching.py", line 120, in flatten_fun_for_vmap
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/ppo_ray_worker.py", line 1967, in <lambda>
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 4190, in reset
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/callback.py", line 577, in io_callback
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/core.py", line 669, in bind
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/core.py", line 677, in bind_with_trace
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/batching.py", line 266, in process_primitive
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/batching.py", line 604, in wrapped
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/core.py", line 669, in bind
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/core.py", line 677, in bind_with_trace
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/core.py", line 1249, in process_primitive
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/dispatch.py", line 90, in apply_primitive
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/traceback_util.py", line 196, in reraise_with_filtered_traceback
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 252, in cache_miss
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 137, in _run_python_pjit
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 1177, in _pjit_call_impl_python
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/profiler.py", line 384, in wrapper
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/pxla.py", line 381, in __call__
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/callback.py", line 814, in _wrapped_callback
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/callback.py", line 493, in _callback
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/callback.py", line 439, in io_callback_impl
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/callback.py", line 70, in __call__
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/env.py", line 2700, in _callback
+  File "/Users/assmuth/dsnn/graphax/src/graphax/core.py", line 2775, in extract_jaxpr
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/traceback_util.py", line 200, in reraise_with_filtered_traceback
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/api.py", line 2028, in make_jaxpr_f
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/traceback_util.py", line 200, in reraise_with_filtered_traceback
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 292, in jit_trace
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 620, in _infer_params
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/pjit.py", line 522, in _trace_for_jit
+  File "/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jax/_src/interpreters/partial_eval.py", line 2295, in trace_to_jaxpr
+  File "/Users/assmuth/dsnn/graphax/src/graphax/core.py", line 2727, in eval_graph
+  File "/Users/assmuth/dsnn/graphax/src/graphax/core.py", line 2553, in vertex_elimination_jaxpr
+ValueError: jacve: the elimination order left 5 intermediate vertex/vertices with live edges un-eliminated — the dense Jacobian would silently drop every path through them (this typically means the numeric order was built from the non-inlined jaxpr; jacve inlines jit/pjit/custom_jvp bodies, which adds equations). Pass a full order or set GRAPHAX_ALLOW_PARTIAL_ORDER=1 to accept a partial Jacobian. [executable_name='jit_broadcast_in_dim']
+ppo_ray:   0%|                                                                                                                                                | 0/3 [00:02<?, ?it/s]
+=== RC=1 Thu Jul 23 05:16:38 AM UTC 2026 ===

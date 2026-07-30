@@ -1,0 +1,28 @@
+/Users/assmuth/dsnn/.venv/lib/python3.13/site-packages/jaxlib/plugin_support.py:92: RuntimeWarning: JAX plugin jax_cuda12_plugin version 0.10.1.dev0+selfbuilt is installed, but it is not compatible with the installed jaxlib version 0.11.0, so it will not be used.
+  warnings.warn(
+[train_lean] {'commit/alphagrad': '522a757', 'commit/graphax': 'eb6ad3e', 'commit/dsnn': '4cf29af'}
+wandb: Loading settings from /Users/assmuth/.config/wandb/settings
+wandb: Tracking run with wandb version 0.25.0
+wandb: W&B syncing is set to `offline` in this directory. Run `wandb online` or set WANDB_MODE=online to enable cloud syncing.
+wandb: Run data is saved locally in /Users/assmuth/dsnn/alphagrad/wandb/offline-run-20260724_105240-e39aavcz
+W0724 10:52:42.003253 3901125 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 15:53 (N = 1): text format contains deprecated field "split_k"
+W0724 10:52:42.003271 3901125 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:53 (N = 2): text format contains deprecated field "split_k"
+W0724 10:52:42.003278 3901125 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 18:53 (N = 4): text format contains deprecated field "split_k"
+W0724 10:52:42.003285 3901125 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 22:53 (N = 8): text format contains deprecated field "split_k"
+W0724 10:52:42.003297 3901125 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 30:53 (N = 16): text format contains deprecated field "split_k"
+W0724 10:52:42.003323 3901125 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 16:52 (N = 32): text format contains deprecated field "split_k"
+W0724 10:52:42.003366 3901125 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 48:53 (N = 64): text format contains deprecated field "split_k"
+W0724 10:52:42.003459 3901125 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 78:53 (N = 128): text format contains deprecated field "split_k"
+W0724 10:52:42.003619 3901125 text_format.cc:393] Warning parsing text-format xla.TritonGemmConfigsProto: 36:55 (N = 256): text format contains deprecated field "split_k"
+Traceback (most recent call last):
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/train_lean.py", line 123, in <module>
+    main()
+    ~~~~^^
+  File "/Users/assmuth/dsnn/alphagrad/src/alphagrad/approx/train_lean.py", line 108, in main
+    agent = build_policy(max_substeps=1, policy="palimpsa")
+TypeError: build_policy() missing 8 required keyword-only arguments: 'vocab_size', 'embd_dim', 'num_layers', 'num_heads', 'hidden_dim', 'num_vertices', 'value_dims', and 'key'
+[1;34mwandb[0m: 
+[1;34mwandb[0m: You can sync this run to the cloud by running:
+[1;34mwandb[0m: [1mwandb sync /Users/assmuth/dsnn/alphagrad/wandb/offline-run-20260724_105240-e39aavcz[0m
+[1;34mwandb[0m: Find logs at: [1;35mwandb/offline-run-20260724_105240-e39aavcz/logs[0m
+=== RC=1 ===
