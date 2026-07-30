@@ -1766,6 +1766,14 @@ def make_argparser() -> argparse.ArgumentParser:
         "stationary across the whole run).",
     )
     p.add_argument(
+        "--lean-logging", action="store_true",
+        help="Log only aggregates (means, entropy, KL, collapse counts, "
+             "losses). Drops per-channel best/median/worst + all-time stats, "
+             "the three per-episode Pareto scatter tables, and the "
+             "elimination-order table. The all-time block also grew a python "
+             "list by one entry per episode per channel and re-medianed it "
+             "every episode, so its cost rises with episode count.")
+    p.add_argument(
         "--unified-head", action="store_true",
         help="Replace the autoregressive approximation sub-episode with ONE "
              "64-output head per vertex (skip / op / i / j / prime-exponent "
@@ -5161,8 +5169,9 @@ def main():
         # "higher is better" (costs negated), so best = max, worst = min.
         elig_rets = all_rets[eligible] if eligible.any() else all_rets[:0]
         alltime = host_state.setdefault("channel_alltime", {})
+        _lean = bool(getattr(args, "lean_logging", False))
         for j, name in enumerate(REWARD_NAMES):
-            if elig_rets.shape[0] == 0:
+            if elig_rets.shape[0] == 0 or _lean:
                 continue
             col = elig_rets[:, j].astype(np.float64)
             b, w = float(col.max()), float(col.min())
@@ -5300,6 +5309,8 @@ def main():
                     # current one: stamping `ep` on every row made the whole
                     # front look re-measured every episode.
                     _peps = getattr(pareto_archive, "eps", None) or []
+                    if _lean:
+                        continue
                     tbl = wandb.Table(columns=["x", "y", "episode"])
                     for _i, row in enumerate(fx):
                         _e = int(_peps[_i]) if _i < len(_peps) else int(ep)
