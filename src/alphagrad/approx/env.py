@@ -1975,13 +1975,14 @@ def _callback(
     # If no `target_fun` is supplied, we can't compile/execute. Skip every
     # execution-derived metric and return a partial reward vector.
     if config.target_fun is None:
-        rewards = jnp.array(
-            [
-                -muls_adds_fmas, 0.0, 0.0, -max_io_sum,
-                0.0, 0.0, 1.0, 0.0,
-            ],
-            dtype=jnp.float32,
-        )
+        # cosine_sim stays 0.0, NOT 1.0. Without a target function nothing is
+        # compiled or executed, so there is no fidelity measurement to report;
+        # 1.0 handed a plan that computed nothing a PERFECT score on the only
+        # quality channel. (tests/test_all_cost_channels.py has asserted this
+        # since 2026-05-24; the constant below had drifted back to 1.0.)
+        rewards = jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
+        rewards = rewards.at[REWARD_INDEX["muls_adds_fmas"]].set(-muls_adds_fmas)
+        rewards = rewards.at[REWARD_INDEX["max_io_sum"]].set(-max_io_sum)
         return tokens, eqn_ids, rewards
 
     # ------------------------------------------------------------------

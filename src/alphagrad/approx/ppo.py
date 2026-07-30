@@ -173,6 +173,10 @@ HEAD_NAMES: tuple[str, ...] = ("latency", "mem", "cos")
 # default because it forces a host callback inside the jitted update.
 _DEBUG_NAN = os.environ.get("ALPHAGRAD_DEBUG_NAN", "0") == "1"
 
+# Per-step vertex-pick trace (see the jax.debug.print below). Off by default:
+# it forces a host callback inside the jitted rollout scan.
+_DEBUG_ORDER = os.environ.get("ALPHAGRAD_DEBUG_ORDER", "0") == "1"
+
 # PopArt decodes the value head itself (value * sigma + mu), so GAE must
 # NOT symexp on top of that. See the call site for why this only bites on
 # the second update.
@@ -1263,6 +1267,16 @@ class Agent(eqx.Module):
         vertex_logits, vertex_contexts = self.vertex_policy.from_vertex_memory(
             vmem_rows, vmask
         )
+        if _DEBUG_ORDER:
+            jax.debug.print(
+                "[vmem] occupied={o}/{n} total_tokens={t} global_slot={g} "
+                "logit_max={lm}",
+                o=jnp.sum(vmask.astype(jnp.int32)),
+                n=vmem_counts.shape[0],
+                t=jnp.sum(vmem_counts),
+                g=vmem_counts[-1],
+                lm=jnp.max(vertex_logits),
+            )
         if vertex_features is not None:
             vertex_contexts = vertex_contexts + self._data_embedding(vertex_features)
         if residual_state is not None:
@@ -1329,11 +1343,26 @@ class Agent(eqx.Module):
                 key=net_key,
             )
 
-        masked_v_logits = jnp.where(vertex_avail_mask > 0.5, vertex_logits, -1e9)
+        masked_v_logits = _mask_vertex_logits(vertex_logits, vertex_avail_mask)
         if vertex_temperature is not None:
             masked_v_logits = masked_v_logits / vertex_temperature
         vertex_dist = jnn.softmax(masked_v_logits, axis=-1)
         vertex_idx = distrax.Categorical(probs=vertex_dist).sample(seed=vertex_key)
+        if _DEBUG_ORDER:
+            _legal = vertex_avail_mask > 0.5
+            jax.debug.print(
+                "[pick] idx={v} p_pick={p} avail={a} psum={ps} "
+                "pmass_illegal={pi} log_max={mx} log_minlegal={mn} "
+                "nonfinite={nf}",
+                v=vertex_idx,
+                p=vertex_dist[vertex_idx],
+                a=vertex_avail_mask[vertex_idx],
+                ps=jnp.sum(vertex_dist),
+                pi=jnp.sum(jnp.where(_legal, 0.0, vertex_dist)),
+                mx=jnp.max(masked_v_logits),
+                mn=jnp.min(jnp.where(_legal, masked_v_logits, jnp.inf)),
+                nf=jnp.sum((~jnp.isfinite(vertex_logits)).astype(jnp.int32)),
+            )
 
         v_context = vertex_contexts[vertex_idx]
         features = _axis_features_from_state(
@@ -1482,7 +1511,7 @@ class Agent(eqx.Module):
                 key=key,
             )
 
-        masked_v_logits = jnp.where(vertex_avail_mask > 0.5, vertex_logits, -1e9)
+        masked_v_logits = _mask_vertex_logits(vertex_logits, vertex_avail_mask)
         vertex_dist = jnn.softmax(masked_v_logits, axis=-1)
         log_p_vertex = jnp.log(vertex_dist[vertex_idx] + 1e-8)
         vertex_ent = entropy(vertex_dist)
@@ -2614,6 +2643,29 @@ def _scale_output_heads(agent, scale: float):
     return agent
 
 
+def _mask_vertex_logits(vertex_logits, vertex_avail_mask):
+    """Availability mask that holds for ANY finite logits.
+
+    `-inf` rather than `-1e9`: an absolute sentinel is only a mask while the
+    legal logits sit above it, and the set pointer emits exactly -1e9 for its
+    own unoccupied slots. Two sentinels of equal magnitude make the vector
+    constant, and softmax(constant) is UNIFORM -- the mask silently inverts
+    into "sample anything". With -inf the illegal entries are exactly 0 after
+    softmax no matter what the legal ones are.
+
+    If nothing is legal, fall back to a flat vector over everything: a
+    softmax of all -inf is NaN, which would propagate into the sampler and
+    the log-prob rather than failing loudly.
+    """
+    legal = vertex_avail_mask > 0.5
+    any_legal = jnp.any(legal)
+    return jnp.where(
+        any_legal,
+        jnp.where(legal, vertex_logits, -jnp.inf),
+        jnp.zeros_like(vertex_logits),
+    )
+
+
 def _action_to_pylist_dynamic(
     vertex_seq,
     op_seq,
@@ -3720,6 +3772,19 @@ def main():
                     face_comp_v = jnp.zeros(
                         (ENV_MAX_FACES, MAX_AXES_PER_VERTEX), jnp.float32)
                     face_valid_v = jnp.zeros((ENV_MAX_FACES,), jnp.float32)
+                if _DEBUG_ORDER:
+                    # avail = how many vertices are still selectable; picked =
+                    # the 0-based index chosen; was_avail = 1.0 iff that pick
+                    # was legal. was_avail == 0 is the duplicate-pick bug.
+                    jax.debug.print(
+                        "[order] step={s} n_avail={a} pick={v} was_avail={w} "
+                        "order={o}",
+                        s=state.step_count,
+                        a=jnp.sum(vertex_avail_mask),
+                        v=vertex_idx,
+                        w=vertex_avail_mask[vertex_idx],
+                        o=state.order,
+                    )
                 env_action = agent.to_env_action_dynamic(
                     vertex_idx,
                     micro_actions,
