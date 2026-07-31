@@ -2758,6 +2758,40 @@ class VertexEliminationEnv:
         # bound args) and re-packages ``eval_samples`` as a tuple.
         pool = self._remote_pool
 
+        if batched:
+            def _remote_callback_batched(args, consts, order, specs,
+                                         face_specs, face_skips, step,
+                                         *eval_samples):
+                # Face actions must never reach this path -- it cannot carry
+                # them, and silently dropping them would measure a plan the
+                # policy did not choose. ppo.py refuses the combination up
+                # front; this is the backstop.
+                _fs = np.asarray(face_specs)
+                _sk = np.asarray(face_skips)
+                if _fs.size and (_fs[..., 0] >= 0).any() or (_sk == 1).any():
+                    raise RuntimeError(
+                        "Ray measurement pool cannot carry face actions "
+                        "(face_specs/face_skips are dropped by the pool's "
+                        "per-vertex env). Run without --face-actions."
+                    )
+                _o = np.asarray(order)
+                E = int(_o.shape[0])
+                _sp = np.asarray(specs)
+                _st = np.asarray(step).reshape(-1)
+                _ev = (tuple(_cb_slot(x, 0, E) for x in eval_samples)
+                       if eval_samples else None)
+                tokens, eqn_ids, rewards, _sent = pool.evaluate_batch(
+                    [_o[i] for i in range(E)],
+                    [_sp[i] for i in range(E)],
+                    [int(_st[i] if _st.size > 1 else _st[0]) for i in range(E)],
+                    eval_samples=_ev,
+                    init=init,
+                )
+                return (np.asarray(tokens), np.asarray(eqn_ids),
+                        np.asarray(rewards))
+
+            return _remote_callback_batched
+
         def _remote_callback(args, consts, order, specs, face_specs,
                              face_skips, step, *eval_samples):
             # The Ray pool path predates face actions (DEPRECATED line) —

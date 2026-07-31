@@ -1906,6 +1906,20 @@ def make_argparser() -> argparse.ArgumentParser:
              "out. Exposed through MicroActionPolicy's contract, so the env "
              "and loss are unchanged.")
     p.add_argument(
+        "--ray-measure", type=int, default=0, metavar="N",
+        help="Fan the env measurement callback out over N Ray actors "
+             "(0 = off, in-process serial). Requires "
+             "ALPHAGRAD_BATCHED_CALLBACK=1. With --exec-on-gpu each actor is "
+             "pinned to its OWN gpu (num_gpus=1) so no two TIMED executions "
+             "ever share a device -- co-residency measured CV 0.0000% -> "
+             "49.7%. Ray rather than threads because the per-measure XLA "
+             "executable leak is only freed by process teardown. Incompatible "
+             "with --face-actions (the pool's env is per-vertex and would "
+             "silently drop the per-face decisions).")
+    p.add_argument(
+        "--ray-measure-timeout", type=float, default=600.0,
+        help="Per-call timeout for a --ray-measure actor, seconds.")
+    p.add_argument(
         "--no-approx-head", action="store_true",
         help="REMOVE the approximation heads instead of masking them. "
              "--variant ve_only only multiplies the op categorical by "
@@ -3255,6 +3269,59 @@ def main():
         measure_grad=bool(args.measure_grad),
         terminal_rewards_only=args.terminal_rewards_only,
     )
+
+    # ---- --ray-measure: fan the measurement callback out over Ray actors ----
+    if int(getattr(args, "ray_measure", 0) or 0) > 0:
+        _n_actors = int(args.ray_measure)
+        if getattr(args, "face_actions", False):
+            raise ValueError(
+                "--ray-measure is incompatible with --face-actions: the "
+                "measurement pool's env is per-vertex and DROPS "
+                "face_specs/face_skips, so it would measure a different plan "
+                "than the policy chose."
+            )
+        if os.environ.get("ALPHAGRAD_BATCHED_CALLBACK", "0") != "1":
+            raise ValueError(
+                "--ray-measure needs ALPHAGRAD_BATCHED_CALLBACK=1; without it "
+                "the callback is invoked once per env and the pool would add "
+                "Ray IPC with no parallelism."
+            )
+        import ray as _ray
+        from alphagrad.approx.cpu_approx_actors import CpuApproximationActor
+        from alphagrad.approx.cpu_approx_pool import CpuApproxPool
+
+        if not _ray.is_initialized():
+            _ray.init(ignore_reinit_error=True, include_dashboard=False)
+        # One actor per MEASUREMENT device. Under --exec-on-gpu that is
+        # num_gpus=1 each, so Ray hands every actor a disjoint
+        # CUDA_VISIBLE_DEVICES and the timed execs cannot collide.
+        _opts = {"num_gpus": 1} if getattr(args, "exec_on_gpu", False) else {}
+        _args_dict = vars(args)
+        _next_id = [0]
+
+        def _spawn():
+            _next_id[0] += 1
+            return CpuApproximationActor.options(**_opts).remote(
+                _args_dict, variant=None, actor_id=_next_id[0],
+            )
+
+        _actors = [_spawn() for _ in range(_n_actors)]
+        _pool = CpuApproxPool(
+            _actors,
+            timeout_s=float(args.ray_measure_timeout),
+            initial_timeout_s=float(args.ray_measure_timeout) * 4.0,
+            warm_after=3,
+            respawn_factory=_spawn,
+            max_tokens=int(MAX_TOKENS),
+            num_rewards=int(NUM_REWARDS),
+            cosine_sim_idx=int(REWARD_INDEX["cosine_sim"]),
+            frob_residual_idx=int(REWARD_INDEX["frob_residual"]),
+        )
+        object.__setattr__(env, "_remote_pool", _pool)
+        object.__setattr__(env, "_remote_timeout_s",
+                           float(args.ray_measure_timeout))
+        print(f"[ray-measure] {_n_actors} actors, opts={_opts}, "
+              f"timeout={args.ray_measure_timeout}s", flush=True)
 
     # DIAG per-face masking. The dynamic policy's DIAG head must be masked by the
     # LIVE per-vertex pair / compress validity — the nominal tag-bit mask admits
