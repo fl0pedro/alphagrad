@@ -573,10 +573,23 @@ class LiveVertexMaskOracle:
         set_approx_active(bool(approx))
         try:
             with _jcore.set_current_trace(incr.trace):
-                _eliminate_vertex(
-                    int(vertex), incr.jaxpr, graph, tgraph, incr.vo, False,
-                    transforms=(_record,), face_transforms=None,
-                )
+                try:
+                    _eliminate_vertex(
+                        int(vertex), incr.jaxpr, graph, tgraph, incr.vo, False,
+                        transforms=(_record,), face_transforms=None,
+                    )
+                except Exception as exc:
+                    # graphax cannot trace this elimination (observed on the
+                    # xent graph: an add of a tensor and its own transpose,
+                    # (16,10,784,256) vs (16,10,256,784), from the open
+                    # canonical-output-order gap in _normalize_inputs).
+                    # A vertex that cannot be eliminated has no LEGAL
+                    # approximation, so return the faces seen so far and let
+                    # vertex_mask's all() intersection admit nothing -- the
+                    # policy then eliminates it exactly. Never transpose a
+                    # side to make the add fit: guessing the axis order
+                    # silently corrupts the Jacobian the reward is built on.
+                    _record_probe_failure(int(vertex), bool(approx), exc)
         finally:
             set_approx_active(prev)
             # Throw away the equations the probe traced; nothing ever
@@ -1009,3 +1022,29 @@ def masked_face_transforms(face_keys, *, pre=None, post=None, res=None,
     post = {k: _wrap(v) for k, v in (post or {}).items()}
     res = {k: _wrap(v) for k, v in (res or {}).items()}
     return face_transforms_from_edges(face_keys, pre=pre, post=post, res=res)
+
+
+# --- oracle probe failure accounting ---------------------------------------
+# probe_faces fails SOFT (see the except clause there), which is silent by
+# construction: an approx run whose oracle rejects every vertex degrades into
+# an exact run while every other metric still looks healthy. These counters are
+# what make that visible, so they are not optional decoration.
+_PROBE_FAILURES = {"count": 0, "vertices": set(), "last": ""}
+
+
+def _record_probe_failure(vertex: int, approx: bool, exc: BaseException) -> None:
+    _PROBE_FAILURES["count"] += 1
+    _PROBE_FAILURES["vertices"].add(int(vertex))
+    _PROBE_FAILURES["last"] = f"v{vertex} approx={approx} {type(exc).__name__}: {exc}"
+
+
+def consume_probe_failure_stats() -> dict:
+    """Per-episode probe-failure counts; resets the accumulator."""
+    out = {
+        "count": int(_PROBE_FAILURES["count"]),
+        "n_vertices": len(_PROBE_FAILURES["vertices"]),
+        "last": _PROBE_FAILURES["last"],
+    }
+    _PROBE_FAILURES["count"] = 0
+    _PROBE_FAILURES["vertices"] = set()
+    return out

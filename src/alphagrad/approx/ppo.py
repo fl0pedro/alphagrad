@@ -5708,6 +5708,21 @@ def main():
             log_dict["measure/compression_ratio"] = xla_stats["compression_ratio"]
 
         # ---- tokenization truncation (was computed but never logged) --------
+        # Oracle probe failures. Non-zero means graphax could not trace some
+        # vertex elimination, so the legality oracle admitted NO approximation
+        # there and the policy was forced to eliminate it exactly. A large
+        # count means the approx arm is not really approximating.
+        try:
+            from alphagrad.approx.common.masks import consume_probe_failure_stats
+            _probe = consume_probe_failure_stats()
+            log_dict["oracle/probe_failures"] = int(_probe["count"])
+            log_dict["oracle/probe_failed_vertices"] = int(_probe["n_vertices"])
+            if _probe["count"] and not host_state.get("_probe_fail_printed"):
+                print(f"[oracle] probe failed (fail-soft, vertex forced exact): "
+                      f"{_probe['last']}", flush=True)
+                host_state["_probe_fail_printed"] = True
+        except Exception:
+            pass
         trunc = consume_tokenization_truncation_stats()
         log_dict["tokenization/truncated_count"] = trunc["count"]
         log_dict["tokenization/max_observed_len"] = trunc["max_observed_len"]
