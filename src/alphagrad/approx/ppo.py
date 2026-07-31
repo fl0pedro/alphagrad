@@ -3406,6 +3406,14 @@ def main():
                 break
         return o
 
+    # Bounded memo for the prefix replay. Keyed on exactly the inputs the
+    # result depends on: the eliminated prefix, its specs, and the probed
+    # vertex. Bounded so a long run cannot grow it without limit; FIFO-evicted
+    # because the useful entries are the recent prefixes.
+    _ORACLE_MEMO: dict = {}
+    _ORACLE_MEMO_MAX = int(os.environ.get("ALPHAGRAD_ORACLE_MEMO", "8192"))
+    _ORACLE_STATS = [0, 0]        # [hits, misses]
+
     def _oracle_one_host(order, spec_hist, step_count, vertex_idx):
         _pt0 = _prof_time.perf_counter()
         try:
@@ -3414,6 +3422,15 @@ def main():
             n = int(np.asarray(step_count))
             v = int(np.asarray(vertex_idx)) + 1   # policy 0-based -> oracle 1-based
             F, N = _F_FACES, _oracle_N
+            if _ORACLE_MEMO_MAX > 0:
+                _k = (eo[:n].tobytes(), specs[:n].tobytes(), v)
+                _hit = _ORACLE_MEMO.get(_k)
+                if _hit is not None:
+                    _ORACLE_STATS[0] += 1
+                    return _hit
+                _ORACLE_STATS[1] += 1
+            else:
+                _k = None
             o = _oracle_replay(eo, specs, n)
             pair, comp = o.masks(candidates=[v])
             fp_arr = np.zeros((F, N, N), np.float32)
@@ -3426,8 +3443,16 @@ def main():
                 fv_arr[: int(nf)] = 1.0
             except Exception:
                 pass
-            return (np.asarray(pair[v], np.float32),
+            _res = (np.asarray(pair[v], np.float32),
                     np.asarray(comp[v], np.float32), fp_arr, fc_arr, fv_arr)
+            if _k is not None:
+                if len(_ORACLE_MEMO) >= _ORACLE_MEMO_MAX:
+                    # FIFO evict a chunk rather than one-at-a-time, so the
+                    # eviction cost is amortised.
+                    for _dk in list(_ORACLE_MEMO)[: _ORACLE_MEMO_MAX // 8]:
+                        _ORACLE_MEMO.pop(_dk, None)
+                _ORACLE_MEMO[_k] = _res
+            return _res
         finally:
             _env_prof_add("oracle.one_vertex",
                           _prof_time.perf_counter() - _pt0)
@@ -3447,6 +3472,8 @@ def main():
 
     _ORACLE_ONE_VERTEX = os.environ.get(
         "ALPHAGRAD_ORACLE_ONE_VERTEX", "1") == "1"
+    # No approximation head => no legality to compute. See _NO_ORACLE use.
+    _NO_ORACLE = bool(getattr(args, "no_approx_head", False))
 
     total_v = len(closed_jaxpr.jaxpr.eqns)
     num_valid = len(env.valid_vertices)
@@ -3789,7 +3816,12 @@ def main():
                 # --face-actions the same host replay also returns the
                 # PER-FACE masks for every candidate vertex.
                 oracle_one_fn = None
-                if _ORACLE_ONE_VERTEX:
+                if _NO_ORACLE:
+                    # --no-approx-head: nothing to mask, so every probe is
+                    # pure waste (48% of host time when it does run).
+                    oracle_pair_all = oracle_comp_all = None
+                    face_masks_all = None
+                elif _ORACLE_ONE_VERTEX:
                     # Perf path: defer the probe until the vertex is known,
                     # then probe ONLY that vertex (see _oracle_one).
                     _st_o, _st_s, _st_k = (
