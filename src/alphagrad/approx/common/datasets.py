@@ -111,12 +111,23 @@ def load_dataset(name: str, dataset_size: int | None, subset: str = "train"):
         x_np = x_np.reshape(x_np.shape[0], -1).astype(np.float32) / 255.0
         y_np = np.eye(10, dtype=np.float32)[y_np]
         if os.environ.get("ALPHAGRAD_PM1_TARGETS", "1") == "1":
-            # {0,1} -> {-s,+s}. See the module note: with a tanh output and
+            # {0,1} -> {-s,+s}, INSET from tanh's asymptotes by default.
+            # Measured at 40k steps, jax_grad, seed 250197:
+            #   {0,1}  acc 0.8602  drawdown 0.1380   <- the accuracy crater
+            #   +/-0.9 acc 0.8453  drawdown 0.0053
+            #   +/-0.8 acc 0.8443  drawdown 0.0130
+            #   +/-0.7 acc 0.8443  drawdown 0.0056
+            #   +/-0.6 acc 0.8449  drawdown 0.0057
+            #   +/-1.0 acc 0.6162  drawdown 0.0048   <- asymptote, do not use
+            # Anything inset removes the crater; the choice between 0.6 and
+            # 0.9 is worth 0.001. Exactly 1.0 puts the target ON tanh's limit
+            # where tanh'(z) -> 0, and costs 0.23 accuracy.
+            # See the module note: with a tanh output and
             # squared error, {0,1} makes "predict 0 everywhere" a large free
             # loss win that destroys argmax accuracy; +/-1 makes it 10x worse
             # and uses tanh's range symmetrically.
             try:
-                _s = float(os.environ.get("ALPHAGRAD_TARGET_SCALE", "1.0"))
+                _s = float(os.environ.get("ALPHAGRAD_TARGET_SCALE", "0.9"))
             except ValueError:
                 _s = 1.0
             y_np = ((2.0 * y_np - 1.0) * _s).astype(np.float32)
