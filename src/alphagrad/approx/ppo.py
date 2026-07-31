@@ -1920,6 +1920,13 @@ def make_argparser() -> argparse.ArgumentParser:
         "--ray-measure-timeout", type=float, default=600.0,
         help="Per-call timeout for a --ray-measure actor, seconds.")
     p.add_argument(
+        "--pareto-dump-every", type=int, default=50, metavar="N",
+        help="Write the Pareto FRONT (objectives + the sequences that "
+             "achieved them) to the wandb run dir every N episodes, plus once "
+             "at the end. 0 disables. Without this only pareto/hypervolume "
+             "and pareto/archive_size are recorded — scalars describing a "
+             "front whose sequences are then discarded at process exit.")
+    p.add_argument(
         "--no-approx-head", action="store_true",
         help="REMOVE the approximation heads instead of masking them. "
              "--variant ve_only only multiplies the op categorical by "
@@ -2857,6 +2864,48 @@ def _cmp_reward_index(cmp_type: str) -> int:
 def _mem_reward_index(mem_type: str) -> int:
     return REWARD_INDEX[_MEM_TYPE_TO_REWARD[mem_type]]
 
+
+
+def _dump_pareto(archive, args, ep, *, final=False):
+    """Persist the front + a replayable best_sequences.json. Never raises."""
+    if archive is None or not getattr(archive, "pts", None):
+        return
+    try:
+        import json as _json
+        import os as _os
+        try:
+            _dir = wandb.run.dir if wandb.run is not None else "."
+        except Exception:
+            _dir = "."
+        _os.makedirs(_dir, exist_ok=True)
+        archive.dump_front(
+            _os.path.join(_dir, "pareto_front.json"),
+            extra={"episode": int(ep), "final": bool(final),
+                   "run_name": getattr(args, "name", None)},
+        )
+        # Replayable form. Objective 0 is the compute channel and objective 1
+        # memory (see ParetoArchive construction); lower is better in the
+        # archive's minimisation convention, so rank by objective 0.
+        _pts = [list(map(float, p)) for p in archive.pts]
+        _order = sorted(range(len(_pts)), key=lambda i: _pts[i][0])
+        _doc = {
+            "best_overall": {"seq": archive.seqs[_order[0]],
+                             "obj": _pts[_order[0]]},
+            "best_per_channel": {
+                f"rank{r}": {"seq": archive.seqs[i], "obj": _pts[i]}
+                for r, i in enumerate(_order)
+            },
+            "_provenance": {"source": "ParetoArchive.dump", "episode": int(ep),
+                            "num_points": len(_pts)},
+        }
+        with open(_os.path.join(_dir, "best_sequences.json"), "w") as _fh:
+            _json.dump(_doc, _fh, indent=2)
+    except Exception as _exc:
+        try:
+            tqdm.write(f"[pareto-dump] failed at ep={ep}: {_exc!r}",
+                       file=sys.stderr)
+        except Exception:
+            pass
 
 
 def _build_reward_weights(args) -> np.ndarray:
@@ -5623,6 +5672,10 @@ def main():
             )
             log_dict["pareto/hypervolume"] = float(pareto_archive.hypervolume())
             log_dict["pareto/archive_size"] = len(pareto_archive.pts)
+            # Persist the FRONT, not just these two scalars — see _dump_pareto.
+            _pd = int(getattr(args, "pareto_dump_every", 50) or 0)
+            if _pd > 0 and (ep % _pd == 0):
+                _dump_pareto(pareto_archive, args, ep)
             if pareto_archive.pts:
                 fx = np.stack(pareto_archive.pts).astype(np.float64)
                 # 3 scatter tables: (latency|cmp x cos), (mem x cos), (cmp x mem)
@@ -6144,6 +6197,7 @@ def main():
             file=sys.stderr,
         )
 
+    _dump_pareto(pareto_archive, args, args.episodes, final=True)
     print_top_n("Total Reward", host_state["top_n_total"])
     print_top_n(f"CMP (Lowest {args.cmp_type})", host_state["top_n_cmp"])
     print_top_n(f"Memory (Lowest {args.mem_type})", host_state["top_n_mem"])
