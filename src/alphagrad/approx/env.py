@@ -246,12 +246,7 @@ def consume_tokenization_truncation_stats() -> dict:
 MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "1024"))
 
 _INCR_TOK_CACHE: dict = {}
-# One episode produces num_envs x rollout_length distinct prefixes (192 at
-# 16x12), so 512 overflowed every ~2.7 episodes. Each miss whose PARENT is also
-# missing costs a full cold replay from the base, so a wipe is quadratic, not
-# linear. Sized for tens of episodes of a still-exploring policy; tune with
-# ALPHAGRAD_TOK_CACHE if host RSS ever becomes tight.
-_INCR_TOK_CACHE_CAP = int(os.environ.get("ALPHAGRAD_TOK_CACHE", "4096"))
+_INCR_TOK_CACHE_CAP = 512
 
 
 def incremental_token_delta(jaxpr, argnums, consts, args, order_prefix,
@@ -307,12 +302,7 @@ def incremental_token_delta(jaxpr, argnums, consts, args, order_prefix,
         )
     _record_delta_length(len(delta))
     if len(_INCR_TOK_CACHE) > _INCR_TOK_CACHE_CAP:
-        # FIFO-evict a SLICE, never `.clear()`. A wipe drops the parent chain
-        # too, so the very next step misses its parent and replays from the
-        # base — the whole point of the incremental tokenizer is that the
-        # parent is warm.
-        for _dk in list(_INCR_TOK_CACHE)[: max(1, _INCR_TOK_CACHE_CAP // 8)]:
-            _INCR_TOK_CACHE.pop(_dk, None)
+        _INCR_TOK_CACHE.clear()
     _INCR_TOK_CACHE[key] = (tk, delta)
     return delta
 
