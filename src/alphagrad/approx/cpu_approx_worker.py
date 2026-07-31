@@ -278,6 +278,7 @@ class CpuApproximationServer:
                 init=bool(init),
             )
             self._n_calls += 1
+            self._maybe_print_profile()
             if self._leak_profile is not None:
                 self._leak_profile.record_call(self._n_calls)
             out = np.asarray(tokens), np.asarray(eqn_ids), np.asarray(reward)
@@ -543,6 +544,32 @@ class CpuApproximationServer:
         self._env = eqx.tree_at(lambda e: e.config, self._env, new_config)
         self._config = new_config
         return True
+
+    # Host-phase profile, per actor. See the patch note: under --ray-measure
+    # the counters live HERE, not in the trainer, so the trainer's
+    # `[prof ep=...]` line would otherwise be empty.
+    def _maybe_print_profile(self) -> None:
+        try:
+            every = int(os.environ.get("ALPHAGRAD_ACTOR_PROF_EVERY", "0") or 0)
+        except ValueError:
+            every = 0
+        if every <= 0 or (self._n_calls % every) != 0:
+            return
+        try:
+            from alphagrad.approx.env import consume_profile
+            prof = consume_profile()
+            if not prof:
+                return
+            items = sorted(prof.items(), key=lambda kv: -kv[1])
+            tot = sum(v for _, v in items)
+            aid = os.getpid()
+            print(
+                f"[prof-actor pid{aid} n={self._n_calls}] host_total={tot:6.1f}s  "
+                + "  ".join(f"{k}={v:.1f}s" for k, v in items),
+                flush=True,
+            )
+        except Exception:
+            pass
 
     def _maybe_clear_compile_caches(self, *, force_on_oom: str | None = None) -> None:
         """Periodically drop JAX's in-process compilation caches so XLA
