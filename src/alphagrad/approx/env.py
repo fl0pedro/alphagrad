@@ -1468,6 +1468,74 @@ _LAT_FLOOR_NS = 100.0
 _MEASURE_TURN = itertools.count()
 
 
+# --------------------------------------------------------------------------
+# Batched host callback (ALPHAGRAD_BATCHED_CALLBACK=1). See module docstring
+# in the patch that introduced this for the full rationale.
+# --------------------------------------------------------------------------
+_BATCHED_CALLBACK = os.environ.get("ALPHAGRAD_BATCHED_CALLBACK", "0") == "1"
+
+
+def _cb_slot(x, i, E):
+    """Row ``i`` of a possibly-unbatched pytree.
+
+    Under ``vmap_method="expand_dims"`` a per-env argument has leading dim E
+    and a closed-over constant has leading dim 1, so dispatch on that.
+    """
+    def _one(v):
+        shp = getattr(v, "shape", None)
+        if shp is None or len(shp) < 1:
+            return v
+        # Return a JAX array, not numpy: the count pass hands these straight
+        # to graphax, which reads `.aval` off them. np.asarray() here made the
+        # batched path diverge from the per-env one with an AttributeError.
+        if shp[0] == E:
+            return jnp.asarray(v[i])
+        if shp[0] == 1:
+            return jnp.asarray(v[0])
+        return v
+    return jax.tree_util.tree_map(_one, x)
+
+
+def _batched_host(fn, n_out: int = 3):
+    """Per-env host fn -> one that takes the whole batch and stacks results.
+
+    The loop is SERIAL and in slot order, so this is equivalent to the per-env
+    callback it replaces. It moves the call boundary; it does not change what
+    happens inside it.
+    """
+    def _wrapped(*a):
+        # Batch width = largest leading dim among the arguments. The per-env
+        # arguments (order / specs / step) carry it; closed-over constants
+        # arrive as size-1 and are broadcast by _cb_slot.
+        E = 1
+        for leaf in jax.tree_util.tree_leaves(a):
+            v = np.asarray(leaf)
+            if v.ndim >= 1:
+                E = max(E, int(v.shape[0]))
+        if os.environ.get("ALPHAGRAD_BATCHED_DEBUG", "0") == "1":
+            print("[batched] E=", E, "shapes=",
+                  [tuple(np.asarray(l).shape)
+                   for l in jax.tree_util.tree_leaves(a)][:12], flush=True)
+        outs = [[] for _ in range(n_out)]
+        for i in range(E):
+            r = fn(*[_cb_slot(x, i, E) for x in a])
+            for k in range(n_out):
+                outs[k].append(np.asarray(r[k]))
+        return tuple(np.stack(o, axis=0) for o in outs)
+    return _wrapped
+
+
+def _env_callback(fn, shapes, *args, batched: bool = False):
+    """Dispatch the env callback, batched or per-env.
+
+    Batched needs `pure_callback` because `io_callback` has no `vmap_method`.
+    """
+    if batched and _BATCHED_CALLBACK:
+        return jax.pure_callback(fn, shapes, *args,
+                                 vmap_method="expand_dims")
+    return io_callback(fn, shapes, *args)
+
+
 def _next_measure_device(devices):
     """Round-robin over the measurement GPUs (everything but the trainer's).
 
@@ -2664,7 +2732,7 @@ class VertexEliminationEnv:
             remote_timeout_s=remote_timeout_s,
         )
 
-    def tokenize(self, init: bool = False):
+    def tokenize(self, init: bool = False, batched: bool = False):
         """Build the host-side function passed into ``io_callback``.
 
         If ``self._remote_pool`` is set, return a closure that
@@ -2676,7 +2744,10 @@ class VertexEliminationEnv:
         with ``ppo.py`` / non-Ray callers.
         """
         if self._remote_pool is None:
-            return partial(_callback, self.config, init=init)
+            _fn = partial(_callback, self.config, init=init)
+            # Only the STEP callback runs under vmap; reset() is called once,
+            # unbatched, and must not be wrapped.
+            return _batched_host(_fn) if (batched and _BATCHED_CALLBACK) else _fn
 
         # The pool's ``evaluate`` signature is
         # ``(order, specs, step, eval_samples, *, init)`` — but
@@ -2728,7 +2799,7 @@ class VertexEliminationEnv:
             (initial_order.shape[0], MAX_FACES), dtype=jnp.int32
         )
 
-        tokens, eqn_ids, _ = io_callback(
+        tokens, eqn_ids, _ = _env_callback(
             self.tokenize(init=True),
             self._callback_shape,
             self.args,
@@ -2811,8 +2882,8 @@ class VertexEliminationEnv:
             state.face_skips[shifted.astype(jnp.int32)].at[idx].set(face_skip)
         )
 
-        tokens, eqn_ids, reward = io_callback(
-            self.tokenize(),
+        tokens, eqn_ids, reward = _env_callback(
+            self.tokenize(batched=True),
             self._callback_shape,
             self.args,
             self.consts,
@@ -2822,6 +2893,7 @@ class VertexEliminationEnv:
             new_face_skips,
             new_step,
             *(self.eval_args_samples if self.eval_args_samples is not None else ()),
+            batched=True,
         )
 
         terminated = new_step >= state.max_steps
