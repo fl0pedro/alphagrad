@@ -254,16 +254,28 @@ class CpuApproximationServer:
         # GPU trainer that dispatched the request via Ray).
         self._maybe_init_leak_profile()
         try:
+            # env._callback takes face_specs / face_skips between the
+            # per-vertex specs and `stop`. This caller predates them; passing
+            # them explicitly as EMPTY (-1 / 0) is the documented per-vertex
+            # mode and is byte-identical to the non-face path. `point_idx` is
+            # gone from _callback and is not forwarded.
+            from alphagrad.approx.env import (
+                MAX_FACES as _MAX_FACES, FACE_SLOTS as _FACE_SLOTS)
+            _n_ord = int(np.asarray(order_j).shape[0])
+            _face_specs = np.full(
+                (_n_ord, _MAX_FACES, _FACE_SLOTS, 3), -1, dtype=np.int32)
+            _face_skips = np.zeros((_n_ord, _MAX_FACES), dtype=np.int32)
             tokens, eqn_ids, reward = _callback(
                 self._config,
                 self._args,
                 self._consts,
                 order_j,
                 specs_j,
+                _face_specs,
+                _face_skips,
                 int(step),
                 *es,
                 init=bool(init),
-                point_idx=int(point_idx),
             )
             self._n_calls += 1
             if self._leak_profile is not None:

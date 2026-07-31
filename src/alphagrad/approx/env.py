@@ -1474,6 +1474,11 @@ _MEASURE_TURN = itertools.count()
 # --------------------------------------------------------------------------
 _BATCHED_CALLBACK = os.environ.get("ALPHAGRAD_BATCHED_CALLBACK", "0") == "1"
 
+# Set by ppo.py's --ray-measure actors. Marks this process as a DEDICATED
+# measurement process: no trainer shares it, so every visible GPU is a
+# measurement GPU and one is sufficient.
+_MEASURE_ACTOR = os.environ.get("ALPHAGRAD_MEASURE_ACTOR", "0") == "1"
+
 
 def _cb_slot(x, i, E):
     """Row ``i`` of a possibly-unbatched pytree.
@@ -2065,7 +2070,19 @@ def _callback(
     # outstanding work on gpu[0]. Pick the *last* available GPU so we
     # stay as far from the trainer as possible; requires ≥ 2 GPUs.
     callback_device = None
-    if config.exec_on_gpu:
+    if config.exec_on_gpu and _MEASURE_ACTOR:
+        # Dedicated measure process (see module note): every visible GPU is a
+        # measurement GPU and there is no trainer to reserve one for. The
+        # actor is pinned to a single device, so this is it.
+        _gd = jax.devices("gpu")
+        if not _gd:
+            raise RuntimeError(
+                "ALPHAGRAD_MEASURE_ACTOR=1 with --exec-on-gpu but no GPU is "
+                "visible to this process; check the actor's "
+                "CUDA_VISIBLE_DEVICES pin."
+            )
+        callback_device = _next_measure_device(_gd)
+    elif config.exec_on_gpu:
         gpu_devices = jax.devices("gpu")
         if len(gpu_devices) < 2:
             raise RuntimeError(

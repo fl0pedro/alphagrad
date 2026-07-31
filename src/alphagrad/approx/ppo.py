@@ -3295,17 +3295,64 @@ def main():
         # One actor per MEASUREMENT device. Under --exec-on-gpu that is
         # num_gpus=1 each, so Ray hands every actor a disjoint
         # CUDA_VISIBLE_DEVICES and the timed execs cannot collide.
-        _opts = {"num_gpus": 1} if getattr(args, "exec_on_gpu", False) else {}
-        _args_dict = vars(args)
+        # Ray must launch workers with the SAME interpreter as the driver.
+        # Under `uv run` the raylet otherwise picks a python without ray
+        # installed and every worker dies with ModuleNotFoundError. (The
+        # `.ray_*venv` paths hardcoded in ppo/ray_vertex_ppo.py no longer
+        # exist; sys.executable is correct and self-maintaining.)
+        import sys as _sys
+        _gpu = bool(getattr(args, "exec_on_gpu", False))
+
+        def _actor_opts(idx: int) -> dict:
+            """Pin actor ``idx`` to its OWN measurement GPU.
+
+            Letting Ray allocate (num_gpus=1) handed the FIRST actor GPU 0 --
+            the trainer's own device. Two processes then contend on it, which
+            both hung the pool and broke the isolation the timing depends on.
+            So: num_gpus=0 (Ray does not allocate) plus an explicit
+            CUDA_VISIBLE_DEVICES, mirroring ray_vertex_ppo.py. Device 0 is
+            reserved for the trainer; actors take 1..N in order, so no two
+            timed executions can ever share a device.
+            """
+            rt = {"py_executable": _sys.executable}
+            if _gpu:
+                # num_gpus=0 makes Ray MASK the GPUs (it sets
+                # CUDA_VISIBLE_DEVICES="" for workers that request none),
+                # which overrode our pin and dropped the actor to CPU. The
+                # NOSET flag tells Ray to leave CUDA_VISIBLE_DEVICES alone so
+                # our explicit pin stands; it must also be exported in the
+                # DRIVER environment so it reaches Ray's worker startup.
+                rt["env_vars"] = {
+                    "CUDA_VISIBLE_DEVICES": str(idx + 1),
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                    # Dedicated measure process: no trainer shares this
+                    # actor, so its single pinned GPU IS the measure device
+                    # and env.py must not reserve one for a trainer.
+                    "ALPHAGRAD_MEASURE_ACTOR": "1",
+                }
+            return {"runtime_env": rt, "num_gpus": 0}
+        # The actor slices CPU cores by ``num_cpu_workers`` BEFORE importing
+        # jax, so XLA sizes its Eigen pool to that slice. ppo.py never set it,
+        # so every actor defaulted to n_workers=1 and claimed ALL cores --
+        # "N actors each defaulting to all 64 cores oversubscribe
+        # catastrophically (~48s/exec vs 0.45s)" (cpu_approx_actors.py).
+        # Observed: only 1 of 3 actors finished __init__ before the pool
+        # timed out. Copy rather than mutate the parsed args.
+        _args_dict = dict(vars(args))
+        _args_dict["num_cpu_workers"] = _n_actors
         _next_id = [0]
 
-        def _spawn():
+        def _spawn(slot: int | None = None):
             _next_id[0] += 1
-            return CpuApproximationActor.options(**_opts).remote(
+            _slot = _next_id[0] - 1 if slot is None else int(slot)
+            # Wrap around the available measurement devices so a RESPAWN
+            # lands back on a real device instead of drifting past the last.
+            _slot = _slot % max(_n_actors, 1)
+            return CpuApproximationActor.options(**_actor_opts(_slot)).remote(
                 _args_dict, variant=None, actor_id=_next_id[0],
             )
 
-        _actors = [_spawn() for _ in range(_n_actors)]
+        _actors = [_spawn(i) for i in range(_n_actors)]
         _pool = CpuApproxPool(
             _actors,
             timeout_s=float(args.ray_measure_timeout),
@@ -3320,8 +3367,10 @@ def main():
         object.__setattr__(env, "_remote_pool", _pool)
         object.__setattr__(env, "_remote_timeout_s",
                            float(args.ray_measure_timeout))
-        print(f"[ray-measure] {_n_actors} actors, opts={_opts}, "
-              f"timeout={args.ray_measure_timeout}s", flush=True)
+        print(f"[ray-measure] {_n_actors} actors on gpus "
+              f"{[i + 1 for i in range(_n_actors)] if _gpu else 'cpu'} "
+              f"(trainer keeps gpu 0), timeout={args.ray_measure_timeout}s",
+              flush=True)
 
     # DIAG per-face masking. The dynamic policy's DIAG head must be masked by the
     # LIVE per-vertex pair / compress validity — the nominal tag-bit mask admits
