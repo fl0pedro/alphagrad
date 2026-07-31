@@ -110,6 +110,16 @@ def load_dataset(name: str, dataset_size: int | None, subset: str = "train"):
         x_np, y_np = _load_mnist_native(subset=subset)
         x_np = x_np.reshape(x_np.shape[0], -1).astype(np.float32) / 255.0
         y_np = np.eye(10, dtype=np.float32)[y_np]
+        if os.environ.get("ALPHAGRAD_PM1_TARGETS", "1") == "1":
+            # {0,1} -> {-s,+s}. See the module note: with a tanh output and
+            # squared error, {0,1} makes "predict 0 everywhere" a large free
+            # loss win that destroys argmax accuracy; +/-1 makes it 10x worse
+            # and uses tanh's range symmetrically.
+            try:
+                _s = float(os.environ.get("ALPHAGRAD_TARGET_SCALE", "1.0"))
+            except ValueError:
+                _s = 1.0
+            y_np = ((2.0 * y_np - 1.0) * _s).astype(np.float32)
         if dataset_size is not None and dataset_size > 0:
             x_np = x_np[:dataset_size]
             y_np = y_np[:dataset_size]
