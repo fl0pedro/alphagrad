@@ -4565,6 +4565,17 @@ def main():
             old_log_probs = old_log_probs + batch.face_old_logp
 
         ratio = jnp.exp(log_probs - old_log_probs)
+        # T2 diagnostics. max|log-ratio| rather than the mean: the unified-head
+        # ratio bug sat in the TAIL (median 2.374, max 2.32e23), which a
+        # batch-averaged KL hides. At epoch 0 this must be ~0 by construction.
+        _log_ratio = log_probs - old_log_probs
+        _max_log_ratio = jnp.max(jnp.abs(_log_ratio))
+        # KL(old || new) on the JOINT log-prob -- the quantity the ratio uses,
+        # and the only live KL for this head now that the per-sub-step dists
+        # are point masses.
+        # Schulman's low-variance, non-negative KL estimator:
+        #   k3 = (r - 1) - log r,  with r = exp(new - old)
+        _kl_approx = jnp.mean((ratio - 1.0) - _log_ratio)
         num_triggers = get_num_clipping_triggers(ratio, args.ppo_clip_eps)
         trigger_ratio = num_triggers / len(ratio)
 
@@ -4682,7 +4693,13 @@ def main():
         # gate on their respective op-type (COMPRESS / QUANT) and the legacy
         # consumer reads slot 4 as "non-vertex / non-op_type / non-axis"
         # collateral.
-        _kl_components = (kl_vertex, kl_op, kl_i, kl_j, kl_exp + kl_kind + kl_quant)
+        # slots 5/6 are T2: joint-ratio KL and max|log-ratio|. The per-sub-step
+        # slots above read 0 for the unified head (point-mass dists), so these
+        # are the live diagnostics there.
+        _kl_components = (kl_vertex, kl_op, kl_i, kl_j,
+                          kl_exp + kl_kind + kl_quant,
+                          jnp.asarray(_kl_approx, jnp.float32),
+                          jnp.asarray(_max_log_ratio, jnp.float32))
 
         # Per-component entropy under the current policy, using the same
         # active-substep / DIAG gating as the KL split. Pairs with the
@@ -5551,6 +5568,15 @@ def main():
                     entropy_components[0] / np.log(max(int(total_v), 2)))
                 log_dict["entropy/op_norm"] = float(
                     entropy_components[1] / np.log(max(int(NUM_OPS), 2)))
+            # T2: the unified head's live diagnostics. kl/approx is the KL on
+            # the JOINT log-prob; ratio/max_log is the TAIL statistic that a
+            # batch-averaged KL hides (this read +53.8 when the ratio was
+            # broken, and must be ~0 at epoch 0).
+            if kl_components.shape[0] > 6:
+                log_dict["kl/approx"] = float(kl_components[5])
+                log_dict["ratio/max_log"] = float(kl_components[6])
+                log_dict["ratio/max"] = float(
+                    np.exp(np.clip(float(kl_components[6]), -700, 700)))
         for j, name in enumerate(REWARD_NAMES):
             log_dict[f"mean_{name}"] = float(mean_r[j]) if j < len(mean_r) else 0.0
 
