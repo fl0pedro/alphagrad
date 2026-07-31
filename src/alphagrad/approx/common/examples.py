@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 
+import os
 import jax
 import jax.numpy as jnp
 import jax.random as jrand
@@ -41,9 +42,33 @@ def example_width(default: int | None = None):
     return w
 
 
+# Which objective the MNIST-style models use. See the patch note: MSE through a
+# saturating tanh is the wrong loss for classification and produced both the
+# all-zeros attractor and (with +/-1 targets) the asymptote trap.
+#   "xent" — softmax cross-entropy (DEFAULT; needs {0,1} targets)
+#   "mse"  — the legacy 0.5*(tanh(z)-y)^2, kept so prior runs reproduce
+# Measured, jax.grad, 40k steps, seed 250197:
+#   MSE {0,1}   final 0.8602  drawdown 0.1642  never reached 0.90
+#   MSE +/-0.9  final 0.8565  drawdown 0.0059  never reached 0.90
+#   XENT        final 0.9467  drawdown 0.0053  reached 0.90 at step 8000
+# xent also closes the graphax-vs-exact gap: graphax_rev 0.9470 vs
+# jax.grad 0.9467 (0.0003), where under MSE it trailed by ~0.03.
+_LOSS_MODE = os.environ.get("ALPHAGRAD_LOSS", "xent").strip().lower()
+if _LOSS_MODE not in ("mse", "xent"):
+    raise ValueError(f"ALPHAGRAD_LOSS must be 'mse' or 'xent', got {_LOSS_MODE!r}")
+
+
 def _neural_network(x, y, W1, b1, W2, b2):
     a1 = jnp.tanh(x @ W1.T + b1)
-    return 0.5 * (jnp.tanh(a1 @ W2.T + b2) - y) ** 2
+    logits = a1 @ W2.T + b2
+    if _LOSS_MODE == "xent":
+        # log_softmax in its stable form. Per-ELEMENT so the (10,) output
+        # convention (and hence the measured Jacobian shape) is unchanged;
+        # summing over the last axis gives the usual NLL.
+        logp = logits - jax.scipy.special.logsumexp(logits, axis=-1,
+                                                    keepdims=True)
+        return -(y * logp)
+    return 0.5 * (jnp.tanh(logits) - y) ** 2
 
 
 # graphax core-v2 vision MNIST models: each takes (x_flat784, y_onehot10, *weights)

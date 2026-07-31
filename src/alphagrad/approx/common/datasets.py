@@ -110,7 +110,11 @@ def load_dataset(name: str, dataset_size: int | None, subset: str = "train"):
         x_np, y_np = _load_mnist_native(subset=subset)
         x_np = x_np.reshape(x_np.shape[0], -1).astype(np.float32) / 255.0
         y_np = np.eye(10, dtype=np.float32)[y_np]
-        if os.environ.get("ALPHAGRAD_PM1_TARGETS", "1") == "1":
+        # Cross-entropy needs a probability vector: -(y * logp) with a
+        # NEGATIVE y would reward the wrong classes. So xent pins {0,1}
+        # regardless of the +/-s setting rather than producing nonsense.
+        _xent = os.environ.get("ALPHAGRAD_LOSS", "mse").strip().lower() == "xent"
+        if not _xent and os.environ.get("ALPHAGRAD_PM1_TARGETS", "1") == "1":
             # {0,1} -> {-s,+s}, INSET from tanh's asymptotes by default.
             # Measured at 40k steps, jax_grad, seed 250197:
             #   {0,1}  acc 0.8602  drawdown 0.1380   <- the accuracy crater

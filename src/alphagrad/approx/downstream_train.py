@@ -332,7 +332,10 @@ def _predict_class(x: jnp.ndarray, weights: Sequence[jnp.ndarray]) -> jnp.ndarra
     invoke the squared-error loss harness."""
     W1, b1, W2, b2 = weights
     a1 = jnp.tanh(x @ W1.T + b1)
-    return jnp.argmax(jnp.tanh(a1 @ W2.T + b2), axis=1)
+    # argmax is invariant to the monotone output map, so this is correct for
+    # both losses; written on the raw logits because under xent there is no
+    # output tanh at all.
+    return jnp.argmax(a1 @ W2.T + b2, axis=1)
 
 
 def main():
