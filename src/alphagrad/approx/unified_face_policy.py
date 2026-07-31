@@ -95,6 +95,34 @@ class UnifiedFacePolicy(eqx.Module):
                                    (FACE_SLOTS, MAX_PAIR_IDX, MAX_PAIR_IDX))
         return om, im, jm, am, pair_ok
 
+    def _face_feats(self, features, face_sizes, f):
+        """AxisTokenFeatures for ONE face's LIVE contraction.
+
+        This is what makes a per-face decision mean anything. Without it the
+        head sees the vertex's static features plus a face EMBEDDING -- a
+        label, not information -- so every face looks identical and the head is
+        approximating a contraction it never read. face_sizes comes from
+        LiveVertexMaskOracle.face_features, which keeps the shape of the
+        SparseTensor the mask probe already built.
+
+        face_sizes is None falls back to the shared vertex features, which
+        is the OLD behaviour -- kept so the blind path stays reachable for an
+        A/B, not because it is correct.
+        """
+        if face_sizes is None:
+            return features
+        sz = jnp.asarray(face_sizes[f], jnp.int32)
+        n = features.size.shape[0]
+        sz = jnp.concatenate([sz, jnp.zeros((n,), jnp.int32)])[:n]
+        valid = (sz > 0).astype(jnp.float32)
+        return AxisTokenFeatures(
+            size=jnp.maximum(sz, 1),
+            log_size=jnp.log(jnp.maximum(sz, 1).astype(jnp.float32)),
+            tag_bits=features.tag_bits,
+            group_id=features.group_id,
+            valid_mask=valid,
+        )
+
     # ------------------------------------------------------------ wire
     def _rows(self, fields: FaceFields, features, tables):
         """FaceFields -> the env's per-slot wire fields. Direct, not expanded.
@@ -151,16 +179,18 @@ class UnifiedFacePolicy(eqx.Module):
     def sample(self, vertex_context, features: AxisTokenFeatures,
                tables: FactorTables, key, face_pair_valid, face_comp_valid,
                face_valid, quant_legality_mask=None,
-               op_legality_override=None):
+               op_legality_override=None, face_sizes=None):
         """``(FaceAction, joint_logp, joint_entropy, arity, skip_probs,
         op_dists, quant_logps)`` -- FacePathPolicy's contract, verbatim."""
         if quant_legality_mask is None:
             quant_legality_mask = quant_hardware_masks()[0]
         F = self.max_faces
         keys = jrand.split(key, F)
-        # ONE encode for the whole vertex; the face enters via its embedding.
-        _tokens, summary = self.encoder(features, vertex_context)
         approx_ok = _approx_allowed(op_legality_override)
+        # Encode EACH FACE's live contraction. The embedding still tags which
+        # face it is, but the content now comes from the face itself.
+        shared = None if face_sizes is not None else self.encoder(
+            features, vertex_context)[1]
 
         logp = jnp.array(0.0)
         ent = jnp.array(0.0)
@@ -168,9 +198,12 @@ class UnifiedFacePolicy(eqx.Module):
         skips, skip_probs, rows, op_dists, q_lps = [], [], [], [], []
         for f in range(F):
             fv = face_valid[f] > 0.5
-            ctx_f = summary + self.face_embedding(jnp.array(f))
+            ff = self._face_feats(features, face_sizes, f)
+            summ = shared if shared is not None else self.encoder(
+                ff, vertex_context)[1]
+            ctx_f = summ + self.face_embedding(jnp.array(f))
             om, im, jm, am, pair_ok = self._face_masks(
-                features, face_pair_valid[f], face_comp_valid[f],
+                ff, face_pair_valid[f], face_comp_valid[f],
                 quant_legality_mask, op_legality_override, tables)
             z, fields, lp, e, ar = self.head.sample(
                 ctx_f, keys[f], op_mask=om, i_mask=im, j_mask=jm,
@@ -181,7 +214,7 @@ class UnifiedFacePolicy(eqx.Module):
             arity = arity + ar
             skips.append(fields.skip)
             skip_probs.append(jax.nn.sigmoid(z[0]))
-            rows.append(self._rows(fields, features, tables))
+            rows.append(self._rows(fields, ff, tables))
             op_dists.append(jax.nn.softmax(
                 jnp.stack([z[1 + 31 * s:1 + 31 * s + NUM_APPROX_OPS]
                            for s in range(FACE_SLOTS)]), axis=-1))
@@ -198,15 +231,16 @@ class UnifiedFacePolicy(eqx.Module):
     def evaluate(self, vertex_context, features: AxisTokenFeatures,
                  tables: FactorTables, fa: FaceAction, face_pair_valid,
                  face_comp_valid, face_valid, quant_legality_mask=None,
-                 op_legality_override=None):
+                 op_legality_override=None, face_sizes=None):
         """Score a stored FaceAction under CURRENT parameters and the STORED
         masks. Mirrors :meth:`sample` gate for gate -- anything less and the
         ratio is not 1 at epoch 0."""
         if quant_legality_mask is None:
             quant_legality_mask = quant_hardware_masks()[0]
         F = self.max_faces
-        _tokens, summary = self.encoder(features, vertex_context)
         approx_ok = _approx_allowed(op_legality_override)
+        shared = None if face_sizes is not None else self.encoder(
+            features, vertex_context)[1]
 
         logp = jnp.array(0.0)
         ent = jnp.array(0.0)
@@ -214,9 +248,12 @@ class UnifiedFacePolicy(eqx.Module):
         skip_probs, op_dists, q_lps = [], [], []
         for f in range(F):
             fv = face_valid[f] > 0.5
-            ctx_f = summary + self.face_embedding(jnp.array(f))
+            ff = self._face_feats(features, face_sizes, f)
+            summ = shared if shared is not None else self.encoder(
+                ff, vertex_context)[1]
+            ctx_f = summ + self.face_embedding(jnp.array(f))
             om, im, jm, am, pair_ok = self._face_masks(
-                features, face_pair_valid[f], face_comp_valid[f],
+                ff, face_pair_valid[f], face_comp_valid[f],
                 quant_legality_mask, op_legality_override, tables)
             z = self.head.logits(ctx_f)
             # Read the fields back off the stored wire rows -- the inverse of

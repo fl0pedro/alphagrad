@@ -598,6 +598,41 @@ class LiveVertexMaskOracle:
             del incr.trace.frame.tracing_eqns[n_eqns0:]
         return seen
 
+    def face_features(self, vertex: int, max_faces: int = 8):
+        """PER-FACE axis sizes of the LIVE contraction: (F, N) int32, n_faces.
+
+        THE POINT OF THIS METHOD. The approximation head used to be handed the
+        vertex's static AxisTokenFeatures plus a face EMBEDDING -- a label,
+        carrying no information about the face it names. Every face therefore
+        looked identical to the head, which makes a per-face decision
+        meaningless: it was approximating a contraction it had never read.
+
+        probe_faces already builds the live SparseTensor for every face (it
+        is how :meth: decides legality); this simply keeps the
+        SHAPE instead of reducing it to booleans, so the head conditions on the
+        actual thing it is approximating. No extra elimination is run -- the
+        probe is shared with the mask path.
+
+        Rows >= n_faces are zero padding, matching face_masks.
+        """
+        N = self.max_axes
+        F = int(max_faces)
+        sizes = np.zeros((F, N), dtype=np.int32)
+        vertex = int(vertex)
+        if not (1 <= vertex <= self.total_v) or vertex in self._eliminated:
+            return sizes, 0
+        faces = self.probe_faces(vertex, approx=True)
+        if not faces:
+            return sizes, 0
+        n_faces = min(len(faces), F)
+        for k in range(n_faces):
+            st = faces[k]
+            val = getattr(st, "val", None)
+            shp = tuple(getattr(val, "shape", ()) or ())
+            for a, n in enumerate(shp[:N]):
+                sizes[k, a] = int(n)
+        return sizes, n_faces
+
     # -- the masks ----------------------------------------------------------
     def vertex_mask(self, vertex: int):
         """``(pair_valid (N, N), compress_valid (N,))`` bool for one vertex.

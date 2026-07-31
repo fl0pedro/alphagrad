@@ -111,6 +111,37 @@ def main():
     ck("encoder called ONCE (FacePathPolicy called it 32x)", calls[0] == 1,
        f"{calls[0]} calls")
 
+    print("\n=== F. the head SEES the face (not just a label) ===")
+    # Two faces with DIFFERENT live contraction shapes must produce different
+    # logits. If they do not, the head is reading an embedding index and the
+    # per-face decision is decoration.
+    fs = np.zeros((F, N), np.int32)
+    fs[0, :3] = [8, 4, 2]
+    fs[1, :3] = [16, 6, 3]
+    fs[2, :2] = [4, 4]
+    fsz = jnp.asarray(fs)
+    ff0 = pol._face_feats(f, fsz, 0)
+    ff1 = pol._face_feats(f, fsz, 1)
+    ck("per-face features differ",
+       not bool(jnp.all(ff0.size == ff1.size)),
+       f"{np.asarray(ff0.size)} vs {np.asarray(ff1.size)}")
+    z0 = pol.head.logits(pol.encoder(ff0, ctx)[1] + pol.face_embedding(jnp.array(0)))
+    z1 = pol.head.logits(pol.encoder(ff1, ctx)[1] + pol.face_embedding(jnp.array(1)))
+    # and against the BLIND path: same features, only the embedding differs
+    b0 = pol.head.logits(pol.encoder(f, ctx)[1] + pol.face_embedding(jnp.array(0)))
+    b1 = pol.head.logits(pol.encoder(f, ctx)[1] + pol.face_embedding(jnp.array(1)))
+    d_seeing = float(jnp.max(jnp.abs(z0 - z1)))
+    d_blind = float(jnp.max(jnp.abs(b0 - b1)))
+    ck("seeing the contraction changes the logits more than the label alone",
+       d_seeing > d_blind, f"seeing={d_seeing:.4f} blind(label only)={d_blind:.4f}")
+    fa_s, lp_s, *_ = pol.sample(ctx, f, tables, jrand.PRNGKey(11), fpv, fcv,
+                                fval, face_sizes=fsz)
+    lp_s2, *_ = pol.evaluate(ctx, f, tables, fa_s, fpv, fcv, fval,
+                             face_sizes=fsz)
+    ck("parity still exact with per-face features",
+       abs(float(lp_s) - float(lp_s2)) < 1e-5,
+       f"d={abs(float(lp_s)-float(lp_s2)):.3e}")
+
     print("\n" + ("ALL PASS" if not FAIL else f"{len(FAIL)} FAILURES: {FAIL}"))
     return 1 if FAIL else 0
 
