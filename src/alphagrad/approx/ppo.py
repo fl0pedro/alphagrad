@@ -4925,6 +4925,24 @@ def main():
             args.gae_lambda,
         )
 
+        # T3 DIAGNOSTICS. `estim_returns` is what _popart_update consumes, and
+        # its final line upstream is `returns = advantages + values` -- a
+        # BOOTSTRAPPED target, bounded by the CRITIC, not by the reward. So
+        # popart/mu_cos exceeding the reward ceiling (observed 1.874 against
+        # 0.946 on v36) is critic overestimation, not the acc reward being
+        # emitted more than once. Capture both sides here, in RAW units, before
+        # the renormalisation below rewrites estim_returns in place.
+        _dv = v_raw if use_popart else traj.value
+        _diag_value_raw = jnp.mean(_dv, axis=tuple(range(_dv.ndim - 1)))
+        _diag_return_raw = jnp.mean(
+            estim_returns, axis=tuple(range(estim_returns.ndim - 1)))
+        # Terminal-gate guard: env.py emits an all-zero reward vector for every
+        # non-terminal step under --terminal-rewards-only, so at most ONE step
+        # per env may carry a non-zero cosine. Max over envs; must stay <= 1.
+        _diag_nonzero_cos_steps = jnp.max(jnp.sum(
+            (traj.reward[..., int(REWARD_INDEX["cosine_sim"])] != 0.0
+             ).astype(jnp.int32), axis=-1))
+
         # DEGENERATE STEPS ARE NEUTRAL, NOT CATASTROPHIC.
         # The env sentinels a plan that computed nothing (every cost = −1e10).
         # Letting that flow into the advantage would inject an enormous
@@ -5263,6 +5281,10 @@ def main():
             p_stop_slot0,
             op_marginals,
             mean_sub_episode_length,
+            # T3, see the capture site above the PopArt update.
+            _diag_value_raw,
+            _diag_return_raw,
+            _diag_nonzero_cos_steps,
         )
         return (
             agent,
@@ -5750,7 +5772,20 @@ def main():
                 p_stop_slot0,
                 op_marginals,
                 mean_sub_episode_length,
+                value_raw,
+                return_raw,
+                nonzero_cos_steps,
             ) = (np.asarray(x) for x in diag_pack)
+            # T3. nonzero_cos_steps > 1 means the --terminal-rewards-only gate
+            # in env.py has stopped holding. The value/return pair measures the
+            # critic overestimate that puts popart/mu_cos above the reward
+            # ceiling: the gap is return_raw - value_raw, and return_raw_acc
+            # above ~1.0 is the critic, not the env.
+            log_dict["reward/nonzero_cos_steps"] = int(nonzero_cos_steps)
+            for j, nm in enumerate(HEAD_NAMES):
+                if j < value_raw.shape[0]:
+                    log_dict[f"diag/value_raw_{nm}"] = float(value_raw[j])
+                    log_dict[f"diag/estim_return_raw_{nm}"] = float(return_raw[j])
             for j, p in enumerate(pair_marg):
                 log_dict[f"pair_marginal/{j}"] = float(p)
             for j, p in enumerate(factor_marg):
