@@ -1768,6 +1768,20 @@ class FaceAction(NamedTuple):
     quant_scale_frac: jax.Array  # (F, S) float32 — scale head's u ∈ [0,1]
 
 
+def _approx_allowed(op_override):
+    """1.0 if ANY approximation op is legal, else 0.0.
+
+    `op_override` is the (NUM_OPS,) variant mask whose last slot is END. A
+    variant that leaves only END legal is asking for NO approximation, and a
+    face SKIP is an approximation (graphax drops the path), so the skip gate
+    has to see this mask too -- it is not enough to mask the op-type head.
+    """
+    if op_override is None:
+        return jnp.array(1.0, dtype=jnp.float32)
+    m = jnp.asarray(op_override, dtype=jnp.float32)[:OP_END]
+    return (jnp.sum(m) > 0).astype(jnp.float32)
+
+
 class FacePathPolicy(eqx.Module):
     """One SKIP gate per face, then one micro decision per (face, slot).
 
@@ -1901,7 +1915,11 @@ class FacePathPolicy(eqx.Module):
                 p_skip * jnn.log_sigmoid(s_logit)
                 + (1.0 - p_skip) * jnn.log_sigmoid(-s_logit)
             )
-            gate_f = fv.astype(jnp.float32)
+            # A SKIP deletes the path (graphax.SKIP_FACE), so it is an
+            # approximation and the variant's op legality gates it too.
+            _ok = _approx_allowed(op_legality_override)
+            skip = (skip * _ok.astype(skip.dtype)).astype(jnp.int32)
+            gate_f = fv.astype(jnp.float32) * _ok
             logp = logp + lp_skip * gate_f
             ent = ent + e_skip * gate_f
             arity = arity + gate_f
@@ -1981,7 +1999,11 @@ class FacePathPolicy(eqx.Module):
                 p_skip * jnn.log_sigmoid(s_logit)
                 + (1.0 - p_skip) * jnn.log_sigmoid(-s_logit)
             )
-            gate_f = fv.astype(jnp.float32)
+            # A SKIP deletes the path (graphax.SKIP_FACE), so it is an
+            # approximation and the variant's op legality gates it too.
+            _ok = _approx_allowed(op_legality_override)
+            skip = (skip * _ok.astype(skip.dtype)).astype(jnp.int32)
+            gate_f = fv.astype(jnp.float32) * _ok
             logp = logp + lp_skip * gate_f
             ent = ent + e_skip * gate_f
             arity = arity + gate_f
