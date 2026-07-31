@@ -99,32 +99,67 @@ def main():
     print(f"\n   BASE = {head_end} tokens.  Palimpsa encodes this, then the")
     print( "   vertex head picks the first elimination.")
 
+    # PIPELINE VIEW.
+    #   =>  a token HANDOFF: new tokens are appended to the stream and
+    #       Palimpsa re-encodes it.
+    #   ->  an internal DELEGATION: the summary is routed to a head.
+    #
+    # The VE head is queried once per VERTEX; the approximation head once per
+    # FACE. Crucially the approximation for face k is emitted TOGETHER with the
+    # contraction of face k+1 -- the chunks are interleaved, not one per face.
+    ap_id = tk.vocab.get("approx")
+
+    def split(a, b):
+        """(contraction, approximated contraction) halves of a face span."""
+        if ap_id is not None and ap_id in toks[a:b]:
+            m = a + toks[a:b].index(ap_id)
+            return (a, m), (m, b)
+        return (a, b), (b, b)
+
     by_central = {}
     for fr, sp in zip(faces, spans):
         by_central.setdefault(fr.central, []).append((fr, sp))
+
+    def emit(label, parts):
+        n = sum(b - a for a, b in parts if b > a)
+        print(f"\n   [{label}]   {n} tokens")
+        for a, b in parts:
+            if b > a:
+                for ln in dec.render(toks[a:b], base_indent="      "):
+                    print(ln)
+
+    def hand(to):
+        print(f"\n   ==> palimpsa  ->  {to}")
+
+    print("\n" + "=" * W)
+    print("  PIPELINE   ( => token handoff / re-encode,  -> head delegation )")
+    print("=" * W)
+    emit("base", [(0, head_end)])
+    hand("VE head")
 
     step = 0
     for k, eqn in enumerate(jaxpr.eqns, start=1):
         grp = by_central.get(eqn.outvars[0])
         if not grp:
-            continue                       # output vertex: no faces
+            continue                        # output vertex: no faces
         step += 1
-        approx = chosen.get(k)
-        print("\n" + "=" * W)
-        print(f"  STEP {step}   eliminate v{k}  ({eqn.primitive.name})"
-              f"   {len(grp)} faces")
-        print(f"  approx head chose: {approx or 'NONE (exact)'}")
-        print("=" * W)
-        for fi, (fr, (a, b)) in enumerate(grp):
-            print(f"\n   --- face {fi} of {len(grp)} "
-                  f"[{fr.in_edge} -> {fr.central} -> {fr.out_edge}] ---")
-            for ln in dec.render(toks[a:b], base_indent="      "):
-                print(ln)
-            print(f"      >> HANDOFF: {b - a} new tokens appended.")
-            print( "      >> Palimpsa encodes the stream so far -> summary ->")
-            print( "      >> next head decides the NEXT face/vertex.")
-        tot = sum(b - a for _, (a, b) in grp)
-        print(f"\n   vertex total: {tot} tokens across {len(grp)} faces")
+        n = len(grp)
+        halves = [split(a, b) for _, (a, b) in grp]
+        print(f"\n   --- vertex v{k} ({eqn.primitive.name}), {n} face(s); "
+              f"approx = {chosen.get(k) or 'NONE (exact)'} ---")
+        # face 1's contraction arrives on its own...
+        emit(f"face {step},1 contraction", [halves[0][0]])
+        for f in range(n):
+            hand("approximation head")
+            nxt = [halves[f][1]]
+            lbl = f"approximated contraction {step},{f + 1}"
+            if f + 1 < n:                  # ...then approx_k rides with face k+1
+                nxt.append(halves[f + 1][0])
+                lbl += f"  &  face {step},{f + 2} contraction"
+            emit(lbl, nxt)
+        hand("VE head" if step < len([1 for e in jaxpr.eqns
+                                      if by_central.get(e.outvars[0])])
+             else "done (order complete)")
 
     print("\n" + "=" * W)
     print(f"  STREAM {len(toks)} tokens = {head_end} base "
