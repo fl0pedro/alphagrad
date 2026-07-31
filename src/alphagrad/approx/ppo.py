@@ -439,6 +439,36 @@ _SP_TYPE_TO_PAIR = jnp.array([PAIR_STOP, 0, 1, 2, 3], dtype=jnp.int32)
 # ---------------------------------------------------------------------------
 
 
+def _zero_micro_action(max_substeps):
+    """Canonical inactive MicroAction: every sub-step END, nothing applied."""
+    S = max_substeps
+    z = jnp.zeros((S,), jnp.int32)
+    return MicroAction(
+        op_type=jnp.full((S,), OP_END, dtype=jnp.int32),
+        i=z, j=z,
+        exponents=jnp.zeros((S, MAX_PRIMES), jnp.int32),
+        factor=z, compress_kind=z, quant_dtype=z,
+        quant_scale_sign=jnp.ones((S,), jnp.int32),
+        quant_scale_frac=jnp.zeros((S,), jnp.float32),
+    )
+
+
+def _zero_micro_dists(max_substeps, n_axes):
+    """Point-mass dists matching the inactive action, so every KL term is 0."""
+    S = max_substeps
+    op_d = jnp.broadcast_to(
+        jnp.zeros((NUM_OPS,)).at[OP_END].set(1.0)[None, :], (S, NUM_OPS))
+    ij_d = jnp.broadcast_to(
+        jnp.zeros((n_axes,)).at[0].set(1.0)[None, :], (S, n_axes))
+    exp_d = jnp.broadcast_to(
+        jnp.zeros((MAX_PRIMES, MAX_EXPONENT + 1)).at[:, 0].set(1.0)[None, ...],
+        (S, MAX_PRIMES, MAX_EXPONENT + 1))
+    kind_d = jnp.broadcast_to(
+        jnp.zeros((NUM_COMPRESS_KINDS,)).at[0].set(1.0)[None, :],
+        (S, NUM_COMPRESS_KINDS))
+    return op_d, ij_d, ij_d, exp_d, kind_d
+
+
 def _zero_face_action():
     """Canonical inactive FaceAction (padding faces: no skip, END slots)."""
     F, S = ENV_MAX_FACES, FACE_SLOTS
@@ -952,6 +982,9 @@ class Agent(eqx.Module):
     # approximation actions (DIAG / COMPRESS / QUANT / END) per eliminated
     # vertex. Optional only so a bare Agent can be constructed in tests.
     micro_action_policy: MicroActionPolicy | None
+    # Needed to shape the inactive action when the approximation head is
+    # REMOVED (--no-approx-head): there is then no policy to ask for it.
+    max_substeps: int = eqx.field(static=True, default=16)
     # P1c: per-path decisions (--face-actions). None ⇒ per-vertex mode.
     face_path_policy: FacePathPolicy | None
     value_head_flops: MLP
@@ -1007,6 +1040,7 @@ class Agent(eqx.Module):
         embd_dim,
         op_embd_dim,
         micro_action_policy=None,
+        max_substeps=16,
         face_path_policy=None,
     ):
         self.embedding = embedding
@@ -1014,6 +1048,7 @@ class Agent(eqx.Module):
         self.encoder = encoder
         self.vertex_policy = vertex_policy
         self.micro_action_policy = micro_action_policy
+        self.max_substeps = int(max_substeps)
         self.face_path_policy = face_path_policy
         self.value_head_flops = value_head_flops
         self.value_head_mem = value_head_mem
@@ -1322,11 +1357,6 @@ class Agent(eqx.Module):
         ``--allow-compress=False`` to keep the policy from emitting
         COMPRESS micro-actions until the graphax wiring lands.
         """
-        if self.micro_action_policy is None:
-            raise RuntimeError(
-                "sample_action_dynamic called but micro_action_policy is "
-                "None — agent was built without --dynamic-substeps."
-            )
         net_key, vertex_key, micro_key = jrand.split(key, 3)
         if precomputed is not None:
             # 3b incremental-encode path: the caller already ran the carry
@@ -1369,6 +1399,25 @@ class Agent(eqx.Module):
             axis_state[vertex_idx],
             axis_valid_mask[vertex_idx],
         )
+
+        if self.micro_action_policy is None:
+            # --no-approx-head: there IS no approximation head. Emit the
+            # canonical inactive action; nothing is sampled or scored, and
+            # face_out stays None so no face policy is consulted either.
+            _n = features.size.shape[0]
+            _od, _id_, _jd, _ed, _kd = _zero_micro_dists(self.max_substeps, _n)
+            return (
+                vertex_idx,
+                _zero_micro_action(self.max_substeps),
+                vertex_dist,
+                _od, _id_, _jd, _ed, _kd,
+                jnp.asarray(0.0, jnp.float32),
+                jnp.zeros((_n, _n), jnp.float32),
+                jnp.zeros((_n,), jnp.float32),
+                None,
+                value,
+                v_context,
+            )
 
         # Live per-vertex DIAG/COMPRESS masks for the CHOSEN vertex (oracle rows
         # are 1-based; vertex_idx is 0-based). These are the authoritative masks
@@ -1494,8 +1543,30 @@ class Agent(eqx.Module):
         op_dists, i_dists, j_dists, exp_dists, sub_episode_length)``.
         """
         if self.micro_action_policy is None:
-            raise RuntimeError(
-                "evaluate_action_dynamic called but micro_action_policy is None."
+            # --no-approx-head: mirror sample() exactly -- zero micro log-prob
+            # and entropy, point-mass dists, so the PPO ratio is 1 on the
+            # approximation factor and every micro KL term is 0.
+            _feat = _axis_features_from_state(
+                axis_state[vertex_idx], axis_valid_mask[vertex_idx])
+            _n = _feat.size.shape[0]
+            _od, _id_, _jd, _ed, _kd = _zero_micro_dists(self.max_substeps, _n)
+            if precomputed is not None:
+                _vl, _vc, _val = precomputed
+            else:
+                _vl, _vc, _val = self.encode(
+                    tokens, eqn_ids=eqn_ids, vertex_features=vertex_features,
+                    residual_state=residual_state, preference=preference,
+                    key=key)
+            _vd = jnn.softmax(
+                _mask_vertex_logits(_vl, vertex_avail_mask), axis=-1)
+            return (
+                jnp.log(_vd[vertex_idx] + 1e-8),
+                entropy(_vd),
+                _val,
+                _vd,
+                jnp.asarray(0, jnp.int32),
+                _od, _id_, _jd, _ed, _kd,
+                jnp.asarray(0.0, jnp.float32),
             )
         if precomputed is not None:
             # 3b: same carry-derived triple the rollout sampled under (the
@@ -1834,6 +1905,16 @@ def make_argparser() -> argparse.ArgumentParser:
              "(square pair -> pure diagonal), and coprime pairs are masked "
              "out. Exposed through MicroActionPolicy's contract, so the env "
              "and loss are unchanged.")
+    p.add_argument(
+        "--no-approx-head", action="store_true",
+        help="REMOVE the approximation heads instead of masking them. "
+             "--variant ve_only only multiplies the op categorical by "
+             "[0,0,0,1]; both heads still exist, still hold parameters, and a "
+             "head the mask does not reach can still act -- the face SKIP gate "
+             "did exactly that, deleting Jacobian paths under a variant that "
+             "asked for none. With this flag neither micro_action_policy nor "
+             "face_path_policy is constructed: the pure "
+             "vertex-elimination-order control.")
     p.add_argument(
         "--force-pure-diag", action="store_true",
         help="NO-OP, accepted for launcher compatibility. --unified-head now "
@@ -2490,7 +2571,11 @@ def _build_agent(
     # Dynamic-substeps head: only constructed when the flag is on so the
     # default agent stays leaner (one extra encoder + MicroActionHead is
     # non-trivial parameter cost).
-    if getattr(args, "dynamic_substeps", False) and getattr(args, "unified_head", False):
+    if getattr(args, "no_approx_head", False):
+        # REMOVED, not masked: no approximation head is constructed, so the
+        # pytree holds no approximation parameters at all.
+        micro_action_policy = None
+    elif getattr(args, "dynamic_substeps", False) and getattr(args, "unified_head", False):
         # ONE flat head per vertex instead of the autoregressive sub-episode.
         # Presented through MicroActionPolicy's sample/evaluate contract so the
         # env decoder, Trajectory and PPO loss are untouched.
@@ -2512,7 +2597,8 @@ def _build_agent(
         )
     else:
         micro_action_policy = None
-    if getattr(args, "face_actions", False):
+    if getattr(args, "face_actions", False) and not getattr(
+            args, "no_approx_head", False):
         face_path_policy = FacePathPolicy(
             embd_dim=args.embd_dim,
             num_heads=args.num_heads,
@@ -2547,6 +2633,7 @@ def _build_agent(
         embd_dim=args.embd_dim,
         op_embd_dim=args.op_embd_dim,
         micro_action_policy=micro_action_policy,
+        max_substeps=int(getattr(args, "max_substeps", 16)),
         face_path_policy=face_path_policy,
     )
 
