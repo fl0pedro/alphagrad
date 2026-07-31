@@ -176,9 +176,9 @@ class UnifiedFaceHead(eqx.Module):
             lp_op, e_op = _cat_logp_ent(
                 z[b + S_OP:b + S_I], op_mask[s], op)
             # Branch masks: exactly the fields this op consumes.
-            is_bd = (op == OP_BLOCKDIAG).astype(jnp.float32)
-            is_rd = (op == OP_REDUCE).astype(jnp.float32)
-            is_qt = (op == OP_QUANT).astype(jnp.float32)
+            is_bd = op == OP_BLOCKDIAG
+            is_rd = op == OP_REDUCE
+            is_qt = op == OP_QUANT
 
             lp_i, e_i = _cat_logp_ent(
                 z[b + S_I:b + S_J], i_mask[s], fields.i[s])
@@ -193,10 +193,22 @@ class UnifiedFaceHead(eqx.Module):
             lp_dt, e_dt = _bern_logp_ent(
                 z[b + S_DTYPE], fields.dtype_idx[s] > 0)
 
-            slot_lp = lp_op + is_bd * (lp_i + lp_j) + is_rd * (lp_ax + lp_fn) \
-                + is_qt * lp_dt
-            slot_e = e_op + is_bd * (e_i + e_j) + is_rd * (e_ax + e_fn) \
-                + is_qt * e_dt
+            # SELECT, never multiply. A branch mask of 0.0 times a -inf
+            # log-prob is NaN, and the unused branches genuinely are -inf:
+            # _rows writes a canonical j = 0 for every non-DIAG slot, which
+            # j_mask_given_i masks out (it removes i itself), so evaluate
+            # scores an illegal index whose logit is -inf. sample() never hit
+            # it because it drew j from the masked distribution. This is the
+            # forward-value bug AND the classic 0*inf gradient trap.
+            _z0 = jnp.zeros_like(lp_op)
+            slot_lp = (lp_op
+                       + jnp.where(is_bd, lp_i + lp_j, _z0)
+                       + jnp.where(is_rd, lp_ax + lp_fn, _z0)
+                       + jnp.where(is_qt, lp_dt, _z0))
+            slot_e = (e_op
+                      + jnp.where(is_bd, e_i + e_j, _z0)
+                      + jnp.where(is_rd, e_ax + e_fn, _z0)
+                      + jnp.where(is_qt, e_dt, _z0))
             logp = logp + slot_lp * active
             ent = ent + slot_e * active
             arity = arity + active * (op != OP_NONE).astype(jnp.float32)
