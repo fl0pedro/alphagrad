@@ -81,6 +81,7 @@ from alphagrad.approx.env import (
     _AXIS_FEAT_GROUP_ID,
     consume_degenerate_plan_count,
     consume_truncated_plan_count,
+    consume_untraceable_plan_count,
     consume_zero_work_plan_count,
     consume_per_face_stats,
     consume_tokenization_truncation_stats,
@@ -5542,6 +5543,12 @@ def main():
             # computed nothing but was KEPT and punished by frob. They are
             # opposite treatments, so they get separate counters.
             "collapse/truncated_this_ep": consume_truncated_plan_count(),
+            # UNTRACEABLE is a SUBSET of truncated: graphax could not build the
+            # plan at all (the open canonical-output-order gap). Separated
+            # because OOM scales with plan size and this scales with nothing we
+            # control -- if it is a large fraction, the approx arm is sampling a
+            # region the library cannot evaluate and the run is not comparable.
+            "collapse/untraceable_this_ep": consume_untraceable_plan_count(),
             "collapse/zero_work_this_ep": consume_zero_work_plan_count(),
             "collapse/count_this_ep": n_collapsed_this_ep,
             "collapse/count_total": host_state["collapsed_total"],

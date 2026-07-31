@@ -507,6 +507,31 @@ def consume_truncated_plan_count() -> int:
     return n
 
 
+# Plans graphax could not TRACE (see _is_graphax_trace_failure in _callback).
+# Kept separate from the OOM count: OOM is a size problem and scales with the
+# plan, a trace failure is a library gap and scales with nothing we control.
+_UNTRACEABLE_PLANS = [0]
+_UNTRACEABLE_SEEN: set = set()
+
+
+def _record_untraceable_plan(exc: BaseException) -> None:
+    _UNTRACEABLE_PLANS[0] += 1
+    _TRUNCATED_PLANS[0] += 1
+    _DEGENERATE_PLANS[0] += 1
+    key = f"{type(exc).__name__}: {str(exc)[:120]}"
+    if key not in _UNTRACEABLE_SEEN:
+        _UNTRACEABLE_SEEN.add(key)
+        print(f"[trunc] graphax cannot trace this plan (excluded from "
+              f"gradient, distinct #{len(_UNTRACEABLE_SEEN)}): {key}",
+              flush=True)
+
+
+def consume_untraceable_plan_count() -> int:
+    n = _UNTRACEABLE_PLANS[0]
+    _UNTRACEABLE_PLANS[0] = 0
+    return n
+
+
 def consume_zero_work_plan_count() -> int:
     n = _ZERO_WORK_PLANS[0]
     _ZERO_WORK_PLANS[0] = 0
@@ -2220,6 +2245,30 @@ def _callback(
             "OOM WHEN ALLOCATING", "CUDA_ERROR_OUT_OF_MEMORY",
         ))
 
+    def _is_graphax_trace_failure(exc: BaseException) -> bool:
+        """True when the exception was RAISED INSIDE graphax.
+
+        Deliberately keyed on traceback origin rather than on the message, so
+        an alphagrad-side bug with a similar message still propagates and kills
+        the run. The known instance is
+        ``_normalize_inputs`` refusing to add a tensor to its own transpose
+        ((16,10,784,256) vs (16,10,256,784)) -- the open canonical-output-order
+        gap -- but the whole family belongs here: the plan is well-defined and
+        the library cannot build it, which is apparatus failure, not plan
+        quality.
+        """
+        tb = exc.__traceback__
+        while tb is not None:
+            fn = tb.tb_frame.f_code.co_filename
+            if f"{os.sep}graphax{os.sep}" in fn:
+                return True
+            tb = tb.tb_next
+        return False
+
+    def _trace_truncate(where: str, exc: BaseException):
+        _record_untraceable_plan(exc)
+        return tokens, eqn_ids, _truncated_reward()
+
     def _oom_truncate(where: str, exc: BaseException):
         _record_truncated_plan()
         # Free whatever the failed attempt is still holding before returning,
@@ -2238,6 +2287,8 @@ def _callback(
         compiled_approx = cached_compile(
             b"approx:" + cache_key, _do_compile_approx)
     except Exception as _exc:
+        if _is_graphax_trace_failure(_exc):
+            return _trace_truncate("approx compile", _exc)
         if not _is_oom(_exc):
             raise
         return _oom_truncate("approx compile", _exc)
@@ -2253,6 +2304,8 @@ def _callback(
             compiled_exact = cached_compile(
                 b"exact:" + exact_cache_key, _do_compile_exact)
         except Exception as _exc:
+            if _is_graphax_trace_failure(_exc):
+                return _trace_truncate("exact compile", _exc)
             if not _is_oom(_exc):
                 raise
             return _oom_truncate("exact compile", _exc)
@@ -2432,6 +2485,8 @@ def _callback(
                         _EXACT_CACHE[_ex_key] = out_exact
 
     except Exception as _exc:
+        if _is_graphax_trace_failure(_exc):
+            return _trace_truncate("measurement", _exc)
         if not _is_oom(_exc):
             raise
         return _oom_truncate('measurement', _exc)
