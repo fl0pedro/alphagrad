@@ -244,26 +244,30 @@ class UnifiedMicroPolicy(eqx.Module):
         arity = jnp.where(is_rd, n_sel, jnp.where(is_bd | is_qt, 1, 0))
         return actions, arity.astype(jnp.int32)
 
-    def _dists(self, z, features):
-        """Legacy per-sub-step dists the PPO KL terms consume.
+    def _dists(self, z, features, actions):
+        """Per-sub-step dists as POINT MASSES at the taken action.
 
-        The exponent dist is now a point mass on 0 for every prime: the factor
-        is derived, not sampled, so its KL contribution is identically zero.
+        These feed `old_micro_log_prob_for_action`, which REBUILDS the old
+        log-prob by summing log(dist[action]) over the sub-step heads. This
+        head cannot be expressed that way -- there is no slot for the skip
+        Bernoulli, the nine axis gates, the reduce-fn or the dtype bit -- so
+        any partial reconstruction disagrees with `score()` and the PPO ratio
+        stops being 1 at epoch 0 (measured: median 2.37, max 2.3e23).
+
+        Emitting point masses makes every rebuilt term log(1) = 0, and the
+        joint log-prob is carried intact in the `quant_logp` slot instead. The
+        ratio is then exactly exp(score_new - score_old).
         """
         S, n = self.max_substeps, features.size.shape[0]
-        op_d = jnp.broadcast_to(jnn.softmax(z[O_OP:O_I])[None, :], (S, NUM_OPS))
-        pad = max(0, n - MAX_PAIR_IDX)
-        i_p = jnp.concatenate([jnn.softmax(z[O_I:O_J]), jnp.zeros((pad,))])[:n]
-        j_p = jnp.concatenate([jnn.softmax(z[O_J:O_AXES]), jnp.zeros((pad,))])[:n]
-        i_d = jnp.broadcast_to(i_p[None, :], (S, n))
-        j_d = jnp.broadcast_to(j_p[None, :], (S, n))
-        exp_d = jnp.broadcast_to(
-            jnp.zeros((MAX_PRIMES, MAX_EXPONENT + 1)).at[:, 0].set(1.0)[None, ...],
-            (S, MAX_PRIMES, MAX_EXPONENT + 1))
-        kp = jnn.softmax(z[O_RFN:O_DTYPE])
-        kind_d = jnp.broadcast_to(
-            jnp.zeros((NUM_COMPRESS_KINDS,)).at[_KIND_MAP].set(kp)[None, :],
-            (S, NUM_COMPRESS_KINDS))
+        ops = jnp.clip(actions.op_type, 0, NUM_OPS - 1)
+        op_d = jnn.one_hot(ops, NUM_OPS)
+        i_d = jnn.one_hot(jnp.clip(actions.i, 0, n - 1), n)
+        j_d = jnn.one_hot(jnp.clip(actions.j, 0, n - 1), n)
+        exp_d = jnn.one_hot(
+            jnp.clip(actions.exponents, 0, MAX_EXPONENT), MAX_EXPONENT + 1)
+        kind_d = jnn.one_hot(
+            jnp.clip(actions.compress_kind, 0, NUM_COMPRESS_KINDS - 1),
+            NUM_COMPRESS_KINDS)
         return op_d, i_d, j_d, exp_d, kind_d
 
     # ---------------------------------------------------------------- sample
@@ -287,9 +291,12 @@ class UnifiedMicroPolicy(eqx.Module):
         act = _Fields(skip=skip, op=op, i=i_idx + 1, j=j_idx + 1, axes=axes,
                       reduce_fn=rfn, dtype_idx=dt.astype(jnp.int32))
         actions, arity = self._emit(act, tables, init_features)
-        op_d, i_d, j_d, exp_d, kind_d = self._dists(z, init_features)
+        op_d, i_d, j_d, exp_d, kind_d = self._dists(z, init_features, actions)
+        # The joint log-prob rides in the quant_logp slot: the loss's
+        # reconstruction adds it verbatim, and the point-mass dists above
+        # contribute 0, so old_log_probs == this exact value.
         return (actions, lp, ent, arity,
-                op_d, i_d, j_d, exp_d, kind_d, jnp.asarray(0.0, jnp.float32))
+                op_d, i_d, j_d, exp_d, kind_d, lp)
 
     # -------------------------------------------------------------- evaluate
     def evaluate(self, vertex_context, init_features, tables, actions,
@@ -319,6 +326,5 @@ class UnifiedMicroPolicy(eqx.Module):
             op_mask=op_mask, i_mask=i_mask, j_mask=j_mask,
             axis_mask=axis_mask, pair_ok=pair_ok)
         arity = jnp.sum((ops != OP_END).astype(jnp.int32))
-        op_d, i_d, j_d, exp_d, kind_d = self._dists(z, init_features)
-        return (lp, ent, arity, op_d, i_d, j_d, exp_d, kind_d,
-                jnp.asarray(0.0, jnp.float32))
+        op_d, i_d, j_d, exp_d, kind_d = self._dists(z, init_features, actions)
+        return (lp, ent, arity, op_d, i_d, j_d, exp_d, kind_d, lp)

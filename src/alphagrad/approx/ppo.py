@@ -4540,6 +4540,23 @@ def main():
             batch.old_micro_kind_dists,
             batch.old_micro_quant_logp,
         )
+        if getattr(args, "unified_head", False):
+            # The unified head's joint log-prob is NOT rebuildable from the
+            # per-sub-step dists: there is no slot for the skip Bernoulli, the
+            # nine axis gates, the reduce-fn or the dtype bit. Reconstructing
+            # it anyway made the two sides of the ratio different formulas --
+            # measured median 2.37, max 2.3e23, at epoch 0 with identical
+            # weights, which is the 1e5-1e10 PPO loss seen from episode 0.
+            # The adapter stores the real joint log-prob in the quant slot and
+            # emits point-mass sub-step dists (so the reconstruction's other
+            # terms are log(1) = 0); take it directly, ungated, because the
+            # in-function quant term only fires for OP_QUANT.
+            _vd = jnp.clip(batch.vertex_idx.astype(jnp.int32), 0,
+                           batch.old_vertex_dist.shape[-1] - 1)
+            _v_old = jnp.log(
+                jnp.take_along_axis(batch.old_vertex_dist, _vd[:, None],
+                                    axis=-1).squeeze(-1) + 1e-8)
+            old_log_probs = _v_old + batch.old_micro_quant_logp
         if args.face_actions:
             # The behaviour policy's face log-prob was captured as a scalar at
             # sample time (FacePathPolicy sample == evaluate parity is unit-
