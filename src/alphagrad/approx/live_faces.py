@@ -345,6 +345,25 @@ class LiveFaceStream:
         self._chunks[ck] = res
         return res
 
+    def n_faces(self, order, specs, n, vertex):
+        """Face count of ``vertex`` on the live prefix graph -- the rollout
+        while_loop's trip count. Raises if it ever exceeds ``max_faces``:
+        the width is the provable ancestors-x-descendants bound, so an
+        excess means the bound argument is violated and a silent clamp
+        would shrink the action space behind a healthy-looking run."""
+        try:
+            tk = self._tokenizer_at(
+                np.asarray(order).reshape(-1), np.asarray(specs), int(n))
+            k = len(list(tk.ij.faces(int(vertex))))
+        except Exception:
+            self.stats["failures"] += 1
+            return 0
+        if k > self.max_faces:
+            raise RuntimeError(
+                f"vertex {vertex}: {k} faces exceed the derived bound "
+                f"{self.max_faces}")
+        return int(k)
+
     def consume_stats(self) -> dict:
         out = dict(self.stats)
         for k in self.stats:

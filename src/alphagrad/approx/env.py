@@ -629,21 +629,58 @@ MAX_RULES_PER_VERTEX = 16
 # row per slot (pre / post / new). Must match the oracle's
 # ``face_masks(v, max_faces)`` budget — both enumerate faces in the SAME
 # canonical visit order (``faces_of``).
-# 16, not 8. MEASURED on the nn256 cross-entropy graph over 82 elimination
-# orders: the per-vertex face count peaks at 12 (vertex 9, `add`, 3 preds x 4
-# succs after fill-in), and 8 silently dropped faces 9..12 -- they ran exact
-# while every counter reported a healthy run. There is no cheap hard bound
-# (faces = |preds| x |succs| and fill-in grows both), so the cap stays, but
-# `_face_transforms_for_order` now COUNTS what it drops instead of slicing
-# quietly. Raise it if `faces/over_cap` is ever non-zero.
-MAX_FACES = int(os.environ.get("ALPHAGRAD_MAX_FACES", "16"))
-_FACE_CAP_STATS = {"over_cap": 0, "max_seen": 0}
+# NOT a knob. The width is the provable per-graph bound, set by
+# ``configure_max_faces`` at launch: faces(v) = |live preds| x |live succs|,
+# elimination only contracts paths, so live neighbours are subsets of the
+# ORIGINAL ancestors/descendants and faces(v) <= |anc(v)|*|desc(v)| for every
+# order. No order can exceed it, so nothing can be truncated. The history
+# that mandates this: 8 silently dropped faces 9..12 of the xent graph's
+# vertex 9 -- they ran exact while every counter reported a healthy run.
+# ALPHAGRAD_MAX_FACES survives only as an explicit experiment override.
+MAX_FACES = int(os.environ.get("ALPHAGRAD_MAX_FACES", "0")) or 16
+_FACE_CAP_STATS = {"max_seen": 0}
+
+
+def derived_max_faces(jaxpr, argnums, consts, args) -> int:
+    """max_v |ancestors(v)| * |descendants(v)| over the PRUNED Jacobian
+    graph -- an upper bound on any vertex's face count under any order."""
+    from graphax.incremental import IncrementalJaxpr
+    ij = IncrementalJaxpr(jaxpr, tuple(argnums), list(consts), list(args),
+                          track_faces=False)
+    g = {k: set(v.keys()) for k, v in ij.graph.items()}
+    tg = {k: set(v.keys()) for k, v in ij.tgraph.items()}
+    for d, o in ((g, tg), (tg, g)):
+        for n in o:
+            d.setdefault(n, set())
+
+    def closure(adj, start):
+        seen, stack = set(), [start]
+        while stack:
+            for w in adj.get(stack.pop(), ()):
+                if w not in seen:
+                    seen.add(w)
+                    stack.append(w)
+        return seen
+
+    best = 1
+    for v in g:
+        b = len(closure(tg, v)) * len(closure(g, v))
+        if b > best:
+            best = b
+    return int(best)
+
+
+def configure_max_faces(n: int) -> None:
+    """Rebind the face width BEFORE any shape is built from it. The env
+    var, if set, wins -- it is the explicit experiment override."""
+    global MAX_FACES
+    if os.environ.get("ALPHAGRAD_MAX_FACES"):
+        return
+    MAX_FACES = int(n)
 
 
 def consume_face_cap_stats() -> dict:
-    out = dict(_FACE_CAP_STATS)
-    _FACE_CAP_STATS["over_cap"] = 0
-    return out
+    return dict(_FACE_CAP_STATS)
 FACE_SLOTS = 3  # pre (lhs), post (rhs), new (res)
 NUM_AXIS_PAIRS = 4
 
@@ -1787,9 +1824,13 @@ def _face_transforms_for_order(config, consts, args, o_list, specs_list,
         if len(keys) > _FACE_CAP_STATS["max_seen"]:
             _FACE_CAP_STATS["max_seen"] = len(keys)
         if len(keys) > MAX_FACES:
-            # NEVER a silent slice: the dropped faces run exact, which is a
-            # smaller action space reported as if it were the full one.
-            _FACE_CAP_STATS["over_cap"] += len(keys) - MAX_FACES
+            # The width is the PROVABLE bound, so this cannot fire unless
+            # the ancestors x descendants argument is wrong -- in which case
+            # a silent slice would shrink the action space while reporting
+            # a healthy run. Die loudly instead.
+            raise RuntimeError(
+                f"vertex {v}: {len(keys)} faces exceed the derived bound "
+                f"{MAX_FACES} -- the subset argument is violated")
         for f, key in enumerate(keys[:MAX_FACES]):
             if int(skips_f[f]) == 1:
                 per_face[key] = SKIP_FACE

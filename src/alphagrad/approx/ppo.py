@@ -106,7 +106,7 @@ from alphagrad.approx.env import (
     VertexEliminationEnv,
     micro_actions_to_rule_specs_jax,
 )
-from alphagrad.approx.live_faces import FACE_TOKEN_WINDOW, LiveFaceStream
+from alphagrad.approx.live_faces import LiveFaceStream
 from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
 from alphagrad.approx.heads import (
     COMPRESS_KINDS,
@@ -598,14 +598,19 @@ class Trajectory(NamedTuple):
     face_comp_valid: jax.Array    # (MAX_FACES, N) float32
     face_valid: jax.Array         # (MAX_FACES,) float32
     face_old_logp: jax.Array      # () float32
-    # The per-face token chunks the approximation head actually read, one
-    # `=>` handoff each: face f-1's approximation equations followed by face
-    # f's contraction. Stored because the loss re-runs the same recurrence
-    # over them -- without them it could only re-score against a context the
-    # rollout never used, and the ratio would not be 1.
-    face_tokens: jax.Array        # (MAX_FACES, FACE_TOKEN_WINDOW) int32
-    face_eqns: jax.Array          # (MAX_FACES, FACE_TOKEN_WINDOW) int32
+    # Per-face chunk LENGTHS -- the only face-stream data the loss needs.
+    # The chunks concatenate to exactly the step delta (pinned property), so
+    # boundaries are the counts' cumsum and the loss pools the delta rows it
+    # already computes in `_carry_heads`. The token windows that used to sit
+    # here were the storage that made any face width expensive.
     face_counts: jax.Array        # (MAX_FACES,) int32
+    # THIS step's emission (the current vertex's contractions + approx
+    # echoes), sliced from next_state.tokens at the post-decision carry pos.
+    # It is NOT in `tokens` (that buffer is the PRE-step stream), and it is
+    # what the face chunks concatenate to -- the loss scans it once from the
+    # stored carry's continuation and pools between chunk boundaries.
+    face_delta_tokens: jax.Array  # (MAX_DELTA_TOKENS,) int32
+    face_delta_eqns: jax.Array    # (MAX_DELTA_TOKENS,) int32
     # Phase 3b (--incremental-encode; degenerate (0,) shapes otherwise). The
     # PRE-step encoder carry + vertex memory, and the delta's owner vertex —
     # everything the loss needs to re-derive this step's encoding by
@@ -666,9 +671,9 @@ class TrainBatch(NamedTuple):
     face_comp_valid: jax.Array
     face_valid: jax.Array
     face_old_logp: jax.Array
-    face_tokens: jax.Array
-    face_eqns: jax.Array
     face_counts: jax.Array
+    face_delta_tokens: jax.Array
+    face_delta_eqns: jax.Array
     enc_M: jax.Array
     enc_I: jax.Array
     enc_cumhist: jax.Array
@@ -1369,6 +1374,7 @@ class Agent(eqx.Module):
         precomputed=None,         # 3b: (vertex_logits, vertex_contexts, value) from the carry path
         oracle_fn=None,           # perf: called with the SAMPLED vertex, returns that vertex's masks only
         face_chunk_fn=None,       # (f, vertex_specs, rows, skips) -> that face's token chunk
+        face_count_fn=None,       # vertex -> ACTUAL face count (while_loop trip count)
         enc_carry=None,           # step carry the per-face SIDE carry branches from
     ):
         """Same as :meth:`sample_action` but routes the rule head through
@@ -1517,9 +1523,9 @@ class Agent(eqx.Module):
                     )
                 )
                 _F = self.face_path_policy.max_faces
-                f_tok = jnp.zeros((_F, FACE_TOKEN_WINDOW), jnp.int32)
-                f_eqn = -jnp.ones((_F, FACE_TOKEN_WINDOW), jnp.int32)
                 f_cnt = jnp.zeros((_F,), jnp.int32)
+                f_dt = jnp.zeros((MAX_DELTA_TOKENS,), jnp.int32)
+                f_de = -jnp.ones((MAX_DELTA_TOKENS,), jnp.int32)
             else:
                 # The per-vertex micro action is already drawn, and it applies
                 # to every face, so the contraction the head reads has to
@@ -1533,15 +1539,15 @@ class Agent(eqx.Module):
                     quant_scale_signs=actions.quant_scale_sign,
                     quant_scale_fracs=actions.quant_scale_frac,
                 ).astype(jnp.int32)
-                (fa, face_logp, face_ent, f_tok, f_eqn,
-                 f_cnt) = self._face_loop(
+                (fa, face_logp, face_ent, f_cnt, f_dt,
+                 f_de) = self._face_loop(
                     v_context, features, factor_tables, face_key,
                     f_pair, f_comp, f_valid, enc_carry, face_chunk_fn,
                     vertex_idx, _vspecs, axis_state[vertex_idx],
-                    op_legality_override,
+                    op_legality_override, face_count_fn(vertex_idx),
                 )
             face_out = (fa, face_logp, face_ent, f_pair, f_comp, f_valid,
-                        f_tok, f_eqn, f_cnt)
+                        f_cnt, f_dt, f_de)
 
         return (
             vertex_idx,
@@ -1573,14 +1579,14 @@ class Agent(eqx.Module):
         needs a fixed trip count, but a vertex has 1-12 faces on this graph
         and 4 have none at all, so most iterations carry nothing -- measured
         84 real faces against 23x16 = 368 iterations, i.e. 77% of the
-        per-face encoder work was a full ``FACE_TOKEN_WINDOW`` scan over
+        per-face encoder work was a full window scan over
         padding. An empty chunk must also leave the carry EXACTLY where it
         was, which the skip guarantees and the all-invalid scan only
         approximates.
         """
         def _run(c):
             c2, rows, valid, _e = self.encode_extend(
-                c, tokens, eqns, count, window=FACE_TOKEN_WINDOW, start=0)
+                c, tokens, eqns, count, window=MAX_DELTA_TOKENS, start=0)
             return c2, self._face_pool(rows, valid, count)
 
         def _skip(c):
@@ -1613,72 +1619,139 @@ class Agent(eqx.Module):
             row["quant_scale_sign"], row["quant_scale_frac"],
         ).astype(jnp.int32)
 
+    _WIRE_KEYS = ("op_type", "i", "j", "exponents", "factor",
+                  "compress_kind", "quant_dtype", "quant_scale_sign",
+                  "quant_scale_frac")
+
     def _face_loop(self, v_context, features, factor_tables, key,
                    f_pair, f_comp, f_valid, enc_carry, face_chunk_fn,
                    vertex_idx, vertex_specs, axis_state_v,
-                   op_legality_override):
-        """Read face f's chunk, decide face f, repeat. The decided rows are
-        what the next callback replays, so face f+1's contraction reflects
-        face f's approximation -- the whole point of the loop."""
+                   op_legality_override, n_faces):
+        """Read face f's chunk, decide face f, repeat -- for the ACTUAL face
+        count, as a while_loop.
+
+        The width F is the provable per-graph bound (196 on nn256-xent) and
+        a python loop unrolled F copies of the encoder scan into the
+        program: the F=16 smokes were OOM-killed at 64G during COMPILE.
+        The body compiles once and runs ``n_faces`` times (the rollout is
+        forward-only, so a dynamic trip count is legal). Padding faces
+        never run -- wire rows stay END/skip-0 and counts stay 0, which the
+        loss's gated evaluate scores as exactly zero, the same contract the
+        unrolled loop's padding iterations had."""
         pol = self.face_path_policy
         F = pol.max_faces
-        keys = jrand.split(key, F)
-        carry = enc_carry
-        rows_specs = -jnp.ones((F, FACE_SLOTS, 3), jnp.int32)
-        skips = jnp.zeros((F,), jnp.int32)
-        logp = jnp.array(0.0)
-        ent = jnp.array(0.0)
-        toks, eqns, cnts, wire = [], [], [], []
-        for f in range(F):
+        S = FACE_SLOTS
+        n = jnp.minimum(jnp.asarray(n_faces, jnp.int32), F)
+        wire0 = (
+            jnp.full((F, S), OP_END, dtype=jnp.int32),     # op_type
+            jnp.zeros((F, S), jnp.int32),                  # i
+            jnp.zeros((F, S), jnp.int32),                  # j
+            jnp.zeros((F, S, MAX_PRIMES), jnp.int32),      # exponents
+            jnp.zeros((F, S), jnp.int32),                  # factor
+            jnp.zeros((F, S), jnp.int32),                  # compress_kind
+            jnp.zeros((F, S), jnp.int32),                  # quant_dtype
+            jnp.ones((F, S), jnp.int32),                   # quant_scale_sign
+            jnp.zeros((F, S), jnp.float32),                # quant_scale_frac
+        )
+        W = MAX_DELTA_TOKENS
+        st0 = (jnp.asarray(0, jnp.int32), enc_carry, jnp.array(0.0),
+               jnp.array(0.0), jnp.zeros((F,), jnp.int32),
+               jnp.zeros((F,), jnp.int32),
+               -jnp.ones((F, S, 3), jnp.int32), wire0,
+               jnp.zeros((W,), jnp.int32), -jnp.ones((W,), jnp.int32),
+               jnp.asarray(0, jnp.int32))
+
+        def _body(st):
+            f, carry, logp, ent, skips, cnts, rs, wa, ftok, feqn, off = st
             tk_f, eq_f, ct_f = face_chunk_fn(f, vertex_idx, vertex_specs,
-                                             rows_specs, skips)
-            carry, summ = self._face_encode(carry, tk_f, eq_f, ct_f)
+                                             rs, skips)
+            # Concatenate this chunk into the step's face stream -- the
+            # EXACT tokens the head reads. The final emission is NOT a
+            # substitute: chunk f's contraction is deliberately unhooked
+            # (the face is undecided when read), while the real stream
+            # emits it WITH its approximation -- a counterfactual the loss
+            # can only reproduce from what was actually read (emission-
+            # window replay measured ratio/max_log 778 at epoch 0).
+            # ct_eff clamps to the remaining buffer AND feeds the encoder,
+            # so sampling and the loss truncate identically if a step's
+            # chunks ever exceed the window.
+            ct_eff = jnp.minimum(jnp.asarray(ct_f, jnp.int32), W - off)
+            _ar_w = jnp.arange(W, dtype=jnp.int32)
+            _m = _ar_w < ct_eff
+            ftok = ftok.at[off + _ar_w].set(
+                jnp.where(_m, tk_f, 0), mode="drop")
+            feqn = feqn.at[off + _ar_w].set(
+                jnp.where(_m, eq_f, -1), mode="drop")
+            carry, summ = self._face_encode(carry, tk_f, eq_f, ct_eff)
             sk, row, lp, e, _ar, _sp, _od = pol.sample_face(
-                v_context, features, factor_tables, keys[f], f,
-                f_pair[f], f_comp[f], f_valid[f], face_context=summ,
+                v_context, features, factor_tables, jrand.fold_in(key, f),
+                f, f_pair[f], f_comp[f], f_valid[f], face_context=summ,
                 op_legality_override=op_legality_override)
-            rows_specs = rows_specs.at[f].set(
-                self._face_row_specs(row, axis_state_v))
+            rs = rs.at[f].set(self._face_row_specs(row, axis_state_v))
             skips = skips.at[f].set(sk.astype(jnp.int32))
-            logp = logp + lp
-            ent = ent + e
-            toks.append(tk_f)
-            eqns.append(eq_f)
-            cnts.append(ct_f)
-            wire.append(row)
-        fa = FaceAction(skip=skips,
-                        **{k: jnp.stack([w[k] for w in wire])
-                           for k in wire[0]})
-        return (fa, logp, ent, jnp.stack(toks), jnp.stack(eqns),
-                jnp.stack(cnts))
+            cnts = cnts.at[f].set(ct_eff)
+            wa = tuple(w.at[f].set(row[k])
+                       for w, k in zip(wa, self._WIRE_KEYS))
+            return (f + 1, carry, logp + lp, ent + e, skips, cnts, rs, wa,
+                    ftok, feqn, off + ct_eff)
+
+        (_f, _c, logp, ent, skips, cnts, _rs, wa, ftok, feqn,
+         _off) = lax.while_loop(lambda st: st[0] < n, _body, st0)
+        fa = FaceAction(skip=skips, **dict(zip(self._WIRE_KEYS, wa)))
+        return fa, logp, ent, cnts, ftok, feqn
 
     def _face_replay(self, v_context, features, factor_tables, fa,
                      f_pair, f_comp, f_valid, enc_carry, face_chunks,
                      op_legality_override):
-        """Score the stored FaceAction off the STORED chunks.
+        """Score the stored FaceAction against contexts pooled from ONE scan
+        of the stored emission window.
 
-        No callback and no host replay: the tokens the rollout read are in the
-        trajectory, so this is the same recurrence through current parameters.
-        Gradient reaches palimpsa through the chunks and truncates at the
-        stored step carry, exactly as `_carry_heads` does for the step delta.
+        The chunks the head read at sampling concatenate to a prefix of this
+        step's emission (the tail is the last face's approximation, which no
+        chunk contains), and the side carry branched from exactly
+        ``enc_carry`` -- so one ``encode_extend`` over the stored window
+        reproduces every chunk row byte-for-byte (the recurrence is causal),
+        and face f's context is the mean of rows [s_f, e_f) with boundaries
+        the counts' cumsum. One window scan per sample, against the old
+        design's F scans over F stored windows. Gradient reaches palimpsa
+        through this scan; truncation at the stored carry, as everywhere.
+
+        ``face_chunks`` is ``(counts (F,), tokens (W,), eqns (W,))``.
         """
         pol = self.face_path_policy
         F = pol.max_faces
-        f_tok, f_eqn, f_cnt = face_chunks
-        carry = enc_carry
-        logp = jnp.array(0.0)
-        ent = jnp.array(0.0)
-        arity = jnp.array(0.0)
-        for f in range(F):
-            carry, summ = self._face_encode(
-                carry, f_tok[f], f_eqn[f], f_cnt[f])
+        f_cnt, f_toks, f_eqns = face_chunks
+        total = jnp.sum(f_cnt.astype(jnp.int32))
+        _, rows, _valid, _e = self.encode_extend(
+            enc_carry, f_toks, f_eqns, total,
+            window=MAX_DELTA_TOKENS, start=0)
+        # Exclusive-prefix boundaries from the counts; pooled mean per span.
+        # An empty chunk gives s == e -> zero context, matching the rollout's
+        # `_face_encode` skip exactly.
+        cum = jnp.concatenate(
+            [jnp.zeros((1, rows.shape[-1]), rows.dtype),
+             jnp.cumsum(rows, axis=0)], axis=0)          # (W+1, E)
+        ends = jnp.cumsum(f_cnt.astype(jnp.int32))
+        starts = ends - f_cnt.astype(jnp.int32)
+
+        # scan, not a python loop: F is the provable bound (196 here), and
+        # unrolling it multiplied the program by F. scan keeps reverse-mode
+        # AD (while_loop would not); padding faces are gated to zero by the
+        # stored face_valid, so the extra iterations cost one small MLP each.
+        def _scan_f(acc, f):
+            logp, ent, arity = acc
+            span = (cum[jnp.clip(ends[f], 0, rows.shape[0])]
+                    - cum[jnp.clip(starts[f], 0, rows.shape[0])])
+            summ = span / jnp.maximum(f_cnt[f].astype(jnp.float32), 1.0)
             lp, e, ar, _sp, _od = pol.evaluate_face(
                 v_context, features, factor_tables, fa, f,
                 f_pair[f], f_comp[f], f_valid[f], face_context=summ,
                 op_legality_override=op_legality_override)
-            logp = logp + lp
-            ent = ent + e
-            arity = arity + ar
+            return (logp + lp, ent + e, arity + ar), None
+
+        (logp, ent, arity), _ = lax.scan(
+            _scan_f, (jnp.array(0.0), jnp.array(0.0), jnp.array(0.0)),
+            jnp.arange(F))
         return logp, ent, arity
 
     def evaluate_action_dynamic(
@@ -1704,8 +1777,8 @@ class Agent(eqx.Module):
         face_comp_valid=None,  # stored (F,N)
         face_valid=None,       # stored (F,)
         precomputed=None,      # 3b: (vertex_logits, vertex_contexts, value) from the carry path
-        face_chunks=None,      # (tokens, eqns, counts) the rollout's per-face chunks
-        face_carry=None,       # step carry the per-face SIDE carry branches from
+        face_chunks=None,      # (counts, emission tokens, emission eqns)
+        face_carry=None,       # carry2: where the sampling side carry branched
     ):
         """Joint log-prob / entropy for a stored typed action sequence.
 
@@ -3706,6 +3779,19 @@ def main():
     # P1c: per-FACE masks for every candidate vertex (1-based rows like the
     # per-vertex masks). Only used under --face-actions; the extra probing
     # (face_masks per candidate) roughly doubles the oracle's host cost.
+    if getattr(args, "face_actions", False):
+        # Face width = the provable per-graph bound, derived BEFORE anything
+        # builds a shape from it (env wire arrays, the 94-head's max_faces,
+        # the trajectory zero-fills all read it downstream of here).
+        from alphagrad.approx import env as _env_mod
+        _B = _env_mod.derived_max_faces(
+            closed_jaxpr.jaxpr, argnums, closed_jaxpr.literals, xs)
+        _env_mod.configure_max_faces(_B)
+        global ENV_MAX_FACES
+        ENV_MAX_FACES = _env_mod.MAX_FACES
+        print(f"face width: derived bound {_B} "
+              f"(max_v |anc|x|desc|; in force: {ENV_MAX_FACES})")
+
     _F_FACES = ENV_MAX_FACES
 
     def _oracle_face_masks_host(order, spec_hist, step_count):
@@ -3866,6 +3952,11 @@ def main():
             _oracle_jaxpr, _oracle_argnums, _oracle_consts, _oracle_args,
             vocab=int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "248")),
             max_faces=_F_FACES, max_axes=_oracle_N,
+            # A chunk is a slice of the step delta, so the delta cap is the
+            # one honest window: truncation becomes impossible whenever the
+            # delta itself fits, and the stored counts stay exact for the
+            # loss's cumsum boundaries.
+            window=MAX_DELTA_TOKENS,
         )
 
     def _live_face_host(order, spec_hist, step_count, vertex_idx,
@@ -3884,15 +3975,29 @@ def main():
 
     def _live_face(f, order, spec_hist, step_count, vertex_idx, vertex_specs,
                    face_rows, face_skips):
-        W = FACE_TOKEN_WINDOW
+        W = MAX_DELTA_TOKENS
+        # f rides as an OPERAND: inside the while_loop it is a tracer, and
+        # a partial would freeze it into the callback as a python object
+        # (TracerArrayConversionError at the first body run).
         return jax.pure_callback(
-            partial(_live_face_host, f=f),
+            _live_face_host,
             (jax.ShapeDtypeStruct((W,), jnp.int32),
              jax.ShapeDtypeStruct((W,), jnp.int32),
              jax.ShapeDtypeStruct((), jnp.int32)),
             order, spec_hist, step_count, vertex_idx, vertex_specs,
-            face_rows, face_skips, vmap_method="sequential",
+            face_rows, face_skips, f, vmap_method="sequential",
         )
+
+    def _live_face_count_host(order, spec_hist, step_count, vertex_idx):
+        return np.int32(_LIVE_FACES.n_faces(
+            order, spec_hist, int(np.asarray(step_count)),
+            int(np.asarray(vertex_idx)) + 1))
+
+    def _live_face_count(order, spec_hist, step_count, vertex_idx):
+        return jax.pure_callback(
+            _live_face_count_host, jax.ShapeDtypeStruct((), jnp.int32),
+            order, spec_hist, step_count, vertex_idx,
+            vmap_method="sequential")
 
     _ORACLE_ONE_VERTEX = os.environ.get(
         "ALPHAGRAD_ORACLE_ONE_VERTEX", "1") == "1"
@@ -4249,6 +4354,7 @@ def main():
                 )
 
             face_chunk_fn = None
+            face_count_fn = None
             if _LIVE_FACES is not None:
                 _fc_o, _fc_s, _fc_k = (
                     state.order, state.sparsity_specs, state.step_count)
@@ -4257,6 +4363,9 @@ def main():
                                   _o=_fc_o, _s=_fc_s, _k=_fc_k):
                     return _live_face(_f, _o, _s, _k, _v,
                                       _vspecs, _rows, _skips)
+
+                def face_count_fn(_v, _o=_fc_o, _s=_fc_s, _k=_fc_k):
+                    return _live_face_count(_o, _s, _k, _v)
 
             if args.dynamic_substeps:
                 # Live per-vertex DIAG/COMPRESS masks for the current graph
@@ -4323,6 +4432,7 @@ def main():
                     precomputed=precomputed,
                     oracle_fn=oracle_one_fn,
                     face_chunk_fn=face_chunk_fn,
+                    face_count_fn=face_count_fn,
                     enc_carry=(enc_carry2 if args.incremental_encode
                                else None),
                 )
@@ -4332,8 +4442,8 @@ def main():
                     vertex_idx.astype(elim_order.dtype))
                 if face_out is not None:
                     (face_action, face_old_logp, _face_ent, face_pair_v,
-                     face_comp_v, face_valid_v, face_tok_v, face_eqn_v,
-                     face_cnt_v) = face_out
+                     face_comp_v, face_valid_v, face_cnt_v, face_dt_v,
+                     face_de_v) = face_out
                 else:
                     face_action = _zero_face_action()
                     face_old_logp = jnp.array(0.0)
@@ -4343,11 +4453,9 @@ def main():
                     face_comp_v = jnp.zeros(
                         (ENV_MAX_FACES, MAX_AXES_PER_VERTEX), jnp.float32)
                     face_valid_v = jnp.zeros((ENV_MAX_FACES,), jnp.float32)
-                    face_tok_v = jnp.zeros(
-                        (ENV_MAX_FACES, FACE_TOKEN_WINDOW), jnp.int32)
-                    face_eqn_v = -jnp.ones(
-                        (ENV_MAX_FACES, FACE_TOKEN_WINDOW), jnp.int32)
                     face_cnt_v = jnp.zeros((ENV_MAX_FACES,), jnp.int32)
+                    face_dt_v = jnp.zeros((MAX_DELTA_TOKENS,), jnp.int32)
+                    face_de_v = -jnp.ones((MAX_DELTA_TOKENS,), jnp.int32)
                 if _DEBUG_ORDER:
                     # avail = how many vertices are still selectable; picked =
                     # the 0-based index chosen; was_avail = 1.0 iff that pick
@@ -4508,9 +4616,9 @@ def main():
                 face_comp_valid=face_comp_v,
                 face_valid=face_valid_v,
                 face_old_logp=jnp.asarray(face_old_logp, jnp.float32),
-                face_tokens=face_tok_v,
-                face_eqns=face_eqn_v,
                 face_counts=face_cnt_v,
+                face_delta_tokens=face_dt_v,
+                face_delta_eqns=face_de_v,
                 **_enc_fields,
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
@@ -4652,8 +4760,11 @@ def main():
                 )
                 ids = jnp.where(eqw >= 0, owner, -1)
                 vs2, vc2 = _vmem.update_ids(vs, vc, rows, ids, valid)
-                # carry2 is the branch point of the per-face SIDE carry: the
-                # rollout ran its face loop from exactly here.
+                # carry2 is where the sampling side carry branched: the
+                # stored pre-step carry advanced past the PREVIOUS delta.
+                # The face replay continues from it over the stored emission
+                # window. (The rows above are the previous delta's -- the
+                # WRONG tokens for face contexts; see face_delta_tokens.)
                 return agent.heads_from_memory(
                     vs2, vc2,
                     vertex_features=vertex_features,
@@ -4684,16 +4795,16 @@ def main():
                 jax.vmap(
                     lambda toks, eids, rs, pref, vidx, action, vmask, ax_st,
                     ax_vm, k, pv, cv, fa, fpv, fcv, fv, pl, pc, pvl,
-                    ftk, feq, fct, cy:
+                    fct, fdt, fde, cy:
                     _eval_dyn(
                         toks, eids, rs, pref, vidx, action, vmask, ax_st,
                         ax_vm, None, k, pv, cv, fa, fpv, fcv, fv,
                         pc3=(pl, pc, pvl),
-                        # The rollout's own per-face chunks, re-run from the
-                        # same branch point. Without them the loss would score
-                        # the stored action against a context the behaviour
-                        # policy never saw, and the ratio would not be 1.
-                        fch=((ftk, feq, fct) if _LIVE_FACES is not None
+                        # Chunk lengths + THIS step's emission window + the
+                        # branch-point carry: everything the behaviour
+                        # policy's face contexts were built from. Anything
+                        # else and the ratio is not 1.
+                        fch=((fct, fdt, fde) if _LIVE_FACES is not None
                              else None),
                         fcy=(cy if _LIVE_FACES is not None else None),
                     )
@@ -4715,7 +4826,8 @@ def main():
                     batch.face_comp_valid,
                     batch.face_valid,
                     pc_logits, pc_ctx, pc_value,
-                    batch.face_tokens, batch.face_eqns, batch.face_counts,
+                    batch.face_counts,
+                    batch.face_delta_tokens, batch.face_delta_eqns,
                     pc_carry,
                 )
                 if args.face_actions
@@ -5425,9 +5537,9 @@ def main():
             face_comp_valid=traj.face_comp_valid,
             face_valid=traj.face_valid,
             face_old_logp=traj.face_old_logp,
-            face_tokens=traj.face_tokens,
-            face_eqns=traj.face_eqns,
             face_counts=traj.face_counts,
+            face_delta_tokens=traj.face_delta_tokens,
+            face_delta_eqns=traj.face_delta_eqns,
             enc_M=traj.enc_M,
             enc_I=traj.enc_I,
             enc_cumhist=traj.enc_cumhist,
