@@ -629,7 +629,21 @@ MAX_RULES_PER_VERTEX = 16
 # row per slot (pre / post / new). Must match the oracle's
 # ``face_masks(v, max_faces)`` budget — both enumerate faces in the SAME
 # canonical visit order (``faces_of``).
-MAX_FACES = int(os.environ.get("ALPHAGRAD_MAX_FACES", "8"))
+# 16, not 8. MEASURED on the nn256 cross-entropy graph over 82 elimination
+# orders: the per-vertex face count peaks at 12 (vertex 9, `add`, 3 preds x 4
+# succs after fill-in), and 8 silently dropped faces 9..12 -- they ran exact
+# while every counter reported a healthy run. There is no cheap hard bound
+# (faces = |preds| x |succs| and fill-in grows both), so the cap stays, but
+# `_face_transforms_for_order` now COUNTS what it drops instead of slicing
+# quietly. Raise it if `faces/over_cap` is ever non-zero.
+MAX_FACES = int(os.environ.get("ALPHAGRAD_MAX_FACES", "16"))
+_FACE_CAP_STATS = {"over_cap": 0, "max_seen": 0}
+
+
+def consume_face_cap_stats() -> dict:
+    out = dict(_FACE_CAP_STATS)
+    _FACE_CAP_STATS["over_cap"] = 0
+    return out
 FACE_SLOTS = 3  # pre (lhs), post (rhs), new (res)
 NUM_AXIS_PAIRS = 4
 
@@ -1770,6 +1784,12 @@ def _face_transforms_for_order(config, consts, args, o_list, specs_list,
         per_face: dict = {}
         rows_f = face_rows_list[k]
         skips_f = face_skips_list[k]
+        if len(keys) > _FACE_CAP_STATS["max_seen"]:
+            _FACE_CAP_STATS["max_seen"] = len(keys)
+        if len(keys) > MAX_FACES:
+            # NEVER a silent slice: the dropped faces run exact, which is a
+            # smaller action space reported as if it were the full one.
+            _FACE_CAP_STATS["over_cap"] += len(keys) - MAX_FACES
         for f, key in enumerate(keys[:MAX_FACES]):
             if int(skips_f[f]) == 1:
                 per_face[key] = SKIP_FACE

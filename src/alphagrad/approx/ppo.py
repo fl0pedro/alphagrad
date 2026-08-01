@@ -1565,6 +1565,29 @@ class Agent(eqx.Module):
     # stored decisions off the STORED chunks. They must stay gate for gate
     # identical or the ratio is not 1 at epoch 0.
     # ------------------------------------------------------------------
+    def _face_encode(self, carry, tokens, eqns, count):
+        """Extend the side carry by one face's chunk; ``(carry, summary)``.
+
+        The scan is SKIPPED when the chunk is empty. That is not a micro-
+        optimisation: the loop is a static ``range(MAX_FACES)`` because jit
+        needs a fixed trip count, but a vertex has 1-12 faces on this graph
+        and 4 have none at all, so most iterations carry nothing -- measured
+        84 real faces against 23x16 = 368 iterations, i.e. 77% of the
+        per-face encoder work was a full ``FACE_TOKEN_WINDOW`` scan over
+        padding. An empty chunk must also leave the carry EXACTLY where it
+        was, which the skip guarantees and the all-invalid scan only
+        approximates.
+        """
+        def _run(c):
+            c2, rows, valid, _e = self.encode_extend(
+                c, tokens, eqns, count, window=FACE_TOKEN_WINDOW, start=0)
+            return c2, self._face_pool(rows, valid, count)
+
+        def _skip(c):
+            return c, jnp.zeros((self.embd_dim,), jnp.float32)
+
+        return lax.cond(count > 0, _run, _skip, carry)
+
     @staticmethod
     def _face_pool(rows, valid, count):
         """Mean palimpsa row over a face's chunk (zero when the chunk is
@@ -1609,9 +1632,7 @@ class Agent(eqx.Module):
         for f in range(F):
             tk_f, eq_f, ct_f = face_chunk_fn(f, vertex_idx, vertex_specs,
                                              rows_specs, skips)
-            carry, rws, vld, _e = self.encode_extend(
-                carry, tk_f, eq_f, ct_f, window=FACE_TOKEN_WINDOW, start=0)
-            summ = self._face_pool(rws, vld, ct_f)
+            carry, summ = self._face_encode(carry, tk_f, eq_f, ct_f)
             sk, row, lp, e, _ar, _sp, _od = pol.sample_face(
                 v_context, features, factor_tables, keys[f], f,
                 f_pair[f], f_comp[f], f_valid[f], face_context=summ,
@@ -1649,10 +1670,8 @@ class Agent(eqx.Module):
         ent = jnp.array(0.0)
         arity = jnp.array(0.0)
         for f in range(F):
-            carry, rws, vld, _e = self.encode_extend(
-                carry, f_tok[f], f_eqn[f], f_cnt[f],
-                window=FACE_TOKEN_WINDOW, start=0)
-            summ = self._face_pool(rws, vld, f_cnt[f])
+            carry, summ = self._face_encode(
+                carry, f_tok[f], f_eqn[f], f_cnt[f])
             lp, e, ar, _sp, _od = pol.evaluate_face(
                 v_context, features, factor_tables, fa, f,
                 f_pair[f], f_comp[f], f_valid[f], face_context=summ,
