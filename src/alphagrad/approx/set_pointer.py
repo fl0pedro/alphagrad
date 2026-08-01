@@ -102,7 +102,12 @@ class SetPointerVertexPolicy(eqx.Module):
         q = self.q_proj(summary)
         k = jax.vmap(self.k_proj)(h)
         logits = (k @ q) / jnp.sqrt(jnp.asarray(self.embd_dim, h.dtype))
-        logits = jnp.where(vmask > 0.5, logits, -1e9)
+        # -inf, NEVER -1e9: the finite sentinel collided with an availability
+        # mask once and produced uniform sampling for six runs. A fully-dead
+        # mask falls back to raw logits so downstream softmaxes stay finite;
+        # the caller's availability mask still decides what is selectable.
+        m = vmask > 0.5
+        logits = jnp.where(jnp.any(m), jnp.where(m, logits, -jnp.inf), logits)
         return logits, h
 
     def from_vertex_memory(self, vmem, vmask):

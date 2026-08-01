@@ -131,11 +131,15 @@ def main():
     ck("per-face features differ",
        not bool(jnp.all(ff0.size == ff1.size)),
        f"{np.asarray(ff0.size)} vs {np.asarray(ff1.size)}")
-    z0 = pol.head.logits(pol.encoder(ff0, ctx)[1] + pol.face_embedding(jnp.array(0)))
-    z1 = pol.head.logits(pol.encoder(ff1, ctx)[1] + pol.face_embedding(jnp.array(1)))
+    # face_embedding is DELETED: identity comes from the face's own tokens
+    # (the chunk opens with `path <central> & <in> & <out>`), so the "label
+    # only" baseline below is now genuinely zero-information -- two faces
+    # with identical features are indistinguishable, which is the point.
+    z0 = pol.head.logits(pol.encoder(ff0, ctx)[1])
+    z1 = pol.head.logits(pol.encoder(ff1, ctx)[1])
     # and against the BLIND path: same features, only the embedding differs
-    b0 = pol.head.logits(pol.encoder(f, ctx)[1] + pol.face_embedding(jnp.array(0)))
-    b1 = pol.head.logits(pol.encoder(f, ctx)[1] + pol.face_embedding(jnp.array(1)))
+    b0 = pol.head.logits(pol.encoder(f, ctx)[1])
+    b1 = pol.head.logits(pol.encoder(f, ctx)[1])
     d_seeing = float(jnp.max(jnp.abs(z0 - z1)))
     d_blind = float(jnp.max(jnp.abs(b0 - b1)))
     ck("seeing the contraction changes the logits more than the label alone",

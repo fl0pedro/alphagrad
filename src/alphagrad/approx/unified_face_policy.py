@@ -41,7 +41,6 @@ class UnifiedFacePolicy(eqx.Module):
 
     encoder: AxisSetEncoder
     head: UnifiedFaceHead
-    face_embedding: eqx.nn.Embedding
 
     max_faces: int = eqx.field(static=True)
     embd_dim: int = eqx.field(static=True)
@@ -57,7 +56,6 @@ class UnifiedFacePolicy(eqx.Module):
             max_groups=max_groups, key=keys[0],
             use_group_embedding=use_group_embedding)
         self.head = UnifiedFaceHead(embd_dim, key=keys[1])
-        self.face_embedding = eqx.nn.Embedding(max_faces, embd_dim, key=keys[2])
 
     # ------------------------------------------------------------ masks
     def _face_masks(self, features, pair_valid_f, comp_valid_f,
@@ -190,7 +188,11 @@ class UnifiedFacePolicy(eqx.Module):
         """
         base = (vertex_context if face_context is None
                 else vertex_context + face_context)
-        return self.encoder(ff, base)[1] + self.face_embedding(jnp.array(f))
+        # NO face_embedding: the face's identity is its header tokens
+        # (`path <central> & <in> & <out>` opens every chunk), so a learned
+        # index table was a label where content already exists -- and a
+        # cap-sized parameter in a design whose width is per-graph.
+        return self.encoder(ff, base)[1]
 
     def sample_face(self, vertex_context, features: AxisTokenFeatures,
                     tables: FactorTables, key, f: int, pair_valid_f,

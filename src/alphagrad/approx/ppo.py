@@ -1325,9 +1325,24 @@ class Agent(eqx.Module):
         """
         vmem_rows = _vmem.read(vmem_sums, vmem_counts)
         vmask = _vmem.occupancy(vmem_counts)
-        vertex_logits, vertex_contexts = self.vertex_policy.from_vertex_memory(
-            vmem_rows, vmask
-        )
+        from alphagrad.approx.set_pointer import SetPointerVertexPolicy
+        if (isinstance(self.vertex_policy, SetPointerVertexPolicy)
+                and vertex_features is not None):
+            # The pointer must score CONTENT, and the vertices it has to
+            # choose between are exactly the ones with EMPTY vmem slots
+            # (slots fill on elimination). Occupancy-masked vmem alone gave
+            # every candidate an identical zero slot -- the v31 uniform-pick
+            # failure. Fold the per-vertex features (axis sizes, op
+            # identity: content, not a learned V-table) into the slots and
+            # let every vertex slot participate.
+            _feat = self._data_embedding(vertex_features)
+            slots = vmem_rows.at[: _feat.shape[0]].add(_feat)
+            smask = jnp.ones_like(vmask)
+            vertex_logits, vertex_contexts = (
+                self.vertex_policy.from_vertex_memory(slots, smask))
+        else:
+            vertex_logits, vertex_contexts = (
+                self.vertex_policy.from_vertex_memory(vmem_rows, vmask))
         if _DEBUG_ORDER:
             jax.debug.print(
                 "[vmem] occupied={o}/{n} total_tokens={t} global_slot={g} "
@@ -1429,10 +1444,13 @@ class Agent(eqx.Module):
             axis_valid_mask[vertex_idx],
         )
 
-        if self.micro_action_policy is None:
+        if self.micro_action_policy is None and (
+                self.face_path_policy is None or face_chunk_fn is None):
             # --no-approx-head: there IS no approximation head. Emit the
             # canonical inactive action; nothing is sampled or scored, and
             # face_out stays None so no face policy is consulted either.
+            # Under --live-faces the micro head is ALSO None but the face
+            # policy is live -- fall through so the faces still sample.
             _n = features.size.shape[0]
             _od, _id_, _jd, _ed, _kd = _zero_micro_dists(self.max_substeps, _n)
             return (
@@ -1478,41 +1496,72 @@ class Agent(eqx.Module):
         # --exact the op head is a forced single-option head (no log-prob, no
         # entropy, no gradient) and the recorded log-prob IS the behaviour
         # policy's. evaluate_action_dynamic must receive the SAME override.
-        (
-            actions,
-            joint_logp,
-            joint_ent,
-            sub_episode_length,
-            op_dists,
-            i_dists,
-            j_dists,
-            exp_dists,
-            kind_dists,
-            quant_logp,
-        # NOTE: quant_legality_mask defaults to None here — the scan-driven
-        # hardware mask inside the policy.
-        ) = self.micro_action_policy.sample(
-            v_context,
-            features,
-            factor_tables,
-            micro_key,
-            pair_valid=_sample_pair,
-            compress_valid=_sample_comp,
-            op_legality_override=op_legality_override,
-        )
+        if self.micro_action_policy is None:
+            # --live-faces: no per-vertex head. Canonical inactive action,
+            # zero log-prob/entropy, point-mass dists -- identical values to
+            # the early return above, so the loss's reconstruction stays 0.
+            _n0 = features.size.shape[0]
+            actions = _zero_micro_action(self.max_substeps)
+            (op_dists, i_dists, j_dists, exp_dists,
+             kind_dists) = _zero_micro_dists(self.max_substeps, _n0)
+            joint_logp = jnp.asarray(0.0, jnp.float32)
+            joint_ent = jnp.asarray(0.0, jnp.float32)
+            sub_episode_length = jnp.asarray(0, jnp.int32)
+            quant_logp = jnp.asarray(0.0, jnp.float32)
+        else:
+            (
+                actions,
+                joint_logp,
+                joint_ent,
+                sub_episode_length,
+                op_dists,
+                i_dists,
+                j_dists,
+                exp_dists,
+                kind_dists,
+                quant_logp,
+            # NOTE: quant_legality_mask defaults to None here — the
+            # scan-driven hardware mask inside the policy.
+            ) = self.micro_action_policy.sample(
+                v_context,
+                features,
+                factor_tables,
+                micro_key,
+                pair_valid=_sample_pair,
+                compress_valid=_sample_comp,
+                op_legality_override=op_legality_override,
+            )
 
         # P1c: per-path decisions for the chosen vertex, from the SAME
         # v_context/features the micro path used (no extra full encode).
         face_out = None
-        _have_faces = (_face_from_fn is not None) or (face_masks_all is not None)
+        _have_faces = ((_face_from_fn is not None)
+                       or (face_masks_all is not None)
+                       or (face_chunk_fn is not None))
         if _have_faces and self.face_path_policy is not None:
+            _n_faces = None
             if _face_from_fn is not None:
                 f_pair, f_comp, f_valid = _face_from_fn
-            else:
+            elif face_masks_all is not None:
                 _fp_all, _fc_all, _fv_all = face_masks_all
                 f_pair = _fp_all[vertex_idx + 1]
                 f_comp = _fc_all[vertex_idx + 1]
                 f_valid = _fv_all[vertex_idx + 1]
+            else:
+                # STATIC sampling masks: axis validity only. DIAG pair
+                # divisibility is already the head's own pair_ok (gcd > 1)
+                # gate; everything finer is per-face legality, which the
+                # application hooks decide on the live operand -- an illegal
+                # draw becomes a no-op there, it is never scored as applied.
+                _F = self.face_path_policy.max_faces
+                _av = axis_valid_mask[vertex_idx].astype(jnp.float32)
+                _pair = (_av[:, None] * _av[None, :]
+                         * (1.0 - jnp.eye(_av.shape[0])))
+                f_pair = jnp.broadcast_to(
+                    _pair, (_F,) + _pair.shape)
+                f_comp = jnp.broadcast_to(_av, (_F,) + _av.shape)
+                _n_faces = face_count_fn(vertex_idx)
+                f_valid = (jnp.arange(_F) < _n_faces).astype(jnp.float32)
             face_key = jrand.fold_in(micro_key, 7)
             if face_chunk_fn is None:
                 fa, face_logp, face_ent, _far, _skp, _fod, _fql = (
@@ -1527,24 +1576,30 @@ class Agent(eqx.Module):
                 f_dt = jnp.zeros((MAX_DELTA_TOKENS,), jnp.int32)
                 f_de = -jnp.ones((MAX_DELTA_TOKENS,), jnp.int32)
             else:
-                # The per-vertex micro action is already drawn, and it applies
-                # to every face, so the contraction the head reads has to
-                # carry it -- otherwise the chunk describes a graph the
-                # measurement will never build.
-                _vspecs = micro_actions_to_rule_specs_jax(
-                    actions.op_type, actions.i, actions.j, actions.factor,
-                    axis_state[vertex_idx],
-                    compress_kinds=actions.compress_kind,
-                    quant_dtypes=actions.quant_dtype,
-                    quant_scale_signs=actions.quant_scale_sign,
-                    quant_scale_fracs=actions.quant_scale_frac,
-                ).astype(jnp.int32)
+                if self.micro_action_policy is None:
+                    # No per-vertex head: the vertex rules are ALWAYS the
+                    # exact END rows -- approximation is purely per-face.
+                    _vspecs = -jnp.ones(
+                        (MAX_RULES_PER_VERTEX, 3), jnp.int32)
+                else:
+                    # The per-vertex micro action applies to every face, so
+                    # the contraction the head reads has to carry it.
+                    _vspecs = micro_actions_to_rule_specs_jax(
+                        actions.op_type, actions.i, actions.j,
+                        actions.factor, axis_state[vertex_idx],
+                        compress_kinds=actions.compress_kind,
+                        quant_dtypes=actions.quant_dtype,
+                        quant_scale_signs=actions.quant_scale_sign,
+                        quant_scale_fracs=actions.quant_scale_frac,
+                    ).astype(jnp.int32)
                 (fa, face_logp, face_ent, f_cnt, f_dt,
                  f_de) = self._face_loop(
                     v_context, features, factor_tables, face_key,
                     f_pair, f_comp, f_valid, enc_carry, face_chunk_fn,
                     vertex_idx, _vspecs, axis_state[vertex_idx],
-                    op_legality_override, face_count_fn(vertex_idx),
+                    op_legality_override,
+                    (_n_faces if _n_faces is not None
+                     else face_count_fn(vertex_idx)),
                 )
             face_out = (fa, face_logp, face_ent, f_pair, f_comp, f_valid,
                         f_cnt, f_dt, f_de)
@@ -1787,7 +1842,7 @@ class Agent(eqx.Module):
         ``(total_log_p, total_entropy, value, vertex_dist,
         op_dists, i_dists, j_dists, exp_dists, sub_episode_length)``.
         """
-        if self.micro_action_policy is None:
+        if self.micro_action_policy is None and face_action is None:
             # --no-approx-head: mirror sample() exactly -- zero micro log-prob
             # and entropy, point-mass dists, so the PPO ratio is 1 on the
             # approximation factor and every micro KL term is 0.
@@ -1838,27 +1893,37 @@ class Agent(eqx.Module):
             axis_valid_mask[vertex_idx],
         )
 
-        (
-            log_p_sub,
-            ent_sub,
-            sub_episode_length,
-            new_op_dists,
-            new_i_dists,
-            new_j_dists,
-            new_exp_dists,
-            new_kind_dists,
-            new_quant_logp,
-        # Masks MUST match sample_action_dynamic (the stored live oracle masks;
-        # all-dtypes QUANT) or the PPO ratio is not 1 at epoch 0.
-        ) = self.micro_action_policy.evaluate(
-            v_context,
-            features,
-            factor_tables,
-            actions,
-            pair_valid=pair_valid,
-            compress_valid=compress_valid,
-            op_legality_override=op_legality_override,
-        )
+        if self.micro_action_policy is None:
+            # --live-faces: mirror the sampling side's zero micro terms.
+            _n0 = features.size.shape[0]
+            (new_op_dists, new_i_dists, new_j_dists, new_exp_dists,
+             new_kind_dists) = _zero_micro_dists(self.max_substeps, _n0)
+            log_p_sub = jnp.asarray(0.0, jnp.float32)
+            ent_sub = jnp.asarray(0.0, jnp.float32)
+            sub_episode_length = jnp.asarray(0, jnp.int32)
+            new_quant_logp = jnp.asarray(0.0, jnp.float32)
+        else:
+            (
+                log_p_sub,
+                ent_sub,
+                sub_episode_length,
+                new_op_dists,
+                new_i_dists,
+                new_j_dists,
+                new_exp_dists,
+                new_kind_dists,
+                new_quant_logp,
+            # Masks MUST match sample_action_dynamic (the stored live oracle
+            # masks; all-dtypes QUANT) or the PPO ratio is not 1 at epoch 0.
+            ) = self.micro_action_policy.evaluate(
+                v_context,
+                features,
+                factor_tables,
+                actions,
+                pair_valid=pair_valid,
+                compress_valid=compress_valid,
+                op_legality_override=op_legality_override,
+            )
 
         total_log_p = log_p_vertex + log_p_sub
         # PER-HEAD ENTROPY NORMALISATION.
@@ -2864,9 +2929,13 @@ def _build_agent(
     # Dynamic-substeps head: only constructed when the flag is on so the
     # default agent stays leaner (one extra encoder + MicroActionHead is
     # non-trivial parameter cost).
-    if getattr(args, "no_approx_head", False):
+    if getattr(args, "no_approx_head", False) or getattr(
+            args, "live_faces", False):
         # REMOVED, not masked: no approximation head is constructed, so the
-        # pytree holds no approximation parameters at all.
+        # pytree holds no approximation parameters at all. Under --live-faces
+        # approximation is purely PER-FACE (the 94-head): the per-vertex
+        # rules are always the exact END rows, so a per-vertex head would be
+        # dead weight with a live gradient path.
         micro_action_policy = None
     elif getattr(args, "dynamic_substeps", False) and getattr(args, "unified_head", False):
         # ONE flat head per vertex instead of the autoregressive sub-episode.
@@ -2910,16 +2979,12 @@ def _build_agent(
         )
     elif getattr(args, "face_actions", False) and not getattr(
             args, "no_approx_head", False):
-        face_path_policy = FacePathPolicy(
-            embd_dim=args.embd_dim,
-            num_heads=args.num_heads,
-            max_faces=ENV_MAX_FACES,
-            num_slots=FACE_SLOTS,
-            num_encoder_layers=1,
-            max_groups=max(args.max_substeps, 16),
-            key=encoder_keys[14],
-            use_group_embedding=getattr(args, "axis_group_embedding", False),
-        )
+        # FacePathPolicy is retired: 32 encoder + 24 head calls per vertex,
+        # python-unrolled -- it cannot compile at the derived face width, and
+        # its per-slot embeddings are exactly the label-not-content design
+        # the 94-head replaced.
+        raise ValueError(
+            "--face-actions now requires --unified-face-head.")
     else:
         face_path_policy = None
     return Agent(
@@ -4002,7 +4067,11 @@ def main():
     _ORACLE_ONE_VERTEX = os.environ.get(
         "ALPHAGRAD_ORACLE_ONE_VERTEX", "1") == "1"
     # No approximation head => no legality to compute. See _NO_ORACLE use.
-    _NO_ORACLE = bool(getattr(args, "no_approx_head", False))
+    # --live-faces: sampling masks are STATIC (axis validity); per-face
+    # legality is enforced once, at application, by make_live_masked_hook --
+    # so the live probe (the single largest host cost) leaves the rollout.
+    _NO_ORACLE = bool(getattr(args, "no_approx_head", False)
+                      or getattr(args, "live_faces", False))
 
     if getattr(args, "live_faces", False):
         # Both are load-bearing, not stylistic. Without --face-actions there
