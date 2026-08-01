@@ -97,7 +97,13 @@ def main():
     ck("padding faces drew skip=0", bool(np.all(np.asarray(fa.skip)[5:] == 0)),
        f"{np.asarray(fa.skip)}")
 
-    print("\n=== E. one encoder call per vertex ===")
+    print("\n=== E. one encoder + one head call PER FACE ===")
+    # This used to assert ONE encoder call for the whole vertex. That was only
+    # true while every face shared a context -- which is exactly the blindness
+    # test F rules out: a shared context means the encoder cannot have read the
+    # face. Per-face contexts (live tokens, live shapes) require a call each.
+    # The property worth pinning is that it is one per FACE and not one per
+    # (face, sub-step): FacePathPolicy ran the encoder 32x and the head 24x.
     calls = [0]
     orig = type(pol.encoder).__call__
     def counted(self, *a, **k):
@@ -108,8 +114,8 @@ def main():
         pol.sample(ctx, f, tables, jrand.PRNGKey(3), fpv, fcv, fval)
     finally:
         type(pol.encoder).__call__ = orig
-    ck("encoder called ONCE (FacePathPolicy called it 32x)", calls[0] == 1,
-       f"{calls[0]} calls")
+    ck("encoder called once per face, not per sub-step "
+       "(FacePathPolicy: 32)", calls[0] == F, f"{calls[0]} calls, F={F}")
 
     print("\n=== F. the head SEES the face (not just a label) ===")
     # Two faces with DIFFERENT live contraction shapes must produce different
