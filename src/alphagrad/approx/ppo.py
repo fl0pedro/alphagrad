@@ -175,6 +175,8 @@ HEAD_NAMES: tuple[str, ...] = ("latency", "mem", "cos")
 # Print every loss component the moment the total goes non-finite. Off by
 # default because it forces a host callback inside the jitted update.
 _DEBUG_NAN = os.environ.get("ALPHAGRAD_DEBUG_NAN", "0") == "1"
+# How many leading episodes print the stdout health line (see its use site).
+_HEALTH_N = [0]
 
 # Per-step vertex-pick trace (see the jax.debug.print below). Off by default:
 # it forces a host callback inside the jitted rollout scan.
@@ -6150,6 +6152,35 @@ def main():
                 )
             except Exception:
                 pass
+        _HEALTH_N[0] += 1
+        if _HEALTH_N[0] <= int(os.environ.get("ALPHAGRAD_HEALTH_EPISODES", "3")):
+            # The launch check, on stdout where a running job can be read
+            # without wandb. ratio/max_log must be ~0 at epoch 0 BY
+            # CONSTRUCTION -- the stored old log-prob IS the sampling
+            # log-prob -- so anything else means the loss is reconstructing
+            # the behaviour policy differently from how it sampled, which is
+            # the bug that ran the ratio to 2.3e23 and was invisible in a
+            # batch-averaged KL. mu_cos above the reward ceiling means critic
+            # overestimation. Non-finite entropy means a poisoned gradient.
+            print("[health ep%d] ppo=%.4g value=%.4g ent=%.4g "
+                  "ratio/max_log=%.3g kl/approx=%.3g mu_cos=%.4g "
+                  "sec/ep=%.1f" % (
+                      _HEALTH_N[0] - 1, ppo_loss, value_loss, policy_entropy,
+                      log_dict.get("ratio/max_log", float("nan")),
+                      log_dict.get("kl/approx", float("nan")),
+                      log_dict.get("popart/mu_cos", float("nan")),
+                      log_dict.get("time/sec_per_episode", float("nan"))),
+                  flush=True)
+            if _LIVE_FACES is not None:
+                # A chunk that fails soft is EMPTY, and an empty chunk leaves
+                # the palimpsa carry where it was -- i.e. the head decides on
+                # the vertex context alone, exactly the blindness --live-faces
+                # exists to remove, while every metric still looks healthy.
+                # `truncated` is the same failure by a different route: the
+                # window kept only the tail of the contraction.
+                print("[health ep%d] live-faces %s" % (
+                    _HEALTH_N[0] - 1, _LIVE_FACES.consume_stats()),
+                    flush=True)
         wandb.log(log_dict)
 
         # Per-episode memory + JIT-cache diagnostic. Off by default; flip on

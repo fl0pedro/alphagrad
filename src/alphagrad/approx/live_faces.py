@@ -50,7 +50,13 @@ import os
 import numpy as np
 
 
-FACE_TOKEN_WINDOW = int(os.environ.get("ALPHAGRAD_FACE_TOKEN_WINDOW", "96"))
+# Sized from the MEASURED distribution on the MNIST xent graph, not guessed:
+# 192 chunks, mean 403 tokens, max 1456. At 96 the window clipped 83 of 206
+# chunks -- i.e. 40% of the time the head read only the TAIL of the
+# contraction it was approximating, which is the same blindness this module
+# removes, just quieter. 1024 clips 8 of 192 (4%). Raise it if
+# `truncated` in the health line is a large fraction of `chunks`.
+FACE_TOKEN_WINDOW = int(os.environ.get("ALPHAGRAD_FACE_TOKEN_WINDOW", "1024"))
 
 
 def _copy_graph(g):
@@ -137,8 +143,12 @@ class LiveFaceStream:
         self.cache_cap = int(cache)
         self._prefix: dict = {}       # prefix key -> tokenizer at that prefix
         self._chunks: dict = {}       # full key -> result tuple
+        # tok_total/tok_max/chunks size the WINDOW from the real
+        # distribution: a window below the typical chunk silently keeps only
+        # the tail of the contraction the head is meant to read.
         self.stats = {"prefix_miss": 0, "prefix_hit": 0, "elims": 0,
-                      "chunk_hit": 0, "failures": 0, "truncated": 0}
+                      "chunk_hit": 0, "failures": 0, "truncated": 0,
+                      "tok_total": 0, "tok_max": 0, "chunks": 0}
 
     # -- prefix ------------------------------------------------------------
     def _tokenizer_at(self, order, specs, n):
@@ -314,6 +324,9 @@ class LiveFaceStream:
         cids += ids[start:split]
 
         cnt = len(chunk)
+        self.stats["tok_total"] += cnt
+        self.stats["tok_max"] = max(self.stats["tok_max"], cnt)
+        self.stats["chunks"] += 1
         if cnt > W:
             # Keep the TAIL: the face being decided is at the end, and it is
             # the part the decision is about. Counted, because a window that
