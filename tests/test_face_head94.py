@@ -169,9 +169,99 @@ def main():
        bool(np.isfinite(float(lp3)) and np.isfinite(float(e3))),
        f"lp={float(lp3)} ent={float(e3)}")
 
+    _grad_checks()
     print("\n" + ("ALL PASS" if not FAIL else f"{len(FAIL)} FAILURES: {FAIL}"))
     return 1 if FAIL else 0
 
+
+
+def _grad_checks():
+    """Non-finite GRADIENT under a finite forward -- the silent failure."""
+    import equinox as eqx
+    print("\n=== G. gradients are finite where the forward is ===")
+    E = 64
+    head = UnifiedFaceHead(E, key=jrand.PRNGKey(11))
+    ctx = jrand.normal(jrand.PRNGKey(12), (E,))
+
+    def masks(op_live, i_live, ax_live):
+        def row(n, live):
+            v = np.zeros((n,), np.float32)
+            for k in live:
+                v[k] = 1.0
+            return jnp.asarray(np.tile(v, (FACE_SLOTS, 1)))
+        return (row(NUM_APPROX_OPS, op_live), row(MAX_PAIR_IDX, i_live),
+                row(MAX_PAIR_IDX, i_live), row(NUM_REDUCE_AXES, ax_live))
+
+    cases = [
+        ("all live", masks(range(NUM_APPROX_OPS), range(MAX_PAIR_IDX),
+                           range(NUM_REDUCE_AXES))),
+        ("one op live", masks([0], range(MAX_PAIR_IDX),
+                              range(NUM_REDUCE_AXES))),
+        ("one axis live", masks(range(NUM_APPROX_OPS), [0], [0])),
+        ("nothing live", masks([], [], [])),
+    ]
+    for tag, (om, im, jm, am) in cases:
+        for fv in (True, False):
+            for skip in (0, 1):
+                def loss(h, om=om, im=im, jm=jm, am=am, fv=fv, skip=skip):
+                    z = h.logits(ctx)
+                    fields = FaceFields(
+                        skip=jnp.array(skip),
+                        op=jnp.arange(FACE_SLOTS) % NUM_APPROX_OPS,
+                        i=jnp.zeros((FACE_SLOTS,), jnp.int32),
+                        j=jnp.ones((FACE_SLOTS,), jnp.int32),
+                        axis=jnp.zeros((FACE_SLOTS,), jnp.int32),
+                        reduce_fn=jnp.zeros((FACE_SLOTS,), jnp.int32),
+                        dtype_idx=jnp.zeros((FACE_SLOTS,), jnp.int32))
+                    lp, ent, _ar = h.score(
+                        z, fields, op_mask=om, i_mask=im, j_mask=jm,
+                        axis_mask=am, pair_ok=None,
+                        face_valid=jnp.array(fv), approx_ok=jnp.array(True))
+                    # The loss differentiates BOTH -- the trainer's ppo term
+                    # rides on the log-prob and its entropy bonus on the
+                    # entropy, and only one of the two hit the trap.
+                    return jnp.nan_to_num(lp, neginf=0.0) + ent
+
+                g = eqx.filter_grad(loss)(head)
+                bad = sum(int(np.sum(~np.isfinite(np.asarray(v))))
+                          for v in jax.tree_util.tree_leaves(g)
+                          if eqx.is_array(v))
+                ck(f"grad finite: {tag}, face_valid={fv}, skip={skip}",
+                   bad == 0, f"{bad} non-finite entries")
+
+    # The exp-overflow case. It is NOT enough to make every logit large: the
+    # shift is by the max over LIVE entries, so a uniform bias moves zmax with
+    # it and nothing overflows. The trap needs ONE MASKED index far above the
+    # live ones, which is what a legality mask routinely produces once the
+    # head has learned to want an action the oracle forbids.
+    om, im, jm, am = masks([1], [0, 1], [0])       # op index 0 is MASKED OUT
+    _b = np.asarray(head.proj.layers[-1].bias).copy()
+    for _s in range(FACE_SLOTS):
+        _b[slot_base(_s) + S_OP + 0] = 400.0       # the masked one, sky-high
+    big = eqx.tree_at(lambda h: h.proj.layers[-1].bias,
+                      head, jnp.asarray(_b))
+
+    def loss_big(h):
+        z = h.logits(ctx)
+        fields = FaceFields(
+            skip=jnp.array(0),
+            op=jnp.ones((FACE_SLOTS,), jnp.int32),      # the LIVE op
+            i=jnp.zeros((FACE_SLOTS,), jnp.int32),
+            j=jnp.ones((FACE_SLOTS,), jnp.int32),
+            axis=jnp.zeros((FACE_SLOTS,), jnp.int32),
+            reduce_fn=jnp.zeros((FACE_SLOTS,), jnp.int32),
+            dtype_idx=jnp.zeros((FACE_SLOTS,), jnp.int32))
+        lp, ent, _ = h.score(z, fields, op_mask=om, i_mask=im, j_mask=jm,
+                             axis_mask=am, pair_ok=None,
+                             face_valid=jnp.array(True),
+                             approx_ok=jnp.array(True))
+        return jnp.nan_to_num(lp, neginf=0.0) + ent
+
+    g = eqx.filter_grad(loss_big)(big)
+    bad = sum(int(np.sum(~np.isfinite(np.asarray(v))))
+              for v in jax.tree_util.tree_leaves(g) if eqx.is_array(v))
+    ck("grad finite: masked logit far above the live max (exp overflow)",
+       bad == 0, f"{bad} non-finite entries")
 
 if __name__ == "__main__":
     raise SystemExit(main())

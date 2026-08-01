@@ -93,28 +93,67 @@ class FaceFields(NamedTuple):
 
 
 def _cat_logp_ent(logits, mask, idx):
-    """Masked categorical. -inf, NOT -1e9.
+    """Masked categorical. -inf in the OUTPUT, never inside the softmax.
 
-    The sentinel matters: a -1e9 availability mask once collided with the set
-    pointer's own -1e9 and produced uniform sampling over every vertex, which
-    broke the order permutation and zeroed the Jacobians for six runs.
+    Two constraints that pull against each other.
+
+    (1) The masked-out log-prob must be -inf, NOT -1e9. That sentinel once
+    collided with the set pointer's own -1e9 and produced uniform sampling
+    over every vertex, which broke the order permutation and zeroed the
+    Jacobians for six runs.
+
+    (2) An -inf may never reach `log_softmax`. Its forward value is fine, but
+    its DERIVATIVE at an -inf input is 0*inf = NaN, and `jnp.where` does not
+    save you: the where's VJP still evaluates the cotangent of the branch it
+    discarded, so a NaN there propagates through the zero selector. Measured:
+    a finite loss whose gradient was non-finite in 119857 entries across 190
+    leaves in the first minibatch, poisoning every parameter, after which
+    every reported loss and entropy read nan.
+
+    So the normalisation is done arithmetically against the mask -- the
+    exponentials of masked entries are ZEROED rather than driven to zero by an
+    -inf logit -- and the -inf appears only in the returned log-prob vector,
+    where `jnp.where`'s zero cotangent is the whole story because the false
+    branch is a constant. Entropy sums the FINITE shifted logits under the
+    same mask, so nothing unsafe is differentiated.
+
+    A fully masked head falls back to uniform; the caller's gate zeroes its
+    contribution anyway.
     """
-    logits = jnp.where(mask > 0.5, logits, -jnp.inf)
-    # A fully-masked head would be all -inf -> NaN. Fall back to uniform; the
-    # caller's gate zeroes the contribution anyway.
-    dead = jnp.sum(mask > 0.5) == 0
-    logits = jnp.where(dead, jnp.zeros_like(logits), logits)
-    logp_all = jnn.log_softmax(logits)
-    p = jnn.softmax(logits)
-    ent = -jnp.sum(jnp.where(p > 0, p * logp_all, 0.0))
+    m = (mask > 0.5)
+    m = jnp.where(jnp.any(m), m, jnp.ones_like(m))
+    mf = m.astype(logits.dtype)
+    # Shift by the max over LIVE entries only (masked entries must not set it).
+    zmax = jnp.max(jnp.where(m, logits, -jnp.finfo(logits.dtype).max))
+    shifted = logits - jax.lax.stop_gradient(zmax)
+    # SANITISE BEFORE THE UNSAFE OP, not after. zmax is the max over LIVE
+    # entries, so a masked-out logit can sit far above it and overflow exp to
+    # inf; `jnp.where` would hide that forward (it selects the 0) while the
+    # VJP still evaluates ct * exp(x) = 0 * inf = NaN on the discarded branch.
+    safe = jnp.where(m, shifted, 0.0)
+    e = jnp.where(m, jnp.exp(safe), 0.0)
+    Z = jnp.sum(e)
+    logZ = jnp.log(Z)
+    p = e / Z
+    lp_live = safe - logZ                         # finite everywhere
+    ent = -jnp.sum(jnp.where(m, p * lp_live, 0.0))
+    logp_all = jnp.where(m, lp_live, -jnp.inf)
     return logp_all[idx], ent
 
 
 def _bern_logp_ent(logit, x):
+    """Bernoulli log-prob and entropy, finite at a SATURATED logit.
+
+    p*log p is 0*(-inf) = NaN once sigmoid saturates to exactly 0 or 1, which
+    a diverging logit reaches in float32 well before it reaches inf. The limit
+    is 0 -- select it rather than computing it.
+    """
     lp1 = jnn.log_sigmoid(logit)
     lp0 = jnn.log_sigmoid(-logit)
     p = jnn.sigmoid(logit)
-    ent = -(p * lp1 + (1.0 - p) * lp0)
+    t1 = jnp.where(p > 0, p * lp1, 0.0)
+    t0 = jnp.where(p < 1, (1.0 - p) * lp0, 0.0)
+    ent = -(t1 + t0)
     return jnp.where(x, lp1, lp0), ent
 
 
@@ -164,12 +203,22 @@ class UnifiedFaceHead(eqx.Module):
         gate_face = jnp.asarray(face_valid, jnp.float32) * jnp.asarray(
             approx_ok, jnp.float32)
 
+        # GATES SELECT, THEY DO NOT MULTIPLY. A gate of 0.0 times an -inf
+        # log-prob is NaN, and -inf is the CORRECT log-prob for a masked
+        # index -- so every gated-off face (padding, variant-disallowed) or
+        # gated-off slot (skipped face) would poison the batch mean. That is
+        # the `ent:nan` this head produced against FacePathPolicy's 2.613 on
+        # the same config. Same trap the branch masks below already avoid.
+        _on = gate_face > 0.5
+        _z = jnp.zeros((), jnp.float32)
+
         lp_skip, e_skip = _bern_logp_ent(z[O_SKIP], fields.skip > 0)
-        logp = lp_skip * gate_face
-        ent = e_skip * gate_face
+        logp = jnp.where(_on, lp_skip, _z)
+        ent = jnp.where(_on, e_skip, _z)
         arity = gate_face
 
         active = gate_face * (fields.skip == 0).astype(jnp.float32)
+        _act = active > 0.5
         for s in range(FACE_SLOTS):
             b = slot_base(s)
             op = fields.op[s]
@@ -209,8 +258,8 @@ class UnifiedFaceHead(eqx.Module):
                       + jnp.where(is_bd, e_i + e_j, _z0)
                       + jnp.where(is_rd, e_ax + e_fn, _z0)
                       + jnp.where(is_qt, e_dt, _z0))
-            logp = logp + slot_lp * active
-            ent = ent + slot_e * active
+            logp = logp + jnp.where(_act, slot_lp, _z)
+            ent = ent + jnp.where(_act, slot_e, _z)
             arity = arity + active * (op != OP_NONE).astype(jnp.float32)
         return logp, ent, arity
 
