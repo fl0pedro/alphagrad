@@ -1244,6 +1244,102 @@ class Agent(eqx.Module):
         toks = jnp.take(tokens_buf, idx, mode="fill", fill_value=0).astype(jnp.int32)
         eqns = jnp.take(eqn_ids_buf, idx, mode="fill", fill_value=-1).astype(jnp.int32)
         valid = jnp.arange(window, dtype=jnp.int32) < count
+
+        _mode = os.environ.get("ALPHAGRAD_CHUNKED_EXTEND", "0")
+        if _mode == "1" or os.environ.get(
+                "ALPHAGRAD_CHUNKED_SELFTEST", "0") == "1":
+            par = self._extend_parallel(carry, toks, eqns, valid, count)
+            if os.environ.get("ALPHAGRAD_CHUNKED_SELFTEST", "0") == "1":
+                seq = self._extend_sequential(carry, toks, eqns, valid, count)
+                jax.debug.print(
+                    "[chunked-selftest] max|rows|={r:.3e} max|M|={m:.3e} "
+                    "max|cumhist|={c:.3e}",
+                    r=jnp.max(jnp.abs(par[1] - seq[1])),
+                    m=jnp.max(jnp.abs(par[0].M - seq[0].M)),
+                    c=jnp.max(jnp.abs(par[0].cumhist - seq[0].cumhist)))
+                if _mode != "1":
+                    return seq
+            return par
+        return self._extend_sequential(carry, toks, eqns, valid, count)
+
+    def _extend_parallel(self, carry, toks, eqns, valid, count):
+        """See encode_extend's docstring; math notes in the commit."""
+        layers = self.encoder.layers
+        T = toks.shape[0]
+        ok = valid
+        tokvalid = ok & (eqns >= 0)
+        tv = tokvalid.astype(jnp.float32)                       # (T,)
+        e = jnp.clip(eqns, 0, MAX_EQNS - 1)
+
+        # Causal relational features WITHOUT the carried histogram: the
+        # count of prior+current valid tokens in the same / an earlier / a
+        # later segment. The carry's histogram supplies the pre-window
+        # prefix. One masked (T, T) comparison replaces T histogram updates.
+        causal = jnp.tril(jnp.ones((T, T), jnp.float32))        # s <= t
+        le = (e[None, :] <= e[:, None]).astype(jnp.float32)     # e_s <= e_t
+        lt = (e[None, :] < e[:, None]).astype(jnp.float32)
+        w = causal * tv[None, :]
+        pre_at = carry.cumhist[e]                                # (T,)
+        pre_below = jnp.where(e > 0, carry.cumhist[jnp.maximum(e - 1, 0)], 0.0)
+        at = pre_at + jnp.sum(w * le, axis=1)
+        below = pre_below + jnp.sum(w * lt, axis=1)
+        nvalid = carry.nvalid + jnp.cumsum(tv)
+        denom = jnp.maximum(nvalid, 1.0)
+        feats = (jnp.stack([at - below, below, nvalid - at], axis=-1)
+                 / denom[:, None] * tv[:, None])                # (T, 3)
+
+        def _affine(l, r):
+            return (r[0] * l[0], r[0] * l[1] + r[1])
+
+        x = jax.vmap(self.embedding)(toks)                      # (T, E)
+        new_M, new_I = [], []
+        for li, layer in enumerate(layers):
+            mixer = layer.attn_layer
+            H, d = mixer.num_heads, mixer.head_dim
+            y = jax.vmap(layer.attn_norm)(x)
+            q = jax.vmap(mixer.query_proj)(y).reshape(T, H, d)
+            kk = jax.vmap(mixer.key_proj)(y).reshape(T, H, d)
+            v = jax.vmap(mixer.value_proj)(y).reshape(T, H, d)
+            b = jnn.softplus(jax.vmap(mixer.bias_proj)(y)).reshape(T, H, d)
+            gt = jnn.softplus(jax.vmap(mixer.gate_proj)(y)
+                              + feats @ mixer.rel_gate.weight.T
+                              + mixer.rel_gate.bias)
+            g = jnn.softplus(mixer.g_raw)
+            Ip = jnn.softplus(mixer.Ip_raw)
+            a = jnp.exp(-gt[:, :, None, None] * g[None, :, None, None])
+            okb = ok[:, None, None, None]
+            a = jnp.where(okb, a, 1.0)                          # freeze
+            B_M = jnp.where(okb, v[:, :, :, None] * kk[:, :, None, :], 0.0)
+            B_I = jnp.where(
+                okb,
+                b[:, :, :, None] * (kk[:, :, None, :] ** 2)
+                + (1.0 - a) * Ip[None, :, None, None], 0.0)
+            A_M, S_M = lax.associative_scan(_affine, (a, B_M))
+            _, S_I = lax.associative_scan(_affine, (a, B_I))
+            M_t = A_M * carry.M[li][None] + S_M                 # (T, H, d, n)
+            I_t = A_M * carry.I[li][None] + S_I
+            mu = M_t / I_t
+            out = jnp.einsum("thdn,thn->thd", mu,
+                             q * (d ** -0.5)).reshape(T, H * d)
+            x = x + jax.vmap(mixer.output_proj)(out)
+            y2 = jax.vmap(layer.mlp_norm)(x)
+            x = x + jax.vmap(layer.mlp)(y2)
+            new_M.append(M_t[-1])
+            new_I.append(I_t[-1])
+
+        rows = jnp.where(ok[:, None], x, 0.0)
+        # Histogram update for FUTURE windows: += one bincount, cumsummed
+        # over the eqn axis (cumhist[j] counts tokens with e_s <= j).
+        cnt = jnp.zeros((MAX_EQNS,), jnp.float32).at[e].add(tv)
+        new_carry = EncCarry(
+            M=jnp.stack(new_M), I=jnp.stack(new_I),
+            cumhist=carry.cumhist + jnp.cumsum(cnt),
+            nvalid=carry.nvalid + jnp.sum(tv),
+            pos=carry.pos + count)
+        return new_carry, rows, valid, eqns
+
+    def _extend_sequential(self, carry, toks, eqns, valid, count):
+        layers = self.encoder.layers
         eq_arange = jnp.arange(MAX_EQNS, dtype=jnp.int32)
 
         def _step(c, tev):
