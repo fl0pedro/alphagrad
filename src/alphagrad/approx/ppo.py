@@ -1358,8 +1358,16 @@ class Agent(eqx.Module):
                   ch + jnp.cumsum(cnt), nv0 + jnp.sum(tv))
             return c2, rows_b
 
+        # CHECKPOINTED blocks: without remat, reverse-mode AD saves every
+        # block's per-token M_t/I_t -- O(T,H,d,n) residuals PER SAMPLE no
+        # matter the block size, which is why blocking alone moved the OOM
+        # from 15.6 GiB to 31.4 GiB instead of fixing it. With remat the
+        # backward stores only the block-boundary carries (~13 MB/sample at
+        # these shapes) and recomputes each block's forward -- the classic
+        # sqrt-storage trade, paying one extra forward per block.
         (M2, I2, ch2, nv2), rows_b = lax.scan(
-            _block, (carry.M, carry.I, carry.cumhist, carry.nvalid),
+            jax.checkpoint(_block),
+            (carry.M, carry.I, carry.cumhist, carry.nvalid),
             (b_toks, b_eqns, b_ok))
         rows = rows_b.reshape(nb * Bk, -1)[:T]
         new_carry = EncCarry(M=M2, I=I2, cumhist=ch2, nvalid=nv2,
