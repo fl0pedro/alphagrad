@@ -1263,79 +1263,107 @@ class Agent(eqx.Module):
         return self._extend_sequential(carry, toks, eqns, valid, count)
 
     def _extend_parallel(self, carry, toks, eqns, valid, count):
-        """See encode_extend's docstring; math notes in the commit."""
-        layers = self.encoder.layers
-        T = toks.shape[0]
-        ok = valid
-        tokvalid = ok & (eqns >= 0)
-        tv = tokvalid.astype(jnp.float32)                       # (T,)
-        e = jnp.clip(eqns, 0, MAX_EQNS - 1)
+        """Blocked parallel extend: scan across fixed-size blocks, one
+        associative_scan within each.
 
-        # Causal relational features WITHOUT the carried histogram: the
-        # count of prior+current valid tokens in the same / an earlier / a
-        # later segment. The carry's histogram supplies the pre-window
-        # prefix. One masked (T, T) comparison replaces T histogram updates.
-        causal = jnp.tril(jnp.ones((T, T), jnp.float32))        # s <= t
-        le = (e[None, :] <= e[:, None]).astype(jnp.float32)     # e_s <= e_t
-        lt = (e[None, :] < e[:, None]).astype(jnp.float32)
-        w = causal * tv[None, :]
-        pre_at = carry.cumhist[e]                                # (T,)
-        pre_below = jnp.where(e > 0, carry.cumhist[jnp.maximum(e - 1, 0)], 0.0)
-        at = pre_at + jnp.sum(w * le, axis=1)
-        below = pre_below + jnp.sum(w * lt, axis=1)
-        nvalid = carry.nvalid + jnp.cumsum(tv)
-        denom = jnp.maximum(nvalid, 1.0)
-        feats = (jnp.stack([at - below, below, nvalid - at], axis=-1)
-                 / denom[:, None] * tv[:, None])                # (T, 3)
+        A single whole-window associative_scan materializes the per-token
+        states (T, H, d, n) -- at T=2048, E=256 that is ~67 MB per tensor per
+        LAYER, and the loss vmaps 108 minibatch samples: the very first
+        train_episode asked the shared 24 GB 4090 for one 15.64 GiB buffer.
+        Blocking bounds the working set at (block, H, d, n) per sample --
+        ALPHAGRAD_CHUNK_BLOCK=128 is ~4 MB -- while keeping T/block fewer
+        sequential steps than the per-token scan. Same affine composition,
+        so the selftest still holds to float-reassociation noise.
+        """
+        Bk = int(os.environ.get("ALPHAGRAD_CHUNK_BLOCK", "128"))
+        T = toks.shape[0]
+        nb = -(-T // Bk)
+        pad = nb * Bk - T
+
+        def _pad(a, fill):
+            if pad == 0:
+                return a
+            return jnp.concatenate(
+                [a, jnp.full((pad,) + a.shape[1:], fill, a.dtype)])
+
+        b_toks = _pad(toks, 0).reshape(nb, Bk)
+        b_eqns = _pad(eqns, -1).reshape(nb, Bk)
+        b_ok = _pad(valid, False).reshape(nb, Bk)
+        layers = self.encoder.layers
 
         def _affine(l, r):
             return (r[0] * l[0], r[0] * l[1] + r[1])
 
-        x = jax.vmap(self.embedding)(toks)                      # (T, E)
-        new_M, new_I = [], []
-        for li, layer in enumerate(layers):
-            mixer = layer.attn_layer
-            H, d = mixer.num_heads, mixer.head_dim
-            y = jax.vmap(layer.attn_norm)(x)
-            q = jax.vmap(mixer.query_proj)(y).reshape(T, H, d)
-            kk = jax.vmap(mixer.key_proj)(y).reshape(T, H, d)
-            v = jax.vmap(mixer.value_proj)(y).reshape(T, H, d)
-            b = jnn.softplus(jax.vmap(mixer.bias_proj)(y)).reshape(T, H, d)
-            gt = jnn.softplus(jax.vmap(mixer.gate_proj)(y)
-                              + feats @ mixer.rel_gate.weight.T
-                              + mixer.rel_gate.bias)
-            g = jnn.softplus(mixer.g_raw)
-            Ip = jnn.softplus(mixer.Ip_raw)
-            a = jnp.exp(-gt[:, :, None, None] * g[None, :, None, None])
-            okb = ok[:, None, None, None]
-            a = jnp.where(okb, a, 1.0)                          # freeze
-            B_M = jnp.where(okb, v[:, :, :, None] * kk[:, :, None, :], 0.0)
-            B_I = jnp.where(
-                okb,
-                b[:, :, :, None] * (kk[:, :, None, :] ** 2)
-                + (1.0 - a) * Ip[None, :, None, None], 0.0)
-            A_M, S_M = lax.associative_scan(_affine, (a, B_M))
-            _, S_I = lax.associative_scan(_affine, (a, B_I))
-            M_t = A_M * carry.M[li][None] + S_M                 # (T, H, d, n)
-            I_t = A_M * carry.I[li][None] + S_I
-            mu = M_t / I_t
-            out = jnp.einsum("thdn,thn->thd", mu,
-                             q * (d ** -0.5)).reshape(T, H * d)
-            x = x + jax.vmap(mixer.output_proj)(out)
-            y2 = jax.vmap(layer.mlp_norm)(x)
-            x = x + jax.vmap(layer.mlp)(y2)
-            new_M.append(M_t[-1])
-            new_I.append(I_t[-1])
+        def _block(c, blk):
+            M, I, ch, nv0 = c
+            btoks, beqns, ok = blk
+            tv = (ok & (beqns >= 0)).astype(jnp.float32)
+            e = jnp.clip(beqns, 0, MAX_EQNS - 1)
+            # Causal relational feats: carried histogram supplies the prefix,
+            # one (Bk, Bk) masked comparison supplies the within-block part.
+            causal = jnp.tril(jnp.ones((Bk, Bk), jnp.float32))
+            w = causal * tv[None, :]
+            le = (e[None, :] <= e[:, None]).astype(jnp.float32)
+            lt = (e[None, :] < e[:, None]).astype(jnp.float32)
+            at = ch[e] + jnp.sum(w * le, axis=1)
+            below = (jnp.where(e > 0, ch[jnp.maximum(e - 1, 0)], 0.0)
+                     + jnp.sum(w * lt, axis=1))
+            nval = nv0 + jnp.cumsum(tv)
+            denom = jnp.maximum(nval, 1.0)
+            feats = (jnp.stack([at - below, below, nval - at], axis=-1)
+                     / denom[:, None] * tv[:, None])
 
-        rows = jnp.where(ok[:, None], x, 0.0)
-        # Histogram update for FUTURE windows: += one bincount, cumsummed
-        # over the eqn axis (cumhist[j] counts tokens with e_s <= j).
-        cnt = jnp.zeros((MAX_EQNS,), jnp.float32).at[e].add(tv)
-        new_carry = EncCarry(
-            M=jnp.stack(new_M), I=jnp.stack(new_I),
-            cumhist=carry.cumhist + jnp.cumsum(cnt),
-            nvalid=carry.nvalid + jnp.sum(tv),
-            pos=carry.pos + count)
+            x = jax.vmap(self.embedding)(btoks)
+            newM, newI = [], []
+            for li, layer in enumerate(layers):
+                mixer = layer.attn_layer
+                H, d = mixer.num_heads, mixer.head_dim
+                y = jax.vmap(layer.attn_norm)(x)
+                q = jax.vmap(mixer.query_proj)(y).reshape(Bk, H, d)
+                kk = jax.vmap(mixer.key_proj)(y).reshape(Bk, H, d)
+                v = jax.vmap(mixer.value_proj)(y).reshape(Bk, H, d)
+                b = jnn.softplus(
+                    jax.vmap(mixer.bias_proj)(y)).reshape(Bk, H, d)
+                gt = jnn.softplus(jax.vmap(mixer.gate_proj)(y)
+                                  + feats @ mixer.rel_gate.weight.T
+                                  + mixer.rel_gate.bias)
+                g = jnn.softplus(mixer.g_raw)
+                Ip = jnn.softplus(mixer.Ip_raw)
+                a = jnp.exp(-gt[:, :, None, None]
+                            * g[None, :, None, None])
+                okb = ok[:, None, None, None]
+                a = jnp.where(okb, a, 1.0)
+                B_M = jnp.where(
+                    okb, v[:, :, :, None] * kk[:, :, None, :], 0.0)
+                B_I = jnp.where(
+                    okb,
+                    b[:, :, :, None] * (kk[:, :, None, :] ** 2)
+                    + (1.0 - a) * Ip[None, :, None, None], 0.0)
+                A_M, S_M = lax.associative_scan(_affine, (a, B_M))
+                _, S_I = lax.associative_scan(_affine, (a, B_I))
+                M_t = A_M * M[li][None] + S_M
+                I_t = A_M * I[li][None] + S_I
+                mu = M_t / I_t
+                out = jnp.einsum("thdn,thn->thd", mu,
+                                 q * (d ** -0.5)).reshape(Bk, H * d)
+                x = x + jax.vmap(mixer.output_proj)(out)
+                y2 = jax.vmap(layer.mlp_norm)(x)
+                x = x + jax.vmap(layer.mlp)(y2)
+                newM.append(M_t[-1])
+                newI.append(I_t[-1])
+
+            rows_b = jnp.where(ok[:, None], x, 0.0)
+            cnt = jnp.zeros((MAX_EQNS,), jnp.float32).at[e].add(tv)
+            c2 = (jnp.stack(newM), jnp.stack(newI),
+                  ch + jnp.cumsum(cnt), nv0 + jnp.sum(tv))
+            return c2, rows_b
+
+        (M2, I2, ch2, nv2), rows_b = lax.scan(
+            _block, (carry.M, carry.I, carry.cumhist, carry.nvalid),
+            (b_toks, b_eqns, b_ok))
+        rows = rows_b.reshape(nb * Bk, -1)[:T]
+        new_carry = EncCarry(M=M2, I=I2, cumhist=ch2, nvalid=nv2,
+                             pos=carry.pos + count)
         return new_carry, rows, valid, eqns
 
     def _extend_sequential(self, carry, toks, eqns, valid, count):

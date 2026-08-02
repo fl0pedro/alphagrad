@@ -2484,24 +2484,49 @@ def _callback(
                     # CAVEAT: device-wide, so a co-resident actor allocating on
                     # the same GPU inflates it (CV 49.7% under a noisy
                     # neighbour) -- keep one measure process per device.
+                    # CPU backends EXPOSE clear_memory_stats but raise
+                    # UNIMPLEMENTED when called (hasattr passes, the call
+                    # dies) -- measured killing both v40 arms at episode 0.
+                    # Without allocator stats the peak falls back to the
+                    # compiled executable's memory_analysis(): args + outputs
+                    # + temps, the deterministic static peak the AZ stack
+                    # validated as its memory cost (CV exactly 0 by
+                    # construction; latency stays the real perf_counter
+                    # timing either way).
+                    _have_stats = True
                     for _d in unique_devices:
-                        if hasattr(_d, "clear_memory_stats"):
+                        try:
                             _d.clear_memory_stats()
+                        except Exception:
+                            _have_stats = False
+                            break
                     jax.effects_barrier()
                     _base = 0.0
-                    for _d in unique_devices:
-                        _bstats = _d.memory_stats() or {}
-                        _base += float(_bstats.get("bytes_in_use", 0.0))
+                    if _have_stats:
+                        for _d in unique_devices:
+                            _bstats = _d.memory_stats() or {}
+                            _base += float(_bstats.get("bytes_in_use", 0.0))
                     _t0 = time.perf_counter()
                     for _k in range(inner):
                         out_approx = compiled_approx(*eval_args_i)
                     jax.block_until_ready(out_approx)
                     _t1 = time.perf_counter()
-                    _peak_abs = 0.0
-                    for _d in unique_devices:
-                        _stats = _d.memory_stats() or {}
-                        _peak_abs += float(_stats.get("peak_bytes_in_use", 0.0))
-                    _peak = max(0.0, _peak_abs - _base)
+                    if _have_stats:
+                        _peak_abs = 0.0
+                        for _d in unique_devices:
+                            _stats = _d.memory_stats() or {}
+                            _peak_abs += float(
+                                _stats.get("peak_bytes_in_use", 0.0))
+                        _peak = max(0.0, _peak_abs - _base)
+                    else:
+                        try:
+                            _ma = compiled_approx.memory_analysis()
+                            _peak = float(
+                                getattr(_ma, "argument_size_in_bytes", 0)
+                                + getattr(_ma, "output_size_in_bytes", 0)
+                                + getattr(_ma, "temp_size_in_bytes", 0))
+                        except Exception:
+                            _peak = 0.0
                     latency_samples.append((_t1 - _t0) / inner * 1e9)  # → ns
                     peak_mem_samples.append(_peak)
                 else:
