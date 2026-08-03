@@ -3088,33 +3088,76 @@ class VertexEliminationEnv:
             def _remote_callback_batched(args, consts, order, specs,
                                          face_specs, face_skips, step,
                                          *eval_samples):
-                # Face actions must never reach this path -- it cannot carry
-                # them, and silently dropping them would measure a plan the
-                # policy did not choose. ppo.py refuses the combination up
-                # front; this is the backstop.
-                _fs = np.asarray(face_specs)
-                _sk = np.asarray(face_skips)
-                if _fs.size and (_fs[..., 0] >= 0).any() or (_sk == 1).any():
-                    raise RuntimeError(
-                        "Ray measurement pool cannot carry face actions "
-                        "(face_specs/face_skips are dropped by the pool's "
-                        "per-vertex env). Run without --face-actions."
-                    )
+                # P3: the pool stack CARRIES face wires now (worker builds
+                # empty ones only when handed None), so face-action rows
+                # ship through instead of raising. TERMINAL rows measure on
+                # the trainer's own device when exec_on_gpu — the pool's
+                # CPU actors must not time a GPU campaign — while
+                # non-terminal rows (tokens-only under
+                # terminal_rewards_only) shard to the pool.
                 _o = np.asarray(order)
                 E = int(_o.shape[0])
-                _sp = np.asarray(specs)
                 _st = np.asarray(step).reshape(-1)
+                _sti = [int(_st[i] if _st.size > 1 else _st[0])
+                        for i in range(E)]
                 _ev = (tuple(_cb_slot(x, 0, E) for x in eval_samples)
                        if eval_samples else None)
-                tokens, eqn_ids, rewards, _sent = pool.evaluate_batch(
-                    [_o[i] for i in range(E)],
-                    [_sp[i] for i in range(E)],
-                    [int(_st[i] if _st.size > 1 else _st[0]) for i in range(E)],
-                    eval_samples=_ev,
-                    init=init,
-                )
-                return (np.asarray(tokens), np.asarray(eqn_ids),
-                        np.asarray(rewards))
+                ro = [np.asarray(_cb_slot(order, i, E)) for i in range(E)]
+                rs = [np.asarray(_cb_slot(specs, i, E)) for i in range(E)]
+                rf = [np.asarray(_cb_slot(face_specs, i, E))
+                      for i in range(E)]
+                rk = [np.asarray(_cb_slot(face_skips, i, E))
+                      for i in range(E)]
+                _any_faces = any(
+                    (f[..., 0] >= 0).any() or (k == 1).any()
+                    or (f[..., 0] == COMPRESS_SENTINEL).any()
+                    or (f[..., 0] == QUANT_SENTINEL).any()
+                    for f, k in zip(rf, rk))
+                # Terminal rows go to the pool BY DEFAULT — measure actors
+                # are GPU-pinned (#23) and their idle device is a quieter
+                # timer than the busy trainer GPU. Opt into trainer-local
+                # terminals (CPU-only actor pools) with
+                # ALPHAGRAD_POOL_TERMINAL_LOCAL=1.
+                _term_local = os.environ.get(
+                    "ALPHAGRAD_POOL_TERMINAL_LOCAL", "0") == "1"
+                _local = set(
+                    i for i in range(E)
+                    if _term_local and _sti[i] >= int(ro[i].shape[0]))
+                _remote = [i for i in range(E) if i not in _local]
+                tk = np.zeros((E, MAX_TOKENS), np.int32)
+                ei = np.zeros((E, MAX_TOKENS), np.int32)
+                rw = np.zeros((E, NUM_REWARDS), np.float32)
+                if _remote:
+                    tokens, eqn_ids, rewards, _sent = pool.evaluate_batch(
+                        [ro[i] for i in _remote],
+                        [rs[i] for i in _remote],
+                        [_sti[i] for i in _remote],
+                        eval_samples=_ev,
+                        init=init,
+                        face_specs_batch=(
+                            [rf[i] for i in _remote] if _any_faces
+                            else None),
+                        face_skips_batch=(
+                            [rk[i] for i in _remote] if _any_faces
+                            else None),
+                    )
+                    for k2, i in enumerate(_remote):
+                        tk[i] = np.asarray(tokens)[k2]
+                        ei[i] = np.asarray(eqn_ids)[k2]
+                        rw[i] = np.asarray(rewards)[k2]
+                for i in _local:
+                    t_i, e_i, r_i = _callback(
+                        self.config,
+                        _cb_slot(args, i, E),
+                        _cb_slot(consts, i, E),
+                        ro[i], rs[i], rf[i], rk[i], _sti[i],
+                        *[_cb_slot(x, i, E) for x in eval_samples],
+                        init=init,
+                    )
+                    tk[i] = np.asarray(t_i)
+                    ei[i] = np.asarray(e_i)
+                    rw[i] = np.asarray(r_i)
+                return tk, ei, rw
 
             return _remote_callback_batched
 

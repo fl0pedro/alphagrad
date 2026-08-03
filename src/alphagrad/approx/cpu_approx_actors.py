@@ -201,10 +201,13 @@ class CpuApproximationActor:
         eval_samples: Sequence | None = None,
         init: bool = False,
         point_idx: int = -1,
+        face_specs=None,
+        face_skips=None,
     ):
         return self._impl.evaluate(
             order, sparsity_specs, step,
             eval_samples=eval_samples, init=init, point_idx=point_idx,
+            face_specs=face_specs, face_skips=face_skips,
         )
 
     def evaluate_batch(self, batch: Sequence[tuple]):

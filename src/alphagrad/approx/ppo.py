@@ -3809,13 +3809,10 @@ def main():
     # ---- --ray-measure: fan the measurement callback out over Ray actors ----
     if int(getattr(args, "ray_measure", 0) or 0) > 0:
         _n_actors = int(args.ray_measure)
-        if getattr(args, "face_actions", False):
-            raise ValueError(
-                "--ray-measure is incompatible with --face-actions: the "
-                "measurement pool's env is per-vertex and DROPS "
-                "face_specs/face_skips, so it would measure a different plan "
-                "than the policy chose."
-            )
+        # P3: the pool stack carries face_specs/face_skips end-to-end now
+        # (cpu_approx_{worker,actors,pool} pass-through; env's remote
+        # closure ships them and keeps exec_on_gpu TERMINAL rows local),
+        # so --face-actions no longer needs to be refused here.
         if os.environ.get("ALPHAGRAD_BATCHED_CALLBACK", "0") != "1":
             raise ValueError(
                 "--ray-measure needs ALPHAGRAD_BATCHED_CALLBACK=1; without it "

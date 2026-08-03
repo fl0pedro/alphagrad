@@ -397,6 +397,8 @@ class CpuApproxPool:
         eval_samples: Any,
         *,
         init: bool = False,
+        face_specs: Any = None,
+        face_skips: Any = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Dispatch one ``(order, specs, step)`` request to a pool
         actor and return ``(tokens, eqn_ids, reward)`` as numpy arrays.
@@ -443,6 +445,10 @@ class CpuApproxPool:
                 int(step),
                 eval_samples=samples_arg,
                 init=bool(init),
+                face_specs=(None if face_specs is None
+                            else np.asarray(face_specs, dtype=np.int32)),
+                face_skips=(None if face_skips is None
+                            else np.asarray(face_skips, dtype=np.int32)),
             )
             # Per-actor cold/warm timeout. ``timeout_for`` returns 0
             # when the user requested no-timeout (``--cpu-callback-timeout 0``);
@@ -526,6 +532,8 @@ class CpuApproxPool:
         *,
         eval_samples: Any = None,
         init: bool = False,
+        face_specs_batch: "Sequence[Any] | None" = None,
+        face_skips_batch: "Sequence[Any] | None" = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Phase-2 memory-mitigation probe #8: optional batch dedup.
 
@@ -541,6 +549,8 @@ class CpuApproxPool:
             return self._evaluate_batch_impl(
                 order_batch, specs_batch, step_batch,
                 eval_samples=eval_samples, init=init,
+                face_specs_batch=face_specs_batch,
+                face_skips_batch=face_skips_batch,
             )
         N = len(order_batch)
         # Build canonical key per slot; first-seen slot is the representative.
@@ -552,6 +562,10 @@ class CpuApproxPool:
                 np.asarray(order_batch[i], dtype=np.int32).tobytes(),
                 np.asarray(specs_batch[i], dtype=np.int32).tobytes(),
                 int(step_batch[i]),
+                (b"" if face_specs_batch is None else
+                 np.asarray(face_specs_batch[i], dtype=np.int32).tobytes()),
+                (b"" if face_skips_batch is None else
+                 np.asarray(face_skips_batch[i], dtype=np.int32).tobytes()),
             )
             if key in rep_of:
                 slot_to_rep[i] = rep_of[key]
@@ -564,12 +578,18 @@ class CpuApproxPool:
             return self._evaluate_batch_impl(
                 order_batch, specs_batch, step_batch,
                 eval_samples=eval_samples, init=init,
+                face_specs_batch=face_specs_batch,
+                face_skips_batch=face_skips_batch,
             )
         t_u, e_u, r_u, s_u = self._evaluate_batch_impl(
             [order_batch[i] for i in uniq_idx],
             [specs_batch[i] for i in uniq_idx],
             [step_batch[i] for i in uniq_idx],
             eval_samples=eval_samples, init=init,
+            face_specs_batch=(None if face_specs_batch is None else
+                              [face_specs_batch[i] for i in uniq_idx]),
+            face_skips_batch=(None if face_skips_batch is None else
+                              [face_skips_batch[i] for i in uniq_idx]),
         )
         pos = {orig: k for k, orig in enumerate(uniq_idx)}
         tokens_out = np.zeros((N, self._max_tokens), dtype=np.int32)
@@ -592,6 +612,8 @@ class CpuApproxPool:
         *,
         eval_samples: Any = None,
         init: bool = False,
+        face_specs_batch: "Sequence[Any] | None" = None,
+        face_skips_batch: "Sequence[Any] | None" = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Dispatch N requests concurrently. Returns
         ``(tokens_stack, eqn_ids_stack, rewards_stack, sentinel_mask)``
@@ -709,6 +731,12 @@ class CpuApproxPool:
                         int(step_batch[i]),
                         eval_samples=samples_arg,
                         init=bool(init),
+                        face_specs=(
+                            None if face_specs_batch is None else
+                            np.asarray(face_specs_batch[i], dtype=np.int32)),
+                        face_skips=(
+                            None if face_skips_batch is None else
+                            np.asarray(face_skips_batch[i], dtype=np.int32)),
                     )
                     f_timeouts[i] = self._timeout_for(actor)
                 except Exception as _exc:

@@ -212,6 +212,8 @@ class CpuApproximationServer:
         eval_samples: Sequence | None = None,
         init: bool = False,
         point_idx: int = -1,
+        face_specs: Any = None,
+        face_skips: Any = None,
     ):
         """Run the per-step reward pipeline once.
 
@@ -255,16 +257,21 @@ class CpuApproximationServer:
         self._maybe_init_leak_profile()
         try:
             # env._callback takes face_specs / face_skips between the
-            # per-vertex specs and `stop`. This caller predates them; passing
-            # them explicitly as EMPTY (-1 / 0) is the documented per-vertex
-            # mode and is byte-identical to the non-face path. `point_idx` is
-            # gone from _callback and is not forwarded.
+            # per-vertex specs and `stop`. With no caller-supplied wires,
+            # EMPTY (-1 / 0) is the documented per-vertex mode and is
+            # byte-identical to the non-face path; face-action callers
+            # (P3 host shard) pass the real wire rows through. `point_idx`
+            # is gone from _callback and is not forwarded.
             from alphagrad.approx.env import (
                 MAX_FACES as _MAX_FACES, FACE_SLOTS as _FACE_SLOTS)
             _n_ord = int(np.asarray(order_j).shape[0])
-            _face_specs = np.full(
-                (_n_ord, _MAX_FACES, _FACE_SLOTS, 3), -1, dtype=np.int32)
-            _face_skips = np.zeros((_n_ord, _MAX_FACES), dtype=np.int32)
+            if face_specs is None:
+                _face_specs = np.full(
+                    (_n_ord, _MAX_FACES, _FACE_SLOTS, 3), -1, dtype=np.int32)
+                _face_skips = np.zeros((_n_ord, _MAX_FACES), dtype=np.int32)
+            else:
+                _face_specs = np.asarray(face_specs, dtype=np.int32)
+                _face_skips = np.asarray(face_skips, dtype=np.int32)
             tokens, eqn_ids, reward = _callback(
                 self._config,
                 self._args,
