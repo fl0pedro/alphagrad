@@ -6606,9 +6606,26 @@ def main():
                         _prof.items(), key=lambda kv: -kv[1]
                     )
                     _tot = sum(v for _, v in _items)
+                    # Prefix-cache engagement counters (consumed per episode,
+                    # like the phase timers): nonzero ext == the O(T) fast
+                    # paths are actually running, cold == full prefix replays.
+                    try:
+                        from alphagrad.approx import env as _envmod
+                        _ss = _envmod._INCR_STREAM_STATS
+                        _fs = _envmod._FACE_ENUM_STATS
+                        _cache_line = (
+                            f"  stream(hit/ext/cold/nostore)={_ss['hit']}/"
+                            f"{_ss['ext']}/{_ss['cold']}/{_ss['nostore']}"
+                            f"  face_enum(ext/cold)={_fs['ext']}/"
+                            f"{_fs['cold']}")
+                        _ss.update(hit=0, ext=0, cold=0, nostore=0)
+                        _fs.update(ext=0, cold=0)
+                    except Exception:
+                        _cache_line = ""
                     tqdm.write(
                         f"[prof ep={ep:3d}] host_total={_tot:6.1f}s  "
-                        + "  ".join(f"{k}={v:.1f}s" for k, v in _items),
+                        + "  ".join(f"{k}={v:.1f}s" for k, v in _items)
+                        + _cache_line,
                         file=sys.stderr,
                     )
             except Exception as _exc:

@@ -309,6 +309,19 @@ def incremental_token_delta(jaxpr, argnums, consts, args, order_prefix,
 
 _INCR_STREAM_CACHE: dict = {}
 _INCR_STREAM_CACHE_CAP = 64
+# Engagement counters (proof instrumentation, not behavior): how often the
+# append-only stream cache hit the full key / EXTENDED a parent / went cold.
+_INCR_STREAM_STATS = {"hit": 0, "ext": 0, "cold": 0, "nostore": 0}
+# Pop-and-extend prefix cache for `_face_transforms_for_order`
+# (ALPHAGRAD_FACE_ENUM_CACHE=1): (IncrementalJaxpr, out) keyed by the full
+# decision prefix — one elimination per env step instead of a fresh
+# build+replay of the whole prefix. Same COMPRESS soundness bound and same
+# pop-on-extend policy as _INCR_STREAM_CACHE. Entries hold a live trace, so
+# the cap is smaller and tunable.
+_FACE_ENUM_CACHE: dict = {}
+_FACE_ENUM_CACHE_CAP = int(os.environ.get("ALPHAGRAD_FACE_ENUM_CACHE_CAP",
+                                          "64"))
+_FACE_ENUM_STATS = {"ext": 0, "cold": 0}
 
 # One ResourceMonitor per device-set, reused for every measurement.
 # Constructing a fresh monitor per call leaks its C++ MemoryTracker/
@@ -333,7 +346,7 @@ def _get_resource_monitor(unique_devices):
 
 def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
                                tok_rules_by_v, ft_by_vertex=None,
-                               face_key=None):
+                               face_key=None, honor_last_compress=True):
     """Full append-only observation stream for the prefix ``o_list``
     (ALPHAGRAD_INCREMENTAL_TOKENS=1): base tokens + one block per elimination
     (path tokens + ``approx`` echoes), from graphax's IncrementalPathTokenizer
@@ -365,10 +378,11 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
 
     hit = _INCR_STREAM_CACHE.get(key)
     if hit is not None:
+        _INCR_STREAM_STATS["hit"] += 1
         return hit[1], hit[2]
 
     tk, stream, seg_ids, done = None, None, None, 0
-    # ANCESTOR EXTENSION IS ONLY SOUND WITHOUT COMPRESS IN THE PREFIX.
+    # ANCESTOR EXTENSION IS ONLY SOUND ACROSS is_last-INSENSITIVE STATES.
     #
     # Measured (tests/stream_prefix_property_test.py): the stream for a
     # length-k prefix is NOT a byte-prefix of the length-k+1 stream when the
@@ -379,24 +393,41 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
     # policy a different observation than a cold replay, i.e. the observation
     # would depend on cache state.
     #
-    # The `face_key is None` clause was already here (its comment gave a
-    # different, weaker reason); the COMPRESS check is the one that actually
-    # makes this correct, and it also protects the per-vertex path that the
-    # original guard left exposed. Plans without COMPRESS still take the fast
-    # path. Remove both conditions only after the COMPRESS last-vertex
-    # restriction is lifted.
-    _prefix_has_compress = any(
-        any(int(r[0]) == COMPRESS_SENTINEL for r in rows) for _v, rows in steps
-    )
-    if face_key is None and not _prefix_has_compress:
+    # REFINED BOUND (v40 counters showed the prefix-wide scan left the cache
+    # disengaged, ext=1/431: with allow_compress a random policy plants a
+    # COMPRESS row within a step or two and every later step replayed cold):
+    # the divergence lives ONLY at the vertex whose decode flips is_last
+    # between lengths — the CURRENT last vertex. So (a) a state is STORED
+    # only if its last vertex is COMPRESS-free (specs AND face rows — same
+    # decoder, same sensitivity), making every stored state
+    # is_last-insensitive by induction; (b) extension from any stored parent
+    # is then always sound; (c) a COMPRESS-last call replays cold WITHOUT
+    # consuming its parent (extending would mutate it) and is not stored —
+    # one O(t) replay per COMPRESS decision instead of a dead cache.
+    # `honor_last_compress=False` (ALPHAGRAD_TOKENS_MID_COMPRESS=0 on a
+    # non-terminal step): the caller decoded the last vertex with
+    # is_last=False, so its COMPRESS row was DROPPED and the state is not
+    # sensitive — storable. The terminal call (honor=True) extends this
+    # chain soundly: vertices 0..T-2 decode identically in both worlds.
+    _last_has_compress = honor_last_compress and bool(steps) and any(
+        int(r[0]) == COMPRESS_SENTINEL for r in steps[-1][1])
+    if (honor_last_compress and not _last_has_compress and steps
+            and isinstance(face_key, tuple) and face_key):
+        _last_has_compress = any(
+            int(r0) == COMPRESS_SENTINEL for r0 in face_key[-1][0][0::3])
+    if not _last_has_compress:
         for cut in range(len(steps) - 1, 0, -1):
             parent = _INCR_STREAM_CACHE.pop(
-                base_key + (tuple(steps[:cut]), None), None)
+                base_key + (tuple(steps[:cut]),
+                            face_key[:cut] if isinstance(face_key, tuple)
+                            else None), None)
             if parent is not None:
+                _INCR_STREAM_STATS["ext"] += 1
                 tk, stream, seg_ids, done = (
                     parent[0], list(parent[1]), list(parent[2]), cut)
                 break
     if tk is None:
+        _INCR_STREAM_STATS["cold"] += 1
         tk = IncrementalPathTokenizer(
             config.jaxpr, tuple(config.argnums), list(consts), list(args),
             vocab_size=vocab,
@@ -417,6 +448,12 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
             (ft_by_vertex or {}).get(int(v)))]
         seg_ids += [int(g) for g in tk.last_eqn_ids()]
 
+    if _last_has_compress:
+        # is_last-SENSITIVE state — serving it is fine, but it must never
+        # become a parent (its last elimination differs from a longer cold
+        # replay's view of the same vertex).
+        _INCR_STREAM_STATS["nostore"] += 1
+        return stream, seg_ids
     if len(_INCR_STREAM_CACHE) > _INCR_STREAM_CACHE_CAP:
         _INCR_STREAM_CACHE.clear()
     _INCR_STREAM_CACHE[key] = (tk, stream, seg_ids)
@@ -1796,7 +1833,8 @@ def decode_vertex_rule_specs(jaxpr, vertex, spec_rows, is_last: bool) -> tuple:
 
 
 def _face_transforms_for_order(config, consts, args, o_list, specs_list,
-                               face_rows_list, face_skips_list):
+                               face_rows_list, face_skips_list,
+                               honor_last_compress=True):
     """Per-vertex ``face_transforms`` dicts for graphax, from the wire arrays.
 
     Face KEYS are graph-state dependent, so enumerate with ``faces_of`` on a
@@ -1811,12 +1849,50 @@ def _face_transforms_for_order(config, consts, args, o_list, specs_list,
     from graphax.incremental import IncrementalJaxpr
     from alphagrad.approx.common.masks import make_live_masked_hook
 
-    ij = IncrementalJaxpr(config.jaxpr, tuple(config.argnums), list(consts),
-                          list(args), track_faces=False)
+    ij = None
     out: dict[int, dict] = {}
+    _start = 0
+    _cache_key = None
+    if os.environ.get("ALPHAGRAD_FACE_ENUM_CACHE", "0") == "1":
+        # Pop-and-extend prefix cache: step k's replay is step k-1's replay
+        # plus ONE elimination, so advance the cached builder instead of
+        # rebuilding it from scratch every env step — O(T) eliminations per
+        # episode instead of O(T^2). Only sound while decode is
+        # is_last-insensitive, i.e. no COMPRESS anywhere in the prefix
+        # (specs OR face rows) — same policy, same reason as
+        # _INCR_STREAM_CACHE. Extension MUTATES the builder, so the parent
+        # entry is POPPED; a sibling chain that misses takes the honest
+        # cold replay.
+        _sigs = tuple(
+            (int(o_list[k]),
+             np.asarray(specs_list[k], dtype=np.int64).tobytes(),
+             np.asarray(face_rows_list[k], dtype=np.int64).tobytes(),
+             np.asarray(face_skips_list[k], dtype=np.int64).tobytes())
+            for k in range(len(o_list)))
+        _base = (id(config.jaxpr), tuple(config.argnums))
+        # Same refined bound as _INCR_STREAM_CACHE: only the LAST vertex's
+        # decode is is_last-sensitive. A COMPRESS-last call is served cold,
+        # keeps its parent cached, and is not stored.
+        _k_last = len(o_list) - 1
+        _last_compress = honor_last_compress and bool(
+            COMPRESS_SENTINEL in np.asarray(specs_list[_k_last])[..., 0]
+            or COMPRESS_SENTINEL in np.asarray(face_rows_list[_k_last])[..., 0])
+        if not _last_compress:
+            _cache_key = _base + (_sigs,)
+            for cut in range(len(_sigs) - 1, 0, -1):
+                parent = _FACE_ENUM_CACHE.pop(_base + (_sigs[:cut],), None)
+                if parent is not None:
+                    ij, out, _start = parent[0], parent[1], cut
+                    _FACE_ENUM_STATS["ext"] += 1
+                    break
+            if ij is None:
+                _FACE_ENUM_STATS["cold"] += 1
+    if ij is None:
+        ij = IncrementalJaxpr(config.jaxpr, tuple(config.argnums),
+                              list(consts), list(args), track_faces=False)
     last = len(o_list) - 1
-    for k, v in enumerate(o_list):
-        v = int(v)
+    for k in range(_start, len(o_list)):
+        v = int(o_list[k])
         keys = faces_of(ij.graph, ij.tgraph, v, config.jaxpr)
         per_face: dict = {}
         rows_f = face_rows_list[k]
@@ -1844,7 +1920,7 @@ def _face_transforms_for_order(config, consts, args, o_list, specs_list,
                 ] * (MAX_RULES_PER_VERTEX - 1)
                 rules = decode_vertex_rule_specs(
                     config.jaxpr, v, one_row,
-                    is_last=(k == last),
+                    is_last=(k == last and honor_last_compress),
                 )
                 slots.append(
                     make_live_masked_hook(tuple(rules)) if rules else None
@@ -1854,7 +1930,8 @@ def _face_transforms_for_order(config, consts, args, o_list, specs_list,
         if per_face:
             out[v] = per_face
         vertex_rules = decode_vertex_rule_specs(
-            config.jaxpr, v, specs_list[k], is_last=(k == last)
+            config.jaxpr, v, specs_list[k],
+            is_last=(k == last and honor_last_compress),
         )
         # Hook-wrap like the measurement/tokenizer paths do under per_face:
         # a raw rule that doesn't fit one face's operand would hit the strict
@@ -1867,6 +1944,15 @@ def _face_transforms_for_order(config, consts, args, o_list, specs_list,
             (make_live_masked_hook(tuple(vertex_rules)),) if vertex_rules else (),
             out.get(v),
         )
+    if _cache_key is not None:
+        # FIFO eviction (dict preserves insertion order): a clear-all here
+        # would cost one full cold replay PER CONCURRENT ENV CHAIN on the
+        # next step; evicting the oldest entries only sheds finished chains.
+        while len(_FACE_ENUM_CACHE) >= _FACE_ENUM_CACHE_CAP:
+            _FACE_ENUM_CACHE.pop(next(iter(_FACE_ENUM_CACHE)))
+        _FACE_ENUM_CACHE[_cache_key] = (ij, out)
+        # the cached dict keeps growing on extension — hand back a snapshot
+        return dict(out)
     return out
 
 
@@ -1902,10 +1988,15 @@ def _callback(
 
     o_list = [int(x) for x in partial_order.tolist()]
     specs_list = partial_specs.tolist()  # list of MAX_RULES x 3 lists
+    _pf("cb.wire2py")
 
     # P1 per-path actions: build graphax's {vertex: {face_key: slots|SKIP}}
     # only when any face action is present in the prefix (all -1 / all 0 is
     # the per-vertex mode and must stay byte-identical to it).
+    # ALPHAGRAD_TOKENS_MID_COMPRESS=0: intermediate steps tokenize their last
+    # vertex with is_last=False (terminal steps always honor COMPRESS).
+    _honor_mid_compress = is_terminal or os.environ.get(
+        "ALPHAGRAD_TOKENS_MID_COMPRESS", "1") == "1"
     _faces_np = np.asarray(face_specs)[: len(o_list)]
     _skips_np = np.asarray(face_skips)[: len(o_list)]
     ft_by_vertex = None
@@ -1915,7 +2006,9 @@ def _callback(
         ft_by_vertex = _face_transforms_for_order(
             config, consts, args, o_list, specs_list,
             _faces_np.tolist(), _skips_np.tolist(),
+            honor_last_compress=_honor_mid_compress,
         )
+    _pf("cb.face_enum")
 
     # Build the per-vertex `transforms` sequence consumed by graphax's
     # typed-transform API. Each row in `sparsity_specs` is
@@ -1939,7 +2032,18 @@ def _callback(
             config.jaxpr, int(v), specs_list[v_idx],
             is_last=(v_idx == last_v_idx),
         )
-        if rules:
+        # TOKENIZER-side rules: under ALPHAGRAD_TOKENS_MID_COMPRESS=0 an
+        # INTERMEDIATE last vertex is tokenized WITHOUT its COMPRESS
+        # (is_last=False decode). The measurement `transforms` above keeps
+        # the legacy decode — this changes the observation only, and only
+        # where the incremental encoder's carry was already being extended
+        # across a rewritten history (the COMPRESS prefix-property
+        # violation). The terminal step is unchanged.
+        tok_rules = rules
+        if v_idx == last_v_idx and not _honor_mid_compress:
+            tok_rules = decode_vertex_rule_specs(
+                config.jaxpr, int(v), specs_list[v_idx], is_last=False)
+        if rules or tok_rules:
             if getattr(config, "per_face", False):
                 # graphax invokes a CALLABLE transform once per face, handing
                 # it that face's live operand — so this is where per-path
@@ -1947,18 +2051,24 @@ def _callback(
                 # skipped for that face only (not for the whole vertex).
                 from alphagrad.approx.common.masks import make_live_masked_hook
                 _face_stats = _PER_FACE_STATS
-                transforms.append(
-                    (int(v), (make_live_masked_hook(rules, stats=_face_stats),))
-                )
+                if rules:
+                    transforms.append(
+                        (int(v),
+                         (make_live_masked_hook(rules, stats=_face_stats),))
+                    )
                 # The tokenizer eliminates its OWN graph copy with equivalent
                 # hooks but no stats sink — the measured graph's hooks own the
                 # applied/skipped counters.
-                tok_rules_by_v[int(v)] = (make_live_masked_hook(rules),)
+                if tok_rules:
+                    tok_rules_by_v[int(v)] = (
+                        make_live_masked_hook(tok_rules),)
             else:
-                transforms.append((int(v), tuple(rules)))
-                tok_rules_by_v[int(v)] = tuple(rules)
+                if rules:
+                    transforms.append((int(v), tuple(rules)))
+                if tok_rules:
+                    tok_rules_by_v[int(v)] = tuple(tok_rules)
 
-    _pf("cb.decode+face_enum")
+    _pf("cb.decode")
     if os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "0") == "1":
         # Append-only observation (spec): the stream grows by one block per
         # elimination and the whole extract_jaxpr re-trace of the Jacobian is
@@ -1969,7 +2079,14 @@ def _callback(
         stream, seg_ids = _incremental_stream_tokens(
             config, consts, args, o_list, specs_list, tok_rules_by_v,
             ft_by_vertex=ft_by_vertex,
-            face_key=(_faces_np.tobytes(), _skips_np.tobytes())
+            honor_last_compress=_honor_mid_compress,
+            # PER-STEP signatures (not one whole-prefix blob) so the stream
+            # cache can find the parent at every ancestor cut under face
+            # actions instead of replaying the whole prefix cold each step.
+            face_key=tuple(
+                (tuple(int(x) for x in _faces_np[k].reshape(-1)),
+                 tuple(int(x) for x in _skips_np[k].reshape(-1)))
+                for k in range(len(o_list)))
             if ft_by_vertex else None,
         )
         _record_token_length(len(stream))
