@@ -148,3 +148,43 @@ def load_dataset(name: str, dataset_size: int | None, subset: str = "train"):
 
     _DATASET_CACHE[cache_key] = result
     return result
+
+
+# ---------------------------------------------------------------------------
+# wikitext-2 (word-level) for the TransformerLM example. The corpus ships
+# pre-tokenized (space-separated, <unk> included); vocab = the `vocab_size`
+# most frequent words, everything else -> <unk>.
+_WIKITEXT_URL = "https://wikitext.smerity.com/wikitext-2-v1.zip"
+
+
+def _wikitext_cache_dir() -> Path:
+    override = os.environ.get("DSNN_WIKITEXT_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".cache" / "dsnn_wikitext"
+
+
+def load_wikitext2(vocab_size: int, subset: str = "train") -> np.ndarray:
+    ck = ("wikitext2", int(vocab_size), subset)
+    if ck in _DATASET_CACHE:
+        return _DATASET_CACHE[ck]
+    cache = _wikitext_cache_dir()
+    cache.mkdir(parents=True, exist_ok=True)
+    z = cache / "wikitext-2-v1.zip"
+    if not z.exists():
+        print(f"  fetching {_WIKITEXT_URL} -> {z}")
+        urllib.request.urlretrieve(_WIKITEXT_URL, z)
+    import zipfile
+    from collections import Counter
+    with zipfile.ZipFile(z) as zf:
+        with zf.open(f"wikitext-2/wiki.{subset}.tokens") as fh:
+            words = fh.read().decode("utf-8").split()
+    counts = Counter(words)
+    vocab = [w for w, _ in counts.most_common(int(vocab_size))]
+    if "<unk>" not in vocab:
+        vocab[-1] = "<unk>"
+    idx = {w: i for i, w in enumerate(vocab)}
+    unk = idx["<unk>"]
+    ids = np.asarray([idx.get(w, unk) for w in words], dtype=np.int32)
+    _DATASET_CACHE[ck] = ids
+    return ids

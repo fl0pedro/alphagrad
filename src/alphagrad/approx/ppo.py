@@ -2474,7 +2474,7 @@ def make_argparser() -> argparse.ArgumentParser:
         "intermediate steps return zeros. Skips per-step jacve compile/exec — the "
         "dominant rollout cost. PPO+GAE handles sparse rewards natively.",
     )
-    p.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "none"])
+    p.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "wikitext2", "none"])
     p.add_argument("--dataset-size", type=int, default=-1)
     p.add_argument("--num-eval-samples", type=int, default=10)
 
@@ -3730,7 +3730,9 @@ def main():
 
     # Resolve example, build env, derive masks.
     dataset_arg = None if args.dataset == "none" else args.dataset
-    use_dataset = dataset_arg is not None and args.example.endswith("NeuralNetwork")
+    use_dataset = dataset_arg is not None and (
+        args.example.endswith("NeuralNetwork")
+        or args.example == "TransformerLM")
     dataset_for_call = dataset_arg if use_dataset else None
 
     target_fn = get_fn(args.example)

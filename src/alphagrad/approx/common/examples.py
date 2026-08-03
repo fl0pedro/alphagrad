@@ -122,6 +122,21 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
 
         return fn
 
+    if fn_str == "TransformerLM":
+        from alphagrad.approx.common.datasets import load_wikitext2
+        S, D, V = _tlm_dims()
+        ids = jnp.asarray(load_wikitext2(V))
+        E = _tlm_embedding(D, V)
+        n_start = int(ids.shape[0]) - (S + 1)
+
+        @jax.jit
+        def fn(keys):
+            s = jrand.randint(keys[0], (), 0, n_start)
+            win = jax.lax.dynamic_slice(ids, (s,), (S + 1,))
+            return E[win[:S]], jax.nn.one_hot(win[1:], V)
+
+        return fn
+
     # NeuralNetwork and the graphax vision models all consume MNIST as
     # (flat-784 image, onehot-10 label), so they share the dataset sampler.
     if fn_str.endswith("NeuralNetwork") or _vision_base(fn_str) is not None:
@@ -341,6 +356,24 @@ def get_args(fn_str: str, key, dataset: str | None = None):
                 shapes = [(_w,), (_w,), (_w, _w), (_w,), (_w, _w), (_w,)]
             else:
                 shapes = [(4,), (4,), (8, 4), (8,), (4, 8), (4,)]
+    elif fn_str == "TransformerLM":
+        S, D, V = _tlm_dims()
+        ks = jax.random.split(key, 16)
+
+        def _w(i, shape):
+            return jax.random.normal(ks[i], shape) / jnp.sqrt(
+                jnp.float32(shape[0]))
+
+        ws = []
+        for blk in range(2):
+            o = blk * 7
+            ws += [_w(o, (D, D)), _w(o + 1, (D, D)), _w(o + 2, (D, D)),
+                   _w(o + 3, (D, D)), jnp.zeros((D,)),
+                   jnp.ones((D,)), jnp.zeros((D,))]
+        ws.append(_w(14, (D, V)))
+        gen = data_gen(fn_str, dataset=dataset or "wikitext2")
+        x, y = gen(jax.random.split(ks[15], 2))
+        return [x, y, *ws]
     elif fn_str.endswith("Perceptron"):
         shapes = [(4,), (4,), (8, 4), (8,), (4, 8), (4,), (8,), (8,)]
     elif "EncoderDecoder" in fn_str:
@@ -379,6 +412,8 @@ def get_fn(fn_str: str):
         fn = _neural_network
     elif base == "Perceptron":
         fn = examples.Perceptron
+    elif base == "TransformerLM":
+        fn = _transformer_lm
     else:
         # strip the Vmapped prefix so graphax models (ConvNet/MoE/ViT/Encoder/...)
         # resolve by their bare name.
@@ -531,6 +566,8 @@ def infer_argnums(fn_str: str) -> tuple[int, ...]:
         # (x, y, *weights) -> every weight arg, matching the vision models
         n = len(inspect.signature(getattr(examples, fn_str)).parameters)
         return tuple(range(2, n))
+    if fn_str == "TransformerLM":
+        return tuple(range(2, 17))
     if fn_str.endswith("NeuralNetwork"):
         return (2, 3, 4, 5)
     if fn_str.endswith("Perceptron"):
@@ -541,3 +578,28 @@ def infer_argnums(fn_str: str) -> tuple[int, ...]:
         n = len(inspect.signature(getattr(examples, vbase)).parameters)
         return tuple(range(2, n))
     return (0,)
+
+
+# ---------------------------------------------------------------------------
+# TransformerLM (wikitext): 2 encoder blocks + LM head + xent. x is the
+# PRE-EMBEDDED (S, D) window, y the (S, V) one-hot next tokens — the
+# embedding gather happens in data_gen, never in the differentiated graph.
+def _tlm_dims():
+    return (int(os.environ.get("ALPHAGRAD_TLM_SEQ", "64")),
+            int(os.environ.get("ALPHAGRAD_TLM_DMODEL", "128")),
+            int(os.environ.get("ALPHAGRAD_TLM_VOCAB", "2048")))
+
+
+def _transformer_lm(x, y, WQ1, WK1, WV1, W1, b1, g0, be0,
+                    WQ2, WK2, WV2, W2, b2, g1, be1, Wout):
+    from graphax.examples.deep_learning import (encoder_block,
+                                                softmax_cross_entropy)
+    z1 = encoder_block(x, WQ1, WK1, WV1, W1, b1, g0, be0)
+    z2 = encoder_block(z1, WQ2, WK2, WV2, W2, b2, g1, be1)
+    return softmax_cross_entropy(z2 @ Wout, y)
+
+
+def _tlm_embedding(D, V):
+    # FIXED (seeded) embedding: part of the data pipeline, not learned here.
+    return jrand.normal(jrand.PRNGKey(1729), (V, D)) / jnp.sqrt(
+        jnp.float32(D))
