@@ -4160,12 +4160,36 @@ def main():
                         vertex_specs, face_rows, face_skips, f):
         _pt0 = _prof_time.perf_counter()
         try:
-            tok, ids, cnt, _nf = _LIVE_FACES.chunk(
-                order, spec_hist, int(np.asarray(step_count)),
-                int(np.asarray(vertex_idx)) + 1, vertex_specs,
-                face_rows, face_skips, int(np.asarray(f)),
-            )
-            return tok, ids, np.asarray(cnt, np.int32)
+            _order = np.asarray(order)
+            if _order.ndim == 1:
+                tok, ids, cnt, _nf = _LIVE_FACES.chunk(
+                    order, spec_hist, int(np.asarray(step_count)),
+                    int(np.asarray(vertex_idx)) + 1, vertex_specs,
+                    face_rows, face_skips, int(np.asarray(f)),
+                )
+                return tok, ids, np.asarray(cnt, np.int32)
+            # BATCHED (vmap_method="broadcast_all"): ONE host dispatch per
+            # face substep for all envs. The sequential vmap ran E separate
+            # callbacks with a device round-trip between each — the GPU
+            # idled through E dispatch+sync latencies per substep (the
+            # dominant share of the approx-vs-exact non-host gap). Values
+            # are identical: the same per-env chunk() calls, in env order.
+            B = _order.shape[0]
+            W = int(MAX_DELTA_TOKENS)
+            toks = np.zeros((B, W), np.int32)
+            idss = np.zeros((B, W), np.int32)
+            cnts = np.zeros((B,), np.int32)
+            _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
+            _vi, _vs = np.asarray(vertex_idx), np.asarray(vertex_specs)
+            _fr, _fs = np.asarray(face_rows), np.asarray(face_skips)
+            _ff = np.asarray(f)
+            for i in range(B):
+                tok, ids, cnt, _nf = _LIVE_FACES.chunk(
+                    _order[i], _sh[i], int(_sc[i]), int(_vi[i]) + 1,
+                    _vs[i], _fr[i], _fs[i], int(_ff[i]),
+                )
+                toks[i], idss[i], cnts[i] = tok, ids, np.int32(cnt)
+            return toks, idss, cnts
         finally:
             _env_prof_add("faces.live_chunk",
                           _prof_time.perf_counter() - _pt0)
@@ -4182,19 +4206,28 @@ def main():
              jax.ShapeDtypeStruct((W,), jnp.int32),
              jax.ShapeDtypeStruct((), jnp.int32)),
             order, spec_hist, step_count, vertex_idx, vertex_specs,
-            face_rows, face_skips, f, vmap_method="sequential",
+            face_rows, face_skips, f, vmap_method="broadcast_all",
         )
 
     def _live_face_count_host(order, spec_hist, step_count, vertex_idx):
-        return np.int32(_LIVE_FACES.n_faces(
-            order, spec_hist, int(np.asarray(step_count)),
-            int(np.asarray(vertex_idx)) + 1))
+        _order = np.asarray(order)
+        if _order.ndim == 1:
+            return np.int32(_LIVE_FACES.n_faces(
+                order, spec_hist, int(np.asarray(step_count)),
+                int(np.asarray(vertex_idx)) + 1))
+        # batched: one dispatch per vertex step (see _live_face_host)
+        _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
+        _vi = np.asarray(vertex_idx)
+        return np.asarray(
+            [_LIVE_FACES.n_faces(_order[i], _sh[i], int(_sc[i]),
+                                 int(_vi[i]) + 1)
+             for i in range(_order.shape[0])], np.int32)
 
     def _live_face_count(order, spec_hist, step_count, vertex_idx):
         return jax.pure_callback(
             _live_face_count_host, jax.ShapeDtypeStruct((), jnp.int32),
             order, spec_hist, step_count, vertex_idx,
-            vmap_method="sequential")
+            vmap_method="broadcast_all")
 
     _ORACLE_ONE_VERTEX = os.environ.get(
         "ALPHAGRAD_ORACLE_ONE_VERTEX", "1") == "1"

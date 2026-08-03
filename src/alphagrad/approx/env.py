@@ -346,7 +346,8 @@ def _get_resource_monitor(unique_devices):
 
 def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
                                tok_rules_by_v, ft_by_vertex=None,
-                               face_key=None, honor_last_compress=True):
+                               face_key=None, honor_last_compress=True,
+                               face_rows_list=None, face_skips_list=None):
     """Full append-only observation stream for the prefix ``o_list``
     (ALPHAGRAD_INCREMENTAL_TOKENS=1): base tokens + one block per elimination
     (path tokens + ``approx`` echoes), from graphax's IncrementalPathTokenizer
@@ -379,9 +380,16 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
     hit = _INCR_STREAM_CACHE.get(key)
     if hit is not None:
         _INCR_STREAM_STATS["hit"] += 1
-        return hit[1], hit[2]
+        return hit[1], hit[2], (hit[3] if len(hit) > 3 and hit[3]
+                                else ft_by_vertex)
 
     tk, stream, seg_ids, done = None, None, None, 0
+    # ALPHAGRAD_UNIFIED_FACE_ENUM=1: the caller hands the raw wire rows and
+    # this function builds the per-face dicts on the TOKENIZER's own
+    # IncrementalJaxpr (tk.ij) right before each elimination — no second
+    # replay. `ft_out` accumulates per prefix and rides the cache entries.
+    _unified = face_rows_list is not None
+    ft_out: dict = {}
     # ANCESTOR EXTENSION IS ONLY SOUND ACROSS is_last-INSENSITIVE STATES.
     #
     # Measured (tests/stream_prefix_property_test.py): the stream for a
@@ -425,6 +433,8 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
                 _INCR_STREAM_STATS["ext"] += 1
                 tk, stream, seg_ids, done = (
                     parent[0], list(parent[1]), list(parent[2]), cut)
+                if len(parent) > 3 and parent[3]:
+                    ft_out = dict(parent[3])
                 break
     if tk is None:
         _INCR_STREAM_STATS["cold"] += 1
@@ -442,22 +452,34 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
                 f"or lower ALPHAGRAD_INCR_TOKEN_VOCAB. (JAX CLAMPS an "
                 f"out-of-range gather, silently reading the wrong row.)"
             )
-    for v, _rows in steps[done:]:
+    for _ki in range(done, len(steps)):
+        v, _rows = steps[_ki]
+        if _unified:
+            _pf_v = _face_dict_for_vertex(
+                config, tk.ij, int(v), face_rows_list[_ki],
+                face_skips_list[_ki],
+                is_last_honored=(_ki == len(steps) - 1
+                                 and honor_last_compress))
+            if _pf_v:
+                ft_out[int(v)] = _pf_v
+        else:
+            _pf_v = (ft_by_vertex or {}).get(int(v))
         stream += [int(t) for t in tk.eliminate(
-            int(v), tok_rules_by_v.get(int(v), ()),
-            (ft_by_vertex or {}).get(int(v)))]
+            int(v), tok_rules_by_v.get(int(v), ()), _pf_v)]
         seg_ids += [int(g) for g in tk.last_eqn_ids()]
 
+    _ft_ret = ft_out if _unified else ft_by_vertex
     if _last_has_compress:
         # is_last-SENSITIVE state — serving it is fine, but it must never
         # become a parent (its last elimination differs from a longer cold
         # replay's view of the same vertex).
         _INCR_STREAM_STATS["nostore"] += 1
-        return stream, seg_ids
+        return stream, seg_ids, _ft_ret
     if len(_INCR_STREAM_CACHE) > _INCR_STREAM_CACHE_CAP:
         _INCR_STREAM_CACHE.clear()
-    _INCR_STREAM_CACHE[key] = (tk, stream, seg_ids)
-    return stream, seg_ids
+    _INCR_STREAM_CACHE[key] = (tk, stream, seg_ids,
+                               ft_out if _unified else None)
+    return stream, seg_ids, _ft_ret
 
 
 # ---------------------------------------------------------------------------
@@ -1832,6 +1854,49 @@ def decode_vertex_rule_specs(jaxpr, vertex, spec_rows, is_last: bool) -> tuple:
     return tuple(rules)
 
 
+def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
+                          is_last_honored):
+    """ONE vertex's ``{face_key: slots|SKIP_FACE}`` from its wire rows,
+    enumerated on ``ij``'s CURRENT graph — call BEFORE eliminating ``v``.
+    Single source of truth for `_face_transforms_for_order` (standalone
+    replay) and the unified tokenizer path (ALPHAGRAD_UNIFIED_FACE_ENUM=1),
+    which rides the tokenizer's own IncrementalJaxpr instead of replaying a
+    second, byte-identical elimination."""
+    from graphax import SKIP_FACE, faces_of
+    from alphagrad.approx.common.masks import make_live_masked_hook
+
+    keys = faces_of(ij.graph, ij.tgraph, int(v), config.jaxpr)
+    if len(keys) > _FACE_CAP_STATS["max_seen"]:
+        _FACE_CAP_STATS["max_seen"] = len(keys)
+    if len(keys) > MAX_FACES:
+        # The width is the PROVABLE bound, so this cannot fire unless
+        # the ancestors x descendants argument is wrong -- in which case
+        # a silent slice would shrink the action space while reporting
+        # a healthy run. Die loudly instead.
+        raise RuntimeError(
+            f"vertex {v}: {len(keys)} faces exceed the derived bound "
+            f"{MAX_FACES} -- the subset argument is violated")
+    per_face: dict = {}
+    for f, key in enumerate(keys[:MAX_FACES]):
+        if int(face_skip[f]) == 1:
+            per_face[key] = SKIP_FACE
+            continue
+        slots = []
+        for s in range(FACE_SLOTS):
+            # The decoder walks all MAX_RULES slots — pad the single face
+            # row with end-sentinels.
+            one_row = [list(face_row[f][s])] + [
+                [-1, -1, 0]
+            ] * (MAX_RULES_PER_VERTEX - 1)
+            rules = decode_vertex_rule_specs(
+                config.jaxpr, int(v), one_row, is_last=is_last_honored)
+            slots.append(
+                make_live_masked_hook(tuple(rules)) if rules else None)
+        if any(sl is not None for sl in slots):
+            per_face[key] = tuple(slots)
+    return per_face
+
+
 def _face_transforms_for_order(config, consts, args, o_list, specs_list,
                                face_rows_list, face_skips_list,
                                honor_last_compress=True):
@@ -1893,40 +1958,9 @@ def _face_transforms_for_order(config, consts, args, o_list, specs_list,
     last = len(o_list) - 1
     for k in range(_start, len(o_list)):
         v = int(o_list[k])
-        keys = faces_of(ij.graph, ij.tgraph, v, config.jaxpr)
-        per_face: dict = {}
-        rows_f = face_rows_list[k]
-        skips_f = face_skips_list[k]
-        if len(keys) > _FACE_CAP_STATS["max_seen"]:
-            _FACE_CAP_STATS["max_seen"] = len(keys)
-        if len(keys) > MAX_FACES:
-            # The width is the PROVABLE bound, so this cannot fire unless
-            # the ancestors x descendants argument is wrong -- in which case
-            # a silent slice would shrink the action space while reporting
-            # a healthy run. Die loudly instead.
-            raise RuntimeError(
-                f"vertex {v}: {len(keys)} faces exceed the derived bound "
-                f"{MAX_FACES} -- the subset argument is violated")
-        for f, key in enumerate(keys[:MAX_FACES]):
-            if int(skips_f[f]) == 1:
-                per_face[key] = SKIP_FACE
-                continue
-            slots = []
-            for s in range(FACE_SLOTS):
-                # The decoder walks all MAX_RULES slots — pad the single face
-                # row with end-sentinels.
-                one_row = [list(rows_f[f][s])] + [
-                    [-1, -1, 0]
-                ] * (MAX_RULES_PER_VERTEX - 1)
-                rules = decode_vertex_rule_specs(
-                    config.jaxpr, v, one_row,
-                    is_last=(k == last and honor_last_compress),
-                )
-                slots.append(
-                    make_live_masked_hook(tuple(rules)) if rules else None
-                )
-            if any(sl is not None for sl in slots):
-                per_face[key] = tuple(slots)
+        per_face = _face_dict_for_vertex(
+            config, ij, v, face_rows_list[k], face_skips_list[k],
+            is_last_honored=(k == last and honor_last_compress))
         if per_face:
             out[v] = per_face
         vertex_rules = decode_vertex_rule_specs(
@@ -2000,9 +2034,19 @@ def _callback(
     _faces_np = np.asarray(face_specs)[: len(o_list)]
     _skips_np = np.asarray(face_skips)[: len(o_list)]
     ft_by_vertex = None
-    if len(o_list) and (np.any(_skips_np == 1) or np.any(_faces_np[..., 0] >= 0)
-                        or np.any(_faces_np[..., 0] == COMPRESS_SENTINEL)
-                        or np.any(_faces_np[..., 0] == QUANT_SENTINEL)):
+    _have_face_actions = bool(
+        len(o_list) and (np.any(_skips_np == 1)
+                         or np.any(_faces_np[..., 0] >= 0)
+                         or np.any(_faces_np[..., 0] == COMPRESS_SENTINEL)
+                         or np.any(_faces_np[..., 0] == QUANT_SENTINEL)))
+    # ALPHAGRAD_UNIFIED_FACE_ENUM=1 (+ incremental tokens): face keys are
+    # enumerated on the TOKENIZER's IncrementalJaxpr inside
+    # _incremental_stream_tokens — the standalone replay below is skipped
+    # and this phase's time moves into cb.tokenize.
+    _unified_fe = (os.environ.get("ALPHAGRAD_UNIFIED_FACE_ENUM", "0") == "1"
+                   and os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "0")
+                   == "1")
+    if _have_face_actions and not _unified_fe:
         ft_by_vertex = _face_transforms_for_order(
             config, consts, args, o_list, specs_list,
             _faces_np.tolist(), _skips_np.tolist(),
@@ -2076,10 +2120,13 @@ def _callback(
         # one stream-global id per contraction/approx group, -1 elsewhere —
         # which is exactly the relational-gate contract (same/earlier/later
         # comparisons, no embedding-table bound).
-        stream, seg_ids = _incremental_stream_tokens(
+        _fe_inline = _unified_fe and _have_face_actions
+        stream, seg_ids, _ft_ret = _incremental_stream_tokens(
             config, consts, args, o_list, specs_list, tok_rules_by_v,
             ft_by_vertex=ft_by_vertex,
             honor_last_compress=_honor_mid_compress,
+            face_rows_list=_faces_np.tolist() if _fe_inline else None,
+            face_skips_list=_skips_np.tolist() if _fe_inline else None,
             # PER-STEP signatures (not one whole-prefix blob) so the stream
             # cache can find the parent at every ancestor cut under face
             # actions instead of replaying the whole prefix cold each step.
@@ -2087,8 +2134,12 @@ def _callback(
                 (tuple(int(x) for x in _faces_np[k].reshape(-1)),
                  tuple(int(x) for x in _skips_np[k].reshape(-1)))
                 for k in range(len(o_list)))
-            if ft_by_vertex else None,
+            if (ft_by_vertex is not None or _fe_inline) else None,
         )
+        if _fe_inline:
+            # measurement sites below read the same dict the eliminations
+            # actually applied
+            ft_by_vertex = _ft_ret or None
         _record_token_length(len(stream))
         _record_tokenization_truncation(len(stream))
         tokens = jnp.asarray(stream[:MAX_TOKENS], dtype=jnp.int32)

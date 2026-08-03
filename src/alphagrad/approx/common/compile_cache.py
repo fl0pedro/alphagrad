@@ -57,6 +57,23 @@ _local_hits = 0
 _local_misses = 0
 _local_errors = 0
 
+# Process-local executable memo in FRONT of the (optional) coordinator:
+# without one, cached_compile was a pass-through and every terminal step
+# re-traced+re-lowered+re-compiled repeated plans. FIFO-evicted; entries are
+# loaded jax.stages.Compiled objects (survive jax.clear_caches(); freed by
+# GC on eviction), so memory is bounded by the cap.
+_LOCAL_CACHE: dict = {}
+_LOCAL_CACHE_CAP = int(os.environ.get(
+    "ALPHAGRAD_LOCAL_COMPILE_CACHE_CAP", "32"))
+
+
+def _local_store(cache_key: bytes, compiled: Any) -> None:
+    if _LOCAL_CACHE_CAP <= 0:
+        return
+    while len(_LOCAL_CACHE) >= _LOCAL_CACHE_CAP:
+        _LOCAL_CACHE.pop(next(iter(_LOCAL_CACHE)))
+    _LOCAL_CACHE[cache_key] = compiled
+
 
 def _get_actor_handle() -> Any | None:
     """Resolve the coordinator handle (lazy, cached). Returns ``None``
@@ -119,10 +136,17 @@ def cached_compile(
     bytes value; identity must be deterministic across actors.
     """
     global _local_hits, _local_misses, _local_errors
+    if _LOCAL_CACHE_CAP > 0:
+        _hit = _LOCAL_CACHE.get(cache_key)
+        if _hit is not None:
+            _local_hits += 1
+            return _hit
     handle = _get_actor_handle()
     if handle is None:
-        # No coordinator — fall through to uncached compile.
-        return compile_fn()
+        # No coordinator — the LOCAL memo above is the only cache layer.
+        compiled = compile_fn()
+        _local_store(cache_key, compiled)
+        return compiled
 
     import ray
 
@@ -139,6 +163,7 @@ def cached_compile(
             blob = ray.get(ref)
             compiled = _deserialize(blob)
             _local_hits += 1
+            _local_store(cache_key, compiled)
             return compiled
         except Exception:
             # Stale ref or deserialise failure — fall through to
@@ -148,6 +173,7 @@ def cached_compile(
     # 3. Cache miss — compile fresh, serialise, ray.put, register.
     _local_misses += 1
     compiled = compile_fn()
+    _local_store(cache_key, compiled)
     try:
         blob = _serialize(compiled)
         new_ref = ray.put(blob)

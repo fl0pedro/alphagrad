@@ -152,7 +152,7 @@ def _stream_pass(cfg, consts, args, order, specs, faces, skips, fts, chained):
     for t in range(1, len(order) + 1):
         if not chained:
             E._INCR_STREAM_CACHE.clear()
-        stream, seg = E._incremental_stream_tokens(
+        stream, seg, _ft = E._incremental_stream_tokens(
             cfg, consts, args, order[:t], specs[:t],
             _tok_rules(cfg, order[:t], specs[:t]),
             ft_by_vertex=fts[t - 1], face_key=_fk(faces, skips, t))
@@ -244,8 +244,8 @@ def test_stream_empty_prefix_init_call_does_not_crash():
     cfg, consts, args = _mk()
     E._INCR_STREAM_CACHE.clear()
     _reset(E._INCR_STREAM_STATS)
-    s1, g1 = E._incremental_stream_tokens(cfg, consts, args, [], [], {},
-                                          ft_by_vertex=None, face_key=None)
+    s1, g1, _ = E._incremental_stream_tokens(
+        cfg, consts, args, [], [], {}, ft_by_vertex=None, face_key=None)
     assert len(s1) > 0 and len(s1) == len(g1)
     assert E._INCR_STREAM_STATS["cold"] == 1
 
@@ -289,7 +289,7 @@ def test_stream_mid_compress_off_extends_through_compress_and_terminal():
             if not chained:
                 E._INCR_STREAM_CACHE.clear()
             honor = (t == T)
-            stream, seg = E._incremental_stream_tokens(
+            stream, seg, _ft = E._incremental_stream_tokens(
                 cfg, consts, args, order[:t], specs[:t],
                 _tok_rules_mid(cfg, order[:t], specs[:t], honor),
                 ft_by_vertex=fts[t - 1], face_key=_fk(faces, skips, t),
@@ -323,3 +323,35 @@ def test_stream_mid_compress_off_terminal_compress_not_stored():
     # t=1 cold, t=2..T-1 extend, t=T cold + nostore (parent preserved)
     assert E._INCR_STREAM_STATS == {
         "hit": 0, "ext": T - 2, "cold": 2, "nostore": 1}, E._INCR_STREAM_STATS
+
+
+def test_unified_face_enum_equals_standalone_and_skips_second_replay():
+    """P2: face enumeration riding the tokenizer's own IncrementalJaxpr must
+    produce the SAME streams and the SAME face structure as the standalone
+    `_face_transforms_for_order` replay — with zero second-replay activity
+    (the face-enum engagement counters stay at 0)."""
+    ep = _episode(seed=5)
+    cfg, consts, args, order, specs, faces, skips = ep
+    T = len(order)
+    fts, _ = _ft_pass(*ep, cached=False)  # standalone (legacy) ft dicts
+    E._INCR_STREAM_CACHE.clear()
+    _reset(E._INCR_STREAM_STATS)
+    _reset(E._FACE_ENUM_STATS)
+    uni_streams, uni_fts = [], []
+    for t in range(1, T + 1):
+        stream, seg, ft = E._incremental_stream_tokens(
+            cfg, consts, args, order[:t], specs[:t],
+            _tok_rules(cfg, order[:t], specs[:t]),
+            ft_by_vertex=None, face_key=_fk(faces, skips, t),
+            face_rows_list=[np.asarray(f).tolist() for f in faces[:t]],
+            face_skips_list=[np.asarray(s).tolist() for s in skips[:t]])
+        uni_streams.append((list(stream), list(seg)))
+        uni_fts.append(ft)
+    stats_uni = dict(E._INCR_STREAM_STATS)
+    legacy, _ = _stream_pass(cfg, consts, args, order, specs, faces, skips,
+                             fts, chained=True)
+    for t in range(T):
+        assert uni_streams[t] == legacy[t], f"stream diverged at t={t + 1}"
+        assert _ft_sig(uni_fts[t]) == _ft_sig(fts[t]), f"ft diverged t={t + 1}"
+    assert stats_uni["ext"] == T - 1, stats_uni
+    assert E._FACE_ENUM_STATS == {"ext": 0, "cold": 0}, E._FACE_ENUM_STATS
