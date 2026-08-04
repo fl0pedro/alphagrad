@@ -84,7 +84,12 @@ env = VertexEliminationEnv.from_jaxpr(
     # raising TRANSFORM DID NOT FIT and voiding the whole measurement.
     per_face=os.environ.get("ALPHAGRAD_GAZ_PER_FACE", "1") == "1",
     measure_latency=True,
-    num_data_points=A.ndata, reps_per_point=1, percentile_keep=0.60,
+    # W3: reps_per_point was HARDCODED to 1, so AZ medianed ndata samples
+    # (2 at the campaign default) against PPO's num_data_points x reps_per_point
+    # = 20. ALPHAGRAD_GAZ_REPS matches PPO's 4.
+    num_data_points=A.ndata,
+    reps_per_point=int(os.environ.get("ALPHAGRAD_GAZ_REPS", "4")),
+    percentile_keep=0.60,
     slow_exec_cutoff_seconds=0.0, flop_gate_threshold=0.0, measure_grad=_GAZ_MGRAD,
     latency_inner_reps=A.latency_inner_reps, latency_timer="perf_counter")
 ev = generate_eval_samples(env, ek, A.ndata)
@@ -280,6 +285,33 @@ def tokens_of(state):
 
 _MS = os.environ.get("ALPHAGRAD_MEASURE_SERVER", "0") == "1"
 _ms_client = None
+_MEASURE_FAILS: dict = {}
+_MEASURE_CALLS: list = [0]
+_MEASURE_CLEAR_EVERY = int(
+    os.environ.get("ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY", "16") or "0")
+
+
+def _clear_measure_caches(force: bool = False) -> None:
+    """Bound the executable population on the measure device.
+
+    AZ measures IN-PROCESS, so the mitigation ``cpu_approx_worker`` applies for
+    the Ray actors (clear every N evaluates, always on OOM) never reached it:
+    the distinct-executable population is effectively unbounded and the device
+    fills until even a small allocation OOMs (observed on job 58274: 74GB
+    resident, 210 allocator warnings, then SIGKILL).
+    """
+    _MEASURE_CALLS[0] += 1
+    _due = _MEASURE_CLEAR_EVERY > 0 and _MEASURE_CALLS[0] % _MEASURE_CLEAR_EVERY == 0
+    if not (force or _due):
+        return
+    try:
+        jax.clear_caches()
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+
+
 def measure(state):
     """Terminal REAL measurement -> [lat, xla_peak, flops, cos] or None.
     ALPHAGRAD_MEASURE_SERVER=1 -> measure in an isolated SUBPROCESS (a CUDA-
@@ -306,11 +338,23 @@ def measure(state):
             jnp.asarray(specs), *_zface, n, *ev,
         )
         reward = np.asarray(reward, dtype=np.float64)
-    except BaseException:
-        try:
-            jax.clear_caches(); import gc; gc.collect()
-        except Exception:
-            pass
+    except (KeyboardInterrupt, SystemExit):
+        raise                       # W3: never swallow an interrupt
+    except BaseException as _exc:
+        # W3: distinguish an apparatus OOM (expected, truncate) from a real bug
+        # (must be seen). The blanket catch is how the dead ``raw_sink`` kwarg
+        # hid: every measurement silently returned None and the run looked
+        # merely slow.
+        _txt = f"{type(_exc).__name__}: {_exc}".upper()
+        _oom = any(k in _txt for k in (
+            "RESOURCE_EXHAUSTED", "OUT OF MEMORY", "OUT_OF_MEMORY",
+            "OOM WHEN ALLOCATING", "CUDA_ERROR_OUT_OF_MEMORY"))
+        _MEASURE_FAILS["oom" if _oom else "other"] = (
+            _MEASURE_FAILS.get("oom" if _oom else "other", 0) + 1)
+        if not _oom:
+            print(f"[gaz] measure FAILED (not OOM): {type(_exc).__name__}: "
+                  f"{str(_exc)[:200]}", flush=True)
+        _clear_measure_caches(force=True)
         return None
     if reward[REWARD_INDEX["latency_ns"]] <= SENTINEL_COST + 1.0:
         return None  # sentinelled measurement
@@ -318,6 +362,7 @@ def measure(state):
     peak = -float(reward[REWARD_INDEX["peak_memory"]])
     flops = -float(reward[REWARD_INDEX["flops"]])
     cos = float(reward[REWARD_INDEX["cosine_sim"]])
+    _clear_measure_caches()          # W3: periodic bound, not only on failure
     r = np.array([lat, peak, flops, cos])
     if not np.all(np.isfinite(r)):
         return None

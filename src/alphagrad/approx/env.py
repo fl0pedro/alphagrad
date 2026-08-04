@@ -614,7 +614,12 @@ def consume_per_face_stats() -> dict:
     """Pop the per-period per-face apply counts (mirrors the other pollers)."""
     out = dict(_PER_FACE_STATS)
     _PER_FACE_STATS.clear()
-    total = sum(out.values()) or 1
+    # Only the TWO aggregate buckets count toward the denominator — the
+    # per-class ``applied_<kind>`` / ``skipped_<kind>`` keys added for the
+    # approximation histogram are a PARTITION of those two, so summing every
+    # value (the old formula) double-counted and halved the fraction.
+    total = (out.get("applied", 0) + out.get("skipped", 0)
+             + out.get("skipped_raised", 0)) or 1
     out["applied_fraction"] = out.get("applied", 0) / total
     return out
 
@@ -1647,6 +1652,9 @@ _BATCHED_CALLBACK = os.environ.get("ALPHAGRAD_BATCHED_CALLBACK", "0") == "1"
 # measurement process: no trainer shares it, so every visible GPU is a
 # measurement GPU and one is sufficient.
 _MEASURE_ACTOR = os.environ.get("ALPHAGRAD_MEASURE_ACTOR", "0") == "1"
+# One-shot latch so the static-estimate fallback warning is printed once per
+# process instead of once per measurement.
+_MEM_FALLBACK_WARNED: list = []
 
 
 def _cb_slot(x, i, E):
@@ -2589,22 +2597,40 @@ def _callback(
     compiled_cost = compiled_approx
     if os.environ.get("ALPHAGRAD_MEASURE_SPARSE", "0") == "1":
         def _do_compile_approx_sparse():
-            return (
-                jax.jit(
-                    jacve(
-                        config.target_fun,
-                        list(o_list),
-                        argnums=config.argnums,
-                        has_aux=config.has_aux,
-                        sparse_representation=True,
-                        transforms=transforms,
-                        face_transforms=ft_by_vertex,
-                    ),
-                    keep_unused=True,
+            # #46: factored outputs for the COST executable only — the trace
+            # happens inside .lower(), so scoping the env var here keeps the
+            # dense/quality/exact executables, tokenizer and replays
+            # byte-untouched. DEFAULT OFF: a respawned measure actor imports
+            # this file fresh, and a mid-campaign default flip would make its
+            # measurements incomparable with its siblings' — opt in per
+            # campaign with ALPHAGRAD_FACTORED_OUTPUTS=1 in the sbatch.
+            _fo = os.environ.get("ALPHAGRAD_FACTORED_OUTPUTS", "0") == "1"
+            _prev = os.environ.get("GRAPHAX_FACTORED_OUTPUTS")
+            if _fo:
+                os.environ["GRAPHAX_FACTORED_OUTPUTS"] = "1"
+            try:
+                return (
+                    jax.jit(
+                        jacve(
+                            config.target_fun,
+                            list(o_list),
+                            argnums=config.argnums,
+                            has_aux=config.has_aux,
+                            sparse_representation=True,
+                            transforms=transforms,
+                            face_transforms=ft_by_vertex,
+                        ),
+                        keep_unused=True,
+                    )
+                    .lower(*args_for_lower)
+                    .compile(compiler_options=_measure_compiler_options())
                 )
-                .lower(*args_for_lower)
-                .compile(compiler_options=_measure_compiler_options())
-            )
+            finally:
+                if _fo:
+                    if _prev is None:
+                        os.environ.pop("GRAPHAX_FACTORED_OUTPUTS", None)
+                    else:
+                        os.environ["GRAPHAX_FACTORED_OUTPUTS"] = _prev
         try:
             compiled_cost = cached_compile(
                 b"approx-sparse:" + cache_key, _do_compile_approx_sparse)
@@ -2759,11 +2785,26 @@ def _callback(
                     # construction; latency stays the real perf_counter
                     # timing either way).
                     _have_stats = True
+                    # Drain FIRST: clear_memory_stats() resets the high-water
+                    # counter, but work still in flight from the previous rep
+                    # lands after the reset and is charged to THIS rep. Barrier
+                    # -> clear -> barrier makes the window tight.
+                    jax.effects_barrier()
                     for _d in unique_devices:
                         try:
                             _d.clear_memory_stats()
-                        except Exception:
+                        except Exception as _cexc:
                             _have_stats = False
+                            if not _MEM_FALLBACK_WARNED:
+                                _MEM_FALLBACK_WARNED.append(1)
+                                print(
+                                    "[measure] WARNING peak_memory channel "
+                                    "switched to the STATIC memory_analysis() "
+                                    "estimate: clear_memory_stats() failed on "
+                                    f"{_d}: {type(_cexc).__name__}: {_cexc}. "
+                                    "This is a DIFFERENT quantity from the "
+                                    "measured peak_bytes_in_use delta.",
+                                    flush=True)
                             break
                     jax.effects_barrier()
                     _base = 0.0

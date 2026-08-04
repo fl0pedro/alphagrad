@@ -977,12 +977,24 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
 
     coupled, _ = couple_quant_rules(rules)
 
+    def _kind_of(rule):
+        """Telemetry label for a rule — the REALITY histogram's bucket."""
+        if isinstance(rule, Diag):
+            return "diag"
+        if isinstance(rule, Compress):
+            return "compress"
+        if isinstance(rule, Quant):
+            return "quant"
+        return "other"
+
     def _hook(st):
         cur = st
         for rule in coupled:
+            _kind = _kind_of(rule)
             if not rule_is_legal(cur, rule, max_dims=max_dims,
                                  max_axes=max_axes):
                 _bump("skipped")
+                _bump(f"skipped_{_kind}")
                 continue
             try:
                 if isinstance(rule, Diag):
@@ -993,13 +1005,16 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
                     cur = apply_quant(cur, rule)
                 else:
                     _bump("skipped")
+                    _bump(f"skipped_{_kind}")
                     continue
                 _bump("applied")
+                _bump(f"applied_{_kind}")
             except ValueError:
                 # The mask is meant to make this unreachable; if a case slips
                 # through, leaving the operand exact is strictly better than
                 # killing the episode's measurement.
                 _bump("skipped_raised")
+                _bump(f"skipped_{_kind}")
         return cur
 
     return _hook

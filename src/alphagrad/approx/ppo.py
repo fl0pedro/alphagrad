@@ -518,8 +518,43 @@ class EncCarry(NamedTuple):
 
 
 def _stream_len(tokens):
-    """Number of real tokens in an append-only buffer (pad id is 0)."""
-    return jnp.sum((tokens != 0).astype(jnp.int32))
+    """Number of real tokens in an append-only buffer (pad id is 0).
+
+    HAZARD (2026-08-04): id 0 is not a reserved pad — it is the vocabulary's
+    first entry, the literal ``'-'`` that graphax's ``int_to_base`` emits for
+    any NEGATIVE value (graphax/jaxpr.py). If a traced op param or literal in
+    the graph is negative, every occurrence is counted as padding here, the
+    delta window comes up short by that many tokens, and the policy silently
+    reads a truncated state. The append-only stream is contiguous, so a real
+    stream can only have zeros in its PADDING TAIL: assert that, cheaply, under
+    ALPHAGRAD_ASSERT_STREAM_LEN=1 (off by default — it forces a device sync).
+    """
+    nz = (tokens != 0).astype(jnp.int32)
+    n = jnp.sum(nz)
+    if os.environ.get("ALPHAGRAD_ASSERT_STREAM_LEN", "0") == "1":
+        # A contiguous prefix has all its non-zeros before index n.
+        contiguous = jnp.all(nz[: jnp.maximum(n, 1)] == 1)
+        jax.debug.callback(_warn_noncontiguous_stream, contiguous, n)
+    return n
+
+
+_STREAM_LEN_WARNED: list = []
+
+
+def _warn_noncontiguous_stream(contiguous, n):
+    """Host-side one-shot warning for the id-0 collision described above."""
+    try:
+        if bool(contiguous) or _STREAM_LEN_WARNED:
+            return
+    except Exception:
+        return
+    _STREAM_LEN_WARNED.append(1)
+    print(
+        "[tokens] WARNING token id 0 appears INSIDE the stream (not only in the "
+        f"padding tail; counted length={int(n)}). id 0 is the literal '-' that "
+        "graphax emits for negative values, so _stream_len undercounts and the "
+        "delta window is short. The observation is silently truncated.",
+        flush=True)
 
 
 def _zero_enc_carry_fields():
@@ -5952,6 +5987,14 @@ def main():
             p_stop_slot0 = jnp.mean(traj.pair_dists[..., 0, PAIR_STOP])
             op_marginals = jnp.zeros((NUM_OPS,), dtype=jnp.float32)
             mean_sub_episode_length = jnp.array(0.0, dtype=jnp.float32)
+        # Mean per-face SKIP gate (the 5th approximation class). traj.face_skip
+        # is the SAMPLED gate (1 = this face contributed nothing), so its mean
+        # is the realized skip rate; 0.0 when face actions are off.
+        _face_skip_p = (
+            jnp.mean(traj.face_skip.astype(jnp.float32))
+            if getattr(traj, "face_skip", None) is not None
+            else jnp.array(0.0, dtype=jnp.float32)
+        )
         diag_pack = (
             jnp.mean(traj.pair_dists, axis=(0, 1, 2)),
             jnp.mean(traj.factor_dists, axis=(0, 1, 2)),
@@ -5963,6 +6006,7 @@ def main():
             _diag_value_raw,
             _diag_return_raw,
             _diag_nonzero_cos_steps,
+            _face_skip_p,
         )
         return (
             agent,
@@ -6408,6 +6452,16 @@ def main():
                 log_dict["per_face/skipped"] = pf.get("skipped", 0)
                 log_dict["per_face/skipped_raised"] = pf.get("skipped_raised", 0)
                 log_dict["per_face/applied_fraction"] = pf["applied_fraction"]
+                # REALITY histogram per approximation class (same keys on the
+                # AZ runs): what the policy proposed is not what survived the
+                # per-face legality mask.
+                for _k in ("diag", "compress", "quant"):
+                    log_dict[f"approx_applied/{_k}"] = pf.get(f"applied_{_k}", 0)
+                    log_dict[f"approx_skipped/{_k}"] = pf.get(f"skipped_{_k}", 0)
+                log_dict["approx_applied/total"] = pf.get("applied", 0)
+                log_dict["approx_skipped/total"] = (
+                    pf.get("skipped", 0) + pf.get("skipped_raised", 0))
+                log_dict["approx_applied/fraction"] = pf["applied_fraction"]
 
         # ---- degenerate plans sentinelled by the env ------------------------
         _degen = consume_degenerate_plan_count()
@@ -6502,6 +6556,7 @@ def main():
                 value_raw,
                 return_raw,
                 nonzero_cos_steps,
+                _face_skip_p,
             ) = (np.asarray(x) for x in diag_pack)
             # T3. nonzero_cos_steps > 1 means the --terminal-rewards-only gate
             # in env.py has stopped holding. The value/return pair measures the
@@ -6539,6 +6594,15 @@ def main():
             for j, op_name in enumerate(("diag", "compress", "quant", "end")):
                 if j < op_marginals.shape[0]:
                     log_dict[f"op_marginal/{op_name}"] = float(op_marginals[j])
+            # POLICY PROBABILITY per approximation class, unified naming with
+            # the AZ runs. ``end`` (emit nothing further) is the "none" class;
+            # ``skip`` is the per-face gate's mass, which lives on a separate
+            # head and is 0 when face actions are off.
+            _ap_names = ("diag", "compress", "quant", "none")
+            for j, _nm in enumerate(_ap_names):
+                if j < op_marginals.shape[0]:
+                    log_dict[f"approx_prob/{_nm}"] = float(op_marginals[j])
+            log_dict["approx_prob/skip"] = float(_face_skip_p)
             log_dict["sub_episode_length"] = float(mean_sub_episode_length)
         # Populate the elimination-order table (it used to be created and
         # logged empty). Bounded: one row per episode for the best eligible
