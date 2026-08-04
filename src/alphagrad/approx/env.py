@@ -1549,35 +1549,69 @@ def _quality_metrics(jac_exact, jac_approx):
     # Layout-align the approx leaves to the exact layout (transpose-back) so
     # cosine/frob compare the SAME entries, not a transposed-layout artifact.
     jac_approx = _align_jac(jac_approx, jac_exact)
-    flat_exact = _flatten_jacobians(jac_exact)
-    flat_approx = _flatten_jacobians(jac_approx)
-    if flat_exact is None or flat_approx is None:
+    # PER-LEAF accumulation (2026-08-04). The old flatten+concatenate built a
+    # >=4GB flat copy of EACH side, and XLA's concatenate kernel faults with
+    # CUDA_ERROR_ILLEGAL_ADDRESS on >=2^31-byte operands once allocations sit
+    # high enough in the address space (residency-dependent: the identical
+    # concatenate passes in an empty process; reproduced with PLAIN EXACT
+    # leaves and fresh elementwise copies at nn256 batch 512 — the v45b
+    # measure-actor crash). Accumulating <e,a>, ||e||², ||a||², ||e-a||² per
+    # leaf is mathematically identical (same eps semantics as ``cossim``:
+    # each side clamped at sqrt(1e-7)) and never materializes the flats.
+    leaves_e = jax.tree_util.tree_leaves(jac_exact)
+    leaves_a = jax.tree_util.tree_leaves(jac_approx)
+    if not leaves_e or not leaves_a or len(leaves_e) != len(leaves_a):
         return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
-    if flat_approx.shape != flat_exact.shape or flat_approx.size == 0:
+    if any(getattr(a, "shape", None) != getattr(e, "shape", None)
+           for a, e in zip(leaves_a, leaves_e)):
+        return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
+    _total = sum(int(getattr(e, "size", 0)) for e in leaves_e)
+    if _total == 0:
         return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
 
     # Measure GPUs rotate but the exact reference is cached, so the two can
-    # land on different devices -> jitted cossim raises "Received incompatible
+    # land on different devices -> jitted ops raise "Received incompatible
     # devices". Co-locate onto the reference's device (read-only, one transfer
-    # only when they differ). Also fixes the later flat_exact - flat_approx.
+    # only when they differ).
     try:
-        _ed = next(iter(flat_exact.devices()))
-        if next(iter(flat_approx.devices())) is not _ed:
-            flat_approx = jax.device_put(flat_approx, _ed)
+        _ed = next(iter(leaves_e[0].devices()))
+        leaves_a = [
+            jax.device_put(a, _ed)
+            if next(iter(a.devices())) is not _ed else a
+            for a in leaves_a
+        ]
     except Exception:
         pass
 
-    cos = cossim(flat_exact, flat_approx)
-    # Certain quant/compress combos yield a complex-valued flattened Jacobian,
-    # making cossim complex. Use the real part — matches the reward path's
-    # existing real cast and keeps downstream float emission from crashing.
+    dot = ee = aa = rr = None
+    for e, a in zip(leaves_e, leaves_a):
+        # Promote per pair to at least f32 (bf16-Quant'd leaves square
+        # horribly in bf16); complex leaves promote to their complex type —
+        # the plain product (no conjugate) matches the old ``cossim``.
+        _cdt = jnp.promote_types(jnp.promote_types(e.dtype, a.dtype),
+                                 jnp.float32)
+        ef = jnp.ravel(e).astype(_cdt)
+        af = jnp.ravel(a).astype(_cdt)
+        _d = jnp.sum(ef * af)
+        _e2 = jnp.sum(jnp.abs(ef) ** 2)
+        _a2 = jnp.sum(jnp.abs(af) ** 2)
+        _r2 = jnp.sum(jnp.abs(ef - af) ** 2)
+        dot = _d if dot is None else dot + _d
+        ee = _e2 if ee is None else ee + _e2
+        aa = _a2 if aa is None else aa + _a2
+        rr = _r2 if rr is None else rr + _r2
+    exact_norm = jnp.sqrt(ee)
+    approx_norm = jnp.sqrt(aa)
+    cos = dot / (jnp.maximum(exact_norm, jnp.sqrt(1e-7))
+                 * jnp.maximum(approx_norm, jnp.sqrt(1e-7)))
+    # Certain quant/compress combos yield complex-valued Jacobian leaves,
+    # making the accumulated dot complex. Use the real part — matches the
+    # reward path's existing real cast.
     cos = jnp.real(cos)
-    exact_norm = jnp.linalg.norm(flat_exact)
-    resid_norm = jnp.linalg.norm(flat_exact - flat_approx)
-    rel_frob = resid_norm / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
+    rel_frob = jnp.sqrt(rr) / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
 
     if os.environ.get("ALPHAGRAD_DEBUG_QUALITY", "0") == "1":
-        approx_norm = float(jnp.linalg.norm(flat_approx))
+        approx_norm = float(approx_norm)
         e_norm = float(exact_norm)
         # Now that ``_callback`` only invokes ``_quality_metrics`` on
         # the terminal step (partial-order zero-Jacobian case is
@@ -1587,7 +1621,7 @@ def _quality_metrics(jac_exact, jac_approx):
         print(
             f"[quality-debug] cos={float(cos):+.4f} frob={float(rel_frob):+.4f} "
             f"||exact||={e_norm:.3g} ||approx||={approx_norm:.3g} "
-            f"size={flat_exact.size}",
+            f"size={_total}",
             flush=True,
         )
     return cos, rel_frob
