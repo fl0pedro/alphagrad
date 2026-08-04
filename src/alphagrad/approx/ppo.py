@@ -5914,6 +5914,12 @@ def main():
             traj.micro_factor_seq,
             traj.micro_compress_kind_seq,
             traj.micro_quant_dtype_seq,
+            # Final env-state face wires — the ONLY record of per-face
+            # approximations (Trajectory carries none). Without these the
+            # pareto archive stored unreplayable fronts (v43 post-mortem:
+            # calls=[] on every entry while cos<<1).
+            env_states.face_specs,
+            env_states.face_skips,
         )
         # Pair / factor / preference marginals — Stage D / E / F diagnostics.
         # Average over (env, time, slot) — broad enough to detect global
@@ -6087,6 +6093,10 @@ def main():
         micro_factor_arr = np.array(actions_pack[6])
         micro_kind_arr = np.array(actions_pack[7])
         micro_quant_arr = np.array(actions_pack[8])
+        face_specs_arr = (np.array(actions_pack[9])
+                          if len(actions_pack) > 9 else None)
+        face_skips_arr = (np.array(actions_pack[10])
+                          if len(actions_pack) > 10 else None)
 
         def _decode(env_i):
             if args.dynamic_substeps:
@@ -6104,6 +6114,30 @@ def main():
                 "the legacy (non-dynamic-substeps) action decoder was removed; "
                 "--dynamic-substeps is the only supported mode"
             )
+
+        def _decode_arch(env_i):
+            """Archive form of _decode: seq + SPARSE per-slot face wires.
+            Only the pareto archive consumes this (json-serializable dict);
+            every other consumer keeps the plain (vertex, calls) list."""
+            seq = _decode(env_i)
+            if face_specs_arr is None or face_skips_arr is None:
+                return seq
+            fs, sk = face_specs_arr[env_i], face_skips_arr[env_i]
+            faces = []
+            for k in range(min(len(seq), int(fs.shape[0]))):
+                rows_k, skip_k = fs[k], sk[k]
+                live = [int(f) for f in range(int(rows_k.shape[0]))
+                        if int(skip_k[f]) == 1
+                        or bool((rows_k[f, :, 0] != -1).any())]
+                if live:
+                    faces.append({
+                        "k": int(k),
+                        "f": live,
+                        "rows": [np.asarray(rows_k[f]).tolist()
+                                 for f in live],
+                        "skips": [int(skip_k[f]) for f in live],
+                    })
+            return {"seq": seq, "faces": faces} if faces else seq
 
         mean_r = np.atleast_1d(np.array(mean_r))
 
@@ -6426,7 +6460,7 @@ def main():
         if pareto_archive is not None and elig_rets.shape[0]:
             elig_idx = [i for i in range(all_rets.shape[0]) if eligible[i]]
             pareto_archive.add_many(
-                ((all_rets[i], _decode(i)) for i in elig_idx), ep
+                ((all_rets[i], _decode_arch(i)) for i in elig_idx), ep
             )
             log_dict["pareto/hypervolume"] = float(pareto_archive.hypervolume())
             log_dict["pareto/archive_size"] = len(pareto_archive.pts)
