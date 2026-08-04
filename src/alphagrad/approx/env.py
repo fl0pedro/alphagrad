@@ -2521,6 +2521,46 @@ def _callback(
         if not _is_oom(_exc):
             raise
         return _oom_truncate("approx compile", _exc)
+    # SPARSE-BOUNDARY COST MEASUREMENT (ALPHAGRAD_MEASURE_SPARSE=1). The
+    # dense executable drains every output to the full nominal Jacobian, so
+    # diag/compress plans measure byte-identical latency+peak to exact --
+    # the boundary write dominates both channels (nn256@512: 4.17GB output
+    # = 2.6ms at HBM rate, temps 0-3MB). That is the mechanism behind
+    # "approx cuts latency ~-8% but NEVER memory". Under the flag the COST
+    # channels (latency, peak) time a second executable compiled with
+    # sparse_representation=True -- same values, compact output buffers
+    # (measured: diag2 0.51x lat / -50% peak, compress ax1 0.12x / -89%) --
+    # while the dense executable stays the ONLY source of quality outputs:
+    # a compact output would shape-mismatch _quality_metrics into the
+    # worst score, and the cosine keeps its dense comparability.
+    compiled_cost = compiled_approx
+    if os.environ.get("ALPHAGRAD_MEASURE_SPARSE", "0") == "1":
+        def _do_compile_approx_sparse():
+            return (
+                jax.jit(
+                    jacve(
+                        config.target_fun,
+                        list(o_list),
+                        argnums=config.argnums,
+                        has_aux=config.has_aux,
+                        sparse_representation=True,
+                        transforms=transforms,
+                        face_transforms=ft_by_vertex,
+                    ),
+                    keep_unused=True,
+                )
+                .lower(*args_for_lower)
+                .compile()
+            )
+        try:
+            compiled_cost = cached_compile(
+                b"approx-sparse:" + cache_key, _do_compile_approx_sparse)
+        except Exception as _exc:
+            if _is_graphax_trace_failure(_exc):
+                return _trace_truncate("approx-sparse compile", _exc)
+            if not _is_oom(_exc):
+                raise
+            return _oom_truncate("approx-sparse compile", _exc)
     # ``compiled_exact`` is ONLY needed for the quality metrics
     # (cosine_sim, frob_residual). Those are meaningful only when the
     # elimination order is complete — graphax's ``jacve`` returns a
@@ -2627,7 +2667,7 @@ def _callback(
             _direct = os.environ.get("ALPHAGRAD_DIRECT_MEASURE", "0") == "1"
             for _rep in range(n_reps):
                 if os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1":
-                    out_approx = compiled_approx(*eval_args_i)
+                    out_approx = compiled_cost(*eval_args_i)
                     latency_samples.append(0.0)
                     peak_mem_samples.append(0.0)
                 elif _direct:
@@ -2676,7 +2716,7 @@ def _callback(
                             _base += float(_bstats.get("bytes_in_use", 0.0))
                     _t0 = time.perf_counter()
                     for _k in range(inner):
-                        out_approx = compiled_approx(*eval_args_i)
+                        out_approx = compiled_cost(*eval_args_i)
                     jax.block_until_ready(out_approx)
                     _t1 = time.perf_counter()
                     if _have_stats:
@@ -2688,7 +2728,7 @@ def _callback(
                         _peak = max(0.0, _peak_abs - _base)
                     else:
                         try:
-                            _ma = compiled_approx.memory_analysis()
+                            _ma = compiled_cost.memory_analysis()
                             _peak = float(
                                 getattr(_ma, "argument_size_in_bytes", 0)
                                 + getattr(_ma, "output_size_in_bytes", 0)
@@ -2706,7 +2746,7 @@ def _callback(
                         # amortized. Peak memory is unaffected (same executable,
                         # same buffers each pass).
                         for _k in range(inner):
-                            out_approx = compiled_approx(*eval_args_i)
+                            out_approx = compiled_cost(*eval_args_i)
                     # Key by name instead of unpacking ``.values()`` so this
                     # stays robust to dict-order / API tweaks in
                     # jax_memory_monitor.
@@ -2715,6 +2755,11 @@ def _callback(
                     latency_samples.append(latency_s * 1e9)  # → ns
                     peak_mem_samples.append(peak_bytes)
 
+            if compiled_cost is not compiled_approx and compiled_exact is not None:
+                # The timed run above used the sparse-boundary executable;
+                # quality must compare DENSE outputs (shape parity with the
+                # exact reference). One untimed dense call, terminal only.
+                out_approx = compiled_approx(*eval_args_i)
             out_approxs.append(out_approx)
             # ``compiled_exact`` is only executed at the terminal step
             # (see the ``is_terminal`` guard around its compile, above).
