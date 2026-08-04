@@ -23,7 +23,11 @@ import numpy as np
 # Default hidden / vmap sizes for the synthetic NeuralNetwork example. Kept here
 # so trainers and data-generators agree on the shapes.
 NN_HIDDEN_DIM = 256  # matrix+sampler at 256 (was 128)
-NN_VMAP_BATCH = 16
+# ALPHAGRAD_NN_BATCH: vmap batch of the NN target. 16 was DISPATCH-
+# BOUND on Blackwell (97-104us wall for 29x flops spreads — the HLO
+# audit 2026-08-04); scale it so one execution carries real compute
+# and the latency reward can SEE approximation savings.
+NN_VMAP_BATCH = int(os.environ.get("ALPHAGRAD_NN_BATCH", "16"))
 
 _DATASET_CACHE: dict = {}
 
