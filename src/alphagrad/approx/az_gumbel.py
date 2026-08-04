@@ -22,7 +22,7 @@ CLEAN implementation (ignores autoscheduler_loop's surrogate-Gumbel search and m
 
 Run:  python -m alphagrad.approx.az_gumbel --seed 7 --total-measurements 150
 """
-import os, sys, json, time, math, argparse
+import os, sys, json, time, math, argparse, collections
 
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "0")
 os.environ.setdefault("ALPHAGRAD_PREVALIDATE_MEASURE", "1")
@@ -45,7 +45,12 @@ import optax
 
 from alphagrad.approx.env import (
     FACE_SLOTS, MAX_FACES as ENV_MAX_FACES, SENTINEL_COST,
-    VertexEliminationEnv, _callback, REWARD_INDEX)
+    VertexEliminationEnv, _callback, REWARD_INDEX, REWARD_NAMES,
+    consume_per_face_stats)
+
+# Full 8-channel reward of the most recent measurement (PPO REWARD_NAMES
+# layout) — logged as ``mean_<name>`` for wandb parity with the PPO arms.
+LAST_FULL_REWARD = np.zeros(len(REWARD_NAMES), dtype=np.float64)
 from alphagrad.approx.common.examples import (
     get_fn, get_args, data_gen, infer_argnums, scalar_loss_fn)
 from alphagrad.approx.common.eval_samples import generate_eval_samples
@@ -57,7 +62,11 @@ from graphax.sparse.micro_actions import COMPRESS_KINDS
 
 # ------------------------------------------------------- 1. config/env (measure_worker pattern)
 TASK = A.task; DSET = A.dataset
-LOSS = scalar_loss_fn(get_fn(TASK))
+# ALPHAGRAD_GAZ_MEASURE_GRAD=0: measure the RAW JACOBIAN (parity with the
+# v45 PPO arms, which run without --measure-grad); default 1 keeps the
+# legacy gradient-pipeline target for existing scripts.
+_GAZ_MGRAD = os.environ.get("ALPHAGRAD_GAZ_MEASURE_GRAD", "1") == "1"
+LOSS = scalar_loss_fn(get_fn(TASK)) if _GAZ_MGRAD else get_fn(TASK)
 ARGN = infer_argnums(TASK)
 k0 = jax.random.PRNGKey(0); ak, ek = jax.random.split(k0)
 xs = get_args(TASK, ak, dataset=DSET)
@@ -76,12 +85,19 @@ env = VertexEliminationEnv.from_jaxpr(
     per_face=os.environ.get("ALPHAGRAD_GAZ_PER_FACE", "1") == "1",
     measure_latency=True,
     num_data_points=A.ndata, reps_per_point=1, percentile_keep=0.60,
-    slow_exec_cutoff_seconds=0.0, flop_gate_threshold=0.0, measure_grad=True,
+    slow_exec_cutoff_seconds=0.0, flop_gate_threshold=0.0, measure_grad=_GAZ_MGRAD,
     latency_inner_reps=A.latency_inner_reps, latency_timer="perf_counter")
 ev = generate_eval_samples(env, ek, A.ndata)
 env = eqx.tree_at(lambda e: e.eval_args_samples, env, ev)
 jaxpr = closed.jaxpr
 VALID = list(np.asarray(env.valid_vertices, dtype=np.int32)); NV = len(VALID)
+# Two vertex-indexing conventions coexist: net_eval/rollouts use
+# ``VALID.index(v)`` while the micro head indexes contexts by ``v - 1``. They
+# agree only while VALID is contiguous 1..NV. Fail loudly rather than silently
+# scoring the wrong vertex on a task whose jaxpr has an early output eqn.
+assert VALID == list(range(1, NV + 1)), (
+    f"VALID must be contiguous 1..{NV} for the vertex-index conventions to "
+    f"agree; got {VALID[:8]}... (see az_gumbel learned_micro vs net_eval)")
 _eg, GRAPH0, TG0, VO = _build_graph(jaxpr, xs, closed.literals, ARGN)
 _prune_graph(GRAPH0, TG0, jaxpr, ARGN)
 def copy_g(g): return {kk: dict(vv) for kk, vv in g.items()}
@@ -105,7 +121,17 @@ if _missing:
         f"Available: {sorted(REWARD_INDEX)}"
     )
 TIDX = np.array([REWARD_INDEX[c] for c in CH], dtype=np.int32)
-W4 = np.array([-1.0, -1.0, 0.0, 1.0], dtype=np.float64)   # equal-weight, flops dropped
+# W2: the objective comes from the SAME helper PPO uses, so the two arms cannot
+# optimize different functions again (PPO weighted cosine x2 while AZ used x1).
+# Overridable per run with ALPHAGRAD_LAMBDA_{CMP,MEM,ACC}.
+class _WNS:
+    rewards = ("cmp", "mem", "acc")
+    lambda_cmp = float(os.environ.get("ALPHAGRAD_LAMBDA_CMP", "1.0"))
+    lambda_mem = float(os.environ.get("ALPHAGRAD_LAMBDA_MEM", "1.0"))
+    lambda_acc = float(os.environ.get("ALPHAGRAD_LAMBDA_ACC", "1.0"))
+
+
+W4 = None   # set after the factory import below (needs az_w4)
 # PopArt value-target normalisation over the TIDX focus channels (van Hasselt
 # 2016; multi-channel IMPALA form) replaces the batch mean/std z-score: a slow
 # debiased-EMA per-channel (mu, sigma) that a homogeneous batch cannot amplify
@@ -293,7 +319,13 @@ def measure(state):
     flops = -float(reward[REWARD_INDEX["flops"]])
     cos = float(reward[REWARD_INDEX["cosine_sim"]])
     r = np.array([lat, peak, flops, cos])
-    return r if np.all(np.isfinite(r)) else None
+    if not np.all(np.isfinite(r)):
+        return None
+    # Stash the full 8-channel vector (PPO's REWARD_NAMES layout, PPO sign
+    # convention) so the run can log ``mean_<channel>`` on the SAME wandb
+    # panels as the PPO arms; the returned 4-vector stays the objective.
+    LAST_FULL_REWARD[:] = reward
+    return r
 
 # --------------------- 2. policy — ppo.py's MAINLINE Agent (stage-2 parity)
 # The prior + value come from the same architecture PPO trains: palimpsa
@@ -309,18 +341,40 @@ from alphagrad.approx.ppo import (
     make_argparser as _ppo_make_argparser,
 )
 
-EMBD = 128
 _HEAD_PICK = np.array([0, 1, 2], dtype=np.int32)   # heads for CH [lat, peak, cos]
 _CH_ACTIVE = jnp.array([1.0, 1.0, 0.0, 1.0])       # flops row inert (no head)
-kA = jax.random.PRNGKey(A.seed)
+# W1 (2026-08-04 parity audit): build the SHARED architecture through the shared
+# factory instead of ppo's bare argparser defaults. Previously this namespace
+# came from ``parse_args([])`` + 5 overrides while the PPO launcher overrode 5
+# DIFFERENT fields, so embd_dim/num_heads/num_layers/pointer-class all diverged
+# silently (161,916 vs 1,171,693 params) and neither ``init_linear_weights`` nor
+# ``_scale_output_heads`` ran here — leaving AZ's initial vertex logits at full
+# scale with non-zero biases, i.e. a BIASED Gumbel root prior.
+from alphagrad.approx.common.agent_factory import (      # noqa: E402
+    apply_policy_arch, build_and_init_agent, az_w4, ALGO_HEAD_FIELDS)
+
 _ns = _ppo_make_argparser().parse_args([])
-_ns.vocab_size = 512
-_ns.embd_dim = EMBD
-_ns.num_heads = 4
-_ns.hidden_dim = 256
-_ns.max_substeps = 1
+apply_policy_arch(
+    _ns,
+    # The approximation-head surface is the ONLY legitimate divergence, and it
+    # is set explicitly here rather than inherited from a default. AZ acts per
+    # VERTEX today; W5 moves it onto PPO's per-face streamed action space, at
+    # which point these match PPO's too.
+    dynamic_substeps=True,
+    unified_head=False,
+    no_approx_head=False,
+    face_actions=False,
+    unified_face_head=False,
+    live_faces=False,
+    max_substeps=1,
+    axis_group_embedding=False,
+)
+_ns.seed = A.seed
 _ft_table, _ft_py, _n_factors, _max_rules = _ppo_build_factor_table(_ns)
-agent = _ppo_build_agent(_ns, len(jaxpr.eqns), _n_factors, _max_rules, kA)
+agent = build_and_init_agent(
+    _ns, len(jaxpr.eqns), _n_factors, _max_rules, seed=A.seed)
+EMBD = _ns.embd_dim
+W4 = az_w4(_WNS)          # W2: [-w_cmp, -w_mem, 0, +w_acc]
 
 
 def _agent_fwd(agent, tok, eqn):
@@ -471,7 +525,13 @@ def net_eval(agent, state, legal):
 
 # ---------------------------------------------------------------- known dynamics
 def step_state(graph, tg, state, vertex, micro):
-    _eliminate_vertex(vertex, jaxpr, graph, tg, VO, count_ops=False, transforms=())
+    # M6: the search's graph model must apply the SAME approximation the
+    # measurement will. With ``transforms=()`` the search planned on an exact
+    # graph and then measured an approximated one — two different MDPs.
+    _rules = _rules_of(micro) if micro is not None else ()
+    _hooks = ((make_live_masked_hook(tuple(_rules)),) if _rules else ())
+    _eliminate_vertex(vertex, jaxpr, graph, tg, VO, count_ops=False,
+                      transforms=_hooks)
     state.append((VALID.index(vertex), micro))
 
 def lockstep_rollout_values(entries, depth):
@@ -496,21 +556,23 @@ def lockstep_rollout_values(entries, depth):
             la = [VALID.index(v) for v in legal]
             v = legal[int(np.argmax(vlog[la]))]
             step_state(live[i]["g"], live[i]["t"], live[i]["st"], v, None)
-    fin = [i for i, e in enumerate(live) if legal_set(e["g"])]
-    evs = batch_eval([live[i]["st"] for i in fin]) if fin else []
-    vmap_ = {i: evs[k] for k, i in enumerate(fin)}
+    # C1: evaluate EVERY rollout, terminal or not. The old code filtered
+    # terminals out and the caller substituted the ROOT value for them, so at
+    # the deciding halvings (where most rollouts have terminated) every
+    # candidate's Q was the same constant: halving degenerated to
+    # argmax(g + logit) and the CE target to softmax(logits) — cross-entropy
+    # against itself, i.e. zero learning signal exactly where the search
+    # matters most. A terminal state's value head reads its own tokens fine.
+    evs = batch_eval([e["st"] for e in live])
     out = []
-    for i, e in enumerate(live):
-        if i in vmap_:
-            v4 = vmap_[i][1]  # mainline Agent heads [lat, mem, cos]
-            out.append(float(W4[0] * v4[0] + W4[1] * v4[1] + W4[3] * v4[2]))
-        else:
-            out.append(None)                               # terminal reached in-search
+    for k in range(len(live)):
+        v4 = evs[k][1]  # mainline Agent heads [lat, mem, cos]
+        out.append(float(W4[0] * v4[0] + W4[1] * v4[1] + W4[3] * v4[2]))
     return out
 
 CVISIT = float(os.environ.get("ALPHAGRAD_GAZ_CVISIT", "50.0"))
 
-def sigma(q, max_n=1, cs=float(os.environ.get("ALPHAGRAD_GAZ_CSCALE", "1.0"))):
+def sigma(q, max_n=1, cs=float(os.environ.get("ALPHAGRAD_GAZ_CSCALE", "0.1"))):
     """Danihelka et al. 2022 monotone Q-transform (mctx qtransform form):
     min-max-normalize Q over the candidate set, then scale by
     (c_visit + max_N) * c_scale, so evaluated Q outweighs the prior+Gumbel
@@ -565,27 +627,58 @@ def gumbel_search(state, graph, tg, rng):
             entries.append((st2, g2, t2))
         vals = lockstep_rollout_values(entries, depth)     # batched per level
         for c, vz in zip(surv, vals):
-            c["q"].append(v_root if vz is None else vz)
+            c["q"].append(vz)          # C1: never a v_root stand-in
         if len(surv) <= 1:
             break
-        qbar = np.array([np.mean(c["q"]) for c in surv])
+        # M2: each phase evaluates at a DEEPER rollout, so the entries of
+        # ``q`` estimate different quantities; averaging them dilutes the
+        # deepest (most informative) one. Use the latest.
+        qbar = np.array([c["q"][-1] for c in surv])
         sc = np.array([c["g"] + c["logit"] for c in surv]) + sigma(
             qbar, max_n=max(len(c["q"]) for c in surv))
-        keep = np.argsort(-sc)[:max(1, len(surv) // 2)]
+        # M3: sequential halving keeps CEIL(n/2) (Karnin 2013; Danihelka
+        # Alg. 1). ``floor`` collapses 3 -> 1 and skips a comparison phase.
+        _keep_n = max(1, -(-len(surv) // 2))
+        if _keep_n >= len(surv):        # guard: must strictly shrink
+            _keep_n = len(surv) - 1
+        keep = np.argsort(-sc)[:_keep_n]
         surv = [surv[i] for i in keep]
+        if len(surv) <= 1:
+            break                      # M3: before paying for another rollout
         depth = min(depth * 2, NV)                         # deepen survivors
     chosen = surv[0]
     # completed-Q improved policy target over the FULL legal set. A vertex's Q =
     # MAX over its evaluated micro variants (the vertex is as good as its best
     # variant); unvisited vertices complete with v_root (Danihelka completed-Q).
-    comp_q = np.full(len(legal), v_root, dtype=np.float64)
-    _seen = set()
+    # C2: complete UNVISITED actions with Danihelka's v_mix (eq. 8-9), not the
+    # bare root value. v_mix is the prior-weighted mixture over the VISITED
+    # actions blended with v_hat, which keeps the completion inside the range
+    # of the evaluated Qs. With the raw v_root fill, any state where
+    # v_root > max_a q(a) — about half of them, since both are noisy estimates
+    # of the same terminal outcome — gave every unsearched action the top of
+    # the sigma range and the executed action the bottom, i.e. a target
+    # ANTI-correlated with the search.
+    _prior = np.exp(logits - logits.max())
+    _prior = _prior / max(_prior.sum(), 1e-12)
+    _qv, _nv = {}, {}
     for c in cands:
-        if c["q"]:
-            qv = float(np.mean(c["q"]))
-            if c["li"] not in _seen or qv > comp_q[c["li"]]:
-                comp_q[c["li"]] = qv
-            _seen.add(c["li"])
+        if not c["q"]:
+            continue
+        qv = float(c["q"][-1])          # deepest estimate, as in the halving
+        li = c["li"]
+        if li not in _qv or qv > _qv[li]:
+            _qv[li] = qv
+        _nv[li] = max(_nv.get(li, 0), len(c["q"]))
+    if _qv:
+        _Nsum = float(sum(_nv.values()))
+        _den = float(sum(_prior[li] for li in _qv)) or 1e-12
+        _num = float(sum(_prior[li] * _qv[li] for li in _qv))
+        v_mix = (v_root + _Nsum * (_num / _den)) / (1.0 + _Nsum)
+    else:
+        v_mix = v_root
+    comp_q = np.full(len(legal), v_mix, dtype=np.float64)
+    for li, qv in _qv.items():
+        comp_q[li] = qv
     pi = logits + sigma(comp_q, max_n=max([len(c["q"]) for c in cands] + [1]))
     pi = np.exp(pi - pi.max()); pi = pi / pi.sum()
     return chosen, pi, la, legal
@@ -595,7 +688,7 @@ def loss_fn(agent, toks, eqns, la_pad, la_mask, pi_pad, vtgt, vmask):
     def per(tok, eqn, la, lam, pi, vt, vm):
         vlog, v4 = _agent_fwd(agent, tok, eqn)
         lg = vlog[la]
-        lg = jnp.where(lam > 0.5, lg, -1e9)
+        lg = jnp.where(lam > 0.5, lg, -jnp.inf)   # -1e9 collided with a sentinel
         logp = jax.nn.log_softmax(lg)
         ce = -jnp.sum(jnp.where(lam > 0.5, pi * logp, 0.0))
         # Predicted CH vector from the 4 heads: [lat, mem, 0 (flops: no
@@ -647,6 +740,9 @@ def _run(args) -> int:
     _solutions = []                                # every (raw4, state, n) — re-ranked under current norm
     best = {"scalar": -1e18, "raw": None, "state": None, "at": 0}
     n_meas = 0; ep = 0
+    _t_start = time.time(); _t_prev = _t_start   # time/* parity with PPO
+    # Realized choice counts over this episode's decisions -> approx_prob/*
+    _MICRO_CHOICES = collections.Counter()
     wb = None
     if args.wandb:
         try:
@@ -674,6 +770,10 @@ def _run(args) -> int:
             tok, eqn = tokens_of(state)
             steps.append({"tok": np.asarray(tok), "eqn": np.asarray(eqn),
                           "la": la.copy(), "pi": pi.copy()})
+            _mk = chosen.get("micro")
+            _MICRO_CHOICES["none" if _mk is None else
+                           {"q": "quant", "d": "diag",
+                            "c": "compress"}.get(_mk[0], "other")] += 1
             step_state(graph, tg, state, chosen["v"], chosen["micro"])
             _dstep += 1
             if _memlog and _dstep % 5 == 0:
@@ -739,15 +839,23 @@ def _run(args) -> int:
             pi_p = jnp.asarray([pad(s["pi"], MAXLA) for s in flat])
             vt = jnp.asarray([(s["raw4"] - popart.mu) / popart.sigma for s in flat])  # PopArt-normalised
             vm = jnp.asarray(np.broadcast_to(np.abs(W4) > 0, (len(flat), 4)).astype(np.float32))
-            idx = rng.permutation(len(flat))[:64]
-            batch = tuple(x[jnp.asarray(idx)] for x in (toks, eqns, la_p, la_m, pi_p, vt, vm))
+            # M5: resample the minibatch EVERY epoch. Taking one fixed 64-sample
+            # draw and hitting it ``train_epochs`` times overfits that draw and
+            # discards the rest of the replay for this update.
             for _ in range(args.train_epochs):
+                idx = rng.permutation(len(flat))[:64]
+                batch = tuple(x[jnp.asarray(idx)]
+                              for x in (toks, eqns, la_p, la_m, pi_p, vt, vm))
                 agent, opt_state, L = train_step(agent, opt_state, batch)
             L = float(L)
             _eval_cache.clear()          # net changed -> cached (prior, value) stale
         else:
             L = float("nan")
         b = best["raw"]
+        try:
+            _scal = float(scalarize(raw))
+        except Exception:
+            _scal = float("nan")
         print(f"[gaz] ep={ep} n={n_meas}/{args.total_measurements} this(lat={raw[0]/1e3:.1f}us "
               f"cos={raw[3]:+.3f}) best(lat={b[0]/1e3:.1f}us peak={b[1]/1e6:.2f}MB "
               f"cos={b[3]:+.4f} at={best['at']}) loss={L:.4f}", flush=True)
@@ -771,10 +879,46 @@ def _run(args) -> int:
             print(f"[gaz] pareto dump failed: {_pexc}", flush=True)
         if wb is not None:
             try:
-                wb.log({"ep": ep, "n_meas": n_meas, "loss": L, "best_scalar": best["scalar"],
-                        "best_lat_us": b[0] / 1e3, "best_cos": b[3], "this_lat_us": raw[0] / 1e3,
-                        "pareto/hypervolume": _pareto.hypervolume(),
-                        "pareto/size": len(_pareto.pts)})
+                _now = time.time()
+                _log = {
+                    # --- AZ-native ---
+                    "ep": ep, "n_meas": n_meas, "loss": L,
+                    "best_scalar": best["scalar"],
+                    "best_lat_us": b[0] / 1e3, "best_cos": b[3],
+                    "this_lat_us": raw[0] / 1e3,
+                    # --- PPO-parity keys (same names => same panels) ---
+                    "pareto/hypervolume": _pareto.hypervolume(),
+                    "pareto/archive_size": len(_pareto.pts),
+                    "pareto/size": len(_pareto.pts),   # legacy AZ key
+                    "Charts/weighted_mean_return": float(_scal),
+                    "measure/xla_peak_memory": raw[1] / 1e6,
+                    "time/episode": ep,
+                    "time/sec_per_episode": _now - _t_prev,
+                    "time/wall_seconds": _now - _t_start,
+                    "time/wall_minutes": (_now - _t_start) / 60.0,
+                }
+                for _j, _nm in enumerate(REWARD_NAMES):
+                    _log[f"mean_{_nm}"] = float(LAST_FULL_REWARD[_j])
+                # --- approximation telemetry (identical keys to the PPO runs)
+                _tot = sum(_MICRO_CHOICES.values()) or 1
+                for _nm in ("none", "diag", "compress", "quant"):
+                    _log[f"approx_prob/{_nm}"] = _MICRO_CHOICES[_nm] / _tot
+                # AZ has no per-face SKIP action (skipping a face is a PPO
+                # live-faces gate); "eliminate but approximate nothing" is
+                # the 'none' class above. Logged as 0.0 so the panel exists
+                # on both runs and is honestly empty here.
+                _log["approx_prob/skip"] = 0.0
+                _pf = consume_per_face_stats()
+                for _k in ("diag", "compress", "quant"):
+                    _log[f"approx_applied/{_k}"] = _pf.get(f"applied_{_k}", 0)
+                    _log[f"approx_skipped/{_k}"] = _pf.get(f"skipped_{_k}", 0)
+                _log["approx_applied/total"] = _pf.get("applied", 0)
+                _log["approx_skipped/total"] = (
+                    _pf.get("skipped", 0) + _pf.get("skipped_raised", 0))
+                _log["approx_applied/fraction"] = _pf.get("applied_fraction", 0.0)
+                _MICRO_CHOICES.clear()
+                _t_prev = _now
+                wb.log(_log)
             except Exception:
                 pass
 
