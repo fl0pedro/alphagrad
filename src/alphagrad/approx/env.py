@@ -1931,6 +1931,25 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
     return per_face
 
 
+def _measure_compiler_options():
+    """Per-executable XLA options for MEASURE compiles only
+    (ALPHAGRAD_MEASURE_COMPILER_OPTS=0 to disable). GEMM autotuning +
+    Triton fusion work dominated cold variant compiles (measured 3.55s ->
+    0.09s, 39x, with ZERO latency change on the bandwidth-bound nn256
+    target — the 3.5s recurs per new GEMM config, it is not process
+    warmup). Values must be typed int/bool: the string "false" is rejected
+    with INVALID_ARGUMENT. Scoped per executable so the TRAINER jit keeps
+    full optimization once the global XLA_FLAGS are dropped. Re-validate
+    once on compute-bound targets (TLM): autotune-off can change kernel
+    choice there."""
+    if os.environ.get("ALPHAGRAD_MEASURE_COMPILER_OPTS", "1") == "0":
+        return None
+    return {
+        "xla_gpu_autotune_level": 0,
+        "xla_gpu_enable_triton_gemm": False,
+    }
+
+
 def _face_transforms_for_order(config, consts, args, o_list, specs_list,
                                face_rows_list, face_skips_list,
                                honor_last_compress=True):
@@ -2451,7 +2470,7 @@ def _callback(
                 keep_unused=True,
             )
             .lower(*args_for_lower)
-            .compile()
+            .compile(compiler_options=_measure_compiler_options())
         )
 
     def _do_compile_exact():
@@ -2467,7 +2486,7 @@ def _callback(
                 keep_unused=True,
             )
             .lower(*args_for_lower)
-            .compile()
+            .compile(compiler_options=_measure_compiler_options())
         )
 
     # The EXACT compile ignores `transforms` / `face_transforms` entirely (see
@@ -2584,7 +2603,7 @@ def _callback(
                     keep_unused=True,
                 )
                 .lower(*args_for_lower)
-                .compile()
+                .compile(compiler_options=_measure_compiler_options())
             )
         try:
             compiled_cost = cached_compile(
@@ -2665,8 +2684,12 @@ def _callback(
     if not unique_devices:
         unique_devices = jax.local_devices()
 
-    out_approxs: list = []
-    out_exacts: list = []
+    # STREAMED quality (#54, 2026-08-04): each data point is scored inside
+    # the measure loop and its Jacobian pair dropped immediately. The old
+    # out_approxs/out_exacts lists held n_points x 2 full Jacobians
+    # (~41.7GB at batch 512) before scoring — an OOM-truncation source that
+    # said nothing about the plan.
+    cosines: list = []
     latency_samples: list[float] = []
     peak_mem_samples: list[float] = []
 
@@ -2794,7 +2817,6 @@ def _callback(
                 # quality must compare DENSE outputs (shape parity with the
                 # exact reference). One untimed dense call, terminal only.
                 out_approx = compiled_approx(*eval_args_i)
-            out_approxs.append(out_approx)
             # ``compiled_exact`` is only executed at the terminal step
             # (see the ``is_terminal`` guard around its compile, above).
             # For non-terminal steps we still loop n_samples times for
@@ -2805,10 +2827,9 @@ def _callback(
                 _ex_key = _eval_digest(eval_args_i) if _CACHE_EXACT else None
                 _hit = _EXACT_CACHE.get(_ex_key) if _ex_key else None
                 if _hit is not None:
-                    out_exacts.append(_hit)
+                    out_exact = _hit
                 else:
                     out_exact = compiled_exact(*eval_args_i)
-                    out_exacts.append(out_exact)
                     if _ex_key is not None:
                         # Bounded: one episode's worth of samples. A new
                         # episode changes every digest, so the old entries are
@@ -2816,6 +2837,13 @@ def _callback(
                         if len(_EXACT_CACHE) >= max(n_points, 1):
                             _EXACT_CACHE.clear()
                         _EXACT_CACHE[_ex_key] = out_exact
+                # Score THIS point now and let the pair go out of scope —
+                # cos is the trained quality channel; the residual is
+                # discarded (frob was dropped as a channel).
+                _jac_a = out_approx[1] if config.has_aux else out_approx
+                _jac_e = out_exact[1] if config.has_aux else out_exact
+                _cos, _rf = _quality_metrics(_jac_e, _jac_a)
+                cosines.append(_cos)
 
     except Exception as _exc:
         if _is_graphax_trace_failure(_exc):
@@ -2853,16 +2881,7 @@ def _callback(
     # comparison is meaningless mid-rollout. Skip the work entirely
     # — the cost channels above (muls/io/flops/peak_memory) still
     # compute per step, only quality is sparse.
-    if is_terminal and out_exacts:
-        cosines: list = []
-        frobs: list = []
-        for out_approx, out_exact in zip(out_approxs, out_exacts):
-            jac_approx = out_approx[1] if config.has_aux else out_approx
-            jac_exact = out_exact[1] if config.has_aux else out_exact
-            # cos is the trained quality channel; the residual it returns
-            # alongside is discarded (frob was dropped as a channel).
-            cos, _rel_frob = _quality_metrics(jac_exact, jac_approx)
-            cosines.append(cos)
+    if is_terminal and cosines:
         cosine_sim = float(_aggregate_samples(cosines, want_top_quartile=True))
         # frob is no longer a channel anything reads. The slot stays 0.0 for
         # real plans; the SENTINEL writers still stamp it, and the Ray pool's

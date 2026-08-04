@@ -1,6 +1,19 @@
 from __future__ import annotations
 
 import os
+
+
+def _ray_measure_compiler_options():
+    """Mirror of env._measure_compiler_options (legacy Ray measure
+    path): per-executable autotune-0 + no-Triton for measure compiles,
+    ALPHAGRAD_MEASURE_COMPILER_OPTS=0 to disable. Typed values only."""
+    if os.environ.get("ALPHAGRAD_MEASURE_COMPILER_OPTS", "1") == "0":
+        return None
+    return {
+        "xla_gpu_autotune_level": 0,
+        "xla_gpu_enable_triton_gemm": False,
+    }
+
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Literal, NamedTuple, Sequence
@@ -656,7 +669,7 @@ def _callback(
                 keep_unused=True,
             )
             .lower(*args_for_lower)
-            .compile()
+            .compile(compiler_options=_ray_measure_compiler_options())
         )
 
         compiled_exact = (
@@ -672,7 +685,7 @@ def _callback(
                 keep_unused=True,
             )
             .lower(*args_for_lower)
-            .compile()
+            .compile(compiler_options=_ray_measure_compiler_options())
         )
 
         if os.environ.get("ALPHAGRAD_SKIP_COST_ANALYSIS", "0") == "1":
