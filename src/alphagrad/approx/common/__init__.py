@@ -140,6 +140,12 @@ _LAZY: dict[str, tuple[str, str]] = {
     "generate_eval_samples": (
         "alphagrad.approx.common.eval_samples", "generate_eval_samples",
     ),
+    # mcts -- without this entry alpha0.py and mu0_ray_worker.py both fail
+    # to import (they pull extract_path_visits through the package, while
+    # mu0.py reaches into common.mcts directly and therefore worked).
+    "extract_path_visits": (
+        "alphagrad.approx.common.mcts", "extract_path_visits",
+    ),
     # examples
     "data_gen": ("alphagrad.approx.common.examples", "data_gen"),
     "get_args": ("alphagrad.approx.common.examples", "get_args"),
