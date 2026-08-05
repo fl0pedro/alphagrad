@@ -954,8 +954,34 @@ def couple_quant_rules(rules, applied_dtype=None):
     return tuple(out), in_force
 
 
+# --- measured-elimination arming -------------------------------------------
+# One hook OBJECT is invoked by several consumers: the structural face-enum
+# replay (env._face_transforms_for_order), the tokenizer replay
+# (env._incremental_stream_tokens), the optional count pass, and the MEASURED
+# jacve trace. A sink that counted all of them would report 2-3x the truth --
+# a fabricated "reality" number, which is worse than the key being absent.
+# Hooks built with ``gated=True`` therefore bump their counters only while
+# :func:`arm_face_counts` is in force; env.py arms exactly around the measured
+# trace. Ungated hooks (direct callers, tests) keep counting unconditionally.
+# A DEPTH counter, not a flag, so nesting cannot disarm an outer scope.
+_COUNT_ARMED = [0]
+
+
+def arm_face_counts() -> None:
+    """Enter a scope whose gated hook invocations ARE the measurement."""
+    _COUNT_ARMED[0] += 1
+
+
+def disarm_face_counts() -> None:
+    _COUNT_ARMED[0] = max(0, _COUNT_ARMED[0] - 1)
+
+
+def face_counts_armed() -> bool:
+    return _COUNT_ARMED[0] > 0
+
+
 def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
-                          stats: dict | None = None):
+                          stats: dict | None = None, gated: bool = False):
     """Wrap ``rules`` into the per-vertex callable graphax applies PER FACE.
 
     Each requested rule is applied iff it is legal on *this* face's operand;
@@ -966,14 +992,17 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
 
     ``stats`` (optional dict) accumulates ``applied`` / ``skipped`` counts so a
     run can report how much of the policy's intent actually survived masking
-    rather than silently approximating nothing.
+    rather than silently approximating nothing. ``gated=True`` restricts those
+    counts to an :func:`arm_face_counts` scope -- see the note above; use it
+    whenever the same hook is replayed on graphs that are not the measured one.
     """
     from graphax.sparse.micro_actions import (
         apply_compress, apply_diag, apply_quant, Compress, Diag, Quant)
 
     def _bump(key):
-        if stats is not None:
-            stats[key] = stats.get(key, 0) + 1
+        if stats is None or (gated and not _COUNT_ARMED[0]):
+            return
+        stats[key] = stats.get(key, 0) + 1
 
     coupled, _ = couple_quant_rules(rules)
 

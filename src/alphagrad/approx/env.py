@@ -1932,8 +1932,15 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
             ] * (MAX_RULES_PER_VERTEX - 1)
             rules = decode_vertex_rule_specs(
                 config.jaxpr, int(v), one_row, is_last=is_last_honored)
+            # THE per-FACE sink. Under --live-faces the per-vertex rows are
+            # all-exact END rows, so the per-vertex sink below is never
+            # constructed and this is the ONLY place approx_applied/* can come
+            # from. ``gated`` because these same objects are replayed by the
+            # face-enum walk right below and by the tokenizer -- only the
+            # armed scope inside ``_do_compile_approx`` is the measurement.
             slots.append(
-                make_live_masked_hook(tuple(rules)) if rules else None)
+                make_live_masked_hook(tuple(rules), stats=_PER_FACE_STATS,
+                                      gated=True) if rules else None)
         if any(sl is not None for sl in slots):
             per_face[key] = tuple(slots)
     return per_face
@@ -1967,9 +1974,12 @@ def _face_transforms_for_order(config, consts, args, o_list, specs_list,
     structural replay that applies the SAME per-vertex rules and face
     transforms the measurement will — the k-th vertex's keys are only valid on
     the graph produced by the first k-1 (transformed) eliminations. Slots wrap
-    their decoded rules in ``make_live_masked_hook`` (no stats sink here — a
-    rule illegal on ITS operand is skipped per-slot, never raises);
-    ``face_skips`` rows become ``graphax.SKIP_FACE``.
+    their decoded rules in ``make_live_masked_hook`` (a rule illegal on ITS
+    operand is skipped per-slot, never raises). The hooks DO carry the
+    ``_PER_FACE_STATS`` sink, but gated: this replay invokes them on a graph
+    nothing is measured on, so it must not count — only the armed scope in
+    ``_do_compile_approx`` does. ``face_skips`` rows become
+    ``graphax.SKIP_FACE``.
     """
     from graphax import SKIP_FACE, faces_of
     from graphax.incremental import IncrementalJaxpr
@@ -2159,7 +2169,8 @@ def _callback(
                 if rules:
                     transforms.append(
                         (int(v),
-                         (make_live_masked_hook(rules, stats=_face_stats),))
+                         (make_live_masked_hook(rules, stats=_face_stats,
+                                                gated=True),))
                     )
                 # The tokenizer eliminates its OWN graph copy with equivalent
                 # hooks but no stats sink — the measured graph's hooks own the
@@ -2464,22 +2475,36 @@ def _callback(
     cache_key = h.digest()
 
     def _do_compile_approx():
-        return (
-            jax.jit(
-                jacve(
-                    config.target_fun,
-                    list(o_list),
-                    argnums=config.argnums,
-                    has_aux=config.has_aux,
-                    sparse_representation=config.sparse,
-                    transforms=transforms,
-                    face_transforms=ft_by_vertex,
-                ),
-                keep_unused=True,
+        # THE MEASURED ELIMINATION. graphax invokes every per-vertex/per-face
+        # hook once per face while ``.lower()`` traces, and this is the only
+        # elimination whose applied/skipped counts describe what was actually
+        # measured -- so this is the ONE scope the per-face counters are armed
+        # in. NOT armed: the face-enum replay, the tokenizer replay, the count
+        # pass, and the sparse-boundary cost re-trace below (a second trace of
+        # the same plan). CAVEAT: a compile-cache HIT skips the trace, so the
+        # counters describe distinct measured plans, not repeats of one.
+        from alphagrad.approx.common.masks import (
+            arm_face_counts, disarm_face_counts)
+        arm_face_counts()
+        try:
+            return (
+                jax.jit(
+                    jacve(
+                        config.target_fun,
+                        list(o_list),
+                        argnums=config.argnums,
+                        has_aux=config.has_aux,
+                        sparse_representation=config.sparse,
+                        transforms=transforms,
+                        face_transforms=ft_by_vertex,
+                    ),
+                    keep_unused=True,
+                )
+                .lower(*args_for_lower)
+                .compile(compiler_options=_measure_compiler_options())
             )
-            .lower(*args_for_lower)
-            .compile(compiler_options=_measure_compiler_options())
-        )
+        finally:
+            disarm_face_counts()
 
     def _do_compile_exact():
         return (
