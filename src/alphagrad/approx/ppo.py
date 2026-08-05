@@ -3894,19 +3894,21 @@ def main():
             # 58355, 58357+58358 on an IDLE gpu19), every one-per-node pair
             # ran clean (58241/58242, 58345/58352). Per-job _temp_dir fixed
             # the session directory but not the sockets.
-            try:
-                _jid = int(os.environ.get("SLURM_JOB_ID", "0"))
-            except Exception:
-                _jid = 0
-            if _jid:
-                _base = 20000 + (_jid % 220) * 200
-                _kw["port"] = _base
-                _kw["node_manager_port"] = _base + 1
-                _kw["object_manager_port"] = _base + 2
-                _kw["min_worker_port"] = _base + 10
-                _kw["max_worker_port"] = _base + 190
-                print(f"[ray] job {_jid} port window {_base}-{_base + 190}",
-                      flush=True)
+            # NOTE: ray.init() does NOT accept port/node_manager_port/
+            # object_manager_port/min_worker_port/max_worker_port -- they are
+            # `ray start` (RayParams) options and raise "Unknown keyword
+            # argument(s)" here. Two Ray heads on ONE node therefore cannot be
+            # separated from inside the process; they collide on the default
+            # ports and the second raylet never registers with the GCS,
+            # surfacing as "current node timed out during startup".
+            # The fix is PLACEMENT: pin one Ray job per node in the sbatch.
+            # gpu19/gpu20 are the 8-GPU dual-socket nodes, which is why SLURM
+            # co-scheduled two 4-GPU arms onto gpu19 and why only that node
+            # ever failed (58353+58355, 58357+58358 both died there; the
+            # one-per-node pairs 58241/58242 and 58345/58352 ran clean).
+            print(f"[ray] node={os.environ.get('SLURMD_NODENAME', '?')} "
+                  f"job={os.environ.get('SLURM_JOB_ID', '?')} "
+                  f"cpus={_kw.get('num_cpus', 'default')}", flush=True)
             # RETRY: raylet/GCS startup on these nodes intermittently exceeds
             # Ray's internal timeout ("The current node timed out during
             # startup") even with the node to ourselves, and the whole run
@@ -6081,18 +6083,50 @@ def main():
         # Padding faces carry skip=0 / op=OP_END, so the means below are over
         # all slots including padding — comparable across steps, and the
         # applied/skipped counters give the absolute reality check.
+        # DENOMINATOR: valid faces only. F is the provable per-graph face
+        # bound (196 here) while a vertex really has ~1.7 faces, so a plain
+        # mean over the padded arrays reports 1 - mean_nf/F no matter what
+        # the policy does. That is exactly what the old metric showed:
+        # none 0.9919 measured vs 0.99148 predicted from padding alone.
+        _fv = getattr(traj, "face_valid", None)
+        if _fv is not None:
+            _fv = _fv.astype(jnp.float32)
+            _fv_n = jnp.maximum(jnp.sum(_fv), 1.0)
         if getattr(traj, "face_skip", None) is not None:
-            _face_skip_p = jnp.mean(traj.face_skip.astype(jnp.float32))
+            _fsk = traj.face_skip.astype(jnp.float32)
+            if _fv is not None:
+                _face_skip_p = jnp.sum(_fsk * _fv) / _fv_n
+            else:
+                _face_skip_p = jnp.mean(_fsk)
         else:
             _face_skip_p = jnp.array(0.0, dtype=jnp.float32)
         _fop = getattr(traj, "face_op_type", None)
         if _fop is not None:
             _fop = _fop.astype(jnp.int32)
-            _face_op_freq = jnp.stack([
-                jnp.mean((_fop == k).astype(jnp.float32)) for k in range(4)
-            ])
+            if _fv is not None:
+                # face_op_type is (..., F, S): broadcast validity over slots,
+                # so the denominator is (valid faces) x (slots per face).
+                _w = _fv[..., None]
+                _wn = _fv_n * float(_fop.shape[-1])
+                _face_op_freq = jnp.stack([
+                    jnp.sum((_fop == k).astype(jnp.float32) * _w) / _wn
+                    for k in range(4)
+                ])
+            else:
+                _face_op_freq = jnp.stack([
+                    jnp.mean((_fop == k).astype(jnp.float32))
+                    for k in range(4)
+                ])
         else:
             _face_op_freq = jnp.zeros((4,), dtype=jnp.float32)
+        # Dilution readout: how loose the static width is versus reality.
+        if _fv is not None:
+            _n_steps = 1.0
+            for _d in _fv.shape[:-1]:
+                _n_steps *= float(_d)
+            _face_mean_valid = jnp.sum(_fv) / max(_n_steps, 1.0)
+        else:
+            _face_mean_valid = jnp.array(0.0, dtype=jnp.float32)
         diag_pack = (
             jnp.mean(traj.pair_dists, axis=(0, 1, 2)),
             jnp.mean(traj.factor_dists, axis=(0, 1, 2)),
@@ -6106,6 +6140,7 @@ def main():
             _diag_nonzero_cos_steps,
             _face_skip_p,
             _face_op_freq,
+            _face_mean_valid,
         )
         return (
             agent,
@@ -6657,6 +6692,7 @@ def main():
                 nonzero_cos_steps,
                 _face_skip_p,
                 _face_op_freq,
+                _face_mean_valid,
             ) = (np.asarray(x) for x in diag_pack)
             # T3. nonzero_cos_steps > 1 means the --terminal-rewards-only gate
             # in env.py has stopped holding. The value/return pair measures the
@@ -6709,6 +6745,11 @@ def main():
                 if j < _face_op_freq.shape[0]:
                     log_dict[f"approx_prob/{_nm}"] = float(_face_op_freq[j])
             log_dict["approx_prob/skip"] = float(_face_skip_p)
+            # The width/reality gap the corrected denominator removes. If
+            # mean_valid stays ~1.7 against width 196, the per-face arrays
+            # are ~99% padding and any UNMASKED face mean is meaningless.
+            log_dict["faces/mean_valid"] = float(_face_mean_valid)
+            log_dict["faces/width"] = int(ENV_MAX_FACES)
             log_dict["sub_episode_length"] = float(mean_sub_episode_length)
         # Populate the elimination-order table (it used to be created and
         # logged empty). Bounded: one row per episode for the best eligible
