@@ -3861,7 +3861,18 @@ def main():
         from alphagrad.approx.cpu_approx_pool import CpuApproxPool
 
         if not _ray.is_initialized():
-            _ray.init(ignore_reinit_error=True, include_dashboard=False)
+            # PER-JOB Ray session dir. Two Ray jobs on ONE node collided:
+            # each sbatch prologue did  (the stale-cluster
+            # fix) and so deleted the other job's live session, producing
+            # "The current node timed out during startup". RAY_TMPDIR gives
+            # each job its own directory, so no prologue wipe is needed.
+            _rt = os.environ.get("RAY_TMPDIR") or None
+            if _rt:
+                os.makedirs(_rt, exist_ok=True)
+                _ray.init(ignore_reinit_error=True, include_dashboard=False,
+                          _temp_dir=_rt)
+            else:
+                _ray.init(ignore_reinit_error=True, include_dashboard=False)
         # One actor per MEASUREMENT device. Under --exec-on-gpu that is
         # num_gpus=1 each, so Ray hands every actor a disjoint
         # CUDA_VISIBLE_DEVICES and the timed execs cannot collide.
