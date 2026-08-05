@@ -62,7 +62,7 @@ def run_benchmark(name, batch_size=8, steps=50):
 
     # Warmup / Reset
     print("Resetting...", flush=True)
-    state = env.reset(, initial_edges)
+    state = env.reset()  # quarantined: reset() takes only num_envs now
     state.tokens.block_until_ready()
 
     print(f"Starting rollout for {steps} steps...", flush=True)

@@ -47,7 +47,7 @@ def test_mcts_integration():
     # Create a batch of states
     batch_size = 2
     order = jnp.arange(1, num_v + 1, dtype=jnp.int32)
-    state = env.reset(=order, edges=edges)
+    state = env.reset()  # quarantined: reset() takes only num_envs now
     batched_state = jax.tree_util.tree_map(lambda x: jnp.stack([x]*batch_size), state)
     
     # 4. Define a dummy model

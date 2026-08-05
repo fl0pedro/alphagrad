@@ -262,8 +262,15 @@ def test_coupled_pair_may_only_subdivide_never_coarsen():
     assert base == 2, "the current meta count is the floor, not 1"
     predicted = {base * d for d in _divisors(span) if d > 1}
     accepted = _factors_graphax_accepts(st, 0, 2)
-    assert predicted == accepted - {base}, "strictly finer only"
-    assert 1 not in accepted, "coarsening a coupled pair is rejected outright"
+    # graphax tolerates the two implicit NO-OPS (factor 1 and factor == the
+    # current meta) -- they leave the tensor untouched rather than coarsening
+    # it. Everything else it accepts must be a strictly finer re-mask.
+    for noop in (1, base):
+        st_noop = apply_diag(st, Diag(0, 2, noop))
+        assert [d.size for d in st_noop.out_dims] == [d.size for d in st.out_dims], (
+            f"factor={noop} must be a no-op, not a coarsening")
+    assert predicted == accepted - {1, base}, "strictly finer only"
+    assert 1 not in predicted, "the no-op factor 1 is never offered"
     assert base not in predicted, "factor == meta is the no-op, never offered"
     assert 1 in _divisors(diag_pair_gcd(st, 0, 2)), (
         "and the plain gcd WOULD have offered factor=1 -- why this helper exists")

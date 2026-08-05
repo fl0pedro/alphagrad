@@ -118,13 +118,26 @@ def test_nn256_vertex4_diag_1_3_factor_3_is_masked(nn256):
     assert not pair[1, 3], "the mask must not admit the production failure"
 
 
-def test_nn256_vertex11_compress_axis2_is_masked(nn256):
-    """The other production failure: a physical axis past the live val.ndim."""
+def test_nn256_reduce_max_compress_axis2_is_masked(nn256):
+    """The other production failure: a physical axis past the live val.ndim.
+
+    The vertex is addressed by POSITION in the jaxpr and the position moved
+    (the graph now carries an extra ``max`` guard for the log-sum-exp), so the
+    (16,10) join intermediate this test was written against is vertex 10, not
+    11. The equation identity is asserted first so a future graph change fails
+    with a clear message instead of silently probing an unrelated vertex.
+    """
+    jaxpr, _, _ = nn256
+    V = 10
+    assert jaxpr.eqns[V - 1].primitive.name == "reduce_max", (
+        f"nn256 graph moved again: expected the (16,10)->(16,) reduce_max at "
+        f"vertex {V}, found {jaxpr.eqns[V - 1].primitive.name}"
+    )
     o = _oracle(nn256)
-    st = o.probe_faces(11)[0]
+    st = o.probe_faces(V)[0]
     assert tuple(st.val.shape) == (16, 10)      # two logical pairs, ONE per axis
     assert not compress_valid_mask(st, 8)[2]
-    _, comp = o.vertex_mask(11)
+    _, comp = o.vertex_mask(V)
     assert not comp[2]
     assert comp[0] and comp[1], "axes 0/1 are real actions and must survive"
 

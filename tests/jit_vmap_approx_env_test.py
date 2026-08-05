@@ -46,7 +46,7 @@ def test_jit_vmap():
         consts=closed_jaxpr.literals
     )
     
-    state = env.reset(=order, edges=edges)
+    state = env.reset()  # quarantined: reset() takes only num_envs now
     
     # 5. Test JIT
     print("Running JIT step...")

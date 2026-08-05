@@ -42,7 +42,7 @@ def main():
     order = jnp.arange(N, dtype=jnp.int32)
     
     print("Resetting env...")
-    start_state = env.reset(, edges)
+    start_state = env.reset()  # quarantined: reset() takes only num_envs now
     # block
     start_state.tokens.block_until_ready()
     print("Reset done. Tokens shape:", start_state.tokens.shape)

@@ -46,7 +46,7 @@ def test_env():
         consts=closed_jaxpr.literals
     )
     
-    state = env.reset(=order, edges=edges)
+    state = env.reset()  # quarantined: reset() takes only num_envs now
     
     print(f"Initial tokens length: {len(state.tokens)}")
     print(f"Initial order: {state.order}")

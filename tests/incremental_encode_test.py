@@ -29,6 +29,7 @@ import numpy as np
 from alphagrad.approx.ppo import (
     EncCarry,
     MAX_EQNS,
+    NUM_VALUE_HEADS,
     _build_agent,
     _stream_len,
     make_argparser,
@@ -159,7 +160,7 @@ def test_vmem_fold_associative_and_heads():
     vl, vc, val = agent.heads_from_memory(s1, c1)
     assert vl.shape == (TOTAL_V,)
     assert vc.shape == (TOTAL_V, EMBD)
-    assert val.shape == (4,)
+    assert val.shape == (NUM_VALUE_HEADS,)
     vl2, vc2, val2 = agent.heads_from_memory(s1, c1)
     assert np.array_equal(np.asarray(vl), np.asarray(vl2))  # deterministic
 

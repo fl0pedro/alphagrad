@@ -154,6 +154,10 @@ def test_aggregate_per_channel_stats_shape_and_keys():
         # Added with Infra 1 (unified per-episode logging). Empty
         # dicts when ``dones_mask=None`` (this call site).
         "terminal_means", "best_terminal",
+        # Per-channel order statistics over the episode's rollout envs plus
+        # the representative sequence at each quantile — lets analysis pull
+        # e.g. the median-cosine order instead of only the raw-return best.
+        "reward_quantiles", "quantile_sequences",
     }
     # per_reward_means covers every channel.
     assert set(stats["per_reward_means"].keys()) == set(REWARD_NAMES)
@@ -190,9 +194,13 @@ def test_aggregate_with_dones_mask_distinguishes_per_step_from_terminal():
     stats = aggregate_per_channel_stats(
         rv, weights, sentinel=SENTINEL_REWARD_VALUE, dones_mask=dones,
     )
-    # Per-step: 4 envs * 5 timesteps = 20 entries, only 4 nonzero, sum=3.30.
-    # Mean = 3.30 / 20 = 0.165.
-    assert abs(stats["per_reward_means"]["cosine_sim"] - 0.165) < 1e-5
+    # cosine_sim is a SPARSE-TERMINAL channel, so per_reward_means is
+    # OVERWRITTEN with the terminal-only mean (reward_scaling.py:512-514):
+    # the diluted 3.30/20 = 0.165 per-step figure was exactly the misleading
+    # number that overwrite exists to remove.
+    assert abs(stats["per_reward_means"]["cosine_sim"] - 0.825) < 1e-5
+    # A dense cost channel is still a plain per-step mean over all T*N.
+    assert abs(stats["per_reward_means"]["flops"]) < 1e-5
     # Terminal: just the 4 terminal entries. Mean = (0.95+0.50+1.0+0.85)/4 = 0.825.
     assert abs(stats["terminal_means"]["cosine_sim"] - 0.825) < 1e-5
     # Best terminal: max over the 4 terminal entries = 1.0.

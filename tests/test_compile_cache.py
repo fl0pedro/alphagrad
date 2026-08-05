@@ -37,14 +37,18 @@ def test_no_ray_fallback_calls_compile_fn():
         called.append(1)
         return "sentinel-compiled"
 
-    out = cached_compile(b"some-key", fake_compile)
+    # The counters are process-global and monotone; other tests in the same
+    # session may already have compiled through the cache. Measure the delta,
+    # and use a key nothing else can have inserted into the local memo.
+    before = local_stats()
+    out = cached_compile(b"test_no_ray_fallback_calls_compile_fn", fake_compile)
     assert out == "sentinel-compiled"
     assert len(called) == 1
-    # No Ray ⇒ counters stay at zero (the function bails before
-    # incrementing).
+    # No Ray ⇒ the counters are untouched (the function bails before
+    # incrementing either of them).
     s = local_stats()
-    assert s["local_hits"] == 0
-    assert s["local_misses"] == 0
+    assert s["local_hits"] - before["local_hits"] == 0
+    assert s["local_misses"] - before["local_misses"] == 0
 
 
 def test_serialize_deserialize_roundtrip_jit():

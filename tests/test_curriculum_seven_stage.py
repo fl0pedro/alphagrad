@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pytest as _pytest_quarantine
 
 _pytest_quarantine.skip(
@@ -12,7 +14,6 @@ and the new ``compress_scalar`` + ``quant_smallest_float`` variants.
 See ``alphagrad/src/alphagrad/approx/CURRICULUM.md`` for the design.
 """
 
-from __future__ import annotations
 
 import numpy as np
 import pytest

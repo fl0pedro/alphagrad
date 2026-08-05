@@ -19,18 +19,22 @@ import pytest
 
 def test_sparse_terminal_indices_match_canonical_channels():
     from alphagrad.approx.common.reward_scaling import (
+        BKSTEP_ACC_IDX,
         COSINE_SIM_IDX,
         FROB_RESIDUAL_IDX,
         SPARSE_TERMINAL_INDICES,
         SPARSE_TERMINAL_MASK_NP,
     )
-    assert set(SPARSE_TERMINAL_INDICES) == {COSINE_SIM_IDX, FROB_RESIDUAL_IDX}
+    # bkstep_acc joined cossim/frob as a third terminal-only QUALITY channel
+    # (the B_kstep accuracy is only meaningful once the graph is eliminated).
+    quality = {COSINE_SIM_IDX, FROB_RESIDUAL_IDX, BKSTEP_ACC_IDX}
+    assert set(SPARSE_TERMINAL_INDICES) == quality
     assert SPARSE_TERMINAL_MASK_NP.dtype == bool
-    assert SPARSE_TERMINAL_MASK_NP[COSINE_SIM_IDX]
-    assert SPARSE_TERMINAL_MASK_NP[FROB_RESIDUAL_IDX]
+    for idx in quality:
+        assert SPARSE_TERMINAL_MASK_NP[idx]
     # Cost channels must NOT be flagged.
     for idx in range(SPARSE_TERMINAL_MASK_NP.shape[0]):
-        if idx not in (COSINE_SIM_IDX, FROB_RESIDUAL_IDX):
+        if idx not in quality:
             assert not SPARSE_TERMINAL_MASK_NP[idx]
 
 

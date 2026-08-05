@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pytest as _pytest_quarantine
 
 _pytest_quarantine.skip(
@@ -14,7 +16,6 @@ the env build / Ray spawn is too heavy for a unit test. The
 end-to-end smoke lives in the sbatch scripts (``--episodes 2``).
 """
 
-from __future__ import annotations
 
 import jax
 import jax.random as jrand

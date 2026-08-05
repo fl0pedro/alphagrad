@@ -65,7 +65,27 @@ def _env_for(target_fn, args, *, measure_latency: bool):
     )
 
 
-def test_all_six_cost_channels_populate_when_measure_latency_on():
+def _force_real_cost_measurement(monkeypatch):
+    """Undo cross-module env pollution + enable env.py's CPU memory path.
+
+    ``ALPHAGRAD_SKIP_COST_ANALYSIS=1`` is set at import time by
+    test_incremental_encoder / test_ppo_az_parity /
+    test_rollout_scan_equivalence, and pytest imports all modules during
+    collection, so it is live here through no fault of the env. It makes
+    env.py skip ``cost_analysis()`` entirely -> flops and bytes_accessed read
+    0 by design.
+
+    ``ALPHAGRAD_DIRECT_MEASURE=1`` selects the measurement path that falls
+    back to the compiled executable's ``memory_analysis()`` when the device
+    has no allocator stats -- i.e. on CPU, where ResourceMonitor's peak is
+    always 0. Both env vars are read inside the callback, so monkeypatch is
+    enough and nothing leaks to other modules.
+    """
+    monkeypatch.setenv("ALPHAGRAD_SKIP_COST_ANALYSIS", "0")
+    monkeypatch.setenv("ALPHAGRAD_DIRECT_MEASURE", "1")
+
+
+def test_all_six_cost_channels_populate_when_measure_latency_on(monkeypatch):
     """The vital assertion: with --measure-latency on, every cost-family
     index (0..5) is non-zero after one successful env step. A pool-
     starvation / timeout sentinel would zero ALL of them; a half-
@@ -73,6 +93,7 @@ def test_all_six_cost_channels_populate_when_measure_latency_on():
     """
     from graphax import examples
 
+    _force_real_cost_measurement(monkeypatch)
     print("\n[env] all 6 cost channels populate (measure_latency=True)")
     x = jnp.array([0.05, 0.15, 0.25, 0.35], dtype=jnp.float32)
     env = _env_for(examples.Helmholtz, (x,), measure_latency=True)
@@ -93,7 +114,7 @@ def test_all_six_cost_channels_populate_when_measure_latency_on():
     print(f"  all 6 channels populated; {len(nonzero)} nonzero values")
 
 
-def test_latency_is_zero_when_measure_latency_off():
+def test_latency_is_zero_when_measure_latency_off(monkeypatch):
     """Inverse check: with measure_latency=False, latency_ns is hardcoded
     to 0.0 (env.py:1356-1360) but every other cost channel still populates.
     Confirms the conditional is the only differentiator — so adding
@@ -101,6 +122,7 @@ def test_latency_is_zero_when_measure_latency_off():
     """
     from graphax import examples
 
+    _force_real_cost_measurement(monkeypatch)
     print("\n[env] latency_ns=0 when measure_latency=False (but others populate)")
     x = jnp.array([0.05, 0.15, 0.25, 0.35], dtype=jnp.float32)
     env = _env_for(examples.Helmholtz, (x,), measure_latency=False)
