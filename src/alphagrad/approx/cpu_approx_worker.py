@@ -771,6 +771,16 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         latency_warmup=int(getattr(args, "latency_warmup", 0)),
         latency_winsor=float(getattr(args, "latency_winsor", 0.0)),
         measure_grad=measure_grad,
+        # PER-FACE application (2026-08-05). The trainer builds its env with
+        # ``per_face=bool(args.per_face or args.face_actions)`` (ppo.py:3841)
+        # but this builder — which constructs the env that performs the actual
+        # pooled measurement — never forwarded it, so every measure actor ran
+        # per_face=False. A per-vertex rule illegal on ONE face then raised the
+        # strict TRANSFORM-DID-NOT-FIT guard inside the actor instead of being
+        # skipped for that face alone, i.e. the measurement applied a different
+        # approximation policy than the trainer intended.
+        per_face=bool(getattr(args, "per_face", False)
+                      or getattr(args, "face_actions", False)),
         latency_timer=str(getattr(args, "latency_timer", "perf_counter")),
         quant_once=bool(getattr(args, "quant_once", False)),
         slow_exec_cutoff_seconds=float(

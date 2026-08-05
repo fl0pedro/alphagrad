@@ -5987,14 +5987,26 @@ def main():
             p_stop_slot0 = jnp.mean(traj.pair_dists[..., 0, PAIR_STOP])
             op_marginals = jnp.zeros((NUM_OPS,), dtype=jnp.float32)
             mean_sub_episode_length = jnp.array(0.0, dtype=jnp.float32)
-        # Mean per-face SKIP gate (the 5th approximation class). traj.face_skip
-        # is the SAMPLED gate (1 = this face contributed nothing), so its mean
-        # is the realized skip rate; 0.0 when face actions are off.
-        _face_skip_p = (
-            jnp.mean(traj.face_skip.astype(jnp.float32))
-            if getattr(traj, "face_skip", None) is not None
-            else jnp.array(0.0, dtype=jnp.float32)
-        )
+        # REALIZED per-face approximation usage (the campaign's actual action
+        # space under --live-faces, where the micro head is None and every
+        # decision comes from the UnifiedFaceHead).
+        #   face_skip  (E, T, F)      1 = face dropped entirely (SKIP_FACE)
+        #   face_op    (E, T, F, S)   op per slot; OP_END(3) = "no approx here"
+        # Padding faces carry skip=0 / op=OP_END, so the means below are over
+        # all slots including padding — comparable across steps, and the
+        # applied/skipped counters give the absolute reality check.
+        if getattr(traj, "face_skip", None) is not None:
+            _face_skip_p = jnp.mean(traj.face_skip.astype(jnp.float32))
+        else:
+            _face_skip_p = jnp.array(0.0, dtype=jnp.float32)
+        _fop = getattr(traj, "face_op_type", None)
+        if _fop is not None:
+            _fop = _fop.astype(jnp.int32)
+            _face_op_freq = jnp.stack([
+                jnp.mean((_fop == k).astype(jnp.float32)) for k in range(4)
+            ])
+        else:
+            _face_op_freq = jnp.zeros((4,), dtype=jnp.float32)
         diag_pack = (
             jnp.mean(traj.pair_dists, axis=(0, 1, 2)),
             jnp.mean(traj.factor_dists, axis=(0, 1, 2)),
@@ -6007,6 +6019,7 @@ def main():
             _diag_return_raw,
             _diag_nonzero_cos_steps,
             _face_skip_p,
+            _face_op_freq,
         )
         return (
             agent,
@@ -6557,6 +6570,7 @@ def main():
                 return_raw,
                 nonzero_cos_steps,
                 _face_skip_p,
+                _face_op_freq,
             ) = (np.asarray(x) for x in diag_pack)
             # T3. nonzero_cos_steps > 1 means the --terminal-rewards-only gate
             # in env.py has stopped holding. The value/return pair measures the
@@ -6598,10 +6612,16 @@ def main():
             # the AZ runs. ``end`` (emit nothing further) is the "none" class;
             # ``skip`` is the per-face gate's mass, which lives on a separate
             # head and is 0 when face actions are off.
+            # The MICRO head's marginals (absent under --live-faces) stay on
+            # their own panel; approx_prob/* reports the head that actually
+            # decided, i.e. realized per-face usage.
             _ap_names = ("diag", "compress", "quant", "none")
             for j, _nm in enumerate(_ap_names):
                 if j < op_marginals.shape[0]:
-                    log_dict[f"approx_prob/{_nm}"] = float(op_marginals[j])
+                    log_dict[f"micro_op_marginal/{_nm}"] = float(op_marginals[j])
+            for j, _nm in enumerate(_ap_names):
+                if j < _face_op_freq.shape[0]:
+                    log_dict[f"approx_prob/{_nm}"] = float(_face_op_freq[j])
             log_dict["approx_prob/skip"] = float(_face_skip_p)
             log_dict["sub_episode_length"] = float(mean_sub_episode_length)
         # Populate the elimination-order table (it used to be created and

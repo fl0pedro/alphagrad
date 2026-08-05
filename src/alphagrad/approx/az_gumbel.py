@@ -93,6 +93,61 @@ env = VertexEliminationEnv.from_jaxpr(
     slow_exec_cutoff_seconds=0.0, flop_gate_threshold=0.0, measure_grad=_GAZ_MGRAD,
     latency_inner_reps=A.latency_inner_reps, latency_timer="perf_counter")
 ev = generate_eval_samples(env, ek, A.ndata)
+
+# ---- W3-durable: optional GPU-pinned Ray measure pool --------------------
+# ALPHAGRAD_GAZ_RAY_MEASURE=N spawns N measure actors the way ppo.py does, so
+# AZ gets the SAME isolation guarantees its measurements are compared against:
+# separate process, exactly one pinned GPU, one timed execution at a time.
+# Default 0 keeps the in-process path (with the clear_caches cadence below).
+_GAZ_RAY_N = int(os.environ.get("ALPHAGRAD_GAZ_RAY_MEASURE", "0") or "0")
+_MEASURE_POOL = None
+if _GAZ_RAY_N > 0:
+    from alphagrad.approx.common.measure_pool import (
+        spawn_measure_pool, measure_one_plan)
+    from alphagrad.approx.env import MAX_TOKENS as _MT, NUM_REWARDS as _NR
+
+    # The actor rebuilds its env from this dict; every field that changes WHAT
+    # is measured must match AZ's own env or the actor measures a different
+    # graph than the search acts on.
+    _pool_args = {
+        "example": TASK,
+        "dataset": DSET if DSET else "none",
+        "dataset_size": 128,
+        "seed": int(A.seed),
+        "rewards": ["cmp", "mem", "acc"],
+        "cmp_type": "latency",
+        "mem_type": "peak_memory",
+        "exec_on_gpu": True,
+        "measure_latency": True,
+        "measure_grad": bool(_GAZ_MGRAD),
+        "per_face": bool(os.environ.get("ALPHAGRAD_GAZ_PER_FACE", "1") != "0"),
+        "face_actions": False,
+        "num_data_points": int(A.ndata),
+        "reps_per_point": int(os.environ.get("ALPHAGRAD_GAZ_REPS", "4")),
+        "latency_inner_reps": int(A.latency_inner_reps),
+        "latency_samples": 1,
+        "latency_warmup": 0,
+        "latency_winsor": 0.0,
+        "percentile_keep": 0.60,
+        "terminal_rewards_only": False,
+        "num_eval_samples": int(A.ndata),
+        "hidden_dim": 256,
+        "num_cpu_workers": _GAZ_RAY_N,
+    }
+    try:
+        _MEASURE_POOL = spawn_measure_pool(
+            _pool_args, n_actors=_GAZ_RAY_N, exec_on_gpu=True,
+            timeout_s=float(os.environ.get("ALPHAGRAD_GAZ_RAY_TIMEOUT", "600")),
+            max_tokens=int(_MT), num_rewards=int(_NR),
+            cosine_sim_idx=int(REWARD_INDEX["cosine_sim"]),
+            frob_residual_idx=int(REWARD_INDEX["frob_residual"]))
+        print(f"[gaz] ray-measure pool: {_GAZ_RAY_N} actors on gpus "
+              f"{list(range(1, _GAZ_RAY_N + 1))} (trainer keeps gpu 0)",
+              flush=True)
+    except Exception as _pexc:
+        print(f"[gaz] ray-measure pool FAILED to start ({type(_pexc).__name__}: "
+              f"{_pexc}); falling back to in-process measurement", flush=True)
+        _MEASURE_POOL = None
 env = eqx.tree_at(lambda e: e.eval_args_samples, env, ev)
 jaxpr = closed.jaxpr
 VALID = list(np.asarray(env.valid_vertices, dtype=np.int32)); NV = len(VALID)
@@ -333,11 +388,20 @@ def measure(state):
             jnp.full((n, ENV_MAX_FACES, FACE_SLOTS, 3), -1, dtype=jnp.int32),
             jnp.zeros((n, ENV_MAX_FACES), dtype=jnp.int32),
         )
-        _, _, reward = _callback(
-            env.config, env.args, env.consts, jnp.asarray(order),
-            jnp.asarray(specs), *_zface, n, *ev,
-        )
-        reward = np.asarray(reward, dtype=np.float64)
+        if _MEASURE_POOL is not None:
+            # Batch of ONE through evaluate_batch: the unbatched pool.evaluate
+            # path predates face actions and silently DROPS the face wires.
+            _, _, reward, _sent = measure_one_plan(
+                _MEASURE_POOL, np.asarray(order), np.asarray(specs),
+                np.asarray(_zface[0]), np.asarray(_zface[1]), n,
+                eval_samples=ev, init=False)
+            reward = np.asarray(reward, dtype=np.float64)
+        else:
+            _, _, reward = _callback(
+                env.config, env.args, env.consts, jnp.asarray(order),
+                jnp.asarray(specs), *_zface, n, *ev,
+            )
+            reward = np.asarray(reward, dtype=np.float64)
     except (KeyboardInterrupt, SystemExit):
         raise                       # W3: never swallow an interrupt
     except BaseException as _exc:
