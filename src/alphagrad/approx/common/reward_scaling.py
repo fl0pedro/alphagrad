@@ -42,9 +42,19 @@ REWARD_NAMES: tuple[str, ...] = (
     "peak_memory",
     "cosine_sim",
     "frob_residual",
-    # index 8: deterministic XLA-analysis peak (temp+output+args). Keep in EXACT
-    # sync with env.REWARD_NAMES. peak_memory (5) = real measured peak (GPU);
-    # xla_peak_memory (8) = compile-time estimate (reliable on CPU).
+    # RECONCILED (2026-08): this tuple is a SUPERSET of env.REWARD_NAMES, not a
+    # copy of it. Indices 0..7 are byte-identical to the env's 8-channel vector;
+    # indices 8 and 9 are the DEPRECATED Ray line's extra slots. They cannot be
+    # deleted here: BKSTEP_ACC_IDX / NO_SYMLOG_REWARD_INDICES and mu0's
+    # documented "10-channel layout" bridge (mu0._build_reward_weights) both pin
+    # bkstep_acc at index 9, and dropping index 8 alone would renumber it --
+    # silently invalidating every persisted PopArt/calibration state keyed by
+    # index. The mainline consumers already map by NAME and drop names the env
+    # does not emit, so a weight on index 8 is unreachable from the 8-channel
+    # env. What WAS wrong -- a second memory channel selectable via --mem-type --
+    # is fixed below: "xla_peak_memory" now ALIASES "peak_memory".
+    # index 8: deterministic XLA-analysis peak (temp+output+args); a dead slot on
+    # the mainline env, retained only to keep index 9 where it is.
     "xla_peak_memory",
     # index 9: B_kstep closed-loop trainability accuracy in [0, 1]. Alternative
     # "acc" reward channel (ALPHAGRAD_ACC_PROXY=bkstep) — see env.REWARD_NAMES.
@@ -98,11 +108,31 @@ _CMP_TYPE_TO_REWARD: dict[str, str] = {
 _MEM_TYPE_TO_REWARD: dict[str, str] = {
     "graphax": "max_io_sum",
     "bytes_accessed": "bytes_accessed",
-    "peak_memory": "peak_memory",          # RM-sampled peak (idx 5)
-    "xla_peak_memory": "xla_peak_memory",  # deterministic XLA peak (idx 8) —
-                                           # preferred CPU memory reward; the RM
-                                           # peak is still measured/logged at idx 5
+    "peak_memory": "peak_memory",          # THE memory channel (idx 5)
+    # DEPRECATED ALIAS. There is one memory channel; the deterministic
+    # memory_analysis() estimate is substituted INTO peak_memory in place by
+    # env._note_static_peak_fallback wherever the runtime high-water mark is
+    # unavailable, so selecting it separately only ever picked a slot the
+    # mainline env never fills. Kept accepting so existing launchers do not
+    # break; warns once via :func:`warn_deprecated_mem_type`.
+    "xla_peak_memory": "peak_memory",
 }
+
+_MEM_TYPE_DEPRECATED: dict[str, str] = {"xla_peak_memory": "peak_memory"}
+_MEM_TYPE_WARNED: set = set()
+
+
+def warn_deprecated_mem_type(mem_type: str) -> str:
+    """Announce (once per process) a deprecated ``--mem-type``; return the
+    canonical name it maps to."""
+    canon = _MEM_TYPE_DEPRECATED.get(mem_type, mem_type)
+    if mem_type in _MEM_TYPE_DEPRECATED and mem_type not in _MEM_TYPE_WARNED:
+        _MEM_TYPE_WARNED.add(mem_type)
+        print(f"[args] WARNING --mem-type {mem_type} is DEPRECATED and maps to "
+              f"{canon}: there is ONE memory channel, and the deterministic "
+              "memory_analysis() estimate is substituted into it in place "
+              "wherever the runtime peak is unavailable.", flush=True)
+    return canon
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +241,9 @@ def build_reward_weights(args) -> np.ndarray:
         # bkstep_acc only when the closed-loop probe is on.
         _names = [
             "flops", "muls_adds_fmas", "max_io_sum", "bytes_accessed",
-            "peak_memory", "xla_peak_memory", "cosine_sim", "frob_residual",
+            # ONE memory channel: xla_peak_memory was a duplicate of
+            # peak_memory and double-weighted memory in the all-channel reward.
+            "peak_memory", "cosine_sim", "frob_residual",
         ]
         if bool(getattr(args, "measure_latency", False)) or \
                 getattr(args, "cmp_type", "") == "latency":
@@ -228,7 +260,7 @@ def build_reward_weights(args) -> np.ndarray:
         cmp_name = _CMP_TYPE_TO_REWARD[args.cmp_type]
         w[REWARD_INDEX[cmp_name]] = float(getattr(args, "lambda_cmp", 1.0))
     if "mem" in args.rewards:
-        mem_name = _MEM_TYPE_TO_REWARD[args.mem_type]
+        mem_name = _MEM_TYPE_TO_REWARD[warn_deprecated_mem_type(args.mem_type)]
         w[REWARD_INDEX[mem_name]] = float(getattr(args, "lambda_mem", 1.0))
     if "acc" in args.rewards:
         # The accuracy/quality channel. Default = cosine_sim (Jacobian fidelity);

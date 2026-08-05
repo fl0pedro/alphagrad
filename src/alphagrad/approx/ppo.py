@@ -85,7 +85,8 @@ from alphagrad.approx.env import (
     consume_zero_work_plan_count,
     consume_per_face_stats,
     consume_tokenization_truncation_stats,
-    consume_xla_memory_stats,
+    consume_memory_compression_stats,
+    consume_static_peak_fallbacks,
     _AXIS_FEAT_IS_COMPRESSED,
     _AXIS_FEAT_IS_OUTPUT,
     _AXIS_FEAT_SIZE,
@@ -3482,6 +3483,8 @@ _MEM_TYPE_TO_REWARD = {
     "graphax": "max_io_sum",
     "bytes_accessed": "bytes_accessed",
     "peak_memory": "peak_memory",
+    # DEPRECATED ALIAS (see common.reward_scaling): one memory channel.
+    "xla_peak_memory": "peak_memory",
 }
 
 
@@ -3490,7 +3493,8 @@ def _cmp_reward_index(cmp_type: str) -> int:
 
 
 def _mem_reward_index(mem_type: str) -> int:
-    return REWARD_INDEX[_MEM_TYPE_TO_REWARD[mem_type]]
+    from alphagrad.approx.common.reward_scaling import warn_deprecated_mem_type
+    return REWARD_INDEX[_MEM_TYPE_TO_REWARD[warn_deprecated_mem_type(mem_type)]]
 
 
 
@@ -6783,11 +6787,20 @@ def main():
         # making it arithmetically identical to collapse/truncated_this_ep.
         _ = _degen
 
-        # ---- XLA side-channel: xla_peak_memory + compression ratio ----------
-        xla_stats = consume_xla_memory_stats()
+        # ---- XLA side-channel: approx/exact compression ratio ---------------
+        # No second memory NUMBER here: peak_memory is the one memory channel
+        # (logged raw as mean_peak_memory) and the static memory_analysis()
+        # estimate only ever substitutes into it.
+        xla_stats = consume_memory_compression_stats()
         if xla_stats["count"]:
-            log_dict["measure/xla_peak_memory"] = xla_stats["xla_peak_memory"]
             log_dict["measure/compression_ratio"] = xla_stats["compression_ratio"]
+        # How many measurements this period had peak_memory replaced by the
+        # STATIC estimate (structural on CPU). 0 = every reading is a real
+        # runtime high-water mark. TRAINER-LOCAL: with --ray-measure the
+        # substitution happens inside the measure actors, whose one-time stdout
+        # note still surfaces in the driver log.
+        log_dict["measure/peak_memory_static_fallback"] = int(
+            consume_static_peak_fallbacks())
 
         # ---- tokenization truncation (was computed but never logged) --------
         # Oracle probe failures. Non-zero means graphax could not trace some

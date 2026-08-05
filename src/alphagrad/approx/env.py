@@ -625,12 +625,16 @@ def consume_per_face_stats() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# XLA-analysis side-channel. The reward vector's shape is baked into the jit
-# (NUM_REWARDS), so the extra diagnostics the logging spec asks for —
-# xla_peak_memory (deterministic memory_analysis estimate) and the
-# approx/exact memory COMPRESSION ratio — travel host-side like the
-# tokenization stats: `_callback` records at each TERMINAL measurement, the
-# driver polls once per episode via `consume_xla_memory_stats`.
+# XLA-analysis side-channel. ONE memory channel exists — ``peak_memory`` — and
+# the deterministic ``memory_analysis()`` estimate is substituted INTO it in
+# place wherever the runtime high-water mark is unavailable (see
+# ``_note_static_peak_fallback``). This side-channel therefore no longer
+# exports a second memory NUMBER; it carries only the approx/exact memory
+# COMPRESSION RATIO, which is a different quantity (dimensionless, and about
+# the exact executable as much as the approximated one). It travels host-side
+# like the tokenization stats: `_callback` records at each TERMINAL
+# measurement, the driver polls once per episode via
+# `consume_memory_compression_stats`.
 # ---------------------------------------------------------------------------
 _XLA_MEM_APPROX: list = []   # bytes per terminal measurement this period
 _XLA_MEM_EXACT: list = []    # bytes; aligned with _XLA_MEM_APPROX where known
@@ -657,26 +661,22 @@ def _memory_analysis_bytes(compiled) -> float | None:
         return None
 
 
-def consume_xla_memory_stats() -> dict:
-    """Pop the per-period XLA-memory telemetry (mirrors the truncation poll).
+def consume_memory_compression_stats() -> dict:
+    """Pop the per-period approx/exact memory COMPRESSION ratio.
 
-    Returns ``xla_peak_memory`` (mean approx bytes over the period's terminal
-    measurements), and ``compression_ratio`` = mean(exact/approx) over
-    measurements where both sides were analyzable — >1 means the approximated
-    executable is smaller than the exact one (the observable sparsity /
-    compression proxy under the dense measurement pipeline).
+    ``compression_ratio`` = mean(exact/approx) over measurements where both
+    sides were analyzable — >1 means the approximated executable is smaller
+    than the exact one (the observable sparsity / compression proxy under the
+    dense measurement pipeline). It deliberately does NOT return an absolute
+    memory number: ``peak_memory`` is the single memory channel.
     """
     if not _XLA_MEM_APPROX:
-        return {"xla_peak_memory": 0.0, "compression_ratio": 0.0, "count": 0}
+        return {"compression_ratio": 0.0, "count": 0}
     approx = np.asarray(_XLA_MEM_APPROX, dtype=np.float64)
     exact = np.asarray(_XLA_MEM_EXACT, dtype=np.float64)
     both = (approx > 0) & (exact > 0)
     ratio = float(np.mean(exact[both] / approx[both])) if both.any() else 0.0
-    out = {
-        "xla_peak_memory": float(approx.mean()),
-        "compression_ratio": ratio,
-        "count": int(approx.size),
-    }
+    out = {"compression_ratio": ratio, "count": int(approx.size)}
     _XLA_MEM_APPROX.clear()
     _XLA_MEM_EXACT.clear()
     return out
@@ -1655,6 +1655,32 @@ _MEASURE_ACTOR = os.environ.get("ALPHAGRAD_MEASURE_ACTOR", "0") == "1"
 # One-shot latch so the static-estimate fallback warning is printed once per
 # process instead of once per measurement.
 _MEM_FALLBACK_WARNED: list = []
+# ...and a COUNT, because the latch alone means a run can silently change what
+# ``peak_memory`` MEANS mid-flight: the runtime high-water mark and the static
+# memory_analysis() estimate are different quantities, and the substitution is
+# in place. Polled per period by the trainers.
+_STATIC_PEAK_FALLBACKS: list = [0]
+
+
+def _note_static_peak_fallback(reason: str) -> None:
+    """Record (and announce once) that ``peak_memory`` is a STATIC estimate."""
+    _STATIC_PEAK_FALLBACKS[0] += 1
+    if not _MEM_FALLBACK_WARNED:
+        _MEM_FALLBACK_WARNED.append(1)
+        print("[measure] NOTE peak_memory is being SUBSTITUTED IN PLACE with "
+              "the deterministic memory_analysis() estimate (arguments + "
+              f"outputs + temps) because {reason}. That is a DIFFERENT "
+              "quantity from the runtime peak_bytes_in_use high-water mark, "
+              "so readings from before and after this line are not "
+              "comparable. Expected on CPU backends, which do not expose "
+              "allocator statistics.", flush=True)
+
+
+def consume_static_peak_fallbacks() -> int:
+    """Pop the per-period count of static-estimate substitutions."""
+    n = _STATIC_PEAK_FALLBACKS[0]
+    _STATIC_PEAK_FALLBACKS[0] = 0
+    return n
 
 
 def _cb_slot(x, i, E):
@@ -2850,14 +2876,12 @@ def _callback(
                                 _stats.get("peak_bytes_in_use", 0.0))
                         _peak = max(0.0, _peak_abs - _base)
                     else:
-                        try:
-                            _ma = compiled_cost.memory_analysis()
-                            _peak = float(
-                                getattr(_ma, "argument_size_in_bytes", 0)
-                                + getattr(_ma, "output_size_in_bytes", 0)
-                                + getattr(_ma, "temp_size_in_bytes", 0))
-                        except Exception:
-                            _peak = 0.0
+                        # SUBSTITUTE IN PLACE — one memory channel, so the
+                        # static estimate lands in peak_memory rather than
+                        # travelling as a second variable. Announced + counted.
+                        _peak = _memory_analysis_bytes(compiled_cost) or 0.0
+                        _note_static_peak_fallback(
+                            "this backend does not expose allocator statistics")
                     latency_samples.append((_t1 - _t0) / inner * 1e9)  # → ns
                     peak_mem_samples.append(_peak)
                 else:
@@ -2875,6 +2899,16 @@ def _callback(
                     # jax_memory_monitor.
                     latency_s = float(monitor.stats.get("time", 0.0)) / inner
                     peak_bytes = float(monitor.stats.get("memory", 0.0))
+                    if peak_bytes <= 0.0:
+                        # ResourceMonitor's DEVICE peak is structurally 0 on a
+                        # CPU backend, so without this the memory channel is a
+                        # flat zero and --mem-type peak_memory trains on
+                        # nothing. Same in-place substitution as the _direct
+                        # branch above: one channel, announced and counted.
+                        peak_bytes = _memory_analysis_bytes(compiled_cost) or 0.0
+                        _note_static_peak_fallback(
+                            "ResourceMonitor reported a zero device peak "
+                            "(structural on CPU backends)")
                     latency_samples.append(latency_s * 1e9)  # → ns
                     peak_mem_samples.append(peak_bytes)
 
@@ -2953,10 +2987,10 @@ def _callback(
         # real plans; the SENTINEL writers still stamp it, and the Ray pool's
         # sentinel test keys on that, so the wire format is unchanged.
         frob_residual = 0.0
-        # XLA-analysis side-channel (log-only: xla_peak_memory + the
-        # exact/approx compression ratio). Nothing trains on it — the memory
-        # objective is the MEASURED peak_bytes_in_use, not this static
-        # estimate — so it rides the same skip flag as the count pass.
+        # XLA-analysis side-channel (log-only: the exact/approx compression
+        # RATIO; the absolute static estimate is not exported — it only ever
+        # substitutes into peak_memory). Nothing trains on it, so it rides the
+        # same skip flag as the count pass.
         # memory_analysis() walks the compiled HLO, which is not free on the
         # big graphs a working policy produces.
         if not _SKIP_COUNT_OPS:

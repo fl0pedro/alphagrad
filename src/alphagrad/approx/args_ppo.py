@@ -85,11 +85,13 @@ def add_ppo_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     p.add_argument(
         "--mem-type", type=str, default="peak_memory",
         choices=["graphax", "bytes_accessed", "peak_memory", "xla_peak_memory"],
-        help="Which measured channel drives the memory reward. "
-        "'peak_memory' = ResourceMonitor high-water mark (idx 5; exact on GPU, "
-        "sampled on CPU). 'xla_peak_memory' = deterministic XLA memory_analysis "
-        "(idx 8; preferred on CPU). All channels are measured/logged regardless; "
-        "this only selects the reward driver.",
+        help="Which measured channel drives the memory reward. There is ONE "
+        "memory channel: 'peak_memory' (idx 5) = the runtime high-water mark, "
+        "with the deterministic memory_analysis() estimate substituted INTO it "
+        "in place where that mark is unavailable (CPU backends expose no "
+        "allocator stats); every such substitution is announced on stdout and "
+        "counted. 'xla_peak_memory' is a DEPRECATED ALIAS kept so existing "
+        "launchers do not break -- it maps to 'peak_memory' and warns once.",
     )
     p.add_argument(
         "--rewards", nargs="+", type=str,
@@ -98,7 +100,7 @@ def add_ppo_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "channel picked by --cmp-type/--mem-type/ALPHAGRAD_ACC_PROXY). ``all`` "
         "(or ALPHAGRAD_REWARD_ALL_CHANNELS=1) puts a uniform positive weight on "
         "EVERY applicable measured channel (flops, muls_adds, latency_ns, "
-        "max_io, bytes, peak_memory, xla_peak_memory, cosine_sim, frob_residual "
+        "max_io, bytes, peak_memory, cosine_sim, frob_residual "
         "+ bkstep_acc when ALPHAGRAD_BKSTEP=1); PopArt normalises each and the "
         "env's stored signs (costs negated, quality positive) make the single "
         "positive weight reward low-cost + high-fidelity.",

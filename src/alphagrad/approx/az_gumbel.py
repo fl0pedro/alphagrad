@@ -21,7 +21,7 @@ CLEAN implementation (ignores autoscheduler_loop's surrogate-Gumbel search and m
     a MicroActionPolicy output.
   * Real measurements ONLY at episode terminals (budget = --total-measurements).
   * Objective identical to the E2 campaign: equal-weight z-scored
-    {cosine_sim, latency_ns, xla_peak_memory}; flops unrewarded.
+    {cosine_sim, latency_ns, peak_memory}; flops unrewarded.
 
 Run:  python -m alphagrad.approx.az_gumbel --seed 7 --total-measurements 150
 """
@@ -173,14 +173,15 @@ def outvar(i): return jaxpr.eqns[i - 1].outvars[0]
 def legal_set(graph): return [i for i in VALID if outvar(i) in graph]
 
 # --------------------------- 4. normalisation (PopArt) + Pareto archive / objective (campaign)
-# Objective channels. ``xla_peak_memory`` was a 10-channel-era name; this env
-# emits 8 and reports the deterministic XLA estimate through the host-side
-# side-channel (env.consume_xla_memory_stats) instead of as a reward slot, so
-# the measured RM peak is the right stand-in here. Resolve by name with an
-# explicit alias table and fail loudly (listing what IS available) rather than
-# dying on a bare KeyError deep in module import.
+# Objective channels. There is ONE memory channel, ``peak_memory``: the
+# deterministic memory_analysis() estimate is substituted INTO it in place
+# where the runtime high-water mark is unavailable (see
+# env._note_static_peak_fallback), so the 10-channel-era name
+# ``xla_peak_memory`` names nothing this env emits. The alias table survives
+# for the remaining legacy names; resolve by name and fail loudly (listing what
+# IS available) rather than dying on a bare KeyError deep in module import.
 _CH_ALIASES = {"xla_peak_memory": "peak_memory", "bkstep_acc": "cosine_sim"}
-CH = ["latency_ns", "xla_peak_memory", "flops", "cosine_sim"]
+CH = ["latency_ns", "peak_memory", "flops", "cosine_sim"]
 CH = [_CH_ALIASES.get(c, c) if c not in REWARD_INDEX else c for c in CH]
 _missing = [c for c in CH if c not in REWARD_INDEX]
 if _missing:
@@ -239,7 +240,7 @@ def scalarize(raw4):
 # excluded). Exactly 3 objectives => hypervolume() uses the exact 2/3-D sweep,
 # not the >=4-D normalized Monte-Carlo estimate.
 _PSGN = np.array([-1.0, -1.0, -1.0, 1.0], dtype=np.float64)   # over [lat,peak,flops,cos]
-_pareto = ParetoArchive(["latency_ns", "xla_peak_memory", "cosine_sim"], [0, 1, 3])
+_pareto = ParetoArchive(["latency_ns", "peak_memory", "cosine_sim"], [0, 1, 3])
 
 # ---------------------------------------------------------------- state <-> tokens
 QD = [d for d in os.environ.get(
@@ -1038,7 +1039,7 @@ def _run(args) -> int:
                     _wlog = {
                         "popart_init/warmup_episode": 1,
                         "this_lat_us": float(_wraw[0]) / 1e3,
-                        "measure/xla_peak_memory": float(_wraw[1]) / 1e6,
+                        "measure/peak_memory_mb": float(_wraw[1]) / 1e6,
                         "time/sec_per_episode": _wnow - _t_prev,
                         "time/wall_seconds": _wnow - _t_start,
                         "time/wall_minutes": (_wnow - _t_start) / 60.0,
@@ -1249,7 +1250,11 @@ def _run(args) -> int:
                     "weighted_mean_return": _wmr,
                     # the raw z-sum kept under its own honest name
                     "scalarized_return": float(_scal),
-                    "measure/xla_peak_memory": raw[1] / 1e6,
+                    # MEASURED peak, in MB. Previously logged under PPO's
+                    # "measure/xla_peak_memory" key, which on that arm was a
+                    # STATIC estimate in BYTES -- two different quantities in
+                    # two different units sharing one panel.
+                    "measure/peak_memory_mb": raw[1] / 1e6,
                     "time/episode": ep,
                     "time/sec_per_episode": _now - _t_prev,
                     "time/wall_seconds": _now - _t_start,

@@ -84,7 +84,8 @@ from alphagrad.approx.env import (
     consume_zero_work_plan_count,
     consume_per_face_stats,
     consume_tokenization_truncation_stats,
-    consume_xla_memory_stats,
+    consume_memory_compression_stats,
+    consume_static_peak_fallbacks,
     _AXIS_FEAT_IS_COMPRESSED,
     _AXIS_FEAT_IS_OUTPUT,
     _AXIS_FEAT_SIZE,
@@ -5132,11 +5133,14 @@ def main():
         _degen = consume_degenerate_plan_count()
         log_dict["collapse/degenerate_plans_this_ep"] = _degen
 
-        # ---- XLA side-channel: xla_peak_memory + compression ratio ----------
-        xla_stats = consume_xla_memory_stats()
+        # ---- XLA side-channel: approx/exact compression ratio ---------------
+        # ONE memory channel: peak_memory (logged raw as mean_peak_memory); the
+        # static memory_analysis() estimate only ever substitutes into it.
+        xla_stats = consume_memory_compression_stats()
         if xla_stats["count"]:
-            log_dict["measure/xla_peak_memory"] = xla_stats["xla_peak_memory"]
             log_dict["measure/compression_ratio"] = xla_stats["compression_ratio"]
+        log_dict["measure/peak_memory_static_fallback"] = int(
+            consume_static_peak_fallbacks())
 
         # ---- tokenization truncation (was computed but never logged) --------
         trunc = consume_tokenization_truncation_stats()
