@@ -4092,26 +4092,38 @@ def main():
                     _kw["num_cpus"] = max(2, int(str(_ncpu).split("(")[0]))
             except Exception:
                 pass
-            # PRIVATE PORT WINDOW PER JOB. A Ray head claims fixed default
-            # ports (GCS, node manager, object manager, worker range), so two
-            # jobs on ONE node collide and the second raylet never registers
-            # with the GCS -- surfacing as the generic "current node timed out
-            # during startup". Measured: every same-node pair died (58353+
-            # 58355, 58357+58358 on an IDLE gpu19), every one-per-node pair
-            # ran clean (58241/58242, 58345/58352). Per-job _temp_dir fixed
-            # the session directory but not the sockets.
-            # NOTE: ray.init() does NOT accept port/node_manager_port/
-            # object_manager_port/min_worker_port/max_worker_port -- they are
-            # `ray start` (RayParams) options and raise "Unknown keyword
-            # argument(s)" here. Two Ray heads on ONE node therefore cannot be
-            # separated from inside the process; they collide on the default
-            # ports and the second raylet never registers with the GCS,
-            # surfacing as "current node timed out during startup".
-            # The fix is PLACEMENT: pin one Ray job per node in the sbatch.
-            # gpu19/gpu20 are the 8-GPU dual-socket nodes, which is why SLURM
-            # co-scheduled two 4-GPU arms onto gpu19 and why only that node
-            # ever failed (58353+58355, 58357+58358 both died there; the
-            # one-per-node pairs 58241/58242 and 58345/58352 ran clean).
+            # NOTE ray.init() does NOT accept port / node_manager_port /
+            # object_manager_port / min_worker_port / max_worker_port -- those
+            # are `ray start` (RayParams) options and raise "Unknown keyword
+            # argument(s)" here. So port windows cannot be set from Python.
+            #
+            # CORRECTION (2026-08-05). An earlier version of this comment
+            # claimed the gpu19 startup failures were two Ray heads colliding
+            # on default ports and prescribed "one Ray job per node". THAT WAS
+            # WRONG, and the counter-evidence was already available: 58362 and
+            # 58364 were ALONE on an idle gpu19 and failed anyway, and gpu20
+            # (the other dual-socket 8-GPU node) co-hosts Ray fine.
+            #
+            # What actually holds: gpu19 is not congenitally broken -- Ray
+            # started on it six times on 2026-07-31 (56860/56861/56863/56864/
+            # 56866/56875). EVERY failure falls in one ~6h window on
+            # 2026-08-05 (00:49-05:03 CEST), beginning at the instant job
+            # 58274 -- which uses no Ray at all -- died on gpu19 in a GPU-OOM
+            # meltdown. The node entered a bad state and stayed there;
+            # leading hypothesis is raylet startup blowing Ray's hard 30s
+            # deadline while accelerator autodetection stalls on a wedged GPU,
+            # or orphaned processes outside the cgroup.
+            #
+            # Two dead ends, recorded so they are not retried: the
+            # RAY_raylet_start_wait_time_s the error message suggests is never
+            # read by ray 2.55.1 (raylet_start_wait_time_s = 30 is hard-coded
+            # at _private/node.py:411); and /dev/shm, memory and fd exhaustion
+            # were all excluded from live node metrics.
+            #
+            # If startup fails again, READ THE SESSION LOGS -- raylet.err /
+            # gcs_server.err under $RAY_TMPDIR carry the real error. The
+            # client-side "current node timed out during startup" is generic
+            # and says nothing about the cause.
             print(f"[ray] node={os.environ.get('SLURMD_NODENAME', '?')} "
                   f"job={os.environ.get('SLURM_JOB_ID', '?')} "
                   f"cpus={_kw.get('num_cpus', 'default')}", flush=True)
