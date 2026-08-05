@@ -3886,6 +3886,27 @@ def main():
                     _kw["num_cpus"] = max(2, int(str(_ncpu).split("(")[0]))
             except Exception:
                 pass
+            # PRIVATE PORT WINDOW PER JOB. A Ray head claims fixed default
+            # ports (GCS, node manager, object manager, worker range), so two
+            # jobs on ONE node collide and the second raylet never registers
+            # with the GCS -- surfacing as the generic "current node timed out
+            # during startup". Measured: every same-node pair died (58353+
+            # 58355, 58357+58358 on an IDLE gpu19), every one-per-node pair
+            # ran clean (58241/58242, 58345/58352). Per-job _temp_dir fixed
+            # the session directory but not the sockets.
+            try:
+                _jid = int(os.environ.get("SLURM_JOB_ID", "0"))
+            except Exception:
+                _jid = 0
+            if _jid:
+                _base = 20000 + (_jid % 220) * 200
+                _kw["port"] = _base
+                _kw["node_manager_port"] = _base + 1
+                _kw["object_manager_port"] = _base + 2
+                _kw["min_worker_port"] = _base + 10
+                _kw["max_worker_port"] = _base + 190
+                print(f"[ray] job {_jid} port window {_base}-{_base + 190}",
+                      flush=True)
             # RETRY: raylet/GCS startup on these nodes intermittently exceeds
             # Ray's internal timeout ("The current node timed out during
             # startup") even with the node to ourselves, and the whole run
