@@ -4383,10 +4383,28 @@ def main():
             # delta itself fits, and the stored counts stay exact for the
             # loss's cumsum boundaries.
             window=MAX_DELTA_TOKENS,
+            # The prefix key now carries the prefix's FACE wires, so two envs
+            # on the same elimination order no longer share a tokenizer. The
+            # live working set is therefore one prefix PER ENV (all faces of
+            # one vertex share it; nothing across envs or steps does). Sized
+            # 4x num_envs so the FIFO never evicts an entry the next face
+            # substep of the same batch still needs -- a capacity below the
+            # env count would turn every substep into a cold replay.
+            cache=int(os.environ.get(
+                "ALPHAGRAD_FACE_PREFIX_CACHE",
+                str(max(64, 4 * _resolve_num_envs(
+                    args.num_envs, args.example))))),
         )
 
     def _live_face_host(order, spec_hist, step_count, vertex_idx,
-                        vertex_specs, face_rows, face_skips, f):
+                        vertex_specs, face_rows, face_skips, f,
+                        face_hist, skip_hist):
+        # face_hist/skip_hist are the PREFIX's per-face wires -- the (N,
+        # MAX_FACES, FACE_SLOTS, 3) / (N, MAX_FACES) history arrays carried by
+        # the env state, aligned with `order` exactly like `spec_hist` is.
+        # Without them the prefix replay rebuilt an EXACT graph while the
+        # measurement built the approximated one, and the prefix cache keyed
+        # two different plans to one tokenizer.
         _pt0 = _prof_time.perf_counter()
         try:
             _order = np.asarray(order)
@@ -4395,6 +4413,7 @@ def main():
                     order, spec_hist, int(np.asarray(step_count)),
                     int(np.asarray(vertex_idx)) + 1, vertex_specs,
                     face_rows, face_skips, int(np.asarray(f)),
+                    face_hist, skip_hist,
                 )
                 return tok, ids, np.asarray(cnt, np.int32)
             # BATCHED (vmap_method="broadcast_all"): ONE host dispatch per
@@ -4411,11 +4430,13 @@ def main():
             _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
             _vi, _vs = np.asarray(vertex_idx), np.asarray(vertex_specs)
             _fr, _fs = np.asarray(face_rows), np.asarray(face_skips)
+            _fh, _kh = np.asarray(face_hist), np.asarray(skip_hist)
             _ff = np.asarray(f)
             for i in range(B):
                 tok, ids, cnt, _nf = _LIVE_FACES.chunk(
                     _order[i], _sh[i], int(_sc[i]), int(_vi[i]) + 1,
                     _vs[i], _fr[i], _fs[i], int(_ff[i]),
+                    _fh[i], _kh[i],
                 )
                 toks[i], idss[i], cnts[i] = tok, ids, np.int32(cnt)
             return toks, idss, cnts
@@ -4424,7 +4445,7 @@ def main():
                           _prof_time.perf_counter() - _pt0)
 
     def _live_face(f, order, spec_hist, step_count, vertex_idx, vertex_specs,
-                   face_rows, face_skips):
+                   face_rows, face_skips, face_hist, skip_hist):
         W = MAX_DELTA_TOKENS
         # f rides as an OPERAND: inside the while_loop it is a tracer, and
         # a partial would freeze it into the callback as a python object
@@ -4435,27 +4456,31 @@ def main():
              jax.ShapeDtypeStruct((W,), jnp.int32),
              jax.ShapeDtypeStruct((), jnp.int32)),
             order, spec_hist, step_count, vertex_idx, vertex_specs,
-            face_rows, face_skips, f, vmap_method="broadcast_all",
+            face_rows, face_skips, f, face_hist, skip_hist,
+            vmap_method="broadcast_all",
         )
 
-    def _live_face_count_host(order, spec_hist, step_count, vertex_idx):
+    def _live_face_count_host(order, spec_hist, step_count, vertex_idx,
+                              face_hist, skip_hist):
         _order = np.asarray(order)
         if _order.ndim == 1:
             return np.int32(_LIVE_FACES.n_faces(
                 order, spec_hist, int(np.asarray(step_count)),
-                int(np.asarray(vertex_idx)) + 1))
+                int(np.asarray(vertex_idx)) + 1, face_hist, skip_hist))
         # batched: one dispatch per vertex step (see _live_face_host)
         _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
         _vi = np.asarray(vertex_idx)
+        _fh, _kh = np.asarray(face_hist), np.asarray(skip_hist)
         return np.asarray(
             [_LIVE_FACES.n_faces(_order[i], _sh[i], int(_sc[i]),
-                                 int(_vi[i]) + 1)
+                                 int(_vi[i]) + 1, _fh[i], _kh[i])
              for i in range(_order.shape[0])], np.int32)
 
-    def _live_face_count(order, spec_hist, step_count, vertex_idx):
+    def _live_face_count(order, spec_hist, step_count, vertex_idx,
+                         face_hist, skip_hist):
         return jax.pure_callback(
             _live_face_count_host, jax.ShapeDtypeStruct((), jnp.int32),
-            order, spec_hist, step_count, vertex_idx,
+            order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
             vmap_method="broadcast_all")
 
     _ORACLE_ONE_VERTEX = os.environ.get(
@@ -4819,16 +4844,24 @@ def main():
             face_chunk_fn = None
             face_count_fn = None
             if _LIVE_FACES is not None:
+                # The FULL per-face history rides along: `_rows`/`_skips` are
+                # the CURRENT vertex's in-flight decisions (the face loop's
+                # carry), while `_fh`/`_kh` are every decision already
+                # committed to the prefix. The prefix replay needs the latter
+                # or it rebuilds an exact graph the measurement never builds.
                 _fc_o, _fc_s, _fc_k = (
                     state.order, state.sparsity_specs, state.step_count)
+                _fc_fh, _fc_kh = state.face_specs, state.face_skips
 
                 def face_chunk_fn(_f, _v, _vspecs, _rows, _skips,
-                                  _o=_fc_o, _s=_fc_s, _k=_fc_k):
+                                  _o=_fc_o, _s=_fc_s, _k=_fc_k,
+                                  _fh=_fc_fh, _kh=_fc_kh):
                     return _live_face(_f, _o, _s, _k, _v,
-                                      _vspecs, _rows, _skips)
+                                      _vspecs, _rows, _skips, _fh, _kh)
 
-                def face_count_fn(_v, _o=_fc_o, _s=_fc_s, _k=_fc_k):
-                    return _live_face_count(_o, _s, _k, _v)
+                def face_count_fn(_v, _o=_fc_o, _s=_fc_s, _k=_fc_k,
+                                  _fh=_fc_fh, _kh=_fc_kh):
+                    return _live_face_count(_o, _s, _k, _v, _fh, _kh)
 
             if args.dynamic_substeps:
                 # Live per-vertex DIAG/COMPRESS masks for the current graph

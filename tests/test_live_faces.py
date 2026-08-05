@@ -114,7 +114,10 @@ def main():
         same &= bool(np.array_equal(
             lfs.chunk(order, specs, 0, v, vspecs, rows, skips, 0)[0], base))
     # ... and the tokenizer is still good for the NEXT step
-    tk_used = lfs._prefix[(order[:0].tobytes(), specs[:0].tobytes())]
+    # The prefix key carries the prefix's FACE wires too (empty here: no
+    # history was passed, and the prefix itself is empty).
+    tk_used = lfs._prefix[(order[:0].tobytes(), specs[:0].tobytes(),
+                           b"", b"")]
     nxt_used = [int(t) for t in tk_used.eliminate(v, ())]
     tk_clean = IncrementalPathTokenizer(
         jaxpr, argnums, list(consts), list(args), vocab_size=512)

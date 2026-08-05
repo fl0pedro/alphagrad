@@ -132,6 +132,11 @@ class LiveFaceStream:
     def __init__(self, jaxpr, argnums, consts, args, *, vocab: int,
                  max_faces: int = 8, max_axes: int = 8,
                  window: int = FACE_TOKEN_WINDOW, cache: int = 64):
+        # ``cache`` is a PREFIX-tokenizer capacity, and with the face wires in
+        # the key the live working set is one prefix per ENV per vertex step
+        # (all faces of one vertex share it, nothing else does). Below the env
+        # count the FIFO evicts entries the very next face substep needs, so
+        # callers size it from num_envs -- see ppo.py.
         self.jaxpr = jaxpr
         self.argnums = tuple(argnums)
         self.consts = list(consts)
@@ -151,12 +156,32 @@ class LiveFaceStream:
                       "tok_total": 0, "tok_max": 0, "chunks": 0}
 
     # -- prefix ------------------------------------------------------------
-    def _tokenizer_at(self, order, specs, n):
+    @staticmethod
+    def _hist(face_rows_hist, face_skips_hist):
+        """``(rows, skips)`` as int32 arrays, or ``(None, None)``."""
+        if face_rows_hist is None or face_skips_hist is None:
+            return None, None
+        return (np.asarray(face_rows_hist, np.int32),
+                np.asarray(face_skips_hist, np.int32))
+
+    def _tokenizer_at(self, order, specs, n, face_rows_hist=None,
+                      face_skips_hist=None):
         from graphax import IncrementalPathTokenizer
         from alphagrad.approx.env import decode_vertex_rule_specs
         from alphagrad.approx.common.masks import make_live_masked_hook
 
-        key = (order[:n].tobytes(), specs[:n].tobytes())
+        order = np.asarray(order).reshape(-1)
+        specs = np.asarray(specs)
+        frh, fsh = self._hist(face_rows_hist, face_skips_hist)
+        # THE PREFIX'S FACE WIRES BELONG IN THE KEY. Under --live-faces ppo.py
+        # sets the per-vertex specs to all-exact END rows for every vertex --
+        # approximation is purely per-face -- so ``specs[:n]`` is a CONSTANT
+        # and a key built from (order, specs) alone degenerates to the vertex
+        # ORDER. Every plan sharing an elimination order was then served one
+        # tokenizer no matter what the face head had decided.
+        key = (order[:n].tobytes(), specs[:n].tobytes(),
+               b"" if frh is None else frh[:n].tobytes(),
+               b"" if fsh is None else fsh[:n].tobytes())
         hit = self._prefix.get(key)
         if hit is not None:
             self.stats["prefix_hit"] += 1
@@ -177,7 +202,23 @@ class LiveFaceStream:
             # not fit one face's operand is skipped for that face instead of
             # raising, which is what keeps key enumeration alive.
             hooks = (make_live_masked_hook(tuple(rules)),) if rules else ()
-            tk.eliminate(v, hooks)
+            # ... AND SO DO THE PREFIX'S APPROXIMATIONS. This loop used to
+            # pass no face transforms at all, so every chunk the head read was
+            # computed on an EXACT prefix while the measurement
+            # (env._face_transforms_for_order -> ft_by_vertex) built an
+            # approximated one: the observation and the measured object
+            # diverged. ``is_last=False`` is what that builder uses for every
+            # vertex but the last of the ORDER, and a prefix vertex here is
+            # never that one.
+            ft = None
+            if frh is not None:
+                try:
+                    _keys, ft = self._decided(
+                        tk, v, frh[k], fsh[k], int(frh.shape[1]),
+                        is_last=False)
+                except Exception:
+                    ft = None
+            tk.eliminate(v, hooks, ft or None)
         if len(self._prefix) >= self.cache_cap:
             for dk in list(self._prefix)[: max(1, self.cache_cap // 4)]:
                 self._prefix.pop(dk, None)
@@ -185,8 +226,16 @@ class LiveFaceStream:
         return tk
 
     # -- decoded per-face transforms for the DECIDED faces -----------------
-    def _decided(self, tk, vertex, face_rows, face_skips, upto):
-        """``{face_key: slots|SKIP_FACE}`` for faces ``0..upto-1``."""
+    def _decided(self, tk, vertex, face_rows, face_skips, upto,
+                 is_last=True):
+        """``{face_key: slots|SKIP_FACE}`` for faces ``0..upto-1``.
+
+        ``is_last`` mirrors ``env._face_dict_for_vertex``'s
+        ``is_last_honored``: True for the vertex whose faces are being decided
+        right now (the newest of the prefix), False when replaying an OLDER
+        prefix vertex, which is exactly how ``_face_transforms_for_order``
+        decodes it.
+        """
         from graphax import SKIP_FACE
         from alphagrad.approx.env import (
             FACE_SLOTS, MAX_RULES_PER_VERTEX, decode_vertex_rule_specs)
@@ -210,7 +259,7 @@ class LiveFaceStream:
                     # so the chunk would describe an exact contraction while
                     # the env applied a reduction.
                     rules = decode_vertex_rule_specs(
-                        self.jaxpr, int(vertex), row, is_last=True)
+                        self.jaxpr, int(vertex), row, is_last=bool(is_last))
                 except Exception:
                     rules = ()
                 slots.append(make_live_masked_hook(tuple(rules))
@@ -221,7 +270,8 @@ class LiveFaceStream:
 
     # -- the chunk ---------------------------------------------------------
     def chunk(self, order, specs, n, vertex, vertex_specs,
-              face_rows, face_skips, f):
+              face_rows, face_skips, f,
+              face_rows_hist=None, face_skips_hist=None):
         """``(tokens (W,), eqn_ids (W,), count, n_faces)``.
 
         ``tokens`` is the ``=>`` handoff before face ``f``'s decision: face
@@ -249,15 +299,18 @@ class LiveFaceStream:
         empty = (np.zeros((W,), np.int32), -np.ones((W,), np.int32),
                  np.int32(0), np.int32(0))
 
+        frh, fsh = self._hist(face_rows_hist, face_skips_hist)
         ck = (order[:n].tobytes(), specs[:n].tobytes(), vertex,
-              vspecs.tobytes(), rows[:f].tobytes(), skips[:f].tobytes(), f)
+              vspecs.tobytes(), rows[:f].tobytes(), skips[:f].tobytes(), f,
+              b"" if frh is None else frh[:n].tobytes(),
+              b"" if fsh is None else fsh[:n].tobytes())
         hit = self._chunks.get(ck)
         if hit is not None:
             self.stats["chunk_hit"] += 1
             return hit
 
         try:
-            tk = self._tokenizer_at(order, specs, n)
+            tk = self._tokenizer_at(order, specs, n, frh, fsh)
         except Exception:
             self.stats["failures"] += 1
             return empty
@@ -345,7 +398,8 @@ class LiveFaceStream:
         self._chunks[ck] = res
         return res
 
-    def n_faces(self, order, specs, n, vertex):
+    def n_faces(self, order, specs, n, vertex, face_rows_hist=None,
+                face_skips_hist=None):
         """Face count of ``vertex`` on the live prefix graph -- the rollout
         while_loop's trip count. Raises if it ever exceeds ``max_faces``:
         the width is the provable ancestors-x-descendants bound, so an
@@ -353,7 +407,8 @@ class LiveFaceStream:
         would shrink the action space behind a healthy-looking run."""
         try:
             tk = self._tokenizer_at(
-                np.asarray(order).reshape(-1), np.asarray(specs), int(n))
+                np.asarray(order).reshape(-1), np.asarray(specs), int(n),
+                face_rows_hist, face_skips_hist)
             k = len(list(tk.ij.faces(int(vertex))))
         except Exception:
             self.stats["failures"] += 1
