@@ -355,11 +355,14 @@ class LiveFaceStream:
                 self.stats["failures"] += 1
                 return empty
 
-        # SKIPPED faces emit nothing, so segment index != face index. Faces
-        # 0..f-1 are the only ones that can be skipped (face f's decision has
-        # not been made yet), so the shift is exactly how many of them were.
-        skipped_before = int(np.sum(skips[:f] == 1))
-        gi = f - skipped_before
+        # Segment index == FACE index. A skipped face is NOT absent from the
+        # stream: since graphax 00a60fa it emits its `path` header with an
+        # EMPTY contraction block plus a lone `approx SKIP {}`, and it gets
+        # its own segment entry. Do NOT shift by the number of earlier skips
+        # -- that reads segment f-k for face f, which silently hands the head
+        # another face's contraction AND another face's approximation tail,
+        # so it never sees its own skip decision.
+        gi = f
         if gi < 0 or gi >= len(segs):
             self.stats["failures"] += 1
             return empty
