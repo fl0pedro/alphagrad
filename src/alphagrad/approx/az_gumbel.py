@@ -983,6 +983,30 @@ def _run(args) -> int:
             _scal = float(scalarize(raw))
         except Exception:
             _scal = float("nan")
+        # PPO-COMPARABLE weighted score. PPO reports a convex combination of
+        # normal CDFs Phi(z) in [0,1] (the running-distribution percentile of
+        # this episode's channel value); AZ used to report the raw z-SUM under
+        # the same key, which is unbounded and not the same quantity. Compute
+        # PPO's form here so one panel means one thing.
+        # sign(W4) orients each channel so higher = better: W4 is
+        # [-w_cmp, -w_mem, 0, +w_acc], and raw holds POSITIVE cost magnitudes.
+        try:
+            from math import erf as _erf
+            _mu_v = np.asarray(popart.mu, np.float64).reshape(-1)
+            _sig_v = np.asarray(popart.sigma, np.float64).reshape(-1)
+            _w4 = np.asarray(W4, np.float64).reshape(-1)
+            _raw_v = np.asarray(raw, np.float64).reshape(-1)
+            _z = (_raw_v - _mu_v) / np.maximum(_sig_v, 1e-8)
+            _z = _z * np.sign(_w4)          # higher = better on every channel
+            _phi_v = np.array(
+                [0.5 * (1.0 + _erf(float(v) / np.sqrt(2.0))) for v in _z],
+                dtype=np.float64)
+            _aw = np.abs(_w4)
+            _awsum = float(np.sum(_aw))
+            _wn_v = (_aw / _awsum) if _awsum > 0 else np.zeros_like(_aw)
+            _wmr = float(np.sum(_phi_v * _wn_v))
+        except Exception:
+            _phi_v, _wmr = None, float("nan")
         print(f"[gaz] ep={ep} n={n_meas}/{args.total_measurements} this(lat={raw[0]/1e3:.1f}us "
               f"cos={raw[3]:+.3f}) best(lat={b[0]/1e3:.1f}us peak={b[1]/1e6:.2f}MB "
               f"cos={b[3]:+.4f} at={best['at']}) loss={L:.4f}", flush=True)
@@ -1017,7 +1041,9 @@ def _run(args) -> int:
                     "pareto/hypervolume": _pareto.hypervolume(),
                     "pareto/archive_size": len(_pareto.pts),
                     "pareto/size": len(_pareto.pts),   # legacy AZ key
-                    "Charts/weighted_mean_return": float(_scal),
+                    "weighted_mean_return": _wmr,
+                    # the raw z-sum kept under its own honest name
+                    "scalarized_return": float(_scal),
                     "measure/xla_peak_memory": raw[1] / 1e6,
                     "time/episode": ep,
                     "time/sec_per_episode": _now - _t_prev,
@@ -1066,6 +1092,19 @@ def _run(args) -> int:
                         print("[approx per-vertex] " + " ".join(
                             f"{_k2.split('/')[-1]}={float(_v2):.4g}"
                             for _k2, _v2 in sorted(_ap.items())), flush=True)
+                # per-head percentile companions + the PopArt state that
+                # produced them. AZ channel order is [lat, peak, flops, cos];
+                # flops has W4 == 0 and no head, so it is skipped.
+                try:
+                    for _hi, _hn in ((0, "latency"), (1, "mem"), (3, "cos")):
+                        if _phi_v is not None and _hi < _phi_v.shape[0]:
+                            _log[f"weighted_mean_{_hn}"] = float(_phi_v[_hi])
+                        _log[f"popart/mu_{_hn}"] = float(
+                            np.asarray(popart.mu).reshape(-1)[_hi])
+                        _log[f"popart/sigma_{_hn}"] = float(
+                            np.asarray(popart.sigma).reshape(-1)[_hi])
+                except Exception:
+                    pass
                 _MICRO_CHOICES.clear()
                 _t_prev = _now
                 wb.log(_log)

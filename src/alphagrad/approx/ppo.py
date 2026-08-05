@@ -6561,10 +6561,13 @@ def main():
             _wsum = float(np.sum(np.abs(_hw)))
             _wn = (np.abs(_hw) / _wsum) if _wsum > 0 else np.zeros_like(_hw)
             # convex combination of [0,1] values -> itself in [0,1]
-            log_dict["Charts/weighted_mean_return"] = float(np.sum(_phi * _wn))
+            # No "Charts/" folder: it was a wandb section prefix only (no
+            # define_metric, no in-repo panel refers to it) and it buried the
+            # headline score under a group name.
+            log_dict["weighted_mean_return"] = float(np.sum(_phi * _wn))
             for j, nm in enumerate(HEAD_NAMES):
                 if _hw[j] != 0.0:
-                    log_dict[f"Charts/weighted_mean_{nm}"] = float(_phi[j])
+                    log_dict[f"weighted_mean_{nm}"] = float(_phi[j])
 
         # ---- wall clock: lets the wandb x-axis be switched from episode to
         # elapsed time, so a slowdown shows up as a flat stretch instead of
