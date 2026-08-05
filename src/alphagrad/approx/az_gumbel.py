@@ -972,6 +972,20 @@ def _run(args) -> int:
     best = {"scalar": -1e18, "raw": None, "state": None, "at": 0}
     n_meas = 0; ep = 0
     _t_start = time.time(); _t_prev = _t_start   # time/* parity with PPO
+    # Logging must never kill training, but it must never be SILENT either: a
+    # swallowed exception here used to cost the episode's row, poison
+    # approx_prob/* (uncleared counters) and skew time/sec_per_episode (stale
+    # _t_prev) with nothing in the log to say so. Rate-limited so a systematic
+    # failure cannot flood stdout.
+    _log_fails = [0]
+
+    def _log_failure(where, exc):
+        _log_fails[0] += 1
+        n = _log_fails[0]
+        if n <= 3 or n % 50 == 0:
+            print(f"[gaz] wandb logging FAILED in {where} "
+                  f"(occurrence {n}): {type(exc).__name__}: {exc}",
+                  flush=True)
     # Realized choice counts over this episode's decisions -> approx_prob/*
     _MICRO_CHOICES = collections.Counter()
     wb = None
@@ -1046,10 +1060,12 @@ def _run(args) -> int:
                     }
                     for _wj, _wnm in enumerate(REWARD_NAMES):
                         _wlog[f"mean_{_wnm}"] = float(LAST_FULL_REWARD[_wj])
-                    _t_prev = _wnow
                     wb.log(_wlog)
-                except Exception:
-                    pass
+                except Exception as _lexc:
+                    _log_failure("popart-init warm-up", _lexc)
+                else:
+                    # only once the row is actually on the wire
+                    _t_prev = _wnow
         print(f"[popart-init] {_pie} random-plan episodes -> "
               f"{len(_seed_rows)}/{_pie} usable terminal measurements",
               flush=True)
@@ -1235,8 +1251,9 @@ def _run(args) -> int:
         except Exception as _pexc:
             print(f"[gaz] pareto dump failed: {_pexc}", flush=True)
         if wb is not None:
+            _now = time.time()
+            _log = None
             try:
-                _now = time.time()
                 _log = {
                     # --- AZ-native ---
                     "ep": ep, "n_meas": n_meas,
@@ -1348,8 +1365,6 @@ def _run(args) -> int:
                             _log["entropy/palimpsa"] = _pe
                     except Exception:
                         pass
-                _VE_ENT.clear()
-                _AP_ENT.clear()
                 # Mirror the three head entropies to stdout under the same
                 # switch the approximation telemetry uses, so a --wandb
                 # disabled probe (or a dead run's log) still shows them.
@@ -1360,11 +1375,26 @@ def _run(args) -> int:
                         print("[entropy] " + " ".join(
                             f"{_k3.split('/')[-1]}={float(_v3):.4g}"
                             for _k3, _v3 in sorted(_ek.items())), flush=True)
-                _MICRO_CHOICES.clear()
-                _t_prev = _now
-                wb.log(_log)
-            except Exception:
-                pass
+            except Exception as _lexc:
+                # NARROW. A failure while BUILDING the payload loses this
+                # episode's row and nothing else -- it no longer takes the
+                # state resets with it, and it is no longer invisible.
+                _log_failure("episode payload build", _lexc)
+                _log = None
+            if _log is not None:
+                try:
+                    wb.log(_log)
+                except Exception as _lexc:
+                    _log_failure("wb.log", _lexc)
+                else:
+                    # ONLY after the row landed. If it did not, the counters
+                    # keep accumulating and _t_prev keeps its old mark, so the
+                    # NEXT successful row covers both episodes honestly instead
+                    # of reporting a two-episode average as one episode.
+                    _MICRO_CHOICES.clear()
+                    _VE_ENT.clear()
+                    _AP_ENT.clear()
+                    _t_prev = _now
 
     # --- 6. logging/dump ---
     json.dump({"best": best, "n_measured": n_meas, "config": vars(args),
