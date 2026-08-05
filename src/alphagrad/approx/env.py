@@ -260,6 +260,11 @@ MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "1024"))
 #   Encoder 1323 | TransformerLM 1406 | ViT 1457 | EncoderDecoder 1627 |
 #   RoeFlux_3d 1777 | BlackScholes_Jacobian 4219
 #
+# Those figures are at the OLD default vocab (248). The default is 512 now,
+# which only SHRINKS a base (a wider name alphabet spells fewer names out by
+# concatenation: nn256 425 -> 331), so every entry above is a conservative
+# upper bound and the budget below still holds with room to spare.
+#
 # 8192 is ~1.9x the largest measured base (4219) and ~20x the flagship
 # nn256's (419), and one base buffer per env is 32 KB -- headroom is free
 # here in a way it is not for the per-step buffers. ppo.py ASSERTS on the
@@ -464,10 +469,22 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
     """
     from graphax import IncrementalPathTokenizer
 
-    # 229 reserved tokens + 10 digits leave `vocab - 239` symbols for the name
-    # alphabet (the tokenizer needs >= 2). 248 fits under the default 256-row
-    # policy embedding with a 9-symbol alphabet.
-    vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "248"))
+    # `vocab_size` is the TOTAL id space: 230 reserved structural tokens + 10
+    # digits, leaving `vocab - 240` symbols for the NAME alphabet (the
+    # tokenizer needs >= 2); a name past the alphabet spells itself out by
+    # concatenation. 512 == the launchers' --vocab-size == the policy
+    # embedding's row count, so the tokenizer and the embedding table name
+    # the SAME id space (272 name symbols, max_token_id 511 < 512).
+    #
+    # It was 248, sized for a 256-row embedding constraint that no longer
+    # applies, which left an 8-symbol alphabet (9 before graphax added the
+    # `^` slot separator) and paid for it in concatenated names: measured on
+    # nn256 (ALPHAGRAD_NN_HIDDEN=256, reverse order), base 425 -> 331 tokens,
+    # full stream 13114 -> 10453 (1.25x), max single-step delta 2385 -> 2063.
+    # CONSISTENCY, not speed: `base_observation` below must resolve the same
+    # default or the base and the deltas are tokenized at different vocabs
+    # and do not concatenate.
+    vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "512"))
     steps = []
     for v_idx, v in enumerate(o_list):
         rows = tuple(tuple(int(x) for x in row)
@@ -3561,7 +3578,7 @@ class VertexEliminationEnv:
         """
         from graphax import IncrementalPathTokenizer
 
-        vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "248"))
+        vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "512"))
         tk = IncrementalPathTokenizer(
             self.config.jaxpr, tuple(self.config.argnums),
             list(self.consts), list(self.args), vocab_size=vocab,

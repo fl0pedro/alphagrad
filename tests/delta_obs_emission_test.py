@@ -28,8 +28,9 @@ Two things must hold, and neither is visible in any metric we log:
      a different id, i.e. a different embedding row, for the base only. Test 1
      pins this: any mismatch breaks the concatenation at the first base token
      that differs. It says nothing about WHICH id space is right; the
-     launcher's ``--vocab-size 512`` against this default is a separate,
-     pre-existing question.
+     default IS the launchers' ``--vocab-size 512`` now, so the tokenizer
+     and the policy embedding name one id space (230 reserved + 10 digits
+     + 272 name symbols, max id 511).
 """
 import os
 
@@ -102,7 +103,7 @@ def _delta_at(cfg, specs, step):
     return list(t[1:1 + n]), list(e[1:1 + n])
 
 
-_VOCAB = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "248"))
+_VOCAB = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "512"))
 
 
 def _cold_stream(prefix, specs_np, vocab=_VOCAB):

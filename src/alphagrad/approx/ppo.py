@@ -4427,7 +4427,7 @@ def main():
     if getattr(args, "live_faces", False):
         _LIVE_FACES = LiveFaceStream(
             _oracle_jaxpr, _oracle_argnums, _oracle_consts, _oracle_args,
-            vocab=int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "248")),
+            vocab=int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "512")),
             max_faces=_F_FACES, max_axes=_oracle_N,
             # A chunk is a slice of the step delta, so the delta cap is the
             # one honest window: truncation becomes impossible whenever the
