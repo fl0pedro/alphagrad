@@ -3867,12 +3867,34 @@ def main():
             # "The current node timed out during startup". RAY_TMPDIR gives
             # each job its own directory, so no prologue wipe is needed.
             _rt = os.environ.get("RAY_TMPDIR") or None
+            _kw = dict(ignore_reinit_error=True, include_dashboard=False)
             if _rt:
                 os.makedirs(_rt, exist_ok=True)
-                _ray.init(ignore_reinit_error=True, include_dashboard=False,
-                          _temp_dir=_rt)
-            else:
-                _ray.init(ignore_reinit_error=True, include_dashboard=False)
+                _kw["_temp_dir"] = _rt
+            # RETRY: raylet/GCS startup on these nodes intermittently exceeds
+            # Ray's internal timeout ("The current node timed out during
+            # startup") even with the node to ourselves, and the whole run
+            # dies before episode 0. Three attempts with backoff turns a
+            # multi-hour loss into a 40s delay.
+            import time as _time
+            _last = None
+            for _try in range(3):
+                try:
+                    _ray.init(**_kw)
+                    _last = None
+                    break
+                except Exception as _rexc:
+                    _last = _rexc
+                    print(f"[ray] init attempt {_try + 1}/3 failed: "
+                          f"{type(_rexc).__name__}: {str(_rexc)[:120]}",
+                          flush=True)
+                    try:
+                        _ray.shutdown()
+                    except Exception:
+                        pass
+                    _time.sleep(20.0 * (_try + 1))
+            if _last is not None:
+                raise _last
         # One actor per MEASUREMENT device. Under --exec-on-gpu that is
         # num_gpus=1 each, so Ray hands every actor a disjoint
         # CUDA_VISIBLE_DEVICES and the timed execs cannot collide.
