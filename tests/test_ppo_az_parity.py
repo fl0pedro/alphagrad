@@ -41,9 +41,14 @@ PPO_HEADS = dict(
     face_actions=True, unified_face_head=True, live_faces=True,
     max_substeps=16, axis_group_embedding=False,
 )
+# W5: AZ's head inventory IS PPO's. The only remaining field that differs is
+# `max_substeps`, which sizes the per-VERTEX micro policy's sub-episode -- and
+# that policy is not built on either arm under --live-faces, so it carries no
+# parameters. Every test below therefore asserts IDENTITY, not "differs only
+# by the approximation heads".
 AZ_HEADS = dict(
     dynamic_substeps=True, unified_head=False, no_approx_head=False,
-    face_actions=False, unified_face_head=False, live_faces=False,
+    face_actions=True, unified_face_head=True, live_faces=True,
     max_substeps=1, axis_group_embedding=False,
 )
 
@@ -93,24 +98,27 @@ def test_shared_modules_have_identical_structure(agents):
 
 
 def test_same_config_same_seed_is_bitwise_identical():
-    """Determinism: identical config + identical seed => identical weights.
-
-    NOTE the limit of what is achievable today. init_linear_weights does
-    jax.random.split(key, len(weights)) over the Linear modules in TREE
-    ORDER (common/init.py:41), so the number of Linears decides every module's
-    subkey. While PPO carries a face head and AZ a micro head, the SHARED
-    modules necessarily draw different subkeys — bitwise cross-arm identity is
-    impossible without changing PPO's init (and thus every existing PPO
-    baseline). What matters for the comparison is asserted by the two tests
-    below: identical shapes/structure, and the same init DISTRIBUTION. Once W5
-    gives both arms the same head inventory, tighten this to a cross-arm
-    bitwise check.
-    """
+    """Determinism: identical config + identical seed => identical weights."""
     a1 = _build(AZ_HEADS)
     a2 = _build(AZ_HEADS)
     for x, y in zip(jax.tree_util.tree_leaves(eqx.filter(a1, eqx.is_array)),
                     jax.tree_util.tree_leaves(eqx.filter(a2, eqx.is_array))):
         assert jnp.array_equal(x, y)
+
+
+def test_cross_arm_weights_are_bitwise_identical(agents):
+    """W5 tightening. ``init_linear_weights`` splits its key over the Linear
+    modules in TREE ORDER, so the head inventory used to decide every SHARED
+    module's subkey: while PPO carried a face head and AZ a micro head, the
+    two arms could not share a single weight even at matched shapes. Same
+    inventory now, so the whole agent must match bit for bit -- anything else
+    means a head-config field is still diverging."""
+    ppo_a, az_a = agents
+    lp = jax.tree_util.tree_leaves(eqx.filter(ppo_a, eqx.is_array))
+    la = jax.tree_util.tree_leaves(eqx.filter(az_a, eqx.is_array))
+    assert len(lp) == len(la), (len(lp), len(la))
+    for i, (x, y) in enumerate(zip(lp, la)):
+        assert jnp.array_equal(x, y), f"leaf {i} differs (shape {x.shape})"
 
 
 def test_shared_modules_share_the_init_distribution(agents):
@@ -128,16 +136,18 @@ def test_shared_modules_share_the_init_distribution(agents):
                 f"{name}: init spread differs ({sa:.4f} vs {sb:.4f})")
 
 
-def test_only_approximation_heads_differ(agents):
-    """Total params may differ ONLY by the approximation heads."""
+def test_nothing_differs(agents):
+    """No head may differ any more: both arms eliminate per VERTEX and
+    approximate per FACE, through the same UnifiedFacePolicy. A live
+    `micro_action_policy` on either arm is a second, differently-trained
+    action space -- the divergence this whole change removes."""
     ppo_a, az_a = agents
-    shared_p = _nparams(_shared_modules(ppo_a))
-    shared_a = _nparams(_shared_modules(az_a))
-    assert shared_p == shared_a, (
-        f"shared backbone/vertex/value params differ: {shared_p} vs {shared_a}")
-    # PPO carries the face head and no micro head; AZ the reverse (until W5).
-    assert ppo_a.face_path_policy is not None and ppo_a.micro_action_policy is None
-    assert az_a.face_path_policy is None and az_a.micro_action_policy is not None
+    assert _nparams(_shared_modules(ppo_a)) == _nparams(_shared_modules(az_a))
+    assert _nparams(ppo_a) == _nparams(az_a), (
+        f"total params differ: {_nparams(ppo_a)} vs {_nparams(az_a)}")
+    for a in (ppo_a, az_a):
+        assert a.face_path_policy is not None
+        assert a.micro_action_policy is None
 
 
 def test_initial_vertex_logits_are_near_uniform(agents):
