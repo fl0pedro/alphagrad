@@ -57,6 +57,18 @@ def add_az_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     # Measurement
     p.add_argument("--ndata", type=int, default=5)
 
+    # PopArt warm-start (parity with ppo's --popart-init-episodes, which every
+    # PPO launcher passes as 3). Without it az's normaliser starts at (0, 1)
+    # and its first EMA step sees M == 1 sample, whose variance is 0 -- sigma
+    # then clips to sigma_min (0.1/0.2) while the raw memory channel is ~1e9.
+    p.add_argument(
+        "--popart-init-episodes", type=int, default=3,
+        help="Warm-start PopArt (mu, sigma) from this many episodes of "
+             "UNIFORMLY RANDOM but valid elimination orders, measured through "
+             "the real measurement path, before training. 0 disables. These "
+             "episodes are NOT logged to wandb and do NOT count against "
+             "--total-measurements.")
+
     # Logging
     p.add_argument("--out", default=os.path.expanduser("~/dsnn/az_gumbel_out"))
     p.add_argument("--wandb", action="store_true")

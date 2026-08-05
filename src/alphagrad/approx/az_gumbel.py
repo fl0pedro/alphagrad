@@ -911,6 +911,108 @@ def _run(args) -> int:
     print(f"[gaz] NV={NV} budget={args.total_measurements} m={args.n_candidates} "
           f"depth={args.rollout_depth} micro={GAZ_MICRO}", flush=True)
 
+    # --- 4b. PopArt WARM-START ------------------------------------------
+    # Uniform on the standardised (ppo) form. Without it the normaliser starts
+    # at (0, 1) and the first EMA step is fed M == 1 sample, whose variance is
+    # exactly 0 -- sigma clips to sigma_min (0.1, or 0.2 on the quality
+    # channels) while the raw memory channel is ~1e9, so the critic's targets
+    # are ~1e10 for the first episodes.
+    #
+    # WHAT IS SEEDED: the RAW terminal 4-vector. Unlike ppo (which regresses a
+    # DISCOUNTED RETURN and therefore has to build Monte-Carlo returns for its
+    # seed) az's value target IS the terminal raw vector -- see ``vt`` below,
+    # ``(raw4 - mu) / sigma``. Seeding on anything else would be seeding in a
+    # different space from the one that is updated.
+    #
+    # Plans are drawn UNIFORMLY AT RANDOM over the legal set (gumbel_search is
+    # bypassed): the point is the measurement SCALE, and an untrained search is
+    # both slower and no more representative. Each episode IS logged to wandb
+    # (minus a "loss" key -- no train step ran), uniform with ppo's warm-up,
+    # but they do not advance ``n_meas``: the warm start is not spent from the
+    # --total-measurements budget, exactly as ppo's warm-up rollouts do not
+    # advance its episode counter.
+    _pie = int(getattr(args, "popart_init_episodes", 0) or 0)
+    if _pie > 0:
+        _seed_rows = []
+        for _wi in range(_pie):
+            _wst = []
+            _wg, _wtg = copy_g(GRAPH0), copy_g(TG0)
+            while True:
+                _wlegal = legal_set(_wg)
+                if not _wlegal:
+                    break
+                _wv = _wlegal[int(rng.integers(len(_wlegal)))]
+                step_state(_wg, _wtg, _wst, _wv, rand_micro(rng))
+            _wraw = measure(_wst)
+            if _wraw is None:
+                print(f"[popart-init] episode {_wi + 1}/{_pie} measure FAILED",
+                      flush=True)
+                continue
+            _wraw = np.asarray(_wraw, dtype=np.float64)
+            if not np.isfinite(_wraw).all():
+                print(f"[popart-init] episode {_wi + 1}/{_pie} non-finite",
+                      flush=True)
+                continue
+            _seed_rows.append(_wraw)
+            # Log the warm-up episode. Uniform with ppo, which now also logs
+            # its warm-start rollouts: the measurement IS real and the wandb
+            # step counter must advance so these episodes are not a silent gap.
+            # No "loss" key -- no train step ran, and a NaN loss would wreck
+            # the panel's y-range for the whole run.
+            if wb is not None:
+                try:
+                    _wnow = time.time()
+                    _wlog = {
+                        "popart_init/warmup_episode": 1,
+                        "this_lat_us": float(_wraw[0]) / 1e3,
+                        "measure/xla_peak_memory": float(_wraw[1]) / 1e6,
+                        "time/sec_per_episode": _wnow - _t_prev,
+                        "time/wall_seconds": _wnow - _t_start,
+                        "time/wall_minutes": (_wnow - _t_start) / 60.0,
+                    }
+                    for _wj, _wnm in enumerate(REWARD_NAMES):
+                        _wlog[f"mean_{_wnm}"] = float(LAST_FULL_REWARD[_wj])
+                    _t_prev = _wnow
+                    wb.log(_wlog)
+                except Exception:
+                    pass
+        print(f"[popart-init] {_pie} random-plan episodes -> "
+              f"{len(_seed_rows)}/{_pie} usable terminal measurements",
+              flush=True)
+        # >= 2 rows or keep the zero init: a single row has variance 0 on every
+        # channel, so it would seed nothing but a mean and leave every sigma on
+        # the floor -- the exact failure this block exists to remove.
+        if len(_seed_rows) >= 2:
+            _R = np.stack(_seed_rows)
+            popart.seed(_R)
+            _mu0 = _R.mean(axis=0)
+            _sd0 = _R.std(axis=0)
+            _sd_eff = np.maximum(_sd0, np.asarray(popart.sigma_min, np.float64))
+            _zvar = (((_R - _mu0) / _sd_eff) ** 2).mean(axis=0)
+            _cfg = {}
+            for _k, _nm in enumerate(CH):
+                if _sd0[_k] <= 1e-12:
+                    _fl = "  <-- CONSTANT in the sample, left COLD"
+                elif _sd0[_k] < _sd_eff[_k]:
+                    _fl = "  <-- sigma FLOORED by popart sigma_min"
+                else:
+                    _fl = ""
+                print(f"[popart-init]   {_nm}: mu={_mu0[_k]:.6g} "
+                      f"sigma={_sd0[_k]:.6g} norm_var={_zvar[_k]:.4f}{_fl}",
+                      flush=True)
+                _cfg[f"popart_init_mu_{_nm}"] = float(_mu0[_k])
+                _cfg[f"popart_init_sigma_{_nm}"] = float(_sd0[_k])
+                _cfg[f"popart_init_normvar_{_nm}"] = float(_zvar[_k])
+            _cfg["popart_init_samples"] = int(_R.shape[0])
+            if wb is not None:
+                try:
+                    wb.config.update(_cfg, allow_val_change=True)
+                except Exception:
+                    pass
+        else:
+            print("[popart-init] too few usable measurements; keeping zero "
+                  "init", flush=True)
+
     MAXTOK = 0
     # --- 5. loop: act/search -> measure -> popart -> pareto -> train ---
     while n_meas < args.total_measurements:
@@ -1063,7 +1165,7 @@ def _run(args) -> int:
                 _now = time.time()
                 _log = {
                     # --- AZ-native ---
-                    "ep": ep, "n_meas": n_meas, "loss": L,
+                    "ep": ep, "n_meas": n_meas,
                     "best_scalar": best["scalar"],
                     "best_lat_us": b[0] / 1e3, "best_cos": b[3],
                     "this_lat_us": raw[0] / 1e3,
@@ -1080,6 +1182,12 @@ def _run(args) -> int:
                     "time/wall_seconds": _now - _t_start,
                     "time/wall_minutes": (_now - _t_start) / 60.0,
                 }
+                # B3: while the PopArt gate (popart.n_updates < 8) still
+                # holds no train step runs and L is NaN. wandb records NaN as a
+                # DATA POINT, which wrecks the loss panel's y-range for the
+                # whole run; omitting the key leaves a clean gap instead.
+                if math.isfinite(L):
+                    _log["loss"] = float(L)
                 for _j, _nm in enumerate(REWARD_NAMES):
                     _log[f"mean_{_nm}"] = float(LAST_FULL_REWARD[_j])
                 # --- approximation telemetry (identical keys to the PPO runs)

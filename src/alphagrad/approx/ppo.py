@@ -2541,7 +2541,11 @@ def make_argparser() -> argparse.ArgumentParser:
         "--set-pointer-blocks", type=int, default=2,
         help="Number of Set-Transformer blocks used by --set-pointer.")
     p.add_argument(
-        "--popart-init-episodes", type=int, default=0,
+        # Default 3, not 0: every launcher passed 3 explicitly, so an unflagged
+        # run was silently unseeded and defined its scale from whatever the
+        # untrained policy happened to produce. az_gumbel's flag of the same
+        # name has the same default.
+        "--popart-init-episodes", type=int, default=3,
         help="Warm-start PopArt (mu, sigma) from this many rollouts of RANDOM "
              "but VALID plans before training. 0 disables. The rollouts use "
              "the real legality masks and the real measurement path, so the "
@@ -6376,7 +6380,7 @@ def main():
 
     def host_log(
         ep, all_rets, actions_pack, mean_r, mets, diag_pack=None,
-        popart_stats=None, attn_entropy=None,
+        popart_stats=None, attn_entropy=None, warmup=False,
     ):
         ep = int(ep)
         all_rets = np.array(all_rets)  # (num_envs, NUM_REWARDS)
@@ -6976,6 +6980,24 @@ def main():
                 print("[entropy] " + " ".join(
                     f"{k.split('/')[-1]}={float(v):.4g}"
                     for k, v in sorted(_ek.items())), flush=True)
+        if warmup:
+            # POPART WARM-START episode. The rollout, the measurements and the
+            # collapse counters are REAL and belong on their panels -- and the
+            # wandb step counter must advance, so these episodes are not a
+            # silent gap in every curve. But NO gradient step ran, so every key
+            # derived from the loss is undefined. Drop them entirely rather
+            # than logging NaN: wandb records NaN as a DATA POINT and it wrecks
+            # the panel's y-range for the whole run, while an absent key leaves
+            # a clean gap. (This is the same rule az_gumbel applies to "loss"
+            # while its PopArt gate still holds.)
+            _drop_exact = ("KL divergence", "entropy evolution",
+                           "explained variance", "ppo loss", "value loss",
+                           "total loss", "loss")
+            for _k in list(log_dict):
+                if _k in _drop_exact or _k.startswith(
+                        ("kl/", "ent/", "entropy/", "ratio/")):
+                    log_dict.pop(_k, None)
+            log_dict["popart_init/warmup_episode"] = 1
         wandb.log(log_dict)
 
         # Per-episode memory + JIT-cache diagnostic. Off by default; flip on
@@ -7278,7 +7300,7 @@ def main():
             for _wi in range(int(args.popart_init_episodes)):
                 _wkey, key = jrand.split(key)
                 _wstates = reset_envs(env_episode)
-                _, _wtraj, _ = rollout_fn(
+                _wend, _wtraj, _wtot = rollout_fn(
                     agent, env_episode, num_valid, _wstates,
                     jrand.split(_wkey, num_envs), vertex_features,
                     preferences_per_env, stage_override, stage_pin_rules,
@@ -7313,6 +7335,35 @@ def main():
                     _g[:, _t, :] = _run
                 _wG.append(_g.reshape(-1, _g.shape[-1]))
                 _wlive.append(_wl.reshape(-1))
+                # Log this warm-up episode like any other one, minus every
+                # gradient-derived key (see host_log's `warmup` branch). NaN
+                # metrics are passed only so the tuple shape is uniform; they
+                # are dropped before the wandb call, never logged.
+                _wmets = (
+                    (float("nan"),) * 9
+                    + (np.full((7,), np.nan), np.full((6,), np.nan))
+                )
+                host_log(
+                    ep,
+                    _wtot,
+                    (
+                        _wtraj.vertex_idx,
+                        _wtraj.pair_seq,
+                        _wtraj.factor_seq,
+                        _wtraj.micro_op_seq,
+                        _wtraj.micro_i_seq,
+                        _wtraj.micro_j_seq,
+                        _wtraj.micro_factor_seq,
+                        _wtraj.micro_compress_kind_seq,
+                        _wtraj.micro_quant_dtype_seq,
+                        _wend.face_specs,
+                        _wend.face_skips,
+                    ),
+                    jnp.mean(_wtot, axis=0),
+                    _wmets,
+                    None,
+                    warmup=True,
+                )
             _R = np.concatenate(_wG, axis=0)
             _live_m = np.concatenate(_wlive, axis=0)
             _ok = _live_m & np.isfinite(_R).all(axis=1)

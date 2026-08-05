@@ -90,7 +90,13 @@ class PopArtStats:
         # ~9 decades and the second moment squares that).
         self._mu_acc = np.zeros(self.num_channels, dtype=np.float64)
         self._nu_acc = np.zeros(self.num_channels, dtype=np.float64)
-        self._w = 0.0
+        # PER-CHANNEL debias weight (was a scalar). ``update`` drives every
+        # channel with the same beta, so all entries stay numerically identical
+        # and the vector form is a no-op there; the vector exists so
+        # :meth:`seed` can warm SOME channels and leave the constant ones COLD
+        # (w == 0), which is what makes the debiased EMA still adopt their
+        # first real batch exactly.
+        self._w = np.zeros(self.num_channels, dtype=np.float64)
         self.n_updates = 0
         # Public stats. Init (0, 1): normalisation is an exact no-op
         # until the first update.
@@ -136,6 +142,8 @@ class PopArtStats:
             targets = np.clip(targets, _lo[None, :], _hi[None, :])
         self._mu_acc = (1.0 - b) * self._mu_acc + b * targets.mean(axis=0)
         self._nu_acc = (1.0 - b) * self._nu_acc + b * (targets ** 2).mean(axis=0)
+        # Elementwise; >= b > 0 for every channel after this line, so the
+        # divisions below are safe even for a channel seed() left cold.
         self._w = (1.0 - b) * self._w + b
         mu = self._mu_acc / self._w
         var = np.maximum(self._nu_acc / self._w - mu ** 2, 0.0)
@@ -144,6 +152,49 @@ class PopArtStats:
         self.sigma = sigma.astype(np.float32)
         self.n_updates += 1
         return old_mu, old_sigma, self.mu.copy(), self.sigma.copy()
+
+    def seed(self, targets: np.ndarray) -> None:
+        """WARM-START the accumulators from a batch of raw value targets.
+
+        ``targets`` is ``(M, K)``. Per channel this sets ``mu = mean(x)``,
+        ``nu = mean(x**2)`` and the debias weight to 1.0 -- but ONLY where the
+        sample actually has spread (``std(x) > 1e-12``).
+
+        A CONSTANT channel is not seed-able and must stay COLD. Random plans
+        routinely return e.g. cosine == 0 on every episode (an all-zero
+        Jacobian and a half-destroyed one both read ~0), so that channel's
+        sample carries no scale information. Stamping w=1 on it anyway would
+        claim the accumulator is already warm, and the debiasing in
+        :meth:`update` would then let the FIRST real measurement move mu by
+        only beta instead of adopting the batch exactly -- the seed would
+        actively slow down learning the one channel it knows nothing about.
+
+        Does NOT touch ``n_updates``: seeding is not an EMA step, and
+        consumers gate their first training step on the number of REAL
+        updates. Mirrors ppo.py's `--popart-init-episodes` block exactly.
+        """
+        targets = np.asarray(targets, dtype=np.float64)
+        if targets.ndim != 2 or targets.shape[1] != self.num_channels:
+            raise ValueError(
+                f"targets must be (M, {self.num_channels}), got "
+                f"{targets.shape}",
+            )
+        if targets.shape[0] < 1:
+            raise ValueError("PopArtStats.seed: empty targets")
+        if not np.isfinite(targets).all():
+            raise ValueError("PopArtStats.seed: non-finite targets")
+        mu0 = targets.mean(axis=0)
+        nu0 = (targets ** 2).mean(axis=0)
+        warm = targets.std(axis=0) > 1e-12
+        self._mu_acc = np.where(warm, mu0, 0.0)
+        self._nu_acc = np.where(warm, nu0, 0.0)
+        self._w = warm.astype(np.float64)
+        # Public stats consistent with the accumulators. A cold channel keeps
+        # the (0, 1) init, i.e. normalisation stays an exact no-op there.
+        var = np.maximum(nu0 - mu0 ** 2, 0.0)
+        sigma = np.clip(np.sqrt(var), self.sigma_min, self.sigma_max)
+        self.mu = np.where(warm, mu0, 0.0).astype(np.float32)
+        self.sigma = np.where(warm, sigma, 1.0).astype(np.float32)
 
 
 def _final_linear_index(seq_layers) -> int:
