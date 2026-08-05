@@ -94,9 +94,7 @@ from alphagrad.approx.env import (
     MAX_AXES_PER_VERTEX,
     MAX_FACES as ENV_MAX_FACES,
     MAX_RULES_PER_VERTEX,
-    MAX_TOKENS,
     MAX_DELTA_TOKENS,
-    MAX_BASE_TOKENS,
     consume_token_length_stats,
     COMPUTE_REWARD_INDICES,
     NUM_AXIS_PAIRS,
@@ -522,64 +520,24 @@ class EncCarry(NamedTuple):
 _FACE_MASK_FAILS = [0]
 
 
-def _stream_len(tokens):
-    """Number of real tokens in an append-only buffer (pad id is 0).
-
-    HAZARD (2026-08-04): id 0 is not a reserved pad — it is the vocabulary's
-    first entry, the literal ``'-'`` that graphax's ``int_to_base`` emits for
-    any NEGATIVE value (graphax/jaxpr.py). If a traced op param or literal in
-    the graph is negative, every occurrence is counted as padding here, the
-    delta window comes up short by that many tokens, and the policy silently
-    reads a truncated state. The append-only stream is contiguous, so a real
-    stream can only have zeros in its PADDING TAIL: assert that, cheaply, under
-    ALPHAGRAD_ASSERT_STREAM_LEN=1 (off by default — it forces a device sync).
-    """
-    nz = (tokens != 0).astype(jnp.int32)
-    n = jnp.sum(nz)
-    if os.environ.get("ALPHAGRAD_ASSERT_STREAM_LEN", "0") == "1":
-        # A contiguous prefix has all its non-zeros before index n.
-        contiguous = jnp.all(nz[: jnp.maximum(n, 1)] == 1)
-        jax.debug.callback(_warn_noncontiguous_stream, contiguous, n)
-    return n
-
-
-_STREAM_LEN_WARNED: list = []
-
-
-def _warn_noncontiguous_stream(contiguous, n):
-    """Host-side one-shot warning for the id-0 collision described above."""
-    try:
-        if bool(contiguous) or _STREAM_LEN_WARNED:
-            return
-    except Exception:
-        return
-    _STREAM_LEN_WARNED.append(1)
-    print(
-        "[tokens] WARNING token id 0 appears INSIDE the stream (not only in the "
-        f"padding tail; counted length={int(n)}). id 0 is the literal '-' that "
-        "graphax emits for negative values, so _stream_len undercounts and the "
-        "delta window is short. The observation is silently truncated.",
-        flush=True)
-
-
 # ---------------------------------------------------------------------------
-# DELTA BUFFERS (ALPHAGRAD_DELTA_TOKENS=1; default OFF -- stage 1 adds the
-# path, keeps the old one, and proves they agree; see
-# tests/delta_buffer_equivalence_test.py).
+# DELTA BUFFERS (stage 2: the ONLY path).
 #
-# Nothing in the pipeline ever re-reads earlier tokens: the rollout consumes
-# `stream[pos : pos + delta]` and the loss re-derives the SAME window from the
-# stored per-step carry. The growing (MAX_TOKENS,) buffer is an artefact of
-# the cursor being ABSOLUTE. These helpers give the vertex stream the same
-# shape the FACE stream already has -- a standalone buffer read from 0 with an
-# explicit count (`_face_encode` / `_face_replay` pass ``start=0``).
+# Nothing in the pipeline ever re-read earlier tokens -- the rollout consumed
+# `stream[pos : pos + delta]` and the loss re-derived the SAME window from the
+# stored per-step carry -- so the growing (MAX_TOKENS,) buffer was pure
+# artefact of the cursor being ABSOLUTE. The env now emits each step's delta
+# DIRECTLY, with the tokenizer's own length (`EnvConfig.delta_obs`), and the
+# base stream is a host-side constant (`env.base_observation()`). The vertex
+# stream therefore has exactly the shape the FACE stream always had: a
+# standalone buffer read from 0 with an explicit count.
+#
+# `_stream_end` / `_window_copy` below are no longer on any live path. They
+# are the REFERENCE DEFINITION of the window the old absolute cursor read,
+# and tests/delta_buffer_equivalence_test.py drives them against real
+# tokenizer streams to keep that description pinned to the buffers the env
+# now emits. Deleting them would delete the proof, not dead code.
 # ---------------------------------------------------------------------------
-
-
-def _use_delta_buffers() -> bool:
-    """Is the per-step delta-buffer path on? Read per trace (not cached at
-    import) so a test can flip it without reloading the module."""
-    return os.environ.get("ALPHAGRAD_DELTA_TOKENS", "0") == "1"
 
 
 def _stream_end(tokens):
@@ -596,20 +554,6 @@ def _stream_end(tokens):
     n = tokens.shape[-1]
     last = n - 1 - jnp.argmax(nz[::-1])
     return jnp.where(jnp.any(nz), last + 1, 0).astype(jnp.int32)
-
-
-def _assert_base_fits(count):
-    """Host guard for the base buffer. Clipping the base would desync the
-    encoder's recurrence from the stream for the WHOLE episode, so this
-    raises rather than truncating."""
-    # np.max, not int(): under vmap the debug callback may be handed the
-    # whole batched count rather than one env's.
-    c = int(np.max(np.asarray(count)))
-    if c > MAX_BASE_TOKENS:
-        raise ValueError(
-            f"base token stream is {c} tokens > MAX_BASE_TOKENS="
-            f"{MAX_BASE_TOKENS}. Raise ALPHAGRAD_MAX_BASE_TOKENS."
-        )
 
 
 def _window_copy(tokens_buf, eqn_ids_buf, pos, count, width):
@@ -634,37 +578,7 @@ def _window_copy(tokens_buf, eqn_ids_buf, pos, count, width):
     return jnp.where(keep, toks, 0), jnp.where(keep, eqns, -1)
 
 
-def _zero_delta_buffer_fields():
-    """Degenerate stand-ins for the delta-buffer trajectory fields when the
-    path is off -- 4 bytes per step, uniform pytree structure.
-
-    WIDTH 1, NOT 0: ``common.batching.shuffle_and_batch`` reshapes every leaf
-    to ``(-1, *shape[2:])`` and jax computes ``size % prod(other_sizes)``, so a
-    zero-width leaf is an integer modulo by zero at the first minibatch.
-    """
-    return dict(
-        delta_tokens=jnp.zeros((1,), jnp.int32),
-        delta_eqns=-jnp.ones((1,), jnp.int32),
-        delta_count=jnp.zeros((), jnp.int32),
-    )
-
-
-def _zero_enc_carry_fields():
-    """Degenerate (0,)-shaped stand-ins for the incremental-encode trajectory
-    fields when the mode is off — zero memory, uniform pytree structure."""
-    z = jnp.zeros((0,), jnp.float32)
-    return dict(
-        enc_M=z, enc_I=z, enc_cumhist=z,
-        enc_nvalid=jnp.zeros((), jnp.float32),
-        enc_pos=jnp.zeros((), jnp.int32),
-        vmem_sums=z, vmem_counts=z,
-        delta_owner=jnp.zeros((), jnp.int32),
-    )
-
-
 class Trajectory(NamedTuple):
-    tokens: jax.Array
-    eqn_ids: jax.Array
     residual_state: jax.Array  # (V, embd_dim) at the start of this step
     preference: jax.Array  # (NUM_VALUE_HEADS,) — weights V_latency/V_mem/V_cos
     vertex_idx: jax.Array
@@ -732,14 +646,15 @@ class Trajectory(NamedTuple):
     # here were the storage that made any face width expensive.
     face_counts: jax.Array        # (MAX_FACES,) int32
     # THIS step's emission (the current vertex's contractions + approx
-    # echoes), sliced from next_state.tokens at the post-decision carry pos.
-    # It is NOT in `tokens` (that buffer is the PRE-step stream), and it is
+    # echoes) -- the NEXT state's delta, i.e. what the chosen elimination
+    # produced. Not the same buffer as `delta_tokens` below (that is the
+    # PREVIOUS step's delta, the one this step's carry consumes), and it is
     # what the face chunks concatenate to -- the loss scans it once from the
     # stored carry's continuation and pools between chunk boundaries.
     face_delta_tokens: jax.Array  # (MAX_DELTA_TOKENS,) int32
     face_delta_eqns: jax.Array    # (MAX_DELTA_TOKENS,) int32
-    # Phase 3b (--incremental-encode; degenerate (0,) shapes otherwise). The
-    # PRE-step encoder carry + vertex memory, and the delta's owner vertex —
+    # Phase 3b incremental encode (mandatory since stage 2). The PRE-step
+    # encoder carry + vertex memory, and the delta's owner vertex —
     # everything the loss needs to re-derive this step's encoding by
     # extending with the delta tokens only.
     enc_M: jax.Array        # (L, H, d, d)
@@ -749,11 +664,10 @@ class Trajectory(NamedTuple):
     enc_pos: jax.Array      # () int32
     vmem_sums: jax.Array    # (V+1, E)
     vmem_counts: jax.Array  # (V+1,)
-    # STAGE 1 delta buffers (ALPHAGRAD_DELTA_TOKENS=1; degenerate width-1
-    # otherwise). THIS step's delta as a standalone buffer with a RELATIVE
-    # cursor plus its EXPLICIT length -- the same shape the face stream
-    # already stores. It replaces reading `tokens` at an absolute cursor;
-    # stage 2 deletes `tokens`/`eqn_ids` from the trajectory entirely.
+    # THIS step's delta, straight off the env, as a standalone buffer read
+    # from 0 plus its EXACT length -- the same shape the face stream stores.
+    # This IS the observation: there is no episode-wide token buffer any
+    # more, and no absolute cursor with which to index one.
     delta_tokens: jax.Array   # (MAX_DELTA_TOKENS,) int32
     delta_eqns: jax.Array     # (MAX_DELTA_TOKENS,) int32
     delta_count: jax.Array    # () int32
@@ -763,8 +677,6 @@ class Trajectory(NamedTuple):
 
 
 class TrainBatch(NamedTuple):
-    tokens: jax.Array
-    eqn_ids: jax.Array
     residual_state: jax.Array
     preference: jax.Array
     vertex_idx: jax.Array
@@ -2545,7 +2457,7 @@ def make_argparser() -> argparse.ArgumentParser:
         "projection of a single per-vertex rule list.",
     )
     p.add_argument(
-        "--incremental-encode", action="store_true",
+        "--incremental-encode", action="store_true",  # mandatory (stage 2)
         help="Phase 3b: autoregressive O(delta) encoding. The palimpsa carry "
         "rides the rollout scan (base stream consumed once, each step extends "
         "by its delta tokens only); pointer/value heads read from the "
@@ -3223,7 +3135,12 @@ def _build_agent(
     _force_pe = os.environ.get("ALPHAGRAD_POS_ENC", "auto").strip().lower()
     _use_pe = (_policy == "transformer") if _force_pe == "auto" else (
         _force_pe in ("1", "true", "yes"))
-    pos_enc = PositionalEncoder(args.embd_dim, MAX_TOKENS) if _use_pe else None
+    # LEGACY absolute-PE table, transformer backbone only. Unreachable on the
+    # live path (incremental encode is mandatory, requires palimpsa, and
+    # rejects ALPHAGRAD_POS_ENC=1); sized by its own knob so no part of the
+    # model depends on the deleted full-stream budget.
+    _pe_len = int(os.environ.get("ALPHAGRAD_POS_ENC_LEN", "8192"))
+    pos_enc = PositionalEncoder(args.embd_dim, _pe_len) if _use_pe else None
     print(f"[alphagrad] positional encoding: {'ON' if _use_pe else 'OFF'} "
           f"(backbone={_policy})", flush=True)
     if _policy == "palimpsa":
@@ -3923,31 +3840,39 @@ def main():
     # carry is a CAUSAL recurrence: it needs the unidirectional palimpsa
     # backbone (no pos-enc, no bidirectional second pass) and the append-only
     # token stream (a re-traced stream has no prefix property to extend).
-    if getattr(args, "incremental_encode", False):
-        _pol = os.environ.get("ALPHAGRAD_POLICY", "transformer").strip().lower()
-        if _pol != "palimpsa":
-            raise ValueError(
-                "--incremental-encode requires ALPHAGRAD_POLICY=palimpsa "
-                f"(causal); got {_pol!r} (palimpsa_bi's reverse pass cannot "
-                "ride a causal carry, and the transformer needs absolute "
-                "positions)."
-            )
-        if os.environ.get("ALPHAGRAD_POS_ENC", "auto").strip().lower() in (
-            "1", "true", "yes"
-        ):
-            raise ValueError(
-                "--incremental-encode is incompatible with ALPHAGRAD_POS_ENC=1 "
-                "(absolute positions have no incremental analogue)."
-            )
-        if os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "0") != "1":
-            raise ValueError(
-                "--incremental-encode requires ALPHAGRAD_INCREMENTAL_TOKENS=1 "
-                "(the append-only stream is what the carry extends)."
-            )
-        if not args.dynamic_substeps:
-            raise ValueError(
-                "--incremental-encode is only wired for --dynamic-substeps."
-            )
+    #
+    # STAGE 2: no longer optional. The full-stream observation, and with it
+    # the non-incremental rollout and loss, is gone -- the env emits one
+    # DELTA per step and only the carry can consume that. The CLI flag stays
+    # for launcher compatibility; the preconditions are now requirements.
+    args.incremental_encode = True
+    _pol = os.environ.get("ALPHAGRAD_POLICY", "transformer").strip().lower()
+    if _pol != "palimpsa":
+        raise ValueError(
+            "the delta observation requires ALPHAGRAD_POLICY=palimpsa "
+            f"(causal); got {_pol!r} (palimpsa_bi's reverse pass cannot "
+            "ride a causal carry, and the transformer needs absolute "
+            "positions)."
+        )
+    if os.environ.get("ALPHAGRAD_POS_ENC", "auto").strip().lower() in (
+        "1", "true", "yes"
+    ):
+        raise ValueError(
+            "the delta observation is incompatible with "
+            "ALPHAGRAD_POS_ENC=1 (there is no absolute position to encode: "
+            "the policy never sees the whole stream)."
+        )
+    if os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "0") != "1":
+        raise ValueError(
+            "the delta observation requires "
+            "ALPHAGRAD_INCREMENTAL_TOKENS=1 (a per-step DELTA only exists "
+            "under the append-only tokenizer; the extract_jaxpr path "
+            "re-tokenizes the whole Jacobian every step)."
+        )
+    if not args.dynamic_substeps:
+        raise ValueError(
+            "the delta observation is only wired for --dynamic-substeps."
+        )
 
     main_device = _resolve_main_device(args)
     if args.no_jit:
@@ -4050,7 +3975,22 @@ def main():
         per_face=bool(args.per_face or args.face_actions),
         measure_grad=bool(args.measure_grad),
         terminal_rewards_only=args.terminal_rewards_only,
+        # STAGE 2: emit the per-step token DELTA, not the growing stream.
+        delta_obs=True,
     )
+
+    # THE BASE STREAM, once, on the host. `len(base_tokens())` depends only on
+    # the jaxpr -- not on the elimination order -- so this is a constant every
+    # env and every episode shares, and its length is the tokenizer's own
+    # rather than a device-side non-zero count over a padded buffer (which is
+    # what token id 0, the literal '-', used to corrupt). Sliced to its exact
+    # length, so the base encode scan is exactly as long as the base is.
+    _BASE_TOK, _BASE_EQN, _BASE_N = env.base_observation()
+    _BASE_W = max(int(_BASE_N), 1)
+    _BASE_TOK = _BASE_TOK[:_BASE_W]
+    _BASE_EQN = _BASE_EQN[:_BASE_W]
+    print(f"[alphagrad] base token stream: {int(_BASE_N)} tokens "
+          f"(per-step delta budget {MAX_DELTA_TOKENS})", flush=True)
 
     # ---- --ray-measure: fan the measurement callback out over Ray actors ----
     if int(getattr(args, "ray_measure", 0) or 0) > 0:
@@ -4206,7 +4146,7 @@ def main():
             initial_timeout_s=float(args.ray_measure_timeout) * 4.0,
             warm_after=3,
             respawn_factory=_spawn,
-            max_tokens=int(MAX_TOKENS),
+            max_tokens=int(env.obs_width),
             num_rewards=int(NUM_REWARDS),
             cosine_sim_idx=int(REWARD_INDEX["cosine_sim"]),
             frob_residual_idx=int(REWARD_INDEX["frob_residual"]),
@@ -4833,8 +4773,6 @@ def main():
         init_residual = jnp.zeros((total_v, args.embd_dim), dtype=jnp.float32)
 
         encode_key, scan_key = jrand.split(keys[0], 2)
-        initial_tokens = None
-        initial_eqn_ids = None
 
         # Shapes for the unused trajectory branch. The Trajectory NamedTuple
         # carries both legacy and dynamic action fields so the rollout's
@@ -4883,43 +4821,23 @@ def main():
         _dyn_zero_quant_sign = jnp.ones((args.max_substeps,), dtype=jnp.int32)
         _dyn_zero_quant_logp = jnp.zeros((args.max_substeps,), dtype=jnp.float32)
 
-        # 3b: consume the initial base stream ONCE (window = MAX_TOKENS),
-        # fold its rows into the per-vertex memory (base eqn ids map to
-        # vertex slots positionally; structural/overflow → global slot),
-        # then each scan step extends by that step's delta only.
-        if getattr(args, "incremental_encode", False):
-            _enc0 = agent.carry_init()
-            if _use_delta_buffers():
-                # BASE BUFFER: the base tokenized jaxpr in a buffer sized for
-                # the base (MAX_BASE_TOKENS, measured distribution in env.py)
-                # instead of a MAX_TOKENS-wide window over the whole growing
-                # stream. The valid prefix is bitwise independent of the
-                # window (pad steps freeze the carry), so this is the same
-                # carry through a 4x shorter scan at 32768/8192.
-                _base_count = _stream_end(env_state.tokens)
-                jax.debug.callback(_assert_base_fits, _base_count)
-                _base_tok, _base_eqn = _window_copy(
-                    env_state.tokens, env_state.eqn_ids, 0, _base_count,
-                    MAX_BASE_TOKENS)
-                _enc1, _rows0, _valid0, _eqns0 = agent.encode_extend(
-                    _enc0, _base_tok, _base_eqn, _base_count,
-                    window=MAX_BASE_TOKENS, start=0,
-                )
-            else:
-                _base_count = _stream_len(env_state.tokens)
-                _enc1, _rows0, _valid0, _eqns0 = agent.encode_extend(
-                    _enc0, env_state.tokens, env_state.eqn_ids, _base_count,
-                    window=MAX_TOKENS,
-                )
-            _base_ids = jnp.where(
-                (_eqns0 >= 0) & (_eqns0 < total_v), _eqns0, -1
-            )
-            _vs0 = jnp.zeros((total_v + 1, args.embd_dim), jnp.float32)
-            _vc0 = jnp.zeros((total_v + 1,), jnp.float32)
-            _vs0, _vc0 = _vmem.update_ids(_vs0, _vc0, _rows0, _base_ids, _valid0)
-            init_enc_state = (_enc1, _vs0, _vc0)
-        else:
-            init_enc_state = None
+        # Consume the base stream ONCE (a host-side constant of exactly
+        # _BASE_W tokens -- no window, no cursor, no padded scan), fold its
+        # rows into the per-vertex memory (base eqn ids map to vertex slots
+        # positionally; structural/overflow → global slot), then each scan
+        # step extends by that step's delta only.
+        _enc0 = agent.carry_init()
+        _enc1, _rows0, _valid0, _eqns0 = agent.encode_extend(
+            _enc0, _BASE_TOK, _BASE_EQN, _BASE_N,
+            window=_BASE_W, start=0,
+        )
+        _base_ids = jnp.where(
+            (_eqns0 >= 0) & (_eqns0 < total_v), _eqns0, -1
+        )
+        _vs0 = jnp.zeros((total_v + 1, args.embd_dim), jnp.float32)
+        _vc0 = jnp.zeros((total_v + 1,), jnp.float32)
+        _vs0, _vc0 = _vmem.update_ids(_vs0, _vc0, _rows0, _base_ids, _valid0)
+        init_enc_state = (_enc1, _vs0, _vc0)
 
         def step_fn(carry, k):
             state, residual_state, elim_order, enc_state = carry
@@ -4928,49 +4846,35 @@ def main():
                 state, vertex_valid_static, total_v, num_valid
             )
 
-            precomputed = None
-            if args.incremental_encode:
-                enc_carry, vmem_s, vmem_c = enc_state
-                # The delta appended since the carry's pos was emitted by the
-                # PREVIOUS step's elimination (empty at step 0 — the base
-                # stream is already consumed).
-                delta_owner = jnp.where(
-                    state.step_count > 0,
-                    elim_order[jnp.maximum(state.step_count - 1, 0)],
-                    jnp.array(-1, jnp.int32),
-                ).astype(jnp.int32)
-                if _use_delta_buffers():
-                    # PER-STEP DELTA BUFFER + RELATIVE cursor. `_stream_end`
-                    # (one past the last non-zero, not the non-zero COUNT) is
-                    # what keeps the length right when the delta contains the
-                    # literal '-' (token id 0).
-                    delta_count = _stream_end(state.tokens) - enc_carry.pos
-                    delta_tok, delta_eqn = _window_copy(
-                        state.tokens, state.eqn_ids, enc_carry.pos,
-                        delta_count, MAX_DELTA_TOKENS)
-                    enc_carry2, d_rows, d_valid, d_eqns = agent.encode_extend(
-                        enc_carry, delta_tok, delta_eqn, delta_count,
-                        window=MAX_DELTA_TOKENS, start=0,
-                    )
-                else:
-                    delta_count = _stream_len(state.tokens) - enc_carry.pos
-                    delta_tok = delta_eqn = None
-                    enc_carry2, d_rows, d_valid, d_eqns = agent.encode_extend(
-                        enc_carry, state.tokens, state.eqn_ids, delta_count,
-                        window=MAX_DELTA_TOKENS,
-                    )
-                d_ids = jnp.where(d_eqns >= 0, delta_owner, -1)
-                vmem_s2, vmem_c2 = _vmem.update_ids(
-                    vmem_s, vmem_c, d_rows, d_ids, d_valid
-                )
-                precomputed = agent.heads_from_memory(
-                    vmem_s2, vmem_c2,
-                    vertex_features=vertex_features,
-                    residual_state=residual_state,
-                    preference=(
-                        preference if args.preference_conditioned else None
-                    ),
-                )
+            enc_carry, vmem_s, vmem_c = enc_state
+            # THIS step's delta was emitted by the PREVIOUS step's elimination
+            # (empty at step 0 — the base stream is already consumed). It
+            # arrives from the env as its own buffer with its own exact
+            # count; nothing is sliced out of a growing stream.
+            delta_owner = jnp.where(
+                state.step_count > 0,
+                elim_order[jnp.maximum(state.step_count - 1, 0)],
+                jnp.array(-1, jnp.int32),
+            ).astype(jnp.int32)
+            delta_tok = state.delta_tokens
+            delta_eqn = state.delta_eqns
+            delta_count = state.delta_count
+            enc_carry2, d_rows, d_valid, d_eqns = agent.encode_extend(
+                enc_carry, delta_tok, delta_eqn, delta_count,
+                window=MAX_DELTA_TOKENS, start=0,
+            )
+            d_ids = jnp.where(d_eqns >= 0, delta_owner, -1)
+            vmem_s2, vmem_c2 = _vmem.update_ids(
+                vmem_s, vmem_c, d_rows, d_ids, d_valid
+            )
+            precomputed = agent.heads_from_memory(
+                vmem_s2, vmem_c2,
+                vertex_features=vertex_features,
+                residual_state=residual_state,
+                preference=(
+                    preference if args.preference_conditioned else None
+                ),
+            )
 
             face_chunk_fn = None
             face_count_fn = None
@@ -5041,14 +4945,16 @@ def main():
                     value,
                     v_context,
                 ) = agent.sample_action_dynamic(
-                    state.tokens,
+                    # No token argument: `precomputed` below IS the encoding,
+                    # derived from the carry plus this step's delta.
+                    None,
                     vertex_avail_mask,
                     state.axis_state,
                     state.axis_valid_mask,
                     factor_tables,
                     op_legality_override,
                     sample_key,
-                    eqn_ids=state.eqn_ids,
+                    eqn_ids=None,
                     vertex_features=vertex_features,
                     residual_state=residual_state,
                     preference=preference if args.preference_conditioned else None,
@@ -5060,8 +4966,7 @@ def main():
                     oracle_fn=oracle_one_fn,
                     face_chunk_fn=face_chunk_fn,
                     face_count_fn=face_count_fn,
-                    enc_carry=(enc_carry2 if args.incremental_encode
-                               else None),
+                    enc_carry=enc_carry2,
                 )
                 # Record this vertex in the elimination prefix for the next
                 # step's oracle replay.
@@ -5135,87 +5040,41 @@ def main():
             )
 
             pref_arg = preference if args.preference_conditioned else None
-            if args.incremental_encode:
-                # Bootstrap value at next_state: extend the post-decision
-                # carry by the delta the JUST-CHOSEN elimination emitted.
-                # This extension is recomputed by the next scan iteration
-                # (kept self-contained rather than threading heads across
-                # iterations); deltas are O(hundreds) of tokens, so the
-                # duplicate extend is cheap next to a full re-encode.
-                if _use_delta_buffers():
-                    nv_count = _stream_end(next_state.tokens) - enc_carry2.pos
-                    nv_tok, nv_eqn = _window_copy(
-                        next_state.tokens, next_state.eqn_ids,
-                        enc_carry2.pos, nv_count, MAX_DELTA_TOKENS)
-                    _, nv_rows, nv_valid, nv_eqns = agent.encode_extend(
-                        enc_carry2, nv_tok, nv_eqn, nv_count,
-                        window=MAX_DELTA_TOKENS, start=0,
-                    )
-                else:
-                    nv_count = _stream_len(next_state.tokens) - enc_carry2.pos
-                    _, nv_rows, nv_valid, nv_eqns = agent.encode_extend(
-                        enc_carry2, next_state.tokens, next_state.eqn_ids,
-                        nv_count, window=MAX_DELTA_TOKENS,
-                    )
-                nv_ids = jnp.where(nv_eqns >= 0, vertex_idx.astype(jnp.int32), -1)
-                nv_s, nv_c = _vmem.update_ids(
-                    vmem_s2, vmem_c2, nv_rows, nv_ids, nv_valid
-                )
-                _, _, next_value = agent.heads_from_memory(
-                    nv_s, nv_c,
-                    vertex_features=vertex_features,
-                    residual_state=new_residual,
-                    preference=pref_arg,
-                )
-            else:
-                next_value = (
-                    agent.value_for(
-                        next_state.tokens,
-                        eqn_ids=next_state.eqn_ids,
-                        vertex_features=vertex_features,
-                        residual_state=new_residual,
-                        preference=pref_arg,
-                        key=next_net_key,
-                    )
-                )
+            # Bootstrap value at next_state: extend the post-decision carry by
+            # the delta the JUST-CHOSEN elimination emitted -- which is
+            # exactly what next_state carries. This extension is recomputed by
+            # the next scan iteration (kept self-contained rather than
+            # threading heads across iterations); deltas are O(hundreds) of
+            # tokens, so the duplicate extend is cheap.
+            _, nv_rows, nv_valid, nv_eqns = agent.encode_extend(
+                enc_carry2, next_state.delta_tokens, next_state.delta_eqns,
+                next_state.delta_count, window=MAX_DELTA_TOKENS, start=0,
+            )
+            nv_ids = jnp.where(nv_eqns >= 0, vertex_idx.astype(jnp.int32), -1)
+            nv_s, nv_c = _vmem.update_ids(
+                vmem_s2, vmem_c2, nv_rows, nv_ids, nv_valid
+            )
+            _, _, next_value = agent.heads_from_memory(
+                nv_s, nv_c,
+                vertex_features=vertex_features,
+                residual_state=new_residual,
+                preference=pref_arg,
+            )
 
-            # In cache-encoding mode the trajectory's tokens/eqn_ids fields
-            # carry the *initial* episode tokens (constant across the
-            # rollout) so the loss path can encode_once + decode_from_cache
-            # against the same reference. In the legacy path they remain
-            # the per-step residual jaxpr tokens.
-            traj_tokens = (
-                state.tokens
-            ).astype(jnp.int32)
-            traj_eqn_ids = (
-                state.eqn_ids
-            ).astype(jnp.int32)
-
-            if args.incremental_encode:
-                # PRE-step snapshots (§7b): the carry/memory synced to the
-                # PREVIOUS step's stream — the loss re-derives this step's
-                # encoding by the same delta extension.
-                _enc_fields = dict(
-                    enc_M=enc_carry.M, enc_I=enc_carry.I,
-                    enc_cumhist=enc_carry.cumhist,
-                    enc_nvalid=enc_carry.nvalid, enc_pos=enc_carry.pos,
-                    vmem_sums=vmem_s, vmem_counts=vmem_c,
-                    delta_owner=delta_owner,
-                )
-                if _use_delta_buffers():
-                    _enc_fields.update(
-                        delta_tokens=delta_tok, delta_eqns=delta_eqn,
-                        delta_count=jnp.asarray(delta_count, jnp.int32),
-                    )
-                else:
-                    _enc_fields.update(_zero_delta_buffer_fields())
-            else:
-                _enc_fields = _zero_enc_carry_fields()
-                _enc_fields.update(_zero_delta_buffer_fields())
+            # PRE-step snapshots (§7b): the carry/memory synced to the
+            # PREVIOUS step's delta — the loss re-derives this step's
+            # encoding by the same delta extension.
+            _enc_fields = dict(
+                enc_M=enc_carry.M, enc_I=enc_carry.I,
+                enc_cumhist=enc_carry.cumhist,
+                enc_nvalid=enc_carry.nvalid, enc_pos=enc_carry.pos,
+                vmem_sums=vmem_s, vmem_counts=vmem_c,
+                delta_owner=delta_owner,
+                delta_tokens=delta_tok, delta_eqns=delta_eqn,
+                delta_count=jnp.asarray(delta_count, jnp.int32),
+            )
 
             transition = Trajectory(
-                tokens=traj_tokens,
-                eqn_ids=traj_eqn_ids,
                 residual_state=residual_state,
                 preference=preference.astype(jnp.float32),
                 vertex_idx=jnp.asarray(vertex_idx, dtype=jnp.int32),
@@ -5268,11 +5127,7 @@ def main():
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
             )
-            next_enc_state = (
-                (enc_carry2, vmem_s2, vmem_c2)
-                if args.incremental_encode
-                else enc_state
-            )
+            next_enc_state = (enc_carry2, vmem_s2, vmem_c2)
             return (
                 (next_state, new_residual, elim_order, next_enc_state),
                 (transition, raw_rewards),
@@ -5324,8 +5179,7 @@ def main():
             (lambda p: p) if args.preference_conditioned else (lambda _: None)
         )
 
-        cached_flat = None
-        keys = jrand.split(key, batch.tokens.shape[0])
+        keys = jrand.split(key, batch.vertex_idx.shape[0])
 
         actions = MicroAction(
             op_type=batch.micro_op_seq,
@@ -5357,11 +5211,13 @@ def main():
             else None
         )
 
-        def _eval_dyn(toks, eids, rs, pref, vidx, action, vmask, ax_st, ax_vm,
-                      cached, k, pv, cv, fa=None, fpv=None, fcv=None, fv=None,
+        def _eval_dyn(rs, pref, vidx, action, vmask, ax_st, ax_vm,
+                      k, pv, cv, fa=None, fpv=None, fcv=None, fv=None,
                       pc3=None, fch=None, fcy=None):
+            # No token arguments: `pc3` (the carry-derived heads) IS the
+            # encoding, exactly as on the rollout side.
             return agent.evaluate_action_dynamic(
-                toks,
+                None,
                 vidx,
                 action,
                 vmask,
@@ -5369,10 +5225,10 @@ def main():
                 ax_vm,
                 factor_tables,
                 k,
-                eqn_ids=eids,
+                eqn_ids=None,
                 vertex_features=vertex_features,
                 residual_state=rs,
-                cached_encoding=cached,
+                cached_encoding=None,
                 preference=pref_or_none(pref),
                 pair_valid=pv,
                 compress_valid=cv,
@@ -5388,210 +5244,74 @@ def main():
                 face_carry=fcy,
             )
 
-        if args.incremental_encode:
-            # 3b: re-derive each sample's encoding by extending its stored
-            # PRE-step carry with the delta tokens (gather-sliced from the
-            # stored stream at the carried pos), fold into the stored vertex
-            # memory, and run the heads — the exact computation the rollout
-            # sampled under, through CURRENT params (ratio 1 at epoch 0;
-            # gradient flows through the delta + heads, truncating at the
-            # stored carry by design).
-            _dbuf = _use_delta_buffers()
+        # Re-derive each sample's encoding by extending its stored
+        # PRE-step carry with the STORED delta buffer + count, fold into
+        # the stored vertex memory, and run the heads — the exact
+        # computation the rollout sampled under, through CURRENT params
+        # (ratio 1 at epoch 0; gradient flows through the delta + heads,
+        # truncating at the stored carry by design).
 
-            def _carry_heads(toks, eids, M, I, ch, nv, pos, owner, vs, vc,
-                             rs, pref, dtok, deqn, dcnt):
-                carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
-                if _dbuf:
-                    # The delta is STORED, with its length: the loss never
-                    # re-derives a window from the growing stream, so
-                    # `_stream_len`'s id-0 hazard cannot reach it at all.
-                    carry2, rows, valid, eqw = agent.encode_extend(
-                        carry, dtok, deqn, dcnt,
-                        window=MAX_DELTA_TOKENS, start=0,
-                    )
-                else:
-                    count = _stream_len(toks) - pos
-                    carry2, rows, valid, eqw = agent.encode_extend(
-                        carry, toks, eids, count, window=MAX_DELTA_TOKENS
-                    )
-                ids = jnp.where(eqw >= 0, owner, -1)
-                vs2, vc2 = _vmem.update_ids(vs, vc, rows, ids, valid)
-                # carry2 is where the sampling side carry branched: the
-                # stored pre-step carry advanced past the PREVIOUS delta.
-                # The face replay continues from it over the stored emission
-                # window. (The rows above are the previous delta's -- the
-                # WRONG tokens for face contexts; see face_delta_tokens.)
-                return agent.heads_from_memory(
-                    vs2, vc2,
-                    vertex_features=vertex_features,
-                    residual_state=rs,
-                    preference=pref_or_none(pref),
-                ) + (carry2,)
+        def _carry_heads(M, I, ch, nv, pos, owner, vs, vc,
+                         rs, pref, dtok, deqn, dcnt):
+            carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
+            # The delta is STORED, with its length. The loss re-derives no
+            # window from anything, so there is no length to get wrong.
+            carry2, rows, valid, eqw = agent.encode_extend(
+                carry, dtok, deqn, dcnt,
+                window=MAX_DELTA_TOKENS, start=0,
+            )
+            ids = jnp.where(eqw >= 0, owner, -1)
+            vs2, vc2 = _vmem.update_ids(vs, vc, rows, ids, valid)
+            # carry2 is where the sampling side carry branched: the
+            # stored pre-step carry advanced past the PREVIOUS delta.
+            # The face replay continues from it over the stored emission
+            # window. (The rows above are the previous delta's -- the
+            # WRONG tokens for face contexts; see face_delta_tokens.)
+            return agent.heads_from_memory(
+                vs2, vc2,
+                vertex_features=vertex_features,
+                residual_state=rs,
+                preference=pref_or_none(pref),
+            ) + (carry2,)
 
-            pc_logits, pc_ctx, pc_value, pc_carry = jax.vmap(_carry_heads)(
-                batch.tokens, batch.eqn_ids,
-                batch.enc_M, batch.enc_I, batch.enc_cumhist,
-                batch.enc_nvalid, batch.enc_pos, batch.delta_owner,
-                batch.vmem_sums, batch.vmem_counts,
-                batch.residual_state, batch.preference,
-                batch.delta_tokens, batch.delta_eqns, batch.delta_count,
-            )
-            (
-                log_probs,
-                entropies,
-                values,
-                new_vertex_dist,
-                sub_lengths,
-                new_op_dists,
-                new_i_dists,
-                new_j_dists,
-                new_exp_dists,
-                new_kind_dists,
-                new_quant_logp,
-                face_ents,
-            ) = (
-                jax.vmap(
-                    lambda toks, eids, rs, pref, vidx, action, vmask, ax_st,
-                    ax_vm, k, pv, cv, fa, fpv, fcv, fv, pl, pc, pvl,
-                    fct, fdt, fde, cy:
-                    _eval_dyn(
-                        toks, eids, rs, pref, vidx, action, vmask, ax_st,
-                        ax_vm, None, k, pv, cv, fa, fpv, fcv, fv,
-                        pc3=(pl, pc, pvl),
-                        # Chunk lengths + THIS step's emission window + the
-                        # branch-point carry: everything the behaviour
-                        # policy's face contexts were built from. Anything
-                        # else and the ratio is not 1.
-                        fch=((fct, fdt, fde) if _LIVE_FACES is not None
-                             else None),
-                        fcy=(cy if _LIVE_FACES is not None else None),
-                    )
-                )(
-                    batch.tokens,
-                    batch.eqn_ids,
-                    batch.residual_state,
-                    batch.preference,
-                    batch.vertex_idx,
-                    actions,
-                    batch.vertex_avail_mask,
-                    batch.axis_state,
-                    batch.axis_valid_mask,
-                    keys,
-                    batch.micro_pair_valid,
-                    batch.micro_compress_valid,
-                    face_actions_b,
-                    batch.face_pair_valid,
-                    batch.face_comp_valid,
-                    batch.face_valid,
-                    pc_logits, pc_ctx, pc_value,
-                    batch.face_counts,
-                    batch.face_delta_tokens, batch.face_delta_eqns,
-                    pc_carry,
+        pc_logits, pc_ctx, pc_value, pc_carry = jax.vmap(_carry_heads)(
+            batch.enc_M, batch.enc_I, batch.enc_cumhist,
+            batch.enc_nvalid, batch.enc_pos, batch.delta_owner,
+            batch.vmem_sums, batch.vmem_counts,
+            batch.residual_state, batch.preference,
+            batch.delta_tokens, batch.delta_eqns, batch.delta_count,
+        )
+        (
+            log_probs,
+            entropies,
+            values,
+            new_vertex_dist,
+            sub_lengths,
+            new_op_dists,
+            new_i_dists,
+            new_j_dists,
+            new_exp_dists,
+            new_kind_dists,
+            new_quant_logp,
+            face_ents,
+        ) = (
+            jax.vmap(
+                lambda rs, pref, vidx, action, vmask, ax_st,
+                ax_vm, k, pv, cv, fa, fpv, fcv, fv, pl, pc, pvl,
+                fct, fdt, fde, cy:
+                _eval_dyn(
+                    rs, pref, vidx, action, vmask, ax_st,
+                    ax_vm, k, pv, cv, fa, fpv, fcv, fv,
+                    pc3=(pl, pc, pvl),
+                    # Chunk lengths + THIS step's emission window + the
+                    # branch-point carry: everything the behaviour
+                    # policy's face contexts were built from. Anything
+                    # else and the ratio is not 1.
+                    fch=((fct, fdt, fde) if _LIVE_FACES is not None
+                         else None),
+                    fcy=(cy if _LIVE_FACES is not None else None),
                 )
-                if args.face_actions
-                else jax.vmap(
-                    lambda toks, eids, rs, pref, vidx, action, vmask, ax_st,
-                    ax_vm, k, pv, cv, pl, pc, pvl:
-                    _eval_dyn(
-                        toks, eids, rs, pref, vidx, action, vmask, ax_st,
-                        ax_vm, None, k, pv, cv, pc3=(pl, pc, pvl)
-                    )
-                )(
-                    batch.tokens,
-                    batch.eqn_ids,
-                    batch.residual_state,
-                    batch.preference,
-                    batch.vertex_idx,
-                    actions,
-                    batch.vertex_avail_mask,
-                    batch.axis_state,
-                    batch.axis_valid_mask,
-                    keys,
-                    batch.micro_pair_valid,
-                    batch.micro_compress_valid,
-                    pc_logits, pc_ctx, pc_value,
-                )
-            )
-        elif cached_flat is None:
-            (
-                log_probs,
-                entropies,
-                values,
-                new_vertex_dist,
-                sub_lengths,
-                new_op_dists,
-                new_i_dists,
-                new_j_dists,
-                new_exp_dists,
-                new_kind_dists,
-                new_quant_logp,
-                face_ents,
-            ) = (
-                jax.vmap(
-                    lambda toks, eids, rs, pref, vidx, action, vmask, ax_st,
-                    ax_vm, k, pv, cv, fa, fpv, fcv, fv:
-                    _eval_dyn(
-                        toks, eids, rs, pref, vidx, action, vmask, ax_st,
-                        ax_vm, None, k, pv, cv, fa, fpv, fcv, fv
-                    )
-                )(
-                    batch.tokens,
-                    batch.eqn_ids,
-                    batch.residual_state,
-                    batch.preference,
-                    batch.vertex_idx,
-                    actions,
-                    batch.vertex_avail_mask,
-                    batch.axis_state,
-                    batch.axis_valid_mask,
-                    keys,
-                    batch.micro_pair_valid,
-                    batch.micro_compress_valid,
-                    face_actions_b,
-                    batch.face_pair_valid,
-                    batch.face_comp_valid,
-                    batch.face_valid,
-                )
-                if args.face_actions
-                else jax.vmap(
-                    lambda toks, eids, rs, pref, vidx, action, vmask, ax_st,
-                    ax_vm, k, pv, cv:
-                    _eval_dyn(
-                        toks, eids, rs, pref, vidx, action, vmask, ax_st,
-                        ax_vm, None, k, pv, cv
-                    )
-                )(
-                    batch.tokens,
-                    batch.eqn_ids,
-                    batch.residual_state,
-                    batch.preference,
-                    batch.vertex_idx,
-                    actions,
-                    batch.vertex_avail_mask,
-                    batch.axis_state,
-                    batch.axis_valid_mask,
-                    keys,
-                    batch.micro_pair_valid,
-                    batch.micro_compress_valid,
-                )
-            )
-        else:
-            (
-                log_probs,
-                entropies,
-                values,
-                new_vertex_dist,
-                sub_lengths,
-                new_op_dists,
-                new_i_dists,
-                new_j_dists,
-                new_exp_dists,
-                new_kind_dists,
-                new_quant_logp,
-                face_ents,
-            ) = jax.vmap(_eval_dyn)(
-                batch.tokens,
-                batch.eqn_ids,
+            )(
                 batch.residual_state,
                 batch.preference,
                 batch.vertex_idx,
@@ -5599,11 +5319,40 @@ def main():
                 batch.vertex_avail_mask,
                 batch.axis_state,
                 batch.axis_valid_mask,
-                cached_flat,
                 keys,
                 batch.micro_pair_valid,
                 batch.micro_compress_valid,
+                face_actions_b,
+                batch.face_pair_valid,
+                batch.face_comp_valid,
+                batch.face_valid,
+                pc_logits, pc_ctx, pc_value,
+                batch.face_counts,
+                batch.face_delta_tokens, batch.face_delta_eqns,
+                pc_carry,
             )
+            if args.face_actions
+            else jax.vmap(
+                lambda rs, pref, vidx, action, vmask, ax_st,
+                ax_vm, k, pv, cv, pl, pc, pvl:
+                _eval_dyn(
+                    rs, pref, vidx, action, vmask, ax_st,
+                    ax_vm, k, pv, cv, pc3=(pl, pc, pvl)
+                )
+            )(
+                batch.residual_state,
+                batch.preference,
+                batch.vertex_idx,
+                actions,
+                batch.vertex_avail_mask,
+                batch.axis_state,
+                batch.axis_valid_mask,
+                keys,
+                batch.micro_pair_valid,
+                batch.micro_compress_valid,
+                pc_logits, pc_ctx, pc_value,
+            )
+        )
 
         old_log_probs = jax.vmap(old_micro_log_prob_for_action)(
             batch.vertex_idx,
@@ -6162,8 +5911,6 @@ def main():
         # carry the actions; we add micro_*_dists alongside them so the
         # old log-prob computation can index them.)
         full_batch = TrainBatch(
-            tokens=traj.tokens,
-            eqn_ids=traj.eqn_ids,
             residual_state=traj.residual_state,
             preference=traj.preference,
             vertex_idx=traj.vertex_idx,
@@ -6458,10 +6205,15 @@ def main():
             _face_mean_valid,
         )
         if _ATTN_ENTROPY_ON:
+            # Reads the BASE buffer -- which is exactly what it read
+            # before: `traj.tokens[0, 0]` was env 0 at step 0, i.e. the reset
+            # state, i.e. the base stream inside a MAX_TOKENS-wide buffer.
+            # Same tokens, same eqn ids, no padding tail, and no dependence
+            # on a trajectory field that no longer exists.
             _attn_ent = attention_entropy_diagnostic(
                 agent,
-                traj.tokens[0, 0],
-                traj.eqn_ids[0, 0],
+                _BASE_TOK,
+                _BASE_EQN,
                 traj.axis_state[0, 0],
                 traj.axis_valid_mask[0, 0],
             )
@@ -7020,11 +6772,13 @@ def main():
         log_dict["tokenization/max_observed_len"] = trunc["max_observed_len"]
         log_dict["tokenization/overflow_sum_this_ep"] = trunc["overflow_sum"]
         # Token SIZE telemetry (not just loss). `delta_*` is one palimpsa
-        # call's width in the append-only path and is what should size
-        # ALPHAGRAD_MAX_DELTA_TOKENS; `stream_*` is the full re-read length
-        # that MAX_TOKENS has to cover while the full-buffer path is in use.
-        # Watch delta_max: incremental_token_delta RAISES rather than clips,
-        # because silently truncating a delta would desync the recurrence.
+        # call's width -- the ONLY observation the policy gets per step -- and
+        # is what must size ALPHAGRAD_MAX_DELTA_TOKENS. `stream_*` is now just
+        # the base length (logged once per episode by `base_observation`); the
+        # growing full stream MAX_TOKENS used to size is gone.
+        # WATCH delta_max: `env._delta_observation` CLIPS at
+        # MAX_DELTA_TOKENS, and the clipped tail is DROPPED, not deferred to
+        # the next step. tokenization/truncated_count counts exactly that.
         _tl = consume_token_length_stats()
         log_dict["tokens/stream_mean"] = _tl["stream_mean"]
         log_dict["tokens/stream_max"] = _tl["stream_max"]

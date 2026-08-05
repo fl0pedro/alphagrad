@@ -267,6 +267,68 @@ MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "1024"))
 # encoder's recurrence from the stream for the whole episode.
 MAX_BASE_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_BASE_TOKENS", "8192"))
 
+
+def _record_delta_truncation(raw_len: int) -> None:
+    """Same sink as ``_record_tokenization_truncation``, for the DELTA buffer.
+
+    Under ``delta_obs`` the observation is no longer clipped at MAX_TOKENS --
+    it is clipped at MAX_DELTA_TOKENS, per step. The wandb keys
+    (``tokenization/{truncated_count, overflow_sum_this_ep}``) keep their
+    meaning ("how often, and by how much, was the observation clipped");
+    only the budget they refer to changes.
+    """
+    if raw_len <= MAX_DELTA_TOKENS:
+        return
+    _TOKENIZATION_TRUNCATION_COUNT[0] += 1
+    _TOKENIZATION_TRUNCATION_OVERFLOW_SUM[0] += raw_len - MAX_DELTA_TOKENS
+    if raw_len > _TOKENIZATION_TRUNCATION_MAX_LEN[0]:
+        _TOKENIZATION_TRUNCATION_MAX_LEN[0] = raw_len
+    if not _TOKENIZATION_TRUNCATION_WARNED[0]:
+        import warnings
+        warnings.warn(
+            f"[alphagrad.approx.env] token DELTA truncated: {raw_len} > "
+            f"MAX_DELTA_TOKENS={MAX_DELTA_TOKENS}. Those tokens are DROPPED "
+            f"(they are not re-read at the next step -- the cursor is "
+            f"relative). Raise ALPHAGRAD_MAX_DELTA_TOKENS.",
+            stacklevel=2,
+        )
+        _TOKENIZATION_TRUNCATION_WARNED[0] = True
+
+
+def _delta_observation(stream, seg_ids, last_start):
+    """Wire form of ONE step's token delta: ``(1 + MAX_DELTA_TOKENS,)`` pair.
+
+    Slot 0 is a HEADER carrying the exact host-side token count; slots 1..
+    are the delta itself, pad-filled (0 for tokens, -1 for eqn ids). The
+    header rides in-band because the callback's output arity is shared with
+    the Ray measurement pool and the batched host shim -- one extra slot
+    changes no signature anywhere, and ``env.step`` splits it straight back
+    out into ``EnvState.delta_count`` / ``delta_tokens`` / ``delta_eqns``.
+
+    The count is the TOKENIZER'S OWN length. Nothing scans a padded buffer
+    for it, so token id 0 -- the literal '-' graphax emits for a negative
+    value, which occurs INTERIOR to real streams -- cannot make it short.
+    """
+    blk = stream[last_start:]
+    ids = seg_ids[last_start:]
+    n_raw = len(blk)
+    _record_delta_length(n_raw)
+    _record_delta_truncation(n_raw)
+    # CLIP, do not raise: the campaign runs in the clipping regime by design
+    # (nn256 deltas reach 5664 against MAX_DELTA_TOKENS=2048), and the old
+    # absolute-cursor path clipped too -- it just deferred the dropped tail to
+    # the NEXT step, where it was attributed to the wrong vertex.
+    n = min(n_raw, MAX_DELTA_TOKENS)
+    t = np.zeros((1 + MAX_DELTA_TOKENS,), dtype=np.int32)
+    e = np.full((1 + MAX_DELTA_TOKENS,), -1, dtype=np.int32)
+    t[0] = n
+    e[0] = n
+    if n:
+        t[1:1 + n] = np.asarray(blk[:n], dtype=np.int32)
+        e[1:1 + n] = np.asarray(ids[:n], dtype=np.int32)
+    return jnp.asarray(t), jnp.asarray(e)
+
+
 _INCR_TOK_CACHE: dict = {}
 _INCR_TOK_CACHE_CAP = 512
 
@@ -274,6 +336,17 @@ _INCR_TOK_CACHE_CAP = 512
 def incremental_token_delta(jaxpr, argnums, consts, args, order_prefix,
                             vocab_size: int = 512):
     """Tokens ADDED by the last vertex of ``order_prefix`` (1-based ids).
+
+    NOT AN OBSERVATION PRODUCER -- ``tests/append_only_tokens_test.py`` is its
+    only caller, and it must stay that way unless it is fixed first. It
+    eliminates BARE (no per-vertex rules, no per-face transform dict), so its
+    delta describes the EXACT graph while the measurement builds the
+    APPROXIMATED one; and its cache key is ``(jaxpr, argnums, order_prefix)``,
+    which collapses two plans that differ only in their approximation
+    decisions onto one entry. Both are the divergence c83a6a1 fixed on the
+    LiveFaceStream side. The live observation path is
+    ``_incremental_stream_tokens`` (rules + face wires applied, both in the
+    cache key), and ``_delta_observation`` ships its last block.
 
     ``order_prefix`` == () returns the base-function tokens. Returns a python
     list of ints; the caller pads it to ``MAX_DELTA_TOKENS`` for the callback's
@@ -379,7 +452,13 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
     The stream for a prefix is a byte-wise prefix of the stream for any
     extension, so the cache extends the episode's tokenizer by ONE elimination
     per env step instead of re-tracing the whole Jacobian (``extract_jaxpr``)
-    every step. Extending MUTATES the tokenizer, so the parent entry is POPPED
+    every step.
+
+    Returns ``(stream, seg_ids, ft, last_start)``; ``last_start`` indexes the
+    first token of the LAST elimination's block, which is what ``delta_obs``
+    ships as the observation.
+
+    Extending MUTATES the tokenizer, so the parent entry is POPPED
     before extension — a sibling chain that misses takes the honest cold
     replay (same policy as ``incremental_token_delta``).
     """
@@ -403,9 +482,13 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
     if hit is not None:
         _INCR_STREAM_STATS["hit"] += 1
         return hit[1], hit[2], (hit[3] if len(hit) > 3 and hit[3]
-                                else ft_by_vertex)
+                                else ft_by_vertex), hit[4]
 
     tk, stream, seg_ids, done = None, None, None, 0
+    # Index in `stream` where the LAST elimination's block begins --
+    # i.e. exactly this step's DELTA. 0 for the empty prefix (the base
+    # IS the block). Rides the cache so a hit reports it too.
+    last_start = 0
     # ALPHAGRAD_UNIFIED_FACE_ENUM=1: the caller hands the raw wire rows and
     # this function builds the per-face dicts on the TOKENIZER's own
     # IncrementalJaxpr (tk.ij) right before each elimination — no second
@@ -455,6 +538,7 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
                 _INCR_STREAM_STATS["ext"] += 1
                 tk, stream, seg_ids, done = (
                     parent[0], list(parent[1]), list(parent[2]), cut)
+                last_start = parent[4]
                 if len(parent) > 3 and parent[3]:
                     ft_out = dict(parent[3])
                 break
@@ -486,6 +570,7 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
                 ft_out[int(v)] = _pf_v
         else:
             _pf_v = (ft_by_vertex or {}).get(int(v))
+        last_start = len(stream)
         stream += [int(t) for t in tk.eliminate(
             int(v), tok_rules_by_v.get(int(v), ()), _pf_v)]
         seg_ids += [int(g) for g in tk.last_eqn_ids()]
@@ -496,12 +581,12 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
         # become a parent (its last elimination differs from a longer cold
         # replay's view of the same vertex).
         _INCR_STREAM_STATS["nostore"] += 1
-        return stream, seg_ids, _ft_ret
+        return stream, seg_ids, _ft_ret, last_start
     if len(_INCR_STREAM_CACHE) > _INCR_STREAM_CACHE_CAP:
         _INCR_STREAM_CACHE.clear()
     _INCR_STREAM_CACHE[key] = (tk, stream, seg_ids,
-                               ft_out if _unified else None)
-    return stream, seg_ids, _ft_ret
+                               ft_out if _unified else None, last_start)
+    return stream, seg_ids, _ft_ret, last_start
 
 
 # ---------------------------------------------------------------------------
@@ -906,8 +991,18 @@ class EnvState(NamedTuple):
     # SKIPPED (graphax.SKIP_FACE — the path's contraction never happens).
     face_specs: Array  # (N, MAX_FACES, FACE_SLOTS, 3) int32
     face_skips: Array  # (N, MAX_FACES) int32
+    # LEGACY full-stream observation. Under ``EnvConfig.delta_obs`` these are
+    # degenerate ``(1,)`` sentinels and ``delta_*`` below carries the
+    # observation instead; every non-delta consumer (alpha0 / gdpo / gfn /
+    # mu0 / the ray workers) keeps the ``(MAX_TOKENS,)`` growing buffer.
     tokens: Array
     eqn_ids: Array  # (MAX_TOKENS,) int32; per-token equation ID, -1 for non-eqn tokens
+    # DELTA observation (``EnvConfig.delta_obs``): the tokens THIS step's
+    # elimination emitted, as a standalone buffer read from 0, plus their
+    # exact count. Degenerate ``(1,)`` / 0 when delta_obs is off.
+    delta_tokens: Array   # (MAX_DELTA_TOKENS,) int32
+    delta_eqns: Array     # (MAX_DELTA_TOKENS,) int32
+    delta_count: Array    # () int32
     # Per-vertex axis state — observation surface for the dynamic action
     # space. `axis_state` is a packed int32 array of (size, is_output,
     # is_compressed, group_id) per axis slot; `axis_valid_mask` flags
@@ -989,6 +1084,20 @@ class EnvConfig(NamedTuple):
     # the per-path SKIP falls out of it (a face where nothing is legal is
     # left exact).
     per_face: bool = False
+    # DELTA OBSERVATION (ppo.py; every other trainer leaves this False).
+    #
+    # False -- LEGACY: the callback returns the WHOLE append-only stream in a
+    # ``(MAX_TOKENS,)`` buffer and the policy re-reads it at an ABSOLUTE
+    # cursor. That buffer is the observation for alpha0 / gdpo / gfn / mu0 and
+    # the ray workers, which have no incremental encoder to hand a delta to.
+    #
+    # True -- the callback returns ONLY the tokens the LAST elimination
+    # emitted, in a ``(MAX_DELTA_TOKENS,)`` buffer with its EXACT host-side
+    # length, and the base stream is a host-side constant
+    # (``base_observation()``). Nothing downstream ever re-reads an earlier
+    # token, so the growing buffer -- and the id-0 length hazard that came
+    # with counting non-zeros in it -- is simply gone.
+    delta_obs: bool = False
 
 
 def _get_partials(order, sparsity_specs, stop):
@@ -2241,7 +2350,7 @@ def _callback(
         # which is exactly the relational-gate contract (same/earlier/later
         # comparisons, no embedding-table bound).
         _fe_inline = _unified_fe and _have_face_actions
-        stream, seg_ids, _ft_ret = _incremental_stream_tokens(
+        stream, seg_ids, _ft_ret, _last_start = _incremental_stream_tokens(
             config, consts, args, o_list, specs_list, tok_rules_by_v,
             ft_by_vertex=ft_by_vertex,
             honor_last_compress=_honor_mid_compress,
@@ -2261,14 +2370,33 @@ def _callback(
             # actually applied
             ft_by_vertex = _ft_ret or None
         _record_token_length(len(stream))
-        _record_tokenization_truncation(len(stream))
-        tokens = jnp.asarray(stream[:MAX_TOKENS], dtype=jnp.int32)
-        tokens = jnp.pad(tokens, (0, MAX_TOKENS - tokens.shape[0]))
-        _ids = np.full((MAX_TOKENS,), -1, dtype=np.int32)
-        _n_ids = min(len(seg_ids), MAX_TOKENS)
-        _ids[:_n_ids] = np.asarray(seg_ids[:_n_ids], dtype=np.int32)
-        eqn_ids = jnp.asarray(_ids)
+        if config.delta_obs:
+            if init:
+                raise ValueError(
+                    "delta_obs=True: the BASE stream is delivered by "
+                    "VertexEliminationEnv.base_observation() (host-side, "
+                    "exact length, order-independent), never through the "
+                    "reset callback -- clipping the base to "
+                    "MAX_DELTA_TOKENS would desync the encoder's recurrence "
+                    "for the whole episode."
+                )
+            tokens, eqn_ids = _delta_observation(stream, seg_ids, _last_start)
+        else:
+            _record_tokenization_truncation(len(stream))
+            tokens = jnp.asarray(stream[:MAX_TOKENS], dtype=jnp.int32)
+            tokens = jnp.pad(tokens, (0, MAX_TOKENS - tokens.shape[0]))
+            _ids = np.full((MAX_TOKENS,), -1, dtype=np.int32)
+            _n_ids = min(len(seg_ids), MAX_TOKENS)
+            _ids[:_n_ids] = np.asarray(seg_ids[:_n_ids], dtype=np.int32)
+            eqn_ids = jnp.asarray(_ids)
     else:
+        if config.delta_obs:
+            raise ValueError(
+                "delta_obs=True needs ALPHAGRAD_INCREMENTAL_TOKENS=1: the "
+                "per-step DELTA only exists under the append-only "
+                "tokenizer; the extract_jaxpr path re-tokenizes the whole "
+                "Jacobian and has no notion of a delta."
+            )
         ve = extract_jaxpr(
             config.jaxpr,
             config.argnums,
@@ -3176,6 +3304,7 @@ class VertexEliminationEnv:
         latency_inner_reps: int = 1,
         per_face: bool = False,
         measure_grad: bool = False,
+        delta_obs: bool = False,
         quality_rewarded=None,
         **_compat,
     ):
@@ -3228,6 +3357,7 @@ class VertexEliminationEnv:
             exec_on_gpu=exec_on_gpu,
             measure_latency=measure_latency,
             terminal_rewards_only=terminal_rewards_only,
+            delta_obs=bool(delta_obs),
         )
         return cls(
             config,
@@ -3303,6 +3433,7 @@ class VertexEliminationEnv:
         # drops ``args``/``consts`` (the actor's own env has its own
         # bound args) and re-packages ``eval_samples`` as a tuple.
         pool = self._remote_pool
+        _obs_w = self.obs_width
 
         if batched:
             def _remote_callback_batched(args, consts, order, specs,
@@ -3344,8 +3475,8 @@ class VertexEliminationEnv:
                     i for i in range(E)
                     if _term_local and _sti[i] >= int(ro[i].shape[0]))
                 _remote = [i for i in range(E) if i not in _local]
-                tk = np.zeros((E, MAX_TOKENS), np.int32)
-                ei = np.zeros((E, MAX_TOKENS), np.int32)
+                tk = np.zeros((E, _obs_w), np.int32)
+                ei = np.zeros((E, _obs_w), np.int32)
                 rw = np.zeros((E, NUM_REWARDS), np.float32)
                 if _remote:
                     tokens, eqn_ids, rewards, _sent = pool.evaluate_batch(
@@ -3396,12 +3527,71 @@ class VertexEliminationEnv:
         return _remote_callback
 
     @property
+    def obs_width(self) -> int:
+        """Width of the callback's token/eqn_id outputs.
+
+        ``1 + MAX_DELTA_TOKENS`` under ``delta_obs`` (header slot + delta),
+        ``MAX_TOKENS`` for the legacy full stream. The Ray measurement pool
+        preallocates its buffers at this width too (``CpuApproxPool(
+        max_tokens=...)``), so it must be read from the env, not assumed.
+        """
+        return (1 + MAX_DELTA_TOKENS if self.config.delta_obs else MAX_TOKENS)
+
+    @property
     def _callback_shape(self):
+        _w = self.obs_width
         return (
-            jax.ShapeDtypeStruct((MAX_TOKENS,), jnp.int32),
-            jax.ShapeDtypeStruct((MAX_TOKENS,), jnp.int32),
+            jax.ShapeDtypeStruct((_w,), jnp.int32),
+            jax.ShapeDtypeStruct((_w,), jnp.int32),
             jax.ShapeDtypeStruct((NUM_REWARDS,), jnp.float32),
         )
+
+    def base_observation(self):
+        """The BASE token stream as a standalone constant buffer.
+
+        ``len(base_tokens())`` depends only on the jaxpr, not on the
+        elimination order, so the base is the SAME array for every env and
+        every episode: compute it once, on the host, and share it. There is
+        no callback, no per-env copy, and the length is the tokenizer's own
+        -- not a device-side scan over a padded buffer, which is where the
+        id-0 undercount used to come from.
+
+        Returns ``(tokens, eqn_ids, count)`` with both buffers
+        ``(MAX_BASE_TOKENS,) int32`` and ``count`` a python int.
+        """
+        from graphax import IncrementalPathTokenizer
+
+        vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "248"))
+        tk = IncrementalPathTokenizer(
+            self.config.jaxpr, tuple(self.config.argnums),
+            list(self.consts), list(self.args), vocab_size=vocab,
+        )
+        toks = [int(t) for t in tk.base_tokens()]
+        ids = [int(g) for g in tk.last_eqn_ids()]
+        guard = os.environ.get("ALPHAGRAD_VOCAB_SIZE")
+        if guard is not None and tk.max_token_id() >= int(guard):
+            raise ValueError(
+                f"incremental token ids reach {tk.max_token_id()} but the "
+                f"policy embedding has only {guard} rows -- raise "
+                f"--vocab-size or lower ALPHAGRAD_INCR_TOKEN_VOCAB. (JAX "
+                f"CLAMPS an out-of-range gather, silently reading the wrong "
+                f"row.)"
+            )
+        n = len(toks)
+        if n > MAX_BASE_TOKENS:
+            raise ValueError(
+                f"base token stream is {n} tokens > MAX_BASE_TOKENS="
+                f"{MAX_BASE_TOKENS}. Raise ALPHAGRAD_MAX_BASE_TOKENS -- a "
+                f"CLIPPED base desyncs the encoder's recurrence from the "
+                f"stream for the whole episode."
+            )
+        _record_token_length(n)
+        t = np.zeros((MAX_BASE_TOKENS,), dtype=np.int32)
+        e = np.full((MAX_BASE_TOKENS,), -1, dtype=np.int32)
+        if n:
+            t[:n] = np.asarray(toks, dtype=np.int32)
+            e[:len(ids)] = np.asarray(ids, dtype=np.int32)
+        return jnp.asarray(t), jnp.asarray(e), n
 
     def reset(self, num_envs: int | None = None) -> EnvState:
         if num_envs is None:
@@ -3422,18 +3612,32 @@ class VertexEliminationEnv:
             (initial_order.shape[0], MAX_FACES), dtype=jnp.int32
         )
 
-        tokens, eqn_ids, _ = _env_callback(
-            self.tokenize(init=True),
-            self._callback_shape,
-            self.args,
-            self.consts,
-            initial_order,
-            initial_specs,
-            initial_face_specs,
-            initial_face_skips,
-            0,
-            *(self.eval_args_samples if self.eval_args_samples is not None else ()),
-        )
+        if self.config.delta_obs:
+            # The base stream is a host-side CONSTANT (base_observation()),
+            # not part of the state, so reset makes NO host callback: at
+            # step 0 nothing has been eliminated and the delta is empty.
+            tokens = jnp.zeros((1,), dtype=jnp.int32)
+            eqn_ids = jnp.zeros((1,), dtype=jnp.int32)
+            delta_tokens = jnp.zeros((MAX_DELTA_TOKENS,), dtype=jnp.int32)
+            delta_eqns = jnp.full((MAX_DELTA_TOKENS,), -1, dtype=jnp.int32)
+            delta_count = jnp.zeros((), dtype=jnp.int32)
+        else:
+            tokens, eqn_ids, _ = _env_callback(
+                self.tokenize(init=True),
+                self._callback_shape,
+                self.args,
+                self.consts,
+                initial_order,
+                initial_specs,
+                initial_face_specs,
+                initial_face_skips,
+                0,
+                *(self.eval_args_samples
+                  if self.eval_args_samples is not None else ()),
+            )
+            delta_tokens = jnp.zeros((1,), dtype=jnp.int32)
+            delta_eqns = -jnp.ones((1,), dtype=jnp.int32)
+            delta_count = jnp.zeros((), dtype=jnp.int32)
 
         max_steps_val = initial_order.shape[0]
         step_count = jnp.array(0, dtype=jnp.int32)
@@ -3448,6 +3652,9 @@ class VertexEliminationEnv:
             face_skips=initial_face_skips,
             tokens=tokens,
             eqn_ids=eqn_ids,
+            delta_tokens=delta_tokens,
+            delta_eqns=delta_eqns,
+            delta_count=delta_count,
             axis_state=self.axis_state_static,
             axis_valid_mask=self.axis_valid_static,
             step_count=step_count,
@@ -3519,6 +3726,19 @@ class VertexEliminationEnv:
             batched=True,
         )
 
+        if self.config.delta_obs:
+            # Slot 0 is the exact host-side token count (see
+            # `_delta_observation`); slots 1.. are this step's delta.
+            delta_count = tokens[0].astype(jnp.int32)
+            delta_tokens = tokens[1:]
+            delta_eqns = eqn_ids[1:]
+            tokens = jnp.zeros((1,), dtype=jnp.int32)
+            eqn_ids = jnp.zeros((1,), dtype=jnp.int32)
+        else:
+            delta_tokens = jnp.zeros((1,), dtype=jnp.int32)
+            delta_eqns = -jnp.ones((1,), dtype=jnp.int32)
+            delta_count = jnp.zeros((), dtype=jnp.int32)
+
         terminated = new_step >= state.max_steps
 
         # Single-vertex axis_state mutation: the just-acted-on vertex's
@@ -3540,6 +3760,9 @@ class VertexEliminationEnv:
             face_skips=new_face_skips,
             tokens=tokens,
             eqn_ids=eqn_ids,
+            delta_tokens=delta_tokens,
+            delta_eqns=delta_eqns,
+            delta_count=delta_count,
             axis_state=new_axis_state,
             axis_valid_mask=state.axis_valid_mask,
             step_count=new_step,
@@ -3602,6 +3825,15 @@ class VertexEliminationEnv:
               the input state unchanged and the tokenizer output is
               discarded.
         """
+        if self.config.delta_obs:
+            raise NotImplementedError(
+                "the external (Ray-split) tokenizer path predates the DELTA "
+                "observation and still stitches a full stream back into "
+                "`tokens`/`eqn_ids` -- it would leave `delta_*` empty and "
+                "the encoder would never advance. Build the env with "
+                "delta_obs=False for this path (ppo_ray_worker does), or "
+                "port assemble_step_result to split the delta header."
+            )
         if isinstance(action, StepAction):
             target_vertex = jnp.asarray(action.target_vertex, dtype=jnp.int32)
             rule_specs = jnp.asarray(action.rule_specs, dtype=jnp.int32)
@@ -3641,6 +3873,12 @@ class VertexEliminationEnv:
             face_skips=state.face_skips[shifted.astype(jnp.int32)],
             tokens=jnp.zeros_like(state.tokens),
             eqn_ids=jnp.zeros_like(state.eqn_ids),
+            # Legacy sentinels, byte-identical to what `step()` writes on
+            # the non-delta path (pad is -1 for eqn ids, not 0) -- this
+            # state is compared against `step()`'s field by field.
+            delta_tokens=jnp.zeros((1,), dtype=jnp.int32),
+            delta_eqns=-jnp.ones((1,), dtype=jnp.int32),
+            delta_count=jnp.zeros((), dtype=jnp.int32),
             axis_state=new_axis_state,
             axis_valid_mask=state.axis_valid_mask,
             step_count=new_step,
@@ -3701,6 +3939,15 @@ class VertexEliminationEnv:
         `(order, specs)` tensors to the worker pool, which is easier
         when each shard owns its own (un-broadcast) state.
         """
+        if self.config.delta_obs:
+            raise NotImplementedError(
+                "the external (Ray-split) tokenizer path predates the DELTA "
+                "observation and still stitches a full stream back into "
+                "`tokens`/`eqn_ids` -- it would leave `delta_*` empty and "
+                "the encoder would never advance. Build the env with "
+                "delta_obs=False for this path (ppo_ray_worker does), or "
+                "port assemble_step_result to split the delta header."
+            )
         initial_order = jnp.array(self.valid_vertices, dtype=jnp.int32)
         initial_specs = jnp.full(
             (initial_order.shape[0], MAX_RULES_PER_VERTEX, 3),
@@ -3719,8 +3966,11 @@ class VertexEliminationEnv:
             face_skips=jnp.zeros(
                 (initial_order.shape[0], MAX_FACES), dtype=jnp.int32
             ),
-            tokens=jnp.zeros((MAX_TOKENS,), dtype=jnp.int32),
-            eqn_ids=jnp.zeros((MAX_TOKENS,), dtype=jnp.int32),
+            tokens=jnp.zeros((self.obs_width,), dtype=jnp.int32),
+            eqn_ids=jnp.zeros((self.obs_width,), dtype=jnp.int32),
+            delta_tokens=jnp.zeros((1,), dtype=jnp.int32),
+            delta_eqns=-jnp.ones((1,), dtype=jnp.int32),
+            delta_count=jnp.zeros((), dtype=jnp.int32),
             axis_state=self.axis_state_static,
             axis_valid_mask=self.axis_valid_static,
             step_count=jnp.array(0, dtype=jnp.int32),
