@@ -23,12 +23,24 @@ from graphax.sparse.micro_actions import COMPRESS_KINDS, QUANT_DTYPES
 _DIAG = re.compile(r"diag\((\d+),\s*(\d+),\s*(-?\d+)\)")
 _COMP = re.compile(r"compress\('([^']+)',\s*(\d+)\)")
 _QUANT = re.compile(r"quant\('([^']+)'\)")
+# AZ's per-vertex SKIP marker. NOT a rule spec -- it rides the SEPARATE
+# ``face_skips`` wire (env._face_dict_for_vertex turns a 1 into
+# ``graphax.SKIP_FACE`` for that face), so it is parsed out here and handed
+# back by ``build_order_specs(..., return_skips=True)``.
+_SKIP = re.compile(r"skip\(\)")
+
+
+def calls_have_skip(calls):
+    """True iff ``calls`` carries the per-vertex ``skip()`` marker."""
+    return any(_SKIP.fullmatch(str(c)) for c in calls)
 
 
 def parse_calls(calls):
     """Decoded string calls -> per-substep micro-action arrays."""
     op, i, j, fac, kind, quant = [], [], [], [], [], []
     for c in calls:
+        if _SKIP.fullmatch(c):
+            continue        # carried on the face_skips wire, not as a rule row
         m = _DIAG.fullmatch(c)
         if m:
             op.append(OP_DIAG); i.append(int(m[1])); j.append(int(m[2]))
@@ -45,7 +57,7 @@ def parse_calls(calls):
     return op, i, j, fac, kind, quant
 
 
-def build_order_specs(seq, env):
+def build_order_specs(seq, env, return_skips=False):
     # The recorded ``seq`` vertex is the agent's 0-based ACTION INDEX into
     # ``env.valid_vertices`` (see ppo_ray_worker: ``act_step`` returns the raw
     # ``vertex_action`` and the env applies ``vertex_id = vertex_action + 1``).
@@ -61,14 +73,30 @@ def build_order_specs(seq, env):
     specs = np.full((len(resolved), MAX_RULES_PER_VERTEX, 3), -1, dtype=np.int32)
     specs[:, :, 2] = 0
     n_rules = 0
+    # ``skips[k]`` == the k-th eliminated vertex asked for SKIP. It is returned
+    # ONLY when the caller opted in; a caller that cannot carry the wire gets a
+    # loud ValueError instead of a plan that silently measures as if exact.
+    skips = np.zeros(len(resolved), dtype=bool)
     for k, ((_, calls), vid) in enumerate(zip(seq, resolved)):
         if not calls:
             continue
+        if calls_have_skip(calls):
+            skips[k] = True
         op, i, j, fac, kind, quant = parse_calls(calls)
+        if not op:
+            continue          # skip-only vertex: no per-vertex rule rows
         n_rules += len(op)
         specs[k] = micro_actions_to_rule_specs(
             np.array(op), np.array(i), np.array(j), np.array(fac),
             axis_state_for_vertex=axis_static[vid - 1],
             compress_kinds=np.array(kind), quant_dtypes=np.array(quant),
         )
-    return np.array(resolved, dtype=np.int32), specs, n_rules
+    order = np.array(resolved, dtype=np.int32)
+    if return_skips:
+        return order, specs, n_rules, skips
+    if skips.any():
+        raise ValueError(
+            "seq contains skip() but build_order_specs was called without "
+            "return_skips=True -- the face_skips wire would be DROPPED and "
+            "the plan would measure identically to the exact one")
+    return order, specs, n_rules

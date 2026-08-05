@@ -14,8 +14,11 @@ CLEAN implementation (ignores autoscheduler_loop's surrogate-Gumbel search and m
     target softmax(logits + sigma(completed_q)) over the legal set.
   * SAMPLED (Hubert 2021, pragmatic): with ALPHAGRAD_GAZ_MICRO=1 each root candidate
     is (vertex, micro-action) with the micro drawn from an explicit-range proposal
-    (quant/diag/compress, sparse); the search Q decides which survive. The learned
-    heads stay vertex-level in v1 (micro-head learning = follow-up).
+    (quant/diag/compress/skip, sparse); the search Q decides which survive. The
+    learned heads stay vertex-level in v1 (micro-head learning = follow-up).
+    SKIP = drop the contraction of every face of that vertex (graphax.SKIP_FACE);
+    it is a SEARCH variant only -- see the ("s",) block below for why it is not
+    a MicroActionPolicy output.
   * Real measurements ONLY at episode terminals (budget = --total-measurements).
   * Objective identical to the E2 campaign: equal-weight z-scored
     {cosine_sim, latency_ns, xla_peak_memory}; flops unrewarded.
@@ -245,33 +248,78 @@ GAZ_MICRO = os.environ.get("ALPHAGRAD_GAZ_MICRO", "0") == "1"
 MICRO_P = float(os.environ.get("ALPHAGRAD_GAZ_MICRO_P", "0.25"))
 MAXAX = int(os.environ.get("ALPHAGRAD_GAZ_MAX_AX", "2"))
 FACS = [int(x) for x in os.environ.get("ALPHAGRAD_GAZ_FACTORS", "2,3,4").split(",")]
+# ---------------------------------------------------------------- SKIP ("s",)
+# The fourth micro op: DROP the contraction of EVERY face of this vertex
+# (graphax.SKIP_FACE per face, carried on the face_skips wire -- see measure).
+#
+# ASYMMETRY, deliberate and documented: PPO's skip is per FACE
+# (UnifiedFaceHead.sample draws one Bernoulli per face); az decides per VERTEX,
+# so "skip all of this vertex's faces" is the closest faithful variant az's
+# action space can express. Exact parity is impossible until the per-face
+# action space lands on az (W5).
+#
+# SKIP IS A SEARCH VARIANT, NOT A POLICY OUTPUT. It is deliberately NOT an
+# output of MicroActionPolicy: that head is SHARED with PPO and a fourth op
+# there would perturb PPO's heads. gumbel_search proposes it, the value net
+# scores it, and the completed-Q improved-policy target teaches the VERTEX
+# policy where skipping pays.
+GAZ_SKIP = os.environ.get("ALPHAGRAD_GAZ_SKIP", "1") == "1"
 
 def rand_micro(rng, force=False):
     """SAMPLED proposal for a candidate's micro-action (explicit ranges).
     force=True always returns a non-None micro (root candidate variants)."""
     if not GAZ_MICRO or (not force and rng.random() >= MICRO_P):
         return None
-    op = rng.integers(3)
+    op = int(rng.integers(4 if GAZ_SKIP else 3))
     if op == 0:
         return ("q", QD[int(rng.integers(len(QD)))])
     if op == 1:
         i = int(rng.integers(MAXAX)); j = (i + 1) % max(MAXAX, 2)
         return ("d", i, j, FACS[int(rng.integers(len(FACS)))])
-    return ("c", int(rng.integers(MAXAX)), int(rng.integers(len(COMPRESS_KINDS))))
+    if op == 2:
+        return ("c", int(rng.integers(MAXAX)),
+                int(rng.integers(len(COMPRESS_KINDS))))
+    return ("s",)
 
 def micro_str(m):
     if m is None: return []
     if m[0] == "q": return ["quant('%s')" % m[1]]
     if m[0] == "d": return ["diag(%d,%d,%d)" % (m[1], m[2], m[3])]
+    # WIRE FORMAT: build_order_specs/parse_calls recognise "skip()" and route
+    # it to the face_skips array (it decodes to no rule spec), so seq_of ->
+    # build_order_specs round-trips a skip without a format hack.
+    if m[0] == "s": return ["skip()"]
     return ["compress('%s',%d)" % (COMPRESS_KINDS[m[2]], m[1])]
 
 def _rules_of(m):
-    """micro tuple -> graphax rule objects (for the append-only micro tokens)."""
+    """micro tuple -> graphax rule objects (for the append-only micro tokens).
+
+    A SKIP is NOT a rule object -- it is ``graphax.SKIP_FACE`` applied per
+    face -- so this returns () for ("s",), exactly like None. The skip travels
+    on the face_skips array instead (see ``measure``). Where the STATE has to
+    stay distinguishable, use ``_tok_rules_of``."""
     from graphax.sparse.micro_actions import Diag as _D, Compress as _C, Quant as _Q
     if m is None: return ()
     if m[0] == "q": return (_Q(dtype=m[1]),)
     if m[0] == "d": return (_D(i=int(m[1]), j=int(m[2]), factor=int(m[3])),)
+    if m[0] == "s": return ()
     return (_C(axes=(int(m[1]),), kind=COMPRESS_KINDS[m[2]]),)
+
+def _tok_rules_of(m):
+    """TOKENIZER-side transforms for one micro: ``_rules_of`` except a SKIP
+    emits ``graphax.SKIP_FACE``, which VEJaxpr encodes through its opaque
+    -transform tag (``<crc32(repr(t))>``; repr is the stable string
+    "graphax.SKIP_FACE", so trainer and measure actors agree).
+
+    LOAD-BEARING for the search: with ``_rules_of`` here the skip variant of a
+    vertex would tokenize IDENTICALLY to the plain variant, so the value net
+    would score the two the same, and sequential halving (stable argsort over
+    tied g+logit+sigma(Q)) would always keep the plain one -- the action would
+    exist and never be chosen."""
+    if m is not None and m[0] == "s":
+        from graphax import SKIP_FACE as _SK
+        return (_SK,)
+    return _rules_of(m)
 
 def seq_of(state):
     """state = list of (action_idx, micro-or-None) -> build_order_specs seq."""
@@ -301,6 +349,13 @@ if GAZ_MICRO:
     from graphax.sparse.micro_actions import Compress as _Cw
     _worst = tuple((v, (_Cw(axes=(0,), kind="mean"),)) for v in _full_order)
     _cap_src = max(_cap_src, len(_state_ids(_full_order, _worst)))
+    if GAZ_SKIP:
+        # A SKIP tokenizes as the opaque tag "<" crc32 ">" -- up to 10 digits,
+        # LONGER than a compress sub-block. Size the cap from it too, else an
+        # all-skip plan truncates and the value net goes blind past the cap.
+        from graphax import SKIP_FACE as _SKw
+        _worst_s = tuple((v, (_SKw,)) for v in _full_order)
+        _cap_src = max(_cap_src, len(_state_ids(_full_order, _worst_s)))
 TOKCAP = int(os.environ.get("ALPHAGRAD_GAZ_TOKCAP", str(int(_cap_src * 1.3) + 8)))
 print(f"[gaz] graphax state tokenizer: base={len(_state_ids([]))} "
       f"full_order={_full_len} worst_micro={_cap_src} TOKCAP={TOKCAP}", flush=True)
@@ -325,7 +380,7 @@ def tokens_of(state):
     if hit is not None:
         return hit
     vertices = [int(VALID[int(a)]) for a, _ in state]
-    transforms = tuple((int(VALID[int(a)]), _rules_of(m))
+    transforms = tuple((int(VALID[int(a)]), _tok_rules_of(m))
                        for a, m in state if m is not None)
     ids = _state_ids(vertices, transforms)
     tok = _padcap(ids)
@@ -383,15 +438,27 @@ def measure(state):
             _ms_client = MeasureClient()
         return _ms_client.measure_seq(seq_of(state))
     try:
-        order, specs, _ = build_order_specs(seq_of(state), env)
+        order, specs, _, _skips = build_order_specs(
+            seq_of(state), env, return_skips=True)
         # Current 8-channel _callback: no raw_sink (that was the 9-channel-era
         # API — passing it raised TypeError, the blanket except returned None,
         # and every "measurement" silently failed). The reward VECTOR carries
         # the winsorized aggregates; costs are stored NEGATED (higher=better).
         n = len(order)
+        # FACE WIRES. Slot 0 = per-face rule rows (az has no per-face rules
+        # yet: all -1). Slot 1 = face_skips, and THIS is where a ("s",) micro
+        # becomes real: row k is set to 1 for every face of the k-th
+        # eliminated vertex, which env._face_dict_for_vertex turns into
+        # graphax.SKIP_FACE. _face_dict_for_vertex only reads the first
+        # len(faces_of(v)) entries of the row, so an all-ones row is exactly
+        # "skip every face of this vertex" and the padding is inert.
+        # Without this the skip is silently dropped and the measurement is
+        # byte-identical to the exact plan.
+        _skip_rows = np.zeros((n, ENV_MAX_FACES), dtype=np.int32)
+        _skip_rows[np.asarray(_skips, dtype=bool)] = 1
         _zface = (
             jnp.full((n, ENV_MAX_FACES, FACE_SLOTS, 3), -1, dtype=jnp.int32),
-            jnp.zeros((n, ENV_MAX_FACES), dtype=jnp.int32),
+            jnp.asarray(_skip_rows, dtype=jnp.int32),
         )
         if _MEASURE_POOL is not None:
             # Batch of ONE through evaluate_batch: the unbatched pool.evaluate
@@ -665,6 +732,12 @@ def step_state(graph, tg, state, vertex, micro):
     # and the pre-M6 approx arm both ran fine, so the hooks are the trigger.
     # W5 (drive the single authoritative tokenizer graph) removes the
     # trade-off; until then this is an explicit, logged limitation.
+    # A ("s",) micro yields _rules_of == (), hence no hook: the search's graph
+    # model stays EXACT for a skip, exactly as it already does for every micro
+    # while ALPHAGRAD_GAZ_SEARCH_HOOKS is off (the default -- applying hooks
+    # in-search hit the graphax densify wall, see below). No crash either way;
+    # the skip is expressed to the value net through the tokens
+    # (``_tok_rules_of``) and to the measurement through face_skips.
     _hooks = ()
     if micro is not None and os.environ.get(
             "ALPHAGRAD_GAZ_SEARCH_HOOKS", "0") == "1":
@@ -1031,8 +1104,8 @@ def _run(args) -> int:
                           "la": la.copy(), "pi": pi.copy()})
             _mk = chosen.get("micro")
             _MICRO_CHOICES["none" if _mk is None else
-                           {"q": "quant", "d": "diag",
-                            "c": "compress"}.get(_mk[0], "other")] += 1
+                           {"q": "quant", "d": "diag", "c": "compress",
+                            "s": "skip"}.get(_mk[0], "other")] += 1
             step_state(graph, tg, state, chosen["v"], chosen["micro"])
             _dstep += 1
             if _memlog and _dstep % 5 == 0:
@@ -1192,13 +1265,14 @@ def _run(args) -> int:
                     _log[f"mean_{_nm}"] = float(LAST_FULL_REWARD[_j])
                 # --- approximation telemetry (identical keys to the PPO runs)
                 _tot = sum(_MICRO_CHOICES.values()) or 1
-                for _nm in ("none", "diag", "compress", "quant"):
+                # ``skip`` is the REALIZED fraction of vertex decisions
+                # that chose ("s",) -- every face of that vertex measured with
+                # graphax.SKIP_FACE. Same key as PPO's, NOT the same
+                # denominator: PPO reports the per-FACE skip probability of the
+                # UnifiedFaceHead, az the per-VERTEX choice frequency. The two
+                # curves share a panel and are comparable in trend only.
+                for _nm in ("none", "diag", "compress", "quant", "skip"):
                     _log[f"approx_prob/{_nm}"] = _MICRO_CHOICES[_nm] / _tot
-                # AZ has no per-face SKIP action (skipping a face is a PPO
-                # live-faces gate); "eliminate but approximate nothing" is
-                # the 'none' class above. Logged as 0.0 so the panel exists
-                # on both runs and is honestly empty here.
-                _log["approx_prob/skip"] = 0.0
                 _pf = consume_per_face_stats()
                 # Same story as PPO: the per-face hooks run inside the Ray
                 # measure actors, so this process' counters are always empty
