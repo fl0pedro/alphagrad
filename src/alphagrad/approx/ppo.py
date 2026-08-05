@@ -6886,10 +6886,18 @@ def main():
                 if j < value_raw.shape[0]:
                     log_dict[f"diag/value_raw_{nm}"] = float(value_raw[j])
                     log_dict[f"diag/estim_return_raw_{nm}"] = float(return_raw[j])
-            for j, p in enumerate(pair_marg):
-                log_dict[f"pair_marginal/{j}"] = float(p)
-            for j, p in enumerate(factor_marg):
-                log_dict[f"factor_marginal/{j}"] = float(p)
+            # Per-vertex micro-head panels: only meaningful when that head
+            # is actually constructed. Under --live-faces / --no-approx-head
+            # the micro dists are point masses and every one of these is a
+            # constant (see the module note above the guard below).
+            _has_micro_head = not (bool(getattr(args, "live_faces", False))
+                                   or bool(getattr(args, "no_approx_head",
+                                                   False)))
+            if _has_micro_head:
+                for j, p in enumerate(pair_marg):
+                    log_dict[f"pair_marginal/{j}"] = float(p)
+                for j, p in enumerate(factor_marg):
+                    log_dict[f"factor_marginal/{j}"] = float(p)
             # Preferences are STATIC for the run -> they belong in the run
             # config, not in a time series that plots a flat line. Written
             # once, on the first episode that has them.
@@ -6903,15 +6911,23 @@ def main():
                 except Exception:
                     pass
                 host_state["_pref_logged"] = True
-            log_dict["p_stop_slot0"] = float(p_stop_slot0)
+            if _has_micro_head:
+                # == 1.0 exactly when the micro head is absent (END one-hot).
+                log_dict["p_stop_slot0"] = float(p_stop_slot0)
             # Dynamic-substeps op-type marginals. Names MUST match
             # heads.py's op order (DIAG=0, COMPRESS=1, QUANT=2, END=3) —
             # this used to label index 2 "end", so the plotted "end" curve
             # was really QUANT and the true END mass was never logged, which
             # hid exactly the END-collapse mode the diagnostic exists for.
-            for j, op_name in enumerate(("diag", "compress", "quant", "end")):
-                if j < op_marginals.shape[0]:
-                    log_dict[f"op_marginal/{op_name}"] = float(op_marginals[j])
+            if _has_micro_head:
+                # (0,0,0,1) when the micro head is absent. The LIVE
+                # approximation usage lives in approx_prob/* below, which
+                # reads the per-face head that actually decides.
+                for j, op_name in enumerate(
+                        ("diag", "compress", "quant", "end")):
+                    if j < op_marginals.shape[0]:
+                        log_dict[f"op_marginal/{op_name}"] = float(
+                            op_marginals[j])
             # POLICY PROBABILITY per approximation class, unified naming with
             # the AZ runs. ``end`` (emit nothing further) is the "none" class;
             # ``skip`` is the per-face gate's mass, which lives on a separate
@@ -6932,7 +6948,11 @@ def main():
             log_dict["faces/mean_valid"] = float(_face_mean_valid)
             # DROPPED: faces/width -- the ENV_MAX_FACES constant. The
             # dilution it existed to expose is carried by faces/mean_valid.
-            log_dict["sub_episode_length"] = float(mean_sub_episode_length)
+            if _has_micro_head:
+                # == 1.0 exactly without a micro head (the sub-episode is a
+                # single forced END step).
+                log_dict["sub_episode_length"] = float(
+                    mean_sub_episode_length)
         # Populate the elimination-order table (it used to be created and
         # logged empty). Bounded: one row per episode for the best eligible
         # env, so the table stays small over a 1000-episode run.
