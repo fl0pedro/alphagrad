@@ -207,7 +207,16 @@ class AxisSetEncoder(eqx.Module):
         DIAG) :class:`PrimeExponentHead`.
         """
         # Build per-axis input feature vector.
-        size_f = features.size.astype(jnp.float32)[..., None]              # (N, 1)
+        # BOUNDED, not raw. The raw extent (32..1024 here) is the single
+        # amplifier that saturated every downstream logit: with it, the
+        # pooled context reached |ctx|inf 235 and the skip logit sat at
+        # z ~ -213 (p_skip ~ 1e-16, gradient ~ 1e-93 -- an absorbing state
+        # the gate can never leave), while the op categoricals collapsed to
+        # one-hots that only looked reasonable once averaged over faces.
+        # log_size (next line) already carries the magnitude in a tame
+        # range, so this keeps a monotone small-axis signal at O(1).
+        size_f = jnp.tanh(
+            features.size.astype(jnp.float32) / 256.0)[..., None]          # (N, 1)
         log_size_f = features.log_size[..., None]                          # (N, 1)
         tag_f = features.tag_bits.astype(jnp.float32)                      # (N, T)
 
