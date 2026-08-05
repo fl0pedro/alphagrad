@@ -139,6 +139,9 @@ class AxisTokenFeatures(NamedTuple):
 # ---------------------------------------------------------------------------
 
 
+from alphagrad.approx.set_pointer import _nanmean  # noqa: E402
+
+
 class AxisSetEncoder(eqx.Module):
     """Small transformer over a set of axis tokens.
 
@@ -247,6 +250,40 @@ class AxisSetEncoder(eqx.Module):
 
         return jax.vmap(self.output_proj)(x), self.output_proj(pooled)
 
+    def attention_entropy(self, features: AxisTokenFeatures,
+                          vertex_context: jax.Array) -> jax.Array:
+        """Mean attention-row entropy over this encoder's blocks.
+
+        REPRESENTATION-collapse diagnostic (see
+        ``_SelfAttentionBlock.attention_entropy``), NOT a policy entropy and
+        NOT comparable in units to entropy/ve_head or entropy/approx_head.
+
+        Duplicates ``__call__``'s feature build rather than returning the
+        scores out of the hot path: the scores are consumed inside a vmapped,
+        gradient-carrying call and plumbing them out would change every head's
+        return contract. This method is called ONCE PER EPISODE on a single
+        state, outside the gradient, so the recompute is free in practice.
+        """
+        size_f = jnp.tanh(
+            features.size.astype(jnp.float32) / 256.0)[..., None]
+        log_size_f = features.log_size[..., None]
+        tag_f = features.tag_bits.astype(jnp.float32)
+        feat_list = [size_f, log_size_f, tag_f]
+        if self.use_group_embedding:
+            group_slot = jnp.where(
+                features.group_id >= 0, features.group_id + 1, 0,
+            ).astype(jnp.int32)
+            group_slot = jnp.clip(group_slot, 0, self.max_groups)
+            feat_list.append(jax.vmap(self.group_embedding)(group_slot))
+        x = jax.vmap(self.proj_in)(jnp.concatenate(feat_list, axis=-1))
+        x = x + vertex_context[None, :]
+        valid = features.valid_mask
+        ents = []
+        for block in self.blocks:
+            ents.append(block.attention_entropy(x, valid))
+            x = block(x, valid)
+        return _nanmean(jnp.stack(ents))
+
 
 class _SelfAttentionBlock(eqx.Module):
     """One multi-head self-attention + MLP block with mask support."""
@@ -301,6 +338,38 @@ class _SelfAttentionBlock(eqx.Module):
         h = jnn.gelu(h)
         h = jax.vmap(self.mlp2)(h)
         return x + h
+
+    def attention_entropy(self, x: jax.Array, valid: jax.Array) -> jax.Array:
+        """Mean ATTENTION-ROW ENTROPY (nats) of this block's attention.
+
+        REPRESENTATION-COLLAPSE DIAGNOSTIC, **NOT A POLICY ENTROPY**. It
+        measures how spread each query's attention is over the valid keys; it
+        is NOT comparable in units or meaning to entropy/ve_head or
+        entropy/approx_head, which are entropies of ACTION distributions. Read
+        it only as "is the encoder still mixing information across slots, or
+        has every query collapsed onto one key".
+        """
+        N = x.shape[0]
+        q = jax.vmap(self.q_proj)(x).reshape(N, self.num_heads, self.head_dim)
+        k = jax.vmap(self.k_proj)(x).reshape(N, self.num_heads, self.head_dim)
+        scores = jnp.einsum("ihd,jhd->hij", q, k) / jnp.sqrt(self.head_dim)
+        mask2d = (valid[:, None] * valid[None, :]) > 0.5
+        # Finite sentinel, deliberately: this softmax is DIAGNOSTIC ONLY and
+        # never reaches an action distribution, so the -1e9-vs--inf sentinel
+        # hazard that bit the vertex logits does not apply, and a finite value
+        # keeps a fully-masked row NaN-free.
+        scores = jnp.where(mask2d[None, :, :], scores, -1e9)
+        attn = jnn.softmax(scores, axis=-1)
+        ent = -jnp.sum(attn * jnp.log(attn + 1e-12), axis=-1)      # (H, N)
+        w = jnp.broadcast_to(
+            (valid > 0.5).astype(ent.dtype)[None, :], ent.shape)
+        mean = jnp.sum(ent * w) / jnp.maximum(jnp.sum(w), 1.0)
+        # UNDEFINED, not 0, when fewer than two keys are attendable: the
+        # entropy of a one-element alphabet is trivially 0 and carries no
+        # information about the representation. Returning 0 would paint a
+        # flat-zero panel that reads as total collapse. NaN propagates to the
+        # caller, which drops the key.
+        return jnp.where(jnp.sum(valid > 0.5) >= 2, mean, jnp.nan)
 
 
 # ---------------------------------------------------------------------------

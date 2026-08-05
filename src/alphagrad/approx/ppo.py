@@ -982,6 +982,86 @@ class ResidualStateUpdate(eqx.Module):
         return residual_state.at[vertex_idx].set(new_slot)
 
 
+# ATTENTION-ENTROPY DIAGNOSTIC (entropy/palimpsa).
+#
+# NOT A POLICY ENTROPY. entropy/ve_head and entropy/approx_head are entropies
+# of ACTION distributions (what the policy might do). This is the mean entropy
+# of the ENCODER's attention rows -- how spread each query's attention is over
+# the valid keys. It answers "has the representation collapsed", and its units
+# are not comparable to the other two: the alphabets are slots/axes, not
+# actions. Read it alone, never against the other two curves.
+#
+# Two sources are averaged, whichever exist on the agent:
+#   * SetPointerVertexPolicy's Set-Transformer blocks over the (V+1) pooled
+#     vertex slots  -- the vertex-side encoder attention;
+#   * AxisSetEncoder's self-attention blocks over one vertex's axis tokens --
+#     the approximation-side encoder attention.
+# The palimpsa token mixer itself is LINEAR attention with no softmax, so it
+# has no attention distribution to take an entropy of; these two softmax
+# attentions are the only distributional objects in the encoder stack.
+#
+# COST: one extra encoder forward per EPISODE on ONE state (the rollout's first
+# step), outside the gradient. The scores are recomputed rather than plumbed
+# out of the hot path, so nothing in the vmapped loss changes. Default ON;
+# ALPHAGRAD_ATTN_ENTROPY=0 disables it and the key is simply not logged.
+_ATTN_ENTROPY_ON = os.environ.get("ALPHAGRAD_ATTN_ENTROPY", "1") == "1"
+
+
+@eqx.filter_jit
+def attention_entropy_diagnostic(agent, tokens, eqn_ids=None,
+                                 axis_state=None, axis_valid=None):
+    """Mean encoder attention-row entropy, or NaN when nothing applies."""
+    from alphagrad.approx.set_pointer import SetPointerVertexPolicy
+    parts = []
+    pol = getattr(agent, "vertex_policy", None)
+    if isinstance(pol, SetPointerVertexPolicy):
+        token_mask = tokens != 0
+        x = jax.vmap(agent.embedding)(tokens)
+        if agent.pos_enc is not None:
+            x = agent.pos_enc(x)
+        enc_mask = None if agent.pos_enc is not None else token_mask
+        enc_x = agent.encoder(x, eqn_ids=eqn_ids, mask=enc_mask,
+                              key=jrand.PRNGKey(0))
+        # Same segment pooling SetPointerVertexPolicy.__call__ does, so the
+        # slots this scores are the slots the pointer actually sees.
+        n_slots = pol.num_vertices + 1
+        w = (token_mask > 0.5).astype(enc_x.dtype)
+        if eqn_ids is None:
+            pooled = jnp.broadcast_to(
+                jnp.mean(enc_x, axis=0), (n_slots, enc_x.shape[-1]))
+            vmask = jnp.ones((n_slots,), enc_x.dtype)
+        else:
+            ids = jnp.clip(eqn_ids, 0, n_slots - 1)
+            sums = jax.ops.segment_sum(enc_x * w[:, None], ids,
+                                       num_segments=n_slots)
+            cnts = jax.ops.segment_sum(w, ids, num_segments=n_slots)
+            pooled = sums / jnp.maximum(cnts, 1.0)[:, None]
+            vmask = (cnts > 0).astype(enc_x.dtype)
+        parts.append(pol.attention_entropy(pooled, vmask))
+        if axis_state is not None and axis_valid is not None:
+            # Whichever approximation head exists owns the AxisSetEncoder:
+            # UnifiedFacePolicy (--live-faces) or MicroActionPolicy.
+            _ax = None
+            for _owner in (getattr(agent, "face_path_policy", None),
+                           getattr(agent, "micro_action_policy", None)):
+                _cand = getattr(_owner, "encoder", None)
+                if _cand is not None and hasattr(_cand, "attention_entropy"):
+                    _ax = _cand
+                    break
+            if _ax is not None:
+                _logits, _ctx = pol.from_vertex_memory(pooled, vmask)
+                feats = _axis_features_from_state(axis_state[0], axis_valid[0])
+                parts.append(_ax.attention_entropy(feats, _ctx[0]))
+    if not parts:
+        return jnp.asarray(float("nan"), jnp.float32)
+    # NaN-aware: a source whose attention has no real alphabet (e.g. the
+    # raw-stream pointer fallback, where every vertex slot is the SAME
+    # broadcast mean and only one slot is occupied) reports NaN and is
+    # skipped rather than dragging the average to 0.
+    from alphagrad.approx.set_pointer import _nanmean
+    return _nanmean(jnp.stack(parts)).astype(jnp.float32)
+
+
 def _axis_features_from_state(
     axis_state_v: jax.Array,
     axis_valid_v: jax.Array,
@@ -2037,6 +2117,9 @@ class Agent(eqx.Module):
                 jnp.asarray(0, jnp.int32),
                 _od, _id_, _jd, _ed, _kd,
                 jnp.asarray(0.0, jnp.float32),
+                # slot 11: face-head entropy. This branch is taken only when
+                # there is no face action at all, so it is exactly 0.
+                jnp.asarray(0.0, jnp.float32),
             )
         if precomputed is not None:
             # 3b: same carry-derived triple the rollout sampled under (the
@@ -2108,6 +2191,14 @@ class Agent(eqx.Module):
         # becoming chatty cannot silence the others. The vertex head emits
         # exactly one action per step, hence arity 1.
         total_entropy = vertex_ent + ent_sub / jnp.maximum(sub_episode_length, 1.0)
+        # APPROXIMATION-HEAD ENTROPY, kept SEPARATELY from ``total_entropy``.
+        # Under --live-faces the per-vertex MicroActionPolicy is not
+        # constructed at all (see the agent factory), so ``ent_sub`` is a
+        # constant 0 and the per-sub-step entropy slots are point masses: the
+        # only live approximation entropy is the per-FACE head's. It is
+        # returned as its own component so the logger can report it instead of
+        # a dead 0.
+        face_entropy = jnp.asarray(0.0, jnp.float32)
         # P1c: fold the face decisions' log-prob/entropy into the totals so
         # the PPO ratio covers them (evaluated with the STORED masks, same
         # gates as sampling — see FacePathPolicy).
@@ -2127,7 +2218,11 @@ class Agent(eqx.Module):
                     face_carry, face_chunks, op_legality_override,
                 )
             total_log_p = total_log_p + f_logp
-            total_entropy = total_entropy + f_ent / jnp.maximum(f_arity, 1.0)
+            # Arity-normalised per the PER-HEAD ENTROPY NORMALISATION note
+            # above: divided by the FACE head's own action count so a chatty
+            # face head cannot silence the vertex head (and vice versa).
+            face_entropy = f_ent / jnp.maximum(f_arity, 1.0)
+            total_entropy = total_entropy + face_entropy
         # Per-step dists are forwarded for KL tracking against the rollout-time
         # old-policy snapshots; ``new_quant_logp`` is the factored-quant log-prob
         # (no flat dist), forwarded for parity with the trajectory schema.
@@ -2143,6 +2238,10 @@ class Agent(eqx.Module):
             new_exp_dists,
             new_kind_dists,
             new_quant_logp,
+            # slot 11: the FACE head's arity-normalised entropy, already folded
+            # into ``total_entropy`` above and returned separately so the PPO
+            # metrics can log it as its own channel (entropy/approx_head).
+            face_entropy,
         )
 
     def to_env_action_dynamic(
@@ -5147,6 +5246,7 @@ def main():
                 new_exp_dists,
                 new_kind_dists,
                 new_quant_logp,
+                face_ents,
             ) = (
                 jax.vmap(
                     lambda toks, eids, rs, pref, vidx, action, vmask, ax_st,
@@ -5223,6 +5323,7 @@ def main():
                 new_exp_dists,
                 new_kind_dists,
                 new_quant_logp,
+                face_ents,
             ) = (
                 jax.vmap(
                     lambda toks, eids, rs, pref, vidx, action, vmask, ax_st,
@@ -5285,6 +5386,7 @@ def main():
                 new_exp_dists,
                 new_kind_dists,
                 new_quant_logp,
+                face_ents,
             ) = jax.vmap(_eval_dyn)(
                 batch.tokens,
                 batch.eqn_ids,
@@ -5514,9 +5616,12 @@ def main():
             jnp.sum(quant_ent_per * active_steps * is_quant_step, axis=-1) / denom
         )
         # Fold the kind + quant entropies into the exp slot to keep the
-        # 5-slot layout the legacy loss path returns.
+        # first 5 slots identical to the legacy loss path's layout. Slot 5 is
+        # NEW: the per-FACE approximation head's arity-normalised entropy,
+        # which is the ONLY live approximation entropy under --live-faces.
         _entropy_components = (
             ent_vertex, ent_op, ent_i, ent_j, ent_exp + ent_kind + ent_quant,
+            jnp.mean(face_ents),
         )
 
         total_loss = (
@@ -5565,9 +5670,9 @@ def main():
             # returns the same 5-slot suffix with zeros so the metrics
             # tuple shape is uniform across modes (lax.scan needs that).
             jnp.stack(_kl_components),
-            # Per-component entropies (same 5-slot layout); legacy returns
-            # zeros for the dynamic-only slots and the vertex entropy in
-            # slot 0 if available.
+            # Per-component entropies (the same 5-slot layout in slots 0-4);
+            # legacy returns zeros for the dynamic-only slots and the vertex
+            # entropy in slot 0 if available. Slot 5 = face/approximation head.
             jnp.stack(_entropy_components),
         )
 
@@ -5593,6 +5698,11 @@ def main():
         rollout_key, key = jrand.split(key)
         rollout_keys = jrand.split(rollout_key, num_envs)
 
+        # entropy/palimpsa, once per episode on the rollout's FIRST state of
+        # env 0 (the root elimination state -- the same input every episode, so
+        # the curve isolates the ENCODER's drift rather than state drift).
+        # See attention_entropy_diagnostic: representation diagnostic, not a
+        # policy entropy.
         env_states, traj, total_rewards_full = rollout_fn(
             agent,
             env_obj,
@@ -6142,6 +6252,16 @@ def main():
             _face_op_freq,
             _face_mean_valid,
         )
+        if _ATTN_ENTROPY_ON:
+            _attn_ent = attention_entropy_diagnostic(
+                agent,
+                traj.tokens[0, 0],
+                traj.eqn_ids[0, 0],
+                traj.axis_state[0, 0],
+                traj.axis_valid_mask[0, 0],
+            )
+        else:
+            _attn_ent = jnp.asarray(float("nan"), jnp.float32)
         return (
             agent,
             opt_state,
@@ -6154,6 +6274,7 @@ def main():
             new_m1,
             new_m2,
             new_w,
+            _attn_ent,
         )
 
     if not args.no_jit:
@@ -6255,7 +6376,7 @@ def main():
 
     def host_log(
         ep, all_rets, actions_pack, mean_r, mets, diag_pack=None,
-        popart_stats=None,
+        popart_stats=None, attn_entropy=None,
     ):
         ep = int(ep)
         all_rets = np.array(all_rets)  # (num_envs, NUM_REWARDS)
@@ -6320,7 +6441,8 @@ def main():
         mean_r = np.atleast_1d(np.array(mean_r))
 
         host_state["samplecounts"] += num_envs * num_valid
-        # mets is an 11-tuple: 9 scalars + two (5,) per-component arrays.
+        # mets is an 11-tuple: 9 scalars + two per-component arrays (KL is
+        # (7,), entropy is (6,) -- slot 5 of the latter is the face head).
         # Slot 9 is per-component KL (vertex/op/i/j/exp in dynamic mode;
         # vertex/pair/factor/0/0 in legacy). Slot 10 is per-component
         # entropy (same slot layout; legacy = all zeros today).
@@ -6463,9 +6585,41 @@ def main():
                 # (op / i / j / exp) averaged. `entropy evolution` above is
                 # the overall mean.
                 log_dict["entropy/macro_vertex"] = float(entropy_components[0])
-                log_dict["entropy/micro_approx"] = float(
-                    np.mean(entropy_components[1:5])
-                )
+                # A2: cross-arm alias for the VERTEX-ELIMINATION head. az_gumbel
+                # logs the entropy of the same distribution (the softmaxed
+                # vertex logits over the legal set) under this exact key, so one
+                # panel compares the two trainers' pointer heads directly.
+                # entropy/macro_vertex and ent/vertex are kept for continuity.
+                log_dict["entropy/ve_head"] = float(entropy_components[0])
+                # entropy/micro_approx is GONE. It averaged the PER-VERTEX
+                # MicroActionPolicy slots (1..4), which under --live-faces /
+                # --no-approx-head belong to a head that is not constructed at
+                # all -- a permanently-0 panel that read as a collapsed policy.
+                # The per-slot numbers survive as ent/op, ent/i, ent/j, ent/exp.
+                #
+                # THE approximation-head entropy panel, arity-normalised.
+                #
+                # CAVEAT for the shared panel: PPO's entropy/approx_head is the
+                # PER-FACE head (UnifiedFacePolicy -- one decision per live
+                # face), while az_gumbel's key of the same name is the
+                # PER-VERTEX head (MicroActionPolicy -- one sub-episode per
+                # vertex). Both are divided by their OWN action arity, so the
+                # two curves are comparable in SHAPE (trend, collapse, revival)
+                # but NOT in absolute scale: they are entropies over different
+                # action spaces with different alphabet sizes.
+                if entropy_components.shape[0] > 5 and getattr(
+                        args, "face_actions", False):
+                    log_dict["entropy/approx_head"] = float(
+                        entropy_components[5])
+        # entropy/palimpsa -- the encoder's mean ATTENTION-ROW entropy. Logged
+        # outside the dynamic-substeps branch because it is a property of the
+        # ENCODER, not of any action head. NOT a policy entropy and NOT
+        # comparable in units to entropy/ve_head or entropy/approx_head; see
+        # attention_entropy_diagnostic.
+        if attn_entropy is not None:
+            _ae = float(np.asarray(attn_entropy))
+            if np.isfinite(_ae):
+                log_dict["entropy/palimpsa"] = _ae
                 # NORMALISED companions, in [0,1] = fraction of that head's
                 # MAXIMUM possible entropy. The raw nats are not comparable
                 # across heads: the vertex head picks among ~total_v vertices
@@ -6814,6 +6968,14 @@ def main():
                 print("[approx] " + " ".join(
                     f"{k.split('/')[-1]}={float(v):.4g}"
                     for k, v in sorted(_ap.items())), flush=True)
+            # Same mirror for the three head entropies (az_gumbel prints the
+            # identical line under the identical switch).
+            _ek = {k: v for k, v in log_dict.items()
+                   if k.startswith("entropy/")}
+            if _ek:
+                print("[entropy] " + " ".join(
+                    f"{k.split('/')[-1]}={float(v):.4g}"
+                    for k, v in sorted(_ek.items())), flush=True)
         wandb.log(log_dict)
 
         # Per-episode memory + JIT-cache diagnostic. Off by default; flip on
@@ -7223,6 +7385,7 @@ def main():
             popart_m1,
             popart_m2,
             popart_w,
+            attn_ent,
         ) = train_episode(
             agent,
             opt_state,
@@ -7251,6 +7414,7 @@ def main():
             popart_stats=_popart_derive(
                 popart_m1, popart_m2, popart_w,
                 args.popart_sigma_min, 1e12),
+            attn_entropy=attn_ent,
         )
         # Mid-training top-N snapshot. Skips the wandb table log so we
         # don't pollute the offline run with duplicate tables — only the

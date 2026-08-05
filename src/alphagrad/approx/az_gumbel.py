@@ -513,6 +513,8 @@ from alphagrad.approx.env import (
 )
 from alphagrad.approx.ppo import (
     _axis_features_from_state as _axis_feats,
+    attention_entropy_diagnostic as _attn_ent_diag,
+    _ATTN_ENTROPY_ON,
 )
 from graphax.sparse.micro_actions import Compress as _GxC, Diag as _GxD, Quant as _GxQ
 
@@ -577,6 +579,17 @@ def learned_micro(state, vertex, key):
         pair_valid=jnp.asarray(pair, jnp.float32),
         compress_valid=jnp.asarray(comp, jnp.float32),
     )
+    # APPROXIMATION-HEAD ENTROPY. MicroActionPolicy.sample returns
+    # (actions, sum logp, sum entropy, sum arity, *dists), so _r[1] is the
+    # summed sub-episode entropy and _r[2] the summed arity. Normalise by the
+    # head's OWN arity, exactly as ppo's evaluate_action_dynamic does, so a
+    # longer sub-episode does not inflate the number. Recorded here (before the
+    # decode, which can still fail) because the entropy of the draw is real
+    # regardless of whether the resulting rows decode to a usable rule.
+    try:
+        _AP_ENT.append(float(_r[1]) / max(float(_r[2]), 1.0))
+    except Exception:
+        pass
     rows = _micro_to_rows(
         acts.op_type, acts.i, acts.j, acts.factor,
         env.axis_state_static[v_idx],
@@ -712,6 +725,19 @@ def sigma(q, max_n=1, cs=float(os.environ.get("ALPHAGRAD_GAZ_CSCALE", "0.1"))):
     qn = (q - lo) / max(hi - lo, 1e-8)
     return (CVISIT + float(max_n)) * cs * qn
 
+# Per-episode POLICY-ENTROPY accumulators, one entry per DECISION; drained to
+# their episode means in the wandb block and cleared alongside _MICRO_CHOICES.
+#   _VE_ENT : entropy (nats) of the vertex-elimination prior the search acts
+#             under -- ppo logs the same quantity as entropy/ve_head.
+#   _AP_ENT : arity-normalised entropy of the approximation head.
+# CAVEAT: az's approximation head is the PER-VERTEX MicroActionPolicy, while
+# ppo's entropy/approx_head is the PER-FACE UnifiedFacePolicy. Both are divided
+# by their own action arity, so the curves are comparable in SHAPE but NOT in
+# absolute scale -- different action spaces, different alphabet sizes.
+_VE_ENT: list = []
+_AP_ENT: list = []
+
+
 # ---------------------------------------------------------------- Gumbel root search
 def gumbel_search(state, graph, tg, rng):
     legal = legal_set(graph)
@@ -787,6 +813,10 @@ def gumbel_search(state, graph, tg, rng):
     # ANTI-correlated with the search.
     _prior = np.exp(logits - logits.max())
     _prior = _prior / max(_prior.sum(), 1e-12)
+    # VE-HEAD ENTROPY (nats) of the prior this decision actually acted under.
+    # Free: the softmaxed vertex prior is already materialised for the
+    # completed-Q target. One sample per decision; the episode mean is logged.
+    _VE_ENT.append(float(-np.sum(_prior * np.log(_prior + 1e-12))))
     _qv, _nv = {}, {}
     for c in cands:
         if not c["q"]:
@@ -1105,6 +1135,44 @@ def _run(args) -> int:
                             np.asarray(popart.sigma).reshape(-1)[_hi])
                 except Exception:
                     pass
+                # Episode-mean policy entropies. Keys match ppo.py's so the
+                # two arms share a panel -- see the module-level CAVEAT: the
+                # VE head is the same distribution on both, the approximation
+                # head is per-VERTEX here and per-FACE on ppo. Omitted (not
+                # logged as 0) when the head is not in play, so an absent panel
+                # means "not applicable" rather than "collapsed".
+                if _VE_ENT:
+                    _log["entropy/ve_head"] = float(np.mean(_VE_ENT))
+                if _AP_ENT:
+                    _log["entropy/approx_head"] = float(np.mean(_AP_ENT))
+                # entropy/palimpsa: the ENCODER's mean attention-row entropy on
+                # the ROOT state (same input every episode, so the curve
+                # isolates the encoder's drift). Representation-collapse
+                # diagnostic -- NOT a policy entropy, NOT comparable in units
+                # to the two keys above. Same helper ppo uses, so the two arms
+                # measure the identical quantity.
+                if _ATTN_ENTROPY_ON:
+                    try:
+                        _rt, _re = tokens_of([])
+                        _pe = float(_attn_ent_diag(
+                            agent, jnp.asarray(_rt), jnp.asarray(_re),
+                            env.axis_state_static, env.axis_valid_static))
+                        if _pe == _pe:      # not NaN
+                            _log["entropy/palimpsa"] = _pe
+                    except Exception:
+                        pass
+                _VE_ENT.clear()
+                _AP_ENT.clear()
+                # Mirror the three head entropies to stdout under the same
+                # switch the approximation telemetry uses, so a --wandb
+                # disabled probe (or a dead run's log) still shows them.
+                if os.environ.get("ALPHAGRAD_DEBUG_APPROX_PROB", "0") == "1":
+                    _ek = {_k3: _v3 for _k3, _v3 in _log.items()
+                           if _k3.startswith("entropy/")}
+                    if _ek:
+                        print("[entropy] " + " ".join(
+                            f"{_k3.split('/')[-1]}={float(_v3):.4g}"
+                            for _k3, _v3 in sorted(_ek.items())), flush=True)
                 _MICRO_CHOICES.clear()
                 _t_prev = _now
                 wb.log(_log)

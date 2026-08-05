@@ -40,6 +40,16 @@ import jax.numpy as jnp
 import jax.random as jrand
 
 
+def _nanmean(x):
+    """Mean over the FINITE entries; NaN when there are none. Used so a block
+    or a source with no attendable alphabet is skipped rather than counted as
+    a zero."""
+    ok = jnp.isfinite(x)
+    n = jnp.sum(ok)
+    return jnp.where(n > 0, jnp.sum(jnp.where(ok, x, 0.0)) / jnp.maximum(n, 1),
+                     jnp.nan)
+
+
 class SetBlock(eqx.Module):
     """One permutation-equivariant Set-Transformer block: masked MHSA + MLP,
     both pre-norm with residuals. Permutation equivariance is what makes this
@@ -65,6 +75,41 @@ class SetBlock(eqx.Module):
         h = h + self.attn(n, n, n, mask=attn_mask)
         h = h + jax.vmap(self.mlp)(jax.vmap(self.norm2)(h))
         return h
+
+    def attention_entropy(self, h: jax.Array, mask: jax.Array) -> jax.Array:
+        """Mean attention-row entropy (nats) of this block's MHSA.
+
+        REPRESENTATION-COLLAPSE DIAGNOSTIC, **NOT A POLICY ENTROPY**: it says
+        how spread each slot's attention is over the occupied slots, and is
+        NOT comparable in units to entropy/ve_head or entropy/approx_head
+        (those are entropies of ACTION distributions).
+
+        ``eqx.nn.MultiheadAttention`` does not expose its attention weights,
+        so the q/k projections and the softmax are RECOMPUTED here from the
+        module's own parameters. That is a genuine recompute -- it is why this
+        lives in a separate method called once per episode on a single state
+        (O(V^2 E) with V ~ 13-83) rather than inside ``__call__``.
+        """
+        n = jax.vmap(self.norm1)(h)
+        a = self.attn
+        N = n.shape[0]
+        q = jax.vmap(a.query_proj)(n).reshape(N, a.num_heads, a.qk_size)
+        k = jax.vmap(a.key_proj)(n).reshape(N, a.num_heads, a.qk_size)
+        logits = jnp.einsum("qhd,khd->hqk", q, k) / jnp.sqrt(
+            jnp.asarray(a.qk_size, n.dtype))
+        # Finite sentinel: diagnostic-only softmax, never an action dist.
+        logits = jnp.where((mask > 0.5)[None, None, :], logits, -1e9)
+        p = jnn.softmax(logits, axis=-1)
+        ent = -jnp.sum(p * jnp.log(p + 1e-12), axis=-1)            # (H, N)
+        w = jnp.broadcast_to(
+            (mask > 0.5).astype(ent.dtype)[None, :], ent.shape)
+        mean = jnp.sum(ent * w) / jnp.maximum(jnp.sum(w), 1.0)
+        # UNDEFINED, not 0, when fewer than two keys are attendable: the
+        # entropy of a one-element alphabet is trivially 0 and carries no
+        # information about the representation. Returning 0 would paint a
+        # flat-zero panel that reads as total collapse. NaN propagates to the
+        # caller, which drops the key.
+        return jnp.where(jnp.sum(mask > 0.5) >= 2, mean, jnp.nan)
 
 
 class SetPointerVertexPolicy(eqx.Module):
@@ -109,6 +154,19 @@ class SetPointerVertexPolicy(eqx.Module):
         m = vmask > 0.5
         logits = jnp.where(jnp.any(m), jnp.where(m, logits, -jnp.inf), logits)
         return logits, h
+
+    def attention_entropy(self, vmem, vmask):
+        """Mean attention-row entropy over the set-attention blocks.
+
+        REPRESENTATION-collapse diagnostic, NOT a policy entropy -- see
+        :meth:`SetBlock.attention_entropy`.
+        """
+        h = vmem
+        ents = []
+        for blk in self.blocks:
+            ents.append(blk.attention_entropy(h, vmask))
+            h = blk(h, vmask)
+        return _nanmean(jnp.stack(ents))
 
     def from_vertex_memory(self, vmem, vmask):
         """(V+1, E) pooled slots -> (V,) logits and (V, E) contexts."""
