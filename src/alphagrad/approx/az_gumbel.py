@@ -1,13 +1,21 @@
 """Sampled + Gumbel AlphaZero over vertex elimination, built from the PPO components.
 
 CLEAN implementation (ignores autoscheduler_loop's surrogate-Gumbel search and mu0):
-  * KNOWN dynamics: symbolic graph elimination (_eliminate_vertex) — no learned model,
-    no mctx (elimination is not jittable). Python MCTS.
-  * Value + prior = the PPO MicroPPOAgent (palimpsa encoder + PointerVertexPolicy +
-    per-channel value head). Leaf evaluation = value net; simulations NEVER measure.
+  * KNOWN dynamics: symbolic graph elimination — no learned model, no mctx
+    (elimination is not jittable). Python MCTS. There is exactly ONE graph
+    model, the one inside graphax's IncrementalPathTokenizer (`tk.ij.graph`),
+    so the graph the search plans on IS the graph the tokens describe.
+  * OBSERVATION = PPO's, not a parallel one: the append-only path tokenizer
+    (base stream once, one token DELTA per decision) consumed by the shared
+    `common/carry_stream.py` into the palimpsa carry + per-vertex memory.
+    Speculative expansions branch with `live_faces._Snapshot`.
+  * Value + prior = the mainline PPO Agent (palimpsa encoder + Set-pointer
+    vertex head + per-channel value heads), read through
+    `heads_from_memory` off that carry — the same call PPO's rollout makes.
+    Leaf evaluation = value net; simulations NEVER measure.
   * GUMBEL (Danihelka 2022): root Gumbel-top-m without replacement over the prior
     logits, candidate-set halving with PROGRESSIVE DEEPENING (survivors get a
-    2x deeper lockstep rollout each phase; total work ~= n_candidates x
+    2x deeper rollout each phase; total work ~= n_candidates x
     rollout_depth x ceil(log2 m) — there is no separate simulation budget
     knob), action chosen by
     argmax(g + logits + sigma(q)), policy trained by CE to the COMPLETED-Q improved
@@ -49,7 +57,7 @@ import optax
 from alphagrad.approx.env import (
     FACE_SLOTS, MAX_FACES as ENV_MAX_FACES, SENTINEL_COST,
     VertexEliminationEnv, _callback, REWARD_INDEX, REWARD_NAMES,
-    consume_per_face_stats)
+    consume_per_face_stats, MAX_DELTA_TOKENS, _record_delta_truncation)
 
 # Full 8-channel reward of the most recent measurement (PPO REWARD_NAMES
 # layout) — logged as ``mean_<name>`` for wandb parity with the PPO arms.
@@ -57,15 +65,22 @@ LAST_FULL_REWARD = np.zeros(len(REWARD_NAMES), dtype=np.float64)
 from alphagrad.approx.common.examples import (
     get_fn, get_args, data_gen, infer_argnums, scalar_loss_fn)
 from alphagrad.approx.common.eval_samples import generate_eval_samples
-# M6 (search dynamics must apply the approximation) needs this at module
-# level: step_state runs outside the functions that imported it locally, so
-# the approx arm crashed with NameError on its first micro action while the
-# exact arm (micro always None) never reached the branch.
+# The application hook the MEASUREMENT uses, needed here so the golden-stream
+# check drives the env's tokenizer with exactly the hooks the measurement
+# builds (a rule that does not fit one face is skipped for that face, not
+# raised for the whole vertex).
 from alphagrad.approx.common.masks import make_live_masked_hook
 from alphagrad.approx.common.order_specs import build_order_specs
 from alphagrad.approx.common.popart import PopArtStats
 from alphagrad.approx.common.pareto_archive import ParetoArchive
-from graphax.core import _build_graph, _prune_graph, _eliminate_vertex
+# THE tokenizer: graphax's IncrementalPathTokenizer, driven exactly as PPO's
+# env drives it (base once, one delta per decision) through the shared
+# PlanTokenizer. VEJaxpr — graphax's own docstring calls it LEGACY and says
+# not to build on it — is gone, and with it the whole-state TOKCAP re-encode
+# and its ALL-ZERO eqn array (the relational gate was inert on AZ and live on
+# PPO for the entire comparison; `tk.last_eqn_ids()` supplies real ids here).
+from alphagrad.approx.common.plan_tokens import PlanTokenizer
+from alphagrad.approx.common import carry_stream as _cs
 from graphax.sparse.micro_actions import COMPRESS_KINDS
 
 # ------------------------------------------------------- 1. config/env (measure_worker pattern)
@@ -166,11 +181,35 @@ VALID = list(np.asarray(env.valid_vertices, dtype=np.int32)); NV = len(VALID)
 assert VALID == list(range(1, NV + 1)), (
     f"VALID must be contiguous 1..{NV} for the vertex-index conventions to "
     f"agree; got {VALID[:8]}... (see az_gumbel learned_micro vs net_eval)")
-_eg, GRAPH0, TG0, VO = _build_graph(jaxpr, xs, closed.literals, ARGN)
-_prune_graph(GRAPH0, TG0, jaxpr, ARGN)
-def copy_g(g): return {kk: dict(vv) for kk, vv in g.items()}
-def outvar(i): return jaxpr.eqns[i - 1].outvars[0]
-def legal_set(graph): return [i for i in VALID if outvar(i) in graph]
+TOTAL_V = len(jaxpr.eqns)
+# ONE graph model. `PlanTokenizer.legal` reads the TOKENIZER's own
+# `tk.ij.graph`, which is built by the same `_build_graph`/`_prune_graph` and
+# advanced by the same `_eliminate_vertex` a separate search model would run.
+# The parallel model (`_build_graph`/`copy_g`/`legal_set`/`step_state`'s own
+# `_eliminate_vertex`) is DELETED: keeping two is the two-MDPs hazard — the
+# search plans on one graph while the tokens describe another.
+PT = PlanTokenizer(jaxpr, ARGN, list(closed.literals), list(xs),
+                   max_faces=int(ENV_MAX_FACES))
+_BASE_TOKS, _BASE_IDS = PT.base()
+BASE_N = len(_BASE_TOKS)
+BASE_W = max(BASE_N, 1)
+BASE_TOK = jnp.asarray(np.asarray(_BASE_TOKS[:BASE_W], dtype=np.int32))
+BASE_EQN = jnp.asarray(np.asarray(_BASE_IDS[:BASE_W], dtype=np.int32))
+# Cross-check against the env's own producer: the two must agree bitwise or
+# the search reads a different base than the measurement tokenizes.
+_ebt, _ebe, _ebn = env.base_observation()
+assert int(_ebn) == BASE_N, (
+    f"base stream length disagrees: PlanTokenizer {BASE_N} vs "
+    f"env.base_observation() {int(_ebn)}")
+assert np.array_equal(np.asarray(_ebt)[:BASE_N], np.asarray(_BASE_TOKS)), (
+    "base token stream disagrees between PlanTokenizer and "
+    "env.base_observation()")
+assert np.array_equal(np.asarray(_ebe)[:BASE_N], np.asarray(_BASE_IDS)), (
+    "base eqn ids disagree between PlanTokenizer and env.base_observation()")
+del _ebt, _ebe, _ebn
+print(f"[gaz] path tokenizer: base={BASE_N} tokens "
+      f"(per-step delta budget {MAX_DELTA_TOKENS}, total_v={TOTAL_V})",
+      flush=True)
 
 # --------------------------- 4. normalisation (PopArt) + Pareto archive / objective (campaign)
 # Objective channels. There is ONE memory channel, ``peak_memory``: the
@@ -326,78 +365,64 @@ def seq_of(state):
     """state = list of (action_idx, micro-or-None) -> build_order_specs seq."""
     return [(int(a), micro_str(m)) for a, m in state]
 
-# ---- tokenization: graphax append-only STATE tokenizer ----
-# VEJaxpr(base_jaxpr, elim_order, transforms) emits
-#     <original-graph tokens> | <vertex [: micro-actions] ;> ...
-# pure Python over the UNTRACED base jaxpr — no re-trace, no XLA compile, no
-# executable leak. The base block is invariant and the suffix grows a few
-# tokens per action, so streams stay short and prefix-stable step-to-step.
-#  * fixed-cap PADDING (ALPHAGRAD_GAZ_TOKCAP): every stream padded to one length
-#    (pad id 0 = masked via tok>0 downstream) -> the encoder compiles ONCE.
-from graphax.jaxpr import VEJaxpr
 
-def _state_ids(vertices, transforms=()):
-    """(1-based vertex order, ((vertex, rules), ...)) -> token id list."""
-    ve = VEJaxpr(jaxpr, elim_order=list(vertices), transforms=tuple(transforms))
-    return [int(t) for t in ve.tokenized()]
+# ---------------------------------------------------------------- the WIRE
+# ONE builder for the arrays that go to BOTH the tokenizer and the
+# measurement. Previously the tokenizer got graphax rule OBJECTS (VEJaxpr
+# transforms) while `measure` built spec ROWS from `build_order_specs`; two
+# encoders of the same decision is how they drift.
+#
+# `build_order_specs` is per-step independent -- `specs[k]` depends only on
+# that step's calls and its resolved vertex id -- so one step's row can be
+# built on its own and appended, which is what an incremental search needs.
+def _step_wire(action_idx, micro):
+    """One decision -> ``(spec_row (MAX_RULES,3), face_rows, face_skips)``."""
+    _o, _s, _n, _sk = build_order_specs(
+        [(int(action_idx), micro_str(micro))], env, return_skips=True)
+    rows = np.full((int(ENV_MAX_FACES), FACE_SLOTS, 3), -1, dtype=np.int32)
+    skips = np.zeros((int(ENV_MAX_FACES),), dtype=np.int32)
+    if bool(_sk[0]):
+        # "skip every face of this vertex" -- env._face_dict_for_vertex only
+        # reads the first len(faces_of(v)) entries, so the padding is inert.
+        skips[:] = 1
+    return np.asarray(_s[0], dtype=np.int32), rows, skips
 
-_full_order = [int(VALID[a]) for a in range(NV)][::-1]
-_full_len = len(_state_ids(_full_order))
-# MICRO-AWARE cap: micro sub-blocks add a few tokens per vertex — size the cap
-# from the worst single-micro-per-vertex stream, else micro states TRUNCATE.
-_cap_src = _full_len
-if GAZ_MICRO:
-    from graphax.sparse.micro_actions import Compress as _Cw
-    _worst = tuple((v, (_Cw(axes=(0,), kind="mean"),)) for v in _full_order)
-    _cap_src = max(_cap_src, len(_state_ids(_full_order, _worst)))
-    if GAZ_SKIP:
-        # A SKIP tokenizes as the opaque tag "<" crc32 ">" -- up to 10 digits,
-        # LONGER than a compress sub-block. Size the cap from it too, else an
-        # all-skip plan truncates and the value net goes blind past the cap.
-        from graphax import SKIP_FACE as _SKw
-        _worst_s = tuple((v, (_SKw,)) for v in _full_order)
-        _cap_src = max(_cap_src, len(_state_ids(_full_order, _worst_s)))
-TOKCAP = int(os.environ.get("ALPHAGRAD_GAZ_TOKCAP", str(int(_cap_src * 1.3) + 8)))
-print(f"[gaz] graphax state tokenizer: base={len(_state_ids([]))} "
-      f"full_order={_full_len} worst_micro={_cap_src} TOKCAP={TOKCAP}", flush=True)
 
-def _padcap(ids):
-    if len(ids) > TOKCAP:
-        print(f"[gaz][WARN] token stream {len(ids)} > TOKCAP {TOKCAP} — "
-              f"TRUNCATED (value net blind past the cap)", flush=True)
-    a = np.zeros(TOKCAP, dtype=np.int32)
-    n = min(len(ids), TOKCAP)
-    a[:n] = np.asarray(ids[:n], dtype=np.int32)
-    return a
+def plan_wires(state):
+    """A whole plan -> ``(order, specs, face_rows, face_skips)``.
 
-_tok_cache = {}
-_tok_miss = [0]
-# Retained as an escape hatch; the VEJaxpr state tokenizer never touches XLA,
-# so cache clearing is off by default.
-_TOK_CLEAR_EVERY = int(os.environ.get("ALPHAGRAD_GAZ_TOK_CLEAR_EVERY", "0"))
-def tokens_of(state):
-    key = tuple((int(a), tuple(m) if m else None) for a, m in state)
-    hit = _tok_cache.get(key)
-    if hit is not None:
-        return hit
-    vertices = [int(VALID[int(a)]) for a, _ in state]
-    transforms = tuple((int(VALID[int(a)]), _tok_rules_of(m))
-                       for a, m in state if m is not None)
-    ids = _state_ids(vertices, transforms)
-    tok = _padcap(ids)
-    eqn = np.zeros_like(tok)
-    # cache on the HOST (numpy). Caching jnp (device) arrays leaked ~16MB of GPU
-    # per distinct ViT state (the array + its referenced XLA buffer stayed live),
-    # growing linearly with the search until _net_fwd_b OOMs. Host arrays are
-    # ~64KB each and moved to device only transiently inside _net_fwd_b.
-    out = (np.asarray(tok, dtype=np.int32), np.asarray(eqn, dtype=np.int32))
-    if len(_tok_cache) < 8192:
-        _tok_cache[key] = out
-    _tok_miss[0] += 1
-    if _TOK_CLEAR_EVERY and _tok_miss[0] % _TOK_CLEAR_EVERY == 0:
-        import gc
-        jax.clear_caches(); gc.collect()   # free leaked _callback executables
-    return out
+    THE wire. The tokenizer, the measurement and the dumps all read these
+    same four arrays, so a decision cannot be expressed one way to the
+    observation and another way to the measurement.
+    """
+    order, specs, _n, skips = build_order_specs(
+        seq_of(state), env, return_skips=True)
+    n = len(order)
+    face_rows = np.full((n, int(ENV_MAX_FACES), FACE_SLOTS, 3), -1,
+                        dtype=np.int32)
+    face_skips = np.zeros((n, int(ENV_MAX_FACES)), dtype=np.int32)
+    if n:
+        face_skips[np.asarray(skips, dtype=bool)] = 1
+    return (np.asarray(order, dtype=np.int32),
+            np.asarray(specs, dtype=np.int32), face_rows, face_skips)
+
+
+def _wire_delta(toks, ids):
+    """A tokenizer block -> the ``(MAX_DELTA_TOKENS,)`` device buffers.
+
+    Same clip-don't-raise policy as ``env._delta_observation`` (and the same
+    truncation counter), minus its in-band header slot: AZ hands the count
+    directly to ``encode_extend`` instead of shipping it through a callback.
+    """
+    n_raw = len(toks)
+    _record_delta_truncation(n_raw)
+    n = min(n_raw, MAX_DELTA_TOKENS)
+    t = np.zeros((MAX_DELTA_TOKENS,), dtype=np.int32)
+    e = np.full((MAX_DELTA_TOKENS,), -1, dtype=np.int32)
+    if n:
+        t[:n] = np.asarray(toks[:n], dtype=np.int32)
+        e[:n] = np.asarray(ids[:n], dtype=np.int32)
+    return t, e, n
 
 _MS = os.environ.get("ALPHAGRAD_MEASURE_SERVER", "0") == "1"
 _ms_client = None
@@ -439,26 +464,22 @@ def measure(state):
             _ms_client = MeasureClient()
         return _ms_client.measure_seq(seq_of(state))
     try:
-        order, specs, _, _skips = build_order_specs(
-            seq_of(state), env, return_skips=True)
+        # THE SAME four wire arrays the tokenizer read (`plan_wires`). Slot 0
+        # is the per-face rule rows, slot 1 the face_skips -- the latter is
+        # where a ("s",) micro becomes real: env._face_dict_for_vertex turns a
+        # 1 into graphax.SKIP_FACE, and it only reads the first
+        # len(faces_of(v)) entries, so the padding is inert. Without them the
+        # skip is silently dropped and the measurement is byte-identical to
+        # the exact plan.
+        #
         # Current 8-channel _callback: no raw_sink (that was the 9-channel-era
         # API — passing it raised TypeError, the blanket except returned None,
         # and every "measurement" silently failed). The reward VECTOR carries
         # the winsorized aggregates; costs are stored NEGATED (higher=better).
+        order, specs, _face_rows, _skip_rows = plan_wires(state)
         n = len(order)
-        # FACE WIRES. Slot 0 = per-face rule rows (az has no per-face rules
-        # yet: all -1). Slot 1 = face_skips, and THIS is where a ("s",) micro
-        # becomes real: row k is set to 1 for every face of the k-th
-        # eliminated vertex, which env._face_dict_for_vertex turns into
-        # graphax.SKIP_FACE. _face_dict_for_vertex only reads the first
-        # len(faces_of(v)) entries of the row, so an all-ones row is exactly
-        # "skip every face of this vertex" and the padding is inert.
-        # Without this the skip is silently dropped and the measurement is
-        # byte-identical to the exact plan.
-        _skip_rows = np.zeros((n, ENV_MAX_FACES), dtype=np.int32)
-        _skip_rows[np.asarray(_skips, dtype=bool)] = 1
         _zface = (
-            jnp.full((n, ENV_MAX_FACES, FACE_SLOTS, 3), -1, dtype=jnp.int32),
+            jnp.asarray(_face_rows, dtype=jnp.int32),
             jnp.asarray(_skip_rows, dtype=jnp.int32),
         )
         if _MEASURE_POOL is not None:
@@ -559,11 +580,73 @@ EMBD = _ns.embd_dim
 W4 = az_w4(_WNS)          # W2: [-w_cmp, -w_mem, 0, +w_acc]
 
 
-def _agent_fwd(agent, tok, eqn):
-    """(masked-later vertex logits, per-head value (4,)) from the mainline
-    Agent's single encode pass."""
-    vlog, _ctx, v4 = agent.encode(tok, eqn_ids=eqn, key=jax.random.PRNGKey(0))
-    return vlog, v4
+# ------------------------------------------------- the OBSERVATION CARRY
+# PPO's two-move protocol, verbatim (common/carry_stream.py): consume the
+# base stream ONCE into the palimpsa carry + per-vertex memory, then extend
+# by one step's DELTA per decision. Both moves are pure jnp, so AZ calls
+# them eagerly on its single env while PPO scans them.
+#
+# PER-VERTEX FEATURES ARE LOAD-BEARING, not decoration. The pointer is a
+# SetPointerVertexPolicy (agent_factory: set_pointer=True) and it scores
+# CONTENT: with `vertex_features=None` its slots for the un-eliminated
+# vertices are all the same empty row, so every candidate gets an identical
+# score up to its own query embedding -- the v31 uniform-pick failure. AZ ran
+# that way (agent.encode(tok, eqn_ids=eqn) with no features) for the whole
+# comparison. They are computed from the same calibration samples PPO uses.
+from alphagrad.approx.ppo import _episode_vertex_features as _ep_vfeat  # noqa: E402
+
+VFEAT = _ep_vfeat(_ns, jaxpr, tuple(closed.literals), tuple(xs),
+                  eval_samples=ev, argnums=tuple(ARGN))
+
+
+@eqx.filter_jit
+def _carry_init(agent):
+    return _cs.init_carry(agent, BASE_TOK, BASE_EQN, BASE_N,
+                          window=BASE_W, total_v=TOTAL_V, embd_dim=EMBD)
+
+
+@eqx.filter_jit
+def _carry_advance(agent, enc, vs, vc, dtok, deqn, dcount, owner):
+    return _cs.advance(agent, enc, vs, vc, dtok, deqn, dcount, owner,
+                       window=MAX_DELTA_TOKENS)
+
+
+@eqx.filter_jit
+def _carry_heads(agent, vs, vc, residual):
+    """(vertex_logits (total_v,), vertex_contexts (total_v, E), value (3,))."""
+    return _cs.heads(agent, vs, vc, vertex_features=VFEAT,
+                     residual_state=residual, preference=None)
+
+
+@eqx.filter_jit
+def _residual_update(agent, residual, v0, ctx_row):
+    return agent.update_residual(residual, v0, ctx_row)
+
+
+def _zero_residual():
+    return jnp.zeros((TOTAL_V, EMBD), dtype=jnp.float32)
+
+
+class Carry:
+    """The DEVICE half of a search node (~35 KB on nn256).
+
+    EncCarry(M, I, cumhist, nvalid, pos) + the per-vertex memory
+    (sums/counts) + the elimination residual. Params-DEPENDENT, unlike the
+    old `_tok_cache`: a carry cached across a `train_step` is silently STALE,
+    not wrong-shaped, so carries live for exactly one `gumbel_search` call
+    and every decision rebuilds from the committed root carry.
+    """
+
+    __slots__ = ("enc", "vs", "vc", "residual")
+
+    def __init__(self, enc, vs, vc, residual):
+        self.enc, self.vs, self.vc, self.residual = enc, vs, vc, residual
+
+
+def _q_of(value3):
+    """The 3 value heads [lat, mem, cos] scalarized with the CH weights."""
+    v = np.asarray(value3, dtype=np.float64).reshape(-1)
+    return float(W4[0] * v[0] + W4[1] * v[1] + W4[3] * v[2])
 
 
 # ---------------- stage-3: LEARNED Sampled-AZ micro proposals ----------------
@@ -590,12 +673,6 @@ _LM_TABLES = None
 _lm_oracle_cache: dict = {}
 
 
-@eqx.filter_jit
-def _ctx_fwd(agent, tok, eqn):
-    _vlog, ctxs, _v4 = agent.encode(tok, eqn_ids=eqn, key=jax.random.PRNGKey(0))
-    return ctxs
-
-
 def _rule_to_tuple(rule):
     if isinstance(rule, _GxD):
         return ("d", int(rule.i), int(rule.j), int(rule.factor))
@@ -611,10 +688,14 @@ def _rule_to_tuple(rule):
     return None
 
 
-def learned_micro(state, vertex, key):
+def learned_micro(ctxs, state, vertex, key):
     """One masked draw from the mainline micro policy for ``vertex`` at the
     graph produced by ``state``; None on END or any mask/replay failure (the
-    candidate then enters plain, exactly like rand_micro's None)."""
+    candidate then enters plain, exactly like rand_micro's None).
+
+    ``ctxs`` are the per-vertex contexts of the CURRENT node, already
+    materialised by the carry heads -- there is no second encode any more.
+    """
     global _LM_TABLES
     if agent.micro_action_policy is None:
         return None
@@ -638,8 +719,6 @@ def learned_micro(state, vertex, key):
         pair, comp = o.vertex_mask(int(vertex))
     except Exception:
         return None
-    tok, eqn = tokens_of(state)
-    ctxs = _ctx_fwd(agent, jnp.asarray(tok), jnp.asarray(eqn))
     v_idx = int(vertex) - 1
     feats = _axis_feats(env.axis_state_static[v_idx], env.axis_valid_static[v_idx])
     acts, *_r = agent.micro_action_policy.sample(
@@ -678,111 +757,174 @@ def learned_micro(state, vertex, key):
 opt = optax.adam(A.lr)
 opt_state = opt.init(eqx.filter(agent, eqx.is_array))
 
-@eqx.filter_jit
-def _net_fwd_b(agent, toks, eqns):
-    """BATCHED fixed-shape forward: vmap over a stack of TOKCAP-padded states.
-    One GPU dispatch evaluates every candidate/rollout frontier at once; only a
-    handful of batch sizes occur (<= n_candidates) so compiles are bounded."""
-    return jax.vmap(lambda tok, eqn: _agent_fwd(agent, tok, eqn))(toks, eqns)
-
-_eval_cache = {}                       # state-key -> (vlog, v10); cleared on net update
 def _skey(state):
     return tuple((int(a), tuple(m) if m else None) for a, m in state)
 
-def batch_eval(states):
-    """Evaluate a LIST of states in one batched forward, with per-state caching
-    (within a search, siblings share prefixes and halving re-visits survivors)."""
-    miss = [i for i, s in enumerate(states) if _skey(s) not in _eval_cache]
-    if miss:
-        # chunk the batched forward: long ViT contexts (16k tokens) OOM the
-        # encoder if the whole candidate batch is vmapped at once.
-        chunk = int(os.environ.get("ALPHAGRAD_GAZ_EVAL_CHUNK", "0")) or len(miss)
-        for c0 in range(0, len(miss), chunk):
-            grp = miss[c0:c0 + chunk]
-            toks = jnp.stack([tokens_of(states[i])[0] for i in grp])
-            eqns = jnp.stack([tokens_of(states[i])[1] for i in grp])
-            vlogs, v10s = _net_fwd_b(agent, toks, eqns)
-            vlogs = np.asarray(vlogs, dtype=np.float64)
-            v10s = np.asarray(v10s, dtype=np.float64)
-            for k, i in enumerate(grp):
-                _eval_cache[_skey(states[i])] = (vlogs[k], v10s[k])
-    return [_eval_cache[_skey(s)] for s in states]
 
-def net_eval(agent, state, legal):
-    """(prior logits over legal action idxs, scalar value in z-space)."""
-    vlog, v4 = batch_eval([state])[0]
-    la = np.array([VALID.index(v) for v in legal], dtype=np.int32)
-    logits = vlog[la] - vlog[la].max()
-    # Heads [lat, mem, cos] scalarized with the CH weights (flops has no head
-    # and W4[2] == 0); trained in PopArt-normalised space like the targets.
-    vz = float(W4[0] * v4[0] + W4[1] * v4[1] + W4[3] * v4[2])
-    return logits, vz, la
+# ------------------------------------------------------- known dynamics
+# ONE elimination per expansion, on the tokenizer's own graph, producing that
+# expansion's token DELTA and extending the carry by it. There is no
+# `_eliminate_vertex` here and no `copy_g`: `PT.eliminate` advances the
+# tokenizer's `ij.graph` through exactly that call, and `PT.branch()` undoes
+# the whole speculative chain in one restore.
+#
+# NO CROSS-DECISION CACHE. `_tok_cache`/`_eval_cache` were params-INdependent
+# and never cleared; a carry is params-DEPENDENT, and a carry cached across a
+# `train_step` is silently STALE (right shape, wrong weights). Every decision
+# rebuilds from the committed root carry, and nothing survives a search.
+def _step(node, vertex, micro):
+    """Eliminate ``vertex`` (with ``micro``) on PT and return the child node.
 
-# ---------------------------------------------------------------- known dynamics
-def step_state(graph, tg, state, vertex, micro):
-    # M6: the search's graph model should apply the SAME approximation the
-    # measurement will -- with ``transforms=()`` the search plans on an exact
-    # graph and then measures an approximated one, i.e. two different MDPs.
+    ``node`` is ``(state, carry, ctxs)``; the returned child carries its own
+    ``(state, carry)``. The caller decides whether the elimination is
+    speculative (inside ``PT.branch()``) or committed.
+    """
+    state, carry, ctxs = node
+    a = int(vertex) - 1                     # VALID is contiguous 1..NV
+    spec_row, face_rows, face_skips = _step_wire(a, micro)
+    # is_last mirrors the MEASUREMENT's decode exactly (`_callback` uses
+    # is_last=(v_idx == last_v_idx) over the FULL order, and
+    # `_face_dict_for_vertex`/`_face_transforms_for_order` the same): COMPRESS
+    # is honored only on the genuinely TERMINAL vertex.
     #
-    # GATED OFF BY DEFAULT. The search eliminates in-process on the trainer
-    # GPU, and applying the hooks on deep elimination states hits the graphax
-    # densify wall: job 58352 produced ZERO episodes in 35 min, looping
-    # "GPU_0_bfc ran out of memory trying to allocate 3.83GiB" and finally
-    # "byte size of input/output arguments (362538860544) exceeds the base
-    # limit (76479332352)" -- a 362 GB program on a 76 GB GPU. The exact arm
-    # and the pre-M6 approx arm both ran fine, so the hooks are the trigger.
-    # W5 (drive the single authoritative tokenizer graph) removes the
-    # trade-off; until then this is an explicit, logged limitation.
-    # A ("s",) micro yields _rules_of == (), hence no hook: the search's graph
-    # model stays EXACT for a skip, exactly as it already does for every micro
-    # while ALPHAGRAD_GAZ_SEARCH_HOOKS is off (the default -- applying hooks
-    # in-search hit the graphax densify wall, see below). No crash either way;
-    # the skip is expressed to the value net through the tokens
-    # (``_tok_rules_of``) and to the measurement through face_skips.
-    _hooks = ()
-    if micro is not None and os.environ.get(
-            "ALPHAGRAD_GAZ_SEARCH_HOOKS", "0") == "1":
-        _rules = _rules_of(micro)
-        _hooks = ((make_live_masked_hook(tuple(_rules)),) if _rules else ())
-    _eliminate_vertex(vertex, jaxpr, graph, tg, VO, count_ops=False,
-                      transforms=_hooks)
-    state.append((VALID.index(vertex), micro))
+    # Honoring it mid-plan is what makes the append-only stream
+    # non-prefix-stable -- env's documented COMPRESS prefix-property
+    # violation, which PPO mitigates with ALPHAGRAD_TOKENS_MID_COMPRESS=0.
+    # Here a block is emitted ONCE and never rewritten, so it has to carry
+    # the terminal decode from the start or the stream and the measurement
+    # describe different graphs.
+    #
+    # "Terminal" is DETECTED, not counted: eliminating a vertex can make
+    # OTHER vertices non-eliminable (nn256: NV=27 valid vertices but 24
+    # decisions), so `len(state) == NV - 1` is simply wrong. The last
+    # decision is the one taken when exactly one vertex is still legal; the
+    # caller asserts the prediction against the graph afterwards, and only a
+    # COMPRESS row makes a misprediction observable at all.
+    is_last = (len(PT.legal(VALID)) == 1)
+    toks, ids = PT.eliminate(vertex, spec_row, face_rows, face_skips,
+                             is_last=is_last)
+    dt, de, dc = _wire_delta(toks, ids)
+    enc2, vs2, vc2 = _carry_advance(
+        agent, carry.enc, carry.vs, carry.vc,
+        jnp.asarray(dt), jnp.asarray(de), jnp.asarray(dc, jnp.int32),
+        jnp.asarray(a, jnp.int32))
+    resid2 = _residual_update(
+        agent, carry.residual, jnp.asarray(a, jnp.int32), ctxs[a])
+    st2 = list(state) + [(a, micro)]
+    return (st2, Carry(enc2, vs2, vc2, resid2),
+            {"tokens": toks, "eqn_ids": ids, "delta": (dt, de, dc),
+             "owner": a, "spec_row": spec_row, "face_rows": face_rows,
+             "face_skips": face_skips, "is_last": is_last})
 
-def lockstep_rollout_values(entries, depth):
-    """Advance ALL rollouts in LOCKSTEP: one batched forward per depth level
-    (instead of one dispatch per rollout per step). entries = [(state, graph,
-    tg)] already stepped into each candidate. Returns per-entry scalar value in
-    z-space, or None where the rollout reached terminal in-search."""
-    live = [{"st": list(s), "g": g, "t": t, "done": False} for s, g, t in entries]
+
+def _assert_terminal_prediction(d):
+    """The `is_last` prediction of the step just COMMITTED, against the graph.
+
+    A misprediction only changes bytes when the step carried a COMPRESS row
+    (that is the sole `is_last` sensitivity of `decode_vertex_rule_specs`), so
+    the guard fires exactly when it matters instead of on every long tail.
+    """
+    from alphagrad.approx.env import COMPRESS_SENTINEL
+    if d["is_last"] or PT.legal(VALID):
+        return
+    has_compress = (
+        bool(np.any(np.asarray(d["spec_row"])[..., 0] == COMPRESS_SENTINEL))
+        or bool(np.any(np.asarray(d["face_rows"])[..., 0] == COMPRESS_SENTINEL)))
+    if has_compress:
+        raise AssertionError(
+            "the terminal decision was not predicted as terminal AND carried "
+            "a COMPRESS row: its block was tokenized with is_last=False while "
+            "the measurement will decode it with is_last=True, so the "
+            "observation and the measured graph diverge. (Elimination made "
+            "the remaining legal vertices vanish at the same step.)")
+
+
+def _eval_node(state, carry):
+    """``(vertex_logits (total_v,), contexts, scalar value in z-space)``."""
+    vlog, ctxs, val = _carry_heads(agent, carry.vs, carry.vc, carry.residual)
+    return np.asarray(vlog, dtype=np.float64), ctxs, _q_of(val)
+
+
+def rollout_value(state, carry, depth):
+    """Greedy descent of ``depth`` steps from an already-expanded child.
+
+    DEPTH-FIRST, not lockstep. The old lockstep loop batched one device
+    dispatch per level, but interleaving chains is exactly what a single
+    stateful tokenizer cannot do: branching would force a cold prefix replay
+    per chain per level (O(prefix) eliminations each). One `PT.branch()` per
+    chain costs 0.02 ms to enter and 0.17 ms to leave at depth 23 against a
+    5-17 ms elimination, so the sequential dispatches are the cheaper trade.
+
+    C1 (kept): EVERY rollout is valued, terminal or not. Filtering terminals
+    out and substituting the root value made every candidate's Q the same
+    constant at the deciding halvings.
+    """
     for _ in range(depth):
-        idx = []
-        for i, e in enumerate(live):
-            if not e["done"] and not legal_set(e["g"]):
-                e["done"] = True
-            if not e["done"]:
-                idx.append(i)
-        if not idx:
+        legal = PT.legal(VALID)
+        if not legal:
             break
-        evs = batch_eval([live[i]["st"] for i in idx])     # ONE dispatch for the level
-        for k, i in enumerate(idx):
-            vlog = evs[k][0]
-            legal = legal_set(live[i]["g"])
-            la = [VALID.index(v) for v in legal]
-            v = legal[int(np.argmax(vlog[la]))]
-            step_state(live[i]["g"], live[i]["t"], live[i]["st"], v, None)
-    # C1: evaluate EVERY rollout, terminal or not. The old code filtered
-    # terminals out and the caller substituted the ROOT value for them, so at
-    # the deciding halvings (where most rollouts have terminated) every
-    # candidate's Q was the same constant: halving degenerated to
-    # argmax(g + logit) and the CE target to softmax(logits) — cross-entropy
-    # against itself, i.e. zero learning signal exactly where the search
-    # matters most. A terminal state's value head reads its own tokens fine.
-    evs = batch_eval([e["st"] for e in live])
-    out = []
-    for k in range(len(live)):
-        v4 = evs[k][1]  # mainline Agent heads [lat, mem, cos]
-        out.append(float(W4[0] * v4[0] + W4[1] * v4[1] + W4[3] * v4[2]))
-    return out
+        vlog, ctxs, _v = _eval_node(state, carry)
+        la = [int(v) - 1 for v in legal]
+        v = legal[int(np.argmax(vlog[la]))]
+        state, carry, _d = _step((state, carry, ctxs), v, None)
+    _vl, _cx, vz = _eval_node(state, carry)
+    return vz
+
+# ---------------------------------------------------------------- golden check
+# ACCEPTANCE (a): for an episode, `base ++ concat(per-decision deltas)` must
+# equal `env._incremental_stream_tokens` on the committed plan, BITWISE. The
+# two producers are the same graphax tokenizer driven by the same decoded
+# hooks, so a mismatch means a decode divergence (is_last, face wires) or a
+# cache-state dependence -- both silent otherwise. On by default for the first
+# ALPHAGRAD_GAZ_GOLD_EPISODES episodes; 0 disables.
+_GOLD_EPISODES = int(os.environ.get("ALPHAGRAD_GAZ_GOLD_EPISODES", "1"))
+_GOLD_CHECK = _GOLD_EPISODES > 0
+_GOLD_FAILS = [0]
+
+
+def _golden_equivalence(state, stream, seg_ids, ep):
+    """Compare the streamed episode against the env's own full-stream builder."""
+    global _GOLD_CHECK
+    if ep > _GOLD_EPISODES:
+        _GOLD_CHECK = False
+        return
+    from alphagrad.approx.env import (
+        _incremental_stream_tokens, decode_vertex_rule_specs)
+    order, specs, face_rows, face_skips = plan_wires(state)
+    n = len(order)
+    tok_rules_by_v = {}
+    for k in range(n):
+        rules = decode_vertex_rule_specs(
+            jaxpr, int(order[k]), specs[k].tolist(), is_last=(k == n - 1))
+        if rules:
+            tok_rules_by_v[int(order[k])] = (
+                make_live_masked_hook(tuple(rules)),)
+    ref, ref_ids, _ft, _ls = _incremental_stream_tokens(
+        env.config, env.consts, env.args, [int(v) for v in order],
+        specs.tolist(), tok_rules_by_v,
+        face_rows_list=face_rows.tolist(),
+        face_skips_list=face_skips.tolist(),
+        honor_last_compress=True,
+        face_key=tuple(
+            (tuple(int(x) for x in face_rows[k].reshape(-1)),
+             tuple(int(x) for x in face_skips[k].reshape(-1)))
+            for k in range(n)),
+    )
+    ok_t = list(ref) == list(stream)
+    ok_i = list(ref_ids) == list(seg_ids)
+    if ok_t and ok_i:
+        print(f"[gaz][gold] ep={ep} BITWISE OK: {len(stream)} tokens, "
+              f"{n} decisions (base {BASE_N} + deltas)", flush=True)
+        return
+    _GOLD_FAILS[0] += 1
+    _bad = next((i for i in range(min(len(ref), len(stream)))
+                 if ref[i] != stream[i]), min(len(ref), len(stream)))
+    raise AssertionError(
+        f"[gaz][gold] ep={ep} STREAM MISMATCH: streamed {len(stream)} tokens "
+        f"vs env {len(ref)}; first differing index {_bad}; "
+        f"eqn_ids match={ok_i}. The search reads a different graph than the "
+        f"measurement tokenizes.")
+
 
 CVISIT = float(os.environ.get("ALPHAGRAD_GAZ_CVISIT", "50.0"))
 
@@ -812,10 +954,41 @@ _VE_ENT: list = []
 _AP_ENT: list = []
 
 
+# SILENT-FAILURE ASSERT 1 (learned the hard way): an action that does not
+# change the OBSERVATION is invisible to search. A per-vertex skip once
+# tokenized IDENTICALLY to no-skip, so the value net scored the two the same
+# and stable-argsort ties always kept the plain variant -- the action existed
+# and was never chosen. Every halving phase now checks that candidates with
+# distinct WIRE bytes have distinct TOKEN bytes; a non-zero steady state on
+# `search/tied_candidates` is a bug, not noise.
+_TIED_CANDIDATES = [0]
+_TIED_TOTAL = [0]
+
+
+def _check_distinct_observations(cands):
+    by_tokens: dict = {}
+    tied = 0
+    for c in cands:
+        wire = (int(c["v"]), c["_wire"])
+        tok = c["_tokbytes"]
+        prev = by_tokens.get(tok)
+        if prev is None:
+            by_tokens[tok] = wire
+        elif prev != wire:
+            tied += 1
+    _TIED_CANDIDATES[0] += tied
+    _TIED_TOTAL[0] += len(cands)
+    return tied
+
+
 # ---------------------------------------------------------------- Gumbel root search
-def gumbel_search(state, graph, tg, rng):
-    legal = legal_set(graph)
-    logits, v_root, la = net_eval(agent, state, legal)
+def gumbel_search(state, carry, rng):
+    """One decision. ``PT`` is positioned at the COMMITTED prefix on entry and
+    is left there on exit -- every expansion runs inside ``PT.branch()``."""
+    legal = PT.legal(VALID)
+    vlog, ctxs, v_root = _eval_node(state, carry)
+    la = np.array([int(v) - 1 for v in legal], dtype=np.int32)
+    logits = vlog[la] - vlog[la].max()
     m = min(A.n_candidates, len(legal))
     g = rng.gumbel(size=len(legal))
     order_idx = np.argsort(-(logits + g))[:m]
@@ -830,7 +1003,7 @@ def gumbel_search(state, graph, tg, rng):
         if GAZ_MICRO:
             n_rand = K_MICRO
             if GAZ_MICRO_LEARNED:
-                lm = learned_micro(state, legal[int(ci)],
+                lm = learned_micro(ctxs, state, legal[int(ci)],
                                    jax.random.fold_in(_lm_key, int(ci)))
                 if lm is not None:
                     variants.append(lm)
@@ -843,18 +1016,29 @@ def gumbel_search(state, graph, tg, rng):
     # SEQUENTIAL HALVING with PROGRESSIVE DEEPENING (deterministic dynamics +
     # deterministic value net => repeated sims of a candidate are IDENTICAL, so
     # instead of re-simulating, each halving phase gives the SURVIVORS a 2x
-    # deeper lockstep rollout — the budget buys more accurate Q, not duplicates).
+    # deeper rollout — the budget buys more accurate Q, not duplicates).
     surv = list(cands)
     depth = A.rollout_depth
+    _phase = 0
     while True:
-        entries = []
         for c in surv:
-            st2 = list(state); g2, t2 = copy_g(graph), copy_g(tg)
-            step_state(g2, t2, st2, c["v"], c["micro"])
-            entries.append((st2, g2, t2))
-        vals = lockstep_rollout_values(entries, depth)     # batched per level
-        for c, vz in zip(surv, vals):
-            c["q"].append(vz)          # C1: never a v_root stand-in
+            # ONE branch per candidate covers its expansion AND its whole
+            # rollout chain: _Snapshot.__exit__ truncates the append-only
+            # lists back to their entry length, so any number of
+            # eliminations inside are undone together.
+            with PT.branch():
+                st2, cy2, d = _step((state, carry, ctxs), c["v"], c["micro"])
+                if _phase == 0:
+                    c["_wire"] = (d["spec_row"].tobytes(),
+                                  d["face_rows"].tobytes(),
+                                  d["face_skips"].tobytes())
+                    c["_tokbytes"] = (
+                        np.asarray(d["tokens"], np.int32).tobytes(),
+                        np.asarray(d["eqn_ids"], np.int32).tobytes())
+                c["q"].append(rollout_value(st2, cy2, depth))
+        if _phase == 0:
+            _check_distinct_observations(cands)
+        _phase += 1
         if len(surv) <= 1:
             break
         # M2: each phase evaluates at a DEEPER rollout, so the entries of
@@ -912,22 +1096,44 @@ def gumbel_search(state, graph, tg, rng):
         comp_q[li] = qv
     pi = logits + sigma(comp_q, max_n=max([len(c["q"]) for c in cands] + [1]))
     pi = np.exp(pi - pi.max()); pi = pi / pi.sum()
-    return chosen, pi, la, legal
+    # ``ctxs`` rides out so the caller can commit the chosen action without a
+    # second heads pass (the residual update needs this node's context row).
+    return chosen, pi, la, legal, ctxs
 
 # ---------------------------------------------------------------- training
-def loss_fn(agent, toks, eqns, la_pad, la_mask, pi_pad, vtgt, vmask):
-    def per(tok, eqn, la, lam, pi, vt, vm):
-        vlog, v4 = _agent_fwd(agent, tok, eqn)
+def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
+            resid, dtok, deqn, dcnt, owner, la_pad, la_mask, pi_pad,
+            vtgt, vmask):
+    """Vertex CE + value MSE, re-derived from the STORED PRE-step carry.
+
+    §7b of the PPO design, applied here: the replay stores the carry synced to
+    the PREVIOUS step's delta plus this step's delta, and the loss reproduces
+    the step's encoding by the SAME extension the rollout ran. Gradient
+    reaches palimpsa through that ``encode_extend``; it is truncated at the
+    stored carry, exactly as in PPO.
+    """
+    from alphagrad.approx.ppo import EncCarry
+
+    def per(M, I, ch, nv, pos, vs, vc, rs, dt, de, dc, ow,
+            la, lam, pi, vt, vm):
+        carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
+        _c2, vs2, vc2 = _cs.advance(agent, carry, vs, vc, dt, de, dc, ow,
+                                    window=MAX_DELTA_TOKENS)
+        vlog, _ctx, v3 = _cs.heads(agent, vs2, vc2, vertex_features=VFEAT,
+                                   residual_state=rs, preference=None)
         lg = vlog[la]
         lg = jnp.where(lam > 0.5, lg, -jnp.inf)   # -1e9 collided with a sentinel
         logp = jax.nn.log_softmax(lg)
         ce = -jnp.sum(jnp.where(lam > 0.5, pi * logp, 0.0))
-        # Predicted CH vector from the 4 heads: [lat, mem, 0 (flops: no
+        # Predicted CH vector from the 3 heads: [lat, mem, 0 (flops: no
         # head, _CH_ACTIVE masks it), cos]; targets vt are PopArt-normalised.
-        pred = jnp.stack([v4[0], v4[1], jnp.zeros_like(v4[0]), v4[2]])
+        pred = jnp.stack([v3[0], v3[1], jnp.zeros_like(v3[0]), v3[2]])
         vl = jnp.sum(vm * _CH_ACTIVE * (pred - vt) ** 2)
         return ce + 0.5 * vl
-    return jnp.mean(jax.vmap(per)(toks, eqns, la_pad, la_mask, pi_pad, vtgt, vmask))
+
+    return jnp.mean(jax.vmap(per)(
+        enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c, resid,
+        dtok, deqn, dcnt, owner, la_pad, la_mask, pi_pad, vtgt, vmask))
 
 @eqx.filter_jit
 def train_step(agent, opt_state, batch):
@@ -941,16 +1147,17 @@ def _run(args) -> int:
 
     Mirrors `ppo_ray._run`, with one deliberate asymmetry: az's SETUP (env,
     agent, opt, popart, _pareto and the TASK/VALID/NV/TIDX/W4 constants) stays
-    at MODULE level, because the search functions (`gumbel_search`, `net_eval`,
-    `batch_eval`, `measure`, `scalarize`) read it through module globals —
+    at MODULE level, because the search functions (`gumbel_search`, `_step`,
+    `_eval_node`, `measure`, `scalarize`) read it through module globals —
     moving it into a function would silently turn those reads stale. For the
     same reason `gumbel_search` still reads `A.n_candidates` / `A.rollout_depth`
     off the module-level `A`, not off `args` (same values; see `main`).
 
     `global agent, opt_state` is LOAD-BEARING, not decoration: this loop REBINDS
-    `agent` (PopArt head rescale, then `train_step`) and `batch_eval` must see
-    the rebound agent. Without it both names would become `_run` locals and the
-    net would either go stale in the search or raise UnboundLocalError.
+    `agent` (PopArt head rescale, then `train_step`) and the jitted carry
+    helpers must see the rebound agent. Without it both names would become
+    `_run` locals and the net would either go stale in the search or raise
+    UnboundLocalError.
     """
     global agent, opt_state
     # Phase map, shared with `ppo_ray._run` so the two trainers read in the same
@@ -1024,13 +1231,22 @@ def _run(args) -> int:
         _seed_rows = []
         for _wi in range(_pie):
             _wst = []
-            _wg, _wtg = copy_g(GRAPH0), copy_g(TG0)
-            while True:
-                _wlegal = legal_set(_wg)
-                if not _wlegal:
-                    break
-                _wv = _wlegal[int(rng.integers(len(_wlegal)))]
-                step_state(_wg, _wtg, _wst, _wv, rand_micro(rng))
+            # The warm start needs a PLAN, not an observation -- no carry, no
+            # network. It still eliminates on the tokenizer's graph (the only
+            # graph model there is) inside a branch, so the committed
+            # tokenizer is untouched.
+            with PT.branch():
+                while True:
+                    _wlegal = PT.legal(VALID)
+                    if not _wlegal:
+                        break
+                    _wv = _wlegal[int(rng.integers(len(_wlegal)))]
+                    _wm = rand_micro(rng)
+                    _wa = int(_wv) - 1
+                    _wrow, _wfr, _wfs = _step_wire(_wa, _wm)
+                    PT.eliminate(_wv, _wrow, _wfr, _wfs,
+                                 is_last=(len(_wlegal) == 1))
+                    _wst.append((_wa, _wm))
             _wraw = measure(_wst)
             if _wraw is None:
                 print(f"[popart-init] episode {_wi + 1}/{_pie} measure FAILED",
@@ -1103,27 +1319,49 @@ def _run(args) -> int:
             print("[popart-init] too few usable measurements; keeping zero "
                   "init", flush=True)
 
-    MAXTOK = 0
     # --- 5. loop: act/search -> measure -> popart -> pareto -> train ---
     while n_meas < args.total_measurements:
         ep += 1
-        state = []; graph, tg = copy_g(GRAPH0), copy_g(TG0)
+        # A fresh episode = a fresh tokenizer at the base, and a fresh carry
+        # built from the base stream under the CURRENT weights. The carry is
+        # params-dependent, so it can never outlive a train_step.
+        PT.reset()
+        state = []
+        carry = Carry(*_carry_init(agent), _zero_residual())
         steps = []
         _memlog = os.environ.get("ALPHAGRAD_GAZ_MEMLOG", "0") == "1"
         _dstep = 0
+        # Golden-equivalence accumulator: base ++ concat(per-decision deltas).
+        _gold_stream = list(_BASE_TOKS)
+        _gold_ids = list(_BASE_IDS)
         while True:
-            legal = legal_set(graph)
+            legal = PT.legal(VALID)
             if not legal:
                 break
-            chosen, pi, la, legal = gumbel_search(state, graph, tg, rng)
-            tok, eqn = tokens_of(state)
-            steps.append({"tok": np.asarray(tok), "eqn": np.asarray(eqn),
-                          "la": la.copy(), "pi": pi.copy()})
+            chosen, pi, la, legal, ctxs = gumbel_search(state, carry, rng)
             _mk = chosen.get("micro")
             _MICRO_CHOICES["none" if _mk is None else
                            {"q": "quant", "d": "diag", "c": "compress",
                             "s": "skip"}.get(_mk[0], "other")] += 1
-            step_state(graph, tg, state, chosen["v"], chosen["micro"])
+            # PRE-step snapshot (§7b): the carry synced to the PREVIOUS step's
+            # delta, plus THIS step's delta. The loss re-derives this step's
+            # encoding by the same extension.
+            _pre = carry
+            state, carry, d = _step((state, carry, ctxs),
+                                    chosen["v"], chosen["micro"])
+            _assert_terminal_prediction(d)
+            _gold_stream += list(d["tokens"])
+            _gold_ids += list(d["eqn_ids"])
+            steps.append({
+                "enc_M": np.asarray(_pre.enc.M), "enc_I": np.asarray(_pre.enc.I),
+                "enc_ch": np.asarray(_pre.enc.cumhist),
+                "enc_nv": np.asarray(_pre.enc.nvalid),
+                "enc_pos": np.asarray(_pre.enc.pos),
+                "vmem_s": np.asarray(_pre.vs), "vmem_c": np.asarray(_pre.vc),
+                "resid": np.asarray(_pre.residual),
+                "dtok": d["delta"][0], "deqn": d["delta"][1],
+                "dcnt": np.int32(d["delta"][2]), "owner": np.int32(d["owner"]),
+                "la": la.copy(), "pi": pi.copy()})
             _dstep += 1
             if _memlog and _dstep % 5 == 0:
                 try:
@@ -1131,9 +1369,11 @@ def _run(args) -> int:
                     print(f"[gaz][mem] ep={ep} decision={_dstep}/{len(legal)+_dstep} "
                           f"peak={ms.get('peak_bytes_in_use',0)/1e9:.2f}GB "
                           f"curr={ms.get('bytes_in_use',0)/1e9:.2f}GB "
-                          f"tokcache={len(_tok_cache)} evalcache={len(_eval_cache)}", flush=True)
+                          f"delta={int(d['delta'][2])}", flush=True)
                 except Exception:
                     pass
+        if _GOLD_CHECK:
+            _golden_equivalence(state, _gold_stream, _gold_ids, ep)
         raw = measure(state)
         n_meas += 1
         if raw is None:
@@ -1154,7 +1394,9 @@ def _run(args) -> int:
             return m, s
         agent = _ppo_popart_rescale_heads(
             agent, *_stats4(_o_mu, _o_sig), *_stats4(_n_mu, _n_sig))
-        _eval_cache.clear()          # value head rescaled -> cached (prior, value) stale
+        # No cache to invalidate: carries are params-dependent and are rebuilt
+        # from the base at every episode, so a rescaled value head cannot be
+        # read through a stale one.
         # Pareto front over RAW {lat, xla_peak, cos} (sign-oriented; archive maximises)
         _pareto.add(_PSGN * raw,
                     [(int(a), list(m) if m else None) for a, m in state], ep)
@@ -1175,29 +1417,35 @@ def _run(args) -> int:
         # magnitudes ~1e4-1e6 would explode the value loss before MU/SD are set) ----
         flat = [s for epi in replay for s in epi]
         if len(flat) >= 8 and popart.n_updates >= 8:
-            # fixed shapes (tok already TOKCAP-padded; legal set <= NV) -> train_step
-            # compiles ONCE instead of re-jitting as episode lengths vary
-            MAXTOK = TOKCAP
+            # fixed shapes (delta buffers are MAX_DELTA_TOKENS-wide; legal set
+            # <= NV) -> train_step compiles ONCE instead of re-jitting as
+            # episode lengths vary
             MAXLA = NV
             def pad(x, n, v=0):
                 return np.pad(x, (0, n - len(x)), constant_values=v)
-            toks = jnp.asarray([pad(s["tok"], MAXTOK) for s in flat])
-            eqns = jnp.asarray([pad(s["eqn"], MAXTOK) for s in flat])
+            def stk(k):
+                return jnp.asarray(np.stack([s[k] for s in flat]))
+            enc_M, enc_I = stk("enc_M"), stk("enc_I")
+            enc_ch, enc_nv, enc_pos = stk("enc_ch"), stk("enc_nv"), stk("enc_pos")
+            vmem_s, vmem_c, resid = stk("vmem_s"), stk("vmem_c"), stk("resid")
+            dtok, deqn = stk("dtok"), stk("deqn")
+            dcnt, owner = stk("dcnt"), stk("owner")
             la_p = jnp.asarray([pad(s["la"], MAXLA) for s in flat])
             la_m = jnp.asarray([pad(np.ones(len(s["la"])), MAXLA) for s in flat])
             pi_p = jnp.asarray([pad(s["pi"], MAXLA) for s in flat])
             vt = jnp.asarray([(s["raw4"] - popart.mu) / popart.sigma for s in flat])  # PopArt-normalised
             vm = jnp.asarray(np.broadcast_to(np.abs(W4) > 0, (len(flat), 4)).astype(np.float32))
+            _cols = (enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
+                     resid, dtok, deqn, dcnt, owner, la_p, la_m, pi_p, vt, vm)
             # M5: resample the minibatch EVERY epoch. Taking one fixed 64-sample
             # draw and hitting it ``train_epochs`` times overfits that draw and
             # discards the rest of the replay for this update.
+            _bs = int(os.environ.get("ALPHAGRAD_GAZ_BATCH", "64"))
             for _ in range(args.train_epochs):
-                idx = rng.permutation(len(flat))[:64]
-                batch = tuple(x[jnp.asarray(idx)]
-                              for x in (toks, eqns, la_p, la_m, pi_p, vt, vm))
+                idx = jnp.asarray(rng.permutation(len(flat))[:_bs])
+                batch = tuple(x[idx] for x in _cols)
                 agent, opt_state, L = train_step(agent, opt_state, batch)
             L = float(L)
-            _eval_cache.clear()          # net changed -> cached (prior, value) stale
         else:
             L = float("nan")
         b = best["raw"]
@@ -1350,21 +1598,27 @@ def _run(args) -> int:
                 if _AP_ENT:
                     _log["entropy/approx_head"] = float(np.mean(_AP_ENT))
                 # entropy/palimpsa: the ENCODER's mean attention-row entropy on
-                # the ROOT state (same input every episode, so the curve
-                # isolates the encoder's drift). Representation-collapse
-                # diagnostic -- NOT a policy entropy, NOT comparable in units
-                # to the two keys above. Same helper ppo uses, so the two arms
-                # measure the identical quantity.
+                # the ROOT state -- now the BASE stream itself (the root state
+                # IS the base under the append-only tokenizer), same input
+                # every episode, so the curve isolates the encoder's drift.
+                # Representation-collapse diagnostic -- NOT a policy entropy,
+                # NOT comparable in units to the two keys above. Same helper
+                # ppo uses, so the two arms measure the identical quantity.
                 if _ATTN_ENTROPY_ON:
                     try:
-                        _rt, _re = tokens_of([])
                         _pe = float(_attn_ent_diag(
-                            agent, jnp.asarray(_rt), jnp.asarray(_re),
+                            agent, BASE_TOK, BASE_EQN,
                             env.axis_state_static, env.axis_valid_static))
                         if _pe == _pe:      # not NaN
                             _log["entropy/palimpsa"] = _pe
                     except Exception:
                         pass
+                # SILENT-FAILURE 1 telemetry: candidates whose WIRE bytes
+                # differ but whose TOKEN bytes do not. Non-zero steady state
+                # means an action the search cannot see.
+                _log["search/tied_candidates"] = int(_TIED_CANDIDATES[0])
+                _log["search/tied_fraction"] = (
+                    _TIED_CANDIDATES[0] / max(_TIED_TOTAL[0], 1))
                 # Mirror the three head entropies to stdout under the same
                 # switch the approximation telemetry uses, so a --wandb
                 # disabled probe (or a dead run's log) still shows them.
@@ -1392,6 +1646,8 @@ def _run(args) -> int:
                     # NEXT successful row covers both episodes honestly instead
                     # of reporting a two-episode average as one episode.
                     _MICRO_CHOICES.clear()
+                    _TIED_CANDIDATES[0] = 0
+                    _TIED_TOTAL[0] = 0
                     _VE_ENT.clear()
                     _AP_ENT.clear()
                     _t_prev = _now
