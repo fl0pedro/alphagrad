@@ -517,6 +517,9 @@ class EncCarry(NamedTuple):
     pos: jax.Array      # () int32 — stream position consumed so far
 
 
+_FACE_MASK_FAILS = [0]
+
+
 def _stream_len(tokens):
     """Number of real tokens in an append-only buffer (pad id is 0).
 
@@ -4173,8 +4176,25 @@ def main():
                 fp_arr[:] = np.asarray(fp, np.float32)
                 fc_arr[:] = np.asarray(fc, np.float32)
                 fv_arr[: int(nf)] = 1.0
-            except Exception:
-                pass
+            except Exception as _fmexc:
+                # DO NOT SWALLOW (2026-08-05). fv_arr stays ALL-ZERO here,
+                # which marks every face invalid and disables the whole
+                # per-face action space: the head multiplies its skip draw by
+                # face_valid (so skip becomes identically 0), and the
+                # all-zero pair/compress masks leave only END legal (so every
+                # slot draws "none"). Measured before this was visible:
+                # skip=0.0000, none=99.2%, and not one rule ever applied.
+                _FACE_MASK_FAILS[0] += 1
+                _n = _FACE_MASK_FAILS[0]
+                if _n <= 3 or _n % 500 == 0:
+                    print("[oracle] face_masks FAILED for vertex "
+                          f"{int(v)} (count={_n}): "
+                          f"{type(_fmexc).__name__}: {str(_fmexc)[:200]} -- "
+                          "ALL FACES MARKED INVALID, per-face approximation "
+                          "disabled for this vertex", flush=True)
+                    if _n == 1:
+                        import traceback as _tb
+                        _tb.print_exc()
             _res = (np.asarray(pair[v], np.float32),
                     np.asarray(comp[v], np.float32), fp_arr, fc_arr, fv_arr)
             if _k is not None:
