@@ -3874,6 +3874,18 @@ def main():
             if _rt:
                 os.makedirs(_rt, exist_ok=True)
                 _kw["_temp_dir"] = _rt
+            # Ray sizes its worker pool from the MACHINE's cpu count, not the
+            # SLURM allocation. On the 128-CPU node it therefore tried to
+            # start ~128 workers inside a 32-CPU allocation and the raylet
+            # missed its startup deadline on every retry, while the same code
+            # started fine on the 64-CPU nodes. Match the allocation.
+            _ncpu = os.environ.get("SLURM_CPUS_PER_TASK") or os.environ.get(
+                "SLURM_JOB_CPUS_PER_NODE")
+            try:
+                if _ncpu:
+                    _kw["num_cpus"] = max(2, int(str(_ncpu).split("(")[0]))
+            except Exception:
+                pass
             # RETRY: raylet/GCS startup on these nodes intermittently exceeds
             # Ray's internal timeout ("The current node timed out during
             # startup") even with the node to ourselves, and the whole run
