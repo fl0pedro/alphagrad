@@ -1052,6 +1052,20 @@ def _run(args) -> int:
                 _log["approx_skipped/total"] = (
                     _pf.get("skipped", 0) + _pf.get("skipped_raised", 0))
                 _log["approx_applied/fraction"] = _pf.get("applied_fraction", 0.0)
+                # Mirror to stdout (same switch ppo.py uses), so a
+                # --wandb disabled probe or a dead run's log still shows
+                # what the policy chose. NOTE the quantities differ from
+                # PPO's despite the identical keys: PPO counts realized
+                # usage per FACE, AZ counts the chosen class per VERTEX.
+                if os.environ.get("ALPHAGRAD_DEBUG_APPROX_PROB", "0") == "1":
+                    _ap = {_k2: _v2 for _k2, _v2 in _log.items()
+                           if _k2.startswith(("approx_prob/",
+                                              "approx_applied/",
+                                              "approx_skipped/"))}
+                    if _ap:
+                        print("[approx per-vertex] " + " ".join(
+                            f"{_k2.split('/')[-1]}={float(_v2):.4g}"
+                            for _k2, _v2 in sorted(_ap.items())), flush=True)
                 _MICRO_CHOICES.clear()
                 _t_prev = _now
                 wb.log(_log)
