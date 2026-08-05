@@ -56,7 +56,7 @@ def build_live_face_stream(jaxpr, argnums, consts, args, *, max_faces,
     stay exact for the loss's cumsum boundaries.
     """
     if vocab is None:
-        vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "248"))
+        vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "512"))
     if window is None:
         window = _default_window()
     return LiveFaceStream(
