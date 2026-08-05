@@ -106,7 +106,12 @@ from alphagrad.approx.env import (
     VertexEliminationEnv,
     micro_actions_to_rule_specs_jax,
 )
-from alphagrad.approx.live_faces import LiveFaceStream
+from alphagrad.approx.common import carry_stream as _carry_stream
+from alphagrad.approx.common.face_driver import (
+    bind_step_callbacks,
+    build_live_face_stream,
+    make_face_callbacks,
+)
 from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
 from alphagrad.approx.heads import (
     COMPRESS_KINDS,
@@ -4424,10 +4429,10 @@ def main():
     # f-1's approximation in place; the prefix is replayed once per distinct
     # prefix, so the cost is n_faces eliminations per env step.
     _LIVE_FACES = None
+    _live_face = _live_face_count = None
     if getattr(args, "live_faces", False):
-        _LIVE_FACES = LiveFaceStream(
+        _LIVE_FACES = build_live_face_stream(
             _oracle_jaxpr, _oracle_argnums, _oracle_consts, _oracle_args,
-            vocab=int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "248")),
             max_faces=_F_FACES, max_axes=_oracle_N,
             # A chunk is a slice of the step delta, so the delta cap is the
             # one honest window: truncation becomes impossible whenever the
@@ -4441,98 +4446,15 @@ def main():
             # 4x num_envs so the FIFO never evicts an entry the next face
             # substep of the same batch still needs -- a capacity below the
             # env count would turn every substep into a cold replay.
-            cache=int(os.environ.get(
-                "ALPHAGRAD_FACE_PREFIX_CACHE",
-                str(max(64, 4 * _resolve_num_envs(
-                    args.num_envs, args.example))))),
+            # (AZ, with no envs, passes its own capacity;
+            # ALPHAGRAD_FACE_PREFIX_CACHE still overrides.)
+            cache=max(64, 4 * _resolve_num_envs(
+                args.num_envs, args.example)),
         )
-
-    def _live_face_host(order, spec_hist, step_count, vertex_idx,
-                        vertex_specs, face_rows, face_skips, f,
-                        face_hist, skip_hist):
-        # face_hist/skip_hist are the PREFIX's per-face wires -- the (N,
-        # MAX_FACES, FACE_SLOTS, 3) / (N, MAX_FACES) history arrays carried by
-        # the env state, aligned with `order` exactly like `spec_hist` is.
-        # Without them the prefix replay rebuilt an EXACT graph while the
-        # measurement built the approximated one, and the prefix cache keyed
-        # two different plans to one tokenizer.
-        _pt0 = _prof_time.perf_counter()
-        try:
-            _order = np.asarray(order)
-            if _order.ndim == 1:
-                tok, ids, cnt, _nf = _LIVE_FACES.chunk(
-                    order, spec_hist, int(np.asarray(step_count)),
-                    int(np.asarray(vertex_idx)) + 1, vertex_specs,
-                    face_rows, face_skips, int(np.asarray(f)),
-                    face_hist, skip_hist,
-                )
-                return tok, ids, np.asarray(cnt, np.int32)
-            # BATCHED (vmap_method="broadcast_all"): ONE host dispatch per
-            # face substep for all envs. The sequential vmap ran E separate
-            # callbacks with a device round-trip between each — the GPU
-            # idled through E dispatch+sync latencies per substep (the
-            # dominant share of the approx-vs-exact non-host gap). Values
-            # are identical: the same per-env chunk() calls, in env order.
-            B = _order.shape[0]
-            W = int(MAX_DELTA_TOKENS)
-            toks = np.zeros((B, W), np.int32)
-            idss = np.zeros((B, W), np.int32)
-            cnts = np.zeros((B,), np.int32)
-            _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
-            _vi, _vs = np.asarray(vertex_idx), np.asarray(vertex_specs)
-            _fr, _fs = np.asarray(face_rows), np.asarray(face_skips)
-            _fh, _kh = np.asarray(face_hist), np.asarray(skip_hist)
-            _ff = np.asarray(f)
-            for i in range(B):
-                tok, ids, cnt, _nf = _LIVE_FACES.chunk(
-                    _order[i], _sh[i], int(_sc[i]), int(_vi[i]) + 1,
-                    _vs[i], _fr[i], _fs[i], int(_ff[i]),
-                    _fh[i], _kh[i],
-                )
-                toks[i], idss[i], cnts[i] = tok, ids, np.int32(cnt)
-            return toks, idss, cnts
-        finally:
-            _env_prof_add("faces.live_chunk",
-                          _prof_time.perf_counter() - _pt0)
-
-    def _live_face(f, order, spec_hist, step_count, vertex_idx, vertex_specs,
-                   face_rows, face_skips, face_hist, skip_hist):
-        W = MAX_DELTA_TOKENS
-        # f rides as an OPERAND: inside the while_loop it is a tracer, and
-        # a partial would freeze it into the callback as a python object
-        # (TracerArrayConversionError at the first body run).
-        return jax.pure_callback(
-            _live_face_host,
-            (jax.ShapeDtypeStruct((W,), jnp.int32),
-             jax.ShapeDtypeStruct((W,), jnp.int32),
-             jax.ShapeDtypeStruct((), jnp.int32)),
-            order, spec_hist, step_count, vertex_idx, vertex_specs,
-            face_rows, face_skips, f, face_hist, skip_hist,
-            vmap_method="broadcast_all",
-        )
-
-    def _live_face_count_host(order, spec_hist, step_count, vertex_idx,
-                              face_hist, skip_hist):
-        _order = np.asarray(order)
-        if _order.ndim == 1:
-            return np.int32(_LIVE_FACES.n_faces(
-                order, spec_hist, int(np.asarray(step_count)),
-                int(np.asarray(vertex_idx)) + 1, face_hist, skip_hist))
-        # batched: one dispatch per vertex step (see _live_face_host)
-        _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
-        _vi = np.asarray(vertex_idx)
-        _fh, _kh = np.asarray(face_hist), np.asarray(skip_hist)
-        return np.asarray(
-            [_LIVE_FACES.n_faces(_order[i], _sh[i], int(_sc[i]),
-                                 int(_vi[i]) + 1, _fh[i], _kh[i])
-             for i in range(_order.shape[0])], np.int32)
-
-    def _live_face_count(order, spec_hist, step_count, vertex_idx,
-                         face_hist, skip_hist):
-        return jax.pure_callback(
-            _live_face_count_host, jax.ShapeDtypeStruct((), jnp.int32),
-            order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
-            vmap_method="broadcast_all")
+        # The `pure_callback` wrappers themselves now live in
+        # common/face_driver.py so AZ drives the SAME stream, not a copy.
+        _live_face, _live_face_count = make_face_callbacks(
+            _LIVE_FACES, window=MAX_DELTA_TOKENS, prof_sink=_env_prof_add)
 
     _ORACLE_ONE_VERTEX = os.environ.get(
         "ALPHAGRAD_ORACLE_ONE_VERTEX", "1") == "1"
@@ -4838,18 +4760,10 @@ def main():
         # rows into the per-vertex memory (base eqn ids map to vertex slots
         # positionally; structural/overflow → global slot), then each scan
         # step extends by that step's delta only.
-        _enc0 = agent.carry_init()
-        _enc1, _rows0, _valid0, _eqns0 = agent.encode_extend(
-            _enc0, _BASE_TOK, _BASE_EQN, _BASE_N,
-            window=_BASE_W, start=0,
+        init_enc_state = _carry_stream.init_carry(
+            agent, _BASE_TOK, _BASE_EQN, _BASE_N,
+            window=_BASE_W, total_v=total_v, embd_dim=args.embd_dim,
         )
-        _base_ids = jnp.where(
-            (_eqns0 >= 0) & (_eqns0 < total_v), _eqns0, -1
-        )
-        _vs0 = jnp.zeros((total_v + 1, args.embd_dim), jnp.float32)
-        _vc0 = jnp.zeros((total_v + 1,), jnp.float32)
-        _vs0, _vc0 = _vmem.update_ids(_vs0, _vc0, _rows0, _base_ids, _valid0)
-        init_enc_state = (_enc1, _vs0, _vc0)
 
         def step_fn(carry, k):
             state, residual_state, elim_order, enc_state = carry
@@ -4871,16 +4785,13 @@ def main():
             delta_tok = state.delta_tokens
             delta_eqn = state.delta_eqns
             delta_count = state.delta_count
-            enc_carry2, d_rows, d_valid, d_eqns = agent.encode_extend(
-                enc_carry, delta_tok, delta_eqn, delta_count,
-                window=MAX_DELTA_TOKENS, start=0,
+            enc_carry2, vmem_s2, vmem_c2 = _carry_stream.advance(
+                agent, enc_carry, vmem_s, vmem_c,
+                delta_tok, delta_eqn, delta_count, delta_owner,
+                window=MAX_DELTA_TOKENS,
             )
-            d_ids = jnp.where(d_eqns >= 0, delta_owner, -1)
-            vmem_s2, vmem_c2 = _vmem.update_ids(
-                vmem_s, vmem_c, d_rows, d_ids, d_valid
-            )
-            precomputed = agent.heads_from_memory(
-                vmem_s2, vmem_c2,
+            precomputed = _carry_stream.heads(
+                agent, vmem_s2, vmem_c2,
                 vertex_features=vertex_features,
                 residual_state=residual_state,
                 preference=(
@@ -4896,19 +4807,11 @@ def main():
                 # carry), while `_fh`/`_kh` are every decision already
                 # committed to the prefix. The prefix replay needs the latter
                 # or it rebuilds an exact graph the measurement never builds.
-                _fc_o, _fc_s, _fc_k = (
-                    state.order, state.sparsity_specs, state.step_count)
-                _fc_fh, _fc_kh = state.face_specs, state.face_skips
-
-                def face_chunk_fn(_f, _v, _vspecs, _rows, _skips,
-                                  _o=_fc_o, _s=_fc_s, _k=_fc_k,
-                                  _fh=_fc_fh, _kh=_fc_kh):
-                    return _live_face(_f, _o, _s, _k, _v,
-                                      _vspecs, _rows, _skips, _fh, _kh)
-
-                def face_count_fn(_v, _o=_fc_o, _s=_fc_s, _k=_fc_k,
-                                  _fh=_fc_fh, _kh=_fc_kh):
-                    return _live_face_count(_o, _s, _k, _v, _fh, _kh)
+                face_chunk_fn, face_count_fn = bind_step_callbacks(
+                    _live_face, _live_face_count,
+                    state.order, state.sparsity_specs, state.step_count,
+                    state.face_specs, state.face_skips,
+                )
 
             if args.dynamic_substeps:
                 # Live per-vertex DIAG/COMPRESS masks for the current graph
@@ -5058,16 +4961,14 @@ def main():
             # the next scan iteration (kept self-contained rather than
             # threading heads across iterations); deltas are O(hundreds) of
             # tokens, so the duplicate extend is cheap.
-            _, nv_rows, nv_valid, nv_eqns = agent.encode_extend(
-                enc_carry2, next_state.delta_tokens, next_state.delta_eqns,
-                next_state.delta_count, window=MAX_DELTA_TOKENS, start=0,
+            _, nv_s, nv_c = _carry_stream.advance(
+                agent, enc_carry2, vmem_s2, vmem_c2,
+                next_state.delta_tokens, next_state.delta_eqns,
+                next_state.delta_count, vertex_idx.astype(jnp.int32),
+                window=MAX_DELTA_TOKENS,
             )
-            nv_ids = jnp.where(nv_eqns >= 0, vertex_idx.astype(jnp.int32), -1)
-            nv_s, nv_c = _vmem.update_ids(
-                vmem_s2, vmem_c2, nv_rows, nv_ids, nv_valid
-            )
-            _, _, next_value = agent.heads_from_memory(
-                nv_s, nv_c,
+            _, _, next_value = _carry_stream.heads(
+                agent, nv_s, nv_c,
                 vertex_features=vertex_features,
                 residual_state=new_residual,
                 preference=pref_arg,
@@ -5268,19 +5169,17 @@ def main():
             carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
             # The delta is STORED, with its length. The loss re-derives no
             # window from anything, so there is no length to get wrong.
-            carry2, rows, valid, eqw = agent.encode_extend(
-                carry, dtok, deqn, dcnt,
-                window=MAX_DELTA_TOKENS, start=0,
+            carry2, vs2, vc2 = _carry_stream.advance(
+                agent, carry, vs, vc, dtok, deqn, dcnt, owner,
+                window=MAX_DELTA_TOKENS,
             )
-            ids = jnp.where(eqw >= 0, owner, -1)
-            vs2, vc2 = _vmem.update_ids(vs, vc, rows, ids, valid)
             # carry2 is where the sampling side carry branched: the
             # stored pre-step carry advanced past the PREVIOUS delta.
             # The face replay continues from it over the stored emission
             # window. (The rows above are the previous delta's -- the
             # WRONG tokens for face contexts; see face_delta_tokens.)
-            return agent.heads_from_memory(
-                vs2, vc2,
+            return _carry_stream.heads(
+                agent, vs2, vc2,
                 vertex_features=vertex_features,
                 residual_state=rs,
                 preference=pref_or_none(pref),
