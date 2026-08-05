@@ -20,13 +20,17 @@ CLEAN implementation (ignores autoscheduler_loop's surrogate-Gumbel search and m
     knob), action chosen by
     argmax(g + logits + sigma(q)), policy trained by CE to the COMPLETED-Q improved
     target softmax(logits + sigma(completed_q)) over the legal set.
-  * SAMPLED (Hubert 2021, pragmatic): with ALPHAGRAD_GAZ_MICRO=1 each root candidate
-    is (vertex, micro-action) with the micro drawn from an explicit-range proposal
-    (quant/diag/compress/skip, sparse); the search Q decides which survive. The
-    learned heads stay vertex-level in v1 (micro-head learning = follow-up).
-    SKIP = drop the contraction of every face of that vertex (graphax.SKIP_FACE);
-    it is a SEARCH variant only -- see the ("s",) block below for why it is not
-    a MicroActionPolicy output.
+  * APPROXIMATION = PER FACE, from PPO's UnifiedFacePolicy, reading the SAME
+    live per-face token chunks (`common/face_driver.py` -> `live_faces.py`)
+    PPO's head reads. It is drawn ONCE per COMMITTED decision (~NV x
+    mean_faces chunks per episode); the SEARCH proposes and scores at VERTEX
+    granularity, because running the face loop at every sequential-halving
+    expansion would be ~12x PPO's chunk count. Face variants inside the
+    search are a later stage. The per-VERTEX micro-action space is gone.
+  * The approximation head is TRAINED, not frozen: `Agent._face_replay`
+    re-scores the stored FaceAction off ONE scan of the stored emission
+    window ("gradient reaches palimpsa through this scan"), and its log-prob
+    enters the loss as a REINFORCE term with the critic as baseline.
   * Real measurements ONLY at episode terminals (budget = --total-measurements).
   * Objective identical to the E2 campaign: equal-weight z-scored
     {cosine_sim, latency_ns, peak_memory}; flops unrewarded.
@@ -57,7 +61,8 @@ import optax
 from alphagrad.approx.env import (
     FACE_SLOTS, MAX_FACES as ENV_MAX_FACES, SENTINEL_COST,
     VertexEliminationEnv, _callback, REWARD_INDEX, REWARD_NAMES,
-    consume_per_face_stats, MAX_DELTA_TOKENS, _record_delta_truncation)
+    consume_per_face_stats, MAX_DELTA_TOKENS, _record_delta_truncation,
+    MAX_RULES_PER_VERTEX, MAX_AXES_PER_VERTEX)
 
 # Full 8-channel reward of the most recent measurement (PPO REWARD_NAMES
 # layout) — logged as ``mean_<name>`` for wandb parity with the PPO arms.
@@ -70,7 +75,6 @@ from alphagrad.approx.common.eval_samples import generate_eval_samples
 # builds (a rule that does not fit one face is skipped for that face, not
 # raised for the whole vertex).
 from alphagrad.approx.common.masks import make_live_masked_hook
-from alphagrad.approx.common.order_specs import build_order_specs
 from alphagrad.approx.common.popart import PopArtStats
 from alphagrad.approx.common.pareto_archive import ParetoArchive
 # THE tokenizer: graphax's IncrementalPathTokenizer, driven exactly as PPO's
@@ -81,7 +85,6 @@ from alphagrad.approx.common.pareto_archive import ParetoArchive
 # PPO for the entire comparison; `tk.last_eqn_ids()` supplies real ids here).
 from alphagrad.approx.common.plan_tokens import PlanTokenizer
 from alphagrad.approx.common import carry_stream as _cs
-from graphax.sparse.micro_actions import COMPRESS_KINDS
 
 # ------------------------------------------------------- 1. config/env (measure_worker pattern)
 TASK = A.task; DSET = A.dataset
@@ -116,6 +119,19 @@ env = VertexEliminationEnv.from_jaxpr(
     slow_exec_cutoff_seconds=0.0, flop_gate_threshold=0.0, measure_grad=_GAZ_MGRAD,
     latency_inner_reps=A.latency_inner_reps, latency_timer="perf_counter")
 ev = generate_eval_samples(env, ek, A.ndata)
+
+# FACE WIDTH. `from ... import MAX_FACES as ENV_MAX_FACES` binds a VALUE at
+# import time, so the module default would stick even after the per-graph
+# bound is configured -- every face wire, the head's max_faces and the replay
+# zero-fills all read this. Derive and rebind BEFORE anything builds a shape
+# from it, exactly as ppo.main() does under --face-actions.
+from alphagrad.approx import env as _env_mod              # noqa: E402
+_FACE_BOUND = _env_mod.derived_max_faces(
+    closed.jaxpr, ARGN, closed.literals, xs)
+_env_mod.configure_max_faces(_FACE_BOUND)
+ENV_MAX_FACES = _env_mod.MAX_FACES
+print(f"[gaz] face width: derived bound {_FACE_BOUND} "
+      f"(max_v |anc|x|desc|; in force: {ENV_MAX_FACES})", flush=True)
 
 # ---- W3-durable: optional GPU-pinned Ray measure pool --------------------
 # ALPHAGRAD_GAZ_RAY_MEASURE=N spawns N measure actors the way ppo.py does, so
@@ -175,12 +191,13 @@ env = eqx.tree_at(lambda e: e.eval_args_samples, env, ev)
 jaxpr = closed.jaxpr
 VALID = list(np.asarray(env.valid_vertices, dtype=np.int32)); NV = len(VALID)
 # Two vertex-indexing conventions coexist: net_eval/rollouts use
-# ``VALID.index(v)`` while the micro head indexes contexts by ``v - 1``. They
-# agree only while VALID is contiguous 1..NV. Fail loudly rather than silently
-# scoring the wrong vertex on a task whose jaxpr has an early output eqn.
+# ``VALID.index(v)`` while every head indexes by ``v - 1`` (vertex logits,
+# vertex contexts, vmem slots, axis_state rows). They agree only while VALID
+# is contiguous 1..NV. Fail loudly rather than silently scoring the wrong
+# vertex on a task whose jaxpr has an early output eqn.
 assert VALID == list(range(1, NV + 1)), (
     f"VALID must be contiguous 1..{NV} for the vertex-index conventions to "
-    f"agree; got {VALID[:8]}... (see az_gumbel learned_micro vs net_eval)")
+    f"agree; got {VALID[:8]}...")
 TOTAL_V = len(jaxpr.eqns)
 # ONE graph model. `PlanTokenizer.legal` reads the TOKENIZER's own
 # `tk.ij.graph`, which is built by the same `_build_graph`/`_prune_graph` and
@@ -281,130 +298,63 @@ def scalarize(raw4):
 _PSGN = np.array([-1.0, -1.0, -1.0, 1.0], dtype=np.float64)   # over [lat,peak,flops,cos]
 _pareto = ParetoArchive(["latency_ns", "peak_memory", "cosine_sim"], [0, 1, 3])
 
-# ---------------------------------------------------------------- state <-> tokens
-QD = [d for d in os.environ.get(
-    "ALPHAGRAD_QUANT_ALLOWED", "int8,int16,bfloat16,float16").split(",") if d]
-GAZ_MICRO = os.environ.get("ALPHAGRAD_GAZ_MICRO", "0") == "1"
-MICRO_P = float(os.environ.get("ALPHAGRAD_GAZ_MICRO_P", "0.25"))
-MAXAX = int(os.environ.get("ALPHAGRAD_GAZ_MAX_AX", "2"))
-FACS = [int(x) for x in os.environ.get("ALPHAGRAD_GAZ_FACTORS", "2,3,4").split(",")]
-# ---------------------------------------------------------------- SKIP ("s",)
-# The fourth micro op: DROP the contraction of EVERY face of this vertex
-# (graphax.SKIP_FACE per face, carried on the face_skips wire -- see measure).
+# ------------------------------------------------- the APPROXIMATION space
+# PER-VERTEX APPROXIMATIONS ARE GONE (owner: "we won't be keeping the vertex
+# based approximations"). Deleted with them: rand_micro, micro_str, _rules_of,
+# _tok_rules_of, seq_of, QD, GAZ_MICRO, MICRO_P, MAXAX, FACS, GAZ_SKIP,
+# K_MICRO, learned_micro, _ctx_fwd, _LM_TABLES, GAZ_MICRO_LEARNED,
+# ALPHAGRAD_GAZ_SEARCH_HOOKS and its M6 hook branch -- and the crc32 SKIP_FACE
+# tag hack, which existed only because VEJaxpr had no way to render a skip;
+# the path tokenizer emits a real ``approx SKIP`` header, so the opaque tag
+# was dead weight AND the reason the search could not see a skip at all.
 #
-# ASYMMETRY, deliberate and documented: PPO's skip is per FACE
-# (UnifiedFaceHead.sample draws one Bernoulli per face); az decides per VERTEX,
-# so "skip all of this vertex's faces" is the closest faithful variant az's
-# action space can express. Exact parity is impossible until the per-face
-# action space lands on az (W5).
-#
-# SKIP IS A SEARCH VARIANT, NOT A POLICY OUTPUT. It is deliberately NOT an
-# output of MicroActionPolicy: that head is SHARED with PPO and a fourth op
-# there would perturb PPO's heads. gumbel_search proposes it, the value net
-# scores it, and the completed-Q improved-policy target teaches the VERTEX
-# policy where skipping pays.
-GAZ_SKIP = os.environ.get("ALPHAGRAD_GAZ_SKIP", "1") == "1"
-
-def rand_micro(rng, force=False):
-    """SAMPLED proposal for a candidate's micro-action (explicit ranges).
-    force=True always returns a non-None micro (root candidate variants)."""
-    if not GAZ_MICRO or (not force and rng.random() >= MICRO_P):
-        return None
-    op = int(rng.integers(4 if GAZ_SKIP else 3))
-    if op == 0:
-        return ("q", QD[int(rng.integers(len(QD)))])
-    if op == 1:
-        i = int(rng.integers(MAXAX)); j = (i + 1) % max(MAXAX, 2)
-        return ("d", i, j, FACS[int(rng.integers(len(FACS)))])
-    if op == 2:
-        return ("c", int(rng.integers(MAXAX)),
-                int(rng.integers(len(COMPRESS_KINDS))))
-    return ("s",)
-
-def micro_str(m):
-    if m is None: return []
-    if m[0] == "q": return ["quant('%s')" % m[1]]
-    if m[0] == "d": return ["diag(%d,%d,%d)" % (m[1], m[2], m[3])]
-    # WIRE FORMAT: build_order_specs/parse_calls recognise "skip()" and route
-    # it to the face_skips array (it decodes to no rule spec), so seq_of ->
-    # build_order_specs round-trips a skip without a format hack.
-    if m[0] == "s": return ["skip()"]
-    return ["compress('%s',%d)" % (COMPRESS_KINDS[m[2]], m[1])]
-
-def _rules_of(m):
-    """micro tuple -> graphax rule objects (for the append-only micro tokens).
-
-    A SKIP is NOT a rule object -- it is ``graphax.SKIP_FACE`` applied per
-    face -- so this returns () for ("s",), exactly like None. The skip travels
-    on the face_skips array instead (see ``measure``). Where the STATE has to
-    stay distinguishable, use ``_tok_rules_of``."""
-    from graphax.sparse.micro_actions import Diag as _D, Compress as _C, Quant as _Q
-    if m is None: return ()
-    if m[0] == "q": return (_Q(dtype=m[1]),)
-    if m[0] == "d": return (_D(i=int(m[1]), j=int(m[2]), factor=int(m[3])),)
-    if m[0] == "s": return ()
-    return (_C(axes=(int(m[1]),), kind=COMPRESS_KINDS[m[2]]),)
-
-def _tok_rules_of(m):
-    """TOKENIZER-side transforms for one micro: ``_rules_of`` except a SKIP
-    emits ``graphax.SKIP_FACE``, which VEJaxpr encodes through its opaque
-    -transform tag (``<crc32(repr(t))>``; repr is the stable string
-    "graphax.SKIP_FACE", so trainer and measure actors agree).
-
-    LOAD-BEARING for the search: with ``_rules_of`` here the skip variant of a
-    vertex would tokenize IDENTICALLY to the plain variant, so the value net
-    would score the two the same, and sequential halving (stable argsort over
-    tied g+logit+sigma(Q)) would always keep the plain one -- the action would
-    exist and never be chosen."""
-    if m is not None and m[0] == "s":
-        from graphax import SKIP_FACE as _SK
-        return (_SK,)
-    return _rules_of(m)
-
-def seq_of(state):
-    """state = list of (action_idx, micro-or-None) -> build_order_specs seq."""
-    return [(int(a), micro_str(m)) for a, m in state]
+# AZ eliminates at the VERTEX level and approximates at the FACE level,
+# through the SAME UnifiedFacePolicy PPO trains. The per-vertex rule rows are
+# therefore ALWAYS the exact END rows, exactly as ppo.py sets them under
+# --live-faces ("No per-vertex head: the vertex rules are ALWAYS the exact END
+# rows -- approximation is purely per-face").
+EXACT_SPEC_ROW = np.full((MAX_RULES_PER_VERTEX, 3), -1, dtype=np.int32)
+EXACT_SPEC_ROW[:, 2] = 0
+EXACT_FACE_ROWS = np.full((int(ENV_MAX_FACES), FACE_SLOTS, 3), -1, dtype=np.int32)
+EXACT_FACE_SKIPS = np.zeros((int(ENV_MAX_FACES),), dtype=np.int32)
 
 
 # ---------------------------------------------------------------- the WIRE
-# ONE builder for the arrays that go to BOTH the tokenizer and the
-# measurement. Previously the tokenizer got graphax rule OBJECTS (VEJaxpr
+# ONE builder for the arrays that go to the tokenizer, the measurement AND the
+# dumps. Previously the tokenizer got graphax rule OBJECTS (VEJaxpr
 # transforms) while `measure` built spec ROWS from `build_order_specs`; two
 # encoders of the same decision is how they drift.
 #
-# `build_order_specs` is per-step independent -- `specs[k]` depends only on
-# that step's calls and its resolved vertex id -- so one step's row can be
-# built on its own and appended, which is what an incremental search needs.
-def _step_wire(action_idx, micro):
-    """One decision -> ``(spec_row (MAX_RULES,3), face_rows, face_skips)``."""
-    _o, _s, _n, _sk = build_order_specs(
-        [(int(action_idx), micro_str(micro))], env, return_skips=True)
-    rows = np.full((int(ENV_MAX_FACES), FACE_SLOTS, 3), -1, dtype=np.int32)
-    skips = np.zeros((int(ENV_MAX_FACES),), dtype=np.int32)
-    if bool(_sk[0]):
-        # "skip every face of this vertex" -- env._face_dict_for_vertex only
-        # reads the first len(faces_of(v)) entries, so the padding is inert.
-        skips[:] = 1
-    return np.asarray(_s[0], dtype=np.int32), rows, skips
-
-
+# A plan step is ``(action_idx, face_rows, face_skips)``. There is no
+# per-vertex rule any more, so `build_order_specs` (whose entire job was
+# parsing micro CALL STRINGS) leaves this path: the order is the action
+# indices + 1 and the specs are the constant exact rows. The face arrays come
+# straight off `to_env_action_dynamic`'s translator, so AZ and PPO write
+# IDENTICAL wire bytes for the same FaceAction.
 def plan_wires(state):
-    """A whole plan -> ``(order, specs, face_rows, face_skips)``.
-
-    THE wire. The tokenizer, the measurement and the dumps all read these
-    same four arrays, so a decision cannot be expressed one way to the
-    observation and another way to the measurement.
-    """
-    order, specs, _n, skips = build_order_specs(
-        seq_of(state), env, return_skips=True)
-    n = len(order)
-    face_rows = np.full((n, int(ENV_MAX_FACES), FACE_SLOTS, 3), -1,
-                        dtype=np.int32)
-    face_skips = np.zeros((n, int(ENV_MAX_FACES)), dtype=np.int32)
+    """A whole plan -> ``(order, specs, face_rows, face_skips)``."""
+    n = len(state)
+    order = np.array([int(a) + 1 for a, _fr, _fs in state], dtype=np.int32)
+    specs = np.broadcast_to(
+        EXACT_SPEC_ROW, (n,) + EXACT_SPEC_ROW.shape).copy()
     if n:
-        face_skips[np.asarray(skips, dtype=bool)] = 1
-    return (np.asarray(order, dtype=np.int32),
-            np.asarray(specs, dtype=np.int32), face_rows, face_skips)
+        face_rows = np.stack([np.asarray(fr, np.int32) for _a, fr, _fs in state])
+        face_skips = np.stack([np.asarray(fs, np.int32) for _a, _fr, fs in state])
+    else:
+        face_rows = np.zeros((0,) + EXACT_FACE_ROWS.shape, dtype=np.int32)
+        face_skips = np.zeros((0,) + EXACT_FACE_SKIPS.shape, dtype=np.int32)
+    return order, specs, face_rows, face_skips
+
+
+def state_to_json(state):
+    """Serialisable plan. The FACE WIRES ride along -- a dump that stored only
+    the order (or only per-vertex micros, as it used to) is NOT replayable
+    under per-face approximation: re-measuring it would build the EXACT plan
+    and silently report a different cosine."""
+    return [{"vertex": int(a) + 1,
+             "face_rows": np.asarray(fr, np.int32).tolist(),
+             "face_skips": np.asarray(fs, np.int32).tolist()}
+            for a, fr, fs in state]
 
 
 def _wire_delta(toks, ids):
@@ -454,15 +404,20 @@ def _clear_measure_caches(force: bool = False) -> None:
 
 
 def measure(state):
-    """Terminal REAL measurement -> [lat, xla_peak, flops, cos] or None.
-    ALPHAGRAD_MEASURE_SERVER=1 -> measure in an isolated SUBPROCESS (a CUDA-
-    poisoned kernel kills the child, not this training process)."""
+    """Terminal REAL measurement -> [lat, xla_peak, flops, cos] or None."""
     global _ms_client
     if _MS:
-        if _ms_client is None:
-            from alphagrad.approx.measure_client import MeasureClient
-            _ms_client = MeasureClient()
-        return _ms_client.measure_seq(seq_of(state))
+        # ALPHAGRAD_MEASURE_SERVER=1 used to measure in an isolated SUBPROCESS
+        # over a CALL-STRING sequence (`measure_seq`). That wire has no
+        # per-face representation at all, so under per-face approximation it
+        # would silently measure the EXACT plan and report its cosine as the
+        # approximated plan's. RAISE instead of measuring the wrong graph.
+        raise NotImplementedError(
+            "ALPHAGRAD_MEASURE_SERVER=1 cannot carry the per-face wires "
+            "(face_rows / face_skips): its measure_seq protocol is a list of "
+            "per-vertex CALL STRINGS. It would measure the exact plan and "
+            "report it as the approximated one. Unset it, or extend the "
+            "measure server's protocol first.")
     try:
         # THE SAME four wire arrays the tokenizer read (`plan_wires`). Slot 0
         # is the per-face rule rows, slot 1 the face_skips -- the latter is
@@ -559,16 +514,16 @@ from alphagrad.approx.common.agent_factory import (      # noqa: E402
 _ns = _ppo_make_argparser().parse_args([])
 apply_policy_arch(
     _ns,
-    # The approximation-head surface is the ONLY legitimate divergence, and it
-    # is set explicitly here rather than inherited from a default. AZ acts per
-    # VERTEX today; W5 moves it onto PPO's per-face streamed action space, at
-    # which point these match PPO's too.
+    # W5: THE SAME approximation-head surface PPO builds. There is no longer a
+    # legitimate divergence here -- `micro_action_policy` is None on both arms
+    # and the approximation head is the per-FACE UnifiedFacePolicy on both.
+    # AZ eliminates per VERTEX and approximates per FACE, exactly like PPO.
     dynamic_substeps=True,
     unified_head=False,
     no_approx_head=False,
-    face_actions=False,
-    unified_face_head=False,
-    live_faces=False,
+    face_actions=True,
+    unified_face_head=True,
+    live_faces=True,
     max_substeps=1,
     axis_group_embedding=False,
 )
@@ -649,117 +604,132 @@ def _q_of(value3):
     return float(W4[0] * v[0] + W4[1] * v[1] + W4[3] * v[2])
 
 
-# ---------------- stage-3: LEARNED Sampled-AZ micro proposals ----------------
-# Root candidate micros drawn from the mainline MicroActionPolicy under the
-# LIVE oracle masks (per-state replay), instead of rand_micro's blind
-# explicit-range draw — proposals are legal-by-construction on the vertex's
-# live edge, and improve as the heads train. ALPHAGRAD_GAZ_MICRO_LEARNED=0
-# restores the blind draw.
-GAZ_MICRO_LEARNED = os.environ.get("ALPHAGRAD_GAZ_MICRO_LEARNED", "1") == "1"
-from alphagrad.approx.common.masks import LiveVertexMaskOracle as _LVMO
-from alphagrad.approx.heads import precompute_factor_tables as _pft
-from alphagrad.approx.env import (
-    decode_vertex_rule_specs as _decode_rows,
-    micro_actions_to_rule_specs_jax as _micro_to_rows,
-)
-from alphagrad.approx.ppo import (
+# ------------------------------------- the PER-FACE head (PPO's, verbatim)
+# `agent.micro_action_policy` is None and `agent.face_path_policy` is the
+# UnifiedFacePolicy -- the SAME two facts hold on PPO under --live-faces. The
+# stream the head reads, the host callbacks that feed it and the per-step
+# prefix binding all come from common/face_driver.py: the same objects
+# ppo.main() drives, not a second copy. A second copy is exactly how the
+# face-index shift survived unnoticed for months.
+from alphagrad.approx.common.face_driver import (      # noqa: E402
+    bind_step_callbacks, build_live_face_stream, make_face_callbacks)
+from alphagrad.approx.heads import (                   # noqa: E402
+    NUM_OPS as _NUM_OPS, OP_COMPRESS as _OP_COMPRESS, OP_DIAG as _OP_DIAG,
+    OP_END as _OP_END, OP_QUANT as _OP_QUANT,
+    precompute_factor_tables as _pft)
+from alphagrad.approx.ppo import (                     # noqa: E402
     _axis_features_from_state as _axis_feats,
     attention_entropy_diagnostic as _attn_ent_diag,
     _ATTN_ENTROPY_ON,
 )
-from graphax.sparse.micro_actions import Compress as _GxC, Diag as _GxD, Quant as _GxQ
 
-_LM_TABLES = None
-_lm_oracle_cache: dict = {}
+assert agent.micro_action_policy is None, (
+    "the per-VERTEX approximation head is still built -- AZ approximates per "
+    "FACE now, and a live micro head would be a second, untrained action "
+    "space PPO does not have")
+assert agent.face_path_policy is not None, (
+    "no per-face head was built: check face_actions/unified_face_head/"
+    "live_faces in the agent factory call above")
+
+LIVE_FACES = build_live_face_stream(
+    jaxpr, ARGN, list(closed.literals), list(xs),
+    max_faces=int(ENV_MAX_FACES), max_axes=MAX_AXES_PER_VERTEX,
+    # A chunk is a slice of the step delta, so the delta cap is the one
+    # honest window -- identical to PPO's choice.
+    window=MAX_DELTA_TOKENS,
+    # AZ has no envs, so PPO's max(64, 4 * num_envs) is a formula in a number
+    # that does not exist here. The live working set is ONE prefix (all faces
+    # of the current vertex share it), so any capacity >= 1 is warm; 64 keeps
+    # the previous decisions' prefixes around for the loss-free re-reads.
+    cache=int(os.environ.get("ALPHAGRAD_GAZ_FACE_PREFIX_CACHE", "64")),
+)
+_live_face, _live_face_count = make_face_callbacks(
+    LIVE_FACES, window=MAX_DELTA_TOKENS, prof_sink=None)
+
+# WARM THE QUANT HARDWARE SCAN EAGERLY, before anything is traced. Its own
+# docstring demands it ("Warm this once at build (eagerly, before any jit) so
+# the jnp.dot probes never run under trace") and PPO does it in main(). AZ has
+# TWO separate jits over the face head -- `_face_plan` at rollout and
+# `train_step` in the loss -- so a cache first filled under `_face_plan`'s
+# while_body handed `train_step` a DEAD TRACER:
+#   UnexpectedTracerError: float32[24] ... created at
+#   micro_actions.py:299 (verify_hardware_compat), leaked from
+#   Agent._face_loop._body traced for while_body.
+# PPO never saw it because its rollout and its loss are traced inside the same
+# jit. Warming here makes the tables concrete constants for both.
+try:
+    from graphax.sparse.micro_actions import report_hardware_scan as _hw_scan
+    _hw_scan()
+except Exception as _hwe:
+    print(f"[quant-scan] unavailable: {_hwe!r}", flush=True)
+
+FACT_TABLES = _pft(_ns.max_axis_size)
+# (NUM_OPS,) all-ones: AZ runs no --variant curriculum, so nothing is masked
+# out of the op alphabet. Sampling and the loss MUST pass the same array or
+# the re-scored log-prob is not the behaviour policy's.
+OP_OVERRIDE = jnp.ones((_NUM_OPS,), dtype=jnp.float32)
+AXIS_STATE = env.axis_state_static
+AXIS_VALID = env.axis_valid_static
+_PREFIX_W = max(NV, 1)
 
 
-def _rule_to_tuple(rule):
-    if isinstance(rule, _GxD):
-        return ("d", int(rule.i), int(rule.j), int(rule.factor))
-    if isinstance(rule, _GxC):
-        kind = rule.kind if isinstance(rule.kind, str) else str(rule.kind)
-        return ("c", int(rule.axes[0]), COMPRESS_KINDS.index(kind))
-    if isinstance(rule, _GxQ):
-        try:
-            name = np.dtype(rule.dtype).name
-        except Exception:
-            name = str(rule.dtype)
-        return ("q", name)
-    return None
+def _prefix_arrays(state):
+    """The committed prefix in the wire shapes `bind_step_callbacks` wants.
 
-
-def learned_micro(ctxs, state, vertex, key):
-    """One masked draw from the mainline micro policy for ``vertex`` at the
-    graph produced by ``state``; None on END or any mask/replay failure (the
-    candidate then enters plain, exactly like rand_micro's None).
-
-    ``ctxs`` are the per-vertex contexts of the CURRENT node, already
-    materialised by the carry heads -- there is no second encode any more.
+    `order` / `spec_hist` / `face_hist` / `skip_hist` are aligned 1:1 and
+    sliced to `step_count` on the host side, exactly like the env state
+    arrays PPO passes.
     """
-    global _LM_TABLES
-    if agent.micro_action_policy is None:
-        return None
-    N = int(env.axis_state_static.shape[1])
-    if _LM_TABLES is None:
-        _LM_TABLES = _pft(max(8, int(np.asarray(env.axis_state_static)[..., 0].max())))
-    k = ("lm",) + _skey(state)
-    o = _lm_oracle_cache.get(k)
-    if o is None:
-        try:
-            o = _LVMO(jaxpr, list(closed.literals), list(xs), tuple(ARGN),
-                      max_axes=N)
-            for a, m in state:
-                o.advance(VALID[int(a)], rules=_rules_of(m))
-        except Exception:
-            return None
-        if len(_lm_oracle_cache) > 256:
-            _lm_oracle_cache.clear()
-        _lm_oracle_cache[k] = o
-    try:
-        pair, comp = o.vertex_mask(int(vertex))
-    except Exception:
-        return None
-    v_idx = int(vertex) - 1
-    feats = _axis_feats(env.axis_state_static[v_idx], env.axis_valid_static[v_idx])
-    acts, *_r = agent.micro_action_policy.sample(
-        ctxs[v_idx], feats, _LM_TABLES, key,
-        pair_valid=jnp.asarray(pair, jnp.float32),
-        compress_valid=jnp.asarray(comp, jnp.float32),
+    order = np.zeros((_PREFIX_W,), np.int32)
+    spec_hist = np.broadcast_to(
+        EXACT_SPEC_ROW, (_PREFIX_W,) + EXACT_SPEC_ROW.shape).copy()
+    face_hist = np.broadcast_to(
+        EXACT_FACE_ROWS, (_PREFIX_W,) + EXACT_FACE_ROWS.shape).copy()
+    skip_hist = np.zeros((_PREFIX_W, int(ENV_MAX_FACES)), np.int32)
+    for k, (a, fr, fs) in enumerate(state):
+        order[k] = int(a) + 1
+        face_hist[k] = fr
+        skip_hist[k] = fs
+    return order, spec_hist, face_hist, skip_hist
+
+
+@eqx.filter_jit
+def _face_plan(agent, precomputed, enc_carry, avail, residual,
+               order, spec_hist, step_count, face_hist, skip_hist, key):
+    """Draw the per-face plan for the ALREADY-CHOSEN vertex.
+
+    The vertex is forced by handing `sample_action_dynamic` a ONE-HOT
+    availability mask: the categorical then has no choice, and every other
+    gate in that function (masks, face loop, wire translation) runs exactly as
+    it does for PPO. Reimplementing the face loop here instead would be a
+    second copy of the pipeline this whole change exists to remove.
+    """
+    face_chunk_fn, face_count_fn = bind_step_callbacks(
+        _live_face, _live_face_count, order, spec_hist, step_count,
+        face_hist, skip_hist)
+    (vertex_idx, actions, _vdist, _od, _id, _jd, _ed, _kd, _qlp,
+     _vp, _vc, face_out, value, v_context) = agent.sample_action_dynamic(
+        None, avail, AXIS_STATE, AXIS_VALID, FACT_TABLES, OP_OVERRIDE, key,
+        vertex_features=VFEAT, residual_state=residual,
+        precomputed=precomputed, enc_carry=enc_carry,
+        face_chunk_fn=face_chunk_fn, face_count_fn=face_count_fn,
     )
-    # APPROXIMATION-HEAD ENTROPY. MicroActionPolicy.sample returns
-    # (actions, sum logp, sum entropy, sum arity, *dists), so _r[1] is the
-    # summed sub-episode entropy and _r[2] the summed arity. Normalise by the
-    # head's OWN arity, exactly as ppo's evaluate_action_dynamic does, so a
-    # longer sub-episode does not inflate the number. Recorded here (before the
-    # decode, which can still fail) because the entropy of the draw is real
-    # regardless of whether the resulting rows decode to a usable rule.
-    try:
-        _AP_ENT.append(float(_r[1]) / max(float(_r[2]), 1.0))
-    except Exception:
-        pass
-    rows = _micro_to_rows(
-        acts.op_type, acts.i, acts.j, acts.factor,
-        env.axis_state_static[v_idx],
-        compress_kinds=acts.compress_kind, quant_dtypes=acts.quant_dtype,
-        quant_scale_signs=acts.quant_scale_sign,
-        quant_scale_fracs=acts.quant_scale_frac,
-    )
-    try:
-        rules = _decode_rows(jaxpr, int(vertex), np.asarray(rows).tolist(),
-                             is_last=(len(state) == NV - 1))
-    except Exception:
-        return None
-    if not rules:
-        return None
-    return _rule_to_tuple(rules[0])
+    (fa, face_logp, face_ent, f_pair, f_comp, f_valid,
+     f_cnt, f_dt, f_de) = face_out
+    # THE WIRE, from `to_env_action_dynamic`'s own translator -- so AZ and PPO
+    # emit identical bytes for identical FaceActions. AZ's `measure()` already
+    # passed correctly-shaped face arrays; they were filled with -1.
+    env_action = agent.to_env_action_dynamic(
+        vertex_idx, actions, AXIS_STATE, face_action=fa)
+    features = _axis_feats(AXIS_STATE[vertex_idx], AXIS_VALID[vertex_idx])
+    return (env_action.face_rows, env_action.face_skip, fa, f_pair, f_comp,
+            f_valid, f_cnt, f_dt, f_de, v_context, features, face_ent,
+            vertex_idx)
+
 
 # ------------------------------------------------------------------ 3. optimizer
 opt = optax.adam(A.lr)
 opt_state = opt.init(eqx.filter(agent, eqx.is_array))
-
-def _skey(state):
-    return tuple((int(a), tuple(m) if m else None) for a, m in state)
-
 
 # ------------------------------------------------------- known dynamics
 # ONE elimination per expansion, on the tokenizer's own graph, producing that
@@ -772,16 +742,26 @@ def _skey(state):
 # and never cleared; a carry is params-DEPENDENT, and a carry cached across a
 # `train_step` is silently STALE (right shape, wrong weights). Every decision
 # rebuilds from the committed root carry, and nothing survives a search.
-def _step(node, vertex, micro):
-    """Eliminate ``vertex`` (with ``micro``) on PT and return the child node.
+def _step(node, vertex, face_rows=None, face_skips=None, face_keys=None):
+    """Eliminate ``vertex`` on PT and return the child node.
 
     ``node`` is ``(state, carry, ctxs)``; the returned child carries its own
     ``(state, carry)``. The caller decides whether the elimination is
     speculative (inside ``PT.branch()``) or committed.
+
+    ``face_rows``/``face_skips`` default to EXACT. The SEARCH expands with the
+    exact wires -- it proposes and scores at VERTEX granularity, and running
+    the face loop at every sequential-halving expansion would be ~12x PPO's
+    per-episode chunk count. The COMMITTED decision passes the drawn plan, so
+    the committed carry is built from the approximated delta.
     """
     state, carry, ctxs = node
     a = int(vertex) - 1                     # VALID is contiguous 1..NV
-    spec_row, face_rows, face_skips = _step_wire(a, micro)
+    spec_row = EXACT_SPEC_ROW
+    face_rows = EXACT_FACE_ROWS if face_rows is None else np.asarray(
+        face_rows, np.int32)
+    face_skips = EXACT_FACE_SKIPS if face_skips is None else np.asarray(
+        face_skips, np.int32)
     # is_last mirrors the MEASUREMENT's decode exactly (`_callback` uses
     # is_last=(v_idx == last_v_idx) over the FULL order, and
     # `_face_dict_for_vertex`/`_face_transforms_for_order` the same): COMPRESS
@@ -802,7 +782,7 @@ def _step(node, vertex, micro):
     # COMPRESS row makes a misprediction observable at all.
     is_last = (len(PT.legal(VALID)) == 1)
     toks, ids = PT.eliminate(vertex, spec_row, face_rows, face_skips,
-                             is_last=is_last)
+                             is_last=is_last, face_keys=face_keys)
     dt, de, dc = _wire_delta(toks, ids)
     enc2, vs2, vc2 = _carry_advance(
         agent, carry.enc, carry.vs, carry.vc,
@@ -810,11 +790,116 @@ def _step(node, vertex, micro):
         jnp.asarray(a, jnp.int32))
     resid2 = _residual_update(
         agent, carry.residual, jnp.asarray(a, jnp.int32), ctxs[a])
-    st2 = list(state) + [(a, micro)]
+    st2 = list(state) + [(a, face_rows, face_skips)]
     return (st2, Carry(enc2, vs2, vc2, resid2),
             {"tokens": toks, "eqn_ids": ids, "delta": (dt, de, dc),
              "owner": a, "spec_row": spec_row, "face_rows": face_rows,
              "face_skips": face_skips, "is_last": is_last})
+
+
+_OP_NAME = {int(_OP_END): "none", int(_OP_DIAG): "diag",
+            int(_OP_COMPRESS): "compress", int(_OP_QUANT): "quant"}
+
+
+def _face_choice_counts(fa, f_valid):
+    """Realized per-FACE approximation classes -> approx_prob/* counts.
+
+    PPO reports the per-face probability of the UnifiedFaceHead; this is the
+    same quantity from the same head, counted over the faces that EXIST
+    (``f_valid``) rather than the padded width. Padding faces never ran, so
+    counting them would dilute every class toward "none".
+    """
+    out = collections.Counter()
+    ops = np.asarray(fa.op_type, np.int32)
+    skips = np.asarray(fa.skip, np.int32)
+    valid = np.asarray(f_valid) > 0.5
+    for f in range(ops.shape[0]):
+        if not valid[f]:
+            continue
+        if int(skips[f]) == 1:
+            out["skip"] += 1
+            continue
+        named = [_OP_NAME.get(int(o), "other") for o in ops[f]]
+        real = [nm for nm in named if nm != "none"]
+        if real:
+            for nm in set(real):
+                out[nm] += 1
+        else:
+            out["none"] += 1
+    return out
+
+
+_FACE_WINDOW_SATURATED = [0]
+_FACE_STEPS = [0]
+_LAST_PREFIX = {}
+
+
+def _face_count_diag(vertex):
+    """Recompute the LiveFaceStream count on the HOST, off the same prefix the
+    jitted callback was handed, so a disagreement can be attributed to the
+    tokenizers rather than to the callback plumbing."""
+    try:
+        pfx = _LAST_PREFIX
+        direct = int(LIVE_FACES.n_faces(
+            pfx["order"], pfx["specs"], pfx["n"], int(vertex),
+            pfx["face_hist"], pfx["skip_hist"]))
+        wires = [(int(pfx["order"][k]),
+                  int(np.sum(pfx["skip_hist"][k])),
+                  int(np.sum(pfx["face_hist"][k][..., 0] >= 0)))
+                 for k in range(pfx["n"])]
+        return (f"direct_live_n_faces={direct} n={pfx['n']} "
+                f"prefix(v,skips,rulerows)={wires}")
+    except Exception as _e:
+        return f"diag failed: {type(_e).__name__}: {_e}"
+
+
+def _assert_face_accounting(f_cnt, f_valid, d, n_faces, vertex, tk_faces):
+    """SILENT-FAILURE 2: face/chunk accounting, with the one identity that
+    actually holds.
+
+    ``sum(face_counts) == step_delta_count`` does NOT hold, and cannot: face
+    f's chunk is face f-1's approximation followed by face f's contraction
+    emitted UNHOOKED (`live_faces.chunk`: "NO hook on face f ... a recording
+    hook on an UNDECIDED face would make the head read a contraction the
+    measurement will not build"), whereas the committed delta emits every
+    face's contraction WITH its approximation. The chunks are a
+    COUNTERFACTUAL of the delta, not a prefix of it, so the totals differ in
+    both directions -- measured 1128 chunk tokens against an 874-token delta
+    on nn256 vertex 25.
+
+    What must hold, and is checked:
+
+    (a) the concatenated emission window did not SATURATE. `_face_loop` clamps
+        each chunk with ``ct_eff = min(ct_f, W - off)``, so once the window is
+        full every later face reads an EMPTY chunk and decides blind -- a
+        silent failure that reads as a healthy run. Counted per step and
+        logged as ``faces/window_saturated``.
+    (b) the number of decided faces equals the length of the key list the
+        committed elimination was indexed by. Both come from the LiveFaceStream
+        prefix tokenizer -- deliberately, see `PlanTokenizer.face_transforms`
+        -- but by two different routes: `n_faces` through the jitted
+        `face_count_fn` callback inside `sample_action_dynamic`, `tk_faces`
+        through the host-side enumeration. A shift between them fed the head
+        another face's contraction for months.
+    """
+    total = int(np.sum(np.asarray(f_cnt, np.int64)))
+    _FACE_STEPS[0] += 1
+    if total >= MAX_DELTA_TOKENS:
+        _FACE_WINDOW_SATURATED[0] += 1
+    assert total <= MAX_DELTA_TOKENS, (
+        f"vertex {vertex}: face chunks total {total} > the emission window "
+        f"{MAX_DELTA_TOKENS} -- the per-face clamp did not hold")
+    if n_faces != tk_faces:
+        _dbg = _face_count_diag(vertex)
+        raise AssertionError(
+            f"vertex {vertex}: the face loop decided {n_faces} faces but the "
+            f"plan tokenizer enumerates {tk_faces} -- a face-index shift feeds "
+            f"the head another face's contraction. "
+            f"[diag] step={_FACE_STEPS[0] - 1} "
+            f"pt_legal={len(PT.legal(VALID))} "
+            f"chunk_counts={np.asarray(f_cnt)[:8].tolist()} "
+            f"valid_prefix={np.asarray(f_valid)[:8].tolist()} "
+            f"{_dbg}")
 
 
 def _assert_terminal_prediction(d):
@@ -840,9 +925,14 @@ def _assert_terminal_prediction(d):
 
 
 def _eval_node(state, carry):
-    """``(vertex_logits (total_v,), contexts, scalar value in z-space)``."""
-    vlog, ctxs, val = _carry_heads(agent, carry.vs, carry.vc, carry.residual)
-    return np.asarray(vlog, dtype=np.float64), ctxs, _q_of(val)
+    """``(vertex_logits (host), the raw head triple, scalar value in z-space)``.
+
+    The raw triple is `sample_action_dynamic`'s ``precomputed`` argument --
+    handing it back means the committed decision's face draw conditions on the
+    encoding the search actually acted under, with no second encode.
+    """
+    out = _carry_heads(agent, carry.vs, carry.vc, carry.residual)
+    return np.asarray(out[0], dtype=np.float64), out, _q_of(out[2])
 
 
 def rollout_value(state, carry, depth):
@@ -863,11 +953,11 @@ def rollout_value(state, carry, depth):
         legal = PT.legal(VALID)
         if not legal:
             break
-        vlog, ctxs, _v = _eval_node(state, carry)
+        vlog, out, _v = _eval_node(state, carry)
         la = [int(v) - 1 for v in legal]
         v = legal[int(np.argmax(vlog[la]))]
-        state, carry, _d = _step((state, carry, ctxs), v, None)
-    _vl, _cx, vz = _eval_node(state, carry)
+        state, carry, _d = _step((state, carry, out[1]), v)
+    _vl, _out, vz = _eval_node(state, carry)
     return vz
 
 # ---------------------------------------------------------------- golden check
@@ -941,15 +1031,18 @@ def sigma(q, max_n=1, cs=float(os.environ.get("ALPHAGRAD_GAZ_CSCALE", "0.1"))):
     qn = (q - lo) / max(hi - lo, 1e-8)
     return (CVISIT + float(max_n)) * cs * qn
 
-# Per-episode POLICY-ENTROPY accumulators, one entry per DECISION; drained to
-# their episode means in the wandb block and cleared alongside _MICRO_CHOICES.
+# Per-episode POLICY-ENTROPY accumulators, drained to their episode means in
+# the wandb block.
 #   _VE_ENT : entropy (nats) of the vertex-elimination prior the search acts
 #             under -- ppo logs the same quantity as entropy/ve_head.
-#   _AP_ENT : arity-normalised entropy of the approximation head.
-# CAVEAT: az's approximation head is the PER-VERTEX MicroActionPolicy, while
-# ppo's entropy/approx_head is the PER-FACE UnifiedFacePolicy. Both are divided
-# by their own action arity, so the curves are comparable in SHAPE but NOT in
-# absolute scale -- different action spaces, different alphabet sizes.
+#   _AP_ENT : arity-normalised entropy of the approximation head, taken from
+#             `_face_replay` in the train step.
+# The CAVEAT that used to sit here ("az's approximation head is the PER-VERTEX
+# MicroActionPolicy while ppo's is the PER-FACE UnifiedFacePolicy ...
+# comparable in SHAPE but NOT in absolute scale") is GONE with the head it
+# described: both arms now report the same head's arity-normalised entropy
+# over the same per-face action space, so the two curves are directly
+# comparable.
 _VE_ENT: list = []
 _AP_ENT: list = []
 
@@ -986,33 +1079,23 @@ def gumbel_search(state, carry, rng):
     """One decision. ``PT`` is positioned at the COMMITTED prefix on entry and
     is left there on exit -- every expansion runs inside ``PT.branch()``."""
     legal = PT.legal(VALID)
-    vlog, ctxs, v_root = _eval_node(state, carry)
+    vlog, head_out, v_root = _eval_node(state, carry)
+    ctxs = head_out[1]
     la = np.array([int(v) - 1 for v in legal], dtype=np.int32)
     logits = vlog[la] - vlog[la].max()
     m = min(A.n_candidates, len(legal))
     g = rng.gumbel(size=len(legal))
     order_idx = np.argsort(-(logits + g))[:m]
-    # SAMPLED micro variants as first-class root candidates: each Gumbel-selected
-    # vertex enters as (v, None) plus K_MICRO sampled micro variants sharing the
-    # vertex's (g + logit); the search Q decides which variant survives halving.
-    K_MICRO = int(os.environ.get("ALPHAGRAD_GAZ_K_MICRO", "2"))
+    # ONE candidate per Gumbel-selected VERTEX. The per-vertex micro variants
+    # (K_MICRO sampled + one learned draw) are gone with the action space they
+    # belonged to; face variants inside the search are a later stage, and until
+    # then the search is a pure vertex-ordering search whose expansions carry
+    # the EXACT face wires.
     cands = []
-    _lm_key = jax.random.PRNGKey(int(rng.integers(2**31)))
     for ci in order_idx:
-        variants = [None]
-        if GAZ_MICRO:
-            n_rand = K_MICRO
-            if GAZ_MICRO_LEARNED:
-                lm = learned_micro(ctxs, state, legal[int(ci)],
-                                   jax.random.fold_in(_lm_key, int(ci)))
-                if lm is not None:
-                    variants.append(lm)
-                    n_rand = max(0, K_MICRO - 1)
-            variants += [rand_micro(rng, force=True) for _ in range(n_rand)]
-        for micro in variants:
-            cands.append({"li": int(ci), "v": legal[int(ci)], "micro": micro,
-                          "q": [], "g": float(g[int(ci)]),
-                          "logit": float(logits[int(ci)])})
+        cands.append({"li": int(ci), "v": legal[int(ci)],
+                      "q": [], "g": float(g[int(ci)]),
+                      "logit": float(logits[int(ci)])})
     # SEQUENTIAL HALVING with PROGRESSIVE DEEPENING (deterministic dynamics +
     # deterministic value net => repeated sims of a candidate are IDENTICAL, so
     # instead of re-simulating, each halving phase gives the SURVIVORS a 2x
@@ -1027,7 +1110,7 @@ def gumbel_search(state, carry, rng):
             # lists back to their entry length, so any number of
             # eliminations inside are undone together.
             with PT.branch():
-                st2, cy2, d = _step((state, carry, ctxs), c["v"], c["micro"])
+                st2, cy2, d = _step((state, carry, ctxs), c["v"])
                 if _phase == 0:
                     c["_wire"] = (d["spec_row"].tobytes(),
                                   d["face_rows"].tobytes(),
@@ -1058,9 +1141,8 @@ def gumbel_search(state, carry, rng):
             break                      # M3: before paying for another rollout
         depth = min(depth * 2, NV)                         # deepen survivors
     chosen = surv[0]
-    # completed-Q improved policy target over the FULL legal set. A vertex's Q =
-    # MAX over its evaluated micro variants (the vertex is as good as its best
-    # variant); unvisited vertices complete with v_root (Danihelka completed-Q).
+    # completed-Q improved policy target over the FULL legal set; unvisited
+    # vertices complete with v_mix (Danihelka completed-Q).
     # C2: complete UNVISITED actions with Danihelka's v_mix (eq. 8-9), not the
     # bare root value. v_mix is the prior-weighted mixture over the VISITED
     # actions blended with v_hat, which keeps the completion inside the range
@@ -1096,31 +1178,49 @@ def gumbel_search(state, carry, rng):
         comp_q[li] = qv
     pi = logits + sigma(comp_q, max_n=max([len(c["q"]) for c in cands] + [1]))
     pi = np.exp(pi - pi.max()); pi = pi / pi.sum()
-    # ``ctxs`` rides out so the caller can commit the chosen action without a
-    # second heads pass (the residual update needs this node's context row).
-    return chosen, pi, la, legal, ctxs
+    # ``head_out`` rides out so the caller can commit the chosen action, draw
+    # its per-face plan and update the residual without a second heads pass.
+    return chosen, pi, la, legal, head_out
 
 # ---------------------------------------------------------------- training
+# THE APPROXIMATION TERM. Before this, AZ's loss was vertex CE + value MSE
+# only: `learned_micro` sampled the micro head as a PROPOSAL and the result
+# never entered a loss, so AZ's approximation head was FROZEN AT INIT for the
+# whole comparison while PPO trained its per-face head every update.
+#
+# The search does not (yet) search over face variants, so there is no
+# improved-policy target for the face head the way there is for the vertex
+# head. The signal that DOES exist is the measured terminal return, so the
+# face plan is trained by REINFORCE with the critic as its baseline, both in
+# PopArt-normalised space. `Agent._face_replay` is the path -- its docstring:
+# "Gradient reaches palimpsa through this scan".
+_FACE_COEF = float(os.environ.get("ALPHAGRAD_GAZ_FACE_COEF", "1.0"))
+_FACE_ENT_COEF = float(os.environ.get("ALPHAGRAD_GAZ_FACE_ENT_COEF", "0.01"))
+_W4J = jnp.asarray(np.asarray(W4, dtype=np.float32))
+
+
 def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
-            resid, dtok, deqn, dcnt, owner, la_pad, la_mask, pi_pad,
-            vtgt, vmask):
-    """Vertex CE + value MSE, re-derived from the STORED PRE-step carry.
+            resid, dtok, deqn, dcnt, owner, vsel, la_pad, la_mask, pi_pad,
+            vtgt, vmask, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de, fa):
+    """Vertex CE + value MSE + the per-face REINFORCE term, all re-derived
+    from the STORED PRE-step carry.
 
     §7b of the PPO design, applied here: the replay stores the carry synced to
-    the PREVIOUS step's delta plus this step's delta, and the loss reproduces
-    the step's encoding by the SAME extension the rollout ran. Gradient
-    reaches palimpsa through that ``encode_extend``; it is truncated at the
-    stored carry, exactly as in PPO.
+    the PREVIOUS step's delta plus that delta, and the loss reproduces the
+    step's encoding by the SAME extension the rollout ran. Gradient reaches
+    palimpsa through that ``encode_extend`` and, for the face head, through
+    ``_face_replay``'s scan of the stored emission window; it is truncated at
+    the stored carry, exactly as in PPO.
     """
     from alphagrad.approx.ppo import EncCarry
 
-    def per(M, I, ch, nv, pos, vs, vc, rs, dt, de, dc, ow,
-            la, lam, pi, vt, vm):
+    def per(M, I, ch, nv, pos, vs, vc, rs, dt, de, dc, ow, vsl,
+            la, lam, pi, vt, vm, fp, fc, fv, fcnt, fdt, fde, face_action):
         carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
-        _c2, vs2, vc2 = _cs.advance(agent, carry, vs, vc, dt, de, dc, ow,
-                                    window=MAX_DELTA_TOKENS)
-        vlog, _ctx, v3 = _cs.heads(agent, vs2, vc2, vertex_features=VFEAT,
-                                   residual_state=rs, preference=None)
+        c2, vs2, vc2 = _cs.advance(agent, carry, vs, vc, dt, de, dc, ow,
+                                   window=MAX_DELTA_TOKENS)
+        vlog, ctx, v3 = _cs.heads(agent, vs2, vc2, vertex_features=VFEAT,
+                                  residual_state=rs, preference=None)
         lg = vlog[la]
         lg = jnp.where(lam > 0.5, lg, -jnp.inf)   # -1e9 collided with a sentinel
         logp = jax.nn.log_softmax(lg)
@@ -1129,17 +1229,37 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
         # head, _CH_ACTIVE masks it), cos]; targets vt are PopArt-normalised.
         pred = jnp.stack([v3[0], v3[1], jnp.zeros_like(v3[0]), v3[2]])
         vl = jnp.sum(vm * _CH_ACTIVE * (pred - vt) ** 2)
-        return ce + 0.5 * vl
 
-    return jnp.mean(jax.vmap(per)(
+        # --- the per-face head ---------------------------------------
+        # v_context / features for the vertex this step ACTUALLY chose
+        # (`vsl`), not the delta's owner (`ow`, which is the PREVIOUS
+        # step's vertex -- the two differ by one and confusing them is the
+        # index-mapping class of bug this file has been bitten by before).
+        v_context = ctx[vsl]
+        features = _axis_feats(AXIS_STATE[vsl], AXIS_VALID[vsl])
+        f_logp, f_ent, f_arity = agent._face_replay(
+            v_context, features, FACT_TABLES, face_action, fp, fc, fv,
+            c2, (fcnt, fdt, fde), OP_OVERRIDE)
+        z = jnp.sum(_W4J * _CH_ACTIVE * vt)
+        base = jnp.sum(_W4J * _CH_ACTIVE * pred)
+        adv = jax.lax.stop_gradient(z - base)
+        face_ent_norm = f_ent / jnp.maximum(f_arity, 1.0)
+        face_loss = -_FACE_COEF * adv * f_logp - _FACE_ENT_COEF * face_ent_norm
+        return ce + 0.5 * vl + face_loss, face_ent_norm
+
+    losses, ents = jax.vmap(per)(
         enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c, resid,
-        dtok, deqn, dcnt, owner, la_pad, la_mask, pi_pad, vtgt, vmask))
+        dtok, deqn, dcnt, owner, vsel, la_pad, la_mask, pi_pad, vtgt, vmask,
+        f_pair, f_comp, f_valid, f_cnt, f_dt, f_de, fa)
+    return jnp.mean(losses), jnp.mean(ents)
+
 
 @eqx.filter_jit
 def train_step(agent, opt_state, batch):
-    l, gr = eqx.filter_value_and_grad(loss_fn)(agent, *batch)
+    (l, ent), gr = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
+        agent, *batch)
     up, opt_state = opt.update(gr, opt_state, eqx.filter(agent, eqx.is_array))
-    return eqx.apply_updates(agent, up), opt_state, l
+    return eqx.apply_updates(agent, up), opt_state, l, ent
 
 # ---------------------------------------------------------------- 5.-6. main loop
 def _run(args) -> int:
@@ -1204,7 +1324,8 @@ def _run(args) -> int:
         except Exception:
             wb = None
     print(f"[gaz] NV={NV} budget={args.total_measurements} m={args.n_candidates} "
-          f"depth={args.rollout_depth} micro={GAZ_MICRO}", flush=True)
+          f"depth={args.rollout_depth} per-face-head=True "
+          f"max_faces={ENV_MAX_FACES}", flush=True)
 
     # --- 4b. PopArt WARM-START ------------------------------------------
     # Uniform on the standardised (ppo) form. Without it the normaliser starts
@@ -1241,12 +1362,14 @@ def _run(args) -> int:
                     if not _wlegal:
                         break
                     _wv = _wlegal[int(rng.integers(len(_wlegal)))]
-                    _wm = rand_micro(rng)
                     _wa = int(_wv) - 1
-                    _wrow, _wfr, _wfs = _step_wire(_wa, _wm)
-                    PT.eliminate(_wv, _wrow, _wfr, _wfs,
+                    # EXACT plans. The warm start exists to fix the measurement
+                    # SCALE; drawing an untrained face plan would only add
+                    # variance to the (mu, sigma) it seeds.
+                    PT.eliminate(_wv, EXACT_SPEC_ROW, EXACT_FACE_ROWS,
+                                 EXACT_FACE_SKIPS,
                                  is_last=(len(_wlegal) == 1))
-                    _wst.append((_wa, _wm))
+                    _wst.append((_wa, EXACT_FACE_ROWS, EXACT_FACE_SKIPS))
             _wraw = measure(_wst)
             if _wraw is None:
                 print(f"[popart-init] episode {_wi + 1}/{_pie} measure FAILED",
@@ -1334,34 +1457,99 @@ def _run(args) -> int:
         # Golden-equivalence accumulator: base ++ concat(per-decision deltas).
         _gold_stream = list(_BASE_TOKS)
         _gold_ids = list(_BASE_IDS)
+        # The (carry, delta) pair the LOSS re-runs. PPO's step_fn scores step t
+        # off the carry BEFORE step t-1's delta plus that delta; storing the
+        # post-advance carry with THIS step's delta instead is an off-by-one
+        # that scores step t's target against step t+1's encoding.
+        _prev_pre = carry
+        _prev_delta = (np.zeros((MAX_DELTA_TOKENS,), np.int32),
+                       np.full((MAX_DELTA_TOKENS,), -1, np.int32), 0)
+        _prev_owner = -1
+        _ep_faces = 0
+        _ep_chunks = 0
         while True:
             legal = PT.legal(VALID)
             if not legal:
                 break
-            chosen, pi, la, legal, ctxs = gumbel_search(state, carry, rng)
-            _mk = chosen.get("micro")
-            _MICRO_CHOICES["none" if _mk is None else
-                           {"q": "quant", "d": "diag", "c": "compress",
-                            "s": "skip"}.get(_mk[0], "other")] += 1
-            # PRE-step snapshot (§7b): the carry synced to the PREVIOUS step's
-            # delta, plus THIS step's delta. The loss re-derives this step's
-            # encoding by the same extension.
-            _pre = carry
-            state, carry, d = _step((state, carry, ctxs),
-                                    chosen["v"], chosen["micro"])
+            chosen, pi, la, legal, head_out = gumbel_search(state, carry, rng)
+            v = int(chosen["v"])
+            # ---- the per-face plan: ONE draw per COMMITTED decision ----
+            # ~NV x mean_faces chunks per episode. Drawing it at every
+            # sequential-halving expansion instead would be ~12x PPO's chunk
+            # count on the same graph, which is not affordable; the SEARCH
+            # therefore proposes and scores at VERTEX granularity.
+            _o_arr, _sp_h, _f_h, _s_h = _prefix_arrays(state)
+            _LAST_PREFIX.update(order=_o_arr, specs=_sp_h, n=len(state),
+                                face_hist=_f_h, skip_hist=_s_h)
+            # THE AUTHORITATIVE FACE KEYS, from the tokenizer the head is
+            # about to read its chunks from. NOT from PT: `faces_of` filters
+            # LazyEdges whose thunk has already run, speculation forces them
+            # IN PLACE, and `_Snapshot` cannot restore that memo -- so PT's
+            # enumeration SHRINKS across branches that are otherwise perfect
+            # no-ops (measured on nn256: vertices 13/16/17 lost 1/2/2 faces
+            # after 8 speculative chains, with a bit-identical legal set).
+            # Indexing the per-face plan by a shrunk key list drops the head's
+            # decisions or applies face_rows[f] to a different face. This
+            # tokenizer is rebuilt per PREFIX and is queried before any
+            # `chunk()` has speculated on it, so it carries the same
+            # enumeration the measurement's fresh replay will.
+            _lf_tk = LIVE_FACES._tokenizer_at(_o_arr, _sp_h, len(state),
+                                              _f_h, _s_h)
+            _face_keys = list(_lf_tk.ij.faces(v))
+            _nf_pre = len(_face_keys)
+            _avail = np.zeros((TOTAL_V,), np.float32)
+            _avail[v - 1] = 1.0
+            (fr, fs, fa, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de,
+             v_context, features, face_ent, _vi) = _face_plan(
+                agent, head_out, carry.enc, jnp.asarray(_avail),
+                carry.residual, jnp.asarray(_o_arr), jnp.asarray(_sp_h),
+                jnp.asarray(len(state), jnp.int32), jnp.asarray(_f_h),
+                jnp.asarray(_s_h),
+                jax.random.PRNGKey(int(rng.integers(2 ** 31))))
+            assert int(_vi) == v - 1, (
+                f"the one-hot availability mask did not force the searched "
+                f"vertex: head picked {int(_vi) + 1}, search chose {v}")
+            fr = np.asarray(fr, np.int32)
+            fs = np.asarray(fs, np.int32)
+            _MICRO_CHOICES.update(_face_choice_counts(fa, f_valid))
+            _nf = int(np.sum(np.asarray(f_valid) > 0.5))
+            _ep_faces += _nf
+            _ep_chunks += int(np.sum(np.asarray(f_cnt) > 0))
+            # ---- commit: re-tokenize the vertex WITH its face wires ----
+            _pre_for_loss = (_prev_pre, _prev_delta, _prev_owner)
+            _carry_before = carry
+            state, carry, d = _step((state, carry, head_out[1]), v, fr, fs,
+                                    face_keys=_face_keys)
             _assert_terminal_prediction(d)
+            _assert_face_accounting(f_cnt, f_valid, d, _nf, v, _nf_pre)
             _gold_stream += list(d["tokens"])
             _gold_ids += list(d["eqn_ids"])
             steps.append({
-                "enc_M": np.asarray(_pre.enc.M), "enc_I": np.asarray(_pre.enc.I),
-                "enc_ch": np.asarray(_pre.enc.cumhist),
-                "enc_nv": np.asarray(_pre.enc.nvalid),
-                "enc_pos": np.asarray(_pre.enc.pos),
-                "vmem_s": np.asarray(_pre.vs), "vmem_c": np.asarray(_pre.vc),
-                "resid": np.asarray(_pre.residual),
-                "dtok": d["delta"][0], "deqn": d["delta"][1],
-                "dcnt": np.int32(d["delta"][2]), "owner": np.int32(d["owner"]),
-                "la": la.copy(), "pi": pi.copy()})
+                "enc_M": np.asarray(_pre_for_loss[0].enc.M),
+                "enc_I": np.asarray(_pre_for_loss[0].enc.I),
+                "enc_ch": np.asarray(_pre_for_loss[0].enc.cumhist),
+                "enc_nv": np.asarray(_pre_for_loss[0].enc.nvalid),
+                "enc_pos": np.asarray(_pre_for_loss[0].enc.pos),
+                "vmem_s": np.asarray(_pre_for_loss[0].vs),
+                "vmem_c": np.asarray(_pre_for_loss[0].vc),
+                "resid": np.asarray(_pre_for_loss[0].residual),
+                "dtok": _pre_for_loss[1][0], "deqn": _pre_for_loss[1][1],
+                "dcnt": np.int32(_pre_for_loss[1][2]),
+                "owner": np.int32(_pre_for_loss[2]),
+                "vsel": np.int32(v - 1),
+                "la": la.copy(), "pi": pi.copy(),
+                # the per-face pass, stored exactly as PPO's trajectory stores
+                # it: the SAMPLING masks, the emission window the head read and
+                # the FaceAction itself, so `_face_replay` re-scores the same
+                # decisions against the same gates.
+                "f_pair": np.asarray(f_pair), "f_comp": np.asarray(f_comp),
+                "f_valid": np.asarray(f_valid), "f_cnt": np.asarray(f_cnt),
+                "f_dt": np.asarray(f_dt), "f_de": np.asarray(f_de),
+                "fa": jax.tree_util.tree_map(np.asarray, fa)})
+            # slide the (carry, delta) window forward by one decision
+            _prev_pre = _carry_before
+            _prev_delta = d["delta"]
+            _prev_owner = d["owner"]
             _dstep += 1
             if _memlog and _dstep % 5 == 0:
                 try:
@@ -1372,6 +1560,9 @@ def _run(args) -> int:
                           f"delta={int(d['delta'][2])}", flush=True)
                 except Exception:
                     pass
+        print(f"[gaz] ep={ep} face pipeline: {_dstep} decisions, "
+              f"{_ep_faces} faces, {_ep_chunks} non-empty chunks "
+              f"(NV x mean_faces = {_ep_faces})", flush=True)
         if _GOLD_CHECK:
             _golden_equivalence(state, _gold_stream, _gold_ids, ep)
         raw = measure(state)
@@ -1398,14 +1589,12 @@ def _run(args) -> int:
         # from the base at every episode, so a rescaled value head cannot be
         # read through a stale one.
         # Pareto front over RAW {lat, xla_peak, cos} (sign-oriented; archive maximises)
-        _pareto.add(_PSGN * raw,
-                    [(int(a), list(m) if m else None) for a, m in state], ep)
+        _pareto.add(_PSGN * raw, state_to_json(state), ep)
         # best-tracker: scores from different normalizer epochs are NOT comparable
         # (pre-warmup raw-scale ~-1e6 vs z-scored O(1) let a worse order overwrite a
         # better one at n=8). Keep every (raw, state) and re-argmax under the CURRENT
         # normalizer each episode.
-        _solutions.append((raw.copy(),
-                           [(int(a), list(m) if m else None) for a, m in state], n_meas))
+        _solutions.append((raw.copy(), state_to_json(state), n_meas))
         bi = int(np.argmax([scalarize(r) for r, _, _ in _solutions]))
         braw, bstate, bat = _solutions[bi]
         best.update(scalar=scalarize(braw), raw=braw.tolist(), state=bstate, at=bat)
@@ -1429,25 +1618,91 @@ def _run(args) -> int:
             enc_ch, enc_nv, enc_pos = stk("enc_ch"), stk("enc_nv"), stk("enc_pos")
             vmem_s, vmem_c, resid = stk("vmem_s"), stk("vmem_c"), stk("resid")
             dtok, deqn = stk("dtok"), stk("deqn")
-            dcnt, owner = stk("dcnt"), stk("owner")
+            dcnt, owner, vsel = stk("dcnt"), stk("owner"), stk("vsel")
+            f_pair, f_comp = stk("f_pair"), stk("f_comp")
+            f_valid, f_cnt = stk("f_valid"), stk("f_cnt")
+            f_dt, f_de = stk("f_dt"), stk("f_de")
+            fa_b = jax.tree_util.tree_map(
+                lambda *xs: jnp.asarray(np.stack(xs)),
+                *[s["fa"] for s in flat])
             la_p = jnp.asarray([pad(s["la"], MAXLA) for s in flat])
             la_m = jnp.asarray([pad(np.ones(len(s["la"])), MAXLA) for s in flat])
             pi_p = jnp.asarray([pad(s["pi"], MAXLA) for s in flat])
             vt = jnp.asarray([(s["raw4"] - popart.mu) / popart.sigma for s in flat])  # PopArt-normalised
             vm = jnp.asarray(np.broadcast_to(np.abs(W4) > 0, (len(flat), 4)).astype(np.float32))
             _cols = (enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
-                     resid, dtok, deqn, dcnt, owner, la_p, la_m, pi_p, vt, vm)
+                     resid, dtok, deqn, dcnt, owner, vsel, la_p, la_m, pi_p,
+                     vt, vm, f_pair, f_comp, f_valid, f_cnt, f_dt,
+                     f_de, fa_b)
             # M5: resample the minibatch EVERY epoch. Taking one fixed 64-sample
             # draw and hitting it ``train_epochs`` times overfits that draw and
             # discards the rest of the replay for this update.
             _bs = int(os.environ.get("ALPHAGRAD_GAZ_BATCH", "64"))
             for _ in range(args.train_epochs):
                 idx = jnp.asarray(rng.permutation(len(flat))[:_bs])
-                batch = tuple(x[idx] for x in _cols)
-                agent, opt_state, L = train_step(agent, opt_state, batch)
+                batch = tuple(
+                    jax.tree_util.tree_map(lambda a: a[idx], x)
+                    for x in _cols)
+                agent, opt_state, L, _AH = train_step(agent, opt_state, batch)
             L = float(L)
+            # ACCEPTANCE (b): the approximation head is no longer frozen. This
+            # is the arity-normalised per-FACE entropy from `_face_replay`,
+            # the same quantity PPO logs under this key.
+            _AP_ENT.append(float(_AH))
         else:
             L = float("nan")
+        # --- approximation telemetry ---------------------------------
+        # Built OUTSIDE the wandb block. It used to live inside it, so a
+        # --wandb-off probe could not see `approx_applied/*` at all -- and
+        # that key is precisely the one that proves the face wires reached
+        # the measurement (a flat 0 means they never did).
+        _approx_telemetry = {}
+        _tot = sum(_MICRO_CHOICES.values()) or 1
+        # REALIZED per-FACE class fractions, over the faces that exist. Same
+        # head, same denominator as PPO's -- the per-VERTEX-vs-per-FACE
+        # caveat that used to qualify this panel is gone with the per-vertex
+        # action space.
+        for _nm in ("none", "diag", "compress", "quant", "skip"):
+            _approx_telemetry[f"approx_prob/{_nm}"] = _MICRO_CHOICES[_nm] / _tot
+        _pf = consume_per_face_stats()
+        # In-process measurement fills these directly; with a Ray measure pool
+        # the hooks run in the actors, so merge their counters or every
+        # approx_applied/* key logs as a flat 0.
+        try:
+            from alphagrad.approx.common.measure_pool import (
+                merge_pool_face_stats as _merge_pf)
+            _pf = _merge_pf(_MEASURE_POOL, _pf)
+        except Exception:
+            pass
+        for _k in ("diag", "compress", "quant"):
+            _approx_telemetry[f"approx_applied/{_k}"] = _pf.get(f"applied_{_k}", 0)
+            _approx_telemetry[f"approx_skipped/{_k}"] = _pf.get(f"skipped_{_k}", 0)
+        _approx_telemetry["approx_applied/total"] = _pf.get("applied", 0)
+        _approx_telemetry["approx_skipped/total"] = (
+            _pf.get("skipped", 0) + _pf.get("skipped_raised", 0))
+        _approx_telemetry["approx_applied/fraction"] = _pf.get(
+            "applied_fraction", 0.0)
+        if os.environ.get("ALPHAGRAD_DEBUG_APPROX_PROB", "0") == "1":
+            print("[approx per-face] " + " ".join(
+                f"{_k2.split('/')[-1]}={float(_v2):.4g}"
+                for _k2, _v2 in sorted(_approx_telemetry.items())), flush=True)
+            _edbg = {}
+            if _VE_ENT:
+                _edbg["ve_head"] = float(np.mean(_VE_ENT))
+            if _AP_ENT:
+                _edbg["approx_head"] = float(np.mean(_AP_ENT))
+            _edbg["tied_candidates"] = float(_TIED_CANDIDATES[0])
+            _edbg["window_saturated"] = (
+                _FACE_WINDOW_SATURATED[0] / max(_FACE_STEPS[0], 1))
+            print("[entropy] " + " ".join(
+                f"{_k3}={_v3:.4g}" for _k3, _v3 in sorted(_edbg.items())),
+                flush=True)
+        if wb is None:
+            # No wandb row to gate on, so drain the per-episode counters here
+            # or every mean silently becomes a run-to-date mean.
+            _MICRO_CHOICES.clear(); _VE_ENT.clear(); _AP_ENT.clear()
+            _TIED_CANDIDATES[0] = 0; _TIED_TOTAL[0] = 0
+            _FACE_WINDOW_SATURATED[0] = 0; _FACE_STEPS[0] = 0
         b = best["raw"]
         try:
             _scal = float(scalarize(raw))
@@ -1484,7 +1739,12 @@ def _run(args) -> int:
         # PARETO FRONT over {lat, xla_peak, cos} is computed offline from this —
         # any weighting re-analyzable without re-running.
         json.dump({"best": best, "n_measured": n_meas, "config": vars(args),
-                   "micro": GAZ_MICRO,
+                   # PER-FACE plans. Each `state` entry carries {vertex,
+                   # face_rows, face_skips} -- the full wire, so a dump
+                   # re-measures to the cosine/latency the run reported. The
+                   # old per-vertex-micro dumps are not replayable under
+                   # per-face approximation.
+                   "wire": "per_face_v1",
                    "solutions": [{"n": nn, "raw": r.tolist(), "state": st}
                                  for r, st, nn in _solutions]},
                   open(os.path.join(args.out, "gaz_result.json"), "w"),
@@ -1534,46 +1794,7 @@ def _run(args) -> int:
                 for _j, _nm in enumerate(REWARD_NAMES):
                     _log[f"mean_{_nm}"] = float(LAST_FULL_REWARD[_j])
                 # --- approximation telemetry (identical keys to the PPO runs)
-                _tot = sum(_MICRO_CHOICES.values()) or 1
-                # ``skip`` is the REALIZED fraction of vertex decisions
-                # that chose ("s",) -- every face of that vertex measured with
-                # graphax.SKIP_FACE. Same key as PPO's, NOT the same
-                # denominator: PPO reports the per-FACE skip probability of the
-                # UnifiedFaceHead, az the per-VERTEX choice frequency. The two
-                # curves share a panel and are comparable in trend only.
-                for _nm in ("none", "diag", "compress", "quant", "skip"):
-                    _log[f"approx_prob/{_nm}"] = _MICRO_CHOICES[_nm] / _tot
-                _pf = consume_per_face_stats()
-                # Same story as PPO: the per-face hooks run inside the Ray
-                # measure actors, so this process' counters are always empty
-                # and every approx_applied/* key would log as a flat 0.
-                try:
-                    from alphagrad.approx.common.measure_pool import (
-                        merge_pool_face_stats as _merge_pf)
-                    _pf = _merge_pf(_MEASURE_POOL, _pf)
-                except Exception:
-                    pass
-                for _k in ("diag", "compress", "quant"):
-                    _log[f"approx_applied/{_k}"] = _pf.get(f"applied_{_k}", 0)
-                    _log[f"approx_skipped/{_k}"] = _pf.get(f"skipped_{_k}", 0)
-                _log["approx_applied/total"] = _pf.get("applied", 0)
-                _log["approx_skipped/total"] = (
-                    _pf.get("skipped", 0) + _pf.get("skipped_raised", 0))
-                _log["approx_applied/fraction"] = _pf.get("applied_fraction", 0.0)
-                # Mirror to stdout (same switch ppo.py uses), so a
-                # --wandb disabled probe or a dead run's log still shows
-                # what the policy chose. NOTE the quantities differ from
-                # PPO's despite the identical keys: PPO counts realized
-                # usage per FACE, AZ counts the chosen class per VERTEX.
-                if os.environ.get("ALPHAGRAD_DEBUG_APPROX_PROB", "0") == "1":
-                    _ap = {_k2: _v2 for _k2, _v2 in _log.items()
-                           if _k2.startswith(("approx_prob/",
-                                              "approx_applied/",
-                                              "approx_skipped/"))}
-                    if _ap:
-                        print("[approx per-vertex] " + " ".join(
-                            f"{_k2.split('/')[-1]}={float(_v2):.4g}"
-                            for _k2, _v2 in sorted(_ap.items())), flush=True)
+                _log.update(_approx_telemetry)
                 # per-head percentile companions + the PopArt state that
                 # produced them. AZ channel order is [lat, peak, flops, cos];
                 # flops has W4 == 0 and no head, so it is skipped.
@@ -1587,12 +1808,12 @@ def _run(args) -> int:
                             np.asarray(popart.sigma).reshape(-1)[_hi])
                 except Exception:
                     pass
-                # Episode-mean policy entropies. Keys match ppo.py's so the
-                # two arms share a panel -- see the module-level CAVEAT: the
-                # VE head is the same distribution on both, the approximation
-                # head is per-VERTEX here and per-FACE on ppo. Omitted (not
-                # logged as 0) when the head is not in play, so an absent panel
-                # means "not applicable" rather than "collapsed".
+                # Episode-mean policy entropies. Keys match ppo.py's and so
+                # do the quantities: the VE head is the same distribution on
+                # both arms, and the approximation head is the same per-FACE
+                # UnifiedFacePolicy. Omitted (not logged as 0) when the head
+                # has not been scored yet (before the first train step), so an
+                # absent panel means "not applicable" rather than "collapsed".
                 if _VE_ENT:
                     _log["entropy/ve_head"] = float(np.mean(_VE_ENT))
                 if _AP_ENT:
@@ -1616,6 +1837,8 @@ def _run(args) -> int:
                 # SILENT-FAILURE 1 telemetry: candidates whose WIRE bytes
                 # differ but whose TOKEN bytes do not. Non-zero steady state
                 # means an action the search cannot see.
+                _log["faces/window_saturated"] = (
+                    _FACE_WINDOW_SATURATED[0] / max(_FACE_STEPS[0], 1))
                 _log["search/tied_candidates"] = int(_TIED_CANDIDATES[0])
                 _log["search/tied_fraction"] = (
                     _TIED_CANDIDATES[0] / max(_TIED_TOTAL[0], 1))
@@ -1648,13 +1871,16 @@ def _run(args) -> int:
                     _MICRO_CHOICES.clear()
                     _TIED_CANDIDATES[0] = 0
                     _TIED_TOTAL[0] = 0
+                    _FACE_WINDOW_SATURATED[0] = 0
+                    _FACE_STEPS[0] = 0
                     _VE_ENT.clear()
                     _AP_ENT.clear()
                     _t_prev = _now
 
     # --- 6. logging/dump ---
     json.dump({"best": best, "n_measured": n_meas, "config": vars(args),
-               "micro": GAZ_MICRO}, open(os.path.join(args.out, "gaz_result.json"), "w"),
+               "wire": "per_face_v1"},
+              open(os.path.join(args.out, "gaz_result.json"), "w"),
               indent=2, default=float)
     try:
         _pex = {"episode": ep, "n_measured": n_meas, "task": args.task, "seed": args.seed}

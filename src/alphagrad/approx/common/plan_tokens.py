@@ -138,12 +138,33 @@ class PlanTokenizer:
             rules = ()
         return (make_live_masked_hook(tuple(rules)),) if rules else ()
 
-    def face_transforms(self, vertex, face_rows, face_skips, *, is_last=True):
+    def face_transforms(self, vertex, face_rows, face_skips, *, is_last=True,
+                        keys=None):
         """``{face_key: slots|SKIP_FACE}`` for EVERY face of ``vertex``.
 
         Same decoder ``live_faces.LiveFaceStream._decided`` uses, run to the
         full face count -- the measurement applies every decided face, not a
         prefix of them.
+
+        ``keys`` OVERRIDES the live enumeration, and passing it is REQUIRED on
+        a tokenizer that has been speculated on. Why:
+
+        ``faces_of`` filters an edge out when ``_known_none_edge`` says its
+        Jacobian is None, and that predicate is answerable only for a LazyEdge
+        whose thunk has ALREADY RUN (an unforced one is listed optimistically).
+        A speculative elimination forces LazyEdges IN PLACE, and ``_Snapshot``
+        restores the two graph DICT levels but not the memo inside the shared
+        LazyEdge objects -- so the enumeration SHRINKS across a branch that is
+        otherwise a perfect no-op. Measured on nn256 (mnist), 8 branches of 8
+        eliminations at the empty prefix, then committing vertex 27: vertices
+        13, 16 and 17 went from 1/2/2 faces to 0/0/0 while the legal set was
+        bit-identical. The head had already decided face 0 of vertex 13 off the
+        FRESH enumeration, so a shrunk key list either drops its decision or --
+        worse -- applies ``face_rows[f]`` to a different face.
+
+        The elimination RESULT is unaffected (a known-None face is skipped
+        either way); only the key list the per-face plan is indexed by is. So
+        the fix is to index by the enumeration the DECIDING tokenizer used.
         """
         from alphagrad.approx.env import (
             FACE_SLOTS, MAX_RULES_PER_VERTEX, decode_vertex_rule_specs)
@@ -152,7 +173,10 @@ class PlanTokenizer:
 
         if face_rows is None and face_skips is None:
             return None
-        keys = list(self.tk.ij.faces(int(vertex)))
+        if keys is None:
+            keys = list(self.tk.ij.faces(int(vertex)))
+        else:
+            keys = list(keys)
         rows = (None if face_rows is None
                 else np.asarray(face_rows, np.int32))
         skips = (None if face_skips is None
@@ -179,15 +203,16 @@ class PlanTokenizer:
         return ft or None
 
     def eliminate(self, vertex, vertex_specs=None, face_rows=None,
-                  face_skips=None, *, is_last=True):
+                  face_skips=None, *, is_last=True, face_keys=None):
         """Advance the tokenizer by one vertex; return ``(tokens, eqn_ids)``.
 
         MUTATES. Wrap in :meth:`branch` for a speculative expansion, call bare
-        to commit a decision.
+        to commit a decision. Pass ``face_keys`` from the tokenizer the per-face
+        plan was DECIDED on -- see :meth:`face_transforms`.
         """
         hooks = self._hooks(vertex, vertex_specs, is_last)
         ft = self.face_transforms(vertex, face_rows, face_skips,
-                                  is_last=is_last)
+                                  is_last=is_last, keys=face_keys)
         self.stats["eliminations"] += 1
         toks = [int(t) for t in self.tk.eliminate(int(vertex), hooks, ft)]
         ids = [int(g) for g in self.tk.last_eqn_ids()]
@@ -206,6 +231,12 @@ class PlanTokenizer:
         return [int(v) for v in valid_vertices if eqns[int(v) - 1].outvars[0] in g]
 
     def n_faces(self, vertex):
+        """Faces of ``vertex`` ON THIS TOKENIZER'S LIVE GRAPH.
+
+        NOT authoritative after speculation -- see :meth:`face_transforms` for
+        why the count can shrink across a branch. Use the deciding tokenizer's
+        enumeration when the answer has to line up with a per-face plan.
+        """
         k = len(list(self.tk.ij.faces(int(vertex))))
         if self.max_faces is not None and k > self.max_faces:
             raise RuntimeError(
