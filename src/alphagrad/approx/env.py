@@ -245,6 +245,28 @@ def consume_tokenization_truncation_stats() -> dict:
 # rather than a full re-tokenize.
 MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "1024"))
 
+# BASE-TOKEN budget for the delta-buffer observation path
+# (ALPHAGRAD_DELTA_TOKENS=1 in ppo.py). The base tokenized jaxpr is encoded
+# into the policy carry ONCE, at episode start, so it needs a buffer of its
+# own instead of a MAX_TOKENS-wide window over the whole growing stream.
+#
+# SIZED FROM THE MEASURED DISTRIBUTION, not a guess. `len(base_tokens())` is
+# order-independent (it depends only on the jaxpr), measured 2026-08-05 with
+# ALPHAGRAD_INCR_TOKEN_VOCAB=248 over every resolvable example:
+#
+#   Helmholtz 60 | Lighthouse 69 | NeuralNetwork 317 | ADALIF_SNN 340 |
+#   ConvNet 397 | VmappedNeuralNetwork(h=256,mnist) 419 | VmappedConvNet 559 |
+#   LIF_SNN 678 | MoE 797 | RoeFlux_1d 1184 | RobotArm_6DOF 1295 |
+#   Encoder 1323 | TransformerLM 1406 | ViT 1457 | EncoderDecoder 1627 |
+#   RoeFlux_3d 1777 | BlackScholes_Jacobian 4219
+#
+# 8192 is ~1.9x the largest measured base (4219) and ~20x the flagship
+# nn256's (419), and one base buffer per env is 32 KB -- headroom is free
+# here in a way it is not for the per-step buffers. ppo.py ASSERTS on the
+# device-side count rather than clipping: a clipped base would desync the
+# encoder's recurrence from the stream for the whole episode.
+MAX_BASE_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_BASE_TOKENS", "8192"))
+
 _INCR_TOK_CACHE: dict = {}
 _INCR_TOK_CACHE_CAP = 512
 

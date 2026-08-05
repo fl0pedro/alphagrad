@@ -96,6 +96,7 @@ from alphagrad.approx.env import (
     MAX_RULES_PER_VERTEX,
     MAX_TOKENS,
     MAX_DELTA_TOKENS,
+    MAX_BASE_TOKENS,
     consume_token_length_stats,
     COMPUTE_REWARD_INDICES,
     NUM_AXIS_PAIRS,
@@ -561,6 +562,93 @@ def _warn_noncontiguous_stream(contiguous, n):
         flush=True)
 
 
+# ---------------------------------------------------------------------------
+# DELTA BUFFERS (ALPHAGRAD_DELTA_TOKENS=1; default OFF -- stage 1 adds the
+# path, keeps the old one, and proves they agree; see
+# tests/delta_buffer_equivalence_test.py).
+#
+# Nothing in the pipeline ever re-reads earlier tokens: the rollout consumes
+# `stream[pos : pos + delta]` and the loss re-derives the SAME window from the
+# stored per-step carry. The growing (MAX_TOKENS,) buffer is an artefact of
+# the cursor being ABSOLUTE. These helpers give the vertex stream the same
+# shape the FACE stream already has -- a standalone buffer read from 0 with an
+# explicit count (`_face_encode` / `_face_replay` pass ``start=0``).
+# ---------------------------------------------------------------------------
+
+
+def _use_delta_buffers() -> bool:
+    """Is the per-step delta-buffer path on? Read per trace (not cached at
+    import) so a test can flip it without reloading the module."""
+    return os.environ.get("ALPHAGRAD_DELTA_TOKENS", "0") == "1"
+
+
+def _stream_end(tokens):
+    """Index one past the LAST non-zero token of an append-only buffer.
+
+    ``_stream_len`` COUNTS non-zeros, so an interior id 0 -- the literal '-'
+    graphax emits for any negative value -- makes it undercount and the delta
+    window comes up short (the hazard documented on ``_stream_len``). An
+    append-only stream is contiguous with a zero-padded TAIL, so "one past the
+    last non-zero" is the same number when there is no interior zero and the
+    RIGHT number when there is. Same cost, one reduction.
+    """
+    nz = tokens != 0
+    n = tokens.shape[-1]
+    last = n - 1 - jnp.argmax(nz[::-1])
+    return jnp.where(jnp.any(nz), last + 1, 0).astype(jnp.int32)
+
+
+def _assert_base_fits(count):
+    """Host guard for the base buffer. Clipping the base would desync the
+    encoder's recurrence from the stream for the WHOLE episode, so this
+    raises rather than truncating."""
+    # np.max, not int(): under vmap the debug callback may be handed the
+    # whole batched count rather than one env's.
+    c = int(np.max(np.asarray(count)))
+    if c > MAX_BASE_TOKENS:
+        raise ValueError(
+            f"base token stream is {c} tokens > MAX_BASE_TOKENS="
+            f"{MAX_BASE_TOKENS}. Raise ALPHAGRAD_MAX_BASE_TOKENS."
+        )
+
+
+def _window_copy(tokens_buf, eqn_ids_buf, pos, count, width):
+    """``stream[pos : pos + width]`` as a STANDALONE ``(width,)`` buffer pair
+    with a RELATIVE cursor (read it back with ``encode_extend(..., start=0)``).
+
+    Entries at or past ``count`` are written as pad (0 / -1), so the buffer
+    holds exactly the delta and then padding. That is bitwise what the
+    absolute cursor read out of the growing stream, because an append-only
+    stream past its own length is already pad -- which is the token-for-token
+    equality tests/delta_buffer_equivalence_test.py asserts.
+    """
+    pos = jnp.asarray(pos, jnp.int32)
+    count = jnp.clip(jnp.asarray(count, jnp.int32), 0, width)
+    ar = jnp.arange(width, dtype=jnp.int32)
+    idx = pos + ar
+    toks = jnp.take(tokens_buf, idx, mode="fill",
+                    fill_value=0).astype(jnp.int32)
+    eqns = jnp.take(eqn_ids_buf, idx, mode="fill",
+                    fill_value=-1).astype(jnp.int32)
+    keep = ar < count
+    return jnp.where(keep, toks, 0), jnp.where(keep, eqns, -1)
+
+
+def _zero_delta_buffer_fields():
+    """Degenerate stand-ins for the delta-buffer trajectory fields when the
+    path is off -- 4 bytes per step, uniform pytree structure.
+
+    WIDTH 1, NOT 0: ``common.batching.shuffle_and_batch`` reshapes every leaf
+    to ``(-1, *shape[2:])`` and jax computes ``size % prod(other_sizes)``, so a
+    zero-width leaf is an integer modulo by zero at the first minibatch.
+    """
+    return dict(
+        delta_tokens=jnp.zeros((1,), jnp.int32),
+        delta_eqns=-jnp.ones((1,), jnp.int32),
+        delta_count=jnp.zeros((), jnp.int32),
+    )
+
+
 def _zero_enc_carry_fields():
     """Degenerate (0,)-shaped stand-ins for the incremental-encode trajectory
     fields when the mode is off — zero memory, uniform pytree structure."""
@@ -661,6 +749,14 @@ class Trajectory(NamedTuple):
     enc_pos: jax.Array      # () int32
     vmem_sums: jax.Array    # (V+1, E)
     vmem_counts: jax.Array  # (V+1,)
+    # STAGE 1 delta buffers (ALPHAGRAD_DELTA_TOKENS=1; degenerate width-1
+    # otherwise). THIS step's delta as a standalone buffer with a RELATIVE
+    # cursor plus its EXPLICIT length -- the same shape the face stream
+    # already stores. It replaces reading `tokens` at an absolute cursor;
+    # stage 2 deletes `tokens`/`eqn_ids` from the trajectory entirely.
+    delta_tokens: jax.Array   # (MAX_DELTA_TOKENS,) int32
+    delta_eqns: jax.Array     # (MAX_DELTA_TOKENS,) int32
+    delta_count: jax.Array    # () int32
     delta_owner: jax.Array  # () int32 — vertex whose elimination emitted the delta
     discount: jax.Array
     vertex_avail_mask: jax.Array
@@ -720,6 +816,9 @@ class TrainBatch(NamedTuple):
     enc_pos: jax.Array
     vmem_sums: jax.Array
     vmem_counts: jax.Array
+    delta_tokens: jax.Array
+    delta_eqns: jax.Array
+    delta_count: jax.Array
     delta_owner: jax.Array
     estim_returns: jax.Array
     norm_adv: jax.Array
@@ -4790,11 +4889,28 @@ def main():
         # then each scan step extends by that step's delta only.
         if getattr(args, "incremental_encode", False):
             _enc0 = agent.carry_init()
-            _base_count = _stream_len(env_state.tokens)
-            _enc1, _rows0, _valid0, _eqns0 = agent.encode_extend(
-                _enc0, env_state.tokens, env_state.eqn_ids, _base_count,
-                window=MAX_TOKENS,
-            )
+            if _use_delta_buffers():
+                # BASE BUFFER: the base tokenized jaxpr in a buffer sized for
+                # the base (MAX_BASE_TOKENS, measured distribution in env.py)
+                # instead of a MAX_TOKENS-wide window over the whole growing
+                # stream. The valid prefix is bitwise independent of the
+                # window (pad steps freeze the carry), so this is the same
+                # carry through a 4x shorter scan at 32768/8192.
+                _base_count = _stream_end(env_state.tokens)
+                jax.debug.callback(_assert_base_fits, _base_count)
+                _base_tok, _base_eqn = _window_copy(
+                    env_state.tokens, env_state.eqn_ids, 0, _base_count,
+                    MAX_BASE_TOKENS)
+                _enc1, _rows0, _valid0, _eqns0 = agent.encode_extend(
+                    _enc0, _base_tok, _base_eqn, _base_count,
+                    window=MAX_BASE_TOKENS, start=0,
+                )
+            else:
+                _base_count = _stream_len(env_state.tokens)
+                _enc1, _rows0, _valid0, _eqns0 = agent.encode_extend(
+                    _enc0, env_state.tokens, env_state.eqn_ids, _base_count,
+                    window=MAX_TOKENS,
+                )
             _base_ids = jnp.where(
                 (_eqns0 >= 0) & (_eqns0 < total_v), _eqns0, -1
             )
@@ -4818,16 +4934,31 @@ def main():
                 # The delta appended since the carry's pos was emitted by the
                 # PREVIOUS step's elimination (empty at step 0 — the base
                 # stream is already consumed).
-                delta_count = _stream_len(state.tokens) - enc_carry.pos
                 delta_owner = jnp.where(
                     state.step_count > 0,
                     elim_order[jnp.maximum(state.step_count - 1, 0)],
                     jnp.array(-1, jnp.int32),
                 ).astype(jnp.int32)
-                enc_carry2, d_rows, d_valid, d_eqns = agent.encode_extend(
-                    enc_carry, state.tokens, state.eqn_ids, delta_count,
-                    window=MAX_DELTA_TOKENS,
-                )
+                if _use_delta_buffers():
+                    # PER-STEP DELTA BUFFER + RELATIVE cursor. `_stream_end`
+                    # (one past the last non-zero, not the non-zero COUNT) is
+                    # what keeps the length right when the delta contains the
+                    # literal '-' (token id 0).
+                    delta_count = _stream_end(state.tokens) - enc_carry.pos
+                    delta_tok, delta_eqn = _window_copy(
+                        state.tokens, state.eqn_ids, enc_carry.pos,
+                        delta_count, MAX_DELTA_TOKENS)
+                    enc_carry2, d_rows, d_valid, d_eqns = agent.encode_extend(
+                        enc_carry, delta_tok, delta_eqn, delta_count,
+                        window=MAX_DELTA_TOKENS, start=0,
+                    )
+                else:
+                    delta_count = _stream_len(state.tokens) - enc_carry.pos
+                    delta_tok = delta_eqn = None
+                    enc_carry2, d_rows, d_valid, d_eqns = agent.encode_extend(
+                        enc_carry, state.tokens, state.eqn_ids, delta_count,
+                        window=MAX_DELTA_TOKENS,
+                    )
                 d_ids = jnp.where(d_eqns >= 0, delta_owner, -1)
                 vmem_s2, vmem_c2 = _vmem.update_ids(
                     vmem_s, vmem_c, d_rows, d_ids, d_valid
@@ -5011,11 +5142,21 @@ def main():
                 # (kept self-contained rather than threading heads across
                 # iterations); deltas are O(hundreds) of tokens, so the
                 # duplicate extend is cheap next to a full re-encode.
-                nv_count = _stream_len(next_state.tokens) - enc_carry2.pos
-                _, nv_rows, nv_valid, nv_eqns = agent.encode_extend(
-                    enc_carry2, next_state.tokens, next_state.eqn_ids,
-                    nv_count, window=MAX_DELTA_TOKENS,
-                )
+                if _use_delta_buffers():
+                    nv_count = _stream_end(next_state.tokens) - enc_carry2.pos
+                    nv_tok, nv_eqn = _window_copy(
+                        next_state.tokens, next_state.eqn_ids,
+                        enc_carry2.pos, nv_count, MAX_DELTA_TOKENS)
+                    _, nv_rows, nv_valid, nv_eqns = agent.encode_extend(
+                        enc_carry2, nv_tok, nv_eqn, nv_count,
+                        window=MAX_DELTA_TOKENS, start=0,
+                    )
+                else:
+                    nv_count = _stream_len(next_state.tokens) - enc_carry2.pos
+                    _, nv_rows, nv_valid, nv_eqns = agent.encode_extend(
+                        enc_carry2, next_state.tokens, next_state.eqn_ids,
+                        nv_count, window=MAX_DELTA_TOKENS,
+                    )
                 nv_ids = jnp.where(nv_eqns >= 0, vertex_idx.astype(jnp.int32), -1)
                 nv_s, nv_c = _vmem.update_ids(
                     vmem_s2, vmem_c2, nv_rows, nv_ids, nv_valid
@@ -5061,8 +5202,16 @@ def main():
                     vmem_sums=vmem_s, vmem_counts=vmem_c,
                     delta_owner=delta_owner,
                 )
+                if _use_delta_buffers():
+                    _enc_fields.update(
+                        delta_tokens=delta_tok, delta_eqns=delta_eqn,
+                        delta_count=jnp.asarray(delta_count, jnp.int32),
+                    )
+                else:
+                    _enc_fields.update(_zero_delta_buffer_fields())
             else:
                 _enc_fields = _zero_enc_carry_fields()
+                _enc_fields.update(_zero_delta_buffer_fields())
 
             transition = Trajectory(
                 tokens=traj_tokens,
@@ -5247,13 +5396,24 @@ def main():
             # sampled under, through CURRENT params (ratio 1 at epoch 0;
             # gradient flows through the delta + heads, truncating at the
             # stored carry by design).
+            _dbuf = _use_delta_buffers()
+
             def _carry_heads(toks, eids, M, I, ch, nv, pos, owner, vs, vc,
-                             rs, pref):
+                             rs, pref, dtok, deqn, dcnt):
                 carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
-                count = _stream_len(toks) - pos
-                carry2, rows, valid, eqw = agent.encode_extend(
-                    carry, toks, eids, count, window=MAX_DELTA_TOKENS
-                )
+                if _dbuf:
+                    # The delta is STORED, with its length: the loss never
+                    # re-derives a window from the growing stream, so
+                    # `_stream_len`'s id-0 hazard cannot reach it at all.
+                    carry2, rows, valid, eqw = agent.encode_extend(
+                        carry, dtok, deqn, dcnt,
+                        window=MAX_DELTA_TOKENS, start=0,
+                    )
+                else:
+                    count = _stream_len(toks) - pos
+                    carry2, rows, valid, eqw = agent.encode_extend(
+                        carry, toks, eids, count, window=MAX_DELTA_TOKENS
+                    )
                 ids = jnp.where(eqw >= 0, owner, -1)
                 vs2, vc2 = _vmem.update_ids(vs, vc, rows, ids, valid)
                 # carry2 is where the sampling side carry branched: the
@@ -5274,6 +5434,7 @@ def main():
                 batch.enc_nvalid, batch.enc_pos, batch.delta_owner,
                 batch.vmem_sums, batch.vmem_counts,
                 batch.residual_state, batch.preference,
+                batch.delta_tokens, batch.delta_eqns, batch.delta_count,
             )
             (
                 log_probs,
@@ -6054,6 +6215,9 @@ def main():
             enc_pos=traj.enc_pos,
             vmem_sums=traj.vmem_sums,
             vmem_counts=traj.vmem_counts,
+            delta_tokens=traj.delta_tokens,
+            delta_eqns=traj.delta_eqns,
+            delta_count=traj.delta_count,
             delta_owner=traj.delta_owner,
             estim_returns=estim_returns,
             norm_adv=norm_adv,
