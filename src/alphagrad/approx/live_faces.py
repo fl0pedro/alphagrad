@@ -47,6 +47,8 @@ distinct prefix and cached; only the current vertex is re-eliminated per face.
 from __future__ import annotations
 
 import os
+import warnings
+
 import numpy as np
 
 
@@ -57,6 +59,14 @@ import numpy as np
 # removes, just quieter. 1024 clips 8 of 192 (4%). Raise it if
 # `truncated` in the health line is a large fraction of `chunks`.
 FACE_TOKEN_WINDOW = int(os.environ.get("ALPHAGRAD_FACE_TOKEN_WINDOW", "1024"))
+
+
+# One process-wide shout the first time the emitted faces are a PROPER
+# subsequence of the enumerated ones with something still emitted -- the
+# only shape of divergence that can mis-index, and the one never yet
+# observed. Total drops (every face of a vertex) are routine and ride the
+# `face_dropped` counter instead of shouting once per run.
+_PARTIAL_DROP_WARNED = [False]
 
 
 def _copy_graph(g):
@@ -153,7 +163,18 @@ class LiveFaceStream:
         # the tail of the contraction the head is meant to read.
         self.stats = {"prefix_miss": 0, "prefix_hit": 0, "elims": 0,
                       "chunk_hit": 0, "failures": 0, "truncated": 0,
-                      "tok_total": 0, "tok_max": 0, "chunks": 0}
+                      "tok_total": 0, "tok_max": 0, "chunks": 0,
+                      # The face <-> segment correspondence (see `chunk`).
+                      # `face_key_seg_mismatch` / `face_dropped` are
+                      # SURVIVABLE and mapped around; the other two are
+                      # structural corruption and raise. They are named
+                      # separately so the health line says which, instead
+                      # of everything landing in `failures` next to a
+                      # graph graphax simply could not trace.
+                      "face_key_seg_mismatch": 0,
+                      "face_dropped": 0,
+                      "face_seg_not_tiled": 0,
+                      "face_header_mismatch": 0}
 
     # -- prefix ------------------------------------------------------------
     @staticmethod
@@ -268,6 +289,40 @@ class LiveFaceStream:
                 ft[keys[f]] = tuple(slots)
         return keys, ft
 
+    # -- what the elimination ACTUALLY emitted ------------------------------
+    @staticmethod
+    def _emitted(tk, keys, f):
+        """``(emitted face keys, expected `path` header tokens of ``keys[f]``)``.
+
+        MUST be called INSIDE the :class:`_Snapshot` block. ``__exit__``
+        truncates ``face_sink.faces`` back to its pre-elimination length and
+        restores ``tk._names``, so the FaceRecords that pair a segment with
+        its ``(in_edge, out_edge)`` key -- and the names their header was
+        emitted under -- exist only in there.
+
+        The header is rebuilt with the tokenizer's OWN emitter, so it is the
+        exact byte sequence graphax would write. ``_var_name`` is a pure
+        lookup at this point (the header was just emitted for these vars),
+        and even if it were not, the snapshot restores ``_names`` and rewinds
+        ``_namegen`` on exit, so nothing can leak into the stream.
+        """
+        ij = tk.ij
+        sink = getattr(ij, "face_sink", None)
+        if sink is None or not ij.steps:
+            return None, None
+        vidx = sink.vidx
+        if vidx is None:
+            from graphax.core import _vidx_for
+            vidx = _vidx_for(ij.jaxpr)
+        recs = list(ij.step_faces(len(ij.steps) - 1))
+        ekeys = [(vidx.get(fr.in_edge), vidx.get(fr.out_edge)) for fr in recs]
+        hdr = None
+        if 0 <= f < len(keys) and keys[f] in ekeys:
+            hdr = []
+            tk._emit_face_header(recs[ekeys.index(keys[f])], hdr)
+            hdr = [int(t) for t in hdr]
+        return ekeys, hdr
+
     # -- the chunk ---------------------------------------------------------
     def chunk(self, order, specs, n, vertex, vertex_specs,
               face_rows, face_skips, f,
@@ -351,6 +406,11 @@ class LiveFaceStream:
                 toks = [int(t) for t in tk.eliminate(vertex, vhooks, ft)]
                 ids = [int(g) for g in tk.last_eqn_ids()]
                 segs = tk.last_face_segments()
+                # Everything the checks below need that dies with the
+                # snapshot. Pure reads -- they must not raise in here or
+                # the except would file a structural defect as a soft
+                # "failure" and hand back an empty chunk.
+                ekeys, exp_hdr = self._emitted(tk, keys, f)
             except Exception:
                 self.stats["failures"] += 1
                 return empty
@@ -362,10 +422,113 @@ class LiveFaceStream:
         # -- that reads segment f-k for face f, which silently hands the head
         # another face's contraction AND another face's approximation tail,
         # so it never sees its own skip decision.
-        gi = f
-        if gi < 0 or gi >= len(segs):
+        #
+        # BUT `gi = f` is only sound while THE KEY LIST AND THE SEGMENT LIST
+        # AGREE, and graphax does not promise that. `faces_of` -- the list the
+        # head's action space and `n_faces` (the rollout while_loop's trip
+        # count) are BOTH sized from -- enumerates OPTIMISTICALLY: a face whose
+        # edge Jacobian forces to None (an unevaluated LazyEdge behind a
+        # stop_gradient, say) is never visited and never emitted, so `keys` is
+        # a SUPERSET of the emitted faces.
+        #
+        # MEASURED, not hypothetical. Per full elimination: Perceptron (the
+        # graph tests/delta_buffer_equivalence_test.py drives) vertex 11
+        # enumerates 4 keys and emits 0 (forward order), vertex 12 enumerates
+        # 1 and emits 0 (reverse); the flagship nn256 drops 8 of 84 enumerated
+        # faces (vertices 13 and 16, 4 keys -> 0) forward and 1 of 25 reverse.
+        # So this is the steady state, not an alarm -- which is exactly why it
+        # must be mapped around and COUNTED rather than raised on.
+        #
+        # Two different things hide behind it, and one silent `failures` bump
+        # used to cover both:
+        #
+        #   * face f itself was not emitted. The head has already DECIDED an
+        #     approximation for it, and paid log-prob for that decision, on a
+        #     contraction that does not exist. There is no chunk to hand back,
+        #     so the empty chunk stands -- but under its own name,
+        #     `face_dropped`, instead of disappearing into the same counter as
+        #     a graph graphax could not trace. A persistently non-zero
+        #     `face_dropped` means the action space is wider than the stream,
+        #     which only the policy side can fix.
+        #
+        #   * face f WAS emitted but an earlier one was not, so segment f
+        #     belongs to a later-keyed face. That is a real mis-index -- the
+        #     same defect class as the `skipped_before` shift 5036daf removed,
+        #     from a different cause -- and it was completely silent. Map by
+        #     the face's OWN key instead of by position: a lookup in a <=12
+        #     entry list, and it cannot mis-index. (A SKIPPED face is a
+        #     different thing and needs no compensation: it IS emitted and DOES
+        #     get a segment, so its key is in `ekeys` like any other.)
+        if ekeys is None or len(ekeys) != len(segs):
             self.stats["failures"] += 1
             return empty
+        if ekeys != keys:
+            self.stats["face_key_seg_mismatch"] += 1
+            if ekeys and not _PARTIAL_DROP_WARNED[0]:
+                # Partial drop: the case positional indexing gets WRONG rather
+                # than merely empty. Never observed -- say so out loud once.
+                _PARTIAL_DROP_WARNED[0] = True
+                warnings.warn(
+                    f"[alphagrad.approx.live_faces] vertex {vertex}: faces_of "
+                    f"enumerated {keys} but the elimination emitted {ekeys} -- "
+                    f"a PARTIAL drop. Chunks are now mapped by face key, so "
+                    f"the head still reads its own face; positional indexing "
+                    f"would have handed it a later face's contraction. See "
+                    f"`face_key_seg_mismatch` in the face-stream health line.",
+                    stacklevel=2)
+
+        # INVARIANT: THE CHUNKS CONCATENATE TO EXACTLY THE STEP DELTA.
+        # `_face_replay` scores the stored actions by pooling rows
+        # [cumsum(counts)[f-1] : cumsum(counts)[f]) of ONE scan over the
+        # stored emission, so its boundaries address the window the head
+        # actually read only if the segments TILE that emission: first starts
+        # at 0, each ends where the next begins, the last ends at the end.
+        # ppo.TrainState.face_counts pins the property ("the chunks
+        # concatenate to exactly the step delta") and the loss depends on it;
+        # nothing checked it. (The chunks cover the tiling MINUS the last
+        # face's approximation tail, which no chunk contains -- that tail is
+        # the only slack, and it is exactly what `_face_replay` documents.)
+        _prev = 0
+        for _s, _sp, _e in segs:
+            if _s != _prev or not (_s <= _sp <= _e):
+                self.stats["face_seg_not_tiled"] += 1
+                raise RuntimeError(
+                    f"vertex {vertex}: face segments {segs} do not tile the "
+                    f"{len(toks)}-token emission -- the per-face chunks no "
+                    f"longer concatenate to the step delta, so the loss's "
+                    f"cumsum boundaries pool the wrong rows.")
+            _prev = _e
+        if _prev != len(toks):
+            self.stats["face_seg_not_tiled"] += 1
+            raise RuntimeError(
+                f"vertex {vertex}: face segments end at {_prev} but the "
+                f"emission is {len(toks)} tokens -- the per-face chunks no "
+                f"longer concatenate to the step delta.")
+
+        if keys[f] not in ekeys:
+            # Decided, then never contracted. Empty chunk (the head falls
+            # back to the vertex context for this face alone, as it does
+            # for any soft failure), but counted as what it is.
+            self.stats["face_dropped"] += 1
+            res = (empty[0], empty[1], empty[2], np.int32(n_faces))
+            self._chunks[ck] = res
+            return res
+        gi = ekeys.index(keys[f])
+
+        # INVARIANT: FACE f'S CHUNK OPENS ON FACE f'S OWN `path` HEADER.
+        # The mapping is only as good as the record it was read from, so pin
+        # the other end at the TOKEN level: segment gi must begin with the
+        # `path <central> & <in_edge> & <out_edge>` graphax emits for the face
+        # whose key is keys[f]. This is the check that fires if emission order
+        # ever changes underneath the sink.
+        if exp_hdr is None or toks[segs[gi][0]:segs[gi][0] + len(exp_hdr)] != exp_hdr:
+            self.stats["face_header_mismatch"] += 1
+            raise RuntimeError(
+                f"vertex {vertex} face {f} (key {keys[f]}): segment {gi} does "
+                f"not open with that face's `path` header -- got "
+                f"{toks[segs[gi][0]:segs[gi][0] + 12]}, expected "
+                f"{None if exp_hdr is None else exp_hdr[:12]}. The head would "
+                f"be reading another face's contraction.")
 
         chunk: list[int] = []
         cids: list[int] = []
