@@ -54,7 +54,7 @@ class PlanTokenizer:
         from graphax import IncrementalPathTokenizer
 
         if vocab is None:
-            vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "248"))
+            vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "512"))
         self.jaxpr = jaxpr
         self.argnums = tuple(int(a) for a in argnums)
         self.consts = list(consts)
