@@ -401,8 +401,16 @@ class CpuApproximationServer:
                     flush=True,
                 )
             # ---- end verbose diagnostics ----
-            sentinel_tokens = np.zeros((MAX_TOKENS,), dtype=np.int32)
-            sentinel_eqn_ids = np.zeros((MAX_TOKENS,), dtype=np.int32)
+            from alphagrad.approx.env import MAX_DELTA_TOKENS as _MDT
+            # Width follows the env's observation contract: under delta_obs
+            # the wire is (1 header slot + MAX_DELTA_TOKENS), and an
+            # all-zero sentinel then reads back as an EMPTY delta -- the
+            # encoder simply does not advance, which is the right failure
+            # mode. Legacy full-stream envs keep MAX_TOKENS.
+            _sw = (1 + _MDT if getattr(self._config, "delta_obs", False)
+                   else MAX_TOKENS)
+            sentinel_tokens = np.zeros((_sw,), dtype=np.int32)
+            sentinel_eqn_ids = np.zeros((_sw,), dtype=np.int32)
             sentinel_reward = np.full((NUM_REWARDS,), -1e10, dtype=np.float32)
             # cosine_sim is "higher is better, capped at 1" — set to 0 so the
             # acc head doesn't see a weirdly bad positive signal.
@@ -781,6 +789,11 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         # approximation policy than the trainer intended.
         per_face=bool(getattr(args, "per_face", False)
                       or getattr(args, "face_actions", False)),
+        # DELTA OBSERVATION. ppo.py is the only trainer that sets
+        # ``incremental_encode`` (it is mandatory there); mu0 / gfn ray
+        # workers rebuild through this same function and must keep the
+        # legacy full stream, which is exactly what the default gives them.
+        delta_obs=bool(getattr(args, "incremental_encode", False)),
         latency_timer=str(getattr(args, "latency_timer", "perf_counter")),
         quant_once=bool(getattr(args, "quant_once", False)),
         slow_exec_cutoff_seconds=float(

@@ -31,7 +31,6 @@ from alphagrad.approx.ppo import (
     MAX_EQNS,
     NUM_VALUE_HEADS,
     _build_agent,
-    _stream_len,
     make_argparser,
 )
 from alphagrad.approx import vertex_memory as vmem
