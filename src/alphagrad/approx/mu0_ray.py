@@ -40,8 +40,13 @@ from alphagrad.approx.common.reward_scaling import (
     symlog_np as _symlog_np,
 )
 
+# NOTE: "full_curriculum" is deliberately NOT here. 9cdd258 deleted it from
+# VARIANT_PRESETS, so leaving it in the DEFAULT sweep made a default run
+# train six variants and then die on the seventh with
+# "Unknown --variant 'full_curriculum'". Re-add it here only together with
+# the preset in variants.py.
 _DEFAULT_VARIANT_SWEEP = (
-    "ve_only,diag_gcd,diag_factor,compress,quantize,full,full_curriculum"
+    "ve_only,diag_gcd,diag_factor,compress,quantize,full"
 )
 
 
