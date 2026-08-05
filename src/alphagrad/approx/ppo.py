@@ -6663,6 +6663,17 @@ def main():
                 print("[health ep%d] live-faces %s" % (
                     _HEALTH_N[0] - 1, _LIVE_FACES.consume_stats()),
                     flush=True)
+        # ALPHAGRAD_DEBUG_APPROX_PROB=1: mirror the approximation telemetry to
+        # stdout, so a --wandb disabled probe (or a crashed run's log) still
+        # answers "is skip/none ever chosen, or is it masked?".
+        if os.environ.get("ALPHAGRAD_DEBUG_APPROX_PROB", "0") == "1":
+            _ap = {k: v for k, v in log_dict.items()
+                   if k.startswith(("approx_prob/", "approx_applied/",
+                                    "approx_skipped/", "per_face/"))}
+            if _ap:
+                print("[approx] " + " ".join(
+                    f"{k.split('/')[-1]}={float(v):.4g}"
+                    for k, v in sorted(_ap.items())), flush=True)
         wandb.log(log_dict)
 
         # Per-episode memory + JIT-cache diagnostic. Off by default; flip on
