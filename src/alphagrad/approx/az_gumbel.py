@@ -54,6 +54,11 @@ LAST_FULL_REWARD = np.zeros(len(REWARD_NAMES), dtype=np.float64)
 from alphagrad.approx.common.examples import (
     get_fn, get_args, data_gen, infer_argnums, scalar_loss_fn)
 from alphagrad.approx.common.eval_samples import generate_eval_samples
+# M6 (search dynamics must apply the approximation) needs this at module
+# level: step_state runs outside the functions that imported it locally, so
+# the approx arm crashed with NameError on its first micro action while the
+# exact arm (micro always None) never reached the branch.
+from alphagrad.approx.common.masks import make_live_masked_hook
 from alphagrad.approx.common.order_specs import build_order_specs
 from alphagrad.approx.common.popart import PopArtStats
 from alphagrad.approx.common.pareto_archive import ParetoArchive
