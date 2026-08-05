@@ -1,3 +1,11 @@
+import pytest as _pytest_quarantine
+
+_pytest_quarantine.skip(
+    "QUARANTINED 2026-08-05: ppo_ray_worker.SimplePPOAgent was removed (the Ray PPO line is retired). "
+    "Kept for provenance; delete once the subsystem is confirmed gone for good.",
+    allow_module_level=True,
+)
+
 """Smoke test: ``SimplePPOAgent`` builds with the 4-way op-type head
 plus ``quant_dtype_head`` after Phase 6's QUANT propagation.
 

@@ -18,7 +18,31 @@ from jax import Array, jit
 from jax.experimental import io_callback
 from jax.tree_util import register_pytree_node_class
 
-from alphagrad.utils.profiler import track_activity, register_thread, update_thread_registry, get_dashboard_summary
+# OPTIONAL instrumentation (2026-08-05). ``alphagrad.utils`` is a module, not
+# a package, and no ``profiler`` submodule exists — this import raised
+# ModuleNotFoundError and took the whole ``alphagrad.vertexgame`` package with
+# it, so ~20 test modules could not be collected. The four names are a timing
+# context manager plus three thread-registry pokes; degrade to no-ops when the
+# profiler is absent instead of making the package unimportable.
+try:  # pragma: no cover - exercised only when a profiler is installed
+    from alphagrad.utils.profiler import (  # type: ignore
+        track_activity, register_thread, update_thread_registry,
+        get_dashboard_summary)
+except (ImportError, ModuleNotFoundError):  # pragma: no cover
+    from contextlib import contextmanager as _contextmanager
+
+    @_contextmanager
+    def track_activity(*_args, **_kwargs):
+        yield
+
+    def register_thread(*_args, **_kwargs):
+        return None
+
+    def update_thread_registry(*_args, **_kwargs):
+        return None
+
+    def get_dashboard_summary(*_args, **_kwargs):
+        return {}
 
 ENABLE_PREFETCH = True
 MAX_TOKENS = 1024
@@ -657,7 +681,11 @@ class VertexEliminationEnv:
         if valid_vertices is None:
             args_np = jax.tree_util.tree_map(np.asarray, args)
             consts_np = jax.tree_util.tree_map(np.asarray, consts)
-            _, _, _, _, vo_vertices = _build_graph(jaxpr, args_np, consts_np)
+            # graphax._build_graph returns FOUR values (env, graph, tgraph,
+            # vo_vertices) — it dropped a fifth element; this legacy unpack was
+            # never updated and raised "not enough values to unpack" on every
+            # call (2026-08-05).
+            _, _, _, vo_vertices = _build_graph(jaxpr, args_np, consts_np)
             valid = []
             for i, eqn in enumerate(jaxpr.eqns, 1):
                 if eqn.outvars[0] not in jaxpr.outvars or i in vo_vertices:
