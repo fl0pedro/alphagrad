@@ -14,8 +14,11 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("ALPHAGRAD_POLICY", "palimpsa")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
 os.environ.setdefault("GRAPHAX_ALLOW_PARTIAL_ORDER", "1")
-os.environ.setdefault("ALPHAGRAD_NN_HIDDEN", "64")
-os.environ.setdefault("ALPHAGRAD_NN_BATCH", "16")
+# NO ALPHAGRAD_NN_HIDDEN / ALPHAGRAD_NN_BATCH here. They size the TARGET
+# function, `setdefault` makes the first importer in the pytest session win,
+# and live_vertex_mask_test pins the nn256 shapes at the default hidden 63 --
+# setting 64 here failed two of its tests purely by import order. This test
+# does not care about the hidden size at all.
 
 import jax  # noqa: E402
 import numpy as np  # noqa: E402
@@ -37,9 +40,13 @@ def setup():
     closed = jax.make_jaxpr(get_fn(TASK))(*xs)
     jaxpr, consts = closed.jaxpr, list(closed.literals)
     argnums = infer_argnums(TASK)
-    E.configure_max_faces(
-        E.derived_max_faces(jaxpr, argnums, closed.literals, xs))
-    F = E.MAX_FACES
+    # Use the derived bound LOCALLY. `E.configure_max_faces` mutates a module
+    # global that every later test in the session inherits -- doing it here
+    # broke face_actions_env_test and live_vertex_mask_test purely by import
+    # order. Nothing this test touches reads `E.MAX_FACES`: the stream takes
+    # its width as an argument and `_decided` reads FACE_SLOTS /
+    # MAX_RULES_PER_VERTEX only.
+    F = E.derived_max_faces(jaxpr, argnums, closed.literals, xs)
     lfs = build_live_face_stream(
         jaxpr, argnums, consts, list(xs), max_faces=F,
         max_axes=E.MAX_AXES_PER_VERTEX, window=E.MAX_DELTA_TOKENS, cache=16)
