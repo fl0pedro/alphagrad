@@ -6561,11 +6561,14 @@ def main():
             "collapse/zero_work_this_ep": consume_zero_work_plan_count(),
             "collapse/count_this_ep": n_collapsed_this_ep,
             "collapse/count_total": host_state["collapsed_total"],
-            "collapse/fraction_this_ep": n_collapsed_this_ep / max(1, all_rets.shape[0]),
-            "KL divergence": kl_div,
+            # DROPPED: collapse/fraction_this_ep (= count_this_ep / num_envs),
+            # sample count (linear in the episode), and "KL divergence" --
+            # that one summed the per-component micro KLs, which are point
+            # masses under --live-faces, so it equalled kl/vertex AND
+            # contained no face-head term at all. kl/approx is the real
+            # joint (vertex+face) KL; kl/vertex is the component view.
             "entropy evolution": policy_entropy,
             "explained variance": explained_var,
-            "sample count": host_state["samplecounts"],
             "ppo loss": ppo_loss,
             "value loss": value_loss,
             "total loss": total_loss,
@@ -6737,6 +6740,10 @@ def main():
         log_dict["time/wall_minutes"] = float((_now - _t0) / 60.0)
         log_dict["time/sec_per_episode"] = float(_now - _prev)
         log_dict["time/episode"] = int(ep)
+        # Shared x-axis with the AZ arm. One AZ episode is ONE measurement;
+        # one PPO episode is num_envs of them, so plotting the two against
+        # "episode" understates PPO's cost by ~num_envs.
+        log_dict["n_meas"] = int(num_envs) * (int(ep) + 1)
         host_state["_wall_prev"] = _now
 
         # ---- per-face apply telemetry ---------------------------------------
@@ -6770,7 +6777,11 @@ def main():
 
         # ---- degenerate plans sentinelled by the env ------------------------
         _degen = consume_degenerate_plan_count()
-        log_dict["collapse/degenerate_plans_this_ep"] = _degen
+        # DROPPED: collapse/degenerate_plans_this_ep -- _record_degenerate_plan
+        # has no caller, and _DEGENERATE_PLANS is only bumped by the
+        # truncated/untraceable recorders (which also bump _TRUNCATED_PLANS),
+        # making it arithmetically identical to collapse/truncated_this_ep.
+        _ = _degen
 
         # ---- XLA side-channel: xla_peak_memory + compression ratio ----------
         xla_stats = consume_xla_memory_stats()
@@ -6810,8 +6821,8 @@ def main():
         log_dict["tokens/delta_mean"] = _tl["delta_mean"]
         log_dict["tokens/delta_max"] = _tl["delta_max"]
         log_dict["tokens/delta_count"] = _tl["delta_count"]
-        log_dict["tokens/delta_budget"] = MAX_DELTA_TOKENS
-        log_dict["tokens/delta_headroom"] = MAX_DELTA_TOKENS - _tl["delta_max"]
+        # DROPPED: tokens/delta_budget (a constant) and tokens/delta_headroom
+        # (= budget - tokens/delta_max, affine in a key already logged).
 
         # ---- Pareto front + hypervolume (spec P2) ---------------------------
         # Objectives are logged in "higher is better" form, so the archive's
@@ -6909,9 +6920,8 @@ def main():
             # their own panel; approx_prob/* reports the head that actually
             # decided, i.e. realized per-face usage.
             _ap_names = ("diag", "compress", "quant", "none")
-            for j, _nm in enumerate(_ap_names):
-                if j < op_marginals.shape[0]:
-                    log_dict[f"micro_op_marginal/{_nm}"] = float(op_marginals[j])
+            # DROPPED: micro_op_marginal/* -- the SAME op_marginals array as
+            # op_marginal/*, only relabelling index 3 end -> none.
             for j, _nm in enumerate(_ap_names):
                 if j < _face_op_freq.shape[0]:
                     log_dict[f"approx_prob/{_nm}"] = float(_face_op_freq[j])
@@ -6920,7 +6930,8 @@ def main():
             # mean_valid stays ~1.7 against width 196, the per-face arrays
             # are ~99% padding and any UNMASKED face mean is meaningless.
             log_dict["faces/mean_valid"] = float(_face_mean_valid)
-            log_dict["faces/width"] = int(ENV_MAX_FACES)
+            # DROPPED: faces/width -- the ENV_MAX_FACES constant. The
+            # dilution it existed to expose is carried by faces/mean_valid.
             log_dict["sub_episode_length"] = float(mean_sub_episode_length)
         # Populate the elimination-order table (it used to be created and
         # logged empty). Bounded: one row per episode for the best eligible
