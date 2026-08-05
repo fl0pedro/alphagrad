@@ -6581,6 +6581,16 @@ def main():
         # ---- per-face apply telemetry ---------------------------------------
         if args.per_face or args.face_actions:
             pf = consume_per_face_stats()
+            # The per-face legality hooks run INSIDE the Ray measure actors,
+            # so the trainer's own counters are always empty when the pool is
+            # active -- poll the actors and merge, or approx_applied/* never
+            # appears at all. No-op (and never raises) without a pool.
+            try:
+                from alphagrad.approx.common.measure_pool import (
+                    merge_pool_face_stats as _merge_pf)
+                pf = _merge_pf(getattr(env, "_remote_pool", None), pf)
+            except Exception:
+                pass
             if pf.get("applied", 0) or pf.get("skipped", 0):
                 log_dict["per_face/applied"] = pf.get("applied", 0)
                 log_dict["per_face/skipped"] = pf.get("skipped", 0)

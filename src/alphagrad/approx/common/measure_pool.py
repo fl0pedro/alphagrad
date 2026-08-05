@@ -86,6 +86,47 @@ def spawn_measure_pool(args_dict: dict, *, n_actors: int, exec_on_gpu: bool,
     )
 
 
+def merge_pool_face_stats(pool, pf: dict | None = None) -> dict:
+    """Merge the measure actors' per-face apply counters into ``pf``.
+
+    WHY: ``env._PER_FACE_STATS`` is a plain module global written by the
+    per-face legality hook inside the measurement ``_callback``. When the
+    Ray measure pool is active that callback runs in the ACTOR processes,
+    so the trainer's own dict is always empty, the ``if applied or
+    skipped`` guard never fires and the ``approx_applied/*`` histogram is
+    silently never logged.
+
+    Polls every live actor, sums the additive counters, then RECOMPUTES
+    ``applied_fraction`` -- the per-actor fractions are not additive.
+
+    Best-effort by construction: a missing pool, a dead actor, or an old
+    actor without ``consume_face_stats`` contributes nothing and never
+    raises. Used by both ppo.py and az_gumbel.py so the two trainers emit
+    identical key names.
+    """
+    out = dict(pf or {})
+    try:
+        import ray as _ray
+        actors = list(pool.live_actors()) if pool is not None else []
+    except Exception:
+        return out
+    for _h in actors:
+        try:
+            _s = _ray.get(_h.consume_face_stats.remote(), timeout=10)
+        except Exception:
+            continue
+        for _k, _v in (_s or {}).items():
+            if _k == "applied_fraction":
+                continue
+            if isinstance(_v, bool) or not isinstance(_v, (int, float)):
+                continue
+            out[_k] = out.get(_k, 0) + _v
+    _tot = (out.get("applied", 0) + out.get("skipped", 0)
+            + out.get("skipped_raised", 0)) or 1
+    out["applied_fraction"] = out.get("applied", 0) / _tot
+    return out
+
+
 def measure_one_plan(pool, order, specs, face_specs, face_skips, step,
                      *, eval_samples=None, init: bool = False):
     """Measure a SINGLE plan through the pool, face wires included.

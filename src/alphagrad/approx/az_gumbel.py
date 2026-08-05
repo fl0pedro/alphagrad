@@ -1023,6 +1023,15 @@ def _run(args) -> int:
                 # on both runs and is honestly empty here.
                 _log["approx_prob/skip"] = 0.0
                 _pf = consume_per_face_stats()
+                # Same story as PPO: the per-face hooks run inside the Ray
+                # measure actors, so this process' counters are always empty
+                # and every approx_applied/* key would log as a flat 0.
+                try:
+                    from alphagrad.approx.common.measure_pool import (
+                        merge_pool_face_stats as _merge_pf)
+                    _pf = _merge_pf(_MEASURE_POOL, _pf)
+                except Exception:
+                    pass
                 for _k in ("diag", "compress", "quant"):
                     _log[f"approx_applied/{_k}"] = _pf.get(f"applied_{_k}", 0)
                     _log[f"approx_skipped/{_k}"] = _pf.get(f"skipped_{_k}", 0)

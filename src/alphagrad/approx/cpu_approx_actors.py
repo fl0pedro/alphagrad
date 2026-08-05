@@ -266,3 +266,14 @@ class CpuApproximationActor:
             consume_tokenization_truncation_stats as _consume,
         )
         return _consume()
+
+    def consume_face_stats(self) -> dict:
+        """Pop this actor's per-face apply counters.
+
+        The hooks that decide per-face legality run HERE (the measurement
+        ``_callback`` executes inside the actor process, not the trainer),
+        so ``env._PER_FACE_STATS`` only ever fills up in this process; the
+        trainer's own dict is always empty while the pool is active.
+        """
+        from alphagrad.approx.env import consume_per_face_stats as _consume_pf
+        return _consume_pf()
