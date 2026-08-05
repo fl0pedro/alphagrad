@@ -639,11 +639,24 @@ def net_eval(agent, state, legal):
 
 # ---------------------------------------------------------------- known dynamics
 def step_state(graph, tg, state, vertex, micro):
-    # M6: the search's graph model must apply the SAME approximation the
-    # measurement will. With ``transforms=()`` the search planned on an exact
-    # graph and then measured an approximated one — two different MDPs.
-    _rules = _rules_of(micro) if micro is not None else ()
-    _hooks = ((make_live_masked_hook(tuple(_rules)),) if _rules else ())
+    # M6: the search's graph model should apply the SAME approximation the
+    # measurement will -- with ``transforms=()`` the search plans on an exact
+    # graph and then measures an approximated one, i.e. two different MDPs.
+    #
+    # GATED OFF BY DEFAULT. The search eliminates in-process on the trainer
+    # GPU, and applying the hooks on deep elimination states hits the graphax
+    # densify wall: job 58352 produced ZERO episodes in 35 min, looping
+    # "GPU_0_bfc ran out of memory trying to allocate 3.83GiB" and finally
+    # "byte size of input/output arguments (362538860544) exceeds the base
+    # limit (76479332352)" -- a 362 GB program on a 76 GB GPU. The exact arm
+    # and the pre-M6 approx arm both ran fine, so the hooks are the trigger.
+    # W5 (drive the single authoritative tokenizer graph) removes the
+    # trade-off; until then this is an explicit, logged limitation.
+    _hooks = ()
+    if micro is not None and os.environ.get(
+            "ALPHAGRAD_GAZ_SEARCH_HOOKS", "0") == "1":
+        _rules = _rules_of(micro)
+        _hooks = ((make_live_masked_hook(tuple(_rules)),) if _rules else ())
     _eliminate_vertex(vertex, jaxpr, graph, tg, VO, count_ops=False,
                       transforms=_hooks)
     state.append((VALID.index(vertex), micro))
