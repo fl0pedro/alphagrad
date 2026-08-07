@@ -908,8 +908,27 @@ _AXIS_FEAT_GROUP_ID = 3
 #   5 peak_memory      — peak HBM bytes during a single execution of the approx
 #                        fn, captured via `ResourceMonitor`.
 # Quality family (indices 6..7):
-#   6 cosine_sim       — cosine similarity between flattened approximated and
-#                        exact Jacobians, averaged over the calibration samples.
+#   6 quality          — THE quality channel. Which QUANTITY sits in it is
+#                        selected by ``ALPHAGRAD_QUALITY_METRIC`` (see
+#                        ``quality_metric()`` below):
+#                          "loss_drop" (default under --measure-grad) — the
+#                            relative loss drop of a 200-step Adam walk driven
+#                            by THIS PLAN's gradient, probed on a fixed batch
+#                            of 512 real MNIST images. Pearson 0.922 against
+#                            final downstream test accuracy vs 0.610 for the
+#                            Jacobian cosine, at 0.22 s / 40 MB per plan vs
+#                            9.70 s / 4.24 GB.
+#                          "cosine" (legacy) — cosine similarity between the
+#                            flattened approximated and exact Jacobians,
+#                            aggregated over the calibration samples.
+#                        The slot was called ``cosine_sim`` until 2026-08-07;
+#                        ``REWARD_INDEX["cosine_sim"]`` still resolves to 6 so
+#                        every historical call site keeps working, but the
+#                        NAME is now metric-agnostic because the wandb keys
+#                        (mean_/measure_/popart_ are all built from
+#                        REWARD_NAMES) must not claim "cosine" for a number
+#                        that is not one. The concrete metric is published as
+#                        ``quality/metric``.
 #   7 frob_residual    — relative Frobenius residual ||J_e - J_a||_F / ||J_e||_F.
 NUM_REWARDS = 8
 REWARD_NAMES: tuple[str, ...] = (
@@ -919,10 +938,14 @@ REWARD_NAMES: tuple[str, ...] = (
     "max_io_sum",
     "bytes_accessed",
     "peak_memory",
-    "cosine_sim",
+    "quality",
     "frob_residual",
 )
 REWARD_INDEX = {name: i for i, name in enumerate(REWARD_NAMES)}
+# BACK-COMPAT ALIAS. 269 call sites (and the persisted PopArt/calibration
+# state, which is keyed by INDEX) address slot 6 as "cosine_sim". The slot did
+# not move; only its display name changed, so the alias is exact.
+REWARD_INDEX["cosine_sim"] = REWARD_INDEX["quality"]
 COMPUTE_REWARD_INDICES = tuple(range(0, 6))  # cost components
 QUALITY_REWARD_INDICES = (6, 7)             # cosine, frobenius
 
@@ -1115,6 +1138,12 @@ class EnvConfig(NamedTuple):
     # token, so the growing buffer -- and the id-0 length hazard that came
     # with counting non-zeros in it -- is simply gone.
     delta_obs: bool = False
+    # --measure-grad: the traced target IS a scalar loss and the plan's output
+    # IS a gradient. Recorded on the CONFIG (not just validated in from_jaxpr)
+    # because ``_callback`` sees only the config, and ``quality_metric()``'s
+    # ``auto`` default needs it to decide between the loss-drop walk (defined
+    # only for a scalar loss) and the legacy Jacobian cosine.
+    measure_grad: bool = False
 
 
 def _get_partials(order, sparsity_specs, stop):
@@ -1780,6 +1809,303 @@ def _quality_metrics(jac_exact, jac_approx):
     return cos, rel_frob
 
 
+# ---------------------------------------------------------------------------
+# THE QUALITY CHANNEL (reward slot 6).
+#
+# Until 2026-08-07 slot 6 held the cosine similarity between the plan's
+# Jacobian and the exact Jacobian. Measured against the quantity we actually
+# care about — the FINAL DOWNSTREAM TEST ACCURACY of a network trained with
+# the plan's gradient (139 archived plans x 3-5 seeds x 100k MNIST steps):
+#
+#                             Pearson  Spearman  cost/plan  peak mem
+#   Jacobian cosine            0.610    0.858     9.70 s     4.24 GB
+#   gradient cosine at init    0.737    0.857     0.33 s     ~40 MB
+#   loss drop, 200 Adam steps  0.922    0.854     0.22 s     40 MB
+#
+# So slot 6 now holds the LOSS DROP OF A SHORT ADAM WALK DRIVEN BY THE PLAN'S
+# OWN GRADIENT:
+#
+#     L0      = loss(W0, probe)
+#     W_{t+1} = adam(W_t, plan_gradient(W_t, batch))     t = 0 .. T-1
+#     quality = (L0 - loss(W_T, probe)) / |L0|
+#
+# ``plan_gradient`` is the gradient the PLAN BEING EVALUATED produces — its
+# elimination order AND its approximations — while ``loss`` is the TRUE scalar
+# loss. The channel therefore answers "does training with this approximate
+# gradient actually reduce the real loss", which is the question the thesis is
+# asking, rather than "does this approximate Jacobian point the same way".
+#
+# Rejected in the owner's sweep, do not re-litigate: 30 probe batches instead
+# of 5 (+0.00 Pearson), weight noise +/-10..100% (+0.00), cosine at trained
+# weights (-0.11), chained displacement over 20/200/1000 steps (-0.24),
+# product of per-step cosines (-0.39), fraction of decreasing steps
+# (Spearman -0.21).
+_QUALITY_METRIC_ENV = "ALPHAGRAD_QUALITY_METRIC"
+
+
+def quality_metric(config=None) -> str:
+    """``"loss_drop"`` or ``"cosine"`` — WHICH quantity reward slot 6 holds.
+
+    ``ALPHAGRAD_QUALITY_METRIC`` selects it; the default ``auto`` resolves to
+    ``loss_drop`` whenever the measured graph IS a scalar loss (i.e. under
+    ``--measure-grad``, where the plan's output is a gradient and the walk is
+    defined) and to the legacy ``cosine`` otherwise. Read identically by the
+    trainer and by every CpuApproximationActor — both run THIS function inside
+    THIS module's ``_callback``, so the two paths cannot disagree.
+    """
+    want = os.environ.get(_QUALITY_METRIC_ENV, "auto").strip().lower()
+    if want in ("loss_drop", "lossdrop", "walk"):
+        return "loss_drop"
+    if want in ("cosine", "cos", "cosine_sim"):
+        return "cosine"
+    if want not in ("auto", ""):
+        raise ValueError(
+            f"{_QUALITY_METRIC_ENV} must be one of auto/loss_drop/cosine, "
+            f"got {want!r}"
+        )
+    return "loss_drop" if bool(getattr(config, "measure_grad", False)) else "cosine"
+
+
+# Walk hyper-parameters. The defaults ARE the measured configuration above;
+# changing them invalidates the correlation numbers, so they are env-tunable
+# but never silently different between the trainer and the measure actors
+# (both read this module in the same process tree / the same sbatch env).
+def _walk_steps() -> int:
+    return int(os.environ.get("ALPHAGRAD_WALK_STEPS", "200"))
+
+
+def _walk_lr() -> float:
+    return float(os.environ.get("ALPHAGRAD_WALK_LR", "1e-3"))
+
+
+def _walk_probe_seed() -> int:
+    """Seed of the PROBE BATCH. The batch must be IDENTICAL for every plan in a
+    run or the scores are not comparable, so it is a fixed constant rather than
+    anything derived from the episode / env / actor."""
+    return int(os.environ.get("ALPHAGRAD_WALK_PROBE_SEED", "20260807"))
+
+
+def _walk_noise_std() -> float:
+    """OPTIONAL, DEFAULT OFF. Resampling N(0, 0.3) pixel noise on the walk
+    batch each step lifts Pearson 0.922 -> 0.950, but it changes the measured
+    configuration, so the headline numbers stay reproducible only at 0.0."""
+    return float(os.environ.get("ALPHAGRAD_WALK_NOISE_STD", "0.0"))
+
+
+# One probe batch per (process, data-generator, shape) — built once, kept on
+# the host, device_put per measurement onto whichever device the plan was
+# compiled for.
+_PROBE_BATCH: dict = {}
+
+
+def _probe_batch(config, base_args):
+    """The FIXED probe batch: real data from ``config.data_gen`` at a fixed key.
+
+    SYNTHETIC DATA IS NOT AN OPTION for the loss-drop metric. Walking on noise
+    and probing real MNIST gives Spearman 0.08 (gaussian) / 0.13 (uniform) and
+    catches 2 of 7 degenerate plans, vs 6 of 7 with real images; self-probing
+    on noise scores a healthy-looking 0.72-0.78 and is MISLEADING, because
+    random labels are memorisable by any descending gradient. 8 tiled images
+    give Pearson 0.261, one image 0.015. 60000 -> 512 distinct images costs
+    +0.003, which is why 512 (one resident batch, no data pipeline) is enough.
+
+    Returns ``None`` when the example has no data generator, which is the
+    signal to fall back to the legacy cosine channel rather than to invent
+    data.
+    """
+    if config.data_gen is None:
+        return None
+    _key = (id(config.data_gen), _walk_probe_seed(),
+            tuple(getattr(a, "shape", ()) for a in base_args[:2]))
+    hit = _PROBE_BATCH.get(_key)
+    if hit is not None:
+        return hit
+    k = jrand.PRNGKey(_walk_probe_seed())
+    data = config.data_gen(jrand.split(k, 5))
+    data = tuple(jax.device_get(d) for d in data)
+    _PROBE_BATCH.clear()          # one batch per process, by construction
+    _PROBE_BATCH[_key] = data
+    return data
+
+
+def _walk_argnums(config, base_args) -> tuple[int, ...]:
+    """The differentiated slots the walk is allowed to UPDATE.
+
+    0-d argnums are excluded: under ``--seed-vertices`` the last differentiated
+    argument is the tangent seed ``t``, whose gradient is a directional
+    derivative and not a weight update — stepping it moves every weight by
+    ``t*ones`` and saturates the net (the same reason
+    ``generate_eval_samples`` leaves 0-d argnums at their injected value)."""
+    return tuple(
+        i for i in config.argnums
+        if i < len(base_args) and getattr(base_args[i], "ndim", 0) > 0
+    )
+
+
+def _sanitise_grad(g, like):
+    """Plan gradients arrive with two documented irregularities: some weight
+    leaves come back TRANSPOSED for certain elimination orders (the reason
+    ``_align_jac`` exists), and quant/compress plans can produce complex or
+    non-finite leaves. Fix the layout, take the real part, and replace
+    non-finite entries with 0 BEFORE the Adam step — a NaN that reaches the
+    optimiser poisons every subsequent step and the walk would report a
+    non-finite loss for a plan that is merely bad on a few entries."""
+    def _fix(a, e):
+        if getattr(a, "shape", None) != getattr(e, "shape", None):
+            if getattr(a, "ndim", 0) == 2 and a.shape == e.shape[::-1]:
+                a = a.T
+            else:
+                return None
+        a = jnp.real(a) if jnp.iscomplexobj(a) else a
+        return jnp.nan_to_num(a.astype(e.dtype), nan=0.0, posinf=0.0, neginf=0.0)
+    return [_fix(a, e) for a, e in zip(g, like)]
+
+
+@partial(jax.jit, static_argnums=())
+def _adam_step(w, g, m, v, t, lr, b1, b2, eps):
+    m = [b1 * mi + (1.0 - b1) * gi for mi, gi in zip(m, g)]
+    v = [b2 * vi + (1.0 - b2) * gi * gi for vi, gi in zip(v, g)]
+    mh = [mi / (1.0 - b1 ** t) for mi in m]
+    vh = [vi / (1.0 - b2 ** t) for vi in v]
+    w = [wi - lr * mhi / (jnp.sqrt(vhi) + eps)
+         for wi, mhi, vhi in zip(w, mh, vh)]
+    return w, m, v
+
+
+def _loss_drop_quality(config, compiled_approx, base_args, device=None):
+    """Reward slot 6 under ``ALPHAGRAD_QUALITY_METRIC=loss_drop``.
+
+    ``compiled_approx`` is the AOT-compiled DENSE executable of the plan under
+    evaluation, so the gradient it returns carries the plan's elimination order
+    AND its approximations. ``config.target_fun`` is the TRUE scalar loss (this
+    metric is only selected when the measured graph is a scalar loss), so the
+    probe is never contaminated by the approximation.
+
+    Returns ``None`` when the walk cannot be defined (no data generator, no
+    updatable weight slots, shape mismatch), which the caller treats as "fall
+    back to the legacy cosine" rather than as a score.
+    """
+    probe = _probe_batch(config, base_args)
+    if probe is None or config.target_fun is None:
+        return None
+    wnums = _walk_argnums(config, base_args)
+    if not wnums:
+        return None
+
+    full = list(base_args)
+    for i, d in enumerate(probe):
+        if i < len(full):
+            full[i] = jnp.asarray(d)
+    if device is not None:
+        full = [jax.device_put(a, device) for a in full]
+    # The walk batch IS the probe batch: one batch resident on device, no data
+    # pipeline (spec). 512 images at batch 512; batch 128 costs 0.02 Pearson
+    # and batch 32 costs 0.08, and memory is flat in batch size anyway
+    # (33.6 MB XLA temp + 2.5-4.1 MB args).
+    x0 = full[0]
+
+    loss_fn = _jit_loss(config)
+    w = [full[i] for i in wnums]
+
+    def _call_loss(weights):
+        a = list(full)
+        for i, wi in zip(wnums, weights):
+            a[i] = wi
+        return loss_fn(*a)
+
+    # The plan's output has ONE leaf per entry of ``config.argnums``, in that
+    # order. Index by POSITION IN argnums rather than assuming the updatable
+    # slots are a prefix, so the --seed-vertices layout (weights..., tangent
+    # seed t) picks the weight leaves and drops d/dt no matter where it sits.
+    _grad_pos = [list(config.argnums).index(i) for i in wnums]
+
+    def _call_grad(weights, xb):
+        a = list(full)
+        a[0] = xb
+        for i, wi in zip(wnums, weights):
+            a[i] = wi
+        out = compiled_approx(*a)
+        out = out[1] if config.has_aux else out
+        leaves = jax.tree_util.tree_leaves(out)
+        if len(leaves) <= max(_grad_pos):
+            return None
+        return _sanitise_grad([leaves[p] for p in _grad_pos], weights)
+
+    L0 = float(_call_loss(w))
+    if not np.isfinite(L0) or abs(L0) < 1e-12:
+        return None
+
+    # ONE-TIME FINGERPRINT of the walk's starting point, per process.
+    #
+    # W0 is ``env.args`` — the initial weights, which ppo.py never refreshes
+    # (only ``eval_args_samples`` is re-drawn per episode), so W0 and the probe
+    # batch are both constants of the run and plan scores are comparable.
+    # CAVEAT, deliberately logged rather than "fixed": ppo.py derives its arg
+    # key with ``jrand.split(key)`` while cpu_approx_worker uses
+    # ``jrand.split(key, 3)``, so an ACTOR's W0 differs from the TRAINER's. It
+    # does not bite in the GPU campaigns because ``--exec-on-gpu`` keeps every
+    # TERMINAL row (the only rows quality is computed on) in the trainer
+    # process. Printing the fingerprint makes a future divergence visible
+    # instead of silent — compare the line across processes.
+    if not _WALK_FINGERPRINT:
+        _WALK_FINGERPRINT.append(1)
+        import hashlib as _hl
+        _h = _hl.blake2b(digest_size=8)
+        for _a in (x0,) + tuple(full[1:2]) + tuple(w):
+            _h.update(np.asarray(jax.device_get(_a)).tobytes())
+        print(
+            f"[measure] loss-drop walk armed: probe batch "
+            f"{tuple(np.asarray(x0).shape)} (seed {_walk_probe_seed()}), "
+            f"{_walk_steps()} Adam steps @ lr {_walk_lr():g}, "
+            f"noise std {_walk_noise_std():g}, L0={L0:.6g}, "
+            f"fingerprint(probe+W0)={_h.hexdigest()}",
+            flush=True)
+
+    T = _walk_steps()
+    lr = _walk_lr()
+    noise = _walk_noise_std()
+    nkey = jrand.PRNGKey(_walk_probe_seed() + 1)
+    m = [jnp.zeros_like(wi) for wi in w]
+    v = [jnp.zeros_like(wi) for wi in w]
+    for t in range(1, T + 1):
+        xb = x0
+        if noise > 0.0:
+            nkey, sk = jrand.split(nkey)
+            xb = x0 + noise * jrand.normal(sk, x0.shape, x0.dtype)
+        g = _call_grad(w, xb)
+        if g is None or any(gi is None for gi in g):
+            return None
+        w, m, v = _adam_step(w, g, m, v, float(t), lr, 0.9, 0.999, 1e-8)
+    L1 = float(_call_loss(w))
+    if not np.isfinite(L1):
+        # The walk DIVERGED. That is the worst outcome a plan can have on this
+        # channel, and it must not read as "no progress" (0.0) — otherwise a
+        # gradient that blows the network up ties with a gradient that is
+        # identically zero.
+        return -1.0
+    drop = (L0 - L1) / abs(L0)
+    # Clamped to [-1, 1]. Upper: a full loss wipe-out is 1.0, matching the old
+    # cosine's ceiling so PopArt's per-channel sigma floor
+    # (ALPHAGRAD_POPART_SIGMA_MIN_QUALITY, 0.2) and the head warm start keep
+    # the scale they were tuned for. Lower: an unbounded blow-up would let one
+    # catastrophic plan own the channel's PopArt sigma and crush the signal
+    # for every other plan in the episode.
+    return float(np.clip(drop, -1.0, 1.0))
+
+
+_LOSS_JIT: dict = {}
+
+
+def _jit_loss(config):
+    key = id(config.target_fun)
+    fn = _LOSS_JIT.get(key)
+    if fn is None:
+        fn = jax.jit(config.target_fun)
+        _LOSS_JIT.clear()
+        _LOSS_JIT[key] = fn
+    return fn
+
+
 # Smallest latency reading we accept as a real measurement. Sub-100ns for a
 # compiled grad executable is physically implausible (a fake-fast artifact of
 # timer bypass / zero-work executables); clamp UP so a degenerate plan can't
@@ -1803,6 +2129,10 @@ _MEASURE_ACTOR = os.environ.get("ALPHAGRAD_MEASURE_ACTOR", "0") == "1"
 # One-shot latch so the static-estimate fallback warning is printed once per
 # process instead of once per measurement.
 _MEM_FALLBACK_WARNED: list = []
+# One-shot warning flag for an undefinable loss-drop walk (see _callback).
+_WALK_UNDEFINED_WARNED: list = []
+# One-shot flag for the walk's starting-point fingerprint line.
+_WALK_FINGERPRINT: list = []
 # ...and a COUNT, because the latch alone means a run can silently change what
 # ``peak_memory`` MEANS mid-flight: the runtime high-water mark and the static
 # memory_analysis() estimate are different quantities, and the substitution is
@@ -2865,7 +3195,13 @@ def _callback(
     # exact mid-rollout yields ``(cos=0, frob=0)`` regardless. Skip
     # the compile + execute when the step is non-terminal; the cache
     # entry would never be re-used productively anyway.
-    if is_terminal:
+    #
+    # LOSS-DROP QUALITY (2026-08-07): the walk never looks at the exact
+    # Jacobian, so under ``ALPHAGRAD_QUALITY_METRIC=loss_drop`` the exact
+    # executable is not compiled and not executed at all. That is where the
+    # 9.70 s -> 0.22 s and 4.24 GB -> 40 MB per-plan saving comes from.
+    _qmetric = quality_metric(config)
+    if is_terminal and _qmetric == "cosine":
         try:
             compiled_exact = cached_compile(
                 b"exact:" + exact_cache_key, _do_compile_exact)
@@ -2933,6 +3269,10 @@ def _callback(
     # out_approxs/out_exacts lists held n_points x 2 full Jacobians
     # (~41.7GB at batch 512) before scoring — an OOM-truncation source that
     # said nothing about the plan.
+    # Samples of THE QUALITY CHANNEL (reward slot 6). Historical name: under
+    # ALPHAGRAD_QUALITY_METRIC=cosine it holds one Jacobian cosine per
+    # calibration point; under the default loss_drop it holds exactly ONE
+    # entry, the plan's 200-step Adam-walk loss drop.
     cosines: list = []
     latency_samples: list[float] = []
     peak_mem_samples: list[float] = []
@@ -3112,6 +3452,33 @@ def _callback(
                 _cos, _rf = _quality_metrics(_jac_e, _jac_a)
                 cosines.append(_cos)
 
+        # ---- LOSS-DROP QUALITY ------------------------------------------
+        # ONE walk per PLAN (not per data point): the probe batch is fixed
+        # across plans by construction, so repeating the walk over the
+        # calibration samples would re-measure the same number. Runs after
+        # the cost loop so the timing/peak windows above never contain it.
+        if is_terminal and _qmetric == "loss_drop":
+            _ld = _loss_drop_quality(
+                config, compiled_approx, list(args), callback_device)
+            if _ld is None:
+                # The walk is undefined for this env (no data generator, no
+                # updatable weight slot, or a plan whose output does not even
+                # have the weights' shapes). Say so LOUDLY once — silently
+                # scoring 0 would look like "this plan does not train".
+                if not _WALK_UNDEFINED_WARNED:
+                    _WALK_UNDEFINED_WARNED.append(1)
+                    print(
+                        "[measure] WARNING quality channel: the loss-drop "
+                        "walk is UNDEFINED for this configuration (no "
+                        "data_gen / no non-scalar differentiated arg / "
+                        "gradient shape mismatch). The channel reads 0.0 "
+                        "for every affected plan; set "
+                        "ALPHAGRAD_QUALITY_METRIC=cosine to train on the "
+                        "legacy Jacobian cosine instead.", flush=True)
+                cosines.append(0.0)
+            else:
+                cosines.append(_ld)
+
     except Exception as _exc:
         if _is_graphax_trace_failure(_exc):
             return _trace_truncate("measurement", _exc)
@@ -3139,16 +3506,26 @@ def _callback(
     )
 
     # ------------------------------------------------------------------
-    # Quality family — cosine similarity + relative Frobenius residual.
+    # Quality family — reward slot 6 (``quality``) + frob_residual.
     # ------------------------------------------------------------------
+    # WHICH quantity lands in slot 6 is ``quality_metric(config)``:
+    # ``loss_drop`` (default under --measure-grad) = the relative loss drop of
+    # a 200-step Adam walk driven by this plan's gradient; ``cosine`` = the
+    # legacy Jacobian cosine. Both are "higher is better", both are ~[0, 1]
+    # (loss_drop can reach -1 when the walk diverges), so every downstream
+    # consumer — PopArt's per-channel sigma floor, --lambda-acc, the symlog
+    # bypass, the mult gate — keeps its calibration.
+    #
     # Sparse-terminal channels: only computed on the terminal step
     # of the rollout. Partial elimination orders produce
     # ``||jac||=0`` for both ``compiled_approx`` and ``compiled_exact``
-    # (verified empirically against graphax.jacve), so the
-    # comparison is meaningless mid-rollout. Skip the work entirely
-    # — the cost channels above (muls/io/flops/peak_memory) still
+    # (verified empirically against graphax.jacve), so neither the
+    # comparison nor the walk is meaningful mid-rollout. Skip the work
+    # entirely — the cost channels above (muls/io/flops/peak_memory) still
     # compute per step, only quality is sparse.
     if is_terminal and cosines:
+        # loss_drop appends exactly one entry, so the aggregation is the
+        # identity there; it still runs so the cosine path is untouched.
         cosine_sim = float(_aggregate_samples(cosines, want_top_quartile=True))
         # frob is no longer a channel anything reads. The slot stays 0.0 for
         # real plans; the SENTINEL writers still stamp it, and the Ray pool's
@@ -3201,7 +3578,11 @@ def _callback(
     #     symlog+lambda scheme lacked (there, destroying the Jacobian paid 8.8x
     #     better than computing it);
     #   * and a refusal is a FLAT signal, which is what froze v17.
-    # So we let it measure, let frob punish it, and keep the gradient.
+    # So we let it measure, let the QUALITY CHANNEL punish it, and keep the
+    # gradient. Under loss_drop that punishment is direct and no longer relies
+    # on frob: a plan that computes nothing produces an all-zero gradient, the
+    # 200-step Adam walk therefore never moves the weights, and the loss drop
+    # is exactly 0.0 -- the floor for any plan that does not actively diverge.
     # This is telemetry only.
     if (not _SKIP_COUNT_OPS and is_terminal
             and (muls_adds_fmas <= 0.0) and (flops <= 0.0)):
@@ -3213,9 +3594,9 @@ def _callback(
             _n_comp = int(np.sum(_spec_rows[..., 0] == COMPRESS_SENTINEL))
             _n_diag = int(np.sum(_spec_rows[..., 0] >= 0))
             print(
-                f"[zero-work] KEPT (frob punishes): muls=0 "
+                f"[zero-work] KEPT (the quality channel punishes): muls=0 "
                 f"lat={latency_ns:.3g} peak={peak_memory:.3g} "
-                f"cos={cosine_sim:.3e} frob={frob_residual:.3e} "
+                f"{_qmetric}={cosine_sim:.3e} frob={frob_residual:.3e} "
                 f"rules(d/c/q)={_n_diag}/{_n_comp}/{_n_quant} "
                 f"skips={_n_skips} order={o_list}",
                 flush=True,
@@ -3375,6 +3756,7 @@ class VertexEliminationEnv:
             measure_latency=measure_latency,
             terminal_rewards_only=terminal_rewards_only,
             delta_obs=bool(delta_obs),
+            measure_grad=bool(measure_grad),
         )
         return cls(
             config,

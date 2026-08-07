@@ -78,6 +78,7 @@ from alphagrad.approx.common import (
 )
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
+    quality_metric as _env_quality_metric,
     _AXIS_FEAT_GROUP_ID,
     consume_degenerate_plan_count,
     consume_truncated_plan_count,
@@ -175,7 +176,19 @@ HEAD_REWARD_INDICES: tuple[int, ...] = (
     REWARD_INDEX["cosine_sim"],
 )
 NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
-HEAD_NAMES: tuple[str, ...] = ("latency", "mem", "cos")
+# Resolved from --quality-metric in `main`; names the quantity reward slot 6
+# actually holds, for every human-readable log line and the wandb
+# ``quality/metric`` key.
+_QUALITY_METRIC: str = "quality"
+HEAD_NAMES: tuple[str, ...] = ("latency", "mem", "quality")
+# Slot 2 was named "cos" until 2026-08-07; it is the value head for reward
+# slot 6, which now holds whichever quality metric env.quality_metric()
+# selects (the 200-step Adam-walk loss drop by default under --measure-grad,
+# the legacy Jacobian cosine otherwise) -- so the wandb keys built from this
+# tuple (popart/mu_*, popart/sigma_*, weighted_mean_*) no longer claim
+# "cosine" for a number that is not one. The eqx MODULE ATTRIBUTE keeps its
+# historical spelling ``value_head_cos``: renaming it would change the
+# pytree structure and invalidate every saved checkpoint for a cosmetic win.
 
 # Print every loss component the moment the total goes non-finite. Off by
 # default because it forces a host callback inside the jitted update.
@@ -2516,8 +2529,8 @@ def make_argparser() -> argparse.ArgumentParser:
              "(0 = off, in-process serial). Requires "
              "ALPHAGRAD_BATCHED_CALLBACK=1. With --exec-on-gpu each actor is "
              "pinned to its OWN gpu (num_gpus=1) so no two TIMED executions "
-             "ever share a device -- co-residency measured CV 0.0000% -> "
-             "49.7%. Ray rather than threads because the per-measure XLA "
+             "ever share a device -- co-residency measured CV 0.0000%% -> "
+             "49.7%%. Ray rather than threads because the per-measure XLA "
              "executable leak is only freed by process teardown. Incompatible "
              "with --face-actions (the pool's env is per-vertex and would "
              "silently drop the per-face decisions).")
@@ -2606,6 +2619,39 @@ def make_argparser() -> argparse.ArgumentParser:
         "examples) BEFORE tracing, so the policy graph, mask oracle, and "
         "measured executable all live on the same scalar-loss graph and "
         "jacve of it yields the gradients the spec asks to time.",
+    )
+    p.add_argument(
+        "--quality-metric", choices=["auto", "loss_drop", "cosine"],
+        default="auto",
+        help="WHICH quantity reward slot 6 (the --lambda-acc channel) holds. "
+        "loss_drop = the relative loss drop of a 200-step Adam walk driven by "
+        "the PLAN's own gradient, probed on a fixed batch of 512 real MNIST "
+        "images (Pearson 0.922 against final downstream test accuracy, 0.22 s "
+        "and 40 MB per plan). cosine = the legacy Jacobian cosine (Pearson "
+        "0.610, 9.70 s, 4.24 GB). auto = loss_drop under --measure-grad "
+        "(where the plan's output IS a gradient and the walk is defined), "
+        "cosine otherwise. Published as ALPHAGRAD_QUALITY_METRIC so the Ray "
+        "measure actors resolve the SAME metric as the trainer.",
+    )
+    p.add_argument(
+        "--walk-steps", type=int, default=200,
+        help="Adam steps in the loss-drop walk (measured configuration: 200).",
+    )
+    p.add_argument(
+        "--walk-lr", type=float, default=1e-3,
+        help="Adam lr for the loss-drop walk (measured configuration: 1e-3, "
+        "b1 0.9, b2 0.999, eps 1e-8).",
+    )
+    p.add_argument(
+        "--walk-probe-seed", type=int, default=20260807,
+        help="Seed of the loss-drop PROBE BATCH. Fixed across plans within a "
+        "run by construction -- plan scores are only comparable on one batch.",
+    )
+    p.add_argument(
+        "--walk-noise-std", type=float, default=0.0,
+        help="OPTIONAL, default OFF. Resample N(0, std) pixel noise on the "
+        "walk batch each step (std 0.3 lifts Pearson 0.922 -> 0.950). Leave "
+        "at 0.0 to reproduce the headline numbers.",
     )
     p.add_argument(
         "--seed-vertices",
@@ -2927,7 +2973,9 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--capture-perfect-grads",
         action="store_true",
-        help="Allow the top-N accuracy heap to keep trajectories with cosine similarity == 1.0.",
+        help="Allow the top-N quality heap to keep trajectories whose quality "
+             "channel reads exactly 1.0 (a perfect Jacobian cosine, or a walk "
+             "that wiped the loss out entirely).",
     )
     p.add_argument(
         "--print-top-every",
@@ -3957,6 +4005,29 @@ def main():
     # space against this embedding size (an out-of-range gather CLAMPS
     # silently); publish it where the host callback can see it.
     os.environ["ALPHAGRAD_VOCAB_SIZE"] = str(int(args.vocab_size))
+    # QUALITY CHANNEL — published to the ENVIRONMENT, not passed as an
+    # argument, because the Ray measure actors run env._callback in their own
+    # processes and this codebase's dominant bug class is "two paths that must
+    # agree". One env var read by one function (env.quality_metric) in one
+    # module makes disagreement impossible. Set BEFORE ray.init so every actor
+    # inherits it.
+    os.environ["ALPHAGRAD_QUALITY_METRIC"] = str(args.quality_metric)
+    os.environ["ALPHAGRAD_WALK_STEPS"] = str(int(args.walk_steps))
+    os.environ["ALPHAGRAD_WALK_LR"] = repr(float(args.walk_lr))
+    os.environ["ALPHAGRAD_WALK_PROBE_SEED"] = str(int(args.walk_probe_seed))
+    os.environ["ALPHAGRAD_WALK_NOISE_STD"] = repr(float(args.walk_noise_std))
+    global _QUALITY_METRIC
+    from types import SimpleNamespace as _NS
+    _QUALITY_METRIC = _env_quality_metric(
+        _NS(measure_grad=bool(args.measure_grad)))
+    print(
+        f"[alphagrad] quality channel (reward slot 6, --lambda-acc) = "
+        f"{_QUALITY_METRIC}"
+        + (f" (walk: {int(args.walk_steps)} Adam steps, lr {args.walk_lr:g}, "
+           f"probe seed {int(args.walk_probe_seed)}, noise std "
+           f"{args.walk_noise_std:g})" if _QUALITY_METRIC == "loss_drop"
+           else " (Jacobian cosine vs the exact reference)"),
+        flush=True)
     env = VertexEliminationEnv.from_jaxpr(
         closed_jaxpr,
         args=xs,
@@ -4531,7 +4602,10 @@ def main():
     head_reward_weights = jnp.asarray(head_reward_weights_np, dtype=jnp.float32)
     cmp_idx = _cmp_reward_index(args.cmp_type)
     mem_idx = _mem_reward_index(args.mem_type)
-    cosine_idx = REWARD_INDEX["cosine_sim"]
+    # Reward slot 6 -- THE quality channel. ``REWARD_INDEX["cosine_sim"]`` is
+    # the back-compat alias for ``REWARD_INDEX["quality"]``; the local name
+    # stays ``cosine_idx`` only because ~30 references in this file use it.
+    cosine_idx = REWARD_INDEX["quality"]
     # ``--reward-mode mult``: cost weights for the cheapness term = the display
     # weights with the quality channels zeroed (the gate multiplies fidelity
     # back in); the preference collapses to one-hot on the cosine head so the
@@ -4541,7 +4615,7 @@ def main():
     mult_cost_weights = jnp.asarray(mult_cost_weights_np, dtype=jnp.float32)
     if args.reward_mode == "mult":
         head_reward_weights_np = np.zeros(NUM_VALUE_HEADS, dtype=np.float32)
-        head_reward_weights_np[HEAD_NAMES.index("cos")] = 1.0
+        head_reward_weights_np[HEAD_NAMES.index("quality")] = 1.0
         head_reward_weights = jnp.asarray(head_reward_weights_np, dtype=jnp.float32)
 
     # Per-(vertex, pair, factor) validity mask. The legacy mask filtered
@@ -6184,6 +6258,13 @@ def main():
 
     _wandb_config = dict(vars(args))
     _wandb_config.update(_repo_commits())
+    # WHICH quantity reward slot 6 holds, recorded on the run itself. The
+    # per-channel keys (mean_quality, measure/quality/*, popart/mu_quality,
+    # weighted_mean_quality) are deliberately metric-AGNOSTIC so two runs on
+    # different metrics never silently share an axis; this is the key that
+    # tells them apart. ``entropy/*`` panels are unaffected -- they describe
+    # the policy heads, not the reward.
+    _wandb_config["quality_metric_resolved"] = _QUALITY_METRIC
     wandb.init(
         project=getattr(args, "wandb_project", None) or "dsnn-vertex",
         entity=getattr(args, "wandb_entity", None) or None,
@@ -6249,10 +6330,11 @@ def main():
             total_ret = float(np.sum(arr * weights))
             cmp_val = -float(arr[cmp_idx])  # display as positive cost
             mem_val = -float(arr[mem_idx])  # display as positive cost
-            acc_val = float(arr[cosine_idx])  # cosine ∈ [0, 1]
+            acc_val = float(arr[cosine_idx])  # quality channel, ~[0, 1]
             print(
                 f"{rank}. Ep {ep} | Total Reward: {total_ret:.2e} | "
-                f"CMP({args.cmp_type}): {cmp_val:.2e} | Acc: {acc_val:.4f} | "
+                f"CMP({args.cmp_type}): {cmp_val:.2e} | "
+                f"Quality({_QUALITY_METRIC}): {acc_val:.4f} | "
                 f"Mem({args.mem_type}): {mem_val:.2e}"
             )
             # ``seq`` is a list of (vertex, [callable_str, ...]) tuples; the
@@ -6264,7 +6346,19 @@ def main():
                 joined = ", ".join(calls)
                 seq_strs.append(f"({v}, [{joined}])")
             seq_repr = "[" + ", ".join(seq_strs) + "]"
-            print(f"   Sequence (vertex, [calls...]): {seq_repr}")
+            # THE PER-VERTEX CALLS ONLY. Under --face-actions the plan's
+            # approximations live in the FACE wires (face_specs / face_skips),
+            # which `_decode` does not see -- only `_decode_arch` (the pareto
+            # archive) renders them. An empty "[]" here therefore means "no
+            # PER-VERTEX micro-rule", NOT "no approximation": job 59045 ran at
+            # applied_fraction 0.70-0.83 with every printed call list empty,
+            # and reading those lines as approximation-free plans produced a
+            # false P0 ("identical orders, different cosine"). Labelled, not
+            # silently omitted.
+            print(f"   Sequence (vertex, [per-vertex calls...]): {seq_repr}")
+            if getattr(args, "face_actions", False):
+                print("   (face-level approximations are NOT shown here — "
+                      "see the pareto archive's `faces` field)")
             if table is not None:
                 table.add_data(
                     rank, ep, total_ret, cmp_val, acc_val, mem_val, seq_repr
@@ -6413,7 +6507,8 @@ def main():
             decoded = _decode(i)
             total_ret = float(np.sum(rets * weights))
             # Per-family heap keys: cmp uses the canonical compute index,
-            # mem uses the canonical memory index, and acc tracks cosine_sim.
+            # mem uses the canonical memory index, and acc tracks the quality
+            # channel (loss_drop or cosine -- see env.quality_metric()).
             heaps_and_keys = [
                 ("top_n_total", total_ret),
                 ("top_n_cmp", float(rets[cmp_idx])),
@@ -6980,12 +7075,12 @@ def main():
             # batch-averaged KL. mu_cos above the reward ceiling means critic
             # overestimation. Non-finite entropy means a poisoned gradient.
             print("[health ep%d] ppo=%.4g value=%.4g ent=%.4g "
-                  "ratio/max_log=%.3g kl/approx=%.3g mu_cos=%.4g "
+                  "ratio/max_log=%.3g kl/approx=%.3g mu_quality=%.4g "
                   "sec/ep=%.1f" % (
                       _HEALTH_N[0] - 1, ppo_loss, value_loss, policy_entropy,
                       log_dict.get("ratio/max_log", float("nan")),
                       log_dict.get("kl/approx", float("nan")),
-                      log_dict.get("popart/mu_cos", float("nan")),
+                      log_dict.get("popart/mu_quality", float("nan")),
                       log_dict.get("time/sec_per_episode", float("nan"))),
                   flush=True)
             if _LIVE_FACES is not None:
@@ -7546,7 +7641,7 @@ def main():
     print_top_n("Total Reward", host_state["top_n_total"])
     print_top_n(f"CMP (Lowest {args.cmp_type})", host_state["top_n_cmp"])
     print_top_n(f"Memory (Lowest {args.mem_type})", host_state["top_n_mem"])
-    print_top_n("Accuracy (Highest Cosine Similarity)", host_state["top_n_acc"])
+    print_top_n(f"Quality (Highest {_QUALITY_METRIC})", host_state["top_n_acc"])
     wandb.log({"Elimination order": elim_order_table})
 
 

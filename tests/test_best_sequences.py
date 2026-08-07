@@ -46,9 +46,9 @@ def test_aggregate_records_full_reward_tuple_per_channel():
     buf = np.zeros((T, N, NUM_REWARDS), dtype=np.float32)
     flops_idx = REWARD_INDEX["flops"]
     peak_idx = REWARD_INDEX["peak_memory"]
-    cos_idx = REWARD_INDEX["cosine_sim"]
+    cos_idx = REWARD_INDEX["quality"]
 
-    # Env 0 wins on flops; env 2 wins on peak_memory; env 3 wins on cosine_sim.
+    # Env 0 wins on flops; env 2 wins on peak_memory; env 3 wins on quality.
     # The "tuple" we want recorded for the per-channel best is the full vector
     # the winning env carried at the time. Hand-pick values so they're all
     # distinguishable.
@@ -86,27 +86,27 @@ def test_aggregate_records_full_reward_tuple_per_channel():
     assert bpr["flops"]["env_idx"] == 0
     assert bpr["flops"]["all_raw"]["flops"] == 15.0
     assert bpr["flops"]["all_raw"]["peak_memory"] == 3.0
-    assert bpr["flops"]["all_raw"]["cosine_sim"] == pytest.approx(0.3, rel=1e-5)
+    assert bpr["flops"]["all_raw"]["quality"] == pytest.approx(0.3, rel=1e-5)
     assert bpr["flops"]["seq"] == seqs[0]
 
     # peak_memory winner is env 2 → its all_raw must reflect ENV 2's values.
     assert bpr["peak_memory"]["env_idx"] == 2
     assert bpr["peak_memory"]["all_raw"]["peak_memory"] == 12.0
     assert bpr["peak_memory"]["all_raw"]["flops"] == 3.0
-    assert bpr["peak_memory"]["all_raw"]["cosine_sim"] == pytest.approx(0.6, rel=1e-5)
+    assert bpr["peak_memory"]["all_raw"]["quality"] == pytest.approx(0.6, rel=1e-5)
     assert bpr["peak_memory"]["seq"] == seqs[2]
 
-    # cosine_sim winner is env 3 → tuple should be env 3's full row.
-    assert bpr["cosine_sim"]["env_idx"] == 3
-    assert bpr["cosine_sim"]["all_raw"]["cosine_sim"] == pytest.approx(2.7, rel=1e-5)
-    assert bpr["cosine_sim"]["all_raw"]["flops"] == pytest.approx(1.5, rel=1e-5)
-    assert bpr["cosine_sim"]["all_raw"]["peak_memory"] == pytest.approx(1.5, rel=1e-5)
-    assert bpr["cosine_sim"]["seq"] == seqs[3]
+    # quality winner is env 3 → tuple should be env 3's full row.
+    assert bpr["quality"]["env_idx"] == 3
+    assert bpr["quality"]["all_raw"]["quality"] == pytest.approx(2.7, rel=1e-5)
+    assert bpr["quality"]["all_raw"]["flops"] == pytest.approx(1.5, rel=1e-5)
+    assert bpr["quality"]["all_raw"]["peak_memory"] == pytest.approx(1.5, rel=1e-5)
+    assert bpr["quality"]["seq"] == seqs[3]
 
     # Untuned channels (e.g. muls_adds_fmas) must NOT appear — they had
     # zero weight, the live trainers don't want noise in the JSON.
     for ch in REWARD_NAMES:
-        if ch not in {"flops", "peak_memory", "cosine_sim"}:
+        if ch not in {"flops", "peak_memory", "quality"}:
             assert ch not in bpr
 
 
@@ -154,7 +154,7 @@ def test_running_bests_keeps_per_channel_seqs_across_episodes():
     )
 
     flops_idx = REWARD_INDEX["flops"]
-    cos_idx = REWARD_INDEX["cosine_sim"]
+    cos_idx = REWARD_INDEX["quality"]
 
     weights = np.zeros((NUM_REWARDS,), dtype=np.float32)
     weights[flops_idx] = 1.0
@@ -163,7 +163,7 @@ def test_running_bests_keeps_per_channel_seqs_across_episodes():
     def _stats_for(flops_winner_value, cos_winner_value, ep_seq_label):
         T, N = 2, 2
         buf = np.zeros((T, N, NUM_REWARDS), dtype=np.float32)
-        # env 0 wins flops, env 1 wins cosine_sim
+        # env 0 wins flops, env 1 wins quality
         buf[:, 0, flops_idx] = flops_winner_value / T
         buf[:, 1, cos_idx] = cos_winner_value / T
         seqs = [
@@ -185,8 +185,8 @@ def test_running_bests_keeps_per_channel_seqs_across_episodes():
     assert state["best_per_reward"]["flops"]["seq"] == [
         ("ep0", "env0", t) for t in range(2)
     ]
-    # cosine_sim winner from ep0
-    assert state["best_per_reward"]["cosine_sim"]["raw_value"] == pytest.approx(0.5)
+    # quality winner from ep0
+    assert state["best_per_reward"]["quality"]["raw_value"] == pytest.approx(0.5)
 
     # Ep 1: flops=10 (NEW BEST), cos=0.2 (worse, ignored)
     s1 = _stats_for(10.0, 0.2, "ep1")
@@ -197,14 +197,14 @@ def test_running_bests_keeps_per_channel_seqs_across_episodes():
     assert state["best_per_reward"]["flops"]["seq"] == [
         ("ep1", "env0", t) for t in range(2)
     ]
-    # cosine_sim should still be the ep0 winner
-    assert state["best_per_reward"]["cosine_sim"]["raw_value"] == pytest.approx(0.5)
-    assert state["best_per_reward"]["cosine_sim"]["seq"] == [
+    # quality should still be the ep0 winner
+    assert state["best_per_reward"]["quality"]["raw_value"] == pytest.approx(0.5)
+    assert state["best_per_reward"]["quality"]["seq"] == [
         ("ep0", "env1", t) for t in range(2)
     ]
     # ep field is set
     assert state["best_per_reward"]["flops"]["ep"] == 1
-    assert state["best_per_reward"]["cosine_sim"]["ep"] == 0
+    assert state["best_per_reward"]["quality"]["ep"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +224,7 @@ def test_dump_and_reload_best_sequences_json_preserves_tuples():
     )
 
     flops_idx = REWARD_INDEX["flops"]
-    cos_idx = REWARD_INDEX["cosine_sim"]
+    cos_idx = REWARD_INDEX["quality"]
     weights = np.zeros((NUM_REWARDS,), dtype=np.float32)
     weights[flops_idx] = 1.0
     weights[cos_idx] = 2.0
@@ -256,18 +256,18 @@ def test_dump_and_reload_best_sequences_json_preserves_tuples():
     # Top-level structure
     assert "best_overall" in blob
     assert "best_per_channel" in blob
-    # The flops winner is env 0 — its per-channel cosine_sim must be 0
-    # (env 0 had 0 cosine_sim entries) and must round-trip exactly.
+    # The flops winner is env 0 — its per-channel quality must be 0
+    # (env 0 had 0 quality entries) and must round-trip exactly.
     flops_entry = blob["best_per_channel"]["flops"]
     assert flops_entry["ep"] == 7
     assert flops_entry["raw_value"] == pytest.approx(8.0)
     assert flops_entry["all_raw"]["flops"] == pytest.approx(8.0)
-    assert flops_entry["all_raw"]["cosine_sim"] == pytest.approx(0.0)
+    assert flops_entry["all_raw"]["quality"] == pytest.approx(0.0)
     assert flops_entry["seq"] == [["e0", t] for t in range(T)]
 
-    # The cosine_sim winner is env 1 — record its flops contribution too.
-    cos_entry = blob["best_per_channel"]["cosine_sim"]
-    assert cos_entry["all_raw"]["cosine_sim"] == pytest.approx(1.0)
+    # The quality winner is env 1 — record its flops contribution too.
+    cos_entry = blob["best_per_channel"]["quality"]
+    assert cos_entry["all_raw"]["quality"] == pytest.approx(1.0)
     assert cos_entry["all_raw"]["flops"] == pytest.approx(2.0)
     assert cos_entry["seq"] == [["e1", t] for t in range(T)]
 
@@ -291,8 +291,8 @@ def test_wandb_payload_emits_per_channel_namespace():
     state["best_global_return"] = 42.0
     state["best_global_ep"] = 3
     state["best_global_seq"] = [0, 1, 2]
-    state["best_global_rewards"] = {"flops": 4.0, "cosine_sim": 0.9}
-    state["best_global_weighted_split"] = {"flops": 4.0, "cosine_sim": 1.8}
+    state["best_global_rewards"] = {"flops": 4.0, "quality": 0.9}
+    state["best_global_weighted_split"] = {"flops": 4.0, "quality": 1.8}
     state["best_per_reward"] = {
         "flops": {
             "raw_value": 9.0,
@@ -301,8 +301,8 @@ def test_wandb_payload_emits_per_channel_namespace():
             "env_idx": 1,
             "ep": 2,
             "seq": [9, 8, 7],
-            "all_raw": {"flops": 9.0, "cosine_sim": 0.1},
-            "all_weighted": {"flops": 9.0, "cosine_sim": 0.2},
+            "all_raw": {"flops": 9.0, "quality": 0.1},
+            "all_weighted": {"flops": 9.0, "quality": 0.2},
         },
     }
 
@@ -316,7 +316,7 @@ def test_wandb_payload_emits_per_channel_namespace():
     assert payload["best_sequences/per_channel/flops/ep"] == 2
     assert payload["best_sequences/per_channel/flops/seq_len"] == 3
     assert payload["best_sequences/per_channel/flops/rewards_raw/flops"] == 9.0
-    assert payload["best_sequences/per_channel/flops/rewards_raw/cosine_sim"] == 0.1
+    assert payload["best_sequences/per_channel/flops/rewards_raw/quality"] == 0.1
 
 
 def test_dump_handles_empty_state():

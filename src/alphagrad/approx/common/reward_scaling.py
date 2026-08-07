@@ -40,7 +40,11 @@ REWARD_NAMES: tuple[str, ...] = (
     "max_io_sum",
     "bytes_accessed",
     "peak_memory",
-    "cosine_sim",
+    # Slot 6, renamed 2026-08-07 from "cosine_sim": it holds whichever quality
+    # metric ``env.quality_metric()`` selects — the 200-step Adam-walk loss
+    # drop (default under --measure-grad) or the legacy Jacobian cosine. The
+    # slot did not move; ``REWARD_INDEX["cosine_sim"]`` is aliased below.
+    "quality",
     "frob_residual",
     # RECONCILED (2026-08): this tuple is a SUPERSET of env.REWARD_NAMES, not a
     # copy of it. Indices 0..7 are byte-identical to the env's 8-channel vector;
@@ -62,7 +66,14 @@ REWARD_NAMES: tuple[str, ...] = (
 )
 NUM_REWARDS: int = len(REWARD_NAMES)
 REWARD_INDEX: dict[str, int] = {n: i for i, n in enumerate(REWARD_NAMES)}
-COSINE_SIM_IDX: int = REWARD_INDEX["cosine_sim"]
+# BACK-COMPAT ALIAS, mirrors env.REWARD_INDEX: slot 6 was called "cosine_sim"
+# until 2026-08-07. Every persisted PopArt / calibration state is keyed by
+# INDEX, so the alias is exact and nothing needs migrating.
+REWARD_INDEX["cosine_sim"] = REWARD_INDEX["quality"]
+QUALITY_IDX: int = REWARD_INDEX["quality"]
+# Historical spelling kept so the ~40 modules that import COSINE_SIM_IDX keep
+# working; it is the QUALITY slot, which no longer necessarily holds a cosine.
+COSINE_SIM_IDX: int = QUALITY_IDX
 FROB_RESIDUAL_IDX: int = REWARD_INDEX["frob_residual"]
 BKSTEP_ACC_IDX: int = REWARD_INDEX["bkstep_acc"]
 

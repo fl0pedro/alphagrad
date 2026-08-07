@@ -45,7 +45,7 @@ def test_build_reward_weights_default_three_channels():
     assert w.shape == (10,)
     assert w[REWARD_INDEX["flops"]] == 1.0
     assert w[REWARD_INDEX["peak_memory"]] == 1.0
-    assert w[REWARD_INDEX["cosine_sim"]] == 1.0
+    assert w[REWARD_INDEX["quality"]] == 1.0
     assert w[REWARD_INDEX["muls_adds_fmas"]] == 0.0
     assert w[REWARD_INDEX["frob_residual"]] == 0.0
 
@@ -59,7 +59,7 @@ def test_build_reward_weights_empty_falls_back_to_mul_add_fma():
     assert w[REWARD_INDEX["muls_adds_fmas"]] == 1.0
     assert (w[REWARD_INDEX["muls_adds_fmas"]] > 0)
     # other channels stay zero
-    for k in ("flops", "peak_memory", "cosine_sim", "frob_residual"):
+    for k in ("flops", "peak_memory", "quality", "frob_residual"):
         assert w[REWARD_INDEX[k]] == 0.0
 
 
@@ -103,15 +103,15 @@ def test_filter_sentinel_mask_detects_any_cost_channel():
     rv = np.zeros((3, 4, NUM_REWARDS), dtype=np.float32)
     rv[0, 0, REWARD_INDEX["flops"]] = SENTINEL_REWARD_VALUE
     rv[1, 2, REWARD_INDEX["peak_memory"]] = SENTINEL_REWARD_VALUE
-    # cosine_sim is a quality channel — NOT considered for sentinel
+    # quality is a quality channel — NOT considered for sentinel
     # detection (otherwise normal zero-cos values would be flagged).
-    rv[2, 3, REWARD_INDEX["cosine_sim"]] = SENTINEL_REWARD_VALUE
+    rv[2, 3, REWARD_INDEX["quality"]] = SENTINEL_REWARD_VALUE
 
     mask = filter_sentinel_mask(rv, SENTINEL_REWARD_VALUE)
     assert mask.shape == (3, 4)
     assert mask[0, 0] == False  # sentinel on cost channel
     assert mask[1, 2] == False  # sentinel on cost channel
-    assert mask[2, 3] == True   # cosine_sim sentinel doesn't disqualify
+    assert mask[2, 3] == True   # quality sentinel doesn't disqualify
     # All other cells are valid.
     assert mask.sum() == 3 * 4 - 2
 
@@ -134,12 +134,12 @@ def test_aggregate_per_channel_stats_shape_and_keys():
     rv[:, 1, REWARD_INDEX["flops"]] = -1e9  # worst
     rv[:, 2, REWARD_INDEX["flops"]] = -1e3  # best (least negative)
     rv[:, 1, REWARD_INDEX["peak_memory"]] = -1e5  # only env 1 has non-zero peak
-    rv[:, 0, REWARD_INDEX["cosine_sim"]] = 0.7
+    rv[:, 0, REWARD_INDEX["quality"]] = 0.7
 
     weights = np.zeros((NUM_REWARDS,), dtype=np.float32)
     weights[REWARD_INDEX["flops"]] = 1.0
     weights[REWARD_INDEX["peak_memory"]] = 1.0
-    weights[REWARD_INDEX["cosine_sim"]] = 1.0
+    weights[REWARD_INDEX["quality"]] = 1.0
 
     stats = aggregate_per_channel_stats(
         rv, weights, sentinel=SENTINEL_REWARD_VALUE,
@@ -185,7 +185,7 @@ def test_aggregate_with_dones_mask_distinguishes_per_step_from_terminal():
 
     T, N = 5, 4
     rv = np.zeros((T, N, NUM_REWARDS), dtype=np.float32)
-    cs_idx = REWARD_INDEX["cosine_sim"]
+    cs_idx = REWARD_INDEX["quality"]
     rv[-1, :, cs_idx] = np.array([0.95, 0.50, 1.00, 0.85], dtype=np.float32)
     dones = np.zeros((T, N), dtype=bool)
     dones[-1, :] = True
@@ -194,17 +194,17 @@ def test_aggregate_with_dones_mask_distinguishes_per_step_from_terminal():
     stats = aggregate_per_channel_stats(
         rv, weights, sentinel=SENTINEL_REWARD_VALUE, dones_mask=dones,
     )
-    # cosine_sim is a SPARSE-TERMINAL channel, so per_reward_means is
+    # quality is a SPARSE-TERMINAL channel, so per_reward_means is
     # OVERWRITTEN with the terminal-only mean (reward_scaling.py:512-514):
     # the diluted 3.30/20 = 0.165 per-step figure was exactly the misleading
     # number that overwrite exists to remove.
-    assert abs(stats["per_reward_means"]["cosine_sim"] - 0.825) < 1e-5
+    assert abs(stats["per_reward_means"]["quality"] - 0.825) < 1e-5
     # A dense cost channel is still a plain per-step mean over all T*N.
     assert abs(stats["per_reward_means"]["flops"]) < 1e-5
     # Terminal: just the 4 terminal entries. Mean = (0.95+0.50+1.0+0.85)/4 = 0.825.
-    assert abs(stats["terminal_means"]["cosine_sim"] - 0.825) < 1e-5
+    assert abs(stats["terminal_means"]["quality"] - 0.825) < 1e-5
     # Best terminal: max over the 4 terminal entries = 1.0.
-    assert stats["best_terminal"]["cosine_sim"] == 1.0
+    assert stats["best_terminal"]["quality"] == 1.0
 
 
 def test_build_unified_reward_log_dict_emits_grouped_keys():
@@ -219,8 +219,8 @@ def test_build_unified_reward_log_dict_emits_grouped_keys():
 
     T, N = 3, 2
     rv = np.zeros((T, N, NUM_REWARDS), dtype=np.float32)
-    rv[-1, 0, REWARD_INDEX["cosine_sim"]] = 0.95
-    rv[-1, 1, REWARD_INDEX["cosine_sim"]] = 0.70
+    rv[-1, 0, REWARD_INDEX["quality"]] = 0.95
+    rv[-1, 1, REWARD_INDEX["quality"]] = 0.70
     rv[-1, :, REWARD_INDEX["flops"]] = np.array([-1e6, -2e6], dtype=np.float32)
     dones = np.zeros((T, N), dtype=bool)
     dones[-1, :] = True
@@ -232,15 +232,15 @@ def test_build_unified_reward_log_dict_emits_grouped_keys():
         stats,
         corridor_low=0.8,
         corridor_high=0.9,
-        terminal_cossims=rv[-1, :, REWARD_INDEX["cosine_sim"]],
+        terminal_cossims=rv[-1, :, REWARD_INDEX["quality"]],
     )
-    # Grouping: flops is cost, cosine_sim is quality.
+    # Grouping: flops is cost, quality is quality.
     assert "reward/cost/per_step/flops" in log
     assert "reward/cost/terminal/flops" in log
     assert "reward/cost/best_terminal/flops" in log
-    assert "reward/quality/per_step/cosine_sim" in log
-    assert "reward/quality/terminal/cosine_sim" in log
-    assert "reward/quality/best_terminal/cosine_sim" in log
+    assert "reward/quality/per_step/quality" in log
+    assert "reward/quality/terminal/quality" in log
+    assert "reward/quality/best_terminal/quality" in log
     # Symlog flags surfaced.
     assert log["reward/cost/symlog_applied"] is True
     assert log["reward/quality/symlog_applied"] is False
@@ -287,7 +287,7 @@ def test_aggregate_filters_sentinels_from_per_channel_means():
     rv[:, :, REWARD_INDEX["flops"]] = -1e6  # baseline
     # Single sentinel transition.
     rv[0, 0, :] = SENTINEL_REWARD_VALUE
-    rv[0, 0, REWARD_INDEX["cosine_sim"]] = 0.0
+    rv[0, 0, REWARD_INDEX["quality"]] = 0.0
     rv[0, 0, REWARD_INDEX["frob_residual"]] = SENTINEL_REWARD_VALUE
 
     weights = np.zeros((NUM_REWARDS,), dtype=np.float32)
