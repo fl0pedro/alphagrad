@@ -66,8 +66,10 @@ def add_az_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Warm-start PopArt (mu, sigma) from this many episodes of "
              "UNIFORMLY RANDOM but valid elimination orders, measured through "
              "the real measurement path, before training. 0 disables. These "
-             "episodes are NOT logged to wandb and do NOT count against "
-             "--total-measurements.")
+             "episodes ARE logged to wandb (the measurement is real and the "
+             "step counter must advance, uniform with ppo's warm-up) but they "
+             "carry no `loss`, no `n_meas` and no `ep`, and they do NOT count "
+             "against --total-measurements.")
 
     # Logging
     p.add_argument("--out", default=os.path.expanduser("~/dsnn/az_gumbel_out"))

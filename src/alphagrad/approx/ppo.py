@@ -6080,7 +6080,27 @@ def main():
             if _fv is not None:
                 # face_op_type is (..., F, S): broadcast validity over slots,
                 # so the denominator is (valid faces) x (slots per face).
-                _w = _fv[..., None]
+                #
+                # WANDB AUDIT (2026-08-07) -- SKIP IS EXCLUSIVE. A SKIPPED face
+                # still carries whatever op the head emitted for its slots, and
+                # those slots used to be counted into the diag/compress/quant/
+                # none classes even though the face was dropped before any
+                # approximation could apply. az_gumbel counts a skipped face as
+                # `skip` and nothing else, so the same key meant "P(op | face,
+                # including dropped faces)" on one arm and "realized class"
+                # on the other.
+                #
+                # Both arms now report the SAME partition of the SAME
+                # denominator: one count per (valid face, slot), a skipped
+                # face contributing all of its slots to `skip`. The five
+                # classes {skip, none, diag, compress, quant} are mutually
+                # exclusive and sum to 1 on both trainers.
+                _fk = getattr(traj, "face_skip", None)
+                if _fk is not None:
+                    _keep = (1.0 - _fk.astype(jnp.float32))[..., None]
+                else:
+                    _keep = jnp.asarray(1.0, jnp.float32)
+                _w = _fv[..., None] * _keep
                 _wn = _fv_n * float(_fop.shape[-1])
                 _face_op_freq = jnp.stack([
                     jnp.sum((_fop == k).astype(jnp.float32) * _w) / _wn
@@ -6196,6 +6216,15 @@ def main():
         "top_n_cmp": [],
         "top_n_mem": [],
         "top_n_acc": [],
+        # WALL-CLOCK ORIGIN, stamped HERE and not at the first host_log call.
+        # `_wall_t0` used to be set by the first logged episode, so
+        # time/wall_seconds read exactly 0 on that row and the whole build +
+        # first-trace cost (the single largest block of the run) fell outside
+        # the axis. az_gumbel stamps `_t_start` at the same point in ITS setup
+        # -- before the PopArt warm start -- so the shared time/* keys now
+        # share an origin and time/sec_per_episode's first value is the honest
+        # "setup + first episode" figure on both arms.
+        "_wall_t0": _prof_time.perf_counter(),
     }
 
     def print_top_n(name, heap, reverse_val=True, log_to_wandb=True):
@@ -6308,6 +6337,32 @@ def main():
             return {"seq": seq, "faces": faces} if faces else seq
 
         mean_r = np.atleast_1d(np.array(mean_r))
+        # ---- LIVE (successfully measured) envs -------------------------------
+        # WANDB AUDIT (2026-08-07). `mean_r` arrives as the mean over ALL
+        # num_envs terminal reward vectors, sentinelled ones INCLUDED. A
+        # sentinel is -1e10 on every cost channel, so ONE failed measurement in
+        # 16 moves mean_latency_ns from ~-6e4 to ~-6e8: the panel plots the
+        # collapse rate, not the latency. az_gumbel logs `mean_<channel>` for
+        # the measurement it actually got (a failed measure `continue`s and
+        # emits NO row at all), so under the shared key the two arms were
+        # measuring different things.
+        #
+        # Recompute the mean over the LIVE envs only -- the same exact-sentinel
+        # test `_is_degen` uses in the loss, so "live" means the same thing on
+        # the reward panels as it does in the gradient. When nothing is live the
+        # mean_*/mean_return/weighted_mean_* keys are DROPPED (see below) rather
+        # than logged as -1e10: an absent key leaves a clean gap, matching both
+        # az_gumbel and the warm-up branch's treatment of undefined keys.
+        _sent_ch = np.asarray(COMPUTE_REWARD_INDICES, dtype=np.int64)
+        if all_rets.ndim == 2 and all_rets.shape[1] > int(_sent_ch.max()):
+            _live_env = ~np.all(
+                all_rets[:, _sent_ch] <= (float(SENTINEL_COST) * 0.99), axis=-1)
+        else:
+            _live_env = np.ones((all_rets.shape[0],), dtype=bool)
+        _any_live = bool(_live_env.any())
+        if _any_live:
+            mean_r = np.asarray(
+                all_rets[_live_env].mean(axis=0), dtype=np.float64)
 
         host_state["samplecounts"] += num_envs * num_valid
         # mets is an 11-tuple: 9 scalars + two per-component arrays (KL is
@@ -6411,7 +6466,6 @@ def main():
 
         log_dict = {
             "best_return": host_state["best_global_return"],
-            "mean_return": float(np.sum(mean_r * weights)),
             # TRUNCATED = refused by a resource limit (op cap / OOM) and
             # EXCLUDED from the gradient — "Time Limits in RL". ZERO_WORK =
             # computed nothing but was KEPT and punished by frob. They are
@@ -6492,31 +6546,56 @@ def main():
             _ae = float(np.asarray(attn_entropy))
             if np.isfinite(_ae):
                 log_dict["entropy/palimpsa"] = _ae
-                # NORMALISED companions, in [0,1] = fraction of that head's
-                # MAXIMUM possible entropy. The raw nats are not comparable
-                # across heads: the vertex head picks among ~total_v vertices
-                # (ln 13 = 2.56) while the op head picks among 4 (ln 4 = 1.39),
-                # so macro sat at 1-1.6 and micro at 0-0.3 because of ALPHABET
-                # SIZE, not because the micro heads were more decided.
-                # Only these two get a normaliser: the i/j/exp heads have a
-                # DYNAMIC alphabet (the legal dim/factor set depends on the
-                # live tensor), so there is no static maximum to divide by and
-                # any fixed constant would be wrong.
-                log_dict["entropy/macro_vertex_norm"] = float(
-                    entropy_components[0] / np.log(max(int(total_v), 2)))
+        # NORMALISED companions, in [0,1] = fraction of that head's MAXIMUM
+        # possible entropy. The raw nats are not comparable across heads: the
+        # vertex head picks among ~total_v vertices (ln 13 = 2.56) while the
+        # op head picks among 4 (ln 4 = 1.39), so macro sat at 1-1.6 and micro
+        # at 0-0.3 because of ALPHABET SIZE, not because the micro heads were
+        # more decided. Only these two get a normaliser: the i/j/exp heads
+        # have a DYNAMIC alphabet (the legal dim/factor set depends on the
+        # live tensor), so there is no static maximum to divide by and any
+        # fixed constant would be wrong.
+        #
+        # WANDB AUDIT (2026-08-07): these two -- and the kl/ratio block below
+        # -- used to be NESTED under `attn_entropy is not None` /
+        # `np.isfinite(_ae)`, i.e. gated on an unrelated ENCODER probe.
+        # `attention_entropy_diagnostic` returns NaN "when nothing applies",
+        # and a CPU smoke with --set-pointer --live-faces hit exactly that:
+        # entropy/palimpsa was absent AND it took entropy/macro_vertex_norm,
+        # entropy/op_norm with it. Both blocks are functions of
+        # `entropy_components` / `kl_components` alone, so a NaN from the probe
+        # could also have taken ratio/max_log -- the one tail statistic that
+        # catches the old/new log-prob mismatch a batch-averaged KL hides.
+        if entropy_components.shape[0] >= 2:
+            log_dict["entropy/macro_vertex_norm"] = float(
+                entropy_components[0] / np.log(max(int(total_v), 2)))
+            # entropy/op_norm only exists when the PER-VERTEX MicroActionPolicy
+            # does. Under --live-faces / --no-approx-head that head is not
+            # constructed, `ent_op` is a structural 0, and the panel would
+            # plot a permanently collapsed op head. Same guard the other
+            # micro-head panels (op_marginal/*, sub_episode_length) use.
+            if not (bool(getattr(args, "live_faces", False))
+                    or bool(getattr(args, "no_approx_head", False))):
                 log_dict["entropy/op_norm"] = float(
                     entropy_components[1] / np.log(max(int(NUM_OPS), 2)))
-            # T2: the unified head's live diagnostics. kl/approx is the KL on
-            # the JOINT log-prob; ratio/max_log is the TAIL statistic that a
-            # batch-averaged KL hides (this read +53.8 when the ratio was
-            # broken, and must be ~0 at epoch 0).
-            if kl_components.shape[0] > 6:
-                log_dict["kl/approx"] = float(kl_components[5])
-                log_dict["ratio/max_log"] = float(kl_components[6])
-                log_dict["ratio/max"] = float(
-                    np.exp(np.clip(float(kl_components[6]), -700, 700)))
-        for j, name in enumerate(REWARD_NAMES):
-            log_dict[f"mean_{name}"] = float(mean_r[j]) if j < len(mean_r) else 0.0
+        # T2: the unified head's live diagnostics. kl/approx is the KL on
+        # the JOINT log-prob; ratio/max_log is the TAIL statistic that a
+        # batch-averaged KL hides (this read +53.8 when the ratio was
+        # broken, and must be ~0 at epoch 0).
+        if kl_components.shape[0] > 6:
+            log_dict["kl/approx"] = float(kl_components[5])
+            log_dict["ratio/max_log"] = float(kl_components[6])
+            log_dict["ratio/max"] = float(
+                np.exp(np.clip(float(kl_components[6]), -700, 700)))
+        # Measured-reward panels. Emitted ONLY when at least one env produced a
+        # real measurement this episode (see the LIVE mask above) so the shared
+        # `mean_<channel>` / `mean_return` keys carry the same quantity the
+        # az_gumbel arm puts on them: a MEASUREMENT, never a sentinel.
+        if _any_live:
+            log_dict["mean_return"] = float(np.sum(mean_r * weights))
+            for j, name in enumerate(REWARD_NAMES):
+                log_dict[f"mean_{name}"] = (
+                    float(mean_r[j]) if j < len(mean_r) else 0.0)
 
         # ---- per-channel measurement stats (spec P2) ------------------------
         # best / mean / median / worst per channel, for THIS episode and
@@ -6552,6 +6631,19 @@ def main():
             log_dict[f"measure/{name}/median_alltime"] = float(np.median(a["vals"]))
 
         # ---- PopArt / normalization stats (spec P2) -------------------------
+        # popart/mu_* and popart/sigma_* are the CRITIC's running normaliser
+        # and are defined regardless of whether this episode measured anything,
+        # so they are logged unconditionally.
+        #
+        # CROSS-ARM CAVEAT (audited 2026-08-07, deliberately NOT renamed):
+        # ppo's PopArt tracks `estim_returns` -- the GAE-bootstrapped DISCOUNTED
+        # return over `_symlog_rewards(reward)` -- while az_gumbel's tracks the
+        # RAW TERMINAL 4-vector. Under the campaign config
+        # (--terminal-rewards-only --no-symlog) the two coincide up to the
+        # critic bootstrap and the discount; under any other config they do
+        # not. The key names the same ROLE on both arms (the normaliser the
+        # value head is rescaled by), which is why it keeps one name; the
+        # SPACES are only equal in that configuration.
         if popart_stats is not None:
             _mu, _sig = popart_stats
             for j, nm in enumerate(HEAD_NAMES):
@@ -6569,9 +6661,20 @@ def main():
             # preference-weighted sum, i.e. the units the advantage is
             # actually computed in. Comparable across episodes and across
             # channels, so a move here is a real move in the objective.
+            # SAME SPACE AS (mu, sigma). PopArt is updated from
+            # `estim_returns`, which is built from `_symlog_rewards(reward)`;
+            # this used to z-score the RAW channel value against those stats,
+            # so with symlog on (the default) it compared ~-6e4 against a mu of
+            # ~-11 and every Phi(z) pinned to 0 or 1 -- a constant panel. The
+            # projection is the IDENTITY under --no-symlog, so the campaign
+            # runs are unchanged, but the key now means the same thing in both
+            # configurations (and the same thing az_gumbel means by it: the
+            # running-distribution percentile of this episode's channel value
+            # under the critic's own normaliser).
             _hr = np.asarray(
-                [float(mean_r[k]) for k in HEAD_REWARD_INDICES], dtype=np.float64
-            )
+                _symlog_rewards(jnp.asarray(mean_r, dtype=jnp.float32)),
+                dtype=np.float64,
+            )[np.asarray(HEAD_REWARD_INDICES, dtype=np.int64)]
             _z = (_hr - np.asarray(_mu, np.float64)) / np.maximum(
                 np.asarray(_sig, np.float64), 1e-8
             )
@@ -6590,10 +6693,11 @@ def main():
             # No "Charts/" folder: it was a wandb section prefix only (no
             # define_metric, no in-repo panel refers to it) and it buried the
             # headline score under a group name.
-            log_dict["weighted_mean_return"] = float(np.sum(_phi * _wn))
-            for j, nm in enumerate(HEAD_NAMES):
-                if _hw[j] != 0.0:
-                    log_dict[f"weighted_mean_{nm}"] = float(_phi[j])
+            if _any_live:
+                log_dict["weighted_mean_return"] = float(np.sum(_phi * _wn))
+                for j, nm in enumerate(HEAD_NAMES):
+                    if _hw[j] != 0.0:
+                        log_dict[f"weighted_mean_{nm}"] = float(_phi[j])
 
         # ---- wall clock: lets the wandb x-axis be switched from episode to
         # elapsed time, so a slowdown shows up as a flat stretch instead of
@@ -6624,21 +6728,28 @@ def main():
                 pf = _merge_pf(getattr(env, "_remote_pool", None), pf)
             except Exception:
                 pass
-            if pf.get("applied", 0) or pf.get("skipped", 0):
-                log_dict["per_face/applied"] = pf.get("applied", 0)
-                log_dict["per_face/skipped"] = pf.get("skipped", 0)
-                log_dict["per_face/skipped_raised"] = pf.get("skipped_raised", 0)
-                log_dict["per_face/applied_fraction"] = pf["applied_fraction"]
-                # REALITY histogram per approximation class (same keys on the
-                # AZ runs): what the policy proposed is not what survived the
-                # per-face legality mask.
-                for _k in ("diag", "compress", "quant"):
-                    log_dict[f"approx_applied/{_k}"] = pf.get(f"applied_{_k}", 0)
-                    log_dict[f"approx_skipped/{_k}"] = pf.get(f"skipped_{_k}", 0)
-                log_dict["approx_applied/total"] = pf.get("applied", 0)
-                log_dict["approx_skipped/total"] = (
-                    pf.get("skipped", 0) + pf.get("skipped_raised", 0))
-                log_dict["approx_applied/fraction"] = pf["applied_fraction"]
+            # UNCONDITIONAL. The `if applied or skipped` gate this replaces
+            # meant that a flat 0 -- the ONE reading that proves the face wires
+            # never reached the measurement -- was logged as an ABSENT key
+            # rather than a zero, which is exactly the failure the panel
+            # exists to catch. az_gumbel emits these keys every episode; ppo
+            # now does too, so the shared panel has the same support.
+            log_dict["per_face/applied"] = pf.get("applied", 0)
+            log_dict["per_face/skipped"] = pf.get("skipped", 0)
+            log_dict["per_face/skipped_raised"] = pf.get("skipped_raised", 0)
+            log_dict["per_face/applied_fraction"] = pf.get(
+                "applied_fraction", 0.0)
+            # REALITY histogram per approximation class (same keys on the
+            # AZ runs): what the policy proposed is not what survived the
+            # per-face legality mask.
+            for _k in ("diag", "compress", "quant"):
+                log_dict[f"approx_applied/{_k}"] = pf.get(f"applied_{_k}", 0)
+                log_dict[f"approx_skipped/{_k}"] = pf.get(f"skipped_{_k}", 0)
+            log_dict["approx_applied/total"] = pf.get("applied", 0)
+            log_dict["approx_skipped/total"] = (
+                pf.get("skipped", 0) + pf.get("skipped_raised", 0))
+            log_dict["approx_applied/fraction"] = pf.get(
+                "applied_fraction", 0.0)
 
         # ---- degenerate plans sentinelled by the env ------------------------
         _degen = consume_degenerate_plan_count()
@@ -6708,6 +6819,20 @@ def main():
             pareto_archive.add_many(
                 ((all_rets[i], _decode_arch(i)) for i in elig_idx), ep
             )
+            # CROSS-ARM CAVEAT (audited 2026-08-07). `pareto/archive_size`
+            # is the live front's cardinality and means the same thing on
+            # az_gumbel. `pareto/hypervolume` uses the same ParetoArchive and
+            # the same sweep, but is NOT comparable in absolute value across
+            # the two arms, for two reasons:
+            #   * the OBJECTIVE SET here is (args.cmp_type, args.mem_type,
+            #     cosine_sim) -- config-dependent -- while az hardcodes
+            #     (latency_ns, peak_memory, cosine_sim). They coincide only
+            #     under --cmp-type latency --mem-type peak_memory (the
+            #     campaign config).
+            #   * ParetoArchive freezes its HV nadir at `pts.min(axis=0) - 1`
+            #     on the FIRST non-empty call. That call sees num_envs points
+            #     here and exactly one on az, so the reference boxes differ
+            #     and each run's HV is only monotone WITHIN itself.
             log_dict["pareto/hypervolume"] = float(pareto_archive.hypervolume())
             log_dict["pareto/archive_size"] = len(pareto_archive.pts)
             # Persist the FRONT, not just these two scalars — see _dump_pareto.
@@ -6811,6 +6936,11 @@ def main():
             # The MICRO head's marginals (absent under --live-faces) stay on
             # their own panel; approx_prob/* reports the head that actually
             # decided, i.e. realized per-face usage.
+            # DEFINITION (identical on az_gumbel, see _face_choice_counts):
+            # one count per (VALID face, slot); a SKIPPED face contributes all
+            # of its slots to approx_prob/skip and none to the op classes, so
+            # {skip, diag, compress, quant, none} partition the episode's
+            # realized per-face-slot decisions and sum to 1.
             _ap_names = ("diag", "compress", "quant", "none")
             # DROPPED: micro_op_marginal/* -- the SAME op_marginals array as
             # op_marginal/*, only relabelling index 3 end -> none.
@@ -6905,6 +7035,13 @@ def main():
                         ("kl/", "ent/", "entropy/", "ratio/")):
                     log_dict.pop(_k, None)
             log_dict["popart_init/warmup_episode"] = 1
+            # The warm start is not spent from the measurement budget (az
+            # says so explicitly and does not advance its `n_meas`), and every
+            # warm-up row shares the outer `ep`, so both x-axis keys would
+            # report a stack of identical values for measurements that were
+            # never charged. Drop them: az's warm-up row carries neither.
+            log_dict.pop("n_meas", None)
+            log_dict.pop("time/episode", None)
         wandb.log(log_dict)
 
         # Per-episode memory + JIT-cache diagnostic. Off by default; flip on

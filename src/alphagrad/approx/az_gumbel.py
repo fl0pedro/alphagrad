@@ -802,30 +802,38 @@ _OP_NAME = {int(_OP_END): "none", int(_OP_DIAG): "diag",
 
 
 def _face_choice_counts(fa, f_valid):
-    """Realized per-FACE approximation classes -> approx_prob/* counts.
+    """Realized per-face-SLOT approximation classes -> approx_prob/* counts.
 
-    PPO reports the per-face probability of the UnifiedFaceHead; this is the
-    same quantity from the same head, counted over the faces that EXIST
-    (``f_valid``) rather than the padded width. Padding faces never ran, so
-    counting them would dilute every class toward "none".
+    THE UNIT IS ONE (face, slot) DECISION, over the faces that EXIST
+    (``f_valid``) rather than the padded width -- padding faces never ran, so
+    counting them would dilute every class toward "none". A SKIPPED face is
+    dropped before any approximation can apply, so it contributes all of its
+    slots to ``skip`` and nothing to the op classes. The five classes
+    {skip, none, diag, compress, quant} therefore partition the episode's
+    realized decisions and sum to 1.
+
+    WANDB AUDIT (2026-08-07). This used to be a per-FACE, SET-DEDUPED count:
+    a face with a diag in one of its 3 slots scored 1 for "diag" and 0 for
+    "none", while ppo.py reported the same episode as diag = 1/3, none = 2/3
+    (it counted per slot). Same key, same policy, two curves a factor of
+    FACE_SLOTS apart. The per-slot form is kept as the shared definition
+    because it counts what the head actually emits -- one op per slot -- and
+    the set-dedupe could not distinguish one diag on a face from three.
+    ppo.py's ``_face_op_freq`` now excludes skipped faces to match.
     """
     out = collections.Counter()
     ops = np.asarray(fa.op_type, np.int32)
     skips = np.asarray(fa.skip, np.int32)
     valid = np.asarray(f_valid) > 0.5
+    n_slots = int(ops.shape[1]) if ops.ndim > 1 else 1
     for f in range(ops.shape[0]):
         if not valid[f]:
             continue
         if int(skips[f]) == 1:
-            out["skip"] += 1
+            out["skip"] += n_slots
             continue
-        named = [_OP_NAME.get(int(o), "other") for o in ops[f]]
-        real = [nm for nm in named if nm != "none"]
-        if real:
-            for nm in set(real):
-                out[nm] += 1
-        else:
-            out["none"] += 1
+        for o in np.atleast_1d(ops[f]):
+            out[_OP_NAME.get(int(o), "other")] += 1
     return out
 
 
@@ -1780,7 +1788,13 @@ def _run(args) -> int:
                     # STATIC estimate in BYTES -- two different quantities in
                     # two different units sharing one panel.
                     "measure/peak_memory_mb": raw[1] / 1e6,
-                    "time/episode": ep,
+                    # 0-BASED, to match ppo. `ep` is incremented at the TOP of
+                    # the loop here, so az's FIRST episode is ep == 1 while
+                    # ppo's is ep == 0: plotting the shared `time/episode`
+                    # axis put az one step to the right of ppo for the whole
+                    # run. The az-native `ep` key above keeps the raw 1-based
+                    # counter that the stdout lines and the pareto stamps use.
+                    "time/episode": ep - 1,
                     "time/sec_per_episode": _now - _t_prev,
                     "time/wall_seconds": _now - _t_start,
                     "time/wall_minutes": (_now - _t_start) / 60.0,
@@ -1802,6 +1816,16 @@ def _run(args) -> int:
                     for _hi, _hn in ((0, "latency"), (1, "mem"), (3, "cos")):
                         if _phi_v is not None and _hi < _phi_v.shape[0]:
                             _log[f"weighted_mean_{_hn}"] = float(_phi_v[_hi])
+                        # SPACE CAVEAT (audited 2026-08-07): az's PopArt
+                        # tracks the RAW TERMINAL measurement vector; ppo's
+                        # tracks `estim_returns`, the GAE-bootstrapped
+                        # DISCOUNTED return over `_symlog_rewards(reward)`.
+                        # Under the campaign config
+                        # (--terminal-rewards-only --no-symlog) the two agree
+                        # up to the bootstrap and the discount; under any
+                        # other ppo config they do not. The key names the same
+                        # ROLE on both arms (the normaliser the value head is
+                        # rescaled by), which is why it keeps one name.
                         _log[f"popart/mu_{_hn}"] = float(
                             np.asarray(popart.mu).reshape(-1)[_hi])
                         _log[f"popart/sigma_{_hn}"] = float(
