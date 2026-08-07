@@ -86,6 +86,42 @@ def spawn_measure_pool(args_dict: dict, *, n_actors: int, exec_on_gpu: bool,
     )
 
 
+def merge_pool_collapse_stats(pool, cs: dict | None = None) -> dict:
+    """Merge the measure actors' truncation / collapse counters (#81, #96).
+
+    Sibling of :func:`merge_pool_face_stats`, for the counters behind
+    ``tokenization/*`` and ``collapse/*``. Those are module globals written
+    inside the measurement ``_callback``; with the Ray pool active that
+    runs in the ACTOR processes, so the trainer's own globals never move
+    and the panels read 0 while clipping is happening.
+
+    All counters here are ADDITIVE except ``trunc_max_observed_len``,
+    which is a MAX -- summing it would report a length no step ever had.
+
+    Best-effort: no pool, a dead actor, or an actor without the method
+    contributes nothing and never raises.
+    """
+    out = dict(cs or {})
+    try:
+        import ray as _ray
+        actors = list(pool.live_actors()) if pool is not None else []
+    except Exception:
+        return out
+    for _h in actors:
+        try:
+            _s = _ray.get(_h.consume_collapse_stats.remote(), timeout=10)
+        except Exception:
+            continue
+        for _k, _v in (_s or {}).items():
+            if isinstance(_v, bool) or not isinstance(_v, (int, float)):
+                continue
+            if _k == "trunc_max_observed_len":
+                out[_k] = max(out.get(_k, 0), _v)
+            else:
+                out[_k] = out.get(_k, 0) + _v
+    return out
+
+
 def merge_pool_face_stats(pool, pf: dict | None = None) -> dict:
     """Merge the measure actors' per-face apply counters into ``pf``.
 

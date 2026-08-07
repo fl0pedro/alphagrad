@@ -5819,10 +5819,25 @@ def main():
             # batch z-score's collapse ratchet (a uniformly-degenerate batch
             # drives std->0 and makes the opposing channel vanish).
             # Neutral target on degenerate steps: substitute the value net's
-            # own (normalized) prediction so the value loss for that step is
-            # ~0 and the critic is not dragged toward the sentinel.
+            # own prediction so the value loss for that step is ~0 and the
+            # critic is not dragged toward the sentinel.
+            #
+            # #89: that substitution must be made in the SAME frame the
+            # loss compares against. `traj.value` is the OLD head's
+            # NORMALISED output, captured before `_popart_rescale_heads`
+            # above rewrote the heads into (new_mu, new_sigma), while
+            # `values` in the loss come from the RESCALED head. ART
+            # preserves the RAW prediction, not the normalised one, so
+            # feeding the stale normalised value made every degenerate
+            # step contribute a non-zero loss pulling the critic toward
+            # the old frame (measured 5.77 where the contract says ~0),
+            # worst during the warm start when the stats move most.
+            # Carry it across exactly as ART carries the head: de-normalise
+            # with the OLD stats, re-normalise with the NEW ones.
+            _neutral = (traj.value * popart_sigma + popart_mu
+                        - new_mu) / new_sigma
             estim_returns = jnp.where(
-                _live > 0.5, (estim_returns - new_mu) / new_sigma, traj.value)
+                _live > 0.5, (estim_returns - new_mu) / new_sigma, _neutral)
             norm_adv_components = advantages / new_sigma
         elif args.advantage_norm == "none":
             new_m1, new_m2, new_w = popart_m1, popart_m2, popart_w
@@ -6559,20 +6574,46 @@ def main():
                 host_state["best_global_return"] = best_ret
                 host_state["best_global_act_seq"] = _decode(best_idx)
 
+        # #81/#96 ONE POLL PER host_log. Every actor-side `consume_*` POPS
+        # its counter, so two independent merges would race: the first
+        # would drain the actors and the second would read zeros. Merged
+        # once here and read by BOTH the collapse/* entries in log_dict
+        # below and the tokenization/* block further down. Best-effort:
+        # no pool, a dead actor, or an actor too old to have the method
+        # contributes nothing and never raises.
+        _POOL_CS = {}
+        try:
+            from alphagrad.approx.common.measure_pool import (
+                merge_pool_collapse_stats as _merge_cs)
+            _POOL_CS = _merge_cs(getattr(env, "_remote_pool", None), {})
+        except Exception:
+            pass
+
         log_dict = {
             "best_return": host_state["best_global_return"],
             # TRUNCATED = refused by a resource limit (op cap / OOM) and
             # EXCLUDED from the gradient — "Time Limits in RL". ZERO_WORK =
             # computed nothing but was KEPT and punished by frob. They are
             # opposite treatments, so they get separate counters.
-            "collapse/truncated_this_ep": consume_truncated_plan_count(),
+            # #96: these are module globals written inside the measurement
+            # `_callback`, which runs in the ACTOR processes under
+            # --ray-measure. `_POOL_CS` (merged once at the top of
+            # host_log) carries the actors' share; without it the panels
+            # read 0 while the collapse they count is happening.
+            "collapse/truncated_this_ep": (
+                consume_truncated_plan_count()
+                + _POOL_CS.get("truncated", 0)),
             # UNTRACEABLE is a SUBSET of truncated: graphax could not build the
             # plan at all (the open canonical-output-order gap). Separated
             # because OOM scales with plan size and this scales with nothing we
             # control -- if it is a large fraction, the approx arm is sampling a
             # region the library cannot evaluate and the run is not comparable.
-            "collapse/untraceable_this_ep": consume_untraceable_plan_count(),
-            "collapse/zero_work_this_ep": consume_zero_work_plan_count(),
+            "collapse/untraceable_this_ep": (
+                consume_untraceable_plan_count()
+                + _POOL_CS.get("untraceable", 0)),
+            "collapse/zero_work_this_ep": (
+                consume_zero_work_plan_count()
+                + _POOL_CS.get("zero_work", 0)),
             "collapse/count_this_ep": n_collapsed_this_ep,
             "collapse/count_total": host_state["collapsed_total"],
             # DROPPED: collapse/fraction_this_ep (= count_this_ep / num_envs),
@@ -6886,9 +6927,15 @@ def main():
         except Exception:
             pass
         trunc = consume_tokenization_truncation_stats()
-        log_dict["tokenization/truncated_count"] = trunc["count"]
-        log_dict["tokenization/max_observed_len"] = trunc["max_observed_len"]
-        log_dict["tokenization/overflow_sum_this_ep"] = trunc["overflow_sum"]
+        # `max_observed_len` is a MAX across processes, not a sum --
+        # adding them would report a length no single step ever had.
+        log_dict["tokenization/truncated_count"] = (
+            trunc["count"] + _POOL_CS.get("trunc_count", 0))
+        log_dict["tokenization/max_observed_len"] = max(
+            trunc["max_observed_len"],
+            _POOL_CS.get("trunc_max_observed_len", 0))
+        log_dict["tokenization/overflow_sum_this_ep"] = (
+            trunc["overflow_sum"] + _POOL_CS.get("trunc_overflow_sum", 0))
         # Token SIZE telemetry (not just loss). `delta_*` is one palimpsa
         # call's width -- the ONLY observation the policy gets per step -- and
         # is what must size ALPHAGRAD_MAX_DELTA_TOKENS. `stream_*` is now just

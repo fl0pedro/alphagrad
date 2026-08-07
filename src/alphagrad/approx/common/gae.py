@@ -123,10 +123,22 @@ get_advantages_running_norm = jax.jit(_get_advantages_running_norm)
 
 
 def get_num_clipping_triggers(ratio, eps):
-    """Approximate count of how many ratios fell into the PPO clip region."""
-    _ratio = jnp.where(ratio <= 1.0 + eps, ratio, 0.0)
-    _ratio = jnp.where(ratio >= 1.0 - eps, 1.0, 0.0)
-    return jnp.sum(_ratio)
+    """Count how many ratios fell OUTSIDE the trust region [1-eps, 1+eps].
+
+    #87. The previous body was inverted: its second ``jnp.where``
+    overwrote the first and read ``ratio`` instead of ``_ratio``, so it
+    returned ``count(ratio >= 1 - eps)`` -- how many are NOT clipped from
+    below. The ratio is exactly 1 everywhere at epoch 0, so the panel read
+    1.0 ("everything clipped") when the truth was 0. Diagnostic only: the
+    loss never consumed it, so no trained result changes.
+
+    This is a CANARY, not the guard. The bug class it exists to catch --
+    sampling-time and loss-time log-probs disagreeing -- is prevented by
+    asserting ``ratio == 1`` exactly at epoch 0 (ratio-invariant test),
+    not by watching a curve.
+    """
+    clipped = (ratio < 1.0 - eps) | (ratio > 1.0 + eps)
+    return jnp.sum(clipped.astype(ratio.dtype))
 
 
 @jax.jit

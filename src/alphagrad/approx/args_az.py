@@ -72,6 +72,24 @@ def add_az_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
              "against --total-measurements.")
 
     # Logging
+    # ---- approximation-head surface (#79) --------------------------------
+    # These were literal constants inside apply_policy_arch, so AZ had no
+    # exact arm at all and ALPHAGRAD_GAZ_MICRO (set by 8 launchers) gated
+    # nothing. Defaults reproduce the previous hardcoded behaviour exactly:
+    # face-level approximation ON. Pass --no-approx-head for a genuine exact
+    # arm, the counterpart of PPO fq_v47e.
+    p.add_argument(
+        "--no-approx-head", action="store_true",
+        help="EXACT arm: build no approximation head, so every face is "
+        "computed exactly and only the elimination ORDER is searched. The "
+        "AZ counterpart of PPO --no-approx-head.")
+    p.add_argument(
+        "--no-face-actions", dest="face_actions", action="store_false",
+        help="Disable the per-face action space (default: enabled).")
+    p.add_argument(
+        "--no-live-faces", dest="live_faces", action="store_false",
+        help="Disable the live per-face token stream (default: enabled).")
+    p.set_defaults(face_actions=True, live_faces=True)
     p.add_argument("--out", default=os.path.expanduser("~/dsnn/az_gumbel_out"))
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-name", default="az_gumbel")

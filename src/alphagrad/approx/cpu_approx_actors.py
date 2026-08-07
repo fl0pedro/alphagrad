@@ -277,3 +277,32 @@ class CpuApproximationActor:
         """
         from alphagrad.approx.env import consume_per_face_stats as _consume_pf
         return _consume_pf()
+
+    def consume_collapse_stats(self) -> dict:
+        """Pop this actor's truncation / collapse counters (#81, #96).
+
+        Same reason as :meth:`consume_face_stats`: these are module
+        globals written inside the measurement ``_callback``, which runs
+        in THIS process. The trainer reads its own copy, which is always
+        zero while the pool is active -- so the panels read 0 while the
+        clipping/collapse they count is actually happening.
+        """
+        from alphagrad.approx import env as _e
+        out = {}
+        try:
+            _t = _e.consume_tokenization_truncation_stats()
+            out["trunc_count"] = int(_t.get("count", 0))
+            out["trunc_overflow_sum"] = int(_t.get("overflow_sum", 0))
+            out["trunc_max_observed_len"] = int(
+                _t.get("max_observed_len", 0))
+        except Exception:
+            pass
+        for _key, _fn in (("truncated", "consume_truncated_plan_count"),
+                          ("untraceable", "consume_untraceable_plan_count"),
+                          ("zero_work", "consume_zero_work_plan_count"),
+                          ("degenerate", "consume_degenerate_plan_count")):
+            try:
+                out[_key] = int(getattr(_e, _fn)())
+            except Exception:
+                pass
+        return out

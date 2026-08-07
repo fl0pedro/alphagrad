@@ -272,7 +272,13 @@ W4 = None   # set after the factory import below (needs az_w4)
 # gets a higher sigma floor. az feeds M=1 per update, so the robust winsor
 # pass is inert here, but the config is kept at parity with ppo_ray_worker.
 _sig_min_base = float(os.environ.get("ALPHAGRAD_POPART_SIGMA_MIN", "0.1"))
-_sig_min_qual = float(os.environ.get("ALPHAGRAD_POPART_SIGMA_MIN_QUALITY", "0.2"))
+# #86: this defaulted to 0.2 while PPO passes its scalar popart_sigma_min
+# (0.1) for EVERY channel, so AZ damped the quality advantage ~2x relative
+# to PPO -- and did it exactly when quality converges (var -> 0), which is
+# when that channel carries the reward decision. Defaulting to the base
+# floor makes the arms agree; the knob stays for a deliberate re-raise.
+_sig_min_qual = float(os.environ.get(
+    "ALPHAGRAD_POPART_SIGMA_MIN_QUALITY", str(_sig_min_base)))
 _sig_min_vec = np.full(len(TIDX), _sig_min_base, dtype=np.float64)
 for _qi, _c in enumerate(CH):
     if _c in ("cosine_sim", "bkstep_acc", "frob_residual"):
@@ -317,6 +323,13 @@ EXACT_SPEC_ROW = np.full((MAX_RULES_PER_VERTEX, 3), -1, dtype=np.int32)
 EXACT_SPEC_ROW[:, 2] = 0
 EXACT_FACE_ROWS = np.full((int(ENV_MAX_FACES), FACE_SLOTS, 3), -1, dtype=np.int32)
 EXACT_FACE_SKIPS = np.zeros((int(ENV_MAX_FACES),), dtype=np.int32)
+
+
+# #79: the EXACT arm switch, resolved once from --no-approx-head. When set,
+# the approximation head is not built, the rollout skips _face_plan, and the
+# loss drops its face term -- so AZ searches the elimination ORDER only, the
+# counterpart of PPO fq_v47e.
+_EXACT_ARM = bool(A.no_approx_head)
 
 
 # ---------------------------------------------------------------- the WIRE
@@ -520,13 +533,19 @@ apply_policy_arch(
     # AZ eliminates per VERTEX and approximates per FACE, exactly like PPO.
     dynamic_substeps=True,
     unified_head=False,
-    no_approx_head=False,
-    face_actions=True,
-    unified_face_head=True,
-    live_faces=True,
+    # #79: these four were LITERAL CONSTANTS, so AZ had no exact arm and
+    # ALPHAGRAD_GAZ_MICRO gated nothing. They now come from args_az, with
+    # defaults reproducing the previous behaviour byte-for-byte.
+    no_approx_head=bool(A.no_approx_head),
+    face_actions=bool(A.face_actions) and not bool(A.no_approx_head),
+    unified_face_head=bool(A.face_actions) and not bool(A.no_approx_head),
+    live_faces=bool(A.live_faces) and not bool(A.no_approx_head),
     max_substeps=1,
     axis_group_embedding=False,
 )
+if A.no_approx_head:
+    print("[gaz] EXACT arm: no approximation head; searching the elimination "
+          "ORDER only (face actions and live faces forced off).", flush=True)
 _ns.seed = A.seed
 _ft_table, _ft_py, _n_factors, _max_rules = _ppo_build_factor_table(_ns)
 agent = build_and_init_agent(
@@ -627,9 +646,17 @@ assert agent.micro_action_policy is None, (
     "the per-VERTEX approximation head is still built -- AZ approximates per "
     "FACE now, and a live micro head would be a second, untrained action "
     "space PPO does not have")
-assert agent.face_path_policy is not None, (
-    "no per-face head was built: check face_actions/unified_face_head/"
-    "live_faces in the agent factory call above")
+# #79: the EXACT arm legitimately has no face head. On the APPROX arm its
+# absence is still a hard error -- that is the W5 guarantee (AZ approximates
+# per FACE, like PPO), and losing it silently is how the head went untrained
+# before.
+if _EXACT_ARM:
+    assert agent.face_path_policy is None, (
+        "--no-approx-head was passed but a per-face head was still built")
+else:
+    assert agent.face_path_policy is not None, (
+        "no per-face head was built: check face_actions/unified_face_head/"
+        "live_faces in the agent factory call above")
 
 LIVE_FACES = build_live_face_stream(
     jaxpr, ARGN, list(closed.literals), list(xs),
@@ -1243,6 +1270,12 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
         # (`vsl`), not the delta's owner (`ow`, which is the PREVIOUS
         # step's vertex -- the two differ by one and confusing them is the
         # index-mapping class of bug this file has been bitten by before).
+        # #79 EXACT arm: the approximation head is not built, so there is
+        # nothing to replay and no face term. This is a PYTHON-level branch,
+        # taken before `_face_replay` is traced -- a jnp.where would still
+        # trace a head that does not exist.
+        if _EXACT_ARM:
+            return ce + 0.5 * vl, jnp.zeros((), jnp.float32)
         v_context = ctx[vsl]
         features = _axis_feats(AXIS_STATE[vsl], AXIS_VALID[vsl])
         f_logp, f_ent, f_arity = agent._face_replay(
@@ -1287,7 +1320,13 @@ def _run(args) -> int:
     `_run` locals and the net would either go stale in the search or raise
     UnboundLocalError.
     """
-    global agent, opt_state
+    # #85: `env`, `ev` and `VFEAT` join the rebound globals. AZ used to
+    # draw its eval samples ONCE at import and keep them for the whole
+    # run, so its quality channel could overfit a fixed reference set
+    # while PPO redraws every episode. Same load-bearing `global`
+    # mechanism as `agent`/`opt_state`: the search functions read these
+    # through module globals, so they must be REBOUND, never shadowed.
+    global agent, opt_state, env, ev, VFEAT
     # Phase map, shared with `ppo_ray._run` so the two trainers read in the same
     # order. Phases 1-4 run at IMPORT time here (see the banners above), so only
     # 5 and 6 are in this function:
@@ -1453,6 +1492,15 @@ def _run(args) -> int:
     # --- 5. loop: act/search -> measure -> popart -> pareto -> train ---
     while n_meas < args.total_measurements:
         ep += 1
+        # #85: fresh calibration samples per episode, and the per-vertex
+        # features recomputed from them -- they are sample-derived, so a
+        # stale VFEAT would describe last episode's data. Mirrors
+        # ppo.py's per-episode `generate_eval_samples` + `_ep_vfeat`.
+        _ev_key = jax.random.fold_in(jax.random.PRNGKey(args.seed), ep)
+        ev = generate_eval_samples(env, _ev_key, A.ndata)
+        env = eqx.tree_at(lambda e: e.eval_args_samples, env, ev)
+        VFEAT = _ep_vfeat(_ns, jaxpr, tuple(closed.literals), tuple(xs),
+                          eval_samples=ev, argnums=tuple(ARGN))
         # A fresh episode = a fresh tokenizer at the base, and a fresh carry
         # built from the base stream under the CURRENT weights. The carry is
         # params-dependent, so it can never outlive a train_step.
@@ -1507,19 +1555,37 @@ def _run(args) -> int:
             _nf_pre = len(_face_keys)
             _avail = np.zeros((TOTAL_V,), np.float32)
             _avail[v - 1] = 1.0
-            (fr, fs, fa, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de,
-             v_context, features, face_ent, _vi) = _face_plan(
-                agent, head_out, carry.enc, jnp.asarray(_avail),
-                carry.residual, jnp.asarray(_o_arr), jnp.asarray(_sp_h),
-                jnp.asarray(len(state), jnp.int32), jnp.asarray(_f_h),
-                jnp.asarray(_s_h),
-                jax.random.PRNGKey(int(rng.integers(2 ** 31))))
+            if _EXACT_ARM:
+                # #79 EXACT arm: no approximation head exists, so there is
+                # nothing to plan. Reuse the SAME no-approximation constants
+                # the speculative path uses, so the committed step is the
+                # graph the search reasoned about and the measurement runs a
+                # fully exact plan. Every face-derived quantity below is the
+                # empty/zero form.
+                fr, fs = EXACT_FACE_ROWS, EXACT_FACE_SKIPS
+                fa = None
+                f_pair = f_comp = None
+                f_valid = np.zeros((int(ENV_MAX_FACES),), np.float32)
+                f_cnt = np.zeros((int(ENV_MAX_FACES),), np.int32)
+                f_dt = f_de = None
+                v_context = features = None
+                face_ent = 0.0
+                _vi = v - 1
+            else:
+                (fr, fs, fa, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de,
+                 v_context, features, face_ent, _vi) = _face_plan(
+                    agent, head_out, carry.enc, jnp.asarray(_avail),
+                    carry.residual, jnp.asarray(_o_arr), jnp.asarray(_sp_h),
+                    jnp.asarray(len(state), jnp.int32), jnp.asarray(_f_h),
+                    jnp.asarray(_s_h),
+                    jax.random.PRNGKey(int(rng.integers(2 ** 31))))
             assert int(_vi) == v - 1, (
                 f"the one-hot availability mask did not force the searched "
                 f"vertex: head picked {int(_vi) + 1}, search chose {v}")
             fr = np.asarray(fr, np.int32)
             fs = np.asarray(fs, np.int32)
-            _MICRO_CHOICES.update(_face_choice_counts(fa, f_valid))
+            if fa is not None:
+                _MICRO_CHOICES.update(_face_choice_counts(fa, f_valid))
             _nf = int(np.sum(np.asarray(f_valid) > 0.5))
             _ep_faces += _nf
             _ep_chunks += int(np.sum(np.asarray(f_cnt) > 0))
