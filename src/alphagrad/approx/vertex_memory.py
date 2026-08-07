@@ -69,7 +69,7 @@ def update(sums, counts, rows, eqn_ids, valid=None):
     return sums, counts
 
 
-def update_ids(sums, counts, rows, ids, valid=None):
+def update_ids(sums, counts, rows, ids, valid=None, *, global_slot=None):
     """Fold ``rows`` (D, E) into the memory by EXPLICIT slot ids (D,).
 
     Unlike :func:`update`, ``ids`` are already per-VERTEX slot indices
@@ -80,7 +80,11 @@ def update_ids(sums, counts, rows, ids, valid=None):
     Same associativity guarantees as :func:`update`.
     """
     n_slots = sums.shape[0]
-    gid = n_slots - 1
+    # The unowned/global slot must be named EXPLICITLY. It used to be
+    # `n_slots - 1`, which silently follows the array width -- and once a
+    # trailing SUMMARY row exists (see `summary`), that would route every
+    # header and input token into the value head's accumulator.
+    gid = n_slots - 1 if global_slot is None else int(global_slot)
     slot = jnp.where(ids < 0, gid, jnp.minimum(ids, gid - 1)).astype(jnp.int32)
 
     if valid is not None:
@@ -108,11 +112,22 @@ def occupancy(counts):
     return counts > 0.0
 
 
-def summary(sums, counts):
+def summary(sums, counts, *, summary_slot=None):
     """Mean over ALL tokens, ``(E,)``.
+
+    With ``summary_slot`` given, reads THAT slot alone -- the accumulator
+    every token is credited to EXACTLY ONCE. Under multi-credit (a face's
+    tokens landing in all three of its i/v/j slots) the per-slot sums no
+    longer re-add to the token total, so summing them would hand the value
+    head an arity-weighted mean instead of the plain one. Without it the
+    historical all-slot behaviour is kept, which is correct while every
+    token has exactly one owner.
 
     Identical to ``sum(enc_x * mask) / sum(mask)`` in ``Agent.encode`` — the
     per-slot sums re-add to the same total, so the value heads see exactly what
     they saw under the full-sequence path.
     """
+    if summary_slot is not None:
+        k = int(summary_slot)
+        return sums[k] / jnp.maximum(counts[k], 1e-9)
     return jnp.sum(sums, axis=0) / jnp.maximum(jnp.sum(counts), 1e-9)
