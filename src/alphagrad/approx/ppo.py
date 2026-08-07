@@ -4092,6 +4092,24 @@ def main():
             # "The current node timed out during startup". RAY_TMPDIR gives
             # each job its own directory, so no prologue wipe is needed.
             _rt = os.environ.get("RAY_TMPDIR") or None
+            # #77 MITIGATION. The raylet blocks on the dashboard/metrics
+            # AGENT publishing its port file, and that agent fails to
+            # import its deps on these nodes -- `include_dashboard=False`
+            # does not stop it, because the UI and the agent are separate
+            # processes. Three launches have been lost to this.
+            # Ray maps RAY_<system_config> env vars onto its internal
+            # config, so this asks it not to start metrics collection.
+            # Set as an ENV VAR, not ray.init(_system_config=...), on
+            # purpose: an unrecognised _system_config KEY raises at init
+            # and would turn an intermittent failure into a certain one,
+            # while an unrecognised env var is ignored.
+            # UNVERIFIED by construction -- the failure is intermittent
+            # (attempt 1 succeeded while 2 and 3 failed on the same node
+            # in the same window). If startup fails again, read
+            # raylet.err under $RAY_TMPDIR and confirm the agent is still
+            # the blocker before crediting this. The 3-attempt retry
+            # below remains the real safety net.
+            os.environ.setdefault("RAY_enable_metrics_collection", "0")
             _kw = dict(ignore_reinit_error=True, include_dashboard=False)
             if _rt:
                 os.makedirs(_rt, exist_ok=True)
