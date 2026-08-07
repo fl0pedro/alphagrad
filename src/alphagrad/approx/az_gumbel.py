@@ -13,13 +13,15 @@ CLEAN implementation (ignores autoscheduler_loop's surrogate-Gumbel search and m
     vertex head + per-channel value heads), read through
     `heads_from_memory` off that carry — the same call PPO's rollout makes.
     Leaf evaluation = value net; simulations NEVER measure.
-  * GUMBEL (Danihelka 2022): root Gumbel-top-m without replacement over the prior
-    logits, candidate-set halving with PROGRESSIVE DEEPENING (survivors get a
-    2x deeper rollout each phase; total work ~= n_candidates x
-    rollout_depth x ceil(log2 m) — there is no separate simulation budget
-    knob), action chosen by
-    argmax(g + logits + sigma(q)), policy trained by CE to the COMPLETED-Q improved
-    target softmax(logits + sigma(completed_q)) over the legal set.
+  * GUMBEL (Danihelka 2022) x SAMPLED (Hubert 2021): root Gumbel-top-m
+    without replacement over the prior logits, sequential halving with
+    WIDENING (#93: every evaluation is a depth-0 value bootstrap; round p
+    gives each survivor 2**p new face-sequence draws from beta, so the
+    budget buys lower-variance weighted Q, never depth-mixed Q -- legacy
+    progressive deepening survives behind ALPHAGRAD_GAZ_DEEPEN=1 with
+    same-depth targets), action chosen by argmax(g + logits + sigma(q)),
+    policy trained by CE to the COMPLETED-Q improved target
+    softmax(logits + sigma(completed_q)) over the legal set.
   * APPROXIMATION = PER FACE, from PPO's UnifiedFacePolicy, reading the SAME
     live per-face token chunks (`common/face_driver.py` -> `live_faces.py`)
     PPO's head reads. It is drawn ONCE per COMMITTED decision (~NV x
@@ -27,10 +29,15 @@ CLEAN implementation (ignores autoscheduler_loop's surrogate-Gumbel search and m
     granularity, because running the face loop at every sequential-halving
     expansion would be ~12x PPO's chunk count. Face variants inside the
     search are a later stage. The per-VERTEX micro-action space is gone.
-  * The approximation head is TRAINED, not frozen: `Agent._face_replay`
-    re-scores the stored FaceAction off ONE scan of the stored emission
-    window ("gradient reaches palimpsa through this scan"), and its log-prob
-    enters the loss as a REINFORCE term with the critic as baseline.
+  * The approximation head is TRAINED as the beta factor of a SAMPLED
+    AlphaZero (Hubert et al. 2021) composite action a = (v, F): the search
+    draws K i.i.d. face sequences F_k ~ beta per surviving vertex, weighs
+    them w_k = rho_k * exp(sigma(q_k)), and the loss is the face
+    cross-entropy - lambda_f sum_v pi'_ve(v) sum_k w_hat_{v,k} log beta(F_k)
+    (common/sampled_az.py), with log beta recomputed through
+    `Agent._face_replay` ("gradient reaches palimpsa through this scan").
+    The old unclipped off-policy REINFORCE face term is GONE (#95), and so
+    is its flat-coefficient arity problem (#76).
   * Real measurements ONLY at episode terminals (budget = --total-measurements).
   * Objective identical to the E2 campaign: equal-weight z-scored
     {cosine_sim, latency_ns, peak_memory}; flops unrewarded.
@@ -731,7 +738,9 @@ def _prefix_arrays(state):
 @eqx.filter_jit
 def _face_plan(agent, precomputed, enc_carry, avail, residual,
                order, spec_hist, step_count, face_hist, skip_hist, key):
-    """Draw the per-face plan for the ALREADY-CHOSEN vertex.
+    """Draw ONE face-sequence sample F ~ beta for the vertex the one-hot
+    ``avail`` forces (Sampled AZ calls this per surviving candidate per
+    widening round; see `_draw_face_sequence`).
 
     The vertex is forced by handing `sample_action_dynamic` a ONE-HOT
     availability mask: the categorical then has no choice, and every other
@@ -763,7 +772,14 @@ def _face_plan(agent, precomputed, enc_carry, avail, residual,
 
 
 # ------------------------------------------------------------------ 3. optimizer
-opt = optax.adam(A.lr)
+# #95 training-loop hygiene: the SAME palimpsa gradient guard PPO runs --
+# optax.clip_by_global_norm ahead of adam (ppo.py builds
+# `optax.chain(clip_by_global_norm(args.max_grad_norm), adam(...))`, default
+# --max-grad-norm 0.5). AZ trained on a bare adam, so one bad replayed batch
+# could kick the shared palimpsa backbone arbitrarily far.
+_MAX_GRAD_NORM = float(os.environ.get("ALPHAGRAD_GAZ_MAX_GRAD_NORM", "0.5"))
+opt = optax.chain(optax.clip_by_global_norm(_MAX_GRAD_NORM),
+                  optax.adam(A.lr))
 opt_state = opt.init(eqx.filter(agent, eqx.is_array))
 
 # ------------------------------------------------------- known dynamics
@@ -784,11 +800,12 @@ def _step(node, vertex, face_rows=None, face_skips=None, face_keys=None):
     ``(state, carry)``. The caller decides whether the elimination is
     speculative (inside ``PT.branch()``) or committed.
 
-    ``face_rows``/``face_skips`` default to EXACT. The SEARCH expands with the
-    exact wires -- it proposes and scores at VERTEX granularity, and running
-    the face loop at every sequential-halving expansion would be ~12x PPO's
-    per-episode chunk count. The COMMITTED decision passes the drawn plan, so
-    the committed carry is built from the approximated delta.
+    ``face_rows``/``face_skips`` default to EXACT (the exact arm, the DEEPEN
+    rollouts and the warm start). Under Sampled AZ the search's expansions
+    pass each drawn face sequence's wires, so the search scores the composite
+    (vertex, faces) action on the graph those wires actually build; the
+    COMMITTED decision passes the executed draw's wires, so the committed
+    carry is built from the same approximated delta the search evaluated.
     """
     state, carry, ctxs = node
     a = int(vertex) - 1                     # VALID is contiguous 1..NV
@@ -1060,19 +1077,56 @@ def _golden_equivalence(state, stream, seg_ids, ep):
 
 
 CVISIT = float(os.environ.get("ALPHAGRAD_GAZ_CVISIT", "50.0"))
+CSCALE = float(os.environ.get("ALPHAGRAD_GAZ_CSCALE", "0.1"))
 
-def sigma(q, max_n=1, cs=float(os.environ.get("ALPHAGRAD_GAZ_CSCALE", "0.1"))):
+# ------------------------------------------ Sampled AlphaZero (Hubert 2021)
+# The shared, env-free arithmetic lives in common/sampled_az.py so the unit
+# tests exercise the exact functions this trainer runs (this module cannot be
+# imported by tests -- it builds its env at import time).
+from alphagrad.approx.common.sampled_az import (      # noqa: E402
+    assert_same_depth, draw_weights, face_ce_term, improved_policy,
+    phase_plan, qscale_sigma, rho_from_beta_temp, weighted_q)
+
+# #93: rollout depth defaults to 0 -- pure value bootstrap, textbook
+# Gumbel-AZ. The halving budget WIDENS (2**p new face-sequence draws per
+# survivor in round p) instead of deepening; depth-deepening survives only
+# behind ALPHAGRAD_GAZ_DEEPEN=1, and even then every Q estimate entering one
+# target comes from a single common depth (round 0) -- the 200:1 spread in
+# the completed-Q target was attributable to depth alone.
+_GAZ_DEEPEN = os.environ.get("ALPHAGRAD_GAZ_DEEPEN", "0") == "1"
+if not _GAZ_DEEPEN and int(A.rollout_depth) != 0:
+    print(f"[gaz] #93: --rollout-depth {A.rollout_depth} IGNORED (depth 0, "
+          "pure value bootstrap); set ALPHAGRAD_GAZ_DEEPEN=1 to deepen",
+          flush=True)
+# rho = pi/beta == 1 while the draws come from the head we train. The knob
+# exists so a future proposal temperature CANNOT silently bias the target:
+# any value != 1.0 hard-fails here until the importance ratio is implemented.
+_GAZ_BETA_TEMP = float(os.environ.get("ALPHAGRAD_GAZ_BETA_TEMP", "1.0"))
+_RHO = rho_from_beta_temp(_GAZ_BETA_TEMP)
+# DEEPEN mode has no widening rounds, so the face CE draws its K sequences
+# for the CHOSEN vertex after the search (K >= 2 or the weighted CE carries
+# no ranking signal: a single draw's w_hat is 1 and E[grad(-log beta)] = 0).
+_DEEPEN_FACE_K = max(2, int(os.environ.get("ALPHAGRAD_GAZ_DEEPEN_FACE_K", "2")))
+# Fixed storage pads for the per-decision search draws, from the FULL-width
+# schedule (late-episode decisions have fewer legal vertices => fewer draws).
+_PLAN_FULL = phase_plan(A.n_candidates, deepen=_GAZ_DEEPEN,
+                        rollout_depth=A.rollout_depth)
+if _GAZ_DEEPEN:
+    D_MAX_DRAWS = _DEEPEN_FACE_K
+else:
+    D_MAX_DRAWS = sum(n * d for n, d, _dep in _PLAN_FULL)
+
+
+def sigma(q, max_n=1, cs=CSCALE):
     """Danihelka et al. 2022 monotone Q-transform (mctx qtransform form):
     min-max-normalize Q over the candidate set, then scale by
     (c_visit + max_N) * c_scale, so evaluated Q outweighs the prior+Gumbel
-    and increasingly so as the search deepens. max_N = evaluation rounds of
-    the most-evaluated candidate (progressive-deepening analogue of the
-    paper's max visit count). Replaces a per-set z-score that capped every
-    Q-gap at ~1 sigma and erased magnitudes (2026-07-16 review, Fix 1)."""
-    q = np.asarray(q, dtype=np.float64)
-    lo, hi = float(q.min()), float(q.max())
-    qn = (q - lo) / max(hi - lo, 1e-8)
-    return (CVISIT + float(max_n)) * cs * qn
+    and increasingly so as the search invests more evaluations. max_N =
+    evaluation rounds of the most-evaluated candidate. Delegates to the ONE
+    shared transform in common/sampled_az.py (also used for the draw
+    weights), replacing a per-set z-score that capped every Q-gap at ~1
+    sigma and erased magnitudes (2026-07-16 review, Fix 1)."""
+    return qscale_sigma(q, max_n=max_n, cvisit=CVISIT, cscale=cs)
 
 # Per-episode POLICY-ENTROPY accumulators, drained to their episode means in
 # the wandb block.
@@ -1118,9 +1172,100 @@ def _check_distinct_observations(cands):
 
 
 # ---------------------------------------------------------------- Gumbel root search
-def gumbel_search(state, carry, rng):
-    """One decision. ``PT`` is positioned at the COMMITTED prefix on entry and
-    is left there on exit -- every expansion runs inside ``PT.branch()``."""
+def _draw_face_sequence(vertex, head_out, carry, prefix_arrays, rng):
+    """ONE i.i.d. face-sequence draw F ~ beta for ``vertex`` at the committed
+    prefix -- the SAME `_face_plan` call the old commit path made, so the
+    chunks the head reads and the wires it emits are byte-identical to PPO's.
+    Returns a host dict carrying the wires plus everything `_face_replay`
+    needs to re-score the draw in the loss."""
+    _o_arr, _sp_h, _f_h, _s_h, _n = prefix_arrays
+    # FRESH PREFIX TOKENIZER PER DRAW. `chunk()`'s speculative eliminations
+    # force LazyEdge memos IN PLACE on the CACHED prefix tokenizer (the
+    # `_Snapshot` cannot restore a forced memo), which was harmless while
+    # exactly ONE face loop ran per prefix -- but Sampled AZ runs K of them,
+    # and the second one already reads a SHRUNKEN face enumeration (observed
+    # on the first smoke: a vertex whose draw decided 2 faces enumerated 0
+    # at commit). Evicting the prefix cache makes every face loop start from
+    # the same pristine enumeration the measurement's fresh replay will use;
+    # the caller's loop-top `_lf_tk` reference drops out of the cache and is
+    # never speculated on, so the commit keys stay authoritative. The chunk
+    # cache stays: its keys include (prefix, vertex, decided rows, f), and a
+    # fresh-start recompute of the same key is byte-deterministic.
+    LIVE_FACES._prefix.clear()
+    _avail = np.zeros((TOTAL_V,), np.float32)
+    _avail[int(vertex) - 1] = 1.0
+    (fr, fs, fa, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de,
+     _vctx, _feat, face_ent, _vi) = _face_plan(
+        agent, head_out, carry.enc, jnp.asarray(_avail), carry.residual,
+        jnp.asarray(_o_arr), jnp.asarray(_sp_h),
+        jnp.asarray(_n, jnp.int32), jnp.asarray(_f_h), jnp.asarray(_s_h),
+        jax.random.PRNGKey(int(rng.integers(2 ** 31))))
+    assert int(_vi) == int(vertex) - 1, (
+        f"the one-hot availability mask did not force the searched vertex: "
+        f"head picked {int(_vi) + 1}, search wanted {int(vertex)}")
+    return {"fr": np.asarray(fr, np.int32), "fs": np.asarray(fs, np.int32),
+            "fa": jax.tree_util.tree_map(np.asarray, fa),
+            "f_pair": np.asarray(f_pair), "f_comp": np.asarray(f_comp),
+            "f_valid": np.asarray(f_valid),
+            "f_cnt": np.asarray(f_cnt, np.int32),
+            "f_dt": np.asarray(f_dt, np.int32),
+            "f_de": np.asarray(f_de, np.int32),
+            "face_ent": float(face_ent)}
+
+
+def _pack_search_draws(cands):
+    """The decision's face-sequence draws, flattened to the FIXED
+    ``D_MAX_DRAWS`` slots the loss vmaps over (padding: li == -1, w == 0,
+    all-zero wires -- `face_ce_term` gates it to exactly 0). Each slot
+    carries its own masks/window so the loss needs no per-vertex indirection.
+    """
+    D = int(D_MAX_DRAWS)
+    li = np.full((D,), -1, np.int32)
+    vidx = np.zeros((D,), np.int32)
+    w = np.zeros((D,), np.float32)
+    rows = [dd for c in cands for dd in c.get("draws", ())]
+    assert rows, "no face draws to pack on the approx arm"
+    assert len(rows) <= D, (
+        f"{len(rows)} search draws exceed the D_MAX_DRAWS={D} storage pad")
+    _z = lambda a: np.zeros((D,) + a.shape, a.dtype)
+    fpair, fcomp = _z(rows[0]["f_pair"]), _z(rows[0]["f_comp"])
+    fvalid, fcnt = _z(rows[0]["f_valid"]), _z(rows[0]["f_cnt"])
+    fdt, fde = _z(rows[0]["f_dt"]), _z(rows[0]["f_de"])
+    fa_list = []
+    i = 0
+    for c in cands:
+        for dd in c.get("draws", ()):
+            li[i] = int(c["li"])
+            vidx[i] = int(c["v"]) - 1
+            w[i] = float(dd["w_hat"])
+            fpair[i] = dd["f_pair"]; fcomp[i] = dd["f_comp"]
+            fvalid[i] = dd["f_valid"]; fcnt[i] = dd["f_cnt"]
+            fdt[i] = dd["f_dt"]; fde[i] = dd["f_de"]
+            fa_list.append(dd["fa"])
+            i += 1
+    _fa0 = jax.tree_util.tree_map(np.zeros_like, fa_list[0])
+    fa_list += [_fa0] * (D - len(fa_list))
+    fa = jax.tree_util.tree_map(lambda *xs: np.stack(xs), *fa_list)
+    return {"sd_li": li, "sd_vidx": vidx, "sd_w": w, "sd_fpair": fpair,
+            "sd_fcomp": fcomp, "sd_fvalid": fvalid, "sd_cnt": fcnt,
+            "sd_dt": fdt, "sd_de": fde, "sd_fa": fa}
+
+
+def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
+    """One decision, Sampled AlphaZero over the composite action a = (v, F)
+    with Gumbel-AZ at the vertex level. ``PT`` is positioned at the COMMITTED
+    prefix on entry and is left there on exit -- every expansion runs inside
+    ``PT.branch()``.
+
+    ``prefix_arrays`` / ``face_keys_of`` come from the caller's per-decision
+    LiveFaceStream prefix tokenizer (the authoritative face enumeration; see
+    the commit-path note on `_Snapshot` and forced LazyEdges).
+
+    Returns ``(chosen, pi, la, legal, head_out, cands, exec_draw)``:
+    ``cands`` carries every candidate's weighted draws for the face CE, and
+    ``exec_draw`` is the face sequence to EXECUTE for the chosen vertex,
+    sampled ~ w_hat (the improved beta at the root; None on the exact arm).
+    """
     legal = PT.legal(VALID)
     vlog, head_out, v_root = _eval_node(state, carry)
     ctxs = head_out[1]
@@ -1129,48 +1274,85 @@ def gumbel_search(state, carry, rng):
     m = min(A.n_candidates, len(legal))
     g = rng.gumbel(size=len(legal))
     order_idx = np.argsort(-(logits + g))[:m]
-    # ONE candidate per Gumbel-selected VERTEX. The per-vertex micro variants
-    # (K_MICRO sampled + one learned draw) are gone with the action space they
-    # belonged to; face variants inside the search are a later stage, and until
-    # then the search is a pure vertex-ordering search whose expansions carry
-    # the EXACT face wires.
+    # ONE candidate per Gumbel-selected VERTEX; its Q now aggregates over its
+    # own face-sequence draws, so the search scores the COMPOSITE action.
     cands = []
     for ci in order_idx:
         cands.append({"li": int(ci), "v": legal[int(ci)],
-                      "q": [], "g": float(g[int(ci)]),
+                      "q": [], "q_depths": [], "draws": [],
+                      "g": float(g[int(ci)]),
                       "logit": float(logits[int(ci)])})
-    # SEQUENTIAL HALVING with PROGRESSIVE DEEPENING (deterministic dynamics +
-    # deterministic value net => repeated sims of a candidate are IDENTICAL, so
-    # instead of re-simulating, each halving phase gives the SURVIVORS a 2x
-    # deeper rollout — the budget buys more accurate Q, not duplicates).
+    # SEQUENTIAL HALVING. Default (#93): every evaluation is a DEPTH-0 value
+    # bootstrap and each round WIDENS -- survivors draw 2**p new face
+    # sequences from beta, so the budget buys lower-variance weighted Q over
+    # the composite action, never depth-heterogeneous Q. ALPHAGRAD_GAZ_DEEPEN=1
+    # restores the legacy progressive deepening (exact-wire rollouts, one
+    # evaluation per round, 2x depth for survivors).
+    plan = phase_plan(m, deepen=_GAZ_DEEPEN,
+                      rollout_depth=(A.rollout_depth if _GAZ_DEEPEN else 0))
     surv = list(cands)
-    depth = A.rollout_depth
-    _phase = 0
-    while True:
+    for _phase, (_n_expect, _n_draws, _depth) in enumerate(plan):
+        assert len(surv) == _n_expect, (
+            f"halving drifted from phase_plan: {len(surv)} survivors, "
+            f"plan says {_n_expect}")
+        depth = min(int(_depth), NV)
         for c in surv:
-            # ONE branch per candidate covers its expansion AND its whole
-            # rollout chain: _Snapshot.__exit__ truncates the append-only
-            # lists back to their entry length, so any number of
-            # eliminations inside are undone together.
-            with PT.branch():
-                st2, cy2, d = _step((state, carry, ctxs), c["v"])
-                if _phase == 0:
-                    c["_wire"] = (d["spec_row"].tobytes(),
-                                  d["face_rows"].tobytes(),
-                                  d["face_skips"].tobytes())
-                    c["_tokbytes"] = (
-                        np.asarray(d["tokens"], np.int32).tobytes(),
-                        np.asarray(d["eqn_ids"], np.int32).tobytes())
-                c["q"].append(rollout_value(st2, cy2, depth))
+            if _GAZ_DEEPEN or _EXACT_ARM:
+                # Legacy/exact: ONE exact-wire evaluation per round
+                # (deterministic dynamics + deterministic value net => a
+                # repeat at the same depth would be an identical duplicate;
+                # on the exact arm later rounds add nothing at depth 0).
+                reps = 1 if (_GAZ_DEEPEN or _phase == 0) else 0
+            else:
+                reps = int(_n_draws)
+            for _r in range(reps):
+                dr = None
+                fr = fs = None
+                if not (_GAZ_DEEPEN or _EXACT_ARM):
+                    dr = _draw_face_sequence(c["v"], head_out, carry,
+                                             prefix_arrays, rng)
+                    fr, fs = dr["fr"], dr["fs"]
+                # ONE branch per evaluation covers the expansion AND its
+                # whole rollout chain: _Snapshot.__exit__ truncates the
+                # append-only lists back to their entry length.
+                with PT.branch():
+                    st2, cy2, d = _step((state, carry, ctxs), c["v"], fr, fs,
+                                        face_keys=face_keys_of(c["v"]))
+                    if _phase == 0 and _r == 0:
+                        c["_wire"] = (d["spec_row"].tobytes(),
+                                      d["face_rows"].tobytes(),
+                                      d["face_skips"].tobytes())
+                        c["_tokbytes"] = (
+                            np.asarray(d["tokens"], np.int32).tobytes(),
+                            np.asarray(d["eqn_ids"], np.int32).tobytes())
+                    qk = rollout_value(st2, cy2, depth)
+                if dr is not None:
+                    dr["q"] = float(qk)
+                    dr["depth"] = depth
+                    # #95: the tokens this draw's elimination produced, kept
+                    # so the caller can ASSERT the committed step re-produces
+                    # them bitwise (search dynamics == measured graph).
+                    dr["d_tokens"] = np.asarray(d["tokens"], np.int32)
+                    dr["d_eqns"] = np.asarray(d["eqn_ids"], np.int32)
+                    c["draws"].append(dr)
+                c["q"].append(float(qk))
+                c["q_depths"].append(depth)
         if _phase == 0:
             _check_distinct_observations(cands)
-        _phase += 1
         if len(surv) <= 1:
             break
-        # M2: each phase evaluates at a DEEPER rollout, so the entries of
-        # ``q`` estimate different quantities; averaging them dilutes the
-        # deepest (most informative) one. Use the latest.
-        qbar = np.array([c["q"][-1] for c in surv])
+        if _GAZ_DEEPEN or _EXACT_ARM:
+            # M2 (deepen): entries of ``q`` estimate different-depth
+            # quantities; the halving comparison uses the latest (all
+            # survivors in a round share one depth, so it is homogeneous).
+            qbar = np.array([c["q"][-1] for c in surv])
+        else:
+            # Sampled-AZ weighted Q over each survivor's draws: q(v) =
+            # sum_k w_k q_k / sum_k w_k, w_k = rho * exp(sigma(q_k)). All
+            # draws are depth-0, so the comparison is depth-homogeneous.
+            qbar = np.array([
+                weighted_q([dd["q"] for dd in c["draws"]], rho=_RHO,
+                           cvisit=CVISIT, cscale=CSCALE) for c in surv])
         sc = np.array([c["g"] + c["logit"] for c in surv]) + sigma(
             qbar, max_n=max(len(c["q"]) for c in surv))
         # M3: sequential halving keeps CEIL(n/2) (Karnin 2013; Danihelka
@@ -1182,7 +1364,6 @@ def gumbel_search(state, carry, rng):
         surv = [surv[i] for i in keep]
         if len(surv) <= 1:
             break                      # M3: before paying for another rollout
-        depth = min(depth * 2, NV)                         # deepen survivors
     chosen = surv[0]
     # completed-Q improved policy target over the FULL legal set; unvisited
     # vertices complete with v_mix (Danihelka completed-Q).
@@ -1200,15 +1381,25 @@ def gumbel_search(state, carry, rng):
     # Free: the softmaxed vertex prior is already materialised for the
     # completed-Q target. One sample per decision; the episode mean is logged.
     _VE_ENT.append(float(-np.sum(_prior * np.log(_prior + 1e-12))))
+    # #93: one target, ONE depth. Default mode every estimate is depth-0; in
+    # DEEPEN mode the target takes each candidate's ROUND-0 estimate (the one
+    # depth every visited candidate has) -- never the survivors' deeper ones,
+    # which would mix depths across candidates inside one softmax.
     _qv, _nv = {}, {}
+    _target_depths = []
     for c in cands:
         if not c["q"]:
             continue
-        qv = float(c["q"][-1])          # deepest estimate, as in the halving
-        li = c["li"]
-        if li not in _qv or qv > _qv[li]:
-            _qv[li] = qv
-        _nv[li] = max(_nv.get(li, 0), len(c["q"]))
+        if _GAZ_DEEPEN or _EXACT_ARM:
+            qv = float(c["q"][0])
+            _target_depths.append(c["q_depths"][0])
+        else:
+            qv = weighted_q([dd["q"] for dd in c["draws"]], rho=_RHO,
+                            cvisit=CVISIT, cscale=CSCALE)
+            _target_depths.extend(c["q_depths"])
+        _qv[c["li"]] = qv
+        _nv[c["li"]] = len(c["q"])
+    assert_same_depth(_target_depths, context="completed-Q target")
     if _qv:
         _Nsum = float(sum(_nv.values()))
         _den = float(sum(_prior[li] for li in _qv)) or 1e-12
@@ -1219,24 +1410,59 @@ def gumbel_search(state, carry, rng):
     comp_q = np.full(len(legal), v_mix, dtype=np.float64)
     for li, qv in _qv.items():
         comp_q[li] = qv
-    pi = logits + sigma(comp_q, max_n=max([len(c["q"]) for c in cands] + [1]))
-    pi = np.exp(pi - pi.max()); pi = pi / pi.sum()
-    # ``head_out`` rides out so the caller can commit the chosen action, draw
-    # its per-face plan and update the residual without a second heads pass.
-    return chosen, pi, la, legal, head_out
+    pi = improved_policy(
+        logits, comp_q, max_n=max([len(c["q"]) for c in cands] + [1]),
+        cvisit=CVISIT, cscale=CSCALE)
+    # ---- face-CE draws + the EXECUTED face sequence -----------------------
+    exec_draw = None
+    if not _EXACT_ARM:
+        if _GAZ_DEEPEN:
+            # No widening rounds ran, so the CE's K draws are taken here for
+            # the CHOSEN vertex, each valued by the SAME depth-0 bootstrap
+            # (one depth per target -- the w_hat ranking must not inherit the
+            # depth artifact either).
+            for _k in range(_DEEPEN_FACE_K):
+                dr = _draw_face_sequence(chosen["v"], head_out, carry,
+                                         prefix_arrays, rng)
+                with PT.branch():
+                    st2, cy2, d = _step((state, carry, ctxs), chosen["v"],
+                                        dr["fr"], dr["fs"],
+                                        face_keys=face_keys_of(chosen["v"]))
+                    dr["q"] = float(rollout_value(st2, cy2, 0))
+                dr["depth"] = 0
+                dr["d_tokens"] = np.asarray(d["tokens"], np.int32)
+                dr["d_eqns"] = np.asarray(d["eqn_ids"], np.int32)
+                chosen["draws"].append(dr)
+        # Normalized draw weights w_hat per candidate (the CE's targets).
+        for c in cands:
+            if not c["draws"]:
+                continue
+            assert_same_depth([dd["depth"] for dd in c["draws"]],
+                              context=f"draw weights v={c['v']}")
+            _w, _w_hat = draw_weights([dd["q"] for dd in c["draws"]],
+                                      rho=_RHO, cvisit=CVISIT, cscale=CSCALE)
+            for dd, wh in zip(c["draws"], _w_hat):
+                dd["w_hat"] = float(wh)
+        _cd = chosen["draws"]
+        assert _cd, "chosen vertex has no face draws on the approx arm"
+        _wh = np.array([dd["w_hat"] for dd in _cd], dtype=np.float64)
+        _wh = _wh / _wh.sum()
+        exec_draw = _cd[int(rng.choice(len(_cd), p=_wh))]
+    # ``head_out`` rides out so the caller can commit the chosen action and
+    # update the residual without a second heads pass.
+    return chosen, pi, la, legal, head_out, cands, exec_draw
 
 # ---------------------------------------------------------------- training
-# THE APPROXIMATION TERM. Before this, AZ's loss was vertex CE + value MSE
-# only: `learned_micro` sampled the micro head as a PROPOSAL and the result
-# never entered a loss, so AZ's approximation head was FROZEN AT INIT for the
-# whole comparison while PPO trained its per-face head every update.
-#
-# The search does not (yet) search over face variants, so there is no
-# improved-policy target for the face head the way there is for the vertex
-# head. The signal that DOES exist is the measured terminal return, so the
-# face plan is trained by REINFORCE with the critic as its baseline, both in
-# PopArt-normalised space. `Agent._face_replay` is the path -- its docstring:
-# "Gradient reaches palimpsa through this scan".
+# THE APPROXIMATION TERM: Sampled AlphaZero (Hubert et al. 2021) over the
+# composite action a = (v, F). The search drew K i.i.d. face sequences per
+# surviving vertex and weighed them w_k = rho_k * exp(sigma(q_k)); the loss
+# is the face cross-entropy toward those weighted draws,
+#     - lambda_f sum_v pi'_ve(v) sum_k w_hat_{v,k} log beta_theta(F_{v,k}),
+# with log beta recomputed through `Agent._face_replay` ("Gradient reaches
+# palimpsa through this scan"). This REPLACES the old unclipped off-policy
+# REINFORCE term over replayed plans (#95) and with it the flat-coefficient
+# f_logp arity problem (#76): the CE targets are the CURRENT search's stored
+# improved weights, not a raw return times a whole-plan log-prob.
 _FACE_COEF = float(os.environ.get("ALPHAGRAD_GAZ_FACE_COEF", "1.0"))
 _FACE_ENT_COEF = float(os.environ.get("ALPHAGRAD_GAZ_FACE_ENT_COEF", "0.01"))
 _W4J = jnp.asarray(np.asarray(W4, dtype=np.float32))
@@ -1244,21 +1470,24 @@ _W4J = jnp.asarray(np.asarray(W4, dtype=np.float32))
 
 def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
             resid, dtok, deqn, dcnt, owner, vsel, la_pad, la_mask, pi_pad,
-            vtgt, vmask, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de, fa):
-    """Vertex CE + value MSE + the per-face REINFORCE term, all re-derived
-    from the STORED PRE-step carry.
+            vtgt, vmask, sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp, sd_fvalid,
+            sd_cnt, sd_dt, sd_de, sd_fa):
+    """Vertex CE + value MSE + the Sampled-AZ face CE, all re-derived from
+    the STORED PRE-step carry.
 
     §7b of the PPO design, applied here: the replay stores the carry synced to
     the PREVIOUS step's delta plus that delta, and the loss reproduces the
     step's encoding by the SAME extension the rollout ran. Gradient reaches
     palimpsa through that ``encode_extend`` and, for the face head, through
-    ``_face_replay``'s scan of the stored emission window; it is truncated at
-    the stored carry, exactly as in PPO.
+    ``_face_replay``'s scan of each stored emission window; it is truncated at
+    the stored carry, exactly as in PPO. On the exact arm the ``sd_*`` slots
+    are None (leafless pytrees -- vmap passes them through untouched).
     """
     from alphagrad.approx.ppo import EncCarry
 
     def per(M, I, ch, nv, pos, vs, vc, rs, dt, de, dc, ow, vsl,
-            la, lam, pi, vt, vm, fp, fc, fv, fcnt, fdt, fde, face_action):
+            la, lam, pi, vt, vm, s_li, s_vidx, s_w, s_fp, s_fc, s_fv,
+            s_cnt, s_dt, s_de, s_fa):
         carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
         c2, vs2, vc2 = _cs.advance(agent, carry, vs, vc, dt, de, dc, ow,
                                    window=MAX_DELTA_TOKENS)
@@ -1273,33 +1502,29 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
         pred = jnp.stack([v3[0], v3[1], jnp.zeros_like(v3[0]), v3[2]])
         vl = jnp.sum(vm * _CH_ACTIVE * (pred - vt) ** 2)
 
-        # --- the per-face head ---------------------------------------
-        # v_context / features for the vertex this step ACTUALLY chose
-        # (`vsl`), not the delta's owner (`ow`, which is the PREVIOUS
-        # step's vertex -- the two differ by one and confusing them is the
-        # index-mapping class of bug this file has been bitten by before).
+        # --- the per-face head: Sampled-AZ cross-entropy --------------
         # #79 EXACT arm: the approximation head is not built, so there is
         # nothing to replay and no face term. This is a PYTHON-level branch,
         # taken before `_face_replay` is traced -- a jnp.where would still
         # trace a head that does not exist.
         if _EXACT_ARM:
             return ce + 0.5 * vl, jnp.zeros((), jnp.float32)
-        v_context = ctx[vsl]
-        features = _axis_feats(AXIS_STATE[vsl], AXIS_VALID[vsl])
-        f_logp, f_ent, f_arity = agent._face_replay(
-            v_context, features, FACT_TABLES, face_action, fp, fc, fv,
-            c2, (fcnt, fdt, fde), OP_OVERRIDE)
-        z = jnp.sum(_W4J * _CH_ACTIVE * vt)
-        base = jnp.sum(_W4J * _CH_ACTIVE * pred)
-        adv = jax.lax.stop_gradient(z - base)
-        face_ent_norm = f_ent / jnp.maximum(f_arity, 1.0)
-        face_loss = -_FACE_COEF * adv * f_logp - _FACE_ENT_COEF * face_ent_norm
+        # Each stored draw carries its own vertex index (the search's top-m,
+        # NOT only `vsl`), masks and emission window; ``pi`` supplies the
+        # pi'_ve(v) factor via the draw's legal-set index. `face_ce_term`
+        # gates the padding slots (li == -1 / w == 0) to exactly 0.
+        face_ce, face_ent_norm = face_ce_term(
+            agent._face_replay, ctx, c2, AXIS_STATE, AXIS_VALID, FACT_TABLES,
+            OP_OVERRIDE, _axis_feats, pi,
+            s_li, s_vidx, s_w, s_fp, s_fc, s_fv, s_cnt, s_dt, s_de, s_fa)
+        face_loss = _FACE_COEF * face_ce - _FACE_ENT_COEF * face_ent_norm
         return ce + 0.5 * vl + face_loss, face_ent_norm
 
     losses, ents = jax.vmap(per)(
         enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c, resid,
         dtok, deqn, dcnt, owner, vsel, la_pad, la_mask, pi_pad, vtgt, vmask,
-        f_pair, f_comp, f_valid, f_cnt, f_dt, f_de, fa)
+        sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp, sd_fvalid,
+        sd_cnt, sd_dt, sd_de, sd_fa)
     return jnp.mean(losses), jnp.mean(ents)
 
 
@@ -1379,7 +1604,8 @@ def _run(args) -> int:
         except Exception:
             wb = None
     print(f"[gaz] NV={NV} budget={args.total_measurements} m={args.n_candidates} "
-          f"depth={args.rollout_depth} per-face-head=True "
+          f"mode={'deepen(d0=%d)' % args.rollout_depth if _GAZ_DEEPEN else 'widen(depth=0)'} "
+          f"draws/decision<={D_MAX_DRAWS} per-face-head={not _EXACT_ARM} "
           f"max_faces={ENV_MAX_FACES}", flush=True)
 
     # --- 4b. PopArt WARM-START ------------------------------------------
@@ -1535,13 +1761,11 @@ def _run(args) -> int:
             legal = PT.legal(VALID)
             if not legal:
                 break
-            chosen, pi, la, legal, head_out = gumbel_search(state, carry, rng)
-            v = int(chosen["v"])
-            # ---- the per-face plan: ONE draw per COMMITTED decision ----
-            # ~NV x mean_faces chunks per episode. Drawing it at every
-            # sequential-halving expansion instead would be ~12x PPO's chunk
-            # count on the same graph, which is not affordable; the SEARCH
-            # therefore proposes and scores at VERTEX granularity.
+            # The committed prefix + its LiveFaceStream tokenizer, BEFORE the
+            # search: under Sampled AZ the SEARCH draws face sequences (K per
+            # surviving vertex, the widened halving budget), so it needs the
+            # same prefix binding and face enumeration the committed
+            # execution will use.
             _o_arr, _sp_h, _f_h, _s_h = _prefix_arrays(state)
             _LAST_PREFIX.update(order=_o_arr, specs=_sp_h, n=len(state),
                                 face_hist=_f_h, skip_hist=_s_h)
@@ -1559,10 +1783,20 @@ def _run(args) -> int:
             # enumeration the measurement's fresh replay will.
             _lf_tk = LIVE_FACES._tokenizer_at(_o_arr, _sp_h, len(state),
                                               _f_h, _s_h)
-            _face_keys = list(_lf_tk.ij.faces(v))
+            _fkeys_cache = {}
+
+            def _face_keys_of(_vv, _tk=_lf_tk, _c=_fkeys_cache):
+                if _vv not in _c:
+                    _c[_vv] = list(_tk.ij.faces(int(_vv)))
+                return _c[_vv]
+
+            (chosen, pi, la, legal, head_out, cands,
+             exec_draw) = gumbel_search(
+                state, carry, rng,
+                (_o_arr, _sp_h, _f_h, _s_h, len(state)), _face_keys_of)
+            v = int(chosen["v"])
+            _face_keys = _face_keys_of(v)
             _nf_pre = len(_face_keys)
-            _avail = np.zeros((TOTAL_V,), np.float32)
-            _avail[v - 1] = 1.0
             if _EXACT_ARM:
                 # #79 EXACT arm: no approximation head exists, so there is
                 # nothing to plan. Reuse the SAME no-approximation constants
@@ -1572,24 +1806,17 @@ def _run(args) -> int:
                 # empty/zero form.
                 fr, fs = EXACT_FACE_ROWS, EXACT_FACE_SKIPS
                 fa = None
-                f_pair = f_comp = None
                 f_valid = np.zeros((int(ENV_MAX_FACES),), np.float32)
                 f_cnt = np.zeros((int(ENV_MAX_FACES),), np.int32)
-                f_dt = f_de = None
-                v_context = features = None
-                face_ent = 0.0
-                _vi = v - 1
             else:
-                (fr, fs, fa, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de,
-                 v_context, features, face_ent, _vi) = _face_plan(
-                    agent, head_out, carry.enc, jnp.asarray(_avail),
-                    carry.residual, jnp.asarray(_o_arr), jnp.asarray(_sp_h),
-                    jnp.asarray(len(state), jnp.int32), jnp.asarray(_f_h),
-                    jnp.asarray(_s_h),
-                    jax.random.PRNGKey(int(rng.integers(2 ** 31))))
-            assert int(_vi) == v - 1, (
-                f"the one-hot availability mask did not force the searched "
-                f"vertex: head picked {int(_vi) + 1}, search chose {v}")
+                # Sampled AZ EXECUTES one of the search's own draws for the
+                # chosen vertex (sampled ~ w_hat in gumbel_search) -- the
+                # committed graph is one the search actually evaluated, and
+                # the commit-time extra face loop is gone with it.
+                fr, fs = exec_draw["fr"], exec_draw["fs"]
+                fa = exec_draw["fa"]
+                f_valid = exec_draw["f_valid"]
+                f_cnt = exec_draw["f_cnt"]
             fr = np.asarray(fr, np.int32)
             fs = np.asarray(fs, np.int32)
             if fa is not None:
@@ -1604,6 +1831,22 @@ def _run(args) -> int:
                                     face_keys=_face_keys)
             _assert_terminal_prediction(d)
             _assert_face_accounting(f_cnt, f_valid, d, _nf, v, _nf_pre)
+            # #95: search dynamics == measured graph, ASSERTED not assumed.
+            # The committed elimination must re-produce BITWISE the tokens the
+            # search's branch produced for the executed draw -- same prefix,
+            # same wires, same face keys; a mismatch means the search scored
+            # a different graph than the measurement will tokenize.
+            if exec_draw is not None:
+                if not (np.array_equal(np.asarray(d["tokens"], np.int32),
+                                       exec_draw["d_tokens"])
+                        and np.array_equal(np.asarray(d["eqn_ids"], np.int32),
+                                           exec_draw["d_eqns"])):
+                    raise AssertionError(
+                        f"vertex {v}: committed step tokens diverge from the "
+                        f"search branch that evaluated the executed face "
+                        f"draw ({len(d['tokens'])} vs "
+                        f"{len(exec_draw['d_tokens'])} tokens) -- the search "
+                        f"dynamics and the measured graph disagree")
             _gold_stream += list(d["tokens"])
             _gold_ids += list(d["eqn_ids"])
             steps.append({
@@ -1620,14 +1863,13 @@ def _run(args) -> int:
                 "owner": np.int32(_pre_for_loss[2]),
                 "vsel": np.int32(v - 1),
                 "la": la.copy(), "pi": pi.copy(),
-                # the per-face pass, stored exactly as PPO's trajectory stores
-                # it: the SAMPLING masks, the emission window the head read and
-                # the FaceAction itself, so `_face_replay` re-scores the same
-                # decisions against the same gates.
-                "f_pair": np.asarray(f_pair), "f_comp": np.asarray(f_comp),
-                "f_valid": np.asarray(f_valid), "f_cnt": np.asarray(f_cnt),
-                "f_dt": np.asarray(f_dt), "f_de": np.asarray(f_de),
-                "fa": jax.tree_util.tree_map(np.asarray, fa)})
+                # the SEARCH's face-sequence draws, flattened to the fixed
+                # D_MAX_DRAWS slots: per draw its legal-set index, vertex,
+                # normalized weight w_hat, the SAMPLING masks, the emission
+                # window the head read and the FaceAction itself -- so
+                # `_face_replay` re-scores the same decisions against the
+                # same gates and the CE reweights them by pi'_ve * w_hat.
+                **({} if _EXACT_ARM else _pack_search_draws(cands))})
             # slide the (carry, delta) window forward by one decision
             _prev_pre = _carry_before
             _prev_delta = d["delta"]
@@ -1701,12 +1943,21 @@ def _run(args) -> int:
             vmem_s, vmem_c, resid = stk("vmem_s"), stk("vmem_c"), stk("resid")
             dtok, deqn = stk("dtok"), stk("deqn")
             dcnt, owner, vsel = stk("dcnt"), stk("owner"), stk("vsel")
-            f_pair, f_comp = stk("f_pair"), stk("f_comp")
-            f_valid, f_cnt = stk("f_valid"), stk("f_cnt")
-            f_dt, f_de = stk("f_dt"), stk("f_de")
-            fa_b = jax.tree_util.tree_map(
-                lambda *xs: jnp.asarray(np.stack(xs)),
-                *[s["fa"] for s in flat])
+            # The search-draw columns for the Sampled-AZ face CE. On the
+            # exact arm there are no draws: None is a leafless pytree, so
+            # vmap and the minibatch tree_map pass it through untouched and
+            # the loss's _EXACT_ARM branch never reads it.
+            if _EXACT_ARM:
+                sd_li = sd_vidx = sd_w = sd_fpair = sd_fcomp = None
+                sd_fvalid = sd_cnt = sd_dt = sd_de = sd_fa = None
+            else:
+                sd_li, sd_vidx, sd_w = stk("sd_li"), stk("sd_vidx"), stk("sd_w")
+                sd_fpair, sd_fcomp = stk("sd_fpair"), stk("sd_fcomp")
+                sd_fvalid, sd_cnt = stk("sd_fvalid"), stk("sd_cnt")
+                sd_dt, sd_de = stk("sd_dt"), stk("sd_de")
+                sd_fa = jax.tree_util.tree_map(
+                    lambda *xs: jnp.asarray(np.stack(xs)),
+                    *[s["sd_fa"] for s in flat])
             la_p = jnp.asarray([pad(s["la"], MAXLA) for s in flat])
             la_m = jnp.asarray([pad(np.ones(len(s["la"])), MAXLA) for s in flat])
             pi_p = jnp.asarray([pad(s["pi"], MAXLA) for s in flat])
@@ -1714,8 +1965,8 @@ def _run(args) -> int:
             vm = jnp.asarray(np.broadcast_to(np.abs(W4) > 0, (len(flat), 4)).astype(np.float32))
             _cols = (enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
                      resid, dtok, deqn, dcnt, owner, vsel, la_p, la_m, pi_p,
-                     vt, vm, f_pair, f_comp, f_valid, f_cnt, f_dt,
-                     f_de, fa_b)
+                     vt, vm, sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp,
+                     sd_fvalid, sd_cnt, sd_dt, sd_de, sd_fa)
             # M5: resample the minibatch EVERY epoch. Taking one fixed 64-sample
             # draw and hitting it ``train_epochs`` times overfits that draw and
             # discards the rest of the replay for this update.
