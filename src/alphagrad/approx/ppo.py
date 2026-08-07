@@ -4853,9 +4853,17 @@ def main():
         # rows into the per-vertex memory (base eqn ids map to vertex slots
         # positionally; structural/overflow → global slot), then each scan
         # step extends by that step's delta only.
+        # Per-token owning VERTEX for the base stream. Without it every
+        # base row lands in the global slot and the pointer has only the
+        # static vertex_features to tell candidates apart at the root.
+        try:
+            _BASE_OWN = env.base_owners()
+        except Exception:
+            _BASE_OWN = None
         init_enc_state = _carry_stream.init_carry(
             agent, _BASE_TOK, _BASE_EQN, _BASE_N,
             window=_BASE_W, total_v=total_v, embd_dim=args.embd_dim,
+            base_owners=_BASE_OWN,
         )
 
         def step_fn(carry, k):

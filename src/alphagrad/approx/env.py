@@ -2400,6 +2400,13 @@ def decode_vertex_rule_specs(jaxpr, vertex, spec_rows, is_last: bool) -> tuple:
     return tuple(rules)
 
 
+# #72: apply a face's `new`-slot approximation to the EXISTING EDGE at the
+# join as well as to the contraction result, so compute is saved on both
+# operands of the add. Set 0 to restore the contraction-only behaviour --
+# the two are NOT comparable, since this changes the measured object.
+_NEW_SLOT_JOIN = os.environ.get("ALPHAGRAD_NEW_SLOT_JOIN", "1") != "0"
+
+
 def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
                           is_last_honored):
     """ONE vertex's ``{face_key: slots|SKIP_FACE}`` from its wire rows,
@@ -2446,7 +2453,32 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
                 make_live_masked_hook(tuple(rules), stats=_PER_FACE_STATS,
                                       gated=True) if rules else None)
         if any(sl is not None for sl in slots):
-            per_face[key] = tuple(slots)
+            # #72. A bare 3-tuple means CONTRACTION ONLY to graphax
+            # (_normalize_perpath, core.py:797): pre/post hit the two
+            # contraction operands and `new` the contraction RESULT, while
+            # the join hooks stay None. The requested semantics is that a
+            # `new`-slot approximation ALSO applies to the existing edge
+            # this result is added to, so compute is saved on both
+            # operands of the join.
+            #
+            # graphax already wires that: `_h_rhs` is applied to `_edge`
+            # -- the existing edge -- immediately before the add
+            # (core.py:1679). So emit the TWO-OP form and put the new-slot
+            # hook in `rhs`.
+            #
+            # `lhs` stays None on purpose: `new` has already transformed
+            # the contraction result at core.py:1657, and `lhs` hits that
+            # SAME tensor at 1678, so setting it would apply the
+            # approximation twice. `res` (the summed edge) is a decision
+            # the head does not make.
+            #
+            # Faces with no existing edge are unaffected -- graphax simply
+            # never reaches the join hooks for them.
+            _new_hook = slots[2] if len(slots) > 2 else None
+            if _new_hook is not None and _NEW_SLOT_JOIN:
+                per_face[key] = (tuple(slots), (None, _new_hook, None))
+            else:
+                per_face[key] = tuple(slots)
     return per_face
 
 
@@ -3991,6 +4023,37 @@ class VertexEliminationEnv:
             t[:n] = np.asarray(toks, dtype=np.int32)
             e[:len(ids)] = np.asarray(ids, dtype=np.int32)
         return jnp.asarray(t), jnp.asarray(e), n
+
+    def base_owners(self):
+        """Per-token OWNING VERTEX for the base stream, ``(MAX_BASE_TOKENS,)``.
+
+        1-based vertex, 0 = no owner (the ``inputs`` header, shape
+        declarations, and anything not emitted from an equation).
+
+        This is what the per-vertex memory must be keyed on. The stream's
+        ``eqn_ids`` CANNOT serve: they are stream-global SEGMENT ids -- the
+        whole base block is one ``_emit_eqns`` call, so every base equation
+        token shares id 0, and reading them as vertex indices credited the
+        entire base stream to vertex 1 (#92).
+
+        Returns an all-zero array (i.e. everything to the global slot, the
+        safe #92 behaviour) against a graphax without ``last_owner_ids``.
+        """
+        from graphax import IncrementalPathTokenizer
+
+        vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "512"))
+        tk = IncrementalPathTokenizer(
+            self.config.jaxpr, tuple(self.config.argnums),
+            list(self.consts), list(self.args), vocab_size=vocab,
+        )
+        toks = tk.base_tokens()
+        own_fn = getattr(tk, "last_owner_ids", None)
+        owners = [int(v) for v in own_fn()] if own_fn is not None else []
+        o = np.zeros((MAX_BASE_TOKENS,), dtype=np.int32)
+        k = min(len(owners), len(toks), MAX_BASE_TOKENS)
+        if k:
+            o[:k] = np.asarray(owners[:k], dtype=np.int32)
+        return jnp.asarray(o)
 
     def reset(self, num_envs: int | None = None) -> EnvState:
         if num_envs is None:

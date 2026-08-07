@@ -4,9 +4,10 @@ Stage 2 retired the growing token stream -- the env emits each step's DELTA
 with its own exact count, and the base stream is a host-side constant. What
 remains is a two-move protocol every trainer runs identically:
 
-``init_carry``  consume the base stream ONCE, fold its rows into the
-                GLOBAL memory slot (the base block is one tokenizer segment
-                with no per-vertex owner -- see #92 in-line note).
+``init_carry``  consume the base stream ONCE, folding each row into the
+                slot of the VERTEX that produced it (``base_owners``, from
+                the tokenizer); headers and inputs, and the whole block if
+                owners are unavailable, go to the global slot.
 ``advance``     extend the carry by ONE step's delta and fold those rows in
                 under the delta's owning vertex.
 ``heads``       run the pointer / value block off the memory.
@@ -24,11 +25,12 @@ __all__ = ["init_carry", "advance", "heads"]
 
 
 def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
-               total_v, embd_dim):
+               total_v, embd_dim, base_owners=None):
     """``(enc_carry, vmem_sums, vmem_counts)`` after the base stream.
 
-    Base rows land in the GLOBAL slot: the tokenizer emits the whole base
-    equation block as ONE segment, so its ids carry no vertex information.
+    ``base_owners`` is the tokenizer's per-token owning VERTEX (1-based,
+    0 = none). Its SEGMENT ids carry no vertex information and must not be
+    used for this. Omit it and the whole block goes to the global slot.
 
     ``window`` is the base stream's OWN length (it is a constant of the
     jaxpr, not of the elimination order), so the base encode scan is exactly
@@ -38,18 +40,33 @@ def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
     enc1, rows0, valid0, eqns0 = agent.encode_extend(
         enc0, base_tokens, base_eqns, base_count, window=window, start=0,
     )
-    # #92. `eqns0` are SEGMENT ids from a stream-global running counter --
-    # graphax.jaxpr.last_eqn_ids is explicit that they are "built for
-    # relational consumers that only compare ids", NOT vertex indices. And
-    # base_tokens emits the whole base equation block in ONE _emit_eqns call,
-    # so every base equation token carries the SAME id (0, the counter start).
-    # Reading it as a vertex index therefore credited the entire base stream
-    # to vertex 1: measured 335/360 rows into slot 0 with slots 1..30 empty
-    # forever, making vertex 1 the only distinguishable vertex at every root.
-    # The base block has no per-vertex owner, so it goes to the GLOBAL slot
-    # (id -1) -- still an attention key for the pointer and still counted in
-    # the value summary, just not attributed to a vertex that does not own it.
-    base_ids = jnp.full(eqns0.shape, -1, jnp.int32)
+    # BASE ATTRIBUTION. `eqns0` are SEGMENT ids from a stream-global running
+    # counter -- graphax.jaxpr.last_eqn_ids is explicit that they are "built
+    # for relational consumers that only compare ids", NOT vertex indices,
+    # and base_tokens emits the whole base block in ONE _emit_eqns call so
+    # every base equation token shares id 0. Reading them as vertex indices
+    # credited the entire base stream to vertex 1 (#92).
+    #
+    # The TRUE owners come from the tokenizer instead:
+    # `IncrementalPathTokenizer.last_owner_ids()` gives the 1-based vertex
+    # that produced each base token (0 = no owner: headers, the input list),
+    # recorded because `_build_graph` walks `jaxpr.eqns` and every traced
+    # base equation therefore belongs to exactly one original equation.
+    # With them, every vertex starts with palimpsa content describing its
+    # own primal op and elemental partials -- without them the pointer has
+    # only static vertex_features to tell candidates apart at the root.
+    #
+    # Fallback is the #92 behaviour (everything to the GLOBAL slot), which
+    # is always safe. Never fall back to reading `eqns0` as vertex ids.
+    if base_owners is None:
+        base_ids = jnp.full(eqns0.shape, -1, jnp.int32)
+    else:
+        _own = jnp.asarray(base_owners, jnp.int32)
+        _own = jnp.concatenate(
+            [_own, jnp.zeros(eqns0.shape, jnp.int32)])[:eqns0.shape[0]]
+        # owner is 1-based; slot index is owner-1. 0 (no owner) -> -1 ->
+        # the global slot, same destination the fallback uses.
+        base_ids = jnp.where(_own > 0, _own - 1, -1)
     vs0 = jnp.zeros((total_v + 1, embd_dim), jnp.float32)
     vc0 = jnp.zeros((total_v + 1,), jnp.float32)
     vs0, vc0 = _vmem.update_ids(vs0, vc0, rows0, base_ids, valid0)

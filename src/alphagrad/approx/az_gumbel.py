@@ -215,6 +215,13 @@ BASE_EQN = jnp.asarray(np.asarray(_BASE_IDS[:BASE_W], dtype=np.int32))
 # Cross-check against the env's own producer: the two must agree bitwise or
 # the search reads a different base than the measurement tokenizes.
 _ebt, _ebe, _ebn = env.base_observation()
+# Per-token owning VERTEX, from the SAME env method PPO uses -- keying the
+# per-vertex memory differently on the two arms is exactly the class of
+# divergence this file exists to avoid.
+try:
+    BASE_OWN = env.base_owners()
+except Exception:
+    BASE_OWN = None
 assert int(_ebn) == BASE_N, (
     f"base stream length disagrees: PlanTokenizer {BASE_N} vs "
     f"env.base_observation() {int(_ebn)}")
@@ -576,7 +583,8 @@ VFEAT = _ep_vfeat(_ns, jaxpr, tuple(closed.literals), tuple(xs),
 @eqx.filter_jit
 def _carry_init(agent):
     return _cs.init_carry(agent, BASE_TOK, BASE_EQN, BASE_N,
-                          window=BASE_W, total_v=TOTAL_V, embd_dim=EMBD)
+                          window=BASE_W, total_v=TOTAL_V, embd_dim=EMBD,
+                          base_owners=BASE_OWN)
 
 
 @eqx.filter_jit
