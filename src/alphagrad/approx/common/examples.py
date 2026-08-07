@@ -20,6 +20,7 @@ from alphagrad.approx.common.datasets import (
     NN_VMAP_BATCH,
     dataset_dims,
     load_dataset,
+    loss_mode,
 )
 
 
@@ -53,9 +54,10 @@ def example_width(default: int | None = None):
 #   XENT        final 0.9467  drawdown 0.0053  reached 0.90 at step 8000
 # xent also closes the graphax-vs-exact gap: graphax_rev 0.9470 vs
 # jax.grad 0.9467 (0.0003), where under MSE it trailed by ~0.03.
-_LOSS_MODE = os.environ.get("ALPHAGRAD_LOSS", "xent").strip().lower()
-if _LOSS_MODE not in ("mse", "xent"):
-    raise ValueError(f"ALPHAGRAD_LOSS must be 'mse' or 'xent', got {_LOSS_MODE!r}")
+# Resolved by datasets.loss_mode() -- the single reader of ALPHAGRAD_LOSS.
+# This module and datasets.py previously read the var separately with
+# different defaults, silently pairing the xent branch with +/-0.9 targets.
+_LOSS_MODE = loss_mode()
 
 
 def _neural_network(x, y, W1, b1, W2, b2):
@@ -402,7 +404,22 @@ def get_args(fn_str: str, key, dataset: str | None = None):
             shapes[1] = (NN_VMAP_BATCH, *shapes[1])
 
     keys = jax.random.split(key, len(shapes))
-    return [jax.random.normal(k, s) for k, s in zip(keys, shapes)]
+    out = [jax.random.normal(k, s) for k, s in zip(keys, shapes)]
+    if fn_str.endswith("NeuralNetwork"):
+        # LeCun/Xavier fan-in scaling + zero biases -- the same convention
+        # _tlm_dims/TransformerLM already uses above. Unscaled N(0,1) on 784
+        # normalized inputs drove the tanh into saturation, which does not
+        # change any SHAPE or the vertex/action space (so cost measurements
+        # stay comparable) but does move the VALUES the quality channels
+        # (cosine / frobenius) and the magnitude-sensitive COMPRESS/QUANT
+        # rules are computed from.
+        # args 2,4 = W1 (h, in_dim), W2 (out_dim, h); applied as x @ W.T, so
+        # fan-in is shape[-1]. args 3,5 = biases.
+        for _i in (2, 4):
+            out[_i] = out[_i] / jnp.sqrt(jnp.float32(out[_i].shape[-1]))
+        for _i in (3, 5):
+            out[_i] = jnp.zeros_like(out[_i])
+    return out
 
 
 def get_fn(fn_str: str):
@@ -433,15 +450,24 @@ def get_fn(fn_str: str):
 
 
 def scalar_loss_fn(fn):
-    """Wrap an example function into a SCALAR training loss by averaging its
-    outputs. Required for graphax ``grad`` / ``value_and_grad`` (which need a
+    """Wrap an example function into a SCALAR training loss: sum the class
+    axis, average the batch. Required for graphax ``grad`` / ``value_and_grad`` (which need a
     scalar output) when measuring the GRADIENT instead of the full Jacobian.
     The NeuralNetwork examples already return per-element squared errors, so the
     mean is the MSE loss — the gradient that would hit the optimizer. Shared by
     every measurement site (rollout worker + CPU measure-actor + gfn worker) so
     the jaxpr/order/transforms all operate on the SAME scalar-loss graph."""
     def _loss(*a):
-        return jnp.mean(fn(*a))
+        out = fn(*a)
+        # Canonical classification reduction: SUM over the class/feature axis
+        # (the examples return PER-ELEMENT losses, and y is one-hot, so this
+        # is the per-sample NLL / squared error), MEAN over the batch. The
+        # previous jnp.mean(out) averaged the class axis too, making the loss
+        # NLL/10 -- a constant factor, harmless to the scale-invariant quality
+        # channels but not the objective a real training loop optimizes.
+        if jnp.ndim(out) >= 2:
+            return jnp.mean(jnp.sum(out, axis=-1))
+        return jnp.mean(out)
 
     return _loss
 

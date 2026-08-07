@@ -43,6 +43,20 @@ _MNIST_FILES = {
 }
 
 
+def loss_mode() -> str:
+    """Canonical ALPHAGRAD_LOSS resolution -- the ONLY reader of the var.
+
+    This used to be read independently here and in examples.py with DIFFERENT
+    defaults (mse here, xent there). Unset, that combination fed +/-0.9
+    targets into the cross-entropy branch, making -(y*logp) negative and
+    rewarding wrong classes. One resolver, one default.
+    """
+    m = os.environ.get("ALPHAGRAD_LOSS", "xent").strip().lower()
+    if m not in ("mse", "xent"):
+        raise ValueError(f"ALPHAGRAD_LOSS must be mse or xent, got {m!r}")
+    return m
+
+
 def _mnist_cache_dir() -> Path:
     """Where to put the four IDX files. ``DSNN_MNIST_DIR`` overrides for
     air-gapped / shared-mount setups; default lives under XDG cache."""
@@ -117,7 +131,7 @@ def load_dataset(name: str, dataset_size: int | None, subset: str = "train"):
         # Cross-entropy needs a probability vector: -(y * logp) with a
         # NEGATIVE y would reward the wrong classes. So xent pins {0,1}
         # regardless of the +/-s setting rather than producing nonsense.
-        _xent = os.environ.get("ALPHAGRAD_LOSS", "mse").strip().lower() == "xent"
+        _xent = loss_mode() == "xent"
         if not _xent and os.environ.get("ALPHAGRAD_PM1_TARGETS", "1") == "1":
             # {0,1} -> {-s,+s}, INSET from tanh's asymptotes by default.
             # Measured at 40k steps, jax_grad, seed 250197:
