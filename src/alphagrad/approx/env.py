@@ -2645,8 +2645,15 @@ def _compile_measure(lowered):
         if os.environ.get("ALPHAGRAD_MEASURE_COMPILE_FALLBACK", "1") == "0":
             raise
         _m = str(_e)
+        # "Shared memory size limit exceeded" is labelled
+        # RESOURCE_EXHAUSTED but is a compiler KERNEL-CONFIG failure
+        # (XLA chose a tile above the SM's shared-mem budget -- observed
+        # on Blackwell per-order exact compiles: requested 131072,
+        # available 101376), not a real allocation OOM -- degraded
+        # fusion legitimately avoids it. True OOMs still re-raise.
         if not any(_sig in _m for _sig in (
-                "ptxas exited", "Triton kernel", "INTERNAL")):
+                "ptxas exited", "Triton kernel", "INTERNAL",
+                "Shared memory size limit")):
             raise
         _MEASURE_COMPILE_FALLBACKS["n"] += 1
         print(

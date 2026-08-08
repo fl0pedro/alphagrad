@@ -49,3 +49,11 @@ def test_kill_switch(monkeypatch):
     with pytest.raises(RuntimeError):
         env_mod._compile_measure(lo)
     assert len(lo.calls) == 1
+
+
+def test_fallback_on_shared_memory_kernel_config():
+    """RESOURCE_EXHAUSTED by label, compiler kernel-config by nature."""
+    lo = _Lowered("RESOURCE_EXHAUSTED: Shared memory size limit exceeded: "
+                  "requested 131072, available: 101376, context: [Fusion")
+    assert env_mod._compile_measure(lo) == "EXE"
+    assert len(lo.calls) == 2
