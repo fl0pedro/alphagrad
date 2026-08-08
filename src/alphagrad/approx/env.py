@@ -1712,6 +1712,105 @@ def _align_jac(jac_approx, jac_exact):
         return jac_approx
 
 
+_COST_REF: dict = {}
+_QUALITY_GATE_STATS = {"clamps": 0}
+
+
+def _exact_cost_reference(config, base_args):
+    """(latency_ns, peak_bytes) of the EXACT 'rev' plan -- the additive
+    quality gate's floor. Measured ONCE per process through the same
+    compile path (_compile_measure) so the clamp compares like with
+    like. Returns None (gate fails OPEN, with one warning) if the
+    reference cannot be built."""
+    if "ref" in _COST_REF:
+        return _COST_REF["ref"]
+    try:
+        from graphax import jacve as _jacve
+        ex = _compile_measure(
+            jax.jit(
+                _jacve(config.target_fun, "rev",
+                       argnums=config.argnums, has_aux=config.has_aux,
+                       sparse_representation=config.sparse),
+                keep_unused=True,
+            ).lower(*base_args))
+        out = ex(*base_args)
+        jax.block_until_ready(out)
+        _devs = set()
+        for _l in jax.tree_util.tree_leaves(out):
+            try:
+                _devs |= set(_l.devices())
+            except Exception:
+                pass
+        _have = all(
+            (d.memory_stats() or {}).get("peak_bytes_in_use") is not None
+            for d in _devs) and bool(_devs)
+        for _ in range(3):
+            jax.block_until_ready(ex(*base_args))
+        if _have:
+            _base = sum(float((d.memory_stats() or {}).get(
+                "bytes_in_use", 0.0)) for d in _devs)
+            for d in _devs:
+                try:
+                    d.client.clear_memory_stats()
+                except Exception:
+                    pass
+        _laps = []
+        for _ in range(3):
+            _t0 = time.perf_counter()
+            for _ in range(20):
+                out = ex(*base_args)
+            jax.block_until_ready(out)
+            _laps.append((time.perf_counter() - _t0) / 20)
+        _lat = float(np.median(_laps) * 1e9)
+        if _have:
+            _peak = max(0.0, sum(float((d.memory_stats() or {}).get(
+                "peak_bytes_in_use", 0.0)) for d in _devs) - _base)
+        else:
+            _peak = float(_memory_analysis_bytes(ex) or 0.0)
+        _COST_REF["ref"] = (_lat, _peak)
+        print(f"[measure] quality gate armed: exact-rev reference "
+              f"latency={_lat/1e3:.1f}us peak={_peak/1e6:.1f}MB "
+              f"(qmin={os.environ.get('ALPHAGRAD_QUALITY_GATE_MIN')})",
+              flush=True)
+    except Exception as _exc:
+        print(f"[measure] WARNING quality gate: exact-rev reference "
+              f"failed ({type(_exc).__name__}: {str(_exc)[:120]}) -- "
+              f"gate fails OPEN", flush=True)
+        _COST_REF["ref"] = None
+    return _COST_REF["ref"]
+
+
+def _apply_quality_gate(latency_ns, peak_memory, quality, is_terminal,
+                        has_quality, config, base_args):
+    """ADDITIVE quality gate: below ALPHAGRAD_QUALITY_GATE_MIN the cost
+    channels are FLOORED at the exact-reverse reference -- destruction
+    pays what exact computation pays, so it gains nothing, while every
+    channel stays a plain additive term. Cost channels are PENALTIES:
+    scaling them toward zero would reward destruction, hence the clamp
+    form. No-op unless the env var is set, quality was actually
+    measured this step, and it fell below the threshold."""
+    try:
+        _qmin = float(os.environ.get(
+            "ALPHAGRAD_QUALITY_GATE_MIN", "0") or 0.0)
+    except ValueError:
+        _qmin = 0.0
+    if (_qmin <= 0.0 or not is_terminal or not has_quality
+            or float(quality) >= _qmin):
+        return latency_ns, peak_memory
+    _ref = _exact_cost_reference(config, base_args)
+    if _ref is None:
+        return latency_ns, peak_memory
+    _rl, _rm = _ref
+    _QUALITY_GATE_STATS["clamps"] += 1
+    if _QUALITY_GATE_STATS["clamps"] == 1 \
+            or _QUALITY_GATE_STATS["clamps"] % 50 == 0:
+        print(f"[measure] quality gate CLAMP "
+              f"#{_QUALITY_GATE_STATS['clamps']}: q={float(quality):.4f}"
+              f" < {_qmin}; lat {latency_ns/1e3:.1f}->"
+              f"{max(latency_ns, _rl)/1e3:.1f}us", flush=True)
+    return max(latency_ns, _rl), max(peak_memory, _rm)
+
+
 def _quality_metrics(jac_exact, jac_approx):
     """`(cosine_sim, relative_frobenius)` of `jac_approx` against `jac_exact`.
 
@@ -3623,6 +3722,14 @@ def _callback(
         cosine_sim = 0.0
         frob_residual = 0.0
 
+    # ---- ADDITIVE QUALITY GATE (owner 2026-08-09): see
+    # _apply_quality_gate. Fires only when quality was MEASURED this
+    # step (terminal + cosines non-empty) and fell below the env-var
+    # threshold; clamps the two campaign cost channels to the
+    # exact-reverse reference so destruction has no cost advantage.
+    latency_ns, peak_memory = _apply_quality_gate(
+        latency_ns, peak_memory, cosine_sim, is_terminal,
+        bool(cosines), config, list(args))
     _pf("cb.quality")
     rewards = jnp.array(
         [
