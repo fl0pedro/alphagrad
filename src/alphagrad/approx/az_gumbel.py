@@ -1759,6 +1759,25 @@ def _run(args) -> int:
         # stopped fitting a 96GB card (~78GB resident by ep15; v54 jobs
         # 59332/59345 died this way at batch 4 AND 2 -- it is creep, not
         # batch size). Costs one recompile of the touched jits per clear.
+        # Per-episode LIVE-BUFFER census (GAZ_MEMLOG=1): clear_caches()
+        # did NOT stop the creep (59352 died at ~ep17 right after the
+        # ep16 clear), so the ~78GB is LIVE ARRAYS someone retains, not
+        # executables. The census names them by shape.
+        if os.environ.get("ALPHAGRAD_GAZ_MEMLOG", "0") == "1":
+            try:
+                _la = jax.live_arrays()
+                _tot = sum(int(a.nbytes) for a in _la)
+                from collections import Counter as _C
+                _by = _C()
+                for _a in _la:
+                    _by[(tuple(_a.shape), str(_a.dtype))] += int(_a.nbytes)
+                _top = ", ".join(
+                    f"{_sh}x{_dt}={_b/2**20:.0f}MB"
+                    for (_sh, _dt), _b in _by.most_common(5))
+                print(f"[gaz-mem] ep={ep} live={len(_la)} "
+                      f"{_tot/2**30:.2f}GiB top: {_top}", flush=True)
+            except Exception as _me:
+                print(f"[gaz-mem] census failed: {_me}", flush=True)
         _tce = int(os.environ.get(
             "ALPHAGRAD_GAZ_TRAINER_CLEAR_EVERY", "0") or 0)
         if _tce > 0 and ep % _tce == 0:
