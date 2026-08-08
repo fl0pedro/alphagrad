@@ -2533,6 +2533,15 @@ def _compile_measure(lowered):
             "xla_gpu_enable_triton_gemm": False,
             "xla_gpu_enable_dynamic_slice_fusion": False,
             "xla_gpu_use_runtime_fusion": False,
+            # The observed Blackwell failures are kCustom __triton
+            # fusions with block_level_fusion_config -- produced by the
+            # BLOCK-LEVEL rewriter, which the four knobs above do not
+            # touch (observed: fallback #1 fired and still died on
+            # fusion.205). Both names probed-valid on this build.
+            "xla_gpu_experimental_enable_fusion_block_level_rewriter":
+                False,
+            "xla_gpu_experimental_enable_triton_heroless_priority_fusion":
+                False,
         })
 
 
