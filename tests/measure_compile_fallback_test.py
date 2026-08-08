@@ -57,3 +57,10 @@ def test_fallback_on_shared_memory_kernel_config():
                   "requested 131072, available: 101376, context: [Fusion")
     assert env_mod._compile_measure(lo) == "EXE"
     assert len(lo.calls) == 2
+
+
+def test_fallback_on_fusion_cycle():
+    lo = _Lowered("FAILED_PRECONDITION: A cycle is detected while visiting "
+                  "instruction %fusion.113")
+    assert env_mod._compile_measure(lo) == "EXE"
+    assert len(lo.calls) == 2

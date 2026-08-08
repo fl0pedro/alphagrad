@@ -2671,9 +2671,13 @@ def _compile_measure(lowered):
         # on Blackwell per-order exact compiles: requested 131072,
         # available 101376), not a real allocation OOM -- degraded
         # fusion legitimately avoids it. True OOMs still re-raise.
+        # "A cycle is detected" (FAILED_PRECONDITION) is an XLA
+        # fusion-pass graph bug -- observed on an exact TLM plan
+        # (fusion.113, Blackwell); by construction a degraded-fusion
+        # retry can avoid the offending fusion.
         if not any(_sig in _m for _sig in (
                 "ptxas exited", "Triton kernel", "INTERNAL",
-                "Shared memory size limit")):
+                "Shared memory size limit", "A cycle is detected")):
             raise
         _MEASURE_COMPILE_FALLBACKS["n"] += 1
         print(
