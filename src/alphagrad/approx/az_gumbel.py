@@ -1752,6 +1752,21 @@ def _run(args) -> int:
     # --- 5. loop: act/search -> measure -> popart -> pareto -> train ---
     while n_meas < args.total_measurements:
         ep += 1
+        # TRAINER-SIDE cache clear (ALPHAGRAD_GAZ_TRAINER_CLEAR_EVERY,
+        # default 0=off). Under GAZ_RAY_MEASURE=1 the in-process
+        # measure-cache cadence never runs, and the TRAINER process
+        # accumulated executables until jit_train_step's ~18.5GiB buffer
+        # stopped fitting a 96GB card (~78GB resident by ep15; v54 jobs
+        # 59332/59345 died this way at batch 4 AND 2 -- it is creep, not
+        # batch size). Costs one recompile of the touched jits per clear.
+        _tce = int(os.environ.get(
+            "ALPHAGRAD_GAZ_TRAINER_CLEAR_EVERY", "0") or 0)
+        if _tce > 0 and ep % _tce == 0:
+            import gc as _gc
+            jax.clear_caches()
+            _gc.collect()
+            print(f"[gaz] ep={ep} trainer jax.clear_caches() "
+                  f"(every {_tce})", flush=True)
         # #85: fresh calibration samples per episode, and the per-vertex
         # features recomputed from them -- they are sample-derived, so a
         # stale VFEAT would describe last episode's data. Mirrors
