@@ -119,3 +119,20 @@ def test_order_floor_failure_falls_back_to_rev(monkeypatch):
     lat, mem = env_mod._apply_quality_gate(
         37e3, 1e6, 0.0, True, True, None, None, order_floor_fn=_boom)
     assert lat == 132e3 and mem == 4.0e9        # fell back, still floored
+
+
+def test_oomed_order_floor_carries_alloc_into_mem_floor(monkeypatch):
+    """destroy + un-compilable order must not earn the tiny rev floor: the
+    failed allocation becomes the memory floor."""
+    monkeypatch.setenv("ALPHAGRAD_QUALITY_GATE_MIN", "0.05")
+    _seed_ref(132e3, 4.0e9)
+
+    def _oom():
+        raise RuntimeError(
+            "RESOURCE_EXHAUSTED: Out of memory while trying to allocate "
+            "34.05GiB. [tf-allocator-allocation-error='']")
+
+    lat, mem = env_mod._apply_quality_gate(
+        37e3, 1e6, 0.0, True, True, None, None, order_floor_fn=_oom)
+    assert lat == 132e3
+    assert mem == pytest.approx(34.05 * 2**30)

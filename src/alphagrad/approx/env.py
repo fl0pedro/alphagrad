@@ -1814,15 +1814,35 @@ def _apply_quality_gate(latency_ns, peak_memory, quality, is_terminal,
     # (the global rev reference under-floored: random orders measure
     # ~500x above rev, so a clamped-to-rev SKIP still "won" latency).
     _ref = None
+    _oom_floor_bytes = 0.0
     if order_floor_fn is not None:
         try:
             _ref = order_floor_fn()
         except Exception as _exc:
+            _m = str(_exc)
+            # A genuine allocation OOM on the per-order exact floor means
+            # this ORDER's honest cost is AT LEAST the failed allocation.
+            # Falling back to the tiny rev floor would mint a second-order
+            # cliff (destroy + pick an order whose exact plan cannot even
+            # compile -> cheapest floor in the pool); carry the requested
+            # bytes into the MEMORY floor instead.
+            import re as _re
+            _g = _re.search(
+                r"allocate ([0-9.]+)\s*([KMGT])iB", _m)
+            if _g:
+                _oom_floor_bytes = float(_g.group(1)) * {
+                    "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40,
+                }[_g.group(2)]
             print(f"[measure] quality gate: per-order floor failed "
-                  f"({type(_exc).__name__}: {str(_exc)[:120]}) -- "
-                  f"falling back to the rev reference", flush=True)
+                  f"({type(_exc).__name__}: {_m[:120]}) -- "
+                  f"falling back to the rev reference"
+                  + (f" + OOM mem floor "
+                     f"{_oom_floor_bytes/2**30:.1f}GiB"
+                     if _oom_floor_bytes else ""), flush=True)
     if _ref is None:
         _ref = _exact_cost_reference(config, base_args)
+        if _ref is not None and _oom_floor_bytes > 0.0:
+            _ref = (_ref[0], max(_ref[1], _oom_floor_bytes))
     if _ref is None:
         return latency_ns, peak_memory
     _rl, _rm = _ref
