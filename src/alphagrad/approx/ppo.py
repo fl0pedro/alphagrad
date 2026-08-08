@@ -4741,6 +4741,10 @@ def main():
     agent = _build_agent(args, total_v, num_factors, max_rules, agent_key)
     agent = init_linear_weights(agent, init_key)
     agent = _scale_output_heads(agent, args.head_init_scale)
+    # Identity-init parity with the factory path (az): ppo.main predates
+    # build_and_init_agent and does not route through it.
+    from alphagrad.approx.common.agent_factory import apply_face_none_bias
+    agent = apply_face_none_bias(agent)
     # Stage D: build per-head boolean parameter masks once. Used inside
     # train_minibatch to scale gradients by the head-specific LR multiplier
     # (warm-up ramp from §3.2). Masks are pytree leaves aligned with the

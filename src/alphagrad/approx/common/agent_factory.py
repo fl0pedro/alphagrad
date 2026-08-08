@@ -84,6 +84,34 @@ def derive_agent_keys(seed: int):
     return agent_key, init_key
 
 
+def apply_face_none_bias(agent):
+    """IDENTITY-INIT for the face head (ALPHAGRAD_FACE_NONE_BIAS,
+    default 0 = off): +B on each slot's OP_NONE logit, -B on SKIP.
+    Called by build_and_init_agent AND by ppo.main's inline init path
+    (which predates the factory and does not route through it -- the
+    v54 PPO arm shipped without the bias until this was split out)."""
+    import os as _os
+    _nb = float(_os.environ.get("ALPHAGRAD_FACE_NONE_BIAS", "0") or 0.0)
+    _fpp = getattr(agent, "face_path_policy", None)
+    if _nb == 0.0 or _fpp is None or getattr(_fpp, "head", None) is None:
+        return agent
+    import equinox as _eqx
+    from alphagrad.approx.unified_face_head import (
+        FACE_SLOTS as _FS, OP_NONE as _NONE, O_SKIP as _SKIP,
+        S_OP as _SOP, slot_base as _sb)
+    _bias = _fpp.head.proj.layers[-1].bias
+    for _s in range(_FS):
+        _bias = _bias.at[_sb(_s) + _SOP + _NONE].add(_nb)
+    _bias = _bias.at[_SKIP].add(-_nb)
+    agent = _eqx.tree_at(
+        lambda a: a.face_path_policy.head.proj.layers[-1].bias,
+        agent, _bias)
+    print(f"[factory] face-head IDENTITY INIT: OP_NONE bias +{_nb}, "
+          f"SKIP bias -{_nb} (trainable; P(approx/face) ~ "
+          f"{3 * 2.718 ** (-_nb):.3f})", flush=True)
+    return agent
+
+
 def build_and_init_agent(args, total_v: int, num_factors: int, max_rules: int,
                          *, seed: int | None = None, key=None, init_key=None):
     """``_build_agent`` + orthogonal init + output-head scaling, as one step.
@@ -115,33 +143,7 @@ def build_and_init_agent(args, total_v: int, num_factors: int, max_rules: int,
     agent = init_linear_weights(agent, init_key)
     agent = _scale_output_heads(agent, float(getattr(args, "head_init_scale", 0.1)))
 
-    # IDENTITY-INIT for the face head (owner 2026-08-09,
-    # ALPHAGRAD_FACE_NONE_BIAS, default 0 = off): +B on each slot's
-    # OP_NONE logit, -B on the SKIP logit. At B=6 the per-face approx
-    # probability is ~2%, so an INIT plan is near-exact -- the loss-drop
-    # quality channel warms at ~0.85 instead of the constant 0.0 that
-    # froze PopArt on TLM -- while ~5 faces per plan still explore
-    # approximations. An INIT, not a mask: every logit stays trainable,
-    # nothing about WHICH approximations are good is encoded.
-    import os as _os
-    _nb = float(_os.environ.get("ALPHAGRAD_FACE_NONE_BIAS", "0") or 0.0)
-    _fpp = getattr(agent, "face_path_policy", None)
-    if _nb != 0.0 and _fpp is not None \
-            and getattr(_fpp, "head", None) is not None:
-        import equinox as _eqx
-        from alphagrad.approx.unified_face_head import (
-            FACE_SLOTS as _FS, OP_NONE as _NONE, O_SKIP as _SKIP,
-            S_OP as _SOP, slot_base as _sb)
-        _bias = _fpp.head.proj.layers[-1].bias
-        for _s in range(_FS):
-            _bias = _bias.at[_sb(_s) + _SOP + _NONE].add(_nb)
-        _bias = _bias.at[_SKIP].add(-_nb)
-        agent = _eqx.tree_at(
-            lambda a: a.face_path_policy.head.proj.layers[-1].bias,
-            agent, _bias)
-        print(f"[factory] face-head IDENTITY INIT: OP_NONE bias +{_nb}, "
-              f"SKIP bias -{_nb} (trainable; P(approx/face) ~ "
-              f"{3 * 2.718 ** (-_nb):.3f})", flush=True)
+    agent = apply_face_none_bias(agent)
     return agent
 
 
