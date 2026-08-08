@@ -1716,6 +1716,49 @@ _COST_REF: dict = {}
 _QUALITY_GATE_STATS = {"clamps": 0}
 
 
+def _measure_exec_cost(ex, base_args):
+    """(latency_ns, peak_bytes) of a compiled executable, measured with
+    the gate's own light protocol (3x20 perf_counter, allocator-delta
+    peak with static fallback). Shared by the global rev reference and
+    the per-order floor so the clamp compares like with like."""
+    out = ex(*base_args)
+    jax.block_until_ready(out)
+    _devs = set()
+    for _l in jax.tree_util.tree_leaves(out):
+        try:
+            _devs |= set(_l.devices())
+        except Exception:
+            pass
+    _have = bool(_devs) and all(
+        (d.memory_stats() or {}).get("peak_bytes_in_use") is not None
+        for d in _devs)
+    for _ in range(3):
+        jax.block_until_ready(ex(*base_args))
+    _base = 0.0
+    if _have:
+        _base = sum(float((d.memory_stats() or {}).get(
+            "bytes_in_use", 0.0)) for d in _devs)
+        for d in _devs:
+            try:
+                d.client.clear_memory_stats()
+            except Exception:
+                pass
+    _laps = []
+    for _ in range(3):
+        _t0 = time.perf_counter()
+        for _ in range(20):
+            out = ex(*base_args)
+        jax.block_until_ready(out)
+        _laps.append((time.perf_counter() - _t0) / 20)
+    _lat = float(np.median(_laps) * 1e9)
+    if _have:
+        _peak = max(0.0, sum(float((d.memory_stats() or {}).get(
+            "peak_bytes_in_use", 0.0)) for d in _devs) - _base)
+    else:
+        _peak = float(_memory_analysis_bytes(ex) or 0.0)
+    return _lat, _peak
+
+
 def _exact_cost_reference(config, base_args):
     """(latency_ns, peak_bytes) of the EXACT 'rev' plan -- the additive
     quality gate's floor. Measured ONCE per process through the same
@@ -1733,40 +1776,7 @@ def _exact_cost_reference(config, base_args):
                        sparse_representation=config.sparse),
                 keep_unused=True,
             ).lower(*base_args))
-        out = ex(*base_args)
-        jax.block_until_ready(out)
-        _devs = set()
-        for _l in jax.tree_util.tree_leaves(out):
-            try:
-                _devs |= set(_l.devices())
-            except Exception:
-                pass
-        _have = all(
-            (d.memory_stats() or {}).get("peak_bytes_in_use") is not None
-            for d in _devs) and bool(_devs)
-        for _ in range(3):
-            jax.block_until_ready(ex(*base_args))
-        if _have:
-            _base = sum(float((d.memory_stats() or {}).get(
-                "bytes_in_use", 0.0)) for d in _devs)
-            for d in _devs:
-                try:
-                    d.client.clear_memory_stats()
-                except Exception:
-                    pass
-        _laps = []
-        for _ in range(3):
-            _t0 = time.perf_counter()
-            for _ in range(20):
-                out = ex(*base_args)
-            jax.block_until_ready(out)
-            _laps.append((time.perf_counter() - _t0) / 20)
-        _lat = float(np.median(_laps) * 1e9)
-        if _have:
-            _peak = max(0.0, sum(float((d.memory_stats() or {}).get(
-                "peak_bytes_in_use", 0.0)) for d in _devs) - _base)
-        else:
-            _peak = float(_memory_analysis_bytes(ex) or 0.0)
+        _lat, _peak = _measure_exec_cost(ex, base_args)
         _COST_REF["ref"] = (_lat, _peak)
         print(f"[measure] quality gate armed: exact-rev reference "
               f"latency={_lat/1e3:.1f}us peak={_peak/1e6:.1f}MB "
@@ -1781,7 +1791,8 @@ def _exact_cost_reference(config, base_args):
 
 
 def _apply_quality_gate(latency_ns, peak_memory, quality, is_terminal,
-                        has_quality, config, base_args):
+                        has_quality, config, base_args,
+                        order_floor_fn=None):
     """ADDITIVE quality gate: below ALPHAGRAD_QUALITY_GATE_MIN the cost
     channels are FLOORED at the exact-reverse reference -- destruction
     pays what exact computation pays, so it gains nothing, while every
@@ -1797,7 +1808,21 @@ def _apply_quality_gate(latency_ns, peak_memory, quality, is_terminal,
     if (_qmin <= 0.0 or not is_terminal or not has_quality
             or float(quality) >= _qmin):
         return latency_ns, peak_memory
-    _ref = _exact_cost_reference(config, base_args)
+    # Prefer the SAME-ORDER exact floor: a destroyed plan pays what its
+    # OWN order would cost done exactly, so destruction is strictly
+    # dominated at every fixed order while order search stays rewarded
+    # (the global rev reference under-floored: random orders measure
+    # ~500x above rev, so a clamped-to-rev SKIP still "won" latency).
+    _ref = None
+    if order_floor_fn is not None:
+        try:
+            _ref = order_floor_fn()
+        except Exception as _exc:
+            print(f"[measure] quality gate: per-order floor failed "
+                  f"({type(_exc).__name__}: {str(_exc)[:120]}) -- "
+                  f"falling back to the rev reference", flush=True)
+    if _ref is None:
+        _ref = _exact_cost_reference(config, base_args)
     if _ref is None:
         return latency_ns, peak_memory
     _rl, _rm = _ref
@@ -3727,9 +3752,16 @@ def _callback(
     # step (terminal + cosines non-empty) and fell below the env-var
     # threshold; clamps the two campaign cost channels to the
     # exact-reverse reference so destruction has no cost advantage.
+    def _gate_order_floor():
+        # LAZY: only clamped plans pay this compile+measure. Reuses the
+        # order-keyed exact cache, so a repeat offender order is free.
+        _gex = cached_compile(b"exact:" + exact_cache_key,
+                              _do_compile_exact)
+        return _measure_exec_cost(_gex, list(args_for_lower))
     latency_ns, peak_memory = _apply_quality_gate(
         latency_ns, peak_memory, cosine_sim, is_terminal,
-        bool(cosines), config, list(args))
+        bool(cosines), config, list(args),
+        order_floor_fn=_gate_order_floor)
     _pf("cb.quality")
     rewards = jnp.array(
         [

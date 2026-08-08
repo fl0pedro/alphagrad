@@ -98,3 +98,24 @@ def test_reference_measures_on_a_real_target():
     assert ref is not None
     lat, mem = ref
     assert lat > 0.0 and mem >= 0.0
+
+
+def test_order_floor_preferred_over_rev_reference(monkeypatch):
+    monkeypatch.setenv("ALPHAGRAD_QUALITY_GATE_MIN", "0.05")
+    _seed_ref(132e3, 4.0e9)                     # global rev reference
+    lat, mem = env_mod._apply_quality_gate(
+        37e3, 1e6, 0.0, True, True, None, None,
+        order_floor_fn=lambda: (67e6, 9.0e9))   # this order, done exactly
+    assert lat == 67e6 and mem == 9.0e9         # order floor wins
+
+
+def test_order_floor_failure_falls_back_to_rev(monkeypatch):
+    monkeypatch.setenv("ALPHAGRAD_QUALITY_GATE_MIN", "0.05")
+    _seed_ref(132e3, 4.0e9)
+
+    def _boom():
+        raise RuntimeError("compile died")
+
+    lat, mem = env_mod._apply_quality_gate(
+        37e3, 1e6, 0.0, True, True, None, None, order_floor_fn=_boom)
+    assert lat == 132e3 and mem == 4.0e9        # fell back, still floored
