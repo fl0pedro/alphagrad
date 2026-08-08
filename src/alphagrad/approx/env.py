@@ -2501,6 +2501,41 @@ def _measure_compiler_options():
     }
 
 
+_MEASURE_COMPILE_FALLBACKS = {"n": 0}
+
+
+def _compile_measure(lowered):
+    """Compile a MEASURE executable; on an INTERNAL GPU-compiler failure
+    (ptxas exit-139 segfault / Triton fusion compile error -- both observed
+    on Blackwell TLM plans, v53 jobs 59279/59306, across actors and order
+    families) retry ONCE with a degraded-fusion option set instead of
+    sentineling the whole plan. Option names are PROBED-VALID on this
+    jax/XLA build (an unknown name raises INVALID_ARGUMENT and would
+    defeat the fallback). The fallback executable is less fused, so its
+    latency reads conservatively -- a real measurement, not a sentinel;
+    every use is printed and counted so the bias stays visible.
+    ALPHAGRAD_MEASURE_COMPILE_FALLBACK=0 disables."""
+    try:
+        return lowered.compile(compiler_options=_measure_compiler_options())
+    except Exception as _e:
+        if os.environ.get("ALPHAGRAD_MEASURE_COMPILE_FALLBACK", "1") == "0":
+            raise
+        _m = str(_e)
+        if not any(_sig in _m for _sig in (
+                "ptxas exited", "Triton kernel", "INTERNAL")):
+            raise
+        _MEASURE_COMPILE_FALLBACKS["n"] += 1
+        print(
+            f"[measure] compile FALLBACK #{_MEASURE_COMPILE_FALLBACKS['n']} "
+            f"(degraded fusion) after: {_m[:200]}", flush=True)
+        return lowered.compile(compiler_options={
+            "xla_gpu_autotune_level": 0,
+            "xla_gpu_enable_triton_gemm": False,
+            "xla_gpu_enable_dynamic_slice_fusion": False,
+            "xla_gpu_use_runtime_fusion": False,
+        })
+
+
 def _face_transforms_for_order(config, consts, args, o_list, specs_list,
                                face_rows_list, face_skips_list,
                                honor_last_compress=True):
@@ -3042,7 +3077,7 @@ def _callback(
             arm_face_counts, disarm_face_counts)
         arm_face_counts()
         try:
-            return (
+            return _compile_measure(
                 jax.jit(
                     jacve(
                         config.target_fun,
@@ -3056,13 +3091,12 @@ def _callback(
                     keep_unused=True,
                 )
                 .lower(*args_for_lower)
-                .compile(compiler_options=_measure_compiler_options())
             )
         finally:
             disarm_face_counts()
 
     def _do_compile_exact():
-        return (
+        return _compile_measure(
             jax.jit(
                 jacve(
                     config.target_fun,
@@ -3074,7 +3108,6 @@ def _callback(
                 keep_unused=True,
             )
             .lower(*args_for_lower)
-            .compile(compiler_options=_measure_compiler_options())
         )
 
     # The EXACT compile ignores `transforms` / `face_transforms` entirely (see
@@ -3189,7 +3222,7 @@ def _callback(
             if _fo:
                 os.environ["GRAPHAX_FACTORED_OUTPUTS"] = "1"
             try:
-                return (
+                return _compile_measure(
                     jax.jit(
                         jacve(
                             config.target_fun,
@@ -3203,7 +3236,6 @@ def _callback(
                         keep_unused=True,
                     )
                     .lower(*args_for_lower)
-                    .compile(compiler_options=_measure_compiler_options())
                 )
             finally:
                 if _fo:
