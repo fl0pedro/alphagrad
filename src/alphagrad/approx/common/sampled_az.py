@@ -191,3 +191,27 @@ def face_ce_term(face_replay_fn, ctx, enc_carry, axis_state, axis_valid,
     n_real = jnp.maximum(jnp.sum(valid.astype(jnp.float32)), 1.0)
     mean_ent = jnp.sum(jnp.where(valid, ent_n, 0.0)) / n_real
     return ce, mean_ent
+
+
+def mult_gate_scalar(raw4, gate_tau, gate_w, anti_degen_penalty,
+                     anti_degen_tau, cost_weights=(1.0, 1.0, 0.0)):
+    """PPO ``_apply_mult_gate`` parity for az's raw [lat, peak, flops, cos].
+
+    g(cos) = clip((cos - tau)/(1 - tau), 0, 1); cheapness =
+    max(0, W - sum_c w_c * log1p(cost_c)); scalar = g * cheapness. Below
+    ``anti_degen_tau`` the shaped penalty -(P - cos*P) replaces the flat 0 so
+    the destroyed basin keeps a positive slope in cos. Costs arrive RAW
+    POSITIVE (native units); PPO's env layout stores them negated, which is
+    the only difference the parity test bridges.
+    """
+    import numpy as _np
+    r = _np.asarray(raw4, dtype=_np.float64)
+    cos = float(_np.clip(r[3], 0.0, 1.0))
+    g = float(_np.clip((cos - gate_tau) / max(1.0 - gate_tau, 1e-6), 0.0, 1.0))
+    w = _np.asarray(cost_weights, dtype=_np.float64)
+    cheap = max(0.0, gate_w - float(_np.sum(w * _np.log1p(_np.abs(r[:3])))))
+    scal = g * cheap
+    if cos < anti_degen_tau:
+        fid_basin = min(max(cos, 0.0), anti_degen_tau)
+        scal = -(anti_degen_penalty - fid_basin * anti_degen_penalty)
+    return float(scal)

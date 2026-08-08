@@ -5747,6 +5747,18 @@ def main():
         use_popart = args.advantage_norm == "popart"
         popart_mu, popart_sigma = _popart_derive(
             popart_m1, popart_m2, popart_w, args.popart_sigma_min, 1e12)
+        # TRUE OPTIMIZED RETURN (owner 2026-08-09): preference-weighted
+        # PopArt-z of the post-gate post-symlog TERMINAL head rewards --
+        # the exact scalar this update maximizes, in the space the
+        # advantages live in. Valid for additive AND mult (the gate was
+        # applied to traj_reward above). Logged as `scalarized_return`,
+        # the same key az_gumbel already uses, so the two arms' headline
+        # panels finally show the same quantity.
+        _term_hr = head_rewards[:, -1, :]
+        _term_z = (_term_hr - popart_mu) / popart_sigma
+        _pref_t = (traj.preference[:, -1, :]
+                   if traj.preference.ndim == 3 else traj.preference)
+        true_scalar_return = jnp.mean(jnp.sum(_term_z * _pref_t, axis=-1))
         v_raw = traj.value * popart_sigma + popart_mu
         nv_raw = traj.next_value * popart_sigma + popart_mu
         # ONE value encoding, not two.
@@ -6279,6 +6291,7 @@ def main():
             new_m2,
             new_w,
             _attn_ent,
+            true_scalar_return,
         )
 
     if not args.no_jit:
@@ -6409,8 +6422,7 @@ def main():
 
     def host_log(
         ep, all_rets, actions_pack, mean_r, mets, diag_pack=None,
-        popart_stats=None, attn_entropy=None, warmup=False,
-    ):
+        popart_stats=None, attn_entropy=None, warmup=False, true_return=None):
         ep = int(ep)
         all_rets = np.array(all_rets)  # (num_envs, NUM_REWARDS)
         v_idx_arr = np.array(actions_pack[0])
@@ -6755,6 +6767,11 @@ def main():
         # az_gumbel arm puts on them: a MEASUREMENT, never a sentinel.
         if _any_live:
             log_dict["mean_return"] = float(np.sum(mean_r * weights))
+        # THE TRUE OPTIMIZED SCALAR (see train_episode). Emitted every
+        # trained episode, live measurement or not -- it is a training-
+        # space quantity, not a measurement.
+        if true_return is not None:
+            log_dict["scalarized_return"] = float(true_return)
             for j, name in enumerate(REWARD_NAMES):
                 log_dict[f"mean_{name}"] = (
                     float(mean_r[j]) if j < len(mean_r) else 0.0)
@@ -7649,6 +7666,7 @@ def main():
             popart_m2,
             popart_w,
             attn_ent,
+            true_scalar_return,
         ) = train_episode(
             agent,
             opt_state,
@@ -7678,6 +7696,7 @@ def main():
                 popart_m1, popart_m2, popart_w,
                 args.popart_sigma_min, 1e12),
             attn_entropy=attn_ent,
+            true_return=float(true_scalar_return),
         )
         # Mid-training top-N snapshot. Skips the wandb table log so we
         # don't pollute the offline run with duplicate tables — only the

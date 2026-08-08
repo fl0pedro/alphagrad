@@ -309,6 +309,32 @@ def scalarize(raw4):
     r = np.asarray(raw4, dtype=np.float64)
     return float(np.sum(W4 * (r - popart.mu) / popart.sigma))
 
+
+# --reward-mode mult parity (owner 2026-08-09): under
+# ALPHAGRAD_REWARD_MODE=mult the ONE scalar everything consumes --
+# search leaf values, completed-Q, CE draw weights, replay and the
+# `scalarized_return` panel -- is the cosine-gated cheapness, so AZ
+# optimizes exactly what PPO's mult arm optimizes. PopArt keeps
+# normalizing the VALUE net targets downstream; the gate replaces the
+# additive W4 z-sum, not the normalizer.
+if os.environ.get("ALPHAGRAD_REWARD_MODE", "additive") == "mult":
+    from alphagrad.approx.common.sampled_az import mult_gate_scalar
+    _GATE_TAU = float(os.environ.get("ALPHAGRAD_GAZ_GATE_TAU", "0.5"))
+    _GATE_W = float(os.environ.get("ALPHAGRAD_GAZ_GATE_W", "40.0"))
+    _ADEG_P = float(os.environ.get(
+        "ALPHAGRAD_GAZ_ANTI_DEGEN_P", "2.0"))
+    _ADEG_TAU = float(os.environ.get(
+        "ALPHAGRAD_GAZ_ANTI_DEGEN_TAU", "0.05"))
+
+    def scalarize(raw4):  # noqa: F811 -- deliberate mult-mode override
+        return mult_gate_scalar(raw4, _GATE_TAU, _GATE_W, _ADEG_P,
+                                _ADEG_TAU)
+
+    print(f"[gaz] REWARD MODE mult: g(cos>tau={_GATE_TAU}) x "
+          f"max(0, {_GATE_W} - symlog costs); anti-degen P={_ADEG_P} "
+          f"below cos={_ADEG_TAU} (PPO _apply_mult_gate parity)",
+          flush=True)
+
 # Pareto archive over the 3 focus OBJECTIVES {latency, xla_peak, cosine} in RAW
 # native units (kept SEPARATE from PopArt -- never the normalized values). The
 # archive MAXIMISES, so feed a sign-oriented raw vector (negate the cost
