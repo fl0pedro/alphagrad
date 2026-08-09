@@ -1996,8 +1996,14 @@ def _run(args) -> int:
             MAXLA = NV
             def pad(x, n, v=0):
                 return np.pad(x, (0, n - len(x)), constant_values=v)
+            # HOST-SIDE replay columns (root cause of the ep15-17 OOM
+            # saga, census-proven: uploading the FULL flattened replay --
+            # sd_fpair alone is (rows, D, 2538, 8, 8) ~ 0.5GB/episode --
+            # to the GPU every episode retained a generation stack of
+            # 78GiB by ep15 on 96GB. Columns stay numpy; only the sampled
+            # minibatch rows are uploaded per epoch (~5MB/row).
             def stk(k):
-                return jnp.asarray(np.stack([s[k] for s in flat]))
+                return np.stack([s[k] for s in flat])
             enc_M, enc_I = stk("enc_M"), stk("enc_I")
             enc_ch, enc_nv, enc_pos = stk("enc_ch"), stk("enc_nv"), stk("enc_pos")
             vmem_s, vmem_c, resid = stk("vmem_s"), stk("vmem_c"), stk("resid")
@@ -2016,13 +2022,13 @@ def _run(args) -> int:
                 sd_fvalid, sd_cnt = stk("sd_fvalid"), stk("sd_cnt")
                 sd_dt, sd_de = stk("sd_dt"), stk("sd_de")
                 sd_fa = jax.tree_util.tree_map(
-                    lambda *xs: jnp.asarray(np.stack(xs)),
+                    lambda *xs: np.stack(xs),
                     *[s["sd_fa"] for s in flat])
-            la_p = jnp.asarray([pad(s["la"], MAXLA) for s in flat])
-            la_m = jnp.asarray([pad(np.ones(len(s["la"])), MAXLA) for s in flat])
-            pi_p = jnp.asarray([pad(s["pi"], MAXLA) for s in flat])
-            vt = jnp.asarray([(s["raw4"] - popart.mu) / popart.sigma for s in flat])  # PopArt-normalised
-            vm = jnp.asarray(np.broadcast_to(np.abs(W4) > 0, (len(flat), 4)).astype(np.float32))
+            la_p = np.stack([pad(s["la"], MAXLA) for s in flat])
+            la_m = np.stack([pad(np.ones(len(s["la"])), MAXLA) for s in flat])
+            pi_p = np.stack([pad(s["pi"], MAXLA) for s in flat])
+            vt = np.stack([(s["raw4"] - popart.mu) / popart.sigma for s in flat])  # PopArt-normalised
+            vm = np.broadcast_to(np.abs(W4) > 0, (len(flat), 4)).astype(np.float32)
             _cols = (enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
                      resid, dtok, deqn, dcnt, owner, vsel, la_p, la_m, pi_p,
                      vt, vm, sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp,
@@ -2032,9 +2038,10 @@ def _run(args) -> int:
             # discards the rest of the replay for this update.
             _bs = int(os.environ.get("ALPHAGRAD_GAZ_BATCH", "64"))
             for _ in range(args.train_epochs):
-                idx = jnp.asarray(rng.permutation(len(flat))[:_bs])
+                idx = rng.permutation(len(flat))[:_bs]     # numpy sample
                 batch = tuple(
-                    jax.tree_util.tree_map(lambda a: a[idx], x)
+                    jax.tree_util.tree_map(
+                        lambda a: jnp.asarray(a[idx]), x)
                     for x in _cols)
                 agent, opt_state, L, _AH = train_step(agent, opt_state, batch)
             L = float(L)
