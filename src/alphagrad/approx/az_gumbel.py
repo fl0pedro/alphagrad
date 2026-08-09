@@ -1037,6 +1037,8 @@ def rollout_value(state, carry, depth):
     """
     for _ in range(depth):
         legal = PT.legal(VALID)
+        if os.environ.get("ALPHAGRAD_FORCE_REV_ORDER", "0") == "1" and legal:
+            legal = [max(legal)]   # rev: highest first
         if not legal:
             break
         vlog, out, _v = _eval_node(state, carry)
@@ -1293,6 +1295,8 @@ def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
     sampled ~ w_hat (the improved beta at the root; None on the exact arm).
     """
     legal = PT.legal(VALID)
+    if os.environ.get("ALPHAGRAD_FORCE_REV_ORDER", "0") == "1" and legal:
+        legal = [max(legal)]   # rev: highest first
     vlog, head_out, v_root = _eval_node(state, carry)
     ctxs = head_out[1]
     la = np.array([int(v) - 1 for v in legal], dtype=np.int32)
@@ -1666,6 +1670,8 @@ def _run(args) -> int:
             with PT.branch():
                 while True:
                     _wlegal = PT.legal(VALID)
+                    if os.environ.get("ALPHAGRAD_FORCE_REV_ORDER", "0") == "1" and _wlegal:
+                        _wlegal = [max(_wlegal)]   # rev: highest first
                     if not _wlegal:
                         break
                     _wv = _wlegal[int(rng.integers(len(_wlegal)))]
@@ -1819,6 +1825,8 @@ def _run(args) -> int:
         _ep_chunks = 0
         while True:
             legal = PT.legal(VALID)
+            if os.environ.get("ALPHAGRAD_FORCE_REV_ORDER", "0") == "1" and legal:
+                legal = [max(legal)]   # rev: highest first
             if not legal:
                 break
             # The committed prefix + its LiveFaceStream tokenizer, BEFORE the

@@ -141,6 +141,15 @@ def build_legacy_sp_valid_mask(
     return jnp.array(sp_mask)
 
 
+# FORCE-REV (import-time constant so it is static under jit): with the
+# flag on, vertex_avail_at_step keeps only the HIGHEST remaining vertex.
+import os as _os
+_FORCE_REV = _os.environ.get("ALPHAGRAD_FORCE_REV_ORDER", "0") == "1"
+if _FORCE_REV:
+    print("[cfg] FORCE REV ORDER: vertex choice pinned to reverse "
+          "elimination; only approximations are learned", flush=True)
+
+
 def build_vertex_valid_static(valid_vertices, total_v: int):
     """Static per-vertex 0/1 mask for "this vertex can be eliminated at all"."""
     arr = np.zeros(total_v, dtype=np.float32)
@@ -163,7 +172,16 @@ def vertex_avail_at_step(state, vertex_valid_static, total_v: int, num_valid: in
     already_chosen = (
         jnp.zeros(total_v, dtype=jnp.float32).at[chosen - 1].add(active)
     )
-    return vertex_valid_static * (1.0 - jnp.clip(already_chosen, 0.0, 1.0))
+    avail = vertex_valid_static * (1.0 - jnp.clip(already_chosen, 0.0, 1.0))
+    if _FORCE_REV:
+        # Keep ONLY the highest-indexed available vertex ('rev' order:
+        # [n, ..., 2, 1]). All-zero avail (terminal) stays all-zero:
+        # argmax lands on 0 and avail[0] is 0 there.
+        _score = avail * (jnp.arange(total_v, dtype=jnp.float32) + 1.0)
+        _top = jnp.argmax(_score)
+        avail = jnp.zeros_like(avail).at[_top].set(
+            (avail[_top] > 0).astype(avail.dtype))
+    return avail
 
 
 # ---------------------------------------------------------------------------
