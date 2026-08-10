@@ -55,6 +55,13 @@ def spawn_measure_pool(args_dict: dict, *, n_actors: int, exec_on_gpu: bool,
             rt["env_vars"] = {
                 "CUDA_VISIBLE_DEVICES": str(first_gpu + idx),
                 "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                # Measurement semantics must not depend on the TRAINER process's
+                # allocator: an inherited XLA_PYTHON_CLIENT_ALLOCATOR=platform puts
+                # raw cudaMalloc/cudaFree in the timed region (154us -> 379us, 2.46x
+                # flat, probe jobs 59598/59599) and breaks clear_memory_stats() so
+                # peak_memory silently becomes the STATIC estimate. Pin the default
+                # (BFC) allocator in every measure actor.
+                "XLA_PYTHON_CLIENT_ALLOCATOR": "default",
                 "ALPHAGRAD_MEASURE_ACTOR": "1",
             }
         return {"runtime_env": rt, "num_gpus": 0}
