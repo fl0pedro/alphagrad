@@ -165,6 +165,24 @@ class ParetoArchive:
         # and would spuriously dominate the front + inflate the HV box).
         if np.any(g == _SENTINEL_OBJ_VALUE) or not np.any(g != 0.0):
             return False
+        # QUALITY GATE AT INSERTION (sibling audit 2026-08-10): the reward
+        # gate never guarded the archive, so destroyed plans (quality 0.0)
+        # sat on the front as fake best-cost points on BOTH arms. A
+        # sub-gate candidate is not a usable Pareto point -- its cost was
+        # obtained by not computing the gradient. Uses the same env var as
+        # the reward gate; unset/0 keeps the historical behaviour.
+        import os as _os
+        try:
+            _qmin = float(_os.environ.get(
+                "ALPHAGRAD_QUALITY_GATE_MIN", "0") or 0.0)
+        except ValueError:
+            _qmin = 0.0
+        if _qmin > 0.0:
+            for _k, _nm in enumerate(self.obj_names):
+                if "cos" in _nm or "quality" in _nm:
+                    if g[_k] < _qmin:
+                        return False
+                    break
         for p in self.pts:
             # dominated by, or objective-identical to, an existing front point
             if np.allclose(g, p) or (np.all(p >= g) and np.any(p > g)):
