@@ -714,6 +714,43 @@ LIVE_FACES = build_live_face_stream(
 _live_face, _live_face_count = make_face_callbacks(
     LIVE_FACES, window=MAX_DELTA_TOKENS, prof_sink=None)
 
+# ---------------- #109: bucket-compiled face width (search hot path) -------
+# `_face_plan` used to be jitted at the CONFIGURED face bound (2538 on the
+# TLM targets) although a vertex has ~1-8 live faces: the while_loop already
+# runs the ACTUAL count, but every draw still uploaded the (prefix,
+# MAX_FACES, SLOTS, 3) history wires, carried MAX_FACES-wide loop state
+# through every pure_callback, and shipped MAX_FACES-wide outputs back to
+# the host -- >99.9% padding. Each draw is now padded to the smallest bucket
+# in {2, 4, 8, 32} (fallback: ENV_MAX_FACES) covering BOTH the drawn
+# vertex's live count and the widest face slot the committed prefix uses
+# (history shares the face axis), and jitted once per bucket via the face
+# head's STATIC max_faces. Outputs are re-padded to ENV_MAX_FACES on the
+# host with the exact bytes the unbucketed call produces for never-visited
+# faces (see common/face_buckets.py), so replay storage, the loss and the
+# PlanTokenizer wires are byte-identical either way.
+# ALPHAGRAD_GAZ_FACE_BUCKETS=0 restores the single-shape path.
+from alphagrad.approx.common.face_buckets import (      # noqa: E402
+    bucket_width, hist_face_width, pad_face_outputs, with_face_width)
+
+_FACE_BUCKETS_ON = (os.environ.get("ALPHAGRAD_GAZ_FACE_BUCKETS", "1") == "1"
+                    and not _EXACT_ARM)
+_BUCKET_AGENT_CACHE: dict = {}
+
+
+def _agent_for_face_width(fb):
+    """The CURRENT module-global agent with the face head's static width
+    rebound to ``fb`` -- params shared, one `_face_plan` compile per width.
+    Re-derived whenever `train_step`/PopArt rebinds `agent` (the cache entry
+    keeps the source agent so staleness is an identity check, not a leak
+    hazard: at most one superseded params set per bucket, replaced on the
+    next draw)."""
+    ent = _BUCKET_AGENT_CACHE.get(int(fb))
+    if ent is not None and ent[0] is agent:
+        return ent[1]
+    ag2 = with_face_width(agent, int(fb))
+    _BUCKET_AGENT_CACHE[int(fb)] = (agent, ag2)
+    return ag2
+
 # WARM THE QUANT HARDWARE SCAN EAGERLY, before anything is traced. Its own
 # docstring demands it ("Warm this once at build (eagerly, before any jit) so
 # the jnp.dot probes never run under trace") and PPO does it in main(). AZ has
@@ -1200,12 +1237,19 @@ def _check_distinct_observations(cands):
 
 
 # ---------------------------------------------------------------- Gumbel root search
-def _draw_face_sequence(vertex, head_out, carry, prefix_arrays, rng):
+def _draw_face_sequence(vertex, head_out, carry, prefix_arrays, rng,
+                        n_live=None, hist_w=0):
     """ONE i.i.d. face-sequence draw F ~ beta for ``vertex`` at the committed
     prefix -- the SAME `_face_plan` call the old commit path made, so the
     chunks the head reads and the wires it emits are byte-identical to PPO's.
     Returns a host dict carrying the wires plus everything `_face_replay`
-    needs to re-score the draw in the loss."""
+    needs to re-score the draw in the loss.
+
+    ``n_live`` is the caller's authoritative face count for ``vertex`` (from
+    the per-decision `face_keys_of` enumeration) and ``hist_w`` the widest
+    face slot the committed prefix uses: together they pick the #109 compile
+    bucket. ``n_live=None`` (or ALPHAGRAD_GAZ_FACE_BUCKETS=0) keeps the old
+    single-shape ENV_MAX_FACES path."""
     _o_arr, _sp_h, _f_h, _s_h, _n = prefix_arrays
     # FRESH PREFIX TOKENIZER PER DRAW. `chunk()`'s speculative eliminations
     # force LazyEdge memos IN PLACE on the CACHED prefix tokenizer (the
@@ -1222,20 +1266,53 @@ def _draw_face_sequence(vertex, head_out, carry, prefix_arrays, rng):
     LIVE_FACES._prefix.clear()
     _avail = np.zeros((TOTAL_V,), np.float32)
     _avail[int(vertex) - 1] = 1.0
+    _key = jax.random.PRNGKey(int(rng.integers(2 ** 31)))
+    # #109: pick the compile bucket. The width must cover the CURRENT
+    # vertex's enumeration (or the while_loop would silently truncate) AND
+    # the widest face slot any committed decision wrote (the history wires
+    # share the face axis and ride into the same jit).
+    _fb = int(ENV_MAX_FACES)
+    _ag = agent
+    _f_use, _s_use = _f_h, _s_h
+    if _FACE_BUCKETS_ON and n_live is not None:
+        _fb = bucket_width(max(int(n_live), int(hist_w)), int(ENV_MAX_FACES))
+        if _fb < int(ENV_MAX_FACES):
+            _ag = _agent_for_face_width(_fb)
+            _f_use = np.ascontiguousarray(_f_h[:, :_fb])
+            _s_use = np.ascontiguousarray(_s_h[:, :_fb])
     (fr, fs, fa, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de,
      _vctx, _feat, face_ent, _vi) = _face_plan(
-        agent, head_out, carry.enc, jnp.asarray(_avail), carry.residual,
+        _ag, head_out, carry.enc, jnp.asarray(_avail), carry.residual,
         jnp.asarray(_o_arr), jnp.asarray(_sp_h),
-        jnp.asarray(_n, jnp.int32), jnp.asarray(_f_h), jnp.asarray(_s_h),
-        jax.random.PRNGKey(int(rng.integers(2 ** 31))))
+        jnp.asarray(_n, jnp.int32), jnp.asarray(_f_use), jnp.asarray(_s_use),
+        _key)
     assert int(_vi) == int(vertex) - 1, (
         f"the one-hot availability mask did not force the searched vertex: "
         f"head picked {int(_vi) + 1}, search wanted {int(vertex)}")
-    return {"fr": np.asarray(fr, np.int32), "fs": np.asarray(fs, np.int32),
-            "fa": jax.tree_util.tree_map(np.asarray, fa),
-            "f_pair": np.asarray(f_pair), "f_comp": np.asarray(f_comp),
-            "f_valid": np.asarray(f_valid),
-            "f_cnt": np.asarray(f_cnt, np.int32),
+    fr = np.asarray(fr, np.int32)
+    fs = np.asarray(fs, np.int32)
+    fa = jax.tree_util.tree_map(np.asarray, fa)
+    f_pair = np.asarray(f_pair)
+    f_comp = np.asarray(f_comp)
+    f_valid = np.asarray(f_valid)
+    f_cnt = np.asarray(f_cnt, np.int32)
+    if _fb < int(ENV_MAX_FACES):
+        # The callback count and the caller's key list must agree, or the
+        # bucket could be too narrow and the loop would truncate SILENTLY --
+        # the same divergence `_assert_face_accounting` catches at commit,
+        # surfaced here for every draw.
+        _ndec = int(np.sum(f_valid > 0.5))
+        assert _ndec == int(n_live), (
+            f"vertex {vertex}: bucketed draw decided {_ndec} faces at width "
+            f"{_fb} but the authoritative enumeration has {n_live} -- "
+            f"face_count_fn and face_keys_of disagree")
+        (fr, fs, fa, f_pair, f_comp, f_valid, f_cnt) = pad_face_outputs(
+            int(ENV_MAX_FACES), fr, fs, fa, f_pair, f_comp, f_valid, f_cnt)
+    return {"fr": fr, "fs": fs,
+            "fa": fa,
+            "f_pair": f_pair, "f_comp": f_comp,
+            "f_valid": f_valid,
+            "f_cnt": f_cnt,
             "f_dt": np.asarray(f_dt, np.int32),
             "f_de": np.asarray(f_de, np.int32),
             "face_ent": float(face_ent)}
@@ -1320,6 +1397,13 @@ def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
     # evaluation per round, 2x depth for survivors).
     plan = phase_plan(m, deepen=_GAZ_DEEPEN,
                       rollout_depth=(A.rollout_depth if _GAZ_DEEPEN else 0))
+    # #109: the committed prefix's used face width, ONCE per decision -- with
+    # the per-vertex live counts (via `face_keys_of`) it selects each draw's
+    # compile bucket.
+    _hist_wd = 0
+    if _FACE_BUCKETS_ON and not _EXACT_ARM:
+        _hist_wd = hist_face_width(prefix_arrays[2], prefix_arrays[3],
+                                   int(prefix_arrays[4]))
     surv = list(cands)
     for _phase, (_n_expect, _n_draws, _depth) in enumerate(plan):
         assert len(surv) == _n_expect, (
@@ -1339,8 +1423,9 @@ def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
                 dr = None
                 fr = fs = None
                 if not (_GAZ_DEEPEN or _EXACT_ARM):
-                    dr = _draw_face_sequence(c["v"], head_out, carry,
-                                             prefix_arrays, rng)
+                    dr = _draw_face_sequence(
+                        c["v"], head_out, carry, prefix_arrays, rng,
+                        n_live=len(face_keys_of(c["v"])), hist_w=_hist_wd)
                     fr, fs = dr["fr"], dr["fs"]
                 # ONE branch per evaluation covers the expansion AND its
                 # whole rollout chain: _Snapshot.__exit__ truncates the
@@ -1452,8 +1537,9 @@ def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
             # (one depth per target -- the w_hat ranking must not inherit the
             # depth artifact either).
             for _k in range(_DEEPEN_FACE_K):
-                dr = _draw_face_sequence(chosen["v"], head_out, carry,
-                                         prefix_arrays, rng)
+                dr = _draw_face_sequence(
+                    chosen["v"], head_out, carry, prefix_arrays, rng,
+                    n_live=len(face_keys_of(chosen["v"])), hist_w=_hist_wd)
                 with PT.branch():
                     st2, cy2, d = _step((state, carry, ctxs), chosen["v"],
                                         dr["fr"], dr["fs"],
@@ -1823,12 +1909,16 @@ def _run(args) -> int:
         _prev_owner = -1
         _ep_faces = 0
         _ep_chunks = 0
+        # #109 smoke hook: per-decision wall time (search + commit), default
+        # off -- the buckets-on/off A/B reads these lines.
+        _dtl = os.environ.get("ALPHAGRAD_GAZ_DECISION_TIMELOG", "0") == "1"
         while True:
             legal = PT.legal(VALID)
             if os.environ.get("ALPHAGRAD_FORCE_REV_ORDER", "0") == "1" and legal:
                 legal = [max(legal)]   # rev: highest first
             if not legal:
                 break
+            _t_dec = time.perf_counter() if _dtl else 0.0
             # The committed prefix + its LiveFaceStream tokenizer, BEFORE the
             # search: under Sampled AZ the SEARCH draws face sequences (K per
             # surviving vertex, the widened halving budget), so it needs the
@@ -1917,6 +2007,9 @@ def _run(args) -> int:
                         f"dynamics and the measured graph disagree")
             _gold_stream += list(d["tokens"])
             _gold_ids += list(d["eqn_ids"])
+            if _dtl:
+                print(f"[gaz][dtime] ep={ep} d={_dstep} v={v} nf={_nf} "
+                      f"{time.perf_counter() - _t_dec:.3f}s", flush=True)
             steps.append({
                 "enc_M": np.asarray(_pre_for_loss[0].enc.M),
                 "enc_I": np.asarray(_pre_for_loss[0].enc.I),
