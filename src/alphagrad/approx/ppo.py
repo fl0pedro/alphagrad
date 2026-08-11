@@ -1837,8 +1837,21 @@ class Agent(eqx.Module):
 
                     return lax.cond(i < nb, _run, _skip, c)
 
+                # REMAT the chunk body. Without it the scan stores every
+                # step's per-layer activations for the backward -- and the
+                # SKIPPED chunks store a zero block of exactly the same
+                # shape, because `cond`'s partial-eval joins both branches'
+                # residuals. That residual traffic is O(window) no matter how
+                # few chunks actually run, which is why shrinking the chunk
+                # count alone left a floor. With remat each chunk stores only
+                # its boundary carry and recomputes its forward, so a skipped
+                # chunk costs a predicate.
+                _body = (jax.checkpoint(_chunk_d)
+                         if os.environ.get(
+                             "ALPHAGRAD_LOSS_EXTEND_REMAT", "0") != "0"
+                         else _chunk_d)
                 (M2, I2, ch2, nv2), rows_b = lax.scan(
-                    _chunk_d, c0,
+                    _body, c0,
                     (jnp.arange(nb_max, dtype=jnp.int32),
                      b_toks, b_eqns, b_valid))
                 rows = rows_b.reshape(nb_max * C, -1)[:W]
@@ -2365,33 +2378,64 @@ class Agent(eqx.Module):
 
         # scan, not a python loop: F is the provable bound (196 here), and
         # unrolling it multiplied the program by F. scan keeps reverse-mode
-        # AD (while_loop would not); with `face_bound` the slots past the last
-        # live face cost a predicate each instead of a full head evaluation.
-        def _scan_f(acc, f):
-            def _run(acc):
-                logp, ent, arity = acc
-                span = (cum[jnp.clip(ends[f], 0, rows.shape[0])]
-                        - cum[jnp.clip(starts[f], 0, rows.shape[0])])
-                summ = span / jnp.maximum(f_cnt[f].astype(jnp.float32), 1.0)
-                lp, e, ar, _sp, _od = pol.evaluate_face(
-                    v_context, features, factor_tables, fa, f,
-                    f_pair[f], f_comp[f], f_valid[f], face_context=summ,
-                    op_legality_override=op_legality_override)
-                return (logp + lp, ent + e, arity + ar)
+        # AD (while_loop would not).
+        def _one_face(acc, f, gate=None):
+            logp, ent, arity = acc
+            span = (cum[jnp.clip(ends[f], 0, rows.shape[0])]
+                    - cum[jnp.clip(starts[f], 0, rows.shape[0])])
+            summ = span / jnp.maximum(f_cnt[f].astype(jnp.float32), 1.0)
+            lp, e, ar, _sp, _od = pol.evaluate_face(
+                v_context, features, factor_tables, fa, f,
+                f_pair[f], f_comp[f], f_valid[f], face_context=summ,
+                op_legality_override=op_legality_override)
+            if gate is not None:
+                _z = jnp.zeros((), jnp.float32)
+                lp = jnp.where(gate, lp, _z)
+                e = jnp.where(gate, e, _z)
+                ar = jnp.where(gate, ar, _z)
+            return (logp + lp, ent + e, arity + ar)
 
-            if face_bound is None:
-                return _run(acc), None
-            # Skipping f >= face_bound is EXACT, not an approximation: the
-            # head's gates SELECT rather than multiply, so a slot with
-            # `face_valid == 0` returns (0, 0, 0) and contributes a zero
-            # cotangent to every parameter. `face_bound` is one past the last
-            # index any sample in the minibatch marks valid, so nothing that
-            # could contribute is skipped.
-            return lax.cond(f < face_bound, _run, lambda a: a, acc), None
+        _acc0 = (jnp.array(0.0), jnp.array(0.0), jnp.array(0.0))
+        K = int(os.environ.get("ALPHAGRAD_FACE_REPLAY_BLOCK", "64"))
+        if face_bound is None or K <= 0 or K >= F:
+            (logp, ent, arity), _ = lax.scan(
+                lambda a, f: (_one_face(a, f), None), _acc0, jnp.arange(F))
+            return logp, ent, arity
+
+        # BLOCKED gate. Skipping f >= face_bound is EXACT, not an
+        # approximation: the head's gates SELECT rather than multiply, so a
+        # slot with `face_valid == 0` returns (0, 0, 0) and contributes a zero
+        # cotangent to every parameter, and `face_bound` is one past the last
+        # index any sample in the minibatch marks valid.
+        #
+        # The gate is per BLOCK, not per face, and that is the whole point: a
+        # `lax.cond` per face turned all F=2538 iterations into device-side
+        # branches, which measured SLOWER than just running the (tiny) head --
+        # 2538 predicates cost more than 2538 small MLPs. One predicate per
+        # 64-face block leaves ceil(F/K) = 40 of them and one live block, and
+        # the faces inside a live block run as a plain scan.
+        #
+        # Faces are still visited in increasing f, and the padded tail of the
+        # last block is gated to an exact 0 before it is added, so the
+        # accumulation order -- and therefore the float result -- is the same
+        # as the unblocked scan's.
+        nblk = -(-F // K)
+        nlive = (jnp.maximum(jnp.asarray(face_bound, jnp.int32), 0)
+                 + K - 1) // K
+
+        def _blk(acc, b):
+            def _run(acc):
+                def _inner(a, k):
+                    fi = b * K + k
+                    return _one_face(a, jnp.minimum(fi, F - 1),
+                                     gate=fi < F), None
+
+                return lax.scan(_inner, acc, jnp.arange(K, dtype=jnp.int32))[0]
+
+            return lax.cond(b < nlive, _run, lambda a: a, acc), None
 
         (logp, ent, arity), _ = lax.scan(
-            _scan_f, (jnp.array(0.0), jnp.array(0.0), jnp.array(0.0)),
-            jnp.arange(F))
+            _blk, _acc0, jnp.arange(nblk, dtype=jnp.int32))
         return logp, ent, arity
 
     def evaluate_action_dynamic(
