@@ -5091,11 +5091,30 @@ def main():
             _BASE_OWN = env.base_owners()
         except Exception:
             _BASE_OWN = None
-        init_enc_state = _carry_stream.init_carry(
+        _init_pre = _carry_stream.init_carry(
             agent, _BASE_TOK, _BASE_EQN, _BASE_N,
             window=_BASE_W, total_v=total_v, embd_dim=args.embd_dim,
             base_owners=_BASE_OWN,
         )
+        # The scan carries the encoder state at TWO points, PRE and POST this
+        # step's delta, because they are the same two things every iteration
+        # already computed -- twice. See `step_fn`'s bootstrap block. POST is
+        # seeded here with what iteration 0's extend used to do: step 0's
+        # delta is whatever `env_state` carries, with owner -1 (no previous
+        # elimination emitted it).
+        _init_post = _carry_stream.advance(
+            agent, *_init_pre,
+            env_state.delta_tokens, env_state.delta_eqns,
+            env_state.delta_count,
+            # `delta_owner` as step_fn computes it on iteration 0, spelled
+            # out: `elim_order` is all zeros at scan entry, so its lookup
+            # arm is 0 and the step_count == 0 arm is -1.
+            jnp.where(env_state.step_count > 0,
+                      jnp.zeros((), jnp.int32),
+                      jnp.array(-1, jnp.int32)).astype(jnp.int32),
+            window=MAX_DELTA_TOKENS,
+        )
+        init_enc_state = _init_pre + _init_post
 
         def step_fn(carry, k):
             state, residual_state, elim_order, enc_state = carry
@@ -5104,7 +5123,13 @@ def main():
                 state, vertex_valid_static, total_v, num_valid
             )
 
-            enc_carry, vmem_s, vmem_c = enc_state
+            # PRE (synced through the PREVIOUS delta) and POST (synced through
+            # THIS step's delta). POST is not recomputed here: the previous
+            # iteration's value-bootstrap already extended the carry by
+            # exactly this delta, under exactly this owner, and threading it
+            # forward is what makes that extend cost once instead of twice.
+            # See the bootstrap block below for the proof of equality.
+            enc_carry, vmem_s, vmem_c, enc_carry2, vmem_s2, vmem_c2 = enc_state
             # THIS step's delta was emitted by the PREVIOUS step's elimination
             # (empty at step 0 — the base stream is already consumed). It
             # arrives from the env as its own buffer with its own exact
@@ -5120,11 +5145,9 @@ def main():
             # Phase-0: everything since the previous mark is scan glue
             # (avail mask, key split, the delta unpack above).
             delta_tok = _pp_mark("prof/scanmisc", delta_tok)
-            enc_carry2, vmem_s2, vmem_c2 = _carry_stream.advance(
-                agent, enc_carry, vmem_s, vmem_c,
-                delta_tok, delta_eqn, delta_count, delta_owner,
-                window=MAX_DELTA_TOKENS,
-            )
+            # Kept as a mark so the key still reports: `prof/encode` is now
+            # the cost of NOT extending here, i.e. ~0. The extend it used to
+            # time is `prof/encode_bootstrap`, run once.
             enc_carry2, vmem_s2, vmem_c2 = _pp_mark(
                 "prof/encode", (enc_carry2, vmem_s2, vmem_c2))
             precomputed = _carry_stream.heads(
@@ -5305,17 +5328,38 @@ def main():
             pref_arg = preference if args.preference_conditioned else None
             # Bootstrap value at next_state: extend the post-decision carry by
             # the delta the JUST-CHOSEN elimination emitted -- which is
-            # exactly what next_state carries. This extension is recomputed by
-            # the next scan iteration (kept self-contained rather than
-            # threading heads across iterations); deltas are O(hundreds) of
-            # tokens, so the duplicate extend is cheap.
-            _, nv_s, nv_c = _carry_stream.advance(
+            # exactly what next_state carries.
+            #
+            # This used to be thrown away and recomputed by the next scan
+            # iteration, on the reasoning that "deltas are O(hundreds) of
+            # tokens, so the duplicate extend is cheap". The deltas ARE
+            # O(hundreds) (TLM mean 94) but the extend is O(WINDOW), and the
+            # duplicate measured 30.5 s/episode = 20.9%. So keep the carry
+            # and thread it: it IS the next iteration's post-delta state.
+            #
+            # Equality, term by term, at iteration t -> t+1:
+            #   the scan carries next_state, so state_{t+1}.delta_* is the
+            #     next_state.delta_* fed here;
+            #   owner_{t+1} = elim_order[step_count_{t+1} - 1] =
+            #     elim_order[t] = vertex_idx_t, which is what is passed here
+            #     (elim_order was written at index step_count = t just above);
+            #   the base carry is enc_carry2/vmem2 in both cases.
+            # Same function, same inputs, so the same bits -- this is a
+            # deletion of recomputation, not a change of semantics.
+            nxt_carry, nv_s_raw, nv_c_raw = _carry_stream.advance(
                 agent, enc_carry2, vmem_s2, vmem_c2,
                 next_state.delta_tokens, next_state.delta_eqns,
                 next_state.delta_count, vertex_idx.astype(jnp.int32),
                 window=MAX_DELTA_TOKENS,
             )
-            nv_s, nv_c = _pp_mark("prof/encode_bootstrap", (nv_s, nv_c))
+            # The UNMARKED triple is what gets threaded (see next_enc_state):
+            # `_pp_mark` adds a host-produced 0.0 to every numeric leaf, so
+            # threading the marked one would put two marks on the value the
+            # next iteration re-marks as `prof/encode`, where today there is
+            # exactly one. Timing is unaffected -- the mark still forces the
+            # extend to be complete before its callback fires.
+            nv_s, nv_c = _pp_mark(
+                "prof/encode_bootstrap", (nv_s_raw, nv_c_raw))
             _, _, next_value = _carry_stream.heads(
                 agent, nv_s, nv_c,
                 vertex_features=vertex_features,
@@ -5390,7 +5434,10 @@ def main():
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
             )
-            next_enc_state = (enc_carry2, vmem_s2, vmem_c2)
+            # (PRE, POST) for the next iteration: this step's POST becomes its
+            # PRE, and the bootstrap above is already its POST.
+            next_enc_state = (enc_carry2, vmem_s2, vmem_c2,
+                              nxt_carry, nv_s_raw, nv_c_raw)
             return (
                 (next_state, new_residual, elim_order, next_enc_state),
                 (transition, raw_rewards),
