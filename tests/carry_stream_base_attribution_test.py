@@ -37,7 +37,8 @@ class _StubAgent:
     def carry_init(self):
         return jnp.zeros((), jnp.float32)
 
-    def encode_extend(self, carry, tokens, eqns, count, *, window, start):
+    def encode_extend(self, carry, tokens, eqns, count, *, window, start,
+                      chunk=None, budget=None):
         n = tokens.shape[0]
         rows = jnp.ones((n, EMBD), jnp.float32)
         valid = (jnp.arange(n) < count).astype(jnp.float32)
