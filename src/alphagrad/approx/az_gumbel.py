@@ -1605,8 +1605,10 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
             la, lam, pi, vt, vm, s_li, s_vidx, s_w, s_fp, s_fc, s_fv,
             s_cnt, s_dt, s_de, s_fa):
         carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
+        # chunk=0: AZ's loss is reverse-differentiated through this extend
+        # too, and the dynamic trip count is a lax.while_loop.
         c2, vs2, vc2 = _cs.advance(agent, carry, vs, vc, dt, de, dc, ow,
-                                   window=MAX_DELTA_TOKENS)
+                                   window=MAX_DELTA_TOKENS, chunk=0)
         vlog, ctx, v3 = _cs.heads(agent, vs2, vc2, vertex_features=VFEAT,
                                   residual_state=rs, preference=None)
         lg = vlog[la]

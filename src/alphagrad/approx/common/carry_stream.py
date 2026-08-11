@@ -37,8 +37,12 @@ def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
     as long as the base is.
     """
     enc0 = agent.carry_init()
+    # chunk=0: the base window IS the base length (count == window), so a
+    # dynamic trip count has nothing to skip -- and this runs once per
+    # episode, where the flat scan is the cheaper thing to compile.
     enc1, rows0, valid0, eqns0 = agent.encode_extend(
         enc0, base_tokens, base_eqns, base_count, window=window, start=0,
+        chunk=0,
     )
     # BASE ATTRIBUTION. `eqns0` are SEGMENT ids from a stream-global running
     # counter -- graphax.jaxpr.last_eqn_ids is explicit that they are "built
@@ -74,16 +78,22 @@ def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
 
 
 def advance(agent, enc_carry, vmem_sums, vmem_counts,
-            delta_tokens, delta_eqns, delta_count, owner, *, window):
+            delta_tokens, delta_eqns, delta_count, owner, *, window,
+            chunk=None):
     """Extend the carry by one step's delta; returns the new
     ``(enc_carry, vmem_sums, vmem_counts)``.
 
     ``owner`` is the vertex whose elimination emitted this delta -- every row
     of it belongs to that vertex's memory slot.
+
+    ``chunk`` is forwarded to :meth:`Agent.encode_extend`: it bounds how much
+    of the (mostly empty) delta window is actually scanned. ``None`` takes the
+    ``ALPHAGRAD_EXTEND_CHUNK`` default; REVERSE-DIFFERENTIATED callers must
+    pass ``0``, because the dynamic trip count is a ``lax.while_loop``.
     """
     carry2, rows, valid, eqns = agent.encode_extend(
         enc_carry, delta_tokens, delta_eqns, delta_count,
-        window=window, start=0,
+        window=window, start=0, chunk=chunk,
     )
     ids = jnp.where(eqns >= 0, owner, -1)
     sums2, counts2 = _vmem.update_ids(

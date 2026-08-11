@@ -1509,12 +1509,18 @@ class Agent(eqx.Module):
         )
 
     def encode_extend(self, carry, tokens_buf, eqn_ids_buf, count, *, window,
-                      start=None):
+                      start=None, chunk=None):
         """Extend the palimpsa carry by ``count`` tokens read from
         ``tokens_buf`` at ``carry.pos`` (fixed static ``window``; pad steps
         freeze the carry, so the valid prefix is bitwise-independent of the
         window size). Returns ``(new_carry, rows, valid, eqn_window)`` with
         ``rows`` (window, E) zeroed on invalid steps.
+
+        ``chunk`` bounds how many of those pad steps are actually SCANNED --
+        see :meth:`_extend_sequential`. ``None`` reads
+        ``ALPHAGRAD_EXTEND_CHUNK`` (0 = scan the whole window, the original
+        behaviour); pass ``0`` explicitly on any path that is
+        reverse-differentiated.
 
         Byte-identical math to the PalimpsaMixer/EncoderLayer stack with ONE
         deliberate exception: the relational forget-gate features are CAUSAL
@@ -1553,7 +1559,8 @@ class Agent(eqx.Module):
                 if _mode != "1":
                     return seq
             return par
-        return self._extend_sequential(carry, toks, eqns, valid, count)
+        return self._extend_sequential(carry, toks, eqns, valid, count,
+                                       chunk=chunk)
 
     def _extend_parallel(self, carry, toks, eqns, valid, count):
         """Blocked parallel extend: scan across fixed-size blocks, one
@@ -1667,7 +1674,7 @@ class Agent(eqx.Module):
                              pos=carry.pos + count)
         return new_carry, rows, valid, eqns
 
-    def _extend_sequential(self, carry, toks, eqns, valid, count):
+    def _extend_sequential(self, carry, toks, eqns, valid, count, chunk=None):
         layers = self.encoder.layers
         eq_arange = jnp.arange(MAX_EQNS, dtype=jnp.int32)
 
@@ -1723,12 +1730,78 @@ class Agent(eqx.Module):
         # K bodies per loop iteration into one fused kernel; values are
         # step-identical (unrolling never reassociates), so rollout/loss
         # parity is untouched.
-        (M2, I2, ch2, nv2), rows = lax.scan(
-            _step,
-            (carry.M, carry.I, carry.cumhist, carry.nvalid),
-            (toks, eqns, valid),
-            unroll=int(os.environ.get("ALPHAGRAD_EXTEND_UNROLL", "8")),
-        )
+        unroll = int(os.environ.get("ALPHAGRAD_EXTEND_UNROLL", "8"))
+        c0 = (carry.M, carry.I, carry.cumhist, carry.nvalid)
+        W = toks.shape[0]
+        C = int(os.environ.get("ALPHAGRAD_EXTEND_CHUNK", "0")
+                if chunk is None else chunk)
+
+        if C <= 0 or C >= W:
+            (M2, I2, ch2, nv2), rows = lax.scan(
+                _step, c0, (toks, eqns, valid), unroll=unroll)
+        else:
+            # DYNAMIC TRIP COUNT. The scan above is `window` long no matter
+            # what `count` is -- on the TLM flagship a median 78-token delta
+            # paid for 16384 steps, and `prof/encode` was dead constant at
+            # 191.0/191.0/192.1 ms (mean/p95/max) because of it: 21% + 12% of
+            # the episode spent scanning zeros.
+            #
+            # Why a while_loop of chunk-sized scans and NOT a `lax.switch`
+            # over a bucket grid: the rollout that owns this cost is
+            # `@jax.vmap`-decorated (rollout_fn), and vmap lowers a switch on
+            # a BATCHED index to `select_n` over every branch -- measured:
+            # all 7 grid scans, 16384 included, survive into the jaxpr, so
+            # bucketing by switch would have cost MORE, not less. A while_loop
+            # keeps one compiled body (no retrace per bucket at all) and runs
+            # ceil(count/C) of them.
+            #
+            # Bit-identical, not approximately: `_step` FREEZES the whole
+            # carry on an invalid step (`where(ok, M_l, M[li])`, `cumhist +
+            # 0*`, `nvalid + 0`, `row = 0`), so the steps this skips are
+            # provably no-ops, and `rows` is written into the SAME full-width
+            # zero buffer the scan produced, so every downstream reduction
+            # (segment_sum, cumsum, masked mean) sees the identical array.
+            # NEVER truncates: `count` is already clipped to `window` by
+            # `encode_extend`, so an over-long delta still takes the existing
+            # truncation path and its telemetry, untouched.
+            #
+            # Reverse-mode AD does not work through `lax.while_loop`, so the
+            # differentiated paths (the PPO loss, `_face_replay`) pass
+            # `chunk=0` and keep the flat scan. That is a loud failure, not a
+            # silent one, if a new differentiated caller forgets.
+            nb_max = -(-W // C)
+            pad = nb_max * C - W
+            if pad:
+                toks_p = jnp.concatenate(
+                    [toks, jnp.zeros((pad,), toks.dtype)])
+                eqns_p = jnp.concatenate(
+                    [eqns, jnp.full((pad,), -1, eqns.dtype)])
+                valid_p = jnp.concatenate(
+                    [valid, jnp.zeros((pad,), valid.dtype)])
+            else:
+                toks_p, eqns_p, valid_p = toks, eqns, valid
+            nb = jnp.minimum(
+                (jnp.maximum(count, 0) + C - 1) // C, nb_max).astype(jnp.int32)
+
+            def _chunk(st):
+                i, M, I, ch, nv, rows = st
+                off = i * C
+
+                def _sl(a):
+                    return lax.dynamic_slice(a, (off,), (C,))
+
+                (M2, I2, ch2, nv2), r = lax.scan(
+                    _step, (M, I, ch, nv),
+                    (_sl(toks_p), _sl(eqns_p), _sl(valid_p)), unroll=unroll)
+                return (i + 1, M2, I2, ch2, nv2,
+                        lax.dynamic_update_slice(rows, r, (off, 0)))
+
+            _i, M2, I2, ch2, nv2, rows = lax.while_loop(
+                lambda st: st[0] < nb, _chunk,
+                (jnp.zeros((), jnp.int32),) + c0
+                + (jnp.zeros((nb_max * C, self.embd_dim), jnp.float32),))
+            rows = rows[:W]
+
         new_carry = EncCarry(M=M2, I=I2, cumhist=ch2, nvalid=nv2,
                              pos=carry.pos + count)
         return new_carry, rows, valid, eqns
@@ -2202,9 +2275,11 @@ class Agent(eqx.Module):
         F = pol.max_faces
         f_cnt, f_toks, f_eqns = face_chunks
         total = jnp.sum(f_cnt.astype(jnp.int32))
+        # chunk=0: this is the LOSS side and it is reverse-differentiated
+        # (gradient reaches palimpsa through exactly this scan).
         _, rows, _valid, _e = self.encode_extend(
             enc_carry, f_toks, f_eqns, total,
-            window=MAX_DELTA_TOKENS, start=0)
+            window=MAX_DELTA_TOKENS, start=0, chunk=0)
         # Exclusive-prefix boundaries from the counts; pooled mean per span.
         # An empty chunk gives s == e -> zero context, matching the rollout's
         # `_face_encode` skip exactly.
@@ -5447,6 +5522,11 @@ def main():
             carry2, vs2, vc2 = _carry_stream.advance(
                 agent, carry, vs, vc, dtok, deqn, dcnt, owner,
                 window=MAX_DELTA_TOKENS,
+                # chunk=0: the loss is reverse-differentiated through this
+                # extend, and lax.while_loop has no reverse rule. The rollout
+                # gets the dynamic trip count; the update keeps the flat scan
+                # (its cost is prof/update's, a separate task).
+                chunk=0,
             )
             # carry2 is where the sampling side carry branched: the
             # stored pre-step carry advanced past the PREVIOUS delta.
