@@ -140,6 +140,151 @@ from alphagrad.transformer.encoder import RelationalMultiheadAttention
 from alphagrad.utils import entropy, explained_variance
 
 # ---------------------------------------------------------------------------
+# PHASE-0 POLICY-PATH ATTRIBUTION  (ALPHAGRAD_PROFILE_POLICY=1)
+# ---------------------------------------------------------------------------
+# env.py's `_PROF` covers the HOST phases only (`cb.*`, `faces.live_chunk`,
+# `oracle.*`). Everything else in an episode was a single undifferentiated
+# residual, and the per-decision policy cost was INFERRED from it by
+# subtraction rather than measured. This attributes it.
+#
+# Why callbacks and not a wall timer: `train_episode` is ONE
+# `eqx.filter_jit` region -- the rollout scan AND the PPO update epochs are
+# inside it -- so a host timer around the dispatch can only ever see the
+# episode total. The only way to get a boundary inside is to drop a host
+# timestamp there:
+#
+#   * an `io_callback` whose OPERAND is a cheap scalar reduction of the
+#     phase's output, so it cannot be scheduled before the phase finished
+#     and (being effectful) cannot be dead-code-eliminated -- a
+#     `pure_callback` here IS eliminated, because the only consumer of its
+#     result is an `optimization_barrier` output we drop, and JAX's DCE rule
+#     for that primitive drops the matching operand with it. Measured: 0
+#     host calls with `pure_callback`, 2 per mark with `io_callback`.
+#   * plus an `optimization_barrier` across the phase's outputs, so XLA
+#     cannot fuse work across the boundary and blur the two segments, and
+#   * the callback's RESULT -- an opaque runtime EXACT ZERO -- added into
+#     every array the phase produced. That add is a numeric identity but XLA
+#     cannot prove it (the value comes from the host), so every consumer of
+#     the phase's output is forced to wait for the mark. WITHOUT this the
+#     barrier alone is not enough: its token output is unused, JAX's DCE rule
+#     for `optimization_barrier` then drops the matching OPERAND, and the
+#     ordering constraint disappears -- the first version of this measured
+#     0.4 ms for an encode whose cost had been hoisted into the neighbouring
+#     segment.
+#
+# A mark is a REAL serialization of the device stream: it costs
+# a device->host->device round trip and it removes the overlap XLA would
+# otherwise get between adjacent phases. It is therefore strictly a
+# measurement mode, OFF BY DEFAULT, and the gate is read at TRACE time --
+# with it off not one extra HLO op is emitted and the compiled graph is
+# byte-identical to the uninstrumented one.
+#
+# Convention follows env.py's `_pf`: a mark CLOSES the segment since the
+# previous mark and attributes it to the mark's key. `key=None` only resets
+# the clock (used once per episode so the first segment isn't charged with
+# whatever preceded the episode).
+_PROFILE_POLICY = os.environ.get("ALPHAGRAD_PROFILE_POLICY", "0") == "1"
+_PP_LAST: list = [None]
+_PP_SINK: list = [None, None]
+
+
+def _pp_sinks():
+    if _PP_SINK[0] is None:
+        from alphagrad.approx.env import _prof_add, _prof_sample
+        _PP_SINK[0], _PP_SINK[1] = _prof_add, _prof_sample
+    return _PP_SINK
+
+
+def _pp_mark_host(key, x):
+    import time as _t
+    now = _t.perf_counter()
+    prev = _PP_LAST[0]
+    _PP_LAST[0] = now
+    if prev is not None and key is not None:
+        dt = now - prev
+        _add, _samp = _pp_sinks()
+        _add(key, dt)
+        _samp(key, dt)
+    a = np.asarray(x)
+    # io_callback's batching rule calls the host ONCE PER BATCH ELEMENT, so
+    # with num_envs > 1 the marks of the E envs interleave and the running
+    # clock splits one phase across E entries. The per-decision numbers are
+    # therefore only literal at --num-envs 1 (the flagship config); at E > 1
+    # read the per-key TOTALS, not the per-sample mean.
+    return np.float32(0.0) if a.ndim == 0 else np.zeros(a.shape[:1], np.float32)
+
+
+def _pp_mark(key, x):
+    """Timestamp the instant `x` is ready; return `x`, barriered.
+
+    No-op (and zero HLO) unless ALPHAGRAD_PROFILE_POLICY=1.
+    """
+    if not _PROFILE_POLICY:
+        return x
+    flat, treedef = jax.tree_util.tree_flatten(x)
+    arrs = [l for l in flat if hasattr(l, "shape") or hasattr(l, "dtype")]
+    if not arrs:
+        return x
+    # Anchor: a scalar the phase's output must be computed to produce. Summing
+    # a few leaves is cheaper than any of the phases being timed (the widest
+    # leaf here is a (16384,) int32 delta buffer).
+    acc = jnp.zeros((), jnp.float32)
+    for leaf in arrs[:4]:
+        acc = acc + jnp.sum(jnp.asarray(leaf).astype(jnp.float32))
+    from jax.experimental import io_callback as _io_callback
+    tok = _io_callback(
+        partial(_pp_mark_host, key),
+        jax.ShapeDtypeStruct((), jnp.float32),
+        acc,
+    )
+    out = list(lax.optimization_barrier(tuple(flat) + (tok,)))
+    tok2, leaves = out[-1], out[:-1]
+    gated = []
+    for leaf in leaves:
+        a = jnp.asarray(leaf) if hasattr(leaf, "dtype") else leaf
+        if hasattr(a, "dtype") and (jnp.issubdtype(a.dtype, jnp.floating)
+                                    or jnp.issubdtype(a.dtype, jnp.integer)):
+            gated.append(a + tok2.astype(a.dtype))
+        else:
+            gated.append(leaf)
+    return jax.tree_util.tree_unflatten(treedef, gated)
+
+
+def _pp_summary(samples: dict) -> str:
+    """`key n=.. mean=..ms p95=..ms tot=..s` for each timed phase."""
+    if not samples:
+        return ""
+    rows = []
+    for k, v in sorted(samples.items(), key=lambda kv: -sum(kv[1])):
+        a = np.asarray(v, np.float64)
+        rows.append(
+            f"{k} n={a.size} mean={a.mean() * 1e3:.1f}ms "
+            f"p95={np.percentile(a, 95) * 1e3:.1f}ms "
+            f"max={a.max() * 1e3:.1f}ms tot={a.sum():.1f}s")
+    return "\n  ".join(rows)
+
+
+def _pp_dist_summary(dists: dict, caps: dict) -> str:
+    """median / mean / p95 / max / occupancy for each measured distribution."""
+    if not dists:
+        return ""
+    rows = []
+    for k, v in sorted(dists.items()):
+        a = np.asarray(v, np.float64)
+        cap = caps.get(k)
+        occ = f" occ={a.mean() / cap * 100:.3f}%(cap={cap})" if cap else ""
+        # Coarse decile histogram against the cap (or the observed max).
+        top = float(cap) if cap else max(a.max(), 1.0)
+        hist, _ = np.histogram(a, bins=10, range=(0.0, top))
+        rows.append(
+            f"{k} n={a.size} median={np.median(a):.0f} mean={a.mean():.1f} "
+            f"p95={np.percentile(a, 95):.0f} p99={np.percentile(a, 99):.0f} "
+            f"max={a.max():.0f}{occ}\n      hist[0..{top:.0f}]="
+            + ",".join(str(int(h)) for h in hist))
+    return "\n  ".join(rows)
+
+
+# ---------------------------------------------------------------------------
 # Constants shared by all three agent variants
 # ---------------------------------------------------------------------------
 
@@ -4897,11 +5042,16 @@ def main():
             delta_tok = state.delta_tokens
             delta_eqn = state.delta_eqns
             delta_count = state.delta_count
+            # Phase-0: everything since the previous mark is scan glue
+            # (avail mask, key split, the delta unpack above).
+            delta_tok = _pp_mark("prof/scanmisc", delta_tok)
             enc_carry2, vmem_s2, vmem_c2 = _carry_stream.advance(
                 agent, enc_carry, vmem_s, vmem_c,
                 delta_tok, delta_eqn, delta_count, delta_owner,
                 window=MAX_DELTA_TOKENS,
             )
+            enc_carry2, vmem_s2, vmem_c2 = _pp_mark(
+                "prof/encode", (enc_carry2, vmem_s2, vmem_c2))
             precomputed = _carry_stream.heads(
                 agent, vmem_s2, vmem_c2,
                 vertex_features=vertex_features,
@@ -4910,6 +5060,7 @@ def main():
                     preference if args.preference_conditioned else None
                 ),
             )
+            precomputed = _pp_mark("prof/heads", precomputed)
 
             face_chunk_fn = None
             face_count_fn = None
@@ -4995,6 +5146,12 @@ def main():
                     face_count_fn=face_count_fn,
                     enc_carry=enc_carry2,
                 )
+                # prof/action: the vertex pointer sample + the micro/face
+                # head loop (INCLUDES the faces.live_chunk host callbacks,
+                # which env.py counts separately -- the two overlap by
+                # construction).
+                vertex_idx, value, v_context = _pp_mark(
+                    "prof/action", (vertex_idx, value, v_context))
                 # Record this vertex in the elimination prefix for the next
                 # step's oracle replay.
                 elim_order = elim_order.at[state.step_count].set(
@@ -5051,6 +5208,10 @@ def main():
             env_out = env_obj.step(state, env_action)
             next_state = env_out.state
             raw_rewards = env_out.reward
+            # prof/envstep: the env callback (tokenizer replay + measurement).
+            # Overlaps env.py's cb.* / prof/measure_wait keys by construction.
+            next_state, raw_rewards = _pp_mark(
+                "prof/envstep", (next_state, raw_rewards))
             rewards = raw_rewards
             done = env_out.terminated.astype(jnp.float32)
             # Stage C potential-based shaping. Bootstraps a denser per-step
@@ -5079,12 +5240,14 @@ def main():
                 next_state.delta_count, vertex_idx.astype(jnp.int32),
                 window=MAX_DELTA_TOKENS,
             )
+            nv_s, nv_c = _pp_mark("prof/encode_bootstrap", (nv_s, nv_c))
             _, _, next_value = _carry_stream.heads(
                 agent, nv_s, nv_c,
                 vertex_features=vertex_features,
                 residual_state=new_residual,
                 preference=pref_arg,
             )
+            next_value = _pp_mark("prof/heads_bootstrap", next_value)
 
             # PRE-step snapshots (§7b): the carry/memory synced to the
             # PREVIOUS step's delta — the loss re-derives this step's
@@ -5671,6 +5834,8 @@ def main():
         subkey, key = jrand.split(key)
         rollout_key, key = jrand.split(key)
         rollout_keys = jrand.split(rollout_key, num_envs)
+        # Phase-0: start the attribution clock at the top of the episode.
+        env_states = _pp_mark(None, env_states)
 
         # entropy/palimpsa, once per episode on the rollout's FIRST state of
         # env 0 (the root elimination state -- the same input every episode, so
@@ -6121,11 +6286,17 @@ def main():
             return lax.scan(mb_step_fn, (carry, step), (batches, mb_keys))
 
         epoch_keys = jrand.split(subkey, args.ppo_epochs)
+        # prof/postrollout: GAE + PopArt + the TrainBatch assembly.
+        dynamic_carry, full_batch = _pp_mark(
+            "prof/postrollout", (dynamic_carry, full_batch))
         (dynamic_carry, final_step), metrics_seq = lax.scan(
             epoch_step_fn,
             (dynamic_carry, global_step),
             epoch_keys,
         )
+        # prof/update: ppo_epochs x minibatches of grad + optimizer step.
+        dynamic_carry, metrics_seq = _pp_mark(
+            "prof/update", (dynamic_carry, metrics_seq))
 
         agent, opt_state = eqx.combine(dynamic_carry, static_carry)
         # metrics_seq leaves have a leading (ppo_epochs, minibatches) pair.
@@ -7353,6 +7524,48 @@ def main():
                         + _cache_line,
                         file=sys.stderr,
                     )
+                # Phase-0 per-decision attribution + the size distributions
+                # that size the bucket grids. Both are separately gated
+                # (ALPHAGRAD_PROFILE_POLICY / ALPHAGRAD_PROFILE_DIST) and
+                # empty when off.
+                try:
+                    from alphagrad.approx.env import (
+                        consume_profile_samples as _cps,
+                        consume_distributions as _cds,
+                    )
+                    _samp = _cps()
+                    if _samp:
+                        tqdm.write(
+                            f"[ppdec ep={ep:3d}]\n  " + _pp_summary(_samp),
+                            file=sys.stderr)
+                    _dst = _cds()
+                    if _dst:
+                        _caps = {
+                            "faces_per_vertex": int(ENV_MAX_FACES),
+                            "face_chunk_len": int(MAX_DELTA_TOKENS),
+                            "delta_len": int(MAX_DELTA_TOKENS),
+                        }
+                        tqdm.write(
+                            f"[ppdist ep={ep:3d}]\n  "
+                            + _pp_dist_summary(_dst, _caps),
+                            file=sys.stderr)
+                        _fpv = _dst.get("faces_per_vertex")
+                        _fcl = _dst.get("face_chunk_len")
+                        if _fpv and _fcl:
+                            _real = float(np.mean(_fpv)) * float(np.mean(_fcl))
+                            _pad = float(ENV_MAX_FACES) * float(
+                                MAX_DELTA_TOKENS)
+                            tqdm.write(
+                                f"[ppdist ep={ep:3d}] live-face buffer "
+                                f"occupancy: mean_faces="
+                                f"{np.mean(_fpv):.2f} x mean_chunk="
+                                f"{np.mean(_fcl):.1f} = {_real:.0f} real "
+                                f"slots vs {_pad:.0f} allocated "
+                                f"({100.0 * _real / _pad:.4f}%)",
+                                file=sys.stderr)
+                except Exception as _exc:
+                    tqdm.write(f"[ppdec ep={ep}] failed: {_exc!r}",
+                               file=sys.stderr)
             except Exception as _exc:
                 tqdm.write(f"[prof ep={ep}] failed: {_exc!r}", file=sys.stderr)
 

@@ -40,6 +40,19 @@ def _default_window():
     return int(MAX_DELTA_TOKENS)
 
 
+def _dist(key, value):
+    """Record one size sample into the env module's distribution sink.
+
+    Lazy import (env imports nothing from here, but the reverse is a cycle
+    at module scope) and a no-op unless ALPHAGRAD_PROFILE_DIST=1.
+    """
+    try:
+        from alphagrad.approx.env import _dist_add
+        _dist_add(key, value)
+    except Exception:
+        pass
+
+
 def build_live_face_stream(jaxpr, argnums, consts, args, *, max_faces,
                            max_axes, vocab=None, window=None, cache):
     """The per-face token stream for one graph.
@@ -106,6 +119,7 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None):
                     face_rows, face_skips, int(np.asarray(f)),
                     face_hist, skip_hist,
                 )
+                _dist("face_chunk_len", cnt)
                 return tok, ids, np.asarray(cnt, np.int32)
             # BATCHED (vmap_method="broadcast_all"): ONE host dispatch per
             # face substep for all envs. The sequential vmap ran E separate
@@ -129,6 +143,7 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None):
                     _fh[i], _kh[i],
                 )
                 toks[i], idss[i], cnts[i] = tok, ids, np.int32(cnt)
+                _dist("face_chunk_len", cnt)
             return toks, idss, cnts
         finally:
             if _perf is not None:
@@ -153,17 +168,21 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None):
                               face_hist, skip_hist):
         _order = np.asarray(order)
         if _order.ndim == 1:
-            return np.int32(live_faces.n_faces(
+            _nf1 = int(live_faces.n_faces(
                 order, spec_hist, int(np.asarray(step_count)),
                 int(np.asarray(vertex_idx)) + 1, face_hist, skip_hist))
+            _dist("faces_per_vertex", _nf1)
+            return np.int32(_nf1)
         # batched: one dispatch per vertex step (see _live_face_host)
         _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
         _vi = np.asarray(vertex_idx)
         _fh, _kh = np.asarray(face_hist), np.asarray(skip_hist)
-        return np.asarray(
-            [live_faces.n_faces(_order[i], _sh[i], int(_sc[i]),
-                                int(_vi[i]) + 1, _fh[i], _kh[i])
-             for i in range(_order.shape[0])], np.int32)
+        _nfs = [int(live_faces.n_faces(_order[i], _sh[i], int(_sc[i]),
+                                       int(_vi[i]) + 1, _fh[i], _kh[i]))
+                for i in range(_order.shape[0])]
+        for _n in _nfs:
+            _dist("faces_per_vertex", _n)
+        return np.asarray(_nfs, np.int32)
 
     def _live_face_count(order, spec_hist, step_count, vertex_idx,
                          face_hist, skip_hist):

@@ -133,6 +133,7 @@ def _record_token_length(raw_len: int) -> None:
     """Record one full-stream tokenization length."""
     _TOKLEN_SUM[0] += int(raw_len)
     _TOKLEN_COUNT[0] += 1
+    _dist_add("stream_len", raw_len)
     if raw_len > _TOKLEN_MAX[0]:
         _TOKLEN_MAX[0] = int(raw_len)
 
@@ -141,6 +142,7 @@ def _record_delta_length(delta_len: int) -> None:
     """Record one per-elimination DELTA length = one palimpsa call's width."""
     _DELTALEN_SUM[0] += int(delta_len)
     _DELTALEN_COUNT[0] += 1
+    _dist_add("delta_len", delta_len)
     if delta_len > _DELTALEN_MAX[0]:
         _DELTALEN_MAX[0] = int(delta_len)
 
@@ -624,6 +626,48 @@ def consume_profile() -> dict:
     """Pop the accumulated per-phase host seconds since the last call."""
     out = dict(_PROF)
     _PROF.clear()
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Phase-0 attribution sinks (see ppo.py `_pp_mark`).
+#
+# `_PROF` answers "how many seconds did phase X cost this episode" but not
+# "how much did ONE decision cost", which is the number the optimisation plan
+# is gated on. `_prof_sample` keeps the individual observations so the driver
+# can report mean AND p95 per decision; `_dist_add` keeps the raw
+# distributions (faces per vertex, delta length, ...) that size the Phase-1
+# bucket grids. Both are opt-in -- the sample lists grow with the step count,
+# and nothing downstream may depend on a profiling buffer.
+# ---------------------------------------------------------------------------
+_PROF_SAMPLES: dict = {}
+_PROF_DIST: dict = {}
+_PROFILE_DIST = os.environ.get("ALPHAGRAD_PROFILE_DIST", "0") == "1"
+
+
+def _prof_sample(key: str, dt: float) -> None:
+    """Record ONE observation of phase `key` (per-decision granularity)."""
+    _PROF_SAMPLES.setdefault(key, []).append(float(dt))
+
+
+def consume_profile_samples() -> dict:
+    """Pop {key: [seconds, ...]} since the last call."""
+    out = {k: list(v) for k, v in _PROF_SAMPLES.items()}
+    _PROF_SAMPLES.clear()
+    return out
+
+
+def _dist_add(key: str, value) -> None:
+    """Record one sample of a size distribution (ALPHAGRAD_PROFILE_DIST=1)."""
+    if not _PROFILE_DIST:
+        return
+    _PROF_DIST.setdefault(key, []).append(int(value))
+
+
+def consume_distributions() -> dict:
+    """Pop {key: [int, ...]} since the last call."""
+    out = {k: list(v) for k, v in _PROF_DIST.items()}
+    _PROF_DIST.clear()
     return out
 
 
@@ -4121,19 +4165,30 @@ class VertexEliminationEnv:
                 ei = np.zeros((E, _obs_w), np.int32)
                 rw = np.zeros((E, NUM_REWARDS), np.float32)
                 if _remote:
-                    tokens, eqn_ids, rewards, _sent = pool.evaluate_batch(
-                        [ro[i] for i in _remote],
-                        [rs[i] for i in _remote],
-                        [_sti[i] for i in _remote],
-                        eval_samples=_ev,
-                        init=init,
-                        face_specs_batch=(
-                            [rf[i] for i in _remote] if _any_faces
-                            else None),
-                        face_skips_batch=(
-                            [rk[i] for i in _remote] if _any_faces
-                            else None),
-                    )
+                    # prof/measure_wait: the host BLOCKS here until the
+                    # measurement actors return. Timed separately from the
+                    # cb.* phases because it is not trainer compute at all --
+                    # it is idle time the rollout pays per (terminal) step.
+                    _mw0 = time.perf_counter()
+                    try:
+                        (tokens, eqn_ids, rewards,
+                         _sent) = pool.evaluate_batch(
+                            [ro[i] for i in _remote],
+                            [rs[i] for i in _remote],
+                            [_sti[i] for i in _remote],
+                            eval_samples=_ev,
+                            init=init,
+                            face_specs_batch=(
+                                [rf[i] for i in _remote] if _any_faces
+                                else None),
+                            face_skips_batch=(
+                                [rk[i] for i in _remote] if _any_faces
+                                else None),
+                        )
+                    finally:
+                        _mwdt = time.perf_counter() - _mw0
+                        _prof_add("prof/measure_wait", _mwdt)
+                        _prof_sample("prof/measure_wait", _mwdt)
                     for k2, i in enumerate(_remote):
                         tk[i] = np.asarray(tokens)[k2]
                         ei[i] = np.asarray(eqn_ids)[k2]
@@ -4159,11 +4214,17 @@ class VertexEliminationEnv:
             # The Ray pool path predates face actions (DEPRECATED line) —
             # they are dropped here; the pool's own env measures per-vertex.
             eval_samples_t = tuple(eval_samples) if eval_samples else None
-            tokens, eqn_ids, reward = pool.evaluate(
-                order, specs, int(step),
-                eval_samples=eval_samples_t,
-                init=init,
-            )
+            _mw0 = time.perf_counter()
+            try:
+                tokens, eqn_ids, reward = pool.evaluate(
+                    order, specs, int(step),
+                    eval_samples=eval_samples_t,
+                    init=init,
+                )
+            finally:
+                _mwdt = time.perf_counter() - _mw0
+                _prof_add("prof/measure_wait", _mwdt)
+                _prof_sample("prof/measure_wait", _mwdt)
             return tokens, eqn_ids, reward
 
         return _remote_callback
