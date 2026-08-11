@@ -7,6 +7,18 @@
 (d) infeasible measurements are scored finitely and never NaN the update;
 plus front/hypervolume and plan-realization sanity, and a small end-to-end
 learning check on the tiny target.
+
+M3 measurement-protocol fixes (#119 / #120 / #121), all CPU-only:
+(e) the PAIRED reward is invariant to reference drift -- identical rewards,
+    loss and gradients -- and the unpaired one is NOT (the control that shows
+    the fix matters);
+(f) unmeasurable (compile-failure class) trajectories are DROPPED and the
+    shared baseline is the mean over survivors only;
+(g) a batch with fewer than MIN_TRAJ_FOR_UPDATE survivors is skippable and
+    never NaNs;
+(h) OOM / timeout / predicted-memory keep the floor score and are NOT dropped;
+(i) a plan failing the numeric check is invalidated, excluded and logged;
+(j) ReferenceTracker interpolation / drift telemetry.
 """
 
 import math
@@ -42,6 +54,21 @@ def tiny():
 def _stub_result(latency_ns, mem_bytes=1 << 20, status="ok"):
     return {"status": status, "executed": status == "ok",
             "latency_ns": float(latency_ns), "mem_total_bytes": float(mem_bytes)}
+
+
+def _paired(latency_ns, ref_latency_ns, mem_bytes=1 << 20,
+            ref_mem_bytes=1 << 20, **extra):
+    """A feasible result already paired with its own reference measurement."""
+    r = _stub_result(latency_ns, mem_bytes)
+    r.update(extra)
+    return P.attach_ratio(r, ref_latency_ns, ref_mem_bytes)
+
+
+def _compile_failure():
+    """The Blackwell failure mode: no verdict about the plan at all."""
+    return {"status": "error", "executed": False,
+            "reason": ("JaxRuntimeError: INTERNAL: Failed to compile Triton "
+                       "kernel. Context: [...]")}
 
 
 def _make_policy(static, seed=0, hidden=32, width=32):
@@ -369,3 +396,320 @@ def test_full_episode_rollout_terminates_with_distinct_forced_starts(tiny):
     assert step_mask.shape == (n, runner.L)
     # padded steps contribute nothing; live steps are exactly the order length
     assert [int(m.sum()) for m in step_mask] == [len(o) for o in orders]
+
+
+# ===========================================================================
+# (e) #121 -- paired measurement is drift-invariant, unpaired is not
+# ===========================================================================
+def _grad_of_surrogate(R, logp=(-1.0, -2.0, -0.5, -3.0)):
+    lp = jnp.asarray(logp, jnp.float32)
+    return np.asarray(jax.grad(lambda x: P.pomo_surrogate(x, R))(lp))
+
+
+def test_paired_reward_is_invariant_to_reference_drift():
+    """Simulated clock excursion: candidate n AND its own back-to-back
+    reference both read d_n times slower. The ratio is untouched, so the
+    rewards, the loss and the gradients are bit-for-bit the same."""
+    lat = [100e3, 120e3, 90e3, 150e3]
+    ref = 100e3
+    drift = [1.0, 1.05, 1.12, 1.2]          # a within-batch clock ramp
+
+    clean = [_paired(l, ref) for l in lat]
+    drifted = [_paired(l * d, ref * d, mem_bytes=1 << 20,
+                       ref_mem_bytes=1 << 20)
+               for l, d in zip(lat, drift)]
+
+    rb_c = P.score_rewards_paired(clean, (1.0, 0.0))
+    rb_d = P.score_rewards_paired(drifted, (1.0, 0.0))
+    assert rb_c.feasible.all() and rb_d.feasible.all()
+    assert np.allclose(rb_c.R, rb_d.R, atol=1e-12)
+    assert np.allclose(rb_c.lat_ratio, rb_d.lat_ratio, atol=1e-12)
+
+    loss_c = float(P.pomo_surrogate(jnp.array([-1.0, -2.0, -0.5, -3.0]), rb_c.R))
+    loss_d = float(P.pomo_surrogate(jnp.array([-1.0, -2.0, -0.5, -3.0]), rb_d.R))
+    assert abs(loss_c - loss_d) < 1e-12
+    assert np.allclose(_grad_of_surrogate(rb_c.R),
+                       _grad_of_surrogate(rb_d.R), atol=1e-12)
+
+    # a UNIFORM excursion (every measurement 1.2x slower) is likewise a no-op
+    uniform = [_paired(l * 1.2, ref * 1.2) for l in lat]
+    assert np.allclose(P.score_rewards_paired(uniform, (1.0, 0.0)).R, rb_c.R,
+                       atol=1e-12)
+
+
+def test_unpaired_reward_is_NOT_invariant_to_drift_the_control():
+    """The control for the fix. Unpaired rewards are absolute microseconds:
+    the same clock ramp changes the advantages (and hence the gradient), and
+    even a uniform excursion moves the reward scale that the archive, the
+    best-so-far and the 'beats reverse' gate are read off."""
+    lat = [100e3, 120e3, 90e3, 150e3]
+    drift = [1.0, 1.05, 1.12, 1.2]
+    clean = [_stub_result(l) for l in lat]
+    drifted = [_stub_result(l * d) for l, d in zip(lat, drift)]
+
+    R_c, _f = P.score_rewards(clean, (1.0, 0.0))
+    R_d, _f = P.score_rewards(drifted, (1.0, 0.0))
+    adv_c = np.asarray(P.shared_baseline_advantage(jnp.asarray(R_c)))
+    adv_d = np.asarray(P.shared_baseline_advantage(jnp.asarray(R_d)))
+    assert not np.allclose(adv_c, adv_d, atol=1e-6)
+    assert not np.allclose(_grad_of_surrogate(R_c), _grad_of_surrogate(R_d),
+                           atol=1e-6)
+    # the ranking itself flips: trajectory 2 is cheapest clean, 0 under drift
+    assert int(np.argmax(R_c)) == 2 and int(np.argmax(R_d)) == 0
+
+    # a UNIFORM excursion leaves the advantage alone but shifts every reward,
+    # which is exactly the channel that produced the bogus 17.5% headline
+    # (a plan measured hours after its reference).
+    R_u, _f = P.score_rewards([_stub_result(l * 1.2) for l in lat], (1.0, 0.0))
+    assert not np.allclose(R_u, R_c, atol=1e-6)
+    assert abs((R_u - R_c).std()) < 1e-9        # ... a pure, invisible shift
+
+
+def test_paired_scoring_refuses_to_score_an_unpaired_measurement():
+    """A feasible measurement with no reference is dropped, never silently
+    scored on absolutes -- that silent fallback IS the defect."""
+    rb = P.score_rewards_paired(
+        [_paired(100e3, 100e3), _stub_result(1e3)], (1.0, 0.0))
+    assert list(rb.dropped) == [False, True]
+    assert rb.labels[1] == "unpaired"
+
+
+# ===========================================================================
+# (f) #119 -- unmeasurable trajectories are DROPPED, baseline over survivors
+# ===========================================================================
+def test_compile_failures_are_dropped_and_baseline_is_over_survivors_only():
+    results = [_paired(100e3, 100e3), _paired(200e3, 100e3),
+               _compile_failure(), _paired(400e3, 100e3)]
+    rb = P.score_rewards_paired(results, (1.0, 0.0))
+
+    assert list(rb.dropped) == [False, False, True, False]
+    assert rb.labels[2] == "compile_error"
+    assert rb.drop_counts() == {"compile_error": 1}
+    assert rb.n_dropped == 1 and abs(rb.drop_rate - 0.25) < 1e-12
+    assert rb.usable(min_traj=2)
+
+    idx, R = rb.survivors()
+    assert idx == [0, 1, 3]
+    assert np.all(np.isfinite(R))
+    adv = np.asarray(P.shared_baseline_advantage(jnp.asarray(R)))
+    assert abs(float(adv.sum())) < 1e-9
+    assert abs(float(np.mean(R)) - float(np.mean(rb.R[[0, 1, 3]]))) < 1e-12
+
+    # the OLD behaviour scored it worst-in-batch, which moves the baseline
+    R_old, feas_old = P.score_rewards(results, (1.0, 0.0))
+    assert not feas_old[2] and np.isfinite(R_old[2])
+    assert abs(float(np.mean(R_old)) - float(np.mean(R))) > 1e-3
+
+    # unmeasurable is NOT missing-at-random (it tracks graph structure), so
+    # the drop rate has to be reported, not just silently applied
+    assert rb.drop_counts()
+
+
+def test_worker_death_and_missing_results_are_unmeasurable_too():
+    rb = P.score_rewards_paired(
+        [_paired(100e3, 100e3), _paired(200e3, 100e3),
+         {"status": "infeasible", "reason": "worker_died", "executed": False},
+         None], (1.0, 0.0))
+    assert list(rb.dropped) == [False, False, True, True]
+    assert rb.labels[2] == "worker_died" and rb.labels[3] == "missing"
+
+
+# ===========================================================================
+# (g) fewer than 2 survivors -> the update is skipped, and nothing NaNs
+# ===========================================================================
+def test_batch_with_too_few_survivors_is_skipped_without_nan():
+    rb = P.score_rewards_paired(
+        [_paired(100e3, 100e3), _compile_failure(), _compile_failure(),
+         _compile_failure()], (1.0, 0.0))
+    assert int(rb.keep.sum()) == 1
+    assert not rb.usable(min_traj=P.MIN_TRAJ_FOR_UPDATE)
+    idx, R = rb.survivors()
+    assert idx == [0] and np.all(np.isfinite(R))
+    # ... and the skip is not pedantry: a single survivor has zero advantage
+    adv = np.asarray(P.shared_baseline_advantage(jnp.asarray(R)))
+    assert np.allclose(adv, 0.0)
+
+
+def test_all_unmeasurable_batch_is_unusable_and_finite_where_it_matters():
+    rb = P.score_rewards_paired([_compile_failure()] * 4, (0.5, 0.5))
+    assert rb.dropped.all() and not rb.feasible.any()
+    assert not rb.usable() and rb.survivors()[0] == []
+    assert np.isnan(rb.R).all()             # never scored, never used
+    assert rb.drop_rate == 1.0
+
+
+def test_update_over_survivors_only_is_finite(tiny):
+    """Trainer-shaped: drop one trajectory, sub-slice the step batch and take
+    a real gradient step over the survivors."""
+    _fn, _args, _an, env, static, _graph = tiny
+    n = 4
+    envs = [ElimEnv(*tiny_target(), vertex_only=True, symbolic=True)
+            for _ in range(n)]
+    runner = P.PomoRunner(static, n, len(env.jacve_vertices),
+                          edge_hint=len(env.state().edges),
+                          cand_hint=len(env.reset().legal_vertices))
+    policy = _make_policy(static, seed=5)
+    rng = np.random.default_rng(11)
+    batch, step_mask, _orders = runner.rollout(envs, policy, (1.0, 0.0), rng)
+
+    results = [_paired(1e5 * (i + 1), 1e5) for i in range(n)]
+    results[2] = _compile_failure()
+    rb = P.score_rewards_paired(results, (1.0, 0.0))
+    assert rb.usable()
+    idx, R = rb.survivors()
+    sub = batch.rows_of(idx, runner.L)
+    assert sub.dyn.shape[0] == len(idx) * runner.L
+
+    optim = optax.adam(1e-3)
+    opt_state = optim.init(eqx.filter(policy, eqx.is_inexact_array))
+    pol2, _os, loss, gnorm = runner.update(
+        policy, optim, opt_state, sub, (1.0, 0.0), R,
+        np.asarray(step_mask)[idx], 0.01)
+    assert math.isfinite(loss) and math.isfinite(gnorm)
+    assert all(bool(np.all(np.isfinite(np.asarray(x)))) for x in
+               jax.tree_util.tree_leaves(eqx.filter(pol2, eqx.is_inexact_array)))
+
+
+# ===========================================================================
+# (h) OOM / timeout are a VERDICT: floor score, not dropped
+# ===========================================================================
+@pytest.mark.parametrize("reason", ["oom", "timeout", "predicted_memory"])
+def test_measured_as_bad_keeps_the_floor_score_and_is_not_dropped(reason):
+    results = [_paired(100e3, 100e3), _paired(200e3, 100e3),
+               {"status": "infeasible", "executed": False, "reason": reason}]
+    rb = P.score_rewards_paired(results, (1.0, 0.0))
+    assert not rb.dropped.any(), rb.labels
+    assert rb.labels[2] == reason
+    assert not rb.feasible[2]
+    assert np.all(np.isfinite(rb.R))
+    assert rb.R[2] < rb.R[rb.feasible].min()
+    margin = float(rb.R[rb.feasible].min() - rb.R[2])
+    assert margin >= P.INFEASIBLE_MARGIN_FLOOR - 1e-12
+    assert list(rb.survivors()[0]) == [0, 1, 2]
+
+
+def test_classification_separates_verdicts_from_toolchain_failures():
+    assert P.classify_measurement(_paired(1e3, 1e3))[0] == "feasible"
+    assert P.classify_measurement(
+        {"status": "infeasible", "reason": "oom"}) == ("bad", "oom")
+    assert P.classify_measurement(_compile_failure()) == (
+        "unmeasurable", "compile_error")
+    assert P.classify_measurement(None) == ("unmeasurable", "missing")
+    assert P.classify_measurement({"status": "ok", "executed": False})[0] == (
+        "unmeasurable")
+
+
+# ===========================================================================
+# (i) #120 -- a plan failing the numeric check is invalidated and excluded
+# ===========================================================================
+def test_numeric_check_failure_invalidates_excludes_and_logs():
+    good = _paired(100e3, 100e3, check_cos=1.00000012, check_maxdiff=1.49e-8)
+    bad = _paired(50e3, 100e3, check_cos=0.42, check_maxdiff=3.1)
+    assert P.numeric_check(good) == (True, "ok")
+    ok, label = P.numeric_check(bad)
+    assert not ok and label == "cos_low"
+
+    P.invalidate(bad, label)
+    # the invalidation is the LOG record: greppable status/reason on the row
+    assert bad["status"] == "error"
+    assert bad["reason"].startswith("numeric_check_failed")
+    assert bad["numeric_check_failed"] == "cos_low"
+    assert P.reason_label(bad) == "numeric_check_failed"
+
+    rb = P.score_rewards_paired([good, bad], (1.0, 0.0))
+    assert list(rb.feasible) == [True, False]
+    assert list(rb.dropped) == [False, True]
+    assert rb.labels[1] == "numeric_check_failed"
+    # ... and it is NEVER the batch maximum, i.e. never rewarded for being fast
+    assert np.isnan(rb.R[1])
+
+
+def test_an_unchecked_plan_is_not_a_passed_plan():
+    assert P.numeric_check(_paired(1e3, 1e3)) == (False, "unchecked")
+    assert P.numeric_check({"check_error": "leaf-size mismatch 4 vs 6"}) == (
+        False, "check_error")
+    assert P.numeric_check({"check_cos": float("nan")}) == (False, "cos_low")
+    assert P.numeric_check(None) == (False, "missing")
+    # the floor is tight: the verified good plan reads cos 1.00000012
+    assert P.numeric_check({"check_cos": 0.999}, min_cos=P.NUMERIC_CHECK_MIN_COS)[0] is False
+
+
+# ===========================================================================
+# (j) ReferenceTracker: interpolation, modes, drift telemetry
+# ===========================================================================
+def test_reference_tracker_interpolates_geometrically_between_samples():
+    t = [0.0]
+    lat = iter([100e3, 144e3])
+    trk = P.ReferenceTracker(
+        lambda: {"latency_ns": next(lat), "mem_total_bytes": 2.0 ** 20},
+        mode="bracket", clock=lambda: t[0])
+    trk.sample()
+    t[0] = 10.0
+    trk.sample()
+    assert trk.n_ref == 2 and trk.n_failed == 0
+    # geometric midpoint of 100 and 144 is 120, not the arithmetic 122
+    lat_mid, _m = trk.reference_at(5.0)
+    assert abs(lat_mid - 120e3) < 1e-6
+    assert trk.reference_at(-1.0)[0] == 100e3        # clamp to the first
+    assert trk.reference_at(99.0)[0] == 144e3        # clamp to the last
+
+    res = trk.pair(_stub_result(240e3), 5.0)
+    assert abs(res["lat_ratio"] - 2.0) < 1e-9
+    assert res["ref_latency_ns"] == pytest.approx(120e3)
+    assert res["ref_mode"] == "bracket"
+
+
+def test_reference_tracker_off_mode_measures_nothing():
+    calls = []
+
+    def ref():
+        calls.append(1)
+        return {"latency_ns": 1.0, "mem_total_bytes": 1.0}
+
+    trk = P.ReferenceTracker(ref, mode="off")
+    assert trk.sample() is None and calls == [] and trk.n_ref == 0
+    assert trk.reference_at(0.0) == (None, None)
+    # an unpaired result then carries no ratio and is dropped downstream
+    res = trk.pair(_stub_result(1e3), 0.0)
+    assert res["lat_ratio"] is None
+    assert P.score_rewards_paired([res], (1.0, 0.0)).dropped.all()
+
+
+def test_reference_tracker_counts_failed_references_and_reports_drift():
+    seq = iter([100e3, None, 110e3, 105e3])
+    t = [0.0]
+
+    def ref():
+        v = next(seq)
+        t[0] += 60.0
+        return {"latency_ns": v, "mem_total_bytes": 2.0 ** 20}
+
+    trk = P.ReferenceTracker(ref, mode="update", clock=lambda: t[0])
+    for _ in range(4):
+        trk.sample()
+    assert trk.n_ref == 4 and trk.n_failed == 1
+    d = trk.drift_stats()
+    assert d["n"] == 3
+    assert abs(d["span_frac"] - 0.1) < 1e-9
+    assert d["max_step_frac"] > 0.0 and d["max_rate_frac_per_min"] > 0.0
+    assert P.ReferenceTracker(ref, mode="off").drift_stats() == {"n": 0}
+
+
+def test_pairing_is_stable_under_a_slow_reference_ramp():
+    """End-to-end shape of the fix: the same plan measured at t=0 and at
+    t=1h, on a reference that ramped 20%, archives the SAME ratio -- which is
+    what makes a cross-time 'beats reverse' claim defensible at all."""
+    t = [0.0]
+    vals = iter([100e3, 120e3])
+    trk = P.ReferenceTracker(
+        lambda: {"latency_ns": next(vals), "mem_total_bytes": 2.0 ** 20},
+        mode="update", clock=lambda: t[0])
+    trk.sample()
+    early = trk.pair(_stub_result(95e3), 0.0)
+    t[0] = 3600.0
+    trk.sample()
+    late = trk.pair(_stub_result(114e3), 3600.0)
+    assert abs(early["lat_ratio"] - late["lat_ratio"]) < 1e-9
+    assert abs(early["lat_ratio"] - 0.95) < 1e-9
+    # the raw microseconds say the late plan is 20% WORSE -- the artifact
+    assert late["latency_ns"] > early["latency_ns"] * 1.19

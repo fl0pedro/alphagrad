@@ -33,17 +33,33 @@ advantage, and keeping the term lets the policy learn which starts are good.
 
 POMO update
 -----------
-    R_n  = -(lam1 * ln latency_n + lam2 * ln memory_bytes_n)   REAL measurements
+    R_n  = -(lam1 * ln (lat_n / lat_ref) + lam2 * ln (mem_n / mem_ref))
     b    = mean_n R_n                 (shared mean; NO critic, no PopArt)
     loss = -mean_n (R_n - b) * log p(tau_n)  -  ent_coef * mean-step-entropy
+
+PAIRED measurement (task #121)
+------------------------------
+Every candidate is scored against a jacve-REVERSE reference measured in the
+SAME worker close in time (:class:`ReferenceTracker`), and the optimised /
+archived quantity is the RATIO, not the absolute microseconds. The Max-Q
+cards this campaign runs on drift far beyond the +-3% the original protocol
+assumed -- the identical reverse computation reads 131.3 / 143.6 / 155.4us on
+three nominally identical nodes, and a plan that read 128.2us against a
+job-start reference of 155.4us (an apparent 17.5% win) is NOT faster when
+re-measured interleaved in one process (ratio 1.001-1.010). Absolute values
+stay in ``measurements.jsonl`` for diagnostics and every reference sample is
+logged, so drift is an explicit, plottable channel.
 
 Both terms decompose additively over trajectories, so
 :meth:`PomoRunner.update` can accumulate the gradient in trajectory chunks
 (``grad_chunk``) at identical arithmetic -- the [N*L]-row backward otherwise
 dominates trainer memory.
 
-Infeasible scoring (scale-free, documented choice): an infeasible / errored /
-missing measurement gets
+Failed measurements: MEASURED-BAD vs UNMEASURABLE (task #119)
+-------------------------------------------------------------
+A measurement that came back with a VERDICT about the plan (OOM, predicted
+memory over budget, timeout) is real information: the plan is bad, and it
+keeps the floor score
 
     R_n = min(feasible R in this update) - margin,
     margin = max(std(feasible R), 0.05)
@@ -51,8 +67,19 @@ missing measurement gets
 R lives in log space, so the 0.05 floor is a ~5% multiplicative penalty and
 the std term adapts to the batch spread -- no invented huge constant, no
 dependence on absolute latency/memory units, and (unlike -inf or a fixed
--1e9) it cannot NaN or swamp the update. An all-infeasible update produces no
-usable advantage and is SKIPPED by the trainer.
+-1e9) it cannot NaN or swamp the update.
+
+A measurement that produced NO verdict -- toolchain compile failure ("INTERNAL:
+Failed to compile Triton kernel", ~10% of measurements on Blackwell and NOT
+fixable by any compile option we probed), worker death, a broken pairing or a
+failed numeric check -- says nothing about how fast the plan is. Scoring it
+worst-in-batch injects a bias, so it is DROPPED from the POMO batch and the
+shared baseline is renormalised over the survivors only. These failures are
+NOT missing-at-random -- they correlate with the graph structure the plan
+produces, i.e. with the very thing the policy controls -- so the drop rate is
+counted per update and cumulatively and BELONGS IN ANY RESULTS TABLE. An
+update with fewer than ``MIN_TRAJ_FOR_UPDATE`` survivors has no meaningful
+shared baseline and is SKIPPED by the trainer, as is an all-infeasible one.
 
 Episodes: nominal length L = |jacve_vertices| with a per-step mask. An episode
 whose line dag terminates early (argnums-pruned no-op vertices left over) pads
@@ -87,6 +114,12 @@ from alphagrad.elimrl.features import (
 from alphagrad.elimrl.symmetry import ElimGraph, eliminate_vertex, trace_key
 
 INFEASIBLE_MARGIN_FLOOR = 0.05        # log-space ~5% multiplicative penalty
+MIN_TRAJ_FOR_UPDATE = 2               # <2 survivors => no shared baseline
+NUMERIC_CHECK_MIN_COS = 1.0 - 1e-6    # verified good plans read 1.00000012
+
+#: reasons that ARE a verdict about the plan (it really is too big / too slow).
+#: These keep the floor score and stay in the batch.
+MEASURED_BAD_REASONS = frozenset({"oom", "predicted_memory", "timeout"})
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +220,302 @@ def pomo_loss(policy: PomoPolicy, prim, stat, nmask, lam,
 
 
 # ---------------------------------------------------------------------------
-# rewards
+# measurement classification (#119) + numeric verification (#120)
+# ---------------------------------------------------------------------------
+def reason_label(res: Optional[dict]) -> str:
+    """Short, groupable label for a non-ok measurement result."""
+    if not res:
+        return "missing"
+    r = str(res.get("reason") or "")
+    if not r:
+        return str(res.get("status") or "unknown")
+    if "Failed to compile" in r or "Triton" in r:
+        return "compile_error"
+    if r.startswith("numeric_check_failed"):
+        return "numeric_check_failed"
+    if "RESOURCE_EXHAUSTED" in r:
+        return "oom"
+    head = r.split(":")[0].strip()
+    return head[:40] or "unknown"
+
+
+def classify_measurement(res: Optional[dict]) -> Tuple[str, str]:
+    """``(class, label)`` with class in ``feasible`` / ``bad`` / ``unmeasurable``.
+
+    ``bad``          the worker returned a VERDICT about the plan (OOM /
+                     predicted-memory / timeout) -- keeps the floor score.
+    ``unmeasurable`` no verdict at all (compile failure, worker death, a
+                     missing/failed pairing, a failed numeric check) -- the
+                     trajectory is dropped from the update.
+    """
+    if not res:
+        return "unmeasurable", "missing"
+    label = reason_label(res)
+    if res.get("status") == "ok":
+        if (res.get("executed") and res.get("latency_ns")
+                and res.get("mem_total_bytes")):
+            return "feasible", "ok"
+        return "unmeasurable", "ok_without_numbers"
+    if label in MEASURED_BAD_REASONS:
+        return "bad", label
+    return "unmeasurable", label
+
+
+def numeric_check(res: Optional[dict],
+                  min_cos: float = NUMERIC_CHECK_MIN_COS) -> Tuple[bool, str]:
+    """Verify a measured plan's Jacobian against the worker's ``check_against``
+    reference. ``(ok, label)``; an ABSENT check is NOT a pass ("unchecked")."""
+    if not res:
+        return False, "missing"
+    if res.get("check_error"):
+        return False, "check_error"
+    if "check_cos" not in res:
+        return False, "unchecked"
+    cos = float(res["check_cos"])
+    if not math.isfinite(cos) or cos < float(min_cos):
+        return False, "cos_low"
+    return True, "ok"
+
+
+def invalidate(res: dict, label: str) -> dict:
+    """Mark a measured-but-WRONG plan invalid in place: it must never be
+    scored as a good plan and must not survive in the measurement cache."""
+    res["status"] = "error"
+    res["reason"] = f"numeric_check_failed:{label}"
+    res["numeric_check_failed"] = label
+    return res
+
+
+# ---------------------------------------------------------------------------
+# paired (ratio) rewards -- #121
+# ---------------------------------------------------------------------------
+def attach_ratio(res: Optional[dict], ref_latency_ns, ref_mem_bytes,
+                 ref_meta: Optional[dict] = None) -> Optional[dict]:
+    """Pair one candidate result with its reference measurement, in place.
+
+    Stores the reference's absolutes next to the ratios so a row of
+    ``measurements.jsonl`` is self-contained (and so a CACHED result keeps the
+    pairing it was actually measured with, instead of being re-paired against
+    an unrelated later reference)."""
+    if res is None:
+        return res
+    res["ref_latency_ns"] = (float(ref_latency_ns)
+                             if ref_latency_ns else None)
+    res["ref_mem_bytes"] = float(ref_mem_bytes) if ref_mem_bytes else None
+    if ref_meta:
+        res.update(ref_meta)
+    lat, mem = res.get("latency_ns"), res.get("mem_total_bytes")
+    res["lat_ratio"] = (float(lat) / float(ref_latency_ns)
+                        if lat and ref_latency_ns else None)
+    res["mem_ratio"] = (float(mem) / float(ref_mem_bytes)
+                        if mem and ref_mem_bytes else None)
+    return res
+
+
+@dataclass
+class RewardBatch:
+    """Result of scoring one POMO batch under the paired protocol."""
+    R: np.ndarray                 # [n] rewards; NaN on dropped trajectories
+    feasible: np.ndarray          # [n] real, paired measurement
+    dropped: np.ndarray           # [n] unmeasurable -> excluded from the update
+    labels: List[str]             # [n] per-trajectory class label
+    lat_ratio: np.ndarray         # [n] candidate / reference latency
+    mem_ratio: np.ndarray         # [n] candidate / reference memory
+
+    @property
+    def keep(self) -> np.ndarray:
+        return ~self.dropped
+
+    @property
+    def keep_idx(self) -> List[int]:
+        return [int(i) for i in np.flatnonzero(self.keep)]
+
+    @property
+    def n_dropped(self) -> int:
+        return int(self.dropped.sum())
+
+    @property
+    def drop_rate(self) -> float:
+        n = len(self.labels)
+        return float(self.dropped.sum()) / n if n else 0.0
+
+    def drop_counts(self) -> dict:
+        out: dict = {}
+        for i, lab in enumerate(self.labels):
+            if self.dropped[i]:
+                out[lab] = out.get(lab, 0) + 1
+        return out
+
+    def usable(self, min_traj: int = MIN_TRAJ_FOR_UPDATE) -> bool:
+        """A shared-mean baseline needs >= ``min_traj`` surviving trajectories
+        AND at least one real measurement to anchor the floor."""
+        return bool(self.keep.sum() >= int(min_traj) and self.feasible.any())
+
+    def survivors(self):
+        """``(idx, R[idx])`` -- exactly what the update must be built from."""
+        idx = self.keep_idx
+        return idx, self.R[idx]
+
+
+def score_rewards_paired(results: Sequence[Optional[dict]], lam,
+                         margin_floor: float = INFEASIBLE_MARGIN_FLOOR
+                         ) -> RewardBatch:
+    """``R_n = -(lam1 ln lat_ratio_n + lam2 ln mem_ratio_n)`` -- DRIFT-FREE.
+
+    Ratios come from :func:`attach_ratio` (candidate / back-to-back jacve-rev
+    reference), so a global change in GPU clock state cancels exactly and only
+    the plan's relative cost is optimised. A feasible result whose pairing is
+    missing is NOT silently scored on absolutes -- it is dropped ("unpaired"),
+    because an unpaired number is the exact defect this protocol removes.
+    """
+    lam1, lam2 = float(lam[0]), float(lam[1])
+    n = len(results)
+    R = np.full(n, np.nan, np.float64)
+    lat_r = np.full(n, np.nan, np.float64)
+    mem_r = np.full(n, np.nan, np.float64)
+    feas = np.zeros(n, bool)
+    drop = np.zeros(n, bool)
+    labels: List[str] = []
+    for i, r in enumerate(results):
+        cls, label = classify_measurement(r)
+        if cls == "feasible":
+            lr, mr = r.get("lat_ratio"), r.get("mem_ratio")
+            if not lr or not mr or lr <= 0 or mr <= 0:
+                drop[i] = True
+                labels.append("unpaired")
+                continue
+            lat_r[i], mem_r[i] = float(lr), float(mr)
+            R[i] = -(lam1 * math.log(float(lr)) + lam2 * math.log(float(mr)))
+            feas[i] = True
+        elif cls == "unmeasurable":
+            drop[i] = True
+        labels.append(label)
+    if feas.any():
+        margin = max(float(np.std(R[feas])), float(margin_floor))
+        floor = float(R[feas].min()) - margin
+        R[~feas & ~drop] = floor
+    return RewardBatch(R=R, feasible=feas, dropped=drop, labels=labels,
+                       lat_ratio=lat_r, mem_ratio=mem_r)
+
+
+# ---------------------------------------------------------------------------
+# reference tracker (the "paired" half of the paired measurement)
+# ---------------------------------------------------------------------------
+class ReferenceTracker:
+    """Fresh jacve-rev reference measurements interleaved with the candidates.
+
+    ``mode``
+      ``every``    one reference per candidate (the gold standard, 2x cost).
+      ``bracket``  one reference before and one after each update's candidate
+                   block; each candidate is paired with the LOG-LINEAR
+                   interpolation of the two at its own timestamp. Cost is
+                   2 references per update (~25% at n_traj=8) and it also
+                   yields a per-update INTRA-update drift estimate for free.
+      ``update``   a single fresh reference per update (~12%).
+      ``off``      no re-measurement: everything is paired against whatever
+                   samples exist (i.e. the OLD, broken protocol) -- kept only
+                   so the defect can be reproduced.
+
+    ``measure_ref()`` must return the worker result dict for a jacve-rev
+    measurement taken in the SAME worker as the candidates.
+    """
+
+    MODES = ("every", "bracket", "update", "off")
+
+    def __init__(self, measure_ref: Callable[[], dict], mode: str = "bracket",
+                 clock: Callable[[], float] = None):
+        if mode not in self.MODES:
+            raise ValueError(f"unknown pair mode {mode!r}")
+        self.measure_ref = measure_ref
+        self.mode = mode
+        self.clock = clock or (lambda: 0.0)
+        self.samples: List[Tuple[float, float, float]] = []   # (t, lat, mem)
+        self.n_ref = 0
+        self.n_failed = 0
+
+    # -- sampling ------------------------------------------------------------
+    def add_sample(self, t: float, latency_ns, mem_bytes) -> bool:
+        if not latency_ns or not mem_bytes:
+            return False
+        self.samples.append((float(t), float(latency_ns), float(mem_bytes)))
+        self.samples.sort(key=lambda s: s[0])
+        return True
+
+    def sample(self) -> Optional[dict]:
+        """Measure ONE fresh reference now (no-op in ``off`` mode)."""
+        if self.mode == "off":
+            return None
+        t = self.clock()
+        res = self.measure_ref()
+        self.n_ref += 1
+        if not self.add_sample(t, (res or {}).get("latency_ns"),
+                               (res or {}).get("mem_total_bytes")):
+            self.n_failed += 1
+        return res
+
+    # -- pairing -------------------------------------------------------------
+    def reference_at(self, t: float) -> Tuple[Optional[float], Optional[float]]:
+        """Reference (latency, memory) for a candidate measured at time ``t``:
+        geometric interpolation between the bracketing samples, nearest sample
+        outside the bracket, ``(None, None)`` when no reference exists."""
+        s = self.samples
+        if not s:
+            return None, None
+        if t <= s[0][0]:
+            return s[0][1], s[0][2]
+        if t >= s[-1][0]:
+            return s[-1][1], s[-1][2]
+        for k in range(len(s) - 1):
+            t0, l0, m0 = s[k]
+            t1, l1, m1 = s[k + 1]
+            if t0 <= t <= t1:
+                w = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
+                return l0 * (l1 / l0) ** w, m0 * (m1 / m0) ** w
+        return s[-1][1], s[-1][2]
+
+    def pair(self, res: Optional[dict], t: float) -> Optional[dict]:
+        lat, mem = self.reference_at(t)
+        return attach_ratio(res, lat, mem, {"ref_t_s": float(t),
+                                            "ref_mode": self.mode,
+                                            "ref_n": len(self.samples)})
+
+    # -- drift telemetry -----------------------------------------------------
+    @property
+    def last(self) -> Optional[Tuple[float, float, float]]:
+        return self.samples[-1] if self.samples else None
+
+    def drift_stats(self, window: Optional[int] = None) -> dict:
+        """Drift of the reference itself -- the explicit, plottable channel."""
+        s = self.samples[-window:] if window else self.samples
+        if not s:
+            return {"n": 0}
+        lat = np.array([x[1] for x in s], np.float64)
+        out = {"n": len(s), "min_ns": float(lat.min()),
+               "max_ns": float(lat.max()), "median_ns": float(np.median(lat)),
+               "span_frac": float(lat.max() / lat.min() - 1.0),
+               "cv": float(lat.std() / lat.mean()) if lat.mean() else 0.0}
+        if len(s) > 1:
+            steps = [(abs(math.log(s[k + 1][1] / s[k][1])),
+                      max(s[k + 1][0] - s[k][0], 1e-9))
+                     for k in range(len(s) - 1)]
+            out["max_step_frac"] = float(max(a for a, _ in steps))
+            out["max_rate_frac_per_min"] = float(
+                max(a / (d / 60.0) for a, d in steps))
+        return out
+
+
+# ---------------------------------------------------------------------------
+# rewards (unpaired -- kept as the documented CONTROL for the #121 fix)
 # ---------------------------------------------------------------------------
 def score_rewards(results: Sequence[Optional[dict]], lam,
                   margin_floor: float = INFEASIBLE_MARGIN_FLOOR):
     """``R_n = -(lam1 ln latency_ns + lam2 ln mem_total_bytes)`` per result.
+
+    The ORIGINAL, UNPAIRED scoring: rewards are absolute microseconds, so a
+    GPU clock/thermal excursion between two measurements is indistinguishable
+    from a better plan. Superseded by :func:`score_rewards_paired` for the
+    campaign; kept because it is the control that shows the paired reward is
+    drift-invariant and this one is not (and because it needs no reference).
 
     Infeasible / errored / missing results score ``min(feasible R) - margin``
     with ``margin = max(std(feasible R), margin_floor)``. Returns
