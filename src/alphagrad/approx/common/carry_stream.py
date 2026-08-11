@@ -79,7 +79,7 @@ def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
 
 def advance(agent, enc_carry, vmem_sums, vmem_counts,
             delta_tokens, delta_eqns, delta_count, owner, *, window,
-            chunk=None):
+            chunk=None, budget=None):
     """Extend the carry by one step's delta; returns the new
     ``(enc_carry, vmem_sums, vmem_counts)``.
 
@@ -88,12 +88,14 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
 
     ``chunk`` is forwarded to :meth:`Agent.encode_extend`: it bounds how much
     of the (mostly empty) delta window is actually scanned. ``None`` takes the
-    ``ALPHAGRAD_EXTEND_CHUNK`` default; REVERSE-DIFFERENTIATED callers must
-    pass ``0``, because the dynamic trip count is a ``lax.while_loop``.
+    ``ALPHAGRAD_EXTEND_CHUNK`` default. REVERSE-DIFFERENTIATED callers add
+    ``budget`` -- an unbatched batch-wide bound on ``delta_count`` -- which
+    swaps the ``lax.while_loop`` for a transposable ``scan``/``cond`` pair;
+    without it they must pass ``chunk=0``.
     """
     carry2, rows, valid, eqns = agent.encode_extend(
         enc_carry, delta_tokens, delta_eqns, delta_count,
-        window=window, start=0, chunk=chunk,
+        window=window, start=0, chunk=chunk, budget=budget,
     )
     ids = jnp.where(eqns >= 0, owner, -1)
     sums2, counts2 = _vmem.update_ids(

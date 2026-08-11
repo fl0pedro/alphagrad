@@ -1509,7 +1509,7 @@ class Agent(eqx.Module):
         )
 
     def encode_extend(self, carry, tokens_buf, eqn_ids_buf, count, *, window,
-                      start=None, chunk=None):
+                      start=None, chunk=None, budget=None):
         """Extend the palimpsa carry by ``count`` tokens read from
         ``tokens_buf`` at ``carry.pos`` (fixed static ``window``; pad steps
         freeze the carry, so the valid prefix is bitwise-independent of the
@@ -1519,8 +1519,16 @@ class Agent(eqx.Module):
         ``chunk`` bounds how many of those pad steps are actually SCANNED --
         see :meth:`_extend_sequential`. ``None`` reads
         ``ALPHAGRAD_EXTEND_CHUNK`` (0 = scan the whole window, the original
-        behaviour); pass ``0`` explicitly on any path that is
-        reverse-differentiated.
+        behaviour).
+
+        ``budget`` is what makes the chunked path usable under reverse-mode
+        AD: an UNBATCHED upper bound on ``count`` valid for every sample of
+        the surrounding ``vmap``. With it the trip count comes from a
+        ``lax.scan`` + ``lax.cond`` pair instead of a ``lax.while_loop``
+        (which has no transpose rule). CONTRACT: the caller must derive it
+        from the same array the counts come from, e.g.
+        ``jnp.max(batch.delta_count)`` computed OUTSIDE the vmap -- a budget
+        below some sample's ``count`` silently drops that sample's tail.
 
         Byte-identical math to the PalimpsaMixer/EncoderLayer stack with ONE
         deliberate exception: the relational forget-gate features are CAUSAL
@@ -1560,7 +1568,7 @@ class Agent(eqx.Module):
                     return seq
             return par
         return self._extend_sequential(carry, toks, eqns, valid, count,
-                                       chunk=chunk)
+                                       chunk=chunk, budget=budget)
 
     def _extend_parallel(self, carry, toks, eqns, valid, count):
         """Blocked parallel extend: scan across fixed-size blocks, one
@@ -1674,7 +1682,8 @@ class Agent(eqx.Module):
                              pos=carry.pos + count)
         return new_carry, rows, valid, eqns
 
-    def _extend_sequential(self, carry, toks, eqns, valid, count, chunk=None):
+    def _extend_sequential(self, carry, toks, eqns, valid, count,
+                           chunk=None, budget=None):
         layers = self.encoder.layers
         eq_arange = jnp.arange(MAX_EQNS, dtype=jnp.int32)
 
@@ -1765,10 +1774,11 @@ class Agent(eqx.Module):
             # `encode_extend`, so an over-long delta still takes the existing
             # truncation path and its telemetry, untouched.
             #
-            # Reverse-mode AD does not work through `lax.while_loop`, so the
-            # differentiated paths (the PPO loss, `_face_replay`) pass
-            # `chunk=0` and keep the flat scan. That is a loud failure, not a
-            # silent one, if a new differentiated caller forgets.
+            # Reverse-mode AD does not work through `lax.while_loop`, so a
+            # differentiated caller passes `budget` instead and gets the
+            # `lax.scan` + `lax.cond` form below -- same skipping, but every
+            # primitive on the path has a transpose rule. A differentiated
+            # caller that passes NEITHER still lands on the flat scan.
             nb_max = -(-W // C)
             pad = nb_max * C - W
             if pad:
@@ -1780,8 +1790,50 @@ class Agent(eqx.Module):
                     [valid, jnp.zeros((pad,), valid.dtype)])
             else:
                 toks_p, eqns_p, valid_p = toks, eqns, valid
+            _trip = count if budget is None else jnp.asarray(
+                budget, jnp.int32)
             nb = jnp.minimum(
-                (jnp.maximum(count, 0) + C - 1) // C, nb_max).astype(jnp.int32)
+                (jnp.maximum(_trip, 0) + C - 1) // C, nb_max).astype(jnp.int32)
+
+            if budget is not None:
+                # DIFFERENTIABLE dynamic trip count. `nb` here is a batch-wide
+                # bound, so the predicate `i < nb` is UNBATCHED under the
+                # loss's vmap -- vmap then keeps a real `cond` instead of
+                # lowering it to `select_n` over both branches, which is the
+                # whole point (a per-sample predicate would compute the
+                # skipped chunk anyway and save nothing).
+                #
+                # Bit-identical for the same reason the while_loop is: `_step`
+                # freezes the entire carry and emits a zero row on an invalid
+                # step, so a skipped chunk is the identity map -- and its
+                # gradient is exactly zero, because every param path out of a
+                # padded step goes through `jnp.where(ok, ., <carry>)` /
+                # `jnp.where(ok, x, 0)` whose cotangent on the frozen side is
+                # zero. The zero rows are still materialised at full width, so
+                # every downstream reduction sees the identical array.
+                b_toks = toks_p.reshape(nb_max, C)
+                b_eqns = eqns_p.reshape(nb_max, C)
+                b_valid = valid_p.reshape(nb_max, C)
+
+                def _chunk_d(c, xs):
+                    i, bt, be, bv = xs
+
+                    def _run(c):
+                        return lax.scan(_step, c, (bt, be, bv), unroll=unroll)
+
+                    def _skip(c):
+                        return c, jnp.zeros((C, self.embd_dim), jnp.float32)
+
+                    return lax.cond(i < nb, _run, _skip, c)
+
+                (M2, I2, ch2, nv2), rows_b = lax.scan(
+                    _chunk_d, c0,
+                    (jnp.arange(nb_max, dtype=jnp.int32),
+                     b_toks, b_eqns, b_valid))
+                rows = rows_b.reshape(nb_max * C, -1)[:W]
+                new_carry = EncCarry(M=M2, I=I2, cumhist=ch2, nvalid=nv2,
+                                     pos=carry.pos + count)
+                return new_carry, rows, valid, eqns
 
             def _chunk(st):
                 i, M, I, ch, nv, rows = st
@@ -5561,6 +5613,12 @@ def main():
         # (ratio 1 at epoch 0; gradient flows through the delta + heads,
         # truncating at the stored carry by design).
 
+        # BATCH-WIDE window bounds, computed once OUTSIDE the vmaps below and
+        # closed over (a closed-over tracer is unbatched inside vmap, which is
+        # what keeps the chunk predicate a real `cond`). The loss scans
+        # ceil(bound / chunk) chunks instead of the full 16384-step window.
+        _delta_budget = jnp.max(batch.delta_count.astype(jnp.int32))
+
         def _carry_heads(M, I, ch, nv, pos, owner, vs, vc,
                          rs, pref, dtok, deqn, dcnt):
             carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
@@ -5569,11 +5627,12 @@ def main():
             carry2, vs2, vc2 = _carry_stream.advance(
                 agent, carry, vs, vc, dtok, deqn, dcnt, owner,
                 window=MAX_DELTA_TOKENS,
-                # chunk=0: the loss is reverse-differentiated through this
-                # extend, and lax.while_loop has no reverse rule. The rollout
-                # gets the dynamic trip count; the update keeps the flat scan
-                # (its cost is prof/update's, a separate task).
-                chunk=0,
+                # The loss is reverse-differentiated through this extend, so
+                # it cannot use the rollout's while_loop -- it passes the
+                # batch-wide `budget` instead and gets the scan/cond form,
+                # which has a transpose rule and skips exactly the same pad
+                # steps.
+                chunk=None, budget=_delta_budget,
             )
             # carry2 is where the sampling side carry branched: the
             # stored pre-step carry advanced past the PREVIOUS delta.
