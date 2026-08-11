@@ -1846,9 +1846,13 @@ class Agent(eqx.Module):
                 # count alone left a floor. With remat each chunk stores only
                 # its boundary carry and recomputes its forward, so a skipped
                 # chunk costs a predicate.
+                # ON by default: measured 4.8s -> 2.1s of prof/update on the
+                # TLM flagship and 4.1s -> 3.2s on CPU, with a bitwise
+                # identical forward. ALPHAGRAD_LOSS_EXTEND_REMAT=0 restores
+                # the stored-residual form.
                 _body = (jax.checkpoint(_chunk_d)
                          if os.environ.get(
-                             "ALPHAGRAD_LOSS_EXTEND_REMAT", "0") != "0"
+                             "ALPHAGRAD_LOSS_EXTEND_REMAT", "1") != "0"
                          else _chunk_d)
                 (M2, I2, ch2, nv2), rows_b = lax.scan(
                     _body, c0,
