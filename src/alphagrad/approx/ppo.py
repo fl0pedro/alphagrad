@@ -2307,7 +2307,8 @@ class Agent(eqx.Module):
 
     def _face_replay(self, v_context, features, factor_tables, fa,
                      f_pair, f_comp, f_valid, enc_carry, face_chunks,
-                     op_legality_override):
+                     op_legality_override, face_bound=None,
+                     face_win_budget=None):
         """Score the stored FaceAction against contexts pooled from ONE scan
         of the stored emission window.
 
@@ -2322,16 +2323,26 @@ class Agent(eqx.Module):
         through this scan; truncation at the stored carry, as everywhere.
 
         ``face_chunks`` is ``(counts (F,), tokens (W,), eqns (W,))``.
+
+        ``face_bound`` / ``face_win_budget`` are the batch-wide (UNBATCHED,
+        so the predicates stay real ``cond``s under the loss's vmap) bounds on
+        the live-face index and on the emission length. The sampling side is a
+        ``while_loop`` over the ACTUAL face count; without these the replay was
+        the only place still paying the padded width -- F = 2538 slots and a
+        16384-token window against a measured 1.2 faces x ~80 tokens.
         """
         pol = self.face_path_policy
         F = pol.max_faces
         f_cnt, f_toks, f_eqns = face_chunks
         total = jnp.sum(f_cnt.astype(jnp.int32))
-        # chunk=0: this is the LOSS side and it is reverse-differentiated
-        # (gradient reaches palimpsa through exactly this scan).
+        # This is the LOSS side and it is reverse-differentiated (gradient
+        # reaches palimpsa through exactly this scan), so the trip count comes
+        # from `budget` (scan/cond) and never from a while_loop.
         _, rows, _valid, _e = self.encode_extend(
             enc_carry, f_toks, f_eqns, total,
-            window=MAX_DELTA_TOKENS, start=0, chunk=0)
+            window=MAX_DELTA_TOKENS, start=0,
+            chunk=(None if face_win_budget is not None else 0),
+            budget=face_win_budget)
         # Exclusive-prefix boundaries from the counts; pooled mean per span.
         # An empty chunk gives s == e -> zero context, matching the rollout's
         # `_face_encode` skip exactly.
@@ -2343,18 +2354,29 @@ class Agent(eqx.Module):
 
         # scan, not a python loop: F is the provable bound (196 here), and
         # unrolling it multiplied the program by F. scan keeps reverse-mode
-        # AD (while_loop would not); padding faces are gated to zero by the
-        # stored face_valid, so the extra iterations cost one small MLP each.
+        # AD (while_loop would not); with `face_bound` the slots past the last
+        # live face cost a predicate each instead of a full head evaluation.
         def _scan_f(acc, f):
-            logp, ent, arity = acc
-            span = (cum[jnp.clip(ends[f], 0, rows.shape[0])]
-                    - cum[jnp.clip(starts[f], 0, rows.shape[0])])
-            summ = span / jnp.maximum(f_cnt[f].astype(jnp.float32), 1.0)
-            lp, e, ar, _sp, _od = pol.evaluate_face(
-                v_context, features, factor_tables, fa, f,
-                f_pair[f], f_comp[f], f_valid[f], face_context=summ,
-                op_legality_override=op_legality_override)
-            return (logp + lp, ent + e, arity + ar), None
+            def _run(acc):
+                logp, ent, arity = acc
+                span = (cum[jnp.clip(ends[f], 0, rows.shape[0])]
+                        - cum[jnp.clip(starts[f], 0, rows.shape[0])])
+                summ = span / jnp.maximum(f_cnt[f].astype(jnp.float32), 1.0)
+                lp, e, ar, _sp, _od = pol.evaluate_face(
+                    v_context, features, factor_tables, fa, f,
+                    f_pair[f], f_comp[f], f_valid[f], face_context=summ,
+                    op_legality_override=op_legality_override)
+                return (logp + lp, ent + e, arity + ar)
+
+            if face_bound is None:
+                return _run(acc), None
+            # Skipping f >= face_bound is EXACT, not an approximation: the
+            # head's gates SELECT rather than multiply, so a slot with
+            # `face_valid == 0` returns (0, 0, 0) and contributes a zero
+            # cotangent to every parameter. `face_bound` is one past the last
+            # index any sample in the minibatch marks valid, so nothing that
+            # could contribute is skipped.
+            return lax.cond(f < face_bound, _run, lambda a: a, acc), None
 
         (logp, ent, arity), _ = lax.scan(
             _scan_f, (jnp.array(0.0), jnp.array(0.0), jnp.array(0.0)),
@@ -2386,6 +2408,8 @@ class Agent(eqx.Module):
         precomputed=None,      # 3b: (vertex_logits, vertex_contexts, value) from the carry path
         face_chunks=None,      # (counts, emission tokens, emission eqns)
         face_carry=None,       # carry2: where the sampling side carry branched
+        face_bound=None,       # batch-wide live-face bound (unbatched)
+        face_win_budget=None,  # batch-wide emission-length bound (unbatched)
     ):
         """Joint log-prob / entropy for a stored typed action sequence.
 
@@ -2518,6 +2542,8 @@ class Agent(eqx.Module):
                     v_context, features, factor_tables, face_action,
                     face_pair_valid, face_comp_valid, face_valid,
                     face_carry, face_chunks, op_legality_override,
+                    face_bound=face_bound,
+                    face_win_budget=face_win_budget,
                 )
             total_log_p = total_log_p + f_logp
             # Arity-normalised per the PER-HEAD ENTROPY NORMALISATION note
@@ -5575,7 +5601,7 @@ def main():
 
         def _eval_dyn(rs, pref, vidx, action, vmask, ax_st, ax_vm,
                       k, pv, cv, fa=None, fpv=None, fcv=None, fv=None,
-                      pc3=None, fch=None, fcy=None):
+                      pc3=None, fch=None, fcy=None, fb=None, fwb=None):
             # No token arguments: `pc3` (the carry-derived heads) IS the
             # encoding, exactly as on the rollout side.
             return agent.evaluate_action_dynamic(
@@ -5604,6 +5630,8 @@ def main():
                 precomputed=pc3,
                 face_chunks=fch,
                 face_carry=fcy,
+                face_bound=fb,
+                face_win_budget=fwb,
             )
 
         # Re-derive each sample's encoding by extending its stored
@@ -5618,6 +5646,19 @@ def main():
         # what keeps the chunk predicate a real `cond`). The loss scans
         # ceil(bound / chunk) chunks instead of the full 16384-step window.
         _delta_budget = jnp.max(batch.delta_count.astype(jnp.int32))
+        if args.face_actions and _LIVE_FACES is not None:
+            # One past the LAST valid face index, not the count: the sampling
+            # masks come from the live oracle and are not contractually
+            # packed, so a sum would be wrong the day one is not a prefix.
+            _fv = batch.face_valid
+            _F_ax = jnp.arange(_fv.shape[-1], dtype=jnp.int32)
+            _face_bound = jnp.max(
+                jnp.max(jnp.where(_fv > 0, _F_ax, -1), axis=-1)) + 1
+            _face_win_budget = jnp.max(
+                jnp.sum(batch.face_counts.astype(jnp.int32), axis=-1))
+        else:
+            _face_bound = None
+            _face_win_budget = None
 
         def _carry_heads(M, I, ch, nv, pos, owner, vs, vc,
                          rs, pref, dtok, deqn, dcnt):
@@ -5682,6 +5723,8 @@ def main():
                     fch=((fct, fdt, fde) if _LIVE_FACES is not None
                          else None),
                     fcy=(cy if _LIVE_FACES is not None else None),
+                    fb=_face_bound,
+                    fwb=_face_win_budget,
                 )
             )(
                 batch.residual_state,
