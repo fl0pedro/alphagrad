@@ -1744,6 +1744,17 @@ class Agent(eqx.Module):
         W = toks.shape[0]
         C = int(os.environ.get("ALPHAGRAD_EXTEND_CHUNK", "0")
                 if chunk is None else chunk)
+        if budget is not None:
+            # The differentiated form pays nb_max = ceil(W/C) OUTER scan
+            # iterations whatever the budget is -- the trip count is a
+            # predicate inside the body, not a loop bound -- and on GPU a
+            # scan iteration carrying this much state costs far more than the
+            # ~C token steps it guards. Its optimum therefore sits at a much
+            # LARGER chunk than the rollout while_loop's, which really does
+            # stop after ceil(count/C) iterations and so wants C small. One
+            # knob each; unset falls back to ALPHAGRAD_EXTEND_CHUNK, so the
+            # old behaviour is one env var away.
+            C = int(os.environ.get("ALPHAGRAD_LOSS_EXTEND_CHUNK", C))
 
         if C <= 0 or C >= W:
             (M2, I2, ch2, nv2), rows = lax.scan(
