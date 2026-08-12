@@ -7972,6 +7972,15 @@ def main():
     # which HLO op inside `env.step` costs what, and the last two host
     # attributions were both wrong until the mark anchor was fixed. Off by
     # default; when off this is one bool test per episode and zero HLO.
+    #
+    # DOES NOT WORK ON THE pgi15 GPU NODES. They run with the driver at
+    # `RmProfilingAdminOnly: 1` (check /proc/driver/nvidia/params), so CUPTI
+    # cannot attach; the failed attach poisons the CUDA context and the next
+    # launch dies with `CUDA_ERROR_LAUNCH_FAILED: unspecified launch failure`
+    # inside jit(train_episode) -- after the ~320 s compile, so it costs a
+    # full run to rediscover (job 60018). Leave this off until a sysadmin
+    # clears the restriction; use the ALPHAGRAD_PROFILE_TRACE event trace
+    # (host timestamps around each callback) for attribution meanwhile.
     _xtr_dir = os.environ.get("ALPHAGRAD_XLA_TRACE_DIR", "")
     _xtr_eps = {int(_x) for _x in
                 os.environ.get("ALPHAGRAD_XLA_TRACE_EPS", "").split(",")
