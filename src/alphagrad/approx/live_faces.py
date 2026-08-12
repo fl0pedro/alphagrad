@@ -141,42 +141,6 @@ class _Snapshot:
 # O(T^2) rebuild (kept as an A/B switch, not because the rebuild is wanted).
 _PREFIX_EXTEND = os.environ.get("ALPHAGRAD_FACE_PREFIX_EXTEND", "1") == "1"
 
-# Key the prefix / chunk caches on the LIVE face wires instead of the dense
-# MAX_FACES-padded buffers. The wires are (n, MAX_FACES, FACE_SLOTS, 3) int32
-# and (n, MAX_FACES) int32 -- 9.6 MB at the flagship's n=95 / MAX_FACES=2538 --
-# and `tobytes()` + `hash()` on the [:n] slice ran on EVERY callback, so the
-# key alone cost O(n x MAX_FACES) per decision and O(T^2 x MAX_FACES) per
-# episode. Measured on the TLM flagship (host harness): the per-decision face
-# cost ramps 0.081 ms per step at MAX_FACES=2538, 0.003 ms at MAX_FACES=64 --
-# i.e. the slope IS this key, at 3.2e-5 ms per (step x face slot), and it is
-# 43% of the whole live-face host budget at V=95 (57% at V=143).
-#
-# The buffers pad with -1 (wires) and 0 (skips), so `(flat positions of the
-# non-padding entries, their values)` is a COMPLETE and injective description
-# for a fixed shape -- exactly the argument env.py's `_face_wire_keys` already
-# runs on the measurement side. One vectorised `flatnonzero` replaces the
-# 9.6 MB memcpy + 9.6 MB siphash: measured 0.400 ms vs 2.292 ms per key at
-# n=95, occupancy 1.24 live faces per vertex.
-#
-# ALPHAGRAD_FACE_KEY_COMPACT=0 restores the dense key (an A/B switch, not
-# because the dense key is wanted).
-_COMPACT_KEY = os.environ.get("ALPHAGRAD_FACE_KEY_COMPACT", "1") == "1"
-
-
-def _wire_key(frh, fsh, n):
-    """Hashable, injective identity of the face-wire prefix ``[:n]``."""
-    if n <= 0:
-        return (b"", b"", b"", b"")
-    if not _COMPACT_KEY:
-        return (frh[:n].tobytes(), fsh[:n].tobytes())
-    f = frh[:n].reshape(-1)
-    sk = fsh[:n].reshape(-1)
-    fi = np.flatnonzero(f != -1)
-    si = np.flatnonzero(sk != 0)
-    return (fi.astype(np.int64).tobytes(), f[fi].tobytes(),
-            si.astype(np.int64).tobytes(), sk[si].tobytes())
-
-
 class LiveFaceStream:
     """Per-face token chunks for one graph, cached across env steps."""
 
@@ -246,7 +210,8 @@ class LiveFaceStream:
         # ORDER. Every plan sharing an elimination order was then served one
         # tokenizer no matter what the face head had decided.
         key = (order[:n].tobytes(), specs[:n].tobytes(),
-               () if frh is None else _wire_key(frh, fsh, n))
+               b"" if frh is None else frh[:n].tobytes(),
+               b"" if fsh is None else fsh[:n].tobytes())
         hit = self._prefix.get(key)
         if hit is not None:
             self.stats["prefix_hit"] += 1
@@ -312,7 +277,8 @@ class LiveFaceStream:
         tk = None
         if _PREFIX_EXTEND and n > 0:
             pkey = (order[:n - 1].tobytes(), specs[:n - 1].tobytes(),
-                    () if frh is None else _wire_key(frh, fsh, n - 1))
+                    b"" if frh is None else frh[:n - 1].tobytes(),
+                    b"" if fsh is None else fsh[:n - 1].tobytes())
             tk = self._prefix.pop(pkey, None)
             if tk is not None:
                 try:
@@ -446,7 +412,8 @@ class LiveFaceStream:
         frh, fsh = self._hist(face_rows_hist, face_skips_hist)
         ck = (order[:n].tobytes(), specs[:n].tobytes(), vertex,
               vspecs.tobytes(), rows[:f].tobytes(), skips[:f].tobytes(), f,
-              () if frh is None else _wire_key(frh, fsh, n))
+              b"" if frh is None else frh[:n].tobytes(),
+              b"" if fsh is None else fsh[:n].tobytes())
         hit = self._chunks.get(ck)
         if hit is not None:
             self.stats["chunk_hit"] += 1
