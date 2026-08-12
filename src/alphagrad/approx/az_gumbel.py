@@ -1104,7 +1104,7 @@ def _golden_equivalence(state, stream, seg_ids, ep):
         _GOLD_CHECK = False
         return
     from alphagrad.approx.env import (
-        _incremental_stream_tokens, decode_vertex_rule_specs)
+        _face_wire_keys, _incremental_stream_tokens, decode_vertex_rule_specs)
     order, specs, face_rows, face_skips = plan_wires(state)
     n = len(order)
     tok_rules_by_v = {}
@@ -1120,10 +1120,14 @@ def _golden_equivalence(state, stream, seg_ids, ep):
         face_rows_list=face_rows.tolist(),
         face_skips_list=face_skips.tolist(),
         honor_last_compress=True,
-        face_key=tuple(
-            (tuple(int(x) for x in face_rows[k].reshape(-1)),
-             tuple(int(x) for x in face_skips[k].reshape(-1)))
-            for k in range(n)),
+        # MUST be the env's own builder, not a hand-rolled tuple: the
+        # ancestor-cut branch in _incremental_stream_tokens does
+        # np.frombuffer(face_key[-1][0]) and needs the int32-BYTES form
+        # _face_wire_keys emits. The dense-tuple form only survived because
+        # that branch is skipped whenever the last vertex carries a COMPRESS
+        # row -- which is every approximation episode and NO exact one, so
+        # --no-approx-head crashed here on its first golden check.
+        face_key=_face_wire_keys(face_rows, face_skips, n),
     )
     ok_t = list(ref) == list(stream)
     ok_i = list(ref_ids) == list(seg_ids)
@@ -2032,7 +2036,19 @@ def _run(args) -> int:
             state, carry, d = _step((state, carry, head_out[1]), v, fr, fs,
                                     face_keys=_face_keys)
             _assert_terminal_prediction(d)
-            _assert_face_accounting(f_cnt, f_valid, d, _nf, v, _nf_pre)
+            # #79 EXACT arm: there is no face loop, so `f_valid`/`f_cnt` are
+            # the ZERO form by construction (see the branch above) and `_nf`
+            # is 0 while the tokenizer still enumerates the vertex's real
+            # faces. Check (b) -- "the face loop decided as many faces as the
+            # plan tokenizer enumerates" -- is a statement about the
+            # APPROXIMATION head's face INDEXING; with no head there is
+            # nothing indexed and the identity is vacuously false on the first
+            # vertex with >= 1 face. That is why --no-approx-head has never
+            # completed a single episode. Pass the enumerated count so check
+            # (a) (emission-window saturation) still runs and (b) is a no-op.
+            _assert_face_accounting(
+                f_cnt, f_valid, d, (_nf_pre if _EXACT_ARM else _nf), v,
+                _nf_pre)
             # #95: search dynamics == measured graph, ASSERTED not assumed.
             # The committed elimination must re-produce BITWISE the tokens the
             # search's branch produced for the executed draw -- same prefix,
