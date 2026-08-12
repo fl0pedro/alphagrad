@@ -166,23 +166,35 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None):
 
     def _live_face_count_host(order, spec_hist, step_count, vertex_idx,
                               face_hist, skip_hist):
-        _order = np.asarray(order)
-        if _order.ndim == 1:
-            _nf1 = int(live_faces.n_faces(
-                order, spec_hist, int(np.asarray(step_count)),
-                int(np.asarray(vertex_idx)) + 1, face_hist, skip_hist))
-            _dist("faces_per_vertex", _nf1)
-            return np.int32(_nf1)
-        # batched: one dispatch per vertex step (see _live_face_host)
-        _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
-        _vi = np.asarray(vertex_idx)
-        _fh, _kh = np.asarray(face_hist), np.asarray(skip_hist)
-        _nfs = [int(live_faces.n_faces(_order[i], _sh[i], int(_sc[i]),
-                                       int(_vi[i]) + 1, _fh[i], _kh[i]))
-                for i in range(_order.shape[0])]
-        for _n in _nfs:
-            _dist("faces_per_vertex", _n)
-        return np.asarray(_nfs, np.int32)
+        # TIMED, like its sibling. This callback was the only host stage in
+        # the rollout with no prof sink, and it is the one that pays the
+        # prefix-tokenizer miss: `n_faces` calls `_tokenizer_at`, so the
+        # FIRST request at each new step rebuilds the whole prefix while the
+        # chunk callbacks that follow hit the entry it just built. Untimed,
+        # that cost surfaced only as a device-side gap and was read as
+        # `env.step` device time for two rounds of profiling.
+        _ct0 = _perf() if _perf is not None else None
+        try:
+            _order = np.asarray(order)
+            if _order.ndim == 1:
+                _nf1 = int(live_faces.n_faces(
+                    order, spec_hist, int(np.asarray(step_count)),
+                    int(np.asarray(vertex_idx)) + 1, face_hist, skip_hist))
+                _dist("faces_per_vertex", _nf1)
+                return np.int32(_nf1)
+            # batched: one dispatch per vertex step (see _live_face_host)
+            _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
+            _vi = np.asarray(vertex_idx)
+            _fh, _kh = np.asarray(face_hist), np.asarray(skip_hist)
+            _nfs = [int(live_faces.n_faces(_order[i], _sh[i], int(_sc[i]),
+                                           int(_vi[i]) + 1, _fh[i], _kh[i]))
+                    for i in range(_order.shape[0])]
+            for _n in _nfs:
+                _dist("faces_per_vertex", _n)
+            return np.asarray(_nfs, np.int32)
+        finally:
+            if _perf is not None:
+                prof_sink("faces.live_count", _perf() - _ct0)
 
     def _live_face_count(order, spec_hist, step_count, vertex_idx,
                          face_hist, skip_hist):
