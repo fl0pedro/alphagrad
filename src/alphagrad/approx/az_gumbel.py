@@ -1159,6 +1159,14 @@ from alphagrad.approx.common.sampled_az import (      # noqa: E402
 # target comes from a single common depth (round 0) -- the 200:1 spread in
 # the completed-Q target was attributable to depth alone.
 _GAZ_DEEPEN = os.environ.get("ALPHAGRAD_GAZ_DEEPEN", "0") == "1"
+# --- ORDER-SEARCH DIAGNOSTICS ------------------------------------------
+# `_SEARCH_DIAG` is refreshed by gumbel_search on every root decision and
+# read by the JSONL sink at the end of the episode, so the record carries the
+# LAST root's completed-Q spread. At depth 0 the completed Q IS the value
+# net's own output (there is no tree to back up), so a flat comp_q spread and
+# a flat improved policy are the same statement: the bandit has no signal.
+_SEARCH_DIAG = {}
+_GAZ_JSONL = os.environ.get("ALPHAGRAD_GAZ_JSONL", "")
 if not _GAZ_DEEPEN and int(A.rollout_depth) != 0:
     print(f"[gaz] #93: --rollout-depth {A.rollout_depth} IGNORED (depth 0, "
           "pure value bootstrap); set ALPHAGRAD_GAZ_DEEPEN=1 to deepen",
@@ -1525,9 +1533,39 @@ def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
     comp_q = np.full(len(legal), v_mix, dtype=np.float64)
     for li, qv in _qv.items():
         comp_q[li] = qv
+    # Completed-Q spread at this root. `comp_q` is v_mix everywhere the
+    # candidate was NOT visited, so a spread of ~0 means the search saw no
+    # difference between the actions it sampled -- which at depth 0, where the
+    # completed Q IS the value net's own output, is a statement about the
+    # value net alone and not about the tree.
+    try:
+        _cq = np.asarray(comp_q, dtype=np.float64).reshape(-1)
+        _lg = np.asarray(logits, dtype=np.float64).reshape(-1)
+        _SEARCH_DIAG.clear()
+        _SEARCH_DIAG.update({
+            "search/comp_q_mean": float(_cq.mean()),
+            "search/comp_q_std": float(_cq.std()),
+            "search/comp_q_min": float(_cq.min()),
+            "search/comp_q_max": float(_cq.max()),
+            "search/comp_q_ptp": float(_cq.max() - _cq.min()),
+            "search/comp_q_n": int(_cq.size),
+            "search/n_visited": int(len(_qv)),
+            "search/v_root": float(v_root),
+            "search/v_mix": float(v_mix),
+            "search/logit_std": float(_lg.std()),
+        })
+    except Exception:
+        pass
     pi = improved_policy(
         logits, comp_q, max_n=max([len(c["q"]) for c in cands] + [1]),
         cvisit=CVISIT, cscale=CSCALE)
+    try:
+        _p = np.asarray(pi, dtype=np.float64).reshape(-1)
+        _SEARCH_DIAG["search/pi_max"] = float(_p.max())
+        _p = _p[_p > 0]
+        _SEARCH_DIAG["search/pi_entropy"] = float(-(_p * np.log(_p)).sum())
+    except Exception:
+        pass
     # ---- face-CE draws + the EXECUTED face sequence -----------------------
     exec_draw = None
     if not _EXACT_ARM:
@@ -1626,7 +1664,7 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
         # taken before `_face_replay` is traced -- a jnp.where would still
         # trace a head that does not exist.
         if _EXACT_ARM:
-            return ce + 0.5 * vl, jnp.zeros((), jnp.float32)
+            return ce + 0.5 * vl, (jnp.zeros((), jnp.float32), vl, ce)
         # Each stored draw carries its own vertex index (the search's top-m,
         # NOT only `vsl`), masks and emission window; ``pi`` supplies the
         # pi'_ve(v) factor via the draw's legal-set index. `face_ce_term`
@@ -1636,22 +1674,26 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
             OP_OVERRIDE, _axis_feats, pi,
             s_li, s_vidx, s_w, s_fp, s_fc, s_fv, s_cnt, s_dt, s_de, s_fa)
         face_loss = _FACE_COEF * face_ce - _FACE_ENT_COEF * face_ent_norm
-        return ce + 0.5 * vl + face_loss, face_ent_norm
+        return ce + 0.5 * vl + face_loss, (face_ent_norm, vl, ce)
 
-    losses, ents = jax.vmap(per)(
+    losses, (ents, vls, ces) = jax.vmap(per)(
         enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c, resid,
         dtok, deqn, dcnt, owner, vsel, la_pad, la_mask, pi_pad, vtgt, vmask,
         sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp, sd_fvalid,
         sd_cnt, sd_dt, sd_de, sd_fa)
-    return jnp.mean(losses), jnp.mean(ents)
+    return jnp.mean(losses), (jnp.mean(ents), jnp.mean(vls),
+                             jnp.mean(ces))
 
 
 @eqx.filter_jit
 def train_step(agent, opt_state, batch):
-    (l, ent), gr = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
+    (l, aux), gr = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
         agent, *batch)
     up, opt_state = opt.update(gr, opt_state, eqx.filter(agent, eqx.is_array))
-    return eqx.apply_updates(agent, up), opt_state, l, ent
+    # aux = (approx-head entropy, value MSE, vertex cross-entropy). The two
+    # loss halves are reported separately: `l` alone cannot say whether the
+    # value net or the policy head is the one that stopped learning.
+    return eqx.apply_updates(agent, up), opt_state, l, aux
 
 # ---------------------------------------------------------------- 5.-6. main loop
 def _run(args) -> int:
@@ -2146,14 +2188,18 @@ def _run(args) -> int:
                     jax.tree_util.tree_map(
                         lambda a: jnp.asarray(a[idx]), x)
                     for x in _cols)
-                agent, opt_state, L, _AH = train_step(agent, opt_state, batch)
+                agent, opt_state, L, _AUX = train_step(
+                    agent, opt_state, batch)
+            _AH, _VL, _CE = _AUX
             L = float(L)
+            _VLOSS, _CELOSS = float(_VL), float(_CE)
             # ACCEPTANCE (b): the approximation head is no longer frozen. This
             # is the arity-normalised per-FACE entropy from `_face_replay`,
             # the same quantity PPO logs under this key.
             _AP_ENT.append(float(_AH))
         else:
             L = float("nan")
+            _VLOSS, _CELOSS = float("nan"), float("nan")
         # --- approximation telemetry ---------------------------------
         # Built OUTSIDE the wandb block. It used to live inside it, so a
         # --wandb-off probe could not see `approx_applied/*` at all -- and
@@ -2206,6 +2252,47 @@ def _run(args) -> int:
             _MICRO_CHOICES.clear(); _VE_ENT.clear(); _AP_ENT.clear()
             _TIED_CANDIDATES[0] = 0; _TIED_TOTAL[0] = 0
             _FACE_WINDOW_SATURATED[0] = 0; _FACE_STEPS[0] = 0
+        # PER-EPISODE JSONL SINK (ALPHAGRAD_GAZ_JSONL, default off). Written
+        # append-only and BEFORE any dump, so a killed run keeps every
+        # measured episode -- the final gaz_result.json drops `solutions`.
+        if _GAZ_JSONL:
+            try:
+                _o = np.asarray(plan_wires(state)[0]).reshape(-1).tolist()
+                _rw = np.asarray(raw, dtype=np.float64).reshape(-1).tolist()
+                _bb = best.get("raw")
+                _rec = {
+                    "ep": int(ep),
+                    "n_meas": int(n_meas),
+                    "order": [int(v) for v in _o],
+                    "raw": _rw,
+                    "raw_names": ["latency_ns", "xla_peak_bytes",
+                                  "flops", "cos"],
+                    "loss": float(L),
+                    "value_loss": float(_VLOSS),
+                    "vertex_ce": float(_CELOSS),
+                    "best_scalar": float(best.get("scalar", float("nan"))),
+                    "best_raw": (list(_bb) if _bb is not None else None),
+                    "best_at": int(best.get("at", 0)),
+                    # PRIMARY READOUT. The analytic entropy of an exactly
+                    # UNIFORM policy over the shrinking legal set across a
+                    # 95-step elimination is mean_{k=1..95} ln k = 3.58749
+                    # nats; a run that ends there never left the random
+                    # policy, whatever its best latency says.
+                    "entropy/ve_head": (float(np.mean(_VE_ENT))
+                                       if _VE_ENT else float("nan")),
+                    "entropy/ve_head_std": (float(np.std(_VE_ENT))
+                                           if _VE_ENT else float("nan")),
+                    "entropy/ve_head_n": int(len(_VE_ENT)),
+                    "popart_mu": np.asarray(
+                        popart.mu, np.float64).reshape(-1).tolist(),
+                    "popart_sigma": np.asarray(
+                        popart.sigma, np.float64).reshape(-1).tolist(),
+                }
+                _rec.update(_SEARCH_DIAG)
+                with open(_GAZ_JSONL, "a") as _fh:
+                    _fh.write(json.dumps(_rec, default=float) + "\n")
+            except Exception as _je:
+                print(f"[gaz-jsonl] write failed: {_je}", flush=True)
         b = best["raw"]
         try:
             _scal = float(scalarize(raw))

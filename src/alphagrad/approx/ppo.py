@@ -350,6 +350,39 @@ HEAD_NAMES: tuple[str, ...] = ("latency", "mem", "quality")
 # Print every loss component the moment the total goes non-finite. Off by
 # default because it forces a host callback inside the jitted update.
 _DEBUG_NAN = os.environ.get("ALPHAGRAD_DEBUG_NAN", "0") == "1"
+# --- ORDER-SEARCH DIAGNOSTICS (task: PPO/GAZ vs POMO on the order space) ---
+# Both default OFF, so the trained path is byte-identical unless asked for.
+#   ALPHAGRAD_ADV_DIAG=1        -> one host callback per episode capturing the
+#     spread of the RAW and NORMALISED advantages, the GAE return targets and
+#     the critic's own predictions. The prior TLM order run reported explained
+#     variance -1.105 (critic worse than the mean), which is a statement about
+#     exactly these arrays, and none of them were observable.
+#   ALPHAGRAD_UPDATE_JSONL=<f>  -> append one JSON record per episode with the
+#     complete log_dict (scalars), the per-env elimination ORDERS and the raw
+#     terminal reward vectors, so a best-so-far-vs-unique-measurements curve
+#     and an order-diversity count can be built offline. wandb is not a
+#     substitute: --lean-logging drops every measure/<channel>/*_ep key.
+_ADV_DIAG = os.environ.get("ALPHAGRAD_ADV_DIAG", "0") == "1"
+_ADV_STATS = {}
+_UPD_JSONL = os.environ.get("ALPHAGRAD_UPDATE_JSONL", "")
+
+
+def _spread(prefix, x):
+    """min/max/mean/std/absmax of a finite-masked array, as a flat dict."""
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    f = np.isfinite(x)
+    out = {prefix + "/n": int(x.size),
+           prefix + "/n_nonfinite": int(x.size - int(f.sum()))}
+    if not f.any():
+        return out
+    y = x[f]
+    out.update({prefix + "/mean": float(y.mean()),
+                prefix + "/std": float(y.std()),
+                prefix + "/min": float(y.min()),
+                prefix + "/max": float(y.max()),
+                prefix + "/absmax": float(np.abs(y).max()),
+                prefix + "/n_zero": int((y == 0.0).sum())})
+    return out
 # How many leading episodes print the stdout health line (see its use site).
 _HEALTH_N = [0]
 
@@ -6397,6 +6430,29 @@ def main():
             # CLI --lambda-* weights; in Stage F it's the Dirichlet sample.
             norm_adv = jnp.sum(norm_adv_components * traj.preference, axis=-1)
 
+        # ADVANTAGE / BASELINE DIAGNOSTIC (ALPHAGRAD_ADV_DIAG=1, default off).
+        # `advantages` is what GAE produced, `norm_adv` is what the PPO ratio
+        # is actually multiplied by, `estim_returns` is the critic's target
+        # and `traj.value` is its prediction. One callback per episode (the
+        # arrays are already materialised here), so the cost is one host sync
+        # on a path that already has several.
+        if _ADV_DIAG:
+            # `new_sigma` only exists on the PopArt branch (Python-level `if`),
+            # so fall back to the incoming accumulator elsewhere.
+            _sig_diag = new_sigma if use_popart else popart_sigma
+
+            def _adv_cb(_a, _na, _er, _v, _s):
+                _ADV_STATS.clear()
+                _ADV_STATS.update(_spread("adv_raw", _a))
+                _ADV_STATS.update(_spread("adv_norm", _na))
+                _ADV_STATS.update(_spread("estim_returns", _er))
+                _ADV_STATS.update(_spread("value_pred", _v))
+                _ADV_STATS.update(_spread("popart_sigma", _s))
+
+            jax.debug.callback(
+                _adv_cb, advantages, norm_adv, estim_returns, traj.value,
+                _sig_diag)
+
         # Stage-by-stage NaN trace through the advantage/return path. The loss
         # localizer proved the NaN is ALREADY in norm_adv / estim_returns when
         # the batch is built, with every finite advantage exactly 0 and returns
@@ -7716,6 +7772,38 @@ def main():
             # never charged. Drop them: az's warm-up row carries neither.
             log_dict.pop("n_meas", None)
             log_dict.pop("time/episode", None)
+        # PER-EPISODE JSONL SINK (ALPHAGRAD_UPDATE_JSONL, default off).
+        # Written BEFORE wandb.log so a crashed/offline run still has it, and
+        # append-only so a mid-run kill keeps every completed episode. Carries
+        # what wandb cannot: the raw per-env terminal reward VECTORS (from
+        # which best-so-far latency/memory is reconstructible even under
+        # --lean-logging) and the ELIMINATION ORDERS themselves.
+        if _UPD_JSONL:
+            try:
+                import json as _json
+                _row = {"ep": int(ep), "warmup": bool(warmup)}
+                for _k, _v in log_dict.items():
+                    if isinstance(_v, bool):
+                        _row[_k] = _v
+                    elif isinstance(_v, (int, np.integer)):
+                        _row[_k] = int(_v)
+                    elif isinstance(_v, (float, np.floating)):
+                        _row[_k] = float(_v)
+                    elif isinstance(_v, str):
+                        _row[_k] = _v
+                    # wandb.Table / Image / anything else: skipped on purpose.
+                _row["orders"] = np.asarray(v_idx_arr).tolist()
+                _row["rets"] = np.asarray(all_rets, dtype=np.float64).tolist()
+                _row["reward_names"] = list(REWARD_NAMES)
+                _row["reward_weights"] = np.asarray(
+                    reward_weights_np, dtype=np.float64).tolist()
+                if true_return is not None:
+                    _row["true_return"] = float(true_return)
+                _row.update(_ADV_STATS)
+                with open(_UPD_JSONL, "a") as _fh:
+                    _fh.write(_json.dumps(_row) + "\n")
+            except Exception as _je:
+                print(f"[update-jsonl] write failed: {_je}", flush=True)
         wandb.log(log_dict)
 
         # Per-episode memory + JIT-cache diagnostic. Off by default; flip on
