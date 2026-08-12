@@ -136,6 +136,11 @@ class _Snapshot:
         return False
 
 
+# Serve a prefix miss by extending the n-1 tokenizer by one vertex instead of
+# replaying the whole prefix. ALPHAGRAD_FACE_PREFIX_EXTEND=0 restores the
+# O(T^2) rebuild (kept as an A/B switch, not because the rebuild is wanted).
+_PREFIX_EXTEND = os.environ.get("ALPHAGRAD_FACE_PREFIX_EXTEND", "1") == "1"
+
 class LiveFaceStream:
     """Per-face token chunks for one graph, cached across env steps."""
 
@@ -162,6 +167,10 @@ class LiveFaceStream:
         # distribution: a window below the typical chunk silently keeps only
         # the tail of the contraction the head is meant to read.
         self.stats = {"prefix_miss": 0, "prefix_hit": 0, "elims": 0,
+                      # `prefix_ext`: misses served by extending the n-1
+                      # tokenizer by ONE vertex instead of replaying the
+                      # whole prefix (see `_tokenizer_at`).
+                      "prefix_ext": 0,
                       "chunk_hit": 0, "failures": 0, "truncated": 0,
                       "tok_total": 0, "tok_max": 0, "chunks": 0,
                       # The face <-> segment correspondence (see `chunk`).
@@ -208,11 +217,15 @@ class LiveFaceStream:
             self.stats["prefix_hit"] += 1
             return hit
         self.stats["prefix_miss"] += 1
-        tk = IncrementalPathTokenizer(
-            self.jaxpr, self.argnums, list(self.consts), list(self.args),
-            vocab_size=self.vocab)
-        tk.base_tokens()
-        for k in range(n):
+
+        def _apply(tk, k):
+            """Replay prefix vertex ``k`` onto ``tk``.
+
+            Lifted verbatim out of the cold loop so the extend path below
+            and the cold path apply the SAME sequence of operations to the
+            same tokenizer state -- that identity is what makes the extend
+            observationally invisible.
+            """
             v = int(order[k])
             try:
                 rules = decode_vertex_rule_specs(
@@ -240,6 +253,48 @@ class LiveFaceStream:
                 except Exception:
                     ft = None
             tk.eliminate(v, hooks, ft or None)
+
+        # POP-EXTEND. A rollout asks for prefixes 1, 2, 3, ... in order, and
+        # the key grows by one vertex each time, so EVERY step missed and
+        # rebuilt the tokenizer from `base_tokens()` by replaying all n
+        # eliminations. That is O(T^2) per episode: measured at 1.8 ms per
+        # replayed vertex it ramped the per-decision cost from 17 ms at
+        # step 0 to ~190 ms at step 94 (~8 s of the ~13 s rollout), and it
+        # was invisible because it runs on the host inside the face-count
+        # `pure_callback` -- device-side timers charged it to `env.step`.
+        #
+        # The n-1 tokenizer is already in the cache and, once step n starts,
+        # nothing will ask for it again. POP it (rather than copy: a copy of
+        # the whole IncrementalJaxpr per step is the cost we are removing)
+        # and push it forward by the single new vertex. Popping is what keeps
+        # this invisible -- no live entry is ever mutated under a reader, and
+        # any consumer that really does want the n-1 prefix back simply takes
+        # a cold rebuild, exactly as it would have on any other eviction.
+        #
+        # `order[:n-1]` / `specs[:n-1]` / the face wires below index n-1 are
+        # bitwise stable across the step: `env.step` only shift-and-inserts
+        # at `idx = step_count`, so rows below it never move.
+        tk = None
+        if _PREFIX_EXTEND and n > 0:
+            pkey = (order[:n - 1].tobytes(), specs[:n - 1].tobytes(),
+                    b"" if frh is None else frh[:n - 1].tobytes(),
+                    b"" if fsh is None else fsh[:n - 1].tobytes())
+            tk = self._prefix.pop(pkey, None)
+            if tk is not None:
+                try:
+                    _apply(tk, n - 1)
+                    self.stats["prefix_ext"] += 1
+                except Exception:
+                    # Half-applied: discard and take the cold path, which
+                    # rebuilds from scratch and cannot see the damage.
+                    tk = None
+        if tk is None:
+            tk = IncrementalPathTokenizer(
+                self.jaxpr, self.argnums, list(self.consts), list(self.args),
+                vocab_size=self.vocab)
+            tk.base_tokens()
+            for k in range(n):
+                _apply(tk, k)
         if len(self._prefix) >= self.cache_cap:
             for dk in list(self._prefix)[: max(1, self.cache_cap // 4)]:
                 self._prefix.pop(dk, None)
