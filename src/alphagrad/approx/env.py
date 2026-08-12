@@ -446,6 +446,44 @@ def _get_resource_monitor(unique_devices):
     return mon
 
 
+def _face_wire_keys(faces_np, skips_np, n):
+    """Per-vertex compact hashable identity of the face wire rows.
+
+    The stream cache keys on the face history, and the history it was keyed
+    on was the DENSE int tuple: ``MAX_FACES x FACE_SLOTS x 3`` Python ints per
+    vertex, for every vertex in the prefix, rebuilt AND rehashed on every
+    callback. With the flagship's derived bound (MAX_FACES=2538) that is
+    22842 ints per vertex, i.e. O(T x 22842) per step and O(T^2 x 22842) per
+    episode -- while the measured live-face occupancy is 1.24 faces per
+    vertex, so >99.9% of it encodes padding.
+
+    The wire format pads with -1, so ``(positions of the non -1 entries,
+    their values)`` is a COMPLETE and injective description of the row for a
+    fixed shape -- every entry not listed is exactly -1. Same for the skips
+    against their 0 padding. One vectorised pass over the prefix replaces the
+    Python int construction, and the resulting keys are a few bytes each, so
+    hashing them (and the ancestor-cut slices, which hash the whole prefix
+    key once per probe) stops being O(T x MAX_FACES).
+    """
+    if n <= 0:
+        return ()
+    f = np.ascontiguousarray(faces_np[:n]).reshape(n, -1)
+    s = np.ascontiguousarray(skips_np[:n]).reshape(n, -1)
+    fr, fc = np.nonzero(f != -1)
+    sr, sc = np.nonzero(s != 0)
+    fb = np.searchsorted(fr, np.arange(n + 1))
+    sb = np.searchsorted(sr, np.arange(n + 1))
+    fv = f[fr, fc].astype(np.int32)
+    sv = s[sr, sc].astype(np.int32)
+    fc = fc.astype(np.int32)
+    sc = sc.astype(np.int32)
+    return tuple(
+        (fc[fb[k]:fb[k + 1]].tobytes(), fv[fb[k]:fb[k + 1]].tobytes(),
+         sc[sb[k]:sb[k + 1]].tobytes(), sv[sb[k]:sb[k + 1]].tobytes())
+        for k in range(n)
+    )
+
+
 def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
                                tok_rules_by_v, ft_by_vertex=None,
                                face_key=None, honor_last_compress=True,
@@ -545,8 +583,14 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
         int(r[0]) == COMPRESS_SENTINEL for r in steps[-1][1])
     if (honor_last_compress and not _last_has_compress and steps
             and isinstance(face_key, tuple) and face_key):
-        _last_has_compress = any(
-            int(r0) == COMPRESS_SENTINEL for r0 in face_key[-1][0][0::3])
+        # `_face_wire_keys` entries are (flat positions of the non -1 face
+        # entries, their values, ...) as int32 bytes. The wire row is
+        # ``[r0, r1, r2]``, so the r0 column is exactly the positions
+        # divisible by 3 -- the same set the dense ``[0::3]`` slice picked.
+        _c = np.frombuffer(face_key[-1][0], dtype=np.int32)
+        _v = np.frombuffer(face_key[-1][1], dtype=np.int32)
+        _last_has_compress = bool(
+            np.any((_c % 3 == 0) & (_v == COMPRESS_SENTINEL)))
     if not _last_has_compress:
         for cut in range(len(steps) - 1, 0, -1):
             parent = _INCR_STREAM_CACHE.pop(
@@ -2654,7 +2698,9 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
         for s in range(FACE_SLOTS):
             # The decoder walks all MAX_RULES slots — pad the single face
             # row with end-sentinels.
-            one_row = [list(face_row[f][s])] + [
+            # `face_row` may be a numpy view (the caller no longer pays for a
+            # dense `.tolist()`), so pull the 3 wire ints out explicitly.
+            one_row = [[int(x) for x in face_row[f][s]]] + [
                 [-1, -1, 0]
             ] * (MAX_RULES_PER_VERTEX - 1)
             rules = decode_vertex_rule_specs(
@@ -3004,15 +3050,16 @@ def _callback(
             config, consts, args, o_list, specs_list, tok_rules_by_v,
             ft_by_vertex=ft_by_vertex,
             honor_last_compress=_honor_mid_compress,
-            face_rows_list=_faces_np.tolist() if _fe_inline else None,
-            face_skips_list=_skips_np.tolist() if _fe_inline else None,
+            # NUMPY, not `.tolist()`: only the ~1.24 LIVE faces of the
+            # CURRENT vertex are ever indexed out of these, so materialising
+            # T x MAX_FACES x FACE_SLOTS x 3 Python ints per step was pure
+            # padding cost (O(T^2) per episode).
+            face_rows_list=_faces_np if _fe_inline else None,
+            face_skips_list=_skips_np if _fe_inline else None,
             # PER-STEP signatures (not one whole-prefix blob) so the stream
             # cache can find the parent at every ancestor cut under face
             # actions instead of replaying the whole prefix cold each step.
-            face_key=tuple(
-                (tuple(int(x) for x in _faces_np[k].reshape(-1)),
-                 tuple(int(x) for x in _skips_np[k].reshape(-1)))
-                for k in range(len(o_list)))
+            face_key=_face_wire_keys(_faces_np, _skips_np, len(o_list))
             if (ft_by_vertex is not None or _fe_inline) else None,
         )
         if _fe_inline:
