@@ -4223,9 +4223,18 @@ class VertexEliminationEnv:
                        if eval_samples else None)
                 ro = [np.asarray(_cb_slot(order, i, E)) for i in range(E)]
                 rs = [np.asarray(_cb_slot(specs, i, E)) for i in range(E)]
-                rf = [np.asarray(_cb_slot(face_specs, i, E))
+                # LIVE PREFIX ONLY. `_callback` reads `face_specs[:stop]` and
+                # nothing else, but the wire buffer is (N, MAX_FACES,
+                # FACE_SLOTS, 3) int32 -- 8.7 MB at the flagship's N=95 /
+                # MAX_FACES=2538 -- and every byte of it was being pickled
+                # and shipped to the actor on every step, including the
+                # all-(-1) rows for eliminations that have not happened yet.
+                # Slicing here is exactly what the callee would have sliced.
+                rf = [np.ascontiguousarray(
+                          np.asarray(_cb_slot(face_specs, i, E))[:_sti[i]])
                       for i in range(E)]
-                rk = [np.asarray(_cb_slot(face_skips, i, E))
+                rk = [np.ascontiguousarray(
+                          np.asarray(_cb_slot(face_skips, i, E))[:_sti[i]])
                       for i in range(E)]
                 _any_faces = any(
                     (f[..., 0] >= 0).any() or (k == 1).any()
