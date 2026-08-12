@@ -277,6 +277,9 @@ def main(argv=None):
             {"tag": "ref", "update": ref_state["update"], "t_s": r["t_s"],
              "status": r.get("status"), "reason": r.get("reason"),
              "latency_ns": _lat(r), "mem_total_bytes": _mem(r),
+             "mem_temp_bytes": r.get("mem_temp_bytes"),
+             "mem_output_bytes": r.get("mem_output_bytes"),
+             "peak_delta_bytes": r.get("peak_delta_bytes"),
              "compile_s": r.get("compile_s"), "wall_s": r["wall_s"]}) + "\n")
         return r
 
@@ -309,6 +312,18 @@ def main(argv=None):
                "check_error": res.get("check_error"),
                "t_s": res.get("t_s"),
                "compile_s": res.get("compile_s"), "wall_s": res.get("wall_s"),
+               # BOTH memory numbers per measurement: the STATIC
+               # memory_analysis temp+output the objective is built on
+               # (mem_total_bytes above) and the RUNTIME peak_bytes_in_use
+               # delta the alphagrad stack's peak_memory channel holds. The
+               # worker has always returned both; only the objective was
+               # persisted, so the two could not be compared across plans.
+               # peak_delta_bytes is None exactly when the backend does not
+               # expose allocator statistics -- an explicit field, not a
+               # silent substitution.
+               "mem_temp_bytes": res.get("mem_temp_bytes"),
+               "mem_output_bytes": res.get("mem_output_bytes"),
+               "peak_delta_bytes": res.get("peak_delta_bytes"),
                "order": [int(j) for j in order]}
         if extra:
             row.update(extra)

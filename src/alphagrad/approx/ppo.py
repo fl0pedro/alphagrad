@@ -3023,7 +3023,8 @@ def make_argparser() -> argparse.ArgumentParser:
         "jacve of it yields the gradients the spec asks to time.",
     )
     p.add_argument(
-        "--quality-metric", choices=["auto", "loss_drop", "cosine"],
+        "--quality-metric",
+        choices=["auto", "loss_drop", "cosine", "none"],
         default="auto",
         help="WHICH quantity reward slot 6 (the --lambda-acc channel) holds. "
         "loss_drop = the relative loss drop of a 200-step Adam walk driven by "
@@ -4413,7 +4414,22 @@ def main():
     # agree". One env var read by one function (env.quality_metric) in one
     # module makes disagreement impossible. Set BEFORE ray.init so every actor
     # inherits it.
-    os.environ["ALPHAGRAD_QUALITY_METRIC"] = str(args.quality_metric)
+    # ORDER-ONLY / EXACT ARM: with --no-approx-head no plan can approximate
+    # anything, so every plan returns the EXACT gradient and the quality
+    # channel is a CONSTANT (measured on TLM: 0.88532-0.88533 on every plan of
+    # every arm, 503/503 progress samples of job 59311). A constant channel
+    # contributes exactly zero gradient while the loss-drop walk that produces
+    # it costs 200 executions of the plan -- twice the entire latency budget.
+    # Resolve "auto" to "none" there and say so; an explicit --quality-metric
+    # is always honoured.
+    _qm = str(args.quality_metric)
+    if _qm == "auto" and bool(getattr(args, "no_approx_head", False)):
+        _qm = "none"
+        print("[alphagrad] ORDER-ONLY arm (--no-approx-head): the quality "
+              "channel is constant by construction, so it is NOT computed "
+              "(--quality-metric none). Pass --quality-metric loss_drop to "
+              "force it.", flush=True)
+    os.environ["ALPHAGRAD_QUALITY_METRIC"] = _qm
     os.environ["ALPHAGRAD_WALK_STEPS"] = str(int(args.walk_steps))
     os.environ["ALPHAGRAD_WALK_LR"] = repr(float(args.walk_lr))
     os.environ["ALPHAGRAD_WALK_PROBE_SEED"] = str(int(args.walk_probe_seed))
@@ -4428,7 +4444,9 @@ def main():
         + (f" (walk: {int(args.walk_steps)} Adam steps, lr {args.walk_lr:g}, "
            f"probe seed {int(args.walk_probe_seed)}, noise std "
            f"{args.walk_noise_std:g})" if _QUALITY_METRIC == "loss_drop"
-           else " (Jacobian cosine vs the exact reference)"),
+           else (" (NOT COMPUTED -- reward slot 6 stays 0.0; the cost "
+                 "channels are unaffected)" if _QUALITY_METRIC == "none"
+                 else " (Jacobian cosine vs the exact reference)")),
         flush=True)
     env = VertexEliminationEnv.from_jaxpr(
         closed_jaxpr,

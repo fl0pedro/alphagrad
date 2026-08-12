@@ -1260,6 +1260,15 @@ class EnvConfig(NamedTuple):
     # ``auto`` default needs it to decide between the loss-drop walk (defined
     # only for a scalar loss) and the legacy Jacobian cosine.
     measure_grad: bool = False
+    # WARMUP executions before the timed window. Passed by every caller
+    # (cpu_approx_worker, az_gumbel) since the actor-args dict was written, but
+    # until now it had NO READER in this module -- it was swallowed by
+    # ``from_jaxpr(**_compat)``. The elimrl/POMO worker always runs exactly one
+    # untimed warmup call before its timing loop; this stack ran none, so its
+    # FIRST timed rep paid first-touch/allocator cost that the reference
+    # protocol does not. Default 0 keeps every existing campaign bit-identical;
+    # set it to 1 to match the reference protocol.
+    latency_warmup: int = 0
 
 
 def _get_partials(order, sparsity_specs, stop):
@@ -2118,10 +2127,29 @@ def quality_metric(config=None) -> str:
         return "loss_drop"
     if want in ("cosine", "cos", "cosine_sim"):
         return "cosine"
+    # "none" -- NO QUALITY CHANNEL AT ALL: neither the exact executable nor the
+    # 200-step loss-drop walk is built, and reward slot 6 stays 0.0.
+    #
+    # For an ORDER-ONLY / exact arm the channel is a measured CONSTANT (TLM
+    # seq32/dm128/vocab1024, --no-approx-head: 0.8853 on every plan of every
+    # arm) because the plan cannot approximate anything -- the gradient it
+    # returns is the exact gradient whatever the elimination order, so the walk
+    # re-derives the same loss drop every time. It therefore contributes
+    # exactly zero gradient while costing the single largest share of the
+    # measurement budget (200 extra executions of the plan + ~1 s of host
+    # overhead, vs 100 executions for the whole latency channel).
+    #
+    # The COST channels are untouched by this: with no quality sample
+    # ``cosines`` stays empty, so ``_apply_quality_gate`` is handed
+    # has_quality=False and returns its inputs unchanged -- latency_ns and
+    # peak_memory are bit-identical to a run that computed the walk and threw
+    # the number away.
+    if want in ("none", "off", "skip"):
+        return "none"
     if want not in ("auto", ""):
         raise ValueError(
-            f"{_QUALITY_METRIC_ENV} must be one of auto/loss_drop/cosine, "
-            f"got {want!r}"
+            f"{_QUALITY_METRIC_ENV} must be one of "
+            f"auto/loss_drop/cosine/none, got {want!r}"
         )
     return "loss_drop" if bool(getattr(config, "measure_grad", False)) else "cosine"
 
@@ -2419,6 +2447,75 @@ def consume_static_peak_fallbacks() -> int:
     n = _STATIC_PEAK_FALLBACKS[0]
     _STATIC_PEAK_FALLBACKS[0] = 0
     return n
+
+
+# ---------------------------------------------------------------------------
+# MEMORY PARITY (ALPHAGRAD_MEM_PARITY=1, default on; 0 disables).
+#
+# Two different quantities have been called "the" memory cost of a plan:
+#
+#   STATIC   ``compiled.memory_analysis()`` temp + output bytes -- deterministic
+#            (CV exactly 0 by construction) and what the elimrl/POMO stack
+#            optimises (``mem_total_bytes``);
+#   RUNTIME  the ``peak_bytes_in_use`` delta across one execution window --
+#            what ``peak_memory`` holds here whenever the backend exposes
+#            allocator statistics.
+#
+# They are NOT incomparable: on the same plan they track each other to roughly
+# a constant factor. Recording BOTH for EVERY measurement -- together with
+# WHICH one actually landed in the reward -- is the only way to verify that
+# factor across many plans instead of one, and it turns the static fallback
+# from a silent in-place substitution into an explicit field of the record.
+# ---------------------------------------------------------------------------
+_MEM_PARITY: list = []
+_MEM_PARITY_ON = os.environ.get("ALPHAGRAD_MEM_PARITY", "1") != "0"
+
+
+def _record_mem_parity(compiled, runtime_peak, source: str,
+                       is_terminal: bool) -> None:
+    """One (static, runtime, source) triple per measurement."""
+    if not _MEM_PARITY_ON or compiled is None:
+        return
+    _t0 = time.perf_counter()
+    try:
+        ma = compiled.memory_analysis()
+    except Exception:
+        ma = None
+    if ma is None:
+        _st = _so = None
+    else:
+        _st = float(getattr(ma, "temp_size_in_bytes", 0) or 0.0)
+        _so = float(getattr(ma, "output_size_in_bytes", 0) or 0.0)
+    rec = {
+        "static_temp_bytes": _st,
+        "static_output_bytes": _so,
+        "static_total_bytes": None if _st is None else _st + _so,
+        "runtime_peak_bytes": (None if runtime_peak is None
+                               else float(runtime_peak)),
+        # "runtime_delta"   the reward's peak_memory IS the measured delta;
+        # "static_fallback" allocator stats were unavailable and the STATIC
+        #                   estimate was substituted in place (a different
+        #                   quantity -- this is the field that used to be a
+        #                   one-shot printed warning and nothing else);
+        # "bypassed"        ALPHAGRAD_BYPASS_RESOURCE_MONITOR=1, no reading.
+        "peak_source": source,
+        "terminal": bool(is_terminal),
+    }
+    _MEM_PARITY.append(rec)
+    _prof_add("cb.mem_parity", time.perf_counter() - _t0)
+    if os.environ.get("ALPHAGRAD_DEBUG_MEASURE", "0") == "1":
+        _s, _r = rec["static_total_bytes"], rec["runtime_peak_bytes"]
+        _f = f"{_r / _s:.3f}" if (_s and _r) else "n/a"
+        print(f"[mem-parity] static(temp+out)={_s} runtime_peak={_r} "
+              f"runtime/static={_f} source={source} "
+              f"terminal={bool(is_terminal)}", flush=True)
+
+
+def consume_mem_parity() -> list:
+    """Pop the per-period memory-parity records (see ``_record_mem_parity``)."""
+    out = list(_MEM_PARITY)
+    _MEM_PARITY.clear()
+    return out
 
 
 def _cb_slot(x, i, E):
@@ -3648,6 +3745,9 @@ def _callback(
     cosines: list = []
     latency_samples: list[float] = []
     peak_mem_samples: list[float] = []
+    # WHICH quantity the peak samples hold (see _record_mem_parity): the
+    # measured runtime delta, the substituted static estimate, or nothing.
+    _peak_src = "not_measured"
 
     # OOM during EXECUTION is truncation too (see _oom_truncate): the
     # measurement allocates the full approximated Jacobian, so a graph that
@@ -3677,12 +3777,19 @@ def _callback(
             # ``ResourceMonitor`` (not its C++ tracker) leaks. peak_memory +
             # latency_ns are zero for the run.
             inner = max(1, int(getattr(config, "latency_inner_reps", 1)))
+            # WARMUP (config.latency_warmup, default 0 = unchanged): untimed
+            # executions before the first timed rep, matching the elimrl/POMO
+            # worker's single warmup call. Runs OUTSIDE every timing and memory
+            # window, so it can only remove first-touch bias, never add to it.
+            for _w in range(max(0, int(getattr(config, "latency_warmup", 0)))):
+                jax.block_until_ready(compiled_cost(*eval_args_i))
             _direct = os.environ.get("ALPHAGRAD_DIRECT_MEASURE", "0") == "1"
             for _rep in range(n_reps):
                 if os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1":
                     out_approx = compiled_cost(*eval_args_i)
                     latency_samples.append(0.0)
                     peak_mem_samples.append(0.0)
+                    _peak_src = "bypassed"
                 elif _direct:
                     # Spec-native primitives, no jax_memory_monitor object at all
                     # (its per-call C++ trackers are the leak that killed v10):
@@ -3761,6 +3868,8 @@ def _callback(
                         _peak = _memory_analysis_bytes(compiled_cost) or 0.0
                         _note_static_peak_fallback(
                             "this backend does not expose allocator statistics")
+                    _peak_src = ("runtime_delta" if _have_stats
+                                 else "static_fallback")
                     latency_samples.append((_t1 - _t0) / inner * 1e9)  # → ns
                     peak_mem_samples.append(_peak)
                 else:
@@ -3788,6 +3897,9 @@ def _callback(
                         _note_static_peak_fallback(
                             "ResourceMonitor reported a zero device peak "
                             "(structural on CPU backends)")
+                        _peak_src = "static_fallback"
+                    else:
+                        _peak_src = "runtime_delta"
                     latency_samples.append(latency_s * 1e9)  # → ns
                     peak_mem_samples.append(peak_bytes)
 
@@ -3829,6 +3941,7 @@ def _callback(
         # across plans by construction, so repeating the walk over the
         # calibration samples would re-measure the same number. Runs after
         # the cost loop so the timing/peak windows above never contain it.
+        _pf("cb.exec_measure")
         if is_terminal and _qmetric == "loss_drop":
             _ld = _loss_drop_quality(
                 config, compiled_approx, list(args), callback_device)
@@ -3850,6 +3963,11 @@ def _callback(
                 cosines.append(0.0)
             else:
                 cosines.append(_ld)
+        # The walk is the single most expensive phase of a measurement on an
+        # approximation arm (200 executions of the plan + ~1 s of host time,
+        # vs 100 executions for the entire latency channel), so it gets its
+        # own bucket instead of hiding inside cb.exec_measure.
+        _pf("cb.quality_walk")
 
     except Exception as _exc:
         if _is_graphax_trace_failure(_exc):
@@ -3857,7 +3975,6 @@ def _callback(
         if not _is_oom(_exc):
             raise
         return _oom_truncate('measurement', _exc)
-    _pf("cb.exec_measure")
     latency_ns = (
         float(_aggregate_samples(latency_samples, want_top_quartile=True))
         if config.measure_latency
@@ -3876,6 +3993,11 @@ def _callback(
         if peak_mem_samples
         else 0.0
     )
+    # BOTH memory numbers, per measurement, with the source of the one that
+    # trains made explicit (see _record_mem_parity).
+    _record_mem_parity(compiled_cost,
+                       peak_memory if peak_mem_samples else None,
+                       _peak_src, is_terminal)
 
     # ------------------------------------------------------------------
     # Quality family — reward slot 6 (``quality``) + frob_residual.
@@ -4087,6 +4209,7 @@ class VertexEliminationEnv:
         num_data_points: int = 5,
         reps_per_point: int = 4,
         latency_inner_reps: int = 1,
+        latency_warmup: int = 0,
         per_face: bool = False,
         measure_grad: bool = False,
         delta_obs: bool = False,
@@ -4136,6 +4259,7 @@ class VertexEliminationEnv:
             num_data_points=int(num_data_points),
             reps_per_point=int(reps_per_point),
             latency_inner_reps=int(latency_inner_reps),
+            latency_warmup=int(latency_warmup),
             per_face=bool(per_face),
             target_fun=target_fun,
             data_gen=data_gen,
