@@ -185,13 +185,13 @@ from alphagrad.utils import entropy, explained_variance
 # whatever preceded the episode).
 _PROFILE_POLICY = os.environ.get("ALPHAGRAD_PROFILE_POLICY", "0") == "1"
 _PP_LAST: list = [None]
-_PP_SINK: list = [None, None]
+_PP_SINK: list = [None, None, None]
 
 
 def _pp_sinks():
     if _PP_SINK[0] is None:
-        from alphagrad.approx.env import _prof_add, _prof_sample
-        _PP_SINK[0], _PP_SINK[1] = _prof_add, _prof_sample
+        from alphagrad.approx.env import _prof_add, _prof_sample, _trace
+        _PP_SINK[0], _PP_SINK[1], _PP_SINK[2] = _prof_add, _prof_sample, _trace
     return _PP_SINK
 
 
@@ -200,9 +200,13 @@ def _pp_mark_host(key, x):
     now = _t.perf_counter()
     prev = _PP_LAST[0]
     _PP_LAST[0] = now
+    if _PP_SINK[0] is None:
+        _pp_sinks()
+    if _PP_SINK[2] is not None:
+        _PP_SINK[2](f"mark:{key}")
     if prev is not None and key is not None:
         dt = now - prev
-        _add, _samp = _pp_sinks()
+        _add, _samp = _pp_sinks()[:2]
         _add(key, dt)
         _samp(key, dt)
     a = np.asarray(x)
@@ -5279,9 +5283,22 @@ def main():
             delta_tok = state.delta_tokens
             delta_eqn = state.delta_eqns
             delta_count = state.delta_count
-            # Phase-0: everything since the previous mark is scan glue
-            # (avail mask, key split, the delta unpack above).
-            delta_tok = _pp_mark("prof/scanmisc", delta_tok)
+            # prof/envcb: THE ENV CALLBACK, not scan glue.
+            #
+            # `_pp_mark` anchors on the first few leaves of the value it is
+            # handed, and `prof/envstep`'s anchor is EnvState's leading
+            # leaves -- order / sparsity_specs / face_specs / face_skips --
+            # every one of which is produced on device and none of which
+            # depends on the host callback. So the envstep mark fires as soon
+            # as the device-side state update is done and the callback is
+            # still in flight; the first mark that MUST wait for it is this
+            # one, whose anchor (`state.delta_tokens`) IS the callback's
+            # output. Verified on an event trace: per decision the callback's
+            # enter/exit bracket falls strictly between mark:prof/envstep and
+            # mark:prof/envcb, and `prof/measure_wait` is nested INSIDE it.
+            # Read the pair as: envstep = device env step + callback
+            # dispatch, envcb = the callback itself (>= measure_wait).
+            delta_tok = _pp_mark("prof/envcb", delta_tok)
             # Kept as a mark so the key still reports: `prof/encode` is now
             # the cost of NOT extending here, i.e. ~0. The extend it used to
             # time is `prof/encode_bootstrap`, run once.
@@ -5443,8 +5460,10 @@ def main():
             env_out = env_obj.step(state, env_action)
             next_state = env_out.state
             raw_rewards = env_out.reward
-            # prof/envstep: the env callback (tokenizer replay + measurement).
-            # Overlaps env.py's cb.* / prof/measure_wait keys by construction.
+            # prof/envstep: the DEVICE-side env step (order/spec/face-wire
+            # shift-and-insert, axis-state update) plus callback dispatch --
+            # NOT the callback, which lands in `prof/envcb` at the top of the
+            # next iteration. See the note there.
             next_state, raw_rewards = _pp_mark(
                 "prof/envstep", (next_state, raw_rewards))
             rewards = raw_rewards
@@ -7826,6 +7845,18 @@ def main():
                         tqdm.write(
                             f"[ppdec ep={ep:3d}]\n  " + _pp_summary(_samp),
                             file=sys.stderr)
+                    # EVENT TRACE (ALPHAGRAD_PROFILE_TRACE=1 +
+                    # ALPHAGRAD_PROFILE_TRACE_FILE=path): the flat (t, label)
+                    # log that establishes which timed phase CONTAINS which.
+                    # Appended per episode; never read back by the trainer.
+                    _tf = os.environ.get("ALPHAGRAD_PROFILE_TRACE_FILE", "")
+                    if _tf:
+                        from alphagrad.approx.env import consume_trace as _ct
+                        _evs = _ct()
+                        if _evs:
+                            with open(_tf, "a") as _fh:
+                                for _t, _lab in _evs:
+                                    _fh.write(f"{ep}\t{_t:.9f}\t{_lab}\n")
                     _dst = _cds()
                     if _dst:
                         _caps = {
@@ -8197,6 +8228,27 @@ def main():
             popart_m2,
             popart_w,
         )
+        # SEEDED EQUIVALENCE DUMP (ALPHAGRAD_EQ_DUMP=<prefix>, off by default).
+        # Any change to the env / callback / rollout path has to be proven
+        # trajectory-identical against its parent commit, and the only honest
+        # way to do that is to pickle the post-episode state and diff it leaf
+        # by leaf (see ~/dsnn/_eq137_cmp.py). Pure instrumentation: nothing
+        # downstream reads the file, and the branch is dead without the var.
+        _eqp = os.environ.get("ALPHAGRAD_EQ_DUMP", "")
+        if _eqp:
+            import pickle as _pk
+            _leaves = lambda t: [np.asarray(l) for l in
+                                 jax.tree_util.tree_leaves(t)]
+            with open(f"{_eqp}.ep{ep}.pkl", "wb") as _fh:
+                _pk.dump({
+                    "params": _leaves(eqx.filter(agent, eqx.is_array)),
+                    "opt": _leaves(opt_state),
+                    "metrics": _leaves(metrics),
+                    "actions": _leaves(actions_pack),
+                    "rewards": np.asarray(total_rewards_full),
+                    "step": int(global_step),
+                    "ret": float(true_scalar_return),
+                }, _fh)
         host_log(
             ep,
             total_rewards_full,

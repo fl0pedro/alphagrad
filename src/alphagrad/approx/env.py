@@ -657,6 +657,34 @@ def consume_profile_samples() -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# EVENT TRACE (ALPHAGRAD_PROFILE_TRACE=1).
+#
+# `_prof_add` totals and `_prof_sample` per-decision means both assume the
+# phases they time are disjoint. They are not: the env callback's own
+# `prof/measure_wait` is nested inside ppo's `prof/envstep` mark interval, and
+# a running-clock mark ("everything since the previous mark") silently absorbs
+# whatever it does not name. A flat (t, label) event log is the only way to
+# establish who contains whom -- reconstruct the nesting from the timestamps
+# instead of trusting the bucket names.
+# ---------------------------------------------------------------------------
+_PROF_TRACE: list = []
+_PROFILE_TRACE = os.environ.get("ALPHAGRAD_PROFILE_TRACE", "0") == "1"
+
+
+def _trace(label: str) -> None:
+    """Append one timestamped event (ALPHAGRAD_PROFILE_TRACE=1, else no-op)."""
+    if _PROFILE_TRACE:
+        _PROF_TRACE.append((time.perf_counter(), label))
+
+
+def consume_trace() -> list:
+    """Pop [(perf_counter, label), ...] since the last call."""
+    out = list(_PROF_TRACE)
+    _PROF_TRACE.clear()
+    return out
+
+
 def _dist_add(key: str, value) -> None:
     """Record one sample of a size distribution (ALPHAGRAD_PROFILE_DIST=1)."""
     if not _PROFILE_DIST:
@@ -4132,6 +4160,13 @@ class VertexEliminationEnv:
                 # CPU actors must not time a GPU campaign — while
                 # non-terminal rows (tokens-only under
                 # terminal_rewards_only) shard to the pool.
+                _trace("cb_batched.enter")
+                # prof/env_cb_host: the WHOLE host callback, so the episode
+                # table closes without an event trace. `prof/measure_wait` is
+                # nested inside this, and this is nested inside ppo's
+                # `prof/envcb` mark interval (which adds only the mark's own
+                # dispatch on either side).
+                _cb0 = time.perf_counter()
                 _o = np.asarray(order)
                 E = int(_o.shape[0])
                 _st = np.asarray(step).reshape(-1)
@@ -4169,6 +4204,7 @@ class VertexEliminationEnv:
                     # measurement actors return. Timed separately from the
                     # cb.* phases because it is not trainer compute at all --
                     # it is idle time the rollout pays per (terminal) step.
+                    _trace("measure_wait.enter")
                     _mw0 = time.perf_counter()
                     try:
                         (tokens, eqn_ids, rewards,
@@ -4189,6 +4225,7 @@ class VertexEliminationEnv:
                         _mwdt = time.perf_counter() - _mw0
                         _prof_add("prof/measure_wait", _mwdt)
                         _prof_sample("prof/measure_wait", _mwdt)
+                        _trace("measure_wait.exit")
                     for k2, i in enumerate(_remote):
                         tk[i] = np.asarray(tokens)[k2]
                         ei[i] = np.asarray(eqn_ids)[k2]
@@ -4205,6 +4242,10 @@ class VertexEliminationEnv:
                     tk[i] = np.asarray(t_i)
                     ei[i] = np.asarray(e_i)
                     rw[i] = np.asarray(r_i)
+                _cbdt = time.perf_counter() - _cb0
+                _prof_add("prof/env_cb_host", _cbdt)
+                _prof_sample("prof/env_cb_host", _cbdt)
+                _trace("cb_batched.exit")
                 return tk, ei, rw
 
             return _remote_callback_batched
