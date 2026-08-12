@@ -7964,6 +7964,19 @@ def main():
         _jax_trace_ep = 2
     _jax_trace_active = False
 
+    # DEVICE-LEVEL TRACE (ALPHAGRAD_XLA_TRACE_DIR=<dir> plus
+    # ALPHAGRAD_XLA_TRACE_EPS=<comma-separated episode indices>). Wraps the
+    # whole `train_episode` call in `jax.profiler.trace`, which records the
+    # XLA op timeline as the device actually ran it. The `_pp_mark` timers
+    # can only attribute HOST spans between two callbacks; they cannot say
+    # which HLO op inside `env.step` costs what, and the last two host
+    # attributions were both wrong until the mark anchor was fixed. Off by
+    # default; when off this is one bool test per episode and zero HLO.
+    _xtr_dir = os.environ.get("ALPHAGRAD_XLA_TRACE_DIR", "")
+    _xtr_eps = {int(_x) for _x in
+                os.environ.get("ALPHAGRAD_XLA_TRACE_EPS", "").split(",")
+                if _x.strip()}
+
     for ep in range(args.episodes):
         if _jax_trace_dir and ep == _jax_trace_ep and not _jax_trace_active:
             tqdm.write(
@@ -8211,6 +8224,9 @@ def main():
                       flush=True)
             env_states = reset_envs(env_episode)
 
+        _xtr_on = bool(_xtr_dir) and ep in _xtr_eps
+        if _xtr_on:
+            jax.profiler.start_trace(os.path.join(_xtr_dir, f"ep{ep}"))
         (
             agent,
             opt_state,
@@ -8243,6 +8259,13 @@ def main():
             popart_m2,
             popart_w,
         )
+        if _xtr_on:
+            # The trace has to stay open until the device is drained or the
+            # timeline stops at the first output that happens to be ready.
+            jax.block_until_ready(
+                (agent, opt_state, metrics, total_rewards_full,
+                 global_step, popart_m1, popart_m2, popart_w))
+            jax.profiler.stop_trace()
         # SEEDED EQUIVALENCE DUMP (ALPHAGRAD_EQ_DUMP=<prefix>, off by default).
         # Any change to the env / callback / rollout path has to be proven
         # trajectory-identical against its parent commit, and the only honest
