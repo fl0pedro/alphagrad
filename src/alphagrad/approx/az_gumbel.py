@@ -1170,6 +1170,14 @@ _GAZ_DEEPEN = os.environ.get("ALPHAGRAD_GAZ_DEEPEN", "0") == "1"
 # net's own output (there is no tree to back up), so a flat comp_q spread and
 # a flat improved policy are the same statement: the bandit has no signal.
 _SEARCH_DIAG = {}
+# ACCUMULATOR over the episode's ROOTS. Roots with < 2 legal actions are
+# excluded entirely -- they have no decision to spread over, and the last root
+# of every episode is exactly that case.
+_SEARCH_ACC: dict = {}
+
+
+def _search_acc(k, v):
+    _SEARCH_ACC.setdefault(k, []).append(float(v))
 _GAZ_JSONL = os.environ.get("ALPHAGRAD_GAZ_JSONL", "")
 if not _GAZ_DEEPEN and int(A.rollout_depth) != 0:
     print(f"[gaz] #93: --rollout-depth {A.rollout_depth} IGNORED (depth 0, "
@@ -1558,6 +1566,16 @@ def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
             "search/v_mix": float(v_mix),
             "search/logit_std": float(_lg.std()),
         })
+        if _cq.size >= 2:
+            _search_acc("comp_q_std", _cq.std())
+            _search_acc("comp_q_ptp", _cq.max() - _cq.min())
+            _search_acc("n_legal", _cq.size)
+            _search_acc("n_visited", len(_qv))
+            _search_acc("v_root", v_root)
+            _search_acc("logit_std", _lg.std())
+            if len(_qv) > 1:
+                _vq = np.asarray(list(_qv.values()), np.float64)
+                _search_acc("visited_q_ptp", _vq.max() - _vq.min())
     except Exception:
         pass
     pi = improved_policy(
@@ -1568,6 +1586,9 @@ def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
         _SEARCH_DIAG["search/pi_max"] = float(_p.max())
         _p = _p[_p > 0]
         _SEARCH_DIAG["search/pi_entropy"] = float(-(_p * np.log(_p)).sum())
+        if _p.size >= 2:
+            _search_acc("pi_entropy", -(_p * np.log(_p)).sum())
+            _search_acc("pi_max", _p.max())
     except Exception:
         pass
     # ---- face-CE draws + the EXECUTED face sequence -----------------------
@@ -2305,6 +2326,19 @@ def _run(args) -> int:
                         popart.sigma, np.float64).reshape(-1).tolist(),
                 }
                 _rec.update(_SEARCH_DIAG)
+                # EPISODE-level search telemetry: the completed-Q spread the
+                # depth-0 bandit actually trained on, over every root that had
+                # a real choice.
+                for _k, _vs in _SEARCH_ACC.items():
+                    if not _vs:
+                        continue
+                    _a = np.asarray(_vs, np.float64)
+                    _rec["ep_search/" + _k + "_mean"] = float(_a.mean())
+                    _rec["ep_search/" + _k + "_median"] = float(np.median(_a))
+                    _rec["ep_search/" + _k + "_max"] = float(_a.max())
+                _rec["ep_search/n_roots"] = int(
+                    len(_SEARCH_ACC.get("comp_q_std", [])))
+                _SEARCH_ACC.clear()
                 with open(_GAZ_JSONL, "a") as _fh:
                     _fh.write(json.dumps(_rec, default=float) + "\n")
             except Exception as _je:
