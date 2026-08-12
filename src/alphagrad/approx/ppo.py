@@ -8021,6 +8021,21 @@ def main():
 
         eval_samples = generate_eval_samples(env, ep_eval_key, args.num_eval_samples)
         env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
+        # ONE ray.put per EPISODE instead of one serialisation per STEP.
+        # `eval_args_samples` rides the env, so it is a closed-over constant
+        # of the step callback and the pool re-shipped the whole tuple (tens
+        # of MB for TransformerLM) on every one of the ~95 decisions. The
+        # pool already knows how to hold an ObjectRef -- it was simply never
+        # handed one from here. Samples are regenerated per episode, so the
+        # ref is refreshed here and nowhere else.
+        _ep_pool = getattr(env, "_remote_pool", None)
+        if _ep_pool is not None:
+            try:
+                _ep_pool.set_eval_samples(eval_samples)
+            except Exception as _exc:
+                tqdm.write(f"[pool] set_eval_samples failed ({_exc!r}); "
+                           "falling back to per-call shipping",
+                           file=sys.stderr)
 
         # Stage B.2.A / B.3: per-vertex features depend on the calibration
         # samples; recompute them per episode. The dispatch (mean-aggregated
