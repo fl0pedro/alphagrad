@@ -2471,6 +2471,31 @@ def _batched_host(fn, n_out: int = 3):
     return _wrapped
 
 
+def _pool_owns_bound_operands(pool):
+    """True iff the STEP callback can skip shipping args/consts/samples.
+
+    Three conditions, all necessary: a pool is attached (so the remote
+    closure, which ignores args/consts, is the one that runs), the pool
+    already holds an eval-samples ObjectRef (so it will not fall back to the
+    per-call tuple), and no row is served in-process
+    (ALPHAGRAD_POOL_TERMINAL_LOCAL, which calls `_callback` directly and needs
+    the real arrays). Fails closed on anything unexpected.
+
+    MODULE-LEVEL ON PURPOSE. As a `-> bool` method on VertexEliminationEnv
+    this came back as a traced `bool[]` under jit -- the class's annotated
+    methods are wrapped -- and `x if flag else y` then raised
+    TracerBoolConversionError. The flag has to be a plain Python bool: it
+    selects which operands are TRACED, so it cannot be a traced value.
+    """
+    if os.environ.get("ALPHAGRAD_CB_OMIT_BOUND", "1") != "1":
+        return False
+    if pool is None:
+        return False
+    if os.environ.get("ALPHAGRAD_POOL_TERMINAL_LOCAL", "0") == "1":
+        return False
+    return getattr(pool, "_eval_samples_ref", None) is not None
+
+
 def _env_callback(fn, shapes, *args, batched: bool = False):
     """Dispatch the env callback, batched or per-env.
 
@@ -4543,17 +4568,33 @@ class VertexEliminationEnv:
             state.face_skips[shifted.astype(jnp.int32)].at[idx].set(face_skip)
         )
 
+        # BOUND OPERANDS: only the in-process callback reads them.
+        #
+        # `args` / `consts` / `eval_args_samples` are episode constants that
+        # the MEASURE ACTOR already owns a copy of -- the remote closure
+        # drops args/consts outright, and the pool serves eval_samples from
+        # its own ObjectRef. Passing them as callback operands anyway forces
+        # JAX to marshal every one of them device->host on EVERY decision
+        # (tens of MB and ~150 separate arrays for TransformerLM) so the
+        # remote closure can throw them away. Hand the pooled path
+        # zero-length placeholders instead; the in-process path (no pool) and
+        # the trainer-local terminal rows (ALPHAGRAD_POOL_TERMINAL_LOCAL=1)
+        # still get the real thing.
+        _drop_bound = _pool_owns_bound_operands(self._remote_pool)
+        _z = jnp.zeros((1,), jnp.int32)
         tokens, eqn_ids, reward = _env_callback(
             self.tokenize(batched=True),
             self._callback_shape,
-            self.args,
-            self.consts,
+            _z if _drop_bound else self.args,
+            _z if _drop_bound else self.consts,
             new_order,
             new_specs,
             new_face_specs,
             new_face_skips,
             new_step,
-            *(self.eval_args_samples if self.eval_args_samples is not None else ()),
+            *(() if _drop_bound
+              else (self.eval_args_samples
+                    if self.eval_args_samples is not None else ())),
             batched=True,
         )
 
