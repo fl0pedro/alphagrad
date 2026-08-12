@@ -229,11 +229,19 @@ def _pp_mark(key, x):
     arrs = [l for l in flat if hasattr(l, "shape") or hasattr(l, "dtype")]
     if not arrs:
         return x
-    # Anchor: a scalar the phase's output must be computed to produce. Summing
-    # a few leaves is cheaper than any of the phases being timed (the widest
-    # leaf here is a (16384,) int32 delta buffer).
+    # Anchor: a scalar the phase's output must be computed to produce.
+    #
+    # EVERY leaf, not the first four. With a partial anchor the mark is free
+    # to fire before the leaves it skipped are ready, and XLA takes that
+    # freedom: `prof/envstep` anchored on EnvState's leading (device-only)
+    # leaves fired while the host callback that fills the token leaves was
+    # still running, so the callback's cost landed in the NEXT mark and the
+    # buckets stopped being nestable at all (measured: `prof/measure_wait`
+    # totalled MORE than the `prof/envstep` it was supposed to sit inside).
+    # A sum over all leaves is a reduction over a few MB -- microseconds on
+    # device, and far below any phase being timed.
     acc = jnp.zeros((), jnp.float32)
-    for leaf in arrs[:4]:
+    for leaf in arrs:
         acc = acc + jnp.sum(jnp.asarray(leaf).astype(jnp.float32))
     from jax.experimental import io_callback as _io_callback
     tok = _io_callback(
@@ -5283,21 +5291,14 @@ def main():
             delta_tok = state.delta_tokens
             delta_eqn = state.delta_eqns
             delta_count = state.delta_count
-            # prof/envcb: THE ENV CALLBACK, not scan glue.
-            #
-            # `_pp_mark` anchors on the first few leaves of the value it is
-            # handed, and `prof/envstep`'s anchor is EnvState's leading
-            # leaves -- order / sparsity_specs / face_specs / face_skips --
-            # every one of which is produced on device and none of which
-            # depends on the host callback. So the envstep mark fires as soon
-            # as the device-side state update is done and the callback is
-            # still in flight; the first mark that MUST wait for it is this
-            # one, whose anchor (`state.delta_tokens`) IS the callback's
-            # output. Verified on an event trace: per decision the callback's
-            # enter/exit bracket falls strictly between mark:prof/envstep and
-            # mark:prof/envcb, and `prof/measure_wait` is nested INSIDE it.
-            # Read the pair as: envstep = device env step + callback
-            # dispatch, envcb = the callback itself (>= measure_wait).
+            # prof/envcb: scan glue (avail mask, key split, the delta unpack
+            # above). Under the partial mark anchor this key used to absorb
+            # the WHOLE env callback -- `prof/envstep` fired on EnvState's
+            # device-only leading leaves while the callback was still in
+            # flight, and the first mark that had to wait for it was this one
+            # (its anchor, `state.delta_tokens`, IS the callback's output).
+            # With the full anchor the callback is back inside `prof/envstep`
+            # and this reads ~0; `prof/env_cb_host` is its host span.
             delta_tok = _pp_mark("prof/envcb", delta_tok)
             # Kept as a mark so the key still reports: `prof/encode` is now
             # the cost of NOT extending here, i.e. ~0. The extend it used to
@@ -5460,10 +5461,9 @@ def main():
             env_out = env_obj.step(state, env_action)
             next_state = env_out.state
             raw_rewards = env_out.reward
-            # prof/envstep: the DEVICE-side env step (order/spec/face-wire
-            # shift-and-insert, axis-state update) plus callback dispatch --
-            # NOT the callback, which lands in `prof/envcb` at the top of the
-            # next iteration. See the note there.
+            # prof/envstep: the device-side env step (order/spec/face-wire
+            # shift-and-insert, axis-state update) PLUS the host callback.
+            # Subtract `prof/env_cb_host` for the device-only half.
             next_state, raw_rewards = _pp_mark(
                 "prof/envstep", (next_state, raw_rewards))
             rewards = raw_rewards
