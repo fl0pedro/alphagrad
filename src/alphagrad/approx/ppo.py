@@ -7976,6 +7976,10 @@ def main():
     _xtr_eps = {int(_x) for _x in
                 os.environ.get("ALPHAGRAD_XLA_TRACE_EPS", "").split(",")
                 if _x.strip()}
+    # The device `train_episode` runs on. Uncommitted arrays already live
+    # here (it is the default device); naming it is what makes them
+    # COMMITTED, which is the point -- see the loop body.
+    _train_dev = jax.local_devices()[0]
 
     for ep in range(args.episodes):
         if _jax_trace_dir and ep == _jax_trace_ep and not _jax_trace_active:
@@ -8224,6 +8228,31 @@ def main():
                       flush=True)
             env_states = reset_envs(env_episode)
 
+        # ONE COMPILE, NOT TWO. `eqx.filter_jit`'s cache key includes every
+        # argument's SHARDING, and JAX distinguishes an UNCOMMITTED array
+        # (anything built host-side -- `jnp.zeros`, `jnp.asarray(nparray)`)
+        # from a COMMITTED one (anything a jit returned). Six leaves flip:
+        # the three PopArt statistics, which the calibration episode rebuilds
+        # from numpy, and three int32 step counters inside the agent/optimiser
+        # state. They arrive uncommitted on the first call and committed from
+        # the first jit output onwards, so `train_episode` was traced and
+        # compiled a SECOND time -- 327 s, on top of the first 327 s, against
+        # a 15 s steady-state episode. Committing them up front makes every
+        # episode present the same key.
+        #
+        # `jax.Array` leaves ONLY. Several arguments are static Python values
+        # that shape the trace (`EnvState.max_steps`, the stage flags, the
+        # jaxpr in `EnvConfig`); turning those into device arrays would change
+        # WHAT is compiled, not just where the bytes live. numpy leaves are
+        # left alone too -- they are uncommitted on every call already, so
+        # they never contributed to the divergence.
+        (agent, opt_state, global_step,
+         popart_m1, popart_m2, popart_w) = jax.tree_util.tree_map(
+            lambda _x: (jax.device_put(_x, _train_dev)
+                        if isinstance(_x, jax.Array) else _x),
+            (agent, opt_state, global_step,
+             popart_m1, popart_m2, popart_w),
+        )
         _xtr_on = bool(_xtr_dir) and ep in _xtr_eps
         if _xtr_on:
             jax.profiler.start_trace(os.path.join(_xtr_dir, f"ep{ep}"))
