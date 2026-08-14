@@ -942,11 +942,14 @@ class TrainBatch(NamedTuple):
     enc_pos: jax.Array
     vmem_sums: jax.Array
     vmem_counts: jax.Array
-    delta_tokens: jax.Array
-    delta_eqns: jax.Array
-    delta_count: jax.Array
-    delta_owner: jax.Array
-    delta_participants: jax.Array
+    # WINDOWED (leading K axis, --grad-window; K=1 is the historical single
+    # delta): the last K step deltas ending at THIS step, oldest first. The
+    # enc_*/vmem_* above are the carry at the OLDEST of them.
+    delta_tokens: jax.Array        # (K, MAX_DELTA_TOKENS)
+    delta_eqns: jax.Array          # (K, MAX_DELTA_TOKENS)
+    delta_count: jax.Array         # (K,)
+    delta_owner: jax.Array         # (K,)
+    delta_participants: jax.Array  # (K, total_v + 1)
     estim_returns: jax.Array
     norm_adv: jax.Array
     vertex_avail_mask: jax.Array
@@ -2769,6 +2772,16 @@ def make_argparser() -> argparse.ArgumentParser:
              "Set to 'dll-streetview' to land in that team's project.",
     )
     p.add_argument("--episodes", type=int, default=50)
+    p.add_argument(
+        "--grad-window", type=int, default=1,
+        help="How many CONSECUTIVE step deltas the loss re-runs under the "
+             "current parameters before scoring a step (K). The stored "
+             "vertex memory is read as a CONSTANT, so K=1 -- the default and "
+             "an exact reproduction of the previous behaviour -- gives "
+             "palimpsa gradient from ONE delta and none from the elimination "
+             "history. K>1 anchors the replay K-1 steps earlier and folds "
+             "the intervening deltas in with gradient, at K times the stored "
+             "delta buffers and K times the loss-side extend.")
     p.add_argument("--no-jit", action="store_true")
     p.add_argument(
         "--exec-on-gpu",
@@ -5732,19 +5745,25 @@ def main():
 
         def _carry_heads(M, I, ch, nv, pos, owner, part, vs, vc,
                          pref, dtok, deqn, dcnt):
-            carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
-            # The delta is STORED, with its length. The loss re-derives no
-            # window from anything, so there is no length to get wrong.
-            carry2, vs2, vc2 = _carry_stream.advance(
-                agent, carry, vs, vc, dtok, deqn, dcnt, owner,
-                window=MAX_DELTA_TOKENS, participants=part,
-                # The loss is reverse-differentiated through this extend, so
-                # it cannot use the rollout's while_loop -- it passes the
-                # batch-wide `budget` instead and gets the scan/cond form,
-                # which has a transpose rule and skips exactly the same pad
-                # steps.
-                chunk=None, budget=_delta_budget,
-            )
+            carry2 = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
+            vs2, vc2 = vs, vc
+            # The deltas are STORED, with their lengths. The loss re-derives
+            # no window from anything, so there is no length to get wrong.
+            # PYTHON loop, not a scan: K is static, and at K=1 this is
+            # literally the single call it replaced -- same ops, same order,
+            # bit-identical.
+            for _k in range(dtok.shape[0]):
+                carry2, vs2, vc2 = _carry_stream.advance(
+                    agent, carry2, vs2, vc2,
+                    dtok[_k], deqn[_k], dcnt[_k], owner[_k],
+                    window=MAX_DELTA_TOKENS, participants=part[_k],
+                    # The loss is reverse-differentiated through this extend,
+                    # so it cannot use the rollout's while_loop -- it passes
+                    # the batch-wide `budget` instead and gets the scan/cond
+                    # form, which has a transpose rule and skips exactly the
+                    # same pad steps.
+                    chunk=None, budget=_delta_budget,
+                )
             # carry2 is where the sampling side carry branched: the
             # stored pre-step carry advanced past the PREVIOUS delta.
             # The face replay continues from it over the stored emission
@@ -6446,6 +6465,35 @@ def main():
         # mini-batching pipeline. (TrainBatch's micro_*_seq fields below
         # carry the actions; we add micro_*_dists alongside them so the
         # old log-prob computation can index them.)
+        # THE GRADIENT WINDOW (--grad-window K). The loss re-derives a step's
+        # encoding by extending a STORED carry with a STORED delta, so
+        # gradient reaches palimpsa through the last K deltas and stops at
+        # the anchor carry. K = 1 selects step t's own anchor and its own
+        # delta -- the previous behaviour, unrolled to the same single call.
+        # Steps earlier than K-1 clamp the anchor to step 0 and mark the
+        # missing entries with count 0, which `advance` runs as an exact
+        # no-op (every row invalid), so the short prefix needs no special
+        # case.
+        _T_steps = traj.delta_count.shape[1]
+        _wK = max(1, int(getattr(args, "grad_window", 1)))
+        _w_t = (jnp.arange(_T_steps, dtype=jnp.int32)[:, None]
+                + (jnp.arange(_wK, dtype=jnp.int32) - (_wK - 1))[None, :])
+        _w_idx = jnp.clip(_w_t, 0, _T_steps - 1)            # (T, K)
+        _w_live = (_w_t >= 0)
+        _w_anchor = _w_idx[:, 0]                            # (T,)
+        _w_dtok = traj.delta_tokens[:, _w_idx]
+        _w_deqn = traj.delta_eqns[:, _w_idx]
+        _w_dcnt = jnp.where(_w_live[None], traj.delta_count[:, _w_idx], 0)
+        _w_down = traj.delta_owner[:, _w_idx]
+        _w_dpart = jnp.where(_w_live[None, ..., None],
+                             traj.delta_participants[:, _w_idx], 0.0)
+        _w_encM = traj.enc_M[:, _w_anchor]
+        _w_encI = traj.enc_I[:, _w_anchor]
+        _w_ench = traj.enc_cumhist[:, _w_anchor]
+        _w_encn = traj.enc_nvalid[:, _w_anchor]
+        _w_encp = traj.enc_pos[:, _w_anchor]
+        _w_vs = traj.vmem_sums[:, _w_anchor]
+        _w_vc = traj.vmem_counts[:, _w_anchor]
         full_batch = TrainBatch(
             preference=traj.preference,
             vertex_idx=traj.vertex_idx,
@@ -6491,18 +6539,18 @@ def main():
             face_counts=traj.face_counts,
             face_delta_tokens=traj.face_delta_tokens,
             face_delta_eqns=traj.face_delta_eqns,
-            enc_M=traj.enc_M,
-            enc_I=traj.enc_I,
-            enc_cumhist=traj.enc_cumhist,
-            enc_nvalid=traj.enc_nvalid,
-            enc_pos=traj.enc_pos,
-            vmem_sums=traj.vmem_sums,
-            vmem_counts=traj.vmem_counts,
-            delta_tokens=traj.delta_tokens,
-            delta_eqns=traj.delta_eqns,
-            delta_count=traj.delta_count,
-            delta_owner=traj.delta_owner,
-            delta_participants=traj.delta_participants,
+            enc_M=_w_encM,
+            enc_I=_w_encI,
+            enc_cumhist=_w_ench,
+            enc_nvalid=_w_encn,
+            enc_pos=_w_encp,
+            vmem_sums=_w_vs,
+            vmem_counts=_w_vc,
+            delta_tokens=_w_dtok,
+            delta_eqns=_w_deqn,
+            delta_count=_w_dcnt,
+            delta_owner=_w_down,
+            delta_participants=_w_dpart,
             estim_returns=estim_returns,
             norm_adv=norm_adv,
             vertex_avail_mask=traj.vertex_avail_mask,
