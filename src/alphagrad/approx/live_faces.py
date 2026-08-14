@@ -74,6 +74,23 @@ def _copy_graph(g):
     return _shallow_copy_graph(g)
 
 
+def _ends(key, vmap):
+    """A face key as the policy's own 2-vector ENDPOINT wire.
+
+    ``graphax.core.faces_of`` keys a face by ``(vidx[in_edge],
+    vidx[out_edge])`` where ``vidx`` is ``_stable_var_index``: a position
+    over (constvars, invars, then every equation's outvars). That is NOT the
+    trainer's vertex numbering, which is the 1-based EQUATION index -- on the
+    gate's graph the two differ by the four invars, so reading a key
+    straight off the wire would hand the head a different vertex's context
+    (and clip anything past V onto the last row). ``vmap`` is the
+    stable-index -> 1-based vertex map; anything absent from it is a jaxpr
+    INPUT or const, which has no vertex and no context, and is written as 0.
+    """
+    i, j = key
+    return np.asarray([int(vmap.get(i, 0)), int(vmap.get(j, 0))], np.int32)
+
+
 class _Snapshot:
     """Everything one speculative ``eliminate`` mutates, restored on exit.
 
@@ -301,6 +318,27 @@ class LiveFaceStream:
         self._prefix[key] = tk
         return tk
 
+    def _vertex_of(self, tk):
+        """``{stable var index: 1-based vertex}`` for ``tk``'s jaxpr.
+
+        Built from the SAME ``_stable_var_index`` graphax keys faces with, so
+        the two cannot drift; memoized on the jaxpr object because the prefix
+        tokenizers all share one.
+        """
+        from graphax.core import _vidx_for
+        jx = tk.ij.jaxpr
+        cached = getattr(self, "_vmap_memo", None)
+        if cached is not None and cached[0] is jx:
+            return cached[1]
+        vidx = _vidx_for(jx)
+        m = {}
+        for k, eqn in enumerate(jx.eqns):
+            for ov in eqn.outvars:
+                if ov in vidx:
+                    m[vidx[ov]] = k + 1
+        self._vmap_memo = (jx, m)
+        return m
+
     # -- decoded per-face transforms for the DECIDED faces -----------------
     def _decided(self, tk, vertex, face_rows, face_skips, upto,
                  is_last=True):
@@ -406,8 +444,13 @@ class LiveFaceStream:
         rows = np.asarray(face_rows, np.int32)
         skips = np.asarray(face_skips, np.int32)
         vspecs = np.asarray(vertex_specs, np.int32)
+        # 5th slot: the face's ENDPOINT VERTICES, as the head's identity for
+        # it. `faces_of` keys are `(vidx[in_edge], vidx[out_edge])` and
+        # `vidx.get` is None for a var no equation produces (a jaxpr input),
+        # so the wire is 1-BASED with 0 = "no vertex" -- the device side
+        # gathers a zero context for 0 rather than an arbitrary row.
         empty = (np.zeros((W,), np.int32), -np.ones((W,), np.int32),
-                 np.int32(0), np.int32(0))
+                 np.int32(0), np.int32(0), np.zeros((2,), np.int32))
 
         frh, fsh = self._hist(face_rows_hist, face_skips_hist)
         ck = (order[:n].tobytes(), specs[:n].tobytes(), vertex,
@@ -431,7 +474,8 @@ class LiveFaceStream:
             return empty
         n_faces = len(keys)
         if f >= n_faces:
-            res = (empty[0], empty[1], empty[2], np.int32(n_faces))
+            res = (empty[0], empty[1], empty[2], np.int32(n_faces),
+                   empty[4])
             self._chunks[ck] = res
             return res
 
@@ -565,7 +609,8 @@ class LiveFaceStream:
             # back to the vertex context for this face alone, as it does
             # for any soft failure), but counted as what it is.
             self.stats["face_dropped"] += 1
-            res = (empty[0], empty[1], empty[2], np.int32(n_faces))
+            res = (empty[0], empty[1], empty[2], np.int32(n_faces),
+                   _ends(keys[f], self._vertex_of(tk)))
             self._chunks[ck] = res
             return res
         gi = ekeys.index(keys[f])
@@ -612,7 +657,8 @@ class LiveFaceStream:
         tok_a[:cnt] = np.asarray(chunk, np.int32)
         ids_a[:cnt] = np.asarray(cids, np.int32)
 
-        res = (tok_a, ids_a, np.int32(cnt), np.int32(n_faces))
+        res = (tok_a, ids_a, np.int32(cnt), np.int32(n_faces),
+               _ends(keys[f], self._vertex_of(tk)))
         if len(self._chunks) >= 4096:
             for dk in list(self._chunks)[:1024]:
                 self._chunks.pop(dk, None)

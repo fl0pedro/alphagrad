@@ -182,9 +182,18 @@ class UnifiedFaceHead(eqx.Module):
 
     proj: eqx.nn.MLP
 
-    def __init__(self, embd_dim: int, *, hidden: int | None = None, key):
-        self.proj = eqx.nn.MLP(embd_dim, HEAD_WIDTH, hidden or embd_dim,
-                               depth=1, key=key)
+    def __init__(self, embd_dim: int, *, in_dim: int | None = None,
+                 hidden: int | None = None, key):
+        """``in_dim`` is the width of the face REPRESENTATION the head reads.
+
+        It is 3*embd_dim under :class:`UnifiedFacePolicy`, whose input is
+        ``[ctx_i || ctx_j || face_latent]`` -- the two endpoint vertices'
+        contexts and the face's own palimpsa readout. It defaults to
+        ``embd_dim`` so the single-vector callers (tests, the blind path)
+        keep working unchanged.
+        """
+        self.proj = eqx.nn.MLP(in_dim or embd_dim, HEAD_WIDTH,
+                               hidden or embd_dim, depth=1, key=key)
 
     def logits(self, ctx):
         return self.proj(ctx)

@@ -87,7 +87,8 @@ def with_face_width(agent, width):
 _END_SPEC_ROW = np.array([-1, -1, 0], dtype=np.int32)
 
 
-def pad_face_outputs(max_faces, fr, fs, fa, f_pair, f_comp, f_valid, f_cnt):
+def pad_face_outputs(max_faces, fr, fs, fa, f_pair, f_comp, f_valid, f_cnt,
+                     f_ends=None):
     """Host-side re-pad of a bucketed draw's outputs to ``max_faces``.
 
     Fill values are the EXACT bytes the unbucketed call produces for faces
@@ -99,7 +100,9 @@ def pad_face_outputs(max_faces, fr, fs, fa, f_pair, f_comp, f_valid, f_cnt):
     * ``f_pair`` / ``f_comp``  the static sampling masks, which are a
       broadcast of ONE per-vertex row over the face axis -- so the padding
       rows equal row 0;
-    * ``f_valid`` / ``f_cnt``  0.
+    * ``f_valid`` / ``f_cnt``  0;
+    * ``f_ends``   0 -- the "no vertex" endpoint id, which gathers a zero
+      context, exactly what an unvisited face slot has.
 
     ``fa`` is a ``heads.FaceAction`` of numpy arrays; returns the same tuple
     shape padded, all numpy.
@@ -111,8 +114,11 @@ def pad_face_outputs(max_faces, fr, fs, fa, f_pair, f_comp, f_valid, f_cnt):
     fr = np.asarray(fr, np.int32)
     fb = int(fr.shape[0])
     if fb >= F:
-        return fr, np.asarray(fs, np.int32), fa, np.asarray(f_pair), \
-            np.asarray(f_comp), np.asarray(f_valid), np.asarray(f_cnt)
+        _out = (fr, np.asarray(fs, np.int32), fa, np.asarray(f_pair),
+                np.asarray(f_comp), np.asarray(f_valid),
+                np.asarray(f_cnt))
+        return _out if f_ends is None else _out + (
+            np.asarray(f_ends, np.int32),)
 
     def _fill(x, fill):
         x = np.asarray(x)
@@ -144,7 +150,10 @@ def pad_face_outputs(max_faces, fr, fs, fa, f_pair, f_comp, f_valid, f_cnt):
     fc2[:fb] = fc
     fv2 = _fill(np.asarray(f_valid), np.asarray(f_valid).dtype.type(0))
     fn2 = _fill(np.asarray(f_cnt, np.int32), 0)
-    return fr2, fs2, fa2, fp2, fc2, fv2, fn2
+    if f_ends is None:
+        return fr2, fs2, fa2, fp2, fc2, fv2, fn2
+    fe2 = _fill(np.asarray(f_ends, np.int32), 0)
+    return fr2, fs2, fa2, fp2, fc2, fv2, fn2, fe2
 
 
 def hist_face_width(face_hist, skip_hist, n):

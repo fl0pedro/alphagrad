@@ -120,7 +120,10 @@ def setup():
         la=jnp.arange(n_legal, dtype=jnp.int32),
         pi=jnp.asarray(pi_np[:n_legal]), pi_pad=jnp.asarray(pi_np),
         sd=(sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp, sd_fvalid,
-            sd_cnt, sd_dt, sd_de, sd_fa),
+            sd_cnt, sd_dt, sd_de, sd_fa,
+            # endpoint ids per draw: face 0 -> (1, 2), rest "no vertex"
+            jnp.asarray(np.pad(np.array([[[1, 2]]] * D, np.int32),
+                               ((0, 0), (0, F - 1), (0, 0)))),),
         op_override=jnp.ones((NUM_OPS,), jnp.float32))
 
 

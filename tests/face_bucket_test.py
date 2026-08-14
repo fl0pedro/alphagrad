@@ -122,7 +122,10 @@ def _chunk_fns(n):
         ar = jnp.arange(W, dtype=jnp.int32)
         tok = jnp.where(ar < ct, (f + ar) % 50 + 1, 0).astype(jnp.int32)
         eqn = jnp.where(ar < ct, f.astype(jnp.int32), -1).astype(jnp.int32)
-        return tok, eqn, jnp.asarray(ct, jnp.int32)
+        # 4th output: the face's ENDPOINT vertices (1-based, 0 = none).
+        # Deterministic stand-in, same shape the real callback returns.
+        ends = jnp.stack([(f % 3) + 1, (f % 2) + 1]).astype(jnp.int32)
+        return tok, eqn, jnp.asarray(ct, jnp.int32), ends
 
     def face_count_fn(vertex_idx):
         return jnp.asarray(n, jnp.int32)
@@ -140,8 +143,8 @@ def _run_face_path(agent, n, key):
         None, avail, ax_state, ax_mask, ft, ovr, key,
         precomputed=pre, enc_carry=enc,
         face_chunk_fn=chunk_fn, face_count_fn=count_fn)
-    fa, face_logp, face_ent, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de = \
-        face_out
+    (fa, face_logp, face_ent, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de,
+     f_ends) = face_out
     ea = agent.to_env_action_dynamic(
         vertex_idx, actions, ax_state, face_action=fa)
     return {

@@ -845,6 +845,11 @@ class Trajectory(NamedTuple):
     face_pair_valid: jax.Array    # (MAX_FACES, N, N) float32
     face_comp_valid: jax.Array    # (MAX_FACES, N) float32
     face_valid: jax.Array         # (MAX_FACES,) float32
+    # The face's IDENTITY: its (in_edge, out_edge) endpoint vertices, 1-based
+    # with 0 = "no vertex" (a jaxpr input). Stored for the same reason the
+    # masks are: the loss must gather the SAME two endpoint contexts the
+    # behaviour policy read, or the ratio is not 1 at epoch 0.
+    face_endpoints: jax.Array     # (MAX_FACES, 2) int32
     face_old_logp: jax.Array      # () float32
     # Per-face chunk LENGTHS -- the only face-stream data the loss needs.
     # The chunks concatenate to exactly the step delta (pinned property), so
@@ -923,6 +928,7 @@ class TrainBatch(NamedTuple):
     face_pair_valid: jax.Array
     face_comp_valid: jax.Array
     face_valid: jax.Array
+    face_endpoints: jax.Array
     face_old_logp: jax.Array
     face_counts: jax.Array
     face_delta_tokens: jax.Array
@@ -2142,6 +2148,10 @@ class Agent(eqx.Module):
                 )
                 _F = self.face_path_policy.max_faces
                 f_cnt = jnp.zeros((_F,), jnp.int32)
+                # No live stream -> no endpoints; 0 is "no vertex", which
+                # gathers zero contexts, and the blind `sample` path above
+                # already used the vertex context for both slots.
+                f_ends = jnp.zeros((_F, 2), jnp.int32)
                 f_dt = jnp.zeros((MAX_DELTA_TOKENS,), jnp.int32)
                 f_de = -jnp.ones((MAX_DELTA_TOKENS,), jnp.int32)
             else:
@@ -2162,8 +2172,8 @@ class Agent(eqx.Module):
                         quant_scale_fracs=actions.quant_scale_frac,
                     ).astype(jnp.int32)
                 (fa, face_logp, face_ent, f_cnt, f_dt,
-                 f_de) = self._face_loop(
-                    v_context, features, factor_tables, face_key,
+                 f_de, f_ends) = self._face_loop(
+                    vertex_contexts, features, factor_tables, face_key,
                     f_pair, f_comp, f_valid, enc_carry, face_chunk_fn,
                     vertex_idx, _vspecs, axis_state[vertex_idx],
                     op_legality_override,
@@ -2171,7 +2181,7 @@ class Agent(eqx.Module):
                      else face_count_fn(vertex_idx)),
                 )
             face_out = (fa, face_logp, face_ent, f_pair, f_comp, f_valid,
-                        f_cnt, f_dt, f_de)
+                        f_cnt, f_dt, f_de, f_ends)
 
         return (
             vertex_idx,
@@ -2247,7 +2257,20 @@ class Agent(eqx.Module):
                   "compress_kind", "quant_dtype", "quant_scale_sign",
                   "quant_scale_frac")
 
-    def _face_loop(self, v_context, features, factor_tables, key,
+    @staticmethod
+    def _endpoint_ctx(vertex_contexts, vid):
+        """Face endpoint ``vid`` (1-BASED, 0 = no vertex) -> its context row.
+
+        The wire is 1-based because ``graphax.faces_of`` keys a face by
+        ``(vidx[in_edge], vidx[out_edge])`` and an endpoint that is a jaxpr
+        INPUT has no vertex at all. 0 gathers a ZERO row -- an input has no
+        context, and substituting one would hand it vertex 0's.
+        """
+        V = vertex_contexts.shape[0]
+        row = vertex_contexts[jnp.clip(vid - 1, 0, V - 1)]
+        return jnp.where(vid > 0, row, jnp.zeros_like(row))
+
+    def _face_loop(self, vertex_contexts, features, factor_tables, key,
                    f_pair, f_comp, f_valid, enc_carry, face_chunk_fn,
                    vertex_idx, vertex_specs, axis_state_v,
                    op_legality_override, n_faces):
@@ -2283,12 +2306,16 @@ class Agent(eqx.Module):
                jnp.zeros((F,), jnp.int32),
                -jnp.ones((F, S, 3), jnp.int32), wire0,
                jnp.zeros((W,), jnp.int32), -jnp.ones((W,), jnp.int32),
-               jnp.asarray(0, jnp.int32))
+               jnp.asarray(0, jnp.int32), jnp.zeros((F, 2), jnp.int32))
 
         def _body(st):
-            f, carry, logp, ent, skips, cnts, rs, wa, ftok, feqn, off = st
-            tk_f, eq_f, ct_f = face_chunk_fn(f, vertex_idx, vertex_specs,
-                                             rs, skips)
+            (f, carry, logp, ent, skips, cnts, rs, wa, ftok, feqn, off,
+             fends) = st
+            # The chunk callback hands back the face's ENDPOINT VERTICES with
+            # its tokens: the face enumeration that produced the chunk keyed
+            # the face by exactly that pair, so it is free.
+            tk_f, eq_f, ct_f, ends_f = face_chunk_fn(
+                f, vertex_idx, vertex_specs, rs, skips)
             # Concatenate this chunk into the step's face stream -- the
             # EXACT tokens the head reads. The final emission is NOT a
             # substitute: chunk f's contraction is deliberately unhooked
@@ -2308,7 +2335,9 @@ class Agent(eqx.Module):
                 jnp.where(_m, eq_f, -1), mode="drop")
             carry, summ = self._face_encode(carry, tk_f, eq_f, ct_eff)
             sk, row, lp, e, _ar, _sp, _od = pol.sample_face(
-                v_context, features, factor_tables, jrand.fold_in(key, f),
+                self._endpoint_ctx(vertex_contexts, ends_f[0]),
+                self._endpoint_ctx(vertex_contexts, ends_f[1]),
+                features, factor_tables, jrand.fold_in(key, f),
                 f, f_pair[f], f_comp[f], f_valid[f], face_context=summ,
                 op_legality_override=op_legality_override)
             rs = rs.at[f].set(self._face_row_specs(row, axis_state_v))
@@ -2317,17 +2346,17 @@ class Agent(eqx.Module):
             wa = tuple(w.at[f].set(row[k])
                        for w, k in zip(wa, self._WIRE_KEYS))
             return (f + 1, carry, logp + lp, ent + e, skips, cnts, rs, wa,
-                    ftok, feqn, off + ct_eff)
+                    ftok, feqn, off + ct_eff, fends.at[f].set(ends_f))
 
         (_f, _c, logp, ent, skips, cnts, _rs, wa, ftok, feqn,
-         _off) = lax.while_loop(lambda st: st[0] < n, _body, st0)
+         _off, fends) = lax.while_loop(lambda st: st[0] < n, _body, st0)
         fa = FaceAction(skip=skips, **dict(zip(self._WIRE_KEYS, wa)))
-        return fa, logp, ent, cnts, ftok, feqn
+        return fa, logp, ent, cnts, ftok, feqn, fends
 
-    def _face_replay(self, v_context, features, factor_tables, fa,
+    def _face_replay(self, vertex_contexts, features, factor_tables, fa,
                      f_pair, f_comp, f_valid, enc_carry, face_chunks,
                      op_legality_override, face_bound=None,
-                     face_win_budget=None):
+                     face_win_budget=None, face_ends=None):
         """Score the stored FaceAction against contexts pooled from ONE scan
         of the stored emission window.
 
@@ -2379,8 +2408,17 @@ class Agent(eqx.Module):
             span = (cum[jnp.clip(ends[f], 0, rows.shape[0])]
                     - cum[jnp.clip(starts[f], 0, rows.shape[0])])
             summ = span / jnp.maximum(f_cnt[f].astype(jnp.float32), 1.0)
+            # The STORED endpoints, for the same reason every mask here is
+            # stored: the head must read the identity it sampled under or
+            # the ratio is not 1 at epoch 0.
+            _ei = jnp.asarray(0, jnp.int32) if face_ends is None \
+                else face_ends[f][0]
+            _ej = jnp.asarray(0, jnp.int32) if face_ends is None \
+                else face_ends[f][1]
             lp, e, ar, _sp, _od = pol.evaluate_face(
-                v_context, features, factor_tables, fa, f,
+                self._endpoint_ctx(vertex_contexts, _ei),
+                self._endpoint_ctx(vertex_contexts, _ej),
+                features, factor_tables, fa, f,
                 f_pair[f], f_comp[f], f_valid[f], face_context=summ,
                 op_legality_override=op_legality_override)
             if gate is not None:
@@ -2454,6 +2492,7 @@ class Agent(eqx.Module):
         face_pair_valid=None,  # stored (F,N,N) sampling mask
         face_comp_valid=None,  # stored (F,N)
         face_valid=None,       # stored (F,)
+        face_ends=None,        # stored (F, 2) endpoint vertex ids (1-based)
         precomputed=None,      # 3b: (vertex_logits, vertex_contexts, value) from the carry path
         face_chunks=None,      # (counts, emission tokens, emission eqns)
         face_carry=None,       # carry2: where the sampling side carry branched
@@ -2586,11 +2625,12 @@ class Agent(eqx.Module):
                 )
             else:
                 f_logp, f_ent, f_arity = self._face_replay(
-                    v_context, features, factor_tables, face_action,
+                    vertex_contexts, features, factor_tables, face_action,
                     face_pair_valid, face_comp_valid, face_valid,
                     face_carry, face_chunks, op_legality_override,
                     face_bound=face_bound,
                     face_win_budget=face_win_budget,
+                    face_ends=face_ends,
                 )
             total_log_p = total_log_p + f_logp
             # Arity-normalised per the PER-HEAD ENTROPY NORMALISATION note
@@ -5380,7 +5420,7 @@ def main():
                 if face_out is not None:
                     (face_action, face_old_logp, _face_ent, face_pair_v,
                      face_comp_v, face_valid_v, face_cnt_v, face_dt_v,
-                     face_de_v) = face_out
+                     face_de_v, face_ends_v) = face_out
                 else:
                     face_action = _zero_face_action()
                     face_old_logp = jnp.array(0.0)
@@ -5390,6 +5430,7 @@ def main():
                     face_comp_v = jnp.zeros(
                         (ENV_MAX_FACES, MAX_AXES_PER_VERTEX), jnp.float32)
                     face_valid_v = jnp.zeros((ENV_MAX_FACES,), jnp.float32)
+                    face_ends_v = jnp.zeros((ENV_MAX_FACES, 2), jnp.int32)
                     face_cnt_v = jnp.zeros((ENV_MAX_FACES,), jnp.int32)
                     face_dt_v = jnp.zeros((MAX_DELTA_TOKENS,), jnp.int32)
                     face_de_v = -jnp.ones((MAX_DELTA_TOKENS,), jnp.int32)
@@ -5542,6 +5583,7 @@ def main():
                 face_pair_valid=face_pair_v,
                 face_comp_valid=face_comp_v,
                 face_valid=face_valid_v,
+                face_endpoints=face_ends_v,
                 face_old_logp=jnp.asarray(face_old_logp, jnp.float32),
                 face_counts=face_cnt_v,
                 face_delta_tokens=face_dt_v,
@@ -5639,7 +5681,8 @@ def main():
 
         def _eval_dyn(pref, vidx, action, vmask, ax_st, ax_vm,
                       k, pv, cv, fa=None, fpv=None, fcv=None, fv=None,
-                      pc3=None, fch=None, fcy=None, fb=None, fwb=None):
+                      fen=None, pc3=None, fch=None, fcy=None, fb=None,
+                      fwb=None):
             # No token arguments: `pc3` (the carry-derived heads) IS the
             # encoding, exactly as on the rollout side.
             return agent.evaluate_action_dynamic(
@@ -5664,6 +5707,7 @@ def main():
                 face_pair_valid=fpv,
                 face_comp_valid=fcv,
                 face_valid=fv,
+                face_ends=fen,
                 precomputed=pc3,
                 face_chunks=fch,
                 face_carry=fcy,
@@ -5746,11 +5790,11 @@ def main():
         ) = (
             jax.vmap(
                 lambda pref, vidx, action, vmask, ax_st,
-                ax_vm, k, pv, cv, fa, fpv, fcv, fv, pl, pc, pvl,
+                ax_vm, k, pv, cv, fa, fpv, fcv, fv, fen, pl, pc, pvl,
                 fct, fdt, fde, cy:
                 _eval_dyn(
                     pref, vidx, action, vmask, ax_st,
-                    ax_vm, k, pv, cv, fa, fpv, fcv, fv,
+                    ax_vm, k, pv, cv, fa, fpv, fcv, fv, fen,
                     pc3=(pl, pc, pvl),
                     # Chunk lengths + THIS step's emission window + the
                     # branch-point carry: everything the behaviour
@@ -5776,6 +5820,7 @@ def main():
                 batch.face_pair_valid,
                 batch.face_comp_valid,
                 batch.face_valid,
+                batch.face_endpoints,
                 pc_logits, pc_ctx, pc_value,
                 batch.face_counts,
                 batch.face_delta_tokens, batch.face_delta_eqns,
@@ -6451,6 +6496,7 @@ def main():
             face_pair_valid=traj.face_pair_valid,
             face_comp_valid=traj.face_comp_valid,
             face_valid=traj.face_valid,
+            face_endpoints=traj.face_endpoints,
             face_old_logp=traj.face_old_logp,
             face_counts=traj.face_counts,
             face_delta_tokens=traj.face_delta_tokens,

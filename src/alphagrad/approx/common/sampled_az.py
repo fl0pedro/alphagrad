@@ -152,7 +152,7 @@ def phase_plan(m, deepen=False, rollout_depth=0):
 def face_ce_term(face_replay_fn, ctx, enc_carry, axis_state, axis_valid,
                  fact_tables, op_override, axis_feats_fn, pi_pad,
                  sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp, sd_fvalid,
-                 sd_cnt, sd_dt, sd_de, sd_fa):
+                 sd_cnt, sd_dt, sd_de, sd_fa, sd_fends):
     """The Sampled-AZ face cross-entropy for ONE decision:
 
         CE = - sum_v pi'_ve(v) sum_k w_hat_{v,k} log beta_theta(F_{v,k})
@@ -173,17 +173,20 @@ def face_ce_term(face_replay_fn, ctx, enc_carry, axis_state, axis_valid,
 
     nv = ctx.shape[0]
 
-    def _one(vidx, fp, fc, fv, cnt, dt, de, fa_k):
+    def _one(vidx, fp, fc, fv, cnt, dt, de, fa_k, fend):
         vi = jnp.clip(vidx, 0, nv - 1)
-        v_context = ctx[vi]
         features = axis_feats_fn(axis_state[vi], axis_valid[vi])
+        # The FULL per-vertex contexts, not the central vertex's row: the
+        # face head reads its own two ENDPOINT vertices' contexts, gathered
+        # inside `_face_replay` from the draw's stored endpoint ids.
         lp, ent, ar = face_replay_fn(
-            v_context, features, fact_tables, fa_k, fp, fc, fv,
-            enc_carry, (cnt, dt, de), op_override)
+            ctx, features, fact_tables, fa_k, fp, fc, fv,
+            enc_carry, (cnt, dt, de), op_override, face_ends=fend)
         return lp, ent / jnp.maximum(ar, 1.0)
 
     lp, ent_n = jax.vmap(_one)(
-        sd_vidx, sd_fpair, sd_fcomp, sd_fvalid, sd_cnt, sd_dt, sd_de, sd_fa)
+        sd_vidx, sd_fpair, sd_fcomp, sd_fvalid, sd_cnt, sd_dt, sd_de, sd_fa,
+        sd_fends)
     li = jnp.clip(sd_li, 0, pi_pad.shape[0] - 1)
     valid = (sd_li >= 0) & (sd_w > 0)
     w = jnp.where(valid, sd_w * pi_pad[li], 0.0)

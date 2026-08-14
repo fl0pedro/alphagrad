@@ -115,7 +115,14 @@ import numpy as np  # noqa: E402
 
 GOLDEN = Path(__file__).with_name("golden") / "policy_gate_golden.json"
 
-SEED = 20260810
+# SEED 20260810 -> 13 (2026-08-14, with the face-path collapse). The seed
+# picks the weights AND the rollout's draws, so a policy change moves the
+# sampled elimination order; under the new head the old seed's order never
+# reached a vertex with two live faces, and `assert_nontrivial` (rightly)
+# refuses to record a trace in which a face-INDEX shift is invisible. Seed 13
+# decides 2 faces on three of its five steps -- the strongest coverage of the
+# eight seeds probed, so the tripwire got sharper, not looser.
+SEED = 13
 ROLLOUT_STEPS = None  # None => (num_valid - 1): stop before the terminal step
 EMBD = 32
 
@@ -341,7 +348,7 @@ def run_trace(case=None, steps=None):
 
         if face_out is not None:
             (fa, f_logp, f_ent, f_pair, f_comp, f_valid, f_cnt, f_dt,
-             f_de) = face_out
+             f_de, f_ends) = face_out
             n_live = int(np.sum(np.asarray(f_valid) > 0.5))
             cnt = np.asarray(f_cnt, np.int32)
             tot = int(cnt[:n_live].sum()) if n_live else 0
@@ -382,6 +389,11 @@ def run_trace(case=None, steps=None):
                 "chunk_counts": [int(x) for x in cnt[:n_live]],
                 "chunk_tokens_sha": _sha(np.asarray(f_dt)[:tot]),
                 "chunk_eqns_sha": _sha(np.asarray(f_de)[:tot]),
+                # the face's own ENDPOINT vertices -- the identity the head
+                # gathers its two contexts from. A face-index shift or a
+                # key-order change moves these before it moves a wire.
+                "endpoints": [[int(x) for x in np.asarray(f_ends)[f]]
+                              for f in range(n_live)],
             }
             face_action = fa
         else:

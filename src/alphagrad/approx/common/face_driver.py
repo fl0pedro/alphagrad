@@ -87,7 +87,11 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None):
 
     ``chunk_cb(f, order, spec_hist, step_count, vertex_idx, vertex_specs,
     face_rows, face_skips, face_hist, skip_hist)`` returns
-    ``(tokens (window,), eqn_ids (window,), count)``.
+    ``(tokens (window,), eqn_ids (window,), count, endpoints (2,))``.
+    ``endpoints`` is the face's own ``(in_edge, out_edge)`` vertex pair,
+    1-based with 0 = "no vertex" -- the face's IDENTITY, which the head
+    gathers its two endpoint contexts from. It costs nothing: the face
+    enumeration that produces the chunk already computed the key.
     ``count_cb(order, spec_hist, step_count, vertex_idx, face_hist,
     skip_hist)`` returns the vertex's face count.
 
@@ -113,14 +117,15 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None):
         try:
             _order = np.asarray(order)
             if _order.ndim == 1:
-                tok, ids, cnt, _nf = live_faces.chunk(
+                tok, ids, cnt, _nf, ends = live_faces.chunk(
                     order, spec_hist, int(np.asarray(step_count)),
                     int(np.asarray(vertex_idx)) + 1, vertex_specs,
                     face_rows, face_skips, int(np.asarray(f)),
                     face_hist, skip_hist,
                 )
                 _dist("face_chunk_len", cnt)
-                return tok, ids, np.asarray(cnt, np.int32)
+                return (tok, ids, np.asarray(cnt, np.int32),
+                        np.asarray(ends, np.int32))
             # BATCHED (vmap_method="broadcast_all"): ONE host dispatch per
             # face substep for all envs. The sequential vmap ran E separate
             # callbacks with a device round-trip between each — the GPU
@@ -131,20 +136,22 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None):
             toks = np.zeros((B, W), np.int32)
             idss = np.zeros((B, W), np.int32)
             cnts = np.zeros((B,), np.int32)
+            ends = np.zeros((B, 2), np.int32)
             _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
             _vi, _vs = np.asarray(vertex_idx), np.asarray(vertex_specs)
             _fr, _fs = np.asarray(face_rows), np.asarray(face_skips)
             _fh, _kh = np.asarray(face_hist), np.asarray(skip_hist)
             _ff = np.asarray(f)
             for i in range(B):
-                tok, ids, cnt, _nf = live_faces.chunk(
+                tok, ids, cnt, _nf, end = live_faces.chunk(
                     _order[i], _sh[i], int(_sc[i]), int(_vi[i]) + 1,
                     _vs[i], _fr[i], _fs[i], int(_ff[i]),
                     _fh[i], _kh[i],
                 )
                 toks[i], idss[i], cnts[i] = tok, ids, np.int32(cnt)
+                ends[i] = end
                 _dist("face_chunk_len", cnt)
-            return toks, idss, cnts
+            return toks, idss, cnts, ends
         finally:
             if _perf is not None:
                 prof_sink("faces.live_chunk", _perf() - _pt0)
@@ -158,7 +165,8 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None):
             _live_face_host,
             (jax.ShapeDtypeStruct((W,), jnp.int32),
              jax.ShapeDtypeStruct((W,), jnp.int32),
-             jax.ShapeDtypeStruct((), jnp.int32)),
+             jax.ShapeDtypeStruct((), jnp.int32),
+             jax.ShapeDtypeStruct((2,), jnp.int32)),
             order, spec_hist, step_count, vertex_idx, vertex_specs,
             face_rows, face_skips, f, face_hist, skip_hist,
             vmap_method="broadcast_all",

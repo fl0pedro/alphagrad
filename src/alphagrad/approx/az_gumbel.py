@@ -826,7 +826,7 @@ def _face_plan(agent, precomputed, enc_carry, avail,
         face_chunk_fn=face_chunk_fn, face_count_fn=face_count_fn,
     )
     (fa, face_logp, face_ent, f_pair, f_comp, f_valid,
-     f_cnt, f_dt, f_de) = face_out
+     f_cnt, f_dt, f_de, f_ends) = face_out
     # THE WIRE, from `to_env_action_dynamic`'s own translator -- so AZ and PPO
     # emit identical bytes for identical FaceActions. AZ's `measure()` already
     # passed correctly-shaped face arrays; they were filled with -1.
@@ -834,7 +834,7 @@ def _face_plan(agent, precomputed, enc_carry, avail,
         vertex_idx, actions, AXIS_STATE, face_action=fa)
     features = _axis_feats(AXIS_STATE[vertex_idx], AXIS_VALID[vertex_idx])
     return (env_action.face_rows, env_action.face_skip, fa, f_pair, f_comp,
-            f_valid, f_cnt, f_dt, f_de, v_context, features, face_ent,
+            f_valid, f_cnt, f_dt, f_de, f_ends, v_context, features, face_ent,
             vertex_idx)
 
 
@@ -1304,7 +1304,7 @@ def _draw_face_sequence(vertex, head_out, carry, prefix_arrays, rng,
             _ag = _agent_for_face_width(_fb)
             _f_use = np.ascontiguousarray(_f_h[:, :_fb])
             _s_use = np.ascontiguousarray(_s_h[:, :_fb])
-    (fr, fs, fa, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de,
+    (fr, fs, fa, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de, f_ends,
      _vctx, _feat, face_ent, _vi) = _face_plan(
         _ag, head_out, carry.enc, jnp.asarray(_avail),
         jnp.asarray(_o_arr), jnp.asarray(_sp_h),
@@ -1330,8 +1330,10 @@ def _draw_face_sequence(vertex, head_out, carry, prefix_arrays, rng,
             f"vertex {vertex}: bucketed draw decided {_ndec} faces at width "
             f"{_fb} but the authoritative enumeration has {n_live} -- "
             f"face_count_fn and face_keys_of disagree")
-        (fr, fs, fa, f_pair, f_comp, f_valid, f_cnt) = pad_face_outputs(
-            int(ENV_MAX_FACES), fr, fs, fa, f_pair, f_comp, f_valid, f_cnt)
+        (fr, fs, fa, f_pair, f_comp, f_valid, f_cnt,
+         f_ends) = pad_face_outputs(
+            int(ENV_MAX_FACES), fr, fs, fa, f_pair, f_comp, f_valid, f_cnt,
+            f_ends)
     return {"fr": fr, "fs": fs,
             "fa": fa,
             "f_pair": f_pair, "f_comp": f_comp,
@@ -1339,6 +1341,7 @@ def _draw_face_sequence(vertex, head_out, carry, prefix_arrays, rng,
             "f_cnt": f_cnt,
             "f_dt": np.asarray(f_dt, np.int32),
             "f_de": np.asarray(f_de, np.int32),
+            "f_ends": np.asarray(f_ends, np.int32),
             "face_ent": float(face_ent)}
 
 
@@ -1360,6 +1363,7 @@ def _pack_search_draws(cands):
     fpair, fcomp = _z(rows[0]["f_pair"]), _z(rows[0]["f_comp"])
     fvalid, fcnt = _z(rows[0]["f_valid"]), _z(rows[0]["f_cnt"])
     fdt, fde = _z(rows[0]["f_dt"]), _z(rows[0]["f_de"])
+    fends = _z(rows[0]["f_ends"])
     fa_list = []
     i = 0
     for c in cands:
@@ -1370,6 +1374,7 @@ def _pack_search_draws(cands):
             fpair[i] = dd["f_pair"]; fcomp[i] = dd["f_comp"]
             fvalid[i] = dd["f_valid"]; fcnt[i] = dd["f_cnt"]
             fdt[i] = dd["f_dt"]; fde[i] = dd["f_de"]
+            fends[i] = dd["f_ends"]
             fa_list.append(dd["fa"])
             i += 1
     _fa0 = jax.tree_util.tree_map(np.zeros_like, fa_list[0])
@@ -1377,7 +1382,8 @@ def _pack_search_draws(cands):
     fa = jax.tree_util.tree_map(lambda *xs: np.stack(xs), *fa_list)
     return {"sd_li": li, "sd_vidx": vidx, "sd_w": w, "sd_fpair": fpair,
             "sd_fcomp": fcomp, "sd_fvalid": fvalid, "sd_cnt": fcnt,
-            "sd_dt": fdt, "sd_de": fde, "sd_fa": fa}
+            "sd_dt": fdt, "sd_de": fde, "sd_fa": fa,
+            "sd_fends": fends}
 
 
 def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
@@ -1654,7 +1660,7 @@ _W4J = jnp.asarray(np.asarray(W4, dtype=np.float32))
 def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
             dtok, deqn, dcnt, owner, vsel, la_pad, la_mask, pi_pad,
             vtgt, vmask, sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp, sd_fvalid,
-            sd_cnt, sd_dt, sd_de, sd_fa):
+            sd_cnt, sd_dt, sd_de, sd_fa, sd_fends):
     """Vertex CE + value MSE + the Sampled-AZ face CE, all re-derived from
     the STORED PRE-step carry.
 
@@ -1670,7 +1676,7 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
 
     def per(M, I, ch, nv, pos, vs, vc, dt, de, dc, ow, vsl,
             la, lam, pi, vt, vm, s_li, s_vidx, s_w, s_fp, s_fc, s_fv,
-            s_cnt, s_dt, s_de, s_fa):
+            s_cnt, s_dt, s_de, s_fa, s_fend):
         carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
         # chunk=0: AZ's loss is reverse-differentiated through this extend
         # too, and the dynamic trip count is a lax.while_loop.
@@ -1701,7 +1707,8 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
         face_ce, face_ent_norm = face_ce_term(
             agent._face_replay, ctx, c2, AXIS_STATE, AXIS_VALID, FACT_TABLES,
             OP_OVERRIDE, _axis_feats, pi,
-            s_li, s_vidx, s_w, s_fp, s_fc, s_fv, s_cnt, s_dt, s_de, s_fa)
+            s_li, s_vidx, s_w, s_fp, s_fc, s_fv, s_cnt, s_dt, s_de, s_fa,
+            s_fend)
         face_loss = _FACE_COEF * face_ce - _FACE_ENT_COEF * face_ent_norm
         return ce + 0.5 * vl + face_loss, (face_ent_norm, vl, ce)
 
@@ -1709,7 +1716,7 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
         enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
         dtok, deqn, dcnt, owner, vsel, la_pad, la_mask, pi_pad, vtgt, vmask,
         sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp, sd_fvalid,
-        sd_cnt, sd_dt, sd_de, sd_fa)
+        sd_cnt, sd_dt, sd_de, sd_fa, sd_fends)
     return jnp.mean(losses), (jnp.mean(ents), jnp.mean(vls),
                              jnp.mean(ces))
 
@@ -2201,11 +2208,13 @@ def _run(args) -> int:
             if _EXACT_ARM:
                 sd_li = sd_vidx = sd_w = sd_fpair = sd_fcomp = None
                 sd_fvalid = sd_cnt = sd_dt = sd_de = sd_fa = None
+                sd_fends = None
             else:
                 sd_li, sd_vidx, sd_w = stk("sd_li"), stk("sd_vidx"), stk("sd_w")
                 sd_fpair, sd_fcomp = stk("sd_fpair"), stk("sd_fcomp")
                 sd_fvalid, sd_cnt = stk("sd_fvalid"), stk("sd_cnt")
                 sd_dt, sd_de = stk("sd_dt"), stk("sd_de")
+                sd_fends = stk("sd_fends")
                 sd_fa = jax.tree_util.tree_map(
                     lambda *xs: np.stack(xs),
                     *[s["sd_fa"] for s in flat])
@@ -2217,7 +2226,7 @@ def _run(args) -> int:
             _cols = (enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
                      dtok, deqn, dcnt, owner, vsel, la_p, la_m, pi_p,
                      vt, vm, sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp,
-                     sd_fvalid, sd_cnt, sd_dt, sd_de, sd_fa)
+                     sd_fvalid, sd_cnt, sd_dt, sd_de, sd_fa, sd_fends)
             # M5: resample the minibatch EVERY epoch. Taking one fixed 64-sample
             # draw and hitting it ``train_epochs`` times overfits that draw and
             # discards the rest of the replay for this update.
