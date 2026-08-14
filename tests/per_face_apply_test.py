@@ -142,29 +142,59 @@ def test_env_exposes_the_per_face_switch():
 # Observation token budget (the nn256 truncation)
 # --------------------------------------------------------------------------- #
 
-def test_max_tokens_is_configurable_and_sizes_the_positional_encoder():
-    """nn256 emits ~4657 tokens against a 4096 budget, so the tail of every
-    observation was silently clipped. MAX_TOKENS must be raisable, and the
-    positional encoder must follow it (otherwise raising it just moves the
-    failure into the encoder)."""
+def _run_env_import(extra_env):
     import os
     import subprocess
     import sys
-
     src = (
-        "from alphagrad.approx.env import MAX_TOKENS;"
-        "from alphagrad.transformer.utils import PositionalEncoder;"
-        "import jax.numpy as jnp;"
-        "pe = PositionalEncoder(8, MAX_TOKENS);"
-        "x = jnp.zeros((MAX_TOKENS, 8));"
-        "print(MAX_TOKENS, pe(x).shape[0])"
+        "from alphagrad.approx.env import "
+        "LEGACY_STREAM_TOKENS, MAX_DELTA_TOKENS;"
+        "print(LEGACY_STREAM_TOKENS, MAX_DELTA_TOKENS)"
     )
     env = dict(os.environ)
-    env["ALPHAGRAD_MAX_TOKENS"] = "8192"
     env["ALPHAGRAD_DISABLE_RESOURCE_MONITOR"] = "1"
-    out = subprocess.run([sys.executable, "-c", src], capture_output=True,
-                         text=True, env=env, timeout=300)
+    env.pop("ALPHAGRAD_MAX_TOKENS", None)
+    env.update(extra_env)
+    return subprocess.run([sys.executable, "-c", src], capture_output=True,
+                          text=True, env=env, timeout=300)
+
+
+def test_total_stream_cap_is_gone_and_setting_it_is_a_hard_error():
+    """There is no total-stream token budget any more.
+
+    The encoder is a recurrence -- the base stream is consumed once into a
+    fixed ``(L, H, d, d)`` carry and every step after it is an extend by that
+    step's DELTA -- so the whole stream is never materialised and a cap on its
+    length buys nothing. It also actively harmed: the slice kept the OLDEST
+    tokens, so a saturated buffer froze the observation for the rest of the
+    episode. The knob must be a HARD ERROR rather than a silent no-op,
+    because three smoke scripts used to set it.
+    """
+    out = _run_env_import({"ALPHAGRAD_MAX_TOKENS": "8192"})
+    assert out.returncode != 0, "ALPHAGRAD_MAX_TOKENS must not be accepted"
+    assert "ALPHAGRAD_MAX_TOKENS is GONE" in out.stderr
+
+
+def test_delta_budget_is_the_only_bound_and_both_widths_are_settable():
+    """The per-step DELTA buffer is the one bound JAX's static shapes need."""
+    out = _run_env_import({"ALPHAGRAD_LEGACY_STREAM_TOKENS": "8192",
+                           "ALPHAGRAD_MAX_DELTA_TOKENS": "16384"})
     assert out.returncode == 0, out.stderr[-600:]
-    budget, pe_len = out.stdout.strip().split()[-2:]
-    assert int(budget) == 8192
-    assert int(pe_len) == 8192, "positional encoder must span the whole budget"
+    legacy, delta = out.stdout.strip().split()[-2:]
+    assert int(legacy) == 8192
+    assert int(delta) == 16384
+
+    # Default: sized from the measured TLM distribution (worst single delta
+    # 25737 tokens), not from a guess.
+    out = _run_env_import({})
+    assert out.returncode == 0, out.stderr[-600:]
+    assert int(out.stdout.strip().split()[-1]) == 32768
+
+
+def test_delta_overflow_is_never_silent():
+    """A delta that does not fit raises by default; ``clip`` prints."""
+    from alphagrad.approx import env as _env
+
+    big = _env.MAX_DELTA_TOKENS + 1
+    with pytest.raises(ValueError, match="token DELTA truncated"):
+        _env._record_delta_truncation(big)

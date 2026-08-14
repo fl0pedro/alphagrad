@@ -4441,6 +4441,26 @@ def main():
         _BASE_OWN = None
     print(f"[alphagrad] base token stream: {int(_BASE_N)} tokens "
           f"(per-step delta budget {MAX_DELTA_TOKENS})", flush=True)
+    # THE BUDGET IS FREE ONLY IF THE SCAN IS PREFIX-PROPORTIONAL, and by
+    # default it is NOT: `_extend_sequential` falls back to a FLAT
+    # `lax.scan` over the whole window when ALPHAGRAD_EXTEND_CHUNK is 0
+    # (the shipped default), so the cost follows `window`, not `count`.
+    # Measured on one Blackwell GPU, E=32/L=3/H=2, one `encode_extend`:
+    #   chunk=0    window  1024, count    78 -> fwd  18.2 ms / grad   84 ms
+    #   chunk=0    window 32768, count    78 -> fwd 529.1 ms / grad 2966 ms
+    #   chunk=0    window 32768, count 25737 -> fwd 528.7 ms / grad 2965 ms
+    #   chunk=256  window  1024, count    78 -> fwd   4.1 ms / grad   27 ms
+    #   chunk=256  window 32768, count    78 -> fwd   4.1 ms / grad   67 ms
+    # i.e. flat in `count` and linear in `window` at chunk=0 (29x for the
+    # 1024 -> 32768 raise), and flat in `window` at chunk=256. Say so.
+    if int(os.environ.get("ALPHAGRAD_EXTEND_CHUNK", "0")) <= 0 \
+            and MAX_DELTA_TOKENS > 2048:
+        print(f"[alphagrad] WARNING: ALPHAGRAD_EXTEND_CHUNK is 0, so every "
+              f"encode_extend scans all {MAX_DELTA_TOKENS} window steps "
+              f"whatever the delta's real length is. Set "
+              f"ALPHAGRAD_EXTEND_CHUNK (256 measured well) to make the "
+              f"scan prefix-proportional; otherwise the delta budget is "
+              f"paid in full every step.", flush=True)
 
     # ---- --ray-measure: fan the measurement callback out over Ray actors ----
     if int(getattr(args, "ray_measure", 0) or 0) > 0:

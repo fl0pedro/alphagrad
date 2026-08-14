@@ -4,6 +4,7 @@ import gc
 import itertools
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -81,15 +82,52 @@ import math as _math
 # rebuilding it on every callback is pure overhead.
 _TOKEN_VOCAB, _, _ = _graphax_get_vocab()
 
-# Observation token budget. The jaxpr token stream is clipped to this and
-# zero-padded, so a graph whose stream is LONGER is only partially visible to
-# the policy — nn256 emits ~4657 tokens, so the historical 4096 silently hid
-# the tail of every observation. Settable via ALPHAGRAD_MAX_TOKENS (it sizes
-# the io_callback's static output shape, so it must be fixed before the env is
-# built, not per-call). Raise it until tokenization/truncated_count logs 0.
-MAX_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_TOKENS", "4096"))
-if MAX_TOKENS < 256:
-    raise ValueError(f"ALPHAGRAD_MAX_TOKENS must be >= 256, got {MAX_TOKENS}")
+# LEGACY full-stream observation width. NOT a token budget any more.
+#
+# THE TOTAL-STREAM CAP ``ALPHAGRAD_MAX_TOKENS`` IS GONE. palimpsa is a
+# RECURRENT linear-attention encoder: its entire state is a fixed
+# ``(L, H, d, d)`` carry -- 1536 floats at the flagship's (3, 2, 16, 16) --
+# however long the stream is. The base stream is consumed ONCE into that carry
+# (``VertexEliminationEnv.base_observation``) and every step after it is an
+# EXTEND by that step's DELTA, so the full stream is never materialised and a
+# cap on its total length buys nothing.
+#
+# It was worse than nothing. ``stream[:MAX_TOKENS]`` keeps the OLDEST tokens,
+# so once the buffer saturates the observation stops advancing and the policy
+# reads a frozen prefix for the rest of the episode -- the delta shrinks to
+# zero while the graph keeps changing. JAX needs static shapes, so a bound
+# survives only on the per-step DELTA buffer (``MAX_DELTA_TOKENS`` below);
+# that is the only place a bound belongs.
+#
+# What survives here is the width of the LEGACY full-stream observation
+# (``EnvConfig.delta_obs=False``: the ``extract_jaxpr`` re-tokenize path, and
+# the non-delta drivers that still import this symbol -- gfn, gdpo, mu0,
+# alpha0, az_gumbel, ppo_ray_worker, pretrain, cpu_approx_worker), plus the
+# radix of the legacy scalar action encoding
+# ``sp_type * MAX_TOKENS + target_vertex``. approx/ppo.py's live path does not
+# read it at all. This is the split ppo.py already made for the absolute
+# positional table (``ALPHAGRAD_POS_ENC_LEN``): a legacy buffer gets its own
+# knob so no live component depends on a deleted budget.
+LEGACY_STREAM_TOKENS = int(
+    os.environ.get("ALPHAGRAD_LEGACY_STREAM_TOKENS", "4096"))
+if LEGACY_STREAM_TOKENS < 256:
+    raise ValueError("ALPHAGRAD_LEGACY_STREAM_TOKENS must be >= 256, got "
+                     f"{LEGACY_STREAM_TOKENS}")
+# The legacy drivers and the action radix still spell it ``MAX_TOKENS``.
+MAX_TOKENS = LEGACY_STREAM_TOKENS
+if os.environ.get("ALPHAGRAD_MAX_TOKENS") is not None:
+    # HARD ERROR, not a silent ignore: three smoke scripts set this knob, and
+    # a knob that no longer does what its name says is how a run gets
+    # mis-read. Never silent.
+    raise RuntimeError(
+        "ALPHAGRAD_MAX_TOKENS is GONE -- there is no total-stream token "
+        "budget any more. The encoder is a recurrence: the base stream is "
+        "consumed once and extended by per-step deltas, so the full stream is "
+        "never materialised. On the live delta path this knob did nothing; on "
+        "the legacy path it clipped the OLDEST tokens. Use "
+        "ALPHAGRAD_MAX_DELTA_TOKENS for the per-step delta buffer (the only "
+        "bound that is real), or ALPHAGRAD_LEGACY_STREAM_TOKENS if you really "
+        "are running the legacy full-stream observation.")
 
 # Per-process tokenization-truncation telemetry. ``_callback`` writes
 # here whenever the un-truncated jaxpr token sequence exceeds
@@ -245,7 +283,15 @@ def consume_tokenization_truncation_stats() -> dict:
 # Deltas are cached by order prefix, so sibling envs that share a prefix share
 # the replay, and extending a prefix by one vertex is one `eliminate` call
 # rather than a full re-tokenize.
-MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "1024"))
+# THE ONLY REAL BOUND IN THE OBSERVATION PATH, and the only one JAX's static
+# shapes actually require. SIZED FROM THE MEASURED DISTRIBUTION:
+# ``decode3_data.py`` over 192 TLM trajectories measured the largest SINGLE
+# delta at 25,737 tokens (mean whole-stream length 43,678, max 122,910), so
+# 32768 is the next power of two with headroom. The previous 1024 dropped
+# ~96% of the flagship's worst delta EVERY step, and the drop was silent
+# (issue #81: the ``tokenization/*`` counters are process-blind -- they read 0
+# from the driver while the callback process clips).
+MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "32768"))
 
 # BASE-TOKEN budget for the delta-buffer observation path
 # (ALPHAGRAD_DELTA_TOKENS=1 in ppo.py). The base tokenized jaxpr is encoded
@@ -275,14 +321,40 @@ MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "1024"))
 MAX_BASE_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_BASE_TOKENS", "8192"))
 
 
+# What a delta that does not fit ``MAX_DELTA_TOKENS`` does.
+#
+#   "raise" (DEFAULT) -- stop. A clipped delta DESYNCS the encoder's
+#       recurrence from the token stream for the rest of the episode: the
+#       dropped tail is never re-read (the cursor is relative), so the carry
+#       and the graph diverge silently and every later observation is wrong
+#       about a graph the policy is still acting on. With the budget sized
+#       from the measured distribution (32768 vs a measured worst case of
+#       25737) this fires only when the budget is genuinely too small.
+#   "clip" -- keep the old behaviour, but LOUDLY: one stderr line per
+#       occurrence, never a once-per-process warning that a driver's
+#       stderr handling can swallow.
+#
+# There is no third option. Dropping tokens silently is what #81 was.
+_DELTA_OVERFLOW = os.environ.get(
+    "ALPHAGRAD_DELTA_OVERFLOW", "raise").strip().lower()
+if _DELTA_OVERFLOW not in ("raise", "clip"):
+    raise ValueError("ALPHAGRAD_DELTA_OVERFLOW must be 'raise' or 'clip', "
+                     f"got {_DELTA_OVERFLOW!r}")
+
+
 def _record_delta_truncation(raw_len: int) -> None:
     """Same sink as ``_record_tokenization_truncation``, for the DELTA buffer.
 
-    Under ``delta_obs`` the observation is no longer clipped at MAX_TOKENS --
-    it is clipped at MAX_DELTA_TOKENS, per step. The wandb keys
-    (``tokenization/{truncated_count, overflow_sum_this_ep}``) keep their
-    meaning ("how often, and by how much, was the observation clipped");
-    only the budget they refer to changes.
+    Under ``delta_obs`` the observation is not clipped at the (deleted)
+    total-stream cap -- it is clipped at MAX_DELTA_TOKENS, per step. The wandb
+    keys (``tokenization/{truncated_count, overflow_sum_this_ep}``) keep their
+    meaning ("how often, and by how much, was the observation clipped"); only
+    the budget they refer to changes.
+
+    NEVER SILENT. The counters here are PROCESS-LOCAL and the driver that
+    reads them is usually a different process (#81), so "no clipping
+    reported" was never evidence that nothing was clipped. The raise/print
+    below is the evidence.
     """
     if raw_len <= MAX_DELTA_TOKENS:
         return
@@ -290,16 +362,19 @@ def _record_delta_truncation(raw_len: int) -> None:
     _TOKENIZATION_TRUNCATION_OVERFLOW_SUM[0] += raw_len - MAX_DELTA_TOKENS
     if raw_len > _TOKENIZATION_TRUNCATION_MAX_LEN[0]:
         _TOKENIZATION_TRUNCATION_MAX_LEN[0] = raw_len
-    if not _TOKENIZATION_TRUNCATION_WARNED[0]:
-        import warnings
-        warnings.warn(
-            f"[alphagrad.approx.env] token DELTA truncated: {raw_len} > "
-            f"MAX_DELTA_TOKENS={MAX_DELTA_TOKENS}. Those tokens are DROPPED "
-            f"(they are not re-read at the next step -- the cursor is "
-            f"relative). Raise ALPHAGRAD_MAX_DELTA_TOKENS.",
-            stacklevel=2,
-        )
-        _TOKENIZATION_TRUNCATION_WARNED[0] = True
+    msg = (
+        f"token DELTA truncated: {raw_len} > "
+        f"MAX_DELTA_TOKENS={MAX_DELTA_TOKENS} "
+        f"(overflow={raw_len - MAX_DELTA_TOKENS}). Those tokens are DROPPED "
+        f"-- they are NOT re-read at the next step (the cursor is relative), "
+        f"so the encoder's recurrence desyncs from the stream for the rest of "
+        f"the episode. Raise ALPHAGRAD_MAX_DELTA_TOKENS, or set "
+        f"ALPHAGRAD_DELTA_OVERFLOW=clip to accept the loss."
+    )
+    if _DELTA_OVERFLOW == "raise":
+        raise ValueError(f"[alphagrad.approx.env] {msg}")
+    print(f"[alphagrad.approx.env] {msg}", file=sys.stderr, flush=True)
+    _TOKENIZATION_TRUNCATION_WARNED[0] = True
 
 
 def _delta_observation(stream, seg_ids, last_start):
@@ -320,11 +395,9 @@ def _delta_observation(stream, seg_ids, last_start):
     ids = seg_ids[last_start:]
     n_raw = len(blk)
     _record_delta_length(n_raw)
+    # Raises unless ALPHAGRAD_DELTA_OVERFLOW=clip; the clamp below is what
+    # that opt-out buys, and it is announced on stderr every time.
     _record_delta_truncation(n_raw)
-    # CLIP, do not raise: the campaign runs in the clipping regime by design
-    # (nn256 deltas reach 5664 against MAX_DELTA_TOKENS=2048), and the old
-    # absolute-cursor path clipped too -- it just deferred the dropped tail to
-    # the NEXT step, where it was attributed to the wrong vertex.
     n = min(n_raw, MAX_DELTA_TOKENS)
     t = np.zeros((1 + MAX_DELTA_TOKENS,), dtype=np.int32)
     e = np.full((1 + MAX_DELTA_TOKENS,), -1, dtype=np.int32)

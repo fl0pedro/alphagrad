@@ -7,8 +7,7 @@ export JAX_PLATFORMS=cpu
 export GRAPHAX_ALLOW_PARTIAL_ORDER=1
 export ALPHAGRAD_POLICY=palimpsa
 export ALPHAGRAD_INCREMENTAL_TOKENS=1
-export ALPHAGRAD_MAX_TOKENS=8192
-export ALPHAGRAD_MAX_DELTA_TOKENS=1024
+export ALPHAGRAD_MAX_DELTA_TOKENS=8192
 export ALPHAGRAD_NN_HIDDEN=16
 exec uv run --no-sync python src/alphagrad/approx/ppo.py \
   --example NeuralNetwork --episodes 2 \
