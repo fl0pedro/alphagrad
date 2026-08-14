@@ -79,7 +79,20 @@ def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
     # mean instead of the plain one.
     vs0 = jnp.zeros((total_v + 2, embd_dim), jnp.float32)
     vc0 = jnp.zeros((total_v + 2,), jnp.float32)
-    vs0, vc0 = _vmem.update_ids(vs0, vc0, rows0, base_ids, valid0,
+    # THE VERTEX SLOTS ARE THE DYNAMIC CHANNEL, so the base stream does NOT
+    # go into them: a vertex's own base tokens are its IDENTITY, and the
+    # identity is a separate half of the representation
+    # (`VertexIdentityPool`, concatenated in `heads_from_memory`). Folding
+    # them in here as well would put identity back into the dynamic address
+    # -- the exact sharing the split exists to end -- and would double-count
+    # them. What still lands:
+    #   * UNOWNED base rows (headers, the input list) -> the GLOBAL slot,
+    #     which is the pointer's learned summary of the graph's syntax and
+    #     has no identity half to move to;
+    #   * every base row -> the SUMMARY slot, so the value head's mean is
+    #     still over the whole stream.
+    _unowned = jnp.asarray(valid0, jnp.float32) * (base_ids < 0)
+    vs0, vc0 = _vmem.update_ids(vs0, vc0, rows0, base_ids, _unowned,
                                 global_slot=total_v)
     return (enc1,) + _credit_summary(vs0, vc0, rows0, valid0)
 

@@ -1227,6 +1227,12 @@ def attention_entropy_diagnostic(agent, tokens, eqn_ids=None,
             cnts = jax.ops.segment_sum(w, ids, num_segments=n_slots)
             pooled = sums / jnp.maximum(cnts, 1.0)[:, None]
             vmask = (cnts > 0).astype(enc_x.dtype)
+        # The pointer scores [identity || dynamic]; this diagnostic pools the
+        # raw stream, which is the DYNAMIC half only, so the identity half is
+        # zero-padded. It measures how SPREAD the pointer's attention is over
+        # slots, which stays a meaningful reading with a constant half.
+        if getattr(pol, "embd_dim", pooled.shape[-1]) == 2 * pooled.shape[-1]:
+            pooled = jnp.concatenate([jnp.zeros_like(pooled), pooled], -1)
         parts.append(pol.attention_entropy(pooled, vmask))
         if axis_state is not None and axis_valid is not None:
             # Whichever approximation head exists owns the AxisSetEncoder:
@@ -1324,6 +1330,10 @@ class Agent(eqx.Module):
     # It replaced `vertex_feature_proj` (hand features) and the Set
     # Transformer that aggregated them across calibration samples.
     identity_pool: VertexIdentityPool
+    # [identity || dynamic] is 2E wide, and the SetPointer scores it at that
+    # width; this brings its contexts back to E for everything downstream
+    # (the face head's endpoint contexts, the micro head, the value path).
+    ctx_proj: eqx.nn.Linear
     # F: preference-vector → embd_dim projection. Adds the per-episode
     # preference w ∈ Δ^7 into the policy's per-vertex contexts and the
     # value-head summary so a single net covers the whole Pareto front.
@@ -1351,6 +1361,7 @@ class Agent(eqx.Module):
         value_head_cos,
         op_embedding,
         identity_pool,
+        ctx_proj,
         pref_proj,
         num_vertices,
         num_value_heads,
@@ -1375,6 +1386,7 @@ class Agent(eqx.Module):
         self.value_head_cos = value_head_cos
         self.op_embedding = op_embedding
         self.identity_pool = identity_pool
+        self.ctx_proj = ctx_proj
         self.pref_proj = pref_proj
         self.num_vertices = num_vertices
         self.num_value_heads = num_value_heads
@@ -1882,18 +1894,21 @@ class Agent(eqx.Module):
         vmask = _vmem.occupancy(vmem_counts)
         from alphagrad.approx.set_pointer import SetPointerVertexPolicy
         _ident = self.identity(identity_stream, vmem_rows.shape[0])
-        if (isinstance(self.vertex_policy, SetPointerVertexPolicy)
-                and _ident is not None):
-            # The pointer must score CONTENT, and the vertices it has to
-            # choose between are exactly the ones whose vmem slot holds only
-            # their BASE tokens (a slot grows on elimination). The identity
-            # is that base content, pooled by the vertex's own learned
-            # attention rather than described by a hand-written feature row,
-            # and every vertex slot participates.
-            slots = vmem_rows + _ident
-            smask = jnp.ones_like(vmask)
-            vertex_logits, vertex_contexts = (
+        if isinstance(self.vertex_policy, SetPointerVertexPolicy):
+            # [IDENTITY || DYNAMIC], CONCATENATED. They used to be ADDED into
+            # one slot, so "which vertex this is" and "what has happened to it
+            # since" shared an address and no downstream weight could tell
+            # them apart. Concatenated, each half has its own coordinates
+            # through every pointer block. Every vertex slot participates:
+            # the identity half is never empty, so occupancy stops being the
+            # mask.
+            _id_half = (jnp.zeros_like(vmem_rows) if _ident is None
+                        else _ident)
+            slots = jnp.concatenate([_id_half, vmem_rows], axis=-1)
+            smask = (jnp.ones_like(vmask) if _ident is not None else vmask)
+            vertex_logits, _ctx2 = (
                 self.vertex_policy.from_vertex_memory(slots, smask))
+            vertex_contexts = jax.vmap(self.ctx_proj)(_ctx2)
         else:
             vertex_logits, vertex_contexts = (
                 self.vertex_policy.from_vertex_memory(vmem_rows, vmask))
@@ -1907,9 +1922,6 @@ class Agent(eqx.Module):
                 g=vmem_counts[-1],
                 lm=jnp.max(vertex_logits),
             )
-        if _ident is not None:
-            vertex_contexts = vertex_contexts + _ident[
-                : vertex_contexts.shape[0]]
         # The SUMMARY slot, not a re-add of the per-slot sums: under
         # participation crediting a row lands in every slot it touches, so
         # the sums no longer total the tokens (see carry_stream.advance).
@@ -3598,9 +3610,10 @@ def _build_agent(
     )
     if getattr(args, "set_pointer", False):
         from alphagrad.approx.set_pointer import SetPointerVertexPolicy
+        # 2 * embd_dim: the pointer scores [identity || dynamic] slots.
         vertex_policy = SetPointerVertexPolicy(
             num_vertices=total_v,
-            embd_dim=args.embd_dim,
+            embd_dim=2 * args.embd_dim,
             num_heads=args.num_heads,
             num_blocks=int(getattr(args, "set_pointer_blocks", 2)),
             key=encoder_keys[2],
@@ -3631,6 +3644,8 @@ def _build_agent(
     # re-indexing would move pref_proj and the approximation heads onto
     # different randomness and change every seeded run for no reason.
     identity_pool = VertexIdentityPool(args.embd_dim, key=encoder_keys[8])
+    ctx_proj = eqx.nn.Linear(2 * args.embd_dim, args.embd_dim,
+                             key=encoder_keys[7])
     pref_proj = eqx.nn.Linear(NUM_VALUE_HEADS, args.embd_dim, key=encoder_keys[11])
     # Dynamic-substeps head: only constructed when the flag is on so the
     # default agent stays leaner (one extra encoder + MicroActionHead is
@@ -3703,6 +3718,7 @@ def _build_agent(
         value_head_cos=value_head_cos,
         op_embedding=op_embedding,
         identity_pool=identity_pool,
+        ctx_proj=ctx_proj,
         pref_proj=pref_proj,
         num_vertices=total_v,
         num_value_heads=NUM_VALUE_HEADS,
@@ -3731,17 +3747,13 @@ def _scale_output_heads(agent, scale: float):
         agent = scale_module_weight(
             agent, lambda a: a.vertex_policy.k_proj.weight, scale
         )
-    # Zero the IDENTITY pool's output projection, the same discipline every
-    # other additive context path here follows: at initialisation the vertex
-    # slots are their raw base-token memory and the pointer is near-uniform,
-    # and the identity earns its contribution by gradient. (The hand-feature
-    # projection it replaced was zeroed for exactly this reason, so the
-    # initial policy is unchanged by the swap.)
-    agent = scale_module_weight(
-        agent,
-        lambda a: a.identity_pool.out_proj.weight,
-        0.0,
-    )
+    # The IDENTITY pool is deliberately NOT zeroed. Every other additive
+    # context path here starts at zero because it is an EXTRA on top of a
+    # channel that already carries content -- but the vertex slots now hold
+    # only DYNAMICS (a candidate's slot is empty until something touches it),
+    # so a zero identity would make every candidate identical at the root:
+    # the v31 uniform-pick failure, reintroduced by initialisation. Its
+    # content is the vertex's own base tokens, discriminative from step 0.
     # F: zero the preference projection so the conditioned and
     # unconditioned paths produce identical step-0 policies on the same seed.
     agent = scale_module_weight(
