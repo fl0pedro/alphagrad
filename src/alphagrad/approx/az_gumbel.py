@@ -641,35 +641,25 @@ def _carry_advance(agent, enc, vs, vc, dtok, deqn, dcount, owner):
 
 
 @eqx.filter_jit
-def _carry_heads(agent, vs, vc, residual):
+def _carry_heads(agent, vs, vc):
     """(vertex_logits (total_v,), vertex_contexts (total_v, E), value (3,))."""
-    return _cs.heads(agent, vs, vc, vertex_features=VFEAT,
-                     residual_state=residual, preference=None)
-
-
-@eqx.filter_jit
-def _residual_update(agent, residual, v0, ctx_row):
-    return agent.update_residual(residual, v0, ctx_row)
-
-
-def _zero_residual():
-    return jnp.zeros((TOTAL_V, EMBD), dtype=jnp.float32)
+    return _cs.heads(agent, vs, vc, vertex_features=VFEAT, preference=None)
 
 
 class Carry:
     """The DEVICE half of a search node (~35 KB on nn256).
 
     EncCarry(M, I, cumhist, nvalid, pos) + the per-vertex memory
-    (sums/counts) + the elimination residual. Params-DEPENDENT, unlike the
+    (sums/counts). Params-DEPENDENT, unlike the
     old `_tok_cache`: a carry cached across a `train_step` is silently STALE,
     not wrong-shaped, so carries live for exactly one `gumbel_search` call
     and every decision rebuilds from the committed root carry.
     """
 
-    __slots__ = ("enc", "vs", "vc", "residual")
+    __slots__ = ("enc", "vs", "vc")
 
-    def __init__(self, enc, vs, vc, residual):
-        self.enc, self.vs, self.vc, self.residual = enc, vs, vc, residual
+    def __init__(self, enc, vs, vc):
+        self.enc, self.vs, self.vc = enc, vs, vc
 
 
 def _q_of(value3):
@@ -813,7 +803,7 @@ def _prefix_arrays(state):
 
 
 @eqx.filter_jit
-def _face_plan(agent, precomputed, enc_carry, avail, residual,
+def _face_plan(agent, precomputed, enc_carry, avail,
                order, spec_hist, step_count, face_hist, skip_hist, key):
     """Draw ONE face-sequence sample F ~ beta for the vertex the one-hot
     ``avail`` forces (Sampled AZ calls this per surviving candidate per
@@ -831,7 +821,7 @@ def _face_plan(agent, precomputed, enc_carry, avail, residual,
     (vertex_idx, actions, _vdist, _od, _id, _jd, _ed, _kd, _qlp,
      _vp, _vc, face_out, value, v_context) = agent.sample_action_dynamic(
         None, avail, AXIS_STATE, AXIS_VALID, FACT_TABLES, OP_OVERRIDE, key,
-        vertex_features=VFEAT, residual_state=residual,
+        vertex_features=VFEAT,
         precomputed=precomputed, enc_carry=enc_carry,
         face_chunk_fn=face_chunk_fn, face_count_fn=face_count_fn,
     )
@@ -875,7 +865,9 @@ def _step(node, vertex, face_rows=None, face_skips=None, face_keys=None):
 
     ``node`` is ``(state, carry, ctxs)``; the returned child carries its own
     ``(state, carry)``. The caller decides whether the elimination is
-    speculative (inside ``PT.branch()``) or committed.
+    speculative (inside ``PT.branch()``) or committed. ``ctxs`` is INERT since
+    the B.4 residual was deleted -- it fed the per-vertex residual update and
+    nothing else -- but the node shape is the caller's, so it stays.
 
     ``face_rows``/``face_skips`` default to EXACT (the exact arm, the DEEPEN
     rollouts and the warm start). Under Sampled AZ the search's expansions
@@ -884,7 +876,7 @@ def _step(node, vertex, face_rows=None, face_skips=None, face_keys=None):
     COMMITTED decision passes the executed draw's wires, so the committed
     carry is built from the same approximated delta the search evaluated.
     """
-    state, carry, ctxs = node
+    state, carry, _ctxs = node
     a = int(vertex) - 1                     # VALID is contiguous 1..NV
     spec_row = EXACT_SPEC_ROW
     face_rows = EXACT_FACE_ROWS if face_rows is None else np.asarray(
@@ -917,10 +909,8 @@ def _step(node, vertex, face_rows=None, face_skips=None, face_keys=None):
         agent, carry.enc, carry.vs, carry.vc,
         jnp.asarray(dt), jnp.asarray(de), jnp.asarray(dc, jnp.int32),
         jnp.asarray(a, jnp.int32))
-    resid2 = _residual_update(
-        agent, carry.residual, jnp.asarray(a, jnp.int32), ctxs[a])
     st2 = list(state) + [(a, face_rows, face_skips)]
-    return (st2, Carry(enc2, vs2, vc2, resid2),
+    return (st2, Carry(enc2, vs2, vc2),
             {"tokens": toks, "eqn_ids": ids, "delta": (dt, de, dc),
              "owner": a, "spec_row": spec_row, "face_rows": face_rows,
              "face_skips": face_skips, "is_last": is_last})
@@ -1068,7 +1058,7 @@ def _eval_node(state, carry):
     handing it back means the committed decision's face draw conditions on the
     encoding the search actually acted under, with no second encode.
     """
-    out = _carry_heads(agent, carry.vs, carry.vc, carry.residual)
+    out = _carry_heads(agent, carry.vs, carry.vc)
     return np.asarray(out[0], dtype=np.float64), out, _q_of(out[2])
 
 
@@ -1316,7 +1306,7 @@ def _draw_face_sequence(vertex, head_out, carry, prefix_arrays, rng,
             _s_use = np.ascontiguousarray(_s_h[:, :_fb])
     (fr, fs, fa, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de,
      _vctx, _feat, face_ent, _vi) = _face_plan(
-        _ag, head_out, carry.enc, jnp.asarray(_avail), carry.residual,
+        _ag, head_out, carry.enc, jnp.asarray(_avail),
         jnp.asarray(_o_arr), jnp.asarray(_sp_h),
         jnp.asarray(_n, jnp.int32), jnp.asarray(_f_use), jnp.asarray(_s_use),
         _key)
@@ -1641,8 +1631,8 @@ def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
         _wh = np.array([dd["w_hat"] for dd in _cd], dtype=np.float64)
         _wh = _wh / _wh.sum()
         exec_draw = _cd[int(rng.choice(len(_cd), p=_wh))]
-    # ``head_out`` rides out so the caller can commit the chosen action and
-    # update the residual without a second heads pass.
+    # ``head_out`` rides out so the caller can commit the chosen action
+    # without a second heads pass.
     return chosen, pi, la, legal, head_out, cands, exec_draw
 
 # ---------------------------------------------------------------- training
@@ -1662,7 +1652,7 @@ _W4J = jnp.asarray(np.asarray(W4, dtype=np.float32))
 
 
 def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
-            resid, dtok, deqn, dcnt, owner, vsel, la_pad, la_mask, pi_pad,
+            dtok, deqn, dcnt, owner, vsel, la_pad, la_mask, pi_pad,
             vtgt, vmask, sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp, sd_fvalid,
             sd_cnt, sd_dt, sd_de, sd_fa):
     """Vertex CE + value MSE + the Sampled-AZ face CE, all re-derived from
@@ -1678,7 +1668,7 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
     """
     from alphagrad.approx.ppo import EncCarry
 
-    def per(M, I, ch, nv, pos, vs, vc, rs, dt, de, dc, ow, vsl,
+    def per(M, I, ch, nv, pos, vs, vc, dt, de, dc, ow, vsl,
             la, lam, pi, vt, vm, s_li, s_vidx, s_w, s_fp, s_fc, s_fv,
             s_cnt, s_dt, s_de, s_fa):
         carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
@@ -1687,7 +1677,7 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
         c2, vs2, vc2 = _cs.advance(agent, carry, vs, vc, dt, de, dc, ow,
                                    window=MAX_DELTA_TOKENS, chunk=0)
         vlog, ctx, v3 = _cs.heads(agent, vs2, vc2, vertex_features=VFEAT,
-                                  residual_state=rs, preference=None)
+                                  preference=None)
         lg = vlog[la]
         lg = jnp.where(lam > 0.5, lg, -jnp.inf)   # -1e9 collided with a sentinel
         logp = jax.nn.log_softmax(lg)
@@ -1716,7 +1706,7 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
         return ce + 0.5 * vl + face_loss, (face_ent_norm, vl, ce)
 
     losses, (ents, vls, ces) = jax.vmap(per)(
-        enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c, resid,
+        enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
         dtok, deqn, dcnt, owner, vsel, la_pad, la_mask, pi_pad, vtgt, vmask,
         sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp, sd_fvalid,
         sd_cnt, sd_dt, sd_de, sd_fa)
@@ -1975,7 +1965,7 @@ def _run(args) -> int:
         # params-dependent, so it can never outlive a train_step.
         PT.reset()
         state = []
-        carry = Carry(*_carry_init(agent), _zero_residual())
+        carry = Carry(*_carry_init(agent))
         steps = []
         _memlog = os.environ.get("ALPHAGRAD_GAZ_MEMLOG", "0") == "1"
         _dstep = 0
@@ -2113,7 +2103,6 @@ def _run(args) -> int:
                 "enc_pos": np.asarray(_pre_for_loss[0].enc.pos),
                 "vmem_s": np.asarray(_pre_for_loss[0].vs),
                 "vmem_c": np.asarray(_pre_for_loss[0].vc),
-                "resid": np.asarray(_pre_for_loss[0].residual),
                 "dtok": _pre_for_loss[1][0], "deqn": _pre_for_loss[1][1],
                 "dcnt": np.int32(_pre_for_loss[1][2]),
                 "owner": np.int32(_pre_for_loss[2]),
@@ -2202,7 +2191,7 @@ def _run(args) -> int:
                 return np.stack([s[k] for s in flat])
             enc_M, enc_I = stk("enc_M"), stk("enc_I")
             enc_ch, enc_nv, enc_pos = stk("enc_ch"), stk("enc_nv"), stk("enc_pos")
-            vmem_s, vmem_c, resid = stk("vmem_s"), stk("vmem_c"), stk("resid")
+            vmem_s, vmem_c = stk("vmem_s"), stk("vmem_c")
             dtok, deqn = stk("dtok"), stk("deqn")
             dcnt, owner, vsel = stk("dcnt"), stk("owner"), stk("vsel")
             # The search-draw columns for the Sampled-AZ face CE. On the
@@ -2226,7 +2215,7 @@ def _run(args) -> int:
             vt = np.stack([(s["raw4"] - popart.mu) / popart.sigma for s in flat])  # PopArt-normalised
             vm = np.broadcast_to(np.abs(W4) > 0, (len(flat), 4)).astype(np.float32)
             _cols = (enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
-                     resid, dtok, deqn, dcnt, owner, vsel, la_p, la_m, pi_p,
+                     dtok, deqn, dcnt, owner, vsel, la_p, la_m, pi_p,
                      vt, vm, sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp,
                      sd_fvalid, sd_cnt, sd_dt, sd_de, sd_fa)
             # M5: resample the minibatch EVERY epoch. Taking one fixed 64-sample

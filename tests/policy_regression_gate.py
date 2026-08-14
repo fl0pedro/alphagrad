@@ -273,7 +273,6 @@ def run_trace(case=None, steps=None):
     enc_carry, vmem_s, vmem_c = CS.init_carry(
         agent, base_tok[:base_w], base_eqn[:base_w], base_n,
         window=base_w, total_v=total_v, embd_dim=EMBD, base_owners=base_own)
-    residual = jnp.zeros((total_v, EMBD), jnp.float32)
 
     keys = jrand.split(jrand.PRNGKey(SEED), steps)
     out_steps = []
@@ -287,8 +286,7 @@ def run_trace(case=None, steps=None):
             state.delta_tokens, state.delta_eqns, state.delta_count,
             delta_owner, window=case["window"])
         precomputed = CS.heads(agent, vmem_s, vmem_c,
-                               vertex_features=None, residual_state=residual,
-                               preference=None)
+                               vertex_features=None, preference=None)
         avail = vertex_avail_at_step(
             state, case["vertex_valid_static"], total_v, num_valid)
 
@@ -302,7 +300,7 @@ def run_trace(case=None, steps=None):
          v_context) = agent.sample_action_dynamic(
             None, avail, state.axis_state, state.axis_valid_mask,
             case["factor_tables"], case["op_legality"], keys[t],
-            eqn_ids=None, vertex_features=None, residual_state=residual,
+            eqn_ids=None, vertex_features=None,
             preference=None, precomputed=precomputed,
             face_chunk_fn=chunk_fn, face_count_fn=count_fn,
             enc_carry=enc_carry,
@@ -409,7 +407,6 @@ def run_trace(case=None, steps=None):
 
         env_out = env.step(state, env_action)
         state = env_out.state
-        residual = agent.update_residual(residual, vertex_idx, v_context)
         rec["env_delta_count"] = int(state.delta_count)
         rec["env_order_prefix"] = [
             int(x) for x in np.asarray(state.order)[:int(state.step_count)]]

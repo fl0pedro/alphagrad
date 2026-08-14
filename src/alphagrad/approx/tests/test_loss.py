@@ -90,8 +90,6 @@ def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, nu
     estim_returns = jrand.normal(keys[4], (batch_size, num_value_heads))
     norm_adv = jrand.normal(keys[5], (batch_size,))
     vertex_avail = jnp.ones((batch_size, total_v))
-    # B.4 residual state — zero-init mirrors the rollout's first-step value.
-    residual_state = jnp.zeros((batch_size, total_v, 32), dtype=jnp.float32)
     # F preference vector — uniform 1/K as a stand-in for the per-env Dirichlet sample.
     preference = jnp.full(
         (batch_size, num_value_heads), 1.0 / num_value_heads, dtype=jnp.float32,
@@ -134,7 +132,6 @@ def fake_batch(batch_size, total_v, max_rules, num_factors, num_pair_choices, nu
     return TrainBatch(
         tokens=tokens,
         eqn_ids=eqn_ids,
-        residual_state=residual_state,
         preference=preference,
         vertex_idx=vertex_idx,
         pair_seq=pair_seq,

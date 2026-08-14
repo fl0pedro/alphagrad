@@ -105,11 +105,10 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
 
 
 def heads(agent, vmem_sums, vmem_counts, *, vertex_features=None,
-          residual_state=None, preference=None):
+          preference=None):
     """``(vertex_logits, vertex_contexts, value)`` off the vertex memory."""
     return agent.heads_from_memory(
         vmem_sums, vmem_counts,
         vertex_features=vertex_features,
-        residual_state=residual_state,
         preference=preference,
     )

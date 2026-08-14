@@ -787,7 +787,6 @@ def _window_copy(tokens_buf, eqn_ids_buf, pos, count, width):
 
 
 class Trajectory(NamedTuple):
-    residual_state: jax.Array  # (V, embd_dim) at the start of this step
     preference: jax.Array  # (NUM_VALUE_HEADS,) — weights V_latency/V_mem/V_cos
     vertex_idx: jax.Array
     # Legacy rule-head action — zero-filled in --dynamic-substeps mode.
@@ -885,7 +884,6 @@ class Trajectory(NamedTuple):
 
 
 class TrainBatch(NamedTuple):
-    residual_state: jax.Array
     preference: jax.Array
     vertex_idx: jax.Array
     pair_seq: jax.Array
@@ -1161,45 +1159,20 @@ class SetTransformerAggregator(eqx.Module):
         return jax.vmap(self.output_proj)(pooled)  # (V, embd_dim)
 
 
-class ResidualStateUpdate(eqx.Module):
-    """Stage B.4: small recurrent update on the per-vertex residual state.
-
-    Spec calls for tracking the cumulative effect of past eliminations so the
-    decoder can condition on what's already happened without re-encoding the
-    full residual jaxpr. The minimal-viable form here is a per-slot GRU-style
-    gate: when vertex ``v`` is eliminated, blend its new representation into
-    ``s_v`` with a learned scalar gate; other slots are unchanged.
-
-    A future B.4.next can extend this to propagate updates through the DAG
-    neighbours of the eliminated vertex (using the relation masks from B.1)
-    so the residual carries dataflow information beyond just "this vertex
-    was eliminated".
-    """
-
-    event_proj: eqx.nn.Linear
-    decay_logit: jax.Array
-
-    residual_dim: int = eqx.field(static=True)
-
-    def __init__(self, *, residual_dim: int, key):
-        keys = jrand.split(key, 2)
-        self.residual_dim = residual_dim
-        self.event_proj = eqx.nn.Linear(residual_dim, residual_dim, key=keys[0])
-        # Initialised at 0 → gate sigmoid(0) = 0.5; first-step blend is
-        # symmetric. Letting this become a learned scalar saves us from
-        # picking a hyperparameter.
-        self.decay_logit = jnp.zeros((), dtype=jnp.float32)
-
-    def __call__(self, residual_state, vertex_idx, vertex_repr):
-        """Update slot ``vertex_idx`` of ``residual_state`` with ``vertex_repr``.
-
-        ``residual_state`` is `(V, residual_dim)`; ``vertex_repr`` is
-        `(residual_dim,)`. Returns a new array of the same shape.
-        """
-        gate = jnn.sigmoid(self.decay_logit)
-        update = self.event_proj(vertex_repr)
-        new_slot = residual_state[vertex_idx] * (1.0 - gate) + update * gate
-        return residual_state.at[vertex_idx].set(new_slot)
+# STAGE B.4 `residual_state` IS GONE (2026-08-14).
+#
+# `ResidualStateUpdate` blended the eliminated vertex's context into a
+# per-vertex state that `encode` / `heads_from_memory` ADDED to the vertex
+# contexts. It was identically ZERO for every run this repo ever did:
+# `init_linear_weights` zeroes every Linear bias and `_scale_output_heads`
+# zeroed `event_proj.weight`, so the "update" was 0*ctx + 0 = 0 forever, and
+# `residual_to_summary` (the B.4.next projection) had no reader at all. Zero
+# is exactly what the additive path contributed, which is why deleting it is
+# BIT-IDENTICAL on tests/policy_regression_gate.py.
+#
+# The dynamic per-vertex state the spec wanted is not this: it is the
+# PARTICIPATION channel (every vertex a delta touches, concatenated beside a
+# static identity), which lands in its own stage.
 
 
 # ATTENTION-ENTROPY DIAGNOSTIC (entropy/palimpsa).
@@ -1355,11 +1328,6 @@ class Agent(eqx.Module):
     # constructed; only invoked when `vertex_features` arrives with a leading
     # sample axis (rank-3) — the agent dispatches automatically.
     set_transformer_agg: SetTransformerAggregator
-    residual_update: ResidualStateUpdate
-    # B.4.next: residual-state → summary projection used by the cached-encoding
-    # value path. Zero-initialised so the cached and re-encoding paths agree
-    # on the initial value at episode start (residual_state == 0).
-    residual_to_summary: eqx.nn.Linear
     # F: preference-vector → embd_dim projection. Adds the per-episode
     # preference w ∈ Δ^7 into the policy's per-vertex contexts and the
     # value-head summary so a single net covers the whole Pareto front.
@@ -1388,8 +1356,6 @@ class Agent(eqx.Module):
         op_embedding,
         vertex_feature_proj,
         set_transformer_agg,
-        residual_update,
-        residual_to_summary,
         pref_proj,
         num_vertices,
         num_value_heads,
@@ -1415,8 +1381,6 @@ class Agent(eqx.Module):
         self.op_embedding = op_embedding
         self.vertex_feature_proj = vertex_feature_proj
         self.set_transformer_agg = set_transformer_agg
-        self.residual_update = residual_update
-        self.residual_to_summary = residual_to_summary
         self.pref_proj = pref_proj
         self.num_vertices = num_vertices
         self.num_value_heads = num_value_heads
@@ -1451,7 +1415,6 @@ class Agent(eqx.Module):
         tokens,
         eqn_ids=None,
         vertex_features=None,
-        residual_state=None,
         preference=None,
         key=None,
     ):
@@ -1484,12 +1447,6 @@ class Agent(eqx.Module):
         if vertex_features is not None:
             vertex_contexts = vertex_contexts + self._data_embedding(vertex_features)
 
-        # Stage B.4: add the cumulative-elimination residual state so the
-        # decoder can condition on which vertices have already been picked
-        # without paying for re-encoding the residual jaxpr from scratch.
-        if residual_state is not None:
-            vertex_contexts = vertex_contexts + residual_state
-
         summary = jnp.sum(enc_x * mask, axis=0) / jnp.maximum(
             jnp.sum(mask, axis=0), 1e-9
         )
@@ -1512,7 +1469,6 @@ class Agent(eqx.Module):
         tokens,
         eqn_ids=None,
         vertex_features=None,
-        residual_state=None,
         preference=None,
         key=None,
     ):
@@ -1520,15 +1476,10 @@ class Agent(eqx.Module):
             tokens,
             eqn_ids=eqn_ids,
             vertex_features=vertex_features,
-            residual_state=residual_state,
             preference=preference,
             key=key,
         )
         return value
-
-    def update_residual(self, residual_state, vertex_idx, vertex_repr):
-        """Apply the per-slot recurrent update to ``residual_state``."""
-        return self.residual_update(residual_state, vertex_idx, vertex_repr)
 
     # -- Phase 3b: incremental autoregressive encode ------------------------
 
@@ -1936,7 +1887,6 @@ class Agent(eqx.Module):
         vmem_sums,
         vmem_counts,
         vertex_features=None,
-        residual_state=None,
         preference=None,
     ):
         """The ``encode()`` head block, fed from the per-vertex memory instead
@@ -1978,8 +1928,6 @@ class Agent(eqx.Module):
             )
         if vertex_features is not None:
             vertex_contexts = vertex_contexts + self._data_embedding(vertex_features)
-        if residual_state is not None:
-            vertex_contexts = vertex_contexts + residual_state
         summary = _vmem.summary(vmem_sums, vmem_counts)
         if preference is not None:
             pref_emb = self.pref_proj(preference)
@@ -2002,7 +1950,6 @@ class Agent(eqx.Module):
         key,
         eqn_ids=None,
         vertex_features=None,
-        residual_state=None,
         cached_encoding=None,
         preference=None,
         vertex_temperature=None,
@@ -2035,7 +1982,6 @@ class Agent(eqx.Module):
                 tokens,
                 eqn_ids=eqn_ids,
                 vertex_features=vertex_features,
-                residual_state=residual_state,
                 preference=preference,
                 key=net_key,
             )
@@ -2499,7 +2445,6 @@ class Agent(eqx.Module):
         key,
         eqn_ids=None,
         vertex_features=None,
-        residual_state=None,
         cached_encoding=None,
         preference=None,
         pair_valid=None,       # stored live DIAG mask for the chosen vertex
@@ -2535,8 +2480,7 @@ class Agent(eqx.Module):
             else:
                 _vl, _vc, _val = self.encode(
                     tokens, eqn_ids=eqn_ids, vertex_features=vertex_features,
-                    residual_state=residual_state, preference=preference,
-                    key=key)
+                    preference=preference, key=key)
             _vd = jnn.softmax(
                 _mask_vertex_logits(_vl, vertex_avail_mask), axis=-1)
             return (
@@ -2560,7 +2504,6 @@ class Agent(eqx.Module):
                 tokens,
                 eqn_ids=eqn_ids,
                 vertex_features=vertex_features,
-                residual_state=residual_state,
                 preference=preference,
                 key=key,
             )
@@ -3650,15 +3593,11 @@ def _build_agent(
         args.embd_dim,
         key=encoder_keys[7],
     )
-    residual_update = ResidualStateUpdate(
-        residual_dim=args.embd_dim,
-        key=encoder_keys[8],
-    )
-    residual_to_summary = eqx.nn.Linear(
-        args.embd_dim,
-        args.embd_dim,
-        key=encoder_keys[9],
-    )
+    # encoder_keys[8] / [9] used to build the B.4 residual modules. The slots
+    # are deliberately LEFT UNUSED rather than reindexed: every later key is
+    # positional, so re-packing them would move set_transformer_agg /
+    # pref_proj / the approximation heads onto different randomness and change
+    # every seeded run for no reason.
     # Hidden dim must be divisible by num_heads — keep it at embd_dim for
     # simplicity. The aggregator is small (one attention block over the
     # sample axis), so this isn't a meaningful parameter cost.
@@ -3744,8 +3683,6 @@ def _build_agent(
         op_embedding=op_embedding,
         vertex_feature_proj=vertex_feature_proj,
         set_transformer_agg=set_transformer_agg,
-        residual_update=residual_update,
-        residual_to_summary=residual_to_summary,
         pref_proj=pref_proj,
         num_vertices=total_v,
         num_value_heads=NUM_VALUE_HEADS,
@@ -3788,21 +3725,6 @@ def _scale_output_heads(agent, scale: float):
     agent = scale_module_weight(
         agent,
         lambda a: a.set_transformer_agg.output_proj.weight,
-        0.0,
-    )
-    # Stage B.4: zero the residual-update event projection so the residual
-    # state contributes nothing at initialisation. Same idea — keeps the
-    # initial policy distribution uncorrupted by uninitialised additive paths.
-    agent = scale_module_weight(
-        agent,
-        lambda a: a.residual_update.event_proj.weight,
-        0.0,
-    )
-    # B.4.next: zero residual_to_summary so the cached-encoding value path
-    # produces the same initial summary as the re-encoding path.
-    agent = scale_module_weight(
-        agent,
-        lambda a: a.residual_to_summary.weight,
         0.0,
     )
     # F: zero the preference projection so the conditioned and
@@ -5226,9 +5148,6 @@ def main():
         vertex_temperature=None,
     ):
         keys = jrand.split(key, rollout_length)
-        # Stage B.4: per-vertex residual state, initialised to zero at episode
-        # start. Carried through the rollout's scan alongside env_state.
-        init_residual = jnp.zeros((total_v, args.embd_dim), dtype=jnp.float32)
 
         encode_key, scan_key = jrand.split(keys[0], 2)
 
@@ -5317,7 +5236,7 @@ def main():
         init_enc_state = _init_pre + _init_post
 
         def step_fn(carry, k):
-            state, residual_state, elim_order, enc_state = carry
+            state, elim_order, enc_state = carry
             sample_key, next_net_key = jrand.split(k, 2)
             vertex_avail_mask = vertex_avail_at_step(
                 state, vertex_valid_static, total_v, num_valid
@@ -5359,7 +5278,6 @@ def main():
             precomputed = _carry_stream.heads(
                 agent, vmem_s2, vmem_c2,
                 vertex_features=vertex_features,
-                residual_state=residual_state,
                 preference=(
                     preference if args.preference_conditioned else None
                 ),
@@ -5438,7 +5356,6 @@ def main():
                     sample_key,
                     eqn_ids=None,
                     vertex_features=vertex_features,
-                    residual_state=residual_state,
                     preference=preference if args.preference_conditioned else None,
                     oracle_pair_all=oracle_pair_all,
                     oracle_comp_all=oracle_comp_all,
@@ -5526,12 +5443,6 @@ def main():
             # trains against the original returns. Disabled when the
             # coefficient is zero.
 
-            new_residual = agent.update_residual(
-                residual_state,
-                vertex_idx,
-                v_context,
-            )
-
             pref_arg = preference if args.preference_conditioned else None
             # Bootstrap value at next_state: extend the post-decision carry by
             # the delta the JUST-CHOSEN elimination emitted -- which is
@@ -5570,7 +5481,6 @@ def main():
             _, _, next_value = _carry_stream.heads(
                 agent, nv_s, nv_c,
                 vertex_features=vertex_features,
-                residual_state=new_residual,
                 preference=pref_arg,
             )
             next_value = _pp_mark("prof/heads_bootstrap", next_value)
@@ -5589,7 +5499,6 @@ def main():
             )
 
             transition = Trajectory(
-                residual_state=residual_state,
                 preference=preference.astype(jnp.float32),
                 vertex_idx=jnp.asarray(vertex_idx, dtype=jnp.int32),
                 pair_seq=jnp.asarray(pair_seq, dtype=jnp.int32),
@@ -5646,13 +5555,13 @@ def main():
             next_enc_state = (enc_carry2, vmem_s2, vmem_c2,
                               nxt_carry, nv_s_raw, nv_c_raw)
             return (
-                (next_state, new_residual, elim_order, next_enc_state),
+                (next_state, elim_order, next_enc_state),
                 (transition, raw_rewards),
             )
 
-        (final_state, _, _, _), (traj, all_raw_rewards) = lax.scan(
+        (final_state, _, _), (traj, all_raw_rewards) = lax.scan(
             step_fn,
-            (env_state, init_residual, jnp.zeros((total_v,), dtype=jnp.int32),
+            (env_state, jnp.zeros((total_v,), dtype=jnp.int32),
              init_enc_state),
             keys,
         )
@@ -5728,7 +5637,7 @@ def main():
             else None
         )
 
-        def _eval_dyn(rs, pref, vidx, action, vmask, ax_st, ax_vm,
+        def _eval_dyn(pref, vidx, action, vmask, ax_st, ax_vm,
                       k, pv, cv, fa=None, fpv=None, fcv=None, fv=None,
                       pc3=None, fch=None, fcy=None, fb=None, fwb=None):
             # No token arguments: `pc3` (the carry-derived heads) IS the
@@ -5744,7 +5653,6 @@ def main():
                 k,
                 eqn_ids=None,
                 vertex_features=vertex_features,
-                residual_state=rs,
                 cached_encoding=None,
                 preference=pref_or_none(pref),
                 pair_valid=pv,
@@ -5790,7 +5698,7 @@ def main():
             _face_win_budget = None
 
         def _carry_heads(M, I, ch, nv, pos, owner, vs, vc,
-                         rs, pref, dtok, deqn, dcnt):
+                         pref, dtok, deqn, dcnt):
             carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
             # The delta is STORED, with its length. The loss re-derives no
             # window from anything, so there is no length to get wrong.
@@ -5812,7 +5720,6 @@ def main():
             return _carry_stream.heads(
                 agent, vs2, vc2,
                 vertex_features=vertex_features,
-                residual_state=rs,
                 preference=pref_or_none(pref),
             ) + (carry2,)
 
@@ -5820,7 +5727,7 @@ def main():
             batch.enc_M, batch.enc_I, batch.enc_cumhist,
             batch.enc_nvalid, batch.enc_pos, batch.delta_owner,
             batch.vmem_sums, batch.vmem_counts,
-            batch.residual_state, batch.preference,
+            batch.preference,
             batch.delta_tokens, batch.delta_eqns, batch.delta_count,
         )
         (
@@ -5838,11 +5745,11 @@ def main():
             face_ents,
         ) = (
             jax.vmap(
-                lambda rs, pref, vidx, action, vmask, ax_st,
+                lambda pref, vidx, action, vmask, ax_st,
                 ax_vm, k, pv, cv, fa, fpv, fcv, fv, pl, pc, pvl,
                 fct, fdt, fde, cy:
                 _eval_dyn(
-                    rs, pref, vidx, action, vmask, ax_st,
+                    pref, vidx, action, vmask, ax_st,
                     ax_vm, k, pv, cv, fa, fpv, fcv, fv,
                     pc3=(pl, pc, pvl),
                     # Chunk lengths + THIS step's emission window + the
@@ -5856,7 +5763,6 @@ def main():
                     fwb=_face_win_budget,
                 )
             )(
-                batch.residual_state,
                 batch.preference,
                 batch.vertex_idx,
                 actions,
@@ -5877,14 +5783,13 @@ def main():
             )
             if args.face_actions
             else jax.vmap(
-                lambda rs, pref, vidx, action, vmask, ax_st,
+                lambda pref, vidx, action, vmask, ax_st,
                 ax_vm, k, pv, cv, pl, pc, pvl:
                 _eval_dyn(
-                    rs, pref, vidx, action, vmask, ax_st,
+                    pref, vidx, action, vmask, ax_st,
                     ax_vm, k, pv, cv, pc3=(pl, pc, pvl)
                 )
             )(
-                batch.residual_state,
                 batch.preference,
                 batch.vertex_idx,
                 actions,
@@ -6507,7 +6412,6 @@ def main():
         # carry the actions; we add micro_*_dists alongside them so the
         # old log-prob computation can index them.)
         full_batch = TrainBatch(
-            residual_state=traj.residual_state,
             preference=traj.preference,
             vertex_idx=traj.vertex_idx,
             pair_seq=traj.pair_seq,
