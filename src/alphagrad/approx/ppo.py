@@ -882,6 +882,10 @@ class Trajectory(NamedTuple):
     delta_eqns: jax.Array     # (MAX_DELTA_TOKENS,) int32
     delta_count: jax.Array    # () int32
     delta_owner: jax.Array  # () int32 — vertex whose elimination emitted the delta
+    # The slots that delta TOUCHES (vertex + its faces' endpoints), 0/1 over
+    # (total_v + 1). Stored because the loss re-runs the same `advance` and
+    # must credit the same slots the rollout did.
+    delta_participants: jax.Array  # (total_v + 1,) float32
     discount: jax.Array
     vertex_avail_mask: jax.Array
 
@@ -942,6 +946,7 @@ class TrainBatch(NamedTuple):
     delta_eqns: jax.Array
     delta_count: jax.Array
     delta_owner: jax.Array
+    delta_participants: jax.Array
     estim_returns: jax.Array
     norm_adv: jax.Array
     vertex_avail_mask: jax.Array
@@ -1905,7 +1910,11 @@ class Agent(eqx.Module):
         if _ident is not None:
             vertex_contexts = vertex_contexts + _ident[
                 : vertex_contexts.shape[0]]
-        summary = _vmem.summary(vmem_sums, vmem_counts)
+        # The SUMMARY slot, not a re-add of the per-slot sums: under
+        # participation crediting a row lands in every slot it touches, so
+        # the sums no longer total the tokens (see carry_stream.advance).
+        summary = _vmem.summary(vmem_sums, vmem_counts,
+                                summary_slot=vmem_sums.shape[0] - 1)
         if preference is not None:
             pref_emb = self.pref_proj(preference)
             vertex_contexts = vertex_contexts + pref_emb[None, :]
@@ -2227,6 +2236,26 @@ class Agent(eqx.Module):
     _WIRE_KEYS = ("op_type", "i", "j", "exponents", "factor",
                   "compress_kind", "quant_dtype", "quant_scale_sign",
                   "quant_scale_frac")
+
+    @staticmethod
+    def participation_mask(total_v, owner, face_ends, face_valid):
+        """``(total_v + 1,)`` 0/1 mask: every slot this step's delta TOUCHES.
+
+        ``{v} u {endpoints of v's faces}``. The face endpoints are the ones
+        the head already reads its per-face contexts from, so participation
+        costs one scatter and no new host traffic. The trailing entry is the
+        GLOBAL slot, used when a delta touches nothing (the pre-scan
+        bootstrap, whose owner is -1).
+        """
+        m = jnp.zeros((total_v + 1,), jnp.float32)
+        m = m.at[jnp.where(owner >= 0, owner, total_v)].add(1.0)
+        live = jnp.asarray(face_valid, jnp.float32) > 0.5
+        ids = jnp.where(live[:, None], jnp.asarray(face_ends, jnp.int32),
+                        0).reshape(-1) - 1
+        # mode="drop": an endpoint of 0 ("no vertex": a jaxpr input) and a
+        # padding face have no slot, and must not be folded into one.
+        m = m.at[ids].add(jnp.where(ids >= 0, 1.0, 0.0), mode="drop")
+        return (m > 0).astype(jnp.float32)
 
     @staticmethod
     def _endpoint_ctx(vertex_contexts, vid):
@@ -5189,6 +5218,11 @@ def main():
             window=_BASE_W, total_v=total_v, embd_dim=args.embd_dim,
             base_owners=_BASE_OWN,
         )
+        # The pre-scan delta was emitted before any elimination this rollout
+        # made, so it touches nothing: an all-zero participation mask, which
+        # `advance` sends to the global slot -- authorship's destination for
+        # an owner of -1.
+        _init_part = jnp.zeros((total_v + 1,), jnp.float32)
         # The scan carries the encoder state at TWO points, PRE and POST this
         # step's delta, because they are the same two things every iteration
         # already computed -- twice. See `step_fn`'s bootstrap block. POST is
@@ -5206,11 +5240,12 @@ def main():
                       jnp.zeros((), jnp.int32),
                       jnp.array(-1, jnp.int32)).astype(jnp.int32),
             window=MAX_DELTA_TOKENS,
+            participants=_init_part,
         )
         init_enc_state = _init_pre + _init_post
 
         def step_fn(carry, k):
-            state, elim_order, enc_state = carry
+            state, elim_order, enc_state, prev_part = carry
             sample_key, next_net_key = jrand.split(k, 2)
             vertex_avail_mask = vertex_avail_at_step(
                 state, vertex_valid_static, total_v, num_valid
@@ -5439,11 +5474,18 @@ def main():
             #   the base carry is enc_carry2/vmem2 in both cases.
             # Same function, same inputs, so the same bits -- this is a
             # deletion of recomputation, not a change of semantics.
+            # PARTICIPATION of the delta the just-chosen elimination emits:
+            # the vertex itself plus the endpoints of every face it contracted
+            # through. `face_ends_v` is the face loop's own enumeration, so no
+            # second host probe is needed.
+            step_part = agent.participation_mask(
+                total_v, vertex_idx.astype(jnp.int32),
+                face_ends_v, face_valid_v)
             nxt_carry, nv_s_raw, nv_c_raw = _carry_stream.advance(
                 agent, enc_carry2, vmem_s2, vmem_c2,
                 next_state.delta_tokens, next_state.delta_eqns,
                 next_state.delta_count, vertex_idx.astype(jnp.int32),
-                window=MAX_DELTA_TOKENS,
+                window=MAX_DELTA_TOKENS, participants=step_part,
             )
             # The UNMARKED triple is what gets threaded (see next_enc_state):
             # `_pp_mark` adds a host-produced 0.0 to every numeric leaf, so
@@ -5469,6 +5511,7 @@ def main():
                 enc_nvalid=enc_carry.nvalid, enc_pos=enc_carry.pos,
                 vmem_sums=vmem_s, vmem_counts=vmem_c,
                 delta_owner=delta_owner,
+                delta_participants=prev_part,
                 delta_tokens=delta_tok, delta_eqns=delta_eqn,
                 delta_count=jnp.asarray(delta_count, jnp.int32),
             )
@@ -5531,14 +5574,14 @@ def main():
             next_enc_state = (enc_carry2, vmem_s2, vmem_c2,
                               nxt_carry, nv_s_raw, nv_c_raw)
             return (
-                (next_state, elim_order, next_enc_state),
+                (next_state, elim_order, next_enc_state, step_part),
                 (transition, raw_rewards),
             )
 
-        (final_state, _, _), (traj, all_raw_rewards) = lax.scan(
+        (final_state, _, _, _), (traj, all_raw_rewards) = lax.scan(
             step_fn,
             (env_state, jnp.zeros((total_v,), dtype=jnp.int32),
-             init_enc_state),
+             init_enc_state, _init_part),
             keys,
         )
         return final_state, traj, all_raw_rewards[-1]
@@ -5675,14 +5718,14 @@ def main():
             _face_bound = None
             _face_win_budget = None
 
-        def _carry_heads(M, I, ch, nv, pos, owner, vs, vc,
+        def _carry_heads(M, I, ch, nv, pos, owner, part, vs, vc,
                          pref, dtok, deqn, dcnt):
             carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
             # The delta is STORED, with its length. The loss re-derives no
             # window from anything, so there is no length to get wrong.
             carry2, vs2, vc2 = _carry_stream.advance(
                 agent, carry, vs, vc, dtok, deqn, dcnt, owner,
-                window=MAX_DELTA_TOKENS,
+                window=MAX_DELTA_TOKENS, participants=part,
                 # The loss is reverse-differentiated through this extend, so
                 # it cannot use the rollout's while_loop -- it passes the
                 # batch-wide `budget` instead and gets the scan/cond form,
@@ -5704,6 +5747,7 @@ def main():
         pc_logits, pc_ctx, pc_value, pc_carry = jax.vmap(_carry_heads)(
             batch.enc_M, batch.enc_I, batch.enc_cumhist,
             batch.enc_nvalid, batch.enc_pos, batch.delta_owner,
+            batch.delta_participants,
             batch.vmem_sums, batch.vmem_counts,
             batch.preference,
             batch.delta_tokens, batch.delta_eqns, batch.delta_count,
@@ -6446,6 +6490,7 @@ def main():
             delta_eqns=traj.delta_eqns,
             delta_count=traj.delta_count,
             delta_owner=traj.delta_owner,
+            delta_participants=traj.delta_participants,
             estim_returns=estim_returns,
             norm_adv=norm_adv,
             vertex_avail_mask=traj.vertex_avail_mask,

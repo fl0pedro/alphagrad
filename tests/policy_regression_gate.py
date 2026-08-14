@@ -289,6 +289,10 @@ def run_trace(case=None, steps=None):
 
     keys = jrand.split(jrand.PRNGKey(SEED), steps)
     out_steps = []
+    # The PARTICIPATION mask of the delta each step consumes: the previous
+    # step's vertex plus its faces' endpoints. Empty before the first
+    # elimination, which `advance` routes to the global slot.
+    part = jnp.zeros((total_v + 1,), jnp.float32)
     for t in range(steps):
         delta_owner = jnp.where(
             state.step_count > 0,
@@ -297,7 +301,7 @@ def run_trace(case=None, steps=None):
         enc_carry, vmem_s, vmem_c = CS.advance(
             agent, enc_carry, vmem_s, vmem_c,
             state.delta_tokens, state.delta_eqns, state.delta_count,
-            delta_owner, window=case["window"])
+            delta_owner, window=case["window"], participants=part)
         precomputed = CS.heads(agent, vmem_s, vmem_c,
                                identity_stream=ident, preference=None)
         avail = vertex_avail_at_step(
@@ -422,6 +426,17 @@ def run_trace(case=None, steps=None):
             ]
             rec["face_skip"] = [
                 int(x) for x in np.asarray(env_action.face_skip)[:n_live]]
+
+        # The slots THIS elimination touches -- the next step's delta is
+        # credited to them, so a change in the participation rule shows up
+        # here before it shows up in a logit.
+        part = agent.participation_mask(
+            total_v, jnp.asarray(v, jnp.int32),
+            (jnp.zeros((case["max_faces"], 2), jnp.int32)
+             if face_out is None else face_out[9]),
+            (jnp.zeros((case["max_faces"],), jnp.float32)
+             if face_out is None else face_out[5]))
+        rec["participants"] = _idx(part)
 
         env_out = env.step(state, env_action)
         state = env_out.state

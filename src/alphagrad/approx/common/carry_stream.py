@@ -71,20 +71,53 @@ def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
         # owner is 1-based; slot index is owner-1. 0 (no owner) -> -1 ->
         # the global slot, same destination the fallback uses.
         base_ids = jnp.where(_own > 0, _own - 1, -1)
-    vs0 = jnp.zeros((total_v + 1, embd_dim), jnp.float32)
-    vc0 = jnp.zeros((total_v + 1,), jnp.float32)
-    vs0, vc0 = _vmem.update_ids(vs0, vc0, rows0, base_ids, valid0)
-    return enc1, vs0, vc0
+    # LAYOUT (total_v + 2): 0..V-1 the vertices, V the GLOBAL slot
+    # (structural tokens), V+1 the SUMMARY slot -- every row credited exactly
+    # ONCE. The summary slot exists because a row now lands in EVERY vertex it
+    # touches (see `advance`), so the per-slot sums no longer re-add to the
+    # token total and the value head would otherwise get a fan-out-weighted
+    # mean instead of the plain one.
+    vs0 = jnp.zeros((total_v + 2, embd_dim), jnp.float32)
+    vc0 = jnp.zeros((total_v + 2,), jnp.float32)
+    vs0, vc0 = _vmem.update_ids(vs0, vc0, rows0, base_ids, valid0,
+                                global_slot=total_v)
+    return (enc1,) + _credit_summary(vs0, vc0, rows0, valid0)
+
+
+def _credit_summary(sums, counts, rows, valid):
+    """Credit the SUMMARY slot (the last one) with every valid row, once."""
+    w = jnp.asarray(valid, jnp.float32)
+    return (sums.at[-1].add(jnp.sum(rows * w[:, None], axis=0)),
+            counts.at[-1].add(jnp.sum(w)))
 
 
 def advance(agent, enc_carry, vmem_sums, vmem_counts,
             delta_tokens, delta_eqns, delta_count, owner, *, window,
-            chunk=None, budget=None):
+            chunk=None, budget=None, participants=None):
     """Extend the carry by one step's delta; returns the new
     ``(enc_carry, vmem_sums, vmem_counts)``.
 
-    ``owner`` is the vertex whose elimination emitted this delta -- every row
-    of it belongs to that vertex's memory slot.
+    PARTICIPATION, NOT AUTHORSHIP. ``owner`` is the vertex whose elimination
+    emitted this delta, and crediting the rows to that slot alone was the
+    whole dynamic channel: an un-eliminated CANDIDATE's slot never changed,
+    however much the elimination rewired the graph around it, so the pointer
+    was choosing between vertices whose state had not moved since the base
+    stream. ``participants`` is the set of slots the delta TOUCHES -- the
+    eliminated vertex plus the endpoints of every face it contracted through
+    -- as a ``(total_v + 1,)`` 0/1 mask (the trailing entry is the global
+    slot). Every equation row of the delta is credited to every one of them.
+
+    There is NO fan-out cap and nothing to overflow: the set is a mask over
+    the slots, not a K-vector of ids, so it costs O(V) and cannot truncate.
+
+    WHAT ``vmem_counts`` MEANS under fan-out: "how many rows TOUCHED this
+    slot", so ``read`` stays the mean over the rows that touched it. It is no
+    longer the token count, which is why the value head reads the dedicated
+    SUMMARY slot (credited exactly once per row) instead of re-adding the
+    per-slot sums.
+
+    ``participants=None`` keeps the old authorship crediting, which is what
+    the unit tests and any caller without a face enumeration get.
 
     ``chunk`` is forwarded to :meth:`Agent.encode_extend`: it bounds how much
     of the (mostly empty) delta window is actually scanned. ``None`` takes the
@@ -97,11 +130,32 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
         enc_carry, delta_tokens, delta_eqns, delta_count,
         window=window, start=0, chunk=chunk, budget=budget,
     )
-    ids = jnp.where(eqns >= 0, owner, -1)
-    sums2, counts2 = _vmem.update_ids(
-        vmem_sums, vmem_counts, rows, ids, valid
-    )
-    return carry2, sums2, counts2
+    n_slots = vmem_sums.shape[0]
+    gid = n_slots - 2                      # the GLOBAL slot (see init_carry)
+    w = jnp.asarray(valid, jnp.float32)
+    if participants is None:
+        ids = jnp.where(eqns >= 0, owner, -1)
+        sums2, counts2 = _vmem.update_ids(
+            vmem_sums, vmem_counts, rows, ids, valid, global_slot=gid,
+        )
+        return (carry2,) + _credit_summary(sums2, counts2, rows, valid)
+    # Every row of a delta carries the SAME participation set, so the fan-out
+    # is one outer product, not a (rows x slots) scatter.
+    w_eqn = w * (eqns >= 0).astype(jnp.float32)
+    w_str = w - w_eqn                       # structural rows -> global slot
+    tot_eqn = jnp.sum(rows * w_eqn[:, None], axis=0)
+    n_eqn = jnp.sum(w_eqn)
+    part = jnp.asarray(participants, jnp.float32)
+    # A delta with no participants at all (the pre-scan bootstrap, whose
+    # "owner" is -1) goes to the global slot -- the destination authorship
+    # gave it, so nothing is silently dropped.
+    part = jnp.where(jnp.sum(part) > 0, part,
+                     jnp.eye(n_slots - 1, dtype=jnp.float32)[gid])
+    sums2 = vmem_sums.at[: n_slots - 1].add(part[:, None] * tot_eqn[None, :])
+    counts2 = vmem_counts.at[: n_slots - 1].add(part * n_eqn)
+    sums2 = sums2.at[gid].add(jnp.sum(rows * w_str[:, None], axis=0))
+    counts2 = counts2.at[gid].add(jnp.sum(w_str))
+    return (carry2,) + _credit_summary(sums2, counts2, rows, valid)
 
 
 def heads(agent, vmem_sums, vmem_counts, *, identity_stream=None,

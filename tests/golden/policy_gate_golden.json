@@ -55,8 +55,8 @@
       2
      ]
     ],
-    "entropy": "3f3171ee",
-    "logp": "bf32038e",
+    "entropy": "3f3167aa",
+    "logp": "bf360dba",
     "n_live": 1,
     "pair_valid": [
      [
@@ -192,13 +192,17 @@
    "micro_quant_logp": [
     "00000000"
    ],
+   "participants": [
+    0,
+    1
+   ],
    "rule_specs": [],
    "step": 0,
    "target_vertex": 1,
    "value": [
-    "3d94aacf",
-    "be24f1d7",
-    "3c942179"
+    "3d94aace",
+    "be24f1db",
+    "3c942173"
    ],
    "vertex": 0,
    "vertex_mask_fill": [
@@ -208,27 +212,27 @@
    "vertex_probs_live": [
     [
      0,
-     "3e249e9f"
+     "3e22b7d3"
     ],
     [
      1,
-     "3e1efd1b"
+     "3e1d8de5"
     ],
     [
      2,
-     "3e29bd2a"
+     "3e2b0c3f"
     ],
     [
      3,
-     "3e28ffb1"
+     "3e2b7cc2"
     ],
     [
      4,
-     "3e30e852"
+     "3e31f1ab"
     ],
     [
      5,
-     "3e38bf14"
+     "3e373f99"
     ]
    ]
   },
@@ -265,8 +269,8 @@
       7
      ]
     ],
-    "entropy": "40e655c5",
-    "logp": "c0c83514",
+    "entropy": "40d7fc82",
+    "logp": "c0d2f949",
     "n_live": 1,
     "pair_valid": [
      [
@@ -333,7 +337,7 @@
        0
       ],
       "i": [
-       0,
+       1,
        0,
        0
       ],
@@ -369,7 +373,7 @@
    "face_rows": [
     [
      [
-      0,
+      1,
       0,
       2
      ],
@@ -402,13 +406,18 @@
    "micro_quant_logp": [
     "00000000"
    ],
+   "participants": [
+    4,
+    5,
+    6
+   ],
    "rule_specs": [],
    "step": 1,
    "target_vertex": 6,
    "value": [
-    "3d97ed6a",
-    "bde3fb40",
-    "3d3762ea"
+    "3d97ed63",
+    "bde3fb3f",
+    "3d3762f2"
    ],
    "vertex": 5,
    "vertex_mask_fill": [
@@ -418,23 +427,23 @@
    "vertex_probs_live": [
     [
      1,
-     "3e4ddd7b"
+     "3e487bcb"
     ],
     [
      2,
-     "3e47b422"
+     "3e56769e"
     ],
     [
      3,
-     "3e40063d"
+     "3e421522"
     ],
     [
      4,
-     "3e533fe2"
+     "3e53a6ea"
     ],
     [
      5,
-     "3e572842"
+     "3e4b518c"
     ]
    ]
   },
@@ -482,8 +491,8 @@
       4
      ]
     ],
-    "entropy": "414e125c",
-    "logp": "c1373b4a",
+    "entropy": "4152a49a",
+    "logp": "c1435418",
     "n_live": 2,
     "pair_valid": [
      [
@@ -730,13 +739,18 @@
    "micro_quant_logp": [
     "00000000"
    ],
+   "participants": [
+    1,
+    2,
+    3
+   ],
    "rule_specs": [],
    "step": 2,
    "target_vertex": 3,
    "value": [
-    "3cf114d8",
-    "be7f168d",
-    "3d544504"
+    "3cf114c1",
+    "be7f1695",
+    "3d54451c"
    ],
    "vertex": 2,
    "vertex_mask_fill": [
@@ -746,19 +760,19 @@
    "vertex_probs_live": [
     [
      1,
-     "3e775a89"
+     "3e83189d"
     ],
     [
      2,
-     "3e857310"
+     "3e91f021"
     ],
     [
      3,
-     "3e6ee300"
+     "3e733cb1"
     ],
     [
      4,
-     "3e876e2c"
+     "3e62b1d5"
     ]
    ]
   },
@@ -768,7 +782,7 @@
     3,
     4
    ],
-   "env_delta_count": 505,
+   "env_delta_count": 366,
    "env_order_prefix": [
     1,
     6,
@@ -806,8 +820,8 @@
       7
      ]
     ],
-    "entropy": "4128d875",
-    "logp": "c12df5c7",
+    "entropy": "411d6d5f",
+    "logp": "c10dcb83",
     "n_live": 2,
     "pair_valid": [
      [
@@ -968,7 +982,7 @@
       ],
       "i": [
        0,
-       1,
+       3,
        0
       ],
       "j": [
@@ -1026,7 +1040,7 @@
      ],
      [
       -2,
-      1,
+      3,
       0
      ],
      [
@@ -1054,13 +1068,18 @@
    "micro_quant_logp": [
     "00000000"
    ],
+   "participants": [
+    1,
+    4,
+    6
+   ],
    "rule_specs": [],
    "step": 3,
    "target_vertex": 5,
    "value": [
-    "3da484ed",
-    "be49e2ba",
-    "3e0baf54"
+    "3da484de",
+    "be49e2b7",
+    "3e0baf56"
    ],
    "vertex": 4,
    "vertex_mask_fill": [
@@ -1070,15 +1089,15 @@
    "vertex_probs_live": [
     [
      1,
-     "3eab3b0c"
+     "3ea981f6"
     ],
     [
      3,
-     "3e9414f3"
+     "3ea95594"
     ],
     [
      4,
-     "3ec0b002"
+     "3ead2875"
     ]
    ]
   },
@@ -1087,7 +1106,7 @@
     1,
     3
    ],
-   "env_delta_count": 682,
+   "env_delta_count": 670,
    "env_order_prefix": [
     1,
     6,
@@ -1126,8 +1145,8 @@
       7
      ]
     ],
-    "entropy": "412859d3",
-    "logp": "c12201ca",
+    "entropy": "4113f350",
+    "logp": "c10f435d",
     "n_live": 2,
     "pair_valid": [
      [
@@ -1277,7 +1296,7 @@
      },
      {
       "compress_kind": [
-       2,
+       1,
        0,
        0
       ],
@@ -1298,12 +1317,12 @@
       ],
       "op_type": [
        1,
-       2,
+       3,
        0
       ],
       "quant_dtype": [
        0,
-       2,
+       0,
        0
       ],
       "quant_frac": [
@@ -1342,12 +1361,12 @@
      [
       -2,
       0,
-      2
+      1
      ],
      [
-      -3,
-      2,
-      1
+      -1,
+      -1,
+      0
      ],
      [
       -1,
@@ -1374,13 +1393,18 @@
    "micro_quant_logp": [
     "00000000"
    ],
+   "participants": [
+    1,
+    3,
+    6
+   ],
    "rule_specs": [],
    "step": 4,
    "target_vertex": 4,
    "value": [
-    "3db884e5",
-    "be5540f7",
-    "3dbb9429"
+    "3da9d183",
+    "be56115e",
+    "3db9c862"
    ],
    "vertex": 3,
    "vertex_mask_fill": [
@@ -1390,11 +1414,11 @@
    "vertex_probs_live": [
     [
      1,
-     "3f0c7a1b"
+     "3f003cd3"
     ],
     [
      3,
-     "3ee70bcb"
+     "3eff8659"
     ]
    ]
   }
