@@ -124,7 +124,9 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
 
         return fn
 
-    if fn_str == "TransformerLM":
+    if fn_str in _TLM_BLOCKS:
+        # Same data path for every depth: the window/embedding are a property
+        # of (S, D, V), not of how many encoder blocks consume them.
         from alphagrad.approx.common.datasets import load_wikitext2
         S, D, V = _tlm_dims()
         ids = jnp.asarray(load_wikitext2(V))
@@ -358,23 +360,27 @@ def get_args(fn_str: str, key, dataset: str | None = None):
                 shapes = [(_w,), (_w,), (_w, _w), (_w,), (_w, _w), (_w,)]
             else:
                 shapes = [(4,), (4,), (8, 4), (8,), (4, 8), (4,)]
-    elif fn_str == "TransformerLM":
+    elif fn_str in _TLM_BLOCKS:
+        n_blk = _TLM_BLOCKS[fn_str]
         S, D, V = _tlm_dims()
-        ks = jax.random.split(key, 16)
+        # Slot layout is per-block-strided (7 slots/block, 4 of them used) so
+        # block b of the 3-block target draws the SAME key as block b of the
+        # 2-block one -- depth is the only difference between them.
+        ks = jax.random.split(key, 7 * n_blk + 2)
 
         def _w(i, shape):
             return jax.random.normal(ks[i], shape) / jnp.sqrt(
                 jnp.float32(shape[0]))
 
         ws = []
-        for blk in range(2):
+        for blk in range(n_blk):
             o = blk * 7
             ws += [_w(o, (D, D)), _w(o + 1, (D, D)), _w(o + 2, (D, D)),
                    _w(o + 3, (D, D)), jnp.zeros((D,)),
                    jnp.ones((D,)), jnp.zeros((D,))]
-        ws.append(_w(14, (D, V)))
+        ws.append(_w(7 * n_blk, (D, V)))
         gen = data_gen(fn_str, dataset=dataset or "wikitext2")
-        x, y = gen(jax.random.split(ks[15], 2))
+        x, y = gen(jax.random.split(ks[7 * n_blk + 1], 2))
         return [x, y, *ws]
     elif fn_str.endswith("Perceptron"):
         shapes = [(4,), (4,), (8, 4), (8,), (4, 8), (4,), (8,), (8,)]
@@ -431,6 +437,8 @@ def get_fn(fn_str: str):
         fn = examples.Perceptron
     elif base == "TransformerLM":
         fn = _transformer_lm
+    elif base == "TransformerLM3":
+        fn = _transformer_lm3
     else:
         # strip the Vmapped prefix so graphax models (ConvNet/MoE/ViT/Encoder/...)
         # resolve by their bare name.
@@ -592,8 +600,9 @@ def infer_argnums(fn_str: str) -> tuple[int, ...]:
         # (x, y, *weights) -> every weight arg, matching the vision models
         n = len(inspect.signature(getattr(examples, fn_str)).parameters)
         return tuple(range(2, n))
-    if fn_str == "TransformerLM":
-        return tuple(range(2, 17))
+    if fn_str in _TLM_BLOCKS:
+        # (x, y, 7 weights per block, Wout) -> differentiate every weight.
+        return tuple(range(2, 2 + 7 * _TLM_BLOCKS[fn_str] + 1))
     if fn_str.endswith("NeuralNetwork"):
         return (2, 3, 4, 5)
     if fn_str.endswith("Perceptron"):
@@ -607,9 +616,16 @@ def infer_argnums(fn_str: str) -> tuple[int, ...]:
 
 
 # ---------------------------------------------------------------------------
-# TransformerLM (wikitext): 2 encoder blocks + LM head + xent. x is the
+# TransformerLM (wikitext): N encoder blocks + LM head + xent. x is the
 # PRE-EMBEDDED (S, D) window, y the (S, V) one-hot next tokens — the
 # embedding gather happens in data_gen, never in the differentiated graph.
+# The depth is in the NAME, one entry per registered target: TransformerLM is
+# the 2-block target every prior result is measured on and MUST NOT MOVE;
+# TransformerLM3 is the deeper variant. Shapes (S, D, V) are shared, so both
+# read the same _tlm_dims()/_tlm_embedding data path.
+_TLM_BLOCKS = {"TransformerLM": 2, "TransformerLM3": 3}
+
+
 def _tlm_dims():
     return (int(os.environ.get("ALPHAGRAD_TLM_SEQ", "64")),
             int(os.environ.get("ALPHAGRAD_TLM_DMODEL", "128")),
@@ -623,6 +639,17 @@ def _transformer_lm(x, y, WQ1, WK1, WV1, W1, b1, g0, be0,
     z1 = encoder_block(x, WQ1, WK1, WV1, W1, b1, g0, be0)
     z2 = encoder_block(z1, WQ2, WK2, WV2, W2, b2, g1, be1)
     return softmax_cross_entropy(z2 @ Wout, y)
+
+
+def _transformer_lm3(x, y, WQ1, WK1, WV1, W1, b1, g0, be0,
+                     WQ2, WK2, WV2, W2, b2, g1, be1,
+                     WQ3, WK3, WV3, W3, b3, g2, be2, Wout):
+    from graphax.examples.deep_learning import (encoder_block,
+                                                softmax_cross_entropy)
+    z1 = encoder_block(x, WQ1, WK1, WV1, W1, b1, g0, be0)
+    z2 = encoder_block(z1, WQ2, WK2, WV2, W2, b2, g1, be1)
+    z3 = encoder_block(z2, WQ3, WK3, WV3, W3, b3, g2, be2)
+    return softmax_cross_entropy(z3 @ Wout, y)
 
 
 def _tlm_embedding(D, V):

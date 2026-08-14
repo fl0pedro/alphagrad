@@ -4302,7 +4302,7 @@ def main():
     dataset_arg = None if args.dataset == "none" else args.dataset
     use_dataset = dataset_arg is not None and (
         args.example.endswith("NeuralNetwork")
-        or args.example == "TransformerLM")
+        or args.example.startswith("TransformerLM"))
     dataset_for_call = dataset_arg if use_dataset else None
 
     target_fn = get_fn(args.example)
