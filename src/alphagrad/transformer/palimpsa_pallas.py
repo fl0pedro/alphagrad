@@ -155,6 +155,37 @@ def _fwd_kernel(q_ref, k_ref, v_ref, b_ref, gt_ref, g_ref, Ip_ref,
     lax.fori_loop(0, T, body, (mu0, I0))
 
 
+# --------------------------------------------------------------------------
+# Backend resolution. ONE definition of the recurrence: the Pallas kernel,
+# run through Pallas' own interpreter on CPU (interpret=True) rather than a
+# second hand-written implementation. `palimpsa_ref` is retained as a TEST
+# ORACLE only -- GRAPHAX_PALIMPSA_REF=1 still forces it so the two can be
+# cross-checked, but nothing reaches it by default.
+# --------------------------------------------------------------------------
+_BACKEND_LOGGED = [False]
+
+
+def _resolve_backend() -> str:
+    """"kernel" | "interpret" | "ref". Logged ONCE per process: a silent
+    fallback (CPU host, or a jaxlib/Triton skew) previously changed which
+    code computed the recurrence with no trace in the run log."""
+    if os.environ.get("GRAPHAX_PALIMPSA_REF", "0") == "1":
+        mode = "ref"
+    elif jax.default_backend() == "cpu":
+        mode = "interpret"
+    else:
+        mode = "kernel"
+    if not _BACKEND_LOGGED[0]:
+        _BACKEND_LOGGED[0] = True
+        print("[palimpsa] backend=%s jax_default_backend=%s"
+              % (mode, jax.default_backend()), flush=True)
+    return mode
+
+
+def _interpret() -> bool:
+    return _resolve_backend() == "interpret"
+
+
 def _palimpsa_fwd_pallas(q, k, v, b, gt, g, Ip, scale, chunk_size):
     B, T, H, DK0 = q.shape
     DV0 = v.shape[-1]
@@ -181,6 +212,7 @@ def _palimpsa_fwd_pallas(q, k, v, b, gt, g, Ip, scale, chunk_size):
     )
     o, state_mu, state_I = pl.pallas_call(
         kernel,
+        interpret=_interpret(),
         grid=(BH,),
         in_specs=[
             pl.BlockSpec((1, T, DK), lambda i: (i, 0, 0)),
@@ -320,6 +352,7 @@ def _palimpsa_bwd_pallas(q, k, v, b, gt, g, Ip, scale, chunk_size, state_mu, sta
     )
     dq, dk, dv, db, dgt, dg_bh, dIp_bh = pl.pallas_call(
         kernel,
+        interpret=_interpret(),
         grid=(BH,),
         in_specs=[
             pl.BlockSpec((1, T, DV), lambda i: (i, 0, 0)),
@@ -383,22 +416,14 @@ palimpsa_attention.defvjp(_fwd, _bwd)
 
 
 def palimpsa(q, k, v, b, gt, g, Ip, scale=None, chunk_size=16):
-    """Backend dispatcher: the Pallas-Triton kernel on GPU, the verified
-    pure-JAX reference on CPU. The kernel is GPU-only ('Only interpret mode is
-    supported on CPU backend'); palimpsa_ref is numerically the kernel's
-    ground-truth oracle, so this lets the palimpsa policy be constructed AND
-    run a forward/backward pass on a CPU-only host (head-node smoke tests)
-    without changing GPU numerics. chunk_size only affects the kernel's
-    residual frequency, so it is dropped on the ref path."""
-    if (os.environ.get("GRAPHAX_PALIMPSA_REF", "0") == "1"
-            or jax.default_backend() == "cpu"):
-        # GRAPHAX_PALIMPSA_REF=1 forces the reference path even on GPU.
-        # Needed when the installed jaxlib's Triton disagrees with the IR
-        # Pallas emits (jax/jaxlib 0.9.0.1 alongside a 0.10.1 cuda plugin
-        # -> 'Failed to parse Triton module: expected CacheModifierAttr').
-        # Numerically the same as the kernel (palimpsa_ref is its verified
-        # oracle), just slower -- lets the palimpsa policy train while the
-        # env mismatch is fixed separately.
+    """Backend dispatcher. The recurrence is defined ONCE, in the Pallas
+    kernel; on CPU that SAME kernel runs under ``interpret=True`` instead of a
+    second implementation, so CPU and GPU numerics cannot drift.
+
+    ``GRAPHAX_PALIMPSA_REF=1`` forces the legacy pure-JAX ``palimpsa_ref``. It
+    is a TEST ORACLE, not a live path -- kept for cross-checks and as an escape
+    hatch if a jaxlib/Triton skew breaks Pallas entirely, not for training.
+    The resolved backend is logged once per process."""
+    if _resolve_backend() == "ref":
         return palimpsa_ref(q, k, v, b, gt, g, Ip, scale)
     return palimpsa_attention(q, k, v, b, gt, g, Ip, scale, chunk_size)
-
