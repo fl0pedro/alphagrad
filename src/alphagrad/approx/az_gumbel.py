@@ -621,10 +621,21 @@ W4 = az_w4(_WNS)          # W2: [-w_cmp, -w_mem, 0, +w_acc]
 # score up to its own query embedding -- the v31 uniform-pick failure. AZ ran
 # that way (agent.encode(tok, eqn_ids=eqn) with no features) for the whole
 # comparison. They are computed from the same calibration samples PPO uses.
-from alphagrad.approx.ppo import _episode_vertex_features as _ep_vfeat  # noqa: E402
+# The per-vertex IDENTITY replaced the hand-written feature matrix (see
+# ppo.VertexIdentityPool): one encoder pass over the BASE stream, kept as
+# rows so the pool runs -- and trains -- inside the heads. Params-dependent,
+# so it is rebuilt whenever the weights move (per episode, below), exactly
+# as the carry is.
 
-VFEAT = _ep_vfeat(_ns, jaxpr, tuple(closed.literals), tuple(xs),
-                  eval_samples=ev, argnums=tuple(ARGN))
+
+@eqx.filter_jit
+def _identity_stream(agent):
+    return _cs.base_identity_stream(agent, BASE_TOK, BASE_EQN, BASE_N,
+                                    window=BASE_W, total_v=TOTAL_V,
+                                    base_owners=BASE_OWN)
+
+
+VFEAT = None    # rebound to the identity stream once `agent` exists
 
 
 @eqx.filter_jit
@@ -643,7 +654,8 @@ def _carry_advance(agent, enc, vs, vc, dtok, deqn, dcount, owner):
 @eqx.filter_jit
 def _carry_heads(agent, vs, vc):
     """(vertex_logits (total_v,), vertex_contexts (total_v, E), value (3,))."""
-    return _cs.heads(agent, vs, vc, vertex_features=VFEAT, preference=None)
+    return _cs.heads(agent, vs, vc, identity_stream=VFEAT,
+                     preference=None)
 
 
 class Carry:
@@ -821,7 +833,7 @@ def _face_plan(agent, precomputed, enc_carry, avail,
     (vertex_idx, actions, _vdist, _od, _id, _jd, _ed, _kd, _qlp,
      _vp, _vc, face_out, value, v_context) = agent.sample_action_dynamic(
         None, avail, AXIS_STATE, AXIS_VALID, FACT_TABLES, OP_OVERRIDE, key,
-        vertex_features=VFEAT,
+        identity_stream=VFEAT,
         precomputed=precomputed, enc_carry=enc_carry,
         face_chunk_fn=face_chunk_fn, face_count_fn=face_count_fn,
     )
@@ -1682,7 +1694,7 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
         # too, and the dynamic trip count is a lax.while_loop.
         c2, vs2, vc2 = _cs.advance(agent, carry, vs, vc, dt, de, dc, ow,
                                    window=MAX_DELTA_TOKENS, chunk=0)
-        vlog, ctx, v3 = _cs.heads(agent, vs2, vc2, vertex_features=VFEAT,
+        vlog, ctx, v3 = _cs.heads(agent, vs2, vc2, identity_stream=VFEAT,
                                   preference=None)
         lg = vlog[la]
         lg = jnp.where(lam > 0.5, lg, -jnp.inf)   # -1e9 collided with a sentinel
@@ -1958,15 +1970,17 @@ def _run(args) -> int:
             _gc.collect()
             print(f"[gaz] ep={ep} trainer jax.clear_caches() "
                   f"(every {_tce})", flush=True)
-        # #85: fresh calibration samples per episode, and the per-vertex
-        # features recomputed from them -- they are sample-derived, so a
-        # stale VFEAT would describe last episode's data. Mirrors
-        # ppo.py's per-episode `generate_eval_samples` + `_ep_vfeat`.
+        # #85: fresh calibration samples per episode (the measurement's
+        # data), and the per-vertex IDENTITY re-pooled under this episode's
+        # weights. Mirrors ppo.main's per-episode `generate_eval_samples` +
+        # `base_identity_stream`.
         _ev_key = jax.random.fold_in(jax.random.PRNGKey(args.seed), ep)
         ev = generate_eval_samples(env, _ev_key, A.ndata)
         env = eqx.tree_at(lambda e: e.eval_args_samples, env, ev)
-        VFEAT = _ep_vfeat(_ns, jaxpr, tuple(closed.literals), tuple(xs),
-                          eval_samples=ev, argnums=tuple(ARGN))
+        # The identity is params-dependent, not sample-dependent: it is the
+        # pool's reading of this graph's base tokens under the CURRENT
+        # weights, so it is rebuilt here for the same reason the carry is.
+        VFEAT = _identity_stream(agent)
         # A fresh episode = a fresh tokenizer at the base, and a fresh carry
         # built from the base stream under the CURRENT weights. The carry is
         # params-dependent, so it can never outlive a train_step.

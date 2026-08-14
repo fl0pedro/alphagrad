@@ -58,8 +58,6 @@ from alphagrad.approx.common import (
     OP_TYPE_VOCAB_SIZE,
     build_pair_valid_mask,
     build_vertex_valid_static,
-    compute_per_sample_vertex_features,
-    compute_vertex_features,
     data_gen,
     generate_eval_samples,
     get_advantages,
@@ -1081,88 +1079,76 @@ class PointerVertexPolicy(eqx.Module):
         return vertex_logits, vertex_reprs
 
 
-class SetTransformerAggregator(eqx.Module):
-    """Stage B.3 — permutation-invariant aggregator over calibration samples.
+class VertexIdentityPool(eqx.Module):
+    """Each vertex's IDENTITY: a learned attention pool over its OWN span of
+    the base token stream.
 
-    Spec: "A small Set Transformer aggregates these features across the
-    calibration samples, permutation-invariantly, to produce a per-vertex
-    data embedding $d_v$." The per-sample variability is what tells the
-    policy whether a vertex's behaviour is stable on the data distribution.
+    WHAT THIS REPLACES. ``_data_embedding``/``vertex_feature_proj`` projected
+    a hand-written per-vertex feature vector (op-type id + calibration-derived
+    scalars) and ADDED it into the vertex's memory slot. The comment defending
+    it cited "the v31 uniform-pick failure", where every candidate had an
+    identical ZERO slot -- but that was bug #92 (every base token credited to
+    vertex 1), fixed by `carry_stream.init_carry`'s `base_owners`. With the
+    fix, the pointer discriminates on base content alone: on the gate's graph
+    the six candidates' probabilities spread 0.155-0.180 around uniform at
+    step 0, with vertex_features=None. So the hand features are not what
+    keeps the pointer from collapsing, and content beats a feature list.
 
-    Architecture (intentionally lightweight):
+    WHY AN ATTENTION POOL AND NOT A BOUNDARY READ. The obvious cheap identity
+    -- the LAST row of the vertex's span -- was measured at within-step
+    R2 -0.217 (train 0.765): it fits the training decisions and transfers
+    nothing. A pool that learns WHICH of its own tokens matter is the form
+    that has a chance of transferring, and it is permutation-safe over the
+    span.
 
-    * Embed the static op-type id (column 0) and concatenate with the
-      remaining ``F-1`` continuous features → ``(S, V, hidden)``.
-    * One self-attention block over the **sample** axis per vertex (each
-      vertex's S samples form a set; attention is permutation-equivariant).
-    * Mean-pool over samples → permutation-invariant ``(V, hidden)``.
-    * Project to ``embd_dim`` → per-vertex data embedding.
-
-    With 5 calibration samples this is essentially free; for larger sample
-    counts the attention cost is O(S²) per vertex which is still tiny vs
-    the main encoder.
+    The pool is a segment attention: one learned query against every row of
+    the base stream, softmax-normalised WITHIN each owning vertex's segment.
+    No fixed per-vertex slot cap, so no span is silently truncated -- the
+    spans are whole equations and run to hundreds of tokens.
     """
 
-    op_embedding: eqx.nn.Embedding
-    input_proj: eqx.nn.Linear
-    sample_attn: RelationalMultiheadAttention
-    output_proj: eqx.nn.Linear
+    q: jax.Array
+    k_proj: eqx.nn.Linear
+    v_proj: eqx.nn.Linear
+    out_proj: eqx.nn.Linear
+    embd_dim: int = eqx.field(static=True)
 
-    hidden_dim: int = eqx.field(static=True)
-    num_heads: int = eqx.field(static=True)
-    op_embd_dim: int = eqx.field(static=True)
-    num_features: int = eqx.field(static=True)
-
-    def __init__(
-        self,
-        *,
-        num_features,
-        op_embd_dim,
-        hidden_dim,
-        num_heads,
-        embd_dim,
-        vocab_size,
-        key,
-    ):
+    def __init__(self, embd_dim: int, *, key):
         keys = jrand.split(key, 4)
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.op_embd_dim = op_embd_dim
-        self.num_features = num_features
-        self.op_embedding = eqx.nn.Embedding(vocab_size, op_embd_dim, key=keys[0])
-        # +op_embd_dim for op_emb, +num_features-1 for continuous features
-        # (we drop column 0 since the op-type id is consumed by the embedding).
-        self.input_proj = eqx.nn.Linear(
-            op_embd_dim + num_features - 1,
-            hidden_dim,
-            key=keys[1],
-        )
-        self.sample_attn = RelationalMultiheadAttention(
-            num_heads,
-            hidden_dim,
-            key=keys[2],
-        )
-        self.output_proj = eqx.nn.Linear(hidden_dim, embd_dim, key=keys[3])
+        self.embd_dim = embd_dim
+        self.q = jrand.normal(keys[0], (embd_dim,)) * (embd_dim ** -0.5)
+        self.k_proj = eqx.nn.Linear(embd_dim, embd_dim, key=keys[1])
+        self.v_proj = eqx.nn.Linear(embd_dim, embd_dim, key=keys[2])
+        self.out_proj = eqx.nn.Linear(embd_dim, embd_dim, key=keys[3])
 
-    def __call__(self, per_sample_features, *, key):
-        """``per_sample_features``: ``(S, V, F)``. Returns ``(V, embd_dim)``."""
-        S, V, _ = per_sample_features.shape
-        op_ids = per_sample_features[0, :, 0].astype(jnp.int32)
-        op_emb = jax.vmap(self.op_embedding)(op_ids)  # (V, op_d)
-        cont = per_sample_features[:, :, 1:]  # (S, V, F-1)
-        op_emb_b = jnp.broadcast_to(op_emb[None, :, :], (S, V, op_emb.shape[-1]))
-        combined = jnp.concatenate([op_emb_b, cont], axis=-1)  # (S, V, op_d+F-1)
-        h = jax.vmap(jax.vmap(self.input_proj))(combined)  # (S, V, hidden)
+    def __call__(self, rows, ids, valid, n_slots):
+        """``(n_slots, E)`` identities from ``rows (T, E)``.
 
-        # Self-attention over samples, per-vertex independently.
-        h_perm = jnp.transpose(h, (1, 0, 2))  # (V, S, hidden)
-        attn_keys = jrand.split(key, V)
-        h_attn = jax.vmap(lambda x, k: self.sample_attn(x, x, x, key=k))(
-            h_perm, attn_keys
-        )  # (V, S, hidden)
-
-        pooled = jnp.mean(h_attn, axis=1)  # (V, hidden)
-        return jax.vmap(self.output_proj)(pooled)  # (V, embd_dim)
+        ``ids`` is the 0-based owning SLOT per row (``-1`` = none: headers,
+        the input list -- they go nowhere, not to slot 0), ``valid`` the
+        encoder's own per-row validity.
+        """
+        live = (valid > 0.5) & (ids >= 0)
+        k = jax.vmap(self.k_proj)(rows)
+        v = jax.vmap(self.v_proj)(rows)
+        sc = (k @ self.q) / jnp.sqrt(jnp.asarray(self.embd_dim, rows.dtype))
+        # Rows with no owner are parked in a TRASH segment that is sliced off,
+        # so they can neither shift another vertex's softmax nor land in a
+        # slot. -inf is never fed to the exponential: dead rows are zeroed
+        # arithmetically (the 0*inf gradient trap this file documents twice).
+        seg = jnp.where(live, jnp.clip(ids, 0, n_slots - 1), n_slots)
+        mx = jax.ops.segment_max(jnp.where(live, sc, -jnp.inf), seg,
+                                 num_segments=n_slots + 1)
+        mx = jnp.where(jnp.isfinite(mx), mx, 0.0)
+        e = jnp.where(live, jnp.exp(sc - mx[seg]), 0.0)
+        z = jax.ops.segment_sum(e, seg, num_segments=n_slots + 1)
+        w = e / jnp.maximum(z[seg], 1e-9)
+        pooled = jax.ops.segment_sum(v * w[:, None], seg,
+                                     num_segments=n_slots + 1)[:n_slots]
+        # A slot with no rows of its own pools to exactly zero, not to a
+        # learned bias -- an empty identity must be empty.
+        occupied = (z[:n_slots] > 0)[:, None]
+        return jnp.where(occupied, jax.vmap(self.out_proj)(pooled), 0.0)
 
 
 # STAGE B.4 `residual_state` IS GONE (2026-08-14).
@@ -1329,11 +1315,10 @@ class Agent(eqx.Module):
     value_head_mem: MLP
     value_head_cos: MLP
     op_embedding: eqx.nn.Embedding
-    vertex_feature_proj: eqx.nn.Linear
-    # B.3: Set Transformer aggregator over calibration samples. Always
-    # constructed; only invoked when `vertex_features` arrives with a leading
-    # sample axis (rank-3) — the agent dispatches automatically.
-    set_transformer_agg: SetTransformerAggregator
+    # The per-vertex IDENTITY, learned from each vertex's own base tokens.
+    # It replaced `vertex_feature_proj` (hand features) and the Set
+    # Transformer that aggregated them across calibration samples.
+    identity_pool: VertexIdentityPool
     # F: preference-vector → embd_dim projection. Adds the per-episode
     # preference w ∈ Δ^7 into the policy's per-vertex contexts and the
     # value-head summary so a single net covers the whole Pareto front.
@@ -1360,8 +1345,7 @@ class Agent(eqx.Module):
         value_head_mem,
         value_head_cos,
         op_embedding,
-        vertex_feature_proj,
-        set_transformer_agg,
+        identity_pool,
         pref_proj,
         num_vertices,
         num_value_heads,
@@ -1385,8 +1369,7 @@ class Agent(eqx.Module):
         self.value_head_mem = value_head_mem
         self.value_head_cos = value_head_cos
         self.op_embedding = op_embedding
-        self.vertex_feature_proj = vertex_feature_proj
-        self.set_transformer_agg = set_transformer_agg
+        self.identity_pool = identity_pool
         self.pref_proj = pref_proj
         self.num_vertices = num_vertices
         self.num_value_heads = num_value_heads
@@ -1396,31 +1379,25 @@ class Agent(eqx.Module):
         self.embd_dim = embd_dim
         self.op_embd_dim = op_embd_dim
 
-    def _data_embedding(self, vertex_features, *, agg_key=None):
-        """Project per-vertex features to a per-vertex embedding ``(V, embd_dim)``.
+    def identity(self, identity_stream, n_slots):
+        """``(n_slots, E)`` per-vertex identity from the BASE token stream.
 
-        Two input shapes are accepted, dispatched on rank:
-
-        * ``(V, NUM_VERTEX_FEATURES)`` — already aggregated across samples
-          (Stage B.2.A path). Goes through :attr:`vertex_feature_proj`.
-        * ``(S, V, NUM_VERTEX_FEATURES)`` — per-sample features (Stage B.3).
-          The :class:`SetTransformerAggregator` is invoked to do a learned,
-          permutation-invariant pool across the sample axis.
+        ``identity_stream`` is ``(rows (T, E), slot ids (T,), valid (T,))`` --
+        `carry_stream.base_identity_stream`'s output, computed ONCE per
+        episode outside the rollout because the base stream is a constant of
+        the graph. ``None`` means "no identity channel", which is the
+        pre-identity behaviour and is what the unit tests build.
         """
-        if vertex_features.ndim == 3:
-            key = agg_key if agg_key is not None else jrand.PRNGKey(0)
-            return self.set_transformer_agg(vertex_features, key=key)
-        op_ids = vertex_features[:, 0].astype(jnp.int32)
-        op_emb = jax.vmap(self.op_embedding)(op_ids)
-        cont = vertex_features[:, 1:]
-        combined = jnp.concatenate([op_emb, cont], axis=-1)
-        return jax.vmap(self.vertex_feature_proj)(combined)
+        if identity_stream is None:
+            return None
+        rows, ids, valid = identity_stream
+        return self.identity_pool(rows, ids, valid, n_slots)
 
     def encode(
         self,
         tokens,
         eqn_ids=None,
-        vertex_features=None,
+        identity_stream=None,
         preference=None,
         key=None,
     ):
@@ -1447,12 +1424,6 @@ class Agent(eqx.Module):
 
         vertex_logits, vertex_contexts = self.vertex_policy(enc_x, token_mask)
 
-        # Stage B.2.A: fold per-vertex data features into the per-vertex
-        # contexts so the rule policy and value head are conditioned on
-        # the calibration-sample-derived signal alongside the IR encoding.
-        if vertex_features is not None:
-            vertex_contexts = vertex_contexts + self._data_embedding(vertex_features)
-
         summary = jnp.sum(enc_x * mask, axis=0) / jnp.maximum(
             jnp.sum(mask, axis=0), 1e-9
         )
@@ -1474,14 +1445,14 @@ class Agent(eqx.Module):
         self,
         tokens,
         eqn_ids=None,
-        vertex_features=None,
+        identity_stream=None,
         preference=None,
         key=None,
     ):
         _, _, value = self.encode(
             tokens,
             eqn_ids=eqn_ids,
-            vertex_features=vertex_features,
+            identity_stream=identity_stream,
             preference=preference,
             key=key,
         )
@@ -1892,7 +1863,7 @@ class Agent(eqx.Module):
         self,
         vmem_sums,
         vmem_counts,
-        vertex_features=None,
+        identity_stream=None,
         preference=None,
     ):
         """The ``encode()`` head block, fed from the per-vertex memory instead
@@ -1905,17 +1876,16 @@ class Agent(eqx.Module):
         vmem_rows = _vmem.read(vmem_sums, vmem_counts)
         vmask = _vmem.occupancy(vmem_counts)
         from alphagrad.approx.set_pointer import SetPointerVertexPolicy
+        _ident = self.identity(identity_stream, vmem_rows.shape[0])
         if (isinstance(self.vertex_policy, SetPointerVertexPolicy)
-                and vertex_features is not None):
+                and _ident is not None):
             # The pointer must score CONTENT, and the vertices it has to
-            # choose between are exactly the ones with EMPTY vmem slots
-            # (slots fill on elimination). Occupancy-masked vmem alone gave
-            # every candidate an identical zero slot -- the v31 uniform-pick
-            # failure. Fold the per-vertex features (axis sizes, op
-            # identity: content, not a learned V-table) into the slots and
-            # let every vertex slot participate.
-            _feat = self._data_embedding(vertex_features)
-            slots = vmem_rows.at[: _feat.shape[0]].add(_feat)
+            # choose between are exactly the ones whose vmem slot holds only
+            # their BASE tokens (a slot grows on elimination). The identity
+            # is that base content, pooled by the vertex's own learned
+            # attention rather than described by a hand-written feature row,
+            # and every vertex slot participates.
+            slots = vmem_rows + _ident
             smask = jnp.ones_like(vmask)
             vertex_logits, vertex_contexts = (
                 self.vertex_policy.from_vertex_memory(slots, smask))
@@ -1932,8 +1902,9 @@ class Agent(eqx.Module):
                 g=vmem_counts[-1],
                 lm=jnp.max(vertex_logits),
             )
-        if vertex_features is not None:
-            vertex_contexts = vertex_contexts + self._data_embedding(vertex_features)
+        if _ident is not None:
+            vertex_contexts = vertex_contexts + _ident[
+                : vertex_contexts.shape[0]]
         summary = _vmem.summary(vmem_sums, vmem_counts)
         if preference is not None:
             pref_emb = self.pref_proj(preference)
@@ -1955,7 +1926,7 @@ class Agent(eqx.Module):
         op_legality_override,  # (NUM_OPS,) float32 — multiplied into op_legal (e.g. zeros COMPRESS)
         key,
         eqn_ids=None,
-        vertex_features=None,
+        identity_stream=None,
         cached_encoding=None,
         preference=None,
         vertex_temperature=None,
@@ -1987,7 +1958,7 @@ class Agent(eqx.Module):
             vertex_logits, vertex_contexts, value = self.encode(
                 tokens,
                 eqn_ids=eqn_ids,
-                vertex_features=vertex_features,
+                identity_stream=identity_stream,
                 preference=preference,
                 key=net_key,
             )
@@ -2482,7 +2453,7 @@ class Agent(eqx.Module):
         factor_tables: FactorTables,
         key,
         eqn_ids=None,
-        vertex_features=None,
+        identity_stream=None,
         cached_encoding=None,
         preference=None,
         pair_valid=None,       # stored live DIAG mask for the chosen vertex
@@ -2518,7 +2489,7 @@ class Agent(eqx.Module):
                 _vl, _vc, _val = precomputed
             else:
                 _vl, _vc, _val = self.encode(
-                    tokens, eqn_ids=eqn_ids, vertex_features=vertex_features,
+                    tokens, eqn_ids=eqn_ids, identity_stream=identity_stream,
                     preference=preference, key=key)
             _vd = jnn.softmax(
                 _mask_vertex_logits(_vl, vertex_avail_mask), axis=-1)
@@ -2542,7 +2513,7 @@ class Agent(eqx.Module):
             vertex_logits, vertex_contexts, value = self.encode(
                 tokens,
                 eqn_ids=eqn_ids,
-                vertex_features=vertex_features,
+                identity_stream=identity_stream,
                 preference=preference,
                 key=key,
             )
@@ -3625,31 +3596,12 @@ def _build_agent(
         args.op_embd_dim,
         key=encoder_keys[6],
     )
-    # Continuous part of the feature vector = NUM_VERTEX_FEATURES - 1 (we drop
-    # column 0 / op_type_id which is consumed by the embedding).
-    proj_in_dim = args.op_embd_dim + NUM_VERTEX_FEATURES - 1
-    vertex_feature_proj = eqx.nn.Linear(
-        proj_in_dim,
-        args.embd_dim,
-        key=encoder_keys[7],
-    )
-    # encoder_keys[8] / [9] used to build the B.4 residual modules. The slots
-    # are deliberately LEFT UNUSED rather than reindexed: every later key is
-    # positional, so re-packing them would move set_transformer_agg /
-    # pref_proj / the approximation heads onto different randomness and change
-    # every seeded run for no reason.
-    # Hidden dim must be divisible by num_heads — keep it at embd_dim for
-    # simplicity. The aggregator is small (one attention block over the
-    # sample axis), so this isn't a meaningful parameter cost.
-    set_transformer_agg = SetTransformerAggregator(
-        num_features=NUM_VERTEX_FEATURES,
-        op_embd_dim=args.op_embd_dim,
-        hidden_dim=args.embd_dim,
-        num_heads=args.num_heads,
-        embd_dim=args.embd_dim,
-        vocab_size=OP_TYPE_VOCAB_SIZE,
-        key=encoder_keys[10],
-    )
+    # keys[7] (vertex_feature_proj), [8]/[9] (the B.4 residual modules) and
+    # [10] (the Set-Transformer aggregator) are DEAD SLOTS. They are left
+    # unused rather than re-packed: every later key is positional, so
+    # re-indexing would move pref_proj and the approximation heads onto
+    # different randomness and change every seeded run for no reason.
+    identity_pool = VertexIdentityPool(args.embd_dim, key=encoder_keys[8])
     pref_proj = eqx.nn.Linear(NUM_VALUE_HEADS, args.embd_dim, key=encoder_keys[11])
     # Dynamic-substeps head: only constructed when the flag is on so the
     # default agent stays leaner (one extra encoder + MicroActionHead is
@@ -3721,8 +3673,7 @@ def _build_agent(
         value_head_mem=value_head_mem,
         value_head_cos=value_head_cos,
         op_embedding=op_embedding,
-        vertex_feature_proj=vertex_feature_proj,
-        set_transformer_agg=set_transformer_agg,
+        identity_pool=identity_pool,
         pref_proj=pref_proj,
         num_vertices=total_v,
         num_value_heads=NUM_VALUE_HEADS,
@@ -3751,20 +3702,15 @@ def _scale_output_heads(agent, scale: float):
         agent = scale_module_weight(
             agent, lambda a: a.vertex_policy.k_proj.weight, scale
         )
-    # Stage B.2.A: zero the data-feature projection's output so the initial
-    # data embedding is `0` and the agent's behaviour at step 0 matches the
-    # B.1 agent. Gradient still flows in normally once training starts.
+    # Zero the IDENTITY pool's output projection, the same discipline every
+    # other additive context path here follows: at initialisation the vertex
+    # slots are their raw base-token memory and the pointer is near-uniform,
+    # and the identity earns its contribution by gradient. (The hand-feature
+    # projection it replaced was zeroed for exactly this reason, so the
+    # initial policy is unchanged by the swap.)
     agent = scale_module_weight(
         agent,
-        lambda a: a.vertex_feature_proj.weight,
-        0.0,
-    )
-    # B.3: zero the Set Transformer's output projection too. Same idea —
-    # initial data embedding from the per-sample path is exactly zero, so
-    # toggling --set-transformer-agg doesn't perturb the initial policy.
-    agent = scale_module_weight(
-        agent,
-        lambda a: a.set_transformer_agg.output_proj.weight,
+        lambda a: a.identity_pool.out_proj.weight,
         0.0,
     )
     # F: zero the preference projection so the conditioned and
@@ -4035,7 +3981,7 @@ _HEAD_PATH_MARKERS: dict[str, tuple[str, ...]] = {
         "micro_action_policy.head.exp_head",
         "micro_action_policy.head.factor",
     ),
-    "aggregator": ("set_transformer_agg",),
+    "aggregator": ("identity_pool",),
 }
 
 
@@ -4143,30 +4089,13 @@ def _scale_grads(
 
 
 
-def _episode_vertex_features(
-    args,
-    jaxpr,
-    consts: tuple,
-    base_args: tuple,
-    eval_samples,
-    argnums: tuple,
-) -> "jax.Array":
-    """Single dispatch site for the per-vertex feature computation.
-
-    Switches between mean-aggregated (Stage B.2.A) and per-sample (Stage B.3
-    Set Transformer aggregator) features based on ``--set-transformer-agg``;
-    used by the main training loop and the BC warm-start. Returns a
-    `jnp.float32` array.
-    """
-    fn = (
-        compute_per_sample_vertex_features
-        if args.set_transformer_agg
-        else compute_vertex_features
-    )
-    return jnp.asarray(
-        fn(jaxpr, consts, base_args, eval_samples=eval_samples, argnums=argnums),
-        dtype=jnp.float32,
-    )
+# `_episode_vertex_features` lived here: the per-episode hand-written
+# per-vertex feature matrix (op-type id + calibration-derived scalars), fed to
+# `Agent._data_embedding`. Both are gone -- the per-vertex IDENTITY is now
+# pooled from the vertex's OWN base tokens (`VertexIdentityPool`), which is
+# content rather than a feature list and needs no calibration samples.
+# `compute_vertex_features` / `compute_per_sample_vertex_features` remain in
+# heads.py with no caller here; `--set-transformer-agg` is accepted and inert.
 
 
 # ---------------------------------------------------------------------------
@@ -4447,6 +4376,15 @@ def main():
     _BASE_W = max(int(_BASE_N), 1)
     _BASE_TOK = _BASE_TOK[:_BASE_W]
     _BASE_EQN = _BASE_EQN[:_BASE_W]
+    # Per-token owning VERTEX for the base stream (1-based, 0 = none). Both
+    # readers of the base stream need it -- the carry's per-vertex memory and
+    # the identity pool's segments -- so it is resolved ONCE here rather than
+    # inside the rollout, where the identity (built per episode in `main`)
+    # could not see it.
+    try:
+        _BASE_OWN = env.base_owners()
+    except Exception:
+        _BASE_OWN = None
     print(f"[alphagrad] base token stream: {int(_BASE_N)} tokens "
           f"(per-step delta budget {MAX_DELTA_TOKENS})", flush=True)
 
@@ -5181,7 +5119,7 @@ def main():
         rollout_length,
         env_state,
         key,
-        vertex_features,
+        identity_stream,
         preference,
         op_legality_override,
         pin_rules_to_exact_jax,
@@ -5243,13 +5181,9 @@ def main():
         # rows into the per-vertex memory (base eqn ids map to vertex slots
         # positionally; structural/overflow → global slot), then each scan
         # step extends by that step's delta only.
-        # Per-token owning VERTEX for the base stream. Without it every
-        # base row lands in the global slot and the pointer has only the
-        # static vertex_features to tell candidates apart at the root.
-        try:
-            _BASE_OWN = env.base_owners()
-        except Exception:
-            _BASE_OWN = None
+        # `_BASE_OWN` (the per-token owning vertex) is resolved once with the
+        # base stream itself; without it every base row lands in the global
+        # slot and the pointer has only the identity to tell candidates apart.
         _init_pre = _carry_stream.init_carry(
             agent, _BASE_TOK, _BASE_EQN, _BASE_N,
             window=_BASE_W, total_v=total_v, embd_dim=args.embd_dim,
@@ -5317,7 +5251,7 @@ def main():
                 "prof/encode", (enc_carry2, vmem_s2, vmem_c2))
             precomputed = _carry_stream.heads(
                 agent, vmem_s2, vmem_c2,
-                vertex_features=vertex_features,
+                identity_stream=identity_stream,
                 preference=(
                     preference if args.preference_conditioned else None
                 ),
@@ -5395,7 +5329,7 @@ def main():
                     op_legality_override,
                     sample_key,
                     eqn_ids=None,
-                    vertex_features=vertex_features,
+                    identity_stream=identity_stream,
                     preference=preference if args.preference_conditioned else None,
                     oracle_pair_all=oracle_pair_all,
                     oracle_comp_all=oracle_comp_all,
@@ -5521,7 +5455,7 @@ def main():
                 "prof/encode_bootstrap", (nv_s_raw, nv_c_raw))
             _, _, next_value = _carry_stream.heads(
                 agent, nv_s, nv_c,
-                vertex_features=vertex_features,
+                identity_stream=identity_stream,
                 preference=pref_arg,
             )
             next_value = _pp_mark("prof/heads_bootstrap", next_value)
@@ -5612,7 +5546,7 @@ def main():
     def loss_fn(
         agent,
         batch: TrainBatch,
-        vertex_features,
+        identity_stream,
         key,
         pin_rules_to_exact_jax,
         op_legality_override,
@@ -5625,10 +5559,10 @@ def main():
         # the JAX-traced arg is ignored there.)
         if args.dynamic_substeps:
             return _dynamic_loss_fn(
-                agent, batch, vertex_features, key, op_legality_override
+                agent, batch, identity_stream, key, op_legality_override
             )
     def _dynamic_loss_fn(
-        agent, batch: TrainBatch, vertex_features, key, op_legality_override
+        agent, batch: TrainBatch, identity_stream, key, op_legality_override
     ):
         """Dynamic-substeps loss: routes through MicroActionPolicy.evaluate.
 
@@ -5695,7 +5629,7 @@ def main():
                 factor_tables,
                 k,
                 eqn_ids=None,
-                vertex_features=vertex_features,
+                identity_stream=identity_stream,
                 cached_encoding=None,
                 preference=pref_or_none(pref),
                 pair_valid=pv,
@@ -5763,7 +5697,7 @@ def main():
             # WRONG tokens for face contexts; see face_delta_tokens.)
             return _carry_stream.heads(
                 agent, vs2, vc2,
-                vertex_features=vertex_features,
+                identity_stream=identity_stream,
                 preference=pref_or_none(pref),
             ) + (carry2,)
 
@@ -6126,7 +6060,7 @@ def main():
         opt_state,
         env_states,
         env_obj,
-        vertex_features,
+        identity_stream,
         preferences_per_env,
         global_step,
         key,
@@ -6156,7 +6090,7 @@ def main():
             num_valid,
             env_states,
             rollout_keys,
-            vertex_features,
+            identity_stream,
             preferences_per_env,
             op_legality_override_arg,
             pin_rules_to_exact_arg,
@@ -6552,7 +6486,7 @@ def main():
                 grads, metrics = eqx.filter_grad(loss_fn, has_aux=True)(
                     comb_agent,
                     batch,
-                    vertex_features,
+                    identity_stream,
                     t_key,
                     pin_rules_to_exact_arg,
                     op_legality_override_arg,
@@ -8119,17 +8053,14 @@ def main():
                            "falling back to per-call shipping",
                            file=sys.stderr)
 
-        # Stage B.2.A / B.3: per-vertex features depend on the calibration
-        # samples; recompute them per episode. The dispatch (mean-aggregated
-        # vs Set-Transformer per-sample) is centralised in
-        # ``_episode_vertex_features``.
-        vertex_features = _episode_vertex_features(
-            args,
-            closed_jaxpr.jaxpr,
-            tuple(closed_jaxpr.literals),
-            tuple(xs),
-            eval_samples=eval_samples,
-            argnums=tuple(argnums),
+        # The per-vertex IDENTITY: one pass over the BASE token stream under
+        # the CURRENT weights, kept as (rows, owning slot, valid) so the pool
+        # itself runs inside the heads and takes gradient on both the rollout
+        # and the loss side. Recomputed per episode because it is
+        # params-dependent; the base stream itself is a constant of the graph.
+        identity_stream = _carry_stream.base_identity_stream(
+            agent, _BASE_TOK, _BASE_EQN, _BASE_N,
+            window=_BASE_W, total_v=total_v, base_owners=_BASE_OWN,
         )
 
         env_states = reset_envs(env_episode)
@@ -8171,7 +8102,7 @@ def main():
                 _wstates = reset_envs(env_episode)
                 _wend, _wtraj, _wtot = rollout_fn(
                     agent, env_episode, num_valid, _wstates,
-                    jrand.split(_wkey, num_envs), vertex_features,
+                    jrand.split(_wkey, num_envs), identity_stream,
                     preferences_per_env, stage_override, stage_pin_rules,
                     _wt,   # positional: vmap in_axes is a positional tuple
                 )
@@ -8340,7 +8271,7 @@ def main():
             opt_state,
             env_states,
             env_episode,
-            vertex_features,
+            identity_stream,
             preferences_per_env,
             global_step,
             ep_key,

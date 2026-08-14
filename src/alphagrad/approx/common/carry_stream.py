@@ -21,7 +21,7 @@ import jax.numpy as jnp
 
 from alphagrad.approx import vertex_memory as _vmem
 
-__all__ = ["init_carry", "advance", "heads"]
+__all__ = ["init_carry", "advance", "heads", "base_identity_stream"]
 
 
 def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
@@ -104,11 +104,42 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
     return carry2, sums2, counts2
 
 
-def heads(agent, vmem_sums, vmem_counts, *, vertex_features=None,
+def heads(agent, vmem_sums, vmem_counts, *, identity_stream=None,
           preference=None):
     """``(vertex_logits, vertex_contexts, value)`` off the vertex memory."""
     return agent.heads_from_memory(
         vmem_sums, vmem_counts,
-        vertex_features=vertex_features,
+        identity_stream=identity_stream,
         preference=preference,
     )
+
+
+def base_identity_stream(agent, base_tokens, base_eqns, base_count, *,
+                         window, total_v, base_owners=None):
+    """``(rows (T, E), slot ids (T,), valid (T,))`` for the IDENTITY pool.
+
+    One pass of the encoder over the BASE stream -- the same pass
+    :func:`init_carry` makes, kept as ROWS instead of pooled sums so the
+    identity is an attention pool the head runs (and trains) rather than a
+    stored constant. The base stream is a constant of the graph, so this is
+    computed ONCE per episode, outside the rollout's vmap; it is
+    params-dependent, so it cannot outlive an update.
+
+    ``base_owners`` is the tokenizer's 1-based owning vertex per base token
+    (0 = none), read exactly as :func:`init_carry` reads it. Without it every
+    row is unowned and the identity is empty for every vertex -- safe, and
+    the pre-identity behaviour.
+    """
+    enc0 = agent.carry_init()
+    _enc1, rows, valid, eqns = agent.encode_extend(
+        enc0, base_tokens, base_eqns, base_count, window=window, start=0,
+        chunk=0,
+    )
+    if base_owners is None:
+        ids = jnp.full(eqns.shape, -1, jnp.int32)
+    else:
+        _own = jnp.asarray(base_owners, jnp.int32)
+        _own = jnp.concatenate(
+            [_own, jnp.zeros(eqns.shape, jnp.int32)])[:eqns.shape[0]]
+        ids = jnp.where(_own > 0, _own - 1, -1)
+    return rows, ids, valid.astype(jnp.float32)

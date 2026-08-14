@@ -129,7 +129,7 @@ def setup():
 
 def _loss_pieces(agent, s):
     vlog, ctx, _v3 = _cs.heads(agent, s["vs"], s["vc"],
-                               vertex_features=None)
+                               identity_stream=None)
     logp = jax.nn.log_softmax(vlog[s["la"]])
     vertex_ce = -jnp.sum(s["pi"] * logp)
     face_ce, ent = face_ce_term(
@@ -183,7 +183,7 @@ def test_padding_slots_contribute_exactly_zero(setup):
     (sd_li, sd_vidx, sd_w, *rest) = s["sd"]
     sd0 = (jnp.full_like(sd_li, -1), sd_vidx, jnp.zeros_like(sd_w), *rest)
     _vlog, ctx, _v3 = _cs.heads(s["agent"], s["vs"], s["vc"],
-                                vertex_features=None)
+                                identity_stream=None)
     ce, _ent = face_ce_term(
         s["agent"]._face_replay, ctx, s["enc"], s["axis_state"],
         s["axis_valid"], s["tables"], s["op_override"],
