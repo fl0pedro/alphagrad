@@ -4947,6 +4947,18 @@ def main():
         _live_face, _live_face_count = make_face_callbacks(
             _LIVE_FACES, window=MAX_DELTA_TOKENS, prof_sink=_env_prof_add)
 
+    # Live elimination chains: one per concurrent env, plus the previous
+    # episode's, which the LRU only sheds once the new ones exist. Sized like
+    # the face-prefix cache above and for the same reason -- a capacity below
+    # the concurrent chain count turns every step into a cold O(T) rebuild,
+    # i.e. straight back to O(T^2) per episode. That is not silent (the
+    # `restart` counter reports it in the [prof] line), but it should not be
+    # possible by default. ALPHAGRAD_FACE_LIVE_CHAINS still overrides.
+    if not os.environ.get("ALPHAGRAD_FACE_LIVE_CHAINS"):
+        from alphagrad.approx import env as _env_chain_mod
+        _env_chain_mod._LIVE_CHAIN_CAP = max(
+            8, 4 * _resolve_num_envs(args.num_envs, args.example))
+
     _ORACLE_ONE_VERTEX = os.environ.get(
         "ALPHAGRAD_ORACLE_ONE_VERTEX", "1") == "1"
     # No approximation head => no legality to compute. See _NO_ORACLE use.
@@ -7939,7 +7951,9 @@ def main():
                             f"{_fs['compress']}"
                             f"  face_enum(calls/elims/build)="
                             f"{_fs['calls']}/{_fs['elims']}/"
-                            f"{_fs['build']}")
+                            f"{_fs['build']}"
+                            f"  live_chain="
+                            f"{_envmod.consume_live_chain_stats()}")
                         _ss.update(hit=0, ext=0, cold=0, nostore=0)
                         _fs.update(ext=0, cold=0, compress=0, elims=0,
                                    calls=0, build=0)
