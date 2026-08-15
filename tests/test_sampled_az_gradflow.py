@@ -68,12 +68,22 @@ def setup():
     axis_valid = jnp.asarray(axis_valid)
 
     # A real carry off a tiny fabricated base stream.
+    #
+    # base_owners IS PASSED (2026-08-15). With `None` every base row lands in
+    # the GLOBAL slot, no VERTEX slot is occupied, and the pointer masks all
+    # V logits to -inf -- so the vertex CE below had no gradient to give and
+    # `test_gradient_reaches_...vertex_head...` was in fact being satisfied by
+    # the FACE term, which used to read the pointer's per-vertex contexts as
+    # `ctx_i`/`ctx_j`. That path is gone (the face head reads the face's own
+    # latent), which is what exposed the degenerate fixture. Owning the base
+    # rows makes the vertex CE test what its name says.
     W0 = 16
     base_tok = jnp.asarray((np.arange(W0) % 7 + 1).astype(np.int32))
     base_eqn = jnp.zeros((W0,), jnp.int32)
+    base_own = jnp.asarray(((np.arange(W0) % TOTAL_V) + 1).astype(np.int32))
     enc, vs, vc = _cs.init_carry(
         agent, base_tok, base_eqn, W0, window=W0, total_v=TOTAL_V,
-        embd_dim=ns.embd_dim, base_owners=None)
+        embd_dim=ns.embd_dim, base_owners=base_own)
 
     F = agent.face_path_policy.max_faces
     S = FACE_SLOTS
@@ -158,7 +168,10 @@ def test_gradient_reaches_face_head_vertex_head_and_encoder(setup):
     g_vertex = _norm(grads.vertex_policy)
     g_enc = _norm(grads.encoder)
     assert g_face > 0.0, "face CE reaches no face-head parameter"
-    assert g_vertex > 0.0, "vertex CE reaches no vertex-head parameter"
+    assert g_vertex > 0.0, ("vertex CE reaches no vertex-head parameter -- "
+                            "check the fixture occupies vertex slots, since "
+                            "the face head no longer reads the pointer's "
+                            "contexts and cannot cover for it")
     assert g_enc > 0.0, ("no gradient reaches the palimpsa encoder -- the "
                          "emission-window replay must touch it")
     assert np.isfinite(g_face) and np.isfinite(g_vertex) and np.isfinite(g_enc)
