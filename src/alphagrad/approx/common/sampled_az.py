@@ -176,12 +176,14 @@ def face_ce_term(face_replay_fn, ctx, enc_carry, axis_state, axis_valid,
     def _one(vidx, fp, fc, fv, cnt, dt, de, fa_k, fend):
         vi = jnp.clip(vidx, 0, nv - 1)
         features = axis_feats_fn(axis_state[vi], axis_valid[vi])
-        # The FULL per-vertex contexts, not the central vertex's row: the
-        # face head reads its own two ENDPOINT vertices' contexts, gathered
-        # inside `_face_replay` from the draw's stored endpoint ids.
+        # `ctx` and `fend` are no longer head inputs: since 2026-08-15 the
+        # face head reads the face's OWN palimpsa latent and nothing else, so
+        # `_face_replay` takes neither the per-vertex contexts nor the stored
+        # endpoint ids. Both are still threaded in by the caller (the search
+        # stores them for `participation_mask`); they are ignored here.
         lp, ent, ar = face_replay_fn(
-            ctx, features, fact_tables, fa_k, fp, fc, fv,
-            enc_carry, (cnt, dt, de), op_override, face_ends=fend)
+            features, fact_tables, fa_k, fp, fc, fv,
+            enc_carry, (cnt, dt, de), op_override)
         return lp, ent / jnp.maximum(ar, 1.0)
 
     lp, ent_n = jax.vmap(_one)(

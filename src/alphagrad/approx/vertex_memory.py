@@ -69,6 +69,47 @@ def update(sums, counts, rows, eqn_ids, valid=None):
     return sums, counts
 
 
+def scatter(rows, ids, valid, n_segments, *, spill=None):
+    """THE SCATTER. ``(sums (n, E), counts (n,))`` -- and NOTHING ELSE.
+
+    One ``segment_sum`` of the rows and one of their weights, keyed by
+    ``ids``. It has NO PARAMETERS and it is the ONLY pooling primitive in the
+    policy: the vertex slots are this scatter keyed by the owning VERTEX, and
+    a face's latent is this scatter keyed by the FACE. Two keyings of one
+    operation, not two mechanisms -- which is the entire point. If a weight
+    ever appears in here, the two readouts have stopped being the same object.
+
+    ``ids < 0`` (or an invalid row) goes to ``spill`` when a spill segment is
+    named, and is DROPPED otherwise -- dropped via a trash segment that is
+    sliced off, never by folding into segment 0. A row with no owner must land
+    nowhere, not on whichever vertex happens to be first.
+
+    Associative in ``rows`` up to float addition order within one segment,
+    which is what lets the delta path fold incrementally and still agree with
+    a single pass over the whole stream (the PPO ratio-1 invariant).
+    """
+    n = int(n_segments)
+    w = jnp.ones(rows.shape[0], jnp.float32) if valid is None \
+        else jnp.asarray(valid, jnp.float32)
+    ids = jnp.asarray(ids, jnp.int32)
+    if spill is None:
+        seg = jnp.where(ids >= 0, jnp.clip(ids, 0, n - 1), n)
+    else:
+        seg = jnp.where(ids >= 0, jnp.clip(ids, 0, n - 1), int(spill))
+    live = (w > 0.0).astype(jnp.float32)
+    seg = jnp.where(live > 0.5, seg, n).astype(jnp.int32)
+    w = w * live
+    sums = jax.ops.segment_sum(rows * w[:, None], seg, num_segments=n + 1)
+    counts = jax.ops.segment_sum(w, seg, num_segments=n + 1)
+    return sums[:n], counts[:n]
+
+
+def scatter_mean(rows, ids, valid, n_segments, *, spill=None):
+    """:func:`scatter` read as a per-segment MEAN; empty segments read 0."""
+    s, c = scatter(rows, ids, valid, n_segments, spill=spill)
+    return s / jnp.maximum(c, 1.0)[:, None]
+
+
 def update_ids(sums, counts, rows, ids, valid=None, *, global_slot=None):
     """Fold ``rows`` (D, E) into the memory by EXPLICIT slot ids (D,).
 
@@ -77,7 +118,9 @@ def update_ids(sums, counts, rows, ids, valid=None, *, global_slot=None):
     encoder uses this: base-stream tokens map eqn→vertex positionally,
     while a delta block's tokens all belong to the vertex whose
     elimination emitted them — a mapping only the caller knows.
-    Same associativity guarantees as :func:`update`.
+
+    This is :func:`scatter` with the unowned rows spilled to the global slot,
+    accumulated into an existing memory.
     """
     n_slots = sums.shape[0]
     # The unowned/global slot must be named EXPLICITLY. It used to be
@@ -85,17 +128,9 @@ def update_ids(sums, counts, rows, ids, valid=None, *, global_slot=None):
     # trailing SUMMARY row exists (see `summary`), that would route every
     # header and input token into the value head's accumulator.
     gid = n_slots - 1 if global_slot is None else int(global_slot)
-    slot = jnp.where(ids < 0, gid, jnp.minimum(ids, gid - 1)).astype(jnp.int32)
-
-    if valid is not None:
-        w = valid.astype(jnp.float32)
-        rows = rows * w[:, None]
-    else:
-        w = jnp.ones(rows.shape[0], jnp.float32)
-
-    sums = sums + jax.ops.segment_sum(rows, slot, num_segments=n_slots)
-    counts = counts + jax.ops.segment_sum(w, slot, num_segments=n_slots)
-    return sums, counts
+    s, c = scatter(rows, jnp.minimum(jnp.asarray(ids, jnp.int32), gid - 1),
+                   valid, n_slots, spill=gid)
+    return sums + s, counts + c
 
 
 def read(sums, counts):

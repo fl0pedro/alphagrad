@@ -39,12 +39,25 @@ from alphagrad.approx.unified_face_head import (
 class UnifiedFacePolicy(eqx.Module):
     """One 94-output decision per face; three operand slots, no unrolling.
 
-    THE FACE'S INPUT IS ITS ENDPOINTS (2026-08-14). A face is a path
-    ``i -> v -> j`` through the vertex being eliminated, so it IS the pair
-    ``(i, j)`` plus the contraction that pair produces. The head therefore
-    reads ``[ctx_i || ctx_j || face_latent]`` -- the two endpoint vertices'
-    own contexts, gathered from the pointer's per-vertex contexts, plus the
-    palimpsa readout of that face's own token chunk.
+    THE FACE'S INPUT IS ITS OWN PALIMPSA LATENT, AND NOTHING ELSE
+    (2026-08-15). The head reads ``face_latent`` -- the parameter-free
+    scatter of the palimpsa rows of that face's own token chunk, keyed by
+    face, the same primitive the vertex slots are keyed by vertex.
+
+    WHAT WAS REMOVED AND WHY. The input was ``[ctx_i || ctx_j ||
+    face_latent]``: the two endpoint vertices' contexts gathered from the
+    pointer, 3E wide. The endpoint contexts are a SECOND route from the same
+    encoder into the same head, and this rewrite exists to leave exactly one
+    of everything; the owner's instruction was "remove all ctx, and extents
+    for now". So this is the MINIMAL baseline, deliberately: E in, 94 out.
+
+    STATE THE EXPECTED RESULT HONESTLY. Every tokens-only face target
+    measured ~0 within-step R2 (best 0.104 with shapes explicitly tokenised,
+    against a 0.528 bar), and that was WITH full end-to-end gradient -- so
+    fixing the gradient does not rescue the face side. Extents cleared the
+    bar (main effect +0.51) and message passing added +0.19 on top. This
+    class is what those get added back to, not a claim that they are
+    unnecessary.
 
     What that replaces: an ``AxisSetEncoder`` re-run per face over the SAME
     vertex-level axis tokens, seeded with ``vertex_context + face_context``.
@@ -71,8 +84,9 @@ class UnifiedFacePolicy(eqx.Module):
         self.embd_dim = embd_dim
         self.max_faces = max_faces
         keys = jrand.split(key, 3)
-        # in_dim = 3E: [ctx_i || ctx_j || face_latent].
-        self.head = UnifiedFaceHead(embd_dim, in_dim=3 * embd_dim,
+        # in_dim = E: the face's own latent. Not 3E -- there are no endpoint
+        # contexts in the input any more.
+        self.head = UnifiedFaceHead(embd_dim, in_dim=embd_dim,
                                     key=keys[1])
 
     # ------------------------------------------------------------ masks
@@ -196,24 +210,19 @@ class UnifiedFacePolicy(eqx.Module):
         )
 
     # -------------------------------------------------- ONE face at a time
-    def _repr(self, ctx_i, ctx_j, face_latent):
-        """``[ctx_i || ctx_j || face_latent]`` -- the head's input, 3E wide.
+    def _repr(self, face_latent):
+        """The head's input: the face's own latent, E wide.
 
-        NO face_embedding and no learned index table: the face's identity is
-        the pair of vertices it connects, which is content the pointer
-        already computed, and its dynamics are the tokens its own
-        contraction emitted. A missing part is a ZERO block, never a
-        substitute vector -- an endpoint that is a jaxpr INPUT has no vertex
-        context to gather, and an empty chunk must leave the latent at 0
-        exactly as ``_face_encode``'s skip does.
+        NO face_embedding and no learned index table -- a label is not
+        information. An absent latent is a ZERO vector, never a substitute:
+        an empty chunk must leave the input at 0, exactly as
+        ``Agent._face_encode``'s skip does.
         """
-        z = jnp.zeros((self.embd_dim,), jnp.float32)
-        return jnp.concatenate([
-            z if ctx_i is None else ctx_i,
-            z if ctx_j is None else ctx_j,
-            z if face_latent is None else face_latent])
+        if face_latent is None:
+            return jnp.zeros((self.embd_dim,), jnp.float32)
+        return face_latent
 
-    def sample_face(self, ctx_i, ctx_j, features: AxisTokenFeatures,
+    def sample_face(self, features: AxisTokenFeatures,
                     tables: FactorTables, key, f: int, pair_valid_f,
                     comp_valid_f, face_valid_f, *, face_context=None,
                     face_sizes_f=None, quant_legality_mask=None,
@@ -223,7 +232,7 @@ class UnifiedFacePolicy(eqx.Module):
         if quant_legality_mask is None:
             quant_legality_mask = quant_hardware_masks()[0]
         ff = self._face_feats_1(features, face_sizes_f)
-        ctx_f = self._repr(ctx_i, ctx_j, face_context)
+        ctx_f = self._repr(face_context)
         om, im, jm, am, pair_ok = self._face_masks(
             ff, pair_valid_f, comp_valid_f, quant_legality_mask,
             op_legality_override, tables)
@@ -234,7 +243,7 @@ class UnifiedFacePolicy(eqx.Module):
         return (fields.skip, self._rows(fields, ff, tables), lp, e, ar,
                 jax.nn.sigmoid(z[0]), self._op_dist(z))
 
-    def evaluate_face(self, ctx_i, ctx_j, features: AxisTokenFeatures,
+    def evaluate_face(self, features: AxisTokenFeatures,
                       tables: FactorTables, fa: FaceAction, f: int,
                       pair_valid_f, comp_valid_f, face_valid_f, *,
                       face_context=None, face_sizes_f=None,
@@ -245,7 +254,7 @@ class UnifiedFacePolicy(eqx.Module):
         if quant_legality_mask is None:
             quant_legality_mask = quant_hardware_masks()[0]
         ff = self._face_feats_1(features, face_sizes_f)
-        ctx_f = self._repr(ctx_i, ctx_j, face_context)
+        ctx_f = self._repr(face_context)
         om, im, jm, am, pair_ok = self._face_masks(
             ff, pair_valid_f, comp_valid_f, quant_legality_mask,
             op_legality_override, tables)
@@ -294,12 +303,14 @@ class UnifiedFacePolicy(eqx.Module):
         arity = jnp.array(0.0)
         skips, skip_probs, rows, op_dists, q_lps = [], [], [], [], []
         for f in range(F):
-            # BLIND PATH (no live-faces stream): there are no endpoint ids
-            # and no per-face tokens, so both endpoint blocks get the
-            # CENTRAL vertex's context and the latent stays zero. That is
-            # the old vertex-only behaviour, stated instead of implied.
+            # BLIND PATH (no live-faces stream): there are no per-face
+            # tokens, so the latent is zero and every face of a vertex sees
+            # the same (empty) input. Stated instead of implied -- this path
+            # exists for the no-stream A/B, not because it can decide
+            # anything. `vertex_context` is accepted and IGNORED: the head
+            # reads one thing, and it is the face's own latent.
             sk, row, lp, e, ar, sp, od = self.sample_face(
-                vertex_context, vertex_context, features, tables, keys[f], f,
+                features, tables, keys[f], f,
                 face_pair_valid[f], face_comp_valid[f], face_valid[f],
                 face_sizes_f=None if face_sizes is None else face_sizes[f],
                 quant_legality_mask=quant_legality_mask,
@@ -338,7 +349,7 @@ class UnifiedFacePolicy(eqx.Module):
         skip_probs, op_dists, q_lps = [], [], []
         for f in range(F):
             lp, e, ar, sp, od = self.evaluate_face(
-                vertex_context, vertex_context, features, tables, fa, f,
+                features, tables, fa, f,
                 face_pair_valid[f], face_comp_valid[f], face_valid[f],
                 face_sizes_f=None if face_sizes is None else face_sizes[f],
                 quant_legality_mask=quant_legality_mask,

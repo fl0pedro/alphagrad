@@ -11,7 +11,7 @@ Nothing crashed. The health lines looked fine.
 This module is the tripwire. It runs a SHORT, seeded, fully deterministic
 rollout through the REAL policy path --
 
-    env.reset -> carry_stream.init_carry (base stream)
+    env.reset -> carry_stream.init_carry (base stream -> the base memory)
       per step:
         carry_stream.advance   (this step's token delta)
         carry_stream.heads     (vertex logits / contexts / value)
@@ -93,7 +93,15 @@ os.environ["ALPHAGRAD_POLICY"] = "palimpsa"
 os.environ["ALPHAGRAD_SKIP_COST_ANALYSIS"] = "1"
 os.environ["ALPHAGRAD_SKIP_COUNT_OPS"] = "1"
 os.environ["ALPHAGRAD_MAX_FACES"] = "16"
-os.environ["ALPHAGRAD_MAX_DELTA_TOKENS"] = "1024"
+# 1024 -> 4096 (2026-08-15). NOT a semantic change and not a loosening: the
+# golden stores only the LIVE prefix of every buffer, so widening a padding
+# bound leaves every recorded field untouched (this file's header says so, and
+# the re-recorded golden proves it -- the chunk hashes are over live tokens).
+# The lean policy samples a different elimination ORDER, and seed 13's new
+# order reaches a step whose token delta is 1053 tokens, which the 1024 budget
+# RAISES on (correctly -- a dropped delta desyncs the recurrence). Raising the
+# harness budget is the fix; clipping would have hidden it.
+os.environ["ALPHAGRAD_MAX_DELTA_TOKENS"] = "4096"
 os.environ["ALPHAGRAD_INCR_TOKEN_VOCAB"] = "512"
 os.environ["ALPHAGRAD_INCREMENTAL_TOKENS"] = "1"
 os.environ["ALPHAGRAD_FACE_ENUM_CACHE"] = "1"
@@ -277,15 +285,16 @@ def run_trace(case=None, steps=None):
         base_own = env.base_owners()
     except Exception:                                    # pragma: no cover
         base_own = None
-    enc_carry, vmem_s, vmem_c = CS.init_carry(
+    # `init_carry` returns the BASE MEMORY: palimpsa's rows for each vertex's
+    # own equation, scattered into that vertex's slot. It is NOT the
+    # accumulator -- the dynamic memory starts EMPTY and the two are added at
+    # head time (carry_stream's docstring says why: the loss has to be able
+    # to recompute the base half inside the gradient).
+    enc_carry, base_s, base_c = CS.init_carry(
         agent, base_tok[:base_w], base_eqn[:base_w], base_n,
         window=base_w, total_v=total_v, embd_dim=EMBD, base_owners=base_own)
-    # The per-vertex IDENTITY pool reads the SAME base stream; it is on the
-    # policy path (it shifts every vertex slot the pointer scores), so the
-    # gate has to drive it.
-    ident = CS.base_identity_stream(
-        agent, base_tok[:base_w], base_eqn[:base_w], base_n,
-        window=base_w, total_v=total_v, base_owners=base_own)
+    base_mem = (base_s, base_c)
+    vmem_s, vmem_c = CS.zero_memory(total_v, EMBD)
 
     keys = jrand.split(jrand.PRNGKey(SEED), steps)
     out_steps = []
@@ -303,7 +312,7 @@ def run_trace(case=None, steps=None):
             state.delta_tokens, state.delta_eqns, state.delta_count,
             delta_owner, window=case["window"], participants=part)
         precomputed = CS.heads(agent, vmem_s, vmem_c,
-                               identity_stream=ident, preference=None)
+                               base_mem=base_mem, preference=None)
         avail = vertex_avail_at_step(
             state, case["vertex_valid_static"], total_v, num_valid)
 
@@ -317,7 +326,7 @@ def run_trace(case=None, steps=None):
          v_context) = agent.sample_action_dynamic(
             None, avail, state.axis_state, state.axis_valid_mask,
             case["factor_tables"], case["op_legality"], keys[t],
-            eqn_ids=None, identity_stream=ident,
+            eqn_ids=None,
             preference=None, precomputed=precomputed,
             face_chunk_fn=chunk_fn, face_count_fn=count_fn,
             enc_carry=enc_carry,

@@ -1,16 +1,48 @@
-"""The observation carry: bootstrap from the base stream, advance by a delta.
+"""The observation carry: the BASE memory, plus a delta per step.
 
-Stage 2 retired the growing token stream -- the env emits each step's DELTA
-with its own exact count, and the base stream is a host-side constant. What
-remains is a two-move protocol every trainer runs identically:
+THE GOVERNING RULE OF THIS MODULE (2026-08-15)
+----------------------------------------------
+EVERY LEARNED PARAMETER SITS DOWNSTREAM OF PALIMPSA, AND EVERY PATH FROM
+PALIMPSA TO THE LOSS IS DIFFERENTIATED. Nothing the encoder produces may be
+stored, detached, or precomputed outside the gradient.
 
-``init_carry``  consume the base stream ONCE, folding each row into the
-                slot of the VERTEX that produced it (``base_owners``, from
-                the tokenizer); headers and inputs, and the whole block if
-                owners are unavailable, go to the global slot.
-``advance``     extend the carry by ONE step's delta and fold those rows in
-                under the delta's owning vertex.
-``heads``       run the pointer / value block off the memory.
+That rule is why the base stream is no longer consumed into a value that the
+loss then treats as a constant. It used to be, twice over:
+
+  * ``init_carry`` folded the base rows into a per-vertex memory which the
+    rollout STORED per step and the loss read back -- so the encode that
+    produced them was outside every gradient;
+  * ``base_identity_stream`` ran a SECOND encoder pass per episode, outside
+    the loss, and handed the resulting rows to a ``VertexIdentityPool``. The
+    pool's own weights took gradient; the palimpsa pass that wrote its input
+    took none. The encoder that produces vertex identity was trained only
+    through the single step-delta encode of ``--grad-window`` K=1.
+
+Now there is one function, :func:`init_carry`, which returns the BASE MEMORY
+as its own object, and callers are required to keep it separate from the
+dynamic accumulation:
+
+    base_mem = (base_sums, base_counts)     <- RECOMPUTED under gradient
+    dyn_mem  = zero_memory(...) then advance(), advance(), ...   <- stored
+    slots    = read(base_sums + dyn_sums, base_counts + dyn_counts)
+
+The split is exact because the memory is (sum, count) pairs and the readout
+is a mean: adding the two memories IS pooling the union of their rows. So the
+rollout can store the dynamic half (cheap, and it must, since it is a
+trajectory) while the loss re-derives the base half from the tokens every
+time it differentiates -- which is what puts the base encode back inside the
+gradient, over the WHOLE base stream, not a K-step window of it.
+
+The two-move protocol every trainer runs is otherwise unchanged:
+
+``init_carry``  consume the base stream ONCE -> the palimpsa carry and the
+                base rows SCATTERED into the slot of the vertex that produced
+                each one (``base_owners``, from the tokenizer). Headers and
+                inputs, and the whole block if owners are unavailable, go to
+                the global slot.
+``advance``     extend the carry by ONE step's delta and scatter those rows
+                over the slots the delta PARTICIPATES in.
+``heads``       run the pointer / value block off ``dyn_mem + base_mem``.
 
 Pure ``jnp``: PPO's jitted scan and its vmapped loss call these unchanged, and
 AZ can call them eagerly on a single env. Nothing here closes over PPO state.
@@ -21,12 +53,38 @@ import jax.numpy as jnp
 
 from alphagrad.approx import vertex_memory as _vmem
 
-__all__ = ["init_carry", "advance", "heads", "base_identity_stream"]
+__all__ = ["init_carry", "base_memory", "zero_memory", "advance", "heads"]
+
+
+def zero_memory(total_v, embd_dim):
+    """The EMPTY dynamic memory: ``(sums, counts)``.
+
+    LAYOUT (total_v + 2): 0..V-1 the vertices, V the GLOBAL slot (structural
+    tokens), V+1 the SUMMARY slot -- every row credited exactly ONCE. The
+    summary slot exists because a row lands in EVERY vertex it touches (see
+    :func:`advance`), so the per-slot sums no longer re-add to the token
+    total and the value head would otherwise get a fan-out-weighted mean
+    instead of the plain one.
+    """
+    return (jnp.zeros((int(total_v) + 2, int(embd_dim)), jnp.float32),
+            jnp.zeros((int(total_v) + 2,), jnp.float32))
 
 
 def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
                total_v, embd_dim, base_owners=None):
-    """``(enc_carry, vmem_sums, vmem_counts)`` after the base stream.
+    """``(enc_carry, base_sums, base_counts)`` -- the BASE MEMORY.
+
+    The returned memory is NOT an accumulator to advance into: it is the base
+    stream's own contribution, kept separate so it can be recomputed inside
+    the loss (see this module's docstring). Start the dynamic accumulation
+    from :func:`zero_memory` and hand this to :func:`heads` as ``base_mem``.
+
+    A VERTEX'S IDENTITY IS ITS OWN ROWS, ARRIVING THROUGH THE SAME SCATTER.
+    There is no identity pool and no ``[identity || dynamic]`` concatenation:
+    the rows palimpsa emits for a vertex's own equation are scattered into
+    that vertex's slot by ``_vmem.scatter``, exactly as a step delta's rows
+    are scattered into the slots it participates in. One mechanism, no
+    weights, and the slots stay E wide.
 
     ``base_owners`` is the tokenizer's per-token owning VERTEX (1-based,
     0 = none). Its SEGMENT ids carry no vertex information and must not be
@@ -38,8 +96,8 @@ def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
     """
     enc0 = agent.carry_init()
     # chunk=0: the base window IS the base length (count == window), so a
-    # dynamic trip count has nothing to skip -- and this runs once per
-    # episode, where the flat scan is the cheaper thing to compile.
+    # dynamic trip count has nothing to skip -- and the flat scan is the form
+    # reverse-mode AD can transpose, which this call now needs.
     enc1, rows0, valid0, eqns0 = agent.encode_extend(
         enc0, base_tokens, base_eqns, base_count, window=window, start=0,
         chunk=0,
@@ -56,9 +114,6 @@ def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
     # that produced each base token (0 = no owner: headers, the input list),
     # recorded because `_build_graph` walks `jaxpr.eqns` and every traced
     # base equation therefore belongs to exactly one original equation.
-    # With them, every vertex starts with palimpsa content describing its
-    # own primal op and elemental partials -- without them the pointer has
-    # only static vertex_features to tell candidates apart at the root.
     #
     # Fallback is the #92 behaviour (everything to the GLOBAL slot), which
     # is always safe. Never fall back to reading `eqns0` as vertex ids.
@@ -71,30 +126,25 @@ def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
         # owner is 1-based; slot index is owner-1. 0 (no owner) -> -1 ->
         # the global slot, same destination the fallback uses.
         base_ids = jnp.where(_own > 0, _own - 1, -1)
-    # LAYOUT (total_v + 2): 0..V-1 the vertices, V the GLOBAL slot
-    # (structural tokens), V+1 the SUMMARY slot -- every row credited exactly
-    # ONCE. The summary slot exists because a row now lands in EVERY vertex it
-    # touches (see `advance`), so the per-slot sums no longer re-add to the
-    # token total and the value head would otherwise get a fan-out-weighted
-    # mean instead of the plain one.
-    vs0 = jnp.zeros((total_v + 2, embd_dim), jnp.float32)
-    vc0 = jnp.zeros((total_v + 2,), jnp.float32)
-    # THE VERTEX SLOTS ARE THE DYNAMIC CHANNEL, so the base stream does NOT
-    # go into them: a vertex's own base tokens are its IDENTITY, and the
-    # identity is a separate half of the representation
-    # (`VertexIdentityPool`, concatenated in `heads_from_memory`). Folding
-    # them in here as well would put identity back into the dynamic address
-    # -- the exact sharing the split exists to end -- and would double-count
-    # them. What still lands:
-    #   * UNOWNED base rows (headers, the input list) -> the GLOBAL slot,
-    #     which is the pointer's learned summary of the graph's syntax and
-    #     has no identity half to move to;
-    #   * every base row -> the SUMMARY slot, so the value head's mean is
-    #     still over the whole stream.
-    _unowned = jnp.asarray(valid0, jnp.float32) * (base_ids < 0)
-    vs0, vc0 = _vmem.update_ids(vs0, vc0, rows0, base_ids, _unowned,
+    vs0, vc0 = zero_memory(total_v, embd_dim)
+    vs0, vc0 = _vmem.update_ids(vs0, vc0, rows0, base_ids, valid0,
                                 global_slot=total_v)
     return (enc1,) + _credit_summary(vs0, vc0, rows0, valid0)
+
+
+def base_memory(agent, base_tokens, base_eqns, base_count, *, window,
+                total_v, embd_dim, base_owners=None):
+    """:func:`init_carry` without the carry -- ``(base_sums, base_counts)``.
+
+    THIS IS THE CALL THE LOSS MAKES, inside the differentiated region, once
+    per loss evaluation and OUTSIDE the per-sample vmap (the base stream is a
+    constant of the graph, so the result is the same for every sample in the
+    minibatch and a closed-over unbatched tracer is what vmap wants). It is
+    the entire reason palimpsa's base encode now has a cotangent.
+    """
+    return init_carry(agent, base_tokens, base_eqns, base_count,
+                      window=window, total_v=total_v, embd_dim=embd_dim,
+                      base_owners=base_owners)[1:]
 
 
 def _credit_summary(sums, counts, rows, valid):
@@ -122,6 +172,9 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
 
     There is NO fan-out cap and nothing to overflow: the set is a mask over
     the slots, not a K-vector of ids, so it costs O(V) and cannot truncate.
+    It is the same scatter :func:`init_carry` uses, written in its mask form
+    because every row of one delta shares one participation set -- an outer
+    product instead of a (rows x slots) key.
 
     WHAT ``vmem_counts`` MEANS under fan-out: "how many rows TOUCHED this
     slot", so ``read`` stays the mean over the rows that touched it. It is no
@@ -144,7 +197,7 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
         window=window, start=0, chunk=chunk, budget=budget,
     )
     n_slots = vmem_sums.shape[0]
-    gid = n_slots - 2                      # the GLOBAL slot (see init_carry)
+    gid = n_slots - 2                      # the GLOBAL slot (see zero_memory)
     w = jnp.asarray(valid, jnp.float32)
     if participants is None:
         ids = jnp.where(eqns >= 0, owner, -1)
@@ -171,42 +224,16 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
     return (carry2,) + _credit_summary(sums2, counts2, rows, valid)
 
 
-def heads(agent, vmem_sums, vmem_counts, *, identity_stream=None,
-          preference=None):
-    """``(vertex_logits, vertex_contexts, value)`` off the vertex memory."""
+def heads(agent, vmem_sums, vmem_counts, *, base_mem=None, preference=None):
+    """``(vertex_logits, vertex_contexts, value)`` off the vertex memory.
+
+    ``base_mem`` is :func:`base_memory`'s ``(sums, counts)``, ADDED to the
+    dynamic memory before the readout. It is a separate argument and not a
+    stored part of ``vmem_*`` for one reason: the caller has to be able to
+    recompute it inside the gradient.
+    """
     return agent.heads_from_memory(
         vmem_sums, vmem_counts,
-        identity_stream=identity_stream,
+        base_mem=base_mem,
         preference=preference,
     )
-
-
-def base_identity_stream(agent, base_tokens, base_eqns, base_count, *,
-                         window, total_v, base_owners=None):
-    """``(rows (T, E), slot ids (T,), valid (T,))`` for the IDENTITY pool.
-
-    One pass of the encoder over the BASE stream -- the same pass
-    :func:`init_carry` makes, kept as ROWS instead of pooled sums so the
-    identity is an attention pool the head runs (and trains) rather than a
-    stored constant. The base stream is a constant of the graph, so this is
-    computed ONCE per episode, outside the rollout's vmap; it is
-    params-dependent, so it cannot outlive an update.
-
-    ``base_owners`` is the tokenizer's 1-based owning vertex per base token
-    (0 = none), read exactly as :func:`init_carry` reads it. Without it every
-    row is unowned and the identity is empty for every vertex -- safe, and
-    the pre-identity behaviour.
-    """
-    enc0 = agent.carry_init()
-    _enc1, rows, valid, eqns = agent.encode_extend(
-        enc0, base_tokens, base_eqns, base_count, window=window, start=0,
-        chunk=0,
-    )
-    if base_owners is None:
-        ids = jnp.full(eqns.shape, -1, jnp.int32)
-    else:
-        _own = jnp.asarray(base_owners, jnp.int32)
-        _own = jnp.concatenate(
-            [_own, jnp.zeros(eqns.shape, jnp.int32)])[:eqns.shape[0]]
-        ids = jnp.where(_own > 0, _own - 1, -1)
-    return rows, ids, valid.astype(jnp.float32)

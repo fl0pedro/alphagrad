@@ -614,35 +614,33 @@ W4 = az_w4(_WNS)          # W2: [-w_cmp, -w_mem, 0, +w_acc]
 # by one step's DELTA per decision. Both moves are pure jnp, so AZ calls
 # them eagerly on its single env while PPO scans them.
 #
-# PER-VERTEX FEATURES ARE LOAD-BEARING, not decoration. The pointer is a
+# PER-VERTEX CONTENT IS LOAD-BEARING, not decoration. The pointer is a
 # SetPointerVertexPolicy (agent_factory: set_pointer=True) and it scores
-# CONTENT: with `vertex_features=None` its slots for the un-eliminated
-# vertices are all the same empty row, so every candidate gets an identical
-# score up to its own query embedding -- the v31 uniform-pick failure. AZ ran
-# that way (agent.encode(tok, eqn_ids=eqn) with no features) for the whole
-# comparison. They are computed from the same calibration samples PPO uses.
-# The per-vertex IDENTITY replaced the hand-written feature matrix (see
-# ppo.VertexIdentityPool): one encoder pass over the BASE stream, kept as
-# rows so the pool runs -- and trains -- inside the heads. Params-dependent,
-# so it is rebuilt whenever the weights move (per episode, below), exactly
-# as the carry is.
+# CONTENT: with an EMPTY slot per un-eliminated vertex every candidate gets
+# an identical score up to its own query embedding -- the v31 uniform-pick
+# failure. AZ ran that way (agent.encode(tok, eqn_ids=eqn) with no features)
+# for the whole comparison.
+#
+# What fills the slots now is the BASE MEMORY: palimpsa's rows for a vertex's
+# own equation, scattered into that vertex's slot. It is params-dependent, so
+# it is rebuilt whenever the weights move (per episode, below), exactly as
+# the carry is -- and the LOSS rebuilds it itself, inside the gradient, so
+# the base encode is trained rather than merely read.
 
 
 @eqx.filter_jit
-def _identity_stream(agent):
-    return _cs.base_identity_stream(agent, BASE_TOK, BASE_EQN, BASE_N,
-                                    window=BASE_W, total_v=TOTAL_V,
-                                    base_owners=BASE_OWN)
-
-
-VFEAT = None    # rebound to the identity stream once `agent` exists
-
-
-@eqx.filter_jit
-def _carry_init(agent):
+def _base_init(agent):
+    """``(enc_carry, base_sums, base_counts)`` -- carry + base scatter."""
     return _cs.init_carry(agent, BASE_TOK, BASE_EQN, BASE_N,
                           window=BASE_W, total_v=TOTAL_V, embd_dim=EMBD,
                           base_owners=BASE_OWN)
+
+
+BASE_MEM = None   # rebound to (base_sums, base_counts) once `agent` exists
+
+
+def _zero_mem():
+    return _cs.zero_memory(TOTAL_V, EMBD)
 
 
 @eqx.filter_jit
@@ -654,7 +652,7 @@ def _carry_advance(agent, enc, vs, vc, dtok, deqn, dcount, owner):
 @eqx.filter_jit
 def _carry_heads(agent, vs, vc):
     """(vertex_logits (total_v,), vertex_contexts (total_v, E), value (3,))."""
-    return _cs.heads(agent, vs, vc, identity_stream=VFEAT,
+    return _cs.heads(agent, vs, vc, base_mem=BASE_MEM,
                      preference=None)
 
 
@@ -833,7 +831,6 @@ def _face_plan(agent, precomputed, enc_carry, avail,
     (vertex_idx, actions, _vdist, _od, _id, _jd, _ed, _kd, _qlp,
      _vp, _vc, face_out, value, v_context) = agent.sample_action_dynamic(
         None, avail, AXIS_STATE, AXIS_VALID, FACT_TABLES, OP_OVERRIDE, key,
-        identity_stream=VFEAT,
         precomputed=precomputed, enc_carry=enc_carry,
         face_chunk_fn=face_chunk_fn, face_count_fn=face_count_fn,
     )
@@ -1665,6 +1662,15 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
     """
     from alphagrad.approx.ppo import EncCarry
 
+    # THE BASE ENCODE, INSIDE THE GRADIENT -- the same move PPO's
+    # `_dynamic_loss_fn` makes, and for the same reason: reading the module
+    # global `BASE_MEM` here would hand the loss an encoder output computed
+    # outside `filter_grad`, and palimpsa's base encode would get a cotangent
+    # of exactly zero. Computed ONCE per loss call, outside the vmap below.
+    _base_mem = _cs.base_memory(agent, BASE_TOK, BASE_EQN, BASE_N,
+                                window=BASE_W, total_v=TOTAL_V, embd_dim=EMBD,
+                                base_owners=BASE_OWN)
+
     def per(M, I, ch, nv, pos, vs, vc, dt, de, dc, ow, vsl,
             la, lam, pi, vt, vm, s_li, s_vidx, s_w, s_fp, s_fc, s_fv,
             s_cnt, s_dt, s_de, s_fa, s_fend):
@@ -1673,7 +1679,7 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
         # too, and the dynamic trip count is a lax.while_loop.
         c2, vs2, vc2 = _cs.advance(agent, carry, vs, vc, dt, de, dc, ow,
                                    window=MAX_DELTA_TOKENS, chunk=0)
-        vlog, ctx, v3 = _cs.heads(agent, vs2, vc2, identity_stream=VFEAT,
+        vlog, ctx, v3 = _cs.heads(agent, vs2, vc2, base_mem=_base_mem,
                                   preference=None)
         lg = vlog[la]
         lg = jnp.where(lam > 0.5, lg, -jnp.inf)   # -1e9 collided with a sentinel
@@ -1740,13 +1746,13 @@ def _run(args) -> int:
     `_run` locals and the net would either go stale in the search or raise
     UnboundLocalError.
     """
-    # #85: `env`, `ev` and `VFEAT` join the rebound globals. AZ used to
+    # #85: `env`, `ev` and `BASE_MEM` join the rebound globals. AZ used to
     # draw its eval samples ONCE at import and keep them for the whole
     # run, so its quality channel could overfit a fixed reference set
     # while PPO redraws every episode. Same load-bearing `global`
     # mechanism as `agent`/`opt_state`: the search functions read these
     # through module globals, so they must be REBOUND, never shadowed.
-    global agent, opt_state, env, ev, VFEAT
+    global agent, opt_state, env, ev, BASE_MEM
     # Phase map, shared with `ppo_ray._run` so the two trainers read in the same
     # order. Phases 1-4 run at IMPORT time here (see the banners above), so only
     # 5 and 6 are in this function:
@@ -1949,22 +1955,22 @@ def _run(args) -> int:
             print(f"[gaz] ep={ep} trainer jax.clear_caches() "
                   f"(every {_tce})", flush=True)
         # #85: fresh calibration samples per episode (the measurement's
-        # data), and the per-vertex IDENTITY re-pooled under this episode's
-        # weights. Mirrors ppo.main's per-episode `generate_eval_samples` +
-        # `base_identity_stream`.
+        # data), and the BASE MEMORY re-derived under this episode's weights.
+        # Mirrors ppo.main's per-episode `generate_eval_samples` +
+        # `base_memory`.
         _ev_key = jax.random.fold_in(jax.random.PRNGKey(args.seed), ep)
         ev = generate_eval_samples(env, _ev_key, A.ndata)
         env = eqx.tree_at(lambda e: e.eval_args_samples, env, ev)
-        # The identity is params-dependent, not sample-dependent: it is the
-        # pool's reading of this graph's base tokens under the CURRENT
-        # weights, so it is rebuilt here for the same reason the carry is.
-        VFEAT = _identity_stream(agent)
         # A fresh episode = a fresh tokenizer at the base, and a fresh carry
-        # built from the base stream under the CURRENT weights. The carry is
-        # params-dependent, so it can never outlive a train_step.
+        # built from the base stream under the CURRENT weights. The carry and
+        # the base memory are params-dependent, so neither can outlive a
+        # train_step. The DYNAMIC memory starts EMPTY: the base half is
+        # `BASE_MEM`, added at head time, and re-derived inside the loss.
         PT.reset()
         state = []
-        carry = Carry(*_carry_init(agent))
+        _enc0, _bs, _bc = _base_init(agent)
+        BASE_MEM = (_bs, _bc)
+        carry = Carry(_enc0, *_zero_mem())
         steps = []
         _memlog = os.environ.get("ALPHAGRAD_GAZ_MEMLOG", "0") == "1"
         _dstep = 0

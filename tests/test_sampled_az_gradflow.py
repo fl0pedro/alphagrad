@@ -84,6 +84,8 @@ def setup():
     # Two real draws sampled from the head itself (F ~ beta), one padding.
     feats0 = P._axis_features_from_state(axis_state[0], axis_valid[0])
     ctx0 = jnp.ones((ns.embd_dim,)) * 0.1
+    # `ctx0` is accepted and ignored by the blind path (the head reads the
+    # face's own latent, which is empty without a live-faces stream).
     fa0, *_ = agent.face_path_policy.sample(
         ctx0, feats0, tables, jrand.PRNGKey(0), pair, comp, valid)
     fa1, *_ = agent.face_path_policy.sample(
@@ -128,8 +130,7 @@ def setup():
 
 
 def _loss_pieces(agent, s):
-    vlog, ctx, _v3 = _cs.heads(agent, s["vs"], s["vc"],
-                               identity_stream=None)
+    vlog, ctx, _v3 = _cs.heads(agent, s["vs"], s["vc"], base_mem=None)
     logp = jax.nn.log_softmax(vlog[s["la"]])
     vertex_ce = -jnp.sum(s["pi"] * logp)
     face_ce, ent = face_ce_term(
@@ -182,8 +183,7 @@ def test_padding_slots_contribute_exactly_zero(setup):
     s = setup
     (sd_li, sd_vidx, sd_w, *rest) = s["sd"]
     sd0 = (jnp.full_like(sd_li, -1), sd_vidx, jnp.zeros_like(sd_w), *rest)
-    _vlog, ctx, _v3 = _cs.heads(s["agent"], s["vs"], s["vc"],
-                                identity_stream=None)
+    _vlog, ctx, _v3 = _cs.heads(s["agent"], s["vs"], s["vc"], base_mem=None)
     ce, _ent = face_ce_term(
         s["agent"]._face_replay, ctx, s["enc"], s["axis_state"],
         s["axis_valid"], s["tables"], s["op_override"],
