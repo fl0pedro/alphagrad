@@ -3060,7 +3060,7 @@ def main():
             v = int(eo[k])  # env order is 1-based already
             try:
                 rules = _decode_specs(
-                    _oracle_jaxpr, v, specs[k], is_last=(k == n - 1)
+                    _oracle_jaxpr, v, specs[k]
                 )
             except Exception:
                 rules = ()
@@ -3103,7 +3103,7 @@ def main():
             v = int(eo[k])
             try:
                 rules = _decode_specs(
-                    _oracle_jaxpr, v, specs[k], is_last=(k == n - 1)
+                    _oracle_jaxpr, v, specs[k]
                 )
             except Exception:
                 rules = ()
@@ -3156,7 +3156,7 @@ def main():
             v = int(eo[k])
             try:
                 rules = _decode_specs(
-                    _oracle_jaxpr, v, specs[k], is_last=(k == n - 1)
+                    _oracle_jaxpr, v, specs[k]
                 )
             except Exception:
                 rules = ()

@@ -487,6 +487,16 @@ _INCR_STREAM_CACHE_CAP = 64
 # Engagement counters (proof instrumentation, not behavior): how often the
 # append-only stream cache hit the full key / EXTENDED a parent / went cold.
 _INCR_STREAM_STATS = {"hit": 0, "ext": 0, "cold": 0, "nostore": 0}
+
+if os.environ.get("ALPHAGRAD_TOKENS_MID_COMPRESS") is not None:
+    raise RuntimeError(
+        "ALPHAGRAD_TOKENS_MID_COMPRESS is GONE. It existed to mitigate the "
+        "COMPRESS prefix-property violation by tokenizing an intermediate "
+        "last vertex WITHOUT its COMPRESS -- which made the observation "
+        "describe an exact contraction while the measurement applied a "
+        "reduction. The `is_last` gate it worked around has been removed: "
+        "COMPRESS is now honored at every position, so the stream is "
+        "append-only and there is nothing to mitigate. Unset the variable.")
 # Pop-and-extend prefix cache for `_face_transforms_for_order`
 # (ALPHAGRAD_FACE_ENUM_CACHE=1): (IncrementalJaxpr, out) keyed by the full
 # decision prefix — one elimination per env step instead of a fresh
@@ -496,7 +506,8 @@ _INCR_STREAM_STATS = {"hit": 0, "ext": 0, "cold": 0, "nostore": 0}
 _FACE_ENUM_CACHE: dict = {}
 _FACE_ENUM_CACHE_CAP = int(os.environ.get("ALPHAGRAD_FACE_ENUM_CACHE_CAP",
                                           "64"))
-_FACE_ENUM_STATS = {"ext": 0, "cold": 0}
+_FACE_ENUM_STATS = {"ext": 0, "cold": 0, "compress": 0, "elims": 0,
+                    "calls": 0, "build": 0}
 
 # One ResourceMonitor per device-set, reused for every measurement.
 # Constructing a fresh monitor per call leaks its C++ MemoryTracker/
@@ -559,7 +570,7 @@ def _face_wire_keys(faces_np, skips_np, n):
 
 def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
                                tok_rules_by_v, ft_by_vertex=None,
-                               face_key=None, honor_last_compress=True,
+                               face_key=None,
                                face_rows_list=None, face_skips_list=None):
     """Full append-only observation stream for the prefix ``o_list``
     (ALPHAGRAD_INCREMENTAL_TOKENS=1): base tokens + one block per elimination
@@ -625,59 +636,36 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
     # replay. `ft_out` accumulates per prefix and rides the cache entries.
     _unified = face_rows_list is not None
     ft_out: dict = {}
-    # ANCESTOR EXTENSION IS ONLY SOUND ACROSS is_last-INSENSITIVE STATES.
+    # ANCESTOR EXTENSION IS SOUND FOR EVERY STATE.
     #
-    # Measured (tests/stream_prefix_property_test.py): the stream for a
-    # length-k prefix is NOT a byte-prefix of the length-k+1 stream when the
-    # prefix carries COMPRESS. `decode_vertex_rule_specs` emits Compress only
-    # when `is_last=True`, so vertex k-1 is tokenized WITH its Compress at
-    # length k and WITHOUT it at length k+1 — the streams diverge (token 681
-    # of 931 on the test graph). Extending a cached parent would then hand the
-    # policy a different observation than a cold replay, i.e. the observation
-    # would depend on cache state.
+    # It used not to be. `decode_vertex_rule_specs` used to emit COMPRESS only
+    # when `is_last=True`, so vertex k-1 was tokenized WITH its Compress at
+    # prefix length k and WITHOUT it at k+1 — the streams diverged
+    # (tests/stream_prefix_property_test.py measured token 681 of 931), and
+    # extending a cached parent would have handed the policy a different
+    # observation than a cold replay. Two carve-outs lived here: a prefix-wide
+    # COMPRESS scan (which left the cache dead, ext=1/431 at v40 — a random
+    # policy plants a COMPRESS within a step or two) and then a refined
+    # "store only COMPRESS-free-last states" bound.
     #
-    # REFINED BOUND (v40 counters showed the prefix-wide scan left the cache
-    # disengaged, ext=1/431: with allow_compress a random policy plants a
-    # COMPRESS row within a step or two and every later step replayed cold):
-    # the divergence lives ONLY at the vertex whose decode flips is_last
-    # between lengths — the CURRENT last vertex. So (a) a state is STORED
-    # only if its last vertex is COMPRESS-free (specs AND face rows — same
-    # decoder, same sensitivity), making every stored state
-    # is_last-insensitive by induction; (b) extension from any stored parent
-    # is then always sound; (c) a COMPRESS-last call replays cold WITHOUT
-    # consuming its parent (extending would mutate it) and is not stored —
-    # one O(t) replay per COMPRESS decision instead of a dead cache.
-    # `honor_last_compress=False` (ALPHAGRAD_TOKENS_MID_COMPRESS=0 on a
-    # non-terminal step): the caller decoded the last vertex with
-    # is_last=False, so its COMPRESS row was DROPPED and the state is not
-    # sensitive — storable. The terminal call (honor=True) extends this
-    # chain soundly: vertices 0..T-2 decode identically in both worlds.
-    _last_has_compress = honor_last_compress and bool(steps) and any(
-        int(r[0]) == COMPRESS_SENTINEL for r in steps[-1][1])
-    if (honor_last_compress and not _last_has_compress and steps
-            and isinstance(face_key, tuple) and face_key):
-        # `_face_wire_keys` entries are (flat positions of the non -1 face
-        # entries, their values, ...) as int32 bytes. The wire row is
-        # ``[r0, r1, r2]``, so the r0 column is exactly the positions
-        # divisible by 3 -- the same set the dense ``[0::3]`` slice picked.
-        _c = np.frombuffer(face_key[-1][0], dtype=np.int32)
-        _v = np.frombuffer(face_key[-1][1], dtype=np.int32)
-        _last_has_compress = bool(
-            np.any((_c % 3 == 0) & (_v == COMPRESS_SENTINEL)))
-    if not _last_has_compress:
-        for cut in range(len(steps) - 1, 0, -1):
-            parent = _INCR_STREAM_CACHE.pop(
-                base_key + (tuple(steps[:cut]),
-                            face_key[:cut] if isinstance(face_key, tuple)
-                            else None), None)
-            if parent is not None:
-                _INCR_STREAM_STATS["ext"] += 1
-                tk, stream, seg_ids, done = (
-                    parent[0], list(parent[1]), list(parent[2]), cut)
-                last_start = parent[4]
-                if len(parent) > 3 and parent[3]:
-                    ft_out = dict(parent[3])
-                break
+    # The `is_last` gate is GONE (see decode_vertex_rule_specs), so the decode
+    # of a vertex no longer depends on where the prefix ends: the stream for a
+    # prefix is a byte-prefix of the stream for any extension for EVERY rule
+    # kind, COMPRESS included, and the test asserts it. Nothing to carve out —
+    # every state is storable and every parent is extendable.
+    for cut in range(len(steps) - 1, 0, -1):
+        parent = _INCR_STREAM_CACHE.pop(
+            base_key + (tuple(steps[:cut]),
+                        face_key[:cut] if isinstance(face_key, tuple)
+                        else None), None)
+        if parent is not None:
+            _INCR_STREAM_STATS["ext"] += 1
+            tk, stream, seg_ids, done = (
+                parent[0], list(parent[1]), list(parent[2]), cut)
+            last_start = parent[4]
+            if len(parent) > 3 and parent[3]:
+                ft_out = dict(parent[3])
+            break
     if tk is None:
         _INCR_STREAM_STATS["cold"] += 1
         tk = IncrementalPathTokenizer(
@@ -699,9 +687,7 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
         if _unified:
             _pf_v = _face_dict_for_vertex(
                 config, tk.ij, int(v), face_rows_list[_ki],
-                face_skips_list[_ki],
-                is_last_honored=(_ki == len(steps) - 1
-                                 and honor_last_compress))
+                face_skips_list[_ki])
             if _pf_v:
                 ft_out[int(v)] = _pf_v
         else:
@@ -712,12 +698,6 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
         seg_ids += [int(g) for g in tk.last_eqn_ids()]
 
     _ft_ret = ft_out if _unified else ft_by_vertex
-    if _last_has_compress:
-        # is_last-SENSITIVE state — serving it is fine, but it must never
-        # become a parent (its last elimination differs from a longer cold
-        # replay's view of the same vertex).
-        _INCR_STREAM_STATS["nostore"] += 1
-        return stream, seg_ids, _ft_ret, last_start
     if len(_INCR_STREAM_CACHE) > _INCR_STREAM_CACHE_CAP:
         _INCR_STREAM_CACHE.clear()
     _INCR_STREAM_CACHE[key] = (tk, stream, seg_ids,
@@ -2725,7 +2705,7 @@ def _aggregate_samples(values, want_top_quartile: bool):
 # rather than per-actor, multiplying effective coverage.
 
 
-def decode_vertex_rule_specs(jaxpr, vertex, spec_rows, is_last: bool) -> tuple:
+def decode_vertex_rule_specs(jaxpr, vertex, spec_rows) -> tuple:
     """Decode ONE vertex's wire-format ``(MAX_RULES_PER_VERTEX, 3)`` rows into
     graphax transforms ``(Diag | Compress | Quant, ...)``.
 
@@ -2739,9 +2719,35 @@ def decode_vertex_rule_specs(jaxpr, vertex, spec_rows, is_last: bool) -> tuple:
       * ``row[0] == -1``               end-of-sequence sentinel.
       * ``row[0] == QUANT_SENTINEL``   QUANT, ``row[1]`` → QUANT_DTYPES.
       * ``row[0] == COMPRESS_SENTINEL`` COMPRESS, physical axis ``row[1]``,
-        kind ``row[2]`` — honored only when ``is_last`` (COMPRESS reduces
-        ``val.ndim``, which trips graphax's shape-preservation assertion when
-        the compressed edge feeds a later elimination).
+        kind ``row[2]`` — honored at EVERY position of the plan.
+
+        There used to be an ``is_last`` gate here that emitted COMPRESS only
+        for the NEWEST vertex of the prefix, on the stated grounds that a
+        ``val.ndim`` reduction upstream of a later elimination trips graphax's
+        shape-preservation assertion. It is gone, because the premise is false
+        and the cost was severe:
+
+        * graphax's nominal-shape asserts are EXACT-AD only — core.py gates
+          them on ``not _perpath and not _is_approx_cfg and not approx_active()``
+          — and ``apply_compress`` drops the axis POINTER (``Index.axis =
+          None``), not the logical size, so a compressed edge still contracts.
+          The over-conservative structural guard the note referred to was
+          removed from ``apply_compress`` on 2026-07-15.
+        * MEASURED (2026-08-15, ``compress_probe``/``compress_probe2``, CPU):
+          the same decoded COMPRESS applied at all 23 positions of the
+          NeuralNetwork plan and at 11 sampled positions of the TransformerLM
+          plan, RAW and ``make_live_masked_hook``-wrapped, raised NOTHING
+          (0/46 exceptions) and genuinely changed the Jacobian (cos vs exact
+          AD 0.55–0.99). So the gate was not preventing a failure, it was
+          silently DISCARDING every COMPRESS the policy placed anywhere but
+          the terminal vertex: the terminal measurement of a mid-plan COMPRESS
+          came back bit-identical to exact AD (cos 1.000000) while the honest
+          application scores cos 0.653 (NN) / 0.9957 (TLM).
+        * It is also what made the append-only stream non-prefix-stable: the
+          same vertex tokenized WITH its COMPRESS at prefix length k and
+          WITHOUT it at k+1 (``tests/stream_prefix_property_test.py``), which
+          forced the COMPRESS carve-outs in both prefix caches
+          (v40: ext=1/431).
       * ``row[0] >= 0``                DIAG ``(bi1, bi2, factor)`` with the
         legacy -1 (joint gcd) factor sentinel; 0/1 factors are dropped.
 
@@ -2790,11 +2796,9 @@ def decode_vertex_rule_specs(jaxpr, vertex, spec_rows, is_last: bool) -> tuple:
                                    scale_sign=_sign, scale_frac=_u))
             continue
         if bi1 == COMPRESS_SENTINEL:
-            # COMPRESS: physical axis row[1], kind row[2]. Only honored on the
-            # LAST vertex of the partial order (val.ndim reduction upstream of
-            # a later elimination trips graphax's shape assertion).
-            if not is_last:
-                continue
+            # COMPRESS: physical axis row[1], kind row[2]. Honored wherever it
+            # sits in the plan — see the docstring for why the last-vertex
+            # gate is gone.
             axis_idx = bi2
             kind_idx = factor  # row[2] reused as kind index for COMPRESS
             fits_all = True
@@ -2862,8 +2866,7 @@ def decode_vertex_rule_specs(jaxpr, vertex, spec_rows, is_last: bool) -> tuple:
 _NEW_SLOT_JOIN = os.environ.get("ALPHAGRAD_NEW_SLOT_JOIN", "1") != "0"
 
 
-def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
-                          is_last_honored):
+def _face_dict_for_vertex(config, ij, v, face_row, face_skip):
     """ONE vertex's ``{face_key: slots|SKIP_FACE}`` from its wire rows,
     enumerated on ``ij``'s CURRENT graph — call BEFORE eliminating ``v``.
     Single source of truth for `_face_transforms_for_order` (standalone
@@ -2898,8 +2901,7 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
             one_row = [[int(x) for x in face_row[f][s]]] + [
                 [-1, -1, 0]
             ] * (MAX_RULES_PER_VERTEX - 1)
-            rules = decode_vertex_rule_specs(
-                config.jaxpr, int(v), one_row, is_last=is_last_honored)
+            rules = decode_vertex_rule_specs(config.jaxpr, int(v), one_row)
             # THE per-FACE sink. Under --live-faces the per-vertex rows are
             # all-exact END rows, so the per-vertex sink below is never
             # constructed and this is the ONLY place approx_applied/* can come
@@ -3014,8 +3016,7 @@ def _compile_measure(lowered):
 
 
 def _face_transforms_for_order(config, consts, args, o_list, specs_list,
-                               face_rows_list, face_skips_list,
-                               honor_last_compress=True):
+                               face_rows_list, face_skips_list):
     """Per-vertex ``face_transforms`` dicts for graphax, from the wire arrays.
 
     Face KEYS are graph-state dependent, so enumerate with ``faces_of`` on a
@@ -3041,51 +3042,46 @@ def _face_transforms_for_order(config, consts, args, o_list, specs_list,
         # Pop-and-extend prefix cache: step k's replay is step k-1's replay
         # plus ONE elimination, so advance the cached builder instead of
         # rebuilding it from scratch every env step — O(T) eliminations per
-        # episode instead of O(T^2). Only sound while decode is
-        # is_last-insensitive, i.e. no COMPRESS anywhere in the prefix
-        # (specs OR face rows) — same policy, same reason as
+        # episode instead of O(T^2). Sound for EVERY prefix now that the
+        # COMPRESS `is_last` gate is gone and a vertex's decode no longer
+        # depends on where the prefix ends — same reason as
         # _INCR_STREAM_CACHE. Extension MUTATES the builder, so the parent
         # entry is POPPED; a sibling chain that misses takes the honest
         # cold replay.
+        _t_key = time.perf_counter()
         _sigs = tuple(
             (int(o_list[k]),
              np.asarray(specs_list[k], dtype=np.int64).tobytes(),
              np.asarray(face_rows_list[k], dtype=np.int64).tobytes(),
              np.asarray(face_skips_list[k], dtype=np.int64).tobytes())
             for k in range(len(o_list)))
+        _prof_add("cb.face_enum_key", time.perf_counter() - _t_key)
+        _FACE_ENUM_STATS["calls"] += 1
         _base = (id(config.jaxpr), tuple(config.argnums))
-        # Same refined bound as _INCR_STREAM_CACHE: only the LAST vertex's
-        # decode is is_last-sensitive. A COMPRESS-last call is served cold,
-        # keeps its parent cached, and is not stored.
-        _k_last = len(o_list) - 1
-        _last_compress = honor_last_compress and bool(
-            COMPRESS_SENTINEL in np.asarray(specs_list[_k_last])[..., 0]
-            or COMPRESS_SENTINEL in np.asarray(face_rows_list[_k_last])[..., 0])
-        if not _last_compress:
-            _cache_key = _base + (_sigs,)
-            for cut in range(len(_sigs) - 1, 0, -1):
-                parent = _FACE_ENUM_CACHE.pop(_base + (_sigs[:cut],), None)
-                if parent is not None:
-                    ij, out, _start = parent[0], parent[1], cut
-                    _FACE_ENUM_STATS["ext"] += 1
-                    break
-            if ij is None:
-                _FACE_ENUM_STATS["cold"] += 1
+        # No COMPRESS carve-out: the decode is position-independent, so every
+        # prefix is a legal parent and every result is storable.
+        _cache_key = _base + (_sigs,)
+        for cut in range(len(_sigs) - 1, 0, -1):
+            parent = _FACE_ENUM_CACHE.pop(_base + (_sigs[:cut],), None)
+            if parent is not None:
+                ij, out, _start = parent[0], parent[1], cut
+                _FACE_ENUM_STATS["ext"] += 1
+                break
+        if ij is None:
+            _FACE_ENUM_STATS["cold"] += 1
     if ij is None:
+        _FACE_ENUM_STATS["build"] += 1
         ij = IncrementalJaxpr(config.jaxpr, tuple(config.argnums),
                               list(consts), list(args), track_faces=False)
-    last = len(o_list) - 1
+    _FACE_ENUM_STATS["elims"] += len(o_list) - _start
     for k in range(_start, len(o_list)):
         v = int(o_list[k])
         per_face = _face_dict_for_vertex(
-            config, ij, v, face_rows_list[k], face_skips_list[k],
-            is_last_honored=(k == last and honor_last_compress))
+            config, ij, v, face_rows_list[k], face_skips_list[k])
         if per_face:
             out[v] = per_face
         vertex_rules = decode_vertex_rule_specs(
-            config.jaxpr, v, specs_list[k],
-            is_last=(k == last and honor_last_compress),
-        )
+            config.jaxpr, v, specs_list[k])
         # Hook-wrap like the measurement/tokenizer paths do under per_face:
         # a raw rule that doesn't fit one face's operand would hit the strict
         # TRANSFORM-DID-NOT-FIT guard here — DURING KEY ENUMERATION — and
@@ -3146,10 +3142,6 @@ def _callback(
     # P1 per-path actions: build graphax's {vertex: {face_key: slots|SKIP}}
     # only when any face action is present in the prefix (all -1 / all 0 is
     # the per-vertex mode and must stay byte-identical to it).
-    # ALPHAGRAD_TOKENS_MID_COMPRESS=0: intermediate steps tokenize their last
-    # vertex with is_last=False (terminal steps always honor COMPRESS).
-    _honor_mid_compress = is_terminal or os.environ.get(
-        "ALPHAGRAD_TOKENS_MID_COMPRESS", "1") == "1"
     _faces_np = np.asarray(face_specs)[: len(o_list)]
     _skips_np = np.asarray(face_skips)[: len(o_list)]
     ft_by_vertex = None
@@ -3166,10 +3158,12 @@ def _callback(
                    and os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "0")
                    == "1")
     if _have_face_actions and not _unified_fe:
+        _fr_list = _faces_np.tolist()
+        _fs_list = _skips_np.tolist()
+        _pf("cb.face_tolist")
         ft_by_vertex = _face_transforms_for_order(
             config, consts, args, o_list, specs_list,
-            _faces_np.tolist(), _skips_np.tolist(),
-            honor_last_compress=_honor_mid_compress,
+            _fr_list, _fs_list,
         )
     _pf("cb.face_enum")
 
@@ -3189,23 +3183,13 @@ def _callback(
     # with j=1 only fits the first).
     transforms: list[tuple[int, tuple]] = []
     tok_rules_by_v: dict[int, tuple] = {}
-    last_v_idx = len(o_list) - 1
     for v_idx, v in enumerate(o_list):
         rules = decode_vertex_rule_specs(
-            config.jaxpr, int(v), specs_list[v_idx],
-            is_last=(v_idx == last_v_idx),
-        )
-        # TOKENIZER-side rules: under ALPHAGRAD_TOKENS_MID_COMPRESS=0 an
-        # INTERMEDIATE last vertex is tokenized WITHOUT its COMPRESS
-        # (is_last=False decode). The measurement `transforms` above keeps
-        # the legacy decode — this changes the observation only, and only
-        # where the incremental encoder's carry was already being extended
-        # across a rewritten history (the COMPRESS prefix-property
-        # violation). The terminal step is unchanged.
+            config.jaxpr, int(v), specs_list[v_idx])
+        # TOKENIZER-side rules are the SAME rules: the decode no longer
+        # depends on the vertex's position in the prefix, so the observation
+        # and the measured graph cannot disagree about a COMPRESS.
         tok_rules = rules
-        if v_idx == last_v_idx and not _honor_mid_compress:
-            tok_rules = decode_vertex_rule_specs(
-                config.jaxpr, int(v), specs_list[v_idx], is_last=False)
         if rules or tok_rules:
             if getattr(config, "per_face", False):
                 # graphax invokes a CALLABLE transform once per face, handing
@@ -3244,7 +3228,6 @@ def _callback(
         stream, seg_ids, _ft_ret, _last_start = _incremental_stream_tokens(
             config, consts, args, o_list, specs_list, tok_rules_by_v,
             ft_by_vertex=ft_by_vertex,
-            honor_last_compress=_honor_mid_compress,
             # NUMPY, not `.tolist()`: only the ~1.24 LIVE faces of the
             # CURRENT vertex are ever indexed out of these, so materialising
             # T x MAX_FACES x FACE_SLOTS x 3 Python ints per step was pure

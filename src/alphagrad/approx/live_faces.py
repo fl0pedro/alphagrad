@@ -245,8 +245,7 @@ class LiveFaceStream:
             """
             v = int(order[k])
             try:
-                rules = decode_vertex_rule_specs(
-                    self.jaxpr, v, specs[k], is_last=False)
+                rules = decode_vertex_rule_specs(self.jaxpr, v, specs[k])
             except Exception:
                 rules = ()
             # Hook-wrapped exactly like the measurement path: a rule that does
@@ -258,15 +257,13 @@ class LiveFaceStream:
             # computed on an EXACT prefix while the measurement
             # (env._face_transforms_for_order -> ft_by_vertex) built an
             # approximated one: the observation and the measured object
-            # diverged. ``is_last=False`` is what that builder uses for every
-            # vertex but the last of the ORDER, and a prefix vertex here is
-            # never that one.
+            # diverged. The decode is position-independent now, so replaying a
+            # prefix vertex here and deciding it fresh give the same rules.
             ft = None
             if frh is not None:
                 try:
                     _keys, ft = self._decided(
-                        tk, v, frh[k], fsh[k], int(frh.shape[1]),
-                        is_last=False)
+                        tk, v, frh[k], fsh[k], int(frh.shape[1]))
                 except Exception:
                     ft = None
             tk.eliminate(v, hooks, ft or None)
@@ -340,15 +337,12 @@ class LiveFaceStream:
         return m
 
     # -- decoded per-face transforms for the DECIDED faces -----------------
-    def _decided(self, tk, vertex, face_rows, face_skips, upto,
-                 is_last=True):
+    def _decided(self, tk, vertex, face_rows, face_skips, upto):
         """``{face_key: slots|SKIP_FACE}`` for faces ``0..upto-1``.
 
-        ``is_last`` mirrors ``env._face_dict_for_vertex``'s
-        ``is_last_honored``: True for the vertex whose faces are being decided
-        right now (the newest of the prefix), False when replaying an OLDER
-        prefix vertex, which is exactly how ``_face_transforms_for_order``
-        decodes it.
+        Position-independent: the same wire rows decode to the same rules for
+        the vertex being decided now and for an OLDER prefix vertex being
+        replayed, which is what ``_face_transforms_for_order`` also does.
         """
         from graphax import SKIP_FACE
         from alphagrad.approx.env import (
@@ -366,14 +360,11 @@ class LiveFaceStream:
                 row = [list(int(x) for x in face_rows[f][s])] + [
                     [-1, -1, 0]] * (MAX_RULES_PER_VERTEX - 1)
                 try:
-                    # is_last=True: the vertex the face loop is deciding is
-                    # the NEWEST of the prefix, which is exactly when
-                    # decode_vertex_rule_specs admits COMPRESS. Decoding it
-                    # with is_last=False drops every COMPRESS row SILENTLY,
-                    # so the chunk would describe an exact contraction while
-                    # the env applied a reduction.
+                    # No position gate: COMPRESS is admitted for every vertex,
+                    # so the chunk the head reads and the graph the env
+                    # measures carry the same reduction.
                     rules = decode_vertex_rule_specs(
-                        self.jaxpr, int(vertex), row, is_last=bool(is_last))
+                        self.jaxpr, int(vertex), row)
                 except Exception:
                     rules = ()
                 slots.append(make_live_masked_hook(tuple(rules))
@@ -494,7 +485,7 @@ class LiveFaceStream:
         from alphagrad.approx.common.masks import make_live_masked_hook
         try:
             vrules = decode_vertex_rule_specs(
-                self.jaxpr, vertex, vspecs.tolist(), is_last=True)
+                self.jaxpr, vertex, vspecs.tolist())
         except Exception:
             vrules = ()
         vhooks = (make_live_masked_hook(tuple(vrules)),) if vrules else ()

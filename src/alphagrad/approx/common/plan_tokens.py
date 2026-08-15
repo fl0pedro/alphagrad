@@ -122,7 +122,7 @@ class PlanTokenizer:
             yield self
 
     # -- the delta ---------------------------------------------------------
-    def _hooks(self, vertex, vertex_specs, is_last):
+    def _hooks(self, vertex, vertex_specs):
         from alphagrad.approx.common.masks import make_live_masked_hook
         from alphagrad.approx.env import decode_vertex_rule_specs
 
@@ -132,14 +132,12 @@ class PlanTokenizer:
         if all(int(r[0]) == -1 for r in rows):
             return ()
         try:
-            rules = decode_vertex_rule_specs(
-                self.jaxpr, int(vertex), rows, is_last=bool(is_last))
+            rules = decode_vertex_rule_specs(self.jaxpr, int(vertex), rows)
         except Exception:
             rules = ()
         return (make_live_masked_hook(tuple(rules)),) if rules else ()
 
-    def face_transforms(self, vertex, face_rows, face_skips, *, is_last=True,
-                        keys=None):
+    def face_transforms(self, vertex, face_rows, face_skips, *, keys=None):
         """``{face_key: slots|SKIP_FACE}`` for EVERY face of ``vertex``.
 
         Same decoder ``live_faces.LiveFaceStream._decided`` uses, run to the
@@ -194,7 +192,7 @@ class PlanTokenizer:
                     [-1, -1, 0]] * (MAX_RULES_PER_VERTEX - 1)
                 try:
                     r = decode_vertex_rule_specs(
-                        self.jaxpr, int(vertex), row, is_last=bool(is_last))
+                        self.jaxpr, int(vertex), row)
                 except Exception:
                     r = ()
                 slots.append(make_live_masked_hook(tuple(r)) if r else None)
@@ -203,16 +201,16 @@ class PlanTokenizer:
         return ft or None
 
     def eliminate(self, vertex, vertex_specs=None, face_rows=None,
-                  face_skips=None, *, is_last=True, face_keys=None):
+                  face_skips=None, *, face_keys=None):
         """Advance the tokenizer by one vertex; return ``(tokens, eqn_ids)``.
 
         MUTATES. Wrap in :meth:`branch` for a speculative expansion, call bare
         to commit a decision. Pass ``face_keys`` from the tokenizer the per-face
         plan was DECIDED on -- see :meth:`face_transforms`.
         """
-        hooks = self._hooks(vertex, vertex_specs, is_last)
+        hooks = self._hooks(vertex, vertex_specs)
         ft = self.face_transforms(vertex, face_rows, face_skips,
-                                  is_last=is_last, keys=face_keys)
+                                  keys=face_keys)
         self.stats["eliminations"] += 1
         toks = [int(t) for t in self.tk.eliminate(int(vertex), hooks, ft)]
         ids = [int(g) for g in self.tk.last_eqn_ids()]

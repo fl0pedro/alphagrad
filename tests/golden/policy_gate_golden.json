@@ -377,7 +377,7 @@
      365
     ],
     "chunk_eqns_sha": "ab3e1a392eb17012",
-    "chunk_tokens_sha": "93e0ba65af442084",
+    "chunk_tokens_sha": "2f6c6126cbe757d9",
     "comp_valid": [
      [
       0,
@@ -392,8 +392,8 @@
       7
      ]
     ],
-    "entropy": "4103c94c",
-    "logp": "c0fec188",
+    "entropy": "41041bbc",
+    "logp": "c0fef3d9",
     "n_live": 1,
     "pair_valid": [
      [
@@ -588,7 +588,7 @@
      472
     ],
     "chunk_eqns_sha": "dba0bb23649fe7fa",
-    "chunk_tokens_sha": "5281b21791335239",
+    "chunk_tokens_sha": "3e00104006c3655e",
     "comp_valid": [
      [
       0,
@@ -603,8 +603,8 @@
       2
      ]
     ],
-    "entropy": "3f1c7f74",
-    "logp": "beb702f3",
+    "entropy": "3f1e2536",
+    "logp": "bebcbe97",
     "n_live": 1,
     "pair_valid": [
      [
@@ -748,9 +748,9 @@
    "step": 2,
    "target_vertex": 1,
    "value": [
-    "3d8e54ea",
-    "be655ac7",
-    "3daa44b7"
+    "3d90687b",
+    "be5eddf3",
+    "3de37dd9"
    ],
    "vertex": 0,
    "vertex_mask_fill": [
@@ -760,19 +760,19 @@
    "vertex_probs_live": [
     [
      0,
-     "3e591fd2"
+     "3e5a4f00"
     ],
     [
      1,
-     "3e6db2df"
+     "3e6d18bc"
     ],
     [
      3,
-     "3e8cd991"
+     "3e8c66bc"
     ],
     [
      4,
-     "3e8fbd16"
+     "3e8fe565"
     ]
    ]
   },
@@ -795,7 +795,7 @@
      352
     ],
     "chunk_eqns_sha": "31fef2986d571cf9",
-    "chunk_tokens_sha": "be4e4685b9ba0f4e",
+    "chunk_tokens_sha": "2ac04d14e1517043",
     "comp_valid": [
      [
       0,
@@ -820,8 +820,8 @@
       7
      ]
     ],
-    "entropy": "41212643",
-    "logp": "c10f95f0",
+    "entropy": "4121dcc4",
+    "logp": "c1132968",
     "n_live": 2,
     "pair_valid": [
      [
@@ -1077,9 +1077,9 @@
    "step": 3,
    "target_vertex": 5,
    "value": [
-    "3d8d0eec",
-    "be6300e2",
-    "3da5ee79"
+    "3d8e441e",
+    "be5cd0bd",
+    "3de0823f"
    ],
    "vertex": 4,
    "vertex_mask_fill": [
@@ -1089,15 +1089,15 @@
    "vertex_probs_live": [
     [
      1,
-     "3ea298b4"
+     "3ea1d493"
     ],
     [
      3,
-     "3eab356b"
+     "3eaf7260"
     ],
     [
      4,
-     "3eb231e0"
+     "3eaeb90e"
     ]
    ]
   },
@@ -1116,10 +1116,10 @@
    ],
    "face": {
     "chunk_counts": [
-     690
+     779
     ],
-    "chunk_eqns_sha": "f4a148ac87ae3445",
-    "chunk_tokens_sha": "5c0b50ac6a163cdf",
+    "chunk_eqns_sha": "b8c1644acebbe1a5",
+    "chunk_tokens_sha": "01e5c0c5a92f1722",
     "comp_valid": [
      [
       0,
@@ -1134,8 +1134,8 @@
       7
      ]
     ],
-    "entropy": "3f20ecab",
-    "logp": "bf90eb8c",
+    "entropy": "3f19a80d",
+    "logp": "bf9f65dc",
     "n_live": 1,
     "pair_valid": [
      [
@@ -1280,9 +1280,9 @@
    "step": 4,
    "target_vertex": 4,
    "value": [
-    "3da0c58a",
-    "be662f6e",
-    "3d6d9b67"
+    "3da1f40f",
+    "be635ca7",
+    "3d8f3f16"
    ],
    "vertex": 3,
    "vertex_mask_fill": [
@@ -1292,11 +1292,11 @@
    "vertex_probs_live": [
     [
      1,
-     "3efa54d6"
+     "3ef5f75b"
     ],
     [
      3,
-     "3f02d595"
+     "3f050453"
     ]
    ]
   }

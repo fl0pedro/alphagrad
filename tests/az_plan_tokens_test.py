@@ -117,7 +117,7 @@ def test_golden_stream_equivalence(setup):
             if not legal:
                 break
             v = int(legal[rng.integers(len(legal))])
-            t, i = pt.eliminate(v, is_last=(len(legal) == 1))
+            t, i = pt.eliminate(v)
             stream += t
             seg += i
             order.append(v)
@@ -133,7 +133,7 @@ def test_golden_stream_equivalence(setup):
     cfg.jaxpr = jaxpr
     cfg.argnums = tuple(argnums)
     ref, ref_ids, _ft, _ls = _incremental_stream_tokens(
-        cfg, consts, xs, order, specs.tolist(), {}, honor_last_compress=True)
+        cfg, consts, xs, order, specs.tolist(), {})
 
     assert list(ref) == stream, (
         f"streamed {len(stream)} tokens vs env {len(ref)}")

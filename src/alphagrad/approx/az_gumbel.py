@@ -895,27 +895,16 @@ def _step(node, vertex, face_rows=None, face_skips=None, face_keys=None):
         face_rows, np.int32)
     face_skips = EXACT_FACE_SKIPS if face_skips is None else np.asarray(
         face_skips, np.int32)
-    # is_last mirrors the MEASUREMENT's decode exactly (`_callback` uses
-    # is_last=(v_idx == last_v_idx) over the FULL order, and
-    # `_face_dict_for_vertex`/`_face_transforms_for_order` the same): COMPRESS
-    # is honored only on the genuinely TERMINAL vertex.
-    #
-    # Honoring it mid-plan is what makes the append-only stream
-    # non-prefix-stable -- env's documented COMPRESS prefix-property
-    # violation, which PPO mitigates with ALPHAGRAD_TOKENS_MID_COMPRESS=0.
-    # Here a block is emitted ONCE and never rewritten, so it has to carry
-    # the terminal decode from the start or the stream and the measurement
-    # describe different graphs.
-    #
-    # "Terminal" is DETECTED, not counted: eliminating a vertex can make
-    # OTHER vertices non-eliminable (nn256: NV=27 valid vertices but 24
-    # decisions), so `len(state) == NV - 1` is simply wrong. The last
-    # decision is the one taken when exactly one vertex is still legal; the
-    # caller asserts the prediction against the graph afterwards, and only a
-    # COMPRESS row makes a misprediction observable at all.
-    is_last = (len(PT.legal(VALID)) == 1)
+    # A block is emitted ONCE here and never rewritten, which is only
+    # coherent because the decode is POSITION-INDEPENDENT: COMPRESS is honored
+    # at every vertex, so the block a step emits is the block the terminal
+    # measurement will decode. (This used to need an `is_last` prediction —
+    # "terminal" DETECTED as `len(PT.legal(VALID)) == 1`, because eliminating
+    # a vertex can make OTHER vertices non-eliminable — plus a guard asserting
+    # the prediction against the graph afterwards. Both are gone with the
+    # gate.)
     toks, ids = PT.eliminate(vertex, spec_row, face_rows, face_skips,
-                             is_last=is_last, face_keys=face_keys)
+                             face_keys=face_keys)
     dt, de, dc = _wire_delta(toks, ids)
     enc2, vs2, vc2 = _carry_advance(
         agent, carry.enc, carry.vs, carry.vc,
@@ -925,7 +914,7 @@ def _step(node, vertex, face_rows=None, face_skips=None, face_keys=None):
     return (st2, Carry(enc2, vs2, vc2),
             {"tokens": toks, "eqn_ids": ids, "delta": (dt, de, dc),
              "owner": a, "spec_row": spec_row, "face_rows": face_rows,
-             "face_skips": face_skips, "is_last": is_last})
+             "face_skips": face_skips})
 
 
 _OP_NAME = {int(_OP_END): "none", int(_OP_DIAG): "diag",
@@ -1042,25 +1031,15 @@ def _assert_face_accounting(f_cnt, f_valid, d, n_faces, vertex, tk_faces):
 
 
 def _assert_terminal_prediction(d):
-    """The `is_last` prediction of the step just COMMITTED, against the graph.
+    """No-op kept as a named seam.
 
-    A misprediction only changes bytes when the step carried a COMPRESS row
-    (that is the sole `is_last` sensitivity of `decode_vertex_rule_specs`), so
-    the guard fires exactly when it matters instead of on every long tail.
+    It used to check the `is_last` prediction of the step just COMMITTED
+    against the graph, because mispredicting terminality changed the emitted
+    bytes whenever the step carried a COMPRESS row. `decode_vertex_rule_specs`
+    has no position sensitivity any more, so there is no prediction to be
+    wrong about.
     """
-    from alphagrad.approx.env import COMPRESS_SENTINEL
-    if d["is_last"] or PT.legal(VALID):
-        return
-    has_compress = (
-        bool(np.any(np.asarray(d["spec_row"])[..., 0] == COMPRESS_SENTINEL))
-        or bool(np.any(np.asarray(d["face_rows"])[..., 0] == COMPRESS_SENTINEL)))
-    if has_compress:
-        raise AssertionError(
-            "the terminal decision was not predicted as terminal AND carried "
-            "a COMPRESS row: its block was tokenized with is_last=False while "
-            "the measurement will decode it with is_last=True, so the "
-            "observation and the measured graph diverge. (Elimination made "
-            "the remaining legal vertices vanish at the same step.)")
+    return
 
 
 def _eval_node(state, carry):
@@ -1126,7 +1105,7 @@ def _golden_equivalence(state, stream, seg_ids, ep):
     tok_rules_by_v = {}
     for k in range(n):
         rules = decode_vertex_rule_specs(
-            jaxpr, int(order[k]), specs[k].tolist(), is_last=(k == n - 1))
+            jaxpr, int(order[k]), specs[k].tolist())
         if rules:
             tok_rules_by_v[int(order[k])] = (
                 make_live_masked_hook(tuple(rules)),)
@@ -1135,14 +1114,14 @@ def _golden_equivalence(state, stream, seg_ids, ep):
         specs.tolist(), tok_rules_by_v,
         face_rows_list=face_rows.tolist(),
         face_skips_list=face_skips.tolist(),
-        honor_last_compress=True,
         # MUST be the env's own builder, not a hand-rolled tuple: the
         # ancestor-cut branch in _incremental_stream_tokens does
         # np.frombuffer(face_key[-1][0]) and needs the int32-BYTES form
         # _face_wire_keys emits. The dense-tuple form only survived because
-        # that branch is skipped whenever the last vertex carries a COMPRESS
-        # row -- which is every approximation episode and NO exact one, so
-        # --no-approx-head crashed here on its first golden check.
+        # that branch used to be skipped whenever the last vertex carried a
+        # COMPRESS row -- which is every approximation episode and NO exact
+        # one, so --no-approx-head crashed here on its first golden check.
+        # That skip is gone, so the branch is now always live.
         face_key=_face_wire_keys(face_rows, face_skips, n),
     )
     ok_t = list(ref) == list(stream)
@@ -1858,8 +1837,7 @@ def _run(args) -> int:
                     # SCALE; drawing an untrained face plan would only add
                     # variance to the (mu, sigma) it seeds.
                     PT.eliminate(_wv, EXACT_SPEC_ROW, EXACT_FACE_ROWS,
-                                 EXACT_FACE_SKIPS,
-                                 is_last=(len(_wlegal) == 1))
+                                 EXACT_FACE_SKIPS)
                     _wst.append((_wa, EXACT_FACE_ROWS, EXACT_FACE_SKIPS))
             _wraw = measure(_wst)
             if _wraw is None:

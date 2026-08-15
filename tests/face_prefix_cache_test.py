@@ -9,13 +9,14 @@ Covers the two O(T^2) -> O(T) host-overhead fixes:
   * `_incremental_stream_tokens` ancestor extension under FACE actions
     (per-step `face_key` signatures instead of one whole-prefix blob).
 
-Soundness bound (measured in stream_prefix_property_test.py): only the
-CURRENT LAST vertex's decode is is_last-sensitive — COMPRESS is emitted only
-when `is_last=True`. The rule both caches implement: a COMPRESS-last state is
-SERVED (cold, without consuming its parent) but never STORED, so every stored
-state is is_last-insensitive by induction and extension from any stored
-parent is sound. One COMPRESS decision costs one cold replay, not a dead
-cache for the rest of the episode (the v40 failure mode: ext=1/431).
+Soundness (asserted in stream_prefix_property_test.py): the decode has NO
+position sensitivity, so the stream for a prefix is a byte-prefix of the
+stream for any extension for every rule kind. Both caches therefore store
+every state and extend from every parent — there is no COMPRESS carve-out any
+more. There used to be one, because `decode_vertex_rule_specs` emitted
+COMPRESS only when `is_last=True`; the tests below pin that COMPRESS is now
+ordinary, in the per-vertex specs AND in the face rows (the v40 failure mode
+it caused: ext=1/431).
 
 Every test asserts the ENGAGEMENT COUNTERS too — an equality proof over a
 fast path that never ran is vacuous.
@@ -109,10 +110,8 @@ def _ft_sig(ft):
 
 def _tok_rules(cfg, o_list, specs_list):
     d = {}
-    last = len(o_list) - 1
     for i, v in enumerate(o_list):
-        rules = decode_vertex_rule_specs(
-            cfg.jaxpr, int(v), specs_list[i], is_last=(i == last))
+        rules = decode_vertex_rule_specs(cfg.jaxpr, int(v), specs_list[i])
         if rules:
             d[int(v)] = (make_live_masked_hook(tuple(rules)),)
     return d
@@ -133,9 +132,9 @@ def _check_last_start(prev_out, stream, last_start):
     measurement builds -- and with face wires in play (which is what this
     module drives) the block is where every approximation echo lives.
 
-    Only asserted where the prefix property actually holds: a COMPRESS-last
-    state is is_last-SENSITIVE and its predecessor is deliberately not a
-    byte-prefix of it (see `_incremental_stream_tokens`).
+    The prefix property holds unconditionally now, so this is asserted for
+    every step (the guard below is kept because the very first prefix has no
+    predecessor to compare against).
     """
     assert 0 <= last_start <= len(stream)
     if not prev_out:
@@ -156,6 +155,16 @@ def _reset(d):
 
 def _ft_pass(cfg, consts, args, order, specs, faces, skips, cached):
     os.environ["ALPHAGRAD_FACE_ENUM_CACHE"] = "1" if cached else "0"
+    # This file is about the BRANCHING-search prefix cache. The default path
+    # is now the live elimination state (face_live_state_test.py), which would
+    # otherwise serve every call here and leave the cache counters at 0.
+    # getattr/delattr rather than a bare read: `_FACE_LIVE_STATE` is an
+    # IN-FLIGHT symbol (the live-elimination-state rework) that env.py does not
+    # define yet, and a bare read makes every test in this file error out on a
+    # tree that does not have it. Once it lands this is exactly the same
+    # save/restore.
+    _live = getattr(E, "_FACE_LIVE_STATE", None)
+    E._FACE_LIVE_STATE = False
     try:
         E._FACE_ENUM_CACHE.clear()
         _reset(E._FACE_ENUM_STATS)
@@ -167,6 +176,10 @@ def _ft_pass(cfg, consts, args, order, specs, faces, skips, cached):
                 [np.asarray(s).tolist() for s in skips[:t]]))
         return out, dict(E._FACE_ENUM_STATS)
     finally:
+        if _live is None:
+            delattr(E, "_FACE_LIVE_STATE")
+        else:
+            E._FACE_LIVE_STATE = _live
         os.environ["ALPHAGRAD_FACE_ENUM_CACHE"] = "0"
 
 
@@ -195,10 +208,16 @@ def test_face_enum_cache_equals_cold_and_engages():
     for t, (a, b) in enumerate(zip(on, off), start=1):
         assert _ft_sig(a) == _ft_sig(b), f"face enum diverged at step {t}"
     # engagement: every step after the first must EXTEND, not rebuild
-    assert stats_on == {"ext": T - 1, "cold": 1}, stats_on
+    assert {k: stats_on[k] for k in ("ext", "cold")} == {
+        "ext": T - 1, "cold": 1}, stats_on
 
 
-def test_face_enum_cache_compress_last_served_cold_chain_survives():
+def test_face_enum_cache_compress_is_not_special():
+    """A COMPRESS in the per-vertex specs costs the cache NOTHING.
+
+    It used to cost one cold replay per COMPRESS decision (and, before the
+    refined bound, the rest of the episode).
+    """
     T = len(_episode()[3])
     c = T // 2
     ep = _episode(compress_at=c)
@@ -206,10 +225,8 @@ def test_face_enum_cache_compress_last_served_cold_chain_survives():
     off, _ = _ft_pass(*ep, cached=False)
     for t, (a, b) in enumerate(zip(on, off), start=1):
         assert _ft_sig(a) == _ft_sig(b), f"face enum diverged at step {t}"
-    # step c+1 (COMPRESS-last) is served cold with NO cache interaction; its
-    # parent survives, so step c+2 extends from cut=c across two vertices —
-    # the chain loses exactly one extension, not the rest of the episode.
-    assert stats_on == {"ext": T - 2, "cold": 1}, stats_on
+    assert {k: stats_on[k] for k in ("ext", "cold")} == {
+        "ext": T - 1, "cold": 1}, stats_on
 
 
 def test_stream_extension_under_faces_equals_cold_and_engages():
@@ -228,7 +245,10 @@ def test_stream_extension_under_faces_equals_cold_and_engages():
         stats_ch)
 
 
-def test_stream_compress_last_served_cold_not_stored_chain_survives():
+def test_stream_compress_in_specs_extends_like_any_other_rule():
+    """A COMPRESS in the per-vertex specs neither breaks the chain nor blocks
+    storage: one cold replay for the whole episode, T-1 extensions, and the
+    chained streams are byte-identical to the cold ones."""
     T = len(_episode()[3])
     c = T // 2
     ep = _episode(compress_at=c)
@@ -240,10 +260,7 @@ def test_stream_compress_last_served_cold_not_stored_chain_survives():
                            fts, chained=False)
     for t, (a, b) in enumerate(zip(chained, cold), start=1):
         assert a[0] == b[0] and a[1] == b[1], f"diverged at step {t}"
-    # t=1 cold(store); t=c+1 COMPRESS-last: cold + nostore, parent kept;
-    # t=c+2 extends from cut=c (re-eliminating vertex c with is_last=False,
-    # which drops the COMPRESS — the exact divergence the rule guards).
-    assert stats_ch == {"hit": 0, "ext": T - 2, "cold": 2, "nostore": 1}, (
+    assert stats_ch == {"hit": 0, "ext": T - 1, "cold": 1, "nostore": 0}, (
         stats_ch)
 
 
@@ -258,9 +275,8 @@ def test_stream_face_row_compress_same_rule():
                            fts, chained=False)
     for t, (a, b) in enumerate(zip(chained, cold), start=1):
         assert a[0] == b[0] and a[1] == b[1], f"diverged at step {t}"
-    # a COMPRESS inside a FACE row has the same is_last sensitivity: t=1 is
-    # cold+nostore, t=2 cold (nothing stored yet), t>=3 extend.
-    assert stats_ch == {"hit": 0, "ext": T - 2, "cold": 2, "nostore": 1}, (
+    # a COMPRESS inside a FACE row is equally ordinary now.
+    assert stats_ch == {"hit": 0, "ext": T - 1, "cold": 1, "nostore": 0}, (
         stats_ch)
 
 
@@ -278,80 +294,22 @@ def test_stream_empty_prefix_init_call_does_not_crash():
     assert E._INCR_STREAM_STATS["cold"] == 1
 
 
-def _tok_rules_mid(cfg, o_list, specs_list, honor):
-    """Tokenizer rules as the callback builds them under
-    ALPHAGRAD_TOKENS_MID_COMPRESS=0: the intermediate last vertex decodes
-    with is_last=False; `honor` is True only on the terminal step."""
-    d = {}
-    last = len(o_list) - 1
-    for i, v in enumerate(o_list):
-        rules = decode_vertex_rule_specs(
-            cfg.jaxpr, int(v), specs_list[i],
-            is_last=(i == last and honor))
-        if rules:
-            d[int(v)] = (make_live_masked_hook(tuple(rules)),)
-    return d
-
-
-def test_stream_mid_compress_off_extends_through_compress_and_terminal():
-    """Flag=0 world: every intermediate COMPRESS-last state is storable, the
-    chain never dies, and the TERMINAL call (honor=True) soundly extends the
-    honor=False chain - its final elimination is the only difference."""
-    T = len(_episode()[3])
-    ep = _episode(compress_at=T // 2, seed=3)
-    cfg, consts, args, order, specs, faces, skips = ep
-    fts = [
-        E._face_transforms_for_order(
-            cfg, consts, args, order[:t], specs[:t],
-            [np.asarray(f).tolist() for f in faces[:t]],
-            [np.asarray(s).tolist() for s in skips[:t]],
-            honor_last_compress=(t == T))
-        for t in range(1, T + 1)
-    ]
-
-    def _pass(chained):
-        E._INCR_STREAM_CACHE.clear()
-        _reset(E._INCR_STREAM_STATS)
-        out = []
-        for t in range(1, T + 1):
-            if not chained:
-                E._INCR_STREAM_CACHE.clear()
-            honor = (t == T)
-            stream, seg, _ft, ls = E._incremental_stream_tokens(
-                cfg, consts, args, order[:t], specs[:t],
-                _tok_rules_mid(cfg, order[:t], specs[:t], honor),
-                ft_by_vertex=fts[t - 1], face_key=_fk(faces, skips, t),
-                honor_last_compress=honor)
-            _check_last_start(out, stream, ls)
-            out.append((list(stream), list(seg)))
-        return out, dict(E._INCR_STREAM_STATS)
-
-    chained, stats_ch = _pass(chained=True)
-    cold, _ = _pass(chained=False)
-    for t, (a, b) in enumerate(zip(chained, cold), start=1):
-        assert a[0] == b[0] and a[1] == b[1], f"diverged at step {t}"
-    # every step after the first extends - the COMPRESS-at-mid step included
-    assert stats_ch["ext"] == T - 1 and stats_ch["cold"] == 1, stats_ch
-
-
-def test_stream_mid_compress_off_terminal_compress_not_stored():
-    """Terminal step with a COMPRESS-carrying FINAL vertex: is_last-sensitive
-    again (honor=True), so it takes the one honest cold replay of the
-    episode, leaves its parent untouched, and is never stored."""
+def test_stream_terminal_compress_extends_and_stores():
+    """A COMPRESS on the FINAL vertex used to be the one is_last-sensitive
+    state: served cold, never stored. It is ordinary now -- one cold replay
+    at t=1 and an extension at every step including the terminal one."""
     T = len(_episode()[3])
     ep = _episode(compress_at=T - 1, seed=4)
     cfg, consts, args, order, specs, faces, skips = ep
     E._INCR_STREAM_CACHE.clear()
     _reset(E._INCR_STREAM_STATS)
     for t in range(1, T + 1):
-        honor = (t == T)
         E._incremental_stream_tokens(
             cfg, consts, args, order[:t], specs[:t],
-            _tok_rules_mid(cfg, order[:t], specs[:t], honor),
-            ft_by_vertex=None, face_key=None, honor_last_compress=honor)
-    # t=1 cold, t=2..T-1 extend, t=T cold + nostore (parent preserved)
+            _tok_rules(cfg, order[:t], specs[:t]),
+            ft_by_vertex=None, face_key=None)
     assert E._INCR_STREAM_STATS == {
-        "hit": 0, "ext": T - 2, "cold": 2, "nostore": 1}, E._INCR_STREAM_STATS
+        "hit": 0, "ext": T - 1, "cold": 1, "nostore": 0}, E._INCR_STREAM_STATS
 
 
 def test_unified_face_enum_equals_standalone_and_skips_second_replay():
@@ -384,4 +342,5 @@ def test_unified_face_enum_equals_standalone_and_skips_second_replay():
         assert uni_streams[t] == legacy[t], f"stream diverged at t={t + 1}"
         assert _ft_sig(uni_fts[t]) == _ft_sig(fts[t]), f"ft diverged t={t + 1}"
     assert stats_uni["ext"] == T - 1, stats_uni
-    assert E._FACE_ENUM_STATS == {"ext": 0, "cold": 0}, E._FACE_ENUM_STATS
+    assert {k: E._FACE_ENUM_STATS[k] for k in ("ext", "cold")} == {
+        "ext": 0, "cold": 0}, E._FACE_ENUM_STATS

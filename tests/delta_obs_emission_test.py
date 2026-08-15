@@ -108,7 +108,8 @@ _VOCAB = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "512"))
 
 def _cold_stream(prefix, specs_np, vocab=_VOCAB):
     """Reference replay: tokenize exactly `prefix` with the same rule decode
-    `_callback` uses, so `is_last` lands on the same vertex."""
+    `_callback` uses (position-independent, so a prefix vertex and the newest
+    vertex decode identically)."""
     from graphax import IncrementalPathTokenizer
     from alphagrad.approx.env import decode_vertex_rule_specs
 
@@ -116,10 +117,9 @@ def _cold_stream(prefix, specs_np, vocab=_VOCAB):
         _CJ.jaxpr, (0, 1), list(_CONSTS), list(ARGS), vocab_size=vocab)
     stream = [int(t) for t in tk.base_tokens()]
     seg = [int(g) for g in tk.last_eqn_ids()]
-    last = len(prefix) - 1
-    for k, v in enumerate(prefix):
+    for v in prefix:
         rules = decode_vertex_rule_specs(
-            _CJ.jaxpr, int(v), specs_np[int(v) - 1], is_last=(k == last))
+            _CJ.jaxpr, int(v), specs_np[int(v) - 1])
         stream += [int(t) for t in tk.eliminate(int(v), tuple(rules))]
         seg += [int(g) for g in tk.last_eqn_ids()]
     return stream, seg
@@ -135,8 +135,6 @@ def test_base_plus_deltas_reconstructs_the_stream(diag):
     dropped. ``diag=True`` on this graph produces a 1346-token block against
     the default 1024 budget, so the clipping branch is genuinely exercised.
     """
-    if os.environ.get("ALPHAGRAD_TOKENS_MID_COMPRESS", "1") == "0":
-        pytest.skip("mid-compress decode changes is_last semantics")
     specs = _specs(diag)
     specs_np = np.asarray(specs)
     cfg = _cfg(True)
@@ -152,8 +150,7 @@ def test_base_plus_deltas_reconstructs_the_stream(diag):
 
     exp_t, exp_e = list(prev_t), list(prev_e)
     clipped = 0
-    # NON-TERMINAL steps only: the terminal step would run the measurement,
-    # and its is_last decode is the one the prefix property does not cover.
+    # NON-TERMINAL steps only: the terminal step would run the measurement.
     for k in range(1, _V):
         cur_t, cur_e = _cold_stream(list(range(1, k + 1)), specs_np)
         assert cur_t[:len(prev_t)] == prev_t, (

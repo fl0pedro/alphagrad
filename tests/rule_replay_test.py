@@ -2,8 +2,9 @@
 
 ``decode_vertex_rule_specs`` is the single wire→transform translation shared by
 the measurement (``_callback``) and the mask-oracle bridge (``ppo.py``). These
-pin (a) faithful decoding of each row type incl. the is_last COMPRESS gate and
-the -1 (joint gcd) factor sentinel, and (b) that advancing the oracle WITH the
+pin (a) faithful decoding of each row type -- including a COMPRESS that is
+honored at EVERY position of the plan, no longer only on the terminal vertex --
+and the -1 (joint gcd) factor sentinel, and (b) that advancing the oracle WITH the
 applied Diag yields different downstream masks than the old structural
 (rules=()) replay — the desync the fix removes.
 """
@@ -39,25 +40,89 @@ def test_decode_diag_quant_and_gcd_sentinel():
     cj = _mk(fn, (jnp.ones((4, 6)), jnp.ones((6, 4))))
     # DIAG bi1=0 (out axis 0, size 4), bi2=1 (primal axis 1: 6 / 4), factor -1
     # -> joint gcd(4, 6, 4) = 2
-    rules = decode_vertex_rule_specs(cj.jaxpr, 1, _rows([0, 1, -1]), is_last=True)
+    rules = decode_vertex_rule_specs(cj.jaxpr, 1, _rows([0, 1, -1]))
     assert len(rules) == 1 and isinstance(rules[0], Diag)
     assert rules[0].factor == 2, f"joint gcd expected 2, got {rules[0].factor}"
     # QUANT row decodes regardless of position
     rules = decode_vertex_rule_specs(
-        cj.jaxpr, 1, _rows([QUANT_SENTINEL, 0, 0]), is_last=False)
+        cj.jaxpr, 1, _rows([QUANT_SENTINEL, 0, 0]))
     assert len(rules) == 1 and isinstance(rules[0], Quant)
     # factor 1 no-op and non-dividing factors are dropped
-    assert decode_vertex_rule_specs(cj.jaxpr, 1, _rows([0, 1, 1]), is_last=True) == ()
-    assert decode_vertex_rule_specs(cj.jaxpr, 1, _rows([0, 1, 5]), is_last=True) == ()
+    assert decode_vertex_rule_specs(cj.jaxpr, 1, _rows([0, 1, 1])) == ()
+    assert decode_vertex_rule_specs(cj.jaxpr, 1, _rows([0, 1, 5])) == ()
 
 
-def test_compress_honored_only_on_last_vertex():
+def test_compress_honored_at_every_position():
+    """COMPRESS decodes for any vertex, not only the terminal one.
+
+    The removed `is_last` gate returned () for every non-final vertex, which
+    silently discarded the action: the terminal measurement came back
+    bit-identical to exact AD while the policy had been credited with an
+    approximation.
+    """
     fn = lambda x, y: jnp.tanh(x @ y)
     cj = _mk(fn, (jnp.ones((4, 6)), jnp.ones((6, 4))))
     row = _rows([COMPRESS_SENTINEL, 0, 0])
-    assert decode_vertex_rule_specs(cj.jaxpr, 1, row, is_last=False) == ()
-    got = decode_vertex_rule_specs(cj.jaxpr, 1, row, is_last=True)
+    got = decode_vertex_rule_specs(cj.jaxpr, 1, row)
     assert len(got) == 1 and isinstance(got[0], Compress)
+
+
+def test_mid_plan_compress_reaches_the_measured_jacobian():
+    """A COMPRESS on a NON-final vertex must survive into the measurement.
+
+    Numeric, not structural: eliminate a COMPLETE order with one COMPRESS
+    planted at each position in turn and compare against exact AD. Every
+    position must (a) not raise -- graphax's nominal-shape asserts are
+    exact-AD-only and apply_compress drops the axis POINTER, not the logical
+    size -- and (b) at least one NON-FINAL position must actually move the
+    Jacobian, which is precisely what the old gate suppressed.
+    """
+    from graphax import jacve
+    from graphax.core import _build_graph
+    from alphagrad.approx.common.masks import make_live_masked_hook
+    from alphagrad.approx.common.examples import get_args, get_fn
+
+    # A REAL target (the small 4-8-4 MLP), not the 2-op toy above: on the toy
+    # every axis-0 COMPRESS happens to land on an edge that is already uniform
+    # along that axis, so the reduction is the identity and the test could not
+    # tell a working COMPRESS from a dropped one.
+    fn = get_fn("NeuralNetwork")
+    args = get_args("NeuralNetwork", jax.random.PRNGKey(0))
+    argnums = tuple(range(len(args)))
+    cj = jax.make_jaxpr(fn)(*args)
+    _, _, _, vo = _build_graph(cj.jaxpr, args, list(cj.literals), argnums)
+    valid = [i for i, eqn in enumerate(cj.jaxpr.eqns, 1)
+             if eqn.outvars[0] not in cj.jaxpr.outvars or i in vo]
+    order = list(reversed(valid))
+
+    def _flat(t):
+        return np.concatenate(
+            [np.asarray(x, np.float64).ravel()
+             for x in jax.tree_util.tree_leaves(t)])
+
+    ref = _flat(jax.jit(jacve(fn, order, argnums=argnums))(*args))
+    tried = moved = 0
+    for v in order[:-1]:                          # NON-final positions only
+        rules = ()
+        for axis in range(4):
+            rules = decode_vertex_rule_specs(
+                cj.jaxpr, int(v), _rows([COMPRESS_SENTINEL, axis, 0]))
+            if rules:
+                break
+        if not rules:
+            continue
+        tried += 1
+        out = _flat(jax.jit(jacve(                # must not raise
+            fn, order, argnums=argnums,
+            transforms=[(int(v),
+                         (make_live_masked_hook(tuple(rules)),))]))(*args))
+        cos = float(out @ ref / (np.linalg.norm(out) * np.linalg.norm(ref)))
+        if cos < 0.999:
+            moved += 1
+    assert tried > 5, f"only {tried} non-final vertices took a COMPRESS at all"
+    assert moved > 0, (
+        "no NON-FINAL COMPRESS changed the measured Jacobian -- the position "
+        "gate is back, or the rules are being dropped somewhere downstream")
 
 
 def test_rules_replay_diverges_from_structural_replay():
@@ -102,7 +167,7 @@ def test_rules_replay_diverges_from_structural_replay():
                     i, j = diag_row_to_pair(cj.jaxpr, v, bi1, bi2)
                     if i != j and pair[i, j]:
                         rules = decode_vertex_rule_specs(
-                            cj.jaxpr, v, _rows([bi1, bi2, -1]), is_last=False)
+                            cj.jaxpr, v, _rows([bi1, bi2, -1]))
                         if rules and isinstance(rules[0], Diag):
                             found = (v, rules)
                             break

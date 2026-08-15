@@ -90,11 +90,8 @@ def _exact_skips(T):
 def _ref_face0(cfg, consts, args, order, specs, faces, skips, n, v_cur):
     """Face 0 of ``v_cur`` on the prefix graph THE MEASUREMENT BUILDS.
 
-    ``honor_last_compress=False`` puts every prefix vertex on ``is_last=False``
-    -- the decode the terminal measurement gives a vertex that is not the last
-    of the order, and the one ``_tokenizer_at`` replays with. The searched
-    decisions below are DIAG, for which ``is_last`` is irrelevant, so nothing
-    here depends on that choice.
+    The decode is position-independent, so this replay, ``_tokenizer_at``'s
+    and the terminal measurement's all give a vertex the same rules.
     """
     ft_ref = E._face_transforms_for_order(
         cfg, consts, args,
@@ -102,7 +99,6 @@ def _ref_face0(cfg, consts, args, order, specs, faces, skips, n, v_cur):
         [np.asarray(specs[k]).tolist() for k in range(n)],
         [np.asarray(faces[k]).tolist() for k in range(n)],
         [np.asarray(skips[k]).tolist() for k in range(n)],
-        honor_last_compress=False,
     )
     ref = IncrementalPathTokenizer(cfg.jaxpr, ARGNUMS, list(consts),
                                    list(args), vocab_size=VOCAB)

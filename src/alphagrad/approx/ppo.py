@@ -4710,7 +4710,7 @@ def main():
             v = int(eo[k])  # env order is 1-based already
             try:
                 rules = _decode_specs(
-                    _oracle_jaxpr, v, specs[k], is_last=(k == n - 1)
+                    _oracle_jaxpr, v, specs[k]
                 )
             except Exception:
                 rules = ()
@@ -4766,7 +4766,7 @@ def main():
             v = int(eo[k])
             try:
                 rules = _decode_specs(
-                    _oracle_jaxpr, v, specs[k], is_last=(k == n - 1)
+                    _oracle_jaxpr, v, specs[k]
                 )
             except Exception:
                 rules = ()
@@ -4819,7 +4819,7 @@ def main():
             v = int(eo[k])
             try:
                 rules = _decode_specs(
-                    _oracle_jaxpr, v, specs[k], is_last=(k == n - 1)
+                    _oracle_jaxpr, v, specs[k]
                 )
             except Exception:
                 rules = ()
@@ -7934,10 +7934,15 @@ def main():
                         _cache_line = (
                             f"  stream(hit/ext/cold/nostore)={_ss['hit']}/"
                             f"{_ss['ext']}/{_ss['cold']}/{_ss['nostore']}"
-                            f"  face_enum(ext/cold)={_fs['ext']}/"
-                            f"{_fs['cold']}")
+                            f"  face_enum(ext/cold/compress)="
+                            f"{_fs['ext']}/{_fs['cold']}/"
+                            f"{_fs['compress']}"
+                            f"  face_enum(calls/elims/build)="
+                            f"{_fs['calls']}/{_fs['elims']}/"
+                            f"{_fs['build']}")
                         _ss.update(hit=0, ext=0, cold=0, nostore=0)
-                        _fs.update(ext=0, cold=0)
+                        _fs.update(ext=0, cold=0, compress=0, elims=0,
+                                   calls=0, build=0)
                     except Exception:
                         _cache_line = ""
                     tqdm.write(
