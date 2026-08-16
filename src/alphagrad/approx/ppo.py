@@ -5150,9 +5150,22 @@ def main():
         )
 
     # Optimiser: single cosine decay across the whole run.
+    #
+    # CLAMPED TO >= 1. The product is zero whenever any factor is zero, and
+    # optax then raises "cosine_decay_schedule requires positive decay_steps"
+    # from deep inside the optimiser build -- an opaque failure a long way
+    # from the flag that caused it. --ppo-epochs 0 is a LEGITIMATE mode: it
+    # runs the rollout and skips the update entirely, which is how the
+    # rollout's memory footprint is isolated from the loss forward and
+    # backward (they share one XLA program and no flag separates them).
+    # A run that takes zero optimiser steps never evaluates the schedule, so
+    # the clamped value is unobservable -- it exists only to keep the
+    # construction total.
+    _decay_steps = max(
+        1, int(args.episodes) * int(args.ppo_epochs) * int(args.minibatches))
     schedule = optax.cosine_decay_schedule(
         args.lr,
-        args.episodes * args.ppo_epochs * args.minibatches,
+        _decay_steps,
         args.lr_decay_min_mult,
     )
     optimizer = optax.chain(
