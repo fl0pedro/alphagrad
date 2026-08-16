@@ -2732,7 +2732,14 @@ def make_argparser() -> argparse.ArgumentParser:
              "palimpsa gradient from ONE delta and none from the elimination "
              "history. K>1 anchors the replay K-1 steps earlier and folds "
              "the intervening deltas in with gradient, at K times the stored "
-             "delta buffers and K times the loss-side extend.")
+             "delta buffers and K times the loss-side extend. "
+             "K=0 selects the FULL-HORIZON path instead of a window: one "
+             "`lax.scan` over the WHOLE episode from the base carry, so the "
+             "gradient horizon is T rather than K, the per-step anchors and "
+             "the (T, K) delta gather are dead, and the compile stops "
+             "scaling with K (one scan body, not K unrolled ones). The "
+             "minibatch axis moves from steps to SEQUENCES, because a scan "
+             "needs a trajectory's steps in order.")
     p.add_argument("--no-jit", action="store_true")
     p.add_argument(
         "--exec-on-gpu",
@@ -5086,6 +5093,21 @@ def main():
             "and no learning happens. Lower --minibatches or raise "
             "--num-envs."
         )
+    # FULL-HORIZON SCAN (--grad-window 0) minibatches over SEQUENCES, not
+    # steps: a scan needs a trajectory's steps in order, so the unit of a
+    # minibatch is a whole env. `shuffle_and_batch_by_trajectory` floor-divides
+    # num_envs by minibatches and returns EMPTY minibatches (NaN loss, silent
+    # no-op training) when that is 0, which is the same trap the check above
+    # catches for the per-step path -- so clamp loudly instead.
+    if int(getattr(args, "grad_window", 1)) == 0 and args.minibatches > num_envs:
+        print(
+            f"[grad-window 0] --minibatches={args.minibatches} > "
+            f"--num-envs={num_envs}: the full-horizon path batches whole "
+            f"TRAJECTORIES, so minibatches is clamped to {num_envs}. "
+            "Updates per epoch are the minibatch count, i.e. this run does "
+            f"{num_envs} instead of {args.minibatches}."
+        )
+        args.minibatches = int(num_envs)
     nonzero_w = ", ".join(
         f"{REWARD_NAMES[i]}={float(reward_weights_np[i]):+.3g}"
         for i in range(NUM_REWARDS)
@@ -5633,6 +5655,21 @@ def main():
             (lambda p: p) if args.preference_conditioned else (lambda _: None)
         )
 
+        # --grad-window 0: THE FULL-HORIZON PATH. The minibatch arrives as
+        # whole TRAJECTORIES, `(envs_per_mb, T, ...)`, because a scan needs a
+        # trajectory's steps in order. Everything downstream of the carry --
+        # the action evaluation, the ratio, the advantage, every mean -- is
+        # written against a batch that is FLAT in samples, so flatten (env,
+        # step) here and keep the sequence-shaped view for the scan alone.
+        # Row-major `reshape(-1)` maps (e, t) -> e*T + t, which is exactly the
+        # order `jax.vmap(scan)` produces its outputs in, so the two sides
+        # line up without an index.
+        _FULL_SCAN = int(getattr(args, "grad_window", 1)) == 0
+        _ep_batch = batch if _FULL_SCAN else None
+        if _FULL_SCAN:
+            batch = jax.tree_util.tree_map(
+                lambda x: x.reshape(-1, *x.shape[2:]), batch)
+
         keys = jrand.split(key, batch.vertex_idx.shape[0])
 
         actions = MicroAction(
@@ -5740,11 +5777,18 @@ def main():
         # minibatch shares it, and a closed-over UNBATCHED tracer is exactly
         # what vmap wants (the same reason `_delta_budget` is computed here).
         # It costs one base-length scan per loss call, not one per sample.
-        _base_mem = _carry_stream.base_memory(
+        # `base_memory` IS `init_carry(...)[1:]`; taking the whole triple costs
+        # nothing extra (one call, and the unused carry is DCE'd on the K
+        # path) and gives the full-horizon scan its starting carry -- the
+        # palimpsa state after the base stream, recomputed under the current
+        # parameters rather than read back from the trajectory.
+        _init0 = _carry_stream.init_carry(
             agent, _BASE_TOK, _BASE_EQN, _BASE_N,
             window=_BASE_W, total_v=total_v, embd_dim=args.embd_dim,
             base_owners=_BASE_OWN,
         )
+        _base_carry = _init0[0]
+        _base_mem = _init0[1:]
 
         def _advance_k(carry2, vs2, vc2, dtok_k, deqn_k, dcnt_k, own_k,
                        part_k):
@@ -5810,14 +5854,86 @@ def main():
                 preference=pref_or_none(pref),
             ) + (carry2,)
 
-        pc_logits, pc_ctx, pc_value, pc_carry = jax.vmap(_carry_heads)(
-            batch.enc_M, batch.enc_I, batch.enc_cumhist,
-            batch.enc_nvalid, batch.enc_pos, batch.delta_owner,
-            batch.delta_participants,
-            batch.vmem_sums, batch.vmem_counts,
-            batch.preference,
-            batch.delta_tokens, batch.delta_eqns, batch.delta_count,
-        )
+        def _episode_heads(dtok, deqn, dcnt, own, part, pref):
+            """ONE episode, ONE `lax.scan`: gradient horizon T, not K.
+
+            THE RECURRENCE IS ALREADY IN THE TRAJECTORY. The rollout carries
+            the encoder state at two points, PRE and POST this step's delta,
+            and threads POST forward as the next step's PRE (`next_enc_state`
+            in `step_fn`); PRE at step 0 is `init_carry`'s carry over the base
+            stream with a ZERO dynamic memory. So
+
+                POST_t = advance(POST_{t-1}, delta_t),  POST_{-1} = base carry
+
+            is exactly a scan, and the per-step anchors the K path gathers are
+            that scan's intermediate carries -- STORED, i.e. constants, which
+            is precisely what truncated the gradient at K steps. Running the
+            recurrence here instead makes every earlier delta an ancestor of
+            step t's logits, so one cotangent reaches all T encodes.
+
+            The body is `_advance_k` UNCHANGED -- the same reverse-
+            differentiable `chunk=None, budget=` scan/cond form the K loop
+            uses -- so this is a re-association of the SAME per-step function,
+            not a different one. At K=1 the two paths do the same NUMBER of
+            advances (one per (env, step)); what changes is that they are
+            chained rather than independent.
+
+            `jax.checkpoint` on the whole body is what keeps that affordable:
+            a length-T scan otherwise stores every step's encode residuals for
+            the backward pass. With it each step stores only its boundary
+            `(carry, vmem_sums, vmem_counts)` and replays its own forward when
+            the cotangent arrives -- the same trade the K loop makes, one
+            level up. ALPHAGRAD_CARRY_HEADS_REMAT=0 restores stored residuals.
+            """
+            def _body(state, x):
+                c2, s2, n2 = state
+                _dt, _de, _dc, _ow, _pa, _pr = x
+                c2, s2, n2 = _advance_k(c2, s2, n2, _dt, _de, _dc, _ow, _pa)
+                # The heads run INSIDE the scan, off this step's POST memory:
+                # the K path's `heads` call, once per step, unchanged.
+                out = _carry_stream.heads(
+                    agent, s2, n2,
+                    base_mem=_base_mem,
+                    preference=pref_or_none(_pr),
+                ) + (c2,)
+                return (c2, s2, n2), out
+
+            _bd = (
+                jax.checkpoint(_body)
+                if os.environ.get("ALPHAGRAD_CARRY_HEADS_REMAT", "1") != "0"
+                else _body
+            )
+            _vs0, _vc0 = _carry_stream.zero_memory(total_v, args.embd_dim)
+            _, ys = lax.scan(
+                _bd, (_base_carry, _vs0, _vc0),
+                (dtok, deqn, dcnt, own, part, pref),
+            )
+            return ys
+
+        if _FULL_SCAN:
+            # vmap over ENVS (the sequence axis is the scan's), then flatten
+            # (env, step) so everything downstream sees the flat batch it
+            # always has. The stored anchors -- enc_M / enc_I / enc_cumhist /
+            # enc_nvalid / enc_pos / vmem_sums / vmem_counts -- are NOT read
+            # here: that is the whole point, and `full_batch` carries them as
+            # dead placeholders on this path.
+            pc_logits, pc_ctx, pc_value, pc_carry = jax.tree_util.tree_map(
+                lambda x: x.reshape(-1, *x.shape[2:]),
+                jax.vmap(_episode_heads)(
+                    _ep_batch.delta_tokens, _ep_batch.delta_eqns,
+                    _ep_batch.delta_count, _ep_batch.delta_owner,
+                    _ep_batch.delta_participants, _ep_batch.preference,
+                ),
+            )
+        else:
+            pc_logits, pc_ctx, pc_value, pc_carry = jax.vmap(_carry_heads)(
+                batch.enc_M, batch.enc_I, batch.enc_cumhist,
+                batch.enc_nvalid, batch.enc_pos, batch.delta_owner,
+                batch.delta_participants,
+                batch.vmem_sums, batch.vmem_counts,
+                batch.preference,
+                batch.delta_tokens, batch.delta_eqns, batch.delta_count,
+            )
         (
             log_probs,
             entropies,
@@ -6509,26 +6625,45 @@ def main():
         # missing entries with count 0, which `advance` runs as an exact
         # no-op (every row invalid), so the short prefix needs no special
         # case.
+        # K = 0 is NOT a window: the loss scans the whole episode from the
+        # base carry, so there is nothing to gather and nothing to anchor.
+        # The (T, K) index materialises every delta K times and the anchor
+        # fields are a per-step copy of the encoder state; both are dead here,
+        # so the deltas are handed over as they were recorded and the anchor
+        # slots carry a placeholder. TrainBatch's leaves must keep the leading
+        # `(num_envs, T)` pair -- `shuffle_and_batch_by_trajectory` indexes the
+        # env axis -- but nothing constrains what is under it.
         _T_steps = traj.delta_count.shape[1]
-        _wK = max(1, int(getattr(args, "grad_window", 1)))
-        _w_t = (jnp.arange(_T_steps, dtype=jnp.int32)[:, None]
-                + (jnp.arange(_wK, dtype=jnp.int32) - (_wK - 1))[None, :])
-        _w_idx = jnp.clip(_w_t, 0, _T_steps - 1)            # (T, K)
-        _w_live = (_w_t >= 0)
-        _w_anchor = _w_idx[:, 0]                            # (T,)
-        _w_dtok = traj.delta_tokens[:, _w_idx]
-        _w_deqn = traj.delta_eqns[:, _w_idx]
-        _w_dcnt = jnp.where(_w_live[None], traj.delta_count[:, _w_idx], 0)
-        _w_down = traj.delta_owner[:, _w_idx]
-        _w_dpart = jnp.where(_w_live[None, ..., None],
-                             traj.delta_participants[:, _w_idx], 0.0)
-        _w_encM = traj.enc_M[:, _w_anchor]
-        _w_encI = traj.enc_I[:, _w_anchor]
-        _w_ench = traj.enc_cumhist[:, _w_anchor]
-        _w_encn = traj.enc_nvalid[:, _w_anchor]
-        _w_encp = traj.enc_pos[:, _w_anchor]
-        _w_vs = traj.vmem_sums[:, _w_anchor]
-        _w_vc = traj.vmem_counts[:, _w_anchor]
+        _FULL_SCAN_EP = int(getattr(args, "grad_window", 1)) == 0
+        if _FULL_SCAN_EP:
+            _w_dtok = traj.delta_tokens
+            _w_deqn = traj.delta_eqns
+            _w_dcnt = traj.delta_count
+            _w_down = traj.delta_owner
+            _w_dpart = traj.delta_participants
+            _dead = jnp.zeros(traj.delta_count.shape + (1,), jnp.float32)
+            _w_encM = _w_encI = _w_ench = _w_encn = _w_encp = _dead
+            _w_vs = _w_vc = _dead
+        else:
+            _wK = max(1, int(getattr(args, "grad_window", 1)))
+            _w_t = (jnp.arange(_T_steps, dtype=jnp.int32)[:, None]
+                    + (jnp.arange(_wK, dtype=jnp.int32) - (_wK - 1))[None, :])
+            _w_idx = jnp.clip(_w_t, 0, _T_steps - 1)            # (T, K)
+            _w_live = (_w_t >= 0)
+            _w_anchor = _w_idx[:, 0]                            # (T,)
+            _w_dtok = traj.delta_tokens[:, _w_idx]
+            _w_deqn = traj.delta_eqns[:, _w_idx]
+            _w_dcnt = jnp.where(_w_live[None], traj.delta_count[:, _w_idx], 0)
+            _w_down = traj.delta_owner[:, _w_idx]
+            _w_dpart = jnp.where(_w_live[None, ..., None],
+                                 traj.delta_participants[:, _w_idx], 0.0)
+            _w_encM = traj.enc_M[:, _w_anchor]
+            _w_encI = traj.enc_I[:, _w_anchor]
+            _w_ench = traj.enc_cumhist[:, _w_anchor]
+            _w_encn = traj.enc_nvalid[:, _w_anchor]
+            _w_encp = traj.enc_pos[:, _w_anchor]
+            _w_vs = traj.vmem_sums[:, _w_anchor]
+            _w_vc = traj.vmem_counts[:, _w_anchor]
         full_batch = TrainBatch(
             preference=traj.preference,
             vertex_idx=traj.vertex_idx,
@@ -6608,7 +6743,13 @@ def main():
         # case; the loss path still cache-encodes per sample via the
         # ``elif args.cache_encoding`` branch in ``_dynamic_loss_fn`` /
         # ``loss_fn``.
-        use_traj_batch = False
+        #
+        # THE FULL-HORIZON PATH REQUIRES IT: `lax.scan` over an episode needs
+        # that episode's steps, in order, in one minibatch. Shuffling steps
+        # across envs (the default) would hand the scan an arbitrary
+        # permutation of unrelated deltas. `main` has already clamped
+        # `--minibatches` to `--num-envs` so no minibatch is empty.
+        use_traj_batch = _FULL_SCAN_EP
 
         def epoch_step_fn(carry_with_step, epoch_key):
             carry, step = carry_with_step
