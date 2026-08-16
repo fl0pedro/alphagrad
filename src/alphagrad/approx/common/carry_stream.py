@@ -49,9 +49,13 @@ AZ can call them eagerly on a single env. Nothing here closes over PPO state.
 """
 from __future__ import annotations
 
+import os
+
 import jax.numpy as jnp
+from jax import lax
 
 from alphagrad.approx import vertex_memory as _vmem
+from alphagrad.approx.common import delta_fold as _fold
 
 __all__ = ["init_carry", "base_memory", "zero_memory", "advance", "heads"]
 
@@ -98,6 +102,19 @@ def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
     # chunk=0: the base window IS the base length (count == window), so a
     # dynamic trip count has nothing to skip -- and the flat scan is the form
     # reverse-mode AD can transpose, which this call now needs.
+    # The base stream is the LARGEST row block in the system -- mean 43,678
+    # tokens on the TLM -- and d815349 made it full-horizon inside the
+    # gradient, so its (window, E) rows are materialised and held for the
+    # backward on every loss call. Folding removes that array outright; the
+    # per-chunk reduction reuses the SAME `_vmem.update_ids` +
+    # `_credit_summary` primitives, so the attribution semantics are
+    # unchanged and scatter-add's associativity is what makes the split
+    # exact. ALPHAGRAD_FOLD_DELTA=0 restores the full-width form.
+    if _FOLD:
+        return _init_carry_folded(
+            agent, enc0, base_tokens, base_eqns, base_count,
+            window=window, total_v=total_v, embd_dim=embd_dim,
+            base_owners=base_owners)
     enc1, rows0, valid0, eqns0 = agent.encode_extend(
         enc0, base_tokens, base_eqns, base_count, window=window, start=0,
         chunk=0,
@@ -132,6 +149,46 @@ def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
     return (enc1,) + _credit_summary(vs0, vc0, rows0, valid0)
 
 
+def _base_ids(base_owners, n):
+    """Per-token owning vertex SLOT, or -1 for the global slot.
+
+    Extracted verbatim from `init_carry` so both paths derive the ids the
+    same way. NEVER read `eqns0` here: those are stream-global segment ids,
+    and reading them as vertex indices is bug #92 (the whole base stream
+    credited to vertex 1).
+    """
+    if base_owners is None:
+        return jnp.full((n,), -1, jnp.int32)
+    _own = jnp.asarray(base_owners, jnp.int32)
+    _own = jnp.concatenate([_own, jnp.zeros((n,), jnp.int32)])[:n]
+    return jnp.where(_own > 0, _own - 1, -1)
+
+
+def _init_carry_folded(agent, enc0, base_tokens, base_eqns, base_count, *,
+                       window, total_v, embd_dim, base_owners=None):
+    """`init_carry` with the (window, E) rows folded away chunk by chunk."""
+    # Pad the ids to the fold's PADDED length, not the window: the fold pads
+    # its token buffers to nb * C and slices side arrays at the same offsets,
+    # so a window-length ids array overruns the final chunk. -1 sends the pad
+    # to the global slot, and those lanes are invalid anyway so they carry
+    # zero weight.
+    C, _nb, padded = _fold.plan_chunks(window)
+    base_ids = _base_ids(base_owners, padded)
+    vs0, vc0 = zero_memory(total_v, embd_dim)
+
+    def fold(acc, rows, valid, _eqns, off):
+        sums, counts = acc
+        ids_c = lax.dynamic_slice(base_ids, (off,), (C,))
+        s2, c2 = _vmem.update_ids(sums, counts, rows, ids_c, valid,
+                                  global_slot=total_v)
+        return _credit_summary(s2, c2, rows, valid)
+
+    enc1, (vs1, vc1) = _fold.extend_fold(
+        agent, enc0, base_tokens, base_eqns, base_count,
+        window=window, init_acc=(vs0, vc0), fold_fn=fold)
+    return enc1, vs1, vc1
+
+
 def base_memory(agent, base_tokens, base_eqns, base_count, *, window,
                 total_v, embd_dim, base_owners=None):
     """:func:`init_carry` without the carry -- ``(base_sums, base_counts)``.
@@ -145,6 +202,9 @@ def base_memory(agent, base_tokens, base_eqns, base_count, *, window,
     return init_carry(agent, base_tokens, base_eqns, base_count,
                       window=window, total_v=total_v, embd_dim=embd_dim,
                       base_owners=base_owners)[1:]
+
+
+_FOLD = os.environ.get("ALPHAGRAD_FOLD_DELTA", "1") != "0"
 
 
 def _credit_summary(sums, counts, rows, valid):
@@ -192,6 +252,15 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
     swaps the ``lax.while_loop`` for a transposable ``scan``/``cond`` pair;
     without it they must pass ``chunk=0``.
     """
+    if _FOLD and participants is not None:
+        # Only the PARTICIPATION branch folds. The authorship branch below is
+        # the legacy path for callers without a face enumeration (unit tests),
+        # so leaving it full-width keeps this patch off code production does
+        # not run.
+        return _advance_folded(
+            agent, enc_carry, vmem_sums, vmem_counts, delta_tokens,
+            delta_eqns, delta_count, window=window, chunk=chunk,
+            budget=budget, participants=participants)
     carry2, rows, valid, eqns = agent.encode_extend(
         enc_carry, delta_tokens, delta_eqns, delta_count,
         window=window, start=0, chunk=chunk, budget=budget,
@@ -222,6 +291,54 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
     sums2 = sums2.at[gid].add(jnp.sum(rows * w_str[:, None], axis=0))
     counts2 = counts2.at[gid].add(jnp.sum(w_str))
     return (carry2,) + _credit_summary(sums2, counts2, rows, valid)
+
+
+def _advance_folded(agent, enc_carry, vmem_sums, vmem_counts, delta_tokens,
+                    delta_eqns, delta_count, *, window, chunk=None,
+                    budget=None, participants=None):
+    """`advance`'s participation branch with the rows folded away.
+
+    Everything the branch does with `rows` is LINEAR in four running
+    quantities -- the eqn-owned row sum and count, and the structural row sum
+    and count -- plus the summary credit, which is a fifth. So the chunks
+    accumulate those and the outer product with `part` is applied ONCE at the
+    end, exactly as the full-width form applies it once. Fewer scatters than
+    folding the scatter itself, and identical arithmetic up to the order of
+    the additions.
+    """
+    n_slots = vmem_sums.shape[0]
+    gid = n_slots - 2
+    E = vmem_sums.shape[1]
+    init = (jnp.zeros((E,), jnp.float32), jnp.zeros((), jnp.float32),
+            jnp.zeros((E,), jnp.float32), jnp.zeros((), jnp.float32))
+
+    def fold(acc, rows, valid, eqns, _off):
+        tot_e, n_e, tot_s, n_s = acc
+        w = jnp.asarray(valid, jnp.float32)
+        w_eqn = w * (eqns >= 0).astype(jnp.float32)
+        w_str = w - w_eqn
+        return (tot_e + jnp.sum(rows * w_eqn[:, None], axis=0),
+                n_e + jnp.sum(w_eqn),
+                tot_s + jnp.sum(rows * w_str[:, None], axis=0),
+                n_s + jnp.sum(w_str))
+
+    carry2, (tot_eqn, n_eqn, tot_str, n_str) = _fold.extend_fold(
+        agent, enc_carry, delta_tokens, delta_eqns, delta_count,
+        window=window, chunk=chunk, budget=budget,
+        init_acc=init, fold_fn=fold)
+
+    part = jnp.asarray(participants, jnp.float32)
+    part = jnp.where(jnp.sum(part) > 0, part,
+                     jnp.eye(n_slots - 1, dtype=jnp.float32)[gid])
+    sums2 = vmem_sums.at[: n_slots - 1].add(part[:, None] * tot_eqn[None, :])
+    counts2 = vmem_counts.at[: n_slots - 1].add(part * n_eqn)
+    sums2 = sums2.at[gid].add(tot_str)
+    counts2 = counts2.at[gid].add(n_str)
+    # The summary slot takes EVERY valid row exactly once, which is the sum
+    # of the two disjoint weightings.
+    sums2 = sums2.at[-1].add(tot_eqn + tot_str)
+    counts2 = counts2.at[-1].add(n_eqn + n_str)
+    return carry2, sums2, counts2
 
 
 def heads(agent, vmem_sums, vmem_counts, *, base_mem=None, preference=None):

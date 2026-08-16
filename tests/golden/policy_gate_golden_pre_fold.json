@@ -415,9 +415,9 @@
    "step": 1,
    "target_vertex": 6,
    "value": [
-    "bd84c723",
-    "bdf85f14",
-    "3decc33e"
+    "bd84c724",
+    "bdf85f15",
+    "3decc33f"
    ],
    "vertex": 5,
    "vertex_mask_fill": [
@@ -427,23 +427,23 @@
    "vertex_probs_live": [
     [
      1,
-     "3e4da948"
+     "3e4da947"
     ],
     [
      2,
-     "3e4a417a"
+     "3e4a4179"
     ],
     [
      3,
-     "3e4c9a1f"
+     "3e4c9a1e"
     ],
     [
      4,
-     "3e45f7b8"
+     "3e45f7b7"
     ],
     [
      5,
-     "3e558367"
+     "3e558366"
     ]
    ]
   },
@@ -748,9 +748,9 @@
    "step": 2,
    "target_vertex": 3,
    "value": [
-    "bd89c0ac",
-    "be7daf49",
-    "3e1f7652"
+    "bd89c0aa",
+    "be7daf4a",
+    "3e1f7651"
    ],
    "vertex": 2,
    "vertex_mask_fill": [
@@ -764,7 +764,7 @@
     ],
     [
      2,
-     "3e95eb61"
+     "3e95eb60"
     ],
     [
      3,
@@ -1078,7 +1078,7 @@
    "target_vertex": 5,
    "value": [
     "bd689031",
-    "be917f06",
+    "be917f08",
     "3e53f747"
    ],
    "vertex": 4,
@@ -1402,9 +1402,9 @@
    "step": 4,
    "target_vertex": 4,
    "value": [
-    "bd379c3d",
-    "be8c39ae",
-    "3e247a16"
+    "bd379c3f",
+    "be8c39ad",
+    "3e247a17"
    ],
    "vertex": 3,
    "vertex_mask_fill": [
@@ -1414,7 +1414,7 @@
    "vertex_probs_live": [
     [
      1,
-     "3efc46f9"
+     "3efc46f8"
     ],
     [
      3,

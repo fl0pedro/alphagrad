@@ -54,6 +54,36 @@ def default_chunk() -> int:
     return int(os.environ.get("ALPHAGRAD_FOLD_CHUNK", "1024"))
 
 
+def plan_chunks(window, chunk=None):
+    """``(C, nb, padded_len)`` for a window.
+
+    EVERY caller with a per-token SIDE array (base_owners ids, face keys)
+    must pad it to ``padded_len``, not to ``window``: the fold pads its token
+    buffers up to ``nb * C`` and slices side arrays by the same offsets, so a
+    window-length side array runs off the end of the last chunk. That is not
+    a silent failure -- ``dynamic_slice`` raises on the shape -- but it is
+    easy to hit, so the length lives here rather than in each caller.
+
+    ``C`` is clamped to the window: a chunk larger than the whole window
+    would pad more than it processes.
+    """
+    # chunk=0 is a SENTINEL in the encode_extend API, not an error: it means
+    # "flat scan, no dynamic trip count", which a reverse-differentiated
+    # caller passes when it has no budget (see advance's docstring). The fold
+    # has no flat mode -- its transposability comes from the scan/cond pair,
+    # not from being unchunked -- so 0 means "use the fold's own chunk", the
+    # same as None. Only a NEGATIVE chunk is a caller error.
+    C = int(chunk) if chunk else default_chunk()
+    if C < 0:
+        raise ValueError("fold chunk must be positive, got %r" % (C,))
+    W = int(window)
+    if W <= 0:
+        return C, 0, 0
+    C = min(C, W)
+    nb = -(-W // C)
+    return C, nb, nb * C
+
+
 def extend_fold(agent, carry, tokens, eqns, count, *, window, chunk=None,
                 init_acc, fold_fn, budget=None, remat=None):
     """Extend ``carry`` over ``window`` tokens, folding rows into an acc.
@@ -73,12 +103,9 @@ def extend_fold(agent, carry, tokens, eqns, count, *, window, chunk=None,
     Returns ``(new_carry, acc)``. NOTE the rows are never returned -- that is
     the point; a caller who needs them wants ``encode_extend``.
     """
-    C = int(chunk if chunk is not None else default_chunk())
-    if C <= 0:
-        raise ValueError("fold chunk must be positive, got %r" % (C,))
+    C, nb, padded = plan_chunks(window, chunk)
     W = int(window)
-    nb = -(-W // C)                       # ceil
-    pad = nb * C - W
+    pad = padded - W
     if pad:
         tokens = jnp.concatenate([tokens, jnp.zeros((pad,), tokens.dtype)])
         eqns = jnp.concatenate([eqns, jnp.full((pad,), -1, eqns.dtype)])

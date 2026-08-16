@@ -178,10 +178,28 @@ def test_chunk_size_does_not_change_the_answer():
         assert bool(jnp.allclose(o, outs[0], atol=1e-5))
 
 
-def test_rejects_a_nonpositive_chunk():
+def test_chunk_zero_is_the_encode_extend_sentinel_not_an_error():
+    """chunk=0 means "flat, no dynamic trip count" in the encode_extend API.
+
+    advance's docstring tells reverse-differentiated callers without a budget
+    to pass exactly that, so rejecting it breaks every such caller -- which is
+    how it broke palimpsa_base_grad. The fold has no flat mode, so 0 falls
+    back to the fold's own chunk and the answer is unchanged.
+    """
+    agent = StubAgent()
+    toks, eqns, cnt = _mk(64, 40, seed=21)
+    ref = _flat_sums(agent, toks, eqns, cnt, 64)[1]
+    init, fold = sum_reducer(E)
+    _c, acc = extend_fold(agent, 0.0, toks, eqns, cnt, window=64, chunk=0,
+                          init_acc=init, fold_fn=fold)
+    for a, b in zip(acc, ref):
+        assert bool(jnp.allclose(a, b, atol=1e-5))
+
+
+def test_rejects_a_negative_chunk():
     with pytest.raises(ValueError, match="chunk must be positive"):
         init, fold = sum_reducer(E)
-        extend_fold(StubAgent(), 0.0, *_mk(16, 8), window=16, chunk=0,
+        extend_fold(StubAgent(), 0.0, *_mk(16, 8), window=16, chunk=-4,
                     init_acc=init, fold_fn=fold)
 
 
