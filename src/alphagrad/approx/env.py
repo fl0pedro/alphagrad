@@ -284,14 +284,29 @@ def consume_tokenization_truncation_stats() -> dict:
 # the replay, and extending a prefix by one vertex is one `eliminate` call
 # rather than a full re-tokenize.
 # THE ONLY REAL BOUND IN THE OBSERVATION PATH, and the only one JAX's static
-# shapes actually require. SIZED FROM THE MEASURED DISTRIBUTION:
-# ``decode3_data.py`` over 192 TLM trajectories measured the largest SINGLE
-# delta at 25,737 tokens (mean whole-stream length 43,678, max 122,910), so
-# 32768 is the next power of two with headroom. The previous 1024 dropped
-# ~96% of the flagship's worst delta EVERY step, and the drop was silent
-# (issue #81: the ``tokenization/*`` counters are process-blind -- they read 0
-# from the driver while the callback process clips).
-MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "32768"))
+# shapes actually require. SIZED FROM THE MEASURED DISTRIBUTION -- and it is
+# a MEMORY FLOOR, not just a padding bound: every reverse-differentiated
+# `encode_extend` in the loss materialises a ``(window, E)`` row block per
+# sample per K-step whatever the actual delta length is, which is why the
+# ``ALPHAGRAD_EXTEND_CHUNK`` sweep found peak memory FLAT at 2051 MB across
+# every chunk size. Blocking cannot shrink a fixed window; only the window
+# can.
+#
+# 32768 came from a single 25,737-token worst case reported by
+# ``decode3_data.py``. A later per-step measurement of the actual delta
+# distribution on BOTH the 2- and 3-block TransformerLM (380 / 540 steps)
+# does not reproduce it: median 0, mean 75-114, p95 537-642, p99 1001-1411,
+# MAX 1173-2833 -- i.e. the observed worst case is 0.23-0.35% of a 32768
+# window and the buffer was 8-16x oversized on the very target it was sized
+# for. 4096 clears the largest delta ever measured here (2833) with ~45%
+# headroom and is still the next power of two above it.
+#
+# This is safe to shrink because overflow is LOUD: it RAISES by default
+# (``ALPHAGRAD_DELTA_OVERFLOW``), so a target whose deltas really do exceed
+# 4096 stops rather than silently desyncing the recurrence -- the failure
+# mode that made the old bound feel like it had to be generous. Raise the
+# env var if a new target trips it; do NOT switch to clip to hide it.
+MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "4096"))
 
 # BASE-TOKEN budget for the delta-buffer observation path
 # (ALPHAGRAD_DELTA_TOKENS=1 in ppo.py). The base tokenized jaxpr is encoded
