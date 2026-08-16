@@ -5698,6 +5698,45 @@ def main():
             base_owners=_BASE_OWN,
         )
 
+        def _advance_k(carry2, vs2, vc2, dtok_k, deqn_k, dcnt_k, own_k,
+                       part_k):
+            return _carry_stream.advance(
+                agent, carry2, vs2, vc2,
+                dtok_k, deqn_k, dcnt_k, own_k,
+                window=MAX_DELTA_TOKENS, participants=part_k,
+                # The loss is reverse-differentiated through this extend,
+                # so it cannot use the rollout's while_loop -- it passes
+                # the batch-wide `budget` instead and gets the scan/cond
+                # form, which has a transpose rule and skips exactly the
+                # same pad steps.
+                chunk=None, budget=_delta_budget,
+            )
+
+        # REMAT THE K-LOOP BODY. `advance` is a whole `encode_extend` over
+        # the delta window, and the K of them were an UNROLLED PYTHON LOOP:
+        # reverse-mode AD stored every step's rows -- a (window, E) array per
+        # K per sample -- so peak memory tracked K almost linearly (measured
+        # on the TLM: 8971 MiB at K=1, 9037 at 2, 13197 at 4, 13401 at 8,
+        # 21785 at 16). With remat each of the K steps stores only its
+        # boundary `(carry, vmem_sums, vmem_counts)` and recomputes its own
+        # forward when the cotangent arrives -- the same trade `_block` and
+        # `_chunk_d` already make one level down, and the reason nesting is
+        # correct rather than doubly wasteful: the inner remat bounds what a
+        # single recomputed step costs.
+        #
+        # NOTHING COMPUTED CHANGES, only where the activations live: the
+        # recomputation replays the identical jaxpr on the identical inputs,
+        # so the forward is bitwise identical and the cotangents are the
+        # cotangents of the same function (proved in
+        # tests/carry_heads_remat_equiv_test.py: outputs AND gradients
+        # bit-identical at K=1..4, remat on vs off).
+        # ALPHAGRAD_CARRY_HEADS_REMAT=0 restores the stored-residual form.
+        _advance_step = (
+            jax.checkpoint(_advance_k)
+            if os.environ.get("ALPHAGRAD_CARRY_HEADS_REMAT", "1") != "0"
+            else _advance_k
+        )
+
         def _carry_heads(M, I, ch, nv, pos, owner, part, vs, vc,
                          pref, dtok, deqn, dcnt):
             carry2 = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
@@ -5708,16 +5747,9 @@ def main():
             # literally the single call it replaced -- same ops, same order,
             # bit-identical.
             for _k in range(dtok.shape[0]):
-                carry2, vs2, vc2 = _carry_stream.advance(
-                    agent, carry2, vs2, vc2,
-                    dtok[_k], deqn[_k], dcnt[_k], owner[_k],
-                    window=MAX_DELTA_TOKENS, participants=part[_k],
-                    # The loss is reverse-differentiated through this extend,
-                    # so it cannot use the rollout's while_loop -- it passes
-                    # the batch-wide `budget` instead and gets the scan/cond
-                    # form, which has a transpose rule and skips exactly the
-                    # same pad steps.
-                    chunk=None, budget=_delta_budget,
+                carry2, vs2, vc2 = _advance_step(
+                    carry2, vs2, vc2,
+                    dtok[_k], deqn[_k], dcnt[_k], owner[_k], part[_k],
                 )
             # carry2 is where the sampling side carry branched: the
             # stored pre-step carry advanced past the PREVIOUS delta.
