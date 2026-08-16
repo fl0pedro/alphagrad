@@ -306,7 +306,7 @@ def consume_tokenization_truncation_stats() -> dict:
 # 4096 stops rather than silently desyncing the recurrence -- the failure
 # mode that made the old bound feel like it had to be generous. Raise the
 # env var if a new target trips it; do NOT switch to clip to hide it.
-MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "4096"))
+MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "32768"))
 
 # BASE-TOKEN budget for the delta-buffer observation path
 # (ALPHAGRAD_DELTA_TOKENS=1 in ppo.py). The base tokenized jaxpr is encoded

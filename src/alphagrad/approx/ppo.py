@@ -137,6 +137,11 @@ from alphagrad.approx import vertex_memory as _vmem
 from alphagrad.transformer.encoder import RelationalMultiheadAttention
 from alphagrad.transformer.palimpsa_encoder import (
     palimpsa_beta as _pal_beta, palimpsa_qk_norm as _pal_qk_norm)
+from alphagrad.approx.common import delta_fold as _fold
+
+# Same switch carry_stream reads, so one flag turns the whole fold on or
+# off rather than leaving half the consumers folded and half not.
+_FOLD_DELTA = os.environ.get("ALPHAGRAD_FOLD_DELTA", "1") != "0"
 from alphagrad.utils import entropy, explained_variance
 
 # ---------------------------------------------------------------------------
@@ -2315,11 +2320,48 @@ class Agent(eqx.Module):
         # This is the LOSS side and it is reverse-differentiated (gradient
         # reaches palimpsa through exactly this scan), so the trip count comes
         # from `budget` (scan/cond) and never from a while_loop.
-        _, rows, _valid, _e = self.encode_extend(
-            enc_carry, f_toks, f_eqns, total,
-            window=MAX_DELTA_TOKENS, start=0,
-            chunk=(None if face_win_budget is not None else 0),
-            budget=face_win_budget)
+        if _FOLD_DELTA:
+            # FOLDED. This is the reverse-differentiated face path, so its
+            # (window, E) rows are STORED for the backward -- unlike the
+            # rollout's `_face_encode`, whose rows are transient. Folding
+            # here is the one that moves loss-side peak.
+            #
+            # `scatter_mean` is `scatter` then `s / max(c, 1)`, so
+            # accumulating (s, c) per chunk and dividing ONCE at the end is
+            # exact, and calling `_vmem.scatter` itself rather than
+            # reimplementing it keeps the spill and out-of-range handling
+            # identical.
+            #
+            # THE OFFSET IS LOAD-BEARING. The key is
+            # `searchsorted(ends, position)`, so a chunk starting at `off`
+            # must key on `off + arange(C)`. Dropping it sends every chunk
+            # after the first to face 0 -- a plausible wrong answer, not a
+            # crash, which is why delta_fold pins this in a dedicated test.
+            _ends = jnp.cumsum(f_cnt.astype(jnp.int32))
+            _C, _nb, _pad_len = _fold.plan_chunks(MAX_DELTA_TOKENS)
+
+            def _face_fold(acc, rows_c, valid_c, _eqns_c, off):
+                s_acc, c_acc = acc
+                pos = off + jnp.arange(rows_c.shape[0], dtype=jnp.int32)
+                fid = jnp.searchsorted(_ends, pos, side="right").astype(
+                    jnp.int32)
+                live = jnp.asarray(valid_c, jnp.float32) * (pos < total)
+                s_c, c_c = _vmem.scatter(rows_c, fid, live, F)
+                return (s_acc + s_c, c_acc + c_c)
+
+            _, (_fs, _fc) = _fold.extend_fold(
+                self, enc_carry, f_toks, f_eqns, total,
+                window=MAX_DELTA_TOKENS,
+                init_acc=(jnp.zeros((F, self.embd_dim), jnp.float32),
+                          jnp.zeros((F,), jnp.float32)),
+                fold_fn=_face_fold, budget=face_win_budget)
+            face_latents = _fs / jnp.maximum(_fc, 1.0)[:, None]
+        else:
+            _, rows, _valid, _e = self.encode_extend(
+                enc_carry, f_toks, f_eqns, total,
+                window=MAX_DELTA_TOKENS, start=0,
+                chunk=(None if face_win_budget is not None else 0),
+                budget=face_win_budget)
         # ONE SCATTER, KEYED BY FACE. The chunks concatenate in face order,
         # so token t belongs to the face whose exclusive-prefix interval
         # contains t -- a `searchsorted` against the counts' cumsum. That key
@@ -2328,11 +2370,11 @@ class Agent(eqx.Module):
         # face as the key instead of the vertex. An empty chunk owns no
         # token, so its segment is empty and its latent is exactly zero --
         # matching the rollout's `_face_encode` skip.
-        ends = jnp.cumsum(f_cnt.astype(jnp.int32))
-        _pos = jnp.arange(rows.shape[0], dtype=jnp.int32)
-        _fid = jnp.searchsorted(ends, _pos, side="right").astype(jnp.int32)
-        _live = jnp.asarray(_valid, jnp.float32) * (_pos < total)
-        face_latents = _vmem.scatter_mean(rows, _fid, _live, F)     # (F, E)
+            ends = jnp.cumsum(f_cnt.astype(jnp.int32))
+            _pos = jnp.arange(rows.shape[0], dtype=jnp.int32)
+            _fid = jnp.searchsorted(ends, _pos, side="right").astype(jnp.int32)
+            _live = jnp.asarray(_valid, jnp.float32) * (_pos < total)
+            face_latents = _vmem.scatter_mean(rows, _fid, _live, F)  # (F, E)
 
         # scan, not a python loop: F is the provable bound (196 here), and
         # unrolling it multiplied the program by F. scan keeps reverse-mode
