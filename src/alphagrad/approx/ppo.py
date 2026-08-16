@@ -5911,6 +5911,15 @@ def main():
             return ys
 
         if _FULL_SCAN:
+            # STATE THE HORIZON, once per compile. "Full T" is a claim about
+            # the scan length, and the scan length is a shape -- so print the
+            # shape rather than leave the reader to infer it from the flag.
+            # Trace time, so one line per compile and nothing per step.
+            print("[grad-window 0] full-horizon scan: T=%d steps x %d "
+                  "envs/minibatch, delta window %d"
+                  % (_ep_batch.delta_count.shape[1],
+                     _ep_batch.delta_count.shape[0],
+                     _ep_batch.delta_tokens.shape[-1]), flush=True)
             # vmap over ENVS (the sequence axis is the scan's), then flatten
             # (env, step) so everything downstream sees the flat batch it
             # always has. The stored anchors -- enc_M / enc_I / enc_cumhist /
