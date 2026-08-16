@@ -55,7 +55,7 @@ def default_chunk() -> int:
 
 
 def extend_fold(agent, carry, tokens, eqns, count, *, window, chunk=None,
-                init_acc, fold_fn, remat=None):
+                init_acc, fold_fn, budget=None, remat=None):
     """Extend ``carry`` over ``window`` tokens, folding rows into an acc.
 
     ``fold_fn(acc, rows_c, valid_c, eqns_c, offset) -> acc`` sees one chunk at
@@ -86,16 +86,42 @@ def extend_fold(agent, carry, tokens, eqns, count, *, window, chunk=None,
     b_eqn = eqns[: nb * C].reshape(nb, C)
     cnt = jnp.asarray(count, jnp.int32)
 
+    # DYNAMIC TRIP COUNT, same reasoning as _extend_sequential's budget form.
+    # Without this the fold walks every chunk of the window regardless of the
+    # real delta length, so raising the bound to 65536 would cost 64x the work
+    # of a 1024 delta -- exactly the cost folding exists to remove. A skipped
+    # chunk is EXACT, not approximate: all its tokens are invalid, so `_step`
+    # freezes the carry and emits zero rows, and a zero row contributes zero
+    # to every reducer here (all of them are weighted sums with the weight
+    # coming from `valid`). Its cotangent is zero for the same reason.
+    #
+    # `budget` must be UNBATCHED -- a batch-wide bound -- so that under the
+    # loss's vmap the predicate stays scalar and vmap keeps a real `cond`
+    # instead of lowering it to `select_n` over both branches, which would
+    # compute the skipped chunk anyway and save nothing.
+    if budget is None:
+        nb_live = nb
+    else:
+        nb_live = jnp.minimum(
+            (jnp.maximum(jnp.asarray(budget, jnp.int32), 0) + C - 1) // C,
+            nb).astype(jnp.int32)
+
     def _body(state, xs):
-        enc, acc = state
         i, tk, eq = xs
         off = i * C
         # Tokens remaining once this chunk starts, clipped into [0, C]. A
         # chunk beyond the delta gets 0 and contributes nothing.
         c_cnt = jnp.clip(cnt - off, 0, C)
-        enc2, rows_c, valid_c, eqns_c = agent.encode_extend(
-            enc, tk, eq, c_cnt, window=C, start=0, chunk=0)
-        return (enc2, fold_fn(acc, rows_c, valid_c, eqns_c, off)), None
+
+        def _run(s):
+            enc, acc = s
+            enc2, rows_c, valid_c, eqns_c = agent.encode_extend(
+                enc, tk, eq, c_cnt, window=C, start=0, chunk=0)
+            return (enc2, fold_fn(acc, rows_c, valid_c, eqns_c, off))
+
+        if budget is None:
+            return _run(state), None
+        return lax.cond(i < nb_live, _run, lambda s: s, state), None
 
     use_remat = (os.environ.get("ALPHAGRAD_FOLD_REMAT", "1") != "0"
                  if remat is None else bool(remat))

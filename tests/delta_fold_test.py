@@ -183,3 +183,46 @@ def test_rejects_a_nonpositive_chunk():
         init, fold = sum_reducer(E)
         extend_fold(StubAgent(), 0.0, *_mk(16, 8), window=16, chunk=0,
                     init_acc=init, fold_fn=fold)
+
+
+@pytest.mark.parametrize("window,count,chunk,budget", [
+    (128, 20, 16, 20), (128, 20, 16, 32), (128, 0, 16, 0),
+    (128, 128, 16, 128), (128, 65, 32, 65), (96, 40, 7, 40),
+])
+def test_budget_skipping_is_exact(window, count, chunk, budget):
+    """Skipping chunks past the budget must not change the answer.
+
+    A skipped chunk is all-invalid, so `_step` freezes the carry and emits
+    zero rows, and every reducer here is a `valid`-weighted sum -- so the
+    skip is exact, not approximate. Without this the fold walks the WHOLE
+    window regardless of the delta length, which would make a 65536 bound
+    cost 64x a 1024 delta: the cost folding exists to remove.
+    """
+    agent = StubAgent()
+    toks, eqns, cnt = _mk(window, count, seed=11)
+    init, fold = sum_reducer(E)
+    c_no, acc_no = extend_fold(agent, 0.0, toks, eqns, cnt, window=window,
+                               chunk=chunk, init_acc=init, fold_fn=fold)
+    init2, fold2 = sum_reducer(E)
+    c_bd, acc_bd = extend_fold(agent, 0.0, toks, eqns, cnt, window=window,
+                               chunk=chunk, init_acc=init2, fold_fn=fold2,
+                               budget=budget)
+    assert float(jnp.abs(c_bd - c_no)) < 1e-5, "carry diverged under budget"
+    for a, b in zip(acc_bd, acc_no):
+        assert bool(jnp.allclose(a, b, atol=1e-5)), "%s vs %s" % (a, b)
+
+
+def test_budget_gradient_survives_the_cond():
+    """cond must stay transposable -- while_loop here would kill the loss."""
+    agent = StubAgent()
+    toks, eqns, cnt = _mk(128, 30, seed=13)
+
+    def g(c0):
+        init, fold = sum_reducer(E)
+        _, (te, _ne, ts, _ns) = extend_fold(
+            agent, c0, toks, eqns, cnt, window=128, chunk=16,
+            init_acc=init, fold_fn=fold, budget=30)
+        return jnp.sum(te) + jnp.sum(ts)
+
+    d = jax.grad(g)(0.5)
+    assert bool(jnp.isfinite(d)) and float(jnp.abs(d)) > 0.0
