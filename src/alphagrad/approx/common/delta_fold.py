@@ -54,6 +54,34 @@ def default_chunk() -> int:
     return int(os.environ.get("ALPHAGRAD_FOLD_CHUNK", "1024"))
 
 
+def _use_parallel() -> bool:
+    return os.environ.get("ALPHAGRAD_FOLD_PARALLEL", "1") != "0"
+
+
+def _encode_chunk(agent, enc, tk, eq, c_cnt, C, parallel):
+    """One chunk's encode. PARALLEL inside the chunk by default.
+
+    Chunking and parallelism are ORTHOGONAL: the chunk bounds how much is
+    live at once (memory), the scan inside it decides whether the tokens are
+    walked serially or with log depth (speed). `_extend_parallel` is the
+    associative-scan form, and reverse mode of an associative scan is itself
+    an associative scan -- so a parallel forward buys a parallel backward for
+    free.
+
+    `encode_extend` picks the two apart by a global env var, which is not
+    what a caller wants here, so the parallel path is called directly with
+    the same `valid` mask `encode_extend` would have built. Falls back to
+    `encode_extend` when the agent has no parallel path (test stubs).
+    """
+    if parallel:
+        par = getattr(agent, "_extend_parallel", None)
+        if par is not None:
+            valid = jnp.arange(C, dtype=jnp.int32) < jnp.asarray(c_cnt,
+                                                                 jnp.int32)
+            return par(enc, tk, eq, valid, c_cnt)
+    return agent.encode_extend(enc, tk, eq, c_cnt, window=C, start=0, chunk=0)
+
+
 def plan_chunks(window, chunk=None):
     """``(C, nb, padded_len)`` for a window.
 
@@ -85,7 +113,7 @@ def plan_chunks(window, chunk=None):
 
 
 def extend_fold(agent, carry, tokens, eqns, count, *, window, chunk=None,
-                init_acc, fold_fn, budget=None, remat=None):
+                init_acc, fold_fn, budget=None, remat=None, parallel=None):
     """Extend ``carry`` over ``window`` tokens, folding rows into an acc.
 
     ``fold_fn(acc, rows_c, valid_c, eqns_c, offset) -> acc`` sees one chunk at
@@ -126,6 +154,8 @@ def extend_fold(agent, carry, tokens, eqns, count, *, window, chunk=None,
     # loss's vmap the predicate stays scalar and vmap keeps a real `cond`
     # instead of lowering it to `select_n` over both branches, which would
     # compute the skipped chunk anyway and save nothing.
+    par = _use_parallel() if parallel is None else bool(parallel)
+
     if budget is None:
         nb_live = nb
     else:
@@ -142,8 +172,8 @@ def extend_fold(agent, carry, tokens, eqns, count, *, window, chunk=None,
 
         def _run(s):
             enc, acc = s
-            enc2, rows_c, valid_c, eqns_c = agent.encode_extend(
-                enc, tk, eq, c_cnt, window=C, start=0, chunk=0)
+            enc2, rows_c, valid_c, eqns_c = _encode_chunk(
+                agent, enc, tk, eq, c_cnt, C, par)
             return (enc2, fold_fn(acc, rows_c, valid_c, eqns_c, off))
 
         if budget is None:
