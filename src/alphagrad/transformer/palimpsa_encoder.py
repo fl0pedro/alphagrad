@@ -4,6 +4,7 @@ Both mixers here route through the verified Pallas-Triton kernel in
 ``alphagrad.transformer.palimpsa_pallas`` -- the recurrence is defined once,
 in the kernel, and is not reimplemented in raw JAX.
 """
+import os
 from typing import Sequence, Optional
 
 import jax
@@ -19,6 +20,67 @@ from alphagrad.transformer.encoder import SwiGLU
 
 Array = jax.Array
 PRNGKey = jax.Array
+
+
+# --------------------------------------------------------------------------
+# PALIMPSA-D: the two ingredients that BOUND the precision state I.
+#
+# Paper A.1 (and the reference implementation) put two bounds on the update
+#     I_t = alpha*I_{t-1} + (1-alpha)*I_prior + beta (x) k^2
+# that were both absent here: Palimpsa-D L2-normalises q and k, and beta is
+# bounded as sigmoid(.)*softplus(scale) rather than an unbounded softplus.
+# With neither, nothing bounds ||k||^2 or beta, so one large beta*||k||^2
+# drives I up, 1/I -> 0, and that head stops integrating -- the catastrophic
+# remembering the forgetting term exists to prevent. It presents as silent
+# quality loss, never as an error.
+#
+# With ||k||_2 = 1 each step's precision increment sums to exactly beta, so
+# the plasticity 1/I sits on a controlled scale independent of the residual
+# stream's magnitude.
+#
+# Each is independently env-gated; =0 restores the previous form. The
+# b_scale_raw parameter is ALWAYS constructed so the parameter tree does not
+# depend on the flag.
+# --------------------------------------------------------------------------
+PALIMPSA_QK_NORM = int(os.environ.get("ALPHAGRAD_PALIMPSA_QK_NORM", "1"))
+PALIMPSA_BETA_BOUNDED = int(os.environ.get("ALPHAGRAD_PALIMPSA_BETA_BOUNDED", "1"))
+_QK_EPS2 = 1e-12
+
+
+def palimpsa_qk_norm(x):
+    """L2-normalise the trailing head_dim axis (Palimpsa-D, paper A.1).
+
+    The epsilon goes INSIDE the sqrt. Neither of the two obvious spellings
+    survives reverse mode on a zero (padding) row:
+
+      * ``where(n > 0, x / n, x)`` differentiates the unsafe branch anyway --
+        the forward is guarded, the backward is not.
+      * ``x / maximum(n, eps)`` guards the DIVISION and correctly sends a zero
+        cotangent back to ``n``, but ``n = sqrt(sum(x*x))`` still has
+        ``d sqrt/du = 1/(2 sqrt(u)) -> inf`` at u = 0, so the chain evaluates
+        ``0 * inf = NaN``. MEASURED: max|grad| = nan on an all-zero row.
+
+    ``rsqrt(sum(x*x) + eps)`` never evaluates a root at zero, so the gradient
+    is finite everywhere. For a unit-scale row the eps costs ~5e-13 of norm.
+    Padding rows land at 0 (0 * rsqrt(eps) = 0), which is what the downstream
+    mask wants anyway.
+    """
+    if not PALIMPSA_QK_NORM:
+        return x
+    return x * jax.lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + _QK_EPS2)
+
+
+def palimpsa_beta(raw, b_scale_raw):
+    """Per-row importance beta from the RAW bias projection, shape (..., H, d).
+
+    Bounded form ``sigmoid(raw) * softplus(scale)`` caps the observation
+    precision a single token may inject; the legacy form is an unbounded
+    ``softplus(raw)``. ``b_scale_raw`` is (H,) and broadcasts as (H, 1).
+    """
+    if not PALIMPSA_BETA_BOUNDED:
+        return jnn.softplus(raw)
+    return jnn.sigmoid(raw) * jnn.softplus(b_scale_raw)[:, None]
+
 
 
 class PalimpsaMixer(eqx.Module):
@@ -78,6 +140,7 @@ class PalimpsaMixer(eqx.Module):
 
     g_raw: Array      # (H,) raw param; g = softplus(g_raw)
     Ip_raw: Array     # (H,) raw param; Ip = softplus(Ip_raw)
+    b_scale_raw: Array  # (H,) beta = sigmoid(bias_proj) * softplus(b_scale_raw)
 
     num_heads: int = eqx.field(static=True)
     embd_dim: int = eqx.field(static=True)
@@ -125,6 +188,10 @@ class PalimpsaMixer(eqx.Module):
         self.g_raw = jnp.full((num_heads,), -3.0, dtype=jnp.float32)
         # softplus(Ip_raw) ~= 0.69 -> moderate prior precision at init.
         self.Ip_raw = jnp.zeros((num_heads,), dtype=jnp.float32)
+        # softplus(1.1) ~= 1.376, so beta ~= 0.5 * 1.376 = 0.688 at init
+        # against the legacy softplus(0) = 0.693: the bounded form STARTS
+        # where the unbounded one did and differs only in its tail.
+        self.b_scale_raw = jnp.full((num_heads,), 1.1, dtype=jnp.float32)
 
     def _relational_gate_mod(self, eqn_ids: Array, S: int) -> Array:
         """Per-token additive gate modulation (S, H) from DAG relation degrees.
@@ -164,8 +231,8 @@ class PalimpsaMixer(eqx.Module):
         H = self.num_heads
         d = self.head_dim
 
-        q = jax.vmap(self.query_proj)(x).reshape(S, H, d)
-        k = jax.vmap(self.key_proj)(x).reshape(S, H, d)
+        q = palimpsa_qk_norm(jax.vmap(self.query_proj)(x).reshape(S, H, d))
+        k = palimpsa_qk_norm(jax.vmap(self.key_proj)(x).reshape(S, H, d))
         v = jax.vmap(self.value_proj)(x).reshape(S, H, d)
         # b is the PRECISION NUMERATOR of the kernel's posterior update:
         #   I_t = b_t * k_t^2 + (1 - decay) * Ip + decay * I_{t-1};  mu = M / I.
@@ -176,7 +243,8 @@ class PalimpsaMixer(eqx.Module):
         # ~15%% of rollout forwards emitting non-finite values on the larger
         # residual graphs). softplus enforces the positivity the Bayesian
         # precision semantics require.
-        b = jnn.softplus(jax.vmap(self.bias_proj)(x)).reshape(S, H, d)
+        b = palimpsa_beta(
+            jax.vmap(self.bias_proj)(x).reshape(S, H, d), self.b_scale_raw)
         # Relational structural prior folded into the forget gate (mirrors
         # BiPalimpsaMixer, but injected PRE-softplus — the cleaner form the
         # bi docstring itself notes — so a zero gate_mod is an EXACT no-op:

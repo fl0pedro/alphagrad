@@ -55,8 +55,8 @@
       2
      ]
     ],
-    "entropy": "3f20b2a2",
-    "logp": "bf916478",
+    "entropy": "3f29e198",
+    "logp": "bf785720",
     "n_live": 1,
     "pair_valid": [
      [
@@ -200,9 +200,9 @@
    "step": 0,
    "target_vertex": 1,
    "value": [
-    "bd8f01ec",
-    "be2a1503",
-    "3dd95439"
+    "3d94aace",
+    "be24f1db",
+    "3c942173"
    ],
    "vertex": 0,
    "vertex_mask_fill": [
@@ -212,27 +212,27 @@
    "vertex_probs_live": [
     [
      0,
-     "3e29ace5"
+     "3e22b7d3"
     ],
     [
      1,
-     "3e3229be"
+     "3e1d8de5"
     ],
     [
      2,
-     "3e1d71af"
+     "3e2b0c3f"
     ],
     [
      3,
-     "3e2fe591"
+     "3e2b7cc2"
     ],
     [
      4,
-     "3e1c7d80"
+     "3e31f1ab"
     ],
     [
      5,
-     "3e3a549d"
+     "3e373f99"
     ]
    ]
   },
@@ -269,8 +269,8 @@
       7
      ]
     ],
-    "entropy": "40daf98e",
-    "logp": "c0e3a90e",
+    "entropy": "41153bdf",
+    "logp": "c11d67e8",
     "n_live": 1,
     "pair_valid": [
      [
@@ -333,7 +333,7 @@
       ],
       "factor": [
        2,
-       0,
+       2,
        0
       ],
       "i": [
@@ -343,12 +343,12 @@
       ],
       "j": [
        2,
-       0,
+       3,
        0
       ],
       "op_type": [
        0,
-       3,
+       0,
        3
       ],
       "quant_dtype": [
@@ -378,9 +378,9 @@
       2
      ],
      [
-      -1,
-      -1,
-      0
+      0,
+      1,
+      2
      ],
      [
       -1,
@@ -415,9 +415,9 @@
    "step": 1,
    "target_vertex": 6,
    "value": [
-    "bd84c724",
-    "bdf85f15",
-    "3decc33f"
+    "3d97ed63",
+    "bde3fb3f",
+    "3d3762f2"
    ],
    "vertex": 5,
    "vertex_mask_fill": [
@@ -427,23 +427,23 @@
    "vertex_probs_live": [
     [
      1,
-     "3e4da947"
+     "3e487bcb"
     ],
     [
      2,
-     "3e4a4179"
+     "3e56769e"
     ],
     [
      3,
-     "3e4c9a1e"
+     "3e421522"
     ],
     [
      4,
-     "3e45f7b7"
+     "3e53a6ea"
     ],
     [
      5,
-     "3e558366"
+     "3e4b518c"
     ]
    ]
   },
@@ -454,7 +454,7 @@
     3,
     4
    ],
-   "env_delta_count": 1085,
+   "env_delta_count": 1053,
    "env_order_prefix": [
     1,
     6,
@@ -491,8 +491,8 @@
       4
      ]
     ],
-    "entropy": "417b8db4",
-    "logp": "c1792c94",
+    "entropy": "4189588d",
+    "logp": "c18a1cb9",
     "n_live": 2,
     "pair_valid": [
      [
@@ -648,27 +648,27 @@
       ],
       "factor": [
        0,
-       0,
+       16,
        0
       ],
       "i": [
        0,
-       0,
+       1,
        0
       ],
       "j": [
        0,
-       0,
+       3,
        0
       ],
       "op_type": [
        3,
-       2,
+       0,
        2
       ],
       "quant_dtype": [
        0,
-       2,
+       0,
        0
       ],
       "quant_frac": [
@@ -710,9 +710,9 @@
       0
      ],
      [
-      -3,
-      2,
-      1
+      1,
+      1,
+      16
      ],
      [
       -3,
@@ -748,9 +748,9 @@
    "step": 2,
    "target_vertex": 3,
    "value": [
-    "bd89c0aa",
-    "be7daf4a",
-    "3e1f7651"
+    "3cf114af",
+    "be7f1696",
+    "3d544523"
    ],
    "vertex": 2,
    "vertex_mask_fill": [
@@ -760,19 +760,19 @@
    "vertex_probs_live": [
     [
      1,
-     "3e6f59d5"
+     "3e83189d"
     ],
     [
      2,
-     "3e95eb60"
+     "3e91f020"
     ],
     [
      3,
-     "3e69865a"
+     "3e733cb1"
     ],
     [
      4,
-     "3e7b4911"
+     "3e62b1d5"
     ]
    ]
   },
@@ -782,7 +782,7 @@
     3,
     4
    ],
-   "env_delta_count": 1045,
+   "env_delta_count": 1055,
    "env_order_prefix": [
     1,
     6,
@@ -795,7 +795,7 @@
      352
     ],
     "chunk_eqns_sha": "7ed0c57149125a9f",
-    "chunk_tokens_sha": "edf4e616ff740888",
+    "chunk_tokens_sha": "f21402f1b12f7726",
     "comp_valid": [
      [
       0,
@@ -820,8 +820,8 @@
       7
      ]
     ],
-    "entropy": "41328851",
-    "logp": "c139c00c",
+    "entropy": "413178a7",
+    "logp": "c13b3db6",
     "n_live": 2,
     "pair_valid": [
      [
@@ -1077,9 +1077,9 @@
    "step": 3,
    "target_vertex": 5,
    "value": [
-    "bd689031",
-    "be917f08",
-    "3e53f747"
+    "3da50606",
+    "be501d21",
+    "3dec7506"
    ],
    "vertex": 4,
    "vertex_mask_fill": [
@@ -1089,15 +1089,15 @@
    "vertex_probs_live": [
     [
      1,
-     "3eac865f"
+     "3ea9e085"
     ],
     [
      3,
-     "3eac4f62"
+     "3ea9b589"
     ],
     [
      4,
-     "3ea72a40"
+     "3eac69f3"
     ]
    ]
   },
@@ -1106,7 +1106,7 @@
     1,
     3
    ],
-   "env_delta_count": 867,
+   "env_delta_count": 873,
    "env_order_prefix": [
     1,
     6,
@@ -1117,10 +1117,10 @@
    "face": {
     "chunk_counts": [
      215,
-     741
+     747
     ],
-    "chunk_eqns_sha": "a79992f04f0c0651",
-    "chunk_tokens_sha": "b28282846a18a597",
+    "chunk_eqns_sha": "8bdd5291ea6d2fce",
+    "chunk_tokens_sha": "841734ce01599ccc",
     "comp_valid": [
      [
       0,
@@ -1145,8 +1145,8 @@
       7
      ]
     ],
-    "entropy": "41489b10",
-    "logp": "c14a1f96",
+    "entropy": "41490b7f",
+    "logp": "c1496562",
     "n_live": 2,
     "pair_valid": [
      [
@@ -1402,9 +1402,9 @@
    "step": 4,
    "target_vertex": 4,
    "value": [
-    "bd379c3f",
-    "be8c39ad",
-    "3e247a17"
+    "3dbc380f",
+    "be5fae0f",
+    "3d8e2044"
    ],
    "vertex": 3,
    "vertex_mask_fill": [
@@ -1414,11 +1414,11 @@
    "vertex_probs_live": [
     [
      1,
-     "3efc46f8"
+     "3efe5f69"
     ],
     [
      3,
-     "3f01dc84"
+     "3f00d04c"
     ]
    ]
   }

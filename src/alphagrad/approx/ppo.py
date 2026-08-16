@@ -135,6 +135,8 @@ from alphagrad.approx.heads import (
 from alphagrad.transformer import MLP, Encoder, PositionalEncoder, make_encoder
 from alphagrad.approx import vertex_memory as _vmem
 from alphagrad.transformer.encoder import RelationalMultiheadAttention
+from alphagrad.transformer.palimpsa_encoder import (
+    palimpsa_beta as _pal_beta, palimpsa_qk_norm as _pal_qk_norm)
 from alphagrad.utils import entropy, explained_variance
 
 # ---------------------------------------------------------------------------
@@ -1545,11 +1547,14 @@ class Agent(eqx.Module):
                 mixer = layer.attn_layer
                 H, d = mixer.num_heads, mixer.head_dim
                 y = jax.vmap(layer.attn_norm)(x)
-                q = jax.vmap(mixer.query_proj)(y).reshape(Bk, H, d)
-                kk = jax.vmap(mixer.key_proj)(y).reshape(Bk, H, d)
+                q = _pal_qk_norm(
+                    jax.vmap(mixer.query_proj)(y).reshape(Bk, H, d))
+                kk = _pal_qk_norm(
+                    jax.vmap(mixer.key_proj)(y).reshape(Bk, H, d))
                 v = jax.vmap(mixer.value_proj)(y).reshape(Bk, H, d)
-                b = jnn.softplus(
-                    jax.vmap(mixer.bias_proj)(y)).reshape(Bk, H, d)
+                b = _pal_beta(
+                    jax.vmap(mixer.bias_proj)(y).reshape(Bk, H, d),
+                    mixer.b_scale_raw)
                 gt = jnn.softplus(jax.vmap(mixer.gate_proj)(y)
                                   + feats @ mixer.rel_gate.weight.T
                                   + mixer.rel_gate.bias)
@@ -1630,10 +1635,11 @@ class Agent(eqx.Module):
                 H = mixer.num_heads
                 d = mixer.head_dim
                 y = layer.attn_norm(x)
-                q = mixer.query_proj(y).reshape(H, d)
-                kk = mixer.key_proj(y).reshape(H, d)
+                q = _pal_qk_norm(mixer.query_proj(y).reshape(H, d))
+                kk = _pal_qk_norm(mixer.key_proj(y).reshape(H, d))
                 v = mixer.value_proj(y).reshape(H, d)
-                b = jnn.softplus(mixer.bias_proj(y)).reshape(H, d)
+                b = _pal_beta(mixer.bias_proj(y).reshape(H, d),
+                              mixer.b_scale_raw)
                 gt = jnn.softplus(mixer.gate_proj(y) + mixer.rel_gate(feats))
                 g = jnn.softplus(mixer.g_raw)
                 Ip = jnn.softplus(mixer.Ip_raw)

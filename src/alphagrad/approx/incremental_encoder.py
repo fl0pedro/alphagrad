@@ -23,6 +23,9 @@ import jax.numpy as jnp
 import jax.nn as jnn
 import equinox as eqx
 
+from alphagrad.transformer.palimpsa_encoder import (
+    palimpsa_beta as _pal_beta, palimpsa_qk_norm as _pal_qk_norm)
+
 
 def _palimpsa_step(mixer, y_t, carry):
     """One-token palimpsa recurrence, MASK ALL-ONES (fully-valid prefix)."""
@@ -30,10 +33,10 @@ def _palimpsa_step(mixer, y_t, carry):
     d = mixer.head_dim
     scale = d ** -0.5
 
-    q = mixer.query_proj(y_t).reshape(H, d)
-    kk = mixer.key_proj(y_t).reshape(H, d)
+    q = _pal_qk_norm(mixer.query_proj(y_t).reshape(H, d))
+    kk = _pal_qk_norm(mixer.key_proj(y_t).reshape(H, d))
     v = mixer.value_proj(y_t).reshape(H, d)
-    b = jnn.softplus(mixer.bias_proj(y_t)).reshape(H, d)
+    b = _pal_beta(mixer.bias_proj(y_t).reshape(H, d), mixer.b_scale_raw)
     gt = jnn.softplus(mixer.gate_proj(y_t))          # (H,)
     g = jnn.softplus(mixer.g_raw)                     # (H,)
     Ip = jnn.softplus(mixer.Ip_raw)                   # (H,)
