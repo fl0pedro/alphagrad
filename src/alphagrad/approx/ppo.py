@@ -5353,8 +5353,12 @@ def main():
             _cos = optax.cosine_decay_schedule(
                 args.lr, _decay_steps, args.lr_decay_min_mult)
 
-            def schedule(count):
-                ramp = jnp.clip((count + 1.0) / float(_warm), 1e-3, 1.0)
+            # _w is BOUND AT DEFINITION: main() later rebinds `_warm`
+            # (popart-init uses the same name for its warm-channel MASK, a
+            # numpy array), and a late-binding closure would read that --
+            # float(array) killed v60/61514 at the first traced update.
+            def schedule(count, _w=float(_warm)):
+                ramp = jnp.clip((count + 1.0) / _w, 1e-3, 1.0)
                 return _cos(count) * ramp
 
             print(f"[lr] MULT warmup {_warm} steps ({_wf:.0%} of "
