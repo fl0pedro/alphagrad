@@ -8895,11 +8895,26 @@ def main():
                 # about. So w is per-channel: warm where the sample has spread,
                 # cold (w=0, the untouched init) where it does not.
                 _warm = _sd0 > 1e-12
-                popart_m1 = jnp.asarray(np.where(_warm, _mu0, 0.0),
-                                        dtype=jnp.float32)
-                popart_m2 = jnp.asarray(np.where(_warm, (_R ** 2).mean(axis=0),
-                                                 0.0), dtype=jnp.float32)
-                popart_w = jnp.asarray(_warm.astype(np.float32))
+                # A constant channel with a NONZERO mean is a different
+                # animal from the cosine==0 case above: it is a real
+                # reference measurement (v57: rev-pinned + FACE_NONE_BIAS
+                # made all 3 warmup plans the identical exact-rev plan, so
+                # latency/mem sampled CONSTANT at ~1.5e5 -- correct mu, no
+                # spread). Leaving those cold cost ~150 episodes of online
+                # mu drift that read as fake improvement while distorting
+                # every advantage against the calibrated channels. Seed mu
+                # from the reference and a synthetic sigma of 10 pct |mu|
+                # (a scale prior, refined by the normal PopArt update);
+                # mu ~= 0 constants stay COLD exactly as before.
+                _seed = (~_warm) & (np.abs(_mu0) > 1e-6)
+                _sig_syn = 0.10 * np.abs(_mu0)
+                popart_m1 = jnp.asarray(
+                    np.where(_warm | _seed, _mu0, 0.0), dtype=jnp.float32)
+                popart_m2 = jnp.asarray(
+                    np.where(_warm, (_R ** 2).mean(axis=0),
+                             np.where(_seed, _mu0 ** 2 + _sig_syn ** 2, 0.0)),
+                    dtype=jnp.float32)
+                popart_w = jnp.asarray((_warm | _seed).astype(np.float32))
                 # Variance of the NORMALISED target the critic will see. It
                 # is 1.0 by construction UNLESS `--popart-sigma-min` floors the
                 # channel's sigma, in which case the channel is being SHRUNK
@@ -8909,7 +8924,10 @@ def main():
                 _sd_eff = np.maximum(_sd0, float(args.popart_sigma_min))
                 _zvar = (((_R - _mu0) / _sd_eff) ** 2).mean(axis=0)
                 for _k, _nm in enumerate(HEAD_NAMES):
-                    if not _warm[_k]:
+                    if _seed[_k]:
+                        _fl = ("  <-- CONSTANT reference: warm-started, "
+                               "synthetic sigma=10% |mu|")
+                    elif not _warm[_k]:
                         _fl = "  <-- CONSTANT in the sample, left COLD"
                     elif _sd0[_k] < _sd_eff[_k]:
                         _fl = "  <-- sigma FLOORED by --popart-sigma-min"
