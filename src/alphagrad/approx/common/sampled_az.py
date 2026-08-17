@@ -181,7 +181,9 @@ def face_ce_term(face_replay_fn, ctx, enc_carry, axis_state, axis_valid,
         # `_face_replay` takes neither the per-vertex contexts nor the stored
         # endpoint ids. Both are still threaded in by the caller (the search
         # stores them for `participation_mask`); they are ignored here.
-        lp, ent, ar = face_replay_fn(
+        # 4th return (face_latents) exists only for ppo's feature probe;
+        # discarded here exactly as on ppo's default path (DCE'd under jit).
+        lp, ent, ar, _probe_face_lat = face_replay_fn(
             features, fact_tables, fa_k, fp, fc, fv,
             enc_carry, (cnt, dt, de), op_override)
         return lp, ent / jnp.maximum(ar, 1.0)
