@@ -2972,6 +2972,15 @@ def _measure_compiler_options():
     return {
         "xla_gpu_autotune_level": 0,
         "xla_gpu_enable_triton_gemm": False,
+        # Parallel LLVM-module compilation. OFF by default in this jax build
+        # (gated behind a persistent-cache setting nobody enables), so every
+        # run to date compiled serially. Isolated benchmark 61445 (12 random
+        # TLM plans, paired on the SAME lowered object, arm order alternated):
+        # median compile 14.46 -> 12.71 s (-12%), heaviest plans -29..-35%
+        # (45.6 -> 32.7 s), no plan slower. Passed per-executable here rather
+        # than via JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES so it does not
+        # depend on cache state and never touches trainer compiles.
+        "xla_gpu_enable_llvm_module_compilation_parallelism": True,
     }
 
 
