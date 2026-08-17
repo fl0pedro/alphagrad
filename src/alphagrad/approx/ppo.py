@@ -3245,6 +3245,17 @@ def make_argparser() -> argparse.ArgumentParser:
         help="Parallel rollout envs. -1 = os.cpu_count() (or 16 for Vmapped examples).",
     )
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument(
+        "--lr-warmup-frac", type=float, default=0.0,
+        help="Fraction of total optimiser steps spent in a LINEAR LR ramp "
+             "from ~0 to --lr before the cosine decay begins. 0 (default) "
+             "keeps the plain cosine schedule bit-identically. Motivation "
+             "(v58, job 61498): the policy walked off the identity init and "
+             "into the mult-reward g(q)=0 plateau while the critic baseline "
+             "was still calibrating -- the descent was never priced. A slow "
+             "ramp holds the policy near identity until the baseline is "
+             "accurate, so the first step toward low quality meets a "
+             "correctly-scaled negative advantage.")
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--ppo-clip-eps", type=float, default=0.2)
     p.add_argument("--minibatches", type=int, default=32)
@@ -5317,11 +5328,29 @@ def main():
     # construction total.
     _decay_steps = max(
         1, int(args.episodes) * int(args.ppo_epochs) * int(args.minibatches))
-    schedule = optax.cosine_decay_schedule(
-        args.lr,
-        _decay_steps,
-        args.lr_decay_min_mult,
-    )
+    _wf = float(getattr(args, "lr_warmup_frac", 0.0) or 0.0)
+    if _wf > 0.0:
+        # Linear ramp then cosine. NOTE the conversion: warmup_cosine takes
+        # decay_steps as the TOTAL (warmup included) and an ABSOLUTE end
+        # value, where the plain cosine takes alpha as a FRACTION of the
+        # peak -- converted here so the tail matches the old schedule.
+        _warm = max(1, int(_decay_steps * _wf))
+        schedule = optax.warmup_cosine_decay_schedule(
+            init_value=args.lr * 1e-3,
+            peak_value=args.lr,
+            warmup_steps=_warm,
+            decay_steps=_decay_steps,
+            end_value=args.lr * args.lr_decay_min_mult,
+        )
+        print(f"[lr] linear warmup {_warm} steps "
+              f"({_wf:.0%} of {_decay_steps}), then cosine to "
+              f"{args.lr * args.lr_decay_min_mult:.2e}", flush=True)
+    else:
+        schedule = optax.cosine_decay_schedule(
+            args.lr,
+            _decay_steps,
+            args.lr_decay_min_mult,
+        )
     optimizer = optax.chain(
         optax.clip_by_global_norm(args.max_grad_norm),
         optax.adam(schedule, b1=args.adam_b1, eps=args.adam_eps),
