@@ -138,6 +138,7 @@ from alphagrad.transformer.encoder import RelationalMultiheadAttention
 from alphagrad.transformer.palimpsa_encoder import (
     palimpsa_beta as _pal_beta, palimpsa_qk_norm as _pal_qk_norm)
 from alphagrad.approx.common import delta_fold as _fold
+from alphagrad.approx.common import feature_probe as _fprobe
 
 # Same switch carry_stream reads, so one flag turns the whole fold on or
 # off rather than leaving half the consumers folded and half not.
@@ -895,6 +896,16 @@ class Trajectory(NamedTuple):
     delta_participants: jax.Array  # (total_v + 1,) float32
     discount: jax.Array
     vertex_avail_mask: jax.Array
+    # FEATURE PROBE (ALPHAGRAD_FEATURE_PROBE=1, default OFF). ``None`` when the
+    # probe is off, and None is not a pytree LEAF -- so the default path stores
+    # no extra array, changes no shape, and adds nothing to the scan carry.
+    # P = ALPHAGRAD_FEATURE_PROBE_FACES (<= the face bound): the face count is
+    # ~1.7 against a bound of thousands, so the probe pays for a prefix rather
+    # than for the padding.
+    probe_targets: jax.Array = None    # (P, NFT) float32 host oracle targets
+    probe_extents: jax.Array = None    # (P, MAX_AXES) float32 log2 axis sizes
+    probe_valid: jax.Array = None      # (P,) float32
+    probe_step: jax.Array = None       # () int32 elimination step index
 
 
 class TrainBatch(NamedTuple):
@@ -960,6 +971,11 @@ class TrainBatch(NamedTuple):
     estim_returns: jax.Array
     norm_adv: jax.Array
     vertex_avail_mask: jax.Array
+    # Feature-probe targets, threaded exactly like `delta_participants`.
+    probe_targets: jax.Array = None
+    probe_extents: jax.Array = None
+    probe_valid: jax.Array = None
+    probe_step: jax.Array = None
 
 
 # ---------------------------------------------------------------------------
@@ -2398,7 +2414,10 @@ class Agent(eqx.Module):
         if face_bound is None or K <= 0 or K >= F:
             (logp, ent, arity), _ = lax.scan(
                 lambda a, f: (_one_face(a, f), None), _acc0, jnp.arange(F))
-            return logp, ent, arity
+            # `face_latents` is the 4th return ONLY so the feature probe can
+            # read the live head's own input -- `face_context=summ` above IS
+            # `face_latents[f]`. Discarded (and DCE'd) on the default path.
+            return logp, ent, arity, face_latents
 
         # BLOCKED gate. Skipping f >= face_bound is EXACT, not an
         # approximation: the head's gates SELECT rather than multiply, so a
@@ -2434,7 +2453,7 @@ class Agent(eqx.Module):
 
         (logp, ent, arity), _ = lax.scan(
             _blk, _acc0, jnp.arange(nblk, dtype=jnp.int32))
-        return logp, ent, arity
+        return logp, ent, arity, face_latents
 
     def evaluate_action_dynamic(
         self,
@@ -2501,6 +2520,8 @@ class Agent(eqx.Module):
                 # slot 11: face-head entropy. This branch is taken only when
                 # there is no face action at all, so it is exactly 0.
                 jnp.asarray(0.0, jnp.float32),
+                # slot 12: no face path here, so no probe representation.
+                ((None, _vc[vertex_idx]) if _fprobe.PROBE_ON else None),
             )
         if precomputed is not None:
             # 3b: same carry-derived triple the rollout sampled under (the
@@ -2578,6 +2599,9 @@ class Agent(eqx.Module):
         # returned as its own component so the logger can report it instead of
         # a dead 0.
         face_entropy = jnp.asarray(0.0, jnp.float32)
+        # Feature probe: the LEAN arm's input is the face-keyed scatter, which
+        # only the replay path builds. None elsewhere.
+        _probe_face_lat = None
         # P1c: fold the face decisions' log-prob/entropy into the totals so
         # the PPO ratio covers them (evaluated with the STORED masks, same
         # gates as sampling — see FacePathPolicy).
@@ -2591,7 +2615,7 @@ class Agent(eqx.Module):
                     )
                 )
             else:
-                f_logp, f_ent, f_arity = self._face_replay(
+                f_logp, f_ent, f_arity, _probe_face_lat = self._face_replay(
                     features, factor_tables, face_action,
                     face_pair_valid, face_comp_valid, face_valid,
                     face_carry, face_chunks, op_legality_override,
@@ -2623,6 +2647,11 @@ class Agent(eqx.Module):
             # into ``total_entropy`` above and returned separately so the PPO
             # metrics can log it as its own channel (entropy/approx_head).
             face_entropy,
+            # slot 12: the FEATURE PROBE's read-only view of the representation
+            # -- (face latents (F, E), this step's vertex slot row (E,)). None
+            # unless ALPHAGRAD_FEATURE_PROBE=1, and None is not a pytree leaf,
+            # so nothing is computed, stored or transferred when it is off.
+            ((_probe_face_lat, v_context) if _fprobe.PROBE_ON else None),
         )
 
     def to_env_action_dynamic(
@@ -4865,6 +4894,104 @@ def main():
             vmap_method="sequential",
         )
 
+    # ---- FEATURE PROBE targets (ALPHAGRAD_FEATURE_PROBE=1) ------------
+    # Modelled on `_oracle_one`: the SAME `_LVMO` prefix replay, the SAME
+    # deferred-until-the-vertex-is-known shape, one extra `probe_faces` on top
+    # of the `face_masks` the oracle already runs (see face_targets_host).
+    # DEFAULT OFF -- the whole block is dead, no callback and no field, when
+    # `ALPHAGRAD_FEATURE_PROBE` is unset.
+    _PROBE_FACES = min(
+        int(os.environ.get("ALPHAGRAD_FEATURE_PROBE_FACES", "32")), _F_FACES)
+    _PROBE_ON = bool(_fprobe.PROBE_ON) and bool(
+        getattr(args, "dynamic_substeps", False))
+    if _fprobe.PROBE_ON and not _PROBE_ON:
+        print("[probe] ALPHAGRAD_FEATURE_PROBE=1 IGNORED: the probe reads the "
+              "per-face scatter and the pointer slots, both of which only the "
+              "--dynamic-substeps path builds.", flush=True)
+    # [failed target builds, one-shot census done]
+    _PROBE_FAILS = [0, 0]
+    if _PROBE_ON:
+        # THE STATIC CONTROLS' pre-image: log2 numel of an endpoint vertex's
+        # output var, keyed by the 1-based vertex id `face_endpoints` stores
+        # (0 = a jaxpr input, which has no equation and so scores 0). This is
+        # the same quantity decode2_face_data.py's `ln_of_vidx` holds, keyed by
+        # vertex instead of by var index.
+        _PROBE_LNV = np.zeros((_oracle_total_v + 2,), np.float32)
+        for _pi, _peq in enumerate(_oracle_jaxpr.eqns, start=1):
+            _pn = 1
+            if _peq.outvars and hasattr(_peq.outvars[0], "aval"):
+                for _ps in _peq.outvars[0].aval.shape:
+                    _pn *= int(_ps)
+            _PROBE_LNV[_pi] = float(np.log2(max(_pn, 1)))
+        print("[probe] feature probe ON: arm=%s width=%d faces=%d/%d "
+              "(targets %s)"
+              % (_fprobe.PROBE_ARM, _fprobe.PROBE_WIDTH, _PROBE_FACES,
+                 _F_FACES, ",".join(_fprobe.FACE_NAMES)), flush=True)
+
+        def _probe_targets_host(order, spec_hist, step_count, vertex_idx,
+                                ends):
+            _pt0 = _prof_time.perf_counter()
+            try:
+                eo = np.asarray(order).reshape(-1)
+                specs = np.asarray(spec_hist)
+                n = int(np.asarray(step_count))
+                v = int(np.asarray(vertex_idx)) + 1
+                P, N = _PROBE_FACES, _oracle_N
+                tgt = np.zeros((P, _fprobe.NFT), np.float32)
+                ext = np.zeros((P, N), np.float32)
+                val = np.zeros((P,), np.float32)
+                try:
+                    o = _oracle_replay(eo, specs, n)
+                    _t, _e, _nf = _fprobe.face_targets_host(
+                        o, _oracle_jaxpr, v, P, N,
+                        ln_of_vidx=_PROBE_LNV,
+                        endpoints=np.asarray(ends, np.int32))
+                except Exception as _pexc:
+                    _PROBE_FAILS[0] += 1
+                    if _PROBE_FAILS[0] <= 3:
+                        print("[probe] target build FAILED for vertex "
+                              f"{v}: {type(_pexc).__name__}: "
+                              f"{str(_pexc)[:200]}", flush=True)
+                    return tgt, ext, val
+                _nf = min(int(_nf), P)
+                tgt[:_nf] = _t[:_nf]
+                ext[:_nf] = _e[:_nf]
+                val[:_nf] = 1.0
+                # ONE-SHOT TARGET CENSUS. A within-step R2 of 0 has two very
+                # different causes -- "the representation cannot decode it"
+                # and "the target is constant, so there is nothing to decode"
+                # -- and within_step_r2 reports 0 for BOTH by design. This
+                # prints the per-column spread once, on the first vertex that
+                # yields faces, so the two are distinguishable from the log.
+                if _PROBE_FAILS[1] == 0 and _nf > 0:
+                    _PROBE_FAILS[1] = 1
+                    print("[probe] first targets: vertex=%d n_faces=%d "
+                          "endpoints=%s" % (v, _nf,
+                                            np.asarray(ends)[:_nf].tolist()),
+                          flush=True)
+                    for _c, _nm in enumerate(_fprobe.FACE_NAMES):
+                        _col = tgt[:_nf, _c]
+                        print("[probe]   %-10s min=%.3f max=%.3f std=%.3f"
+                              % (_nm, float(_col.min()), float(_col.max()),
+                                 float(_col.std())), flush=True)
+                return tgt, ext, val
+            finally:
+                _env_prof_add("oracle.feature_probe",
+                              _prof_time.perf_counter() - _pt0)
+
+        def _probe_targets(order, spec_hist, step_count, vertex_idx, ends):
+            P, N = _PROBE_FACES, _oracle_N
+            return jax.pure_callback(
+                _probe_targets_host,
+                (jax.ShapeDtypeStruct((P, _fprobe.NFT), jnp.float32),
+                 jax.ShapeDtypeStruct((P, N), jnp.float32),
+                 jax.ShapeDtypeStruct((P,), jnp.float32)),
+                order, spec_hist, step_count, vertex_idx, ends,
+                vmap_method="sequential",
+            )
+    else:
+        _probe_targets = None
+
     # ---- per-FACE token chunks (--live-faces) -------------------------
     # One callback per face. It replays the elimination prefix (cached) and
     # re-eliminates the CURRENT vertex with faces 0..f-1 carrying their
@@ -5173,6 +5300,30 @@ def main():
         optax.adam(schedule, b1=args.adam_b1, eps=args.adam_eps),
     )
     opt_state = optimizer.init(eqx.filter(agent, eqx.is_inexact_array))
+
+    # FEATURE PROBES: A SEPARATE PARAMETER TREE WITH A SEPARATE OPTIMISER.
+    # `opt_state` above is initialised from `agent` ALONE, so the PPO chain
+    # provably cannot touch a probe weight, and `_probe_loss` below is a
+    # function of `probes` alone, so the probe gradient provably cannot touch
+    # palimpsa. Neither guarantee rests on a coefficient being small.
+    if _PROBE_ON:
+        probes = _fprobe.FeatureProbes(
+            embd_dim=int(args.embd_dim),
+            max_axes=int(MAX_AXES_PER_VERTEX),
+            # The vertex probe decodes the same seven columns, aggregated over
+            # the vertex's faces -- see `_probe_loss`.
+            n_vertex_out=_fprobe.NFT,
+            width=_fprobe.PROBE_WIDTH,
+            key=jrand.PRNGKey(
+                int(os.environ.get("ALPHAGRAD_FEATURE_PROBE_SEED", "0"))),
+            arm=_fprobe.PROBE_ARM,
+        )
+        probe_optimizer = optax.adam(
+            float(os.environ.get("ALPHAGRAD_FEATURE_PROBE_LR", "1e-3")))
+        probe_opt_state = probe_optimizer.init(
+            eqx.filter(probes, eqx.is_inexact_array))
+    else:
+        probes = probe_opt_state = probe_optimizer = None
 
     # Rollout / loss / training step factories.
     def reset_envs(env_obj):
@@ -5561,6 +5712,21 @@ def main():
                 delta_count=jnp.asarray(delta_count, jnp.int32),
             )
 
+            # FEATURE PROBE targets for the vertex this step actually
+            # eliminated -- the same prefix + same chosen vertex the oracle
+            # callback above is keyed on, so the targets describe the very
+            # faces the head decided over.
+            if _PROBE_ON:
+                _pb_t, _pb_e, _pb_v = _probe_targets(
+                    state.order, state.sparsity_specs, state.step_count,
+                    vertex_idx, face_ends_v)
+                _probe_fields = dict(
+                    probe_targets=_pb_t, probe_extents=_pb_e,
+                    probe_valid=_pb_v,
+                    probe_step=jnp.asarray(state.step_count, jnp.int32),
+                )
+            else:
+                _probe_fields = {}
             transition = Trajectory(
                 preference=preference.astype(jnp.float32),
                 vertex_idx=jnp.asarray(vertex_idx, dtype=jnp.int32),
@@ -5611,6 +5777,7 @@ def main():
                 face_delta_tokens=face_dt_v,
                 face_delta_eqns=face_de_v,
                 **_enc_fields,
+                **_probe_fields,
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
             )
@@ -5969,6 +6136,7 @@ def main():
             new_kind_dists,
             new_quant_logp,
             face_ents,
+            probe_reprs,
         ) = (
             jax.vmap(
                 lambda pref, vidx, action, vmask, ax_st,
@@ -6257,6 +6425,40 @@ def main():
             - args.entropy_weight * entropy_loss
         )
 
+        # ---------------------------------------------------- FEATURE PROBE
+        # The pack is returned as `has_aux` DATA, never as a term of
+        # `total_loss`: `eqx.filter_grad` does not differentiate aux, and the
+        # representation is `stop_gradient`-ed here as well as inside
+        # `Probe.__call__`. Two independent reasons the probe cannot train what
+        # it measures, either of which alone is sufficient.
+        _probe_pack = None
+        if _PROBE_ON:
+            _B = batch.vertex_idx.shape[0]
+            _lat, _vctx = probe_reprs
+            if _lat is None:
+                _lat = jnp.zeros((_B, _PROBE_FACES, args.embd_dim),
+                                 jnp.float32)
+            else:
+                _lat = _lat[:, :_PROBE_FACES]
+            _lat = jax.lax.stop_gradient(_lat)
+            _vctx = jax.lax.stop_gradient(_vctx)
+            if _fprobe.PROBE_ARM == _fprobe.FaceProbeArm.ENDPOINTS:
+                # The reference arm every prior face probe was measured on:
+                # the two ENDPOINT slot rows, gathered from the same pointer
+                # memory. `face_endpoints` is 1-based with 0 = jaxpr input, so
+                # index e-1 and zero the input rows.
+                _ends = batch.face_endpoints[:, :_PROBE_FACES]
+                _g = jax.vmap(lambda c, e: c[e])(
+                    jax.lax.stop_gradient(pc_ctx),
+                    jnp.clip(_ends - 1, 0, pc_ctx.shape[1] - 1))
+                _g = _g * (_ends > 0).astype(jnp.float32)[..., None]
+                _cxi, _cxj = _g[:, :, 0], _g[:, :, 1]
+            else:
+                _cxi = _cxj = None
+            _probe_pack = (_lat, _vctx, batch.probe_targets,
+                           batch.probe_extents, batch.probe_valid,
+                           batch.probe_step, _cxi, _cxj)
+
         # NaN LOCALIZER (ALPHAGRAD_DEBUG_NAN=1).
         # `ent:nan` in the progress bar means the params are ALREADY NaN, which
         # is one update too late to say why. This prints each loss component
@@ -6283,7 +6485,7 @@ def main():
                 ),
                 lambda: None,
             )
-        return total_loss, (
+        _metrics = (
             kl_div,
             entropy_loss,
             0.0,
@@ -6302,6 +6504,56 @@ def main():
             # entropy in slot 0 if available. Slot 5 = face/approximation head.
             jnp.stack(_entropy_components),
         )
+        if _PROBE_ON:
+            return total_loss, (_metrics, _probe_pack)
+        return total_loss, _metrics
+
+    # n_steps for the WITHIN-STEP R2. Elimination step indices run 0..T-1 with
+    # T <= total_v, so total_v + 1 is a safe static bound for the one-hot.
+    _PROBE_NSTEPS = int(total_v) + 1
+
+    def _probe_loss(probes, pack):
+        """MSE of the probe decode, as a function of the PROBE ALONE.
+
+        `pack` arrives as `has_aux` data from the PPO loss -- already
+        `stop_gradient`-ed there and again inside `Probe.__call__` -- and the
+        agent is not an argument, so this function has no derivative with
+        respect to any policy parameter. That is the invariant the whole probe
+        exists to preserve: it must not train the thing it measures.
+        """
+        lat, vctx, tgt, ext, val, sid, cxi, cxj = pack
+        n_p = val.shape[-1]
+        if _fprobe.PROBE_ARM == _fprobe.FaceProbeArm.LEAN:
+            pred = jax.vmap(jax.vmap(probes.face_predict))(lat)
+        elif _fprobe.PROBE_ARM == _fprobe.FaceProbeArm.EXTENTS:
+            pred = jax.vmap(jax.vmap(
+                lambda l, e: probes.face_predict(l, extents=e)))(lat, ext)
+        else:
+            pred = jax.vmap(jax.vmap(
+                lambda l, a, b: probes.face_predict(
+                    l, ctx_i=a, ctx_j=b)))(lat, cxi, cxj)
+        f_pred = pred.reshape(-1, _fprobe.NFT)
+        f_tgt = tgt.reshape(-1, _fprobe.NFT)
+        f_val = val.reshape(-1)
+        l_face = _fprobe.masked_mse(f_pred, f_tgt, f_val).sum()
+
+        # THE VERTEX PROBE reads ONE pointer slot row (E wide, the lean
+        # collapse) and decodes the same seven columns AGGREGATED over that
+        # vertex's valid faces -- the vertex-level form of the identical
+        # quantity, so the face and vertex numbers sit on one axis instead of
+        # measuring two unrelated things.
+        w = val[..., None]
+        v_tgt = (tgt * w).sum(1) / jnp.maximum(val.sum(1), 1.0)[:, None]
+        v_val = (val.sum(1) > 0).astype(jnp.float32)
+        v_pred = jax.vmap(probes.vertex_predict)(vctx)
+        l_vertex = _fprobe.masked_mse(v_pred, v_tgt, v_val).sum()
+
+        _sid = sid.astype(jnp.int32)
+        r2 = _fprobe.within_step_r2(
+            f_pred, f_tgt, f_val, jnp.repeat(_sid, n_p), _PROBE_NSTEPS)
+        v_r2 = _fprobe.within_step_r2(
+            v_pred, v_tgt, v_val, _sid, _PROBE_NSTEPS)
+        return l_face + l_vertex, (r2, v_r2, l_face, l_vertex)
 
     def train_episode(
         agent,
@@ -6320,6 +6572,8 @@ def main():
         popart_m1,
         popart_m2,
         popart_w,
+        probes,
+        probe_opt_state,
     ):
         subkey, key = jrand.split(key)
         rollout_key, key = jrand.split(key)
@@ -6746,9 +7000,21 @@ def main():
             estim_returns=estim_returns,
             norm_adv=norm_adv,
             vertex_avail_mask=traj.vertex_avail_mask,
+            # Threaded exactly like `delta_participants`: recorded per step in
+            # the rollout, sliced by the same shuffle, read by the loss. All
+            # four are None when the probe is off.
+            probe_targets=traj.probe_targets,
+            probe_extents=traj.probe_extents,
+            probe_valid=traj.probe_valid,
+            probe_step=traj.probe_step,
         )
 
-        dynamic_carry, static_carry = eqx.partition((agent, opt_state), eqx.is_array)
+        # The probes ride in the SAME scan carry (so their updates
+        # accumulate across minibatches) but in their own slots, with their own
+        # optimiser state. Both are None when the probe is off, and None is not
+        # a pytree leaf, so the carry is byte-identical to before.
+        dynamic_carry, static_carry = eqx.partition(
+            (agent, opt_state, probes, probe_opt_state), eqx.is_array)
 
         # Stage D head LR warmup: thread a step counter through both scans
         # (epoch × minibatch) so the per-head LR multiplier ramps continuously
@@ -6784,15 +7050,24 @@ def main():
 
             def mb_step_fn(c_with_step, batch_and_key):
                 c, step = c_with_step
-                comb_agent, comb_opt_state = eqx.combine(c, static_carry)
+                (comb_agent, comb_opt_state, comb_probes,
+                 comb_probe_opt) = eqx.combine(c, static_carry)
                 batch, t_key = batch_and_key
-                grads, metrics = eqx.filter_grad(loss_fn, has_aux=True)(
+                grads, _aux = eqx.filter_grad(loss_fn, has_aux=True)(
                     comb_agent,
                     batch,
                     t_key,
                     pin_rules_to_exact_arg,
                     op_legality_override_arg,
                 )
+                # `has_aux` carries the probe's read-only view of the
+                # representation alongside the metrics. filter_grad does not
+                # differentiate aux, so this is a second, independent reason
+                # the probe cannot appear in `grads`.
+                if _PROBE_ON:
+                    metrics, _probe_pack = _aux
+                else:
+                    metrics = _aux
                 # Single fused per-leaf gradient scaling: combines the
                 # Stage D head-LR ramp and the Stage G freeze mask. With an
                 # all-True ``freeze_mask`` (regular training) the freeze
@@ -6847,8 +7122,24 @@ def main():
                     grads, comb_opt_state, comb_agent
                 )
                 new_agent = eqx.apply_updates(comb_agent, updates)
-                next_carry, _ = eqx.partition((new_agent, new_opt_state), eqx.is_array)
-                return (next_carry, step + 1), metrics
+                # THE PROBE'S OWN GRADIENT, ITS OWN CHAIN, ITS OWN TREE. The
+                # agent is not an argument of `_probe_loss`, so no cotangent of
+                # this scalar can reach a policy parameter -- and the probe
+                # scalar is never added to `total_loss`, so the PPO gradient
+                # above never saw a probe weight either.
+                if _PROBE_ON:
+                    _pgrads, _pmet = eqx.filter_grad(
+                        _probe_loss, has_aux=True)(comb_probes, _probe_pack)
+                    _pupd, new_probe_opt = probe_optimizer.update(
+                        _pgrads, comb_probe_opt, comb_probes)
+                    new_probes = eqx.apply_updates(comb_probes, _pupd)
+                else:
+                    new_probes = new_probe_opt = _pmet = None
+                next_carry, _ = eqx.partition(
+                    (new_agent, new_opt_state, new_probes, new_probe_opt),
+                    eqx.is_array)
+                return (next_carry, step + 1), (
+                    (metrics, _pmet) if _PROBE_ON else metrics)
 
             return lax.scan(mb_step_fn, (carry, step), (batches, mb_keys))
 
@@ -6865,7 +7156,16 @@ def main():
         dynamic_carry, metrics_seq = _pp_mark(
             "prof/update", (dynamic_carry, metrics_seq))
 
-        agent, opt_state = eqx.combine(dynamic_carry, static_carry)
+        (agent, opt_state, probes,
+         probe_opt_state) = eqx.combine(dynamic_carry, static_carry)
+        if _PROBE_ON:
+            metrics_seq, _probe_seq = metrics_seq
+            # Mean over the (ppo_epochs, minibatches) scan axes, the same
+            # reduction the PPO metrics get.
+            probe_metrics = jax.tree_util.tree_map(
+                lambda x: jnp.mean(x, axis=(0, 1)), _probe_seq)
+        else:
+            probe_metrics = None
         # metrics_seq leaves have a leading (ppo_epochs, minibatches) pair.
         # Reduce by mean over those two scan axes only — scalars become
         # scalars, and the per-component KL slot (a (5,) array per step)
@@ -7041,6 +7341,9 @@ def main():
             new_w,
             _attn_ent,
             true_scalar_return,
+            probes,
+            probe_opt_state,
+            probe_metrics,
         )
 
     if not args.no_jit:
@@ -7171,7 +7474,8 @@ def main():
 
     def host_log(
         ep, all_rets, actions_pack, mean_r, mets, diag_pack=None,
-        popart_stats=None, attn_entropy=None, warmup=False, true_return=None):
+        popart_stats=None, attn_entropy=None, warmup=False, true_return=None,
+        probe_metrics=None):
         ep = int(ep)
         all_rets = np.array(all_rets)  # (num_envs, NUM_REWARDS)
         v_idx_arr = np.array(actions_pack[0])
@@ -7976,6 +8280,31 @@ def main():
             # never charged. Drop them: az's warm-up row carries neither.
             log_dict.pop("n_meas", None)
             log_dict.pop("time/episode", None)
+        # FEATURE PROBE (ALPHAGRAD_FEATURE_PROBE=1). THE TWO CONTROLS ARE
+        # THE HARNESS CHECK, not a bonus row: `stat_ln_i` / `stat_ln_j` are
+        # recoverable from the endpoint vertex ids alone and scored 0.96-0.98
+        # in EVERY offline arm. If they do not read ~0.97 here the plumbing is
+        # broken and the five real numbers mean nothing -- so they are printed
+        # on their own line every episode rather than left in a wandb panel.
+        if probe_metrics is not None:
+            _pr2, _pvr2, _plf, _plv = [np.asarray(_x) for _x in probe_metrics]
+            for _i, _nm in enumerate(_fprobe.FACE_NAMES):
+                log_dict[f"probe/r2_{_nm}"] = float(_pr2[_i])
+                log_dict[f"probe/vertex_r2_{_nm}"] = float(_pvr2[_i])
+            log_dict["probe/loss_face"] = float(_plf)
+            log_dict["probe/loss_vertex"] = float(_plv)
+            log_dict["probe/arm"] = _fprobe.PROBE_ARM
+            _nctrl = len(_fprobe.FACE_TARGETS)
+            print(
+                "[probe] arm=%s | CONTROLS %s | targets %s | loss %.4g/%.4g"
+                % (_fprobe.PROBE_ARM,
+                   " ".join("%s=%.3f" % (_n, float(_pr2[_nctrl + _k]))
+                            for _k, _n in enumerate(_fprobe.FACE_CONTROLS)),
+                   " ".join("%s=%.3f" % (_n, float(_pr2[_k]))
+                            for _k, _n in enumerate(_fprobe.FACE_TARGETS)),
+                   float(_plf), float(_plv)),
+                flush=True)
+
         # PER-EPISODE JSONL SINK (ALPHAGRAD_UPDATE_JSONL, default off).
         # Written BEFORE wandb.log so a crashed/offline run still has it, and
         # append-only so a mid-run kill keeps every completed episode. Carries
@@ -8582,6 +8911,9 @@ def main():
             popart_w,
             attn_ent,
             true_scalar_return,
+            probes,
+            probe_opt_state,
+            probe_metrics,
         ) = train_episode(
             agent,
             opt_state,
@@ -8599,6 +8931,8 @@ def main():
             popart_m1,
             popart_m2,
             popart_w,
+            probes,
+            probe_opt_state,
         )
         if _xtr_on:
             # The trace has to stay open until the device is drained or the
@@ -8640,6 +8974,7 @@ def main():
                 args.popart_sigma_min, 1e12),
             attn_entropy=attn_ent,
             true_return=float(true_scalar_return),
+            probe_metrics=probe_metrics,
         )
         # Mid-training top-N snapshot. Skips the wandb table log so we
         # don't pollute the offline run with duplicate tables — only the
