@@ -46,9 +46,10 @@ NV = 5
 
 @pytest.fixture(scope="module")
 def probes():
+    # LEAN = exactly the live head's input (the face latent alone).
     return FP.FeatureProbes(
         embd_dim=EMBD, max_axes=NAXES, n_vertex_out=3, width=32,
-        key=jax.random.PRNGKey(0), use_extents=False)
+        key=jax.random.PRNGKey(0), arm=FP.FaceProbeArm.LEAN)
 
 
 @pytest.fixture(scope="module")
@@ -64,19 +65,17 @@ def data():
 
 
 def _face_loss(probes, d):
-    pred = jax.vmap(probes.face_predict)(d["ctx_i"], d["ctx_j"], d["lat"])
+    pred = jax.vmap(probes.face_predict)(d["lat"])
     return FP.masked_mse(pred, d["tgt"], d["valid"]).sum()
 
 
 def test_probe_loss_has_no_gradient_to_its_inputs(probes, data):
-    """The representation is a CONSTANT to the probe loss, on every input."""
-    def loss_wrt_inputs(ctx_i, ctx_j, lat):
-        d = dict(data, ctx_i=ctx_i, ctx_j=ctx_j, lat=lat)
-        return _face_loss(probes, d)
+    """The representation is a CONSTANT to the probe loss."""
+    def loss_wrt_inputs(lat):
+        return _face_loss(probes, dict(data, lat=lat))
 
-    g = jax.grad(loss_wrt_inputs, argnums=(0, 1, 2))(
-        data["ctx_i"], data["ctx_j"], data["lat"])
-    for name, gi in zip(("ctx_i", "ctx_j", "face_latent"), g):
+    g = (jax.grad(loss_wrt_inputs)(data["lat"]),)
+    for name, gi in zip(("face_latent",), g):
         arr = np.asarray(gi)
         assert np.all(arr == 0.0), (
             f"probe gradient LEAKED into {name}: max|g|={np.abs(arr).max()}. "
@@ -155,16 +154,48 @@ def test_degenerate_target_scores_zero_not_one():
     assert float(r2[0]) == 0.0, "a degenerate target reported a perfect decode"
 
 
-def test_extents_arm_refuses_to_run_without_extents():
-    p = FP.FeatureProbes(
+def test_reference_arms_refuse_to_run_without_their_extra_inputs():
+    """A reference arm must FAIL LOUDLY rather than silently score the lean
+    input under a different name -- that would corrupt the paired rows."""
+    ep = FP.FeatureProbes(
         embd_dim=EMBD, max_axes=NAXES, n_vertex_out=3, width=16,
-        key=jax.random.PRNGKey(2), use_extents=True)
-    with pytest.raises(ValueError, match="use_extents"):
-        p.face_predict(jnp.zeros(EMBD), jnp.zeros(EMBD), jnp.zeros(EMBD))
+        key=jax.random.PRNGKey(2), arm=FP.FaceProbeArm.ENDPOINTS)
+    with pytest.raises(ValueError, match="ENDPOINTS"):
+        ep.face_predict(jnp.zeros(EMBD))
+    ex = FP.FeatureProbes(
+        embd_dim=EMBD, max_axes=NAXES, n_vertex_out=3, width=16,
+        key=jax.random.PRNGKey(3), arm=FP.FaceProbeArm.EXTENTS)
+    with pytest.raises(ValueError, match="EXTENTS"):
+        ex.face_predict(jnp.zeros(EMBD))
 
 
-def test_bars_and_null_cover_every_named_target():
+def test_lean_arm_input_width_matches_the_live_head():
+    """The whole point: the probe sees what UnifiedFaceHead sees.
+    UnifiedFacePolicy builds UnifiedFaceHead(embd_dim, in_dim=embd_dim), and
+    _repr returns the face latent unchanged -- so LEAN must be E, not 3E."""
+    assert FP.face_input_dim(FP.FaceProbeArm.LEAN, EMBD, NAXES) == EMBD
+    assert FP.face_input_dim(FP.FaceProbeArm.ENDPOINTS, EMBD, NAXES) == 3 * EMBD
+    assert FP.face_input_dim(FP.FaceProbeArm.EXTENTS, EMBD, NAXES) == EMBD + NAXES
+
+
+def test_unknown_arm_is_rejected():
+    with pytest.raises(ValueError, match="unknown face probe arm"):
+        FP.FeatureProbes(embd_dim=EMBD, max_axes=NAXES, n_vertex_out=3,
+                         width=16, key=jax.random.PRNGKey(4), arm="nope")
+
+
+def test_steps_to_threshold():
+    assert FP.steps_to_threshold([0.0, 0.2, 0.55, 0.8], 0.5) == 2
+    assert FP.steps_to_threshold([0.0, 0.1], 0.5) == -1
+
+
+def test_bars_are_labelled_as_a_reference_not_a_lean_target():
+    """The bars were measured on the ENDPOINTS arm plus extents. The lean arm
+    removes ctx_i/ctx_j on top of that, so BARS is a reference line."""
     for name in FP.FACE_TARGETS:
-        assert name in FP.BARS, f"{name} has no offline bar to compare against"
-        assert name in FP.OFFLINE_NULL, f"{name} has no offline null"
+        assert name in FP.BARS
+        assert name in FP.OFFLINE_ENDPOINTS_NULL
+
+
+def test_names_and_arity_agree():
     assert len(FP.FACE_NAMES) == FP.NFT

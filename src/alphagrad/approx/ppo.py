@@ -4902,14 +4902,32 @@ def main():
     # `ALPHAGRAD_FEATURE_PROBE` is unset.
     _PROBE_FACES = min(
         int(os.environ.get("ALPHAGRAD_FEATURE_PROBE_FACES", "32")), _F_FACES)
-    _PROBE_ON = bool(_fprobe.PROBE_ON) and bool(
-        getattr(args, "dynamic_substeps", False))
+    # The probe measures the LIVE face pipeline, so it needs ALL of it.
+    # --no-approx-head DELETES the face head (the agent factory sets
+    # face_path_policy = None), which leaves face_out = None in the rollout:
+    # zero endpoints, zero latents, and a probe that decodes zeros. Job 61427
+    # (NN256, GPU) ran exactly that flag combination for an hour -- every
+    # control target was 0 and every R2 column read 0.000. Refuse loudly.
+    _PROBE_ON = bool(_fprobe.PROBE_ON) and all((
+        bool(getattr(args, "dynamic_substeps", False)),
+        bool(getattr(args, "live_faces", False)),
+        bool(getattr(args, "face_actions", False)),
+        bool(getattr(args, "unified_face_head", False)),
+        not getattr(args, "no_approx_head", False),
+    ))
     if _fprobe.PROBE_ON and not _PROBE_ON:
-        print("[probe] ALPHAGRAD_FEATURE_PROBE=1 IGNORED: the probe reads the "
-              "per-face scatter and the pointer slots, both of which only the "
-              "--dynamic-substeps path builds.", flush=True)
-    # [failed target builds, one-shot census done]
-    _PROBE_FAILS = [0, 0]
+        print("[probe] ALPHAGRAD_FEATURE_PROBE=1 IGNORED: the probe reads "
+              "the per-face scatter, which exists only under "
+              "--dynamic-substeps --live-faces --face-actions "
+              "--unified-face-head and WITHOUT --no-approx-head "
+              "(--no-approx-head removes the face head entirely, so the "
+              "probe would decode zeros -- job 61427).", flush=True)
+    # [ppo-level target-build failures, first-callback census done,
+    #  first nonzero-face census done]
+    _PROBE_FAILS = [0, 0, 0]
+    # Per-episode n_faces histogram over probe callbacks; printed and reset
+    # by the per-episode probe census line in host_log.
+    _PROBE_NF_HIST = np.zeros(_PROBE_FACES + 1, np.int64)
     if _PROBE_ON:
         # THE STATIC CONTROLS' pre-image: log2 numel of an endpoint vertex's
         # output var, keyed by the 1-based vertex id `face_endpoints` stores
@@ -4948,8 +4966,9 @@ def main():
                         endpoints=np.asarray(ends, np.int32))
                 except Exception as _pexc:
                     _PROBE_FAILS[0] += 1
+                    _PROBE_NF_HIST[0] += 1
                     if _PROBE_FAILS[0] <= 3:
-                        print("[probe] target build FAILED for vertex "
+                        print("[probe census] target build FAILED for vertex "
                               f"{v}: {type(_pexc).__name__}: "
                               f"{str(_pexc)[:200]}", flush=True)
                     return tgt, ext, val
@@ -4957,21 +4976,29 @@ def main():
                 tgt[:_nf] = _t[:_nf]
                 ext[:_nf] = _e[:_nf]
                 val[:_nf] = 1.0
-                # ONE-SHOT TARGET CENSUS. A within-step R2 of 0 has two very
-                # different causes -- "the representation cannot decode it"
-                # and "the target is constant, so there is nothing to decode"
-                # -- and within_step_r2 reports 0 for BOTH by design. This
-                # prints the per-column spread once, on the first vertex that
-                # yields faces, so the two are distinguishable from the log.
-                if _PROBE_FAILS[1] == 0 and _nf > 0:
+                _PROBE_NF_HIST[_nf] += 1
+                # TARGET CENSUS. A within-step R2 of 0 has two very different
+                # causes -- "the representation cannot decode it" and "the
+                # target is constant, so there is nothing to decode" -- and
+                # within_step_r2 reports 0 for BOTH by design. Printed
+                # UNCONDITIONALLY on the first callback (and again on the
+                # first vertex that yields faces, if the first had none), so
+                # the two are distinguishable from any log. The marker is
+                # "probe census" -- job 61427's launcher grepped for exactly
+                # that and the old "[probe] first targets" line vanished.
+                if _PROBE_FAILS[1] == 0 or (_PROBE_FAILS[2] == 0
+                                            and _nf > 0):
                     _PROBE_FAILS[1] = 1
-                    print("[probe] first targets: vertex=%d n_faces=%d "
-                          "endpoints=%s" % (v, _nf,
-                                            np.asarray(ends)[:_nf].tolist()),
+                    if _nf > 0:
+                        _PROBE_FAILS[2] = 1
+                    print("[probe census] first targets: vertex=%d "
+                          "n_faces=%d endpoints=%s"
+                          % (v, _nf, np.asarray(ends)[:_nf].tolist()),
                           flush=True)
                     for _c, _nm in enumerate(_fprobe.FACE_NAMES):
-                        _col = tgt[:_nf, _c]
-                        print("[probe]   %-10s min=%.3f max=%.3f std=%.3f"
+                        _col = tgt[:max(_nf, 1), _c]
+                        print("[probe census]   %-10s min=%.3f max=%.3f "
+                              "std=%.3f"
                               % (_nm, float(_col.min()), float(_col.max()),
                                  float(_col.std())), flush=True)
                 return tgt, ext, val
@@ -6433,13 +6460,16 @@ def main():
         # it measures, either of which alone is sufficient.
         _probe_pack = None
         if _PROBE_ON:
-            _B = batch.vertex_idx.shape[0]
             _lat, _vctx = probe_reprs
             if _lat is None:
-                _lat = jnp.zeros((_B, _PROBE_FACES, args.embd_dim),
-                                 jnp.float32)
-            else:
-                _lat = _lat[:, :_PROBE_FACES]
+                # No face latents on the loss path. Decoding zeros is not a
+                # measurement (job 61427); the setup gate should have refused
+                # this configuration already, so reaching here is a bug.
+                raise RuntimeError(
+                    "feature probe: the loss path produced no face latents; "
+                    "the probe needs the --live-faces replay "
+                    "(face_path_policy present and face_chunks stored).")
+            _lat = _lat[:, :_PROBE_FACES]
             _lat = jax.lax.stop_gradient(_lat)
             _vctx = jax.lax.stop_gradient(_vctx)
             if _fprobe.PROBE_ARM == _fprobe.FaceProbeArm.ENDPOINTS:
@@ -6548,12 +6578,17 @@ def main():
         v_pred = jax.vmap(probes.vertex_predict)(vctx)
         l_vertex = _fprobe.masked_mse(v_pred, v_tgt, v_val).sum()
 
+        # NO R2 HERE. Computed per minibatch, a within-step group is only
+        # (rows at that step in the minibatch) x faces; at --minibatches >=
+        # --num-envs the groups degenerate to single vertices, centring
+        # annihilates them and the statistic is noise regardless of the
+        # representation. The predictions and targets ride out through the
+        # aux instead, and train_episode computes ONE R2 per episode over
+        # the full batch -- the largest groups obtainable.
         _sid = sid.astype(jnp.int32)
-        r2 = _fprobe.within_step_r2(
-            f_pred, f_tgt, f_val, jnp.repeat(_sid, n_p), _PROBE_NSTEPS)
-        v_r2 = _fprobe.within_step_r2(
-            v_pred, v_tgt, v_val, _sid, _PROBE_NSTEPS)
-        return l_face + l_vertex, (r2, v_r2, l_face, l_vertex)
+        aux = (f_pred, f_tgt, f_val, jnp.repeat(_sid, n_p),
+               v_pred, v_tgt, v_val, _sid, l_face, l_vertex)
+        return l_face + l_vertex, aux
 
     def train_episode(
         agent,
@@ -7160,10 +7195,25 @@ def main():
          probe_opt_state) = eqx.combine(dynamic_carry, static_carry)
         if _PROBE_ON:
             metrics_seq, _probe_seq = metrics_seq
-            # Mean over the (ppo_epochs, minibatches) scan axes, the same
-            # reduction the PPO metrics get.
-            probe_metrics = jax.tree_util.tree_map(
-                lambda x: jnp.mean(x, axis=(0, 1)), _probe_seq)
+            (_fp, _ft, _fv, _fs, _vp, _vt, _vv, _vs,
+             _plf, _plv) = _probe_seq
+            # ONE R2 per episode, over the FULL batch: the LAST epoch's
+            # predictions (the most-trained probe), all minibatches
+            # concatenated back into the whole episode. See the note in
+            # _probe_loss for why per-minibatch R2 was wrong.
+            def _last_epoch_flat(x):
+                return x[-1].reshape((-1,) + tuple(x.shape[3:]))
+            _r2 = _fprobe.within_step_r2(
+                _last_epoch_flat(_fp), _last_epoch_flat(_ft),
+                _last_epoch_flat(_fv),
+                _last_epoch_flat(_fs).astype(jnp.int32), _PROBE_NSTEPS)
+            _v_r2 = _fprobe.within_step_r2(
+                _last_epoch_flat(_vp), _last_epoch_flat(_vt),
+                _last_epoch_flat(_vv),
+                _last_epoch_flat(_vs).astype(jnp.int32), _PROBE_NSTEPS)
+            # The two losses keep the PPO metrics' reduction: mean over both
+            # scan axes.
+            probe_metrics = (_r2, _v_r2, jnp.mean(_plf), jnp.mean(_plv))
         else:
             probe_metrics = None
         # metrics_seq leaves have a leading (ppo_epochs, minibatches) pair.
@@ -8304,6 +8354,20 @@ def main():
                             for _k, _n in enumerate(_fprobe.FACE_TARGETS)),
                    float(_plf), float(_plv)),
                 flush=True)
+            # Host-side census, once per episode: how many faces each probe
+            # callback saw, and whether any target build failed. A failure
+            # used to be silently indistinguishable from "no faces".
+            _hist = " ".join("%d:%d" % (_k, int(_c))
+                             for _k, _c in enumerate(_PROBE_NF_HIST) if _c)
+            _tf = int(_fprobe.TARGET_FAILS[0]) + int(_PROBE_FAILS[0])
+            _cmsg = "[probe census] n_faces hist {%s}" % (_hist or "empty")
+            if _tf:
+                _cmsg += " | target-build FAILS %d (last: %s)" % (
+                    _tf, _fprobe.LAST_TARGET_ERR[0] or "see FAILED lines")
+            print(_cmsg, flush=True)
+            _PROBE_NF_HIST[:] = 0
+            _fprobe.TARGET_FAILS[0] = 0
+            _PROBE_FAILS[0] = 0
 
         # PER-EPISODE JSONL SINK (ALPHAGRAD_UPDATE_JSONL, default off).
         # Written BEFORE wandb.log so a crashed/offline run still has it, and
