@@ -3256,6 +3256,15 @@ def make_argparser() -> argparse.ArgumentParser:
              "ramp holds the policy near identity until the baseline is "
              "accurate, so the first step toward low quality meets a "
              "correctly-scaled negative advantage.")
+    p.add_argument(
+        "--lr-warmup-mult", action="store_true",
+        help="MULTIPLICATIVE warmup: the linear ramp multiplies a FULL-length "
+             "cosine (which starts decaying at step 0), instead of the "
+             "piecewise ramp-then-cosine. The post-warmup tail is then "
+             "pointwise identical to the no-warmup schedule -- the piecewise "
+             "form exits warmup at 1.0x peak where the plain cosine would "
+             "already be at ~0.91x, i.e. it runs hotter through the middle. "
+             "Only read when --lr-warmup-frac > 0.")
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--ppo-clip-eps", type=float, default=0.2)
     p.add_argument("--minibatches", type=int, default=32)
@@ -5335,16 +5344,34 @@ def main():
         # value, where the plain cosine takes alpha as a FRACTION of the
         # peak -- converted here so the tail matches the old schedule.
         _warm = max(1, int(_decay_steps * _wf))
-        schedule = optax.warmup_cosine_decay_schedule(
-            init_value=args.lr * 1e-3,
-            peak_value=args.lr,
-            warmup_steps=_warm,
-            decay_steps=_decay_steps,
-            end_value=args.lr * args.lr_decay_min_mult,
-        )
-        print(f"[lr] linear warmup {_warm} steps "
-              f"({_wf:.0%} of {_decay_steps}), then cosine to "
-              f"{args.lr * args.lr_decay_min_mult:.2e}", flush=True)
+        if bool(getattr(args, "lr_warmup_mult", False)):
+            # ramp x full-length cosine: cosine phase runs 0.._decay_steps
+            # from step 0; the ramp is a pure multiplicative envelope, so
+            # after _warm steps the schedule rejoins the plain cosine
+            # POINTWISE (a schedule in optax is just a callable of the step
+            # count -- jnp ops keep it jit-safe inside the optimiser).
+            _cos = optax.cosine_decay_schedule(
+                args.lr, _decay_steps, args.lr_decay_min_mult)
+
+            def schedule(count):
+                ramp = jnp.clip((count + 1.0) / float(_warm), 1e-3, 1.0)
+                return _cos(count) * ramp
+
+            print(f"[lr] MULT warmup {_warm} steps ({_wf:.0%} of "
+                  f"{_decay_steps}): linear envelope x full cosine; tail "
+                  f"pointwise-identical to the no-warmup schedule",
+                  flush=True)
+        else:
+            schedule = optax.warmup_cosine_decay_schedule(
+                init_value=args.lr * 1e-3,
+                peak_value=args.lr,
+                warmup_steps=_warm,
+                decay_steps=_decay_steps,
+                end_value=args.lr * args.lr_decay_min_mult,
+            )
+            print(f"[lr] linear warmup {_warm} steps "
+                  f"({_wf:.0%} of {_decay_steps}), then cosine to "
+                  f"{args.lr * args.lr_decay_min_mult:.2e}", flush=True)
     else:
         schedule = optax.cosine_decay_schedule(
             args.lr,
