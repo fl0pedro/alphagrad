@@ -524,13 +524,26 @@ class LiveVertexMaskOracle:
         }
         self._eliminated: set[int] = set()
 
-    def advance(self, vertex: int, rules=()):
+    def advance(self, vertex: int, rules=(), face_wires=None):
         """Commit one elimination so later masks see the post-step graph.
 
         ``rules`` must be the transforms the env ACTUALLY applied at this
         vertex (``rule_specs_to_transforms``' output for it) -- an earlier
         approximation changes the structure of every downstream edge, so a mask
         computed against an exact-elimination replay would be wrong.
+
+        ``face_wires`` (probe-path hygiene, docs/FACE_LATENT_INFO_LOSS.md
+        section 4): the step's REALIZED per-face decisions as
+        ``(face_rows (F, S, 3), face_skips (F,))`` wire rows. Under
+        --live-faces the per-vertex ``rules`` are all-exact and the real
+        approximations live in these wires, so a replay that drops them
+        rebuilds an exact graph the measurement never built -- targets
+        decoded from it drift as soon as the face head approximates.
+        Decoding mirrors ``live_faces.LiveFaceStream._decided`` (position-
+        independent wire decode, ``make_live_masked_hook`` wrap, SKIP_FACE
+        for skips), with keys from :func:`graphax.core.faces_of` on each
+        dispatch mode's own live graph. Default ``None`` = the historical
+        exact-face replay every mask consumer keeps.
         """
         from graphax.sparse.elemental.dispatch import (
             approx_active, set_approx_active,
@@ -541,10 +554,56 @@ class LiveVertexMaskOracle:
         try:
             for mode, incr in self._incrs.items():
                 set_approx_active(mode)
-                incr.eliminate(vertex, rules=tuple(rules))
+                ft = None
+                if face_wires is not None:
+                    try:
+                        ft = self._face_ft(incr, vertex, face_wires)
+                    except Exception:
+                        # A face decode must never take the replay down --
+                        # worst case is the historical exact-face behaviour.
+                        ft = None
+                incr.eliminate(vertex, rules=tuple(rules),
+                               face_transforms=ft or None)
         finally:
             set_approx_active(prev)
         self._eliminated.add(vertex)
+
+    def _face_ft(self, incr, vertex, face_wires):
+        """``{face_key: slots | SKIP_FACE}`` decoded from realized wires.
+
+        Returns ``None`` for an all-inert step (no skip, every row still
+        the -1 fill) so the exact path pays no ``faces_of`` enumeration.
+        """
+        face_rows, face_skips = face_wires
+        fr = np.asarray(face_rows)
+        fs = np.asarray(face_skips)
+        if not (np.any(fs == 1) or np.any(fr >= 0)):
+            return None
+        from graphax import SKIP_FACE
+        from graphax.core import faces_of
+        from alphagrad.approx.env import (
+            FACE_SLOTS, MAX_RULES_PER_VERTEX, decode_vertex_rule_specs)
+
+        keys = faces_of(incr.graph, incr.tgraph, int(vertex), incr.jaxpr)
+        ft: dict = {}
+        for f in range(min(len(keys), fr.shape[0])):
+            if int(fs[f]) == 1:
+                ft[keys[f]] = SKIP_FACE
+                continue
+            slots = []
+            for s in range(FACE_SLOTS):
+                row = [[int(x) for x in fr[f][s]]] + [
+                    [-1, -1, 0]] * (MAX_RULES_PER_VERTEX - 1)
+                try:
+                    rls = decode_vertex_rule_specs(
+                        self.jaxpr, int(vertex), row)
+                except Exception:
+                    rls = ()
+                slots.append(make_live_masked_hook(tuple(rls))
+                             if rls else None)
+            if any(sl is not None for sl in slots):
+                ft[keys[f]] = tuple(slots)
+        return ft or None
 
     @property
     def eliminated(self):

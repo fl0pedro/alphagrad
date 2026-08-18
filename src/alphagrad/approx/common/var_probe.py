@@ -202,9 +202,9 @@ def face_var_targets_host(oracle, vertex, max_faces):
     vertex = int(vertex)
     events: list = []
 
-    def _rec(slot):
+    def _rec(key, slot):
         def _hook(st):
-            events.append((slot, meta_of_sparse(st)))
+            events.append((key, slot, meta_of_sparse(st)))
             return st
         return _hook
 
@@ -218,7 +218,7 @@ def face_var_targets_host(oracle, vertex, max_faces):
         keys = faces_of(graph, tgraph, vertex, incr.jaxpr)
         if not keys:
             return tgt, val, 0
-        ft = {k: ((_rec("lhs"), _rec("rhs"), _rec("res")),
+        ft = {k: ((_rec(k, "lhs"), _rec(k, "rhs"), _rec(k, "res")),
                   (None, None, None))
               for k in set(keys)}
         n_eqns0 = len(incr.trace.frame.tracing_eqns)
@@ -245,21 +245,30 @@ def face_var_targets_host(oracle, vertex, max_faces):
             return tgt, val, 0
         # A mid-elimination failure still yields the faces recorded so far.
 
-    faces: list = []
-    cur = None
-    for slot, meta in events:
-        if slot == "lhs" or cur is None:
-            cur = {}
-            faces.append(cur)
-        cur[slot] = meta
-    n_faces = min(len(faces), F)
-    for k in range(n_faces):
+    # KEYED parse (hygiene (i), docs/FACE_LATENT_INFO_LOSS.md section 2
+    # H-A): rows follow the ENUMERATION order of ``keys`` -- the same order
+    # the face loop pools latents in -- and each row is filled only from
+    # events recorded UNDER THAT FACE'S KEY, the way live_faces keys
+    # chunks. The old positional parse ("new face at each lhs") misassigned
+    # every row after a mid-elimination failure and shifted neighbours when
+    # a face emitted nothing (SKIP_FACE prefix replays); such faces are now
+    # masked rows in place. First event per (key, slot) wins: it is the
+    # operand the head decided over (a two-op face form fires later hooks
+    # on derived tensors).
+    by_key: dict = {}
+    for k, slot, meta in events:
+        by_key.setdefault(k, {}).setdefault(slot, meta)
+    n_faces = min(len(keys), F)
+    for r in range(n_faces):
+        m = by_key.get(keys[r])
+        if not m:
+            continue  # skipped / failed face: every slot stays masked
         for s, sname in enumerate(VAR_SLOTS):
-            meta = faces[k].get(sname)
+            meta = m.get(sname)
             if meta is None:
                 continue  # truncated face (mid-face failure): slot masked
-            tgt[k, s] = encode_var(*meta)
-            val[k, s] = 1.0
+            tgt[r, s] = encode_var(*meta)
+            val[r, s] = 1.0
     return tgt, val, n_faces
 
 

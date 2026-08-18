@@ -5296,7 +5296,34 @@ def main():
                  _vprobe.N_DIM_BUCKETS, _vprobe.MAX_NDIM,
                  _VP_VTAB_np.shape, float(_VP_VVAL_np.mean())), flush=True)
 
-        def _vp_targets_host(order, spec_hist, step_count, vertex_idx):
+        def _vp_oracle_replay(eo, specs, n, frh, fsh):
+            # FACE-AWARE prefix replay (hygiene (ii), docs/
+            # FACE_LATENT_INFO_LOSS.md section 4): _oracle_replay advances
+            # from per-vertex specs only, and under --live-faces those are
+            # all-exact -- the realized approximations live in the FACE
+            # wires (face_specs / face_skips). Targets built on an exact
+            # replay silently drift from the measured graph once the face
+            # head approximates (irrelevant at v61's 0.7% approx rate, not
+            # at a trained one's). Deliberately SEPARATE from
+            # _oracle_replay: the mask oracle (policy path) and its memo
+            # stay byte-identical.
+            o = _LVMO(_oracle_jaxpr, _oracle_consts, _oracle_args,
+                      _oracle_argnums, max_axes=_oracle_N)
+            for k in range(n):
+                v = int(eo[k])
+                try:
+                    rules = _decode_specs(_oracle_jaxpr, v, specs[k])
+                except Exception:
+                    rules = ()
+                try:
+                    o.advance(v, rules=rules,
+                              face_wires=(frh[k], fsh[k]))
+                except Exception:
+                    break
+            return o
+
+        def _vp_targets_host(order, spec_hist, step_count, vertex_idx,
+                             face_hist, skip_hist):
             _pt0 = _prof_time.perf_counter()
             try:
                 eo = np.asarray(order).reshape(-1)
@@ -5312,7 +5339,9 @@ def main():
                                      np.float32),
                             np.zeros((P, _vprobe.N_SLOTS), np.float32))
                 try:
-                    o = _oracle_replay(eo, specs, n)
+                    o = _vp_oracle_replay(
+                        eo, specs, n,
+                        np.asarray(face_hist), np.asarray(skip_hist))
                     t, va, nf = _vprobe.face_var_targets_host(o, v, P)
                 except Exception as _exc:
                     _VP_FAILS[0] += 1
@@ -5347,7 +5376,8 @@ def main():
                 _env_prof_add("oracle.var_probe",
                               _prof_time.perf_counter() - _pt0)
 
-        def _vp_targets(order, spec_hist, step_count, vertex_idx):
+        def _vp_targets(order, spec_hist, step_count, vertex_idx,
+                        face_hist, skip_hist):
             P = _PROBE_FACES
             return jax.pure_callback(
                 _vp_targets_host,
@@ -5355,6 +5385,7 @@ def main():
                     (P, _vprobe.N_SLOTS, _vprobe.TGT_COLS), jnp.float32),
                  jax.ShapeDtypeStruct((P, _vprobe.N_SLOTS), jnp.float32)),
                 order, spec_hist, step_count, vertex_idx,
+                face_hist, skip_hist,
                 vmap_method="sequential",
             )
     else:
@@ -6178,7 +6209,7 @@ def main():
             if _VPROBE_ON:
                 _vp_t, _vp_v = _vp_targets(
                     state.order, state.sparsity_specs, state.step_count,
-                    vertex_idx)
+                    vertex_idx, state.face_specs, state.face_skips)
                 _vp_fields = dict(vp_targets=_vp_t, vp_valid=_vp_v)
             else:
                 _vp_fields = {}
