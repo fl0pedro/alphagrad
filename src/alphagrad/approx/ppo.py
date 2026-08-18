@@ -627,6 +627,19 @@ def _lag_dual_ascent(lam: float, mean_violation: float, eta: float,
                          lam_min, lam_max))
 
 
+def _face_entropy_floor_penalty(h_face, floor, weight):
+    """--face-entropy-floor hinge: ``weight * relu(floor - H_face)**2``.
+
+    Zero at and above the floor; below it the gradient w.r.t. H is
+    ``-2*weight*(floor - H)`` -- it GROWS as the head saturates, exactly
+    when the ``-entropy_weight * H`` bonus gradient is vanishing. Pinned
+    by tests/face_entropy_floor_test.py, including the adversarial
+    pushed-toward-determinism bound under the --face-logit-clamp tanh
+    parameterization.
+    """
+    return weight * jnp.maximum(0.0, floor - h_face) ** 2
+
+
 def _lag_basin_freeze(old_stats, new_stats, q_terminal, lag_tau, head_idx):
     """Dossier section-10(3) basin-freeze guard for the quality PopArt channel.
 
@@ -3432,6 +3445,29 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--minibatches", type=int, default=32)
     p.add_argument("--ppo-epochs", type=int, default=2)
     p.add_argument("--entropy-weight", type=float, default=0.05)
+    p.add_argument("--face-entropy-floor", type=float, default=0.0,
+                   help="saturation guard for the per-FACE approximation "
+                   "head (v61 collapsed to 100%% SKIP, approx-head entropy "
+                   "8e-5, after which all plans were identical, all "
+                   "advantages zero and PG dead): hinge penalty "
+                   "face_entropy_floor_weight * relu(floor - H_face)^2 "
+                   "ADDED to the loss, where H_face is the arity-"
+                   "normalised mean per-face policy entropy the loss "
+                   "already computes (slot 5 of _entropy_components, the "
+                   "entropy/approx_head panel -- no second entropy "
+                   "computation). Below the floor the penalty gradient "
+                   "GROWS (2*w*(floor-H)) while the entropy BONUS gradient "
+                   "vanishes under a saturating softmax -- that asymmetry "
+                   "is the point. Nats; 0 = off.")
+    p.add_argument("--face-entropy-floor-weight", type=float, default=10.0,
+                   help="weight of the --face-entropy-floor hinge.")
+    p.add_argument("--face-logit-clamp", type=float, default=15.0,
+                   help="bound every unified-face-head logit to (-C, C) "
+                   "via C*tanh(z/C) before softmax/sigmoid (see "
+                   "unified_face_head.LOGIT_CLAMP): keeps raw-logit drift "
+                   "finite so the --face-entropy-floor hinge never loses "
+                   "its restoring gradient. Near-identity for |z| << C. "
+                   "0 = off.")
     p.add_argument("--value-weight", type=float, default=0.5)
     p.add_argument("--discount", type=float, default=0.99)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
@@ -4370,6 +4406,10 @@ def _setup_jax_compile_cache() -> None:
 
 def main():
     args = make_argparser().parse_args()
+    # --face-logit-clamp must be installed BEFORE any jit trace exists:
+    # UnifiedFaceHead.logits reads the module constant at trace time.
+    from alphagrad.approx.unified_face_head import set_logit_clamp
+    set_logit_clamp(float(getattr(args, "face_logit_clamp", 0.0)))
 
     # ``ALPHAGRAD_TRACEMALLOC=1`` — start the Python allocator tracker
     # before any model code runs. Per-episode snapshots are diffed
@@ -6817,6 +6857,18 @@ def main():
             + args.value_weight * value_loss
             - args.entropy_weight * entropy_loss
         )
+        # --face-entropy-floor: hinge on the SAME quantity slot 5 of
+        # _entropy_components logs (jnp.mean(face_ents), the
+        # entropy/approx_head panel). Static gate: the face head must
+        # exist, or face_ents is a structural zero and the hinge would
+        # penalise a head that was never built.
+        if (float(getattr(args, "face_entropy_floor", 0.0)) > 0.0
+                and bool(getattr(args, "face_actions", False))
+                and bool(getattr(args, "unified_face_head", False))):
+            total_loss = total_loss + _face_entropy_floor_penalty(
+                jnp.mean(face_ents),
+                float(args.face_entropy_floor),
+                float(args.face_entropy_floor_weight))
 
         # ---------------------------------------------------- FEATURE PROBE
         # The pack is returned as `has_aux` DATA, never as a term of
@@ -8274,6 +8326,17 @@ def main():
                         args, "face_actions", False):
                     log_dict["entropy/approx_head"] = float(
                         entropy_components[5])
+                    if float(getattr(args, "face_entropy_floor", 0.0)) > 0:
+                        # entropy_floor/*: H_face is the minibatch-mean the
+                        # loss hinges on; the penalty here is recomputed
+                        # from the episode-mean H (telemetry -- mean-of-
+                        # penalty vs penalty-of-mean is fine for a panel).
+                        _ef_h = float(entropy_components[5])
+                        _ef_f = float(args.face_entropy_floor)
+                        _ef_w = float(args.face_entropy_floor_weight)
+                        log_dict["entropy_floor/H_face"] = _ef_h
+                        log_dict["entropy_floor/penalty"] = float(
+                            _ef_w * max(0.0, _ef_f - _ef_h) ** 2)
         # entropy/palimpsa -- the encoder's mean ATTENTION-ROW entropy. Logged
         # outside the dynamic-substeps branch because it is a property of the
         # ENCODER, not of any action head. NOT a policy entropy and NOT

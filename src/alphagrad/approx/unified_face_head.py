@@ -76,6 +76,22 @@ O_SKIP = 0
 O_SLOT0 = 1
 HEAD_WIDTH = O_SLOT0 + FACE_SLOTS * SLOT_WIDTH   # 94
 
+# --face-logit-clamp (v62 saturation guard, ppo.py sets this right after
+# argparse, BEFORE any jit trace -- UnifiedFaceHead.logits reads it at
+# trace time). 0.0 = off, so az_gumbel and every existing test see the
+# unclamped head. When C > 0 every head logit is bounded to (-C, C) via
+# C*tanh(z/C): near-identity for |z| << C, but raw-parameter drift can no
+# longer run the effective logits to +-inf, so the --face-entropy-floor
+# hinge always retains a nonzero restoring gradient and recovery from a
+# saturated head stays possible (a hard clip would have ZERO gradient
+# outside the bound -- exactly where the guard must still pull back).
+LOGIT_CLAMP = [0.0]
+
+
+def set_logit_clamp(c: float) -> None:
+    """Set the global face-logit bound; 0 disables. Call before tracing."""
+    LOGIT_CLAMP[0] = float(c)
+
 
 def slot_base(s: int) -> int:
     return O_SLOT0 + SLOT_WIDTH * s
@@ -196,7 +212,14 @@ class UnifiedFaceHead(eqx.Module):
                                hidden or embd_dim, depth=1, key=key)
 
     def logits(self, ctx):
-        return self.proj(ctx)
+        z = self.proj(ctx)
+        c = LOGIT_CLAMP[0]
+        if c > 0.0:
+            # tanh, not hard clip: see LOGIT_CLAMP. sample() and score()
+            # both come through here, so behaviour and evaluation stay the
+            # same parameterization and the PPO ratio is untouched.
+            z = c * jnp.tanh(z / c)
+        return z
 
     # ------------------------------------------------------------------ score
     def score(self, z, fields: FaceFields, *, op_mask, i_mask, j_mask,
