@@ -2902,6 +2902,16 @@ def make_argparser() -> argparse.ArgumentParser:
              "Requires the --live-faces stack; default off.")
     p.add_argument("--var-probe-lr", type=float, default=1e-3,
                    help="adam LR for the --var-probe heads")
+    p.add_argument("--var-probe-steps", type=int, default=16,
+                   help="--var-probe: build FACE-level targets for a "
+                   "uniformly-sampled subset of this many decision steps "
+                   "per episode (WITHOUT replacement, terminal step always "
+                   "included, resampled each episode) instead of every "
+                   "step -- the face-target oracle replay was 210s of a "
+                   "246s v61 host episode. Vertex targets are a static "
+                   "table and stay per-step. Loss and metric denominators "
+                   "already mask by valid, so they reflect only the "
+                   "supervised steps. 0 = every step (v61 behaviour).")
     p.add_argument(
         "--exec-on-gpu",
         action="store_true",
@@ -5266,6 +5276,12 @@ def main():
               "zeros).", flush=True)
     # [face-target-build failures, first-census-printed]
     _VP_FAILS = [0, 0]
+    # [--var-probe-steps] the episode's supervised-step subset (None =
+    # every step). Refreshed by the episode loop; the host callback still
+    # fires on every step but returns all-invalid rows WITHOUT touching
+    # the oracle replay for unsampled steps, so oracle.var_probe scales
+    # with the sample size, not the horizon.
+    _VP_SEL = [None]
     if _VPROBE_ON:
         # The agent's slot-12 latent return is gated on this env var (the
         # module cannot see args); set BEFORE any jit trace happens.
@@ -5288,6 +5304,13 @@ def main():
                 n = int(np.asarray(step_count))
                 v = int(np.asarray(vertex_idx)) + 1
                 P = _PROBE_FACES
+                if _VP_SEL[0] is not None and n not in _VP_SEL[0]:
+                    # Unsampled step: all-invalid rows. level_loss divides
+                    # by valids.sum() and episode_metrics masks val > 0,
+                    # so denominators reflect only supervised steps.
+                    return (np.zeros((P, _vprobe.N_SLOTS, _vprobe.TGT_COLS),
+                                     np.float32),
+                            np.zeros((P, _vprobe.N_SLOTS), np.float32))
                 try:
                     o = _oracle_replay(eo, specs, n)
                     t, va, nf = _vprobe.face_var_targets_host(o, v, P)
@@ -9278,6 +9301,21 @@ def main():
             )
         ep_key, key = jrand.split(key)
         ep_eval_key, ep_key = jrand.split(ep_key)
+        if _VPROBE_ON and int(getattr(args, "var_probe_steps", 0)) > 0:
+            # --var-probe-steps: resample the supervised subset, WITHOUT
+            # replacement, the terminal decision step (num_valid - 1)
+            # always included. Host-side numpy RNG: never touches the JAX
+            # key chain, so probe-off runs stay bit-identical.
+            _vps_n = max(1, min(int(args.var_probe_steps), num_valid))
+            _vps_rng = np.random.default_rng(
+                (int(args.seed) * 1000003 + ep) & 0x7FFFFFFF)
+            if _vps_n > 1 and num_valid > 1:
+                _vps_pick = _vps_rng.choice(
+                    num_valid - 1, size=_vps_n - 1, replace=False)
+            else:
+                _vps_pick = np.empty((0,), np.int64)
+            _VP_SEL[0] = frozenset(
+                int(x) for x in _vps_pick) | {int(num_valid - 1)}
         if args.preference_conditioned:
             # Stage F mixture: each env independently draws its preference
             # from either the corner Dirichlet (α<1) or the uniform Dirichlet
