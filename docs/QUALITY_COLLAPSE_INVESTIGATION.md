@@ -394,10 +394,11 @@ targets, dual-ascent clip, basin-freeze trigger/non-trigger). Dual ascent:
 `lam <- clip(lam + 0.05 * mean_violation, 0.1, 10)`, once per episode,
 host-side, after the PPO update. Section-10(3) guard: `--popart-basin-freeze`
 (default on) holds the quality channel's (m1, m2, w) for an episode when
->50% of the batch has violation > 0.9*(tau+0.5) (i.e. is diverged-dominated;
-a q=0-dominated batch deliberately does NOT freeze -- with stationary
-targets the channel needs to keep adapting, and the escape signal now rides
-lambda, which rises under violation instead of being eroded by mu).
+>50% of the batch sits in the basin (terminal q_eff <= 0.05, the section-2
+occupancy measure -- covers both the historically observed q = 0.0 zero-work
+mode and diverged plans). Corrected 2026-08-18: the first cut used
+violation > 0.9*(tau+0.5), which needs q < -0.375 and could never fire on
+the v58-v60 basin (q = 0.0 exactly).
 
 Offline falsifier -- zero GPU, the section-10 cheapest test -- against the
 3,024 measured v58b plans (192 eps x 16 envs; the wandb export carries

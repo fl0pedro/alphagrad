@@ -14,10 +14,12 @@ Contracts of the RCPO-style quality-constrained reward
    killing the mult path's [0, 1]-clip conflation.
 3. Dual ascent ``lam <- clip(lam + eta*mean_violation, lam_min, lam_max)``,
    once per episode, host-side, after the PPO update.
-4. Basin freeze: when >50% of the batch is at near-total destruction
-   (violation > 0.9*(tau+0.5)), the quality channel's PopArt accumulators
-   (m1, m2, w -- all per-channel) hold for the episode, so the debiased
-   (mu, sigma) are bitwise unchanged and the ART rescale is a no-op.
+4. Basin freeze: when >50% of the batch sits in the basin (terminal
+   q_eff <= 0.05 -- the dossier's section-2 occupancy measure, covering
+   both the historical q = 0.0 zero-work mode and diverged plans), the
+   quality channel's PopArt accumulators (m1, m2, w -- all per-channel)
+   hold for the episode, so the debiased (mu, sigma) are bitwise unchanged
+   and the ART rescale is a no-op.
 """
 from __future__ import annotations
 
@@ -176,11 +178,14 @@ def _stats(seed):
                              jnp.float32) for _ in range(3))
 
 
-def test_basin_freeze_triggers_on_majority_destruction():
+def test_basin_freeze_triggers_on_majority_basin_occupancy():
     old = _stats(1)
     new = _stats(2)
-    # 9 of 16 diverged: violation 1.25 > 0.9*1.25 = 1.125 -> frac 0.5625.
-    q = jnp.asarray([-1.0] * 9 + [0.885] * 7)
+    # THE HISTORICAL FAILURE MODE (v58-v60): 9 of 16 envs at q = 0.0
+    # exactly (zero-work plans) -> occupancy 0.5625 > 0.5 MUST freeze.
+    # The first-cut predicate (violation > 0.9*(tau+0.5)) required
+    # q < -0.375 and could never fire on this batch.
+    q = jnp.asarray([0.0] * 9 + [0.885] * 7)
     m1, m2, w, frozen = _lag_basin_freeze(old, new, q, TAU, QHEAD)
     assert bool(frozen)
     for got, o, n in zip((m1, m2, w), old, new):
@@ -197,19 +202,35 @@ def test_basin_freeze_triggers_on_majority_destruction():
                                   np.asarray(sg_o)[QHEAD])
 
 
+def test_basin_freeze_diverged_batch_also_freezes():
+    # Diverged plans (q = -1 -> q_eff = -0.5 <= 0.05) count as basin
+    # occupants too: 9 of 16 diverged freezes.
+    old = _stats(1)
+    new = _stats(2)
+    q = jnp.asarray([-1.0] * 9 + [0.885] * 7)
+    *_, frozen = _lag_basin_freeze(old, new, q, TAU, QHEAD)
+    assert bool(frozen)
+
+
 def test_basin_freeze_does_not_trigger_at_half_or_below():
     old = _stats(3)
     new = _stats(4)
-    # Exactly 8 of 16: frac 0.5, NOT > 0.5 -> no freeze.
-    q = jnp.asarray([-1.0] * 8 + [0.885] * 8)
+    # A HEALTHY batch (all plans at the identity quality) must never freeze.
+    q = jnp.asarray([0.885] * 16)
     m1, m2, w, frozen = _lag_basin_freeze(old, new, q, TAU, QHEAD)
     assert not bool(frozen)
     for got, n in zip((m1, m2, w), new):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(n))
-    # Zero-work plans (q=0, violation=tau=0.75 < 1.125) are NOT "near-total
-    # destruction": a q=0-dominated batch must keep PopArt adapting -- the
-    # freeze guards only the diverged-dominated extreme.
-    q = jnp.asarray([0.0] * 16)
+    # 40% occupancy (8 of 20 at q = 0) -> below the majority bar, no freeze.
+    q = jnp.asarray([0.0] * 8 + [0.885] * 12)
+    *_, frozen = _lag_basin_freeze(old, new, q, TAU, QHEAD)
+    assert not bool(frozen)
+    # Exactly half (8 of 16): frac 0.5 is NOT > 0.5 -> no freeze.
+    q = jnp.asarray([0.0] * 8 + [0.885] * 8)
+    *_, frozen = _lag_basin_freeze(old, new, q, TAU, QHEAD)
+    assert not bool(frozen)
+    # Marginal-but-alive plans (q = 0.06 > 0.05) are NOT basin occupants.
+    q = jnp.asarray([0.06] * 16)
     *_, frozen = _lag_basin_freeze(old, new, q, TAU, QHEAD)
     assert not bool(frozen)
 

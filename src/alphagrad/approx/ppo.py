@@ -630,18 +630,25 @@ def _lag_dual_ascent(lam: float, mean_violation: float, eta: float,
 def _lag_basin_freeze(old_stats, new_stats, q_terminal, lag_tau, head_idx):
     """Dossier section-10(3) basin-freeze guard for the quality PopArt channel.
 
-    If more than half of the batch sits at NEAR-TOTAL destruction
-    (``violation > 0.9 * (lag_tau + 0.5)``, i.e. within 10% of the diverged
-    ceiling), the section-3 mu-ratchet would re-center the quality channel
-    on the basin; keep that channel's RAW accumulators for this episode --
+    If more than half of the batch sits IN THE BASIN (terminal
+    ``q_eff <= 0.05`` -- the same occupancy measure the dossier's section-2
+    windows use, equivalently ``violation >= lag_tau - 0.05``; this covers
+    both the historically observed q = 0.0 zero-work mode AND diverged
+    plans), the section-3 mu-ratchet would re-center the quality channel on
+    the basin; keep that channel's RAW accumulators for this episode --
     (m1, m2, w) are all per-channel vectors, so freezing all three leaves
     the debiased (mu, sigma) bitwise put and the downstream ART rescale a
     no-op for that head. Returns ``(m1, m2, w, frozen)``.
+
+    2026-08-18 correction: an earlier predicate
+    (``violation > 0.9*(lag_tau+0.5)``) required q < -0.375 and so could
+    only fire on diverged-DOMINATED batches, never on the v58-v60 basin
+    (q = 0.0 exactly, violation = lag_tau).
     """
     om1, om2, ow = old_stats
     nm1, nm2, nw = new_stats
-    viol = _lag_violation(q_terminal, lag_tau)
-    frac_basin = jnp.mean((viol > 0.9 * (lag_tau + 0.5)).astype(jnp.float32))
+    q_eff = jnp.clip(q_terminal, -0.5, 1.0)
+    frac_basin = jnp.mean((q_eff <= 0.05).astype(jnp.float32))
     frozen = frac_basin > 0.5
     keep = frozen & (jnp.arange(nm1.shape[-1]) == head_idx)
     return (
@@ -2993,9 +3000,10 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--popart-basin-freeze",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="lagrangian mode: freeze the quality head's PopArt "
-                   "(m1, m2, w) for an episode when >50%% of the batch is "
-                   "at near-total destruction (violation > 0.9*(tau+0.5)) "
-                   "-- the collapse dossier's section-3 ratchet guard.")
+                   "(m1, m2, w) for an episode when >50%% of the batch sits "
+                   "in the basin (terminal q_eff <= 0.05, the dossier's "
+                   "section-2 occupancy measure) -- the section-3 ratchet "
+                   "guard.")
     p.add_argument(
         "--per-face", action="store_true",
         help="Apply each vertex's approximation rules PER FACE (per local "
@@ -7194,9 +7202,9 @@ def main():
                 args.popart_beta, args.popart_sigma_min, 1e12, 5.0,
             )
             if args.reward_mode == "lagrangian" and args.popart_basin_freeze:
-                # Section-3 ratchet guard: a near-uniformly-destroyed batch
-                # must not drag the quality channel's (mu, sigma) onto the
-                # basin. Host telemetry (lagrangian/popart_frozen) recomputes
+                # Section-3 ratchet guard: a majority-in-the-basin batch
+                # (q_eff <= 0.05 occupancy > 50%) must not drag the quality
+                # channel's (mu, sigma) onto the basin. Host telemetry (lagrangian/popart_frozen) recomputes
                 # the same deterministic predicate from total_rewards_full,
                 # so nothing extra crosses the jit boundary.
                 new_m1, new_m2, new_w, _ = _lag_basin_freeze(
@@ -9570,7 +9578,8 @@ def main():
             _lag_frozen = bool(
                 args.popart_basin_freeze
                 and args.advantage_norm == "popart"
-                and float(np.mean(_lag_v > 0.9 * (args.lag_tau + 0.5))) > 0.5)
+                and float(np.mean(
+                    np.clip(_lag_q, -0.5, 1.0) <= 0.05)) > 0.5)
             lag_lambda = _lag_dual_ascent(
                 lag_lambda, float(np.mean(_lag_v)), args.lag_eta,
                 args.lag_min, args.lag_max)
