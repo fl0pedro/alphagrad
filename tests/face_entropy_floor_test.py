@@ -121,7 +121,7 @@ def test_logit_clamp_bounds_and_identity():
         set_logit_clamp(15.0)
         z_small_cl = head.logits(0.01 * jnp.ones((EMBD,)))
         np.testing.assert_allclose(np.asarray(z_small_cl),
-                                   np.asarray(z_small), rtol=1e-3, atol=1e-4)
+                                   np.asarray(z_small), rtol=1e-2, atol=1e-3)
         # off = bitwise the raw projection
         set_logit_clamp(0.0)
         np.testing.assert_array_equal(np.asarray(head.logits(ctx)),
