@@ -228,7 +228,7 @@ def face_var_targets_host(oracle, vertex, max_faces):
             with _jcore.set_current_trace(incr.trace):
                 _eliminate_vertex(
                     vertex, incr.jaxpr, graph, tgraph, incr.vo, False,
-                    transforms=None, face_transforms=ft,
+                    transforms=(), face_transforms=ft,
                 )
         finally:
             set_approx_active(prev)

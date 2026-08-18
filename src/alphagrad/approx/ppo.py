@@ -139,6 +139,7 @@ from alphagrad.transformer.palimpsa_encoder import (
     palimpsa_beta as _pal_beta, palimpsa_qk_norm as _pal_qk_norm)
 from alphagrad.approx.common import delta_fold as _fold
 from alphagrad.approx.common import feature_probe as _fprobe
+from alphagrad.approx.common import var_probe as _vprobe
 
 # Same switch carry_stream reads, so one flag turns the whole fold on or
 # off rather than leaving half the consumers folded and half not.
@@ -999,6 +1000,12 @@ class Trajectory(NamedTuple):
     probe_extents: jax.Array = None    # (P, MAX_AXES) float32 log2 axis sizes
     probe_valid: jax.Array = None      # (P,) float32
     probe_step: jax.Array = None       # () int32 elimination step index
+    # VAR PROBE (--var-probe, default OFF): per-variable targets for the
+    # eliminated vertex's faces -- one var_probe.TGT_COLS row per
+    # (lhs, rhs, res) slot of each face, plus a per-slot validity mask.
+    # Same None-when-off contract as the feature-probe fields above.
+    vp_targets: jax.Array = None       # (P, 3, TGT_COLS) float32
+    vp_valid: jax.Array = None         # (P, 3) float32
 
 
 class TrainBatch(NamedTuple):
@@ -1069,6 +1076,8 @@ class TrainBatch(NamedTuple):
     probe_extents: jax.Array = None
     probe_valid: jax.Array = None
     probe_step: jax.Array = None
+    vp_targets: jax.Array = None
+    vp_valid: jax.Array = None
 
 
 # ---------------------------------------------------------------------------
@@ -2744,7 +2753,8 @@ class Agent(eqx.Module):
             # -- (face latents (F, E), this step's vertex slot row (E,)). None
             # unless ALPHAGRAD_FEATURE_PROBE=1, and None is not a pytree leaf,
             # so nothing is computed, stored or transferred when it is off.
-            ((_probe_face_lat, v_context) if _fprobe.PROBE_ON else None),
+            ((_probe_face_lat, v_context)
+             if (_fprobe.PROBE_ON or _vprobe.probe_on()) else None),
         )
 
     def to_env_action_dynamic(
@@ -2863,6 +2873,15 @@ def make_argparser() -> argparse.ArgumentParser:
              "minibatch axis moves from steps to SEQUENCES, because a scan "
              "needs a trajectory's steps in order.")
     p.add_argument("--no-jit", action="store_true")
+    p.add_argument(
+        "--var-probe", action="store_true",
+        help="gradient-isolated online probes decoding per-variable "
+             "(lhs/rhs/res) ndim, log-size, dtype and bucketed shape "
+             "from the live face latent and the vertex pointer row; "
+             "trains in its own optimiser, never touches the policy. "
+             "Requires the --live-faces stack; default off.")
+    p.add_argument("--var-probe-lr", type=float, default=1e-3,
+                   help="adam LR for the --var-probe heads")
     p.add_argument(
         "--exec-on-gpu",
         action="store_true",
@@ -5162,6 +5181,103 @@ def main():
     else:
         _probe_targets = None
 
+    # ---- VAR PROBE targets (--var-probe) ------------------------------
+    # The owner's variable-level probe: for each of the three variables the
+    # two-op face wire carries -- ((lhs, rhs, new), (jl, jr, jres)) -- decode
+    # ndim / log-size / dtype / bucketed shape from the latent alone.
+    # FACE level rides the SAME _LVMO prefix replay as the feature probe
+    # (one host callback per step, var_probe.face_var_targets_host records
+    # the live SparseTensors through face_transforms hooks). VERTEX level
+    # needs NO callback at all: the eliminated vertex's equation variables
+    # come from the ORIGINAL jaxpr, so they are a STATIC table gathered by
+    # the sampled vertex id inside the loss.
+    _VPROBE_ON = bool(getattr(args, "var_probe", False)) and all((
+        bool(getattr(args, "dynamic_substeps", False)),
+        bool(getattr(args, "live_faces", False)),
+        bool(getattr(args, "face_actions", False)),
+        bool(getattr(args, "unified_face_head", False)),
+        not getattr(args, "no_approx_head", False),
+    ))
+    if bool(getattr(args, "var_probe", False)) and not _VPROBE_ON:
+        print("[vprobe] --var-probe IGNORED: the probe reads the per-face "
+              "scatter, which exists only under --dynamic-substeps "
+              "--live-faces --face-actions --unified-face-head and WITHOUT "
+              "--no-approx-head (job 61427's lesson: anything less decodes "
+              "zeros).", flush=True)
+    # [face-target-build failures, first-census-printed]
+    _VP_FAILS = [0, 0]
+    if _VPROBE_ON:
+        # The agent's slot-12 latent return is gated on this env var (the
+        # module cannot see args); set BEFORE any jit trace happens.
+        os.environ["ALPHAGRAD_VAR_PROBE"] = "1"
+        _VP_VTAB_np, _VP_VVAL_np = _vprobe.vertex_var_table(
+            _oracle_jaxpr, _oracle_total_v)
+        _VP_VTAB = jnp.asarray(_VP_VTAB_np)
+        _VP_VVAL = jnp.asarray(_VP_VVAL_np)
+        print("[vprobe] var probe ON: faces=%d slots=%s dtypes=%d "
+              "dim_buckets=%d max_ndim=%d | vertex table %s (valid %.2f)"
+              % (_PROBE_FACES, ",".join(_vprobe.VAR_SLOTS), _vprobe.N_DTYPES,
+                 _vprobe.N_DIM_BUCKETS, _vprobe.MAX_NDIM,
+                 _VP_VTAB_np.shape, float(_VP_VVAL_np.mean())), flush=True)
+
+        def _vp_targets_host(order, spec_hist, step_count, vertex_idx):
+            _pt0 = _prof_time.perf_counter()
+            try:
+                eo = np.asarray(order).reshape(-1)
+                specs = np.asarray(spec_hist)
+                n = int(np.asarray(step_count))
+                v = int(np.asarray(vertex_idx)) + 1
+                P = _PROBE_FACES
+                try:
+                    o = _oracle_replay(eo, specs, n)
+                    t, va, nf = _vprobe.face_var_targets_host(o, v, P)
+                except Exception as _exc:
+                    _VP_FAILS[0] += 1
+                    if _VP_FAILS[0] <= 3:
+                        print("[vprobe census] target build FAILED for "
+                              "vertex %d: %s: %s"
+                              % (v, type(_exc).__name__, str(_exc)[:200]),
+                              flush=True)
+                    return (np.zeros((P, _vprobe.N_SLOTS, _vprobe.TGT_COLS),
+                                     np.float32),
+                            np.zeros((P, _vprobe.N_SLOTS), np.float32))
+                # One-shot census on the first vertex that yields faces, so
+                # "the representation cannot decode it" and "the targets are
+                # empty/degenerate" stay distinguishable from any log.
+                if _VP_FAILS[1] == 0 and nf > 0:
+                    _VP_FAILS[1] = 1
+                    print("[vprobe census] first face targets: vertex=%d "
+                          "n_faces=%d" % (v, nf), flush=True)
+                    for s, nm in enumerate(_vprobe.VAR_SLOTS):
+                        r = t[0, s]
+                        print("[vprobe census]   %-3s valid=%d ndim=%d "
+                              "dtype=%s log10size=%.2f buckets=%s"
+                              % (nm, int(va[0, s]), int(r[_vprobe.COL_NDIM]),
+                                 _vprobe.DTYPE_VOCAB[
+                                     int(r[_vprobe.COL_DTYPE])],
+                                 r[_vprobe.COL_LOGSIZE],
+                                 r[_vprobe.COL_DIMS:_vprobe.COL_DIMS
+                                   + int(r[_vprobe.COL_NDIM])]
+                                 .astype(int).tolist()), flush=True)
+                return t, va
+            finally:
+                _env_prof_add("oracle.var_probe",
+                              _prof_time.perf_counter() - _pt0)
+
+        def _vp_targets(order, spec_hist, step_count, vertex_idx):
+            P = _PROBE_FACES
+            return jax.pure_callback(
+                _vp_targets_host,
+                (jax.ShapeDtypeStruct(
+                    (P, _vprobe.N_SLOTS, _vprobe.TGT_COLS), jnp.float32),
+                 jax.ShapeDtypeStruct((P, _vprobe.N_SLOTS), jnp.float32)),
+                order, spec_hist, step_count, vertex_idx,
+                vmap_method="sequential",
+            )
+    else:
+        _vp_targets = None
+        _VP_VTAB = _VP_VVAL = None
+
     # ---- per-FACE token chunks (--live-faces) -------------------------
     # One callback per face. It replays the elimination prefix (cached) and
     # re-eliminates the CURRENT vertex with faces 0..f-1 carrying their
@@ -5554,6 +5670,22 @@ def main():
             eqx.filter(probes, eqx.is_inexact_array))
     else:
         probes = probe_opt_state = probe_optimizer = None
+
+    # VAR PROBES: the same separate-tree contract as FeatureProbes -- their
+    # own parameter tree, their own optax adam, initialised from `vprobes`
+    # and never from `agent`, so the PPO chain provably cannot reach a
+    # var-probe weight and `_var_probe_loss` cannot reach a policy weight.
+    if _VPROBE_ON:
+        vprobes = _vprobe.VarProbes(
+            embd_dim=int(args.embd_dim),
+            key=jrand.PRNGKey(
+                int(os.environ.get("ALPHAGRAD_VAR_PROBE_SEED", "0"))),
+        )
+        vprobe_optimizer = optax.adam(float(args.var_probe_lr))
+        vprobe_opt_state = vprobe_optimizer.init(
+            eqx.filter(vprobes, eqx.is_inexact_array))
+    else:
+        vprobes = vprobe_opt_state = vprobe_optimizer = None
 
     # Rollout / loss / training step factories.
     def reset_envs(env_obj):
@@ -5957,6 +6089,16 @@ def main():
                 )
             else:
                 _probe_fields = {}
+            # VAR PROBE face targets for the SAME chosen vertex, same
+            # prefix -- the rows describe the very faces the head
+            # decided over. Vertex targets are static, nothing stored.
+            if _VPROBE_ON:
+                _vp_t, _vp_v = _vp_targets(
+                    state.order, state.sparsity_specs, state.step_count,
+                    vertex_idx)
+                _vp_fields = dict(vp_targets=_vp_t, vp_valid=_vp_v)
+            else:
+                _vp_fields = {}
             transition = Trajectory(
                 preference=preference.astype(jnp.float32),
                 vertex_idx=jnp.asarray(vertex_idx, dtype=jnp.int32),
@@ -6008,6 +6150,7 @@ def main():
                 face_delta_eqns=face_de_v,
                 **_enc_fields,
                 **_probe_fields,
+                **_vp_fields,
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
             )
@@ -6692,6 +6835,25 @@ def main():
                            batch.probe_extents, batch.probe_valid,
                            batch.probe_step, _cxi, _cxj)
 
+        # VAR PROBE pack: the same two latents (the face-keyed scatter
+        # rows the face head consumes + the pointer slot row), stop-
+        # gradient-ed HERE as well as inside VarHead. Vertex targets are
+        # gathered from the static table by the 1-based vertex id.
+        _vp_pack = None
+        if _VPROBE_ON:
+            _q_lat, _q_vctx = probe_reprs
+            if _q_lat is None:
+                raise RuntimeError(
+                    "var probe: the loss path produced no face latents; "
+                    "the probe needs the --live-faces replay "
+                    "(face_path_policy present and face_chunks stored).")
+            _q_lat = jax.lax.stop_gradient(_q_lat[:, :_PROBE_FACES])
+            _q_vctx = jax.lax.stop_gradient(_q_vctx)
+            _q_vidx = batch.vertex_idx.astype(jnp.int32) + 1
+            _vp_pack = (_q_lat, _q_vctx, batch.vp_targets,
+                        batch.vp_valid, _VP_VTAB[_q_vidx],
+                        _VP_VVAL[_q_vidx])
+
         # NaN LOCALIZER (ALPHAGRAD_DEBUG_NAN=1).
         # `ent:nan` in the progress bar means the params are ALREADY NaN, which
         # is one update too late to say why. This prints each loss component
@@ -6737,8 +6899,8 @@ def main():
             # entropy in slot 0 if available. Slot 5 = face/approximation head.
             jnp.stack(_entropy_components),
         )
-        if _PROBE_ON:
-            return total_loss, (_metrics, _probe_pack)
+        if _PROBE_ON or _VPROBE_ON:
+            return total_loss, (_metrics, _probe_pack, _vp_pack)
         return total_loss, _metrics
 
     # n_steps for the WITHIN-STEP R2. Elimination step indices run 0..T-1 with
@@ -6793,6 +6955,24 @@ def main():
                v_pred, v_tgt, v_val, _sid, l_face, l_vertex)
         return l_face + l_vertex, aux
 
+    def _var_probe_loss(vps, pack):
+        """Var-probe objective -- a function of the VAR PROBES ALONE.
+
+        Same isolation contract as `_probe_loss`: the pack arrives as
+        has_aux data (never differentiated by the PPO grad), every latent in
+        it is already stop_gradient-ed and VarHead stops it AGAIN, and the
+        agent is not an argument -- so this scalar has no derivative with
+        respect to any policy parameter, at any weight, at any LR.
+        """
+        lat, vctx, f_tgt, f_val, v_tgt, v_val = pack
+        E = lat.shape[-1]
+        return _vprobe.var_probe_loss(
+            vps,
+            lat.reshape(-1, E),
+            f_tgt.reshape(-1, _vprobe.N_SLOTS, _vprobe.TGT_COLS),
+            f_val.reshape(-1, _vprobe.N_SLOTS),
+            vctx, v_tgt, v_val)
+
     def train_episode(
         agent,
         opt_state,
@@ -6812,6 +6992,8 @@ def main():
         popart_w,
         probes,
         probe_opt_state,
+        vprobes,
+        vprobe_opt_state,
     ):
         subkey, key = jrand.split(key)
         rollout_key, key = jrand.split(key)
@@ -7266,6 +7448,8 @@ def main():
             probe_extents=traj.probe_extents,
             probe_valid=traj.probe_valid,
             probe_step=traj.probe_step,
+            vp_targets=traj.vp_targets,
+            vp_valid=traj.vp_valid,
         )
 
         # The probes ride in the SAME scan carry (so their updates
@@ -7273,7 +7457,8 @@ def main():
         # optimiser state. Both are None when the probe is off, and None is not
         # a pytree leaf, so the carry is byte-identical to before.
         dynamic_carry, static_carry = eqx.partition(
-            (agent, opt_state, probes, probe_opt_state), eqx.is_array)
+            (agent, opt_state, probes, probe_opt_state,
+             vprobes, vprobe_opt_state), eqx.is_array)
 
         # Stage D head LR warmup: thread a step counter through both scans
         # (epoch × minibatch) so the per-head LR multiplier ramps continuously
@@ -7310,7 +7495,8 @@ def main():
             def mb_step_fn(c_with_step, batch_and_key):
                 c, step = c_with_step
                 (comb_agent, comb_opt_state, comb_probes,
-                 comb_probe_opt) = eqx.combine(c, static_carry)
+                 comb_probe_opt, comb_vprobes,
+                 comb_vprobe_opt) = eqx.combine(c, static_carry)
                 batch, t_key = batch_and_key
                 grads, _aux = eqx.filter_grad(loss_fn, has_aux=True)(
                     comb_agent,
@@ -7323,8 +7509,8 @@ def main():
                 # representation alongside the metrics. filter_grad does not
                 # differentiate aux, so this is a second, independent reason
                 # the probe cannot appear in `grads`.
-                if _PROBE_ON:
-                    metrics, _probe_pack = _aux
+                if _PROBE_ON or _VPROBE_ON:
+                    metrics, _probe_pack, _vp_pack = _aux
                 else:
                     metrics = _aux
                 # Single fused per-leaf gradient scaling: combines the
@@ -7394,11 +7580,25 @@ def main():
                     new_probes = eqx.apply_updates(comb_probes, _pupd)
                 else:
                     new_probes = new_probe_opt = _pmet = None
+                # VAR PROBE: its own gradient, its own chain, its own
+                # tree -- `_var_probe_loss` takes (vprobes, pack) only.
+                if _VPROBE_ON:
+                    _q_grads, _vpmet = eqx.filter_grad(
+                        _var_probe_loss, has_aux=True)(
+                            comb_vprobes, _vp_pack)
+                    _q_upd, new_vprobe_opt = vprobe_optimizer.update(
+                        _q_grads, comb_vprobe_opt, comb_vprobes)
+                    new_vprobes = eqx.apply_updates(comb_vprobes, _q_upd)
+                else:
+                    new_vprobes = new_vprobe_opt = _vpmet = None
                 next_carry, _ = eqx.partition(
-                    (new_agent, new_opt_state, new_probes, new_probe_opt),
+                    (new_agent, new_opt_state, new_probes, new_probe_opt,
+                     new_vprobes, new_vprobe_opt),
                     eqx.is_array)
-                return (next_carry, step + 1), (
-                    (metrics, _pmet) if _PROBE_ON else metrics)
+                _outs = metrics
+                if _PROBE_ON or _VPROBE_ON:
+                    _outs = (metrics, _pmet, _vpmet)
+                return (next_carry, step + 1), _outs
 
             return lax.scan(mb_step_fn, (carry, step), (batches, mb_keys))
 
@@ -7415,18 +7615,31 @@ def main():
         dynamic_carry, metrics_seq = _pp_mark(
             "prof/update", (dynamic_carry, metrics_seq))
 
-        (agent, opt_state, probes,
-         probe_opt_state) = eqx.combine(dynamic_carry, static_carry)
-        if _PROBE_ON:
-            metrics_seq, _probe_seq = metrics_seq
-            (_fp, _ft, _fv, _fs, _vp, _vt, _vv, _vs,
-             _plf, _plv) = _probe_seq
-            # ONE R2 per episode, over the FULL batch: the LAST epoch's
-            # predictions (the most-trained probe), all minibatches
-            # concatenated back into the whole episode. See the note in
-            # _probe_loss for why per-minibatch R2 was wrong.
+        (agent, opt_state, probes, probe_opt_state, vprobes,
+         vprobe_opt_state) = eqx.combine(dynamic_carry, static_carry)
+        vp_metrics = None
+        if _PROBE_ON or _VPROBE_ON:
+            metrics_seq, _probe_seq, _vp_seq = metrics_seq
+
+            # LAST epoch's predictions (the most-trained probe), all
+            # minibatches concatenated back into the whole episode. See
+            # the note in _probe_loss for why per-minibatch stats were
+            # wrong.
             def _last_epoch_flat(x):
                 return x[-1].reshape((-1,) + tuple(x.shape[3:]))
+        if _VPROBE_ON:
+            (_qfp, _qft, _qfv, _qvp, _qvt, _qvv,
+             _qlf, _qlv) = _vp_seq
+            vp_metrics = (
+                tuple(_last_epoch_flat(x) for x in _qfp),
+                _last_epoch_flat(_qft), _last_epoch_flat(_qfv),
+                tuple(_last_epoch_flat(x) for x in _qvp),
+                _last_epoch_flat(_qvt), _last_epoch_flat(_qvv),
+                jnp.mean(_qlf), jnp.mean(_qlv))
+        if _PROBE_ON:
+            (_fp, _ft, _fv, _fs, _vp, _vt, _vv, _vs,
+             _plf, _plv) = _probe_seq
+            # ONE R2 per episode, over the FULL batch (see above).
             _r2 = _fprobe.within_step_r2(
                 _last_epoch_flat(_fp), _last_epoch_flat(_ft),
                 _last_epoch_flat(_fv),
@@ -7618,6 +7831,9 @@ def main():
             probes,
             probe_opt_state,
             probe_metrics,
+            vprobes,
+            vprobe_opt_state,
+            vp_metrics,
         )
 
     if not args.no_jit:
@@ -7749,7 +7965,7 @@ def main():
     def host_log(
         ep, all_rets, actions_pack, mean_r, mets, diag_pack=None,
         popart_stats=None, attn_entropy=None, warmup=False, true_return=None,
-        probe_metrics=None, extra_log=None):
+        probe_metrics=None, extra_log=None, vp_metrics=None):
         ep = int(ep)
         all_rets = np.array(all_rets)  # (num_envs, NUM_REWARDS)
         v_idx_arr = np.array(actions_pack[0])
@@ -8593,6 +8809,49 @@ def main():
             _fprobe.TARGET_FAILS[0] = 0
             _PROBE_FAILS[0] = 0
 
+        # VAR PROBE (--var-probe): per-variable decodability, EVERY accuracy
+        # printed and logged NEXT TO its majority-class baseline from the
+        # same episode's targets -- raw accuracy without the baseline bar is
+        # unreadable (the last probe round's lesson).
+        if vp_metrics is not None:
+            (_qf5, _qftg, _qfvl, _qv5, _qvtg, _qvvl,
+             _qlf, _qlv) = vp_metrics
+            _vp_log = {}
+            _vp_log.update(_vprobe.episode_metrics(
+                [np.asarray(_x) for _x in _qf5], np.asarray(_qftg),
+                np.asarray(_qfvl), "face"))
+            _vp_log.update(_vprobe.episode_metrics(
+                [np.asarray(_x) for _x in _qv5], np.asarray(_qvtg),
+                np.asarray(_qvvl), "vertex"))
+            _vp_log["probe/face/loss"] = float(_qlf)
+            _vp_log["probe/vertex/loss"] = float(_qlv)
+            log_dict.update(_vp_log)
+            for _lvl, _ll in (("face", _qlf), ("vertex", _qlv)):
+                print("[vprobe] %s loss %.4g | %s" % (
+                    _lvl, float(_ll),
+                    " | ".join(
+                        "%s: ndim %.2f/%.2f dtype %.2f/%.2f dims %.2f/%.2f"
+                        " exact %.2f szR2 %.2f" % (
+                            _s,
+                            _vp_log["probe/%s/%s/ndim_acc" % (_lvl, _s)],
+                            _vp_log["probe/%s/%s/ndim_base" % (_lvl, _s)],
+                            _vp_log["probe/%s/%s/dtype_acc" % (_lvl, _s)],
+                            _vp_log["probe/%s/%s/dtype_base" % (_lvl, _s)],
+                            _vp_log["probe/%s/%s/shape_dim_acc"
+                                    % (_lvl, _s)],
+                            _vp_log["probe/%s/%s/shape_dim_base"
+                                    % (_lvl, _s)],
+                            _vp_log["probe/%s/%s/shape_exact" % (_lvl, _s)],
+                            _vp_log["probe/%s/%s/size_r2" % (_lvl, _s)],
+                        ) for _s in _vprobe.VAR_SLOTS)), flush=True)
+            _qtf = int(_vprobe.TARGET_FAILS[0]) + int(_VP_FAILS[0])
+            if _qtf:
+                print("[vprobe census] target-build FAILS %d (last: %s)"
+                      % (_qtf, _vprobe.LAST_TARGET_ERR[0] or "see log"),
+                      flush=True)
+                _vprobe.TARGET_FAILS[0] = 0
+                _VP_FAILS[0] = 0
+
         # --reward-mode lagrangian controller telemetry (lambda, violation,
         # basin freeze). Merged here so BOTH sinks (jsonl below + wandb)
         # carry it; survives --lean-logging (four cheap scalars).
@@ -9246,6 +9505,9 @@ def main():
             probes,
             probe_opt_state,
             probe_metrics,
+            vprobes,
+            vprobe_opt_state,
+            vp_metrics,
         ) = train_episode(
             agent,
             opt_state,
@@ -9265,6 +9527,8 @@ def main():
             popart_w,
             probes,
             probe_opt_state,
+            vprobes,
+            vprobe_opt_state,
         )
         if _xtr_on:
             # The trace has to stay open until the device is drained or the
@@ -9329,6 +9593,7 @@ def main():
             attn_entropy=attn_ent,
             true_return=float(true_scalar_return),
             probe_metrics=probe_metrics,
+            vp_metrics=vp_metrics,
             extra_log=lag_extra,
         )
         # Mid-training top-N snapshot. Skips the wandb table log so we
