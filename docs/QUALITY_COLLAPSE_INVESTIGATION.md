@@ -370,3 +370,84 @@ its failure mode directly quantifies the second.
   required.
 - v57 (61485) and v59 (61507) were operator-cancelled mid-run (sacct CANCELLED+ 0:0),
   which is why their wandb states read "crashed".
+
+## 11. Intervention 1 implemented: Lagrangian quality-constrained reward (2026-08-18)
+
+Implementation (commit f332f13, branch hostperf-caches): `--reward-mode
+lagrangian` in `src/alphagrad/approx/ppo.py`. ADDITIVE composition (owner
+decision 2026-08-18 -- NOT built on the mult scalar): the latency/mem
+channels flow exactly as `--reward-mode additive` computes them; the quality
+slot is replaced by a stationary violation channel
+
+    v = max(0, tau_q - q_eff),   q_eff = clip(q, -0.5, 1.0)
+
+stored NEGATED on the terminal step (`_apply_lagrangian_channels`). The
+q_eff clip kills the section-1(c) conflation: DIVERGED (-1.0 sentinel) maps
+to q_eff = -0.5 and carries violation tau+0.5 = 1.25, strictly worse than a
+zero-work plan (0.75). lambda enters ONLY as the quality slot of the
+advantage-scalarization preference (`traj.preference` at the
+`norm_adv = sum(norm_adv_components * traj.preference)` site); value
+targets and PopArt statistics are lambda-free by construction -- pinned by
+`tests/lagrangian_reward_test.py` (7 tests: violation values, no-flat-band
+monotonicity, cost-channel bitwise passthrough, lambda-invariance of value
+targets, dual-ascent clip, basin-freeze trigger/non-trigger). Dual ascent:
+`lam <- clip(lam + 0.05 * mean_violation, 0.1, 10)`, once per episode,
+host-side, after the PPO update. Section-10(3) guard: `--popart-basin-freeze`
+(default on) holds the quality channel's (m1, m2, w) for an episode when
+>50% of the batch has violation > 0.9*(tau+0.5) (i.e. is diverged-dominated;
+a q=0-dominated batch deliberately does NOT freeze -- with stationary
+targets the channel needs to keep adapting, and the escape signal now rides
+lambda, which rises under violation instead of being eroded by mu).
+
+Offline falsifier -- zero GPU, the section-10 cheapest test -- against the
+3,024 measured v58b plans (192 eps x 16 envs; the wandb export carries
+per-episode best/median/worst/mean quantiles per channel, not per-plan
+tuples, so per-plan checks use the 576 quantile samples + plans anchored to
+measured cost ranges). Script + outputs:
+`/Users/assmuth/dsnn/collapse_invest/lagrangian_falsifier/`
+(`falsify_lagrangian.py`, `falsifier_report.txt`, `falsifier_verdict.json`,
+`lambda_trajectory_v58b.csv`). Scalarization under test:
+`score = -log1p(lat) - log1p(mem) - lam * v(q)`, lam in {0.1,0.5,1,2,5,10}.
+
+VERDICT: PASS on all four checks.
+
+- (i) NO flat region: finite-difference slope == lam exactly, everywhere on
+  the operative band [-0.5, tau), at every lam; 0 flat segments (the mult
+  surface had a 0.45-wide flat + a +1.9 discontinuity). The band (-1, -0.5]
+  saturates BY DESIGN (maximal violation); 12/576 measured quantile
+  qualities fall in (-1, -0.5) and tie with diverged there.
+- (ii) diverged strictly below every plan measured at q > -0.5 at every lam:
+  zero-work minus diverged = 0.5*lam (+0.05 .. +5.0); the worst measured
+  non-diverged plan (q = -0.4705) clears diverged by +0.003 (lam 0.1) to
+  +0.30 (lam 10).
+- (iii) identity NOT dominant when a real latency win exists: 22 episodes
+  held median q >= tau; best measured latency there 9.12e4 ns vs identity
+  1.60e5 ns. A constraint-satisfying cheaper plan beats identity by +0.562
+  (the latency symlog term) at EVERY lam -- feasible plans tie on violation
+  (0) and the cost channels decide. Cost work below tau still pays down to
+  q > tau - dlat/lam: q > 0.19 at lam=1, q > 0.47 at lam=2, q > 0.69 at
+  lam=10 -- lam prices quality loss, it does not forbid approximation.
+- (iv) dual-ascent replay of the v58b episode sequence (violation estimated
+  from the quantiles, weights 0.25/0.5/0.25): lambda 1.00 -> 1.08 (ep10) ->
+  1.42 (ep30) -> 1.72 (ep40, basin entry) -> 2.40 (ep60) -> 7.05 (ep191),
+  monotone non-decreasing -- the price of destruction RISES as the basin
+  fills, the anti-ratchet by construction (contrast section 3: mu_quality
+  fell 4.63 -> 0.27 over the same window). Advantage ordering at ep35
+  (lam = 1.55, mean measured costs of ep30-40): identity -29.72 = survivor
+  (q=0.79) -29.72 > partial (q=0.4) -30.27 > zero-work -30.89 > diverged
+  -31.66. Quality-preserving plans rank strictly above destroyed ones; the
+  feasible tie at matched cost is the intended constraint semantics.
+
+Caveats, stated honestly: the falsifier proves the reward SURFACE has the
+claimed shape on real measured data; it cannot prove the policy escapes the
+basin (that is the 100-episode v58-config rerun of section 10), and the
+representation blindness of section 4 is untouched (intervention 2).
+
+Launcher prepared (NOT submitted):
+`/Users/assmuth/dsnn/fq_v61_tlm_lagrangian.sbatch` -- v60 clone, constant
+LR (mult-warmup flags dropped), `--reward-mode lagrangian --lag-tau 0.75
+--lag-eta 0.05 --lag-init 1.0 --lag-min 0.1 --lag-max 10
+--popart-basin-freeze`, 500 eps / 16 envs / --grad-window 0 / TLM pins,
+wandb name v61-tlm-lagrangian, placeholder comment for the probe-flag
+workstream. New wandb keys: lagrangian/lambda, lagrangian/mean_violation,
+lagrangian/frac_violating, lagrangian/popart_frozen.
