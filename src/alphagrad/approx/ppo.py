@@ -2997,6 +2997,18 @@ def make_argparser() -> argparse.ArgumentParser:
                    "channel's relative advantage weight (channels are "
                    "PopArt-normalized, so the scalarized advantage stays "
                    "O(1) by construction).")
+    p.add_argument("--lag-target", type=float, default=0.02,
+                   help="lagrangian mode: dual-ascent violation target. "
+                   "lam <- clip(lam + eta*(mean_violation - target), "
+                   "lag_min, lag_max), so lambda FALLS when the constraint "
+                   "is essentially satisfied (mean_violation < target) -- "
+                   "a start-high lambda can relax. v62 schedule: init at "
+                   "the falsifier's price-out level (--lag-init 10; "
+                   "lambda=10 prices destruction out to q>0.69, closing "
+                   "the lag-init=1 transient window v61's policy raced "
+                   "through), decay ONLY on satisfied constraint, floor "
+                   "--lag-min 2 keeps quality binding even after decay. "
+                   "0 restores v61's pure ascent.")
     p.add_argument("--popart-basin-freeze",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="lagrangian mode: freeze the quality head's PopArt "
@@ -9582,7 +9594,15 @@ def main():
                     np.clip(_lag_q, -0.5, 1.0) <= 0.05)) > 0.5)
             lag_lambda = _lag_dual_ascent(
                 lag_lambda, float(np.mean(_lag_v)), args.lag_eta,
-                args.lag_min, args.lag_max)
+                args.lag_min, args.lag_max,
+                violation_target=float(getattr(args, "lag_target", 0.0)))
+            # stdout mirror of the wandb keys: v61's log never carried
+            # lambda anywhere, which made the collapse post-mortem blind.
+            print("[lagrangian] ep=%d lambda=%.4f mean_violation=%.4f "
+                  "frac_violating=%.3f frozen=%d"
+                  % (ep, lag_lambda, float(np.mean(_lag_v)),
+                     float(np.mean(_lag_v > 0.0)), int(_lag_frozen)),
+                  flush=True)
             lag_extra = {
                 "lagrangian/lambda": float(lag_lambda),
                 "lagrangian/mean_violation": float(np.mean(_lag_v)),

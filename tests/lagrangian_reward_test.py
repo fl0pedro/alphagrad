@@ -168,6 +168,31 @@ def test_dual_ascent_clip_behavior():
     assert _lag_dual_ascent(0.1, -5.0, 1.0, 0.1, 10.0, violation_target=0.0) == 0.1
 
 
+def test_dual_ascent_target_binding():
+    """v62 --lag-target: lambda RISES above target, FALLS below it, holds
+    exactly at it, and clips at both bounds (the start-high-decay
+    schedule: --lag-init 10 --lag-min 2 --lag-max 20 --lag-target 0.02)."""
+    # rises when mean_violation > target
+    np.testing.assert_allclose(
+        _lag_dual_ascent(10.0, 0.50, 0.05, 2.0, 20.0,
+                         violation_target=0.02),
+        10.0 + 0.05 * (0.50 - 0.02), rtol=1e-9)
+    # FALLS when the constraint is essentially satisfied (v < target)
+    np.testing.assert_allclose(
+        _lag_dual_ascent(10.0, 0.0, 0.05, 2.0, 20.0,
+                         violation_target=0.02),
+        10.0 - 0.05 * 0.02, rtol=1e-9)
+    # holds exactly at the target
+    assert _lag_dual_ascent(5.0, 0.02, 0.05, 2.0, 20.0,
+                            violation_target=0.02) == 5.0
+    # decay clips at lam_min (quality stays binding after full decay)
+    assert _lag_dual_ascent(2.0, 0.0, 1000.0, 2.0, 20.0,
+                            violation_target=0.02) == 2.0
+    # ascent clips at lam_max
+    assert _lag_dual_ascent(20.0, 5.0, 1000.0, 2.0, 20.0,
+                            violation_target=0.02) == 20.0
+
+
 # ---------------------------------------------------------------------------
 # 4. basin freeze
 # ---------------------------------------------------------------------------
