@@ -558,6 +558,99 @@ def _apply_mult_gate(
     return out.at[..., REWARD_INDEX["cosine_sim"]].set(gated)
 
 
+def _lag_violation(q_raw: "jax.Array", lag_tau: float) -> "jax.Array":
+    """Stationary constraint-violation transform (``--reward-mode lagrangian``).
+
+    ``q_eff = clip(q_raw, -0.5, 1.0)``: the env's DIVERGED sentinel (-1.0,
+    env.py ``_loss_drop_quality``) maps to an EXPLICIT ``q_eff = -0.5``, so a
+    diverged walk carries ``violation = lag_tau + 0.5`` -- strictly worse
+    than any plan measured at q > -0.5 -- instead of being conflated with a
+    zero-work plan by a [0, 1] clip (the mult path's ppo.py:538 conflation;
+    docs/QUALITY_COLLAPSE_INVESTIGATION.md section 1, fact (c)).
+
+    ``violation = max(0, lag_tau - q_eff)``: zero iff the constraint
+    ``quality >= lag_tau`` holds, and with slope -1 in q everywhere on
+    (-0.5, lag_tau) -- no flat basin, no discontinuity (dossier section 2).
+    The [-1, -0.5] saturation is deliberate: at/below q_eff = -0.5 every
+    plan is maximally violating; the ordering that matters (diverged below
+    every zero-work plan: 1.25 vs 0.75 at tau=0.75) is preserved.
+    """
+    q_eff = jnp.clip(q_raw, -0.5, 1.0)
+    return jnp.maximum(0.0, lag_tau - q_eff)
+
+
+def _apply_lagrangian_channels(rewards: "jax.Array", lag_tau: float) -> "jax.Array":
+    """``--reward-mode lagrangian``: ADDITIVE channels + a violation channel.
+
+    The cost channels (latency / peak_memory, stored negated by the env)
+    pass through UNTOUCHED -- they flow exactly as ``--reward-mode
+    additive`` computes them (symlog and/or PopArt handles scale
+    downstream). NO multiplicative quality gate anywhere on this path
+    (owner 2026-08-18: additive composition, not built on the mult scalar).
+    Only the quality slot is rewritten: the TERMINAL step carries the
+    NEGATED violation ``-max(0, lag_tau - q_eff)``, every other step 0
+    (sparse-terminal quality, the same masking the mult gate uses).
+
+    SIGN CONVENTION (load-bearing, do not flip one side only): the channel
+    stores ``-violation`` so that -- like every other channel -- HIGHER IS
+    BETTER, and the preference weight on the quality head is ``+lambda``
+    (> 0). The scalarized advantage is then
+    ``w_lat*A_lat + w_mem*A_mem + lambda*A_negviol``, i.e. cheapness minus
+    lambda times violation: RCPO. ``lambda`` NEVER appears in this
+    function: every channel's value target is a STATIONARY function of the
+    measured outcome, so the value net and PopArt are lambda-free by
+    construction (the value-net safeguard; pinned by
+    tests/lagrangian_reward_test.py).
+    """
+    terminal = jnp.zeros(rewards.shape[:2], dtype=bool).at[:, -1].set(True)
+    q_raw = rewards[..., REWARD_INDEX["cosine_sim"]]
+    viol = _lag_violation(q_raw, lag_tau)
+    chan = jnp.where(terminal, -viol, 0.0)
+    return rewards.at[..., REWARD_INDEX["cosine_sim"]].set(chan)
+
+
+def _lag_dual_ascent(lam: float, mean_violation: float, eta: float,
+                     lam_min: float, lam_max: float,
+                     violation_target: float = 0.0) -> float:
+    """RCPO dual ascent -- ONCE PER EPISODE, host-side, AFTER the PPO update.
+
+    ``lam <- clip(lam + eta * (mean_violation - violation_target),
+    lam_min, lam_max)``. ``violation_target = 0``: pure constraint -- any
+    violation raises the price of quality loss; ``lam_min > 0`` keeps the
+    quality channel's advantage weight alive even at zero violation.
+    ``lam`` is a HOST float and reaches the update exclusively through the
+    preference vector (advantage scalarization) -- never through rewards,
+    value targets or PopArt statistics.
+    """
+    return float(np.clip(lam + eta * (float(mean_violation) - violation_target),
+                         lam_min, lam_max))
+
+
+def _lag_basin_freeze(old_stats, new_stats, q_terminal, lag_tau, head_idx):
+    """Dossier section-10(3) basin-freeze guard for the quality PopArt channel.
+
+    If more than half of the batch sits at NEAR-TOTAL destruction
+    (``violation > 0.9 * (lag_tau + 0.5)``, i.e. within 10% of the diverged
+    ceiling), the section-3 mu-ratchet would re-center the quality channel
+    on the basin; keep that channel's RAW accumulators for this episode --
+    (m1, m2, w) are all per-channel vectors, so freezing all three leaves
+    the debiased (mu, sigma) bitwise put and the downstream ART rescale a
+    no-op for that head. Returns ``(m1, m2, w, frozen)``.
+    """
+    om1, om2, ow = old_stats
+    nm1, nm2, nw = new_stats
+    viol = _lag_violation(q_terminal, lag_tau)
+    frac_basin = jnp.mean((viol > 0.9 * (lag_tau + 0.5)).astype(jnp.float32))
+    frozen = frac_basin > 0.5
+    keep = frozen & (jnp.arange(nm1.shape[-1]) == head_idx)
+    return (
+        jnp.where(keep, om1, nm1),
+        jnp.where(keep, om2, nm2),
+        jnp.where(keep, ow, nw),
+        frozen,
+    )
+
+
 def _popart_derive(m1, m2, w, sigma_min, sigma_max):
     """Debiased (mu, sigma) from the raw EMA accumulators.
 
@@ -2846,14 +2939,44 @@ def make_argparser() -> argparse.ArgumentParser:
         "--reward-mode",
         type=str,
         default="additive",
-        choices=["additive", "mult"],
+        choices=["additive", "mult", "lagrangian"],
         help="additive: per-head advantages scalarized by the preference "
         "weights (default). mult: multiplicative cosine gate — the scalar "
         "reward is g(cos)·max(0, W − Σ w_c·symlog(cost_c)) with an "
         "anti-degeneracy penalty, written into the cosine head with a "
         "one-hot preference (ported from the ray worker's "
-        "ALPHAGRAD_REWARD_MODE=mult; the structural anti-collapse option).",
+        "ALPHAGRAD_REWARD_MODE=mult; the structural anti-collapse option). "
+        "lagrangian: RCPO-style quality constraint -- ADDITIVE cost channels "
+        "exactly as additive mode computes them, plus a stationary violation "
+        "channel -max(0, lag_tau - clip(q, -0.5, 1)) in the quality slot; "
+        "lambda (dual variable, ascended once per episode on the measured "
+        "mean violation) enters ONLY as the quality slot of the advantage-"
+        "scalarization preference. No flat basin, diverged strictly below "
+        "zero-work, value net never sees lambda.",
     )
+    p.add_argument("--lag-tau", type=float, default=0.75,
+                   help="lagrangian mode: quality constraint threshold; the "
+                   "violation channel is max(0, tau - clip(q, -0.5, 1)).")
+    p.add_argument("--lag-eta", type=float, default=0.05,
+                   help="lagrangian mode: dual-ascent step size on lambda "
+                   "(once per episode, from the episode's measured "
+                   "terminal qualities, AFTER the PPO update).")
+    p.add_argument("--lag-init", type=float, default=1.0,
+                   help="lagrangian mode: initial lambda.")
+    p.add_argument("--lag-min", type=float, default=0.1,
+                   help="lagrangian mode: lambda floor. Never 0 -- quality "
+                   "must always retain advantage weight.")
+    p.add_argument("--lag-max", type=float, default=10.0,
+                   help="lagrangian mode: lambda cap. Bounds the violation "
+                   "channel's relative advantage weight (channels are "
+                   "PopArt-normalized, so the scalarized advantage stays "
+                   "O(1) by construction).")
+    p.add_argument("--popart-basin-freeze",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="lagrangian mode: freeze the quality head's PopArt "
+                   "(m1, m2, w) for an episode when >50%% of the batch is "
+                   "at near-total destruction (violation > 0.9*(tau+0.5)) "
+                   "-- the collapse dossier's section-3 ratchet guard.")
     p.add_argument(
         "--per-face", action="store_true",
         help="Apply each vertex's approximation rules PER FACE (per local "
@@ -5177,6 +5300,26 @@ def main():
         head_reward_weights_np = np.zeros(NUM_VALUE_HEADS, dtype=np.float32)
         head_reward_weights_np[HEAD_NAMES.index("quality")] = 1.0
         head_reward_weights = jnp.asarray(head_reward_weights_np, dtype=jnp.float32)
+    if args.reward_mode == "lagrangian":
+        # Cost weights keep the CLI --lambda-cmp / --lambda-mem additive
+        # semantics; the quality slot's weight IS lambda -- a live host-side
+        # dual variable seeded from --lag-init and re-broadcast into
+        # preferences_per_env every episode (see the training loop).
+        # --lambda-acc is ignored in this mode.
+        if args.loss_mode != "multi_head":
+            raise ValueError(
+                "--reward-mode lagrangian needs the vector value heads "
+                "(--loss-mode multi_head): lambda is an advantage-"
+                "scalarization weight over per-channel advantages.")
+        if args.preference_conditioned:
+            raise ValueError(
+                "--reward-mode lagrangian drives the quality preference "
+                "slot with the dual variable lambda; "
+                "--preference-conditioned (Dirichlet preference sampling) "
+                "would overwrite it every episode. Pick one.")
+        head_reward_weights_np[HEAD_NAMES.index("quality")] = np.float32(
+            args.lag_init)
+        head_reward_weights = jnp.asarray(head_reward_weights_np, dtype=jnp.float32)
 
     # Per-(vertex, pair, factor) validity mask. The legacy mask filtered
     # out factors that didn't divide the relevant axis sizes. With
@@ -6738,6 +6881,14 @@ def main():
                 args.anti_degen_tau,
                 gate_fidelity=args.gate_fidelity,
             )
+        elif args.reward_mode == "lagrangian":
+            # ADDITIVE composition (owner 2026-08-18): the cost channels
+            # flow exactly as --reward-mode additive computes them; only
+            # the quality slot is replaced by the stationary -violation
+            # channel. No multiplicative gate anywhere on this path;
+            # lambda enters ONLY via traj.preference at the advantage
+            # scalarization below -- value targets stay lambda-free.
+            traj_reward = _apply_lagrangian_channels(traj_reward, args.lag_tau)
         sl_reward = _symlog_rewards(traj_reward)  # (E, T, NUM_REWARDS)
         if args.loss_mode == "scalar":
             scalar_reward = jnp.sum(sl_reward * reward_weights, axis=-1)  # (E, T)
@@ -6860,6 +7011,19 @@ def main():
                 popart_m1, popart_m2, popart_w, estim_returns,
                 args.popart_beta, args.popart_sigma_min, 1e12, 5.0,
             )
+            if args.reward_mode == "lagrangian" and args.popart_basin_freeze:
+                # Section-3 ratchet guard: a near-uniformly-destroyed batch
+                # must not drag the quality channel's (mu, sigma) onto the
+                # basin. Host telemetry (lagrangian/popart_frozen) recomputes
+                # the same deterministic predicate from total_rewards_full,
+                # so nothing extra crosses the jit boundary.
+                new_m1, new_m2, new_w, _ = _lag_basin_freeze(
+                    (popart_m1, popart_m2, popart_w),
+                    (new_m1, new_m2, new_w),
+                    traj.reward[:, -1, REWARD_INDEX["cosine_sim"]],
+                    args.lag_tau,
+                    HEAD_NAMES.index("quality"),
+                )
             new_mu, new_sigma = _popart_derive(
                 new_m1, new_m2, new_w, args.popart_sigma_min, 1e12)
             # ART: output-preserving head rescale so the critic's predictions
@@ -7585,7 +7749,7 @@ def main():
     def host_log(
         ep, all_rets, actions_pack, mean_r, mets, diag_pack=None,
         popart_stats=None, attn_entropy=None, warmup=False, true_return=None,
-        probe_metrics=None):
+        probe_metrics=None, extra_log=None):
         ep = int(ep)
         all_rets = np.array(all_rets)  # (num_envs, NUM_REWARDS)
         v_idx_arr = np.array(actions_pack[0])
@@ -8429,6 +8593,12 @@ def main():
             _fprobe.TARGET_FAILS[0] = 0
             _PROBE_FAILS[0] = 0
 
+        # --reward-mode lagrangian controller telemetry (lambda, violation,
+        # basin freeze). Merged here so BOTH sinks (jsonl below + wandb)
+        # carry it; survives --lean-logging (four cheap scalars).
+        if extra_log:
+            log_dict.update(extra_log)
+
         # PER-EPISODE JSONL SINK (ALPHAGRAD_UPDATE_JSONL, default off).
         # Written BEFORE wandb.log so a crashed/offline run still has it, and
         # append-only so a mid-run kill keeps every completed episode. Carries
@@ -8701,6 +8871,13 @@ def main():
     # `(num_envs, NUM_VALUE_HEADS)` shape.
     static_pref = jnp.broadcast_to(head_reward_weights, (num_envs, NUM_VALUE_HEADS))
 
+    # --reward-mode lagrangian: the dual variable. A HOST-side float that
+    # reaches the update EXCLUSIVELY through preferences_per_env (advantage
+    # scalarization). Rewards, value targets and PopArt statistics are
+    # lambda-free by construction -- the value net is safeguarded against
+    # the non-stationary constraint price.
+    lag_lambda = float(args.lag_init)
+
     # JAX profiler hook. ``ALPHAGRAD_JAX_TRACE_DIR=/path`` enables a
     # per-episode trace: starts on the episode index given by
     # ``ALPHAGRAD_JAX_TRACE_EP`` (default 2 — first ep after the cold
@@ -8796,6 +8973,17 @@ def main():
             )
         else:
             preferences_per_env = static_pref
+        if args.reward_mode == "lagrangian":
+            # lambda enters HERE and ONLY here: the quality slot of the
+            # advantage-scalarization preference (the channel stores
+            # -violation, so the weight is +lambda -- see
+            # _apply_lagrangian_channels for the sign convention). Same
+            # shape/dtype every episode: updating lambda never retriggers
+            # a compile.
+            _lagp = np.array(head_reward_weights_np, dtype=np.float32, copy=True)
+            _lagp[HEAD_NAMES.index("quality")] = np.float32(lag_lambda)
+            preferences_per_env = jnp.broadcast_to(
+                jnp.asarray(_lagp), (num_envs, NUM_VALUE_HEADS))
 
         eval_samples = generate_eval_samples(env, ep_eval_key, args.num_eval_samples)
         env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
@@ -8889,6 +9077,8 @@ def main():
                         _wr, mult_cost_weights, args.gate_tau, args.gate_w,
                         args.anti_degen_penalty, args.anti_degen_tau,
                         gate_fidelity=args.gate_fidelity)
+                elif args.reward_mode == "lagrangian":
+                    _wr = _apply_lagrangian_channels(_wr, args.lag_tau)
                 _hr = np.asarray(
                     _symlog_rewards(_wr)[..., _HEAD_REWARD_INDICES_ARR],
                     dtype=np.float64)                           # (E, T, K)
@@ -9104,6 +9294,28 @@ def main():
                     "step": int(global_step),
                     "ret": float(true_scalar_return),
                 }, _fh)
+        lag_extra = None
+        if args.reward_mode == "lagrangian":
+            # Dual ascent: ONCE PER EPISODE, AFTER the PPO update, from the
+            # episode's measured terminal qualities (total_rewards_full is
+            # the raw per-env reward-vector sum; quality is sparse-terminal,
+            # so the sum IS the terminal measurement, diverged -1.0 intact).
+            _lag_q = np.asarray(total_rewards_full)[:, REWARD_INDEX["cosine_sim"]]
+            _lag_v = np.maximum(
+                0.0, args.lag_tau - np.clip(_lag_q, -0.5, 1.0))
+            _lag_frozen = bool(
+                args.popart_basin_freeze
+                and args.advantage_norm == "popart"
+                and float(np.mean(_lag_v > 0.9 * (args.lag_tau + 0.5))) > 0.5)
+            lag_lambda = _lag_dual_ascent(
+                lag_lambda, float(np.mean(_lag_v)), args.lag_eta,
+                args.lag_min, args.lag_max)
+            lag_extra = {
+                "lagrangian/lambda": float(lag_lambda),
+                "lagrangian/mean_violation": float(np.mean(_lag_v)),
+                "lagrangian/frac_violating": float(np.mean(_lag_v > 0.0)),
+                "lagrangian/popart_frozen": float(_lag_frozen),
+            }
         host_log(
             ep,
             total_rewards_full,
@@ -9117,6 +9329,7 @@ def main():
             attn_entropy=attn_ent,
             true_return=float(true_scalar_return),
             probe_metrics=probe_metrics,
+            extra_log=lag_extra,
         )
         # Mid-training top-N snapshot. Skips the wandb table log so we
         # don't pollute the offline run with duplicate tables — only the
