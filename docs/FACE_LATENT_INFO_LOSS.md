@@ -455,3 +455,34 @@ Artifacts: `probe_invest/edgemem/` (`classify.py`, `capture_ext.py`,
 `data/classify_*.pkl`, `data/vidx_map.json`, `data/edgemem_results.txt`,
 `data/edgemem_faces.pkl`, logs `data/run_cap_61854.log`,
 `data/run_ana_61857.log`).
+
+**Implementation (v64).** The production design above is implemented in
+commit `e16a255` behind `--face-edge-mem` (default OFF; the disabled
+path is bit-identical -- pinned in `tests/edge_mem_test.py`, and the v63
+endpoint suite still passes 7/7). Write: the SAME `_vmem.scatter`,
+riding `carry_stream.advance`'s single encode fold (new
+`edge_mem`/`edge_ids` arms), keyed by a host-assigned res-edge slot
+table (`face_driver.EdgeSlotTable`: K = ALPHAGRAD_MAX_FACES, assign on
+first emission, evict-oldest past K; per-episode telemetry `edgemem/*`
+incl. `evictions` and `nonzero_reads`). The span attribution is
+`last_face_segments`' own tiling, recovered on device from the stored
+chunk counts plus a new approx-echo prefix-length wire
+(`live_faces.chunk_ex` -> `ppo._edge_write_ids`) -- exactly the spans
+the offline arm pooled. Read: `_face_loop` (rollout) and
+`_face_replay` (loss, off the re-derived POST-delta memory, gradient
+through both write and read) gather the face's lhs/rhs operand-edge rows
+(-1 -> zero row), and the head + var probe input becomes
+`[chunk || (vmem_i||vmem_j)? || (emem_lhs||emem_rhs)?]` = E / 3E / 5E =
+32 / 96 / 160 at E=32, composing with `--face-endpoint-read`.
+Rollout==replay logp (both flag combinations), slot-assignment determinism
++ eviction telemetry, zero rows for never-written operands, and the
+write->read binding (a later face's emem_lhs equals the scattered rows of
+its lhs edge's creation event) are unit-pinned. CPU gate (job 61862,
+Helmholtz 2-ep, free orders): RC=0 for edge-mem alone, both flags
+(160-wide), the flag-off regression, and the --grad-window 1 anchor path;
+`edgemem/nonzero_reads` = 2-3 per episode > 0, evictions 0. Launcher:
+`~/dsnn/fq_v64_tlm_joint.sbatch` (v63 + the flag, 160-wide), NOT
+submitted: under ALPHAGRAD_FORCE_REV_ORDER=1 the emem half is predicted
+inert (the stratum degeneracy above), so v64 is only meaningful once the
+rev pin is lifted or orders are randomized -- the launcher keeps the pin
+with that note inline.
