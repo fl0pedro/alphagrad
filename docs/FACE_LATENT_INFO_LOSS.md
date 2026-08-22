@@ -486,3 +486,144 @@ submitted: under ALPHAGRAD_FORCE_REV_ORDER=1 the emem half is predicted
 inert (the stratum degeneracy above), so v64 is only meaningful once the
 rev pin is lifted or orders are randomized -- the launcher keeps the pin
 with that note inline.
+
+## 10. Fast-weight query falsifier — could a palimpsa DECODER replace the keyed slots?
+
+(§9 is reserved for the in-flight width sweep of arms B/C,
+`probe_invest/width/`; this section is independent of it.)
+
+**Hypothesis tested** (owner's): palimpsa's per-layer fast-weight state is
+an associative matrix memory — the live recurrence (`_extend_sequential`,
+src/alphagrad/approx/ppo.py:1846-1866) updates, per layer l and head h,
+
+    M_l = v k^T           + exp(-gt·g) · M_l          (numerator)
+    I_l = beta ⊙ k^2 + (1-exp(-gt·g)) · Ip + exp(-gt·g) · I_l   (precision)
+
+with retrieval `v_hat = (M/I) q` (`out = einsum("hdn,hn->hd", mu, q·d^-0.5)`),
+beta = sigmoid(bias_proj)·softplus(b_scale) the Bayesian importance gate
+(palimpsa_encoder.py:75-90, Palimpsa-D bounded form) and q,k L2-normalised.
+In theory a large enough S retains the whole graph evolution, and what §1-§8
+diagnosed as missing is only an EXTRACTION mechanism — a decoder issuing
+edge-shaped queries against S — so the §8 edge-keyed slot archive would be a
+convenience, not a necessity. Counter-consideration: clean random-access
+retrieval from linear-attention state is bounded by key orthogonality
+(~d_k = E/2 per head, 6 (layer,head) matrices at L=3,H=2), against 206-286
+distinct edges per random-order episode.
+
+**Protocol** (`probe_invest/squery/`: `squery_replay.py`,
+`squery_analyze.py`, `run_squery.sbatch`; job 61867, outputs
+`data/sq_E{32,64,128,256}.pkl`, `data/squery_results.txt`,
+`data/run_61867.log`). Same frozen random-init palimpsa, same captures
+(rev + 3 random orders), same ridge/3-fold protocol, targets and strata as
+§8, via `edgemem_faces.pkl` (join 1044/1044 faces, header-parse failures 0;
+harness validation: chunk-mean on the rev capture reproduces §2 ndim
+0.83/0.86/0.89). Per face, at its decision step, the SIDE carry's (M, I) is
+recorded after the face's chunk — the state palimpsa actually has when the
+face is decided — and probed with three query arms (all
+`chunk ‖ v_hat(lhs) ‖ v_hat(rhs) ‖ v_hat(res)`, retrieval = the model's own
+read-out contraction):
+
+- **Sa** hand-built: q = the key palimpsa itself would form for the edge —
+  the model's own key projection over the edge's `path`-header atoms
+  (lhs = pred+central, rhs = central+succ, res = pred+succ), run through the
+  3-layer stack from an empty carry, mean-pooled, re-L2-normalised. A
+  query-projection variant (SaQ) tracks Sa within noise everywhere.
+- **Sb** learned ("decoder" arm): a small MLP (edge header embedding → q per
+  layer/head, L2-normalised) trained JOINTLY with the linear probe heads on
+  the train folds — extraction is learned, storage is palimpsa's.
+- **S-shuf** control: same queries against a random OTHER face's S.
+
+Width sweep E ∈ {32, 64, 128, 256} (d_k = 16…128), fresh random init at
+each width under the same `derive_agent_keys(250197)` discipline.
+
+**Interpretation rule — CV only.** The retrieval features are 10E wide
+(320…2560 at n=929): from E=64 up every S-arm ridge interpolates (train
+1.00 across the board), and Sb's joint fit reaches train 1.00 even at E=32.
+The §8 train-column convention is meaningless here; every number below and
+the verdict are OUT-OF-FOLD (3-fold CV), where C@32's floor is also
+evaluated. C@32 cv on both-intermediate: lhs ndim 0.55 (maj 0.43) szR²
+0.20, rhs ndim 0.75 (maj 0.56) szR² 0.37.
+
+**Results** (both-intermediate stratum, n=463; cv, maj lhs 0.43 / rhs 0.56
+/ res 0.37; full arm×stratum×E tables incl. one-inter/both-prim in
+`squery_results.txt`):
+
+| arm | E | lhs ndim | lhs szR² | rhs ndim | rhs szR² | res szR² |
+|---|---|---|---|---|---|---|
+| A chunk | 32 | 0.45 | −0.07 | 0.59 | −0.07 | 0.15 |
+| C@32 (slot floor) | 32 | 0.55 | 0.20 | 0.75 | 0.37 | 0.28 |
+| Sa hand-built | 32 | 0.51 | −0.89 | 0.68 | −0.53 | −0.03 |
+| Sa hand-built | 128 | 0.54 | −1.15 | 0.81 | −0.36 | −0.12 |
+| Sa hand-built | 256 | 0.54 | −2.15 | 0.83 | −1.09 | −1.10 |
+| Sb learned | 32 | 0.66 | −0.14 | 0.87 | 0.18 | 0.29 |
+| Sb learned | 64 | 0.69 | −0.09 | 0.89 | 0.39 | 0.47 |
+| Sb learned | 128 | 0.75 | 0.15 | 0.92 | 0.53 | 0.56 |
+| Sb learned | 256 | **0.70** | **0.24** | **0.90** | **0.41** | **0.51** |
+| S-shuf control | 32-256 | 0.40-0.45 | ≤−1.0 | 0.31-0.60 | ≤−0.6 | ≤−0.4 |
+
+Verdict block (majority-margin recovered vs C@32, the §8 four decisive
+numbers, cv): Sb@32 fails (lhs szR² −70%), Sb@64 fails (lhs szR² −44%),
+Sb@128 3-of-4 (lhs szR² 74%; the other three 142-270%), **Sb@256 clears
+all four: lhs ndim 231%, lhs szR² 120%, rhs ndim 181%, rhs szR² 109%**.
+Sa (hand-built) fails size-R² at EVERY width (cv negative throughout, down
+to −2.15 at 256) while its rhs ndim does scale (0.68→0.83, above C's 0.75
+from E=128); the shuffled-S control sits at/below majority everywhere with
+deeply negative szR² — the retrieved signal is real state content bound to
+THIS face's step, not chunk leakage or query-feature leakage.
+
+**Verdicts.**
+- **EXTRACTABLE — at E=256 with LEARNED queries** (criterion: ≥90% of C@32
+  on all four both-intermediate cv numbers; met at E=256, near-met at
+  E=128). The owner's storage claim survives its falsification attempt:
+  the fast-weight state of a random-init palimpsa DOES retain
+  operand-level structure for accumulated intermediates that no §1-§8 read
+  point reaches, including res-size (Sb res szR² 0.51 vs C's 0.28 — the
+  one slot emem structurally cannot serve). The decoder theory is viable
+  and the design conversation changes accordingly.
+- **Extraction NEEDS learning.** Palimpsa's own key/query projections do
+  not address edges at random init: Sa never decodes size at any width
+  (interference: composite multi-token addresses against d_k-bounded
+  superposition), so "S + a reader" is not enough — the reader must be a
+  trained query map, exactly the pathway class PPO training drained in §3.
+  Any production decoder therefore needs the same anchoring the §4/§6/§8
+  slot reads get for free (probe-loss or policy-gradient through the
+  query map), plus ~8× encoder width.
+- **Capacity picture:** the E=32 production width (d_k=16 against 206-286
+  edges/episode) is where size extraction fails hardest (Sb szR² lhs
+  −0.14); crossing d_k ≈ 64-128 (E=128-256) is what buys size decodability
+  — consistent with the key-orthogonality bound, softened by the 6
+  (layer,head) stores and a tolerant linear read.
+- **Per-layer:** no layer owns the operand info — per-layer Sa reads track
+  each other within noise at every width (E=32 both-inter rhs ndim
+  0.66/0.67/0.71 for L0/L1/L2) and none decodes size alone; the signal is
+  distributed across all three (M, I) pairs.
+
+**Caveats.** (i) Random-init palimpsa is the storage-quality floor —
+trained fast weights could store better; but §H-D cuts the other way too
+(v61 training measurably DRAINED face-relevant content from the shared
+rows), so the trained state could equally be worse for these targets:
+extraction viability at init does not promise it under the full training
+pull. (ii) The probe-trained-encoder arm was skipped — no decode5/probe
+checkpoint exists on disk (decode5_out holds logs/audits only). (iii) At
+E≥64 every train column is interpolation (1.00); conclusions here are
+cv-only, n=463 in the decisive stratum.
+
+**Answer to the owner's question — could a palimpsa decoder replace the
+keyed slots?** In principle yes, but not at the production operating
+point: with learned edge-queries and E=256 (8× the shipped width, ~64×
+the per-step state: (M,I) = 2·3·2·d_k² floats), retrieval from palimpsa's
+own fast weights matches or beats the edge-keyed archive on every
+decisive both-intermediate number, res-size included — storage is not the
+binding constraint, extraction is, and extraction is learnable. But the
+slot archive reaches that floor TODAY at E=32, parameter-free, with a
+read that is anchored by construction and already implemented
+(`--face-edge-mem`, §8). The pragmatic split: keep the keyed slots as the
+production mechanism at current width; treat the learned-query decoder as
+the scale-up path (it subsumes the slots' function only once E≥128-256
+AND the query map is anchored against the §3 collapse — e.g. trained
+under the probe loss, not the PPO surrogate alone).
+
+Artifacts: `probe_invest/squery/` (`squery_replay.py` — state capture +
+hand-built keys via the model's own projections; `squery_analyze.py` —
+arms, ridge + joint decoder training, verdict block; `run_squery.sbatch`;
+`data/sq_E*.pkl`, `data/squery_results.txt`, `data/run_61867.log`).
