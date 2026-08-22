@@ -198,3 +198,21 @@ With the endpoint-slot read concatenated (probe input 96-wide), same probe proto
 - If the concatenated probe ALSO decays to baseline while `probe/vertex/*` holds ≈1.0,
   the collapse is upstream in the shared rows and the next lever is palimpsa row-collapse
   telemetry (attention-entropy diagnostic), not the read-point.
+
+## 6. Implementation (v63)
+
+The section-4 fix is implemented in commit `0605ad0` behind
+`--face-endpoint-read` (default OFF; the disabled path is bit-identical to
+v62 -- pinned in `tests/endpoint_read_test.py`). When on, both
+`_face_loop` (rollout) and `_face_replay` (loss) hand the head
+`[chunk_mean || slot_i || slot_j]` (3E = 96): the two endpoint slot rows are
+`read(base+dyn)[face_endpoints-1]` with a zero row for endpoint 0, gathered
+from the memory synced through the previous elimination's delta (the state
+that exists when the step's faces are decided). `UnifiedFaceHead` widens to
+`in_dim = 3E`; the gradient flows through the endpoint rows into palimpsa
+(the read is a POLICY input -- that is what anchors it), while the var probe
+decodes the SAME concatenation through its own stop-gradient-isolated heads
+(`VarProbes(face_in_dim=3E)`), so the section-5 predictions are measured on
+exactly the tensor the head reads. Launcher:
+`~/dsnn/fq_v63_tlm_endpoint.sbatch` (v62 config + the flag). az_gumbel does
+not support the flag yet and fails loudly if handed an endpoint-read policy.
