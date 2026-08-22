@@ -640,6 +640,32 @@ def _face_entropy_floor_penalty(h_face, floor, weight):
     return weight * jnp.maximum(0.0, floor - h_face) ** 2
 
 
+def _split_entropy_bonus(entropy_loss, face_ent_mean, entropy_weight,
+                         face_entropy_weight):
+    """--face-entropy-weight: face/vertex entropy-bonus split.
+
+    ``entropy_loss`` is the mean JOINT per-sample entropy, which already
+    folds the face head's arity-normalised entropy in (evaluate_action_
+    dynamic adds ``f_ent / max(f_arity, 1)`` -- the SAME quantity slot 5
+    of ``_entropy_components`` logs and --face-entropy-floor hinges on;
+    ``face_ent_mean`` is its batch mean). ``face_entropy_weight is None``
+    (the default) reproduces the historic single-weight bonus
+    bit-identically; when set, the face component is re-weighted while
+    the vertex/ve-head component keeps the global weight, so the
+    effective gradient on the face entropy is exactly the flag. v62 (job
+    61844): the global 0.05 bonus dragged the face head from H=0.027 to
+    1.26 nats -- far above the 0.3 floor, which only pushes UP -- until
+    every plan violated the quality constraint, advantage contrast
+    vanished and the bonus was the only gradient left (a diffusion
+    absorber). The face head needs the floor plus a near-ZERO bonus, not
+    a uniformising one. Pinned by tests/lagrangian_reward_test.py.
+    """
+    if face_entropy_weight is None:
+        return entropy_weight * entropy_loss
+    return (entropy_weight * (entropy_loss - face_ent_mean)
+            + face_entropy_weight * face_ent_mean)
+
+
 def _lag_basin_freeze(old_stats, new_stats, q_terminal, lag_tau, head_idx):
     """Dossier section-10(3) basin-freeze guard for the quality PopArt channel.
 
@@ -3683,6 +3709,21 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--minibatches", type=int, default=32)
     p.add_argument("--ppo-epochs", type=int, default=2)
     p.add_argument("--entropy-weight", type=float, default=0.05)
+    p.add_argument("--face-entropy-weight", type=float, default=None,
+                   help="entropy-bonus weight for the FACE head's arity-"
+                   "normalised entropy (slot 5 of _entropy_components, "
+                   "the same quantity --face-entropy-floor reads); the "
+                   "vertex/ve-head entropy term keeps --entropy-weight. "
+                   "Default None = fall back to --entropy-weight, "
+                   "bit-identical to every prior config. v62 diffusion "
+                   "mechanism: the global 0.05 bonus dragged the face "
+                   "head toward uniform (entropy 0.027 -> 1.26 nats, far "
+                   "above the 0.3 floor which only pushes UP) until "
+                   "every plan violated the quality constraint, "
+                   "advantage contrast vanished and the bonus became the "
+                   "only gradient -- so the face head needs the floor "
+                   "plus a near-zero bonus (e.g. 0.005), not a "
+                   "uniformising one.")
     p.add_argument("--face-entropy-floor", type=float, default=0.0,
                    help="saturation guard for the per-FACE approximation "
                    "head (v61 collapsed to 100%% SKIP, approx-head entropy "
@@ -7399,10 +7440,18 @@ def main():
             jnp.mean(face_ents),
         )
 
+        # --face-entropy-weight: split the entropy bonus so the face
+        # head's component (already folded into `entropies` per sample)
+        # can carry a near-zero weight while the vertex/ve entropy keeps
+        # the global one. None = the historic single-weight expression,
+        # bit-identical.
+        _ent_bonus = _split_entropy_bonus(
+            entropy_loss, jnp.mean(face_ents), args.entropy_weight,
+            getattr(args, "face_entropy_weight", None))
         total_loss = (
             ppo_loss
             + args.value_weight * value_loss
-            - args.entropy_weight * entropy_loss
+            - _ent_bonus
         )
         # --face-entropy-floor: hinge on the SAME quantity slot 5 of
         # _entropy_components logs (jnp.mean(face_ents), the
@@ -7506,7 +7555,7 @@ def main():
             explained_var,
             ppo_loss,
             args.value_weight * value_loss,
-            args.entropy_weight * entropy_loss,
+            _ent_bonus,
             total_loss,
             trigger_ratio,
             # Per-component KLs for dynamic-mode debugging; legacy loss_fn
@@ -10265,14 +10314,21 @@ def main():
             # stdout mirror of the wandb keys: v61's log never carried
             # lambda anywhere, which made the collapse post-mortem blind.
             print("[lagrangian] ep=%d lambda=%.4f mean_violation=%.4f "
-                  "frac_violating=%.3f frozen=%d"
+                  "frac_violating=%.3f mean_raw_q=%.4f frozen=%d"
                   % (ep, lag_lambda, float(np.mean(_lag_v)),
-                     float(np.mean(_lag_v > 0.0)), int(_lag_frozen)),
+                     float(np.mean(_lag_v > 0.0)), float(np.mean(_lag_q)),
+                     int(_lag_frozen)),
                   flush=True)
             lag_extra = {
                 "lagrangian/lambda": float(lag_lambda),
                 "lagrangian/mean_violation": float(np.mean(_lag_v)),
                 "lagrangian/frac_violating": float(np.mean(_lag_v > 0.0)),
+                # 2026-08-21 dashboard confusion: the reward-channel
+                # quality slot stores -violation, so a HEALTHY run
+                # (q >= tau, violation 0) plots at 0 and reads like
+                # collapse. This is the RAW terminal quality, pre-clip,
+                # mean over envs -- the number actually to read.
+                "lagrangian/mean_raw_q": float(np.mean(_lag_q)),
                 "lagrangian/popart_frozen": float(_lag_frozen),
             }
         host_log(

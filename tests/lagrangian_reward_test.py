@@ -29,11 +29,14 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
 
+import jax                                                      # noqa: E402
 import numpy as np                                              # noqa: E402
 import jax.numpy as jnp                                         # noqa: E402
 
 from alphagrad.approx.ppo import (                              # noqa: E402
     HEAD_NAMES,
+    _face_entropy_floor_penalty,
+    _split_entropy_bonus,
     HEAD_REWARD_INDICES,
     NUM_VALUE_HEADS,
     _apply_lagrangian_channels,
@@ -263,3 +266,73 @@ def test_basin_freeze_does_not_trigger_at_half_or_below():
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# --face-entropy-weight: face/vertex entropy-bonus split (v63)
+# ---------------------------------------------------------------------------
+
+def test_split_entropy_bonus_default_none_bit_identical():
+    """None (the default) must be BITWISE the pre-change expression
+    ``entropy_weight * entropy_loss`` -- every prior config unchanged."""
+    rng = np.random.default_rng(3)
+    ents = jnp.asarray(rng.uniform(0.0, 2.0, 64), jnp.float32)
+    face = jnp.asarray(rng.uniform(0.0, 1.0, 64), jnp.float32)
+    el, fm = jnp.mean(ents), jnp.mean(face)
+    got = _split_entropy_bonus(el, fm, 0.05, None)
+    ref = 0.05 * el
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+    # and equal to the flag explicitly set to the global weight
+    np.testing.assert_allclose(
+        float(_split_entropy_bonus(el, fm, 0.05, 0.05)), float(ref),
+        rtol=1e-6)
+
+
+def test_split_entropy_bonus_face_scales_vertex_keeps_global():
+    """Face term scales with the flag; vertex term keeps the global
+    weight. The joint entropy folds the face entropy in per sample, so
+    the effective gradient on the face entropy is EXACTLY the flag."""
+    v, h, g = 0.9, 0.4, 0.05  # vertex part, face mean, global weight
+    el = v + h
+    for few in (0.0, 0.005, 0.05, 0.5):
+        np.testing.assert_allclose(
+            float(_split_entropy_bonus(el, h, g, few)),
+            g * v + few * h, rtol=1e-6)
+    # linear in the flag through the face mean only
+    b1 = float(_split_entropy_bonus(el, h, g, 0.005))
+    b2 = float(_split_entropy_bonus(el, h, g, 0.010))
+    np.testing.assert_allclose(b2 - b1, 0.005 * h, rtol=1e-5)
+
+    # gradient wrt the FACE entropy is the flag; wrt the VERTEX entropy
+    # it stays the global weight, whatever the flag says.
+    def bonus(hh, vv, few):
+        return _split_entropy_bonus(vv + hh, hh, g, few)
+
+    for few in (0.0, 0.005, 0.5):
+        np.testing.assert_allclose(
+            float(jax.grad(bonus, argnums=0)(h, v, few)), few, atol=1e-7)
+        np.testing.assert_allclose(
+            float(jax.grad(bonus, argnums=1)(h, v, few)), g, atol=1e-7)
+    # None falls back to the global weight on both components
+    np.testing.assert_allclose(
+        float(jax.grad(lambda hh: bonus(hh, v, None))(h)), g, atol=1e-7)
+
+
+def test_floor_hinge_unaffected_by_face_entropy_weight():
+    """--face-entropy-floor keeps its value and its restoring gradient
+    no matter what --face-entropy-weight says (including 0)."""
+    H, FLOORV, W, g = 0.1, 0.3, 10.0, 0.05
+    ref = float(_face_entropy_floor_penalty(H, FLOORV, W))
+    hinge_grad = -2.0 * W * (FLOORV - H)  # d hinge / dH below the floor
+    for few in (None, 0.0, 0.005, 1.0):
+        def loss(hh):
+            b = _split_entropy_bonus(0.9 + hh, hh, g, few)
+            return -b + _face_entropy_floor_penalty(hh, FLOORV, W)
+        b = float(_split_entropy_bonus(0.9 + H, H, g, few))
+        # hinge contribution identical for every flag value
+        np.testing.assert_allclose(float(loss(H)) + b, ref, rtol=1e-6)
+        few_eff = g if few is None else few
+        grad = float(jax.grad(loss)(H))
+        np.testing.assert_allclose(grad + few_eff, hinge_grad, rtol=1e-5)
+        # below the floor the loss still pushes H UP even at flag 0
+        assert grad < 0.0, (few, grad)
