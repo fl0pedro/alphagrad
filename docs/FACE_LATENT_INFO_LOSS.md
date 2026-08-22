@@ -216,3 +216,107 @@ decodes the SAME concatenation through its own stop-gradient-isolated heads
 exactly the tensor the head reads. Launcher:
 `~/dsnn/fq_v63_tlm_endpoint.sbatch` (v62 config + the flag). az_gumbel does
 not support the flag yet and fails loudly if handed an endpoint-read policy.
+
+## 7. Numeric-lexicon ablation — REFUTED
+
+**Hypothesis tested** (owner's): shape dims/sizes enter the token stream as
+bare digit-symbol token ids; the embedding treats them as unrelated symbols,
+so magnitude/order/product structure is unlearnable — and THIS, not
+routing/anchoring, is what caps the face probes (sizes-are-products worst,
+supervised ceiling == probe plateau, vertex 1.00 = static-target
+memorization). Decisive prediction if TRUE: a numeric channel at the
+embedding layer lifts chunk-mean size-R² from ~0.45-0.55 to >0.85 and ndim
+to ~1.0; if it stays ~baseline, the hypothesis is falsified.
+
+**Where dims become tokens** (graphax `4ea0bf8`,
+src/graphax/jaxpr.py): `IncrementalPathTokenizer._format_shape`
+(jaxpr.py:1315-1324) spells a shape as `< d0 * d1 * ... >` with each dim
+rendered MSB-first in base-10 by `int_to_base` (jaxpr.py:755); input shapes
+enter the base header at jaxpr.py:1256 (`base_tokens`), and numeric op
+params (reshape `new_sizes`, dot dims, scalar literals, dtype tags) enter
+first-sight `fns` definitions via `tokenize_value` (jaxpr.py:887-925)
+called from `_emit_op_params` (jaxpr.py:1165). Every digit symbol lands in
+the token-id range `[len(vocab), len(vocab)+10)` = [230, 240) via
+`_emit_symbols` (jaxpr.py:884); name atoms occupy [240, vocab_size), with
+`ALPHAGRAD_INCR_TOKEN_VOCAB` (=512 here) bounding the name alphabet.
+
+**Protocol** (`probe_invest/lexicon/analyze_lexicon.py`, job 61852, outputs
+`lexicon_results.txt` / `lexicon_reprs.npz` / `run_61852.log`): same
+capture, same replay, same ridge probes as stage 2 (§2 H-C/H-D). Ground
+truth: every maximal digit-token run in every stream (base, per-step
+emissions, per-face chunks) is parsed back to its numeric value v. Each
+digit occurrence is remapped to a synthetic id unique to its
+(digit-symbol, v) pair and the frozen `eqx.nn.Embedding` table is extended
+so the new row implements the arm — (a) original digit row (baseline,
+reproduces stage 2 bit-for-bit); (b) digit row + s·P·phi(v); (c) s·P·phi(v)
+only (no symbol identity); (d) digit row + s·MLP(phi(v)) (random 2-layer
+MLP), with phi(v) = [log1p v, sin/cos(w·log1p v), w ∈ {0.5,1,2,4,8,16}]
+column-standardized and s matching the numeric component's std to the
+symbol table's. This is exactly the candidate production change
+(embedding-layer-only symbol_embed + numeric-enc for value tokens) injected
+BEFORE the recurrence, so it reaches both reads through the full pipeline.
+
+**Lexicon census first** — the premise is structurally thinner than
+assumed: the whole episode stream contains **1126 digit-token occurrences
+but only 8 distinct numbers** (19 distinct (digit,value) pairs), and only
+**2 distinct dims ever appear in shape context**: 128 (23 runs) and
+1024 (1 run). Most face-target dims never enter the stream as numbers at
+all — the sizes the probe must predict are PRODUCTS created by graph
+structure (contractions), never spelled as tokens (§2 H-B said 13-16% of
+targets' dims appear in the own chunk; the census sharpens it: as *shape
+dims* almost nothing appears anywhere).
+
+**Results** (train/cv, majority in parens; n=115 faces):
+
+| read | slot | arm | ndim | size-R² | dtype | dim0-bucket |
+|---|---|---|---|---|---|---|
+| chunk mean | lhs | a | 0.82/0.60 (0.47) | **0.45**/−0.64 | 0.94/0.89 (0.91) | 0.78/0.50 (0.48) |
+| chunk mean | lhs | b | 0.86/0.67 | **0.50**/−0.47 | 0.93/0.89 | 0.79/0.50 |
+| chunk mean | lhs | c | 0.86/0.60 | 0.45/−0.80 | 0.93/0.90 | 0.73/0.49 |
+| chunk mean | lhs | d | 0.86/0.63 | 0.47/−0.59 | 0.94/0.87 | 0.80/0.53 |
+| chunk mean | rhs | a | 0.86/0.73 (0.76) | **0.48**/−0.25 | 0.99/0.99 (0.99) | 0.96/0.87 (0.89) |
+| chunk mean | rhs | b | 0.85/0.73 | **0.44**/−0.43 | 0.99/0.99 | 0.96/0.90 |
+| chunk mean | res | a | 0.89/0.68 (0.64) | **0.55**/−0.95 | 1.00/0.99 (0.99) | 0.93/0.79 (0.77) |
+| chunk mean | res | b | 0.88/0.60 | **0.54**/−1.18 | 1.00/0.99 | 0.93/0.84 |
+| mean‖ep_slot | lhs | a | 0.99/0.48 | 0.90/− | 1.00/0.64 | 1.00/0.41 |
+| mean‖ep_slot | lhs | b | 1.00/0.45 | 0.92/− | 1.00/0.68 | 1.00/0.39 |
+| mean‖ep_slot | rhs | a/b | 1.00 / 1.00 | 0.95 / 0.95 | 1.00 / 1.00 | 1.00 / 1.00 |
+| mean‖ep_slot | res | a/b | 1.00 / 1.00 | 0.94 / 0.92 | 1.00 / 1.00 | 1.00 / 1.00 |
+
+(arms c and d track a/b within ±0.05 everywhere; full table in
+`lexicon_results.txt`.) The decisive number — chunk-mean size-R² — moves
+0.45→0.50 (lhs), 0.48→0.44 (rhs), 0.55→0.54 (res): **noise, nowhere near
+the predicted >0.85**; ndim stays ~0.85, not ~1.0. The endpoint-slot
+concatenation was already at 0.90-0.95 under symbols alone and does not
+move either. Vertex-side control: ctx-read ndim/szR² is unchanged by the
+numeric channel (lhs 0.86→0.89, rhs szR² 0.82→0.88, res 0.45→0.49 train —
+same within-protocol jitter), confirming no lift is needed where targets
+are static.
+
+**Frequency-tracking check** (cv preds, chunk-mean read, faces binned by
+stream frequency of the target's largest dim): the memorization account
+predicts accuracy tracks per-symbol frequency under (a) but NOT under (b).
+Observed: identical tracking in both arms — ndim-acc 0.61→0.73 (a) vs
+0.60→0.71 (b) from rare-dim to frequent-dim bin; dim0/|szerr| likewise
+arm-independent. The frequency signature is a property of the targets and
+the read, not of the symbol lexicon.
+
+**Verdict: REFUTED.** Giving the embedding layer full magnitude information
+(linear, Fourier, or MLP-encoded; with or without symbol identity) changes
+nothing at either read-point. The face-probe cap is not a
+numeric-lexicon/embedding problem: with a 2-symbol dim lexicon there is no
+magnitude structure to compose, and the sizes the probe misses are products
+that never appear in the stream as tokens — the bottleneck stays where §3
+put it: (1) the transient, unanchored chunk-mean read that training drains,
+and (2) name-only chunk content whose shape facts must ride the recurrence.
+The §4/§6 endpoint-slot read (`--face-endpoint-read`, commit `0605ad0`)
+remains the live lever; a v64 that instead shipped
+symbol_embed+MLP(numeric) at the embedding layer is predicted to be a null
+experiment (face size-R² still ~0.0-0.2 online, ndim decaying to majority
+as in v61). Mechanically, if a numeric channel is ever wanted for
+richer-dim targets (ViT-scale shape diversity), this ablation validates the
+embedding-layer-only route: extend the table above id 512 keyed by
+(digit, value) pairs — it composes with `ALPHAGRAD_INCR_TOKEN_VOCAB` (pair
+ids must sit above the name range) and is untouched by the two-name-
+universes constraint (digit ids are shared by both universes; only names
+diverge).
