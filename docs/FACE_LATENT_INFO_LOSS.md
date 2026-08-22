@@ -320,3 +320,138 @@ embedding-layer-only route: extend the table above id 512 keyed by
 ids must sit above the name range) and is untouched by the two-name-
 universes constraint (digit ids are shared by both universes; only names
 diverge).
+
+## 8. Edge-keyed memory — H1 (endpoint read degrades on intermediates) CONFIRMED, H2 (edge-keyed fix) CONFIRMED
+
+**Hypotheses tested** (owner's): **H1** — the §4/§6 endpoint-vertex read
+under-specifies faces whose lhs/rhs are ACCUMULATED INTERMEDIATE Jacobians
+(not primitives): `vmem_i` entangles ALL edges incident to vertex i, so the
+binding "which events belong to THIS edge" fails as fill-in accumulates.
+**H2** — an EDGE-KEYED memory (the same parameter-free scatter/segment-mean
+primitive as vmem, keyed by canonical edge id) restores decodability for
+intermediate operands.
+
+**Edge identity.** The canonical edge id is a pair in the face-key space
+(`_stable_var_index` positions, graphax core.py:896-908): a face with key
+(i, j) at central v has lhs edge (i, vidx(v)) (in-edge Jacobian, `pre_val`),
+rhs edge (vidx(v), j) (`post_val`), and res edge (i, j) — **the face key IS
+the res-edge id** (`faces_of`, core.py:1154-1215). An edge is INTERMEDIATE
+iff it was a PRIOR face's res edge in the episode (created/updated by
+fill-in), else PRIMITIVE (an original elemental partial).
+
+**The rev capture is stratum-degenerate.** Classifying the 115-face §2
+capture (`probe_invest/edgemem/classify.py`, job 61853): **1 both-primitive
+/ 114 one-intermediate / 0 both-intermediate** — under FORCE REV ORDER a res
+edge (i, j) always has j past the central, so no prior elimination can have
+written an edge ENDING at a not-yet-eliminated vertex: every lhs is
+primitive, nearly every rhs intermediate. All §2-§7 face numbers were
+measured on this one stratum. Extension (`capture_ext.py`, job 61854): three
+episodes with seeded RANDOM orders, same protocol otherwise — 938 faces =
+164 bp / 311 oi / 463 bi (929 with keyed truth + chunk; 3 dropped
+faces/episode as in §1).
+
+**Protocol** (`analyze_edgemem.py`, job 61857, outputs
+`edgemem_results.txt` / `edgemem_faces.pkl`): same frozen random-init
+palimpsa + ridge probes as stage 2. emem write = for each emitted face,
+its emission rows (per-face spans from `last_face_segments`) accumulate
+into bucket[res edge = face key]; reads are strictly-prior-step (online-
+causal), vmem reads post-step as in stage 2. Arms: **A** chunk-mean, **B**
+chunk‖vmem_i‖vmem_j (v63 read), **C** chunk‖emem_lhs‖emem_rhs, **D** =
+B∪C (all five), plus emem-only. One global ridge per arm/slot/target
+(fit on the pooled 929), metrics per stratum; size-R² uses the stratum's
+own mean (within-stratum SST). Harness validation: replaying the rev
+capture reproduces stage 2 — arm A ndim 0.84/0.86/0.89, szR² 0.46/0.47/0.54
+(§2: 0.82/0.86/0.89, 0.45/0.48/0.55); arm B 1.00 ndim, szR² 0.90/0.95/0.93
+(§2 mean‖ep_slot: 0.99-1.00, 0.90-0.95).
+
+**Stratified results** (random-order pool, n=929; train/cv, majority in
+parens; full table in `edgemem_results.txt`):
+
+| slot | arm | both-prim (n=158) | one-inter (n=308) | both-inter (n=463) |
+|---|---|---|---|---|
+| lhs ndim | A | 0.78/0.72 (0.53) | 0.54/0.52 (0.51) | 0.52/0.45 (0.43) |
+| lhs ndim | B | **0.85**/0.74 | 0.70/0.56 | **0.61**/0.49 |
+| lhs ndim | C | 0.79/0.78 | 0.73/0.67 | **0.72**/0.55 |
+| lhs ndim | D | 0.89/0.78 | 0.83/0.69 | **0.77**/0.57 |
+| lhs szR² | B | **0.39**/−0.17 | 0.27/0.05 | **0.19**/−0.06 |
+| lhs szR² | C | 0.33/0.22 | 0.60/0.49 | **0.44**/0.20 |
+| lhs szR² | D | 0.52/0.10 | 0.68/0.46 | **0.53**/0.23 |
+| rhs ndim | B | 0.74/0.58 (0.47) | 0.70/0.55 (0.45) | 0.76/0.68 (0.56) |
+| rhs ndim | C | 0.68/0.65 | 0.70/0.60 | **0.89**/0.75 |
+| rhs ndim | D | 0.82/0.64 | 0.82/0.66 | **0.93**/0.84 |
+| rhs szR² | B | 0.32/−0.07 | 0.52/0.32 | 0.37/0.19 |
+| rhs szR² | C | 0.25/0.18 | 0.58/0.45 | **0.60**/0.37 |
+| rhs szR² | D | 0.49/0.18 | 0.68/0.48 | **0.67**/0.40 |
+| res szR² | B | 0.17/−0.26 (0.53) | 0.44/0.24 (0.43) | 0.44/0.33 (0.37) |
+| res szR² | C | 0.05/−0.07 | 0.43/0.27 | 0.49/0.28 |
+| res szR² | D | 0.21/−0.35 | 0.55/0.21 | **0.59**/0.36 |
+
+**H1: CONFIRMED.** The endpoint read (B) drops materially from its primitive
+stratum to the intermediate ones — lhs ndim 0.85 → 0.61 train (0.74 → 0.49
+cv; majority-margin 0.32 → 0.18), lhs szR² 0.39 → 0.19 — and monotonically
+with depth (step terciles, lhs: ndim 1.00→1.00 on rev but 0.85 → 0.71 →
+0.59 on random orders while C holds 0.76/0.75/0.71). The chunk-mean drops
+too, as predicted (lhs ndim 0.78 → 0.52). rhs/res margins shrink more
+mildly (B rhs margin 0.27 → 0.20). Note the rev capture hid all of this:
+its one populated stratum sits where B scores 0.90-0.95 szR².
+
+**H2: CONFIRMED** (operand slots). On the both-intermediate stratum C beats
+B everywhere it structurally can: lhs ndim 0.72 vs 0.61 (szR² 0.44 vs
+0.19), rhs ndim 0.89 vs 0.76 (szR² 0.60 vs 0.37); measured as
+majority-margin recovered relative to B's own both-primitive stratum, C-on-
+both-inter reaches 91% (lhs ndim), >100% (lhs szR², rhs ndim, rhs szR²) —
+the ≥90% criterion is met on all four decisive numbers. D (B∪C) dominates
+or ties every cell, including res (szR² 0.59/0.36 vs B 0.44/0.33). Sanity
+checks: emem-only is exactly at majority on both-primitive faces (no
+writes: coverage 0 by construction, 1.00/1.00 on intermediates) yet reaches
+0.83/0.73 ndim, 0.57/0.41 szR² on both-inter rhs — the edge-keyed rows
+alone carry most of the intermediate signal. The res slot is the one place
+C cannot act (the res edge is being created NOW; its first write is this
+face's own emission) — there the information must come through the
+operands, which is what D does.
+
+**Practicality** (per episode): distinct edge keys 206-286 on random orders
+(rev: 101); tokens/key mean 129-169, median 61-77, max 2631; emission↔key
+alignment failures 0 of 285 steps; every intermediate operand's bucket had
+≥1 write. **Edge keys are recoverable ONLINE from the delta stream**: the
+tokenizer emits each face's edge identity in its `path` header —
+`_emit_face_header` (graphax jaxpr.py:1438-1445) writes
+`path <central> & <pred> & <succ>` with pred = `fr.in_edge`, succ =
+`fr.out_edge` — and `_emit_step_paths` / `last_face_segments`
+(jaxpr.py:1489-1497 / 1499-1545) hand back per-face token spans keyed to
+faces. alphagrad already reconstructs `(vidx[fr.in_edge],
+vidx[fr.out_edge])` per emitted face online (`LiveFaceStream._emitted`,
+live_faces.py:378-408) — the attribution the write path needs is the face
+key live_faces has been keying chunks by since §1.
+
+**Minimal production design** (`--face-edge-mem`, composable with
+`--face-endpoint-read`):
+- *Write path*: the identical `vertex_memory.scatter` primitive
+  (vertex_memory.py:72-110 — "two keyings of one operation") over an
+  edge-slot table: host side assigns a dense slot to each NEW res-edge key
+  as faces are emitted (the live_faces host loop already walks per-face
+  segments with their keys); capacity K = MAX_FACES (each face writes
+  exactly one res edge, so distinct keys ≤ faces eliminated). State:
+  `(K, E)` sums + `(K,)` counts next to vmem's `(V+2, E)`.
+- *Read*: per face, host resolves lhs edge (i, vidx(v)) and rhs edge
+  (vidx(v), j) to slots (−1 → zero row, exactly the endpoint-0 convention);
+  device gathers two rows. Head/probe input
+  `[chunk ‖ emem_lhs ‖ emem_rhs]` = 3E = 96, or with the v63 endpoint read
+  `[chunk ‖ vmem_i ‖ vmem_j ‖ emem_lhs ‖ emem_rhs]` = 5E = 160
+  (`UnifiedFaceHead.in_dim` widens; `VarProbes(face_in_dim=...)` reads the
+  same tensor). Like §6, the read is a POLICY input, so gradient flows
+  through the emem rows — the same anchoring that kept the 61458 endpoint
+  controls alive.
+- *Predicted online probe numbers* (next campaign): under FORCE REV ORDER,
+  ≈ no change (lhs all-primitive — the regime v63 already covers). On
+  random/learned orders, at init on intermediate-operand faces: ndim ≥ 0.72
+  (lhs) / ≥ 0.85 (rhs) vs the endpoint read's 0.61 / 0.76, operand size-R²
+  ≥ 0.4 vs ≤ 0.2 (lhs); with both flags (arm D) rhs ndim ≥ 0.9. If the
+  trained probe still decays to majority with emem in the loop, the §5
+  fallback stands: the collapse is upstream in the shared rows.
+
+Artifacts: `probe_invest/edgemem/` (`classify.py`, `capture_ext.py`,
+`analyze_edgemem.py`, `env.sh`, sbatch files; `data/cap_rand{1,2,3}.pkl`,
+`data/classify_*.pkl`, `data/vidx_map.json`, `data/edgemem_results.txt`,
+`data/edgemem_faces.pkl`, logs `data/run_cap_61854.log`,
+`data/run_ana_61857.log`).
