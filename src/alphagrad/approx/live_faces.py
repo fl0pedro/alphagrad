@@ -74,6 +74,13 @@ def _copy_graph(g):
     return _shallow_copy_graph(g)
 
 
+# --face-edge-mem: how many central-vertex vidx candidates ride the wire.
+# A vertex owns one vidx per OUTVAR of its equation; >1 outvar is rare and
+# >8 unobserved. Candidates past the width are dropped (the read then
+# resolves fewer lhs/rhs slot candidates -- a zero row, never a wrong one).
+EDGE_CVX_WIDTH = 8
+
+
 def _ends(key, vmap):
     """A face key as the policy's own 2-vector ENDPOINT wire.
 
@@ -336,6 +343,23 @@ class LiveFaceStream:
         self._vmap_memo = (jx, m)
         return m
 
+    def _central_vidx(self, tk, vertex):
+        """``vertex``'s own stable var indices, ``(EDGE_CVX_WIDTH,)`` int32.
+
+        The inverse read of :meth:`_vertex_of` (one vidx per outvar of the
+        vertex's equation), padded with -1. These are the CENTRAL halves of
+        the face's operand edge keys (--face-edge-mem): lhs edge
+        ``(i, vidx(v))``, rhs edge ``(vidx(v), j)`` -- section 8's edge
+        identity, in exactly the key space ``faces_of`` keys faces with.
+        """
+        out = -np.ones((EDGE_CVX_WIDTH,), np.int32)
+        k = 0
+        for vx, vv in self._vertex_of(tk).items():
+            if vv == vertex and k < EDGE_CVX_WIDTH:
+                out[k] = int(vx)
+                k += 1
+        return out
+
     # -- decoded per-face transforms for the DECIDED faces -----------------
     def _decided(self, tk, vertex, face_rows, face_skips, upto):
         """``{face_key: slots|SKIP_FACE}`` for faces ``0..upto-1``.
@@ -411,7 +435,30 @@ class LiveFaceStream:
     def chunk(self, order, specs, n, vertex, vertex_specs,
               face_rows, face_skips, f,
               face_rows_hist=None, face_skips_hist=None):
-        """``(tokens (W,), eqn_ids (W,), count, n_faces)``.
+        """Back-compat 5-tuple view of :meth:`chunk_ex` (its first 5)."""
+        return self.chunk_ex(order, specs, n, vertex, vertex_specs,
+                             face_rows, face_skips, f,
+                             face_rows_hist, face_skips_hist)[:5]
+
+    def chunk_ex(self, order, specs, n, vertex, vertex_specs,
+                 face_rows, face_skips, f,
+                 face_rows_hist=None, face_skips_hist=None):
+        """``(tokens (W,), eqn_ids (W,), count, n_faces, ends (2,),
+        ekey (2,), cvx (EDGE_CVX_WIDTH,), head, wrok)``.
+
+        The last four are the --face-edge-mem wires (section 8), all cheap
+        reads of state the enumeration already computed: ``ekey`` is the
+        face's RAW key ``(i, j)`` in stable-var-index space -- the RES edge
+        this face creates/updates; ``cvx`` the central vertex's own vidx
+        candidates (so the operand edge keys are ``(i, cvx)`` / ``(cvx,
+        j)``); ``head`` the length of the approx-echo PREFIX of this chunk
+        (face f-1's approximation equations), which is what lets the write
+        path recover face f's TRUE emission span [start_f, end_f) --
+        ``last_face_segments``'s tiling -- from the stored chunk counts:
+        ``start_f = cumsum(counts)[f-1] + head_f``; ``wrok`` is 1 iff this
+        face was actually emitted (its res edge WILL be written this step;
+        a dropped face must not claim a slot). All four are (-1/-1s/0/0) on
+        every soft-failure path.
 
         ``tokens`` is the ``=>`` handoff before face ``f``'s decision: face
         ``f-1``'s approximation equations followed by face ``f``'s contraction
@@ -440,8 +487,12 @@ class LiveFaceStream:
         # `vidx.get` is None for a var no equation produces (a jaxpr input),
         # so the wire is 1-BASED with 0 = "no vertex" -- the device side
         # gathers a zero context for 0 rather than an arbitrary row.
+        _no_edge = (-np.ones((2,), np.int32),
+                    -np.ones((EDGE_CVX_WIDTH,), np.int32),
+                    np.int32(0), np.int32(0))
         empty = (np.zeros((W,), np.int32), -np.ones((W,), np.int32),
-                 np.int32(0), np.int32(0), np.zeros((2,), np.int32))
+                 np.int32(0), np.int32(0), np.zeros((2,), np.int32)
+                 ) + _no_edge
 
         frh, fsh = self._hist(face_rows_hist, face_skips_hist)
         ck = (order[:n].tobytes(), specs[:n].tobytes(), vertex,
@@ -466,7 +517,7 @@ class LiveFaceStream:
         n_faces = len(keys)
         if f >= n_faces:
             res = (empty[0], empty[1], empty[2], np.int32(n_faces),
-                   empty[4])
+                   empty[4]) + _no_edge
             self._chunks[ck] = res
             return res
 
@@ -595,13 +646,20 @@ class LiveFaceStream:
                 f"emission is {len(toks)} tokens -- the per-face chunks no "
                 f"longer concatenate to the step delta.")
 
+        _k2i = lambda x: np.int32(int(x) if x is not None else -1)  # noqa: E731
+        _ekey = np.asarray([_k2i(keys[f][0]), _k2i(keys[f][1])], np.int32)
+        _cvx = self._central_vidx(tk, vertex)
         if keys[f] not in ekeys:
             # Decided, then never contracted. Empty chunk (the head falls
             # back to the vertex context for this face alone, as it does
-            # for any soft failure), but counted as what it is.
+            # for any soft failure), but counted as what it is. The edge
+            # KEY still rides (the face exists and its operand edges are
+            # readable); wrok=0 -- its res edge is never emitted, so it
+            # must not claim a write slot.
             self.stats["face_dropped"] += 1
             res = (empty[0], empty[1], empty[2], np.int32(n_faces),
-                   _ends(keys[f], self._vertex_of(tk)))
+                   _ends(keys[f], self._vertex_of(tk)),
+                   _ekey, _cvx, np.int32(0), np.int32(0))
             self._chunks[ck] = res
             return res
         gi = ekeys.index(keys[f])
@@ -629,6 +687,10 @@ class LiveFaceStream:
             _s, split, end = segs[gi - 1]
             chunk += toks[split:end]
             cids += ids[split:end]
+        # --face-edge-mem: the approx-echo PREFIX length of this chunk. The
+        # write path subtracts it from the cumsum boundary to recover face
+        # f's OWN `last_face_segments` span in the true emission.
+        head = len(chunk)
         start, split, _e = segs[gi]
         chunk += toks[start:split]
         cids += ids[start:split]
@@ -642,6 +704,7 @@ class LiveFaceStream:
             # the part the decision is about. Counted, because a window that
             # silently drops the contraction would read as a healthy run.
             self.stats["truncated"] += 1
+            head = max(0, head - (cnt - W))
             chunk, cids, cnt = chunk[-W:], cids[-W:], W
         tok_a = np.zeros((W,), np.int32)
         ids_a = -np.ones((W,), np.int32)
@@ -649,7 +712,8 @@ class LiveFaceStream:
         ids_a[:cnt] = np.asarray(cids, np.int32)
 
         res = (tok_a, ids_a, np.int32(cnt), np.int32(n_faces),
-               _ends(keys[f], self._vertex_of(tk)))
+               _ends(keys[f], self._vertex_of(tk)),
+               _ekey, _cvx, np.int32(head), np.int32(1))
         if len(self._chunks) >= 4096:
             for dk in list(self._chunks)[:1024]:
                 self._chunks.pop(dk, None)

@@ -1026,6 +1026,23 @@ class Trajectory(NamedTuple):
     # Same None-when-off contract as the feature-probe fields above.
     vp_targets: jax.Array = None       # (P, 3, TGT_COLS) float32
     vp_valid: jax.Array = None         # (P, 3) float32
+    # EDGE-KEYED MEMORY (--face-edge-mem, docs/FACE_LATENT_INFO_LOSS.md
+    # section 8). None-when-off, exactly like the probe fields above.
+    # `emem_*` is the PRE-step edge memory (synced through the PREVIOUS
+    # delta's writes) -- the anchor the K-window loss replays from; stored
+    # only when --grad-window != 0 (the full-horizon scan starts from
+    # zeros and needs no anchor). `face_eslots` are the two OPERAND edge
+    # slots each face READ (-1 = never written -> zero row). `delta_wr_*`
+    # is the ARRIVING delta's write attribution -- the PREVIOUS step's
+    # face-chunk counts, approx-head lengths, res-edge slots and live face
+    # count, aligned with `delta_tokens` exactly as delta_participants is.
+    emem_sums: jax.Array = None        # (K_edge, E) float32
+    emem_counts: jax.Array = None      # (K_edge,) float32
+    face_eslots: jax.Array = None      # (MAX_FACES, 2) int32
+    delta_wr_cnt: jax.Array = None     # (MAX_FACES,) int32
+    delta_wr_head: jax.Array = None    # (MAX_FACES,) int32
+    delta_wr_slot: jax.Array = None    # (MAX_FACES,) int32
+    delta_wr_n: jax.Array = None       # () int32
 
 
 class TrainBatch(NamedTuple):
@@ -1098,11 +1115,63 @@ class TrainBatch(NamedTuple):
     probe_step: jax.Array = None
     vp_targets: jax.Array = None
     vp_valid: jax.Array = None
+    # --face-edge-mem (see Trajectory): anchors windowed like vmem_* (the
+    # state at the OLDEST delta of the K window), write metadata windowed
+    # like delta_* (leading K axis). None when the flag is off, and on the
+    # full-horizon path the anchors stay None (the episode scan starts from
+    # zeros) while the write metadata keeps its (T, ...) recording.
+    emem_sums: jax.Array = None
+    emem_counts: jax.Array = None
+    face_eslots: jax.Array = None
+    delta_wr_cnt: jax.Array = None     # (K, MAX_FACES)
+    delta_wr_head: jax.Array = None    # (K, MAX_FACES)
+    delta_wr_slot: jax.Array = None    # (K, MAX_FACES)
+    delta_wr_n: jax.Array = None       # (K,)
 
 
 # ---------------------------------------------------------------------------
 # Helpers used by every variant
 # ---------------------------------------------------------------------------
+
+
+def _edge_write_ids(face_counts, face_heads, face_slots, n_faces, n_delta,
+                    window):
+    """Per-token EDGE SLOT ids for one step's emission (--face-edge-mem).
+
+    The write attribution is `last_face_segments`'s OWN tiling -- face f's
+    span is its contraction plus its OWN approximation echo, exactly what
+    the offline arm pooled into bucket[res edge] (dossier section 8) -- but
+    recovered from the wires the trainer already stores: the chunk the head
+    read for face f is [approx(f-1) || contraction(f)], so with C = cumsum
+    (counts) and a_f = the chunk's approx-echo prefix length,
+
+        span_f = [C_{f-1} + a_f,  C_f + a_{f+1})            (f < last)
+        span_last ends at n_delta (the tail is the last face's own echo,
+        which no chunk contains).
+
+    Every id is the face's res-edge slot (-1 = no slot -> dropped by the
+    scatter's trash segment). Tokens past ``n_delta`` are -1; a step with
+    no live faces writes nothing.
+    """
+    F = face_counts.shape[0]
+    idx = jnp.arange(F, dtype=jnp.int32)
+    nf = jnp.asarray(n_faces, jnp.int32)
+    nd = jnp.asarray(n_delta, jnp.int32)
+    live = idx < nf
+    cnt = jnp.where(live, jnp.asarray(face_counts, jnp.int32), 0)
+    a = jnp.where(live, jnp.asarray(face_heads, jnp.int32), 0)
+    C = jnp.cumsum(cnt)
+    a_next = jnp.concatenate([a[1:], jnp.zeros((1,), jnp.int32)])
+    ends = C + a_next
+    last = jnp.maximum(nf - 1, 0)
+    ends = jnp.where(idx == last, nd, ends)
+    # Dead faces must never bound a position.
+    ends = jnp.where(live, ends, nd + 1)
+    pos = jnp.arange(int(window), dtype=jnp.int32)
+    fid = jnp.sum((pos[:, None] >= ends[None, :]).astype(jnp.int32), axis=1)
+    fid = jnp.clip(jnp.minimum(fid, last), 0, F - 1)
+    slots = jnp.asarray(face_slots, jnp.int32)
+    return jnp.where((pos < nd) & (nf > 0), slots[fid], -1).astype(jnp.int32)
 
 
 def old_micro_log_prob_for_action(
@@ -2033,6 +2102,7 @@ class Agent(eqx.Module):
         face_count_fn=None,       # vertex -> ACTUAL face count (while_loop trip count)
         enc_carry=None,           # step carry the per-face SIDE carry branches from
         endpoint_rows=None,       # (V+1, E) read(base+dyn) rows (--face-endpoint-read)
+        edge_rows=None,           # (K, E) edge-memory read rows (--face-edge-mem)
     ):
         """Same as :meth:`sample_action` but routes the rule head through
         :class:`MicroActionPolicy`. ``axis_state`` and ``axis_valid_mask``
@@ -2209,6 +2279,10 @@ class Agent(eqx.Module):
                         "--face-endpoint-read requires the live-faces "
                         "stream: the blind face path has no endpoint "
                         "slots to read.")
+                if getattr(self.face_path_policy, "edge_mem", False):
+                    raise ValueError(
+                        "--face-edge-mem requires the live-faces stream: "
+                        "the blind face path has no edge slots to read.")
                 fa, face_logp, face_ent, _far, _skp, _fod, _fql = (
                     self.face_path_policy.sample(
                         v_context, features, factor_tables, face_key,
@@ -2241,8 +2315,7 @@ class Agent(eqx.Module):
                         quant_scale_signs=actions.quant_scale_sign,
                         quant_scale_fracs=actions.quant_scale_frac,
                     ).astype(jnp.int32)
-                (fa, face_logp, face_ent, f_cnt, f_dt,
-                 f_de, f_ends) = self._face_loop(
+                _fl_out = self._face_loop(
                     features, factor_tables, face_key,
                     f_pair, f_comp, f_valid, enc_carry, face_chunk_fn,
                     vertex_idx, _vspecs, axis_state[vertex_idx],
@@ -2250,9 +2323,18 @@ class Agent(eqx.Module):
                     (_n_faces if _n_faces is not None
                      else face_count_fn(vertex_idx)),
                     endpoint_rows=endpoint_rows,
+                    edge_rows=edge_rows,
                 )
+                (fa, face_logp, face_ent, f_cnt, f_dt,
+                 f_de, f_ends) = _fl_out[:7]
+                _fl_edge = _fl_out[7:]  # (f_eslots, f_ewr) under edge_mem
             face_out = (fa, face_logp, face_ent, f_pair, f_comp, f_valid,
                         f_cnt, f_dt, f_de, f_ends)
+            if getattr(self.face_path_policy, "edge_mem", False):
+                # --face-edge-mem: append the read slots + write metadata.
+                # Conditional so the flag-off tuple (and az_gumbel's
+                # 10-element unpack) is untouched.
+                face_out = face_out + tuple(_fl_edge)
 
         return (
             vertex_idx,
@@ -2354,7 +2436,8 @@ class Agent(eqx.Module):
     def _face_loop(self, features, factor_tables, key,
                    f_pair, f_comp, f_valid, enc_carry, face_chunk_fn,
                    vertex_idx, vertex_specs, axis_state_v,
-                   op_legality_override, n_faces, endpoint_rows=None):
+                   op_legality_override, n_faces, endpoint_rows=None,
+                   edge_rows=None):
         """Read face f's chunk, decide face f, repeat -- for the ACTUAL face
         count, as a while_loop.
 
@@ -2375,6 +2458,12 @@ class Agent(eqx.Module):
                 "None: the caller must pass the (V+1, E) read(base+dyn) "
                 "slot rows (az_gumbel does not support --face-endpoint-read "
                 "yet).")
+        _EM = bool(getattr(pol, "edge_mem", False))
+        if _EM and edge_rows is None:
+            raise ValueError(
+                "face_path_policy.edge_mem is on but edge_rows is None: the "
+                "caller must pass the (K, E) edge-memory read rows "
+                "(az_gumbel does not support --face-edge-mem yet).")
         n = jnp.minimum(jnp.asarray(n_faces, jnp.int32), F)
         wire0 = (
             jnp.full((F, S), OP_END, dtype=jnp.int32),     # op_type
@@ -2394,15 +2483,30 @@ class Agent(eqx.Module):
                -jnp.ones((F, S, 3), jnp.int32), wire0,
                jnp.zeros((W,), jnp.int32), -jnp.ones((W,), jnp.int32),
                jnp.asarray(0, jnp.int32), jnp.zeros((F, 2), jnp.int32))
+        if _EM:
+            # (F, 2) read slots [lhs, rhs] + (F, 2) write meta [res, head].
+            st0 = st0 + (-jnp.ones((F, 2), jnp.int32),
+                         jnp.zeros((F, 2), jnp.int32))
 
         def _body(st):
-            (f, carry, logp, ent, skips, cnts, rs, wa, ftok, feqn, off,
-             fends) = st
+            if _EM:
+                (f, carry, logp, ent, skips, cnts, rs, wa, ftok, feqn, off,
+                 fends, fesl, fwr) = st
+            else:
+                (f, carry, logp, ent, skips, cnts, rs, wa, ftok, feqn, off,
+                 fends) = st
             # The chunk callback hands back the face's ENDPOINT VERTICES with
             # its tokens: the face enumeration that produced the chunk keyed
             # the face by exactly that pair, so it is free.
-            tk_f, eq_f, ct_f, ends_f = face_chunk_fn(
-                f, vertex_idx, vertex_specs, rs, skips)
+            if _EM:
+                # --face-edge-mem: the callback additionally resolves the
+                # face's operand edges against the host slot table --
+                # einfo = [lhs_slot, rhs_slot, res_slot, head].
+                tk_f, eq_f, ct_f, ends_f, ei_f = face_chunk_fn(
+                    f, vertex_idx, vertex_specs, rs, skips)
+            else:
+                tk_f, eq_f, ct_f, ends_f = face_chunk_fn(
+                    f, vertex_idx, vertex_specs, rs, skips)
             # Concatenate this chunk into the step's face stream -- the
             # EXACT tokens the head reads. The final emission is NOT a
             # substitute: chunk f's contraction is deliberately unhooked
@@ -2435,6 +2539,19 @@ class Agent(eqx.Module):
                 _eps = jnp.where((ends_f > 0)[:, None],
                                  endpoint_rows[_epi], 0.0)
                 summ = jnp.concatenate([summ, _eps[0], _eps[1]])
+            if _EM:
+                # EDGE-KEYED READ (--face-edge-mem, dossier section 8): the
+                # face's lhs/rhs OPERAND edge rows, gathered at the host-
+                # resolved slots. -1 (never written: a primitive elemental,
+                # or an edge outside the table) is a ZERO row -- exactly the
+                # endpoint-0 convention above. Appended AFTER the endpoint
+                # half, so the width table is [chunk || (vmem_i||vmem_j)?
+                # || (emem_lhs||emem_rhs)?] = E/3E/5E.
+                _els = ei_f[:2].astype(jnp.int32)
+                _eli = jnp.clip(_els, 0, edge_rows.shape[0] - 1)
+                _elr = jnp.where((_els >= 0)[:, None],
+                                 edge_rows[_eli], 0.0)
+                summ = jnp.concatenate([summ, _elr[0], _elr[1]])
             sk, row, lp, e, _ar, _sp, _od = pol.sample_face(
                 features, factor_tables, jrand.fold_in(key, f),
                 f, f_pair[f], f_comp[f], f_valid[f], face_context=summ,
@@ -2444,19 +2561,26 @@ class Agent(eqx.Module):
             cnts = cnts.at[f].set(ct_eff)
             wa = tuple(w.at[f].set(row[k])
                        for w, k in zip(wa, self._WIRE_KEYS))
-            return (f + 1, carry, logp + lp, ent + e, skips, cnts, rs, wa,
-                    ftok, feqn, off + ct_eff, fends.at[f].set(ends_f))
+            out = (f + 1, carry, logp + lp, ent + e, skips, cnts, rs, wa,
+                   ftok, feqn, off + ct_eff, fends.at[f].set(ends_f))
+            if _EM:
+                out = out + (fesl.at[f].set(ei_f[:2]),
+                             fwr.at[f].set(ei_f[2:4]))
+            return out
 
+        _st = lax.while_loop(lambda st: st[0] < n, _body, st0)
         (_f, _c, logp, ent, skips, cnts, _rs, wa, ftok, feqn,
-         _off, fends) = lax.while_loop(lambda st: st[0] < n, _body, st0)
+         _off, fends) = _st[:12]
         fa = FaceAction(skip=skips, **dict(zip(self._WIRE_KEYS, wa)))
+        if _EM:
+            return (fa, logp, ent, cnts, ftok, feqn, fends) + tuple(_st[12:])
         return fa, logp, ent, cnts, ftok, feqn, fends
 
     def _face_replay(self, features, factor_tables, fa,
                      f_pair, f_comp, f_valid, enc_carry, face_chunks,
                      op_legality_override, face_bound=None,
                      face_win_budget=None, endpoint_rows=None,
-                     face_ends=None):
+                     face_ends=None, edge_rows=None, face_eslots=None):
         """Score the stored FaceAction against contexts pooled from ONE scan
         of the stored emission window.
 
@@ -2488,6 +2612,12 @@ class Agent(eqx.Module):
                 "face_path_policy.endpoint_read is on but the replay was "
                 "not handed endpoint_rows/face_ends (az_gumbel does not "
                 "support --face-endpoint-read yet).")
+        if getattr(pol, "edge_mem", False) and (
+                edge_rows is None or face_eslots is None):
+            raise ValueError(
+                "face_path_policy.edge_mem is on but the replay was not "
+                "handed edge_rows/face_eslots (az_gumbel does not support "
+                "--face-edge-mem yet).")
         total = jnp.sum(f_cnt.astype(jnp.int32))
         # This is the LOSS side and it is reverse-differentiated (gradient
         # reaches palimpsa through exactly this scan), so the trip count comes
@@ -2560,6 +2690,19 @@ class Agent(eqx.Module):
             _eps = jnp.where((_fe > 0)[..., None], endpoint_rows[_epi], 0.0)
             face_latents = jnp.concatenate(
                 [face_latents, _eps[:, 0], _eps[:, 1]], axis=-1)
+
+        if getattr(pol, "edge_mem", False):
+            # EDGE-KEYED READ, loss-side mirror of `_face_loop`: the SAME
+            # emem rows (recomputed under gradient from the stored PRE
+            # memory + this delta's writes), gathered at the STORED slots
+            # the behaviour policy read -- anything less and the ratio is
+            # not 1 at epoch 0. Appended after the endpoint half, widths
+            # E/3E/5E as on the rollout side.
+            _fs = jnp.asarray(face_eslots, jnp.int32)[:F]
+            _fsi = jnp.clip(_fs, 0, edge_rows.shape[0] - 1)
+            _fsr = jnp.where((_fs >= 0)[..., None], edge_rows[_fsi], 0.0)
+            face_latents = jnp.concatenate(
+                [face_latents, _fsr[:, 0], _fsr[:, 1]], axis=-1)
 
         # scan, not a python loop: F is the provable bound (196 here), and
         # unrolling it multiplied the program by F. scan keeps reverse-mode
@@ -2657,6 +2800,8 @@ class Agent(eqx.Module):
         face_bound=None,       # batch-wide live-face bound (unbatched)
         face_win_budget=None,  # batch-wide emission-length bound (unbatched)
         endpoint_rows=None,    # (V+1, E) loss-side read(base+dyn) rows
+        edge_rows=None,        # (K, E) loss-side edge-memory read rows
+        face_eslots=None,      # stored (F, 2) operand edge slots
     ):
         """Joint log-prob / entropy for a stored typed action sequence.
 
@@ -2795,6 +2940,8 @@ class Agent(eqx.Module):
                     face_win_budget=face_win_budget,
                     endpoint_rows=endpoint_rows,
                     face_ends=face_ends,
+                    edge_rows=edge_rows,
+                    face_eslots=face_eslots,
                 )
             total_log_p = total_log_p + f_logp
             # Arity-normalised per the PER-HEAD ENTROPY NORMALISATION note
@@ -2976,6 +3123,23 @@ def make_argparser() -> argparse.ArgumentParser:
              "section 4; offline: mean||endpoint decodes ndim 0.99-1.00 / "
              "size-R2 0.90-0.95 vs 0.82-0.89 / 0.45-0.55 for the chunk "
              "mean). Requires the --live-faces face stack; default off.")
+    p.add_argument(
+        "--face-edge-mem", action="store_true",
+        help="EDGE-KEYED memory read (docs/FACE_LATENT_INFO_LOSS.md "
+             "section 8). Maintains a (K, E) memory over RES-EDGE keys -- "
+             "the same parameter-free scatter as the vertex memory, keyed "
+             "by the canonical edge id (i, j) a face creates -- written "
+             "with each step's emission attributed per face span, and "
+             "concatenates each face's lhs/rhs OPERAND edge rows onto its "
+             "head input: [chunk || (vmem_i||vmem_j)? || "
+             "(emem_lhs||emem_rhs)?] = E/3E/5E with/without "
+             "--face-endpoint-read. K = ALPHAGRAD_MAX_FACES slots, host-"
+             "assigned on first emission, evict-oldest past K (telemetry "
+             "edgemem/evictions). Offline: closes >=90 percent of the "
+             "endpoint read's drop on intermediate operands (section 8; "
+             "under FORCE_REV_ORDER it is predicted inert -- every lhs is "
+             "primitive there). Requires the --live-faces stack; default "
+             "off, bit-identical when off.")
     p.add_argument(
         "--exec-on-gpu",
         action="store_true",
@@ -3990,6 +4154,7 @@ def _build_agent(
             key=encoder_keys[14],
             use_group_embedding=getattr(args, "axis_group_embedding", False),
             endpoint_read=bool(getattr(args, "face_endpoint_read", False)),
+            edge_mem=bool(getattr(args, "face_edge_mem", False)),
         )
     elif getattr(args, "face_actions", False) and not getattr(
             args, "no_approx_head", False):
@@ -5357,6 +5522,27 @@ def main():
             "--face-endpoint-read: ALPHAGRAD_FEATURE_PROBE reads the E-wide "
             "face latent, the endpoint read makes it 3E. Run one or the "
             "other.")
+    # --face-edge-mem (docs/FACE_LATENT_INFO_LOSS.md section 8): same stack
+    # requirements as the endpoint read (the write/read attribution is the
+    # live-face stream's), same feature-probe width conflict. Composes with
+    # --face-endpoint-read: widths E / 3E / 5E.
+    _EDGE_MEM = bool(getattr(args, "face_edge_mem", False))
+    if _EDGE_MEM and not all((
+            bool(getattr(args, "dynamic_substeps", False)),
+            bool(getattr(args, "live_faces", False)),
+            bool(getattr(args, "face_actions", False)),
+            bool(getattr(args, "unified_face_head", False)))):
+        raise ValueError(
+            "--face-edge-mem requires --dynamic-substeps --live-faces "
+            "--face-actions --unified-face-head")
+    if _EDGE_MEM and _fprobe.PROBE_ON:
+        raise ValueError(
+            "--face-edge-mem: ALPHAGRAD_FEATURE_PROBE reads the E-wide "
+            "face latent, the edge read widens it. Run one or the other.")
+    # Anchors for the K-window loss replay; the full-horizon scan
+    # (--grad-window 0) starts its edge memory from zeros, so the (K, E)
+    # per-step snapshot would be dead weight in the trajectory there.
+    _EM_STORE_ANCHOR = _EDGE_MEM and int(getattr(args, "grad_window", 1)) != 0
     # [face-target-build failures, first-census-printed]
     _VP_FAILS = [0, 0]
     # [--var-probe-steps] the episode's supervised-step subset (None =
@@ -5485,6 +5671,7 @@ def main():
     # prefix, so the cost is n_faces eliminations per env step.
     _LIVE_FACES = None
     _live_face = _live_face_count = None
+    _EDGE_TABLE = None
     if getattr(args, "live_faces", False):
         _LIVE_FACES = build_live_face_stream(
             _oracle_jaxpr, _oracle_argnums, _oracle_consts, _oracle_args,
@@ -5509,8 +5696,16 @@ def main():
         )
         # The `pure_callback` wrappers themselves now live in
         # common/face_driver.py so AZ drives the SAME stream, not a copy.
+        # --face-edge-mem: the host edge-key -> emem-slot table rides the
+        # SAME callbacks (slot assignment on first emission, lookup-only
+        # reads, evict-oldest past K = the face bound).
+        _EDGE_TABLE = None
+        if _EDGE_MEM:
+            from alphagrad.approx.common.face_driver import EdgeSlotTable
+            _EDGE_TABLE = EdgeSlotTable(int(_F_FACES))
         _live_face, _live_face_count = make_face_callbacks(
-            _LIVE_FACES, window=MAX_DELTA_TOKENS, prof_sink=_env_prof_add)
+            _LIVE_FACES, window=MAX_DELTA_TOKENS, prof_sink=_env_prof_add,
+            edge_table=_EDGE_TABLE)
 
     # Live elimination chains: one per concurrent env, plus the previous
     # episode's, which the LRU only sheds once the new ones exist. Sized like
@@ -5873,11 +6068,15 @@ def main():
     # and never from `agent`, so the PPO chain provably cannot reach a
     # var-probe weight and `_var_probe_loss` cannot reach a policy weight.
     if _VPROBE_ON:
+        _face_probe_w = int(args.embd_dim) * (
+            1 + (2 if _EP_READ else 0) + (2 if _EDGE_MEM else 0))
         vprobes = _vprobe.VarProbes(
             embd_dim=int(args.embd_dim),
-            # --face-endpoint-read: the face heads decode the SAME 3E
-            # concatenation the policy head reads; vertex heads stay E.
-            face_in_dim=(3 * int(args.embd_dim) if _EP_READ else None),
+            # --face-endpoint-read / --face-edge-mem: the face heads decode
+            # the SAME concatenation the policy head reads (E/3E/5E);
+            # vertex heads stay E.
+            face_in_dim=(_face_probe_w
+                         if _face_probe_w != int(args.embd_dim) else None),
             key=jrand.PRNGKey(
                 int(os.environ.get("ALPHAGRAD_VAR_PROBE_SEED", "0"))),
         )
@@ -6002,9 +6201,26 @@ def main():
             participants=_init_part,
         )
         init_enc_state = _init_pre + _init_post
+        if _EDGE_MEM:
+            # --face-edge-mem: (PRE, POST) edge memories, both empty -- the
+            # pre-scan delta has no face attribution, so nothing is written
+            # before step 0 (and the loss's stored all -1 write metadata
+            # replays the same no-op, bitwise).
+            _em0 = _carry_stream.zero_edge_memory(_F_FACES, args.embd_dim)
+            init_enc_state = init_enc_state + _em0 + _em0
+            # The ARRIVING delta's write metadata, threaded exactly like
+            # `prev_part`: (chunk counts, approx-head lengths, res-edge
+            # slots, live face count) of the PREVIOUS step's face loop.
+            _init_wr = (jnp.zeros((_F_FACES,), jnp.int32),
+                        jnp.zeros((_F_FACES,), jnp.int32),
+                        -jnp.ones((_F_FACES,), jnp.int32),
+                        jnp.zeros((), jnp.int32))
 
         def step_fn(carry, k):
-            state, elim_order, enc_state, prev_part = carry
+            if _EDGE_MEM:
+                state, elim_order, enc_state, prev_part, prev_wr = carry
+            else:
+                state, elim_order, enc_state, prev_part = carry
             sample_key, next_net_key = jrand.split(k, 2)
             vertex_avail_mask = vertex_avail_at_step(
                 state, vertex_valid_static, total_v, num_valid
@@ -6016,7 +6232,12 @@ def main():
             # exactly this delta, under exactly this owner, and threading it
             # forward is what makes that extend cost once instead of twice.
             # See the bootstrap block below for the proof of equality.
-            enc_carry, vmem_s, vmem_c, enc_carry2, vmem_s2, vmem_c2 = enc_state
+            if _EDGE_MEM:
+                (enc_carry, vmem_s, vmem_c, enc_carry2, vmem_s2, vmem_c2,
+                 emem_s, emem_c, emem_s2, emem_c2) = enc_state
+            else:
+                (enc_carry, vmem_s, vmem_c,
+                 enc_carry2, vmem_s2, vmem_c2) = enc_state
             # THIS step's delta was emitted by the PREVIOUS step's elimination
             # (empty at step 0 — the base stream is already consumed). It
             # arrives from the env as its own buffer with its own exact
@@ -6061,6 +6282,15 @@ def main():
                 # `heads_from_memory` runs for the vertex pointer.
                 _ep_rows = _vmem.read(vmem_s2 + base_mem[0],
                                       vmem_c2 + base_mem[1])
+
+            _em_rows = None
+            if _EDGE_MEM:
+                # --face-edge-mem: the (K, E) edge-memory rows at the
+                # CURRENT step -- synced through the previous elimination's
+                # delta writes, i.e. every res edge that exists when this
+                # step's faces are decided. No base component: no base
+                # emission belongs to a face.
+                _em_rows = _vmem.read(emem_s2, emem_c2)
 
             face_chunk_fn = None
             face_count_fn = None
@@ -6144,6 +6374,7 @@ def main():
                     face_count_fn=face_count_fn,
                     enc_carry=enc_carry2,
                     endpoint_rows=_ep_rows,
+                    edge_rows=_em_rows,
                 )
                 # prof/action: the vertex pointer sample + the micro/face
                 # head loop (INCLUDES the faces.live_chunk host callbacks,
@@ -6158,7 +6389,9 @@ def main():
                 if face_out is not None:
                     (face_action, face_old_logp, _face_ent, face_pair_v,
                      face_comp_v, face_valid_v, face_cnt_v, face_dt_v,
-                     face_de_v, face_ends_v) = face_out
+                     face_de_v, face_ends_v) = face_out[:10]
+                    if _EDGE_MEM:
+                        face_eslots_v, face_ewr_v = face_out[10:12]
                 else:
                     face_action = _zero_face_action()
                     face_old_logp = jnp.array(0.0)
@@ -6172,6 +6405,12 @@ def main():
                     face_cnt_v = jnp.zeros((ENV_MAX_FACES,), jnp.int32)
                     face_dt_v = jnp.zeros((MAX_DELTA_TOKENS,), jnp.int32)
                     face_de_v = -jnp.ones((MAX_DELTA_TOKENS,), jnp.int32)
+                    if _EDGE_MEM:
+                        face_eslots_v = -jnp.ones(
+                            (ENV_MAX_FACES, 2), jnp.int32)
+                        face_ewr_v = jnp.zeros(
+                            (ENV_MAX_FACES, 2), jnp.int32
+                        ).at[:, 0].set(-1)
                 if _DEBUG_ORDER:
                     # avail = how many vertices are still selectable; picked =
                     # the 0-based index chosen; was_avail = 1.0 iff that pick
@@ -6250,12 +6489,32 @@ def main():
             step_part = agent.participation_mask(
                 total_v, vertex_idx.astype(jnp.int32),
                 face_ends_v, face_valid_v)
-            nxt_carry, nv_s_raw, nv_c_raw = _carry_stream.advance(
-                agent, enc_carry2, vmem_s2, vmem_c2,
-                next_state.delta_tokens, next_state.delta_eqns,
-                next_state.delta_count, vertex_idx.astype(jnp.int32),
-                window=MAX_DELTA_TOKENS, participants=step_part,
-            )
+            if _EDGE_MEM:
+                # --face-edge-mem WRITE: the just-decided elimination's
+                # emission, scattered by res-edge slot inside the SAME fold
+                # that already encodes it for the vertex memory. The span
+                # per face is `last_face_segments`'s own tiling, recovered
+                # from (counts, approx-head lengths) -- see _edge_write_ids.
+                _n_live_f = jnp.sum(
+                    face_valid_v > 0.5).astype(jnp.int32)
+                _wr_ids = _edge_write_ids(
+                    face_cnt_v, face_ewr_v[:, 1], face_ewr_v[:, 0],
+                    _n_live_f, next_state.delta_count, MAX_DELTA_TOKENS)
+                (nxt_carry, nv_s_raw, nv_c_raw, nem_s_raw,
+                 nem_c_raw) = _carry_stream.advance(
+                    agent, enc_carry2, vmem_s2, vmem_c2,
+                    next_state.delta_tokens, next_state.delta_eqns,
+                    next_state.delta_count, vertex_idx.astype(jnp.int32),
+                    window=MAX_DELTA_TOKENS, participants=step_part,
+                    edge_mem=(emem_s2, emem_c2), edge_ids=_wr_ids,
+                )
+            else:
+                nxt_carry, nv_s_raw, nv_c_raw = _carry_stream.advance(
+                    agent, enc_carry2, vmem_s2, vmem_c2,
+                    next_state.delta_tokens, next_state.delta_eqns,
+                    next_state.delta_count, vertex_idx.astype(jnp.int32),
+                    window=MAX_DELTA_TOKENS, participants=step_part,
+                )
             # The UNMARKED triple is what gets threaded (see next_enc_state):
             # `_pp_mark` adds a host-produced 0.0 to every numeric leaf, so
             # threading the marked one would put two marks on the value the
@@ -6310,6 +6569,20 @@ def main():
                 _vp_fields = dict(vp_targets=_vp_t, vp_valid=_vp_v)
             else:
                 _vp_fields = {}
+            # --face-edge-mem: read slots (this step's decisions) + the
+            # ARRIVING delta's write metadata (the previous step's face
+            # loop, threaded like `prev_part`); anchors only when the
+            # K-window loss will replay from them.
+            if _EDGE_MEM:
+                _em_fields = dict(
+                    face_eslots=face_eslots_v,
+                    delta_wr_cnt=prev_wr[0], delta_wr_head=prev_wr[1],
+                    delta_wr_slot=prev_wr[2], delta_wr_n=prev_wr[3],
+                )
+                if _EM_STORE_ANCHOR:
+                    _em_fields.update(emem_sums=emem_s, emem_counts=emem_c)
+            else:
+                _em_fields = {}
             transition = Trajectory(
                 preference=preference.astype(jnp.float32),
                 vertex_idx=jnp.asarray(vertex_idx, dtype=jnp.int32),
@@ -6362,6 +6635,7 @@ def main():
                 **_enc_fields,
                 **_probe_fields,
                 **_vp_fields,
+                **_em_fields,
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
             )
@@ -6369,15 +6643,28 @@ def main():
             # PRE, and the bootstrap above is already its POST.
             next_enc_state = (enc_carry2, vmem_s2, vmem_c2,
                               nxt_carry, nv_s_raw, nv_c_raw)
+            if _EDGE_MEM:
+                next_enc_state = next_enc_state + (
+                    emem_s2, emem_c2, nem_s_raw, nem_c_raw)
+                next_wr = (face_cnt_v, face_ewr_v[:, 1], face_ewr_v[:, 0],
+                           jnp.sum(face_valid_v > 0.5).astype(jnp.int32))
+                return (
+                    (next_state, elim_order, next_enc_state, step_part,
+                     next_wr),
+                    (transition, raw_rewards),
+                )
             return (
                 (next_state, elim_order, next_enc_state, step_part),
                 (transition, raw_rewards),
             )
 
-        (final_state, _, _, _), (traj, all_raw_rewards) = lax.scan(
+        _scan_init = (env_state, jnp.zeros((total_v,), dtype=jnp.int32),
+                      init_enc_state, _init_part)
+        if _EDGE_MEM:
+            _scan_init = _scan_init + (_init_wr,)
+        (final_state, *_rest), (traj, all_raw_rewards) = lax.scan(
             step_fn,
-            (env_state, jnp.zeros((total_v,), dtype=jnp.int32),
-             init_enc_state, _init_part),
+            _scan_init,
             keys,
         )
         return final_state, traj, all_raw_rewards[-1]
@@ -6469,7 +6756,7 @@ def main():
         def _eval_dyn(pref, vidx, action, vmask, ax_st, ax_vm,
                       k, pv, cv, fa=None, fpv=None, fcv=None, fv=None,
                       fen=None, pc3=None, fch=None, fcy=None, fb=None,
-                      fwb=None, fer=None):
+                      fwb=None, fer=None, fem=None, fes=None):
             # No token arguments: `pc3` (the carry-derived heads) IS the
             # encoding, exactly as on the rollout side.
             return agent.evaluate_action_dynamic(
@@ -6500,6 +6787,8 @@ def main():
                 face_bound=fb,
                 face_win_budget=fwb,
                 endpoint_rows=fer,
+                edge_rows=fem,
+                face_eslots=fes,
             )
 
         # Re-derive each sample's encoding by extending its stored
@@ -6594,20 +6883,58 @@ def main():
             else _advance_k
         )
 
+        def _advance_k_edge(carry2, vs2, vc2, dtok_k, deqn_k, dcnt_k, own_k,
+                            part_k, es, ec, eids):
+            # `_advance_k` + the --face-edge-mem write, in the SAME fold
+            # (advance's edge_mem arm) -- so the loss re-derives the edge
+            # memory the rollout read, bitwise, and gradient flows through
+            # the write into palimpsa exactly as it does through the vertex
+            # scatter.
+            return _carry_stream.advance(
+                agent, carry2, vs2, vc2,
+                dtok_k, deqn_k, dcnt_k, own_k,
+                window=MAX_DELTA_TOKENS, participants=part_k,
+                chunk=None, budget=_delta_budget,
+                edge_mem=(es, ec), edge_ids=eids,
+            )
+
+        _advance_edge_step = (
+            jax.checkpoint(_advance_k_edge)
+            if os.environ.get("ALPHAGRAD_CARRY_HEADS_REMAT", "1") != "0"
+            else _advance_k_edge
+        )
+
         def _carry_heads(M, I, ch, nv, pos, owner, part, vs, vc,
-                         pref, dtok, deqn, dcnt):
+                         pref, dtok, deqn, dcnt, *em):
             carry2 = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
             vs2, vc2 = vs, vc
+            if _EDGE_MEM:
+                # --face-edge-mem: (anchor sums, anchor counts, write cnt,
+                # write head, write slot, write n) -- the edge memory at
+                # the OLDEST delta of the window plus each delta's write
+                # attribution.
+                es2, ec2 = em[0], em[1]
+                _wrc, _wrh, _wrs, _wrn = em[2], em[3], em[4], em[5]
             # The deltas are STORED, with their lengths. The loss re-derives
             # no window from anything, so there is no length to get wrong.
             # PYTHON loop, not a scan: K is static, and at K=1 this is
             # literally the single call it replaced -- same ops, same order,
             # bit-identical.
             for _k in range(dtok.shape[0]):
-                carry2, vs2, vc2 = _advance_step(
-                    carry2, vs2, vc2,
-                    dtok[_k], deqn[_k], dcnt[_k], owner[_k], part[_k],
-                )
+                if _EDGE_MEM:
+                    _eids = _edge_write_ids(
+                        _wrc[_k], _wrh[_k], _wrs[_k], _wrn[_k], dcnt[_k],
+                        MAX_DELTA_TOKENS)
+                    carry2, vs2, vc2, es2, ec2 = _advance_edge_step(
+                        carry2, vs2, vc2,
+                        dtok[_k], deqn[_k], dcnt[_k], owner[_k], part[_k],
+                        es2, ec2, _eids,
+                    )
+                else:
+                    carry2, vs2, vc2 = _advance_step(
+                        carry2, vs2, vc2,
+                        dtok[_k], deqn[_k], dcnt[_k], owner[_k], part[_k],
+                    )
             # carry2 is where the sampling side carry branched: the
             # stored pre-step carry advanced past the PREVIOUS delta.
             # The face replay continues from it over the stored emission
@@ -6626,9 +6953,14 @@ def main():
                 # probe heads alone stay stop_gradient-isolated (VarHead).
                 _out = _out + (_vmem.read(vs2 + _base_mem[0],
                                           vc2 + _base_mem[1]),)
+            if _EDGE_MEM:
+                # --face-edge-mem: the loss-side edge rows, off the SAME
+                # (es2, ec2) the replay just re-derived. Same anchoring
+                # rationale as the endpoint rows.
+                _out = _out + (_vmem.read(es2, ec2),)
             return _out
 
-        def _episode_heads(dtok, deqn, dcnt, own, part, pref):
+        def _episode_heads(dtok, deqn, dcnt, own, part, pref, *em):
             """ONE episode, ONE `lax.scan`: gradient horizon T, not K.
 
             THE RECURRENCE IS ALREADY IN THE TRAJECTORY. The rollout carries
@@ -6660,9 +6992,18 @@ def main():
             level up. ALPHAGRAD_CARRY_HEADS_REMAT=0 restores stored residuals.
             """
             def _body(state, x):
-                c2, s2, n2 = state
-                _dt, _de, _dc, _ow, _pa, _pr = x
-                c2, s2, n2 = _advance_k(c2, s2, n2, _dt, _de, _dc, _ow, _pa)
+                if _EDGE_MEM:
+                    c2, s2, n2, es, ec = state
+                    _dt, _de, _dc, _ow, _pa, _pr, _wc, _wh, _ws, _wn = x
+                    _eids = _edge_write_ids(_wc, _wh, _ws, _wn, _dc,
+                                            MAX_DELTA_TOKENS)
+                    c2, s2, n2, es, ec = _advance_k_edge(
+                        c2, s2, n2, _dt, _de, _dc, _ow, _pa, es, ec, _eids)
+                else:
+                    c2, s2, n2 = state
+                    _dt, _de, _dc, _ow, _pa, _pr = x
+                    c2, s2, n2 = _advance_k(
+                        c2, s2, n2, _dt, _de, _dc, _ow, _pa)
                 # The heads run INSIDE the scan, off this step's POST memory:
                 # the K path's `heads` call, once per step, unchanged.
                 out = _carry_stream.heads(
@@ -6674,6 +7015,11 @@ def main():
                     # --face-endpoint-read: same rows as `_carry_heads`.
                     out = out + (_vmem.read(s2 + _base_mem[0],
                                             n2 + _base_mem[1]),)
+                if _EDGE_MEM:
+                    # --face-edge-mem: same rows as `_carry_heads` -- the
+                    # POST-delta edge memory, i.e. what the face loop read.
+                    out = out + (_vmem.read(es, ec),)
+                    return (c2, s2, n2, es, ec), out
                 return (c2, s2, n2), out
 
             _bd = (
@@ -6682,10 +7028,16 @@ def main():
                 else _body
             )
             _vs0, _vc0 = _carry_stream.zero_memory(total_v, args.embd_dim)
-            _, ys = lax.scan(
-                _bd, (_base_carry, _vs0, _vc0),
-                (dtok, deqn, dcnt, own, part, pref),
-            )
+            _st0 = (_base_carry, _vs0, _vc0)
+            _xs = (dtok, deqn, dcnt, own, part, pref)
+            if _EDGE_MEM:
+                # The episode scan starts from an EMPTY edge memory (there
+                # is no anchor to read back: the whole point of grad-window
+                # 0 is that the recurrence is replayed, not stored).
+                _st0 = _st0 + _carry_stream.zero_edge_memory(
+                    _F_FACES, args.embd_dim)
+                _xs = _xs + tuple(em)
+            _, ys = lax.scan(_bd, _st0, _xs)
             return ys
 
         if _FULL_SCAN:
@@ -6710,6 +7062,9 @@ def main():
                     _ep_batch.delta_tokens, _ep_batch.delta_eqns,
                     _ep_batch.delta_count, _ep_batch.delta_owner,
                     _ep_batch.delta_participants, _ep_batch.preference,
+                    *((_ep_batch.delta_wr_cnt, _ep_batch.delta_wr_head,
+                       _ep_batch.delta_wr_slot, _ep_batch.delta_wr_n)
+                      if _EDGE_MEM else ()),
                 ),
             )
         else:
@@ -6720,12 +7075,22 @@ def main():
                 batch.vmem_sums, batch.vmem_counts,
                 batch.preference,
                 batch.delta_tokens, batch.delta_eqns, batch.delta_count,
+                *((batch.emem_sums, batch.emem_counts,
+                   batch.delta_wr_cnt, batch.delta_wr_head,
+                   batch.delta_wr_slot, batch.delta_wr_n)
+                  if _EDGE_MEM else ()),
             )
+        pc_logits, pc_ctx, pc_value, pc_carry = _heads_out[:4]
+        _ho_i = 4
         if _EP_READ:
-            (pc_logits, pc_ctx, pc_value, pc_carry, pc_eprows) = _heads_out
+            pc_eprows = _heads_out[_ho_i]
+            _ho_i += 1
         else:
-            pc_logits, pc_ctx, pc_value, pc_carry = _heads_out
             pc_eprows = None
+        if _EDGE_MEM:
+            pc_emrows = _heads_out[_ho_i]
+        else:
+            pc_emrows = None
         (
             log_probs,
             entropies,
@@ -6742,9 +7107,11 @@ def main():
             probe_reprs,
         ) = (
             jax.vmap(
-                # `*per` carries the --face-endpoint-read rows ONLY when the
-                # flag is on (the arg tuple below appends them); with it off
+                # `*per` carries the --face-endpoint-read rows and/or the
+                # --face-edge-mem rows + stored slots ONLY when the flags
+                # are on (the arg tuple below appends them); with both off
                 # the vmapped signature -- and the trace -- is unchanged.
+                # Static index bookkeeping: [eprows?][emrows, eslots?].
                 lambda pref, vidx, action, vmask, ax_st,
                 ax_vm, k, pv, cv, fa, fpv, fcv, fv, fen, pl, pc, pvl,
                 fct, fdt, fde, cy, *per:
@@ -6761,7 +7128,11 @@ def main():
                     fcy=(cy if _LIVE_FACES is not None else None),
                     fb=_face_bound,
                     fwb=_face_win_budget,
-                    fer=(per[0] if per else None),
+                    fer=(per[0] if _EP_READ else None),
+                    fem=(per[1 if _EP_READ else 0]
+                         if _EDGE_MEM else None),
+                    fes=(per[2 if _EP_READ else 1]
+                         if _EDGE_MEM else None),
                 )
             )(
                 batch.preference,
@@ -6783,6 +7154,7 @@ def main():
                 batch.face_delta_tokens, batch.face_delta_eqns,
                 pc_carry,
                 *((pc_eprows,) if _EP_READ else ()),
+                *((pc_emrows, batch.face_eslots) if _EDGE_MEM else ()),
             )
             if args.face_actions
             else jax.vmap(
@@ -7608,6 +7980,14 @@ def main():
             _dead = jnp.zeros(traj.delta_count.shape + (1,), jnp.float32)
             _w_encM = _w_encI = _w_ench = _w_encn = _w_encp = _dead
             _w_vs = _w_vc = _dead
+            # --face-edge-mem: the episode scan re-derives the edge memory
+            # from zeros, so there is no anchor; the write metadata rides
+            # as recorded (leading T axis, consumed by _episode_heads).
+            _w_es = _w_ec = None
+            _w_ewc = traj.delta_wr_cnt
+            _w_ewh = traj.delta_wr_head
+            _w_ews = traj.delta_wr_slot
+            _w_ewn = traj.delta_wr_n
         else:
             _wK = max(1, int(getattr(args, "grad_window", 1)))
             _w_t = (jnp.arange(_T_steps, dtype=jnp.int32)[:, None]
@@ -7628,6 +8008,20 @@ def main():
             _w_encp = traj.enc_pos[:, _w_anchor]
             _w_vs = traj.vmem_sums[:, _w_anchor]
             _w_vc = traj.vmem_counts[:, _w_anchor]
+            # --face-edge-mem: anchors windowed like vmem (state at the
+            # OLDEST delta), write metadata windowed like the deltas (K
+            # axis). A clamped pre-episode entry already carries count 0
+            # (see _w_dcnt), which makes its edge write an exact no-op.
+            if _EDGE_MEM:
+                _w_es = traj.emem_sums[:, _w_anchor]
+                _w_ec = traj.emem_counts[:, _w_anchor]
+                _w_ewc = traj.delta_wr_cnt[:, _w_idx]
+                _w_ewh = traj.delta_wr_head[:, _w_idx]
+                _w_ews = traj.delta_wr_slot[:, _w_idx]
+                _w_ewn = traj.delta_wr_n[:, _w_idx]
+            else:
+                _w_es = _w_ec = None
+                _w_ewc = _w_ewh = _w_ews = _w_ewn = None
         full_batch = TrainBatch(
             preference=traj.preference,
             vertex_idx=traj.vertex_idx,
@@ -7697,6 +8091,14 @@ def main():
             probe_step=traj.probe_step,
             vp_targets=traj.vp_targets,
             vp_valid=traj.vp_valid,
+            # --face-edge-mem: None throughout when the flag is off.
+            emem_sums=_w_es,
+            emem_counts=_w_ec,
+            face_eslots=traj.face_eslots,
+            delta_wr_cnt=_w_ewc,
+            delta_wr_head=_w_ewh,
+            delta_wr_slot=_w_ews,
+            delta_wr_n=_w_ewn,
         )
 
         # The probes ride in the SAME scan carry (so their updates
@@ -8955,6 +9357,17 @@ def main():
                 )
             except Exception:
                 pass
+        # --face-edge-mem telemetry: slot-table traffic per episode.
+        # `evictions` nonzero at steady state means K (= the face bound) is
+        # undersized for this graph's distinct-edge-key count; a zero
+        # `nonzero_reads` under FORCE_REV_ORDER is EXPECTED (every lhs is
+        # primitive there -- dossier section 8), under random/learned
+        # orders it means the read path is dead.
+        if _EDGE_TABLE is not None:
+            _em_stats = _EDGE_TABLE.consume_stats()
+            for _ek, _ev in _em_stats.items():
+                log_dict[f"edgemem/{_ek}"] = float(_ev)
+            print("[edgemem ep%d] %s" % (ep, _em_stats), flush=True)
         _HEALTH_N[0] += 1
         if _HEALTH_N[0] <= int(os.environ.get("ALPHAGRAD_HEALTH_EPISODES", "3")):
             # The launch check, on stdout where a running job can be read

@@ -32,7 +32,80 @@ __all__ = [
     "build_live_face_stream",
     "make_face_callbacks",
     "bind_step_callbacks",
+    "EdgeSlotTable",
 ]
+
+
+class EdgeSlotTable:
+    """Host-side edge-key -> emem-slot map (--face-edge-mem, dossier sec 8).
+
+    One insertion-ordered dict PER ENV (the batched callback walks envs in
+    a stable order, so the loop index IS the env identity, exactly as the
+    per-env prefix tokenizers are keyed). A slot is assigned on the FIRST
+    EMISSION of a res-edge key -- i.e. when the face that creates/updates
+    that edge is being decided for the vertex being eliminated -- and only
+    then; lookups (a later face resolving its lhs/rhs OPERAND edge) never
+    assign. Past ``capacity`` the OLDEST key is evicted and its slot reused
+    (`evictions` in the stats -- a nonzero steady state means K is under-
+    sized, not that anything is wrong). The table resets when an env's
+    ``step_count`` regresses: a new episode, new graph history, dead keys.
+
+    Determinism: dict order is insertion order, the face loop visits faces
+    in order, the batched callback visits envs in order -- so a replayed
+    identical episode assigns identical slots (pinned in
+    tests/edge_mem_test.py). Callback re-execution is harmless: assignment
+    is idempotent per key.
+    """
+
+    def __init__(self, capacity: int):
+        self.capacity = int(capacity)
+        self._tables: dict = {}      # env index -> {edge key: slot}
+        self._last_step: dict = {}   # env index -> last seen step_count
+        self.stats = {"assigned": 0, "evictions": 0, "nonzero_reads": 0,
+                      "resets": 0, "lookups": 0}
+
+    def begin(self, env: int, step_count: int):
+        """Per-(env, step) prologue: reset on episode restart."""
+        last = self._last_step.get(env)
+        if last is not None and step_count < last:
+            self._tables[env] = {}
+            self.stats["resets"] += 1
+        self._last_step[env] = int(step_count)
+
+    def assign(self, env: int, key) -> int:
+        """Slot of ``key``, assigning (evict-oldest past capacity) if new."""
+        t = self._tables.setdefault(env, {})
+        s = t.get(key)
+        if s is not None:
+            return s
+        if len(t) < self.capacity:
+            s = len(t)
+        else:
+            oldest = next(iter(t))
+            s = t.pop(oldest)
+            self.stats["evictions"] += 1
+        t[key] = s
+        self.stats["assigned"] += 1
+        return s
+
+    def lookup(self, env: int, keys) -> int:
+        """First assigned slot among ``keys`` (candidate edge ids); -1 if
+        none. NEVER assigns -- an unwritten edge must read a zero row."""
+        t = self._tables.get(env)
+        self.stats["lookups"] += 1
+        if t:
+            for k in keys:
+                s = t.get(k)
+                if s is not None:
+                    self.stats["nonzero_reads"] += 1
+                    return s
+        return -1
+
+    def consume_stats(self) -> dict:
+        out = dict(self.stats)
+        for k in self.stats:
+            self.stats[k] = 0
+        return out
 
 
 def _default_window():
@@ -82,7 +155,8 @@ def build_live_face_stream(jaxpr, argnums, consts, args, *, max_faces,
     )
 
 
-def make_face_callbacks(live_faces, *, window, prof_sink=None):
+def make_face_callbacks(live_faces, *, window, prof_sink=None,
+                        edge_table=None):
     """``(chunk_cb, count_cb)`` -- the device-side face callbacks.
 
     ``chunk_cb(f, order, spec_hist, step_count, vertex_idx, vertex_specs,
@@ -97,12 +171,36 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None):
 
     ``prof_sink(name, seconds)`` accumulates host time (PPO passes the env
     module's shared sink); ``None`` disables the timing entirely.
+
+    ``edge_table`` (an :class:`EdgeSlotTable`, --face-edge-mem) appends a
+    5th output ``einfo (4,) int32 = [lhs_slot, rhs_slot, res_slot, head]``:
+    the emem slots of the face's two OPERAND edges (lookup only, -1 =
+    never written -> zero row), the slot ASSIGNED to its res edge (first
+    emission assigns; -1 for a dropped face), and the chunk's approx-echo
+    prefix length (the write path's span correction). With ``None`` the
+    callback shapes -- and the flag-off trace -- are exactly the v63 ones.
     """
     W = int(window)
     _perf = None
     if prof_sink is not None:
         import time as _time
         _perf = _time.perf_counter
+
+    def _einfo_host(env_i, step_count, ekey, cvx, head, wrok):
+        """One face's edge-slot wire, resolved against the host table."""
+        edge_table.begin(env_i, int(step_count))
+        lhs = rhs = res = -1
+        i, j = int(ekey[0]), int(ekey[1])
+        if i >= 0 and j >= 0:
+            cands = [int(c) for c in cvx if c >= 0]
+            # Lookups FIRST (they can never hit this face's own res edge --
+            # operand edges are incident to the central vertex, res edges
+            # bypass it -- but the order keeps that a structural fact).
+            lhs = edge_table.lookup(env_i, [(i, c) for c in cands])
+            rhs = edge_table.lookup(env_i, [(c, j) for c in cands])
+            if int(wrok):
+                res = edge_table.assign(env_i, (i, j))
+        return np.asarray([lhs, rhs, res, int(head)], np.int32)
 
     def _live_face_host(order, spec_hist, step_count, vertex_idx,
                         vertex_specs, face_rows, face_skips, f,
@@ -117,6 +215,19 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None):
         try:
             _order = np.asarray(order)
             if _order.ndim == 1:
+                if edge_table is not None:
+                    _sc1 = int(np.asarray(step_count))
+                    (tok, ids, cnt, _nf, ends, ekey, cvx, head,
+                     wrok) = live_faces.chunk_ex(
+                        order, spec_hist, _sc1,
+                        int(np.asarray(vertex_idx)) + 1, vertex_specs,
+                        face_rows, face_skips, int(np.asarray(f)),
+                        face_hist, skip_hist,
+                    )
+                    _dist("face_chunk_len", cnt)
+                    return (tok, ids, np.asarray(cnt, np.int32),
+                            np.asarray(ends, np.int32),
+                            _einfo_host(0, _sc1, ekey, cvx, head, wrok))
                 tok, ids, cnt, _nf, ends = live_faces.chunk(
                     order, spec_hist, int(np.asarray(step_count)),
                     int(np.asarray(vertex_idx)) + 1, vertex_specs,
@@ -137,20 +248,33 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None):
             idss = np.zeros((B, W), np.int32)
             cnts = np.zeros((B,), np.int32)
             ends = np.zeros((B, 2), np.int32)
+            einf = -np.ones((B, 4), np.int32)
             _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
             _vi, _vs = np.asarray(vertex_idx), np.asarray(vertex_specs)
             _fr, _fs = np.asarray(face_rows), np.asarray(face_skips)
             _fh, _kh = np.asarray(face_hist), np.asarray(skip_hist)
             _ff = np.asarray(f)
             for i in range(B):
-                tok, ids, cnt, _nf, end = live_faces.chunk(
-                    _order[i], _sh[i], int(_sc[i]), int(_vi[i]) + 1,
-                    _vs[i], _fr[i], _fs[i], int(_ff[i]),
-                    _fh[i], _kh[i],
-                )
+                if edge_table is not None:
+                    (tok, ids, cnt, _nf, end, ekey, cvx, head,
+                     wrok) = live_faces.chunk_ex(
+                        _order[i], _sh[i], int(_sc[i]), int(_vi[i]) + 1,
+                        _vs[i], _fr[i], _fs[i], int(_ff[i]),
+                        _fh[i], _kh[i],
+                    )
+                    einf[i] = _einfo_host(i, int(_sc[i]), ekey, cvx,
+                                          head, wrok)
+                else:
+                    tok, ids, cnt, _nf, end = live_faces.chunk(
+                        _order[i], _sh[i], int(_sc[i]), int(_vi[i]) + 1,
+                        _vs[i], _fr[i], _fs[i], int(_ff[i]),
+                        _fh[i], _kh[i],
+                    )
                 toks[i], idss[i], cnts[i] = tok, ids, np.int32(cnt)
                 ends[i] = end
                 _dist("face_chunk_len", cnt)
+            if edge_table is not None:
+                return toks, idss, cnts, ends, einf
             return toks, idss, cnts, ends
         finally:
             if _perf is not None:
@@ -161,12 +285,15 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None):
         # f rides as an OPERAND: inside the while_loop it is a tracer, and
         # a partial would freeze it into the callback as a python object
         # (TracerArrayConversionError at the first body run).
+        _shapes = (jax.ShapeDtypeStruct((W,), jnp.int32),
+                   jax.ShapeDtypeStruct((W,), jnp.int32),
+                   jax.ShapeDtypeStruct((), jnp.int32),
+                   jax.ShapeDtypeStruct((2,), jnp.int32))
+        if edge_table is not None:
+            _shapes = _shapes + (jax.ShapeDtypeStruct((4,), jnp.int32),)
         return jax.pure_callback(
             _live_face_host,
-            (jax.ShapeDtypeStruct((W,), jnp.int32),
-             jax.ShapeDtypeStruct((W,), jnp.int32),
-             jax.ShapeDtypeStruct((), jnp.int32),
-             jax.ShapeDtypeStruct((2,), jnp.int32)),
+            _shapes,
             order, spec_hist, step_count, vertex_idx, vertex_specs,
             face_rows, face_skips, f, face_hist, skip_hist,
             vmap_method="broadcast_all",
