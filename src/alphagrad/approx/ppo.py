@@ -2032,6 +2032,7 @@ class Agent(eqx.Module):
         face_chunk_fn=None,       # (f, vertex_specs, rows, skips) -> that face's token chunk
         face_count_fn=None,       # vertex -> ACTUAL face count (while_loop trip count)
         enc_carry=None,           # step carry the per-face SIDE carry branches from
+        endpoint_rows=None,       # (V+1, E) read(base+dyn) rows (--face-endpoint-read)
     ):
         """Same as :meth:`sample_action` but routes the rule head through
         :class:`MicroActionPolicy`. ``axis_state`` and ``axis_valid_mask``
@@ -2203,6 +2204,11 @@ class Agent(eqx.Module):
                 f_valid = (jnp.arange(_F) < _n_faces).astype(jnp.float32)
             face_key = jrand.fold_in(micro_key, 7)
             if face_chunk_fn is None:
+                if getattr(self.face_path_policy, "endpoint_read", False):
+                    raise ValueError(
+                        "--face-endpoint-read requires the live-faces "
+                        "stream: the blind face path has no endpoint "
+                        "slots to read.")
                 fa, face_logp, face_ent, _far, _skp, _fod, _fql = (
                     self.face_path_policy.sample(
                         v_context, features, factor_tables, face_key,
@@ -2243,6 +2249,7 @@ class Agent(eqx.Module):
                     op_legality_override,
                     (_n_faces if _n_faces is not None
                      else face_count_fn(vertex_idx)),
+                    endpoint_rows=endpoint_rows,
                 )
             face_out = (fa, face_logp, face_ent, f_pair, f_comp, f_valid,
                         f_cnt, f_dt, f_de, f_ends)
@@ -2347,7 +2354,7 @@ class Agent(eqx.Module):
     def _face_loop(self, features, factor_tables, key,
                    f_pair, f_comp, f_valid, enc_carry, face_chunk_fn,
                    vertex_idx, vertex_specs, axis_state_v,
-                   op_legality_override, n_faces):
+                   op_legality_override, n_faces, endpoint_rows=None):
         """Read face f's chunk, decide face f, repeat -- for the ACTUAL face
         count, as a while_loop.
 
@@ -2362,6 +2369,12 @@ class Agent(eqx.Module):
         pol = self.face_path_policy
         F = pol.max_faces
         S = FACE_SLOTS
+        if getattr(pol, "endpoint_read", False) and endpoint_rows is None:
+            raise ValueError(
+                "face_path_policy.endpoint_read is on but endpoint_rows is "
+                "None: the caller must pass the (V+1, E) read(base+dyn) "
+                "slot rows (az_gumbel does not support --face-endpoint-read "
+                "yet).")
         n = jnp.minimum(jnp.asarray(n_faces, jnp.int32), F)
         wire0 = (
             jnp.full((F, S), OP_END, dtype=jnp.int32),     # op_type
@@ -2408,6 +2421,20 @@ class Agent(eqx.Module):
             feqn = feqn.at[off + _ar_w].set(
                 jnp.where(_m, eq_f, -1), mode="drop")
             carry, summ = self._face_encode(carry, tk_f, eq_f, ct_eff)
+            if getattr(pol, "endpoint_read", False):
+                # ENDPOINT-SLOT READ (--face-endpoint-read,
+                # docs/FACE_LATENT_INFO_LOSS.md section 4): concatenate the
+                # face's two participation-attributed slot rows --
+                # read(base+dyn) gathered at the stored 1-based endpoints,
+                # zero row for endpoint 0 (a jaxpr input) -- onto the
+                # chunk-mean latent. The identical primitive the vertex
+                # pointer reads; the offline stage2 protocol's
+                # `mean || ep_slot` row (ndim 0.99-1.00 vs 0.82-0.89).
+                _epi = jnp.clip(ends_f.astype(jnp.int32) - 1, 0,
+                                endpoint_rows.shape[0] - 1)
+                _eps = jnp.where((ends_f > 0)[:, None],
+                                 endpoint_rows[_epi], 0.0)
+                summ = jnp.concatenate([summ, _eps[0], _eps[1]])
             sk, row, lp, e, _ar, _sp, _od = pol.sample_face(
                 features, factor_tables, jrand.fold_in(key, f),
                 f, f_pair[f], f_comp[f], f_valid[f], face_context=summ,
@@ -2428,7 +2455,8 @@ class Agent(eqx.Module):
     def _face_replay(self, features, factor_tables, fa,
                      f_pair, f_comp, f_valid, enc_carry, face_chunks,
                      op_legality_override, face_bound=None,
-                     face_win_budget=None):
+                     face_win_budget=None, endpoint_rows=None,
+                     face_ends=None):
         """Score the stored FaceAction against contexts pooled from ONE scan
         of the stored emission window.
 
@@ -2454,6 +2482,12 @@ class Agent(eqx.Module):
         pol = self.face_path_policy
         F = pol.max_faces
         f_cnt, f_toks, f_eqns = face_chunks
+        if getattr(pol, "endpoint_read", False) and (
+                endpoint_rows is None or face_ends is None):
+            raise ValueError(
+                "face_path_policy.endpoint_read is on but the replay was "
+                "not handed endpoint_rows/face_ends (az_gumbel does not "
+                "support --face-endpoint-read yet).")
         total = jnp.sum(f_cnt.astype(jnp.int32))
         # This is the LOSS side and it is reverse-differentiated (gradient
         # reaches palimpsa through exactly this scan), so the trip count comes
@@ -2513,6 +2547,19 @@ class Agent(eqx.Module):
             _fid = jnp.searchsorted(ends, _pos, side="right").astype(jnp.int32)
             _live = jnp.asarray(_valid, jnp.float32) * (_pos < total)
             face_latents = _vmem.scatter_mean(rows, _fid, _live, F)  # (F, E)
+
+        if getattr(pol, "endpoint_read", False):
+            # ENDPOINT-SLOT READ, loss-side mirror of `_face_loop`: the SAME
+            # concatenated [chunk_mean || slot_i || slot_j] input, built from
+            # the STORED endpoints and the loss's own read(base+dyn) rows --
+            # anything less and the ratio is not 1 at epoch 0. The 4th
+            # return below IS this concatenation, so the var probe decodes
+            # exactly what the head reads.
+            _fe = jnp.asarray(face_ends, jnp.int32)[:F]
+            _epi = jnp.clip(_fe - 1, 0, endpoint_rows.shape[0] - 1)
+            _eps = jnp.where((_fe > 0)[..., None], endpoint_rows[_epi], 0.0)
+            face_latents = jnp.concatenate(
+                [face_latents, _eps[:, 0], _eps[:, 1]], axis=-1)
 
         # scan, not a python loop: F is the provable bound (196 here), and
         # unrolling it multiplied the program by F. scan keeps reverse-mode
@@ -2597,16 +2644,19 @@ class Agent(eqx.Module):
         face_pair_valid=None,  # stored (F,N,N) sampling mask
         face_comp_valid=None,  # stored (F,N)
         face_valid=None,       # stored (F,)
-        # UNUSED by the head since 2026-08-15 (the face input is the face's
-        # own latent, not its endpoints' contexts). Still accepted because
-        # the trajectory stores it for `participation_mask` on the rollout
-        # side, and dropping it from the batch is a separate edit.
+        # Head-unused since 2026-08-15 (the face input is the face's own
+        # latent) EXCEPT under --face-endpoint-read, which gathers the two
+        # endpoint SLOT ROWS from `endpoint_rows` by these ids and
+        # concatenates them onto the chunk-mean latent (the loss-side mirror
+        # of `_face_loop`'s read). Otherwise still accepted because the
+        # trajectory stores it for `participation_mask` on the rollout side.
         face_ends=None,        # stored (F, 2) endpoint vertex ids (1-based)
         precomputed=None,      # 3b: (vertex_logits, vertex_contexts, value) from the carry path
         face_chunks=None,      # (counts, emission tokens, emission eqns)
         face_carry=None,       # carry2: where the sampling side carry branched
         face_bound=None,       # batch-wide live-face bound (unbatched)
         face_win_budget=None,  # batch-wide emission-length bound (unbatched)
+        endpoint_rows=None,    # (V+1, E) loss-side read(base+dyn) rows
     ):
         """Joint log-prob / entropy for a stored typed action sequence.
 
@@ -2743,6 +2793,8 @@ class Agent(eqx.Module):
                     face_carry, face_chunks, op_legality_override,
                     face_bound=face_bound,
                     face_win_budget=face_win_budget,
+                    endpoint_rows=endpoint_rows,
+                    face_ends=face_ends,
                 )
             total_log_p = total_log_p + f_logp
             # Arity-normalised per the PER-HEAD ENTROPY NORMALISATION note
@@ -2912,6 +2964,18 @@ def make_argparser() -> argparse.ArgumentParser:
                    "table and stay per-step. Loss and metric denominators "
                    "already mask by valid, so they reflect only the "
                    "supervised steps. 0 = every step (v61 behaviour).")
+    p.add_argument(
+        "--face-endpoint-read", action="store_true",
+        help="Concatenate the face's two ENDPOINT slot rows "
+             "(read(base+dyn)[face_endpoints-1], zero row for endpoint 0) "
+             "onto the chunk-mean face latent, so the face head reads "
+             "[chunk_mean || slot_i || slot_j] (3E wide) instead of the "
+             "chunk mean alone. The endpoint slots are the participation-"
+             "attributed memory the vertex pointer reads -- the anchored, "
+             "collapse-resistant read-point (docs/FACE_LATENT_INFO_LOSS.md "
+             "section 4; offline: mean||endpoint decodes ndim 0.99-1.00 / "
+             "size-R2 0.90-0.95 vs 0.82-0.89 / 0.45-0.55 for the chunk "
+             "mean). Requires the --live-faces face stack; default off.")
     p.add_argument(
         "--exec-on-gpu",
         action="store_true",
@@ -3925,6 +3989,7 @@ def _build_agent(
             max_groups=max(args.max_substeps, 16),
             key=encoder_keys[14],
             use_group_embedding=getattr(args, "axis_group_embedding", False),
+            endpoint_read=bool(getattr(args, "face_endpoint_read", False)),
         )
     elif getattr(args, "face_actions", False) and not getattr(
             args, "no_approx_head", False):
@@ -5274,6 +5339,24 @@ def main():
               "--live-faces --face-actions --unified-face-head and WITHOUT "
               "--no-approx-head (job 61427's lesson: anything less decodes "
               "zeros).", flush=True)
+    # --face-endpoint-read (docs/FACE_LATENT_INFO_LOSS.md section 4): the
+    # face head reads [chunk_mean || slot_i || slot_j] (3E). Requires the
+    # live-faces stack (the read is keyed by the stream's stored endpoints);
+    # the fixed-width FeatureProbes cannot take the 3E latent.
+    _EP_READ = bool(getattr(args, "face_endpoint_read", False))
+    if _EP_READ and not all((
+            bool(getattr(args, "dynamic_substeps", False)),
+            bool(getattr(args, "live_faces", False)),
+            bool(getattr(args, "face_actions", False)),
+            bool(getattr(args, "unified_face_head", False)))):
+        raise ValueError(
+            "--face-endpoint-read requires --dynamic-substeps --live-faces "
+            "--face-actions --unified-face-head")
+    if _EP_READ and _fprobe.PROBE_ON:
+        raise ValueError(
+            "--face-endpoint-read: ALPHAGRAD_FEATURE_PROBE reads the E-wide "
+            "face latent, the endpoint read makes it 3E. Run one or the "
+            "other.")
     # [face-target-build failures, first-census-printed]
     _VP_FAILS = [0, 0]
     # [--var-probe-steps] the episode's supervised-step subset (None =
@@ -5792,6 +5875,9 @@ def main():
     if _VPROBE_ON:
         vprobes = _vprobe.VarProbes(
             embd_dim=int(args.embd_dim),
+            # --face-endpoint-read: the face heads decode the SAME 3E
+            # concatenation the policy head reads; vertex heads stay E.
+            face_in_dim=(3 * int(args.embd_dim) if _EP_READ else None),
             key=jrand.PRNGKey(
                 int(os.environ.get("ALPHAGRAD_VAR_PROBE_SEED", "0"))),
         )
@@ -5966,6 +6052,16 @@ def main():
             )
             precomputed = _pp_mark("prof/heads", precomputed)
 
+            _ep_rows = None
+            if _EP_READ:
+                # --face-endpoint-read: the (V+1, E) read(base+dyn) slot
+                # rows at the CURRENT step -- the memory synced through the
+                # previous elimination's delta, i.e. everything that exists
+                # when this step's faces are decided. The identical read
+                # `heads_from_memory` runs for the vertex pointer.
+                _ep_rows = _vmem.read(vmem_s2 + base_mem[0],
+                                      vmem_c2 + base_mem[1])
+
             face_chunk_fn = None
             face_count_fn = None
             if _LIVE_FACES is not None:
@@ -6047,6 +6143,7 @@ def main():
                     face_chunk_fn=face_chunk_fn,
                     face_count_fn=face_count_fn,
                     enc_carry=enc_carry2,
+                    endpoint_rows=_ep_rows,
                 )
                 # prof/action: the vertex pointer sample + the micro/face
                 # head loop (INCLUDES the faces.live_chunk host callbacks,
@@ -6372,7 +6469,7 @@ def main():
         def _eval_dyn(pref, vidx, action, vmask, ax_st, ax_vm,
                       k, pv, cv, fa=None, fpv=None, fcv=None, fv=None,
                       fen=None, pc3=None, fch=None, fcy=None, fb=None,
-                      fwb=None):
+                      fwb=None, fer=None):
             # No token arguments: `pc3` (the carry-derived heads) IS the
             # encoding, exactly as on the rollout side.
             return agent.evaluate_action_dynamic(
@@ -6402,6 +6499,7 @@ def main():
                 face_carry=fcy,
                 face_bound=fb,
                 face_win_budget=fwb,
+                endpoint_rows=fer,
             )
 
         # Re-derive each sample's encoding by extending its stored
@@ -6515,11 +6613,20 @@ def main():
             # The face replay continues from it over the stored emission
             # window. (The rows above are the previous delta's -- the
             # WRONG tokens for face contexts; see face_delta_tokens.)
-            return _carry_stream.heads(
+            _out = _carry_stream.heads(
                 agent, vs2, vc2,
                 base_mem=_base_mem,
                 preference=pref_or_none(pref),
             ) + (carry2,)
+            if _EP_READ:
+                # --face-endpoint-read: the loss-side read(base+dyn) rows,
+                # off the SAME (vs2, vc2) the heads run off. Gradient flows
+                # through them into palimpsa BY DESIGN -- the endpoint read
+                # feeds the POLICY head, anchoring the representation; the
+                # probe heads alone stay stop_gradient-isolated (VarHead).
+                _out = _out + (_vmem.read(vs2 + _base_mem[0],
+                                          vc2 + _base_mem[1]),)
+            return _out
 
         def _episode_heads(dtok, deqn, dcnt, own, part, pref):
             """ONE episode, ONE `lax.scan`: gradient horizon T, not K.
@@ -6563,6 +6670,10 @@ def main():
                     base_mem=_base_mem,
                     preference=pref_or_none(_pr),
                 ) + (c2,)
+                if _EP_READ:
+                    # --face-endpoint-read: same rows as `_carry_heads`.
+                    out = out + (_vmem.read(s2 + _base_mem[0],
+                                            n2 + _base_mem[1]),)
                 return (c2, s2, n2), out
 
             _bd = (
@@ -6593,7 +6704,7 @@ def main():
             # enc_nvalid / enc_pos / vmem_sums / vmem_counts -- are NOT read
             # here: that is the whole point, and `full_batch` carries them as
             # dead placeholders on this path.
-            pc_logits, pc_ctx, pc_value, pc_carry = jax.tree_util.tree_map(
+            _heads_out = jax.tree_util.tree_map(
                 lambda x: x.reshape(-1, *x.shape[2:]),
                 jax.vmap(_episode_heads)(
                     _ep_batch.delta_tokens, _ep_batch.delta_eqns,
@@ -6602,7 +6713,7 @@ def main():
                 ),
             )
         else:
-            pc_logits, pc_ctx, pc_value, pc_carry = jax.vmap(_carry_heads)(
+            _heads_out = jax.vmap(_carry_heads)(
                 batch.enc_M, batch.enc_I, batch.enc_cumhist,
                 batch.enc_nvalid, batch.enc_pos, batch.delta_owner,
                 batch.delta_participants,
@@ -6610,6 +6721,11 @@ def main():
                 batch.preference,
                 batch.delta_tokens, batch.delta_eqns, batch.delta_count,
             )
+        if _EP_READ:
+            (pc_logits, pc_ctx, pc_value, pc_carry, pc_eprows) = _heads_out
+        else:
+            pc_logits, pc_ctx, pc_value, pc_carry = _heads_out
+            pc_eprows = None
         (
             log_probs,
             entropies,
@@ -6626,9 +6742,12 @@ def main():
             probe_reprs,
         ) = (
             jax.vmap(
+                # `*per` carries the --face-endpoint-read rows ONLY when the
+                # flag is on (the arg tuple below appends them); with it off
+                # the vmapped signature -- and the trace -- is unchanged.
                 lambda pref, vidx, action, vmask, ax_st,
                 ax_vm, k, pv, cv, fa, fpv, fcv, fv, fen, pl, pc, pvl,
-                fct, fdt, fde, cy:
+                fct, fdt, fde, cy, *per:
                 _eval_dyn(
                     pref, vidx, action, vmask, ax_st,
                     ax_vm, k, pv, cv, fa, fpv, fcv, fv, fen,
@@ -6642,6 +6761,7 @@ def main():
                     fcy=(cy if _LIVE_FACES is not None else None),
                     fb=_face_bound,
                     fwb=_face_win_budget,
+                    fer=(per[0] if per else None),
                 )
             )(
                 batch.preference,
@@ -6662,6 +6782,7 @@ def main():
                 batch.face_counts,
                 batch.face_delta_tokens, batch.face_delta_eqns,
                 pc_carry,
+                *((pc_eprows,) if _EP_READ else ()),
             )
             if args.face_actions
             else jax.vmap(

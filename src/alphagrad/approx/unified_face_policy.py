@@ -73,20 +73,27 @@ class UnifiedFacePolicy(eqx.Module):
 
     max_faces: int = eqx.field(static=True)
     embd_dim: int = eqx.field(static=True)
+    endpoint_read: bool = eqx.field(static=True)
 
     def __init__(self, embd_dim: int, num_heads: int, max_faces: int = 8,
                  num_encoder_layers: int = 1, max_groups: int = 16, *, key,
-                 use_group_embedding: bool = False):
+                 use_group_embedding: bool = False,
+                 endpoint_read: bool = False):
         # num_heads / num_encoder_layers / max_groups / use_group_embedding
         # configured the deleted per-face AxisSetEncoder. They stay in the
         # signature because every trainer builds this policy positionally
         # from the shared arch defaults; they are INERT.
         self.embd_dim = embd_dim
         self.max_faces = max_faces
+        self.endpoint_read = bool(endpoint_read)
         keys = jrand.split(key, 3)
-        # in_dim = E: the face's own latent. Not 3E -- there are no endpoint
-        # contexts in the input any more.
-        self.head = UnifiedFaceHead(embd_dim, in_dim=embd_dim,
+        # in_dim = E: the face's own latent -- UNLESS --face-endpoint-read
+        # (docs/FACE_LATENT_INFO_LOSS.md section 4), where the input is
+        # [chunk_mean || slot_i || slot_j] and the head widens to 3E. The
+        # key stream is untouched either way, so a flag-off build is
+        # bit-identical to the pre-flag policy.
+        _in = embd_dim * (3 if self.endpoint_read else 1)
+        self.head = UnifiedFaceHead(embd_dim, in_dim=_in,
                                     key=keys[1])
 
     # ------------------------------------------------------------ masks
@@ -211,7 +218,9 @@ class UnifiedFacePolicy(eqx.Module):
 
     # -------------------------------------------------- ONE face at a time
     def _repr(self, face_latent):
-        """The head's input: the face's own latent, E wide.
+        """The head's input: the face's own latent, E wide -- 3E under
+        ``endpoint_read`` ([chunk_mean || slot_i || slot_j], the caller
+        concatenates; this module never gathers).
 
         NO face_embedding and no learned index table -- a label is not
         information. An absent latent is a ZERO vector, never a substitute:
@@ -219,7 +228,8 @@ class UnifiedFacePolicy(eqx.Module):
         ``Agent._face_encode``'s skip does.
         """
         if face_latent is None:
-            return jnp.zeros((self.embd_dim,), jnp.float32)
+            n = self.embd_dim * (3 if self.endpoint_read else 1)
+            return jnp.zeros((n,), jnp.float32)
         return face_latent
 
     def sample_face(self, features: AxisTokenFeatures,

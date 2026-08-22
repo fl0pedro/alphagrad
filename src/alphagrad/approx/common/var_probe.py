@@ -372,10 +372,16 @@ class VarProbes(eqx.Module):
     face: tuple
     vertex: tuple
 
-    def __init__(self, embd_dim, key, width=64, gru_hidden=32, embed_dim=16):
+    def __init__(self, embd_dim, key, width=64, gru_hidden=32, embed_dim=16,
+                 face_in_dim=None):
+        # ``face_in_dim`` (--face-endpoint-read): the FACE heads decode the
+        # 3E ``[chunk_mean || slot_i || slot_j]`` concatenation the policy
+        # head reads; the vertex heads stay E. Same key splits either way,
+        # so a None build is bit-identical to the pre-flag probes.
+        _fi = int(embd_dim) if face_in_dim is None else int(face_in_dim)
         ks = jax.random.split(key, 2 * N_SLOTS)
         self.face = tuple(
-            VarHead(int(embd_dim), width, gru_hidden, embed_dim, ks[s])
+            VarHead(_fi, width, gru_hidden, embed_dim, ks[s])
             for s in range(N_SLOTS))
         self.vertex = tuple(
             VarHead(int(embd_dim), width, gru_hidden, embed_dim,
