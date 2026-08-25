@@ -487,10 +487,104 @@ inert (the stratum degeneracy above), so v64 is only meaningful once the
 rev pin is lifted or orders are randomized -- the launcher keeps the pin
 with that note inline.
 
+## 9. Width-vs-addressing ablation — ADDRESSING CONFIRMED (width does not substitute)
+
+**Question tested** (owner's): is arm B's both-intermediate failure (§8) a
+WIDTH/compression problem — would a larger palimpsa state with a plain MLP
+readout suffice — or an addressing/binding problem that no reasonable width
+fixes? Superposition theory predicts B's both-intermediate retrieval
+improves only ~sqrt(E) (crosstalk within the vertex-row sum over incident
+edges) while C is already near its ceiling at E=32.
+
+**Protocol** (`probe_invest/width/`; jobs 61858/61881 sweep, 61935 CV
+verdict): `analyze_width.py` loads `edgemem/analyze_edgemem.py` VERBATIM
+and patches only E ∈ {32, 64, 128, 256, 512} (`--embd-dim E` + memory
+width; fresh random embedding table per E falls out of equinox init at the
+new shape under the same `derive_agent_keys(250197)`). Same captures, same
+targets, same ridge/3-fold protocol, same strata as §8. Harness
+validation: the E=32 arm reproduces `edgemem_results.txt` BYTE-IDENTICAL
+(`diff` clean).
+
+**The train-metric trap, stated up front**: on train metrics B "crosses
+over" at E=128 (4/4 criteria vs 90% of C@32) — that crossover is VOID.
+From E=128 the ridge probe interpolates (train acc 1.00 across all arms at
+E≥256, up to 5E+1=2561 features on n=929 faces; §10 hit the same trap) and
+3-fold-CV szR² collapses under the fixed λ=1e-2. All numbers below are
+CV-ONLY with λ tuned per (E, arm, slot, target) over {1e-2…1e3} by pooled
+CV (`cv_verdict.py` / `width_cv_verdict.txt`), so a larger E is never
+penalised for being under-regularised. **The train crossover does NOT
+survive CV: crossover E = None.**
+
+**Both-intermediate stratum, CV, tuned λ** (n=463; cells ndim/szR²;
+majority lhs 0.43, rhs 0.56; full table incl. both-prim in
+`width_cv_verdict.txt`):
+
+| E | A lhs | B lhs | C lhs | D lhs | A rhs | B rhs | C rhs | D rhs |
+|---|---|---|---|---|---|---|---|---|
+| 32 | 0.46/−0.10 | 0.48/−0.05 | 0.56/+0.22 | 0.57/+0.26 | 0.59/−0.07 | 0.68/+0.22 | 0.75/+0.39 | 0.84/+0.44 |
+| 64 | 0.47/−0.12 | 0.52/−0.05 | 0.62/+0.21 | 0.63/+0.36 | 0.62/−0.14 | 0.73/+0.26 | 0.83/+0.32 | 0.87/+0.45 |
+| 128 | 0.50/+0.03 | 0.50/+0.01 | 0.65/+0.30 | 0.67/+0.34 | 0.64/−0.03 | 0.79/+0.33 | 0.88/+0.44 | 0.91/+0.65 |
+| 256 | 0.52/+0.10 | 0.59/+0.00 | 0.70/+0.21 | 0.69/+0.28 | 0.68/−0.18 | 0.82/+0.44 | 0.91/+0.43 | 0.94/+0.66 |
+| 512 | 0.55/+0.11 | 0.57/+0.03 | 0.75/+0.17 | 0.73/−0.02 | 0.69/−0.04 | 0.84/+0.42 | 0.93/+0.31 | 0.94/+0.52 |
+
+**Verdict: ADDRESSING-CONFIRMED.** Against the pre-registered criterion —
+B at some E≤512 within 90% of C@32's four decisive both-inter numbers (CV:
+lhs ndim 0.56, lhs szR² 0.22, rhs ndim 0.75, rhs szR² 0.39) — B reaches
+1/4 at 32, 2/4 at 64-128, 3/4 at 256-512, and NEVER 4/4: **lhs size-R² is
+pinned at ≈0 at every width** (−0.05, −0.05, +0.01, +0.00, +0.03 — slope
++0.021/doubling; reaching C@32's 0.22 extrapolates to E ≈ 10^5). Growth is
+sublinear and sits BELOW even the sqrt-E crosstalk bound: B's
+majority-margin at E=512 is lhs +0.14 vs sqrt-E-predicted +0.19 (×4 SNR
+from E=32's +0.05), rhs +0.28 vs predicted +0.51. Gap closure (§8 metric,
+CV): B-on-both-inter recovers 0.21→0.46 (lhs ndim, 32→512) of B's own
+both-prim margin where C@32 already stood at 0.54 and C@512 at 1.05. The
+one asymmetric concession: on rhs, width does help B substantially (ndim
+0.68→0.84, szR² 0.22→0.42, matching C's szR² by E≥256) — the rhs edge
+(v, j) hangs off the CURRENTLY-eliminated central vertex whose row is
+dominated by this step's events, so its crosstalk is mild; the lhs edge
+(i, vidx(v)) reads an old, high-degree vertex row where superposition is
+worst, and that is exactly where no tested width recovers the signal.
+
+**C across E — is 32 enough for the edge-keyed read?** ndim does benefit:
+monotone lhs 0.56→0.75, rhs 0.75→0.93 (and D peaks at E=128-256: rhs
+0.91-0.94 ndim, 0.65-0.66 szR²). Size does not: C's szR² is flat-to-
+declining past E=128 (lhs 0.22→0.17, rhs 0.39→0.31, best at 128) — the
+edge-keyed read is at its size ceiling by E=32-128. Production cost
+context: E scales the WHOLE recurrence — qkv/MLP params O(E²) per layer,
+the 6 (layer,head) fast-weight matrices O(E²), every carry and both
+memories O(E) per row, and the sweep's wall-clock went 5 min (E=32) to
+2h50 total (E=512-dominated). Verdict for v64: keep E=32 (or E=64-128 if
+the ~+0.06-0.09 ndim headroom on arm D ever matters); the lever is the
+keying, not the width.
+
+**Interpretation — "could we just scale palimpsa + MLP readout?" No.**
+The three probes now triangulate cleanly: (i) this section — the
+vertex-keyed endpoint read (B) with a fair, capacity-controlled readout
+stays materially below edge-keyed C@32 on the decisive stratum at 16× the
+width (256× the recurrence state/compute); (ii) §10 — the information IS
+present in the fast-weight state at E=256, because a LEARNED query decoder
+extracts it (Sb passes all four vs C@32), while hand-built model keys fail
+size at every E; (iii) §8 — two parameter-free E=32 tables keyed by
+canonical edge id recover it for the cost of a segment-mean. Independent
+confirmation: §10's A@{64,128,256} chunk-read arms show the same
+CV-flatness under width. So B's failure is binding, not capacity: the
+vertex-row sum superimposes every incident edge and a linear/MLP readout
+cannot un-mix WHICH edge's events are wanted — scaling E dilutes the
+crosstalk no faster than sqrt(E) in the best case and measurably slower
+here, while addressing (edge keys, or learned queries) removes it
+outright. Width is the expensive non-fix.
+
+Artifacts: `probe_invest/width/` (`analyze_width.py` patch-driver,
+`summarize_width.py`, `cv_verdict.py`, `run_width.sbatch`, `run_cv.sbatch`;
+`data/faces_E{32..512}.pkl`, `data/results_E{32..512}.txt`,
+`data/width_summary.{txt,json}` (train — superseded by CV),
+`data/width_cv_verdict.{txt,json}`, logs `data/run_width_61881.log`,
+`data/run_cv_61935.log`).
+
 ## 10. Fast-weight query falsifier — could a palimpsa DECODER replace the keyed slots?
 
-(§9 is reserved for the in-flight width sweep of arms B/C,
-`probe_invest/width/`; this section is independent of it.)
+(Independent of the §9 width sweep; §9's CV verdict above and this
+section's Sb arm are two views of the same conclusion.)
 
 **Hypothesis tested** (owner's): palimpsa's per-layer fast-weight state is
 an associative matrix memory — the live recurrence (`_extend_sequential`,
