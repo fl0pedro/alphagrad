@@ -640,6 +640,62 @@ def _face_entropy_floor_penalty(h_face, floor, weight):
     return weight * jnp.maximum(0.0, floor - h_face) ** 2
 
 
+def _causal_quality_mask(face_valid, face_skip, face_op_type):
+    """--lag-causal-mask (docs/QUALITY_COLLAPSE_INVESTIGATION.md sec 12.7,
+    fix 1): m(e,t) = 1 iff step t of env e took ANY causal face action on a
+    VALID face -- skip counts as causal (a skipped face is dropped from the
+    graph before anything can apply), as does any slot op != OP_NONE on a
+    kept face. Padding faces (face_valid == 0) never count. The quality
+    channel's advantage weight becomes lambda * m(e,t), so a violating
+    plan's terminal credit lands ONLY on the decisions that could have
+    caused the violation and never on the shared OP_NONE bias -- the sec-12
+    anti-none runaway entered through PPO's unclipped negative branch
+    hammering every step of a violating plan's joint log-prob (kl/approx
+    0.4 -> 109), and under rev-pin an all-none step CANNOT cause a
+    violation.
+
+    FREE-ORDER GENERALIZATION (when ALPHAGRAD_FORCE_REV_ORDER is lifted):
+    the causal set is {approx actions} UNION {vertex choices} -- the vertex
+    head must stay inside the quality credit because the elimination order
+    changes which faces exist; an all-none exact plan still keeps quality
+    advantage 0 on every FACE decision. Under the rev pin the vertex choice
+    is legality-pinned, so no vertex term is needed here. Cost channels are
+    NEVER masked (every action shapes cost).
+
+    Shapes: face_valid/face_skip (..., F), face_op_type (..., F, S);
+    returns float32 (...,). Computed from the SAME stored batch fields the
+    loss replay consumes (_face_replay reads batch.face_skip /
+    batch.face_op_type), so the rollout-collected and replay-recomputed
+    paths see one identical mask by construction. Pinned by
+    tests/credit_fix_test.py.
+    """
+    from alphagrad.approx.unified_face_head import OP_NONE
+    fv = jnp.asarray(face_valid, jnp.float32) > 0.5
+    causal = jnp.logical_or(
+        jnp.asarray(face_skip, jnp.int32) > 0,
+        jnp.any(jnp.asarray(face_op_type, jnp.int32) != OP_NONE, axis=-1),
+    )
+    return jnp.any(jnp.logical_and(fv, causal), axis=-1).astype(jnp.float32)
+
+
+def _winsorize_adv(norm_adv_components, z):
+    """--adv-winsorize Z (sec 12.7 fix 2): clip each PER-CHANNEL normalized
+    advantage to [-Z, +Z] BEFORE preference weighting, all channels. Bounds
+    a destroyed plan's quality kick at lambda*Z instead of the open-ended
+    z-score (v63 measured: sigma_quality ~0.128 put one destroyed plan at
+    z ~ -5.6, x lambda 10 = -56, vs +3 for a healthy plan -- 1 violator
+    outweighed 19 clean plans and fed the epoch-2 unclipped-negative
+    runaway). Returns (clipped, per-channel clip fraction over all leading
+    axes). Pinned by tests/credit_fix_test.py.
+    """
+    pre = norm_adv_components
+    clipped = jnp.clip(pre, -z, z)
+    clip_frac = jnp.mean(
+        (jnp.abs(pre) > z).astype(jnp.float32),
+        axis=tuple(range(pre.ndim - 1)))
+    return clipped, clip_frac
+
+
 def _split_entropy_bonus(entropy_loss, face_ent_mean, entropy_weight,
                          face_entropy_weight):
     """--face-entropy-weight: face/vertex entropy-bonus split.
@@ -3737,7 +3793,13 @@ def make_argparser() -> argparse.ArgumentParser:
                    "computation). Below the floor the penalty gradient "
                    "GROWS (2*w*(floor-H)) while the entropy BONUS gradient "
                    "vanishes under a saturating softmax -- that asymmetry "
-                   "is the point. Nats; 0 = off.")
+                   "is the point. Nats; 0 = off. SEC-12 FINDING "
+                   "(2026-08-25, v62/v63): 0.3 at identity init "
+                   "(H ~ 0.03-0.06) is an ALWAYS-ON IGNITER -- the hinge "
+                   "(~100-1000x the face bonus) drags p_none toward ~0.93 "
+                   "= 8-18 approx ops per TLM plan, structurally inside "
+                   "the violation regime, feeding the sec-12.2 anti-none "
+                   "runaway. v64+ uses 0.05, matching identity-init H.")
     p.add_argument("--face-entropy-floor-weight", type=float, default=10.0,
                    help="weight of the --face-entropy-floor hinge.")
     p.add_argument("--face-logit-clamp", type=float, default=15.0,
@@ -3747,6 +3809,26 @@ def make_argparser() -> argparse.ArgumentParser:
                    "finite so the --face-entropy-floor hinge never loses "
                    "its restoring gradient. Near-identity for |z| << C. "
                    "0 = off.")
+    p.add_argument("--lag-causal-mask", action="store_true",
+                   help="QUALITY_COLLAPSE sec 12.7 fix 1: weight the "
+                   "quality-channel advantage by lambda*m(e,t), where "
+                   "m(e,t)=1 iff step t of env e took ANY non-NONE face "
+                   "action (skip counts as causal) on a valid face, else "
+                   "0. Under rev-pin an all-none step cannot cause a "
+                   "quality violation, so a destroyed plan's -lambda*z "
+                   "terminal credit lands only on its causal decisions "
+                   "and never on the shared OP_NONE bias -- the v62/v63 "
+                   "anti-none runaway channel (kl/approx 0.4->109 via "
+                   "PPO's unclipped negative branch). Cost channels stay "
+                   "unmasked. Default off = bit-identical.")
+    p.add_argument("--adv-winsorize", type=float, default=0.0,
+                   help="sec 12.7 fix 2: clip each PER-CHANNEL normalized "
+                   "advantage to [-Z, +Z] BEFORE preference weighting "
+                   "(all channels). Bounds a destroyed plan's quality "
+                   "kick at lambda*Z instead of the open z-score (v63: "
+                   "z=-5.6 -> -56 at lambda=10 vs +3 healthy; one "
+                   "violator outweighed 19 clean plans). 0 = off "
+                   "(bit-identical). v64 uses 3.0.")
     p.add_argument("--value-weight", type=float, default=0.5)
     p.add_argument("--discount", type=float, default=0.99)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
@@ -7932,6 +8014,27 @@ def main():
             norm_adv_components = jax.vmap(normalize, in_axes=-1, out_axes=-1)(
                 advantages.reshape(-1, advantages.shape[-1])
             ).reshape(advantages.shape)
+        # --adv-winsorize Z (sec 12.7 fix 2), default 0 = off (bit-identical
+        # path: no clip, no extra ops on the advantage). Applied to ALL
+        # channels, BEFORE preference weighting, on the per-channel
+        # normalized advantage exactly as the fix spec states.
+        _wz = float(getattr(args, "adv_winsorize", 0.0) or 0.0)
+        if _wz > 0.0:
+            norm_adv_components, _wz_clip_frac = _winsorize_adv(
+                norm_adv_components, _wz)
+        else:
+            _wz_clip_frac = jnp.zeros(
+                (norm_adv_components.shape[-1],), jnp.float32)
+        # --lag-causal-mask (sec 12.7 fix 1), default off (bit-identical:
+        # _pref_eff IS traj.preference). mask_frac sentinel -1 = mask off.
+        _pref_eff = traj.preference
+        _lag_mask_frac = jnp.asarray(-1.0, jnp.float32)
+        if bool(getattr(args, "lag_causal_mask", False)):
+            _lag_m = _causal_quality_mask(
+                traj.face_valid, traj.face_skip, traj.face_op_type)
+            _lag_mask_frac = jnp.mean(_lag_m)
+            _pref_eff = _pref_eff.at[
+                ..., HEAD_NAMES.index("quality")].multiply(_lag_m)
         if args.loss_mode == "scalar":
             # Single-channel path: only slot 0 carries signal — skip the
             # preference scalarization entirely so we don't multiply the
@@ -7941,7 +8044,9 @@ def main():
             # Always use the per-step preference for advantage weighting. In
             # the unconditioned (Stage A–E) path it's broadcast from the static
             # CLI --lambda-* weights; in Stage F it's the Dirichlet sample.
-            norm_adv = jnp.sum(norm_adv_components * traj.preference, axis=-1)
+            # Under --lag-causal-mask the quality slot additionally carries
+            # m(e,t) so quality credit only lands on causal steps.
+            norm_adv = jnp.sum(norm_adv_components * _pref_eff, axis=-1)
 
         # ADVANTAGE / BASELINE DIAGNOSTIC (ALPHAGRAD_ADV_DIAG=1, default off).
         # `advantages` is what GAE produced, `norm_adv` is what the PPO ratio
@@ -8496,6 +8601,11 @@ def main():
             _face_skip_p,
             _face_op_freq,
             _face_mean_valid,
+            # sec 12.7 credit-fix telemetry: mean of the causal quality
+            # mask over batch steps (-1 = mask off) + per-channel
+            # winsorize clip fraction (all-zero when off).
+            _lag_mask_frac,
+            _wz_clip_frac,
         )
         if _ATTN_ENTROPY_ON:
             # Reads the BASE buffer -- which is exactly what it read
@@ -9313,7 +9423,19 @@ def main():
                 _face_skip_p,
                 _face_op_freq,
                 _face_mean_valid,
+                _lag_mask_frac,
+                _wz_clip_frac,
             ) = (np.asarray(x) for x in diag_pack)
+            # sec 12.7 credit-fix telemetry. mask_fraction is the mean of
+            # m(e,t) over batch steps; -1 sentinels the mask being off so
+            # a flag-off run never plots a fake 0/1.
+            if float(_lag_mask_frac) >= 0.0:
+                log_dict["lagrangian/mask_fraction"] = float(_lag_mask_frac)
+            if float(getattr(args, "adv_winsorize", 0.0) or 0.0) > 0.0:
+                for _j, _nm in enumerate(HEAD_NAMES):
+                    if _j < _wz_clip_frac.shape[0]:
+                        log_dict[f"adv/winsorize_clip_frac_{_nm}"] = float(
+                            _wz_clip_frac[_j])
             # T3. nonzero_cos_steps > 1 means the --terminal-rewards-only gate
             # in env.py has stopped holding. The value/return pair measures the
             # critic overestimate that puts popart/mu_cos above the reward
@@ -10313,11 +10435,14 @@ def main():
                 violation_target=float(getattr(args, "lag_target", 0.0)))
             # stdout mirror of the wandb keys: v61's log never carried
             # lambda anywhere, which made the collapse post-mortem blind.
+            _lag_mask_f = (float(np.asarray(diag_pack[-2]))
+                           if diag_pack is not None else -1.0)
             print("[lagrangian] ep=%d lambda=%.4f mean_violation=%.4f "
-                  "frac_violating=%.3f mean_raw_q=%.4f frozen=%d"
+                  "frac_violating=%.3f mean_raw_q=%.4f frozen=%d "
+                  "mask_frac=%.3f"
                   % (ep, lag_lambda, float(np.mean(_lag_v)),
                      float(np.mean(_lag_v > 0.0)), float(np.mean(_lag_q)),
-                     int(_lag_frozen)),
+                     int(_lag_frozen), _lag_mask_f),
                   flush=True)
             lag_extra = {
                 "lagrangian/lambda": float(lag_lambda),
