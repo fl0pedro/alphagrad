@@ -697,3 +697,18 @@ flatten into noisy op-level selection pressure.
 - Fix test: v63 config + mask + winsorize (floor untouched): predicts
   frac_violating stays < 0.2, none ≥ 0.9, quant applied/batch keeps its
   ep50-55 growth, and kl/approx never leaves O(0.5).
+
+### 12.8 Implementation + falsifier + launch record (2026-08-25)
+
+Fix implemented as commit `6d917fc` (`--lag-causal-mask`, `--adv-winsorize`, floor-help igniter note;
+tests/credit_fix_test.py 8/8; flag-off smoke bit-identical to 83a4ced). CPU no-slide falsifier
+(job 61964, Helmholtz slide-repro config + full fix + floor 0.05, 60 eps): **PASS** -- none held
+0.993-1.0 the entire run (unfixed 61936 baseline: 0.70 by ep60), frac_violating 0 except one
+recovered 0.062 blip, mean_raw_q ~1.0, entropy stable ~0.10 with no hinge drag, lambda decayed
+9.99->9.95 (first in-the-wild exercise of --lag-target decay), mask_frac 0.025-0.038.
+Log: collapse_invest/v63_anti_none/armFix_61964.log.
+
+Online arms: **v64b** = full fix production candidate (job 61983, gpu16, 500 eps, wandb 38oyqf4g,
+predictions: frac_violating<0.2, none>=0.9, kl/approx O(0.5), quant learns without slide).
+Igniter-only arm moved to CPU (repro_armB, job 61984: floor 0.05, NO mask/winsorize -- prediction:
+slide delayed/absent vs 61936; if it slides late, mask+winsorize are load-bearing, not just belt).
