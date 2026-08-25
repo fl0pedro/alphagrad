@@ -452,3 +452,248 @@ LR (mult-warmup flags dropped), `--reward-mode lagrangian --lag-tau 0.75
 wandb name v61-tlm-lagrangian, placeholder comment for the probe-flag
 workstream. New wandb keys: lagrangian/lambda, lagrangian/mean_violation,
 lagrangian/frac_violating, lagrangian/popart_frozen.
+
+## 12. v62/v63 — the anti-none global-credit slide: CONFIRMED (with a corrected mechanism), its igniter, and the fix spec (2026-08-25)
+
+v61's fix (lambda=10 prices destruction out to q > 0.69) held the cost story:
+no plan profits from destruction any more. Both follow-up runs still slid into
+an absorber. This section pins the mechanism from the two full records —
+v62 (job 61844, wandb `w6sh91ya`, crashed ~ep122) and v63 (job 61866, wandb
+`as9s5yrl`, COMPLETED, 500 eps) — plus a CPU falsifier with per-plan
+instrumentation. Analysis artifacts:
+`/Users/assmuth/dsnn/collapse_invest/v63_anti_none/` (wandb exports
+`v6{2,3}_full.csv`, throwaway `ppo_instr.py` built by `make_instr.py` — NO
+src/ change — per-episode `dumps_armA/advdump_*.npz`, `analyze_dumps.py`).
+
+### 12.1 The phenomenon, aligned across both runs
+
+Two phases, identical in both runs, shifted ~9 episodes:
+
+| phase | v62 | v63 |
+|---|---|---|
+| slow drift (hinge active, H<0.3) | ep0–49 | ep0–57 |
+| H crosses the 0.3 floor | ep49→50 (0.229→0.327) | ep60→61 (0.180→0.344) |
+| runaway (hinge OFF) | ep50–~90 | ep61–~73 |
+| none prob 0.98 → | 0.15 (ep80), 0.02 (ep100) | 0.016 (ep70), 0.000 (ep74+) |
+| terminal absorber | uniform-ish incl. skip 0.22 | quant/diag/compress ~0.28/0.28/0.17, skip ~0.27, none 0 |
+
+v63 detail (log + export): none 0.975 (ep51) → 0.964/0.949/0.926/0.829
+(ep55-58) → 0.54 (ep60) → 0.11 (ep64) → 0.016 (ep67) → 0.000 (ep74, exactly —
+the shared OP_NONE bias is at the clamp). frac_violating at onset (ep55-58):
+0.06–0.38; saturation (0.875+) only from ep63. mean_raw_q 0.75→−0.12.
+lambda: 10.13 (onset) → 10.35 (ep67) → 20.0 (pinned, ep~350+) with **zero
+recovery**: mean_raw_q ≈ 0 for 430 further episodes while scalarized_return
+falls monotonically −58 → −114.5 — the policy sits in an absorber where its
+own optimized objective keeps worsening, because with every plan destroyed
+the advantage contrast is ~0 and PG is dead (the v61 endgame, reached by a
+different road).
+
+Sampled-approx census (v63): applied+skipped ≈ 40-60/batch pre-slide →
+489 (ep61) → 2814 (ep70). Op-prob gains ep53→ep67: quant 52×, compress 41×,
+diag 36× — proportional within 1.4× — skip 2.4× (pinned at 0.003 while the
+others reach 0.30-0.38). Final ordering quant > compress ≈ diag ≫ skip is
+exactly the harm-ordering (one skip deterministically DCEs the TLM graph;
+diag/compress sometimes destroy; quant rarely).
+
+Post-collapse per-decision entropy is 0.03–0.09 nats while the op MARGINALS
+are near-uniform: the head is (near-)deterministic PER FACE with different
+ops on different faces — a face-deterministic destroyed-plan absorber, not a
+high-temperature one. The entropy floor (still active there, penalty ~0.62)
+cannot lift it: the raw logits sit far beyond the ±15 tanh clamp where the
+clamp's gradient attenuation (~50×) neuters the hinge — the "restoring
+gradient survives saturation" design failed in exactly the state it was
+built for.
+
+### 12.2 Mechanism: three forces on ONE shared parameter
+
+The face head's OP_NONE logit is one shared bias entry per slot
+(`agent_factory.py::apply_face_none_bias`, `unified_face_head` final linear):
+every face's none-vs-rest decision moves together. Three forces act on it:
+
+**(F1) The entropy-floor hinge — the IGNITER (ALT-3, confirmed as such).**
+`entropy_floor/penalty` was **continuously ~0.6–0.72 from ep0** in BOTH runs
+(H ≈ 0.03–0.06 ≪ floor 0.3; hinge gradient dP/dH = −2·10·(0.3−H) ≈ −5.4 —
+~1000× v63's 0.005 face bonus, ~100× v62's 0.05). It pushes H up = none down,
+and its per-parameter bite GROWS as saturation lifts (dH/dθ ∝ p(1−p)·…), so
+the drift accelerates: each op's prob doubles over ~50 eps, then triples in
+3. The penalty hits exactly 0 at the crossing (v62 ep50, v63 ep61) — the
+hinge cannot explain anything past H = 0.3 (p_none ≈ 0.93). Note the floor
+was mis-targeted from the start: H = 0.3 per face decision means ~7% approx
+per decision ≈ 8–18 approx ops per TLM plan — structurally inside the
+violation regime. The igniter is a config bug, not bad luck.
+
+**(F2) The entropy bonus — v62's tail only.** v63 cut the face bonus 10×
+(0.05→0.005) and slid anyway, ~9 eps later and FASTER through the runaway —
+falsifying the §11-era attribution of the slide to the bonus. The bonus only
+explains v62's late walk to full uniform (skip 0.01→0.22 by ep99); v63's
+absorber keeps skip low until after none dies, then skip relaxes up to ~0.27
+once every plan is destroyed anyway and skip is no longer differentially
+punished.
+
+**(F3) Advantage-mediated anti-none — the RUNAWAY (H-NONE, corrected).**
+Terminal-only rewards + GAE(0.99, 0.95) give plan-global, tail-weighted
+credit (step T−k carries 0.9405^k of the terminal advantage). PopArt stats at
+onset: sigma_quality ≈ 0.127–0.129, mu_quality ≈ −0.036 → one destroyed plan
+(violation 0.75) scores z ≈ −5.6, ×lambda 10 ≈ **−56**, against healthy
+plans' +0.3 × 10 ≈ **+3** (their violation channel is exactly 0, so healthy
+contrast exists only through −mu). One violator ≈ 19 healthy plans.
+
+The naive statement of H-NONE — "Σ_batch (advantage × N_none) < 0 ⇒ anti-none
+gradient" — is NOT the gradient. For a plan-constant advantage the softmax
+score function obeys E[Σ ∇log π] = 0: the per-plan drift on the shared none
+bias is A_p · (N_none,p − N_p·p̄_none), a covariance, and at epoch 0 its
+expectation is CORRECTIVE (a plan violates because it sampled more approx
+than the mean, so its none-count deviation is negative and A_p·dev > 0
+supports none). What actually breaks the symmetry is **PPO's
+negative-advantage clipping asymmetry over epochs** (--ppo-epochs 2 × 4
+minibatches): for A < 0 the surrogate min(rA, clip(r)A) is UNCLIPPED as the
+ratio rises, while the healthy plans' positive-advantage terms saturate at
+1+ε. The epoch-2 updates keep pushing every step of a violating plan's JOINT
+log-prob down without bound; ~(1−p_none) ≈ 0.02 lands per none decision × 
+~200 decisions ≈ the ~1 × 3 landed on the sampled approx logits, and the
+relative winners are the ~60 UNSAMPLED approx variants — which is exactly the
+observed proportional quant/diag/compress rise with skip (sampled, punished,
+deterministic harm) pinned.
+
+The signature is in the export: `kl/approx` (joint-ratio KL) sits at 0.35–0.5
+all through the healthy phase, rises with violation frequency
+(0.69→1.45, ep58–60), then explodes through the runaway — 3.3, 6.0, 8.5,
+**109 (ep65)**, 9.7 — with `ratio/max_log` 10→35 and the ppo surrogate loss
+spiking to +60 (ep66). Updates of that size are only reachable through the
+unclipped negative branch.
+
+The loop: hinge-driven drift → more approx per plan → violation frequency up
+→ more −56 plans per batch → unclipped negative pressure on the shared none
+bias → more approx → … lambda's dual ascent (+0.0015/ep pre-slide) is a slow
+follower — an amplifier, never the trigger.
+
+### 12.3 No cost payoff anywhere in the slide (ALT-1)
+
+During the slide latency means WORSEN monotonically: 1.60e5 → 2.22e5 ns
+(ep57→70); memory flat at 5.54e7. The transition pays cost, it does not
+collect it. (The post-collapse absorber IS cheaper — 1.37e5 ns, −14% — but at
+lambda ≥ 11 its violation price is z·λ ≈ −56…−108 against a latency gain of
+~+2; the absorber persists because PG contrast is dead, not because the
+trade pays.) The z-space asymmetry also rules it out numerically: |quality
+advantage| ≈ 56 vs |cost advantage| ≲ 2. v61 is the control: at lambda = 1
+destruction WAS profitable (falsifier fact iii: pays down to q > 0.19) and
+the policy collapsed INTO the cost-optimal absorber (100% SKIP). At
+lambda = 10 the same machine collapses into a cost-WORSE absorber — the
+slide's driver is not cost.
+
+### 12.4 v62 kills the endpoint-read coupling (ALT-2)
+
+v62 has no `--face-endpoint-read` and slid ~9 episodes EARLIER with the same
+two-phase shape, same hinge-crossing structure, same KL blowup (0.47 → 11.9),
+same absorber. The v63 endpoint read changed nothing material about the
+slide. REFUTED as a cause.
+
+### 12.5 CPU falsifier: the slide REPRODUCES, and the per-plan data picks the mechanism
+
+Job 61936 (pgi15-cpu2), Helmholtz (6 vertices, 5 steps, face bound 9, ~10
+face decisions/plan), the proven v63 smoke config scaled to 16 envs ×
+4 minibatches × 200 eps with the campaign pins (FACE_NONE_BIAS=6,
+FORCE_REV_ORDER=1, QUALITY_GATE_MIN=0.05, lag-init 10, floor 0.3/10, face
+bonus 0.005, quality = Jacobian cosine). Instrumented via the throwaway
+`ppo_instr.py` (per-episode npz: per-(env,step) scalarized + per-channel
+normalized advantages, raw rewards, face actions). Numbers below are the
+first 60 trained episodes (run still extending the record in
+`dumps_armA/` + `armA_61936.log`).
+
+**The slide reproduces, compressed.** Valid-face none: 0.99 (ep1) → 0.95
+(ep7) → 0.85 (ep12) → 0.77 (ep46) → 0.70 (mean of ep55–59; single episodes
+down to 0.60). H crosses the 0.3
+floor at ~ep7-8 (hinge phase compressed to ~7 eps by the small alphabet) and
+keeps rising after the hinge zeroes — same two-phase shape as TLM. quant is
+the main gainer (harmless on this target, so corrective PG never opposes
+it); skip stays pinned ≤ 0.02 with P1_true_skip −3…−9 on every violating
+episode — the per-op corrective signal works where causality is
+deterministic, exactly as on TLM.
+
+**P1, decided.** The naive statistic Σ_p A_p·N_none,p flips sign with the
+batch mean (−2690…+108) and does not track the slide. The actual epoch-0
+score-function drift on the shared none bias, Σ_p A_p·(N_none,p −
+N_p·p̄_none), is **positive (none-SUPPORTIVE) even in violating episodes**
+(+0.3…+10.5) — the corrective covariance argument is confirmed in vivo. Yet
+none falls. The discriminating measurement: **Δnone(t→t+1) = −0.015 to
+−0.021 after an episode containing a violator vs −0.001 after a clean
+episode (−0.0149 vs −0.0008 over 60 eps, ~19×; corr(frac_viol, Δnone) ≈
+−0.13)**. The anti-none
+drift is violation-DRIVEN but not epoch-0-PG-driven — the only channel left
+is the epoch-2 negative-advantage pressure (v62/v63's kl/approx 0.4→109 is
+the same channel at TLM scale). H-NONE's substance is confirmed; its
+mechanism is the clipping asymmetry, not the raw advantage×count sum.
+
+**P2, refined.** The none decline is NOT position-uniform: over ep55–59 the
+LAST step-tercile's none rate averages 0.39 while the first tercile holds
+0.85. Tail-weighted plan-global credit lands where GAE puts it — late
+decisions first — on top of the global shared-bias shift. (On TLM the same
+gradient concentrates on the shared bias; the exported aggregate cannot
+resolve position, but the repro says the tail leads.)
+
+**A third, gentler pressure appears late:** healthy plans' quality-channel
+tail advantage `qual[ok]` drifts slightly negative (−0.02…−0.04 by
+ep47–58) — critic optimism (mu ratchet, §3) turns even clean plans'
+quality credit mildly negative, adding wholesale-negative pressure on
+sampled actions. Same family, smaller than the violator kicks.
+
+The full TLM-style terminal absorber (frac_violating→1, none→0) has not
+fired by ep59 on this target — quant absorbs the redistributed mass and
+quant is harmless on Helmholtz, so the violation-density feedback loop is
+weak. The load-bearing claims (drift reproduces; violation-coupled anti-none
+kicks; epoch-0 PG corrective; skip pinned; late-first) do not depend on it.
+
+### 12.6 Verdict table
+
+| claim | verdict | decisive evidence |
+|---|---|---|
+| P1 Σ(adv×N_none) < 0 at onset | REFUTED as stated, CONFIRMED as corrected | the naive sum sign-flips with the batch mean and does not track the slide; epoch-0 drift on the none bias is POSITIVE even in violating episodes; the anti-none channel is the epoch-2 unclipped negative branch (repro: Δnone ~19× larger after violator episodes; TLM: kl/approx 0.4→109, ppo loss +60) |
+| P2 simultaneous global none fall | CONFIRMED, with a tail-first refinement | OP_NONE is ONE shared bias/slot (structural globality); none hits 0.000 exactly across all faces on TLM; repro tercile split shows LATE faces lose none first (0.39 vs 0.85) — GAE tail-weighting rides on the global shift |
+| P3 proportional gains except punished ops | CONFIRMED | quant 52× / compress 41× / diag 36× vs skip 2.4×; final order = harm order |
+| P4 higher lambda accelerates | UNTESTED (no contrast) | v62/v63 identical lag config, both ignited at λ≈10.10–10.14; λ is a slow follower (dual ascent), rises only AFTER violations; v61 (λ=1) shows λ selects WHICH absorber, consistent with advantage-scale mechanics |
+| P5 onset at first strong violators (frac 0.1–0.4), not saturation | HALF-CONFIRMED | onset frac 0.06–0.38, saturation only 5+ eps later ✓; but strong violators existed from ep6–9 (frac 0.25, q 0.63) with NO slide for ~46 eps ✗ — the trigger is the hinge-driven approx-prob level, not the first violators |
+| ALT-1 cost advantage pays for destruction | REFUTED (λ=10) | latency worsens 1.60→2.22e5 during the slide; |A_qual| ≈ 19–28× |A_cost|; true at λ=1 (v61) only |
+| ALT-2 endpoint-read coupling | REFUTED | v62 (no read) slid earlier, same shape |
+| ALT-3 entropy floor hinge | CONFIRMED as IGNITER, refuted as runaway | penalty ~0.6–0.72 continuously ep0→crossing, exactly 0 after; floor 0.3 targets p_none≈0.93 ≈ 8–18 approx/plan = inside the violation regime; cannot explain none 0.83→0.016 post-crossing |
+| overall H-NONE | **CONFIRMED with corrected mechanism** | anti-none global credit is real and drives the runaway, but it enters through PPO's negative-advantage epoch asymmetry on the shared OP_NONE bias, ignited by the always-on entropy floor — not through the naive adv×count sum |
+
+### 12.7 Fix spec (NOT implemented)
+
+1. **Causal mask on the quality-channel advantage.** At the scalarization
+   (`norm_adv = Σ_c norm_adv_components[...,c] · pref[...,c]`,
+   ppo.py ~line 7895): replace the quality slot's constant weight λ by
+   λ·m(e,t), where m(e,t) = 1 iff step t of env e contains a causal action —
+   any valid face with skip = 1 or sampled op ≠ OP_NONE (from
+   traj.face_skip / face_op_type / face_valid, all already in the batch).
+   Under rev-pin, `none` cannot cause a violation, so the violating plan's
+   −56 lands only on its 2–10 causal actions and never on the shared none
+   bias. Free-order generalization: mask to {approx actions} ∪ {vertex
+   choices} — the vertex head stays inside the quality credit because order
+   changes which faces exist, but an all-none exact plan keeps quality
+   advantage 0 on every face decision. Cost channels stay unmasked (every
+   action shapes cost).
+2. **|z| winsorize ≈ 3 per channel** (ppo.py ~line 7859:
+   `norm_adv_components = clip(advantages/new_sigma, ±3)`): bounds a
+   destroyed plan at −30 (λ=10) instead of −56 and, with (1), caps the
+   per-episode unclipped negative drift.
+3. **Fix the igniter**: `--face-entropy-floor 0.05` (matches the identity
+   init H≈0.03–0.06; 0.3 structurally demands ~8–18 approx ops/plan), or
+   hinge on the batch op-MARGINAL entropy instead of the per-decision mean.
+
+Predicted dynamics under (1)+(2): violating plans stop suppressing none (their
+quality credit lands on causal actions only — which is also a *better*
+credit assignment for learning which ops are safe); the positive feedback
+loop is broken; quant learning survives on its own merits (its cost advantage
+is its own: bf16 pulldown −5.8…−7.7% latency at cos 0.99997); skip stays
+priced out by its own causal punishment. Without (3) the hinge still drags
+p_none toward 0.93, but the masked credit turns the resulting violations
+into per-op corrective signal instead of anti-none fuel — the slide should
+flatten into noisy op-level selection pressure.
+
+**Cheapest online falsifiers** (one 4-GPU TLM run each, 150 eps):
+- Igniter test: v63 config, ONLY `--face-entropy-floor 0.05`. Floor-as-igniter
+  predicts no slide in 150 eps; if it still slides, F3 self-ignites and the
+  mask is the load-bearing fix.
+- Fix test: v63 config + mask + winsorize (floor untouched): predicts
+  frac_violating stays < 0.2, none ≥ 0.9, quant applied/batch keeps its
+  ep50-55 growth, and kl/approx never leaves O(0.5).
