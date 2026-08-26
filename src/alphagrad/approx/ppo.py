@@ -431,6 +431,37 @@ if _NO_SYMLOG_REWARD_INDICES:
     _NO_SYMLOG_MASK_NP[list(_NO_SYMLOG_REWARD_INDICES)] = True
 
 
+def _set_no_symlog_indices(indices) -> None:
+    """Pre-trace setter for the per-channel symlog exemption (sec 12.10).
+
+    Rebuilds ``_NO_SYMLOG_MASK`` / ``_NO_SYMLOG_MASK_NP`` from ``indices``
+    (reward-vector slots). MUST be called BEFORE any jit tracing -- like
+    ``_NO_SYMLOG_ALL``, the traced graphs capture the mask as a constant.
+    Used by the static-objective lagrangian mode to keep the bounded
+    violation channel RAW while the cost channels stay symlog'd: symlog is a
+    magnitude-compression for the ~1e5..1e10 cost scales, and applying it to
+    the violation channel would re-introduce a (mild) nonlinearity into the
+    one channel whose ABSOLUTE scale lambda is supposed to price
+    (symlog(0.75) = 0.56: a 25% discount exactly on the constraint bound).
+    The encode/decode pair around the value head (``_value_target`` symlog
+    on the target, ``get_advantages``' symexp on the head output) is applied
+    uniformly per channel, so the per-channel reward space chosen here is
+    self-consistent through GAE and the value loss without further changes.
+    Passing ``()`` restores the all-symlog default, bit-identical to the
+    module-import state. Pinned by tests/static_objective_test.py.
+    """
+    global _NO_SYMLOG_REWARD_INDICES, _NO_SYMLOG_MASK, _NO_SYMLOG_MASK_NP
+    _NO_SYMLOG_REWARD_INDICES = tuple(int(i) for i in indices)
+    _NO_SYMLOG_MASK = (
+        jnp.zeros((NUM_REWARDS,), dtype=jnp.bool_)
+        .at[jnp.asarray(_NO_SYMLOG_REWARD_INDICES, dtype=jnp.int32)]
+        .set(True)
+    )
+    _NO_SYMLOG_MASK_NP = np.zeros((NUM_REWARDS,), dtype=np.bool_)
+    if _NO_SYMLOG_REWARD_INDICES:
+        _NO_SYMLOG_MASK_NP[list(_NO_SYMLOG_REWARD_INDICES)] = True
+
+
 
 def _traced_inlined(target_fn, xs):
     """``jax.make_jaxpr(target_fn)(*xs)``, numbered on the form that is actually
@@ -495,6 +526,28 @@ def _value_target(x: "jax.Array") -> "jax.Array":
     bit-identical.
     """
     return x if _NO_SYMLOG_ALL[0] else reward_normalization_fn(x)
+
+
+def _per_channel_value_loss(values, targets):
+    """Critic MSE, total and PER CHANNEL (sec 12.10 battery telemetry).
+
+    ``values`` is the head output ``(B, NUM_VALUE_HEADS)`` (any leading
+    axes), ``targets`` the estim_returns in the same layout; the target
+    transform is ``_value_target`` exactly as the summed loss applies it.
+    Returns ``(total, per_channel)`` where ``total`` is BITWISE the
+    pre-existing ``mean(sum(sq, -1))`` value loss and ``per_channel`` is the
+    mean squared error per value head, shape ``(NUM_VALUE_HEADS,)`` -- the
+    quantity behind the ``value_loss/<channel>`` wandb keys. The owner's
+    critic-noise hypothesis (the QUALITY head's value error drowns the
+    violation signal) is only measurable with the quality slot on its own
+    panel instead of summed into "value loss" with the cost heads.
+    Pinned by tests/static_objective_test.py.
+    """
+    sq = (values - _value_target(targets)) ** 2
+    return (
+        jnp.mean(jnp.sum(sq, axis=-1)),
+        jnp.mean(sq, axis=tuple(range(sq.ndim - 1))),
+    )
 
 
 def _apply_mult_gate(
@@ -694,6 +747,61 @@ def _winsorize_adv(norm_adv_components, z):
         (jnp.abs(pre) > z).astype(jnp.float32),
         axis=tuple(range(pre.ndim - 1)))
     return clipped, clip_frac
+
+
+# --lag-raw-viol-adv safety clip (sec 12.9). The raw violation-channel
+# advantage is bounded by construction: the channel stores -violation with
+# violation = max(0, tau - clip(q, -0.5, 1)) in [0, tau + 0.5] (tau 0.75 ->
+# 1.25), and the critic's RAW prediction tracks the same bounded channel, so
+# |A_raw| <= tau + 0.5 + margin ~ 1.3 in steady state. 2.0 is a SAFETY clip
+# for a transiently wrong critic (warm start), NOT a normalizer -- the raw
+# path deliberately does not go through --adv-winsorize.
+_RAW_VIOL_ADV_CLIP = 2.0
+
+
+def _raw_viol_override(norm_adv_components, advantages_raw, quality_idx):
+    """--lag-raw-viol-adv (sec 12.9/12.10): QUALITY advantage on the RAW
+    scale -- bypass PopArt z-normalization for that channel only.
+
+    HISTORY: written as the fix for H-ZNEUT (PopArt was supposed to
+    neutralize lambda's price as violations grew: mu_q tracking down and
+    sigma_q widening would make the same absolute violation read as a
+    fading z). **H-ZNEUT IS REFUTED** -- across v64b's drift window sigma_q
+    SHRANK (0.1446 -> 0.1265) and the per-unit violation price ROSE
+    (58.9 -> 68.3 at a 0.25 violation, 66.0 -> 76.5 unwinsorized at 0.75).
+    The penalty stayed fully priced and the policy slid anyway; see sec 12.9.
+
+    WHAT IT IS FOR NOW: the property the flag actually delivers -- a quality
+    term BITWISE invariant to any (mu_q, sigma_q) -- makes it the clean
+    CONTROL that isolates the PopArt layer. It removes the 1/sigma_q
+    amplification of critic error and the policy-dependent exchange rate for
+    the quality channel, while KEEPING PopArt on the costs, winsorize, and
+    lambda dual ascent. Run against the sec-12.10 static arms
+    (--advantage-norm none), it separates "the normalizer" from "the whole
+    nonstationary objective". It is arm D of that battery, not "the fix".
+
+    ``advantages_raw`` must be the RAW-scale GAE advantages: on the PopArt
+    branch _GAE_POPART consumes v_raw = value*sigma + mu (the sec-H2
+    verified ART un-normalization of the value head, so the raw-scale value
+    prediction survives every stats shift) and raw head_rewards -- slot
+    ``quality_idx`` therefore IS (raw violation-channel return) - (raw-scale
+    value prediction), invariant to (mu_q, sigma_q) by construction.
+
+    SIGN/SCALE CONVENTION: the channel stores -violation (HIGHER IS BETTER,
+    see _apply_lagrangian_channels) and the preference weight is +lambda,
+    so one unit of absolute violation below the critic's raw expectation
+    contributes -lambda*1 to the scalarized advantage on every step the
+    causal mask keeps: an ABSOLUTE price. Clipped at +-_RAW_VIOL_ADV_CLIP
+    (see above); NOT winsorized. Cost channels are untouched; PopArt stats
+    and the value loss for the quality head keep updating in normalized
+    space -- only the ADVANTAGE path bypasses. Pinned by
+    tests/credit_fix_test.py (popart-perturbation immunity).
+
+    Returns ``(components_with_quality_slot_overridden, raw_adv_q)``.
+    """
+    raw_q = jnp.clip(advantages_raw[..., quality_idx],
+                     -_RAW_VIOL_ADV_CLIP, _RAW_VIOL_ADV_CLIP)
+    return norm_adv_components.at[..., quality_idx].set(raw_q), raw_q
 
 
 def _split_entropy_bonus(entropy_loss, face_ent_mean, entropy_weight,
@@ -3829,6 +3937,26 @@ def make_argparser() -> argparse.ArgumentParser:
                    "z=-5.6 -> -56 at lambda=10 vs +3 healthy; one "
                    "violator outweighed 19 clean plans). 0 = off "
                    "(bit-identical). v64 uses 3.0.")
+    p.add_argument("--lag-raw-viol-adv", action="store_true",
+                   help="QUALITY_COLLAPSE sec 12.9/12.10: compute the "
+                   "QUALITY/violation channel's advantage term on the RAW "
+                   "scale -- (raw violation-channel return) - (raw-scale "
+                   "value prediction) -- bypassing PopArt z-normalization "
+                   "for THAT channel only. Built for H-ZNEUT, which is "
+                   "REFUTED (v64b's sigma_q SHRANK 0.145->0.126 and the "
+                   "per-unit violation price ROSE 58.9->68.3 across the "
+                   "drift window -- the penalty never faded). Kept as the "
+                   "sec-12.10 CONTROL that isolates the PopArt layer: it "
+                   "removes the 1/sigma_q amplification of critic error and "
+                   "the policy-dependent exchange rate for the quality "
+                   "channel while keeping PopArt on the costs and dual "
+                   "ascent on lambda. Violations are priced ABSOLUTELY at "
+                   "lambda per unit, invariant to (mu, sigma). The raw term is "
+                   "bounded by construction (|A_raw| <= tau+0.5+margin) "
+                   "and clips at 2.0 for safety; it does NOT go through "
+                   "--adv-winsorize. Cost channels keep PopArt+winsorize; "
+                   "value loss stays in normalized space; composes with "
+                   "--lag-causal-mask. Default off = bit-identical.")
     p.add_argument("--value-weight", type=float, default=0.5)
     p.add_argument("--discount", type=float, default=0.99)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
@@ -7379,16 +7507,19 @@ def main():
                 (values[..., 0] - _value_target(batch.estim_returns[..., 0]))
                 ** 2
             )
+            # Only slot 0 is alive in scalar mode (see above); the other
+            # per-channel entries are structural zeros.
+            _vloss_ch = (jnp.zeros((NUM_VALUE_HEADS,), jnp.float32)
+                         .at[0].set(value_loss))
             explained_var = explained_variance(
                 values[..., 0], batch.estim_returns[..., 0]
             )
         else:
-            value_loss = jnp.mean(
-                jnp.sum(
-                    (values - _value_target(batch.estim_returns)) ** 2,
-                    axis=-1,
-                )
-            )
+            # Total is BITWISE the previous mean(sum(sq, -1)); the
+            # per-channel vector feeds the value_loss/<channel> wandb keys
+            # (sec 12.10 critic-noise telemetry).
+            value_loss, _vloss_ch = _per_channel_value_loss(
+                values, batch.estim_returns)
             explained_var = explained_variance(
                 jnp.sum(values, axis=-1),
                 jnp.sum(batch.estim_returns, axis=-1),
@@ -7648,6 +7779,9 @@ def main():
             # legacy returns zeros for the dynamic-only slots and the vertex
             # entropy in slot 0 if available. Slot 5 = face/approximation head.
             jnp.stack(_entropy_components),
+            # Slot 11 (sec 12.10): per-channel critic MSE,
+            # (NUM_VALUE_HEADS,). host_log maps it to value_loss/<channel>.
+            _vloss_ch,
         )
         if _PROBE_ON or _VPROBE_ON:
             return total_loss, (_metrics, _probe_pack, _vp_pack)
@@ -8025,6 +8159,41 @@ def main():
         else:
             _wz_clip_frac = jnp.zeros(
                 (norm_adv_components.shape[-1],), jnp.float32)
+        # --lag-raw-viol-adv (sec 12.10 arm-D control; built for the
+        # REFUTED H-ZNEUT, see _raw_viol_override), default off
+        # (bit-identical: no slot is touched). Applied AFTER winsorize so
+        # the raw quality term REPLACES the winsorized z-term wholesale --
+        # the raw path is bounded by construction and must not be
+        # re-normalized (see _raw_viol_override for the full convention).
+        # `advantages` here is the RAW-scale GAE output with degen zeroing
+        # (_live) already applied; the causal mask below composes
+        # unchanged (it multiplies the PREFERENCE quality slot, so masked
+        # steps carry zero quality term and unmasked steps carry
+        # lambda*A_raw).
+        _lag_raw_adv_mean = jnp.asarray(float("nan"), jnp.float32)
+        _lag_raw_adv_min = jnp.asarray(float("nan"), jnp.float32)
+        if bool(getattr(args, "lag_raw_viol_adv", False)):
+            _qh_raw = HEAD_NAMES.index("quality")
+            norm_adv_components, _raw_adv_q = _raw_viol_override(
+                norm_adv_components, advantages, _qh_raw)
+            # Telemetry on VIOLATING plans: envs whose terminal
+            # -violation channel is < 0 (head_rewards holds the
+            # lagrangian-rewritten channel; symlog passes the quality
+            # slot's sign through). Mean/min of the raw quality advantage
+            # over every step of those envs; NaN when no env violates.
+            _vio_env = head_rewards[:, -1, _qh_raw] < 0.0          # (E,)
+            _vio_et = jnp.broadcast_to(
+                _vio_env[:, None], _raw_adv_q.shape)               # (E,T)
+            _n_vio = jnp.sum(_vio_et.astype(jnp.float32))
+            _lag_raw_adv_mean = jnp.where(
+                _n_vio > 0.0,
+                jnp.sum(jnp.where(_vio_et, _raw_adv_q, 0.0))
+                / jnp.maximum(_n_vio, 1.0),
+                _lag_raw_adv_mean)
+            _lag_raw_adv_min = jnp.where(
+                _n_vio > 0.0,
+                jnp.min(jnp.where(_vio_et, _raw_adv_q, jnp.inf)),
+                _lag_raw_adv_min)
         # --lag-causal-mask (sec 12.7 fix 1), default off (bit-identical:
         # _pref_eff IS traj.preference). mask_frac sentinel -1 = mask off.
         _pref_eff = traj.preference
@@ -8606,6 +8775,13 @@ def main():
             # winsorize clip fraction (all-zero when off).
             _lag_mask_frac,
             _wz_clip_frac,
+            # sec 12.9 --lag-raw-viol-adv telemetry: mean/min of the raw
+            # quality advantage over the steps of violating envs (NaN =
+            # flag off or no violator this episode). NOTE the stdout
+            # [lagrangian] print reads _lag_mask_frac via diag_pack[-4];
+            # keep these two LAST or update that index.
+            _lag_raw_adv_mean,
+            _lag_raw_adv_min,
         )
         if _ATTN_ENTROPY_ON:
             # Reads the BASE buffer -- which is exactly what it read
@@ -8659,6 +8835,24 @@ def main():
         else:
             print("[cfg] symlog DISABLED; PopArt alone scales the channels.",
                   flush=True)
+    elif args.reward_mode == "lagrangian":
+        # STATIC-OBJECTIVE support (sec 12.10): with symlog ON in lagrangian
+        # mode the VIOLATION channel is exempted from the transform. The
+        # channel is bounded by construction (terminal -violation in
+        # [-(tau+0.5), 0], every other step 0) so it needs no magnitude
+        # compression, and symlog would discount the absolute per-unit price
+        # lambda is supposed to set (symlog(0.75) = 0.56 exactly at the
+        # constraint bound). Cost channels stay symlog'd -- that is what
+        # replaces PopArt's scaling under --advantage-norm none. Applied
+        # under every advantage-norm for consistency (no lagrangian
+        # campaign runs popart WITHOUT --no-symlog, where this would
+        # change behaviour); the encode/decode pair around the value head
+        # is per-channel uniform, so all three sites (reward transform,
+        # value target, GAE) stay mutually consistent by construction.
+        _set_no_symlog_indices((int(REWARD_INDEX["cosine_sim"]),))
+        print("[cfg] lagrangian + symlog: cost channels symlog'd, violation "
+              "channel RAW (symlog-exempt, bounded [-(tau+0.5), 0]).",
+              flush=True)
 
     _wandb_config = dict(vars(args))
     _wandb_config.update(_repo_commits())
@@ -8863,11 +9057,12 @@ def main():
                 all_rets[_live_env].mean(axis=0), dtype=np.float64)
 
         host_state["samplecounts"] += num_envs * num_valid
-        # mets is an 11-tuple: 9 scalars + two per-component arrays (KL is
-        # (7,), entropy is (6,) -- slot 5 of the latter is the face head).
-        # Slot 9 is per-component KL (vertex/op/i/j/exp in dynamic mode;
-        # vertex/pair/factor/0/0 in legacy). Slot 10 is per-component
-        # entropy (same slot layout; legacy = all zeros today).
+        # mets is a 12-tuple: 9 scalars + three per-component arrays (KL is
+        # (7,), entropy is (6,) -- slot 5 of the latter is the face head --
+        # and slot 11 is the (NUM_VALUE_HEADS,) per-channel critic MSE,
+        # sec 12.10). Slot 9 is per-component KL (vertex/op/i/j/exp in
+        # dynamic mode; vertex/pair/factor/0/0 in legacy). Slot 10 is
+        # per-component entropy (same slot layout; legacy = all zeros today).
         kl_div = float(mets[0])
         policy_entropy = float(mets[1])
         _fit_quality = float(mets[2])
@@ -8879,6 +9074,10 @@ def main():
         _clipping_trigger_ratio = float(mets[8])
         kl_components = np.asarray(mets[9])
         entropy_components = np.asarray(mets[10])
+        # Slot 11 (sec 12.10): per-channel critic MSE. Guarded so an
+        # 11-tuple caller (none should remain) degrades to "keys absent"
+        # rather than an IndexError.
+        vloss_ch = np.asarray(mets[11]) if len(mets) > 11 else None
 
         weights = reward_weights_np
         n_collapsed_this_ep = 0
@@ -9017,6 +9216,17 @@ def main():
             "value loss": value_loss,
             "total loss": total_loss,
         }
+        # Per-channel critic loss (sec 12.10 static-objective battery). The
+        # critic-noise hypothesis -- the QUALITY head's value error drowns
+        # the violation signal -- is only testable across arms with the
+        # quality slot's value error on its own panel, not summed into
+        # "value loss" with the cost heads. NaN entries (warmup shape
+        # filler) are dropped, matching the NaN policy everywhere else.
+        if vloss_ch is not None and np.ndim(vloss_ch) == 1 \
+                and vloss_ch.shape[0] >= len(HEAD_NAMES):
+            for _vj, _vnm in enumerate(HEAD_NAMES):
+                if np.isfinite(vloss_ch[_vj]):
+                    log_dict[f"value_loss/{_vnm}"] = float(vloss_ch[_vj])
         # Per-component KL and entropy: slot semantics depend on the
         # trainer mode. In dynamic mode the components are vertex / op /
         # i / j / exp; in legacy mode they are vertex / pair / factor /
@@ -9425,6 +9635,8 @@ def main():
                 _face_mean_valid,
                 _lag_mask_frac,
                 _wz_clip_frac,
+                _lag_raw_adv_mean,
+                _lag_raw_adv_min,
             ) = (np.asarray(x) for x in diag_pack)
             # sec 12.7 credit-fix telemetry. mask_fraction is the mean of
             # m(e,t) over batch steps; -1 sentinels the mask being off so
@@ -9436,6 +9648,16 @@ def main():
                     if _j < _wz_clip_frac.shape[0]:
                         log_dict[f"adv/winsorize_clip_frac_{_nm}"] = float(
                             _wz_clip_frac[_j])
+            # sec 12.9 --lag-raw-viol-adv telemetry. NaN = no violating
+            # env this episode (or flag off) -- only log real numbers so
+            # the wandb panel plots the violating episodes alone.
+            if bool(getattr(args, "lag_raw_viol_adv", False)):
+                if np.isfinite(float(_lag_raw_adv_mean)):
+                    log_dict["lagrangian/raw_adv_mean"] = float(
+                        _lag_raw_adv_mean)
+                if np.isfinite(float(_lag_raw_adv_min)):
+                    log_dict["lagrangian/raw_adv_min"] = float(
+                        _lag_raw_adv_min)
             # T3. nonzero_cos_steps > 1 means the --terminal-rewards-only gate
             # in env.py has stopped holding. The value/return pair measures the
             # critic overestimate that puts popart/mu_cos above the reward
@@ -9602,7 +9824,8 @@ def main():
                            "total loss", "loss")
             for _k in list(log_dict):
                 if _k in _drop_exact or _k.startswith(
-                        ("kl/", "ent/", "entropy/", "ratio/")):
+                        ("kl/", "ent/", "entropy/", "ratio/",
+                         "value_loss/")):
                     log_dict.pop(_k, None)
             log_dict["popart_init/warmup_episode"] = 1
             # The warm start is not spent from the measurement budget (az
@@ -10216,7 +10439,8 @@ def main():
                 # are dropped before the wandb call, never logged.
                 _wmets = (
                     (float("nan"),) * 9
-                    + (np.full((7,), np.nan), np.full((6,), np.nan))
+                    + (np.full((7,), np.nan), np.full((6,), np.nan),
+                       np.full((NUM_VALUE_HEADS,), np.nan))
                 )
                 host_log(
                     ep,
@@ -10435,14 +10659,19 @@ def main():
                 violation_target=float(getattr(args, "lag_target", 0.0)))
             # stdout mirror of the wandb keys: v61's log never carried
             # lambda anywhere, which made the collapse post-mortem blind.
-            _lag_mask_f = (float(np.asarray(diag_pack[-2]))
+            # diag_pack tail: (..., mask_frac, wz_clip_frac,
+            # raw_adv_mean, raw_adv_min) -- sec 12.9 appended two entries,
+            # so mask_frac moved from [-2] to [-4].
+            _lag_mask_f = (float(np.asarray(diag_pack[-4]))
                            if diag_pack is not None else -1.0)
+            _lag_raw_a = (float(np.asarray(diag_pack[-2]))
+                          if diag_pack is not None else float("nan"))
             print("[lagrangian] ep=%d lambda=%.4f mean_violation=%.4f "
                   "frac_violating=%.3f mean_raw_q=%.4f frozen=%d "
-                  "mask_frac=%.3f"
+                  "mask_frac=%.3f raw_adv=%.3f"
                   % (ep, lag_lambda, float(np.mean(_lag_v)),
                      float(np.mean(_lag_v > 0.0)), float(np.mean(_lag_q)),
-                     int(_lag_frozen), _lag_mask_f),
+                     int(_lag_frozen), _lag_mask_f, _lag_raw_a),
                   flush=True)
             lag_extra = {
                 "lagrangian/lambda": float(lag_lambda),

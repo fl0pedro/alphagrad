@@ -17,6 +17,17 @@ Pins the two mechanisms that break the v62/v63 anti-none runaway
    batch fields (face_valid/face_skip/face_op_type), so any slicing or
    shuffling of the batch commutes with computing the mask -- the same
    guarantee the loss's replay path relies on.
+
+sec 12.9 (--lag-raw-viol-adv, H-ZNEUT):
+
+5. NEUTRALIZATION IMMUNITY (THE test): the raw-scale quality advantage is
+   bitwise invariant to any perturbation of the PopArt (mu, sigma) for
+   fixed raw advantages, while the z path it replaces scales by 1/sigma
+   -- the v64b fade (sigma_q widening as violations grew) cannot touch it.
+6. Flag off / other channels: the override touches ONLY the quality slot.
+7. Composition with --lag-causal-mask: masked steps carry ZERO quality
+   term, unmasked steps carry exactly lambda*A_raw.
+8. Bounded: |A_raw| <= _RAW_VIOL_ADV_CLIP (= 2.0) for any critic error.
 """
 from __future__ import annotations
 
@@ -32,7 +43,9 @@ import jax.numpy as jnp                                         # noqa: E402
 from alphagrad.approx.ppo import (                              # noqa: E402
     HEAD_NAMES,
     NUM_VALUE_HEADS,
+    _RAW_VIOL_ADV_CLIP,
     _causal_quality_mask,
+    _raw_viol_override,
     _winsorize_adv,
 )
 from alphagrad.approx.unified_face_head import OP_NONE          # noqa: E402
@@ -193,3 +206,114 @@ def test_mask_commutes_with_batch_slicing():
     fop_f = fop.reshape(N, F, S)[mb]
     replay = np.asarray(_causal_quality_mask(fv_f, fsk_f, fop_f))
     np.testing.assert_array_equal(replay, full.reshape(N)[mb])
+
+
+# ---------------------------------------------------------------------------
+# sec 12.9: --lag-raw-viol-adv
+# ---------------------------------------------------------------------------
+
+def _mk_raw_advantages(seed=7, scale=0.6):
+    """Raw-scale GAE advantages: cost channels at symlog scale, quality
+    channel in the bounded -violation range (tau 0.75 -> [-1.25, ~1])."""
+    rng = np.random.default_rng(seed)
+    adv = (rng.normal(size=(E, T, NUM_VALUE_HEADS)) * 8.0).astype(np.float32)
+    adv[..., QHEAD] = rng.uniform(-1.25, 1.0, (E, T)).astype(np.float32) \
+        * scale
+    return adv
+
+
+def test_raw_adv_invariant_to_popart_stats():
+    """THE test: for fixed RAW advantages the raw-path quality term is
+    BITWISE invariant to any (mu, sigma) perturbation, while the z path it
+    replaces scales by 1/sigma.
+
+    NOTE the framing changed with sec 12.9. This was written as H-ZNEUT
+    immunity ("sigma_q widens as violations grow, so the price fades");
+    H-ZNEUT is REFUTED -- v64b's sigma_q SHRANK 0.1446 -> 0.1265 and the
+    per-unit price ROSE. The INVARIANCE property tested here is unaffected
+    and is exactly what makes the flag the sec-12.10 arm-D control: the
+    quality term stops depending on the critic-driven scale in EITHER
+    direction."""
+    adv = _mk_raw_advantages()
+    lam = 10.0
+    pref = np.ones((E, T, NUM_VALUE_HEADS), dtype=np.float32)
+    pref[..., QHEAD] = lam
+    outs, raws, zs = [], [], []
+    # a 10x sigma_q perturbation in the direction H-ZNEUT predicted. The
+    # measured v64b move was the OTHER way and smaller (0.1446 -> 0.1265);
+    # 10x is used here because the test asserts INVARIANCE, so the widest
+    # perturbation is the strongest statement. mu never enters the
+    # advantage at all (GAE takes differences); sigma is the only scale.
+    for sigma_q in (0.128, 1.28):
+        sigma = np.ones((NUM_VALUE_HEADS,), dtype=np.float32)
+        sigma[QHEAD] = sigma_q
+        comps = jnp.asarray(adv) / jnp.asarray(sigma)     # PopArt step
+        comps_ov, raw_q = _raw_viol_override(comps, jnp.asarray(adv), QHEAD)
+        outs.append(np.asarray(jnp.sum(comps_ov * pref, axis=-1)))
+        raws.append(np.asarray(raw_q))
+        zs.append(np.asarray(comps[..., QHEAD]))
+    np.testing.assert_array_equal(raws[0], raws[1])       # BITWISE immune
+    np.testing.assert_array_equal(outs[0], outs[1])       # through scalarize
+    np.testing.assert_array_equal(
+        raws[0], np.clip(adv[..., QHEAD], -_RAW_VIOL_ADV_CLIP,
+                         _RAW_VIOL_ADV_CLIP))
+    # control: WITHOUT the override the z path scales by exactly 1/sigma --
+    # the scale dependence the flag removes (and the reason the flag is a
+    # clean PopArt-layer control regardless of which way sigma moved).
+    np.testing.assert_allclose(zs[0], zs[1] * 10.0, rtol=1e-5)
+
+
+def test_raw_adv_touches_only_quality_slot():
+    adv = _mk_raw_advantages(seed=8)
+    rng = np.random.default_rng(9)
+    comps = jnp.asarray(
+        (rng.normal(size=(E, T, NUM_VALUE_HEADS)) * 2.0).astype(np.float32))
+    comps_ov, _ = _raw_viol_override(comps, jnp.asarray(adv), QHEAD)
+    other = [j for j in range(NUM_VALUE_HEADS) if j != QHEAD]
+    np.testing.assert_array_equal(
+        np.asarray(comps_ov)[..., other], np.asarray(comps)[..., other])
+    # flag off == the ppo path never calls the override (Python-level if);
+    # the untouched components ARE the pre-12.9 scalarization input.
+
+
+def test_raw_adv_composes_with_causal_mask():
+    """Masked steps carry ZERO quality term; unmasked steps carry exactly
+    lambda*A_raw (the mask multiplies the PREFERENCE quality slot, the
+    override rewrites the COMPONENT quality slot -- independent axes)."""
+    adv = _mk_raw_advantages(seed=10)
+    lam = 10.0
+    pref = np.ones((E, T, NUM_VALUE_HEADS), dtype=np.float32)
+    pref[..., QHEAD] = lam
+    rng = np.random.default_rng(11)
+    m = (rng.random((E, T)) < 0.4).astype(np.float32)
+    comps = jnp.asarray(adv) / 0.3                        # some sigma
+    comps_ov, raw_q = _raw_viol_override(comps, jnp.asarray(adv), QHEAD)
+    got = np.asarray(_scalarize(comps_ov, pref, mask=m))
+    cost_only = np.asarray(_scalarize(
+        np.asarray(comps_ov)[..., [j for j in range(NUM_VALUE_HEADS)
+                                   if j != QHEAD]],
+        pref[..., [j for j in range(NUM_VALUE_HEADS) if j != QHEAD]]))
+    np.testing.assert_allclose(
+        got - cost_only, lam * np.asarray(raw_q) * m, rtol=1e-5, atol=1e-6)
+    # masked steps: quality term exactly zero.
+    np.testing.assert_array_equal((got - cost_only)[m == 0.0], 0.0)
+
+
+def test_raw_adv_bounded_for_any_critic_error():
+    """|A_raw| <= 2.0 even for a transiently insane critic (warm start);
+    the raw path is NOT winsorized, the clip is its only guard."""
+    adv = np.zeros((E, T, NUM_VALUE_HEADS), dtype=np.float32)
+    adv[..., QHEAD] = np.linspace(-1e6, 1e6, E * T).reshape(E, T)
+    comps = jnp.zeros((E, T, NUM_VALUE_HEADS), jnp.float32)
+    _, raw_q = _raw_viol_override(comps, jnp.asarray(adv), QHEAD)
+    raw_q = np.asarray(raw_q)
+    assert np.abs(raw_q).max() <= _RAW_VIOL_ADV_CLIP
+    assert raw_q.min() == -_RAW_VIOL_ADV_CLIP
+    assert raw_q.max() == _RAW_VIOL_ADV_CLIP
+    # in-range values pass through untouched (identity inside the bound).
+    adv2 = _mk_raw_advantages(seed=12)
+    _, raw_q2 = _raw_viol_override(
+        jnp.zeros_like(jnp.asarray(adv2)), jnp.asarray(adv2), QHEAD)
+    inside = np.abs(adv2[..., QHEAD]) <= _RAW_VIOL_ADV_CLIP
+    np.testing.assert_array_equal(
+        np.asarray(raw_q2)[inside], adv2[..., QHEAD][inside])
