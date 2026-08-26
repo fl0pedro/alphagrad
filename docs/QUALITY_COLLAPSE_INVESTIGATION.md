@@ -1443,3 +1443,663 @@ it) is what says whether that is exploration or an emptied graph.
 `approx_head=nan macro_vertex=nan ve_head=nan` (warm-up rows, before any
 update contributes metrics). Not a defect, but it means `_step` 0–2 are not
 data.
+
+## 14. Mechanism synthesis for the whole campaign: the two absorbers, the instrument bug that makes one of them pay, and what is now dead (2026-08-26)
+
+Commissioned as the third of three parallel pieces of work on the v57→v66c
+record. The factual base is taken as given and is **not** re-derived here:
+
+* `docs/run_analysis/params_matrix.md` (+ `.csv`) — what every run was
+  configured to do, the consecutive-run delta list, the never-set defaults and
+  the twelve launcher-vs-runtime contradictions C1–C12.
+* `docs/run_analysis/how_runs_ran.md` (+ `run_analysis/figs/*.png`,
+  `run_analysis/data/*.csv`) — landmarks, phase timings, live-arm status.
+* Sections 0–13 of this dossier, and `docs/CLEAN_DESIGN_AUDIT.md`.
+
+Everything new below is computed from `run_analysis/data/*.csv` (the full
+`scan_history` of all twelve runs), from the STDOUT logs in
+`/Users/assmuth/dsnn/`, and from read-only inspection of
+`src/alphagrad/approx/env.py` at `0e601ae`. No GPU job was touched; jobs
+62072–62075 were running throughout.
+
+Vocabulary, following `how_runs_ran.md` §2:
+
+* **group B** — v58b, v60, v61, v62, v63, v64b: cross `approx_prob/none < 0.5`
+  at ep38–71, then lose 88–99 % of their live faces as `approx_prob/skip`
+  rises to 0.20–1.00, and never leave that state (up to 420 further episodes).
+* **group C** — v65, v66a, v66b, v66c (the four live arms): cross at ep81–112,
+  `faces/mean_valid` stays at 1.19–1.24 = at or above their own base,
+  `skip` stays at 0.0002–0.004, no entropy collapse — but quality still
+  degrades (v66a −0.021, v66c −0.105, v66b +0.233, v65 +0.594).
+
+---
+
+### 14.1 The finding that reframes everything: the anti-destruction gate's floor is measured with a different instrument, and under-floors by 13 %
+
+`ALPHAGRAD_QUALITY_GATE_MIN=0.05` is set in all twelve launchers. Its job
+(`_apply_quality_gate`, `env.py:1986`) is to make destruction cost-neutral: a
+plan whose measured quality falls under 0.05 has its latency and memory
+**floored at what its own elimination order would cost done exactly**, so
+"destroy the graph" cannot win the cost channels. The docstring is explicit:
+*"destruction pays what exact computation pays, so it gains nothing"*.
+
+It does not. The gate prints its own before→after on every 50th clamp, and the
+numbers say the floor is 13–15 % below what an honest exact plan is charged in
+the same run:
+
+```
+v63  (61866)  quality gate CLAMP #1   : q=0.0000 < 0.05; lat  65.8 -> 138.5us
+              quality gate CLAMP #50  : q=0.0000 < 0.05; lat  73.5 -> 137.7us
+              quality gate CLAMP #2050: q=0.0000 < 0.05; lat 102.8 -> 133.6us
+v64b (61983)  quality gate CLAMP #1   : q=0.0000 < 0.05; lat  67.9 -> 137.9us
+              quality gate CLAMP #2100: q=0.0000 < 0.05; lat  75.2 -> 136.5us
+              quality gate CLAMP #2550: q=0.0000 < 0.05; lat  82.9 -> 137.5us
+```
+
+Against `mean_latency_ns` of **155–160 µs** for the identity/exact plans of the
+same runs (ep3–10 means: v63 159.0, v64b 158.3, v66a 155.1, v65 157.6 µs).
+
+Two things follow, and both are load-bearing.
+
+**(a) A DCE'd graph really is ~2.3× cheaper.** The pre-clamp readings are
+53–103 µs against 156 µs. One `SKIP` on the TLM graph removes the work (the
+project-memory "skip cliff": one SKIP DCEs the graph, 37 µs, cos 0). The gate
+is the only thing standing between the policy and that prize.
+
+**(b) The floor is measured with a different instrument than the thing it
+floors.** `_measure_exec_cost` (`env.py:1912-1952`) times the reference as the
+**median of 3 laps of 20 back-to-back executions** — a throughput timing that
+amortises per-call dispatch. The plan's own latency comes from the campaign
+measurement path — `--num-data-points 5 × --reps-per-point 4`, each at
+`--latency-inner-reps 5` (C11 records that the standing project rule is 50),
+reduced by `_aggregate_samples(..., want_top_quartile=True)` = a plain median
+(`env.py:2686-2705`). The `_measure_exec_cost` docstring says the protocol is
+*"shared by the global rev reference and the per-order floor so the clamp
+compares like with like"* — which is true **between the two references** and
+false **between the floor and the plan being floored**.
+
+Net effect, present in every one of the twelve runs: **a plan that destroys the
+gradient is charged 132–139 µs where an honest exact plan is charged 155–160 µs
+— a guaranteed −13 % latency and −1.4 % memory bonus for destruction.**
+
+This is the correct location of the "destruction pays" claim, which §12.3
+refuted at the level of the *reward design* (and was right to: at λ=10 the
+latency of the drift state gets *worse*). It pays at the level of the
+*instrument*, and only for the one destruction mode that makes the graph
+cheap — `SKIP` — not for the approximation-heavy mode.
+
+That asymmetry is the hinge of the whole campaign, and it is visible in the
+clamp prints of the live arms. v66a's late clamps read:
+
+```
+v66a (62072)  quality gate CLAMP #400: q=-0.2505 < 0.05; lat 181.4 -> 181.4us
+              quality gate CLAMP #450: q= 0.0000 < 0.05; lat 179.4 -> 179.4us
+              quality gate CLAMP #400: q= 0.0000 < 0.05; lat 189.8 -> 189.8us
+              quality gate CLAMP #450: q=-1.0000 < 0.05; lat 202.5 -> 202.5us
+```
+
+`X -> X`: the floor never binds, because v66a's destroyed plans are destroyed
+by ~180 approximations and are **more expensive** than the floor. Group B's
+destroyed plans are destroyed by `SKIP` and are cheaper than the floor, so they
+collect the bonus every time.
+
+**Falsifier / fix.** Measure the floor with the same protocol as the plan (or
+raise `--latency-inner-reps` to the project-standard 50, at which the two
+protocols converge). Until then, treat every clamped-plan cost number in
+v57–v66 as carrying a −13 % artefact, and treat the group-B absorber's
+"136 µs" as **the floor's own value, not a measurement of anything the policy
+achieved**.
+
+---
+
+### 14.2 Q1 — why group C does not destroy the graph
+
+#### 14.2.1 Group C is not a different mode; it is group B's drift window, held open
+
+The two groups are not distinguished by the state they occupy. Group B passes
+straight through the group-C state:
+
+| window | none | skip | faces/mean_valid | applied/batch | mean_q (sd over eps) | lat |
+|---|---|---|---|---|---|---|
+| v63 ep64–77 (post-cross, pre-skip) | 0.43→0.00 | 0.002–0.014 | 1.119 | 2319 | +0.016 (0.261) | 205.6 µs |
+| v64b ep71–87 (post-cross, pre-skip) | 0.47→0.01 | 0.004–0.013 | 1.117 | 1873 | +0.121 (0.271) | 208.2 µs |
+| v66a ep100–199 (trailing) | 0.000 | 0.0004 | 1.242 | 2895 | −0.021 (0.126) | 179.1 µs |
+| v66c ep100–199 (trailing) | 0.000 | 0.0012 | 1.229 | 2826 | −0.105 (0.076) | 300.5 µs |
+
+Same census, same face population, same approximation density, same
+already-destroyed quality. The difference is what happens **next**: in group B
+`skip` leaves its floor within 6–14 episodes of `none` reaching ~0 (v63 ep78,
+v64b ep88), the graph is DCE'd 3–5 episodes later (v63 ep83, v64b ep93), and
+from that point the run is over. In group C, 100+ episodes past the same point,
+`skip` has not moved.
+
+#### 14.2.2 The skip rise is an *active* learned change, and so is its absence
+
+Because `OP_NONE` and the other ops share one softmax per slot, `none → 0`
+mechanically renormalises every other op upward. That alone predicts
+`p_skip → p_skip · (1−p_none^after)/(1−p_none^before)`. Measured against it:
+
+| run | window | none | skip | skip predicted by renormalisation alone | observed / predicted |
+|---|---|---|---|---|---|
+| v63 | ep58→82 | 0.964→0.000 | 0.0016→0.1441 | 0.0457 | **3.15×** |
+| v64b | ep77→95 | 0.163→0.000 | 0.0037→0.3651 | 0.0045 | **81.8×** |
+| v66a | ep89→131 | 0.190→0.000 | 0.00053→0.00053 | 0.00065 | **0.81×** |
+| v66b | ep88→142 | 0.127→0.121 | 0.00159→0.00111 | 0.00161 | **0.69×** |
+| v66c | ep87→141 | 0.293→0.017 | 0.00161→0.00172 | 0.00223 | **0.77×** |
+| v65 | ep106→172 | 0.751→0.462 | 0.00426→0.00377 | 0.00920 | **0.41×** |
+
+Group B raised the `SKIP` logit by 3–82× beyond renormalisation. Group C
+**lowered** it (0.41–0.81×). Both are learned; neither is an artefact of the
+`none` collapse. So the question is well posed: what makes the per-op
+corrective signal on `SKIP` survive in one group and not the other?
+
+#### 14.2.3 The two forces on SKIP, with numbers
+
+A `SKIP` action buys a cost bonus and pays a quality penalty.
+
+*Bonus* (from §14.1): the plan is floored at 136 µs where an honest plan is
+charged 157 µs. Under PopArt (group B, σ_lat ≈ 28 944 ns) that is
+21 000/28 944 = **+0.72 σ** of latency advantage, at head weight 1. Under the
+static arms' symlog scale (σ_lat = 2.119) it is ln(157/136) = **+0.14**.
+
+*Penalty*: the violation channel moves from the plan's current `v` to its cap
+0.75 (q clipped at 0), scaled by λ and by the channel's normaliser:
+
+* group B (PopArt): `λ/σ_q · (0.75 − v)` = 10/0.1375 · (0.75−v) = **72.7·(0.75−v)**
+* group C (raw scale): `λ · (0.75 − v)` = **10–16 · (0.75−v)**
+
+Both penalties **vanish identically when the batch's violation saturates at the
+cap** — and only then does the bonus decide. Whether the batch saturates is
+directly measurable:
+
+| run | window | `lagrangian/mean_violation` | sd across episodes | `frac_violating` |
+|---|---|---|---|---|
+| v61 | ep100–140 | **0.7500** | **0.0000** | 1.000 |
+| v64b | ep100–140 | **0.7500** | **0.0000** | 1.000 |
+| v63 | ep100–140 | 0.7289 | 0.0332 | 0.971 |
+| v66a | ep160–200 | 0.7347 | **0.0984** | 0.983 |
+| v66b | ep160–200 | 0.4231 | **0.1275** | 0.845 |
+| v66c | ep160–200 | 0.8152 | **0.0682** | 0.990 |
+| v65 | ep160–200 | 0.1902 | **0.0858** | 0.389 |
+
+Group B's absorbers are *pinned at the cap with zero variance* — the quality
+channel emits exactly no contrast, so `SKIP` is unpunished and collects +0.72 σ
+of floored latency for free. Group C sits near the cap **in the mean** but with
+a live spread of 0.07–0.13, so a `SKIP` still moves a plan measurably further
+into violation and is still punished at 10–16 × that move.
+
+The same reading in the quality channel itself (rolling 15-episode sd of
+`mean_quality`):
+
+```
+ep      60     80    100    120    140    160    180    195
+v64b  0.076  0.293  0.098  0.000  0.000  0.000  0.010  0.013
+v63   0.077  0.136  0.104  0.035  0.023  0.034  0.039  0.052
+v66a  0.075  0.102  0.147  0.156  0.210  0.113  0.111  0.150
+v66b  0.075  0.090  0.174  0.189  0.199  0.221  0.162    —
+v66c  0.075  0.089  0.218  0.158  0.209  0.243  0.104  0.079
+v65   0.070  0.111  0.088  0.121  0.202  0.132  0.105  0.141
+```
+
+Group B's contrast dies (v64b to *exactly* 0.000 for ~60 consecutive episodes);
+group C's does not, and is not trending down after 115 episodes of drift.
+
+Note the ordering: v64b's contrast is still 0.098 at ep100, i.e. **after** the
+faces are gone (ep93). Contrast death is the *consequence* of graph
+destruction, not its cause. The cause is the loss of the per-op corrective
+signal on `SKIP` while contrast still existed.
+
+#### 14.2.4 The single factor that separates the two groups
+
+Six candidate factors, tested against the 12-run membership:
+
+| candidate factor | in group B | in group C | verdict |
+|---|---|---|---|
+| symlog on the cost channels | no | v66a/b/c only (**v65 has `--no-symlog`**) | **not necessary** |
+| `--advantage-norm none` | no | v66a/b/c only (**v65 is PopArt**) | **not necessary** |
+| frozen λ (`--lag-eta 0`) | no | v66a/b/c only (**v65 does dual ascent**) | **not necessary** |
+| `--lag-causal-mask` | v64b **yes**; v61/62/63 no | v65/66a/66b yes; **v66c no** | **neither necessary nor sufficient** |
+| `--adv-winsorize 3` | v64b **yes**; v63 no | v65 yes; v66a/b/c no | **neither** |
+| `--face-entropy-floor 0.05` | v64b **yes**; v62/63 = 0.3; v61 = 0 | all four | **necessary-looking, not sufficient** |
+| **quality advantage computed on the RAW scale** (not divided by σ_q) | **none of the six** | **all four** | **perfect separation, 12/12** |
+
+v65 gets the raw scale from `--lag-raw-viol-adv`; v66a/b/c get it from
+`--advantage-norm none`. No other flag partitions the campaign this way.
+
+**And the contrast is causal, not merely correlational.** Per the params
+matrix §5, v64b → v65 changed `--episodes 500→250` and added
+`--lag-raw-viol-adv`, *and nothing else* — same SHA family (`6d917fc` →
+`0e601ae`, flag-off bit-identical on 248 metrics per §12.10.2), same node
+(pgi15-gpu16), same seed 250197, same 16 envs. The two histories are identical
+to three decimals for the first ~25 episodes and then separate:
+
+```
+        v64b                                  v65
+ep  3   none 0.982 q +0.807 H 0.028 kl 0.45 | none 0.982 q +0.807 H 0.028 kl 0.45
+ep 20   none 0.980 q +0.824 H 0.042 kl 0.52 | none 0.981 q +0.824 H 0.041 kl 0.51
+ep 40   none 0.972 q +0.673 H 0.057 kl 0.66 | none 0.975 q +0.669 H 0.051 kl 0.60
+ep 60   none 0.932 q +0.733 H 0.174 kl 1.73 | none 0.976 q +0.844 H 0.056 kl 0.58
+ep 70   none 0.531 q +0.642 H 0.712 kl 15.5 | none 0.972 q +0.885 H 0.077 kl 0.74
+ep 90   none 0.000 q -0.106 H 0.504 kl 1.46 | none 0.952 q +0.846 H 0.113 kl 1.15
+ep120   none 0.000 q  0.000 H 0.005 kl 0.15 | none 0.390 q +0.381 H 0.897 kl 9.44
+ep190   none 0.000 q  0.000 H 0.014 kl 0.16 | none 0.454 q +0.802 H 0.800 kl 9.22
+```
+
+At ep60 the flag has already cut the per-face entropy rise 3.1× (0.174 vs
+0.056) and the joint-ratio KL 3.0× (1.73 vs 0.58). Crossing moves 71 → 112
+(+58 %); absorption at ep93 becomes no absorption at ep203.
+
+**One flag moved a run from group B to group C.** That is the campaign's
+cleanest single result and it is a *scale/noise* result, not a *pricing*
+result — which matters, because §12.9.3 already refuted the pricing story
+(H-ZNEUT) from the other direction.
+
+#### 14.2.5 What the raw scale actually changes: magnitude, not signal-to-noise
+
+Dividing the quality advantage by σ_q scales the true violation signal and the
+critic's error by the same factor, so it cannot change that channel's SNR. What
+it changes is the **magnitude of the quality term relative to everything else in
+the loss** — the cost channels, the entropy bonus, and the PPO ratio at which
+the negative-advantage branch stops being clipped (the §12.2 F3 mechanism).
+
+Measured directly from the `diag/estim_return_raw_quality` and
+`diag/value_raw_quality` series over each run's own pre-crossing window
+(ep10 → first `none<0.5`):
+
+| run | \|A_raw\| mean | per-unit coefficient | typical per-step \|quality term\| |
+|---|---|---|---|
+| v62 | 0.0109 | λ/σ_q = 62.9 | **0.682** |
+| v63 | 0.0107 | λ/σ_q = 72.7 | **0.776** |
+| v64b | 0.0116 | λ/σ_q = 73.5 | **0.855** |
+| v65 | 0.0112 | λ = 10.2 | **0.114** |
+| v66a | 0.0098 | λ = 10.0 | **0.098** |
+| v66b | 0.0100 | λ = 16.0 | **0.160** |
+| v66c | 0.0098 | λ = 13.0 | **0.127** |
+
+A clean 5–8× separation, with no overlap, and it matches group membership
+exactly. (v61 sits at 0.169 with λ=1.53 and is still group B — it is the
+λ-too-low case §12.3 already diagnosed: at λ=1 destruction was *priced* to pay,
+and v61 went straight to 100 % SKIP by ep35. It fails for a different, already
+closed reason.)
+
+The corresponding critic-error claim in F3 needs a units correction. The raw
+per-head MSE `value_loss/quality` reads 0.0035 on v66a and 0.451 on v65
+pre-crossing — 128×. But v65's quality head lives in PopArt-normalised space,
+so its MSE carries a 1/σ_q² = 1/0.128² = 61× unit factor. Converting:
+
+```
+v65  0.4506 × σ_q²(0.01648) = 0.00743  (raw units)
+v66a 0.00352                = 0.00352  (raw units)
+                       ratio = 2.11×
+```
+
+Over the full ep10–190 window the ratio is 1.7×. **The genuine improvement in
+critic accuracy on the quality channel is ~2×, not 150×** — the headline
+figure is ~61× unit conversion times ~2× real. §12.9.4's diagnosis survives in
+direction but its magnitude was overstated by the units.
+
+#### 14.2.6 Q1 answer
+
+> Group C avoids graph destruction because its quality-channel advantage is
+> computed on the raw, un-normalised scale, which shrinks the per-step quality
+> term 5–8× (0.68–0.86 → 0.098–0.160). That slows the anti-`OP_NONE` drift
+> enough (crossing 64–71 → 81–112) that the batch never reaches the
+> zero-variance saturated state (`mean_violation` 0.7500, sd 0.0000) in which
+> the quality penalty on `SKIP` vanishes identically. While a live violation
+> spread survives, `SKIP` keeps paying 10–16 × its own deterministic damage,
+> and the head keeps its logit actively suppressed (0.41–0.81× of pure
+> renormalisation). Group B saturated, `SKIP` became free, and the quality
+> gate's mis-measured floor then *paid* +0.72 σ of latency advantage for taking
+> it — which is why the group-B absorber is not merely gradient-free but a
+> genuine local optimum, stable for up to 420 episodes.
+
+Not the discriminator: symlog, `--advantage-norm none`, frozen λ, the causal
+mask, the winsorize (each present in group C members and absent in others, or
+present in group B members). The entropy floor at 0.05 is common to all four
+group-C arms and to v64b, so it is necessary-looking but demonstrably not
+sufficient.
+
+---
+
+### 14.3 Q2 — what degrades quality in group C, with an intact graph and a quiet critic
+
+#### 14.3.1 It is cheap-but-numerous, by two orders of magnitude
+
+`approx_applied/total` is per 16-env batch; divide by 16 for per plan.
+
+| run | window | applied/batch | **per plan** | quant : diag : compress (op prob) | quality |
+|---|---|---|---|---|---|
+| all | ep3–10 | 42–44 | **2.6–2.8** | — | +0.80…+0.84 |
+| v65 | trailing 20 | 782 | **49** | 0.102 : 0.278 : 0.165 (none 0.452) | +0.594 |
+| v66b | trailing 20 | 2475 | **155** | 0.389 : 0.387 : 0.224 | +0.233 |
+| v66c | trailing 20 | 2826 | **177** | 0.339 : 0.337 : **0.323** | −0.105 |
+| v66a | trailing 20 | 2895 | **181** | 0.389 : 0.387 : 0.224 | −0.021 |
+| v63 | trailing 20 | 132 | 8 (graph gone) | 0.287 : 0.281 : 0.167 (skip 0.264) | −0.001 |
+
+The graph carries ~115 live faces per plan (FACE_LATENT §1). At 155–181
+applied ops per plan, essentially every face is approximated in every slot that
+will take one — `approx_applied/fraction` is 0.60–0.65 against 0.78 at ep3–10
+when there were 2.7 ops per plan. This is not a handful of catastrophic
+choices; it is saturation coverage of cheap individually-survivable
+approximations whose composition destroys the gradient.
+
+Within-arm, over each arm's own drift window, more approximations is
+monotonically worse quality:
+
+```
+corr(mean_quality, approx_applied/total)   v66c −0.738  v66b −0.612  v66a −0.415  v65 −0.231
+```
+
+#### 14.3.2 No arm is winning the cost channel — the density is bad for latency too
+
+`corr(approx_applied/total, mean_latency_ns)` over the same windows is
+**+0.86 (v66c), +0.48 (v66b), +0.51 (v65), +0.32 (v66a)** — every additional
+approximation makes the plan *slower*. Bucketing every episode of the live arms
+by approximation count and normalising latency to that run's ep3–10 mean:
+
+| arm | 20–60 ops | 200–1 000 ops | >1 000 ops |
+|---|---|---|---|
+| v66a | 1.005 × (q 0.79) | 1.022 × (q 0.64) | **1.356 ×** (q −0.04) |
+| v66b | 0.998 × (q 0.79) | 1.035 × (q 0.69) | **1.106 ×** (q 0.17) |
+| v66c | 1.000 × (q 0.79) | 1.006 × (q 0.69) | **1.385 ×** (q 0.12) |
+| v65 | 1.005 × (q 0.79) | 1.107 × (q 0.54) | — |
+
+There is no bucket, in any live arm, where approximation is cheaper than the
+exact plan. **Group C loses on both axes simultaneously; it is not a trade.**
+Trailing-20 latency is 179.1 / 179.6 / 300.5 / 171.3 µs against a 155–160 µs
+identity — 15 % to 92 % *worse*.
+
+Group B's trailing 133–136 µs is not a counter-example: §14.1 shows it is the
+quality gate's own floor value, printed by the clamp itself.
+
+v66c's 300 µs deserves naming, because it is a clean within-arm demonstration.
+Between ep152 and ep194 its compress probability goes 0.055 → 0.324 and its
+applied-compress count 134 → 912, while diag applications collapse 40 → 26:
+
+```
+ep152  lat 171.5us  q +0.486  comp_p 0.069  applied_compress  134
+ep164  lat 276.7us  q -0.027  comp_p 0.203  applied_compress  688
+ep188  lat 302.0us  q -0.150  comp_p 0.324  applied_compress  881
+ep194  lat 294.8us  q -0.149  comp_p 0.324  applied_compress  912
+```
+
+Compress is the expensive op on this graph, and v66c walked into it and lost
+0.6 of quality and 72 % of latency in 40 episodes. Note that v66c had, at
+ep140–152, a genuinely respectable state (q +0.37…+0.49 at 171 µs) and left it.
+
+#### 14.3.3 Q2 answer
+
+> Group C degrades because it converges on **saturation-density approximation**
+> — 155–181 ops per plan against 2.7 at initialisation — in a regime where each
+> additional op subtracts quality *and* adds latency. The op mix is
+> near-identical between v66a and v66b (quant 0.389 / diag 0.387 / compress
+> 0.224); what differs is the *count*, which λ controls: λ=16 realises 155
+> ops/plan and q +0.233, λ=10 realises 181 ops/plan and q −0.021. v66c is the
+> outlier in *mix*, not count, and its compress share is what carries its 300 µs.
+> No arm beats the identity plan on latency at any approximation density, so
+> nothing here is a quality-for-speed trade: it is a loss on both axes. The
+> critic being 2× (not 150×) more accurate did not help, because the thing the
+> head cannot do is tell *which* of 115 faces is safe to approximate — the §4
+> representation deficit (probe R² 0.03–0.18 against a 0.48–0.67 bar), which
+> none of v61–v66 touched.
+
+**And the win it is failing to find is real and was on the table from episode
+zero.** v58b is the only 16-env run that logged per-plan order statistics
+(because C8 dropped `--lean-logging` from that one launcher). At its **ep0**,
+with ~20 stray approximations across all 16 plans and `measure/quality/worst_ep`
+= 0.884 (i.e. *every* plan at identity quality), `measure/latency_ns/best_ep`
+= **91.2 µs** against a median of 157.5 µs. The all-time best reaches 76.2 µs
+by ep~50. v57 corroborates without any min-order-statistic bias — it ran
+`--num-envs 1`, so each episode is one plan measured once, and 14 of its 162
+episodes have `q ≥ 0.5` **and** latency < 0.9 × base:
+
+```
+ep 41   101 µs   q 0.885   1 approximation
+ep117    96 µs   q 0.882  14 approximations
+ep155   108 µs   q 0.885  23 approximations
+ep162   123 µs   q 0.885  63 approximations
+```
+
+Against a v57 latency distribution of mean 155.9, sd 15.3 µs, so 96 µs is 4 σ
+below and 101 µs is 3.6 σ below; two such points in 162 episodes is not the
+measurement noise. **Every other run in the campaign has zero such episodes.**
+(v61 has one, at 520 applied ops, and is not the same phenomenon.)
+
+So a ~35–40 % latency win at *no measurable quality cost* exists on this target
+and is reachable with **1–15 approximations per plan** — and both instruments
+that could see it found it by random exploration inside the first fifty
+episodes. Every learner in the campaign then walked away from it, in the
+direction of 155–2 900 approximations per batch, where both axes are worse.
+
+Caveats stated honestly: the v58b number is a min over 16 plans and is
+downward-biased by measurement noise (a 10 % sd gives ≈ −18 % for a min of 16;
+the observed gap is −42 %, so selection accounts for at most half of it); the
+v57 numbers are unpaired single measurements on a machine whose state moves
+~18–20 % (project memory, paired-measurement rule), which is why the 4 σ
+framing and the two independent instruments matter more than any single point.
+
+---
+
+### 14.4 Q3 — is the monotone delay a mechanism improvement or just weaker forcing?
+
+The crossings are 38 (v58b), 64 (v61, v62, v63), 71 (v60, v64b), 81/82/83
+(v66c/b/a), 112 (v65). Normalising against the actual per-step pressure toward
+approximation, measured in each run's own pre-crossing window:
+
+| step | what changed | dense pro-approximation force | quality restraint (§14.2.5) | crossing | bought |
+|---|---|---|---|---|---|
+| v62 → v63 | face entropy bonus 0.05 → **0.005** (10× cut) | floor penalty 0.404 → 0.604 (both hinge hard) | 0.682 → 0.776 | 64 → 64 | **0 episodes** |
+| v63 → v64b | floor 0.3 → **0.05** (+ mask + winsorize) | penalty 0.604 → **0.0002** (hinge goes inert) | 0.776 → 0.855 | 64 → 71 | **7 episodes** |
+| v64b → v66a/b/c | static objective (5 simultaneous changes, C6) | penalty 0.0001 (unchanged, inert) | 0.855 → 0.098–0.160 | 71 → 81–83 | **10–12 episodes** |
+| v64b → v65 | `--lag-raw-viol-adv` **only** | penalty 0.0001 (unchanged, inert) | 0.855 → 0.114 | 71 → 112 | **41 episodes** |
+
+Read this in two halves, because they answer differently.
+
+**The first half is weaker forcing, and that is all it is.** The 0.3 entropy
+floor fired continuously at penalty 0.40–0.60 from ep0 in v62/v63 (§12.2 F1,
+§13.4); dropping it to 0.05 makes the hinge bitwise inert (penalty 2e-4) and
+bought 7 episodes. Cutting the face entropy bonus 10× bought nothing at all.
+So the igniter fix delayed the crossing by ~11 % and changed nothing else —
+v64b absorbed exactly like v63, 10 episodes later. **We bought time, not
+immunity, from ALT-3.** Say it plainly: the entropy-floor fix is worth 7
+episodes out of 500.
+
+**The second half is not weaker forcing.** From v64b onward the dense
+pro-approximation force is *bitwise identical* across v64b, v65, v66a, v66b,
+v66c — same `--face-entropy-weight 0.005`, same inert floor, same
+`FACE_NONE_BIAS=6`, same clamp. The restraint got **weaker**, not stronger: the
+static arms' realised quality:cost pull is 0.75:1 to 1.20:1 against v64b's 10:1
+(§12.10.4, an 8–13× reduction), and v65's raw-advantage path cut the quality
+term 7.5×. Under any pricing account, weaker restraint at constant forcing must
+cross *earlier*. It crossed **10 to 41 episodes later**, and one of the four
+arms stopped destroying the graph altogether.
+
+> **Q3 answer.** The delay is mechanism up to v62→v63→v64b only in the trivial
+> sense that the igniter was real and its fix was worth 7 episodes. From v64b
+> onward the forcing is constant and the restraint is weaker, so the additional
+> 10–41 episodes cannot be "we forced it less" — they are the removal of a term
+> that was destabilising the policy rather than steering it. That is a genuine
+> mechanism change, and it is corroborated by the qualitative outcome (no graph
+> destruction) rather than only by the timing.
+
+The honest limit: v65 is 91 episodes past its crossing and v66a/b/c are 116
+past theirs, against group B's 6–22 episodes from crossing to skip onset. That
+is 5–19× the group-B horizon, which is evidence, not proof. §14.2.3 gives the
+concrete thing that would end it: if any live arm's `mean_violation` spread
+falls below ~0.02 across episodes, the `SKIP` penalty vanishes and the +0.72 σ /
++0.14 floor bonus takes over. v66a is the closest (mean 0.735, sd 0.098).
+
+---
+
+### 14.5 Q4 — re-reading the mult era in the light of C2
+
+C2 records that for the whole mult block (v57–v60) the training head weights
+were `latency=+0, mem=+0, quality=+1` while the display line said `+1,+1,+1`,
+and C4 that PopArt consequently left both cost channels cold
+(`mu=0 sigma=0 norm_var=0`). C1 records that v57 additionally ran 1 minibatch
+instead of 4.
+
+What this does **not** mean is that cost was invisible: `_apply_mult_gate`
+folds cost into the *scalar on the quality head* through
+`cheapness = max(0, gate_w − weighted_cost)`. What it means is that cost had
+**no value head of its own, hence no credit assignment**, and entered only as a
+multiplicative modifier of the quality term. With the run's constants (§1:
+weighted symlog cost ≈ 29.8, W = 40 → cheapness ≈ 10.2), a 40 % latency win
+moves symlog(lat) by ln(1.6) = 0.47, i.e. cheapness 10.2 → 10.67, reward
+7.9 → 8.2: **+4 %**. Losing quality below 0.5 costs **100 %**.
+
+| §12/§0 conclusion | status after C2 | why |
+|---|---|---|
+| **"g(q) = 0 flat basin"** (§2, H1 CONFIRMED) | **SURVIVES as a description, DEMOTED as the binding constraint** | The surface analysis in §1 already priced cost inside the gate, so C2 does not invalidate the arithmetic; it sharpens it — with no cost value head, the only channel carrying credit was the one with the 0.45-wide flat. But §11's falsifier removed the flat band entirely (finite-difference slope = λ everywhere) and v61–v64b collapsed anyway, so the basin was a real feature of one reward mode, not the campaign's cause. |
+| **"destruction pays"** (§12.3 REFUTED at λ=10) | **REFUTED as a reward-design claim, CONFIRMED as an instrument bug** | §14.1: every q<0.05 plan is floored at 132–139 µs where honest plans are charged 155–160 µs. Destruction pays −13 %, in all twelve runs, because the floor is timed by a different protocol. The v66 arms then *falsify* the reward-design version from the other side: they price cost 8–13× more strongly relative to quality than v64b did and still never take the cheap destructive action, because their approximation-destroyed plans are *above* the floor. |
+| **"SKIP cliff"** (one SKIP DCEs the graph) | **SURVIVES structurally, RE-RANKED as the amplifier, not the initiator** | The DCE is real (pre-clamp readings of 53–103 µs against 156 µs). But §14.2.2 shows the skip rise is a *learned* 3–82× move above renormalisation that happens only *after* `none` reaches ~0 and only when the violation channel has saturated. It converts a policy drift into an irreversible absorber — by deleting the decisions themselves, so that no gradient can exist afterwards — rather than starting anything. |
+| **PopArt as the ratchet** (§3) | **SURVIVES for the mult block only** | §3's μ 4.63 → −0.95 inversion is a mult-mode measurement. In the lagrangian block σ_q *shrank* monotonically and the price *rose* (§12.9.3), and the four raw-scale arms show that removing the normaliser from the quality channel helps for a reason unrelated to any ratchet. |
+| **v57 "held 0.885, no learning"** (§0) | **RE-READ: v57 is the campaign's only positive result** | v57 is the run with 1 env, 1 minibatch (C1) and zero cost head weight (C2) — i.e. the least-optimised configuration in the campaign — and it is the only run that ever produced plans at 96–108 µs with q ≈ 0.88 (§14.3.3). It did not learn; it *sampled* the win, repeatedly, and had no machinery that could reward it. |
+
+---
+
+### 14.6 Q5 — one account for both groups, and the dead list
+
+#### 14.6.1 The account
+
+1. **The head cannot see what it is approximating** (§4, unchanged, untouched
+   by every intervention v61–v66: face-probe R² 0.03–0.18 against a 0.48–0.67
+   bar; `face_sizes` still never passed). Per-face credit is therefore
+   unlearnable, and the only expressible policies are approximately global:
+   "approximate more" / "approximate less".
+2. **`OP_NONE` is a single shared bias per slot** (§12.2), so "approximate
+   less" is one parameter, and every force in the loss lands on it together.
+3. **A dense, coherent force pushes that parameter one way.** In v62/v63 it was
+   the mis-targeted 0.3 entropy floor firing at penalty 0.40–0.60 from ep0
+   (ALT-3, worth 7 episodes when fixed). From v64b onward the floor is inert and
+   what remains is the 0.005 face entropy bonus, which reaches every face slot
+   of every step and always points the same way — plus, per §12.2 F3, PPO's
+   unclipped negative-advantage branch, which pushes every sampled action of a
+   violating plan down and hence pushes the *unsampled* alternatives up. `none`
+   is the most-sampled action at init, so it loses first, mechanically.
+4. **The force that should oppose it is sparse and, when amplified, acts as
+   noise.** The quality term reaches only the masked ~11–16 % of steps and, on
+   most of those, carries the critic's error rather than a true violation
+   signal. Multiplying that by λ/σ_q ≈ 63–74 (group B) makes the per-step
+   quality term 0.68–0.86 — large, sign-varying, and landing on a shared
+   parameter. On the raw scale it is 0.098–0.160 and the deterministic
+   signals inside it (above all `SKIP` → certain violation) survive.
+5. **Both groups therefore cross.** Every run in the campaign that ran past
+   ep112 lost `approx_prob/none` — 10 out of 10. The crossing is universal and
+   objective-independent; only its date moves (38 → 112).
+6. **After crossing, the outcome is decided by whether the violation channel
+   saturates.** Group B's 5–8× larger quality term drives every plan to
+   `q = 0.000` within ~20 episodes, `mean_violation` pins at its 0.75 cap with
+   *zero* variance, and the quality penalty on `SKIP` becomes identically zero.
+   Group C's smaller term leaves a spread of 0.07–0.13 and `SKIP` stays priced.
+7. **Once `SKIP` is free, the quality gate pays for it.** §14.1: the floor is
+   under-measured by 13 %, so a DCE'd plan collects +0.72 σ of latency
+   advantage. Group B's absorber is a genuine local optimum, which is why it
+   survives 420 episodes and why nothing in the reward can dislodge it.
+8. **Once `SKIP` has run, there is nothing left to learn from.**
+   `faces/mean_valid` falls to 0.011–0.147 — the decisions the head acts on no
+   longer exist, so both the contrast and the entropy metric go to zero
+   (§13: the entropy fall is 91 % population, not policy).
+9. **Group C's own absorber is different and cheaper to escape, but it is still
+   an absorber**: saturation-density approximation, 155–181 ops/plan, where
+   quality is ≈0 and latency is 15–92 % *worse* than exact. v66a's `kl/approx`
+   has fallen to 0.001–0.02 — its policy has effectively stopped moving.
+10. **The region that actually wins was sampled at ep0 and never revisited**
+    (§14.3.3: 1–15 ops/plan, 96–108 µs, q 0.88). Nothing in any of the twelve
+    configurations creates gradient pressure back toward low density once
+    `none`'s shared logit has been driven to its clamp.
+
+#### 14.6.2 DEAD
+
+| explanation | status | killed by |
+|---|---|---|
+| **Entropy bonus as the driver** (H5 strong form) | **DEAD** since §6; re-killed here | `--face-entropy-weight 0.005` is bitwise identical in v63/v64b (destroyed) and v66a/b/c (intact); the 10× cut v62→v63 bought 0 episodes |
+| **Entropy floor as *the* igniter** (ALT-3 general form) | **DEAD as general; SURVIVES for v62/v63 only** | v64b/v65/v66 run the floor at 0.05 with penalty 1–2e-4 (bitwise inert) and cross anyway, at ep71–112 |
+| **PopArt neutralisation / the penalty got cheap** (H-ZNEUT) | **DEAD** (§12.9.3) and now dead from the other side too | σ_q *shrank*, price *rose* 16 %; and the arms with an 8–13× **weaker** realised quality price did **better** |
+| **Reward shape / the flat basin as the binding constraint** | **DEAD** | §11's falsifier removed the flat band (slope = λ everywhere); v61–v64b collapsed regardless |
+| **Cost bribe / "destruction pays" as a reward-design property** | **DEAD** | §12.3 at λ=10; and group C prices cost 8–13× more strongly than v64b yet never takes the cheap destructive action |
+| **The causal mask as load-bearing for survival** (registered prediction iii) | **DEAD as a discriminator** | v64b has the mask and is group B; v66c lacks it and is group C |
+| **Critic noise as a *sufficient* explanation** (§12.9.4) | **DOWNGRADED** | Direction confirmed (removing the amplification changes group membership) but v66a/b/c hold their graph with a critic only ~2× better in raw units, and they still lose all their quality |
+| **The 150× critic-quality improvement** (F3 as stated) | **CORRECTED to ~2×** | 61× of it is the σ_q² unit conversion between normalised and raw value-head spaces |
+| **"The policy collapsed to determinism"** | **DEAD** (§13) | 91 % of the entropy fall is the disappearance of the decisions being measured |
+| **PPO-specific pathologies as the root cause** | **DEAD** (§7) | GAZ, no entropy bonus, search-based, collapses faster per measurement |
+| **Winsorize / λ dual-ascent / symlog / `--advantage-norm none` individually** | **DEAD as discriminators** | each is present in some group-C arm and absent from another (§14.2.4) |
+
+#### 14.6.3 What remains unexplained
+
+1. **Why `none` falls in *every* configuration.** 10 of 10 runs that reached
+   ep112 crossed, across two reward modes, three normalisers, four λ values,
+   two entropy-floor settings and with/without the causal mask. Four candidate
+   residual drivers remain unseparated: the 0.005 entropy bonus; PPO's
+   negative-advantage epoch asymmetry on a shared bias; the fact that the face
+   head is the only action head `_scale_output_heads` never touches (§13.1(ii),
+   so it starts with full-magnitude orthogonal-init logits); and the terminal-
+   only reward with (γλ)^95 = 0.0079 credit at step 0. None of the twelve runs
+   varies any of these.
+2. **Why group C loses quality at all** given an intact graph, live contrast,
+   an inert floor and a 2×-better critic. The inference is §4's representation
+   deficit (the head cannot rank 115 faces by safety, so it converges to
+   "approximate all of them"), but nothing in this record *demonstrates* it —
+   the decisive test is the online face probe against the 0.48–0.67 bar with
+   the per-face latent wired through, which has never been run in a GPU
+   campaign arm.
+3. **Whether v65 and v66a/b/c eventually slide.** They are 91 and 116 episodes
+   past their crossings against a group-B horizon of 6–22. Evidence, not proof.
+4. **The size of the real Pareto set.** We have two instruments showing
+   96–108 µs at q ≈ 0.88 and one showing 76–91 µs as a min-order-statistic. We
+   have never measured one of those plans a second time, paired against its own
+   exact reference, on the same GPU state — which is exactly what the project's
+   paired-measurement rule exists for. Until that is done the size of the prize
+   is bracketed, not known.
+
+---
+
+### 14.7 Q6 — the radical-simplification design, element by element
+
+Predictions are stated against this analysis only; each names the evidence.
+
+| element | prediction | why |
+|---|---|---|
+| **Additive `λ_lat·symlog(lat) + λ_mem·symlog(mem) + λ_q·q`** | **HELPS** (stationarity) but the λ_q values are the whole ballgame | It keeps the one property that separates group C — a quality advantage on the raw scale — and drops the moving frame. But see the next row: the proposed λ_q sweep lands entirely inside the band that has already failed. |
+| **λ_q sweep {1, 4, 16}** | **1 and 4 are predicted to fail outright; 16 reproduces v66b** | §12.10.4's arithmetic, redone for raw q: realised quality:cost pull = λ_q·σ_q/σ_cost with σ_q ≈ 0.159 and σ_lat ≈ 2.12 (symlog). λ_q=1 → **0.075 : 1**; λ_q=4 → 0.30 : 1; λ_q=16 → **1.20 : 1** — which is exactly v66b, the arm that ended at q +0.233 with 155 ops/plan and latency 12 % worse than exact. Matching v64b's realised 10:1 needs **λ_q ≈ 134**. If the sweep is to be informative it must be {16, 130, 400}, or `--lambda-cmp/--lambda-mem` must come down ~13×. This is the single most consequential number in the design. |
+| **γ = 1, GAE λ = 1** | **HELPS** | It removes the (γλ)^95 = 0.0079 attenuation that gives step 0 0.8 % of the terminal advantage (§6, and the v55-era "PPO never left uniform" result). It is the only proposed element that attacks a documented, quantified defect. Cost: credit becomes perfectly plan-global, so per-face resolution comes *only* from the representation — which raises the stakes on the face-latent row below. |
+| **No PopArt** | **HELPS** | This is the group-C property, established at 12/12 separation and by the v64b→v65 single-flag same-seed contrast (§14.2.4). Highest-confidence element in the design. |
+| **No entropy terms at all** | **HELPS on the crossing, HARMFUL on exploration, net unknown** | Removes the dense coherent anti-`none` force (§14.6.1 step 3) — the one that v62/v63 proved can drive the whole slide by itself. But combined with random init (below) there is then *nothing* maintaining coverage, and the only reason any run ever sampled the 1–15-op win was stochasticity at low density. |
+| **No gate** | **HARMFUL at λ_q ≤ 4; SAFE at λ_q ≥ 16 — and it removes a real bug** | Removing the gate deletes the mis-measured floor (good: kills the −13 % destruction bonus, §14.1) but also uncaps the full `SKIP` prize: pre-clamp readings are 53–103 µs against 156 µs, i.e. symlog(157/70) ≈ **+0.81** for one action. Against `λ_q · Δq ≈ λ_q · 0.885`, `SKIP` wins outright at λ_q = 1 (0.81 vs 0.89 per unit, and cheaper still at 53 µs), is marginal at λ_q = 4, and is priced out at λ_q = 16. **Do not run λ_q ∈ {1, 4} without the gate.** If the gate is kept instead, fix its measurement protocol first. |
+| **No `OP_NONE` bias, standard init** | **HARMFUL, and it is the element most likely to make the run uninterpretable** | `CLEAN_DESIGN_AUDIT` §4(i): at bias 0 the head emits ~372 approximation ops per plan and P(any of 16 plans is exact) ≈ 10⁻²¹³. That is *twice the density of the state group C converged to after 200 episodes*, and §14.3.2 shows that region is worse than exact on both axes with q ≈ 0. Episode 0 therefore starts inside the terminal absorber, with the batch-quality contrast that PG needs already at ~0. The 40 %-win region (1–15 ops/plan) is ~370 decisions away and will not be sampled. |
+| **Standard init on the face head** | **HELPS (independently)** | §13.1(ii): the face head is the only action head `_scale_output_heads` never touches, so it starts with full-magnitude orthogonal logits — decisive per face while near-uniform in the marginal. Giving it the ×0.1 the other heads get is a genuine fix, and it is *separable* from removing the +6 bias. Do that one; think twice about the bias. |
+| **Quant PULLUP (vs the campaign's `GRAPHAX_QUANT_PULLDOWN=1`)** | **CONFOUNDED — do not change it in the same run as the objective** | Quant is 34–40 % of the op mass and 2 258 of v66a's 2 895 applied ops. PULLUP changes the quality-per-op *and* the latency-per-op of the dominant action, so it changes the target function, not the learner. Any result would be unattributable. Run it as its own A/B on a fixed policy. |
+| **Order pinned to reverse** | **NEUTRAL for this question** | It is the campaign's constant, keeps the 156 µs identity reference clean, and keeps the `ve` head's entropy and gradient at exactly 0 (§13.2(e)). It also means approximation is the *only* lever, whose entire measured range on TLM is −40 % … +92 %. |
+| **Face head reads palimpsa's per-face latent instead of the pooled chunk mean** | **HELPS, and is the only element addressing the unexplained item (2)** | §4 + FACE_LATENT §9 (addressing confirmed; width does not substitute) + `CLEAN_DESIGN_AUDIT` §4(ii) (chunk-mean size-R² negative on CV at every width). Necessary for any *positive* result; §10(2) records that it is not by itself an anti-collapse fix. |
+| **One full TLM run + NN256 for the sweep** | **NN256 is CONFOUNDED for the cost channels** | Project memory, measurement-resolution limit: at nn256/batch16 the memory channel has no signal and the latency floor is ~10 %, so only quant is measurable. A λ_q sweep there measures the quality channel alone and cannot tell you whether the trade exists. Sweep λ_q on TLM if the sweep is about the trade. |
+
+#### The one measurement that would most cheaply falsify the whole design
+
+**Drop `--lean-logging`, and at ep30 read the per-plan joint of (approximation
+count, quality, latency): is there any plan, in any episode so far, with
+≤ 20 approximations, `q ≥ 0.8`, and latency ≤ 0.9 × the exact-rev cost measured
+by the same protocol?**
+
+Why this one, and not a loss or entropy curve:
+
+* It is the *only* region in twelve runs that has ever contained a win (§14.3.3:
+  v57 ep41/117/155 at 96–108 µs and q 0.88 with 1–23 ops; v58b ep0
+  `best_ep` 91.2 µs at `worst_ep` quality 0.884). Everything the campaign
+  learned to do lives 10–100× further out in density and is worse on both axes.
+* Under the proposed random init, `CLEAN_DESIGN_AUDIT` §4(i) predicts that
+  region has probability ≈ 10⁻²¹³ of being sampled. So the measurement is a
+  direct test of the design's most dangerous element, and it resolves in 30
+  episodes rather than 250.
+* If the answer is "no plan, ever", then the reward can be perfect and the
+  critic silent and it will still have nothing to select — and the fix is the
+  init and the representation, not the objective. If the answer is "yes, and
+  the advantage ordering puts it above the batch mean", the objective is doing
+  its job and the run is worth its 36 hours.
+* It costs one launcher flag and one wandb panel. v58b already proved the keys
+  exist (`measure/{quality,latency_ns}/{best,median,worst}_ep`); C8 records that
+  they were lost for the other eleven runs by an accidental flag flip.
+
+Second-cheapest, as a companion on the same panel: the **across-plan spread of
+the quality channel within the batch** at ep ≤ 30. If it is ~0 (every plan
+equally destroyed), no policy gradient exists at all, and §14.2.3 shows that is
+precisely the state from which `SKIP` becomes free.
