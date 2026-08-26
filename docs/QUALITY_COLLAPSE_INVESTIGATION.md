@@ -1042,31 +1042,74 @@ under `--advantage-norm none`: it keeps the random-plan warm-up census and
 the `scalarized_return` frame on the same footing as arm D, at a cost of
 3 episodes out of 250.
 
-#### 12.10.4 What the static arms actually price (read this before reading the results)
+#### 12.10.4 What the static arms actually price — CORRECTED against the launched runs' own census
 
-The arms' *nominal* weights are quality λ ∈ {10, 13, 16} against
-`--lambda-cmp 1 --lambda-mem 1`. The *realized* pull of a channel on the
-policy is that weight times the channel's own advantage spread, and the two
-differ because the static objective no longer divides each channel by its σ.
-Estimating both from v64b's own history (ep32: σ_lat 2.88e4, σ_mem 9.80e6,
-σ_q 0.141, µ_lat −1.02e5, µ_mem −3.56e7):
+**This subsection was rewritten within the hour after launch.** Its first
+version estimated the static arms' realized quality:cost pull at 5.0–8.1×
+against v64b's 10×, by taking the symlog'd cost channel's advantage scale to
+be the *relative* spread σ_lat/|µ_lat| ≈ 0.28. That was wrong: symlog
+preserves a channel's relative spread but not its absolute footing, and the
+advantage under `--advantage-norm none` carries the absolute scale. The four
+launched jobs each print a `[popart-init]` census of their own MC returns at
+ep0, which measures the quantity directly.
 
-| | v64b (PopArt) | static arms |
+Measured at ep0 (v66a/b/c identical to 3 significant figures; v65 = the
+PopArt/no-symlog control):
+
+| channel | v66a/b/c µ | v66a/b/c σ | v65 µ | v65 σ | rel. spread (static / v65) |
+|---|---|---|---|---|---|
+| latency | −7.743 | **2.119** (symlog) | −102883 | 28944 (raw) | 0.274 / 0.281 |
+| mem | −11.545 | **3.158** (symlog) | −3.588e7 | 9.817e6 (raw) | 0.2735 / 0.2736 |
+| quality | −0.04156 | **0.15852** (raw) | −0.04156 | 0.15852 (raw) | — |
+
+Two things are confirmed and one is falsified.
+
+**Confirmed — the exemption works exactly as specified.** The quality channel
+reads µ = −0.0415611, σ = 0.15852 on *all four arms*, bitwise: the static
+arms' violation channel is in precisely the same raw space as the PopArt
+control's, while their cost channels sit at symlog scale (−7.7, −11.5) where
+v65's sit at raw scale (−1.0e5, −3.6e7). **Confirmed — symlog preserved the
+relative spread**: σ/|µ| is 0.274 vs 0.281 for latency and 0.2735 vs 0.2736
+for memory, i.e. the same underlying plan-to-plan variability, re-expressed.
+
+**Falsified — the pricing.** Under PopArt every channel is divided by its own
+σ, so v64b's realized quality:cost pull was λ : 1 = **10 : 1** on both cost
+channels. Under `--advantage-norm none` the channels keep their absolute
+scales, so the realized pull is λ·σ_q/σ_cost:
+
+| λ | quality : latency | quality : mem |
 |---|---|---|
-| cost channel advantage scale | ÷σ ⇒ O(1) | symlog ⇒ σ_lat/\|µ_lat\| ≈ **0.28** |
-| quality channel advantage scale | ÷σ_q ⇒ O(1) | raw ⇒ σ_q ≈ **0.141** |
-| realized quality : cost pull | λ ≈ **10×** | λ·0.141/0.28 = **5.0×** (λ=10), **6.5×** (13), **8.1×** (16) |
+| 10 (v66a) | **0.75 : 1** | **0.50 : 1** |
+| 13 (v66c) | 0.97 : 1 | 0.65 : 1 |
+| 16 (v66b) | 1.20 : 1 | 0.80 : 1 |
+| v64b / v65 (PopArt) | 10 : 1 | 10 : 1 |
 
-So the battery does not merely repeat v64b's price — it **brackets** it from
-below: v66b (λ=16, ≈8×) sits closest to v64b's realized ≈10×, v66a (λ=10,
-≈5×) is deliberately at half of it, v66c (λ=13) in between. This is a
-registered caveat, not a defect: if all three static arms slide, "quality was
-priced lower than v64b in realized terms" is a live alternative to the
-critic-noise reading and the *right* follow-up is λ ≈ 20 rather than
-abandoning the static objective. Prediction (ii) below is the test that
-separates them. (Both scales are first-order estimates from v64b's policy;
-the arms log `value_loss/*` and the raw channel spreads so the realized
-numbers can be recomputed in place.)
+So the launched static arms price quality **8–13× more weakly relative to
+cost than v64b did**, not 1.2–2× more weakly as first estimated. The nominal
+"quality 10–16× the cost weights" is true of the CLI numbers and false of the
+objective: symlog compresses the cost channels' dynamic range but leaves them
+~50–70× above the bounded violation channel in absolute magnitude, and λ ≤ 16
+does not close that gap. Matching v64b's realized 10 : 1 would need
+**λ ≈ 134** (against latency) or **λ ≈ 199** (against memory) — equivalently,
+`--lambda-cmp`/`--lambda-mem` ≈ 0.05–0.08 at λ = 10.
+
+**Consequence for the battery, and the early read.** The arms as launched
+confound the objective's *stationarity* (what the battery is meant to test)
+with a large drop in the quality *price* (what it is not). If the static arms
+slide, mispricing is the leading explanation and the critic-noise hypothesis
+is NOT thereby falsified. This is cheap to detect early, so the arms were left
+running rather than killed: **if `lagrangian/frac_violating` climbs and
+`mean_raw_q` falls below τ = 0.75 within roughly the first 20 episodes on
+v66a/b/c while v65 stays near its ep0 level, the mispricing dominates** — kill
+the three static arms and relaunch at λ ∈ {130, 170, 210} (or equivalently
+scale the cost weights down by ~13×). If instead the static arms hold `none`
+and quality through the ep60–90 window where v64b's H_face crossed its floor,
+they are holding at a *weaker* quality price than the arm that collapsed,
+which is a strictly stronger result for the static objective than the battery
+was designed to produce.
+
+Predictions (i)–(iv) below were registered before this correction; they stand
+as written, read through this caveat.
 
 #### 12.10.5 Registered predictions
 
