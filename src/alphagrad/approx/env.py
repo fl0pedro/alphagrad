@@ -1906,14 +1906,271 @@ def _align_jac(jac_approx, jac_exact):
 
 
 _COST_REF: dict = {}
-_QUALITY_GATE_STATS = {"clamps": 0}
+# ``clamps``       total gate firings this process
+# ``unclamped``    bounded ring of the campaign latencies (ns) of terminal
+#                  plans the gate did NOT clamp -- the denominator of the
+#                  floor/plan ratio telemetry below.
+# ``instrument``   the campaign instrument parameters the last floor was
+#                  measured with, logged so a future re-fork is visible.
+_QUALITY_GATE_STATS: dict = {"clamps": 0, "unclamped": [], "instrument": None}
+# (order, arg-shape, device)-keyed floor cache: `exact_cache_key` already
+# digests exactly that, so a repeat offender order is measured ONCE.
+_ORDER_FLOOR_CACHE: dict = {}
+_ORDER_FLOOR_CACHE_MAX = 256
+# One legacy-vs-campaign audit print per process (see _gate_order_floor).
+_FLOOR_AUDIT_DONE: list = []
+
+
+def _time_one_rep(ex, eval_args, unique_devices, inner):
+    """ONE timing repetition of `ex` under THE campaign protocol.
+
+    Returns ``(latency_ns, peak_bytes, peak_src, last_output)``. The
+    output is handed back rather than dropped so the campaign loop can
+    keep scoring the very execution it timed (byte-identical to the
+    inline loop this replaced).
+
+    THIS IS THE SINGLE INSTRUMENT. Both the campaign measurement loop
+    (the number a plan is scored on) and the quality gate's exact-cost
+    floor (the number a destroyed plan is clamped to) call it, with the
+    same parameters, so the clamp compares like with like.
+
+    It did not use to. Until 2026-08-26 the floor was timed by
+    ``_measure_exec_cost`` -- median of 3 laps of 20 back-to-back
+    executions, after 4 untimed warmups -- while the plan was timed by
+    this loop at ``--latency-inner-reps 5`` with no warmup. Twenty
+    back-to-back executions amortise per-call dispatch far better than
+    five, so the floor read 13-15% BELOW what an honest exact plan was
+    charged in the same run (clamp prints: 133.6/137.5 us against
+    155-160 us campaign means). The gate exists to make destruction
+    cost-neutral; with two instruments it instead paid destruction a
+    guaranteed -13% latency bonus, in every run of the v57-v66
+    campaign. Do not re-fork this function.
+    """
+    if os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1":
+        return 0.0, 0.0, "bypassed", ex(*eval_args)
+    if os.environ.get("ALPHAGRAD_DIRECT_MEASURE", "0") == "1":
+        # Spec-native primitives, no jax_memory_monitor object at all
+        # (its per-call C++ trackers are the leak that killed v10):
+        # clear_memory_stats() resets the high-water mark, the inner
+        # loop is timed with perf_counter around a drained queue, and
+        # peak_bytes_in_use is read per device afterwards.
+        #
+        # ABOVE-BASELINE DELTA, not the absolute high-water mark.
+        # peak_bytes_in_use is a DEVICE-WIDE ABSOLUTE counter, and
+        # clear_memory_stats() resets the COUNTER but not the resident
+        # baseline -- so an absolute reading is (resident baseline +
+        # this call transient). CPU backends EXPOSE clear_memory_stats
+        # but raise UNIMPLEMENTED when called, so the peak falls back
+        # to the compiled executable's memory_analysis() static peak;
+        # latency stays the real perf_counter timing either way.
+        _have_stats = True
+        # Drain FIRST: clear_memory_stats() resets the high-water
+        # counter, but work still in flight from the previous rep lands
+        # after the reset and is charged to THIS rep. Barrier -> clear
+        # -> barrier makes the window tight.
+        jax.effects_barrier()
+        for _d in unique_devices:
+            try:
+                _d.clear_memory_stats()
+            except Exception as _cexc:
+                _have_stats = False
+                if not _MEM_FALLBACK_WARNED:
+                    _MEM_FALLBACK_WARNED.append(1)
+                    print(
+                        "[measure] WARNING peak_memory channel "
+                        "switched to the STATIC memory_analysis() "
+                        "estimate: clear_memory_stats() failed on "
+                        f"{_d}: {type(_cexc).__name__}: {_cexc}. "
+                        "This is a DIFFERENT quantity from the "
+                        "measured peak_bytes_in_use delta.",
+                        flush=True)
+                break
+        jax.effects_barrier()
+        _base = 0.0
+        if _have_stats:
+            for _d in unique_devices:
+                _bstats = _d.memory_stats() or {}
+                _base += float(_bstats.get("bytes_in_use", 0.0))
+        _t0 = time.perf_counter()
+        for _k in range(inner):
+            out = ex(*eval_args)
+        jax.block_until_ready(out)
+        _t1 = time.perf_counter()
+        if _have_stats:
+            _peak_abs = 0.0
+            for _d in unique_devices:
+                _stats = _d.memory_stats() or {}
+                _peak_abs += float(_stats.get("peak_bytes_in_use", 0.0))
+            _peak = max(0.0, _peak_abs - _base)
+        else:
+            # SUBSTITUTE IN PLACE -- one memory channel, so the static
+            # estimate lands in peak_memory rather than travelling as a
+            # second variable. Announced + counted.
+            _peak = _memory_analysis_bytes(ex) or 0.0
+            _note_static_peak_fallback(
+                "this backend does not expose allocator statistics")
+        return ((_t1 - _t0) / inner * 1e9, _peak,
+                "runtime_delta" if _have_stats else "static_fallback", out)
+    with _get_resource_monitor(unique_devices) as monitor:
+        # Accumulation loop (spec, default 50 when opted in): the
+        # executions queue back-to-back inside one monitor window and
+        # the exit barrier drains them all, so time/inner is a
+        # per-execution latency with dispatch + timer overhead
+        # amortized. Peak memory is unaffected (same executable, same
+        # buffers each pass).
+        for _k in range(inner):
+            out = ex(*eval_args)
+    # Key by name instead of unpacking ``.values()`` so this stays
+    # robust to dict-order / API tweaks in jax_memory_monitor.
+    _lat_s = float(monitor.stats.get("time", 0.0)) / inner
+    _peak_bytes = float(monitor.stats.get("memory", 0.0))
+    if _peak_bytes <= 0.0:
+        # ResourceMonitor's DEVICE peak is structurally 0 on a CPU
+        # backend, so without this the memory channel is a flat zero
+        # and --mem-type peak_memory trains on nothing. Same in-place
+        # substitution as the _direct branch above: one channel,
+        # announced and counted.
+        _peak_bytes = _memory_analysis_bytes(ex) or 0.0
+        _note_static_peak_fallback(
+            "ResourceMonitor reported a zero device peak "
+            "(structural on CPU backends)")
+        return _lat_s * 1e9, _peak_bytes, "static_fallback", out
+    return _lat_s * 1e9, _peak_bytes, "runtime_delta", out
+
+
+def _campaign_measure_cost(ex, eval_args_list, unique_devices,
+                           inner, warmup, n_reps):
+    """(latency_ns, peak_bytes) of `ex` under the FULL campaign
+    instrument: ``len(eval_args_list)`` data points x `n_reps` timing
+    repetitions of `inner` back-to-back executions each, `warmup`
+    untimed executions per point, reduced by ``_aggregate_samples``
+    (the same median the plan's own channels get).
+
+    Used for the quality gate's exact floor so the floor is, literally,
+    the number the campaign path would have printed for that plan.
+    """
+    _lat: list[float] = []
+    _peak: list[float] = []
+    for _eval_args in eval_args_list:
+        for _w in range(max(0, int(warmup))):
+            jax.block_until_ready(ex(*_eval_args))
+        for _r in range(max(1, int(n_reps))):
+            _l, _p, _s, _o = _time_one_rep(
+                ex, _eval_args, unique_devices, inner)
+            del _o
+            _lat.append(_l)
+            _peak.append(_p)
+    return (
+        float(_aggregate_samples(_lat, want_top_quartile=True)) if _lat else 0.0,
+        float(_aggregate_samples(_peak, want_top_quartile=True)) if _peak else 0.0,
+    )
+
+
+def _resolve_warmup(config) -> int:
+    """Untimed executions to run before the first TIMED one.
+
+    ``config.latency_warmup`` when set; otherwise 1 unless
+    ``ALPHAGRAD_MEASURE_WARMUP=0``. See the call site in the measurement
+    loop for why the default is 1: without it the first timed sample of
+    a plan is the first execution of a freshly compiled executable.
+    """
+    _w = max(0, int(getattr(config, "latency_warmup", 0) or 0))
+    if _w == 0 and os.environ.get("ALPHAGRAD_MEASURE_WARMUP", "1") != "0":
+        return 1
+    return _w
+
+
+def _instrument_label() -> str:
+    """Human-readable dump of the campaign instrument parameters the
+    gate floor was measured with. Printed with every floor and every
+    logged clamp: if a future edit re-forks the two measurement paths,
+    the parameters stop matching the run's own launcher flags and the
+    regression is visible in the log instead of silently worth -13%."""
+    _p = _QUALITY_GATE_STATS.get("instrument")
+    if not _p:
+        return "campaign (parameters not yet recorded)"
+    return ("campaign points={points} reps={reps} inner={inner} "
+            "warmup={warmup} agg=median".format(**_p))
+
+
+def _record_unclamped_latency(latency_ns: float) -> None:
+    """Bounded ring of the campaign latencies of terminal plans the gate
+    let through -- the denominator of the floor/plan ratio telemetry."""
+    if not (latency_ns > 0.0):
+        return
+    _ring = _QUALITY_GATE_STATS["unclamped"]
+    _ring.append(float(latency_ns))
+    if len(_ring) > 512:
+        del _ring[:-512]
+
+
+def _order_floor(order_key, compile_fn, measure_fn, legacy_measure_fn=None):
+    """The quality gate's PER-ORDER exact floor: what this plan's own
+    elimination order costs done exactly, measured ONCE per
+    `order_key`.
+
+    `order_key` is the caller's exact-compile cache key, which already
+    digests (order, arg shapes/dtypes, device) -- the complete set of
+    things the exact executable's cost depends on. Approximation specs
+    are deliberately NOT in it: the exact executable ignores them, so
+    every plan that destroyed the SAME order shares one measurement
+    instead of paying a fresh compile+measure per clamp.
+
+    `measure_fn(ex)` must be the campaign instrument
+    (``_campaign_measure_cost`` bound to this run's eval args and
+    points/reps/inner/warmup). `legacy_measure_fn(ex)`, when given,
+    re-times the FIRST floor of the process with the pre-2026-08-26
+    3x20 protocol and prints both -- so every run records, in its own
+    conditions, how large the instrument gap it used to pay was.
+    """
+    _hit = _ORDER_FLOOR_CACHE.get(order_key)
+    if _hit is not None:
+        return _hit
+    _ex = compile_fn()
+    _val = measure_fn(_ex)
+    if legacy_measure_fn is not None and not _FLOOR_AUDIT_DONE:
+        _FLOOR_AUDIT_DONE.append(1)
+        try:
+            _leg_l, _leg_m = legacy_measure_fn(_ex)
+            print(f"[measure] quality gate floor AUDIT: campaign "
+                  f"instrument {_val[0]/1e3:.1f}us vs legacy 3x20 "
+                  f"{_leg_l/1e3:.1f}us (legacy/campaign "
+                  f"{(_leg_l/_val[0]) if _val[0] else float('nan'):.3f}"
+                  f") | peak {_val[1]/1e6:.1f}MB vs {_leg_m/1e6:.1f}MB",
+                  flush=True)
+        except Exception as _aexc:
+            print(f"[measure] quality gate floor AUDIT skipped "
+                  f"({type(_aexc).__name__}: {str(_aexc)[:80]})",
+                  flush=True)
+    print(f"[measure] quality gate floor: order-key="
+          f"{order_key.hex()[:8] if isinstance(order_key, bytes) else order_key}"
+          f" lat={_val[0]/1e3:.1f}us peak={_val[1]/1e6:.1f}MB"
+          f" | instrument={_instrument_label()}", flush=True)
+    if len(_ORDER_FLOOR_CACHE) >= _ORDER_FLOOR_CACHE_MAX:
+        _ORDER_FLOOR_CACHE.clear()
+    _ORDER_FLOOR_CACHE[order_key] = _val
+    return _val
 
 
 def _measure_exec_cost(ex, base_args):
-    """(latency_ns, peak_bytes) of a compiled executable, measured with
-    the gate's own light protocol (3x20 perf_counter, allocator-delta
-    peak with static fallback). Shared by the global rev reference and
-    the per-order floor so the clamp compares like with like."""
+    """LEGACY light protocol -- (latency_ns, peak_bytes) of a compiled
+    executable from 3 laps of 20 back-to-back executions.
+
+    NOT the instrument anything is scored with. It survives only as (a)
+    the last-resort fallback for the global rev reference when no
+    campaign eval args are available and (b) the comparison arm of the
+    one-shot floor audit, which prints how far it lands from the
+    campaign instrument. Timing a floor with this while the thing being
+    floored is timed by ``_time_one_rep`` is exactly the bug that paid
+    destruction -13% for the whole v57-v66 campaign; see
+    ``_time_one_rep``'s docstring before reaching for it.
+
+    (Original docstring: measured with the gate's own light protocol
+    (3x20 perf_counter, allocator-delta peak with static fallback).
+    Shared by the global rev reference and the per-order floor so the
+    clamp compares like with like -- true between the two REFERENCES,
+    false between the floor and the plan being floored.)
+    """
     out = ex(*base_args)
     jax.block_until_ready(out)
     _devs = set()
@@ -1952,14 +2209,26 @@ def _measure_exec_cost(ex, base_args):
     return _lat, _peak
 
 
-def _exact_cost_reference(config, base_args):
+def _exact_cost_reference(config, base_args, measure_fn=None):
     """(latency_ns, peak_bytes) of the EXACT 'rev' plan -- the additive
-    quality gate's floor. Measured ONCE per process through the same
-    compile path (_compile_measure) so the clamp compares like with
-    like. Returns None (gate fails OPEN, with one warning) if the
-    reference cannot be built."""
+    quality gate's GLOBAL fallback floor, used only when the per-order
+    floor could not be built. Measured ONCE per process through the same
+    compile path (_compile_measure).
+
+    `measure_fn(ex) -> (latency_ns, peak_bytes)` is THE INSTRUMENT and
+    the campaign path passes its own (``_campaign_measure_cost`` bound
+    to this run's eval args / points / reps / inner-reps) so the
+    reference is timed exactly like the plans it floors. It defaults to
+    the legacy 3x20 protocol only for callers that have no campaign eval
+    args to hand -- which reintroduces the instrument mismatch, so the
+    fallback announces itself.
+    """
     if "ref" in _COST_REF:
         return _COST_REF["ref"]
+    _legacy = measure_fn is None
+    if _legacy:
+        def measure_fn(_ex):
+            return _measure_exec_cost(_ex, base_args)
     try:
         from graphax import jacve as _jacve
         ex = _compile_measure(
@@ -1969,11 +2238,15 @@ def _exact_cost_reference(config, base_args):
                        sparse_representation=config.sparse),
                 keep_unused=True,
             ).lower(*base_args))
-        _lat, _peak = _measure_exec_cost(ex, base_args)
+        _lat, _peak = measure_fn(ex)
         _COST_REF["ref"] = (_lat, _peak)
         print(f"[measure] quality gate armed: exact-rev reference "
               f"latency={_lat/1e3:.1f}us peak={_peak/1e6:.1f}MB "
-              f"(qmin={os.environ.get('ALPHAGRAD_QUALITY_GATE_MIN')})",
+              f"(qmin={os.environ.get('ALPHAGRAD_QUALITY_GATE_MIN')}; "
+              f"instrument="
+              + ("LEGACY 3x20 -- NOT the campaign instrument, this "
+                 "reference under-reads by ~13%"
+                 if _legacy else _instrument_label()) + ")",
               flush=True)
     except Exception as _exc:
         print(f"[measure] WARNING quality gate: exact-rev reference "
@@ -1985,14 +2258,28 @@ def _exact_cost_reference(config, base_args):
 
 def _apply_quality_gate(latency_ns, peak_memory, quality, is_terminal,
                         has_quality, config, base_args,
-                        order_floor_fn=None):
+                        order_floor_fn=None, ref_measure_fn=None):
     """ADDITIVE quality gate: below ALPHAGRAD_QUALITY_GATE_MIN the cost
     channels are FLOORED at the exact-reverse reference -- destruction
     pays what exact computation pays, so it gains nothing, while every
     channel stays a plain additive term. Cost channels are PENALTIES:
     scaling them toward zero would reward destruction, hence the clamp
     form. No-op unless the env var is set, quality was actually
-    measured this step, and it fell below the threshold."""
+    measured this step, and it fell below the threshold.
+
+    ``ALPHAGRAD_QUALITY_GATE_MIN`` unset or ``0`` disables the gate
+    entirely: no floor is measured, no compile is triggered, and both
+    cost channels pass through byte-identically.
+
+    THE FLOOR AND THE PLAN MUST SHARE AN INSTRUMENT. `order_floor_fn`
+    is expected to time the same-order exact executable with
+    ``_campaign_measure_cost`` at this run's own points/reps/inner-reps;
+    `ref_measure_fn` does the same for the global rev fallback. Timing
+    the floor with a throughput protocol while the plan is timed by the
+    campaign loop is what made the floor land 13-15% below an honest
+    exact plan for the whole v57-v66 campaign -- i.e. paid destruction a
+    bonus through the very mechanism meant to forbid it.
+    """
     try:
         _qmin = float(os.environ.get(
             "ALPHAGRAD_QUALITY_GATE_MIN", "0") or 0.0)
@@ -2000,6 +2287,11 @@ def _apply_quality_gate(latency_ns, peak_memory, quality, is_terminal,
         _qmin = 0.0
     if (_qmin <= 0.0 or not is_terminal or not has_quality
             or float(quality) >= _qmin):
+        # Terminal plans the gate lets through are the denominator of
+        # the floor/plan ratio telemetry below: if the floor ever drifts
+        # away from what honest plans are charged, the ratio moves.
+        if is_terminal and has_quality and _qmin > 0.0:
+            _record_unclamped_latency(latency_ns)
         return latency_ns, peak_memory
     # Prefer the SAME-ORDER exact floor: a destroyed plan pays what its
     # OWN order would cost done exactly, so destruction is strictly
@@ -2033,7 +2325,7 @@ def _apply_quality_gate(latency_ns, peak_memory, quality, is_terminal,
                      f"{_oom_floor_bytes/2**30:.1f}GiB"
                      if _oom_floor_bytes else ""), flush=True)
     if _ref is None:
-        _ref = _exact_cost_reference(config, base_args)
+        _ref = _exact_cost_reference(config, base_args, ref_measure_fn)
         if _ref is not None and _oom_floor_bytes > 0.0:
             _ref = (_ref[0], max(_ref[1], _oom_floor_bytes))
     if _ref is None:
@@ -2042,10 +2334,22 @@ def _apply_quality_gate(latency_ns, peak_memory, quality, is_terminal,
     _QUALITY_GATE_STATS["clamps"] += 1
     if _QUALITY_GATE_STATS["clamps"] == 1 \
             or _QUALITY_GATE_STATS["clamps"] % 50 == 0:
+        # RATIO TELEMETRY: the floor against the median campaign latency
+        # of the terminal plans the gate did NOT clamp. Both numbers now
+        # come from the same instrument, so a healthy run prints a ratio
+        # near 1 for an exact-cost floor; a ratio that drifts below 1
+        # again means the two measurement paths have re-forked and
+        # destruction is being paid a bonus.
+        _ring = _QUALITY_GATE_STATS["unclamped"]
+        _med = float(np.median(_ring)) if _ring else 0.0
+        _ratio = (f"{_rl/_med:.3f}" if _med > 0.0 else "n/a")
         print(f"[measure] quality gate CLAMP "
               f"#{_QUALITY_GATE_STATS['clamps']}: q={float(quality):.4f}"
               f" < {_qmin}; lat {latency_ns/1e3:.1f}->"
-              f"{max(latency_ns, _rl)/1e3:.1f}us", flush=True)
+              f"{max(latency_ns, _rl)/1e3:.1f}us"
+              f" | floor={_rl/1e3:.1f}us peak_floor={_rm/1e6:.1f}MB"
+              f" | floor/median-unclamped={_ratio} (n={len(_ring)})"
+              f" | instrument={_instrument_label()}", flush=True)
     return max(latency_ns, _rl), max(peak_memory, _rm)
 
 
@@ -4001,13 +4305,47 @@ def _callback(
     # compiled fine can still exhaust the device here. Excluded from the
     # gradient rather than scored.
     try:
+        # THE MEASUREMENT INPUTS, materialised ONCE. The quality gate's
+        # per-order floor re-measures the exact executable over exactly
+        # this list, with exactly the parameters below, so a clamped plan
+        # and an honest plan are timed on the same data with the same
+        # instrument (see _time_one_rep). Built inside the try so a
+        # device_put OOM still truncates rather than escaping.
+        eval_args_all: list = []
         for i in range(n_points):
             if eval_samples:
-                eval_args_i = [arg[i] for arg in eval_samples]
+                _ea = [arg[i] for arg in eval_samples]
             else:
-                eval_args_i = list(args)
+                _ea = list(args)
             if callback_device is not None:
-                eval_args_i = [jax.device_put(d, callback_device) for d in eval_args_i]
+                _ea = [jax.device_put(d, callback_device) for d in _ea]
+            eval_args_all.append(_ea)
+        # INSTRUMENT PARAMETERS (see _instrument_label): hoisted out of
+        # the point loop so the floor can be handed the identical values.
+        _inner = max(1, int(getattr(config, "latency_inner_reps", 1)))
+        # WARMUP (config.latency_warmup): untimed executions before the
+        # first timed rep, matching the elimrl/POMO worker's single warmup
+        # call. Runs OUTSIDE every timing and memory window, so it can only
+        # remove first-touch bias, never add to it.
+        #
+        # DEFAULT ON (2026-08-26, ALPHAGRAD_MEASURE_WARMUP=0 to restore the
+        # old behaviour). Without it the FIRST timed sample of a plan is the
+        # FIRST EXECUTION of a freshly compiled executable, so first-touch
+        # (buffer setup, lazy scratch allocation, cold caches/clocks) lands
+        # inside a timed window. The 5x4 median absorbs one cold sample out
+        # of twenty almost completely -- so this is not the source of the
+        # campaign's latency numbers -- but a paired harness with few
+        # samples is fully exposed to it (identity-vs-itself measured
+        # 0.51 +/- 0.59 without a warmup, 1.00 +/- 0.14 with one), and the
+        # gate floor is a FRESH compile every time it is measured. One
+        # untimed execution costs one execution and removes the whole class.
+        _warmup = _resolve_warmup(config)
+        _QUALITY_GATE_STATS["instrument"] = {
+            "points": n_points, "reps": n_reps,
+            "inner": _inner, "warmup": _warmup,
+        }
+        for i in range(n_points):
+            eval_args_i = eval_args_all[i]
 
             # ResourceMonitor already runs ``jax.effects_barrier()`` in
             # ``__enter__`` / ``__exit__``, so we don't need an extra
@@ -4023,132 +4361,18 @@ def _callback(
             # Used to isolate whether the per-call Python lifecycle around
             # ``ResourceMonitor`` (not its C++ tracker) leaks. peak_memory +
             # latency_ns are zero for the run.
-            inner = max(1, int(getattr(config, "latency_inner_reps", 1)))
-            # WARMUP (config.latency_warmup, default 0 = unchanged): untimed
-            # executions before the first timed rep, matching the elimrl/POMO
-            # worker's single warmup call. Runs OUTSIDE every timing and memory
-            # window, so it can only remove first-touch bias, never add to it.
-            for _w in range(max(0, int(getattr(config, "latency_warmup", 0)))):
+            # ONE instrument (see _time_one_rep): this loop and the
+            # quality gate's exact floor call the same function with the
+            # same (points, reps, inner, warmup), so the floor is exactly
+            # what the campaign path would have printed for the same-order
+            # exact plan -- not a throughput timing that reads 13% low.
+            for _w in range(_warmup):
                 jax.block_until_ready(compiled_cost(*eval_args_i))
-            _direct = os.environ.get("ALPHAGRAD_DIRECT_MEASURE", "0") == "1"
             for _rep in range(n_reps):
-                if os.environ.get("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0") == "1":
-                    out_approx = compiled_cost(*eval_args_i)
-                    latency_samples.append(0.0)
-                    peak_mem_samples.append(0.0)
-                    _peak_src = "bypassed"
-                elif _direct:
-                    # Spec-native primitives, no jax_memory_monitor object at all
-                    # (its per-call C++ trackers are the leak that killed v10):
-                    # clear_memory_stats() resets the high-water mark, the inner
-                    # loop is timed with perf_counter around a drained queue, and
-                    # peak_bytes_in_use is read per device afterwards.
-                    #
-                    # ABOVE-BASELINE DELTA, not the absolute high-water mark.
-                    # peak_bytes_in_use is a DEVICE-WIDE ABSOLUTE counter, and
-                    # clear_memory_stats() resets the COUNTER but not the
-                    # resident baseline -- so an absolute reading is
-                    # (resident baseline + this call transient). Measured: a
-                    # dirty allocator made four very different approximations
-                    # all read ~281 MB when the true per-call cost was 1.6 MB.
-                    # A 9-method comparison ranked this delta first among
-                    # runtime methods: CV 0.0000% over 200 reps, byte-identical
-                    # across separate processes, 0 drift after a 3 GB
-                    # alloc/free or a real OOM. It is exactly what
-                    # ResourceMonitor computes internally.
-                    # CAVEAT: device-wide, so a co-resident actor allocating on
-                    # the same GPU inflates it (CV 49.7% under a noisy
-                    # neighbour) -- keep one measure process per device.
-                    # CPU backends EXPOSE clear_memory_stats but raise
-                    # UNIMPLEMENTED when called (hasattr passes, the call
-                    # dies) -- measured killing both v40 arms at episode 0.
-                    # Without allocator stats the peak falls back to the
-                    # compiled executable's memory_analysis(): args + outputs
-                    # + temps, the deterministic static peak the AZ stack
-                    # validated as its memory cost (CV exactly 0 by
-                    # construction; latency stays the real perf_counter
-                    # timing either way).
-                    _have_stats = True
-                    # Drain FIRST: clear_memory_stats() resets the high-water
-                    # counter, but work still in flight from the previous rep
-                    # lands after the reset and is charged to THIS rep. Barrier
-                    # -> clear -> barrier makes the window tight.
-                    jax.effects_barrier()
-                    for _d in unique_devices:
-                        try:
-                            _d.clear_memory_stats()
-                        except Exception as _cexc:
-                            _have_stats = False
-                            if not _MEM_FALLBACK_WARNED:
-                                _MEM_FALLBACK_WARNED.append(1)
-                                print(
-                                    "[measure] WARNING peak_memory channel "
-                                    "switched to the STATIC memory_analysis() "
-                                    "estimate: clear_memory_stats() failed on "
-                                    f"{_d}: {type(_cexc).__name__}: {_cexc}. "
-                                    "This is a DIFFERENT quantity from the "
-                                    "measured peak_bytes_in_use delta.",
-                                    flush=True)
-                            break
-                    jax.effects_barrier()
-                    _base = 0.0
-                    if _have_stats:
-                        for _d in unique_devices:
-                            _bstats = _d.memory_stats() or {}
-                            _base += float(_bstats.get("bytes_in_use", 0.0))
-                    _t0 = time.perf_counter()
-                    for _k in range(inner):
-                        out_approx = compiled_cost(*eval_args_i)
-                    jax.block_until_ready(out_approx)
-                    _t1 = time.perf_counter()
-                    if _have_stats:
-                        _peak_abs = 0.0
-                        for _d in unique_devices:
-                            _stats = _d.memory_stats() or {}
-                            _peak_abs += float(
-                                _stats.get("peak_bytes_in_use", 0.0))
-                        _peak = max(0.0, _peak_abs - _base)
-                    else:
-                        # SUBSTITUTE IN PLACE — one memory channel, so the
-                        # static estimate lands in peak_memory rather than
-                        # travelling as a second variable. Announced + counted.
-                        _peak = _memory_analysis_bytes(compiled_cost) or 0.0
-                        _note_static_peak_fallback(
-                            "this backend does not expose allocator statistics")
-                    _peak_src = ("runtime_delta" if _have_stats
-                                 else "static_fallback")
-                    latency_samples.append((_t1 - _t0) / inner * 1e9)  # → ns
-                    peak_mem_samples.append(_peak)
-                else:
-                    with _get_resource_monitor(unique_devices) as monitor:
-                        # Accumulation loop (spec, default 50 when opted in): the
-                        # executions queue back-to-back inside one monitor window
-                        # and the exit barrier drains them all, so time/inner is a
-                        # per-execution latency with dispatch + timer overhead
-                        # amortized. Peak memory is unaffected (same executable,
-                        # same buffers each pass).
-                        for _k in range(inner):
-                            out_approx = compiled_cost(*eval_args_i)
-                    # Key by name instead of unpacking ``.values()`` so this
-                    # stays robust to dict-order / API tweaks in
-                    # jax_memory_monitor.
-                    latency_s = float(monitor.stats.get("time", 0.0)) / inner
-                    peak_bytes = float(monitor.stats.get("memory", 0.0))
-                    if peak_bytes <= 0.0:
-                        # ResourceMonitor's DEVICE peak is structurally 0 on a
-                        # CPU backend, so without this the memory channel is a
-                        # flat zero and --mem-type peak_memory trains on
-                        # nothing. Same in-place substitution as the _direct
-                        # branch above: one channel, announced and counted.
-                        peak_bytes = _memory_analysis_bytes(compiled_cost) or 0.0
-                        _note_static_peak_fallback(
-                            "ResourceMonitor reported a zero device peak "
-                            "(structural on CPU backends)")
-                        _peak_src = "static_fallback"
-                    else:
-                        _peak_src = "runtime_delta"
-                    latency_samples.append(latency_s * 1e9)  # → ns
-                    peak_mem_samples.append(peak_bytes)
+                _lat_ns, _peak_b, _peak_src, out_approx = _time_one_rep(
+                    compiled_cost, eval_args_i, unique_devices, _inner)
+                latency_samples.append(_lat_ns)
+                peak_mem_samples.append(_peak_b)
 
             if compiled_cost is not compiled_approx and compiled_exact is not None:
                 # The timed run above used the sparse-boundary executable;
@@ -4297,15 +4521,39 @@ def _callback(
     # threshold; clamps the two campaign cost channels to the
     # exact-reverse reference so destruction has no cost advantage.
     def _gate_order_floor():
-        # LAZY: only clamped plans pay this compile+measure. Reuses the
-        # order-keyed exact cache, so a repeat offender order is free.
-        _gex = cached_compile(b"exact:" + exact_cache_key,
-                              _do_compile_exact)
-        return _measure_exec_cost(_gex, list(args_for_lower))
+        # LAZY: only clamped plans pay this compile+measure. `_order_floor`
+        # memoises on `exact_cache_key`, which digests exactly (order, arg
+        # shapes/dtypes, device) -- everything the exact executable's cost
+        # depends on -- so a repeat offender order is measured ONCE per
+        # process, not once per clamp.
+        return _order_floor(
+            exact_cache_key,
+            lambda: cached_compile(b"exact:" + exact_cache_key,
+                                   _do_compile_exact),
+            # THE SAME INSTRUMENT as the plan being floored: same eval
+            # args, same points x reps, same inner-reps, same warmup,
+            # same median.
+            lambda _ex: _campaign_measure_cost(
+                _ex, eval_args_all, unique_devices, _inner, _warmup, n_reps),
+            legacy_measure_fn=lambda _ex: _measure_exec_cost(
+                _ex, list(args_for_lower)),
+        )
+
+    def _gate_ref_measure(_ex):
+        # Global rev fallback, timed by the campaign instrument too, so
+        # the fail-open path cannot reintroduce the mismatch.
+        return _campaign_measure_cost(
+            _ex, eval_args_all, unique_devices, _inner, _warmup, n_reps)
+    # ``args_for_lower`` (not ``args``): the global rev fallback must be
+    # lowered onto the SAME device the plans are measured on, or the
+    # fail-open floor is a CPU timing clamped onto GPU plans -- a second
+    # instrument mismatch in the same clamp. Identical object whenever
+    # --exec-on-gpu is off.
     latency_ns, peak_memory = _apply_quality_gate(
         latency_ns, peak_memory, cosine_sim, is_terminal,
-        bool(cosines), config, list(args),
-        order_floor_fn=_gate_order_floor)
+        bool(cosines), config, list(args_for_lower),
+        order_floor_fn=_gate_order_floor,
+        ref_measure_fn=_gate_ref_measure)
     _pf("cb.quality")
     rewards = jnp.array(
         [
