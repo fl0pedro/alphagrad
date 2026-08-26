@@ -1168,3 +1168,278 @@ floor and `none` began to fall. The keys that decide each prediction:
 `lagrangian/mask_fraction` on A/B/D. λ is constant by construction on A/B/C —
 if `lagrangian/lambda` ever moves on a static arm, the frozen-λ mechanism is
 broken and the arm is void.
+
+## 13. The entropy path audited end to end: H-SIGN **REFUTED**, the metric is population-diluted, and the "collapse to determinism" is mostly an artifact (2026-08-26)
+
+Commissioned to test **H-SIGN** — "somewhere in the entropy path a sign or a
+normalization is wrong, so the term does not do what its name says" — against
+the characteristic `entropy/approx_head` shape every face run reproduces:
+~0.03 at init, a slow rise over tens of episodes, then a fall to near zero.
+Read-only audit of `hostperf-caches` @ `0e601ae`; every claim below is either a
+quoted `file:line` or a number produced by running the **real** functions
+(`unified_face_head.py` loaded by path; `_face_entropy_floor_penalty`,
+`_split_entropy_bonus`, `_mask_vertex_logits`, `utils.entropy` `exec`'d
+straight out of the source text via `ast`, so nothing is a transcription).
+Trajectory numbers are from `collapse_invest/v64b_zneut/v64b_full.csv`
+(`38oyqf4g`, ep0–122) and `collapse_invest/v63_anti_none/v6{2,3}_full.csv`.
+
+**Verdicts.** bonus sign **CORRECT** · floor sign **CORRECT** · split sign
+**CORRECT** · metric-vs-loss consistency **CORRECT** · ve-head inertness
+**CORRECT** · arity/padding denominator **BUG** · floor arithmetic **BUG**
+(in sec 12.2's stated numbers, not in the code). No sign is inverted anywhere;
+**H-SIGN is refuted**. What is wrong is the *population* the reported
+quantity averages over, and the consequences are large enough to change the
+reading of sec 12.1 and sec 12.9.
+
+### 13.1 Every site, with its sign
+
+`entropies` (per sample) and `face_ents` (per sample) come out of the vmapped
+`evaluate_action_dynamic` at `ppo.py:7346-7358` (slots 1 and 11).
+
+| # | quantity | formula | site | sign in loss | intended | actual gradient |
+|---|----------|---------|------|--------------|----------|-----------------|
+| 1 | per-face entropy `e` | `e_skip + 1{¬skip}·Σ_s(e_op + branch-masked e_i,e_j / e_ax,e_fn / e_dt)` | `unified_face_head.py:247-294` | — | one face's decision entropy | — |
+| 2 | per-face arity `ar` | `gate_face + Σ_s active·1{op≠OP_NONE}` ∈ [1,4] | `unified_face_head.py:250,295` | — | "number of decisions" | **counts only non-NONE slots; the numerator counts skip + all three op softmaxes** |
+| 3 | per-step face sums | `(Σ_f lp, Σ_f e, Σ_f ar)` over F slots, invalid faces gated to exactly 0 | `ppo.py:2900-2913, 2955-2957` | — | one env step | valid faces only ✓ |
+| 4 | per-sample `face_entropy` | `f_ent / max(f_arity, 1)` | `ppo.py:3140` | — | arity-normalised H | **0/1 = 0 on a step with no live face** |
+| 5 | joint per-sample entropy | `vertex_ent + ent_sub/max(sub_len,1) + face_entropy` | `ppo.py:3100,3141` | — | per-head normalisation | ✓ |
+| 6 | `entropy_loss` | `mean_B(entropies)` | `ppo.py:7501` | `−` (via 8) | bonus | ✓ |
+| 7 | `H_face` (THE metric) | `jnp.mean(face_ents)` — batch mean over ALL samples | `ppo.py:7653, 7662, 7678` | `−` (via 8), `+` (via 9) | mean per-face entropy | **mean over steps, face-less steps enter as 0** |
+| 8 | `_ent_bonus` | `w·(H_tot − H_face) + w_f·H_face`; `w·H_tot` if unsplit | `ppo.py:807-830, 7661` | `total_loss … − _ent_bonus` (`ppo.py:7664-7668`) | raise entropy | raises it ✓ |
+| 9 | floor hinge | `w_fl·relu(floor − H_face)²` | `ppo.py:683-693, 7674-7680` | `total_loss = total_loss + …` | raise H when below floor | raises it ✓ |
+| 10 | logit clamp | `C·tanh(z/C)`, `C = --face-logit-clamp` (default **15**) | `unified_face_head.py:88-93, 214-222`; installed pre-trace `ppo.py:4900-4903` | — | keep dH/dθ alive at saturation | ✓ (attenuation cost noted in 12.1) |
+| 11 | logged panel | `entropy_components[5]` → `entropy/approx_head`, `entropy_floor/H_face`, `entropy_floor/penalty = w·max(0,floor−H)²` | `ppo.py:7651-7654, 9271-9286` | — | report what the loss hinges on | **identical expression, same minibatch, reduced by `mean` over (epochs, minibatches) at `ppo.py:8632-8635`** ✓ |
+
+Two structural notes that matter later. (i) `arity` and the entropy numerator
+count *different things*: a face that emits three `OP_NONE`s contributes three
+op-softmax entropies to the numerator and **1** to the denominator; each
+approximation it emits adds 1 to the denominator and its own field entropies to
+the numerator. (ii) The face head is the **only** action head
+`_scale_output_heads` does not touch (`ppo.py:4443-4505` scales
+`vertex_policy`, `pref_proj`, `micro_action_policy`; `face_path_policy.head`
+is absent), so it is **not** given the ×0.1 near-uniform init the other heads
+get — on top of `apply_face_none_bias`'s +6 on each slot's `OP_NONE` and −6 on
+`SKIP` (`common/agent_factory.py:87-111`; v64b and all four v65/v66 arms log
+`[factory] face-head IDENTITY INIT: OP_NONE bias +6.0, SKIP bias -6.0`).
+
+### 13.2 Numerical proofs (CPU, real functions, `jax.grad`)
+
+400 Adam steps on the real 94-logit head, scoring stored actions, with the
+real loss terms assembled exactly as `ppo.py:7664-7680` assembles them:
+
+```
+(a) bonus w=0.05, no split, floor OFF : H 0.2054 -> 4.8520  RISES  (correct)
+(a') split wf=0.005,        floor OFF : H 0.2054 -> 4.8520  RISES  (correct)
+(b) bonus 0, floor 0.3 w=10, H<floor  : H 0.2054 -> 0.3800  RISES  (correct)
+(c) H=2.1479 > floor 0.3: penalty=0.000e+00, max|grad_on-grad_off| = 0.000e+00
+(d) d(bonus)/dH_total = +0.050000 == --entropy-weight
+    d(bonus)/dH_face  = -0.045000 == (face_w - w); NET face coefficient
+                      = +0.005000 == --face-entropy-weight, exactly
+    unsplit (None): d/dH_total=+0.05, d/dH_face=0 (face rides the joint term)
+(e) ve head, one legal vertex: H = -0.0e+00, max|dH/dlogits| = 0.0e+00, finite
+    (3 legal vertices: H = 0.9643, max|dH/dlogits| = 1.37e-01 — the test is live)
+```
+
+(a)–(d) close the sign question: the bonus is a bonus, the hinge pushes up,
+the hinge is **bitwise** inert above the floor, and the split re-weights the
+face component only, preserving direction. (e) closes the second-silent-force
+question: with `FORCE_REV_ORDER`'s one-legal-vertex mask
+(`_mask_vertex_logits`, `ppo.py:4508-4528`) the ve-head entropy is exactly
+zero **and its gradient is exactly zero** — no NaN, no hidden pull. Every
+episode of v64b and of the four live arms logs `ve_head=0 macro_vertex=0`,
+consistent.
+
+### 13.3 What `entropy/approx_head` actually measures
+
+Sampling the real head with the real init (`+6/−6`, all-legal masks) and
+forming exactly `Σ_f e / Σ_f ar`:
+
+| none bias | p_none/slot | **H reported** | E[arity] | p_skip | p_approx/slot |
+|---|---|---|---|---|---|
+| 0 | 0.250 | 3.104 | 3.239 | 0.002 | 0.748 |
+| 2 | 0.711 | 2.712 | 1.875 | 0.002 | 0.292 |
+| 4 | 0.948 | 1.066 | 1.167 | 0.002 | 0.056 |
+| **6** | 0.993 | **0.232** | 1.024 | 0.002 | 0.008 |
+| 8 | 0.999 | 0.051 | 1.003 | 0.002 | 0.001 |
+| 10 | 1.000 | 0.023 | 1.000 | 0.002 | 0.000 |
+
+Per-face decomposition at the shipped init: an unskipped all-NONE face carries
+`ent = 0.1724, arity = 1` (three op softmaxes + the skip Bernoulli); a
+**skipped** face carries `ent = 0.0173, arity = 1` (all slot terms are gated
+off by `active`). So the reported number is neither "nats per decision" nor an
+entropy over the 94-logit alphabet: it is `(skip + up to 3 op softmaxes +
+whatever fields the chosen ops consume) / (1 + #non-NONE slots)`. Between
+`p_none = 0.99` and `p_none = 0.25` the raw numerator moves 42× while the
+reported ratio moves 13× — the metric is a **compressive (≈3.2×) transform**
+of the head's true uncertainty, monotone but not affine, and its scale shifts
+with the action distribution itself.
+
+**The padding-denominator trap, one level up.** `approx_prob/*` was fixed in
+2026-08 to divide by *valid faces* (`ppo.py:8695-8745`, and the comment there
+records the earlier bug: "none 0.9919 measured vs 0.99148 predicted from
+padding alone"). `entropy/approx_head` was **not** given the same treatment:
+it is `jnp.mean(face_ents)` over the flat (env × step) batch, and a step whose
+vertex has **no live face** contributes `0/max(0,1) = 0` — a structural zero,
+indistinguishable from a deterministic head. The same run logs the size of
+that population every episode as `faces/mean_valid` (`ppo.py:9735`), and it is
+**not** stationary.
+
+### 13.4 De-diluting v64b, v63 and v62
+
+`faces/mean_valid` is the mean live-face count per env step; the face-bearing
+fraction `f` is `mean_valid / k` for a per-face-bearing-step count `k` that is
+unlogged but bounded (below). `H_rep / mean_valid` is therefore the diluted
+metric divided by its own population, up to the constant `k`.
+
+v64b (`38oyqf4g`), the endgame:
+
+| ep | H_rep | faces/mean_valid | H_rep÷mean_valid | approx_prob/none | skip | applied |
+|---|---|---|---|---|---|---|
+| 3 | 0.0283 | 1.212 | 0.023 | 0.982 | 0.005 | 40 |
+| 60 | 0.1736 | 1.230 | 0.141 | 0.932 | 0.003 | 151 |
+| 84 | 0.9285 | 1.195 | 0.777 | 0.002 | 0.023 | 2368 |
+| 88 | 0.5949 | 0.785 | 0.758 | 0.000 | 0.061 | 1557 |
+| 90 | 0.5038 | 0.663 | 0.760 | 0.000 | 0.086 | 1265 |
+| 92 | 0.2736 | 0.386 | 0.710 | 0.000 | 0.140 | 694 |
+| 93 | 0.1403 | 0.190 | 0.738 | 0.000 | 0.142 | 327 |
+| 96 | 0.0105 | 0.020 | 0.516 | 0.000 | 0.516 | 13 |
+| 110 | 0.0054 | 0.016 | 0.329 | 0.000 | 0.640 | 10 |
+| 122 | 0.0026 | 0.013 | 0.196 | 0.000 | 0.800 | 8 |
+
+Between ep84 and ep122 the reported entropy falls **357×** while the face
+population falls **91×**. The quotient falls 4×. The "decrease to near-zero
+determinism as the policy commits to destruction" is, to first order, **the
+disappearance of the decisions being measured**: by ep96 the policy's own
+skips have DCE'd the graph to 0.02 live faces per step (so at most 2% of
+steps carry any face at all), and the head's per-face entropy on the survivors
+is **at least** 0.2–0.5 nats (the quotient is a lower bound: k ≥ 1) — **4–10× ABOVE the 0.05 floor it is simultaneously being
+penalised for missing** (`entropy_floor/penalty` is 0.014–0.022 across ep96–122).
+
+v63 makes the point over 420 episodes: from ep80 to ep500 `H_rep` wanders
+between 0.019 and 0.14 (7×) while `H_rep ÷ mean_valid` is pinned in
+**0.66–0.96** — flat. Over the same 420 episodes `entropy_floor/penalty` sits
+at **0.5–0.79 continuously**, i.e. the hinge fires at ~full strength
+(`dP/dH = −2·10·(0.3−0.04) ≈ −5.2`) against a head whose per-face entropy is
+**at least** 0.66–0.96 nats, i.e. **≥2.2× above the 0.3 floor it is
+supposedly restoring**. v62 is the
+same: ep90→ep121 `H_rep` 1.361→0.156 (8.7×) with `mean_valid` 1.220→0.141
+(8.6×) and the quotient constant at ~1.1, and the penalty re-igniting to
+0.10–0.35 at ep119–121 on a head ≥3.5× above the floor.
+
+So the shape decomposes as:
+
+* **the fall to ~0 is an ARTIFACT** (population, not policy) in all three runs;
+* **the slow rise is REAL** — `mean_valid` is flat at 1.15–1.24 from ep3 to
+  ep84 in v64b, so the ep3→ep84 rise 0.028→0.93 is a genuine 33× rise in
+  per-face entropy, matching `approx_prob/none` 0.982→0.002 decision-for-decision;
+* **the low init is REAL but is not "94 logits near uniform"** — see below.
+
+**The init level.** For the observed ep3 marginals (`p_approx/slot = 0.0129`,
+`p_skip = 0.0054`) the head model's *minimum* reported H is **0.222** (zero
+per-face logit spread) and 0.326 at the spread that reproduces the observed
+approx rate; no `(none-bias, spread)` pair in a 25×25 grid reproduces
+`H = 0.028` **and** the marginals (best fit misses the approx rate by 6.4×).
+Dilution cannot close it either: the uniform ceiling of the metric is ~3.1
+nats, so ep84's `H_rep = 0.93` forces `f ≥ 0.30`, hence `k ≤ 4.0`, hence
+`f(ep3) ≥ 0.30` and a de-diluted init of **at most 0.09** — still 2.5× under
+the model floor. The residual is **Jensen**: the reported quantity is a
+*mean of per-face entropies* while `approx_prob/*` is the *marginal over
+faces*, and a head that is decisive per face but disagrees across faces has a
+low mean and a spread marginal (exactly what sec 12.1 measured post-collapse:
+"0.03–0.09 nats while the op MARGINALS are near-uniform"). That it is already
+true at **init** is explained by 13.1(ii): the face head never receives the
+×0.1 output scaling that makes the other heads near-uniform, so its 94 logits
+carry full orthogonal-init magnitude from step 0.
+
+### 13.5 The floor-target arithmetic, corrected
+
+Sec 12.2 states "H = 0.3 per face decision means ~7% approx per decision ≈
+8–18 approx ops per TLM plan". The 0.3 is in the units of the metric the hinge
+reads, not of one op softmax. Solving `Σe/Σar = floor` on the real head:
+
+| floor | none bias | p_none/slot | p_approx/slot | approx/face | approx per plan (150 / 160 / 250 faces) |
+|---|---|---|---|---|---|
+| 0.30 | 5.66 | **0.9897** | 0.0108 | 0.032 | **4.9 / 5.2 / 8.1** |
+| 0.05 | 8.01 | 0.9990 | 0.0009 | 0.003 | 0.40 / 0.43 / 0.67 |
+
+For comparison, `H = 0.3` for a *single* 4-way op softmax gives
+`p_none = 0.938` — the number sec 12.2 quotes. The metric is ~3.4× that
+single softmax (three slots plus the skip Bernoulli, over arity ≈ 1), so the
+true `p_none` at the 0.3 floor is **0.990, not 0.938**. Sec 12.2's *conclusion*
+survives — 4.9–8.1 approx ops per plan is still structurally inside the
+violation regime, so floor 0.3 was still mis-targeted and still an igniter —
+but its stated `p_none` and its 8–18 range were derived from a different
+quantity than the one the hinge reads, and the corrected range is lower.
+
+Worse, the floor's meaning is **not stable within a run**: because `H_face` is
+population-diluted, the same 0.05 corresponds to a per-face entropy of ~0.05 at
+`mean_valid = 1.2` and to ~3.2 nats at `mean_valid = 0.016`. A floor is a
+static gate on a quantity whose scale moves 60× — and it moves *because of the
+policy's own destruction*, which is a feedback path, not a measurement.
+
+### 13.6 Verdicts
+
+| item | verdict | evidence |
+|---|---|---|
+| bonus sign | **CORRECT** | 13.2(a)(a'); `−_ent_bonus` at `ppo.py:7664-7668` |
+| floor sign | **CORRECT** | 13.2(b)(c); `+ w·relu(floor−H)²` at `ppo.py:7677` |
+| split sign | **CORRECT** | 13.2(d): net face coefficient == `--face-entropy-weight` exactly |
+| metric vs loss | **CORRECT** | same `jnp.mean(face_ents)` expression feeds hinge, bonus and panel (`ppo.py:7653/7662/7678`), same (epoch,minibatch) mean; `entropy_floor/H_face == entropy/approx_head` byte-for-byte in 739/739 populated rows across v62/v63/v64b |
+| ve-head inertness | **CORRECT** | 13.2(e): H and dH/dθ both exactly 0 under the rev-pinned mask |
+| **arity / padding denominator** | **BUG** | (i) `mean(face_ents)` averages face-less steps in as structural zeros — 91× population swing inside v64b, 7× reported-metric swing at constant de-diluted entropy across 420 v63 episodes; (ii) `arity` counts only non-NONE slots while the numerator counts skip + all op softmaxes, making the metric a 3.2×-compressive, action-dependent transform |
+| **floor arithmetic** | **BUG (dossier, not code)** | 13.5: `p_none(H=0.3) = 0.990` not 0.938; 4.9–8.1 approx/plan not 8–18; and the target is non-stationary in `mean_valid` |
+
+**What this does NOT explain.** The anti-none slide itself. Sec 12.2's F1/F3
+mechanism is untouched: the hinge really did fire continuously from ep0 in
+v62/v63 (13.4 confirms the penalty trace), and the rise from ep3 to ep84 in
+v64b is a real 33× rise in per-face entropy. H-SIGN was a reasonable
+hypothesis for "neither exploratory nor exact, drifts then commits" and it is
+**refuted**: the drift is real and the commitment is mostly the metric.
+
+### 13.7 Minimal fix, and the four running arms
+
+**Fix (≈10 lines, `ppo.py`).** Return the per-sample pair `(f_ent, f_arity)`
+in slot 11 of `evaluate_action_dynamic` instead of their ratio, and in the
+loss aggregate as a **ratio of sums over the batch**:
+
+```
+H_face_batch = jnp.sum(face_ents_raw) / jnp.maximum(jnp.sum(face_arities), 1.0)
+```
+
+Use that single quantity for `_entropy_components[5]` (`ppo.py:7653`) and for
+the floor hinge (`ppo.py:7678`). **Leave `total_entropy` / the bonus alone**
+(`ppo.py:3141`, `7662`): the bonus is a per-sample objective term and a step
+with no decision correctly buys no exploration, so changing it would alter the
+PPO objective rather than a diagnostic. Ship behind
+`--face-entropy-agg {mean,valid-weighted}` defaulting to `mean` so the
+flag-off path stays bit-identical, per the sec 12.10 shipment gate. Log
+`faces/frac_steps_with_faces` alongside `faces/mean_valid` to pin `k` (the
+one number this audit had to bound rather than read).
+
+**Do the four arms (62072/62073/62074/62075) need relaunching? NO.**
+
+1. No sign is wrong, so the objective they are optimising is the intended one.
+2. All four run `--face-entropy-floor 0.05 --face-entropy-floor-weight 10
+   --face-logit-clamp 15 --face-entropy-weight 0.005`,
+   `ALPHAGRAD_FACE_NONE_BIAS=6` — identical to v64b. Floor 0.05 sits *at* the
+   init level (v64b crossed it at ~ep28 and the penalty was exactly 0 from
+   ep31 to ep95), so the hinge is inert through the entire window the battery
+   is being read on. It only re-arms in the endgame absorber, where the run is
+   already decided.
+3. The defect is in a **diagnostic** and can be corrected **post hoc from keys
+   already being logged**: `entropy/approx_head ÷ faces/mean_valid`.
+
+**Amend the sec 12.10.6 reading rule accordingly**: `entropy_floor/H_face` is
+only comparable across episodes at constant `faces/mean_valid`. Read the
+quotient, and treat any drop in `H_face` that tracks a drop in
+`faces/mean_valid` as a graph-destruction signal, **not** an entropy collapse.
+As of 2026-08-26 ~18:40 all four arms are at `approx_head` ≈ 0.85–1.05 after
+~140 episodes (62072: 1.029, 62073: 0.853, 62074: 1.001, 62075: 0.965), i.e.
+already past the crossing and in the v62-shaped high-entropy regime — the
+`mean_valid` quotient (wandb only; the stdout `[entropy]` line does not carry
+it) is what says whether that is exploration or an emptied graph.
+
+**Also worth recording**: the first three logged episodes of every run report
+`approx_head=nan macro_vertex=nan ve_head=nan` (warm-up rows, before any
+update contributes metrics). Not a defect, but it means `_step` 0–2 are not
+data.
