@@ -155,6 +155,11 @@ exception.
 Per-channel `value_loss/{quality,latency,mem}` exists only for v65 and
 v66a/b/c and is plotted in figure (iv), lower-left.
 
+> **Do not read this table as critic accuracy.** `value loss` is in each arm's
+> own target units, which differ by orders of magnitude between the PopArt and
+> the `advantage_norm=none` arms. See §6.4 for the scale-free version, which
+> reverses the ordering on the cost channels.
+
 ### T5 — trailing 20 episodes (basis for the LIVE verdicts)
 
 | run | none | skip | faces | Hraw | Hded | quality | raw_q | fracviol | lat µs |
@@ -422,7 +427,273 @@ range, and the two entropy panels track each other rather than diverging.
 
 ---
 
-## 6. Manifest
+## 6. Follow-up interrogation (normalized age, op mix, cost/quality, critic, quality signal)
+
+Same descriptive rule as above. Raw output of this pass:
+`run_analysis/deep_findings.md`; mined archives: `data/*_archive.csv`.
+
+### 6.1 Group B vs group C at a **normalized age** (Q2)
+
+Every run aligned on **its own** `none < 0.5` crossing, so the comparison is
+like-for-like rather than at different run ages. `faces/base` is
+`faces/mean_valid ÷ base_faces`.
+
+| run | cross ep | +0: skip / faces-base | +20: skip / faces-base | +50: skip / faces-base |
+|---|---|---|---|---|
+| v58b | 38 | 0.060 / 0.589 | 0.102 / 0.270 | 0.169 / **0.107** |
+| v60 | 71 | 0.021 / 0.681 | 0.051 / 0.557 | 0.173 / **0.180** |
+| v61 | 64 | 0.396 / 0.026 | 1.000 / 0.009 | 1.000 / **0.009** |
+| v62 | 64 | 0.006 / 0.925 | 0.004 / 0.983 | 0.100 / **0.433** |
+| v63 | 64 | 0.002 / 0.963 | 0.154 / 0.198 | 0.221 / **0.070** |
+| v64b | 71 | 0.004 / 0.869 | 0.113 / 0.422 | 0.667 / **0.013** |
+| **v65** | 112 | 0.005 / 1.030 | 0.003 / 1.035 | **0.004 / 0.899** |
+| **v66a** | 83 | 0.003 / 1.034 | 0.002 / 1.023 | **0.002 / 0.995** |
+| **v66b** | 82 | 0.004 / 0.957 | 0.002 / 0.994 | **0.001 / 1.045** |
+| **v66c** | 81 | 0.001 / 1.044 | 0.002 / 1.044 | **0.003 / 1.032** |
+
+**At +20 the split is not clean** — v62 sits at `faces/base` 0.983 and
+`skip` 0.004, i.e. indistinguishable from the v66 arms, and only loses its
+faces later. **At +50 it is close to binary**: every group-B run is at
+`faces/base` ≤ 0.433 (five of six at ≤ 0.180) and every group-C run at ≥ 0.899,
+with an empty band between 0.433 and 0.899. On `skip` there is no continuum at
+all at +50: group B spans 0.100–1.000, group C spans 0.001–0.004, a 25×–1000×
+separation with nothing in between.
+
+**Does v65 look like v66a/b/c or like v64b?** At the same normalized age (+50)
+v65 is `skip` 0.0037 / `faces/base` 0.899; v66a/b/c are 0.001–0.003 / 0.995–
+1.045; v64b is 0.667 / 0.013. On this normalized basis **v65 is with the v66
+arms**, separated from v64b by 180× in `skip` and 69× in surviving faces —
+even though v65 shares v64b's `adv_winsorize=3` / `advantage_norm=popart`
+configuration.
+
+### 6.2 What replaces `none` (Q3)
+
+Mix as a fraction of the **non-none mass** `1 − p(none)`:
+
+| run | +0 quant/diag/compress/skip | +20 | +50 | winner @+50 |
+|---|---|---|---|---|
+| v58b | .462/.308/.111/.119 | .499/.249/.094/.157 | .367/.231/.161/.241 | quant |
+| v60 | .572/.287/.100/.041 | .509/.261/.154/.076 | .378/.234/.133/.255 | quant |
+| v61 | .143/.078/.039/.740 | .000/.000/.000/1.00 | .000/.000/.000/1.00 | **skip** |
+| v62 | .338/.223/.428/.011 | .274/.258/.463/.005 | .256/.304/.338/.102 | **compress** |
+| v63 | .389/.286/.322/.004 | .345/.297/.204/.154 | .325/.297/.157/.220 | quant |
+| v64b | .327/.329/.337/.007 | .322/.371/.194/.113 | .194/.111/.028/.667 | **skip** |
+| v65 | .157/.503/.330/.009 | .128/.550/.317/.004 | .153/.537/.304/.006 | **diag** |
+| v66a | .481/.464/.049/.006 | .435/.272/.291/.002 | .393/.385/.220/.002 | quant |
+| v66b | .474/.478/.041/.007 | .457/.469/.072/.002 | .498/.375/.126/.001 | quant |
+| v66c | .478/.474/.047/.002 | .394/.510/.094/.002 | .393/.524/.079/.003 | **diag** |
+
+**The same op does not win everywhere.** All four ops win somewhere: quant in
+v58b/v60/v63/v66a/v66b, diag in v65/v66c, compress in v62, skip in v61/v64b.
+
+Observed co-variation with config (association only, no mechanism claimed):
+
+* The two arms whose winner is **diag** by a wide margin are v65 (diag 0.537,
+  quant 0.153) and v66c (diag 0.524). v65 is the only run with
+  `advantage_norm=popart` **and** the raw-violation change; v66c is the only
+  v66 arm with `--no-mask`.
+* The three arms sharing `advantage_norm=none, adv_winsorize=0` (v66a/b/c,
+  differing only in λ = 10 / 16 / 13 and the mask) start from near-identical
+  mixes (quant ≈ 0.47–0.48, diag ≈ 0.46–0.48, compress ≈ 0.04–0.05 at +0) and
+  diverge afterwards, so λ alone does not fix the winner.
+* `skip` only ever wins in the two runs where the face population also
+  collapsed (v61, v64b), and never in a run whose faces survived.
+* Note the mix keeps moving after +50: v66c's compress share is 0.079 at +50
+  but 0.319 in its **last** logged census, so the "+50 winner" is a snapshot,
+  not a terminal state.
+
+### 6.3 Joint cost/quality — is anything actually trading? (Q4)
+
+Identity baseline per run = median over that run's own episodes with
+`approx_prob/none > 0.95`. Across the 12 runs these are tightly clustered:
+latency **154.8–160.2 µs** and quality **0.778–0.885**. Campaign-median
+identity point: **157.5 µs, q 0.8125**.
+
+**Yes — genuinely better cost/quality points exist, and they were found early.**
+The Pareto archive dumped to STDOUT (39 entries each, recoverable only for
+v60, v63, v64b) contains **26 plans that beat the identity point on both axes**
+(latency lower, q ≥ 0.8). The strongest:
+
+| run | ep | latency µs | quality | mem MB | vs identity |
+|---|---|---|---|---|---|
+| **v64b** | **3** | **69.8** | **0.8606** | 55.40 | **2.26× cheaper, q +0.048** |
+| **v63** | **3** | **72.2** | **0.8606** | 55.40 | **2.18× cheaper, q +0.048** |
+| **v60** | **239** | **76.8** | **0.8606** | 55.60 | **2.05× cheaper, q +0.048** |
+| v63 | 113 | 78.2 | 0.8605 | 55.40 | 2.01× cheaper |
+| v60 | 196 | 79.1 | 0.8188 | 55.60 | 1.99× cheaper |
+| v60 | 142 | 83.5 | 0.8651 | 55.60 | 1.89× cheaper |
+| v64b | 39 | 84.7 | 0.8660 | 55.40 | 1.86× cheaper |
+| v64b | 71 | 87.2 | 0.8605 | 55.60 | 1.81× cheaper |
+
+At the **episode-mean** level the same conclusion holds more weakly: every run
+has at least 2 episodes whose mean latency is below its own identity latency
+with mean quality ≥ 0.8. The single best episode mean is **v57 ep117 at
+95.8 µs with mean quality 0.8824** — 1.62× cheaper than v57's own identity
+(155.5 µs) at essentially unchanged quality.
+
+Quadrant census of episode-mean points (cheaper = lat < own identity;
+quality kept = q ≥ identity q − 0.02):
+
+| run | down-left (real trade) | down-right | up-left | up-right |
+|---|---|---|---|---|
+| v57 | **46** | 36 | 33 | 47 |
+| v58b | 2 | 178 | 4 | 5 |
+| v59 | 9 | 18 | 12 | 8 |
+| v60 | 9 | 442 | 12 | 37 |
+| v61 | 4 | 457 | 3 | 13 |
+| v62 | 12 | 26 | 14 | 67 |
+| v63 | 15 | 433 | 17 | 35 |
+| v64b | 13 | 426 | 18 | 43 |
+| v65 | 25 | 24 | 34 | **117** |
+| v66a | 22 | 16 | 24 | **135** |
+| v66b | 22 | 16 | 23 | **129** |
+| v66c | 24 | 13 | 21 | **138** |
+
+Two distinct shapes: the completed group-B runs pile up **down-right** (426–457
+episodes at lower latency with quality lost — the cheap-because-destroyed
+corner), while the four live arms pile up **up-right** (129–138 episodes that
+are *both* dearer and worse than their own identity). No run spends the
+majority of its episodes down-left; v57 comes closest at 46/162 (28%).
+
+The **latency** side of these points is the robust part (1.8×–2.3×). The
+quality side should be read as "inside the identity band", not as an
+improvement: q 0.8606 sits within the 0.778–0.885 spread that the identity
+baseline itself takes across the 12 runs, so `q +0.048` against the campaign
+median is not a quality gain, only evidence that quality was **not** given up.
+
+Caveats on this subsection: archive latencies are single-plan measurements
+taken when the plan was archived, not re-measured back-to-back against
+identity, so the 1.8×–2.3× figures carry the usual unpaired-measurement risk;
+the archive was only recoverable for 3 of 12 runs (the Top-N dump is printed
+at run end, which the cancelled runs never reached), so the absence of archive
+points for the other 9 is a **logging** absence, not evidence they found none.
+
+### 6.4 Value loss: units, not accuracy (Q5)
+
+The earlier observation that the v66 arms' `value loss` is ≈150× smaller than
+v63/v64b **does not survive** a scale-free check. It is a change of units.
+
+The target scales differ by orders of magnitude. `diag/estim_return_raw_latency`
+has mean −8.2e4 and std 1.4e4 in v64b (raw ns) but mean −7.7 and std 0.72 in
+v66a (the `advantage_norm=none` arms never leave the scaled space):
+
+```
+v63  V: -108074.7 -101735.0 -98020.8  ...  -76722.9 -78411.9 -79310.6
+v63  R: -102066.0  -98853.6 -96332.6  ...  -76861.9 -77940.8 -78701.9
+v66a V:      -0.142     -0.384    -0.809 ...    -2.104   -2.142   -2.170
+v66a R:      -2.218     -2.450    -3.025 ...    -7.550   -7.820   -8.031
+```
+
+R² of `diag/value_raw_X` against `diag/estim_return_raw_X`, in raw units:
+
+| run | quality R² | latency R² | mem R² | latency bias (v−r) | target std | bias in σ | latency R² after removing bias |
+|---|---|---|---|---|---|---|---|
+| v57 | 0.629 | 0.878 | 0.869 | −0.0007 | 0.011 | −0.06 | 0.883 |
+| v60 | 0.997 | 0.875 | 0.851 | −0.0005 | 0.011 | −0.05 | 0.878 |
+| v61 | 0.992 | 0.990 | 0.967 | 26.5 | 5599 | 0.005 | 0.990 |
+| v63 | 0.994 | 0.996 | 0.964 | 28.7 | 12660 | 0.002 | 0.996 |
+| v64b | 0.996 | 0.996 | 0.980 | 75.6 | 13950 | 0.005 | 0.996 |
+| v65 | 0.915 | 0.982 | 0.904 | 33.5 | 6371 | 0.005 | 0.982 |
+| **v66a** | 0.904 | **−58.3** | **−69.0** | **+5.557** | 0.725 | **+7.7σ** | **0.499** |
+| **v66b** | 0.907 | **−56.9** | **−63.9** | **+5.490** | 0.725 | **+7.6σ** | **0.506** |
+| **v66c** | 0.881 | **−54.7** | **−72.8** | **+5.598** | 0.753 | **+7.4σ** | **0.484** |
+
+In scale-free terms the static arms' critic is **not** more accurate. On the
+quality channel it is comparable (0.88–0.91 vs 0.92–0.996). On latency and
+memory it is negative, driven by a systematic offset of 5.5–8.9 raw units
+against a target standard deviation of 0.72–1.10 — a **7.4–8.2 σ** bias — and
+even after that offset is removed it explains only 0.42–0.51 of the variance,
+against 0.90–0.996 for every PopArt arm.
+
+The independently logged `explained variance` (the in-update, per-sample
+measure) points the same way on the ordering of the live arms:
+
+| run | median | last-20 median |
+|---|---|---|
+| v57 | 0.498 | −1.062 |
+| v58b | 0.061 | 0.059 |
+| v59 | 0.336 | 0.546 |
+| v60 | 0.0004 | −0.0004 |
+| v61 | 0.005 | 0.005 |
+| v62 | 0.884 | 0.636 |
+| v63 | 0.028 | 0.030 |
+| v64b | 0.008 | 0.014 |
+| **v65** | **0.874** | **0.881** |
+| v66a | 0.186 | 0.197 |
+| v66b | 0.184 | 0.193 |
+| v66c | 0.184 | 0.201 |
+
+Note the two scale-free measures **disagree in level** for v63/v64b (logged EV
+0.01–0.03 vs across-episode R² 0.996) and must not be conflated: the
+across-episode R² asks whether the critic tracks the slow episode-to-episode
+movement of returns (easy, because both share a trend), while the logged
+`explained variance` asks whether it separates samples *within* an update. Both
+nevertheless agree that the v66 arms' small `value loss` is not a smaller
+critic error, and that v65 (0.874) sits well above v66a/b/c (0.184–0.186).
+
+### 6.5 The quality signal: how noisy, and is it binary? (Q6)
+
+`mean_quality` is an **episode mean over the envs**; no per-env quality key is
+logged in any run, so within-episode spread across the 16 envs cannot be
+recovered from wandb. The two proxies available are the distribution of
+episode means and the mined per-plan archive qualities.
+
+| run | n eps | frac q>0.8 | frac q<0.1 | frac MIDDLE (0.1<q<0.8) | lag-1 autocorr | lag-1, first 20 eps | min | max |
+|---|---|---|---|---|---|---|---|---|
+| v57 | 162 | 0.568 | 0.290 | **0.142** | 0.150 | **−0.021** | −1.000 | 0.885 |
+| v58b | 189 | 0.032 | 0.720 | **0.249** | 0.838 | 0.355 | −0.253 | 0.885 |
+| v59 | 47 | 0.447 | 0.000 | 0.553 | 0.435 | **0.001** | 0.318 | 0.885 |
+| v60 | 500 | 0.042 | 0.826 | **0.132** | 0.925 | **0.001** | −0.392 | 0.885 |
+| v61 | 477 | 0.019 | 0.916 | **0.065** | 0.917 | 0.854 | −0.209 | 0.885 |
+| v62 | 119 | 0.193 | 0.462 | 0.345 | 0.949 | 0.073 | −0.539 | 0.885 |
+| v63 | 500 | 0.062 | 0.852 | **0.086** | 0.959 | 0.117 | −0.263 | 0.885 |
+| v64b | 500 | 0.062 | 0.850 | **0.088** | 0.965 | 0.077 | −0.332 | 0.885 |
+| v65 | 200 | 0.250 | 0.015 | 0.735 | 0.488 | 0.078 | −0.002 | 0.885 |
+| v66a | 197 | 0.223 | 0.492 | 0.284 | 0.907 | 0.160 | −0.770 | 0.885 |
+| v66b | 190 | 0.221 | 0.226 | 0.553 | 0.827 | 0.160 | −0.358 | 0.885 |
+| v66c | 196 | 0.219 | 0.291 | 0.490 | 0.894 | 0.161 | −0.279 | 0.885 |
+
+Per-plan archive qualities (v60/v63/v64b, the only recoverable archives) show
+the **same** bimodality without any averaging: middle-mass 0.128 / 0.205 /
+0.103, with 0.487–0.564 of archived plans at q < 0.1 and 0.308–0.385 at
+q > 0.8.
+
+Two things are visible here. **(a) The signal is close to binary in the
+completed runs**: middle-mass 0.086–0.142 for v57/v60/v63/v64b, i.e. 86–91% of
+episode means sit either above 0.8 or below 0.1, and the per-plan archive
+agrees. It is *not* binary everywhere — v65 (0.735), v66b (0.553) and v59
+(0.553) put most of their mass in the middle band. **(b) For a policy that is
+barely moving, the episode-to-episode signal is close to white**: over each
+run's first 20 episodes the lag-1 autocorrelation of `mean_quality` is
+−0.021 to +0.161 in 11 of 12 runs (v61's 0.854 is the sole exception). The high
+whole-run autocorrelations (0.83–0.97) come from the long absorbed stretches
+where quality is pinned at a constant, not from a smooth signal.
+
+The value 0.885 is the maximum in **every one of the 12 runs**, and −1.000 is
+hit exactly in v57 — the channel is bounded at both ends.
+
+### 6.6 Anomalies noted while building the figures
+
+Recorded as observations, without explanation:
+
+* The best cost/quality plans in the recoverable archives were found at
+  **ep3, ep9, ep19, ep22, ep39, ep42** — i.e. at the very start of the runs.
+  v63 and v64b both list their best-quality entry as *ep42, q 0.8854,
+  165.0 µs*, and both archives hold exactly 39 entries.
+* The identity baseline is reproduced to within 3.5% across 12 runs
+  (154.8–160.2 µs) and the peak-memory channel to within 1.5% (54.57–55.35 MB).
+* v58b and v60 have their **de-diluted** entropy maximum deep inside the
+  absorbed phase (ep165 → 1.706; ep343 → 1.844), above anything reached while
+  healthy.
+* v57 — the run with the most down-left episodes (46) and the single best
+  episode-mean cost/quality point (ep117, 95.8 µs, q 0.882) — was cancelled
+  after 41 minutes, the shortest run in the campaign.
+* v61's first-20-episode quality autocorrelation (0.854) is an order of
+  magnitude above every other run's (−0.02 to 0.16).
+* `lagrangian/raw_adv_mean` and `raw_adv_min` exist **only** in v65; the
+  `[lagrangian]` STDOUT line logs `raw_adv=nan` in v66a from ep0 onward.
+
+## 7. Manifest
 
 ```
 /Users/assmuth/dsnn/run_analysis/figs/run_v57.png
@@ -443,9 +714,38 @@ range, and the two entropy panels track each other rather than diverging.
 /Users/assmuth/dsnn/run_analysis/figs/cross_iv_value_loss.png
 /Users/assmuth/dsnn/run_analysis/figs/cross_v_phase_timing.png
 /Users/assmuth/dsnn/run_analysis/figs/cross_vi_live_arms.png
+/Users/assmuth/dsnn/run_analysis/figs/cross_vii_normalized_age.png
+/Users/assmuth/dsnn/run_analysis/figs/cross_viii_cost_quality.png
+/Users/assmuth/dsnn/run_analysis/figs/cross_ix_critic_scalefree.png
+/Users/assmuth/dsnn/run_analysis/figs/cross_x_quality_distribution.png
 ```
 
+**(vii) `cross_vii_normalized_age.png`** — `approx_prob/skip`,
+`faces/mean_valid ÷ base_faces` and `approx_prob/none`, with every run's x-axis
+shifted so 0 is its **own** `none < 0.5` crossing. The middle panel shows the
+group-B traces diving through the 0.25 line within 20–50 episodes of crossing
+while the four live traces stay flat at ≈1.0 out to +90.
+
+**(viii) `cross_viii_cost_quality.png`** — joint (latency, quality) points: on
+the left every run's episode means, joined in time order; on the right the
+per-plan Pareto-archive points mined from STDOUT. A star marks the campaign
+identity point (157.5 µs, q 0.8125). The right panel shows three separated
+clusters — ≈70–95 µs at q 0.78–0.87, ≈130–140 µs at q ≈ 0, and ≈142–185 µs at
+q 0.885 — the first of which lies down-left of the star.
+
+**(ix) `cross_ix_critic_scalefree.png`** — R² of V(s) against realized return
+per channel, in raw units, one bar per run. The quality panel is uniformly
+0.63–0.997; the latency and mem panels show the three v66 bars going sharply
+negative while every other bar is 0.85–0.996.
+
+**(x) `cross_x_quality_distribution.png`** — histogram of episode-mean quality
+per run with the 0.1–0.8 "middle" band shaded and its mass printed in each
+title. v57/v60/v63/v64b are visibly two-spiked at the extremes; v59/v65/v66b
+fill the band.
+
 Supporting artefacts (not figures): `run_analysis/data/*.csv` (per-run wandb
-history), `data/*_log.csv` (STDOUT-mined telemetry), `data/meta.json`,
-`data/logmeta.json`, `landmarks.json`, `landmarks.md`, `manifest.txt`, and the
-scripts `pull_all.py`, `mine_logs.py`, `analyze.py`, `verify.py`.
+history), `data/*_log.csv` (STDOUT-mined telemetry), `data/*_archive.csv`
+(mined Pareto archives), `data/meta.json`, `data/logmeta.json`,
+`landmarks.json`, `landmarks.md`, `deep_findings.md`, `manifest.txt`, and the
+scripts `pull_all.py`, `mine_logs.py`, `analyze.py`, `verify.py`, `deep.py`,
+`q5b.py`.
