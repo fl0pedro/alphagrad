@@ -906,3 +906,222 @@ load-bearing once the scales stop moving. Per-channel critic telemetry
 (`value_loss/latency|mem|quality`, added for this battery — v64b logged only a
 summed `value loss`) is what makes the diagnosis measurable across arms
 rather than inferred. Registered predictions in sec 12.10.
+
+### 12.10 The static-objective battery: implementation, launch record, registered predictions (2026-08-26)
+
+#### 12.10.1 What was implemented
+
+Three mechanisms, all off by default, shipped in commit `0e601ae`:
+
+1. **Per-channel symlog exemption** (`_set_no_symlog_indices`, a pre-trace
+   setter for `_NO_SYMLOG_MASK` — the machinery sec 12's header comment left
+   in place for exactly this). Under `--reward-mode lagrangian` *without*
+   `--no-symlog`, the violation slot (`REWARD_INDEX["cosine_sim"]`, which the
+   lagrangian rewrite has already replaced with `−violation`) is exempted and
+   the latency/memory channels are symlog'd. Prints
+   `[cfg] lagrangian + symlog: cost channels symlog'd, violation channel RAW`.
+   `--no-symlog` still short-circuits everything to the identity, so every
+   PopArt arm — v65 included — is untouched.
+
+   **The three-sites check** (project memory: "symlog vs PopArt: 3 sites must
+   agree"). The sites are (a) the reward transform `_symlog_rewards`, (b) the
+   value target `_value_target`, (c) the GAE's value decode
+   (`get_advantages` = `make_get_advantages(use_symlog=True)` symexps the head
+   output; `_GAE_POPART` = `use_symlog=False` does not, and is selected only
+   when `advantage_norm == "popart"`). Only (a) is per-channel; (b) and (c)
+   are a *uniform* encode/decode pair around the value head. That is what
+   makes the exemption safe: whatever per-channel reward space (a) chooses,
+   (b) symlogs it and (c) symexps it back, so GAE, the value loss and the
+   advantages all live in the space (a) defined, per channel, with no further
+   changes. The `--advantage-norm none` branch's degenerate-step neutral
+   target (`inverse_reward_normalization_fn(traj.value)`) inverts (b) exactly
+   and stays a ~0-loss substitution channel-wise. Pinned by
+   `tests/static_objective_test.py`.
+
+2. **`--lag-eta 0` freezes λ.** No new code: `_lag_dual_ascent` reduces to
+   `clip(λ, lag_min, lag_max)`, which is bitwise identity for any λ inside
+   the bounds (all three arms: 10/13/16 inside [2, 20]). The `[lagrangian]`
+   stdout line and the `lagrangian/*` wandb keys keep printing off the frozen
+   float, and `popart_frozen` is structurally 0 under `--advantage-norm none`
+   (the freeze test requires `advantage_norm == "popart"`). Pinned by a
+   bitwise no-op test over the λ × violation × target grid, with a positive-η
+   control so the test cannot pass against a broken updater.
+
+3. **Per-channel critic telemetry.** `_per_channel_value_loss` returns
+   `(total, per_channel)` where `total` is *bitwise* the pre-existing
+   `mean(sum(sq, −1))` value loss, and the `(NUM_VALUE_HEADS,)` vector is
+   threaded out through the metrics tuple (now 12 entries) to
+   `value_loss/latency`, `value_loss/mem`, `value_loss/quality`. v64b logged
+   only a single summed `value loss`, which cannot distinguish "the critic is
+   noisy on the channel λ prices" from "the critic is noisy on a cost
+   channel" — the whole point of the battery. The keys join the warm-up drop
+   list alongside the other loss-derived keys, so PopArt warm-up episodes
+   leave a clean gap rather than a NaN point.
+
+`--lag-raw-viol-adv` (sec 12.9.6) ships in the same commit for arm D.
+
+#### 12.10.2 Shipment gate (job 62068, pgi15-cpu2)
+
+One CPU job on pgi15-cpu2 ran the whole gate serially: a flag-off
+Helmholtz smoke on the *pristine* HEAD build, then the install, then the same
+smoke on the new build, then the five unit suites, then the two new-mode
+smokes. Every episode's full `log_dict` was captured through
+`ALPHAGRAD_UPDATE_JSONL` and compared entry by entry.
+
+- **Flag-off bit-identity: PASS.** All 248 shared metric entries over 3
+  episodes compare bitwise equal between HEAD (`8bd84d5`) and the new build
+  under a v64b-shaped flag set (`--advantage-norm popart --no-symlog
+  --lag-causal-mask --adv-winsorize 3 --popart-basin-freeze`). The only
+  difference is the three *added* `value_loss/<channel>` keys on the two
+  gradient episodes — no value changed anywhere.
+- **Unit suites: 51/51 green.** credit_fix 12 (incl. the four raw-adv cases:
+  bitwise (µ,σ)-invariance with a 1/σ control, quality-slot-only, mask
+  composition, boundedness), lagrangian_reward 12, endpoint_read 7,
+  edge_mem 12, static_objective 8.
+- **static_objective_test.py (new, 8 cases)** pins: the symlog exemption hits
+  exactly the violation slot and leaves latency/mem bitwise symlog'd;
+  resetting to `()` restores the all-symlog default bitwise; `--no-symlog`
+  overrides the mask entirely; the end-to-end
+  `_apply_lagrangian_channels → _symlog_rewards` pipeline puts exactly
+  `−violation` on the terminal step, 0 elsewhere, bounded by `τ+0.5`;
+  `--lag-eta 0` is a bitwise no-op over the λ × violation × target grid with
+  a positive-η control; `_per_channel_value_loss` totals bitwise and
+  decomposes exactly; and it follows the `--no-symlog` switch like the summed
+  loss does.
+- **Static-mode smoke (arm-A flag set): PASS.** Prints
+  `[cfg] lagrangian + symlog: cost channels symlog'd, violation channel RAW`;
+  λ frozen **bitwise** at 10.0 across episodes (the arm-D smoke's λ moves
+  10.0009 → 10.0027 in the same two episodes — the freeze is η doing the
+  freezing); `value_loss/{latency,mem,quality}` present on every gradient
+  episode (ep0: 0.01547 / 2.3816 / 0.004286) and absent on the warm-up row.
+- **Raw-viol smoke (arm-D flag set): PASS.** `lagrangian/raw_adv_mean|min`
+  emitted; `[lagrangian] … raw_adv=0.003 / −0.013` on stdout; the static arm
+  correctly reports `raw_adv=nan` (flag off).
+
+**One reporting nuance, recorded so nobody mis-reads the panels.** The
+existing scalar `value loss` key is `--value-weight × Σ_channels MSE`
+(default 0.5), while the new `value_loss/<channel>` keys are the **raw**
+per-head MSE. In the smoke: per-channel sum 2.40139 vs `value loss` 1.20069,
+exactly the factor 2. `--value-weight` is identical across all four arms, so
+cross-arm comparison is unaffected; do not compare the two keys directly
+within a run.
+
+The final build differs from the tested build only in three documentation
+edits (the `_raw_viol_override` docstring, the `--lag-raw-viol-adv` help
+text, and one comment) that replace the refuted H-ZNEUT framing with the
+sec-12.9 verdict. That was proved mechanically before commit: both files
+have identical ASTs once docstrings and >40-character text constants are
+masked, and the two fast suites (20 cases) were re-run green on the final
+build.
+
+#### 12.10.3 The arms as launched
+
+Code shipped as commit `0e601ae`; all four jobs stamp
+`ag=0e601ae gx=4ea0bf8` in their logs. Launched 2026-08-26 14:11 CEST,
+250 episodes each, 4 GPUs per node, one arm per node, all four RUNNING and
+syncing to wandb `dll-streetview/dsnn-vertex`.
+
+| arm | job | node | wandb run | launcher | log |
+|---|---|---|---|---|---|
+| A `v66a-static-lam10` | 62072 | pgi15-gpu15 | `318ktrgq` | `fq_v66a_static_lam10.sbatch` | `v66a_tlm_62072.log` |
+| B `v66b-static-lam16` | 62073 | pgi15-gpu17 | `0olsxsjl` | `fq_v66b_static_lam16.sbatch` | `v66b_tlm_62073.log` |
+| C `v66c-static-lam13-nomask` | 62074 | pgi15-gpu18 | `s1537jdd` | `fq_v66c_static_lam13_nomask.sbatch` | `v66c_tlm_62074.log` |
+| D `v65-tlm-rawviol` | 62075 | pgi15-gpu16 | `8sht6x1m` | `fq_v65_tlm_rawviol.sbatch` | `v65_tlm_62075.log` |
+
+Config confirmed live from the logs: A/B/C each print
+`[cfg] lagrangian + symlog: cost channels symlog'd, violation channel RAW
+(symlog-exempt, bounded [-(tau+0.5), 0])`, and D prints
+`[cfg] symlog DISABLED; PopArt alone scales the channels` — i.e. the
+exemption is active on exactly the three static arms and the PopArt control
+is untouched by it. Everything outside the objective layer is v64b's stack
+verbatim (rev-pin, face bound 2538, `--measure-grad --seed-vertices`,
+`--quality-metric loss_drop`, `--face-endpoint-read`, var probe,
+`--popart-init-episodes 3`, seed 250197). `--popart-init-episodes 3` is
+retained on the static arms even though PopArt statistics are never consumed
+under `--advantage-norm none`: it keeps the random-plan warm-up census and
+the `scalarized_return` frame on the same footing as arm D, at a cost of
+3 episodes out of 250.
+
+#### 12.10.4 What the static arms actually price (read this before reading the results)
+
+The arms' *nominal* weights are quality λ ∈ {10, 13, 16} against
+`--lambda-cmp 1 --lambda-mem 1`. The *realized* pull of a channel on the
+policy is that weight times the channel's own advantage spread, and the two
+differ because the static objective no longer divides each channel by its σ.
+Estimating both from v64b's own history (ep32: σ_lat 2.88e4, σ_mem 9.80e6,
+σ_q 0.141, µ_lat −1.02e5, µ_mem −3.56e7):
+
+| | v64b (PopArt) | static arms |
+|---|---|---|
+| cost channel advantage scale | ÷σ ⇒ O(1) | symlog ⇒ σ_lat/\|µ_lat\| ≈ **0.28** |
+| quality channel advantage scale | ÷σ_q ⇒ O(1) | raw ⇒ σ_q ≈ **0.141** |
+| realized quality : cost pull | λ ≈ **10×** | λ·0.141/0.28 = **5.0×** (λ=10), **6.5×** (13), **8.1×** (16) |
+
+So the battery does not merely repeat v64b's price — it **brackets** it from
+below: v66b (λ=16, ≈8×) sits closest to v64b's realized ≈10×, v66a (λ=10,
+≈5×) is deliberately at half of it, v66c (λ=13) in between. This is a
+registered caveat, not a defect: if all three static arms slide, "quality was
+priced lower than v64b in realized terms" is a live alternative to the
+critic-noise reading and the *right* follow-up is λ ≈ 20 rather than
+abandoning the static objective. Prediction (ii) below is the test that
+separates them. (Both scales are first-order estimates from v64b's policy;
+the arms log `value_loss/*` and the raw channel spreads so the realized
+numbers can be recomputed in place.)
+
+#### 12.10.5 Registered predictions
+
+Registered before any arm produced an episode.
+
+**(i) The critic-noise reading.** If value-net noise at the penalty's scale is
+what randomizes the quality advantage, then the static arms — which remove the
+1/σ_q amplification and the moving frame — should show a **materially lower
+variance of `value_loss/quality`** than v65 (episode-to-episode variance over
+a matched window, and lower relative to `value_loss/latency|mem` within the
+same arm), and should **hold `approx_prob/none` ≥ 0.9** with violation spikes
+that **recover** (the ep24-style snap-back v64b managed exactly once) rather
+than accumulate. Falsified if the static arms slide with `value_loss/quality`
+variance indistinguishable from v65's.
+
+**(ii) Price sensitivity.** v66b (λ=16) should be **strictly more
+conservative** than v66a (λ=10): lower `frac_violating`, higher `mean_raw_q`,
+lower `approx_applied/fraction`, and later (or no) onset of any drift. If
+v66a slides and v66b does not, the binding variable is the realized price and
+sec 12.10.4's λ≈20 follow-up is indicated. If **both** hold, the static
+objective is robust across the whole 5–8× realized band and the price is not
+the binding variable.
+
+**(iii) Is the causal mask still load-bearing?** v66c (λ=13, **no**
+`--lag-causal-mask`) sits between A and B in price, so a monotone
+interpolation of A and B is the null. If v66c slides while A and B hold, the
+sec-12.7 mask is still load-bearing *even under static scales* — i.e. the
+global-credit path onto the shared `OP_NONE` bias survives the removal of
+PopArt. If v66c tracks the A/B interpolation, the mask's value was specific
+to the PopArt regime and it can be retired.
+
+**(iv) v65 as the PopArt control.** v65 is **expected to slide like v64b**
+(drift into the absorber within ~100 episodes), because it fixes only the
+quality channel's normalizer while leaving PopArt on the costs, the moving
+frame, dual ascent, and the stale-moment coupling. If it does **not** slide,
+the discriminating variable is not the normalizer at all but
+**dual-ascent-vs-frozen-λ** (v65 is the only arm whose λ still moves) or the
+raw-advantage clip acting as a de-facto bound the static arms lack — and the
+next contrast is v65 with `--lag-eta 0` against v65 as launched.
+
+**Cross-arm reading rule, fixed in advance.** The headline outcome is the
+joint pattern, not any single arm: (A,B hold; C,D slide) ⇒ critic noise +
+mask both real, static objective adopted; (A,B,C hold; D slides) ⇒ PopArt was
+the whole story and the mask is retirable; (all slide) ⇒ read sec 12.10.4
+first (realized price) before concluding the static objective failed;
+(all hold, D included) ⇒ 250 eps is too short a window and the battery must
+be re-run at 500.
+
+#### 12.10.6 Reading the battery
+
+First checkpoint is ~ep60–90, the window in which v64b's H_face crossed its
+floor and `none` began to fall. The keys that decide each prediction:
+`value_loss/quality` (and its variance) against `value_loss/latency|mem`;
+`approx_prob/none`; `entropy_floor/H_face`; `lagrangian/frac_violating` and
+`mean_raw_q`; `kl/approx` (v64b's slide took it from O(0.5) to 10.5);
+`lagrangian/mask_fraction` on A/B/D. λ is constant by construction on A/B/C —
+if `lagrangian/lambda` ever moves on a static arm, the frozen-λ mechanism is
+broken and the arm is void.
