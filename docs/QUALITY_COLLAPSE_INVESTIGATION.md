@@ -712,3 +712,197 @@ Online arms: **v64b** = full fix production candidate (job 61983, gpu16, 500 eps
 predictions: frac_violating<0.2, none>=0.9, kl/approx O(0.5), quant learns without slide).
 Igniter-only arm moved to CPU (repro_armB, job 61984: floor 0.05, NO mask/winsorize -- prediction:
 slide delayed/absent vs 61936; if it slides late, mask+winsorize are load-bearing, not just belt).
+
+### 12.9 v64b post-mortem: H-ZNEUT **REFUTED**, and the corrected diagnosis — the critic is the bottleneck (2026-08-26)
+
+#### 12.9.1 What v64b actually did
+
+v64b (job 61983, wandb `38oyqf4g`, log `v64b_tlm_61983.log`) ran the full
+sec-12.7 credit fix (`--lag-causal-mask`, `--adv-winsorize 3`,
+`--face-entropy-floor 0.05`, `--popart-basin-freeze`, λ init 10) and ran to
+completion — 500/500 episodes — **inside the terminal absorber**: λ pinned at
+`--lag-max` 20, mean_violation 0.75 (the maximum reachable at τ=0.75 with
+q clipped at 0), mean_raw_q 0.000, PopArt frozen. The credit fix did not
+prevent the collapse; it changed its *shape* from v62/v63's runaway into a
+~25-episode drift.
+
+The history (`collapse_invest/v64b_zneut/v64b_full.csv`, ep0–120):
+
+| ep | λ | frac_viol | mean_raw_q | approx_prob/none | H_face | mask_frac | σ_q | value loss | kl/approx |
+|---|---|---|---|---|---|---|---|---|---|
+| 3 | 10.00 | 0.062 | 0.807 | 0.982 | 0.028 | 0.052 | 0.158 | 0.503 | 0.45 |
+| 16 | 10.02 | 0.000 | 0.880 | 0.981 | 0.046 | 0.064 | 0.149 | 0.019 | 0.54 |
+| 30 | 10.07 | 0.188 | 0.730 | 0.980 | 0.050 | 0.070 | 0.142 | 0.268 | 0.56 |
+| 48 | 10.12 | 0.125 | 0.803 | 0.966 | 0.080 | 0.106 | 0.133 | 0.163 | 0.84 |
+| 56 | 10.15 | 0.312 | 0.807 | 0.955 | 0.117 | 0.149 | 0.129 | 0.028 | 1.18 |
+| 64 | 10.18 | 0.062 | 0.750 | **0.709** | 0.503 | 0.475 | 0.126 | 0.315 | 6.06 |
+| 72 | 10.25 | 0.375 | 0.534 | **0.419** | 0.807 | 0.730 | 0.125 | 0.507 | 10.53 |
+| 80 | 10.44 | 1.000 | −0.110 | **0.053** | 0.987 | 0.869 | 0.132 | 0.674 | 10.51 |
+| 96 | 11.01 | 1.000 | 0.000 | 0.000 | 0.011 | 0.020 | 0.132 | 0.800 | 0.14 |
+| 120 | 11.89 | 1.000 | 0.000 | 0.000 | 0.005 | 0.016 | 0.132 | 0.691 | 0.15 |
+
+Read the two right-hand columns together with `none`. The ordering is
+unambiguous: **H_face rises first** (0.028 → 0.05 by ep30 → 0.117 by ep56 →
+0.50 by ep64), `none` follows it down, and only then do violations become
+universal. By ep96 the run has settled into a *deterministic* destructive
+policy (H_face 0.005, none 0.000, q 0.000) — the absorber is not a noisy
+plateau, it is a committed plan.
+
+#### 12.9.2 H-ZNEUT as stated, and its falsifier
+
+H-ZNEUT (drafted from the v64b shape before the history was pulled): under
+PopArt the quality channel's advantage term is `A_raw/σ_q` and λ multiplies
+that *relative* signal. As violations become prevalent the quality head's
+return distribution should move — µ_q tracking down, σ_q widening — so the
+same absolute violation reads as an ever-smaller z. The penalty would then
+fade exactly when the constraint must bind, and no λ could set an absolute
+price on a relative signal.
+
+That is a quantitative claim about σ_q, and it is directly measurable. The
+falsifier compares the one clean **recovery** window (ep20–30, n=11, where a
+violation spike was pushed back to frac_violating 0) against the **drift**
+window (ep55–75, n=21, where the policy slid): if H-ZNEUT holds, the
+effective per-unit violation price must be materially LOWER in the drift
+window.
+
+#### 12.9.3 Evidence: the price went UP while the policy slid
+
+`/Users/assmuth/dsnn/collapse_invest/v64b_zneut/v64b_zneut_summary.txt`
+(analysis CSV alongside it; windows as above, rec = ep20–30, drift = ep55–75):
+
+| quantity | recovery | drift | rec/drift |
+|---|---|---|---|
+| µ_q | −0.03828 | −0.03819 | 1.002 |
+| **σ_q** | **0.14461** | **0.12649** | **1.143** |
+| λ | 10.0506 | 10.1975 | 0.986 |
+| **λ/σ_q** | **69.51** | **80.63** | **0.862** |
+| z at violation 0.25 | −1.4642 | −1.6747 | 0.874 |
+| **per-unit price @0.25** | **58.87** | **68.31** | **0.862** |
+| per-unit price @0.75 (winsorized) | 40.20 | 40.79 | 0.986 |
+| per-unit price @0.75 (unwinsorized) | 65.96 | 76.53 | 0.862 |
+| winsorize clip frac, quality | 0.0098 | 0.0219 | 0.445 |
+| frac_violating | 0.1477 | 0.3066 | 0.482 |
+| mean_violation | 0.0809 | 0.1748 | 0.463 |
+| mean_raw_q | 0.7589 | 0.6285 | 1.207 |
+| mask_fraction | 0.0692 | 0.4542 | 0.152 |
+
+Every leg of H-ZNEUT fails:
+
+- **σ_q did not widen — it SHRANK**, 0.1446 → 0.1265 (and monotonically
+  across the whole run, 0.158 at ep3 → 0.125 at ep72). µ_q is flat to four
+  decimals. The distribution the mechanism needs simply did not move.
+- **The per-unit price ROSE**, 58.9 → 68.3 (+16%) at a 0.25 violation, and
+  65.96 → 76.53 at 0.75 before winsorization. λ/σ_q rose 69.5 → 80.6.
+- The only price that is flat is the *winsorized* one at large violations
+  (40.20 → 40.79), because |z| there is past the clip — but the clip is
+  binding on **1–2% of quality entries** (0.98% → 2.19%), so winsorization is
+  not neutralizing the channel either.
+
+**Verdict: H-ZNEUT is REFUTED.** The penalty stayed fully priced —
+*increasingly* priced — and the policy slid anyway. Any explanation that
+routes through "the penalty got cheap" is dead.
+
+#### 12.9.4 The corrected diagnosis: the critic is the bottleneck
+
+The penalty's *price* was never the problem; its *reliability per step* was.
+The quality term entering the policy gradient is
+`λ · m(e,t) · (G_q(e,t) − V_q(e,t)) / σ_q`, and on the overwhelming majority
+of steps the true quality advantage is ~0 (no violation to explain), so what
+that expression carries is **the value net's error, amplified by 1/σ_q ≈ 7.9
+and by λ ≈ 10 — roughly 80× per raw unit**. A quality head whose error has
+random sign therefore injects a large, sign-random force on exactly the
+parameters λ was supposed to steer, and it averages out over the batch
+instead of steering. Four coupled loops make this worse rather than
+self-correcting:
+
+1. **Noise amplification by the normalizer.** σ_q is small (0.13) *because*
+   the channel is sparse-terminal and mostly zero — so the very sparsity that
+   makes the true signal rare is what multiplies the critic's error by ~8.
+2. **Moving frame.** PopArt rescales the heads (ART) and renormalizes the
+   targets (POP) every episode; the critic is chasing a target whose units
+   move under it.
+3. **Stale optimizer moments.** Adam's second-moment estimates for the value
+   head were accumulated in the *previous* frame; after a rescale they are
+   mis-scaled for the new one, so the effective critic learning rate is wrong
+   exactly when the frame moves most.
+4. **Policy-dependent σ and a µ ratchet.** σ_q and µ_q are statistics of the
+   *policy's own* returns, so the per-channel exchange rate between quality
+   and cost drifts as a function of the thing being optimized — a
+   nonstationary objective, not a fixed one.
+
+The corroborating observation from the v64b history is the *density*
+asymmetry. With `mask_fraction` 0.05–0.07 through ep3–30, the quality term
+reaches ~6% of steps; the entropy bonus (`--face-entropy-weight 0.005`)
+reaches every face slot of every step and always points the same way (raise
+H). A sparse, sign-random force loses to a dense, coherent one regardless of
+its nominal per-unit price — which is exactly the observed ordering, H_face
+rising *before* `none` falls and long before violations become universal.
+This vindicates the residual role left open for H5 in sec 6: the entropy
+bonus is not the *initiator*, but once the quality term is noise-dominated it
+is the only coherent gradient on the face head.
+
+Note what this does NOT claim. It does not claim the critic is badly
+implemented (sec-H2's ART/POP carry and the #89 neutral-target fix are
+verified); it claims the *objective the critic has to track is nonstationary
+and the normalizer amplifies whatever error remains*. The remedy is therefore
+not a better critic — it is an objective that does not move.
+
+#### 12.9.5 Remedy under test: a fully STATIC objective
+
+Owner-directed (2026-08-26). Remove every adaptive statistic from the
+objective and make the exchange rate a constant chosen in advance:
+
+- `--advantage-norm none` — no PopArt, no batch z-score. No moving frame, no
+  head rescale, no stale-moment mismatch, no policy-dependent σ.
+- **symlog on the cost channels** (these arms DROP `--no-symlog`) — a FIXED,
+  policy-independent magnitude compression that replaces PopArt's job for the
+  ~1e5…1e10 cost scales.
+- **the violation channel RAW** — bounded by construction in `[−(τ+0.5), 0]`,
+  so it needs no compression, and symlogging it would discount the absolute
+  price λ is meant to set (symlog(0.75) = 0.56, a 25% discount exactly at the
+  constraint bound).
+- **λ frozen** via `--lag-eta 0` — no dual ascent. The exchange rate between
+  a unit of violation and a unit of symlog-cost is a predetermined constant
+  (10–16, i.e. quality ~10–16× the cost weights) for the entire run.
+
+Under this objective a given plan scores the same at ep 5 and ep 500, and the
+quality term's scale is a constant instead of `λ/σ_q`. If the critic-noise
+diagnosis is right, the quality-channel value error should be materially
+smaller and better behaved, and `none` should hold.
+
+#### 12.9.6 The v65 raw-violation-advantage arm, retained as a control
+
+`--lag-raw-viol-adv` was built as the H-ZNEUT fix: it computes the QUALITY
+channel's advantage on the RAW scale — `(raw violation-channel return) −
+(raw-scale value prediction)`, clipped at ±2.0 for a transiently wrong
+critic, NOT winsorized — bypassing PopArt z-normalization for that channel
+only, while the cost channels keep PopArt+winsorize and the value loss stays
+in normalized space. It composes with `--lag-causal-mask`; default off is
+bit-identical. Telemetry: `lagrangian/raw_adv_mean|min` (violating envs only)
+and `raw_adv=` on the `[lagrangian]` stdout line.
+
+H-ZNEUT being refuted does not make the flag useless — it makes it the right
+*control*. It removes the 1/σ_q amplification (loop 1) and the
+policy-dependent exchange rate for the quality channel (loop 4) while
+*keeping* PopArt on the costs and dual ascent on λ. Run against the static
+arms it isolates the PopArt layer specifically. It is therefore shipped and
+launched as arm D of the sec-12.10 battery rather than as "the fix".
+
+#### 12.9.7 Battery design
+
+Four arms, 250 episodes each, one per GPU node, identical except for the
+objective layer under test:
+
+| arm | normalizer | cost transform | violation channel | λ | causal mask |
+|---|---|---|---|---|---|
+| A `v66a-static-lam10` | none | symlog | raw | frozen 10 | yes |
+| B `v66b-static-lam16` | none | symlog | raw | frozen 16 | yes |
+| C `v66c-static-lam13-nomask` | none | symlog | raw | frozen 13 | **no** |
+| D `v65-tlm-rawviol` | popart (+winsorize 3) | none (`--no-symlog`) | raw advantage | dual ascent from 10 | yes |
+
+A vs D is the whole-PopArt-layer contrast. A vs B is the price sensitivity of
+the static objective. A vs C asks whether the sec-12.7 causal mask is still
+load-bearing once the scales stop moving. Per-channel critic telemetry
+(`value_loss/latency|mem|quality`, added for this battery — v64b logged only a
+summed `value loss`) is what makes the diagnosis measurable across arms
+rather than inferred. Registered predictions in sec 12.10.
