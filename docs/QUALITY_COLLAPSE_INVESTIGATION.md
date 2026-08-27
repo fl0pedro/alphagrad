@@ -2103,3 +2103,40 @@ Second-cheapest, as a companion on the same panel: the **across-plan spread of
 the quality channel within the batch** at ep ≤ 30. If it is ~0 (every plan
 equally destroyed), no policy gradient exists at all, and §14.2.3 shows that is
 precisely the state from which `SKIP` becomes free.
+
+---
+
+## 15. Pointer: the unbiased Pareto re-measurement (2026-08-27)
+
+This dossier stops at §14's synthesis, which was written from **campaign
+telemetry**. Everything §14 asserts about latency has since been re-measured
+**paired, warm, on pinned code**, and the results — including two corrections to
+§14 and one refutation of a session hypothesis — live in a separate file:
+
+> **[`UNBIASED_PARETO_AND_MEASUREMENT.md`](UNBIASED_PARETO_AND_MEASUREMENT.md)**
+
+Read it before quoting any cost number from §0–§14. In brief:
+
+* **§14.3.3's "the win is real and was on the table from episode zero" is
+  CONFIRMED, paired.** The archived winners reproduce at latency ratio
+  **0.522–0.646** against an identity-vs-itself drift floor of
+  **1.0007 ± 0.0008 (n=6)**. The competing "cold-measurement artifact"
+  hypothesis is **REFUTED**: the cold effect is −7.2 % on measurement #1 only,
+  and its sign *hides* winners rather than inventing them.
+* **The win is ONE SKIP, in elimination steps 13–24.** Five independent runs
+  (v63, v64b, v65, v66a, v66c) archived the *same* one-face plan at ratio
+  0.578–0.581, quality 0.9258 against identity 0.9260. Adding 20–43 further
+  approximations buys **zero** extra latency and costs 0.25 of quality.
+* **§14.1's gate-floor instrument bug is FIXED** (`1c1e480`).
+* **§14.6.2's DEAD list gains an entry: DIAG.** On TLM, DIAG applies **0 of 103**
+  requested rules — every diag result in the campaign is an identity plan wearing
+  a diag label. COMPRESS applies but is net *negative* on latency at every budget.
+  QUANT applies 100 % for a real but small −5.0 % / −1.8 %.
+* **Two protocol bugs the campaign ran with**: all 264 archived Pareto points
+  were unreplayable (0-based action index vs 1-based vertex id, fixed `907c231`,
+  recovery 0/42 → 42/42), and `ALPHAGRAD_NEW_SLOT_JOIN=1` — the default — emits a
+  face form graphax rejects, so res-slot plans died at elimination and were
+  *silently dropped from the gradient*. Worked around, root cause unfixed.
+* **One caveat is still open** (job 62415): three of the winning faces skip the
+  path to a broadcast `(1,128)` parameter-shaped operand, so the win may be
+  "stop differentiating a parameter", which a 200-step Adam walk cannot see.
