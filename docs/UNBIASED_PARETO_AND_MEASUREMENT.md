@@ -809,7 +809,7 @@ Per output leaf `l` (one leaf per entry of `config.argnums`, in that order):
 
 ```
 n_a[l] = ||g_a[l]||_2                      n_e[l] = ||g_e[l]||_2
-counted(l)   <=>  n_e[l] > eps
+counted(l)   <=>  ndim(g_e[l]) > 0  and  n_e[l] > eps
 ratio[l]     =  min(1, n_a[l] / n_e[l])    (non-finite n_a scores 0)
 min_leaf_ratio     = min over counted leaves of ratio[l]      (1.0 if none)
 frac_leaves_zeroed = #{counted l : n_a[l] == 0 or non-finite} / #counted
@@ -818,11 +818,23 @@ frac_leaves_zeroed = #{counted l : n_a[l] == 0 or non-finite} / #counted
 The full per-leaf vector (`approx_norms`, `exact_norms`, `ratios`, `zeroed`) is
 kept on the record for telemetry and is what the probe dumps.
 
-**Leaf set.** *Every* output leaf, i.e. one per differentiated argument. Under
-`--seed-vertices` that includes the scalar tangent seed, which the forensics
-also counted — keeping the same set is what makes §10.4(a) a real
-cross-check rather than a re-definition. It is also conservative in the right
-direction for the guard.
+**Leaf set.** Every output leaf of **rank ≥ 1**, i.e. one per differentiated
+argument that is an actual tensor. **0-d leaves are excluded by convention**
+(`env._leaf_norms` reports them as `nan`, which `_grad_coverage`'s existing
+`n_e[l] > eps` test routes to UNCOUNTED). Pinned by
+`src/alphagrad/approx/tests/test_seed_vertices_dropped.py`.
+
+*This changed in workstream A4.* It previously counted **every** leaf,
+matching the forensics. A 0-d differentiated slot is a seed / direction
+scalar, never a weight: under the now-dropped `--seed-vertices` the last
+argnum was the tangent seed `t`, whose leaf is `d(loss)/dt`. Counting it
+put the `--reject-frozen-grads` guard (default ON) in a position to
+sentinel an entire plan on the **seed's** gradient — a verdict about the
+apparatus, not the plan. It also contradicted the two places that already
+made the opposite call: `_walk_argnums` excludes 0-d argnums from the Adam
+walk, and `generate_eval_samples` leaves them at their injected value. The
+leaf set now agrees with both. On every rank-≥1 leaf the measurement is
+unchanged, so §10.4(a) remains a real cross-check against the forensics.
 
 **Epsilon policy** (explicit, because it decides what "frozen" means). With
 

@@ -188,12 +188,12 @@ def add_ppo_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--seed-vertices", action="store_true",
-        help="Grad-mode only: treat the tangent + adjoint SEEDS as their own graph "
+        help="DEPRECATED (workstream A4): seeds are NOT vertices. No launcher passes this any more, and passing it WITHOUT --measure-grad is now an ERROR instead of the silent no-op it used to be. Kept accepted only so the forensics/landscape replay can rebuild an archived run's graph. What it did: grad-mode only, treat the tangent + adjoint SEEDS as their own graph "
         "vertices (graphax.seed_vertices). The scalar loss becomes "
         "<ones/N, fn(p + t*dir)> with the tangent seed t appended as the LAST arg "
         "and the adjoint contraction explicit, so the elimination order chooses "
         "forward / reverse / cross-country seed timing. Same value/gradient as the "
-        "plain scalar loss; only the action space (and graph) grows.",
+        "plain scalar loss; only the action space (and graph) grows -- by 2 ordinary eliminable vertices (nn256: 13 -> 15), which also enlarge derived_max_faces. The order freedom it was meant to expose is unreachable under ALPHAGRAD_FORCE_REV_ORDER=1.",
     )
     p.add_argument(
         "--latency-timer", type=str, default="perf_counter",

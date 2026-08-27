@@ -80,7 +80,7 @@ RAY_CPUS_GPUNODE="${RAY_CPUS_GPUNODE:-0}"          # tiny -> measure spills to c
 RAY_CPUS_CPUNODE="${RAY_CPUS_CPUNODE:-$((4 * NUM_CPU_WORKERS + 16))}"
 
 MODELS=(VmappedNeuralNetwork VmappedConvNet VmappedMoE VmappedViT)
-# --seed-vertices ~doubles the graph (NN 15->36 eqns etc.), enlarging the policy's
+# A4: --seed-vertices REMOVED (seeds are NOT vertices). It used to ~double the graph,
 # relational attention; envs=4 + higher minibatches keeps jit_update_step in 80GB.
 ENVS=(4 4 4 4)
 MBS=(8 8 8 16)
@@ -143,7 +143,7 @@ launch_one() {
       --example $M --dataset mnist \
       --rewards cmp mem acc --cmp-type latency --mem-type xla_peak_memory \
       --lambda-cmp $LCMP --lambda-mem $LMEM --lambda-acc $LAMBDA_ACC --lambda-frob $LAMBDA_FROB \
-      --measure-grad --measure-latency --quant-once --seed-vertices \
+      --measure-grad --measure-latency --quant-once \
       --latency-timer perf_counter --latency-inner-reps 5 --latency-warmup 2 --latency-winsor 0.2 \
       --cpu-cores-per-actor 1 --cpu-cores-shared --num-cpu-workers $NUM_CPU_WORKERS \
       --actor-num-gpus 1 --ray-address $HEAD_IP:$RAY_PORT \

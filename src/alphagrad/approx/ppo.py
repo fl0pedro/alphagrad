@@ -4006,14 +4006,22 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--seed-vertices",
         action="store_true",
-        help="With --measure-grad, use seed_loss_fn instead of scalar_loss_fn: "
+        help="DEPRECATED (workstream A4): seeds are NOT vertices. No launcher "
+        "passes this any more, and passing it WITHOUT --measure-grad is an "
+        "ERROR instead of the silent no-op it used to be; it is kept accepted "
+        "only so the forensics/landscape replay can rebuild an archived run's "
+        "graph. What it did: with --measure-grad, use seed_loss_fn instead of scalar_loss_fn: "
         "the tangent seed and the adjoint contraction enter the graph as "
         "ORDINARY ELIMINABLE VERTICES, so the elimination/action space stays "
         "the Jacobian graph (plus seed nodes) while the MEASURED object is the "
         "gradient. The policy then learns WHEN to apply the seed — seeding "
         "early is one VJP (gradient-cost), seeding late builds the full "
         "Jacobian — i.e. forward/reverse/cross-country becomes part of the "
-        "search. Requires graphax >= 5c56105 (seed-vertex sentinel fix).",
+        "search. Requires graphax >= 5c56105 (seed-vertex sentinel fix). "
+        "Why it is gone: those 2 extra vertices enter the pointer's action "
+        "space and enlarge derived_max_faces, and the forward/reverse/"
+        "cross-country freedom they buy is UNREACHABLE while "
+        "ALPHAGRAD_FORCE_REV_ORDER=1 pins the order to reverse.",
     )
     p.add_argument(
         "--measure-latency",

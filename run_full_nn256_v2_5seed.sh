@@ -193,7 +193,7 @@ LAMBDA_COSSIM_GUIDE="${LAMBDA_COSSIM_GUIDE:-1.0}"
 #   JACOBIAN d(output)/d(weights) via jacve (grad_target_setup returns the base
 #   fn unwrapped). Cross-country vertex elimination CAN beat jacrev's redundant
 #   per-output-row VJPs here — the object where the approach can actually win.
-#   In this mode: --seed-vertices is grad-only so it is dropped; cosine_sim +
+#   In this mode: --seed-vertices is gone entirely (A4); cosine_sim +
 #   frob_residual compare the approx vs exact OUTPUT JACOBIAN directly; bkstep
 #   still runs (env contracts the output Jacobian with the loss output-cotangent
 #   (1/N)*ones to recover the training gradient -> trainability of the Jacobian).
@@ -302,11 +302,11 @@ rm -rf "$OUT"; mkdir -p "$OUT" "$CAMP/logs"
 # Assemble the mode-dependent flags:
 #   * --measure-grad only when MEASURE_GRAD=1 (else OUTPUT-JACOBIAN mode).
 #   * --exec-on-gpu whenever EXEC_ON_GPU=1 (GPU measuring; independent of mode).
-#   * --seed-vertices only when SEED_VERTICES=1 AND grad mode (grad-only flag).
+#   * --seed-vertices: REMOVED (A4). It was grad-only -- a no-op without --measure-grad --
 #   * --rewards: 'all' when ALPHAGRAD_REWARD_ALL_CHANNELS=1, else cmp mem acc.
 MEASURE_GRAD_FLAG=$([ "$MEASURE_GRAD" = 1 ] && echo --measure-grad)
 EXEC_ON_GPU_FLAG=$([ "${EXEC_ON_GPU:-1}" = 1 ] && echo --exec-on-gpu)
-SEED_VERTICES_FLAG=$([ "${SEED_VERTICES:-0}" = 1 ] && [ "$MEASURE_GRAD" = 1 ] && echo --seed-vertices)
+SEED_VERTICES_FLAG=          # A4: dropped -- seeds are NOT vertices
 REWARDS_FLAG=$([ "${ALPHAGRAD_REWARD_ALL_CHANNELS:-0}" = 1 ] && echo all || echo "cmp mem acc")
 
 # >>> REPLAY / V-trace flags <<<

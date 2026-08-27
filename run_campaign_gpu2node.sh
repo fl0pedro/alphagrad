@@ -7,7 +7,7 @@
 #
 #   ALL measurement runs ON GPU (--exec-on-gpu): peak_memory = ResourceMonitor
 #   high-water mark (the WATERLINE, exact on GPU), latency + cosine on GPU too.
-#   Pure on-policy PPO (no replay/V-trace). Keep --seed-vertices (tangent+adjoint
+#   Pure on-policy PPO (no replay/V-trace). A4: --seed-vertices REMOVED (tangent+adjoint
 #   seeds as eliminable vertices, eval at t=0). Per-MODEL reward lambdas.
 #   No-barrier 4-slot queue (a fast run frees its 3 GPUs for the next immediately).
 #
@@ -98,7 +98,7 @@ launch_one() {
       --example $M --dataset mnist \
       --rewards cmp mem acc --cmp-type latency --mem-type peak_memory \
       --lambda-cmp $LCMP --lambda-mem $LMEM --lambda-acc $LAMBDA_ACC --lambda-frob $LAMBDA_FROB \
-      --measure-grad --measure-latency --quant-once --seed-vertices \
+      --measure-grad --measure-latency --quant-once \
       --exec-on-gpu --use-placement-group --actor-num-gpus $PPO_GPUS --cpu-actor-num-gpus $GRAD_GPUS --num-cpu-workers 1 \
       --latency-timer perf_counter --latency-inner-reps 5 --latency-warmup 2 --latency-winsor 0.2 \
       --ray-address $HEAD_IP:$RAY_PORT \

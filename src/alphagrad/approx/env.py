@@ -974,13 +974,43 @@ def reject_frozen_grads() -> bool:
 def _leaf_norms(out, has_aux: bool) -> list[float]:
     """Per-leaf L2 norms of a jacve output, in ``config.argnums`` order.
 
-    Identical to what ``ls_face_forensics.py`` computes (float32 norm of every
-    ``tree_leaves`` entry), so the forensics numbers and this implementation
-    are the same measurement and can be compared leaf by leaf.
+    LEAF-SET CONVENTION (workstream A4; pinned by
+    ``tests/test_seed_vertices_dropped.py``). A **0-d output leaf is not a
+    countable leaf** and is reported as ``nan``.
+
+    WHY. A 0-d differentiated slot is a SEED / DIRECTION scalar, never a
+    weight. Under ``--seed-vertices`` the appended argnum is the tangent seed
+    ``t`` and its output leaf is ``d(loss)/dt`` -- a directional derivative,
+    not a parameter gradient. Two other places in this file already say so and
+    act on it: ``_walk_argnums`` excludes 0-d argnums from the Adam walk
+    ("stepping it moves every weight by ``t*ones`` and saturates the net"),
+    and ``generate_eval_samples`` leaves 0-d argnums at their injected value.
+    Counting the seed here contradicted both.
+
+    WHAT IT DECIDED. ``--reject-frozen-grads`` (default ON) sentinels a WHOLE
+    PLAN as soon as any counted leaf is zeroed. With the seed counted, a plan
+    could be destroyed on the SEED's gradient -- a verdict about the seeding
+    apparatus dressed up as a verdict about the plan, which is precisely the
+    error ``_truncated_reward``'s docstring warns about.
+
+    WHY ``nan`` and not a dropped entry, or 0.0. Dropping would break the
+    positional alignment with ``config.argnums`` that the forensics records
+    (``zeroed``, ``ratios``) are read by. 0.0 would claim a MEASURED zero
+    where there was an exclusion. ``nan`` is neither: ``_grad_coverage``'s
+    pre-existing rule "the exact reference does not differentiate it either,
+    so an approximation cannot be blamed" already routes it to UNCOUNTED
+    (``nan > eps`` is False) with no new branch, and the logged
+    ``exact_norms``/``approx_norms`` stay honest.
+
+    On every 1-d-or-larger leaf this is still exactly what
+    ``ls_face_forensics.py`` computes (float32 norm of every ``tree_leaves``
+    entry), so the forensics numbers remain comparable leaf by leaf; the only
+    divergence is the scalar seed, which no longer exists in any launcher.
     """
     out = out[1] if has_aux else out
     leaves = jax.tree_util.tree_leaves(out)
-    return [float(jnp.linalg.norm(jnp.asarray(l, dtype=jnp.float32)))
+    return [float("nan") if jnp.ndim(l) == 0
+            else float(jnp.linalg.norm(jnp.asarray(l, dtype=jnp.float32)))
             for l in leaves]
 
 
@@ -1009,12 +1039,20 @@ def _grad_coverage(approx_norms, exact_norms) -> dict:
     n = min(len(approx_norms), len(exact_norms))
     a = [float(x) for x in approx_norms[:n]]
     e = [float(x) for x in exact_norms[:n]]
+    # 0-d (seed/direction) leaves arrive as nan from `_leaf_norms` and are
+    # NEVER countable -- see its docstring for the convention. They are
+    # kept out of the eps scale too: a bare max() over a list containing
+    # nan is order-dependent in Python and would silently poison eps.
+    _finite_e = [x for x in e if np.isfinite(x)]
+    n_uncountable = len(e) - len(_finite_e)
     eps = max(_GRAD_COV_EPS_ABS,
-              _GRAD_COV_EPS_REL * (max(e) if e else 0.0))
+              _GRAD_COV_EPS_REL * (max(_finite_e) if _finite_e else 0.0))
     ratios: list[float] = []
     counted: list[int] = []
     zeroed: list[int] = []
     for i in range(n):
+        # nan (0-d seed leaf) fails this comparison, so the A4 leaf-set
+        # convention needs no branch of its own here.
         if not (e[i] > eps):
             ratios.append(float("nan"))       # uncounted
             continue
@@ -1029,6 +1067,7 @@ def _grad_coverage(approx_norms, exact_norms) -> dict:
         return {"defined": False, "min_leaf_ratio": 1.0, "frac_zeroed": 0.0,
                 "n_leaves": n, "n_counted": 0, "n_uncounted": n,
                 "n_zeroed": 0, "zeroed": [], "ratios": ratios,
+                "n_uncountable": n_uncountable,
                 "approx_norms": a, "exact_norms": e, "channel": 1.0,
                 "leaf_mismatch": len(approx_norms) != len(exact_norms)}
     min_ratio = min(ratios[i] for i in counted)
@@ -1040,6 +1079,10 @@ def _grad_coverage(approx_norms, exact_norms) -> dict:
         "n_leaves": n,
         "n_counted": len(counted),
         "n_uncounted": n - len(counted),
+        # Of which this many were EXCLUDED BY CONVENTION (0-d seed /
+        # direction leaves, marked nan by `_leaf_norms`), as opposed to
+        # uncounted because the exact reference norm was <= eps.
+        "n_uncountable": n_uncountable,
         "n_zeroed": len(zeroed),
         "zeroed": zeroed,
         "ratios": ratios,

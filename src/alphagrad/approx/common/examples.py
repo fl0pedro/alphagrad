@@ -548,10 +548,71 @@ def seed_loss_fn(fn, argnums):
     return g
 
 
+_SEED_VERTICES_WARNED: list = []
+
+
+def _seed_vertices_requested(_flag) -> bool:
+    """``--seed-vertices``: DEPRECATED (workstream A4). Seeds are NOT vertices.
+
+    This is the ONE gate in front of the ONE place the flag is read, and it
+    makes two things loud that used to be silent.
+
+    1. THE COUPLING. ``--seed-vertices`` is meaningless without
+       ``--measure-grad``: both readers below return the unwrapped target
+       BEFORE they ever look at the seed flag, so passing it alone changed
+       nothing and said nothing -- a footgun that stayed live for the whole
+       campaign. The shell already encoded the rule by hand
+       (``run_full_nn256_v2_5seed.sh:305,309``: "--seed-vertices only when
+       SEED_VERTICES=1 AND grad mode (grad-only flag)"); the incoherent
+       combination is now an error rather than a no-op.
+
+    2. THE DEPRECATION. ``seed_loss_fn`` appends exactly two eqns -- a
+       tangent-seed ``add`` and an adjoint ``reduce_sum`` -- and they are
+       ORDINARY ELIMINABLE VERTICES: they enter the pointer's action space
+       (``env.py`` ``valid_vertices``, ``masks.build_vertex_valid_static``)
+       and enlarge the ``derived_max_faces`` closure bound. Measured on
+       nn256: 13 -> 15 vertices. Their stated purpose -- exposing forward /
+       reverse / cross-country seeding to the search -- was UNREACHABLE
+       anyway under ``ALPHAGRAD_FORCE_REV_ORDER=1``, which keeps only the
+       highest remaining vertex (``common/masks.py:145-151``), so the order
+       is pinned to reverse and only approximations are learned
+       (``docs/CLEAN_DESIGN_AUDIT.md`` row b10). No launcher passes it now.
+
+    The flag is kept ACCEPTED rather than deleted for exactly one reason: the
+    forensics / landscape-replay paths (``tools/landscape_map.py``,
+    ``ls_verify.sh``) must rebuild the SAME graph as an archived run that was
+    launched with it. New work should never set it.
+    """
+    if not _flag("seed_vertices"):
+        return False
+    if not _flag("measure_grad"):
+        raise ValueError(
+            "--seed-vertices requires --measure-grad. Without it the traced "
+            "target is the full Jacobian, the seed wrapper is never applied, "
+            "and the flag is a SILENT NO-OP (grad_target_setup / "
+            "grad_target_fn return before the seed branch). Pass "
+            "--measure-grad, or -- preferred -- drop --seed-vertices: "
+            "workstream A4 removed it from every launcher because seeds are "
+            "NOT vertices."
+        )
+    if not _SEED_VERTICES_WARNED:
+        _SEED_VERTICES_WARNED.append(1)
+        print("[A4] WARNING: --seed-vertices is DEPRECATED and is no longer "
+              "set by any launcher. It injects 2 eliminable vertices "
+              "(tangent-seed add + adjoint reduce_sum) into the action space "
+              "and into derived_max_faces, and the forward/reverse/"
+              "cross-country freedom they were meant to expose is unreachable "
+              "under ALPHAGRAD_FORCE_REV_ORDER=1. Keep it ONLY to reproduce "
+              "an archived run's graph.", flush=True)
+    return True
+
+
 def grad_target_setup(args_like, base_fn, xs, example):
     """Shared grad-mode target builder — returns ``(target_fn, xs, argnums)``.
 
-    Honors ``--measure-grad`` and ``--seed-vertices``. Called identically by the
+    Honors ``--measure-grad``. (``--seed-vertices`` is still accepted for
+    archived-run replay but is DEPRECATED -- see
+    ``_seed_vertices_requested``.) Called identically by the
     trainer (ppo_ray_worker) and the CPU measure-actor (cpu_approx_worker) so
     both build the IDENTICAL graph (jaxpr / vertex+action space / argnums).
     ``args_like`` may be an argparse Namespace or the actor's args dict."""
@@ -561,9 +622,12 @@ def grad_target_setup(args_like, base_fn, xs, example):
         return bool(getattr(args_like, name, False))
 
     base_argnums = infer_argnums(example)
+    # Checked BEFORE the measure_grad early return: that return is
+    # exactly what made --seed-vertices a silent no-op on its own.
+    seeded = _seed_vertices_requested(_flag)
     if not _flag("measure_grad"):
         return base_fn, tuple(xs), base_argnums
-    if _flag("seed_vertices"):
+    if seeded:
         return (
             seed_loss_fn(base_fn, base_argnums),
             tuple(xs) + (jnp.zeros(()),),                 # append tangent seed t=0
@@ -580,9 +644,11 @@ def grad_target_fn(args_like, base_fn, example):
             return bool(args_like.get(name, False))
         return bool(getattr(args_like, name, False))
 
+    # Same gate, same reason as in grad_target_setup.
+    seeded = _seed_vertices_requested(_flag)
     if not _flag("measure_grad"):
         return base_fn
-    if _flag("seed_vertices"):
+    if seeded:
         return seed_loss_fn(base_fn, infer_argnums(example))
     return scalar_loss_fn(base_fn)
 
