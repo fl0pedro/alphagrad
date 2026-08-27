@@ -9850,6 +9850,10 @@ def main():
         host_state["_wall_prev"] = _now
 
         # ---- per-face apply telemetry ---------------------------------------
+        # `_pf_stats` is the same dict, hoisted so the per-plan block below
+        # can read the per-kind applied fractions whether or not the face
+        # stack is on (empty dict -> NaN fractions, never a stale value).
+        _pf_stats: dict = {}
         if args.per_face or args.face_actions:
             pf = consume_per_face_stats()
             # The per-face legality hooks run INSIDE the Ray measure actors,
@@ -9884,6 +9888,94 @@ def main():
                 pf.get("skipped", 0) + pf.get("skipped_raised", 0))
             log_dict["approx_applied/fraction"] = pf.get(
                 "applied_fraction", 0.0)
+            _pf_stats = pf
+
+        # ---- PER-PLAN JOINT RECORDS (QUALITY_COLLAPSE sec 14.7) ------------
+        # "The one measurement that would most cheaply falsify the whole
+        # design": at ep30, read the per-plan JOINT of (approximation count,
+        # quality, latency, peak memory) and ask whether ANY plan has few
+        # approximations, q >= 0.8 and a real latency win. Twelve runs logged
+        # only MEANS, so within-episode spread -- the second-cheapest
+        # companion measurement, and the thing that decides whether a policy
+        # gradient exists at all -- was not reconstructible from ANY of them.
+        #
+        # Everything here is trainer-local numpy over arrays that are already
+        # materialised: no extra device work, no extra host callback. Per-env
+        # KEYS rather than a wandb.Table because a Table is re-uploaded whole
+        # on every log and this must survive 250 episodes.
+        #
+        # REQUESTED vs APPLIED -- READ THIS BEFORE USING THE NUMBERS.
+        #   `plan/NN/req_*` is what the POLICY CHOSE for that plan: spec rows
+        #   with `bi1 != -1`, split by kind (bi1 >= 0 DIAG, -2 COMPRESS,
+        #   -3 QUANT) plus the skip gate. It is exact and PER PLAN.
+        #   `approx_applied/*` is what graphax actually applied. It comes from
+        #   `_PER_FACE_STATS` via the measure actors, which is process-global
+        #   and consumed per LOG STEP, so it CANNOT be attributed to a plan
+        #   without changing env.py's telemetry. On TLM the two differ by two
+        #   orders of magnitude for DIAG (applied fraction 0.008-0.012) while
+        #   QUANT applies ~100% under pulldown, so they must never be
+        #   conflated.
+        #   `plan/NN/approx_applied_est` is the bridge and is an ESTIMATE, not
+        #   a measurement: per-plan requested-per-kind times the BATCH-WIDE
+        #   applied fraction of that kind. Use it for ranking, never as a
+        #   count. The `WIN` test on the stdout census uses the REQUESTED
+        #   total, which is conservative in the right direction (requested >=
+        #   applied, so "requested <= 20" is a subset of "applied <= 20").
+        host_state["_last_plan_rows"] = None
+        if not _lean and all_rets.ndim == 2:
+            _pl = {}
+            _KINDS = ("diag", "compress", "quant")
+            if face_specs_arr is not None:
+                _b1 = face_specs_arr[..., 0].reshape(
+                    face_specs_arr.shape[0], -1)               # (E, T*F*S)
+                _pl["req_diag"] = (_b1 >= 0).sum(axis=1)
+                _pl["req_compress"] = (_b1 == -2).sum(axis=1)
+                _pl["req_quant"] = (_b1 == -3).sum(axis=1)
+                _pl["approx_count"] = (_b1 != -1).sum(axis=1)   # req total
+            if face_skips_arr is not None:
+                _pl["skip_count"] = (face_skips_arr == 1).reshape(
+                    face_skips_arr.shape[0], -1).sum(axis=1)
+            # Batch-wide applied fraction per kind, from the SAME `pf` the
+            # approx_applied/* keys above are built from. Logged explicitly
+            # (the counts alone made the ratio a manual division).
+            _frac = {}
+            for _kd in _KINDS:
+                _ap = float(_pf_stats.get(f"applied_{_kd}", 0.0))
+                _sk = float(_pf_stats.get(f"skipped_{_kd}", 0.0))
+                _fr = _ap / (_ap + _sk) if (_ap + _sk) > 0 else float("nan")
+                _frac[_kd] = _fr
+                log_dict[f"approx_applied/frac_{_kd}"] = _fr
+                log_dict[f"approx_requested/{_kd}"] = float(
+                    np.sum(_pl.get(f"req_{_kd}", 0)))
+            log_dict["approx_requested/total"] = float(
+                np.sum(_pl.get("approx_count", 0)))
+            if face_specs_arr is not None:
+                _est = np.zeros((face_specs_arr.shape[0],), np.float64)
+                for _kd in _KINDS:
+                    _f = _frac[_kd]
+                    if np.isfinite(_f):
+                        _est += np.asarray(_pl[f"req_{_kd}"], np.float64) * _f
+                _pl["approx_applied_est"] = _est
+            for _nm in ("quality", "latency_ns", "peak_memory"):
+                _j = REWARD_INDEX.get(_nm)
+                if _j is not None and all_rets.shape[1] > _j:
+                    _pl[_nm] = all_rets[:, _j].astype(np.float64)
+            for _k, _v in _pl.items():
+                _v = np.asarray(_v)
+                for _i in range(_v.shape[0]):
+                    log_dict[f"plan/{_i:02d}/{_k}"] = float(_v[_i])
+                # WITHIN-EPISODE SPREAD. `plan/quality/std_ep` is the
+                # companion measurement sec 14.7 asks for: ~0 means every
+                # plan is equally destroyed and no policy gradient exists.
+                _f = _v[_live_env] if _live_env.any() else _v
+                _f = np.asarray(_f, np.float64)
+                log_dict[f"plan/{_k}/std_ep"] = float(_f.std())
+                log_dict[f"plan/{_k}/spread_ep"] = float(_f.max() - _f.min())
+                log_dict[f"plan/{_k}/min_ep"] = float(_f.min())
+                log_dict[f"plan/{_k}/max_ep"] = float(_f.max())
+                log_dict[f"plan/{_k}/median_ep"] = float(np.median(_f))
+            log_dict["plan/n_live"] = int(_live_env.sum())
+            host_state["_last_plan_rows"] = _pl
 
         # ---- degenerate plans sentinelled by the env ------------------------
         _degen = consume_degenerate_plan_count()
@@ -10154,15 +10246,18 @@ def main():
             # the bug that ran the ratio to 2.3e23 and was invisible in a
             # batch-averaged KL. mu_cos above the reward ceiling means critic
             # overestimation. Non-finite entropy means a poisoned gradient.
-            print("[health ep%d] ppo=%.4g value=%.4g ent=%.4g "
-                  "ratio/max_log=%.3g kl/approx=%.3g mu_quality=%.4g "
-                  "sec/ep=%.1f" % (
-                      _HEALTH_N[0] - 1, ppo_loss, value_loss, policy_entropy,
-                      log_dict.get("ratio/max_log", float("nan")),
-                      log_dict.get("kl/approx", float("nan")),
-                      log_dict.get("popart/mu_quality", float("nan")),
-                      log_dict.get("time/sec_per_episode", float("nan"))),
-                  flush=True)
+            # tqdm.write, not print: a bare print during a live progress bar
+            # is clobbered by the next \r repaint, which is how v65/v66b lost
+            # stdout lines that were genuinely emitted.
+            tqdm.write("[health ep%d] ppo=%.4g value=%.4g ent=%.4g "
+                       "ratio/max_log=%.3g kl/approx=%.3g mu_quality=%.4g "
+                       "sec/ep=%.1f" % (
+                           _HEALTH_N[0] - 1, ppo_loss, value_loss,
+                           policy_entropy,
+                           log_dict.get("ratio/max_log", float("nan")),
+                           log_dict.get("kl/approx", float("nan")),
+                           log_dict.get("popart/mu_quality", float("nan")),
+                           log_dict.get("time/sec_per_episode", float("nan"))))
             if _LIVE_FACES is not None:
                 # A chunk that fails soft is EMPTY, and an empty chunk leaves
                 # the palimpsa carry where it was -- i.e. the head decides on
@@ -10170,9 +10265,60 @@ def main():
                 # exists to remove, while every metric still looks healthy.
                 # `truncated` is the same failure by a different route: the
                 # window kept only the tail of the contraction.
-                print("[health ep%d] live-faces %s" % (
-                    _HEALTH_N[0] - 1, _LIVE_FACES.consume_stats()),
-                    flush=True)
+                tqdm.write("[health ep%d] live-faces %s" % (
+                    _HEALTH_N[0] - 1, _LIVE_FACES.consume_stats()))
+        # ---- PER-EPISODE PER-PLAN CENSUS on stdout -------------------------
+        # One line, every episode, whenever --lean-logging is off. This is the
+        # sec-14.7 falsifier in readable form: the per-plan JOINT plus an
+        # explicit answer to "is there a plan with few approximations, intact
+        # quality and a real latency win?". Routed through tqdm.write so the
+        # progress bar cannot overwrite it.
+        _pr = host_state.get("_last_plan_rows")
+        if _pr:
+            def _fmt(a, scale=1.0, sign=""):
+                a = np.asarray(a, np.float64) * scale
+                return (f"med={np.median(a):{sign}.4g} "
+                        f"[{a.min():{sign}.4g},{a.max():{sign}.4g}] "
+                        f"sd={a.std():.4g}")
+            _q = np.asarray(_pr.get("quality", []), np.float64)
+            _lt = -np.asarray(_pr.get("latency_ns", []), np.float64) / 1e3
+            _ac = np.asarray(_pr.get("approx_count", []), np.float64)
+            _ae = np.asarray(_pr.get("approx_applied_est", []), np.float64)
+            _sk = np.asarray(_pr.get("skip_count", []), np.float64)
+            _parts = [f"[plan ep={ep}] n={all_rets.shape[0]} "
+                      f"live={int(_live_env.sum())}"]
+            if _q.size:
+                _parts.append("q " + _fmt(_q, sign="+"))
+            if _lt.size:
+                _parts.append("lat_us " + _fmt(_lt))
+            if _ac.size:
+                # `req` is EXACT per plan; `applied~` is req x the batch-wide
+                # per-kind applied fraction -- an estimate, marked as one.
+                _parts.append("req " + _fmt(_ac))
+                _rk = "/".join(
+                    str(int(np.sum(_pr.get(f"req_{k}", 0))))
+                    for k in ("diag", "compress", "quant"))
+                _parts.append(f"req d/c/q={_rk}")
+            if _ae.size:
+                _parts.append("applied~ " + _fmt(_ae))
+            if _sk.size:
+                _parts.append(f"skips={int(_sk.sum())}")
+            # THE WIN TEST (sec 14.7): <= 20 approximations REQUESTED (an
+            # upper bound on applied, so this cannot miss a real win), q >=
+            # 0.8, and a latency at or below 0.9x this episode's own live
+            # median.
+            if _q.size and _lt.size and _ac.size:
+                _base = float(np.median(_lt[_live_env])) if _live_env.any() \
+                    else float(np.median(_lt))
+                _hit = np.where((_ac <= 20) & (_q >= 0.8)
+                                & (_lt <= 0.9 * _base) & _live_env)[0]
+                if _hit.size:
+                    _b = int(_hit[np.argmin(_lt[_hit])])
+                    _parts.append(f"WIN env={_b} lat={_lt[_b]:.4g}us "
+                                  f"q={_q[_b]:+.3f} ops={int(_ac[_b])}")
+                else:
+                    _parts.append("WIN none")
+            tqdm.write(" | ".join(_parts))
         # ALPHAGRAD_DEBUG_APPROX_PROB=1: mirror the approximation telemetry to
         # stdout, so a --wandb disabled probe (or a crashed run's log) still
         # answers "is skip/none ever chosen, or is it masked?".
