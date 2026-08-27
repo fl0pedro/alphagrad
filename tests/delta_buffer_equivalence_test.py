@@ -345,7 +345,7 @@ def test_face_chunks_and_counts_unchanged():
 
     vertex, n_faces = None, 0
     for cand in range(1, V + 1):
-        _t, _i, _c, n = lfs.chunk(order, specs, 0, cand, vspecs, rows, skips, 0)
+        _t, _i, _c, n = lfs.chunk(order, specs, 0, cand, vspecs, rows, skips, 0)[:4]
         if int(n) > n_faces:
             vertex, n_faces = cand, int(n)
         if n_faces >= 3:
@@ -365,9 +365,9 @@ def test_face_chunks_and_counts_unchanged():
 
     counts = []
     for f in range(n_faces):
-        t, i, c, n = lfs.chunk(order, specs, 0, vertex, vspecs, rows, skips, f)
+        t, i, c, n = lfs.chunk(order, specs, 0, vertex, vspecs, rows, skips, f)[:4]
         t2, i2, c2, n2 = lfs.chunk(order, specs, 0, vertex, vspecs, rows,
-                                   skips, f)
+                                   skips, f)[:4]
         # the chunk itself does not depend on the encoder at all
         assert np.array_equal(np.asarray(t), np.asarray(t2))
         assert np.array_equal(np.asarray(i), np.asarray(i2))

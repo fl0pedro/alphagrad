@@ -63,7 +63,7 @@ def main():
     v, nf = None, 0
     for cand in range(1, V + 1):
         _t, _i, _c, n = lfs.chunk(order, specs, 0, cand, vspecs, rows,
-                                  skips, 0)
+                                  skips, 0)[:4]
         if int(n) > nf:
             v, nf = cand, int(n)
         if nf >= 3:
@@ -76,7 +76,7 @@ def main():
     # --- 1. chunks carry tokens ------------------------------------------
     counts = []
     for f in range(nf):
-        t, i, c, n = lfs.chunk(order, specs, 0, v, vspecs, rows, skips, f)
+        t, i, c, n = lfs.chunk(order, specs, 0, v, vspecs, rows, skips, f)[:4]
         counts.append(int(c))
         print(f"  face {f}: {int(c):4d} tokens  n_faces={int(n)}")
     if all(c > 0 for c in counts):
@@ -96,7 +96,7 @@ def main():
     cat = []
     for f in range(nf):
         t, _i, c, _n = lfs.chunk(order, specs, 0, v, vspecs, rows,
-                                  skips, f)
+                                  skips, f)[:4]
         cat += [int(x) for x in t[:int(c)]]
     if cat == full:
         print(f"PASS 2  chunks concatenate to the real step ({len(full)} tok)")
@@ -140,7 +140,7 @@ def main():
     for cand in range(1, V + 1):
         lfs._chunks.clear()
         _t, _i, _c, nfc = lfs.chunk(order, specs, 0, cand, vspecs, rows,
-                                    skips, 0)
+                                    skips, 0)[:4]
         if int(nfc) < 2:
             continue
         lfs._chunks.clear()

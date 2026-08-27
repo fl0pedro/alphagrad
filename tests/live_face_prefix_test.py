@@ -237,7 +237,7 @@ def test_prefix_replay_matches_the_measurements_graph(disc):
     lfs._chunks.clear()
     lfs._prefix.clear()
     tok, _ids, cnt, _nf = lfs.chunk(order, specs, n, v_cur, vspecs, rows0,
-                                    sk0, 0, faces_a, skips)
+                                    sk0, 0, faces_a, skips)[:4]
     got = [int(x) for x in tok[:int(cnt)]]
     assert got == want_approx, (
         f"chunk read a graph the measurement never builds (decision {where}): "
@@ -247,7 +247,7 @@ def test_prefix_replay_matches_the_measurements_graph(disc):
     lfs._chunks.clear()
     lfs._prefix.clear()
     tok_o, _i, cnt_o, _n = lfs.chunk(order, specs, n, v_cur, vspecs, rows0,
-                                     sk0, 0)
+                                     sk0, 0)[:4]
     assert [int(x) for x in tok_o[:int(cnt_o)]] == want_exact
 
 

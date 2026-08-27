@@ -90,7 +90,7 @@ def test_a_skip_is_visible_in_the_next_faces_chunk(setup):
         for f in range(nf):
             tok, ids, cnt, n = lfs.chunk(
                 order, spec_hist, 0, v, vspecs, rows, skips, f,
-                face_hist, skip_hist)
+                face_hist, skip_hist)[:4]
             out.append(np.asarray(tok)[: int(cnt)].tobytes())
         return out
 
@@ -128,7 +128,7 @@ def test_the_shift_would_be_caught(setup):
         tok, ids, cnt, n = lfs.chunk(
             order, spec_hist, 0, v, vspecs,
             np.full((F, E.FACE_SLOTS, 3), -1, np.int32), skips, f,
-            face_hist, skip_hist)
+            face_hist, skip_hist)[:4]
         return np.asarray(tok)[: int(cnt)].tobytes()
 
     k = 1
