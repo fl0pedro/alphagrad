@@ -152,7 +152,11 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--noise-floor-reps", type=int, default=10,
                    help="Extra repeats of ONE plan to establish the quality "
                         "noise floor (>=10 required by the brief).")
-    p.add_argument("--noise-floor-plan", default="identity")
+    p.add_argument("--noise-floor-plan", default="identity",
+                   help="Comma-separated plan ids. The brief wants the "
+                        "quality noise floor on identity AND a mid-ladder "
+                        "plan, because a floor measured only on the exact "
+                        "plan says nothing about a plan that approximates.")
     p.add_argument("--warmup-trials", type=int, default=1,
                    help="Unrecorded-for-the-summary passes over every plan "
                         "before the measured trials. They ARE written to the "
@@ -172,6 +176,22 @@ def make_argparser() -> argparse.ArgumentParser:
                         "Repeatable.")
     p.add_argument("--archive-tol", type=float, default=0.02,
                    help="Relative tolerance when matching a target latency.")
+    p.add_argument("--archive-all-points", action="store_true",
+                   help="Replay EVERY point of every --archive front, not "
+                        "just the --archive-target ones. Recovery is "
+                        "attempted for all of them and reported as "
+                        "recovered/held per run; MEASUREMENT is capped by "
+                        "--archive-max-measure.")
+    p.add_argument("--archive-max-measure", type=int, default=10,
+                   help="How many recovered points per run actually get "
+                        "measured, taken in order of best (lowest) recorded "
+                        "latency -- that is the part of the front the "
+                        "owner's question is about.")
+    p.add_argument("--report-only", action="store_true",
+                   help="Measure nothing; read every rows_*.csv in --out-dir "
+                        "and emit the COMBINED report across configs.")
+    p.add_argument("--config-note", default="",
+                   help="Free-text note stamped on every row of this phase.")
     # plumbing
     p.add_argument("--out-dir",
                    default="/Users/assmuth/dsnn/run_analysis/landscape")
@@ -233,8 +253,9 @@ from alphagrad.approx.common.eval_samples import (            # noqa: E402
     generate_eval_samples,
 )
 from alphagrad.approx.common.order_specs import (             # noqa: E402
-    build_order_specs,
+    build_order_specs, parse_calls, calls_have_skip,
 )
+from alphagrad.approx.env import micro_actions_to_rule_specs  # noqa: E402
 from graphax.sparse.micro_actions import (                    # noqa: E402
     COMPRESS_KINDS, QUANT_DTYPES,
 )
@@ -499,6 +520,71 @@ def recover_archive_plan(path, env, order, target_latency_ns, target_quality,
                       "reported in the analysis is NOT on the final dumped "
                       "front, so its spec is unrecoverable from this file")
 
+    plan, note2 = _point_to_plan(best, env, order, path)
+    if plan is None:
+        return None, note2
+    return plan, note2
+
+
+class _RecoveryError(Exception):
+    pass
+
+
+def _recover_order_specs(seq, env):
+    """Rebuild (order, specs, n_rules, skips, convention) from a recorded seq.
+
+    WHY NOT ``build_order_specs``. That helper documents the recorded vertex
+    column as the agent's 0-BASED ACTION INDEX and resolves it through
+    ``env.valid_vertices``. For the face-actions/live-faces archives that is
+    simply false: on TLM the recorded column runs 1..95 over 95 valid
+    vertices, so ``valid[95]`` walks off the end -- which is why all 264
+    archived Pareto points failed to replay with
+    ``IndexError: index 95 is out of bounds for axis 0 with size 95``.
+
+    Both conventions exist in the archive set, so DETECT rather than assume,
+    and refuse rather than guess: a mis-resolved column shifts the whole
+    order by one, drops the real last vertex, and measures a garbage
+    Jacobian while reporting a healthy number (the exact failure mode
+    ``build_order_specs``'s own comment warns about)."""
+    valid = [int(v) for v in env.valid_vertices]
+    idx = [int(v) for v, _ in seq]
+    if not idx:
+        raise _RecoveryError("recorded seq is empty")
+    if sorted(idx) == sorted(valid):
+        resolved, conv = list(idx), "vertex-ids"
+    elif sorted(idx) == list(range(len(valid))):
+        resolved, conv = [valid[i] for i in idx], "action-indices"
+    else:
+        raise _RecoveryError(
+            f"NOT RECOVERED: the recorded vertex column matches neither the "
+            f"1-based vertex ids nor the 0-based action indices "
+            f"(n={len(idx)}, min={min(idx)}, max={max(idx)}, "
+            f"|valid_vertices|={len(valid)}) -- refusing to guess")
+
+    axis_static = np.asarray(env.axis_state_static)
+    specs = np.full((len(resolved), MAX_RULES_PER_VERTEX, 3), -1, dtype=np.int32)
+    specs[:, :, 2] = 0
+    skips = np.zeros(len(resolved), dtype=bool)
+    n_rules = 0
+    for k, ((_v, calls), vid) in enumerate(zip(seq, resolved)):
+        if not calls:
+            continue
+        if calls_have_skip(calls):
+            skips[k] = True
+        op, i, j, fac, kind, quant = parse_calls(calls)
+        if not op:
+            continue
+        n_rules += len(op)
+        specs[k] = micro_actions_to_rule_specs(
+            np.array(op), np.array(i), np.array(j), np.array(fac),
+            axis_state_for_vertex=axis_static[vid - 1],
+            compress_kinds=np.array(kind), quant_dtypes=np.array(quant))
+    return np.array(resolved, dtype=np.int32), specs, n_rules, skips, conv
+
+
+def _point_to_plan(best, env, order, path):
+    """One front entry -> (plan, note). Split out so the targeted matcher and
+    the --archive-all-points sweep cannot diverge in how they replay."""
     seq_field = best["seq"]
     if isinstance(seq_field, dict):
         seq, faces = seq_field.get("seq"), seq_field.get("faces") or []
@@ -508,10 +594,11 @@ def recover_archive_plan(path, env, order, target_latency_ns, target_quality,
         return None, f"{path}: matched point carries no 'seq'"
 
     try:
-        a_order, specs, n_rules, v_skips = build_order_specs(
-            seq, env, return_skips=True)
+        a_order, specs, n_rules, v_skips, conv = _recover_order_specs(seq, env)
+    except _RecoveryError as exc:
+        return None, f"{path}: {exc}"
     except Exception as exc:
-        return None, f"{path}: build_order_specs failed: {exc!r}"
+        return None, f"{path}: order/spec reconstruction failed: {exc!r}"
 
     mf = envmod.MAX_FACES
     face_specs = np.full((len(a_order), mf, FACE_SLOTS, 3), -1, dtype=np.int32)
@@ -538,7 +625,7 @@ def recover_archive_plan(path, env, order, target_latency_ns, target_quality,
                       "but no face wires -- cannot place it on the face "
                       "skip wire without guessing which faces it meant")
 
-    note = (f"recovered from {os.path.basename(path)}: "
+    note = (f"recovered from {os.path.basename(path)} [{conv}]: "
             f"{len(a_order)} vertices, {n_rules} per-vertex rules, "
             f"{n_faces} face wires, obj={best['obj']}")
     if list(map(int, a_order)) != list(map(int, order)):
@@ -575,6 +662,12 @@ def measure(env, eval_samples, order, plan):
     wall = time.perf_counter() - t0
     r = np.asarray(reward, dtype=np.float64)
     st = consume_per_face_stats()
+    # PER-KIND, not just the totals. Agent B measured DIAG landing on ~1% of
+    # the rules it was asked for on TLM, which makes a diag rung identity in
+    # disguise -- invisible in an aggregate `applied` count that a
+    # co-requested QUANT is filling up.
+    detail = {k: int(v) for k, v in st.items()
+              if k.startswith(("applied_", "skipped_"))}
     return {
         "latency_ns": float(-r[REWARD_INDEX["latency_ns"]]),
         "peak_memory": float(-r[REWARD_INDEX["peak_memory"]]),
@@ -583,15 +676,42 @@ def measure(env, eval_samples, order, plan):
         "wall_s": wall,
         "applied": int(st.get("applied", 0)),
         "skipped": int(st.get("skipped", 0)),
+        "applied_detail": json.dumps(detail, sort_keys=True),
     }
 
 
+# EVERY ROW CARRIES ITS CONFIG. The campaign's numbers are not comparable
+# across GRAPHAX_QUANT_PULLDOWN or across --latency-inner-reps (agent B
+# measured inner=5 carrying a systematic -13.1% amortisation bias vs
+# inner=50), so a row without its config is a row that will be misread.
 CSV_FIELDS = [
     "plan_id", "op", "budget", "trial", "role",
     "n_faces_approx", "n_slot_rows", "total_live_faces",
     "latency_ns", "peak_memory", "quality", "frob_residual",
-    "applied", "skipped", "wall_s", "timestamp",
+    "applied", "skipped", "applied_detail", "wall_s", "timestamp",
+    "pulldown", "inner_reps", "warmup_src", "config_note", "gpu",
 ]
+
+
+def config_stamp(args):
+    """The (pulldown, inner, warmup) triple this process is measuring under."""
+    return {
+        "pulldown": os.environ.get("GRAPHAX_QUANT_PULLDOWN", "unset"),
+        "inner_reps": int(args.latency_inner_reps),
+        # BOTH warmups, named. `script` = this tool's whole-plan pass, which
+        # pays the COMPILE. `env` = agent B's _resolve_warmup, untimed
+        # executions inside the measure loop, which pays first-touch on an
+        # already-compiled executable. They are not the same thing and both
+        # are on.
+        "warmup_src": (f"script:{int(args.warmup_trials)}+"
+                       f"env:{os.environ.get('ALPHAGRAD_MEASURE_WARMUP', '1')}"
+                       f"/cfg:{int(args.latency_warmup)}"),
+        "config_note": args.config_note,
+        # WHICH PHYSICAL DEVICE measured this row. If plan A and plan B are
+        # measured by different actors, a systematic per-device offset lands
+        # straight in PPO's within-batch advantage comparison.
+        "gpu": os.environ.get("CUDA_VISIBLE_DEVICES", "?"),
+    }
 
 
 def load_done(path):
@@ -733,16 +853,40 @@ def write_markdown(path, summ, notes, args, extra):
                  f"gives latency ratio {d['mean']:.4f} +/- {d['std']:.4f} "
                  f"(range {d['min']:.4f}-{d['max']:.4f}). No candidate ratio "
                  f"inside that band is evidence of anything.\n")
+    if extra.get("cold_seq"):
+        L.append("## Cold-measurement sequence (fresh process, no warmup)\n")
+        L.append("The SAME plan measured repeatedly from a cold process. "
+                 "This is how many rounds the campaign must discard: the "
+                 "first-round error here is the size of the spurious "
+                 "'winner' a round-1 measurement can invent.\n")
+        for cs in extra["cold_seq"]:
+            seq = cs["latencies"]
+            settled = cs["settled"]
+            L.append(f"**`{cs['plan_id']}`** (gpu {cs['gpu']}) - "
+                     f"{len(seq)} consecutive measurements, ns:\n")
+            L.append("| # | " + " | ".join(str(i) for i in
+                                           range(len(seq))) + " |")
+            L.append("|---|" + "---|" * len(seq))
+            L.append("| ns | " + " | ".join(f"{v:.0f}" for v in seq) + " |")
+            L.append("| vs settled | " + " | ".join(
+                f"{v / settled:.3f}" if settled else "n/a"
+                for v in seq) + " |")
+            L.append("")
+            L.append(f"- settled value (median of the last half): "
+                     f"{settled:.0f} ns")
+            L.append(f"- FIRST measurement error: {cs['first_err']:+.1%}")
+            L.append(f"- rounds until within 2% of settled: "
+                     f"{cs['rounds_to_settle']}")
+            L.append("")
     if extra.get("noise_floor"):
-        nf = extra["noise_floor"]
         L.append("## Quality noise floor\n")
-        L.append(f"Plan `{nf['plan_id']}` measured {nf['n']} times "
-                 f"independently:\n")
-        L.append(f"- quality mean {nf['mean']:.6f}, sd {nf['std']:.6g}, "
-                 f"range {nf['min']:.6f} - {nf['max']:.6f}")
-        L.append(f"- latency mean {nf['lat_mean']:.0f} ns, "
-                 f"sd {nf['lat_std']:.0f} ns "
-                 f"(CV {nf['lat_cv']:.2%})")
+        L.append("| plan | n | quality mean | quality sd | quality range | "
+                 "latency mean | latency CV |")
+        L.append("|---|---:|---:|---:|---|---:|---:|")
+        for nf in extra["noise_floor"]:
+            L.append(f"| `{nf['plan_id']}` | {nf['n']} | {nf['mean']:.6f} | "
+                     f"{nf['std']:.3g} | {nf['min']:.6f} - {nf['max']:.6f} | "
+                     f"{nf['lat_mean']:.0f} ns | {nf['lat_cv']:.2%} |")
         L.append("")
         L.append(f"The {args.walk_steps}-step Adam walk reads a FIXED probe batch and the "
                  "env's fixed initial weights (`env.args`, never re-drawn), "
@@ -751,8 +895,21 @@ def write_markdown(path, summ, notes, args, extra):
                  "quality autocorrelation against it: a spread far below the "
                  "between-episode variation means the episodes really were "
                  "measuring DIFFERENT plans.\n")
+    if extra.get("correction"):
+        L.append("## inner=5 vs inner=50 correction factor\n")
+        L.append("The campaign published every latency at "
+                 "`--latency-inner-reps 5`. Agent B measured that setting "
+                 "carrying a systematic amortisation bias against inner=50. "
+                 "Same plan, same pulldown, both measured in this session:\n")
+        L.append("| plan | pulldown | inner=5 (ns) | inner=50 (ns) | "
+                 "in5 / in50 |")
+        L.append("|---|---|---:|---:|---:|")
+        for c in extra["correction"]:
+            L.append(f"| `{c['plan']}` | {c['pulldown']} | {c['in5']:.0f} | "
+                     f"{c['in50']:.0f} | {c['in5_over_in50']:.4f} |")
+        L.append("")
     if notes:
-        L.append("## Archived winners\n")
+        L.append("## Archive recovery (points held / recovered / measured)\n")
         for n in notes:
             L.append(f"- {n}")
         L.append("")
@@ -803,6 +960,126 @@ def write_figure(path, summ, archive_ids):
     print(f"[landscape] figure -> {path}", flush=True)
 
 
+
+def _cold_sequences(rows):
+    """Ordered first-N measurements per noise-floor plan (the cold curve)."""
+    out = []
+    for pid in sorted({r["plan_id"] for r in rows if r["op"] == "noisefloor"}):
+        nf = sorted((r for r in rows if r["plan_id"] == pid),
+                    key=lambda r: int(r["trial"]))
+        lat = [float(r["latency_ns"]) for r in nf]
+        if len(lat) < 4:
+            continue
+        half = lat[len(lat) // 2:]
+        settled = float(np.median(half))
+        rts = next((i for i, v in enumerate(lat)
+                    if settled and abs(v - settled) / settled <= 0.02),
+                   len(lat))
+        out.append({
+            "plan_id": pid.replace("noisefloor:", ""),
+            "gpu": nf[0].get("gpu", "?"), "latencies": lat,
+            "settled": settled,
+            "first_err": (lat[0] - settled) / settled if settled else 0.0,
+            "rounds_to_settle": rts,
+        })
+    return out
+
+def combined_report(args):
+    """Merge every rows_*.csv in --out-dir into ONE cross-config report.
+
+    Rows from different (pulldown, inner_reps) settings are NOT comparable,
+    so the plan id is suffixed with its config rather than pooled. The
+    inner=5 vs inner=50 pairs are then reported side by side as the
+    CORRECTION FACTOR between the campaign's published numbers and honest
+    ones."""
+    import glob
+    rows = []
+    for f in sorted(glob.glob(os.path.join(args.out_dir, "rows_*.csv"))):
+        with open(f, newline="") as fh:
+            for r in csv.DictReader(fh):
+                r.setdefault("pulldown", "unset")
+                r.setdefault("inner_reps", "?")
+                r["_base"] = r["plan_id"]
+                r["_cfg"] = (f"pd{r['pulldown']}/in{r['inner_reps']}"
+                     f"/gpu{r.get('gpu', '?')}")
+                r["plan_id"] = f"{r['_base']} [{r['_cfg']}]"
+                rows.append(r)
+    if not rows:
+        print(f"[landscape] no rows_*.csv under {args.out_dir}", flush=True)
+        return
+    print(f"[landscape] merging {len(rows)} rows from "
+          f"{len({r['_cfg'] for r in rows})} configs", flush=True)
+
+    summ = summarise([r for r in rows if r["op"] != "noisefloor"])
+    extra = {}
+    floors = []
+    for pid in sorted({r["plan_id"] for r in rows if r["op"] == "noisefloor"}):
+        nf = [r for r in rows if r["plan_id"] == pid]
+        if len(nf) < 2:
+            continue
+        q = np.array([float(r["quality"]) for r in nf])
+        la = np.array([float(r["latency_ns"]) for r in nf])
+        floors.append({"plan_id": pid.replace("noisefloor:", ""),
+                       "n": int(q.size), "mean": float(q.mean()),
+                       "std": float(q.std(ddof=1)), "min": float(q.min()),
+                       "max": float(q.max()), "lat_mean": float(la.mean()),
+                       "lat_std": float(la.std(ddof=1)),
+                       "lat_cv": float(la.std(ddof=1) / la.mean())
+                       if la.mean() else 0.0})
+    if floors:
+        extra["noise_floor"] = floors
+    cs = _cold_sequences(rows)
+    if cs:
+        extra["cold_seq"] = cs
+
+    # inner=5 vs inner=50 correction factor, per base plan, SAME pulldown.
+    corr = []
+    base_cfg = {}
+    for pid, sm in summ.items():
+        b, cfg = pid.rsplit(" [", 1)
+        base_cfg[(b, cfg.rstrip("]"))] = sm
+    for (b, cfg), sm in sorted(base_cfg.items()):
+        if not cfg.endswith("/in5"):
+            continue
+        pd = cfg.split("/")[0]
+        other = base_cfg.get((b, f"{pd}/in50"))
+        if other is None:
+            continue
+        a, c = sm["latency_ns"]["mean"], other["latency_ns"]["mean"]
+        if a > 0 and c > 0:
+            corr.append({"plan": b, "pulldown": pd, "in5": a, "in50": c,
+                         "in5_over_in50": a / c})
+    if corr:
+        extra["correction"] = corr
+
+    notes = []
+    cen = sorted(glob.glob(os.path.join(args.out_dir, "archive_census*.json")))
+    for f in cen:
+        try:
+            for c in json.load(open(f)):
+                notes.append(
+                    f"`{c['run']}`: front holds {c['held']}, recovered "
+                    f"{c['recovered']}, measured {c['measured']}"
+                    + (f" -- **NOT RECOVERED**: {c['reason']}"
+                       if c.get("reason") else ""))
+        except Exception:
+            pass
+
+    md = os.path.join(args.out_dir, "summary_COMBINED.md")
+    write_markdown(md, summ, notes, args, extra)
+    with open(os.path.join(args.out_dir, "summary_COMBINED.json"), "w") as fh:
+        json.dump({"summary": summ, "extra": extra, "notes": notes}, fh,
+                  indent=2)
+    print(f"[landscape] combined summary -> {md}", flush=True)
+    if not args.no_figure:
+        # Figure shows the PRIMARY config only; mixing pulldown settings on
+        # one axis is exactly the comparison this report exists to prevent.
+        prim = {k: v for k, v in summ.items() if "pd1/in50" in k}
+        write_figure(os.path.join(args.out_dir, "landscape_COMBINED.png"),
+                     prim or summ,
+                     {k for k in (prim or summ) if k.startswith("arch:")})
+
+
 # ---------------------------------------------------------------------------
 def main():
     args = ARGS
@@ -812,6 +1089,10 @@ def main():
     md_path = os.path.join(args.out_dir, f"summary{tag}.md")
     fig_path = os.path.join(args.out_dir, f"landscape{tag}.png")
     plans_path = os.path.join(args.out_dir, f"plans{tag}.json")
+
+    if args.report_only:
+        combined_report(args)
+        return
 
     env, eval_samples, _cj = build_env(args)
     order = rev_order(env)
@@ -887,6 +1168,72 @@ def main():
         notes.append(f"**{lab}: recovered** -- {note}")
         print(f"[landscape] archive {lab}: {note}", flush=True)
 
+    # ---- EVERY point of EVERY archive (coordinator item 2) ---------------
+    # Recovery is attempted for ALL points and reported as recovered/held;
+    # MEASUREMENT is capped at --archive-max-measure per run, taken from the
+    # best-latency end -- that is the part of the front the owner's question
+    # ("re-measure the Pareto frontier unbiased") is actually about.
+    archive_census = []
+    if args.archive_all_points:
+        for lab, path in sorted(archive_paths.items()):
+            if not os.path.exists(path):
+                archive_census.append({"run": lab, "held": 0, "recovered": 0,
+                                       "measured": 0,
+                                       "reason": f"no such file: {path}"})
+                continue
+            try:
+                with open(path) as fh:
+                    doc = json.load(fh)
+            except Exception as exc:
+                archive_census.append({"run": lab, "held": 0, "recovered": 0,
+                                       "measured": 0,
+                                       "reason": f"unparseable: {exc!r}"})
+                continue
+            front = doc.get("front") or []
+            objs = doc.get("objectives") or []
+            lat_name = ("latency" if "latency" in objs
+                        else ("latency_ns" if "latency_ns" in objs else None))
+            recovered, failures = [], {}
+            for i, pt in enumerate(front):
+                pl, note = _point_to_plan(pt, env, order, path)
+                if pl is None:
+                    key = str(note).split(":")[-1].strip()[:80]
+                    failures[key] = failures.get(key, 0) + 1
+                    continue
+                lat = (-float(pt.get("obj", {}).get(lat_name, 0.0))
+                       if lat_name else 0.0)
+                recovered.append((lat, i, pl, pt.get("obj", {})))
+            # best-latency first; points with no latency sort last
+            recovered.sort(key=lambda t: (t[0] <= 0, t[0]))
+            take = recovered[:max(0, int(args.archive_max_measure))]
+            for lat, i, pl, obj in take:
+                pid = f"arch:{lab}:{i}"
+                pl["op"], pl["budget"] = "archive", f"{lab}#{i}"
+                pl["archive_obj"] = obj
+                plans[pid] = pl
+                plan_orders[pid] = pl["order"]
+                archive_ids.add(pid)
+            archive_census.append({
+                "run": lab, "held": len(front), "recovered": len(recovered),
+                "measured": len(take),
+                "reason": ("" if not failures else
+                           "; ".join(f"{v}x {k}" for k, v in failures.items())),
+            })
+            print(f"[landscape] archive {lab}: held {len(front)}, "
+                  f"recovered {len(recovered)}, measuring {len(take)}"
+                  + (f" | NOT RECOVERED: "
+                     + "; ".join(f"{v}x {k}" for k, v in failures.items())
+                     if failures else ""), flush=True)
+        with open(os.path.join(args.out_dir, f"archive_census{tag}.json"),
+                  "w") as fh:
+            json.dump(archive_census, fh, indent=2)
+        for c in archive_census:
+            notes.append(
+                f"`{c['run']}`: front holds {c['held']}, recovered "
+                f"{c['recovered']}, measured {c['measured']}"
+                + (f" -- **NOT RECOVERED**: {c['reason']}"
+                   if c["reason"] else ""))
+
     with open(plans_path, "w") as fh:
         json.dump({pid: {"op": p["op"], "budget": p["budget"],
                          "n_faces_approx": p["n_faces_approx"],
@@ -905,6 +1252,8 @@ def main():
 
     # --- measure ------------------------------------------------------------
     done = load_done(csv_path)
+    stamp = config_stamp(args)
+    print(f"[landscape] CONFIG {stamp}", flush=True)
     t_start = time.perf_counter()
     stop = False
 
@@ -938,7 +1287,8 @@ def main():
                 "timestamp": f"{time.time():.3f}",
                 **{k: m[k] for k in ("latency_ns", "peak_memory", "quality",
                                      "frob_residual", "applied", "skipped",
-                                     "wall_s")},
+                                     "applied_detail", "wall_s")},
+                **stamp,
             }
             append_row(csv_path, row)
             done[key] = row
@@ -982,7 +1332,9 @@ def main():
                     "timestamp": f"{time.time():.3f}",
                     **{k: m[k] for k in ("latency_ns", "peak_memory",
                                          "quality", "frob_residual",
-                                         "applied", "skipped", "wall_s")},
+                                         "applied", "skipped",
+                                         "applied_detail", "wall_s")},
+                    **stamp,
                 }
                 append_row(csv_path, row)
                 done[key] = row
@@ -992,13 +1344,18 @@ def main():
                       f"({m['wall_s']:.1f}s)", flush=True)
 
     # --- quality noise floor ------------------------------------------------
-    nf_pid = args.noise_floor_plan
-    nf_rows = []
-    if nf_pid in plans and args.noise_floor_reps > 0:
+    nf_pids = [x.strip() for x in args.noise_floor_plan.split(",")
+               if x.strip()]
+    for nf_pid in nf_pids:
+        if nf_pid not in plans:
+            print(f"[landscape] noise-floor plan {nf_pid!r} is not in this "
+                  f"phase's plan set -- skipped", flush=True)
+            continue
+        if args.noise_floor_reps <= 0:
+            continue
         for i in range(args.noise_floor_reps):
             key = (f"noisefloor:{nf_pid}", i, "candidate")
             if key in done:
-                nf_rows.append(done[key])
                 continue
             if not _budget_left():
                 break
@@ -1017,13 +1374,14 @@ def main():
                 "timestamp": f"{time.time():.3f}",
                 **{k: m[k] for k in ("latency_ns", "peak_memory", "quality",
                                      "frob_residual", "applied", "skipped",
-                                     "wall_s")},
+                                     "applied_detail", "wall_s")},
+                **stamp,
             }
             append_row(csv_path, row)
             done[key] = row
-            nf_rows.append(row)
-            print(f"[landscape] noise-floor {i}: q={m['quality']:.6f} "
-                  f"lat={m['latency_ns']:.0f}ns", flush=True)
+            print(f"[landscape] noise-floor[{nf_pid}] {i}: "
+                  f"q={m['quality']:.6f} lat={m['latency_ns']:.0f}ns",
+                  flush=True)
 
     # --- report -------------------------------------------------------------
     all_rows = list(load_done(csv_path).values())
@@ -1032,17 +1390,26 @@ def main():
     # from every measured aggregate.
     summ = summarise([r for r in all_rows if r["op"] != "noisefloor"])
     extra = {}
-    nf = [r for r in all_rows if r["op"] == "noisefloor"]
-    if len(nf) >= 2:
+    floors = []
+    for pid in sorted({r["plan_id"] for r in all_rows
+                       if r["op"] == "noisefloor"}):
+        nf = [r for r in all_rows if r["plan_id"] == pid]
+        if len(nf) < 2:
+            continue
         q = np.array([float(r["quality"]) for r in nf])
         la = np.array([float(r["latency_ns"]) for r in nf])
-        extra["noise_floor"] = {
-            "plan_id": nf_pid, "n": int(q.size),
+        floors.append({
+            "plan_id": pid.replace("noisefloor:", ""), "n": int(q.size),
             "mean": float(q.mean()), "std": float(q.std(ddof=1)),
             "min": float(q.min()), "max": float(q.max()),
             "lat_mean": float(la.mean()), "lat_std": float(la.std(ddof=1)),
             "lat_cv": float(la.std(ddof=1) / la.mean()) if la.mean() else 0.0,
-        }
+        })
+    if floors:
+        extra["noise_floor"] = floors
+    cs = _cold_sequences(all_rows)
+    if cs:
+        extra["cold_seq"] = cs
     write_markdown(md_path, summ, notes, args, extra)
     print(f"[landscape] summary -> {md_path}", flush=True)
     with open(os.path.join(args.out_dir, f"summary{tag}.json"), "w") as fh:
