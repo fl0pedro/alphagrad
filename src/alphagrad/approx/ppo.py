@@ -4079,6 +4079,30 @@ def make_argparser() -> argparse.ArgumentParser:
         help="Multiplier applied to output-head weights at startup for a near-uniform initial policy.",
     )
     p.add_argument(
+        "--init-scheme", type=str, default="campaign",
+        choices=["campaign", "classic"],
+        help="WHICH weight initialisation the agent is built with "
+             "(radical-simplification design, 2026-08-26). 'campaign' "
+             "(default) is TODAY'S pipeline bit-for-bit: orthogonal(sqrt 2) "
+             "weights, zero biases, then _scale_output_heads "
+             "(--head-init-scale on the pointer, 0.0 on pref_proj, and -- "
+             "per CLEAN_DESIGN_AUDIT a3 -- NOTHING on the face head, which "
+             "under --live-faces is the only live approximation head). "
+             "'classic' is textbook: Glorot/Xavier UNIFORM on every Linear, "
+             "zero biases, and NO output-head rescaling at all, so every "
+             "head is treated identically. --scale-face-head is independent "
+             "of this flag.")
+    p.add_argument(
+        "--scale-face-head", type=float, default=0.0,
+        help="CLEAN_DESIGN_AUDIT CODE-CHANGE #1, as its OWN knob: multiply "
+             "face_path_policy.head's output projection by SCALE at init. "
+             "0 (default) = off = bit-identical to every prior run, which is "
+             "also the state the audit calls a defect: the face head is the "
+             "one action head _scale_output_heads never touches, so its 94 "
+             "logits carry full orthogonal magnitude while the pointer sits "
+             "at --head-init-scale. Pass 0.1 to give it the same treatment "
+             "the other heads get, WITHOUT switching --init-scheme.")
+    p.add_argument(
         "--pin-rules-to-exact",
         action="store_true",
         help="Stage C: pin the axis-pair / factor heads to exact-AD "
@@ -4544,8 +4568,20 @@ def _build_agent(
     )
 
 
-def _scale_output_heads(agent, scale: float):
-    """Scale policy-head weights so the initial action distribution is near-uniform."""
+def _scale_output_heads(agent, scale: float, face_head_scale: float = 0.0):
+    """Scale policy-head weights so the initial action distribution is near-uniform.
+
+    ``face_head_scale`` (``--scale-face-head``, default 0 = OFF and therefore
+    bit-identical to every prior run) additionally scales
+    ``face_path_policy.head``'s output projection. CLEAN_DESIGN_AUDIT
+    CODE-CHANGE #1: that head is the ONLY action head this function has ever
+    touched -- and under ``--live-faces`` ``micro_action_policy`` is None, so
+    it is also the only LIVE approximation head. Its 94 logits therefore keep
+    full orthogonal(sqrt 2) magnitude while the pointer sits at 0.1x, i.e.
+    "random init" is asymmetric across heads. The knob is separate from
+    ``--init-scheme`` on purpose, so the fix can be tested without also
+    changing the sampler.
+    """
     # Vertex-head logit magnitude. PointerVertexPolicy scores through
     # pointer_proj; SetPointerVertexPolicy scores through
     # (k_proj(h) . q_proj(summary))/sqrt(E), so scaling k_proj scales
@@ -4606,7 +4642,50 @@ def _scale_output_heads(agent, scale: float):
                 lambda a: a.micro_action_policy.head.proj.layers[-1].weight,
                 scale,
             )
-    return agent
+    return _scale_face_head(agent, face_head_scale)
+
+
+def _scale_face_head(agent, scale: float):
+    """--scale-face-head (audit CODE-CHANGE #1); ``scale <= 0`` = no-op.
+
+    Same shape of edit as ``_scale_output_heads``' UnifiedApproxHead branch:
+    the face head has one shared output projection, so scaling its final
+    Linear scales all 94 logits together.
+    """
+    if float(scale) <= 0.0:
+        return agent
+    _fpp = getattr(agent, "face_path_policy", None)
+    if _fpp is None or getattr(_fpp, "head", None) is None:
+        return agent
+    return scale_module_weight(
+        agent, lambda a: a.face_path_policy.head.proj.layers[-1].weight,
+        float(scale))
+
+
+def apply_init_scheme(agent, init_key, args):
+    """``--init-scheme`` + ``--scale-face-head``, in ONE place.
+
+    ``ppo.main`` and ``common.agent_factory.build_and_init_agent`` are two
+    independent copies of the init pipeline (the factory docstring records
+    why), so the scheme dispatch lives here and both call it. With
+    ``init_scheme="campaign"`` and ``scale_face_head=0`` this is exactly
+    ``init_linear_weights(agent, init_key)`` followed by
+    ``_scale_output_heads(agent, head_init_scale)`` -- the historical two
+    lines, bit for bit.
+    """
+    scheme = str(getattr(args, "init_scheme", "campaign") or "campaign")
+    face_scale = float(getattr(args, "scale_face_head", 0.0) or 0.0)
+    if scheme not in ("campaign", "classic"):
+        raise ValueError(f"--init-scheme: unknown scheme {scheme!r}")
+    if scheme == "classic":
+        # Textbook: Glorot uniform everywhere, zero biases, and NO head
+        # rescaling -- every head, the face head included, on one scale.
+        agent = init_linear_weights(agent, init_key, scheme="glorot")
+        return _scale_face_head(agent, face_scale)
+    agent = init_linear_weights(agent, init_key)
+    return _scale_output_heads(
+        agent, float(getattr(args, "head_init_scale", 0.1)),
+        face_head_scale=face_scale)
 
 
 def _mask_vertex_logits(vertex_logits, vertex_avail_mask):
@@ -6302,8 +6381,11 @@ def main():
 
     agent_key, init_key, key = jrand.split(key, 3)
     agent = _build_agent(args, total_v, num_factors, max_rules, agent_key)
-    agent = init_linear_weights(agent, init_key)
-    agent = _scale_output_heads(agent, args.head_init_scale)
+    agent = apply_init_scheme(agent, init_key, args)
+    print(f"[init] scheme={getattr(args, 'init_scheme', 'campaign')} "
+          f"head_init_scale={float(getattr(args, 'head_init_scale', 0.1)):g} "
+          f"scale_face_head={float(getattr(args, 'scale_face_head', 0.0)):g}",
+          flush=True)
     # Identity-init parity with the factory path (az): ppo.main predates
     # build_and_init_agent and does not route through it.
     from alphagrad.approx.common.agent_factory import apply_face_none_bias

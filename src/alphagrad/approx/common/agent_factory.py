@@ -124,11 +124,14 @@ def build_and_init_agent(args, total_v: int, num_factors: int, max_rules: int,
                                        (kills the constant per-vertex offset),
       3. ``_scale_output_heads``     — x0.1 on the pointer scoring projection and
                                        zeroing of the five additive context paths.
+    Stages 2+3 are dispatched through ``ppo.apply_init_scheme`` so this path
+    and ``ppo.main``'s inline copy honour ``--init-scheme`` /
+    ``--scale-face-head`` identically; the defaults reproduce the pipeline
+    above bit for bit.
     """
     # Imported lazily: ppo.py imports heavy JAX/equinox modules and this module
     # is also imported by trainers that ppo.py itself does not know about.
-    from alphagrad.approx.ppo import _build_agent, _scale_output_heads
-    from alphagrad.approx.common.init import init_linear_weights
+    from alphagrad.approx.ppo import _build_agent, apply_init_scheme
 
     if key is None or init_key is None:
         if seed is None:
@@ -140,8 +143,7 @@ def build_and_init_agent(args, total_v: int, num_factors: int, max_rules: int,
         key, init_key = derive_agent_keys(seed)
 
     agent = _build_agent(args, total_v, num_factors, max_rules, key)
-    agent = init_linear_weights(agent, init_key)
-    agent = _scale_output_heads(agent, float(getattr(args, "head_init_scale", 0.1)))
+    agent = apply_init_scheme(agent, init_key, args)
 
     agent = apply_face_none_bias(agent)
     return agent
