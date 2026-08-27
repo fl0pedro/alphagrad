@@ -517,6 +517,63 @@ def _symlog_rewards(reward_vec: "jax.Array") -> "jax.Array":
     )
 
 
+def resolve_symlog_channels(args) -> str:
+    """``--symlog-channels`` after folding in the legacy ``--no-symlog``.
+
+    ``--no-symlog`` predates the three-way flag and is a strict alias for
+    ``none``; passing both is allowed only when they agree. Returns one of
+    ``"all" | "cost" | "none"``.
+    """
+    mode = str(getattr(args, "symlog_channels", "all") or "all")
+    if mode not in ("all", "cost", "none"):
+        raise ValueError(f"--symlog-channels: unknown mode {mode!r}")
+    if bool(getattr(args, "no_symlog", False)):
+        if mode not in ("all", "none"):
+            raise ValueError(
+                "--no-symlog and --symlog-channels "
+                f"{mode} disagree: --no-symlog IS --symlog-channels none. "
+                "Pass one of them.")
+        return "none"
+    return mode
+
+
+def configure_symlog(args) -> str:
+    """Set the module's symlog state from ``args``. PRE-TRACE ONLY.
+
+    ``_NO_SYMLOG_ALL`` and ``_NO_SYMLOG_MASK`` are captured as constants by
+    every traced graph, so this must run before the first jit. Returns the
+    resolved mode; the caller prints.
+
+    The three modes:
+
+    * ``all``  -- module default (every channel symlog'd) plus the historical
+      ``--reward-mode lagrangian`` carve-out that keeps the bounded violation
+      slot raw. BIT-IDENTICAL to the pre-flag code path.
+    * ``cost`` -- symlog on the latency/memory channels, QUALITY slot raw.
+      This is the additive design's composition:
+      ``l_cmp*symlog(lat) + l_mem*symlog(mem) + l_acc*q_raw``. Same mechanism
+      as the lagrangian carve-out, so the exempt set is the same single slot.
+    * ``none`` -- identity everywhere (``--no-symlog``).
+
+    Consistency of the "three sites" (QUALITY_COLLAPSE sec 12.10 /
+    CLEAN_DESIGN_AUDIT (c7)): the reward transform is PER CHANNEL, while the
+    value head's encode (``_value_target``) and GAE's decode
+    (``get_advantages``' symexp) are uniform and mutually inverse. A uniform
+    self-inverse pair around the critic preserves whatever space a channel's
+    reward was left in, so exempting a subset of channels needs no second
+    change. ``tests/symlog_channels_test.py`` pins the round trip per channel.
+    """
+    mode = resolve_symlog_channels(args)
+    _NO_SYMLOG_ALL[0] = (mode == "none")
+    if mode == "cost":
+        _set_no_symlog_indices((int(REWARD_INDEX["cosine_sim"]),))
+    elif mode == "all" and getattr(args, "reward_mode", None) == "lagrangian":
+        _set_no_symlog_indices((int(REWARD_INDEX["cosine_sim"]),))
+    else:
+        _set_no_symlog_indices(())
+    return mode
+
+
 def _value_target(x: "jax.Array") -> "jax.Array":
     """The value head's regression target.
 
@@ -524,8 +581,35 @@ def _value_target(x: "jax.Array") -> "jax.Array":
     live in, so applying ``reward_normalization_fn`` here symlogs them A SECOND
     TIME. Identity under --no-symlog; unchanged otherwise so the legacy path is
     bit-identical.
+
+    Its INVERSE is :func:`_value_decode`, and the two must be chosen together
+    -- see that function.
     """
     return x if _NO_SYMLOG_ALL[0] else reward_normalization_fn(x)
+
+
+def _value_decode(x: "jax.Array") -> "jax.Array":
+    """The exact inverse of :func:`_value_target`: what turns the value head's
+    output back into reward-channel units.
+
+    THE THIRD SITE OF THE SYMLOG TRIO. ``get_advantages`` is
+    ``make_get_advantages(use_symlog=True)`` and symexps the value head's
+    output inside its scan; ``_GAE_POPART`` is the ``use_symlog=False``
+    variant and does not. Which one is correct depends ONLY on how
+    ``_value_target`` encoded the critic's target, so the selection at the GAE
+    call site is ``use_popart or _NO_SYMLOG_ALL[0]`` and not just
+    ``use_popart``.
+
+    BUG THIS CLOSES (found 2026-08-26 by tests/symlog_channels_test.py's
+    per-channel round-trip): with ``--no-symlog`` AND ``--advantage-norm
+    none`` the critic learned a RAW target while GAE symexp'd its prediction,
+    so the baseline subtracted was ``symexp(V)`` against a ``V`` that meant
+    ``G`` -- an exponential distortion of every advantage, growing with the
+    channel's magnitude. No campaign run hit it (v65 pairs --no-symlog with
+    PopArt, which already selected the identity decode), but the
+    radical-simplification design's ``--symlog-channels none`` would have.
+    """
+    return x if _NO_SYMLOG_ALL[0] else inverse_reward_normalization_fn(x)
 
 
 def _per_channel_value_loss(values, targets):
@@ -3506,6 +3590,26 @@ def make_argparser() -> argparse.ArgumentParser:
              "sigma 0.00694 against a 0.1 floor) so the channel is shrunk "
              "~14x instead of normalised. Only meaningful with "
              "--advantage-norm popart.")
+    p.add_argument(
+        "--symlog-channels", type=str, default="all",
+        choices=["all", "cost", "none"],
+        help="WHICH reward channels the symlog transform is applied to "
+             "(radical-simplification design, 2026-08-26). 'all' (default) "
+             "is TODAY'S behaviour bit-for-bit: every channel is symlog'd, "
+             "except that --reward-mode lagrangian additionally exempts the "
+             "bounded violation slot. 'cost': symlog the LATENCY and MEMORY "
+             "channels only and leave the QUALITY channel RAW, so the "
+             "additive composition is "
+             "lambda_cmp*symlog(lat) + lambda_mem*symlog(mem) + lambda_acc*q "
+             "and lambda_acc prices one raw unit of quality directly (a "
+             "loss_drop of 1.0 buys exactly lambda_acc). 'none': the full "
+             "identity, i.e. exactly --no-symlog. The encode/decode pair "
+             "around the value head (_value_target's symlog on the target, "
+             "get_advantages' symexp on the head output) is uniform across "
+             "channels and self-inverse, so exempting a SUBSET of channels "
+             "leaves all three sites (reward transform, value target, GAE "
+             "symexp) mutually consistent -- pinned by "
+             "tests/symlog_channels_test.py.")
     p.add_argument(
         "--lean-logging", action="store_true",
         help="Log only aggregates (means, entropy, KL, collapse counts, "
@@ -8009,7 +8113,13 @@ def main():
         # overflows float32 — the trace showed `advantages` pinned at 3.403e38,
         # FLT_MAX, with estim_returns already NaN and every finite advantage
         # crushed to 0 by the resulting sigma.
-        _gae = _GAE_POPART if use_popart else get_advantages
+        # THE VALUE DECODE MUST MATCH `_value_target` (see _value_decode):
+        # the symexp variant is correct iff the critic's target was symlog'd.
+        # `use_popart` alone was the wrong predicate -- under
+        # `--no-symlog --advantage-norm none` the target is raw and the
+        # symexp variant exponentiated an already-raw prediction.
+        _gae = (_GAE_POPART if (use_popart or _NO_SYMLOG_ALL[0])
+                else get_advantages)
         _, estim_returns, advantages = _gae(
             head_rewards,
             traj.done,
@@ -8137,7 +8247,7 @@ def main():
             estim_returns = jnp.where(
                 _live > 0.5,
                 estim_returns,
-                inverse_reward_normalization_fn(traj.value),
+                _value_decode(traj.value),
             )
         else:
             new_m1, new_m2, new_w = popart_m1, popart_m2, popart_w
@@ -8825,8 +8935,8 @@ def main():
 
     # Reporting.
     # BEFORE any jit tracing: the transforms capture this as a constant.
-    if getattr(args, "no_symlog", False):
-        _NO_SYMLOG_ALL[0] = True
+    _symlog_mode = configure_symlog(args)
+    if _symlog_mode == "none":
         if args.advantage_norm != "popart":
             print(
                 "[warn] --no-symlog without --advantage-norm popart leaves the "
@@ -8835,6 +8945,12 @@ def main():
         else:
             print("[cfg] symlog DISABLED; PopArt alone scales the channels.",
                   flush=True)
+    elif _symlog_mode == "cost":
+        print("[cfg] --symlog-channels cost: latency/memory symlog'd, "
+              "QUALITY channel RAW. Additive composition is "
+              f"{float(args.lambda_cmp):g}*symlog(lat) + "
+              f"{float(args.lambda_mem):g}*symlog(mem) + "
+              f"{float(args.lambda_acc):g}*q_raw.", flush=True)
     elif args.reward_mode == "lagrangian":
         # STATIC-OBJECTIVE support (sec 12.10): with symlog ON in lagrangian
         # mode the VIOLATION channel is exempted from the transform. The
@@ -8849,7 +8965,7 @@ def main():
         # change behaviour); the encode/decode pair around the value head
         # is per-channel uniform, so all three sites (reward transform,
         # value target, GAE) stay mutually consistent by construction.
-        _set_no_symlog_indices((int(REWARD_INDEX["cosine_sim"]),))
+        # (The setter call itself now lives in `configure_symlog` above.)
         print("[cfg] lagrangian + symlog: cost channels symlog'd, violation "
               "channel RAW (symlog-exempt, bounded [-(tau+0.5), 0]).",
               flush=True)
