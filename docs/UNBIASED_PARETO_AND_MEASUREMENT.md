@@ -1152,3 +1152,41 @@ reference is the one coverage already compiles and caches.
 | `run_analysis/landscape/face_forensics.json` | §10.0 the per-leaf gradient norms of the four faces (T1) |
 | `run_analysis/landscape/grad_coverage_probe.json` | §10.6 the (a)-(e) validation run, job 62417/62421 |
 | `src/alphagrad/approx/tools/grad_coverage_probe.py`, `tests/grad_coverage_test.py` | §10 the instrument and its regression pins |
+
+## 11. R2 vs R3: the credit horizon is causal (CONFIRMED 2026-08-27)
+
+R2 (job 62412) and R3 (job 62413) differ by EXACTLY two flags -- verified by
+diffing the launchers; same seed 250197, same node class, same code:
+
+    R2: --discount 1.0  --gae-lambda 1.0
+    R3: --discount 0.99 --gae-lambda 0.95   (the never-set argparse defaults)
+
+At episode ~130:
+
+| run | none | quality med | skip | state |
+|---|---|---|---|---|
+| R2 | 0.998 | 0.8853 (sd 3.0e-06) | 0.000 | stable at identity, no drift |
+| R3 | 0.256 | 0.0000 (sd 0) | 0.615 | drifted to destruction |
+
+(gamma*lambda)^95 = 0.0079: under the defaults a terminal reward reaches the
+first elimination at 0.8 percent strength. Every campaign run v57-v66 used
+these defaults and none ever set them explicitly. CONCLUSION: the
+drift-to-destruction seen in v58b/v60/v61/v62/v63/v64b is caused by the credit
+horizon, and pure terminal Monte-Carlo credit (gamma=lambda=1) removes it.
+
+SECOND, EQUALLY IMPORTANT OBSERVATION: R2 does not collapse, but neither does
+it LEARN. Its quality spread is 3e-06 and its latency spread 1.7 us across 16
+plans -- every plan is effectively identical, so the advantage is about zero
+and there is no gradient. With FACE_NONE_BIAS=6 and every entropy term at zero
+(bonus 0, floor 0, clamp 0), nothing pushes the policy off identity. R2 is a
+no-contrast fixed point at the GOOD end, exactly as R1 is one at the destroyed
+end. The three arms bracket the space:
+
+    R1  random init, no gate    -> destroyed absorber, no contrast
+    R2  identity init, gamma=1  -> identity fixed point, no contrast
+    R3  identity init, gamma<1  -> drifts to destruction
+
+NEXT EXPERIMENT this implies: the R2 configuration plus a BOUNDED exploration
+pressure, made safe by the gradient-coverage guard (bcb61a1) so that exploring
+toward skips cannot be rewarded for freezing gradients. Without the guard,
+adding exploration to R2 would walk it into the same hack R3 found.
