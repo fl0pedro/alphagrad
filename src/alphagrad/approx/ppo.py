@@ -397,6 +397,43 @@ _HEALTH_N = [0]
 # it forces a host callback inside the jitted rollout scan.
 _DEBUG_ORDER = os.environ.get("ALPHAGRAD_DEBUG_ORDER", "0") == "1"
 
+# --face-read: WHERE in its chunk the face head reads
+# (docs/FACE_READ_POINT_TRACE.md). Set from argparse BEFORE any jit trace --
+# like LOGIT_CLAMP and _NO_SYMLOG_ALL, the traced graphs capture it as a
+# constant, and it also decides whether the per-face `head` wire exists at
+# all (so "chunk-mean" keeps the historical trace, not just the historical
+# numbers).
+#
+#   chunk-mean     (default, = today) mean over the WHOLE chunk, which is
+#                  [approx-echo(f-1) || header+contraction(f)] -- the head's
+#                  input is a token-count-weighted blend of the PREVIOUS
+#                  face's approximation with THIS face's contraction.
+#   own-span-mean  mean over face f's OWN span only, i.e. the chunk minus its
+#                  approx-echo prefix. The documented fix.
+#   last-row       the recurrence's output row for the LAST token of the
+#                  chunk: palimpsa's state conditioned on everything up to
+#                  and including face f's contraction ("read the state, not
+#                  the window").
+#
+# The CARRY ADVANCE is identical in all three: the side carry still consumes
+# the whole chunk, which is what keeps the recurrence causal.
+FACE_READ_MODES: tuple[str, ...] = ("chunk-mean", "own-span-mean", "last-row")
+_FACE_READ: list = ["chunk-mean"]
+
+
+def set_face_read(mode: str) -> None:
+    """Set the face read point; PRE-TRACE ONLY. Returns nothing."""
+    m = str(mode or "chunk-mean")
+    if m not in FACE_READ_MODES:
+        raise ValueError(f"--face-read: unknown mode {m!r} "
+                         f"(expected one of {FACE_READ_MODES})")
+    _FACE_READ[0] = m
+
+
+def _face_read_needs_head() -> bool:
+    """True iff the per-face approx-echo prefix length has to be wired."""
+    return _FACE_READ[0] != "chunk-mean"
+
 # PopArt decodes the value head itself (value * sigma + mu), so GAE must
 # NOT symexp on top of that. See the call site for why this only bites on
 # the second update.
@@ -1317,6 +1354,11 @@ class Trajectory(NamedTuple):
     delta_wr_head: jax.Array = None    # (MAX_FACES,) int32
     delta_wr_slot: jax.Array = None    # (MAX_FACES,) int32
     delta_wr_n: jax.Array = None       # () int32
+    # --face-read (docs/FACE_READ_POINT_TRACE.md): the per-face approx-echo
+    # PREFIX lengths of the chunks the head read, so `_face_replay` can mask
+    # its pooling exactly as `_face_encode` did. None-when-off, like the
+    # probe / edge-mem fields above.
+    face_heads: jax.Array = None       # (MAX_FACES,) int32
 
 
 class TrainBatch(NamedTuple):
@@ -1401,6 +1443,7 @@ class TrainBatch(NamedTuple):
     delta_wr_head: jax.Array = None    # (K, MAX_FACES)
     delta_wr_slot: jax.Array = None    # (K, MAX_FACES)
     delta_wr_n: jax.Array = None       # (K,)
+    face_heads: jax.Array = None       # (MAX_FACES,) int32 (--face-read)
 
 
 # ---------------------------------------------------------------------------
@@ -2601,14 +2644,14 @@ class Agent(eqx.Module):
                 )
                 (fa, face_logp, face_ent, f_cnt, f_dt,
                  f_de, f_ends) = _fl_out[:7]
-                _fl_edge = _fl_out[7:]  # (f_eslots, f_ewr) under edge_mem
+                _fl_tail = _fl_out[7:]  # (f_eslots, f_ewr)? + (f_heads)?
             face_out = (fa, face_logp, face_ent, f_pair, f_comp, f_valid,
                         f_cnt, f_dt, f_de, f_ends)
-            if getattr(self.face_path_policy, "edge_mem", False):
-                # --face-edge-mem: append the read slots + write metadata.
-                # Conditional so the flag-off tuple (and az_gumbel's
-                # 10-element unpack) is untouched.
-                face_out = face_out + tuple(_fl_edge)
+            # --face-edge-mem appends the read slots + write metadata;
+            # --face-read appends the per-face approx-echo prefix lengths,
+            # always LAST. Both conditional so the flag-off tuple (and
+            # az_gumbel's 10-element unpack) is untouched.
+            face_out = face_out + tuple(_fl_tail)
 
         return (
             vertex_idx,
@@ -2632,8 +2675,16 @@ class Agent(eqx.Module):
     # stored decisions off the STORED chunks. They must stay gate for gate
     # identical or the ratio is not 1 at epoch 0.
     # ------------------------------------------------------------------
-    def _face_encode(self, carry, tokens, eqns, count):
+    def _face_encode(self, carry, tokens, eqns, count, pool_from=None):
         """Extend the side carry by one face's chunk; ``(carry, summary)``.
+
+        ``pool_from`` (--face-read own-span-mean / last-row) is the chunk's
+        approx-echo PREFIX length: the number of leading rows that belong to
+        face ``f-1``'s approximation rather than to face ``f``'s own
+        contraction. Only the READOUT is masked by it -- the carry still
+        consumes the whole chunk, which is what keeps the recurrence causal
+        (docs/FACE_READ_POINT_TRACE.md, "Minimal change"). ``None`` (the
+        chunk-mean default) is the historical path, bitwise.
 
         The scan is SKIPPED when the chunk is empty. That is not a micro-
         optimisation: the loop is a static ``range(MAX_FACES)`` because jit
@@ -2645,6 +2696,8 @@ class Agent(eqx.Module):
         was, which the skip guarantees and the all-invalid scan only
         approximates.
         """
+        _mode = _FACE_READ[0]
+
         def _run(c):
             c2, rows, valid, _e = self.encode_extend(
                 c, tokens, eqns, count, window=MAX_DELTA_TOKENS, start=0)
@@ -2653,8 +2706,26 @@ class Agent(eqx.Module):
             # primitive the vertex slots are built from, and it has no
             # parameters. `_face_replay` runs the many-key form of exactly
             # this over the whole stored emission window.
+            _ar = jnp.arange(rows.shape[0], dtype=jnp.int32)
+            if _mode == "last-row":
+                # `rows[count-1]` IS the recurrence's output conditioned on
+                # everything consumed up to and including face f's
+                # contraction. Expressed as a one-hot mask rather than a
+                # dynamic index so `_face_replay` can mirror it with the
+                # identical scatter primitive.
+                ok = jnp.asarray(valid, jnp.float32) * (
+                    _ar == (jnp.asarray(count, jnp.int32) - 1))
+            elif _mode == "own-span-mean":
+                # `head` is TRACED (it comes off a pure_callback), so the
+                # mask is arange >= head -- never a Python slice.
+                ok = jnp.asarray(valid, jnp.float32) * (
+                    _ar >= jnp.asarray(pool_from, jnp.int32))
+            else:
+                ok = valid
+            # Empty pool -> scatter_mean divides by max(count, 1) -> the ZERO
+            # vector, which is exactly _repr's documented absent convention.
             return c2, _vmem.scatter_mean(
-                rows, jnp.zeros((rows.shape[0],), jnp.int32), valid, 1)[0]
+                rows, jnp.zeros((rows.shape[0],), jnp.int32), ok, 1)[0]
 
         def _skip(c):
             return c, jnp.zeros((self.embd_dim,), jnp.float32)
@@ -2761,26 +2832,36 @@ class Agent(eqx.Module):
             # (F, 2) read slots [lhs, rhs] + (F, 2) write meta [res, head].
             st0 = st0 + (-jnp.ones((F, 2), jnp.int32),
                          jnp.zeros((F, 2), jnp.int32))
+        # --face-read: the per-face approx-echo prefix lengths, stored so the
+        # loss can mirror the SAME pooling mask. Absent under chunk-mean, so
+        # the default carry (and trace) is unchanged.
+        _RH = _face_read_needs_head()
+        if _RH:
+            st0 = st0 + (jnp.zeros((F,), jnp.int32),)
 
         def _body(st):
+            _hds = st[-1] if _RH else None
+            _st_core = st[:-1] if _RH else st
             if _EM:
                 (f, carry, logp, ent, skips, cnts, rs, wa, ftok, feqn, off,
-                 fends, fesl, fwr) = st
+                 fends, fesl, fwr) = _st_core
             else:
                 (f, carry, logp, ent, skips, cnts, rs, wa, ftok, feqn, off,
-                 fends) = st
+                 fends) = _st_core
             # The chunk callback hands back the face's ENDPOINT VERTICES with
             # its tokens: the face enumeration that produced the chunk keyed
             # the face by exactly that pair, so it is free.
+            _cb = face_chunk_fn(f, vertex_idx, vertex_specs, rs, skips)
+            hd_f = None
+            if _RH:
+                _cb, hd_f = _cb[:-1], _cb[-1]
             if _EM:
                 # --face-edge-mem: the callback additionally resolves the
                 # face's operand edges against the host slot table --
                 # einfo = [lhs_slot, rhs_slot, res_slot, head].
-                tk_f, eq_f, ct_f, ends_f, ei_f = face_chunk_fn(
-                    f, vertex_idx, vertex_specs, rs, skips)
+                tk_f, eq_f, ct_f, ends_f, ei_f = _cb
             else:
-                tk_f, eq_f, ct_f, ends_f = face_chunk_fn(
-                    f, vertex_idx, vertex_specs, rs, skips)
+                tk_f, eq_f, ct_f, ends_f = _cb
             # Concatenate this chunk into the step's face stream -- the
             # EXACT tokens the head reads. The final emission is NOT a
             # substitute: chunk f's contraction is deliberately unhooked
@@ -2798,7 +2879,14 @@ class Agent(eqx.Module):
                 jnp.where(_m, tk_f, 0), mode="drop")
             feqn = feqn.at[off + _ar_w].set(
                 jnp.where(_m, eq_f, -1), mode="drop")
-            carry, summ = self._face_encode(carry, tk_f, eq_f, ct_eff)
+            # The prefix cannot outrun the buffer clamp: if the chunk was
+            # itself clamped to `ct_eff` the pool must start no later than
+            # its end, or an own-span read would pool nothing where the
+            # replay (which keys on the STORED count) pools something.
+            hd_eff = (jnp.minimum(jnp.asarray(hd_f, jnp.int32), ct_eff)
+                      if _RH else None)
+            carry, summ = self._face_encode(carry, tk_f, eq_f, ct_eff,
+                                            pool_from=hd_eff)
             if getattr(pol, "endpoint_read", False):
                 # ENDPOINT-SLOT READ (--face-endpoint-read,
                 # docs/FACE_LATENT_INFO_LOSS.md section 4): concatenate the
@@ -2840,21 +2928,26 @@ class Agent(eqx.Module):
             if _EM:
                 out = out + (fesl.at[f].set(ei_f[:2]),
                              fwr.at[f].set(ei_f[2:4]))
+            if _RH:
+                out = out + (_hds.at[f].set(hd_eff),)
             return out
 
         _st = lax.while_loop(lambda st: st[0] < n, _body, st0)
         (_f, _c, logp, ent, skips, cnts, _rs, wa, ftok, feqn,
          _off, fends) = _st[:12]
         fa = FaceAction(skip=skips, **dict(zip(self._WIRE_KEYS, wa)))
-        if _EM:
-            return (fa, logp, ent, cnts, ftok, feqn, fends) + tuple(_st[12:])
-        return fa, logp, ent, cnts, ftok, feqn, fends
+        # Layout: (fa, logp, ent, cnts, ftok, feqn, fends) then the edge-mem
+        # pair (if any) then the face heads (if any) -- heads LAST so the
+        # historical `[:7]` / edge `[7:9]` unpacks are untouched.
+        _tail = tuple(_st[12:])
+        return (fa, logp, ent, cnts, ftok, feqn, fends) + _tail
 
     def _face_replay(self, features, factor_tables, fa,
                      f_pair, f_comp, f_valid, enc_carry, face_chunks,
                      op_legality_override, face_bound=None,
                      face_win_budget=None, endpoint_rows=None,
-                     face_ends=None, edge_rows=None, face_eslots=None):
+                     face_ends=None, edge_rows=None, face_eslots=None,
+                     face_heads=None):
         """Score the stored FaceAction against contexts pooled from ONE scan
         of the stored emission window.
 
@@ -2892,7 +2985,32 @@ class Agent(eqx.Module):
                 "face_path_policy.edge_mem is on but the replay was not "
                 "handed edge_rows/face_eslots (az_gumbel does not support "
                 "--face-edge-mem yet).")
+        # --face-read mirror. THIS AND `_face_encode` MUST MOVE TOGETHER: a
+        # sampling-only change leaves the PPO ratio != 1 at epoch 0 with no
+        # error anywhere (the comment at `_face_loop`'s docstring is explicit
+        # about it). `_ends` are the chunk boundaries; face f's OWN span
+        # starts `a_f` tokens later, and its last row sits at `_ends[f]-1`.
+        _mode = _FACE_READ[0]
+        if _mode != "chunk-mean" and face_heads is None:
+            raise ValueError(
+                f"--face-read {_mode} needs the stored per-face approx-echo "
+                "prefix lengths (face_heads); the replay was handed None, "
+                "which would silently break the PPO ratio.")
         total = jnp.sum(f_cnt.astype(jnp.int32))
+
+        def _read_gate(pos, fid, ends_):
+            """Extra per-token gate implementing the --face-read mode.
+
+            ``None`` under chunk-mean, so the default path keeps not only the
+            same numbers but the same graph."""
+            if _mode == "chunk-mean":
+                return None
+            _starts = jnp.concatenate(
+                [jnp.zeros((1,), jnp.int32), ends_[:-1]])
+            if _mode == "last-row":
+                return (pos == (ends_[fid] - 1)).astype(jnp.float32)
+            _a = jnp.asarray(face_heads, jnp.int32)[:ends_.shape[0]]
+            return (pos >= (_starts[fid] + _a[fid])).astype(jnp.float32)
         # This is the LOSS side and it is reverse-differentiated (gradient
         # reaches palimpsa through exactly this scan), so the trip count comes
         # from `budget` (scan/cond) and never from a while_loop.
@@ -2922,6 +3040,9 @@ class Agent(eqx.Module):
                 fid = jnp.searchsorted(_ends, pos, side="right").astype(
                     jnp.int32)
                 live = jnp.asarray(valid_c, jnp.float32) * (pos < total)
+                _g = _read_gate(pos, jnp.minimum(fid, F - 1), _ends)
+                if _g is not None:
+                    live = live * _g
                 s_c, c_c = _vmem.scatter(rows_c, fid, live, F)
                 return (s_acc + s_c, c_acc + c_c)
 
@@ -2950,6 +3071,9 @@ class Agent(eqx.Module):
             _pos = jnp.arange(rows.shape[0], dtype=jnp.int32)
             _fid = jnp.searchsorted(ends, _pos, side="right").astype(jnp.int32)
             _live = jnp.asarray(_valid, jnp.float32) * (_pos < total)
+            _g = _read_gate(_pos, jnp.minimum(_fid, F - 1), ends)
+            if _g is not None:
+                _live = _live * _g
             face_latents = _vmem.scatter_mean(rows, _fid, _live, F)  # (F, E)
 
         if getattr(pol, "endpoint_read", False):
@@ -3076,6 +3200,7 @@ class Agent(eqx.Module):
         endpoint_rows=None,    # (V+1, E) loss-side read(base+dyn) rows
         edge_rows=None,        # (K, E) loss-side edge-memory read rows
         face_eslots=None,      # stored (F, 2) operand edge slots
+        face_heads=None,       # stored (F,) approx-echo prefix lengths
     ):
         """Joint log-prob / entropy for a stored typed action sequence.
 
@@ -3216,6 +3341,7 @@ class Agent(eqx.Module):
                     face_ends=face_ends,
                     edge_rows=edge_rows,
                     face_eslots=face_eslots,
+                    face_heads=face_heads,
                 )
             total_log_p = total_log_p + f_logp
             # Arity-normalised per the PER-HEAD ENTROPY NORMALISATION note
@@ -3414,6 +3540,30 @@ def make_argparser() -> argparse.ArgumentParser:
              "under FORCE_REV_ORDER it is predicted inert -- every lhs is "
              "primitive there). Requires the --live-faces stack; default "
              "off, bit-identical when off.")
+    p.add_argument(
+        "--face-read", type=str, default="chunk-mean",
+        choices=["chunk-mean", "own-span-mean", "last-row"],
+        help="WHERE in its chunk the face head reads "
+             "(docs/FACE_READ_POINT_TRACE.md). Face f's chunk is "
+             "[approx-echo(f-1) || header+contraction(f)]. "
+             "'chunk-mean' (default, = today) pools the WHOLE chunk, so the "
+             "94 logits are produced from a token-count-weighted blend of "
+             "the PREVIOUS face's approximation with THIS face's "
+             "contraction, with no marker separating them -- types 2 and 3 "
+             "conflated with a one-face offset. "
+             "'own-span-mean' masks the pooling at the already-computed "
+             "approx-echo prefix, so the head reads face f's OWN span "
+             "(the documented minimal fix; it also makes the edge-mem WRITE "
+             "and READ spans share a start). "
+             "'last-row' feeds the recurrence's output row for the LAST "
+             "token of the chunk -- palimpsa's state conditioned on "
+             "everything up to and including face f's contraction, i.e. the "
+             "state read rather than a window mean. "
+             "In ALL THREE the carry advance is unchanged: the side carry "
+             "still consumes the whole chunk, which is what keeps the "
+             "recurrence causal. Requires --live-faces. Sampling AND replay "
+             "move together (tests/face_read_point_test.py pins "
+             "rollout == replay for all three).")
     p.add_argument(
         "--exec-on-gpu",
         action="store_true",
@@ -5961,6 +6111,22 @@ def main():
     # live-face stream's), same feature-probe width conflict. Composes with
     # --face-endpoint-read: widths E / 3E / 5E.
     _EDGE_MEM = bool(getattr(args, "face_edge_mem", False))
+    # --face-read (docs/FACE_READ_POINT_TRACE.md). Set BEFORE any jit trace:
+    # `_face_encode` / `_face_replay` read `_FACE_READ` at trace time, and it
+    # also decides whether the per-face `head` wire exists at all.
+    set_face_read(getattr(args, "face_read", "chunk-mean"))
+    _FACE_HEADS = _face_read_needs_head()
+    if _FACE_HEADS and not bool(getattr(args, "live_faces", False)):
+        raise ValueError(
+            f"--face-read {_FACE_READ[0]} needs --live-faces: the read point "
+            "it moves only exists on the per-face chunk stream.")
+    if _FACE_HEADS:
+        print(f"[cfg] --face-read {_FACE_READ[0]}: the face head reads "
+              + ("face f's OWN span (the chunk minus its approx-echo "
+                 "prefix)" if _FACE_READ[0] == "own-span-mean"
+                 else "the LAST row of face f's chunk (palimpsa's state "
+                      "after f's contraction)")
+              + "; the carry still consumes the whole chunk.", flush=True)
     if _EDGE_MEM and not all((
             bool(getattr(args, "dynamic_substeps", False)),
             bool(getattr(args, "live_faces", False)),
@@ -6139,7 +6305,7 @@ def main():
             _EDGE_TABLE = EdgeSlotTable(int(_F_FACES))
         _live_face, _live_face_count = make_face_callbacks(
             _LIVE_FACES, window=MAX_DELTA_TOKENS, prof_sink=_env_prof_add,
-            edge_table=_EDGE_TABLE)
+            edge_table=_EDGE_TABLE, emit_head=_FACE_HEADS)
 
     # Live elimination chains: one per concurrent env, plus the previous
     # episode's, which the LRU only sheds once the new ones exist. Sized like
@@ -6829,6 +6995,9 @@ def main():
                      face_de_v, face_ends_v) = face_out[:10]
                     if _EDGE_MEM:
                         face_eslots_v, face_ewr_v = face_out[10:12]
+                    # --face-read: always the LAST element (see _face_loop).
+                    if _FACE_HEADS:
+                        face_heads_v = face_out[-1]
                 else:
                     face_action = _zero_face_action()
                     face_old_logp = jnp.array(0.0)
@@ -6848,6 +7017,8 @@ def main():
                         face_ewr_v = jnp.zeros(
                             (ENV_MAX_FACES, 2), jnp.int32
                         ).at[:, 0].set(-1)
+                    if _FACE_HEADS:
+                        face_heads_v = jnp.zeros((ENV_MAX_FACES,), jnp.int32)
                 if _DEBUG_ORDER:
                     # avail = how many vertices are still selectable; picked =
                     # the 0-based index chosen; was_avail = 1.0 iff that pick
@@ -7020,6 +7191,10 @@ def main():
                     _em_fields.update(emem_sums=emem_s, emem_counts=emem_c)
             else:
                 _em_fields = {}
+            # --face-read: the per-face approx-echo prefix lengths the head
+            # pooled from. Stored unconditionally-when-on, next to
+            # face_counts (which is what the loss's boundaries come from).
+            _fr_fields = ({"face_heads": face_heads_v} if _FACE_HEADS else {})
             transition = Trajectory(
                 preference=preference.astype(jnp.float32),
                 vertex_idx=jnp.asarray(vertex_idx, dtype=jnp.int32),
@@ -7073,6 +7248,7 @@ def main():
                 **_probe_fields,
                 **_vp_fields,
                 **_em_fields,
+                **_fr_fields,
                 discount=jnp.array(args.discount),
                 vertex_avail_mask=vertex_avail_mask,
             )
@@ -7193,7 +7369,7 @@ def main():
         def _eval_dyn(pref, vidx, action, vmask, ax_st, ax_vm,
                       k, pv, cv, fa=None, fpv=None, fcv=None, fv=None,
                       fen=None, pc3=None, fch=None, fcy=None, fb=None,
-                      fwb=None, fer=None, fem=None, fes=None):
+                      fwb=None, fer=None, fem=None, fes=None, fhd=None):
             # No token arguments: `pc3` (the carry-derived heads) IS the
             # encoding, exactly as on the rollout side.
             return agent.evaluate_action_dynamic(
@@ -7226,6 +7402,7 @@ def main():
                 endpoint_rows=fer,
                 edge_rows=fem,
                 face_eslots=fes,
+                face_heads=fhd,
             )
 
         # Re-derive each sample's encoding by extending its stored
@@ -7548,7 +7725,8 @@ def main():
                 # --face-edge-mem rows + stored slots ONLY when the flags
                 # are on (the arg tuple below appends them); with both off
                 # the vmapped signature -- and the trace -- is unchanged.
-                # Static index bookkeeping: [eprows?][emrows, eslots?].
+                # Static index bookkeeping:
+                # [eprows?][emrows, eslots?][fheads?].
                 lambda pref, vidx, action, vmask, ax_st,
                 ax_vm, k, pv, cv, fa, fpv, fcv, fv, fen, pl, pc, pvl,
                 fct, fdt, fde, cy, *per:
@@ -7570,6 +7748,9 @@ def main():
                          if _EDGE_MEM else None),
                     fes=(per[2 if _EP_READ else 1]
                          if _EDGE_MEM else None),
+                    # --face-read: the stored per-face approx-echo prefix
+                    # lengths; ALWAYS last in `per`.
+                    fhd=(per[-1] if _FACE_HEADS else None),
                 )
             )(
                 batch.preference,
@@ -7592,6 +7773,7 @@ def main():
                 pc_carry,
                 *((pc_eprows,) if _EP_READ else ()),
                 *((pc_emrows, batch.face_eslots) if _EDGE_MEM else ()),
+                *((batch.face_heads,) if _FACE_HEADS else ()),
             )
             if args.face_actions
             else jax.vmap(
@@ -8582,6 +8764,9 @@ def main():
             face_counts=traj.face_counts,
             face_delta_tokens=traj.face_delta_tokens,
             face_delta_eqns=traj.face_delta_eqns,
+            # --face-read: per-step, sliced by the same shuffle as
+            # face_counts (both are (num_envs, T, MAX_FACES)); None when off.
+            face_heads=traj.face_heads,
             enc_M=_w_encM,
             enc_I=_w_encI,
             enc_cumhist=_w_ench,

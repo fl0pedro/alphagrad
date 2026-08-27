@@ -156,7 +156,7 @@ def build_live_face_stream(jaxpr, argnums, consts, args, *, max_faces,
 
 
 def make_face_callbacks(live_faces, *, window, prof_sink=None,
-                        edge_table=None):
+                        edge_table=None, emit_head=False):
     """``(chunk_cb, count_cb)`` -- the device-side face callbacks.
 
     ``chunk_cb(f, order, spec_hist, step_count, vertex_idx, vertex_specs,
@@ -179,6 +179,14 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
     emission assigns; -1 for a dropped face), and the chunk's approx-echo
     prefix length (the write path's span correction). With ``None`` the
     callback shapes -- and the flag-off trace -- are exactly the v63 ones.
+
+    ``emit_head`` (``--face-read`` != chunk-mean) appends ONE MORE int32
+    scalar after everything else: the chunk's approx-echo prefix length
+    ``head``, which the read-point fix masks the head's pooling at
+    (``docs/FACE_READ_POINT_TRACE.md`` "Minimal change"). It rides
+    separately from the edge-mem ``einfo[3]`` so the two flags compose and
+    so ``--face-read chunk-mean`` keeps the historical callback arity --
+    i.e. the flag-off TRACE, not merely the flag-off values, is unchanged.
     """
     W = int(window)
     _perf = None
@@ -225,18 +233,24 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
                         face_hist, skip_hist,
                     )
                     _dist("face_chunk_len", cnt)
-                    return (tok, ids, np.asarray(cnt, np.int32),
+                    out1 = (tok, ids, np.asarray(cnt, np.int32),
                             np.asarray(ends, np.int32),
                             _einfo_host(0, _sc1, ekey, cvx, head, wrok))
-                tok, ids, cnt, _nf, ends = live_faces.chunk(
+                    if emit_head:
+                        out1 = out1 + (np.asarray(head, np.int32),)
+                    return out1
+                tok, ids, cnt, _nf, ends, head = live_faces.chunk(
                     order, spec_hist, int(np.asarray(step_count)),
                     int(np.asarray(vertex_idx)) + 1, vertex_specs,
                     face_rows, face_skips, int(np.asarray(f)),
                     face_hist, skip_hist,
                 )
                 _dist("face_chunk_len", cnt)
-                return (tok, ids, np.asarray(cnt, np.int32),
+                out1 = (tok, ids, np.asarray(cnt, np.int32),
                         np.asarray(ends, np.int32))
+                if emit_head:
+                    out1 = out1 + (np.asarray(head, np.int32),)
+                return out1
             # BATCHED (vmap_method="broadcast_all"): ONE host dispatch per
             # face substep for all envs. The sequential vmap ran E separate
             # callbacks with a device round-trip between each — the GPU
@@ -249,6 +263,7 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
             cnts = np.zeros((B,), np.int32)
             ends = np.zeros((B, 2), np.int32)
             einf = -np.ones((B, 4), np.int32)
+            heads = np.zeros((B,), np.int32)
             _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
             _vi, _vs = np.asarray(vertex_idx), np.asarray(vertex_specs)
             _fr, _fs = np.asarray(face_rows), np.asarray(face_skips)
@@ -265,17 +280,20 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
                     einf[i] = _einfo_host(i, int(_sc[i]), ekey, cvx,
                                           head, wrok)
                 else:
-                    tok, ids, cnt, _nf, end = live_faces.chunk(
+                    tok, ids, cnt, _nf, end, head = live_faces.chunk(
                         _order[i], _sh[i], int(_sc[i]), int(_vi[i]) + 1,
                         _vs[i], _fr[i], _fs[i], int(_ff[i]),
                         _fh[i], _kh[i],
                     )
                 toks[i], idss[i], cnts[i] = tok, ids, np.int32(cnt)
                 ends[i] = end
+                heads[i] = np.int32(head)
                 _dist("face_chunk_len", cnt)
-            if edge_table is not None:
-                return toks, idss, cnts, ends, einf
-            return toks, idss, cnts, ends
+            outB = ((toks, idss, cnts, ends, einf) if edge_table is not None
+                    else (toks, idss, cnts, ends))
+            if emit_head:
+                outB = outB + (heads,)
+            return outB
         finally:
             if _perf is not None:
                 prof_sink("faces.live_chunk", _perf() - _pt0)
@@ -291,6 +309,8 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
                    jax.ShapeDtypeStruct((2,), jnp.int32))
         if edge_table is not None:
             _shapes = _shapes + (jax.ShapeDtypeStruct((4,), jnp.int32),)
+        if emit_head:
+            _shapes = _shapes + (jax.ShapeDtypeStruct((), jnp.int32),)
         return jax.pure_callback(
             _live_face_host,
             _shapes,

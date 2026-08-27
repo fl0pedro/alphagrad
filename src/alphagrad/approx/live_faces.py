@@ -435,10 +435,21 @@ class LiveFaceStream:
     def chunk(self, order, specs, n, vertex, vertex_specs,
               face_rows, face_skips, f,
               face_rows_hist=None, face_skips_hist=None):
-        """Back-compat 5-tuple view of :meth:`chunk_ex` (its first 5)."""
-        return self.chunk_ex(order, specs, n, vertex, vertex_specs,
-                             face_rows, face_skips, f,
-                             face_rows_hist, face_skips_hist)[:5]
+        """``(tokens, eqn_ids, count, n_faces, ends, head)``.
+
+        :meth:`chunk_ex`'s first five plus ``head`` -- the approx-echo PREFIX
+        length of this chunk, i.e. how many of its leading tokens belong to
+        face ``f-1``'s APPROXIMATION rather than to face ``f``'s own
+        contraction (``docs/FACE_READ_POINT_TRACE.md`` (E)(i)). It is
+        returned UNCONDITIONALLY, not only under --face-edge-mem, because
+        ``--face-read own-span-mean`` / ``last-row`` need it to mask the
+        head's pooling to face ``f``'s own span. Cost: zero -- it is already
+        computed (and already truncation-corrected) inside ``chunk_ex``.
+        """
+        r = self.chunk_ex(order, specs, n, vertex, vertex_specs,
+                          face_rows, face_skips, f,
+                          face_rows_hist, face_skips_hist)
+        return r[:5] + (r[7],)
 
     def chunk_ex(self, order, specs, n, vertex, vertex_specs,
                  face_rows, face_skips, f,
