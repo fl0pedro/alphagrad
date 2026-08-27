@@ -10,6 +10,7 @@ convenience builders for the most common mask layouts.
 from __future__ import annotations
 
 import math
+import os
 
 import jax.numpy as jnp
 import numpy as np
@@ -404,6 +405,160 @@ def legal_compress_actions(st, max_axes: int = 8,
     mask = compress_valid_mask(st, max_axes)
     return [Compress(axes=(a,), kind=k)
             for a in range(max_axes) if mask[a] for k in kinds]
+
+
+# ---------------------------------------------------------------------------
+# PER-FACE DIAG masking  (``--diag-per-face``)
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS, and what it is NOT fixing.
+#
+# The unified face head does not choose a DIAG factor: ``_rows``
+# (unified_face_policy.py) hardcodes ``factor = gcd(N_i, N_j)`` over the
+# vertex's NOMINAL jaxpr sizes, and the (i, j) pair comes from a mask built by
+# ``face_masks`` against a PROBE of the face. Both are per-VERTEX quantities
+# dressed up as per-face ones: the probe records the tensor handed to the
+# per-vertex ``transforms`` callable, while the rule is then applied to the
+# face's THREE slot operands (lhs / rhs / res), whose index structures differ
+# from the probe's and from each other.
+#
+# MEASURED (NeuralNetwork, all three slots planted with the mask-admitted pair,
+# 2026-08-27). Of 155 live rejections in ``rule_is_legal``:
+#
+#   128 (83%)  the pair is ALREADY COUPLED at exactly this factor
+#              (base = factor, span = 1) -- an idempotent re-request, and a
+#              correct skip: applying it again would change nothing;
+#    20        one side is coupled to a DIFFERENT partner;
+#     8        the operand has rank 0 at this point;
+#     0        any factor clause (``factor % base``, ``d == 1``, ``span % d``).
+#
+# So the factor arithmetic was never the blocker -- the hypothesis that
+# ``d = factor // base == 1`` holds by construction is FALSE, because a free
+# pair returns ``base = 1``, not ``base = gcd``. What is missing is that the
+# requested (pair, factor) is not drawn from THIS operand's own legal set.
+#
+# ``diag_pair_factor_space`` IS that set -- legal factors are ``base * d`` for
+# divisors ``d > 1`` of ``span`` -- and the hook below is the only place in the
+# system where the live operand exists. So this is where the per-face mask has
+# to be applied. When enabled, an illegal DIAG is PROJECTED onto the operand's
+# legal set instead of being dropped:
+#
+#   1. keep the requested pair when it is legal here, and snap the factor to a
+#      legal one;
+#   2. otherwise fall back to a legal pair on this operand (deterministic
+#      order: prefer the requested ``i``, then the requested ``j``, then
+#      ascending index) and snap the factor there;
+#   3. otherwise leave the operand exact -- today's behaviour.
+#
+# The ``d``-selection rule is DETERMINISTIC and stated, not learned: the factor
+# is still not an action in the 94-slot head layout. ``largest`` (the default)
+# picks the finest blocks, matching what the head asks for today; ``nearest``
+# picks the legal factor closest to the requested one; ``smallest`` picks the
+# coarsest, i.e. the mildest approximation. It is a flag so that it can later
+# be replaced by a learned factor field without moving anything else.
+#
+# DEFAULT OFF. With the flag off this module behaves exactly as before, down to
+# the telemetry keys -- pinned by ``tests/diag_per_face_test.py``.
+
+_DIAG_PER_FACE = [os.environ.get("ALPHAGRAD_DIAG_PER_FACE", "0")
+                  not in ("0", "", "false", "False", "no")]
+_DIAG_PER_FACE_RULE = [os.environ.get("ALPHAGRAD_DIAG_PER_FACE_RULE",
+                                      "largest")]
+_DIAG_PER_FACE_REPAIR_PAIR = [os.environ.get(
+    "ALPHAGRAD_DIAG_PER_FACE_REPAIR_PAIR", "1")
+    not in ("0", "", "false", "False", "no")]
+_DIAG_RULES = ("largest", "nearest", "smallest")
+
+
+def set_diag_per_face(enabled: bool, rule: str = "largest",
+                      repair_pair: bool = True) -> None:
+    """Install the ``--diag-per-face`` setting process-wide.
+
+    Also republished to the ENVIRONMENT so the Ray measure actors -- which run
+    ``env._callback`` in their own processes and import this module fresh --
+    inherit it. Same "one env var read by one module" discipline the quality
+    channel uses; two paths that must agree is this codebase's dominant bug
+    class.
+    """
+    rule = str(rule)
+    if rule not in _DIAG_RULES:
+        raise ValueError(
+            f"--diag-per-face-rule must be one of {_DIAG_RULES}, got {rule!r}")
+    _DIAG_PER_FACE[0] = bool(enabled)
+    _DIAG_PER_FACE_RULE[0] = rule
+    _DIAG_PER_FACE_REPAIR_PAIR[0] = bool(repair_pair)
+    os.environ["ALPHAGRAD_DIAG_PER_FACE"] = "1" if enabled else "0"
+    os.environ["ALPHAGRAD_DIAG_PER_FACE_RULE"] = rule
+    os.environ["ALPHAGRAD_DIAG_PER_FACE_REPAIR_PAIR"] = (
+        "1" if repair_pair else "0")
+
+
+def diag_per_face_enabled() -> bool:
+    return bool(_DIAG_PER_FACE[0])
+
+
+def diag_pair_legal_factors(st, i: int, j: int) -> list:
+    """THE per-face legal ``Diag.factor`` set for ``(i, j)`` on ``st``.
+
+    Exactly the enumeration :func:`diag_pair_factor_space` describes: ``base *
+    d`` for every divisor ``d > 1`` of ``span``, ascending. Empty when the pair
+    affords nothing but the no-op -- which is the case that makes an
+    already-coupled pair unrepairable rather than merely mis-factored.
+    """
+    base, span = diag_pair_factor_space(st, i, j)
+    if base <= 0 or span <= 1:
+        return []
+    return [base * d for d in _divisors_above_one(span)]
+
+
+def _pick_diag_factor(factors: list, want: int, rule: str) -> int | None:
+    if not factors:
+        return None
+    if rule == "largest":
+        return factors[-1]
+    if rule == "smallest":
+        return factors[0]
+    return min(factors, key=lambda f: (abs(f - int(want)), f))
+
+
+def project_diag_to_face(st, rule, *, max_dims: int = 8,
+                         factor_rule: str | None = None,
+                         repair_pair: bool | None = None):
+    """``rule`` re-expressed inside THIS operand's legal set, or ``None``.
+
+    Returns ``None`` when the operand affords no legal DIAG at all -- notably
+    for the idempotent case (the pair is already coupled at this granularity,
+    so ``span == 1`` and there is nothing finer to ask for) and for a rank-0
+    operand. ``None`` means "leave exact", never "apply something illegal".
+    """
+    from graphax.sparse.micro_actions import Diag
+
+    if factor_rule is None:
+        factor_rule = _DIAG_PER_FACE_RULE[0]
+    if repair_pair is None:
+        repair_pair = _DIAG_PER_FACE_REPAIR_PAIR[0]
+    want = int(getattr(rule, "factor", 0))
+    vm = diag_valid_mask(st, max_dims)
+    i, j = int(rule.i), int(rule.j)
+    if 0 <= i < max_dims and 0 <= j < max_dims and vm[i, j]:
+        f = _pick_diag_factor(diag_pair_legal_factors(st, i, j), want,
+                              factor_rule)
+        return None if f is None else Diag(i, j, f)
+    if not repair_pair:
+        return None
+    # The requested pair does not exist on this operand. Deterministic
+    # fallback -- a stable order matters more than a clever one, because the
+    # policy has to be able to learn what its own action does.
+    cands = [(a, b) for a in range(max_dims) for b in range(max_dims)
+             if vm[a, b]]
+    if not cands:
+        return None
+    cands.sort(key=lambda ab: (ab[0] != i, ab[1] != j, ab))
+    for a, b in cands:
+        f = _pick_diag_factor(diag_pair_legal_factors(st, a, b), want,
+                              factor_rule)
+        if f is not None:
+            return Diag(a, b, f)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1097,18 +1252,44 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
         cur = st
         for rule in coupled:
             _kind = _kind_of(rule)
-            if not rule_is_legal(cur, rule, max_dims=max_dims,
+            live = rule
+            if not rule_is_legal(cur, live, max_dims=max_dims,
                                  max_axes=max_axes):
-                _bump("skipped")
-                _bump(f"skipped_{_kind}")
-                continue
+                # PER-FACE DIAG MASKING. The requested rule was chosen against
+                # the vertex's nominal sizes and a probe of the face; this
+                # operand has its own legal set, so ask for the nearest thing
+                # in it rather than dropping the action. Off by default.
+                _alt = None
+                if isinstance(rule, Diag) and _DIAG_PER_FACE[0]:
+                    _alt = project_diag_to_face(cur, rule, max_dims=max_dims)
+                    if _alt is not None and not rule_is_legal(
+                            cur, _alt, max_dims=max_dims, max_axes=max_axes):
+                        # The projection is meant to make this unreachable;
+                        # never apply an action the mask has not cleared.
+                        _alt = None
+                if _alt is None:
+                    _bump("skipped")
+                    _bump(f"skipped_{_kind}")
+                    if isinstance(rule, Diag) and _DIAG_PER_FACE[0]:
+                        # Distinguish the idempotent re-request (already
+                        # coupled at exactly this granularity, so span == 1 and
+                        # nothing finer is legal) from a genuine miss. Without
+                        # this split `applied_fraction` reads a correct no-op
+                        # as a failure, which is how DIAG came to look inert.
+                        _b, _s = diag_pair_factor_space(cur, rule.i, rule.j)
+                        if _b > 1 and _s == 1:
+                            _bump("skipped_diag_noop")
+                    continue
+                if _alt is not rule:
+                    live = _alt
+                    _bump("repaired_diag")
             try:
-                if isinstance(rule, Diag):
-                    cur = apply_diag(cur, rule)
-                elif isinstance(rule, Compress):
-                    cur = apply_compress(cur, rule)
-                elif isinstance(rule, Quant):
-                    cur = apply_quant(cur, rule)
+                if isinstance(live, Diag):
+                    cur = apply_diag(cur, live)
+                elif isinstance(live, Compress):
+                    cur = apply_compress(cur, live)
+                elif isinstance(live, Quant):
+                    cur = apply_quant(cur, live)
                 else:
                     _bump("skipped")
                     _bump(f"skipped_{_kind}")

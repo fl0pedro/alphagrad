@@ -4085,6 +4085,31 @@ def make_argparser() -> argparse.ArgumentParser:
              "indistinguishable to the head. Requires --face-actions and "
              "--incremental-encode (the loss re-runs the same recurrence from "
              "the stored step carry).")
+    p.add_argument(
+        "--diag-per-face", action="store_true",
+        help="Mask DIAG by each FACE's own legal factor set instead of the "
+             "vertex's. The head does not choose a factor -- it hardcodes "
+             "gcd(N_i, N_j) over NOMINAL jaxpr sizes -- and the (i, j) pair "
+             "comes from a probe of the face, not from the three slot "
+             "operands the rule is applied to. With this flag a DIAG that is "
+             "illegal on the live operand is PROJECTED onto that operand's "
+             "own legal set (`diag_pair_factor_space`: base*d for divisors "
+             "d>1 of span) rather than dropped. Also splits out "
+             "`per_face/skipped_diag_noop`, the idempotent re-requests that "
+             "today are counted as failures. Default off = unchanged.")
+    p.add_argument(
+        "--diag-per-face-rule", type=str, default="largest",
+        choices=("largest", "nearest", "smallest"),
+        help="Which legal d to take when projecting (--diag-per-face). "
+             "largest = finest blocks, what the head asks for today; nearest "
+             "= closest to the requested factor; smallest = mildest. "
+             "DETERMINISTIC, not learned -- the 94-slot head layout has no "
+             "factor field; this is the seam a learned one would replace.")
+    p.add_argument(
+        "--no-diag-per-face-repair-pair", action="store_true",
+        help="With --diag-per-face, project the FACTOR only: if the requested "
+             "(i, j) pair does not exist on the live operand, leave it exact "
+             "instead of falling back to a legal pair.")
     p.add_argument("--num-heads", type=int, default=2)
     p.add_argument("--hidden-dim", type=int, default=64)
     p.add_argument(
@@ -5234,6 +5259,17 @@ def main():
     # UnifiedFaceHead.logits reads the module constant at trace time.
     from alphagrad.approx.unified_face_head import set_logit_clamp
     set_logit_clamp(float(getattr(args, "face_logit_clamp", 0.0)))
+
+    # --diag-per-face must be installed BEFORE ray.init: the setter republishes
+    # to os.environ so the measure actors, which build their own hooks in their
+    # own processes, inherit the same setting.
+    from alphagrad.approx.common.masks import set_diag_per_face
+    set_diag_per_face(
+        bool(getattr(args, "diag_per_face", False)),
+        rule=str(getattr(args, "diag_per_face_rule", "largest")),
+        repair_pair=not bool(
+            getattr(args, "no_diag_per_face_repair_pair", False)),
+    )
 
     # ``ALPHAGRAD_TRACEMALLOC=1`` — start the Python allocator tracker
     # before any model code runs. Per-episode snapshots are diffed
@@ -9888,6 +9924,12 @@ def main():
                 pf.get("skipped", 0) + pf.get("skipped_raised", 0))
             log_dict["approx_applied/fraction"] = pf.get(
                 "applied_fraction", 0.0)
+            # --diag-per-face only (absent, not zero, when the flag is off, so
+            # the panel can tell "not enabled" from "enabled and never fired").
+            if pf.get("skipped_diag_noop") is not None:
+                log_dict["per_face/skipped_diag_noop"] = pf["skipped_diag_noop"]
+            if pf.get("repaired_diag") is not None:
+                log_dict["per_face/repaired_diag"] = pf["repaired_diag"]
             _pf_stats = pf
 
         # ---- PER-PLAN JOINT RECORDS (QUALITY_COLLAPSE sec 14.7) ------------
