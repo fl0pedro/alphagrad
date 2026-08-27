@@ -79,6 +79,8 @@ from alphagrad.approx.env import (
     quality_metric as _env_quality_metric,
     _AXIS_FEAT_GROUP_ID,
     consume_degenerate_plan_count,
+    consume_frozen_grad_plan_count,
+    consume_grad_coverage_stats,
     consume_truncated_plan_count,
     consume_untraceable_plan_count,
     consume_zero_work_plan_count,
@@ -340,11 +342,59 @@ HEAD_REWARD_INDICES: tuple[int, ...] = (
     REWARD_INDEX["cosine_sim"],
 )
 NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
+# The eqx attribute name of each value head, index-aligned with
+# HEAD_REWARD_INDICES / HEAD_NAMES. Single source of truth for
+# `_popart_rescale_heads` and `Agent.encode`'s concatenation.
+VALUE_HEAD_ATTRS: tuple[str, ...] = (
+    "value_head_flops", "value_head_mem", "value_head_cos")
+# --grad-coverage-weight > 0 APPENDS a FOURTH head on reward slot 7
+# (``grad_coverage``); `configure_grad_coverage` rebinds the four names above
+# before the agent is built and before any jit trace, exactly as
+# `configure_symlog` rebinds the symlog mask. Default 0 => three heads and a
+# bit-identical agent pytree (pinned by tests/grad_coverage_test.py).
+GRAD_COVERAGE_HEAD = "value_head_gcov"
 # Resolved from --quality-metric in `main`; names the quantity reward slot 6
 # actually holds, for every human-readable log line and the wandb
 # ``quality/metric`` key.
 _QUALITY_METRIC: str = "quality"
 HEAD_NAMES: tuple[str, ...] = ("latency", "mem", "quality")
+
+
+def configure_grad_coverage(args) -> tuple[bool, float]:
+    """Install the gradient-coverage configuration. PRE-EVERYTHING.
+
+    Must run BEFORE ``ray.init`` (the measure actors read the exported
+    environment), BEFORE ``_build_agent`` (the fourth value head changes the
+    agent pytree and ``pref_proj``'s input width) and BEFORE the first jit
+    trace (``_HEAD_REWARD_INDICES_ARR`` is captured as a constant).
+
+    Returns ``(guard_on, weight)``.
+
+    WHY ENV VARS AND NOT ARGS. Measurement happens in the Ray measure actors
+    (``--ray-measure``), which are separate processes that never see
+    ``args``. Every other measurement switch in this project travels the same
+    way (ALPHAGRAD_DIRECT_MEASURE, ALPHAGRAD_MEASURE_WARMUP, ...), and env.py
+    deliberately defaults the whole feature OFF when the variables are absent
+    so that a job launched before this commit cannot pick the guard up from a
+    respawned actor.
+    """
+    global HEAD_REWARD_INDICES, NUM_VALUE_HEADS, HEAD_NAMES
+    global VALUE_HEAD_ATTRS, _HEAD_REWARD_INDICES_ARR
+    guard = bool(getattr(args, "reject_frozen_grads", False))
+    weight = float(getattr(args, "grad_coverage_weight", 0.0) or 0.0)
+    os.environ["ALPHAGRAD_REJECT_FROZEN_GRADS"] = "1" if guard else "0"
+    os.environ["ALPHAGRAD_GRAD_COVERAGE_WEIGHT"] = repr(weight)
+    if weight != 0.0 and GRAD_COVERAGE_HEAD not in VALUE_HEAD_ATTRS:
+        # IDEMPOTENT: main() calls this once, but a test (or a caller that
+        # re-parses args) must not append the head twice.
+        HEAD_REWARD_INDICES = tuple(HEAD_REWARD_INDICES) + (
+            int(REWARD_INDEX["grad_coverage"]),)
+        HEAD_NAMES = tuple(HEAD_NAMES) + ("grad_cov",)
+        VALUE_HEAD_ATTRS = tuple(VALUE_HEAD_ATTRS) + (GRAD_COVERAGE_HEAD,)
+        NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
+        _HEAD_REWARD_INDICES_ARR = jnp.asarray(
+            HEAD_REWARD_INDICES, dtype=jnp.int32)
+    return guard, weight
 # Slot 2 was named "cos" until 2026-08-07; it is the value head for reward
 # slot 6, which now holds whichever quality metric env.quality_metric()
 # selects (the 200-step Adam-walk loss drop by default under --measure-grad,
@@ -602,12 +652,22 @@ def configure_symlog(args) -> str:
     """
     mode = resolve_symlog_channels(args)
     _NO_SYMLOG_ALL[0] = (mode == "none")
+    # GRADIENT COVERAGE is bounded [-1, 1] by construction (env.py's
+    # `_grad_coverage`: +min_leaf_ratio, or -frac_leaves_zeroed), so it needs
+    # no magnitude compression and symlog would only discount its per-unit
+    # price against the cost channels. Exempt it whenever the channel is live,
+    # in EVERY mode -- the same carve-out `cost` gives the quality slot. When
+    # the channel is off the slot is 0.0 and symlog(0) == 0, so adding the
+    # index would be a no-op anyway; it is added conditionally only to keep
+    # the flag-off mask bit-identical to HEAD.
+    _exempt: tuple[int, ...] = ()
     if mode == "cost":
-        _set_no_symlog_indices((int(REWARD_INDEX["cosine_sim"]),))
+        _exempt = (int(REWARD_INDEX["cosine_sim"]),)
     elif mode == "all" and getattr(args, "reward_mode", None) == "lagrangian":
-        _set_no_symlog_indices((int(REWARD_INDEX["cosine_sim"]),))
-    else:
-        _set_no_symlog_indices(())
+        _exempt = (int(REWARD_INDEX["cosine_sim"]),)
+    if float(getattr(args, "grad_coverage_weight", 0.0) or 0.0) != 0.0:
+        _exempt = _exempt + (int(REWARD_INDEX["grad_coverage"]),)
+    _set_no_symlog_indices(_exempt)
     return mode
 
 
@@ -1040,8 +1100,7 @@ def _popart_rescale_heads(agent, old_mu, old_sigma, new_mu, new_sigma):
     PopArt). ``common.popart.popart_rescale_mlp_head`` assumes ONE head with K
     output rows; ours are K separate 1-row MLPs, so apply it per head.
     """
-    heads = ("value_head_flops", "value_head_mem", "value_head_cos")
-    for k, name in enumerate(heads):
+    for k, name in enumerate(VALUE_HEAD_ATTRS):
         mlp = getattr(agent, name)
         seq = mlp.layers.layers
         li = max(i for i, l in enumerate(seq) if isinstance(l, eqx.nn.Linear))
@@ -1810,6 +1869,11 @@ class Agent(eqx.Module):
     value_head_flops: MLP
     value_head_mem: MLP
     value_head_cos: MLP
+    # FOURTH value head, reward slot 7 (``grad_coverage``). ``None`` unless
+    # --grad-coverage-weight != 0. A ``None`` field contributes NO leaves to
+    # the pytree, so the flag-off agent is leaf-for-leaf what HEAD builds and
+    # every saved checkpoint keeps loading.
+    value_head_gcov: MLP | None
     op_embedding: eqx.nn.Embedding
     # NO identity_pool and NO ctx_proj. A vertex's identity is palimpsa's rows
     # for its own equation, scattered into its own slot by `carry_stream`;
@@ -1851,6 +1915,7 @@ class Agent(eqx.Module):
         micro_action_policy=None,
         max_substeps=16,
         face_path_policy=None,
+        value_head_gcov=None,
     ):
         self.embedding = embedding
         self.pos_enc = pos_enc
@@ -1862,6 +1927,7 @@ class Agent(eqx.Module):
         self.value_head_flops = value_head_flops
         self.value_head_mem = value_head_mem
         self.value_head_cos = value_head_cos
+        self.value_head_gcov = value_head_gcov
         self.op_embedding = op_embedding
         self.pref_proj = pref_proj
         self.num_vertices = num_vertices
@@ -1916,7 +1982,10 @@ class Agent(eqx.Module):
         v_flops = self.value_head_flops(summary)
         v_mem = self.value_head_mem(summary)
         v_cos = self.value_head_cos(summary)
-        value = jnp.concatenate([v_flops, v_mem, v_cos], axis=-1)
+        _vs = [v_flops, v_mem, v_cos]
+        if self.value_head_gcov is not None:
+            _vs.append(self.value_head_gcov(summary))
+        value = jnp.concatenate(_vs, axis=-1)
         return vertex_logits, vertex_contexts, value
 
     def value_for(
@@ -2394,7 +2463,10 @@ class Agent(eqx.Module):
         v_flops = self.value_head_flops(summary)
         v_mem = self.value_head_mem(summary)
         v_cos = self.value_head_cos(summary)
-        value = jnp.concatenate([v_flops, v_mem, v_cos], axis=-1)
+        _vs = [v_flops, v_mem, v_cos]
+        if self.value_head_gcov is not None:
+            _vs.append(self.value_head_gcov(summary))
+        value = jnp.concatenate(_vs, axis=-1)
         return vertex_logits, vertex_contexts, value
 
     def sample_action_dynamic(
@@ -3622,6 +3694,29 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--gate-w", type=float, default=40.0,
                    help="mult mode: cheapness budget W in symlog-cost units "
                    "(cheapness = max(0, W - sum w_c*symlog(cost_c))).")
+    # ---- GRADIENT COVERAGE (docs/UNBIASED_PARETO_AND_MEASUREMENT.md sec 10)
+    p.add_argument(
+        "--reject-frozen-grads", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="HARD GUARD, DEFAULT ON. Measure per-leaf gradient coverage of "
+        "every terminal plan and REJECT (sentinel, advantage 0, never "
+        "ranked) any plan that leaves a trainable leaf with an exactly zero "
+        "gradient where the same order done exactly gives a non-zero one. "
+        "Closes the confirmed TLM reward hack: one skipped face removes "
+        "62-73%% of the backward pass and freezes 11-15 of 16 parameter "
+        "leaves, and the 200-step quality probe prices that at 0.02%% "
+        "(0.9258 vs 0.9260) at every horizon tested. Rejections are counted "
+        "on grad_cov/rejected_this_ep and printed, never silently dropped. "
+        "Exports ALPHAGRAD_REJECT_FROZEN_GRADS to the measure actors.")
+    p.add_argument(
+        "--grad-coverage-weight", type=float, default=0.0, metavar="W",
+        help="REWARD CHANNEL, default 0 = off. Adds gradient coverage as a "
+        "fourth value head on reward slot 7, weight W: the additive "
+        "composition becomes lambda_cmp*symlog(lat) + lambda_mem*symlog(mem) "
+        "+ lambda_acc*q + W*coverage. The channel is +min_leaf_ratio when "
+        "nothing is frozen and -frac_leaves_zeroed when something is, so it "
+        "is bounded [-1,1] and is NEVER symlogged (composes with "
+        "--symlog-channels cost). W != 0 also turns the measurement on.")
     p.add_argument("--anti-degen-penalty", type=float, default=2.0,
                    help="mult mode: penalty floor P for degenerate terminals "
                    "(shaped ramp -P -> -P*(1-tau_d) over cos in [0, tau_d]).")
@@ -4645,6 +4740,14 @@ def _build_agent(
     value_head_flops = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[4])
     value_head_mem = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[5])
     value_head_cos = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[12])
+    # GRAD-COVERAGE value head. Its key is FOLDED IN from keys[12] rather than
+    # taken from a widened `jrand.split`: widening the split would move every
+    # positional key and change the randomness of every seeded run, flag off
+    # included. Built only when the channel is live.
+    value_head_gcov = None
+    if GRAD_COVERAGE_HEAD in VALUE_HEAD_ATTRS:
+        value_head_gcov = MLP(args.embd_dim, 1, value_dims,
+                              key=jrand.fold_in(encoder_keys[12], 7))
     op_embedding = eqx.nn.Embedding(
         OP_TYPE_VOCAB_SIZE,
         args.op_embd_dim,
@@ -4728,6 +4831,7 @@ def _build_agent(
         value_head_flops=value_head_flops,
         value_head_mem=value_head_mem,
         value_head_cos=value_head_cos,
+        value_head_gcov=value_head_gcov,
         op_embedding=op_embedding,
         pref_proj=pref_proj,
         num_vertices=total_v,
@@ -5061,6 +5165,14 @@ def _build_head_weights(args) -> np.ndarray:
         weights[1] = args.lambda_mem
     if "acc" in args.rewards:
         weights[2] = args.lambda_acc
+    # --grad-coverage-weight W. The additive composition becomes
+    #   lambda_cmp*symlog(lat) + lambda_mem*symlog(mem) + lambda_acc*q
+    #     + W*grad_coverage
+    # with grad_coverage RAW (see configure_symlog: never symlogged). The
+    # head exists only when W != 0, so this index is in range exactly then.
+    if GRAD_COVERAGE_HEAD in VALUE_HEAD_ATTRS:
+        weights[HEAD_NAMES.index("grad_cov")] = np.float32(
+            getattr(args, "grad_coverage_weight", 0.0) or 0.0)
     return weights
 
 
@@ -5294,6 +5406,14 @@ def main():
     # no-op; other variants overwrite those three flags. Explicit CLI values
     # passed alongside --variant are clobbered — pick `custom` if you want
     # to mix-and-match.
+    # GRADIENT COVERAGE: before ray.init (the measure actors read the
+    # exported env), before _build_agent (the 4th value head changes the
+    # pytree) and before the first jit trace.
+    _gc_guard, _gc_weight = configure_grad_coverage(args)
+    print(f"[cfg] grad coverage: guard={'ON' if _gc_guard else 'OFF'} "
+          f"(--reject-frozen-grads) reward_weight={_gc_weight:g} "
+          f"heads={NUM_VALUE_HEADS} ({', '.join(HEAD_NAMES)})", flush=True)
+
     _apply_variant_preset(args)
     if args.variant != "custom":
         print(
@@ -10002,6 +10122,18 @@ def main():
                 _j = REWARD_INDEX.get(_nm)
                 if _j is not None and all_rets.shape[1] > _j:
                     _pl[_nm] = all_rets[:, _j].astype(np.float64)
+            # PER-PLAN GRADIENT COVERAGE. Reward slot 7 carries BOTH numbers
+            # in one float (env.py `_grad_coverage`): positive => nothing
+            # frozen and the value IS min_leaf_ratio; non-positive => the
+            # magnitude IS frac_leaves_zeroed and min_leaf_ratio is 0 by
+            # construction. Decoded here into the two keys the joint record
+            # is supposed to carry. The -1e10 pool-timeout sentinel is
+            # clipped out so it cannot own the panel's y-range.
+            _jg = REWARD_INDEX.get("grad_coverage")
+            if _jg is not None and all_rets.shape[1] > _jg:
+                _gc = np.clip(all_rets[:, _jg].astype(np.float64), -1.0, 1.0)
+                _pl["grad_cov_min_leaf_ratio"] = np.maximum(_gc, 0.0)
+                _pl["grad_cov_frac_zeroed"] = np.maximum(-_gc, 0.0)
             for _k, _v in _pl.items():
                 _v = np.asarray(_v)
                 for _i in range(_v.shape[0]):
@@ -10018,6 +10150,44 @@ def main():
                 log_dict[f"plan/{_k}/median_ep"] = float(np.median(_f))
             log_dict["plan/n_live"] = int(_live_env.sum())
             host_state["_last_plan_rows"] = _pl
+
+        # ---- GRADIENT COVERAGE census --------------------------------------
+        # THE ANTI-BUG-(c) REQUIREMENT. A rejected plan is excluded from the
+        # gradient, and docs sec 7(c) is the record of what happens when that
+        # is done SILENTLY: the res-slot plans were eaten for a whole campaign
+        # with no counter anywhere. Every rejection lands here, every episode,
+        # whether or not wandb is on.
+        try:
+            _gcs = consume_grad_coverage_stats()
+            _gc_rej = consume_frozen_grad_plan_count()
+            log_dict["grad_cov/rejected_this_ep"] = int(_gc_rej)
+            log_dict["grad_cov/measured_this_ep"] = int(_gcs["count"])
+            log_dict["grad_cov/undefined_this_ep"] = int(_gcs["undefined"])
+            if _gcs["count"]:
+                log_dict["grad_cov/min_leaf_ratio"] = float(
+                    _gcs["mean_min_leaf_ratio"])
+                log_dict["grad_cov/min_leaf_ratio_worst"] = float(
+                    _gcs["min_min_leaf_ratio"])
+                log_dict["grad_cov/frac_zeroed"] = float(
+                    _gcs["mean_frac_zeroed"])
+                log_dict["grad_cov/frac_zeroed_worst"] = float(
+                    _gcs["max_frac_zeroed"])
+                log_dict["grad_cov/wall_frac"] = float(_gcs["wall_frac"])
+                log_dict["grad_cov/wall_s"] = float(_gcs["wall_s"])
+            if _gc_rej or _gcs["count"]:
+                print(f"[grad-cov ep{ep}] measured={int(_gcs['count'])} "
+                      f"rejected={int(_gc_rej)} "
+                      f"undefined={int(_gcs['undefined'])} "
+                      f"min_leaf_ratio(mean/worst)="
+                      f"{_gcs['mean_min_leaf_ratio']:.4g}/"
+                      f"{_gcs['min_min_leaf_ratio']:.4g} "
+                      f"frac_zeroed(mean/worst)="
+                      f"{_gcs['mean_frac_zeroed']:.4g}/"
+                      f"{_gcs['max_frac_zeroed']:.4g} "
+                      f"added_wall={100.0 * _gcs['wall_frac']:.2f}%",
+                      flush=True)
+        except Exception:
+            pass
 
         # ---- degenerate plans sentinelled by the env ------------------------
         _degen = consume_degenerate_plan_count()
@@ -10345,6 +10515,13 @@ def main():
                 _parts.append("applied~ " + _fmt(_ae))
             if _sk.size:
                 _parts.append(f"skips={int(_sk.sum())}")
+            _gcm = np.asarray(_pr.get("grad_cov_min_leaf_ratio", []),
+                              np.float64)
+            _gcz = np.asarray(_pr.get("grad_cov_frac_zeroed", []), np.float64)
+            if _gcm.size and (_gcm.max() > 0.0 or _gcz.max() > 0.0):
+                _parts.append(f"cov med={np.median(_gcm):.4g} "
+                              f"[{_gcm.min():.4g},{_gcm.max():.4g}] "
+                              f"frozen={int((_gcz > 0).sum())}/{_gcz.size}")
             # THE WIN TEST (sec 14.7): <= 20 approximations REQUESTED (an
             # upper bound on applied, so this cannot miss a real win), q >=
             # 0.8, and a latency at or below 0.9x this episode's own live

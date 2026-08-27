@@ -868,6 +868,260 @@ def _record_zero_work_plan() -> None:
     _ZERO_WORK_PLANS[0] += 1
 
 
+# ==========================================================================
+# GRADIENT COVERAGE  (2026-08-27)
+# ==========================================================================
+# THE HACK THIS CLOSES. On the TransformerLM target a SINGLE skipped face
+# removes 62-73% of the backward pass AND zeroes the gradient of most
+# trainable parameters (measured: k24/f0 freezes 11 of 16 leaves, k22/f0 12,
+# k19/f0 14, k13/f1 15 -- run_analysis/landscape/face_forensics.json). The
+# 200-step Adam quality probe scores those plans at 0.9258 against an exact
+# 0.9260 -- a 0.02% gap -- and the discrimination gets 50-200x WORSE at longer
+# horizons (gap 0.000215 -> 0.000004 from 200 to 3200 steps), because the walk
+# measures single-batch overfitting, which a small subset of the parameters
+# achieves on its own. So NO horizon of that probe can separate a full
+# backward pass from a third of one. Coverage measures the thing directly.
+#
+# DEFINITION. For a plan P and one fixed measurement point x:
+#   g_a = P's gradient output at x       (the compiled approx executable)
+#   g_e = the SAME order done exactly at x (``_do_compile_exact``)
+# per output leaf l (one leaf per entry of ``config.argnums``):
+#   n_a[l] = ||g_a[l]||_2 ,  n_e[l] = ||g_e[l]||_2
+#   counted(l)  <=>  n_e[l] > eps   (epsilon policy below)
+#   ratio[l]    = min(1, n_a[l] / n_e[l])   -- NaN/inf in g_a scores 0
+#   min_leaf_ratio    = min over counted leaves of ratio[l]   (1.0 if none)
+#   frac_leaves_zeroed = #{counted l : n_a[l] == 0 or non-finite} / #counted
+#
+# EPSILON POLICY (explicit, because it decides what "frozen" means). A leaf
+# whose EXACT norm is at or below
+#     eps = max(_GRAD_COV_EPS_ABS, _GRAD_COV_EPS_REL * max_l n_e[l])
+# is UNCOUNTED: it carries no gradient under the exact reference either, so an
+# approximation cannot be blamed for zeroing it, and dividing by it would
+# manufacture a 0/0. Uncounted leaves are excluded from BOTH the min and the
+# denominator of frac_zeroed, and their number is reported
+# (``n_uncounted``) so a silently-empty denominator is visible. Defaults
+# 1e-12 (relative) and 1e-30 (absolute); override with
+# ALPHAGRAD_GRAD_COV_EPS_REL / _ABS. With every leaf uncounted the plan is
+# reported as ``undefined`` and is NEVER rejected.
+#
+# THE WIRE. One reward slot (7, ``grad_coverage``) carries both numbers,
+# losslessly, because they are mutually exclusive by construction: a zeroed
+# leaf has ratio exactly 0 and is therefore the minimum, so
+# ``frac_zeroed > 0`` implies ``min_leaf_ratio == 0``. Encoding:
+#     channel = +min_leaf_ratio      when frac_zeroed == 0   -> ( 0, 1]
+#     channel = -frac_leaves_zeroed  when frac_zeroed  > 0   -> [-1, 0)
+# so the channel is bounded [-1, 1], monotone in "how much of the gradient
+# survives", and needs NO symlog. The all-frozen end (-1.0) coincides with the
+# value ``_SENTINEL_BAD_REWARD`` already writes into slot 7.
+#
+# COST. n_a comes from an execution the measurement loop ALREADY ran (point 0
+# of the campaign budget), so it is free apart from the norm reductions. n_e
+# needs the exact executable, which is memoised per (order, arg shapes,
+# device, measurement point) in ``_EXACT_LEAF_NORMS`` -- under a fixed order
+# that is ONE compile and ONE execution per process, amortised over every
+# plan. Measured overhead is published as ``grad_cov/wall_frac``.
+_GRAD_COV_EPS_REL = float(os.environ.get("ALPHAGRAD_GRAD_COV_EPS_REL", "1e-12"))
+_GRAD_COV_EPS_ABS = float(os.environ.get("ALPHAGRAD_GRAD_COV_EPS_ABS", "1e-30"))
+# Per-(order, point) exact per-leaf gradient norms. Small: one tuple of floats
+# per distinct elimination order per process.
+_EXACT_LEAF_NORMS: dict = {}
+# Plans REJECTED by the hard guard (frac_leaves_zeroed > 0). Counted on its
+# OWN counter -- not folded into _TRUNCATED_PLANS -- because a rejection is a
+# verdict about the PLAN, while a truncation is the apparatus giving up, and
+# the two must never be read as one number. It DOES bump _DEGENERATE_PLANS so
+# the legacy aggregate keeps meaning "transitions excluded from the gradient".
+_FROZEN_GRAD_PLANS = [0]
+_GRAD_COV_STATS: dict = {
+    "n": 0,                 # coverage measurements taken
+    "n_undefined": 0,       # every leaf uncounted, or the exact ref failed
+    "n_rejected": 0,        # guard fired
+    "sum_min_ratio": 0.0,
+    "min_min_ratio": 1.0,
+    "sum_frac_zeroed": 0.0,
+    "max_frac_zeroed": 0.0,
+    "wall_s": 0.0,          # wall spent INSIDE the coverage block
+    "measure_wall_s": 0.0,  # wall of the whole measure+quality phase
+    "last": None,           # full per-leaf record of the last measurement
+}
+
+
+def grad_coverage_enabled() -> bool:
+    """Is gradient coverage measured at all?
+
+    DEFAULT OFF AT THE LIBRARY LEVEL, ON AT THE CLI. ``ppo.py``'s
+    ``--reject-frozen-grads`` defaults to True and exports
+    ALPHAGRAD_REJECT_FROZEN_GRADS=1 before ray.init, so a campaign gets the
+    guard by default; a bare import of env.py (landscape_map.py, the forensics
+    scripts, and -- the reason this is not a module default -- a measure actor
+    respawned inside an ALREADY RUNNING job that was launched before this
+    commit) gets the historical behaviour unless the variable is set.
+    """
+    if os.environ.get("ALPHAGRAD_GRAD_COVERAGE", "") not in ("", "0"):
+        return True
+    if os.environ.get("ALPHAGRAD_REJECT_FROZEN_GRADS", "0") == "1":
+        return True
+    try:
+        return float(os.environ.get("ALPHAGRAD_GRAD_COVERAGE_WEIGHT", "0")) != 0.0
+    except ValueError:
+        return False
+
+
+def reject_frozen_grads() -> bool:
+    """Is the HARD GUARD armed? (``--reject-frozen-grads``)"""
+    return os.environ.get("ALPHAGRAD_REJECT_FROZEN_GRADS", "0") == "1"
+
+
+def _leaf_norms(out, has_aux: bool) -> list[float]:
+    """Per-leaf L2 norms of a jacve output, in ``config.argnums`` order.
+
+    Identical to what ``ls_face_forensics.py`` computes (float32 norm of every
+    ``tree_leaves`` entry), so the forensics numbers and this implementation
+    are the same measurement and can be compared leaf by leaf.
+    """
+    out = out[1] if has_aux else out
+    leaves = jax.tree_util.tree_leaves(out)
+    return [float(jnp.linalg.norm(jnp.asarray(l, dtype=jnp.float32)))
+            for l in leaves]
+
+
+def _exact_leaf_norms(order_key: bytes, digest: bytes, compile_fn, eval_args,
+                      has_aux: bool) -> list[float]:
+    """Memoised per-leaf norms of the EXACT gradient at one measurement point.
+
+    Keyed on (exact_cache_key, eval-args digest) -- exactly what the exact
+    executable and its output depend on. ONE compile + ONE execution per
+    (order, point) per process; every subsequent plan on that order reads the
+    cache. Bounded to 8 entries.
+    """
+    key = order_key + b"|" + digest
+    hit = _EXACT_LEAF_NORMS.get(key)
+    if hit is not None:
+        return hit
+    norms = _leaf_norms(compile_fn()(*eval_args), has_aux)
+    if len(_EXACT_LEAF_NORMS) >= 8:
+        _EXACT_LEAF_NORMS.clear()
+    _EXACT_LEAF_NORMS[key] = norms
+    return norms
+
+
+def _grad_coverage(approx_norms, exact_norms) -> dict:
+    """The coverage record. See the block comment above for the definition."""
+    n = min(len(approx_norms), len(exact_norms))
+    a = [float(x) for x in approx_norms[:n]]
+    e = [float(x) for x in exact_norms[:n]]
+    eps = max(_GRAD_COV_EPS_ABS,
+              _GRAD_COV_EPS_REL * (max(e) if e else 0.0))
+    ratios: list[float] = []
+    counted: list[int] = []
+    zeroed: list[int] = []
+    for i in range(n):
+        if not (e[i] > eps):
+            ratios.append(float("nan"))       # uncounted
+            continue
+        counted.append(i)
+        ai = a[i]
+        if not np.isfinite(ai) or ai == 0.0:
+            ratios.append(0.0)
+            zeroed.append(i)
+        else:
+            ratios.append(min(1.0, ai / e[i]))
+    if not counted:
+        return {"defined": False, "min_leaf_ratio": 1.0, "frac_zeroed": 0.0,
+                "n_leaves": n, "n_counted": 0, "n_uncounted": n,
+                "n_zeroed": 0, "zeroed": [], "ratios": ratios,
+                "approx_norms": a, "exact_norms": e, "channel": 1.0,
+                "leaf_mismatch": len(approx_norms) != len(exact_norms)}
+    min_ratio = min(ratios[i] for i in counted)
+    frac_zeroed = len(zeroed) / float(len(counted))
+    return {
+        "defined": True,
+        "min_leaf_ratio": float(min_ratio),
+        "frac_zeroed": float(frac_zeroed),
+        "n_leaves": n,
+        "n_counted": len(counted),
+        "n_uncounted": n - len(counted),
+        "n_zeroed": len(zeroed),
+        "zeroed": zeroed,
+        "ratios": ratios,
+        "approx_norms": a,
+        "exact_norms": e,
+        # The one-slot encoding (see the block comment).
+        "channel": float(-frac_zeroed if zeroed else min_ratio),
+        "leaf_mismatch": len(approx_norms) != len(exact_norms),
+    }
+
+
+def _record_grad_coverage(cov: dict) -> None:
+    s = _GRAD_COV_STATS
+    s["n"] += 1
+    s["last"] = cov
+    if not cov["defined"]:
+        s["n_undefined"] += 1
+        return
+    s["sum_min_ratio"] += cov["min_leaf_ratio"]
+    s["min_min_ratio"] = min(s["min_min_ratio"], cov["min_leaf_ratio"])
+    s["sum_frac_zeroed"] += cov["frac_zeroed"]
+    s["max_frac_zeroed"] = max(s["max_frac_zeroed"], cov["frac_zeroed"])
+
+
+_FROZEN_GRAD_SEEN: list = []
+
+
+def _record_frozen_grad_plan(cov: dict, o_list) -> None:
+    """A plan the HARD GUARD refused. VISIBLY counted, never silent.
+
+    This is the failure mode bug (c) of docs/UNBIASED_PARETO_AND_MEASUREMENT.md
+    describes: NEW_SLOT_JOIN=1 plans were routed through ``_trace_truncate``
+    and vanished from the gradient with no counter and no line in any log, so
+    "the res slot was unreachable all along" went unnoticed for a whole
+    campaign. A rejection here bumps a DEDICATED counter that ppo.py drains
+    every episode onto ``grad_cov/rejected_this_ep``, and prints the first one
+    plus every 50th with the leaf census attached.
+    """
+    _FROZEN_GRAD_PLANS[0] += 1
+    _DEGENERATE_PLANS[0] += 1
+    _GRAD_COV_STATS["n_rejected"] += 1
+    k = _FROZEN_GRAD_PLANS[0]
+    if k == 1 or k % 50 == 0:
+        print(f"[grad-cov] REJECTED #{k}: {cov['n_zeroed']}/{cov['n_counted']} "
+              f"trainable leaves have ZERO gradient under this plan "
+              f"(frac_zeroed={cov['frac_zeroed']:.4f}, "
+              f"min_leaf_ratio={cov['min_leaf_ratio']:.4g}, "
+              f"uncounted={cov['n_uncounted']}) zeroed_leaves="
+              f"{cov['zeroed'][:24]} order_len={len(o_list)}", flush=True)
+
+
+def consume_frozen_grad_plan_count() -> int:
+    """Pop the count of plans the hard guard refused this period."""
+    n = _FROZEN_GRAD_PLANS[0]
+    _FROZEN_GRAD_PLANS[0] = 0
+    return n
+
+
+def consume_grad_coverage_stats() -> dict:
+    """Pop the per-period coverage aggregate (mirrors the other pollers)."""
+    s = _GRAD_COV_STATS
+    n = max(int(s["n"]), 0)
+    ndef = n - int(s["n_undefined"])
+    out = {
+        "count": n,
+        "undefined": int(s["n_undefined"]),
+        "rejected": int(s["n_rejected"]),
+        "mean_min_leaf_ratio": (s["sum_min_ratio"] / ndef) if ndef else float("nan"),
+        "min_min_leaf_ratio": s["min_min_ratio"] if ndef else float("nan"),
+        "mean_frac_zeroed": (s["sum_frac_zeroed"] / ndef) if ndef else float("nan"),
+        "max_frac_zeroed": s["max_frac_zeroed"] if ndef else float("nan"),
+        "wall_s": s["wall_s"],
+        "measure_wall_s": s["measure_wall_s"],
+        "wall_frac": (s["wall_s"] / s["measure_wall_s"]
+                      if s["measure_wall_s"] > 0 else float("nan")),
+    }
+    s.update({"n": 0, "n_undefined": 0, "n_rejected": 0, "sum_min_ratio": 0.0,
+              "min_min_ratio": 1.0, "sum_frac_zeroed": 0.0,
+              "max_frac_zeroed": 0.0, "wall_s": 0.0, "measure_wall_s": 0.0})
+    return out
+
+
 def consume_truncated_plan_count() -> int:
     n = _TRUNCATED_PLANS[0]
     _TRUNCATED_PLANS[0] = 0
@@ -1123,9 +1377,17 @@ REWARD_NAMES: tuple[str, ...] = (
     "bytes_accessed",
     "peak_memory",
     "quality",
-    "frob_residual",
+    "grad_coverage",
 )
 REWARD_INDEX = {name: i for i, name in enumerate(REWARD_NAMES)}
+# BACK-COMPAT ALIAS for slot 7. The slot was ``frob_residual`` until
+# 2026-08-27 and had been DEAD since the quality channel absorbed it (see the
+# REWARD_NAMES comment above: "the env still emits the frob_residual slot ...
+# but nothing reads it"). It now carries GRADIENT COVERAGE -- see
+# ``_grad_coverage`` below -- and the alias keeps every historical call site
+# (cpu_approx_pool's sentinel writer, alpha0's --lambda-frob, az_gumbel) on
+# index 7. Exactly the precedent slot 6 set when cosine_sim became quality.
+REWARD_INDEX["frob_residual"] = REWARD_INDEX["grad_coverage"]
 # BACK-COMPAT ALIAS. 269 call sites (and the persisted PopArt/calibration
 # state, which is keyed by INDEX) address slot 6 as "cosine_sim". The slot did
 # not move; only its display name changed, so the alias is exact.
@@ -2791,6 +3053,9 @@ _MEASURE_ACTOR = os.environ.get("ALPHAGRAD_MEASURE_ACTOR", "0") == "1"
 _MEM_FALLBACK_WARNED: list = []
 # One-shot warning flag for an undefinable loss-drop walk (see _callback).
 _WALK_UNDEFINED_WARNED: list = []
+# One-shot warning when the EXACT reference gradient cannot be built (see the
+# fail-soft branch of the coverage block in `_callback`).
+_GRAD_COV_REF_WARNED: list = []
 # One-shot flag for the walk's starting-point fingerprint line.
 _WALK_FINGERPRINT: list = []
 # ...and a COUNT, because the latch alone means a run can silently change what
@@ -3609,6 +3874,13 @@ def _callback(
     is skipped entirely until the elimination order is complete.
     """
     _pf_last = [time.perf_counter()]
+    # THE COVERAGE COST DENOMINATOR. `grad_cov/wall_frac` divides the coverage
+    # block's wall by the WHOLE callback's -- compile, measurement, quality
+    # walk and all. Timing it from a later point (e.g. the start of the
+    # measurement loop) puts the coverage block's own EXACT COMPILE in the
+    # numerator and not in the denominator, which reads a ~300% overhead on
+    # a target whose measurement is microseconds. Same instrument, both sides.
+    _cb_t0 = _pf_last[0]
 
     def _pf(key):
         now = time.perf_counter()
@@ -4296,6 +4568,13 @@ def _callback(
     cosines: list = []
     latency_samples: list[float] = []
     peak_mem_samples: list[float] = []
+    # GRADIENT COVERAGE state for this plan (see the block comment on
+    # `_grad_coverage`). `_gcov_on` is read ONCE per callback so a mid-episode
+    # env-var flip cannot make one plan's coverage incomparable with the next.
+    _gcov_on = bool(is_terminal) and grad_coverage_enabled()
+    _gcov_approx_norms = None
+    _gcov_eval_args = None
+    _gcov_measure_t0 = _cb_t0
     # WHICH quantity the peak samples hold (see _record_mem_parity): the
     # measured runtime delta, the substituted static estimate, or nothing.
     _peak_src = "not_measured"
@@ -4373,6 +4652,25 @@ def _callback(
                     compiled_cost, eval_args_i, unique_devices, _inner)
                 latency_samples.append(_lat_ns)
                 peak_mem_samples.append(_peak_b)
+
+            # GRADIENT COVERAGE, approx half. Point 0 only, terminal only.
+            # Scored HERE, off the execution the loop already ran, and the
+            # Jacobian is dropped immediately (the streamed-quality rule at
+            # the top of this loop: never hold a second full Jacobian).
+            # Costs the norm reductions and one device sync, no extra exec.
+            if _gcov_on and is_terminal and i == 0:
+                _gc_t0 = time.perf_counter()
+                _dense = out_approx
+                if compiled_cost is not compiled_approx:
+                    # The timed executable was the sparse-boundary one; the
+                    # coverage comparison needs DENSE leaves for shape parity
+                    # with the exact reference. One extra execution, and only
+                    # under ALPHAGRAD_MEASURE_SPARSE.
+                    _dense = compiled_approx(*eval_args_i)
+                _gcov_approx_norms = _leaf_norms(_dense, config.has_aux)
+                _gcov_eval_args = eval_args_i
+                _dense = None
+                _GRAD_COV_STATS["wall_s"] += time.perf_counter() - _gc_t0
 
             if compiled_cost is not compiled_approx and compiled_exact is not None:
                 # The timed run above used the sparse-boundary executable;
@@ -4555,6 +4853,70 @@ def _callback(
         order_floor_fn=_gate_order_floor,
         ref_measure_fn=_gate_ref_measure)
     _pf("cb.quality")
+
+    # ------------------------------------------------------------------
+    # GRADIENT COVERAGE -- reward slot 7 (``grad_coverage``) + the HARD GUARD.
+    # ------------------------------------------------------------------
+    # Runs AFTER the cost measurement (so nothing it does is inside a timing
+    # or peak-memory window) and after the quality gate (so a clamped plan is
+    # still checked). See `_grad_coverage` for the definition, the epsilon
+    # policy and the one-slot encoding.
+    _GRAD_COV_STATS["measure_wall_s"] += (
+        time.perf_counter() - _gcov_measure_t0)
+    grad_coverage = 0.0
+    if _gcov_on and _gcov_approx_norms is not None:
+        _gc_t0 = time.perf_counter()
+        try:
+            _ex_norms = _exact_leaf_norms(
+                exact_cache_key,
+                _eval_digest(_gcov_eval_args),
+                lambda: cached_compile(b"exact:" + exact_cache_key,
+                                       _do_compile_exact),
+                _gcov_eval_args,
+                config.has_aux,
+            )
+        except Exception as _exc:
+            # FAIL SOFT, LOUDLY. The exact reference is apparatus, not plan
+            # quality: if graphax cannot build it (or it OOMs) the coverage is
+            # UNDEFINED and the guard must not fire -- refusing a plan because
+            # our own reference failed is exactly the "score it BADLY" error
+            # `_truncated_reward`'s docstring warns about.
+            _record_grad_coverage({"defined": False, "min_leaf_ratio": 1.0,
+                                   "frac_zeroed": 0.0, "n_leaves": 0,
+                                   "n_counted": 0, "n_uncounted": 0,
+                                   "n_zeroed": 0, "zeroed": [], "ratios": [],
+                                   "approx_norms": [], "exact_norms": [],
+                                   "channel": 0.0, "leaf_mismatch": False,
+                                   "error": f"{type(_exc).__name__}: {_exc}"})
+            if not _GRAD_COV_REF_WARNED:
+                _GRAD_COV_REF_WARNED.append(1)
+                print("[grad-cov] WARNING: the EXACT reference gradient could "
+                      "not be built for this order; coverage is UNDEFINED and "
+                      "the guard is inert for every affected plan: "
+                      f"{type(_exc).__name__}: {str(_exc)[:160]}", flush=True)
+        else:
+            _cov = _grad_coverage(_gcov_approx_norms, _ex_norms)
+            _record_grad_coverage(_cov)
+            grad_coverage = _cov["channel"]
+            if _cov["defined"] and _cov["frac_zeroed"] > 0.0 \
+                    and reject_frozen_grads():
+                # HARD GUARD. Reuse of the DEGENERATE-PLAN path, deliberately:
+                # `_SENTINEL_BAD_REWARD` is the exact vector train_episode's
+                # `_is_degen` recognises (all six cost channels at
+                # SENTINEL_COST), which forces the advantage to 0, drops the
+                # step from the value target, and sentinels the row everywhere
+                # it is RANKED (top-N, best_global, Pareto) -- so a plan that
+                # freezes a parameter can never be crowned and teaches nothing.
+                # It is NOT `_trace_truncate`: that path is for apparatus
+                # failure, and routing a plan-quality verdict through it is
+                # precisely bug (c) (the res-slot plans that disappeared from
+                # the gradient with no counter). `_record_frozen_grad_plan`
+                # gives this its own visible counter and stdout line.
+                _GRAD_COV_STATS["wall_s"] += time.perf_counter() - _gc_t0
+                _record_frozen_grad_plan(_cov, o_list)
+                return tokens, eqn_ids, _SENTINEL_BAD_REWARD
+        _GRAD_COV_STATS["wall_s"] += time.perf_counter() - _gc_t0
+    _pf("cb.grad_coverage")
     rewards = jnp.array(
         [
             -muls_adds_fmas,
@@ -4564,7 +4926,10 @@ def _callback(
             -bytes_accessed,
             -peak_memory,
             cosine_sim,
-            -frob_residual,
+            # Slot 7: GRADIENT COVERAGE, not frob. 0.0 whenever coverage was
+            # not measured -- byte-identical to what the dead frob slot
+            # emitted (`frob_residual = 0.0` for every real plan).
+            grad_coverage,
         ],
         dtype=jnp.float32,
     )
