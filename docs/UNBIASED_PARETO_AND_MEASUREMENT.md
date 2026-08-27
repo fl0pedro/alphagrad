@@ -273,7 +273,7 @@ a 25× reduction, at quality 0.0000. There is no memory Pareto front here.
 
 ---
 
-## 4. THE OPEN CAVEAT — is the win "stop differentiating a parameter"? **PENDING**
+## 4. THE OPEN CAVEAT — is the win "stop differentiating a parameter"? **RESOLVED: YES (§10)**
 
 ### 4.1 The worry, stated precisely
 
@@ -326,6 +326,14 @@ scale, quality cost 0.0002) is the one most likely to show a zeroed leaf;
 `k19/f0` costs 0.019 of quality already at 200 steps, which is 95× the `k24`
 cost, so something there is *already* visible to the short probe. If that
 asymmetry appears in T1/T2 it is itself the answer.
+
+> **RESOLVED 2026-08-27 -- see §10.** T1 landed. The FIRST row of the table
+> above is the outcome: `k24/f0` freezes ELEVEN of sixteen parameter leaves,
+> and so does every other winning face. The prediction above stands as
+> written and is scored in §10.0: the `k24`/`k19` asymmetry is real in the
+> quality channel (0.0002 vs 0.019) but NOT in the mechanism -- both freeze
+> leaves, `k19/f0` simply freezes three more. §10 is the measurement, the
+> guard and the reward channel built on that answer.
 
 ---
 
@@ -751,6 +759,379 @@ was `PENDING (Resources)`.
 
 ---
 
+## 10. GRADIENT COVERAGE — the measurement, the guard, the channel
+
+**Written 2026-08-27.** §4 asked whether the one-face win is "a cheaper
+Jacobian" or "stop differentiating a parameter". `face_forensics.json` (T1)
+answered it, and this section is what was built on that answer:
+a measurement, a hard guard and a reward channel, all in tree, plus the
+numbers that validate them. Code: `env.py` (`_grad_coverage` and the block
+comment above it is the normative definition), `ppo.py`
+(`configure_grad_coverage`), `tests/grad_coverage_test.py`,
+`src/alphagrad/approx/tools/grad_coverage_probe.py`.
+
+### 10.0 The finding this closes — **CONFIRMED**
+
+§4.3's pre-registered first row is the one that came true. On the TLM target,
+skipping ONE face removes 62–73 % of the backward pass **and zeroes the
+gradient of most trainable parameters**:
+
+| plan | eqns | zeroed leaves (of 16) | quality (200-step walk) | latency ratio |
+|---|---:|---:|---:|---|
+| exact | 1086 | 0 | 0.9260 | 1.0007 ± 0.0008 |
+| `k24/f0` | 417 | **11** | 0.9258 | 0.578 |
+| `k22/f0` | 398 | **12** | 0.9257 | 0.563 |
+| `k19/f0` | 366 | **14** | 0.9071 | 0.530 |
+| `k13/f1` | 297 | **15** | 0.8981 | 0.550 |
+
+For `k24/f0` the zeroed leaves are six `(128,128)` matrices with exact norms up
+to 105.4, three `(128,)` vectors and the scalar. The quality channel prices
+that at **0.0002**, and the discrimination gets **50–200× worse** at longer
+horizons (measured gap 0.000215 → 0.000004 from 200 to 3200 steps), because
+the walk measures single-batch overfitting, which a small parameter subset
+achieves on its own. **No horizon of that probe separates a full backward pass
+from a third of one.** §10.7 is what to do about the probe itself.
+
+### 10.1 Definition
+
+For a plan *P* and one fixed measurement point *x* (point 0 of the campaign's
+own `--num-data-points` budget, so the inputs are the ones the plan was timed
+on):
+
+* `g_a` = *P*'s gradient output at *x* — the **same compiled executable the
+  measurement path built** (`_do_compile_approx`), not a re-derivation;
+* `g_e` = the **same elimination order done exactly** at *x*
+  (`_do_compile_exact`, i.e. `jacve(order)` with no transforms and no
+  face_transforms — byte-for-byte what `ls_face_forensics.py` called
+  `build_fn([])`).
+
+Per output leaf `l` (one leaf per entry of `config.argnums`, in that order):
+
+```
+n_a[l] = ||g_a[l]||_2                      n_e[l] = ||g_e[l]||_2
+counted(l)   <=>  n_e[l] > eps
+ratio[l]     =  min(1, n_a[l] / n_e[l])    (non-finite n_a scores 0)
+min_leaf_ratio     = min over counted leaves of ratio[l]      (1.0 if none)
+frac_leaves_zeroed = #{counted l : n_a[l] == 0 or non-finite} / #counted
+```
+
+The full per-leaf vector (`approx_norms`, `exact_norms`, `ratios`, `zeroed`) is
+kept on the record for telemetry and is what the probe dumps.
+
+**Leaf set.** *Every* output leaf, i.e. one per differentiated argument. Under
+`--seed-vertices` that includes the scalar tangent seed, which the forensics
+also counted — keeping the same set is what makes §10.4(a) a real
+cross-check rather than a re-definition. It is also conservative in the right
+direction for the guard.
+
+**Epsilon policy** (explicit, because it decides what "frozen" means). With
+
+```
+eps = max(1e-30, 1e-12 * max_l n_e[l])       # ALPHAGRAD_GRAD_COV_EPS_{ABS,REL}
+```
+
+a leaf whose **exact** norm is at or below `eps` is **UNCOUNTED**: the exact
+reference does not differentiate it either, so an approximation cannot be
+blamed for zeroing it, and dividing by it would manufacture a 0/0. Uncounted
+leaves are excluded from both the min and the denominator of `frac_zeroed`,
+and their number is reported (`n_uncounted`) so a silently-empty denominator
+is visible. If **every** leaf is uncounted the record is `defined: False`,
+`min_leaf_ratio = 1.0`, `frac_zeroed = 0.0` — and the guard can never fire on
+it. The same fail-soft applies when the exact reference cannot be built at
+all: that is apparatus failure, and refusing a plan because *our* reference
+broke is exactly the "score it BADLY" error `_truncated_reward`'s docstring
+warns about. It prints once and lands on `grad_cov/undefined_this_ep`.
+
+### 10.2 The wire — one slot, both numbers
+
+Reward slot 7 was `frob_residual` and had been **dead** since the quality
+channel absorbed it (§ the REWARD_NAMES comment: *"the env still emits the
+frob_residual slot … but nothing reads it"*). It is now `grad_coverage`;
+`REWARD_INDEX["frob_residual"]` is a back-compat alias for the same index, the
+exact precedent slot 6 set when `cosine_sim` became `quality`, so
+`cpu_approx_pool`'s sentinel writer, `alpha0`'s `--lambda-frob` and
+`az_gumbel` are untouched. `NUM_REWARDS` is still 8.
+
+Both numbers ride that one slot, **losslessly**, because they are mutually
+exclusive by construction — a zeroed leaf has ratio exactly 0 and is therefore
+the minimum, so `frac_zeroed > 0` implies `min_leaf_ratio == 0`:
+
+```
+channel = +min_leaf_ratio        when frac_zeroed == 0     ->  ( 0, 1]
+channel = -frac_leaves_zeroed    when frac_zeroed  > 0     ->  [-1, 0)
+```
+
+Bounded `[-1, 1]`, monotone in "how much of the gradient survives", and
+decoded on the trainer side as `(max(c,0), max(-c,0))`. The all-frozen end
+(`-1.0`) is exactly the value `_SENTINEL_BAD_REWARD` already writes into slot
+7, so a rejected plan reads as "everything frozen" without a special case.
+
+### 10.3 The hard guard — `--reject-frozen-grads`, default ON
+
+Any plan with `frac_leaves_zeroed > 0` is **rejected outright**: `_callback`
+returns `_SENTINEL_BAD_REWARD` instead of a score.
+
+**Which existing mechanism, and why.** That vector is precisely what
+`train_episode`'s `_is_degen` recognises (all six cost channels at
+`SENTINEL_COST`, ppo.py ≈8479). Its consequences are already specified and
+already tested: the advantage is forced to 0, the step is dropped from the
+value target (the critic's own prediction is taken as correct there, so
+nothing trains on a number we refuse to credit), and the row is sentinelled
+everywhere it is **ranked** — top-N, `best_global`, the Pareto archive — so a
+plan that freezes a parameter **can never be crowned**. That is the correct
+treatment: we are not claiming the plan is slow, we are refusing to score it.
+
+**It is NOT `_trace_truncate`.** That path is for apparatus failure, and
+routing a plan-quality verdict through it is bug (c) of §7 verbatim: the
+`NEW_SLOT_JOIN=1` res-slot plans were excluded from the gradient with **no
+counter and no log line anywhere**, and "the res slot was unreachable all
+along" went unnoticed for a whole campaign. So a rejection here:
+
+* bumps its **own** counter `_FROZEN_GRAD_PLANS` (drained per episode onto
+  `grad_cov/rejected_this_ep`) and `_DEGENERATE_PLANS` (so the legacy
+  aggregate keeps meaning "transitions excluded from the gradient") — but
+  **not** `_TRUNCATED_PLANS`, because a rejection is a verdict about the plan
+  and a truncation is the apparatus giving up, and reading those as one number
+  is what hid bug (c);
+* prints the first rejection and every 50th with the leaf census attached;
+* appears on the stdout per-episode census line and in the per-plan joint
+  records, whether or not wandb is on.
+
+**Default ON at the flag, default OFF in the library.** `ppo.py` defaults
+`--reject-frozen-grads` to True and exports `ALPHAGRAD_REJECT_FROZEN_GRADS`
+before `ray.init` so the measure actors inherit it. `env.py` treats the
+*absence* of the variable as off — deliberately: a measure actor respawned
+inside a job that was launched before this commit must behave exactly as HEAD
+did, and `landscape_map.py` / the forensics scripts must keep measuring the
+un-guarded space.
+
+**A batch in which EVERY plan is rejected carries no gradient.** Observed
+directly in the CPU smoke (`NeuralNetwork`, 2 envs, random policy): every plan
+froze all 5 leaves, all were rejected, and the census read
+`live=0 … frozen=2/2`. That is correct behaviour — those plans destroyed the
+gradient and none of them should be credited — but it is the same flat-signal
+shape §8/R1 diagnosed at episode 0, so `grad_cov/rejected_this_ep` against
+`plan/n_live` is the pair to watch: a run where they stay equal is not
+learning, it is being refused.
+
+**Known tension, stated rather than hidden.** `_is_degen` gives a rejected
+plan advantage 0, and env.py's own SOFT-SENTINEL comment (the v16 ep-39
+post-mortem) records that "degeneracy becomes the safe haven" once the value
+baseline rises. On this target that is the intended trade — the frozen-gradient
+region *is* most of the SKIP win, and a 0 advantage is strictly better than the
++47 % latency bonus it collects today — but if the policy is later observed
+parking in the rejected region, the alternative is to score a rejected plan at
+its own order's exact floor (the §7(a) `_order_floor` machinery already
+exists) instead of sentinelling it.
+
+### 10.4 The reward channel — `--grad-coverage-weight W`, default 0 (off)
+
+`W != 0` appends a **fourth value head** on reward slot 7, wired exactly as the
+existing three: `HEAD_REWARD_INDICES` gains index 7, `HEAD_NAMES` gains
+`grad_cov`, `Agent` gains `value_head_gcov`, PopArt's per-head rescale and the
+preference vector widen with it. Under the R-run additive config the
+composition becomes
+
+```
+lambda_cmp*symlog(lat) + lambda_mem*symlog(mem) + lambda_acc*q + W*coverage
+```
+
+**`--symlog-channels cost` composes.** Coverage is bounded by construction, so
+it is added to the symlog exemption set alongside the quality slot, in every
+mode — pinned by `test_symlog_cost_composes_with_the_coverage_channel`, which
+asserts the exempt set is exactly `{quality, grad_coverage}` and that a
+coverage of 0.5325 survives `_symlog_rewards` unchanged while latency is still
+compressed. With `W = 0` the exemption set is HEAD's, byte for byte.
+
+The channel is `min_leaf_ratio` in the region the guard leaves live (the
+negative branch only reaches the trainer when the guard is off), so with both
+on it is a **graded** signal on top of a **hard** one: "how much of the
+gradient survives", `(0, 1]`, higher is better.
+
+### 10.5 Telemetry
+
+Per plan, in the joint records §14.7 added (`plan/NN/…`, so within-episode
+spread is reconstructible):
+
+* `plan/NN/grad_cov_min_leaf_ratio` — `max(slot7, 0)`
+* `plan/NN/grad_cov_frac_zeroed` — `max(-slot7, 0)`
+* plus the usual `plan/<k>/{std,spread,min,max,median}_ep` for both.
+
+Per episode: `grad_cov/rejected_this_ep`, `grad_cov/measured_this_ep`,
+`grad_cov/undefined_this_ep`, `grad_cov/min_leaf_ratio{,_worst}`,
+`grad_cov/frac_zeroed{,_worst}`, `grad_cov/wall_frac`, `grad_cov/wall_s`, and
+a `[grad-cov ep<N>]` stdout line carrying all of them. The per-plan stdout
+census line gains `cov med=… [min,max] frozen=k/n`.
+
+### 10.6 VALIDATION
+
+Instrument: `python -m alphagrad.approx.tools.grad_coverage_probe`, one CPU
+node (pgi15-cpu2, job 62417), `JAX_PLATFORMS=cpu`,
+`PYTHONDONTWRITEBYTECODE=1`, TLM `SEQ=32 DMODEL=128 VOCAB=1024`,
+`NEW_SLOT_JOIN=0`, fixed reverse order, 95 vertices,
+`--measure-grad --seed-vertices`. Raw output:
+`run_analysis/landscape/grad_coverage_probe.json`.
+
+**(a) The four forensics faces reproduce — EXACTLY.** Same zeroed-leaf
+**sets**, not merely the same counts:
+
+| plan | forensics zeroed | this implementation | `frac_zeroed` | `min_leaf_ratio` |
+|---|---|---|---:|---:|
+| `k24/f0` | `[0..9, 15]` (11) | `[0..9, 15]` (11) | 0.6875 | 0.0 |
+| `k22/f0` | `[0..9, 12, 15]` (12) | `[0..9, 12, 15]` (12) | 0.7500 | 0.0 |
+| `k19/f0` | `[0..9, 10, 12, 13, 15]` (14) | identical (14) | 0.8750 | 0.0 |
+| `k13/f1` | `[0..9, 10, 11, 12, 13, 15]` (15) | identical (15) | 0.9375 | 0.0 |
+
+**VERDICT: REPRODUCED.** `tests/grad_coverage_test.py::test_forensics_zeroed_sets_reproduce`
+replays the recorded norms through the shipped function so this cannot
+silently regress.
+
+**(b) Identity.** `min_leaf_ratio == 1.0` and `frac_zeroed == 0` **exactly**
+(not approximately): 16 leaves counted, 0 uncounted, channel `1.0`.
+
+**(c) `k21/f1` — the face no run ever found.** v74 `dot_general`
+`(32,128)×(128,128)`, ratio 0.5325, quality 0.9257, i.e. §3.3's "essentially
+tied *and free*" candidate, and **not** in the forensics batch.
+
+```
+k21/f1:  frac_zeroed = 0.8125     13 of 16 leaves frozen     min_leaf_ratio = 0
+         zeroed [0,1,2,3,4,5,6,7,8,9,12,13,15]
+         per-leaf ratios [0,0,0,0,0,0,0,0,0,0,1,1,0,0,1,0]
+```
+
+**Prediction CONFIRMED.** `k21/f1` freezes **more** leaves than `k24/f0`
+(13 vs 11) and more than `k22/f0` (12), at a quality cost of **0.0003** —
+statistically the same price the quality channel puts on `k24/f0`'s eleven
+(0.0002). §3.3's "best *free* single skip" and §6.4's "most of the latency win
+at full quality" are, on this measurement, the plan that stops differentiating
+13 of 16 parameter leaves.
+
+Across the five faces measured here the ordering is the point:
+
+| face | zeroed leaves | quality cost vs identity | latency ratio |
+|---|---:|---:|---|
+| `k24/f0` | 11 | 0.0002 | 0.578 |
+| `k22/f0` | 12 | 0.0003 | 0.563 |
+| **`k21/f1`** | **13** | **0.0003** | **0.532** |
+| `k19/f0` | 14 | 0.0189 | 0.530 |
+| `k13/f1` | 15 | 0.0279 | 0.550 |
+
+The quality channel does move monotonically with the damage — but the first
+**three** rows, spanning 11 to 13 frozen leaves, are separated by **0.0001**
+of quality, i.e. by nothing the reward can act on, while their latency ratios
+differ by 4.6 points. In the region the policy actually searches, quality is
+flat and latency is not: the gradient points straight at the face that freezes
+the most. That is the reward hack stated as sharply as the data allows.
+
+**(d) Flag-off bit-identity.** `tests/grad_coverage_test.py`, **20/20 passed**
+(job 62417). The load-bearing ones:
+
+* `test_flag_off_head_configuration_is_heads` — 3 heads on
+  (latency_ns, peak_memory, quality), HEAD's tuple exactly;
+* `test_agent_flag_off_has_no_extra_leaf_and_flag_on_perturbs_nothing` —
+  flag off, `value_head_gcov is None` and the pytree carries no extra leaf;
+  flag **on**, every pre-existing array leaf is **bitwise unchanged** and the
+  only new leaves are the fourth head's own. (The head's key is
+  `fold_in(keys[12], 7)`, not a widened `jrand.split` — widening the split
+  would move every positional key and change the randomness of every seeded
+  run, flag off included.) `pref_proj` is the one exception and legitimately
+  gains a column, since its input width *is* `NUM_VALUE_HEADS`;
+* `test_symlog_exempt_set_is_unchanged_when_the_channel_is_off` — all three
+  modes × additive/lagrangian;
+* `test_display_weights_never_touch_slot_7`;
+* `test_degenerate_sentinel_unchanged` and
+  `test_slot7_is_grad_coverage_and_frob_is_an_alias` — the wire.
+
+**(e) Cost.** The approx half is free: it is scored off an execution the
+measurement loop already ran, and the Jacobian is dropped immediately (the
+streamed-quality rule). The exact half is memoised per
+(order, arg shapes, device, point) — under `FORCE_REV_ORDER` that is **one
+compile and one execution per process**, amortised over every plan.
+
+```
+identity plan, full _callback wall, CPU, n=3 paired:
+   coverage OFF  503.7 ms      coverage ON  511.2 ms      -> +1.48 %
+   self-reported grad_cov/wall_frac            0.71 %   (21.7 ms / 3 plans)
+```
+
+Read the **0.71 %** as the steady-state number and the 1.48 % as its paired
+upper bound at n=3; both are measured on CPU, where a `_callback` is ~0.5 s.
+On GPU the denominator (5×4 timed executions at `--latency-inner-reps 50`,
+plus the 200-step walk) is larger and the numerator — 16 norm reductions and
+one device sync — is smaller, so the fraction can only fall. The absolute
+added work per plan is *16 vector norms*.
+
+> **Caveat, and it is the one that matters for a non-R-run.** That number is
+> the **fixed-order** cost. `_EXACT_LEAF_NORMS` is keyed on the elimination
+> ORDER, so with `ALPHAGRAD_FORCE_REV_ORDER=1` (all four arms of §8) there is
+> exactly one exact compile per process and the amortised cost is the norms.
+> Under an order-searching policy **every distinct order pays its own exact
+> compile**, and on a target whose whole measurement is microseconds that
+> compile dominates: the `NeuralNetwork` CPU smoke read
+> `grad_cov/wall_frac` at 8.9 % on its first period. `cached_compile` +
+> `JAX_COMPILATION_CACHE_DIR` blunt it across repeats, but if coverage is ever
+> wanted on the order space, budget for it — or key the reference on a canonical
+> (e.g. reverse) order instead of the plan's own, which changes what the
+> measurement means and would need saying.
+>
+> (The first draft of this measurement reported 280–412 % here. That was an
+> instrument mismatch of the same family as §7(a): the numerator included the
+> coverage block's exact compile while the denominator started *after* the
+> plan's own compile. Fixed — `grad_cov/wall_frac` now divides by the whole
+> callback.)
+
+**Guard, end to end.** `k24/f0` through `_callback` with the guard on returns
+`[-1e10 ×6, 0.0, -1.0]` — the exact vector `_is_degen` matches — and
+`consume_frozen_grad_plan_count()` reads 1. With the guard off the same plan
+scores normally with slot 7 at `-0.6875`.
+
+### 10.7 THE ROOT DEFECT IS THE PROBE — three concrete replacements
+
+Coverage is a guard, not a fix. The quality metric is still a 200-step Adam
+walk on **one fixed batch** with the loss measured on **that same batch**: it
+is single-batch overfitting, a small parameter subset achieves it alone, and
+that is *why* it cannot see 11 frozen leaves at any horizon. Three
+replacements, with what each buys and what it does not (**not implemented** —
+the owner picks):
+
+1. **Held-out loss after the walk.** Same walk, but score
+   `1 - L(x_heldout; W_T)/L(x_heldout; W_0)` on a second fixed batch the walk
+   never touched. **Cost: +1 forward pass per plan (~1 % of the walk).**
+   Catches: memorisation that does not generalise, which is exactly what a
+   partial-parameter fit produces. Misses: a frozen leaf that genuinely does
+   not matter for this loss at 200 steps — it would still score well, and it
+   would be *right* to.
+2. **Multi-batch walk (the honest one).** Draw a fresh batch per walk step
+   from the existing `data_gen`, score on a held-out batch. **Cost: 200 extra
+   host→device batch transfers, walk wall roughly 1.5–2×** (the walk is
+   already the most expensive phase of an approximation-arm measurement, so
+   this is the expensive option). Catches: everything (1) catches, plus
+   optimiser pathologies that only appear when the gradient must track a
+   moving objective. Misses: nothing structural — this is closest to "does
+   this gradient train the model". Loses **bit-determinism** (§5.3), which is
+   a real cost: episode-to-episode quality variation stops being pure signal.
+3. **Gradient cosine against the exact gradient over K batches.** Per batch,
+   `cos(flatten(g_a), flatten(g_e))`, averaged over K = 4–8 fixed batches;
+   optionally per-leaf, which subsumes coverage as the `cos = 0` case.
+   **Cost: K executions of the plan + K of the exact reference, the latter
+   memoisable per order exactly as coverage's is — so ~K extra plan
+   executions, ≈5–10 % of a measurement at K = 4.** Catches: direction errors
+   of every size, not just total freezing, and it is bit-deterministic.
+   Misses: it says nothing about *optimisation* — a systematically shrunk but
+   perfectly aligned gradient scores 1.0, and a small-but-crucial component
+   drowned by a large aligned one is invisible. It is a Jacobian-fidelity
+   metric wearing a training label; the project already measured
+   `Pearson 0.610` for the plain Jacobian cosine against downstream accuracy
+   versus `0.922` for the loss drop, so it should **complement** (1) or (2),
+   not replace them.
+
+Cheapest useful move is **(1)**: one forward pass, keeps bit-determinism,
+keeps the whole existing walk, and directly attacks the "measures
+overfitting" defect. **(3)** is the natural companion because its exact
+reference is the one coverage already compiles and caches.
+
+---
+
 ## Provenance index
 
 | artifact | what it establishes |
@@ -768,3 +1149,6 @@ was `PENDING (Resources)`.
 | `r1_trim_62411.log`, `r2_trimplus_62412.log`, `r3_credit_62413.log` | §8 observations |
 | `graphax/src/graphax/sparse/dtype_compute.py:124-212` | §6.3 pullup mechanism |
 | commits `1c1e480`, `907c231`, `39d8bd1`, `c2b8104` | §7 bug fixes |
+| `run_analysis/landscape/face_forensics.json` | §10.0 the per-leaf gradient norms of the four faces (T1) |
+| `run_analysis/landscape/grad_coverage_probe.json` | §10.6 the (a)-(e) validation run, job 62417/62421 |
+| `src/alphagrad/approx/tools/grad_coverage_probe.py`, `tests/grad_coverage_test.py` | §10 the instrument and its regression pins |
