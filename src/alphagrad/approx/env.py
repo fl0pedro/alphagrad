@@ -2844,10 +2844,110 @@ def _walk_lr() -> float:
 
 
 def _walk_probe_seed() -> int:
-    """Seed of the PROBE BATCH. The batch must be IDENTICAL for every plan in a
-    run or the scores are not comparable, so it is a fixed constant rather than
-    anything derived from the episode / env / actor."""
+    """BASE seed of the PROBE BATCH.
+
+    Scores are only comparable across plans measured on the SAME batch. Until
+    2026-08-28 that requirement was implemented as "one batch for the entire
+    process, for the entire run": the cache key carried no episode term and the
+    dict was cleared on every miss. Two consequences, both measured:
+
+    * the channel was bit-deterministic (48 readings of one plan, sd exactly
+      0), so a plan's score carried no sampling variance at all; and
+    * what it measured was single-batch OVERFITTING, which is why a plan that
+      SKIPS one face -- freezing the gradient of most parameters -- scored
+      0.9258 against an exact plan's 0.9260, and why the gap SHRANK 50-200x at
+      longer walks.
+
+    Comparability is only needed WITHIN one comparison set, i.e. within an
+    episode. ``ALPHAGRAD_WALK_ROTATE`` therefore folds the episode index into
+    this seed (see :func:`_walk_seed`), and ``ALPHAGRAD_WALK_HELDOUT`` draws a
+    SECOND batch the walk never trains on and scores there instead.
+    """
     return int(os.environ.get("ALPHAGRAD_WALK_PROBE_SEED", "20260807"))
+
+
+# ---- (A3) held-out scoring + per-episode rotation -------------------------
+#
+# TWO INDEPENDENT SWITCHES, BOTH DEFAULT OFF, so a run launched without them
+# reproduces the pre-A3 number bit-for-bit (pinned by
+# ``tests/walk_heldout_test.py``: the default probe batch is asserted equal to
+# ``data_gen(split(PRNGKey(20260807), 5))`` byte for byte, and a published
+# episode is asserted to change neither the seed nor the score):
+#
+#   ALPHAGRAD_WALK_HELDOUT=1  the walk TRAINS on batch A and both endpoints of
+#                             the loss drop are SCORED on a held-out batch B
+#                             that the walk never saw.
+#   ALPHAGRAD_WALK_ROTATE=1   A and B are re-drawn every EPISODE.
+#
+# WHY THE EPISODE TERM TRAVELS AS AN ENVIRONMENT VARIABLE. The trainer and each
+# Ray measure actor are SEPARATE PROCESSES with separate ``_PROBE_BATCH``
+# dicts, so the rotation index must be readable by both without new plumbing --
+# the same "one env var, read by one module, by both sides" discipline the rest
+# of the measurement configuration uses (``ppo.configure_grad_coverage``,
+# ``masks.set_diag_per_face``).
+#
+# CAVEAT, DELIBERATELY LOGGED RATHER THAN ASSUMED AWAY: Ray workers inherit the
+# driver's environment as it stood at ``ray.init`` time, so a value republished
+# mid-run reaches the TRAINER -- which is where every TERMINAL row, the only
+# rows quality is computed on, is measured under ``--exec-on-gpu`` -- but not a
+# long-lived measure actor, which keeps whatever episode was current when it
+# was spawned. ``_loss_drop_quality`` therefore also accepts an explicit
+# ``episode=`` argument (the one-line integration point for the pooled path),
+# and the fingerprint line prints the episode and the batch digests it actually
+# used, so a trainer/actor divergence shows up in the log instead of silently
+# de-pairing the comparison.
+_WALK_EPISODE_ENV = "ALPHAGRAD_WALK_EPISODE"
+
+
+def set_walk_episode(episode: int) -> None:
+    """Publish the CURRENT episode index for the probe-batch rotation.
+
+    Called once per episode by the trainer; a no-op for the score itself
+    unless ``ALPHAGRAD_WALK_ROTATE=1``.
+    """
+    os.environ[_WALK_EPISODE_ENV] = str(int(episode))
+
+
+def walk_episode() -> int:
+    """The published episode index, 0 when nobody published one."""
+    try:
+        return int(os.environ.get(_WALK_EPISODE_ENV, "0"))
+    except ValueError:
+        return 0
+
+
+def walk_rotate_enabled() -> bool:
+    return os.environ.get("ALPHAGRAD_WALK_ROTATE", "0") not in (
+        "0", "", "false", "False", "no")
+
+
+def walk_heldout_enabled() -> bool:
+    return os.environ.get("ALPHAGRAD_WALK_HELDOUT", "0") not in (
+        "0", "", "false", "False", "no")
+
+
+# Stride between consecutive episodes' probe seeds, and the offset from the
+# TRAIN batch's seed to the HELD-OUT batch's seed. Large coprime constants, so
+# no two (episode, role) pairs can land on the same PRNGKey and no episode's
+# held-out batch can be another episode's training batch.
+_WALK_EPISODE_STRIDE = 1000003
+_WALK_HELDOUT_OFFSET = 7919
+
+
+def _walk_seed(role: str = "train", episode: int | None = None) -> int:
+    """PRNGKey seed of the ``role`` (``"train"`` / ``"eval"``) probe batch.
+
+    With both switches off this returns exactly ``_walk_probe_seed()`` for the
+    only role that is ever requested (``"train"``) -- that identity is what
+    makes flag-off bit-identical, and it is asserted by the test.
+    """
+    base = _walk_probe_seed()
+    if walk_rotate_enabled():
+        ep = walk_episode() if episode is None else int(episode)
+        base += _WALK_EPISODE_STRIDE * int(ep)
+    if role == "eval":
+        base += _WALK_HELDOUT_OFFSET
+    return int(base)
 
 
 def _walk_noise_std() -> float:
@@ -2857,14 +2957,27 @@ def _walk_noise_std() -> float:
     return float(os.environ.get("ALPHAGRAD_WALK_NOISE_STD", "0.0"))
 
 
-# One probe batch per (process, data-generator, shape) — built once, kept on
-# the host, device_put per measurement onto whichever device the plan was
-# compiled for.
+# One probe batch per (process, data-generator, shape, ROLE, EPISODE) — built
+# once per key, kept on the host, device_put per measurement onto whichever
+# device the plan was compiled for.
+#
+# BOUNDED rather than cleared-on-miss: one episode needs at most two entries
+# (train + held-out) and the previous episode's pair is worth keeping while the
+# pool drains. With both A3 switches off exactly ONE key is ever produced, so
+# the dict never reaches the cap and the behaviour is the old "one batch per
+# process, by construction". 512 MNIST images is ~1.6 MB, so four is free.
 _PROBE_BATCH: dict = {}
+_PROBE_BATCH_MAX = 4
 
 
-def _probe_batch(config, base_args):
-    """The FIXED probe batch: real data from ``config.data_gen`` at a fixed key.
+def _probe_batch(config, base_args, role: str = "train",
+                 episode: int | None = None):
+    """The probe batch: real data from ``config.data_gen`` at ``_walk_seed``.
+
+    ``role`` is ``"train"`` (the batch the Adam walk steps on) or ``"eval"``
+    (the held-out batch it is scored on); ``episode`` overrides the published
+    rotation index. With both A3 switches off there is exactly one role, one
+    seed and one entry -- the pre-A3 behaviour.
 
     SYNTHETIC DATA IS NOT AN OPTION for the loss-drop metric. Walking on noise
     and probing real MNIST gives Spearman 0.08 (gaussian) / 0.13 (uniform) and
@@ -2880,15 +2993,21 @@ def _probe_batch(config, base_args):
     """
     if config.data_gen is None:
         return None
-    _key = (id(config.data_gen), _walk_probe_seed(),
+    # THE KEY CARRIES THE EPISODE. ``_walk_seed`` already folds (role,
+    # episode) into the seed, and the seed is in the key, so a new episode
+    # cannot be served a stale batch -- which is exactly the bug that made the
+    # pre-A3 cache serve one batch for the whole run.
+    _seed = _walk_seed(role, episode)
+    _key = (id(config.data_gen), _seed,
             tuple(getattr(a, "shape", ()) for a in base_args[:2]))
     hit = _PROBE_BATCH.get(_key)
     if hit is not None:
         return hit
-    k = jrand.PRNGKey(_walk_probe_seed())
+    k = jrand.PRNGKey(_seed)
     data = config.data_gen(jrand.split(k, 5))
     data = tuple(jax.device_get(d) for d in data)
-    _PROBE_BATCH.clear()          # one batch per process, by construction
+    if len(_PROBE_BATCH) >= _PROBE_BATCH_MAX:
+        _PROBE_BATCH.clear()
     _PROBE_BATCH[_key] = data
     return data
 
@@ -2937,7 +3056,8 @@ def _adam_step(w, g, m, v, t, lr, b1, b2, eps):
     return w, m, v
 
 
-def _loss_drop_quality(config, compiled_approx, base_args, device=None):
+def _loss_drop_quality(config, compiled_approx, base_args, device=None,
+                       episode: int | None = None):
     """Reward slot 6 under ``ALPHAGRAD_QUALITY_METRIC=loss_drop``.
 
     ``compiled_approx`` is the AOT-compiled DENSE executable of the plan under
@@ -2949,12 +3069,34 @@ def _loss_drop_quality(config, compiled_approx, base_args, device=None):
     Returns ``None`` when the walk cannot be defined (no data generator, no
     updatable weight slots, shape mismatch), which the caller treats as "fall
     back to the legacy cosine" rather than as a score.
+
+    HELD-OUT SCORING (``ALPHAGRAD_WALK_HELDOUT=1``, default off). The walk
+    trains on batch A; BOTH endpoints of the loss drop are then evaluated on a
+    second, independent batch B that the walk never saw:
+
+        quality = (loss(W0, B) - loss(W_T, B)) / |loss(W0, B)|
+
+    WHY L0 IS MEASURED ON B, NOT ON A. Mixing endpoints -- ``L0`` on A and
+    ``L1`` on B -- would make the numerator ``(train loss at W0) - (test loss
+    at W_T)``, i.e. a loss drop CONTAMINATED by the train/test gap of the two
+    different draws. At W0 the weights have seen neither batch, so ``E[L0_A] =
+    E[L0_B]`` and that contamination has zero mean but non-zero variance: it
+    adds noise and no signal. Scoring both endpoints on B is the textbook
+    definition of "how much did training reduce the loss on data it never
+    saw", it keeps the ratio's numerator and denominator on the same
+    distribution, and it is the lower-variance estimator. So: BOTH ON B.
     """
-    probe = _probe_batch(config, base_args)
+    probe = _probe_batch(config, base_args, "train", episode)
     if probe is None or config.target_fun is None:
         return None
     wnums = _walk_argnums(config, base_args)
     if not wnums:
+        return None
+
+    heldout = walk_heldout_enabled()
+    probe_ev = (_probe_batch(config, base_args, "eval", episode)
+                if heldout else probe)
+    if probe_ev is None:
         return None
 
     full = list(base_args)
@@ -2969,11 +3111,28 @@ def _loss_drop_quality(config, compiled_approx, base_args, device=None):
     # (33.6 MB XLA temp + 2.5-4.1 MB args).
     x0 = full[0]
 
+    # THE SCORING ARGS. Identical to ``full`` (same object) unless held-out
+    # scoring is on, in which case the data slots carry batch B instead. Same
+    # shapes and dtypes either way, so ``_jit_loss`` does not re-trace and the
+    # extra cost is one ``data_gen`` draw per (episode, role) plus one
+    # ``device_put`` per measurement.
+    if heldout:
+        full_ev = list(base_args)
+        for i, d in enumerate(probe_ev):
+            if i < len(full_ev):
+                full_ev[i] = jnp.asarray(d)
+        if device is not None:
+            full_ev = [jax.device_put(a, device) for a in full_ev]
+    else:
+        full_ev = full
+
     loss_fn = _jit_loss(config)
     w = [full[i] for i in wnums]
 
     def _call_loss(weights):
-        a = list(full)
+        # Scored on ``full_ev`` (batch B under --walk-heldout); the walk's own
+        # gradient steps read ``full`` (batch A) in ``_call_grad`` below.
+        a = list(full_ev)
         for i, wi in zip(wnums, weights):
             a[i] = wi
         return loss_fn(*a)
@@ -3012,24 +3171,55 @@ def _loss_drop_quality(config, compiled_approx, base_args, device=None):
     # TERMINAL row (the only rows quality is computed on) in the trainer
     # process. Printing the fingerprint makes a future divergence visible
     # instead of silent — compare the line across processes.
-    if not _WALK_FINGERPRINT:
-        _WALK_FINGERPRINT.append(1)
+    #
+    # PROVENANCE (A3). Readings now VARY, so the log has to say which batch a
+    # reading came from. The line fires once per (probe seed, held-out) pair --
+    # exactly once for a flag-off run whatever episodes get published, matching
+    # the old one-shot behaviour -- and carries the episode, both probe seeds,
+    # and a separate digest for the train batch, the held-out batch and W0, so
+    # a trainer/actor divergence (see the env-var caveat above) is visible by
+    # comparing lines rather than by inference.
+    _ep_used = walk_episode() if episode is None else int(episode)
+    _seed_tr = _walk_seed("train", episode)
+    # LATCHED ON THE SEED, not on the episode. With rotation OFF every episode
+    # resolves to the same seed, so a 250-episode run prints exactly ONE line
+    # -- the pre-A3 behaviour. With rotation ON the seed changes every episode,
+    # so there is exactly one line per batch actually used.
+    _fp_key = (_seed_tr, heldout)
+    if _fp_key not in _WALK_FINGERPRINT and len(_WALK_FINGERPRINT) < 1024:
+        _WALK_FINGERPRINT.append(_fp_key)
         import hashlib as _hl
-        _h = _hl.blake2b(digest_size=8)
-        for _a in (x0,) + tuple(full[1:2]) + tuple(w):
-            _h.update(np.asarray(jax.device_get(_a)).tobytes())
+
+        def _dig(arrs):
+            _h = _hl.blake2b(digest_size=8)
+            for _a in arrs:
+                _h.update(np.asarray(jax.device_get(_a)).tobytes())
+            return _h.hexdigest()
+
+        _fp_tr = _dig((x0,) + tuple(full[1:2]))
+        _fp_w0 = _dig(tuple(w))
+        # Back-compatible composite: the pre-A3 line hashed probe+W0 in one
+        # stream, and that combined digest is what old logs can be diffed
+        # against, so keep emitting it under the same name.
+        _fp_all = _dig((x0,) + tuple(full[1:2]) + tuple(w))
         print(
             f"[measure] loss-drop walk armed: probe batch "
-            f"{tuple(np.asarray(x0).shape)} (seed {_walk_probe_seed()}), "
+            f"{tuple(np.asarray(x0).shape)} (seed {_seed_tr}), "
             f"{_walk_steps()} Adam steps @ lr {_walk_lr():g}, "
             f"noise std {_walk_noise_std():g}, L0={L0:.6g}, "
-            f"fingerprint(probe+W0)={_h.hexdigest()}",
+            f"fingerprint(probe+W0)={_fp_all}"
+            f" | episode={_ep_used} rotate={int(walk_rotate_enabled())}"
+            f" heldout={int(heldout)}"
+            f" train_batch={_fp_tr} W0={_fp_w0}"
+            + (f" eval_seed={_walk_seed('eval', episode)}"
+               f" eval_batch={_dig((full_ev[0],) + tuple(full_ev[1:2]))}"
+               if heldout else " eval_batch=<same as train>"),
             flush=True)
 
     T = _walk_steps()
     lr = _walk_lr()
     noise = _walk_noise_std()
-    nkey = jrand.PRNGKey(_walk_probe_seed() + 1)
+    nkey = jrand.PRNGKey(_walk_seed("train", episode) + 1)
     m = [jnp.zeros_like(wi) for wi in w]
     v = [jnp.zeros_like(wi) for wi in w]
     for t in range(1, T + 1):

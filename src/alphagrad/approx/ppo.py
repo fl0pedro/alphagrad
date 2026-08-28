@@ -4060,6 +4060,23 @@ def make_argparser() -> argparse.ArgumentParser:
         "at 0.0 to reproduce the headline numbers.",
     )
     p.add_argument(
+        "--walk-heldout", action="store_true",
+        help="(A3) HELD-OUT SCORING, default OFF. The walk TRAINS on probe "
+        "batch A and both endpoints of the loss drop are scored on an "
+        "independent batch B the walk never saw, so the channel measures "
+        "generalisation rather than how well the plan's gradient can overfit "
+        "one fixed batch. Published as ALPHAGRAD_WALK_HELDOUT.",
+    )
+    p.add_argument(
+        "--walk-rotate", action="store_true",
+        help="(A3) PER-EPISODE PROBE ROTATION, default OFF. Re-draw the walk "
+        "batch (and the held-out batch) every episode instead of reusing one "
+        "batch for the whole run, so the quality channel has sampling "
+        "variance. Plans stay paired WITHIN an episode; comparisons ACROSS "
+        "episodes now need repeats. Published as ALPHAGRAD_WALK_ROTATE, with "
+        "the episode index in ALPHAGRAD_WALK_EPISODE.",
+    )
+    p.add_argument(
         "--seed-vertices",
         action="store_true",
         help="DEPRECATED (workstream A4): seeds are NOT vertices. No launcher "
@@ -5667,6 +5684,16 @@ def main():
     os.environ["ALPHAGRAD_WALK_LR"] = repr(float(args.walk_lr))
     os.environ["ALPHAGRAD_WALK_PROBE_SEED"] = str(int(args.walk_probe_seed))
     os.environ["ALPHAGRAD_WALK_NOISE_STD"] = repr(float(args.walk_noise_std))
+    # (A3) Both default OFF => bit-identical to a pre-A3 run. Exported BEFORE
+    # ray.init so the measure actors inherit them; the per-episode index is
+    # republished from the episode loop (see env.set_walk_episode) and reaches
+    # the trainer, which is where every terminal row is measured under
+    # --exec-on-gpu.
+    os.environ["ALPHAGRAD_WALK_HELDOUT"] = (
+        "1" if bool(getattr(args, "walk_heldout", False)) else "0")
+    os.environ["ALPHAGRAD_WALK_ROTATE"] = (
+        "1" if bool(getattr(args, "walk_rotate", False)) else "0")
+    os.environ["ALPHAGRAD_WALK_EPISODE"] = "0"
     global _QUALITY_METRIC
     from types import SimpleNamespace as _NS
     _QUALITY_METRIC = _env_quality_metric(
@@ -5676,7 +5703,10 @@ def main():
         f"{_QUALITY_METRIC}"
         + (f" (walk: {int(args.walk_steps)} Adam steps, lr {args.walk_lr:g}, "
            f"probe seed {int(args.walk_probe_seed)}, noise std "
-           f"{args.walk_noise_std:g})" if _QUALITY_METRIC == "loss_drop"
+           f"{args.walk_noise_std:g}, held-out "
+           f"{int(bool(getattr(args, 'walk_heldout', False)))}, rotate "
+           f"{int(bool(getattr(args, 'walk_rotate', False)))})"
+           if _QUALITY_METRIC == "loss_drop"
            else (" (NOT COMPUTED -- reward slot 6 stays 0.0; the cost "
                  "channels are unaffected)" if _QUALITY_METRIC == "none"
                  else " (Jacobian cosine vs the exact reference)")),
@@ -11238,6 +11268,10 @@ def main():
     _train_dev = jax.local_devices()[0]
 
     for ep in range(args.episodes):
+        # (A3) Publish the episode index for the loss-drop probe rotation.
+        # Inert unless --walk-rotate; one env-var write per episode.
+        from alphagrad.approx.env import set_walk_episode as _set_walk_ep
+        _set_walk_ep(ep)
         if _jax_trace_dir and ep == _jax_trace_ep and not _jax_trace_active:
             tqdm.write(
                 f"[profiler] jax.profiler.start_trace -> {_jax_trace_dir} (ep={ep})",
