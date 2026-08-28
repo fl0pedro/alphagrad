@@ -195,6 +195,58 @@ def _build_gradient_fn(
             True,
         )
 
+    if spec.startswith("deg:"):
+        # SYNTHETIC SINGLE-VERTEX APPROXIMATION, generated for the CURRENT
+        # graph by alphagrad.approx.tools.quality_bakeoff.  The archived
+        # best_sequences.json plans were recorded against an older graph whose
+        # edges were 4-D and no longer replay here, so the bake-off population
+        # is built natively instead.  The elimination ORDER is left to graphax
+        # ("rev") -- only the per-vertex approximation rules come from the
+        # spec, which sidesteps the stale-vertex-list problem entirely.
+        #
+        # SEVERITIES is IMPORTED, not copied: the metric harness and this
+        # ground-truth harness must describe the same plan or the correlation
+        # is meaningless.
+        from alphagrad.approx.common.seq_replay import parse_recorded_seq
+        from alphagrad.approx.tools.quality_bakeoff import SEVERITIES
+
+        body = spec[len("deg:") :]
+        sev, _, where = body.partition("@")
+        if sev not in SEVERITIES:
+            raise SystemExit(
+                f"unknown deg severity {sev!r}; known: {sorted(SEVERITIES)}"
+            )
+        ops = SEVERITIES[sev]
+        jx = jax.make_jaxpr(target_fn)(*sample_args)
+        n_eqns = len(jx.jaxpr.eqns)
+        axis_sizes = sorted(
+            {
+                int(s)
+                for eqn in jx.jaxpr.eqns
+                for ov in eqn.outvars
+                for s in (getattr(getattr(ov, "aval", None), "shape", ()) or ())
+            }
+        )
+        targets = (
+            [int(where)] if where not in ("", "all") else list(range(1, n_eqns + 1))
+        )
+        seq = [{"vertex": v, "ops": [dict(o) for o in ops]} for v in targets]
+        _order, transforms = parse_recorded_seq(
+            seq, axis_sizes=axis_sizes, skip_low_precision_quant=True,
+        )
+        return (
+            _make_grad_from_jacobian(
+                jax.jit(
+                    jacve(
+                        target_fn, order="rev", transforms=transforms,
+                        argnums=argnums, has_aux=True,
+                    )
+                ),
+                returns_primal=True,
+            ),
+            True,
+        )
+
     if spec.startswith("wandb:"):
         rest = spec[len("wandb:") :]
         if ":" not in rest:

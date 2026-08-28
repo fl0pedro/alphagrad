@@ -4334,7 +4334,7 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--quality-metric",
-        choices=["auto", "loss_drop", "cosine", "none"],
+        choices=["auto", "loss_drop", "grad_cosine", "jac_cosine", "cosine", "none"],
         default="auto",
         help="WHICH quantity reward slot 6 (the --lambda-acc channel) holds. "
         "loss_drop = the relative loss drop of a 200-step Adam walk driven by "
@@ -6128,7 +6128,8 @@ def main():
            if _QUALITY_METRIC == "loss_drop"
            else (" (NOT COMPUTED -- reward slot 6 stays 0.0; the cost "
                  "channels are unaffected)" if _QUALITY_METRIC == "none"
-                 else " (Jacobian cosine vs the exact reference)")),
+                 else " (gradient cosine at init vs the exact reference; "
+                  "'cosine' is a deprecated alias)")),
         flush=True)
     env = VertexEliminationEnv.from_jaxpr(
         closed_jaxpr,
