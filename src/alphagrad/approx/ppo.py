@@ -1418,6 +1418,16 @@ class Trajectory(NamedTuple):
     # its pooling exactly as `_face_encode` did. None-when-off, like the
     # probe / edge-mem fields above.
     face_heads: jax.Array = None       # (MAX_FACES,) int32
+    # --per-face-masks (workstream A1). Both enter the head's MASKS, so both
+    # must be stored for the loss to re-mask identically (ratio 1 at epoch 0)
+    # -- exactly why face_pair_valid / face_comp_valid are stored.
+    # `face_sizes` is LiveVertexMaskOracle.face_dim_sizes: each face's LIVE
+    # `logical_size` of out_dims ++ primal_dims, the numbering Diag(i, j) and
+    # rule_is_legal use. `face_quant` is 1 iff some emittable dtype is a legal,
+    # NON-IDEMPOTENT cast on that face's operand. None-when-off, like the probe
+    # / edge-mem / face-read fields above: no extra leaf, no shape change.
+    face_sizes: jax.Array = None       # (MAX_FACES, N) int32
+    face_quant: jax.Array = None       # (MAX_FACES,) float32
 
 
 class TrainBatch(NamedTuple):
@@ -1503,6 +1513,9 @@ class TrainBatch(NamedTuple):
     delta_wr_slot: jax.Array = None    # (K, MAX_FACES)
     delta_wr_n: jax.Array = None       # (K,)
     face_heads: jax.Array = None       # (MAX_FACES,) int32 (--face-read)
+    # --per-face-masks (see Trajectory): threaded exactly like face_heads.
+    face_sizes: jax.Array = None       # (MAX_FACES, N) int32
+    face_quant: jax.Array = None       # (MAX_FACES,) float32
 
 
 # ---------------------------------------------------------------------------
@@ -2578,7 +2591,11 @@ class Agent(eqx.Module):
             _o = oracle_fn(vertex_idx)
             v_pair, v_comp = _o[0], _o[1]
             _sample_pair, _sample_comp = v_pair, v_comp
-            _face_from_fn = (_o[2], _o[3], _o[4])
+            # (fpair, fcomp, fvalid) and, under --per-face-masks, the two
+            # extra per-face arrays (live dim sizes, QUANT legality). The
+            # ARITY is the flag: the callback only emits them when it is on,
+            # so nothing here has to be told about the flag twice.
+            _face_from_fn = tuple(_o[2:])
         elif oracle_pair_all is not None:
             v_pair = oracle_pair_all[vertex_idx + 1]
             v_comp = oracle_comp_all[vertex_idx + 1]
@@ -2639,13 +2656,22 @@ class Agent(eqx.Module):
                        or (face_chunk_fn is not None))
         if _have_faces and self.face_path_policy is not None:
             _n_faces = None
+            # --per-face-masks extras; None on every other path, which is what
+            # `UnifiedFacePolicy.sample_face` reads as "use the vertex's
+            # nominal features and the unnarrowed hardware dtype mask".
+            f_sizes = f_quant = None
             if _face_from_fn is not None:
-                f_pair, f_comp, f_valid = _face_from_fn
+                f_pair, f_comp, f_valid = _face_from_fn[:3]
+                if len(_face_from_fn) > 3:
+                    f_sizes, f_quant = _face_from_fn[3], _face_from_fn[4]
             elif face_masks_all is not None:
-                _fp_all, _fc_all, _fv_all = face_masks_all
+                _fp_all, _fc_all, _fv_all = face_masks_all[:3]
                 f_pair = _fp_all[vertex_idx + 1]
                 f_comp = _fc_all[vertex_idx + 1]
                 f_valid = _fv_all[vertex_idx + 1]
+                if len(face_masks_all) > 3:
+                    f_sizes = face_masks_all[3][vertex_idx + 1]
+                    f_quant = face_masks_all[4][vertex_idx + 1]
             else:
                 # STATIC sampling masks: axis validity only. DIAG pair
                 # divisibility is already the head's own pair_ok (gcd > 1)
@@ -2677,6 +2703,7 @@ class Agent(eqx.Module):
                         v_context, features, factor_tables, face_key,
                         f_pair, f_comp, f_valid,
                         op_legality_override=op_legality_override,
+                        face_sizes=f_sizes, face_quant=f_quant,
                     )
                 )
                 _F = self.face_path_policy.max_faces
@@ -2687,6 +2714,7 @@ class Agent(eqx.Module):
                 f_ends = jnp.zeros((_F, 2), jnp.int32)
                 f_dt = jnp.zeros((MAX_DELTA_TOKENS,), jnp.int32)
                 f_de = -jnp.ones((MAX_DELTA_TOKENS,), jnp.int32)
+                _fl_tail = ()   # no live-face stream -> no per-face tail
             else:
                 if self.micro_action_policy is None:
                     # No per-vertex head: the vertex rules are ALWAYS the
@@ -2713,6 +2741,8 @@ class Agent(eqx.Module):
                      else face_count_fn(vertex_idx)),
                     endpoint_rows=endpoint_rows,
                     edge_rows=edge_rows,
+                    face_sizes=f_sizes,
+                    face_quant=f_quant,
                 )
                 (fa, face_logp, face_ent, f_cnt, f_dt,
                  f_de, f_ends) = _fl_out[:7]
@@ -2724,6 +2754,16 @@ class Agent(eqx.Module):
             # always LAST. Both conditional so the flag-off tuple (and
             # az_gumbel's 10-element unpack) is untouched.
             face_out = face_out + tuple(_fl_tail)
+            # --per-face-masks appends the two ORACLE arrays the head masked
+            # with, so the rollout can STORE them: they enter the masks, so
+            # the loss must re-mask with the identical values or the PPO ratio
+            # is not 1 at epoch 0 -- the same reason f_pair/f_comp/f_valid ride
+            # out through this tuple. Appended after the _face_loop tail so
+            # the historical [:10] / [10:12] slices keep meaning what they did;
+            # the --face-read read moves from [-1] to [-3] and the caller
+            # computes that offset explicitly.
+            if f_sizes is not None:
+                face_out = face_out + (f_sizes, f_quant)
 
         return (
             vertex_idx,
@@ -2854,7 +2894,7 @@ class Agent(eqx.Module):
                    f_pair, f_comp, f_valid, enc_carry, face_chunk_fn,
                    vertex_idx, vertex_specs, axis_state_v,
                    op_legality_override, n_faces, endpoint_rows=None,
-                   edge_rows=None):
+                   edge_rows=None, face_sizes=None, face_quant=None):
         """Read face f's chunk, decide face f, repeat -- for the ACTUAL face
         count, as a while_loop.
 
@@ -2989,6 +3029,12 @@ class Agent(eqx.Module):
             sk, row, lp, e, _ar, _sp, _od = pol.sample_face(
                 features, factor_tables, jrand.fold_in(key, f),
                 f, f_pair[f], f_comp[f], f_valid[f], face_context=summ,
+                # --per-face-masks: this face's LIVE dim sizes (which become
+                # its AxisTokenFeatures, hence its pair_ok gate AND the factor
+                # `_rows` derives) and its QUANT legality bit. `f` is a TRACED
+                # while_loop index, so these are dynamic gathers, not slices.
+                face_sizes_f=None if face_sizes is None else face_sizes[f],
+                face_quant_f=None if face_quant is None else face_quant[f],
                 op_legality_override=op_legality_override)
             rs = rs.at[f].set(self._face_row_specs(row, axis_state_v))
             skips = skips.at[f].set(sk.astype(jnp.int32))
@@ -3019,7 +3065,7 @@ class Agent(eqx.Module):
                      op_legality_override, face_bound=None,
                      face_win_budget=None, endpoint_rows=None,
                      face_ends=None, edge_rows=None, face_eslots=None,
-                     face_heads=None):
+                     face_heads=None, face_sizes=None, face_quant=None):
         """Score the stored FaceAction against contexts pooled from ONE scan
         of the stored emission window.
 
@@ -3183,6 +3229,11 @@ class Agent(eqx.Module):
             lp, e, ar, _sp, _od = pol.evaluate_face(
                 features, factor_tables, fa, f,
                 f_pair[f], f_comp[f], f_valid[f], face_context=summ,
+                # THE SAMPLING-SIDE MIRROR. `_face_loop` passes exactly these
+                # two, from the STORED oracle arrays; anything less and the
+                # loss scores a different masked distribution -> ratio != 1.
+                face_sizes_f=None if face_sizes is None else face_sizes[f],
+                face_quant_f=None if face_quant is None else face_quant[f],
                 op_legality_override=op_legality_override)
             if gate is not None:
                 _z = jnp.zeros((), jnp.float32)
@@ -3273,6 +3324,8 @@ class Agent(eqx.Module):
         edge_rows=None,        # (K, E) loss-side edge-memory read rows
         face_eslots=None,      # stored (F, 2) operand edge slots
         face_heads=None,       # stored (F,) approx-echo prefix lengths
+        face_sizes=None,       # stored (F, N) live per-face dim sizes
+        face_quant=None,       # stored (F,) per-face QUANT legality
     ):
         """Joint log-prob / entropy for a stored typed action sequence.
 
@@ -3400,6 +3453,7 @@ class Agent(eqx.Module):
                         v_context, features, factor_tables, face_action,
                         face_pair_valid, face_comp_valid, face_valid,
                         op_legality_override=op_legality_override,
+                        face_sizes=face_sizes, face_quant=face_quant,
                     )
                 )
             else:
@@ -3414,6 +3468,8 @@ class Agent(eqx.Module):
                     edge_rows=edge_rows,
                     face_eslots=face_eslots,
                     face_heads=face_heads,
+                    face_sizes=face_sizes,
+                    face_quant=face_quant,
                 )
             total_log_p = total_log_p + f_logp
             # Arity-normalised per the PER-HEAD ENTROPY NORMALISATION note
@@ -4019,8 +4075,8 @@ def make_argparser() -> argparse.ArgumentParser:
         "Jacobian — i.e. forward/reverse/cross-country becomes part of the "
         "search. Requires graphax >= 5c56105 (seed-vertex sentinel fix). "
         "Why it is gone: those 2 extra vertices enter the pointer's action "
-        "space and enlarge derived_max_faces, and the forward/reverse/"
-        "cross-country freedom they buy is UNREACHABLE while "
+        "space and enlarge derived_max_faces (nn256: 13 -> 15 eqns), and the "
+        "forward/reverse/cross-country freedom they buy is UNREACHABLE while "
         "ALPHAGRAD_FORCE_REV_ORDER=1 pins the order to reverse.",
     )
     p.add_argument(
@@ -4213,6 +4269,29 @@ def make_argparser() -> argparse.ArgumentParser:
         help="With --diag-per-face, project the FACTOR only: if the requested "
              "(i, j) pair does not exist on the live operand, leave it exact "
              "instead of falling back to a legal pair.")
+    p.add_argument(
+        "--per-face-masks", action="store_true",
+        help="PER-FACE masking for EVERY approximation (the generalisation of "
+             "--diag-per-face). Approximation legality is decided at three "
+             "layers that disagree about granularity -- nominal/per-vertex, "
+             "the oracle face probe, and the live operand at apply time -- and "
+             "only the last one decides. This flag expresses the first two in "
+             "the last one's terms: (1) the head is handed each face's LIVE "
+             "logical dim sizes (masks.face_dim_sizes) instead of the vertex's "
+             "nominal ones, which makes its pair_ok gate and its hardcoded "
+             "factor = gcd(N_i, N_j) per-face and legal BY CONSTRUCTION; "
+             "(2) QUANT gets the per-face mask it never had (a dtype that is "
+             "already the operand's, or an operand with no val, is a no-op, "
+             "not an approximation); (3) an illegal COMPRESS axis is projected "
+             "onto the operand's own legal axis set instead of being dropped "
+             "silently. Every projection is re-verified with rule_is_legal "
+             "before it is applied, so skipped_raised cannot rise. NO head "
+             "shape change: the 94-slot layout is untouched. Default off = "
+             "bit-identical to before, no extra stored array, same trace.")
+    p.add_argument(
+        "--no-per-face-repair-axis", action="store_true",
+        help="With --per-face-masks, drop an out-of-range COMPRESS axis "
+             "instead of snapping it to the nearest legal one.")
     p.add_argument("--num-heads", type=int, default=2)
     p.add_argument("--hidden-dim", type=int, default=64)
     p.add_argument(
@@ -5383,12 +5462,19 @@ def main():
     # --diag-per-face must be installed BEFORE ray.init: the setter republishes
     # to os.environ so the measure actors, which build their own hooks in their
     # own processes, inherit the same setting.
-    from alphagrad.approx.common.masks import set_diag_per_face
+    from alphagrad.approx.common.masks import (
+        set_diag_per_face, set_per_face_masks)
     set_diag_per_face(
         bool(getattr(args, "diag_per_face", False)),
         rule=str(getattr(args, "diag_per_face_rule", "largest")),
         repair_pair=not bool(
             getattr(args, "no_diag_per_face_repair_pair", False)),
+    )
+    # --per-face-masks, same discipline and for the same reason: the apply-time
+    # projection runs inside the Ray measure actors' own processes.
+    set_per_face_masks(
+        bool(getattr(args, "per_face_masks", False)),
+        repair_axis=not bool(getattr(args, "no_per_face_repair_axis", False)),
     )
 
     # ``ALPHAGRAD_TRACEMALLOC=1`` — start the Python allocator tracker
@@ -5943,6 +6029,15 @@ def main():
 
     _F_FACES = ENV_MAX_FACES
 
+    # --per-face-masks (workstream A1). A PYTHON bool, read at trace time, so
+    # with the flag off none of the extra arrays below is ever created: no new
+    # callback output, no new trajectory leaf, no shape change anywhere.
+    _PFM = bool(getattr(args, "per_face_masks", False))
+    if _PFM and not getattr(args, "face_actions", False):
+        raise ValueError(
+            "--per-face-masks needs --face-actions: it masks the per-FACE "
+            "action space, and without the face head there is none.")
+
     def _oracle_face_masks_host(order, spec_hist, step_count):
         _pt0 = _prof_time.perf_counter()
         try:
@@ -5973,26 +6068,37 @@ def main():
         fpair = np.zeros((V + 1, F, N, N), np.float32)
         fcomp = np.zeros((V + 1, F, N), np.float32)
         fvalid = np.zeros((V + 1, F), np.float32)
+        fsizes = np.zeros((V + 1, F, N), np.int32)
+        fquant = np.zeros((V + 1, F), np.float32)
         for v in range(1, V + 1):
             try:
-                fp, fc, nf = o.face_masks(v, F)
+                fp, fc, fs, fq, nf = o.face_masks_and_sizes(v, F,
+                                                            per_face=_PFM)
             except Exception:
                 continue
             fpair[v] = np.asarray(fp, np.float32)
             fcomp[v] = np.asarray(fc, np.float32)
             fvalid[v, : int(nf)] = 1.0
-        return (np.asarray(pair, np.float32), np.asarray(comp, np.float32),
-                fpair, fcomp, fvalid)
+            if _PFM:
+                fsizes[v] = np.asarray(fs, np.int32)
+                fquant[v] = np.asarray(fq, np.float32)
+        out = (np.asarray(pair, np.float32), np.asarray(comp, np.float32),
+               fpair, fcomp, fvalid)
+        return out + ((fsizes, fquant) if _PFM else ())
 
     def _oracle_face_masks(order, spec_hist, step_count):
         V, F, N = _oracle_total_v, _F_FACES, _oracle_N
+        _shapes = (jax.ShapeDtypeStruct((V + 1, N, N), jnp.float32),
+                   jax.ShapeDtypeStruct((V + 1, N), jnp.float32),
+                   jax.ShapeDtypeStruct((V + 1, F, N, N), jnp.float32),
+                   jax.ShapeDtypeStruct((V + 1, F, N), jnp.float32),
+                   jax.ShapeDtypeStruct((V + 1, F), jnp.float32))
+        if _PFM:
+            _shapes = _shapes + (
+                jax.ShapeDtypeStruct((V + 1, F, N), jnp.int32),
+                jax.ShapeDtypeStruct((V + 1, F), jnp.float32))
         return jax.pure_callback(
-            _oracle_face_masks_host,
-            (jax.ShapeDtypeStruct((V + 1, N, N), jnp.float32),
-             jax.ShapeDtypeStruct((V + 1, N), jnp.float32),
-             jax.ShapeDtypeStruct((V + 1, F, N, N), jnp.float32),
-             jax.ShapeDtypeStruct((V + 1, F, N), jnp.float32),
-             jax.ShapeDtypeStruct((V + 1, F), jnp.float32)),
+            _oracle_face_masks_host, _shapes,
             order, spec_hist, step_count, vmap_method="sequential",
         )
 
@@ -6053,11 +6159,22 @@ def main():
             fp_arr = np.zeros((F, N, N), np.float32)
             fc_arr = np.zeros((F, N), np.float32)
             fv_arr = np.zeros((F,), np.float32)
+            # --per-face-masks: the LIVE per-face dim sizes the head reads and
+            # the per-face QUANT legality bit. Same probe, same failure
+            # semantics -- an exception leaves them zero, which (with fv_arr
+            # zero) already disables the whole face action space for this
+            # vertex, so a zero size vector can never be sampled under.
+            fs_arr = np.zeros((F, N), np.int32)
+            fq_arr = np.zeros((F,), np.float32)
             try:
-                fp, fc, nf = o.face_masks(v, F)
+                fp, fc, fs, fq, nf = o.face_masks_and_sizes(v, F,
+                                                            per_face=_PFM)
                 fp_arr[:] = np.asarray(fp, np.float32)
                 fc_arr[:] = np.asarray(fc, np.float32)
                 fv_arr[: int(nf)] = 1.0
+                if _PFM:
+                    fs_arr[:] = np.asarray(fs, np.int32)
+                    fq_arr[:] = np.asarray(fq, np.float32)
             except Exception as _fmexc:
                 # DO NOT SWALLOW (2026-08-05). fv_arr stays ALL-ZERO here,
                 # which marks every face invalid and disables the whole
@@ -6079,6 +6196,8 @@ def main():
                         _tb.print_exc()
             _res = (np.asarray(pair[v], np.float32),
                     np.asarray(comp[v], np.float32), fp_arr, fc_arr, fv_arr)
+            if _PFM:
+                _res = _res + (fs_arr, fq_arr)
             if _k is not None:
                 if len(_ORACLE_MEMO) >= _ORACLE_MEMO_MAX:
                     # FIFO evict a chunk rather than one-at-a-time, so the
@@ -6093,13 +6212,17 @@ def main():
 
     def _oracle_one(order, spec_hist, step_count, vertex_idx):
         F, N = _F_FACES, _oracle_N
+        _shapes = (jax.ShapeDtypeStruct((N, N), jnp.float32),
+                   jax.ShapeDtypeStruct((N,), jnp.float32),
+                   jax.ShapeDtypeStruct((F, N, N), jnp.float32),
+                   jax.ShapeDtypeStruct((F, N), jnp.float32),
+                   jax.ShapeDtypeStruct((F,), jnp.float32))
+        if _PFM:
+            _shapes = _shapes + (
+                jax.ShapeDtypeStruct((F, N), jnp.int32),
+                jax.ShapeDtypeStruct((F,), jnp.float32))
         return jax.pure_callback(
-            _oracle_one_host,
-            (jax.ShapeDtypeStruct((N, N), jnp.float32),
-             jax.ShapeDtypeStruct((N,), jnp.float32),
-             jax.ShapeDtypeStruct((F, N, N), jnp.float32),
-             jax.ShapeDtypeStruct((F, N), jnp.float32),
-             jax.ShapeDtypeStruct((F,), jnp.float32)),
+            _oracle_one_host, _shapes,
             order, spec_hist, step_count, vertex_idx,
             vmap_method="sequential",
         )
@@ -7096,10 +7219,13 @@ def main():
                     oracle_pair_all = oracle_comp_all = None
                     face_masks_all = None
                 elif args.face_actions:
-                    (oracle_pair_all, oracle_comp_all, _fp_all, _fc_all,
-                     _fv_all) = _oracle_face_masks(
+                    _om = _oracle_face_masks(
                         state.order, state.sparsity_specs, state.step_count)
-                    face_masks_all = (_fp_all, _fc_all, _fv_all)
+                    oracle_pair_all, oracle_comp_all = _om[0], _om[1]
+                    # (fpair, fcomp, fvalid) [+ (fsizes, fquant) under
+                    # --per-face-masks]; the arity IS the flag, as in
+                    # `sample_action_dynamic`'s `_face_from_fn`.
+                    face_masks_all = tuple(_om[2:])
                 else:
                     oracle_pair_all, oracle_comp_all = _oracle_masks(
                         state.order, state.sparsity_specs, state.step_count)
@@ -7159,9 +7285,15 @@ def main():
                      face_de_v, face_ends_v) = face_out[:10]
                     if _EDGE_MEM:
                         face_eslots_v, face_ewr_v = face_out[10:12]
-                    # --face-read: always the LAST element (see _face_loop).
+                    # --per-face-masks appends its two arrays AFTER the
+                    # _face_loop tail, so --face-read's "always last" becomes
+                    # "last before those two". Computed, not hardcoded, so the
+                    # two flags compose.
+                    _pfm_tail = 2 if _PFM else 0
                     if _FACE_HEADS:
-                        face_heads_v = face_out[-1]
+                        face_heads_v = face_out[len(face_out) - 1 - _pfm_tail]
+                    if _PFM:
+                        face_sizes_v, face_quant_v = face_out[-2], face_out[-1]
                 else:
                     face_action = _zero_face_action()
                     face_old_logp = jnp.array(0.0)
@@ -7183,6 +7315,14 @@ def main():
                         ).at[:, 0].set(-1)
                     if _FACE_HEADS:
                         face_heads_v = jnp.zeros((ENV_MAX_FACES,), jnp.int32)
+                    if _PFM:
+                        # No faces -> no live sizes and no legal QUANT. Zero
+                        # sizes read back as an all-invalid axis set, which is
+                        # the correct "nothing is approximable here".
+                        face_sizes_v = jnp.zeros(
+                            (ENV_MAX_FACES, MAX_AXES_PER_VERTEX), jnp.int32)
+                        face_quant_v = jnp.zeros(
+                            (ENV_MAX_FACES,), jnp.float32)
                 if _DEBUG_ORDER:
                     # avail = how many vertices are still selectable; picked =
                     # the 0-based index chosen; was_avail = 1.0 iff that pick
@@ -7359,6 +7499,12 @@ def main():
             # pooled from. Stored unconditionally-when-on, next to
             # face_counts (which is what the loss's boundaries come from).
             _fr_fields = ({"face_heads": face_heads_v} if _FACE_HEADS else {})
+            # --per-face-masks: the two ORACLE arrays the head masked with.
+            # Stored for the same reason face_pair_valid is -- the loss has to
+            # re-mask with the identical values or the ratio is not 1.
+            if _PFM:
+                _fr_fields = dict(_fr_fields, face_sizes=face_sizes_v,
+                                  face_quant=face_quant_v)
             transition = Trajectory(
                 preference=preference.astype(jnp.float32),
                 vertex_idx=jnp.asarray(vertex_idx, dtype=jnp.int32),
@@ -7533,7 +7679,8 @@ def main():
         def _eval_dyn(pref, vidx, action, vmask, ax_st, ax_vm,
                       k, pv, cv, fa=None, fpv=None, fcv=None, fv=None,
                       fen=None, pc3=None, fch=None, fcy=None, fb=None,
-                      fwb=None, fer=None, fem=None, fes=None, fhd=None):
+                      fwb=None, fer=None, fem=None, fes=None, fhd=None,
+                      fsz=None, fqt=None):
             # No token arguments: `pc3` (the carry-derived heads) IS the
             # encoding, exactly as on the rollout side.
             return agent.evaluate_action_dynamic(
@@ -7567,6 +7714,10 @@ def main():
                 edge_rows=fem,
                 face_eslots=fes,
                 face_heads=fhd,
+                # --per-face-masks: the STORED oracle arrays, so the loss
+                # re-masks with exactly what the behaviour policy masked with.
+                face_sizes=fsz,
+                face_quant=fqt,
             )
 
         # Re-derive each sample's encoding by extending its stored
@@ -7913,8 +8064,12 @@ def main():
                     fes=(per[2 if _EP_READ else 1]
                          if _EDGE_MEM else None),
                     # --face-read: the stored per-face approx-echo prefix
-                    # lengths; ALWAYS last in `per`.
-                    fhd=(per[-1] if _FACE_HEADS else None),
+                    # lengths; last in `per` EXCEPT for the --per-face-masks
+                    # pair, which is appended after it.
+                    fhd=(per[-1 - (2 if _PFM else 0)]
+                         if _FACE_HEADS else None),
+                    fsz=(per[-2] if _PFM else None),
+                    fqt=(per[-1] if _PFM else None),
                 )
             )(
                 batch.preference,
@@ -7938,6 +8093,7 @@ def main():
                 *((pc_eprows,) if _EP_READ else ()),
                 *((pc_emrows, batch.face_eslots) if _EDGE_MEM else ()),
                 *((batch.face_heads,) if _FACE_HEADS else ()),
+                *((batch.face_sizes, batch.face_quant) if _PFM else ()),
             )
             if args.face_actions
             else jax.vmap(
@@ -8931,6 +9087,10 @@ def main():
             # --face-read: per-step, sliced by the same shuffle as
             # face_counts (both are (num_envs, T, MAX_FACES)); None when off.
             face_heads=traj.face_heads,
+            # --per-face-masks: per-step (num_envs, T, MAX_FACES, ...), sliced
+            # by the same shuffle as face_counts; None when the flag is off.
+            face_sizes=traj.face_sizes,
+            face_quant=traj.face_quant,
             enc_M=_w_encM,
             enc_I=_w_encI,
             enc_cumhist=_w_ench,
@@ -10052,12 +10212,16 @@ def main():
                 pf.get("skipped", 0) + pf.get("skipped_raised", 0))
             log_dict["approx_applied/fraction"] = pf.get(
                 "applied_fraction", 0.0)
-            # --diag-per-face only (absent, not zero, when the flag is off, so
-            # the panel can tell "not enabled" from "enabled and never fired").
-            if pf.get("skipped_diag_noop") is not None:
-                log_dict["per_face/skipped_diag_noop"] = pf["skipped_diag_noop"]
-            if pf.get("repaired_diag") is not None:
-                log_dict["per_face/repaired_diag"] = pf["repaired_diag"]
+            # --diag-per-face / --per-face-masks only (absent, not zero, when
+            # the flags are off, so the panel can tell "not enabled" from
+            # "enabled and never fired"). `skipped_K_noop` is the IDEMPOTENT
+            # denominator correction: the honest applied fraction for kind K is
+            # applied_K / (applied_K + skipped_K - skipped_K_noop).
+            for _k in ("diag", "compress", "quant"):
+                for _sfx in ("skipped_%s_noop", "repaired_%s"):
+                    _key = _sfx % _k
+                    if pf.get(_key) is not None:
+                        log_dict[f"per_face/{_key}"] = pf[_key]
             _pf_stats = pf
 
         # ---- PER-PLAN JOINT RECORDS (QUALITY_COLLAPSE sec 14.7) ------------

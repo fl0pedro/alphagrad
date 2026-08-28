@@ -131,6 +131,13 @@ class UnifiedFacePolicy(eqx.Module):
         am = jnp.broadcast_to(_fit(i_compress, NUM_REDUCE_AXES),
                               (FACE_SLOTS, NUM_REDUCE_AXES))
         # Non-coprime (i, j) table: gcd == 1 admits only factor 1, a no-op.
+        #
+        # PER-FACE UNDER --per-face-masks. `features` here is `_face_feats_1`'s
+        # output, so once `face_sizes_f` is supplied these are THIS FACE's live
+        # logical sizes (`masks.dim_logical_sizes`) rather than the vertex's
+        # nominal ones -- the same numbers `masks.face_masks_and_sizes` screened
+        # the pair with, and the same ones `_rows` derives the factor from. With
+        # `face_sizes_f=None` it is the historical per-VERTEX table.
         sz = jnp.asarray(features.size, jnp.int32)
         sz = jnp.concatenate([sz, jnp.ones((MAX_PAIR_IDX,), jnp.int32)]
                              )[:MAX_PAIR_IDX]
@@ -156,6 +163,18 @@ class UnifiedFacePolicy(eqx.Module):
         face_sizes is None falls back to the shared vertex features, which
         is the OLD behaviour -- kept so the blind path stays reachable for an
         A/B, not because it is correct.
+
+        WHICH SIZES (--per-face-masks). The array wired in is
+        ``LiveVertexMaskOracle.face_dim_sizes`` -- the LIVE ``logical_size`` of
+        ``out_dims ++ primal_dims`` -- NOT ``face_features``' ``val.shape``.
+        Only the former is indexed the way ``Diag(i, j)``, the (N, N) pair
+        mask and ``rule_is_legal`` are indexed, so only the former makes the
+        head's ``gcd``-derived factor mean the same thing as the mask that
+        admitted the pair. ``tag_bits`` / ``group_id`` still come from the
+        vertex: they are structural flags the env stamps after a per-vertex
+        DIAG lands, which under --live-faces never happens (the vertex rule
+        rows are always exact), and the oracle's ``pair_valid_f`` is AND-ed in
+        downstream and is authoritative either way.
         """
         if sizes_f is None:
             return features
@@ -193,6 +212,18 @@ class UnifiedFacePolicy(eqx.Module):
         # blocks. Square pairs therefore give a pure diagonal. Sampling the
         # factor was removed upstream because the env clamped it to a divisor
         # of this gcd anyway -- the clamp, not the head, decided it.
+        #
+        # THE FACTOR IS NOT AN ACTION, AND UNDER --per-face-masks IT DOES NOT
+        # NEED TO BE. `features` is the FACE's features there, so this gcd is
+        # taken over the live operand's own logical sizes, and the mask
+        # (`face_masks_and_sizes`, per_face=True) admits (i, j) only when
+        # `base == 1` and `span % g_face == 0` on every dispatch mode. A free
+        # pair has `base = 1, span = gcd`, so `factor = g_face` is exactly
+        # `base * span` -- the finest end of `diag_pair_legal_factors`, LEGAL
+        # BY CONSTRUCTION rather than by luck. That is the documented
+        # deterministic factor rule; the 94-slot head layout is UNCHANGED (no
+        # factor field, no head-shape change), and a learned factor field would
+        # replace this one line without moving anything else.
         sz = jnp.asarray(features.size, jnp.int32)
         sz = jnp.concatenate([sz, jnp.ones((MAX_PAIR_IDX,), jnp.int32)]
                              )[:MAX_PAIR_IDX]
@@ -241,15 +272,35 @@ class UnifiedFacePolicy(eqx.Module):
             return jnp.zeros((n,), jnp.float32)
         return face_latent
 
+    @staticmethod
+    def _quant_mask_1(quant_legality_mask, face_quant_f):
+        """The hardware dtype mask narrowed by THIS face's QUANT legality.
+
+        ``face_quant_f`` (0/1, from ``masks.face_masks_and_sizes``) is 0 when
+        no dtype the head can emit is both a legal chain and a real cast on
+        this face's operand -- i.e. the operand has no ``val``, or is already
+        that dtype. ``_compute_op_legality`` reads this mask as
+        ``sum(mask) > 0.5``, so zeroing it makes OP_QUANT unrepresentable on
+        that face. Before this, QUANT was the ONE operator with no per-face
+        legality at all, which is exactly why it was always available.
+        """
+        if face_quant_f is None:
+            return quant_legality_mask
+        return jnp.asarray(quant_legality_mask, jnp.float32) * jnp.asarray(
+            face_quant_f, jnp.float32)
+
     def sample_face(self, features: AxisTokenFeatures,
                     tables: FactorTables, key, f: int, pair_valid_f,
                     comp_valid_f, face_valid_f, *, face_context=None,
-                    face_sizes_f=None, quant_legality_mask=None,
+                    face_sizes_f=None, face_quant_f=None,
+                    quant_legality_mask=None,
                     op_legality_override=None):
         """Draw face ``f``'s decision. ``(skip, row, logp, ent, arity,
         skip_prob, op_dist)`` -- one slice of what :meth:`sample` stacks."""
         if quant_legality_mask is None:
             quant_legality_mask = quant_hardware_masks()[0]
+        quant_legality_mask = self._quant_mask_1(quant_legality_mask,
+                                                 face_quant_f)
         ff = self._face_feats_1(features, face_sizes_f)
         ctx_f = self._repr(face_context)
         om, im, jm, am, pair_ok = self._face_masks(
@@ -266,12 +317,17 @@ class UnifiedFacePolicy(eqx.Module):
                       tables: FactorTables, fa: FaceAction, f: int,
                       pair_valid_f, comp_valid_f, face_valid_f, *,
                       face_context=None, face_sizes_f=None,
+                      face_quant_f=None,
                       quant_legality_mask=None, op_legality_override=None):
         """Score the stored face ``f`` under current params and STORED masks.
         Mirrors :meth:`sample_face` gate for gate -- anything less and the
-        ratio is not 1 at epoch 0."""
+        ratio is not 1 at epoch 0. That includes ``face_sizes_f`` and
+        ``face_quant_f``: both enter the MASKS, so a replay that drops them
+        scores a different distribution and the ratio silently leaves 1."""
         if quant_legality_mask is None:
             quant_legality_mask = quant_hardware_masks()[0]
+        quant_legality_mask = self._quant_mask_1(quant_legality_mask,
+                                                 face_quant_f)
         ff = self._face_feats_1(features, face_sizes_f)
         ctx_f = self._repr(face_context)
         om, im, jm, am, pair_ok = self._face_masks(
@@ -309,7 +365,8 @@ class UnifiedFacePolicy(eqx.Module):
     def sample(self, vertex_context, features: AxisTokenFeatures,
                tables: FactorTables, key, face_pair_valid, face_comp_valid,
                face_valid, quant_legality_mask=None,
-               op_legality_override=None, face_sizes=None):
+               op_legality_override=None, face_sizes=None,
+               face_quant=None):
         """``(FaceAction, joint_logp, joint_entropy, arity, skip_probs,
         op_dists, quant_logps)`` -- FacePathPolicy's contract, verbatim."""
         if quant_legality_mask is None:
@@ -332,6 +389,7 @@ class UnifiedFacePolicy(eqx.Module):
                 features, tables, keys[f], f,
                 face_pair_valid[f], face_comp_valid[f], face_valid[f],
                 face_sizes_f=None if face_sizes is None else face_sizes[f],
+                face_quant_f=None if face_quant is None else face_quant[f],
                 quant_legality_mask=quant_legality_mask,
                 op_legality_override=op_legality_override)
             logp = logp + lp
@@ -354,7 +412,8 @@ class UnifiedFacePolicy(eqx.Module):
     def evaluate(self, vertex_context, features: AxisTokenFeatures,
                  tables: FactorTables, fa: FaceAction, face_pair_valid,
                  face_comp_valid, face_valid, quant_legality_mask=None,
-                 op_legality_override=None, face_sizes=None):
+                 op_legality_override=None, face_sizes=None,
+                 face_quant=None):
         """Score a stored FaceAction under CURRENT parameters and the STORED
         masks. Mirrors :meth:`sample` gate for gate -- anything less and the
         ratio is not 1 at epoch 0."""
@@ -371,6 +430,7 @@ class UnifiedFacePolicy(eqx.Module):
                 features, tables, fa, f,
                 face_pair_valid[f], face_comp_valid[f], face_valid[f],
                 face_sizes_f=None if face_sizes is None else face_sizes[f],
+                face_quant_f=None if face_quant is None else face_quant[f],
                 quant_legality_mask=quant_legality_mask,
                 op_legality_override=op_legality_override)
             logp = logp + lp

@@ -310,6 +310,22 @@ def compress_valid_mask(st, max_axes: int) -> np.ndarray:
     return mask
 
 
+def dim_logical_sizes(st, max_dims: int = 8) -> np.ndarray:
+    """``(max_dims,)`` int32 LOGICAL sizes of ``out_dims ++ primal_dims``.
+
+    The size vector indexed the way ``Diag(i, j)``, :func:`diag_valid_mask`,
+    :func:`diag_pair_factor_space` and :func:`rule_is_legal` are indexed -- so
+    ``gcd(sizes[i], sizes[j])`` is exactly the ``span`` those functions compute
+    for a free pair. Entries past the tensor's rank stay 0, which is what marks
+    them invalid when they reach the head as ``AxisTokenFeatures``.
+    """
+    dims = tuple(st.out_dims) + tuple(st.primal_dims)
+    out = np.zeros((int(max_dims),), dtype=np.int32)
+    for a, d in enumerate(dims[:int(max_dims)]):
+        out[a] = int(d.logical_size)
+    return out
+
+
 def diag_pair_factor_space(st, i: int, j: int) -> tuple[int, int]:
     """``(base, span)`` describing the legal ``Diag.factor`` set for ``(i, j)``.
 
@@ -398,11 +414,21 @@ def legal_diag_actions(st, max_dims: int = 8) -> list:
 
 
 def legal_compress_actions(st, max_axes: int = 8,
-                           kinds: tuple = ("mean",)) -> list:
-    """Every single-axis ``Compress`` graphax will accept on ``st``."""
+                           kinds: tuple = ("mean",),
+                           strict: bool = False) -> list:
+    """Every single-axis ``Compress`` graphax will accept on ``st``.
+
+    ``strict`` swaps :func:`compress_valid_mask` (bounded by ``val.ndim``) for
+    :func:`compress_slot_mask` (bounded by the CANONICAL SLOT count, which is
+    the bound ``apply_compress`` actually enforces). Default ``False`` keeps
+    the historical enumeration byte-for-byte -- ``masked_micro_chooser`` and
+    ``face_masks`` both read it, and both are on paths that must not move when
+    ``--per-face-masks`` is off.
+    """
     from graphax.sparse.micro_actions import Compress
 
-    mask = compress_valid_mask(st, max_axes)
+    mask = (compress_slot_mask(st, max_axes) if strict
+            else compress_valid_mask(st, max_axes))
     return [Compress(axes=(a,), kind=k)
             for a in range(max_axes) if mask[a] for k in kinds]
 
@@ -559,6 +585,361 @@ def project_diag_to_face(st, rule, *, max_dims: int = 8,
         if f is not None:
             return Diag(a, b, f)
     return None
+
+
+# ---------------------------------------------------------------------------
+# PER-FACE MASKING FOR EVERY APPROXIMATION  (``--per-face-masks``)
+# ---------------------------------------------------------------------------
+# WHAT THIS GENERALISES, AND WHY IT IS NOT JUST "--diag-per-face FOR THE OTHER
+# TWO OPS".
+#
+# Approximation legality is decided at THREE layers that disagree about
+# granularity:
+#
+#   L1  NOMINAL / per-VERTEX  -- ``env.decode_vertex_rule_specs`` builds the
+#       rule from the jaxpr equation's ``out_shape ++ primal_shape``;
+#   L2  ORACLE PROBE          -- ``LiveVertexMaskOracle.face_masks`` is
+#       per-face, but it screens the pair with a gcd taken over L1's NOMINAL
+#       sizes (``g_nom``), and the head then derives its DIAG factor from the
+#       same nominal sizes;
+#   L3  APPLY TIME            -- ``rule_is_legal`` reads the LIVE operand the
+#       slot actually holds, whose dims are neither L1's nor (necessarily)
+#       the probe's.
+#
+# L3 is the layer that decides, so L1 and L2 must be expressed in L3's terms
+# or the policy is choosing in a coordinate system nothing downstream uses.
+# Measured consequence on TLM: DIAG applied 0 of 103 requested rules, QUANT
+# had no per-face mask at all (``diag_valid_mask``'s note: "QUANT is never
+# masked at all"), and COMPRESS's per-face mask existed but its misses were
+# dropped silently.
+#
+# Two independent halves, both behind the one flag:
+#
+#   (a) THE SIZES THE HEAD READS. ``LiveVertexMaskOracle.face_dim_sizes``
+#       returns the LIVE ``logical_size`` of ``out_dims ++ primal_dims`` per
+#       face -- index-aligned with ``diag_valid_mask`` /
+#       ``diag_pair_factor_space`` / ``rule_is_legal``, i.e. with L3. Handed to
+#       the head as that face's ``AxisTokenFeatures.size`` it makes both the
+#       ``pair_ok`` (gcd > 1) gate and the hardcoded ``factor = gcd(N_i, N_j)``
+#       per-face and, for the free pairs the mask admits, LEGAL BY
+#       CONSTRUCTION (a free pair has ``base = 1`` and ``span = gcd``, so
+#       ``factor = gcd`` is exactly ``base * span``, the coarsest-to-finest
+#       endpoint of :func:`diag_pair_legal_factors`).
+#
+#       NOTE this is deliberately NOT ``face_features``, which keeps
+#       ``val.shape`` -- the PHYSICAL axes of the sparse tensor. Those are not
+#       the numbering the wire format, the masks or ``Diag(i, j)`` use (a
+#       coupled pair stores two logical dims in one physical axis), so feeding
+#       them to the head would align nothing.
+#
+#   (b) THE APPLY-TIME PROJECTION. ``make_live_masked_hook`` gains the
+#       COMPRESS and QUANT counterparts of ``project_diag_to_face``, each
+#       picking from the action list :func:`face_legal_actions` enumerates FROM
+#       the live operand -- the ``masked_micro_chooser`` property ("an illegal
+#       action is unrepresentable"), applied to the per-vertex hook protocol.
+#       Every projection is re-verified with :func:`rule_is_legal` before it is
+#       applied, so ``skipped_raised`` cannot rise.
+#
+# DEFAULT OFF, and with the flag off every path here is bypassed: same masks,
+# same rules, same telemetry keys, same trace.
+
+_PER_FACE_MASKS = [os.environ.get("ALPHAGRAD_PER_FACE_MASKS", "0")
+                   not in ("0", "", "false", "False", "no")]
+_PER_FACE_REPAIR_AXIS = [os.environ.get(
+    "ALPHAGRAD_PER_FACE_REPAIR_AXIS", "1")
+    not in ("0", "", "false", "False", "no")]
+
+
+def set_per_face_masks(enabled: bool, repair_axis: bool = True) -> None:
+    """Install the ``--per-face-masks`` setting process-wide.
+
+    Republished to the ENVIRONMENT for the same reason
+    :func:`set_diag_per_face` is: the Ray measure actors import this module
+    fresh in their own processes and would otherwise run the flag-off hook
+    against a flag-on policy.
+    """
+    _PER_FACE_MASKS[0] = bool(enabled)
+    _PER_FACE_REPAIR_AXIS[0] = bool(repair_axis)
+    os.environ["ALPHAGRAD_PER_FACE_MASKS"] = "1" if enabled else "0"
+    os.environ["ALPHAGRAD_PER_FACE_REPAIR_AXIS"] = "1" if repair_axis else "0"
+
+
+def per_face_masks_enabled() -> bool:
+    return bool(_PER_FACE_MASKS[0])
+
+
+# The 94-slot face head's dtype field is a BERNOULLI over exactly these two
+# (``unified_face_policy._rows``: ``_BF16_SLOT`` / ``_F32_SLOT``), so this --
+# not the full ``QUANT_DTYPES`` catalog -- is the QUANT action set a face can
+# actually request. Kept here rather than imported from ``heads`` so this
+# module stays importable inside the measure actors without pulling equinox.
+FACE_QUANT_DTYPES = ("float32", "bfloat16")
+
+
+def compress_slot_mask(st, max_axes: int = 8) -> np.ndarray:
+    """``(max_axes,)`` bool mask of legal ``Compress`` SLOTS on ``st``.
+
+    THE CORRECTION :func:`compress_valid_mask` NEEDS, and the reason this had
+    to be found rather than assumed. ``Compress.axes`` are CANONICAL LOGICAL
+    SLOTS (``graphax.sparse.micro_actions.canonical_axis_order``), not physical
+    ``val`` axes: a coupled pair contributes ONE meta slot for its TWO dims
+    (plus a block slot only when it has a block size), and an implicit
+    component contributes a slot that resolves to ``None``.
+    :func:`compress_valid_mask` bounds the axis by ``val.ndim`` instead, which
+    is neither an upper nor a lower bound on the slot count -- so it admits
+    slots ``apply_compress`` then rejects with "Compress.axes entry {a} out of
+    range".
+
+    MEASURED, not theorised: with the per-face COMPRESS projection snapping
+    out-of-range axes to the top of the ``val.ndim`` range, the ``_mlp``
+    fixture produced 3 ``skipped_raised`` -- the first non-zero that counter
+    has ever shown here. This mask is what takes it back to 0.
+
+    Slots resolving to ``None``, and slots whose physical extent is 1, are
+    excluded: ``apply_compress`` returns the operand unchanged for both
+    (``if not drops: return st``; "reducing an implicit or extent-1 slot is the
+    identity"), so they are guaranteed no-ops -- the same reason
+    ``compress_valid_mask`` excludes ``val is None``.
+    """
+    mask = np.zeros((int(max_axes),), dtype=bool)
+    val = getattr(st, "val", None)
+    if val is None:
+        return mask
+    try:
+        from graphax.sparse.micro_actions import canonical_axis_order
+        slots = canonical_axis_order(st)
+    except Exception:
+        # Never be LOOSER than the historical mask on a graphax we cannot
+        # introspect: fall back to it rather than admitting everything.
+        return compress_valid_mask(st, max_axes)
+    shape = tuple(getattr(val, "shape", ()) or ())
+    for a, phys in enumerate(slots[: int(max_axes)]):
+        if phys is None or not (0 <= int(phys) < len(shape)):
+            continue
+        if int(shape[int(phys)]) > 1:
+            mask[a] = True
+    return mask
+
+
+def compress_is_noop(st, rule, *, max_axes: int = 8) -> bool:
+    """Would this ``Compress`` leave ``st`` unchanged?
+
+    ``val is None`` (uniform tensor), or every addressed slot is implicit /
+    extent-1 -- in both cases ``apply_compress`` returns the operand itself.
+    """
+    if getattr(st, "val", None) is None:
+        return True
+    mask = compress_slot_mask(st, max_axes)
+    axes = rule.axes if isinstance(rule.axes, tuple) else (rule.axes,)
+    return not any(0 <= int(a) < max_axes and mask[int(a)] for a in axes)
+
+
+def quant_is_noop(st, dtype_name: str) -> bool:
+    """Would ``Quant(dtype_name)`` leave ``st`` bit-identical?
+
+    ``apply_quant`` returns the operand UNCHANGED when ``val is None`` (a
+    pure-structure Jacobian) or when ``val.dtype`` already is the target. Both
+    are legal and both do nothing, which is why QUANT's applied count has
+    always looked healthy while carrying no approximation: a face head that
+    draws ``float32`` on a ``float32`` operand is scored as having applied an
+    approximation it did not make. This is QUANT's exact analogue of DIAG's
+    idempotent re-request.
+    """
+    val = getattr(st, "val", None)
+    if val is None:
+        return True
+    return str(getattr(val, "dtype", "")) == str(dtype_name)
+
+
+def quant_valid_mask(st, dtypes: tuple = FACE_QUANT_DTYPES) -> np.ndarray:
+    """Per-dtype bool mask of QUANTs that are legal AND not a no-op on ``st``.
+
+    THE per-face QUANT mask. Before this, QUANT was the one operator with no
+    per-face legality at all -- which is what made it the only always-available
+    action, and therefore the one the policy could always fall back on.
+    """
+    return np.array(
+        [bool(quant_chain_ok(st, d)) and not quant_is_noop(st, d)
+         for d in dtypes], dtype=bool)
+
+
+def legal_quant_actions(st, dtypes: tuple = FACE_QUANT_DTYPES,
+                        scale_sign: int = 1) -> list:
+    """Every ``Quant`` that both fits and CHANGES ``st``, as concrete actions."""
+    from graphax.sparse.micro_actions import Quant
+
+    mask = quant_valid_mask(st, dtypes)
+    return [Quant(dtype=d, scale_sign=scale_sign)
+            for d, ok in zip(dtypes, mask) if ok]
+
+
+def face_legal_actions(st, *, max_dims: int = 8, max_axes: int = 8,
+                       kinds: tuple = ("mean",),
+                       quant_dtypes: tuple = ()) -> list:
+    """THE operand's own legal action set -- what a per-face mask *is*.
+
+    The enumeration :func:`masked_micro_chooser` hands its picker, factored out
+    so the apply-time projection can pick from exactly the same list rather
+    than re-deriving legality with a second copy of the rules (two paths that
+    must agree is this codebase's dominant bug class).
+
+    ``quant_dtypes`` defaults to EMPTY so the historical chooser -- which never
+    offered QUANT -- is unchanged; pass :data:`FACE_QUANT_DTYPES` for the
+    per-face action set the 94-slot head can actually express.
+    """
+    out = (legal_diag_actions(st, max_dims)
+           + legal_compress_actions(st, max_axes, kinds))
+    if quant_dtypes:
+        out += legal_quant_actions(st, quant_dtypes)
+    return out
+
+
+def project_compress_to_face(st, rule, *, max_axes: int = 8,
+                             repair_axis: bool | None = None):
+    """``rule`` re-expressed inside THIS operand's legal COMPRESS set, or None.
+
+    ``Compress.axes`` are PHYSICAL positions into ``st.val``, and a face's
+    live ``val.ndim`` is routinely smaller than the nominal rank the axis the
+    head drew was indexed against (a coupled pair stores two logical dims in
+    one physical axis, and every prior COMPRESS on the same operand drops one).
+    An out-of-range axis is not a wrong *kind* of request, it is the right
+    request in the wrong coordinates -- so it is snapped to the nearest legal
+    axis rather than dropped.
+
+    Deterministic, and stated: NEAREST legal axis, ties to the LOWER index. A
+    stable rule matters more than a clever one, because the policy has to be
+    able to learn what its own action does. ``repair_axis=False`` keeps the
+    strict behaviour (drop rather than snap).
+
+    ``None`` when the operand affords no COMPRESS at all -- notably the
+    ``val is None`` pure-structure Jacobian, where a Compress is accepted by
+    graphax but is a guaranteed no-op.
+    """
+    from graphax.sparse.micro_actions import Compress
+
+    if repair_axis is None:
+        repair_axis = _PER_FACE_REPAIR_AXIS[0]
+    kind = getattr(rule, "kind", "mean")
+    # STRICT: the CANONICAL SLOT range, the bound apply_compress enforces. A
+    # repair that snapped into the val.ndim range instead is exactly what
+    # produced this module's first-ever non-zero `skipped_raised`.
+    legal_axes = [int(a.axes[0])
+                  for a in legal_compress_actions(st, max_axes, kinds=(kind,),
+                                                  strict=True)]
+    if not legal_axes:
+        return None
+    axes = rule.axes if isinstance(rule.axes, tuple) else (rule.axes,)
+    out: list[int] = []
+    for a in axes:
+        a = int(a)
+        if a in legal_axes:
+            b = a
+        elif not repair_axis:
+            continue
+        else:
+            b = min(legal_axes, key=lambda c: (abs(c - a), c))
+        if b not in out:
+            out.append(b)
+    if not out:
+        return None
+    return Compress(axes=tuple(out), kind=kind)
+
+
+def project_quant_to_face(st, rule, *, dtypes: tuple = FACE_QUANT_DTYPES):
+    """``rule`` re-expressed inside THIS operand's legal QUANT set, or None.
+
+    THERE IS DELIBERATELY NO DTYPE FALLBACK, and that asymmetry with DIAG /
+    COMPRESS is the point. A DIAG projected to a different factor, or a
+    COMPRESS to a different axis, is the SAME approximation re-expressed in the
+    operand's own coordinates. A QUANT projected to a different dtype is a
+    DIFFERENT approximation -- swapping a requested ``float32`` (a no-op on a
+    ``float32`` operand) for ``bfloat16`` would invent a numerical change the
+    policy never asked for, and attribute its reward to an action the policy
+    did not take.
+
+    So QUANT's per-face treatment is a MASK, not a repair: the request stands
+    when it is a legal, non-idempotent cast on this operand, and is otherwise
+    left exact and counted as a no-op rather than as an approximation.
+    """
+    if not quant_valid_mask(st, (rule.dtype,))[0]:
+        return None
+    return rule
+
+
+def project_rule_to_face(st, rule, *, max_dims: int = 8, max_axes: int = 8,
+                         factor_rule: str | None = None,
+                         repair_pair: bool | None = None,
+                         repair_axis: bool | None = None):
+    """Dispatch ``rule`` to its per-kind projection. ``None`` = leave exact."""
+    from graphax.sparse.micro_actions import Compress, Diag, Quant
+
+    if isinstance(rule, Diag):
+        return project_diag_to_face(st, rule, max_dims=max_dims,
+                                    factor_rule=factor_rule,
+                                    repair_pair=repair_pair)
+    if isinstance(rule, Compress):
+        return project_compress_to_face(st, rule, max_axes=max_axes,
+                                        repair_axis=repair_axis)
+    if isinstance(rule, Quant):
+        return project_quant_to_face(st, rule)
+    return None
+
+
+def rule_is_idempotent_noop(st, rule, *, max_dims: int = 8,
+                            max_axes: int = 8) -> bool:
+    """Would applying ``rule`` to ``st`` change nothing? A CORRECT skip.
+
+    THE HONEST DENOMINATOR. ``applied / requested`` reads an idempotent
+    re-request as a failure, which is how DIAG came to look inert: 83% of the
+    live DIAG rejections measured on NeuralNetwork were pairs already coupled
+    at exactly the requested granularity. The metric that means something is
+    ``applied / (requested - idempotent no-ops)``, and this is the predicate
+    that splits the denominator.
+    """
+    from graphax.sparse.micro_actions import Compress, Diag, Quant
+
+    if isinstance(rule, Diag):
+        base, span = diag_pair_factor_space(st, rule.i, rule.j)
+        # Already coupled at this granularity: nothing finer is legal (span
+        # == 1), or the request IS the current meta count (graphax's own
+        # definition of a Diag no-op).
+        return base > 1 and (span <= 1 or int(rule.factor) == base)
+    if isinstance(rule, Compress):
+        return compress_is_noop(st, rule, max_axes=max_axes)
+    if isinstance(rule, Quant):
+        return quant_is_noop(st, rule.dtype)
+    return False
+
+
+def face_rule_is_legal(st, rule, *, max_dims: int = 8,
+                       max_axes: int = 8) -> bool:
+    """:func:`rule_is_legal`, TIGHTENED to the live operand's own addressing.
+
+    THE per-face legality predicate (``--per-face-masks``). Everything
+    ``rule_is_legal`` rejects is still rejected; on top of it:
+
+    * COMPRESS is bounded by the CANONICAL SLOT count rather than ``val.ndim``
+      (:func:`compress_slot_mask`) -- the bound ``apply_compress`` enforces,
+      and the one whose absence is the only way this hook ever raised;
+    * an IDEMPOTENT request is not "legal", it is a no-op
+      (:func:`rule_is_idempotent_noop`) and is accounted as one rather than as
+      an approximation the policy made.
+
+    Kept separate from :func:`rule_is_legal` rather than folded into it:
+    that one is read by ``face_masks``, ``masked_face_transforms`` and the
+    flag-off hook, none of which may move.
+    """
+    from graphax.sparse.micro_actions import Compress
+
+    if not rule_is_legal(st, rule, max_dims=max_dims, max_axes=max_axes):
+        return False
+    if isinstance(rule, Compress):
+        m = compress_slot_mask(st, max_axes)
+        axes = rule.axes if isinstance(rule.axes, tuple) else (rule.axes,)
+        if not all(0 <= int(a) < max_axes and m[int(a)] for a in axes):
+            return False
+    return not rule_is_idempotent_noop(st, rule, max_dims=max_dims,
+                                       max_axes=max_axes)
 
 
 # ---------------------------------------------------------------------------
@@ -959,6 +1340,27 @@ class LiveVertexMaskOracle:
                     pair[j, i] = True  # the row format canonicalises the order
         return pair, comp
 
+    def face_dim_sizes(self, vertex: int, max_faces: int = 8):
+        """PER-FACE LIVE ``logical_size`` of ``out_dims ++ primal_dims``.
+
+        ``(F, N) int32, n_faces``. THE NUMBERING MATTERS: this is the
+        concatenated-dims numbering :class:`graphax.sparse.micro_actions.Diag`
+        uses, which is also what :func:`diag_valid_mask`,
+        :func:`diag_pair_factor_space` and :func:`rule_is_legal` index -- i.e.
+        the numbering the decision is ACTUALLY made in at apply time. Handed to
+        the head as a face's ``AxisTokenFeatures.size`` it puts the head's
+        ``gcd``-derived factor and its ``pair_ok`` gate in the same coordinate
+        system as the mask that admits the pair.
+
+        Contrast :meth:`face_features`, which keeps ``val.shape`` -- the
+        PHYSICAL axes. Those are a different (shorter, and order-dependent)
+        list, so they align with nothing the policy emits.
+
+        Rows ``>= n_faces`` are zero padding, matching :meth:`face_masks`.
+        """
+        _p, _c, sizes, _q, n = self.face_masks_and_sizes(vertex, max_faces)
+        return sizes, n
+
     def face_masks(self, vertex: int, max_faces: int = 8):
         """PER-FACE ``(pair_valid (F, N, N), compress_valid (F, N), n_faces)``.
 
@@ -982,38 +1384,93 @@ class LiveVertexMaskOracle:
         :meth:`vertex_mask`: that one is on the live per-vertex training path and
         must not be perturbed.
         """
+        pair, comp, _sizes, _quant, n_faces = self.face_masks_and_sizes(
+            vertex, max_faces, per_face=False)
+        return pair, comp, n_faces
+
+    def face_masks_and_sizes(self, vertex: int, max_faces: int = 8, *,
+                             per_face: bool = True,
+                             quant_dtypes: tuple = FACE_QUANT_DTYPES):
+        """``(pair (F,N,N), comp (F,N), sizes (F,N) int32, quant (F,), n)``.
+
+        ONE probe pass for all four outputs. :meth:`face_masks` already runs
+        ``probe_faces`` once per dispatch mode and those probes trace a whole
+        elimination, so deriving the sizes and the QUANT mask from a SEPARATE
+        call would have added 50% to the oracle's host cost for data the same
+        probe already holds.
+
+        ``per_face`` selects the screen:
+
+        * ``False`` -- exactly :meth:`face_masks`, byte for byte: a DIAG pair
+          is admitted when every emittable divisor of the NOMINAL gcd is legal
+          on every mode's operand. ``sizes`` and ``quant`` come back as zeros
+          (nothing consumes them on that path).
+        * ``True`` (``--per-face-masks``) -- the same screen with the nominal
+          gcd replaced by ``g_face``, the gcd over THIS FACE's own live
+          logical sizes, which is what the head will derive its factor from
+          once it is handed those sizes. The two must be the same quantity or
+          the mask admits a pair whose factor the operand then rejects.
+
+          Soundness across dispatch modes is unchanged in form: the pair is
+          admitted only when ``span % g_face == 0`` on EVERY mode, and since a
+          free pair has ``span = gcd(N_i, N_j)`` that implies ``g_face``
+          divides both dims on every mode -- so ``factor = g_face`` is legal
+          everywhere, exactly as ``g_nom`` was.
+
+        ``quant[k]`` is 1 iff at least one dtype in ``quant_dtypes`` is a
+        legal, NON-IDEMPOTENT cast on every mode's operand for face ``k``.
+        That is the per-face QUANT mask that did not exist before: QUANT was
+        the only operator with no per-face legality, hence the only one always
+        available.
+        """
         from alphagrad.approx.env import diag_row_to_pair
 
         N = self.max_axes
         F = int(max_faces)
         pair = np.zeros((F, N, N), dtype=bool)
         comp = np.zeros((F, N), dtype=bool)
+        sizes = np.zeros((F, N), dtype=np.int32)
+        quant = np.zeros((F,), dtype=bool)
         vertex = int(vertex)
         if not (1 <= vertex <= self.total_v) or vertex in self._eliminated:
-            return pair, comp, 0
+            return pair, comp, sizes, quant, 0
 
         eqn = self.jaxpr.eqns[vertex - 1]
         if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
-            return pair, comp, 0
+            return pair, comp, sizes, quant, 0
         out_shape = tuple(eqn.outvars[0].aval.shape)
         out_len = len(out_shape)
         primal_shapes = [
             tuple(iv.aval.shape) for iv in eqn.invars if hasattr(iv, "aval")
         ]
         if not primal_shapes:
-            return pair, comp, 0
+            return pair, comp, sizes, quant, 0
 
-        per_mode = [self.probe_faces(vertex, approx=m) for m in self._DISPATCH_MODES]
-        per_mode = [fs for fs in per_mode if fs]
+        probes = {m: self.probe_faces(vertex, approx=m)
+                  for m in self._DISPATCH_MODES}
+        per_mode = [fs for fs in probes.values() if fs]
         if not per_mode:
-            return pair, comp, 0
+            return pair, comp, sizes, quant, 0
         n_faces = min(min(len(fs) for fs in per_mode), F)
+        # The size source is the approx=True graph -- the one
+        # ``vertex_elimination_jaxpr`` builds for the op counts, and the one
+        # ``face_features`` already reads. Falls back to the other mode only
+        # if that probe produced nothing at all.
+        sizes_src = probes.get(True) or probes.get(False) or []
 
         edge_phys_axes = out_len + max((len(ps) for ps in primal_shapes), default=0)
         n_primal = min(len(ps) for ps in primal_shapes)
 
         for k in range(n_faces):
             faces_k = [fs[k] for fs in per_mode]
+
+            if per_face:
+                if k < len(sizes_src):
+                    sizes[k] = dim_logical_sizes(sizes_src[k], N)
+                qm = np.ones((len(quant_dtypes),), dtype=bool)
+                for st in faces_k:
+                    qm &= quant_valid_mask(st, quant_dtypes)
+                quant[k] = bool(qm.any())
 
             # --- COMPRESS: vertex_mask's screens, this face only ------------
             if edge_phys_axes > 1:
@@ -1034,10 +1491,16 @@ class LiveVertexMaskOracle:
                     i, j = diag_row_to_pair(self.jaxpr, vertex, bi1, bi2)
                     if i == j or i >= N or j >= N:
                         continue
-                    g_nom = n1
-                    for ps in primal_shapes:
-                        g_nom = math.gcd(g_nom, int(ps[bi2]))
-                    if g_nom <= 1:
+                    if per_face:
+                        # The gcd the HEAD will compute, over the sizes it will
+                        # be handed. Same quantity on both sides by
+                        # construction -- that is the whole fix.
+                        g_ref = math.gcd(int(sizes[k, i]), int(sizes[k, j]))
+                    else:
+                        g_ref = n1
+                        for ps in primal_shapes:
+                            g_ref = math.gcd(g_ref, int(ps[bi2]))
+                    if g_ref <= 1:
                         continue
                     ok = True
                     for st, dm in zip(faces_k, face_diag):
@@ -1045,13 +1508,13 @@ class LiveVertexMaskOracle:
                             ok = False
                             break
                         base, span = diag_pair_factor_space(st, i, j)
-                        if base != 1 or span % g_nom != 0:
+                        if base != 1 or span % g_ref != 0:
                             ok = False
                             break
                     if ok:
                         pair[k, i, j] = True
                         pair[k, j, i] = True
-        return pair, comp, n_faces
+        return pair, comp, sizes, quant, n_faces
 
     def masks(self, candidates=None):
         """``(pair_valid, compress_valid)`` for every vertex, 1-based rows.
@@ -1076,7 +1539,8 @@ class LiveVertexMaskOracle:
 
 
 def masked_micro_chooser(pick, max_dims: int = 8, max_axes: int = 8,
-                         kinds: tuple = ("mean",)):
+                         kinds: tuple = ("mean",),
+                         quant_dtypes: tuple = ()):
     """Wrap ``pick`` into the slot callable graphax invokes per face slot.
 
     ``pick(tensor, actions)`` receives the live operand and the list of actions
@@ -1087,11 +1551,17 @@ def masked_micro_chooser(pick, max_dims: int = 8, max_axes: int = 8,
     Returning the chosen action rather than a transformed tensor is what keeps
     it visible to the AOJ's transform log; a callable that returns a tensor is
     applied but never recorded.
+
+    ``quant_dtypes`` defaults to EMPTY, i.e. the historical DIAG+COMPRESS
+    enumeration; pass :data:`FACE_QUANT_DTYPES` to include the QUANTs the
+    94-slot face head can express. The enumeration itself now lives in
+    :func:`face_legal_actions`, which the apply-time projection also picks
+    from -- one definition of "legal on this operand", not two.
     """
     def _chooser(st):
-        actions = (legal_diag_actions(st, max_dims)
-                   + legal_compress_actions(st, max_axes, kinds))
-        return pick(st, actions)
+        return pick(st, face_legal_actions(
+            st, max_dims=max_dims, max_axes=max_axes, kinds=kinds,
+            quant_dtypes=quant_dtypes))
 
     return _chooser
 
@@ -1248,41 +1718,62 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
             return "quant"
         return "other"
 
+    def _project_on(rule) -> bool:
+        """Is the per-face projection armed for THIS rule's kind?
+
+        ``--diag-per-face`` is the DIAG-only predecessor and stays exactly
+        that; ``--per-face-masks`` arms all three. Both off = the historical
+        drop-on-illegal hook.
+        """
+        if _PER_FACE_MASKS[0]:
+            return True
+        return isinstance(rule, Diag) and _DIAG_PER_FACE[0]
+
+    def _legal(st, rule):
+        """The arm's legality predicate. ONE definition, used by BOTH the
+        initial test and the post-projection re-verify -- a projection cleared
+        by a laxer predicate than the one that rejected the original is how a
+        repair turns into a raise."""
+        if _PER_FACE_MASKS[0]:
+            return face_rule_is_legal(st, rule, max_dims=max_dims,
+                                      max_axes=max_axes)
+        return rule_is_legal(st, rule, max_dims=max_dims, max_axes=max_axes)
+
     def _hook(st):
         cur = st
         for rule in coupled:
             _kind = _kind_of(rule)
             live = rule
-            if not rule_is_legal(cur, live, max_dims=max_dims,
-                                 max_axes=max_axes):
-                # PER-FACE DIAG MASKING. The requested rule was chosen against
-                # the vertex's nominal sizes and a probe of the face; this
-                # operand has its own legal set, so ask for the nearest thing
-                # in it rather than dropping the action. Off by default.
+            if not _legal(cur, live):
+                # PER-FACE MASKING. The requested rule was chosen against the
+                # vertex's nominal sizes and a probe of the face; this operand
+                # has its own legal set, so ask for the nearest thing in it
+                # rather than dropping the action. Off by default.
                 _alt = None
-                if isinstance(rule, Diag) and _DIAG_PER_FACE[0]:
-                    _alt = project_diag_to_face(cur, rule, max_dims=max_dims)
-                    if _alt is not None and not rule_is_legal(
-                            cur, _alt, max_dims=max_dims, max_axes=max_axes):
+                if _project_on(rule):
+                    _alt = project_rule_to_face(cur, rule, max_dims=max_dims,
+                                                max_axes=max_axes)
+                    if _alt is not None and not _legal(cur, _alt):
                         # The projection is meant to make this unreachable;
                         # never apply an action the mask has not cleared.
                         _alt = None
                 if _alt is None:
                     _bump("skipped")
                     _bump(f"skipped_{_kind}")
-                    if isinstance(rule, Diag) and _DIAG_PER_FACE[0]:
-                        # Distinguish the idempotent re-request (already
-                        # coupled at exactly this granularity, so span == 1 and
-                        # nothing finer is legal) from a genuine miss. Without
-                        # this split `applied_fraction` reads a correct no-op
-                        # as a failure, which is how DIAG came to look inert.
-                        _b, _s = diag_pair_factor_space(cur, rule.i, rule.j)
-                        if _b > 1 and _s == 1:
-                            _bump("skipped_diag_noop")
+                    if _project_on(rule) and rule_is_idempotent_noop(
+                            cur, rule, max_dims=max_dims, max_axes=max_axes):
+                        # Distinguish the idempotent re-request (DIAG: already
+                        # coupled at exactly this granularity; COMPRESS: every
+                        # addressed slot implicit or extent-1; QUANT: already
+                        # this dtype) from a genuine miss. Without this split
+                        # `applied_fraction` reads a correct no-op as a
+                        # failure, which is how DIAG came to look inert -- and
+                        # how QUANT came to look like it always worked.
+                        _bump(f"skipped_{_kind}_noop")
                     continue
                 if _alt is not rule:
                     live = _alt
-                    _bump("repaired_diag")
+                    _bump(f"repaired_{_kind}")
             try:
                 if isinstance(live, Diag):
                     cur = apply_diag(cur, live)
