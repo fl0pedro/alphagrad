@@ -1708,6 +1708,232 @@ def consume_per_face_stats() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# A6 -- THE PLAN LOG. Every TERMINAL plan, the LOSERS included.
+# ---------------------------------------------------------------------------
+# ``ppo._dump_pareto`` persists the FRONT. Nothing persisted the plans that
+# lost, and X3 -- "diff the lowered graphs of the recorded losers against
+# identity and attribute the regression" -- has no input without them. This is
+# the producing half: the measurement callback appends ONE record per terminal
+# plan to a process-local list, the trainer drains it (its own, plus every
+# measure actor's, via ``measure_pool.merge_pool_plan_records``) once per
+# episode and appends it to a JSONL. See ``common/plan_log.py`` for the schema
+# and for why the replayable spec is the raw integer WIRE and not a rendered
+# ``seq``.
+#
+# WHY THE RECORD IS BUILT HERE AND NOT IN THE TRAINER. Three of the five
+# things the record must carry only exist in this process:
+#   * the per-kind APPLIED / IDEMPOTENT-NO-OP counts. ``_PER_FACE_STATS`` is a
+#     module global written by the per-face legality hook and consumed per LOG
+#     STEP, which is why ppo.py's own comment says the applied counts "CANNOT
+#     be attributed to a plan without changing env.py's telemetry". The plan
+#     log is that change: a snapshot at callback entry differenced at the
+#     return attributes exactly this plan's hook invocations, because one
+#     callback measures one plan and the pollers cannot interleave with it (a
+#     Ray actor runs one task at a time; the trainer's io_callback is
+#     synchronous on the main thread). The delta is clamped at 0 so a poll
+#     that did interleave under-reports rather than reporting a negative;
+#   * the per-leaf COVERAGE CENSUS. ``_grad_coverage`` returns the per-leaf
+#     approx/exact norms and ratios and they are then aggregated away; only
+#     the one-float slot-7 encoding reaches the trainer;
+#   * the plans the frozen-gradient HARD GUARD sentinelled. Those return early
+#     with ``_SENTINEL_BAD_REWARD`` and are, by construction, losers -- so
+#     they are recorded at that return too, flagged ``sentinelled``.
+#
+# COST. Everything written is already materialised host-side; nothing here
+# adds a device operation, an executable, an exact reference or a compile.
+# With the flag OFF the whole feature is two ``dict`` reads and a one-element
+# list per callback.
+_PLAN_LOG_ENV = "ALPHAGRAD_PLAN_LOG"
+_PLAN_LOG_CAP_ENV = "ALPHAGRAD_PLAN_LOG_CAP"
+_PLAN_LOG_MAX_FACES_ENV = "ALPHAGRAD_PLAN_LOG_MAX_FACES"
+_PLAN_LOG_MAX_LEAVES_ENV = "ALPHAGRAD_PLAN_LOG_MAX_LEAVES"
+_PLAN_RECORDS: list = []
+_PLAN_LOG_DROPPED = [0]
+_PLAN_LOG_WARNED: list = []
+# TERMINAL callbacks this process saw with the log ON. The DENOMINATOR for
+# `records`: 0 records with 0 terminals means this process measured nothing,
+# 0 records with N terminals means the recorder itself dropped them. Without
+# it "the plan log is empty" is not a diagnosable statement.
+_PLAN_LOG_TERMINALS = [0]
+
+# The four telemetry buckets the per-face hook maintains, per approximation
+# class. ``other`` exists because ``masks._kind_of`` emits it for a rule that
+# is none of the three -- dropping it here would make the record's totals
+# disagree with the hook's.
+_PLAN_FACE_KINDS = ("diag", "compress", "quant", "other")
+
+
+def plan_log_enabled() -> bool:
+    """Is the A6 plan log on in THIS process? (``ALPHAGRAD_PLAN_LOG``)"""
+    return os.environ.get(_PLAN_LOG_ENV, "0") not in ("", "0")
+
+
+def _plan_log_int_env(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _plan_log_cap() -> int:
+    """Ring capacity between two drains. A record past it is DROPPED and
+    COUNTED, never silently overwritten -- the count is logged and printed."""
+    return _plan_log_int_env(_PLAN_LOG_CAP_ENV, 4096) or 4096
+
+
+def _plan_log_max_faces() -> int:
+    """0 = record every live face (the default, and the only replayable
+    setting). See ``plan_log.encode_wires``."""
+    return _plan_log_int_env(_PLAN_LOG_MAX_FACES_ENV, 0)
+
+
+def _plan_log_max_leaves() -> int:
+    """0 = record every leaf of the coverage census."""
+    return _plan_log_int_env(_PLAN_LOG_MAX_LEAVES_ENV, 0)
+
+
+def _record_plan(rec: dict) -> None:
+    if len(_PLAN_RECORDS) >= _plan_log_cap():
+        _PLAN_LOG_DROPPED[0] += 1
+        return
+    _PLAN_RECORDS.append(rec)
+
+
+def consume_plan_records() -> dict:
+    """Pop this process's plan records (mirrors the other pollers)."""
+    out = {"records": list(_PLAN_RECORDS),
+           "dropped": int(_PLAN_LOG_DROPPED[0]),
+           "terminals": int(_PLAN_LOG_TERMINALS[0]),
+           "enabled": plan_log_enabled(),
+           "pid": os.getpid()}
+    _PLAN_RECORDS.clear()
+    _PLAN_LOG_DROPPED[0] = 0
+    _PLAN_LOG_TERMINALS[0] = 0
+    return out
+
+
+def _plan_face_delta(before: dict | None, after: dict | None) -> dict:
+    """This plan's share of the per-face hook counters.
+
+    A DELTA, because ``_PER_FACE_STATS`` is process-global. Clamped at 0:
+    the only way a component can go negative is a poller draining the dict
+    mid-callback, and under-reporting that is honest where a negative count
+    is not.
+    """
+    before = before or {}
+    after = after or {}
+
+    def d(k):
+        return max(0, int(after.get(k, 0)) - int(before.get(k, 0)))
+
+    applied = {kd: d(f"applied_{kd}") for kd in _PLAN_FACE_KINDS}
+    applied["total"] = d("applied")
+    skipped = {kd: d(f"skipped_{kd}") for kd in _PLAN_FACE_KINDS}
+    skipped["raised"] = d("skipped_raised")
+    skipped["total"] = d("skipped") + skipped["raised"]
+    return {
+        "applied": applied,
+        "skipped": skipped,
+        # The IDEMPOTENT re-request: the rule was refused because the operand
+        # ALREADY has that property (DIAG coupled at exactly this
+        # granularity, COMPRESS on an implicit/extent-1 axis, QUANT already
+        # this dtype). It is the denominator correction that separates "the
+        # approximation did not apply" from "it was already there".
+        "idempotent_noop": {kd: d(f"skipped_{kd}_noop")
+                            for kd in _PLAN_FACE_KINDS},
+        "repaired": {kd: d(f"repaired_{kd}") for kd in _PLAN_FACE_KINDS},
+    }
+
+
+def _plan_coverage_census(cov: dict | None) -> dict:
+    """The per-leaf coverage census for ONE plan.
+
+    ``{"measured": False}`` when the coverage block did not run for this
+    plan (channel off, or the exact reference could not be built) --
+    DISTINCT from a census that ran and found nothing frozen, which the
+    aggregate ``grad_cov/*`` keys cannot tell apart.
+    """
+    if not cov:
+        return {"measured": False}
+    n = _plan_log_max_leaves()
+
+    def _cut(xs):
+        xs = list(xs or ())
+        return xs[:n] if (n and len(xs) > n) else xs
+
+    ratios = _cut(cov.get("ratios"))
+    out = {
+        "measured": True,
+        "defined": bool(cov.get("defined", False)),
+        "min_leaf_ratio": float(cov.get("min_leaf_ratio", float("nan"))),
+        # The brief's name for `_grad_coverage`'s `frac_zeroed`.
+        "frac_leaves_zeroed": float(cov.get("frac_zeroed", float("nan"))),
+        "channel": float(cov.get("channel", 0.0)),
+        "n_leaves": int(cov.get("n_leaves", 0)),
+        "n_counted": int(cov.get("n_counted", 0)),
+        "n_uncounted": int(cov.get("n_uncounted", 0)),
+        "n_uncountable": int(cov.get("n_uncountable", 0)),
+        "n_zeroed": int(cov.get("n_zeroed", 0)),
+        "zeroed": [int(i) for i in _cut(cov.get("zeroed"))],
+        "leaf_ratios": [float(x) for x in ratios],
+        "approx_norms": [float(x) for x in _cut(cov.get("approx_norms"))],
+        "exact_norms": [float(x) for x in _cut(cov.get("exact_norms"))],
+        "leaf_mismatch": bool(cov.get("leaf_mismatch", False)),
+        "leaves_recorded": len(ratios),
+        "leaves_elided": max(0, len(list(cov.get("ratios") or ())) -
+                             len(ratios)),
+    }
+    if cov.get("error"):
+        out["error"] = str(cov["error"])
+    return out
+
+
+def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
+                          reward_vec, cov, face_before, face_after,
+                          counts_from_trace: bool,
+                          sentinelled: bool) -> None:
+    """Append ONE terminal plan to this process's plan log. Never raises.
+
+    A logging failure must not kill a measurement, but it must not be
+    invisible either: the first one prints to stderr with its exception.
+    """
+    try:
+        from alphagrad.approx.common import plan_log as _plog
+        rec = {
+            "schema": _plog.SCHEMA,
+            "pid": os.getpid(),
+            "wall_time": time.time(),
+            # The frozen-gradient HARD GUARD refused this plan: it returned
+            # `_SENTINEL_BAD_REWARD`, trained nothing and was never ranked.
+            # It is a loser BY CONSTRUCTION and the reason this flag exists.
+            "sentinelled": bool(sentinelled),
+            # False = the approx compile came from the cache, so graphax
+            # never re-traced the elimination and the per-face hook was
+            # never invoked: `applied`/`skipped`/`idempotent_noop` are all
+            # 0 because NOTHING WAS COUNTED, not because nothing applied.
+            # `requested` is exact either way (it is read off the wire).
+            "counts_from_trace": bool(counts_from_trace),
+        }
+        rec.update(_plog.encode_wires(
+            order, rule_specs, face_specs, face_skips,
+            max_faces_recorded=_plan_log_max_faces(),
+            compress_sentinel=COMPRESS_SENTINEL,
+            quant_sentinel=QUANT_SENTINEL))
+        rec["rewards"] = [float(x) for x in
+                          np.asarray(reward_vec).reshape(-1).tolist()]
+        rec["reward_names"] = list(REWARD_NAMES)
+        rec.update(_plan_face_delta(face_before, face_after))
+        rec["coverage"] = _plan_coverage_census(cov)
+        _record_plan(rec)
+    except Exception as _exc:          # pragma: no cover - telemetry only
+        if not _PLAN_LOG_WARNED:
+            _PLAN_LOG_WARNED.append(1)
+            print(f"[plan-log] WARNING: could not record a terminal plan; "
+                  f"the log will be INCOMPLETE: {type(_exc).__name__}: "
+                  f"{_exc}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
 # XLA-analysis side-channel. ONE memory channel exists — ``peak_memory`` — and
 # the deterministic ``memory_analysis()`` estimate is substituted INTO it in
 # place wherever the runtime high-water mark is unavailable (see
@@ -4863,6 +5089,21 @@ def _callback(
     # point. Terminal only: mid-rollout the elimination is a prefix, and
     # slots 6/7/8 already establish that convention.
     _sparsity_on = bool(is_terminal) and sparsity_enabled()
+    # A6 PLAN LOG (``ALPHAGRAD_PLAN_LOG``), terminal only for the same reason
+    # slots 6/7/8 are. Two snapshots are taken HERE and differenced at the
+    # return: ``_PER_FACE_STATS``, because it is process-global and only a
+    # per-callback delta can be attributed to this plan; and the IDENTITY of
+    # the last coverage census, because ``_record_grad_coverage`` overwrites
+    # one shared "last" slot and a stale census from the previous plan must
+    # never be reported as this one's. `_plan_traced` is set by
+    # `_do_compile_approx`, which runs only on a compile-cache MISS -- the
+    # exact condition under which the per-face counters saw this plan.
+    _plan_log_on = bool(is_terminal) and plan_log_enabled()
+    if _plan_log_on:
+        _PLAN_LOG_TERMINALS[0] += 1
+    _plan_pf0 = dict(_PER_FACE_STATS) if _plan_log_on else None
+    _plan_cov0 = _GRAD_COV_STATS.get("last") if _plan_log_on else None
+    _plan_traced = [False]
 
     o_list = [int(x) for x in partial_order.tolist()]
     specs_list = partial_specs.tolist()  # list of MAX_RULES x 3 lists
@@ -5297,6 +5538,10 @@ def _callback(
         from alphagrad.approx.common.masks import (
             arm_face_counts, disarm_face_counts)
         arm_face_counts()
+        # A6: this closure is what `cached_compile` calls on a MISS, so
+        # reaching it is exactly "the per-face hook got a chance to count
+        # this plan". Recorded as `counts_from_trace`.
+        _plan_traced[0] = True
         # SAME SCOPE, SAME REASON as the per-face counters: this is the
         # ONE trace that walks the elimination that is actually measured.
         _arm_store_tally(_sparsity_on)
@@ -6064,6 +6309,18 @@ def _callback(
                 if _fid_needs_ref:
                     _FIDELITY_STATS["wall_s"] += (
                         time.perf_counter() - _gc_t0)
+                # A6: a guard rejection is a LOSER by construction and is
+                # the single most informative row in the plan log -- it is
+                # the plan that froze a gradient. Recorded BEFORE the early
+                # return, with the census that condemned it attached.
+                if _plan_log_on:
+                    _record_terminal_plan(
+                        order=o_list, rule_specs=partial_specs,
+                        face_specs=_faces_np, face_skips=_skips_np,
+                        reward_vec=_SENTINEL_BAD_REWARD, cov=_cov,
+                        face_before=_plan_pf0, face_after=_PER_FACE_STATS,
+                        counts_from_trace=bool(_plan_traced[0]),
+                        sentinelled=True)
                 _record_frozen_grad_plan(_cov, o_list)
                 return tokens, eqn_ids, _SENTINEL_BAD_REWARD
         _GRAD_COV_STATS["wall_s"] += time.perf_counter() - _gc_t0
@@ -6102,7 +6359,11 @@ def _callback(
             _SPARSITY_STATS["wall_s"] += time.perf_counter() - _sp_t0
             _record_sparsity_failure(_exc)
     _pf("cb.sparsity")
-    rewards = jnp.array(
+    # A6: the slot list is NAMED before it becomes a device array. The plan
+    # log records THESE host-side floats, so recording a terminal plan costs
+    # no device->host transfer and no sync; `jnp.array` of this same list,
+    # below, is bit-for-bit what this expression always built.
+    _reward_slots = (
         [
             -muls_adds_fmas,
             -flops,
@@ -6127,9 +6388,9 @@ def _callback(
             # Slot 10: SPARSITY = clip(1 - stored_approx/stored_exact,
             # -1, 1). 0.0 whenever it was not measured, same convention.
             sparsity,
-        ],
-        dtype=jnp.float32,
+        ]
     )
+    rewards = jnp.array(_reward_slots, dtype=jnp.float32)
 
     # ZERO-WORK PLANS ARE KEPT (user-directed 2026-07-28).
     #
@@ -6172,6 +6433,21 @@ def _callback(
                 f"skips={_n_skips} order={o_list}",
                 flush=True,
             )
+
+    # ---- A6 PLAN LOG: this plan, win or lose -------------------------
+    # `_GRAD_COV_STATS["last"]` is only THIS plan's census when it is a
+    # different object than the one snapshotted at entry; otherwise the
+    # coverage block did not run for this plan and the census is recorded
+    # as "not measured" rather than as somebody else's numbers.
+    if _plan_log_on:
+        _cov_now = _GRAD_COV_STATS.get("last")
+        _record_terminal_plan(
+            order=o_list, rule_specs=partial_specs,
+            face_specs=_faces_np, face_skips=_skips_np,
+            reward_vec=_reward_slots,
+            cov=(_cov_now if _cov_now is not _plan_cov0 else None),
+            face_before=_plan_pf0, face_after=_PER_FACE_STATS,
+            counts_from_trace=bool(_plan_traced[0]), sentinelled=False)
 
     return tokens, eqn_ids, rewards
 

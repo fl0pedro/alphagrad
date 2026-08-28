@@ -514,6 +514,83 @@ def configure_sparsity(args) -> float:
             HEAD_REWARD_INDICES, dtype=jnp.int32)
     return weight
 
+
+# ---------------------------------------------------------------------------
+# A6 -- THE PLAN LOG. Where the run's losers are written down.
+# ---------------------------------------------------------------------------
+# ``_dump_pareto`` persists the FRONT. X3 ("diff the lowered graphs of the
+# recorded losers against identity and attribute the regression") needs the
+# rest, and until now the rest was thrown away at the end of every episode.
+# ``--plan-log`` turns on one APPEND-ONLY JSONL per run holding, for EVERY
+# terminal plan: the replayable wire, all 11 reward slots, the per-kind
+# requested / applied / idempotent-no-op counts, the per-leaf coverage census
+# and the episode.
+#
+# THIS IS A LOGGING EXTENSION AND NOTHING ELSE. It reads state that is
+# already materialised, adds no reward, no action, no head, no exact
+# reference and no device operation, and with the flag off its whole cost is
+# one ``is None`` test per episode. Pinned by the ALPHAGRAD_EQ_DUMP
+# flag-off bit-identity gate, the same one 02e2679 and 949f1af used.
+#
+# "auto" resolves LAZILY, at the first write, because ``configure_plan_log``
+# must run before ``ray.init`` (the measure actors inherit the exported
+# environment there) and that is BEFORE ``wandb.init``, so ``wandb.run.dir``
+# does not exist yet at configuration time.
+_PLAN_LOG_PATH: str | None = None
+
+
+def configure_plan_log(args) -> str | None:
+    """Install the A6 plan-log configuration. PRE-RAY.INIT.
+
+    Same "before" as :func:`configure_fidelity`'s first one and for the same
+    reason: every measure actor decides whether to record from the
+    environment it inherited at ``ray.init``. It shares NONE of the other
+    two, because this channel appends no value head and changes no reward
+    slot -- the agent pytree, the head order and ``NUM_VALUE_HEADS`` are
+    untouched.
+
+    Returns the configured path (possibly the literal ``"auto"``, resolved
+    at first write) or None when the log is off.
+    """
+    global _PLAN_LOG_PATH
+    path = getattr(args, "plan_log", None)
+    if not path and bool(getattr(args, "record_all_plans", False)):
+        path = "auto"
+    # Set EXPLICITLY in both directions, like `configure_sparsity`: a measure
+    # actor respawned inside a long job must never inherit a stale "on".
+    os.environ["ALPHAGRAD_PLAN_LOG"] = "1" if path else "0"
+    if not path:
+        _PLAN_LOG_PATH = None
+        return None
+    os.environ["ALPHAGRAD_PLAN_LOG_CAP"] = str(
+        int(getattr(args, "plan_log_cap", 4096) or 4096))
+    os.environ["ALPHAGRAD_PLAN_LOG_MAX_FACES"] = str(
+        int(getattr(args, "plan_log_max_faces", 0) or 0))
+    os.environ["ALPHAGRAD_PLAN_LOG_MAX_LEAVES"] = str(
+        int(getattr(args, "plan_log_max_leaves", 0) or 0))
+    _PLAN_LOG_PATH = str(path)
+    return _PLAN_LOG_PATH
+
+
+def _resolve_plan_log_path(args) -> str | None:
+    """The run's JSONL, resolving ``"auto"`` once and caching it."""
+    global _PLAN_LOG_PATH
+    if _PLAN_LOG_PATH is None or _PLAN_LOG_PATH != "auto":
+        return _PLAN_LOG_PATH
+    try:
+        _dir = wandb.run.dir if wandb.run is not None else "."
+    except Exception:
+        _dir = "."
+    try:
+        os.makedirs(_dir, exist_ok=True)
+    except Exception:
+        _dir = "."
+    _PLAN_LOG_PATH = os.path.join(
+        _dir, f"plan_log_{getattr(args, 'name', None) or 'run'}.jsonl")
+    print(f"[plan-log] every terminal plan -> {_PLAN_LOG_PATH}", flush=True)
+    return _PLAN_LOG_PATH
+
+
 # Slot 2 was named "cos" until 2026-08-07; it is the value head for reward
 # slot 6, which now holds whichever quality metric env.quality_metric()
 # selects (the 200-step Adam-walk loss drop by default under --measure-grad,
@@ -4049,6 +4126,47 @@ def make_argparser() -> argparse.ArgumentParser:
              "traced and emits no HLO, so it rides compiles the run pays "
              "for anyway; the residual price is reported as "
              "sparsity/wall_amortised_s. Exports ALPHAGRAD_SPARSITY.")
+    # ---- A6: THE PLAN LOG (every terminal plan, losers included) --
+    p.add_argument(
+        "--plan-log", type=str, default=None, metavar="PATH",
+        help="APPEND-ONLY JSONL, one file per run, holding EVERY terminal "
+             "plan -- not just the Pareto front _dump_pareto persists. One "
+             "record per measured plan: the replayable wire (order + "
+             "per-vertex rule rows + per-face rows/skips, verbatim as "
+             "jacve consumed them), all 11 reward slots, the per-kind "
+             "requested/applied/idempotent-no-op counts, the per-leaf "
+             "gradient-coverage census and the episode. PATH, or \"auto\" "
+             "for <wandb-run-dir>/plan_log_<name>.jsonl. This is X3's only "
+             "input: the losers are what a regression is attributed "
+             "against. PURE LOGGING -- no reward, no action, no head, no "
+             "device work, no extra exact reference; it rides the "
+             "measurement the run already pays for. Exports "
+             "ALPHAGRAD_PLAN_LOG to the measure actors.")
+    p.add_argument(
+        "--record-all-plans", action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Shorthand for --plan-log auto.")
+    p.add_argument(
+        "--plan-log-cap", type=int, default=4096, metavar="N",
+        help="Records buffered per measure process BETWEEN two episode "
+             "drains. Past it a record is DROPPED and COUNTED "
+             "(plan_log/dropped_this_ep, plus a stderr line) -- never "
+             "silently overwritten. 4096 is ~256 episodes of a 16-env "
+             "rollout, i.e. it should never fire.")
+    p.add_argument(
+        "--plan-log-max-faces", type=int, default=0, metavar="N",
+        help="Cap on live faces written per record. 0 (default) = all, and "
+             "all is the ONLY REPLAYABLE setting: a truncated record is "
+             "marked replayable=false and its decoder REFUSES it rather "
+             "than replaying a different plan under this plan's name (the "
+             "907c231 failure). Use only to bound disk on a fully dense "
+             "face plan.")
+    p.add_argument(
+        "--plan-log-max-leaves", type=int, default=0, metavar="N",
+        help="Cap on per-leaf coverage entries (norms/ratios) written per "
+             "record. 0 (default) = all. The summary fields "
+             "(frac_leaves_zeroed, min_leaf_ratio, n_counted, n_zeroed) are "
+             "never capped, and leaves_elided counts what a cap dropped.")
     p.add_argument("--gate-tau", type=float, default=0.5,
                    help="mult mode: cosine gate threshold tau (g=0 below it).")
     p.add_argument("--gate-w", type=float, default=40.0,
@@ -5947,6 +6065,19 @@ def main():
                  else "  [TRAINED -- an all-SKIP plan scores the +1 "
                       "ceiling; --reject-frozen-grads is what refuses "
                       "it]"), flush=True)
+
+    # A6 PLAN LOG -- before ray.init so the measure actors inherit
+    # ALPHAGRAD_PLAN_LOG. Independent of the three configure_* calls above:
+    # it appends no value head and moves no reward slot, so it neither reads
+    # nor changes the head order.
+    _plan_log_cfg = configure_plan_log(args)
+    if _plan_log_cfg:
+        print(f"[cfg] plan log: ON -> {_plan_log_cfg} "
+              f"(every TERMINAL plan, losers included; cap="
+              f"{getattr(args, 'plan_log_cap', 4096)} "
+              f"max_faces={getattr(args, 'plan_log_max_faces', 0) or 'all'} "
+              f"max_leaves={getattr(args, 'plan_log_max_leaves', 0) or 'all'})",
+              flush=True)
 
     _apply_variant_preset(args)
     if args.variant != "custom":
@@ -11077,6 +11208,87 @@ def main():
                 log_dict[f"plan/{_k}/median_ep"] = float(np.median(_f))
             log_dict["plan/n_live"] = int(_live_env.sum())
             host_state["_last_plan_rows"] = _pl
+
+        # ---- A6: THE PLAN LOG -- every terminal plan, losers included ------
+        # Drains this process's records AND every measure actor's (with the
+        # pool active, every pooled terminal was measured in an actor and the
+        # trainer's own list is empty), stamps the episode, appends to the
+        # run's JSONL. Trainer-local numpy + one file append over data that
+        # is already on the host: no device work, no extra measurement, and
+        # nothing here is read by the policy, the reward or the update.
+        # The wall it costs is published as plan_log/wall_s so the claim
+        # "rides along at no extra node cost" is a MEASUREMENT, not a claim.
+        if _PLAN_LOG_PATH is not None:
+            _plog_t0 = _prof_time.perf_counter()
+            _plog_path = _resolve_plan_log_path(args)
+            try:
+                from alphagrad.approx.common.plan_log import (
+                    append_records as _plog_append)
+                from alphagrad.approx.env import (
+                    consume_plan_records as _plog_consume)
+                _plog_local = _plog_consume()
+                _plog_recs = list(_plog_local["records"])
+                _plog_dropped = int(_plog_local["dropped"])
+                _plog_actors = 0
+                _plog_why = ""
+                try:
+                    from alphagrad.approx.common.measure_pool import (
+                        merge_pool_plan_records as _plog_merge)
+                    _plog_pool = _plog_merge(
+                        getattr(env, "_remote_pool", None))
+                    _plog_recs.extend(_plog_pool["records"])
+                    _plog_dropped += int(_plog_pool["dropped"])
+                    _plog_actors = int(_plog_pool["actors_polled"])
+                    _plog_why = (
+                        f" pool={bool(_plog_pool.get('have_pool'))}"
+                        f" actors_seen={_plog_pool.get('actors_seen')}"
+                        f" failed={_plog_pool.get('actors_failed')}"
+                        f" pool_terminals={_plog_pool.get('terminals')}"
+                        f" disabled={_plog_pool.get('actors_disabled')}"
+                        + (f" err={_plog_pool['error']}"
+                           if _plog_pool.get("error") else ""))
+                    if _plog_pool["actors_failed"]:
+                        print(f"[plan-log] ep{ep}: "
+                              f"{_plog_pool['actors_failed']} measure actor(s) "
+                              f"could not be polled -- their plans are MISSING "
+                              f"from this episode's records",
+                              file=sys.stderr, flush=True)
+                except Exception as _plog_exc:
+                    print(f"[plan-log] ep{ep}: pool drain failed "
+                          f"({_plog_exc!r}) -- pooled plans are MISSING",
+                          file=sys.stderr, flush=True)
+                _plog_n0 = int(host_state.get("_plan_log_written", 0))
+                for _plog_j, _plog_r in enumerate(_plog_recs):
+                    _plog_r["episode"] = int(ep)
+                    _plog_r["plan_index"] = _plog_n0 + _plog_j
+                _plog_nw = _plog_append(_plog_path, _plog_recs)
+                host_state["_plan_log_written"] = _plog_n0 + _plog_nw
+                log_dict["plan_log/records_this_ep"] = int(_plog_nw)
+                log_dict["plan_log/records_total"] = int(_plog_n0 + _plog_nw)
+                log_dict["plan_log/dropped_this_ep"] = int(_plog_dropped)
+                log_dict["plan_log/actors_polled"] = int(_plog_actors)
+                log_dict["plan_log/sentinelled_this_ep"] = int(sum(
+                    1 for _r in _plog_recs if _r.get("sentinelled")))
+                # PRINTED, NOT ONLY LOGGED. A run whose plan log silently
+                # stays empty -- which is exactly what a pooled run did
+                # before this line existed -- is indistinguishable from a
+                # run with nothing to record unless the drain says so.
+                print(f"[plan-log ep{ep}] wrote={int(_plog_nw)} "
+                      f"local={len(_plog_local['records'])} "
+                      f"local_terminals={_plog_local.get('terminals')} "
+                      f"pooled={int(_plog_nw) - len(_plog_local['records'])}"
+                      f"{_plog_why} total={_plog_n0 + int(_plog_nw)} "
+                      f"dropped={int(_plog_dropped)}", flush=True)
+                if _plog_dropped:
+                    print(f"[plan-log] ep{ep}: {_plog_dropped} record(s) "
+                          f"DROPPED at the buffer cap -- raise --plan-log-cap",
+                          file=sys.stderr, flush=True)
+            except Exception as _plog_exc:
+                print(f"[plan-log] ep{ep}: FAILED to write "
+                      f"{_plog_path!r}: {_plog_exc!r}",
+                      file=sys.stderr, flush=True)
+            log_dict["plan_log/wall_s"] = float(
+                _prof_time.perf_counter() - _plog_t0)
 
         # ---- GRADIENT COVERAGE census --------------------------------------
         # THE ANTI-BUG-(c) REQUIREMENT. A rejected plan is excluded from the

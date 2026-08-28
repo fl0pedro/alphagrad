@@ -65,6 +65,7 @@ REQUIRED_FLAGS = [
     "--var-probe",
     "--face-edge-mem",
     "--per-face-masks",
+    "--plan-log",
 ]
 
 # ---------------------------------------------------------------------------
@@ -216,6 +217,15 @@ SHARED_CLI = [
     ("--sparsity-log", None),
     ("--cos-log-every", "20"),
     ("--pareto-dump-every", "10"),
+    # A6.  --pareto-dump-every persists the FRONT; this persists EVERYTHING,
+    # one append-only JSONL per run holding every terminal plan with its
+    # replayable wire, all 11 reward slots, the per-kind
+    # requested/applied/idempotent counts and the per-leaf coverage census.
+    # X3 is an analysis OF THE LOSERS and they were previously discarded at
+    # the end of every episode.  It is pure logging -- no reward, no action,
+    # no device work, no extra exact reference -- so it rides every arm.
+    # "auto" = <wandb-run-dir>/plan_log_<name>.jsonl.
+    ("--plan-log", "auto"),
     ("--episodes", "250"),
 ]
 

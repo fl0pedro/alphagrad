@@ -293,6 +293,24 @@ class CpuApproximationActor:
         from alphagrad.approx.env import consume_per_face_stats as _consume_pf
         return _consume_pf()
 
+    def consume_plan_records(self) -> dict:
+        """Pop this actor's A6 plan-log records (every terminal plan).
+
+        Same reason as :meth:`consume_face_stats`: the measurement
+        ``_callback`` -- and therefore the plan-log recorder -- runs in
+        THIS process. Under ``--ray-measure`` the trainer's own list is
+        empty for every pooled row, so without this method the plan log
+        would silently contain only the trainer-local terminals.
+
+        Returns ``{"records": [...], "dropped": int, "pid": int}``; the
+        actor id is stamped by the merger, which is the only side that
+        knows it.
+        """
+        from alphagrad.approx.env import consume_plan_records as _consume
+        out = _consume()
+        out["actor_id"] = self._actor_id
+        return out
+
     def consume_collapse_stats(self) -> dict:
         """Pop this actor's truncation / collapse counters (#81, #96).
 

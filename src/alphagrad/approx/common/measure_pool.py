@@ -178,6 +178,56 @@ def merge_pool_face_stats(pool, pf: dict | None = None) -> dict:
     return out
 
 
+def merge_pool_plan_records(pool) -> dict:
+    """Drain every live measure actor's A6 plan-log records.
+
+    Sibling of :func:`merge_pool_face_stats`, for the per-terminal-plan
+    records ``env._record_terminal_plan`` appends. With the Ray pool active
+    the measurement callback runs in the ACTOR processes, so the trainer's
+    own list only ever holds the terminals it measured itself (the
+    ``ALPHAGRAD_POOL_TERMINAL_LOCAL`` rows) -- every other plan, including
+    every plan the frozen-gradient guard sentinelled, would be missing from
+    a log the whole point of which is that nothing is missing.
+
+    Each record is stamped with the ``actor`` it came from before it is
+    handed back, so a plan can be attributed to the process that timed it.
+
+    Returns ``{"records": [...], "dropped": int, "actors_polled": int,
+    "actors_failed": int}``. Best-effort like its siblings -- a dead actor
+    or one too old to have the method contributes nothing and never raises
+    -- but a failed poll is COUNTED, because a silently unpolled actor is a
+    silently incomplete log.
+    """
+    out = {"records": [], "dropped": 0, "actors_polled": 0,
+           "actors_failed": 0, "have_pool": pool is not None,
+           "actors_seen": 0, "error": None, "terminals": 0,
+           "actors_disabled": 0}
+    try:
+        import ray as _ray
+        actors = list(pool.live_actors()) if pool is not None else []
+    except Exception as _exc:
+        out["error"] = f"{type(_exc).__name__}: {_exc}"
+        return out
+    out["actors_seen"] = len(actors)
+    for _h in actors:
+        try:
+            _s = _ray.get(_h.consume_plan_records.remote(), timeout=30)
+        except Exception:
+            out["actors_failed"] += 1
+            continue
+        out["actors_polled"] += 1
+        out["terminals"] += int((_s or {}).get("terminals", 0))
+        if not (_s or {}).get("enabled", True):
+            out["actors_disabled"] += 1
+        _aid = (_s or {}).get("actor_id")
+        for _r in (_s or {}).get("records", ()):
+            if isinstance(_r, dict):
+                _r["actor"] = _aid
+            out["records"].append(_r)
+        out["dropped"] += int((_s or {}).get("dropped", 0))
+    return out
+
+
 def measure_one_plan(pool, order, specs, face_specs, face_skips, step,
                      *, eval_samples=None, init: bool = False):
     """Measure a SINGLE plan through the pool, face wires included.
