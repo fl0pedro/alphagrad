@@ -26,7 +26,10 @@ is measured against itself the same way, so the identity ratio distribution
 IS the drift floor that every other ratio must be read against.
 
 WHAT IT MEASURES ON. The SAME env / target / measurement path the trainer
-uses: `alphagrad.approx.env._callback` with `--measure-grad --seed-vertices`,
+uses: `alphagrad.approx.env._callback` with `--measure-grad` (and NOT
+`--seed-vertices` -- workstream A4 removed it from all 64 launchers because
+seeds are NOT vertices; leaving it on here built a 2-vertex-larger graph
+than the runs whose landscape this is supposed to be),
 `--quality-metric loss_drop`, `--cmp-type latency --mem-type peak_memory`.
 There is no second measurement implementation here -- that is the whole point.
 
@@ -107,17 +110,37 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--measure-grad", action="store_true", default=True)
     p.add_argument("--no-measure-grad", dest="measure_grad",
                    action="store_false")
-    p.add_argument("--seed-vertices", action="store_true", default=True)
+    # A4: DEFAULT OFF. `seed_loss_fn` appends a tangent-seed `add` and an
+    # adjoint `reduce_sum` as ORDINARY ELIMINABLE VERTICES (nn256: 13 ->
+    # 15) and enlarges `derived_max_faces`, so a landscape measured with it
+    # on is not the landscape of the training runs -- a different graph,
+    # a different face count, a different action space. Every launcher
+    # dropped it in e3b07e7; this tool could not be touched then because it
+    # was mid-edit, so it kept measuring the old graph. Kept ACCEPTED (not
+    # deleted) for exactly one reason: replaying an ARCHIVED run that was
+    # launched with it needs the same graph back.
+    p.add_argument("--seed-vertices", action="store_true", default=False,
+                   help="DEPRECATED (A4). Only for replaying an archived "
+                        "run that was launched with it; it adds 2 "
+                        "eliminable vertices the campaign graph does not "
+                        "have. Requires --measure-grad.")
     p.add_argument("--no-seed-vertices", dest="seed_vertices",
                    action="store_false")
     p.add_argument("--exec-on-gpu", action="store_true")
     p.add_argument("--cmp-type", default="latency")
-    p.add_argument("--mem-type", default="peak_memory")
+    # The launchers (run_campaign_2node.sh:144, run_campaign_gpu2node.sh)
+    # measure `xla_peak_memory` -- the deterministic compile-time channel.
+    # `peak_memory` is a runtime high-water mark and is not comparable
+    # with the campaign rows, which is what this tool exists to explain.
+    p.add_argument("--mem-type", default="xla_peak_memory")
     p.add_argument("--num-data-points", type=int, default=5)
     p.add_argument("--reps-per-point", type=int, default=4)
     p.add_argument("--latency-inner-reps", type=int, default=5)
     p.add_argument("--num-eval-samples", type=int, default=5)
-    p.add_argument("--latency-warmup", type=int, default=1,
+    # 2, as the launchers pass (--latency-warmup 2). Warmup is a BIAS
+    # knob, not a precision knob: one untimed execution leaves first-touch
+    # cost in the first timed one.
+    p.add_argument("--latency-warmup", type=int, default=2,
                    help="UNTIMED executions before the first timed rep, "
                         "inside env._callback. The smoke run showed the very "
                         "first execution of a plan reading 5-10x the settled "
@@ -681,9 +704,16 @@ def measure(env, eval_samples, order, plan):
 
 
 # EVERY ROW CARRIES ITS CONFIG. The campaign's numbers are not comparable
-# across GRAPHAX_QUANT_PULLDOWN or across --latency-inner-reps (agent B
-# measured inner=5 carrying a systematic -13.1% amortisation bias vs
-# inner=50), so a row without its config is a row that will be misread.
+# across --latency-inner-reps (agent B measured inner=5 carrying a
+# systematic -13.1% amortisation bias vs inner=50), so a row without its
+# config is a row that will be misread.
+#
+# GRAPHAX_QUANT_PULLDOWN IS GONE. GX-A deleted the branch it gated
+# (graphax 1f3d311: `_compute_dtype` is plain highest-common promotion,
+# 3978 dtype combinations identical to the flag-off predecessor), so the
+# variable no longer changes anything anywhere. The COLUMN stays -- the
+# archived rows_*.csv files have it and `load_done` reads them -- but it
+# now records that fact instead of implying a live configuration axis.
 CSV_FIELDS = [
     "plan_id", "op", "budget", "trial", "role",
     "n_faces_approx", "n_slot_rows", "total_live_faces",
@@ -696,7 +726,11 @@ CSV_FIELDS = [
 def config_stamp(args):
     """The (pulldown, inner, warmup) triple this process is measuring under."""
     return {
-        "pulldown": os.environ.get("GRAPHAX_QUANT_PULLDOWN", "unset"),
+        # Dead knob, stamped honestly: a row that says "removed" cannot be
+        # mistaken for one measured under a pulldown that still bit.
+        "pulldown": ("removed:" + os.environ["GRAPHAX_QUANT_PULLDOWN"]
+                     if os.environ.get("GRAPHAX_QUANT_PULLDOWN")
+                     else "removed"),
         "inner_reps": int(args.latency_inner_reps),
         # BOTH warmups, named. `script` = this tool's whole-plan pass, which
         # pays the COMPILE. `env` = agent B's _resolve_warmup, untimed
