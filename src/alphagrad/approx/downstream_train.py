@@ -59,6 +59,7 @@ from alphagrad.approx.common.examples import (
     data_gen,
     get_args,
     get_fn,
+    get_raw_fn,
     infer_argnums,
 )
 from alphagrad.approx.common.seq_replay import (
@@ -115,9 +116,12 @@ def _make_loss_fns(target_fn: Callable, example: str = "VmappedNeuralNetwork"):
     tenth of the NLL it was labelled as, and it disagreed with the objective
     the measurement path had already been corrected to.
     """
-    from alphagrad.approx.common.examples import scalar_loss_fn
+    from alphagrad.approx.common.examples import get_fn as _get_fn
 
-    loss_scalar = scalar_loss_fn(target_fn, example)
+    # THE registered target, not a reduction applied here: the scalar loss now
+    # lives with the model (common.examples.get_fn), so this harness and the
+    # RL measurement path optimize the SAME callable by construction.
+    loss_scalar = _get_fn(example)
 
     def loss_sum(x, y, *weights):
         return jnp.sum(target_fn(x, y, *weights))
@@ -434,7 +438,11 @@ def main():
     key = jrand.PRNGKey(args.seed)
 
     # Build model + initial weights.
-    target_fn = get_fn(args.example)  # vmapped 2-layer MLP
+    # THE RAW MODEL on purpose: this harness builds FULL Jacobians of it and
+    # contracts them itself (_make_grad_from_jacobian), and sweeps test
+    # accuracy through its per-element output. The scalar loss it optimizes is
+    # the registered target, fetched by name in _make_loss_fns.
+    target_fn = get_raw_fn(args.example)  # vmapped 2-layer MLP
     argnums = tuple(infer_argnums(args.example))
     key, init_key = jrand.split(key)
     init_args = get_args(args.example, init_key, dataset=args.dataset)

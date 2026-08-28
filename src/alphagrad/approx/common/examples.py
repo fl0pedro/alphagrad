@@ -428,8 +428,17 @@ def get_args(fn_str: str, key, dataset: str | None = None):
     return out
 
 
-def get_fn(fn_str: str):
-    """Resolve `fn_str` to a Python callable, applying `jax.vmap` for Vmapped variants."""
+def get_raw_fn(fn_str: str):
+    """THE BARE MODEL: resolve `fn_str` to its Python callable, applying
+    `jax.vmap` for Vmapped variants. NOT the registered target.
+
+    Its output is whatever the model returns -- a per-CLASS loss vector, a
+    per-POSITION NLL, a ``(loss, *state)`` tuple, or several unrelated outputs.
+    :func:`get_fn` is the registered target and returns the scalar loss built
+    on top of this. Use ``get_raw_fn`` only where the PER-ELEMENT output is
+    genuinely what you need -- today that is ``downstream_train``, which
+    contracts full Jacobians of the model and sweeps test accuracy through it.
+    """
     base = fn_str[len("Vmapped"):] if fn_str.startswith("Vmapped") else fn_str
     if base.endswith("NeuralNetwork"):
         fn = _neural_network
@@ -458,112 +467,165 @@ def get_fn(fn_str: str):
 
 
 # ---------------------------------------------------------------------------
-# THE SCALAR TRAINING LOSS
+# THE REGISTERED TARGET IS MODEL + LOSS
 #
-# The reduction is DECLARED PER FAMILY. It used to be INFERRED from ndim
-# (``ndim >= 2 -> mean(sum(out, -1)) else mean(out)``), and ndim cannot tell a
-# CLASS axis from a SEQUENCE axis, so the same rule was right for one family
-# and wrong for the next:
+# ``get_fn(name)`` returns a callable whose output is a 0-d SCALAR: the exact
+# objective a real training run of that model differentiates. Its Jacobian IS
+# the gradient, for every trainable family, with no flag involved.
+#
+# THE LOSS IS WRITTEN NEXT TO THE MODEL, NOT INFERRED AT WRAP TIME. There is
+# no reduction table consulted by a generic wrapper, no ``jnp.ndim`` test and
+# no first-leaf extraction -- all three were shape heuristics standing in for
+# a fact only the model's author knows, and each was right for one family and
+# wrong for the next:
 #
 #   VmappedNeuralNetwork  out (B, C)  ndim 2 -> mean_B(sum_C)   CORRECT
 #   NeuralNetwork         out (C,)    ndim 1 -> mean_C          WRONG: NLL/C
 #   TransformerLM         out (S,)    ndim 1 -> mean_S          CORRECT (the
 #       class axis was already summed inside graphax's softmax_cross_entropy,
 #       so the surviving axis is the SEQUENCE and its mean is the LM loss)
+#   LIF_SNN               (loss, *state)  ndim(tuple) -> crash
 #
-# The unbatched-NeuralNetwork row is the SAME bug this function's previous
-# docstring records having fixed for the batched row: averaging the class axis
-# makes the loss NLL/C. It survived because the fix was written as a shape
-# test rather than as a statement about which axis is which.
+# ANALYTIC TARGETS ARE EXEMPT, EXPLICITLY. ``Simple`` / ``Lighthouse`` /
+# ``Helmholtz`` / ``RobotArm_6DOF`` / ``RoeFlux_1d`` / ``RoeFlux_3d`` /
+# ``BlackScholes_Jacobian`` are AD micro-benchmarks, not models: there is no
+# training run, no optimizer and therefore no loss to match. Their registered
+# target is the bare multi-output function and the measured object is the FULL
+# JACOBIAN -- which is what these benchmarks exist to measure and what every
+# archived run of them measured. Inventing a reduction for them would not make
+# them uniform, it would make them a different benchmark: five of the seven
+# return several unrelated outputs (BlackScholes 5, RobotArm 6, RoeFlux 3),
+# so any scalarisation is an arbitrary choice of adjoint seed dressed up as a
+# training loss. ``has_scalar_loss()`` below is the one place that says which
+# targets carry the scalar contract, and it is what the env's contract check
+# and the quality-channel default read.
 # ---------------------------------------------------------------------------
 
-#: ``"class_sum"`` — the raw output is a PER-ELEMENT loss whose LAST axis is
-#: the class/feature axis. Reduce it the way every framework reduces a
-#: classification loss: SUM the class axis (with one-hot ``y`` that is
-#: ``-log p_true``), MEAN every remaining (batch) axis.
-#: ``"mean"`` — the last axis is NOT a class axis: either the per-example
-#: reduction already happened inside the target (``softmax_cross_entropy``
-#: returns a per-POSITION NLL) or the loss is an elementwise MSE whose
-#: canonical reduction is the plain mean.
-def loss_reduction(fn_str: str | None) -> str:
-    """Which scalar reduction turns ``fn_str``'s raw output into THE training
-    loss. Declared, never guessed -- see the block comment above.
+#: The AD micro-benchmarks: no model, no training run, no loss. Their target
+#: is the raw function and the measured object is the full Jacobian.
+_ANALYTIC_JACOBIAN_TARGETS = frozenset({
+    "Simple", "Lighthouse", "Helmholtz", "RobotArm_6DOF",
+    "RoeFlux_1d", "RoeFlux_3d", "BlackScholes_Jacobian",
+})
 
-    ``None`` (caller did not name an example) -> ``"mean"``, the
-    ``<ones/N, out>`` adjoint. That is correct for a target that is already a
-    per-sample loss and is the only defensible default for the analytic
-    examples (Helmholtz / RoeFlux / Lighthouse / BlackScholes), which are not
-    losses at all and have no training run to match.
+
+def base_name(fn_str: str) -> str:
+    """``"VmappedConvNet" -> "ConvNet"``; any other name unchanged."""
+    return fn_str[len("Vmapped"):] if fn_str.startswith("Vmapped") else fn_str
+
+
+def has_scalar_loss(fn_str: str | None) -> bool:
+    """Does ``fn_str`` carry the scalar-loss contract (``get_fn`` returns 0-d)?
+
+    False exactly for :data:`_ANALYTIC_JACOBIAN_TARGETS` and for an unnamed
+    target. Read by ``env.from_jaxpr`` (whether to ENFORCE the scalar-output
+    contract) and by every production builder that arms it.
     """
-    if not fn_str:
-        return "mean"
-    base = fn_str[len("Vmapped"):] if fn_str.startswith("Vmapped") else fn_str
-    # Per-element loss, last axis = class/feature:
-    #   NeuralNetwork / Perceptron / ConvNet / MoE / ViT  -(y*logp) or
-    #     0.5*(tanh(z)-y)^2 over the 10 MNIST classes;
-    #   EncoderDecoder                                    0.5*(z-y)^2 over the
-    #     model dimension (``Encoder`` is NOT here -- it ends in
-    #     ``softmax_cross_entropy``, which has already summed the classes).
+    return bool(fn_str) and base_name(fn_str) not in _ANALYTIC_JACOBIAN_TARGETS
+
+
+def get_fn(fn_str: str):
+    """THE REGISTERED TARGET: model + loss, one 0-d scalar out.
+
+    Every trainable family below states its own reduction, in the same place
+    the model is resolved, with the training run it reproduces named. The
+    analytic benchmarks are returned bare -- see the block comment above.
+
+    Nothing wraps this afterwards. ``grad_target_setup`` / ``grad_target_fn``
+    hand it straight to the tracer, so ``jacve`` of the traced graph is the
+    gradient that hits the optimizer, and ``downstream_train`` optimizes this
+    same callable.
+    """
+    batched = fn_str.startswith("Vmapped")
+    base = base_name(fn_str)
+    raw = get_raw_fn(fn_str)
+
+    # PER-CLASS LOSS ON THE LAST AXIS.
+    #   NeuralNetwork / Perceptron / ConvNet / MoE / ViT return -(y * log p)
+    #     (or the legacy 0.5*(tanh z - y)^2) for EACH of the 10 MNIST classes;
+    # A training run SUMS that axis -- with a one-hot y the sum is the NLL of
+    # the true class, the number every framework calls "the loss" -- and MEANS
+    # the batch. UNBATCHED these targets score ONE sample, so the class-sum IS
+    # already the loss and no jnp.mean is emitted around it: the mean of a
+    # scalar would add a live reduce_sum over no axes plus a divide by 1, i.e.
+    # two dead vertices in the pointer's action space.
     if (base.endswith(("NeuralNetwork", "Perceptron"))
-            or base in _VISION_MODELS
-            or base == "EncoderDecoder"):
-        return "class_sum"
-    # Everything else. TransformerLM / Encoder: graphax's
-    # ``softmax_cross_entropy`` already summed the classes, so what is left is
-    # the SEQUENCE axis and the LM loss is its mean (mean NLL per token).
-    # LIF_SNN_SHD / ADALIF_SNN_SEQ already return a 0-d loss, so the mean is
-    # the identity. The analytic examples are not losses at all.
-    return "mean"
+            or base in _VISION_MODELS):
+        if batched:
+            return lambda *a: jnp.mean(jnp.sum(raw(*a), axis=-1))
+        return lambda *a: jnp.sum(raw(*a), axis=-1)
+
+    # PER-POSITION, PER-FEATURE SQUARED ERROR. ``EncoderDecoder`` returns
+    # 0.5*(z - y)^2 for every (position, model-dimension) pair, so unlike the
+    # one-sample-per-call classifiers above it carries a SEQUENCE axis even
+    # UNBATCHED -- its raw output is (S, D), not (C,). The loss sums the
+    # feature axis and means every axis that is left: positions when
+    # unbatched, positions and batch when vmapped. The same reduction either
+    # way, which is why it is written once instead of branching on ``batched``.
+    if base == "EncoderDecoder":
+        return lambda *a: jnp.mean(jnp.sum(raw(*a), axis=-1))
+
+    # CLASSES ALREADY SUMMED INSIDE THE MODEL. TransformerLM / TransformerLM3
+    # / Encoder end in graphax's ``softmax_cross_entropy``, which contracts the
+    # vocabulary axis itself, so the surviving axis is the SEQUENCE / position
+    # axis and the language-model loss is its mean -- the mean NLL per token an
+    # LM training run reports and optimizes.
+    if base in _TLM_BLOCKS or base == "Encoder":
+        return lambda *a: jnp.mean(raw(*a))
+
+    # SPIKING NETS. ``LIF_SNN`` / ``ADALIF_SNN`` return
+    # ``(loss, U1, U2, U3, I1..I3 / a1..a3)``: the per-output-unit loss plus
+    # the membrane / synaptic / adaptation state a caller needs to step the
+    # NEXT timestep. Element 0 is the loss by the model's own signature, not
+    # by a pytree heuristic. The trained objective is its mean over output
+    # units -- which is exactly the scalar the already-reduced members of the
+    # same family return: on the shared 16-unit config ADALIF_SNN's
+    # ``mean(loss)`` and ADALIF_SNN_SEQ's built-in 0-d loss are the same float
+    # to the last bit (1.0645949840545654).
+    if base in ("LIF_SNN", "ADALIF_SNN"):
+        return lambda *a: jnp.mean(raw(*a)[0])
+
+    # ALREADY THE LOSS. ``LIF_SNN_SHD`` / ``ADALIF_SNN_SEQ`` reduce inside the
+    # model and return 0-d. Nothing is added: the model IS the target.
+    if base in ("LIF_SNN_SHD", "ADALIF_SNN_SEQ"):
+        return raw
+
+    # NO TRAINING LOSS -- exempt, deliberately. See the block comment.
+    if base in _ANALYTIC_JACOBIAN_TARGETS:
+        return raw
+
+    raise ValueError(
+        f"Target '{fn_str}' is not registered. Every registered target must "
+        "declare what a training run of it optimizes (see get_fn in "
+        "common/examples.py); add it there rather than letting a generic "
+        "reduction guess from its output shape."
+    )
 
 
 def scalar_loss_fn(fn, example: str | None = None):
-    """Wrap an example function into THE SCALAR TRAINING LOSS -- the exact
-    objective a real training run of this target differentiates.
+    """ASSERTION, NOT A TRANSFORMATION. Returns ``fn`` guarded by a 0-d check.
 
-    This is the ONLY traced target now: ``grad_target_setup`` /
-    ``grad_target_fn`` apply it unconditionally, so ``jacve`` of the traced
-    graph is a GRADIENT and never a Jacobian, with or without
-    ``--measure-grad``. Shared by every measurement site (rollout worker + CPU
-    measure-actor + gfn worker + ``downstream_train``) so the jaxpr / order /
-    transforms and the downstream optimizer all operate on the SAME graph.
-
-    ``example`` selects the reduction via :func:`loss_reduction`. Omitting it
-    falls back to the plain mean; pass it whenever you have it.
-
-    AUX OUTPUTS. ``LIF_SNN`` / ``ADALIF_SNN`` return ``(loss, U1, U2, U3, a1,
-    a2, a3)`` -- a loss plus carry state. Only the FIRST leaf is the loss, so
-    only the first leaf is reduced. The old ndim test called ``jnp.ndim`` on
-    the whole tuple; with all seven leaves the same shape that reported ndim
-    2, and the ``jnp.sum(out, axis=-1)`` it then took raised
-    ``TypeError: sum requires ndarray or scalar arguments, got tuple``.
-    ``--measure-grad`` on those two targets has therefore never run at all
-    (the campaign's SNNs are ``LIF_SNN_SHD`` / ``ADALIF_SNN_SEQ``, which
-    already return a 0-d loss). Taking the first leaf turns a crash into the
-    right answer; no measured number changes, because there were none.
+    The reduction moved into the registered target (:func:`get_fn`), so there
+    is nothing left to wrap: this adds NO equation to the traced graph. It is
+    kept because several call sites read as "make me the scalar loss"
+    (``measure_server``, ``elimrl``, the pinning tests) and because a target
+    that silently stopped being scalar is exactly the failure this whole
+    workstream exists to prevent -- so the check names the offender instead of
+    letting a per-class Jacobian be reported as a gradient 200 steps later.
     """
-    how = loss_reduction(example)
-
-    def _loss(*a):
+    def _checked(*a):
         out = fn(*a)
-        leaves = jax.tree_util.tree_leaves(out)
-        # (loss, *aux): the loss is the first leaf, the rest is carry state.
-        out = leaves[0] if leaves else out
-        if how == "class_sum" and jnp.ndim(out) >= 1:
-            # SUM the class axis...
-            out = jnp.sum(out, axis=-1)
-            if jnp.ndim(out) == 0:
-                # ...and for an UNBATCHED target that sum IS the loss. Return
-                # it rather than wrapping it in jnp.mean: the mean of a scalar
-                # emits a live reduce_sum + divide-by-1, i.e. a dead vertex in
-                # the pointer's action space -- exactly the scaffolding A4
-                # removed. The early return is scoped to this branch on
-                # purpose, so the graph of every already-0-d target
-                # (LIF_SNN_SHD, ADALIF_SNN_SEQ) is untouched.
-                return out
-        # ...then MEAN whatever batch / sequence axes are left.
-        return jnp.mean(out)
+        if getattr(out, "shape", None) != ():
+            raise ValueError(
+                f"target {example or fn!r} is not a scalar loss: its output "
+                f"is {jax.tree_util.tree_structure(out)} with shapes "
+                f"{[jnp.shape(l) for l in jax.tree_util.tree_leaves(out)]}. "
+                "The registered target (common.examples.get_fn) must BE "
+                "model + loss; do not reduce it here."
+            )
+        return out
 
-    return _loss
+    return _checked
 
 
 def seed_loss_fn(fn, argnums):
@@ -646,6 +708,54 @@ def seed_loss_fn(fn, argnums):
     return g
 
 
+_MEASURE_GRAD_WARNED: list = []
+
+
+def warn_measure_grad_deprecated(args_like) -> bool:
+    """``--measure-grad`` is a DEPRECATED NO-OP. One warning per process.
+
+    KEPT ACCEPTED, NOT DELETED. 372 files under ``~/dsnn`` name the flag --
+    64 live launchers plus every archived campaign script, the forensics
+    replay (``ls_verify.sh``, ``tools/landscape_map``), ``cpu_approx_worker``,
+    ``ppo_ray_worker`` and ``downstream_train``. Hard-removing the argparse
+    entry would turn each of those into an ``unrecognized arguments`` exit,
+    including the archived replays whose whole purpose is to re-run a command
+    line exactly as it was recorded. Accepting it and doing nothing is the
+    only option that keeps those runnable.
+
+    Its three historical jobs are all gone:
+
+      * WHAT IS TRACED -- it used to switch between the scalar training loss
+        and the raw per-class Jacobian. The registered target is now model +
+        loss for every trainable family, so there is no other mode.
+      * THE QUALITY CHANNEL -- it used to select ``loss_drop`` over
+        ``cosine``. That default now follows the traced target actually being
+        scalar (``env.EnvConfig.scalar_target``), which is true for exactly
+        the targets on which the loss-drop walk is defined.
+      * GATING ``--seed-vertices`` -- see ``_seed_vertices_requested``.
+
+    The NEGATION is a different matter: ``--no-measure-grad`` asked for the
+    per-class-Jacobian behaviour, which no longer exists. Where such a switch
+    is defined (``tools/landscape_map.py``) it is a hard error, because
+    silently ignoring a request for a mode that is gone is how a run reports a
+    Jacobian as a gradient.
+    """
+    v = (args_like.get("measure_grad", False) if isinstance(args_like, dict)
+         else getattr(args_like, "measure_grad", False))
+    if not v:
+        return False
+    if not _MEASURE_GRAD_WARNED:
+        _MEASURE_GRAD_WARNED.append(1)
+        print("[alphagrad] WARNING: --measure-grad is DEPRECATED and does "
+              "NOTHING. The traced target is unconditionally the registered "
+              "scalar training loss (common.examples.get_fn = model + loss), "
+              "so jacve of it is the gradient with or without the flag, and "
+              "the loss-drop quality channel is the default for any "
+              "scalar-loss target. Use --quality-metric to choose the channel "
+              "explicitly. Drop the flag.", flush=True)
+    return True
+
+
 _SEED_VERTICES_WARNED: list = []
 
 
@@ -655,18 +765,16 @@ def _seed_vertices_requested(_flag) -> bool:
     This is the ONE gate in front of the ONE place the flag is read, and it
     makes two things loud that used to be silent.
 
-    1. THE COUPLING. Every archived run that passed ``--seed-vertices``
-       passed ``--measure-grad`` with it -- the shell encoded the rule by hand
-       (``run_full_nn256_v2_5seed.sh:305,309``: "--seed-vertices only when
-       SEED_VERTICES=1 AND grad mode (grad-only flag)"). The pair is required
-       here so a replay rebuilds the archived run's QUALITY CHANNEL as well as
-       its graph: ``--measure-grad`` is what puts ``env.quality_metric`` on
-       ``loss_drop`` rather than ``cosine``, and the flag's ONLY remaining job
-       is that choice. (When A4 wrote this gate the reason was different --
-       the seed wrapper was then unreachable without ``--measure-grad``,
-       making the flag a silent no-op. The scalar loss is now applied
-       unconditionally, so the no-op is gone; the requirement stays because
-       replaying half of an archived configuration is still not a replay.)
+    1. WHAT IT IS GATED ON NOW: NOTHING but itself. The gate used to require
+       ``--measure-grad`` alongside it, on the ground that an archived replay
+       must rebuild the archived QUALITY CHANNEL too -- ``--measure-grad`` was
+       what put ``env.quality_metric`` on ``loss_drop`` instead of ``cosine``.
+       That condition is gone: the traced target is unconditionally the scalar
+       loss, so ``loss_drop`` is now the DEFAULT channel for every target that
+       has one, and a replay gets the archived channel without the flag. The
+       error was removed rather than reworded because it would otherwise have
+       demanded a flag that no longer does anything -- and an error message
+       that names a no-op as the fix is worse than no error.
 
     2. THE DEPRECATION. ``seed_loss_fn`` appends exactly two eqns -- a
        tangent-seed ``add`` and an adjoint ``reduce_sum`` -- and they are
@@ -687,17 +795,6 @@ def _seed_vertices_requested(_flag) -> bool:
     """
     if not _flag("seed_vertices"):
         return False
-    if not _flag("measure_grad"):
-        raise ValueError(
-            "--seed-vertices requires --measure-grad. The flag exists only to "
-            "replay an archived run, every archived run that set it also set "
-            "--measure-grad, and --measure-grad is what selects that run's "
-            "quality channel (loss_drop, not cosine) -- so half the pair "
-            "rebuilds the graph but scores it on the wrong channel. Pass "
-            "--measure-grad, or -- preferred -- drop --seed-vertices: "
-            "workstream A4 removed it from every launcher because seeds are "
-            "NOT vertices."
-        )
     if not _SEED_VERTICES_WARNED:
         _SEED_VERTICES_WARNED.append(1)
         print("[A4] WARNING: --seed-vertices is DEPRECATED and is no longer "
@@ -713,17 +810,14 @@ def _seed_vertices_requested(_flag) -> bool:
 def grad_target_setup(args_like, base_fn, xs, example):
     """Shared target builder — returns ``(target_fn, xs, argnums)``.
 
-    THE TARGET IS ALWAYS A SCALAR LOSS. It used to be the RAW example unless
-    ``--measure-grad`` was passed, and the raw NeuralNetwork/Encoder/vision
-    examples return PER-ELEMENT losses -- so without the flag the measured
-    object was a full JACOBIAN (one row per class), not the gradient any
-    training run computes. There is now no way to ask for that: ``jacve`` of
-    this graph is the gradient, up to a leading size-1 axis.
+    THE TARGET IS ALREADY THE SCALAR LOSS when it arrives here: ``base_fn``
+    comes from :func:`get_fn`, which registers model + loss. This function
+    therefore ADDS NOTHING to the graph in the normal case -- it exists to
+    resolve ``argnums`` and to host the one deprecated replay branch.
 
-    ``--measure-grad`` no longer decides that. What it still does is pick the
-    quality channel (``env.quality_metric``: ``loss_drop`` vs ``cosine``) and
-    gate ``--seed-vertices`` (accepted for archived-run replay, DEPRECATED --
-    see ``_seed_vertices_requested``).
+    ``--measure-grad`` is a DEPRECATED NO-OP and is not read here at all. It
+    used to decide whether the traced target was the scalar loss or the raw
+    per-class Jacobian; the raw-Jacobian mode no longer exists.
 
     Called identically by the trainer (ppo_ray_worker), the CPU measure-actor
     (cpu_approx_worker) and ``tools/landscape_map`` so all three build the
@@ -741,14 +835,15 @@ def grad_target_setup(args_like, base_fn, xs, example):
             tuple(xs) + (jnp.zeros(()),),                 # append tangent seed t=0
             tuple(base_argnums) + (len(xs),),             # differentiate weights + t
         )
-    return scalar_loss_fn(base_fn, example), tuple(xs), base_argnums
+    return base_fn, tuple(xs), base_argnums
 
 
 def grad_target_fn(args_like, base_fn, example):
-    """Wrap-only variant of ``grad_target_setup`` for sites that re-swap just the
-    target function (the env's args/argnums were fixed at build time).
+    """Target-only variant of ``grad_target_setup`` for sites that re-swap just
+    the target function (the env's args/argnums were fixed at build time).
 
-    Always wraps, for the reason spelled out in ``grad_target_setup``."""
+    Identity outside the deprecated ``--seed-vertices`` replay branch, for the
+    reason spelled out in ``grad_target_setup``."""
     def _flag(name):
         if isinstance(args_like, dict):
             return bool(args_like.get(name, False))
@@ -756,7 +851,7 @@ def grad_target_fn(args_like, base_fn, example):
 
     if _seed_vertices_requested(_flag):
         return seed_loss_fn(base_fn, infer_argnums(example))
-    return scalar_loss_fn(base_fn, example)
+    return base_fn
 
 
 def infer_argnums(fn_str: str) -> tuple[int, ...]:
@@ -769,8 +864,11 @@ def infer_argnums(fn_str: str) -> tuple[int, ...]:
     if fn_str in ("LIF_SNN", "LIF_SNN_SHD", "ADALIF_SNN", "ADALIF_SNN_SEQ"):
         return (8, 9, 10)
     if "Encoder" in fn_str or "Decoder" in fn_str:
-        # (x, y, *weights) -> every weight arg, matching the vision models
-        n = len(inspect.signature(getattr(examples, fn_str)).parameters)
+        # (x, y, *weights) -> every weight arg, matching the vision models.
+        # Resolve the BASE name: ``graphax.examples`` has ``Encoder``, never
+        # ``VmappedEncoder``, so the Vmapped variants raised AttributeError
+        # here and were unreachable -- get_fn/get_args build them fine.
+        n = len(inspect.signature(getattr(examples, base_name(fn_str))).parameters)
         return tuple(range(2, n))
     if fn_str in _TLM_BLOCKS:
         # (x, y, 7 weights per block, Wout) -> differentiate every weight.

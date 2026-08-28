@@ -143,7 +143,7 @@ launch_one() {
       --example $M --dataset mnist \
       --rewards cmp mem acc --cmp-type latency --mem-type xla_peak_memory \
       --lambda-cmp $LCMP --lambda-mem $LMEM --lambda-acc $LAMBDA_ACC --lambda-frob $LAMBDA_FROB \
-      --measure-grad --measure-latency --quant-once \
+      --measure-latency --quant-once \
       --latency-timer perf_counter --latency-inner-reps 5 --latency-warmup 2 --latency-winsor 0.2 \
       --cpu-cores-per-actor 1 --cpu-cores-shared --num-cpu-workers $NUM_CPU_WORKERS \
       --actor-num-gpus 1 --ray-address $HEAD_IP:$RAY_PORT \

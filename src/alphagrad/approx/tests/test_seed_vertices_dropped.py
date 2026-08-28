@@ -2,11 +2,12 @@
 
 This file pins the two decisions of workstream A4 so neither can drift back:
 
-  1. ``--seed-vertices`` is DEPRECATED, no launcher passes it, and passing it
-     WITHOUT ``--measure-grad`` is an explicit error instead of the silent
-     no-op it was for the whole campaign (``examples.grad_target_setup`` and
-     ``grad_target_fn`` both return before the seed branch when grad mode is
-     off, so the flag changed nothing and said nothing).
+  1. ``--seed-vertices`` is DEPRECATED, no launcher passes it, and it is
+     kept ACCEPTED only so an archived run's graph can be rebuilt. It warns
+     when used. It used to ALSO require ``--measure-grad``; that requirement
+     is gone, because ``--measure-grad`` is now itself a no-op and an error
+     message naming a no-op as the fix is worse than no error. See
+     ``test_seed_vertices_no_longer_requires_measure_grad``.
 
   2. THE GRADIENT-COVERAGE LEAF SET excludes 0-d leaves, agreeing with
      ``env._walk_argnums``. Before A4 the two contradicted each other:
@@ -14,8 +15,9 @@ This file pins the two decisions of workstream A4 so neither can drift back:
      ``_leaf_norms`` counted it, which put ``--reject-frozen-grads`` (default
      ON) in a position to sentinel a whole plan on the SEED's gradient.
 
-``--measure-grad`` itself is NOT dropped and is NOT redundant; the last test
-records why.
+``--measure-grad`` IS now redundant -- a DEPRECATED NO-OP kept accepted for
+the 372 files that name it -- and the last two tests record that: it moves
+nothing, and it is still an accepted CLI option.
 """
 import os
 
@@ -52,29 +54,31 @@ def _fn(*a):
 # 1. the coupling is loud
 # --------------------------------------------------------------------------
 
-def test_seed_vertices_without_measure_grad_raises_namespace():
-    """The footgun. Was a silent no-op; is now an error.
+def test_seed_vertices_no_longer_requires_measure_grad():
+    """The gate that WAS here demanded ``--measure-grad`` alongside, so that a
+    replay rebuilt the archived QUALITY CHANNEL (loss_drop) as well as the
+    archived graph. That condition no longer exists: the traced target is
+    unconditionally the scalar loss, so loss_drop is the DEFAULT channel for
+    every target that has one and the replay gets it without the flag.
 
-    The rule is not new -- the shell already encoded it by hand in
-    ``run_full_nn256_v2_5seed.sh:305,309``
-    ("--seed-vertices only when SEED_VERTICES=1 AND grad mode (grad-only
-    flag)"). Every caller that did NOT encode it was silently ignored.
+    Requiring a flag that does nothing would make the error message false, so
+    the requirement is dropped and ``--seed-vertices`` stands alone.
     """
     a = NS(measure_grad=False, seed_vertices=True)
-    with pytest.raises(ValueError, match="--measure-grad"):
-        grad_target_setup(a, _fn, (np.zeros((2, 2)),), EXAMPLE)
-    with pytest.raises(ValueError, match="--measure-grad"):
-        grad_target_fn(a, _fn, EXAMPLE)
+    xs = (np.zeros((2, 2)),)
+    fn, out_xs, argnums = grad_target_setup(a, _fn, xs, EXAMPLE)
+    assert len(out_xs) == len(xs) + 1          # the tangent seed is appended
+    assert grad_target_fn(a, _fn, EXAMPLE) is not _fn
 
 
-def test_seed_vertices_without_measure_grad_raises_dict():
+def test_seed_vertices_no_longer_requires_measure_grad_dict():
     """The CPU measure-actor passes a dict, not a Namespace -- and it MUST
-    build the identical graph, so it must hit the identical error."""
+    build the identical graph, so it must take the identical branch."""
     a = {"measure_grad": False, "seed_vertices": True}
-    with pytest.raises(ValueError, match="--measure-grad"):
-        grad_target_setup(a, _fn, (np.zeros((2, 2)),), EXAMPLE)
-    with pytest.raises(ValueError, match="--measure-grad"):
-        grad_target_fn(a, _fn, EXAMPLE)
+    xs = (np.zeros((2, 2)),)
+    fn, out_xs, argnums = grad_target_setup(a, _fn, xs, EXAMPLE)
+    assert len(out_xs) == len(xs) + 1
+    assert grad_target_fn(a, _fn, EXAMPLE) is not _fn
 
 
 def test_no_seed_vertices_is_the_default_and_adds_nothing():
@@ -88,7 +92,9 @@ def test_no_seed_vertices_is_the_default_and_adds_nothing():
     fn, out_xs, argnums = grad_target_setup(a, _fn, xs, EXAMPLE)
     assert len(out_xs) == len(xs)
     assert tuple(argnums) == tuple(infer_argnums(EXAMPLE))
-    assert grad_target_fn(a, _fn, EXAMPLE) is not _fn      # scalar_loss_fn wrap
+    # ...and nothing is wrapped around the target either: the registered
+    # target IS model + loss, so grad_target_fn is the identity here.
+    assert grad_target_fn(a, _fn, EXAMPLE) is _fn
 
 
 def test_seed_vertices_with_measure_grad_still_replays():
@@ -210,31 +216,36 @@ def test_no_in_repo_launcher_passes_seed_vertices():
     assert not offenders, "launchers still pass --seed-vertices: %s" % offenders
 
 
-def test_measure_grad_no_longer_gates_the_scalar_loss():
-    """SUPERSEDED A4's third finding, deliberately.
+def test_measure_grad_is_a_deprecated_no_op():
+    """SUPERSEDED A4's third finding, deliberately, and then the other two.
 
-    A4 recorded ``--measure-grad`` as load-bearing in three ways. Two survive:
-    it flips the quality-metric default cosine -> ``loss_drop``, and it gates
-    ``--seed-vertices`` above. The third -- "``scalar_loss_fn`` wraps the
-    target BEFORE tracing" -- is no longer conditional on the flag: the target
-    is ALWAYS the scalar training loss, because the alternative was measuring
-    a full Jacobian and calling it a gradient. The env's scalar-output
-    contract check is now armed by ``from_jaxpr(scalar_target=True)``, which
-    the production builders pass unconditionally.
+    A4 recorded ``--measure-grad`` as load-bearing in three ways, and none
+    survives:
 
-    ``test_jacobian_equals_grad.py`` owns the positive statement (the traced
-    target is scalar with the flag off, and ``jacve`` of it == ``jax.grad``);
-    this asserts only that the flag no longer moves the target.
+      * "``scalar_loss_fn`` wraps the target BEFORE tracing" -- the registered
+        target IS model + loss now (``common.examples.get_fn``), so there is
+        nothing to wrap and no other mode to select. ``grad_target_setup`` is
+        the IDENTITY here.
+      * "it flips the quality-metric default to ``loss_drop``" -- that default
+        now follows ``EnvConfig.scalar_target``, a fact read off the traced
+        jaxpr, which is true for exactly the targets on which the loss-drop
+        walk is defined.
+      * "it gates ``--seed-vertices``" -- see the first test in this file.
+
+    ``test_jacobian_equals_grad.py`` owns the positive statement (every
+    registered target is scalar and ``jacve`` of it == ``jax.grad``); this
+    asserts only that the flag moves nothing.
     """
     xs = (np.zeros((2, 2)),)
     off = grad_target_setup(NS(measure_grad=False, seed_vertices=False),
                             _fn, xs, EXAMPLE)
     on = grad_target_setup(NS(measure_grad=True, seed_vertices=False),
                            _fn, xs, EXAMPLE)
-    assert off[0] is not _fn             # wrapped into a scalar loss...
-    assert on[0] is not _fn              # ...with the flag on OR off
+    assert off[0] is _fn                 # the identity...
+    assert on[0] is _fn                  # ...with the flag on OR off
     probe = jnp.asarray([[1.0, 2.0], [3.0, 4.0]])
-    assert float(off[0](probe)) == pytest.approx(float(on[0](probe)))
+    np.testing.assert_array_equal(np.asarray(off[0](probe)),
+                                  np.asarray(on[0](probe)))
     assert off[1:] == on[1:]             # same args, same argnums
 
 

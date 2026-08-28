@@ -1637,7 +1637,8 @@ _AXIS_FEAT_GROUP_ID = 3
 #   6 quality          — THE quality channel. Which QUANTITY sits in it is
 #                        selected by ``ALPHAGRAD_QUALITY_METRIC`` (see
 #                        ``quality_metric()`` below):
-#                          "loss_drop" (default under --measure-grad) — the
+#                          "loss_drop" (the default for any scalar-loss
+#                            target, i.e. every trainable example) -- the
 #                            relative loss drop of a 200-step Adam walk driven
 #                            by THIS PLAN's gradient, probed on a fixed batch
 #                            of 512 real MNIST images. Pearson 0.922 against
@@ -1915,11 +1916,18 @@ class EnvConfig(NamedTuple):
     # token, so the growing buffer -- and the id-0 length hazard that came
     # with counting non-zeros in it -- is simply gone.
     delta_obs: bool = False
-    # --measure-grad: the traced target IS a scalar loss and the plan's output
-    # IS a gradient. Recorded on the CONFIG (not just validated in from_jaxpr)
-    # because ``_callback`` sees only the config, and ``quality_metric()``'s
-    # ``auto`` default needs it to decide between the loss-drop walk (defined
-    # only for a scalar loss) and the legacy Jacobian cosine.
+    # THE TRACED TARGET IS A SCALAR LOSS, so the plan's output IS a gradient.
+    # A FACT READ OFF THE JAXPR, not a flag: ``from_jaxpr`` sets this from the
+    # target's output avals. Recorded on the CONFIG (not just validated in
+    # from_jaxpr) because ``_callback`` sees only the config, and
+    # ``quality_metric()``'s ``auto`` default needs it to decide between the
+    # loss-drop walk (defined only for a scalar loss) and the legacy Jacobian
+    # cosine.
+    scalar_target: bool = False
+    # DEPRECATED AND UNREAD. ``--measure-grad`` used to decide what was traced.
+    # The traced target is now unconditionally the registered target
+    # (``common.examples.get_fn`` = model + loss), so this field selects
+    # nothing; it is kept accepted because callers still forward it.
     measure_grad: bool = False
     # WARMUP executions before the timed window. Passed by every caller
     # (cpu_approx_worker, az_gumbel) since the actor-args dict was written, but
@@ -3081,9 +3089,14 @@ def quality_metric(config=None) -> str:
     """``"loss_drop"`` or ``"cosine"`` — WHICH quantity reward slot 6 holds.
 
     ``ALPHAGRAD_QUALITY_METRIC`` selects it; the default ``auto`` resolves to
-    ``loss_drop`` whenever the measured graph IS a scalar loss (i.e. under
-    ``--measure-grad``, where the plan's output is a gradient and the walk is
-    defined) and to the legacy ``cosine`` otherwise. Read identically by the
+    ``loss_drop`` whenever the measured graph IS a scalar loss, which is now a
+    FACT READ OFF THE TRACED JAXPR (``EnvConfig.scalar_target``, set by
+    ``from_jaxpr`` from the target's output avals) rather than a flag. Every
+    trainable example is model + loss, so ``auto`` is ``loss_drop`` for all of
+    them; it falls back to the legacy ``cosine`` only for the analytic AD
+    benchmarks (Helmholtz / RoeFlux / Lighthouse / RobotArm / BlackScholes /
+    Simple), whose target is a full Jacobian and for which an Adam walk on
+    "the loss" is not defined. Read identically by the
     trainer and by every CpuApproximationActor — both run THIS function inside
     THIS module's ``_callback``, so the two paths cannot disagree.
     """
@@ -3116,7 +3129,7 @@ def quality_metric(config=None) -> str:
             f"{_QUALITY_METRIC_ENV} must be one of "
             f"auto/loss_drop/cosine/none, got {want!r}"
         )
-    return "loss_drop" if bool(getattr(config, "measure_grad", False)) else "cosine"
+    return "loss_drop" if bool(getattr(config, "scalar_target", False)) else "cosine"
 
 
 # Walk hyper-parameters. The defaults ARE the measured configuration above;
@@ -5344,7 +5357,7 @@ def _callback(
     # Quality family — reward slot 6 (``quality``) + frob_residual.
     # ------------------------------------------------------------------
     # WHICH quantity lands in slot 6 is ``quality_metric(config)``:
-    # ``loss_drop`` (default under --measure-grad) = the relative loss drop of
+    # ``loss_drop`` (the default for any scalar-loss target) = the loss drop of
     # a 200-step Adam walk driven by this plan's gradient; ``cosine`` = the
     # legacy Jacobian cosine. Both are "higher is better", both are ~[0, 1]
     # (loss_drop can reach -1 when the walk diverges), so every downstream
@@ -5735,6 +5748,17 @@ class VertexEliminationEnv:
         # the total budget so old scripts keep working.
         if latency_samples and latency_samples > 1:
             reps_per_point = max(1, int(latency_samples) // max(1, num_data_points))
+        # Is the traced target scalar? A FACT about the jaxpr, computed
+        # unconditionally so ``EnvConfig.scalar_target`` records what was
+        # actually traced (``quality_metric``'s ``auto`` default reads it) and
+        # so the contract check below has one definition of "scalar", not two.
+        _outs0 = getattr(jaxpr, "out_avals", None) or [
+            getattr(v, "aval", None) for v in jaxpr.jaxpr.outvars
+        ]
+        _is_scalar = not [
+            a for a in _outs0
+            if a is not None and getattr(a, "shape", ()) not in ((), (1,))
+        ]
         if measure_grad or scalar_target:
             # THE SCALAR-OUTPUT CONTRACT: the traced function is a SCALAR
             # loss, so differentiating its jaxpr already yields gradients —
@@ -5745,12 +5769,12 @@ class VertexEliminationEnv:
             # az_gumbel unimportable rather than protecting anything. Verify
             # the contract and continue.
             #
-            # ``scalar_target`` is what arms it on the PRODUCTION paths.
-            # ``common.examples.grad_target_setup`` now wraps the target in
-            # ``scalar_loss_fn`` UNCONDITIONALLY, so ppo / cpu_approx_worker /
-            # landscape_map always satisfy the contract and always pass
-            # ``scalar_target=True`` -- the check no longer switches off with
-            # ``--measure-grad``, which today only picks the quality channel.
+            # ``scalar_target`` is what ARMS the check on the PRODUCTION
+            # paths, and they pass ``examples.has_scalar_loss(example)``: True
+            # for every trainable family (whose registered target IS model +
+            # loss) and False for the analytic AD benchmarks, which have no
+            # training loss and are measured as full Jacobians on purpose.
+            # ``--measure-grad`` does not arm anything any more.
             # It stays default-False so the callers that legitimately trace a
             # NON-scalar target (elimrl, bare-jaxpr tests) are unaffected.
             _outs = getattr(jaxpr, "out_avals", None) or [
@@ -5764,9 +5788,9 @@ class VertexEliminationEnv:
                 raise ValueError(
                     "a SCALAR-output target is required (so jacve of it "
                     "yields gradients); got output avals "
-                    f"{[getattr(a, 'shape', a) for a in _outs]}. Wrap the "
-                    "model in a scalar loss (see common.examples."
-                    "scalar_loss_fn) or drop measure_grad/scalar_target."
+                    f"{[getattr(a, 'shape', a) for a in _outs]}. The "
+                    "registered target must BE model + loss (see "
+                    "common.examples.get_fn), or drop scalar_target."
                 )
         assert (argnums is None and args is None) or not (args is None or args is None)
         config = EnvConfig(
@@ -5790,6 +5814,7 @@ class VertexEliminationEnv:
             terminal_rewards_only=terminal_rewards_only,
             delta_obs=bool(delta_obs),
             measure_grad=bool(measure_grad),
+            scalar_target=bool(_is_scalar),
         )
         return cls(
             config,

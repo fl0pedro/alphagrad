@@ -4212,11 +4212,14 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--measure-grad",
         action="store_true",
-        help="Measure the GRADIENT pipeline instead of the raw Jacobian: the "
-        "example is wrapped in scalar_loss_fn (mean -> MSE for the NN "
-        "examples) BEFORE tracing, so the policy graph, mask oracle, and "
-        "measured executable all live on the same scalar-loss graph and "
-        "jacve of it yields the gradients the spec asks to time.",
+        help="DEPRECATED NO-OP, accepted so archived launchers and replay "
+        "scripts still run. The gradient pipeline is now the ONLY pipeline: "
+        "every registered target IS model + loss (common.examples.get_fn), so "
+        "the traced graph is the scalar-loss graph and jacve of it is the "
+        "gradient, flag or no flag. It last selected the quality channel; "
+        "that default is now taken from the traced target being scalar, and "
+        "--quality-metric is the explicit control. Passing it prints one "
+        "warning and changes nothing.",
     )
     p.add_argument(
         "--quality-metric",
@@ -4227,9 +4230,10 @@ def make_argparser() -> argparse.ArgumentParser:
         "the PLAN's own gradient, probed on a fixed batch of 512 real MNIST "
         "images (Pearson 0.922 against final downstream test accuracy, 0.22 s "
         "and 40 MB per plan). cosine = the legacy Jacobian cosine (Pearson "
-        "0.610, 9.70 s, 4.24 GB). auto = loss_drop under --measure-grad "
-        "(where the plan's output IS a gradient and the walk is defined), "
-        "cosine otherwise. Published as ALPHAGRAD_QUALITY_METRIC so the Ray "
+        "0.610, 9.70 s, 4.24 GB). auto = loss_drop whenever the traced "
+        "target is a scalar loss (every trainable example: the plan's output "
+        "IS a gradient and the walk is defined), cosine for the analytic AD "
+        "benchmarks. Published as ALPHAGRAD_QUALITY_METRIC so the Ray "
         "measure actors resolve the SAME metric as the trainer.",
     )
     p.add_argument(
@@ -4273,10 +4277,11 @@ def make_argparser() -> argparse.ArgumentParser:
         "--seed-vertices",
         action="store_true",
         help="DEPRECATED (workstream A4): seeds are NOT vertices. No launcher "
-        "passes this any more, and passing it WITHOUT --measure-grad is an "
-        "ERROR instead of the silent no-op it used to be; it is kept accepted "
-        "only so the forensics/landscape replay can rebuild an archived run's "
-        "graph. What it did: with --measure-grad, use seed_loss_fn instead of scalar_loss_fn: "
+        "passes this any more; it is kept accepted only so the forensics/"
+        "landscape replay can rebuild an archived run's graph, and it prints a "
+        "warning. It no longer requires --measure-grad (which is itself a "
+        "no-op now). What it does: use seed_loss_fn instead of the registered "
+        "scalar-loss target: "
         "the tangent seed and the adjoint contraction enter the graph as "
         "ORDINARY ELIMINABLE VERTICES, so the elimination/action space stays "
         "the Jacobian graph (plus seed nodes) while the MEASURED object is the "
@@ -5883,27 +5888,30 @@ def main():
         or args.example.startswith("TransformerLM"))
     dataset_for_call = dataset_arg if use_dataset else None
 
+    from alphagrad.approx.common.examples import (
+        has_scalar_loss as _has_scalar_loss,
+        warn_measure_grad_deprecated as _warn_mgrad)
+    _warn_mgrad(args)
+    # THE REGISTERED TARGET IS MODEL + LOSS (common.examples.get_fn), so
+    # closed_jaxpr, the mask oracle and the env's measured executable all
+    # address the SAME scalar-loss graph by construction. Wrapping only at
+    # measurement time was the graph mismatch that produced the old stack's
+    # zero-gradient bug.
+    _scalar_target = _has_scalar_loss(args.example)
     target_fn = get_fn(args.example)
-    if args.measure_grad:
-        # Wrap BEFORE tracing: closed_jaxpr, the mask oracle, and the env's
-        # measured executable must all address the SAME scalar-loss graph —
-        # wrapping only at measurement time is the graph-mismatch that
-        # produced the old stack's zero-gradient bug.
-        pass
     xs = get_args(args.example, args_key, dataset=dataset_for_call)
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
     )
-    # GRAD-TARGET SETUP — routed through the shared builder so the trainer and
+    # TARGET SETUP -- routed through the shared builder so the trainer and
     # every measure-actor construct the IDENTICAL graph (jaxpr / vertex+action
-    # space / argnums). Three modes:
+    # space / argnums). Two modes:
     #
-    #   neither flag        -> raw Jacobian target (the historical default).
-    #   --measure-grad      -> scalar_loss_fn: mean BEFORE tracing. Measures the
-    #                          gradient, but the traced graph IS the loss graph,
-    #                          so the ACTION SPACE CHANGES (measured: 15 vertices
-    #                          vs 13 for the Jacobian graph).
-    #   + --seed-vertices   -> seed_loss_fn: the tangent seed `t` and the
+    #   default             -> the registered target itself: model + loss, one
+    #                          0-d scalar out, so jacve of it is the gradient
+    #                          the optimizer sees. There is no raw-Jacobian
+    #                          mode any more and no flag that selects one.
+    #   --seed-vertices     -> seed_loss_fn: the tangent seed `t` and the
     #                          <ones/N, .> adjoint contraction become ORDINARY
     #                          ELIMINABLE VERTICES. The graph stays the
     #                          Jacobian-elimination graph (plus the seed nodes),
@@ -5970,7 +5978,7 @@ def main():
     global _QUALITY_METRIC
     from types import SimpleNamespace as _NS
     _QUALITY_METRIC = _env_quality_metric(
-        _NS(measure_grad=bool(args.measure_grad)))
+        _NS(scalar_target=bool(_scalar_target)))
     print(
         f"[alphagrad] quality channel (reward slot 6, --lambda-acc) = "
         f"{_QUALITY_METRIC}"
@@ -6005,12 +6013,11 @@ def main():
         # tokenization (found by the 3b smoke: Compress on an implicit-dim
         # edge, legal by the logical-axis oracle, unappliable on the 1-D val).
         per_face=bool(args.per_face or args.face_actions),
-        measure_grad=bool(args.measure_grad),
-        # The target came from common.examples.grad_target_setup, which now
-        # wraps it in the SCALAR TRAINING LOSS unconditionally -- so the
-        # scalar-output contract always holds here and is always checked.
-        # (--measure-grad no longer decides that; it picks the quality channel.)
-        scalar_target=True,
+        # THE SCALAR-OUTPUT CONTRACT, armed by a property of the EXAMPLE, not
+        # by a flag: True for every trainable family (registered target = model
+        # + loss) and False for the analytic AD benchmarks, which have no
+        # training loss and are measured as full Jacobians on purpose.
+        scalar_target=_scalar_target,
         terminal_rewards_only=args.terminal_rewards_only,
         # STAGE 2: emit the per-step token DELTA, not the growing stream.
         delta_obs=True,

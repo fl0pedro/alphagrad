@@ -99,7 +99,9 @@ TASK = A.task; DSET = A.dataset
 # v45 PPO arms, which run without --measure-grad); default 1 keeps the
 # legacy gradient-pipeline target for existing scripts.
 _GAZ_MGRAD = os.environ.get("ALPHAGRAD_GAZ_MEASURE_GRAD", "1") == "1"
-LOSS = scalar_loss_fn(get_fn(TASK), TASK) if _GAZ_MGRAD else get_fn(TASK)
+# get_fn IS the registered target (model + loss), so there is nothing to
+# wrap and nothing for _GAZ_MGRAD to switch between.
+LOSS = get_fn(TASK)
 # ORDER-ONLY / EXACT ARM (--no-approx-head): no plan can approximate anything,
 # so every plan returns the EXACT gradient and the quality channel is a
 # CONSTANT (measured on TLM order-only: cos=+0.885 on every episode). It

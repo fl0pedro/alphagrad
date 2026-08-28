@@ -48,7 +48,7 @@ if TYPE_CHECKING:  # pragma: no cover - never executed at runtime
         generate_eval_samples,
     )
     from alphagrad.approx.common.examples import (  # noqa: F401
-        data_gen, get_args, get_fn, grad_target_fn, grad_target_setup, infer_argnums, scalar_loss_fn, seed_loss_fn,
+        base_name, data_gen, get_args, get_fn, get_raw_fn, grad_target_fn, grad_target_setup, has_scalar_loss, infer_argnums, scalar_loss_fn, seed_loss_fn,
     )
     from alphagrad.approx.common.gae import (  # noqa: F401
         get_advantages, make_get_advantages, get_num_clipping_triggers, inverse_reward_normalization_fn, reward_normalization_fn,
@@ -150,6 +150,9 @@ _LAZY: dict[str, tuple[str, str]] = {
     "data_gen": ("alphagrad.approx.common.examples", "data_gen"),
     "get_args": ("alphagrad.approx.common.examples", "get_args"),
     "get_fn": ("alphagrad.approx.common.examples", "get_fn"),
+    "get_raw_fn": ("alphagrad.approx.common.examples", "get_raw_fn"),
+    "has_scalar_loss": ("alphagrad.approx.common.examples", "has_scalar_loss"),
+    "base_name": ("alphagrad.approx.common.examples", "base_name"),
     "scalar_loss_fn": ("alphagrad.approx.common.examples", "scalar_loss_fn"),
     "seed_loss_fn": ("alphagrad.approx.common.examples", "seed_loss_fn"),
     "grad_target_setup": ("alphagrad.approx.common.examples", "grad_target_setup"),

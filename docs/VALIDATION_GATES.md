@@ -33,15 +33,28 @@ The other contract a measurement run depends on is **the measured object is the
 gradient a training run computes**, pinned by
 `src/alphagrad/approx/tests/test_jacobian_equals_grad.py`:
 
-* the traced target is a SCALAR loss with `--measure-grad` on *and* off (it used
-  to be the raw per-element example without the flag, i.e. a per-class Jacobian);
-* `graphax.jacve` of that graph equals `jax.grad` of the same loss, leaf by leaf,
-  at `max|jacve-grad|/max|grad| <= 1e-5` (measured: 1.3e-7 NeuralNetwork,
-  1.1e-7 VmappedNeuralNetwork, 6.4e-7 TransformerLM-shaped);
-* the reduction is the one a real training run optimizes and is DECLARED per
-  family in `examples.loss_reduction`, not inferred from `ndim`;
-* `downstream_train` — this repo's definition of "a real training run" — calls
-  the same `scalar_loss_fn`, so the two cannot drift apart.
+* the REGISTERED TARGET IS MODEL + LOSS: `examples.get_fn(name)` returns a 0-d
+  scalar for every trainable family in the registry, so `jacve` of the traced
+  graph is a gradient with no flag involved. `--measure-grad` is a deprecated
+  no-op (it used to switch the target to the raw per-element example, i.e. a
+  per-class Jacobian); `--no-measure-grad`, which asked for that mode, is a
+  hard error in `tools/landscape_map`;
+* `graphax.jacve` of that graph equals `jax.grad` of the same loss, leaf by
+  leaf, at `max|jacve-grad|/max|grad| <= 1e-5` AND graph-wide
+  `||jacve-grad||/||grad|| <= 2e-6`, for all 18 trainable families (worst
+  per-leaf 8.8e-6 TransformerLM3; `Encoder` 1.7e-5 and `EncoderDecoder` 8.2e-5
+  carry a documented per-leaf relaxation because one of their leaves has a
+  near-zero gradient -- their graph-wide residuals are 3.2e-7 and 1.5e-7);
+* the reduction is the one a real training run optimizes and is written NEXT TO
+  THE MODEL in `examples.get_fn`, not inferred from `ndim` and not looked up in
+  a reduction table at wrap time. The seven analytic AD benchmarks (Simple,
+  Lighthouse, Helmholtz, RobotArm_6DOF, RoeFlux_1d/3d, BlackScholes_Jacobian)
+  have no training run and are EXEMPT by name (`has_scalar_loss`): their target
+  is the full multi-output Jacobian, which is what they exist to measure;
+* `downstream_train` — this repo's definition of "a real training run" —
+  optimizes the SAME registered target (it fetches it by name), so the two
+  cannot drift apart. `scalar_loss_fn` survives only as an assertion that its
+  argument is 0-d; it adds no equation.
 
 `tests/policy_regression_gate.py` is the broader tripwire: a seeded rollout
 through the real policy path, compared **bit-exactly** against a committed

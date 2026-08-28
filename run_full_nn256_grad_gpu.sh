@@ -153,7 +153,7 @@ rm -rf "$OUT"; mkdir -p "$OUT" "$CAMP/logs"
 uv run --no-sync $PPO --name full_nn256_grad_s${SEED} --variant full --seed $SEED \
   --example VmappedNeuralNetwork --dataset mnist \
   --rewards cmp mem acc --cmp-type latency --mem-type peak_memory \
-  --measure-grad --exec-on-gpu --measure-latency --latency-inner-reps 50 \
+  --exec-on-gpu --measure-latency --latency-inner-reps 50 \
   --lambda-cmp $LAMBDA_CMP --lambda-mem $LAMBDA_MEM --lambda-acc $LAMBDA_ACC --lambda-frob 0.0 \
   --lambda-cossim-guide $LAMBDA_COSSIM_GUIDE \
   --entropy-coef $ENTROPY_COEF --entropy-coef-final $ENTROPY_COEF_FINAL \

@@ -31,7 +31,7 @@ REPS = int(os.environ.get("ALPHAGRAD_MS_INNER_REPS", "50"))
 TASK = os.environ.get("ALPHAGRAD_MS_TASK", "VmappedNeuralNetwork")
 DSET = os.environ.get("ALPHAGRAD_MS_DATASET", "mnist")
 
-LOSS = scalar_loss_fn(get_fn(TASK), TASK)
+LOSS = get_fn(TASK)          # the registered target IS model + loss
 ARGN = infer_argnums(TASK)
 k0 = jax.random.PRNGKey(0); ak, ek = jax.random.split(k0)
 xs = get_args(TASK, ak, dataset=DSET)

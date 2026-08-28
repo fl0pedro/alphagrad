@@ -541,6 +541,8 @@ class PPORayWorker:
             and self.args.example.endswith("NeuralNetwork")
         )
         dataset_for_call = dataset_arg if use_dataset else None
+        from alphagrad.approx.common.examples import (
+            has_scalar_loss as _has_scalar_loss)
         target_fn = get_fn(self.args.example)
         xs = get_args(self.args.example, args_key, dataset=dataset_for_call)
         gen = data_gen(
@@ -548,8 +550,8 @@ class PPORayWorker:
             dataset=dataset_for_call,
             dataset_size=self.args.dataset_size,
         )
-        # GRAD MODE (--measure-grad): wrap into the scalar-loss (+ optional
-        # seed-vertex) graph and shift argnums, IDENTICALLY to the measure
+        # THE SCALAR-LOSS GRAPH (+ optional deprecated seed-vertex form)
+        # with the matching argnums, IDENTICALLY to the measure
         # actor (cpu_approx_worker._build_env_from_args). This makes the POLICY
         # env's jaxpr / valid_vertices / argnums match the graph the actor
         # actually differentiates, so the policy emits a COMPLETE elimination
@@ -577,7 +579,9 @@ class PPORayWorker:
             exec_on_gpu=getattr(self.args, "exec_on_gpu", False),
             measure_latency=measure_latency,
             terminal_rewards_only=self._terminal_rewards_only,
-            measure_grad=bool(getattr(self.args, "measure_grad", False)),
+            # Armed by a property of the EXAMPLE, not by a flag: the registered
+            # target is model + loss for every trainable family.
+            scalar_target=_has_scalar_loss(self.args.example),
             # PERF (bridge-cse): skip the exact reference Jacobian when neither
             # cosine_sim nor frob_residual is rewarded — derived from the SAME
             # weight vector the reward uses, so it can never diverge.

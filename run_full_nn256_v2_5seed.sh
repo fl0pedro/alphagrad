@@ -304,7 +304,7 @@ rm -rf "$OUT"; mkdir -p "$OUT" "$CAMP/logs"
 #   * --exec-on-gpu whenever EXEC_ON_GPU=1 (GPU measuring; independent of mode).
 #   * --seed-vertices: REMOVED (A4). It was grad-only -- a no-op without --measure-grad --
 #   * --rewards: 'all' when ALPHAGRAD_REWARD_ALL_CHANNELS=1, else cmp mem acc.
-MEASURE_GRAD_FLAG=$([ "$MEASURE_GRAD" = 1 ] && echo --measure-grad)
+MEASURE_GRAD_FLAG=$([ "$MEASURE_GRAD" = 1 ] && echo)
 EXEC_ON_GPU_FLAG=$([ "${EXEC_ON_GPU:-1}" = 1 ] && echo --exec-on-gpu)
 SEED_VERTICES_FLAG=          # A4: dropped -- seeds are NOT vertices
 REWARDS_FLAG=$([ "${ALPHAGRAD_REWARD_ALL_CHANNELS:-0}" = 1 ] && echo all || echo "cmp mem acc")

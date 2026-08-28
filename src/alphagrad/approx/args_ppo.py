@@ -185,13 +185,13 @@ def add_ppo_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--measure-grad", action="store_true",
-        help="Select the LOSS-DROP quality channel (an Adam walk on the "
-        "measured gradient) instead of the gradient cosine. It no longer "
-        "decides WHAT is measured: the traced target is now ALWAYS the scalar "
-        "training loss (common.examples.scalar_loss_fn), so jacve of it is "
-        "the gradient that hits the optimizer with or without this flag. It "
-        "used to be the switch between that and a full per-class JACOBIAN. "
-        "Still required alongside the deprecated --seed-vertices.",
+        help="DEPRECATED NO-OP, accepted so archived launchers and replay "
+        "scripts still run. Every registered target IS model + loss "
+        "(common.examples.get_fn), so the traced graph is the scalar-loss "
+        "graph and jacve of it is the gradient that hits the optimizer, flag "
+        "or no flag. Its last job was selecting the LOSS-DROP quality "
+        "channel; that is now the default for any scalar-loss target, with "
+        "--quality-metric as the explicit control.",
     )
     p.add_argument(
         "--quant-once", action="store_true",
@@ -201,7 +201,7 @@ def add_ppo_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--seed-vertices", action="store_true",
-        help="DEPRECATED (workstream A4): seeds are NOT vertices. No launcher passes this any more, and passing it WITHOUT --measure-grad is now an ERROR instead of the silent no-op it used to be. Kept accepted only so the forensics/landscape replay can rebuild an archived run's graph. What it did: grad-mode only, treat the tangent + adjoint SEEDS as their own graph "
+        help="DEPRECATED (workstream A4): seeds are NOT vertices. No launcher passes this any more; kept accepted only so the forensics/landscape replay can rebuild an archived run's graph, and it prints a warning. It no longer requires --measure-grad (itself a no-op now). What it does: treat the tangent + adjoint SEEDS as their own graph "
         "vertices (graphax.seed_vertices). The scalar loss becomes "
         "<ones/N, fn(p + t*dir)> with the tangent seed t appended as the LAST arg "
         "and the adjoint contraction explicit, so the elimination order chooses "

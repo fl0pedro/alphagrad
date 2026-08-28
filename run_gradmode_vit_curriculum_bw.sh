@@ -116,7 +116,7 @@ rm -rf "$OUT"; mkdir -p "$OUT" "$CAMP/logs"
 uv run --no-sync $PPO --name $NAME --variant ${VARIANT:-full} --seed $SEED \
   --example ${EXAMPLE:-VmappedViT} --dataset mnist \
   --rewards cmp mem acc --cmp-type latency --mem-type peak_memory \
-  --measure-grad --exec-on-gpu --measure-latency --latency-inner-reps $LATENCY_INNER_REPS \
+  --exec-on-gpu --measure-latency --latency-inner-reps $LATENCY_INNER_REPS \
   --entropy-coef $ENTROPY_COEF --entropy-coef-final $ENTROPY_COEF_FINAL \
   --dynamic-substeps --max-substeps ${MAX_SUBSTEPS} \
   --actor-num-gpus 1 --cpu-actor-num-gpus 1 --num-cpu-workers $NUM_CPU_WORKERS \

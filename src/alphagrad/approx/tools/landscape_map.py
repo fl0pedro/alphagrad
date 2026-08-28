@@ -26,7 +26,9 @@ is measured against itself the same way, so the identity ratio distribution
 IS the drift floor that every other ratio must be read against.
 
 WHAT IT MEASURES ON. The SAME env / target / measurement path the trainer
-uses: `alphagrad.approx.env._callback` with `--measure-grad` (and NOT
+uses: `alphagrad.approx.env._callback` on the registered scalar-loss target
+(model + loss -- jacve of it IS the gradient; `--measure-grad` is a
+deprecated no-op) and NOT
 `--seed-vertices` -- workstream A4 removed it from all 64 launchers because
 seeds are NOT vertices; leaving it on here built a 2-vertex-larger graph
 than the runs whose landscape this is supposed to be),
@@ -86,6 +88,23 @@ import time
 import traceback
 
 
+class _NoMeasureGradIsGone(argparse.Action):
+    """``--no-measure-grad`` asked for the raw per-class Jacobian target.
+
+    That mode no longer exists: every registered target IS model + loss, so
+    the traced graph is the scalar-loss graph and jacve of it is the gradient.
+    Accepting the switch and ignoring it would hand back a landscape measured
+    on a different object than the one asked for, so it is an error.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(
+            "--no-measure-grad is no longer supported: the per-class-Jacobian "
+            "target it selected does not exist any more. Every registered "
+            "target is model + loss (common.examples.get_fn), so jacve of the "
+            "traced graph is the gradient. Drop the flag.")
+
+
 # ---------------------------------------------------------------------------
 # CLI -- parsed BEFORE any heavy import, because several env-var knobs the
 # env module reads are IMPORT-TIME constants (_MEASURE_ACTOR, MAX_FACES,
@@ -107,9 +126,17 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--num-heads", type=int, default=4)
     p.add_argument("--seed", type=int, default=250197)
     # measurement path (defaults = the campaign configuration)
-    p.add_argument("--measure-grad", action="store_true", default=True)
-    p.add_argument("--no-measure-grad", dest="measure_grad",
-                   action="store_false")
+    # DEPRECATED NO-OP, accepted so an archived command line still runs.
+    # The traced target is unconditionally the registered scalar training loss
+    # (common.examples.get_fn = model + loss), so the flag selects nothing.
+    p.add_argument("--measure-grad", action="store_true", default=True,
+                   help="DEPRECATED NO-OP (see common.examples."
+                        "warn_measure_grad_deprecated).")
+    # ITS NEGATION IS A HARD ERROR. --no-measure-grad asked for the raw
+    # per-class JACOBIAN target; that mode is gone, and silently ignoring a
+    # request for it is how a run reports a Jacobian as a gradient.
+    p.add_argument("--no-measure-grad", dest="measure_grad", nargs=0,
+                   action=_NoMeasureGradIsGone)
     # A4: DEFAULT OFF. `seed_loss_fn` appends a tangent-seed `add` and an
     # adjoint `reduce_sum` as ORDINARY ELIMINABLE VERTICES (nn256: 13 ->
     # 15) and enlarges `derived_max_faces`, so a landscape measured with it
@@ -123,7 +150,7 @@ def make_argparser() -> argparse.ArgumentParser:
                    help="DEPRECATED (A4). Only for replaying an archived "
                         "run that was launched with it; it adds 2 "
                         "eliminable vertices the campaign graph does not "
-                        "have. Requires --measure-grad.")
+                        "have.")
     p.add_argument("--no-seed-vertices", dest="seed_vertices",
                    action="store_false")
     p.add_argument("--exec-on-gpu", action="store_true")
@@ -269,7 +296,8 @@ from alphagrad.approx.env import (                            # noqa: E402
     QUANT_SENTINEL,
     consume_per_face_stats,
 )
-from alphagrad.approx.common.examples import (                # noqa: E402
+from alphagrad.approx.common.examples import (
+    has_scalar_loss as _has_scalar_loss,                # noqa: E402
     get_fn, get_args, data_gen, infer_argnums, grad_target_setup,
 )
 from alphagrad.approx.common.eval_samples import (            # noqa: E402
@@ -342,12 +370,11 @@ def build_env(args):
         # that does not fit ONE face's operand would otherwise hit graphax's
         # strict TRANSFORM-DID-NOT-FIT guard and kill the measurement).
         per_face=True,
-        measure_grad=bool(args.measure_grad),
-        # The target came from common.examples.grad_target_setup, which now
-        # wraps it in the SCALAR TRAINING LOSS unconditionally -- so the
-        # scalar-output contract always holds here and is always checked.
-        # (--measure-grad no longer decides that; it picks the quality channel.)
-        scalar_target=True,
+        # THE SCALAR-OUTPUT CONTRACT, armed by a property of the EXAMPLE, not
+        # by a flag: the registered target is model + loss for every trainable
+        # family, and the analytic AD benchmarks (no training loss) are
+        # measured as full Jacobians on purpose.
+        scalar_target=_has_scalar_loss(args.example),
         # NOT terminal_rewards_only: we always call at stop == len(order), so
         # every call is terminal anyway, and leaving it off removes one
         # config difference that could silently zero a channel.
@@ -853,7 +880,7 @@ def write_markdown(path, summ, notes, args, extra):
              f"(hidden {args.hidden_dim}, layers {args.num_layers}, "
              f"vocab {args.vocab_size})")
     L.append(f"- measurement: the trainer's own `env._callback` "
-             f"(measure_grad={args.measure_grad}, "
+             f"(scalar-loss target, "
              f"seed_vertices={args.seed_vertices}, "
              f"quality={args.quality_metric}, walk {args.walk_steps} steps)")
     L.append(f"- {args.reps} INDEPENDENT paired trials per plan; every "

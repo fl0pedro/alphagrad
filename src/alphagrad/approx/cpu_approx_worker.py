@@ -732,7 +732,8 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
     # the trainer exactly, or grad-mode runs would silently measure the Jacobian.
     # Shared helper (same as ppo_ray_worker) builds the IDENTICAL graph; honors
     # --seed-vertices (tangent+adjoint seed vertices + appended seed arg t).
-    measure_grad = bool(getattr(args, "measure_grad", False))
+    from alphagrad.approx.common.examples import has_scalar_loss
+    scalar_target = has_scalar_loss(args.example)
     from alphagrad.approx.common import grad_target_setup
     target_fn, xs, argnums = grad_target_setup(args, target_fn, xs, args.example)
     closed_jaxpr = _traced_inlined(target_fn, xs)
@@ -793,12 +794,10 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         latency_inner_reps=int(getattr(args, "latency_inner_reps", 1)),
         latency_warmup=int(getattr(args, "latency_warmup", 0)),
         latency_winsor=float(getattr(args, "latency_winsor", 0.0)),
-        measure_grad=measure_grad,
-        # The target came from common.examples.grad_target_setup, which now
-        # wraps it in the SCALAR TRAINING LOSS unconditionally -- so the
-        # scalar-output contract always holds here and is always checked.
-        # (--measure-grad no longer decides that; it picks the quality channel.)
-        scalar_target=True,
+        # THE SCALAR-OUTPUT CONTRACT, armed by a property of the EXAMPLE:
+        # True for every trainable family (registered target = model + loss),
+        # False for the analytic AD benchmarks, which have no training loss.
+        scalar_target=scalar_target,
         # PER-FACE application (2026-08-05). The trainer builds its env with
         # ``per_face=bool(args.per_face or args.face_actions)`` (ppo.py:3841)
         # but this builder — which constructs the env that performs the actual
