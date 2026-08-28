@@ -109,9 +109,11 @@ from alphagrad.approx.env import (
 )
 from alphagrad.approx.common import carry_stream as _carry_stream
 from alphagrad.approx.common.face_driver import (
+    bind_sizes_callback,
     bind_step_callbacks,
     build_live_face_stream,
     make_face_callbacks,
+    make_face_sizes_callback,
 )
 from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
 from alphagrad.approx.heads import (
@@ -2502,6 +2504,7 @@ class Agent(eqx.Module):
         oracle_fn=None,           # perf: called with the SAMPLED vertex, returns that vertex's masks only
         face_chunk_fn=None,       # (f, vertex_specs, rows, skips) -> that face's token chunk
         face_count_fn=None,       # vertex -> ACTUAL face count (while_loop trip count)
+        face_sizes_fn=None,       # --per-face-masks on --live-faces: vertex -> ((F,N) live dim sizes, (F,) QUANT legality)
         enc_carry=None,           # step carry the per-face SIDE carry branches from
         endpoint_rows=None,       # (V+1, E) read(base+dyn) rows (--face-endpoint-read)
         edge_rows=None,           # (K, E) edge-memory read rows (--face-edge-mem)
@@ -2687,6 +2690,23 @@ class Agent(eqx.Module):
                 f_comp = jnp.broadcast_to(_av, (_F,) + _av.shape)
                 _n_faces = face_count_fn(vertex_idx)
                 f_valid = (jnp.arange(_F) < _n_faces).astype(jnp.float32)
+                # --per-face-masks, SIZES half (workstream A1b). The
+                # masks above are static BY DESIGN on this path (per-face
+                # legality is enforced at APPLICATION), but the head's
+                # `pair_ok` gate and its hardcoded
+                # `factor = gcd(N_i, N_j)` are computed from the axis
+                # SIZES it is handed -- and those were the vertex's
+                # NOMINAL out_shape ++ first-invar shape, the same vector
+                # for every face. `face_sizes_fn` replaces them with the
+                # face's own live `out_dims ++ primal_dims` logical
+                # sizes, read off THIS stream's elimination
+                # (`LiveFaceStream.face_dim_sizes`) rather than off the
+                # oracle, which --live-faces does not run. Same arrays
+                # the oracle path supplies, so everything downstream --
+                # `_face_loop`, the stored trajectory leaf, `_face_replay`
+                # -- is untouched.
+                if face_sizes_fn is not None:
+                    f_sizes, f_quant = face_sizes_fn(vertex_idx)
             face_key = jrand.fold_in(micro_key, 7)
             if face_chunk_fn is None:
                 if getattr(self.face_path_policy, "endpoint_read", False):
@@ -6595,6 +6615,7 @@ def main():
     # prefix, so the cost is n_faces eliminations per env step.
     _LIVE_FACES = None
     _live_face = _live_face_count = None
+    _live_face_sizes = None
     _EDGE_TABLE = None
     if getattr(args, "live_faces", False):
         _LIVE_FACES = build_live_face_stream(
@@ -6630,6 +6651,12 @@ def main():
         _live_face, _live_face_count = make_face_callbacks(
             _LIVE_FACES, window=MAX_DELTA_TOKENS, prof_sink=_env_prof_add,
             edge_table=_EDGE_TABLE, emit_head=_FACE_HEADS)
+        # --per-face-masks SIZES half (A1b): built unconditionally (it is
+        # one closure) but only CALLED under `_PFM_SIZES` below, so the
+        # flag-off trace has no extra callback and no extra host work.
+        _live_face_sizes = make_face_sizes_callback(
+            _LIVE_FACES, max_faces=_F_FACES,
+            max_axes=MAX_AXES_PER_VERTEX, prof_sink=_env_prof_add)
 
     # Live elimination chains: one per concurrent env, plus the previous
     # episode's, which the LRU only sheds once the new ones exist. Sized like
@@ -6665,23 +6692,34 @@ def main():
     #   skipped_raised 4->0).
     #
     #   SIZES half -- handing the head each face's LIVE dim sizes and QUANT
-    #   bit. These come from `LiveVertexMaskOracle`, and --live-faces turns
-    #   the oracle OFF (`_NO_ORACLE` above; the probes were ~48% of host time
-    #   and the live stream is supposed to supersede them). With no oracle
-    #   there are no per-face sizes to hand over, and the sampling masks are
-    #   the STATIC axis-validity broadcast -- so this half is simply not
-    #   available there, and pretending otherwise stores whatever array
-    #   happens to be in the tuple slot.
+    #   bit, so its `pair_ok` gate and its hardcoded `factor = gcd(N_i, N_j)`
+    #   are computed on the operand the rule will actually hit instead of on
+    #   the vertex's nominal `out_shape ++ first-invar shape`.
     #
-    # So it is gated on the oracle actually running. NOT silently: a flag that
-    # half-applies without saying so is how a measurement gets attributed to
-    # the wrong change.
-    _PFM_SIZES = bool(_PFM and not _NO_ORACLE)
+    #   A1 could only source those from `LiveVertexMaskOracle`, and
+    #   --live-faces turns the oracle OFF (`_NO_ORACLE` above; the probes were
+    #   ~48% of host time and the live stream is meant to supersede them) --
+    #   so on the CAMPAIGN path (every v57-v66 run, R1-R3) this half was
+    #   inert. A1b removes that gap: the sizes do not need the oracle, they
+    #   need an elimination, and `--live-faces` already runs one per face.
+    #   `LiveFaceStream.face_dim_sizes` reads them off the stream's own
+    #   prefix tokenizer (two extra eliminations per (prefix, vertex),
+    #   memoized across the whole face loop) and returns exactly what
+    #   `face_masks_and_sizes(per_face=True)` returns, keyed by FACE KEY so a
+    #   dropped face cannot shift the row the head reads.
+    #
+    # Still NOT silent: the source is named in the line below, because a flag
+    # that half-applies without saying so is how a measurement gets
+    # attributed to the wrong change.
+    _PFM_LIVE_SIZES = bool(_PFM and _NO_ORACLE and _live_face_sizes is not None
+                           and not getattr(args, "no_approx_head", False))
+    _PFM_SIZES = bool(_PFM and (not _NO_ORACLE or _PFM_LIVE_SIZES))
     if _PFM:
         print("[cfg] --per-face-masks: apply-time projection ON; "
               "per-face SIZES + QUANT mask "
-              + ("ON (live oracle)" if _PFM_SIZES else
-                 "OFF -- the live-faces path runs no oracle, so there are "
+              + ("ON (live-face stream)" if _PFM_LIVE_SIZES else
+                 "ON (live oracle)" if _PFM_SIZES else
+                 "OFF -- no oracle and no live-face stream, so there are "
                  "no per-face sizes to hand the head. Only the apply-time "
                  "half is active."), flush=True)
 
@@ -7254,6 +7292,7 @@ def main():
 
             face_chunk_fn = None
             face_count_fn = None
+            face_sizes_fn = None
             if _LIVE_FACES is not None:
                 # The FULL per-face history rides along: `_rows`/`_skips` are
                 # the CURRENT vertex's in-flight decisions (the face loop's
@@ -7265,6 +7304,17 @@ def main():
                     state.order, state.sparsity_specs, state.step_count,
                     state.face_specs, state.face_skips,
                 )
+                if _PFM_LIVE_SIZES:
+                    # Same prefix, same history arrays: the sizes are
+                    # read off the SAME tokenizer state the chunks are,
+                    # or the head would condition on one graph and read
+                    # the tokens of another.
+                    face_sizes_fn = bind_sizes_callback(
+                        _live_face_sizes,
+                        state.order, state.sparsity_specs,
+                        state.step_count,
+                        state.face_specs, state.face_skips,
+                    )
 
             if args.dynamic_substeps:
                 # Live per-vertex DIAG/COMPRESS masks for the current graph
@@ -7335,6 +7385,7 @@ def main():
                     oracle_fn=oracle_one_fn,
                     face_chunk_fn=face_chunk_fn,
                     face_count_fn=face_count_fn,
+                    face_sizes_fn=face_sizes_fn,
                     enc_carry=enc_carry2,
                     endpoint_rows=_ep_rows,
                     edge_rows=_em_rows,

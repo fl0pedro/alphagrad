@@ -361,6 +361,94 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
     return _live_face, _live_face_count
 
 
+def make_face_sizes_callback(live_faces, *, max_faces, max_axes,
+                             prof_sink=None):
+    """``sizes_cb(order, spec_hist, step_count, vertex_idx, face_hist,
+    skip_hist)`` -> ``((F, N) int32 live per-face dim sizes, (F,) float32
+    per-face QUANT legality)``.
+
+    THE SIZES HALF OF ``--per-face-masks`` ON THE ``--live-faces`` PATH.
+    A1 wired the head's per-face ``AxisTokenFeatures.size`` to
+    ``LiveVertexMaskOracle.face_dim_sizes``, and ``--live-faces`` runs no
+    oracle (``ppo._NO_ORACLE``) -- so on the campaign path that half was
+    inert and the head kept masking with the STATIC per-VERTEX axis vector.
+    :meth:`LiveFaceStream.face_dim_sizes` produces the same quantity from the
+    stream's own elimination, and this is its device-side wire.
+
+    Shaped and batched exactly like ``count_cb``: ONE host dispatch per
+    VERTEX step for every env (``vmap_method="broadcast_all"``), not one per
+    face -- the underlying probe is memoized per (prefix, vertex), so the
+    whole face loop is served by two extra eliminations.
+
+    The arrays must ride out of the rollout and be STORED, because they enter
+    the masks: the loss re-scores the stored action against them, and a
+    replay that recomputes (or drops) them is not the behaviour policy's
+    distribution -- the PPO ratio would leave 1 at epoch 0 with no error
+    anywhere. ``ppo.sample_action_dynamic`` returns them in ``face_out`` for
+    exactly that reason.
+    """
+    F, N = int(max_faces), int(max_axes)
+    _perf = None
+    if prof_sink is not None:
+        import time as _time
+        _perf = _time.perf_counter
+
+    def _sizes_host(order, spec_hist, step_count, vertex_idx,
+                    face_hist, skip_hist):
+        _t0 = _perf() if _perf is not None else None
+        try:
+            _order = np.asarray(order)
+            if _order.ndim == 1:
+                sz, qt, _n = live_faces.face_dim_sizes(
+                    order, spec_hist, int(np.asarray(step_count)),
+                    int(np.asarray(vertex_idx)) + 1, face_hist, skip_hist)
+                return (np.asarray(sz, np.int32)[:F, :N],
+                        np.asarray(qt, np.float32)[:F])
+            B = _order.shape[0]
+            szs = np.zeros((B, F, N), np.int32)
+            qts = np.zeros((B, F), np.float32)
+            _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
+            _vi = np.asarray(vertex_idx)
+            _fh, _kh = np.asarray(face_hist), np.asarray(skip_hist)
+            for i in range(B):
+                sz, qt, _n = live_faces.face_dim_sizes(
+                    _order[i], _sh[i], int(_sc[i]), int(_vi[i]) + 1,
+                    _fh[i], _kh[i])
+                szs[i] = np.asarray(sz, np.int32)[:F, :N]
+                qts[i] = np.asarray(qt, np.float32)[:F]
+            return szs, qts
+        finally:
+            if _perf is not None:
+                prof_sink("faces.live_sizes", _perf() - _t0)
+
+    def _sizes_cb(order, spec_hist, step_count, vertex_idx,
+                  face_hist, skip_hist):
+        return jax.pure_callback(
+            _sizes_host,
+            (jax.ShapeDtypeStruct((F, N), jnp.int32),
+             jax.ShapeDtypeStruct((F,), jnp.float32)),
+            order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
+            vmap_method="broadcast_all")
+
+    return _sizes_cb
+
+
+def bind_sizes_callback(sizes_cb, order, spec_hist, step_count,
+                        face_hist, skip_hist):
+    """Bind this step's prefix to ``face_sizes_fn(vertex_idx)``.
+
+    The sibling of :func:`bind_step_callbacks`, kept separate so the
+    historical ``(chunk, count)`` pair -- and every caller that unpacks it --
+    is untouched when ``--per-face-masks`` is off.
+    """
+
+    def face_sizes_fn(_v, _o=order, _s=spec_hist, _k=step_count,
+                      _fh=face_hist, _kh=skip_hist):
+        return sizes_cb(_o, _s, _k, _v, _fh, _kh)
+
+    return face_sizes_fn
+
+
 def bind_step_callbacks(chunk_cb, count_cb, order, spec_hist, step_count,
                         face_hist, skip_hist):
     """Bind this step's prefix to ``(face_chunk_fn, face_count_fn)``.

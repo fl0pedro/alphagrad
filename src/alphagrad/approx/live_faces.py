@@ -207,7 +207,16 @@ class LiveFaceStream:
                       "face_key_seg_mismatch": 0,
                       "face_dropped": 0,
                       "face_seg_not_tiled": 0,
-                      "face_header_mismatch": 0}
+                      "face_header_mismatch": 0,
+                      # --per-face-masks SIZES half (`face_dim_sizes`).
+                      # `size_probe` counts the extra eliminations it
+                      # runs (2 per (prefix, vertex), cached across the
+                      # whole face loop); `size_miss` counts ENUMERATED
+                      # faces the probe never visited, which come back as
+                      # a zero size vector (= no approximation offered).
+                      "size_probe": 0, "size_hit": 0,
+                      "size_probe_fail": 0, "size_miss": 0}
+        self._sizes: dict = {}        # (prefix, vertex) -> (sizes, quant, n)
 
     # -- prefix ------------------------------------------------------------
     @staticmethod
@@ -751,6 +760,221 @@ class LiveFaceStream:
                 f"vertex {vertex}: {k} faces exceed the derived bound "
                 f"{self.max_faces}")
         return int(k)
+
+    # -- per-face LIVE dim sizes (--per-face-masks, SIZES half) -------------
+    # THE SIZES HALF ON THE CAMPAIGN PATH. `--per-face-masks` has two halves
+    # (see `common/masks.py`, "Two independent halves"): the apply-time
+    # projection, which runs everywhere, and the SIZES the head reads, which
+    # A1 could only source from `LiveVertexMaskOracle.face_dim_sizes` -- and
+    # `--live-faces` runs no oracle (`ppo._NO_ORACLE`), so on every v57-v66
+    # run and R1-R3 the head masked with the STATIC per-VERTEX axis vector.
+    #
+    # It does not need the oracle. This stream already re-runs the real
+    # elimination of the current vertex once per face; the SAME machinery
+    # (`_Snapshot` + `graphax.core._eliminate_vertex`) yields the live
+    # per-face operand directly, on the prefix tokenizer that is already
+    # built and cached. Cost: TWO extra eliminations per (prefix, vertex) --
+    # not per face -- memoized in `self._sizes`, against the `n_faces`
+    # eliminations `chunk_ex` already pays for the same vertex.
+    #
+    # DELIBERATELY IDENTICAL IN FORM to the oracle's
+    # `face_masks_and_sizes(per_face=True)`, so the two are comparable (and
+    # `tests/per_face_sizes_live_test.py` asserts they agree face for face):
+    #
+    #   * both dispatch modes are probed (`approx_active` True and False --
+    #     `probe_faces`' `_DISPATCH_MODES`), because the measurement path
+    #     exercises both and an action must be legal on both;
+    #   * the SIZES come from the approx=True graph (the one
+    #     `vertex_elimination_jaxpr` builds), falling back to the other mode
+    #     only if that probe produced nothing;
+    #   * `quant[k]` is 1 iff some dtype the 94-slot head can emit is a
+    #     legal, NON-idempotent cast on EVERY mode's operand;
+    #   * a per-vertex transform (an identity callable) is installed for the
+    #     probe, exactly as `probe_faces` does, because that is what arms
+    #     graphax's `_is_approx_cfg` -- the code path the real run takes.
+    #
+    # ONE DELIBERATE DIFFERENCE, and it is a fix. The oracle indexes its
+    # faces by PROBE VISIT ORDER; the face index `f` the policy and
+    # `chunk_ex` use is a position in `faces_of` -- the ENUMERATION, of which
+    # the visited faces are a subsequence (a face whose edge Jacobian forces
+    # to None is enumerated and never visited). Indexing sizes positionally
+    # would hand face `f` a later face's dims whenever anything is dropped.
+    # So the probe is keyed BY FACE KEY: the recording hook rides in
+    # `face_transforms`, which graphax looks up by exactly the
+    # `(vidx[in_edge], vidx[out_edge])` pair `faces_of` returns. A callable
+    # there is not a `Diag`/`Compress`/`SKIP_FACE`, so it does NOT arm
+    # `_is_approx_cfg` (core.py's `if face_transforms:` test) -- the arming
+    # still comes from the per-vertex identity, as in the oracle.
+    #
+    # An enumerated-but-unvisited face gets an ALL-ZERO size row. That reads
+    # back through `UnifiedFacePolicy._face_feats_1` as an all-invalid axis
+    # set (`valid = sz > 0`), i.e. no legal pair and no legal compress axis,
+    # so no approximation is offered on a face the elimination never
+    # contracts. That is the correct answer, and it is counted (`size_miss`)
+    # rather than being silently indistinguishable from a real zero.
+    _SIZE_DISPATCH_MODES = (True, False)
+
+    @staticmethod
+    def _size_probe_identity(st):
+        """The per-vertex transform the size probe installs.
+
+        Identity in value, NOT in effect: ``graphax.core._eliminate_vertex``
+        sets ``_is_approx_cfg`` from ``any(isinstance(t, (Diag, Compress)) or
+        callable(t) for t in transforms)``, so installing a callable is what
+        puts the probe on the same code path the approximated run takes.
+        ``LiveVertexMaskOracle.probe_faces`` does exactly this.
+        """
+        return st
+
+    def _probe_faces(self, tk, vertex, keys, approx):
+        """``{face key: live SparseTensor}`` for one dispatch mode.
+
+        Runs INSIDE a :class:`_Snapshot`, so the speculative elimination is
+        undone in full -- graph, transpose graph, ``vo``, traced equations,
+        face records, transform log, variable names and the name generator.
+        Nothing it touches survives, which is what lets it run against the
+        live prefix tokenizer instead of a private rebuild of it.
+        """
+        from jax._src import core as _jcore
+        from graphax.core import _eliminate_vertex
+        from graphax.sparse.elemental.dispatch import (
+            approx_active, set_approx_active,
+        )
+
+        seen: dict = {}
+
+        def _mk(k):
+            def _rec(st):
+                # setdefault: in the rare multi-outvar case two faces can
+                # collide on one key (faces_of's own note) and the FIRST is
+                # the one `chunk_ex` maps `f` to.
+                seen.setdefault(k, st)
+                return st
+            return _rec
+
+        ft = {k: (None, None, _mk(k)) for k in keys}
+        prev = approx_active()
+        set_approx_active(bool(approx))
+        try:
+            with _Snapshot(tk) as snap:
+                ij = snap.ij
+                try:
+                    self.stats["size_probe"] += 1
+                    with _jcore.set_current_trace(ij.trace):
+                        _eliminate_vertex(
+                            int(vertex), ij.jaxpr, ij.graph, ij.tgraph, ij.vo,
+                            False, transforms=(self._size_probe_identity,),
+                            face_transforms=ft,
+                        )
+                except Exception:
+                    # A vertex graphax cannot trace has no legal
+                    # approximation either: keep the faces seen so far (the
+                    # rest stay zero, i.e. nothing offered) and never let a
+                    # probe take the rollout down. Same contract as
+                    # `probe_faces`.
+                    self.stats["size_probe_fail"] += 1
+        finally:
+            set_approx_active(prev)
+        return seen
+
+    def face_dim_sizes(self, order, specs, n, vertex,
+                       face_rows_hist=None, face_skips_hist=None):
+        """``(sizes (F, N) int32, quant (F,) float32, n_faces)``.
+
+        ``sizes[k]`` is face ``k``'s LIVE ``logical_size`` vector over
+        ``out_dims ++ primal_dims`` -- ``masks.dim_logical_sizes``, i.e. THE
+        NUMBERING ``Diag(i, j)``, ``diag_valid_mask``,
+        ``diag_pair_factor_space`` and ``rule_is_legal`` are indexed in, which
+        is the numbering the decision is actually made in at apply time.
+
+        NOT ``val.shape``. The physical axes of the sparse tensor are a
+        different (shorter, order-dependent) list -- a coupled pair stores two
+        logical dims in one physical axis -- so handing those to the head
+        would align with nothing it emits. ``face_features`` keeps
+        ``val.shape``; this deliberately does not.
+
+        ``quant[k]`` is 1.0 iff at least one of ``FACE_QUANT_DTYPES`` (the two
+        dtypes the 94-slot head's Bernoulli can actually request) is a legal
+        and non-idempotent cast on face ``k``'s operand under BOTH dispatch
+        modes.
+
+        Rows ``>= n_faces``, and any enumerated face the elimination did not
+        visit, are zero -- which the head reads as "no valid axis", hence no
+        legal DIAG pair and no legal COMPRESS axis on that face.
+
+        NO VERTEX RULES ARE APPLIED. The probe carries the per-vertex identity
+        only, exactly as the oracle's does: under ``--live-faces`` the
+        per-vertex wire rows are always the exact END rows (approximation is
+        purely per-face), so there is nothing to apply, and keeping it that
+        way makes this bit-comparable with `face_masks_and_sizes`.
+        """
+        from alphagrad.approx.common.masks import (
+            FACE_QUANT_DTYPES, dim_logical_sizes, quant_valid_mask)
+
+        F, N = self.max_faces, self.max_axes
+        order = np.asarray(order).reshape(-1)
+        specs = np.asarray(specs)
+        n, vertex = int(n), int(vertex)
+        frh, fsh = self._hist(face_rows_hist, face_skips_hist)
+        # The sizes depend on the PREFIX and the vertex only -- not on the
+        # in-flight per-face decisions of this vertex. Faces of one vertex
+        # write disjoint (in_edge, out_edge) edges and read only edges
+        # incident to the central vertex, so approximating face f-1 cannot
+        # move face f's operand. That is what makes one probe serve the whole
+        # face loop instead of one per face.
+        ck = (order[:n].tobytes(), specs[:n].tobytes(), vertex,
+              b"" if frh is None else frh[:n].tobytes(),
+              b"" if fsh is None else fsh[:n].tobytes())
+        hit = self._sizes.get(ck)
+        if hit is not None:
+            self.stats["size_hit"] += 1
+            return hit
+
+        sizes = np.zeros((F, N), np.int32)
+        quant = np.zeros((F,), np.float32)
+        try:
+            tk = self._tokenizer_at(order, specs, n, frh, fsh)
+            keys = list(tk.ij.faces(vertex))
+        except Exception:
+            self.stats["failures"] += 1
+            return sizes, quant, np.int32(0)
+
+        per_mode = [self._probe_faces(tk, vertex, keys, m)
+                    for m in self._SIZE_DISPATCH_MODES]
+        # Index space = the ENUMERATION, because that is what `f` means in
+        # `_face_loop` / `chunk_ex` / `n_faces`.
+        n_faces = min(len(keys), F)
+        src = per_mode[0] or (per_mode[1] if len(per_mode) > 1 else {})
+        for k in range(n_faces):
+            kk = keys[k]
+            st = src.get(kk)
+            if st is None:
+                self.stats["size_miss"] += 1
+                continue
+            try:
+                sizes[k] = dim_logical_sizes(st, N)
+            except Exception:
+                self.stats["size_miss"] += 1
+                continue
+            qm = np.ones((len(FACE_QUANT_DTYPES),), dtype=bool)
+            seen_any = False
+            for mode in per_mode:
+                stm = mode.get(kk)
+                if stm is None:
+                    continue
+                try:
+                    qm &= quant_valid_mask(stm, FACE_QUANT_DTYPES)
+                except Exception:
+                    qm[:] = False
+                seen_any = True
+            quant[k] = 1.0 if (seen_any and bool(qm.any())) else 0.0
+
+        res = (sizes, quant, np.int32(n_faces))
+        if len(self._sizes) >= 4096:
+            for dk in list(self._sizes)[:1024]:
+                self._sizes.pop(dk, None)
+        self._sizes[ck] = res
+        return res
 
     def consume_stats(self) -> dict:
         out = dict(self.stats)
