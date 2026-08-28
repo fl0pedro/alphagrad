@@ -4287,7 +4287,14 @@ def make_argparser() -> argparse.ArgumentParser:
              "silently. Every projection is re-verified with rule_is_legal "
              "before it is applied, so skipped_raised cannot rise. NO head "
              "shape change: the 94-slot layout is untouched. Default off = "
-             "bit-identical to before, no extra stored array, same trace.")
+             "bit-identical to before, no extra stored array, same trace. "
+             "TWO HALVES, AND --live-faces GETS ONLY ONE: (1) is fed by "
+             "LiveVertexMaskOracle, which --live-faces turns off, so the "
+             "SIZES half is inactive there and the run says so on stdout; "
+             "(2) and (3) are apply-time and are active on every path -- and "
+             "they are the half with the measured payoff (TLM3 yield: diag "
+             "0.765->1.000, compress 0.627->0.874, quant 0.465->1.000, "
+             "skipped_raised 4->0).")
     p.add_argument(
         "--no-per-face-repair-axis", action="store_true",
         help="With --per-face-masks, drop an out-of-range COMPRESS axis "
@@ -6073,18 +6080,18 @@ def main():
         for v in range(1, V + 1):
             try:
                 fp, fc, fs, fq, nf = o.face_masks_and_sizes(v, F,
-                                                            per_face=_PFM)
+                                                            per_face=_PFM_SIZES)
             except Exception:
                 continue
             fpair[v] = np.asarray(fp, np.float32)
             fcomp[v] = np.asarray(fc, np.float32)
             fvalid[v, : int(nf)] = 1.0
-            if _PFM:
+            if _PFM_SIZES:
                 fsizes[v] = np.asarray(fs, np.int32)
                 fquant[v] = np.asarray(fq, np.float32)
         out = (np.asarray(pair, np.float32), np.asarray(comp, np.float32),
                fpair, fcomp, fvalid)
-        return out + ((fsizes, fquant) if _PFM else ())
+        return out + ((fsizes, fquant) if _PFM_SIZES else ())
 
     def _oracle_face_masks(order, spec_hist, step_count):
         V, F, N = _oracle_total_v, _F_FACES, _oracle_N
@@ -6093,7 +6100,7 @@ def main():
                    jax.ShapeDtypeStruct((V + 1, F, N, N), jnp.float32),
                    jax.ShapeDtypeStruct((V + 1, F, N), jnp.float32),
                    jax.ShapeDtypeStruct((V + 1, F), jnp.float32))
-        if _PFM:
+        if _PFM_SIZES:
             _shapes = _shapes + (
                 jax.ShapeDtypeStruct((V + 1, F, N), jnp.int32),
                 jax.ShapeDtypeStruct((V + 1, F), jnp.float32))
@@ -6168,11 +6175,11 @@ def main():
             fq_arr = np.zeros((F,), np.float32)
             try:
                 fp, fc, fs, fq, nf = o.face_masks_and_sizes(v, F,
-                                                            per_face=_PFM)
+                                                            per_face=_PFM_SIZES)
                 fp_arr[:] = np.asarray(fp, np.float32)
                 fc_arr[:] = np.asarray(fc, np.float32)
                 fv_arr[: int(nf)] = 1.0
-                if _PFM:
+                if _PFM_SIZES:
                     fs_arr[:] = np.asarray(fs, np.int32)
                     fq_arr[:] = np.asarray(fq, np.float32)
             except Exception as _fmexc:
@@ -6196,7 +6203,7 @@ def main():
                         _tb.print_exc()
             _res = (np.asarray(pair[v], np.float32),
                     np.asarray(comp[v], np.float32), fp_arr, fc_arr, fv_arr)
-            if _PFM:
+            if _PFM_SIZES:
                 _res = _res + (fs_arr, fq_arr)
             if _k is not None:
                 if len(_ORACLE_MEMO) >= _ORACLE_MEMO_MAX:
@@ -6217,7 +6224,7 @@ def main():
                    jax.ShapeDtypeStruct((F, N, N), jnp.float32),
                    jax.ShapeDtypeStruct((F, N), jnp.float32),
                    jax.ShapeDtypeStruct((F,), jnp.float32))
-        if _PFM:
+        if _PFM_SIZES:
             _shapes = _shapes + (
                 jax.ShapeDtypeStruct((F, N), jnp.int32),
                 jax.ShapeDtypeStruct((F,), jnp.float32))
@@ -6614,6 +6621,39 @@ def main():
     # so the live probe (the single largest host cost) leaves the rollout.
     _NO_ORACLE = bool(getattr(args, "no_approx_head", False)
                       or getattr(args, "live_faces", False))
+
+    # --per-face-masks HAS TWO HALVES, AND ONLY ONE OF THEM IS AVAILABLE ON
+    # EVERY PATH. Measured the hard way (Helmholtz smoke, 2026-08-28: the
+    # rollout stored `face_out[-1]`, which under --live-faces is the ENDPOINT
+    # array, and the loss then multiplied a (24,) dtype mask by a (2,) row).
+    #
+    #   APPLY-TIME half -- the projection and the per-face QUANT/COMPRESS
+    #   legality inside `make_live_masked_hook`. Installed process-wide by
+    #   `set_per_face_masks` and active on EVERY path, including --live-faces.
+    #   This is the half with the measured payoff (TLM3 yield: diag
+    #   0.765->1.000, compress 0.627->0.874, quant 0.465->1.000, and
+    #   skipped_raised 4->0).
+    #
+    #   SIZES half -- handing the head each face's LIVE dim sizes and QUANT
+    #   bit. These come from `LiveVertexMaskOracle`, and --live-faces turns
+    #   the oracle OFF (`_NO_ORACLE` above; the probes were ~48% of host time
+    #   and the live stream is supposed to supersede them). With no oracle
+    #   there are no per-face sizes to hand over, and the sampling masks are
+    #   the STATIC axis-validity broadcast -- so this half is simply not
+    #   available there, and pretending otherwise stores whatever array
+    #   happens to be in the tuple slot.
+    #
+    # So it is gated on the oracle actually running. NOT silently: a flag that
+    # half-applies without saying so is how a measurement gets attributed to
+    # the wrong change.
+    _PFM_SIZES = bool(_PFM and not _NO_ORACLE)
+    if _PFM:
+        print("[cfg] --per-face-masks: apply-time projection ON; "
+              "per-face SIZES + QUANT mask "
+              + ("ON (live oracle)" if _PFM_SIZES else
+                 "OFF -- the live-faces path runs no oracle, so there are "
+                 "no per-face sizes to hand the head. Only the apply-time "
+                 "half is active."), flush=True)
 
     if getattr(args, "live_faces", False):
         # Both are load-bearing, not stylistic. Without --face-actions there
@@ -7289,11 +7329,29 @@ def main():
                     # _face_loop tail, so --face-read's "always last" becomes
                     # "last before those two". Computed, not hardcoded, so the
                     # two flags compose.
-                    _pfm_tail = 2 if _PFM else 0
+                    _pfm_tail = 2 if _PFM_SIZES else 0
                     if _FACE_HEADS:
                         face_heads_v = face_out[len(face_out) - 1 - _pfm_tail]
-                    if _PFM:
+                    if _PFM_SIZES:
                         face_sizes_v, face_quant_v = face_out[-2], face_out[-1]
+                        # SHAPE GUARD. `face_out`'s tail is assembled from
+                        # three independent flags, so a wrong index here is a
+                        # SILENT misalignment: the loss would then re-mask
+                        # with whatever array happened to land in the slot and
+                        # the PPO ratio would leave 1 with no error anywhere.
+                        # Cheap (static shapes, trace time) and names the
+                        # mistake instead of surfacing it as a broadcast error
+                        # 5 frames deep in the head.
+                        _want = ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX),
+                                 (ENV_MAX_FACES,))
+                        _got = (tuple(face_sizes_v.shape),
+                                tuple(face_quant_v.shape))
+                        if _got != _want:
+                            raise ValueError(
+                                "--per-face-masks: the oracle arrays are not "
+                                f"where the rollout expects them. got {_got}, "
+                                f"want {_want}; face_out has {len(face_out)} "
+                                "elements (10 + face-loop tail + 2).")
                 else:
                     face_action = _zero_face_action()
                     face_old_logp = jnp.array(0.0)
@@ -7315,7 +7373,7 @@ def main():
                         ).at[:, 0].set(-1)
                     if _FACE_HEADS:
                         face_heads_v = jnp.zeros((ENV_MAX_FACES,), jnp.int32)
-                    if _PFM:
+                    if _PFM_SIZES:
                         # No faces -> no live sizes and no legal QUANT. Zero
                         # sizes read back as an all-invalid axis set, which is
                         # the correct "nothing is approximable here".
@@ -7502,7 +7560,7 @@ def main():
             # --per-face-masks: the two ORACLE arrays the head masked with.
             # Stored for the same reason face_pair_valid is -- the loss has to
             # re-mask with the identical values or the ratio is not 1.
-            if _PFM:
+            if _PFM_SIZES:
                 _fr_fields = dict(_fr_fields, face_sizes=face_sizes_v,
                                   face_quant=face_quant_v)
             transition = Trajectory(
@@ -7675,6 +7733,21 @@ def main():
             if args.face_actions
             else None
         )
+
+        def _pfm_checked(fsz, fqt):
+            """--per-face-masks: the loss must re-mask with the SAME arrays
+            the rollout masked with. A wrong tuple slot here is silent (the
+            ratio just stops being 1), so the shapes are asserted where they
+            enter the loss rather than discovered as a broadcast error inside
+            the head."""
+            _w = ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX), (ENV_MAX_FACES,))
+            _g = (tuple(fsz.shape[-2:]), tuple(fqt.shape[-1:]))
+            if _g != _w:
+                raise ValueError(
+                    "--per-face-masks: stored face_sizes/face_quant have "
+                    f"trailing shapes {_g}, want {_w} (full: "
+                    f"{tuple(fsz.shape)} / {tuple(fqt.shape)}).")
+            return (fsz, fqt)
 
         def _eval_dyn(pref, vidx, action, vmask, ax_st, ax_vm,
                       k, pv, cv, fa=None, fpv=None, fcv=None, fv=None,
@@ -8066,10 +8139,10 @@ def main():
                     # --face-read: the stored per-face approx-echo prefix
                     # lengths; last in `per` EXCEPT for the --per-face-masks
                     # pair, which is appended after it.
-                    fhd=(per[-1 - (2 if _PFM else 0)]
+                    fhd=(per[-1 - (2 if _PFM_SIZES else 0)]
                          if _FACE_HEADS else None),
-                    fsz=(per[-2] if _PFM else None),
-                    fqt=(per[-1] if _PFM else None),
+                    fsz=(per[-2] if _PFM_SIZES else None),
+                    fqt=(per[-1] if _PFM_SIZES else None),
                 )
             )(
                 batch.preference,
@@ -8093,7 +8166,8 @@ def main():
                 *((pc_eprows,) if _EP_READ else ()),
                 *((pc_emrows, batch.face_eslots) if _EDGE_MEM else ()),
                 *((batch.face_heads,) if _FACE_HEADS else ()),
-                *((batch.face_sizes, batch.face_quant) if _PFM else ()),
+                *((_pfm_checked(batch.face_sizes, batch.face_quant))
+                  if _PFM_SIZES else ()),
             )
             if args.face_actions
             else jax.vmap(
