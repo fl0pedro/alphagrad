@@ -136,3 +136,44 @@ So: measure candidate **and** reference in the same process, back to back, and
 report the **ratio** plus a distribution over **5 seeds** — never a single
 best-so-far number. A flat best-so-far curve after an early hit is luck, not
 learning.
+
+---
+
+## 5. Running the ratio gates — **one process each**, and a skip is a failure
+
+`tools/ratio_gates.sh` is the runnable form of section 1. It runs each
+sampling-==-replay pin in **its own python process**:
+
+```
+tests/endpoint_read_test.py::test_flag_on_rollout_equals_replay
+tests/per_face_masks_test.py::test_sample_equals_evaluate_with_per_face_sizes_and_quant
+tests/per_face_sizes_live_test.py::test_sample_equals_replay_with_live_derived_sizes
+tests/live_vertex_mask_test.py::test_sample_and_evaluate_agree_under_the_same_masks
+tests/masked_extend_equivalence_test.py::test_valid_prefix_is_bitwise_identical
+tests/policy_regression_gate_test.py
+```
+
+```
+PY="uv run --no-sync python" tools/ratio_gates.sh
+```
+
+The process isolation is **load-bearing, not tidiness**.
+`alphagrad.approx.env` freezes `MAX_DELTA_TOKENS` and the `MAX_FACES` default
+into module constants at *its first import*, so a test module that asks for a
+small test scale with `os.environ.setdefault` only gets it when it is the first
+module in the process to import alphagrad. Batch these gates into one pytest
+process and `tests/endpoint_read_test.py` reads `ALPHAGRAD_MAX_DELTA_TOKENS=128`
+for its stand-in face chunks while `_face_loop` is still building a 32768-wide
+chunk-stream buffer:
+
+```
+ValueError: Incompatible shapes for broadcasting: shapes=[(32768,), (128,), ()]
+```
+
+That is **scaffolding, not the mirror**. Production builds the face chunk
+callback as `LiveFaceStream(..., window=MAX_DELTA_TOKENS)` from the very
+constant `_face_loop` sizes the stream with, so the two cannot disagree — and a
+shape error is a *trace-time crash*, never a silently wrong ratio.
+`tests/_scale_guard.py` now turns the batched case into a **named skip** with
+that explanation instead of a broadcast error 200 frames down, and this runner
+**treats a skip as a failure**: a gate that did not run pins nothing.

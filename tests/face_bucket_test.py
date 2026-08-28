@@ -23,14 +23,25 @@ here; the kill-switch (ALPHAGRAD_GAZ_FACE_BUCKETS=0) short-circuits before
 any of the machinery tested here is touched.
 """
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("ALPHAGRAD_POLICY", "palimpsa")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
-# The test's "configured MAX_FACES". Read by env.py at import, so it must be
-# set before any alphagrad import.
-os.environ.setdefault("ALPHAGRAD_MAX_FACES", "64")
-os.environ.setdefault("ALPHAGRAD_MAX_DELTA_TOKENS", "128")
+# The small test scale is a REQUEST, not a guarantee: env.py freezes
+# MAX_DELTA_TOKENS / MAX_FACES at ITS first import, so a shared pytest
+# process behind a module that imported alphagrad first leaves the env var
+# at 128 while env.MAX_DELTA_TOKENS is still 32768 -- and the stand-in
+# chunk_fn below would then hand _face_loop 128-wide chunks for its
+# 32768-wide stream buffer. request_scale returns what env.py ACTUALLY
+# holds and skips this module by name if the request did not take
+# (tests/_scale_guard.py); tools/ratio_gates.sh runs it in its own process.
+from _scale_guard import request_scale  # noqa: E402
+
+W, MAXF, pytestmark = request_scale(max_delta_tokens=128,
+                                    max_faces=64)
 
 import equinox as eqx  # noqa: E402
 import jax  # noqa: E402
@@ -43,9 +54,7 @@ from alphagrad.approx.common.face_buckets import (  # noqa: E402
     FACE_BUCKETS, bucket_width, hist_face_width, pad_face_outputs,
     with_face_width)
 
-MAXF = 64
 TOTAL_V = 6
-W = int(os.environ["ALPHAGRAD_MAX_DELTA_TOKENS"])
 
 
 # ------------------------------------------------------------------ fixtures

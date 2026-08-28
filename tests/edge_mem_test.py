@@ -35,13 +35,25 @@ Pins (template: tests/endpoint_read_test.py):
    (the az_gumbel guard), never silently zero-fills.
 """
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("ALPHAGRAD_POLICY", "palimpsa")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
-# Read by env.py at import, so set before any alphagrad import.
-os.environ.setdefault("ALPHAGRAD_MAX_FACES", "64")
-os.environ.setdefault("ALPHAGRAD_MAX_DELTA_TOKENS", "128")
+# The small test scale is a REQUEST, not a guarantee: env.py freezes
+# MAX_DELTA_TOKENS / MAX_FACES at ITS first import, so a shared pytest
+# process behind a module that imported alphagrad first leaves the env var
+# at 128 while env.MAX_DELTA_TOKENS is still 32768 -- and the stand-in
+# chunk_fn below would then hand _face_loop 128-wide chunks for its
+# 32768-wide stream buffer. request_scale returns what env.py ACTUALLY
+# holds and skips this module by name if the request did not take
+# (tests/_scale_guard.py); tools/ratio_gates.sh runs it in its own process.
+from _scale_guard import request_scale  # noqa: E402
+
+W, MAXF, pytestmark = request_scale(max_delta_tokens=128,
+                                    max_faces=64)
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
@@ -50,10 +62,8 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import equinox as eqx  # noqa: E402
 
-MAXF = 64
 TOTAL_V = 6
 EMBD = 32
-W = int(os.environ["ALPHAGRAD_MAX_DELTA_TOKENS"])
 KE = MAXF  # edge-memory capacity = the face bound
 
 
