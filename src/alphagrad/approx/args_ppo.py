@@ -185,11 +185,13 @@ def add_ppo_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--measure-grad", action="store_true",
-        help="Measure value_and_grad of the SCALAR training loss (the gradient "
-        "that hits the optimizer) via graphax.value_and_grad instead of the "
-        "full Jacobian via jacve. Quality channels (cosine_sim/frob_residual) "
-        "then compare the approx gradient vs the exact gradient — a more "
-        "faithful gradient-accuracy signal. Requires a loss-like example.",
+        help="Select the LOSS-DROP quality channel (an Adam walk on the "
+        "measured gradient) instead of the gradient cosine. It no longer "
+        "decides WHAT is measured: the traced target is now ALWAYS the scalar "
+        "training loss (common.examples.scalar_loss_fn), so jacve of it is "
+        "the gradient that hits the optimizer with or without this flag. It "
+        "used to be the switch between that and a full per-class JACOBIAN. "
+        "Still required alongside the deprecated --seed-vertices.",
     )
     p.add_argument(
         "--quant-once", action="store_true",

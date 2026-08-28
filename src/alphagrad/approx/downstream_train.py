@@ -98,19 +98,26 @@ def _cosine(a: jnp.ndarray, b: jnp.ndarray) -> float:
     return num / den
 
 
-def _make_loss_fns(target_fn: Callable):
-    """Wrap ``target_fn`` (returns per-sample squared-error tensor) into
-    matched scalar / sum reductions consumed by ``jax.grad`` and
-    ``jacve`` respectively.
+def _make_loss_fns(target_fn: Callable, example: str = "VmappedNeuralNetwork"):
+    """Wrap ``target_fn`` into THE scalar training loss.
 
-    ``target_fn(x, y, *weights)`` returns shape ``(batch, out_dim)`` for
-    Vmapped variants. For scalar gradients we average; for Jacobian-mode
-    callables we sum (so the resulting "Jacobian" of a scalar output
-    matches the gradient).
+    THIS HARNESS IS THE DEFINITION OF "a real training run" in this repo, so
+    it must not carry a loss of its own: it now calls the SAME
+    ``common.examples.scalar_loss_fn`` the RL measurement path traces. That is
+    the whole point -- the gradient the agent is scored on and the gradient
+    this loop feeds to ``optax.adam`` are the same function by construction,
+    not by two comments agreeing.
+
+    It previously used ``jnp.mean(target_fn(...))``, which for the
+    ``(batch, 10)`` per-element cross-entropy averaged the CLASS axis too and
+    so optimized ``NLL/10``. A constant factor, so it never changed the
+    gradient DIRECTION or ``cossim_vs_exact``; it did make ``train_loss`` a
+    tenth of the NLL it was labelled as, and it disagreed with the objective
+    the measurement path had already been corrected to.
     """
+    from alphagrad.approx.common.examples import scalar_loss_fn
 
-    def loss_scalar(x, y, *weights):
-        return jnp.mean(target_fn(x, y, *weights))
+    loss_scalar = scalar_loss_fn(target_fn, example)
 
     def loss_sum(x, y, *weights):
         return jnp.sum(target_fn(x, y, *weights))
@@ -271,6 +278,13 @@ def _make_grad_from_jacobian(
     """
 
     def _contract(j):
+        # J has shape (batch, out_dim, *weight_shape). The loss is
+        # mean_batch(sum_class(out)), so its gradient is SUM over the class
+        # axis and MEAN over the batch axis -- matching
+        # ``examples.scalar_loss_fn(..., "VmappedNeuralNetwork")`` exactly.
+        # This was ``mean(j, axis=(0, 1))``, the gradient of the mean over
+        # BOTH axes, i.e. 1/out_dim of the training gradient.
+        #
         # Final ``.astype(float32)`` so a Quant op that left the val in
         # a low-precision dtype (e.g. ``float4_e2m1fn``) is brought
         # back to a precision optax / the weight update expects —
@@ -278,7 +292,7 @@ def _make_grad_from_jacobian(
         # ``weights - lr * grads`` step. This is the only place we
         # widen; the gradient COMPUTATION still runs at whatever
         # precision the elimination chose.
-        return jnp.mean(j, axis=(0, 1)).astype(jnp.float32)
+        return jnp.mean(jnp.sum(j, axis=1), axis=0).astype(jnp.float32)
 
     def _grads_only(*args):
         jac = jacobian_fn(*args)
@@ -288,7 +302,8 @@ def _make_grad_from_jacobian(
 
     def _loss_and_grads(*args):
         primal, jac = jacobian_fn(*args)
-        loss_val = jnp.mean(primal).astype(jnp.float32)
+        # Same reduction as scalar_loss_fn / _contract, on the primal.
+        loss_val = jnp.mean(jnp.sum(primal, axis=-1)).astype(jnp.float32)
         if isinstance(jac, (tuple, list)):
             grads = [_contract(j) for j in jac]
         else:
@@ -517,7 +532,7 @@ def main():
         "step_wall_ms", "peak_mem_bytes", "grad_cossim_vs_exact",
     ])
 
-    loss_scalar, _ = _make_loss_fns(target_fn)
+    loss_scalar, _ = _make_loss_fns(target_fn, args.example)
     loss_scalar_jit = jax.jit(loss_scalar)
 
     # ``ResourceMonitor`` from jax_memory_monitor — same primitive the

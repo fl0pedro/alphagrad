@@ -343,6 +343,11 @@ def build_env(args):
         # strict TRANSFORM-DID-NOT-FIT guard and kill the measurement).
         per_face=True,
         measure_grad=bool(args.measure_grad),
+        # The target came from common.examples.grad_target_setup, which now
+        # wraps it in the SCALAR TRAINING LOSS unconditionally -- so the
+        # scalar-output contract always holds here and is always checked.
+        # (--measure-grad no longer decides that; it picks the quality channel.)
+        scalar_target=True,
         # NOT terminal_rewards_only: we always call at stop == len(order), so
         # every call is terminal anyway, and leaving it off removes one
         # config difference that could silently zero a channel.

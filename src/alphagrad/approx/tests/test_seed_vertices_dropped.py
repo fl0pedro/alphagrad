@@ -210,22 +210,41 @@ def test_no_in_repo_launcher_passes_seed_vertices():
     assert not offenders, "launchers still pass --seed-vertices: %s" % offenders
 
 
-def test_measure_grad_is_kept_because_it_is_not_redundant():
-    """Recorded deliberately: A4 drops the SEED flag, not the GRAD flag.
+def test_measure_grad_no_longer_gates_the_scalar_loss():
+    """SUPERSEDED A4's third finding, deliberately.
 
-    ``--measure-grad`` is load-bearing in three independent ways:
-      * ``scalar_loss_fn`` wraps the target BEFORE tracing, so the traced graph
-        IS the loss graph (nn256: 15 eqns vs 13) -- not a post-hoc reduction;
-      * it flips the quality-metric default from cosine to loss_drop;
-      * it arms the scalar-output contract check in the env.
-    Only the first is asserted here (the other two live in env.py); it is the
-    one that would silently change the measured object if the flag were
-    dropped as "redundant".
+    A4 recorded ``--measure-grad`` as load-bearing in three ways. Two survive:
+    it flips the quality-metric default cosine -> ``loss_drop``, and it gates
+    ``--seed-vertices`` above. The third -- "``scalar_loss_fn`` wraps the
+    target BEFORE tracing" -- is no longer conditional on the flag: the target
+    is ALWAYS the scalar training loss, because the alternative was measuring
+    a full Jacobian and calling it a gradient. The env's scalar-output
+    contract check is now armed by ``from_jaxpr(scalar_target=True)``, which
+    the production builders pass unconditionally.
+
+    ``test_jacobian_equals_grad.py`` owns the positive statement (the traced
+    target is scalar with the flag off, and ``jacve`` of it == ``jax.grad``);
+    this asserts only that the flag no longer moves the target.
     """
     xs = (np.zeros((2, 2)),)
     off = grad_target_setup(NS(measure_grad=False, seed_vertices=False),
                             _fn, xs, EXAMPLE)
     on = grad_target_setup(NS(measure_grad=True, seed_vertices=False),
                            _fn, xs, EXAMPLE)
-    assert off[0] is _fn                 # Jacobian mode: the target is untouched
-    assert on[0] is not _fn              # grad mode: wrapped into a scalar loss
+    assert off[0] is not _fn             # wrapped into a scalar loss...
+    assert on[0] is not _fn              # ...with the flag on OR off
+    probe = jnp.asarray([[1.0, 2.0], [3.0, 4.0]])
+    assert float(off[0](probe)) == pytest.approx(float(on[0](probe)))
+    assert off[1:] == on[1:]             # same args, same argnums
+
+
+def test_seed_vertices_is_still_an_accepted_cli_option():
+    """A4 kept the flag ACCEPTED for archived-run replay; that must not rot
+    into "removed" the next time someone tidies the argparser."""
+    import argparse
+    from alphagrad.approx.args_ppo import add_ppo_args
+    opts = set()
+    for a in add_ppo_args(argparse.ArgumentParser())._actions:
+        opts.update(a.option_strings)
+    assert "--seed-vertices" in opts
+    assert "--measure-grad" in opts

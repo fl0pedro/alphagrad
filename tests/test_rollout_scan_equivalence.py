@@ -14,7 +14,7 @@ from alphagrad.approx.common.examples import get_fn, get_args, infer_argnums, sc
 from alphagrad.approx.ppo_ray_worker import MicroPPOAgent
 from alphagrad.approx import incremental_encoder as ie
 
-LOSS = scalar_loss_fn(get_fn("VmappedNeuralNetwork"))
+LOSS = scalar_loss_fn(get_fn("VmappedNeuralNetwork"), "VmappedNeuralNetwork")
 ARGN = infer_argnums("VmappedNeuralNetwork")
 k = jax.random.PRNGKey(0); ak, _ = jax.random.split(k)
 xs = get_args("VmappedNeuralNetwork", ak, dataset="mnist")

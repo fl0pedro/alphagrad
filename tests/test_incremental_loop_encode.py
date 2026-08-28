@@ -57,7 +57,7 @@ EMBD = 128
 SEED = 0
 
 # --------------------------------------------------------------- env + jaxpr
-LOSS = scalar_loss_fn(get_fn("VmappedNeuralNetwork"))
+LOSS = scalar_loss_fn(get_fn("VmappedNeuralNetwork"), "VmappedNeuralNetwork")
 ARGN = infer_argnums("VmappedNeuralNetwork")
 k = jax.random.PRNGKey(0); ak, ek = jax.random.split(k)
 xs = get_args("VmappedNeuralNetwork", ak, dataset="mnist")

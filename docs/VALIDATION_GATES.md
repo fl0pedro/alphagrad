@@ -29,6 +29,20 @@ It is pinned by, in rough order of directness:
 * `tests/masked_extend_equivalence_test.py::test_valid_prefix_is_bitwise_identical`
   (a 1e-7 drift in `enc_x` becomes a ratio != 1 and a spurious first-epoch update)
 
+The other contract a measurement run depends on is **the measured object is the
+gradient a training run computes**, pinned by
+`src/alphagrad/approx/tests/test_jacobian_equals_grad.py`:
+
+* the traced target is a SCALAR loss with `--measure-grad` on *and* off (it used
+  to be the raw per-element example without the flag, i.e. a per-class Jacobian);
+* `graphax.jacve` of that graph equals `jax.grad` of the same loss, leaf by leaf,
+  at `max|jacve-grad|/max|grad| <= 1e-5` (measured: 1.3e-7 NeuralNetwork,
+  1.1e-7 VmappedNeuralNetwork, 6.4e-7 TransformerLM-shaped);
+* the reduction is the one a real training run optimizes and is DECLARED per
+  family in `examples.loss_reduction`, not inferred from `ndim`;
+* `downstream_train` — this repo's definition of "a real training run" — calls
+  the same `scalar_loss_fn`, so the two cannot drift apart.
+
 `tests/policy_regression_gate.py` is the broader tripwire: a seeded rollout
 through the real policy path, compared **bit-exactly** against a committed
 semantic golden (realized choices, available-vertex sets, mask fill values, live

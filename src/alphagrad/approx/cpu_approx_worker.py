@@ -794,6 +794,11 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         latency_warmup=int(getattr(args, "latency_warmup", 0)),
         latency_winsor=float(getattr(args, "latency_winsor", 0.0)),
         measure_grad=measure_grad,
+        # The target came from common.examples.grad_target_setup, which now
+        # wraps it in the SCALAR TRAINING LOSS unconditionally -- so the
+        # scalar-output contract always holds here and is always checked.
+        # (--measure-grad no longer decides that; it picks the quality channel.)
+        scalar_target=True,
         # PER-FACE application (2026-08-05). The trainer builds its env with
         # ``per_face=bool(args.per_face or args.face_actions)`` (ppo.py:3841)
         # but this builder — which constructs the env that performs the actual

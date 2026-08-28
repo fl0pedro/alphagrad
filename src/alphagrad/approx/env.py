@@ -5724,6 +5724,7 @@ class VertexEliminationEnv:
         latency_warmup: int = 0,
         per_face: bool = False,
         measure_grad: bool = False,
+        scalar_target: bool = False,
         delta_obs: bool = False,
         quality_rewarded=None,
         **_compat,
@@ -5734,8 +5735,8 @@ class VertexEliminationEnv:
         # the total budget so old scripts keep working.
         if latency_samples and latency_samples > 1:
             reps_per_point = max(1, int(latency_samples) // max(1, num_data_points))
-        if measure_grad:
-            # ``measure_grad`` asserts that the traced function is a SCALAR
+        if measure_grad or scalar_target:
+            # THE SCALAR-OUTPUT CONTRACT: the traced function is a SCALAR
             # loss, so differentiating its jaxpr already yields gradients —
             # which is what the spec asks to measure ("instead of returning
             # the Jacobian we return the gradients from the Jacobian"). It is
@@ -5743,6 +5744,15 @@ class VertexEliminationEnv:
             # for the env, and the previous hard NotImplementedError made
             # az_gumbel unimportable rather than protecting anything. Verify
             # the contract and continue.
+            #
+            # ``scalar_target`` is what arms it on the PRODUCTION paths.
+            # ``common.examples.grad_target_setup`` now wraps the target in
+            # ``scalar_loss_fn`` UNCONDITIONALLY, so ppo / cpu_approx_worker /
+            # landscape_map always satisfy the contract and always pass
+            # ``scalar_target=True`` -- the check no longer switches off with
+            # ``--measure-grad``, which today only picks the quality channel.
+            # It stays default-False so the callers that legitimately trace a
+            # NON-scalar target (elimrl, bare-jaxpr tests) are unaffected.
             _outs = getattr(jaxpr, "out_avals", None) or [
                 getattr(v, "aval", None) for v in jaxpr.jaxpr.outvars
             ]
@@ -5752,11 +5762,11 @@ class VertexEliminationEnv:
             ]
             if _bad:
                 raise ValueError(
-                    "measure_grad=True requires a SCALAR-output target "
-                    "(so jacve of it yields gradients); got output avals "
+                    "a SCALAR-output target is required (so jacve of it "
+                    "yields gradients); got output avals "
                     f"{[getattr(a, 'shape', a) for a in _outs]}. Wrap the "
                     "model in a scalar loss (see common.examples."
-                    "scalar_loss_fn) or pass measure_grad=False."
+                    "scalar_loss_fn) or drop measure_grad/scalar_target."
                 )
         assert (argnums is None and args is None) or not (args is None or args is None)
         config = EnvConfig(

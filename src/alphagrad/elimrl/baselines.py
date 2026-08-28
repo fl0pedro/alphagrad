@@ -68,7 +68,7 @@ def tlm_target(seq: int = 32, dmodel: int = 128, vocab: int = 1024,
     import jax
     from alphagrad.approx.common.examples import (
         get_fn, get_args, infer_argnums, scalar_loss_fn)
-    fn = scalar_loss_fn(get_fn("TransformerLM"))
+    fn = scalar_loss_fn(get_fn("TransformerLM"), "TransformerLM")
     argnums = infer_argnums("TransformerLM")
     args = get_args("TransformerLM", jax.random.PRNGKey(seed),
                     dataset="wikitext2")

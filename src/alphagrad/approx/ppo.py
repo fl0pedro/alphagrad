@@ -6006,6 +6006,11 @@ def main():
         # edge, legal by the logical-axis oracle, unappliable on the 1-D val).
         per_face=bool(args.per_face or args.face_actions),
         measure_grad=bool(args.measure_grad),
+        # The target came from common.examples.grad_target_setup, which now
+        # wraps it in the SCALAR TRAINING LOSS unconditionally -- so the
+        # scalar-output contract always holds here and is always checked.
+        # (--measure-grad no longer decides that; it picks the quality channel.)
+        scalar_target=True,
         terminal_rewards_only=args.terminal_rewards_only,
         # STAGE 2: emit the per-step token DELTA, not the growing stream.
         delta_obs=True,

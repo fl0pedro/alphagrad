@@ -741,7 +741,7 @@ def build_example_graph(name: str = "TransformerLM", dataset: Optional[str] = No
     from alphagrad.approx.common.examples import (get_args, get_fn,
                                                   infer_argnums,
                                                   scalar_loss_fn)
-    fn = scalar_loss_fn(get_fn(name))
+    fn = scalar_loss_fn(get_fn(name), name)
     argnums = infer_argnums(name)
     args = get_args(name, jax.random.PRNGKey(seed), dataset=dataset)
     return build_elim_graph(fn, args, argnums)
