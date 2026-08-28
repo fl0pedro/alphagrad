@@ -214,6 +214,7 @@ class CpuApproximationServer:
         point_idx: int = -1,
         face_specs: Any = None,
         face_skips: Any = None,
+        episode: int | None = None,
     ):
         """Run the per-step reward pipeline once.
 
@@ -232,6 +233,15 @@ class CpuApproximationServer:
                            inside `_callback` does the rest.
         * `init`         — True only for the reset-time tokenization (no
                            reward computation).
+        * `episode`      — optional trainer episode index (A3 walk rotation).
+                           Ray actors inherit the driver env AS IT STOOD AT
+                           `ray.init`, so the trainer's per-episode
+                           `set_walk_episode` never reaches a long-lived actor.
+                           Republishing it here, per call, is what makes a
+                           pooled measurement rotate its probe batch in step
+                           with the trainer instead of pinning the episode it
+                           was spawned on. `None` leaves the actor's
+                           environment untouched.
 
         Returns
         -------
@@ -243,6 +253,11 @@ class CpuApproximationServer:
         import numpy as np
         from alphagrad.approx.env import MAX_TOKENS, NUM_REWARDS, _callback
 
+        if episode is not None:
+            # A3 rotation, pooled path. One env-var write per call; `_walk_seed`
+            # is the only reader and it is a no-op unless --walk-rotate.
+            from alphagrad.approx.env import set_walk_episode as _set_walk_ep
+            _set_walk_ep(int(episode))
         order_j = jnp.asarray(order, dtype=jnp.int32)
         specs_j = jnp.asarray(sparsity_specs, dtype=jnp.int32)
         es = (

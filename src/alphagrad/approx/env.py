@@ -1165,6 +1165,251 @@ def consume_grad_coverage_stats() -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# THE FIDELITY CHANNEL (reward slot 8) -- CLIPPED RELATIVE FROBENIUS.
+# ---------------------------------------------------------------------------
+# Owner's choice, 2026-08-28: "clipped relative-Frobenius TRAINED, cosine
+# LOGGED, gradient coverage a hard GUARD." This block is the trained half; the
+# cosine subsample is `cos_log_every` below and the guard is `_grad_coverage`
+# above. The three are deliberately different instruments on the same pair of
+# Jacobians and are NOT interchangeable:
+#
+#   * coverage is a PER-LEAF, ZERO/NON-ZERO verdict. It answers "does every
+#     trainable parameter still receive a gradient at all?" and nothing else --
+#     which is exactly what a hard guard should answer, and exactly why it is a
+#     bad training signal: it is flat over the entire region where all leaves
+#     are alive.
+#   * fidelity is a MAGNITUDE. `1 - ||J_e - J_a||_F / ||J_e||_F`, clipped to
+#     [-1, 1]. It is defined (and equals 0) when the approximated gradient is
+#     identically zero, where the cosine is 0/0.
+#   * the cosine is an ANGLE and ignores magnitude entirely: a plan that halves
+#     every entry of the Jacobian scores cos == 1.0 and rel_frob == 0.5.
+#
+# COST. Both fidelity and the cosine need the EXACT Jacobian. Under the default
+# `loss_drop` quality metric the exact executable is otherwise never compiled or
+# run -- that is where loss_drop's 0.22 s / 40 MB per plan (vs the cosine's
+# 9.70 s / 4.24 GB) comes from. So fidelity is NOT free by itself. What makes it
+# cheap in practice is that `--reject-frozen-grads` (default ON) ALREADY
+# materialises the exact Jacobian at measurement point 0 for the coverage
+# guard: `_exact_ref_scores` folds the residual, the exact-norm and the cosine
+# into that SAME single exact execution, so with the guard on the marginal cost
+# of the fidelity channel is the per-leaf reductions plus holding one extra
+# Jacobian alive -- not a second 9.70 s reference. With the guard OFF the
+# channel pays the full exact reference and says so in the log.
+_FIDELITY_STATS: dict = {
+    "n": 0,                 # fidelity measurements taken
+    "sum": 0.0,
+    "min": 1.0,
+    "max": -1.0,
+    "n_clipped_low": 0,     # rel_frob >= 2: the clip floor actually bound
+    "n_cos": 0,             # cosine samples logged (subsampled)
+    "sum_cos": 0.0,
+    "min_cos": 1.0,
+    "wall_s": 0.0,          # wall spent inside the exact-reference block
+    "exact_execs": 0,       # exact executions this block was responsible for
+    "last": None,
+}
+# Terminal plans seen since import, for the cosine subsample stride.
+_COS_LOG_SEEN = [0]
+
+
+def fidelity_enabled() -> bool:
+    """Is the clipped-relative-Frobenius channel (slot 8) measured?
+
+    DEFAULT OFF AT THE LIBRARY LEVEL, exactly like `grad_coverage_enabled`, and
+    for the same reason: measurement happens in Ray measure actors that are
+    separate processes and may be RESPAWNED inside a job launched before this
+    commit. ``ppo.configure_fidelity`` exports the variables before ``ray.init``.
+    """
+    if os.environ.get("ALPHAGRAD_FIDELITY", "") not in ("", "0"):
+        return True
+    try:
+        return float(os.environ.get("ALPHAGRAD_FIDELITY_WEIGHT", "0")) != 0.0
+    except ValueError:
+        return False
+
+
+def cos_log_every() -> int:
+    """Stride of the COSINE LOG subsample; 0 (default) = never.
+
+    The cosine is a diagnostic, not a trained channel, and it costs an exact
+    reference (9.70 s / 4.24 GB per plan) that the default quality metric does
+    not otherwise build -- 44x loss_drop's 0.22 s / 40 MB. Computing it per plan
+    would dominate the measurement budget, so it is sampled every Nth TERMINAL
+    plan per process.
+
+    NOTE the asymmetry that makes this flag mostly unnecessary in practice: when
+    the exact reference is materialised anyway (the coverage guard, the fidelity
+    channel, or ALPHAGRAD_QUALITY_METRIC=cosine), the cosine is one extra
+    per-leaf dot product on leaves that are already resident, so it is taken on
+    EVERY such plan regardless of this stride. The stride only ever FORCES an
+    exact reference that nothing else asked for.
+    """
+    try:
+        return max(0, int(os.environ.get("ALPHAGRAD_COS_LOG_EVERY", "0") or 0))
+    except ValueError:
+        return 0
+
+
+def _cos_log_due() -> bool:
+    """Consume one terminal-plan tick; True on every ``cos_log_every()``-th."""
+    every = cos_log_every()
+    if every <= 0:
+        return False
+    _COS_LOG_SEEN[0] += 1
+    return (_COS_LOG_SEEN[0] - 1) % every == 0
+
+
+def clipped_rel_frob(rel_frob) -> float:
+    """THE FIDELITY VALUE: ``clip(1 - rel_frob, -1, +1)``.
+
+    See the slot-8 entry in the REWARD_NAMES block for the sign convention.
+    A non-finite ``rel_frob`` (nan/inf from a blown-up plan) scores the FLOOR:
+    it is a real statement about the plan, not apparatus failure.
+    """
+    x = float(rel_frob)
+    if not np.isfinite(x):
+        return -1.0
+    return float(min(1.0, max(-1.0, 1.0 - x)))
+
+
+def _record_fidelity(fid: float | None, rel_frob: float | None,
+                     cos: float | None) -> None:
+    """Record one plan's fidelity and/or logged cosine.
+
+    ``fid`` is ``None`` when only the COSINE subsample fired (the channel is
+    off but ``--cos-log-every`` asked for a reference), so the cosine counter
+    and the fidelity counter move independently and the amortised-cost line
+    stays honest about which one paid.
+    """
+    s = _FIDELITY_STATS
+    if fid is not None:
+        s["n"] += 1
+        s["sum"] += float(fid)
+        s["min"] = min(s["min"], float(fid))
+        s["max"] = max(s["max"], float(fid))
+        if float(fid) <= -1.0:
+            s["n_clipped_low"] += 1
+    s["last"] = {"fidelity": (None if fid is None else float(fid)),
+                 "rel_frob": (None if rel_frob is None else float(rel_frob)),
+                 "cos": (None if cos is None else float(cos))}
+    if cos is not None:
+        s["n_cos"] += 1
+        s["sum_cos"] += float(cos)
+        s["min_cos"] = min(s["min_cos"], float(cos))
+
+
+def consume_fidelity_stats() -> dict:
+    """Pop the per-period fidelity + logged-cosine aggregate.
+
+    ``cos_wall_amortised_s`` is the honest per-plan price of the cosine LOG:
+    the wall this block spent divided by the number of fidelity measurements it
+    served, which is the number the subsample stride is meant to control.
+    """
+    s = _FIDELITY_STATS
+    n = max(int(s["n"]), 0)
+    ncos = max(int(s["n_cos"]), 0)
+    out = {
+        "count": n,
+        "mean": (s["sum"] / n) if n else float("nan"),
+        "min": s["min"] if n else float("nan"),
+        "max": s["max"] if n else float("nan"),
+        "clipped_low": int(s["n_clipped_low"]),
+        "cos_count": ncos,
+        "cos_mean": (s["sum_cos"] / ncos) if ncos else float("nan"),
+        "cos_min": s["min_cos"] if ncos else float("nan"),
+        "wall_s": s["wall_s"],
+        "exact_execs": int(s["exact_execs"]),
+        # Wall per PLAN SERVED by the exact-reference block, whichever consumer
+        # asked for it. This is the number to quote as "what the fidelity
+        # channel / the cosine log actually cost per plan".
+        "wall_amortised_s": ((s["wall_s"] / max(n, ncos))
+                             if max(n, ncos) else float("nan")),
+    }
+    s.update({"n": 0, "sum": 0.0, "min": 1.0, "max": -1.0, "n_clipped_low": 0,
+              "n_cos": 0, "sum_cos": 0.0, "min_cos": 1.0, "wall_s": 0.0,
+              "exact_execs": 0})
+    return out
+
+
+def _residual_scores(exact_out, approx_out, has_aux: bool):
+    """``(rel_frob, cos)`` of ``approx_out`` against ``exact_out``, STREAMED.
+
+    Same arithmetic and the same epsilon policy as `_quality_metrics` (the
+    per-leaf accumulation of <e,a>, ||e||^2, ||a||^2, ||e-a||^2 that exists
+    precisely so a >=4 GB flat concatenate is never materialised); this variant
+    exists only because the coverage path holds the two outputs at a different
+    place in `_callback` and needs the exact leaves for its own norms in the
+    same pass. Returns ``(nan, nan)`` on the same "broken comparison" cases
+    `_quality_metrics` scores worst -- the caller decides what a broken
+    comparison means for the channel.
+    """
+    e_out = exact_out[1] if has_aux else exact_out
+    a_out = approx_out[1] if has_aux else approx_out
+    a_out = _align_jac(a_out, e_out)
+    leaves_e = jax.tree_util.tree_leaves(e_out)
+    leaves_a = jax.tree_util.tree_leaves(a_out)
+    if not leaves_e or not leaves_a or len(leaves_e) != len(leaves_a):
+        return float("nan"), float("nan")
+    if any(getattr(a, "shape", None) != getattr(e, "shape", None)
+           for a, e in zip(leaves_a, leaves_e)):
+        return float("nan"), float("nan")
+    dot = ee = aa = rr = None
+    for e, a in zip(leaves_e, leaves_a):
+        _cdt = jnp.promote_types(jnp.promote_types(e.dtype, a.dtype),
+                                 jnp.float32)
+        ef = jnp.ravel(e).astype(_cdt)
+        af = jnp.ravel(a).astype(_cdt)
+        _d = jnp.sum(ef * af)
+        _e2 = jnp.sum(jnp.abs(ef) ** 2)
+        _a2 = jnp.sum(jnp.abs(af) ** 2)
+        _r2 = jnp.sum(jnp.abs(ef - af) ** 2)
+        dot = _d if dot is None else dot + _d
+        ee = _e2 if ee is None else ee + _e2
+        aa = _a2 if aa is None else aa + _a2
+        rr = _r2 if rr is None else rr + _r2
+    exact_norm = jnp.sqrt(ee)
+    approx_norm = jnp.sqrt(aa)
+    rel_frob = jnp.sqrt(rr) / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
+    cos = jnp.real(dot / (jnp.maximum(exact_norm, jnp.sqrt(1e-7))
+                          * jnp.maximum(approx_norm, jnp.sqrt(1e-7))))
+    return float(rel_frob), float(cos)
+
+
+def _exact_ref_scores(order_key: bytes, digest: bytes, compile_fn, eval_args,
+                      has_aux: bool, approx_out=None, want_cos: bool = False):
+    """ONE exact execution serving the coverage guard AND the fidelity channel.
+
+    Returns ``(exact_norms, rel_frob, cos)``; ``rel_frob``/``cos`` are ``None``
+    when ``approx_out`` is ``None`` (coverage only -- the pre-A2 behaviour) and
+    ``cos`` is ``None`` unless ``want_cos``.
+
+    THE POINT OF THIS FUNCTION is that the exact Jacobian is the expensive
+    object and it is needed by two consumers. `_exact_leaf_norms` (kept, and
+    still the only path when fidelity is off) memoises just the per-leaf norms
+    and drops the leaves immediately, so it cannot serve a residual; when a
+    residual IS wanted the leaves must survive one more pass, and doing that
+    twice would double the most expensive thing in the measurement. So: execute
+    once, score everything, drop. The norms are still memoised on the way out,
+    so a repeat order pays nothing for the coverage half.
+    """
+    key = order_key + b"|" + digest
+    if approx_out is None:
+        return _exact_leaf_norms(order_key, digest, compile_fn, eval_args,
+                                 has_aux), None, None
+    out = compile_fn()(*eval_args)
+    _FIDELITY_STATS["exact_execs"] += 1
+    try:
+        norms = _leaf_norms(out, has_aux)
+        rel_frob, cos = _residual_scores(out, approx_out, has_aux)
+    finally:
+        out = None
+    if len(_EXACT_LEAF_NORMS) >= 8:
+        _EXACT_LEAF_NORMS.clear()
+    _EXACT_LEAF_NORMS[key] = norms
+    return norms, rel_frob, (cos if want_cos else None)
+
+
 def consume_truncated_plan_count() -> int:
     n = _TRUNCATED_PLANS[0]
     _TRUNCATED_PLANS[0] = 0
@@ -1410,8 +1655,42 @@ _AXIS_FEAT_GROUP_ID = 3
 #                        REWARD_NAMES) must not claim "cosine" for a number
 #                        that is not one. The concrete metric is published as
 #                        ``quality/metric``.
-#   7 frob_residual    — relative Frobenius residual ||J_e - J_a||_F / ||J_e||_F.
-NUM_REWARDS = 8
+#   7 grad_coverage    — per-leaf gradient coverage, bounded [-1, 1]. See
+#                        ``_grad_coverage``. Historically ``frob_residual``;
+#                        the alias below keeps index 7 addressable by that name.
+#   8 fidelity         — CLIPPED RELATIVE FROBENIUS (workstream A2, owner's
+#                        choice 2026-08-28):
+#
+#                            fidelity = clip(1 - ||J_e - J_a||_F / ||J_e||_F,
+#                                            -1, +1)
+#
+#                        SIGN CONVENTION, deliberately "higher is better" like
+#                        every other slot:
+#                          +1  <=>  rel_frob == 0   <=>  J_a == J_e exactly.
+#                           0  <=>  rel_frob == 1   <=>  the error is exactly
+#                                   the size of the gradient. An all-zero
+#                                   Jacobian lands here EXACTLY (||J_e-0||=||J_e||),
+#                                   which is the whole reason this is preferable
+#                                   to the cosine: cos(0, J_e) is 0/0, undefined,
+#                                   and the eps-clamped formula reports it as 0
+#                                   only by accident of the epsilon.
+#                          -1  <=>  rel_frob >= 2 (clipped). rel_frob is
+#                                   unbounded above -- a wrong-signed Jacobian of
+#                                   the same magnitude gives 2, a blown-up one
+#                                   gives arbitrarily more -- so the FLOOR is
+#                                   what makes the channel bounded and therefore
+#                                   symlog-free and PopArt-friendly.
+#                        The slot is 0.0 whenever fidelity was not measured
+#                        (non-terminal steps, and every step when the channel is
+#                        off), matching the sparse-terminal convention slot 6
+#                        already uses.
+#                        MEASURED ONLY WHEN ASKED FOR: `fidelity_enabled()`
+#                        (ppo's --fidelity-weight / ALPHAGRAD_FIDELITY). It needs
+#                        the EXACT Jacobian, which under the default loss_drop
+#                        quality metric is otherwise never built -- see
+#                        `_exact_ref_scores` for how it shares that one exact
+#                        execution with the gradient-coverage guard.
+NUM_REWARDS = 9
 REWARD_NAMES: tuple[str, ...] = (
     "muls_adds_fmas",
     "flops",
@@ -1421,6 +1700,7 @@ REWARD_NAMES: tuple[str, ...] = (
     "peak_memory",
     "quality",
     "grad_coverage",
+    "fidelity",
 )
 REWARD_INDEX = {name: i for i, name in enumerate(REWARD_NAMES)}
 # BACK-COMPAT ALIAS for slot 7. The slot was ``frob_residual`` until
@@ -1436,7 +1716,8 @@ REWARD_INDEX["frob_residual"] = REWARD_INDEX["grad_coverage"]
 # not move; only its display name changed, so the alias is exact.
 REWARD_INDEX["cosine_sim"] = REWARD_INDEX["quality"]
 COMPUTE_REWARD_INDICES = tuple(range(0, 6))  # cost components
-QUALITY_REWARD_INDICES = (6, 7)             # cosine, frobenius
+# quality (loss_drop / cosine), gradient coverage, clipped relative Frobenius.
+QUALITY_REWARD_INDICES = (6, 7, 8)
 
 # Sentinel reward returned when a per-vertex transform sequence matches an
 # entry in the in-file blacklist (used during exploration to penalise
@@ -1446,10 +1727,17 @@ QUALITY_REWARD_INDICES = (6, 7)             # cosine, frobenius
 # channels at their floor. Derived from REWARD_INDEX so adding a channel can't
 # leave a stale hand-written row behind.
 SENTINEL_COST = -1e10
+# The BOUNDED channels take their own floor, not SENTINEL_COST: slot 7 and
+# slot 8 both live in [-1, 1], and stamping -1e10 into a bounded channel would
+# make its PopArt sigma meaningless for every real plan measured afterwards.
+_SENTINEL_BOUNDED_FLOOR = {
+    REWARD_INDEX["frob_residual"]: -1.0,   # grad_coverage: all leaves frozen
+    REWARD_INDEX["fidelity"]: -1.0,        # rel_frob >= 2, the clip floor
+}
 _SENTINEL_BAD_REWARD = jnp.array(
     [
         0.0 if i == REWARD_INDEX["cosine_sim"]
-        else (-1.0 if i == REWARD_INDEX["frob_residual"] else SENTINEL_COST)
+        else _SENTINEL_BOUNDED_FLOOR.get(i, SENTINEL_COST)
         for i in range(NUM_REWARDS)
     ],
     dtype=jnp.float32,
@@ -2886,16 +3174,21 @@ def _walk_probe_seed() -> int:
 # of the measurement configuration uses (``ppo.configure_grad_coverage``,
 # ``masks.set_diag_per_face``).
 #
-# CAVEAT, DELIBERATELY LOGGED RATHER THAN ASSUMED AWAY: Ray workers inherit the
-# driver's environment as it stood at ``ray.init`` time, so a value republished
-# mid-run reaches the TRAINER -- which is where every TERMINAL row, the only
-# rows quality is computed on, is measured under ``--exec-on-gpu`` -- but not a
-# long-lived measure actor, which keeps whatever episode was current when it
-# was spawned. ``_loss_drop_quality`` therefore also accepts an explicit
-# ``episode=`` argument (the one-line integration point for the pooled path),
-# and the fingerprint line prints the episode and the batch digests it actually
-# used, so a trainer/actor divergence shows up in the log instead of silently
-# de-pairing the comparison.
+# CAVEAT, RAISED BY A3 AND CLOSED BY A2: Ray workers inherit the driver's
+# environment as it stood at ``ray.init`` time, so a value republished mid-run
+# reaches the TRAINER -- which is where every TERMINAL row, the only rows
+# quality is computed on, is measured under ``--exec-on-gpu`` -- but NOT a
+# long-lived measure actor, which would keep whatever episode was current when
+# it was spawned. That hole is now plugged at the WIRE rather than worked
+# around: ``CpuApproxPool.evaluate`` / ``evaluate_batch`` carry an ``episode=``
+# field, the two call sites in this file fill it from ``walk_episode()``
+# whenever rotation is on, and ``CpuApproximationServer.evaluate`` republishes
+# it into the ACTOR's own environment before measuring -- so a pooled
+# measurement rotates in step with the trainer instead of pinning its spawn
+# episode. ``_loss_drop_quality``'s explicit ``episode=`` argument remains for
+# direct callers, and the fingerprint line still prints the episode and the
+# batch digests actually used, so any residual divergence shows up in the log
+# instead of silently de-pairing the comparison.
 _WALK_EPISODE_ENV = "ALPHAGRAD_WALK_EPISODE"
 
 
@@ -4808,6 +5101,22 @@ def _callback(
     _gcov_approx_norms = None
     _gcov_eval_args = None
     _gcov_measure_t0 = _cb_t0
+    # FIDELITY (reward slot 8) + the COSINE LOG subsample. Both need the exact
+    # Jacobian, and under ALPHAGRAD_QUALITY_METRIC=cosine one is already being
+    # built and scored PER POINT below -- in that case take the residual from
+    # there (free) instead of asking for a second exact execution.
+    _fid_from_quality = (_qmetric == "cosine")
+    _fid_on = bool(is_terminal) and fidelity_enabled()
+    # `_cos_log_due` CONSUMES a tick, so it must be evaluated exactly once per
+    # terminal callback and only when the subsample could actually be taken.
+    _cos_due = bool(is_terminal) and (not _fid_from_quality) and _cos_log_due()
+    # Does anything need an exact reference that the quality metric is not
+    # already producing? Keeping the approx output of point 0 alive costs one
+    # resident Jacobian, so only do it when a residual is actually wanted.
+    _fid_needs_ref = (_fid_on or _cos_due) and not _fid_from_quality
+    _fid_approx_out = None
+    _rel_frobs: list = []
+    _cos_logged: list = []
     # WHICH quantity the peak samples hold (see _record_mem_parity): the
     # measured runtime delta, the substituted static estimate, or nothing.
     _peak_src = "not_measured"
@@ -4891,7 +5200,7 @@ def _callback(
             # Jacobian is dropped immediately (the streamed-quality rule at
             # the top of this loop: never hold a second full Jacobian).
             # Costs the norm reductions and one device sync, no extra exec.
-            if _gcov_on and is_terminal and i == 0:
+            if (_gcov_on or _fid_needs_ref) and is_terminal and i == 0:
                 _gc_t0 = time.perf_counter()
                 _dense = out_approx
                 if compiled_cost is not compiled_approx:
@@ -4900,8 +5209,33 @@ def _callback(
                     # with the exact reference. One extra execution, and only
                     # under ALPHAGRAD_MEASURE_SPARSE.
                     _dense = compiled_approx(*eval_args_i)
-                _gcov_approx_norms = _leaf_norms(_dense, config.has_aux)
+                if _gcov_on:
+                    _gcov_approx_norms = _leaf_norms(_dense, config.has_aux)
                 _gcov_eval_args = eval_args_i
+                if _fid_needs_ref:
+                    # THE ONE EXTRA RESIDENT JACOBIAN the fidelity channel
+                    # costs. Held from point 0 until the exact-reference block,
+                    # which runs AFTER the whole cost loop -- so the expensive
+                    # half (the exact execution and the per-leaf reductions) is
+                    # never inside a timing or peak-memory window, the
+                    # invariant the coverage block already keeps.
+                    #
+                    # WHY HOLDING IT DOES NOT CORRUPT THE PEAK CHANNEL, which
+                    # is the obvious worry: `_time_one_rep`'s peak is an
+                    # ABOVE-BASELINE DELTA -- it snapshots `bytes_in_use`
+                    # before the rep and subtracts it -- so a retained
+                    # allocation raises the BASELINE, not the delta. Points
+                    # 1..N-1 are timed and measured exactly as they would be
+                    # with the channel off.
+                    #
+                    # WHAT IT DOES COST is residency: one extra full Jacobian
+                    # for the length of the loop, i.e. more OOM headroom used
+                    # on a big target (the streamed-quality note above sizes
+                    # these at ~4 GB each at batch 512). At the moment of
+                    # scoring the exact reference is alive alongside it, which
+                    # is the SAME pair the legacy cosine path holds per point,
+                    # so the ceiling is that path's, not double it.
+                    _fid_approx_out = _dense
                 _dense = None
                 _GRAD_COV_STATS["wall_s"] += time.perf_counter() - _gc_t0
 
@@ -4930,13 +5264,18 @@ def _callback(
                         if len(_EXACT_CACHE) >= max(n_points, 1):
                             _EXACT_CACHE.clear()
                         _EXACT_CACHE[_ex_key] = out_exact
-                # Score THIS point now and let the pair go out of scope —
-                # cos is the trained quality channel; the residual is
-                # discarded (frob was dropped as a channel).
+                # Score THIS point now and let the pair go out of scope — cos
+                # is the trained quality channel under this metric, and the
+                # residual is NO LONGER DISCARDED (A2): it is the fidelity
+                # channel, and here it is genuinely free because the exact
+                # reference is already resident for the cosine.
                 _jac_a = out_approx[1] if config.has_aux else out_approx
                 _jac_e = out_exact[1] if config.has_aux else out_exact
                 _cos, _rf = _quality_metrics(_jac_e, _jac_a)
                 cosines.append(_cos)
+                if _fid_on:
+                    _rel_frobs.append(float(_rf))
+                    _cos_logged.append(float(_cos))
 
         # ---- LOSS-DROP QUALITY ------------------------------------------
         # ONE walk per PLAN (not per data point): the probe batch is fixed
@@ -5023,9 +5362,10 @@ def _callback(
         # loss_drop appends exactly one entry, so the aggregation is the
         # identity there; it still runs so the cosine path is untouched.
         cosine_sim = float(_aggregate_samples(cosines, want_top_quartile=True))
-        # frob is no longer a channel anything reads. The slot stays 0.0 for
-        # real plans; the SENTINEL writers still stamp it, and the Ray pool's
-        # sentinel test keys on that, so the wire format is unchanged.
+        # The RAW relative residual, telemetry only: what TRAINS is the
+        # clipped `fidelity` in slot 8, written by the exact-reference block
+        # below (which may overwrite this). 0.0 here means "not measured",
+        # which is what it meant for every real plan before A2.
         frob_residual = 0.0
         # XLA-analysis side-channel (log-only: the exact/approx compression
         # RATIO; the absolute static estimate is not exported — it only ever
@@ -5097,18 +5437,46 @@ def _callback(
     _GRAD_COV_STATS["measure_wall_s"] += (
         time.perf_counter() - _gcov_measure_t0)
     grad_coverage = 0.0
-    if _gcov_on and _gcov_approx_norms is not None:
+    # FIDELITY (slot 8) -- see the block comment above `fidelity_enabled`.
+    fidelity = 0.0
+    _fid_measured = False
+    # (A) Under ALPHAGRAD_QUALITY_METRIC=cosine the residual was scored PER
+    # POINT inside the measure loop off the exact reference the cosine already
+    # needed, so there is nothing left to execute. Aggregate the FIDELITY
+    # values (not the residuals) with the same summary the cosine gets: both
+    # are "higher is better", so the two channels are summarised identically.
+    if _fid_on and _fid_from_quality and _rel_frobs:
+        _fids = [clipped_rel_frob(x) for x in _rel_frobs]
+        fidelity = float(_aggregate_samples(_fids, want_top_quartile=True))
+        frob_residual = float(np.median(
+            np.asarray(_rel_frobs, dtype=np.float64)))
+        _fid_measured = True
+        _record_fidelity(
+            fidelity, frob_residual,
+            float(np.median(np.asarray(_cos_logged, dtype=np.float64)))
+            if _cos_logged else None)
+    if _gcov_on or _fid_needs_ref:
         _gc_t0 = time.perf_counter()
+    if (_gcov_on or _fid_needs_ref) and _gcov_eval_args is not None:
+        _ex_norms = None
+        _rf_m = None
+        _cos_m = None
         try:
-            _ex_norms = _exact_leaf_norms(
+            # ONE exact execution for BOTH consumers. With `approx_out=None`
+            # (fidelity off) this is exactly the memoised norms-only path the
+            # guard has always used.
+            _ex_norms, _rf_m, _cos_m = _exact_ref_scores(
                 exact_cache_key,
                 _eval_digest(_gcov_eval_args),
                 lambda: cached_compile(b"exact:" + exact_cache_key,
                                        _do_compile_exact),
                 _gcov_eval_args,
                 config.has_aux,
+                approx_out=_fid_approx_out,
+                want_cos=bool(_fid_needs_ref),
             )
         except Exception as _exc:
+            _fid_approx_out = None
             # FAIL SOFT, LOUDLY. The exact reference is apparatus, not plan
             # quality: if graphax cannot build it (or it OOMs) the coverage is
             # UNDEFINED and the guard must not fire -- refusing a plan because
@@ -5127,12 +5495,45 @@ def _callback(
                       "not be built for this order; coverage is UNDEFINED and "
                       "the guard is inert for every affected plan: "
                       f"{type(_exc).__name__}: {str(_exc)[:160]}", flush=True)
+            # FIDELITY FAILS SOFT TOO, and for the same reason: an exact
+            # reference we could not build is apparatus failure, and scoring
+            # the plan -1.0 for it would be the very bias `_truncated_reward`
+            # warns about. The slot stays 0.0 = "not measured".
         else:
-            _cov = _grad_coverage(_gcov_approx_norms, _ex_norms)
-            _record_grad_coverage(_cov)
-            grad_coverage = _cov["channel"]
-            if _cov["defined"] and _cov["frac_zeroed"] > 0.0 \
-                    and reject_frozen_grads():
+            _fid_approx_out = None
+            if _rf_m is not None:
+                # A non-finite residual is a BROKEN COMPARISON (leaf-count or
+                # shape mismatch -- `_residual_scores` returns nan for exactly
+                # the cases `_quality_metrics` scores worst). That is evidence
+                # about the PLAN, not the apparatus, so it takes the floor,
+                # matching `_quality_metrics`'s documented rule.
+                if np.isfinite(_rf_m):
+                    frob_residual = float(_rf_m)
+                    fidelity = clipped_rel_frob(_rf_m)
+                else:
+                    frob_residual = float("inf")
+                    fidelity = -1.0
+                _fid_measured = True
+                _record_fidelity(fidelity, frob_residual, _cos_m)
+            elif _cos_m is not None:
+                # Cosine subsample with the channel off: record the cosine and
+                # DO NOT touch the fidelity counter, so the amortised-cost line
+                # attributes the exact reference to the right consumer. (This
+                # branch also covers the coverage-only case, where both are
+                # None and nothing is recorded -- in particular branch (A) has
+                # already recorded its own measurement and must not be
+                # double-counted here.)
+                _record_fidelity(None, None, _cos_m)
+            # FIDELITY-ONLY runs are possible (--fidelity-weight with
+            # --no-reject-frozen-grads): then nothing measured coverage, the
+            # guard is not armed, and slot 7 keeps its "not measured" 0.0.
+            _cov = (_grad_coverage(_gcov_approx_norms, _ex_norms)
+                    if (_gcov_on and _gcov_approx_norms is not None) else None)
+            if _cov is not None:
+                _record_grad_coverage(_cov)
+                grad_coverage = _cov["channel"]
+            if _cov is not None and _cov["defined"] \
+                    and _cov["frac_zeroed"] > 0.0 and reject_frozen_grads():
                 # HARD GUARD. Reuse of the DEGENERATE-PLAN path, deliberately:
                 # `_SENTINEL_BAD_REWARD` is the exact vector train_episode's
                 # `_is_degen` recognises (all six cost channels at
@@ -5146,9 +5547,18 @@ def _callback(
                 # the gradient with no counter). `_record_frozen_grad_plan`
                 # gives this its own visible counter and stdout line.
                 _GRAD_COV_STATS["wall_s"] += time.perf_counter() - _gc_t0
+                if _fid_needs_ref:
+                    _FIDELITY_STATS["wall_s"] += (
+                        time.perf_counter() - _gc_t0)
                 _record_frozen_grad_plan(_cov, o_list)
                 return tokens, eqn_ids, _SENTINEL_BAD_REWARD
         _GRAD_COV_STATS["wall_s"] += time.perf_counter() - _gc_t0
+        # Attributed to the fidelity channel ONLY when it is what forced the
+        # exact reference: with the coverage guard already paying for it the
+        # marginal cost is the per-leaf reductions, and the amortised line
+        # must not claim the guard's wall as the channel's price.
+        if _fid_needs_ref:
+            _FIDELITY_STATS["wall_s"] += time.perf_counter() - _gc_t0
     _pf("cb.grad_coverage")
     rewards = jnp.array(
         [
@@ -5163,6 +5573,10 @@ def _callback(
             # not measured -- byte-identical to what the dead frob slot
             # emitted (`frob_residual = 0.0` for every real plan).
             grad_coverage,
+            # Slot 8: FIDELITY = clip(1 - rel_frob, -1, 1). 0.0 whenever it was
+            # not measured (non-terminal, channel off, or the exact reference
+            # failed), matching the sparse-terminal convention of slot 6.
+            fidelity,
         ],
         dtype=jnp.float32,
     )
@@ -5172,8 +5586,12 @@ def _callback(
     # A plan that computes nothing reports every COST channel at its best
     # (fake-fast latency, tiny peak memory) — historically it was sentinelled
     # because that is the classic reward hack. It is no longer refused:
-    #   * `frob_residual` is EXACTLY 1.0 for an all-zero Jacobian (the worst
-    #     attainable value), so the quality channel already punishes it;
+    #   * `frob_residual` is EXACTLY 1.0 for an all-zero Jacobian, i.e. the
+    #     `fidelity` channel reads EXACTLY 0.0 there (A2) -- not the -1.0 floor,
+    #     which is reserved for a Jacobian that is actively wrong rather than
+    #     absent. A zero-work plan therefore scores strictly below every plan
+    #     that computes anything correct and strictly above one that computes
+    #     something backwards, which is the ordering we want;
     #   * under PopArt each channel is normalised by its own running sigma, so
     #     frob's [0, 1] range is rescaled to compete on equal terms with
     #     nanoseconds and bytes — which is precisely the commensurability the
@@ -5199,6 +5617,7 @@ def _callback(
                 f"[zero-work] KEPT (the quality channel punishes): muls=0 "
                 f"lat={latency_ns:.3g} peak={peak_memory:.3g} "
                 f"{_qmetric}={cosine_sim:.3e} frob={frob_residual:.3e} "
+                f"fid={fidelity:+.4f} "
                 f"rules(d/c/q)={_n_diag}/{_n_comp}/{_n_quant} "
                 f"skips={_n_skips} order={o_list}",
                 flush=True,
@@ -5518,6 +5937,13 @@ class VertexEliminationEnv:
                             face_skips_batch=(
                                 [rk[i] for i in _remote] if _any_faces
                                 else None),
+                            # A3 rotation, pooled path: the TRAINER's current
+                            # episode travels with the request because the
+                            # actor's inherited environment is frozen at
+                            # ray.init. `None` unless rotation is on, so the
+                            # flag-off wire is unchanged.
+                            episode=(walk_episode() if walk_rotate_enabled()
+                                     else None),
                         )
                     finally:
                         _mwdt = time.perf_counter() - _mw0
@@ -5559,6 +5985,8 @@ class VertexEliminationEnv:
                     order, specs, int(step),
                     eval_samples=eval_samples_t,
                     init=init,
+                    episode=(walk_episode() if walk_rotate_enabled()
+                             else None),
                 )
             finally:
                 _mwdt = time.perf_counter() - _mw0

@@ -155,7 +155,10 @@ def _build_reward_weights(args) -> np.ndarray:
     if "acc" in args.rewards:
         weights[REWARD_INDEX["cosine_sim"]] = 1.0
     if args.lambda_frob != 0.0:
-        weights[REWARD_INDEX["frob_residual"]] = args.lambda_frob
+        # A2: the flag names the Frobenius residual, so it weights the channel
+        # that IS one (slot 8). It addressed slot 7 by its historical alias,
+        # which has held GRADIENT COVERAGE since `bcb61a1`.
+        weights[REWARD_INDEX["fidelity"]] = args.lambda_frob
     return weights
 
 

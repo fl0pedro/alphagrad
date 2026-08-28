@@ -55,6 +55,7 @@ def _sentinel_callback_output(
     num_rewards: int,
     cosine_sim_idx: int,
     frob_residual_idx: int,
+    fidelity_idx: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return ``(tokens, eqn_ids, reward)`` matching the env's
     ``_callback_shape`` for a timeout / actor-death.
@@ -63,12 +64,26 @@ def _sentinel_callback_output(
     accuracy reward head doesn't see a wildly negative signal when
     the channel happens to have non-zero weight (``cosine_sim``'s
     natural range is ``[0, 1]``, with higher better).
+
+    ``fidelity_idx`` (reward slot 8, A2) takes ``-1.0`` -- its CLIP FLOOR --
+    for the same reason, and to match what ``env._SENTINEL_BAD_REWARD`` writes
+    into it. A bounded [-1, 1] channel stamped with -1e10 would make its PopArt
+    sigma meaningless for every real plan measured afterwards.
+
+    KNOWN INCONSISTENCY, deliberately left alone here: slot 7
+    (``frob_residual_idx``, now ``grad_coverage``) gets ``_SENTINEL_REWARD_VALUE``
+    from THIS writer but ``-1.0`` from ``env._SENTINEL_BAD_REWARD``, and it is
+    also bounded [-1, 1]. Changing it would change the value of an existing
+    live channel, which is not this workstream's to change; it is recorded so
+    the next person does not have to rediscover it.
     """
     tokens = np.zeros((max_tokens,), dtype=np.int32)
     eqn_ids = np.zeros((max_tokens,), dtype=np.int32)
     reward = np.full((num_rewards,), _SENTINEL_REWARD_VALUE, dtype=np.float32)
     reward[cosine_sim_idx] = 0.0
     reward[frob_residual_idx] = _SENTINEL_REWARD_VALUE
+    if fidelity_idx is not None and 0 <= int(fidelity_idx) < int(num_rewards):
+        reward[int(fidelity_idx)] = -1.0
     return tokens, eqn_ids, reward
 
 
@@ -103,7 +118,7 @@ class CpuApproxPool:
         the ``args_dict`` / ``variant`` / fresh ``actor_id`` needed
         to construct a replacement; see ``mu0_ray._run_one_variant``
         for the canonical implementation.
-    max_tokens, num_rewards, cosine_sim_idx, frob_residual_idx
+    max_tokens, num_rewards, cosine_sim_idx, frob_residual_idx, fidelity_idx
         Shape / index parameters for ``_sentinel_callback_output``;
         wired through from ``env.py``'s constants so this module
         stays JAX-free (importing ``env.py`` would pull JAX).
@@ -119,6 +134,7 @@ class CpuApproxPool:
         num_rewards: int,
         cosine_sim_idx: int,
         frob_residual_idx: int,
+        fidelity_idx: int | None = None,
         initial_timeout_s: float | None = None,
         warm_after: int = 3,
     ):
@@ -147,6 +163,10 @@ class CpuApproxPool:
         self._num_rewards = num_rewards
         self._cosine_sim_idx = cosine_sim_idx
         self._frob_residual_idx = frob_residual_idx
+        # Reward slot 8 (A2). Optional so a caller built against the 8-channel
+        # vector keeps working -- None simply leaves the slot at the generic
+        # sentinel, which is what it was before the channel existed.
+        self._fidelity_idx = fidelity_idx
         # Cached eval-samples ObjectRef. ``set_eval_samples`` does the
         # ``ray.put`` once; ``evaluate`` then passes the ref in place of
         # the per-call tuple, so Ray re-uses the deserialised value on
@@ -399,6 +419,7 @@ class CpuApproxPool:
         init: bool = False,
         face_specs: Any = None,
         face_skips: Any = None,
+        episode: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Dispatch one ``(order, specs, step)`` request to a pool
         actor and return ``(tokens, eqn_ids, reward)`` as numpy arrays.
@@ -408,6 +429,18 @@ class CpuApproxPool:
         Sentinel arrays mirror the in-process error path in
         ``CpuApproximationServer.evaluate`` (zero tokens, ``-1e10``
         reward except ``cosine_sim=0``).
+
+        ``episode`` CLOSES A3's POOLED-ROTATION GAP. A3 rotates the loss-drop
+        probe batch per episode by publishing ``ALPHAGRAD_WALK_EPISODE`` from
+        the trainer, and recorded the hole itself: Ray actors inherit the
+        driver's environment AS IT STOOD AT ``ray.init``, so a value
+        republished each episode reaches the trainer and NOT a long-lived
+        measure actor -- which would then keep scoring every plan on whatever
+        episode was current when it spawned, silently de-pairing the comparison
+        the rotation exists to make. Carrying the index in the request payload
+        is the fix: the actor republishes it into its OWN environment before
+        measuring, so both processes agree per call. ``None`` (the default)
+        forwards nothing and is byte-identical to the pre-A2 wire.
         """
         import ray
         from ray.exceptions import GetTimeoutError, RayActorError
@@ -425,6 +458,7 @@ class CpuApproxPool:
                 self._num_rewards,
                 self._cosine_sim_idx,
                 self._frob_residual_idx,
+                self._fidelity_idx,
             )
 
         future = None
@@ -449,6 +483,7 @@ class CpuApproxPool:
                             else np.asarray(face_specs, dtype=np.int32)),
                 face_skips=(None if face_skips is None
                             else np.asarray(face_skips, dtype=np.int32)),
+                episode=(None if episode is None else int(episode)),
             )
             # Per-actor cold/warm timeout. ``timeout_for`` returns 0
             # when the user requested no-timeout (``--cpu-callback-timeout 0``);
@@ -481,6 +516,7 @@ class CpuApproxPool:
                 self._num_rewards,
                 self._cosine_sim_idx,
                 self._frob_residual_idx,
+                self._fidelity_idx,
             )
         except RayActorError:
             self._n_actor_errors += 1
@@ -495,6 +531,7 @@ class CpuApproxPool:
                 self._num_rewards,
                 self._cosine_sim_idx,
                 self._frob_residual_idx,
+                self._fidelity_idx,
             )
         except Exception as _exc:
             # Catch-all: anything else (serialization issue, malformed
@@ -515,6 +552,7 @@ class CpuApproxPool:
                 self._num_rewards,
                 self._cosine_sim_idx,
                 self._frob_residual_idx,
+                self._fidelity_idx,
             )
 
     # ------------------------------------------------------------------
@@ -534,6 +572,7 @@ class CpuApproxPool:
         init: bool = False,
         face_specs_batch: "Sequence[Any] | None" = None,
         face_skips_batch: "Sequence[Any] | None" = None,
+        episode: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Phase-2 memory-mitigation probe #8: optional batch dedup.
 
@@ -551,6 +590,7 @@ class CpuApproxPool:
                 eval_samples=eval_samples, init=init,
                 face_specs_batch=face_specs_batch,
                 face_skips_batch=face_skips_batch,
+                episode=episode,
             )
         N = len(order_batch)
         # Build canonical key per slot; first-seen slot is the representative.
@@ -580,6 +620,7 @@ class CpuApproxPool:
                 eval_samples=eval_samples, init=init,
                 face_specs_batch=face_specs_batch,
                 face_skips_batch=face_skips_batch,
+                episode=episode,
             )
         t_u, e_u, r_u, s_u = self._evaluate_batch_impl(
             [order_batch[i] for i in uniq_idx],
@@ -590,6 +631,7 @@ class CpuApproxPool:
                               [face_specs_batch[i] for i in uniq_idx]),
             face_skips_batch=(None if face_skips_batch is None else
                               [face_skips_batch[i] for i in uniq_idx]),
+            episode=episode,
         )
         pos = {orig: k for k, orig in enumerate(uniq_idx)}
         tokens_out = np.zeros((N, self._max_tokens), dtype=np.int32)
@@ -614,6 +656,7 @@ class CpuApproxPool:
         init: bool = False,
         face_specs_batch: "Sequence[Any] | None" = None,
         face_skips_batch: "Sequence[Any] | None" = None,
+        episode: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Dispatch N requests concurrently. Returns
         ``(tokens_stack, eqn_ids_stack, rewards_stack, sentinel_mask)``
@@ -654,6 +697,7 @@ class CpuApproxPool:
                 _sentinel_callback_output(
                     self._max_tokens, self._num_rewards,
                     self._cosine_sim_idx, self._frob_residual_idx,
+                    self._fidelity_idx,
                 )
             )
             sentinel_mask[i] = True
@@ -737,6 +781,7 @@ class CpuApproxPool:
                         face_skips=(
                             None if face_skips_batch is None else
                             np.asarray(face_skips_batch[i], dtype=np.int32)),
+                        episode=(None if episode is None else int(episode)),
                     )
                     f_timeouts[i] = self._timeout_for(actor)
                 except Exception as _exc:
@@ -872,6 +917,7 @@ class CpuApproxPool:
                             int(step_batch[i]),
                             eval_samples=samples_arg,
                             init=bool(init),
+                            episode=(None if episode is None else int(episode)),
                         )
                         rto = self._timeout_for(fresh)
                         if rto <= 0.0:

@@ -45,21 +45,30 @@ REWARD_NAMES: tuple[str, ...] = (
     # drop (default under --measure-grad) or the legacy Jacobian cosine. The
     # slot did not move; ``REWARD_INDEX["cosine_sim"]`` is aliased below.
     "quality",
-    "frob_residual",
+    # Slot 7. RENAMED HERE 2026-08-28 to match env.REWARD_NAMES, which renamed
+    # it in `bcb61a1` and left this table behind: the slot has held GRADIENT
+    # COVERAGE (bounded [-1, 1]; see env._grad_coverage) ever since, while this
+    # module still called it `frob_residual` and `--lambda-frob` therefore
+    # silently weighted COVERAGE. The INDEX does not move and `frob_residual`
+    # is aliased onto it below, so every persisted index-keyed PopArt /
+    # calibration state and every historical call site is unaffected.
+    "grad_coverage",
     # RECONCILED (2026-08): this tuple is a SUPERSET of env.REWARD_NAMES, not a
-    # copy of it. Indices 0..7 are byte-identical to the env's 8-channel vector;
-    # indices 8 and 9 are the DEPRECATED Ray line's extra slots. They cannot be
-    # deleted here: BKSTEP_ACC_IDX / NO_SYMLOG_REWARD_INDICES and mu0's
-    # documented "10-channel layout" bridge (mu0._build_reward_weights) both pin
-    # bkstep_acc at index 9, and dropping index 8 alone would renumber it --
-    # silently invalidating every persisted PopArt/calibration state keyed by
-    # index. The mainline consumers already map by NAME and drop names the env
-    # does not emit, so a weight on index 8 is unreachable from the 8-channel
-    # env. What WAS wrong -- a second memory channel selectable via --mem-type --
-    # is fixed below: "xla_peak_memory" now ALIASES "peak_memory".
-    # index 8: deterministic XLA-analysis peak (temp+output+args); a dead slot on
-    # the mainline env, retained only to keep index 9 where it is.
-    "xla_peak_memory",
+    # copy of it. Indices 0..8 are byte-identical to the env's 9-channel vector;
+    # index 9 is the DEPRECATED Ray line's extra slot. It cannot be renumbered:
+    # BKSTEP_ACC_IDX / NO_SYMLOG_REWARD_INDICES and mu0's documented
+    # "10-channel layout" bridge (mu0._build_reward_weights) pin bkstep_acc at
+    # index 9, and moving it would silently invalidate every persisted
+    # PopArt/calibration state keyed by index.
+    #
+    # index 8 WAS "xla_peak_memory" -- explicitly documented right here as "a
+    # dead slot on the mainline env, retained only to keep index 9 where it is",
+    # and already resolved to `peak_memory` by _MEM_TYPE_TO_REWARD. A2 puts the
+    # env's new FIDELITY channel there, which is the one thing that could
+    # legitimately claim a dead slot: the alias below keeps the name
+    # `xla_peak_memory` working and now points it at index 5, which is where it
+    # actually resolved anyway.
+    "fidelity",
     # index 9: B_kstep closed-loop trainability accuracy in [0, 1]. Alternative
     # "acc" reward channel (ALPHAGRAD_ACC_PROXY=bkstep) — see env.REWARD_NAMES.
     "bkstep_acc",
@@ -70,40 +79,57 @@ REWARD_INDEX: dict[str, int] = {n: i for i, n in enumerate(REWARD_NAMES)}
 # until 2026-08-07. Every persisted PopArt / calibration state is keyed by
 # INDEX, so the alias is exact and nothing needs migrating.
 REWARD_INDEX["cosine_sim"] = REWARD_INDEX["quality"]
+# BACK-COMPAT ALIAS for slot 7, mirroring env.REWARD_INDEX exactly.
+REWARD_INDEX["frob_residual"] = REWARD_INDEX["grad_coverage"]
+# BACK-COMPAT ALIAS for the retired index-8 name. It resolves to the ONE memory
+# channel, which is where _MEM_TYPE_TO_REWARD has sent it since the duplicate
+# was removed; see warn_deprecated_reward_channel.
+REWARD_INDEX["xla_peak_memory"] = REWARD_INDEX["peak_memory"]
 QUALITY_IDX: int = REWARD_INDEX["quality"]
 # Historical spelling kept so the ~40 modules that import COSINE_SIM_IDX keep
 # working; it is the QUALITY slot, which no longer necessarily holds a cosine.
 COSINE_SIM_IDX: int = QUALITY_IDX
-FROB_RESIDUAL_IDX: int = REWARD_INDEX["frob_residual"]
+# Slot 7. `FROB_RESIDUAL_IDX` is retained as the historical spelling only --
+# it is the GRADIENT COVERAGE slot, not a Frobenius residual. New code should
+# use GRAD_COVERAGE_IDX (slot 7) or FIDELITY_IDX (slot 8), which is the one
+# that really is a (clipped, relative) Frobenius number.
+GRAD_COVERAGE_IDX: int = REWARD_INDEX["grad_coverage"]
+FROB_RESIDUAL_IDX: int = GRAD_COVERAGE_IDX
+FIDELITY_IDX: int = REWARD_INDEX["fidelity"]
 BKSTEP_ACC_IDX: int = REWARD_INDEX["bkstep_acc"]
 
 # Channels whose values are bounded / quality-signal, NOT raw cost — they
 # bypass symlog wherever a symlog transform would otherwise apply (gate
 # thresholds, calibration scaling). Mirrored from mu0.py:155 and
 # ppo_ray_worker.py:80.
-NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (COSINE_SIM_IDX, BKSTEP_ACC_IDX)
+# FIDELITY joins them: `clip(1 - rel_frob, -1, 1)` is bounded by construction,
+# so symlog would only discount its per-unit price against the cost channels.
+# (Slot 7 / grad_coverage is bounded too; it is exempted at the ppo.py site
+# instead, conditionally, so the flag-off mask stays bit-identical to HEAD.)
+NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (
+    COSINE_SIM_IDX, FIDELITY_IDX, BKSTEP_ACC_IDX)
 NO_SYMLOG_MASK_NP: np.ndarray = np.zeros((NUM_REWARDS,), dtype=bool)
 NO_SYMLOG_MASK_NP[list(NO_SYMLOG_REWARD_INDICES)] = True
 
 # Sparse-terminal channels: the env's ``_callback`` produces a
 # meaningful value for these ONLY on the terminal elimination step
 # (graphax's ``jacve`` returns a zero-norm Jacobian for any partial
-# order, so the cosine_sim / frob_residual comparison is mathematically
+# order, so the quality / fidelity comparison is mathematically
 # trivial mid-rollout). Downstream consumers must mask intermediate
 # steps when these channels participate in aggregation computations —
 # see :func:`aggregate_per_channel_stats`.
 SPARSE_TERMINAL_INDICES: tuple[int, ...] = (
-    COSINE_SIM_IDX, FROB_RESIDUAL_IDX, BKSTEP_ACC_IDX,
+    COSINE_SIM_IDX, GRAD_COVERAGE_IDX, FIDELITY_IDX, BKSTEP_ACC_IDX,
 )
 SPARSE_TERMINAL_MASK_NP: np.ndarray = np.zeros((NUM_REWARDS,), dtype=bool)
 SPARSE_TERMINAL_MASK_NP[list(SPARSE_TERMINAL_INDICES)] = True
 
 # Cost vs quality channels — the cost channels are stored as negative costs
-# (more negative = worse); the quality channels (cosine_sim, frob_residual,
-# bkstep_acc) are the positive "higher is better" signals. bkstep_acc must be
+# (more negative = worse); the quality channels (cosine_sim, grad_coverage,
+# fidelity, bkstep_acc) are the positive "higher is better" signals. They must be
 # excluded here so it is NOT symlog'd/negated like a cost.
 _QUALITY_REWARD_INDICES: tuple[int, ...] = (
-    COSINE_SIM_IDX, FROB_RESIDUAL_IDX, BKSTEP_ACC_IDX,
+    COSINE_SIM_IDX, GRAD_COVERAGE_IDX, FIDELITY_IDX, BKSTEP_ACC_IDX,
 )
 COST_REWARD_INDICES: tuple[int, ...] = tuple(
     i for i in range(NUM_REWARDS) if i not in _QUALITY_REWARD_INDICES
@@ -131,6 +157,43 @@ _MEM_TYPE_TO_REWARD: dict[str, str] = {
 
 _MEM_TYPE_DEPRECATED: dict[str, str] = {"xla_peak_memory": "peak_memory"}
 _MEM_TYPE_WARNED: set = set()
+# Channel NAMES that no longer own an index of their own (as opposed to
+# --mem-type values). ``xla_peak_memory`` used to be index 8 and is now an
+# alias of ``peak_memory``; index 8 is ``fidelity``. Naming it in
+# ALPHAGRAD_REWARD_CHANNELS still works and still weights the memory channel,
+# which is what it always resolved to -- but it now COLLIDES with an explicit
+# ``peak_memory`` entry in the same list (last one wins), so it warns.
+_CHANNEL_NAME_DEPRECATED: dict[str, str] = {"xla_peak_memory": "peak_memory"}
+_CHANNEL_NAME_WARNED: set = set()
+
+
+def warn_deprecated_reward_channel(name: str) -> str:
+    """Announce (once per process) a deprecated channel NAME; return its
+    canonical spelling."""
+    canon = _CHANNEL_NAME_DEPRECATED.get(name, name)
+    if name in _CHANNEL_NAME_DEPRECATED and name not in _CHANNEL_NAME_WARNED:
+        _CHANNEL_NAME_WARNED.add(name)
+        print(f"[args] WARNING reward channel {name!r} is DEPRECATED and now "
+              f"ALIASES {canon!r} (index {REWARD_INDEX[canon]}). Index 8 is the "
+              "fidelity channel. If your channel list also names "
+              f"{canon!r}, the two entries collide and the LAST one wins.",
+              flush=True)
+    return canon
+
+
+def _fidelity_channel_live() -> bool:
+    """Is the env actually populating reward slot 8 this process?
+
+    Mirrors ``env.fidelity_enabled`` without importing it (this module is
+    deliberately JAX-free and env.py pulls JAX).
+    """
+    import os as _osf
+    if _osf.environ.get("ALPHAGRAD_FIDELITY", "") not in ("", "0"):
+        return True
+    try:
+        return float(_osf.environ.get("ALPHAGRAD_FIDELITY_WEIGHT", "0")) != 0.0
+    except ValueError:
+        return False
 
 
 def warn_deprecated_mem_type(mem_type: str) -> str:
@@ -181,8 +244,9 @@ def build_reward_weights(args) -> np.ndarray:
     # reward vector already stores costs NEGATED (r = -cost) and the quality
     # channels (cosine_sim, bkstep_acc) POSITIVE, so a single POSITIVE weight
     # per channel gives the correct sign (reward low-cost + high-fidelity).
-    # frob_residual is emitted as -residual (negated) so it too takes a
-    # positive weight. Uniform weight (default 1.0, ALPHAGRAD_ALL_CHANNEL_W)
+    # grad_coverage and fidelity are BOTH stored "higher is better" and bounded
+    # in [-1, 1] (coverage: +min_leaf_ratio / -frac_zeroed; fidelity:
+    # clip(1 - rel_frob, -1, 1)), so they too take a positive weight. Uniform weight (default 1.0, ALPHAGRAD_ALL_CHANNEL_W)
     # since PopArt handles the disparate raw scales. Channels that are not
     # actually populated are left at 0 so a dead channel (e.g. latency without
     # --measure-latency, bkstep without ALPHAGRAD_BKSTEP=1) never enters the
@@ -236,7 +300,7 @@ def build_reward_weights(args) -> np.ndarray:
                 f"valid keys: {sorted(REWARD_INDEX)}"
             )
         for _nm, _wv in _pairs:
-            w[REWARD_INDEX[_nm]] = _wv
+            w[REWARD_INDEX[warn_deprecated_reward_channel(_nm)]] = _wv
         if not np.any(w):
             w[REWARD_INDEX["muls_adds_fmas"]] = 1.0
         return w
@@ -254,13 +318,21 @@ def build_reward_weights(args) -> np.ndarray:
             "flops", "muls_adds_fmas", "max_io_sum", "bytes_accessed",
             # ONE memory channel: xla_peak_memory was a duplicate of
             # peak_memory and double-weighted memory in the all-channel reward.
-            "peak_memory", "cosine_sim", "frob_residual",
+            "peak_memory", "cosine_sim",
+            # Spelt correctly since 2026-08-28: this index is GRADIENT
+            # COVERAGE. The name changed, the index did not, so this entry is
+            # byte-identical to the "frob_residual" it replaces.
+            "grad_coverage",
         ]
         if bool(getattr(args, "measure_latency", False)) or \
                 getattr(args, "cmp_type", "") == "latency":
             _names.append("latency_ns")
         if _osac.environ.get("ALPHAGRAD_BKSTEP", "0") == "1":
             _names.append("bkstep_acc")
+        # Gated exactly like bkstep_acc: a channel the env is not populating
+        # must never enter the sum, or PopArt normalises a constant 0.0.
+        if _fidelity_channel_live():
+            _names.append("fidelity")
         for _nm in _names:
             w[REWARD_INDEX[_nm]] = _w_all
         if not np.any(w):
@@ -285,9 +357,28 @@ def build_reward_weights(args) -> np.ndarray:
         _acc_proxy = _os.environ.get("ALPHAGRAD_ACC_PROXY", "cosine").strip().lower()
         _acc_idx = BKSTEP_ACC_IDX if _acc_proxy == "bkstep" else COSINE_SIM_IDX
         w[_acc_idx] = float(getattr(args, "lambda_acc", 1.0))
+    # --lambda-frob NOW WEIGHTS THE FIDELITY CHANNEL (slot 8), not slot 7.
+    #
+    # THE FOOTGUN THIS CLOSES. The flag has always meant "weight on the
+    # Frobenius residual" and has always been written as
+    # ``w[FROB_RESIDUAL_IDX]``. When `bcb61a1` repurposed slot 7 from
+    # frob_residual to grad_coverage, that line did not change and neither did
+    # the name -- so from that commit until now, every driver whose
+    # ``--lambda-frob`` defaulted to 1.0 (args_ppo.py, mu0_args.py) was putting
+    # a full-strength weight on the GRADIENT COVERAGE channel, which nobody
+    # chose and which is a hard GUARD, not a trained objective.
+    #
+    # Two ways to fix it were available: point the flag at nothing (default 0),
+    # or point it at the channel it names. A2 adds a channel that really is the
+    # relative Frobenius residual, so the flag is repointed at slot 8 and its
+    # two 1.0 defaults are set to 0.0 -- matching ppo.py / alpha0.py / gfn.py,
+    # which already default it to 0. The result: nothing is weighted by
+    # accident, and a launcher that passes --lambda-frob gets what it asked for.
+    # NOTE the weight is inert unless the fidelity CHANNEL is measured
+    # (ppo's --fidelity-weight / ALPHAGRAD_FIDELITY); slot 8 reads 0.0 otherwise.
     lam_frob = float(getattr(args, "lambda_frob", 0.0))
     if lam_frob != 0.0:
-        w[FROB_RESIDUAL_IDX] = lam_frob
+        w[FIDELITY_IDX] = lam_frob
 
     # Capped-cossim GUIDE weight (anti flat-zero-basin). When the acc channel
     # is routed to B_kstep (ALPHAGRAD_ACC_PROXY=bkstep), cosine_sim (idx 6) is
@@ -678,10 +769,10 @@ def _reward_group(name: str) -> str:
     """Return ``"cost"`` or ``"quality"`` per REWARD_NAMES layout.
 
     Cost channels: muls_adds_fmas, flops, latency_ns, max_io_sum,
-    bytes_accessed, peak_memory. Quality channels: cosine_sim,
-    frob_residual.
+    bytes_accessed, peak_memory. Quality channels: quality (cosine_sim),
+    grad_coverage, fidelity, bkstep_acc.
     """
-    if REWARD_INDEX[name] in (COSINE_SIM_IDX, FROB_RESIDUAL_IDX):
+    if REWARD_INDEX[name] in _QUALITY_REWARD_INDICES:
         return "quality"
     return "cost"
 

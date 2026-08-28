@@ -78,11 +78,12 @@ def make_argparser() -> argparse.ArgumentParser:
                    default=["cmp", "mem", "acc"], choices=["cmp", "mem", "acc"])
     p.add_argument("--lambda-cmp", type=float, default=1.0)
     p.add_argument("--lambda-mem", type=float, default=1.0)
-    # frob (Jacobian magnitude residual) is now active by default
-    # alongside cossim (direction). Bumped 0.0 → 1.0 so both quality
-    # channels contribute to the gradient; the Lagrangian range
-    # constraint stays on cossim only.
-    p.add_argument("--lambda-frob", type=float, default=1.0)
+    # --lambda-frob: DEFAULT 1.0 -> 0.0 (workstream A2, 2026-08-28). See the
+    # long note on the same flag in args_ppo.py: since `bcb61a1` renamed reward
+    # slot 7 to `grad_coverage`, this default was weighting the coverage GUARD,
+    # not the Jacobian residual it names. The residual now has slot 8
+    # (`fidelity`, clipped relative Frobenius) and the flag points there.
+    p.add_argument("--lambda-frob", type=float, default=0.0)
     p.add_argument(
         "--measure-latency", action="store_true",
         help="Run the compiled approx fn 10x per env step to populate "

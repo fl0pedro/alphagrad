@@ -72,7 +72,13 @@ def test_build_reward_weights_with_lambdas():
     w = build_reward_weights(args)
     assert w[REWARD_INDEX["flops"]] == pytest.approx(3.5)
     assert w[REWARD_INDEX["peak_memory"]] == pytest.approx(0.5)
-    assert w[REWARD_INDEX["frob_residual"]] == pytest.approx(0.25)
+    # --lambda-frob NAMES the Frobenius residual, and since A2 (2026-08-28) it
+    # weights the channel that IS one: slot 8, `fidelity`. It used to be
+    # written as w[FROB_RESIDUAL_IDX], which `bcb61a1` silently turned into a
+    # weight on the GRADIENT COVERAGE guard when it renamed slot 7.
+    assert w[REWARD_INDEX["fidelity"]] == pytest.approx(0.25)
+    assert w[REWARD_INDEX["grad_coverage"]] == 0.0
+    assert w[REWARD_INDEX["frob_residual"]] == 0.0  # the alias == slot 7
 
 
 # ---------------------------------------------------------------------------

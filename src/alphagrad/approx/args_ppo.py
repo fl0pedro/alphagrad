@@ -115,12 +115,23 @@ def add_ppo_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "weight of 1.0 — set ~25 to bring cosine to a COMPARABLE magnitude so "
         "PPO actually trades accuracy against cost.",
     )
-    # Both quality channels (cosine_sim direction + frob magnitude) are
-    # now active rewards by default. cossim is gated by ``acc`` in
-    # ``--rewards`` (weight = 1.0 when present). frob has its own
-    # lambda; bumped from the prior 0.0 default so the Jacobian-error
-    # magnitude contributes to the gradient alongside cossim.
-    p.add_argument("--lambda-frob", type=float, default=1.0)
+    # --lambda-frob: DEFAULT 1.0 -> 0.0 (workstream A2, 2026-08-28).
+    #
+    # The comment this replaces described the flag as putting the Jacobian-error
+    # MAGNITUDE alongside the cosine's direction. That stopped being true in
+    # `bcb61a1`, which repurposed reward slot 7 from `frob_residual` to
+    # `grad_coverage` without touching either the flag or
+    # `reward_scaling.build_reward_weights`'s `w[FROB_RESIDUAL_IDX] = lam_frob`.
+    # From that commit until now, this 1.0 default silently put a full-strength
+    # weight on the GRADIENT COVERAGE channel -- a hard GUARD, not an objective,
+    # and a weight nobody chose.
+    #
+    # A2 gives the residual a slot of its own again (slot 8, `fidelity`, the
+    # CLIPPED relative Frobenius) and repoints the flag there. The default drops
+    # to 0.0 to match ppo.py / alpha0.py / gfn.py, so nothing is weighted by
+    # accident; pass it explicitly, together with the channel switch
+    # (--fidelity-weight / ALPHAGRAD_FIDELITY), to train on fidelity.
+    p.add_argument("--lambda-frob", type=float, default=0.0)
     p.add_argument(
         "--lambda-cossim-guide", type=float, default=0.0,
         help="Weight on the CAPPED-cossim GUIDE term added to the reward: "
@@ -385,10 +396,11 @@ def add_ppo_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--reward-pipeline", type=str, default="legacy",
         choices=["legacy", "pca2"],
         help="Reward scalarization pipeline. ``legacy`` (default): "
-             "current weighted-sum of 8 channels via --lambda-cmp/mem/frob. "
+             "current weighted-sum of the reward channels via "
+             "--lambda-cmp/mem/frob. "
              "``pca2``: PCA-2 compresses the 6 cost channels into 2 "
-             "decorrelated unit-variance latents, sums them; cossim/frob "
-             "still enter via --lambda-frob.",
+             "decorrelated unit-variance latents, sums them; the quality and "
+             "fidelity channels still enter via --lambda-acc/--lambda-frob.",
     )
     p.add_argument(
         "--pca-refit-every", type=int, default=100,

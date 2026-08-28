@@ -81,6 +81,7 @@ from alphagrad.approx.env import (
     consume_degenerate_plan_count,
     consume_frozen_grad_plan_count,
     consume_grad_coverage_stats,
+    consume_fidelity_stats,
     consume_truncated_plan_count,
     consume_untraceable_plan_count,
     consume_zero_work_plan_count,
@@ -355,6 +356,13 @@ VALUE_HEAD_ATTRS: tuple[str, ...] = (
 # `configure_symlog` rebinds the symlog mask. Default 0 => three heads and a
 # bit-identical agent pytree (pinned by tests/grad_coverage_test.py).
 GRAD_COVERAGE_HEAD = "value_head_gcov"
+# --fidelity-weight > 0 APPENDS a head on reward slot 8 (``fidelity``, the
+# CLIPPED RELATIVE FROBENIUS -- workstream A2, the owner's trained fidelity
+# signal). Same mechanism, same discipline as the coverage head above: default
+# 0 => the head is not constructed, contributes no pytree leaves, and every
+# saved checkpoint keeps loading. INDICES ARE ONLY EVER APPENDED, never
+# inserted, because persisted PopArt state is keyed by index.
+FIDELITY_HEAD = "value_head_fid"
 # Resolved from --quality-metric in `main`; names the quantity reward slot 6
 # actually holds, for every human-readable log line and the wandb
 # ``quality/metric`` key.
@@ -397,6 +405,46 @@ def configure_grad_coverage(args) -> tuple[bool, float]:
         _HEAD_REWARD_INDICES_ARR = jnp.asarray(
             HEAD_REWARD_INDICES, dtype=jnp.int32)
     return guard, weight
+
+
+def configure_fidelity(args) -> tuple[float, int]:
+    """Install the fidelity-channel configuration. PRE-EVERYTHING.
+
+    Same contract and the same three "before"s as
+    :func:`configure_grad_coverage` -- before ``ray.init`` (the measure actors
+    read the exported environment), before ``_build_agent`` (an extra value
+    head changes the agent pytree and ``pref_proj``'s input width) and before
+    the first jit trace (``_HEAD_REWARD_INDICES_ARR`` is captured as a
+    constant). CALL IT AFTER ``configure_grad_coverage`` so the appended head
+    order is deterministic: [latency, mem, quality, (grad_cov), (fidelity)].
+
+    Returns ``(weight, cos_log_every)``.
+
+    WHAT IT COSTS. The fidelity channel needs the EXACT Jacobian, which the
+    default ``loss_drop`` quality metric never builds. With
+    ``--reject-frozen-grads`` on (the default) that reference is being
+    materialised anyway for the coverage guard and env.py folds both scores
+    into the one execution; with the guard OFF, turning this on buys a full
+    exact reference per plan. The measured price is published every episode as
+    ``fidelity/wall_amortised_s``.
+    """
+    global HEAD_REWARD_INDICES, NUM_VALUE_HEADS, HEAD_NAMES
+    global VALUE_HEAD_ATTRS, _HEAD_REWARD_INDICES_ARR
+    weight = float(getattr(args, "fidelity_weight", 0.0) or 0.0)
+    cos_every = int(getattr(args, "cos_log_every", 0) or 0)
+    os.environ["ALPHAGRAD_FIDELITY_WEIGHT"] = repr(weight)
+    os.environ["ALPHAGRAD_COS_LOG_EVERY"] = str(max(0, cos_every))
+    if weight != 0.0 and FIDELITY_HEAD not in VALUE_HEAD_ATTRS:
+        # IDEMPOTENT, like the coverage twin: a caller that re-parses args
+        # must not append the head twice.
+        HEAD_REWARD_INDICES = tuple(HEAD_REWARD_INDICES) + (
+            int(REWARD_INDEX["fidelity"]),)
+        HEAD_NAMES = tuple(HEAD_NAMES) + ("fidelity",)
+        VALUE_HEAD_ATTRS = tuple(VALUE_HEAD_ATTRS) + (FIDELITY_HEAD,)
+        NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
+        _HEAD_REWARD_INDICES_ARR = jnp.asarray(
+            HEAD_REWARD_INDICES, dtype=jnp.int32)
+    return weight, max(0, cos_every)
 # Slot 2 was named "cos" until 2026-08-07; it is the value head for reward
 # slot 6, which now holds whichever quality metric env.quality_metric()
 # selects (the 200-step Adam-walk loss drop by default under --measure-grad,
@@ -669,6 +717,11 @@ def configure_symlog(args) -> str:
         _exempt = (int(REWARD_INDEX["cosine_sim"]),)
     if float(getattr(args, "grad_coverage_weight", 0.0) or 0.0) != 0.0:
         _exempt = _exempt + (int(REWARD_INDEX["grad_coverage"]),)
+    # FIDELITY is bounded [-1, 1] by construction too (env.py's
+    # `clipped_rel_frob`), for exactly the same reason and with exactly the
+    # same conditional-so-the-flag-off-mask-is-bit-identical caveat.
+    if float(getattr(args, "fidelity_weight", 0.0) or 0.0) != 0.0:
+        _exempt = _exempt + (int(REWARD_INDEX["fidelity"]),)
     _set_no_symlog_indices(_exempt)
     return mode
 
@@ -1963,6 +2016,9 @@ class Agent(eqx.Module):
     # the pytree, so the flag-off agent is leaf-for-leaf what HEAD builds and
     # every saved checkpoint keeps loading.
     value_head_gcov: MLP | None
+    # Value head for reward slot 8 (``fidelity``). ``None`` unless
+    # --fidelity-weight != 0; a ``None`` field contributes NO leaves.
+    value_head_fid: MLP | None
     op_embedding: eqx.nn.Embedding
     # NO identity_pool and NO ctx_proj. A vertex's identity is palimpsa's rows
     # for its own equation, scattered into its own slot by `carry_stream`;
@@ -2005,6 +2061,7 @@ class Agent(eqx.Module):
         max_substeps=16,
         face_path_policy=None,
         value_head_gcov=None,
+        value_head_fid=None,
     ):
         self.embedding = embedding
         self.pos_enc = pos_enc
@@ -2017,6 +2074,7 @@ class Agent(eqx.Module):
         self.value_head_mem = value_head_mem
         self.value_head_cos = value_head_cos
         self.value_head_gcov = value_head_gcov
+        self.value_head_fid = value_head_fid
         self.op_embedding = op_embedding
         self.pref_proj = pref_proj
         self.num_vertices = num_vertices
@@ -2074,6 +2132,8 @@ class Agent(eqx.Module):
         _vs = [v_flops, v_mem, v_cos]
         if self.value_head_gcov is not None:
             _vs.append(self.value_head_gcov(summary))
+        if self.value_head_fid is not None:
+            _vs.append(self.value_head_fid(summary))
         value = jnp.concatenate(_vs, axis=-1)
         return vertex_logits, vertex_contexts, value
 
@@ -2555,6 +2615,8 @@ class Agent(eqx.Module):
         _vs = [v_flops, v_mem, v_cos]
         if self.value_head_gcov is not None:
             _vs.append(self.value_head_gcov(summary))
+        if self.value_head_fid is not None:
+            _vs.append(self.value_head_fid(summary))
         value = jnp.concatenate(_vs, axis=-1)
         return vertex_logits, vertex_contexts, value
 
@@ -3836,9 +3898,46 @@ def make_argparser() -> argparse.ArgumentParser:
         "--lambda-frob",
         type=float,
         default=0.0,
-        help="NO-OP, accepted for launcher compatibility. The Frobenius "
-             "residual is no longer a trained channel and has no value head.",
+        help="NO-OP ON THIS DRIVER (ppo.py scalarises through "
+             "--lambda-cmp/--lambda-mem/--lambda-acc and the per-head "
+             "preference vector, not through reward_scaling.build_reward_"
+             "weights). On the drivers that DO use build_reward_weights it now "
+             "weights reward slot 8, `fidelity` -- the clipped relative "
+             "Frobenius residual, which is what the flag has always named. It "
+             "weighted slot 7 until 2026-08-28, and slot 7 stopped being the "
+             "Frobenius residual in bcb61a1, so for that window the flag "
+             "silently weighted GRADIENT COVERAGE. Use --fidelity-weight to "
+             "train on fidelity here.",
     )
+    # ---- FIDELITY, reward slot 8 (workstream A2) -------------------------
+    p.add_argument(
+        "--fidelity-weight", type=float, default=0.0,
+        help="Weight on the FIDELITY value head (reward slot 8): "
+             "clip(1 - ||J_e - J_a||_F / ||J_e||_F, -1, 1), where +1 is an "
+             "exact Jacobian, 0 is an error the size of the gradient (an "
+             "all-zero Jacobian lands EXACTLY here, where the cosine is 0/0 "
+             "and undefined) and -1 is the clip floor for a Jacobian that is "
+             "actively wrong. DEFAULT 0 = channel OFF and not measured: the "
+             "slot reads 0.0, no head is constructed, and the agent pytree is "
+             "leaf-for-leaf what it was. Non-zero APPENDS a value head and "
+             "exports ALPHAGRAD_FIDELITY_WEIGHT to the measure actors. COST: "
+             "the channel needs the exact Jacobian; with --reject-frozen-grads "
+             "on (default) it shares the reference that guard already builds "
+             "and costs only the per-leaf reductions, with the guard off it "
+             "pays a full exact reference per plan. Measured price is logged "
+             "as fidelity/wall_amortised_s.")
+    p.add_argument(
+        "--cos-log-every", type=int, default=0,
+        help="Log the Jacobian COSINE every Nth terminal plan per measure "
+             "process. 0 (default) = never. The cosine is a diagnostic, not a "
+             "trained channel: it needs an exact reference at 9.70 s / 4.24 GB "
+             "per plan versus loss_drop's 0.22 s / 40 MB -- 44x -- so it is "
+             "subsampled rather than computed per plan. NOTE this stride only "
+             "FORCES a reference nothing else asked for: whenever one is "
+             "materialised anyway (--fidelity-weight, --reject-frozen-grads, "
+             "or --quality-metric cosine) the cosine is one extra per-leaf dot "
+             "product on resident leaves and is taken on every such plan. "
+             "Exports ALPHAGRAD_COS_LOG_EVERY.")
     p.add_argument("--gate-tau", type=float, default=0.5,
                    help="mult mode: cosine gate threshold tau (g=0 below it).")
     p.add_argument("--gate-w", type=float, default=40.0,
@@ -5005,6 +5104,14 @@ def _build_agent(
     if GRAD_COVERAGE_HEAD in VALUE_HEAD_ATTRS:
         value_head_gcov = MLP(args.embd_dim, 1, value_dims,
                               key=jrand.fold_in(encoder_keys[12], 7))
+    # FIDELITY value head. Key FOLDED IN from keys[12] with a different tag
+    # than the coverage head's, for the same reason: widening the `jrand.split`
+    # would move every positional key and change the randomness of every seeded
+    # run, flag off included.
+    value_head_fid = None
+    if FIDELITY_HEAD in VALUE_HEAD_ATTRS:
+        value_head_fid = MLP(args.embd_dim, 1, value_dims,
+                             key=jrand.fold_in(encoder_keys[12], 8))
     op_embedding = eqx.nn.Embedding(
         OP_TYPE_VOCAB_SIZE,
         args.op_embd_dim,
@@ -5089,6 +5196,7 @@ def _build_agent(
         value_head_mem=value_head_mem,
         value_head_cos=value_head_cos,
         value_head_gcov=value_head_gcov,
+        value_head_fid=value_head_fid,
         op_embedding=op_embedding,
         pref_proj=pref_proj,
         num_vertices=total_v,
@@ -5430,6 +5538,11 @@ def _build_head_weights(args) -> np.ndarray:
     if GRAD_COVERAGE_HEAD in VALUE_HEAD_ATTRS:
         weights[HEAD_NAMES.index("grad_cov")] = np.float32(
             getattr(args, "grad_coverage_weight", 0.0) or 0.0)
+    # --fidelity-weight W adds ``+ W*fidelity``, RAW (see configure_symlog:
+    # bounded, never symlogged). The head exists only when W != 0.
+    if FIDELITY_HEAD in VALUE_HEAD_ATTRS:
+        weights[HEAD_NAMES.index("fidelity")] = np.float32(
+            getattr(args, "fidelity_weight", 0.0) or 0.0)
     return weights
 
 
@@ -5677,6 +5790,20 @@ def main():
     print(f"[cfg] grad coverage: guard={'ON' if _gc_guard else 'OFF'} "
           f"(--reject-frozen-grads) reward_weight={_gc_weight:g} "
           f"heads={NUM_VALUE_HEADS} ({', '.join(HEAD_NAMES)})", flush=True)
+    # FIDELITY (reward slot 8) -- must follow configure_grad_coverage so the
+    # appended head order is deterministic, and must precede _build_agent /
+    # configure_symlog / the first trace for the same three reasons.
+    _fid_weight, _cos_every = configure_fidelity(args)
+    if _fid_weight != 0.0 or _cos_every:
+        os.environ.setdefault("ALPHAGRAD_FIDELITY",
+                              "1" if _fid_weight != 0.0 else "0")
+    print(f"[cfg] fidelity (clipped rel-Frobenius, slot 8): "
+          f"weight={_fid_weight:g} cos_log_every={_cos_every} "
+          f"heads={NUM_VALUE_HEADS} ({', '.join(HEAD_NAMES)})"
+          + ("" if (_fid_weight == 0.0 or _gc_guard) else
+             "  [NOTE: --reject-frozen-grads is OFF, so this channel pays a "
+             "FULL exact Jacobian reference per plan instead of sharing the "
+             "guard's]"), flush=True)
 
     _apply_variant_preset(args)
     if args.variant != "custom":
@@ -6120,6 +6247,7 @@ def main():
             num_rewards=int(NUM_REWARDS),
             cosine_sim_idx=int(REWARD_INDEX["cosine_sim"]),
             frob_residual_idx=int(REWARD_INDEX["frob_residual"]),
+            fidelity_idx=int(REWARD_INDEX["fidelity"]),
         )
         object.__setattr__(env, "_remote_pool", _pool)
         object.__setattr__(env, "_remote_timeout_s",
@@ -10833,6 +10961,42 @@ def main():
                       f"{_gcs['max_frac_zeroed']:.4g} "
                       f"added_wall={100.0 * _gcs['wall_frac']:.2f}%",
                       flush=True)
+        except Exception:
+            pass
+
+        # ---- FIDELITY + the subsampled cosine log ---------------------------
+        # `fidelity/wall_amortised_s` is the honest per-plan price of the exact
+        # reference this channel (and the cosine log) needs -- the number the
+        # --cos-log-every stride exists to control. It is near zero when the
+        # coverage guard was already paying for that reference.
+        try:
+            _fs = consume_fidelity_stats()
+            if _fs["count"] or _fs["cos_count"]:
+                log_dict["fidelity/measured_this_ep"] = int(_fs["count"])
+                log_dict["fidelity/exact_execs_this_ep"] = int(
+                    _fs["exact_execs"])
+                log_dict["fidelity/wall_s"] = float(_fs["wall_s"])
+                log_dict["fidelity/wall_amortised_s"] = float(
+                    _fs["wall_amortised_s"])
+                if _fs["count"]:
+                    log_dict["fidelity/mean"] = float(_fs["mean"])
+                    log_dict["fidelity/min"] = float(_fs["min"])
+                    log_dict["fidelity/max"] = float(_fs["max"])
+                    log_dict["fidelity/clipped_low_this_ep"] = int(
+                        _fs["clipped_low"])
+                if _fs["cos_count"]:
+                    # LOGGED, NOT TRAINED (owner's choice).
+                    log_dict["quality/cos_logged_count"] = int(_fs["cos_count"])
+                    log_dict["quality/cos_logged_mean"] = float(_fs["cos_mean"])
+                    log_dict["quality/cos_logged_min"] = float(_fs["cos_min"])
+                print(f"[fidelity ep{ep}] measured={int(_fs['count'])} "
+                      f"mean={_fs['mean']:.4g} min={_fs['min']:.4g} "
+                      f"clipped_low={int(_fs['clipped_low'])} | "
+                      f"cos_logged={int(_fs['cos_count'])} "
+                      f"mean={_fs['cos_mean']:.4g} | "
+                      f"exact_execs={int(_fs['exact_execs'])} "
+                      f"wall={_fs['wall_s']:.2f}s "
+                      f"({_fs['wall_amortised_s']:.3f}s/plan)", flush=True)
         except Exception:
             pass
 

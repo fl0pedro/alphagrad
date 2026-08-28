@@ -15,9 +15,10 @@ What is pinned here:
    norms (``run_analysis/landscape/face_forensics.json``) so the shipped
    function must produce the same zeroed-leaf sets as the investigation did.
 2. THE WIRE. Reward slot 7 is ``grad_coverage``; ``frob_residual`` is a
-   back-compat alias for the same index (cpu_approx_pool's sentinel writer,
-   alpha0's --lambda-frob and az_gumbel all address it by that name), the
-   vector is still 8 wide, and the degenerate sentinel is unchanged -- so
+   back-compat alias for the same index (cpu_approx_pool's sentinel writer and
+   az_gumbel address it by that name; alpha0's --lambda-frob was repointed at
+   the real Frobenius channel by A2), the vector is 9 wide since A2 APPENDED
+   slot 8, and the degenerate sentinel is unchanged -- so
    ``ppo.train_episode``'s ``_is_degen`` still recognises a rejected plan.
 3. THE GUARD is OFF at the library level unless explicitly enabled, so a job
    launched before this commit cannot pick it up from a respawned measure
@@ -70,7 +71,10 @@ _FORENSICS_ALT = "/Users/assmuth/dsnn/run_analysis/landscape/face_forensics.json
 
 # ---------------------------------------------------------------- the wire
 def test_slot7_is_grad_coverage_and_frob_is_an_alias():
-    assert NUM_REWARDS == 8
+    # 8 until 2026-08-28; A2 APPENDED slot 8 (`fidelity`). Appending is the
+    # only legal way to add a channel -- persisted PopArt / calibration state
+    # is keyed by INDEX -- and slot 7 did not move.
+    assert NUM_REWARDS == 9
     assert REWARD_NAMES[7] == "grad_coverage"
     assert REWARD_INDEX["grad_coverage"] == 7
     # 100+ historical call sites address slot 7 by the old name.

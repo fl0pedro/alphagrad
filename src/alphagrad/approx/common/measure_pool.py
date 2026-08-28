@@ -27,6 +27,7 @@ import sys
 def spawn_measure_pool(args_dict: dict, *, n_actors: int, exec_on_gpu: bool,
                        timeout_s: float, max_tokens: int, num_rewards: int,
                        cosine_sim_idx: int, frob_residual_idx: int,
+                       fidelity_idx: int | None = None,
                        first_gpu: int = 1):
     """Create ``n_actors`` GPU-pinned measure actors and wrap them in a pool.
 
@@ -90,6 +91,10 @@ def spawn_measure_pool(args_dict: dict, *, n_actors: int, exec_on_gpu: bool,
         num_rewards=int(num_rewards),
         cosine_sim_idx=int(cosine_sim_idx),
         frob_residual_idx=int(frob_residual_idx),
+        # Reward slot 8 (A2). None => the sentinel writer leaves the slot at the
+        # generic value, which is what callers built before the channel existed
+        # already get.
+        fidelity_idx=(None if fidelity_idx is None else int(fidelity_idx)),
     )
 
 
