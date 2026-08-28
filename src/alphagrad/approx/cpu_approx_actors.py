@@ -203,11 +203,26 @@ class CpuApproximationActor:
         point_idx: int = -1,
         face_specs=None,
         face_skips=None,
+        episode: int | None = None,
     ):
+        # ``episode`` IS NOT OPTIONAL AT THE WIRE. 4c4d872 gave
+        # ``CpuApproxPool.evaluate`` / ``evaluate_batch`` an ``episode``
+        # field (A3's pooled walk rotation) and both forward it to
+        # ``actor.evaluate.remote(...)``, but this wrapper -- the only thing
+        # between the pool and ``CpuApproximationServer.evaluate``, which
+        # HAS accepted ``episode`` all along -- was never given the
+        # parameter. Every pooled dispatch therefore died with
+        #   TypeError: got an unexpected keyword argument 'episode'
+        # the pool sentinelled the row, killed the actor, and the remaining
+        # slots came back "pool-drained (actor died)": under --ray-measure
+        # NO plan was measured at all, every terminal reward was the
+        # degenerate sentinel, and the failure was visible only as
+        # [SENTINEL] lines the trainer does not gate on.
         return self._impl.evaluate(
             order, sparsity_specs, step,
             eval_samples=eval_samples, init=init, point_idx=point_idx,
             face_specs=face_specs, face_skips=face_skips,
+            episode=episode,
         )
 
     def evaluate_batch(self, batch: Sequence[tuple]):
