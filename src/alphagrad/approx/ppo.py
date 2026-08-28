@@ -1013,6 +1013,80 @@ def _split_entropy_bonus(entropy_loss, face_ent_mean, entropy_weight,
             + face_entropy_weight * face_ent_mean)
 
 
+def kl_ref_enabled(args):
+    """--kl-ref-weight / --kl-ref-target: is the trust region ON?
+
+    Both default to 0.0 = OFF, and OFF is a PYTHON-level static gate: every
+    term this feature adds sits behind ``if _KL_REF_ON:``, the reference
+    forward pass is never traced, the extra ``train_episode`` argument is
+    ``None`` (not a pytree leaf, so it does not even enter the trace) and
+    the metrics tuple keeps its historic 7-slot KL layout. A default run is
+    therefore bit-identical to the one before the flag existed. Pinned by
+    tests/kl_ref_trust_region_test.py.
+    """
+    return (float(getattr(args, "kl_ref_weight", 0.0) or 0.0) > 0.0
+            or float(getattr(args, "kl_ref_target", 0.0) or 0.0) > 0.0)
+
+
+def _kl_ref_estimate(log_p_new, log_p_ref):
+    """KL(reference || current) on the SAMPLED actions -- Schulman's k3.
+
+    ``k3 = (r - 1) - log r`` with ``r = exp(log_p_new - log_p_ref)``. This is
+    the SAME estimator ``_kl_approx`` (the ``kl/approx`` diagnostic) already
+    uses against the behaviour policy, reused rather than a second KL: it is
+    non-negative for EVERY sample (not just in expectation), exactly 0 iff
+    the two policies give the action the identical log-prob, and second-order
+    in the log-ratio, so a single tail sample cannot dominate the mean the
+    way plain ``-log r`` can.
+
+    ESTIMATOR CAVEAT, stated because it changes what the number means: the
+    actions were drawn from the BEHAVIOUR policy (the parameters at rollout
+    time), not from the reference, so this is
+    ``E_behaviour[k3]``, an unbiased estimate of ``KL(ref||new)`` only while
+    behaviour == ref (epoch 0 of episode 0) and a consistent-in-practice
+    proxy afterwards. That is exactly the standard RLHF/PPO usage and is the
+    quantity the adaptive controller below is tuned against.
+
+    ONE-SIDED, BY CONSTRUCTION: k3 is symmetric in neither argument. It grows
+    fastest when the current policy puts LESS mass on an action the reference
+    liked, which is the direction that matters here -- v62/v63 died by the
+    face head's OP_NONE mass diffusing away, not by it concentrating.
+    """
+    lr = log_p_new - log_p_ref
+    return jnp.mean(jnp.exp(lr) - 1.0 - lr)
+
+
+def _kl_ref_dual_update(coef, kl, target, eta, coef_min, coef_max):
+    """--kl-ref-target: the adaptive KL coefficient, ONCE PER EPISODE,
+    host-side, AFTER the update -- the same shape as ``_lag_dual_ascent``.
+
+    The standard RLHF controller (Ziegler et al. 2019, sec 2.2):
+
+        e    = clip((KL - target) / target, -0.2, +0.2)
+        coef = clip(coef * (1 + eta * e), coef_min, coef_max)
+
+    MULTIPLICATIVE, not additive, because the coefficient has to span orders
+    of magnitude (the useful weight for a 1e-4 KL and for a 1e0 KL differ by
+    ~1e4) and an additive dual with a single step size cannot: it either
+    crawls at the top of the range or overshoots at the bottom. The +-20%
+    clamp on the relative error bounds the per-episode move to +-eta*20%
+    regardless of how far off target the KL is, so one pathological episode
+    cannot blow the price up -- and the [coef_min, coef_max] clip bounds the
+    whole trajectory. Fixed weights are what this campaign keeps mis-tuning
+    (--entropy-weight 0.05 -> 0.005 -> 0 across v62/v63/R2); a bounded,
+    self-correcting dual removes that knob.
+
+    ``target <= 0`` returns the coefficient unchanged: --kl-ref-weight alone
+    is the FIXED-price arm and must stay fixed. Pure host arithmetic on
+    floats -- never touches rewards, value targets or PopArt statistics.
+    """
+    if not (target > 0.0):
+        return float(coef)
+    prop = float(np.clip((float(kl) - target) / target, -0.2, 0.2))
+    return float(np.clip(float(coef) * (1.0 + float(eta) * prop),
+                         float(coef_min), float(coef_max)))
+
+
 def _lag_basin_freeze(old_stats, new_stats, q_terminal, lag_tau, head_idx):
     """Dossier section-10(3) basin-freeze guard for the quality PopArt channel.
 
@@ -4415,6 +4489,58 @@ def make_argparser() -> argparse.ArgumentParser:
                    "runaway. v64+ uses 0.05, matching identity-init H.")
     p.add_argument("--face-entropy-floor-weight", type=float, default=10.0,
                    help="weight of the --face-entropy-floor hinge.")
+    # ------------------------------------------- KL-TO-REFERENCE TRUST REGION
+    # THE STABILITY KNOB. It is NOT the contrast knob -- see the note on
+    # --kl-ref-weight. Default 0 = off = bit-identical to before it existed.
+    p.add_argument("--kl-ref-weight", type=float, default=0.0,
+                   help="weight of the KL penalty against a FROZEN "
+                   "reference policy (the identity-initialised parameters, "
+                   "snapshotted once at startup and never updated). The "
+                   "penalty is Schulman k3 on the JOINT log-prob of the "
+                   "stored actions; the vertex term cancels exactly (both "
+                   "sides read the same vertex distribution) and under "
+                   "ALPHAGRAD_FORCE_REV_ORDER=1 the vertex head has exactly "
+                   "ONE legal action anyway, so its KL is structurally 0 -- "
+                   "what is penalised is the FACE head plus its live-face "
+                   "context stream. 0 = OFF (default). WHAT THIS DOES AND "
+                   "DOES NOT FIX: it bounds DRIFT (v62/v63 diffused the "
+                   "face head to uniform until every plan was destroyed); "
+                   "it CANNOT create CONTRAST (R2 parked at identity for "
+                   "250 episodes with quality spread 3e-06 across 16 plans "
+                   "-- there was nothing to learn from, and a trust region "
+                   "makes that MORE stable, not less). The contrast knob is "
+                   "ALPHAGRAD_FACE_NONE_BIAS. Sweep them together.")
+    p.add_argument("--kl-ref-target", type=float, default=0.0,
+                   help="ADAPTIVE variant: hold kl_ref near this value by "
+                   "raising/lowering --kl-ref-weight with the standard "
+                   "RLHF dual (Ziegler et al. 2019), once per episode, "
+                   "host-side, clipped to [--kl-ref-coef-min, "
+                   "--kl-ref-coef-max]. 0 = OFF, i.e. --kl-ref-weight is a "
+                   "FIXED price. Setting a target with weight 0 starts the "
+                   "dual at --kl-ref-coef-min (a multiplicative dual can "
+                   "never leave 0).")
+    p.add_argument("--kl-ref-eta", type=float, default=1.0,
+                   help="step size of the --kl-ref-target dual. The "
+                   "per-episode move is bounded by +-eta*20%% by "
+                   "construction (the relative error is clipped to +-0.2), "
+                   "so eta=1 means at most +-20%% per episode.")
+    p.add_argument("--kl-ref-coef-min", type=float, default=1e-3,
+                   help="lower clip on the adaptive KL coefficient.")
+    p.add_argument("--kl-ref-coef-max", type=float, default=1e3,
+                   help="upper clip on the adaptive KL coefficient.")
+    p.add_argument("--target-kl", type=float, default=0.0,
+                   help="PPO early stopping on the BEHAVIOUR-policy KL "
+                   "(kl/approx, the joint-ratio k3). 0 = OFF (default; it "
+                   "did not exist before). This is NOT a loop break -- the "
+                   "update runs inside a lax.scan over "
+                   "epochs x minibatches, which cannot break -- it zeroes "
+                   "the POLICY-gradient term for any minibatch whose KL "
+                   "already exceeds the target. The value head and the "
+                   "entropy bonus keep training on that minibatch, which "
+                   "is the usual approximation (spinning-up stops the whole "
+                   "epoch instead). Independent of --kl-ref-*: this one "
+                   "bounds movement per UPDATE, the reference KL bounds "
+                   "movement per RUN.")
     p.add_argument("--face-logit-clamp", type=float, default=15.0,
                    help="bound every unified-face-head logit to (-C, C) "
                    "via C*tanh(z/C) before softmax/sigmoid (see "
@@ -6951,6 +7077,78 @@ def main():
     # build_and_init_agent and does not route through it.
     from alphagrad.approx.common.agent_factory import apply_face_none_bias
     agent = apply_face_none_bias(agent)
+    # ------------------------------------------- KL-TO-REFERENCE TRUST REGION
+    # THE FROZEN REFERENCE POLICY, snapshotted HERE and never again: after
+    # _build_agent + apply_init_scheme + apply_face_none_bias, i.e. exactly
+    # the IDENTITY-INITIALISED policy (OP_NONE +B / SKIP -B). equinox modules
+    # are immutable pytrees, so this binding IS the snapshot -- every later
+    # `agent = ...` rebinds the name and leaves these arrays untouched, and a
+    # checkpoint resume replaces `agent` but NOT the reference. Identity is
+    # the only anchor that means anything: it is the policy v62/v63 diffused
+    # away from and the one R2 sat on.
+    #
+    # WHICH HEAD(S) THE KL COVERS -- the design decision, stated once:
+    #   * The penalty is k3 on the JOINT log-prob of the STORED actions.
+    #   * The VERTEX term cancels EXACTLY: both sides read the same
+    #     `new_vertex_dist` (the reference pass re-runs the FACE path only,
+    #     off the current encoding), so log p_vertex is subtracted from both.
+    #     Under ALPHAGRAD_FORCE_REV_ORDER=1 that term is structurally 0
+    #     anyway -- the vertex head has exactly one legal action per step, so
+    #     its distribution is a point mass under ANY parameters and no KL of
+    #     it can ever be non-zero. There is nothing to penalise there.
+    #   * The MICRO (per-vertex) term is 0 under --live-faces: the
+    #     MicroActionPolicy is not constructed at all, log_p_sub is a
+    #     constant 0 (see evaluate_action_dynamic). This is why the flags
+    #     REQUIRE --live-faces below: without it log_p_sub would not cancel
+    #     and the difference would silently mean something else.
+    #   * So the live quantity is the FACE head's KL, including its
+    #     live-face context stream (the reference `_face_replay` runs under
+    #     REFERENCE palimpsa weights over the stored emission window).
+    #   * NOT covered: the base/vertex ENCODER. The reference pass consumes
+    #     the CURRENT encoding (pc_logits / pc_ctx / pc_carry) rather than
+    #     re-running the whole base-stream scan under reference parameters.
+    #     So this is a trust region on the DECISION RULE given the
+    #     representation, not on the representation itself: an encoder that
+    #     drifts moves both policies together and the KL can read small
+    #     while behaviour changes. Stated, not hidden. The alternative costs
+    #     a second full base encode per minibatch and was not worth it for
+    #     the failure this is aimed at (the face head's logits, which is
+    #     where v62/v63 actually moved).
+    _KL_REF_ON = kl_ref_enabled(args)
+    _TARGET_KL = float(getattr(args, "target_kl", 0.0) or 0.0)
+    _kl_ref_agent = agent if _KL_REF_ON else None
+    _kl_ref_coef = 0.0
+    if _KL_REF_ON:
+        _missing = [n for n, v in (
+            ("--face-actions", getattr(args, "face_actions", False)),
+            ("--unified-face-head", getattr(args, "unified_face_head", False)),
+            ("--live-faces", getattr(args, "live_faces", False)),
+            ("--dynamic-substeps", getattr(args, "dynamic_substeps", False)),
+        ) if not bool(v)]
+        if _missing:
+            raise SystemExit(
+                "--kl-ref-weight/--kl-ref-target need " + ", ".join(_missing)
+                + ": the penalty is the FACE head's KL and it is only "
+                "well-defined when the face path is the only live "
+                "approximation head (see the note above -- without "
+                "--live-faces the per-vertex micro log-prob does not "
+                "cancel between the two sides).")
+        _kl_ref_coef = float(getattr(args, "kl_ref_weight", 0.0) or 0.0)
+        if float(getattr(args, "kl_ref_target", 0.0) or 0.0) > 0.0:
+            # A multiplicative dual can never leave 0.
+            _kl_ref_coef = max(
+                _kl_ref_coef, float(args.kl_ref_coef_min))
+        print(f"[kl-ref] trust region ON: coef0={_kl_ref_coef:g} "
+              f"target={float(args.kl_ref_target):g} "
+              f"eta={float(args.kl_ref_eta):g} "
+              f"clip=[{float(args.kl_ref_coef_min):g}, "
+              f"{float(args.kl_ref_coef_max):g}]; reference = the "
+              f"identity-init policy (frozen). KL covers the FACE head; "
+              f"the vertex term cancels exactly.", flush=True)
+    if _TARGET_KL > 0.0:
+        print(f"[target-kl] policy-gradient gate at kl/approx > "
+              f"{_TARGET_KL:g} (per minibatch; value + entropy unaffected)",
+              flush=True)
     # Stage D: build per-head boolean parameter masks once. Used inside
     # train_minibatch to scale gradients by the head-specific LR multiplier
     # (warm-up ramp from §3.2). Masks are pytree leaves aligned with the
@@ -7737,6 +7935,7 @@ def main():
         key,
         pin_rules_to_exact_jax,
         op_legality_override,
+        kl_ref_coef=None,
     ):
         # Dynamic-substeps path branches off here so the legacy path
         # stays exactly as written. `_dynamic_loss_fn` lives below and
@@ -7746,10 +7945,11 @@ def main():
         # the JAX-traced arg is ignored there.)
         if args.dynamic_substeps:
             return _dynamic_loss_fn(
-                agent, batch, key, op_legality_override
+                agent, batch, key, op_legality_override, kl_ref_coef
             )
     def _dynamic_loss_fn(
-        agent, batch: TrainBatch, key, op_legality_override
+        agent, batch: TrainBatch, key, op_legality_override,
+        kl_ref_coef=None,
     ):
         """Dynamic-substeps loss: routes through MicroActionPolicy.evaluate.
 
@@ -8334,6 +8534,90 @@ def main():
         )
         ppo_loss = jnp.mean(-clipping_objective)
 
+        # --target-kl: PPO EARLY STOPPING, minibatch-local. The update lives
+        # inside `lax.scan` over epochs x minibatches and a scan cannot
+        # break, so "stop" is implemented as what stopping would have
+        # achieved -- zero policy gradient from this minibatch. The gate is
+        # stop_gradient-ed: it is a decision about the batch, not a term
+        # whose derivative anyone wants. The value head and the entropy
+        # bonus are deliberately left running (they are not what runs away).
+        if _TARGET_KL > 0.0:
+            ppo_loss = ppo_loss * jax.lax.stop_gradient(
+                (_kl_approx <= _TARGET_KL).astype(jnp.float32))
+
+        # ------------------------------------------ KL TO THE FROZEN REFERENCE
+        # See the design note at the `_kl_ref_agent` snapshot in main(): this
+        # re-scores the STORED face actions under the frozen identity-init
+        # parameters and penalises the k3 divergence from them. It is the
+        # FACE path only -- `_face_replay` is the whole of the face policy
+        # under --live-faces -- and it consumes the CURRENT encoding, so the
+        # vertex log-prob is subtracted from both sides and cancels exactly.
+        #
+        # COST: one extra face replay per sample, FORWARD ONLY (the reference
+        # parameters are closure constants, and the result is
+        # stop_gradient-ed, so no residuals are stored and no cotangent is
+        # produced for it). Nothing is traced at all when the flag is off.
+        kl_ref = jnp.zeros((), jnp.float32)
+        kl_ref_pen = jnp.zeros((), jnp.float32)
+        if _KL_REF_ON:
+            def _ref_face_logp(vidx, ax_st, ax_vm, fa, fpv, fcv, fv, fen,
+                               cy, fct, fdt, fde, *per):
+                """The face log-prob of the stored action under the FROZEN
+                reference, with the identical masks/carry/window the live
+                policy was just scored with -- anything else and the two
+                log-probs are not comparable (the same trap the PPO ratio
+                has: a wrong mask is silent, it just stops meaning 1)."""
+                _feats = _axis_features_from_state(ax_st[vidx], ax_vm[vidx])
+                return _kl_ref_agent._face_replay(
+                    _feats, factor_tables, fa, fpv, fcv, fv, cy,
+                    (fct, fdt, fde), op_legality_override,
+                    face_bound=_face_bound,
+                    face_win_budget=_face_win_budget,
+                    endpoint_rows=(per[0] if _EP_READ else None),
+                    face_ends=fen,
+                    edge_rows=(per[1 if _EP_READ else 0]
+                               if _EDGE_MEM else None),
+                    face_eslots=(per[2 if _EP_READ else 1]
+                                 if _EDGE_MEM else None),
+                    face_heads=(per[-1 - (2 if _PFM_SIZES else 0)]
+                                if _FACE_HEADS else None),
+                    face_sizes=(per[-2] if _PFM_SIZES else None),
+                    face_quant=(per[-1] if _PFM_SIZES else None),
+                )[0]
+
+            _ref_logp = jax.lax.stop_gradient(
+                jax.vmap(_ref_face_logp)(
+                    batch.vertex_idx,
+                    batch.axis_state,
+                    batch.axis_valid_mask,
+                    face_actions_b,
+                    batch.face_pair_valid,
+                    batch.face_comp_valid,
+                    batch.face_valid,
+                    batch.face_endpoints,
+                    pc_carry,
+                    batch.face_counts,
+                    batch.face_delta_tokens,
+                    batch.face_delta_eqns,
+                    *((pc_eprows,) if _EP_READ else ()),
+                    *((pc_emrows, batch.face_eslots) if _EDGE_MEM else ()),
+                    *((batch.face_heads,) if _FACE_HEADS else ()),
+                    *((_pfm_checked(batch.face_sizes, batch.face_quant))
+                      if _PFM_SIZES else ()),
+                )
+            )
+            # Strip the vertex term from the live joint log-prob so both
+            # sides are the FACE log-prob and nothing else. `log_probs` is
+            # log p_vertex + log p_sub + log p_face, and log p_sub is a
+            # structural 0 under --live-faces (enforced at setup).
+            _vd_k = jnp.clip(batch.vertex_idx.astype(jnp.int32), 0,
+                             new_vertex_dist.shape[-1] - 1)
+            _lp_vertex = jnp.log(
+                jnp.take_along_axis(new_vertex_dist, _vd_k[:, None],
+                                    axis=-1).squeeze(-1) + 1e-8)
+            kl_ref = _kl_ref_estimate(log_probs - _lp_vertex, _ref_logp)
+            kl_ref_pen = jnp.asarray(kl_ref_coef, jnp.float32) * kl_ref
+
         # Entropy normalized by per-sample sub-episode length (returned by
         # MicroActionPolicy.evaluate). Clamp to ≥ 1.0 to avoid divide-by-
         # zero on samples where the sub-episode was forced END at step 0.
@@ -8451,6 +8735,15 @@ def main():
                           kl_exp + kl_kind + kl_quant,
                           jnp.asarray(_kl_approx, jnp.float32),
                           jnp.asarray(_max_log_ratio, jnp.float32))
+        if _KL_REF_ON:
+            # Slots 7/8/9 are APPENDED ONLY when the trust region is on, so
+            # a default run keeps the historic 7-slot array byte for byte
+            # (the host reader is guarded on the length).
+            _kl_components = _kl_components + (
+                jnp.asarray(kl_ref, jnp.float32),
+                jnp.asarray(kl_ref_pen, jnp.float32),
+                jnp.asarray(kl_ref_coef, jnp.float32),
+            )
 
         # Per-component entropy under the current policy, using the same
         # active-substep / DIAG gating as the KL split. Pairs with the
@@ -8521,6 +8814,11 @@ def main():
                 jnp.mean(face_ents),
                 float(args.face_entropy_floor),
                 float(args.face_entropy_floor_weight))
+        # --kl-ref-weight: the trust region enters the loss HERE and
+        # nowhere else -- never through rewards, value targets or PopArt
+        # statistics (the same containment rule the Lagrangian dual has).
+        if _KL_REF_ON:
+            total_loss = total_loss + kl_ref_pen
 
         # ---------------------------------------------------- FEATURE PROBE
         # The pack is returned as `has_aux` DATA, never as a term of
@@ -8721,6 +9019,7 @@ def main():
         probe_opt_state,
         vprobes,
         vprobe_opt_state,
+        kl_ref_coef_arg,
     ):
         subkey, key = jrand.split(key)
         rollout_key, key = jrand.split(key)
@@ -9332,6 +9631,9 @@ def main():
                     t_key,
                     pin_rules_to_exact_arg,
                     op_legality_override_arg,
+                    # None when the trust region is off -- None is not a
+                    # pytree leaf, so the trace is unchanged.
+                    kl_ref_coef_arg,
                 )
                 # `has_aux` carries the probe's read-only view of the
                 # representation alongside the metrics. filter_grad does not
@@ -10195,6 +10497,24 @@ def main():
             log_dict["ratio/max_log"] = float(kl_components[6])
             log_dict["ratio/max"] = float(
                 np.exp(np.clip(float(kl_components[6]), -700, 700)))
+        # kl_ref/*: the trust region. Present ONLY when --kl-ref-weight or
+        # --kl-ref-target is set (the slots are appended by the loss under
+        # the same condition), so their absence is the flag being off and
+        # not a missing measurement. `value` is the k3 estimate of
+        # KL(identity-init || current) on the FACE head, `penalty` is what
+        # was actually added to the loss, `coef` is the (possibly adaptive)
+        # price the loss used for THIS episode.
+        if kl_components.shape[0] > 9:
+            log_dict["kl_ref/value"] = float(kl_components[7])
+            log_dict["kl_ref/penalty"] = float(kl_components[8])
+            log_dict["kl_ref/coef"] = float(kl_components[9])
+            # One line per episode, stdout, so the trust region is
+            # legible in a --wandb disabled smoke too (the wandb panels are
+            # the same three numbers). Only ever printed when the flag is
+            # on -- the slots do not exist otherwise.
+            print(f"[kl-ref] value={log_dict['kl_ref/value']:.6g} "
+                  f"penalty={log_dict['kl_ref/penalty']:.6g} "
+                  f"coef={log_dict['kl_ref/coef']:.6g}", flush=True)
         # Measured-reward panels. Emitted ONLY when at least one env produced a
         # real measurement this episode (see the LIVE mask above) so the shared
         # `mean_<channel>` / `mean_return` keys carry the same quantity the
@@ -11645,6 +11965,12 @@ def main():
             (agent, opt_state, global_step,
              popart_m1, popart_m2, popart_w),
         )
+        # --kl-ref-*: the episode's price, as a TRACED scalar. It cannot be
+        # a closure constant: `train_episode` is eqx.filter_jit-ed and its
+        # cache key does not see closure contents, so a captured array would
+        # go STALE the first time the dual moved. None when off.
+        _kl_ref_coef_arg = (jnp.asarray(_kl_ref_coef, jnp.float32)
+                            if _KL_REF_ON else None)
         _xtr_on = bool(_xtr_dir) and ep in _xtr_eps
         if _xtr_on:
             jax.profiler.start_trace(os.path.join(_xtr_dir, f"ep{ep}"))
@@ -11689,6 +12015,7 @@ def main():
             probe_opt_state,
             vprobes,
             vprobe_opt_state,
+            _kl_ref_coef_arg,
         )
         if _xtr_on:
             # The trace has to stay open until the device is drained or the
@@ -11697,6 +12024,17 @@ def main():
                 (agent, opt_state, metrics, total_rewards_full,
                  global_step, popart_m1, popart_m2, popart_w))
             jax.profiler.stop_trace()
+        # --kl-ref-target: DUAL ASCENT, once per episode, host-side, AFTER
+        # the update -- the same placement and the same containment as the
+        # Lagrangian dual (`_lag_dual_ascent`). Slot 7 of the per-component
+        # KL array is this episode's mean kl_ref; the loss appends it only
+        # when the trust region is on.
+        if _KL_REF_ON:
+            _kl_ref_ep = float(np.asarray(metrics[9])[7])
+            _kl_ref_coef = _kl_ref_dual_update(
+                _kl_ref_coef, _kl_ref_ep,
+                float(args.kl_ref_target), float(args.kl_ref_eta),
+                float(args.kl_ref_coef_min), float(args.kl_ref_coef_max))
         # SEEDED EQUIVALENCE DUMP (ALPHAGRAD_EQ_DUMP=<prefix>, off by default).
         # Any change to the env / callback / rollout path has to be proven
         # trajectory-identical against its parent commit, and the only honest
