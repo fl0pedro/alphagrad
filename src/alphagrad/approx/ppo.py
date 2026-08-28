@@ -11095,8 +11095,24 @@ def main():
             for _ek, _ev in _em_stats.items():
                 log_dict[f"edgemem/{_ek}"] = float(_ev)
             print("[edgemem ep%d] %s" % (ep, _em_stats), flush=True)
-        _HEALTH_N[0] += 1
-        if _HEALTH_N[0] <= int(os.environ.get("ALPHAGRAD_HEALTH_EPISODES", "3")):
+        # PopArt WARM-START episodes run NO gradient step: the caller passes an
+        # all-NaN `_wmets` purely to keep the tuple shape uniform (see
+        # --popart-init-episodes) and host_log drops every loss-derived key
+        # ~100 lines below. This line ran BEFORE that drop and counted warm-up
+        # rows against the budget -- and since --popart-init-episodes and
+        # ALPHAGRAD_HEALTH_EPISODES BOTH default to 3, the three health lines a
+        # run printed were ALWAYS the three warm-up rows, reading
+        # "ppo=nan value=nan ent=nan ratio/max_log=nan". The first REAL
+        # training episode never printed one, so ratio/max_log -- the
+        # ratio-1-at-epoch-0 tripwire this line exists to show -- was never
+        # displayed at all, and the expected warm-up NaNs camouflaged that.
+        # Warm-up rows are now labelled `[health warmup]`, print `n/a` for the
+        # undefined fields, and do NOT consume the budget.
+        if not warmup:
+            _HEALTH_N[0] += 1
+        _hlabel = "warmup" if warmup else "ep%d" % (_HEALTH_N[0] - 1)
+        if warmup or _HEALTH_N[0] <= int(
+                os.environ.get("ALPHAGRAD_HEALTH_EPISODES", "3")):
             # The launch check, on stdout where a running job can be read
             # without wandb. ratio/max_log must be ~0 at epoch 0 BY
             # CONSTRUCTION -- the stored old log-prob IS the sampling
@@ -11108,15 +11124,25 @@ def main():
             # tqdm.write, not print: a bare print during a live progress bar
             # is clobbered by the next \r repaint, which is how v65/v66b lost
             # stdout lines that were genuinely emitted.
-            tqdm.write("[health ep%d] ppo=%.4g value=%.4g ent=%.4g "
-                       "ratio/max_log=%.3g kl/approx=%.3g mu_quality=%.4g "
-                       "sec/ep=%.1f" % (
-                           _HEALTH_N[0] - 1, ppo_loss, value_loss,
-                           policy_entropy,
-                           log_dict.get("ratio/max_log", float("nan")),
-                           log_dict.get("kl/approx", float("nan")),
-                           log_dict.get("popart/mu_quality", float("nan")),
-                           log_dict.get("time/sec_per_episode", float("nan"))))
+            # `n/a`, never NaN, for a metric that is UNDEFINED here: a warm-up
+            # row has no gradient step, and an absent key is a missing
+            # measurement rather than a bad number. Anything that still prints
+            # `nan` on a `[health ep..]` line is therefore a REAL non-finite
+            # value -- which is exactly what tools/smoke.sh exits non-zero on.
+            def _hk(_k, _f="%.4g", _warm_undef=True):
+                if (_warm_undef and warmup) or _k not in log_dict:
+                    return "n/a"
+                return _f % float(log_dict[_k])
+            _hv = (lambda _v, _f="%.4g": "n/a" if warmup else _f % float(_v))
+            tqdm.write("[health %s] ppo=%s value=%s ent=%s "
+                       "ratio/max_log=%s kl/approx=%s mu_quality=%s "
+                       "sec/ep=%s" % (
+                           _hlabel, _hv(ppo_loss), _hv(value_loss),
+                           _hv(policy_entropy),
+                           _hk("ratio/max_log", "%.3g"),
+                           _hk("kl/approx", "%.3g"),
+                           _hk("popart/mu_quality", "%.4g", False),
+                           _hk("time/sec_per_episode", "%.1f", False)))
             if _LIVE_FACES is not None:
                 # A chunk that fails soft is EMPTY, and an empty chunk leaves
                 # the palimpsa carry where it was -- i.e. the head decides on
@@ -11124,8 +11150,8 @@ def main():
                 # exists to remove, while every metric still looks healthy.
                 # `truncated` is the same failure by a different route: the
                 # window kept only the tail of the contraction.
-                tqdm.write("[health ep%d] live-faces %s" % (
-                    _HEALTH_N[0] - 1, _LIVE_FACES.consume_stats()))
+                tqdm.write("[health %s] live-faces %s" % (
+                    _hlabel, _LIVE_FACES.consume_stats()))
         # ---- PER-EPISODE PER-PLAN CENSUS on stdout -------------------------
         # One line, every episode, whenever --lean-logging is off. This is the
         # sec-14.7 falsifier in readable form: the per-plan JOINT plus an
@@ -11572,8 +11598,12 @@ def main():
         b_ret_unnorm = np.abs(all_rets[_disp_idx])
         means_str = ", ".join(f"{float(x):.2e}" for x in np.abs(mean_r))
         b_ret_desc = ", ".join(f"{float(x):.2e}" for x in b_ret_unnorm)
+        # `ent:nan` on the bar was the SAME warm-up artefact as the health
+        # line (all-NaN `_wmets`), and it was read as a real failure more than
+        # once. Undefined during a warm-up row -> say so.
         pbar.set_description(
-            f"ent:{policy_entropy:.3f} best:{b_ret_desc} means:{means_str}"
+            f"ent:{'n/a' if warmup else format(policy_entropy, '.3f')} "
+            f"best:{b_ret_desc} means:{means_str}"
         )
 
     # Training loop.
