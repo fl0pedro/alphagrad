@@ -74,7 +74,8 @@ def test_slot7_is_grad_coverage_and_frob_is_an_alias():
     # 8 until 2026-08-28; A2 APPENDED slot 8 (`fidelity`). Appending is the
     # only legal way to add a channel -- persisted PopArt / calibration state
     # is keyed by INDEX -- and slot 7 did not move.
-    assert NUM_REWARDS == 9
+    # ... and A7 APPENDED slot 10 (`sparsity`) with slot 9 reserved.
+    assert NUM_REWARDS == 11
     assert REWARD_NAMES[7] == "grad_coverage"
     assert REWARD_INDEX["grad_coverage"] == 7
     # 100+ historical call sites address slot 7 by the old name.

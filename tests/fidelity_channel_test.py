@@ -161,12 +161,26 @@ def test_residual_matches_quality_metrics_on_the_same_pair():
 # ------------------------------------------------------ 2. the two tables
 def test_env_table_is_a_prefix_of_the_scaling_table():
     assert rs.REWARD_NAMES[:envmod.NUM_REWARDS] == envmod.REWARD_NAMES
+    # A7 STRENGTHENS THIS TO EQUALITY. env.py reserved index 9
+    # (`bkstep_acc`, which it never populates) so that the sparsity
+    # channel could be APPENDED at 10 in both tables rather than colliding
+    # with bkstep_acc at 9 in one of them. With the tables identical, a
+    # weight vector built from either lands on the same channel of the
+    # other -- which is the property the prefix pin was approximating.
+    assert rs.REWARD_NAMES == envmod.REWARD_NAMES
     for name in envmod.REWARD_NAMES:
         assert rs.REWARD_INDEX[name] == envmod.REWARD_INDEX[name], name
 
 
 def test_slot_names_and_the_indices_that_must_not_move():
-    assert envmod.NUM_REWARDS == 9
+    # 9 until 2026-08-28; A7 APPENDED slot 10 (`sparsity`) and RESERVED
+    # slot 9 for reward_scaling's `bkstep_acc` so the two tables are
+    # index-identical. No existing index moved.
+    assert envmod.NUM_REWARDS == 11
+    assert envmod.REWARD_NAMES[9] == "bkstep_acc"
+    assert envmod.REWARD_NAMES[10] == "sparsity"
+    assert rs.REWARD_NAMES[10] == "sparsity"
+    assert rs.SPARSITY_IDX == 10
     assert envmod.REWARD_NAMES[7] == "grad_coverage"
     assert envmod.REWARD_NAMES[8] == "fidelity"
     assert rs.REWARD_NAMES[7] == "grad_coverage"

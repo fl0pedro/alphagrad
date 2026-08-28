@@ -1332,6 +1332,239 @@ def consume_fidelity_stats() -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# SPARSITY -- reward slot 10. HOW MUCH LESS THE APPROXIMATED ELIMINATION
+# ACTUALLY STORES THAN THE EXACT ONE ON THE SAME ORDER.
+#
+# THE DEFINITION, and why it is this one:
+#
+#     sparsity_ratio = stored_bytes(approx) / stored_bytes(exact)
+#     sparsity       = clip(1 - sparsity_ratio, -1, +1)      <- the CHANNEL
+#
+# `stored_bytes` is the sum, over every accumulated-Jacobian edge the
+# elimination WRITES BACK into the graph, of ``val.size * dtype.itemsize`` --
+# the buffer that is really allocated, read at graphax's single edge-store site
+# AFTER the squeeze, once per TRACE. Both arms are the SAME elimination order
+# (`_do_compile_exact` differs from `_do_compile_approx` in nothing but the two
+# approximation kwargs), so the ratio isolates the approximation and nothing
+# else. The identity plan therefore scores EXACTLY 1.0 / channel 0.0 by
+# construction, not by tolerance.
+#
+# WHY STORED BYTES AND NOT A DECLARED CLASS. A tensor can DECLARE a sparse dim
+# and still materialise dense, and the reverse (`val is None`) declares nothing
+# while storing nothing -- so a class-based count overstates sparsity in both
+# directions. This is the project's own recorded rule ("compare STORED BYTES
+# not declared classes"), and it is the same quantity the offline structure
+# audit sums. WHAT WAS REJECTED:
+#   * an NNZ ratio over the OUTPUT Jacobians -- the output is drained dense at
+#     the boundary in both arms, so it is blind to everything the elimination
+#     did in between (this is the same mechanism behind "approx cuts latency
+#     but never memory");
+#   * a STRUCTURAL count (fraction of edges carried as Diag/blockdiag/
+#     compressed) -- that is precisely the declared-class count the rule above
+#     forbids, and a diagonal that is stored dense would score as sparse;
+#   * the XLA memory-compression ratio already logged by
+#     `consume_memory_compression_stats` -- it is a property of the COMPILED
+#     EXECUTABLE (temp+output+argument bytes, forward pass included), not of
+#     the accumulated Jacobians, and the output boundary dominates it.
+# `cells` (graphax's `_structural_val_size`, the on-structure cell count) is
+# tallied beside `bytes` and logged as a second ratio: it is quant-blind, so
+# `bytes` vs `cells` separates "narrower dtype" from "fewer cells".
+#
+# SIGN CONVENTION, "higher is better" like every other slot:
+#   +1  <=>  ratio 0     <=>  the plan stores NOTHING (all-SKIP).
+#    0  <=>  ratio 1     <=>  the plan stores exactly what exact stores.
+#   -1  <=>  ratio >= 2  <=>  the plan stores twice the exact arm or worse,
+#            i.e. it DENSIFIED. That is a real, observed outcome, not a
+#            theoretical one, and the floor is what keeps the channel bounded
+#            and therefore symlog-free and PopArt-friendly.
+#
+# ############ READ THIS BEFORE PUTTING A WEIGHT ON IT ############
+# SPARSITY IS THE MOST HACKABLE CHANNEL ON THE BOARD, BY CONSTRUCTION.
+# An all-SKIP plan is MAXIMALLY sparse and scores the ceiling +1. The
+# confirmed TLM reward hack -- one skipped face that deletes 62-73% of the
+# backward pass and freezes 11-15 of 16 parameter leaves, which the 200-step
+# quality probe prices at 0.02% (0.9258 vs 0.9260) -- scores NEAR the ceiling
+# too. This channel rewards deleting computation, which is exactly the
+# behaviour `--reject-frozen-grads` exists to refuse. So:
+#   * the guard is a HARD PRECONDITION of a non-zero weight
+#     (`ppo.configure_sparsity` raises if `--no-reject-frozen-grads` is set);
+#   * a SENTINELLED plan takes the channel's FLOOR, not its ceiling, so a
+#     rejected destroyer can never be crowned on sparsity;
+#   * and the channel is DEFAULT OFF and default weight 0 -- logged, not
+#     trained -- until somebody has looked at what it correlates with.
+# #################################################################
+#
+# COST. The tally is filled while `jacve` is TRACED, so it is free on any
+# trace that was going to happen: the approx executable is compiled for every
+# plan, and the exact one is materialised for every terminal plan by the
+# `--reject-frozen-grads` guard (see `_exact_ref_scores`). When the compile
+# cache serves an executable WITHOUT tracing, the tally is recovered with an
+# abstract `jax.eval_shape` walk of the same elimination -- traced, never
+# compiled, never executed. Those fallbacks are counted and their wall is
+# published as `sparsity/wall_amortised_s`.
+_SPARSITY_STATS: dict = {
+    "n": 0,
+    "sum": 0.0,            # of the CHANNEL value
+    "min": 1.0,
+    "max": -1.0,
+    "sum_ratio": 0.0,      # of the stored-BYTE ratio
+    "min_ratio": float("inf"),
+    "max_ratio": 0.0,
+    "sum_cells": 0.0,      # of the stored-CELL ratio (quant-blind)
+    "n_undefined": 0,      # exact arm stored nothing: ratio undefined
+    "n_failed": 0,         # apparatus failure; slot stays 0.0
+    "n_fallback_traces": 0,
+    "wall_s": 0.0,
+    "last": None,
+}
+# Per-plan stored-byte tallies, keyed by the SAME digests the compile cache
+# uses. Bounded; see `_read_store_tally`.
+_APPROX_STORE_BYTES: dict = {}
+_EXACT_STORE_BYTES: dict = {}
+
+
+def sparsity_enabled() -> bool:
+    """Is the stored-byte sparsity channel (slot 10) measured?
+
+    DEFAULT OFF AT THE LIBRARY LEVEL, exactly like `fidelity_enabled` and
+    `grad_coverage_enabled`, and for the same reason: measurement happens in
+    Ray measure actors that are separate processes and may be RESPAWNED inside
+    a job launched before this commit. ``ppo.configure_sparsity`` exports the
+    variables before ``ray.init``.
+    """
+    if os.environ.get("ALPHAGRAD_SPARSITY", "") not in ("", "0"):
+        return True
+    try:
+        return float(os.environ.get("ALPHAGRAD_SPARSITY_WEIGHT", "0")) != 0.0
+    except ValueError:
+        return False
+
+
+def sparsity_channel(ratio) -> float:
+    """THE SPARSITY VALUE: ``clip(1 - stored_approx/stored_exact, -1, +1)``.
+
+    A non-finite ratio means the EXACT arm stored nothing measurable -- an
+    undefined comparison, i.e. apparatus, not a verdict on the plan -- and
+    reads 0.0 ("not measured"), never the floor. Contrast `clipped_rel_frob`,
+    where a non-finite residual IS a statement about the plan.
+    """
+    x = float(ratio)
+    if not np.isfinite(x):
+        return 0.0
+    return float(min(1.0, max(-1.0, 1.0 - x)))
+
+
+def _arm_store_tally(on: bool) -> None:
+    """Arm graphax's accumulated-Jacobian byte tally for ONE trace."""
+    if not on:
+        return
+    try:
+        from graphax.core import arm_store_accounting, reset_store_accounting
+    except ImportError:
+        return
+    reset_store_accounting()
+    arm_store_accounting()
+
+
+def _read_store_tally(on: bool, store: dict, key) -> None:
+    """Disarm and memoise the tally under ``key``.
+
+    A compile-cache HIT never traces, and a tally from a call that did not
+    walk the elimination must NOT overwrite a real earlier one with zeros
+    -- the same caveat `_do_compile_approx` records for the per-face
+    counters, except here it is load-bearing for a reward and so is
+    handled rather than documented.
+
+    THE TEST IS ``walks``, NOT ``edges``. An all-SKIP plan walks the whole
+    order and stores NOTHING, so `edges == 0` is a real measurement there
+    -- the most important one the channel takes. Reading it as "no walk"
+    made the destruction ceiling read 0.0 = "not measured".
+    """
+    if not on:
+        return
+    try:
+        from graphax.core import (disarm_store_accounting,
+                                  store_accounting_totals)
+        disarm_store_accounting()
+        t = store_accounting_totals()
+    except Exception:
+        return
+    if int(t.get("walks", 0)) <= 0:
+        return
+    if len(store) >= 64:
+        store.clear()
+    store[bytes(key)] = t
+
+
+def _record_sparsity(ratio: float, cells_ratio: float, channel: float,
+                     approx: dict, exact: dict, fallbacks: int,
+                     wall_s: float) -> None:
+    s = _SPARSITY_STATS
+    s["wall_s"] += float(wall_s)
+    s["n_fallback_traces"] += int(fallbacks)
+    if not np.isfinite(ratio):
+        s["n_undefined"] += 1
+        return
+    s["n"] += 1
+    s["sum"] += float(channel)
+    s["min"] = min(s["min"], float(channel))
+    s["max"] = max(s["max"], float(channel))
+    s["sum_ratio"] += float(ratio)
+    s["min_ratio"] = min(s["min_ratio"], float(ratio))
+    s["max_ratio"] = max(s["max_ratio"], float(ratio))
+    if np.isfinite(cells_ratio):
+        s["sum_cells"] += float(cells_ratio)
+    s["last"] = {"ratio": float(ratio), "cells_ratio": float(cells_ratio),
+                 "channel": float(channel),
+                 "approx_bytes": int(approx.get("bytes", 0)),
+                 "exact_bytes": int(exact.get("bytes", 0)),
+                 "approx_edges": int(approx.get("edges", 0)),
+                 "exact_edges": int(exact.get("edges", 0))}
+
+
+_SPARSITY_FAIL_WARNED: list = []
+
+
+def _record_sparsity_failure(exc: BaseException) -> None:
+    """FAIL SOFT, LOUDLY -- the same policy the exact reference uses. A tally
+    we could not take is apparatus, and scoring the plan for it would be the
+    measurement bias `_truncated_reward` warns about."""
+    _SPARSITY_STATS["n_failed"] += 1
+    if not _SPARSITY_FAIL_WARNED:
+        _SPARSITY_FAIL_WARNED.append(1)
+        print("[sparsity] WARNING: the stored-byte tally could not be taken; "
+              "the channel reads 0.0 = not measured for every affected plan: "
+              f"{type(exc).__name__}: {str(exc)[:160]}", flush=True)
+
+
+def consume_sparsity_stats() -> dict:
+    """Pop the per-period sparsity aggregate (mirrors the other pollers)."""
+    s = _SPARSITY_STATS
+    n = max(int(s["n"]), 0)
+    out = {
+        "count": n,
+        "mean": (s["sum"] / n) if n else float("nan"),
+        "min": s["min"] if n else float("nan"),
+        "max": s["max"] if n else float("nan"),
+        "ratio_mean": (s["sum_ratio"] / n) if n else float("nan"),
+        "ratio_min": s["min_ratio"] if n else float("nan"),
+        "ratio_max": s["max_ratio"] if n else float("nan"),
+        "cells_ratio_mean": (s["sum_cells"] / n) if n else float("nan"),
+        "undefined": int(s["n_undefined"]),
+        "failed": int(s["n_failed"]),
+        "fallback_traces": int(s["n_fallback_traces"]),
+        "wall_s": s["wall_s"],
+        "wall_amortised_s": (s["wall_s"] / n) if n else float("nan"),
+        "last": s["last"],
+    }
+    s.update({"n": 0, "sum": 0.0, "min": 1.0, "max": -1.0, "sum_ratio": 0.0,
+              "min_ratio": float("inf"), "max_ratio": 0.0, "sum_cells": 0.0,
+              "n_undefined": 0, "n_failed": 0, "n_fallback_traces": 0,
+              "wall_s": 0.0})
+    return out
+
+
 def _residual_scores(exact_out, approx_out, has_aux: bool):
     """``(rel_frob, cos)`` of ``approx_out`` against ``exact_out``, STREAMED.
 
@@ -1691,7 +1924,42 @@ _AXIS_FEAT_GROUP_ID = 3
 #                        quality metric is otherwise never built -- see
 #                        `_exact_ref_scores` for how it shares that one exact
 #                        execution with the gradient-coverage guard.
-NUM_REWARDS = 9
+#   9 bkstep_acc     — RESERVED, AND THIS ENV NEVER POPULATES IT. The
+#                        slot belongs to the DEPRECATED Ray line, whose
+#                        table (`common.reward_scaling.REWARD_NAMES`)
+#                        has held `bkstep_acc` at index 9 since long
+#                        before this one reached nine channels, and
+#                        `BKSTEP_ACC_IDX` / `NO_SYMLOG_REWARD_INDICES` /
+#                        mu0's documented "10-channel layout" bridge all
+#                        pin it there. Persisted PopArt / calibration
+#                        state is keyed by INDEX, so index 9 cannot be
+#                        reused and the sparsity channel is APPENDED at
+#                        10 in BOTH tables instead. The reservation is
+#                        what keeps the two tables IDENTICAL rather than
+#                        merely one being a prefix of the other -- the
+#                        property `tests/fidelity_channel_test.py` pins,
+#                        and the property that stops a weight built from
+#                        one table landing on a different channel of the
+#                        other. This env emits 0.0 here, always.
+#  10 sparsity       — STORED-BYTE SPARSITY RATIO, expressed against the
+#                        exact plan on the SAME order:
+#
+#                            sparsity = clip(1 - stored_bytes(approx)
+#                                              / stored_bytes(exact),
+#                                            -1, +1)
+#
+#                        +1 = stores nothing (all-SKIP), 0 = stores what
+#                        exact stores (the identity plan, EXACTLY),
+#                        -1 = stores twice as much or worse (densified).
+#                        0.0 also means "not measured" -- non-terminal
+#                        steps, the channel off, an undefined denominator
+#                        -- matching the sparse-terminal convention slots
+#                        6/7/8 already use.
+#                        MEASURED ONLY WHEN ASKED FOR: `sparsity_enabled()`
+#                        (ppo's --sparsity-weight / --sparsity-log /
+#                        ALPHAGRAD_SPARSITY). READ THE HACKABILITY WARNING
+#                        on `_SPARSITY_STATS` before weighting it.
+NUM_REWARDS = 11
 REWARD_NAMES: tuple[str, ...] = (
     "muls_adds_fmas",
     "flops",
@@ -1702,6 +1970,9 @@ REWARD_NAMES: tuple[str, ...] = (
     "quality",
     "grad_coverage",
     "fidelity",
+    # RESERVED for the deprecated Ray line; never populated here.
+    "bkstep_acc",
+    "sparsity",
 )
 REWARD_INDEX = {name: i for i, name in enumerate(REWARD_NAMES)}
 # BACK-COMPAT ALIAS for slot 7. The slot was ``frob_residual`` until
@@ -1717,8 +1988,11 @@ REWARD_INDEX["frob_residual"] = REWARD_INDEX["grad_coverage"]
 # not move; only its display name changed, so the alias is exact.
 REWARD_INDEX["cosine_sim"] = REWARD_INDEX["quality"]
 COMPUTE_REWARD_INDICES = tuple(range(0, 6))  # cost components
-# quality (loss_drop / cosine), gradient coverage, clipped relative Frobenius.
-QUALITY_REWARD_INDICES = (6, 7, 8)
+# quality (loss_drop / cosine), gradient coverage, clipped relative
+# Frobenius, the reserved bkstep slot and stored-byte sparsity. These are
+# the "higher is better" channels: they are NOT stored negated and must
+# not be treated as costs. Mirrors reward_scaling._QUALITY_REWARD_INDICES.
+QUALITY_REWARD_INDICES = (6, 7, 8, 9, 10)
 
 # Sentinel reward returned when a per-vertex transform sequence matches an
 # entry in the in-file blacklist (used during exploration to penalise
@@ -1734,6 +2008,18 @@ SENTINEL_COST = -1e10
 _SENTINEL_BOUNDED_FLOOR = {
     REWARD_INDEX["frob_residual"]: -1.0,   # grad_coverage: all leaves frozen
     REWARD_INDEX["fidelity"]: -1.0,        # rel_frob >= 2, the clip floor
+    # SPARSITY TAKES ITS FLOOR ON A SENTINELLED PLAN, NOT ITS CEILING.
+    # This is the single most important line in the channel. A plan the
+    # coverage guard rejects is, overwhelmingly, a plan that DELETED
+    # computation -- which is the sparsity ceiling. Leaving the slot at
+    # 0.0 (or letting it inherit SENTINEL_COST) would let the destroyer
+    # top the sparsity ranking it was sentinelled for.
+    REWARD_INDEX["sparsity"]: -1.0,
+    # RESERVED slot 9: this env never populates bkstep_acc, so its
+    # sentinel value must be the same 0.0 it carries on every real plan.
+    # Stamping -1e10 into a bounded [0,1] channel would make its PopArt
+    # sigma meaningless for anything that ever does populate it.
+    REWARD_INDEX["bkstep_acc"]: 0.0,
 }
 _SENTINEL_BAD_REWARD = jnp.array(
     [
@@ -4428,6 +4714,12 @@ def _callback(
 
     partial_order, partial_specs = _get_partials(order, sparsity_specs, stop)
     is_terminal = int(stop) >= len(order)
+    # SPARSITY (reward slot 10). Read ONCE per callback, like `_gcov_on`
+    # and `_fid_on` -- but bound HERE, not beside them, because
+    # `_do_compile_approx` closes over it and is CALLED long before that
+    # point. Terminal only: mid-rollout the elimination is a prefix, and
+    # slots 6/7/8 already establish that convention.
+    _sparsity_on = bool(is_terminal) and sparsity_enabled()
 
     o_list = [int(x) for x in partial_order.tolist()]
     specs_list = partial_specs.tolist()  # list of MAX_RULES x 3 lists
@@ -4831,6 +5123,25 @@ def _callback(
         h.update(repr(callback_device).encode())
     cache_key = h.digest()
 
+    def _jacve_fn(approx: bool):
+        """THE elimination, built once. `approx=False` is the exact
+        reference: same order, same argnums, same has_aux, same sparse
+        representation, and NOTHING but the two approximation kwargs
+        dropped -- which is what makes any approx/exact ratio taken over
+        this pair a statement about the approximation alone. Both the
+        compiles below and the sparsity tally's abstract fallback walk
+        go through here so a change to one cannot miss the other."""
+        _kw = ({"transforms": transforms,
+                "face_transforms": ft_by_vertex} if approx else {})
+        return jacve(
+            config.target_fun,
+            list(o_list),
+            argnums=config.argnums,
+            has_aux=config.has_aux,
+            sparse_representation=config.sparse,
+            **_kw,
+        )
+
     def _do_compile_approx():
         # THE MEASURED ELIMINATION. graphax invokes every per-vertex/per-face
         # hook once per face while ``.lower()`` traces, and this is the only
@@ -4843,39 +5154,58 @@ def _callback(
         from alphagrad.approx.common.masks import (
             arm_face_counts, disarm_face_counts)
         arm_face_counts()
+        # SAME SCOPE, SAME REASON as the per-face counters: this is the
+        # ONE trace that walks the elimination that is actually measured.
+        _arm_store_tally(_sparsity_on)
         try:
             return _compile_measure(
-                jax.jit(
-                    jacve(
-                        config.target_fun,
-                        list(o_list),
-                        argnums=config.argnums,
-                        has_aux=config.has_aux,
-                        sparse_representation=config.sparse,
-                        transforms=transforms,
-                        face_transforms=ft_by_vertex,
-                    ),
-                    keep_unused=True,
-                )
+                jax.jit(_jacve_fn(approx=True), keep_unused=True)
                 .lower(*args_for_lower)
             )
         finally:
             disarm_face_counts()
+            _read_store_tally(_sparsity_on, _APPROX_STORE_BYTES,
+                              cache_key)
 
     def _do_compile_exact():
-        return _compile_measure(
-            jax.jit(
-                jacve(
-                    config.target_fun,
-                    list(o_list),
-                    argnums=config.argnums,
-                    has_aux=config.has_aux,
-                    sparse_representation=config.sparse,
-                ),
-                keep_unused=True,
+        # Wrapped, not duplicated: every consumer of the exact
+        # executable (the cosine quality metric, the coverage guard's
+        # `_exact_ref_scores`, the quality gate's order floor) reaches it
+        # through this one closure, so arming here is what makes the
+        # sparsity denominator FREE on the reference somebody else is
+        # already paying for.
+        _arm_store_tally(_sparsity_on)
+        try:
+            return _compile_measure(
+                jax.jit(_jacve_fn(approx=False), keep_unused=True)
+                .lower(*args_for_lower)
             )
-            .lower(*args_for_lower)
-        )
+        finally:
+            _read_store_tally(_sparsity_on, _EXACT_STORE_BYTES,
+                              exact_cache_key)
+
+    def _store_totals(store: dict, key, approx: bool):
+        """``(totals, did_fallback_trace)`` for one arm.
+
+        The tally is filled by whichever `.lower()` actually traced. When
+        the compile cache served the executable without tracing, walk the
+        SAME elimination abstractly: `jax.eval_shape` runs
+        `_eliminate_vertex` in Python and emits no HLO, so it costs a
+        trace and neither a compile nor an execution."""
+        _t = store.get(bytes(key))
+        if _t is not None:
+            return _t, False
+        _arm_store_tally(True)
+        try:
+            jax.eval_shape(_jacve_fn(approx=approx), *args_for_lower)
+        finally:
+            _read_store_tally(True, store, key)
+        _t = store.get(bytes(key))
+        if _t is None:
+            raise RuntimeError(
+                "the abstract elimination walk did not run; the sparsity "
+                "tally cannot be taken for this plan")
+        return _t, True
 
     # The EXACT compile ignores `transforms` / `face_transforms` entirely (see
     # _do_compile_exact above — it only takes o_list + config + arg shapes), so
@@ -5120,6 +5450,8 @@ def _callback(
     # there (free) instead of asking for a second exact execution.
     _fid_from_quality = (_qmetric == "cosine")
     _fid_on = bool(is_terminal) and fidelity_enabled()
+    # `_sparsity_on` (slot 10) is bound up at `is_terminal`, not here:
+    # the compile closures that arm the tally run before this line.
     # `_cos_log_due` CONSUMES a tick, so it must be evaluated exactly once per
     # terminal callback and only when the subsample could actually be taken.
     _cos_due = bool(is_terminal) and (not _fid_from_quality) and _cos_log_due()
@@ -5573,6 +5905,34 @@ def _callback(
         if _fid_needs_ref:
             _FIDELITY_STATS["wall_s"] += time.perf_counter() - _gc_t0
     _pf("cb.grad_coverage")
+    # ------------------------------------------------------------------
+    # SPARSITY -- reward slot 10. See the block comment on
+    # `_SPARSITY_STATS` for the definition and for why a weight on this
+    # channel requires the coverage guard.
+    # ------------------------------------------------------------------
+    sparsity = 0.0
+    if _sparsity_on:
+        _sp_t0 = time.perf_counter()
+        try:
+            _ap, _ap_fb = _store_totals(_APPROX_STORE_BYTES, cache_key,
+                                        True)
+            _ex, _ex_fb = _store_totals(_EXACT_STORE_BYTES,
+                                        exact_cache_key, False)
+            _ex_b = float(_ex.get("bytes", 0))
+            _ex_c = float(_ex.get("cells", 0))
+            _ratio = (float(_ap.get("bytes", 0)) / _ex_b
+                      if _ex_b > 0.0 else float("nan"))
+            _cratio = (float(_ap.get("cells", 0)) / _ex_c
+                       if _ex_c > 0.0 else float("nan"))
+            sparsity = sparsity_channel(_ratio)
+            _record_sparsity(_ratio, _cratio, sparsity, _ap, _ex,
+                             int(_ap_fb) + int(_ex_fb),
+                             time.perf_counter() - _sp_t0)
+        except Exception as _exc:
+            sparsity = 0.0
+            _SPARSITY_STATS["wall_s"] += time.perf_counter() - _sp_t0
+            _record_sparsity_failure(_exc)
+    _pf("cb.sparsity")
     rewards = jnp.array(
         [
             -muls_adds_fmas,
@@ -5590,6 +5950,14 @@ def _callback(
             # not measured (non-terminal, channel off, or the exact reference
             # failed), matching the sparse-terminal convention of slot 6.
             fidelity,
+            # Slot 9: RESERVED (`bkstep_acc`, the deprecated Ray line's).
+            # This env does not measure it and emits a literal 0.0 so the
+            # two channel tables stay index-identical -- see the slot-9
+            # entry in the REWARD_NAMES block for why it cannot be reused.
+            0.0,
+            # Slot 10: SPARSITY = clip(1 - stored_approx/stored_exact,
+            # -1, 1). 0.0 whenever it was not measured, same convention.
+            sparsity,
         ],
         dtype=jnp.float32,
     )

@@ -21,13 +21,20 @@ def test_sparse_terminal_indices_match_canonical_channels():
     from alphagrad.approx.common.reward_scaling import (
         BKSTEP_ACC_IDX,
         COSINE_SIM_IDX,
+        FIDELITY_IDX,
         FROB_RESIDUAL_IDX,
+        SPARSITY_IDX,
         SPARSE_TERMINAL_INDICES,
         SPARSE_TERMINAL_MASK_NP,
     )
     # bkstep_acc joined cossim/frob as a third terminal-only QUALITY channel
     # (the B_kstep accuracy is only meaningful once the graph is eliminated).
-    quality = {COSINE_SIM_IDX, FROB_RESIDUAL_IDX, BKSTEP_ACC_IDX}
+    # A2 added FIDELITY and A7 added SPARSITY on the same grounds -- both
+    # compare the terminal plan against the exact one, and graphax's jacve
+    # returns a zero-norm Jacobian for any partial order. This test was RED
+    # before A7: A2 widened SPARSE_TERMINAL_INDICES and left the pin behind.
+    quality = {COSINE_SIM_IDX, FROB_RESIDUAL_IDX, BKSTEP_ACC_IDX,
+               FIDELITY_IDX, SPARSITY_IDX}
     assert set(SPARSE_TERMINAL_INDICES) == quality
     assert SPARSE_TERMINAL_MASK_NP.dtype == bool
     for idx in quality:

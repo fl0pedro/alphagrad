@@ -203,7 +203,8 @@ if _GAZ_RAY_N > 0:
             max_tokens=int(_MT), num_rewards=int(_NR),
             cosine_sim_idx=int(REWARD_INDEX["cosine_sim"]),
             frob_residual_idx=int(REWARD_INDEX["frob_residual"]),
-            fidelity_idx=int(REWARD_INDEX["fidelity"]))
+            fidelity_idx=int(REWARD_INDEX["fidelity"]),
+            sparsity_idx=int(REWARD_INDEX["sparsity"]))
         print(f"[gaz] ray-measure pool: {_GAZ_RAY_N} actors on gpus "
               f"{list(range(1, _GAZ_RAY_N + 1))} (trainer keeps gpu 0)",
               flush=True)

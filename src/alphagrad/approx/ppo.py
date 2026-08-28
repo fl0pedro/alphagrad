@@ -82,6 +82,7 @@ from alphagrad.approx.env import (
     consume_frozen_grad_plan_count,
     consume_grad_coverage_stats,
     consume_fidelity_stats,
+    consume_sparsity_stats,
     consume_truncated_plan_count,
     consume_untraceable_plan_count,
     consume_zero_work_plan_count,
@@ -363,6 +364,14 @@ GRAD_COVERAGE_HEAD = "value_head_gcov"
 # saved checkpoint keeps loading. INDICES ARE ONLY EVER APPENDED, never
 # inserted, because persisted PopArt state is keyed by index.
 FIDELITY_HEAD = "value_head_fid"
+# --sparsity-weight > 0 APPENDS a head on reward slot 10 (``sparsity``,
+# the stored-byte ratio against the exact plan on the same order). Same
+# mechanism and same discipline as the two heads above: default 0 => the
+# head is not constructed, contributes no pytree leaves, and every saved
+# checkpoint keeps loading. INDICES ARE ONLY EVER APPENDED. Unlike the
+# other two this head also requires --reject-frozen-grads; see
+# `configure_sparsity` for why that is refused rather than warned about.
+SPARSITY_HEAD = "value_head_spars"
 # Resolved from --quality-metric in `main`; names the quantity reward slot 6
 # actually holds, for every human-readable log line and the wandb
 # ``quality/metric`` key.
@@ -445,6 +454,66 @@ def configure_fidelity(args) -> tuple[float, int]:
         _HEAD_REWARD_INDICES_ARR = jnp.asarray(
             HEAD_REWARD_INDICES, dtype=jnp.int32)
     return weight, max(0, cos_every)
+
+
+def configure_sparsity(args) -> float:
+    """Install the sparsity-channel configuration. PRE-EVERYTHING.
+
+    Same contract and the same three "before"s as :func:`configure_fidelity` --
+    before ``ray.init`` (the measure actors read the exported environment),
+    before ``_build_agent`` (an extra value head changes the agent pytree and
+    ``pref_proj``'s input width) and before the first jit trace
+    (``_HEAD_REWARD_INDICES_ARR`` is captured as a constant). CALL IT AFTER
+    ``configure_fidelity`` so the appended head order stays deterministic:
+    [latency, mem, quality, (grad_cov), (fidelity), (sparsity)].
+
+    Returns the weight.
+
+    THE GUARD IS A HARD PRECONDITION, not advice. Sparsity rewards storing
+    less, an all-SKIP plan stores nothing, and the confirmed TLM reward hack --
+    one skipped face that deletes 62-73% of the backward pass and freezes 11-15
+    of 16 parameter leaves, priced at 0.02% by the 200-step quality probe --
+    scores near the ceiling. `--reject-frozen-grads` is the only thing in the
+    system that refuses that plan, so training this channel with the guard off
+    is asking for the hack directly. Refused here rather than warned about,
+    because the failure is silent and takes a campaign to detect.
+
+    WHAT IT COSTS. The tally is taken while `jacve` is TRACED and emits no HLO.
+    The approx side rides the compile every plan already pays; the exact side
+    rides the reference `--reject-frozen-grads` already materialises. Where the
+    compile cache serves an executable without tracing, env.py falls back to an
+    abstract `jax.eval_shape` walk -- a trace, never a compile or an execution.
+    The measured price is published every episode as
+    ``sparsity/wall_amortised_s``.
+    """
+    global HEAD_REWARD_INDICES, NUM_VALUE_HEADS, HEAD_NAMES
+    global VALUE_HEAD_ATTRS, _HEAD_REWARD_INDICES_ARR
+    weight = float(getattr(args, "sparsity_weight", 0.0) or 0.0)
+    log_only = bool(getattr(args, "sparsity_log", False))
+    if weight != 0.0 and not bool(getattr(args, "reject_frozen_grads", False)):
+        raise ValueError(
+            "--sparsity-weight/--lambda-sparsity requires the gradient-"
+            "coverage guard: sparsity is maximised by DELETING computation "
+            "(an all-SKIP plan stores nothing and scores the +1 ceiling), and "
+            "--reject-frozen-grads is the only thing that refuses a plan which "
+            "freezes a trainable leaf. Drop --no-reject-frozen-grads, or use "
+            "--sparsity-log to record the channel without training on it.")
+    os.environ["ALPHAGRAD_SPARSITY_WEIGHT"] = repr(weight)
+    # Set EXPLICITLY in both directions: a measure actor respawned inside a
+    # long job must never inherit a stale "on" from an earlier configuration.
+    os.environ["ALPHAGRAD_SPARSITY"] = (
+        "1" if (weight != 0.0 or log_only) else "0")
+    if weight != 0.0 and SPARSITY_HEAD not in VALUE_HEAD_ATTRS:
+        # IDEMPOTENT, like both twins above.
+        HEAD_REWARD_INDICES = tuple(HEAD_REWARD_INDICES) + (
+            int(REWARD_INDEX["sparsity"]),)
+        HEAD_NAMES = tuple(HEAD_NAMES) + ("sparsity",)
+        VALUE_HEAD_ATTRS = tuple(VALUE_HEAD_ATTRS) + (SPARSITY_HEAD,)
+        NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
+        _HEAD_REWARD_INDICES_ARR = jnp.asarray(
+            HEAD_REWARD_INDICES, dtype=jnp.int32)
+    return weight
+
 # Slot 2 was named "cos" until 2026-08-07; it is the value head for reward
 # slot 6, which now holds whichever quality metric env.quality_metric()
 # selects (the 200-step Adam-walk loss drop by default under --measure-grad,
@@ -722,6 +791,11 @@ def configure_symlog(args) -> str:
     # same conditional-so-the-flag-off-mask-is-bit-identical caveat.
     if float(getattr(args, "fidelity_weight", 0.0) or 0.0) != 0.0:
         _exempt = _exempt + (int(REWARD_INDEX["fidelity"]),)
+    # SPARSITY is bounded [-1, 1] by construction too (env.py's
+    # `sparsity_channel`), same reason, same conditional-so-the-flag-off-
+    # mask-is-bit-identical caveat.
+    if float(getattr(args, "sparsity_weight", 0.0) or 0.0) != 0.0:
+        _exempt = _exempt + (int(REWARD_INDEX["sparsity"]),)
     _set_no_symlog_indices(_exempt)
     return mode
 
@@ -2019,6 +2093,9 @@ class Agent(eqx.Module):
     # Value head for reward slot 8 (``fidelity``). ``None`` unless
     # --fidelity-weight != 0; a ``None`` field contributes NO leaves.
     value_head_fid: MLP | None
+    # Value head for reward slot 10 (``sparsity``). ``None`` unless
+    # --sparsity-weight != 0; a ``None`` field contributes NO leaves.
+    value_head_spars: MLP | None
     op_embedding: eqx.nn.Embedding
     # NO identity_pool and NO ctx_proj. A vertex's identity is palimpsa's rows
     # for its own equation, scattered into its own slot by `carry_stream`;
@@ -2062,6 +2139,7 @@ class Agent(eqx.Module):
         face_path_policy=None,
         value_head_gcov=None,
         value_head_fid=None,
+        value_head_spars=None,
     ):
         self.embedding = embedding
         self.pos_enc = pos_enc
@@ -2075,6 +2153,7 @@ class Agent(eqx.Module):
         self.value_head_cos = value_head_cos
         self.value_head_gcov = value_head_gcov
         self.value_head_fid = value_head_fid
+        self.value_head_spars = value_head_spars
         self.op_embedding = op_embedding
         self.pref_proj = pref_proj
         self.num_vertices = num_vertices
@@ -2134,6 +2213,8 @@ class Agent(eqx.Module):
             _vs.append(self.value_head_gcov(summary))
         if self.value_head_fid is not None:
             _vs.append(self.value_head_fid(summary))
+        if self.value_head_spars is not None:
+            _vs.append(self.value_head_spars(summary))
         value = jnp.concatenate(_vs, axis=-1)
         return vertex_logits, vertex_contexts, value
 
@@ -2617,6 +2698,8 @@ class Agent(eqx.Module):
             _vs.append(self.value_head_gcov(summary))
         if self.value_head_fid is not None:
             _vs.append(self.value_head_fid(summary))
+        if self.value_head_spars is not None:
+            _vs.append(self.value_head_spars(summary))
         value = jnp.concatenate(_vs, axis=-1)
         return vertex_logits, vertex_contexts, value
 
@@ -3938,6 +4021,34 @@ def make_argparser() -> argparse.ArgumentParser:
              "or --quality-metric cosine) the cosine is one extra per-leaf dot "
              "product on resident leaves and is taken on every such plan. "
              "Exports ALPHAGRAD_COS_LOG_EVERY.")
+    # ---- SPARSITY, reward slot 10 ---------------------------------
+    p.add_argument(
+        "--sparsity-weight", "--lambda-sparsity", type=float,
+        default=0.0, dest="sparsity_weight",
+        help="Weight on the SPARSITY value head (reward slot 10): "
+             "clip(1 - stored_bytes(approx)/stored_bytes(exact), -1, 1) "
+             "over the accumulated Jacobians of the SAME elimination "
+             "order, where +1 means the plan stores nothing, 0 means it "
+             "stores exactly what the exact plan stores (the identity "
+             "plan, exactly) and -1 means it densified. DEFAULT 0 = "
+             "channel OFF and not measured. REQUIRES "
+             "--reject-frozen-grads (the default) and is REFUSED without "
+             "it: sparsity is maximised by DELETING computation, so an "
+             "all-SKIP plan scores the ceiling and so does the confirmed "
+             "TLM hack of skipping one face -- 62-73%% of the backward "
+             "pass gone, 11-15 of 16 leaves frozen, priced at 0.02%% by "
+             "the quality probe. The coverage guard is the only thing "
+             "that refuses those plans. Use --sparsity-log to record the "
+             "channel without training on it. Exports "
+             "ALPHAGRAD_SPARSITY_WEIGHT.")
+    p.add_argument(
+        "--sparsity-log", action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Measure and LOG reward slot 10 (sparsity) with weight 0 -- "
+             "logged, not trained. The tally is taken while jacve is "
+             "traced and emits no HLO, so it rides compiles the run pays "
+             "for anyway; the residual price is reported as "
+             "sparsity/wall_amortised_s. Exports ALPHAGRAD_SPARSITY.")
     p.add_argument("--gate-tau", type=float, default=0.5,
                    help="mult mode: cosine gate threshold tau (g=0 below it).")
     p.add_argument("--gate-w", type=float, default=40.0,
@@ -5117,6 +5228,14 @@ def _build_agent(
     if FIDELITY_HEAD in VALUE_HEAD_ATTRS:
         value_head_fid = MLP(args.embd_dim, 1, value_dims,
                              key=jrand.fold_in(encoder_keys[12], 8))
+    # SPARSITY value head. Key folded in from keys[12] with its own tag,
+    # for the same reason as the two above: widening the `jrand.split`
+    # would move every positional key and change the randomness of every
+    # seeded run, flag off included.
+    value_head_spars = None
+    if SPARSITY_HEAD in VALUE_HEAD_ATTRS:
+        value_head_spars = MLP(args.embd_dim, 1, value_dims,
+                               key=jrand.fold_in(encoder_keys[12], 9))
     op_embedding = eqx.nn.Embedding(
         OP_TYPE_VOCAB_SIZE,
         args.op_embd_dim,
@@ -5202,6 +5321,7 @@ def _build_agent(
         value_head_cos=value_head_cos,
         value_head_gcov=value_head_gcov,
         value_head_fid=value_head_fid,
+        value_head_spars=value_head_spars,
         op_embedding=op_embedding,
         pref_proj=pref_proj,
         num_vertices=total_v,
@@ -5548,6 +5668,11 @@ def _build_head_weights(args) -> np.ndarray:
     if FIDELITY_HEAD in VALUE_HEAD_ATTRS:
         weights[HEAD_NAMES.index("fidelity")] = np.float32(
             getattr(args, "fidelity_weight", 0.0) or 0.0)
+    # --sparsity-weight W adds ``+ W*sparsity``, RAW (bounded, never
+    # symlogged). The head exists only when W != 0.
+    if SPARSITY_HEAD in VALUE_HEAD_ATTRS:
+        weights[HEAD_NAMES.index("sparsity")] = np.float32(
+            getattr(args, "sparsity_weight", 0.0) or 0.0)
     return weights
 
 
@@ -5809,6 +5934,19 @@ def main():
              "  [NOTE: --reject-frozen-grads is OFF, so this channel pays a "
              "FULL exact Jacobian reference per plan instead of sharing the "
              "guard's]"), flush=True)
+
+    # SPARSITY (reward slot 10) -- after configure_fidelity so the
+    # appended head order is deterministic, before _build_agent /
+    # configure_symlog / the first trace for the same three reasons.
+    _spars_weight = configure_sparsity(args)
+    if _spars_weight != 0.0 or bool(getattr(args, 'sparsity_log', False)):
+        print(f"[cfg] sparsity (stored-byte ratio vs exact, slot 10): "
+              f"weight={_spars_weight:g} "
+              f"heads={NUM_VALUE_HEADS} ({', '.join(HEAD_NAMES)})"
+              + ("  [LOGGED, NOT TRAINED]" if _spars_weight == 0.0
+                 else "  [TRAINED -- an all-SKIP plan scores the +1 "
+                      "ceiling; --reject-frozen-grads is what refuses "
+                      "it]"), flush=True)
 
     _apply_variant_preset(args)
     if args.variant != "custom":
@@ -6260,6 +6398,7 @@ def main():
             cosine_sim_idx=int(REWARD_INDEX["cosine_sim"]),
             frob_residual_idx=int(REWARD_INDEX["frob_residual"]),
             fidelity_idx=int(REWARD_INDEX["fidelity"]),
+            sparsity_idx=int(REWARD_INDEX["sparsity"]),
         )
         object.__setattr__(env, "_remote_pool", _pool)
         object.__setattr__(env, "_remote_timeout_s",
@@ -10973,6 +11112,51 @@ def main():
                       f"{_gcs['max_frac_zeroed']:.4g} "
                       f"added_wall={100.0 * _gcs['wall_frac']:.2f}%",
                       flush=True)
+        except Exception:
+            pass
+
+        # ---- SPARSITY (stored bytes vs the exact plan) ---------------------
+        # `sparsity/ratio_mean` is the number the owner asked for: how much
+        # less the approximated elimination stores than the exact one, 1.0
+        # meaning "the same". `cells_ratio_mean` is the same ratio in CELLS
+        # rather than bytes, i.e. quant-blind -- the two together separate a
+        # narrower dtype from genuinely fewer stored cells.
+        try:
+            _sp = consume_sparsity_stats()
+            if _sp["count"] or _sp["undefined"] or _sp["failed"]:
+                log_dict["sparsity/measured_this_ep"] = int(_sp["count"])
+                log_dict["sparsity/undefined_this_ep"] = int(
+                    _sp["undefined"])
+                log_dict["sparsity/failed_this_ep"] = int(_sp["failed"])
+                log_dict["sparsity/fallback_traces_this_ep"] = int(
+                    _sp["fallback_traces"])
+                log_dict["sparsity/wall_s"] = float(_sp["wall_s"])
+                log_dict["sparsity/wall_amortised_s"] = float(
+                    _sp["wall_amortised_s"])
+                if _sp["count"]:
+                    log_dict["sparsity/mean"] = float(_sp["mean"])
+                    log_dict["sparsity/min"] = float(_sp["min"])
+                    log_dict["sparsity/max"] = float(_sp["max"])
+                    log_dict["sparsity/ratio_mean"] = float(
+                        _sp["ratio_mean"])
+                    log_dict["sparsity/ratio_min"] = float(
+                        _sp["ratio_min"])
+                    log_dict["sparsity/ratio_max"] = float(
+                        _sp["ratio_max"])
+                    log_dict["sparsity/cells_ratio_mean"] = float(
+                        _sp["cells_ratio_mean"])
+                    print(f"[sparsity ep{ep}] measured={int(_sp['count'])} "
+                          f"stored_ratio mean={_sp['ratio_mean']:.4g} "
+                          f"[{_sp['ratio_min']:.4g}, "
+                          f"{_sp['ratio_max']:.4g}] "
+                          f"cells={_sp['cells_ratio_mean']:.4g} | "
+                          f"channel mean={_sp['mean']:+.4f} | "
+                          f"undef={int(_sp['undefined'])} "
+                          f"fallback_traces="
+                          f"{int(_sp['fallback_traces'])} "
+                          f"wall={_sp['wall_s']:.2f}s "
+                          f"({_sp['wall_amortised_s']:.3f}s/plan)",
+                          flush=True)
         except Exception:
             pass
 

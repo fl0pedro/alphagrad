@@ -42,7 +42,7 @@ def test_build_reward_weights_default_three_channels():
     )
 
     w = build_reward_weights(_make_args())
-    assert w.shape == (10,)
+    assert w.shape == (11,)
     assert w[REWARD_INDEX["flops"]] == 1.0
     assert w[REWARD_INDEX["peak_memory"]] == 1.0
     assert w[REWARD_INDEX["quality"]] == 1.0

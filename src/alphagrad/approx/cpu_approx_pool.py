@@ -56,6 +56,7 @@ def _sentinel_callback_output(
     cosine_sim_idx: int,
     frob_residual_idx: int,
     fidelity_idx: int | None = None,
+    sparsity_idx: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return ``(tokens, eqn_ids, reward)`` matching the env's
     ``_callback_shape`` for a timeout / actor-death.
@@ -64,6 +65,10 @@ def _sentinel_callback_output(
     accuracy reward head doesn't see a wildly negative signal when
     the channel happens to have non-zero weight (``cosine_sim``'s
     natural range is ``[0, 1]``, with higher better).
+
+    ``sparsity_idx`` (reward slot 10) takes ``-1.0`` on the same grounds,
+    with the extra one that the sparsity CEILING is what "stored nothing"
+    scores and a dead actor stored nothing.
 
     ``fidelity_idx`` (reward slot 8, A2) takes ``-1.0`` -- its CLIP FLOOR --
     for the same reason, and to match what ``env._SENTINEL_BAD_REWARD`` writes
@@ -84,6 +89,13 @@ def _sentinel_callback_output(
     reward[frob_residual_idx] = _SENTINEL_REWARD_VALUE
     if fidelity_idx is not None and 0 <= int(fidelity_idx) < int(num_rewards):
         reward[int(fidelity_idx)] = -1.0
+    # SPARSITY (slot 10) takes its FLOOR here for the same bounded-channel
+    # reason -- and for one more: a timed-out or dead actor must never be
+    # able to score the SPARSITY CEILING. The ceiling is what a plan that
+    # stored nothing gets, and "stored nothing" is exactly what an
+    # apparatus failure looks like from the outside.
+    if sparsity_idx is not None and 0 <= int(sparsity_idx) < int(num_rewards):
+        reward[int(sparsity_idx)] = -1.0
     return tokens, eqn_ids, reward
 
 
@@ -118,7 +130,8 @@ class CpuApproxPool:
         the ``args_dict`` / ``variant`` / fresh ``actor_id`` needed
         to construct a replacement; see ``mu0_ray._run_one_variant``
         for the canonical implementation.
-    max_tokens, num_rewards, cosine_sim_idx, frob_residual_idx, fidelity_idx
+    max_tokens, num_rewards, cosine_sim_idx, frob_residual_idx,
+    fidelity_idx, sparsity_idx
         Shape / index parameters for ``_sentinel_callback_output``;
         wired through from ``env.py``'s constants so this module
         stays JAX-free (importing ``env.py`` would pull JAX).
@@ -135,6 +148,7 @@ class CpuApproxPool:
         cosine_sim_idx: int,
         frob_residual_idx: int,
         fidelity_idx: int | None = None,
+        sparsity_idx: int | None = None,
         initial_timeout_s: float | None = None,
         warm_after: int = 3,
     ):
@@ -167,6 +181,8 @@ class CpuApproxPool:
         # vector keeps working -- None simply leaves the slot at the generic
         # sentinel, which is what it was before the channel existed.
         self._fidelity_idx = fidelity_idx
+        # Reward slot 10. Optional on the same terms as slot 8 above.
+        self._sparsity_idx = sparsity_idx
         # Cached eval-samples ObjectRef. ``set_eval_samples`` does the
         # ``ray.put`` once; ``evaluate`` then passes the ref in place of
         # the per-call tuple, so Ray re-uses the deserialised value on
@@ -459,6 +475,7 @@ class CpuApproxPool:
                 self._cosine_sim_idx,
                 self._frob_residual_idx,
                 self._fidelity_idx,
+                self._sparsity_idx,
             )
 
         future = None
@@ -517,6 +534,7 @@ class CpuApproxPool:
                 self._cosine_sim_idx,
                 self._frob_residual_idx,
                 self._fidelity_idx,
+                self._sparsity_idx,
             )
         except RayActorError:
             self._n_actor_errors += 1
@@ -532,6 +550,7 @@ class CpuApproxPool:
                 self._cosine_sim_idx,
                 self._frob_residual_idx,
                 self._fidelity_idx,
+                self._sparsity_idx,
             )
         except Exception as _exc:
             # Catch-all: anything else (serialization issue, malformed
@@ -553,6 +572,7 @@ class CpuApproxPool:
                 self._cosine_sim_idx,
                 self._frob_residual_idx,
                 self._fidelity_idx,
+                self._sparsity_idx,
             )
 
     # ------------------------------------------------------------------
@@ -697,7 +717,7 @@ class CpuApproxPool:
                 _sentinel_callback_output(
                     self._max_tokens, self._num_rewards,
                     self._cosine_sim_idx, self._frob_residual_idx,
-                    self._fidelity_idx,
+                    self._fidelity_idx, self._sparsity_idx,
                 )
             )
             sentinel_mask[i] = True

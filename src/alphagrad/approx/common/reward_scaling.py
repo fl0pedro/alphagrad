@@ -72,6 +72,16 @@ REWARD_NAMES: tuple[str, ...] = (
     # index 9: B_kstep closed-loop trainability accuracy in [0, 1]. Alternative
     # "acc" reward channel (ALPHAGRAD_ACC_PROXY=bkstep) — see env.REWARD_NAMES.
     "bkstep_acc",
+    # index 10: STORED-BYTE SPARSITY, clip(1 - stored_bytes(approx) /
+    # stored_bytes(exact), -1, +1) over the accumulated Jacobians of the
+    # SAME elimination order. APPENDED, never inserted: index 9 is
+    # bkstep_acc and persisted PopArt / calibration state is index-keyed.
+    # env.REWARD_NAMES now reserves index 9 (it never populates bkstep)
+    # so the two tables are IDENTICAL rather than one being a prefix of
+    # the other -- a weight vector built from either table now lands on
+    # the same channel of the other. See env.py's slot-10 entry, and its
+    # hackability warning, before putting a weight here.
+    "sparsity",
 )
 NUM_REWARDS: int = len(REWARD_NAMES)
 REWARD_INDEX: dict[str, int] = {n: i for i, n in enumerate(REWARD_NAMES)}
@@ -97,6 +107,7 @@ GRAD_COVERAGE_IDX: int = REWARD_INDEX["grad_coverage"]
 FROB_RESIDUAL_IDX: int = GRAD_COVERAGE_IDX
 FIDELITY_IDX: int = REWARD_INDEX["fidelity"]
 BKSTEP_ACC_IDX: int = REWARD_INDEX["bkstep_acc"]
+SPARSITY_IDX: int = REWARD_INDEX["sparsity"]
 
 # Channels whose values are bounded / quality-signal, NOT raw cost — they
 # bypass symlog wherever a symlog transform would otherwise apply (gate
@@ -106,8 +117,11 @@ BKSTEP_ACC_IDX: int = REWARD_INDEX["bkstep_acc"]
 # so symlog would only discount its per-unit price against the cost channels.
 # (Slot 7 / grad_coverage is bounded too; it is exempted at the ppo.py site
 # instead, conditionally, so the flag-off mask stays bit-identical to HEAD.)
+# SPARSITY joins them for the same reason as FIDELITY: `clip(1 - ratio,
+# -1, 1)` is bounded by construction, so symlog would only discount its
+# per-unit price against the ~1e5..1e10 cost channels.
 NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (
-    COSINE_SIM_IDX, FIDELITY_IDX, BKSTEP_ACC_IDX)
+    COSINE_SIM_IDX, FIDELITY_IDX, BKSTEP_ACC_IDX, SPARSITY_IDX)
 NO_SYMLOG_MASK_NP: np.ndarray = np.zeros((NUM_REWARDS,), dtype=bool)
 NO_SYMLOG_MASK_NP[list(NO_SYMLOG_REWARD_INDICES)] = True
 
@@ -120,6 +134,7 @@ NO_SYMLOG_MASK_NP[list(NO_SYMLOG_REWARD_INDICES)] = True
 # see :func:`aggregate_per_channel_stats`.
 SPARSE_TERMINAL_INDICES: tuple[int, ...] = (
     COSINE_SIM_IDX, GRAD_COVERAGE_IDX, FIDELITY_IDX, BKSTEP_ACC_IDX,
+    SPARSITY_IDX,
 )
 SPARSE_TERMINAL_MASK_NP: np.ndarray = np.zeros((NUM_REWARDS,), dtype=bool)
 SPARSE_TERMINAL_MASK_NP[list(SPARSE_TERMINAL_INDICES)] = True
@@ -130,6 +145,9 @@ SPARSE_TERMINAL_MASK_NP[list(SPARSE_TERMINAL_INDICES)] = True
 # excluded here so it is NOT symlog'd/negated like a cost.
 _QUALITY_REWARD_INDICES: tuple[int, ...] = (
     COSINE_SIM_IDX, GRAD_COVERAGE_IDX, FIDELITY_IDX, BKSTEP_ACC_IDX,
+    # sparsity is stored "higher is better" like the others, so it must
+    # not be symlog'd/negated as if it were a cost.
+    SPARSITY_IDX,
 )
 COST_REWARD_INDICES: tuple[int, ...] = tuple(
     i for i in range(NUM_REWARDS) if i not in _QUALITY_REWARD_INDICES
@@ -179,6 +197,22 @@ def warn_deprecated_reward_channel(name: str) -> str:
               f"{canon!r}, the two entries collide and the LAST one wins.",
               flush=True)
     return canon
+
+
+def _sparsity_channel_live() -> bool:
+    """Is the env actually populating reward slot 10 this process?
+
+    Mirrors ``env.sparsity_enabled`` without importing it (this module is
+    deliberately JAX-free and env.py pulls JAX).
+    """
+    import os as _oss
+    if _oss.environ.get("ALPHAGRAD_SPARSITY", "") not in ("", "0"):
+        return True
+    try:
+        return float(_oss.environ.get("ALPHAGRAD_SPARSITY_WEIGHT",
+                                      "0")) != 0.0
+    except ValueError:
+        return False
 
 
 def _fidelity_channel_live() -> bool:
@@ -333,6 +367,13 @@ def build_reward_weights(args) -> np.ndarray:
         # must never enter the sum, or PopArt normalises a constant 0.0.
         if _fidelity_channel_live():
             _names.append("fidelity")
+        # SPARSITY IS DELIBERATELY NOT IN THE ALL-CHANNEL SET even when it
+        # is being measured. "all channels" means "every channel we have a
+        # number for", and a uniform positive weight on sparsity is a
+        # uniform positive weight on DELETING COMPUTATION -- the reward
+        # hack --reject-frozen-grads exists to refuse. It is reachable
+        # only by naming it: --lambda-sparsity, or an explicit
+        # ALPHAGRAD_REWARD_CHANNELS entry.
         for _nm in _names:
             w[REWARD_INDEX[_nm]] = _w_all
         if not np.any(w):
@@ -379,6 +420,14 @@ def build_reward_weights(args) -> np.ndarray:
     lam_frob = float(getattr(args, "lambda_frob", 0.0))
     if lam_frob != 0.0:
         w[FIDELITY_IDX] = lam_frob
+
+    # --lambda-sparsity / --sparsity-weight W weights reward slot 10.
+    # Inert unless the CHANNEL is measured (ALPHAGRAD_SPARSITY or a
+    # non-zero weight); slot 10 reads 0.0 otherwise. READ env.py's
+    # hackability warning first: an all-SKIP plan scores the ceiling.
+    lam_sparsity = float(getattr(args, "sparsity_weight", 0.0) or 0.0)
+    if lam_sparsity != 0.0:
+        w[SPARSITY_IDX] = lam_sparsity
 
     # Capped-cossim GUIDE weight (anti flat-zero-basin). When the acc channel
     # is routed to B_kstep (ALPHAGRAD_ACC_PROXY=bkstep), cosine_sim (idx 6) is
