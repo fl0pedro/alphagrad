@@ -79,11 +79,35 @@ nobody wrote.
 
 ### W0-A `fq_w0_cpu_gates.sbatch` — pgi15-cpu1, ~2 CPU-h, **0 node-h**
 
-`tools/ratio_gates.sh` then `tools/smoke.sh NeuralNetwork`. Helmholtz is
-deliberately not smoked (`landscape_map`/`_callback` on Helmholtz carries a
-pre-existing `TypeError` from the scalar-loss retarget `744fc3d`).
+`tools/ratio_gates.sh`, then `tools/smoke.sh NeuralNetwork`, then
+`tools/pool_liveness_gate.sh`. Helmholtz is deliberately not smoked
+(`landscape_map`/`_callback` on Helmholtz carries a pre-existing `TypeError`
+from the scalar-loss retarget `744fc3d`).
 
-**Prediction:** green — both passed at `949f1af`; this catches regression.
+**`tools/pool_liveness_gate.sh` is the third gate**, added 2026-08-29, and it
+pins something the other two do not: that a `--ray-measure` run **measures
+something**. Neither of the others starts a measure pool — the smoke's
+canonical config has no `--ray-measure` at all — which is how the `87cdc49`
+regression (§Findings (b) below) made every pooled measurement a degenerate
+sentinel for 19 hours without turning one gate red. It runs (1) a static
+`ast` check of the pool → actor → server call chain, so a kwarg the pool
+forwards that the actor cannot accept is named in ~10 ms, and (2) a real
+2-actor / 4-env / 1-episode `--ray-measure` run on NeuralNetwork with
+`--plan-log`, then fails if **zero terminal plans were measured inside a
+measure actor**, if **any `[SENTINEL]` line** appeared, or if any recorded
+terminal reward is the degenerate sentinel on all six cost channels. Both
+parts always run: part 1 is a proxy and part 2 is the evidence, and skipping
+the evidence because the proxy is green is the mistake the gate exists to
+correct. It exports `ALPHAGRAD_BATCHED_CALLBACK=1` itself — without it
+`--ray-measure` exits with `ValueError` — and reports that class of failure as
+**exit 2, HARNESS MISCONFIGURED**, distinct from **exit 1, MEASUREMENT DEAD**.
+Both are failures; the distinction exists because they call for opposite
+responses.
+
+**Prediction:** green — `ratio_gates` and `smoke` both passed at `949f1af`;
+the liveness gate is **measured green at `87cdc49`/`2ddbeef` and measured red
+with `87cdc49` reverted**, so it is demonstrated to fail on the bug it targets
+rather than merely asserted to.
 **Falsifier:** any gate red *or skipped* blocks every later wave. A skip is a
 failure: a gate that did not run pins nothing.
 
@@ -562,3 +586,183 @@ What each result makes us do next. One row per experiment; no row says
    aliases to `grad_cosine`, so W0-B is measuring the right channel — but the
    alias is deprecated and warns, and the tool should be widened so the
    measurement instrument and the trainer name the same thing.
+
+---
+
+## Findings recorded after this plan was written (2026-08-29)
+
+Appended, not merged. Nothing above is restated and **the decision table's
+numbering is unchanged** — rows 1 and 2 ("W0-A gates green" / "any gate red
+**or skipped**") already govern the new gate in (b) exactly as they govern the
+two gates that were there before it.
+
+### (a) Gradient coverage is NECESSARY but NOT SUFFICIENT
+
+Measured on the W0-C stand-in run: `coverage_beam.py` at `7313978` over
+`run_analysis/landscape/rows_qb_sweep.csv` with the quality/ratio pre-filter
+opened up (`--quality-min -2 --ratio-max 2 --no-beam --max-depth 1`), output at
+`~/dsnn/run_analysis/w0c_dev/singleton_census.json`.
+
+Face **`k7/f0`** (label `v88/exp`, vertex 88) scores gradient coverage
+**perfectly clean**: `min_leaf_ratio` exactly **1.0**, `frac_zeroed` **0.0**,
+15 of 15 leaves counted, 0 uncountable — *bit for bit the identity plan's own
+census*, which the tool's own guard reads as `min_leaf_ratio 1.0 /
+frac_zeroed 0.0 / n_leaves 15`. Its **quality is 0.0000** (three paired
+trials, `[0.0, 0.0, 0.0]`) at ratio **0.4711** (median of `[0.47113, 0.48407,
+0.40290]`).
+
+Every parameter still receives a nonzero gradient. **The gradient simply
+points the wrong way.** Coverage can ask *"is any leaf frozen?"*; it cannot
+ask *"is the direction right?"*, and a face that rotates or rescales every
+leaf without zeroing one is invisible to it.
+
+**The beam's quality constraint comes from outside the beam.**
+`coverage_beam.py` scores subsets by coverage ALONE — `rank_key = (frac_zeroed
+ASC, -min_leaf_ratio ASC, tiebreak)` and `is_clean = (n_zeroed == 0)`. Quality
+enters at exactly one point, the CSV row filter `c.quality > quality_min`, so
+the constraint is *carried in from P1's measurements* and never re-evaluated
+anywhere in the search. That is why `7313978`'s validation looked sane:
+`--quality-min 0.9` had already deleted the destroyers before the beam saw
+them. With the pre-filter opened up, the unfiltered census duly **crowned a
+quality-0 plan its best coverage-clean subset** — greedy's `final_subset` is
+`["k7/f0"]`, `eval_counts.best_known_plan` is `k7/f0`, reached at evaluation 3
+of 92. Six of the 92 live singleton candidates have quality exactly 0.0, and
+they are the six **cheapest** on the board (ratios 0.4635 `v87/sub`, 0.4650
+`v93/mul`, 0.4711 `v88/exp`, 0.4716 `v95/neg`, 0.4801 `v94/reduce_sum`, 0.4882
+`v92/log`). Coverage rejects five of the six and misses one — and the one it
+misses is the one that then wins.
+
+**Two consequences to carry into W0-C, both stated as limits on what its
+output is worth:**
+
+1. **Composed multi-face subsets are NEVER quality-checked.** The pre-filter
+   is a per-singleton fact read off a CSV. Nothing in the beam or the greedy
+   walk measures the quality of a two-or-more-face subset, so a subset of
+   individually-acceptable faces that is jointly destructive survives the
+   screen with a clean coverage score.
+2. **The survivors' predicted ratios are a product-of-singletons heuristic,
+   not measurements.** `predict_ratio(..., how="prod")` multiplies the member
+   faces' own singleton ratios; single-face latency ratios are not composable
+   in general. The tool labels it NOT MEASURED in every output and it never
+   decides survival — but it *is* the sort key of the survivor list, so "the
+   best survivor" is picked by that heuristic.
+
+**Therefore:** coverage stays the screen — it costs 0 node-h and it does
+reject most destroyers — but its survivor list is a **candidate list, not a
+result**. Nothing from it may be quoted until a **paired GPU pass** measures
+the composed subset's quality *and* its latency ratio against the same-order
+exact reference, back to back (§0's drift rule). Decision-table rows 8/9/10 are
+unchanged; this bounds what feeds them.
+
+### (b) `--ray-measure` measured NOTHING for 19 hours, and no gate saw it
+
+**The bug.** `4c4d872` (2026-08-28 05:18, this session's pooled walk-rotation
+work) gave `CpuApproxPool.evaluate` / `evaluate_batch` an `episode` field and
+made both forward it to `actor.evaluate.remote(...)`.
+`CpuApproximationActor.evaluate` — the single hop between the pool and
+`CpuApproximationServer.evaluate`, which had accepted `episode` all along —
+was never given the parameter. Every pooled dispatch therefore died with
+
+```
+TypeError: got an unexpected keyword argument 'episode'
+```
+
+the pool sentinelled that row and killed the actor, and the remaining slots
+came back `[SENTINEL] batch pool-drained (actor died)`. Under `--ray-measure`
+**nothing was measured at all**: every terminal reward of every env of every
+episode was the degenerate sentinel (−1e10 on all six cost channels,
+`grad_coverage` −1, quality 0). Fixed by `87cdc49` (2026-08-29 00:35), a
+15-line restoration of the pass-through. **The window is 19 h 17 min.**
+
+**Why it matters to this plan specifically.** Every wave-1..4 arm runs
+`--ray-measure 3` (`gen_fq_launchers.py`, `SHARED_CLI`). This *is* the
+production measurement path. A run in this state exits 0, prints health rows
+and steps PPO: the **177 node-hours** of §"Cost summary" would have been 177
+node-hours of pure sentinel that still looked like a training run.
+
+**Why no gate saw it.** `ratio_gates.sh` pins the PPO importance ratio;
+`smoke.sh` pins finite post-warm-up health rows; **neither starts a measure
+pool**, and the smoke's canonical config contains no `--ray-measure`. The only
+trace was `[SENTINEL]` lines that nothing reads. It was caught by accident,
+and late: A6's plan log came back silently **empty** on the pooled path, which
+is a symptom nobody would have looked for on an arm that was not building a
+plan log.
+
+**The R battery predates it and is unaffected — but two numbers in the note
+that said so were wrong, and are corrected here.** R1/R2/R3 are Slurm jobs
+`62411` `r1-trim` / `62412` `r2-trimplus` / `62413` `r3-credit`; `sacct` puts
+all three on **2026-08-27**, `02:50:12 → 07:38:19`, `02:50:13 → 07:28:21` and
+`02:50:13 → 06:56:09` on `pgi15-gpu15/16/17`, one 4-GPU node each, all
+`COMPLETED` at `04:48:07` / `04:38:08` / `04:05:56` — which is where
+§"Cost summary"'s 4:05–4:48 basis comes from, and it holds. They did **not**
+run on 2026-08-12/13 (that date belongs to the unrelated `ord-r0..r3` ordering
+jobs `60141–60144`, which are 2-GPU and two of which TIMEOUT).
+
+The margin is therefore **19 hours, not two weeks**: the last R run ended
+2026-08-27 07:38 and `4c4d872` landed 2026-08-28 05:18. It is still a clean
+margin — no R run ever executed a line of the broken wire — but it is a
+narrow one and worth stating precisely rather than comfortably.
+
+Their sentinel count is **0, not 49–65**:
+
+```
+$ grep -c "\[SENTINEL\]" r{1_trim_62411,2_trimplus_62412,3_credit_62413}.log
+0
+0
+0
+```
+
+A case-insensitive `grep -c SENTINEL` returns 2 per log, and **both hits are
+the string `ALPHAGRAD_MULS_SENTINEL_CAP=5e12` inside the worker's env dump** —
+a tunable's name, not an event. (That is the same false-positive shape as the
+`truncated': 0` telemetry-key incident; the count is quoted here with its
+matched text for that reason.) Zero is a real "no pool failures", not a
+missing emitter: `cpu_approx_pool.py` prints `[SENTINEL]` from ten call sites
+and these runs exercised the pool (`ALPHAGRAD_BATCHED_CALLBACK=1`, actor
+output throughout).
+
+None of this changes the conclusion, and it strengthens the contrast: the R
+battery's real background rate is **0** sentinels over 250 episodes × 3 runs,
+against **400 sentinels and 0 measurements in one 1-episode / 4-env
+reproduction** of the bug. **The credit-horizon result stands** (γ=λ=1 held at
+quality 0.885; γ<1 drifted to destruction at ep131).
+
+*Unrelated caveat found while checking this, recorded because it bears on the
+same wall times:* R2 and R3 both end with `nvlink fatal : Input file ... newer
+than toolkit (129 vs 128)` and compile-fallback counters (`compile FALLBACK
+#603` in R2, `#481` in R3); R1 has none. Those two ran a nontrivial share of
+their steps under degraded fusion, so 4:05–4:48 is a *pessimistic* scaling
+basis, not a clean one.
+
+**The gate.** `tools/pool_liveness_gate.sh` + `tools/pool_liveness_check.py`,
+added to W0-A above. It is demonstrated in both directions rather than
+asserted: with `87cdc49` reverted in a scratch tree it reports
+
+```
+CONTRACT: RED -- the pool/actor/server wire contract is BROKEN
+  ! cpu_approx_pool.py:493: forwards `episode=` to CpuApproximationActor.evaluate(), which does NOT accept it
+VERDICT: [SENTINEL] lines = 400  by kind={'dispatch-error': 200, 'pool-drained': 200}
+VERDICT: plan records = 0  measured in a measure actor = 0
+POOLED-MEASUREMENT LIVENESS GATE: RED -- MEASUREMENT IS DEAD
+```
+
+while the pre-fix training run it is reading **exited 0** and dumped a Pareto
+front of `Total Reward: -2.00e+10 | CMP(flops): 1.00e+10 |
+Quality(loss_drop): 0.0000 | Mem(peak_memory): 1.00e+10` — the degenerate
+sentinel, ten times over, presented as a front. That contrast is the whole
+argument for the gate.
+
+*One false positive was found by running it, and is recorded because it is a
+fact about this campaign's configuration and not only about the gate.* The
+first version failed at HEAD too: 16/16 plans came back `sentinelled` with all
+six cost channels at −1e10, because `--reject-frozen-grads` (default ON, and
+right to be) **returns early before the cost channels are measured**, and at
+episode 0 an untrained face policy on the 25-vertex NeuralNetwork graph
+samples SKIPs that freeze every trainable leaf. On the reward vector alone
+that is indistinguishable from the dead pool. So: **a fully guard-rejected
+episode and a dead measurement path write the same terminal reward**, and any
+future check that reads only the reward vector will confuse them. The gate's
+own run now passes `--no-reject-frozen-grads` so its verdict depends on the
+transport rather than on what a random policy sampled, and its degeneracy
+check demands *positive* evidence — at least one real number on a cost channel
+— rather than the absence of a sentinel, which an empty log also satisfies.
