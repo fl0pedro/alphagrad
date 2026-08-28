@@ -258,17 +258,33 @@ Runs, in order: the ratio gates (sampling log-prob == replay log-prob, i.e.
 the PPO importance ratio is exactly 1 at epoch 0 -- a red gate here means the
 gradients of every arm using that feature were taken against a wrong ratio; a
 past instance of this bug ran the ratio to 2.3e23 invisibly under a
-batch-averaged KL), then the standard smoke on NeuralNetwork.
+batch-averaged KL), then the standard smoke on NeuralNetwork, then the
+POOLED-MEASUREMENT LIVENESS GATE.
 
 Helmholtz is DELIBERATELY NOT SMOKED: landscape_map/_callback on Helmholtz
 carries a pre-existing TypeError from the scalar-loss retarget (744fc3d),
 unrelated to anything this campaign changes.
 
-COST: ~2 CPU-h.  Node-hours on the Blackwells: ZERO.""",
+GATE 3 IS THE NEWEST AND IT PINS WHAT THE OTHER TWO CANNOT: that a
+--ray-measure run MEASURES SOMETHING.  Neither of the first two starts a
+measure pool -- the smoke's canonical config has no --ray-measure at all --
+and 87cdc49 is the proof that this matters: 4c4d872 made
+CpuApproxPool.evaluate forward an `episode` kwarg that
+CpuApproximationActor.evaluate did not accept, every pooled dispatch died with
+TypeError, the pool sentinelled the row and killed the actor, and under
+--ray-measure NOTHING WAS MEASURED for 19 hours -- while the run still exited
+0, still printed health rows and still stepped PPO.  The only trace was
+[SENTINEL] lines no gate reads.  EVERY wave-1..4 arm here runs --ray-measure
+3, so that is 177 node-hours of pure sentinel one launch away.
+
+COST: ~2 CPU-h + ~7 min for the liveness gate.  Blackwell node-hours: ZERO.""",
     prediction="""ratio_gates 6/6 ok with NO skips (a skip is a failure here:
 a gate that did not run pins nothing).  smoke NeuralNetwork rc=0 with every
-post-warm-up [health ep..] row finite.  Since 949f1af these both passed, so
-this gate is expected GREEN and exists to catch regression, not to discover.""",
+post-warm-up [health ep..] row finite.  pool_liveness_gate.sh GREEN: contract
+ok, 0 [SENTINEL] lines, every terminal plan measured inside a measure actor
+and carrying a real cost vector.  Since 949f1af the first two passed; the
+liveness gate is measured GREEN at 2ddbeef and measured RED with 87cdc49
+reverted, so it is demonstrated to fail on the bug it targets.""",
     falsifier="Any gate red, or any gate SKIPPED, blocks every later wave.",
     body=r"""
 export JAX_PLATFORMS=cpu
@@ -276,18 +292,29 @@ export GRAPHAX_ALLOW_PARTIAL_ORDER=1
 export ALPHAGRAD_SKIP_COUNT_OPS=1
 export JAX_COMPILATION_CACHE_DIR=$HOME/dsnn/.jax_compile_cache
 
-echo "=== GATE 1/2: tools/ratio_gates.sh ==="
+echo "=== GATE 1/3: tools/ratio_gates.sh ==="
 PY="uv run --no-sync python" tools/ratio_gates.sh
 RG=$?
 echo "ratio_gates rc=$RG"
 
-echo "=== GATE 2/2: tools/smoke.sh NeuralNetwork ==="
+echo "=== GATE 2/3: tools/smoke.sh NeuralNetwork ==="
 SMOKE_OUT=$HOME/dsnn/run_analysis/w0_smoke uv run --no-sync tools/smoke.sh NeuralNetwork
 SM=$?
 echo "smoke rc=$SM"
 
-if [ $RG -ne 0 ] || [ $SM -ne 0 ]; then
-  echo "W0 CPU GATES RED (ratio_gates=$RG smoke=$SM) -- do not launch wave 1"
+# GATE 3/3.  Does --ray-measure measure anything?  rc 1 = MEASUREMENT DEAD,
+# rc 2 = the gate could not run (harness misconfigured).  BOTH are failures --
+# a gate that did not run pins nothing (116c540).
+echo "=== GATE 3/3: tools/pool_liveness_gate.sh ==="
+POOL_GATE_OUT=$HOME/dsnn/run_analysis/w0_pool_liveness \
+RAY_TMPDIR=/tmp/ray_poolgate_$SLURM_JOB_ID \
+PY="uv run --no-sync python" tools/pool_liveness_gate.sh
+PL=$?
+echo "pool_liveness rc=$PL"
+
+if [ $RG -ne 0 ] || [ $SM -ne 0 ] || [ $PL -ne 0 ]; then
+  echo "W0 CPU GATES RED (ratio_gates=$RG smoke=$SM pool_liveness=$PL)" \
+       "-- do not launch wave 1"
   exit 1
 fi
 echo "W0 CPU GATES GREEN"

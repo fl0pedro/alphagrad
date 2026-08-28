@@ -204,3 +204,77 @@ shape error is a *trace-time crash*, never a silently wrong ratio.
 `tests/_scale_guard.py` now turns the batched case into a **named skip** with
 that explanation instead of a broadcast error 200 frames down, and this runner
 **treats a skip as a failure**: a gate that did not run pins nothing.
+
+---
+
+## 6. `tools/pool_liveness_gate.sh` — does `--ray-measure` measure anything?
+
+Sections 1–5 pin what the numbers *mean*. This one pins that there **are**
+numbers. Nothing above it starts a measure pool: the ratio gates never leave
+one process, and `tools/smoke.sh`'s canonical config has no `--ray-measure` in
+it at all.
+
+`87cdc49` is why that gap is not academic. `4c4d872` gave
+`CpuApproxPool.evaluate` / `evaluate_batch` an `episode` field and made both
+forward it to `actor.evaluate.remote(...)`, but `CpuApproximationActor.evaluate`
+— the one hop to `CpuApproximationServer.evaluate`, which had accepted
+`episode` all along — never got the parameter. Every pooled dispatch died with
+
+```
+TypeError: got an unexpected keyword argument 'episode'
+```
+
+the pool sentinelled the row and killed the actor, and under `--ray-measure`
+**nothing was measured at all**: every terminal reward was the degenerate
+sentinel (−1e10 on all six cost channels, `grad_coverage` −1, quality 0). For
+19 hours the run still exited 0, still printed finite `[health ep..]` rows and
+still stepped PPO. The only trace was `[SENTINEL]` lines no gate reads.
+
+```
+srun -p pgi15-cpu -w pgi15-cpu1 --mem=96G -c 24 -t 0:30:00 \
+     tools/pool_liveness_gate.sh
+```
+
+Two parts, **both always run** — part 1 is a proxy, part 2 is the evidence,
+and there is no fast-fail because skipping the evidence when the proxy looks
+fine is the failure mode this gate is written against:
+
+1. **CONTRACT** — an `ast` read of the pool → actor → server call chain. Every
+   keyword the pool forwards through `.evaluate.remote(...)` must be a
+   parameter the actor wrapper accepts, and every keyword the wrapper forwards
+   to `self._impl.<m>(...)` must be one the server accepts. No ray, no jax,
+   ~10 ms, and it names the offending kwarg and line.
+2. **LIVE** — a real 2-actor / 4-env / 1-episode `--ray-measure` run on
+   NeuralNetwork with `--plan-log`, then `tools/pool_liveness_check.py
+   verdict`: the pool must have started, there must be **zero `[SENTINEL]`
+   lines of any kind**, at least one terminal plan must carry an `actor` stamp
+   (i.e. it was measured *inside* a measure actor, which is what
+   `measure_pool.merge_pool_plan_records` records), and at least one recorded
+   plan must carry a **real number on a cost channel**.
+
+Three things about it are deliberate:
+
+* **It exports `ALPHAGRAD_BATCHED_CALLBACK=1` itself.** Without it
+  `--ray-measure` exits with `ValueError` before starting a pool, and a gate
+  that reported "measurement dead" there would be lying: it never got to test
+  one. That case is detected **by name** and reported as **exit 2, HARNESS
+  MISCONFIGURED**, distinct from **exit 1, MEASUREMENT DEAD**. Both are
+  failures — a skip is a failure — but they call for opposite responses.
+* **It passes `--no-reject-frozen-grads`.** The frozen-gradient guard is
+  default ON and right to be, but it returns early with `_SENTINEL_BAD_REWARD`
+  *before* the cost channels are measured. At episode 0 an untrained face
+  policy on a 25-vertex graph samples SKIPs that freeze every trainable leaf,
+  so at HEAD with the guard armed 16/16 plans came back `sentinelled` with all
+  six cost channels at −1e10 — on the reward vector alone, indistinguishable
+  from the dead pool. Turning the guard off makes the verdict depend on the
+  transport rather than on what a random policy happened to sample. (This was
+  a real false positive, found by running the gate at HEAD, not a hypothetical.)
+* **Check (4) demands positive evidence.** "No degenerate cost vector" is not
+  enough — an empty log satisfies it. At least one plan must carry a real cost.
+
+Demonstrated in both directions, which is the only thing that makes a gate a
+gate: with `87cdc49` reverted in a scratch tree it goes **red** (contract names
+all three `episode=` call sites; the live half reports 400 `[SENTINEL]` lines
+and 0 plan records) while the pre-fix training run it is reading **exits 0**;
+at `2ddbeef` it goes **green** (contract ok, 0 sentinels, 16/16 plans measured
+across both actors). ~6 min per direction on `pgi15-cpu1`.

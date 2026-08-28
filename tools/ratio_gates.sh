@@ -16,6 +16,19 @@
 # A SKIP IS A FAILURE HERE. tests/_scale_guard.py skips exactly when the
 # scale request did not take, and a gate that did not run pins nothing.
 #
+# WHAT THIS FILE DOES NOT COVER, and where that lives.
+# These gates pin what the numbers MEAN; not one of them starts a measure
+# pool, and tools/smoke.sh's canonical config has no --ray-measure in it at
+# all. So a --ray-measure run that measures NOTHING passes every gate in this
+# file (87cdc49: the pool forwarded an `episode` kwarg the actor wrapper did
+# not accept, every pooled dispatch died with TypeError, the pool sentinelled
+# the row and killed the actor, and every terminal reward was the degenerate
+# sentinel -- while the run exited 0 and printed finite health rows). That is
+# tools/pool_liveness_gate.sh's job; it is a SIBLING rather than a member of
+# GATES below because it costs ~6 minutes and a real Ray run rather than a
+# pytest process, and it runs in the SAME W0-A pre-flight (see
+# tools/gen_fq_launchers.py, arm w0_cpu_gates, GATE 3/3).
+#
 # Usage:  tools/ratio_gates.sh          (uses $PY, default: python)
 #         PY="uv run --no-sync python" tools/ratio_gates.sh
 set -uo pipefail
