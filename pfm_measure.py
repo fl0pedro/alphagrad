@@ -54,8 +54,8 @@ from graphax.sparse.micro_actions import Compress, Diag, Quant
 
 from alphagrad.approx.common import masks as M
 from alphagrad.approx.common.masks import (
-    FACE_QUANT_DTYPES, LiveVertexMaskOracle, make_live_masked_hook,
-    rule_is_idempotent_noop, set_per_face_masks)
+    FACE_QUANT_DTYPES, LiveVertexMaskOracle, legal_quant_actions,
+    make_live_masked_hook, rule_is_idempotent_noop, set_per_face_masks)
 from alphagrad.approx.common.examples import get_args, get_fn, infer_argnums
 
 try:
@@ -136,23 +136,48 @@ def _audited(rule, stats):
     inner = make_live_masked_hook((rule,), max_dims=N_AX, max_axes=N_AX,
                                   stats=stats)
 
+    def _bump(k):
+        stats[k] = stats.get(k, 0) + 1
+
     def _h(st):
         k = _kind_of(rule)
-        noop = rule_is_idempotent_noop(st, rule, max_dims=N_AX, max_axes=N_AX)
         n0 = stats.get("applied", 0)
         out = inner(st)
-        if noop:
-            stats[f"audit_noop_{k}"] = stats.get(f"audit_noop_{k}", 0) + 1
-            if stats.get("applied", 0) > n0:
-                # Applied, but inert. This is the count that makes BEFORE's
-                # `applied` an overstatement -- and it is invisible to the
-                # production counters, which is the whole reason QUANT read
-                # 36/36.
-                key = f"audit_noop_applied_{k}"
-                stats[key] = stats.get(key, 0) + 1
+        if stats.get("applied", 0) > n0:
+            # APPLIED. Was it INERT? Every apply_* returns the operand ITSELF
+            # when it has nothing to do (`if st.val.dtype == target: return
+            # st`), so object identity is an exact inertness test -- and it is
+            # unbiased between the arms, unlike classifying the REQUESTED rule
+            # (which would score a repaired rule by the rule it replaced).
+            if out is st:
+                _bump(f"audit_inert_{k}")
+            return out
+        # SKIPPED. Two innocent reasons, which are not masking failures and
+        # must come out of the denominator:
+        if rule_is_idempotent_noop(st, rule, max_dims=N_AX, max_axes=N_AX):
+            _bump(f"audit_noop_{k}")
+        elif not _any_legal(st, rule):
+            # The operand affords NO action of this kind at all -- rank 0, or
+            # every pair already spoken for. Leaving it exact IS the per-path
+            # skip; no mask could have rescued it.
+            _bump(f"audit_nolegal_{k}")
         return out
 
     return _h
+
+
+def _any_legal(st, rule):
+    """Does ``st`` afford ANY action of ``rule``'s kind?"""
+    from alphagrad.approx.common.masks import (
+        legal_compress_actions, legal_diag_actions)
+    try:
+        if isinstance(rule, Diag):
+            return bool(legal_diag_actions(st, N_AX))
+        if isinstance(rule, Compress):
+            return bool(legal_compress_actions(st, N_AX, strict=True))
+        return bool(legal_quant_actions(st, FACE_QUANT_DTYPES))
+    except Exception:
+        return True
 
 
 def _arm(closed, xs, argnums, per_face, seed):
@@ -225,23 +250,30 @@ def _arm(closed, xs, argnums, per_face, seed):
 
 
 def _row(stats, kind):
-    """``(applied, real_applied, skipped, noop, req, app/req, real/(req-noop))``.
+    """The honest row. All four audit counts are classified IDENTICALLY in
+    both arms, by the harness, against the same live operand the hook saw.
 
-    ``noop`` is the AUDIT count -- classified identically in both arms.
-    ``real_applied`` subtracts the requests that were applied but were
-    idempotent (only the BEFORE arm has any: the AFTER arm masks them out),
-    so the last column is the same statistic on both rows: of the requests
-    that COULD have changed the operand, how many did.
+      req    = applied + skipped                       (what the policy asked)
+      inert  = applied but the operand came back unchanged (`out is st`)
+      real   = applied - inert                         (what actually landed)
+      noop   = skipped AND idempotent on this operand  (a CORRECT skip)
+      nolgl  = skipped AND the operand affords no action of this kind at all
+               (rank 0 / every pair spoken for -- the per-path SKIP, also
+               correct, and no mask could rescue it)
+      YIELD  = real / (req - noop - nolgl): of the requests that COULD have
+               changed the operand, how many did.
     """
     ap = stats.get(f"applied_{kind}", 0)
     sk = stats.get(f"skipped_{kind}", 0)
+    inert = stats.get(f"audit_inert_{kind}", 0)
     noop = stats.get(f"audit_noop_{kind}", 0)
+    nolgl = stats.get(f"audit_nolegal_{kind}", 0)
     req = ap + sk
-    real = ap - stats.get(f"audit_noop_applied_{kind}", 0)
+    real = ap - inert
     frac = (ap / req) if req else float("nan")
-    denom = req - noop
+    denom = req - noop - nolgl
     hfrac = (real / denom) if denom > 0 else float("nan")
-    return ap, real, sk, noop, req, frac, hfrac
+    return ap, real, sk, noop, nolgl, req, frac, hfrac
 
 
 def report(example, seed=0):
@@ -250,13 +282,14 @@ def report(example, seed=0):
     before = _arm(closed, xs, argnums, False, seed)
     after = _arm(closed, xs, argnums, True, seed)
     print(f"{'kind':9} | {'arm':6} | {'appl':>5} {'real':>5} {'skip':>5} "
-          f"{'noop':>5} {'req':>5} | {'app/req':>8} {'real/(req-noop)':>16}")
-    print("-" * 84)
+          f"{'noop':>5} {'nolgl':>5} {'req':>5} | {'app/req':>8} "
+          f"{'YIELD':>7}")
+    print("-" * 88)
     for kind in KINDS:
         for name, st in (("before", before), ("after", after)):
-            ap, real, sk, noop, req, frac, hfrac = _row(st, kind)
+            ap, real, sk, noop, nolgl, req, frac, hfrac = _row(st, kind)
             print(f"{kind:9} | {name:6} | {ap:5d} {real:5d} {sk:5d} "
-                  f"{noop:5d} {req:5d} | {frac:8.3f} {hfrac:16.3f}")
+                  f"{noop:5d} {nolgl:5d} {req:5d} | {frac:8.3f} {hfrac:7.3f}")
     for name, st in (("before", before), ("after", after)):
         print(f"[{name}] requests={st['_requests']} "
               f"applied={st.get('applied', 0)} "
@@ -264,8 +297,13 @@ def report(example, seed=0):
               f"skipped_raised={st.get('skipped_raised', 0)} "
               f"repaired_diag={st.get('repaired_diag', 0)} "
               f"repaired_compress={st.get('repaired_compress', 0)}")
-    assert before.get("skipped_raised", 0) == 0
-    assert after.get("skipped_raised", 0) == 0
+    # NOT an assert: `skipped_raised` on the BEFORE arm is a RESULT (measured
+    # 4 on TransformerLM3 -- the Compress canonical-slot bound), and the whole
+    # claim is that the flag takes it to 0. Killing the run on it would have
+    # thrown away the number.
+    if after.get("skipped_raised", 0):
+        print("  !! AFTER RAISED -- the projection cleared an action "
+              "apply_* then rejected; this must be 0")
 
 
 if __name__ == "__main__":

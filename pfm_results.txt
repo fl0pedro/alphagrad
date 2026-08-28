@@ -1,0 +1,24 @@
+
+=== NeuralNetwork  (25 eqns) ===
+kind      | arm    |  appl  real  skip  noop nolgl   req |  app/req   YIELD
+----------------------------------------------------------------------------------------
+diag      | before |     1     1     2     0     2     3 |    0.333   1.000
+diag      | after  |     2     2     7     5     2     9 |    0.222   1.000
+compress  | before |     8     6    19    19     0    27 |    0.296   0.750
+compress  | after  |     5     5    19    18     0    24 |    0.208   0.833
+quant     | before |    36    19     0     0     0    36 |    1.000   0.528
+quant     | after  |    16    16    17    17     0    33 |    0.485   1.000
+[before] requests=66 applied=45 skipped=21 skipped_raised=0 repaired_diag=0 repaired_compress=0
+[after] requests=66 applied=23 skipped=43 skipped_raised=0 repaired_diag=0 repaired_compress=1
+
+=== TransformerLM3  (134 eqns) ===
+kind      | arm    |  appl  real  skip  noop nolgl   req |  app/req   YIELD
+----------------------------------------------------------------------------------------
+diag      | before |    13    13    35    24     7    48 |    0.271   0.765
+diag      | after  |    12    12    48    13    35    60 |    0.200   1.000
+compress  | before |   120    84    81    67     0   201 |    0.597   0.627
+compress  | after  |   104   104   103    88     0   207 |    0.502   0.874
+quant     | before |   243   113     0     0     0   243 |    1.000   0.465
+quant     | after  |    88    88   134   134     0   222 |    0.396   1.000
+[before] requests=492 applied=376 skipped=112 skipped_raised=4 repaired_diag=0 repaired_compress=0
+[after] requests=489 applied=204 skipped=285 skipped_raised=0 repaired_diag=5 repaired_compress=42
