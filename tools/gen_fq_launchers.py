@@ -42,7 +42,16 @@ import tempfile
 
 REPO = "/Users/assmuth/dsnn/alphagrad"
 HOME_DSNN = "/Users/assmuth/dsnn"
-WANDB = "--wandb online --wandb-entity dll-streetview --wandb-project dsnn-vertex"
+# wandb, as THREE constants rather than one opaque string, so the
+# pre-flight below and the emitted command line are provably the same
+# entity/project.  A wave arm that logs to the wrong entity is invisible
+# on the team dashboard and is indistinguishable, from the owner's side,
+# from "wandb is not syncing at all".
+WANDB_MODE = "online"
+WANDB_ENTITY = "dll-streetview"
+WANDB_PROJECT = "dsnn-vertex"
+WANDB = (f"--wandb {WANDB_MODE} --wandb-entity {WANDB_ENTITY}"
+         f" --wandb-project {WANDB_PROJECT}")
 
 # Flags whose ABSENCE from ppo.py must abort the job before any setup noise.
 # The R1-R4 battery shipped with this guard and it caught three missing flags.
@@ -994,13 +1003,18 @@ def render(a: dict) -> str:
 
     # --- pre-flight
     L.append("# ---------------------- PRE-FLIGHT ----------------------------")
-    L.append("# THREE layers, each failing LOUDLY with its own exit code before")
+    _has_wandb = not (kind == "probe" or a.get("needs_tool"))
+    L.append("# %s layers, each failing LOUDLY with its own exit code before"
+             % ("FOUR" if _has_wandb else "THREE"))
     L.append("# any setup noise reaches the log.  The R1-R4 battery shipped the")
     L.append("# first layer and it caught three missing flags.")
     L.append("#   64 = a flag this launcher needs is not defined in ppo.py")
     L.append("#   65 = argparse rejected the assembled command line")
     L.append("#   66 = a tool this launcher invokes does not exist")
     L.append("#   70 = graphax cannot lower what ALPHAGRAD_NEW_SLOT_JOIN asks for")
+    if _has_wandb:
+        L.append("#   71 = --wandb online, but this node cannot reach or"
+                 " authenticate to wandb")
     L.append("MISSING=\"\"")
     L.append("Q='\"'")
     L.append("for F in " + " ".join(REQUIRED_FLAGS) + "; do")
@@ -1048,6 +1062,42 @@ def render(a: dict) -> str:
                      " --format=csv,noheader")
         L.append(a["body"])
         return "\n".join(L) + "\n"
+
+    # --- Layer 3: wandb.  Every arm past this point carries `--wandb online`
+    #     (the WANDB constant), and an online run whose backend is unreachable
+    #     -- expired credentials, a firewalled node, a typo'd entity -- trains
+    #     for hours and lands NOWHERE the owner can see.  That is the "is the
+    #     wandb syncing?  I don't see it on the dashboard" failure, and like
+    #     the two-op form above it is SILENT.  Prove the authenticated
+    #     round-trip HERE, from THIS node, against the SAME entity the command
+    #     line will use, and print the dashboard URL into the slurm log.
+    L.append("# Layer 3: wandb credentials + a real authenticated round-trip")
+    L.append("# from THIS node to THIS entity, before hours are spent.  ~2 s.")
+    L.append('if [ "${FQ_SKIP_WANDB_CHECK:-0}" != "1" ]; then')
+    L.append("  JAX_PLATFORMS=cpu uv run --no-sync python - "
+             "<<'FQ_WANDB_EOF' || {")
+    L.append("import sys, wandb")
+    L.append(f"ENT, PROJ = {WANDB_ENTITY!r}, {WANDB_PROJECT!r}")
+    L.append("api = wandb.Api(timeout=30)")
+    L.append("teams = list(api.viewer.teams)")
+    L.append("if ENT not in teams:")
+    L.append("    sys.exit('wandb entity %r not available to these"
+             " credentials (viewer teams: %r)' % (ENT, teams))")
+    L.append("print('[preflight] wandb reachable and authenticated:"
+             " entity %s, project %s' % (ENT, PROJ))")
+    L.append("FQ_WANDB_EOF")
+    L.append('  echo "ABORT(71): --wandb online but this node cannot reach'
+             ' or authenticate to wandb."')
+    L.append('  echo "          A run started here would train blind.'
+             '  Set FQ_SKIP_WANDB_CHECK=1"')
+    L.append('  echo "          to override, or fix credentials with'
+             ' wandb login."')
+    L.append("  exit 71")
+    L.append("}")
+    L.append(f'  echo "[preflight] dashboard:'
+             f' https://wandb.ai/{WANDB_ENTITY}/{WANDB_PROJECT}"')
+    L.append("fi")
+    L.append("")
 
     # --- the command line, ONCE, as an array: the dry-parse and the real run
     #     cannot disagree because they are the same tokens.
