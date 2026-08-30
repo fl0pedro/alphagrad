@@ -32,7 +32,18 @@ deprecated no-op) and NOT
 `--seed-vertices` -- workstream A4 removed it from all 64 launchers because
 seeds are NOT vertices; leaving it on here built a 2-vertex-larger graph
 than the runs whose landscape this is supposed to be),
-`--quality-metric loss_drop`, `--cmp-type latency --mem-type peak_memory`.
+`--quality-metric grad_cosine`, `--cmp-type latency --mem-type peak_memory`.
+
+QUALITY CHANNEL (changed 2026-08-30).  This tool now defaults to
+`grad_cosine`, the same channel the campaign's training arms were settled on
+(949f1af: 0.874 Pearson / 0.805 Spearman against downstream accuracy, at
+0.003 s per plan).  It replaces `loss_drop`, which cost a 200-step Adam walk
+per plan -- the single largest share of the measurement budget -- for no
+better a signal.  THE TWO ARE NOT COMPARABLE NUMBERS: a `loss_drop` quality
+column and a `grad_cosine` quality column are different quantities on
+different scales, so a `rows_*.csv` written before this change must not be
+read against one written after it.  Every archived CSV predating this carries
+`quality_metric=loss_drop` in its header note for exactly that reason.
 There is no second measurement implementation here -- that is the whole point.
 
 PLANS
@@ -173,8 +184,16 @@ def make_argparser() -> argparse.ArgumentParser:
                         "first execution of a plan reading 5-10x the settled "
                         "value; without this the whole trial-0 column is "
                         "first-touch, not latency.")
-    p.add_argument("--quality-metric", default="loss_drop",
-                   choices=["loss_drop", "cosine", "none"])
+    p.add_argument("--quality-metric", default="grad_cosine",
+                   choices=["loss_drop", "grad_cosine", "jac_cosine",
+                            "cosine", "none"],
+                   help="Which quantity the `quality` column holds. Default "
+                        "grad_cosine (the settled campaign channel; cheap and "
+                        "the better predictor). loss_drop is the old default "
+                        "and runs a 200-step Adam walk per plan. NOT "
+                        "comparable across values -- see the module "
+                        "docstring. 'cosine' is deprecated in env.py and "
+                        "resolves to grad_cosine with a warning.")
     p.add_argument("--walk-steps", type=int, default=200)
     p.add_argument("--walk-lr", type=float, default=1e-3)
     p.add_argument("--walk-probe-seed", type=int, default=0)
@@ -833,6 +852,13 @@ CSV_FIELDS = [
     "latency_ns", "peak_memory", "quality", "frob_residual",
     "applied", "skipped", "applied_detail", "wall_s", "timestamp",
     "pulldown", "inner_reps", "warmup_src", "config_note", "gpu",
+    # WHICH QUANTITY the `quality` column holds. Added 2026-08-30 with the
+    # switch of the default from loss_drop to grad_cosine. They are different
+    # quantities on different scales; a row that does not say which one it is
+    # cannot be safely compared with anything. Every rows_*.csv written before
+    # this lacks the column, and a missing value is read back as `loss_drop`,
+    # which is what all of them are.
+    "quality_metric",
 ]
 
 
@@ -854,6 +880,7 @@ def config_stamp(args):
                        f"env:{os.environ.get('ALPHAGRAD_MEASURE_WARMUP', '1')}"
                        f"/cfg:{int(args.latency_warmup)}"),
         "config_note": args.config_note,
+        "quality_metric": str(args.quality_metric),
         # WHICH PHYSICAL DEVICE measured this row. If plan A and plan B are
         # measured by different actors, a systematic per-device offset lands
         # straight in PPO's within-batch advantage comparison.
@@ -1146,9 +1173,15 @@ def combined_report(args):
             for r in csv.DictReader(fh):
                 r.setdefault("pulldown", "unset")
                 r.setdefault("inner_reps", "?")
+                # A CSV written before 2026-08-30 has no quality_metric
+                # column; every one of those was measured under loss_drop.
+                # Naming it here is what stops a loss_drop quality column
+                # being averaged with a grad_cosine one two lines below.
+                _qm = (r.get("quality_metric") or "loss_drop").strip()
+                r["quality_metric"] = _qm
                 r["_base"] = r["plan_id"]
                 r["_cfg"] = (f"pd{r['pulldown']}/in{r['inner_reps']}"
-                     f"/gpu{r.get('gpu', '?')}")
+                     f"/gpu{r.get('gpu', '?')}/q{_qm}")
                 r["plan_id"] = f"{r['_base']} [{r['_cfg']}]"
                 rows.append(r)
     if not rows:
