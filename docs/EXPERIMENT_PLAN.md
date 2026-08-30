@@ -603,6 +603,18 @@ Measured on the W0-C stand-in run: `coverage_beam.py` at `7313978` over
 opened up (`--quality-min -2 --ratio-max 2 --no-beam --max-depth 1`), output at
 `~/dsnn/run_analysis/w0c_dev/singleton_census.json`.
 
+> **PROVENANCE (added 2026-08-30, ticket 22).** This census reads
+> `run_analysis/landscape/rows_qb_sweep.csv`, produced by a `landscape_map.py`
+> stamped `tool=3cb4ceb2` which **matches no commit**; it survived only inside
+> the mutable `.ag_pin_landscape/` directory and is now frozen at
+> `refs/archive/landscape_map_3cb4ceb2` in `~/alphagrad.git`. Its face indices
+> are on a **118**-live-face graph (`--seed-vertices` defaulted True, since
+> removed by A4); the current tool enumerates **117** and every `k` is shifted
+> by one, so **`k7/f0` names `v88/exp` only under that instrument** -- re-match
+> by `(vertex, primitive)`, not by index. The `min_leaf_ratio 1.0`,
+> `frac_zeroed 0.0`, `quality 0.0000` and `ratio 0.4711` figures themselves are
+> unaffected, as is the finding. Its `quality` column is `loss_drop`.
+
 Face **`k7/f0`** (label `v88/exp`, vertex 88) scores gradient coverage
 **perfectly clean**: `min_leaf_ratio` exactly **1.0**, `frac_zeroed` **0.0**,
 15 of 15 leaves counted, 0 uncountable — *bit for bit the identity plan's own

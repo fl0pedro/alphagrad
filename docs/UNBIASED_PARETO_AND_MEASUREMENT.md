@@ -68,6 +68,22 @@ paid destruction a −13 % bonus in all twelve campaign runs.
 
 ### 1.4 Pinned code: alphagrad `c2b8104`, graphax `4ea0bf8`
 
+> **PA-PH REPRODUCIBILITY: RESOLVED (2026-08-30, ticket 22).** The PA-PH rows
+> (`rows_a_cold_ident.csv` ... `rows_h_corr_pd1_in5.csv`) are stamped
+> `tool=cb7c7667`, a digest that for two days resolved to nothing on disk. It is
+> recovered. Job **62401**'s slurm log (`landscape_unbiased_62401.log`, line 13)
+> records the full 16-char digest `cb7c7667bcbd588b`, and a bounded `sha256sum`
+> sweep of every blob ever stored at that path identifies it as git blob
+> `bca09f77e54cf64dec2f71ef5adce092cb3878a1`, first committed in **`907c231`**
+> (2026-08-27 02:45:52) and reachable from `hostperf-caches`.
+>
+> **These rows ARE reproducible**, from this exact recipe: library = alphagrad
+> `c2b8104` (verified byte-identical to `.ag_pin_landscape/src`, the tool file
+> itself excepted), instrument = `landscape_map.py` as of `907c231`, graphax
+> `4ea0bf8`. Note the pin *directory* is not itself a provenance statement: its
+> copy of the tool was overwritten in place at 2026-08-27 03:00:32, four minutes
+> after this job finished. The sha256 stamped into `config_note` is.
+
 Both libraries are imported from **archived snapshots** (`.ag_pin_landscape/src`,
 `.gx_pin_landscape/src`), not from the live working trees, and the launcher
 **aborts (exit 70)** if `graphax.__file__` / `alphagrad.__file__` do not resolve
@@ -199,6 +215,33 @@ different face: `arch:v63:4` 0.5409, `arch:v64b:3` 0.5409, `arch:v65:1` 0.5449,
 
 ### 3.2 Naming the faces
 
+> **PROVENANCE (resolved 2026-08-30, ticket 22). READ BEFORE RE-USING ANY `k`/`f`
+> INDEX BELOW.** Everything in 3.2 and 3.3 comes from `rows_qb_sweep.csv` and
+> `face_inventory_qa_attrib.json`, written by job 62414 under a
+> `landscape_map.py` stamped `tool=3cb4ceb2`. That instrument **matches no
+> commit** -- it was never committed, and survived only as a file inside the
+> *mutable* `.ag_pin_landscape/` snapshot directory, which had already been
+> overwritten in place once. It is now frozen at
+> `refs/archive/landscape_map_3cb4ceb2` (blob sha256 `3cb4ceb25dbdbb60`) in
+> `~/alphagrad.git`, so these numbers stay reproducible.
+>
+> **The `k`/`f` indices in these tables are NOT valid against the current tool.**
+> `3cb4ceb2` defaults `--seed-vertices` to `True`; workstream A4 removed it
+> (seeds are not vertices, and it builds a 2-vertex-larger graph). The archived
+> inventory therefore holds **118** live faces where the tool now enumerates
+> **117**, with the `k` sequence and every graphax face key shifted by one --
+> measured 2026-08-30 on `pgi15-cpu2`, and shown NOT to be a graphax effect by
+> re-running against the pinned graphax `4ea0bf8` (identical 117). So `k19/f0`
+> names `v76 add` **only under `3cb4ceb2`**; when re-measuring, match faces by
+> `(vertex, primitive, key)`, never by index.
+>
+> What is unaffected: the paired latency **ratios** (0.530 etc.) and the
+> conclusion that the win is a single face -- neither depends on the indexing.
+> The `quality` column here is **`loss_drop`**; since 2026-08-30 the tool
+> defaults to `grad_cosine`, a different quantity on a different scale. The two
+> must not be compared, and `landscape_map` now keys its combined report on the
+> metric so they cannot be pooled.
+
 Phase **QB** (`--singleton-skip-sweep --sweep-stride 1`, job 62414, still
 running at the time of writing) skips **each live face alone** and measures it
 paired. The face inventory (`face_inventory_qa_attrib.json`, 118 live faces on
@@ -231,6 +274,11 @@ with quality 0.9260, i.e. v57 archived a one-face plan that is a pure no-op.
 > plan that buys nothing" is CONFIRMED from the ratio.
 
 ### 3.3 The whole win lives in elimination steps 13–24
+
+> Same provenance and the same index caveat as 3.2: these `k`/`f` labels hold
+> only under `tool=3cb4ceb2` (118 live faces, `--seed-vertices` on), frozen at
+> `refs/archive/landscape_map_3cb4ceb2`. The current tool enumerates 117 and
+> shifts every index. The ratios and the two-regime conclusion are unaffected.
 
 The QB sweep over all 118 live faces finds **14** single faces that beat the
 drift floor at quality ≥ 0.92, and their ratios fall into two regimes:
