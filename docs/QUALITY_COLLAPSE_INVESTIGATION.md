@@ -169,11 +169,11 @@ Checks against the brief's specific claims:
   ln_stored 0.09-0.18, n_paired ≈0.00-0.15` while the controls `stat_ln_i/stat_ln_j`
   score 0.38-0.75 (e.g. log lines 34-63). The head is near-blind to the quantities that
   determine whether an approximation is destructive.
-- Offline campaign (`/Users/assmuth/dsnn/alphagrad/CAMPAIGN_STATE.md`, "STAGE A COMPLETE"
+- Offline campaign (`docs/CAMPAIGN_STATE.md`, "STAGE A COMPLETE"
   and "STAGE B SEED 0" sections): all four lean pooling arms score −0.24…+0.12 (bar
   0.48-0.67); `+extents` clears the bar with main effect ≈ +0.5; MP+EXT clears all five
   targets at 1/3 of training. "#94 (extents) CONFIRMED NECESSARY" is recorded there
-  verbatim (lines 194, 440).
+  verbatim (lines 201, 447).
 - **Nuance the brief's strong form gets wrong**: quality outcomes were *not*
   policy-independent noise at the episode level. Pre-collapse (ep0-60, ud3cla83):
   `corr(approx_applied/quant, mean_quality) = −0.71`, `compress −0.68`, `fraction −0.59`
@@ -325,7 +325,7 @@ Ranked interventions:
 2. **Feed the face head what it approximates** (`face_sizes`/extents + message passing;
    #94/#158). *Supported by*: §4 — necessary for any *positive* result (learning which
    approximations are safe), already CONFIRMED NECESSARY by the 5-seed factorial
-   (CAMPAIGN_STATE.md). *Not supported as*: an anti-collapse fix on its own — the
+   (`docs/CAMPAIGN_STATE.md`). *Not supported as*: an anti-collapse fix on its own — the
    coarse "approximate less" signal (r = −0.71) was visible to the current policy and
    did not prevent collapse. Do it with (1), not instead of it.
    *Cheapest test*: the Stage-B MP+EXT checkpoint arms already exist; wire `face_sizes`
