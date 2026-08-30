@@ -237,6 +237,14 @@ def make_argparser() -> argparse.ArgumentParser:
                         "measured, taken in order of best (lowest) recorded "
                         "latency -- that is the part of the front the "
                         "owner's question is about.")
+    p.add_argument("--face-inventory", action="store_true",
+                   help="Dump the (step, vertex, face-index, face-key, "
+                        "primitive, operand shapes/dtypes) inventory of every "
+                        "LIVE face on the order, then continue. This is what "
+                        "lets a measured ratio be attributed to a NAMED face "
+                        "instead of an anonymous index.")
+    p.add_argument("--inventory-only", action="store_true",
+                   help="Dump the face inventory and exit without measuring.")
     p.add_argument("--report-only", action="store_true",
                    help="Measure nothing; read every rows_*.csv in --out-dir "
                         "and emit the COMBINED report across configs.")
@@ -460,6 +468,38 @@ def _slots(spec: str) -> tuple[int, ...]:
     return out
 
 
+def face_inventory(env, order):
+    """Every LIVE face on `order`, named.
+
+    A face KEY is graphax's ``(vidx[in_edge], vidx[out_edge])`` under its
+    stable var index -- the same key ``_eliminate_vertex`` looks up in
+    ``face_transforms``. Keys are graph-state dependent, so they are
+    enumerated on the EXACT prefix: valid for attributing a plan whose
+    approximations start at or after that step, which is every plan here
+    (the archived winners carry a single wire).
+    """
+    from graphax import faces_of
+    from graphax.incremental import IncrementalJaxpr
+    cfg = env.config
+    ij = IncrementalJaxpr(cfg.jaxpr, tuple(cfg.argnums), list(env.consts),
+                          list(env.args), track_faces=False)
+    inv = []
+    for k, v in enumerate(order):
+        v = int(v)
+        keys = faces_of(ij.graph, ij.tgraph, v, cfg.jaxpr)
+        eqn = cfg.jaxpr.eqns[v - 1]
+        outs = [[list(o.aval.shape), str(o.aval.dtype)]
+                for o in eqn.outvars if hasattr(o, "aval")]
+        ins = [[list(i.aval.shape), str(i.aval.dtype)]
+               for i in eqn.invars if hasattr(i, "aval")]
+        for f, key in enumerate(keys[: envmod.MAX_FACES]):
+            inv.append({"k": int(k), "vertex": v, "f": int(f),
+                        "key": [int(x) for x in key],
+                        "prim": eqn.primitive.name, "out": outs, "in": ins})
+        ij.eliminate(v, (), None)
+    return inv
+
+
 def build_ladder_plan(env, order, op: str, budget, args):
     """Place `op` on exactly `budget` LIVE faces along `order` ('all' = every
     live face), walking the graph forward so the face counts are the ones the
@@ -659,6 +699,7 @@ def _point_to_plan(best, env, order, path):
     face_specs = np.full((len(a_order), mf, FACE_SLOTS, 3), -1, dtype=np.int32)
     face_skips = np.zeros((len(a_order), mf), dtype=np.int32)
     n_faces = 0
+    wires = []
     for grp in faces:
         k = int(grp["k"])
         if not (0 <= k < len(a_order)):
@@ -672,6 +713,20 @@ def _point_to_plan(best, env, order, path):
                               "width; refusing to truncate the plan")
             face_specs[k, f] = np.asarray(grp["rows"][idx], dtype=np.int32)
             face_skips[k, f] = int(grp["skips"][idx])
+            _rows = np.asarray(grp["rows"][idx], dtype=np.int32)
+            _kinds = []
+            if int(grp["skips"][idx]) == 1:
+                _kinds.append("SKIP")
+            for _sl in range(_rows.shape[0]):
+                _b = int(_rows[_sl, 0])
+                if _b == QUANT_SENTINEL:
+                    _kinds.append(f"QUANT@slot{_sl}")
+                elif _b == COMPRESS_SENTINEL:
+                    _kinds.append(f"COMPRESS@slot{_sl}")
+                elif _b >= 0:
+                    _kinds.append(f"DIAG@slot{_sl}")
+            wires.append({"k": k, "f": f,
+                          "kind": "+".join(_kinds) or "none"})
             n_faces += 1
     # A vertex-level skip() has no face-level address; broadcasting it would
     # be an approximation of the recorded plan, so refuse instead.
@@ -694,6 +749,7 @@ def _point_to_plan(best, env, order, path):
         "n_slot_rows": int(np.sum(face_specs[..., 0] != -1)),
         "total_live_faces": -1,
         "per_vertex_faces": [],
+        "wires": wires,
     }, note
 
 
@@ -1165,6 +1221,17 @@ def main():
     print(f"[landscape] {len(order)} valid vertices; rev order "
           f"{order[:6].tolist()}...{order[-3:].tolist()}", flush=True)
 
+    INV = None
+    if args.face_inventory or args.inventory_only:
+        INV = face_inventory(env, order)
+        ipath = os.path.join(args.out_dir, f"face_inventory{tag}.json")
+        with open(ipath, "w") as fh:
+            json.dump(INV, fh, indent=2)
+        print(f"[landscape] face inventory: {len(INV)} live faces -> {ipath}",
+              flush=True)
+        if args.inventory_only:
+            return
+
     rungs = [int(x) for x in args.ladder.split(",") if x.strip()]
     if not args.no_all_rung:
         rungs = rungs + ["all"]
@@ -1301,11 +1368,27 @@ def main():
                    if c["reason"] else ""))
 
     with open(plans_path, "w") as fh:
+        _bykf = {(e["k"], e["f"]): e for e in (INV or [])}
+
+        def _named(p):
+            """Attach the NAMED face (vertex, key, primitive, shapes) to each
+            wire, so a ratio can be attributed to a face instead of an index."""
+            out = []
+            for w in p.get("wires", []) or []:
+                e = _bykf.get((w["k"], w["f"]))
+                out.append({**w, **({"vertex": e["vertex"], "key": e["key"],
+                                     "prim": e["prim"], "out": e["out"],
+                                     "in": e["in"]} if e else
+                                    {"vertex": None, "note": "not in "
+                                     "inventory (enumerated on exact prefix)"})})
+            return out
+
         json.dump({pid: {"op": p["op"], "budget": p["budget"],
                          "n_faces_approx": p["n_faces_approx"],
                          "n_slot_rows": p["n_slot_rows"],
                          "total_live_faces": p["total_live_faces"],
-                         "per_vertex_faces": p["per_vertex_faces"]}
+                         "per_vertex_faces": p["per_vertex_faces"],
+                         "wires": _named(p)}
                    for pid, p in plans.items()}, fh, indent=2)
     print(f"[landscape] {len(plans)} plans; manifest -> {plans_path}",
           flush=True)
