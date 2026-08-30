@@ -12642,7 +12642,7 @@ def main():
         # Any change to the env / callback / rollout path has to be proven
         # trajectory-identical against its parent commit, and the only honest
         # way to do that is to pickle the post-episode state and diff it leaf
-        # by leaf (see ~/dsnn/_eq137_cmp.py). Pure instrumentation: nothing
+        # by leaf (see ~/dsnn/campaign_scratch/_eq137_cmp.py). Pure instrumentation: nothing
         # downstream reads the file, and the branch is dead without the var.
         _eqp = os.environ.get("ALPHAGRAD_EQ_DUMP", "")
         if _eqp:
