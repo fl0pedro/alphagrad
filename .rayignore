@@ -1,0 +1,16 @@
+# Ray uploads the working_dir as a runtime-env package, capped at 512 MiB.
+# This directory had grown to 1.5 GiB of scratch (jax compile caches, wandb
+# runs, campaign outputs), so EVERY --ray-measure job was failing at init with
+# RuntimeEnvSetupError before running a single episode. None of the below is
+# code; src/ and tests/ are deliberately NOT excluded.
+.jaxcache_perf2/
+wandb/
+campaign_exp/
+.claude/
+campaign_aoj_sub1/
+decode2_out/
+decode3_out/
+decode4_out/
+decode5_out/
+decode6_out/
+*.out
