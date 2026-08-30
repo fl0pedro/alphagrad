@@ -73,3 +73,50 @@ wandb_key.txt
 
 playground
 .claude
+
+# ---------------------------------------------------------------------------
+# CAMPAIGN SCRATCH ARTIFACTS (2026-08 agent campaigns, repo root).
+#
+# These are the NON-CODE products of the a1b/a2/a3/a5-a8, ab, apxaudit, bwd,
+# compress, decode..decode6, lean, perf2, pfm, poolgate and tlm3 campaigns:
+# compile caches, job output directories, captured pytest stdout and result
+# dumps.  The owner already classified this same set as "none of the below is
+# code" in .rayignore, which had to exclude it because the tree had grown to
+# 1.5 GiB and every --ray-measure job was dying at RuntimeEnvSetupError.
+#
+# Deliberately NOT ignored here: the campaign .py/.sh/.sbatch scripts at the
+# repo root.  Those are the only surviving record of how the jobs behind the
+# committed results were actually invoked, and this repo has already lost one
+# command line that way (job 61494, see tools/gen_fq_launchers.py).  Their
+# disposition is an owner decision, not a pattern.
+# ---------------------------------------------------------------------------
+
+# JAX persistent compile caches (~600 MiB; .jaxcache_perf2 alone is 10391 files)
+/.jaxcache_*/
+
+# per-campaign job output directories (*_out, *_out_b, *_out_fine, pool_gate_out)
+/*_out*/
+!/decode2_out/
+/decode2_out/*
+# ...except the one log a committed source comment cites by name as the
+# provenance of its numbers (src/alphagrad/approx/common/feature_probe.py:72)
+!/decode2_out/face_today_sizes.log
+
+# .bak copies of tracked source taken before the 2026-08-15 lean refactor;
+# every one of these files is recoverable from git history instead
+/lean_backup/
+
+# captured pytest stdout from the lean and pfm before/after gates
+/lean_pytest_*.txt
+/pfm_pytest_*.txt
+
+# campaign job logs and result dumps at the repo root
+/a7_*.out
+/a3_probe_rows*.csv
+/pfm_m2_nn.txt
+/pfm_m3.txt
+/pfm_meas_out.txt
+/pfm_tlm3.txt
+
+# a scratch dump of `git status` / `git log` left by an agent run
+/_agentA_info.txt
