@@ -22,6 +22,7 @@ decision table, is docs/EXPERIMENT_PLAN.md.
 from __future__ import annotations
 
 import argparse
+import difflib
 import os
 import shutil
 import subprocess
@@ -42,6 +43,51 @@ import tempfile
 
 REPO = "/Users/assmuth/dsnn/alphagrad"
 HOME_DSNN = "/Users/assmuth/dsnn"
+
+# ---------------------------------------------------------------------------
+# THE LANDSCAPE MEASUREMENT ARMS import from the LIVE trees, not from the
+# .ag_pin_landscape / .gx_pin_landscape snapshot directories the hand-written
+# fq_face_attrib.sbatch used.  Three measured reasons, 2026-08-30:
+#
+#  1. THE PIN CANNOT DO grad_cosine.  The settled quality channel is
+#     grad_cosine, but the pinned alphagrad (c2b8104, 2026-08-27) predates it:
+#     its env.quality_metric() has no grad_cosine branch at all and its
+#     landscape_map.py offers choices=[loss_drop, cosine, none].  A
+#     `--quality-metric grad_cosine` phase against the pin argparse-errors,
+#     and if it did not it would raise in quality_metric().
+#  2. THE PIN DIRECTORY IS MUTABLE and has already been overwritten in place:
+#     .ag_pin_landscape's landscape_map.py was replaced on 2026-08-27
+#     03:00:32, four minutes after the PA-PH job that used it finished.  A
+#     directory name is not a provenance statement; a git sha is.
+#  3. THE INSTRUMENT IS NOW COMMITTED.  landscape_map.py's face-inventory and
+#     singleton-sweep work lived uncommitted for two days -- which is why the
+#     launcher had to point at a snapshot at all.  It is committed now, so the
+#     repo path IS the reproducible instrument and the hack is unnecessary.
+#
+# The PA-PH rows under run_analysis/landscape stay reproducible from their own
+# recipe -- alphagrad c2b8104 for the library, landscape_map.py from 907c231
+# (sha256 cb7c7667bcbd588b, the blob those rows are stamped with), graphax
+# 4ea0bf8 -- which is recorded in UNBIASED_PARETO_AND_MEASUREMENT.md.  They are
+# loss_drop rows and are NOT comparable with anything this arm produces.
+# ---------------------------------------------------------------------------
+LANDSCAPE_TOOL = f"{REPO}/src/alphagrad/approx/tools/landscape_map.py"
+
+# Flags fq_face_attrib passes to landscape_map.py.  Grepped against THE TOOL
+# THAT IS ACTUALLY INVOKED, not against ppo.py: this launcher lived outside
+# git for two days passing --face-inventory / --singleton-skip-sweep /
+# --sweep-stride, which at the time NO COMMITTED landscape_map.py defined.
+# That is the 43-line-stale-launcher failure mode, and this list is the guard.
+LANDSCAPE_FLAGS = [
+    "--example", "--dataset", "--hidden-dim", "--vocab-size", "--num-layers",
+    "--seed", "--exec-on-gpu", "--cmp-type", "--mem-type",
+    "--num-data-points", "--reps-per-point", "--quality-metric",
+    "--walk-steps", "--out-dir", "--latency-inner-reps", "--reps",
+    "--warmup-trials", "--ladder", "--no-all-rung", "--ops", "--no-skip-plan",
+    "--archive", "--archive-target", "--archive-tol", "--archive-all-points",
+    "--archive-max-measure", "--face-inventory", "--inventory-only",
+    "--singleton-skip-sweep", "--sweep-stride", "--noise-floor-reps",
+    "--report-only", "--tag", "--config-note", "--max-seconds",
+]
 # wandb, as THREE constants rather than one opaque string, so the
 # pre-flight below and the emitted command line are provably the same
 # entity/project.  A wave arm that logs to the wrong entity is invisible
@@ -76,6 +122,20 @@ REQUIRED_FLAGS = [
     "--per-face-masks",
     "--plan-log",
 ]
+
+class _Delete:
+    """Sentinel: an arm sets a key to _DELETE to REMOVE it, in `cli` or `env`.
+
+    Deleting an inherited env var is not cosmetic.  SHARED_ENV is the
+    TRAINING stack; a measurement arm that silently inherits
+    ALPHAGRAD_QUALITY_GATE_MIN=0.05 has its cost channels FLOORED at the
+    exact-reverse reference for every plan scoring below 0.05 quality --
+    which for a SKIP sweep is precisely the plans being measured.
+    """
+
+
+_DELETE = _Delete()
+
 
 # ---------------------------------------------------------------------------
 # SHARED ENV.  Byte-identical across every training arm -- a controlled
@@ -900,6 +960,236 @@ not a launch.""",
 # RENDERING
 # ---------------------------------------------------------------------------
 
+# ===========================  MEASUREMENT ARMS  =============================
+# These read a landscape rather than train a policy: they invoke
+# landscape_map.py directly, carry no wandb config, and their required-flag
+# guard points at THE TOOL rather than at ppo.py.
+
+_FACE_ATTRIB_BODY = r"""
+# ---- PROVENANCE, RESOLVED AND RECORDED, NOT ASSUMED ----------------------
+# The hand-written predecessor pinned PYTHONPATH at snapshot directories and
+# verified the imports landed there.  This arm imports the live trees, so the
+# equivalent guard is: say exactly which files were imported and exactly which
+# commits they are, and refuse if a stale editable install is shadowing them.
+uv run --no-sync python - <<'PYEOF'
+import sys
+import graphax, alphagrad
+gx, ag = graphax.__file__, alphagrad.__file__
+print("graphax.__file__  =", gx)
+print("alphagrad.__file__=", ag)
+ok = gx.startswith("@HOME_DSNN@/graphax/") and ag.startswith("@REPO@/")
+if not ok:
+    print("ABORT: imports did NOT resolve to the live working trees --")
+    print("       an editable-install finder is beating PYTHONPATH.")
+    sys.exit(70)
+print("IMPORTS VERIFIED: both resolve to the live working trees.")
+PYEOF
+if [ $? -ne 0 ]; then
+  echo "ABORT(70): import resolution failed -- refusing to produce numbers"
+  echo "           whose provenance we cannot state. Nothing measured."
+  exit 70
+fi
+
+# A DIRTY LIBRARY IS A PROVENANCE HOLE.  Not fatal (graphax is routinely
+# mid-edit here) but it must be visible in the log beside the numbers, and
+# the diffstat is recorded so the run can be reconstructed.
+for R in @REPO@ @HOME_DSNN@/graphax; do
+  D=$(git -C $R status --porcelain | wc -l)
+  echo "TREE $R HEAD=$(git -C $R rev-parse --short HEAD) dirty=$D"
+  if [ "$D" != "0" ]; then
+    echo "  WARNING: $R has $D uncommitted change(s); these rows are NOT"
+    echo "           reproducible from a sha alone.  Diffstat:"
+    git -C $R diff --stat | sed 's/^/           /'
+  fi
+done
+
+TOOL=@TOOL@
+echo "TOOL $TOOL sha256=$(sha256sum $TOOL | cut -c1-16)"
+COMMITTED=$(git -C @REPO@ rev-parse HEAD:src/alphagrad/approx/tools/landscape_map.py 2>/dev/null || echo none)
+ONDISK=$(git -C @REPO@ hash-object "$TOOL" 2>/dev/null || echo none)
+if [ "$COMMITTED" = "$ONDISK" ]; then
+  echo "TOOL PROVENANCE: instrument IS the committed HEAD blob $COMMITTED"
+else
+  echo "TOOL PROVENANCE: WARNING -- instrument is NOT the committed HEAD blob"
+  echo "                 on-disk=$ONDISK committed=$COMMITTED"
+fi
+AG_SHA=$(git -C @REPO@ rev-parse --short HEAD)
+GX_SHA=$(git -C @HOME_DSNN@/graphax rev-parse --short HEAD)
+NOTE="ag=$AG_SHA gx=$GX_SHA live tool=$(sha256sum $TOOL | cut -c1-8)"
+
+# A NEW OUTPUT DIRECTORY, DELIBERATELY.  run_analysis/landscape holds the
+# 2026-08-27 loss_drop rows measured on the pinned stack; these are
+# grad_cosine rows on the live stack and the two must not share a --report-only
+# glob.  (landscape_map keys its combined report on the quality metric as
+# well, so pooling is prevented twice.)
+OUT=@HOME_DSNN@/run_analysis/landscape_gradcos
+mkdir -p $OUT
+W=@REPO@/wandb
+ARCH="--archive v57=$W/run-20260817_113827-it05ku34/files/pareto_front.json \
+ --archive v60=$W/run-20260817_181647-ygm8n2jy/files/pareto_front.json \
+ --archive v63=$W/run-20260822_165942-as9s5yrl/files/pareto_front.json \
+ --archive v64b=$W/run-20260825_132646-38oyqf4g/files/pareto_front.json \
+ --archive v65=$W/run-20260826_121153-8sht6x1m/files/pareto_front.json \
+ --archive v66a=$W/run-20260826_121153-318ktrgq/files/pareto_front.json \
+ --archive v66b=$W/run-20260826_121154-0olsxsjl/files/pareto_front.json \
+ --archive v66c=$W/run-20260826_121154-s1537jdd/files/pareto_front.json"
+
+COMMON="--example TransformerLM --dataset wikitext2 \
+ --hidden-dim 256 --vocab-size 512 --num-layers 3 --seed 250197 \
+ --exec-on-gpu \
+ --cmp-type latency --mem-type peak_memory \
+ --num-data-points 5 --reps-per-point 4 \
+ --quality-metric grad_cosine --walk-steps 200 \
+ --out-dir $OUT"
+
+run_on () {   # $1 = gpu index, $2 = label, rest = args
+  local g="$1"; local lbl="$2"; shift 2
+  echo "=========================================================="
+  echo "PHASE $lbl  gpu=$g  start $(date +%H:%M:%S)  PULLDOWN=$GRAPHAX_QUANT_PULLDOWN"
+  echo "=========================================================="
+  CUDA_VISIBLE_DEVICES=$g uv run --no-sync python "$TOOL" "$@"
+  echo "PHASE $lbl exited rc=$? at $(date +%H:%M:%S)"
+}
+
+# ---- QA: name the face every archived plan skips -------------------------
+# --reps 0 --warmup-trials 0: this phase MEASURES NOTHING.  It builds every
+# archived plan, enumerates the live-face inventory on the exact prefix, and
+# writes plans_*.json with each wire resolved to (step, vertex, face key,
+# primitive, operand shapes/dtypes).  Costs ~2 minutes.
+run_on 0 "QA-face-attribution" $COMMON $ARCH \
+  --latency-inner-reps 50 --reps 0 --warmup-trials 0 \
+  --ladder "" --no-all-rung --ops "" --no-skip-plan \
+  --archive-all-points --archive-max-measure 40 \
+  --face-inventory --noise-floor-reps 0 \
+  --tag qa_attrib --config-note "$NOTE phase=QA" --max-seconds 900
+
+# ---- QB: SINGLETON SWEEP -- every live face, skipped alone ---------------
+# Each plan skips exactly ONE face, so every row IS a minimal plan and the
+# best row IS the true optimum of the fixed-rev SKIP space.  Paired against
+# its own exact reference, warm (2 discarded rounds), n=3.
+run_on 0 "QB-singleton-sweep" $COMMON \
+  --latency-inner-reps 50 --reps 3 --warmup-trials 2 \
+  --ladder "" --no-all-rung --ops "" --no-skip-plan \
+  --singleton-skip-sweep --sweep-stride 1 \
+  --face-inventory --noise-floor-reps 0 \
+  --tag qb_sweep --config-note "$NOTE phase=QB" --max-seconds 5400
+
+# ---- QC: combined report -------------------------------------------------
+run_on 0 "QC-report" $COMMON --report-only --tag COMBINED
+
+echo "=========================================================="
+echo "FACE ATTRIBUTION DONE $(date). alphagrad $AG_SHA graphax $GX_SHA"
+ls -la $OUT
+echo "=========================================================="
+""".replace("@TOOL@", LANDSCAPE_TOOL).replace("@REPO@", REPO) \
+   .replace("@HOME_DSNN@", HOME_DSNN)
+
+
+arm(
+    name="face_attrib",
+    job="face-attribution",
+    kind="tool",
+    node="pgi15-gpu18",
+    time="2:30:00",
+    gpus=4,
+    needs_tool=LANDSCAPE_TOOL,
+    required_flags=LANDSCAPE_FLAGS,
+    required_flags_file=LANDSCAPE_TOOL,
+    env={
+        # The archived winners were produced under PULLDOWN=1, so the archived
+        # plans are rebuilt under pulldown.  Comparing them under pullup would
+        # be comparing two different compute stacks and calling the difference
+        # a result.
+        "GRAPHAX_QUANT_PULLDOWN": "1",
+        "ALPHAGRAD_MAX_FACES": "2538",
+        "ALPHAGRAD_MAX_DELTA_TOKENS": "32768",
+        "ALPHAGRAD_MEASURE_WARMUP": "1",
+        "GRAPHAX_PLANNER_EXACT": "1",
+        "GRAPHAX_DEMAND_EMIT": "1",
+        # K=1 is the settled grad-cosine variant (949f1af): most predictive
+        # AND cheapest.  Relevant here because this arm's quality channel IS
+        # grad_cosine.
+        "ALPHAGRAD_GRAD_COSINE_K": "1",
+        # ALPHAGRAD_NEW_SLOT_JOIN is left at the shared default (1).  The
+        # hand-written predecessor forced 0 because the PINNED graphax 4ea0bf8
+        # rejects the res-slot two-op form; the live graphax accepts it
+        # (e5fd46c) and the two-op pre-flight above VERIFIES that before any
+        # phase runs.  It is inert for QB in any case -- a SKIP-only plan
+        # writes no rule into any slot.
+        #
+        # ---- DROPPED FROM THE TRAINING STACK -----------------------------
+        # SHARED_ENV describes ppo.py.  Two of these do not merely add noise
+        # to a measurement arm, they CHANGE THE NUMBER, and the hand-written
+        # launcher this arm replaces set neither:
+        #
+        # QUALITY_GATE_MIN: defaults to 0 = gate OFF.  At 0.05 the additive
+        #   quality gate FLOORS latency_ns and peak_memory at the exact-rev
+        #   reference for any plan scoring below 0.05.  A singleton SKIP
+        #   sweep exists to price exactly those plans, so inheriting this
+        #   would silently replace the measurement with the reference cost.
+        # BATCHED_CALLBACK: defaults to 0.  At 1 env._callback takes the
+        #   batched host path -- a different measurement path from the one
+        #   every archived row was measured on.
+        #
+        # The rest are trainer-only and have no meaning here: there is no
+        # policy, no actor pool and no episode loop in landscape_map.
+        "ALPHAGRAD_QUALITY_GATE_MIN": _DELETE,
+        "ALPHAGRAD_BATCHED_CALLBACK": _DELETE,
+        "ALPHAGRAD_FORCE_REV_ORDER": _DELETE,
+        "ALPHAGRAD_POLICY": _DELETE,
+        "ALPHAGRAD_ACTOR_PROF_EVERY": _DELETE,
+        "ALPHAGRAD_PROFILE": _DELETE,
+        "ALPHAGRAD_DEBUG_APPROX_PROB": _DELETE,
+        "ALPHAGRAD_DEBUG_DEGEN": _DELETE,
+        "ALPHAGRAD_DEBUG_MEM": _DELETE,
+        "ALPHAGRAD_DEBUG_MEASURE": _DELETE,
+    },
+    purpose="""FACE ATTRIBUTION / SINGLETON SKIP SWEEP -- which face is the win?
+
+The archived winners at ratio ~0.52-0.58 carry ONE face wire and ZERO applied
+diag/compress/quant rules -- the win is a SKIP.  So WHICH face is skipped
+decides everything, and the search space is worth mapping face by face.
+
+  QA  FACE ATTRIBUTION -- name the skipped face of every archived plan
+  QB  SINGLETON SWEEP  -- skip each live face ALONE, paired, n=3
+  QC  combined report
+
+WHY ALL FOUR GPUs FOR A ONE-GPU JOB.  The peak_memory channel is a
+DEVICE-WIDE counter (peak_bytes_in_use delta); a co-resident process on the
+same GPU inflates it, and CV was measured going 0.0000% -> 49.7% under a
+noisy neighbour.  Holding the node is what makes the memory column mean
+anything.  Only CUDA_VISIBLE_DEVICES=0 is ever used.
+
+ADOPTED INTO THE GENERATOR 2026-08-30 (ticket 22).  It ran for two days as a
+hand-edited file outside git passing --face-inventory, --singleton-skip-sweep
+and --sweep-stride, none of which any COMMITTED landscape_map.py defined -- it
+worked only because it invoked a snapshot copy.  The required-flag guard above
+now greps THE TOOL IT ACTUALLY INVOKES for every flag it passes, so that
+divergence aborts in seconds instead of hours in.
+
+TWO DELIBERATE CHANGES from the hand-written version, both forced and both
+documented at the constants above and in `env`: the quality channel is
+grad_cosine rather than loss_drop (owner decision), which the 2026-08-27 pin
+cannot express at all, so the arm imports the live trees; and the output goes
+to run_analysis/landscape_gradcos so grad_cosine rows never share a report
+glob with the archived loss_drop ones.""",
+    prediction="""QA resolves every archived winner's single wire to a named
+(step, vertex, graphax face key, primitive, operand shapes) and costs ~2 min
+with --reps 0.  QB measures ~115-118 singleton plans; the best singleton
+reproduces the archived winners' ~0.53 LATENCY RATIO, confirming the win is
+ONE face.  The QUALITY column will NOT match the archived runs and is not
+expected to: it is a different quantity.  Note that the live stack enumerates
+117 live faces where the pinned stack enumerated 118, so k/f indices are NOT
+transferable between the two -- faces must be matched by (vertex, primitive,
+key), not by index.""",
+    falsifier="""Import resolution failing (exit 70), any flag missing from the
+tool (exit 64), or QB's best singleton latency ratio not reproducing the
+archived winner's ratio within the paired noise floor -- the last would mean
+the one-face attribution is wrong.""",
+    body=_FACE_ATTRIB_BODY,
+)
+
+
 def _wrap_comment(text: str, prefix: str = "# ") -> str:
     out = []
     for para in text.split("\n"):
@@ -928,13 +1218,6 @@ def _merge_cli(overrides: dict) -> list[tuple[str, str | None]]:
             continue
         merged.append((flag, val))
     return merged
-
-
-class _Delete:
-    pass
-
-
-_DELETE = _Delete()
 
 
 def render(a: dict) -> str:
@@ -995,9 +1278,12 @@ def render(a: dict) -> str:
     for k, v in SHARED_ENV:
         if k == "RAY_TMPDIR":
             continue
-        L.append(f"export {k}={over.get(k, v)}")
+        nv = over.get(k, v)
+        if nv is _DELETE:
+            continue
+        L.append(f"export {k}={nv}")
     for k, v in over.items():
-        if k not in {kk for kk, _ in SHARED_ENV}:
+        if k not in {kk for kk, _ in SHARED_ENV} and v is not _DELETE:
             L.append(f"export {k}={v}")
     L.append("")
 
@@ -1008,24 +1294,18 @@ def render(a: dict) -> str:
              % ("FOUR" if _has_wandb else "THREE"))
     L.append("# any setup noise reaches the log.  The R1-R4 battery shipped the")
     L.append("# first layer and it caught three missing flags.")
-    L.append("#   64 = a flag this launcher needs is not defined in ppo.py")
+    _flagsrc = a.get("required_flags_file", "src/alphagrad/approx/ppo.py")
+    _flags = a.get("required_flags", REQUIRED_FLAGS)
+    L.append(f"#   64 = a flag this launcher needs is not defined in {_flagsrc}")
     L.append("#   65 = argparse rejected the assembled command line")
     L.append("#   66 = a tool this launcher invokes does not exist")
     L.append("#   70 = graphax cannot lower what ALPHAGRAD_NEW_SLOT_JOIN asks for")
     if _has_wandb:
         L.append("#   71 = --wandb online, but this node cannot reach or"
                  " authenticate to wandb")
-    L.append("MISSING=\"\"")
-    L.append("Q='\"'")
-    L.append("for F in " + " ".join(REQUIRED_FLAGS) + "; do")
-    L.append('  grep -qF -- "$Q$F$Q" src/alphagrad/approx/ppo.py'
-             ' || MISSING="$MISSING $F"')
-    L.append("done")
-    L.append('if [ -n "$MISSING" ]; then')
-    L.append('  echo "ABORT(64): ppo.py does not define:$MISSING"')
-    L.append("  exit 64")
-    L.append("fi")
-    L.append("")
+    # Layer 0 BEFORE layer 1: if the file the flags are grepped from does not
+    # exist, every flag reads as "missing" and the abort names the wrong
+    # problem.  Existence first, then contents.
     if a.get("needs_tool"):
         t = a["needs_tool"]
         L.append(f'if [ ! -f "{t}" ]; then')
@@ -1034,6 +1314,18 @@ def render(a: dict) -> str:
         L.append("  exit 66")
         L.append("fi")
         L.append("")
+    L.append("MISSING=\"\"")
+    L.append("Q='\"'")
+    L.append(f"FLAGSRC={_flagsrc}")
+    L.append("for F in " + " ".join(_flags) + "; do")
+    L.append('  grep -qF -- "$Q$F$Q" "$FLAGSRC"'
+             ' || MISSING="$MISSING $F"')
+    L.append("done")
+    L.append('if [ -n "$MISSING" ]; then')
+    L.append('  echo "ABORT(64): $FLAGSRC does not define:$MISSING"')
+    L.append("  exit 64")
+    L.append("fi")
+    L.append("")
     if kind != "cpu":
         L.append("# ALPHAGRAD_NEW_SLOT_JOIN=1 emits the res-slot two-op face form.")
         L.append("# On a graphax that rejects it, EVERY plan putting a rule in the")
@@ -1141,10 +1433,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=HOME_DSNN)
     ap.add_argument("--check", action="store_true",
-                    help="render and syntax-check, write nothing")
+                    help="render, syntax-check and DIFF against what is on "
+                         "disk; write nothing; exit non-zero on any drift")
     ns = ap.parse_args()
 
     rc = 0
+    drifted = []
     for a in ARMS:
         text = render(a)
         path = os.path.join(ns.out, f"fq_{a['name']}.sbatch")
@@ -1159,12 +1453,41 @@ def main() -> int:
             rc = 1
             continue
         if ns.check:
-            print(f"ok (bash -n)  {path}")
+            # A --check that only ran `bash -n` reported "ok" for a launcher
+            # whose on-disk copy had drifted arbitrarily far from the
+            # generator -- it proved the FILE WAS SHELL, not that it was THIS
+            # file.  Diff, and make drift a non-zero exit.
+            old = None
+            if os.path.exists(path):
+                with open(path) as fh:
+                    old = fh.read()
+            if old is None:
+                print(f"MISSING       {path} (would be created)")
+                drifted.append(path)
+                rc = 1
+            elif old != text:
+                print(f"DRIFT         {path}")
+                sys.stdout.writelines(difflib.unified_diff(
+                    old.splitlines(keepends=True),
+                    text.splitlines(keepends=True),
+                    fromfile=f"{path} (on disk)",
+                    tofile=f"{path} (generated)"))
+                drifted.append(path)
+                rc = 1
+            else:
+                print(f"ok            {path}")
             os.unlink(tmp)
             continue
         shutil.move(tmp, path)
         os.chmod(path, 0o644)
         print(f"wrote {path}")
+    if ns.check and drifted:
+        print(f"\n{len(drifted)} launcher(s) differ from the generator:",
+              file=sys.stderr)
+        for d in drifted:
+            print(f"  {d}", file=sys.stderr)
+        print("Regenerate (drop --check) rather than editing them in place.",
+              file=sys.stderr)
     return rc
 
 
