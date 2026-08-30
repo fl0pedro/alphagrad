@@ -245,6 +245,17 @@ def make_argparser() -> argparse.ArgumentParser:
                         "instead of an anonymous index.")
     p.add_argument("--inventory-only", action="store_true",
                    help="Dump the face inventory and exit without measuring.")
+    p.add_argument("--skip-face", action="append", default=[], metavar="K:F",
+                   help="Build a plan that skips ONLY face F of elimination "
+                        "step K (repeatable; all listed faces go in ONE "
+                        "plan). This is how the minimal plan is built.")
+    p.add_argument("--singleton-skip-sweep", action="store_true",
+                   help="One plan per live face, each skipping exactly that "
+                        "face and nothing else. Gives the SHAPE of the search "
+                        "space: one needle, or many good faces?")
+    p.add_argument("--sweep-stride", type=int, default=1,
+                   help="Measure every Nth live face in the sweep (1 = all). "
+                        "Any subsampling is reported with the results.")
     p.add_argument("--report-only", action="store_true",
                    help="Measure nothing; read every rows_*.csv in --out-dir "
                         "and emit the COMBINED report across configs.")
@@ -498,6 +509,20 @@ def face_inventory(env, order):
                         "prim": eqn.primitive.name, "out": outs, "in": ins})
         ij.eliminate(v, (), None)
     return inv
+
+
+def build_skip_only_plan(env, order, targets):
+    """A plan whose ONLY approximation is SKIPping the listed (step, face)s."""
+    specs, face_specs, face_skips = empty_plan(len(order))
+    for (k, f) in targets:
+        face_skips[int(k), int(f)] = 1
+    return {
+        "specs": specs, "face_specs": face_specs, "face_skips": face_skips,
+        "n_faces_approx": len(targets), "n_slot_rows": 0,
+        "total_live_faces": -1, "per_vertex_faces": [],
+        "wires": [{"k": int(k), "f": int(f), "kind": "SKIP"}
+                  for k, f in targets],
+    }
 
 
 def build_ladder_plan(env, order, op: str, budget, args):
@@ -1222,7 +1247,8 @@ def main():
           f"{order[:6].tolist()}...{order[-3:].tolist()}", flush=True)
 
     INV = None
-    if args.face_inventory or args.inventory_only:
+    if args.face_inventory or args.inventory_only or args.singleton_skip_sweep \
+            or args.skip_face:
         INV = face_inventory(env, order)
         ipath = os.path.join(args.out_dir, f"face_inventory{tag}.json")
         with open(ipath, "w") as fh:
@@ -1267,6 +1293,35 @@ def main():
         pl["op"], pl["budget"] = "skip", "all"
         plans["skip@all"] = pl
         plan_orders["skip@all"] = order
+
+    # --- the MINIMAL plan: skip exactly the named face(s), nothing else -----
+    if args.skip_face:
+        tg = []
+        for spec in args.skip_face:
+            k, f = spec.split(":")
+            tg.append((int(k), int(f)))
+        pid = "skiponly:" + ",".join(f"{k}.{f}" for k, f in tg)
+        pl = build_skip_only_plan(env, order, tg)
+        pl["op"], pl["budget"] = "skiponly", str(len(tg))
+        plans[pid] = pl
+        plan_orders[pid] = order
+        print(f"[landscape] minimal plan {pid}: skips {tg}", flush=True)
+
+    # --- SINGLETON SWEEP: every live face, alone ---------------------------
+    if args.singleton_skip_sweep:
+        stride = max(1, int(args.sweep_stride))
+        picked = INV[::stride]
+        print(f"[landscape] singleton sweep: {len(picked)} of {len(INV)} live "
+              f"faces (stride {stride})", flush=True)
+        for e in picked:
+            k, f = int(e["k"]), int(e["f"])
+            pid = f"skiponly:{k}.{f}"
+            if pid in plans:
+                continue
+            pl = build_skip_only_plan(env, order, [(k, f)])
+            pl["op"], pl["budget"] = "singleton", f"v{e['vertex']}/{e['prim']}"
+            plans[pid] = pl
+            plan_orders[pid] = order
 
     # --- archived winners ---------------------------------------------------
     notes: list[str] = []
