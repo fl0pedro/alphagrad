@@ -530,15 +530,43 @@ def face_inventory(env, order):
     return inv
 
 
-def build_skip_only_plan(env, order, targets):
-    """A plan whose ONLY approximation is SKIPping the listed (step, face)s."""
+def build_skip_only_plan(env, order, targets, inventory=None):
+    """A plan whose ONLY approximation is SKIPping the listed (step, face)s.
+
+    `inventory` is the face_inventory() list. It is what makes a bad
+    --skip-face LOUD: face_skips is MAX_FACES wide, so setting a bit for a
+    face index that no live face occupies raises nothing, changes nothing,
+    and yields a plan that measures identical to identity -- reported as a
+    real 1.00 ratio for a face that was never skipped. Refuse instead.
+    """
+    live = None
+    if inventory is not None:
+        live = {(int(e["k"]), int(e["f"])) for e in inventory}
     specs, face_specs, face_skips = empty_plan(len(order))
     for (k, f) in targets:
-        face_skips[int(k), int(f)] = 1
+        k, f = int(k), int(f)
+        if not (0 <= k < len(order)):
+            raise SystemExit(
+                f"--skip-face {k}:{f}: step {k} outside 0..{len(order) - 1}")
+        if not (0 <= f < envmod.MAX_FACES):
+            raise SystemExit(
+                f"--skip-face {k}:{f}: face {f} outside "
+                f"0..{envmod.MAX_FACES - 1}")
+        if live is not None and (k, f) not in live:
+            at_k = sorted(ff for kk, ff in live if kk == k)
+            raise SystemExit(
+                f"--skip-face {k}:{f}: step {k} has no LIVE face {f}. "
+                f"Live faces at step {k}: {at_k or 'none'}. Skipping a "
+                f"non-live face is a silent no-op that would be reported as "
+                f"a measured ratio.")
+        face_skips[k, f] = 1
     return {
         "specs": specs, "face_specs": face_specs, "face_skips": face_skips,
         "n_faces_approx": len(targets), "n_slot_rows": 0,
-        "total_live_faces": -1, "per_vertex_faces": [],
+        # Known exactly when the inventory was enumerated; -1 means "not
+        # computed on this path", never "zero".
+        "total_live_faces": len(inventory) if inventory is not None else -1,
+        "per_vertex_faces": [],
         "wires": [{"k": int(k), "f": int(f), "kind": "SKIP"}
                   for k, f in targets],
     }
@@ -1334,7 +1362,7 @@ def main():
             k, f = spec.split(":")
             tg.append((int(k), int(f)))
         pid = "skiponly:" + ",".join(f"{k}.{f}" for k, f in tg)
-        pl = build_skip_only_plan(env, order, tg)
+        pl = build_skip_only_plan(env, order, tg, INV)
         pl["op"], pl["budget"] = "skiponly", str(len(tg))
         plans[pid] = pl
         plan_orders[pid] = order
@@ -1351,7 +1379,7 @@ def main():
             pid = f"skiponly:{k}.{f}"
             if pid in plans:
                 continue
-            pl = build_skip_only_plan(env, order, [(k, f)])
+            pl = build_skip_only_plan(env, order, [(k, f)], INV)
             pl["op"], pl["budget"] = "singleton", f"v{e['vertex']}/{e['prim']}"
             plans[pid] = pl
             plan_orders[pid] = order
@@ -1460,7 +1488,15 @@ def main():
 
         def _named(p):
             """Attach the NAMED face (vertex, key, primitive, shapes) to each
-            wire, so a ratio can be attributed to a face instead of an index."""
+            wire, so a ratio can be attributed to a face instead of an index.
+
+            A plan that never recorded wires (the ladder plans place their
+            rule by walking the graph and keep no per-wire list) gets None,
+            NOT []: "not recorded" and "this plan touches no face" are
+            different claims and [] asserts the second one.
+            """
+            if "wires" not in p:
+                return None
             out = []
             for w in p.get("wires", []) or []:
                 e = _bykf.get((w["k"], w["f"]))
