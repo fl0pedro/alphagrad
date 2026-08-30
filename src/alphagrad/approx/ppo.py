@@ -6859,7 +6859,7 @@ def main():
         # THE STATIC CONTROLS' pre-image: log2 numel of an endpoint vertex's
         # output var, keyed by the 1-based vertex id `face_endpoints` stores
         # (0 = a jaxpr input, which has no equation and so scores 0). This is
-        # the same quantity decode2_face_data.py's `ln_of_vidx` holds, keyed by
+        # the same quantity campaign_scratch/decode2_face_data.py's `ln_of_vidx` holds, keyed by
         # vertex instead of by var index.
         _PROBE_LNV = np.zeros((_oracle_total_v + 2,), np.float32)
         for _pi, _peq in enumerate(_oracle_jaxpr.eqns, start=1):

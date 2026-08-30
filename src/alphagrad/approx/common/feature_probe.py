@@ -69,8 +69,8 @@ FACE_NAMES = FACE_TARGETS + FACE_CONTROLS
 NFT = len(FACE_NAMES)
 
 # Within-step test R2 of the offline `today_sizes` arm at step 3000
-# (decode2_out/face_today_sizes.log; same numbers in decode5_summary.py:18-25
-# and decode6_summary.py:32-33). NOTE these were measured on the ENDPOINTS
+# (decode2_out/face_today_sizes.log; same numbers in campaign_scratch/decode5_summary.py:18-25
+# and campaign_scratch/decode6_summary.py:32-33). NOTE these were measured on the ENDPOINTS
 # arm plus extents, NOT on the lean input -- they are a reference line, not a
 # target the lean arm is expected to reach.
 BARS = {

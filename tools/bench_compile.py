@@ -26,7 +26,7 @@ DESIGN, deliberately minimal:
     what training actually pays, not of a default-flags strawman.
   * plans = random elimination orders; half also carry random QUANT-bf16
     approximations on ~8 vertices via jacve's per-vertex `transforms`
-    (the same construction apxaudit_matrix2.py uses). QUANT is used because
+    (the same construction campaign_scratch/apxaudit_matrix2.py uses). QUANT is used because
     it is legal on effectively every vertex, so "random approximation"
     needs no oracle.
   * no persistent cache: JAX_COMPILATION_CACHE_DIR is left unset by the

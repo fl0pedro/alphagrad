@@ -293,7 +293,7 @@ def consume_tokenization_truncation_stats() -> dict:
 # can.
 #
 # 32768 came from a single 25,737-token worst case reported by
-# ``decode3_data.py``. A later per-step measurement of the actual delta
+# ``campaign_scratch/decode3_data.py``. A later per-step measurement of the actual delta
 # distribution on BOTH the 2- and 3-block TransformerLM (380 / 540 steps)
 # does not reproduce it: median 0, mean 75-114, p95 537-642, p99 1001-1411,
 # MAX 1173-2833 -- i.e. the observed worst case is 0.23-0.35% of a 32768

@@ -84,11 +84,11 @@ playground
 # code" in .rayignore, which had to exclude it because the tree had grown to
 # 1.5 GiB and every --ray-measure job was dying at RuntimeEnvSetupError.
 #
-# Deliberately NOT ignored here: the campaign .py/.sh/.sbatch scripts at the
-# repo root.  Those are the only surviving record of how the jobs behind the
+# Deliberately NOT ignored here: the campaign .py/.sh/.sbatch scripts, which
+# ticket 27 moved from the repo root into campaign_scratch/ and committed there
+# verbatim.  Those are the only surviving record of how the jobs behind the
 # committed results were actually invoked, and this repo has already lost one
-# command line that way (job 61494, see tools/gen_fq_launchers.py).  Their
-# disposition is an owner decision, not a pattern.
+# command line that way (job 61494, see tools/gen_fq_launchers.py).
 # ---------------------------------------------------------------------------
 
 # JAX persistent compile caches (~600 MiB; .jaxcache_perf2 alone is 10391 files)
