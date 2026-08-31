@@ -22,6 +22,19 @@ trainer end-to-end on `VmappedNeuralNetwork`:
 
 from __future__ import annotations
 
+import os
+
+# DECLARE, do not borrow. `test_env_step_roundtrip_on_helmholtz` builds its
+# order from the non-inlined jaxpr, so jacve -- which inlines jit/pjit bodies
+# and thereby adds equations -- is left with 5 un-eliminated intermediate
+# vertices and refuses to return a silently partial Jacobian. This module
+# accepts that, exactly as the 18 other modules that set the same knob do.
+#
+# Until 2026-08-31 it did NOT set it and passed anyway, because whichever
+# neighbouring module pytest imported first had already put it in the shared
+# process environment. Running this file alone failed. See finding 47.
+os.environ.setdefault("GRAPHAX_ALLOW_PARTIAL_ORDER", "1")
+
 
 from collections import namedtuple
 from unittest import mock
