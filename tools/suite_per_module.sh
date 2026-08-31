@@ -49,6 +49,7 @@ mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 PY=${PY:-uv run --no-sync python}
 JOBS=${JOBS:-8}
 OUT=${OUT:-$(mktemp -d)}
+mkdir -p "$OUT"   # mktemp -d creates it; a caller-supplied OUT does not
 
 if [ "$#" -gt 0 ]; then
   MODULES=("$@")
