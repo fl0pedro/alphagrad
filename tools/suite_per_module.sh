@@ -71,7 +71,7 @@ run_one() {
   $PY -m pytest "$m" -q --tb=short -p no:cacheprovider > "$log" 2>&1
   local rc=$?
   local last
-  last=$(grep -E "passed|failed|error|no tests ran" "$log" | tail -1)
+  last=$(grep -E "passed|failed|error|skipped|no tests ran" "$log" | tail -1)
   printf "%s\t%d\t%s\n" "$m" "$rc" "${last:-<no summary>}"
 }
 export -f run_one
@@ -81,16 +81,23 @@ printf '%s\n' "${MODULES[@]}" \
   | xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {} "$OUT" \
   > "$OUT/results.tsv"
 
+# pytest exit codes: 0 = all passed, 1 = tests failed, 5 = NO TESTS COLLECTED.
+# 5 is not a failure here -- it is what a module-level quarantine skip and a
+# script-style module with no test functions both produce, and this suite has
+# 62 of those. Counting them red hides the modules that are actually broken.
 echo
-printf "%-62s %s\n" "MODULE" "RESULT"
+echo "-- modules with FAILING tests --"
 sort "$OUT/results.tsv" | while IFS=$'\t' read -r m rc last; do
-  [ "$rc" = "0" ] || printf "%-62s %s\n" "$m" "$last"
+  case "$rc" in 0|5) ;; *) printf "  %-58s %s\n" "$m" "$last" ;; esac
 done
 
-nfail=$(awk -F'\t' '$2 != 0' "$OUT/results.tsv" | wc -l | tr -d ' ')
+nfail=$(awk -F'\t' '$2 != 0 && $2 != 5' "$OUT/results.tsv" | wc -l | tr -d ' ')
 npass=$(awk -F'\t' '$2 == 0' "$OUT/results.tsv" | wc -l | tr -d ' ')
+nempty=$(awk -F'\t' '$2 == 5' "$OUT/results.tsv" | wc -l | tr -d ' ')
+ntests=$(awk -F'\t' '$2 != 0 && $2 != 5 {match($3, /[0-9]+ failed/); if (RSTART) print substr($3, RSTART, RLENGTH)}' \
+         "$OUT/results.tsv" | awk '{s += $1} END {print s + 0}')
 echo
-echo "== $npass modules clean, $nfail modules with failures =="
+echo "== $npass modules clean | $nfail modules failing ($ntests tests) | $nempty ran no tests =="
 echo "== logs: $OUT =="
 [ "$nfail" -gt 250 ] && nfail=250
 exit "$nfail"
