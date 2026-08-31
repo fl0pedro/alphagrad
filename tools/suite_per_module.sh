@@ -71,7 +71,11 @@ run_one() {
   $PY -m pytest "$m" -q --tb=short -p no:cacheprovider > "$log" 2>&1
   local rc=$?
   local last
-  last=$(grep -E "passed|failed|error|skipped|no tests ran" "$log" | tail -1)
+  # Anchor on pytest's own summary line ("1 failed, 1 passed, ... in 42.03s"),
+  # NOT a bare word match: the nanobind leak report this venv prints at exit
+  # contains " - ... skipped remainder", which swallowed a real summary and
+  # undercounted the failing-test total.
+  last=$(grep -E "^([0-9]+ (passed|failed|skipped|xfailed|xpassed|error|warning)|no tests ran)" "$log" | tail -1)
   printf "%s\t%d\t%s\n" "$m" "$rc" "${last:-<no summary>}"
 }
 export -f run_one
