@@ -16,7 +16,6 @@ _pytest_quarantine.skip(
 
 #!/usr/bin/env python3
 """Tests for the SIMPLIFIED head: 16 outputs, fixed factor/reduce/dtype rules."""
-from __future__ import annotations
 import sys
 
 import equinox as eqx
