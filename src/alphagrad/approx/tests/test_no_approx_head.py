@@ -25,30 +25,35 @@ def report(tag, ag):
           f"params={n:,} approx_params={napx:,} approx_leaves={len(approx)}")
     return n, napx, len(approx)
 
-print("=== agent construction ===")
-n_full, a_full, l_full = report("unified-head+faces",
-                                build(["--unified-head", "--face-actions"]))
-n_mask, a_mask, l_mask = report("ve_only (MASKED)",
-                                build(["--unified-head", "--face-actions",
-                                       "--variant", "ve_only"]))
-n_gone, a_gone, l_gone = report("--no-approx-head", build(["--no-approx-head"]))
+def main() -> int:
+    print("=== agent construction ===")
+    n_full, a_full, l_full = report("unified-head+faces",
+                                    build(["--unified-head", "--face-actions"]))
+    n_mask, a_mask, l_mask = report("ve_only (MASKED)",
+                                    build(["--unified-head", "--face-actions",
+                                           "--variant", "ve_only"]))
+    n_gone, a_gone, l_gone = report("--no-approx-head", build(["--no-approx-head"]))
 
-print("\n=== assertions ===")
-ok = True
-def ck(name, cond, d=""):
-    global ok
-    print(f"  {'PASS' if cond else 'FAIL'}  {name}  {d}")
-    ok &= bool(cond)
+    print("\n=== assertions ===")
+    ok = True
+    def ck(name, cond, d=""):
+        nonlocal ok
+        print(f"  {'PASS' if cond else 'FAIL'}  {name}  {d}")
+        ok &= bool(cond)
 
-ck("masked variant still HOLDS approx params", a_mask > 0,
-   f"{a_mask:,} params, {l_mask} leaves — masking does not remove")
-ck("--no-approx-head holds ZERO approx params", a_gone == 0, f"{a_gone}")
-ck("--no-approx-head has no approx leaves", l_gone == 0, f"{l_gone}")
-ck("micro_action_policy is None", build(["--no-approx-head"]).micro_action_policy is None)
-ck("face_path_policy is None",
-   build(["--no-approx-head", "--face-actions"]).face_path_policy is None,
-   "even with --face-actions passed")
-ck("total params strictly smaller", n_gone < n_mask,
-   f"{n_gone:,} < {n_mask:,}  (saved {n_mask - n_gone:,})")
-print("\n" + ("ALL PASS" if ok else "FAILURES"))
-raise SystemExit(0 if ok else 1)
+    ck("masked variant still HOLDS approx params", a_mask > 0,
+       f"{a_mask:,} params, {l_mask} leaves — masking does not remove")
+    ck("--no-approx-head holds ZERO approx params", a_gone == 0, f"{a_gone}")
+    ck("--no-approx-head has no approx leaves", l_gone == 0, f"{l_gone}")
+    ck("micro_action_policy is None", build(["--no-approx-head"]).micro_action_policy is None)
+    ck("face_path_policy is None",
+       build(["--no-approx-head", "--face-actions"]).face_path_policy is None,
+       "even with --face-actions passed")
+    ck("total params strictly smaller", n_gone < n_mask,
+       f"{n_gone:,} < {n_mask:,}  (saved {n_mask - n_gone:,})")
+    print("\n" + ("ALL PASS" if ok else "FAILURES"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

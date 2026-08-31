@@ -1,3 +1,19 @@
+from __future__ import annotations
+
+import pytest as _pytest_quarantine
+
+_pytest_quarantine.skip(
+    "QUARANTINED 2026-08-31: imports block_count from "
+    "alphagrad.approx.unified_head, removed by 7c8058f4 ('approx: unified "
+    "head 64->32 outputs') when the block count stopped being a head output "
+    "and became factor = gcd(N_i, N_j). This module is script-style (a main() "
+    "returning a FAIL count, no pytest test functions), so it contributes no "
+    "tests either way. It rotted unnoticed because nothing collected "
+    "src/alphagrad/approx/tests/ until testpaths named it. Kept for "
+    "provenance; delete once the subsystem is confirmed gone for good.",
+    allow_module_level=True,
+)
+
 #!/usr/bin/env python3
 """Tests for the SIMPLIFIED head: 16 outputs, fixed factor/reduce/dtype rules."""
 from __future__ import annotations

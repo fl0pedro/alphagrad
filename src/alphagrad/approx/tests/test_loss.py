@@ -1,3 +1,19 @@
+from __future__ import annotations
+
+import pytest as _pytest_quarantine
+
+_pytest_quarantine.skip(
+    "QUARANTINED 2026-08-31: 3 of the symbols this module imports from "
+    "alphagrad.approx.ppo were deleted by 1e891bb0 (2026-07-26, 'ppo: delete "
+    "~1.8k lines of dead code') -- _select_variant, _variant_label, "
+    "old_log_prob_for_action. The (vertex-policy, rule-policy) variant matrix "
+    "it sweeps no longer exists; its alphagrad.approx.common imports are "
+    "fine. It rotted unnoticed because nothing collected "
+    "src/alphagrad/approx/tests/ until testpaths named it. Kept for "
+    "provenance; delete once the subsystem is confirmed gone for good.",
+    allow_module_level=True,
+)
+
 """End-to-end loss + gradient test on a synthetic batch.
 
 Exercises the refactored loss path (vmapped `evaluate_action`, joint log-prob
@@ -5,7 +21,6 @@ ratio, KL across heads, value loss) without going through the env. Done for
 all four (vertex-policy, rule-policy) combinations.
 """
 
-from __future__ import annotations
 
 
 import equinox as eqx

@@ -1,6 +1,22 @@
+from __future__ import annotations
+
+import pytest as _pytest_quarantine
+
+_pytest_quarantine.skip(
+    "QUARANTINED 2026-08-31: 8 of the symbols this module imports from "
+    "alphagrad.approx.ppo were deleted by 1e891bb0 (2026-07-26, 'ppo: delete "
+    "~1.8k lines of dead code') -- AutoregRulePolicy, MLPVertexPolicy, "
+    "SingleRulePolicy, _select_variant, _variant_label, build_rule_specs, "
+    "build_legacy_rule_specs, old_log_prob_for_action. The four-variant agent "
+    "matrix this module exercises no longer exists. It rotted unnoticed "
+    "because nothing collected src/alphagrad/approx/tests/ until testpaths "
+    "named it. Kept for provenance; delete once the subsystem is confirmed "
+    "gone for good.",
+    allow_module_level=True,
+)
+
 """Agent-level smoke tests that exercise every variant without the broken graphax env."""
 
-from __future__ import annotations
 
 
 import jax

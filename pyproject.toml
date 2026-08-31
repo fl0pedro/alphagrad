@@ -38,3 +38,27 @@ version_scheme = "no-guess-dev"
 
 [tool.uv.extra-build-dependencies]
 flash-attn = ["psutil"]
+
+[tool.pytest.ini_options]
+# There are TWO test roots. `src/alphagrad/approx/tests/` is easy to miss: it
+# sits inside the package, so a bare `pytest` from the repo root never reached
+# it, and three modules there rotted unnoticed (test_agent, test_loss and
+# test_simple_head, all quarantined 2026-08-31) while a fourth,
+# test_no_approx_head, raised SystemExit at import.
+# Naming both roots is what makes the suite a gate rather than a sample.
+testpaths = ["tests", "src/alphagrad/approx/tests"]
+# Naming both roots also DELIBERATELY drops three stray files a bare
+# `pytest` used to try to import from src/: ppo/reshape_test.py and
+# ppo/implicit_reshape_test.py (module-level asserts, no test functions,
+# no __main__ guard -- they ran their whole body at collection) and
+# approx/test_transformer_approx.py (a __main__ script). None is a
+# regression test; run them directly if wanted.
+# Both naming styles are in use (test_*.py under tests/, *_test.py elsewhere).
+python_files = ["test_*.py", "*_test.py"]
+# -ra prints the reason for every skip. The quarantine convention (62062c58)
+# records why a module cannot run in the skip message itself, so without -ra
+# that record never reaches the person running the suite.
+addopts = "-ra"
+# Default `prepend` import mode is REQUIRED, not incidental:
+# tests/core/... helpers are imported bare (`from utils import ...`), which
+# only resolves because pytest puts each test file's directory on sys.path.
