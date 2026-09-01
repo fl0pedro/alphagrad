@@ -16,8 +16,8 @@
   "window": 4096
  },
  "fingerprint": {
-  "jax": "0.10.1.dev20260424+504d3d965b",
-  "jaxlib": "0.10.1.dev0+selfbuilt",
+  "jax": "0.10.2.dev0+selfbuilt",
+  "jaxlib": "0.10.2.dev0+selfbuilt",
   "platform": "cpu",
   "python": "3.13"
  },
@@ -55,7 +55,7 @@
       2
      ]
     ],
-    "entropy": "3f20b2a2",
+    "entropy": "3f20b2a0",
     "logp": "bf916478",
     "n_live": 1,
     "pair_valid": [
@@ -200,9 +200,9 @@
    "step": 0,
    "target_vertex": 1,
    "value": [
-    "bd8f01f5",
-    "be2a1504",
-    "3dd95438"
+    "bd8f01f0",
+    "be2a1502",
+    "3dd9543a"
    ],
    "vertex": 0,
    "vertex_mask_fill": [
@@ -212,7 +212,7 @@
    "vertex_probs_live": [
     [
      0,
-     "3e29ace5"
+     "3e29ace4"
     ],
     [
      1,
@@ -220,7 +220,7 @@
     ],
     [
      2,
-     "3e1d71b0"
+     "3e1d71af"
     ],
     [
      3,
@@ -228,7 +228,7 @@
     ],
     [
      4,
-     "3e1c7d81"
+     "3e1c7d80"
     ],
     [
      5,
@@ -415,9 +415,9 @@
    "step": 1,
    "target_vertex": 6,
    "value": [
-    "bd84c724",
-    "bdf85f18",
-    "3decc341"
+    "bd84c727",
+    "bdf85f14",
+    "3decc33b"
    ],
    "vertex": 5,
    "vertex_mask_fill": [
@@ -427,23 +427,23 @@
    "vertex_probs_live": [
     [
      1,
-     "3e4da948"
+     "3e4da947"
     ],
     [
      2,
-     "3e4a417c"
+     "3e4a4179"
     ],
     [
      3,
-     "3e4c9a1e"
+     "3e4c9a1f"
     ],
     [
      4,
-     "3e45f7b9"
+     "3e45f7b7"
     ],
     [
      5,
-     "3e558366"
+     "3e558367"
     ]
    ]
   },
@@ -748,9 +748,9 @@
    "step": 2,
    "target_vertex": 3,
    "value": [
-    "bd89c0b4",
-    "be7daf47",
-    "3e1f764f"
+    "bd89c0bc",
+    "be7daf4d",
+    "3e1f7652"
    ],
    "vertex": 2,
    "vertex_mask_fill": [
@@ -760,15 +760,15 @@
    "vertex_probs_live": [
     [
      1,
-     "3e6f59d5"
+     "3e6f59d6"
     ],
     [
      2,
-     "3e95eb60"
+     "3e95eb61"
     ],
     [
      3,
-     "3e698659"
+     "3e69865a"
     ],
     [
      4,
@@ -1077,9 +1077,9 @@
    "step": 3,
    "target_vertex": 5,
    "value": [
-    "bd68904c",
-    "be917f06",
-    "3e53f743"
+    "bd68904f",
+    "be917f08",
+    "3e53f73b"
    ],
    "vertex": 4,
    "vertex_mask_fill": [
@@ -1089,7 +1089,7 @@
    "vertex_probs_live": [
     [
      1,
-     "3eac865f"
+     "3eac8660"
     ],
     [
      3,
@@ -1097,7 +1097,7 @@
     ],
     [
      4,
-     "3ea72a40"
+     "3ea72a3f"
     ]
    ]
   },
@@ -1402,9 +1402,9 @@
    "step": 4,
    "target_vertex": 4,
    "value": [
-    "bd379c55",
-    "be8c39ae",
-    "3e247a13"
+    "bd379c5e",
+    "be8c39b1",
+    "3e247a16"
    ],
    "vertex": 3,
    "vertex_mask_fill": [
@@ -1414,7 +1414,7 @@
    "vertex_probs_live": [
     [
      1,
-     "3efc46f9"
+     "3efc46fa"
     ],
     [
      3,
