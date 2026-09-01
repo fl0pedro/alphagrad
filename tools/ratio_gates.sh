@@ -34,7 +34,6 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
-export GRAPHAX_ALLOW_PARTIAL_ORDER="${GRAPHAX_ALLOW_PARTIAL_ORDER:-1}"
 export ALPHAGRAD_SKIP_COUNT_OPS="${ALPHAGRAD_SKIP_COUNT_OPS:-1}"
 PY=${PY:-python}
 

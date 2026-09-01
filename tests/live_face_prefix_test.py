@@ -38,7 +38,6 @@ and calling it a pass.
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
-os.environ.setdefault("GRAPHAX_ALLOW_PARTIAL_ORDER", "1")
 
 from types import SimpleNamespace
 

@@ -151,7 +151,6 @@ SHARED_ENV = [
     ("XLA_FLAGS",
      '"--xla_gpu_enable_triton_gemm=false --xla_gpu_autotune_level=0"'),
     # --- graphax: PLANNER path for exact lowering + L5 demand-emit (v42-proven)
-    ("GRAPHAX_ALLOW_PARTIAL_ORDER", "1"),
     ("GRAPHAX_PLANNER_EXACT", "1"),
     ("GRAPHAX_DEMAND_EMIT", "1"),
     # PULLUP, not pulldown.  Every TLM arm before R1 ran PULLDOWN=1, so
@@ -357,7 +356,6 @@ reverted, so it is demonstrated to fail on the bug it targets.""",
     falsifier="Any gate red, or any gate SKIPPED, blocks every later wave.",
     body=r"""
 export JAX_PLATFORMS=cpu
-export GRAPHAX_ALLOW_PARTIAL_ORDER=1
 export ALPHAGRAD_SKIP_COUNT_OPS=1
 export JAX_COMPILATION_CACHE_DIR=$HOME/dsnn/.jax_compile_cache
 
@@ -568,7 +566,6 @@ If the beam needs > 10000 evaluations, search is NOT cheap on this target and
 the RL framing survives on cost grounds rather than on quality grounds.""",
     body=r"""
 export JAX_PLATFORMS=cpu
-export GRAPHAX_ALLOW_PARTIAL_ORDER=1
 export ALPHAGRAD_SKIP_COUNT_OPS=1
 export ALPHAGRAD_NEW_SLOT_JOIN=1
 export ALPHAGRAD_FORCE_REV_ORDER=1

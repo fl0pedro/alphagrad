@@ -43,7 +43,6 @@ from types import SimpleNamespace
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
-os.environ.setdefault("GRAPHAX_ALLOW_PARTIAL_ORDER", "1")
 for _k in ("ALPHAGRAD_SPARSITY", "ALPHAGRAD_SPARSITY_WEIGHT",
            "ALPHAGRAD_FIDELITY", "ALPHAGRAD_FIDELITY_WEIGHT",
            "ALPHAGRAD_REJECT_FROZEN_GRADS", "ALPHAGRAD_GRAD_COVERAGE_WEIGHT"):

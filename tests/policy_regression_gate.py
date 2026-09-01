@@ -88,7 +88,6 @@ import os
 # ALPHAGRAD_POLICY. Pinned (not `setdefault`-from-ambient) so the golden cannot
 # silently depend on whatever the caller's shell happened to export.
 os.environ["JAX_PLATFORMS"] = os.environ.get("JAX_PLATFORMS", "cpu")
-os.environ["GRAPHAX_ALLOW_PARTIAL_ORDER"] = "1"
 os.environ["ALPHAGRAD_POLICY"] = "palimpsa"
 os.environ["ALPHAGRAD_SKIP_COST_ANALYSIS"] = "1"
 os.environ["ALPHAGRAD_SKIP_COUNT_OPS"] = "1"

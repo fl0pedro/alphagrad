@@ -6,7 +6,6 @@ away from exact while the same episode without face actions stays cos == 1.
 """
 import os
 
-os.environ.setdefault("GRAPHAX_ALLOW_PARTIAL_ORDER", "1")
 
 import jax
 import jax.numpy as jnp

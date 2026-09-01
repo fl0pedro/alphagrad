@@ -35,7 +35,6 @@ Two things must hold, and neither is visible in any metric we log:
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
-os.environ.setdefault("GRAPHAX_ALLOW_PARTIAL_ORDER", "1")
 
 import jax                                                        # noqa: E402
 import jax.numpy as jnp                                           # noqa: E402

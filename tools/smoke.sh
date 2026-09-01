@@ -40,7 +40,6 @@ export ALPHAGRAD_UNIFIED_FACE_ENUM=1
 export ALPHAGRAD_SKIP_COUNT_OPS=1
 export ALPHAGRAD_SKIP_COST_ANALYSIS=1
 export ALPHAGRAD_MAX_EQNS=512
-export GRAPHAX_ALLOW_PARTIAL_ORDER=1
 export JAX_COMPILATION_CACHE_DIR=${JAX_COMPILATION_CACHE_DIR:-$ROOT/../.jc_smoke}
 # Every training episode must print its health row, or a 2-episode smoke can
 # silently check nothing.

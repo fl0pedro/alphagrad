@@ -9,7 +9,6 @@ unconditionally — this is the fidelity gate for the pass-through.
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
-os.environ.setdefault("GRAPHAX_ALLOW_PARTIAL_ORDER", "1")
 os.environ.setdefault("ALPHAGRAD_INCREMENTAL_TOKENS", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
 

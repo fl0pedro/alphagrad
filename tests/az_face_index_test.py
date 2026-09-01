@@ -13,7 +13,6 @@ import os
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("ALPHAGRAD_POLICY", "palimpsa")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
-os.environ.setdefault("GRAPHAX_ALLOW_PARTIAL_ORDER", "1")
 # NO ALPHAGRAD_NN_HIDDEN / ALPHAGRAD_NN_BATCH here. They size the TARGET
 # function, `setdefault` makes the first importer in the pytest session win,
 # and live_vertex_mask_test pins the nn256 shapes at the default hidden 63 --

@@ -51,7 +51,6 @@ def test_apply_quant_negate_and_scale():
 
 
 def test_wire_roundtrip():
-    os.environ["GRAPHAX_ALLOW_PARTIAL_ORDER"] = "1"
     from alphagrad.approx.env import (
         micro_actions_to_rule_specs_jax, QUANT_SENTINEL)
     from alphagrad.approx.heads import OP_QUANT, OP_END

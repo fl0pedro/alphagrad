@@ -135,8 +135,12 @@ which is the count that can actually be eliminated.
 | `ALPHAGRAD_POLICY` | `palimpsa` | encoder backbone: `palimpsa` / `palimpsa_bi` / `transformer`. Use plain `palimpsa`. |
 | `ALPHAGRAD_LIVE_MASKS` | `1` | live per-vertex mask oracle; `0` restores the old (broken) nominal-shape screen for A/B. |
 | `GRAPHAX_PRUNE` | `1` | `0` keeps the full graph so the policy can learn what to drop/approximate, instead of the eliminator silently removing non-argnum inputs and dead intermediates first. |
-| `GRAPHAX_ALLOW_PARTIAL_ORDER` | `0` | accept an order that has not eliminated everything. Needed because the env measures partial/initial orders. |
 | `GRAPHAX_KEEP_BLOCKDIAG` | `1` | allows re-diagonalising an already-coupled pair (subdivision). |
+
+There is no partial-order flag: Jacobian evaluation happens only at the
+terminal step, on a complete elimination order. Token emission traces
+abstractly, without materialising intermediate Jacobians, so mid-episode
+states never need a partial Jacobian.
 
 ## 5. Trim
 
@@ -207,7 +211,6 @@ That sets:
 export ALPHAGRAD_MEASURE_VIA_AOJ=0   # measure with jacve (AOJ value+jac still in dev)
 export ALPHAGRAD_POLICY=palimpsa     # NOT palimpsa_bi, NOT transformer
 export ALPHAGRAD_PER_FACE_MVP=1      # per-face masked approximation  <-- the MVP
-export GRAPHAX_ALLOW_PARTIAL_ORDER=1 # the env measures partial/initial orders
 export GRAPHAX_PRUNE=0               # let the policy see the whole graph
 ```
 
@@ -346,7 +349,6 @@ All three are wired. Flags, in the order the data flows:
 export ALPHAGRAD_INCREMENTAL_TOKENS=1  # C: append-only AOJ tokens -> palimpsa (default 0)
 export ALPHAGRAD_POLICY=palimpsa       # encoder (never palimpsa_bi, never transformer)
 export ALPHAGRAD_FACE_TRANSFORMS=1     # B: measure via per-face slots (default 1)
-export GRAPHAX_ALLOW_PARTIAL_ORDER=1
 export GRAPHAX_PRUNE=0
 ```
 

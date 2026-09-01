@@ -85,7 +85,6 @@ os.environ.setdefault("ALPHAGRAD_SPARSITY", "1")
 os.environ.setdefault("ALPHAGRAD_GRAD_COVERAGE", "1")
 os.environ.setdefault("ALPHAGRAD_REJECT_FROZEN_GRADS", "0")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
-os.environ.setdefault("GRAPHAX_ALLOW_PARTIAL_ORDER", "1")
 
 import numpy as np                                            # noqa: E402
 import jax.numpy as jnp                                       # noqa: E402

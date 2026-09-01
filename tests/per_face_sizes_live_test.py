@@ -26,7 +26,6 @@ WHAT IS UNDER TEST.
 """
 import os
 
-os.environ.setdefault("GRAPHAX_ALLOW_PARTIAL_ORDER", "1")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax

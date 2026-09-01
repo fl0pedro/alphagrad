@@ -21,7 +21,6 @@ import contextlib
 import math
 import os
 
-os.environ.setdefault("GRAPHAX_ALLOW_PARTIAL_ORDER", "1")
 
 import jax
 import jax.numpy as jnp

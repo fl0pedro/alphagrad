@@ -117,7 +117,7 @@ in-band guard must not also fire.
 
 USAGE (one CPU node, one job)::
 
-    JAX_PLATFORMS=cpu GRAPHAX_ALLOW_PARTIAL_ORDER=1 \\
+    JAX_PLATFORMS=cpu \\
     ALPHAGRAD_SKIP_COUNT_OPS=1 \\
     uv run --no-sync python src/alphagrad/approx/tools/coverage_beam.py \\
       --example TransformerLM --dataset wikitext2 --seed 250197 \\
@@ -151,7 +151,6 @@ ENV_DEFAULTS = {
     "ALPHAGRAD_TLM_VOCAB": "1024",
     "ALPHAGRAD_MAX_FACES": "2538",
     "ALPHAGRAD_MAX_DELTA_TOKENS": "32768",
-    "GRAPHAX_ALLOW_PARTIAL_ORDER": "1",
     "GRAPHAX_PLANNER_EXACT": "1",
     "GRAPHAX_DEMAND_EMIT": "1",
     "ALPHAGRAD_INCREMENTAL_TOKENS": "1",

@@ -6534,7 +6534,7 @@ class VertexEliminationEnv:
         argnums=None,
         args=None,
         has_aux=False,
-        sparse=False,
+        sparse=True,
         num_envs=None,
         data_gen: Callable | None = None,
         target_fun: Callable | None = None,

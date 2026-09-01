@@ -33,7 +33,6 @@ import os
 # Until 2026-08-31 it did NOT set it and passed anyway, because whichever
 # neighbouring module pytest imported first had already put it in the shared
 # process environment. Running this file alone failed. See finding 47.
-os.environ.setdefault("GRAPHAX_ALLOW_PARTIAL_ORDER", "1")
 
 
 from collections import namedtuple

@@ -27,7 +27,6 @@ import json
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
-os.environ.setdefault("GRAPHAX_ALLOW_PARTIAL_ORDER", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
 os.environ.pop("ALPHAGRAD_PLAN_LOG", None)
