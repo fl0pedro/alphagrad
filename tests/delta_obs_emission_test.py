@@ -35,6 +35,21 @@ Two things must hold, and neither is visible in any metric we log:
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
+# PINNED, not inherited (the suite runs one process per module, so these are
+# ours to set). aa0774c8 changed BOTH delta-budget defaults in one commit:
+# ALPHAGRAD_MAX_DELTA_TOKENS 1024 -> 32768 (sized from the measured TLM
+# distribution) and overflow clip -> raise. Under those defaults nothing in
+# this module's graph overflows (the diag block is 2190 tokens), so the
+# clip-branch assertions below would be vacuous -- their own guard says so.
+# Pinning the OLD pair keeps the clip path genuinely exercised; the new
+# RAISE default is covered by the pure-defaults subprocess cases at the
+# bottom of this file. Must be set before the env import: env.py freezes
+# MAX_DELTA_TOKENS / _DELTA_OVERFLOW into module constants at first import.
+os.environ["ALPHAGRAD_MAX_DELTA_TOKENS"] = "1024"
+os.environ["ALPHAGRAD_DELTA_OVERFLOW"] = "clip"
+
+import subprocess                                                 # noqa: E402
+import sys                                                        # noqa: E402
 
 import jax                                                        # noqa: E402
 import jax.numpy as jnp                                           # noqa: E402
@@ -131,8 +146,10 @@ def test_base_plus_deltas_reconstructs_the_stream(diag):
     Up to the documented CLIP: a block longer than MAX_DELTA_TOKENS loses its
     tail, and -- unlike the old absolute cursor, which deferred that tail to
     the next step and attributed it to the wrong vertex -- the tail is simply
-    dropped. ``diag=True`` on this graph produces a 1346-token block against
-    the default 1024 budget, so the clipping branch is genuinely exercised.
+    dropped. Clipping is the pinned ALPHAGRAD_DELTA_OVERFLOW=clip opt-out
+    (module top); the default since aa0774c8 is to RAISE. ``diag=True`` on
+    this graph produces a 2190-token block against the pinned 1024 budget,
+    so the clipping branch is genuinely exercised.
     """
     specs = _specs(diag)
     specs_np = np.asarray(specs)
@@ -233,3 +250,61 @@ def test_reset_carries_an_empty_delta_and_no_callback():
     assert st.delta_eqns.shape == (MAX_DELTA_TOKENS,)
     assert np.all(np.asarray(st.delta_tokens) == 0)
     assert np.all(np.asarray(st.delta_eqns) == -1)
+
+
+# --------------------------------------------------------------------------
+# The RAISE default (aa0774c8). env.py freezes MAX_DELTA_TOKENS and
+# _DELTA_OVERFLOW at first import and this module pins 1024+clip above, so
+# the default behaviour can only be observed in a fresh interpreter with the
+# knobs unset. Each case below runs one, with every ALPHAGRAD_* variable
+# scrubbed -- pure library defaults, exactly what a bare `import` gets.
+
+
+def _run_pure_defaults(script: str) -> None:
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("ALPHAGRAD_")}
+    r = subprocess.run([sys.executable, "-c", script],
+                       env=env, capture_output=True, text=True, timeout=600)
+    assert r.returncode == 0, (
+        f"pure-defaults probe failed (rc={r.returncode})\n"
+        f"--- stdout ---\n{r.stdout}\n--- stderr ---\n{r.stderr}")
+    assert "PROBE-OK" in r.stdout, r.stdout
+
+
+def test_delta_overflow_raises_under_pure_defaults():
+    """A delta that does not fit MAX_DELTA_TOKENS RAISES by default -- a
+    clipped delta desyncs the recurrence for the rest of the episode, and
+    #81 was exactly that loss happening behind process-blind counters."""
+    _run_pure_defaults("""
+import alphagrad.approx.env as E
+assert E.MAX_DELTA_TOKENS == 32768, E.MAX_DELTA_TOKENS
+assert E._DELTA_OVERFLOW == "raise", E._DELTA_OVERFLOW
+try:
+    E._record_delta_truncation(E.MAX_DELTA_TOKENS + 1)
+except ValueError as e:
+    assert "MAX_DELTA_TOKENS" in str(e), e
+    print("PROBE-OK")
+else:
+    raise SystemExit("an overflowing delta did NOT raise under pure defaults")
+""")
+
+
+def test_delta_overflow_boundary_is_exact():
+    """Fits at N, raises at N+1: raw_len == MAX_DELTA_TOKENS is NOT an
+    overflow (no raise, no truncation counters), raw_len == N+1 is."""
+    _run_pure_defaults("""
+import alphagrad.approx.env as E
+n = E.MAX_DELTA_TOKENS
+before = (int(E._TOKENIZATION_TRUNCATION_COUNT[0]),
+          int(E._TOKENIZATION_TRUNCATION_OVERFLOW_SUM[0]))
+E._record_delta_truncation(n)          # exactly full: fits
+after = (int(E._TOKENIZATION_TRUNCATION_COUNT[0]),
+         int(E._TOKENIZATION_TRUNCATION_OVERFLOW_SUM[0]))
+assert before == after, (before, after)
+try:
+    E._record_delta_truncation(n + 1)  # one past: raises
+except ValueError:
+    print("PROBE-OK")
+else:
+    raise SystemExit(f"raw_len == MAX_DELTA_TOKENS + 1 == {n + 1} did not raise")
+""")
