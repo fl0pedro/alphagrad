@@ -346,7 +346,7 @@ from the agent, until `sample_fn` is backed by `FacePathPolicy`.
 All three are wired. Flags, in the order the data flows:
 
 ```bash
-export ALPHAGRAD_INCREMENTAL_TOKENS=1  # C: append-only AOJ tokens -> palimpsa (default 0)
+# ALPHAGRAD_INCREMENTAL_TOKENS defaults to 1: append-only AOJ tokens -> palimpsa
 export ALPHAGRAD_POLICY=palimpsa       # encoder (never palimpsa_bi, never transformer)
 export ALPHAGRAD_FACE_TRANSFORMS=1     # B: measure via per-face slots (default 1)
 export GRAPHAX_PRUNE=0

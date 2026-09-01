@@ -6115,7 +6115,7 @@ def main():
             "ALPHAGRAD_POS_ENC=1 (there is no absolute position to encode: "
             "the policy never sees the whole stream)."
         )
-    if os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "0") != "1":
+    if os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "1") != "1":
         raise ValueError(
             "the delta observation requires "
             "ALPHAGRAD_INCREMENTAL_TOKENS=1 (a per-step DELTA only exists "

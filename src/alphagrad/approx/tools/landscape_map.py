@@ -307,7 +307,6 @@ if ARGS.exec_on_gpu:
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
 os.environ.setdefault("ALPHAGRAD_DIRECT_MEASURE", "1")
 os.environ.setdefault("ALPHAGRAD_CLEAR_JIT_CACHES_EVERY", "0")
-os.environ.setdefault("ALPHAGRAD_INCREMENTAL_TOKENS", "1")
 os.environ.setdefault("ALPHAGRAD_UNIFIED_FACE_ENUM", "1")
 # The quality channel is configured through the ENVIRONMENT in this codebase
 # (one env var, one reader, so two paths cannot disagree) -- mirror ppo.py.

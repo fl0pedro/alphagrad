@@ -5125,7 +5125,7 @@ def _callback(
     # _incremental_stream_tokens — the standalone replay below is skipped
     # and this phase's time moves into cb.tokenize.
     _unified_fe = (os.environ.get("ALPHAGRAD_UNIFIED_FACE_ENUM", "0") == "1"
-                   and os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "0")
+                   and os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "1")
                    == "1")
     # ONE sparse per-vertex encoding of the face wires per callback,
     # shared by the live elimination state below and by the stream
@@ -5199,7 +5199,7 @@ def _callback(
                     tok_rules_by_v[int(v)] = tuple(tok_rules)
 
     _pf("cb.decode")
-    if os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "0") == "1":
+    if os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "1") == "1":
         # Append-only observation (spec): the stream grows by one block per
         # elimination and the whole extract_jaxpr re-trace of the Jacobian is
         # skipped. eqn_ids come from the tokenizer's own segment record —
