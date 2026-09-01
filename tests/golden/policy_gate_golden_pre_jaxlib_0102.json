@@ -1,0 +1,1426 @@
+{
+ "config": {
+  "embd_dim": 32,
+  "max_faces": 16,
+  "seed": 13,
+  "steps": 5,
+  "total_v": 7,
+  "valid_vertices": [
+   1,
+   2,
+   3,
+   4,
+   5,
+   6
+  ],
+  "window": 4096
+ },
+ "fingerprint": {
+  "jax": "0.10.1.dev20260424+504d3d965b",
+  "jaxlib": "0.10.1.dev0+selfbuilt",
+  "platform": "cpu",
+  "python": "3.13"
+ },
+ "steps": [
+  {
+   "avail_vertices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+   ],
+   "env_delta_count": 12,
+   "env_order_prefix": [
+    1
+   ],
+   "face": {
+    "chunk_counts": [
+     681
+    ],
+    "chunk_eqns_sha": "55e9755086b437f5",
+    "chunk_tokens_sha": "a88afd6cae4641f8",
+    "comp_valid": [
+     [
+      0,
+      1,
+      2,
+      3
+     ]
+    ],
+    "endpoints": [
+     [
+      0,
+      2
+     ]
+    ],
+    "entropy": "3f20b2a2",
+    "logp": "bf916478",
+    "n_live": 1,
+    "pair_valid": [
+     [
+      [
+       0,
+       1
+      ],
+      [
+       0,
+       2
+      ],
+      [
+       0,
+       3
+      ],
+      [
+       1,
+       0
+      ],
+      [
+       1,
+       2
+      ],
+      [
+       1,
+       3
+      ],
+      [
+       2,
+       0
+      ],
+      [
+       2,
+       1
+      ],
+      [
+       2,
+       3
+      ],
+      [
+       3,
+       0
+      ],
+      [
+       3,
+       1
+      ],
+      [
+       3,
+       2
+      ]
+     ]
+    ],
+    "wires": [
+     {
+      "compress_kind": [
+       0,
+       0,
+       0
+      ],
+      "factor": [
+       0,
+       0,
+       0
+      ],
+      "i": [
+       0,
+       0,
+       0
+      ],
+      "j": [
+       0,
+       0,
+       0
+      ],
+      "op_type": [
+       3,
+       3,
+       3
+      ],
+      "quant_dtype": [
+       0,
+       0,
+       0
+      ],
+      "quant_frac": [
+       "00000000",
+       "00000000",
+       "00000000"
+      ],
+      "quant_sign": [
+       1,
+       1,
+       1
+      ],
+      "skip": 1
+     }
+    ]
+   },
+   "face_rows": [
+    [
+     [
+      -1,
+      -1,
+      0
+     ],
+     [
+      -1,
+      -1,
+      0
+     ],
+     [
+      -1,
+      -1,
+      0
+     ]
+    ]
+   ],
+   "face_skip": [
+    1
+   ],
+   "micro_compress_valid": [],
+   "micro_i": [
+    0
+   ],
+   "micro_j": [
+    0
+   ],
+   "micro_op_type": [
+    3
+   ],
+   "micro_pair_valid": [],
+   "micro_quant_logp": [
+    "00000000"
+   ],
+   "participants": [
+    0,
+    1
+   ],
+   "rule_specs": [],
+   "step": 0,
+   "target_vertex": 1,
+   "value": [
+    "bd8f01f5",
+    "be2a1504",
+    "3dd95438"
+   ],
+   "vertex": 0,
+   "vertex_mask_fill": [
+    "ff800000"
+   ],
+   "vertex_prob_illegal_mass": "00000000",
+   "vertex_probs_live": [
+    [
+     0,
+     "3e29ace5"
+    ],
+    [
+     1,
+     "3e3229be"
+    ],
+    [
+     2,
+     "3e1d71b0"
+    ],
+    [
+     3,
+     "3e2fe592"
+    ],
+    [
+     4,
+     "3e1c7d81"
+    ],
+    [
+     5,
+     "3e3a549d"
+    ]
+   ]
+  },
+  {
+   "avail_vertices": [
+    1,
+    2,
+    3,
+    4,
+    5
+   ],
+   "env_delta_count": 365,
+   "env_order_prefix": [
+    1,
+    6
+   ],
+   "face": {
+    "chunk_counts": [
+     365
+    ],
+    "chunk_eqns_sha": "c9d373bdb13010a5",
+    "chunk_tokens_sha": "c8338ccf3634980b",
+    "comp_valid": [
+     [
+      0,
+      1,
+      2,
+      3
+     ]
+    ],
+    "endpoints": [
+     [
+      5,
+      7
+     ]
+    ],
+    "entropy": "40daf98e",
+    "logp": "c0e3a90e",
+    "n_live": 1,
+    "pair_valid": [
+     [
+      [
+       0,
+       1
+      ],
+      [
+       0,
+       2
+      ],
+      [
+       0,
+       3
+      ],
+      [
+       1,
+       0
+      ],
+      [
+       1,
+       2
+      ],
+      [
+       1,
+       3
+      ],
+      [
+       2,
+       0
+      ],
+      [
+       2,
+       1
+      ],
+      [
+       2,
+       3
+      ],
+      [
+       3,
+       0
+      ],
+      [
+       3,
+       1
+      ],
+      [
+       3,
+       2
+      ]
+     ]
+    ],
+    "wires": [
+     {
+      "compress_kind": [
+       0,
+       0,
+       0
+      ],
+      "factor": [
+       2,
+       0,
+       0
+      ],
+      "i": [
+       1,
+       0,
+       0
+      ],
+      "j": [
+       2,
+       0,
+       0
+      ],
+      "op_type": [
+       0,
+       3,
+       3
+      ],
+      "quant_dtype": [
+       0,
+       0,
+       0
+      ],
+      "quant_frac": [
+       "00000000",
+       "00000000",
+       "00000000"
+      ],
+      "quant_sign": [
+       1,
+       1,
+       1
+      ],
+      "skip": 0
+     }
+    ]
+   },
+   "face_rows": [
+    [
+     [
+      1,
+      0,
+      2
+     ],
+     [
+      -1,
+      -1,
+      0
+     ],
+     [
+      -1,
+      -1,
+      0
+     ]
+    ]
+   ],
+   "face_skip": [
+    0
+   ],
+   "micro_compress_valid": [],
+   "micro_i": [
+    0
+   ],
+   "micro_j": [
+    0
+   ],
+   "micro_op_type": [
+    3
+   ],
+   "micro_pair_valid": [],
+   "micro_quant_logp": [
+    "00000000"
+   ],
+   "participants": [
+    4,
+    5,
+    6
+   ],
+   "rule_specs": [],
+   "step": 1,
+   "target_vertex": 6,
+   "value": [
+    "bd84c724",
+    "bdf85f18",
+    "3decc341"
+   ],
+   "vertex": 5,
+   "vertex_mask_fill": [
+    "ff800000"
+   ],
+   "vertex_prob_illegal_mass": "00000000",
+   "vertex_probs_live": [
+    [
+     1,
+     "3e4da948"
+    ],
+    [
+     2,
+     "3e4a417c"
+    ],
+    [
+     3,
+     "3e4c9a1e"
+    ],
+    [
+     4,
+     "3e45f7b9"
+    ],
+    [
+     5,
+     "3e558366"
+    ]
+   ]
+  },
+  {
+   "avail_vertices": [
+    1,
+    2,
+    3,
+    4
+   ],
+   "env_delta_count": 1085,
+   "env_order_prefix": [
+    1,
+    6,
+    3
+   ],
+   "face": {
+    "chunk_counts": [
+     689,
+     364
+    ],
+    "chunk_eqns_sha": "132ce27e903f85d8",
+    "chunk_tokens_sha": "5cd5e349f27da618",
+    "comp_valid": [
+     [
+      0,
+      1,
+      2,
+      3
+     ],
+     [
+      0,
+      1,
+      2,
+      3
+     ]
+    ],
+    "endpoints": [
+     [
+      0,
+      4
+     ],
+     [
+      2,
+      4
+     ]
+    ],
+    "entropy": "417b8db4",
+    "logp": "c1792c94",
+    "n_live": 2,
+    "pair_valid": [
+     [
+      [
+       0,
+       1
+      ],
+      [
+       0,
+       2
+      ],
+      [
+       0,
+       3
+      ],
+      [
+       1,
+       0
+      ],
+      [
+       1,
+       2
+      ],
+      [
+       1,
+       3
+      ],
+      [
+       2,
+       0
+      ],
+      [
+       2,
+       1
+      ],
+      [
+       2,
+       3
+      ],
+      [
+       3,
+       0
+      ],
+      [
+       3,
+       1
+      ],
+      [
+       3,
+       2
+      ]
+     ],
+     [
+      [
+       0,
+       1
+      ],
+      [
+       0,
+       2
+      ],
+      [
+       0,
+       3
+      ],
+      [
+       1,
+       0
+      ],
+      [
+       1,
+       2
+      ],
+      [
+       1,
+       3
+      ],
+      [
+       2,
+       0
+      ],
+      [
+       2,
+       1
+      ],
+      [
+       2,
+       3
+      ],
+      [
+       3,
+       0
+      ],
+      [
+       3,
+       1
+      ],
+      [
+       3,
+       2
+      ]
+     ]
+    ],
+    "wires": [
+     {
+      "compress_kind": [
+       1,
+       0,
+       0
+      ],
+      "factor": [
+       0,
+       0,
+       16
+      ],
+      "i": [
+       2,
+       0,
+       1
+      ],
+      "j": [
+       0,
+       0,
+       3
+      ],
+      "op_type": [
+       1,
+       3,
+       0
+      ],
+      "quant_dtype": [
+       0,
+       0,
+       0
+      ],
+      "quant_frac": [
+       "00000000",
+       "00000000",
+       "00000000"
+      ],
+      "quant_sign": [
+       1,
+       1,
+       1
+      ],
+      "skip": 0
+     },
+     {
+      "compress_kind": [
+       0,
+       0,
+       0
+      ],
+      "factor": [
+       0,
+       0,
+       0
+      ],
+      "i": [
+       0,
+       0,
+       0
+      ],
+      "j": [
+       0,
+       0,
+       0
+      ],
+      "op_type": [
+       3,
+       2,
+       2
+      ],
+      "quant_dtype": [
+       0,
+       2,
+       0
+      ],
+      "quant_frac": [
+       "00000000",
+       "00000000",
+       "00000000"
+      ],
+      "quant_sign": [
+       1,
+       1,
+       1
+      ],
+      "skip": 0
+     }
+    ]
+   },
+   "face_rows": [
+    [
+     [
+      -2,
+      2,
+      1
+     ],
+     [
+      -1,
+      -1,
+      0
+     ],
+     [
+      1,
+      1,
+      16
+     ]
+    ],
+    [
+     [
+      -1,
+      -1,
+      0
+     ],
+     [
+      -3,
+      2,
+      1
+     ],
+     [
+      -3,
+      0,
+      1
+     ]
+    ]
+   ],
+   "face_skip": [
+    0,
+    0
+   ],
+   "micro_compress_valid": [],
+   "micro_i": [
+    0
+   ],
+   "micro_j": [
+    0
+   ],
+   "micro_op_type": [
+    3
+   ],
+   "micro_pair_valid": [],
+   "micro_quant_logp": [
+    "00000000"
+   ],
+   "participants": [
+    1,
+    2,
+    3
+   ],
+   "rule_specs": [],
+   "step": 2,
+   "target_vertex": 3,
+   "value": [
+    "bd89c0b4",
+    "be7daf47",
+    "3e1f764f"
+   ],
+   "vertex": 2,
+   "vertex_mask_fill": [
+    "ff800000"
+   ],
+   "vertex_prob_illegal_mass": "00000000",
+   "vertex_probs_live": [
+    [
+     1,
+     "3e6f59d5"
+    ],
+    [
+     2,
+     "3e95eb60"
+    ],
+    [
+     3,
+     "3e698659"
+    ],
+    [
+     4,
+     "3e7b490f"
+    ]
+   ]
+  },
+  {
+   "avail_vertices": [
+    1,
+    3,
+    4
+   ],
+   "env_delta_count": 1045,
+   "env_order_prefix": [
+    1,
+    6,
+    3,
+    5
+   ],
+   "face": {
+    "chunk_counts": [
+     135,
+     352
+    ],
+    "chunk_eqns_sha": "7ed0c57149125a9f",
+    "chunk_tokens_sha": "edf4e616ff740888",
+    "comp_valid": [
+     [
+      0,
+      1,
+      2,
+      3
+     ],
+     [
+      0,
+      1,
+      2,
+      3
+     ]
+    ],
+    "endpoints": [
+     [
+      0,
+      7
+     ],
+     [
+      2,
+      7
+     ]
+    ],
+    "entropy": "41328851",
+    "logp": "c139c00c",
+    "n_live": 2,
+    "pair_valid": [
+     [
+      [
+       0,
+       1
+      ],
+      [
+       0,
+       2
+      ],
+      [
+       0,
+       3
+      ],
+      [
+       1,
+       0
+      ],
+      [
+       1,
+       2
+      ],
+      [
+       1,
+       3
+      ],
+      [
+       2,
+       0
+      ],
+      [
+       2,
+       1
+      ],
+      [
+       2,
+       3
+      ],
+      [
+       3,
+       0
+      ],
+      [
+       3,
+       1
+      ],
+      [
+       3,
+       2
+      ]
+     ],
+     [
+      [
+       0,
+       1
+      ],
+      [
+       0,
+       2
+      ],
+      [
+       0,
+       3
+      ],
+      [
+       1,
+       0
+      ],
+      [
+       1,
+       2
+      ],
+      [
+       1,
+       3
+      ],
+      [
+       2,
+       0
+      ],
+      [
+       2,
+       1
+      ],
+      [
+       2,
+       3
+      ],
+      [
+       3,
+       0
+      ],
+      [
+       3,
+       1
+      ],
+      [
+       3,
+       2
+      ]
+     ]
+    ],
+    "wires": [
+     {
+      "compress_kind": [
+       0,
+       0,
+       0
+      ],
+      "factor": [
+       0,
+       0,
+       0
+      ],
+      "i": [
+       0,
+       0,
+       0
+      ],
+      "j": [
+       0,
+       0,
+       0
+      ],
+      "op_type": [
+       3,
+       3,
+       3
+      ],
+      "quant_dtype": [
+       0,
+       0,
+       0
+      ],
+      "quant_frac": [
+       "00000000",
+       "00000000",
+       "00000000"
+      ],
+      "quant_sign": [
+       1,
+       1,
+       1
+      ],
+      "skip": 1
+     },
+     {
+      "compress_kind": [
+       0,
+       0,
+       0
+      ],
+      "factor": [
+       16,
+       0,
+       0
+      ],
+      "i": [
+       1,
+       1,
+       0
+      ],
+      "j": [
+       3,
+       0,
+       0
+      ],
+      "op_type": [
+       0,
+       1,
+       2
+      ],
+      "quant_dtype": [
+       0,
+       0,
+       2
+      ],
+      "quant_frac": [
+       "00000000",
+       "00000000",
+       "00000000"
+      ],
+      "quant_sign": [
+       1,
+       1,
+       1
+      ],
+      "skip": 0
+     }
+    ]
+   },
+   "face_rows": [
+    [
+     [
+      -1,
+      -1,
+      0
+     ],
+     [
+      -1,
+      -1,
+      0
+     ],
+     [
+      -1,
+      -1,
+      0
+     ]
+    ],
+    [
+     [
+      1,
+      1,
+      16
+     ],
+     [
+      -2,
+      1,
+      0
+     ],
+     [
+      -3,
+      2,
+      1
+     ]
+    ]
+   ],
+   "face_skip": [
+    1,
+    0
+   ],
+   "micro_compress_valid": [],
+   "micro_i": [
+    0
+   ],
+   "micro_j": [
+    0
+   ],
+   "micro_op_type": [
+    3
+   ],
+   "micro_pair_valid": [],
+   "micro_quant_logp": [
+    "00000000"
+   ],
+   "participants": [
+    1,
+    4,
+    6
+   ],
+   "rule_specs": [],
+   "step": 3,
+   "target_vertex": 5,
+   "value": [
+    "bd68904c",
+    "be917f06",
+    "3e53f743"
+   ],
+   "vertex": 4,
+   "vertex_mask_fill": [
+    "ff800000"
+   ],
+   "vertex_prob_illegal_mass": "00000000",
+   "vertex_probs_live": [
+    [
+     1,
+     "3eac865f"
+    ],
+    [
+     3,
+     "3eac4f62"
+    ],
+    [
+     4,
+     "3ea72a40"
+    ]
+   ]
+  },
+  {
+   "avail_vertices": [
+    1,
+    3
+   ],
+   "env_delta_count": 867,
+   "env_order_prefix": [
+    1,
+    6,
+    3,
+    5,
+    4
+   ],
+   "face": {
+    "chunk_counts": [
+     215,
+     741
+    ],
+    "chunk_eqns_sha": "a79992f04f0c0651",
+    "chunk_tokens_sha": "b28282846a18a597",
+    "comp_valid": [
+     [
+      0,
+      1,
+      2,
+      3
+     ],
+     [
+      0,
+      1,
+      2,
+      3
+     ]
+    ],
+    "endpoints": [
+     [
+      0,
+      7
+     ],
+     [
+      2,
+      7
+     ]
+    ],
+    "entropy": "41489b10",
+    "logp": "c14a1f96",
+    "n_live": 2,
+    "pair_valid": [
+     [
+      [
+       0,
+       1
+      ],
+      [
+       0,
+       2
+      ],
+      [
+       0,
+       3
+      ],
+      [
+       1,
+       0
+      ],
+      [
+       1,
+       2
+      ],
+      [
+       1,
+       3
+      ],
+      [
+       2,
+       0
+      ],
+      [
+       2,
+       1
+      ],
+      [
+       2,
+       3
+      ],
+      [
+       3,
+       0
+      ],
+      [
+       3,
+       1
+      ],
+      [
+       3,
+       2
+      ]
+     ],
+     [
+      [
+       0,
+       1
+      ],
+      [
+       0,
+       2
+      ],
+      [
+       0,
+       3
+      ],
+      [
+       1,
+       0
+      ],
+      [
+       1,
+       2
+      ],
+      [
+       1,
+       3
+      ],
+      [
+       2,
+       0
+      ],
+      [
+       2,
+       1
+      ],
+      [
+       2,
+       3
+      ],
+      [
+       3,
+       0
+      ],
+      [
+       3,
+       1
+      ],
+      [
+       3,
+       2
+      ]
+     ]
+    ],
+    "wires": [
+     {
+      "compress_kind": [
+       0,
+       0,
+       0
+      ],
+      "factor": [
+       0,
+       0,
+       0
+      ],
+      "i": [
+       0,
+       0,
+       0
+      ],
+      "j": [
+       0,
+       0,
+       0
+      ],
+      "op_type": [
+       3,
+       3,
+       3
+      ],
+      "quant_dtype": [
+       0,
+       0,
+       0
+      ],
+      "quant_frac": [
+       "00000000",
+       "00000000",
+       "00000000"
+      ],
+      "quant_sign": [
+       1,
+       1,
+       1
+      ],
+      "skip": 1
+     },
+     {
+      "compress_kind": [
+       4,
+       0,
+       0
+      ],
+      "factor": [
+       0,
+       2,
+       2
+      ],
+      "i": [
+       0,
+       2,
+       3
+      ],
+      "j": [
+       0,
+       3,
+       2
+      ],
+      "op_type": [
+       1,
+       0,
+       0
+      ],
+      "quant_dtype": [
+       0,
+       0,
+       0
+      ],
+      "quant_frac": [
+       "00000000",
+       "00000000",
+       "00000000"
+      ],
+      "quant_sign": [
+       1,
+       1,
+       1
+      ],
+      "skip": 0
+     }
+    ]
+   },
+   "face_rows": [
+    [
+     [
+      -1,
+      -1,
+      0
+     ],
+     [
+      -1,
+      -1,
+      0
+     ],
+     [
+      -1,
+      -1,
+      0
+     ]
+    ],
+    [
+     [
+      -2,
+      0,
+      4
+     ],
+     [
+      -1,
+      -1,
+      0
+     ],
+     [
+      -1,
+      -1,
+      0
+     ]
+    ]
+   ],
+   "face_skip": [
+    1,
+    0
+   ],
+   "micro_compress_valid": [],
+   "micro_i": [
+    0
+   ],
+   "micro_j": [
+    0
+   ],
+   "micro_op_type": [
+    3
+   ],
+   "micro_pair_valid": [],
+   "micro_quant_logp": [
+    "00000000"
+   ],
+   "participants": [
+    1,
+    3,
+    6
+   ],
+   "rule_specs": [],
+   "step": 4,
+   "target_vertex": 4,
+   "value": [
+    "bd379c55",
+    "be8c39ae",
+    "3e247a13"
+   ],
+   "vertex": 3,
+   "vertex_mask_fill": [
+    "ff800000"
+   ],
+   "vertex_prob_illegal_mass": "00000000",
+   "vertex_probs_live": [
+    [
+     1,
+     "3efc46f9"
+    ],
+    [
+     3,
+     "3f01dc84"
+    ]
+   ]
+  }
+ ]
+}

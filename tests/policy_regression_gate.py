@@ -76,8 +76,19 @@ DETERMINISM CAVEAT
 ------------------
 The golden pins float32 bit patterns produced by XLA:CPU. It is reproducible on
 a fixed (jax, jaxlib, CPU) triple; the recorded ``fingerprint`` block reports
-that triple and a MISMATCH is printed as a warning next to any diff, so a
-jaxlib bump is never mistaken for a masking regression.
+that triple, and the comparison is fingerprint-aware:
+
+* same fingerprint + ANY diff                     -> hard FAIL;
+* different fingerprint + float-bit-pattern diffs -> WARN, print the diff,
+  do not fail (a toolchain bump re-associates float arithmetic by a few ULP
+  -- the 2026-08-31 jaxlib 0.10.1 -> 0.10.2 rebuild moved 7 fields by 1-2
+  ULP with every integer field intact);
+* STRUCTURAL diffs (a missing key, a length/shape change, any integer field
+  -- a vertex, a wire, a mask index, a count, a chunk hash) -> hard FAIL
+  regardless of fingerprint. A toolchain cannot move an integer.
+
+After a deliberate toolchain bump, re-record on the designated node and keep
+the superseded golden as a named ancestor in ``tests/golden/``.
 """
 from __future__ import annotations
 
@@ -539,21 +550,50 @@ def _walk(prefix, a, b, out, limit):
         out.append((prefix, a, b))
 
 
+_HEX = set("0123456789abcdef")
+
+
+def _is_f32_bits(x) -> bool:
+    """Exactly what ``_f32bits`` emits: 8 lowercase hex chars. The 16-char
+    ``_sha`` chunk hashes deliberately do NOT match -- a hash names integer
+    token content, and a toolchain cannot move an integer."""
+    return isinstance(x, str) and len(x) == 8 and set(x) <= _HEX
+
+
+def _floats_only(diffs) -> bool:
+    """True iff every diff is a float moving: a float32 bit pattern against
+    a float32 bit pattern, or a raw float against a raw float. Anything else
+    (absent key, length change, int, hash, string) is STRUCTURAL."""
+    for _path, g, l in diffs:
+        if _is_f32_bits(g) and _is_f32_bits(l):
+            continue
+        if (isinstance(g, float) and isinstance(l, float)
+                and not isinstance(g, bool) and not isinstance(l, bool)):
+            continue
+        return False
+    return True
+
+
 def compare(golden, live, limit=25):
     """``(ok, report)``. The report names the FIRST differing step and the
-    exact field -- never a bare ``assert x == y`` on two 40 kB blobs."""
+    exact field -- never a bare ``assert x == y`` on two 40 kB blobs.
+
+    Fingerprint-aware: float-only diffs under a DIFFERENT toolchain
+    fingerprint are a WARN (printed, not failed); the same diffs under the
+    SAME fingerprint, and any structural/integer diff under any fingerprint,
+    are a FAIL. See the module docstring's determinism caveat."""
     lines = []
     gf, lf = golden.get("fingerprint", {}), live.get("fingerprint", {})
-    if gf != lf:
+    fp_differs = gf != lf
+    if fp_differs:
         lines.append(
             "NOTE  toolchain fingerprint differs from the golden's:\n"
             f"        golden {gf}\n        live   {lf}\n"
             "      float32 bit patterns are only reproducible on a fixed "
-            "(jax, jaxlib, platform) triple. If the ONLY diffs below are "
-            "float bit patterns, suspect the toolchain before the code; if "
-            "any INTEGER field (a vertex, a wire, a mask index, a count) "
-            "differs, the toolchain is irrelevant -- that is a real "
-            "regression.")
+            "(jax, jaxlib, platform) triple. Float-bit-pattern diffs below "
+            "are therefore WARNINGS, not failures; if any INTEGER field (a "
+            "vertex, a wire, a mask index, a count) differs, the toolchain "
+            "is irrelevant -- that is a real regression and still FAILS.")
     if golden.get("config") != live.get("config"):
         d = []
         for k in sorted(set(golden.get("config", {}))
@@ -567,20 +607,44 @@ def compare(golden, live, limit=25):
     gs, ls = golden.get("steps", []), live.get("steps", [])
     if len(gs) != len(ls):
         lines.append(f"FAIL  step count: golden={len(gs)} live={len(ls)}")
+    warned = False
     for t, (g, l) in enumerate(zip(gs, ls)):
         diffs = []
-        _walk("", g, l, diffs, limit)
-        if diffs:
-            lines.append(f"FAIL  first divergence at STEP {t} "
-                         f"({len(diffs)} differing field(s), showing "
-                         f"{min(len(diffs), limit)}):")
-            for path, gv, lv in diffs[:limit]:
-                p = path.lstrip(".") or "<root>"
-                lines.append(f"        {p}")
-                lines.append(f"            golden : {gv!r}")
-                lines.append(f"            live   : {lv!r}")
-            lines.append(_hint(diffs))
-            break
+        # Walk with a large cap so a structural diff cannot hide behind
+        # `limit` float diffs collected first; only the PRINTING is limited.
+        _walk("", g, l, diffs, 100000)
+        if not diffs:
+            continue
+        if fp_differs and _floats_only(diffs):
+            if not warned:
+                lines.append(
+                    f"WARN  STEP {t}: {len(diffs)} float32 bit pattern(s) "
+                    f"moved under a DIFFERENT toolchain fingerprint -- not "
+                    f"a regression verdict (showing "
+                    f"{min(len(diffs), limit)}):")
+                for path, gv, lv in diffs[:limit]:
+                    p = path.lstrip(".") or "<root>"
+                    lines.append(f"        {p}")
+                    lines.append(f"            golden : {gv!r}")
+                    lines.append(f"            live   : {lv!r}")
+                lines.append(
+                    "      Re-record the golden on the current toolchain "
+                    "once the bump is deliberate (--record).")
+                warned = True
+            else:
+                lines.append(f"WARN  STEP {t}: {len(diffs)} further "
+                             f"float-only field(s) moved (elided)")
+            continue
+        lines.append(f"FAIL  first divergence at STEP {t} "
+                     f"({len(diffs)} differing field(s), showing "
+                     f"{min(len(diffs), limit)}):")
+        for path, gv, lv in diffs[:limit]:
+            p = path.lstrip(".") or "<root>"
+            lines.append(f"        {p}")
+            lines.append(f"            golden : {gv!r}")
+            lines.append(f"            live   : {lv!r}")
+        lines.append(_hint(diffs))
+        break
     ok = not any(x.startswith("FAIL") for x in lines)
     return ok, "\n".join(lines)
 
