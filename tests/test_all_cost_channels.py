@@ -1,6 +1,7 @@
 """Pin that every cost channel populates on a successful env step.
 
-The callback in `env._callback` carries a 10-channel reward vector:
+The callback in `env._callback` carries an 11-channel reward vector
+(`env.REWARD_NAMES`):
 
     [0] muls_adds_fmas   — graphax symbolic op count
     [1] flops            — XLA cost_analysis
@@ -8,10 +9,11 @@ The callback in `env._callback` carries a 10-channel reward vector:
     [3] max_io_sum       — graphax mem accumulator
     [4] bytes_accessed   — XLA cost_analysis
     [5] peak_memory      — ResourceMonitor peak HBM
-    [6] quality       — only at terminal
-    [7] frob_residual    — only at terminal
-    [8] xla_peak_memory  — deterministic XLA memory_analysis peak estimate
-    [9] bkstep_acc       — B_kstep trainability accuracy, only at terminal
+    [6] quality          — only at terminal
+    [7] grad_coverage    — was frob_residual until 2026-08-27 (bcb61a17)
+    [8] fidelity         — only at terminal
+    [9] bkstep_acc       — RESERVED for the deprecated Ray line
+    [10] sparsity        — stored-byte sparsity
 
 The user explicitly asked us to test that ALL SIX cost channels (0..5)
 populate when measure_latency=True — so downstream comparison and wandb
@@ -37,7 +39,7 @@ from alphagrad.approx.env import (
 def _terminal_action_for(env) -> StepAction:
     """Drive the env to its terminal step in one go: pick the first valid
     vertex, plant no approximation rules. With the env at the first
-    pre-terminal vertex this would emit quality and frob_residual; we
+    pre-terminal vertex this would emit quality and grad_coverage; we
     only need the COST channels to populate, so just step once."""
     target_v = jnp.asarray(env.valid_vertices[0], dtype=jnp.int32)
     rule_specs = (
@@ -201,7 +203,7 @@ def test_target_fun_none_early_return_zeros_jit_channels():
         f"cossim must be 0 in early-return (was 1.0 in pre-2026-05-24 code); "
         f"got {quality['quality']}"
     )
-    assert quality["frob_residual"] == 0.0
+    assert quality["grad_coverage"] == 0.0
     print("  confirmed: 4 cost + 2 quality channels zeroed when target_fun=None")
 
 
