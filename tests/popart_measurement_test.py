@@ -110,6 +110,12 @@ def test_measurement_flags_are_wired_not_swallowed():
     assert (cfg.num_data_points, cfg.reps_per_point) == (5, 4)
 
 
-def test_advantage_norm_defaults_to_popart():
+def test_advantage_norm_defaults_to_none():
+    """096f1771 made manual-weight mode the default: NO adaptive advantage
+    normalisation (raw symlog units, --lambda-* the only scaling). PopArt is
+    still selectable and everything above pins its arithmetic."""
     a = make_argparser().parse_args(["--example", "X"])
+    assert a.advantage_norm == "none"
+    a = make_argparser().parse_args(["--example", "X",
+                                     "--advantage-norm", "popart"])
     assert a.advantage_norm == "popart"

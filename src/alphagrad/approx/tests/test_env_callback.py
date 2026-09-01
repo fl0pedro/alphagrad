@@ -33,6 +33,19 @@ import os
 # Until 2026-08-31 it did NOT set it and passed anyway, because whichever
 # neighbouring module pytest imported first had already put it in the shared
 # process environment. Running this file alone failed. See finding 47.
+#
+# LEGACY FULL-STREAM PATH, pinned. These tests mock `extract_jaxpr` /
+# the vertex-elimination call and pin `_callback`'s rule DECODE-AND-FORWARD
+# contract with synthetic specs (e.g. Diag(0, 2, f) on a graph where that
+# axis pair is illegal for real elimination). Since 07c8ead5 the library
+# default is ALPHAGRAD_INCREMENTAL_TOKENS=1, whose tokenizer really
+# eliminates -- and correctly REJECTS those synthetic specs (finding 48 S6
+# documents exactly these three failures). The incremental path has its own
+# modules (delta_obs_emission_test, carry_stream_*, live_face_*); this one
+# declares the path it was written for. `_callback` reads the variable on
+# every call, so a module-scope assignment is sufficient and per-module
+# process isolation makes it ours to set.
+os.environ["ALPHAGRAD_INCREMENTAL_TOKENS"] = "0"
 
 
 from collections import namedtuple
