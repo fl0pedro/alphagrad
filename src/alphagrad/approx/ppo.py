@@ -4293,13 +4293,13 @@ def make_argparser() -> argparse.ArgumentParser:
         "--dynamic-substeps.",
     )
     p.add_argument(
-        "--advantage-norm", type=str, default="popart",
+        "--advantage-norm", type=str, default="none",
         choices=["popart", "zscore", "none"],
-        help="popart (default): per-channel debiased-EMA normalisation of "
+        help="popart: per-channel debiased-EMA normalisation of "
         "value targets + sigma-scaled advantages, with an output-preserving "
         "head rescale. zscore: the legacy per-batch z-score, which has a "
         "collapse ratchet (a uniformly-degenerate batch drives std->0 so the "
-        "opposing channel vanishes). none: NO adaptive normalisation — "
+        "opposing channel vanishes). none (default): NO adaptive normalisation — "
         "advantages stay in raw symlog units and the CLI --lambda-* weights "
         "are the ONLY scaling (manual-weight mode; reward semantics are "
         "stationary across the whole run).",
@@ -4531,10 +4531,11 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--terminal-rewards-only",
-        action="store_true",
+        action=argparse.BooleanOptionalAction, default=True,
         help="Compute the env's reward vector only at the final elimination step; "
         "intermediate steps return zeros. Skips per-step jacve compile/exec — the "
-        "dominant rollout cost. PPO+GAE handles sparse rewards natively.",
+        "dominant rollout cost. PPO+GAE handles sparse rewards natively. "
+        "Default on; pass --no-terminal-rewards-only for per-step rewards.",
     )
     p.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "wikitext2", "none"])
     p.add_argument("--dataset-size", type=int, default=-1)
@@ -4780,7 +4781,7 @@ def make_argparser() -> argparse.ArgumentParser:
              "form exits warmup at 1.0x peak where the plain cosine would "
              "already be at ~0.91x, i.e. it runs hotter through the middle. "
              "Only read when --lr-warmup-frac > 0.")
-    p.add_argument("--gae-lambda", type=float, default=0.95)
+    p.add_argument("--gae-lambda", type=float, default=1.0)
     p.add_argument("--ppo-clip-eps", type=float, default=0.2)
     p.add_argument("--minibatches", type=int, default=32)
     p.add_argument("--ppo-epochs", type=int, default=2)
@@ -4922,7 +4923,7 @@ def make_argparser() -> argparse.ArgumentParser:
                    "value loss stays in normalized space; composes with "
                    "--lag-causal-mask. Default off = bit-identical.")
     p.add_argument("--value-weight", type=float, default=0.5)
-    p.add_argument("--discount", type=float, default=0.99)
+    p.add_argument("--discount", type=float, default=1.0)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
     p.add_argument("--adam-b1", type=float, default=0.9)
     p.add_argument("--adam-eps", type=float, default=1e-7)
