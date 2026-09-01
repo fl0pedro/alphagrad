@@ -82,7 +82,14 @@ def test_attribution_is_independent_of_the_segment_counter(seg_id):
 
 def test_advance_still_credits_the_owning_vertex():
     """The delta path is the one place a vertex attribution IS known, and it
-    must keep working: `advance` uses `owner`, not the segment id."""
+    must keep working: `advance` uses `owner`, not the segment id.
+
+    Slot layout is ``total_v + 2`` (carry_stream.zero_memory): 0..V-1 the
+    vertices, V the GLOBAL slot, V+1 the SUMMARY slot. Since ad6e2856 every
+    row is credited TWICE by design -- once to the slot(s) it participates
+    in, once to the SUMMARY slot (exactly once per row), because per-slot
+    sums no longer re-add to the token total. So a 4-row delta moves the
+    owner slot by 4 AND the summary slot by 4, never the global slot."""
     toks, eqns, count = _base_block()
     carry, sums, counts = cs.init_carry(
         _StubAgent(), toks, eqns, count,
@@ -99,7 +106,11 @@ def test_advance_still_credits_the_owning_vertex():
     delta = np.asarray(counts2) - np.asarray(counts)
     assert delta[owner] == 4.0, f"owner slot did not receive the delta: {delta}"
     assert delta[TOTAL_V] == 0.0, "delta rows must not reach the global slot"
-    assert delta.sum() == 4.0, "no rows may be double-counted"
+    assert delta[TOTAL_V + 1] == 4.0, (
+        f"the SUMMARY slot must be credited exactly once per row: {delta}")
+    assert delta.sum() == 8.0, (
+        f"each row is credited once to a participant slot and once to the "
+        f"SUMMARY slot -- nowhere else: {delta}")
 
 
 def test_summary_is_unchanged_by_the_attribution():
