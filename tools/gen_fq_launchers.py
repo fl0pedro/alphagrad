@@ -103,6 +103,7 @@ WANDB = (f"--wandb {WANDB_MODE} --wandb-entity {WANDB_ENTITY}"
 # The R1-R4 battery shipped with this guard and it caught three missing flags.
 REQUIRED_FLAGS = [
     "--quality-metric",
+    "--measure-toolchain-gate",
     "--reject-frozen-grads",
     "--symlog-channels",
     "--init-scheme",
@@ -205,9 +206,82 @@ SHARED_ENV = [
     ("ALPHAGRAD_FACE_ENUM_CACHE", "1"),
     ("ALPHAGRAD_UNIFIED_FACE_ENUM", "1"),
     ("ALPHAGRAD_BATCHED_CALLBACK", "1"),
-    ("JAX_COMPILATION_CACHE_DIR", "$HOME/dsnn/.jax_compile_cache"),
+    # PER NODE, never shared (owner ruling on ticket .21; finding 03 sec 5a):
+    # an entry written on a healthy node is reused verbatim on a node whose
+    # link toolchain is broken and the fault never fires.  That is why the
+    # wave-1 contamination was 51% / 97% rather than 100%, and why the
+    # contaminated plan set cannot be recovered from the node name.  Expanded
+    # by the shell ON THE NODE at job start.
+    ("JAX_COMPILATION_CACHE_DIR", "$HOME/.jaxcache_$(hostname -s)"),
     ("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "2"),
 ]
+
+# ---------------------------------------------------------------------------
+# THE MEASURE TOOLCHAIN (finding 03, ticket dsnn-3qm.21).  The measure compile
+# options split the module (xla_gpu_enable_llvm_module_compilation_parallelism)
+# and splitting means LINKING: XLA shells out to the first `nvlink` it finds.
+# Wave 1 found it under /usr/local/cuda -- an admin-flipped SYMLINK that on
+# pgi15-gpu16/17 pointed at cuda-12.8 while the venv's ptxas (12.9.86) emits
+# 12.9 cubins.  nvlink refused every one ("newer than toolkit (129 vs 128)"),
+# _compile_measure silently took the degraded-fusion executable, and 51% of
+# w1b and 97% of w1c were contaminated (docs/WAVE1_RESULTS.md).
+#
+# The fix the owner approved (option 4a): put the MATCHED toolkit first on
+# PATH, in a form that names no node and never trusts the symlink, and prove
+# the version before python starts.  Not xla_gpu_cuda_data_dir: it silences
+# the error when pointed at ANY directory, an empty one included (measured).
+# CUDA_WANT is the release of the ptxas the venv ships (nvidia_cuda_nvcc_cu12
+# 12.9.86); nvlink has to be the same release, so the job proves BOTH.
+#
+# A CPU job (JAX_PLATFORMS=cpu) never links, so it runs the same block for the
+# record but does not abort when the node has no toolkit.
+# ---------------------------------------------------------------------------
+
+CUDA_WANT = "12.9"
+
+TOOLCHAIN_BLOCK = r"""# ---------------------- MEASURE TOOLCHAIN ---------------------
+# Finding 03: XLA links the measure executables with the first nvlink on
+# PATH; a 12.8 nvlink refuses 12.9 ptxas cubins and every measurement
+# silently degrades.  Put the matched @WANT@ toolkit first, from whatever
+# /usr/local/cuda-* this node has (never the /usr/local/cuda symlink), and
+# prove the version.  72 = no matched @WANT@ toolkit on this node.
+FQ_CUDA_WANT=@WANT@
+FQ_CUDA_BIN=""
+for d in /usr/local/cuda-*/bin; do
+  [ -x "$d/ptxas" ] && [ -x "$d/nvlink" ] || continue
+  pv=$("$d/ptxas" --version 2>&1 | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' | tail -1)
+  nv=$("$d/nvlink" --version 2>&1 | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' | tail -1)
+  if [ "$pv" = "$FQ_CUDA_WANT" ] && [ "$nv" = "$FQ_CUDA_WANT" ]; then FQ_CUDA_BIN=$d; fi
+done
+if [ -n "$FQ_CUDA_BIN" ]; then
+  export PATH="$FQ_CUDA_BIN:$PATH"
+fi
+FQ_PTXAS_VER=$(ptxas --version 2>&1 | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' | tail -1)
+FQ_NVLINK_VER=$(nvlink --version 2>&1 | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' | tail -1)
+echo "[cfg] measure toolchain on $(hostname -s): PATH<-${FQ_CUDA_BIN:-<none>}" \
+     "ptxas ${FQ_PTXAS_VER:-none} ($(command -v ptxas || echo not-on-PATH))" \
+     "nvlink ${FQ_NVLINK_VER:-none} ($(command -v nvlink || echo not-on-PATH))" \
+     "/usr/local/cuda -> $(readlink -f /usr/local/cuda 2>/dev/null || echo none)"
+if [ "$FQ_PTXAS_VER" != "$FQ_CUDA_WANT" ] || [ "$FQ_NVLINK_VER" != "$FQ_CUDA_WANT" ]; then
+@ON_FAULT@
+fi
+"""
+
+_TOOLCHAIN_ABORT = (
+    '  echo "ABORT(72): measure toolchain on $(hostname -s) is'
+    ' ptxas ${FQ_PTXAS_VER:-none} / nvlink ${FQ_NVLINK_VER:-none},'
+    ' want $FQ_CUDA_WANT -- every measurement here would be a degraded'
+    ' fallback (finding 03)"\n'
+    '  exit 72')
+_TOOLCHAIN_CPU_NOTE = (
+    '  echo "[cfg] CPU job (JAX_PLATFORMS=cpu): XLA never links, no CUDA'
+    ' toolkit required on this node"')
+
+
+def _toolchain_block(kind: str) -> str:
+    on_fault = _TOOLCHAIN_CPU_NOTE if kind == "cpu" else _TOOLCHAIN_ABORT
+    return (TOOLCHAIN_BLOCK.replace("@WANT@", CUDA_WANT)
+            .replace("@ON_FAULT@", on_fault).rstrip())
 
 # ---------------------------------------------------------------------------
 # SHARED CLI.  Ordered list of (group-comment, [tokens]).  Arms override by
@@ -253,6 +327,9 @@ SHARED_CLI = [
     ("--reject-frozen-grads", None),
     # THE TRAINED QUALITY CHANNEL.  auto still means loss_drop; name it.
     ("--quality-metric", "grad_cosine"),
+    # THE MEASURE TOOLCHAIN GATE (finding 03).  abort is the default; named
+    # so no arm can inherit a stale warn.  A SKIP IS A FAILURE.
+    ("--measure-toolchain-gate", "abort"),
     # Sampling variance in the quality signal is WANTED.  --walk-rotate is
     # named for the loss-drop walk but env._walk_seed is SHARED, so it rotates
     # the grad-cosine probe batch too: without it grad_cosine scores every
@@ -357,7 +434,7 @@ reverted, so it is demonstrated to fail on the bug it targets.""",
     body=r"""
 export JAX_PLATFORMS=cpu
 export ALPHAGRAD_SKIP_COUNT_OPS=1
-export JAX_COMPILATION_CACHE_DIR=$HOME/dsnn/.jax_compile_cache
+export JAX_COMPILATION_CACHE_DIR=$HOME/.jaxcache_$(hostname -s)
 
 echo "=== GATE 1/3: tools/ratio_gates.sh ==="
 PY="uv run --no-sync python" tools/ratio_gates.sh
@@ -572,7 +649,7 @@ export ALPHAGRAD_FORCE_REV_ORDER=1
 export ALPHAGRAD_TLM_SEQ=32
 export ALPHAGRAD_TLM_DMODEL=128
 export ALPHAGRAD_TLM_VOCAB=1024
-export JAX_COMPILATION_CACHE_DIR=$HOME/dsnn/.jax_compile_cache
+export JAX_COMPILATION_CACHE_DIR=$HOME/.jaxcache_$(hostname -s)
 
 uv run --no-sync python src/alphagrad/approx/tools/coverage_beam.py \
   --example TransformerLM --dataset wikitext2 --seed 250197 \
@@ -1263,6 +1340,9 @@ def render(a: dict) -> str:
         L.append('export PATH="$HOME/.local/bin:$PATH"')
         L.append('export PYTHONPATH="$HOME/dsnn/graphax/src:$HOME/dsnn/alphagrad/src"')
         L.append("export PYTHONDONTWRITEBYTECODE=1")
+        L.append("")
+        L.append(_toolchain_block(kind))
+        L.append("")
         L.append('echo "HOST=$(hostname) JOB=$SLURM_JOB_ID"')
         L.append('echo "ag=$(git -C ~/dsnn/alphagrad rev-parse --short HEAD)'
                  ' gx=$(git -C ~/dsnn/graphax rev-parse --short HEAD)"')
@@ -1282,6 +1362,8 @@ def render(a: dict) -> str:
     for k, v in over.items():
         if k not in {kk for kk, _ in SHARED_ENV} and v is not _DELETE:
             L.append(f"export {k}={v}")
+    L.append("")
+    L.append(_toolchain_block(kind))
     L.append("")
 
     # --- pre-flight
