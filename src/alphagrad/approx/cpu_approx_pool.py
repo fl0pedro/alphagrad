@@ -99,6 +99,17 @@ def _sentinel_callback_output(
     return tokens, eqn_ids, reward
 
 
+def _is_toolchain_fault(exc: BaseException) -> bool:
+    """True for env.MeasureToolchainFault, however Ray wrapped it."""
+    try:
+        from alphagrad.approx.env import MeasureToolchainFault
+        if isinstance(exc, MeasureToolchainFault):
+            return True
+    except Exception:
+        pass
+    return "TOOLCHAIN FAULT" in str(exc)
+
+
 class CpuApproxPool:
     """Round-robin pool of CPU approximation actors with cancel-on-timeout.
 
@@ -889,6 +900,13 @@ class CpuApproxPool:
                     held[j] = None
                     _sentinel_slot(i)
                 except Exception as _exc:
+                    # The actor's measure toolchain gate fired (finding 03).
+                    # Ray re-raises the actor's exception as a RayTaskError
+                    # that is ALSO an instance of the original class; the
+                    # text match covers a pickling failure. This must stop
+                    # the run, not become one more [SENTINEL] line.
+                    if _is_toolchain_fault(_exc):
+                        raise
                     self._n_other_errors += 1
                     print(
                         f"[SENTINEL] batch other-error slot={i} "

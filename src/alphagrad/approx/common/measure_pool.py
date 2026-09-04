@@ -201,7 +201,11 @@ def merge_pool_plan_records(pool) -> dict:
     out = {"records": [], "dropped": 0, "actors_polled": 0,
            "actors_failed": 0, "have_pool": pool is not None,
            "actors_seen": 0, "error": None, "terminals": 0,
-           "actors_disabled": 0}
+           "actors_disabled": 0,
+           # Measure toolchain telemetry (finding 03): summed over actors;
+           # ``toolchain_ok`` is False if ANY polled actor's node failed.
+           "compile_fallbacks": 0, "compile_fallbacks_total": 0,
+           "toolchain_ok": True}
     try:
         import ray as _ray
         actors = list(pool.live_actors()) if pool is not None else []
@@ -217,6 +221,12 @@ def merge_pool_plan_records(pool) -> dict:
             continue
         out["actors_polled"] += 1
         out["terminals"] += int((_s or {}).get("terminals", 0))
+        out["compile_fallbacks"] += int(
+            (_s or {}).get("compile_fallbacks", 0))
+        out["compile_fallbacks_total"] += int(
+            (_s or {}).get("compile_fallbacks_total", 0))
+        out["toolchain_ok"] = out["toolchain_ok"] and bool(
+            (_s or {}).get("toolchain_ok", True))
         if not (_s or {}).get("enabled", True):
             out["actors_disabled"] += 1
         _aid = (_s or {}).get("actor_id")

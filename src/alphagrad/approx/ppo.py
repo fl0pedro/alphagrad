@@ -4487,6 +4487,24 @@ def make_argparser() -> argparse.ArgumentParser:
         "every plan-log record carries the value that measured it.",
     )
     p.add_argument(
+        "--measure-toolchain-gate",
+        choices=["abort", "warn", "off"],
+        default="abort",
+        help="What the FIRST measure compile of every measuring process does "
+        "when a tiny cache-proof probe, compiled with the live measure "
+        "options, fails (finding 03: a 12.8 nvlink under /usr/local/cuda on "
+        "pgi15-gpu16/17 refused the venv's 12.9 ptxas cubins and every "
+        "measurement silently became a degraded-fusion fallback). abort = "
+        "stop the run naming the node, the ptxas version and the fault "
+        "(default; a skip is a failure). warn = print the fault, run anyway, "
+        "tag every plan record with compile_fallbacks / toolchain_ok=False; "
+        "only under warn may a link fault take the degraded set. off = skip "
+        "the probe; a link fault in a real measure compile still aborts. "
+        "Published as ALPHAGRAD_MEASURE_TOOLCHAIN_GATE before ray.init so "
+        "the measure actors read the same mode through the one reader "
+        "(env.measure_toolchain_gate_mode); this flag is the only control.",
+    )
+    p.add_argument(
         "--walk-steps", type=int, default=200,
         help="Adam steps in the loss-drop walk (measured configuration: 200).",
     )
@@ -6275,6 +6293,12 @@ def main():
     os.environ["ALPHAGRAD_APPROX_OLD"] = str(args.approx_old)
     print(f"[alphagrad] old edge at the face join (--approx-old) = "
           f"{args.approx_old}", flush=True)
+    # MEASURE TOOLCHAIN GATE -- same transport, same reason: the gate runs
+    # inside env._compile_measure in every measuring process, and the actors
+    # inherit this before ray.init. env.measure_toolchain_gate_mode is the
+    # one reader. Not a knob: --measure-toolchain-gate is the only control.
+    os.environ["ALPHAGRAD_MEASURE_TOOLCHAIN_GATE"] = str(
+        args.measure_toolchain_gate)
     os.environ["ALPHAGRAD_WALK_STEPS"] = str(int(args.walk_steps))
     os.environ["ALPHAGRAD_WALK_LR"] = repr(float(args.walk_lr))
     os.environ["ALPHAGRAD_WALK_PROBE_SEED"] = str(int(args.walk_probe_seed))
@@ -11278,6 +11302,14 @@ def main():
                 _plog_dropped = int(_plog_local["dropped"])
                 _plog_actors = 0
                 _plog_why = ""
+                # MEASURE TOOLCHAIN TELEMETRY (finding 03 sec 6): the
+                # counters ride the SAME drain as the records, so the
+                # actor-side values reach here instead of the trainer's
+                # own always-zero globals (the grad_cov/* trap, ticket 07).
+                _plog_fb = int(_plog_local.get("compile_fallbacks", 0))
+                _plog_fb_total = int(
+                    _plog_local.get("compile_fallbacks_total", 0))
+                _plog_tc_ok = bool(_plog_local.get("toolchain_ok", True))
                 try:
                     from alphagrad.approx.common.measure_pool import (
                         merge_pool_plan_records as _plog_merge)
@@ -11286,6 +11318,11 @@ def main():
                     _plog_recs.extend(_plog_pool["records"])
                     _plog_dropped += int(_plog_pool["dropped"])
                     _plog_actors = int(_plog_pool["actors_polled"])
+                    _plog_fb += int(_plog_pool.get("compile_fallbacks", 0))
+                    _plog_fb_total += int(
+                        _plog_pool.get("compile_fallbacks_total", 0))
+                    _plog_tc_ok = _plog_tc_ok and bool(
+                        _plog_pool.get("toolchain_ok", True))
                     _plog_why = (
                         f" pool={bool(_plog_pool.get('have_pool'))}"
                         f" actors_seen={_plog_pool.get('actors_seen')}"
@@ -11316,6 +11353,10 @@ def main():
                 log_dict["plan_log/actors_polled"] = int(_plog_actors)
                 log_dict["plan_log/sentinelled_this_ep"] = int(sum(
                     1 for _r in _plog_recs if _r.get("sentinelled")))
+                log_dict["measure/compile_fallbacks_this_ep"] = int(_plog_fb)
+                log_dict["measure/compile_fallbacks_total"] = int(
+                    _plog_fb_total)
+                log_dict["measure/toolchain_ok"] = int(bool(_plog_tc_ok))
                 # PRINTED, NOT ONLY LOGGED. A run whose plan log silently
                 # stays empty -- which is exactly what a pooled run did
                 # before this line existed -- is indistinguishable from a

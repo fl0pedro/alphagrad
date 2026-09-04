@@ -1804,14 +1804,28 @@ def _record_plan(rec: dict) -> None:
 
 def consume_plan_records() -> dict:
     """Pop this process's plan records (mirrors the other pollers)."""
+    _fb_n = int(_MEASURE_COMPILE_FALLBACKS["n"])
     out = {"records": list(_PLAN_RECORDS),
            "dropped": int(_PLAN_LOG_DROPPED[0]),
            "terminals": int(_PLAN_LOG_TERMINALS[0]),
+           # MEASURE TOOLCHAIN TELEMETRY (finding 03 sec 6). Drained HERE
+           # because the measure compiles happen in THIS process -- the
+           # actor under --ray-measure -- and this dict is the one the
+           # actor already hands to the trainer. Reading the trainer's own
+           # globals is the mistake that made grad_cov/* read 0 (ticket 07).
+           # `compile_fallbacks` is the delta since the previous drain;
+           # `_total` is the process lifetime count (resets on respawn).
+           "compile_fallbacks": max(
+               0, _fb_n - int(_MEASURE_FALLBACKS_AT_LAST_DRAIN[0])),
+           "compile_fallbacks_total": _fb_n,
+           "toolchain_ok": bool(_MEASURE_TOOLCHAIN["ok"]),
+           "toolchain_host": str(_MEASURE_TOOLCHAIN["host"]),
            "enabled": plan_log_enabled(),
            "pid": os.getpid()}
     _PLAN_RECORDS.clear()
     _PLAN_LOG_DROPPED[0] = 0
     _PLAN_LOG_TERMINALS[0] = 0
+    _MEASURE_FALLBACKS_AT_LAST_DRAIN[0] = _fb_n
     return out
 
 
@@ -1932,6 +1946,18 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
         rec["reward_names"] = list(REWARD_NAMES)
         rec.update(_plan_face_delta(face_before, face_after))
         rec["coverage"] = _plan_coverage_census(cov)
+        # Degraded-fusion compiles taken WHILE THIS PLAN WAS MEASURED (a
+        # delta since the previous record in this pid; measurements are
+        # sequential per actor). Non-zero = this plan's latency came from a
+        # less-fused executable and is not comparable with a plan at 0.
+        # `toolchain_ok` False = the link toolchain of this node failed the
+        # gate probe or a real measure compile (finding 03).
+        _fb_n = int(_MEASURE_COMPILE_FALLBACKS["n"])
+        rec["compile_fallbacks"] = max(
+            0, _fb_n - int(_MEASURE_FALLBACKS_AT_LAST_RECORD[0]))
+        rec["compile_fallbacks_total"] = _fb_n
+        rec["toolchain_ok"] = bool(_MEASURE_TOOLCHAIN["ok"])
+        _MEASURE_FALLBACKS_AT_LAST_RECORD[0] = _fb_n
         _record_plan(rec)
     except Exception as _exc:          # pragma: no cover - telemetry only
         if not _PLAN_LOG_WARNED:
@@ -4797,7 +4823,217 @@ def _measure_compiler_options():
     }
 
 
+# ---------------------------------------------------------------------------
+# MEASURE TOOLCHAIN GATE (finding 03, ticket dsnn-3qm.21).
+#
+# `xla_gpu_enable_llvm_module_compilation_parallelism` splits the module, and
+# splitting means LINKING: XLA shells out to the first `nvlink` it finds. On
+# pgi15-gpu16/17 that was /usr/local/cuda/bin/nvlink -- a SYMLINK pointing at
+# cuda-12.8 -- while the venv's ptxas (nvidia_cuda_nvcc_cu12 12.9.86) emits
+# 12.9 cubins, so nvlink refused every one:
+#     nvlink fatal : Input file '...cubin' newer than toolkit (129 vs 128)
+# `_compile_measure` matched the "INTERNAL" signature and silently swapped in
+# the degraded-fusion executable. That contaminated 51% of wave-1 arm w1b and
+# 97% of w1c and was found only in post-hoc log analysis. gpu15 and gpu16 run
+# the SAME driver (580.178.04): it was never a driver mismatch.
+#
+# The gate compiles a tiny throwaway module with the LIVE measure options at
+# the first measure compile of every measuring process (trainer, every
+# CpuApproximationActor, every respawn), which is the one site no call path
+# can bypass. Measured cost 0.07 s; a 4-op probe trips the fault as reliably
+# as a 40-op one (job 62796).
+#
+# THE PROBE MUST NOT BE CACHEABLE. Measured (job 62809): a persistent-cache
+# entry written on a healthy node is reused verbatim on the broken one and
+# the fault never fires, so a cacheable probe is a false-negative generator.
+# See `_toolchain_probe_compile` for how the cache is bypassed and why the
+# obvious way (jax_enable_compilation_cache=False) is wrong.
+#
+# Default = abort. A silent repair that swaps the toolkit would be the same
+# class of invisible change as the bug. A SKIP IS A FAILURE.
+# ---------------------------------------------------------------------------
+
+# Published by ppo.py from --measure-toolchain-gate BEFORE ray.init, exactly
+# like ALPHAGRAD_QUALITY_METRIC: the measure actors run this module's
+# `_compile_measure` in their own processes, and one env var read by ONE
+# function is what makes trainer and actors unable to disagree. This is the
+# transport, not a knob -- the flag is the only control.
+_MEASURE_TOOLCHAIN_GATE_ENV = "ALPHAGRAD_MEASURE_TOOLCHAIN_GATE"
+_MEASURE_TOOLCHAIN_GATE_MODES = ("abort", "warn", "off")
+
+# Process-global gate state. `ok` goes False on a probe failure OR a link
+# fault in a real measure compile; every plan record and every
+# `consume_plan_records` drain carries it.
+_MEASURE_TOOLCHAIN = {"checked": False, "ok": True, "detail": "",
+                      "mode": "", "host": "", "link_faults": 0}
+
+# The XLA error text of a link-toolchain fault. Either line alone is
+# sufficient (finding 03 sec 1).
+_LINK_FAULT_SIGNATURES = ("nvlink", "The CUDA linking API did not work")
+
+
+class MeasureToolchainFault(RuntimeError):
+    """The measure compile toolchain on THIS node is broken.
+
+    Deliberately its own class: the measurement sentinel machinery
+    (``cpu_approx_worker.evaluate``, ``CpuApproxPool.evaluate_batch``)
+    absorbs every other exception into a sentinel row and lets the run
+    continue, which for THIS fault would mean a run that measures nothing
+    or measures degraded executables while exiting 0. Both re-raise it.
+    """
+
+
+def measure_toolchain_gate_mode() -> str:
+    """``abort`` | ``warn`` | ``off`` -- THE one reader of the gate mode.
+
+    Absent (a process not started through ppo.py, e.g. a test or a tool)
+    means ``abort``. A value outside the three modes raises: argparse
+    already validated the flag, so garbage here is a hand edit.
+    """
+    want = os.environ.get(_MEASURE_TOOLCHAIN_GATE_ENV, "abort").strip().lower()
+    if want not in _MEASURE_TOOLCHAIN_GATE_MODES:
+        raise ValueError(
+            f"{_MEASURE_TOOLCHAIN_GATE_ENV}={want!r} is not one of "
+            f"{_MEASURE_TOOLCHAIN_GATE_MODES}; it is published from "
+            f"--measure-toolchain-gate, not set by hand")
+    return want
+
+
+def _is_link_toolchain_fault(msg: str) -> bool:
+    return any(_sig in msg for _sig in _LINK_FAULT_SIGNATURES)
+
+
+def _tool_version(name: str, path: str | None = None) -> str:
+    """``'12.9.86 at /usr/local/cuda-12.9/bin/ptxas'`` for the ``ptxas`` /
+    ``nvlink`` FIRST ON PATH -- the one XLA shells out to -- or a reason.
+    With ``path`` given, that binary instead."""
+    import re
+    import shutil
+    import subprocess
+    p = path if path is not None else shutil.which(name)
+    if p is None:
+        return "not on PATH"
+    if not os.path.exists(p):
+        return f"absent ({p})"
+    try:
+        txt = subprocess.run([p, "--version"], capture_output=True,
+                             text=True, timeout=20).stdout
+    except Exception as _exc:
+        return f"unreadable at {p} ({type(_exc).__name__})"
+    m = re.search(r"release (\d+\.\d+), V(\d+\.\d+\.\d+)", txt)
+    return f"{m.group(2)} at {p}" if m else f"unparsed version at {p}"
+
+
+def _venv_ptxas_version() -> str:
+    """The ptxas the venv ships (nvidia_cuda_nvcc_cu12): with none on PATH
+    this is the one XLA compiles PTX with, and the release its cubins carry
+    -- the '129' in 'newer than toolkit (129 vs 128)'."""
+    import sysconfig
+    p = os.path.join(sysconfig.get_paths()["purelib"], "nvidia", "cuda_nvcc",
+                     "bin", "ptxas")
+    return _tool_version("ptxas", p)
+
+
+def _toolchain_probe_compile():
+    """Compile a tiny throwaway executable with the LIVE measure options,
+    BYPASSING the persistent compile cache. Returns the lowered object.
+
+    Two mechanisms, both needed:
+
+    * UNIQUE KEY. A fresh random constant is baked into the module, so its
+      cache key has never been written by any process on any node and the
+      lookup cannot hit. The input is a ``ShapeDtypeStruct``: a concrete
+      ``jnp.ones`` would run eager helper ops OUTSIDE this function's
+      control and those DO get cached (measured locally).
+    * NO WRITE. The compile-time threshold is raised for this one compile
+      (thread-local jax state), so the probe never leaves an entry behind
+      even under JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0.
+
+    NOT ``jax_enable_compilation_cache=False``: ``compilation_cache.
+    is_cache_used`` latches its answer on the first compile of the process,
+    and this gate IS the first measure compile in every actor -- it would
+    switch the persistent cache off for the whole process.
+    """
+    import secrets
+    from jax._src import config as _jcfg
+    _c = 1.0 + secrets.randbits(52) / float(1 << 52)
+
+    def _probe(x):
+        y = jnp.sin(x * _c)
+        y = jnp.tanh(y) + 0.5
+        y = y @ jnp.eye(y.shape[-1], dtype=y.dtype)
+        return jnp.log1p(jnp.abs(y))
+
+    with _jcfg.persistent_cache_min_compile_time_secs(1e9):
+        lowered = jax.jit(_probe).lower(
+            jax.ShapeDtypeStruct((16, 16), jnp.float32))
+        lowered.compile(compiler_options=_measure_compiler_options())
+    return lowered
+
+
+def _toolchain_fault_message(where: str, detail: str) -> str:
+    import socket
+    host = socket.gethostname()
+    detail = " ".join(str(detail).split())[:400]
+    return (
+        f"[measure] TOOLCHAIN FAULT on {host} ({where}): the live measure "
+        f"compile options do not produce a working executable, so every "
+        f"measurement on this node would silently be a degraded-fusion "
+        f"FALLBACK and not comparable with the other nodes.\n"
+        f"  fault:  {detail}\n"
+        f"  ptxas:  {_tool_version('ptxas')} (PATH); "
+        f"{_venv_ptxas_version()} (venv)\n"
+        f"  nvlink: {_tool_version('nvlink')} (PATH)\n"
+        f"  /usr/local/cuda -> {os.path.realpath('/usr/local/cuda')}\n"
+        f"  FIX: put a toolkit whose ptxas and nvlink MATCH first on PATH in "
+        f"the job script (tools/gen_fq_launchers.py does this; finding 03 "
+        f"sec 4a). Not xla_gpu_cuda_data_dir: it silences the error for any "
+        f"path. --measure-toolchain-gate warn runs anyway and tags every "
+        f"plan; off skips the probe.")
+
+
+def _measure_toolchain_check() -> dict:
+    """One-time per-process gate on the measure compile toolchain."""
+    if _MEASURE_TOOLCHAIN["checked"]:
+        return _MEASURE_TOOLCHAIN
+    import socket
+    mode = measure_toolchain_gate_mode()
+    host = socket.gethostname()
+    _MEASURE_TOOLCHAIN["checked"] = True
+    _MEASURE_TOOLCHAIN["mode"] = mode
+    _MEASURE_TOOLCHAIN["host"] = host
+    if mode == "off":
+        print(f"[measure] toolchain gate OFF on {host} "
+              f"(--measure-toolchain-gate off): a broken link toolchain on "
+              f"this node is NOT probed", flush=True)
+        return _MEASURE_TOOLCHAIN
+    t0 = time.perf_counter()
+    try:
+        _toolchain_probe_compile()
+    except Exception as _exc:
+        detail = f"{type(_exc).__name__}: {_exc}"
+    else:
+        print(f"[measure] toolchain gate OK on {host} "
+              f"({time.perf_counter() - t0:.2f}s; ptxas "
+              f"{_tool_version('ptxas')} (PATH), {_venv_ptxas_version()} "
+              f"(venv); nvlink {_tool_version('nvlink')} (PATH))",
+              flush=True)
+        return _MEASURE_TOOLCHAIN
+    _MEASURE_TOOLCHAIN["ok"] = False
+    _MEASURE_TOOLCHAIN["detail"] = " ".join(detail.split())[:400]
+    msg = _toolchain_fault_message("gate probe", detail)
+    if mode == "warn":
+        print(msg, file=sys.stderr, flush=True)
+        return _MEASURE_TOOLCHAIN
+    raise MeasureToolchainFault(msg)
+
+
 _MEASURE_COMPILE_FALLBACKS = {"n": 0}
+# Fallback count at the previous plan record / drain in THIS process, so a
+# per-plan and a per-episode DELTA can be attributed (measurements are
+# sequential per actor: pure_callback(vmap_method="sequential")).
+_MEASURE_FALLBACKS_AT_LAST_RECORD = [0]
+_MEASURE_FALLBACKS_AT_LAST_DRAIN = [0]
 
 
 def _compile_measure(lowered):
@@ -4810,13 +5046,35 @@ def _compile_measure(lowered):
     defeat the fallback). The fallback executable is less fused, so its
     latency reads conservatively -- a real measurement, not a sentinel;
     every use is printed and counted so the bias stays visible.
-    ALPHAGRAD_MEASURE_COMPILE_FALLBACK=0 disables."""
+    ALPHAGRAD_MEASURE_COMPILE_FALLBACK=0 disables.
+
+    A LINK-toolchain fault (nvlink refusing a newer ptxas cubin) is NOT
+    fallbackable: see the MEASURE TOOLCHAIN GATE block above."""
+    _measure_toolchain_check()
     try:
         return lowered.compile(compiler_options=_measure_compiler_options())
     except Exception as _e:
+        _m = str(_e)
+        # A LINK-toolchain fault is an ENVIRONMENT fault, not a plan-specific
+        # compiler bug: it recurs on every plan for the whole job and
+        # silently degrades every latency on this node. Absorbing it into
+        # the per-plan retry is how it hid inside wave 1 (finding 03). The
+        # gate above should have caught it; reaching here means the
+        # environment changed mid-run. Only --measure-toolchain-gate warn
+        # takes the degraded set, and then the plan is TAGGED
+        # (compile_fallbacks / toolchain_ok in its record).
+        _link_fault = _is_link_toolchain_fault(_m)
+        if _link_fault:
+            _MEASURE_TOOLCHAIN["ok"] = False
+            _MEASURE_TOOLCHAIN["detail"] = " ".join(_m.split())[:400]
+            _MEASURE_TOOLCHAIN["link_faults"] += 1
+            if (measure_toolchain_gate_mode() != "warn"
+                    or os.environ.get("ALPHAGRAD_MEASURE_COMPILE_FALLBACK",
+                                      "1") == "0"):
+                raise MeasureToolchainFault(_toolchain_fault_message(
+                    "measure compile, mid-run", _m)) from _e
         if os.environ.get("ALPHAGRAD_MEASURE_COMPILE_FALLBACK", "1") == "0":
             raise
-        _m = str(_e)
         # "Shared memory size limit exceeded" is labelled
         # RESOURCE_EXHAUSTED but is a compiler KERNEL-CONFIG failure
         # (XLA chose a tile above the SM's shared-mem budget -- observed
@@ -4827,7 +5085,7 @@ def _compile_measure(lowered):
         # fusion-pass graph bug -- observed on an exact TLM plan
         # (fusion.113, Blackwell); by construction a degraded-fusion
         # retry can avoid the offending fusion.
-        if not any(_sig in _m for _sig in (
+        if not _link_fault and not any(_sig in _m for _sig in (
                 "ptxas exited", "Triton kernel", "INTERNAL",
                 "Shared memory size limit", "A cycle is detected")):
             raise
