@@ -119,13 +119,19 @@ def _run_episode(env, skip_face_of_vertex=None):
 def test_slot7_is_exactly_zero_on_every_step_of_a_real_measurement(skip):
     """An exact plan and a skipped-face plan (the class the guard used to
     refuse) both emit a literal 0.0 in slot 7 at every step."""
+    envmod.consume_mem_parity()
     rewards = _run_episode(_make_env(), skip_face_of_vertex=skip)
     assert len(rewards) >= 1
     for r in rewards:
         assert r.shape == (NUM_REWARDS,)
         assert float(r[SLOT7]) == 0.0
     # ...and the terminal step measured SOMETHING, so this is not a zero vector.
-    assert np.any(rewards[-1] != 0.0)
+    # Read off the measurement drain, not off the slots: since ticket .49 slot
+    # 5 is the static temp, which is exactly 0 for this toy's skipped plan
+    # (no temporaries survive), and the other cost slots are 0 by config.
+    _mp = envmod.consume_mem_parity()
+    assert _mp["measured"] == len(rewards)
+    assert any(r["terminal"] for r in _mp["records"])
 
 
 def test_sentinel_vector_keeps_its_shape():

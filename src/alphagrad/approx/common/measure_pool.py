@@ -205,7 +205,10 @@ def merge_pool_plan_records(pool) -> dict:
            # Measure toolchain telemetry (finding 03): summed over actors;
            # ``toolchain_ok`` is False if ANY polled actor's node failed.
            "compile_fallbacks": 0, "compile_fallbacks_total": 0,
-           "toolchain_ok": True}
+           "toolchain_ok": True,
+           # Memory parity (ticket .49): the actors' (temp, watermark)
+           # records and the counts `env.check_mem_parity_complete` compares.
+           "mem_parity": {"records": [], "measured": 0, "dropped": 0}}
     try:
         import ray as _ray
         actors = list(pool.live_actors()) if pool is not None else []
@@ -216,11 +219,21 @@ def merge_pool_plan_records(pool) -> dict:
     for _h in actors:
         try:
             _s = _ray.get(_h.consume_plan_records.remote(), timeout=30)
-        except Exception:
+        except Exception as _exc:
+            # An actor whose memory parity is incomplete raises
+            # env.MemChannelFault from its drain; that is an apparatus
+            # fault and must not be counted as a failed poll.
+            from alphagrad.approx.cpu_approx_pool import _is_toolchain_fault
+            if _is_toolchain_fault(_exc):
+                raise
             out["actors_failed"] += 1
             continue
         out["actors_polled"] += 1
         out["terminals"] += int((_s or {}).get("terminals", 0))
+        _mp = (_s or {}).get("mem_parity") or {}
+        out["mem_parity"]["records"].extend(_mp.get("records", ()))
+        out["mem_parity"]["measured"] += int(_mp.get("measured", 0))
+        out["mem_parity"]["dropped"] += int(_mp.get("dropped", 0))
         out["compile_fallbacks"] += int(
             (_s or {}).get("compile_fallbacks", 0))
         out["compile_fallbacks_total"] += int(
