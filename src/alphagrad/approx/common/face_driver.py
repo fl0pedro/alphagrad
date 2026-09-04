@@ -461,7 +461,7 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
             order, spec_hist, int(np.asarray(step_count)),
             int(np.asarray(vertex_idx)) + 1, face_hist, skip_hist)
         return (np.asarray(sz, np.int32)[:F, :S, :N],
-                np.asarray(qt, np.float32)[:F, :S],
+                np.asarray(qt, np.float32)[:F, :S, :2],
                 np.asarray(pr, np.float32)[:F, :S, :N, :N],
                 np.asarray(cp, np.float32)[:F, :S, :N],
                 np.asarray(no, np.int32)[:F, :S])
@@ -475,7 +475,7 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
                             face_hist, skip_hist)
             B = _order.shape[0]
             outs = (np.zeros((B, F, S, N), np.int32),
-                    np.zeros((B, F, S), np.float32),
+                    np.zeros((B, F, S, 2), np.float32),
                     np.zeros((B, F, S, N, N), np.float32),
                     np.zeros((B, F, S, N), np.float32),
                     np.zeros((B, F, S), np.int32))
@@ -495,7 +495,7 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
         return jax.pure_callback(
             _host,
             (jax.ShapeDtypeStruct((F, S, N), jnp.int32),
-             jax.ShapeDtypeStruct((F, S), jnp.float32),
+             jax.ShapeDtypeStruct((F, S, 2), jnp.float32),
              jax.ShapeDtypeStruct((F, S, N, N), jnp.float32),
              jax.ShapeDtypeStruct((F, S, N), jnp.float32),
              jax.ShapeDtypeStruct((F, S), jnp.int32)),

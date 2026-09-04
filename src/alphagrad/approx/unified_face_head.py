@@ -223,7 +223,7 @@ class UnifiedFaceHead(eqx.Module):
 
     # ------------------------------------------------------------------ score
     def score(self, z, fields: FaceFields, *, op_mask, i_mask, j_mask,
-              axis_mask, pair_ok=None, face_valid=True, approx_ok=True):
+              axis_mask, dtype_mask=None, pair_ok=None, face_valid=True, approx_ok=True):
         """(log_prob, entropy, arity) of ``fields`` under logits ``z``.
 
         Masks are (S, ...) so each slot can carry its own legality; the caller
@@ -271,8 +271,9 @@ class UnifiedFaceHead(eqx.Module):
             lp_fn, e_fn = _cat_logp_ent(
                 z[b + S_RFN:b + S_DTYPE],
                 jnp.ones((NUM_REDUCE_FNS,), jnp.float32), fields.reduce_fn[s])
-            lp_dt, e_dt = _bern_logp_ent(
-                z[b + S_DTYPE], fields.dtype_idx[s] > 0)
+            dm = jnp.ones((2,), jnp.float32) if dtype_mask is None else dtype_mask[s]
+            z_dt = jnp.stack([0.0, z[b + S_DTYPE]])
+            lp_dt, e_dt = _cat_logp_ent(z_dt, dm, fields.dtype_idx[s])
 
             # SELECT, never multiply. A branch mask of 0.0 times a -inf
             # log-prob is NaN, and the unused branches genuinely are -inf:
@@ -297,7 +298,7 @@ class UnifiedFaceHead(eqx.Module):
 
     # ----------------------------------------------------------------- sample
     def sample(self, ctx, key, *, op_mask, i_mask, j_mask, axis_mask,
-               pair_ok=None, face_valid=True, approx_ok=True):
+               dtype_mask=None, pair_ok=None, face_valid=True, approx_ok=True):
         """Draw one face decision. Returns ``(z, FaceFields, lp, ent, arity)``.
 
         Every field is drawn from the SINGLE forward pass ``z`` -- nothing is
@@ -336,8 +337,9 @@ class UnifiedFaceHead(eqx.Module):
             ax = _sample_cat(z[b + S_AXIS:b + S_RFN], axis_mask[s], k[3])
             fn = _sample_cat(z[b + S_RFN:b + S_DTYPE],
                              jnp.ones((NUM_REDUCE_FNS,), jnp.float32), k[4])
-            dt = (jrand.uniform(dt_keys[s]) < jnn.sigmoid(z[b + S_DTYPE])
-                  ).astype(jnp.int32)
+            dm = jnp.ones((2,), jnp.float32) if dtype_mask is None else dtype_mask[s]
+            z_dt = jnp.stack([0.0, z[b + S_DTYPE]])
+            dt = _sample_cat(z_dt, dm, dt_keys[s])
             ops.append(op); iis.append(i_idx); jjs.append(j_idx)
             axs.append(ax); fns.append(fn); dts.append(dt)
 
@@ -349,6 +351,6 @@ class UnifiedFaceHead(eqx.Module):
         )
         lp, ent, arity = self.score(
             z, fields, op_mask=op_mask, i_mask=i_mask, j_mask=j_mask,
-            axis_mask=axis_mask, pair_ok=pair_ok, face_valid=face_valid,
-            approx_ok=approx_ok)
+            axis_mask=axis_mask, dtype_mask=dtype_mask, pair_ok=pair_ok,
+            face_valid=face_valid, approx_ok=approx_ok)
         return z, fields, lp, ent, arity

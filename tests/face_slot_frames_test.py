@@ -374,7 +374,7 @@ def test_slot_legality_is_per_slot_and_matches_the_recorded_tensors():
     sizes, quant, pair, comp, nout, nf = lf.face_slot_legality(
         order, specs, n, 1)
     assert sizes.shape == (MAX_F, FACE_SLOTS, N_AX)
-    assert quant.shape == (MAX_F, FACE_SLOTS)
+    assert quant.shape == (MAX_F, FACE_SLOTS, 2)
     assert pair.shape == (MAX_F, FACE_SLOTS, N_AX, N_AX)
     assert comp.shape == (MAX_F, FACE_SLOTS, N_AX)
     assert nout.shape == (MAX_F, FACE_SLOTS)
@@ -392,7 +392,7 @@ def test_slot_legality_is_per_slot_and_matches_the_recorded_tensors():
             assert int(nout[f, s]) == want.n_out, (f, site)
             assert np.array_equal(pair[f, s] > 0.5, want.pair), (f, site)
             assert np.array_equal(comp[f, s] > 0.5, want.comp), (f, site)
-            assert float(quant[f, s]) == float(want.quant.any()), (f, site)
+            assert np.array_equal(quant[f, s] > 0.5, want.quant), (f, site)
         if not (np.array_equal(sizes[f, 0], sizes[f, 1])
                 and np.array_equal(sizes[f, 1], sizes[f, 2])):
             differing += 1
@@ -526,7 +526,9 @@ def _slot_inputs():
     comp[0, :2] = 1.0
     comp[1, 0] = 1.0
     comp[2, 0] = 1.0
-    quant = np.asarray([1.0, 1.0, 0.0], np.float32)
+    quant = np.zeros((S, 2), np.float32)
+    quant[0, 1] = 1.0
+    quant[1, 1] = 1.0
     return (jnp.asarray(sizes), jnp.asarray(quant), jnp.asarray(pair),
             jnp.asarray(comp))
 
@@ -561,7 +563,7 @@ def test_masked_head_equals_pruned_head_per_slot():
     feats = _features()
     sizes, quant, pair, comp = _slot_inputs()
     ctx = jnp.asarray(np.linspace(-1, 1, pol.embd_dim, dtype=np.float32))
-    om, im, jm, am, pair_ok = pol._face_masks(
+    om, im, jm, am, pair_ok, dm = pol._face_masks(
         [pol._face_feats_1(feats, sizes[s]) for s in range(FACE_SLOTS)],
         pair, comp, quant, None, tables)
     # Slot-dependent legal sets: what D3 is about.
@@ -627,11 +629,13 @@ def test_masked_head_equals_pruned_head_per_slot():
                     ref_lp += l
                     ref_e += e
                 elif op == OP_QUANT:
-                    assert float(quant[s]) == 1.0
-                    pd = 1.0 / (1.0 + np.exp(-zn[b + S_DTYPE]))
+                    legal_dt = np.asarray(dm[s]) > 0.5
+                    assert legal_dt.any()
                     bf = int(row["quant_dtype"][s]) == int(_BF16_SLOT)
-                    ref_lp += np.log(pd if bf else 1.0 - pd)
-                    ref_e += -(pd * np.log(pd) + (1 - pd) * np.log(1 - pd))
+                    l, e, _ = _pruned_cat(np.array([0.0, zn[b + S_DTYPE]]),
+                                          legal_dt, 1 if bf else 0)
+                    ref_lp += l
+                    ref_e += e
                 else:
                     assert op == OP_NONE
         assert abs(float(lp) - ref_lp) < 2e-4, (k, float(lp), ref_lp)
@@ -672,7 +676,7 @@ def test_sampled_distribution_equals_the_pruned_distribution_per_slot():
     feats = _features()
     sizes, quant, pair, comp = _slot_inputs()
     ctx = jnp.asarray(np.linspace(-1, 1, pol.embd_dim, dtype=np.float32))
-    om, _im, _jm, am, _pk = pol._face_masks(
+    om, _im, _jm, am, _pk, _dm = pol._face_masks(
         [pol._face_feats_1(feats, sizes[s]) for s in range(FACE_SLOTS)],
         pair, comp, quant, None, tables)
     z = pol.head.logits(ctx)

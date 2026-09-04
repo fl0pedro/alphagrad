@@ -4306,6 +4306,11 @@ def make_argparser() -> argparse.ArgumentParser:
              "and pareto/archive_size are recorded — scalars describing a "
              "front whose sequences are then discarded at process exit.")
     p.add_argument(
+        "--approx-profile", choices=["all", "skip", "reduce", "quant", "diag", "none"],
+        default=None,
+        help="Approximation-profile mask restricting the approximation head to a subset of classes: "
+             "all (default), skip, reduce, quant, diag, or none (order-only arm, equivalent to --no-approx-head).")
+    p.add_argument(
         "--no-approx-head", action="store_true",
         help="REMOVE the approximation heads instead of masking them. "
              "--variant ve_only only multiplies the op categorical by "
@@ -5173,6 +5178,10 @@ def _apply_variant_preset(args, variant: str | None = None):
     """
     if getattr(args, "exact", False):
         variant = "ve_only"
+    if getattr(args, "approx_profile", None) == "none":
+        args.no_approx_head = True
+    elif getattr(args, "no_approx_head", False) and getattr(args, "approx_profile", None) is None:
+        args.approx_profile = "none"
         
     name = variant if variant is not None else getattr(args, "variant", "custom")
     if name not in VARIANT_PRESETS:
@@ -5201,6 +5210,7 @@ def _op_legality_for_variant(
     variant: str,
     allow_compress: bool,
     allow_quant: bool = True,
+    approx_profile: str | None = None,
 ) -> jax.Array:
     """Per-variant op-type legality mask for the dynamic action space.
 
@@ -5222,6 +5232,21 @@ def _op_legality_for_variant(
     compress = 1.0 if allow_compress else 0.0
     quant = 1.0 if allow_quant else 0.0
     end = 1.0
+    if approx_profile is not None:
+        if approx_profile == "none":
+            return jnp.array([0.0, 0.0, 0.0, end], dtype=jnp.float32)
+        if approx_profile == "skip":
+            return jnp.array([0.0, 0.0, 0.0, end], dtype=jnp.float32)
+        if approx_profile == "diag":
+            return jnp.array([diag, 0.0, 0.0, end], dtype=jnp.float32)
+        if approx_profile == "reduce":
+            return jnp.array([0.0, compress, 0.0, end], dtype=jnp.float32)
+        if approx_profile == "quant":
+            return jnp.array([0.0, 0.0, quant, end], dtype=jnp.float32)
+        if approx_profile == "all":
+            return jnp.array([diag, compress, quant, end], dtype=jnp.float32)
+        raise ValueError(f"Unknown approx_profile '{approx_profile}'.")
+
     if variant == "ve_only":
         return jnp.array([0.0, 0.0, 0.0, 1.0], dtype=jnp.float32)
     if variant in ("diag_gcd", "diag_factor"):
@@ -5415,6 +5440,7 @@ def _build_agent(
             use_group_embedding=getattr(args, "axis_group_embedding", False),
             endpoint_read=bool(getattr(args, "face_endpoint_read", False)),
             edge_mem=bool(getattr(args, "face_edge_mem", False)),
+            allow_skip=bool(getattr(args, "approx_profile", None) == "skip"),
         )
     elif getattr(args, "face_actions", False) and not getattr(
             args, "no_approx_head", False):
@@ -7402,7 +7428,8 @@ def main():
         # that the env then applied, breaking the variant-comparison
         # intent.
         op_legality_override = _op_legality_for_variant(
-            args.variant, args.allow_compress
+            args.variant, args.allow_compress,
+            approx_profile=getattr(args, "approx_profile", None),
         )
         print(
             f"dynamic-substeps: max_substeps={args.max_substeps}, "
@@ -8049,7 +8076,7 @@ def main():
                         # 5 frames deep in the head.
                         _want = (((ENV_MAX_FACES, FACE_SLOTS,
                                    MAX_AXES_PER_VERTEX),
-                                  (ENV_MAX_FACES, FACE_SLOTS))
+                                  (ENV_MAX_FACES, FACE_SLOTS, 2))
                                  if _PFM_SLOT else
                                  ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX),
                                   (ENV_MAX_FACES,)))
@@ -8094,7 +8121,8 @@ def main():
                             (ENV_MAX_FACES,) + _sl + (MAX_AXES_PER_VERTEX,),
                             jnp.int32)
                         face_quant_v = jnp.zeros(
-                            (ENV_MAX_FACES,) + _sl, jnp.float32)
+                            (ENV_MAX_FACES,) + _sl + ((2,) if _PFM_SLOT else ()),
+                            jnp.float32)
                 if _DEBUG_ORDER:
                     # avail = how many vertices are still selectable; picked =
                     # the 0-based index chosen; was_avail = 1.0 iff that pick
@@ -8458,8 +8486,8 @@ def main():
             the head."""
             if _PFM_SLOT:
                 _w = ((ENV_MAX_FACES, FACE_SLOTS, MAX_AXES_PER_VERTEX),
-                      (ENV_MAX_FACES, FACE_SLOTS))
-                _g = (tuple(fsz.shape[-3:]), tuple(fqt.shape[-2:]))
+                      (ENV_MAX_FACES, FACE_SLOTS, 2))
+                _g = (tuple(fsz.shape[-3:]), tuple(fqt.shape[-3:]))
             else:
                 _w = ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX), (ENV_MAX_FACES,))
                 _g = (tuple(fsz.shape[-2:]), tuple(fqt.shape[-1:]))

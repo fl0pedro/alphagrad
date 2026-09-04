@@ -1038,7 +1038,7 @@ class LiveFaceStream:
             return hit
 
         sizes = np.zeros((F, S, N), np.int32)
-        quant = np.zeros((F, S), np.float32)
+        quant = np.zeros((F, S, 2), np.float32)
         pair = np.zeros((F, S, N, N), np.float32)
         comp = np.zeros((F, S, N), np.float32)
         nout = np.zeros((F, S), np.int32)
@@ -1088,7 +1088,7 @@ class LiveFaceStream:
                         qm[:] = False
                 pair[k, s] = pm.astype(np.float32)
                 comp[k, s] = cm.astype(np.float32)
-                quant[k, s] = 1.0 if bool(qm.any()) else 0.0
+                quant[k, s] = qm.astype(np.float32)
 
         res = (sizes, quant, pair, comp, nout, np.int32(n_faces))
         if len(self._slots) >= 4096:
