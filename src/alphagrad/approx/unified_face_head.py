@@ -304,7 +304,18 @@ class UnifiedFaceHead(eqx.Module):
         conditioned on a previously drawn slot, and nothing is unrolled.
         """
         z = self.logits(ctx)
-        keys = jrand.split(key, 1 + FACE_SLOTS * 5)
+        # One skip key, five per slot (op, i, j, axis, reduce_fn), then one
+        # dtype key per slot. The dtype Bernoulli used to share k[4] with the
+        # reduce_fn categorical: under threefry a scalar uniform and the
+        # first Gumbel of a categorical read the same counter word of the
+        # key, so the pair was coupled (P(bf16 | mean) 0.01-0.04 against
+        # 0.6 for every other fn, finding 56 D8) while score() adds
+        # lp_fn + lp_dt as independent terms. The dtype keys are APPENDED:
+        # split(key, n)[i] does not depend on n under
+        # jax_threefry_partitionable, so every other draw is the same as
+        # before for the same seed.
+        keys = jrand.split(key, 1 + FACE_SLOTS * 6)
+        dt_keys = keys[1 + FACE_SLOTS * 5:]
 
         p_skip = jnn.sigmoid(z[O_SKIP])
         skip = (jrand.uniform(keys[0]) < p_skip).astype(jnp.int32)
@@ -325,7 +336,7 @@ class UnifiedFaceHead(eqx.Module):
             ax = _sample_cat(z[b + S_AXIS:b + S_RFN], axis_mask[s], k[3])
             fn = _sample_cat(z[b + S_RFN:b + S_DTYPE],
                              jnp.ones((NUM_REDUCE_FNS,), jnp.float32), k[4])
-            dt = (jrand.uniform(k[4]) < jnn.sigmoid(z[b + S_DTYPE])
+            dt = (jrand.uniform(dt_keys[s]) < jnn.sigmoid(z[b + S_DTYPE])
                   ).astype(jnp.int32)
             ops.append(op); iis.append(i_idx); jjs.append(j_idx)
             axs.append(ax); fns.append(fn); dts.append(dt)
