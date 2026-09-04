@@ -575,7 +575,11 @@ _CH_ACTIVE = jnp.array([1.0, 1.0, 0.0, 1.0])       # flops row inert (no head)
 # ``_scale_output_heads`` ran here — leaving AZ's initial vertex logits at full
 # scale with non-zero biases, i.e. a BIASED Gumbel root prior.
 from alphagrad.approx.common.agent_factory import (      # noqa: E402
-    apply_policy_arch, build_and_init_agent, az_w4, ALGO_HEAD_FIELDS)
+    apply_policy_arch, build_and_init_agent, az_w4, ALGO_HEAD_FIELDS,
+    refuse_removed_env_knobs)
+
+# Knobs that became flags (dsnn-3qm.44) are REFUSED if still exported.
+refuse_removed_env_knobs()
 
 _ns = _ppo_make_argparser().parse_args([])
 apply_policy_arch(
@@ -600,6 +604,7 @@ if A.no_approx_head:
     print("[gaz] EXACT arm: no approximation head; searching the elimination "
           "ORDER only (face actions and live faces forced off).", flush=True)
 _ns.seed = A.seed
+_ns.face_none_bias = float(A.face_none_bias)
 _ft_table, _ft_py, _n_factors, _max_rules = _ppo_build_factor_table(_ns)
 agent = build_and_init_agent(
     _ns, len(jaxpr.eqns), _n_factors, _max_rules, seed=A.seed)

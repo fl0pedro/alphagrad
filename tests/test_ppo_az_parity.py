@@ -53,8 +53,10 @@ AZ_HEADS = dict(
 )
 
 
-def _build(heads):
+def _build(heads, **ns_over):
     ns = _ns(**heads)
+    for k, v in ns_over.items():
+        setattr(ns, k, v)
     tbl, tpy, nfac, mrules = P._build_factor_table(ns)
     return build_and_init_agent(ns, TOTAL_V, nfac, mrules, seed=SEED)
 

@@ -4848,7 +4848,7 @@ def make_argparser() -> argparse.ArgumentParser:
                    "250 episodes with quality spread 3e-06 across 16 plans "
                    "-- there was nothing to learn from, and a trust region "
                    "makes that MORE stable, not less). The contrast knob is "
-                   "ALPHAGRAD_FACE_NONE_BIAS. Sweep them together.")
+                   "--face-none-bias. Sweep them together.")
     p.add_argument("--kl-ref-target", type=float, default=0.0,
                    help="ADAPTIVE variant: hold kl_ref near this value by "
                    "raising/lowering --kl-ref-weight with the standard "
@@ -4880,13 +4880,14 @@ def make_argparser() -> argparse.ArgumentParser:
                    "epoch instead). Independent of --kl-ref-*: this one "
                    "bounds movement per UPDATE, the reference KL bounds "
                    "movement per RUN.")
-    p.add_argument("--face-logit-clamp", type=float, default=15.0,
+    p.add_argument("--face-logit-clamp", type=float, default=0.0,
                    help="bound every unified-face-head logit to (-C, C) "
                    "via C*tanh(z/C) before softmax/sigmoid (see "
                    "unified_face_head.LOGIT_CLAMP): keeps raw-logit drift "
                    "finite so the --face-entropy-floor hinge never loses "
                    "its restoring gradient. Near-identity for |z| << C. "
-                   "0 = off.")
+                   "0 = off (default; the campaign value is set by the "
+                   "launcher generator, tools/gen_fq_launchers.py).")
     p.add_argument("--lag-causal-mask", action="store_true",
                    help="QUALITY_COLLAPSE sec 12.7 fix 1: weight the "
                    "quality-channel advantage by lambda*m(e,t), where "
@@ -4968,6 +4969,18 @@ def make_argparser() -> argparse.ArgumentParser:
              "logits carry full orthogonal magnitude while the pointer sits "
              "at --head-init-scale. Pass 0.1 to give it the same treatment "
              "the other heads get, WITHOUT switching --init-scheme.")
+    p.add_argument(
+        "--face-none-bias", type=float, default=0.0,
+        help="IDENTITY-INIT prior of the face head, applied AFTER "
+             "--init-scheme / --scale-face-head: +B on each slot's OP_NONE "
+             "logit and -B on the face's SKIP logit (trainable; "
+             "common/agent_factory.apply_face_none_bias). At init, on a "
+             "zero context, p_skip = sigmoid(-B) per face and "
+             "p_none = e^B/(e^B+3) per slot with three legal ops. "
+             "0 (default) = off = bit-identical to the head before this "
+             "flag existed. Replaces the env var ALPHAGRAD_FACE_NONE_BIAS "
+             "(ticket dsnn-3qm.44: args only; a set var is refused at "
+             "startup).")
     p.add_argument(
         "--pin-rules-to-exact",
         action="store_true",
@@ -5991,6 +6004,10 @@ def _setup_jax_compile_cache() -> None:
 
 def main():
     args = make_argparser().parse_args()
+    # Knobs that became flags (dsnn-3qm.44) are REFUSED if a launcher still
+    # exports them, never read: an ignored export would run the knob OFF.
+    from alphagrad.approx.common.agent_factory import refuse_removed_env_knobs
+    refuse_removed_env_knobs()
     # --face-logit-clamp must be installed BEFORE any jit trace exists:
     # UnifiedFaceHead.logits reads the module constant at trace time.
     from alphagrad.approx.unified_face_head import set_logit_clamp
@@ -7485,12 +7502,14 @@ def main():
     agent = apply_init_scheme(agent, init_key, args)
     print(f"[init] scheme={getattr(args, 'init_scheme', 'campaign')} "
           f"head_init_scale={float(getattr(args, 'head_init_scale', 0.1)):g} "
-          f"scale_face_head={float(getattr(args, 'scale_face_head', 0.0)):g}",
+          f"scale_face_head={float(getattr(args, 'scale_face_head', 0.0)):g} "
+          f"face_none_bias={float(getattr(args, 'face_none_bias', 0.0)):g}",
           flush=True)
     # Identity-init parity with the factory path (az): ppo.main predates
     # build_and_init_agent and does not route through it.
     from alphagrad.approx.common.agent_factory import apply_face_none_bias
-    agent = apply_face_none_bias(agent)
+    agent = apply_face_none_bias(
+        agent, float(getattr(args, "face_none_bias", 0.0) or 0.0))
     # ------------------------------------------- KL-TO-REFERENCE TRUST REGION
     # THE FROZEN REFERENCE POLICY, snapshotted HERE and never again: after
     # _build_agent + apply_init_scheme + apply_face_none_bias, i.e. exactly

@@ -117,6 +117,7 @@ REQUIRED_FLAGS = [
     "--grad-coverage-weight",
     "--latency-inner-reps",
     "--kl-ref-weight",
+    "--face-none-bias",
     "--exact",
     "--var-probe",
     "--face-edge-mem",
@@ -603,8 +604,9 @@ echo "X2 screen exited with $?"
 #
 # TWO knobs supply that, and both are in the backlog:
 #
-#  * ALPHAGRAD_FACE_NONE_BIAS -- ppo.py:4727 calls it "the contrast knob" in so
-#    many words.  A5's CORRECTED arithmetic (the factory's printed
+#  * --face-none-bias (the env var ALPHAGRAD_FACE_NONE_BIAS until ticket
+#    dsnn-3qm.44; args only now) -- ppo.py's --kl-ref-weight help calls it
+#    "the contrast knob" in so many words.  A5's CORRECTED arithmetic (the factory's printed
 #    P(approx/face) ~ 3*e^-B is a PER-SLOT rate and each face carries 3 slots;
 #    the true expectation on TLM is 118*3*3*e^-B, so the old reading was wrong
 #    by 3x) puts B=6 -- where R2 ran -- at 2.6 approximations per plan, the
@@ -647,8 +649,8 @@ for _n, _bias, _lam, _node in [
         node=_node,
         time="12:00:00",
         gpus=4,
-        env={"ALPHAGRAD_FACE_NONE_BIAS": str(_bias)},
-        cli={"--lambda-acc": str(_lam), "--name": _n.replace("_", "-")},
+        cli={"--face-none-bias": str(_bias), "--lambda-acc": str(_lam),
+             "--name": _n.replace("_", "-")},
         purpose=W1_HEAD + f"""
 
 THIS ARM: NONE-bias B={_bias} (about {{6:2.6, 5:7.2, 4:19.5}}[{_bias}]
@@ -705,6 +707,11 @@ at this scale and the {{130, 170, 210}} relaunch is CANCELLED as answered
 rather than completed.""",
     )
 
+# Waves 2-4 inherit wave 1's winning NONE-bias through the shell variable
+# W1_BIAS, passed as the --face-none-bias VALUE (it was the env var
+# ALPHAGRAD_FACE_NONE_BIAS before dsnn-3qm.44; ppo.py now refuses that var).
+W1_BIAS = '${W1_BIAS:?export W1_BIAS to wave 1 winning NONE-bias}'
+
 # ===========================  WAVE 2  =======================================
 
 for _n, _rev, _extra_cli, _node, _what in [
@@ -721,7 +728,8 @@ for _n, _rev, _extra_cli, _node, _what in [
      "UNPINNED order + the edge-keyed face memory, which is predicted INERT "
      "under rev-pinning and only becomes meaningful here"),
 ]:
-    _cli = {"--name": _n.replace("_", "-"), "--episodes": "250"}
+    _cli = {"--name": _n.replace("_", "-"), "--episodes": "250",
+            "--face-none-bias": W1_BIAS}
     _cli.update(_extra_cli)
     arm(
         name=_n,
@@ -730,9 +738,7 @@ for _n, _rev, _extra_cli, _node, _what in [
         node=_node,
         time="24:00:00",
         gpus=4,
-        env={"ALPHAGRAD_FORCE_REV_ORDER": _rev,
-             "ALPHAGRAD_FACE_NONE_BIAS":
-                 '${W1_BIAS:?export W1_BIAS to wave 1 winning NONE-bias}'},
+        env={"ALPHAGRAD_FORCE_REV_ORDER": _rev},
         cli=_cli,
         depends="wave 1 (inherits its winning NONE-bias via $W1_BIAS)",
         purpose=f"""WAVE 2 -- THE ELIMINATION ORDER.  The axis with real range
@@ -824,10 +830,8 @@ for _n, _lam, _kl, _node, _what in [
         node=_node,
         time="12:00:00",
         gpus=4,
-        env={"ALPHAGRAD_FACE_NONE_BIAS":
-             '${W1_BIAS:?export W1_BIAS to wave 1 winning NONE-bias}'},
-        cli={"--lambda-acc": _lam, "--kl-ref-weight": _kl,
-             "--name": _n.replace("_", "-")},
+        cli={"--face-none-bias": W1_BIAS, "--lambda-acc": _lam,
+             "--kl-ref-weight": _kl, "--name": _n.replace("_", "-")},
         depends="wave 1 finding contrast (otherwise CANCELLED)",
         purpose=f"""WAVE 3 -- PRICE AND STABILITY.  Two registered items that
 were both recorded and neither executed.
@@ -847,8 +851,8 @@ THE STABILITY.  A5's KL-to-reference (4421056) penalises divergence from the
 FROZEN identity-init policy on the face head plus its live-face context; the
 vertex term cancels exactly and is structurally zero under the rev pin.  Its
 own docstring is explicit about what it does and does not do: it bounds DRIFT,
-it CANNOT create CONTRAST -- "the contrast knob is ALPHAGRAD_FACE_NONE_BIAS.
-Sweep them together."  This wave is the second half of that sweep, run only
+it CANNOT create CONTRAST -- "the contrast knob is --face-none-bias.  Sweep
+them together."  This wave is the second half of that sweep, run only
 after wave 1 has established that there IS drift worth bounding.
 
 THIS ARM: {_what}.
@@ -893,7 +897,7 @@ for _n, _read, _node, _what in [
 ]:
     _cli = {"--face-read": _read, "--name": _n.replace("_", "-"),
             "--var-probe": None, "--var-probe-lr": "1e-3",
-            "--var-probe-steps": "16"}
+            "--var-probe-steps": "16", "--face-none-bias": W1_BIAS}
     if _n.endswith("seed2"):
         _cli["--seed"] = "970520"
     arm(
@@ -903,8 +907,6 @@ for _n, _read, _node, _what in [
         node=_node,
         time="12:00:00",
         gpus=4,
-        env={"ALPHAGRAD_FACE_NONE_BIAS":
-             '${W1_BIAS:?export W1_BIAS to wave 1 winning NONE-bias}'},
         cli=_cli,
         depends="waves 1-3 (inherits the winning bias and lambda)",
         purpose=f"""WAVE 4 -- THE FACE READ POINT.  --face-read is the CHEAPEST
