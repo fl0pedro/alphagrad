@@ -4443,6 +4443,24 @@ def make_argparser() -> argparse.ArgumentParser:
         "plan-log record carries the value that measured it.",
     )
     p.add_argument(
+        "--reduce-axis-space",
+        choices=["physical", "canonical"],
+        default="physical",
+        help="Ticket dsnn-3qm.20 (defect D5). A Reduce axis lived in three "
+        "coordinate spaces at once: the head and the wire name a LOGICAL dim "
+        "of the slot's tensor, the legality mask read it as a PHYSICAL val "
+        "axis, graphax applied it as a CANONICAL slot (finding 56: on TLM "
+        "lhs edges the three never coincide). physical = Compress.axes are "
+        "physical val axes; the wire token is resolved to the axis its dim "
+        "is stored in at decode (per slot, with --face-slot-frames slot) and "
+        "to graphax's slot right before apply_compress, both through "
+        "masks.reduce_axis_spaces; the head's per-slot Reduce mask is that "
+        "same resolution. canonical = the pre-ticket read, kept only for "
+        "the flag-off bit-identity gate (ALPHAGRAD_EQ_DUMP). Published as "
+        "ALPHAGRAD_REDUCE_AXIS_SPACE for the Ray measure actors; every "
+        "plan-log record carries the value that measured it.",
+    )
+    p.add_argument(
         "--measure-toolchain-gate",
         choices=["abort", "warn", "off"],
         default="abort",
@@ -6039,7 +6057,8 @@ def main():
     # to os.environ so the measure actors, which build their own hooks in their
     # own processes, inherit the same setting.
     from alphagrad.approx.common.masks import (
-        set_diag_per_face, set_face_slot_frames, set_per_face_masks)
+        set_diag_per_face, set_face_slot_frames, set_per_face_masks,
+        set_reduce_axis_space)
     set_diag_per_face(
         bool(getattr(args, "diag_per_face", False)),
         rule=str(getattr(args, "diag_per_face_rule", "largest")),
@@ -6058,6 +6077,11 @@ def main():
         str(getattr(args, "face_slot_frames", "slot")) == "slot")
     print(f"[alphagrad] face decode frame (--face-slot-frames) = "
           f"{getattr(args, 'face_slot_frames', 'slot')}", flush=True)
+    # --reduce-axis-space (ticket .20), same discipline: the decode and the
+    # graphax-boundary conversion run inside the measure actors' processes.
+    set_reduce_axis_space(str(getattr(args, "reduce_axis_space", "physical")))
+    print(f"[alphagrad] reduce axis space (--reduce-axis-space) = "
+          f"{getattr(args, 'reduce_axis_space', 'physical')}", flush=True)
 
     # ``ALPHAGRAD_TRACEMALLOC=1`` — start the Python allocator tracker
     # before any model code runs. Per-episode snapshots are diffed

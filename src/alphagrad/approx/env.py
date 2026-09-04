@@ -1547,7 +1547,8 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
     try:
         from alphagrad.approx.common import plan_log as _plog
         from alphagrad.approx.common.masks import (
-            face_slot_frames_enabled as _face_slot_frames_enabled)
+            face_slot_frames_enabled as _face_slot_frames_enabled,
+            reduce_axis_space as _reduce_axis_space)
         rec = {
             "schema": _plog.SCHEMA,
             "pid": os.getpid(),
@@ -1576,6 +1577,11 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
                 "runtime_peak_bytes"),
             "mem_peak_source": (mem_parity or {}).get(
                 "peak_source", "not_measured"),
+            # WHICH coordinate space the Reduce axes were applied in
+            # (ticket .20): "physical" (wire token -> physical val axis at
+            # decode -> canonical slot at graphax) or "canonical" (the
+            # pre-ticket read). A replay must convert the same way.
+            "reduce_axis_space": _reduce_axis_space(),
         }
         rec.update(_plog.encode_wires(
             order, rule_specs, face_specs, face_skips,
@@ -1997,6 +2003,12 @@ class EnvState(NamedTuple):
     #                                out axes 0..out_len-1, then primal
     #                                axes out_len.. ) and `row[2]` indexes
     #                                :data:`COMPRESS_KINDS`.
+    #                                Ticket .20: under --face-slot-frames
+    #                                slot and --reduce-axis-space physical
+    #                                `row[1]` is the LOGICAL dim of the
+    #                                slot's tensor; masks.reduce_axis_spaces
+    #                                resolves it to the physical val axis
+    #                                at decode.
     #   row[0] == QUANT_SENTINEL:    QUANT with `row[1]` indexing
     #                                :data:`QUANT_DTYPES`. `row[2]` is
     #                                unused (kept at 0).
@@ -4507,7 +4519,8 @@ def make_slot_frame_hook(one_row, *, stats: dict | None = None,
     decoded rules for a tensor (tests, .59's apply-rate audit).
     """
     from alphagrad.approx.common.masks import (
-        face_counts_armed, make_live_masked_hook)
+        compress_rules_to_physical, face_counts_armed, make_live_masked_hook,
+        reduce_axes_physical, reduce_axis_spaces)
     from alphagrad.approx.common.plan_log import kind_of_slot
 
     row = tuple(int(x) for x in one_row)
@@ -4517,11 +4530,19 @@ def make_slot_frame_hook(one_row, *, stats: dict | None = None,
 
     def _decoded(st):
         out_shape, primal_shapes = slot_frame(st)
-        key = (out_shape, primal_shapes[0])
+        # --reduce-axis-space physical (ticket .20): the wire token is a
+        # LOGICAL dim of this slot's tensor; the rule handed to the hook
+        # names the PHYSICAL axis that dim is stored in, so the memo key
+        # carries the storage layout, not only the logical frame.
+        physical = kind == "compress" and reduce_axes_physical()
+        key = (out_shape, primal_shapes[0],
+               reduce_axis_spaces(st).phys_of_dim if physical else None)
         hit = cache.get(key)
         if hit is None:
             rules = decode_rule_specs_in_frame(out_shape, primal_shapes,
                                                spec_rows)
+            if physical and rules:
+                rules = compress_rules_to_physical(st, rules)
             inner = (make_live_masked_hook(rules, stats=stats, gated=gated)
                      if rules else None)
             hit = cache[key] = (rules, inner)
