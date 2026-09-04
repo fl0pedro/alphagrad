@@ -222,9 +222,7 @@ class UnifiedFacePolicy(eqx.Module):
             return x if x.ndim == rank + 1 else jnp.broadcast_to(
                 x, (S,) + x.shape)
 
-        sizes = (None if face_sizes_f is None
-                 else _rows_of(face_sizes_f, jnp.ndim(face_sizes_f)
-                               if jnp.ndim(face_sizes_f) == 1 else 1))
+        sizes = None if face_sizes_f is None else _rows_of(face_sizes_f, 1)
         ff = [self._face_feats_1(features,
                                  None if sizes is None else sizes[s])
               for s in range(S)]
