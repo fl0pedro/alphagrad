@@ -309,6 +309,12 @@ class CpuApproximationServer:
             self._maybe_clear_compile_caches()
             return out
         except Exception as exc:
+            # A broken link toolchain on this node is not a bad action: a
+            # sentinel here would let the run continue measuring nothing (or
+            # degraded executables) while exiting 0 -- finding 03. Escalate.
+            from alphagrad.approx.env import MeasureToolchainFault
+            if isinstance(exc, MeasureToolchainFault):
+                raise
             # graphax can raise on transforms that produce shape-incompatible
             # edges (e.g. a DIAG whose factor doesn't divide some primal axis,
             # or a COMPRESS in the middle of the elimination order). Killing
