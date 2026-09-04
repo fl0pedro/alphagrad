@@ -12,7 +12,7 @@ answered with numbers on the real measurement path:
      case the channel carries no signal and that is worth knowing FIRST.
   3. WHAT DOES IT REWARD? Sparsity is maximised by DELETING computation. The
      all-SKIP plan and the known gradient-freezing single-face skips are
-     measured HERE, with their coverage verdict beside them, so the failure
+     measured HERE, so the failure
      mode is a number in a table rather than a discovery six weeks into a
      campaign.
 
@@ -21,13 +21,10 @@ latency ratio: if they move together, sparsity adds nothing the cost channels
 do not already carry, and the honest recommendation is to log it, not train
 on it.
 
-THE GUARD IS DELIBERATELY OFF HERE (`--reject-frozen-grads` exports 0). With
-it on, a gradient-freezing plan is SENTINELLED before the sparsity block runs
-and the channel reads its floor -- which is correct in training and useless
-for this table. Coverage is still MEASURED, so slot 7 < 0 is exactly the
-verdict the guard would have delivered, and it is printed next to the
-sparsity the plan would otherwise have scored. THIS IS A DIAGNOSTIC
-CONFIGURATION AND NOT A TRAINING ONE.
+THE GRADIENT-COVERAGE GUARD WAS REMOVED 2026-09-03 (owner ruling 2026-09-03, ticket dsnn-3qm.15). Until then
+this probe disarmed it to see what sparsity would have paid the plans it
+refused; nothing refuses them now, so the sparsity column IS the verdict.
+THIS IS A DIAGNOSTIC CONFIGURATION AND NOT A TRAINING ONE.
 
 Measurement is the trainer's own ``env._callback`` on plans built by
 ``landscape_map``'s own builders -- there is no second implementation of
@@ -78,12 +75,9 @@ sys.argv = [sys.argv[0]] + _REST
 
 # Exported BEFORE landscape_map is imported, for the same reason it exports
 # its own: env.py reads these at import.
-# setdefault, not assignment: an A/B run that wants the channel or the
-# coverage measurement OFF sets it in the launcher and wins.
+# setdefault, not assignment: an A/B run that wants the channel OFF sets it
+# in the launcher and wins.
 os.environ.setdefault("ALPHAGRAD_SPARSITY", "1")
-# Coverage MEASURED, guard NOT armed -- see the module docstring.
-os.environ.setdefault("ALPHAGRAD_GRAD_COVERAGE", "1")
-os.environ.setdefault("ALPHAGRAD_REJECT_FROZEN_GRADS", "0")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
 
 import numpy as np                                            # noqa: E402
@@ -108,7 +102,7 @@ ROW_FIELDS = [
     # and bytes_accessed come from XLA cost analysis and are exactly
     # reproducible, so they are the honest thing to correlate against.
     "flops", "flops_ratio", "bytes_accessed", "bytes_ratio",
-    "quality", "grad_coverage", "coverage_verdict",
+    "quality",
     "applied", "skipped", "wall_s", "fallback_traces",
 ]
 
@@ -173,7 +167,6 @@ def main() -> int:
         sp = consume_sparsity_stats()
         st = consume_per_face_stats()
         last = sp.get("last") or {}
-        cov = float(r[REWARD_INDEX["grad_coverage"]])
         rows.append({
             "plan_id": plan_id, "op": op, "budget": budget,
             "n_faces_approx": int(plan.get("n_faces_approx", 0)),
@@ -194,11 +187,6 @@ def main() -> int:
             "bytes_accessed": float(-r[REWARD_INDEX["bytes_accessed"]]),
             "bytes_ratio": float("nan"),
             "quality": float(r[REWARD_INDEX["quality"]]),
-            "grad_coverage": cov,
-            # slot 7 < 0 encodes -frac_leaves_zeroed, i.e. EXACTLY the
-            # condition --reject-frozen-grads rejects on.
-            "coverage_verdict": ("WOULD BE REJECTED" if cov < 0.0
-                                 else "ok"),
             "applied": int(st.get("applied", 0)),
             "skipped": int(st.get("skipped", 0)),
             "wall_s": wall,
@@ -209,7 +197,6 @@ def main() -> int:
               f"cells={rows[-1]['sparsity_cells_ratio']:.6f} "
               f"chan={rows[-1]['sparsity_channel']:+.4f} "
               f"lat={rows[-1]['latency_ns']:.4g} "
-              f"cov={cov:+.4f} [{rows[-1]['coverage_verdict']}] "
               f"wall={wall:.1f}s", flush=True)
 
     # ---- ratios against the FIRST identity row, paired in-process ------
@@ -260,19 +247,13 @@ def main() -> int:
         print(f"identity stored ratio = {r['sparsity_ratio']!r} "
               f"(MUST be exactly 1.0), channel = {r['sparsity_channel']!r} "
               f"(MUST be exactly 0.0)")
-    worst = [r for r in rows if r["coverage_verdict"] != "ok"]
-    if worst:
+    if rows:
         best = max(rows, key=lambda r: (r["sparsity_channel"]
                                         if np.isfinite(r["sparsity_channel"])
                                         else -9))
         print(f"\nHIGHEST SPARSITY SCORE: {best['plan_id']} "
-              f"= {best['sparsity_channel']:+.4f} "
-              f"[coverage: {best['coverage_verdict']}]")
-        print("plans the coverage guard WOULD REJECT, and what sparsity "
-              "would have paid them:")
-        for r in worst:
-            print(f"  {r['plan_id']:22s} sparsity={r['sparsity_channel']:+.4f} "
-                  f"coverage={r['grad_coverage']:+.4f}")
+              f"= {best['sparsity_channel']:+.4f}  (nothing refuses it: the "
+              f"coverage guard was removed 2026-09-03)")
 
     if MINE.out:
         with open(MINE.out, "w", newline="") as fh:

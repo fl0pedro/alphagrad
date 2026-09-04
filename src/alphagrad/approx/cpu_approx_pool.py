@@ -76,7 +76,7 @@ def _sentinel_callback_output(
     sigma meaningless for every real plan measured afterwards.
 
     KNOWN INCONSISTENCY, deliberately left alone here: slot 7
-    (``frob_residual_idx``, now ``grad_coverage``) gets ``_SENTINEL_REWARD_VALUE``
+    (``frob_residual_idx``, reward slot 7, RESERVED since 2026-09-03) gets ``_SENTINEL_REWARD_VALUE``
     from THIS writer but ``-1.0`` from ``env._SENTINEL_BAD_REWARD``, and it is
     also bounded [-1, 1]. Changing it would change the value of an existing
     live channel, which is not this workstream's to change; it is recorded so

@@ -260,6 +260,8 @@ Three things about it are deliberate:
   one. That case is detected **by name** and reported as **exit 2, HARNESS
   MISCONFIGURED**, distinct from **exit 1, MEASUREMENT DEAD**. Both are
   failures — a skip is a failure — but they call for opposite responses.
+* *(2026-09-03: the guard described in the next bullet was removed — owner ruling 2026-09-03, ticket dsnn-3qm.15;
+  the gate no longer passes the flag.)*
 * **It passes `--no-reject-frozen-grads`.** The frozen-gradient guard is
   default ON and right to be, but it returns early with `_SENTINEL_BAD_REWARD`
   *before* the cost channels are measured. At episode 0 an untrained face

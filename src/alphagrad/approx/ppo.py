@@ -79,8 +79,6 @@ from alphagrad.approx.env import (
     quality_metric as _env_quality_metric,
     _AXIS_FEAT_GROUP_ID,
     consume_degenerate_plan_count,
-    consume_frozen_grad_plan_count,
-    consume_grad_coverage_stats,
     consume_fidelity_stats,
     consume_sparsity_stats,
     consume_truncated_plan_count,
@@ -351,26 +349,21 @@ NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
 # `_popart_rescale_heads` and `Agent.encode`'s concatenation.
 VALUE_HEAD_ATTRS: tuple[str, ...] = (
     "value_head_flops", "value_head_mem", "value_head_cos")
-# --grad-coverage-weight > 0 APPENDS a FOURTH head on reward slot 7
-# (``grad_coverage``); `configure_grad_coverage` rebinds the four names above
-# before the agent is built and before any jit trace, exactly as
-# `configure_symlog` rebinds the symlog mask. Default 0 => three heads and a
-# bit-identical agent pytree (pinned by tests/grad_coverage_test.py).
-GRAD_COVERAGE_HEAD = "value_head_gcov"
 # --fidelity-weight > 0 APPENDS a head on reward slot 8 (``fidelity``, the
 # CLIPPED RELATIVE FROBENIUS -- workstream A2, the owner's trained fidelity
-# signal). Same mechanism, same discipline as the coverage head above: default
-# 0 => the head is not constructed, contributes no pytree leaves, and every
-# saved checkpoint keeps loading. INDICES ARE ONLY EVER APPENDED, never
-# inserted, because persisted PopArt state is keyed by index.
+# signal). `configure_fidelity` rebinds the names above before the agent is
+# built and before any jit trace, exactly as `configure_symlog` rebinds the
+# symlog mask. Default 0 => the head is not constructed, contributes no pytree
+# leaves, and every saved checkpoint keeps loading. INDICES ARE ONLY EVER
+# APPENDED, never inserted, because persisted PopArt state is keyed by index.
+# (A fourth head on reward slot 7, gradient coverage, existed 2026-08-27 to
+# 2026-09-03 and was removed by owner ruling, ticket dsnn-3qm.15.)
 FIDELITY_HEAD = "value_head_fid"
 # --sparsity-weight > 0 APPENDS a head on reward slot 10 (``sparsity``,
 # the stored-byte ratio against the exact plan on the same order). Same
-# mechanism and same discipline as the two heads above: default 0 => the
+# mechanism and same discipline as the fidelity head above: default 0 => the
 # head is not constructed, contributes no pytree leaves, and every saved
-# checkpoint keeps loading. INDICES ARE ONLY EVER APPENDED. Unlike the
-# other two this head also requires --reject-frozen-grads; see
-# `configure_sparsity` for why that is refused rather than warned about.
+# checkpoint keeps loading. INDICES ARE ONLY EVER APPENDED.
 SPARSITY_HEAD = "value_head_spars"
 # Resolved from --quality-metric in `main`; names the quantity reward slot 6
 # actually holds, for every human-readable log line and the wandb
@@ -379,63 +372,27 @@ _QUALITY_METRIC: str = "quality"
 HEAD_NAMES: tuple[str, ...] = ("latency", "mem", "quality")
 
 
-def configure_grad_coverage(args) -> tuple[bool, float]:
-    """Install the gradient-coverage configuration. PRE-EVERYTHING.
+def configure_fidelity(args) -> tuple[float, int]:
+    """Install the fidelity-channel configuration. PRE-EVERYTHING.
 
     Must run BEFORE ``ray.init`` (the measure actors read the exported
-    environment), BEFORE ``_build_agent`` (the fourth value head changes the
+    environment), BEFORE ``_build_agent`` (an extra value head changes the
     agent pytree and ``pref_proj``'s input width) and BEFORE the first jit
-    trace (``_HEAD_REWARD_INDICES_ARR`` is captured as a constant).
-
-    Returns ``(guard_on, weight)``.
+    trace (``_HEAD_REWARD_INDICES_ARR`` is captured as a constant). The
+    appended head order is deterministic: [latency, mem, quality, (fidelity),
+    (sparsity)].
 
     WHY ENV VARS AND NOT ARGS. Measurement happens in the Ray measure actors
     (``--ray-measure``), which are separate processes that never see
     ``args``. Every other measurement switch in this project travels the same
-    way (ALPHAGRAD_DIRECT_MEASURE, ALPHAGRAD_MEASURE_WARMUP, ...), and env.py
-    deliberately defaults the whole feature OFF when the variables are absent
-    so that a job launched before this commit cannot pick the guard up from a
-    respawned actor.
-    """
-    global HEAD_REWARD_INDICES, NUM_VALUE_HEADS, HEAD_NAMES
-    global VALUE_HEAD_ATTRS, _HEAD_REWARD_INDICES_ARR
-    guard = bool(getattr(args, "reject_frozen_grads", False))
-    weight = float(getattr(args, "grad_coverage_weight", 0.0) or 0.0)
-    os.environ["ALPHAGRAD_REJECT_FROZEN_GRADS"] = "1" if guard else "0"
-    os.environ["ALPHAGRAD_GRAD_COVERAGE_WEIGHT"] = repr(weight)
-    if weight != 0.0 and GRAD_COVERAGE_HEAD not in VALUE_HEAD_ATTRS:
-        # IDEMPOTENT: main() calls this once, but a test (or a caller that
-        # re-parses args) must not append the head twice.
-        HEAD_REWARD_INDICES = tuple(HEAD_REWARD_INDICES) + (
-            int(REWARD_INDEX["grad_coverage"]),)
-        HEAD_NAMES = tuple(HEAD_NAMES) + ("grad_cov",)
-        VALUE_HEAD_ATTRS = tuple(VALUE_HEAD_ATTRS) + (GRAD_COVERAGE_HEAD,)
-        NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
-        _HEAD_REWARD_INDICES_ARR = jnp.asarray(
-            HEAD_REWARD_INDICES, dtype=jnp.int32)
-    return guard, weight
-
-
-def configure_fidelity(args) -> tuple[float, int]:
-    """Install the fidelity-channel configuration. PRE-EVERYTHING.
-
-    Same contract and the same three "before"s as
-    :func:`configure_grad_coverage` -- before ``ray.init`` (the measure actors
-    read the exported environment), before ``_build_agent`` (an extra value
-    head changes the agent pytree and ``pref_proj``'s input width) and before
-    the first jit trace (``_HEAD_REWARD_INDICES_ARR`` is captured as a
-    constant). CALL IT AFTER ``configure_grad_coverage`` so the appended head
-    order is deterministic: [latency, mem, quality, (grad_cov), (fidelity)].
+    way, and env.py defaults the channel OFF when the variables are absent.
 
     Returns ``(weight, cos_log_every)``.
 
     WHAT IT COSTS. The fidelity channel needs the EXACT Jacobian, which the
-    ``loss_drop`` quality metric never builds (the default ``grad_cosine``
-    does, and env.py folds the residual into that execution). With
-    ``--reject-frozen-grads`` on (the default) that reference is being
-    materialised anyway for the coverage guard and env.py folds both scores
-    into the one execution; with the guard OFF, turning this on buys a full
-    exact reference per plan. The measured price is published every episode as
+    ``loss_drop`` quality metric never builds: turning this on buys one
+    exact reference per terminal plan unless the quality metric is a cosine
+    (the default ``grad_cosine`` builds it anyway). The measured price is published every episode as
     ``fidelity/wall_amortised_s``.
     """
     global HEAD_REWARD_INDICES, NUM_VALUE_HEADS, HEAD_NAMES
@@ -445,8 +402,8 @@ def configure_fidelity(args) -> tuple[float, int]:
     os.environ["ALPHAGRAD_FIDELITY_WEIGHT"] = repr(weight)
     os.environ["ALPHAGRAD_COS_LOG_EVERY"] = str(max(0, cos_every))
     if weight != 0.0 and FIDELITY_HEAD not in VALUE_HEAD_ATTRS:
-        # IDEMPOTENT, like the coverage twin: a caller that re-parses args
-        # must not append the head twice.
+        # IDEMPOTENT: a caller that re-parses args must not append the head
+        # twice.
         HEAD_REWARD_INDICES = tuple(HEAD_REWARD_INDICES) + (
             int(REWARD_INDEX["fidelity"]),)
         HEAD_NAMES = tuple(HEAD_NAMES) + ("fidelity",)
@@ -466,22 +423,23 @@ def configure_sparsity(args) -> float:
     ``pref_proj``'s input width) and before the first jit trace
     (``_HEAD_REWARD_INDICES_ARR`` is captured as a constant). CALL IT AFTER
     ``configure_fidelity`` so the appended head order stays deterministic:
-    [latency, mem, quality, (grad_cov), (fidelity), (sparsity)].
+    [latency, mem, quality, (fidelity), (sparsity)].
 
     Returns the weight.
 
-    THE GUARD IS A HARD PRECONDITION, not advice. Sparsity rewards storing
-    less, an all-SKIP plan stores nothing, and the confirmed TLM reward hack --
-    one skipped face that deletes 62-73% of the backward pass and freezes 11-15
-    of 16 parameter leaves, priced at 0.02% by the 200-step quality probe --
-    scores near the ceiling. `--reject-frozen-grads` is the only thing in the
-    system that refuses that plan, so training this channel with the guard off
-    is asking for the hack directly. Refused here rather than warned about,
-    because the failure is silent and takes a campaign to detect.
+    NO GUARD PRECONDITION (owner ruling 2026-09-03, ticket dsnn-3qm.15). Until
+    then a non-zero weight was REFUSED without ``--reject-frozen-grads``, the
+    gradient-coverage guard. That guard is gone -- no guard, never a reward
+    gate -- so nothing refuses the confirmed TLM reward hack (one skipped face
+    that deletes 62-73% of the backward pass and freezes 11-15 of 16 parameter
+    leaves, priced at 0.02% by the 200-step quality probe) and it scores near
+    this channel's ceiling. READ env._SPARSITY_STATS' hackability warning
+    before putting a weight here; the channel stays default OFF.
 
     WHAT IT COSTS. The tally is taken while `jacve` is TRACED and emits no HLO.
     The approx side rides the compile every plan already pays; the exact side
-    rides the reference `--reject-frozen-grads` already materialises. Where the
+    rides the reference the fidelity channel or a cosine quality metric
+    materialises. Where the
     compile cache serves an executable without tracing, env.py falls back to an
     abstract `jax.eval_shape` walk -- a trace, never a compile or an execution.
     The measured price is published every episode as
@@ -491,21 +449,13 @@ def configure_sparsity(args) -> float:
     global VALUE_HEAD_ATTRS, _HEAD_REWARD_INDICES_ARR
     weight = float(getattr(args, "sparsity_weight", 0.0) or 0.0)
     log_only = bool(getattr(args, "sparsity_log", False))
-    if weight != 0.0 and not bool(getattr(args, "reject_frozen_grads", False)):
-        raise ValueError(
-            "--sparsity-weight/--lambda-sparsity requires the gradient-"
-            "coverage guard: sparsity is maximised by DELETING computation "
-            "(an all-SKIP plan stores nothing and scores the +1 ceiling), and "
-            "--reject-frozen-grads is the only thing that refuses a plan which "
-            "freezes a trainable leaf. Drop --no-reject-frozen-grads, or use "
-            "--sparsity-log to record the channel without training on it.")
     os.environ["ALPHAGRAD_SPARSITY_WEIGHT"] = repr(weight)
     # Set EXPLICITLY in both directions: a measure actor respawned inside a
     # long job must never inherit a stale "on" from an earlier configuration.
     os.environ["ALPHAGRAD_SPARSITY"] = (
         "1" if (weight != 0.0 or log_only) else "0")
     if weight != 0.0 and SPARSITY_HEAD not in VALUE_HEAD_ATTRS:
-        # IDEMPOTENT, like both twins above.
+        # IDEMPOTENT, like configure_fidelity.
         HEAD_REWARD_INDICES = tuple(HEAD_REWARD_INDICES) + (
             int(REWARD_INDEX["sparsity"]),)
         HEAD_NAMES = tuple(HEAD_NAMES) + ("sparsity",)
@@ -524,8 +474,7 @@ def configure_sparsity(args) -> float:
 # rest, and until now the rest was thrown away at the end of every episode.
 # ``--plan-log`` turns on one APPEND-ONLY JSONL per run holding, for EVERY
 # terminal plan: the replayable wire, all 11 reward slots, the per-kind
-# requested / applied / idempotent-no-op counts, the per-leaf coverage census
-# and the episode.
+# requested / applied / idempotent-no-op counts and the episode.
 #
 # THIS IS A LOGGING EXTENSION AND NOTHING ELSE. It reads state that is
 # already materialised, adds no reward, no action, no head, no exact
@@ -567,8 +516,6 @@ def configure_plan_log(args) -> str | None:
         int(getattr(args, "plan_log_cap", 4096) or 4096))
     os.environ["ALPHAGRAD_PLAN_LOG_MAX_FACES"] = str(
         int(getattr(args, "plan_log_max_faces", 0) or 0))
-    os.environ["ALPHAGRAD_PLAN_LOG_MAX_LEAVES"] = str(
-        int(getattr(args, "plan_log_max_leaves", 0) or 0))
     _PLAN_LOG_PATH = str(path)
     return _PLAN_LOG_PATH
 
@@ -849,24 +796,19 @@ def configure_symlog(args) -> str:
     """
     mode = resolve_symlog_channels(args)
     _NO_SYMLOG_ALL[0] = (mode == "none")
-    # GRADIENT COVERAGE is bounded [-1, 1] by construction (env.py's
-    # `_grad_coverage`: +min_leaf_ratio, or -frac_leaves_zeroed), so it needs
-    # no magnitude compression and symlog would only discount its per-unit
-    # price against the cost channels. Exempt it whenever the channel is live,
-    # in EVERY mode -- the same carve-out `cost` gives the quality slot. When
-    # the channel is off the slot is 0.0 and symlog(0) == 0, so adding the
-    # index would be a no-op anyway; it is added conditionally only to keep
-    # the flag-off mask bit-identical to HEAD.
     _exempt: tuple[int, ...] = ()
     if mode == "cost":
         _exempt = (int(REWARD_INDEX["cosine_sim"]),)
     elif mode == "all" and getattr(args, "reward_mode", None) == "lagrangian":
         _exempt = (int(REWARD_INDEX["cosine_sim"]),)
-    if float(getattr(args, "grad_coverage_weight", 0.0) or 0.0) != 0.0:
-        _exempt = _exempt + (int(REWARD_INDEX["grad_coverage"]),)
-    # FIDELITY is bounded [-1, 1] by construction too (env.py's
-    # `clipped_rel_frob`), for exactly the same reason and with exactly the
-    # same conditional-so-the-flag-off-mask-is-bit-identical caveat.
+    # FIDELITY is bounded [-1, 1] by construction (env.py's
+    # `clipped_rel_frob`), so it needs no magnitude compression and symlog
+    # would only discount its per-unit price against the cost channels.
+    # Exempt it whenever the channel is live, in EVERY mode -- the same
+    # carve-out `cost` gives the quality slot. When the channel is off the
+    # slot is 0.0 and symlog(0) == 0, so adding the index would be a no-op
+    # anyway; it is added conditionally only to keep the flag-off mask
+    # bit-identical to HEAD.
     if float(getattr(args, "fidelity_weight", 0.0) or 0.0) != 0.0:
         _exempt = _exempt + (int(REWARD_INDEX["fidelity"]),)
     # SPARSITY is bounded [-1, 1] by construction too (env.py's
@@ -2163,13 +2105,10 @@ class Agent(eqx.Module):
     value_head_flops: MLP
     value_head_mem: MLP
     value_head_cos: MLP
-    # FOURTH value head, reward slot 7 (``grad_coverage``). ``None`` unless
-    # --grad-coverage-weight != 0. A ``None`` field contributes NO leaves to
-    # the pytree, so the flag-off agent is leaf-for-leaf what HEAD builds and
-    # every saved checkpoint keeps loading.
-    value_head_gcov: MLP | None
     # Value head for reward slot 8 (``fidelity``). ``None`` unless
-    # --fidelity-weight != 0; a ``None`` field contributes NO leaves.
+    # --fidelity-weight != 0. A ``None`` field contributes NO leaves to the
+    # pytree, so the flag-off agent is leaf-for-leaf what HEAD builds and
+    # every saved checkpoint keeps loading.
     value_head_fid: MLP | None
     # Value head for reward slot 10 (``sparsity``). ``None`` unless
     # --sparsity-weight != 0; a ``None`` field contributes NO leaves.
@@ -2215,7 +2154,6 @@ class Agent(eqx.Module):
         micro_action_policy=None,
         max_substeps=16,
         face_path_policy=None,
-        value_head_gcov=None,
         value_head_fid=None,
         value_head_spars=None,
     ):
@@ -2229,7 +2167,6 @@ class Agent(eqx.Module):
         self.value_head_flops = value_head_flops
         self.value_head_mem = value_head_mem
         self.value_head_cos = value_head_cos
-        self.value_head_gcov = value_head_gcov
         self.value_head_fid = value_head_fid
         self.value_head_spars = value_head_spars
         self.op_embedding = op_embedding
@@ -2287,8 +2224,6 @@ class Agent(eqx.Module):
         v_mem = self.value_head_mem(summary)
         v_cos = self.value_head_cos(summary)
         _vs = [v_flops, v_mem, v_cos]
-        if self.value_head_gcov is not None:
-            _vs.append(self.value_head_gcov(summary))
         if self.value_head_fid is not None:
             _vs.append(self.value_head_fid(summary))
         if self.value_head_spars is not None:
@@ -2772,8 +2707,6 @@ class Agent(eqx.Module):
         v_mem = self.value_head_mem(summary)
         v_cos = self.value_head_cos(summary)
         _vs = [v_flops, v_mem, v_cos]
-        if self.value_head_gcov is not None:
-            _vs.append(self.value_head_gcov(summary))
         if self.value_head_fid is not None:
             _vs.append(self.value_head_fid(summary))
         if self.value_head_spars is not None:
@@ -4082,10 +4015,9 @@ def make_argparser() -> argparse.ArgumentParser:
              "slot reads 0.0, no head is constructed, and the agent pytree is "
              "leaf-for-leaf what it was. Non-zero APPENDS a value head and "
              "exports ALPHAGRAD_FIDELITY_WEIGHT to the measure actors. COST: "
-             "the channel needs the exact Jacobian; with --reject-frozen-grads "
-             "on (default) it shares the reference that guard already builds "
-             "and costs only the per-leaf reductions, with the guard off it "
-             "pays a full exact reference per plan. Measured price is logged "
+             "the channel needs the exact Jacobian; unless the quality metric "
+             "is a cosine (which builds it anyway) it pays a full exact "
+             "reference per terminal plan. Measured price is logged "
              "as fidelity/wall_amortised_s.")
     p.add_argument(
         "--cos-log-every", type=int, default=0,
@@ -4095,8 +4027,8 @@ def make_argparser() -> argparse.ArgumentParser:
              "per plan versus loss_drop's 0.22 s / 40 MB -- 44x -- so it is "
              "subsampled rather than computed per plan. NOTE this stride only "
              "FORCES a reference nothing else asked for: whenever one is "
-             "materialised anyway (--fidelity-weight, --reject-frozen-grads, "
-             "or --quality-metric cosine) the cosine is one extra per-leaf dot "
+             "materialised anyway (--fidelity-weight or --quality-metric "
+             "cosine) the cosine is one extra per-leaf dot "
              "product on resident leaves and is taken on every such plan. "
              "Exports ALPHAGRAD_COS_LOG_EVERY.")
     # ---- SPARSITY, reward slot 10 ---------------------------------
@@ -4109,16 +4041,15 @@ def make_argparser() -> argparse.ArgumentParser:
              "order, where +1 means the plan stores nothing, 0 means it "
              "stores exactly what the exact plan stores (the identity "
              "plan, exactly) and -1 means it densified. DEFAULT 0 = "
-             "channel OFF and not measured. REQUIRES "
-             "--reject-frozen-grads (the default) and is REFUSED without "
-             "it: sparsity is maximised by DELETING computation, so an "
-             "all-SKIP plan scores the ceiling and so does the confirmed "
+             "channel OFF and not measured. THE MOST HACKABLE CHANNEL ON "
+             "THE BOARD: sparsity is maximised by DELETING computation, so "
+             "an all-SKIP plan scores the ceiling and so does the confirmed "
              "TLM hack of skipping one face -- 62-73%% of the backward "
              "pass gone, 11-15 of 16 leaves frozen, priced at 0.02%% by "
-             "the quality probe. The coverage guard is the only thing "
-             "that refuses those plans. Use --sparsity-log to record the "
-             "channel without training on it. Exports "
-             "ALPHAGRAD_SPARSITY_WEIGHT.")
+             "the quality probe. Nothing refuses those plans (the "
+             "gradient-coverage guard was removed 2026-09-03). Use "
+             "--sparsity-log to record the channel without training on "
+             "it. Exports ALPHAGRAD_SPARSITY_WEIGHT.")
     p.add_argument(
         "--sparsity-log", action=argparse.BooleanOptionalAction,
         default=False,
@@ -4135,8 +4066,8 @@ def make_argparser() -> argparse.ArgumentParser:
              "record per measured plan: the replayable wire (order + "
              "per-vertex rule rows + per-face rows/skips, verbatim as "
              "jacve consumed them), all 11 reward slots, the per-kind "
-             "requested/applied/idempotent-no-op counts, the per-leaf "
-             "gradient-coverage census and the episode. PATH, or \"auto\" "
+             "requested/applied/idempotent-no-op counts and the episode. "
+             "PATH, or \"auto\" "
              "for <wandb-run-dir>/plan_log_<name>.jsonl. This is X3's only "
              "input: the losers are what a regression is attributed "
              "against. PURE LOGGING -- no reward, no action, no head, no "
@@ -4162,40 +4093,11 @@ def make_argparser() -> argparse.ArgumentParser:
              "than replaying a different plan under this plan's name (the "
              "907c231 failure). Use only to bound disk on a fully dense "
              "face plan.")
-    p.add_argument(
-        "--plan-log-max-leaves", type=int, default=0, metavar="N",
-        help="Cap on per-leaf coverage entries (norms/ratios) written per "
-             "record. 0 (default) = all. The summary fields "
-             "(frac_leaves_zeroed, min_leaf_ratio, n_counted, n_zeroed) are "
-             "never capped, and leaves_elided counts what a cap dropped.")
     p.add_argument("--gate-tau", type=float, default=0.5,
                    help="mult mode: cosine gate threshold tau (g=0 below it).")
     p.add_argument("--gate-w", type=float, default=40.0,
                    help="mult mode: cheapness budget W in symlog-cost units "
                    "(cheapness = max(0, W - sum w_c*symlog(cost_c))).")
-    # ---- GRADIENT COVERAGE (docs/UNBIASED_PARETO_AND_MEASUREMENT.md sec 10)
-    p.add_argument(
-        "--reject-frozen-grads", action=argparse.BooleanOptionalAction,
-        default=True,
-        help="HARD GUARD, DEFAULT ON. Measure per-leaf gradient coverage of "
-        "every terminal plan and REJECT (sentinel, advantage 0, never "
-        "ranked) any plan that leaves a trainable leaf with an exactly zero "
-        "gradient where the same order done exactly gives a non-zero one. "
-        "Closes the confirmed TLM reward hack: one skipped face removes "
-        "62-73%% of the backward pass and freezes 11-15 of 16 parameter "
-        "leaves, and the 200-step quality probe prices that at 0.02%% "
-        "(0.9258 vs 0.9260) at every horizon tested. Rejections are counted "
-        "on grad_cov/rejected_this_ep and printed, never silently dropped. "
-        "Exports ALPHAGRAD_REJECT_FROZEN_GRADS to the measure actors.")
-    p.add_argument(
-        "--grad-coverage-weight", type=float, default=0.0, metavar="W",
-        help="REWARD CHANNEL, default 0 = off. Adds gradient coverage as a "
-        "fourth value head on reward slot 7, weight W: the additive "
-        "composition becomes lambda_cmp*symlog(lat) + lambda_mem*symlog(mem) "
-        "+ lambda_acc*q + W*coverage. The channel is +min_leaf_ratio when "
-        "nothing is frozen and -frac_leaves_zeroed when something is, so it "
-        "is bounded [-1,1] and is NEVER symlogged (composes with "
-        "--symlog-channels cost). W != 0 also turns the measurement on.")
     p.add_argument("--anti-degen-penalty", type=float, default=2.0,
                    help="mult mode: penalty floor P for degenerate terminals "
                    "(shaped ramp -P -> -P*(1-tau_d) over cos in [0, tau_d]).")
@@ -5383,18 +5285,11 @@ def _build_agent(
     value_head_flops = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[4])
     value_head_mem = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[5])
     value_head_cos = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[12])
-    # GRAD-COVERAGE value head. Its key is FOLDED IN from keys[12] rather than
+    # FIDELITY value head. Its key is FOLDED IN from keys[12] rather than
     # taken from a widened `jrand.split`: widening the split would move every
     # positional key and change the randomness of every seeded run, flag off
-    # included. Built only when the channel is live.
-    value_head_gcov = None
-    if GRAD_COVERAGE_HEAD in VALUE_HEAD_ATTRS:
-        value_head_gcov = MLP(args.embd_dim, 1, value_dims,
-                              key=jrand.fold_in(encoder_keys[12], 7))
-    # FIDELITY value head. Key FOLDED IN from keys[12] with a different tag
-    # than the coverage head's, for the same reason: widening the `jrand.split`
-    # would move every positional key and change the randomness of every seeded
-    # run, flag off included.
+    # included. Built only when the channel is live. (Tag 7 was the removed
+    # coverage head's; tag 8 stays, so a fidelity checkpoint keeps its keys.)
     value_head_fid = None
     if FIDELITY_HEAD in VALUE_HEAD_ATTRS:
         value_head_fid = MLP(args.embd_dim, 1, value_dims,
@@ -5490,7 +5385,6 @@ def _build_agent(
         value_head_flops=value_head_flops,
         value_head_mem=value_head_mem,
         value_head_cos=value_head_cos,
-        value_head_gcov=value_head_gcov,
         value_head_fid=value_head_fid,
         value_head_spars=value_head_spars,
         op_embedding=op_embedding,
@@ -5826,16 +5720,11 @@ def _build_head_weights(args) -> np.ndarray:
         weights[1] = args.lambda_mem
     if "acc" in args.rewards:
         weights[2] = args.lambda_acc
-    # --grad-coverage-weight W. The additive composition becomes
+    # --fidelity-weight W. The additive composition becomes
     #   lambda_cmp*symlog(lat) + lambda_mem*symlog(mem) + lambda_acc*q
-    #     + W*grad_coverage
-    # with grad_coverage RAW (see configure_symlog: never symlogged). The
+    #     + W*fidelity
+    # with fidelity RAW (see configure_symlog: bounded, never symlogged). The
     # head exists only when W != 0, so this index is in range exactly then.
-    if GRAD_COVERAGE_HEAD in VALUE_HEAD_ATTRS:
-        weights[HEAD_NAMES.index("grad_cov")] = np.float32(
-            getattr(args, "grad_coverage_weight", 0.0) or 0.0)
-    # --fidelity-weight W adds ``+ W*fidelity``, RAW (see configure_symlog:
-    # bounded, never symlogged). The head exists only when W != 0.
     if FIDELITY_HEAD in VALUE_HEAD_ATTRS:
         weights[HEAD_NAMES.index("fidelity")] = np.float32(
             getattr(args, "fidelity_weight", 0.0) or 0.0)
@@ -6088,27 +5977,16 @@ def main():
     # no-op; other variants overwrite those three flags. Explicit CLI values
     # passed alongside --variant are clobbered — pick `custom` if you want
     # to mix-and-match.
-    # GRADIENT COVERAGE: before ray.init (the measure actors read the
-    # exported env), before _build_agent (the 4th value head changes the
+    # FIDELITY (reward slot 8): before ray.init (the measure actors read the
+    # exported env), before _build_agent (an appended value head changes the
     # pytree) and before the first jit trace.
-    _gc_guard, _gc_weight = configure_grad_coverage(args)
-    print(f"[cfg] grad coverage: guard={'ON' if _gc_guard else 'OFF'} "
-          f"(--reject-frozen-grads) reward_weight={_gc_weight:g} "
-          f"heads={NUM_VALUE_HEADS} ({', '.join(HEAD_NAMES)})", flush=True)
-    # FIDELITY (reward slot 8) -- must follow configure_grad_coverage so the
-    # appended head order is deterministic, and must precede _build_agent /
-    # configure_symlog / the first trace for the same three reasons.
     _fid_weight, _cos_every = configure_fidelity(args)
     if _fid_weight != 0.0 or _cos_every:
         os.environ.setdefault("ALPHAGRAD_FIDELITY",
                               "1" if _fid_weight != 0.0 else "0")
     print(f"[cfg] fidelity (clipped rel-Frobenius, slot 8): "
           f"weight={_fid_weight:g} cos_log_every={_cos_every} "
-          f"heads={NUM_VALUE_HEADS} ({', '.join(HEAD_NAMES)})"
-          + ("" if (_fid_weight == 0.0 or _gc_guard) else
-             "  [NOTE: --reject-frozen-grads is OFF, so this channel pays a "
-             "FULL exact Jacobian reference per plan instead of sharing the "
-             "guard's]"), flush=True)
+          f"heads={NUM_VALUE_HEADS} ({', '.join(HEAD_NAMES)})", flush=True)
 
     # SPARSITY (reward slot 10) -- after configure_fidelity so the
     # appended head order is deterministic, before _build_agent /
@@ -6120,8 +5998,8 @@ def main():
               f"heads={NUM_VALUE_HEADS} ({', '.join(HEAD_NAMES)})"
               + ("  [LOGGED, NOT TRAINED]" if _spars_weight == 0.0
                  else "  [TRAINED -- an all-SKIP plan scores the +1 "
-                      "ceiling; --reject-frozen-grads is what refuses "
-                      "it]"), flush=True)
+                      "ceiling and NOTHING refuses it; read the "
+                      "hackability warning]"), flush=True)
 
     # A6 PLAN LOG -- before ray.init so the measure actors inherit
     # ALPHAGRAD_PLAN_LOG. Independent of the three configure_* calls above:
@@ -6132,8 +6010,7 @@ def main():
         print(f"[cfg] plan log: ON -> {_plan_log_cfg} "
               f"(every TERMINAL plan, losers included; cap="
               f"{getattr(args, 'plan_log_cap', 4096)} "
-              f"max_faces={getattr(args, 'plan_log_max_faces', 0) or 'all'} "
-              f"max_leaves={getattr(args, 'plan_log_max_leaves', 0) or 'all'})",
+              f"max_faces={getattr(args, 'plan_log_max_faces', 0) or 'all'})",
               flush=True)
 
     _apply_variant_preset(args)
@@ -11251,18 +11128,6 @@ def main():
                 _j = REWARD_INDEX.get(_nm)
                 if _j is not None and all_rets.shape[1] > _j:
                     _pl[_nm] = all_rets[:, _j].astype(np.float64)
-            # PER-PLAN GRADIENT COVERAGE. Reward slot 7 carries BOTH numbers
-            # in one float (env.py `_grad_coverage`): positive => nothing
-            # frozen and the value IS min_leaf_ratio; non-positive => the
-            # magnitude IS frac_leaves_zeroed and min_leaf_ratio is 0 by
-            # construction. Decoded here into the two keys the joint record
-            # is supposed to carry. The -1e10 pool-timeout sentinel is
-            # clipped out so it cannot own the panel's y-range.
-            _jg = REWARD_INDEX.get("grad_coverage")
-            if _jg is not None and all_rets.shape[1] > _jg:
-                _gc = np.clip(all_rets[:, _jg].astype(np.float64), -1.0, 1.0)
-                _pl["grad_cov_min_leaf_ratio"] = np.maximum(_gc, 0.0)
-                _pl["grad_cov_frac_zeroed"] = np.maximum(-_gc, 0.0)
             for _k, _v in _pl.items():
                 _v = np.asarray(_v)
                 for _i in range(_v.shape[0]):
@@ -11378,44 +11243,6 @@ def main():
             log_dict["plan_log/wall_s"] = float(
                 _prof_time.perf_counter() - _plog_t0)
 
-        # ---- GRADIENT COVERAGE census --------------------------------------
-        # THE ANTI-BUG-(c) REQUIREMENT. A rejected plan is excluded from the
-        # gradient, and docs sec 7(c) is the record of what happens when that
-        # is done SILENTLY: the res-slot plans were eaten for a whole campaign
-        # with no counter anywhere. Every rejection lands here, every episode,
-        # whether or not wandb is on.
-        try:
-            _gcs = consume_grad_coverage_stats()
-            _gc_rej = consume_frozen_grad_plan_count()
-            log_dict["grad_cov/rejected_this_ep"] = int(_gc_rej)
-            log_dict["grad_cov/measured_this_ep"] = int(_gcs["count"])
-            log_dict["grad_cov/undefined_this_ep"] = int(_gcs["undefined"])
-            if _gcs["count"]:
-                log_dict["grad_cov/min_leaf_ratio"] = float(
-                    _gcs["mean_min_leaf_ratio"])
-                log_dict["grad_cov/min_leaf_ratio_worst"] = float(
-                    _gcs["min_min_leaf_ratio"])
-                log_dict["grad_cov/frac_zeroed"] = float(
-                    _gcs["mean_frac_zeroed"])
-                log_dict["grad_cov/frac_zeroed_worst"] = float(
-                    _gcs["max_frac_zeroed"])
-                log_dict["grad_cov/wall_frac"] = float(_gcs["wall_frac"])
-                log_dict["grad_cov/wall_s"] = float(_gcs["wall_s"])
-            if _gc_rej or _gcs["count"]:
-                print(f"[grad-cov ep{ep}] measured={int(_gcs['count'])} "
-                      f"rejected={int(_gc_rej)} "
-                      f"undefined={int(_gcs['undefined'])} "
-                      f"min_leaf_ratio(mean/worst)="
-                      f"{_gcs['mean_min_leaf_ratio']:.4g}/"
-                      f"{_gcs['min_min_leaf_ratio']:.4g} "
-                      f"frac_zeroed(mean/worst)="
-                      f"{_gcs['mean_frac_zeroed']:.4g}/"
-                      f"{_gcs['max_frac_zeroed']:.4g} "
-                      f"added_wall={100.0 * _gcs['wall_frac']:.2f}%",
-                      flush=True)
-        except Exception:
-            pass
-
         # ---- SPARSITY (stored bytes vs the exact plan) ---------------------
         # `sparsity/ratio_mean` is the number the owner asked for: how much
         # less the approximated elimination stores than the exact one, 1.0
@@ -11465,7 +11292,7 @@ def main():
         # `fidelity/wall_amortised_s` is the honest per-plan price of the exact
         # reference this channel (and the cosine log) needs -- the number the
         # --cos-log-every stride exists to control. It is near zero when the
-        # coverage guard was already paying for that reference.
+        # quality metric was already paying for that reference.
         try:
             _fs = consume_fidelity_stats()
             if _fs["count"] or _fs["cos_count"]:
@@ -11849,13 +11676,6 @@ def main():
                 _parts.append("applied~ " + _fmt(_ae))
             if _sk.size:
                 _parts.append(f"skips={int(_sk.sum())}")
-            _gcm = np.asarray(_pr.get("grad_cov_min_leaf_ratio", []),
-                              np.float64)
-            _gcz = np.asarray(_pr.get("grad_cov_frac_zeroed", []), np.float64)
-            if _gcm.size and (_gcm.max() > 0.0 or _gcz.max() > 0.0):
-                _parts.append(f"cov med={np.median(_gcm):.4g} "
-                              f"[{_gcm.min():.4g},{_gcm.max():.4g}] "
-                              f"frozen={int((_gcz > 0).sum())}/{_gcz.size}")
             # THE WIN TEST (sec 14.7): <= 20 approximations REQUESTED (an
             # upper bound on applied, so this cannot miss a real win), q >=
             # 0.8, and a latency at or below 0.9x this episode's own live
