@@ -114,6 +114,7 @@ from alphagrad.approx.common.face_driver import (
     build_live_face_stream,
     make_face_callbacks,
     make_face_sizes_callback,
+    make_face_slot_legality_callback,
 )
 from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
 from alphagrad.approx.heads import (
@@ -2892,7 +2893,7 @@ class Agent(eqx.Module):
             # --per-face-masks extras; None on every other path, which is what
             # `UnifiedFacePolicy.sample_face` reads as "use the vertex's
             # nominal features and the unnarrowed hardware dtype mask".
-            f_sizes = f_quant = None
+            f_sizes = f_quant = f_nout = None
             if _face_from_fn is not None:
                 f_pair, f_comp, f_valid = _face_from_fn[:3]
                 if len(_face_from_fn) > 3:
@@ -2936,7 +2937,16 @@ class Agent(eqx.Module):
                 # `_face_loop`, the stored trajectory leaf, `_face_replay`
                 # -- is untouched.
                 if face_sizes_fn is not None:
-                    f_sizes, f_quant = face_sizes_fn(vertex_idx)
+                    _fsz = face_sizes_fn(vertex_idx)
+                    f_sizes, f_quant = _fsz[0], _fsz[1]
+                    if len(_fsz) > 2:
+                        # --face-slot-frames (ticket .18): the per-SLOT
+                        # probe also returns the slot's own Diag-pair and
+                        # Reduce-axis masks, which REPLACE the static
+                        # vertex-level ones above (they ride out and are
+                        # stored through the same face_out slots), and the
+                        # slot's out rank for the wire encoder.
+                        f_pair, f_comp, f_nout = _fsz[2], _fsz[3], _fsz[4]
             face_key = jrand.fold_in(micro_key, 7)
             if face_chunk_fn is None:
                 if getattr(self.face_path_policy, "endpoint_read", False):
@@ -2993,6 +3003,7 @@ class Agent(eqx.Module):
                     edge_rows=edge_rows,
                     face_sizes=f_sizes,
                     face_quant=f_quant,
+                    face_nout=f_nout,
                 )
                 (fa, face_logp, face_ent, f_cnt, f_dt,
                  f_de, f_ends) = _fl_out[:7]
@@ -3094,20 +3105,37 @@ class Agent(eqx.Module):
 
         return lax.cond(count > 0, _run, _skip, carry)
 
-    def _face_row_specs(self, row, axis_state_v):
+    def _face_row_specs(self, row, axis_state_v, nout_f=None):
         """One face's per-slot wire row -> the env's ``[bi1, bi2, factor]``
-        spec rows, via the SAME translator the env action uses."""
-        def _one(op, i, j, factor, kind, dtype, qsign, qfrac):
+        spec rows, via the SAME translator the env action uses.
+
+        ``nout_f`` (S,) -- --face-slot-frames (ticket .18): the translator
+        splits ``(i, j)`` into out-side / primal-side relative positions by
+        the axis state's IS_OUTPUT column, which is the VERTEX's; each slot
+        gets that column rewritten to its own out rank so ``bi2 = j - n_out``
+        is taken in the frame the slot's hook decodes in."""
+        def _one(op, i, j, factor, kind, dtype, qsign, qfrac, ax_st):
             return micro_actions_to_rule_specs_jax(
-                op[None], i[None], j[None], factor[None], axis_state_v,
+                op[None], i[None], j[None], factor[None], ax_st,
                 compress_kinds=kind[None], quant_dtypes=dtype[None],
                 quant_scale_signs=qsign[None], quant_scale_fracs=qfrac[None],
             )[0]
 
+        if nout_f is None:
+            ax = jnp.broadcast_to(axis_state_v, (FACE_SLOTS,)
+                                  + tuple(axis_state_v.shape))
+        else:
+            from alphagrad.approx.env import _AXIS_FEAT_IS_OUTPUT
+            _isout = (jnp.arange(axis_state_v.shape[0])[None, :]
+                      < jnp.asarray(nout_f, jnp.int32)[:, None]
+                      ).astype(axis_state_v.dtype)
+            ax = jnp.broadcast_to(
+                axis_state_v, (FACE_SLOTS,) + tuple(axis_state_v.shape)
+            ).at[:, :, _AXIS_FEAT_IS_OUTPUT].set(_isout)
         return jax.vmap(_one)(
             row["op_type"], row["i"], row["j"], row["factor"],
             row["compress_kind"], row["quant_dtype"],
-            row["quant_scale_sign"], row["quant_scale_frac"],
+            row["quant_scale_sign"], row["quant_scale_frac"], ax,
         ).astype(jnp.int32)
 
     _WIRE_KEYS = ("op_type", "i", "j", "exponents", "factor",
@@ -3144,7 +3172,8 @@ class Agent(eqx.Module):
                    f_pair, f_comp, f_valid, enc_carry, face_chunk_fn,
                    vertex_idx, vertex_specs, axis_state_v,
                    op_legality_override, n_faces, endpoint_rows=None,
-                   edge_rows=None, face_sizes=None, face_quant=None):
+                   edge_rows=None, face_sizes=None, face_quant=None,
+                   face_nout=None):
         """Read face f's chunk, decide face f, repeat -- for the ACTUAL face
         count, as a while_loop.
 
@@ -3286,7 +3315,9 @@ class Agent(eqx.Module):
                 face_sizes_f=None if face_sizes is None else face_sizes[f],
                 face_quant_f=None if face_quant is None else face_quant[f],
                 op_legality_override=op_legality_override)
-            rs = rs.at[f].set(self._face_row_specs(row, axis_state_v))
+            rs = rs.at[f].set(self._face_row_specs(
+                row, axis_state_v,
+                None if face_nout is None else face_nout[f]))
             skips = skips.at[f].set(sk.astype(jnp.int32))
             cnts = cnts.at[f].set(ct_eff)
             wa = tuple(w.at[f].set(row[k])
@@ -4387,6 +4418,24 @@ def make_argparser() -> argparse.ArgumentParser:
         "Published as ALPHAGRAD_APPROX_OLD (read by env.approx_old) so the "
         "Ray measure actors resolve the SAME configuration as the trainer; "
         "every plan-log record carries the value that measured it.",
+    )
+    p.add_argument(
+        "--face-slot-frames",
+        choices=["slot", "vertex"],
+        default="slot",
+        help="Ticket dsnn-3qm.18 (defects D2, D3). A face's three operand "
+        "slots (lhs, rhs, new) hold three different tensors (finding 54: "
+        "rhs and new have no out side under a scalar loss). slot = each "
+        "slot decodes its wire row in ITS OWN live tensor's frame (Diag.j "
+        "= out_len + bi2 and the Reduce axis range of that tensor) and, "
+        "with --per-face-masks --live-faces, the head masks each slot with "
+        "that slot's own sizes, Diag-pair, Reduce-axis and Quant legality, "
+        "probed from that slot. vertex = the pre-ticket behaviour: one "
+        "vertex frame and one legality vector (the result tensor's) for all "
+        "three slots. Kept only for the flag-off bit-identity gate "
+        "(ALPHAGRAD_EQ_DUMP). Published as ALPHAGRAD_FACE_SLOT_FRAMES so the "
+        "Ray measure actors decode the wire in the trainer's frame; every "
+        "plan-log record carries the value that measured it.",
     )
     p.add_argument(
         "--measure-toolchain-gate",
@@ -5940,7 +5989,7 @@ def main():
     # to os.environ so the measure actors, which build their own hooks in their
     # own processes, inherit the same setting.
     from alphagrad.approx.common.masks import (
-        set_diag_per_face, set_per_face_masks)
+        set_diag_per_face, set_face_slot_frames, set_per_face_masks)
     set_diag_per_face(
         bool(getattr(args, "diag_per_face", False)),
         rule=str(getattr(args, "diag_per_face_rule", "largest")),
@@ -5953,6 +6002,12 @@ def main():
         bool(getattr(args, "per_face_masks", False)),
         repair_axis=not bool(getattr(args, "no_per_face_repair_axis", False)),
     )
+    # --face-slot-frames (ticket .18), same discipline: the per-slot decode
+    # runs inside the measure actors' own processes.
+    set_face_slot_frames(
+        str(getattr(args, "face_slot_frames", "slot")) == "slot")
+    print(f"[alphagrad] face decode frame (--face-slot-frames) = "
+          f"{getattr(args, 'face_slot_frames', 'slot')}", flush=True)
 
     # ``ALPHAGRAD_TRACEMALLOC=1`` — start the Python allocator tracker
     # before any model code runs. Per-episode snapshots are diffed
@@ -6573,6 +6628,10 @@ def main():
     # with the flag off none of the extra arrays below is ever created: no new
     # callback output, no new trajectory leaf, no shape change anywhere.
     _PFM = bool(getattr(args, "per_face_masks", False))
+    # --face-slot-frames slot (ticket .18): the SIZES half below is probed and
+    # stored PER SLOT (F, S, ...) instead of per face; "vertex" keeps the
+    # historical (F, ...) arrays and code path.
+    _SLOT_FRAMES = str(getattr(args, "face_slot_frames", "slot")) == "slot"
     if _PFM and not getattr(args, "face_actions", False):
         raise ValueError(
             "--per-face-masks needs --face-actions: it masks the per-FACE "
@@ -7137,7 +7196,10 @@ def main():
         # --per-face-masks SIZES half (A1b): built unconditionally (it is
         # one closure) but only CALLED under `_PFM_SIZES` below, so the
         # flag-off trace has no extra callback and no extra host work.
-        _live_face_sizes = make_face_sizes_callback(
+        # --face-slot-frames slot: the per-SLOT probe instead (ticket .18).
+        _live_face_sizes = (
+            make_face_slot_legality_callback if _SLOT_FRAMES
+            else make_face_sizes_callback)(
             _LIVE_FACES, max_faces=_F_FACES,
             max_axes=MAX_AXES_PER_VERTEX, prof_sink=_env_prof_add)
 
@@ -7197,10 +7259,15 @@ def main():
     _PFM_LIVE_SIZES = bool(_PFM and _NO_ORACLE and _live_face_sizes is not None
                            and not getattr(args, "no_approx_head", False))
     _PFM_SIZES = bool(_PFM and (not _NO_ORACLE or _PFM_LIVE_SIZES))
+    # Per-SLOT legality (ticket .18, D3) rides the live-stream sizes half:
+    # sizes, quant, Diag-pair and Reduce-axis masks per (face, slot).
+    _PFM_SLOT = bool(_PFM_LIVE_SIZES and _SLOT_FRAMES)
     if _PFM:
         print("[cfg] --per-face-masks: apply-time projection ON; "
               "per-face SIZES + QUANT mask "
-              + ("ON (live-face stream)" if _PFM_LIVE_SIZES else
+              + ("ON (live-face stream, PER SLOT: lhs/rhs/new)"
+                 if _PFM_SLOT else
+                 "ON (live-face stream)" if _PFM_LIVE_SIZES else
                  "ON (live oracle)" if _PFM_SIZES else
                  "OFF -- no oracle and no live-face stream, so there are "
                  "no per-face sizes to hand the head. Only the apply-time "
@@ -7980,8 +8047,12 @@ def main():
                         # Cheap (static shapes, trace time) and names the
                         # mistake instead of surfacing it as a broadcast error
                         # 5 frames deep in the head.
-                        _want = ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX),
-                                 (ENV_MAX_FACES,))
+                        _want = (((ENV_MAX_FACES, FACE_SLOTS,
+                                   MAX_AXES_PER_VERTEX),
+                                  (ENV_MAX_FACES, FACE_SLOTS))
+                                 if _PFM_SLOT else
+                                 ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX),
+                                  (ENV_MAX_FACES,)))
                         _got = (tuple(face_sizes_v.shape),
                                 tuple(face_quant_v.shape))
                         if _got != _want:
@@ -7993,11 +8064,15 @@ def main():
                 else:
                     face_action = _zero_face_action()
                     face_old_logp = jnp.array(0.0)
+                    # --face-slot-frames: the pair / comp masks carry a slot
+                    # axis on the live path (see _PFM_SLOT).
+                    _sl = (FACE_SLOTS,) if _PFM_SLOT else ()
                     face_pair_v = jnp.zeros(
-                        (ENV_MAX_FACES, MAX_AXES_PER_VERTEX,
+                        (ENV_MAX_FACES,) + _sl + (MAX_AXES_PER_VERTEX,
                          MAX_AXES_PER_VERTEX), jnp.float32)
                     face_comp_v = jnp.zeros(
-                        (ENV_MAX_FACES, MAX_AXES_PER_VERTEX), jnp.float32)
+                        (ENV_MAX_FACES,) + _sl + (MAX_AXES_PER_VERTEX,),
+                        jnp.float32)
                     face_valid_v = jnp.zeros((ENV_MAX_FACES,), jnp.float32)
                     face_ends_v = jnp.zeros((ENV_MAX_FACES, 2), jnp.int32)
                     face_cnt_v = jnp.zeros((ENV_MAX_FACES,), jnp.int32)
@@ -8016,9 +8091,10 @@ def main():
                         # sizes read back as an all-invalid axis set, which is
                         # the correct "nothing is approximable here".
                         face_sizes_v = jnp.zeros(
-                            (ENV_MAX_FACES, MAX_AXES_PER_VERTEX), jnp.int32)
+                            (ENV_MAX_FACES,) + _sl + (MAX_AXES_PER_VERTEX,),
+                            jnp.int32)
                         face_quant_v = jnp.zeros(
-                            (ENV_MAX_FACES,), jnp.float32)
+                            (ENV_MAX_FACES,) + _sl, jnp.float32)
                 if _DEBUG_ORDER:
                     # avail = how many vertices are still selectable; picked =
                     # the 0-based index chosen; was_avail = 1.0 iff that pick
@@ -8380,8 +8456,13 @@ def main():
             ratio just stops being 1), so the shapes are asserted where they
             enter the loss rather than discovered as a broadcast error inside
             the head."""
-            _w = ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX), (ENV_MAX_FACES,))
-            _g = (tuple(fsz.shape[-2:]), tuple(fqt.shape[-1:]))
+            if _PFM_SLOT:
+                _w = ((ENV_MAX_FACES, FACE_SLOTS, MAX_AXES_PER_VERTEX),
+                      (ENV_MAX_FACES, FACE_SLOTS))
+                _g = (tuple(fsz.shape[-3:]), tuple(fqt.shape[-2:]))
+            else:
+                _w = ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX), (ENV_MAX_FACES,))
+                _g = (tuple(fsz.shape[-2:]), tuple(fqt.shape[-1:]))
             if _g != _w:
                 raise ValueError(
                     "--per-face-masks: stored face_sizes/face_quant have "

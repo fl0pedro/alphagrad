@@ -433,6 +433,78 @@ def make_face_sizes_callback(live_faces, *, max_faces, max_axes,
     return _sizes_cb
 
 
+def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
+                                     prof_sink=None):
+    """``cb(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist)``
+    -> ``(sizes (F,S,N) int32, quant (F,S) f32, pair (F,S,N,N) f32,
+    comp (F,S,N) f32, n_out (F,S) int32)``.
+
+    The ``--face-slot-frames`` sibling of :func:`make_face_sizes_callback`
+    (ticket .18, D3): :meth:`LiveFaceStream.face_slot_legality` per slot
+    instead of :meth:`face_dim_sizes` for the result site. Same batching,
+    same memo, same binding (:func:`bind_sizes_callback`); the first two
+    outputs replace ``face_sizes`` / ``face_quant`` with a slot axis, the
+    next two replace the STATIC ``face_pair_valid`` / ``face_comp_valid`` of
+    the live path with per-slot masks, and ``n_out`` feeds the wire encoder.
+    All but ``n_out`` enter the head's masks and are stored, so the loss
+    re-masks with exactly what the behaviour policy masked with.
+    """
+    F, N = int(max_faces), int(max_axes)
+    S = 3   # lhs, rhs, new -- live_faces._SLOT_SITES
+    _perf = None
+    if prof_sink is not None:
+        import time as _time
+        _perf = _time.perf_counter
+
+    def _one(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist):
+        sz, qt, pr, cp, no, _n = live_faces.face_slot_legality(
+            order, spec_hist, int(np.asarray(step_count)),
+            int(np.asarray(vertex_idx)) + 1, face_hist, skip_hist)
+        return (np.asarray(sz, np.int32)[:F, :S, :N],
+                np.asarray(qt, np.float32)[:F, :S],
+                np.asarray(pr, np.float32)[:F, :S, :N, :N],
+                np.asarray(cp, np.float32)[:F, :S, :N],
+                np.asarray(no, np.int32)[:F, :S])
+
+    def _host(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist):
+        _t0 = _perf() if _perf is not None else None
+        try:
+            _order = np.asarray(order)
+            if _order.ndim == 1:
+                return _one(order, spec_hist, step_count, vertex_idx,
+                            face_hist, skip_hist)
+            B = _order.shape[0]
+            outs = (np.zeros((B, F, S, N), np.int32),
+                    np.zeros((B, F, S), np.float32),
+                    np.zeros((B, F, S, N, N), np.float32),
+                    np.zeros((B, F, S, N), np.float32),
+                    np.zeros((B, F, S), np.int32))
+            _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
+            _vi = np.asarray(vertex_idx)
+            _fh, _kh = np.asarray(face_hist), np.asarray(skip_hist)
+            for i in range(B):
+                got = _one(_order[i], _sh[i], _sc[i], _vi[i], _fh[i], _kh[i])
+                for dst, src in zip(outs, got):
+                    dst[i] = src
+            return outs
+        finally:
+            if _perf is not None:
+                prof_sink("faces.live_slot_legality", _perf() - _t0)
+
+    def _cb(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist):
+        return jax.pure_callback(
+            _host,
+            (jax.ShapeDtypeStruct((F, S, N), jnp.int32),
+             jax.ShapeDtypeStruct((F, S), jnp.float32),
+             jax.ShapeDtypeStruct((F, S, N, N), jnp.float32),
+             jax.ShapeDtypeStruct((F, S, N), jnp.float32),
+             jax.ShapeDtypeStruct((F, S), jnp.int32)),
+            order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
+            vmap_method="broadcast_all")
+
+    return _cb
+
+
 def bind_sizes_callback(sizes_cb, order, spec_hist, step_count,
                         face_hist, skip_hist):
     """Bind this step's prefix to ``face_sizes_fn(vertex_idx)``.
