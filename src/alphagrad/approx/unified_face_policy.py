@@ -104,6 +104,17 @@ class UnifiedFacePolicy(eqx.Module):
                                     key=keys[1])
 
     # ------------------------------------------------------------ masks
+    @staticmethod
+    def _fit(v, n):
+        v = jnp.asarray(v, jnp.float32).ravel()
+        return jnp.concatenate([v, jnp.zeros((n,), jnp.float32)])[:n]
+
+    @staticmethod
+    def _pair_sizes(features):
+        sz = jnp.asarray(features.size, jnp.int32)
+        return jnp.concatenate([sz, jnp.ones((MAX_PAIR_IDX,), jnp.int32)]
+                               )[:MAX_PAIR_IDX]
+
     def _face_masks(self, features, pair_valid_f, comp_valid_f,
                     quant_legality_mask, op_override, tables):
         """(op, i, j, axis, pair_ok) masks, broadcast to the three slots.
@@ -111,40 +122,118 @@ class UnifiedFacePolicy(eqx.Module):
         Every slot sees the SAME face, so the legality is the same for all
         three; they are stacked rather than shared so the head's per-slot
         signature stays honest if that ever stops being true.
+
+        IT STOPPED BEING TRUE (ticket .18, D3; finding 54): the three slots
+        hold three different tensors. When ``features`` is a LIST of
+        ``FACE_SLOTS`` per-slot features -- with ``pair_valid_f`` (S, N, N),
+        ``comp_valid_f`` (S, N) and ``quant_legality_mask`` (S, D) to match,
+        all from ``LiveFaceStream.face_slot_legality`` -- each slot's masks
+        come from ITS OWN legality (:meth:`_slot_masks_1`) and are stacked.
+        A single ``features`` keeps the historical broadcast, byte for byte.
+        (A LIST, specifically: ``AxisTokenFeatures`` is itself a tuple.)
+        """
+        if not isinstance(features, list):
+            op_legal = _compute_op_legality(
+                features, pair_valid=pair_valid_f,
+                compress_valid=comp_valid_f,
+                quant_legality_mask=quant_legality_mask,
+                op_override=op_override)
+            i_diag, i_compress, j_diag, _ = _compute_axis_masks(
+                features, pair_valid=pair_valid_f,
+                compress_valid=comp_valid_f)
+            om = jnp.broadcast_to(self._fit(op_legal, NUM_APPROX_OPS),
+                                  (FACE_SLOTS, NUM_APPROX_OPS))
+            im = jnp.broadcast_to(self._fit(i_diag, MAX_PAIR_IDX),
+                                  (FACE_SLOTS, MAX_PAIR_IDX))
+            jm = jnp.broadcast_to(self._fit(j_diag, MAX_PAIR_IDX),
+                                  (FACE_SLOTS, MAX_PAIR_IDX))
+            am = jnp.broadcast_to(self._fit(i_compress, NUM_REDUCE_AXES),
+                                  (FACE_SLOTS, NUM_REDUCE_AXES))
+            # Non-coprime (i, j) table: gcd == 1 admits only factor 1, a no-op.
+            #
+            # PER-FACE UNDER --per-face-masks. `features` here is `_face_feats_1`'s
+            # output, so once `face_sizes_f` is supplied these are THIS FACE's live
+            # logical sizes (`masks.dim_logical_sizes`) rather than the vertex's
+            # nominal ones -- the same numbers `masks.face_masks_and_sizes` screened
+            # the pair with, and the same ones `_rows` derives the factor from. With
+            # `face_sizes_f=None` it is the historical per-VERTEX table.
+            sz = self._pair_sizes(features)
+            g = jnp.gcd(sz[:, None], sz[None, :])
+            pair_ok = jnp.broadcast_to((g > 1).astype(jnp.float32),
+                                       (FACE_SLOTS, MAX_PAIR_IDX, MAX_PAIR_IDX))
+            return om, im, jm, am, pair_ok
+        outs = [self._slot_masks_1(features[s], pair_valid_f[s],
+                                   comp_valid_f[s], quant_legality_mask[s],
+                                   op_override)
+                for s in range(FACE_SLOTS)]
+        return tuple(jnp.stack([o[k] for o in outs]) for k in range(5))
+
+    def _slot_masks_1(self, features, pair_valid, comp_valid,
+                      quant_legality_mask, op_override):
+        """ONE slot's (op, i, j, axis, pair_ok) from ONE slot's legality.
+
+        ``pair_valid`` is the slot's exact Diag-pair set (``slot_legality``:
+        the out/primal split, the coupling rule and the factor check are
+        already in it), so it is folded into ``pair_ok`` -- the ONE (i, j)
+        table the head's ``j_mask_given_i`` reads per ``i``. The flat
+        ``j`` mask the 94-logit head takes is then "j can partner with SOME
+        i" (the column-any of the (N, N) table): together with ``pair_ok[i]``
+        that makes the legal ``j`` given ``i`` exactly ``pair_valid[i]`` with
+        ``gcd > 1``, on this slot -- what "masked == pruned per slot" means.
+        (The broadcast path keeps its historical row-0 read of that table.)
         """
         op_legal = _compute_op_legality(
-            features, pair_valid=pair_valid_f, compress_valid=comp_valid_f,
+            features, pair_valid=pair_valid, compress_valid=comp_valid,
             quant_legality_mask=quant_legality_mask, op_override=op_override)
         i_diag, i_compress, j_diag, _ = _compute_axis_masks(
-            features, pair_valid=pair_valid_f, compress_valid=comp_valid_f)
-
-        def _fit(v, n):
-            v = jnp.asarray(v, jnp.float32).ravel()
-            return jnp.concatenate([v, jnp.zeros((n,), jnp.float32)])[:n]
-
-        om = jnp.broadcast_to(_fit(op_legal, NUM_APPROX_OPS),
-                              (FACE_SLOTS, NUM_APPROX_OPS))
-        im = jnp.broadcast_to(_fit(i_diag, MAX_PAIR_IDX),
-                              (FACE_SLOTS, MAX_PAIR_IDX))
-        jm = jnp.broadcast_to(_fit(j_diag, MAX_PAIR_IDX),
-                              (FACE_SLOTS, MAX_PAIR_IDX))
-        am = jnp.broadcast_to(_fit(i_compress, NUM_REDUCE_AXES),
-                              (FACE_SLOTS, NUM_REDUCE_AXES))
-        # Non-coprime (i, j) table: gcd == 1 admits only factor 1, a no-op.
-        #
-        # PER-FACE UNDER --per-face-masks. `features` here is `_face_feats_1`'s
-        # output, so once `face_sizes_f` is supplied these are THIS FACE's live
-        # logical sizes (`masks.dim_logical_sizes`) rather than the vertex's
-        # nominal ones -- the same numbers `masks.face_masks_and_sizes` screened
-        # the pair with, and the same ones `_rows` derives the factor from. With
-        # `face_sizes_f=None` it is the historical per-VERTEX table.
-        sz = jnp.asarray(features.size, jnp.int32)
-        sz = jnp.concatenate([sz, jnp.ones((MAX_PAIR_IDX,), jnp.int32)]
-                             )[:MAX_PAIR_IDX]
+            features, pair_valid=pair_valid, compress_valid=comp_valid)
+        om = self._fit(op_legal, NUM_APPROX_OPS)
+        im = self._fit(i_diag, MAX_PAIR_IDX)
+        jm = self._fit(jnp.max(jnp.asarray(j_diag, jnp.float32), axis=0),
+                       MAX_PAIR_IDX)
+        am = self._fit(i_compress, NUM_REDUCE_AXES)
+        sz = self._pair_sizes(features)
         g = jnp.gcd(sz[:, None], sz[None, :])
-        pair_ok = jnp.broadcast_to((g > 1).astype(jnp.float32),
-                                   (FACE_SLOTS, MAX_PAIR_IDX, MAX_PAIR_IDX))
+        pv = jnp.asarray(pair_valid, jnp.float32)
+        pv = jnp.pad(pv, ((0, MAX_PAIR_IDX), (0, MAX_PAIR_IDX))
+                     )[:MAX_PAIR_IDX, :MAX_PAIR_IDX]
+        pair_ok = (g > 1).astype(jnp.float32) * pv
         return om, im, jm, am, pair_ok
+
+    def _slot_inputs(self, features, pair_valid_f, comp_valid_f,
+                     quant_legality_mask, face_sizes_f, face_quant_f):
+        """Per-slot inputs, or ``None`` when every input is per-FACE.
+
+        The per-slot arrays come from ``face_slot_legality``
+        (``--face-slot-frames``): sizes (S, N), quant (S,), pair (S, N, N),
+        comp (S, N). Any one of them present switches the whole face to the
+        per-slot path; the others are broadcast to match, so an oracle-path
+        pair mask can still travel with live per-slot sizes.
+        """
+        per = ((face_sizes_f is not None and jnp.ndim(face_sizes_f) == 2)
+               or jnp.ndim(pair_valid_f) == 3 or jnp.ndim(comp_valid_f) == 2
+               or (face_quant_f is not None and jnp.ndim(face_quant_f) == 1))
+        if not per:
+            return None
+        S = FACE_SLOTS
+
+        def _rows_of(x, rank):
+            x = jnp.asarray(x)
+            return x if x.ndim == rank + 1 else jnp.broadcast_to(
+                x, (S,) + x.shape)
+
+        sizes = None if face_sizes_f is None else _rows_of(face_sizes_f, 1)
+        ff = [self._face_feats_1(features,
+                                 None if sizes is None else sizes[s])
+              for s in range(S)]
+        pv = _rows_of(pair_valid_f, 2)
+        cv = _rows_of(comp_valid_f, 1)
+        fq = (None if face_quant_f is None
+              else _rows_of(jnp.asarray(face_quant_f, jnp.float32), 0))
+        qm = jnp.stack([self._quant_mask_1(
+            quant_legality_mask, None if fq is None else fq[s])
+            for s in range(S)])
+        return ff, pv, cv, qm
 
     def _face_feats(self, features, face_sizes, f):
         return self._face_feats_1(
@@ -224,11 +313,18 @@ class UnifiedFacePolicy(eqx.Module):
         # deterministic factor rule; the 94-slot head layout is UNCHANGED (no
         # factor field, no head-shape change), and a learned factor field would
         # replace this one line without moving anything else.
-        sz = jnp.asarray(features.size, jnp.int32)
-        sz = jnp.concatenate([sz, jnp.ones((MAX_PAIR_IDX,), jnp.int32)]
-                             )[:MAX_PAIR_IDX]
-        N_i = sz[jnp.clip(fields.i, 0, MAX_PAIR_IDX - 1)]
-        N_j = sz[jnp.clip(fields.j, 0, MAX_PAIR_IDX - 1)]
+        #
+        # PER SLOT (ticket .18): a list of per-slot features gives each slot
+        # its OWN sizes, so the factor is the gcd on the tensor the Diag hits.
+        if isinstance(features, list):
+            sz = jnp.stack([self._pair_sizes(f) for f in features])
+            _s = jnp.arange(FACE_SLOTS)
+            N_i = sz[_s, jnp.clip(fields.i, 0, MAX_PAIR_IDX - 1)]
+            N_j = sz[_s, jnp.clip(fields.j, 0, MAX_PAIR_IDX - 1)]
+        else:
+            sz = self._pair_sizes(features)
+            N_i = sz[jnp.clip(fields.i, 0, MAX_PAIR_IDX - 1)]
+            N_j = sz[jnp.clip(fields.j, 0, MAX_PAIR_IDX - 1)]
         g = jnp.gcd(N_i, N_j)
         exps = tables.max_exps[g].astype(jnp.int32)                # (S, P)
         primes = tables.primes[g]                                  # (S, P)
@@ -299,13 +395,21 @@ class UnifiedFacePolicy(eqx.Module):
         skip_prob, op_dist)`` -- one slice of what :meth:`sample` stacks."""
         if quant_legality_mask is None:
             quant_legality_mask = quant_hardware_masks()[0]
-        quant_legality_mask = self._quant_mask_1(quant_legality_mask,
-                                                 face_quant_f)
-        ff = self._face_feats_1(features, face_sizes_f)
+        per_slot = self._slot_inputs(
+            features, pair_valid_f, comp_valid_f, quant_legality_mask,
+            face_sizes_f, face_quant_f)
+        if per_slot is None:
+            quant_legality_mask = self._quant_mask_1(quant_legality_mask,
+                                                     face_quant_f)
+            ff = self._face_feats_1(features, face_sizes_f)
+            om, im, jm, am, pair_ok = self._face_masks(
+                ff, pair_valid_f, comp_valid_f, quant_legality_mask,
+                op_legality_override, tables)
+        else:
+            ff, _pv, _cv, _qm = per_slot
+            om, im, jm, am, pair_ok = self._face_masks(
+                ff, _pv, _cv, _qm, op_legality_override, tables)
         ctx_f = self._repr(face_context)
-        om, im, jm, am, pair_ok = self._face_masks(
-            ff, pair_valid_f, comp_valid_f, quant_legality_mask,
-            op_legality_override, tables)
         z, fields, lp, e, ar = self.head.sample(
             ctx_f, key, op_mask=om, i_mask=im, j_mask=jm, axis_mask=am,
             pair_ok=pair_ok, face_valid=face_valid_f > 0.5,
@@ -326,13 +430,21 @@ class UnifiedFacePolicy(eqx.Module):
         scores a different distribution and the ratio silently leaves 1."""
         if quant_legality_mask is None:
             quant_legality_mask = quant_hardware_masks()[0]
-        quant_legality_mask = self._quant_mask_1(quant_legality_mask,
-                                                 face_quant_f)
-        ff = self._face_feats_1(features, face_sizes_f)
+        per_slot = self._slot_inputs(
+            features, pair_valid_f, comp_valid_f, quant_legality_mask,
+            face_sizes_f, face_quant_f)
+        if per_slot is None:
+            quant_legality_mask = self._quant_mask_1(quant_legality_mask,
+                                                     face_quant_f)
+            ff = self._face_feats_1(features, face_sizes_f)
+            om, im, jm, am, pair_ok = self._face_masks(
+                ff, pair_valid_f, comp_valid_f, quant_legality_mask,
+                op_legality_override, tables)
+        else:
+            ff, _pv, _cv, _qm = per_slot
+            om, im, jm, am, pair_ok = self._face_masks(
+                ff, _pv, _cv, _qm, op_legality_override, tables)
         ctx_f = self._repr(face_context)
-        om, im, jm, am, pair_ok = self._face_masks(
-            ff, pair_valid_f, comp_valid_f, quant_legality_mask,
-            op_legality_override, tables)
         z = self.head.logits(ctx_f)
         # Read the fields back off the stored wire rows -- the inverse of
         # _rows. COMPRESS parked the axis in `i`, DIAG parked the pair.

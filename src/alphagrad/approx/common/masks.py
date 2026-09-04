@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import os
+from typing import NamedTuple
 
 import jax.numpy as jnp
 import numpy as np
@@ -666,6 +667,35 @@ def set_per_face_masks(enabled: bool, repair_axis: bool = True) -> None:
 
 def per_face_masks_enabled() -> bool:
     return bool(_PER_FACE_MASKS[0])
+
+
+# --face-slot-frames (ticket dsnn-3qm.18, defects D2 and D3). A face has
+# three operand slots -- lhs (d central / d in_edge), rhs (d out_edge /
+# d central), new (d out_edge / d in_edge) -- and they are NOT alike: under a
+# scalar loss rhs and new have an EMPTY out side on every face (finding 54)
+# while lhs carries the vertex's own out dims. ``slot`` (the default) decodes
+# each slot's wire row in the frame of the live tensor that slot is handed
+# (``env.make_slot_frame_hook``) and masks each slot of the 94-logit head with
+# that slot's own sizes / Diag-pair / Reduce-axis / Quant legality
+# (``LiveFaceStream.face_slot_legality`` -> ``UnifiedFacePolicy``).
+# ``vertex`` is the pre-ticket behaviour -- one vertex frame and one legality
+# vector, probed from the result tensor, broadcast to all three slots -- kept
+# only so the flag-off bit-identity gate (ALPHAGRAD_EQ_DUMP) can reach it.
+# Same discipline as --per-face-masks: republished to the environment so the
+# Ray measure actors decode the wire in the same frame as the trainer.
+_FACE_SLOT_FRAMES = [os.environ.get("ALPHAGRAD_FACE_SLOT_FRAMES", "1")
+                     not in ("0", "", "false", "False", "no")]
+
+
+def set_face_slot_frames(enabled: bool) -> None:
+    """Install the ``--face-slot-frames`` setting process-wide (and in the
+    environment, for the measure actors)."""
+    _FACE_SLOT_FRAMES[0] = bool(enabled)
+    os.environ["ALPHAGRAD_FACE_SLOT_FRAMES"] = "1" if enabled else "0"
+
+
+def face_slot_frames_enabled() -> bool:
+    return bool(_FACE_SLOT_FRAMES[0])
 
 
 # The 94-slot face head's dtype field is a BERNOULLI over exactly these two
@@ -1623,6 +1653,76 @@ def rule_is_legal(st, rule, *, max_dims: int = 8, max_axes: int = 8) -> bool:
     return False
 
 
+def hook_rule_is_legal(st, rule, *, max_dims: int = 8,
+                       max_axes: int = 8) -> bool:
+    """THE legality predicate :func:`make_live_masked_hook` applies.
+
+    ``--per-face-masks`` on: :func:`face_rule_is_legal` (the slot-count bound
+    on COMPRESS, idempotent requests refused); off: :func:`rule_is_legal`.
+    Module-level so :func:`slot_legality` can hand the head EXACTLY the
+    verdict the hook will reach -- one predicate, not two that must agree.
+    """
+    if _PER_FACE_MASKS[0]:
+        return face_rule_is_legal(st, rule, max_dims=max_dims,
+                                  max_axes=max_axes)
+    return rule_is_legal(st, rule, max_dims=max_dims, max_axes=max_axes)
+
+
+class SlotLegality(NamedTuple):
+    """ONE face slot's legal action set, read off its live tensor.
+
+    ``sizes`` -- ``dim_logical_sizes``, the numbering ``Diag(i, j)`` and the
+    wire use; ``n_out`` -- how many of those are out dims (the wire's
+    ``bi2 = j - n_out``); ``pair[i, j]`` -- the head's Diag on ``(i, j)`` with
+    its own factor ``gcd(sizes[i], sizes[j])`` is applied by the hook;
+    ``comp[a]`` -- ``Compress(axes=(a,))`` decodes in this slot's frame AND
+    is applied by the hook; ``quant[d]`` -- ``FACE_QUANT_DTYPES[d]`` is a
+    legal, non-idempotent cast.
+    """
+    sizes: np.ndarray    # (N,) int32
+    n_out: int
+    pair: np.ndarray     # (N, N) bool
+    comp: np.ndarray     # (N,) bool
+    quant: np.ndarray    # (len(FACE_QUANT_DTYPES),) bool
+
+
+def slot_legality(st, max_axes: int = 8,
+                  dtypes: tuple = FACE_QUANT_DTYPES) -> SlotLegality:
+    """Per-slot legality FROM THE SLOT'S OWN LIVE TENSOR (ticket .18, D3).
+
+    Every entry is the answer of :func:`hook_rule_is_legal` -- the predicate
+    the apply-time hook uses -- to the concrete rule the 94-logit head would
+    put on the wire for that choice, after the slot-frame decode
+    (``env.decode_rule_specs_in_frame``) has admitted it. So "the mask admits
+    it" and "the hook applies it" are the same statement, slot by slot; that
+    equality is what ``tests/face_slot_frames_test.py`` pins and what .59's
+    apply-rate-equals-request-rate test can stand on.
+    """
+    from graphax.sparse.micro_actions import Compress, Diag
+
+    N = int(max_axes)
+    sizes = dim_logical_sizes(st, N)
+    n_out = len(st.out_dims)
+    n_log = n_out + len(st.primal_dims)
+    pair = np.zeros((N, N), dtype=bool)
+    comp = np.zeros((N,), dtype=bool)
+    for i in range(min(n_log, N)):
+        for j in range(min(n_log, N)):
+            if i == j or (i < n_out) == (j < n_out):
+                continue  # a Jacobian diagonal ties one OUT to one PRIMAL
+            io, jp = (i, j) if i < n_out else (j, i)
+            g = math.gcd(int(sizes[i]), int(sizes[j]))
+            if g <= 1:
+                continue  # the decoder drops 0/1 factors: a no-op
+            pair[i, j] = hook_rule_is_legal(
+                st, Diag(i=io, j=jp, factor=g), max_dims=N, max_axes=N)
+    for a in range(min(n_log, N)):
+        comp[a] = hook_rule_is_legal(
+            st, Compress(axes=(a,), kind="mean"), max_dims=N, max_axes=N)
+    return SlotLegality(sizes=sizes, n_out=int(n_out), pair=pair, comp=comp,
+                        quant=quant_valid_mask(st, dtypes))
+
+
 def couple_quant_rules(rules, applied_dtype=None):
     """Quant contraction coupling: **one quantization per turn**, and the
     second operand of a contraction INHERITS the first's dtype.
@@ -1735,10 +1835,8 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
         initial test and the post-projection re-verify -- a projection cleared
         by a laxer predicate than the one that rejected the original is how a
         repair turns into a raise."""
-        if _PER_FACE_MASKS[0]:
-            return face_rule_is_legal(st, rule, max_dims=max_dims,
-                                      max_axes=max_axes)
-        return rule_is_legal(st, rule, max_dims=max_dims, max_axes=max_axes)
+        return hook_rule_is_legal(st, rule, max_dims=max_dims,
+                                  max_axes=max_axes)
 
     def _hook(st):
         cur = st

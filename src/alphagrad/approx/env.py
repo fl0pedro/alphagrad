@@ -1541,6 +1541,8 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
     """
     try:
         from alphagrad.approx.common import plan_log as _plog
+        from alphagrad.approx.common.masks import (
+            face_slot_frames_enabled as _face_slot_frames_enabled)
         rec = {
             "schema": _plog.SCHEMA,
             "pid": os.getpid(),
@@ -1556,6 +1558,10 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             # the same function the face emitter reads, so the record cannot
             # disagree with the measurement.
             "approx_old": approx_old(),
+            # WHICH decode frame the face wires were applied in (ticket .18):
+            # True = each slot's own live tensor, False = the vertex frame
+            # broadcast to all three slots. A replay must decode the same way.
+            "face_slot_frames": bool(_face_slot_frames_enabled()),
         }
         rec.update(_plog.encode_wires(
             order, rule_specs, face_specs, face_skips,
@@ -4210,14 +4216,46 @@ def decode_vertex_rule_specs(jaxpr, vertex, spec_rows) -> tuple:
     rows are silently skipped — same best-effort semantics the measurement
     has always had.
     """
+    frame = vertex_frame(jaxpr, vertex)
+    if frame is None:
+        return ()
+    return decode_rule_specs_in_frame(frame[0], frame[1], spec_rows)
+
+
+def vertex_frame(jaxpr, vertex):
+    """``(out_shape, primal_shapes)`` of the eliminated vertex's OWN equation.
+
+    The frame the per-vertex wire rows are decoded in -- and, of a face's
+    three slots, the frame of ``lhs`` only (d central / d in_edge). ``None``
+    when the vertex has no decodable output or no non-literal input.
+    """
     eqn = jaxpr.eqns[vertex - 1]
     if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
-        return ()
+        return None
     out_shape = eqn.outvars[0].aval.shape
-    out_len = len(out_shape)
     primal_shapes = [iv.aval.shape for iv in eqn.invars if hasattr(iv, "aval")]
     if not primal_shapes:
-        return ()  # no non-literal inputs → no edges to transform
+        return None  # no non-literal inputs → no edges to transform
+    return out_shape, primal_shapes
+
+
+def slot_frame(st):
+    """``(out_shape, [primal_shape])`` of ONE live face-slot tensor, in
+    LOGICAL sizes (``Index.logical_size``, the numbering ``Diag(i, j)``,
+    ``dim_logical_sizes`` and ``rule_is_legal`` share). Ticket .18, D2: the
+    frame a slot's wire row is decoded in is the tensor the slot is handed,
+    not the vertex's equation."""
+    return (tuple(int(d.logical_size) for d in st.out_dims),
+            [tuple(int(d.logical_size) for d in st.primal_dims)])
+
+
+def decode_rule_specs_in_frame(out_shape, primal_shapes, spec_rows) -> tuple:
+    """The wire -> transform decode of :func:`decode_vertex_rule_specs` in an
+    EXPLICIT frame: ``Diag.j = len(out_shape) + bi2`` and a Reduce axis must
+    lie in ``out_shape ++ primal_shape`` of THIS frame. One decoder, two
+    frames: :func:`decode_vertex_rule_specs` calls it on the vertex frame,
+    :func:`make_slot_frame_hook` on each slot's own (:func:`slot_frame`)."""
+    out_len = len(out_shape)
 
     rules: list = []  # mixed list[Diag | Compress | Quant]
     used_axes: set[int] = set()
@@ -4313,6 +4351,58 @@ def decode_vertex_rule_specs(jaxpr, vertex, spec_rows) -> tuple:
     return tuple(rules)
 
 
+def make_slot_frame_hook(one_row, *, stats: dict | None = None,
+                         gated: bool = False):
+    """ONE face slot's hook under ``--face-slot-frames slot`` (ticket .18, D2).
+
+    Decodes the slot's wire row ``(b0, b1, b2)`` at APPLY time, in the frame
+    of the live tensor graphax hands the slot (:func:`slot_frame`), then
+    applies through :func:`make_live_masked_hook` -- same legality, same
+    projection, same ``applied`` / ``skipped`` counters. A row that names no
+    dim of this slot (a Diag on a slot with no out side, a Reduce axis past
+    the slot's rank) is counted ``skipped_<kind>`` like any other miss:
+    ``requested`` is read off the wire, so leaving it uncounted would inflate
+    ``applied_fraction``.
+
+    The decode is memoised per frame, so the tokenizer's replay of the same
+    hook on the same shapes decodes once. ``hook.rules_for(st)`` exposes the
+    decoded rules for a tensor (tests, .59's apply-rate audit).
+    """
+    from alphagrad.approx.common.masks import (
+        face_counts_armed, make_live_masked_hook)
+    from alphagrad.approx.common.plan_log import kind_of_slot
+
+    row = tuple(int(x) for x in one_row)
+    spec_rows = [list(row)] + [[-1, -1, 0]] * (MAX_RULES_PER_VERTEX - 1)
+    kind = kind_of_slot(row[0], COMPRESS_SENTINEL, QUANT_SENTINEL)
+    cache: dict = {}
+
+    def _decoded(st):
+        out_shape, primal_shapes = slot_frame(st)
+        key = (out_shape, primal_shapes[0])
+        hit = cache.get(key)
+        if hit is None:
+            rules = decode_rule_specs_in_frame(out_shape, primal_shapes,
+                                               spec_rows)
+            inner = (make_live_masked_hook(rules, stats=stats, gated=gated)
+                     if rules else None)
+            hit = cache[key] = (rules, inner)
+        return hit
+
+    def _hook(st):
+        _rules, inner = _decoded(st)
+        if inner is None:
+            if (kind is not None and stats is not None
+                    and (not gated or face_counts_armed())):
+                stats["skipped"] = stats.get("skipped", 0) + 1
+                stats[f"skipped_{kind}"] = stats.get(f"skipped_{kind}", 0) + 1
+            return st
+        return inner(st)
+
+    _hook.rules_for = lambda st: _decoded(st)[0]
+    return _hook
+
+
 # #72 / ticket .56 -- THE OLD EDGE. A face accumulation multiplies lhs by
 # rhs into `new` and adds `new` onto the existing predecessor-to-successor
 # edge (the OLD edge) when that edge exists. ``--approx-old`` says what the
@@ -4396,7 +4486,8 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip):
     which rides the tokenizer's own IncrementalJaxpr instead of replaying a
     second, byte-identical elimination."""
     from graphax import SKIP_FACE, faces_of
-    from alphagrad.approx.common.masks import make_live_masked_hook
+    from alphagrad.approx.common.masks import (
+        face_slot_frames_enabled, make_live_masked_hook)
 
     keys = faces_of(ij.graph, ij.tgraph, int(v), config.jaxpr)
     if len(keys) > _FACE_CAP_STATS["max_seen"]:
@@ -4423,6 +4514,16 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip):
             one_row = [[int(x) for x in face_row[f][s]]] + [
                 [-1, -1, 0]
             ] * (MAX_RULES_PER_VERTEX - 1)
+            if face_slot_frames_enabled():
+                # Ticket .18, D2. The vertex frame below describes the lhs
+                # tensor only; rhs and new carry other out/primal dims. So
+                # the row is decoded when the slot's LIVE tensor is in hand
+                # (make_slot_frame_hook), through the same per-face sink.
+                slots.append(
+                    make_slot_frame_hook(one_row[0], stats=_PER_FACE_STATS,
+                                         gated=True)
+                    if one_row[0][0] != -1 else None)
+                continue
             rules = decode_vertex_rule_specs(config.jaxpr, int(v), one_row)
             # THE per-FACE sink. Under --live-faces the per-vertex rows are
             # all-exact END rows, so the per-vertex sink below is never
