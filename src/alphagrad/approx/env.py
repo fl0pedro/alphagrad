@@ -1185,10 +1185,13 @@ def consume_grad_coverage_stats() -> dict:
 #   * the cosine is an ANGLE and ignores magnitude entirely: a plan that halves
 #     every entry of the Jacobian scores cos == 1.0 and rel_frob == 0.5.
 #
-# COST. Both fidelity and the cosine need the EXACT Jacobian. Under the default
+# COST. Both fidelity and the cosine need the EXACT Jacobian. Under the
 # `loss_drop` quality metric the exact executable is otherwise never compiled or
 # run -- that is where loss_drop's 0.22 s / 40 MB per plan (vs the cosine's
-# 9.70 s / 4.24 GB) comes from. So fidelity is NOT free by itself. What makes it
+# 9.70 s / 4.24 GB) comes from; under the default `grad_cosine` (2026-09-02)
+# it is built once and executed per plan anyway, and the residual is taken
+# from that same execution. Under loss_drop fidelity is NOT free by itself.
+# What makes it
 # cheap in practice is that `--reject-frozen-grads` (default ON) ALREADY
 # materialises the exact Jacobian at measurement point 0 for the coverage
 # guard: `_exact_ref_scores` folds the residual, the exact-norm and the cosine
@@ -2096,14 +2099,19 @@ _AXIS_FEAT_GROUP_ID = 3
 #   6 quality          — THE quality channel. Which QUANTITY sits in it is
 #                        selected by ``ALPHAGRAD_QUALITY_METRIC`` (see
 #                        ``quality_metric()`` below):
-#                          "loss_drop" (the default for any scalar-loss
-#                            target, i.e. every trainable example) -- the
-#                            relative loss drop of a 200-step Adam walk driven
-#                            by THIS PLAN's gradient, probed on a fixed batch
-#                            of 512 real MNIST images. Pearson 0.922 against
-#                            final downstream test accuracy vs 0.610 for the
+#                          "grad_cosine" (the default for any scalar-loss
+#                            target, i.e. every trainable example; owner
+#                            ruling 2026-09-02) -- the cosine between THIS
+#                            PLAN's gradient and the rev-exact gradient on the
+#                            same probe batch of real data, at init.
+#                          "loss_drop" (by name only) -- the relative loss
+#                            drop of a 200-step Adam walk driven by THIS
+#                            PLAN's gradient, probed on a fixed batch of 512
+#                            real MNIST images. Pearson 0.922 against final
+#                            downstream test accuracy vs 0.610 for the
 #                            Jacobian cosine, at 0.22 s / 40 MB per plan vs
-#                            9.70 s / 4.24 GB.
+#                            9.70 s / 4.24 GB; but finding 51 shows it can
+#                            score 0.885 while the gradient points elsewhere.
 #                          "cosine" (legacy) — cosine similarity between the
 #                            flattened approximated and exact Jacobians,
 #                            aggregated over the calibration samples.
@@ -2433,7 +2441,7 @@ class EnvConfig(NamedTuple):
     # target's output avals. Recorded on the CONFIG (not just validated in
     # from_jaxpr) because ``_callback`` sees only the config, and
     # ``quality_metric()``'s ``auto`` default needs it to decide between the
-    # loss-drop walk (defined only for a scalar loss) and the legacy Jacobian
+    # gradient cosine (defined only for a scalar loss) and the legacy Jacobian
     # cosine.
     scalar_target: bool = False
     # DEPRECATED AND UNREAD. ``--measure-grad`` used to decide what was traced.
@@ -3618,14 +3626,16 @@ def _quality_metrics(jac_exact, jac_approx):
 #     been measured -- is WEAK: 0.350 Pearson / 0.413 Spearman, worse than
 #     every cosine variant including the legacy one. It should stay LOGGED and
 #     should NOT be given a trained slot on this evidence.
-#   * loss_drop remains the `auto` default: its Pearson 0.885 is within noise
-#     of the K=1 gradient cosine's 0.874, but note it is WORSE on Spearman
-#     (0.765 vs 0.805) while costing 200x more. If the default is ever
-#     revisited, the gradient cosine is the cheaper equal -- that call is the
-#     owner's and is NOT made here.
+#   * loss_drop remained the `auto` default until 2026-09-02: its Pearson
+#     0.885 is within noise of the K=1 gradient cosine's 0.874, but note it is
+#     WORSE on Spearman (0.765 vs 0.805) while costing 200x more. The owner
+#     made the call on 2026-09-02 (ticket dsnn-3qm.39, finding 51: a plan can
+#     score 0.885 on loss_drop while its gradient points elsewhere): `auto` IS
+#     the gradient cosine for every scalar-loss target, and loss_drop is
+#     selectable by name only.
 #
-# So slot 6 now holds the LOSS DROP OF A SHORT ADAM WALK DRIVEN BY THE PLAN'S
-# OWN GRADIENT:
+# Under ALPHAGRAD_QUALITY_METRIC=loss_drop slot 6 holds the LOSS DROP OF A
+# SHORT ADAM WALK DRIVEN BY THE PLAN'S OWN GRADIENT:
 #
 #     L0      = loss(W0, probe)
 #     W_{t+1} = adam(W_t, plan_gradient(W_t, batch))     t = 0 .. T-1
@@ -3679,17 +3689,22 @@ def _grad_cosine_k() -> int:
 
 
 def quality_metric(config=None) -> str:
-    """``"loss_drop"`` or ``"cosine"`` — WHICH quantity reward slot 6 holds.
+    """``"grad_cosine"``, ``"jac_cosine"``, ``"loss_drop"`` or ``"none"`` —
+    WHICH quantity reward slot 6 holds.
 
     ``ALPHAGRAD_QUALITY_METRIC`` selects it; the default ``auto`` resolves to
-    ``loss_drop`` whenever the measured graph IS a scalar loss, which is now a
-    FACT READ OFF THE TRACED JAXPR (``EnvConfig.scalar_target``, set by
-    ``from_jaxpr`` from the target's output avals) rather than a flag. Every
-    trainable example is model + loss, so ``auto`` is ``loss_drop`` for all of
-    them; it falls back to the legacy ``cosine`` only for the analytic AD
+    ``grad_cosine`` (owner ruling 2026-09-02, ticket dsnn-3qm.39: the cosine
+    between the plan's gradient and the rev-exact gradient on the same probe
+    batch) whenever the measured graph IS a scalar loss, which is a FACT READ
+    OFF THE TRACED JAXPR (``EnvConfig.scalar_target``, set by ``from_jaxpr``
+    from the target's output avals) rather than a flag. Every trainable
+    example is model + loss, so ``auto`` is ``grad_cosine`` for all of them;
+    it falls back to the legacy ``jac_cosine`` only for the analytic AD
     benchmarks (Helmholtz / RoeFlux / Lighthouse / RobotArm / BlackScholes /
-    Simple), whose target is a full Jacobian and for which an Adam walk on
-    "the loss" is not defined. Read identically by the
+    Simple), whose target is a full Jacobian and which have no loss and no
+    data generator. ``loss_drop`` (the 200-step Adam walk) stays selectable
+    BY NAME and is never the default: finding 51 shows a plan scoring 0.885
+    on loss_drop while its gradient points elsewhere. Read identically by the
     trainer and by every CpuApproximationActor — both run THIS function inside
     THIS module's ``_callback``, so the two paths cannot disagree.
     """
@@ -3739,7 +3754,7 @@ def quality_metric(config=None) -> str:
             f"{_QUALITY_METRIC_ENV} must be one of "
             f"auto/loss_drop/grad_cosine/jac_cosine/cosine/none, got {want!r}"
         )
-    return ("loss_drop" if bool(getattr(config, "scalar_target", False))
+    return ("grad_cosine" if bool(getattr(config, "scalar_target", False))
             else "jac_cosine")
 
 
@@ -5749,6 +5764,9 @@ def _callback(
     # Jacobian, so under ``ALPHAGRAD_QUALITY_METRIC=loss_drop`` the exact
     # executable is not compiled and not executed at all. That is where the
     # 9.70 s -> 0.22 s and 4.24 GB -> 40 MB per-plan saving comes from.
+    # Under the default grad_cosine (2026-09-02) the exact executable IS
+    # built -- its compile is cached on ``exact_cache_key`` -- and executed
+    # once per plan on the probe batch, as the rev-exact reference.
     _qmetric = quality_metric(config)
     if is_terminal and _qmetric in ("jac_cosine", "grad_cosine"):
         try:
@@ -5819,9 +5837,9 @@ def _callback(
     # (~41.7GB at batch 512) before scoring — an OOM-truncation source that
     # said nothing about the plan.
     # Samples of THE QUALITY CHANNEL (reward slot 6). Historical name: under
-    # ALPHAGRAD_QUALITY_METRIC=cosine it holds one Jacobian cosine per
-    # calibration point; under the default loss_drop it holds exactly ONE
-    # entry, the plan's 200-step Adam-walk loss drop.
+    # ALPHAGRAD_QUALITY_METRIC=jac_cosine it holds one Jacobian cosine per
+    # calibration point; under the default grad_cosine (and under loss_drop)
+    # it holds exactly ONE entry per plan.
     cosines: list = []
     latency_samples: list[float] = []
     peak_mem_samples: list[float] = []
@@ -6103,9 +6121,11 @@ def _callback(
     # Quality family — reward slot 6 (``quality``) + frob_residual.
     # ------------------------------------------------------------------
     # WHICH quantity lands in slot 6 is ``quality_metric(config)``:
-    # ``loss_drop`` (the default for any scalar-loss target) = the loss drop of
-    # a 200-step Adam walk driven by this plan's gradient; ``cosine`` = the
-    # legacy Jacobian cosine. Both are "higher is better", both are ~[0, 1]
+    # ``grad_cosine`` (the default for any scalar-loss target) = the cosine
+    # between this plan's gradient and the rev-exact gradient; ``loss_drop``
+    # (by name) = the loss drop of a 200-step Adam walk driven by this plan's
+    # gradient; ``jac_cosine`` = the legacy Jacobian cosine. All are "higher
+    # is better", all are ~[0, 1]
     # (loss_drop can reach -1 when the walk diverges), so every downstream
     # consumer — PopArt's per-channel sigma floor, --lambda-acc, the symlog
     # bypass, the mult gate — keeps its calibration.
