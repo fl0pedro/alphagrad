@@ -4466,6 +4466,22 @@ def make_argparser() -> argparse.ArgumentParser:
         "measure actors resolve the SAME metric as the trainer.",
     )
     p.add_argument(
+        "--approx-old",
+        choices=["same", "exact"],
+        default="same",
+        help="THE OLD EDGE (ticket .56). A face accumulation multiplies lhs "
+        "by rhs into new and adds new onto the existing predecessor-to-"
+        "successor edge (old) when that edge exists. same = old carries the "
+        "SAME approximation as new (graphax's two-op face form, the new-slot "
+        "hook in jr), so both operands of the add carry one structure; "
+        "exact = old is left exact because it already holds the sum of "
+        "approximated and exact contributions from earlier accumulations. "
+        "The two are NOT comparable: the choice changes the measured object. "
+        "Published as ALPHAGRAD_APPROX_OLD (read by env.approx_old) so the "
+        "Ray measure actors resolve the SAME configuration as the trainer; "
+        "every plan-log record carries the value that measured it.",
+    )
+    p.add_argument(
         "--walk-steps", type=int, default=200,
         help="Adam steps in the loss-drop walk (measured configuration: 200).",
     )
@@ -6231,6 +6247,15 @@ def main():
               "(--quality-metric none). Pass --quality-metric loss_drop to "
               "force it.", flush=True)
     os.environ["ALPHAGRAD_QUALITY_METRIC"] = _qm
+    # OLD-EDGE CONFIGURATION (ticket .56), same hand-off shape as the quality
+    # channel: the flag is the ONLY user surface; the variable is how the Ray
+    # measure actors (their own processes) resolve the value the trainer was
+    # given. env.approx_old() is the one reader -- _face_dict_for_vertex emits
+    # the two-op face form under "same" and the bare triple under "exact", and
+    # every plan-log record carries the value that measured it.
+    os.environ["ALPHAGRAD_APPROX_OLD"] = str(args.approx_old)
+    print(f"[alphagrad] old edge at the face join (--approx-old) = "
+          f"{args.approx_old}", flush=True)
     os.environ["ALPHAGRAD_WALK_STEPS"] = str(int(args.walk_steps))
     os.environ["ALPHAGRAD_WALK_LR"] = repr(float(args.walk_lr))
     os.environ["ALPHAGRAD_WALK_PROBE_SEED"] = str(int(args.walk_probe_seed))
