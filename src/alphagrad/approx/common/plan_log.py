@@ -33,6 +33,22 @@ max_faces / face_slots), so ``decode_wires`` never reads the live process's
 the kind of ambient constant that makes an archive un-replayable six months
 later.
 
+THE QUANT DTYPE COLUMN IS A NAME (ticket dsnn-3qm.19 D7, finding 56). On
+the int32 wire a QUANT row is ``[QUANT_SENTINEL, dtype_idx, scale]`` with
+``dtype_idx`` the runtime index into ``graphax.sparse.micro_actions
+.QUANT_DTYPES`` -- a catalog enumerated from the runtime, which
+``jax_enable_x64`` prepends float64 / int64 / uint64 to, so the same dtype is
+index 0 (float32) and 2 (bfloat16) with x64 off and 3 and 5 with it on. A
+record that carried the index decoded to Quant(float64) / Quant(uint64)
+under the other setting. The record therefore carries the NAME, and
+:func:`quant_dtype_id` is the one place the two are converted: on the way
+in (``encode_wires``) the index becomes the name, on the way out
+(``decode_wires``) the name becomes THIS runtime's index. A schema-1 record
+carried a bare integer; ``decode_wires`` reads it as an index into the
+x64-OFF catalog, which is the catalog every archived log was written under
+(no launcher or campaign ever set jax_enable_x64; job 63579 confirms
+x64=False on the cluster).
+
 NON-FINITE FLOATS. The coverage census legitimately contains ``nan`` (an
 uncounted leaf) and can contain ``inf``. ``json.dumps`` would emit bare
 ``NaN``/``Infinity`` literals, which are not JSON and which several readers
@@ -50,7 +66,10 @@ import numpy as np
 
 # Bump the minor when a field is ADDED (readers must tolerate that), the
 # major when one changes meaning or disappears.
-SCHEMA = "alphagrad.plan_log/1"
+#   /1  a QUANT row's dtype column was the runtime INDEX into QUANT_DTYPES.
+#   /2  it is the dtype NAME. decode_wires reads both: a bare integer is a
+#       /1 index and resolves through the x64-OFF catalog.
+SCHEMA = "alphagrad.plan_log/2"
 
 # The vertex column of ``order`` is the 1-based jaxpr vertex id -- the same
 # integers ``env.valid_vertices`` holds and the same ones ``_callback`` hands
@@ -79,6 +98,56 @@ def kind_of_slot(b0: int, compress_sentinel: int = -2,
     if b0 == int(quant_sentinel):
         return "quant"
     return "other"
+
+
+_X64_ONLY_DTYPES = ("float64", "int64", "uint64")
+
+
+def quant_dtype_catalog(x64: bool | None = None) -> tuple[str, ...]:
+    """``QUANT_DTYPES`` as this runtime enumerates it (``x64=None``), or as a
+    runtime with the given ``jax_enable_x64`` setting would.
+
+    The flag is the only thing that moves the catalog between runtimes of the
+    same install (graphax ``_get_quant_dtypes``): on, it PREPENDS the three
+    64-bit dtypes. So the x64-OFF catalog is the live one without them. The
+    x64-ON catalog cannot be built from an x64-OFF process, which has no
+    64-bit dtypes to name; nothing needs it, since names are what is stored.
+    """
+    import jax
+    from graphax.sparse.micro_actions import QUANT_DTYPES
+    live = tuple(str(d) for d in QUANT_DTYPES)
+    if x64 is None or bool(x64) == bool(jax.config.jax_enable_x64):
+        return live
+    if x64:
+        raise ValueError(
+            "the x64-ON QUANT_DTYPES catalog cannot be built in an x64-OFF "
+            "process")
+    return tuple(n for n in live if n not in _X64_ONLY_DTYPES)
+
+
+def quant_dtype_id(value, catalog=None):
+    """THE conversion of a QUANT row's dtype column between the wire (the
+    runtime index into ``QUANT_DTYPES``) and the record (the dtype name).
+
+    An ``int`` is an index and comes back as the name; a ``str`` is a name
+    and comes back as the index. ``catalog`` defaults to this runtime's.
+    Anything unresolvable RAISES: index 0 is float32 with x64 off and
+    float64 with it on, so a silent fallback to 0 (what env.py's decoder
+    does with an out-of-range index) would measure a different plan and
+    report it as this one.
+    """
+    cat = quant_dtype_catalog() if catalog is None else tuple(catalog)
+    if isinstance(value, str):
+        if value not in cat:
+            raise ValueError(
+                f"QUANT dtype {value!r} is not in this runtime's "
+                f"QUANT_DTYPES {cat}")
+        return cat.index(value)
+    idx = int(value)
+    if not 0 <= idx < len(cat):
+        raise ValueError(
+            f"QUANT dtype index {idx} is outside QUANT_DTYPES (len {len(cat)})")
+    return cat[idx]
 
 
 def jsonable(x):
@@ -152,7 +221,7 @@ def encode_wires(order, rule_specs, face_specs, face_skips, *,
     req_v = {"diag": 0, "compress": 0, "quant": 0, "other": 0}
     req_f = {"diag": 0, "compress": 0, "quant": 0, "other": 0}
 
-    rules: list[list[int]] = []
+    rules: list[list[int | str]] = []
     for k in range(min(n, int(rs.shape[0]) if rs.size else 0)):
         for r in range(max_rules):
             b0 = int(rs[k, r, 0])
@@ -161,9 +230,12 @@ def encode_wires(order, rule_specs, face_specs, face_skips, *,
                 continue
             req_v[kind] += 1
             req[kind] += 1
-            rules.append([k, r, b0, int(rs[k, r, 1]), int(rs[k, r, 2])])
+            b1 = int(rs[k, r, 1])
+            if kind == "quant":
+                b1 = quant_dtype_id(b1)
+            rules.append([k, r, b0, b1, int(rs[k, r, 2])])
 
-    faces: list[list[int]] = []
+    faces: list[list[int | str]] = []
     n_live = 0
     truncated = 0
     n_skip = 0
@@ -190,7 +262,10 @@ def encode_wires(order, rule_specs, face_specs, face_skips, *,
                     continue
                 row = [k, f, skip]
                 for s in range(face_slots):
-                    row.extend(int(v) for v in slots[s])
+                    b0, b1, b2 = (int(v) for v in slots[s])
+                    if b0 == int(quant_sentinel):
+                        b1 = quant_dtype_id(b1)
+                    row.extend((b0, b1, b2))
                 faces.append(row)
 
     req["total"] = sum(req[k] for k in ("diag", "compress", "quant", "other"))
@@ -206,9 +281,10 @@ def encode_wires(order, rule_specs, face_specs, face_skips, *,
         "order": [int(v) for v in order.tolist()],
         "shape": {"n": n, "max_rules": max_rules, "max_faces": max_faces,
                   "face_slots": face_slots},
-        # [k, rule_row, b0, b1, b2]
+        # [k, rule_row, b0, b1, b2]; b1 is the dtype NAME on a QUANT row
         "rules": rules,
-        # [k, face, skip, s0b0, s0b1, s0b2, s1b0, ...] -- face_slots triples
+        # [k, face, skip, s0b0, s0b1, s0b2, s1b0, ...] -- face_slots triples,
+        # again with the dtype name in a QUANT slot's middle column
         "faces": faces,
         "n_live_faces": n_live,
         "faces_truncated": truncated,
@@ -219,14 +295,31 @@ def encode_wires(order, rule_specs, face_specs, face_skips, *,
     }
 
 
-def decode_wires(rec: dict):
+def decode_wires(rec: dict, *, quant_sentinel: int = -3):
     """``(order, rule_specs, face_specs, face_skips)`` -- the dense int32
     buffers ``env._callback`` consumes, rebuilt EXACTLY.
 
     Feed them straight back with ``stop=len(order)``. Raises on a record
     that was truncated rather than handing back a plan that would measure
     as something else -- the failure mode 907c231 is about.
+
+    A QUANT row's dtype column comes back as THIS runtime's index for the
+    recorded name. A bare integer there is a schema-1 record: it is read as
+    an index into the x64-OFF catalog (see the module docstring), then
+    resolved by name like any other. A name this runtime cannot resolve
+    raises.
     """
+    legacy_catalog: list = []
+
+    def _dtype_col(b0, b1):
+        if int(b0) != int(quant_sentinel):
+            return int(b1)
+        if not isinstance(b1, str):
+            if not legacy_catalog:
+                legacy_catalog.append(quant_dtype_catalog(x64=False))
+            b1 = quant_dtype_id(int(b1), legacy_catalog[0])
+        return quant_dtype_id(b1)
+
     if not rec.get("replayable", True):
         raise ValueError(
             f"plan-log record is NOT replayable: {rec.get('faces_truncated')} "
@@ -241,8 +334,8 @@ def decode_wires(rec: dict):
     rule_specs = np.full((n, int(sh["max_rules"]), 3), -1, dtype=np.int32)
     rule_specs[:, :, 2] = 0
     for row in rec.get("rules", ()):
-        k, r, b0, b1, b2 = (int(v) for v in row)
-        rule_specs[k, r] = (b0, b1, b2)
+        k, r, b0, b1, b2 = row
+        rule_specs[int(k), int(r)] = (int(b0), _dtype_col(b0, b1), int(b2))
     mf, fslots = int(sh["max_faces"]), int(sh["face_slots"])
     face_specs = np.full((n, mf, fslots, 3), -1, dtype=np.int32)
     face_skips = np.zeros((n, mf), dtype=np.int32)
@@ -250,8 +343,8 @@ def decode_wires(rec: dict):
         k, f, skip = int(row[0]), int(row[1]), int(row[2])
         face_skips[k, f] = skip
         for s in range(fslots):
-            face_specs[k, f, s] = (int(row[3 + 3 * s]),
-                                   int(row[4 + 3 * s]),
+            b0 = row[3 + 3 * s]
+            face_specs[k, f, s] = (int(b0), _dtype_col(b0, row[4 + 3 * s]),
                                    int(row[5 + 3 * s]))
     return order, rule_specs, face_specs, face_skips
 
