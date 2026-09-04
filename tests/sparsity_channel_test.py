@@ -26,10 +26,10 @@ ratio to the original". What is pinned here:
    10 in both rather than colliding with bkstep_acc in one of them. No existing
    index moved.
 
-5. THE GUARD IS A HARD PRECONDITION. ``--sparsity-weight`` without
-   ``--reject-frozen-grads`` raises. Sparsity is maximised by DELETING
-   computation; the coverage guard is the only thing that refuses the plans
-   that do it.
+5. NO GUARD PRECONDITION (owner ruling 2026-09-03, ticket dsnn-3qm.15). The gradient-coverage guard that
+   used to be required for a non-zero ``--sparsity-weight`` was removed --
+   no guard, never a reward gate. Sparsity is still maximised by DELETING
+   computation and nothing refuses those plans; the channel stays default off.
 
 6. FLAG-OFF INERTNESS: no extra value head, no extra pytree leaf, the symlog
    exempt set unchanged, the slot reads 0.0.
@@ -44,8 +44,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
 for _k in ("ALPHAGRAD_SPARSITY", "ALPHAGRAD_SPARSITY_WEIGHT",
-           "ALPHAGRAD_FIDELITY", "ALPHAGRAD_FIDELITY_WEIGHT",
-           "ALPHAGRAD_REJECT_FROZEN_GRADS", "ALPHAGRAD_GRAD_COVERAGE_WEIGHT"):
+           "ALPHAGRAD_FIDELITY", "ALPHAGRAD_FIDELITY_WEIGHT"):
     os.environ.pop(_k, None)
 
 import jax                                                      # noqa: E402
@@ -181,8 +180,8 @@ def test_sparsity_is_a_bounded_quality_channel_not_a_cost():
 
 # ------------------------------------------------------------- 4. sentinels
 def test_a_sentinelled_plan_takes_the_sparsity_floor_not_the_ceiling():
-    """THE most important line in the channel. A plan the coverage guard
-    rejects is overwhelmingly a plan that DELETED computation -- which is the
+    """THE most important line in the channel. A sentinelled plan is
+    overwhelmingly a plan that DELETED computation -- which is the
     sparsity ceiling. It must score the floor instead."""
     v = np.asarray(envmod._SENTINEL_BAD_REWARD)
     assert v.shape == (envmod.NUM_REWARDS,)
@@ -208,11 +207,10 @@ def test_the_pool_sentinel_stays_optional():
     assert r.shape == (envmod.NUM_REWARDS,)
 
 
-# --------------------------------------------- 5. the guard is a precondition
+# ------------------------- 5. no guard precondition (owner ruling 2026-09-03)
 def _args(**kw):
     base = dict(sparsity_weight=0.0, sparsity_log=False,
-                reject_frozen_grads=True, fidelity_weight=0.0,
-                grad_coverage_weight=0.0, cos_log_every=0,
+                fidelity_weight=0.0, cos_log_every=0,
                 reward_mode="additive", symlog_channels="all")
     base.update(kw)
     return SimpleNamespace(**base)
@@ -234,20 +232,19 @@ def _restore_head_globals():
             os.environ[k] = v
 
 
-def test_training_sparsity_without_the_coverage_guard_is_refused():
-    with pytest.raises(ValueError) as exc:
-        ppo.configure_sparsity(_args(sparsity_weight=1.0,
-                                     reject_frozen_grads=False))
-    assert "reject-frozen-grads" in str(exc.value)
-    # the head must not have been appended by the failed call
-    assert ppo.SPARSITY_HEAD not in ppo.VALUE_HEAD_ATTRS
+def test_training_sparsity_is_accepted_without_any_guard():
+    """owner ruling 2026-09-03, ticket dsnn-3qm.15: the gradient-coverage guard is gone and
+    nothing gates a reward. A non-zero weight is accepted as-is; the
+    hackability warning on env._SPARSITY_STATS is the only defence."""
+    w = ppo.configure_sparsity(_args(sparsity_weight=1.0))
+    assert w == 1.0
+    assert ppo.SPARSITY_HEAD in ppo.VALUE_HEAD_ATTRS
 
 
-def test_logging_sparsity_without_the_guard_is_allowed():
-    """--sparsity-log records the channel without training on it, so it does
-    not need the guard: nothing can be reward-hacked through a weight of 0."""
-    w = ppo.configure_sparsity(_args(sparsity_log=True,
-                                     reject_frozen_grads=False))
+def test_logging_sparsity_is_allowed():
+    """--sparsity-log records the channel without training on it: nothing can
+    be reward-hacked through a weight of 0."""
+    w = ppo.configure_sparsity(_args(sparsity_log=True))
     assert w == 0.0
     assert os.environ["ALPHAGRAD_SPARSITY"] == "1"
     assert envmod.sparsity_enabled()
@@ -280,15 +277,12 @@ def test_weight_appends_exactly_one_head_at_the_end():
     assert ppo.NUM_VALUE_HEADS == 4
 
 
-def test_the_head_order_is_deterministic_after_the_other_two():
-    ppo.configure_grad_coverage(
-        _args(grad_coverage_weight=1.0, reject_frozen_grads=True))
+def test_the_head_order_is_deterministic_after_fidelity():
     ppo.configure_fidelity(_args(fidelity_weight=1.0))
     ppo.configure_sparsity(_args(sparsity_weight=1.0))
-    assert ppo.HEAD_NAMES == ("latency", "mem", "quality", "grad_cov",
-                              "fidelity", "sparsity")
-    assert ppo.HEAD_REWARD_INDICES[-3:] == (
-        int(envmod.REWARD_INDEX["grad_coverage"]),
+    assert ppo.HEAD_NAMES == ("latency", "mem", "quality", "fidelity",
+                              "sparsity")
+    assert ppo.HEAD_REWARD_INDICES[-2:] == (
         int(envmod.REWARD_INDEX["fidelity"]), SSLOT)
 
 

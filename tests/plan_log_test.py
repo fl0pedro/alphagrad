@@ -1,4 +1,4 @@
-"""A6 -- THE PLAN LOG: the wire round trip, the census, and REPLAYABILITY.
+"""A6 -- THE PLAN LOG: the wire round trip, the record, and REPLAYABILITY.
 
 What is pinned here:
 
@@ -192,7 +192,6 @@ def test_terminal_plan_is_recorded_and_replays_to_the_same_reward():
         assert len(recs) == 1, [r["order"] for r in recs]
         rec = recs[0]
         assert rec["schema"] == plog.SCHEMA
-        assert rec["sentinelled"] is False
         assert len(rec["rewards"]) == NUM_REWARDS == 11
         assert rec["requested"]["skip"] == 1
         assert rec["requested"]["total"] == 0     # a skip is not a rule
@@ -220,7 +219,7 @@ def test_terminal_plan_is_recorded_and_replays_to_the_same_reward():
         envmod.consume_plan_records()
 
 
-def test_record_carries_the_per_kind_and_coverage_fields():
+def test_record_carries_the_per_kind_fields_and_no_census():
     os.environ["ALPHAGRAD_PLAN_LOG"] = "1"
     try:
         envmod.consume_plan_records()
@@ -232,11 +231,11 @@ def test_record_carries_the_per_kind_and_coverage_fields():
             for kind in ("diag", "compress", "quant"):
                 assert isinstance(rec[bucket][kind], int)
         assert isinstance(rec["counts_from_trace"], bool)
-        # The census is present as a field in every record; "measured" is
-        # False when the coverage channel is off, which is the default here
-        # -- and that is DISTINCT from a census that ran and found nothing.
-        assert "coverage" in rec
-        assert rec["coverage"]["measured"] is False
+        # The gradient-coverage census and the guard's ``sentinelled`` flag
+        # left the record with the guard (owner ruling 2026-09-03, ticket dsnn-3qm.15). Slot 7 keeps its NAME so
+        # archived logs still decode against the same table.
+        assert "coverage" not in rec
+        assert "sentinelled" not in rec
         # The record names its own slots: slot 6 is spelled "quality" in
         # REWARD_NAMES (``cosine_sim`` is the back-compat alias in
         # REWARD_INDEX, not the canonical name) and holds whichever metric
@@ -248,33 +247,6 @@ def test_record_carries_the_per_kind_and_coverage_fields():
     finally:
         os.environ["ALPHAGRAD_PLAN_LOG"] = "0"
         envmod.consume_plan_records()
-
-
-def test_coverage_census_is_recorded_per_plan_when_the_channel_is_on():
-    os.environ["ALPHAGRAD_PLAN_LOG"] = "1"
-    os.environ["ALPHAGRAD_GRAD_COVERAGE"] = "1"
-    try:
-        envmod.consume_plan_records()
-        envmod.consume_grad_coverage_stats()
-        env = _make_env()
-        _run_episode(env, skip_face_of_vertex=1)
-        rec = envmod.consume_plan_records()["records"][0]
-        cov = rec["coverage"]
-        assert cov["measured"] is True, cov
-        assert cov["defined"] is True, cov
-        # The per-leaf census the brief asks for, per PLAN.
-        assert cov["n_counted"] >= 1
-        assert len(cov["approx_norms"]) == len(cov["exact_norms"])
-        assert len(cov["leaf_ratios"]) == cov["n_leaves"]
-        assert 0.0 <= plog.unjson_float(cov["frac_leaves_zeroed"]) <= 1.0
-        # It agrees with the one-float encoding on reward slot 7.
-        ch = rec["rewards"][REWARD_INDEX["grad_coverage"]]
-        assert abs(float(ch) - plog.unjson_float(cov["channel"])) < 1e-6
-    finally:
-        os.environ["ALPHAGRAD_PLAN_LOG"] = "0"
-        os.environ.pop("ALPHAGRAD_GRAD_COVERAGE", None)
-        envmod.consume_plan_records()
-        envmod.consume_grad_coverage_stats()
 
 
 def test_the_jsonl_is_append_only(tmp_path):
