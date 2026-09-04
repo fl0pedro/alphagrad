@@ -454,7 +454,7 @@
     3,
     4
    ],
-   "env_delta_count": 1085,
+   "env_delta_count": 1157,
    "env_order_prefix": [
     1,
     6,
@@ -820,8 +820,8 @@
       7
      ]
     ],
-    "entropy": "41328851",
-    "logp": "c1373fcb",
+    "entropy": "413289e7",
+    "logp": "c1373c7f",
     "n_live": 2,
     "pair_valid": [
      [
@@ -1077,9 +1077,9 @@
    "step": 3,
    "target_vertex": 5,
    "value": [
-    "bd68904f",
-    "be917f08",
-    "3e53f73b"
+    "bd6256e4",
+    "be8c1724",
+    "3e59c8a0"
    ],
    "vertex": 4,
    "vertex_mask_fill": [
@@ -1089,15 +1089,15 @@
    "vertex_probs_live": [
     [
      1,
-     "3eac8660"
+     "3eac7f66"
     ],
     [
      3,
-     "3eac4f62"
+     "3eac4d84"
     ],
     [
      4,
-     "3ea72a3f"
+     "3ea73316"
     ]
    ]
   },
@@ -1106,7 +1106,7 @@
     1,
     3
    ],
-   "env_delta_count": 857,
+   "env_delta_count": 865,
    "env_order_prefix": [
     1,
     6,
@@ -1145,8 +1145,8 @@
       7
      ]
     ],
-    "entropy": "41489956",
-    "logp": "c14a86c7",
+    "entropy": "41489dcd",
+    "logp": "c14a7143",
     "n_live": 2,
     "pair_valid": [
      [
@@ -1402,9 +1402,9 @@
    "step": 4,
    "target_vertex": 4,
    "value": [
-    "bd377755",
-    "be8c53fc",
-    "3e2435dd"
+    "bd3031ec",
+    "be887d7f",
+    "3e2c2037"
    ],
    "vertex": 3,
    "vertex_mask_fill": [
@@ -1414,11 +1414,11 @@
    "vertex_probs_live": [
     [
      1,
-     "3efc2fa4"
+     "3efce12c"
     ],
     [
      3,
-     "3f01e82f"
+     "3f018f6a"
     ]
    ]
   }
