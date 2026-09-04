@@ -28,6 +28,7 @@ What is pinned:
   * sampling == replay under per-slot masks (the PPO ratio at epoch 0);
   * flag off (``vertex``) is the pre-ticket code path, byte for byte.
 """
+import contextlib
 import os
 from collections import Counter
 from types import SimpleNamespace
@@ -105,10 +106,23 @@ def _fresh_ij(closed, xs):
                             list(closed.literals), list(xs))
 
 
+@contextlib.contextmanager
+def _in_trace(rec):
+    """The recorded tensors are tracers of ``rec``'s persistent trace; a rule
+    applied to one must run inside it (as ``per_face_masks_test`` does)."""
+    from jax._src import core as _jcore
+    with _jcore.set_current_trace(rec.trace):
+        yield
+
+
+_REC = {}
+
+
 def _walk_to(closed, xs, upto_vertex):
     """Eliminate reverse order EXACTLY down to (not including) ``upto_vertex``;
     return the ij and the recorded ``{face key: {site: tensor}}`` of that
-    vertex's faces (recorded on a throwaway copy of the elimination)."""
+    vertex's faces (recorded on a throwaway copy of the elimination, kept in
+    ``_REC[id(store)]`` so :func:`_in_trace` can reopen its trace)."""
     total_v = len(closed.jaxpr.eqns)
     ij = _fresh_ij(closed, xs)
     for v in range(total_v, upto_vertex, -1):
@@ -129,6 +143,7 @@ def _walk_to(closed, xs, upto_vertex):
             return h
         ft[key] = ((mk("lhs"), mk("rhs"), mk("new")), (None, None, None))
     rec.eliminate(upto_vertex, (), face_transforms=ft)
+    _REC[id(store)] = rec
     return ij, keys, store
 
 
@@ -259,12 +274,16 @@ def test_frame_decode_is_the_vertex_decode_when_the_frames_agree():
 def test_face_dict_applies_in_the_slot_frame_end_to_end():
     """Through ``_face_dict_for_vertex`` and a real elimination.
 
-    Slot rows: lhs = Reduce axis 1, rhs = Reduce axis 0, new = Reduce axis 0.
-    Every one is legal in its OWN frame, so all three apply. The same wire
-    under the vertex frame decodes the rhs/new rows identically here (axis 0
-    is in range in both frames), so the assertion that separates the two
-    frames is the lhs axis-1 row on the OTHER slots: put axis 1 on rhs and
-    the vertex frame decodes a Compress the mask must then refuse (counted
+    One slot at a time: lhs = Reduce axis 1 (its primal dim, size 4), rhs =
+    Reduce axis 0, new = Reduce axis 0. Each is legal in its OWN frame and
+    applies. (Not all three in one run: ``new`` is the product of the two
+    operands, and once lhs and rhs have each lost an axis the contraction
+    result is a scalar-``val`` tensor on which a Reduce is a no-op -- the
+    slots interact through the contraction, which is exactly why legality
+    is decided on the live tensor at apply time.)
+
+    The row that separates the two frames is the lhs axis-1 row on rhs: the
+    vertex frame decodes a Compress the mask must then refuse (counted
     ``skipped_compress``), the slot frame decodes nothing (also counted
     ``skipped_compress`` -- a requested rule that names no dim of the slot is
     a miss, not silence).
@@ -293,9 +312,14 @@ def test_face_dict_applies_in_the_slot_frame_end_to_end():
 
     legal = {"lhs": (COMPRESS_SENTINEL, 1, 0), "rhs": (COMPRESS_SENTINEL, 0, 0),
              "new": (COMPRESS_SENTINEL, 0, 0)}
-    st = run(legal, True)
-    assert st.get("applied_compress", 0) == 3, st
-    assert st.get("skipped_compress", 0) == 0, st
+    for site, row in legal.items():
+        st = run({site: row}, True)
+        assert st.get("applied_compress", 0) == 1, (site, st)
+        assert st.get("skipped_compress", 0) == 0, (site, st)
+    # The lhs row (axis 1) is what the vertex frame would ALSO have admitted
+    # on rhs and new, where no such axis exists.
+    st = run({"lhs": legal["lhs"]}, False)
+    assert st.get("applied_compress", 0) == 1, st
 
     bad = {"rhs": (COMPRESS_SENTINEL, 1, 0)}
     st_slot = run(bad, True)
@@ -389,6 +413,14 @@ def test_slot_legality_equals_the_hooks_verdict():
     closed = _closed(_chain, _ARGS)
     _ij, keys, store = _walk_to(closed, _ARGS, 1)
     checked = admitted = 0
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(_in_trace(_REC[id(store)]))
+        checked, admitted = _verdict_sweep(keys, store)
+    assert checked > 0 and admitted > 0, (checked, admitted)
+
+
+def _verdict_sweep(keys, store):
+    checked = admitted = 0
     for key in keys:
         st_by_site = store.get(key)
         if not st_by_site or "lhs" not in st_by_site:
@@ -434,7 +466,7 @@ def test_slot_legality_equals_the_hooks_verdict():
                 assert real == bool(L.quant[d]), (site, name, stats)
                 del out
                 checked += 1
-    assert checked > 0 and admitted > 0, (checked, admitted)
+    return checked, admitted
 
 
 def test_the_slot_probe_is_a_pure_read_and_memoized():
@@ -522,6 +554,8 @@ def test_masked_head_equals_pruned_head_per_slot():
         S_DTYPE, S_I, S_J, S_OP, S_RFN, j_mask_given_i, slot_base)
     from alphagrad.approx.unified_micro import _BF16_SLOT, _KIND_MAP
     kinds = np.asarray(_KIND_MAP)
+    # The reference inverts fn -> compress_kind, as evaluate_face does.
+    assert len(set(kinds.tolist())) == len(kinds), kinds
 
     pol, tables = _policy()
     feats = _features()
@@ -534,8 +568,10 @@ def test_masked_head_equals_pruned_head_per_slot():
     assert not np.array_equal(np.asarray(om[0]), np.asarray(om[1]))
     assert float(om[1][OP_BLOCKDIAG]) == 0.0 and float(om[0][OP_BLOCKDIAG]) == 1.0
     assert float(om[2][OP_QUANT]) == 0.0 and float(om[1][OP_QUANT]) == 1.0
-    assert np.array_equal(np.asarray(am[0] > 0.5), np.asarray(comp[0] > 0.5))
-    assert np.array_equal(np.asarray(am[1] > 0.5), np.asarray(comp[1] > 0.5))
+    for s in range(FACE_SLOTS):      # axis head is NUM_REDUCE_AXES (9) wide
+        assert np.array_equal(np.asarray(am[s] > 0.5)[:N_AX],
+                              np.asarray(comp[s] > 0.5)), s
+        assert not bool(am[s][N_AX:].any())
 
     z = pol.head.logits(ctx)
     zn = np.asarray(z, np.float64)
@@ -543,11 +579,12 @@ def test_masked_head_equals_pruned_head_per_slot():
     for k in range(24):
         (skip, row, lp, ent, _ar, _sp, _od) = pol.sample_face(
             feats, tables, jrand.PRNGKey(100 + k), 0,
-            pair, comp, jnp.asarray(1.0), face_sizes_f=sizes,
-            face_quant_f=quant)
+            pair, comp, jnp.asarray(1.0), face_context=ctx,
+            face_sizes_f=sizes, face_quant_f=quant)
         lp2, ent2 = pol.evaluate_face(
             feats, tables, _as_face_action(row, skip), 0, pair, comp,
-            jnp.asarray(1.0), face_sizes_f=sizes, face_quant_f=quant)[:2]
+            jnp.asarray(1.0), face_context=ctx, face_sizes_f=sizes,
+            face_quant_f=quant)[:2]
         assert abs(float(lp) - float(lp2)) < 1e-5
         assert abs(float(ent) - float(ent2)) < 1e-5
         # The reference.
@@ -608,7 +645,7 @@ def _as_face_action(row, skip, F=4):
 
     def _pad(v):
         v = jnp.asarray(v)
-        z = jnp.zeros((F,) + v.shape[1:], v.dtype)
+        z = jnp.zeros((F,) + tuple(v.shape), v.dtype)
         return z.at[0].set(v)
 
     return FaceAction(
@@ -658,28 +695,37 @@ def test_sampled_distribution_equals_the_pruned_distribution_per_slot():
 
 def test_rank_2_inputs_take_the_pre_ticket_broadcast_path():
     """Vertex-frame inputs (one sizes vector, one pair mask, one comp mask,
-    one quant bit) go through the unchanged broadcast code and score the same
-    as a per-slot call with that vector replicated three times."""
+    one quant bit) never enter the per-slot path: ``_slot_inputs`` declines
+    them, ``_face_masks`` gets a single ``AxisTokenFeatures`` (a tuple, not
+    a list) and returns slot-identical masks -- the historical broadcast.
+    The same-key equality with the per-slot call replicated three times holds
+    for the op / i / axis masks; the j mask and the pair table DIFFER on
+    purpose (the per-slot path reads the exact (i, j) table, the broadcast
+    path keeps its historical row-0 read), which is why the flag-off identity
+    is pinned trajectory-wide by ALPHAGRAD_EQ_DUMP and not here."""
+    from alphagrad.approx.heads import quant_hardware_masks
     pol, tables = _policy()
     feats = _features()
-    F, n = 4, N_AX
+    n = N_AX
     fpv = jnp.ones((n, n), jnp.float32) * (1.0 - jnp.eye(n))
     fcv = jnp.ones((n,), jnp.float32)
     sz = jnp.asarray([4, 12, 6, 3, 0, 0, 0, 0], jnp.int32)
-    a = pol.sample_face(feats, tables, jrand.PRNGKey(5), 0, fpv, fcv,
-                        jnp.asarray(1.0), face_sizes_f=sz,
-                        face_quant_f=jnp.asarray(1.0))
-    b = pol.sample_face(feats, tables, jrand.PRNGKey(5), 0,
-                        jnp.broadcast_to(fpv, (FACE_SLOTS, n, n)),
-                        jnp.broadcast_to(fcv, (FACE_SLOTS, n)),
-                        jnp.asarray(1.0),
-                        face_sizes_f=jnp.broadcast_to(sz, (FACE_SLOTS, n)),
-                        face_quant_f=jnp.ones((FACE_SLOTS,), jnp.float32))
-    assert float(a[2]) == float(b[2])
-    assert float(a[3]) == float(b[3])
-    for k in a[1]:
-        assert bool(jnp.all(a[1][k] == b[1][k])), k
-    del F
+    qhw = quant_hardware_masks()[0]
+    assert pol._slot_inputs(feats, fpv, fcv, qhw, sz, jnp.asarray(1.0)) is None
+    assert pol._slot_inputs(feats, fpv, fcv, qhw, None, None) is None
+    single = pol._face_masks(pol._face_feats_1(feats, sz), fpv, fcv, qhw,
+                             None, tables)
+    for m in single:
+        for s in range(1, FACE_SLOTS):
+            assert bool(jnp.all(m[s] == m[0]))
+    per = pol._slot_inputs(feats, jnp.broadcast_to(fpv, (FACE_SLOTS, n, n)),
+                           jnp.broadcast_to(fcv, (FACE_SLOTS, n)), qhw,
+                           jnp.broadcast_to(sz, (FACE_SLOTS, n)),
+                           jnp.ones((FACE_SLOTS,), jnp.float32))
+    assert per is not None and isinstance(per[0], list)
+    rep = pol._face_masks(*per, None, tables)
+    for k in (0, 1, 3):                       # op, i, axis masks agree
+        assert bool(jnp.all(rep[k] == single[k])), k
 
 
 # ==========================================================================

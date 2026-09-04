@@ -130,8 +130,9 @@ class UnifiedFacePolicy(eqx.Module):
         all from ``LiveFaceStream.face_slot_legality`` -- each slot's masks
         come from ITS OWN legality (:meth:`_slot_masks_1`) and are stacked.
         A single ``features`` keeps the historical broadcast, byte for byte.
+        (A LIST, specifically: ``AxisTokenFeatures`` is itself a tuple.)
         """
-        if not isinstance(features, (list, tuple)):
+        if not isinstance(features, list):
             op_legal = _compute_op_legality(
                 features, pair_valid=pair_valid_f,
                 compress_valid=comp_valid_f,
@@ -317,7 +318,7 @@ class UnifiedFacePolicy(eqx.Module):
         #
         # PER SLOT (ticket .18): a list of per-slot features gives each slot
         # its OWN sizes, so the factor is the gcd on the tensor the Diag hits.
-        if isinstance(features, (list, tuple)):
+        if isinstance(features, list):
             sz = jnp.stack([self._pair_sizes(f) for f in features])
             _s = jnp.arange(FACE_SLOTS)
             N_i = sz[_s, jnp.clip(fields.i, 0, MAX_PAIR_IDX - 1)]
