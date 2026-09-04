@@ -1118,7 +1118,8 @@ class LiveVertexMaskOracle:
         from graphax import SKIP_FACE
         from graphax.core import faces_of
         from alphagrad.approx.env import (
-            FACE_SLOTS, MAX_RULES_PER_VERTEX, decode_vertex_rule_specs)
+            FACE_SLOTS, MAX_RULES_PER_VERTEX, decode_vertex_rule_specs,
+            face_entry_from_slots)
 
         keys = faces_of(incr.graph, incr.tgraph, int(vertex), incr.jaxpr)
         ft: dict = {}
@@ -1138,7 +1139,7 @@ class LiveVertexMaskOracle:
                 slots.append(make_live_masked_hook(tuple(rls))
                              if rls else None)
             if any(sl is not None for sl in slots):
-                ft[keys[f]] = tuple(slots)
+                ft[keys[f]] = face_entry_from_slots(slots)
         return ft or None
 
     @property

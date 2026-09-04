@@ -4347,6 +4347,47 @@ def approx_old() -> str:
     return want
 
 
+def face_entry_from_slots(slots):
+    """ONE face's ``face_transforms`` entry from its decoded per-slot hooks
+    ``(lhs, rhs, new)`` -- the ONLY place a face wire becomes a graphax
+    entry (ticket .17, D1). ``_face_dict_for_vertex`` (the measurement),
+    ``live_faces.LiveFaceStream._decided`` (the head's tokens),
+    ``plan_tokens.PlanTokenizer.face_transforms`` (the AZ tokens) and
+    ``masks.LiveVertexMaskOracle._face_ft`` (the mask replay) all go through
+    here, so one wire has one transform semantics and ``approx_old()`` has
+    one reader.
+
+    #72. A bare 3-tuple means CONTRACTION ONLY to graphax
+    (_normalize_perpath, core.py:797): pre/post hit the two
+    contraction operands and `new` the contraction RESULT, while
+    the join hooks stay None. The requested semantics is that a
+    `new`-slot approximation ALSO applies to the existing edge
+    this result is added to, so compute is saved on both
+    operands of the join.
+
+    graphax already wires that: `_h_rhs` is applied to `_edge`
+    -- the existing edge -- immediately before the add
+    (core.py:1679). So emit the TWO-OP form and put the new-slot
+    hook in `rhs`.
+
+    `lhs` stays None on purpose: `new` has already transformed
+    the contraction result at core.py:1657, and `lhs` hits that
+    SAME tensor at 1678, so setting it would apply the
+    approximation twice. `res` (the summed edge) is a decision
+    the head does not make.
+
+    Faces with no existing edge are unaffected -- graphax simply
+    never reaches the join hooks for them.
+
+    --approx-old exact leaves the old edge alone: the bare 3-tuple
+    is emitted and graphax never reaches the join hooks.
+    """
+    _new_hook = slots[2] if len(slots) > 2 else None
+    if _new_hook is not None and approx_old() == "same":
+        return (tuple(slots), (None, _new_hook, None))
+    return tuple(slots)
+
+
 def _face_dict_for_vertex(config, ij, v, face_row, face_skip):
     """ONE vertex's ``{face_key: slots|SKIP_FACE}`` from its wire rows,
     enumerated on ``ij``'s CURRENT graph — call BEFORE eliminating ``v``.
@@ -4393,35 +4434,7 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip):
                 make_live_masked_hook(tuple(rules), stats=_PER_FACE_STATS,
                                       gated=True) if rules else None)
         if any(sl is not None for sl in slots):
-            # #72. A bare 3-tuple means CONTRACTION ONLY to graphax
-            # (_normalize_perpath, core.py:797): pre/post hit the two
-            # contraction operands and `new` the contraction RESULT, while
-            # the join hooks stay None. The requested semantics is that a
-            # `new`-slot approximation ALSO applies to the existing edge
-            # this result is added to, so compute is saved on both
-            # operands of the join.
-            #
-            # graphax already wires that: `_h_rhs` is applied to `_edge`
-            # -- the existing edge -- immediately before the add
-            # (core.py:1679). So emit the TWO-OP form and put the new-slot
-            # hook in `rhs`.
-            #
-            # `lhs` stays None on purpose: `new` has already transformed
-            # the contraction result at core.py:1657, and `lhs` hits that
-            # SAME tensor at 1678, so setting it would apply the
-            # approximation twice. `res` (the summed edge) is a decision
-            # the head does not make.
-            #
-            # Faces with no existing edge are unaffected -- graphax simply
-            # never reaches the join hooks for them.
-            #
-            # --approx-old exact leaves the old edge alone: the bare 3-tuple
-            # is emitted and graphax never reaches the join hooks.
-            _new_hook = slots[2] if len(slots) > 2 else None
-            if _new_hook is not None and approx_old() == "same":
-                per_face[key] = (tuple(slots), (None, _new_hook, None))
-            else:
-                per_face[key] = tuple(slots)
+            per_face[key] = face_entry_from_slots(slots)
     return per_face
 
 

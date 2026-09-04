@@ -165,7 +165,8 @@ class PlanTokenizer:
         the fix is to index by the enumeration the DECIDING tokenizer used.
         """
         from alphagrad.approx.env import (
-            FACE_SLOTS, MAX_RULES_PER_VERTEX, decode_vertex_rule_specs)
+            FACE_SLOTS, MAX_RULES_PER_VERTEX, decode_vertex_rule_specs,
+            face_entry_from_slots)
         from alphagrad.approx.common.masks import make_live_masked_hook
         from graphax import SKIP_FACE
 
@@ -197,7 +198,7 @@ class PlanTokenizer:
                     r = ()
                 slots.append(make_live_masked_hook(tuple(r)) if r else None)
             if any(sl is not None for sl in slots):
-                ft[keys[f]] = tuple(slots)
+                ft[keys[f]] = face_entry_from_slots(slots)
         return ft or None
 
     def eliminate(self, vertex, vertex_specs=None, face_rows=None,

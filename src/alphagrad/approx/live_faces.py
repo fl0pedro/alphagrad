@@ -379,7 +379,8 @@ class LiveFaceStream:
         """
         from graphax import SKIP_FACE
         from alphagrad.approx.env import (
-            FACE_SLOTS, MAX_RULES_PER_VERTEX, decode_vertex_rule_specs)
+            FACE_SLOTS, MAX_RULES_PER_VERTEX, decode_vertex_rule_specs,
+            face_entry_from_slots)
         from alphagrad.approx.common.masks import make_live_masked_hook
 
         keys = list(tk.ij.faces(int(vertex)))
@@ -403,7 +404,7 @@ class LiveFaceStream:
                 slots.append(make_live_masked_hook(tuple(rules))
                              if rules else None)
             if any(sl is not None for sl in slots):
-                ft[keys[f]] = tuple(slots)
+                ft[keys[f]] = face_entry_from_slots(slots)
         return keys, ft
 
     # -- what the elimination ACTUALLY emitted ------------------------------
