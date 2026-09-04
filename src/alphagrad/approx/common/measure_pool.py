@@ -185,8 +185,8 @@ def merge_pool_plan_records(pool) -> dict:
     records ``env._record_terminal_plan`` appends. With the Ray pool active
     the measurement callback runs in the ACTOR processes, so the trainer's
     own list only ever holds the terminals it measured itself (the
-    ``ALPHAGRAD_POOL_TERMINAL_LOCAL`` rows) -- every other plan, including
-    every plan the frozen-gradient guard sentinelled, would be missing from
+    ``ALPHAGRAD_POOL_TERMINAL_LOCAL`` rows) -- every other plan would be
+    missing from
     a log the whole point of which is that nothing is missing.
 
     Each record is stamped with the ``actor`` it came from before it is
