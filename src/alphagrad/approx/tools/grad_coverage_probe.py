@@ -35,7 +35,10 @@ os.environ.setdefault("ALPHAGRAD_MAX_FACES", "2538")
 os.environ.setdefault("ALPHAGRAD_MAX_DELTA_TOKENS", "32768")
 os.environ.setdefault("GRAPHAX_PLANNER_EXACT", "1")
 os.environ.setdefault("GRAPHAX_DEMAND_EMIT", "1")
-os.environ.setdefault("ALPHAGRAD_NEW_SLOT_JOIN", "0")
+# The probe's forensics faces were measured with the OLD edge exact (ticket
+# .56: the configuration ppo.py --approx-old exact selects); env.approx_old()
+# reads this hand-off variable, the same one ppo.py publishes from the flag.
+os.environ["ALPHAGRAD_APPROX_OLD"] = "exact"
 os.environ.setdefault("ALPHAGRAD_MAX_EQNS", "512")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")

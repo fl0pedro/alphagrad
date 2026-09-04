@@ -104,6 +104,12 @@ laid over the pinned library, and its `sha256` prefix is stamped into the
 Set explicitly in all five launchers. See §7(c): the default (`1`) emits a face
 form no graphax on disk accepts. **WORKED-AROUND.**
 
+*2026-09-04 (ticket .56): the env var no longer exists. The old-edge
+configuration is the argument `--approx-old {same,exact}` on `ppo.py`,
+`landscape_map.py` and `coverage_beam.py`; `=0` here corresponds to
+`--approx-old exact`, `=1` to `--approx-old same`. The lines above describe
+what these runs did, not a live switch.*
+
 ### 1.6 `GRAPHAX_QUANT_PULLDOWN=1` for the archive phases
 
 The archived Pareto points were *produced* under pulldown, so they are
@@ -645,6 +651,11 @@ emits the plain 3-tuple graphax accepts. That form still carries the res-slot
 approximation; it just does not also apply it to the existing edge at the join —
 and `env.py` states the two forms are **not comparable**. **The root cause is
 unfixed and the v57–v66 logs have not been audited for how many plans it ate.**
+
+*2026-09-04 (ticket .56): `ALPHAGRAD_NEW_SLOT_JOIN` is removed. The switch is
+`--approx-old {same,exact}` (`same` = the two-op form described here, the
+default; `exact` = the plain 3-tuple the workaround selected), and every
+plan-log record carries the value that measured it.*
 
 ### (d) DIAG per-face masking: implemented, measured, changes nothing — **commit `39d8bd1`, flag default OFF**
 

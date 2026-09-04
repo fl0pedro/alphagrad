@@ -1916,6 +1916,11 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             # 0 because NOTHING WAS COUNTED, not because nothing applied.
             # `requested` is exact either way (it is read off the wire).
             "counts_from_trace": bool(counts_from_trace),
+            # WHICH old-edge configuration measured this plan (ticket .56):
+            # "same" (old carries new's approximation) or "exact". Read from
+            # the same function the face emitter reads, so the record cannot
+            # disagree with the measurement.
+            "approx_old": approx_old(),
         }
         rec.update(_plog.encode_wires(
             order, rule_specs, face_specs, face_skips,
@@ -4652,11 +4657,38 @@ def decode_vertex_rule_specs(jaxpr, vertex, spec_rows) -> tuple:
     return tuple(rules)
 
 
-# #72: apply a face's `new`-slot approximation to the EXISTING EDGE at the
-# join as well as to the contraction result, so compute is saved on both
-# operands of the add. Set 0 to restore the contraction-only behaviour --
-# the two are NOT comparable, since this changes the measured object.
-_NEW_SLOT_JOIN = os.environ.get("ALPHAGRAD_NEW_SLOT_JOIN", "1") != "0"
+# #72 / ticket .56 -- THE OLD EDGE. A face accumulation multiplies lhs by
+# rhs into `new` and adds `new` onto the existing predecessor-to-successor
+# edge (the OLD edge) when that edge exists. ``--approx-old`` says what the
+# old edge gets:
+#   same  -- the SAME approximation as `new` (the two-op face form with the
+#            new-slot hook in graphax's `jr`), so both operands of the add
+#            carry one structure and the add stays elementwise cheap. The
+#            declared default.
+#   exact -- the old edge is left exact (the bare 3-tuple; graphax never
+#            reaches the join hooks). It already holds the sum of
+#            approximated and exact contributions from earlier accumulations.
+# The two are NOT comparable, since the choice changes the measured object.
+# ppo.py publishes the flag as ALPHAGRAD_APPROX_OLD before ray.init -- one
+# hand-off variable, one reader, the same shape as ALPHAGRAD_QUALITY_METRIC --
+# so the trainer and every measure actor resolve the SAME configuration and
+# the plan log records what actually ran. Read at call time, never at import.
+_APPROX_OLD_ENV = "ALPHAGRAD_APPROX_OLD"
+APPROX_OLD_CHOICES = ("same", "exact")
+
+
+def approx_old() -> str:
+    """``"same"`` or ``"exact"`` -- what the OLD edge gets at a face's join.
+
+    The user surface is ``ppo.py --approx-old``; unset means the declared
+    default ``same``. Anything else is a programming error, not a fallback.
+    """
+    want = os.environ.get(_APPROX_OLD_ENV, "same").strip().lower()
+    if want not in APPROX_OLD_CHOICES:
+        raise ValueError(
+            f"{_APPROX_OLD_ENV} must be one of {APPROX_OLD_CHOICES} (set by "
+            f"ppo.py from --approx-old), got {want!r}")
+    return want
 
 
 def _face_dict_for_vertex(config, ij, v, face_row, face_skip):
@@ -4726,8 +4758,11 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip):
             #
             # Faces with no existing edge are unaffected -- graphax simply
             # never reaches the join hooks for them.
+            #
+            # --approx-old exact leaves the old edge alone: the bare 3-tuple
+            # is emitted and graphax never reaches the join hooks.
             _new_hook = slots[2] if len(slots) > 2 else None
-            if _new_hook is not None and _NEW_SLOT_JOIN:
+            if _new_hook is not None and approx_old() == "same":
                 per_face[key] = (tuple(slots), (None, _new_hook, None))
             else:
                 per_face[key] = tuple(slots)
