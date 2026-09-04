@@ -5557,29 +5557,28 @@ def _callback(
                     # ALPHAGRAD_MEASURE_SPARSE.
                     _dense = compiled_approx(*eval_args_i)
                 _fid_eval_args = eval_args_i
-                if True:
-                    # THE ONE EXTRA RESIDENT JACOBIAN the fidelity channel
-                    # costs. Held from point 0 until the exact-reference block,
-                    # which runs AFTER the whole cost loop -- so the expensive
-                    # half (the exact execution and the per-leaf reductions) is
-                    # never inside a timing or peak-memory window.
-                    #
-                    # WHY HOLDING IT DOES NOT CORRUPT THE PEAK CHANNEL, which
-                    # is the obvious worry: `_time_one_rep`'s peak is an
-                    # ABOVE-BASELINE DELTA -- it snapshots `bytes_in_use`
-                    # before the rep and subtracts it -- so a retained
-                    # allocation raises the BASELINE, not the delta. Points
-                    # 1..N-1 are timed and measured exactly as they would be
-                    # with the channel off.
-                    #
-                    # WHAT IT DOES COST is residency: one extra full Jacobian
-                    # for the length of the loop, i.e. more OOM headroom used
-                    # on a big target (the streamed-quality note above sizes
-                    # these at ~4 GB each at batch 512). At the moment of
-                    # scoring the exact reference is alive alongside it, which
-                    # is the SAME pair the legacy cosine path holds per point,
-                    # so the ceiling is that path's, not double it.
-                    _fid_approx_out = _dense
+                # THE ONE EXTRA RESIDENT JACOBIAN the fidelity channel
+                # costs. Held from point 0 until the exact-reference block,
+                # which runs AFTER the whole cost loop -- so the expensive
+                # half (the exact execution and the per-leaf reductions) is
+                # never inside a timing or peak-memory window.
+                #
+                # WHY HOLDING IT DOES NOT CORRUPT THE PEAK CHANNEL, which
+                # is the obvious worry: `_time_one_rep`'s peak is an
+                # ABOVE-BASELINE DELTA -- it snapshots `bytes_in_use`
+                # before the rep and subtracts it -- so a retained
+                # allocation raises the BASELINE, not the delta. Points
+                # 1..N-1 are timed and measured exactly as they would be
+                # with the channel off.
+                #
+                # WHAT IT DOES COST is residency: one extra full Jacobian
+                # for the length of the loop, i.e. more OOM headroom used
+                # on a big target (the streamed-quality note above sizes
+                # these at ~4 GB each at batch 512). At the moment of
+                # scoring the exact reference is alive alongside it, which
+                # is the SAME pair the legacy cosine path holds per point,
+                # so the ceiling is that path's, not double it.
+                _fid_approx_out = _dense
                 _dense = None
 
             if compiled_cost is not compiled_approx and compiled_exact is not None:
