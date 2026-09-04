@@ -55,10 +55,11 @@ def _fn(*a):
 
 def test_seed_vertices_no_longer_requires_measure_grad():
     """The gate that WAS here demanded ``--measure-grad`` alongside, so that a
-    replay rebuilt the archived QUALITY CHANNEL (loss_drop) as well as the
-    archived graph. That condition no longer exists: the traced target is
-    unconditionally the scalar loss, so loss_drop is the DEFAULT channel for
-    every target that has one and the replay gets it without the flag.
+    replay rebuilt the archived QUALITY CHANNEL (loss_drop at the time) as
+    well as the archived graph. That condition no longer exists: the traced
+    target is unconditionally the scalar loss, so the scalar-loss channel
+    (grad_cosine since 2026-09-02) is the DEFAULT for every target that has
+    one and the replay gets it without the flag.
 
     Requiring a flag that does nothing would make the error message false, so
     the requirement is dropped and ``--seed-vertices`` stands alone.
@@ -227,8 +228,8 @@ def test_measure_grad_is_a_deprecated_no_op():
         the IDENTITY here.
       * "it flips the quality-metric default to ``loss_drop``" -- that default
         now follows ``EnvConfig.scalar_target``, a fact read off the traced
-        jaxpr, which is true for exactly the targets on which the loss-drop
-        walk is defined.
+        jaxpr, which is true for exactly the targets on which a gradient is
+        defined (and resolves to ``grad_cosine`` since 2026-09-02).
       * "it gates ``--seed-vertices``" -- see the first test in this file.
 
     ``test_jacobian_equals_grad.py`` owns the positive statement (every

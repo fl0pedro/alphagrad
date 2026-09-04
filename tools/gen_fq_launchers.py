@@ -36,9 +36,10 @@ import tempfile
 # 0.805 Spearman / 0.003 s per plan -- the most predictive AND the cheapest
 # variant measured).  Everything else is LOGGED.
 #
-# ALPHAGRAD_QUALITY_METRIC=auto still resolves to loss_drop (env.py:3516), so
-# every arm names grad_cosine EXPLICITLY.  A launcher that forgets is a
-# launcher that silently ran the 200x-dearer channel.
+# ALPHAGRAD_QUALITY_METRIC=auto resolves to grad_cosine since 2026-09-02
+# (ticket dsnn-3qm.39; it was loss_drop before), and every arm still names
+# grad_cosine EXPLICITLY: the pin is redundant now and harmless, and it keeps
+# the launcher's channel independent of the env default.
 # ---------------------------------------------------------------------------
 
 REPO = "/Users/assmuth/dsnn/alphagrad"
@@ -251,7 +252,8 @@ SHARED_CLI = [
     # frozen-gradient hack at ANY horizon (A3's decisive negative), so
     # coverage is the only defence.
     ("--reject-frozen-grads", None),
-    # THE TRAINED QUALITY CHANNEL.  auto still means loss_drop; name it.
+    # THE TRAINED QUALITY CHANNEL.  auto means grad_cosine since 2026-09-02;
+    # the explicit pin is redundant and kept on purpose.
     ("--quality-metric", "grad_cosine"),
     # Sampling variance in the quality signal is WANTED.  --walk-rotate is
     # named for the loss-drop walk but env._walk_seed is SHARED, so it rotates

@@ -104,18 +104,13 @@ _GAZ_MGRAD = os.environ.get("ALPHAGRAD_GAZ_MEASURE_GRAD", "1") == "1"
 LOSS = get_fn(TASK)
 # ORDER-ONLY / EXACT ARM (--no-approx-head): no plan can approximate anything,
 # so every plan returns the EXACT gradient and the quality channel is a
-# CONSTANT (measured on TLM order-only: cos=+0.885 on every episode). It
-# therefore contributes zero gradient while the 200-step loss-drop walk that
-# produces it costs 200 executions of the plan -- twice the entire latency
-# budget of 100. Resolve the env default to "none" and say so; an explicit
-# ALPHAGRAD_QUALITY_METRIC is always honoured.
-if (os.environ.get("ALPHAGRAD_QUALITY_METRIC", "auto").strip().lower()
-        in ("", "auto") and bool(A.no_approx_head)):
-    os.environ["ALPHAGRAD_QUALITY_METRIC"] = "none"
-    print("[gaz] ORDER-ONLY arm (--no-approx-head): the quality channel is "
-          "constant by construction, so it is NOT computed "
-          "(ALPHAGRAD_QUALITY_METRIC=none). Set it explicitly to override.",
-          flush=True)
+# CONSTANT (measured on TLM order-only: cos=+0.885 on every episode). The env
+# default used to be forced to "none" here because the 200-step loss-drop walk
+# that produced it cost 200 executions of the plan. The default is grad_cosine
+# now (owner ruling 2026-09-02: grad-cosine in EVERY run and sweep, including
+# the order-only arm), one candidate execution plus one rev-exact reference
+# execution per plan, so the order-only arm reports it too.
+# ALPHAGRAD_QUALITY_METRIC=none stays selectable by name.
 ARGN = infer_argnums(TASK)
 k0 = jax.random.PRNGKey(0); ak, ek = jax.random.split(k0)
 xs = get_args(TASK, ak, dataset=DSET)

@@ -5,8 +5,9 @@ The gradient cosine REPLACED the Jacobian cosine in the cosine slot:
 gradient is defined (any scalar-loss target) and to `jac_cosine` only for the
 analytic AD benchmarks, which have no loss and no data generator.
 
-`auto` is deliberately UNCHANGED: still loss_drop for scalar targets. The swap
-changes what the COSINE family means, it does not move the default.
+`auto` was left on loss_drop by that swap. On 2026-09-02 the owner moved it
+(ticket dsnn-3qm.39): `auto` is grad_cosine for scalar targets, jac_cosine for
+the analytic benchmarks; loss_drop is selectable by name only.
 """
 from __future__ import annotations
 
@@ -29,8 +30,8 @@ class _Analytic:
 
 # (env value, expected for a scalar-loss target, expected for an analytic one)
 CASES = [
-    ("auto",        "loss_drop",   "jac_cosine"),
-    ("",            "loss_drop",   "jac_cosine"),
+    ("auto",        "grad_cosine", "jac_cosine"),
+    ("",            "grad_cosine", "jac_cosine"),
     ("loss_drop",   "loss_drop",   "loss_drop"),
     ("walk",        "loss_drop",   "loss_drop"),
     ("grad_cosine", "grad_cosine", "grad_cosine"),
@@ -59,10 +60,12 @@ def test_unknown_metric_is_a_hard_error(monkeypatch):
         quality_metric(_Scalar())
 
 
-def test_auto_is_unchanged_by_the_swap(monkeypatch):
-    """The swap must not move the DEFAULT channel off loss_drop."""
+def test_auto_is_grad_cosine_since_the_owner_ruling(monkeypatch):
+    """With nothing selected the DEFAULT channel is the gradient cosine
+    (owner ruling 2026-09-02); loss_drop is never the default."""
     monkeypatch.delenv("ALPHAGRAD_QUALITY_METRIC", raising=False)
-    assert quality_metric(_Scalar()) == "loss_drop"
+    assert quality_metric(_Scalar()) == "grad_cosine"
+    assert quality_metric(_Analytic()) == "jac_cosine"
 
 
 def test_grad_cosine_k_defaults_to_one(monkeypatch):

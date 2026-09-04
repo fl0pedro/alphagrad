@@ -41,8 +41,9 @@ REWARD_NAMES: tuple[str, ...] = (
     "bytes_accessed",
     "peak_memory",
     # Slot 6, renamed 2026-08-07 from "cosine_sim": it holds whichever quality
-    # metric ``env.quality_metric()`` selects — the 200-step Adam-walk loss
-    # drop (default under --measure-grad) or the legacy Jacobian cosine. The
+    # metric ``env.quality_metric()`` selects — the gradient cosine (the
+    # default for scalar-loss targets since 2026-09-02), the 200-step
+    # Adam-walk loss drop (by name) or the legacy Jacobian cosine. The
     # slot did not move; ``REWARD_INDEX["cosine_sim"]`` is aliased below.
     "quality",
     # Slot 7. RENAMED HERE 2026-08-28 to match env.REWARD_NAMES, which renamed

@@ -430,7 +430,8 @@ def configure_fidelity(args) -> tuple[float, int]:
     Returns ``(weight, cos_log_every)``.
 
     WHAT IT COSTS. The fidelity channel needs the EXACT Jacobian, which the
-    default ``loss_drop`` quality metric never builds. With
+    ``loss_drop`` quality metric never builds (the default ``grad_cosine``
+    does, and env.py folds the residual into that execution). With
     ``--reject-frozen-grads`` on (the default) that reference is being
     materialised anyway for the coverage guard and env.py folds both scores
     into the one execution; with the guard OFF, turning this on buys a full
@@ -4455,15 +4456,19 @@ def make_argparser() -> argparse.ArgumentParser:
         choices=["auto", "loss_drop", "grad_cosine", "jac_cosine", "cosine", "none"],
         default="auto",
         help="WHICH quantity reward slot 6 (the --lambda-acc channel) holds. "
-        "loss_drop = the relative loss drop of a 200-step Adam walk driven by "
-        "the PLAN's own gradient, probed on a fixed batch of 512 real MNIST "
-        "images (Pearson 0.922 against final downstream test accuracy, 0.22 s "
-        "and 40 MB per plan). cosine = the legacy Jacobian cosine (Pearson "
-        "0.610, 9.70 s, 4.24 GB). auto = loss_drop whenever the traced "
-        "target is a scalar loss (every trainable example: the plan's output "
-        "IS a gradient and the walk is defined), cosine for the analytic AD "
-        "benchmarks. Published as ALPHAGRAD_QUALITY_METRIC so the Ray "
-        "measure actors resolve the SAME metric as the trainer.",
+        "grad_cosine = the cosine between the PLAN's gradient and the "
+        "rev-exact gradient on the same probe batch of real data, at init "
+        "(one exact execution per plan). loss_drop = the relative loss drop "
+        "of a 200-step Adam walk driven by the PLAN's own gradient, probed on "
+        "a fixed batch of 512 real MNIST images (Pearson 0.922 against final "
+        "downstream test accuracy, 0.22 s and 40 MB per plan; finding 51: can "
+        "read 0.885 while the gradient points elsewhere). jac_cosine = the "
+        "legacy Jacobian cosine (Pearson 0.610, 9.70 s, 4.24 GB); cosine is "
+        "its deprecated alias. auto = grad_cosine whenever the traced target "
+        "is a scalar loss (every trainable example; owner ruling 2026-09-02), "
+        "jac_cosine for the analytic AD benchmarks. none = no quality "
+        "channel. Published as ALPHAGRAD_QUALITY_METRIC so the Ray measure "
+        "actors resolve the SAME metric as the trainer.",
     )
     p.add_argument(
         "--walk-steps", type=int, default=200,
@@ -6215,21 +6220,18 @@ def main():
     # agree". One env var read by one function (env.quality_metric) in one
     # module makes disagreement impossible. Set BEFORE ray.init so every actor
     # inherits it.
-    # ORDER-ONLY / EXACT ARM: with --no-approx-head no plan can approximate
+    # ORDER-ONLY / EXACT ARM (--no-approx-head): no plan can approximate
     # anything, so every plan returns the EXACT gradient and the quality
-    # channel is a CONSTANT (measured on TLM: 0.88532-0.88533 on every plan of
-    # every arm, 503/503 progress samples of job 59311). A constant channel
-    # contributes exactly zero gradient while the loss-drop walk that produces
-    # it costs 200 executions of the plan -- twice the entire latency budget.
-    # Resolve "auto" to "none" there and say so; an explicit --quality-metric
-    # is always honoured.
+    # channel is a CONSTANT (measured on TLM under loss_drop: 0.88532-0.88533
+    # on every plan of every arm, 503/503 progress samples of job 59311).
+    # "auto" used to be forced to "none" here because the loss-drop walk that
+    # produced that constant cost 200 executions of the plan. Under the
+    # default grad_cosine (owner ruling 2026-09-02: latency, temp memory and
+    # grad-cosine in EVERY run and sweep, including the order-only arm) the
+    # channel costs one execution of the candidate plus one of the rev-exact
+    # reference, whose compile is cached, so the order-only arm reports it
+    # like every other arm. --quality-metric none stays selectable by name.
     _qm = str(args.quality_metric)
-    if _qm == "auto" and bool(getattr(args, "no_approx_head", False)):
-        _qm = "none"
-        print("[alphagrad] ORDER-ONLY arm (--no-approx-head): the quality "
-              "channel is constant by construction, so it is NOT computed "
-              "(--quality-metric none). Pass --quality-metric loss_drop to "
-              "force it.", flush=True)
     os.environ["ALPHAGRAD_QUALITY_METRIC"] = _qm
     os.environ["ALPHAGRAD_WALK_STEPS"] = str(int(args.walk_steps))
     os.environ["ALPHAGRAD_WALK_LR"] = repr(float(args.walk_lr))
