@@ -428,8 +428,12 @@ def legal_compress_actions(st, max_axes: int = 8,
     """
     from graphax.sparse.micro_actions import Compress
 
-    mask = (compress_slot_mask(st, max_axes) if strict
-            else compress_valid_mask(st, max_axes))
+    if reduce_axes_physical():
+        # Ticket .20: the axes are PHYSICAL val axes; one mask, both modes.
+        mask = reduce_axis_mask(st, max_axes)
+    else:
+        mask = (compress_slot_mask(st, max_axes) if strict
+                else compress_valid_mask(st, max_axes))
     return [Compress(axes=(a,), kind=k)
             for a in range(max_axes) if mask[a] for k in kinds]
 
@@ -698,12 +702,226 @@ def face_slot_frames_enabled() -> bool:
     return bool(_FACE_SLOT_FRAMES[0])
 
 
+# --reduce-axis-space (ticket dsnn-3qm.20, defect D5). A Reduce (Compress)
+# axis lives in three coordinate spaces -- the head's LOGICAL dim tokens, the
+# PHYSICAL ``val`` axes a reduction drops, and graphax's CANONICAL slots -- and
+# finding 56 measured that on TLM lhs edges they never coincide (0/114
+# records). The owner's ruling: Diag on logical dims, Reduce on PHYSICAL val
+# axes. ``physical`` (the default) makes the physical val axis the canonical
+# space of ``Compress.axes`` inside alphagrad and converts at the two
+# boundaries through :func:`reduce_axis_spaces`, the one conversion: the
+# wire's logical token -> physical axis at decode (``env.make_slot_frame_hook``
+# and, for the head's per-slot mask, :func:`slot_legality`); physical axis ->
+# canonical slot at the graphax boundary (:func:`make_live_masked_hook`, right
+# before ``apply_compress``). ``canonical`` is the pre-ticket behaviour -- the
+# wire index handed to graphax unconverted as a canonical slot, masked as a
+# physical (``compress_valid_mask``) or slot (``compress_slot_mask``) index --
+# kept only so the flag-off bit-identity gate (ALPHAGRAD_EQ_DUMP) can reach
+# it. Republished to the environment for the Ray measure actors, like the two
+# flags above.
+_REDUCE_AXIS_SPACES = ("physical", "canonical")
+_REDUCE_AXIS_SPACE = [os.environ.get("ALPHAGRAD_REDUCE_AXIS_SPACE", "physical")
+                      if os.environ.get("ALPHAGRAD_REDUCE_AXIS_SPACE",
+                                        "physical") in _REDUCE_AXIS_SPACES
+                      else "physical"]
+
+
+def set_reduce_axis_space(space: str) -> None:
+    """Install the ``--reduce-axis-space`` setting process-wide (and in the
+    environment, for the measure actors)."""
+    space = str(space)
+    if space not in _REDUCE_AXIS_SPACES:
+        raise ValueError(
+            f"--reduce-axis-space must be one of {_REDUCE_AXIS_SPACES}, "
+            f"got {space!r}")
+    _REDUCE_AXIS_SPACE[0] = space
+    os.environ["ALPHAGRAD_REDUCE_AXIS_SPACE"] = space
+
+
+def reduce_axis_space() -> str:
+    return str(_REDUCE_AXIS_SPACE[0])
+
+
+def reduce_axes_physical() -> bool:
+    """``True`` under ``--reduce-axis-space physical``: every ``Compress.axes``
+    inside alphagrad is a physical ``val`` axis of the tensor it is applied
+    to, and the conversions of :func:`reduce_axis_spaces` are in force."""
+    return _REDUCE_AXIS_SPACE[0] == "physical"
+
+
 # The 94-slot face head's dtype field is a BERNOULLI over exactly these two
 # (``unified_face_policy._rows``: ``_BF16_SLOT`` / ``_F32_SLOT``), so this --
 # not the full ``QUANT_DTYPES`` catalog -- is the QUANT action set a face can
 # actually request. Kept here rather than imported from ``heads`` so this
 # module stays importable inside the measure actors without pulling equinox.
 FACE_QUANT_DTYPES = ("float32", "bfloat16")
+
+
+class ReduceAxisSpaces(NamedTuple):
+    """The three coordinate spaces of a Reduce axis on ONE live tensor; see
+    :func:`reduce_axis_spaces`, the only place that builds it."""
+    n_dims: int          # logical dims: len(out_dims) + len(primal_dims)
+    n_phys: int          # physical axes: val.ndim (0 when val is None)
+    phys_of_dim: tuple   # LOGICAL dim a -> PHYSICAL axis, or None (implicit)
+    slot_of_dim: tuple   # LOGICAL dim a -> CANONICAL slot
+    phys_of_slot: tuple  # CANONICAL slot k -> PHYSICAL axis or None (graphax)
+    slot_of_phys: tuple  # PHYSICAL axis p -> CANONICAL slot, or None
+
+
+def reduce_axis_spaces(st) -> ReduceAxisSpaces:
+    """THE conversion between the three coordinate spaces of a Reduce axis
+    (ticket dsnn-3qm.20, defect D5). Every site that turns one space into
+    another reads this table; nothing else may.
+
+    The spaces, on one tensor ``st``:
+
+      * LOGICAL dim ``a`` -- a position in ``out_dims ++ primal_dims``. The
+        head's axis tokens, ``Diag(i, j)``, :func:`dim_logical_sizes` and,
+        under ``--face-slot-frames slot``, the wire's ``row[1]`` are all
+        indexed this way. The two dims of a coupled pair are two logical dims.
+      * PHYSICAL val axis ``p`` -- a position in ``st.val.shape``, the axis a
+        reduction drops. THE CANONICAL SPACE of ``Compress.axes`` inside
+        alphagrad (owner ruling: Diag on logical dims, Reduce on physical val
+        axes). A dense dim is stored in one; a coupled pair shares one (its
+        meta axis) and may own a block axis per side; an implicit dim has
+        none.
+      * CANONICAL slot ``k`` -- an entry of graphax's ``canonical_axis_order``:
+        one slot per dense dim; for a coupled pair, at its first appearance, a
+        meta slot plus a block slot when it is block-diagonal, the partner dim
+        skipped. ``apply_compress`` reads ``Compress.axes`` in THIS space.
+
+    The conversions and their direction (never the reverse):
+
+      * logical -> physical, AT DECODE. ``env.make_slot_frame_hook`` turns
+        the wire token into the physical axis the dim is stored in on the
+        tensor the slot is handed (:func:`compress_rules_to_physical`), and
+        :func:`slot_legality` masks the head's tokens through the same call,
+        so the mask and the decode cannot disagree.
+      * physical -> canonical, AT THE GRAPHAX BOUNDARY.
+        :func:`make_live_masked_hook` converts right before
+        ``apply_compress`` (:func:`compress_to_graphax`).
+
+    ``slot_of_dim`` mirrors ``canonical_axis_order``'s traversal, and the
+    mirrored slot list is checked against graphax's own on every call: a
+    drift raises instead of silently addressing another axis.
+    """
+    from graphax.sparse.micro_actions import canonical_axis_order
+
+    dims = (*st.out_dims, *st.primal_dims)
+    slots: list = []
+    slot_of_dim: list = []
+    first: dict = {}
+    for d in dims:
+        other = getattr(d, "other_id", None)
+        if other is not None:
+            key = frozenset((d.id, other))
+            k = first.get(key)
+            if k is None:
+                k = len(slots)
+                first[key] = k
+                slots.append(d.axis)
+                if d.block_size is not None:
+                    slots.append(d.block_axis)
+            slot_of_dim.append(k)
+        else:
+            slot_of_dim.append(len(slots))
+            slots.append(getattr(d, "axis", None))
+    canon = tuple(canonical_axis_order(st))
+    if tuple(slots) != canon:
+        raise RuntimeError(
+            "reduce_axis_spaces: the logical-dim -> canonical-slot table "
+            f"{tuple(slots)} disagrees with graphax canonical_axis_order "
+            f"{canon}; the two traversals must be one")
+    val = getattr(st, "val", None)
+    n_phys = int(getattr(val, "ndim", 0)) if val is not None else 0
+
+    def _phys(p):
+        return int(p) if (p is not None and 0 <= int(p) < n_phys) else None
+
+    slot_of_phys: list = [None] * n_phys
+    for k, p in enumerate(canon):
+        p = _phys(p)
+        if p is not None and slot_of_phys[p] is None:
+            slot_of_phys[p] = k
+    return ReduceAxisSpaces(
+        n_dims=len(dims), n_phys=n_phys,
+        phys_of_dim=tuple(_phys(canon[k]) for k in slot_of_dim),
+        slot_of_dim=tuple(slot_of_dim), phys_of_slot=canon,
+        slot_of_phys=tuple(slot_of_phys))
+
+
+def reduce_axis_mask(st, max_axes: int = 8) -> np.ndarray:
+    """``(max_axes,)`` bool mask of legal ``Compress`` PHYSICAL axes on ``st``
+    (``--reduce-axis-space physical``): axis ``p`` is legal iff it is a stored
+    axis of ``val`` that graphax can address (it has a canonical slot) and
+    has extent above 1. The extent-1 and the implicit reduction are the
+    identity, and ``val is None`` (a uniform tensor) has no axis at all --
+    the same two exclusions :func:`compress_slot_mask` makes, in physical
+    coordinates."""
+    mask = np.zeros((int(max_axes),), dtype=bool)
+    val = getattr(st, "val", None)
+    if val is None:
+        return mask
+    sp = reduce_axis_spaces(st)
+    shape = tuple(getattr(val, "shape", ()) or ())
+    for p in range(min(sp.n_phys, int(max_axes))):
+        if sp.slot_of_phys[p] is not None and int(shape[p]) > 1:
+            mask[p] = True
+    return mask
+
+
+def _compress_axes(rule) -> tuple:
+    axes = rule.axes if isinstance(rule.axes, tuple) else (rule.axes,)
+    return tuple(int(a) for a in axes)
+
+
+def compress_rules_to_physical(st, rules) -> tuple:
+    """LOGICAL -> PHYSICAL, at decode. Each ``Compress`` in ``rules`` names
+    logical dims of ``st`` (the wire token, decoded in the slot's frame); the
+    returned one names the physical val axes those dims are stored in. A dim
+    with no stored axis (implicit, or ``val is None``) yields the EMPTY
+    reduction ``Compress(axes=())`` -- graphax's identity -- which the hook
+    accounts as an idempotent no-op, not as a miss. Other rules pass through.
+    """
+    from graphax.sparse.micro_actions import Compress
+
+    out: list = []
+    sp = None
+    for r in rules:
+        if not isinstance(r, Compress):
+            out.append(r)
+            continue
+        if sp is None:
+            sp = reduce_axis_spaces(st)
+        phys: list = []
+        for a in _compress_axes(r):
+            p = sp.phys_of_dim[a] if 0 <= a < sp.n_dims else None
+            if p is not None and p not in phys:
+                phys.append(p)
+        out.append(Compress(axes=tuple(phys), kind=r.kind))
+    return tuple(out)
+
+
+def compress_to_graphax(st, rule):
+    """PHYSICAL -> CANONICAL, at the graphax boundary. ``rule.axes`` are
+    physical val axes of ``st``; the returned ``Compress`` names the canonical
+    slots ``apply_compress`` reads. A physical axis with no slot (a partner's
+    block axis, a compressed band buffer's structural axis) cannot be
+    addressed and raises ``ValueError``; :func:`reduce_axis_mask` refuses it
+    first, so the hook never gets here with one."""
+    from graphax.sparse.micro_actions import Compress
+
+    sp = reduce_axis_spaces(st)
+    slots: list = []
+    for p in _compress_axes(rule):
+        k = sp.slot_of_phys[p] if 0 <= p < sp.n_phys else None
+        if k is None:
+            raise ValueError(
+                f"Compress physical axis {p} has no canonical slot on a "
+                f"tensor with {sp.n_phys} val axes (slots {sp.phys_of_slot})")
+        if k not in slots:
+            slots.append(k)
+    return Compress(axes=tuple(slots), kind=rule.kind)
 
 
 def compress_slot_mask(st, max_axes: int = 8) -> np.ndarray:
@@ -759,7 +977,8 @@ def compress_is_noop(st, rule, *, max_axes: int = 8) -> bool:
     """
     if getattr(st, "val", None) is None:
         return True
-    mask = compress_slot_mask(st, max_axes)
+    mask = (reduce_axis_mask(st, max_axes) if reduce_axes_physical()
+            else compress_slot_mask(st, max_axes))
     axes = rule.axes if isinstance(rule.axes, tuple) else (rule.axes,)
     return not any(0 <= int(a) < max_axes and mask[int(a)] for a in axes)
 
@@ -964,7 +1183,8 @@ def face_rule_is_legal(st, rule, *, max_dims: int = 8,
     if not rule_is_legal(st, rule, max_dims=max_dims, max_axes=max_axes):
         return False
     if isinstance(rule, Compress):
-        m = compress_slot_mask(st, max_axes)
+        m = (reduce_axis_mask(st, max_axes) if reduce_axes_physical()
+             else compress_slot_mask(st, max_axes))
         axes = rule.axes if isinstance(rule.axes, tuple) else (rule.axes,)
         if not all(0 <= int(a) < max_axes and m[int(a)] for a in axes):
             return False
@@ -1645,7 +1865,10 @@ def rule_is_legal(st, rule, *, max_dims: int = 8, max_axes: int = 8) -> bool:
         d = rule.factor // base
         return d > 1 and span % d == 0
     if isinstance(rule, Compress):
-        mask = compress_valid_mask(st, max_axes)
+        # Ticket .20: under --reduce-axis-space physical the axes are
+        # physical val axes and reduce_axis_mask is the one legality.
+        mask = (reduce_axis_mask(st, max_axes) if reduce_axes_physical()
+                else compress_valid_mask(st, max_axes))
         axes = rule.axes if isinstance(rule.axes, tuple) else (rule.axes,)
         return bool(axes) and all(0 <= a < max_axes and mask[a] for a in axes)
     if isinstance(rule, Quant):
@@ -1717,8 +1940,12 @@ def slot_legality(st, max_axes: int = 8,
             pair[i, j] = hook_rule_is_legal(
                 st, Diag(i=io, j=jp, factor=g), max_dims=N, max_axes=N)
     for a in range(min(n_log, N)):
-        comp[a] = hook_rule_is_legal(
-            st, Compress(axes=(a,), kind="mean"), max_dims=N, max_axes=N)
+        rule = Compress(axes=(a,), kind="mean")
+        if reduce_axes_physical():
+            # Ticket .20: the head's token is a LOGICAL dim; the hook applies
+            # the PHYSICAL axis the decode resolves it to. Same conversion.
+            rule = compress_rules_to_physical(st, (rule,))[0]
+        comp[a] = hook_rule_is_legal(st, rule, max_dims=N, max_axes=N)
     return SlotLegality(sizes=sizes, n_out=int(n_out), pair=pair, comp=comp,
                         quant=quant_valid_mask(st, dtypes))
 
@@ -1877,7 +2104,11 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
                 if isinstance(live, Diag):
                     cur = apply_diag(cur, live)
                 elif isinstance(live, Compress):
-                    cur = apply_compress(cur, live)
+                    # THE GRAPHAX BOUNDARY (ticket .20): physical val axes
+                    # -> canonical slots, the space apply_compress reads.
+                    cur = apply_compress(
+                        cur, compress_to_graphax(cur, live)
+                        if reduce_axes_physical() else live)
                 elif isinstance(live, Quant):
                     cur = apply_quant(cur, live)
                 else:
