@@ -4461,6 +4461,30 @@ def make_argparser() -> argparse.ArgumentParser:
         "(env.measure_toolchain_gate_mode); this flag is the only control.",
     )
     p.add_argument(
+        "--mem-channel",
+        choices=["temp", "watermark"],
+        default="temp",
+        help="THE MEMORY CHANNEL (ticket dsnn-3qm.49, ruling .29): what "
+        "reward slot 5 (peak_memory, stored negated) HOLDS. temp = the XLA "
+        "static temp bytes of the plan's own timed executable "
+        "(compiled.memory_analysis().temp_size_in_bytes); deterministic, "
+        "one read per compile, and on TLM the runtime watermark is temp + "
+        "2.104 MB with R^2 = 1.000000 (finding 41), so temp is the same "
+        "ranking with 8x the relative dynamic range. The DEFAULT: the old "
+        "channel read sigma = 0 over 16,192 wave-1 plans (finding 49). "
+        "watermark = the runtime peak_bytes_in_use delta over the timed "
+        "window, the pre-.49 channel, kept for the flag-off bit-identity "
+        "gate (ALPHAGRAD_EQ_DUMP). Under both the other quantity is "
+        "recorded beside the channel per measurement (env._record_mem_"
+        "parity) and drained with the plan records; every plan-log record "
+        "carries mem_channel, mem_temp_bytes and mem_watermark_bytes. "
+        "Published as ALPHAGRAD_MEM_CHANNEL before ray.init so the Ray "
+        "measure actors read the same channel through the one reader "
+        "(env.mem_channel); this flag is the only control. --mem-type "
+        "still selects WHICH slot --lambda-mem weights; this flag selects "
+        "what slot 5 holds.",
+    )
+    p.add_argument(
         "--walk-steps", type=int, default=200,
         help="Adam steps in the loss-drop walk (measured configuration: 200).",
     )
@@ -6251,6 +6275,16 @@ def main():
     os.environ["ALPHAGRAD_APPROX_OLD"] = str(args.approx_old)
     print(f"[alphagrad] old edge at the face join (--approx-old) = "
           f"{args.approx_old}", flush=True)
+    # THE MEMORY CHANNEL (ticket .49), same transport, same reason: the
+    # measure actors run env._callback in their own processes and
+    # env.mem_channel is the one reader. The flag is the only control.
+    os.environ["ALPHAGRAD_MEM_CHANNEL"] = str(args.mem_channel)
+    print(f"[alphagrad] memory channel (reward slot 5, --mem-channel) = "
+          f"{args.mem_channel}"
+          + (" (XLA static temp bytes of the timed executable; the runtime "
+             "watermark is logged beside it)" if args.mem_channel == "temp"
+             else " (runtime watermark, the pre-.49 channel; the static "
+                  "temp is logged beside it)"), flush=True)
     # MEASURE TOOLCHAIN GATE -- same transport, same reason: the gate runs
     # inside env._compile_measure in every measuring process, and the actors
     # inherit this before ray.init. env.measure_toolchain_gate_mode is the
@@ -10495,6 +10529,7 @@ def main():
     # tells them apart. ``entropy/*`` panels are unaffected -- they describe
     # the policy heads, not the reward.
     _wandb_config["quality_metric_resolved"] = _QUALITY_METRIC
+    _wandb_config["mem_channel"] = str(args.mem_channel)
     wandb.init(
         project=getattr(args, "wandb_project", None) or "dsnn-vertex",
         entity=getattr(args, "wandb_entity", None) or None,
@@ -11266,6 +11301,10 @@ def main():
         if _PLAN_LOG_PATH is not None:
             _plog_t0 = _prof_time.perf_counter()
             _plog_path = _resolve_plan_log_path(args)
+            from alphagrad.approx.env import (
+                MeasureToolchainFault as _MeasureToolchainFault,
+                check_mem_parity_complete as _mp_check,
+                mem_parity_summary as _mp_summary)
             try:
                 from alphagrad.approx.common.plan_log import (
                     append_records as _plog_append)
@@ -11284,6 +11323,14 @@ def main():
                 _plog_fb_total = int(
                     _plog_local.get("compile_fallbacks_total", 0))
                 _plog_tc_ok = bool(_plog_local.get("toolchain_ok", True))
+                # MEMORY PARITY (ticket .49): same drain, same trap. The
+                # trainer's own share first (every row under --exec-on-gpu,
+                # the ALPHAGRAD_POOL_TERMINAL_LOCAL rows under the pool).
+                _plog_mp = dict(_plog_local.get("mem_parity") or {})
+                _plog_mp.setdefault("records", [])
+                _plog_mp.setdefault("measured", 0)
+                _plog_mp.setdefault("dropped", 0)
+                _plog_mp["records"] = list(_plog_mp["records"])
                 try:
                     from alphagrad.approx.common.measure_pool import (
                         merge_pool_plan_records as _plog_merge)
@@ -11297,6 +11344,13 @@ def main():
                         _plog_pool.get("compile_fallbacks_total", 0))
                     _plog_tc_ok = _plog_tc_ok and bool(
                         _plog_pool.get("toolchain_ok", True))
+                    _plog_mp_pool = _plog_pool.get("mem_parity") or {}
+                    _plog_mp["records"].extend(
+                        _plog_mp_pool.get("records", ()))
+                    _plog_mp["measured"] += int(
+                        _plog_mp_pool.get("measured", 0))
+                    _plog_mp["dropped"] += int(
+                        _plog_mp_pool.get("dropped", 0))
                     _plog_why = (
                         f" pool={bool(_plog_pool.get('have_pool'))}"
                         f" actors_seen={_plog_pool.get('actors_seen')}"
@@ -11311,6 +11365,11 @@ def main():
                               f"could not be polled -- their plans are MISSING "
                               f"from this episode's records",
                               file=sys.stderr, flush=True)
+                except _MeasureToolchainFault:
+                    # A measure actor whose memory parity is incomplete
+                    # (env.check_mem_parity_complete) stops the run: a
+                    # skip is a failure, not a stderr line.
+                    raise
                 except Exception as _plog_exc:
                     print(f"[plan-log] ep{ep}: pool drain failed "
                           f"({_plog_exc!r}) -- pooled plans are MISSING",
@@ -11331,6 +11390,18 @@ def main():
                 log_dict["measure/compile_fallbacks_total"] = int(
                     _plog_fb_total)
                 log_dict["measure/toolchain_ok"] = int(bool(_plog_tc_ok))
+                # MEMORY PARITY, per episode (ticket .49; .45 names these):
+                # the mean and worst watermark - temp in bytes, the two
+                # means, and how many readings were static substitutions
+                # (structural on CPU). Every measured plan must have left a
+                # record -- checked on the merged totals, trainer + actors.
+                _mp_check(_plog_mp, f"ep{ep} (trainer + {_plog_actors} "
+                                    f"measure actor(s))")
+                for _mp_k, _mp_v in _mp_summary(
+                        _plog_mp["records"]).items():
+                    log_dict[f"measure/mem_parity/{_mp_k}"] = _mp_v
+                log_dict["measure/mem_parity/measured"] = int(
+                    _plog_mp["measured"])
                 # PRINTED, NOT ONLY LOGGED. A run whose plan log silently
                 # stays empty -- which is exactly what a pooled run did
                 # before this line existed -- is indistinguishable from a
@@ -11345,6 +11416,8 @@ def main():
                     print(f"[plan-log] ep{ep}: {_plog_dropped} record(s) "
                           f"DROPPED at the buffer cap -- raise --plan-log-cap",
                           file=sys.stderr, flush=True)
+            except _MeasureToolchainFault:
+                raise
             except Exception as _plog_exc:
                 print(f"[plan-log] ep{ep}: FAILED to write "
                       f"{_plog_path!r}: {_plog_exc!r}",

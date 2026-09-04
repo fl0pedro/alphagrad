@@ -4,9 +4,16 @@ Sign-trap regression: cost channels are PENALTIES, so the gate must FLOOR a
 destroyed plan's costs at the exact-reverse reference (destruction pays what
 exact pays), never scale them toward zero (which would reward destruction).
 """
+import os
+
 import numpy as np
 import jax.numpy as jnp
 import pytest
+
+# The gate's memory floor is a runtime watermark, so it only composes with
+# the pre-.49 channel; under --mem-channel temp (the default since ticket
+# dsnn-3qm.49) a clamp is a MemChannelFault (see tests/mem_channel_test.py).
+os.environ["ALPHAGRAD_MEM_CHANNEL"] = "watermark"
 
 from alphagrad.approx import env as env_mod
 

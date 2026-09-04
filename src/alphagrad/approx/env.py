@@ -1489,6 +1489,10 @@ def consume_plan_records() -> dict:
            "compile_fallbacks_total": _fb_n,
            "toolchain_ok": bool(_MEASURE_TOOLCHAIN["ok"]),
            "toolchain_host": str(_MEASURE_TOOLCHAIN["host"]),
+           # MEMORY PARITY (ticket .49): the watermark logged beside the
+           # channel, per measurement, drained on the same trip for the
+           # same reason as the toolchain counters above.
+           "mem_parity": consume_mem_parity(),
            "enabled": plan_log_enabled(),
            "pid": os.getpid()}
     _PLAN_RECORDS.clear()
@@ -1533,7 +1537,8 @@ def _plan_face_delta(before: dict | None, after: dict | None) -> dict:
 
 def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
                           reward_vec, face_before, face_after,
-                          counts_from_trace: bool) -> None:
+                          counts_from_trace: bool,
+                          mem_parity: dict | None = None) -> None:
     """Append ONE terminal plan to this process's plan log. Never raises.
 
     A logging failure must not kill a measurement, but it must not be
@@ -1562,6 +1567,15 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             # True = each slot's own live tensor, False = the vertex frame
             # broadcast to all three slots. A replay must decode the same way.
             "face_slot_frames": bool(_face_slot_frames_enabled()),
+            # WHICH quantity reward slot 5 holds (ticket .49) and BOTH
+            # memory numbers of this plan's timed executable, so a record
+            # can be re-scored on the other channel without a re-measure.
+            "mem_channel": mem_channel(),
+            "mem_temp_bytes": (mem_parity or {}).get("static_temp_bytes"),
+            "mem_watermark_bytes": (mem_parity or {}).get(
+                "runtime_peak_bytes"),
+            "mem_peak_source": (mem_parity or {}).get(
+                "peak_source", "not_measured"),
         }
         rec.update(_plog.encode_wires(
             order, rule_specs, face_specs, face_skips,
@@ -3119,6 +3133,13 @@ def _apply_quality_gate(latency_ns, peak_memory, quality, is_terminal,
     if _ref is None:
         return latency_ns, peak_memory
     _rl, _rm = _ref
+    if mem_channel() == "temp":
+        # The floor's memory is a runtime watermark; the channel is static
+        # temp (ticket .49). Clamping one with the other mixes quantities.
+        raise MemChannelFault(
+            "quality gate: ALPHAGRAD_QUALITY_GATE_MIN is armed while "
+            "--mem-channel temp is the memory channel; the gate's memory "
+            "floor is a watermark and cannot clamp a static temp")
     _QUALITY_GATE_STATS["clamps"] += 1
     if _QUALITY_GATE_STATS["clamps"] == 1 \
             or _QUALITY_GATE_STATS["clamps"] % 50 == 0:
@@ -3963,7 +3984,8 @@ def consume_static_peak_fallbacks() -> int:
 
 
 # ---------------------------------------------------------------------------
-# MEMORY PARITY (ALPHAGRAD_MEM_PARITY=1, default on; 0 disables).
+# MEMORY PARITY (always on since ticket dsnn-3qm.49; the ALPHAGRAD_MEM_PARITY
+# switch is gone -- the record is what the watermark is LOGGED through).
 #
 # Two different quantities have been called "the" memory cost of a plan:
 #
@@ -3981,30 +4003,96 @@ def consume_static_peak_fallbacks() -> int:
 # from a silent in-place substitution into an explicit field of the record.
 # ---------------------------------------------------------------------------
 _MEM_PARITY: list = []
-_MEM_PARITY_ON = os.environ.get("ALPHAGRAD_MEM_PARITY", "1") != "0"
+# Measurements this process completed since the last drain, and records
+# the ring refused past the cap. ``records + dropped == measured`` is the
+# invariant `check_mem_parity_complete` asserts in every measuring process
+# (ticket dsnn-3qm.49, folded from .32): a measured plan without a parity
+# record means the watermark was never logged beside the channel.
+_MEM_PARITY_MEASURED = [0]
+_MEM_PARITY_DROPPED = [0]
+_MEM_PARITY_CAP = 65536
+
+# THE MEMORY CHANNEL (ticket dsnn-3qm.49, ruling .29). What reward slot 5
+# (``peak_memory``, stored negated) HOLDS:
+#   temp       the plan's own compiled executable's XLA static temp bytes
+#              (``compiled.memory_analysis().temp_size_in_bytes``) -- the
+#              default. Finding 41: on TLM the runtime watermark is
+#              temp + 2.104 MB with R^2 = 1.000000, so temp carries the
+#              same ranking with 8x the relative dynamic range and no
+#              allocator quantum; finding 49: the watermark channel read
+#              sigma = 0 over 16,192 wave-1 plans.
+#   watermark  the runtime ``peak_bytes_in_use`` delta over the timed
+#              window (the pre-.49 channel; on a backend without allocator
+#              statistics the in-place static substitution of
+#              ``_note_static_peak_fallback``). Kept for the flag-off
+#              bit-identity gate (ALPHAGRAD_EQ_DUMP).
+# Under both the OTHER quantity is recorded beside it by `_record_mem_parity`
+# and drained through `consume_mem_parity`. Published by ppo.py from
+# --mem-channel before ray.init, exactly like ALPHAGRAD_APPROX_OLD: the
+# flag is the only user surface, the variable is the transport to the Ray
+# measure actors, and this function is the one reader.
+_MEM_CHANNEL_ENV = "ALPHAGRAD_MEM_CHANNEL"
+MEM_CHANNEL_CHOICES = ("temp", "watermark")
+
+
+def mem_channel() -> str:
+    """``"temp"`` or ``"watermark"`` -- WHICH quantity reward slot 5 holds.
+
+    Absent (a process not started through ppo.py) means the declared
+    default ``temp``. Anything else is a hand edit, not a fallback.
+    """
+    want = os.environ.get(_MEM_CHANNEL_ENV, "temp").strip().lower()
+    if want not in MEM_CHANNEL_CHOICES:
+        raise ValueError(
+            f"{_MEM_CHANNEL_ENV} must be one of {MEM_CHANNEL_CHOICES} (set "
+            f"by ppo.py from --mem-channel), got {want!r}")
+    return want
+
+
+def check_mem_parity_complete(mp: dict, where: str) -> None:
+    """Assert every measured plan left a parity record (records + dropped
+    == measured). Called in the process that measured -- the actor under
+    --ray-measure -- and again by the trainer on the merged totals."""
+    _n = len(mp.get("records", ()))
+    _d = int(mp.get("dropped", 0))
+    _m = int(mp.get("measured", 0))
+    if _n + _d != _m:
+        raise MemChannelFault(
+            f"memory parity {where}: {_m} plans were measured but "
+            f"{_n} parity records (+{_d} dropped at the cap) exist -- the "
+            f"runtime watermark was not logged beside the channel for "
+            f"{_m - _n - _d} plan(s)")
 
 
 def _record_mem_parity(compiled, runtime_peak, source: str,
-                       is_terminal: bool) -> None:
-    """One (static, runtime, source) triple per measurement."""
-    if not _MEM_PARITY_ON or compiled is None:
-        return
+                       is_terminal: bool) -> dict | None:
+    """One (static, runtime, source) triple per measurement.
+
+    Returns the record (the channel reads ``static_temp_bytes`` off it),
+    or None when there is no executable to analyse.
+    """
+    if compiled is None:
+        return None
     _t0 = time.perf_counter()
     try:
         ma = compiled.memory_analysis()
     except Exception:
         ma = None
     if ma is None:
-        _st = _so = None
+        _st = _so = _sa = None
     else:
         _st = float(getattr(ma, "temp_size_in_bytes", 0) or 0.0)
         _so = float(getattr(ma, "output_size_in_bytes", 0) or 0.0)
+        _sa = float(getattr(ma, "argument_size_in_bytes", 0) or 0.0)
     rec = {
         "static_temp_bytes": _st,
         "static_output_bytes": _so,
+        "static_argument_bytes": _sa,
         "static_total_bytes": None if _st is None else _st + _so,
         "runtime_peak_bytes": (None if runtime_peak is None
                                else float(runtime_peak)),
+        # WHICH of the two the reward slot took (see `mem_channel`).
+        "channel": mem_channel(),
         # "runtime_delta"   the reward's peak_memory IS the measured delta;
         # "static_fallback" allocator stats were unavailable and the STATIC
         #                   estimate was substituted in place (a different
@@ -4014,7 +4102,10 @@ def _record_mem_parity(compiled, runtime_peak, source: str,
         "peak_source": source,
         "terminal": bool(is_terminal),
     }
-    _MEM_PARITY.append(rec)
+    if len(_MEM_PARITY) >= _MEM_PARITY_CAP:
+        _MEM_PARITY_DROPPED[0] += 1
+    else:
+        _MEM_PARITY.append(rec)
     _prof_add("cb.mem_parity", time.perf_counter() - _t0)
     if os.environ.get("ALPHAGRAD_DEBUG_MEASURE", "0") == "1":
         _s, _r = rec["static_total_bytes"], rec["runtime_peak_bytes"]
@@ -4022,13 +4113,60 @@ def _record_mem_parity(compiled, runtime_peak, source: str,
         print(f"[mem-parity] static(temp+out)={_s} runtime_peak={_r} "
               f"runtime/static={_f} source={source} "
               f"terminal={bool(is_terminal)}", flush=True)
+    return rec
 
 
-def consume_mem_parity() -> list:
-    """Pop the per-period memory-parity records (see ``_record_mem_parity``)."""
-    out = list(_MEM_PARITY)
+def consume_mem_parity() -> dict:
+    """Pop the per-period memory-parity records (see ``_record_mem_parity``).
+
+    ``{"records": [...], "measured": int, "dropped": int}`` -- the counts
+    are what `check_mem_parity_complete` compares. Drained in the process
+    that measured: it rides `consume_plan_records`, which the Ray measure
+    actors already hand to the trainer (the ticket-07 trap: a counter the
+    actor wrote is invisible in the trainer's own module globals).
+    """
+    out = {"records": list(_MEM_PARITY),
+           "measured": int(_MEM_PARITY_MEASURED[0]),
+           "dropped": int(_MEM_PARITY_DROPPED[0])}
     _MEM_PARITY.clear()
+    _MEM_PARITY_MEASURED[0] = 0
+    _MEM_PARITY_DROPPED[0] = 0
     return out
+
+
+def mem_parity_summary(records) -> dict:
+    """Per-period numbers for the log dict (ticket .45 names them): the mean
+    and the worst (largest and smallest) ``watermark - temp`` in bytes over
+    the records that carry both, the two means, and how many records took
+    the static substitution instead of a runtime watermark."""
+    _gaps = []
+    _temps = []
+    _marks = []
+    _fallbacks = 0
+    for _r in records:
+        _t = _r.get("static_temp_bytes")
+        _w = _r.get("runtime_peak_bytes")
+        if _r.get("peak_source") == "static_fallback":
+            _fallbacks += 1
+        if _t is not None:
+            _temps.append(float(_t))
+        if _w is not None:
+            _marks.append(float(_w))
+        if _t is not None and _w is not None:
+            _gaps.append(float(_w) - float(_t))
+    _g = np.asarray(_gaps, dtype=np.float64)
+    return {
+        "n": int(len(records)),
+        "n_paired": int(_g.size),
+        "gap_mean_bytes": float(_g.mean()) if _g.size else float("nan"),
+        "gap_max_bytes": float(_g.max()) if _g.size else float("nan"),
+        "gap_min_bytes": float(_g.min()) if _g.size else float("nan"),
+        "temp_mean_bytes": (float(np.mean(_temps)) if _temps
+                            else float("nan")),
+        "watermark_mean_bytes": (float(np.mean(_marks)) if _marks
+                                 else float("nan")),
+        "static_fallbacks": int(_fallbacks),
+    }
 
 
 def _cb_slot(x, i, E):
@@ -4624,6 +4762,17 @@ class MeasureToolchainFault(RuntimeError):
     absorbs every other exception into a sentinel row and lets the run
     continue, which for THIS fault would mean a run that measures nothing
     or measures degraded executables while exiting 0. Both re-raise it.
+    """
+
+
+class MemChannelFault(MeasureToolchainFault):
+    """The memory channel could not be read for a measured plan, or a
+    measured plan left no parity record (ticket dsnn-3qm.49).
+
+    A subclass of :class:`MeasureToolchainFault` ON PURPOSE: the sentinel
+    machinery re-raises that class instead of absorbing it into a sentinel
+    row, and a plan scored on a memory channel that read nothing is exactly
+    the run that must not continue exiting 0 (a skip is a failure).
     """
 
 
@@ -6126,9 +6275,21 @@ def _callback(
     )
     # BOTH memory numbers, per measurement, with the source of the one that
     # trains made explicit (see _record_mem_parity).
-    _record_mem_parity(compiled_cost,
-                       peak_memory if peak_mem_samples else None,
-                       _peak_src, is_terminal)
+    _MEM_PARITY_MEASURED[0] += 1
+    _mp = _record_mem_parity(compiled_cost,
+                             peak_memory if peak_mem_samples else None,
+                             _peak_src, is_terminal)
+    if mem_channel() == "temp":
+        # THE MEMORY CHANNEL (ticket .49, ruling .29): slot 5 is the static
+        # temp bytes of the executable that was just timed; the watermark
+        # it replaced stays in the parity record. No executable or no
+        # memory_analysis() is a fault, not a zero.
+        if _mp is None or _mp["static_temp_bytes"] is None:
+            raise MemChannelFault(
+                "memory channel: memory_analysis() returned nothing for the "
+                "timed executable, so the static temp bytes of this plan "
+                "cannot be read (peak_source=%s)" % _peak_src)
+        peak_memory = float(_mp["static_temp_bytes"])
 
     # ------------------------------------------------------------------
     # Quality family — reward slot 6 (``quality``) + frob_residual.
@@ -6404,7 +6565,8 @@ def _callback(
             face_specs=_faces_np, face_skips=_skips_np,
             reward_vec=_reward_slots,
             face_before=_plan_pf0, face_after=_PER_FACE_STATS,
-            counts_from_trace=bool(_plan_traced[0]))
+            counts_from_trace=bool(_plan_traced[0]),
+            mem_parity=_mp)
 
     return tokens, eqn_ids, rewards
 
