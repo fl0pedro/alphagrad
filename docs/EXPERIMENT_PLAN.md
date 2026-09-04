@@ -24,7 +24,7 @@ Owner decision; not re-litigated here.
 | **LOGGED** | sparsity (slot 10) | `--sparsity-log` (weight 0) |
 | **LOGGED** | clipped relative Frobenius (slot 8) | automatic — `grad_cosine` materialises the exact reference slot 8 needs |
 | **LOGGED** | legacy Jacobian cosine | `--cos-log-every 20` |
-| **GUARD** | gradient coverage (slot 7) | `--reject-frozen-grads` (default ON, named anyway) |
+| **GUARD** | gradient coverage (slot 7) | `--reject-frozen-grads` (default ON, named anyway) — **removed 2026-09-03** (owner ruling 2026-09-03, ticket dsnn-3qm.15): no guard, slot 7 reserved |
 
 Fixed across all arms:
 

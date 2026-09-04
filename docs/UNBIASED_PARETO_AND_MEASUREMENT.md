@@ -809,6 +809,10 @@ was `PENDING (Resources)`.
 
 ## 10. GRADIENT COVERAGE — the measurement, the guard, the channel
 
+> **Removed 2026-09-03** (owner ruling 2026-09-03, ticket dsnn-3qm.15): no guard, no reward channel, no value head,
+> never a reward gate. Slot 7 is reserved and never populated. This section is
+> the record of what existed and why; nothing below is live code.
+
 **Written 2026-08-27.** §4 asked whether the one-face win is "a cheaper
 Jacobian" or "stop differentiating a parameter". `face_forensics.json` (T1)
 answered it, and this section is what was built on that answer:
