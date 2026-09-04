@@ -87,6 +87,7 @@ LANDSCAPE_FLAGS = [
     "--archive-max-measure", "--face-inventory", "--inventory-only",
     "--singleton-skip-sweep", "--sweep-stride", "--noise-floor-reps",
     "--report-only", "--tag", "--config-note", "--max-seconds",
+    "--approx-old",
 ]
 # wandb, as THREE constants rather than one opaque string, so the
 # pre-flight below and the emitted command line are provably the same
@@ -121,6 +122,7 @@ REQUIRED_FLAGS = [
     "--face-edge-mem",
     "--per-face-masks",
     "--plan-log",
+    "--approx-old",
 ]
 
 class _Delete:
@@ -168,12 +170,8 @@ SHARED_ENV = [
     ("ALPHAGRAD_MAX_FACES", "2538"),
     ("ALPHAGRAD_MAX_DELTA_TOKENS", "32768"),
     ("ALPHAGRAD_MAX_EQNS", "512"),
-    # G4 2026-08-28: graphax's working tree accepts the res-slot two-op form
-    # (tests/misc/test_face_two_op_form.py, committed e5fd46c) and =1 hooks
-    # BOTH addends.  Under =1 on a graphax that does NOT accept it, every plan
-    # putting a rule in the res/new slot dies in _trace_truncate SILENTLY --
-    # UNBIASED_PARETO_AND_MEASUREMENT.md sec 7(c).  The pre-flight VERIFIES it.
-    ("ALPHAGRAD_NEW_SLOT_JOIN", "1"),
+    # The old-edge configuration (formerly ALPHAGRAD_NEW_SLOT_JOIN) is an
+    # ARGUMENT now: --approx-old in SHARED_CLI (ticket .56).
     ("ALPHAGRAD_POLICY", "palimpsa"),
     # Vertex choice pinned to reverse elimination via legality, so ONLY the
     # approximations are learned.  Read at IMPORT time in
@@ -253,6 +251,13 @@ SHARED_CLI = [
     ("--reject-frozen-grads", None),
     # THE TRAINED QUALITY CHANNEL.  auto still means loss_drop; name it.
     ("--quality-metric", "grad_cosine"),
+    # THE OLD EDGE (ticket .56).  same = the new-slot approximation also hits
+    # the existing predecessor-to-successor edge at the join (graphax's two-op
+    # face form; the pre-flight below VERIFIES graphax accepts it), exact =
+    # the old edge is left exact.  NOT comparable across values.  The
+    # declared default, named so no arm inherits an unstated one; an arm
+    # overrides it in `cli`, or `arm_per_approx_old` emits it once per value.
+    ("--approx-old", "same"),
     # Sampling variance in the quality signal is WANTED.  --walk-rotate is
     # named for the loss-drop walk but env._walk_seed is SHARED, so it rotates
     # the grad-cosine probe batch too: without it grad_cosine scores every
@@ -310,6 +315,24 @@ ARMS: list[dict] = []
 
 def arm(**kw):
     ARMS.append(kw)
+
+
+# The two old-edge configurations of ticket .56.  The owner's ruling: both run
+# at least once, as ONE PAIRED PAIR on the all-rev arm of .50, not in every
+# experiment.  `arm_per_approx_old` is how .43 emits that pair: one arm per
+# value, the value on the command line and in the name, everything else
+# byte-identical.  Nothing calls it yet -- .43 does.
+APPROX_OLD_CONFIGS = ("same", "exact")
+
+
+def arm_per_approx_old(**kw):
+    """Emit ``kw`` once per --approx-old value: ``<name>_old<value>``."""
+    for cfg in APPROX_OLD_CONFIGS:
+        a = dict(kw)
+        a["name"] = f"{kw['name']}_old{cfg}"
+        a["job"] = f"{kw['job']}-old{cfg}"
+        a["cli"] = dict(kw.get("cli", {}), **{"--approx-old": cfg})
+        arm(**a)
 
 
 # ===========================  WAVE 0  =======================================
@@ -567,7 +590,6 @@ the RL framing survives on cost grounds rather than on quality grounds.""",
     body=r"""
 export JAX_PLATFORMS=cpu
 export ALPHAGRAD_SKIP_COUNT_OPS=1
-export ALPHAGRAD_NEW_SLOT_JOIN=1
 export ALPHAGRAD_FORCE_REV_ORDER=1
 export ALPHAGRAD_TLM_SEQ=32
 export ALPHAGRAD_TLM_DMODEL=128
@@ -577,6 +599,7 @@ export JAX_COMPILATION_CACHE_DIR=$HOME/dsnn/.jax_compile_cache
 uv run --no-sync python src/alphagrad/approx/tools/coverage_beam.py \
   --example TransformerLM --dataset wikitext2 --seed 250197 \
   --candidates $HOME/dsnn/run_analysis/w0/rows_p1_singleton.csv \
+  --approx-old same \
   --quality-min 0.9 --ratio-max 0.99 \
   --beam-width 16 --max-depth 8 --greedy-also \
   --report-eval-counts \
@@ -1036,7 +1059,7 @@ COMMON="--example TransformerLM --dataset wikitext2 \
  --exec-on-gpu \
  --cmp-type latency --mem-type peak_memory \
  --num-data-points 5 --reps-per-point 4 \
- --quality-metric grad_cosine --walk-steps 200 \
+ --quality-metric grad_cosine --approx-old same --walk-steps 200 \
  --out-dir $OUT"
 
 run_on () {   # $1 = gpu index, $2 = label, rest = args
@@ -1107,12 +1130,12 @@ arm(
         # AND cheapest.  Relevant here because this arm's quality channel IS
         # grad_cosine.
         "ALPHAGRAD_GRAD_COSINE_K": "1",
-        # ALPHAGRAD_NEW_SLOT_JOIN is left at the shared default (1).  The
-        # hand-written predecessor forced 0 because the PINNED graphax 4ea0bf8
-        # rejects the res-slot two-op form; the live graphax accepts it
-        # (e5fd46c) and the two-op pre-flight above VERIFIES that before any
-        # phase runs.  It is inert for QB in any case -- a SKIP-only plan
-        # writes no rule into any slot.
+        # --approx-old is left at the shared default (same).  The
+        # hand-written predecessor forced the old edge exact because the
+        # PINNED graphax 4ea0bf8 rejects the res-slot two-op form; the live
+        # graphax accepts it (e5fd46c) and the two-op pre-flight above
+        # VERIFIES that before any phase runs.  It is inert for QB in any
+        # case -- a SKIP-only plan writes no rule into any slot.
         #
         # ---- DROPPED FROM THE TRAINING STACK -----------------------------
         # SHARED_ENV describes ppo.py.  Two of these do not merely add noise
@@ -1296,7 +1319,7 @@ def render(a: dict) -> str:
     L.append(f"#   64 = a flag this launcher needs is not defined in {_flagsrc}")
     L.append("#   65 = argparse rejected the assembled command line")
     L.append("#   66 = a tool this launcher invokes does not exist")
-    L.append("#   70 = graphax cannot lower what ALPHAGRAD_NEW_SLOT_JOIN asks for")
+    L.append("#   70 = graphax cannot lower the two-op face form --approx-old same asks for")
     if _has_wandb:
         L.append("#   71 = --wandb online, but this node cannot reach or"
                  " authenticate to wandb")
@@ -1323,18 +1346,18 @@ def render(a: dict) -> str:
     L.append("  exit 64")
     L.append("fi")
     L.append("")
-    if kind != "cpu":
-        L.append("# ALPHAGRAD_NEW_SLOT_JOIN=1 emits the res-slot two-op face form.")
+    _approx_old = dict(_merge_cli(a.get("cli", {}))).get("--approx-old", "same")
+    if kind != "cpu" and _approx_old == "same":
+        L.append("# --approx-old same emits the res-slot two-op face form.")
         L.append("# On a graphax that rejects it, EVERY plan putting a rule in the")
         L.append("# res/new slot dies in _trace_truncate SILENTLY -- no counter, no")
         L.append("# log line.  That went unnoticed for a whole campaign.  VERIFY.")
-        L.append('if [ "${ALPHAGRAD_NEW_SLOT_JOIN:-1}" = "1" ]'
-                 ' && [ "${FQ_SKIP_TWOOP:-0}" != "1" ]; then')
+        L.append('if [ "${FQ_SKIP_TWOOP:-0}" != "1" ]; then')
         L.append("  JAX_PLATFORMS=cpu uv run --no-sync python -m pytest -q -x \\")
         L.append("    $HOME/dsnn/graphax/tests/misc/test_face_two_op_form.py \\")
         L.append("    -p no:cacheprovider >/tmp/twoop_$SLURM_JOB_ID.log 2>&1 || {")
         L.append('    echo "ABORT(70): graphax rejects the res-slot two-op form,"')
-        L.append('    echo "           but ALPHAGRAD_NEW_SLOT_JOIN=1 emits it."')
+        L.append('    echo "           but --approx-old same emits it."')
         L.append("    tail -20 /tmp/twoop_$SLURM_JOB_ID.log")
         L.append("    exit 70")
         L.append("  }")

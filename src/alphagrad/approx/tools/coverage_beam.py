@@ -153,7 +153,6 @@ ENV_DEFAULTS = {
     "ALPHAGRAD_MAX_DELTA_TOKENS": "32768",
     "GRAPHAX_PLANNER_EXACT": "1",
     "GRAPHAX_DEMAND_EMIT": "1",
-    "ALPHAGRAD_NEW_SLOT_JOIN": "0",
     "ALPHAGRAD_MAX_EQNS": "512",
     "ALPHAGRAD_SKIP_COUNT_OPS": "1",
     "ALPHAGRAD_SKIP_COST_ANALYSIS": "1",
@@ -341,11 +340,16 @@ def parse_candidates(path, *, face_from="auto", agg="median",
     return kept, cands, report
 
 
-def check_config_note(notes, warn):
+def check_config_note(notes, warn, approx_old="exact"):
     """Warn (never fail) when the CSV was produced under knobs this process
     does not have.  Face INDICES are graph-state dependent, so a plan-join or
-    scale mismatch means the (k, f) pairs may not denote the same faces."""
-    eff = {"newslotjoin": os.environ.get("ALPHAGRAD_NEW_SLOT_JOIN", "0")}
+    scale mismatch means the (k, f) pairs may not denote the same faces.
+
+    ``approx_old`` is this process's --approx-old.  Notes written before the
+    flag existed say ``newslotjoin=0/1`` (the env var it replaced); both
+    spellings are compared."""
+    eff = {"approx_old": str(approx_old),
+           "newslotjoin": "1" if str(approx_old) == "same" else "0"}
     bad = []
     for note in notes:
         for m in re.finditer(r"(\w+)=([\w.-]+)", note):
@@ -725,6 +729,13 @@ def build_parser():
     p.add_argument("--example", default="TransformerLM")
     p.add_argument("--dataset", default="wikitext2")
     p.add_argument("--seed", type=int, default=250197)
+    p.add_argument("--approx-old", default="exact", choices=["same", "exact"],
+                   help="What the OLD edge gets at a face's join (ticket .56); "
+                        "see ppo.py --approx-old.  Default exact: this tool "
+                        "screens the singleton-sweep CSVs, which were measured "
+                        "with the old edge exact, and face indices are only "
+                        "comparable under the configuration that produced "
+                        "them (check_config_note warns on a mismatch).")
     p.add_argument("--quality-min", type=float, default=0.9)
     p.add_argument("--ratio-max", type=float, default=0.99)
     p.add_argument("--agg", default="median",
@@ -801,7 +812,8 @@ def main(argv=None):
     log(f"  faces seen {report['faces_seen']}  KEPT "
         f"{report['faces_kept']} at quality > {args.quality_min} and "
         f"ratio < {args.ratio_max} ({args.agg} over paired trials)")
-    report["config_mismatch"] = check_config_note(report["config_notes"], warn)
+    report["config_mismatch"] = check_config_note(
+        report["config_notes"], warn, approx_old=args.approx_old)
 
     if args.max_candidates and len(kept) > args.max_candidates:
         warn(f"--max-candidates {args.max_candidates}: screening only the "
@@ -829,6 +841,9 @@ def main(argv=None):
         os.environ.setdefault(k, v)
     for k, v in ENV_FORCED.items():
         os.environ[k] = v
+    # The old-edge configuration is an ARGUMENT; this is env.approx_old()'s
+    # hand-off variable, the same shape ppo.py uses.
+    os.environ["ALPHAGRAD_APPROX_OLD"] = str(args.approx_old)
     if "JAX_PLATFORMS" not in os.environ:
         warn("JAX_PLATFORMS is unset; this tool does NOT set it (that is the "
              "import side-effect that poisons child processes). Export "
@@ -1066,6 +1081,7 @@ def _meta(args, warnings):
         "env": {k: os.environ.get(k) for k in
                 sorted(set(list(ENV_DEFAULTS) + list(ENV_FORCED) +
                            ["JAX_PLATFORMS", "ALPHAGRAD_FORCE_REV_ORDER",
+                            "ALPHAGRAD_APPROX_OLD",
                             "JAX_COMPILATION_CACHE_DIR"]))},
         "timestamp": time.time(),
         "n_warnings": len(warnings),

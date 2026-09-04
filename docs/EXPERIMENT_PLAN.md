@@ -581,6 +581,9 @@ What each result makes us do next. One row per experiment; no row says
    rather than trusting either document. The unresolved consequence stands:
    "audit v57–v66 for `NEW_SLOT_JOIN=1` casualties" is still open, and any
    archive statistic from that era may be biased by silently-dropped plans.
+   *2026-09-04 (ticket .56): the env var is gone; the switch is
+   `--approx-old {same,exact}` (`same` = the former `=1`, the default), and
+   the pre-flight verifies the two-op form whenever an arm runs `same`.*
 8. **`landscape_map` cannot name `grad_cosine`.** Its `--quality-metric`
    choices are `loss_drop, cosine, none`. On a scalar-loss target `cosine`
    aliases to `grad_cosine`, so W0-B is measuring the right channel — but the
