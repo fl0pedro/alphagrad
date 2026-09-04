@@ -64,3 +64,193 @@ def test_fallback_on_fusion_cycle():
                   "instruction %fusion.113")
     assert env_mod._compile_measure(lo) == "EXE"
     assert len(lo.calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# MEASURE TOOLCHAIN GATE (finding 03, ticket dsnn-3qm.21).
+#
+# A link-toolchain fault (nvlink refusing a newer ptxas cubin) is an
+# ENVIRONMENT fault that recurs on every plan; it must never be absorbed into
+# the per-plan degraded-fusion retry, and the gate that probes for it must
+# (a) stop the run under the default, (b) only warn-and-tag under warn,
+# (c) be cache-proof by construction.
+# ---------------------------------------------------------------------------
+import json
+import os
+import socket
+import subprocess
+import sys
+
+_NVLINK = ("INTERNAL: nvlink exited with non-zero error code 256, output: "
+           "nvlink fatal   : Input file '/tmp/tempfile-x.cubin' newer than "
+           "toolkit (129 vs 128)")
+
+
+class _OkLowered:
+    def __init__(self):
+        self.calls = []
+
+    def compile(self, compiler_options=None):
+        self.calls.append(compiler_options)
+        return "EXE"
+
+
+@pytest.fixture
+def fresh_gate(monkeypatch):
+    """Un-latch the per-process gate, default mode, probe passes."""
+    monkeypatch.delenv("ALPHAGRAD_MEASURE_TOOLCHAIN_GATE", raising=False)
+    monkeypatch.setattr(env_mod, "_MEASURE_TOOLCHAIN", dict(
+        env_mod._MEASURE_TOOLCHAIN, checked=False, ok=True, detail="",
+        mode="", link_faults=0))
+    monkeypatch.setattr(env_mod, "_toolchain_probe_compile", lambda: None)
+    return env_mod._MEASURE_TOOLCHAIN
+
+
+def test_nvlink_is_not_fallbackable_under_abort(fresh_gate):
+    lo = _Lowered(_NVLINK)
+    before = env_mod._MEASURE_COMPILE_FALLBACKS["n"]
+    with pytest.raises(env_mod.MeasureToolchainFault) as ei:
+        env_mod._compile_measure(lo)
+    assert len(lo.calls) == 1                       # no degraded retry
+    assert env_mod._MEASURE_COMPILE_FALLBACKS["n"] == before
+    msg = str(ei.value)
+    assert socket.gethostname() in msg              # names the node
+    assert "ptxas:" in msg and "nvlink:" in msg     # names the versions
+    assert "129 vs 128" in msg                      # names the fault
+    assert fresh_gate["ok"] is False
+    assert fresh_gate["link_faults"] == 1
+
+
+def test_nvlink_takes_the_degraded_set_and_tags_under_warn(fresh_gate,
+                                                            monkeypatch):
+    monkeypatch.setenv("ALPHAGRAD_MEASURE_TOOLCHAIN_GATE", "warn")
+    lo = _Lowered(_NVLINK)
+    before = env_mod._MEASURE_COMPILE_FALLBACKS["n"]
+    assert env_mod._compile_measure(lo) == "EXE"
+    assert len(lo.calls) == 2
+    assert env_mod._MEASURE_COMPILE_FALLBACKS["n"] == before + 1
+    assert fresh_gate["ok"] is False                # the plan gets tagged
+    # ...and the drain carries the tag in THIS process.
+    out = env_mod.consume_plan_records()
+    assert out["toolchain_ok"] is False
+    assert out["compile_fallbacks"] >= 1
+
+
+def test_nvlink_with_fallback_kill_switch_still_names_the_fault(fresh_gate,
+                                                                 monkeypatch):
+    monkeypatch.setenv("ALPHAGRAD_MEASURE_TOOLCHAIN_GATE", "warn")
+    monkeypatch.setenv("ALPHAGRAD_MEASURE_COMPILE_FALLBACK", "0")
+    lo = _Lowered(_NVLINK)
+    with pytest.raises(env_mod.MeasureToolchainFault):
+        env_mod._compile_measure(lo)
+    assert len(lo.calls) == 1
+
+
+def test_gate_aborts_on_a_probe_failure(fresh_gate, monkeypatch):
+    def _boom():
+        raise RuntimeError(_NVLINK)
+    monkeypatch.setattr(env_mod, "_toolchain_probe_compile", _boom)
+    lo = _OkLowered()
+    with pytest.raises(env_mod.MeasureToolchainFault) as ei:
+        env_mod._compile_measure(lo)
+    assert lo.calls == []                           # nothing was measured
+    msg = str(ei.value)
+    assert socket.gethostname() in msg
+    assert "ptxas:" in msg
+    assert "129 vs 128" in msg
+    assert "gate probe" in msg
+    assert fresh_gate["ok"] is False
+
+
+def test_gate_warns_and_runs_on_a_probe_failure(fresh_gate, monkeypatch,
+                                                capsys):
+    monkeypatch.setenv("ALPHAGRAD_MEASURE_TOOLCHAIN_GATE", "warn")
+
+    def _boom():
+        raise RuntimeError(_NVLINK)
+    monkeypatch.setattr(env_mod, "_toolchain_probe_compile", _boom)
+    lo = _OkLowered()
+    assert env_mod._compile_measure(lo) == "EXE"
+    assert "TOOLCHAIN FAULT" in capsys.readouterr().err
+    assert fresh_gate["ok"] is False
+
+
+def test_gate_off_skips_the_probe_only(fresh_gate, monkeypatch):
+    monkeypatch.setenv("ALPHAGRAD_MEASURE_TOOLCHAIN_GATE", "off")
+    n = [0]
+
+    def _count():
+        n[0] += 1
+    monkeypatch.setattr(env_mod, "_toolchain_probe_compile", _count)
+    assert env_mod._compile_measure(_OkLowered()) == "EXE"
+    assert n[0] == 0
+    assert fresh_gate["ok"] is True
+    # off skips the PROBE; a link fault in a real measure compile is still
+    # not fallbackable.
+    with pytest.raises(env_mod.MeasureToolchainFault):
+        env_mod._compile_measure(_Lowered(_NVLINK))
+
+
+def test_gate_runs_once_per_process(fresh_gate, monkeypatch):
+    n = [0]
+
+    def _count():
+        n[0] += 1
+    monkeypatch.setattr(env_mod, "_toolchain_probe_compile", _count)
+    env_mod._compile_measure(_OkLowered())
+    env_mod._compile_measure(_OkLowered())
+    assert n[0] == 1
+    assert fresh_gate["checked"] is True
+
+
+def test_unknown_gate_mode_is_refused(fresh_gate, monkeypatch):
+    monkeypatch.setenv("ALPHAGRAD_MEASURE_TOOLCHAIN_GATE", "maybe")
+    with pytest.raises(ValueError, match="measure-toolchain-gate"):
+        env_mod._compile_measure(_OkLowered())
+
+
+_CACHE_SCRIPT = r"""
+import json, os, sys, tempfile
+d = tempfile.mkdtemp(prefix="t21_cache_")
+os.environ.update(JAX_PLATFORMS="cpu", JAX_COMPILATION_CACHE_DIR=d,
+                  JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="0",
+                  JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES="0",
+                  ALPHAGRAD_SKIP_COST_ANALYSIS="1",
+                  ALPHAGRAD_SKIP_COUNT_OPS="1")
+from alphagrad.approx import env
+# Importing env runs a few eager module-level jnp ops, and those ARE cached
+# (convert_element_type entries). Snapshot after the import: the claim is
+# that the PROBE adds nothing.
+before = set(os.listdir(d))
+a = env._toolchain_probe_compile().as_text()
+b = env._toolchain_probe_compile().as_text()
+added_by_probe = sorted(set(os.listdir(d)) - before)
+import jax, jax.numpy as jnp
+jax.jit(lambda x: jnp.cos(x) * 2).lower(
+    jax.ShapeDtypeStruct((8, 8), jnp.float32)).compile()
+added_by_control = sorted(set(os.listdir(d)) - before)
+print("RESULT " + json.dumps({"differ": a != b,
+                               "added_by_probe": added_by_probe,
+                               "added_by_control": added_by_control}))
+"""
+
+
+def test_probe_bypasses_the_persistent_compile_cache():
+    """Finding 03 sec 5a: a cache entry written on a clean node is reused on
+    a broken one and the fault never fires, so the probe must be unable to
+    hit the cache and must not populate it. A fresh process, because the
+    cache is initialised once per process from the environment."""
+    r = subprocess.run([sys.executable, "-c", _CACHE_SCRIPT],
+                       capture_output=True, text=True, timeout=600,
+                       env=dict(os.environ))
+    assert r.returncode == 0, r.stderr[-2000:]
+    line = [ln for ln in r.stdout.splitlines() if ln.startswith("RESULT ")]
+    assert line, r.stdout[-2000:]
+    res = json.loads(line[-1][len("RESULT "):])
+    # unique key each call: the two modules are not even the same module
+    assert res["differ"] is True
+    # no write: two probes added NOTHING to the persistent cache...
+    assert res["added_by_probe"] == [], res["added_by_probe"]
+    # ...while an ordinary compile in the same process DID write, so the
+    # cache was live and the silence above is the probe's doing.
+    assert len(res["added_by_control"]) == 1, res["added_by_control"]

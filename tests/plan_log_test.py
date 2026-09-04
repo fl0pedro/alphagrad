@@ -283,3 +283,63 @@ def test_the_jsonl_is_append_only(tmp_path):
     assert plog.append_records(p, [{"a": 2}, {"a": 3}]) == 2
     recs = plog.read_records(p)
     assert [r["a"] for r in recs] == [1, 2, 3]
+
+
+# --------------------------------------------------------------------------
+# 5. the measure toolchain telemetry (finding 03, ticket dsnn-3qm.21)
+# --------------------------------------------------------------------------
+
+def test_record_and_drain_carry_the_measure_toolchain_telemetry():
+    os.environ["ALPHAGRAD_PLAN_LOG"] = "1"
+    try:
+        envmod.consume_plan_records()
+        env = _make_env()
+        _run_episode(env, skip_face_of_vertex=1)
+        out = envmod.consume_plan_records()
+        rec = out["records"][0]
+        # Per plan: the degraded-fusion compiles taken WHILE THIS PLAN was
+        # measured, the process total, and whether this node's toolchain
+        # passed the gate. Nothing degraded here, so 0 / 0 / True.
+        assert rec["compile_fallbacks"] == 0
+        assert isinstance(rec["compile_fallbacks"], int)
+        assert rec["compile_fallbacks_total"] == (
+            envmod._MEASURE_COMPILE_FALLBACKS["n"])
+        assert rec["toolchain_ok"] is True
+        # The drain carries the live counter from THIS process -- the one
+        # that compiles -- so the trainer never reads its own zero.
+        for k in ("compile_fallbacks", "compile_fallbacks_total",
+                  "toolchain_ok", "toolchain_host"):
+            assert k in out, k
+        assert out["toolchain_ok"] is True
+        # A fallback taken between two drains is reported ONCE, as a delta.
+        envmod._MEASURE_COMPILE_FALLBACKS["n"] += 1
+        try:
+            assert envmod.consume_plan_records()["compile_fallbacks"] == 1
+            assert envmod.consume_plan_records()["compile_fallbacks"] == 0
+        finally:
+            envmod._MEASURE_COMPILE_FALLBACKS["n"] -= 1
+    finally:
+        os.environ["ALPHAGRAD_PLAN_LOG"] = "0"
+        envmod.consume_plan_records()
+
+
+def test_gate_mode_and_plan_log_leave_the_reward_bit_identical(monkeypatch):
+    """The library-level half of the flag-off gate: neither the toolchain
+    gate's mode nor the plan-log flag may move a reward slot. (The
+    trajectory-level half is the ALPHAGRAD_EQ_DUMP run in ppo.py.)"""
+    rewards = []
+    for mode, log in (("abort", "0"), ("off", "0"), ("warn", "0"),
+                      ("abort", "1")):
+        monkeypatch.setenv("ALPHAGRAD_MEASURE_TOOLCHAIN_GATE", mode)
+        monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", log)
+        monkeypatch.setattr(envmod, "_MEASURE_TOOLCHAIN", dict(
+            envmod._MEASURE_TOOLCHAIN, checked=False, ok=True))
+        envmod.consume_plan_records()
+        rewards.append(_run_episode(_make_env(), skip_face_of_vertex=1))
+    envmod.consume_plan_records()
+    lat = REWARD_INDEX["latency_ns"]
+    keep = [i for i in range(NUM_REWARDS) if i != lat]
+    for r in rewards[1:]:
+        assert np.array_equal(r[keep].astype(np.float64),
+                              rewards[0][keep].astype(np.float64)), (
+            r, rewards[0])
