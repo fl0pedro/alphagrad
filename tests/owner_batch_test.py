@@ -1,5 +1,5 @@
 """Pins for the owner batch: mult-gate PPO/AZ parity + face-head identity
-init (`ALPHAGRAD_FACE_NONE_BIAS`)."""
+init (`--face-none-bias`)."""
 import numpy as np
 import jax.numpy as jnp
 import pytest
@@ -47,16 +47,13 @@ def test_mult_gate_destroyed_below_every_valid_reward():
     assert honest >= 0.0 and honest > destroyed
 
 
-def test_face_none_bias_identity_init(monkeypatch):
+def test_face_none_bias_identity_init():
     """factory applies +B to each slot's OP_NONE logit and -B to SKIP; the
-    resulting per-face approx probability is small; default (unset) changes
+    resulting per-face approx probability is small; default (0) changes
     nothing."""
-    monkeypatch.setenv("ALPHAGRAD_FACE_NONE_BIAS", "6")
-    import importlib
     import test_ppo_az_parity as par
     agent = par._build({"face_actions": True, "unified_face_head": True,
-                        "live_faces": True})
-    monkeypatch.delenv("ALPHAGRAD_FACE_NONE_BIAS")
+                        "live_faces": True}, face_none_bias=6.0)
     agent0 = par._build({"face_actions": True, "unified_face_head": True,
                          "live_faces": True})
     from alphagrad.approx.unified_face_head import (

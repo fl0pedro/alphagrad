@@ -19,7 +19,7 @@ Pins here:
    textbook bound, and NOT orthogonal), zero biases everywhere, and no head
    rescaling at all -- pointer and face head on one scale.
 4. INIT-LOGIT STATISTICS: max|logit| and std of the face head's 94 logits at
-   init, per scheme, at ALPHAGRAD_FACE_NONE_BIAS 0 and 6. Printed as a table
+   init, per scheme, at --face-none-bias 0 and 6. Printed as a table
    (run with -s) and asserted where the audit makes a claim.
 """
 import os
@@ -193,15 +193,8 @@ def test_classic_rejects_unknown_scheme():
 # ------------------------------------------- 4. init-logit statistics table
 
 def _face_logit_stats(scheme, none_bias, seed=11, n=256):
-    old = os.environ.get("ALPHAGRAD_FACE_NONE_BIAS")
-    os.environ["ALPHAGRAD_FACE_NONE_BIAS"] = str(none_bias)
-    try:
-        a = _agent(_ns(init_scheme=scheme), seed=seed)
-    finally:
-        if old is None:
-            os.environ.pop("ALPHAGRAD_FACE_NONE_BIAS", None)
-        else:
-            os.environ["ALPHAGRAD_FACE_NONE_BIAS"] = old
+    a = _agent(_ns(init_scheme=scheme, face_none_bias=float(none_bias)),
+               seed=seed)
     head = a.face_path_policy.head
     ctx = jrand.normal(jrand.PRNGKey(7), (n, EMBD))
     z = np.asarray(jax.vmap(head.logits)(ctx))               # (n, 94)
