@@ -98,20 +98,11 @@ mkdir -p "$RAY_TMPDIR"
 # fight the --plan-log flag this gate depends on.
 unset ALPHAGRAD_PLAN_LOG ALPHAGRAD_MAX_TOKENS ALPHAGRAD_QUALITY_METRIC
 
-# WHY --no-reject-frozen-grads, ON A GATE, DELIBERATELY.  The frozen-gradient
-# guard is DEFAULT ON and it is right to be on in production -- but it RETURNS
-# EARLY with `_SENTINEL_BAD_REWARD` before the cost channels are measured.  At
-# episode 0 with an untrained face policy on a 25-vertex graph, the sampled
-# SKIPs freeze every trainable leaf, so every terminal plan is guard-rejected
-# and every recorded reward is degenerate FOR A POLICY REASON.  Measured: at
-# HEAD with the guard on, 16/16 plans came back `sentinelled` with all six cost
-# channels at -1e10 -- indistinguishable, on the reward vector alone, from the
-# dead-pool failure this gate exists to detect.  The guard is therefore turned
-# OFF here so that the verdict depends on the TRANSPORT and not on what a
-# random policy happened to sample.  A guard-sentinelled plan still proves the
-# callback ran in the actor (it built the exact reference and the coverage
-# census there), but it proves nothing about whether a COST was measured, and
-# "a cost was measured" is the whole claim.
+# The frozen-gradient guard this gate used to disarm here
+# (--no-reject-frozen-grads: it sentinelled every plan an untrained policy
+# sampled, which on the reward vector alone looked exactly like a dead pool)
+# was REMOVED 2026-09-03 (owner ruling 2026-09-03, ticket dsnn-3qm.15). Nothing sentinels a plan for a policy
+# reason any more, so the verdict depends on the TRANSPORT alone.
 T0=$(date +%s)
 timeout "$GATE_TIMEOUT" ${PY} src/alphagrad/approx/ppo.py \
     --variant full --face-actions --unified-face-head --live-faces \
@@ -120,7 +111,7 @@ timeout "$GATE_TIMEOUT" ${PY} src/alphagrad/approx/ppo.py \
     --cmp-type flops --mem-type peak_memory --terminal-rewards-only \
     --rewards cmp mem --lambda-cmp 1 --lambda-mem 1 --lambda-frob 1 \
     --advantage-norm none --episodes "$EPISODES" --seed 42 \
-    --num-envs "$ENVS" --minibatches 1 --no-reject-frozen-grads \
+    --num-envs "$ENVS" --minibatches 1 \
     --vocab-size 512 --wandb disabled --example NeuralNetwork \
     --ray-measure "$ACTORS" --ray-measure-timeout 300 \
     --plan-log "$PLAN_LOG" --name pool_liveness_gate \

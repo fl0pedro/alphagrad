@@ -56,6 +56,10 @@ therefore passes ``--no-reject-frozen-grads`` so the verdict depends on the
 TRANSPORT and not on what a random policy sampled, and (4) now demands
 POSITIVE evidence (a real cost number) rather than absence of the sentinel.
 
+UPDATE 2026-09-03 (owner ruling 2026-09-03, ticket dsnn-3qm.15): that guard was REMOVED and the gate no longer
+passes ``--no-reject-frozen-grads``. New records carry no ``sentinelled``
+field, so every degenerate record now counts as degenerate WITHOUT a guard.
+
 A SKIP IS A FAILURE (116c540).  A gate that did not run pins nothing, so the
 "could not run" verdict exits non-zero too -- but with its OWN exit code and
 its own headline, because "the harness is misconfigured" and "the measurement

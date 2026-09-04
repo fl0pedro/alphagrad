@@ -103,7 +103,6 @@ WANDB = (f"--wandb {WANDB_MODE} --wandb-entity {WANDB_ENTITY}"
 # The R1-R4 battery shipped with this guard and it caught three missing flags.
 REQUIRED_FLAGS = [
     "--quality-metric",
-    "--reject-frozen-grads",
     "--symlog-channels",
     "--init-scheme",
     "--face-read",
@@ -113,7 +112,6 @@ REQUIRED_FLAGS = [
     "--sparsity-log",
     "--cos-log-every",
     "--pareto-dump-every",
-    "--grad-coverage-weight",
     "--latency-inner-reps",
     "--kl-ref-weight",
     "--exact",
@@ -247,10 +245,8 @@ SHARED_CLI = [
     # explicitly because no campaign run v57-v66 ever set them.
     ("--discount", "1.0"),
     ("--gae-lambda", "1.0"),
-    # THE GUARD, always armed.  Held-out scoring cannot detect the
-    # frozen-gradient hack at ANY horizon (A3's decisive negative), so
-    # coverage is the only defence.
-    ("--reject-frozen-grads", None),
+    # ("--reject-frozen-grads", the gradient-coverage guard, sat here from
+    # wave 1 until 2026-09-03; removed by owner ruling 2026-09-03, ticket dsnn-3qm.15.)
     # THE TRAINED QUALITY CHANNEL.  auto still means loss_drop; name it.
     ("--quality-metric", "grad_cosine"),
     # Sampling variance in the quality signal is WANTED.  --walk-rotate is
@@ -287,8 +283,8 @@ SHARED_CLI = [
     ("--pareto-dump-every", "10"),
     # A6.  --pareto-dump-every persists the FRONT; this persists EVERYTHING,
     # one append-only JSONL per run holding every terminal plan with its
-    # replayable wire, all 11 reward slots, the per-kind
-    # requested/applied/idempotent counts and the per-leaf coverage census.
+    # replayable wire, all 11 reward slots and the per-kind
+    # requested/applied/idempotent counts.
     # X3 is an analysis OF THE LOSERS and they were previously discarded at
     # the end of every episode.  It is pure logging -- no reward, no action,
     # no device work, no extra exact reference -- so it rides every arm.
@@ -520,70 +516,10 @@ echo "W0 PROBE COMPLETE"
 """,
 )
 
-arm(
-    name="w0_x2_screen",
-    job="w0-x2-screen",
-    kind="cpu",
-    node="pgi15-cpu2",
-    time="4:00:00",
-    needs_tool="src/alphagrad/approx/tools/coverage_beam.py",
-    depends="w0_probe P1 (it reads p1_singleton's rows.csv)",
-    purpose="""WAVE 0 / X2 SCREEN -- the coverage-constrained frontier, and the
-evaluation-count measurement that comes with it.
 
-X2 asks: what is the best speedup achievable with frac_leaves_zeroed == 0?
-Gradient COVERAGE is computable WITHOUT the walk and WITHOUT a latency
-measurement, so thousands of multi-skip subsets can be screened on a CPU node
-and only the survivors handed to a GPU.  Greedy and beam over the ~31
-singleton candidates P1 re-derives.
-
-IT ALSO ANSWERS A QUESTION THAT COULD REFRAME THE THESIS.  Counting the
-evaluations a beam search needs to reach the best known plan is the honest
-denominator for "did RL find this".  If a few hundred suffice, RL-as-SEARCH is
-settled on this target and the interesting claim becomes RL-as-AMORTIZATION.
-Cheap to ask; expensive to have never asked.
-
-BLOCKED ON A BUILD.  tools/coverage_beam.py DOES NOT EXIST YET; the pre-flight
-aborts with exit 66 naming it rather than failing halfway through.  It needs:
-(i) read P1's rows.csv, keep faces with quality > 0.9 and ratio < 0.99;
-(ii) greedy and beam (width 16, depth 8) over subsets, scoring each ONLY by
-env._grad_coverage against the exact reference for the same order -- no walk,
-no latency;  (iii) emit every surviving subset plus a running count of
-coverage evaluations to first reaching the best known plan.
-
-COST: ~4 CPU-h.  Node-hours on the Blackwells: ZERO.""",
-    prediction="""REGISTERED BEFORE THE RUN.  Coverage rejects every subset
-containing one of the ~6 gradient-destroyers.  Among the ~26 mild candidates,
-subsets holding frac_leaves_zeroed == 0 exist and compose, so the
-full-coverage frontier beats the drift floor -- but it does NOT reach the
-0.53-0.58 singleton ratios, because those ratios are bought by freezing 11-15
-of 16 trainable leaves.  Beam reaches the best coverage-clean plan in O(100)
-coverage evaluations.""",
-    falsifier="""If no multi-skip subset with full coverage beats the best
-single coverage-clean skip, composition is dead and X2 collapses to the
-singleton answer -- report that, do not keep widening the beam.
-If the beam needs > 10000 evaluations, search is NOT cheap on this target and
-the RL framing survives on cost grounds rather than on quality grounds.""",
-    body=r"""
-export JAX_PLATFORMS=cpu
-export ALPHAGRAD_SKIP_COUNT_OPS=1
-export ALPHAGRAD_NEW_SLOT_JOIN=1
-export ALPHAGRAD_FORCE_REV_ORDER=1
-export ALPHAGRAD_TLM_SEQ=32
-export ALPHAGRAD_TLM_DMODEL=128
-export ALPHAGRAD_TLM_VOCAB=1024
-export JAX_COMPILATION_CACHE_DIR=$HOME/dsnn/.jax_compile_cache
-
-uv run --no-sync python src/alphagrad/approx/tools/coverage_beam.py \
-  --example TransformerLM --dataset wikitext2 --seed 250197 \
-  --candidates $HOME/dsnn/run_analysis/w0/rows_p1_singleton.csv \
-  --quality-min 0.9 --ratio-max 0.99 \
-  --beam-width 16 --max-depth 8 --greedy-also \
-  --report-eval-counts \
-  --out $HOME/dsnn/run_analysis/w0/x2_screen.json
-echo "X2 screen exited with $?"
-""",
-)
+# The w0_x2_screen arm (the coverage-constrained frontier, run through
+# tools/coverage_beam.py) was removed with the gradient-coverage guard on
+# 2026-09-03 (owner ruling 2026-09-03, ticket dsnn-3qm.15).
 
 # ===========================  WAVE 1  =======================================
 #
@@ -628,9 +564,11 @@ echo "X2 screen exited with $?"
 W1_HEAD = """WAVE 1 -- CONTRAST x PRICE.  The settled reward configuration:
 three TRAINED channels (real measured latency, real measured peak memory, and
 the gradient cosine at init with K=1), terminal rewards only, gamma = GAE
-lambda = 1, classic init, symlog on the cost channels only, the gradient
-coverage guard armed, and sparsity / the legacy Jacobian cosine / the clipped
-relative Frobenius LOGGED but never trained."""
+lambda = 1, classic init, symlog on the cost channels only, and sparsity /
+the legacy Jacobian cosine / the clipped relative Frobenius LOGGED but never
+trained.  (Wave 1 ran with the gradient-coverage guard armed; the guard was
+removed 2026-09-03 by owner ruling, ticket dsnn-3qm.15, and a regenerated
+launcher no longer passes it.)"""
 
 for _n, _bias, _lam, _node in [
     ("w1a_bias6_lam170", 6, 170, "pgi15-gpu15"),
