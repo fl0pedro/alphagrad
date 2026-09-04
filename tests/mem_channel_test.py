@@ -11,9 +11,15 @@ on a toy scalar-loss target (no TLM, no data generator, CPU):
 
 2. ``watermark - temp`` is a near-constant across plans (finding 41: 2.104 MB
    on TLM, R^2 = 1.000000): its spread is small relative to the temp spread.
-   On a CPU backend the "watermark" is the in-place static substitution
-   (temp + output + argument bytes), so this half is a test of the plumbing,
-   not of the allocator; the GPU landing test is ticket .24's.
+   THE INSTRUMENT IS PINNED to the spec-native primitives
+   (ALPHAGRAD_DIRECT_MEASURE=1), under which a CPU backend has no allocator
+   statistics and the "watermark" is the in-place static substitution (temp
+   + output + argument bytes): this half tests the plumbing, not the
+   allocator. It has to be pinned: with the ResourceMonitor instrument a CPU
+   node reports a FLAT device peak of 256-260 B for every plan (job 63632:
+   temps 512 / 0 / 33024 B against watermarks 260 / 256 / 260 B), i.e. the
+   sigma = 0 of finding 49 in miniature, and the gap is not a constant. The
+   GPU landing test of the real watermark is ticket .24's.
 
 3. FLAG OFF (``--mem-channel watermark``) is the pre-.49 channel: slot 5 is
    the recorded watermark, and every other slot is identical under both
@@ -38,6 +44,8 @@ os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
 # is what is under test. One process per module (finding 47), so this
 # module owns its configuration.
 os.environ["ALPHAGRAD_QUALITY_METRIC"] = "none"
+# The one instrument this module makes claims about (see the docstring).
+os.environ["ALPHAGRAD_DIRECT_MEASURE"] = "1"
 os.environ.pop("ALPHAGRAD_PLAN_LOG", None)
 os.environ.pop("ALPHAGRAD_MEM_CHANNEL", None)
 os.environ.pop("ALPHAGRAD_QUALITY_GATE_MIN", None)
@@ -158,6 +166,8 @@ def test_watermark_minus_temp_is_near_constant_across_plans(channel):
     _run_plan(env, rev[::-1])                  # forward mode: much more temp
     recs = _terminal_records(envmod.consume_mem_parity())
     assert len(recs) == 3
+    # Name the instrument before claiming anything about the gap.
+    assert [r["peak_source"] for r in recs] == ["static_fallback"] * 3, recs
     temps = np.asarray([r["static_temp_bytes"] for r in recs], np.float64)
     marks = np.asarray([r["runtime_peak_bytes"] for r in recs], np.float64)
     assert np.all(np.isfinite(temps)) and np.all(np.isfinite(marks))
@@ -204,8 +214,10 @@ def test_watermark_channel_is_the_recorded_watermark_and_nothing_else_moves(
     # The same executable was analysed both times.
     assert rec_w["static_temp_bytes"] == rec_t["static_temp_bytes"]
     assert rec_w["runtime_peak_bytes"] == rec_t["runtime_peak_bytes"]
-    # The two channels differ on this plan (the watermark carries the
-    # output + argument bytes the temp does not), and on nothing else.
+    # The two channels differ on this plan (under the pinned instrument the
+    # substituted watermark carries the output + argument bytes the temp
+    # does not), and nothing else moves.
+    assert rec_w["peak_source"] == "static_fallback"
     assert -float(r_w[_MEM]) > -float(r_t[_MEM])
     keep = [i for i in range(NUM_REWARDS) if i not in (_MEM, _LAT)]
     assert np.array_equal(r_w[keep].astype(np.float64),
@@ -273,8 +285,8 @@ def test_plan_log_record_carries_both_memory_numbers(channel, monkeypatch):
     rec = out["records"][0]
     assert rec["mem_channel"] == "temp"
     assert rec["mem_temp_bytes"] == -float(r[_MEM])
+    assert rec["mem_peak_source"] == "static_fallback"  # the pinned instrument
     assert rec["mem_watermark_bytes"] > rec["mem_temp_bytes"]
-    assert rec["mem_peak_source"] == "static_fallback"      # CPU backend
     assert rec["rewards"][_MEM] == float(r[_MEM])
     # ...and the drain's own parity record agrees with the plan record.
     term = _terminal_records(out["mem_parity"])
