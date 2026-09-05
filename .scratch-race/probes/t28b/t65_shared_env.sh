@@ -1,4 +1,4 @@
-# t65: the campaign's SHARED_ENV (alphagrad/tools/gen_fq_launchers.py) for the
+# t28b (lane B of the .28 race): the campaign's SHARED_ENV (alphagrad/tools/gen_fq_launchers.py) for the
 # engine probe, value for value, EXCEPT the two engine knobs: the probe sets
 # GRAPHAX_EINSUM_GENERAL and GRAPHAX_PLANNER_EXACT itself around every
 # ``.lower()`` and removes an inherited value at import.  Source AFTER the
@@ -14,7 +14,9 @@ export ALPHAGRAD_MAX_FACES=2538
 export ALPHAGRAD_MAX_DELTA_TOKENS=32768
 export ALPHAGRAD_MAX_EQNS=512
 export ALPHAGRAD_POLICY=palimpsa
-export ALPHAGRAD_FORCE_REV_ORDER=1
+# ALPHAGRAD_FORCE_REV_ORDER is REMOVED here: the integration base of this race
+# (alphagrad ae2852a9) raises on it (ticket dsnn-3qm.64 promoted it to
+# --fixed-order). The probe passes both orders explicitly, so nothing is lost.
 export ALPHAGRAD_GRAD_COSINE_K=1
 export ALPHAGRAD_ACTOR_PROF_EVERY=20
 export ALPHAGRAD_INCREMENTAL_TOKENS=1
