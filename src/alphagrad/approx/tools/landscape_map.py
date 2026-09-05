@@ -172,6 +172,11 @@ def make_argparser() -> argparse.ArgumentParser:
                         "first execution of a plan reading 5-10x the settled "
                         "value; without this the whole trial-0 column is "
                         "first-touch, not latency.")
+    p.add_argument("--grad-oracle", choices=["reference", "off"],
+                   default="reference",
+                   help="Oracle A (ticket .62): the exact gradient of every "
+                        "order vs jax.grad once per process; a disagreement "
+                        "aborts. Same reader as ppo.py (ALPHAGRAD_GRAD_ORACLE).")
     p.add_argument("--quality-metric", default="grad_cosine",
                    choices=["loss_drop", "grad_cosine", "jac_cosine",
                             "cosine", "none"],
@@ -319,6 +324,7 @@ os.environ.setdefault("ALPHAGRAD_UNIFIED_FACE_ENUM", "1")
 # The quality channel is configured through the ENVIRONMENT in this codebase
 # (one env var, one reader, so two paths cannot disagree) -- mirror ppo.py.
 os.environ["ALPHAGRAD_QUALITY_METRIC"] = str(ARGS.quality_metric)
+os.environ["ALPHAGRAD_GRAD_ORACLE"] = str(ARGS.grad_oracle)
 os.environ["ALPHAGRAD_APPROX_OLD"] = str(ARGS.approx_old)
 os.environ["ALPHAGRAD_WALK_STEPS"] = str(int(ARGS.walk_steps))
 os.environ["ALPHAGRAD_WALK_LR"] = repr(float(ARGS.walk_lr))

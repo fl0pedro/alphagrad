@@ -1269,41 +1269,26 @@ def consume_sparsity_stats() -> dict:
 def _residual_scores(exact_out, approx_out, has_aux: bool):
     """``(rel_frob, cos)`` of ``approx_out`` against ``exact_out``, STREAMED.
 
-    Same arithmetic and the same epsilon policy as `_quality_metrics` (the
-    per-leaf accumulation of <e,a>, ||e||^2, ||a||^2, ||e-a||^2 that exists
-    precisely so a >=4 GB flat concatenate is never materialised); this variant
-    exists only because the fidelity path holds the two outputs at a different
-    place in `_callback`. Returns ``(nan, nan)`` on the same "broken comparison" cases
-    `_quality_metrics` scores worst -- the caller decides what a broken
-    comparison means for the channel.
+    The same accumulator as `_quality_metrics` (``_gradient_similarity``: the
+    per-leaf <e,a>, ||e||^2, ||a||^2, ||e-a||^2 that exists precisely so a
+    >=4 GB flat concatenate is never materialised, with the exact-structure
+    check of ticket .62 -- a mismatch RAISES ``GradientStructureMismatch``,
+    a dead path is zero, an implicit dim is compared analytically). This
+    variant exists only because the fidelity path holds the two outputs at a
+    different place in `_callback`. Returns ``(nan, nan)`` when the exact side
+    has nothing to compare against.
     """
     e_out = exact_out[1] if has_aux else exact_out
     a_out = approx_out[1] if has_aux else approx_out
-    a_out = _align_jac(a_out, e_out)
-    leaves_e = jax.tree_util.tree_leaves(e_out)
-    leaves_a = jax.tree_util.tree_leaves(a_out)
-    if not leaves_e or not leaves_a or len(leaves_e) != len(leaves_a):
+    leaves_e = _gradient_leaves(e_out)
+    if not leaves_e or all(x is None for x in leaves_e):
         return float("nan"), float("nan")
-    if any(getattr(a, "shape", None) != getattr(e, "shape", None)
-           for a, e in zip(leaves_a, leaves_e)):
+    dot, ee, aa, rr, _total = _gradient_similarity(e_out, a_out, "fidelity")
+    if _total == 0:
         return float("nan"), float("nan")
-    dot = ee = aa = rr = None
-    for e, a in zip(leaves_e, leaves_a):
-        _cdt = jnp.promote_types(jnp.promote_types(e.dtype, a.dtype),
-                                 jnp.float32)
-        ef = jnp.ravel(e).astype(_cdt)
-        af = jnp.ravel(a).astype(_cdt)
-        _d = jnp.sum(ef * af)
-        _e2 = jnp.sum(jnp.abs(ef) ** 2)
-        _a2 = jnp.sum(jnp.abs(af) ** 2)
-        _r2 = jnp.sum(jnp.abs(ef - af) ** 2)
-        dot = _d if dot is None else dot + _d
-        ee = _e2 if ee is None else ee + _e2
-        aa = _a2 if aa is None else aa + _a2
-        rr = _r2 if rr is None else rr + _r2
     exact_norm = jnp.sqrt(ee)
     approx_norm = jnp.sqrt(aa)
-    rel_frob = jnp.sqrt(rr) / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
+    rel_frob = jnp.sqrt(jnp.maximum(rr, 0.0)) / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
     cos = jnp.real(dot / (jnp.maximum(exact_norm, jnp.sqrt(1e-7))
                           * jnp.maximum(approx_norm, jnp.sqrt(1e-7))))
     return float(rel_frob), float(cos)
@@ -2721,25 +2706,180 @@ def _flatten_jacobians(jac):
     return jnp.concatenate(flats)
 
 
-def _align_jac(jac_approx, jac_exact):
-    """Align each approx-Jacobian/grad leaf to its exact leaf's LAYOUT before
-    comparison. graphax ``jacve`` returns some weight grads in the transposed
-    (dL/dW^T) layout for certain elimination orders; flattening them as-is makes
-    a (256,784) vs (784,256) ravel near-orthogonal, so cosine/frob become a
-    layout ARTIFACT that badly underestimates true gradient quality. Transpose a
-    2-D leaf back when its shape is the exact leaf's reverse; leave other
-    mismatches for the size/shape guard downstream. (Ported from the fat-line
-    stash — the fix that lifted Spearman-vs-trainability 0.67 -> 0.79.)"""
+class GradientStructureMismatch(RuntimeError):
+    """Two gradient pytrees that must share one structure do not (ticket
+    dsnn-3qm.62). Raised by the grad-cosine and fidelity comparisons instead
+    of the silent 0.0 clamp that hid finding 60; the measure actors re-raise
+    it and the run stops. The message names the site and the leaf."""
+
+
+def _align_jac(jac_approx, jac_exact, site: str = "jac_cosine"):
+    """Align each approx-Jacobian leaf to its exact leaf's LAYOUT before the
+    ANALYTIC JACOBIAN-COSINE comparison (the benchmarks whose target is a full
+    Jacobian: Helmholtz, RoeFlux, ...). graphax ``jacve`` returns some
+    Jacobian blocks in the transposed layout for certain elimination orders;
+    flattening them as-is makes a (256,784) vs (784,256) ravel near-orthogonal.
+    Transpose a 2-D leaf back when its shape is the exact leaf's reverse.
+
+    Ticket .62: this is NOT on the grad-cosine or fidelity path any more (a
+    parameter gradient has ONE layout, graphax's output contract), and a
+    pytree that cannot be mapped against its reference RAISES instead of
+    being returned unaligned (the blanket ``except`` that swallowed finding
+    60's ``tree_map`` error is gone)."""
     def _al(a, e):
         if getattr(a, "shape", None) == getattr(e, "shape", None):
             return a
         if getattr(a, "ndim", 0) == 2 and a.shape == e.shape[::-1]:
+            print(f"[{site}] aligning a transposed Jacobian leaf "
+                  f"{a.shape} -> {e.shape}", flush=True)
             return a.T
         return a
     try:
         return jax.tree_util.tree_map(_al, jac_approx, jac_exact)
-    except Exception:
-        return jac_approx
+    except Exception as exc:
+        raise GradientStructureMismatch(
+            f"[{site}] the approximated Jacobian pytree cannot be mapped "
+            f"against the exact one: {type(exc).__name__}: "
+            f"{' '.join(str(exc).split())[:600]}") from exc
+
+
+def _gradient_leaves(tree):
+    """The gradient leaves of a ``jacve`` output IN ORDER, with a dead path
+    (``None``, a face SKIP deleted every path to that parameter) kept as a
+    ``None`` leaf so the two sides pair up positionally."""
+    return jax.tree_util.tree_leaves(
+        tree, is_leaf=lambda x: x is None or _is_sparse_tensor(x))
+
+
+def _is_sparse_tensor(x) -> bool:
+    from graphax.sparse.tensor import SparseTensor
+    return isinstance(x, SparseTensor)
+
+
+def _leaf_shape(x):
+    if x is None:
+        return None
+    if _is_sparse_tensor(x):
+        return tuple(int(d.logical_size) for d in x.dims)
+    return tuple(int(v) for v in getattr(x, "shape", ()))
+
+
+def _gradient_similarity(jac_exact, jac_approx, site: str):
+    """``(dot, ||e||^2, ||a||^2, ||e - a||^2, n_exact_elements)`` accumulated
+    PER LEAF over the two gradient pytrees, with EXACT structure equality
+    (ticket dsnn-3qm.62) and no densification of the approximated side.
+
+    Per pair of leaves (e, a), in ``jacve`` output order:
+
+      * ``a is None`` (dead path after a SKIP): the plan's gradient for that
+        parameter IS zero -- dot 0, ||a||^2 0, residual ||e||^2. Not a
+        structure fault: graphax's dense path returns zeros there too.
+      * ``a`` a plain array: its shape must equal ``e``'s.
+      * ``a`` a SparseTensor: its logical shape must equal ``e``'s and it
+        must be in PARAMETER LAYOUT (graphax's output contract: the val axes
+        in dim order). A materialized tensor compares like an array. An
+        IMPLICIT dim (``axis is None``, the storage of a Reduce'd gradient:
+        one representative broadcast along that dim) is compared
+        ANALYTICALLY -- ``<e, bcast(a)> = <sum_over_implicit(e), a>`` and
+        ``||bcast(a)||^2 = N_implicit * ||a||^2`` -- so the approximated side
+        is never materialized (owner Q1: no densify). A uniform tensor
+        (``val is None``) is the same with a 0-d representative.
+      * anything else in a returned gradient (a diagonal pair, a compressed
+        index, a mismatched layout, a mismatched logical shape, a leaf
+        count that differs) RAISES ``GradientStructureMismatch``.
+
+    The exact side must be materialized (an array, or a SparseTensor with
+    every dim materialized) -- it is the exact gradient.
+    """
+    leaves_e = _gradient_leaves(jac_exact)
+    leaves_a = _gradient_leaves(jac_approx)
+    if len(leaves_e) != len(leaves_a):
+        raise GradientStructureMismatch(
+            f"[{site}] {len(leaves_a)} gradient leaves against "
+            f"{len(leaves_e)} exact leaves: approx shapes "
+            f"{[_leaf_shape(x) for x in leaves_a]} vs exact "
+            f"{[_leaf_shape(x) for x in leaves_e]}")
+    dot = ee = aa = rr = None
+    total = 0
+    for i, (e, a) in enumerate(zip(leaves_e, leaves_a)):
+        if e is None:
+            raise GradientStructureMismatch(
+                f"[{site}] exact leaf {i} is a dead path (None); the exact "
+                f"reference must carry every parameter gradient")
+        if _is_sparse_tensor(e):
+            if e.val is None or any(d.axis is None or d.is_sparse for d in e.dims):
+                raise GradientStructureMismatch(
+                    f"[{site}] exact leaf {i} is not materialized: dims "
+                    f"{e.dims}")
+            from graphax.sparse.ops.output_layout import is_parameter_layout
+            if not is_parameter_layout(e):
+                raise GradientStructureMismatch(
+                    f"[{site}] exact leaf {i} is not in parameter layout: "
+                    f"dims {e.dims}, val {e.val.shape}")
+            e_arr = e.val * e.scalar_mult if e.scalar_mult is not None else e.val
+        else:
+            e_arr = e
+        e_shape = tuple(int(v) for v in e_arr.shape)
+        total += int(e_arr.size)
+        _cdt = jnp.promote_types(e_arr.dtype, jnp.float32)
+        ef = jnp.asarray(e_arr).astype(_cdt)
+        _e2 = jnp.sum(jnp.abs(ef) ** 2)
+        if a is None:
+            _d = jnp.zeros((), _cdt)
+            _a2 = jnp.zeros((), _cdt)
+            _r2 = _e2
+        elif _is_sparse_tensor(a):
+            a_shape = _leaf_shape(a)
+            if a_shape != e_shape:
+                raise GradientStructureMismatch(
+                    f"[{site}] leaf {i}: logical shape {a_shape} vs exact "
+                    f"{e_shape}; dims {a.dims}")
+            if any(d.is_sparse or getattr(d, "is_compressed", False) for d in a.dims):
+                raise GradientStructureMismatch(
+                    f"[{site}] leaf {i} carries a diagonal pair or a "
+                    f"compressed index in a returned gradient: dims {a.dims}")
+            from graphax.sparse.ops.output_layout import is_parameter_layout
+            if a.val is not None and not is_parameter_layout(a):
+                raise GradientStructureMismatch(
+                    f"[{site}] leaf {i} is not in parameter layout: dims "
+                    f"{a.dims}, val {a.val.shape} (graphax output contract, "
+                    f"ticket .62)")
+            implicit = tuple(pos for pos, d in enumerate(a.dims) if d.axis is None)
+            _cdt = jnp.promote_types(_cdt, jnp.promote_types(a.dtype, jnp.float32))
+            ef = ef.astype(_cdt)
+            mult = jnp.asarray(a.scalar_mult, dtype=_cdt)
+            if a.val is None:
+                a_rep = mult.reshape(())          # uniform: every cell = scalar_mult
+            else:
+                a_rep = jnp.asarray(a.val).astype(_cdt) * mult
+            n_bcast = 1
+            for pos in implicit:
+                n_bcast *= int(a.dims[pos].logical_size)
+            e_red = jnp.sum(ef, axis=implicit) if implicit else ef
+            if tuple(int(v) for v in a_rep.shape) != tuple(int(v) for v in e_red.shape):
+                raise GradientStructureMismatch(
+                    f"[{site}] leaf {i}: stored shape {a_rep.shape} does not "
+                    f"match the exact leaf reduced over the implicit dims "
+                    f"{implicit}: {e_red.shape}; dims {a.dims}")
+            _d = jnp.sum(e_red * a_rep)
+            _a2 = n_bcast * jnp.sum(jnp.abs(a_rep) ** 2)
+            _r2 = _e2 - 2.0 * _d + _a2
+        else:
+            a_shape = tuple(int(v) for v in getattr(a, "shape", ()))
+            if a_shape != e_shape:
+                raise GradientStructureMismatch(
+                    f"[{site}] leaf {i}: shape {a_shape} vs exact {e_shape}")
+            _cdt = jnp.promote_types(_cdt, jnp.promote_types(a.dtype, jnp.float32))
+            ef = ef.astype(_cdt)
+            af = jnp.asarray(a).astype(_cdt)
+            _d = jnp.sum(ef * af)
+            _a2 = jnp.sum(jnp.abs(af) ** 2)
+            _r2 = jnp.sum(jnp.abs(ef - af) ** 2)
+        dot = _d if dot is None else dot + _d
+        ee = _e2 if ee is None else ee + _e2
+        aa = _a2 if aa is None else aa + _a2
+        rr = _r2 if rr is None else rr + _r2
+    return dot, ee, aa, rr, total
 
 
 # ---------------------------------------------------------------------------
@@ -3039,76 +3179,51 @@ def paired_ref_summary(records) -> dict:
     }
 
 
-def _quality_metrics(jac_exact, jac_approx):
+def _quality_metrics(jac_exact, jac_approx, *, align: bool = False,
+                     site: str = "grad_cosine"):
     """`(cosine_sim, relative_frobenius)` of `jac_approx` against `jac_exact`.
 
-    Returns the WORST score `(0.0, 1.0)` when either side has no leaves,
-    mismatched shapes, or zero size. The old fallback returned (1.0, 0.0) —
-    "perfect" — which as a REWARD is a degeneracy backdoor: a plan that
-    destroys the Jacobian's shape (e.g. a terminal COMPRESS) out-scored every
-    honest approximation on all quality channels. A broken comparison is
-    evidence of a broken plan, so it must score as such.
+    Ticket dsnn-3qm.62: the two gradient pytrees are compared with EXACT
+    structure equality by ``_gradient_similarity`` -- a leaf count, logical
+    shape or layout mismatch RAISES ``GradientStructureMismatch``; a dead
+    path (None) is a zero gradient; an implicit (Reduce'd) dim is compared
+    analytically, never densified. The old silent ``(0.0, 1.0)`` clamp on a
+    shape mismatch is what hid finding 60 (an engine-induced axis
+    permutation read as quality 0.0 on every applied plan of the .41 sweep).
 
-    ``ALPHAGRAD_DEBUG_QUALITY=1`` enables a one-line diagnostic print
-    when cosine_sim collapses to ~0 with non-zero norms — used to
-    investigate the persistent ``reward_mean/cosine_sim=0`` we see
-    on the PPO dynamic-substeps path. The print fires only when the
-    formula would have produced a meaningful value but didn't.
+    ``align=True`` is the ANALYTIC JACOBIAN-COSINE path only (``jac_cosine``,
+    the full-Jacobian benchmarks): ``_align_jac`` transposes a 2-D block
+    back first and raises when the trees cannot be mapped.
+
+    Returns the WORST score `(0.0, 1.0)` only when the exact side has no
+    leaves or zero size (nothing to compare against; a broken reference, not
+    a broken plan).
+
+    ``ALPHAGRAD_DEBUG_QUALITY=1`` enables a one-line diagnostic print.
     """
-    # Layout-align the approx leaves to the exact layout (transpose-back) so
-    # cosine/frob compare the SAME entries, not a transposed-layout artifact.
-    jac_approx = _align_jac(jac_approx, jac_exact)
-    # PER-LEAF accumulation (2026-08-04). The old flatten+concatenate built a
-    # >=4GB flat copy of EACH side, and XLA's concatenate kernel faults with
-    # CUDA_ERROR_ILLEGAL_ADDRESS on >=2^31-byte operands once allocations sit
-    # high enough in the address space (residency-dependent: the identical
-    # concatenate passes in an empty process; reproduced with PLAIN EXACT
-    # leaves and fresh elementwise copies at nn256 batch 512 — the v45b
-    # measure-actor crash). Accumulating <e,a>, ||e||², ||a||², ||e-a||² per
-    # leaf is mathematically identical (same eps semantics as ``cossim``:
-    # each side clamped at sqrt(1e-7)) and never materializes the flats.
-    leaves_e = jax.tree_util.tree_leaves(jac_exact)
-    leaves_a = jax.tree_util.tree_leaves(jac_approx)
-    if not leaves_e or not leaves_a or len(leaves_e) != len(leaves_a):
+    if align:
+        jac_approx = _align_jac(jac_approx, jac_exact, site=site)
+    leaves_e = _gradient_leaves(jac_exact)
+    if not leaves_e or all(x is None for x in leaves_e):
         return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
-    if any(getattr(a, "shape", None) != getattr(e, "shape", None)
-           for a, e in zip(leaves_a, leaves_e)):
-        return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
-    _total = sum(int(getattr(e, "size", 0)) for e in leaves_e)
-    if _total == 0:
-        return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
-
     # Measure GPUs rotate but the exact reference is cached, so the two can
     # land on different devices -> jitted ops raise "Received incompatible
     # devices". Co-locate onto the reference's device (read-only, one transfer
     # only when they differ).
     try:
-        _ed = next(iter(leaves_e[0].devices()))
-        leaves_a = [
-            jax.device_put(a, _ed)
-            if next(iter(a.devices())) is not _ed else a
-            for a in leaves_a
-        ]
+        _ed = next(iter(next(x for x in leaves_e if x is not None
+                             and not _is_sparse_tensor(x)).devices()))
+        jac_approx = jax.tree_util.tree_map(
+            lambda a: (jax.device_put(a, _ed)
+                       if hasattr(a, "devices") and next(iter(a.devices())) is not _ed
+                       else a),
+            jac_approx)
     except Exception:
         pass
 
-    dot = ee = aa = rr = None
-    for e, a in zip(leaves_e, leaves_a):
-        # Promote per pair to at least f32 (bf16-Quant'd leaves square
-        # horribly in bf16); complex leaves promote to their complex type —
-        # the plain product (no conjugate) matches the old ``cossim``.
-        _cdt = jnp.promote_types(jnp.promote_types(e.dtype, a.dtype),
-                                 jnp.float32)
-        ef = jnp.ravel(e).astype(_cdt)
-        af = jnp.ravel(a).astype(_cdt)
-        _d = jnp.sum(ef * af)
-        _e2 = jnp.sum(jnp.abs(ef) ** 2)
-        _a2 = jnp.sum(jnp.abs(af) ** 2)
-        _r2 = jnp.sum(jnp.abs(ef - af) ** 2)
-        dot = _d if dot is None else dot + _d
-        ee = _e2 if ee is None else ee + _e2
-        aa = _a2 if aa is None else aa + _a2
-        rr = _r2 if rr is None else rr + _r2
+    dot, ee, aa, rr, _total = _gradient_similarity(jac_exact, jac_approx, site)
+    if _total == 0:
+        return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
     exact_norm = jnp.sqrt(ee)
     approx_norm = jnp.sqrt(aa)
     cos = dot / (jnp.maximum(exact_norm, jnp.sqrt(1e-7))
@@ -3117,109 +3232,16 @@ def _quality_metrics(jac_exact, jac_approx):
     # making the accumulated dot complex. Use the real part — matches the
     # reward path's existing real cast.
     cos = jnp.real(cos)
-    rel_frob = jnp.sqrt(rr) / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
+    rel_frob = jnp.sqrt(jnp.maximum(rr, 0.0)) / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
 
     if os.environ.get("ALPHAGRAD_DEBUG_QUALITY", "0") == "1":
-        approx_norm = float(approx_norm)
-        e_norm = float(exact_norm)
-        # Now that ``_callback`` only invokes ``_quality_metrics`` on
-        # the terminal step (partial-order zero-Jacobian case is
-        # short-circuited upstream), every line here represents a
-        # real terminal evaluation. ``flush=True`` because Ray actor
-        # stdout is line-buffered.
         print(
             f"[quality-debug] cos={float(cos):+.4f} frob={float(rel_frob):+.4f} "
-            f"||exact||={e_norm:.3g} ||approx||={approx_norm:.3g} "
+            f"||exact||={float(exact_norm):.3g} ||approx||={float(approx_norm):.3g} "
             f"size={_total}",
             flush=True,
         )
     return cos, rel_frob
-
-
-# ---------------------------------------------------------------------------
-# THE QUALITY CHANNEL (reward slot 6).
-#
-# Until 2026-08-07 slot 6 held the cosine similarity between the plan's
-# Jacobian and the exact Jacobian. Measured against the quantity we actually
-# care about — the FINAL DOWNSTREAM TEST ACCURACY of a network trained with
-# the plan's gradient (139 archived plans x 3-5 seeds x 100k MNIST steps):
-#
-#                             Pearson  Spearman  cost/plan  peak mem
-#   Jacobian cosine            0.610    0.858     9.70 s     4.24 GB
-#   gradient cosine at init    0.737    0.857     0.33 s     ~40 MB
-#   loss drop, 200 Adam steps  0.922    0.854     0.22 s     40 MB
-#
-# THE THREE COST NUMBERS ABOVE ARE STALE. They predate 744fc3d, which made the
-# traced target an unconditional SCALAR LOSS: what used to be a per-class
-# Jacobian is now the gradient, so nothing materialises a Jacobian any more and
-# the cosine got ~3000x cheaper. RE-MEASURED 2026-08-28 on one Blackwell GPU,
-# VmappedNeuralNetwork/MNIST, 31 plans spanning cos 0.00 (frozen gradient, the
-# k24/f0 analogue) to 1.00, ground truth = final downstream test accuracy at
-# 20k steps x 3 seeds through downstream_train.py -- the SAME definition the
-# table above used, over a NEWLY GENERATED plan population, because the 139
-# archived plans no longer replay (they were recorded against a graph whose
-# edges were 4-D; apply_compress rejects them now):
-#
-#                                    Pearson  Spearman  s/plan   peak MB
-#   gradient cosine at init, K=1      0.874     0.805    0.003     295
-#   gradient cosine at init, K=4      0.861     0.800    0.012     295
-#   gradient cosine at init, K=8      0.856     0.807    0.024     295
-#   mean cosine over 200 steps        0.815     0.797    1.191     295
-#   last-step cosine, 200 steps       0.761     0.800    1.191     295
-#   cosine of summed gradients        0.685     0.748    1.191     295
-#   clipped relative Frobenius        0.350     0.413    0.003     295
-#   loss drop, 200 Adam steps         0.885     0.765    0.606     295
-#   Jacobian cosine (legacy)          0.397     0.498    0.003     443
-#
-# (peak MB is process peak; ~295 MB of it is the resident model+data baseline,
-# so the Jacobian cosine's MARGINAL cost is the ~148 MB of Jacobian it builds
-# and every gradient-space metric's marginal cost is ~0.)
-#
-# WHAT THIS SETTLED, and it answers the owner's 2026-08-07 question directly:
-#   * the gradient cosine is best AT INIT and K=1 -- averaging over more probe
-#     batches makes it slightly WORSE (0.874 -> 0.856), so K=1 is both the most
-#     predictive and the cheapest, and it keeps the channel at EXACTLY ONE
-#     exact execution per terminal plan;
-#   * NONE of the trajectory formulations pay: aggregated-gradient cosine
-#     0.685, last-step 0.761, mean-over-steps 0.815 -- all below the K=1 init
-#     cosine and ~400x more expensive;
-#   * the legacy JACOBIAN cosine is the worst cosine by a wide margin
-#     (0.397/0.498). Replacing it with the gradient cosine is a 2.2x gain in
-#     Pearson at IDENTICAL wall cost and 33% less peak memory, which is why
-#     "cosine" now resolves to grad_cosine;
-#   * CLIPPED RELATIVE FROBENIUS -- the A2 channel whose correlation had never
-#     been measured -- is WEAK: 0.350 Pearson / 0.413 Spearman, worse than
-#     every cosine variant including the legacy one. It should stay LOGGED and
-#     should NOT be given a trained slot on this evidence.
-#   * loss_drop remained the `auto` default until 2026-09-02: its Pearson
-#     0.885 is within noise of the K=1 gradient cosine's 0.874, but note it is
-#     WORSE on Spearman (0.765 vs 0.805) while costing 200x more. The owner
-#     made the call on 2026-09-02 (ticket dsnn-3qm.39, finding 51: a plan can
-#     score 0.885 on loss_drop while its gradient points elsewhere): `auto` IS
-#     the gradient cosine for every scalar-loss target, and loss_drop is
-#     selectable by name only.
-#
-# Under ALPHAGRAD_QUALITY_METRIC=loss_drop slot 6 holds the LOSS DROP OF A
-# SHORT ADAM WALK DRIVEN BY THE PLAN'S OWN GRADIENT:
-#
-#     L0      = loss(W0, probe)
-#     W_{t+1} = adam(W_t, plan_gradient(W_t, batch))     t = 0 .. T-1
-#     quality = (L0 - loss(W_T, probe)) / |L0|
-#
-# ``plan_gradient`` is the gradient the PLAN BEING EVALUATED produces — its
-# elimination order AND its approximations — while ``loss`` is the TRUE scalar
-# loss. The channel therefore answers "does training with this approximate
-# gradient actually reduce the real loss", which is the question the thesis is
-# asking, rather than "does this approximate Jacobian point the same way".
-#
-# Rejected in the owner's sweep, do not re-litigate: 30 probe batches instead
-# of 5 (+0.00 Pearson), weight noise +/-10..100% (+0.00), cosine at trained
-# weights (-0.11), chained displacement over 20/200/1000 steps (-0.24),
-# product of per-step cosines (-0.39), fraction of decreasing steps
-# (Spearman -0.21).
-_QUALITY_METRIC_ENV = "ALPHAGRAD_QUALITY_METRIC"
-
-_COSINE_RENAME_WARNED: list[int] = []
 
 
 def _warn_cosine_is_now_grad_cosine() -> None:
@@ -3251,6 +3273,89 @@ def _grad_cosine_k() -> int:
     except ValueError:
         return 1
 
+
+
+_GRAD_ORACLE_ENV = "ALPHAGRAD_GRAD_ORACLE"
+_GRAD_ORACLE_DONE: set = set()
+_GRAD_ORACLE_STATS = {"checks": 0, "rel_l2_max": 0.0}
+
+
+class GradientOracleFailure(RuntimeError):
+    """The exact gradient of an elimination order disagrees with ``jax.grad``
+    (oracle A, ticket dsnn-3qm.62). The run aborts: every quality number of
+    that order would be measured against a wrong reference."""
+
+
+def grad_oracle() -> str:
+    """``"reference"`` (default) or ``"off"``: whether the exact gradient of
+    every elimination order is checked ONCE per process against ``jax.grad``
+    before it serves as the quality reference (oracle A, owner Q6/Q21;
+    ``--grad-oracle`` on ppo.py and landscape_map, published as
+    ``ALPHAGRAD_GRAD_ORACLE`` so the measure actors read the same value)."""
+    want = os.environ.get(_GRAD_ORACLE_ENV, "reference").strip().lower()
+    if want not in ("reference", "off"):
+        raise ValueError(
+            f"{_GRAD_ORACLE_ENV}={want!r}: expected 'reference' or 'off'")
+    return want
+
+
+def _grad_oracle_check(config, compiled_exact, base_args, device, order_key,
+                       *, rel_tol: float = 1e-4):
+    """Oracle A: the SAME-ORDER exact gradient (the quality reference of this
+    callback) against ``jax.grad`` of the target on the real probe batch, once
+    per process and order. Densifying the exact output here is the oracle's
+    job, not the reward path's. Raises ``GradientOracleFailure`` when the
+    relative L2 distance exceeds ``rel_tol`` (float32 reduction order sits at
+    1e-7..1e-6; a wrong Jacobian sits at 1e-1..1)."""
+    if grad_oracle() == "off" or compiled_exact is None:
+        return
+    key = (tuple(int(v) for v in order_key), str(device))
+    if key in _GRAD_ORACLE_DONE:
+        return
+    if config.target_fun is None:
+        return
+    data = _probe_batch(config, base_args, role="train", index=0)
+    a = list(base_args)
+    if data is not None:
+        for slot in range(min(2, len(data))):
+            a[slot] = jax.device_put(jnp.asarray(data[slot]), device)
+    out = compiled_exact(*a)
+    jac_e = out[1] if config.has_aux else out
+    leaves = _gradient_leaves(jac_e)
+    ref = jax.grad(config.target_fun, argnums=config.argnums,
+                   has_aux=config.has_aux)(*a)
+    ref = ref[0] if config.has_aux else ref
+    ref_leaves = jax.tree_util.tree_leaves(ref)
+    if len(leaves) != len(ref_leaves):
+        raise GradientOracleFailure(
+            f"[grad-oracle] order {key[0][:6]}...: {len(leaves)} exact "
+            f"gradient leaves against {len(ref_leaves)} from jax.grad")
+    num = den = 0.0
+    for i, (e, r) in enumerate(zip(leaves, ref_leaves)):
+        if e is None:
+            raise GradientOracleFailure(
+                f"[grad-oracle] order {key[0][:6]}...: exact leaf {i} is a "
+                f"dead path")
+        e_arr = e.dense() if _is_sparse_tensor(e) else e
+        e_np = np.asarray(e_arr, dtype=np.float64)
+        r_np = np.asarray(r, dtype=np.float64)
+        if e_np.shape != r_np.shape:
+            raise GradientOracleFailure(
+                f"[grad-oracle] order {key[0][:6]}...: exact leaf {i} has "
+                f"shape {e_np.shape}, jax.grad {r_np.shape}")
+        num += float(np.sum((e_np - r_np) ** 2))
+        den += float(np.sum(r_np ** 2))
+    rel = math.sqrt(num) / max(math.sqrt(den), 1e-30)
+    _GRAD_ORACLE_STATS["checks"] += 1
+    _GRAD_ORACLE_STATS["rel_l2_max"] = max(_GRAD_ORACLE_STATS["rel_l2_max"], rel)
+    print(f"[grad-oracle] order {key[0][:6]}... on {device}: exact gradient "
+          f"vs jax.grad rel_l2={rel:.3e} ({len(leaves)} leaves)", flush=True)
+    if not (rel <= rel_tol):
+        raise GradientOracleFailure(
+            f"[grad-oracle] order {key[0][:6]}... on {device}: the exact "
+            f"gradient differs from jax.grad by rel_l2={rel:.3e} > {rel_tol}; "
+            f"the quality reference of this order is wrong -- abort")
+    _GRAD_ORACLE_DONE.add(key)
 
 
 def quality_metric(config=None) -> str:
@@ -5928,6 +6033,12 @@ def _callback(
     else:
         compiled_exact = None
     _pf("cb.xla_compile")
+    # ORACLE A (ticket .62): the same-order exact gradient against jax.grad,
+    # once per process and order, before it serves as the quality reference.
+    if compiled_exact is not None and _qmetric == "grad_cosine":
+        _grad_oracle_check(config, compiled_exact, list(args),
+                           callback_device, o_list)
+        _pf("cb.grad_oracle")
 
     # XLA cost analysis — flops + bytes accessed. Falls back to 0 when the
     # backend doesn't expose them (CPU sometimes returns an empty dict).
@@ -6152,7 +6263,8 @@ def _callback(
                 # reference is already resident for the cosine.
                 _jac_a = out_approx[1] if config.has_aux else out_approx
                 _jac_e = out_exact[1] if config.has_aux else out_exact
-                _cos, _rf = _quality_metrics(_jac_e, _jac_a)
+                _cos, _rf = _quality_metrics(_jac_e, _jac_a, align=True,
+                                             site="jac_cosine")
                 cosines.append(_cos)
                 if _fid_on:
                     _rel_frobs.append(float(_rf))

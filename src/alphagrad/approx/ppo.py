@@ -4378,6 +4378,14 @@ def make_argparser() -> argparse.ArgumentParser:
              "and pareto/archive_size are recorded — scalars describing a "
              "front whose sequences are then discarded at process exit.")
     p.add_argument(
+        "--grad-oracle", choices=["reference", "off"], default="reference",
+        help="Oracle A (ticket dsnn-3qm.62): check the exact gradient of every "
+             "elimination order ONCE per process against jax.grad on the probe "
+             "batch before it serves as the grad-cosine reference; a "
+             "disagreement (rel L2 > 1e-4) aborts the run. Published as "
+             "ALPHAGRAD_GRAD_ORACLE so the measure actors read the same value. "
+             "off disables the check.")
+    p.add_argument(
         "--fixed-order", choices=list(_FIXED_ORDER_CHOICES), default="markowitz",
         help="The elimination order the vertex head is pinned to (ticket "
              "dsnn-3qm.64; common/order.py is the one implementation, shared "
@@ -6433,6 +6441,12 @@ def main():
              else " (absolute measured numbers, negated; the pre-.9 form)"),
           flush=True)
     os.environ["ALPHAGRAD_MEM_CHANNEL"] = str(args.mem_channel)
+    # ORACLE A (ticket .62), same transport: env.grad_oracle is the one reader.
+    os.environ["ALPHAGRAD_GRAD_ORACLE"] = str(args.grad_oracle)
+    print(f"[alphagrad] gradient oracle (--grad-oracle) = {args.grad_oracle}"
+          + (" (exact gradient vs jax.grad once per process and order; a "
+             "disagreement aborts)" if args.grad_oracle == "reference"
+             else " (no check)"), flush=True)
     print(f"[alphagrad] memory channel (reward slot 5, --mem-channel) = "
           f"{args.mem_channel}"
           + (" (XLA static temp bytes of the timed executable; the runtime "
