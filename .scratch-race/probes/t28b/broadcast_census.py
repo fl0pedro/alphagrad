@@ -45,6 +45,26 @@ else:
         cfg, env.consts, env.args, list(order), list(np.asarray(specs)),
         list(np.asarray(face_specs)), list(np.asarray(face_skips)))
 
+_orig_pcv = mm._prepare_contraction_views
+
+
+def _pcv(lhs_val, rhs_val, pairs, shared, total, split, keep_l=None, keep_r=None):
+    N = len(pairs)
+    out = _orig_pcv(lhs_val, rhs_val, pairs, shared, total, split, keep_l, keep_r)
+    lv, rv = out[0], out[1]
+    # merged shapes: lhs = meta(N) + block(N) + split(N) + leftover
+    for i in range(N):
+        pt = pairs[i].pairing_type
+        for side, names, sizes in (
+            ("L", ("meta", "block", "split"),
+             (int(lv.shape[i]), int(lv.shape[N + i]), int(lv.shape[2 * N + i]))),
+            ("R", ("meta", "split", "sblk"),
+             (int(rv.shape[i]), int(rv.shape[N + i]), int(rv.shape[2 * N + i]))),
+        ):
+            pass
+    return out
+
+
 _orig_as_shape = mm._as_shape
 STATS = collections.Counter()
 GROWTH = []
