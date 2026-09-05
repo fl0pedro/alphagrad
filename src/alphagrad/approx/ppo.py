@@ -145,6 +145,7 @@ from alphagrad.transformer.palimpsa_encoder import (
 from alphagrad.approx.common import delta_fold as _fold
 from alphagrad.approx.common import feature_probe as _fprobe
 from alphagrad.approx.common import var_probe as _vprobe
+from alphagrad.approx.common import gate_telemetry as _gate_telemetry
 
 # Same switch carry_stream reads, so one flag turns the whole fold on or
 # off rather than leaving half the consumers folded and half not.
@@ -3867,6 +3868,9 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--name", type=str, default="approx-ppo")
     p.add_argument("--gpus", type=str, default="0")
     p.add_argument("--seed", type=int, default=250197)
+    # Gate G1-G6 telemetry inputs (ticket .45): --gate-winners-table,
+    # --gate-offline-contrast.
+    _gate_telemetry.add_gate_args(p)
     p.add_argument(
         "--wandb",
         type=str,
@@ -9914,6 +9918,15 @@ def main():
                 _adv_cb, advantages, norm_adv, estim_returns, traj.value,
                 _sig_diag)
 
+        # GATE TELEMETRY (ticket .45): hand the critic's per-head target and
+        # prediction -- the pair the value loss compares -- and the per-env
+        # preference to the host for gate/g2/* and gate/g5/*. A host copy,
+        # read-only: nothing here feeds the advantage, the return or the
+        # update.
+        jax.debug.callback(
+            _gate_telemetry.stash_critic, _value_target(estim_returns),
+            traj.value, traj.preference)
+
         # Stage-by-stage NaN trace through the advantage/return path. The loss
         # localizer proved the NaN is ALREADY in norm_adv / estim_returns when
         # the batch is built, with every finite advantage exactly 0 and returns
@@ -10554,6 +10567,10 @@ def main():
     # the policy heads, not the reward.
     _wandb_config["quality_metric_resolved"] = _QUALITY_METRIC
     _wandb_config["mem_channel"] = str(args.mem_channel)
+    # TOOLCHAIN FINGERPRINT (ticket .45): jax / jaxlib versions, XLA_FLAGS,
+    # the sparse flag, beside the repo SHAs _repo_commits put here.
+    _wandb_config.update(_gate_telemetry.toolchain_fingerprint(
+        sparse=getattr(getattr(env, "config", None), "sparse", None)))
     wandb.init(
         project=getattr(args, "wandb_project", None) or "dsnn-vertex",
         entity=getattr(args, "wandb_entity", None) or None,
@@ -11398,6 +11415,8 @@ def main():
                     print(f"[plan-log] ep{ep}: pool drain failed "
                           f"({_plog_exc!r}) -- pooled plans are MISSING",
                           file=sys.stderr, flush=True)
+                # The gate telemetry below reads the same drained records.
+                host_state["_gate_records"] = list(_plog_recs)
                 _plog_n0 = int(host_state.get("_plan_log_written", 0))
                 for _plog_j, _plog_r in enumerate(_plog_recs):
                     _plog_r["episode"] = int(ep)
@@ -11448,6 +11467,79 @@ def main():
                       file=sys.stderr, flush=True)
             log_dict["plan_log/wall_s"] = float(
                 _prof_time.perf_counter() - _plog_t0)
+
+        # ---- GATE G1-G6 TELEMETRY (ticket .45) ------------------------------
+        # Computed from copies the trainer already holds: the plan records
+        # the drain above delivered, the critic stash train_episode filled,
+        # the face-head entropy in mets, the terminal reward rows. Nothing
+        # here is read by the reward, the advantage or the sampler; a
+        # failure prints and the run goes on (this is logging, not a fault
+        # gate). Field table: docs/GATE_TELEMETRY.md.
+        try:
+            _gate_recs = host_state.pop("_gate_records", [])
+            if "_gate_winners" not in host_state:
+                _gw, _gw_why = _gate_telemetry.load_winners_table(
+                    getattr(args, "gate_winners_table", None))
+                host_state["_gate_winners"] = _gw
+                if _gw is None:
+                    _gate_telemetry.print_reason("G1 absent", _gw_why)
+            if "_gate_legal" not in host_state:
+                # The face head's legality, once per run, from the same
+                # oracle probe the sampler uses (reset state: every face of
+                # every valid vertex). Static under the oracle path; under
+                # --face-slot-frames the live per-slot masks can be
+                # tighter, so the floor logged is the static one.
+                host_state["_gate_legal"] = None
+                host_state["_gate_vprim"] = None
+                try:
+                    host_state["_gate_vprim"] = {
+                        int(_v): env.config.jaxpr.eqns[int(_v) - 1].primitive.name
+                        for _v in env.valid_vertices}
+                except Exception as _gexc:
+                    _gate_telemetry.print_reason(
+                        "G1 primitive map absent", repr(_gexc))
+                if getattr(args, "face_actions", False) and not _NO_ORACLE:
+                    try:
+                        _gm = _oracle_face_masks_host(
+                            np.zeros((0,), np.int32), np.zeros((0,), np.int32), 0)
+                        _gvv = [int(_v) for _v in env.valid_vertices]
+                        _gfp = np.concatenate([_gm[2][_v] for _v in _gvv], 0)
+                        _gfc = np.concatenate([_gm[3][_v] for _v in _gvv], 0)
+                        _gfv = np.concatenate([_gm[4][_v] for _v in _gvv], 0)
+                        _gfq = (np.concatenate([_gm[6][_v] for _v in _gvv], 0)
+                                if len(_gm) > 6 else None)
+                        _goo = np.asarray(op_legality_override, np.float32)
+                        _gon = bool(getattr(args, "approx_profile", None)
+                                    == "skip") or bool(np.any(_goo[:3] > 0.5))
+                        host_state["_gate_legal"] = (
+                            _gate_telemetry.legal_counts_from_masks(
+                                _gfp, _gfc, _gfv, _gfq, _goo,
+                                face_head_on=_gon))
+                    except Exception as _gexc:
+                        _gate_telemetry.print_reason(
+                            "G3 floor absent", repr(_gexc))
+                else:
+                    _gate_telemetry.print_reason(
+                        "G3 floor absent", "no face head in this run")
+            log_dict.update(_gate_telemetry.episode_fields(
+                _gate_recs,
+                head_names=HEAD_NAMES,
+                all_rets=all_rets,
+                reward_names=REWARD_NAMES,
+                critic=_gate_telemetry.pop_critic(),
+                face_entropy_nats=(float(entropy_components[5])
+                                   if entropy_components.shape[0] > 5
+                                   else None),
+                legal=host_state.get("_gate_legal"),
+                winners=host_state.get("_gate_winners"),
+                vertex_primitive=host_state.get("_gate_vprim"),
+                quality_floor=getattr(
+                    args, _gate_telemetry.QUALITY_FLOOR_ATTR, None),
+                offline_contrast=getattr(
+                    args, "gate_offline_contrast", None)))
+        except Exception as _gexc:
+            _gate_telemetry.print_reason(
+                f"ep{ep} telemetry FAILED, fields absent", repr(_gexc))
 
         # ---- SPARSITY (stored bytes vs the exact plan) ---------------------
         # `sparsity/ratio_mean` is the number the owner asked for: how much
