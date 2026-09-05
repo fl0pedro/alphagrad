@@ -1780,8 +1780,14 @@ def cli_tokens(a: dict) -> list[str]:
     toks: list[str] = []
     for flag, val in _merge_cli(a.get("cli", {})):
         toks.append(flag)
-        if val is not None:
-            toks.extend(str(val).split())
+        if val is None:
+            continue
+        val = str(val)
+        if val.startswith("${") and val.endswith("}"):
+            # one shell word once expanded (the :? message is never a value)
+            toks.append(val)
+        else:
+            toks.extend(val.split())   # "--rewards cmp mem acc" is 3 words
     toks.extend(WANDB.split())
     return toks
 
