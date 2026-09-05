@@ -139,11 +139,14 @@ def test_halved_jacobian_separates_fidelity_from_the_cosine():
 
 
 def test_broken_comparison_is_not_silently_perfect():
+    """Ticket .62: a leaf-count or shape mismatch is a measurement fault and
+    RAISES (the actors re-raise it, the run stops); it is never a score. The
+    NaN it used to return still maps to the worst fidelity."""
     e = _leaves([[1.0, 2.0]])
     a = _leaves([[1.0, 2.0]], [3.0])
-    rf, cos = envmod._residual_scores(e, a, has_aux=False)
-    assert not np.isfinite(rf) and not np.isfinite(cos)
-    assert envmod.clipped_rel_frob(rf) == -1.0
+    with pytest.raises(envmod.GradientStructureMismatch):
+        envmod._residual_scores(e, a, has_aux=False)
+    assert envmod.clipped_rel_frob(float("nan")) == -1.0
 
 
 def test_residual_matches_quality_metrics_on_the_same_pair():

@@ -3275,6 +3275,123 @@ def _grad_cosine_k() -> int:
 
 
 
+# ---------------------------------------------------------------------------
+# THE QUALITY CHANNEL (reward slot 6).
+#
+# Until 2026-08-07 slot 6 held the cosine similarity between the plan's
+# Jacobian and the exact Jacobian. Measured against the quantity we actually
+# care about — the FINAL DOWNSTREAM TEST ACCURACY of a network trained with
+# the plan's gradient (139 archived plans x 3-5 seeds x 100k MNIST steps):
+#
+#                             Pearson  Spearman  cost/plan  peak mem
+#   Jacobian cosine            0.610    0.858     9.70 s     4.24 GB
+#   gradient cosine at init    0.737    0.857     0.33 s     ~40 MB
+#   loss drop, 200 Adam steps  0.922    0.854     0.22 s     40 MB
+#
+# THE THREE COST NUMBERS ABOVE ARE STALE. They predate 744fc3d, which made the
+# traced target an unconditional SCALAR LOSS: what used to be a per-class
+# Jacobian is now the gradient, so nothing materialises a Jacobian any more and
+# the cosine got ~3000x cheaper. RE-MEASURED 2026-08-28 on one Blackwell GPU,
+# VmappedNeuralNetwork/MNIST, 31 plans spanning cos 0.00 (frozen gradient, the
+# k24/f0 analogue) to 1.00, ground truth = final downstream test accuracy at
+# 20k steps x 3 seeds through downstream_train.py -- the SAME definition the
+# table above used, over a NEWLY GENERATED plan population, because the 139
+# archived plans no longer replay (they were recorded against a graph whose
+# edges were 4-D; apply_compress rejects them now):
+#
+#                                    Pearson  Spearman  s/plan   peak MB
+#   gradient cosine at init, K=1      0.874     0.805    0.003     295
+#   gradient cosine at init, K=4      0.861     0.800    0.012     295
+#   gradient cosine at init, K=8      0.856     0.807    0.024     295
+#   mean cosine over 200 steps        0.815     0.797    1.191     295
+#   last-step cosine, 200 steps       0.761     0.800    1.191     295
+#   cosine of summed gradients        0.685     0.748    1.191     295
+#   clipped relative Frobenius        0.350     0.413    0.003     295
+#   loss drop, 200 Adam steps         0.885     0.765    0.606     295
+#   Jacobian cosine (legacy)          0.397     0.498    0.003     443
+#
+# (peak MB is process peak; ~295 MB of it is the resident model+data baseline,
+# so the Jacobian cosine's MARGINAL cost is the ~148 MB of Jacobian it builds
+# and every gradient-space metric's marginal cost is ~0.)
+#
+# WHAT THIS SETTLED, and it answers the owner's 2026-08-07 question directly:
+#   * the gradient cosine is best AT INIT and K=1 -- averaging over more probe
+#     batches makes it slightly WORSE (0.874 -> 0.856), so K=1 is both the most
+#     predictive and the cheapest, and it keeps the channel at EXACTLY ONE
+#     exact execution per terminal plan;
+#   * NONE of the trajectory formulations pay: aggregated-gradient cosine
+#     0.685, last-step 0.761, mean-over-steps 0.815 -- all below the K=1 init
+#     cosine and ~400x more expensive;
+#   * the legacy JACOBIAN cosine is the worst cosine by a wide margin
+#     (0.397/0.498). Replacing it with the gradient cosine is a 2.2x gain in
+#     Pearson at IDENTICAL wall cost and 33% less peak memory, which is why
+#     "cosine" now resolves to grad_cosine;
+#   * CLIPPED RELATIVE FROBENIUS -- the A2 channel whose correlation had never
+#     been measured -- is WEAK: 0.350 Pearson / 0.413 Spearman, worse than
+#     every cosine variant including the legacy one. It should stay LOGGED and
+#     should NOT be given a trained slot on this evidence.
+#   * loss_drop remained the `auto` default until 2026-09-02: its Pearson
+#     0.885 is within noise of the K=1 gradient cosine's 0.874, but note it is
+#     WORSE on Spearman (0.765 vs 0.805) while costing 200x more. The owner
+#     made the call on 2026-09-02 (ticket dsnn-3qm.39, finding 51: a plan can
+#     score 0.885 on loss_drop while its gradient points elsewhere): `auto` IS
+#     the gradient cosine for every scalar-loss target, and loss_drop is
+#     selectable by name only.
+#
+# Under ALPHAGRAD_QUALITY_METRIC=loss_drop slot 6 holds the LOSS DROP OF A
+# SHORT ADAM WALK DRIVEN BY THE PLAN'S OWN GRADIENT:
+#
+#     L0      = loss(W0, probe)
+#     W_{t+1} = adam(W_t, plan_gradient(W_t, batch))     t = 0 .. T-1
+#     quality = (L0 - loss(W_T, probe)) / |L0|
+#
+# ``plan_gradient`` is the gradient the PLAN BEING EVALUATED produces — its
+# elimination order AND its approximations — while ``loss`` is the TRUE scalar
+# loss. The channel therefore answers "does training with this approximate
+# gradient actually reduce the real loss", which is the question the thesis is
+# asking, rather than "does this approximate Jacobian point the same way".
+#
+# Rejected in the owner's sweep, do not re-litigate: 30 probe batches instead
+# of 5 (+0.00 Pearson), weight noise +/-10..100% (+0.00), cosine at trained
+# weights (-0.11), chained displacement over 20/200/1000 steps (-0.24),
+# product of per-step cosines (-0.39), fraction of decreasing steps
+# (Spearman -0.21).
+_QUALITY_METRIC_ENV = "ALPHAGRAD_QUALITY_METRIC"
+
+_COSINE_RENAME_WARNED: list[int] = []
+
+
+def _warn_cosine_is_now_grad_cosine() -> None:
+    """One-shot, loud: ``cosine`` no longer means the Jacobian cosine."""
+    if _COSINE_RENAME_WARNED:
+        return
+    _COSINE_RENAME_WARNED.append(1)
+    print(
+        "[measure] NOTE ALPHAGRAD_QUALITY_METRIC=cosine is DEPRECATED and its "
+        "MEANING HAS CHANGED: it now resolves to 'grad_cosine' (the gradient "
+        "cosine at init over ALPHAGRAD_GRAD_COSINE_K probe batches) for any "
+        "scalar-loss target, and to 'jac_cosine' (the legacy Jacobian cosine "
+        "at the calibration samples) only for the analytic AD benchmarks. "
+        "Ask for 'jac_cosine' explicitly to reproduce a pre-2026-08-28 run.",
+        flush=True,
+    )
+
+
+def _grad_cosine_k() -> int:
+    """How many probe batches the gradient cosine averages over.
+
+    K=1 is the default because it is the value that keeps the channel at
+    EXACTLY ONE exact execution per terminal plan -- the same reference count
+    the Jacobian cosine paid -- and because the bake-off found K>1 buys
+    essentially no extra correlation on this target.
+    """
+    try:
+        return max(1, int(os.environ.get("ALPHAGRAD_GRAD_COSINE_K", "1")))
+    except ValueError:
+        return 1
+
+
+
 _GRAD_ORACLE_ENV = "ALPHAGRAD_GRAD_ORACLE"
 _GRAD_ORACLE_DONE: set = set()
 _GRAD_ORACLE_STATS = {"checks": 0, "rel_l2_max": 0.0}
