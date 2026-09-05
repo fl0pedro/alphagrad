@@ -1,5 +1,7 @@
 # How every run in the approximation campaign actually ran (v57 → v66c)
 
+> **Contamination note (2026-09-03).** All twelve runs described here (v57 through v66c) ran with discount 0.99 and GAE-lambda 0.95 inherited from `ppo.py` defaults, so the first eliminations of each episode received about 0.31 % of the terminal reward, and all of them also ran under the -13 % timer bug fixed in alphagrad `1c1e480f`. The trajectories are recorded only; any conclusion drawn from them about the order axis, PopArt, or PPO's ability to learn is superseded by the campaign in the dsnn-3qm map. See `.scratch/trustworthy-approx-search/findings/55-gamma-lambda-rot.md` (dsnn superproject).
+
 *Generated 2026-08-26. Purely **descriptive**: trajectories, transitions and
 landmarks. No causal claims — the "why" is a separate piece of work.*
 

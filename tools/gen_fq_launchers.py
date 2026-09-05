@@ -240,9 +240,10 @@ SHARED_CLI = [
     ("--lambda-mem", "1"),
     ("--lambda-acc", "170"),
     ("--advantage-norm", "none"),
-    # THE CREDIT HORIZON.  ppo.py defaults are 0.99/0.95; at 95 eliminations
-    # (gamma*lambda)^95 = 0.0079, i.e. the terminal reward reaches the first
-    # decision at 0.8 percent strength.  R3 restored the defaults and drifted
+    # THE CREDIT HORIZON.  ppo.py defaulted to 0.99/0.95 until 2026-09-01;
+    # at 95 eliminations (gamma*lambda)^94 = 0.0031, i.e. the terminal reward
+    # reaches the first decision at 0.31 percent strength (finding 55).
+    # R3 restored the old defaults on purpose and drifted
     # to destruction at ep131 while R2 at 1.0/1.0 held.  MANDATORY, and named
     # explicitly because no campaign run v57-v66 ever set them.
     ("--discount", "1.0"),

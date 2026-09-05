@@ -48,6 +48,7 @@ identical and behaves differently.
   decision at 0.8 % strength. R2 (γ=λ=1) held at quality 0.885; R3, differing
   by exactly these two flags, drifted to destruction at ep131. This is the
   campaign's one confirmed causal result.
+  (Pointer, 2026-09-03: the decay figure above is wrong; (0.99×0.95)^94 = 0.0031, so the first decision saw 0.31 %, not 0.8 %. The full record of the defect, the affected launchers and the clean set is `.scratch/trustworthy-approx-search/findings/55-gamma-lambda-rot.md` (dsnn superproject).)
 * **`--walk-rotate` must be named, and it is not only about the walk.**
   `env._walk_seed` is shared, so `--walk-rotate` rotates the **grad-cosine**
   probe batch too. Without it, `grad_cosine` scores every plan of every
@@ -240,6 +241,8 @@ vertex has no live face, and v64b's entropy fell 357× while `mean_valid` fell
 graph-destruction signal, not an entropy collapse. (4) `approx_prob/none` and
 per-plan ratios against the drift floor.
 
+> **Scoped note (2026-09-03).** The v64b figures in the paragraph above come from a run that ran discount 0.99 and GAE-lambda 0.95 by omission (`ppo.py` defaults) and under the -13 % timer bug fixed in alphagrad `1c1e480f`. They motivate the panel layout only; as evidence about learning they are superseded by the campaign in the dsnn-3qm map. See `.scratch/trustworthy-approx-search/findings/55-gamma-lambda-rot.md` (dsnn superproject).
+
 **Registered prediction.** B=6 reproduces R2 (parks at identity, spread <1e-3,
 `none` > 0.99) — a repriced λ does not create contrast by itself. B=5 produces
 contrast (spread > 1e-3 and ≥1 plan/episode outside the drift floor by ep50)
@@ -263,6 +266,8 @@ the very credit horizon R2/R3 proved causal. Under
 pointer head has taken **zero gradient across the entire v57–v66 campaign and
 R1–R3** (`ve` entropy `-0.0e+00`, `max|dH/dlogits| = 0.0e+00`). Lifting the
 pin is the first time that head is trained at all.
+
+> **Scoped note (2026-09-03).** The v57-v66 runs cited here ran discount 0.99 and GAE-lambda 0.95 by omission (`ppo.py` defaults), and v57-v66 also ran under the -13 % timer bug fixed in alphagrad `1c1e480f`. The structural zero gradient under the order pin is unaffected, but those runs are not evidence about the order axis; their conclusions are recorded only and superseded by the campaign in the dsnn-3qm map. See `.scratch/trustworthy-approx-search/findings/55-gamma-lambda-rot.md` (dsnn superproject).
 
 **It is also the only place the memory channel is alive.** Under a pinned
 order the memory ratio is `1.0000 ± 0.0000` for every archived winner and
@@ -341,6 +346,8 @@ with 155 ops/plan and latency 12 % worse than exact. The informative sweep is
 drift and **cannot create contrast** — "the contrast knob is
 `ALPHAGRAD_FACE_NONE_BIAS`. Sweep them together." This is the second half of
 that sweep, run after wave 1 establishes there is drift worth bounding.
+
+> **Scoped note (2026-09-03).** The v66 and v66b numbers cited above come from runs that ran discount 0.99 and GAE-lambda 0.95 by omission (`ppo.py` defaults) and under the -13 % timer bug fixed in alphagrad `1c1e480f`. They are recorded motivation only and are superseded by the campaign in the dsnn-3qm map. See `.scratch/trustworthy-approx-search/findings/55-gamma-lambda-rot.md` (dsnn superproject).
 
 | arm | node | λ_acc | `--kl-ref-weight` |
 |---|---|---|---|
