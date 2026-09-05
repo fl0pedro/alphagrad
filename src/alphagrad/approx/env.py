@@ -2727,6 +2727,10 @@ def _align_jac(jac_approx, jac_exact, site: str = "jac_cosine"):
     being returned unaligned (the blanket ``except`` that swallowed finding
     60's ``tree_map`` error is gone)."""
     def _al(a, e):
+        # A dead path (None) and a SparseTensor pass through: the comparison
+        # scores the first as zero and checks the second's layout itself.
+        if a is None or e is None or _is_sparse_tensor(a) or _is_sparse_tensor(e):
+            return a
         if getattr(a, "shape", None) == getattr(e, "shape", None):
             return a
         if getattr(a, "ndim", 0) == 2 and a.shape == e.shape[::-1]:
@@ -2735,7 +2739,9 @@ def _align_jac(jac_approx, jac_exact, site: str = "jac_cosine"):
             return a.T
         return a
     try:
-        return jax.tree_util.tree_map(_al, jac_approx, jac_exact)
+        return jax.tree_util.tree_map(
+            _al, jac_approx, jac_exact,
+            is_leaf=lambda x: x is None or _is_sparse_tensor(x))
     except Exception as exc:
         raise GradientStructureMismatch(
             f"[{site}] the approximated Jacobian pytree cannot be mapped "
@@ -3429,9 +3435,14 @@ def _grad_oracle_check(config, compiled_exact, base_args, device, order_key,
     key = (tuple(int(v) for v in order_key), str(device))
     if key in _GRAD_ORACLE_DONE:
         return
-    if config.target_fun is None:
+    # jax.grad needs a scalar loss and a real probe batch; the analytic
+    # Jacobian benchmarks have neither, and their grad-cosine is undefined
+    # anyway (the walk falls back to jac_cosine there).
+    if config.target_fun is None or not getattr(config, "scalar_target", False):
         return
     data = _probe_batch(config, base_args, role="train", index=0)
+    if data is None:
+        return
     a = list(base_args)
     if data is not None:
         for slot in range(min(2, len(data))):
