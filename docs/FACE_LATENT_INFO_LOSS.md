@@ -1,5 +1,7 @@
 # Face-latent information loss: why the face probe decodes at baseline while the vertex probe is near-perfect
 
+> **Contamination note (2026-09-03).** The evidence base of this note (v61, job 61610) ran with discount 0.99 and GAE-lambda 0.95 inherited from `ppo.py` defaults and under the -13 % timer bug fixed in alphagrad `1c1e480f`, so the policy it probes was trained on near-zero early-step advantages. Statements here about what the policy learned are recorded only and superseded by the campaign in the dsnn-3qm map; the probe geometry itself is a separate question. See `.scratch/trustworthy-approx-search/findings/55-gamma-lambda-rot.md` (dsnn superproject).
+
 **Evidence base.** v61 (job 61610, `/Users/assmuth/dsnn/v61_tlm_61610.log`, TLM wikitext,
 `--var-probe`, FORCE REV ORDER, face head identity-init P(approx)≈0.007): vertex probe
 ndim 1.00/0.75(base), shape-exact 0.98-1.00, size-R² 0.96-0.99; face probe ndim 0.48/0.47

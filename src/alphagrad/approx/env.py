@@ -26,7 +26,10 @@ from graphax.jaxpr import get_vocab as _graphax_get_vocab
 from graphax.sparse.micro_actions import (
     COMPRESS_KINDS, QUANT_DTYPES, Compress, Diag, Quant,
 )
-from jax_memory_monitor import ResourceMonitor as _RealResourceMonitor
+try:
+    from jax_memory_monitor import ResourceMonitor as _RealResourceMonitor
+except (ImportError, AttributeError):
+    _RealResourceMonitor = None
 
 
 class _NoopResourceMonitor:
@@ -71,7 +74,8 @@ class _NoopResourceMonitor:
 
 ResourceMonitor = (
     _NoopResourceMonitor
-    if os.environ.get("ALPHAGRAD_DISABLE_RESOURCE_MONITOR", "0") == "1"
+    if (os.environ.get("ALPHAGRAD_DISABLE_RESOURCE_MONITOR", "0") == "1"
+        or _RealResourceMonitor is None)
     else _RealResourceMonitor
 )
 
@@ -4605,6 +4609,11 @@ def _measure_compiler_options():
     choice there."""
     if os.environ.get("ALPHAGRAD_MEASURE_COMPILER_OPTS", "1") == "0":
         return None
+    try:
+        if jax.default_backend() == "cpu":
+            return None
+    except Exception:
+        pass
     return {
         "xla_gpu_autotune_level": 0,
         "xla_gpu_enable_triton_gemm": False,

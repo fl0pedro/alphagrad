@@ -136,6 +136,8 @@ Phase **PC** (`summary_c_winners_warm.md`), warm, paired, `--reps 6`,
 `--warmup-trials 3`, `--latency-inner-reps 50`, pd1, gpu0, ag=c2b8104 gx=4ea0bf8
 newslotjoin=0 tool=cb7c7667:
 
+> **Scoped note (2026-09-03).** The `archive:v57/v60/v63/v64b` plans in the table below, and the recorded objectives quoted after it, come from runs that ran discount 0.99 and GAE-lambda 0.95 by omission (`ppo.py` defaults) and under the -13 % timer bug fixed in alphagrad `1c1e480f`. The measurements of those plans are sound; what the runs that produced them learned is not evidence and is superseded by the campaign in the dsnn-3qm map. The R1/R2/R4 material in this document is clean. See `.scratch/trustworthy-approx-search/findings/55-gamma-lambda-rot.md` (dsnn superproject).
+
 | plan | approx faces | rules applied / skipped | latency ratio (mean ± sd, n=6) | mem ratio | quality | latency ns |
 |---|---:|---:|---|---|---|---:|
 | `archive:v63` | 1 | 0 / 0 | **0.5222 ± 0.0122** | 1.0000 ± 0.0000 | 0.8981 | 73 318 |

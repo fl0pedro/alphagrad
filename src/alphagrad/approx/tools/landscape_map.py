@@ -93,6 +93,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import sys
 import time
@@ -148,22 +149,9 @@ def make_argparser() -> argparse.ArgumentParser:
     # request for it is how a run reports a Jacobian as a gradient.
     p.add_argument("--no-measure-grad", dest="measure_grad", nargs=0,
                    action=_NoMeasureGradIsGone)
-    # A4: DEFAULT OFF. `seed_loss_fn` appends a tangent-seed `add` and an
-    # adjoint `reduce_sum` as ORDINARY ELIMINABLE VERTICES (nn256: 13 ->
-    # 15) and enlarges `derived_max_faces`, so a landscape measured with it
-    # on is not the landscape of the training runs -- a different graph,
-    # a different face count, a different action space. Every launcher
-    # dropped it in e3b07e7; this tool could not be touched then because it
-    # was mid-edit, so it kept measuring the old graph. Kept ACCEPTED (not
-    # deleted) for exactly one reason: replaying an ARCHIVED run that was
-    # launched with it needs the same graph back.
-    p.add_argument("--seed-vertices", action="store_true", default=False,
-                   help="DEPRECATED (A4). Only for replaying an archived "
-                        "run that was launched with it; it adds 2 "
-                        "eliminable vertices the campaign graph does not "
-                        "have.")
-    p.add_argument("--no-seed-vertices", dest="seed_vertices",
-                   action="store_false")
+    # Elimination order (default: markowitz per owner ruling)
+    p.add_argument("--order", choices=["markowitz", "reverse"], default="markowitz",
+                   help="Elimination order to evaluate approximations on (default: markowitz).")
     p.add_argument("--exec-on-gpu", action="store_true")
     p.add_argument("--cmp-type", default="latency")
     # The launchers (run_campaign_2node.sh:144, run_campaign_gpu2node.sh)
@@ -275,13 +263,23 @@ def make_argparser() -> argparse.ArgumentParser:
                    help="Build a plan that skips ONLY face F of elimination "
                         "step K (repeatable; all listed faces go in ONE "
                         "plan). This is how the minimal plan is built.")
-    p.add_argument("--singleton-skip-sweep", action="store_true",
-                   help="One plan per live face, each skipping exactly that "
-                        "face and nothing else. Gives the SHAPE of the search "
-                        "space: one needle, or many good faces?")
+    p.add_argument("--singleton-sweep", action="store_true",
+                   help="Exhaustive sweep over all singleton approximations "
+                        "(class x face x slot x legal sub-arguments).")
+    p.add_argument("--singleton-skip-sweep", dest="singleton_sweep",
+                   action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--f-star-threshold", type=float, default=0.8,
+                   help="Quality threshold q* for F* inclusion (default: 0.8).")
+    p.add_argument("--stack-ladder", default="",
+                   help="Comma-separated stack sizes N to draw from F* (e.g. '2,5,10').")
+    p.add_argument("--stack-samples", type=int, default=5,
+                   help="Number of random samples M per stack size N (default: 5).")
+    p.add_argument("--pair-samples", type=int, default=0,
+                   help="Number of random pair samples from F* (0 = disabled).")
+    p.add_argument("--shard", default="",
+                   help="Shard specification 'I/N' (0-indexed, e.g. '0/4') to evaluate a slice of plans.")
     p.add_argument("--sweep-stride", type=int, default=1,
-                   help="Measure every Nth live face in the sweep (1 = all). "
-                        "Any subsampling is reported with the results.")
+                   help=argparse.SUPPRESS)
     p.add_argument("--report-only", action="store_true",
                    help="Measure nothing; read every rows_*.csv in --out-dir "
                         "and emit the COMBINED report across configs.")
@@ -301,13 +299,16 @@ def make_argparser() -> argparse.ArgumentParser:
     return p
 
 
-ARGS = make_argparser().parse_args()
+if __name__ == "__main__":
+    ARGS = make_argparser().parse_args()
+else:
+    ARGS = make_argparser().parse_args([])
 
 # --- IMPORT-TIME env knobs -------------------------------------------------
 # `_MEASURE_ACTOR` is read at import of alphagrad.approx.env. Setting it here
 # is what makes --exec-on-gpu work with ONE visible GPU (the trainer's
 # "GPU 0 is the trainer's, so you need >= 2" branch is for the trainer).
-if ARGS.exec_on_gpu:
+if "--exec-on-gpu" in sys.argv or ARGS.exec_on_gpu:
     os.environ["ALPHAGRAD_MEASURE_ACTOR"] = "1"
 # The campaign's measurement stack. setdefault, so a launcher that already
 # exported these (the sbatch skeleton does) always wins.
@@ -339,6 +340,13 @@ from alphagrad.approx.env import (                            # noqa: E402
     COMPRESS_SENTINEL,
     QUANT_SENTINEL,
     consume_per_face_stats,
+    consume_mem_parity,
+)
+from alphagrad.approx.common.masks import (                   # noqa: E402
+    quant_valid_mask,
+    compress_slot_mask,
+    diag_valid_mask,
+    diag_pair_gcd,
 )
 from alphagrad.approx.common.examples import (
     has_scalar_loss as _has_scalar_loss,                # noqa: E402
@@ -453,6 +461,33 @@ def rev_order(env) -> np.ndarray:
                     dtype=np.int32)
 
 
+def markowitz_order(env) -> np.ndarray:
+    """Greedy minimum Markowitz degree order over valid vertices.
+
+    Eliminates intermediate equations before scalar contractions, preserving
+    non-empty Jacobian out-dimensions for structural approximations.
+    """
+    from graphax.incremental import IncrementalJaxpr
+    cfg = env.config
+    ij = IncrementalJaxpr(cfg.jaxpr, tuple(cfg.argnums), list(env.consts),
+                          list(env.args), track_faces=False)
+    eliminable = set(int(v) for v in env.valid_vertices)
+    order = []
+    while eliminable:
+        scores = {}
+        for v in eliminable:
+            v_var = cfg.jaxpr.eqns[v - 1].outvars[0]
+            preds = [u for u in ij.graph if v_var in ij.graph[u]]
+            succs = list(ij.graph.get(v_var, {}).keys())
+            deg = len(preds) * len(succs)
+            scores[v] = deg
+        best_v = min(scores.keys(), key=lambda v: (scores[v], v))
+        order.append(best_v)
+        eliminable.remove(best_v)
+        ij.eliminate(best_v, (), None)
+    return np.array(order, dtype=np.int32)
+
+
 def empty_plan(n_steps: int):
     """(sparsity_specs, face_specs, face_skips) for the exact plan.
 
@@ -504,7 +539,7 @@ def _slots(spec: str) -> tuple[int, ...]:
     return out
 
 
-def face_inventory(env, order):
+def face_inventory(env, order, capture_tensors: bool = False):
     """Every LIVE face on `order`, named.
 
     A face KEY is graphax's ``(vidx[in_edge], vidx[out_edge])`` under its
@@ -513,6 +548,9 @@ def face_inventory(env, order):
     enumerated on the EXACT prefix: valid for attributing a plan whose
     approximations start at or after that step, which is every plan here
     (the archived winners carry a single wire).
+
+    When ``capture_tensors=True``, captures the live operand tensors at
+    slots lhs (0), rhs (1), and new (2) for exact legality testing.
     """
     from graphax import faces_of
     from graphax.incremental import IncrementalJaxpr
@@ -528,12 +566,231 @@ def face_inventory(env, order):
                 for o in eqn.outvars if hasattr(o, "aval")]
         ins = [[list(i.aval.shape), str(i.aval.dtype)]
                for i in eqn.invars if hasattr(i, "aval")]
+        face_tensors = {}
+        if capture_tensors:
+            def make_rec(fk, site):
+                def hook(t):
+                    face_tensors.setdefault(fk, {})[site] = t
+                    return t
+                return hook
+            face_transforms = {
+                fk: ((make_rec(fk, 0), make_rec(fk, 1), make_rec(fk, 2)),
+                     (None, None, None))
+                for fk in keys
+            }
+            ij.eliminate(v, (), face_transforms=face_transforms)
+        else:
+            ij.eliminate(v, (), None)
         for f, key in enumerate(keys[: envmod.MAX_FACES]):
-            inv.append({"k": int(k), "vertex": v, "f": int(f),
-                        "key": [int(x) for x in key],
-                        "prim": eqn.primitive.name, "out": outs, "in": ins})
-        ij.eliminate(v, (), None)
+            entry = {"k": int(k), "vertex": v, "f": int(f),
+                     "key": [int(x) for x in key],
+                     "prim": eqn.primitive.name, "out": outs, "in": ins}
+            if capture_tensors:
+                entry["tensors"] = face_tensors.get(key, {})
+            inv.append(entry)
     return inv
+
+
+def get_plan_arrays(plan, n_steps: int):
+    """Return (specs, face_specs, face_skips) for plan.
+    If already materialized, returns them directly.
+    Otherwise allocates and populates on demand from plan['wires'].
+    """
+    if plan.get("face_specs") is not None:
+        return plan["specs"], plan["face_specs"], plan["face_skips"]
+    specs, face_specs, face_skips = empty_plan(n_steps)
+    for w in plan.get("wires", []) or []:
+        k = int(w["k"])
+        f = int(w["f"])
+        if w.get("kind") == "SKIP":
+            face_skips[k, f] = 1
+        else:
+            slot = int(w["slot"])
+            face_specs[k, f, slot] = w["row"]
+    return specs, face_specs, face_skips
+
+
+def build_singleton_plan(env, order, k: int, f: int, op: str, slot: int = 0,
+                         row: list[int] | None = None):
+    """Build a plan that applies exactly ONE approximation on face (k, f)."""
+    k, f = int(k), int(f)
+    if op == "skip":
+        wires = [{"k": k, "f": f, "kind": "SKIP"}]
+        n_slot_rows = 0
+    else:
+        wires = [{"k": k, "f": f, "slot": slot, "row": list(row),
+                  "kind": f"{op.upper()}@slot{slot}"}]
+        n_slot_rows = 1
+    return {
+        "specs": None,
+        "face_specs": None,
+        "face_skips": None,
+        "n_faces_approx": 1,
+        "n_slot_rows": n_slot_rows,
+        "total_live_faces": -1,
+        "per_vertex_faces": [],
+        "wires": wires,
+    }
+
+
+def build_singleton_sweep_plans(env, order, inv):
+    """Exhaustive singletons over all live faces on order:
+    - SKIP: 1 per face
+    - QUANT: bf16 per legal slot
+    - REDUCE: mean per legal axis per slot
+    - DIAG: explicit gcd per legal out-primal axis pair per slot (never -1)
+    """
+    plans = {}
+    plan_orders = {}
+
+    bf16_idx = QUANT_DTYPES.index("bfloat16")
+    mean_idx = COMPRESS_KINDS.index("mean")
+    slot_names = ["lhs", "rhs", "new"]
+
+    for entry in inv:
+        k = int(entry["k"])
+        f = int(entry["f"])
+        v = int(entry["vertex"])
+        prim = entry["prim"]
+        key = entry["key"]
+        tensors = entry.get("tensors", {})
+        # Face id format per owner ruling: (vertex, predecessor, successor) with primitive name
+        face_tag = f"v{v}({key[0]}->{key[1]})/{prim}"
+        face_short = f"v{v}/{prim}"
+
+        # 1. SKIP (1 per face)
+        pid_skip = f"singleton:skip:k{k}.f{f}:{face_short}"
+        pl_skip = build_singleton_plan(env, order, k, f, op="skip")
+        pl_skip["op"] = "skip"
+        pl_skip["budget"] = face_tag
+        plans[pid_skip] = pl_skip
+        plan_orders[pid_skip] = order
+
+        # For slots lhs(0), rhs(1), new(2):
+        for s in range(3):
+            st = tensors.get(s)
+            if st is None:
+                continue
+            sname = slot_names[s]
+
+            # 2. QUANT (bf16 only)
+            if quant_valid_mask(st, ("bfloat16",))[0]:
+                pid_q = f"singleton:quant:k{k}.f{f}:{sname}:bf16"
+                row_q = [QUANT_SENTINEL, bf16_idx, 0]
+                pl_q = build_singleton_plan(env, order, k, f, op="quant",
+                                            slot=s, row=row_q)
+                pl_q["op"] = "quant"
+                pl_q["budget"] = f"{face_tag}:{sname}"
+                plans[pid_q] = pl_q
+                plan_orders[pid_q] = order
+
+            # 3. REDUCE (mean first, every legal axis)
+            c_mask = compress_slot_mask(st, 8)
+            for a in range(8):
+                if c_mask[a]:
+                    pid_r = f"singleton:reduce:k{k}.f{f}:{sname}:ax{a}"
+                    row_r = [COMPRESS_SENTINEL, a, mean_idx]
+                    pl_r = build_singleton_plan(env, order, k, f, op="compress",
+                                                slot=s, row=row_r)
+                    pl_r["op"] = "compress"
+                    pl_r["budget"] = f"{face_tag}:{sname}:ax{a}"
+                    plans[pid_r] = pl_r
+                    plan_orders[pid_r] = order
+
+            # 4. DIAG (explicit gcd > 1 per legal axis pair, never -1)
+            d_mask = diag_valid_mask(st, 8)
+            n_out = len(getattr(st, "out_dims", ()))
+            dims = tuple(getattr(st, "out_dims", ())) + tuple(getattr(st, "primal_dims", ()))
+            for i in range(min(n_out, 8)):
+                for j in range(n_out, min(len(dims), 8)):
+                    if d_mask[i, j]:
+                        g = diag_pair_gcd(st, i, j)
+                        if g > 1:
+                            primal_j = j - n_out
+                            pid_d = f"singleton:diag:k{k}.f{f}:{sname}:p{i}.{primal_j}.fac{g}"
+                            row_d = [i, primal_j, g]
+                            pl_d = build_singleton_plan(env, order, k, f, op="diag",
+                                                        slot=s, row=row_d)
+                            pl_d["op"] = "diag"
+                            pl_d["budget"] = f"{face_tag}:{sname}:p{i}.{primal_j}"
+                            plans[pid_d] = pl_d
+                            plan_orders[pid_d] = order
+
+    return plans, plan_orders
+
+
+def compose_stack_plan(env, order, singletons_list, pid: str, op: str, budget: str):
+    """Compose multiple compatible singletons into one plan."""
+    wires = []
+    used_faces = set()
+    used_slots = set()
+    for s_plan in singletons_list:
+        for w in s_plan.get("wires", []):
+            k, f = w["k"], w["f"]
+            if w.get("kind") == "SKIP":
+                if (k, f) in used_faces:
+                    continue
+                used_faces.add((k, f))
+                wires.append(w)
+            else:
+                slot = w["slot"]
+                if (k, f, slot) in used_slots:
+                    continue
+                used_slots.add((k, f, slot))
+                wires.append(w)
+    return {
+        "specs": None,
+        "face_specs": None,
+        "face_skips": None,
+        "n_faces_approx": len({(w["k"], w["f"]) for w in wires}),
+        "n_slot_rows": sum(1 for w in wires if w.get("kind") != "SKIP"),
+        "total_live_faces": -1,
+        "per_vertex_faces": [],
+        "wires": wires,
+        "op": op,
+        "budget": budget,
+    }
+
+
+def build_f_star_stacks(env, order, f_star_items, stack_ladder, stack_samples, pair_samples, seed=250197):
+    """Generate pairs and random stacks @N from F* members only."""
+    import random
+    rng = random.Random(seed)
+    plans = {}
+    plan_orders = {}
+
+    if not f_star_items:
+        return plans, plan_orders
+
+    # 1. Pairs from F*
+    if pair_samples > 0 and len(f_star_items) >= 2:
+        n_pairs = min(pair_samples, len(f_star_items) * (len(f_star_items) - 1) // 2)
+        pairs_seen = set()
+        for idx in range(n_pairs):
+            s1, s2 = rng.sample(f_star_items, 2)
+            pair_key = tuple(sorted([s1[0], s2[0]]))
+            if pair_key in pairs_seen:
+                continue
+            pairs_seen.add(pair_key)
+            pid = f"pair:fstar:{idx}"
+            pl = compose_stack_plan(env, order, [s1[1], s2[1]], pid, "pair", "2")
+            plans[pid] = pl
+            plan_orders[pid] = order
+
+    # 2. Stacks @N from F*
+    if stack_ladder:
+        rungs = [int(x) for x in str(stack_ladder).split(",") if x.strip()]
+        for N in rungs:
+            if N > len(f_star_items):
+                continue
+            for m in range(stack_samples):
+                chosen = rng.sample(f_star_items, N)
+                pid = f"stack:fstar:@{N}_s{m}"
+                pl = compose_stack_plan(env, order, [c[1] for c in chosen], pid, "stack", str(N))
+                plans[pid] = pl
+                plan_orders[pid] = order
+
+    return plans, plan_orders
 
 
 def build_skip_only_plan(env, order, targets, inventory=None):
@@ -838,19 +1095,32 @@ def measure(env, eval_samples, order, plan):
     """ONE independent measurement of one plan through the trainer's own
     reward harness. Returns a dict of the channels plus wall time."""
     consume_per_face_stats()          # drop whatever the plan-build replay left
+    consume_mem_parity()
+    specs, face_specs, face_skips = get_plan_arrays(plan, len(order))
     t0 = time.perf_counter()
     _, _, reward = envmod._callback(
         env.config, env.args, env.consts,
         jnp.asarray(order),
-        jnp.asarray(plan["specs"]),
-        jnp.asarray(plan["face_specs"]),
-        jnp.asarray(plan["face_skips"]),
+        jnp.asarray(specs),
+        jnp.asarray(face_specs),
+        jnp.asarray(face_skips),
         int(len(order)),
         *eval_samples,
     )
     wall = time.perf_counter() - t0
     r = np.asarray(reward, dtype=np.float64)
     st = consume_per_face_stats()
+    m_parity = consume_mem_parity()
+
+    static_temp = 0.0
+    runtime_watermark = float(-r[REWARD_INDEX["peak_memory"]])
+    if m_parity:
+        last_rec = m_parity[-1]
+        if last_rec.get("static_temp_bytes") is not None:
+            static_temp = float(last_rec["static_temp_bytes"])
+        if last_rec.get("runtime_peak_bytes") is not None:
+            runtime_watermark = float(last_rec["runtime_peak_bytes"])
+
     # PER-KIND, not just the totals. Agent B measured DIAG landing on ~1% of
     # the rules it was asked for on TLM, which makes a diag rung identity in
     # disguise -- invisible in an aggregate `applied` count that a
@@ -859,7 +1129,8 @@ def measure(env, eval_samples, order, plan):
               if k.startswith(("applied_", "skipped_"))}
     return {
         "latency_ns": float(-r[REWARD_INDEX["latency_ns"]]),
-        "peak_memory": float(-r[REWARD_INDEX["peak_memory"]]),
+        "peak_memory": runtime_watermark,
+        "static_temp": static_temp,
         "quality": float(r[REWARD_INDEX["quality"]]),
         "frob_residual": float(r[REWARD_INDEX["frob_residual"]]),
         "wall_s": wall,
@@ -883,7 +1154,7 @@ def measure(env, eval_samples, order, plan):
 CSV_FIELDS = [
     "plan_id", "op", "budget", "trial", "role",
     "n_faces_approx", "n_slot_rows", "total_live_faces",
-    "latency_ns", "peak_memory", "quality", "frob_residual",
+    "latency_ns", "peak_memory", "static_temp", "quality", "frob_residual",
     "applied", "skipped", "applied_detail", "wall_s", "timestamp",
     "pulldown", "inner_reps", "warmup_src", "config_note", "gpu",
     # WHICH QUANTITY the `quality` column holds. Added 2026-08-30 with the
@@ -978,7 +1249,8 @@ def summarise(rows):
         by.setdefault(pid, {}).setdefault(int(r["trial"]), {})[r["role"]] = r
     out = {}
     for pid, trials in by.items():
-        lat, mem, qual, lat_ratio, mem_ratio, q_delta = [], [], [], [], [], []
+        lat, mem, stemp, qual = [], [], [], []
+        lat_ratio, mem_ratio, stemp_ratio, q_delta = [], [], [], []
         meta = None
         for _t, roles in sorted(trials.items()):
             cand = roles.get("candidate")
@@ -988,13 +1260,18 @@ def summarise(rows):
             meta = meta or cand
             lat.append(float(cand["latency_ns"]))
             mem.append(float(cand["peak_memory"]))
+            stemp.append(float(cand.get("static_temp", 0.0) or 0.0))
             qual.append(float(cand["quality"]))
             if ref is not None:
-                rl, rm = float(ref["latency_ns"]), float(ref["peak_memory"])
+                rl = float(ref["latency_ns"])
+                rm = float(ref["peak_memory"])
+                rst = float(ref.get("static_temp", 0.0) or 0.0)
                 if rl > 0:
                     lat_ratio.append(float(cand["latency_ns"]) / rl)
                 if rm > 0:
                     mem_ratio.append(float(cand["peak_memory"]) / rm)
+                if rst > 0:
+                    stemp_ratio.append(float(cand.get("static_temp", 0.0) or 0.0) / rst)
                 q_delta.append(float(cand["quality"]) - float(ref["quality"]))
         if meta is None:
             continue
@@ -1015,8 +1292,10 @@ def summarise(rows):
             "total_live_faces": int(meta["total_live_faces"]),
             "applied": float(rules.get(pid, (0, 0))[0]),
             "skipped": float(rules.get(pid, (0, 0))[1]),
-            "latency_ns": _s(lat), "peak_memory": _s(mem), "quality": _s(qual),
+            "latency_ns": _s(lat), "peak_memory": _s(mem),
+            "static_temp": _s(stemp), "quality": _s(qual),
             "latency_ratio": _s(lat_ratio), "mem_ratio": _s(mem_ratio),
+            "static_temp_ratio": _s(stemp_ratio),
             "quality_delta": _s(q_delta),
         }
     return out
@@ -1024,19 +1303,18 @@ def summarise(rows):
 
 def write_markdown(path, summ, notes, args, extra):
     L = []
-    L.append("# Approximation landscape on the fixed reverse order\n")
+    L.append(f"# Approximation landscape on the {getattr(args, 'order', 'markowitz')} order\n")
     L.append(f"- target: `{args.example}` / `{args.dataset}` "
              f"(hidden {args.hidden_dim}, layers {args.num_layers}, "
              f"vocab {args.vocab_size})")
     L.append(f"- measurement: the trainer's own `env._callback` "
              f"(scalar-loss target, "
-             f"seed_vertices={args.seed_vertices}, "
              f"quality={args.quality_metric}, walk {args.walk_steps} steps)")
     L.append(f"- {args.reps} INDEPENDENT paired trials per plan; every "
              f"candidate measured back-to-back with its own exact reference "
              f"and reported as a RATIO")
     L.append("")
-    L.append("## Ratios (candidate / its own paired exact-rev reference)\n")
+    L.append("## Ratios (candidate / its own paired exact reference)\n")
     L.append("")
     L.append("`rules applied / skipped` is how many face rules graphax "
              "actually landed vs silently dropped as not fitting their "
@@ -1044,9 +1322,9 @@ def write_markdown(path, summ, notes, args, extra):
              "with skipped > 0 did NOT get the approximation it asked for.")
     L.append("")
     L.append("| plan | approx faces | rules applied / skipped | "
-             "latency ratio (mean +/- sd) | mem ratio | "
+             "latency ratio (mean +/- sd) | temp ratio | watermark ratio | "
              "quality (mean +/- sd) | latency ns (mean) |")
-    L.append("|---|---:|---:|---|---|---|---:|")
+    L.append("|---|---:|---:|---|---|---|---|---:|")
 
     def _fmt(s):
         if s["n"] == 0:
@@ -1059,9 +1337,65 @@ def write_markdown(path, summ, notes, args, extra):
         s = summ[pid]
         L.append(f"| `{pid}` | {s['n_faces_approx']} | "
                  f"{s['applied']:.0f} / {s['skipped']:.0f} | "
-                 f"{_fmt(s['latency_ratio'])} | {_fmt(s['mem_ratio'])} | "
+                 f"{_fmt(s['latency_ratio'])} | {_fmt(s.get('static_temp_ratio', {'n': 0}))} | "
+                 f"{_fmt(s['mem_ratio'])} | "
                  f"{_fmt(s['quality'])} | {s['latency_ns']['mean']:.0f} |")
     L.append("")
+
+    # --- F* Table -----------------------------------------------------------
+    q_thresh = getattr(args, "f_star_threshold", 0.8)
+    f_star = [
+        (pid, s) for pid, s in summ.items()
+        if pid != "identity" and s["quality"]["n"] and s["quality"]["mean"] >= q_thresh
+    ]
+    f_star.sort(key=lambda item: -item[1]["quality"]["mean"])
+    L.append(f"## F* Candidate Table (quality >= {q_thresh:.2f})\n")
+    L.append(f"Found {len(f_star)} candidates meeting quality threshold {q_thresh:.2f}:\n")
+    L.append("| plan | op | budget | quality | latency ratio | temp ratio | watermark ratio |")
+    L.append("|---|---|---|---:|---:|---:|---:|")
+    for pid, s in f_star:
+        tr = s.get("static_temp_ratio", {}).get("mean", float("nan"))
+        mr = s.get("mem_ratio", {}).get("mean", float("nan"))
+        lr = s.get("latency_ratio", {}).get("mean", float("nan"))
+        L.append(f"| `{pid}` | {s['op']} | {s['budget']} | {s['quality']['mean']:.4f} | "
+                 f"{lr:.4f} | {tr:.4f} | {mr:.4f} |")
+    L.append("")
+
+    # --- Per-Class Memory Response ------------------------------------------
+    L.append("## Per-Class Memory Response\n")
+    L.append("| class | count | static temp ratio (mean) | watermark ratio (mean) | quality (mean) |")
+    L.append("|---|---:|---:|---:|---:|")
+    for op_name in ("skip", "quant", "compress", "diag"):
+        op_plans = [s for pid, s in summ.items() if s["op"] == op_name and pid != "identity"]
+        if not op_plans:
+            continue
+        trs = [s.get("static_temp_ratio", {}).get("mean", float("nan")) for s in op_plans]
+        mrs = [s.get("mem_ratio", {}).get("mean", float("nan")) for s in op_plans]
+        qs = [s["quality"]["mean"] for s in op_plans if np.isfinite(s["quality"]["mean"])]
+        trs_valid = [x for x in trs if np.isfinite(x)]
+        mrs_valid = [x for x in mrs if np.isfinite(x)]
+        mean_tr = np.mean(trs_valid) if trs_valid else float("nan")
+        mean_mr = np.mean(mrs_valid) if mrs_valid else float("nan")
+        mean_q = np.mean(qs) if qs else float("nan")
+        L.append(f"| `{op_name}` | {len(op_plans)} | {mean_tr:.4f} | {mean_mr:.4f} | {mean_q:.4f} |")
+    L.append("")
+
+    # --- Top Singletons by Paired Latency Ratio ----------------------------
+    singletons = [
+        (pid, s) for pid, s in summ.items()
+        if (s["op"] in ("skip", "quant", "compress", "diag") or pid.startswith("singleton:"))
+        and s["latency_ratio"]["n"]
+    ]
+    singletons.sort(key=lambda item: item[1]["latency_ratio"]["mean"])
+    L.append("## Top Singletons by Paired Latency Ratio\n")
+    L.append("| plan | op | quality | latency ratio (mean) | temp ratio |")
+    L.append("|---|---|---:|---:|---:|")
+    for pid, s in singletons[:20]:
+        tr = s.get("static_temp_ratio", {}).get("mean", float("nan"))
+        L.append(f"| `{pid}` | {s['op']} | {s['quality']['mean']:.4f} | "
+                 f"{s['latency_ratio']['mean']:.4f} | {tr:.4f} |")
+    L.append("")
+
     if ident is not None and ident["latency_ratio"]["n"]:
         d = ident["latency_ratio"]
         L.append(f"**Drift floor.** The identity plan measured against ITSELF "
@@ -1146,7 +1480,8 @@ def write_figure(path, summ, archive_ids):
         return
     fig, ax = plt.subplots(figsize=(8.0, 5.5))
     colors = {"identity": "#111111", "quant": "#1f77b4", "diag": "#d62728",
-              "compress": "#2ca02c", "skip": "#7f7f7f", "archive": "#ff7f0e"}
+              "compress": "#2ca02c", "skip": "#7f7f7f", "archive": "#ff7f0e",
+              "pair": "#9467bd", "stack": "#8c564b"}
     for pid, s in summ.items():
         x, y = s["latency_ns"]["mean"], s["quality"]["mean"]
         if not np.isfinite(x) or not np.isfinite(y):
@@ -1163,11 +1498,12 @@ def write_figure(path, summ, archive_ids):
                    color=colors.get(op, "#888888"), zorder=3,
                    label=op if op not in ax.get_legend_handles_labels()[1]
                    else None)
-        ax.annotate(pid, (x, y), textcoords="offset points", xytext=(6, 4),
-                    fontsize=7)
+        if len(summ) <= 30 or op in ("identity", "archive", "pair", "stack"):
+            ax.annotate(pid, (x, y), textcoords="offset points", xytext=(6, 4),
+                        fontsize=7)
     ax.set_xlabel("measured latency (ns), mean of independent trials")
-    ax.set_ylabel("quality (200-step Adam loss drop)")
-    ax.set_title("Approximation landscape on the fixed reverse order")
+    ax.set_ylabel("quality (grad_cosine)")
+    ax.set_title("Approximation landscape")
     ax.grid(alpha=0.25)
     ax.legend(fontsize=8, loc="best")
     fig.tight_layout()
@@ -1306,6 +1642,8 @@ def main():
     args = ARGS
     os.makedirs(args.out_dir, exist_ok=True)
     tag = f"_{args.tag}" if args.tag else ""
+    if args.shard:
+        tag += f"_s{args.shard.split('/')[0]}"
     csv_path = os.path.join(args.out_dir, f"rows{tag}.csv")
     md_path = os.path.join(args.out_dir, f"summary{tag}.md")
     fig_path = os.path.join(args.out_dir, f"landscape{tag}.png")
@@ -1316,17 +1654,25 @@ def main():
         return
 
     env, eval_samples, _cj = build_env(args)
-    order = rev_order(env)
-    print(f"[landscape] {len(order)} valid vertices; rev order "
+    if args.order == "markowitz":
+        order = markowitz_order(env)
+    else:
+        order = rev_order(env)
+    print(f"[landscape] {len(order)} valid vertices; {args.order} order "
           f"{order[:6].tolist()}...{order[-3:].tolist()}", flush=True)
 
     INV = None
-    if args.face_inventory or args.inventory_only or args.singleton_skip_sweep \
+    if args.face_inventory or args.inventory_only or args.singleton_sweep \
             or args.skip_face:
-        INV = face_inventory(env, order)
+        capture = bool(args.singleton_sweep)
+        INV = face_inventory(env, order, capture_tensors=capture)
         ipath = os.path.join(args.out_dir, f"face_inventory{tag}.json")
+        inv_clean = [
+            {k: v for k, v in entry.items() if k != "tensors"}
+            for entry in INV
+        ]
         with open(ipath, "w") as fh:
-            json.dump(INV, fh, indent=2)
+            json.dump(inv_clean, fh, indent=2)
         print(f"[landscape] face inventory: {len(INV)} live faces -> {ipath}",
               flush=True)
         if args.inventory_only:
@@ -1347,26 +1693,27 @@ def main():
     plans["identity"] = ident
     plan_orders["identity"] = order
     total_live = ident["total_live_faces"]
-    print(f"[landscape] total LIVE faces on the rev order: {total_live} "
+    print(f"[landscape] total LIVE faces on the {args.order} order: {total_live} "
           f"(per-vertex max {max(ident['per_vertex_faces'] or [0])})",
           flush=True)
 
-    for op in ops:
-        for b in rungs:
-            if b != "all" and int(b) > total_live:
-                print(f"[landscape] skip {op}@{b}: only {total_live} live "
-                      f"faces exist", flush=True)
-                continue
-            pid = f"{op}@{b}"
-            pl = build_ladder_plan(env, order, op, b, args)
-            pl["op"], pl["budget"] = op, str(b)
-            plans[pid] = pl
-            plan_orders[pid] = order
-    if args.skip_plan:
-        pl = build_ladder_plan(env, order, "skip", "all", args)
-        pl["op"], pl["budget"] = "skip", "all"
-        plans["skip@all"] = pl
-        plan_orders["skip@all"] = order
+    if not args.singleton_sweep:
+        for op in ops:
+            for b in rungs:
+                if b != "all" and int(b) > total_live:
+                    print(f"[landscape] skip {op}@{b}: only {total_live} live "
+                          f"faces exist", flush=True)
+                    continue
+                pid = f"{op}@{b}"
+                pl = build_ladder_plan(env, order, op, b, args)
+                pl["op"], pl["budget"] = op, str(b)
+                plans[pid] = pl
+                plan_orders[pid] = order
+        if args.skip_plan:
+            pl = build_ladder_plan(env, order, "skip", "all", args)
+            pl["op"], pl["budget"] = "skip", "all"
+            plans["skip@all"] = pl
+            plan_orders["skip@all"] = order
 
     # --- the MINIMAL plan: skip exactly the named face(s), nothing else -----
     if args.skip_face:
@@ -1381,21 +1728,18 @@ def main():
         plan_orders[pid] = order
         print(f"[landscape] minimal plan {pid}: skips {tg}", flush=True)
 
-    # --- SINGLETON SWEEP: every live face, alone ---------------------------
-    if args.singleton_skip_sweep:
-        stride = max(1, int(args.sweep_stride))
-        picked = INV[::stride]
-        print(f"[landscape] singleton sweep: {len(picked)} of {len(INV)} live "
-              f"faces (stride {stride})", flush=True)
-        for e in picked:
-            k, f = int(e["k"]), int(e["f"])
-            pid = f"skiponly:{k}.{f}"
-            if pid in plans:
-                continue
-            pl = build_skip_only_plan(env, order, [(k, f)], INV)
-            pl["op"], pl["budget"] = "singleton", f"v{e['vertex']}/{e['prim']}"
-            plans[pid] = pl
-            plan_orders[pid] = order
+    # --- SINGLETON SWEEP: exhaustive singletons -----------------------------
+    if args.singleton_sweep:
+        stride = max(1, int(getattr(args, "sweep_stride", 1)))
+        picked_inv = INV[::stride] if stride > 1 else INV
+        if stride > 1:
+            print(f"[landscape] singleton sweep: subsampling {len(picked_inv)} of {len(INV)} faces (stride {stride})",
+                  flush=True)
+        s_plans, s_orders = build_singleton_sweep_plans(env, order, picked_inv)
+        print(f"[landscape] singleton sweep: {len(s_plans)} singleton plans generated across live faces",
+              flush=True)
+        plans.update(s_plans)
+        plan_orders.update(s_orders)
 
     # --- archived winners ---------------------------------------------------
     notes: list[str] = []
@@ -1496,18 +1840,10 @@ def main():
                 + (f" -- **NOT RECOVERED**: {c['reason']}"
                    if c["reason"] else ""))
 
-    with open(plans_path, "w") as fh:
-        _bykf = {(e["k"], e["f"]): e for e in (INV or [])}
+    def _dump_manifest(plans_dict, path, inv):
+        _bykf = {(e["k"], e["f"]): e for e in (inv or [])}
 
         def _named(p):
-            """Attach the NAMED face (vertex, key, primitive, shapes) to each
-            wire, so a ratio can be attributed to a face instead of an index.
-
-            A plan that never recorded wires (the ladder plans place their
-            rule by walking the graph and keep no per-wire list) gets None,
-            NOT []: "not recorded" and "this plan touches no face" are
-            different claims and [] asserts the second one.
-            """
             if "wires" not in p:
                 return None
             out = []
@@ -1520,13 +1856,30 @@ def main():
                                      "inventory (enumerated on exact prefix)"})})
             return out
 
-        json.dump({pid: {"op": p["op"], "budget": p["budget"],
-                         "n_faces_approx": p["n_faces_approx"],
-                         "n_slot_rows": p["n_slot_rows"],
-                         "total_live_faces": p["total_live_faces"],
-                         "per_vertex_faces": p["per_vertex_faces"],
-                         "wires": _named(p)}
-                   for pid, p in plans.items()}, fh, indent=2)
+        with open(path, "w") as fh:
+            json.dump({pid: {"op": p["op"], "budget": p["budget"],
+                             "n_faces_approx": p["n_faces_approx"],
+                             "n_slot_rows": p["n_slot_rows"],
+                             "total_live_faces": p["total_live_faces"],
+                             "per_vertex_faces": p["per_vertex_faces"],
+                             "wires": _named(p)}
+                       for pid, p in plans_dict.items()}, fh, indent=2)
+
+    if args.shard:
+        parts = [int(x) for x in args.shard.split("/")]
+        shard_idx, num_shards = parts[0], parts[1]
+        ident = plans.get("identity")
+        non_ident = [(pid, plans[pid]) for pid in plans if pid != "identity"]
+        chunk_size = math.ceil(len(non_ident) / num_shards)
+        shard_items = non_ident[shard_idx * chunk_size : (shard_idx + 1) * chunk_size]
+        new_plans = {}
+        if ident is not None:
+            new_plans["identity"] = ident
+        new_plans.update(shard_items)
+        plans = new_plans
+        plan_orders = {pid: plan_orders[pid] for pid in plans}
+
+    _dump_manifest(plans, plans_path, INV)
     print(f"[landscape] {len(plans)} plans; manifest -> {plans_path}",
           flush=True)
     for pid, p in plans.items():
@@ -1549,85 +1902,114 @@ def main():
 
     ident_plan = plans["identity"]
 
-    # WARMUP. The smoke run made this non-optional: the FIRST execution of a
-    # plan read 5-10x its settled latency (cold XLA executable, cold
-    # allocator), which is exactly the trial-0 column of every plan. Pay it
-    # once, per plan, under a role the aggregates ignore.
-    for w in range(args.warmup_trials):
-        for pid, plan in plans.items():
-            key = (pid, -1 - w, "warmup")
-            if key in done or not _budget_left():
-                continue
-            try:
-                m = measure(env, eval_samples, plan_orders[pid], plan)
-            except Exception:
-                traceback.print_exc()
-                print(f"[landscape] WARMUP FAILED {pid}", flush=True)
-                continue
-            row = {
-                "plan_id": pid, "op": plan["op"], "budget": plan["budget"],
-                "trial": -1 - w, "role": "warmup",
-                "n_faces_approx": plan["n_faces_approx"],
-                "n_slot_rows": plan["n_slot_rows"],
-                "total_live_faces": plan["total_live_faces"],
-                "timestamp": f"{time.time():.3f}",
-                **{k: m[k] for k in ("latency_ns", "peak_memory", "quality",
-                                     "frob_residual", "applied", "skipped",
-                                     "applied_detail", "wall_s")},
-                **stamp,
-            }
-            append_row(csv_path, row)
-            done[key] = row
-            print(f"[landscape] warmup {pid:22s} lat={m['latency_ns']:.0f}ns "
-                  f"applied={m['applied']} skipped={m['skipped']} "
-                  f"({m['wall_s']:.1f}s)", flush=True)
-
-    for trial in range(args.reps):
-        for pid, plan in plans.items():
-            if stop:
-                break
-            porder = plan_orders[pid]
-            # PAIRED: the reference is re-measured immediately before every
-            # candidate, in the same window, on the same device. Unpaired
-            # comparison is exactly how the campaign got a phantom 17.5%.
-            for role, use_plan, use_order in (
-                    ("reference", ident_plan, order),
-                    ("candidate", plan, porder)):
-                key = (pid, trial, role)
-                if key in done:
+    def _execute_plans(sub_plans, sub_orders):
+        nonlocal stop
+        # WARMUP
+        for w in range(args.warmup_trials):
+            for pid, plan in sub_plans.items():
+                key = (pid, -1 - w, "warmup")
+                if key in done or not _budget_left():
                     continue
-                if not _budget_left():
-                    print("[landscape] wall budget reached -- stopping "
-                          "cleanly (restart to continue)", flush=True)
-                    stop = True
-                    break
                 try:
-                    m = measure(env, eval_samples, use_order, use_plan)
+                    m = measure(env, eval_samples, sub_orders[pid], plan)
                 except Exception:
                     traceback.print_exc()
-                    print(f"[landscape] FAILED {pid} trial {trial} {role} "
-                          "-- recorded as missing, not as a bad score",
-                          flush=True)
+                    print(f"[landscape] WARMUP FAILED {pid}", flush=True)
                     continue
                 row = {
                     "plan_id": pid, "op": plan["op"], "budget": plan["budget"],
-                    "trial": trial, "role": role,
+                    "trial": -1 - w, "role": "warmup",
                     "n_faces_approx": plan["n_faces_approx"],
                     "n_slot_rows": plan["n_slot_rows"],
                     "total_live_faces": plan["total_live_faces"],
                     "timestamp": f"{time.time():.3f}",
-                    **{k: m[k] for k in ("latency_ns", "peak_memory",
-                                         "quality", "frob_residual",
-                                         "applied", "skipped",
+                    **{k: m[k] for k in ("latency_ns", "peak_memory", "static_temp",
+                                         "quality", "frob_residual", "applied", "skipped",
                                          "applied_detail", "wall_s")},
                     **stamp,
                 }
                 append_row(csv_path, row)
                 done[key] = row
-                print(f"[landscape] {pid:22s} t{trial} {role:9s} "
-                      f"lat={m['latency_ns']:.0f}ns "
-                      f"mem={m['peak_memory']:.3g} q={m['quality']:.4f} "
+                print(f"[landscape] warmup {pid:22s} lat={m['latency_ns']:.0f}ns "
+                      f"applied={m['applied']} skipped={m['skipped']} "
                       f"({m['wall_s']:.1f}s)", flush=True)
+
+        # Reps (PAIRED candidate vs reference)
+        for trial in range(args.reps):
+            for pid, plan in sub_plans.items():
+                if stop:
+                    break
+                porder = sub_orders[pid]
+                for role, use_plan, use_order in (
+                        ("reference", ident_plan, order),
+                        ("candidate", plan, porder)):
+                    key = (pid, trial, role)
+                    if key in done:
+                        continue
+                    if not _budget_left():
+                        print("[landscape] wall budget reached -- stopping "
+                              "cleanly (restart to continue)", flush=True)
+                        stop = True
+                        break
+                    try:
+                        m = measure(env, eval_samples, use_order, use_plan)
+                    except Exception:
+                        traceback.print_exc()
+                        print(f"[landscape] FAILED {pid} trial {trial} {role} "
+                              "-- recorded as missing, not as a bad score",
+                              flush=True)
+                        continue
+                    row = {
+                        "plan_id": pid, "op": plan["op"], "budget": plan["budget"],
+                        "trial": trial, "role": role,
+                        "n_faces_approx": plan["n_faces_approx"],
+                        "n_slot_rows": plan["n_slot_rows"],
+                        "total_live_faces": plan["total_live_faces"],
+                        "timestamp": f"{time.time():.3f}",
+                        **{k: m[k] for k in ("latency_ns", "peak_memory", "static_temp",
+                                             "quality", "frob_residual",
+                                             "applied", "skipped",
+                                             "applied_detail", "wall_s")},
+                        **stamp,
+                    }
+                    append_row(csv_path, row)
+                    done[key] = row
+                    print(f"[landscape] {pid:22s} t{trial} {role:9s} "
+                          f"lat={m['latency_ns']:.0f}ns "
+                          f"mem={m['peak_memory']:.3g} stemp={m['static_temp']:.3g} "
+                          f"q={m['quality']:.4f} ({m['wall_s']:.1f}s)", flush=True)
+
+    # 1. Execute initial plans (identity + singletons/ladder/archive)
+    _execute_plans(plans, plan_orders)
+
+    # 2. Draw and execute F* stacks/pairs post-singleton
+    if (args.stack_ladder or args.pair_samples > 0) and not stop and not args.shard:
+        f_star_items = []
+        for pid, pl in plans.items():
+            if not pid.startswith("singleton:"):
+                continue
+            q_vals = [
+                float(done[(pid, t, "candidate")]["quality"])
+                for t in range(args.reps)
+                if (pid, t, "candidate") in done
+            ]
+            if q_vals and np.mean(q_vals) >= args.f_star_threshold:
+                f_star_items.append((pid, pl))
+        print(f"[landscape] F* set: {len(f_star_items)} singletons meet quality >= {args.f_star_threshold:.2f}",
+              flush=True)
+        if f_star_items:
+            stack_plans, stack_orders = build_f_star_stacks(
+                env, order, f_star_items,
+                stack_ladder=args.stack_ladder,
+                stack_samples=args.stack_samples,
+                pair_samples=args.pair_samples,
+            )
+            print(f"[landscape] generated {len(stack_plans)} stack/pair plans from F*", flush=True)
+            if stack_plans:
+                plans.update(stack_plans)
+                plan_orders.update(stack_orders)
+                _dump_manifest(plans, plans_path, INV)
+                _execute_plans(stack_plans, stack_orders)
 
     # --- quality noise floor ------------------------------------------------
     nf_pids = [x.strip() for x in args.noise_floor_plan.split(",")
@@ -1658,8 +2040,8 @@ def main():
                 "n_slot_rows": plans[nf_pid]["n_slot_rows"],
                 "total_live_faces": plans[nf_pid]["total_live_faces"],
                 "timestamp": f"{time.time():.3f}",
-                **{k: m[k] for k in ("latency_ns", "peak_memory", "quality",
-                                     "frob_residual", "applied", "skipped",
+                **{k: m[k] for k in ("latency_ns", "peak_memory", "static_temp",
+                                     "quality", "frob_residual", "applied", "skipped",
                                      "applied_detail", "wall_s")},
                 **stamp,
             }

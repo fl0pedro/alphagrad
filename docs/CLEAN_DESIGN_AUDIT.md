@@ -1,5 +1,7 @@
 # CLEAN-DESIGN AUDIT — every prior the PPO trainer adds beyond the owner's minimal design
 
+> **Contamination note (2026-09-03).** The two launchers audited here (v64b and v66a) set neither `--discount` nor `--gae-lambda`, so both runs inherited 0.99 / 0.95 from `ppo.py` defaults and their first eliminations received about 0.31 % of the terminal reward; both also ran under the -13 % timer bug fixed in alphagrad `1c1e480f`. The audit of what the launchers request stands as a record; any conclusion about what those runs learned is superseded by the campaign in the dsnn-3qm map. See `.scratch/trustworthy-approx-search/findings/55-gamma-lambda-rot.md` (dsnn superproject).
+
 Read-only audit at `alphagrad` HEAD `0e601ae` (code) / `f7ef2c0` (docs), branch
 `hostperf-caches`. Launchers audited: `~/dsnn/fq_v64b_tlm_creditfix.sbatch` and
 `~/dsnn/fq_v66a_static_lam10.sbatch`. Nothing under `src/` was modified; the four

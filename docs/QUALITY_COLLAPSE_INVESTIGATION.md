@@ -1,5 +1,7 @@
 # Why quality collapses in the PPO TLM campaigns — investigation dossier
 
+> **Contamination note (2026-09-03).** Every run this dossier is built on (v57, v58b, v59, v60 and the v61-v64 arms it cites) ran with discount 0.99 and GAE-lambda 0.95 inherited from `ppo.py` defaults, so the first decision of a 95-step episode received about 0.31 % of the terminal reward; v57-v66 also ran under the -13 % timer bug fixed in alphagrad `1c1e480f`. The conclusions below, including the §10 DECISION, are recorded only and are superseded by the campaign in the dsnn-3qm map. See `.scratch/trustworthy-approx-search/findings/55-gamma-lambda-rot.md` (dsnn superproject).
+
 Date: 2026-08-18. Author: investigation agent (read-mostly), commissioned after the
 LR-family falsification (v57/v59/v60: three LR schedules, same collapse).
 Repo: `/Users/assmuth/dsnn/alphagrad` @ `d5b666a` (branch `hostperf-caches`).
@@ -285,6 +287,8 @@ trajectories, matched-n_meas PPO-vs-GAZ, entropy-vs-pg magnitudes), `an6_basin.p
 `srun -p pgi15-cpu -w pgi15-cpu2 ... uv run --no-sync python -u <script>` from the repo.
 
 ## 10. DECISION — what the evidence supports
+
+> **Contamination note (2026-09-03).** This decision was reached on the v57-v60 runs, which ran discount 0.99 and GAE-lambda 0.95 by omission (`ppo.py` defaults) and under the -13 % timer bug fixed in alphagrad `1c1e480f`. It is recorded only and superseded by the campaign in the dsnn-3qm map; see `.scratch/trustworthy-approx-search/findings/55-gamma-lambda-rot.md` (dsnn superproject).
 
 Causal account, at the confidence the data supports:
 

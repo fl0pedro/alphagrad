@@ -1,5 +1,7 @@
 # Approximation campaign — parameter matrix (v57 → v66)
 
+> **Contamination note (2026-09-03).** Every run in this matrix, and in `params_matrix.csv` (which cannot carry this note), ran with discount 0.99 and GAE-lambda 0.95 inherited from `ppo.py` defaults; nobody chose those values, and the first eliminations of each episode received about 0.31 % of the terminal reward. All of these runs (v57 through v66) also ran under the -13 % timer bug fixed in alphagrad `1c1e480f`. The configuration record stands; conclusions drawn from these runs are recorded only and superseded by the campaign in the dsnn-3qm map. See `.scratch/trustworthy-approx-search/findings/55-gamma-lambda-rot.md` (dsnn superproject).
+
 Descriptive record of **what was configured** for every run in the alphagrad
 approximation campaign. No interpretation of outcomes.
 
