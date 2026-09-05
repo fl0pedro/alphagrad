@@ -580,24 +580,40 @@ def face_inventory(env, order, capture_tensors: bool = False):
     return inv
 
 
+def get_plan_arrays(plan, n_steps: int):
+    """Return (specs, face_specs, face_skips) for plan.
+    If already materialized, returns them directly.
+    Otherwise allocates and populates on demand from plan['wires'].
+    """
+    if plan.get("face_specs") is not None:
+        return plan["specs"], plan["face_specs"], plan["face_skips"]
+    specs, face_specs, face_skips = empty_plan(n_steps)
+    for w in plan.get("wires", []) or []:
+        k = int(w["k"])
+        f = int(w["f"])
+        if w.get("kind") == "SKIP":
+            face_skips[k, f] = 1
+        else:
+            slot = int(w["slot"])
+            face_specs[k, f, slot] = w["row"]
+    return specs, face_specs, face_skips
+
+
 def build_singleton_plan(env, order, k: int, f: int, op: str, slot: int = 0,
                          row: list[int] | None = None):
     """Build a plan that applies exactly ONE approximation on face (k, f)."""
-    specs, face_specs, face_skips = empty_plan(len(order))
     k, f = int(k), int(f)
     if op == "skip":
-        face_skips[k, f] = 1
         wires = [{"k": k, "f": f, "kind": "SKIP"}]
         n_slot_rows = 0
     else:
-        face_specs[k, f, slot] = row
         wires = [{"k": k, "f": f, "slot": slot, "row": list(row),
                   "kind": f"{op.upper()}@slot{slot}"}]
         n_slot_rows = 1
     return {
-        "specs": specs,
-        "face_specs": face_specs,
-        "face_skips": face_skips,
+        "specs": None,
+        "face_specs": None,
+        "face_skips": None,
         "n_faces_approx": 1,
         "n_slot_rows": n_slot_rows,
         "total_live_faces": -1,
@@ -694,7 +710,6 @@ def build_singleton_sweep_plans(env, order, inv):
 
 def compose_stack_plan(env, order, singletons_list, pid: str, op: str, budget: str):
     """Compose multiple compatible singletons into one plan."""
-    specs, face_specs, face_skips = empty_plan(len(order))
     wires = []
     used_faces = set()
     used_slots = set()
@@ -704,22 +719,20 @@ def compose_stack_plan(env, order, singletons_list, pid: str, op: str, budget: s
             if w.get("kind") == "SKIP":
                 if (k, f) in used_faces:
                     continue
-                face_skips[k, f] = 1
                 used_faces.add((k, f))
                 wires.append(w)
             else:
                 slot = w["slot"]
                 if (k, f, slot) in used_slots:
                     continue
-                face_specs[k, f, slot] = w["row"]
                 used_slots.add((k, f, slot))
                 wires.append(w)
     return {
-        "specs": specs,
-        "face_specs": face_specs,
-        "face_skips": face_skips,
+        "specs": None,
+        "face_specs": None,
+        "face_skips": None,
         "n_faces_approx": len({(w["k"], w["f"]) for w in wires}),
-        "n_slot_rows": int(np.sum(face_specs[..., 0] != -1)),
+        "n_slot_rows": sum(1 for w in wires if w.get("kind") != "SKIP"),
         "total_live_faces": -1,
         "per_vertex_faces": [],
         "wires": wires,
@@ -1072,13 +1085,14 @@ def measure(env, eval_samples, order, plan):
     reward harness. Returns a dict of the channels plus wall time."""
     consume_per_face_stats()          # drop whatever the plan-build replay left
     consume_mem_parity()
+    specs, face_specs, face_skips = get_plan_arrays(plan, len(order))
     t0 = time.perf_counter()
     _, _, reward = envmod._callback(
         env.config, env.args, env.consts,
         jnp.asarray(order),
-        jnp.asarray(plan["specs"]),
-        jnp.asarray(plan["face_specs"]),
-        jnp.asarray(plan["face_skips"]),
+        jnp.asarray(specs),
+        jnp.asarray(face_specs),
+        jnp.asarray(face_skips),
         int(len(order)),
         *eval_samples,
     )

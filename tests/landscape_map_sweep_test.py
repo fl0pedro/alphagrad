@@ -70,7 +70,8 @@ def test_build_singleton_sweep_plans(helmholtz_setup):
     for pid, p in plans.items():
         if p["op"] == "quant":
             assert ":bf16" in pid
-            assert (p["face_specs"][..., 0] == -3).any()  # QUANT_SENTINEL
+            wire = p["wires"][0]
+            assert wire["row"][0] == -3  # QUANT_SENTINEL
 
     # DIAG: explicit factor > 1 (never -1)
     for pid, p in plans.items():
