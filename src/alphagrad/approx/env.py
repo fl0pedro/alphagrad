@@ -2706,6 +2706,9 @@ def _flatten_jacobians(jac):
     return jnp.concatenate(flats)
 
 
+_JAC_DENSE_WARNED: list = []
+
+
 class GradientStructureMismatch(RuntimeError):
     """Two gradient pytrees that must share one structure do not (ticket
     dsnn-3qm.62). Raised by the grad-cosine and fidelity comparisons instead
@@ -2813,16 +2816,27 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
                 f"[{site}] exact leaf {i} is a dead path (None); the exact "
                 f"reference must carry every parameter gradient")
         if _is_sparse_tensor(e):
-            if e.val is None or any(d.axis is None or d.is_sparse for d in e.dims):
-                raise GradientStructureMismatch(
-                    f"[{site}] exact leaf {i} is not materialized: dims "
-                    f"{e.dims}")
-            from graphax.sparse.ops.output_layout import is_parameter_layout
-            if not is_parameter_layout(e):
-                raise GradientStructureMismatch(
-                    f"[{site}] exact leaf {i} is not in parameter layout: "
-                    f"dims {e.dims}, val {e.val.shape}")
-            e_arr = e.val * e.scalar_mult if e.scalar_mult is not None else e.val
+            if e.val is not None and all(d.axis is not None and not d.is_sparse
+                                         for d in e.dims):
+                from graphax.sparse.ops.output_layout import is_parameter_layout
+                if not is_parameter_layout(e):
+                    raise GradientStructureMismatch(
+                        f"[{site}] exact leaf {i} is not in parameter layout: "
+                        f"dims {e.dims}, val {e.val.shape}")
+                e_arr = e.val * e.scalar_mult if e.scalar_mult is not None else e.val
+            else:
+                # A FULL JACOBIAN leaf (a non-scalar target: the analytic AD
+                # benchmarks, or a Diag that survived to the boundary) carries
+                # a diagonal pair or a uniform fill. The exact reference of a
+                # Jacobian is materialized here, as the legacy Jacobian cosine
+                # did; a scalar loss never reaches this branch (its exact
+                # gradient is dense-stored, finding 61).
+                e_arr = e.dense()
+                if not _JAC_DENSE_WARNED:
+                    _JAC_DENSE_WARNED.append(1)
+                    print(f"[{site}] exact leaf {i} is a structured Jacobian "
+                          f"(dims {e.dims}); the reference is materialized for "
+                          "the comparison", flush=True)
         else:
             e_arr = e
         e_shape = tuple(int(v) for v in e_arr.shape)
@@ -2840,10 +2854,29 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
                 raise GradientStructureMismatch(
                     f"[{site}] leaf {i}: logical shape {a_shape} vs exact "
                     f"{e_shape}; dims {a.dims}")
-            if any(d.is_sparse or getattr(d, "is_compressed", False) for d in a.dims):
+            if any(getattr(d, "is_compressed", False) for d in a.dims):
                 raise GradientStructureMismatch(
-                    f"[{site}] leaf {i} carries a diagonal pair or a "
-                    f"compressed index in a returned gradient: dims {a.dims}")
+                    f"[{site}] leaf {i} carries a compressed index in a "
+                    f"returned gradient: dims {a.dims}")
+            if any(d.is_sparse for d in a.dims):
+                # A diagonal pair in the approximated leaf: a Jacobian target
+                # (see the exact branch above). Compared on its dense form.
+                a_arr = a.dense()
+                if tuple(int(v) for v in a_arr.shape) != e_shape:
+                    raise GradientStructureMismatch(
+                        f"[{site}] leaf {i}: dense shape {a_arr.shape} vs exact "
+                        f"{e_shape}; dims {a.dims}")
+                _cdt = jnp.promote_types(_cdt, jnp.promote_types(a_arr.dtype, jnp.float32))
+                ef = ef.astype(_cdt)
+                af = jnp.asarray(a_arr).astype(_cdt)
+                _d = jnp.sum(ef * af)
+                _a2 = jnp.sum(jnp.abs(af) ** 2)
+                _r2 = jnp.sum(jnp.abs(ef - af) ** 2)
+                dot = _d if dot is None else dot + _d
+                ee = _e2 if ee is None else ee + _e2
+                aa = _a2 if aa is None else aa + _a2
+                rr = _r2 if rr is None else rr + _r2
+                continue
             from graphax.sparse.ops.output_layout import is_parameter_layout
             if a.val is not None and not is_parameter_layout(a):
                 raise GradientStructureMismatch(
