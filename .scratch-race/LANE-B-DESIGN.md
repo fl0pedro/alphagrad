@@ -117,3 +117,38 @@ fusion is gone. XLA on CPU allocates the same broadcast instead, which is the
 So a single engine cannot have both without a device-aware lowering choice.
 The default of this lane is `nodemote`. `GRAPHAX_TILED_LAZY=full` restores the
 leaner CPU frame. The owner decides which one the single engine keeps.
+
+## 5. The two alphagrad goldens the engine change invalidates
+
+The cluster baseline is job 63775: graphax `1f3d404`, alphagrad `ae2852a9`,
+pgi15-cpu2, 122 modules clean, 1 module failing, 0 tests failing. The rerun at
+the lane-B head is job 63810: 120 modules clean, 3 modules failing, 2 tests
+failing. Two modules moved.
+
+`src/alphagrad/approx/tests/test_unified_head_set_pointer.py` fails in the
+baseline too. It cannot import `N_PRIME_GATES` from `unified_head.py`. That one
+is pre-existing and has nothing to do with graphax.
+
+`tests/policy_regression_gate_test.py` pins the token stream that the policy
+head reads. At the head the trace diverges at step 2 on ONE field. That field
+is `env_delta_count`, golden 1157 against live 1124. The live graph has 33
+FEWER tokens. Steps 0 and 1 are bit-identical, including every log-prob,
+entropy, value, vertex mask, face wire and token hash. The graph got smaller
+because the lazy frame stops materialising broadcasts. The gate exists to
+notice exactly this. Any change to the contraction lowering moves this golden.
+Re-record it with `python tests/policy_regression_gate.py --record`, once, on
+the cluster stack, after ticket .28 picks its engine.
+
+`tests/mem_channel_test.py::test_watermark_minus_temp_is_near_constant_across_plans`
+is the same story in memory. The gap, watermark minus temp, is [532, 256, 532]
+bytes. Those are the values the test's own comment records, and the gap spread
+is 276 bytes, also unchanged. What moved is the denominator. The forward-mode
+plan's static temp falls from 33 024 bytes to 768 bytes, which is 43 times
+less. So `temp_spread` falls from 33 kB to 768 bytes, and the bound
+`gap_spread <= 0.05 * temp_spread` cannot hold with a constant 276-byte
+numerator. The claim the test defends is finding 41: the gap does not track the
+plan. That claim is more true after the change, not less. The proposed fix is
+an absolute bound on this toy, `gap_spread <= 512`, in place of a fraction of a
+temp spread that a leaner engine is meant to collapse.
+
+Neither golden was re-recorded and neither bound was changed.
