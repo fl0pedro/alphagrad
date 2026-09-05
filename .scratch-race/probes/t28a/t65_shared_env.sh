@@ -14,7 +14,10 @@ export ALPHAGRAD_MAX_FACES=2538
 export ALPHAGRAD_MAX_DELTA_TOKENS=32768
 export ALPHAGRAD_MAX_EQNS=512
 export ALPHAGRAD_POLICY=palimpsa
-export ALPHAGRAD_FORCE_REV_ORDER=1
+# ALPHAGRAD_FORCE_REV_ORDER is gone (ticket dsnn-3qm.64): the base of this
+# lane, wip/integ-20260904 at ae2852a9, RAISES at import if it is exported.
+# The probe never needed it -- it builds both orders itself from
+# lm.rev_order / lm.markowitz_order and passes the list to jacve.
 export ALPHAGRAD_GRAD_COSINE_K=1
 export ALPHAGRAD_ACTOR_PROF_EVERY=20
 export ALPHAGRAD_INCREMENTAL_TOKENS=1
