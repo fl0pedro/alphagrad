@@ -28,6 +28,7 @@ Wire-up pattern from the driver (mirrors `mu0_ray.py`'s SPMD actor):
 from __future__ import annotations
 
 from typing import Any, Sequence
+import os
 
 import numpy as np
 import ray
