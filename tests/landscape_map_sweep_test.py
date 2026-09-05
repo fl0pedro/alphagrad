@@ -111,3 +111,38 @@ def test_measure_singleton_and_stacks(helmholtz_setup):
         sm = measure(env, eval_samples, stack_orders[spid], spl)
         assert np.isfinite(sm["latency_ns"])
         assert np.isfinite(sm["quality"])
+
+
+def test_shard_partitioning(helmholtz_setup):
+    env, _, order, inv = helmholtz_setup
+    plans, plan_orders = build_singleton_sweep_plans(env, order, inv)
+    plans["identity"] = {"op": "identity", "budget": "0", "wires": []}
+    
+    num_shards = 3
+    shards = []
+    for shard_idx in range(num_shards):
+        ident = plans.get("identity")
+        non_ident = [(pid, plans[pid]) for pid in plans if pid != "identity"]
+        import math
+        chunk_size = math.ceil(len(non_ident) / num_shards)
+        shard_items = non_ident[shard_idx * chunk_size : (shard_idx + 1) * chunk_size]
+        s_plans = {}
+        if ident is not None:
+            s_plans["identity"] = ident
+        s_plans.update(shard_items)
+        shards.append(s_plans)
+
+    # Every shard must have identity
+    for s in shards:
+        assert "identity" in s
+
+    # Union of all non-identity plans must equal original non-identity plans
+    all_sharded_non_ident = set()
+    for s in shards:
+        shard_non_ident = set(k for k in s if k != "identity")
+        # No overlap between shards
+        assert not (all_sharded_non_ident & shard_non_ident)
+        all_sharded_non_ident.update(shard_non_ident)
+
+    orig_non_ident = set(k for k in plans if k != "identity")
+    assert all_sharded_non_ident == orig_non_ident

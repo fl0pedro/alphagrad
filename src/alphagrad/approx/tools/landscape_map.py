@@ -268,6 +268,8 @@ def make_argparser() -> argparse.ArgumentParser:
                    help="Number of random samples M per stack size N (default: 5).")
     p.add_argument("--pair-samples", type=int, default=0,
                    help="Number of random pair samples from F* (0 = disabled).")
+    p.add_argument("--shard", default="",
+                   help="Shard specification 'I/N' (0-indexed, e.g. '0/4') to evaluate a slice of plans.")
     p.add_argument("--sweep-stride", type=int, default=1,
                    help=argparse.SUPPRESS)
     p.add_argument("--report-only", action="store_true",
@@ -1624,6 +1626,8 @@ def main():
     args = ARGS
     os.makedirs(args.out_dir, exist_ok=True)
     tag = f"_{args.tag}" if args.tag else ""
+    if args.shard:
+        tag += f"_s{args.shard.split('/')[0]}"
     csv_path = os.path.join(args.out_dir, f"rows{tag}.csv")
     md_path = os.path.join(args.out_dir, f"summary{tag}.md")
     fig_path = os.path.join(args.out_dir, f"landscape{tag}.png")
@@ -1845,6 +1849,20 @@ def main():
                              "wires": _named(p)}
                        for pid, p in plans_dict.items()}, fh, indent=2)
 
+    if args.shard:
+        parts = [int(x) for x in args.shard.split("/")]
+        shard_idx, num_shards = parts[0], parts[1]
+        ident = plans.get("identity")
+        non_ident = [(pid, plans[pid]) for pid in plans if pid != "identity"]
+        chunk_size = math.ceil(len(non_ident) / num_shards)
+        shard_items = non_ident[shard_idx * chunk_size : (shard_idx + 1) * chunk_size]
+        new_plans = {}
+        if ident is not None:
+            new_plans["identity"] = ident
+        new_plans.update(shard_items)
+        plans = new_plans
+        plan_orders = {pid: plan_orders[pid] for pid in plans}
+
     _dump_manifest(plans, plans_path, INV)
     print(f"[landscape] {len(plans)} plans; manifest -> {plans_path}",
           flush=True)
@@ -1949,7 +1967,7 @@ def main():
     _execute_plans(plans, plan_orders)
 
     # 2. Draw and execute F* stacks/pairs post-singleton
-    if (args.stack_ladder or args.pair_samples > 0) and not stop:
+    if (args.stack_ladder or args.pair_samples > 0) and not stop and not args.shard:
         f_star_items = []
         for pid, pl in plans.items():
             if not pid.startswith("singleton:"):
