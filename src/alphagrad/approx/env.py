@@ -1493,6 +1493,10 @@ def consume_plan_records() -> dict:
            # channel, per measurement, drained on the same trip for the
            # same reason as the toolchain counters above.
            "mem_parity": consume_mem_parity(),
+           # THE PAIRED REFERENCE (ticket .9): one record per rev-exact
+           # measurement, same trip, same reason (the trainer logs
+           # ref/latency_ns and ref/temp_bytes from these; ticket .45).
+           "paired_ref": consume_paired_refs(),
            "enabled": plan_log_enabled(),
            "pid": os.getpid()}
     _PLAN_RECORDS.clear()
@@ -1538,7 +1542,8 @@ def _plan_face_delta(before: dict | None, after: dict | None) -> dict:
 def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
                           reward_vec, face_before, face_after,
                           counts_from_trace: bool,
-                          mem_parity: dict | None = None) -> None:
+                          mem_parity: dict | None = None,
+                          paired_ref: dict | None = None) -> None:
     """Append ONE terminal plan to this process's plan log. Never raises.
 
     A logging failure must not kill a measurement, but it must not be
@@ -1582,6 +1587,20 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             # decode -> canonical slot at graphax) or "canonical" (the
             # pre-ticket read). A replay must convert the same way.
             "reduce_axis_space": _reduce_axis_space(),
+            # HOW slots 2 and 5 are expressed (ticket .9) and, under
+            # paired-log, the rev-exact reference this plan was paired
+            # with, in POSITIVE units -- so a record can be re-scored in
+            # absolute units (candidate_* fields) or against a different
+            # reference without a re-measure. None under absolute.
+            "cost_form": cost_form(),
+            "ref_latency_ns": (paired_ref or {}).get("latency_ns"),
+            "ref_temp_bytes": (paired_ref or {}).get("temp_bytes"),
+            "ref_watermark_bytes": (paired_ref or {}).get("watermark_bytes"),
+            "candidate_latency_ns": (paired_ref or {}).get(
+                "candidate_latency_ns"),
+            "candidate_memory_bytes": (paired_ref or {}).get(
+                "candidate_memory_bytes"),
+            "mem_log_floored": (paired_ref or {}).get("mem_floored"),
         }
         rec.update(_plog.encode_wires(
             order, rule_specs, face_specs, face_skips,
@@ -2719,20 +2738,50 @@ def _align_jac(jac_approx, jac_exact):
         return jac_approx
 
 
-_COST_REF: dict = {}
-# ``clamps``       total gate firings this process
-# ``unclamped``    bounded ring of the campaign latencies (ns) of terminal
-#                  plans the gate did NOT clamp -- the denominator of the
-#                  floor/plan ratio telemetry below.
-# ``instrument``   the campaign instrument parameters the last floor was
-#                  measured with, logged so a future re-fork is visible.
-_QUALITY_GATE_STATS: dict = {"clamps": 0, "unclamped": [], "instrument": None}
-# (order, arg-shape, device)-keyed floor cache: `exact_cache_key` already
-# digests exactly that, so a repeat offender order is measured ONCE.
-_ORDER_FLOOR_CACHE: dict = {}
-_ORDER_FLOOR_CACHE_MAX = 256
-# One legacy-vs-campaign audit print per process (see _gate_order_floor).
-_FLOOR_AUDIT_DONE: list = []
+# ---------------------------------------------------------------------------
+# THE PAIRED REFERENCE (ticket dsnn-3qm.9). Under ``--cost-form paired-log``
+# every terminal measurement also measures REV-EXACT -- the reverse order,
+# every face None, the jax.grad-equivalent -- in the same callback, right
+# after the candidate, through the same executable path and the same
+# instrument (`_campaign_measure_cost` -> `_time_one_rep`, same eval args,
+# same points x reps, same inner-reps, same warmup, same median). The cost
+# channels then carry the LOG-DIFFERENCE ``Delta_c = log cost_c(candidate)
+# - log cost_c(rev-exact)`` (stored negated like every cost slot), so
+# rev-exact scores 0 by construction and a GPU-state drift of 18-20 % between
+# processes cancels instead of masquerading as a win. One record per
+# reference measurement is kept here and drained with the plan records
+# (`consume_plan_records` -> ``"paired_ref"``), so the trainer can log the
+# reference in positive units (ref/latency_ns, ref/temp_bytes; ticket .45).
+#
+# Until 2026-09-04 this block held the additive quality gate
+# (ALPHAGRAD_QUALITY_GATE_MIN, `_apply_quality_gate`, the per-order floor
+# and the global rev reference). The gate clamped a destroyed plan's costs to
+# a CACHED exact reference -- not paired, and the floor was measured with a
+# different instrument for the whole v57-v66 campaign (see `_time_one_rep`).
+# The quality floor that replaces it is a reward channel option in ppo.py
+# (--quality-floor), not a clamp on the cost channels.
+_PAIRED_REF: list = []
+_PAIRED_REF_DROPPED = [0]
+_PAIRED_REF_CAP = 65536
+
+# THE FLOOR UNDER log(temp). ``memory_analysis().temp_size_in_bytes`` is an
+# exact integer count of bytes and a plan whose gradient graph dead-code
+# elimination removed entirely reports EXACTLY 0 (job 63632: every sampled
+# NeuralNetwork plan with 5-11 skips), so log(temp) needs a floor. One byte
+# is the smallest non-zero value the instrument can report, so the floor
+# replaces only an exact 0 and never a measured value: it is not a cap
+# (Delta_mem stays unbounded below in the size of the reference, which the
+# owner ruled for -- no cap by default, ticket .9 Q37), and log(1 B) = 0
+# makes a zero-temp plan's Delta_mem read directly as -log(temp_ref in
+# bytes) -- "how many nats of temporaries the reference has". The
+# alternative, flooring at the reference's own temp, would zero the memory
+# channel for every zero-temp plan and HIDE the absorber's prize instead of
+# leaving it to the quality floor to price (finding 53: that pricing is
+# tau's and lambda's job, not the cost channel's). Latency needs no floor:
+# a measured latency is already clamped up to `_LAT_FLOOR_NS`, and 0.0
+# means "not measured" and stays 0.0 (see `paired_log_costs`). Every
+# floored reading is counted in the reference record (``mem_floored``).
+_MEM_LOG_FLOOR_BYTES = 1.0
 
 
 def _time_one_rep(ex, eval_args, unique_devices, inner):
@@ -2744,9 +2793,10 @@ def _time_one_rep(ex, eval_args, unique_devices, inner):
     inline loop this replaced).
 
     THIS IS THE SINGLE INSTRUMENT. Both the campaign measurement loop
-    (the number a plan is scored on) and the quality gate's exact-cost
-    floor (the number a destroyed plan is clamped to) call it, with the
-    same parameters, so the clamp compares like with like.
+    (the number a plan is scored on) and the paired rev-exact reference
+    (the number it is log-differenced against, ticket dsnn-3qm.9; until
+    2026-09-04 the quality gate's exact-cost floor) call it, with the
+    same parameters, so the pair compares like with like.
 
     It did not use to. Until 2026-08-26 the floor was timed by
     ``_measure_exec_cost`` -- median of 3 laps of 20 back-to-back
@@ -2860,8 +2910,10 @@ def _campaign_measure_cost(ex, eval_args_list, unique_devices,
     untimed executions per point, reduced by ``_aggregate_samples``
     (the same median the plan's own channels get).
 
-    Used for the quality gate's exact floor so the floor is, literally,
-    the number the campaign path would have printed for that plan.
+    Used for the paired rev-exact reference (ticket dsnn-3qm.9; the
+    quality gate's exact floor until 2026-09-04) so the reference is,
+    literally, the number the campaign path would have printed for that
+    plan.
     """
     _lat: list[float] = []
     _peak: list[float] = []
@@ -2894,284 +2946,93 @@ def _resolve_warmup(config) -> int:
     return _w
 
 
-def _instrument_label() -> str:
-    """Human-readable dump of the campaign instrument parameters the
-    gate floor was measured with. Printed with every floor and every
-    logged clamp: if a future edit re-forks the two measurement paths,
-    the parameters stop matching the run's own launcher flags and the
-    regression is visible in the log instead of silently worth -13%."""
-    _p = _QUALITY_GATE_STATS.get("instrument")
-    if not _p:
-        return "campaign (parameters not yet recorded)"
-    return ("campaign points={points} reps={reps} inner={inner} "
-            "warmup={warmup} agg=median".format(**_p))
+def _paired_log_delta(candidate: float, reference: float,
+                      floor: float) -> float:
+    """``log(max(candidate, floor)) - log(max(reference, floor))``."""
+    return (math.log(max(float(candidate), floor))
+            - math.log(max(float(reference), floor)))
 
 
-def _record_unclamped_latency(latency_ns: float) -> None:
-    """Bounded ring of the campaign latencies of terminal plans the gate
-    let through -- the denominator of the floor/plan ratio telemetry."""
-    if not (latency_ns > 0.0):
-        return
-    _ring = _QUALITY_GATE_STATS["unclamped"]
-    _ring.append(float(latency_ns))
-    if len(_ring) > 512:
-        del _ring[:-512]
+def paired_log_costs(latency_ns: float, peak_memory: float,
+                     ref_latency_ns: float, ref_memory: float
+                     ) -> tuple[float, float, int]:
+    """The two cost channels as PAIRED LOG-DIFFERENCES against rev-exact.
 
+    ``(Delta_lat, Delta_mem, n_floored)``. ``Delta_c = log cost_c(candidate)
+    - log cost_c(rev-exact)``: negative = the candidate is cheaper. The
+    caller stores both negated, like every cost slot, so a cheaper plan
+    scores above 0 and rev-exact scores exactly 0.
 
-def _order_floor(order_key, compile_fn, measure_fn, legacy_measure_fn=None):
-    """The quality gate's PER-ORDER exact floor: what this plan's own
-    elimination order costs done exactly, measured ONCE per
-    `order_key`.
-
-    `order_key` is the caller's exact-compile cache key, which already
-    digests (order, arg shapes/dtypes, device) -- the complete set of
-    things the exact executable's cost depends on. Approximation specs
-    are deliberately NOT in it: the exact executable ignores them, so
-    every plan that destroyed the SAME order shares one measurement
-    instead of paying a fresh compile+measure per clamp.
-
-    `measure_fn(ex)` must be the campaign instrument
-    (``_campaign_measure_cost`` bound to this run's eval args and
-    points/reps/inner/warmup). `legacy_measure_fn(ex)`, when given,
-    re-times the FIRST floor of the process with the pre-2026-08-26
-    3x20 protocol and prints both -- so every run records, in its own
-    conditions, how large the instrument gap it used to pay was.
+    Latency ``0.0`` means NOT MEASURED (``config.measure_latency`` off) and
+    passes through as 0.0 -- for the pair, since candidate and reference
+    are measured under one config. A measured latency is never 0: the
+    campaign path clamps it up to `_LAT_FLOOR_NS` first. Memory is
+    floored at `_MEM_LOG_FLOOR_BYTES` on BOTH sides (see the constant for
+    why one byte), and ``n_floored`` says how many of the two readings the
+    floor replaced.
     """
-    _hit = _ORDER_FLOOR_CACHE.get(order_key)
-    if _hit is not None:
-        return _hit
-    _ex = compile_fn()
-    _val = measure_fn(_ex)
-    if legacy_measure_fn is not None and not _FLOOR_AUDIT_DONE:
-        _FLOOR_AUDIT_DONE.append(1)
-        try:
-            _leg_l, _leg_m = legacy_measure_fn(_ex)
-            print(f"[measure] quality gate floor AUDIT: campaign "
-                  f"instrument {_val[0]/1e3:.1f}us vs legacy 3x20 "
-                  f"{_leg_l/1e3:.1f}us (legacy/campaign "
-                  f"{(_leg_l/_val[0]) if _val[0] else float('nan'):.3f}"
-                  f") | peak {_val[1]/1e6:.1f}MB vs {_leg_m/1e6:.1f}MB",
-                  flush=True)
-        except Exception as _aexc:
-            print(f"[measure] quality gate floor AUDIT skipped "
-                  f"({type(_aexc).__name__}: {str(_aexc)[:80]})",
-                  flush=True)
-    print(f"[measure] quality gate floor: order-key="
-          f"{order_key.hex()[:8] if isinstance(order_key, bytes) else order_key}"
-          f" lat={_val[0]/1e3:.1f}us peak={_val[1]/1e6:.1f}MB"
-          f" | instrument={_instrument_label()}", flush=True)
-    if len(_ORDER_FLOOR_CACHE) >= _ORDER_FLOOR_CACHE_MAX:
-        _ORDER_FLOOR_CACHE.clear()
-    _ORDER_FLOOR_CACHE[order_key] = _val
-    return _val
-
-
-def _measure_exec_cost(ex, base_args):
-    """LEGACY light protocol -- (latency_ns, peak_bytes) of a compiled
-    executable from 3 laps of 20 back-to-back executions.
-
-    NOT the instrument anything is scored with. It survives only as (a)
-    the last-resort fallback for the global rev reference when no
-    campaign eval args are available and (b) the comparison arm of the
-    one-shot floor audit, which prints how far it lands from the
-    campaign instrument. Timing a floor with this while the thing being
-    floored is timed by ``_time_one_rep`` is exactly the bug that paid
-    destruction -13% for the whole v57-v66 campaign; see
-    ``_time_one_rep``'s docstring before reaching for it.
-
-    (Original docstring: measured with the gate's own light protocol
-    (3x20 perf_counter, allocator-delta peak with static fallback).
-    Shared by the global rev reference and the per-order floor so the
-    clamp compares like with like -- true between the two REFERENCES,
-    false between the floor and the plan being floored.)
-    """
-    out = ex(*base_args)
-    jax.block_until_ready(out)
-    _devs = set()
-    for _l in jax.tree_util.tree_leaves(out):
-        try:
-            _devs |= set(_l.devices())
-        except Exception:
-            pass
-    _have = bool(_devs) and all(
-        (d.memory_stats() or {}).get("peak_bytes_in_use") is not None
-        for d in _devs)
-    for _ in range(3):
-        jax.block_until_ready(ex(*base_args))
-    _base = 0.0
-    if _have:
-        _base = sum(float((d.memory_stats() or {}).get(
-            "bytes_in_use", 0.0)) for d in _devs)
-        for d in _devs:
-            try:
-                d.client.clear_memory_stats()
-            except Exception:
-                pass
-    _laps = []
-    for _ in range(3):
-        _t0 = time.perf_counter()
-        for _ in range(20):
-            out = ex(*base_args)
-        jax.block_until_ready(out)
-        _laps.append((time.perf_counter() - _t0) / 20)
-    _lat = float(np.median(_laps) * 1e9)
-    if _have:
-        _peak = max(0.0, sum(float((d.memory_stats() or {}).get(
-            "peak_bytes_in_use", 0.0)) for d in _devs) - _base)
+    if latency_ns > 0.0 and ref_latency_ns > 0.0:
+        d_lat = _paired_log_delta(latency_ns, ref_latency_ns, _LAT_FLOOR_NS)
     else:
-        _peak = float(_memory_analysis_bytes(ex) or 0.0)
-    return _lat, _peak
+        d_lat = 0.0
+    n_floored = int(float(peak_memory) < _MEM_LOG_FLOOR_BYTES) + int(
+        float(ref_memory) < _MEM_LOG_FLOOR_BYTES)
+    d_mem = _paired_log_delta(peak_memory, ref_memory, _MEM_LOG_FLOOR_BYTES)
+    return float(d_lat), float(d_mem), n_floored
 
 
-def _exact_cost_reference(config, base_args, measure_fn=None):
-    """(latency_ns, peak_bytes) of the EXACT 'rev' plan -- the additive
-    quality gate's GLOBAL fallback floor, used only when the per-order
-    floor could not be built. Measured ONCE per process through the same
-    compile path (_compile_measure).
-
-    `measure_fn(ex) -> (latency_ns, peak_bytes)` is THE INSTRUMENT and
-    the campaign path passes its own (``_campaign_measure_cost`` bound
-    to this run's eval args / points / reps / inner-reps) so the
-    reference is timed exactly like the plans it floors. It defaults to
-    the legacy 3x20 protocol only for callers that have no campaign eval
-    args to hand -- which reintroduces the instrument mismatch, so the
-    fallback announces itself.
-    """
-    if "ref" in _COST_REF:
-        return _COST_REF["ref"]
-    _legacy = measure_fn is None
-    if _legacy:
-        def measure_fn(_ex):
-            return _measure_exec_cost(_ex, base_args)
+def _static_temp_bytes(compiled) -> float | None:
+    """``compiled.memory_analysis().temp_size_in_bytes`` -- the quantity
+    reward slot 5 holds under ``--mem-channel temp`` (ticket .49) -- or
+    None when the executable exposes no analysis."""
     try:
-        from graphax import jacve as _jacve
-        ex = _compile_measure(
-            jax.jit(
-                _jacve(config.target_fun, "rev",
-                       argnums=config.argnums, has_aux=config.has_aux,
-                       sparse_representation=config.sparse),
-                keep_unused=True,
-            ).lower(*base_args))
-        _lat, _peak = measure_fn(ex)
-        _COST_REF["ref"] = (_lat, _peak)
-        print(f"[measure] quality gate armed: exact-rev reference "
-              f"latency={_lat/1e3:.1f}us peak={_peak/1e6:.1f}MB "
-              f"(qmin={os.environ.get('ALPHAGRAD_QUALITY_GATE_MIN')}; "
-              f"instrument="
-              + ("LEGACY 3x20 -- NOT the campaign instrument, this "
-                 "reference under-reads by ~13%"
-                 if _legacy else _instrument_label()) + ")",
-              flush=True)
-    except Exception as _exc:
-        print(f"[measure] WARNING quality gate: exact-rev reference "
-              f"failed ({type(_exc).__name__}: {str(_exc)[:120]}) -- "
-              f"gate fails OPEN", flush=True)
-        _COST_REF["ref"] = None
-    return _COST_REF["ref"]
+        ma = compiled.memory_analysis()
+    except Exception:
+        return None
+    if ma is None:
+        return None
+    return float(getattr(ma, "temp_size_in_bytes", 0) or 0.0)
 
 
-def _apply_quality_gate(latency_ns, peak_memory, quality, is_terminal,
-                        has_quality, config, base_args,
-                        order_floor_fn=None, ref_measure_fn=None):
-    """ADDITIVE quality gate: below ALPHAGRAD_QUALITY_GATE_MIN the cost
-    channels are FLOORED at the exact-reverse reference -- destruction
-    pays what exact computation pays, so it gains nothing, while every
-    channel stays a plain additive term. Cost channels are PENALTIES:
-    scaling them toward zero would reward destruction, hence the clamp
-    form. No-op unless the env var is set, quality was actually
-    measured this step, and it fell below the threshold.
+def _record_paired_ref(rec: dict) -> None:
+    if len(_PAIRED_REF) >= _PAIRED_REF_CAP:
+        _PAIRED_REF_DROPPED[0] += 1
+        return
+    _PAIRED_REF.append(rec)
 
-    ``ALPHAGRAD_QUALITY_GATE_MIN`` unset or ``0`` disables the gate
-    entirely: no floor is measured, no compile is triggered, and both
-    cost channels pass through byte-identically.
 
-    THE FLOOR AND THE PLAN MUST SHARE AN INSTRUMENT. `order_floor_fn`
-    is expected to time the same-order exact executable with
-    ``_campaign_measure_cost`` at this run's own points/reps/inner-reps;
-    `ref_measure_fn` does the same for the global rev fallback. Timing
-    the floor with a throughput protocol while the plan is timed by the
-    campaign loop is what made the floor land 13-15% below an honest
-    exact plan for the whole v57-v66 campaign -- i.e. paid destruction a
-    bonus through the very mechanism meant to forbid it.
+def consume_paired_refs() -> dict:
+    """Pop this process's paired-reference records (see `_PAIRED_REF`).
+
+    ``{"records": [...], "dropped": int}``. Rides `consume_plan_records`,
+    like the memory-parity drain, because the reference is measured in the
+    process that measured the candidate -- the Ray measure actor under
+    --ray-measure -- and the trainer's own module globals never see it.
     """
-    try:
-        _qmin = float(os.environ.get(
-            "ALPHAGRAD_QUALITY_GATE_MIN", "0") or 0.0)
-    except ValueError:
-        _qmin = 0.0
-    if (_qmin <= 0.0 or not is_terminal or not has_quality
-            or float(quality) >= _qmin):
-        # Terminal plans the gate lets through are the denominator of
-        # the floor/plan ratio telemetry below: if the floor ever drifts
-        # away from what honest plans are charged, the ratio moves.
-        if is_terminal and has_quality and _qmin > 0.0:
-            _record_unclamped_latency(latency_ns)
-        return latency_ns, peak_memory
-    # Prefer the SAME-ORDER exact floor: a destroyed plan pays what its
-    # OWN order would cost done exactly, so destruction is strictly
-    # dominated at every fixed order while order search stays rewarded
-    # (the global rev reference under-floored: random orders measure
-    # ~500x above rev, so a clamped-to-rev SKIP still "won" latency).
-    _ref = None
-    _oom_floor_bytes = 0.0
-    if order_floor_fn is not None:
-        try:
-            _ref = order_floor_fn()
-        except Exception as _exc:
-            _m = str(_exc)
-            # A genuine allocation OOM on the per-order exact floor means
-            # this ORDER's honest cost is AT LEAST the failed allocation.
-            # Falling back to the tiny rev floor would mint a second-order
-            # cliff (destroy + pick an order whose exact plan cannot even
-            # compile -> cheapest floor in the pool); carry the requested
-            # bytes into the MEMORY floor instead.
-            import re as _re
-            _g = _re.search(
-                r"allocate ([0-9.]+)\s*([KMGT])iB", _m)
-            if _g:
-                _oom_floor_bytes = float(_g.group(1)) * {
-                    "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40,
-                }[_g.group(2)]
-            print(f"[measure] quality gate: per-order floor failed "
-                  f"({type(_exc).__name__}: {_m[:120]}) -- "
-                  f"falling back to the rev reference"
-                  + (f" + OOM mem floor "
-                     f"{_oom_floor_bytes/2**30:.1f}GiB"
-                     if _oom_floor_bytes else ""), flush=True)
-    if _ref is None:
-        _ref = _exact_cost_reference(config, base_args, ref_measure_fn)
-        if _ref is not None and _oom_floor_bytes > 0.0:
-            _ref = (_ref[0], max(_ref[1], _oom_floor_bytes))
-    if _ref is None:
-        return latency_ns, peak_memory
-    _rl, _rm = _ref
-    if mem_channel() == "temp":
-        # The floor's memory is a runtime watermark; the channel is static
-        # temp (ticket .49). Clamping one with the other mixes quantities.
-        raise MemChannelFault(
-            "quality gate: ALPHAGRAD_QUALITY_GATE_MIN is armed while "
-            "--mem-channel temp is the memory channel; the gate's memory "
-            "floor is a watermark and cannot clamp a static temp")
-    _QUALITY_GATE_STATS["clamps"] += 1
-    if _QUALITY_GATE_STATS["clamps"] == 1 \
-            or _QUALITY_GATE_STATS["clamps"] % 50 == 0:
-        # RATIO TELEMETRY: the floor against the median campaign latency
-        # of the terminal plans the gate did NOT clamp. Both numbers now
-        # come from the same instrument, so a healthy run prints a ratio
-        # near 1 for an exact-cost floor; a ratio that drifts below 1
-        # again means the two measurement paths have re-forked and
-        # destruction is being paid a bonus.
-        _ring = _QUALITY_GATE_STATS["unclamped"]
-        _med = float(np.median(_ring)) if _ring else 0.0
-        _ratio = (f"{_rl/_med:.3f}" if _med > 0.0 else "n/a")
-        print(f"[measure] quality gate CLAMP "
-              f"#{_QUALITY_GATE_STATS['clamps']}: q={float(quality):.4f}"
-              f" < {_qmin}; lat {latency_ns/1e3:.1f}->"
-              f"{max(latency_ns, _rl)/1e3:.1f}us"
-              f" | floor={_rl/1e3:.1f}us peak_floor={_rm/1e6:.1f}MB"
-              f" | floor/median-unclamped={_ratio} (n={len(_ring)})"
-              f" | instrument={_instrument_label()}", flush=True)
-    return max(latency_ns, _rl), max(peak_memory, _rm)
+    out = {"records": list(_PAIRED_REF), "dropped": int(_PAIRED_REF_DROPPED[0])}
+    _PAIRED_REF.clear()
+    _PAIRED_REF_DROPPED[0] = 0
+    return out
+
+
+def paired_ref_summary(records) -> dict:
+    """Per-period reference numbers for the log dict, in POSITIVE units
+    (ticket .45): the mean rev-exact latency in ns and static temp bytes
+    (and watermark bytes), how many references were taken, and how many
+    memory readings (candidate or reference) the log floor replaced."""
+    _lat = [float(r["latency_ns"]) for r in records
+            if r.get("latency_ns") is not None and r["latency_ns"] > 0.0]
+    _tmp = [float(r["temp_bytes"]) for r in records
+            if r.get("temp_bytes") is not None]
+    _wm = [float(r["watermark_bytes"]) for r in records
+           if r.get("watermark_bytes") is not None]
+    return {
+        "n": int(len(records)),
+        "latency_ns": float(np.mean(_lat)) if _lat else float("nan"),
+        "temp_bytes": float(np.mean(_tmp)) if _tmp else float("nan"),
+        "watermark_bytes": float(np.mean(_wm)) if _wm else float("nan"),
+        "mem_floored": int(sum(int(r.get("mem_floored", 0)) for r in records)),
+    }
 
 
 def _quality_metrics(jac_exact, jac_approx):
@@ -3443,10 +3304,9 @@ def quality_metric(config=None) -> str:
     # overhead, vs 100 executions for the whole latency channel).
     #
     # The COST channels are untouched by this: with no quality sample
-    # ``cosines`` stays empty, so ``_apply_quality_gate`` is handed
-    # has_quality=False and returns its inputs unchanged -- latency_ns and
-    # peak_memory are bit-identical to a run that computed the walk and threw
-    # the number away.
+    # ``cosines`` stays empty and nothing downstream reads it into the cost
+    # slots -- latency_ns and peak_memory are bit-identical to a run that
+    # computed the walk and threw the number away.
     if want in ("none", "off", "skip"):
         return "none"
     if want not in ("auto", ""):
@@ -4058,6 +3918,40 @@ def mem_channel() -> str:
         raise ValueError(
             f"{_MEM_CHANNEL_ENV} must be one of {MEM_CHANNEL_CHOICES} (set "
             f"by ppo.py from --mem-channel), got {want!r}")
+    return want
+
+
+# THE COST FORM (ticket dsnn-3qm.9). HOW reward slots 2 (latency_ns) and 5
+# (peak_memory) are expressed:
+#   absolute    the measured number, stored negated -- the pre-.9 form, kept
+#               for the flag-off bit-identity gate (ALPHAGRAD_EQ_DUMP).
+#   paired-log  the log-difference against rev-exact measured PAIRED in the
+#               same callback (see `_PAIRED_REF`): ``-(log cost(candidate) -
+#               log cost(rev-exact))``, so rev-exact scores 0 and a cheaper
+#               plan scores above 0. The campaign form (ppo.py --cost-form
+#               defaults to it).
+# Same transport as --mem-channel: ppo.py publishes the flag before ray.init,
+# the Ray measure actors read it through this one function. ABSENT means
+# ``absolute``, unlike `mem_channel`: the paired form costs a second compile
+# and a second measurement per terminal plan and changes what two slots MEAN,
+# so a process that was not started through ppo.py (a test module, the other
+# drivers, landscape_map -- which takes its own ratios from absolute numbers)
+# never gets it implicitly.
+_COST_FORM_ENV = "ALPHAGRAD_COST_FORM"
+COST_FORM_CHOICES = ("absolute", "paired-log")
+
+
+def cost_form() -> str:
+    """``"absolute"`` or ``"paired-log"`` -- HOW slots 2 and 5 are expressed.
+
+    Absent means ``absolute`` (see the block above for why this default
+    differs from `mem_channel`'s). Anything else is a hand edit.
+    """
+    want = os.environ.get(_COST_FORM_ENV, "absolute").strip().lower()
+    if want not in COST_FORM_CHOICES:
+        raise ValueError(
+            f"{_COST_FORM_ENV} must be one of {COST_FORM_CHOICES} (set by "
+            f"ppo.py from --cost-form), got {want!r}")
     return want
 
 
@@ -5313,6 +5207,14 @@ def _callback(
     _plan_log_on = bool(is_terminal) and plan_log_enabled()
     if _plan_log_on:
         _PLAN_LOG_TERMINALS[0] += 1
+    # THE COST FORM (ticket .9): under ``paired-log`` the terminal step
+    # measures rev-exact beside the candidate and the two cost slots become
+    # log-differences (see `_PAIRED_REF`). Terminal only, like slots 6/8/10:
+    # a partial order's cost against rev-exact is not a statement about a
+    # plan, so non-terminal steps carry 0.0 in slots 2 and 5 under this form
+    # (training uses terminal rewards strictly; ruling 2026-09-01).
+    _paired = bool(is_terminal) and cost_form() == "paired-log"
+    _paired_ref_rec = None
     _plan_pf0 = dict(_PER_FACE_STATS) if _plan_log_on else None
     _plan_traced = [False]
 
@@ -5769,7 +5671,7 @@ def _callback(
     def _do_compile_exact():
         # Wrapped, not duplicated: every consumer of the exact
         # executable (the cosine quality metric, the fidelity channel's
-        # `_exact_ref_scores`, the quality gate's order floor) reaches it
+        # `_exact_ref_scores`) reaches it
         # through this one closure, so arming here is what makes the
         # sparsity denominator FREE on the reference somebody else is
         # already paying for.
@@ -5821,6 +5723,46 @@ def _callback(
     if callback_device is not None:
         h_ex.update(repr(callback_device).encode())
     exact_cache_key = h_ex.digest()
+
+    # THE PAIRED REFERENCE (ticket .9): rev-exact = the reverse order over
+    # the SAME vertex set the candidate eliminated, no rule on any vertex,
+    # no action on any face. Built through the same ``jacve`` call shape an
+    # identity candidate gets from `_jacve_fn(approx=True)` -- ``transforms``
+    # is the empty list and ``face_transforms`` None whenever a plan has no
+    # rule and no face action -- so an identity plan and its reference are
+    # the SAME executable and land on the same lowering path (ticket .24's
+    # armed-vs-unarmed question is thereby moot for the pair; its GPU
+    # landing test still stands). Descending vertex ids IS graphax's
+    # ``"rev"`` over these vertices (core._checkify_order). The COMPILE is
+    # cached like every other executable (order, arg shapes, device); the
+    # MEASUREMENT is taken anew in every terminal callback, right after the
+    # candidate's -- that is what makes it paired.
+    _rev_order = sorted(o_list, reverse=True)
+    h_rf = hashlib.blake2b(digest_size=16)
+    h_rf.update(np.asarray(_rev_order, dtype=np.int32).tobytes())
+    for a in args_for_lower:
+        if hasattr(a, "shape") and hasattr(a, "dtype"):
+            h_rf.update(repr(a.shape).encode())
+            h_rf.update(repr(a.dtype).encode())
+    if callback_device is not None:
+        h_rf.update(repr(callback_device).encode())
+    paired_ref_key = h_rf.digest()
+
+    def _do_compile_paired_ref():
+        return _compile_measure(
+            jax.jit(
+                jacve(
+                    config.target_fun,
+                    list(_rev_order),
+                    argnums=config.argnums,
+                    has_aux=config.has_aux,
+                    sparse_representation=config.sparse,
+                    transforms=[],
+                    face_transforms=None,
+                ),
+                keep_unused=True,
+            ).lower(*args_for_lower)
+        )
 
     # RESOURCE-LIMIT TRUNCATION (OOM) — "Time Limits in RL" applied to memory.
     #
@@ -6067,10 +6009,10 @@ def _callback(
     # compiled fine can still exhaust the device here. Excluded from the
     # gradient rather than scored.
     try:
-        # THE MEASUREMENT INPUTS, materialised ONCE. The quality gate's
-        # per-order floor re-measures the exact executable over exactly
-        # this list, with exactly the parameters below, so a clamped plan
-        # and an honest plan are timed on the same data with the same
+        # THE MEASUREMENT INPUTS, materialised ONCE. The paired rev-exact
+        # reference (ticket .9) measures its executable over exactly
+        # this list, with exactly the parameters below, so the candidate
+        # and its reference are timed on the same data with the same
         # instrument (see _time_one_rep). Built inside the try so a
         # device_put OOM still truncates rather than escaping.
         eval_args_all: list = []
@@ -6102,10 +6044,6 @@ def _callback(
         # gate floor is a FRESH compile every time it is measured. One
         # untimed execution costs one execution and removes the whole class.
         _warmup = _resolve_warmup(config)
-        _QUALITY_GATE_STATS["instrument"] = {
-            "points": n_points, "reps": n_reps,
-            "inner": _inner, "warmup": _warmup,
-        }
         for i in range(n_points):
             eval_args_i = eval_args_all[i]
 
@@ -6124,10 +6062,10 @@ def _callback(
             # ``ResourceMonitor`` (not its C++ tracker) leaks. peak_memory +
             # latency_ns are zero for the run.
             # ONE instrument (see _time_one_rep): this loop and the
-            # quality gate's exact floor call the same function with the
-            # same (points, reps, inner, warmup), so the floor is exactly
-            # what the campaign path would have printed for the same-order
-            # exact plan -- not a throughput timing that reads 13% low.
+            # paired rev-exact reference call the same function with the
+            # same (points, reps, inner, warmup), so the reference is
+            # exactly what the campaign path would have printed for the
+            # rev-exact plan -- not a throughput timing that reads 13% low.
             for _w in range(_warmup):
                 jax.block_until_ready(compiled_cost(*eval_args_i))
             for _rep in range(n_reps):
@@ -6210,6 +6148,28 @@ def _callback(
                 if _fid_on:
                     _rel_frobs.append(float(_rf))
                     _cos_logged.append(float(_cos))
+
+        # ---- THE PAIRED REFERENCE (ticket .9) ----------------------------
+        # Measured HERE, back to back with the candidate's cost loop above
+        # and BEFORE the quality walk, so nothing expensive sits between
+        # the two halves of the pair. Same executable path (see
+        # `_do_compile_paired_ref`), same eval args, same points x reps,
+        # same inner-reps, same warmup, same median: `_campaign_measure_cost`
+        # is `_time_one_rep` in a loop, exactly like the loop above. The
+        # static temp is read off the reference executable the same way
+        # `_record_mem_parity` reads the candidate's.
+        _ref_lat_ns = 0.0
+        _ref_peak = 0.0
+        _ref_temp = None
+        if _paired:
+            _pf("cb.exec_measure")
+            _ref_ex = cached_compile(
+                b"paired-ref:" + paired_ref_key, _do_compile_paired_ref)
+            _ref_lat_ns, _ref_peak = _campaign_measure_cost(
+                _ref_ex, eval_args_all, unique_devices, _inner, _warmup,
+                n_reps)
+            _ref_temp = _static_temp_bytes(_ref_ex)
+            _pf("cb.paired_ref")
 
         # ---- LOSS-DROP QUALITY ------------------------------------------
         # ONE walk per PLAN (not per data point): the probe batch is fixed
@@ -6360,53 +6320,63 @@ def _callback(
         cosine_sim = 0.0
         frob_residual = 0.0
 
-    # ---- ADDITIVE QUALITY GATE (owner 2026-08-09): see
-    # _apply_quality_gate. Fires only when quality was MEASURED this
-    # step (terminal + cosines non-empty) and fell below the env-var
-    # threshold; clamps the two campaign cost channels to the
-    # exact-reverse reference so destruction has no cost advantage.
-    def _gate_order_floor():
-        # LAZY: only clamped plans pay this compile+measure. `_order_floor`
-        # memoises on `exact_cache_key`, which digests exactly (order, arg
-        # shapes/dtypes, device) -- everything the exact executable's cost
-        # depends on -- so a repeat offender order is measured ONCE per
-        # process, not once per clamp.
-        return _order_floor(
-            exact_cache_key,
-            lambda: cached_compile(b"exact:" + exact_cache_key,
-                                   _do_compile_exact),
-            # THE SAME INSTRUMENT as the plan being floored: same eval
-            # args, same points x reps, same inner-reps, same warmup,
-            # same median.
-            lambda _ex: _campaign_measure_cost(
-                _ex, eval_args_all, unique_devices, _inner, _warmup, n_reps),
-            legacy_measure_fn=lambda _ex: _measure_exec_cost(
-                _ex, list(args_for_lower)),
-        )
-
-    def _gate_ref_measure(_ex):
-        # Global rev fallback, timed by the campaign instrument too, so
-        # the fail-open path cannot reintroduce the mismatch.
-        return _campaign_measure_cost(
-            _ex, eval_args_all, unique_devices, _inner, _warmup, n_reps)
-    # ``args_for_lower`` (not ``args``): the global rev fallback must be
-    # lowered onto the SAME device the plans are measured on, or the
-    # fail-open floor is a CPU timing clamped onto GPU plans -- a second
-    # instrument mismatch in the same clamp. Identical object whenever
-    # --exec-on-gpu is off.
-    latency_ns, peak_memory = _apply_quality_gate(
-        latency_ns, peak_memory, cosine_sim, is_terminal,
-        bool(cosines), config, list(args_for_lower),
-        order_floor_fn=_gate_order_floor,
-        ref_measure_fn=_gate_ref_measure)
+    # ---- THE COST FORM (ticket .9): see `_PAIRED_REF` and
+    # `paired_log_costs`. Under ``absolute`` the two slots below carry the
+    # measured numbers exactly as before (the flag-off bit-identity arm).
+    if cost_form() == "paired-log":
+        if _paired:
+            # The reference's memory is the SAME quantity as the candidate's
+            # (ticket .49): static temp under --mem-channel temp, the
+            # runtime watermark (or its static substitution) otherwise.
+            if mem_channel() == "temp":
+                if _ref_temp is None:
+                    raise MemChannelFault(
+                        "paired reference: memory_analysis() returned "
+                        "nothing for the rev-exact executable, so its static "
+                        "temp bytes cannot be read")
+                _ref_mem = float(_ref_temp)
+            else:
+                _ref_mem = float(_ref_peak)
+            # Same fake-fast clamp the candidate's latency got above, so a
+            # zero-work reference cannot make the pair implausible either.
+            if 0.0 < _ref_lat_ns < _LAT_FLOOR_NS:
+                _ref_lat_ns = _LAT_FLOOR_NS
+            if not config.measure_latency:
+                _ref_lat_ns = 0.0
+            _abs_lat, _abs_mem = latency_ns, peak_memory
+            latency_ns, peak_memory, _n_floored = paired_log_costs(
+                _abs_lat, _abs_mem, _ref_lat_ns, _ref_mem)
+            _paired_ref_rec = {
+                # POSITIVE units (ticket .45 logs these as ref/*).
+                "latency_ns": float(_ref_lat_ns),
+                "temp_bytes": _ref_temp,
+                "watermark_bytes": float(_ref_peak),
+                "memory_bytes": float(_ref_mem),
+                "mem_channel": mem_channel(),
+                "candidate_latency_ns": float(_abs_lat),
+                "candidate_memory_bytes": float(_abs_mem),
+                "delta_latency": float(latency_ns),
+                "delta_memory": float(peak_memory),
+                "mem_floored": int(_n_floored),
+                "order": list(_rev_order),
+            }
+            _record_paired_ref(_paired_ref_rec)
+            if os.environ.get("ALPHAGRAD_DEBUG_MEASURE", "0") == "1":
+                print(f"[paired-ref] rev-exact lat={_ref_lat_ns/1e3:.1f}us "
+                      f"mem={_ref_mem:.0f}B | candidate "
+                      f"lat={_abs_lat/1e3:.1f}us mem={_abs_mem:.0f}B | "
+                      f"Delta_lat={latency_ns:+.4f} Delta_mem={peak_memory:+.4f}"
+                      f" floored={_n_floored}", flush=True)
+        else:
+            latency_ns, peak_memory = 0.0, 0.0
     _pf("cb.quality")
 
     # ------------------------------------------------------------------
     # FIDELITY -- reward slot 8. See the block comment above `fidelity_enabled`.
     # ------------------------------------------------------------------
     # Runs AFTER the cost measurement (so nothing it does is inside a timing
-    # or peak-memory window) and after the quality gate (so a clamped plan is
-    # still scored). Until 2026-09-03 this block also ran the gradient-
+    # or peak-memory window; until 2026-09-04 also after the quality gate,
+    # so a clamped plan was still scored). Until 2026-09-03 this block also ran the gradient-
     # coverage census and the frozen-gradient HARD GUARD on the same exact
     # reference; both were removed by owner ruling (ticket dsnn-3qm.15).
     fidelity = 0.0
@@ -6587,7 +6557,7 @@ def _callback(
             reward_vec=_reward_slots,
             face_before=_plan_pf0, face_after=_PER_FACE_STATS,
             counts_from_trace=bool(_plan_traced[0]),
-            mem_parity=_mp)
+            mem_parity=_mp, paired_ref=_paired_ref_rec)
 
     return tokens, eqn_ids, rewards
 
