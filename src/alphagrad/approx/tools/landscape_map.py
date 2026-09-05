@@ -1110,7 +1110,11 @@ def measure(env, eval_samples, order, plan):
     wall = time.perf_counter() - t0
     r = np.asarray(reward, dtype=np.float64)
     st = consume_per_face_stats()
-    m_parity = consume_mem_parity()
+    # Ticket .49 made the drain return {"records", "measured", "dropped"};
+    # the plan's own record is the last TERMINAL one (the paired reference
+    # writes its own, non-terminal record beside it).
+    m_parity = [rec for rec in consume_mem_parity()["records"]
+                if rec.get("terminal", True)]
 
     static_temp = 0.0
     runtime_watermark = float(-r[REWARD_INDEX["peak_memory"]])
