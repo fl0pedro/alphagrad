@@ -41,7 +41,11 @@ def test_no_rendered_launcher_mentions_the_deleted_env_var(gen):
         text = gen.render(a)
         assert "NEW_SLOT_JOIN" not in text, a["name"]
         if a["kind"] == "train":
-            assert "  --approx-old same\n" in text, a["name"]
+            # Every training arm NAMES the old edge; the campaign's paired
+            # pair (ticket .43) carries exact on one of the two.
+            val = dict(gen._merge_cli(a.get("cli", {})))["--approx-old"]
+            assert val in gen.APPROX_OLD_CONFIGS, (a["name"], val)
+            assert f"  --approx-old {val}\n" in text, a["name"]
 
 
 def _train_arm(gen, **cli):
