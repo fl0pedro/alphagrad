@@ -817,6 +817,18 @@ def configure_symlog(args) -> str:
     # mask-is-bit-identical caveat.
     if float(getattr(args, "sparsity_weight", 0.0) or 0.0) != 0.0:
         _exempt = _exempt + (int(REWARD_INDEX["sparsity"]),)
+    # THE QUALITY FLOOR (ticket .9): the hinge channel is bounded like the
+    # lagrangian violation slot and needs the same carve-out, for the same
+    # reason (symlog would discount the per-unit price of a shortfall).
+    if getattr(args, "quality_floor", None) is not None:
+        _exempt = _exempt + (int(REWARD_INDEX["cosine_sim"]),)
+    # THE COST FORM (ticket .9): a paired log-difference is already O(1)
+    # and already logarithmic; symlog on top would bend it a second time.
+    # Both conditional, so the flag-off mask stays bit-identical to HEAD.
+    if getattr(args, "cost_form", "absolute") == "paired-log":
+        _exempt = _exempt + (int(REWARD_INDEX["latency_ns"]),
+                             int(REWARD_INDEX["peak_memory"]))
+    _exempt = tuple(dict.fromkeys(_exempt))
     _set_no_symlog_indices(_exempt)
     return mode
 
@@ -992,6 +1004,57 @@ def _apply_lagrangian_channels(rewards: "jax.Array", lag_tau: float) -> "jax.Arr
     viol = _lag_violation(q_raw, lag_tau)
     chan = jnp.where(terminal, -viol, 0.0)
     return rewards.at[..., REWARD_INDEX["cosine_sim"]].set(chan)
+
+
+def _apply_quality_floor(rewards: "jax.Array", tau: float) -> "jax.Array":
+    """``--quality-floor tau`` (ticket dsnn-3qm.9): slot 6 = the HINGE.
+
+    The TERMINAL step carries ``-max(0, tau - q)`` in the quality slot in
+    place of the raw quality ``q``; every other step 0 (sparse-terminal
+    quality, the same masking `_apply_lagrangian_channels` uses). Exactly
+    zero for every plan at or above the floor -- plans at q = 0.95 and
+    q = 0.999 are then compared on cost alone -- and the linear shortfall
+    below it. No clip: quality is grad-cosine, bounded in [-1, 1] by
+    construction, and the ruling is the plain hinge (finding 53). The cost
+    channels pass through untouched, so this composes with any preference
+    over the heads (arm P1) and with --cost-form. The dual-ascent arm L
+    keeps `_apply_lagrangian_channels` (its clip at q_eff = -0.5 is the
+    loss_drop diverged-sentinel convention) with tau supplied by this flag.
+    """
+    terminal = jnp.zeros(rewards.shape[:2], dtype=bool).at[:, -1].set(True)
+    q_raw = rewards[..., REWARD_INDEX["cosine_sim"]]
+    hinge = -jnp.maximum(0.0, jnp.float32(tau) - q_raw)
+    chan = jnp.where(terminal, hinge, 0.0)
+    return rewards.at[..., REWARD_INDEX["cosine_sim"]].set(chan)
+
+
+def _lag_preferences(sampled_pref: "jax.Array", head_weights_np: np.ndarray,
+                     lag_lambda: float, conditioned: bool) -> "jax.Array":
+    """The per-env preference under ``--reward-mode lagrangian``.
+
+    lambda enters the update HERE and ONLY here: the quality slot of the
+    advantage-scalarization preference (the channel stores -violation, so
+    the weight is +lambda; see `_apply_lagrangian_channels`).
+
+    ``conditioned=False`` (the pre-.9 path, bit-identical): the static
+    --lambda-cmp / --lambda-mem weights with lambda in the quality slot,
+    broadcast to every env. ``conditioned=True`` (arm L, ticket .9 lifted
+    the exclusion this far): each env's Dirichlet sample over the three
+    heads is restricted to the two COST heads -- the quality coordinate is
+    dropped and the two cost coordinates renormalised to sum to 1, which is
+    a Dirichlet over (latency, memory) with the same concentrations -- and
+    lambda is written into the quality slot. The policy is conditioned on
+    the resulting vector, lambda included: the 2-D front at a fixed floor,
+    priced by dual ascent (finding 53, arm L).
+    """
+    _pq = HEAD_NAMES.index("quality")
+    if not conditioned:
+        _lagp = np.array(head_weights_np, dtype=np.float32, copy=True)
+        _lagp[_pq] = np.float32(lag_lambda)
+        return jnp.broadcast_to(jnp.asarray(_lagp), sampled_pref.shape)
+    _cost = sampled_pref.at[:, _pq].set(0.0)
+    _cost = _cost / jnp.maximum(jnp.sum(_cost, axis=-1, keepdims=True), 1e-8)
+    return _cost.at[:, _pq].set(jnp.float32(lag_lambda))
 
 
 def _lag_dual_ascent(lam: float, mean_violation: float, eta: float,
@@ -4164,7 +4227,8 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--lag-tau", type=float, default=0.75,
                    help="lagrangian mode: quality constraint threshold; the "
-                   "violation channel is max(0, tau - clip(q, -0.5, 1)).")
+                   "violation channel is max(0, tau - clip(q, -0.5, 1)). "
+                   "--quality-floor, when given, sets it (ticket .9).")
     p.add_argument("--lag-eta", type=float, default=0.05,
                    help="lagrangian mode: dual-ascent step size on lambda "
                    "(once per episode, from the episode's measured "
@@ -4501,6 +4565,39 @@ def make_argparser() -> argparse.ArgumentParser:
         "(env.mem_channel); this flag is the only control. --mem-type "
         "still selects WHICH slot --lambda-mem weights; this flag selects "
         "what slot 5 holds.",
+    )
+    p.add_argument(
+        "--cost-form",
+        choices=["absolute", "paired-log"],
+        default="paired-log",
+        help="THE COST FORM (ticket dsnn-3qm.9): HOW reward slots 2 "
+        "(latency_ns) and 5 (peak_memory) are expressed. paired-log (the "
+        "DEFAULT, the campaign form): every terminal measurement also "
+        "measures REV-EXACT -- reverse order, every face None -- in the same "
+        "measure actor, back to back, warm, through the same executable path "
+        "and the same instrument, and the slot carries -(log cost(candidate) "
+        "- log cost(rev-exact)); rev-exact scores 0, a cheaper plan scores "
+        "above 0, and GPU-state drift cancels. Both cost slots are then "
+        "exempt from symlog (a log-difference needs no compression). The "
+        "static-temp floor under log() is one byte (env._MEM_LOG_FLOOR_BYTES). "
+        "absolute: the measured number, negated -- the pre-.9 form, kept for "
+        "the flag-off bit-identity gate (ALPHAGRAD_EQ_DUMP). Published as "
+        "ALPHAGRAD_COST_FORM before ray.init (env.cost_form is the one "
+        "reader); this flag is the only control. The reference is drained "
+        "per episode and logged as ref/latency_ns and ref/temp_bytes.",
+    )
+    p.add_argument(
+        "--quality-floor", type=float, default=None,
+        help="THE QUALITY FLOOR tau (ticket dsnn-3qm.9): with this set, "
+        "reward slot 6 carries -max(0, tau - q) instead of raw quality q "
+        "(grad-cosine), on the terminal step -- exactly 0 for every plan at "
+        "or above the floor, the linear shortfall below it. tau is the "
+        "boundary of the feasible set, not a reward shift. A channel option, "
+        "independent of --reward-mode: under additive it composes with "
+        "--preference-conditioned (arm P1); under lagrangian it IS the "
+        "constraint threshold (it sets --lag-tau, arm L). Refused under "
+        "--reward-mode mult. Off by default (arm P0: raw quality). Replaces "
+        "the deleted cost clamp ALPHAGRAD_QUALITY_GATE_MIN.",
     )
     p.add_argument(
         "--walk-steps", type=int, default=200,
@@ -6302,6 +6399,16 @@ def main():
     # THE MEMORY CHANNEL (ticket .49), same transport, same reason: the
     # measure actors run env._callback in their own processes and
     # env.mem_channel is the one reader. The flag is the only control.
+    # THE COST FORM (ticket .9), same transport, same reason: env.cost_form
+    # is the one reader; the paired reference is measured inside the actors.
+    os.environ["ALPHAGRAD_COST_FORM"] = str(args.cost_form)
+    print(f"[alphagrad] cost form (reward slots 2 and 5, --cost-form) = "
+          f"{args.cost_form}"
+          + (" (paired log-difference against rev-exact, measured beside "
+             "every terminal plan; rev-exact scores 0)"
+             if args.cost_form == "paired-log"
+             else " (absolute measured numbers, negated; the pre-.9 form)"),
+          flush=True)
     os.environ["ALPHAGRAD_MEM_CHANNEL"] = str(args.mem_channel)
     print(f"[alphagrad] memory channel (reward slot 5, --mem-channel) = "
           f"{args.mem_channel}"
@@ -7449,14 +7556,32 @@ def main():
                 "(--loss-mode multi_head): lambda is an advantage-"
                 "scalarization weight over per-channel advantages.")
         if args.preference_conditioned:
-            raise ValueError(
-                "--reward-mode lagrangian drives the quality preference "
-                "slot with the dual variable lambda; "
-                "--preference-conditioned (Dirichlet preference sampling) "
-                "would overwrite it every episode. Pick one.")
+            # Arm L (ticket .9): the Dirichlet preference is restricted to
+            # the two cost heads and lambda takes the quality slot every
+            # episode (see _lag_preferences). Until 2026-09-04 this was
+            # refused ("pick one").
+            print("[cfg] lagrangian + preference-conditioned: Dirichlet over "
+                  "(latency, memory) only; the quality preference IS lambda.",
+                  flush=True)
         head_reward_weights_np[HEAD_NAMES.index("quality")] = np.float32(
             args.lag_init)
         head_reward_weights = jnp.asarray(head_reward_weights_np, dtype=jnp.float32)
+    if args.quality_floor is not None:
+        # THE QUALITY FLOOR (ticket .9): a channel option. Under additive it
+        # rewrites slot 6 to the hinge (_apply_quality_floor); under
+        # lagrangian it IS the constraint threshold, so it sets --lag-tau
+        # (one tau, one hinge, the existing dual-ascent machinery). mult
+        # replaces every channel with its own gated scalar: no slot to floor.
+        if args.reward_mode == "mult":
+            raise ValueError(
+                "--quality-floor has no channel to act on under "
+                "--reward-mode mult (the mult gate replaces the channels).")
+        if args.reward_mode == "lagrangian":
+            args.lag_tau = float(args.quality_floor)
+        print(f"[cfg] quality floor tau={float(args.quality_floor):g}: reward "
+              f"slot 6 = -max(0, tau - q) on the terminal step"
+              + (" (sets --lag-tau; lambda by dual ascent)"
+                 if args.reward_mode == "lagrangian" else ""), flush=True)
 
     # Per-(vertex, pair, factor) validity mask. The legacy mask filtered
     # out factors that didn't divide the relevant axis sizes. With
@@ -9623,6 +9748,10 @@ def main():
             # lambda enters ONLY via traj.preference at the advantage
             # scalarization below -- value targets stay lambda-free.
             traj_reward = _apply_lagrangian_channels(traj_reward, args.lag_tau)
+        elif args.quality_floor is not None:
+            # --quality-floor under additive (arm P1, ticket .9): the same
+            # additive composition, the quality slot rewritten to the hinge.
+            traj_reward = _apply_quality_floor(traj_reward, args.quality_floor)
         sl_reward = _symlog_rewards(traj_reward)  # (E, T, NUM_REWARDS)
         if args.loss_mode == "scalar":
             scalar_reward = jnp.sum(sl_reward * reward_weights, axis=-1)  # (E, T)
@@ -10574,6 +10703,7 @@ def main():
     pareto_archive = ParetoArchive(
         obj_names=(args.cmp_type, args.mem_type, "cosine_sim"),
         obj_idx=(cmp_idx, mem_idx, cosine_idx),
+        quality_floor=args.quality_floor,
     )
     elim_order_table = wandb.Table(columns=["episode", "return", "elimination order"])
     pbar = tqdm(total=args.episodes)
@@ -10743,6 +10873,8 @@ def main():
         else:
             _live_env = np.ones((all_rets.shape[0],), dtype=bool)
         _any_live = bool(_live_env.any())
+        _paired_costs = (
+            getattr(args, "cost_form", "absolute") == "paired-log")
         if _any_live:
             mean_r = np.asarray(
                 all_rets[_live_env].mean(axis=0), dtype=np.float64)
@@ -10790,11 +10922,20 @@ def main():
             # carried by frob in the reward; the collapse guard's job is only
             # to reject rows whose COSTS are degenerate (a zeroed computation
             # reports zero cost and would otherwise be crowned "best").
-            collapsed = bool(
-                rets[cmp_idx] >= 0.0
-                or rets[mem_idx] >= 0.0
-                or (measure_latency and rets[REWARD_INDEX["latency_ns"]] >= 0.0)
-            )
+            # Under --cost-form paired-log (ticket .9) slots 2 and 5 are
+            # log-differences: a plan cheaper than rev-exact scores ABOVE
+            # 0 and rev-exact itself scores exactly 0, so the sign carries
+            # no degeneracy. There, a row is collapsed only when it is a
+            # sentinel (the LIVE mask above).
+            if _paired_costs:
+                collapsed = not bool(_live_env[i])
+            else:
+                collapsed = bool(
+                    rets[cmp_idx] >= 0.0
+                    or rets[mem_idx] >= 0.0
+                    or (measure_latency
+                        and rets[REWARD_INDEX["latency_ns"]] >= 0.0)
+                )
             if collapsed:
                 n_collapsed_this_ep += 1
                 continue
@@ -10833,7 +10974,7 @@ def main():
         weighted_sums = np.sum(all_rets * weights, axis=-1)
         eligible = np.array(
             [
-                not (
+                bool(_live_env[i]) if _paired_costs else not (
                     all_rets[i][cmp_idx] >= 0.0
                     or all_rets[i][mem_idx] >= 0.0
                     or (
@@ -11054,8 +11195,14 @@ def main():
         if true_return is not None:
             log_dict["scalarized_return"] = float(true_return)
             for j, name in enumerate(REWARD_NAMES):
+                _mj = float(mean_r[j]) if j < len(mean_r) else 0.0
+                # COST CHANNELS ARE LOGGED AS THE COST (owner ruling,
+                # finding 53 Q2, ticket .9): the slots stay stored negated,
+                # the panel shows the positive number -- latency in ns and
+                # bytes under --cost-form absolute, the log-difference
+                # against rev-exact (positive = costlier) under paired-log.
                 log_dict[f"mean_{name}"] = (
-                    float(mean_r[j]) if j < len(mean_r) else 0.0)
+                    0.0 - _mj if j in COMPUTE_REWARD_INDICES else _mj)
 
         # ---- per-channel measurement stats (spec P2) ------------------------
         # best / mean / median / worst per channel, for THIS episode and
@@ -11328,7 +11475,8 @@ def main():
             from alphagrad.approx.env import (
                 MeasureToolchainFault as _MeasureToolchainFault,
                 check_mem_parity_complete as _mp_check,
-                mem_parity_summary as _mp_summary)
+                mem_parity_summary as _mp_summary,
+                paired_ref_summary as _pr_summary)
             try:
                 from alphagrad.approx.common.plan_log import (
                     append_records as _plog_append)
@@ -11355,6 +11503,11 @@ def main():
                 _plog_mp.setdefault("measured", 0)
                 _plog_mp.setdefault("dropped", 0)
                 _plog_mp["records"] = list(_plog_mp["records"])
+                # THE PAIRED REFERENCE (ticket .9): same drain, same trap.
+                _plog_pr = list(
+                    (_plog_local.get("paired_ref") or {}).get("records", ()))
+                _plog_pr_dropped = int(
+                    (_plog_local.get("paired_ref") or {}).get("dropped", 0))
                 try:
                     from alphagrad.approx.common.measure_pool import (
                         merge_pool_plan_records as _plog_merge)
@@ -11375,6 +11528,9 @@ def main():
                         _plog_mp_pool.get("measured", 0))
                     _plog_mp["dropped"] += int(
                         _plog_mp_pool.get("dropped", 0))
+                    _plog_pr_pool = _plog_pool.get("paired_ref") or {}
+                    _plog_pr.extend(_plog_pr_pool.get("records", ()))
+                    _plog_pr_dropped += int(_plog_pr_pool.get("dropped", 0))
                     _plog_why = (
                         f" pool={bool(_plog_pool.get('have_pool'))}"
                         f" actors_seen={_plog_pool.get('actors_seen')}"
@@ -11426,6 +11582,23 @@ def main():
                     log_dict[f"measure/mem_parity/{_mp_k}"] = _mp_v
                 log_dict["measure/mem_parity/measured"] = int(
                     _plog_mp["measured"])
+                # THE PAIRED REFERENCE, per episode (ticket .9; .45 logs
+                # these): rev-exact's latency and static temp in POSITIVE
+                # units, how many references were measured, and how many
+                # memory readings the log floor replaced. Absent under
+                # --cost-form absolute (no reference is measured).
+                if _plog_pr or _plog_pr_dropped:
+                    _prs = _pr_summary(_plog_pr)
+                    log_dict["ref/latency_ns"] = _prs["latency_ns"]
+                    log_dict["ref/temp_bytes"] = _prs["temp_bytes"]
+                    log_dict["ref/watermark_bytes"] = _prs["watermark_bytes"]
+                    log_dict["ref/n"] = int(_prs["n"])
+                    log_dict["ref/mem_floored"] = int(_prs["mem_floored"])
+                    log_dict["ref/dropped"] = int(_plog_pr_dropped)
+                    print(f"[paired-ref ep{ep}] n={_prs['n']} "
+                          f"latency_ns={_prs['latency_ns']:.4g} "
+                          f"temp_bytes={_prs['temp_bytes']:.4g} "
+                          f"mem_floored={_prs['mem_floored']}", flush=True)
                 # PRINTED, NOT ONLY LOGGED. A run whose plan log silently
                 # stays empty -- which is exactly what a pooled run did
                 # before this line existed -- is indistinguishable from a
@@ -12435,10 +12608,9 @@ def main():
             # _apply_lagrangian_channels for the sign convention). Same
             # shape/dtype every episode: updating lambda never retriggers
             # a compile.
-            _lagp = np.array(head_reward_weights_np, dtype=np.float32, copy=True)
-            _lagp[HEAD_NAMES.index("quality")] = np.float32(lag_lambda)
-            preferences_per_env = jnp.broadcast_to(
-                jnp.asarray(_lagp), (num_envs, NUM_VALUE_HEADS))
+            preferences_per_env = _lag_preferences(
+                preferences_per_env, head_reward_weights_np, lag_lambda,
+                bool(args.preference_conditioned))
 
         eval_samples = generate_eval_samples(env, ep_eval_key, args.num_eval_samples)
         env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)

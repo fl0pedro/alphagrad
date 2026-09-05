@@ -134,9 +134,15 @@ class ParetoArchive:
         obj_idx:   indices into the full reward_vec for those channels.
     """
 
-    def __init__(self, obj_names, obj_idx):
+    def __init__(self, obj_names, obj_idx, quality_floor=None):
         self.obj_names = list(obj_names)
         self.obj_idx = [int(i) for i in obj_idx]
+        # THE QUALITY FLOOR tau (ticket dsnn-3qm.9, --quality-floor): a
+        # candidate below it is INFEASIBLE and never a usable Pareto point
+        # -- its cost was obtained by not computing the gradient. None (the
+        # default) admits every non-dominated candidate.
+        self.quality_floor = (None if quality_floor is None
+                              else float(quality_floor))
         self.pts: list[np.ndarray] = []          # live front objective vectors
         self.seqs: list = []                     # parallel sequences
         # Episode at which each LIVE front point was admitted. Parallel to
@@ -165,22 +171,18 @@ class ParetoArchive:
         # and would spuriously dominate the front + inflate the HV box).
         if np.any(g == _SENTINEL_OBJ_VALUE) or not np.any(g != 0.0):
             return False
-        # QUALITY GATE AT INSERTION (sibling audit 2026-08-10): the reward
-        # gate never guarded the archive, so destroyed plans (quality 0.0)
-        # sat on the front as fake best-cost points on BOTH arms. A
-        # sub-gate candidate is not a usable Pareto point -- its cost was
-        # obtained by not computing the gradient. Uses the same env var as
-        # the reward gate; unset/0 keeps the historical behaviour.
-        import os as _os
-        try:
-            _qmin = float(_os.environ.get(
-                "ALPHAGRAD_QUALITY_GATE_MIN", "0") or 0.0)
-        except ValueError:
-            _qmin = 0.0
-        if _qmin > 0.0:
+        # QUALITY FLOOR AT INSERTION (sibling audit 2026-08-10; the env var
+        # ALPHAGRAD_QUALITY_GATE_MIN it read until 2026-09-04 is deleted,
+        # ticket .9 -- the floor is the --quality-floor argument now): the
+        # reward never guarded the archive, so destroyed plans (quality 0.0)
+        # sat on the front as fake best-cost points on BOTH arms. An
+        # infeasible candidate is not a usable Pareto point -- its cost was
+        # obtained by not computing the gradient. None keeps the historical
+        # behaviour.
+        if self.quality_floor is not None:
             for _k, _nm in enumerate(self.obj_names):
                 if "cos" in _nm or "quality" in _nm:
-                    if g[_k] < _qmin:
+                    if g[_k] < self.quality_floor:
                         return False
                     break
         for p in self.pts:

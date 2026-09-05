@@ -130,10 +130,11 @@ class _Delete:
     """Sentinel: an arm sets a key to _DELETE to REMOVE it, in `cli` or `env`.
 
     Deleting an inherited env var is not cosmetic.  SHARED_ENV is the
-    TRAINING stack; a measurement arm that silently inherits
-    ALPHAGRAD_QUALITY_GATE_MIN=0.05 has its cost channels FLOORED at the
-    exact-reverse reference for every plan scoring below 0.05 quality --
-    which for a SKIP sweep is precisely the plans being measured.
+    TRAINING stack; a measurement arm that silently inherited
+    ALPHAGRAD_QUALITY_GATE_MIN=0.05 (deleted 2026-09-04, ticket .9) had its
+    cost channels FLOORED at the exact-reverse reference for every plan
+    scoring below 0.05 quality -- which for a SKIP sweep is precisely the
+    plans being measured.
     """
 
 
@@ -178,9 +179,11 @@ SHARED_ENV = [
     # approximations are learned.  Read at IMPORT time in
     # common/masks.py:148 -- it must be exported before python starts.
     ("ALPHAGRAD_FORCE_REV_ORDER", "1"),
-    # The additive quality gate.  Plans below qmin pay the exact-rev reference
-    # cost, so the SKIP cliff earns nothing.
-    ("ALPHAGRAD_QUALITY_GATE_MIN", "0.05"),
+    # The additive quality gate (ALPHAGRAD_QUALITY_GATE_MIN=0.05: plans below
+    # qmin paid the exact-rev reference cost, so the SKIP cliff earned nothing)
+    # was DELETED on 2026-09-04 (ticket dsnn-3qm.9). Its replacement is the
+    # --quality-floor argument (a hinge on the quality channel, not a clamp on
+    # the cost channels); ticket .43 puts it into the campaign CLI.
     # K=1 is both the most predictive and the cheapest (949f1af); K>1 is
     # strictly worse.  Named here so no arm inherits a stale export.
     ("ALPHAGRAD_GRAD_COSINE_K", "1"),
@@ -1157,22 +1160,21 @@ arm(
         # case -- a SKIP-only plan writes no rule into any slot.
         #
         # ---- DROPPED FROM THE TRAINING STACK -----------------------------
-        # SHARED_ENV describes ppo.py.  Two of these do not merely add noise
-        # to a measurement arm, they CHANGE THE NUMBER, and the hand-written
-        # launcher this arm replaces set neither:
+        # SHARED_ENV describes ppo.py.  One of these does not merely add noise
+        # to a measurement arm, it CHANGES THE NUMBER, and the hand-written
+        # launcher this arm replaces did not set it:
         #
-        # QUALITY_GATE_MIN: defaults to 0 = gate OFF.  At 0.05 the additive
-        #   quality gate FLOORS latency_ns and peak_memory at the exact-rev
-        #   reference for any plan scoring below 0.05.  A singleton SKIP
-        #   sweep exists to price exactly those plans, so inheriting this
-        #   would silently replace the measurement with the reference cost.
+        # (QUALITY_GATE_MIN used to be the second: at 0.05 the additive
+        #   quality gate FLOORED latency_ns and peak_memory at the exact-rev
+        #   reference for any plan scoring below 0.05, and a singleton SKIP
+        #   sweep exists to price exactly those plans.  The variable and the
+        #   gate were deleted on 2026-09-04, ticket dsnn-3qm.9.)
         # BATCHED_CALLBACK: defaults to 0.  At 1 env._callback takes the
         #   batched host path -- a different measurement path from the one
         #   every archived row was measured on.
         #
         # The rest are trainer-only and have no meaning here: there is no
         # policy, no actor pool and no episode loop in landscape_map.
-        "ALPHAGRAD_QUALITY_GATE_MIN": _DELETE,
         "ALPHAGRAD_BATCHED_CALLBACK": _DELETE,
         "ALPHAGRAD_FORCE_REV_ORDER": _DELETE,
         "ALPHAGRAD_POLICY": _DELETE,

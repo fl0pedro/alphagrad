@@ -208,7 +208,10 @@ def merge_pool_plan_records(pool) -> dict:
            "toolchain_ok": True,
            # Memory parity (ticket .49): the actors' (temp, watermark)
            # records and the counts `env.check_mem_parity_complete` compares.
-           "mem_parity": {"records": [], "measured": 0, "dropped": 0}}
+           "mem_parity": {"records": [], "measured": 0, "dropped": 0},
+           # The paired rev-exact reference (ticket .9): one record per
+           # reference measurement the actors took.
+           "paired_ref": {"records": [], "dropped": 0}}
     try:
         import ray as _ray
         actors = list(pool.live_actors()) if pool is not None else []
@@ -234,6 +237,9 @@ def merge_pool_plan_records(pool) -> dict:
         out["mem_parity"]["records"].extend(_mp.get("records", ()))
         out["mem_parity"]["measured"] += int(_mp.get("measured", 0))
         out["mem_parity"]["dropped"] += int(_mp.get("dropped", 0))
+        _pr = (_s or {}).get("paired_ref") or {}
+        out["paired_ref"]["records"].extend(_pr.get("records", ()))
+        out["paired_ref"]["dropped"] += int(_pr.get("dropped", 0))
         out["compile_fallbacks"] += int(
             (_s or {}).get("compile_fallbacks", 0))
         out["compile_fallbacks_total"] += int(
