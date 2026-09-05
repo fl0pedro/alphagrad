@@ -30,8 +30,13 @@ on a toy scalar-loss target (no TLM, no data generator, CPU):
    ``MemChannelFault``, which rides the toolchain-fault escalation.
 
 5. The plan-log record carries ``mem_channel`` / ``mem_temp_bytes`` /
-   ``mem_watermark_bytes``, and the quality gate refuses to clamp a static
-   temp with a watermark floor.
+   ``mem_watermark_bytes``. (Until 2026-09-04 this item also pinned that the
+   quality gate refused to clamp a static temp with a watermark floor; the
+   gate was deleted, ticket dsnn-3qm.9.)
+
+This module measures under the ABSOLUTE cost form (the default when
+ALPHAGRAD_COST_FORM is absent): slot 5 IS the temp. The paired-log form is
+tests/paired_log_reward_test.py's.
 """
 from __future__ import annotations
 
@@ -48,7 +53,7 @@ os.environ["ALPHAGRAD_QUALITY_METRIC"] = "none"
 os.environ["ALPHAGRAD_DIRECT_MEASURE"] = "1"
 os.environ.pop("ALPHAGRAD_PLAN_LOG", None)
 os.environ.pop("ALPHAGRAD_MEM_CHANNEL", None)
-os.environ.pop("ALPHAGRAD_QUALITY_GATE_MIN", None)
+os.environ.pop("ALPHAGRAD_COST_FORM", None)
 
 import jax                                                      # noqa: E402
 import jax.numpy as jnp                                         # noqa: E402
@@ -272,7 +277,7 @@ def test_a_measured_plan_without_a_record_is_a_fault():
 
 
 # --------------------------------------------------------------------------
-# 5. the plan-log record and the quality-gate guard
+# 5. the plan-log record
 # --------------------------------------------------------------------------
 
 def test_plan_log_record_carries_both_memory_numbers(channel, monkeypatch):
@@ -293,22 +298,7 @@ def test_plan_log_record_carries_both_memory_numbers(channel, monkeypatch):
     assert len(term) == 1
     assert term[0]["static_temp_bytes"] == rec["mem_temp_bytes"]
     assert term[0]["runtime_peak_bytes"] == rec["mem_watermark_bytes"]
-
-
-def test_quality_gate_refuses_to_clamp_a_temp_with_a_watermark_floor(
-        monkeypatch):
-    monkeypatch.setenv("ALPHAGRAD_QUALITY_GATE_MIN", "0.5")
-    floor = lambda: (1.0e6, 2.0e6)          # (latency_ns, watermark bytes)
-    monkeypatch.setenv("ALPHAGRAD_MEM_CHANNEL", "watermark")
-    lat, mem = envmod._apply_quality_gate(
-        10.0, 20.0, 0.1, True, True, None, [], order_floor_fn=floor)
-    assert (lat, mem) == (1.0e6, 2.0e6)     # the pre-.49 clamp, untouched
-    monkeypatch.setenv("ALPHAGRAD_MEM_CHANNEL", "temp")
-    with pytest.raises(MemChannelFault, match="watermark"):
-        envmod._apply_quality_gate(
-            10.0, 20.0, 0.1, True, True, None, [], order_floor_fn=floor)
-    # Gate disarmed: both channels pass through unchanged.
-    monkeypatch.setenv("ALPHAGRAD_QUALITY_GATE_MIN", "0")
-    assert envmod._apply_quality_gate(
-        10.0, 20.0, 0.1, True, True, None, [], order_floor_fn=floor
-    ) == (10.0, 20.0)
+    # Absolute form: no reference was measured, and the record says so.
+    assert rec["cost_form"] == "absolute"
+    assert rec["ref_temp_bytes"] is None
+    assert out["paired_ref"] == {"records": [], "dropped": 0}
