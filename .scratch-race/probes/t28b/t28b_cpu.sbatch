@@ -29,14 +29,15 @@ echo "[t28b] job=$SLURM_JOB_ID host=$(hostname -s) example=$EXAMPLE dataset=$DAT
 grep -qx "home = $STACK/uv-python/bin" "$STACK/venv/pyvenv.cfg" || sed -i "s|^home = .*|home = $STACK/uv-python/bin|" "$STACK/venv/pyvenv.cfg"
 export PY=$STACK/venv/bin/python
 export PATH=$STACK/venv/bin:$STACK/uv-python/bin:/usr/local/bin:/usr/bin:/bin
-export PYTHONPATH=$T57/agents/t28b-graphax/src:$T57/agents/t28b-alphagrad/src
+GXC=${GXC:-t28b-graphax}
+export PYTHONPATH=$T57/agents/$GXC/src:$T57/agents/t28b-alphagrad/src
 export PYTHONDONTWRITEBYTECODE=1
 export JAX_PLATFORMS=cpu
 export JAX_COMPILATION_CACHE_DIR=$LOCAL/jaxcache
 export WANDB_MODE=disabled WANDB_DIR=$RUN
 source "$T57/probes/t28b/t65_shared_env.sh"
 export ALPHAGRAD_MEASURE_ACTOR=0
-echo "[t28b] ag=$(git -C $T57/agents/t28b-alphagrad rev-parse --short HEAD) gx=$(git -C $T57/agents/t28b-graphax rev-parse --short HEAD)"
+echo "[t28b] ag=$(git -C $T57/agents/t28b-alphagrad rev-parse --short HEAD) gx=$(git -C $T57/agents/$GXC rev-parse --short HEAD)"
 "$PY" -c "import alphagrad, graphax; print(alphagrad.__file__); print(graphax.__file__)"
 
 cd "$T57/agents/t28b-alphagrad"

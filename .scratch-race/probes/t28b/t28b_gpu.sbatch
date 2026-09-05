@@ -29,9 +29,10 @@ export T57_LOCAL=$LOCAL WANDB_DIR=$RUN WANDB_MODE=disabled
 source "$T57/probes/t57_env.sh" "$STACK" "$T57/home" || exit $?
 source "$T57/probes/t28b/t65_shared_env.sh"
 # lane B code: the /Scratch clones of wip/t28b-20260905, not the stack trees.
-export PYTHONPATH=$T57/agents/t28b-graphax/src:$T57/agents/t28b-alphagrad/src
+GXC=${GXC:-t28b-graphax}
+export PYTHONPATH=$T57/agents/$GXC/src:$T57/agents/t28b-alphagrad/src
 export ALPHAGRAD_MEASURE_ACTOR=1
-echo "[t28b] ag=$(git -C $T57/agents/t28b-alphagrad rev-parse --short HEAD) gx=$(git -C $T57/agents/t28b-graphax rev-parse --short HEAD)"
+echo "[t28b] ag=$(git -C $T57/agents/t28b-alphagrad rev-parse --short HEAD) gx=$(git -C $T57/agents/$GXC rev-parse --short HEAD)"
 "$PY" -c "import alphagrad, graphax; print(alphagrad.__file__); print(graphax.__file__)"
 
 cd "$T57/agents/t28b-alphagrad"

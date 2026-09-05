@@ -93,3 +93,27 @@ local probe that wraps `_as_shape`.
 | TransformerLM small, exact | present on 151 pair slots | none |
 
 The small TransformerLM is seq 8, dmodel 32, vocab 64.
+
+## 4. The demote rule is a device-dependent choice
+
+The demote rule is the one that moves a meta axis out of the `dot_general`
+batch list when only one side stores it. A race-only knob `GRAPHAX_TILED_LAZY`
+turns the rules on and off so that the cost can be attributed.
+
+TransformerLM at the campaign shape, GPU, reverse order, exact plan. Every
+number is the candidate over the incumbent, paired in one process.
+
+| rules | candidate over incumbent | drift floor | job |
+|---|---|---|---|
+| full (every rule) | 1.1074 | 0.9996 | 63795 |
+| nosum (only the contracted-axis sum off) | 1.1148 | 1.0008 | 63803 |
+| nodemote (only the demotion off) | 1.0048 | 0.9994 | 63802 |
+
+The whole cost is the demotion. XLA on GPU fuses the broadcast that the
+demotion avoids into the batched dot. Once the axis leaves the batch list that
+fusion is gone. XLA on CPU allocates the same broadcast instead, which is the
+56.9 MB against 378 KB that finding 61 measured.
+
+So a single engine cannot have both without a device-aware lowering choice.
+The default of this lane is `nodemote`. `GRAPHAX_TILED_LAZY=full` restores the
+leaner CPU frame. The owner decides which one the single engine keeps.
