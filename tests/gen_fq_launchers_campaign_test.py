@@ -285,17 +285,18 @@ def test_the_diag_arm_is_emitted_and_held(gen, campaign):
 
 
 def test_the_order_arms_lift_the_pin_and_the_others_keep_it(gen, campaign):
+    # Ticket .64: the order is the --fixed-order ARGUMENT; the env var is gone
+    # from every launcher (a set var fails loudly in common/masks.py).
     for a in campaign:
         text = gen.render(a)
         cli = _cli(gen, a)
+        assert "ALPHAGRAD_FORCE_REV_ORDER" not in text, a["name"]
         if a["name"] in ("p1g_none_free_oldsame_lq5",
                          "p1h_all_free_oldsame_lq5"):
-            # not set (masks.py:149 reads == "1", default off), never "0"
-            assert "export ALPHAGRAD_FORCE_REV_ORDER" not in text, a["name"]
-            assert a["env"]["ALPHAGRAD_FORCE_REV_ORDER"] is gen._DELETE, a["name"]
+            assert cli["--fixed-order"] == "free", a["name"]
             assert a["time"] == "24:00:00", a["name"]
         else:
-            assert "export ALPHAGRAD_FORCE_REV_ORDER=1\n" in text, a["name"]
+            assert cli["--fixed-order"] == "markowitz", a["name"]
     order_only = _cli(gen, _by_name(campaign, "p1g_none_free_oldsame_lq5"))
     assert order_only["--approx-profile"] == "none"
     assert "--no-approx-head" not in order_only   # the profile IS the switch

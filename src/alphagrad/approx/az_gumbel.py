@@ -52,6 +52,7 @@ os.environ.setdefault("ALPHAGRAD_BKSTEP", "0")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 from alphagrad.approx.az_args import make_argparser  # noqa: E402
+from alphagrad.approx.common.order import fixed_order_for_env as _fixed_order_for_env  # noqa: E402
 A = make_argparser().parse_args()
 os.environ["ALPHAGRAD_NN_HIDDEN"] = str(A.nn_hidden)
 # propagate task to the measure-server child (inherits our env at spawn)
@@ -210,6 +211,25 @@ if _GAZ_RAY_N > 0:
 env = eqx.tree_at(lambda e: e.eval_args_samples, env, ev)
 jaxpr = closed.jaxpr
 VALID = list(np.asarray(env.valid_vertices, dtype=np.int32)); NV = len(VALID)
+# --fixed-order (ticket dsnn-3qm.64): the static order table of
+# common/order.py, or None for free. Every legality read below goes through
+# _pin_legal, so under a pin exactly one vertex is legal at every step.
+FIXED_ORDER = _fixed_order_for_env(A.fixed_order, env)
+print(f"[gaz] fixed order: {A.fixed_order}"
+      + ("" if FIXED_ORDER is None else f" {FIXED_ORDER[:6].tolist()} ..."),
+      flush=True)
+
+
+def _pin_legal(legal):
+    """The legal set under the fixed order: the FIRST table vertex that is
+    still legal, alone; the set itself when the order is free."""
+    if FIXED_ORDER is None or not legal:
+        return legal
+    _still = {int(v) for v in legal}
+    for _v in FIXED_ORDER:
+        if int(_v) in _still:
+            return [type(legal[0])(_v)]
+    return legal
 # Two vertex-indexing conventions coexist: net_eval/rollouts use
 # ``VALID.index(v)`` while every head indexes by ``v - 1`` (vertex logits,
 # vertex contexts, vmem slots, axis_state rows). They agree only while VALID
@@ -1070,8 +1090,7 @@ def rollout_value(state, carry, depth):
     """
     for _ in range(depth):
         legal = PT.legal(VALID)
-        if os.environ.get("ALPHAGRAD_FORCE_REV_ORDER", "0") == "1" and legal:
-            legal = [max(legal)]   # rev: highest first
+        legal = _pin_legal(legal)
         if not legal:
             break
         vlog, out, _v = _eval_node(state, carry)
@@ -1394,8 +1413,7 @@ def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
     sampled ~ w_hat (the improved beta at the root; None on the exact arm).
     """
     legal = PT.legal(VALID)
-    if os.environ.get("ALPHAGRAD_FORCE_REV_ORDER", "0") == "1" and legal:
-        legal = [max(legal)]   # rev: highest first
+    legal = _pin_legal(legal)
     vlog, head_out, v_root = _eval_node(state, carry)
     ctxs = head_out[1]
     la = np.array([int(v) - 1 for v in legal], dtype=np.int32)
@@ -1837,8 +1855,7 @@ def _run(args) -> int:
             with PT.branch():
                 while True:
                     _wlegal = PT.legal(VALID)
-                    if os.environ.get("ALPHAGRAD_FORCE_REV_ORDER", "0") == "1" and _wlegal:
-                        _wlegal = [max(_wlegal)]   # rev: highest first
+                    _wlegal = _pin_legal(_wlegal)
                     if not _wlegal:
                         break
                     _wv = _wlegal[int(rng.integers(len(_wlegal)))]
@@ -1996,8 +2013,7 @@ def _run(args) -> int:
         _dtl = os.environ.get("ALPHAGRAD_GAZ_DECISION_TIMELOG", "0") == "1"
         while True:
             legal = PT.legal(VALID)
-            if os.environ.get("ALPHAGRAD_FORCE_REV_ORDER", "0") == "1" and legal:
-                legal = [max(legal)]   # rev: highest first
+            legal = _pin_legal(legal)
             if not legal:
                 break
             _t_dec = time.perf_counter() if _dtl else 0.0

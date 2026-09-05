@@ -143,13 +143,17 @@ def build_legacy_sp_valid_mask(
     return jnp.array(sp_mask)
 
 
-# FORCE-REV (import-time constant so it is static under jit): with the
-# flag on, vertex_avail_at_step keeps only the HIGHEST remaining vertex.
+# The fixed elimination order is an ARGUMENT (ticket dsnn-3qm.64): the
+# trainer passes the static order table of common/order.py into
+# vertex_avail_at_step. ALPHAGRAD_FORCE_REV_ORDER, the import-time env var
+# that used to pin the highest remaining vertex here, is gone; a process that
+# still exports it fails loudly instead of silently running free.
 import os as _os
-_FORCE_REV = _os.environ.get("ALPHAGRAD_FORCE_REV_ORDER", "0") == "1"
-if _FORCE_REV:
-    print("[cfg] FORCE REV ORDER: vertex choice pinned to reverse "
-          "elimination; only approximations are learned", flush=True)
+if "ALPHAGRAD_FORCE_REV_ORDER" in _os.environ:
+    raise RuntimeError(
+        "ALPHAGRAD_FORCE_REV_ORDER is no longer read (ticket dsnn-3qm.64). "
+        "Pass --fixed-order {free,reverse,markowitz} to the trainer "
+        "(--order to landscape_map) and unset the variable.")
 
 
 def build_vertex_valid_static(valid_vertices, total_v: int):
@@ -160,12 +164,22 @@ def build_vertex_valid_static(valid_vertices, total_v: int):
     return jnp.array(arr)
 
 
-def vertex_avail_at_step(state, vertex_valid_static, total_v: int, num_valid: int):
+def vertex_avail_at_step(state, vertex_valid_static, total_v: int, num_valid: int,
+                         fixed_order=None):
     """Per-vertex availability at the current rollout step.
 
     `state.order` keeps the chosen vertices in slots `[0, step_count)` (slots
     beyond `step_count` retain the original valid-vertices ordering). We zero
     out the entries that have already been chosen.
+
+    ``fixed_order`` (ticket dsnn-3qm.64): the static order table of
+    ``common/order.py`` (int32 vertex ids, one per step) or ``None`` for a
+    free order. Under a pin the availability is the ONE-HOT of the table's
+    vertex at ``step_count``, gathered statically, so exactly one vertex is
+    legal at every step and the vertex head's distribution is a point mass
+    (its KL and its gradient are structurally 0). All-zero avail (terminal)
+    stays all-zero: past the last step the gather is clamped to the last
+    entry, which is already chosen.
     """
     chosen = state.order
     step_idx = state.step_count
@@ -175,14 +189,11 @@ def vertex_avail_at_step(state, vertex_valid_static, total_v: int, num_valid: in
         jnp.zeros(total_v, dtype=jnp.float32).at[chosen - 1].add(active)
     )
     avail = vertex_valid_static * (1.0 - jnp.clip(already_chosen, 0.0, 1.0))
-    if _FORCE_REV:
-        # Keep ONLY the highest-indexed available vertex ('rev' order:
-        # [n, ..., 2, 1]). All-zero avail (terminal) stays all-zero:
-        # argmax lands on 0 and avail[0] is 0 there.
-        _score = avail * (jnp.arange(total_v, dtype=jnp.float32) + 1.0)
-        _top = jnp.argmax(_score)
-        avail = jnp.zeros_like(avail).at[_top].set(
-            (avail[_top] > 0).astype(avail.dtype))
+    if fixed_order is not None:
+        table = jnp.asarray(fixed_order, dtype=jnp.int32)
+        n_steps = int(table.shape[0])
+        pin = table[jnp.clip(step_idx, 0, n_steps - 1)] - 1
+        avail = jnp.zeros_like(avail).at[pin].set(avail[pin])
     return avail
 
 

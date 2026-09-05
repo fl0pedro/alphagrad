@@ -49,6 +49,14 @@ def add_common_args(
     # Run / task
     p.add_argument("--seed", type=int, default=seed)
     p.add_argument("--dataset", type=dataset_type, default=dataset)
+    p.add_argument(
+        "--fixed-order", choices=["free", "reverse", "markowitz"],
+        default="markowitz",
+        help="The elimination order the vertex choice is pinned to (ticket "
+             "dsnn-3qm.64, common/order.py): markowitz = the static minimum "
+             "Markowitz degree order, reverse = the reference's order, free = "
+             "no pin. Replaces ALPHAGRAD_FORCE_REV_ORDER.",
+    )
 
     # Optimizer
     p.add_argument("--lr", type=float, default=lr)

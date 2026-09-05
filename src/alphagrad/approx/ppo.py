@@ -74,6 +74,10 @@ from alphagrad.approx.common import (
     shuffle_and_batch_by_trajectory,
     vertex_avail_at_step,
 )
+from alphagrad.approx.common.order import (
+    FIXED_ORDER_CHOICES as _FIXED_ORDER_CHOICES,
+    fixed_order_for_env as _fixed_order_for_env,
+)
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
     quality_metric as _env_quality_metric,
@@ -1102,7 +1106,7 @@ def _causal_quality_mask(face_valid, face_skip, face_op_type):
     0.4 -> 109), and under rev-pin an all-none step CANNOT cause a
     violation.
 
-    FREE-ORDER GENERALIZATION (when ALPHAGRAD_FORCE_REV_ORDER is lifted):
+    FREE-ORDER GENERALIZATION (under --fixed-order free):
     the causal set is {approx actions} UNION {vertex choices} -- the vertex
     head must stay inside the quality credit because the elimination order
     changes which faces exist; an all-none exact plan still keeps quality
@@ -4013,7 +4017,7 @@ def make_argparser() -> argparse.ArgumentParser:
              "assigned on first emission, evict-oldest past K (telemetry "
              "edgemem/evictions). Offline: closes >=90 percent of the "
              "endpoint read's drop on intermediate operands (section 8; "
-             "under FORCE_REV_ORDER it is predicted inert -- every lhs is "
+             "under --fixed-order reverse it is predicted inert -- every lhs is "
              "primitive there). Requires the --live-faces stack; default "
              "off, bit-identical when off.")
     p.add_argument(
@@ -4374,6 +4378,21 @@ def make_argparser() -> argparse.ArgumentParser:
              "and pareto/archive_size are recorded — scalars describing a "
              "front whose sequences are then discarded at process exit.")
     p.add_argument(
+        "--fixed-order", choices=list(_FIXED_ORDER_CHOICES), default="markowitz",
+        help="The elimination order the vertex head is pinned to (ticket "
+             "dsnn-3qm.64; common/order.py is the one implementation, shared "
+             "with landscape_map --order). markowitz (default): the STATIC "
+             "minimum Markowitz degree order of the exact graph, computed once "
+             "at env build, ties to the lowest vertex id -- the fixed order of "
+             "every campaign arm (finding 59: Diag is legal on rhs/new/old "
+             "sites only under this order). reverse: the valid vertices in "
+             "descending id -- the order of the paired rev-exact reference, "
+             "kept as the control (.60). free: no pin, the pointer head "
+             "chooses. Under a pin exactly one vertex is legal per step "
+             "(masks.vertex_avail_at_step), so the vertex head's KL and "
+             "gradient are structurally 0. Replaces ALPHAGRAD_FORCE_REV_ORDER, "
+             "which now fails loudly when set.")
+    p.add_argument(
         "--approx-profile", choices=["all", "skip", "reduce", "quant", "diag", "none"],
         default=None,
         help="Approximation-profile mask restricting the approximation head to a subset of classes: "
@@ -4659,7 +4678,7 @@ def make_argparser() -> argparse.ArgumentParser:
         "Why it is gone: those 2 extra vertices enter the pointer's action "
         "space and enlarge derived_max_faces (nn256: 13 -> 15 eqns), and the "
         "forward/reverse/cross-country freedom they buy is UNREACHABLE while "
-        "ALPHAGRAD_FORCE_REV_ORDER=1 pins the order to reverse.",
+        "a fixed order (--fixed-order) pins the order.",
     )
     p.add_argument(
         "--measure-latency",
@@ -4971,7 +4990,7 @@ def make_argparser() -> argparse.ArgumentParser:
                    "penalty is Schulman k3 on the JOINT log-prob of the "
                    "stored actions; the vertex term cancels exactly (both "
                    "sides read the same vertex distribution) and under "
-                   "ALPHAGRAD_FORCE_REV_ORDER=1 the vertex head has exactly "
+                   "a fixed order (--fixed-order) the vertex head has exactly "
                    "ONE legal action anyway, so its KL is structurally 0 -- "
                    "what is penalised is the FACE head plus its live-face "
                    "context stream. 0 = OFF (default). WHAT THIS DOES AND "
@@ -7490,6 +7509,17 @@ def main():
     )
 
     vertex_valid_static = build_vertex_valid_static(env.valid_vertices, total_v)
+    # --fixed-order (ticket .64): the static order table, computed ONCE here on
+    # the exact graph and gathered inside vertex_avail_at_step; None = free.
+    fixed_order_table = _fixed_order_for_env(args.fixed_order, env)
+    if fixed_order_table is None:
+        print("[cfg] fixed order: free (the vertex head chooses)", flush=True)
+    else:
+        print(f"[cfg] fixed order: {args.fixed_order}, {len(fixed_order_table)} "
+              f"steps, {fixed_order_table[:6].tolist()} ... "
+              f"{fixed_order_table[-3:].tolist()}; only approximations are "
+              "learned", flush=True)
+        fixed_order_table = jnp.asarray(fixed_order_table, dtype=jnp.int32)
     pair_valid_mask = build_pair_valid_mask(
         closed_jaxpr.jaxpr,
         total_v,
@@ -7732,7 +7762,7 @@ def main():
     #   * The VERTEX term cancels EXACTLY: both sides read the same
     #     `new_vertex_dist` (the reference pass re-runs the FACE path only,
     #     off the current encoding), so log p_vertex is subtracted from both.
-    #     Under ALPHAGRAD_FORCE_REV_ORDER=1 that term is structurally 0
+    #     Under a fixed order (--fixed-order) that term is structurally 0
     #     anyway -- the vertex head has exactly one legal action per step, so
     #     its distribution is a point mass under ANY parameters and no KL of
     #     it can ever be non-zero. There is nothing to penalise there.
@@ -8059,7 +8089,8 @@ def main():
                 state, elim_order, enc_state, prev_part = carry
             sample_key, next_net_key = jrand.split(k, 2)
             vertex_avail_mask = vertex_avail_at_step(
-                state, vertex_valid_static, total_v, num_valid
+                state, vertex_valid_static, total_v, num_valid,
+                fixed_order=fixed_order_table,
             )
 
             # PRE (synced through the PREVIOUS delta) and POST (synced through
@@ -12046,7 +12077,7 @@ def main():
         # --face-edge-mem telemetry: slot-table traffic per episode.
         # `evictions` nonzero at steady state means K (= the face bound) is
         # undersized for this graph's distinct-edge-key count; a zero
-        # `nonzero_reads` under FORCE_REV_ORDER is EXPECTED (every lhs is
+        # `nonzero_reads` under --fixed-order reverse is EXPECTED (every lhs is
         # primitive there -- dossier section 8), under random/learned
         # orders it means the read path is dead.
         if _EDGE_TABLE is not None:

@@ -355,6 +355,7 @@ from alphagrad.approx.common.examples import (
 from alphagrad.approx.common.eval_samples import (            # noqa: E402
     generate_eval_samples,
 )
+from alphagrad.approx.common import order as _order            # noqa: E402
 from alphagrad.approx.common.order_specs import (             # noqa: E402
     build_order_specs, parse_calls, calls_have_skip,
 )
@@ -452,40 +453,17 @@ def build_env(args):
 # Plan construction
 # ---------------------------------------------------------------------------
 def rev_order(env) -> np.ndarray:
-    """The order ALPHAGRAD_FORCE_REV_ORDER pins the policy to.
-
-    `masks.vertex_avail_at_step` keeps only the HIGHEST-indexed still-available
-    vertex, and availability is `vertex_valid_static`, so the forced order is
-    the valid vertices in descending id -- not `range(n, 0, -1)`."""
-    return np.array(sorted((int(v) for v in env.valid_vertices), reverse=True),
-                    dtype=np.int32)
+    """The reverse order: the valid vertices in descending id (the order of
+    the paired rev-exact reference). ONE implementation, common/order.py
+    (ticket .64); the trainer's --fixed-order reverse pins to the same table."""
+    return _order.reverse_order(env.valid_vertices)
 
 
 def markowitz_order(env) -> np.ndarray:
-    """Greedy minimum Markowitz degree order over valid vertices.
-
-    Eliminates intermediate equations before scalar contractions, preserving
-    non-empty Jacobian out-dimensions for structural approximations.
-    """
-    from graphax.incremental import IncrementalJaxpr
-    cfg = env.config
-    ij = IncrementalJaxpr(cfg.jaxpr, tuple(cfg.argnums), list(env.consts),
-                          list(env.args), track_faces=False)
-    eliminable = set(int(v) for v in env.valid_vertices)
-    order = []
-    while eliminable:
-        scores = {}
-        for v in eliminable:
-            v_var = cfg.jaxpr.eqns[v - 1].outvars[0]
-            preds = [u for u in ij.graph if v_var in ij.graph[u]]
-            succs = list(ij.graph.get(v_var, {}).keys())
-            deg = len(preds) * len(succs)
-            scores[v] = deg
-        best_v = min(scores.keys(), key=lambda v: (scores[v], v))
-        order.append(best_v)
-        eliminable.remove(best_v)
-        ij.eliminate(best_v, (), None)
-    return np.array(order, dtype=np.int32)
+    """The STATIC minimum Markowitz degree order (finding 59). ONE
+    implementation, common/order.py (ticket .64); the trainer's --fixed-order
+    markowitz pins to the same table, so the sweep and the trainer agree."""
+    return _order.fixed_order_for_env("markowitz", env)
 
 
 def empty_plan(n_steps: int):

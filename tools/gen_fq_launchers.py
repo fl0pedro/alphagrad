@@ -243,10 +243,8 @@ SHARED_ENV = [
     # The old-edge configuration (formerly ALPHAGRAD_NEW_SLOT_JOIN) is an
     # ARGUMENT now: --approx-old in SHARED_CLI (ticket .56).
     ("ALPHAGRAD_POLICY", "palimpsa"),
-    # Vertex choice pinned to reverse elimination via legality, so ONLY the
-    # approximations are learned.  Read at IMPORT time in
-    # common/masks.py:148 -- it must be exported before python starts.
-    ("ALPHAGRAD_FORCE_REV_ORDER", "1"),
+    # The elimination order is an ARGUMENT now: --fixed-order on every train
+    # arm (ticket .64; ALPHAGRAD_FORCE_REV_ORDER fails loudly when set).
     # The additive quality gate (ALPHAGRAD_QUALITY_GATE_MIN=0.05: plans below
     # qmin paid the exact-rev reference cost, so the SKIP cliff earned nothing)
     # was DELETED on 2026-09-04 (ticket dsnn-3qm.9). Its replacement is the
@@ -876,13 +874,13 @@ for _n, _rev, _extra_cli, _node, _what in [
         node=_node,
         time="24:00:00",
         gpus=4,
-        env={"ALPHAGRAD_FORCE_REV_ORDER": _rev},
-        cli=_cli,
+        env={},
+        cli=dict(_cli, **{"--fixed-order": "reverse" if _rev == "1" else "free"}),
         depends="wave 1 (inherits its winning NONE-bias via $W1_BIAS)",
         purpose=f"""WAVE 2 -- THE ELIMINATION ORDER.  The axis with real range
 (45-80x, against at most ~2x on the approximation axis) that has NEVER been
 scheduled, because it was starved by the very credit horizon R2/R3 proved
-causal.  Under ALPHAGRAD_FORCE_REV_ORDER=1 exactly one vertex is legal at
+causal.  Under --fixed-order reverse exactly one vertex is legal at
 every step, so the pointer head has taken ZERO GRADIENT across the entire
 v57-v66 campaign and R1-R3 (ve entropy -0.0e+00, max|dH/dlogits| = 0.0e+00,
 every episode logging ve_head=0 macro_vertex=0).  Lifting the pin is the first
@@ -899,8 +897,8 @@ earns its slot.
 
 THIS ARM: {_what}.
 
-ALPHAGRAD_FORCE_REV_ORDER is read at IMPORT time (common/masks.py:148), so it
-is exported in the env block and cannot be moved onto the CLI.
+The order is the --fixed-order argument (ticket .64; it was the import-time
+env var ALPHAGRAD_FORCE_REV_ORDER until 2026-09-05).
 
 WHAT LIFTING THE PIN COSTS.  Face count 115 (rev) -> ~313 (random), ~2.7x the
 face work; distinct edge keys 101 -> 206-286; the face stratum flips from
@@ -1175,13 +1173,13 @@ identity drift, which confirms the objective, not the init, as the blocker."""
 
 def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
                  prediction: str, falsifier: str,
-                 order: str = "rev", approx_old: str = "same",
+                 order: str = "markowitz", approx_old: str = "same",
                  rewards: str = "cmp mem acc", form: str = "fixed",
                  lambda_q: str = LAMBDA_Q_MVP, advantage_norm: str = "none",
                  seed: str = CAMPAIGN_SEED, time: str | None = None,
                  held: str | None = None, depends: str | None = None) -> dict:
     """One row of the campaign table -> one `arm(...)`.  Returns the arm."""
-    assert order in ("rev", "free"), order
+    assert order in ("markowitz", "reverse", "free"), order
     assert approx_old in APPROX_OLD_CONFIGS, approx_old
     assert form in _FORMS, form
     assert rewards in _CHANNEL_TOKEN, rewards
@@ -1196,8 +1194,8 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
     lam_tok = {"fixed": f"lq{lambda_q}", "P0": "pref",
                "P1": f"pref_tau{tau_tok}", "L": f"dual_tau{tau_tok}"}[form]
     name = f"p{phase}{tag}_{prof_tok}"
-    if order == "free":
-        name += "_free"
+    if order != "markowitz":
+        name += f"_{order}"
     name += f"_old{approx_old}"
     if rewards != "cmp mem acc":
         name += f"_{_CHANNEL_TOKEN[rewards]}"
@@ -1211,6 +1209,10 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
         "--name": job,
         "--seed": seed,
         "--approx-profile": prof_val,
+        # The fixed order (ticket .64): static minimum Markowitz degree for
+        # every fixed-order arm, reverse only as the control (.60), free
+        # for the order arms.  One table, common/order.py.
+        "--fixed-order": order,
         "--approx-old": approx_old,
         "--face-none-bias": FACE_NONE_BIAS_MVP,
         "--scale-face-head": SCALE_FACE_HEAD_MVP,
@@ -1236,11 +1238,6 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
         cli["--no-symlog"] = None
         cli["--symlog-channels"] = "none"
     env: dict = {}
-    if order == "free":
-        # The pointer head is live.  ALPHAGRAD_FORCE_REV_ORDER is read at
-        # import time (common/masks.py:149) and has no flag; NOT SET here
-        # (the default is off), never "0".
-        env["ALPHAGRAD_FORCE_REV_ORDER"] = _DELETE
     a = dict(
         name=name, job=job, kind="train", node=node,
         time=time or ("24:00:00" if order == "free" else "12:00:00"),
@@ -1366,7 +1363,7 @@ must be re-opened on that record.""",
 campaign_arm(
     phase=1, tag="g", profile="none", order="free", node=CAMPAIGN_NODES[0],
     what="""ORDER-ONLY (--approx-profile none; the pointer head live,
-ALPHAGRAD_FORCE_REV_ORDER not set).  --approx-profile none removes the
+--fixed-order free).  --approx-profile none removes the
 approximation heads (equivalent to --no-approx-head): the pure elimination-
 order control.  The axis with real range: across orders the temp channel
 spans ~80x while under the pin every archived winner reads 1.0000 (wave 2
@@ -1685,7 +1682,6 @@ arm(
         # The rest are trainer-only and have no meaning here: there is no
         # policy, no actor pool and no episode loop in landscape_map.
         "ALPHAGRAD_BATCHED_CALLBACK": _DELETE,
-        "ALPHAGRAD_FORCE_REV_ORDER": _DELETE,
         "ALPHAGRAD_POLICY": _DELETE,
         "ALPHAGRAD_ACTOR_PROF_EVERY": _DELETE,
         "ALPHAGRAD_PROFILE": _DELETE,
