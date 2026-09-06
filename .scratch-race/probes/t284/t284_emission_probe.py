@@ -63,6 +63,11 @@ for _k in ("GRAPHAX_PLANNER_EXACT", "GRAPHAX_EINSUM_GENERAL",
            "GRAPHAX_TILED_LAZY", "GRAPHAX_TILED_LEGACY",
            "GRAPHAX_TILED_MULREDUCE"):
     os.environ.pop(_k, None)
+# The campaign SHARED_ENV still exports ALPHAGRAD_FORCE_REV_ORDER, which
+# ticket dsnn-3qm.64 removed from the code: masks.py raises at import if a
+# process still sets it. The probe supplies both elimination orders itself, so
+# the variable has nothing to pin here. Drop it before the import.
+os.environ.pop("ALPHAGRAD_FORCE_REV_ORDER", None)
 
 _BASE = {"GRAPHAX_EINSUM_GENERAL": "0", "GRAPHAX_PLANNER_EXACT": "0",
          "GRAPHAX_TILED_LEGACY": "0", "GRAPHAX_TILED_MULREDUCE": "0",

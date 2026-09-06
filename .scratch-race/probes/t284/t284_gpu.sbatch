@@ -26,6 +26,8 @@ STACK=$T57/stack
 export T57_LOCAL=$LOCAL WANDB_DIR=$RUN WANDB_MODE=disabled
 source "$T57/probes/t57_env.sh" "$STACK" "$T57/home" || exit $?
 source "$T57/probes/t284/t65_shared_env.sh"
+# dsnn-3qm.64 deleted this env var; masks.py raises when it is set.
+unset ALPHAGRAD_FORCE_REV_ORDER
 export PYTHONPATH=$T57/agents/t284-graphax/src:$T57/agents/t284-alphagrad/src
 export ALPHAGRAD_MEASURE_ACTOR=1
 echo "[t284] ag=$(git -C $T57/agents/t284-alphagrad rev-parse --short HEAD) gx=$(git -C $T57/agents/t284-graphax rev-parse --short HEAD)"
@@ -35,12 +37,16 @@ cd "$T57/agents/t284-alphagrad"
 P=$T57/probes/t284
 
 # --- deliverable (a): the synthetic three-emission sweep -------------------
+if [ "${T284_SKIP_SWEEP:-0}" = "0" ]; then
 echo "[t284] ===== sweep (GPU) ====="
 t0=$SECONDS
 timeout 3000 "$PY" "$P/t284_three_emissions_sweep.py" "$RUN/sweep" gpu > "$RUN/sweep.log" 2>&1
 echo "[t284] sweep rc=$? in $((SECONDS-t0))s"
 grep -a "^\[t284\] M=" "$RUN/sweep.log" | tail -90
 tail -5 "$RUN/sweep.log"
+else
+echo "[t284] sweep skipped (T284_SKIP_SWEEP=1)"
+fi
 
 # --- deliverable (b): the three emissions in the real engine ---------------
 echo "[t284] ===== engine probe, TransformerLM (campaign shape) ====="
