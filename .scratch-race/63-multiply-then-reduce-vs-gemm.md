@@ -58,6 +58,21 @@ static temp, the runtime watermark, the kernel census and the values.
 8. **Emission (1) can be deleted.** It is byte-for-byte emission (3) on GPU,
    and on CPU it is dominated: sweep regret 2.031 median with a worst cell of
    83.30, and it is the only emission whose CPU static temp is never zero.
+9. **The GPU 10 percent is the GEMM, not the copies (owner D12).** Emission
+   (2) launches 12 standalone slice copies that the other two do not. Measured
+   in isolation at exactly those shapes, removing the copies takes the GEMM
+   form from 2.17 to 1.85 times the fused form, and the pre-sliced GEMM
+   launches the same number of kernels as the fused version and is still 1.85
+   times slower. Apportioned onto the engine gap: about 2 of the 10 points are
+   the copies, about 8 are the kernel choice. The rule does not collapse to
+   "never broadcast, always one dot".
+10. **Five of the ten implicit cases are already algebra; one still
+    broadcasts; three are untested.** The single implicit sparse axis is the
+    only case that still grows a buffer under the landed default, and
+    `GRAPHAX_TILED_LAZY=full` removes it. The uniform operand was never the
+    cause of `test_14`'s broadcast, which corrects finding 62. The genuine LCM
+    grid, the spatial_sparse pairing and the partially stored extent occur on
+    neither target, so this run does not measure them.
 
 ## Apparatus
 
@@ -76,6 +91,8 @@ Probes: `alphagrad/.scratch-race/probes/t284/`.
 | 63829 | pgi15-cpu1 | the synthetic sweep, CPU |
 | 63830 | pgi15-gpu15 | the engine probe, GPU |
 | 63831 | pgi15-cpu1 | the engine probe, CPU |
+| 63843 | pgi15-gpu15 | the copy attribution and a re-measure, GPU |
+| 63844 | pgi15-cpu1 | the growing-broadcast census and the copy attribution, CPU |
 
 Jobs 63828 and 63829 also ran the engine probe and it died at import. The
 campaign SHARED_ENV still exports `ALPHAGRAD_FORCE_REV_ORDER`, which ticket
@@ -375,6 +392,226 @@ fusion and cuBLAS counts, bit-identical gradients on the exact and Reduce
 plans). On CPU it is dominated: median regret 2.031 over the sweep, worst
 83.30, and it is the only emission whose CPU static temp is never zero.
 
+## Deliverable (e): what the GPU 10 percent is made of (owner D12)
+
+Jobs 63843 (pgi15-gpu15) and 63844 (pgi15-cpu1).
+
+### The kernel census
+
+Every launched kernel of the three arms, TLM at the campaign shape, reverse
+order, exact plan, read off the HLO of job 63830. A `bitcast`, a
+`get-tuple-element` and a constant launch nothing and are not counted.
+
+| kernel class | (1) bcast-in-dot | (2) kept on storing side | (3) mul-then-reduce |
+|---|---|---|---|
+| cuBLAS custom call | 9 | 28 | 9 |
+| copy: `wrapped_slice` | 0 | **12** | 0 |
+| copy: `wrapped_concatenate` | 2 | 2 | 2 |
+| copy: plain | 16 | 15 | 16 |
+| fusion, kInput (reduce) | 27 | 6 | 27 |
+| fusion, kLoop | 9 | 2 | 9 |
+| fusion, kCustom (Triton) | 6 | 11 | 6 |
+| **total launched kernels** | **69** | **76** | **69** |
+
+Emission (2) launches 7 more kernels. It adds 19 cuBLAS calls and 12 standalone
+slice copies, and it gives up 21 reduce fusions and 7 loop fusions. The cuBLAS
+calls each declare an `s8[33554432]` workspace, which is the 32 MiB of finding
+58; XLA aliases one buffer for all of them, so the static temp stays at 33.7 MB.
+
+### The 12 copies cannot be folded away in this engine
+
+The 12 `wrapped_slice` kernels are six `f32[32,384] -> f32[32,128]` and six
+`f32[128,384] -> f32[128,128]`. Their offsets are `[0:128]`, `[128:256]` and
+`[256:384]`, three each from four distinct source buffers. They are the three
+pieces of TransformerLM's own QKV split. Twelve different pieces, no
+duplicates, so there is nothing to common up, and the wide buffer is built
+upstream of the contraction engine. "Build the operand once in the shape the
+dot wants" is therefore not a change the emission site can make. It would mean
+never forming the wide QKV buffer, which is a change to how a concatenate and
+its Jacobian are represented.
+
+### So the copies were measured in isolation instead
+
+Same shapes, one process, paired, drift floor 1.0006. Three arms: `sliced`
+(the operand is a slice of the wide buffer, then a 2-D dot: 12 copies + 12
+GEMMs, emission (2)'s kernel shape), `presliced` (the operand is already its
+own buffer: 0 copies + 12 GEMMs, the fold), and `mulreduce` (the same
+contractions as multiply and reduce: no GEMM, no copy).
+
+| arm | kernels | of which cuBLAS | `wrapped_slice` | static temp |
+|---|---|---|---|---|
+| sliced | 37 | 12 | 12 | 33 689 360 B |
+| presliced | 25 | 12 | 0 | 33 624 080 B |
+| mulreduce | 25 | 0 | 0 | **5 124 B** |
+
+| ratio | GPU | CPU |
+|---|---|---|
+| sliced / presliced (the copies alone) | **1.1712** | 0.9318 |
+| presliced / mulreduce (the GEMM alone) | **1.8535** | 0.8394 |
+| sliced / mulreduce (the whole gap) | 2.1708 | 0.7822 |
+| drift floor | 1.0006 | 0.9989 |
+
+Values agree to 2.6e-06 across the three arms.
+
+### The answer to the hypothesis: no, it is not the copies
+
+Removing the 12 copies takes the GEMM form from 2.17 to 1.85 times the fused
+form. `presliced` and `mulreduce` launch the SAME number of kernels, 25, and
+the GEMM version is still 1.85 times slower. So it is not launch count either.
+It is the kernel choice: at `[32,128] x [128,128]` a cuBLAS call is slower
+than a fused loop, and it cannot absorb the `sum` that follows it.
+
+Apportioning the engine's measured gap by the log-share of the two isolated
+factors (copies 20.4 percent, kernel choice 79.6 percent):
+
+| plan | measured (2) over (3) | of which the copies | of which the kernel choice |
+|---|---|---|---|
+| reverse:exact | 1.0995 | 1.0195 (2.0 points) | 1.0784 (7.8 points) |
+| reverse:quant_all | 1.1040 | 1.0204 (2.0 points) | 1.0820 (8.2 points) |
+
+That apportionment is an inference from the isolated experiment, not a direct
+measurement of the engine. What is directly measured is the isolated pair of
+ratios and the engine gap. Both say the same thing: about two of the ten
+points are the copy kernels and about eight are the GEMM.
+
+**So the rule does not collapse to one line.** "Never broadcast, always one
+dot" would still cost about 8 points on GPU after every copy was folded away,
+and folding them away is not available at the emission site. Emissions (1) and
+(3) cannot both go.
+
+The fresh engine numbers of job 63843 reproduce job 63830 to three decimals,
+drift floor 0.9999 (0.9996 to 1.0033):
+
+| plan | (1) bcast-in-dot | (2) kept on storing side | (3) mul-then-reduce |
+|---|---|---|---|
+| reverse:exact | 1.0021 | 1.0984 | 0.9990 |
+| reverse:quant_all | 0.9766 | 1.0781 | 0.9765 |
+
+On CPU the same isolated experiment goes the other way: the sliced form is
+faster than the pre-sliced one (0.93) and faster than the fused one (0.78).
+XLA on CPU materialized the slices into 491 KB of temp and still won, which is
+the same story as section (b): on CPU a real GEMM is worth its buffers.
+
+## Deliverable (f): the census of what still emits a growing broadcast
+
+Job 63844 (pgi15-cpu1), probe
+`probes/t284/t284_broadcast_census.py`. It wraps `matmul._as_shape` (and the
+verbatim copy inside `matmul_legacy_tiled`) and counts every call whose
+broadcast mode grows the buffer. It also wraps `_prepare_contraction_views`,
+whose two broadcast calls have a fixed axis layout, so each growth is
+attributed to the AXIS that grew and to that axis's case, not to the whole
+contraction. A second, independent count of growing `broadcast_in_dim`
+equations in the jaxpr agrees with it call for call and element for element on
+the hand-built case.
+
+Modes: the incumbent executor (`GRAPHAX_TILED_LEGACY=1`), the lazy frame under
+`GRAPHAX_TILED_LAZY` in {off, nodemote, full}, the multiply-then-reduce
+emission, and the planner as the reference.
+
+The totals reproduce finding 62 deliverable (b) exactly, which is the check on
+the method: NeuralNetwork exact, incumbent 15 calls / 49 398 elements,
+`nodemote` 10 / 49 353, `full` 0 / 0; MLP toy 9 / 1 346, 8 / 1 259, 0 / 0.
+
+### One line per case
+
+| case | incumbent | lazy off | lazy nodemote | mul-then-reduce | lazy full | planner | why |
+|---|---|---|---|---|---|---|---|
+| single implicit sparse axis | **grows** | **grows** | **grows** | **grows** | none | none | the meta axis is a batch axis of the dot, and a batch axis must have the same length on both operands, so the side that does not store it is broadcast. `lazy_full` demotes it to a free axis of the storing side instead; the planner drops the label. |
+| single implicit dense axis (block) | **grows** | **grows** | none | none | none | none | `_lazy_frame`'s `lhs_lazy` / `rhs_lazy` rules shrink an own-side block extent nobody stores to 1 and give the output dim `axis=None`. |
+| single implicit dense axis (contracted) | **grows** | **grows** | none | none | none | none | the driver sums the storing side instead of broadcasting the other one (`keep_sl` / `keep_sr`, the `_sum_rules` block). Off under `GRAPHAX_TILED_LAZY` in {off, nosum}. |
+| single implicit dense axis (carried) | **grows** | **grows** | none | none | none | none | same `lhs_lazy` / `rhs_lazy` rules, on a non-contract pairing. |
+| double implicit contracted axis | none | none | none | none | none | none | both lens set to 1 makes `_contraction_factors`' scalar rule fold `logical_element_count` into `scalar_mult`. Analytic, no dot. |
+| double implicit batch axis | **grows** | **grows** | none | none | none | none | `_lazy_frame`'s `meta_lazy` rule shrinks the meta extent to 1 on both sides and the output dim keeps the logical extent with `axis=None`. |
+| uniform operand (`val is None` on every dim) | **grows** | **grows** | **grows** | **grows** | **none** | none | see below: the growth is NOT caused by the uniform operand. |
+| genuine LCM grid | not reached | not reached | not reached | not reached | not reached | not reached | `_lazy_frame` refuses it (`aligned = T == G or ol == 1 or orr == 1`) and keeps the incumbent frame slot for slot. It does not occur on either target. |
+| spatial_sparse pairing | not reached | not reached | not reached | not reached | not reached | not reached | not in `_LAZY_PAIRINGS`, so the incumbent frame is kept slot for slot. It does not occur on either target. |
+| partially stored extent | not reached | not reached | not reached | not reached | not reached | not reached | the `m_l == T and m_r == 1` tests fall through and the incumbent frame is kept. It does not occur on either target. |
+
+"not reached" means the case did not occur in any contraction of the three
+targets, so this run does not measure it. The "why" column for those three is
+read off `_lazy_frame`, not measured. Ticket dsnn-3qm.28.2 needs a target that
+exercises them before it can claim they are handled by algebra.
+
+### The correction to finding 62
+
+Finding 62 deliverable (a) says the one growing broadcast of `test_14` "comes
+from `a`'s value being `None` on every dim" and "is present under every engine
+mode". Both halves are wrong.
+
+| test_14 | growing calls / elements | attributed to |
+|---|---|---|
+| incumbent | 1 / 19 | single implicit sparse axis 10, block axis 9 |
+| lazy off | 1 / 19 | the same |
+| lazy nodemote | 1 / 4 | single implicit sparse axis 4 |
+| mul-then-reduce | 1 / 4 | single implicit sparse axis 4 |
+| **lazy full** | **0 / 0** | — |
+| planner | 0 / 0 | `out:implicit_kept` 2 |
+
+The uniform operand does not force a broadcast. The single implicit sparse
+axis does, and `GRAPHAX_TILED_LAZY=full` removes it. The jaxpr count agrees
+exactly (1/19, 1/19, 1/4, 1/4, 0/0, 0/0).
+
+### The three targets, in full
+
+| target | mode | contractions | growing calls | growing elements |
+|---|---|---|---|---|
+| MLP toy, reverse, exact | incumbent | 10 | 9 | 1 346 |
+| | lazy off | 10 | 9 | 1 346 |
+| | lazy nodemote | 10 | 8 | 1 259 |
+| | mul-then-reduce | 10 | 8 | 1 259 |
+| | lazy full | 10 | **0** | **0** |
+| | planner | 1 | 0 | 0 |
+| NeuralNetwork, reverse, exact | incumbent | 21 | 15 | 49 398 |
+| | lazy off | 21 | 15 | 49 398 |
+| | lazy nodemote | 21 | 10 | 49 353 |
+| | mul-then-reduce | 21 | 10 | 49 353 |
+| | lazy full | 21 | **0** | **0** |
+| | planner | 2 | 0 | 0 |
+| NeuralNetwork, markowitz, exact | incumbent | 22 | 12 | 97 970 |
+| | lazy off | 22 | 12 | 97 970 |
+| | lazy nodemote | 22 | 8 | 49 282 |
+| | mul-then-reduce | 22 | 8 | 49 282 |
+| | lazy full | 22 | **0** | **0** |
+| | planner | 5 | 0 | 0 |
+
+Per case, on the incumbent, NeuralNetwork reverse: single implicit sparse axis
+10 calls / 49 353 elements, double implicit batch axis 2 / 18, block axis 2 /
+18, carried axis 1 / 9. On the Markowitz order: single implicit sparse 8 /
+49 282, double implicit batch 2 / **48 670**, block 1 / 9, contracted 1 / 9. So
+on that order the double implicit batch axis is half of all the growth, and the
+lazy frame's `meta_lazy` rule already removes it.
+
+### The planner as the reference
+
+| target | planner rules fired |
+|---|---|
+| test_14 | `rule:contract_direct` 2, `out:pair_retained` 2, `rule:spatial_dense` 4, `out:implicit_kept` 2 |
+| MLP toy, reverse | `out:forced_broadcast` 9 |
+| NeuralNetwork, reverse | `out:forced_broadcast` 12, `out:val_none` 7 |
+| NeuralNetwork, markowitz | `out:forced_broadcast` 9, `out:implicit_kept` 1 |
+
+The planner reaches zero growing operand broadcasts on every target. Its
+`out:forced_broadcast` is an OUTPUT broadcast, not an operand one: it builds
+the returned tensor's dense shape after the contraction, which is a different
+buffer from the one this census counts. `out:val_none` (7 on NeuralNetwork
+reverse) is the uniform-operand rule and `out:implicit_kept` is the rule that
+leaves an implicit axis implicit in the result. Those three names are the
+algebra ticket dsnn-3qm.28.2 has to reproduce.
+
+### What dsnn-3qm.28.2 works from
+
+* Five of the ten cases are already algebra under the landed default
+  (`nodemote`): both single implicit dense kinds, the carried kind, the double
+  implicit contracted axis and the double implicit batch axis.
+* One case still broadcasts under the default and is the subject of this whole
+  finding: the single implicit sparse axis. `GRAPHAX_TILED_LAZY=full` removes
+  it by algebra, and section (c) is the rule for when to pay for that.
+* The uniform operand needs no rule of its own. It never was the cause.
+* Three cases are untested here because neither target reaches them: the
+  genuine LCM grid, the spatial_sparse pairing and the partially stored
+  extent. All three fall back to the incumbent frame slot for slot today, so
+  all three still broadcast. They need a target before .28.2 can claim them.
+
 ## What I did not do
 
 **The TLM Markowitz latency never landed.** On CPU the multiply-then-reduce
@@ -384,11 +621,23 @@ same stage hit the probe's 7200-second cap. Both are recorded above as compile
 records, which is the datum that matters there. A rerun would need the shrunk
 protocol and a guard around `measure`.
 
-**I ran two jobs per device, not one.** The first pair (63828, 63829) carried
-both halves; its sweep half succeeded and its engine half died at import on an
-env var that ticket dsnn-3qm.64 deleted. The second pair (63830, 63831) re-ran
-only the engine half. No extra measurement was taken. Only one of my jobs was
-on the cluster per device at any time.
+**I ran three jobs per device, not one.** The first pair (63828, 63829)
+carried the sweep and an engine half that died at import on an env var ticket
+dsnn-3qm.64 deleted. The second pair (63830, 63831) re-ran only the engine
+half. The third pair (63843, 63844) is the two later deliverables the owner
+added. Only one of my jobs was on the cluster per device at any time.
+
+**The fold the owner proposed could not be applied.** The 12 slice copies are
+12 distinct pieces of the target's own QKV split, built upstream of the
+contraction engine, so "build the operand once in the shape the dot wants" is
+not a change the emission site can make. I measured the copies in isolation at
+exactly those shapes instead, which answers the same question.
+
+**Three of the ten implicit cases were never exercised.** The genuine LCM
+grid, the spatial_sparse pairing and the partially stored extent do not occur
+in any contraction of the MLP toy, NeuralNetwork or test_14. Their rows in the
+census are read off `_lazy_frame`, not measured. A target that reaches them is
+needed.
 
 **The sweep is one seed and one pairing type**: the single implicit sparse
 axis on an aligned grid. It does not cover the spatial-sparse pairing or the
