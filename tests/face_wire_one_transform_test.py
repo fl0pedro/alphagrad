@@ -278,23 +278,24 @@ def test_head_tokens_equal_the_measured_graphs_tokens(monkeypatch, approx_add):
         T, rows, skips)
 
 
-def test_the_add_choice_is_INVISIBLE_in_the_token_stream(monkeypatch):
-    """MEASURED CONSEQUENCE OF #73, pinned so it cannot change unnoticed.
+def test_the_head_still_sees_the_add_choice(monkeypatch):
+    """MEASURED, and NOT by the route the retired flag used.
 
-    Under the retired ``--approx-old same`` the old edge carried the new slot's
-    own Quant, so the join face's token chunk differed from ``exact``'s -- the
-    head could SEE the configuration in its observation. A join POLICY is
-    dispatched on by type in graphax's merge branch and never reaches
-    ``_apply_face_transform``, so it emits no ``approx`` record and the token
-    stream is IDENTICAL under both values.
+    Under ``--approx-old same`` the old edge carried the new slot's own Quant,
+    so the join face's token chunk differed from ``exact``'s through a RECORDED
+    micro-action. A join policy records nothing: it is dispatched on by type in
+    graphax's merge branch and never reaches ``_apply_face_transform``, which
+    ``test_the_diff_probe_is_empty`` pins directly (the firing log is
+    ``["new"]`` under both values).
 
-    That is correct for what the tokens are (the plan's micro-actions, and a
-    reconciliation is not one) and it is a real limitation: within an episode
-    the head cannot observe which join semantics it ran under. It is still
-    learnable, because the REWARD carries it -- the two values change the
-    measured cost and quality, which is exactly why they are declared NOT
-    comparable. A future ``choose`` value emits the bit from the head itself,
-    so the head knows its own choice without needing to read it back.
+    The streams nonetheless DIFFER, and that matters for the head's
+    observation: a ``lossy`` policy DROPS values, so it arms graphax's approx
+    configuration exactly as a ``Diag`` does (``core._is_approx_cfg`` and the
+    ``jacve`` dispatch flag both name ``FaceJoinPolicy``), and the armed path
+    produces a different elimination. So the configuration is observable
+    without the reconciliation masquerading as an approximation record.
+
+    Measured, job 64658: asserting the streams were IDENTICAL failed.
     """
     T = _toy()
     rows, skips = _quant_new_rows()
@@ -302,9 +303,9 @@ def test_the_add_choice_is_INVISIBLE_in_the_token_stream(monkeypatch):
     lossy = _tokens_from_wire(T, rows, skips)
     _set(monkeypatch, "lossless")
     lossless = _tokens_from_wire(T, rows, skips)
-    assert lossy == lossless, (
-        "a join policy must record no micro-action; if the streams differ, "
-        "something is recording the reconciliation as an approximation")
+    assert lossy != lossless, (
+        "the two join semantics produce the same token stream, so the head "
+        "cannot observe which one it ran under")
     # An all-NONE wire builds no entry at all, under either value.
     blank = np.full((MAX_FACES, FACE_SLOTS, 3), -1, np.int32)
     blank[..., 2] = 0
