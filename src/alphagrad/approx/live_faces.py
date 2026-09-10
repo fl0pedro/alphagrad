@@ -852,8 +852,9 @@ class LiveFaceStream:
         face wire becomes a graphax entry -- so the sites recorded here are
         by construction the sites the measurement installs. Returns
         ``{face key: {site: live SparseTensor}}`` keyed by
-        ``env.face_slot_sites()``'s names (``"lhs"``, ``"rhs"``, ``"res:new"``
-        and, when the face HAS an old edge, ``"res:jr"``).
+        ``env.face_slot_sites()``'s names, which under ``--approx-add`` are
+        ``"lhs"``, ``"rhs"`` and ``"res:new"`` -- one site per slot, all of them
+        PRE-JOIN.
 
         Finding 72 / ticket .59 fault 1: this used to hard-code
         ``((lhs, rhs, new), (None, None, None))``, recording the fresh
@@ -889,9 +890,16 @@ class LiveFaceStream:
             # ONE recorder per SITE: face_entry_from_slots installs a slot's
             # single hook at several sites, and `at_site` is the only way to
             # tell those invocations apart (the objects are identical).
+            # at_join -> None: the join POLICY is dropped for the probe. Safe,
+            # because every site a slot hook is installed at is PRE-JOIN, so
+            # the reconciliation cannot change a tensor recorded here, and this
+            # elimination is undone in full by the snapshot. Keeping it would
+            # make every probe pay the reconciliation's arithmetic for a result
+            # nothing reads.
             ft = {k: face_entry_from_slots(
                       (0, 1, 2),
-                      at_site=lambda site, _h, k=k: _mk(k, site))
+                      at_site=lambda site, _h, k=k: _mk(k, site),
+                      at_join=lambda _p: None)
                   for k in keys}
         else:
             ft = {k: (None, None, _mk(k)) for k in keys}

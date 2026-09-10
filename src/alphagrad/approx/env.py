@@ -4868,7 +4868,7 @@ def _join_outcome_sink():
     return _sink
 
 
-def face_entry_from_slots(slots, at_site=None):
+def face_entry_from_slots(slots, at_site=None, at_join=None):
     """ONE face's ``face_transforms`` entry from its decoded per-slot hooks
     ``(lhs, rhs, new)`` -- the ONLY place a face wire becomes a graphax entry
     (ticket .17, D1). ``_face_dict_for_vertex`` (the measurement),
@@ -4930,9 +4930,22 @@ def face_entry_from_slots(slots, at_site=None):
     through THIS function precisely so the set of sites it records can never
     drift from the set the measurement installs -- the drift that made the
     ``new`` slot's mask clear Diags the engine refused on the old edge
-    (finding 72, ticket .59 fault 1). The join POLICY is not passed through
-    ``at_site``: it is not a hook, it applies no wire row, and there is no mask
-    for it to answer for.
+    (finding 72, ticket .59 fault 1).
+
+    ``at_join(policy)`` -- a SEPARATE adapter for the join policy, and separate
+    on purpose: the policy is not a hook (it takes two tensors, not one), it
+    applies no wire row, and there is no mask for it to answer for, so routing
+    it through ``at_site`` would hand a per-SITE callback an object that has no
+    site. It returns the object to place at ``jr``; the default is the policy
+    itself.
+
+    The legality probe passes ``at_join=lambda _p: None``. That is SAFE, not a
+    shortcut: every site a slot hook is installed at is PRE-JOIN
+    (:func:`face_slot_sites` is all ``lhs`` / ``rhs`` / ``res:new``), so the
+    reconciliation cannot change any tensor the probe is recording, and the
+    probe's elimination runs inside a snapshot that is undone in full. Leaving
+    the live policy in would make every probe perform the reconciliation's
+    arithmetic for a result nothing reads.
     """
     from graphax.sparse.ops.join import MatchFreshJoin
 
@@ -4966,8 +4979,10 @@ def face_entry_from_slots(slots, at_site=None):
     # list drift from the measurement's (finding 72).
     _armed = any(h is not None for h in (slots[0], slots[1], _new_hook))
     if mode == "lossy" and _armed:
-        return (core3, (None, MatchFreshJoin(on_outcome=_join_outcome_sink()),
-                        None))
+        policy = MatchFreshJoin(on_outcome=_join_outcome_sink())
+        if at_join is not None:
+            policy = at_join(policy)
+        return (core3, (None, policy, None))
     if mode in ("lossy", "lossless"):
         return (core3, (None, None, None))
     raise NotImplementedError(

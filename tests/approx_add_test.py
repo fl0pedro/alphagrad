@@ -233,6 +233,31 @@ def test_an_UNARMED_face_gets_no_join_policy(monkeypatch):
     assert entry[1][1] is not None and entry[1][1].mode == "lossy"
 
 
+def test_at_join_lets_the_legality_probe_drop_the_policy(monkeypatch):
+    """The probe must not pay for a reconciliation nothing reads.
+
+    Every site a slot hook is installed at is PRE-JOIN, so the policy cannot
+    change a tensor the probe records, and the probe's elimination is undone by
+    its snapshot. ``at_join`` is separate from ``at_site`` because the policy
+    has no site: it takes two tensors, applies no wire row, and answers to no
+    mask.
+    """
+    monkeypatch.delenv("ALPHAGRAD_APPROX_OLD", raising=False)
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", "lossy")
+    hook = (lambda st: st)
+    seen = []
+    entry = envmod.face_entry_from_slots(
+        (None, None, hook), at_join=lambda p: seen.append(p.mode) or None)
+    assert seen == ["lossy"], seen
+    assert entry == ((None, None, hook), (None, None, None)), entry
+    # and the default keeps the live policy
+    entry = envmod.face_entry_from_slots((None, None, hook))
+    assert entry[1][1] is not None and entry[1][1].mode == "lossy"
+    # every site a slot hook reaches is pre-join, which is what makes the
+    # drop safe -- stated here so the two cannot drift
+    assert envmod.face_slot_sites() == (("lhs",), ("rhs",), ("res:new",))
+
+
 def test_the_default_is_lossy(monkeypatch):
     entry, log, _ = _emit_and_eliminate(monkeypatch, None)
     assert envmod.approx_add() == "lossy"
