@@ -263,8 +263,13 @@ def test_the_all_rev_pair_differs_only_in_the_face_add(gen, campaign):
             continue  # one ppo job per node: the pair sits on two nodes
         assert same[k] == exact[k], k
     ts, te = gen.render(same), gen.render(exact)
-    assert "test_face_two_op_form.py" in ts     # the two-op pre-flight (.56)
-    assert "test_face_two_op_form.py" not in te
+    # The two-op pre-flight runs under BOTH values now (.56, finding 73):
+    # `lossless` is the two-op form with an all-None join triple and `lossy`
+    # adds a join policy to it, so both need graphax to accept the form. Under
+    # the retired names only `same` did, because `exact` emitted the bare
+    # triple.
+    assert "test_face_two_op_form.py" in ts
+    assert "test_face_two_op_form.py" in te
     assert "  --approx-add lossless\n" in te
 
 
