@@ -117,13 +117,33 @@ def _features():
         valid_mask=jnp.ones((N_AX,), jnp.float32))
 
 
+def _diag_wire(i, j, n_out):
+    """``(bi1, bi2)`` or None, MIRRORING ``env.micro_actions_to_rule_specs_jax``.
+
+    The wire's bi1 is the OUT-side relative position and bi2 the PRIMAL-side
+    one, so a pair the head emits as (primal, out) has to be SWAPPED, and a
+    same-side pair cannot be expressed at all. ``masks.slot_legality`` fills
+    ``pair[i][j]`` for both orders of a legal pair (it builds the Diag with the
+    out index first either way), so an encoder that does not swap asks the
+    engine for a row it cannot decode -- measured on TLM as 43 of 68 Diag
+    requests "rejected" when the fault was here.
+    """
+    i, j, n_out = int(i), int(j), int(n_out)
+    out_i, out_j = i < n_out, j < n_out
+    if out_i == out_j:
+        return None                      # same side: inexpressible
+    rel_i = i if out_i else i - n_out
+    rel_j = j if out_j else j - n_out
+    return (rel_i, rel_j) if out_i else (rel_j, rel_i)
+
+
 def _row_to_wire(op, i, j, axis, dtype_idx, n_out):
-    """The (op, fields) the head chose -> the ``[bi1, bi2, factor]`` wire row
-    the engine decodes. One encoder, the same one ``micro_actions_to_rule_specs``
-    uses: Diag writes ``bi2 = j - n_out``, Reduce writes the axis token, Quant
-    writes the dtype index."""
+    """The (op, fields) the head chose -> the ``[bi1, bi2, factor]`` wire row.
+    ``None`` when the head's pair has no wire form, which is NOT a rejection:
+    the engine marks the row unused too (``diag_used & ~same_side``)."""
     if op == OP_BLOCKDIAG:
-        return (int(i), int(j) - int(n_out), -1)
+        bi = _diag_wire(i, j, n_out)
+        return None if bi is None else (bi[0], bi[1], -1)
     if op == OP_REDUCE:
         return (int(envmod.COMPRESS_SENTINEL), int(axis), 0)
     if op == OP_QUANT:
@@ -175,11 +195,14 @@ def _walk(target, seed):
                 op = int(row["op_type"][s])
                 if op == OP_NONE:
                     continue
-                kind = _OP_KIND[op]
-                requested[kind] += 1
-                rows[f, s] = _row_to_wire(
-                    op, row["i"][s], row["j"][s], row["i"][s],
-                    row["quant_dtype"][s], nout[f, s])
+                w = _row_to_wire(op, row["i"][s], row["j"][s], row["i"][s],
+                                 row["quant_dtype"][s], nout[f, s])
+                if w is None:
+                    # No wire form. The engine drops it too, so it is not a
+                    # request the apply path ever sees.
+                    continue
+                requested[_OP_KIND[op]] += 1
+                rows[f, s] = w
         per_face = _face_dict_for_vertex(config, ij, v, rows, skips)
         arm_face_counts()
         try:
