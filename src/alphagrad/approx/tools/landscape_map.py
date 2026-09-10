@@ -315,6 +315,10 @@ def make_argparser() -> argparse.ArgumentParser:
 # therefore a copy, and ``tests/approx_add_test.py`` asserts it still equals
 # ``env.APPROX_ADD_CHOICES`` / ``env.APPROX_ADD_DEFAULT`` -- a drift is a test
 # failure, not a silently different choice list.
+# The FIXED values only. `choose` decides the join per face from the head's
+# bit, and this tool replays plans through `_face_dict_for_vertex` without a
+# `face_join` channel, so `choose` would raise at the first armed merge face.
+# Not offered rather than offered-and-broken.
 _APPROX_ADD_CHOICES = ("lossy", "lossless")
 _APPROX_ADD_DEFAULT = "lossy"
 

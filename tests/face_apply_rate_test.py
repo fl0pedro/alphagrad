@@ -78,6 +78,18 @@ def _closed(fn, xs):
     return cj if jx is cj.jaxpr else ClosedJaxpr(jx, consts)
 
 
+# ==========================================================================
+# nn256 AND THE FACE ADD: nn256 CANNOT EXERCISE IT. Measured (finding 73, jobs
+# 64653 and 64659): VmappedNeuralNetwork on mnist has ZERO MERGE FACES among
+# armed faces -- graphax's `res:jl` and `res:jr` were invoked 0 times on every
+# seed, with the `new` slot armed alone AND with all three slots armed. A face
+# merge needs the contraction to land on an edge that ALREADY exists, and on
+# this target no armed face does.
+#
+# So `--approx-add` has no effect whatsoever on nn256, and a GREEN nn256 run is
+# NOT evidence that the ADD works. Every nn256 case below tests the per-slot
+# contraction legality only. The ADD is measured on TLM.
+# ==========================================================================
 @pytest.fixture(scope="module")
 def nn256():
     _, args_key, _ = jrand.split(jrand.PRNGKey(7), 3)

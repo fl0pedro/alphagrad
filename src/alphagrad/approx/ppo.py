@@ -83,6 +83,7 @@ from alphagrad.approx.env import (
     quality_metric as _env_quality_metric,
     APPROX_ADD_CHOICES,
     APPROX_ADD_DEFAULT,
+    APPROX_ADD_FIXED,
     _AXIS_FEAT_GROUP_ID,
     consume_degenerate_plan_count,
     consume_fidelity_stats,
@@ -4506,7 +4507,13 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--approx-add",
-        choices=list(APPROX_ADD_CHOICES),
+        # ONLY THE FIXED VALUES ARE CLI-REACHABLE. `choose` exists in
+        # env.APPROX_ADD_CHOICES and the engine honours it per face, but the
+        # ROLLOUT WIRE does not carry face_join yet, so a run started with it
+        # would raise at the first armed merge face. A flag that dies mid-run
+        # is worse than one that is not offered: offer it when the transport
+        # lands (finding 73 section 9).
+        choices=list(APPROX_ADD_FIXED),
         default=APPROX_ADD_DEFAULT,
         help="THE ADD (ticket .56, finding 73). A face accumulation "
         "multiplies lhs by rhs into new and, when the predecessor-to-"
@@ -4519,7 +4526,11 @@ def make_argparser() -> argparse.ArgumentParser:
         "information possible: the sum's support is the UNION of the two "
         "supports, so no non-zero of either addend is dropped (graphax's "
         "sparse + already builds that container: meta gcd, block lcm). "
-        "The two are NOT comparable: the choice changes the measured object. "
+        "(A third value, choose -- the head picks per face from its own logit "
+        "-- exists in env.APPROX_ADD_CHOICES and is honoured by the engine, "
+        "but is not offered here until the rollout wire carries the bit.) "
+        "The values are NOT comparable: the choice changes the measured "
+        "object. "
         "Published as ALPHAGRAD_APPROX_ADD (read by env.approx_add) so the "
         "Ray measure actors resolve the SAME configuration as the trainer; "
         "every plan-log record carries the value that measured it.",

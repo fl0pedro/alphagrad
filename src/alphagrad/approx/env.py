@@ -4767,6 +4767,12 @@ def make_slot_frame_hook(one_row, *, stats: dict | None = None,
 #               addend is dropped. Replaces ``exact`` (which was neither: it
 #               put the `new` slot's rule on the POST-JOIN SUM, approximating
 #               the merge instead of the contraction).
+#   choose   -- the HEAD picks one of the two PER FACE, one bit, from its own
+#               logit (``unified_face_head.O_CHOOSE``). The bit rides the wire
+#               as ``face_join[f]``: 0 = lossy, 1 = lossless
+#               (``JOIN_LOSSY`` / ``JOIN_LOSSLESS``). There is NO legality mask
+#               on it, because both arms are always formable -- see
+#               ``face_entry_from_slots``.
 #
 # WHY ``same`` AND ``exact`` ARE GONE RATHER THAN ALIASED. Both old names map
 # onto a DIFFERENT object than their replacement measures:
@@ -4787,7 +4793,10 @@ def make_slot_frame_hook(one_row, *, stats: dict | None = None,
 # the plan log records what actually ran. Read at call time, never at import.
 _APPROX_ADD_ENV = "ALPHAGRAD_APPROX_ADD"
 _APPROX_OLD_ENV = "ALPHAGRAD_APPROX_OLD"          # RETIRED, raises
-APPROX_ADD_CHOICES = ("lossy", "lossless")
+APPROX_ADD_CHOICES = ("lossy", "lossless", "choose")
+#: The values whose join semantics is FIXED for the whole run. ``choose`` is
+#: not one of them: it is decided per FACE by the head's bit.
+APPROX_ADD_FIXED = ("lossy", "lossless")
 #: The declared default. ``lossy`` and not ``lossless`` because the measured
 #: cost of a union container is not a detail: on TLM (seq 16, dmodel 64,
 #: vocab 256, min-Markowitz, 3 seeds) the summed edge's ``val`` is 9.8 MB
@@ -4833,6 +4842,54 @@ def approx_add() -> str:
     return want
 
 
+def resolve_join_mode(mode=None) -> str:
+    """The join semantics for ONE face: ``"lossy"`` or ``"lossless"``.
+
+    ``mode`` is the per-FACE override the ``choose`` bit decodes to. ``None``
+    means "take it from the configuration", which is only answerable when the
+    configuration FIXES it:
+
+    * a fixed value (:data:`APPROX_ADD_FIXED`) answers for every face;
+    * ``choose`` does NOT -- the decision is the head's, one bit per face, so a
+      caller that reaches here with ``mode=None`` under ``choose`` has lost the
+      bit somewhere between the wire and the entry builder. That raises. It must
+      not silently become ``lossy``: the plan would then be measured under a
+      semantics the policy did not choose, and the log-prob the trainer stored
+      would score a decision that never ran.
+    """
+    cfg = approx_add()
+    if mode is None:
+        if cfg in APPROX_ADD_FIXED:
+            return cfg
+        raise ValueError(
+            f"--approx-add {cfg!r} decides the join PER FACE, so "
+            f"face_entry_from_slots needs an explicit mode for this face and "
+            f"got None. The bit rides the wire as face_join[f]; a caller that "
+            f"drops it has lost the head's decision, and defaulting here would "
+            f"measure a plan under a semantics the policy did not choose.")
+    if mode not in APPROX_ADD_FIXED:
+        raise ValueError(
+            f"per-face join mode must be one of {APPROX_ADD_FIXED}, got "
+            f"{mode!r}.")
+    if cfg in APPROX_ADD_FIXED and mode != cfg:
+        raise ValueError(
+            f"--approx-add {cfg!r} FIXES the join semantics, but this face was "
+            f"handed mode={mode!r}. A per-face override is only meaningful "
+            f"under 'choose'; accepting it here would let a wire silently "
+            f"override the flag.")
+    return mode
+
+
+def join_mode_of_bit(bit) -> str:
+    """``face_join[f]`` -> the join semantics it names.
+
+    ONE decoder for the bit, so the head's encoding
+    (:data:`~alphagrad.approx.unified_face_head.JOIN_LOSSY` = 0 = ``lossy``)
+    and the engine's reading of it cannot drift.
+    """
+    return "lossless" if int(bit) else "lossy"
+
+
 def _join_outcome_sink():
     """The telemetry sink handed to a join policy, or ``None`` when unarmed.
 
@@ -4868,7 +4925,7 @@ def _join_outcome_sink():
     return _sink
 
 
-def face_entry_from_slots(slots, at_site=None, at_join=None):
+def face_entry_from_slots(slots, at_site=None, at_join=None, mode=None):
     """ONE face's ``face_transforms`` entry from its decoded per-slot hooks
     ``(lhs, rhs, new)`` -- the ONLY place a face wire becomes a graphax entry
     (ticket .17, D1). ``_face_dict_for_vertex`` (the measurement),
@@ -4957,7 +5014,7 @@ def face_entry_from_slots(slots, at_site=None, at_join=None):
     _new_hook = slots[2] if len(slots) > 2 else None
     core3 = (_at("lhs", slots[0]), _at("rhs", slots[1]),
              _at("res:new", _new_hook))
-    mode = approx_add()
+    mode = resolve_join_mode(mode)
     # AN UNARMED FACE STAYS EXACT, and the gate lives HERE.
     #
     # ``--approx-add`` says how the two addends of the ADD meet, and that is
@@ -5011,9 +5068,17 @@ def face_slot_sites() -> tuple[tuple[str, ...], ...]:
     return tuple(tuple(g) for g in got)
 
 
-def _face_dict_for_vertex(config, ij, v, face_row, face_skip):
+def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
+                          face_join=None):
     """ONE vertex's ``{face_key: slots|SKIP_FACE}`` from its wire rows,
     enumerated on ``ij``'s CURRENT graph — call BEFORE eliminating ``v``.
+
+    ``face_join`` -- the ``(MAX_FACES,)`` int32 per-face JOIN bit of
+    ``--approx-add choose`` (0 = lossy, 1 = lossless). ``None`` under a value
+    that fixes the join semantics for the whole run. It is a SEPARATE channel
+    from ``face_skip`` on purpose: ``face_skip`` means "drop this face's
+    contraction" and overloading its bits with an unrelated decision would make
+    every reader of a field called "skip" wrong.
     Single source of truth for `_face_transforms_for_order` (standalone
     replay) and the unified tokenizer path (ALPHAGRAD_UNIFIED_FACE_ENUM=1),
     which rides the tokenizer's own IncrementalJaxpr instead of replaying a
@@ -5059,7 +5124,14 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip):
                                      gated=True)
                 if one_row[0][0] != -1 else None)
         if any(sl is not None for sl in slots):
-            per_face[key] = face_entry_from_slots(slots)
+            # THE PER-FACE JOIN BIT (#73, --approx-add choose). `face_join` is
+            # the wire's (F,) int32 channel: 0 = lossy, 1 = lossless. Under a
+            # FIXED value it is absent and `resolve_join_mode` answers from the
+            # configuration; under `choose` it must be present, and
+            # `resolve_join_mode` raises rather than guessing if it is not.
+            _mode = (None if face_join is None
+                     else join_mode_of_bit(face_join[f]))
+            per_face[key] = face_entry_from_slots(slots, mode=_mode)
     return per_face
 
 
