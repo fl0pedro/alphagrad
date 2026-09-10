@@ -18,11 +18,12 @@ of them:
 from identity, which is the direction R2 already refused to go. R2's problem
 was that all 16 plans were the same plan, not that the policy moved too much;
 a KL penalty makes that MORE stable, not less. The contrast knob is
-ALPHAGRAD_FACE_NONE_BIAS (agent_factory.py:87-112) and it needs no code.
+--face-none-bias (agent_factory.apply_face_none_bias) and it needs no code.
 Sweep the two together: KL = stability, bias = contrast.
 
-ALPHAGRAD_FACE_NONE_BIAS SWEEP SPEC (no code; env var read at
-common/agent_factory.py:87-112 and printed at init):
+--face-none-bias SWEEP SPEC (no code; the flag is applied in
+common/agent_factory.apply_face_none_bias and printed at init; it was the
+env var ALPHAGRAD_FACE_NONE_BIAS until ticket dsnn-3qm.44):
 
 The identity init adds +B to every slot's OP_NONE logit and -B to SKIP. The
 factory prints ``P(approx/face) ~ 3*e^-B``. That label is off by one factor:

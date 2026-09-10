@@ -41,8 +41,9 @@ REWARD_NAMES: tuple[str, ...] = (
     "bytes_accessed",
     "peak_memory",
     # Slot 6, renamed 2026-08-07 from "cosine_sim": it holds whichever quality
-    # metric ``env.quality_metric()`` selects — the 200-step Adam-walk loss
-    # drop (default under --measure-grad) or the legacy Jacobian cosine. The
+    # metric ``env.quality_metric()`` selects — the gradient cosine (the
+    # default for scalar-loss targets since 2026-09-02), the 200-step
+    # Adam-walk loss drop (by name) or the legacy Jacobian cosine. The
     # slot did not move; ``REWARD_INDEX["cosine_sim"]`` is aliased below.
     "quality",
     # Slot 7. RENAMED HERE 2026-08-28 to match env.REWARD_NAMES, which renamed
@@ -52,6 +53,9 @@ REWARD_NAMES: tuple[str, ...] = (
     # silently weighted COVERAGE. The INDEX does not move and `frob_residual`
     # is aliased onto it below, so every persisted index-keyed PopArt /
     # calibration state and every historical call site is unaffected.
+    # RESERVED since 2026-09-03 (owner ruling 2026-09-03, ticket dsnn-3qm.15): the coverage guard, channel and
+    # value head were removed; env emits 0.0 here, always. Name and index
+    # kept so archived plan logs and index-keyed state stay readable.
     "grad_coverage",
     # RECONCILED (2026-08): this tuple is a SUPERSET of env.REWARD_NAMES, not a
     # copy of it. Indices 0..8 are byte-identical to the env's 9-channel vector;
@@ -100,8 +104,8 @@ QUALITY_IDX: int = REWARD_INDEX["quality"]
 # working; it is the QUALITY slot, which no longer necessarily holds a cosine.
 COSINE_SIM_IDX: int = QUALITY_IDX
 # Slot 7. `FROB_RESIDUAL_IDX` is retained as the historical spelling only --
-# it is the GRADIENT COVERAGE slot, not a Frobenius residual. New code should
-# use GRAD_COVERAGE_IDX (slot 7) or FIDELITY_IDX (slot 8), which is the one
+# it is the RESERVED slot (gradient coverage until 2026-09-03), not a Frobenius
+# residual. New code should use FIDELITY_IDX (slot 8), which is the one
 # that really is a (clipped, relative) Frobenius number.
 GRAD_COVERAGE_IDX: int = REWARD_INDEX["grad_coverage"]
 FROB_RESIDUAL_IDX: int = GRAD_COVERAGE_IDX
@@ -115,8 +119,7 @@ SPARSITY_IDX: int = REWARD_INDEX["sparsity"]
 # ppo_ray_worker.py:80.
 # FIDELITY joins them: `clip(1 - rel_frob, -1, 1)` is bounded by construction,
 # so symlog would only discount its per-unit price against the cost channels.
-# (Slot 7 / grad_coverage is bounded too; it is exempted at the ppo.py site
-# instead, conditionally, so the flag-off mask stays bit-identical to HEAD.)
+# (Slot 7 is reserved and always 0.0; symlog(0) == 0, so it needs no entry.)
 # SPARSITY joins them for the same reason as FIDELITY: `clip(1 - ratio,
 # -1, 1)` is bounded by construction, so symlog would only discount its
 # per-unit price against the ~1e5..1e10 cost channels.
@@ -278,9 +281,8 @@ def build_reward_weights(args) -> np.ndarray:
     # reward vector already stores costs NEGATED (r = -cost) and the quality
     # channels (cosine_sim, bkstep_acc) POSITIVE, so a single POSITIVE weight
     # per channel gives the correct sign (reward low-cost + high-fidelity).
-    # grad_coverage and fidelity are BOTH stored "higher is better" and bounded
-    # in [-1, 1] (coverage: +min_leaf_ratio / -frac_zeroed; fidelity:
-    # clip(1 - rel_frob, -1, 1)), so they too take a positive weight. Uniform weight (default 1.0, ALPHAGRAD_ALL_CHANNEL_W)
+    # fidelity is stored "higher is better" and bounded in [-1, 1]
+    # (clip(1 - rel_frob, -1, 1)), so it too takes a positive weight. Uniform weight (default 1.0, ALPHAGRAD_ALL_CHANNEL_W)
     # since PopArt handles the disparate raw scales. Channels that are not
     # actually populated are left at 0 so a dead channel (e.g. latency without
     # --measure-latency, bkstep without ALPHAGRAD_BKSTEP=1) never enters the
@@ -353,10 +355,8 @@ def build_reward_weights(args) -> np.ndarray:
             # ONE memory channel: xla_peak_memory was a duplicate of
             # peak_memory and double-weighted memory in the all-channel reward.
             "peak_memory", "cosine_sim",
-            # Spelt correctly since 2026-08-28: this index is GRADIENT
-            # COVERAGE. The name changed, the index did not, so this entry is
-            # byte-identical to the "frob_residual" it replaces.
-            "grad_coverage",
+            # Slot 7 (grad_coverage, RESERVED since 2026-09-03) is NOT in the
+            # set: a channel the env never populates must not enter the sum.
         ]
         if bool(getattr(args, "measure_latency", False)) or \
                 getattr(args, "cmp_type", "") == "latency":
@@ -371,7 +371,8 @@ def build_reward_weights(args) -> np.ndarray:
         # is being measured. "all channels" means "every channel we have a
         # number for", and a uniform positive weight on sparsity is a
         # uniform positive weight on DELETING COMPUTATION -- the reward
-        # hack --reject-frozen-grads exists to refuse. It is reachable
+        # hack nothing refuses any more (the coverage guard was removed
+        # 2026-09-03). It is reachable
         # only by naming it: --lambda-sparsity, or an explicit
         # ALPHAGRAD_REWARD_CHANNELS entry.
         for _nm in _names:

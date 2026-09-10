@@ -74,13 +74,15 @@ from alphagrad.approx.common import (
     shuffle_and_batch_by_trajectory,
     vertex_avail_at_step,
 )
+from alphagrad.approx.common.order import (
+    FIXED_ORDER_CHOICES as _FIXED_ORDER_CHOICES,
+    fixed_order_for_env as _fixed_order_for_env,
+)
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
     quality_metric as _env_quality_metric,
     _AXIS_FEAT_GROUP_ID,
     consume_degenerate_plan_count,
-    consume_frozen_grad_plan_count,
-    consume_grad_coverage_stats,
     consume_fidelity_stats,
     consume_sparsity_stats,
     consume_truncated_plan_count,
@@ -115,7 +117,7 @@ from alphagrad.approx.common.face_driver import (
     bind_step_callbacks,
     build_live_face_stream,
     make_face_callbacks,
-    make_face_sizes_callback,
+    make_face_slot_legality_callback,
 )
 from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
 from alphagrad.approx.heads import (
@@ -146,6 +148,7 @@ from alphagrad.transformer.palimpsa_encoder import (
 from alphagrad.approx.common import delta_fold as _fold
 from alphagrad.approx.common import feature_probe as _fprobe
 from alphagrad.approx.common import var_probe as _vprobe
+from alphagrad.approx.common import gate_telemetry as _gate_telemetry
 
 # Same switch carry_stream reads, so one flag turns the whole fold on or
 # off rather than leaving half the consumers folded and half not.
@@ -351,26 +354,21 @@ NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
 # `_popart_rescale_heads` and `Agent.encode`'s concatenation.
 VALUE_HEAD_ATTRS: tuple[str, ...] = (
     "value_head_flops", "value_head_mem", "value_head_cos")
-# --grad-coverage-weight > 0 APPENDS a FOURTH head on reward slot 7
-# (``grad_coverage``); `configure_grad_coverage` rebinds the four names above
-# before the agent is built and before any jit trace, exactly as
-# `configure_symlog` rebinds the symlog mask. Default 0 => three heads and a
-# bit-identical agent pytree (pinned by tests/grad_coverage_test.py).
-GRAD_COVERAGE_HEAD = "value_head_gcov"
 # --fidelity-weight > 0 APPENDS a head on reward slot 8 (``fidelity``, the
 # CLIPPED RELATIVE FROBENIUS -- workstream A2, the owner's trained fidelity
-# signal). Same mechanism, same discipline as the coverage head above: default
-# 0 => the head is not constructed, contributes no pytree leaves, and every
-# saved checkpoint keeps loading. INDICES ARE ONLY EVER APPENDED, never
-# inserted, because persisted PopArt state is keyed by index.
+# signal). `configure_fidelity` rebinds the names above before the agent is
+# built and before any jit trace, exactly as `configure_symlog` rebinds the
+# symlog mask. Default 0 => the head is not constructed, contributes no pytree
+# leaves, and every saved checkpoint keeps loading. INDICES ARE ONLY EVER
+# APPENDED, never inserted, because persisted PopArt state is keyed by index.
+# (A fourth head on reward slot 7, gradient coverage, existed 2026-08-27 to
+# 2026-09-03 and was removed by owner ruling, ticket dsnn-3qm.15.)
 FIDELITY_HEAD = "value_head_fid"
 # --sparsity-weight > 0 APPENDS a head on reward slot 10 (``sparsity``,
 # the stored-byte ratio against the exact plan on the same order). Same
-# mechanism and same discipline as the two heads above: default 0 => the
+# mechanism and same discipline as the fidelity head above: default 0 => the
 # head is not constructed, contributes no pytree leaves, and every saved
-# checkpoint keeps loading. INDICES ARE ONLY EVER APPENDED. Unlike the
-# other two this head also requires --reject-frozen-grads; see
-# `configure_sparsity` for why that is refused rather than warned about.
+# checkpoint keeps loading. INDICES ARE ONLY EVER APPENDED.
 SPARSITY_HEAD = "value_head_spars"
 # Resolved from --quality-metric in `main`; names the quantity reward slot 6
 # actually holds, for every human-readable log line and the wandb
@@ -379,62 +377,27 @@ _QUALITY_METRIC: str = "quality"
 HEAD_NAMES: tuple[str, ...] = ("latency", "mem", "quality")
 
 
-def configure_grad_coverage(args) -> tuple[bool, float]:
-    """Install the gradient-coverage configuration. PRE-EVERYTHING.
+def configure_fidelity(args) -> tuple[float, int]:
+    """Install the fidelity-channel configuration. PRE-EVERYTHING.
 
     Must run BEFORE ``ray.init`` (the measure actors read the exported
-    environment), BEFORE ``_build_agent`` (the fourth value head changes the
+    environment), BEFORE ``_build_agent`` (an extra value head changes the
     agent pytree and ``pref_proj``'s input width) and BEFORE the first jit
-    trace (``_HEAD_REWARD_INDICES_ARR`` is captured as a constant).
-
-    Returns ``(guard_on, weight)``.
+    trace (``_HEAD_REWARD_INDICES_ARR`` is captured as a constant). The
+    appended head order is deterministic: [latency, mem, quality, (fidelity),
+    (sparsity)].
 
     WHY ENV VARS AND NOT ARGS. Measurement happens in the Ray measure actors
     (``--ray-measure``), which are separate processes that never see
     ``args``. Every other measurement switch in this project travels the same
-    way (ALPHAGRAD_DIRECT_MEASURE, ALPHAGRAD_MEASURE_WARMUP, ...), and env.py
-    deliberately defaults the whole feature OFF when the variables are absent
-    so that a job launched before this commit cannot pick the guard up from a
-    respawned actor.
-    """
-    global HEAD_REWARD_INDICES, NUM_VALUE_HEADS, HEAD_NAMES
-    global VALUE_HEAD_ATTRS, _HEAD_REWARD_INDICES_ARR
-    guard = bool(getattr(args, "reject_frozen_grads", False))
-    weight = float(getattr(args, "grad_coverage_weight", 0.0) or 0.0)
-    os.environ["ALPHAGRAD_REJECT_FROZEN_GRADS"] = "1" if guard else "0"
-    os.environ["ALPHAGRAD_GRAD_COVERAGE_WEIGHT"] = repr(weight)
-    if weight != 0.0 and GRAD_COVERAGE_HEAD not in VALUE_HEAD_ATTRS:
-        # IDEMPOTENT: main() calls this once, but a test (or a caller that
-        # re-parses args) must not append the head twice.
-        HEAD_REWARD_INDICES = tuple(HEAD_REWARD_INDICES) + (
-            int(REWARD_INDEX["grad_coverage"]),)
-        HEAD_NAMES = tuple(HEAD_NAMES) + ("grad_cov",)
-        VALUE_HEAD_ATTRS = tuple(VALUE_HEAD_ATTRS) + (GRAD_COVERAGE_HEAD,)
-        NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
-        _HEAD_REWARD_INDICES_ARR = jnp.asarray(
-            HEAD_REWARD_INDICES, dtype=jnp.int32)
-    return guard, weight
-
-
-def configure_fidelity(args) -> tuple[float, int]:
-    """Install the fidelity-channel configuration. PRE-EVERYTHING.
-
-    Same contract and the same three "before"s as
-    :func:`configure_grad_coverage` -- before ``ray.init`` (the measure actors
-    read the exported environment), before ``_build_agent`` (an extra value
-    head changes the agent pytree and ``pref_proj``'s input width) and before
-    the first jit trace (``_HEAD_REWARD_INDICES_ARR`` is captured as a
-    constant). CALL IT AFTER ``configure_grad_coverage`` so the appended head
-    order is deterministic: [latency, mem, quality, (grad_cov), (fidelity)].
+    way, and env.py defaults the channel OFF when the variables are absent.
 
     Returns ``(weight, cos_log_every)``.
 
     WHAT IT COSTS. The fidelity channel needs the EXACT Jacobian, which the
-    default ``loss_drop`` quality metric never builds. With
-    ``--reject-frozen-grads`` on (the default) that reference is being
-    materialised anyway for the coverage guard and env.py folds both scores
-    into the one execution; with the guard OFF, turning this on buys a full
-    exact reference per plan. The measured price is published every episode as
+    ``loss_drop`` quality metric never builds: turning this on buys one
+    exact reference per terminal plan unless the quality metric is a cosine
+    (the default ``grad_cosine`` builds it anyway). The measured price is published every episode as
     ``fidelity/wall_amortised_s``.
     """
     global HEAD_REWARD_INDICES, NUM_VALUE_HEADS, HEAD_NAMES
@@ -444,8 +407,8 @@ def configure_fidelity(args) -> tuple[float, int]:
     os.environ["ALPHAGRAD_FIDELITY_WEIGHT"] = repr(weight)
     os.environ["ALPHAGRAD_COS_LOG_EVERY"] = str(max(0, cos_every))
     if weight != 0.0 and FIDELITY_HEAD not in VALUE_HEAD_ATTRS:
-        # IDEMPOTENT, like the coverage twin: a caller that re-parses args
-        # must not append the head twice.
+        # IDEMPOTENT: a caller that re-parses args must not append the head
+        # twice.
         HEAD_REWARD_INDICES = tuple(HEAD_REWARD_INDICES) + (
             int(REWARD_INDEX["fidelity"]),)
         HEAD_NAMES = tuple(HEAD_NAMES) + ("fidelity",)
@@ -465,22 +428,23 @@ def configure_sparsity(args) -> float:
     ``pref_proj``'s input width) and before the first jit trace
     (``_HEAD_REWARD_INDICES_ARR`` is captured as a constant). CALL IT AFTER
     ``configure_fidelity`` so the appended head order stays deterministic:
-    [latency, mem, quality, (grad_cov), (fidelity), (sparsity)].
+    [latency, mem, quality, (fidelity), (sparsity)].
 
     Returns the weight.
 
-    THE GUARD IS A HARD PRECONDITION, not advice. Sparsity rewards storing
-    less, an all-SKIP plan stores nothing, and the confirmed TLM reward hack --
-    one skipped face that deletes 62-73% of the backward pass and freezes 11-15
-    of 16 parameter leaves, priced at 0.02% by the 200-step quality probe --
-    scores near the ceiling. `--reject-frozen-grads` is the only thing in the
-    system that refuses that plan, so training this channel with the guard off
-    is asking for the hack directly. Refused here rather than warned about,
-    because the failure is silent and takes a campaign to detect.
+    NO GUARD PRECONDITION (owner ruling 2026-09-03, ticket dsnn-3qm.15). Until
+    then a non-zero weight was REFUSED without ``--reject-frozen-grads``, the
+    gradient-coverage guard. That guard is gone -- no guard, never a reward
+    gate -- so nothing refuses the confirmed TLM reward hack (one skipped face
+    that deletes 62-73% of the backward pass and freezes 11-15 of 16 parameter
+    leaves, priced at 0.02% by the 200-step quality probe) and it scores near
+    this channel's ceiling. READ env._SPARSITY_STATS' hackability warning
+    before putting a weight here; the channel stays default OFF.
 
     WHAT IT COSTS. The tally is taken while `jacve` is TRACED and emits no HLO.
     The approx side rides the compile every plan already pays; the exact side
-    rides the reference `--reject-frozen-grads` already materialises. Where the
+    rides the reference the fidelity channel or a cosine quality metric
+    materialises. Where the
     compile cache serves an executable without tracing, env.py falls back to an
     abstract `jax.eval_shape` walk -- a trace, never a compile or an execution.
     The measured price is published every episode as
@@ -490,21 +454,13 @@ def configure_sparsity(args) -> float:
     global VALUE_HEAD_ATTRS, _HEAD_REWARD_INDICES_ARR
     weight = float(getattr(args, "sparsity_weight", 0.0) or 0.0)
     log_only = bool(getattr(args, "sparsity_log", False))
-    if weight != 0.0 and not bool(getattr(args, "reject_frozen_grads", False)):
-        raise ValueError(
-            "--sparsity-weight/--lambda-sparsity requires the gradient-"
-            "coverage guard: sparsity is maximised by DELETING computation "
-            "(an all-SKIP plan stores nothing and scores the +1 ceiling), and "
-            "--reject-frozen-grads is the only thing that refuses a plan which "
-            "freezes a trainable leaf. Drop --no-reject-frozen-grads, or use "
-            "--sparsity-log to record the channel without training on it.")
     os.environ["ALPHAGRAD_SPARSITY_WEIGHT"] = repr(weight)
     # Set EXPLICITLY in both directions: a measure actor respawned inside a
     # long job must never inherit a stale "on" from an earlier configuration.
     os.environ["ALPHAGRAD_SPARSITY"] = (
         "1" if (weight != 0.0 or log_only) else "0")
     if weight != 0.0 and SPARSITY_HEAD not in VALUE_HEAD_ATTRS:
-        # IDEMPOTENT, like both twins above.
+        # IDEMPOTENT, like configure_fidelity.
         HEAD_REWARD_INDICES = tuple(HEAD_REWARD_INDICES) + (
             int(REWARD_INDEX["sparsity"]),)
         HEAD_NAMES = tuple(HEAD_NAMES) + ("sparsity",)
@@ -523,8 +479,7 @@ def configure_sparsity(args) -> float:
 # rest, and until now the rest was thrown away at the end of every episode.
 # ``--plan-log`` turns on one APPEND-ONLY JSONL per run holding, for EVERY
 # terminal plan: the replayable wire, all 11 reward slots, the per-kind
-# requested / applied / idempotent-no-op counts, the per-leaf coverage census
-# and the episode.
+# requested / applied / idempotent-no-op counts and the episode.
 #
 # THIS IS A LOGGING EXTENSION AND NOTHING ELSE. It reads state that is
 # already materialised, adds no reward, no action, no head, no exact
@@ -566,8 +521,6 @@ def configure_plan_log(args) -> str | None:
         int(getattr(args, "plan_log_cap", 4096) or 4096))
     os.environ["ALPHAGRAD_PLAN_LOG_MAX_FACES"] = str(
         int(getattr(args, "plan_log_max_faces", 0) or 0))
-    os.environ["ALPHAGRAD_PLAN_LOG_MAX_LEAVES"] = str(
-        int(getattr(args, "plan_log_max_leaves", 0) or 0))
     _PLAN_LOG_PATH = str(path)
     return _PLAN_LOG_PATH
 
@@ -848,24 +801,19 @@ def configure_symlog(args) -> str:
     """
     mode = resolve_symlog_channels(args)
     _NO_SYMLOG_ALL[0] = (mode == "none")
-    # GRADIENT COVERAGE is bounded [-1, 1] by construction (env.py's
-    # `_grad_coverage`: +min_leaf_ratio, or -frac_leaves_zeroed), so it needs
-    # no magnitude compression and symlog would only discount its per-unit
-    # price against the cost channels. Exempt it whenever the channel is live,
-    # in EVERY mode -- the same carve-out `cost` gives the quality slot. When
-    # the channel is off the slot is 0.0 and symlog(0) == 0, so adding the
-    # index would be a no-op anyway; it is added conditionally only to keep
-    # the flag-off mask bit-identical to HEAD.
     _exempt: tuple[int, ...] = ()
     if mode == "cost":
         _exempt = (int(REWARD_INDEX["cosine_sim"]),)
     elif mode == "all" and getattr(args, "reward_mode", None) == "lagrangian":
         _exempt = (int(REWARD_INDEX["cosine_sim"]),)
-    if float(getattr(args, "grad_coverage_weight", 0.0) or 0.0) != 0.0:
-        _exempt = _exempt + (int(REWARD_INDEX["grad_coverage"]),)
-    # FIDELITY is bounded [-1, 1] by construction too (env.py's
-    # `clipped_rel_frob`), for exactly the same reason and with exactly the
-    # same conditional-so-the-flag-off-mask-is-bit-identical caveat.
+    # FIDELITY is bounded [-1, 1] by construction (env.py's
+    # `clipped_rel_frob`), so it needs no magnitude compression and symlog
+    # would only discount its per-unit price against the cost channels.
+    # Exempt it whenever the channel is live, in EVERY mode -- the same
+    # carve-out `cost` gives the quality slot. When the channel is off the
+    # slot is 0.0 and symlog(0) == 0, so adding the index would be a no-op
+    # anyway; it is added conditionally only to keep the flag-off mask
+    # bit-identical to HEAD.
     if float(getattr(args, "fidelity_weight", 0.0) or 0.0) != 0.0:
         _exempt = _exempt + (int(REWARD_INDEX["fidelity"]),)
     # SPARSITY is bounded [-1, 1] by construction too (env.py's
@@ -873,6 +821,18 @@ def configure_symlog(args) -> str:
     # mask-is-bit-identical caveat.
     if float(getattr(args, "sparsity_weight", 0.0) or 0.0) != 0.0:
         _exempt = _exempt + (int(REWARD_INDEX["sparsity"]),)
+    # THE QUALITY FLOOR (ticket .9): the hinge channel is bounded like the
+    # lagrangian violation slot and needs the same carve-out, for the same
+    # reason (symlog would discount the per-unit price of a shortfall).
+    if getattr(args, "quality_floor", None) is not None:
+        _exempt = _exempt + (int(REWARD_INDEX["cosine_sim"]),)
+    # THE COST FORM (ticket .9): a paired log-difference is already O(1)
+    # and already logarithmic; symlog on top would bend it a second time.
+    # Both conditional, so the flag-off mask stays bit-identical to HEAD.
+    if getattr(args, "cost_form", "absolute") == "paired-log":
+        _exempt = _exempt + (int(REWARD_INDEX["latency_ns"]),
+                             int(REWARD_INDEX["peak_memory"]))
+    _exempt = tuple(dict.fromkeys(_exempt))
     _set_no_symlog_indices(_exempt)
     return mode
 
@@ -1050,6 +1010,57 @@ def _apply_lagrangian_channels(rewards: "jax.Array", lag_tau: float) -> "jax.Arr
     return rewards.at[..., REWARD_INDEX["cosine_sim"]].set(chan)
 
 
+def _apply_quality_floor(rewards: "jax.Array", tau: float) -> "jax.Array":
+    """``--quality-floor tau`` (ticket dsnn-3qm.9): slot 6 = the HINGE.
+
+    The TERMINAL step carries ``-max(0, tau - q)`` in the quality slot in
+    place of the raw quality ``q``; every other step 0 (sparse-terminal
+    quality, the same masking `_apply_lagrangian_channels` uses). Exactly
+    zero for every plan at or above the floor -- plans at q = 0.95 and
+    q = 0.999 are then compared on cost alone -- and the linear shortfall
+    below it. No clip: quality is grad-cosine, bounded in [-1, 1] by
+    construction, and the ruling is the plain hinge (finding 53). The cost
+    channels pass through untouched, so this composes with any preference
+    over the heads (arm P1) and with --cost-form. The dual-ascent arm L
+    keeps `_apply_lagrangian_channels` (its clip at q_eff = -0.5 is the
+    loss_drop diverged-sentinel convention) with tau supplied by this flag.
+    """
+    terminal = jnp.zeros(rewards.shape[:2], dtype=bool).at[:, -1].set(True)
+    q_raw = rewards[..., REWARD_INDEX["cosine_sim"]]
+    hinge = -jnp.maximum(0.0, jnp.float32(tau) - q_raw)
+    chan = jnp.where(terminal, hinge, 0.0)
+    return rewards.at[..., REWARD_INDEX["cosine_sim"]].set(chan)
+
+
+def _lag_preferences(sampled_pref: "jax.Array", head_weights_np: np.ndarray,
+                     lag_lambda: float, conditioned: bool) -> "jax.Array":
+    """The per-env preference under ``--reward-mode lagrangian``.
+
+    lambda enters the update HERE and ONLY here: the quality slot of the
+    advantage-scalarization preference (the channel stores -violation, so
+    the weight is +lambda; see `_apply_lagrangian_channels`).
+
+    ``conditioned=False`` (the pre-.9 path, bit-identical): the static
+    --lambda-cmp / --lambda-mem weights with lambda in the quality slot,
+    broadcast to every env. ``conditioned=True`` (arm L, ticket .9 lifted
+    the exclusion this far): each env's Dirichlet sample over the three
+    heads is restricted to the two COST heads -- the quality coordinate is
+    dropped and the two cost coordinates renormalised to sum to 1, which is
+    a Dirichlet over (latency, memory) with the same concentrations -- and
+    lambda is written into the quality slot. The policy is conditioned on
+    the resulting vector, lambda included: the 2-D front at a fixed floor,
+    priced by dual ascent (finding 53, arm L).
+    """
+    _pq = HEAD_NAMES.index("quality")
+    if not conditioned:
+        _lagp = np.array(head_weights_np, dtype=np.float32, copy=True)
+        _lagp[_pq] = np.float32(lag_lambda)
+        return jnp.broadcast_to(jnp.asarray(_lagp), sampled_pref.shape)
+    _cost = sampled_pref.at[:, _pq].set(0.0)
+    _cost = _cost / jnp.maximum(jnp.sum(_cost, axis=-1, keepdims=True), 1e-8)
+    return _cost.at[:, _pq].set(jnp.float32(lag_lambda))
+
+
 def _lag_dual_ascent(lam: float, mean_violation: float, eta: float,
                      lam_min: float, lam_max: float,
                      violation_target: float = 0.0) -> float:
@@ -1094,7 +1105,7 @@ def _causal_quality_mask(face_valid, face_skip, face_op_type):
     0.4 -> 109), and under rev-pin an all-none step CANNOT cause a
     violation.
 
-    FREE-ORDER GENERALIZATION (when ALPHAGRAD_FORCE_REV_ORDER is lifted):
+    FREE-ORDER GENERALIZATION (under --fixed-order free):
     the causal set is {approx actions} UNION {vertex choices} -- the vertex
     head must stay inside the quality credit because the elimination order
     changes which faces exist; an all-none exact plan still keeps quality
@@ -2162,13 +2173,10 @@ class Agent(eqx.Module):
     value_head_flops: MLP
     value_head_mem: MLP
     value_head_cos: MLP
-    # FOURTH value head, reward slot 7 (``grad_coverage``). ``None`` unless
-    # --grad-coverage-weight != 0. A ``None`` field contributes NO leaves to
-    # the pytree, so the flag-off agent is leaf-for-leaf what HEAD builds and
-    # every saved checkpoint keeps loading.
-    value_head_gcov: MLP | None
     # Value head for reward slot 8 (``fidelity``). ``None`` unless
-    # --fidelity-weight != 0; a ``None`` field contributes NO leaves.
+    # --fidelity-weight != 0. A ``None`` field contributes NO leaves to the
+    # pytree, so the flag-off agent is leaf-for-leaf what HEAD builds and
+    # every saved checkpoint keeps loading.
     value_head_fid: MLP | None
     # Value head for reward slot 10 (``sparsity``). ``None`` unless
     # --sparsity-weight != 0; a ``None`` field contributes NO leaves.
@@ -2214,7 +2222,6 @@ class Agent(eqx.Module):
         micro_action_policy=None,
         max_substeps=16,
         face_path_policy=None,
-        value_head_gcov=None,
         value_head_fid=None,
         value_head_spars=None,
     ):
@@ -2228,7 +2235,6 @@ class Agent(eqx.Module):
         self.value_head_flops = value_head_flops
         self.value_head_mem = value_head_mem
         self.value_head_cos = value_head_cos
-        self.value_head_gcov = value_head_gcov
         self.value_head_fid = value_head_fid
         self.value_head_spars = value_head_spars
         self.op_embedding = op_embedding
@@ -2286,8 +2292,6 @@ class Agent(eqx.Module):
         v_mem = self.value_head_mem(summary)
         v_cos = self.value_head_cos(summary)
         _vs = [v_flops, v_mem, v_cos]
-        if self.value_head_gcov is not None:
-            _vs.append(self.value_head_gcov(summary))
         if self.value_head_fid is not None:
             _vs.append(self.value_head_fid(summary))
         if self.value_head_spars is not None:
@@ -2771,8 +2775,6 @@ class Agent(eqx.Module):
         v_mem = self.value_head_mem(summary)
         v_cos = self.value_head_cos(summary)
         _vs = [v_flops, v_mem, v_cos]
-        if self.value_head_gcov is not None:
-            _vs.append(self.value_head_gcov(summary))
         if self.value_head_fid is not None:
             _vs.append(self.value_head_fid(summary))
         if self.value_head_spars is not None:
@@ -2958,7 +2960,7 @@ class Agent(eqx.Module):
             # --per-face-masks extras; None on every other path, which is what
             # `UnifiedFacePolicy.sample_face` reads as "use the vertex's
             # nominal features and the unnarrowed hardware dtype mask".
-            f_sizes = f_quant = None
+            f_sizes = f_quant = f_nout = None
             if _face_from_fn is not None:
                 f_pair, f_comp, f_valid = _face_from_fn[:3]
                 if len(_face_from_fn) > 3:
@@ -3002,7 +3004,16 @@ class Agent(eqx.Module):
                 # `_face_loop`, the stored trajectory leaf, `_face_replay`
                 # -- is untouched.
                 if face_sizes_fn is not None:
-                    f_sizes, f_quant = face_sizes_fn(vertex_idx)
+                    _fsz = face_sizes_fn(vertex_idx)
+                    f_sizes, f_quant = _fsz[0], _fsz[1]
+                    if len(_fsz) > 2:
+                        # --face-slot-frames (ticket .18): the per-SLOT
+                        # probe also returns the slot's own Diag-pair and
+                        # Reduce-axis masks, which REPLACE the static
+                        # vertex-level ones above (they ride out and are
+                        # stored through the same face_out slots), and the
+                        # slot's out rank for the wire encoder.
+                        f_pair, f_comp, f_nout = _fsz[2], _fsz[3], _fsz[4]
             face_key = jrand.fold_in(micro_key, 7)
             if face_chunk_fn is None:
                 if getattr(self.face_path_policy, "endpoint_read", False):
@@ -3059,6 +3070,7 @@ class Agent(eqx.Module):
                     edge_rows=edge_rows,
                     face_sizes=f_sizes,
                     face_quant=f_quant,
+                    face_nout=f_nout,
                 )
                 (fa, face_logp, face_ent, f_cnt, f_dt,
                  f_de, f_ends) = _fl_out[:7]
@@ -3160,20 +3172,37 @@ class Agent(eqx.Module):
 
         return lax.cond(count > 0, _run, _skip, carry)
 
-    def _face_row_specs(self, row, axis_state_v):
+    def _face_row_specs(self, row, axis_state_v, nout_f=None):
         """One face's per-slot wire row -> the env's ``[bi1, bi2, factor]``
-        spec rows, via the SAME translator the env action uses."""
-        def _one(op, i, j, factor, kind, dtype, qsign, qfrac):
+        spec rows, via the SAME translator the env action uses.
+
+        ``nout_f`` (S,) -- --face-slot-frames (ticket .18): the translator
+        splits ``(i, j)`` into out-side / primal-side relative positions by
+        the axis state's IS_OUTPUT column, which is the VERTEX's; each slot
+        gets that column rewritten to its own out rank so ``bi2 = j - n_out``
+        is taken in the frame the slot's hook decodes in."""
+        def _one(op, i, j, factor, kind, dtype, qsign, qfrac, ax_st):
             return micro_actions_to_rule_specs_jax(
-                op[None], i[None], j[None], factor[None], axis_state_v,
+                op[None], i[None], j[None], factor[None], ax_st,
                 compress_kinds=kind[None], quant_dtypes=dtype[None],
                 quant_scale_signs=qsign[None], quant_scale_fracs=qfrac[None],
             )[0]
 
+        if nout_f is None:
+            ax = jnp.broadcast_to(axis_state_v, (FACE_SLOTS,)
+                                  + tuple(axis_state_v.shape))
+        else:
+            from alphagrad.approx.env import _AXIS_FEAT_IS_OUTPUT
+            _isout = (jnp.arange(axis_state_v.shape[0])[None, :]
+                      < jnp.asarray(nout_f, jnp.int32)[:, None]
+                      ).astype(axis_state_v.dtype)
+            ax = jnp.broadcast_to(
+                axis_state_v, (FACE_SLOTS,) + tuple(axis_state_v.shape)
+            ).at[:, :, _AXIS_FEAT_IS_OUTPUT].set(_isout)
         return jax.vmap(_one)(
             row["op_type"], row["i"], row["j"], row["factor"],
             row["compress_kind"], row["quant_dtype"],
-            row["quant_scale_sign"], row["quant_scale_frac"],
+            row["quant_scale_sign"], row["quant_scale_frac"], ax,
         ).astype(jnp.int32)
 
     _WIRE_KEYS = ("op_type", "i", "j", "exponents", "factor",
@@ -3210,7 +3239,8 @@ class Agent(eqx.Module):
                    f_pair, f_comp, f_valid, enc_carry, face_chunk_fn,
                    vertex_idx, vertex_specs, axis_state_v,
                    op_legality_override, n_faces, endpoint_rows=None,
-                   edge_rows=None, face_sizes=None, face_quant=None):
+                   edge_rows=None, face_sizes=None, face_quant=None,
+                   face_nout=None):
         """Read face f's chunk, decide face f, repeat -- for the ACTUAL face
         count, as a while_loop.
 
@@ -3352,7 +3382,9 @@ class Agent(eqx.Module):
                 face_sizes_f=None if face_sizes is None else face_sizes[f],
                 face_quant_f=None if face_quant is None else face_quant[f],
                 op_legality_override=op_legality_override)
-            rs = rs.at[f].set(self._face_row_specs(row, axis_state_v))
+            rs = rs.at[f].set(self._face_row_specs(
+                row, axis_state_v,
+                None if face_nout is None else face_nout[f]))
             skips = skips.at[f].set(sk.astype(jnp.int32))
             cnts = cnts.at[f].set(ct_eff)
             wa = tuple(w.at[f].set(row[k])
@@ -3902,6 +3934,9 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--name", type=str, default="approx-ppo")
     p.add_argument("--gpus", type=str, default="0")
     p.add_argument("--seed", type=int, default=250197)
+    # Gate G1-G6 telemetry inputs (ticket .45): --gate-winners-table,
+    # --gate-offline-contrast.
+    _gate_telemetry.add_gate_args(p)
     p.add_argument(
         "--wandb",
         type=str,
@@ -3981,7 +4016,7 @@ def make_argparser() -> argparse.ArgumentParser:
              "assigned on first emission, evict-oldest past K (telemetry "
              "edgemem/evictions). Offline: closes >=90 percent of the "
              "endpoint read's drop on intermediate operands (section 8; "
-             "under FORCE_REV_ORDER it is predicted inert -- every lhs is "
+             "under --fixed-order reverse it is predicted inert -- every lhs is "
              "primitive there). Requires the --live-faces stack; default "
              "off, bit-identical when off.")
     p.add_argument(
@@ -4081,10 +4116,9 @@ def make_argparser() -> argparse.ArgumentParser:
              "slot reads 0.0, no head is constructed, and the agent pytree is "
              "leaf-for-leaf what it was. Non-zero APPENDS a value head and "
              "exports ALPHAGRAD_FIDELITY_WEIGHT to the measure actors. COST: "
-             "the channel needs the exact Jacobian; with --reject-frozen-grads "
-             "on (default) it shares the reference that guard already builds "
-             "and costs only the per-leaf reductions, with the guard off it "
-             "pays a full exact reference per plan. Measured price is logged "
+             "the channel needs the exact Jacobian; unless the quality metric "
+             "is a cosine (which builds it anyway) it pays a full exact "
+             "reference per terminal plan. Measured price is logged "
              "as fidelity/wall_amortised_s.")
     p.add_argument(
         "--cos-log-every", type=int, default=0,
@@ -4094,8 +4128,8 @@ def make_argparser() -> argparse.ArgumentParser:
              "per plan versus loss_drop's 0.22 s / 40 MB -- 44x -- so it is "
              "subsampled rather than computed per plan. NOTE this stride only "
              "FORCES a reference nothing else asked for: whenever one is "
-             "materialised anyway (--fidelity-weight, --reject-frozen-grads, "
-             "or --quality-metric cosine) the cosine is one extra per-leaf dot "
+             "materialised anyway (--fidelity-weight or --quality-metric "
+             "cosine) the cosine is one extra per-leaf dot "
              "product on resident leaves and is taken on every such plan. "
              "Exports ALPHAGRAD_COS_LOG_EVERY.")
     # ---- SPARSITY, reward slot 10 ---------------------------------
@@ -4108,16 +4142,15 @@ def make_argparser() -> argparse.ArgumentParser:
              "order, where +1 means the plan stores nothing, 0 means it "
              "stores exactly what the exact plan stores (the identity "
              "plan, exactly) and -1 means it densified. DEFAULT 0 = "
-             "channel OFF and not measured. REQUIRES "
-             "--reject-frozen-grads (the default) and is REFUSED without "
-             "it: sparsity is maximised by DELETING computation, so an "
-             "all-SKIP plan scores the ceiling and so does the confirmed "
+             "channel OFF and not measured. THE MOST HACKABLE CHANNEL ON "
+             "THE BOARD: sparsity is maximised by DELETING computation, so "
+             "an all-SKIP plan scores the ceiling and so does the confirmed "
              "TLM hack of skipping one face -- 62-73%% of the backward "
              "pass gone, 11-15 of 16 leaves frozen, priced at 0.02%% by "
-             "the quality probe. The coverage guard is the only thing "
-             "that refuses those plans. Use --sparsity-log to record the "
-             "channel without training on it. Exports "
-             "ALPHAGRAD_SPARSITY_WEIGHT.")
+             "the quality probe. Nothing refuses those plans (the "
+             "gradient-coverage guard was removed 2026-09-03). Use "
+             "--sparsity-log to record the channel without training on "
+             "it. Exports ALPHAGRAD_SPARSITY_WEIGHT.")
     p.add_argument(
         "--sparsity-log", action=argparse.BooleanOptionalAction,
         default=False,
@@ -4134,8 +4167,8 @@ def make_argparser() -> argparse.ArgumentParser:
              "record per measured plan: the replayable wire (order + "
              "per-vertex rule rows + per-face rows/skips, verbatim as "
              "jacve consumed them), all 11 reward slots, the per-kind "
-             "requested/applied/idempotent-no-op counts, the per-leaf "
-             "gradient-coverage census and the episode. PATH, or \"auto\" "
+             "requested/applied/idempotent-no-op counts and the episode. "
+             "PATH, or \"auto\" "
              "for <wandb-run-dir>/plan_log_<name>.jsonl. This is X3's only "
              "input: the losers are what a regression is attributed "
              "against. PURE LOGGING -- no reward, no action, no head, no "
@@ -4161,40 +4194,11 @@ def make_argparser() -> argparse.ArgumentParser:
              "than replaying a different plan under this plan's name (the "
              "907c231 failure). Use only to bound disk on a fully dense "
              "face plan.")
-    p.add_argument(
-        "--plan-log-max-leaves", type=int, default=0, metavar="N",
-        help="Cap on per-leaf coverage entries (norms/ratios) written per "
-             "record. 0 (default) = all. The summary fields "
-             "(frac_leaves_zeroed, min_leaf_ratio, n_counted, n_zeroed) are "
-             "never capped, and leaves_elided counts what a cap dropped.")
     p.add_argument("--gate-tau", type=float, default=0.5,
                    help="mult mode: cosine gate threshold tau (g=0 below it).")
     p.add_argument("--gate-w", type=float, default=40.0,
                    help="mult mode: cheapness budget W in symlog-cost units "
                    "(cheapness = max(0, W - sum w_c*symlog(cost_c))).")
-    # ---- GRADIENT COVERAGE (docs/UNBIASED_PARETO_AND_MEASUREMENT.md sec 10)
-    p.add_argument(
-        "--reject-frozen-grads", action=argparse.BooleanOptionalAction,
-        default=True,
-        help="HARD GUARD, DEFAULT ON. Measure per-leaf gradient coverage of "
-        "every terminal plan and REJECT (sentinel, advantage 0, never "
-        "ranked) any plan that leaves a trainable leaf with an exactly zero "
-        "gradient where the same order done exactly gives a non-zero one. "
-        "Closes the confirmed TLM reward hack: one skipped face removes "
-        "62-73%% of the backward pass and freezes 11-15 of 16 parameter "
-        "leaves, and the 200-step quality probe prices that at 0.02%% "
-        "(0.9258 vs 0.9260) at every horizon tested. Rejections are counted "
-        "on grad_cov/rejected_this_ep and printed, never silently dropped. "
-        "Exports ALPHAGRAD_REJECT_FROZEN_GRADS to the measure actors.")
-    p.add_argument(
-        "--grad-coverage-weight", type=float, default=0.0, metavar="W",
-        help="REWARD CHANNEL, default 0 = off. Adds gradient coverage as a "
-        "fourth value head on reward slot 7, weight W: the additive "
-        "composition becomes lambda_cmp*symlog(lat) + lambda_mem*symlog(mem) "
-        "+ lambda_acc*q + W*coverage. The channel is +min_leaf_ratio when "
-        "nothing is frozen and -frac_leaves_zeroed when something is, so it "
-        "is bounded [-1,1] and is NEVER symlogged (composes with "
-        "--symlog-channels cost). W != 0 also turns the measurement on.")
     p.add_argument("--anti-degen-penalty", type=float, default=2.0,
                    help="mult mode: penalty floor P for degenerate terminals "
                    "(shaped ramp -P -> -P*(1-tau_d) over cos in [0, tau_d]).")
@@ -4230,7 +4234,8 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--lag-tau", type=float, default=0.75,
                    help="lagrangian mode: quality constraint threshold; the "
-                   "violation channel is max(0, tau - clip(q, -0.5, 1)).")
+                   "violation channel is max(0, tau - clip(q, -0.5, 1)). "
+                   "--quality-floor, when given, sets it (ticket .9).")
     p.add_argument("--lag-eta", type=float, default=0.05,
                    help="lagrangian mode: dual-ascent step size on lambda "
                    "(once per episode, from the episode's measured "
@@ -4372,6 +4377,34 @@ def make_argparser() -> argparse.ArgumentParser:
              "and pareto/archive_size are recorded — scalars describing a "
              "front whose sequences are then discarded at process exit.")
     p.add_argument(
+        "--grad-oracle", choices=["reference", "off"], default="reference",
+        help="Oracle A (ticket dsnn-3qm.62): check the exact gradient of every "
+             "elimination order ONCE per process against jax.grad on the probe "
+             "batch before it serves as the grad-cosine reference; a "
+             "disagreement (rel L2 > 1e-4) aborts the run. Published as "
+             "ALPHAGRAD_GRAD_ORACLE so the measure actors read the same value. "
+             "off disables the check.")
+    p.add_argument(
+        "--fixed-order", choices=list(_FIXED_ORDER_CHOICES), default="markowitz",
+        help="The elimination order the vertex head is pinned to (ticket "
+             "dsnn-3qm.64; common/order.py is the one implementation, shared "
+             "with landscape_map --order). markowitz (default): the STATIC "
+             "minimum Markowitz degree order of the exact graph, computed once "
+             "at env build, ties to the lowest vertex id -- the fixed order of "
+             "every campaign arm (finding 59: Diag is legal on rhs/new/old "
+             "sites only under this order). reverse: the valid vertices in "
+             "descending id -- the order of the paired rev-exact reference, "
+             "kept as the control (.60). free: no pin, the pointer head "
+             "chooses. Under a pin exactly one vertex is legal per step "
+             "(masks.vertex_avail_at_step), so the vertex head's KL and "
+             "gradient are structurally 0. Replaces ALPHAGRAD_FORCE_REV_ORDER, "
+             "which now fails loudly when set.")
+    p.add_argument(
+        "--approx-profile", choices=["all", "skip", "reduce", "quant", "diag", "none"],
+        default=None,
+        help="Approximation-profile mask restricting the approximation head to a subset of classes: "
+             "all (default), skip, reduce, quant, diag, or none (order-only arm, equivalent to --no-approx-head).")
+    p.add_argument(
         "--no-approx-head", action="store_true",
         help="REMOVE the approximation heads instead of masking them. "
              "--variant ve_only only multiplies the op categorical by "
@@ -4455,15 +4488,128 @@ def make_argparser() -> argparse.ArgumentParser:
         choices=["auto", "loss_drop", "grad_cosine", "jac_cosine", "cosine", "none"],
         default="auto",
         help="WHICH quantity reward slot 6 (the --lambda-acc channel) holds. "
-        "loss_drop = the relative loss drop of a 200-step Adam walk driven by "
-        "the PLAN's own gradient, probed on a fixed batch of 512 real MNIST "
-        "images (Pearson 0.922 against final downstream test accuracy, 0.22 s "
-        "and 40 MB per plan). cosine = the legacy Jacobian cosine (Pearson "
-        "0.610, 9.70 s, 4.24 GB). auto = loss_drop whenever the traced "
-        "target is a scalar loss (every trainable example: the plan's output "
-        "IS a gradient and the walk is defined), cosine for the analytic AD "
-        "benchmarks. Published as ALPHAGRAD_QUALITY_METRIC so the Ray "
-        "measure actors resolve the SAME metric as the trainer.",
+        "grad_cosine = the cosine between the PLAN's gradient and the "
+        "rev-exact gradient on the same probe batch of real data, at init "
+        "(one exact execution per plan). loss_drop = the relative loss drop "
+        "of a 200-step Adam walk driven by the PLAN's own gradient, probed on "
+        "a fixed batch of 512 real MNIST images (Pearson 0.922 against final "
+        "downstream test accuracy, 0.22 s and 40 MB per plan; finding 51: can "
+        "read 0.885 while the gradient points elsewhere). jac_cosine = the "
+        "legacy Jacobian cosine (Pearson 0.610, 9.70 s, 4.24 GB); cosine is "
+        "its deprecated alias. auto = grad_cosine whenever the traced target "
+        "is a scalar loss (every trainable example; owner ruling 2026-09-02), "
+        "jac_cosine for the analytic AD benchmarks. none = no quality "
+        "channel. Published as ALPHAGRAD_QUALITY_METRIC so the Ray measure "
+        "actors resolve the SAME metric as the trainer.",
+    )
+    p.add_argument(
+        "--approx-old",
+        choices=["same", "exact"],
+        default="same",
+        help="THE OLD EDGE (ticket .56). A face accumulation multiplies lhs "
+        "by rhs into new and adds new onto the existing predecessor-to-"
+        "successor edge (old) when that edge exists. same = old carries the "
+        "SAME approximation as new (graphax's two-op face form, the new-slot "
+        "hook in jr), so both operands of the add carry one structure; "
+        "exact = old is left exact because it already holds the sum of "
+        "approximated and exact contributions from earlier accumulations. "
+        "The two are NOT comparable: the choice changes the measured object. "
+        "Published as ALPHAGRAD_APPROX_OLD (read by env.approx_old) so the "
+        "Ray measure actors resolve the SAME configuration as the trainer; "
+        "every plan-log record carries the value that measured it.",
+    )
+    p.add_argument(
+        "--reduce-axis-space",
+        choices=["physical", "canonical"],
+        default="physical",
+        help="Ticket dsnn-3qm.20 (defect D5). A Reduce axis lived in three "
+        "coordinate spaces at once: the head and the wire name a LOGICAL dim "
+        "of the slot's tensor, the legality mask read it as a PHYSICAL val "
+        "axis, graphax applied it as a CANONICAL slot (finding 56: on TLM "
+        "lhs edges the three never coincide). physical = Compress.axes are "
+        "physical val axes; the wire token is resolved to the axis its dim "
+        "is stored in at decode (per slot, with --face-slot-frames slot) and "
+        "to graphax's slot right before apply_compress, both through "
+        "masks.reduce_axis_spaces; the head's per-slot Reduce mask is that "
+        "same resolution. canonical = the pre-ticket read, kept only for "
+        "the flag-off bit-identity gate (ALPHAGRAD_EQ_DUMP). Published as "
+        "ALPHAGRAD_REDUCE_AXIS_SPACE for the Ray measure actors; every "
+        "plan-log record carries the value that measured it.",
+    )
+    p.add_argument(
+        "--measure-toolchain-gate",
+        choices=["abort", "warn", "off"],
+        default="abort",
+        help="What the FIRST measure compile of every measuring process does "
+        "when a tiny cache-proof probe, compiled with the live measure "
+        "options, fails (finding 03: a 12.8 nvlink under /usr/local/cuda on "
+        "pgi15-gpu16/17 refused the venv's 12.9 ptxas cubins and every "
+        "measurement silently became a degraded-fusion fallback). abort = "
+        "stop the run naming the node, the ptxas version and the fault "
+        "(default; a skip is a failure). warn = print the fault, run anyway, "
+        "tag every plan record with compile_fallbacks / toolchain_ok=False; "
+        "only under warn may a link fault take the degraded set. off = skip "
+        "the probe; a link fault in a real measure compile still aborts. "
+        "Published as ALPHAGRAD_MEASURE_TOOLCHAIN_GATE before ray.init so "
+        "the measure actors read the same mode through the one reader "
+        "(env.measure_toolchain_gate_mode); this flag is the only control.",
+    )
+    p.add_argument(
+        "--mem-channel",
+        choices=["temp", "watermark"],
+        default="temp",
+        help="THE MEMORY CHANNEL (ticket dsnn-3qm.49, ruling .29): what "
+        "reward slot 5 (peak_memory, stored negated) HOLDS. temp = the XLA "
+        "static temp bytes of the plan's own timed executable "
+        "(compiled.memory_analysis().temp_size_in_bytes); deterministic, "
+        "one read per compile, and on TLM the runtime watermark is temp + "
+        "2.104 MB with R^2 = 1.000000 (finding 41), so temp is the same "
+        "ranking with 8x the relative dynamic range. The DEFAULT: the old "
+        "channel read sigma = 0 over 16,192 wave-1 plans (finding 49). "
+        "watermark = the runtime peak_bytes_in_use delta over the timed "
+        "window, the pre-.49 channel, kept for the flag-off bit-identity "
+        "gate (ALPHAGRAD_EQ_DUMP). Under both the other quantity is "
+        "recorded beside the channel per measurement (env._record_mem_"
+        "parity) and drained with the plan records; every plan-log record "
+        "carries mem_channel, mem_temp_bytes and mem_watermark_bytes. "
+        "Published as ALPHAGRAD_MEM_CHANNEL before ray.init so the Ray "
+        "measure actors read the same channel through the one reader "
+        "(env.mem_channel); this flag is the only control. --mem-type "
+        "still selects WHICH slot --lambda-mem weights; this flag selects "
+        "what slot 5 holds.",
+    )
+    p.add_argument(
+        "--cost-form",
+        choices=["absolute", "paired-log"],
+        default="paired-log",
+        help="THE COST FORM (ticket dsnn-3qm.9): HOW reward slots 2 "
+        "(latency_ns) and 5 (peak_memory) are expressed. paired-log (the "
+        "DEFAULT, the campaign form): every terminal measurement also "
+        "measures REV-EXACT -- reverse order, every face None -- in the same "
+        "measure actor, back to back, warm, through the same executable path "
+        "and the same instrument, and the slot carries -(log cost(candidate) "
+        "- log cost(rev-exact)); rev-exact scores 0, a cheaper plan scores "
+        "above 0, and GPU-state drift cancels. Both cost slots are then "
+        "exempt from symlog (a log-difference needs no compression). The "
+        "static-temp floor under log() is one byte (env._MEM_LOG_FLOOR_BYTES). "
+        "absolute: the measured number, negated -- the pre-.9 form, kept for "
+        "the flag-off bit-identity gate (ALPHAGRAD_EQ_DUMP). Published as "
+        "ALPHAGRAD_COST_FORM before ray.init (env.cost_form is the one "
+        "reader); this flag is the only control. The reference is drained "
+        "per episode and logged as ref/latency_ns and ref/temp_bytes.",
+    )
+    p.add_argument(
+        "--quality-floor", type=float, default=None,
+        help="THE QUALITY FLOOR tau (ticket dsnn-3qm.9): with this set, "
+        "reward slot 6 carries -max(0, tau - q) instead of raw quality q "
+        "(grad-cosine), on the terminal step -- exactly 0 for every plan at "
+        "or above the floor, the linear shortfall below it. tau is the "
+        "boundary of the feasible set, not a reward shift. A channel option, "
+        "independent of --reward-mode: under additive it composes with "
+        "--preference-conditioned (arm P1); under lagrangian it IS the "
+        "constraint threshold (it sets --lag-tau, arm L). Refused under "
+        "--reward-mode mult. Off by default (arm P0: raw quality). Replaces "
+        "the deleted cost clamp ALPHAGRAD_QUALITY_GATE_MIN.",
     )
     p.add_argument(
         "--walk-steps", type=int, default=200,
@@ -4521,7 +4667,7 @@ def make_argparser() -> argparse.ArgumentParser:
         "Why it is gone: those 2 extra vertices enter the pointer's action "
         "space and enlarge derived_max_faces (nn256: 13 -> 15 eqns), and the "
         "forward/reverse/cross-country freedom they buy is UNREACHABLE while "
-        "ALPHAGRAD_FORCE_REV_ORDER=1 pins the order to reverse.",
+        "a fixed order (--fixed-order) pins the order.",
     )
     p.add_argument(
         "--measure-latency",
@@ -4833,7 +4979,7 @@ def make_argparser() -> argparse.ArgumentParser:
                    "penalty is Schulman k3 on the JOINT log-prob of the "
                    "stored actions; the vertex term cancels exactly (both "
                    "sides read the same vertex distribution) and under "
-                   "ALPHAGRAD_FORCE_REV_ORDER=1 the vertex head has exactly "
+                   "a fixed order (--fixed-order) the vertex head has exactly "
                    "ONE legal action anyway, so its KL is structurally 0 -- "
                    "what is penalised is the FACE head plus its live-face "
                    "context stream. 0 = OFF (default). WHAT THIS DOES AND "
@@ -4843,7 +4989,7 @@ def make_argparser() -> argparse.ArgumentParser:
                    "250 episodes with quality spread 3e-06 across 16 plans "
                    "-- there was nothing to learn from, and a trust region "
                    "makes that MORE stable, not less). The contrast knob is "
-                   "ALPHAGRAD_FACE_NONE_BIAS. Sweep them together.")
+                   "--face-none-bias. Sweep them together.")
     p.add_argument("--kl-ref-target", type=float, default=0.0,
                    help="ADAPTIVE variant: hold kl_ref near this value by "
                    "raising/lowering --kl-ref-weight with the standard "
@@ -4875,13 +5021,14 @@ def make_argparser() -> argparse.ArgumentParser:
                    "epoch instead). Independent of --kl-ref-*: this one "
                    "bounds movement per UPDATE, the reference KL bounds "
                    "movement per RUN.")
-    p.add_argument("--face-logit-clamp", type=float, default=15.0,
+    p.add_argument("--face-logit-clamp", type=float, default=0.0,
                    help="bound every unified-face-head logit to (-C, C) "
                    "via C*tanh(z/C) before softmax/sigmoid (see "
                    "unified_face_head.LOGIT_CLAMP): keeps raw-logit drift "
                    "finite so the --face-entropy-floor hinge never loses "
                    "its restoring gradient. Near-identity for |z| << C. "
-                   "0 = off.")
+                   "0 = off (default; the campaign value is set by the "
+                   "launcher generator, tools/gen_fq_launchers.py).")
     p.add_argument("--lag-causal-mask", action="store_true",
                    help="QUALITY_COLLAPSE sec 12.7 fix 1: weight the "
                    "quality-channel advantage by lambda*m(e,t), where "
@@ -4963,6 +5110,18 @@ def make_argparser() -> argparse.ArgumentParser:
              "logits carry full orthogonal magnitude while the pointer sits "
              "at --head-init-scale. Pass 0.1 to give it the same treatment "
              "the other heads get, WITHOUT switching --init-scheme.")
+    p.add_argument(
+        "--face-none-bias", type=float, default=0.0,
+        help="IDENTITY-INIT prior of the face head, applied AFTER "
+             "--init-scheme / --scale-face-head: +B on each slot's OP_NONE "
+             "logit and -B on the face's SKIP logit (trainable; "
+             "common/agent_factory.apply_face_none_bias). At init, on a "
+             "zero context, p_skip = sigmoid(-B) per face and "
+             "p_none = e^B/(e^B+3) per slot with three legal ops. "
+             "0 (default) = off = bit-identical to the head before this "
+             "flag existed. Replaces the env var ALPHAGRAD_FACE_NONE_BIAS "
+             "(ticket dsnn-3qm.44: args only; a set var is refused at "
+             "startup).")
     p.add_argument(
         "--pin-rules-to-exact",
         action="store_true",
@@ -5170,6 +5329,10 @@ def _apply_variant_preset(args, variant: str | None = None):
     """
     if getattr(args, "exact", False):
         variant = "ve_only"
+    if getattr(args, "approx_profile", None) == "none":
+        args.no_approx_head = True
+    elif getattr(args, "no_approx_head", False) and getattr(args, "approx_profile", None) is None:
+        args.approx_profile = "none"
         
     name = variant if variant is not None else getattr(args, "variant", "custom")
     if name not in VARIANT_PRESETS:
@@ -5198,6 +5361,7 @@ def _op_legality_for_variant(
     variant: str,
     allow_compress: bool,
     allow_quant: bool = True,
+    approx_profile: str | None = None,
 ) -> jax.Array:
     """Per-variant op-type legality mask for the dynamic action space.
 
@@ -5219,6 +5383,21 @@ def _op_legality_for_variant(
     compress = 1.0 if allow_compress else 0.0
     quant = 1.0 if allow_quant else 0.0
     end = 1.0
+    if approx_profile is not None:
+        if approx_profile == "none":
+            return jnp.array([0.0, 0.0, 0.0, end], dtype=jnp.float32)
+        if approx_profile == "skip":
+            return jnp.array([0.0, 0.0, 0.0, end], dtype=jnp.float32)
+        if approx_profile == "diag":
+            return jnp.array([diag, 0.0, 0.0, end], dtype=jnp.float32)
+        if approx_profile == "reduce":
+            return jnp.array([0.0, compress, 0.0, end], dtype=jnp.float32)
+        if approx_profile == "quant":
+            return jnp.array([0.0, 0.0, quant, end], dtype=jnp.float32)
+        if approx_profile == "all":
+            return jnp.array([diag, compress, quant, end], dtype=jnp.float32)
+        raise ValueError(f"Unknown approx_profile '{approx_profile}'.")
+
     if variant == "ve_only":
         return jnp.array([0.0, 0.0, 0.0, 1.0], dtype=jnp.float32)
     if variant in ("diag_gcd", "diag_factor"):
@@ -5331,18 +5510,11 @@ def _build_agent(
     value_head_flops = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[4])
     value_head_mem = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[5])
     value_head_cos = MLP(args.embd_dim, 1, value_dims, key=encoder_keys[12])
-    # GRAD-COVERAGE value head. Its key is FOLDED IN from keys[12] rather than
+    # FIDELITY value head. Its key is FOLDED IN from keys[12] rather than
     # taken from a widened `jrand.split`: widening the split would move every
     # positional key and change the randomness of every seeded run, flag off
-    # included. Built only when the channel is live.
-    value_head_gcov = None
-    if GRAD_COVERAGE_HEAD in VALUE_HEAD_ATTRS:
-        value_head_gcov = MLP(args.embd_dim, 1, value_dims,
-                              key=jrand.fold_in(encoder_keys[12], 7))
-    # FIDELITY value head. Key FOLDED IN from keys[12] with a different tag
-    # than the coverage head's, for the same reason: widening the `jrand.split`
-    # would move every positional key and change the randomness of every seeded
-    # run, flag off included.
+    # included. Built only when the channel is live. (Tag 7 was the removed
+    # coverage head's; tag 8 stays, so a fidelity checkpoint keeps its keys.)
     value_head_fid = None
     if FIDELITY_HEAD in VALUE_HEAD_ATTRS:
         value_head_fid = MLP(args.embd_dim, 1, value_dims,
@@ -5419,6 +5591,7 @@ def _build_agent(
             use_group_embedding=getattr(args, "axis_group_embedding", False),
             endpoint_read=bool(getattr(args, "face_endpoint_read", False)),
             edge_mem=bool(getattr(args, "face_edge_mem", False)),
+            allow_skip=bool(getattr(args, "approx_profile", None) == "skip"),
         )
     elif getattr(args, "face_actions", False) and not getattr(
             args, "no_approx_head", False):
@@ -5438,7 +5611,6 @@ def _build_agent(
         value_head_flops=value_head_flops,
         value_head_mem=value_head_mem,
         value_head_cos=value_head_cos,
-        value_head_gcov=value_head_gcov,
         value_head_fid=value_head_fid,
         value_head_spars=value_head_spars,
         op_embedding=op_embedding,
@@ -5774,16 +5946,11 @@ def _build_head_weights(args) -> np.ndarray:
         weights[1] = args.lambda_mem
     if "acc" in args.rewards:
         weights[2] = args.lambda_acc
-    # --grad-coverage-weight W. The additive composition becomes
+    # --fidelity-weight W. The additive composition becomes
     #   lambda_cmp*symlog(lat) + lambda_mem*symlog(mem) + lambda_acc*q
-    #     + W*grad_coverage
-    # with grad_coverage RAW (see configure_symlog: never symlogged). The
+    #     + W*fidelity
+    # with fidelity RAW (see configure_symlog: bounded, never symlogged). The
     # head exists only when W != 0, so this index is in range exactly then.
-    if GRAD_COVERAGE_HEAD in VALUE_HEAD_ATTRS:
-        weights[HEAD_NAMES.index("grad_cov")] = np.float32(
-            getattr(args, "grad_coverage_weight", 0.0) or 0.0)
-    # --fidelity-weight W adds ``+ W*fidelity``, RAW (see configure_symlog:
-    # bounded, never symlogged). The head exists only when W != 0.
     if FIDELITY_HEAD in VALUE_HEAD_ATTRS:
         weights[HEAD_NAMES.index("fidelity")] = np.float32(
             getattr(args, "fidelity_weight", 0.0) or 0.0)
@@ -5986,6 +6153,10 @@ def _setup_jax_compile_cache() -> None:
 
 def main():
     args = make_argparser().parse_args()
+    # Knobs that became flags (dsnn-3qm.44) are REFUSED if a launcher still
+    # exports them, never read: an ignored export would run the knob OFF.
+    from alphagrad.approx.common.agent_factory import refuse_removed_env_knobs
+    refuse_removed_env_knobs()
     # --face-logit-clamp must be installed BEFORE any jit trace exists:
     # UnifiedFaceHead.logits reads the module constant at trace time.
     from alphagrad.approx.unified_face_head import set_logit_clamp
@@ -5995,7 +6166,7 @@ def main():
     # to os.environ so the measure actors, which build their own hooks in their
     # own processes, inherit the same setting.
     from alphagrad.approx.common.masks import (
-        set_diag_per_face, set_per_face_masks)
+        set_diag_per_face, set_per_face_masks, set_reduce_axis_space)
     set_diag_per_face(
         bool(getattr(args, "diag_per_face", False)),
         rule=str(getattr(args, "diag_per_face_rule", "largest")),
@@ -6008,6 +6179,11 @@ def main():
         bool(getattr(args, "per_face_masks", False)),
         repair_axis=not bool(getattr(args, "no_per_face_repair_axis", False)),
     )
+    # --reduce-axis-space (ticket .20), same discipline: the decode and the
+    # graphax-boundary conversion run inside the measure actors' processes.
+    set_reduce_axis_space(str(getattr(args, "reduce_axis_space", "physical")))
+    print(f"[alphagrad] reduce axis space (--reduce-axis-space) = "
+          f"{getattr(args, 'reduce_axis_space', 'physical')}", flush=True)
 
     # ``ALPHAGRAD_TRACEMALLOC=1`` — start the Python allocator tracker
     # before any model code runs. Per-episode snapshots are diffed
@@ -6032,27 +6208,16 @@ def main():
     # no-op; other variants overwrite those three flags. Explicit CLI values
     # passed alongside --variant are clobbered — pick `custom` if you want
     # to mix-and-match.
-    # GRADIENT COVERAGE: before ray.init (the measure actors read the
-    # exported env), before _build_agent (the 4th value head changes the
+    # FIDELITY (reward slot 8): before ray.init (the measure actors read the
+    # exported env), before _build_agent (an appended value head changes the
     # pytree) and before the first jit trace.
-    _gc_guard, _gc_weight = configure_grad_coverage(args)
-    print(f"[cfg] grad coverage: guard={'ON' if _gc_guard else 'OFF'} "
-          f"(--reject-frozen-grads) reward_weight={_gc_weight:g} "
-          f"heads={NUM_VALUE_HEADS} ({', '.join(HEAD_NAMES)})", flush=True)
-    # FIDELITY (reward slot 8) -- must follow configure_grad_coverage so the
-    # appended head order is deterministic, and must precede _build_agent /
-    # configure_symlog / the first trace for the same three reasons.
     _fid_weight, _cos_every = configure_fidelity(args)
     if _fid_weight != 0.0 or _cos_every:
         os.environ.setdefault("ALPHAGRAD_FIDELITY",
                               "1" if _fid_weight != 0.0 else "0")
     print(f"[cfg] fidelity (clipped rel-Frobenius, slot 8): "
           f"weight={_fid_weight:g} cos_log_every={_cos_every} "
-          f"heads={NUM_VALUE_HEADS} ({', '.join(HEAD_NAMES)})"
-          + ("" if (_fid_weight == 0.0 or _gc_guard) else
-             "  [NOTE: --reject-frozen-grads is OFF, so this channel pays a "
-             "FULL exact Jacobian reference per plan instead of sharing the "
-             "guard's]"), flush=True)
+          f"heads={NUM_VALUE_HEADS} ({', '.join(HEAD_NAMES)})", flush=True)
 
     # SPARSITY (reward slot 10) -- after configure_fidelity so the
     # appended head order is deterministic, before _build_agent /
@@ -6064,8 +6229,8 @@ def main():
               f"heads={NUM_VALUE_HEADS} ({', '.join(HEAD_NAMES)})"
               + ("  [LOGGED, NOT TRAINED]" if _spars_weight == 0.0
                  else "  [TRAINED -- an all-SKIP plan scores the +1 "
-                      "ceiling; --reject-frozen-grads is what refuses "
-                      "it]"), flush=True)
+                      "ceiling and NOTHING refuses it; read the "
+                      "hackability warning]"), flush=True)
 
     # A6 PLAN LOG -- before ray.init so the measure actors inherit
     # ALPHAGRAD_PLAN_LOG. Independent of the three configure_* calls above:
@@ -6076,8 +6241,7 @@ def main():
         print(f"[cfg] plan log: ON -> {_plan_log_cfg} "
               f"(every TERMINAL plan, losers included; cap="
               f"{getattr(args, 'plan_log_cap', 4096)} "
-              f"max_faces={getattr(args, 'plan_log_max_faces', 0) or 'all'} "
-              f"max_leaves={getattr(args, 'plan_log_max_leaves', 0) or 'all'})",
+              f"max_faces={getattr(args, 'plan_log_max_faces', 0) or 'all'})",
               flush=True)
 
     _apply_variant_preset(args)
@@ -6215,22 +6379,60 @@ def main():
     # agree". One env var read by one function (env.quality_metric) in one
     # module makes disagreement impossible. Set BEFORE ray.init so every actor
     # inherits it.
-    # ORDER-ONLY / EXACT ARM: with --no-approx-head no plan can approximate
+    # ORDER-ONLY / EXACT ARM (--no-approx-head): no plan can approximate
     # anything, so every plan returns the EXACT gradient and the quality
-    # channel is a CONSTANT (measured on TLM: 0.88532-0.88533 on every plan of
-    # every arm, 503/503 progress samples of job 59311). A constant channel
-    # contributes exactly zero gradient while the loss-drop walk that produces
-    # it costs 200 executions of the plan -- twice the entire latency budget.
-    # Resolve "auto" to "none" there and say so; an explicit --quality-metric
-    # is always honoured.
+    # channel is a CONSTANT (measured on TLM under loss_drop: 0.88532-0.88533
+    # on every plan of every arm, 503/503 progress samples of job 59311).
+    # "auto" used to be forced to "none" here because the loss-drop walk that
+    # produced that constant cost 200 executions of the plan. Under the
+    # default grad_cosine (owner ruling 2026-09-02: latency, temp memory and
+    # grad-cosine in EVERY run and sweep, including the order-only arm) the
+    # channel costs one execution of the candidate plus one of the rev-exact
+    # reference, whose compile is cached, so the order-only arm reports it
+    # like every other arm. --quality-metric none stays selectable by name.
     _qm = str(args.quality_metric)
-    if _qm == "auto" and bool(getattr(args, "no_approx_head", False)):
-        _qm = "none"
-        print("[alphagrad] ORDER-ONLY arm (--no-approx-head): the quality "
-              "channel is constant by construction, so it is NOT computed "
-              "(--quality-metric none). Pass --quality-metric loss_drop to "
-              "force it.", flush=True)
     os.environ["ALPHAGRAD_QUALITY_METRIC"] = _qm
+    # OLD-EDGE CONFIGURATION (ticket .56), same hand-off shape as the quality
+    # channel: the flag is the ONLY user surface; the variable is how the Ray
+    # measure actors (their own processes) resolve the value the trainer was
+    # given. env.approx_old() is the one reader -- _face_dict_for_vertex emits
+    # the two-op face form under "same" and the bare triple under "exact", and
+    # every plan-log record carries the value that measured it.
+    os.environ["ALPHAGRAD_APPROX_OLD"] = str(args.approx_old)
+    print(f"[alphagrad] old edge at the face join (--approx-old) = "
+          f"{args.approx_old}", flush=True)
+    # THE MEMORY CHANNEL (ticket .49), same transport, same reason: the
+    # measure actors run env._callback in their own processes and
+    # env.mem_channel is the one reader. The flag is the only control.
+    # THE COST FORM (ticket .9), same transport, same reason: env.cost_form
+    # is the one reader; the paired reference is measured inside the actors.
+    os.environ["ALPHAGRAD_COST_FORM"] = str(args.cost_form)
+    print(f"[alphagrad] cost form (reward slots 2 and 5, --cost-form) = "
+          f"{args.cost_form}"
+          + (" (paired log-difference against rev-exact, measured beside "
+             "every terminal plan; rev-exact scores 0)"
+             if args.cost_form == "paired-log"
+             else " (absolute measured numbers, negated; the pre-.9 form)"),
+          flush=True)
+    os.environ["ALPHAGRAD_MEM_CHANNEL"] = str(args.mem_channel)
+    # ORACLE A (ticket .62), same transport: env.grad_oracle is the one reader.
+    os.environ["ALPHAGRAD_GRAD_ORACLE"] = str(args.grad_oracle)
+    print(f"[alphagrad] gradient oracle (--grad-oracle) = {args.grad_oracle}"
+          + (" (exact gradient vs jax.grad once per process and order; a "
+             "disagreement aborts)" if args.grad_oracle == "reference"
+             else " (no check)"), flush=True)
+    print(f"[alphagrad] memory channel (reward slot 5, --mem-channel) = "
+          f"{args.mem_channel}"
+          + (" (XLA static temp bytes of the timed executable; the runtime "
+             "watermark is logged beside it)" if args.mem_channel == "temp"
+             else " (runtime watermark, the pre-.49 channel; the static "
+                  "temp is logged beside it)"), flush=True)
+    # MEASURE TOOLCHAIN GATE -- same transport, same reason: the gate runs
+    # inside env._compile_measure in every measuring process, and the actors
+    # inherit this before ray.init. env.measure_toolchain_gate_mode is the
+    # one reader. Not a knob: --measure-toolchain-gate is the only control.
+    os.environ["ALPHAGRAD_MEASURE_TOOLCHAIN_GATE"] = str(
+        args.measure_toolchain_gate)
     os.environ["ALPHAGRAD_WALK_STEPS"] = str(int(args.walk_steps))
     os.environ["ALPHAGRAD_WALK_LR"] = repr(float(args.walk_lr))
     os.environ["ALPHAGRAD_WALK_PROBE_SEED"] = str(int(args.walk_probe_seed))
@@ -7192,7 +7394,9 @@ def main():
         # --per-face-masks SIZES half (A1b): built unconditionally (it is
         # one closure) but only CALLED under `_PFM_SIZES` below, so the
         # flag-off trace has no extra callback and no extra host work.
-        _live_face_sizes = make_face_sizes_callback(
+        # Per-SLOT, always (ticket .18): the per-face probe recorded the
+        # RESULT tensor only and broadcast it to lhs / rhs / new.
+        _live_face_sizes = make_face_slot_legality_callback(
             _LIVE_FACES, max_faces=_F_FACES,
             max_axes=MAX_AXES_PER_VERTEX, prof_sink=_env_prof_add)
 
@@ -7252,10 +7456,17 @@ def main():
     _PFM_LIVE_SIZES = bool(_PFM and _NO_ORACLE and _live_face_sizes is not None
                            and not getattr(args, "no_approx_head", False))
     _PFM_SIZES = bool(_PFM and (not _NO_ORACLE or _PFM_LIVE_SIZES))
+    # Per-SLOT legality (ticket .18, D3) rides the live-stream sizes half:
+    # sizes, quant, Diag-pair and Reduce-axis masks per (face, slot). There is
+    # no per-vertex alternative any more -- the per-slot frames are the only
+    # behaviour -- so this is exactly "the live sizes half is available".
+    _PFM_SLOT = bool(_PFM_LIVE_SIZES)
     if _PFM:
         print("[cfg] --per-face-masks: apply-time projection ON; "
               "per-face SIZES + QUANT mask "
-              + ("ON (live-face stream)" if _PFM_LIVE_SIZES else
+              + ("ON (live-face stream, PER SLOT: lhs/rhs/new)"
+                 if _PFM_SLOT else
+                 "ON (live-face stream)" if _PFM_LIVE_SIZES else
                  "ON (live oracle)" if _PFM_SIZES else
                  "OFF -- no oracle and no live-face stream, so there are "
                  "no per-face sizes to hand the head. Only the apply-time "
@@ -7283,6 +7494,17 @@ def main():
     )
 
     vertex_valid_static = build_vertex_valid_static(env.valid_vertices, total_v)
+    # --fixed-order (ticket .64): the static order table, computed ONCE here on
+    # the exact graph and gathered inside vertex_avail_at_step; None = free.
+    fixed_order_table = _fixed_order_for_env(args.fixed_order, env)
+    if fixed_order_table is None:
+        print("[cfg] fixed order: free (the vertex head chooses)", flush=True)
+    else:
+        print(f"[cfg] fixed order: {args.fixed_order}, {len(fixed_order_table)} "
+              f"steps, {fixed_order_table[:6].tolist()} ... "
+              f"{fixed_order_table[-3:].tolist()}; only approximations are "
+              "learned", flush=True)
+        fixed_order_table = jnp.asarray(fixed_order_table, dtype=jnp.int32)
     pair_valid_mask = build_pair_valid_mask(
         closed_jaxpr.jaxpr,
         total_v,
@@ -7353,14 +7575,32 @@ def main():
                 "(--loss-mode multi_head): lambda is an advantage-"
                 "scalarization weight over per-channel advantages.")
         if args.preference_conditioned:
-            raise ValueError(
-                "--reward-mode lagrangian drives the quality preference "
-                "slot with the dual variable lambda; "
-                "--preference-conditioned (Dirichlet preference sampling) "
-                "would overwrite it every episode. Pick one.")
+            # Arm L (ticket .9): the Dirichlet preference is restricted to
+            # the two cost heads and lambda takes the quality slot every
+            # episode (see _lag_preferences). Until 2026-09-04 this was
+            # refused ("pick one").
+            print("[cfg] lagrangian + preference-conditioned: Dirichlet over "
+                  "(latency, memory) only; the quality preference IS lambda.",
+                  flush=True)
         head_reward_weights_np[HEAD_NAMES.index("quality")] = np.float32(
             args.lag_init)
         head_reward_weights = jnp.asarray(head_reward_weights_np, dtype=jnp.float32)
+    if args.quality_floor is not None:
+        # THE QUALITY FLOOR (ticket .9): a channel option. Under additive it
+        # rewrites slot 6 to the hinge (_apply_quality_floor); under
+        # lagrangian it IS the constraint threshold, so it sets --lag-tau
+        # (one tau, one hinge, the existing dual-ascent machinery). mult
+        # replaces every channel with its own gated scalar: no slot to floor.
+        if args.reward_mode == "mult":
+            raise ValueError(
+                "--quality-floor has no channel to act on under "
+                "--reward-mode mult (the mult gate replaces the channels).")
+        if args.reward_mode == "lagrangian":
+            args.lag_tau = float(args.quality_floor)
+        print(f"[cfg] quality floor tau={float(args.quality_floor):g}: reward "
+              f"slot 6 = -max(0, tau - q) on the terminal step"
+              + (" (sets --lag-tau; lambda by dual ascent)"
+                 if args.reward_mode == "lagrangian" else ""), flush=True)
 
     # Per-(vertex, pair, factor) validity mask. The legacy mask filtered
     # out factors that didn't divide the relevant axis sizes. With
@@ -7390,7 +7630,8 @@ def main():
         # that the env then applied, breaking the variant-comparison
         # intent.
         op_legality_override = _op_legality_for_variant(
-            args.variant, args.allow_compress
+            args.variant, args.allow_compress,
+            approx_profile=getattr(args, "approx_profile", None),
         )
         print(
             f"dynamic-substeps: max_substeps={args.max_substeps}, "
@@ -7483,12 +7724,14 @@ def main():
     agent = apply_init_scheme(agent, init_key, args)
     print(f"[init] scheme={getattr(args, 'init_scheme', 'campaign')} "
           f"head_init_scale={float(getattr(args, 'head_init_scale', 0.1)):g} "
-          f"scale_face_head={float(getattr(args, 'scale_face_head', 0.0)):g}",
+          f"scale_face_head={float(getattr(args, 'scale_face_head', 0.0)):g} "
+          f"face_none_bias={float(getattr(args, 'face_none_bias', 0.0)):g}",
           flush=True)
     # Identity-init parity with the factory path (az): ppo.main predates
     # build_and_init_agent and does not route through it.
     from alphagrad.approx.common.agent_factory import apply_face_none_bias
-    agent = apply_face_none_bias(agent)
+    agent = apply_face_none_bias(
+        agent, float(getattr(args, "face_none_bias", 0.0) or 0.0))
     # ------------------------------------------- KL-TO-REFERENCE TRUST REGION
     # THE FROZEN REFERENCE POLICY, snapshotted HERE and never again: after
     # _build_agent + apply_init_scheme + apply_face_none_bias, i.e. exactly
@@ -7504,7 +7747,7 @@ def main():
     #   * The VERTEX term cancels EXACTLY: both sides read the same
     #     `new_vertex_dist` (the reference pass re-runs the FACE path only,
     #     off the current encoding), so log p_vertex is subtracted from both.
-    #     Under ALPHAGRAD_FORCE_REV_ORDER=1 that term is structurally 0
+    #     Under a fixed order (--fixed-order) that term is structurally 0
     #     anyway -- the vertex head has exactly one legal action per step, so
     #     its distribution is a point mass under ANY parameters and no KL of
     #     it can ever be non-zero. There is nothing to penalise there.
@@ -7831,7 +8074,8 @@ def main():
                 state, elim_order, enc_state, prev_part = carry
             sample_key, next_net_key = jrand.split(k, 2)
             vertex_avail_mask = vertex_avail_at_step(
-                state, vertex_valid_static, total_v, num_valid
+                state, vertex_valid_static, total_v, num_valid,
+                fixed_order=fixed_order_table,
             )
 
             # PRE (synced through the PREVIOUS delta) and POST (synced through
@@ -8033,8 +8277,12 @@ def main():
                         # Cheap (static shapes, trace time) and names the
                         # mistake instead of surfacing it as a broadcast error
                         # 5 frames deep in the head.
-                        _want = ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX),
-                                 (ENV_MAX_FACES,))
+                        _want = (((ENV_MAX_FACES, FACE_SLOTS,
+                                   MAX_AXES_PER_VERTEX),
+                                  (ENV_MAX_FACES, FACE_SLOTS, 2))
+                                 if _PFM_SLOT else
+                                 ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX),
+                                  (ENV_MAX_FACES,)))
                         _got = (tuple(face_sizes_v.shape),
                                 tuple(face_quant_v.shape))
                         if _got != _want:
@@ -8046,11 +8294,15 @@ def main():
                 else:
                     face_action = _zero_face_action()
                     face_old_logp = jnp.array(0.0)
+                    # --face-slot-frames: the pair / comp masks carry a slot
+                    # axis on the live path (see _PFM_SLOT).
+                    _sl = (FACE_SLOTS,) if _PFM_SLOT else ()
                     face_pair_v = jnp.zeros(
-                        (ENV_MAX_FACES, MAX_AXES_PER_VERTEX,
+                        (ENV_MAX_FACES,) + _sl + (MAX_AXES_PER_VERTEX,
                          MAX_AXES_PER_VERTEX), jnp.float32)
                     face_comp_v = jnp.zeros(
-                        (ENV_MAX_FACES, MAX_AXES_PER_VERTEX), jnp.float32)
+                        (ENV_MAX_FACES,) + _sl + (MAX_AXES_PER_VERTEX,),
+                        jnp.float32)
                     face_valid_v = jnp.zeros((ENV_MAX_FACES,), jnp.float32)
                     face_ends_v = jnp.zeros((ENV_MAX_FACES, 2), jnp.int32)
                     face_cnt_v = jnp.zeros((ENV_MAX_FACES,), jnp.int32)
@@ -8069,9 +8321,11 @@ def main():
                         # sizes read back as an all-invalid axis set, which is
                         # the correct "nothing is approximable here".
                         face_sizes_v = jnp.zeros(
-                            (ENV_MAX_FACES, MAX_AXES_PER_VERTEX), jnp.int32)
+                            (ENV_MAX_FACES,) + _sl + (MAX_AXES_PER_VERTEX,),
+                            jnp.int32)
                         face_quant_v = jnp.zeros(
-                            (ENV_MAX_FACES,), jnp.float32)
+                            (ENV_MAX_FACES,) + _sl + ((2,) if _PFM_SLOT else ()),
+                            jnp.float32)
                 if _DEBUG_ORDER:
                     # avail = how many vertices are still selectable; picked =
                     # the 0-based index chosen; was_avail = 1.0 iff that pick
@@ -8433,8 +8687,13 @@ def main():
             ratio just stops being 1), so the shapes are asserted where they
             enter the loss rather than discovered as a broadcast error inside
             the head."""
-            _w = ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX), (ENV_MAX_FACES,))
-            _g = (tuple(fsz.shape[-2:]), tuple(fqt.shape[-1:]))
+            if _PFM_SLOT:
+                _w = ((ENV_MAX_FACES, FACE_SLOTS, MAX_AXES_PER_VERTEX),
+                      (ENV_MAX_FACES, FACE_SLOTS, 2))
+                _g = (tuple(fsz.shape[-3:]), tuple(fqt.shape[-3:]))
+            else:
+                _w = ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX), (ENV_MAX_FACES,))
+                _g = (tuple(fsz.shape[-2:]), tuple(fqt.shape[-1:]))
             if _g != _w:
                 raise ValueError(
                     "--per-face-masks: stored face_sizes/face_quant have "
@@ -9509,6 +9768,10 @@ def main():
             # lambda enters ONLY via traj.preference at the advantage
             # scalarization below -- value targets stay lambda-free.
             traj_reward = _apply_lagrangian_channels(traj_reward, args.lag_tau)
+        elif args.quality_floor is not None:
+            # --quality-floor under additive (arm P1, ticket .9): the same
+            # additive composition, the quality slot rewritten to the hinge.
+            traj_reward = _apply_quality_floor(traj_reward, args.quality_floor)
         sl_reward = _symlog_rewards(traj_reward)  # (E, T, NUM_REWARDS)
         if args.loss_mode == "scalar":
             scalar_reward = jnp.sum(sl_reward * reward_weights, axis=-1)  # (E, T)
@@ -9799,6 +10062,15 @@ def main():
             jax.debug.callback(
                 _adv_cb, advantages, norm_adv, estim_returns, traj.value,
                 _sig_diag)
+
+        # GATE TELEMETRY (ticket .45): hand the critic's per-head target and
+        # prediction -- the pair the value loss compares -- and the per-env
+        # preference to the host for gate/g2/* and gate/g5/*. A host copy,
+        # read-only: nothing here feeds the advantage, the return or the
+        # update.
+        jax.debug.callback(
+            _gate_telemetry.stash_critic, _value_target(estim_returns),
+            traj.value, traj.preference)
 
         # Stage-by-stage NaN trace through the advantage/return path. The loss
         # localizer proved the NaN is ALREADY in norm_adv / estim_returns when
@@ -10439,6 +10711,11 @@ def main():
     # tells them apart. ``entropy/*`` panels are unaffected -- they describe
     # the policy heads, not the reward.
     _wandb_config["quality_metric_resolved"] = _QUALITY_METRIC
+    _wandb_config["mem_channel"] = str(args.mem_channel)
+    # TOOLCHAIN FINGERPRINT (ticket .45): jax / jaxlib versions, XLA_FLAGS,
+    # the sparse flag, beside the repo SHAs _repo_commits put here.
+    _wandb_config.update(_gate_telemetry.toolchain_fingerprint(
+        sparse=getattr(getattr(env, "config", None), "sparse", None)))
     wandb.init(
         project=getattr(args, "wandb_project", None) or "dsnn-vertex",
         entity=getattr(args, "wandb_entity", None) or None,
@@ -10459,6 +10736,7 @@ def main():
     pareto_archive = ParetoArchive(
         obj_names=(args.cmp_type, args.mem_type, "cosine_sim"),
         obj_idx=(cmp_idx, mem_idx, cosine_idx),
+        quality_floor=args.quality_floor,
     )
     elim_order_table = wandb.Table(columns=["episode", "return", "elimination order"])
     pbar = tqdm(total=args.episodes)
@@ -10628,6 +10906,8 @@ def main():
         else:
             _live_env = np.ones((all_rets.shape[0],), dtype=bool)
         _any_live = bool(_live_env.any())
+        _paired_costs = (
+            getattr(args, "cost_form", "absolute") == "paired-log")
         if _any_live:
             mean_r = np.asarray(
                 all_rets[_live_env].mean(axis=0), dtype=np.float64)
@@ -10675,11 +10955,20 @@ def main():
             # carried by frob in the reward; the collapse guard's job is only
             # to reject rows whose COSTS are degenerate (a zeroed computation
             # reports zero cost and would otherwise be crowned "best").
-            collapsed = bool(
-                rets[cmp_idx] >= 0.0
-                or rets[mem_idx] >= 0.0
-                or (measure_latency and rets[REWARD_INDEX["latency_ns"]] >= 0.0)
-            )
+            # Under --cost-form paired-log (ticket .9) slots 2 and 5 are
+            # log-differences: a plan cheaper than rev-exact scores ABOVE
+            # 0 and rev-exact itself scores exactly 0, so the sign carries
+            # no degeneracy. There, a row is collapsed only when it is a
+            # sentinel (the LIVE mask above).
+            if _paired_costs:
+                collapsed = not bool(_live_env[i])
+            else:
+                collapsed = bool(
+                    rets[cmp_idx] >= 0.0
+                    or rets[mem_idx] >= 0.0
+                    or (measure_latency
+                        and rets[REWARD_INDEX["latency_ns"]] >= 0.0)
+                )
             if collapsed:
                 n_collapsed_this_ep += 1
                 continue
@@ -10718,7 +11007,7 @@ def main():
         weighted_sums = np.sum(all_rets * weights, axis=-1)
         eligible = np.array(
             [
-                not (
+                bool(_live_env[i]) if _paired_costs else not (
                     all_rets[i][cmp_idx] >= 0.0
                     or all_rets[i][mem_idx] >= 0.0
                     or (
@@ -10939,8 +11228,14 @@ def main():
         if true_return is not None:
             log_dict["scalarized_return"] = float(true_return)
             for j, name in enumerate(REWARD_NAMES):
+                _mj = float(mean_r[j]) if j < len(mean_r) else 0.0
+                # COST CHANNELS ARE LOGGED AS THE COST (owner ruling,
+                # finding 53 Q2, ticket .9): the slots stay stored negated,
+                # the panel shows the positive number -- latency in ns and
+                # bytes under --cost-form absolute, the log-difference
+                # against rev-exact (positive = costlier) under paired-log.
                 log_dict[f"mean_{name}"] = (
-                    float(mean_r[j]) if j < len(mean_r) else 0.0)
+                    0.0 - _mj if j in COMPUTE_REWARD_INDICES else _mj)
 
         # ---- per-channel measurement stats (spec P2) ------------------------
         # best / mean / median / worst per channel, for THIS episode and
@@ -11181,18 +11476,6 @@ def main():
                 _j = REWARD_INDEX.get(_nm)
                 if _j is not None and all_rets.shape[1] > _j:
                     _pl[_nm] = all_rets[:, _j].astype(np.float64)
-            # PER-PLAN GRADIENT COVERAGE. Reward slot 7 carries BOTH numbers
-            # in one float (env.py `_grad_coverage`): positive => nothing
-            # frozen and the value IS min_leaf_ratio; non-positive => the
-            # magnitude IS frac_leaves_zeroed and min_leaf_ratio is 0 by
-            # construction. Decoded here into the two keys the joint record
-            # is supposed to carry. The -1e10 pool-timeout sentinel is
-            # clipped out so it cannot own the panel's y-range.
-            _jg = REWARD_INDEX.get("grad_coverage")
-            if _jg is not None and all_rets.shape[1] > _jg:
-                _gc = np.clip(all_rets[:, _jg].astype(np.float64), -1.0, 1.0)
-                _pl["grad_cov_min_leaf_ratio"] = np.maximum(_gc, 0.0)
-                _pl["grad_cov_frac_zeroed"] = np.maximum(-_gc, 0.0)
             for _k, _v in _pl.items():
                 _v = np.asarray(_v)
                 for _i in range(_v.shape[0]):
@@ -11222,6 +11505,11 @@ def main():
         if _PLAN_LOG_PATH is not None:
             _plog_t0 = _prof_time.perf_counter()
             _plog_path = _resolve_plan_log_path(args)
+            from alphagrad.approx.env import (
+                MeasureToolchainFault as _MeasureToolchainFault,
+                check_mem_parity_complete as _mp_check,
+                mem_parity_summary as _mp_summary,
+                paired_ref_summary as _pr_summary)
             try:
                 from alphagrad.approx.common.plan_log import (
                     append_records as _plog_append)
@@ -11232,6 +11520,27 @@ def main():
                 _plog_dropped = int(_plog_local["dropped"])
                 _plog_actors = 0
                 _plog_why = ""
+                # MEASURE TOOLCHAIN TELEMETRY (finding 03 sec 6): the
+                # counters ride the SAME drain as the records, so the
+                # actor-side values reach here instead of the trainer's
+                # own always-zero globals (the grad_cov/* trap, ticket 07).
+                _plog_fb = int(_plog_local.get("compile_fallbacks", 0))
+                _plog_fb_total = int(
+                    _plog_local.get("compile_fallbacks_total", 0))
+                _plog_tc_ok = bool(_plog_local.get("toolchain_ok", True))
+                # MEMORY PARITY (ticket .49): same drain, same trap. The
+                # trainer's own share first (every row under --exec-on-gpu,
+                # the ALPHAGRAD_POOL_TERMINAL_LOCAL rows under the pool).
+                _plog_mp = dict(_plog_local.get("mem_parity") or {})
+                _plog_mp.setdefault("records", [])
+                _plog_mp.setdefault("measured", 0)
+                _plog_mp.setdefault("dropped", 0)
+                _plog_mp["records"] = list(_plog_mp["records"])
+                # THE PAIRED REFERENCE (ticket .9): same drain, same trap.
+                _plog_pr = list(
+                    (_plog_local.get("paired_ref") or {}).get("records", ()))
+                _plog_pr_dropped = int(
+                    (_plog_local.get("paired_ref") or {}).get("dropped", 0))
                 try:
                     from alphagrad.approx.common.measure_pool import (
                         merge_pool_plan_records as _plog_merge)
@@ -11240,6 +11549,21 @@ def main():
                     _plog_recs.extend(_plog_pool["records"])
                     _plog_dropped += int(_plog_pool["dropped"])
                     _plog_actors = int(_plog_pool["actors_polled"])
+                    _plog_fb += int(_plog_pool.get("compile_fallbacks", 0))
+                    _plog_fb_total += int(
+                        _plog_pool.get("compile_fallbacks_total", 0))
+                    _plog_tc_ok = _plog_tc_ok and bool(
+                        _plog_pool.get("toolchain_ok", True))
+                    _plog_mp_pool = _plog_pool.get("mem_parity") or {}
+                    _plog_mp["records"].extend(
+                        _plog_mp_pool.get("records", ()))
+                    _plog_mp["measured"] += int(
+                        _plog_mp_pool.get("measured", 0))
+                    _plog_mp["dropped"] += int(
+                        _plog_mp_pool.get("dropped", 0))
+                    _plog_pr_pool = _plog_pool.get("paired_ref") or {}
+                    _plog_pr.extend(_plog_pr_pool.get("records", ()))
+                    _plog_pr_dropped += int(_plog_pr_pool.get("dropped", 0))
                     _plog_why = (
                         f" pool={bool(_plog_pool.get('have_pool'))}"
                         f" actors_seen={_plog_pool.get('actors_seen')}"
@@ -11254,10 +11578,17 @@ def main():
                               f"could not be polled -- their plans are MISSING "
                               f"from this episode's records",
                               file=sys.stderr, flush=True)
+                except _MeasureToolchainFault:
+                    # A measure actor whose memory parity is incomplete
+                    # (env.check_mem_parity_complete) stops the run: a
+                    # skip is a failure, not a stderr line.
+                    raise
                 except Exception as _plog_exc:
                     print(f"[plan-log] ep{ep}: pool drain failed "
                           f"({_plog_exc!r}) -- pooled plans are MISSING",
                           file=sys.stderr, flush=True)
+                # The gate telemetry below reads the same drained records.
+                host_state["_gate_records"] = list(_plog_recs)
                 _plog_n0 = int(host_state.get("_plan_log_written", 0))
                 for _plog_j, _plog_r in enumerate(_plog_recs):
                     _plog_r["episode"] = int(ep)
@@ -11270,6 +11601,39 @@ def main():
                 log_dict["plan_log/actors_polled"] = int(_plog_actors)
                 log_dict["plan_log/sentinelled_this_ep"] = int(sum(
                     1 for _r in _plog_recs if _r.get("sentinelled")))
+                log_dict["measure/compile_fallbacks_this_ep"] = int(_plog_fb)
+                log_dict["measure/compile_fallbacks_total"] = int(
+                    _plog_fb_total)
+                log_dict["measure/toolchain_ok"] = int(bool(_plog_tc_ok))
+                # MEMORY PARITY, per episode (ticket .49; .45 names these):
+                # the mean and worst watermark - temp in bytes, the two
+                # means, and how many readings were static substitutions
+                # (structural on CPU). Every measured plan must have left a
+                # record -- checked on the merged totals, trainer + actors.
+                _mp_check(_plog_mp, f"ep{ep} (trainer + {_plog_actors} "
+                                    f"measure actor(s))")
+                for _mp_k, _mp_v in _mp_summary(
+                        _plog_mp["records"]).items():
+                    log_dict[f"measure/mem_parity/{_mp_k}"] = _mp_v
+                log_dict["measure/mem_parity/measured"] = int(
+                    _plog_mp["measured"])
+                # THE PAIRED REFERENCE, per episode (ticket .9; .45 logs
+                # these): rev-exact's latency and static temp in POSITIVE
+                # units, how many references were measured, and how many
+                # memory readings the log floor replaced. Absent under
+                # --cost-form absolute (no reference is measured).
+                if _plog_pr or _plog_pr_dropped:
+                    _prs = _pr_summary(_plog_pr)
+                    log_dict["ref/latency_ns"] = _prs["latency_ns"]
+                    log_dict["ref/temp_bytes"] = _prs["temp_bytes"]
+                    log_dict["ref/watermark_bytes"] = _prs["watermark_bytes"]
+                    log_dict["ref/n"] = int(_prs["n"])
+                    log_dict["ref/mem_floored"] = int(_prs["mem_floored"])
+                    log_dict["ref/dropped"] = int(_plog_pr_dropped)
+                    print(f"[paired-ref ep{ep}] n={_prs['n']} "
+                          f"latency_ns={_prs['latency_ns']:.4g} "
+                          f"temp_bytes={_prs['temp_bytes']:.4g} "
+                          f"mem_floored={_prs['mem_floored']}", flush=True)
                 # PRINTED, NOT ONLY LOGGED. A run whose plan log silently
                 # stays empty -- which is exactly what a pooled run did
                 # before this line existed -- is indistinguishable from a
@@ -11284,6 +11648,8 @@ def main():
                     print(f"[plan-log] ep{ep}: {_plog_dropped} record(s) "
                           f"DROPPED at the buffer cap -- raise --plan-log-cap",
                           file=sys.stderr, flush=True)
+            except _MeasureToolchainFault:
+                raise
             except Exception as _plog_exc:
                 print(f"[plan-log] ep{ep}: FAILED to write "
                       f"{_plog_path!r}: {_plog_exc!r}",
@@ -11291,43 +11657,78 @@ def main():
             log_dict["plan_log/wall_s"] = float(
                 _prof_time.perf_counter() - _plog_t0)
 
-        # ---- GRADIENT COVERAGE census --------------------------------------
-        # THE ANTI-BUG-(c) REQUIREMENT. A rejected plan is excluded from the
-        # gradient, and docs sec 7(c) is the record of what happens when that
-        # is done SILENTLY: the res-slot plans were eaten for a whole campaign
-        # with no counter anywhere. Every rejection lands here, every episode,
-        # whether or not wandb is on.
+        # ---- GATE G1-G6 TELEMETRY (ticket .45) ------------------------------
+        # Computed from copies the trainer already holds: the plan records
+        # the drain above delivered, the critic stash train_episode filled,
+        # the face-head entropy in mets, the terminal reward rows. Nothing
+        # here is read by the reward, the advantage or the sampler; a
+        # failure prints and the run goes on (this is logging, not a fault
+        # gate). Field table: docs/GATE_TELEMETRY.md.
         try:
-            _gcs = consume_grad_coverage_stats()
-            _gc_rej = consume_frozen_grad_plan_count()
-            log_dict["grad_cov/rejected_this_ep"] = int(_gc_rej)
-            log_dict["grad_cov/measured_this_ep"] = int(_gcs["count"])
-            log_dict["grad_cov/undefined_this_ep"] = int(_gcs["undefined"])
-            if _gcs["count"]:
-                log_dict["grad_cov/min_leaf_ratio"] = float(
-                    _gcs["mean_min_leaf_ratio"])
-                log_dict["grad_cov/min_leaf_ratio_worst"] = float(
-                    _gcs["min_min_leaf_ratio"])
-                log_dict["grad_cov/frac_zeroed"] = float(
-                    _gcs["mean_frac_zeroed"])
-                log_dict["grad_cov/frac_zeroed_worst"] = float(
-                    _gcs["max_frac_zeroed"])
-                log_dict["grad_cov/wall_frac"] = float(_gcs["wall_frac"])
-                log_dict["grad_cov/wall_s"] = float(_gcs["wall_s"])
-            if _gc_rej or _gcs["count"]:
-                print(f"[grad-cov ep{ep}] measured={int(_gcs['count'])} "
-                      f"rejected={int(_gc_rej)} "
-                      f"undefined={int(_gcs['undefined'])} "
-                      f"min_leaf_ratio(mean/worst)="
-                      f"{_gcs['mean_min_leaf_ratio']:.4g}/"
-                      f"{_gcs['min_min_leaf_ratio']:.4g} "
-                      f"frac_zeroed(mean/worst)="
-                      f"{_gcs['mean_frac_zeroed']:.4g}/"
-                      f"{_gcs['max_frac_zeroed']:.4g} "
-                      f"added_wall={100.0 * _gcs['wall_frac']:.2f}%",
-                      flush=True)
-        except Exception:
-            pass
+            _gate_recs = host_state.pop("_gate_records", [])
+            if "_gate_winners" not in host_state:
+                _gw, _gw_why = _gate_telemetry.load_winners_table(
+                    getattr(args, "gate_winners_table", None))
+                host_state["_gate_winners"] = _gw
+                if _gw is None:
+                    _gate_telemetry.print_reason("G1 absent", _gw_why)
+            if "_gate_legal" not in host_state:
+                # The face head's legality, once per run, from the same
+                # oracle probe the sampler uses (reset state: every face of
+                # every valid vertex). Static under the oracle path; under
+                # --face-slot-frames the live per-slot masks can be
+                # tighter, so the floor logged is the static one.
+                host_state["_gate_legal"] = None
+                host_state["_gate_vprim"] = None
+                try:
+                    host_state["_gate_vprim"] = {
+                        int(_v): env.config.jaxpr.eqns[int(_v) - 1].primitive.name
+                        for _v in env.valid_vertices}
+                except Exception as _gexc:
+                    _gate_telemetry.print_reason(
+                        "G1 primitive map absent", repr(_gexc))
+                if getattr(args, "face_actions", False) and not _NO_ORACLE:
+                    try:
+                        _gm = _oracle_face_masks_host(
+                            np.zeros((0,), np.int32), np.zeros((0,), np.int32), 0)
+                        _gvv = [int(_v) for _v in env.valid_vertices]
+                        _gfp = np.concatenate([_gm[2][_v] for _v in _gvv], 0)
+                        _gfc = np.concatenate([_gm[3][_v] for _v in _gvv], 0)
+                        _gfv = np.concatenate([_gm[4][_v] for _v in _gvv], 0)
+                        _gfq = (np.concatenate([_gm[6][_v] for _v in _gvv], 0)
+                                if len(_gm) > 6 else None)
+                        _goo = np.asarray(op_legality_override, np.float32)
+                        _gon = bool(getattr(args, "approx_profile", None)
+                                    == "skip") or bool(np.any(_goo[:3] > 0.5))
+                        host_state["_gate_legal"] = (
+                            _gate_telemetry.legal_counts_from_masks(
+                                _gfp, _gfc, _gfv, _gfq, _goo,
+                                face_head_on=_gon))
+                    except Exception as _gexc:
+                        _gate_telemetry.print_reason(
+                            "G3 floor absent", repr(_gexc))
+                else:
+                    _gate_telemetry.print_reason(
+                        "G3 floor absent", "no face head in this run")
+            log_dict.update(_gate_telemetry.episode_fields(
+                _gate_recs,
+                head_names=HEAD_NAMES,
+                all_rets=all_rets,
+                reward_names=REWARD_NAMES,
+                critic=_gate_telemetry.pop_critic(),
+                face_entropy_nats=(float(entropy_components[5])
+                                   if entropy_components.shape[0] > 5
+                                   else None),
+                legal=host_state.get("_gate_legal"),
+                winners=host_state.get("_gate_winners"),
+                vertex_primitive=host_state.get("_gate_vprim"),
+                quality_floor=getattr(
+                    args, _gate_telemetry.QUALITY_FLOOR_ATTR, None),
+                offline_contrast=getattr(
+                    args, "gate_offline_contrast", None)))
+        except Exception as _gexc:
+            _gate_telemetry.print_reason(
+                f"ep{ep} telemetry FAILED, fields absent", repr(_gexc))
 
         # ---- SPARSITY (stored bytes vs the exact plan) ---------------------
         # `sparsity/ratio_mean` is the number the owner asked for: how much
@@ -11378,7 +11779,7 @@ def main():
         # `fidelity/wall_amortised_s` is the honest per-plan price of the exact
         # reference this channel (and the cosine log) needs -- the number the
         # --cos-log-every stride exists to control. It is near zero when the
-        # coverage guard was already paying for that reference.
+        # quality metric was already paying for that reference.
         try:
             _fs = consume_fidelity_stats()
             if _fs["count"] or _fs["cos_count"]:
@@ -11661,7 +12062,7 @@ def main():
         # --face-edge-mem telemetry: slot-table traffic per episode.
         # `evictions` nonzero at steady state means K (= the face bound) is
         # undersized for this graph's distinct-edge-key count; a zero
-        # `nonzero_reads` under FORCE_REV_ORDER is EXPECTED (every lhs is
+        # `nonzero_reads` under --fixed-order reverse is EXPECTED (every lhs is
         # primitive there -- dossier section 8), under random/learned
         # orders it means the read path is dead.
         if _EDGE_TABLE is not None:
@@ -11762,13 +12163,6 @@ def main():
                 _parts.append("applied~ " + _fmt(_ae))
             if _sk.size:
                 _parts.append(f"skips={int(_sk.sum())}")
-            _gcm = np.asarray(_pr.get("grad_cov_min_leaf_ratio", []),
-                              np.float64)
-            _gcz = np.asarray(_pr.get("grad_cov_frac_zeroed", []), np.float64)
-            if _gcm.size and (_gcm.max() > 0.0 or _gcz.max() > 0.0):
-                _parts.append(f"cov med={np.median(_gcm):.4g} "
-                              f"[{_gcm.min():.4g},{_gcm.max():.4g}] "
-                              f"frozen={int((_gcz > 0).sum())}/{_gcz.size}")
             # THE WIN TEST (sec 14.7): <= 20 approximations REQUESTED (an
             # upper bound on applied, so this cannot miss a real win), q >=
             # 0.8, and a latency at or below 0.9x this episode's own live
@@ -12322,10 +12716,9 @@ def main():
             # _apply_lagrangian_channels for the sign convention). Same
             # shape/dtype every episode: updating lambda never retriggers
             # a compile.
-            _lagp = np.array(head_reward_weights_np, dtype=np.float32, copy=True)
-            _lagp[HEAD_NAMES.index("quality")] = np.float32(lag_lambda)
-            preferences_per_env = jnp.broadcast_to(
-                jnp.asarray(_lagp), (num_envs, NUM_VALUE_HEADS))
+            preferences_per_env = _lag_preferences(
+                preferences_per_env, head_reward_weights_np, lag_lambda,
+                bool(args.preference_conditioned))
 
         eval_samples = generate_eval_samples(env, ep_eval_key, args.num_eval_samples)
         env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)

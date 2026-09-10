@@ -28,6 +28,7 @@ Wire-up pattern from the driver (mirrors `mu0_ray.py`'s SPMD actor):
 from __future__ import annotations
 
 from typing import Any, Sequence
+import os
 
 import numpy as np
 import ray
@@ -306,9 +307,17 @@ class CpuApproximationActor:
         actor id is stamped by the merger, which is the only side that
         knows it.
         """
-        from alphagrad.approx.env import consume_plan_records as _consume
+        from alphagrad.approx.env import (
+            check_mem_parity_complete as _mp_check,
+            consume_plan_records as _consume)
         out = _consume()
         out["actor_id"] = self._actor_id
+        # MEMORY PARITY (ticket .49, folded from .32): every plan THIS
+        # actor measured must have left a (temp, watermark) record. Checked
+        # HERE, in the process that measured; the fault class rides the
+        # toolchain-fault escalation, so the pool does not swallow it.
+        _mp_check(out.get("mem_parity") or {},
+                  f"measure actor {self._actor_id} (pid {os.getpid()})")
         return out
 
     def consume_collapse_stats(self) -> dict:

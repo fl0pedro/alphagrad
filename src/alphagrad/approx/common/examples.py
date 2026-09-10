@@ -731,7 +731,8 @@ def warn_measure_grad_deprecated(args_like) -> bool:
       * THE QUALITY CHANNEL -- it used to select ``loss_drop`` over
         ``cosine``. That default now follows the traced target actually being
         scalar (``env.EnvConfig.scalar_target``), which is true for exactly
-        the targets on which the loss-drop walk is defined.
+        the targets on which a gradient (and so the gradient cosine, the
+        default since 2026-09-02) is defined.
       * GATING ``--seed-vertices`` -- see ``_seed_vertices_requested``.
 
     The NEGATION is a different matter: ``--no-measure-grad`` asked for the
@@ -770,8 +771,9 @@ def _seed_vertices_requested(_flag) -> bool:
        must rebuild the archived QUALITY CHANNEL too -- ``--measure-grad`` was
        what put ``env.quality_metric`` on ``loss_drop`` instead of ``cosine``.
        That condition is gone: the traced target is unconditionally the scalar
-       loss, so ``loss_drop`` is now the DEFAULT channel for every target that
-       has one, and a replay gets the archived channel without the flag. The
+       loss, so the scalar-loss channel (``grad_cosine`` since 2026-09-02;
+       ``loss_drop`` before) is the DEFAULT for every target that has one, and
+       a replay gets the archived channel without the flag. The
        error was removed rather than reworded because it would otherwise have
        demanded a flag that no longer does anything -- and an error message
        that names a no-op as the fix is worse than no error.

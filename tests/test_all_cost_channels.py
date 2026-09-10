@@ -10,7 +10,7 @@ The callback in `env._callback` carries an 11-channel reward vector
     [4] bytes_accessed   — XLA cost_analysis
     [5] peak_memory      — ResourceMonitor peak HBM
     [6] quality          — only at terminal
-    [7] grad_coverage    — was frob_residual until 2026-08-27 (bcb61a17)
+    [7] grad_coverage    — RESERVED since 2026-09-03 (coverage before, frob before that)
     [8] fidelity         — only at terminal
     [9] bkstep_acc       — RESERVED for the deprecated Ray line
     [10] sparsity        — stored-byte sparsity
@@ -39,7 +39,7 @@ from alphagrad.approx.env import (
 def _terminal_action_for(env) -> StepAction:
     """Drive the env to its terminal step in one go: pick the first valid
     vertex, plant no approximation rules. With the env at the first
-    pre-terminal vertex this would emit quality and grad_coverage; we
+    pre-terminal vertex this would emit quality; we
     only need the COST channels to populate, so just step once."""
     target_v = jnp.asarray(env.valid_vertices[0], dtype=jnp.int32)
     rule_specs = (

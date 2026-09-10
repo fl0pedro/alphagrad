@@ -84,14 +84,34 @@ def derive_agent_keys(seed: int):
     return agent_key, init_key
 
 
-def apply_face_none_bias(agent):
-    """IDENTITY-INIT for the face head (ALPHAGRAD_FACE_NONE_BIAS,
-    default 0 = off): +B on each slot's OP_NONE logit, -B on SKIP.
+REMOVED_ENV_KNOBS = {
+    # env var -> the flag that replaced it (ticket dsnn-3qm.44: args only,
+    # no fallback period). A set var is refused at startup, never read.
+    "ALPHAGRAD_FACE_NONE_BIAS": "--face-none-bias",
+}
+
+
+def refuse_removed_env_knobs(environ=None) -> None:
+    """Fail loudly at startup when a knob that became a flag is still set
+    in the environment. Nothing reads these vars any more, so a launcher
+    exporting one would run with the knob silently OFF."""
+    import os as _os
+    env = _os.environ if environ is None else environ
+    for var, flag in REMOVED_ENV_KNOBS.items():
+        if var in env:
+            raise SystemExit(
+                f"{var} is set but is no longer read: it was replaced by "
+                f"the {flag} flag (ticket dsnn-3qm.44, args only, no "
+                f"fallback). Unset it and pass {flag} instead.")
+
+
+def apply_face_none_bias(agent, bias: float):
+    """IDENTITY-INIT for the face head (--face-none-bias B, default 0 =
+    off): +B on each slot's OP_NONE logit, -B on SKIP.
     Called by build_and_init_agent AND by ppo.main's inline init path
     (which predates the factory and does not route through it -- the
     v54 PPO arm shipped without the bias until this was split out)."""
-    import os as _os
-    _nb = float(_os.environ.get("ALPHAGRAD_FACE_NONE_BIAS", "0") or 0.0)
+    _nb = float(bias or 0.0)
     _fpp = getattr(agent, "face_path_policy", None)
     if _nb == 0.0 or _fpp is None or getattr(_fpp, "head", None) is None:
         return agent
@@ -145,7 +165,8 @@ def build_and_init_agent(args, total_v: int, num_factors: int, max_rules: int,
     agent = _build_agent(args, total_v, num_factors, max_rules, key)
     agent = apply_init_scheme(agent, init_key, args)
 
-    agent = apply_face_none_bias(agent)
+    agent = apply_face_none_bias(
+        agent, float(getattr(args, "face_none_bias", 0.0) or 0.0))
     return agent
 
 

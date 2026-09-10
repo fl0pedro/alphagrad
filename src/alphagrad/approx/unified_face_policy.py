@@ -75,12 +75,14 @@ class UnifiedFacePolicy(eqx.Module):
     embd_dim: int = eqx.field(static=True)
     endpoint_read: bool = eqx.field(static=True)
     edge_mem: bool = eqx.field(static=True)
+    allow_skip: bool = eqx.field(static=True, default=False)
 
     def __init__(self, embd_dim: int, num_heads: int, max_faces: int = 8,
                  num_encoder_layers: int = 1, max_groups: int = 16, *, key,
                  use_group_embedding: bool = False,
                  endpoint_read: bool = False,
-                 edge_mem: bool = False):
+                 edge_mem: bool = False,
+                 allow_skip: bool = False):
         # num_heads / num_encoder_layers / max_groups / use_group_embedding
         # configured the deleted per-face AxisSetEncoder. They stay in the
         # signature because every trainer builds this policy positionally
@@ -89,6 +91,7 @@ class UnifiedFacePolicy(eqx.Module):
         self.max_faces = max_faces
         self.endpoint_read = bool(endpoint_read)
         self.edge_mem = bool(edge_mem)
+        self.allow_skip = bool(allow_skip)
         keys = jrand.split(key, 3)
         # in_dim = E: the face's own latent -- UNLESS --face-endpoint-read
         # (docs/FACE_LATENT_INFO_LOSS.md section 4), where the input is
@@ -104,6 +107,17 @@ class UnifiedFacePolicy(eqx.Module):
                                     key=keys[1])
 
     # ------------------------------------------------------------ masks
+    @staticmethod
+    def _fit(v, n):
+        v = jnp.asarray(v, jnp.float32).ravel()
+        return jnp.concatenate([v, jnp.zeros((n,), jnp.float32)])[:n]
+
+    @staticmethod
+    def _pair_sizes(features):
+        sz = jnp.asarray(features.size, jnp.int32)
+        return jnp.concatenate([sz, jnp.ones((MAX_PAIR_IDX,), jnp.int32)]
+                               )[:MAX_PAIR_IDX]
+
     def _face_masks(self, features, pair_valid_f, comp_valid_f,
                     quant_legality_mask, op_override, tables):
         """(op, i, j, axis, pair_ok) masks, broadcast to the three slots.
@@ -111,40 +125,130 @@ class UnifiedFacePolicy(eqx.Module):
         Every slot sees the SAME face, so the legality is the same for all
         three; they are stacked rather than shared so the head's per-slot
         signature stays honest if that ever stops being true.
+
+        IT STOPPED BEING TRUE (ticket .18, D3; finding 54): the three slots
+        hold three different tensors. When ``features`` is a LIST of
+        ``FACE_SLOTS`` per-slot features -- with ``pair_valid_f`` (S, N, N),
+        ``comp_valid_f`` (S, N) and ``quant_legality_mask`` (S, D) to match,
+        all from ``LiveFaceStream.face_slot_legality`` -- each slot's masks
+        come from ITS OWN legality (:meth:`_slot_masks_1`) and are stacked.
+        A single ``features`` keeps the historical broadcast, byte for byte.
+        (A LIST, specifically: ``AxisTokenFeatures`` is itself a tuple.)
         """
-        op_legal = _compute_op_legality(
-            features, pair_valid=pair_valid_f, compress_valid=comp_valid_f,
-            quant_legality_mask=quant_legality_mask, op_override=op_override)
-        i_diag, i_compress, j_diag, _ = _compute_axis_masks(
-            features, pair_valid=pair_valid_f, compress_valid=comp_valid_f)
+        if not isinstance(features, list):
+            op_legal = _compute_op_legality(
+                features, pair_valid=pair_valid_f,
+                compress_valid=comp_valid_f,
+                quant_legality_mask=quant_legality_mask,
+                op_override=op_override)
+            i_diag, i_compress, j_diag, _ = _compute_axis_masks(
+                features, pair_valid=pair_valid_f,
+                compress_valid=comp_valid_f)
+            om = jnp.broadcast_to(self._fit(op_legal, NUM_APPROX_OPS),
+                                  (FACE_SLOTS, NUM_APPROX_OPS))
+            im = jnp.broadcast_to(self._fit(i_diag, MAX_PAIR_IDX),
+                                  (FACE_SLOTS, MAX_PAIR_IDX))
+            jm = jnp.broadcast_to(self._fit(j_diag, MAX_PAIR_IDX),
+                                  (FACE_SLOTS, MAX_PAIR_IDX))
+            am = jnp.broadcast_to(self._fit(i_compress, NUM_REDUCE_AXES),
+                                  (FACE_SLOTS, NUM_REDUCE_AXES))
+            # Non-coprime (i, j) table: gcd == 1 admits only factor 1, a no-op.
+            #
+            # PER-FACE UNDER --per-face-masks. `features` here is `_face_feats_1`'s
+            # output, so once `face_sizes_f` is supplied these are THIS FACE's live
+            # logical sizes (`masks.dim_logical_sizes`) rather than the vertex's
+            # nominal ones -- the same numbers `masks.face_masks_and_sizes` screened
+            # the pair with, and the same ones `_rows` derives the factor from. With
+            # `face_sizes_f=None` it is the historical per-VERTEX table.
+            sz = self._pair_sizes(features)
+            g = jnp.gcd(sz[:, None], sz[None, :])
+            pair_ok = jnp.broadcast_to((g > 1).astype(jnp.float32),
+                                       (FACE_SLOTS, MAX_PAIR_IDX, MAX_PAIR_IDX))
+            dm = jnp.broadcast_to(self._fit(quant_legality_mask, 2),
+                                  (FACE_SLOTS, 2))
+            return om, im, jm, am, pair_ok, dm
+        outs = [self._slot_masks_1(features[s], pair_valid_f[s],
+                                   comp_valid_f[s], quant_legality_mask[s],
+                                   op_override)
+                for s in range(FACE_SLOTS)]
+        return tuple(jnp.stack([o[k] for o in outs]) for k in range(6))
 
-        def _fit(v, n):
-            v = jnp.asarray(v, jnp.float32).ravel()
-            return jnp.concatenate([v, jnp.zeros((n,), jnp.float32)])[:n]
+    def _slot_masks_1(self, features, pair_valid, comp_valid,
+                      quant_legality_mask, op_override):
+        """ONE slot's (op, i, j, axis, pair_ok, dm) from ONE slot's legality.
 
-        om = jnp.broadcast_to(_fit(op_legal, NUM_APPROX_OPS),
-                              (FACE_SLOTS, NUM_APPROX_OPS))
-        im = jnp.broadcast_to(_fit(i_diag, MAX_PAIR_IDX),
-                              (FACE_SLOTS, MAX_PAIR_IDX))
-        jm = jnp.broadcast_to(_fit(j_diag, MAX_PAIR_IDX),
-                              (FACE_SLOTS, MAX_PAIR_IDX))
-        am = jnp.broadcast_to(_fit(i_compress, NUM_REDUCE_AXES),
-                              (FACE_SLOTS, NUM_REDUCE_AXES))
-        # Non-coprime (i, j) table: gcd == 1 admits only factor 1, a no-op.
-        #
-        # PER-FACE UNDER --per-face-masks. `features` here is `_face_feats_1`'s
-        # output, so once `face_sizes_f` is supplied these are THIS FACE's live
-        # logical sizes (`masks.dim_logical_sizes`) rather than the vertex's
-        # nominal ones -- the same numbers `masks.face_masks_and_sizes` screened
-        # the pair with, and the same ones `_rows` derives the factor from. With
-        # `face_sizes_f=None` it is the historical per-VERTEX table.
-        sz = jnp.asarray(features.size, jnp.int32)
-        sz = jnp.concatenate([sz, jnp.ones((MAX_PAIR_IDX,), jnp.int32)]
-                             )[:MAX_PAIR_IDX]
+        Bottom-up hierarchical legality (ticket .59): a parent op is legal only
+        if at least one of its sub-argument choices is legal.
+          - Diag is legal only if at least one pair has gcd > 1 and pair_valid;
+            im and jm are column/row projections of pair_ok, eliminating invalid
+            axis fallbacks.
+          - Reduce is legal only if at least one reduce axis is valid.
+          - Quant is legal only if at least one target dtype is valid and not a
+            no-op cast (D4 identity quant masking).
+          - None is unconditionally legal.
+        The resulting op_legal mask is composed with op_override.
+        """
+        sz = self._pair_sizes(features)
         g = jnp.gcd(sz[:, None], sz[None, :])
-        pair_ok = jnp.broadcast_to((g > 1).astype(jnp.float32),
-                                   (FACE_SLOTS, MAX_PAIR_IDX, MAX_PAIR_IDX))
-        return om, im, jm, am, pair_ok
+        pv = jnp.asarray(pair_valid, jnp.float32)
+        pv = jnp.pad(pv, ((0, MAX_PAIR_IDX), (0, MAX_PAIR_IDX))
+                     )[:MAX_PAIR_IDX, :MAX_PAIR_IDX]
+        pair_ok = (g > 1).astype(jnp.float32) * pv
+        im = (jnp.sum(pair_ok, axis=-1) > 0.0).astype(jnp.float32)
+        jm = (jnp.sum(pair_ok, axis=0) > 0.0).astype(jnp.float32)
+        diag_legal = (jnp.sum(pair_ok) > 0.0).astype(jnp.float32)
+
+        _, i_compress, _, _ = _compute_axis_masks(
+            features, pair_valid=pair_valid, compress_valid=comp_valid)
+        am = self._fit(i_compress, NUM_REDUCE_AXES)
+        reduce_legal = (jnp.sum(am) > 0.0).astype(jnp.float32)
+
+        dm = self._fit(quant_legality_mask, 2)
+        quant_legal = (jnp.sum(dm) > 0.0).astype(jnp.float32)
+
+        none_legal = 1.0
+
+        op_override_arr = (jnp.ones((NUM_APPROX_OPS,), dtype=jnp.float32)
+                           if op_override is None
+                           else jnp.asarray(op_override, dtype=jnp.float32)[:NUM_APPROX_OPS])
+        om = jnp.stack([diag_legal, reduce_legal, quant_legal, none_legal]) * op_override_arr
+        return om, im, jm, am, pair_ok, dm
+
+    def _slot_inputs(self, features, pair_valid_f, comp_valid_f,
+                     quant_legality_mask, face_sizes_f, face_quant_f):
+        """Per-slot inputs, or ``None`` when every input is per-FACE.
+
+        The per-slot arrays come from ``face_slot_legality``
+        (``--face-slot-frames``): sizes (S, N), quant (S, 2), pair (S, N, N),
+        comp (S, N). Any one of them present switches the whole face to the
+        per-slot path; the others are broadcast to match, so an oracle-path
+        pair mask can still travel with live per-slot sizes.
+        """
+        per = ((face_sizes_f is not None and jnp.ndim(face_sizes_f) == 2)
+               or jnp.ndim(pair_valid_f) == 3 or jnp.ndim(comp_valid_f) == 2
+               or (face_quant_f is not None and jnp.ndim(face_quant_f) >= 1))
+        if not per:
+            return None
+        S = FACE_SLOTS
+
+        def _rows_of(x, rank):
+            x = jnp.asarray(x)
+            return x if x.ndim == rank + 1 else jnp.broadcast_to(
+                x, (S,) + x.shape)
+
+        sizes = None if face_sizes_f is None else _rows_of(face_sizes_f, 1)
+        ff = [self._face_feats_1(features,
+                                 None if sizes is None else sizes[s])
+              for s in range(S)]
+        pv = _rows_of(pair_valid_f, 2)
+        cv = _rows_of(comp_valid_f, 1)
+        fq = (None if face_quant_f is None
+              else _rows_of(jnp.asarray(face_quant_f, jnp.float32),
+                            0 if jnp.ndim(face_quant_f) <= 1 else 1))
+        qm = jnp.stack([self._quant_mask_1(
+            quant_legality_mask, None if fq is None else fq[s])
+            for s in range(S)])
+        return ff, pv, cv, qm
 
     def _face_feats(self, features, face_sizes, f):
         return self._face_feats_1(
@@ -224,11 +328,18 @@ class UnifiedFacePolicy(eqx.Module):
         # deterministic factor rule; the 94-slot head layout is UNCHANGED (no
         # factor field, no head-shape change), and a learned factor field would
         # replace this one line without moving anything else.
-        sz = jnp.asarray(features.size, jnp.int32)
-        sz = jnp.concatenate([sz, jnp.ones((MAX_PAIR_IDX,), jnp.int32)]
-                             )[:MAX_PAIR_IDX]
-        N_i = sz[jnp.clip(fields.i, 0, MAX_PAIR_IDX - 1)]
-        N_j = sz[jnp.clip(fields.j, 0, MAX_PAIR_IDX - 1)]
+        #
+        # PER SLOT (ticket .18): a list of per-slot features gives each slot
+        # its OWN sizes, so the factor is the gcd on the tensor the Diag hits.
+        if isinstance(features, list):
+            sz = jnp.stack([self._pair_sizes(f) for f in features])
+            _s = jnp.arange(FACE_SLOTS)
+            N_i = sz[_s, jnp.clip(fields.i, 0, MAX_PAIR_IDX - 1)]
+            N_j = sz[_s, jnp.clip(fields.j, 0, MAX_PAIR_IDX - 1)]
+        else:
+            sz = self._pair_sizes(features)
+            N_i = sz[jnp.clip(fields.i, 0, MAX_PAIR_IDX - 1)]
+            N_j = sz[jnp.clip(fields.j, 0, MAX_PAIR_IDX - 1)]
         g = jnp.gcd(N_i, N_j)
         exps = tables.max_exps[g].astype(jnp.int32)                # (S, P)
         primes = tables.primes[g]                                  # (S, P)
@@ -276,40 +387,54 @@ class UnifiedFacePolicy(eqx.Module):
     def _quant_mask_1(quant_legality_mask, face_quant_f):
         """The hardware dtype mask narrowed by THIS face's QUANT legality.
 
-        ``face_quant_f`` (0/1, from ``masks.face_masks_and_sizes``) is 0 when
-        no dtype the head can emit is both a legal chain and a real cast on
-        this face's operand -- i.e. the operand has no ``val``, or is already
-        that dtype. ``_compute_op_legality`` reads this mask as
-        ``sum(mask) > 0.5``, so zeroing it makes OP_QUANT unrepresentable on
-        that face. Before this, QUANT was the ONE operator with no per-face
-        legality at all, which is exactly why it was always available.
+        ``face_quant_f`` is either a scalar float (0/1) or a (2,) float array
+        representing [f32_legal, bf16_legal]. Slices quant_legality_mask to the
+        head's 2 dtype classes ('float32', 'bfloat16').
         """
+        if quant_legality_mask is None:
+            quant_legality_mask = quant_hardware_masks()[0]
+        qhw = jnp.asarray(quant_legality_mask, jnp.float32)[:2]
         if face_quant_f is None:
-            return quant_legality_mask
-        return jnp.asarray(quant_legality_mask, jnp.float32) * jnp.asarray(
-            face_quant_f, jnp.float32)
+            return qhw
+        fq = jnp.asarray(face_quant_f, jnp.float32)
+        if fq.ndim == 0:
+            return qhw * fq
+        return qhw * fq[:2]
 
     def sample_face(self, features: AxisTokenFeatures,
                     tables: FactorTables, key, f: int, pair_valid_f,
                     comp_valid_f, face_valid_f, *, face_context=None,
                     face_sizes_f=None, face_quant_f=None,
                     quant_legality_mask=None,
-                    op_legality_override=None):
+                    op_legality_override=None,
+                    allow_skip=None):
         """Draw face ``f``'s decision. ``(skip, row, logp, ent, arity,
         skip_prob, op_dist)`` -- one slice of what :meth:`sample` stacks."""
         if quant_legality_mask is None:
             quant_legality_mask = quant_hardware_masks()[0]
-        quant_legality_mask = self._quant_mask_1(quant_legality_mask,
-                                                 face_quant_f)
-        ff = self._face_feats_1(features, face_sizes_f)
+        per_slot = self._slot_inputs(
+            features, pair_valid_f, comp_valid_f, quant_legality_mask,
+            face_sizes_f, face_quant_f)
+        if per_slot is None:
+            quant_legality_mask = self._quant_mask_1(quant_legality_mask,
+                                                     face_quant_f)
+            ff = self._face_feats_1(features, face_sizes_f)
+            om, im, jm, am, pair_ok, dm = self._face_masks(
+                ff, pair_valid_f, comp_valid_f, quant_legality_mask,
+                op_legality_override, tables)
+        else:
+            ff, _pv, _cv, _qm = per_slot
+            om, im, jm, am, pair_ok, dm = self._face_masks(
+                ff, _pv, _cv, _qm, op_legality_override, tables)
         ctx_f = self._repr(face_context)
-        om, im, jm, am, pair_ok = self._face_masks(
-            ff, pair_valid_f, comp_valid_f, quant_legality_mask,
-            op_legality_override, tables)
+        approx_ok = (jnp.asarray(allow_skip, dtype=jnp.float32)
+                     if allow_skip is not None
+                     else (1.0 if getattr(self, "allow_skip", False)
+                           else _approx_allowed(op_legality_override)))
         z, fields, lp, e, ar = self.head.sample(
             ctx_f, key, op_mask=om, i_mask=im, j_mask=jm, axis_mask=am,
-            pair_ok=pair_ok, face_valid=face_valid_f > 0.5,
-            approx_ok=_approx_allowed(op_legality_override))
+            dtype_mask=dm, pair_ok=pair_ok, face_valid=face_valid_f > 0.5,
+            approx_ok=approx_ok)
         return (fields.skip, self._rows(fields, ff, tables), lp, e, ar,
                 jax.nn.sigmoid(z[0]), self._op_dist(z))
 
@@ -318,7 +443,8 @@ class UnifiedFacePolicy(eqx.Module):
                       pair_valid_f, comp_valid_f, face_valid_f, *,
                       face_context=None, face_sizes_f=None,
                       face_quant_f=None,
-                      quant_legality_mask=None, op_legality_override=None):
+                      quant_legality_mask=None, op_legality_override=None,
+                      allow_skip=None):
         """Score the stored face ``f`` under current params and STORED masks.
         Mirrors :meth:`sample_face` gate for gate -- anything less and the
         ratio is not 1 at epoch 0. That includes ``face_sizes_f`` and
@@ -326,13 +452,21 @@ class UnifiedFacePolicy(eqx.Module):
         scores a different distribution and the ratio silently leaves 1."""
         if quant_legality_mask is None:
             quant_legality_mask = quant_hardware_masks()[0]
-        quant_legality_mask = self._quant_mask_1(quant_legality_mask,
-                                                 face_quant_f)
-        ff = self._face_feats_1(features, face_sizes_f)
+        per_slot = self._slot_inputs(
+            features, pair_valid_f, comp_valid_f, quant_legality_mask,
+            face_sizes_f, face_quant_f)
+        if per_slot is None:
+            quant_legality_mask = self._quant_mask_1(quant_legality_mask,
+                                                     face_quant_f)
+            ff = self._face_feats_1(features, face_sizes_f)
+            om, im, jm, am, pair_ok, dm = self._face_masks(
+                ff, pair_valid_f, comp_valid_f, quant_legality_mask,
+                op_legality_override, tables)
+        else:
+            ff, _pv, _cv, _qm = per_slot
+            om, im, jm, am, pair_ok, dm = self._face_masks(
+                ff, _pv, _cv, _qm, op_legality_override, tables)
         ctx_f = self._repr(face_context)
-        om, im, jm, am, pair_ok = self._face_masks(
-            ff, pair_valid_f, comp_valid_f, quant_legality_mask,
-            op_legality_override, tables)
         z = self.head.logits(ctx_f)
         # Read the fields back off the stored wire rows -- the inverse of
         # _rows. COMPRESS parked the axis in `i`, DIAG parked the pair.
@@ -349,10 +483,14 @@ class UnifiedFacePolicy(eqx.Module):
                  ).astype(jnp.int32), axis=-1).astype(jnp.int32),
             dtype_idx=(fa.quant_dtype[f] == _BF16_SLOT).astype(jnp.int32),
         )
+        approx_ok = (jnp.asarray(allow_skip, dtype=jnp.float32)
+                     if allow_skip is not None
+                     else (1.0 if getattr(self, "allow_skip", False)
+                           else _approx_allowed(op_legality_override)))
         lp, e, ar = self.head.score(
             z, fields, op_mask=om, i_mask=im, j_mask=jm, axis_mask=am,
-            pair_ok=pair_ok, face_valid=face_valid_f > 0.5,
-            approx_ok=_approx_allowed(op_legality_override))
+            dtype_mask=dm, pair_ok=pair_ok, face_valid=face_valid_f > 0.5,
+            approx_ok=approx_ok)
         return lp, e, ar, jax.nn.sigmoid(z[0]), self._op_dist(z)
 
     @staticmethod
@@ -366,7 +504,7 @@ class UnifiedFacePolicy(eqx.Module):
                tables: FactorTables, key, face_pair_valid, face_comp_valid,
                face_valid, quant_legality_mask=None,
                op_legality_override=None, face_sizes=None,
-               face_quant=None):
+               face_quant=None, allow_skip=None):
         """``(FaceAction, joint_logp, joint_entropy, arity, skip_probs,
         op_dists, quant_logps)`` -- FacePathPolicy's contract, verbatim."""
         if quant_legality_mask is None:
@@ -391,7 +529,8 @@ class UnifiedFacePolicy(eqx.Module):
                 face_sizes_f=None if face_sizes is None else face_sizes[f],
                 face_quant_f=None if face_quant is None else face_quant[f],
                 quant_legality_mask=quant_legality_mask,
-                op_legality_override=op_legality_override)
+                op_legality_override=op_legality_override,
+                allow_skip=allow_skip)
             logp = logp + lp
             ent = ent + e
             arity = arity + ar
@@ -413,7 +552,7 @@ class UnifiedFacePolicy(eqx.Module):
                  tables: FactorTables, fa: FaceAction, face_pair_valid,
                  face_comp_valid, face_valid, quant_legality_mask=None,
                  op_legality_override=None, face_sizes=None,
-                 face_quant=None):
+                 face_quant=None, allow_skip=None):
         """Score a stored FaceAction under CURRENT parameters and the STORED
         masks. Mirrors :meth:`sample` gate for gate -- anything less and the
         ratio is not 1 at epoch 0."""
@@ -432,7 +571,8 @@ class UnifiedFacePolicy(eqx.Module):
                 face_sizes_f=None if face_sizes is None else face_sizes[f],
                 face_quant_f=None if face_quant is None else face_quant[f],
                 quant_legality_mask=quant_legality_mask,
-                op_legality_override=op_legality_override)
+                op_legality_override=op_legality_override,
+                allow_skip=allow_skip)
             logp = logp + lp
             ent = ent + e
             arity = arity + ar

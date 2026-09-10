@@ -172,6 +172,11 @@ def make_argparser() -> argparse.ArgumentParser:
                         "first execution of a plan reading 5-10x the settled "
                         "value; without this the whole trial-0 column is "
                         "first-touch, not latency.")
+    p.add_argument("--grad-oracle", choices=["reference", "off"],
+                   default="reference",
+                   help="Oracle A (ticket .62): the exact gradient of every "
+                        "order vs jax.grad once per process; a disagreement "
+                        "aborts. Same reader as ppo.py (ALPHAGRAD_GRAD_ORACLE).")
     p.add_argument("--quality-metric", default="grad_cosine",
                    choices=["loss_drop", "grad_cosine", "jac_cosine",
                             "cosine", "none"],
@@ -182,6 +187,13 @@ def make_argparser() -> argparse.ArgumentParser:
                         "comparable across values -- see the module "
                         "docstring. 'cosine' is deprecated in env.py and "
                         "resolves to grad_cosine with a warning.")
+    p.add_argument("--approx-old", default="same", choices=["same", "exact"],
+                   help="What the OLD edge gets at a face's join (ticket "
+                        ".56): same = the new-slot approximation also hits "
+                        "the existing predecessor-to-successor edge (graphax's "
+                        "two-op form); exact = the old edge is left exact. "
+                        "NOT comparable across values; stamped into every "
+                        "row. Mirrors ppo.py --approx-old.")
     p.add_argument("--walk-steps", type=int, default=200)
     p.add_argument("--walk-lr", type=float, default=1e-3)
     p.add_argument("--walk-probe-seed", type=int, default=0)
@@ -312,6 +324,8 @@ os.environ.setdefault("ALPHAGRAD_UNIFIED_FACE_ENUM", "1")
 # The quality channel is configured through the ENVIRONMENT in this codebase
 # (one env var, one reader, so two paths cannot disagree) -- mirror ppo.py.
 os.environ["ALPHAGRAD_QUALITY_METRIC"] = str(ARGS.quality_metric)
+os.environ["ALPHAGRAD_GRAD_ORACLE"] = str(ARGS.grad_oracle)
+os.environ["ALPHAGRAD_APPROX_OLD"] = str(ARGS.approx_old)
 os.environ["ALPHAGRAD_WALK_STEPS"] = str(int(ARGS.walk_steps))
 os.environ["ALPHAGRAD_WALK_LR"] = repr(float(ARGS.walk_lr))
 os.environ["ALPHAGRAD_WALK_PROBE_SEED"] = str(int(ARGS.walk_probe_seed))
@@ -347,6 +361,7 @@ from alphagrad.approx.common.examples import (
 from alphagrad.approx.common.eval_samples import (            # noqa: E402
     generate_eval_samples,
 )
+from alphagrad.approx.common import order as _order            # noqa: E402
 from alphagrad.approx.common.order_specs import (             # noqa: E402
     build_order_specs, parse_calls, calls_have_skip,
 )
@@ -444,40 +459,17 @@ def build_env(args):
 # Plan construction
 # ---------------------------------------------------------------------------
 def rev_order(env) -> np.ndarray:
-    """The order ALPHAGRAD_FORCE_REV_ORDER pins the policy to.
-
-    `masks.vertex_avail_at_step` keeps only the HIGHEST-indexed still-available
-    vertex, and availability is `vertex_valid_static`, so the forced order is
-    the valid vertices in descending id -- not `range(n, 0, -1)`."""
-    return np.array(sorted((int(v) for v in env.valid_vertices), reverse=True),
-                    dtype=np.int32)
+    """The reverse order: the valid vertices in descending id (the order of
+    the paired rev-exact reference). ONE implementation, common/order.py
+    (ticket .64); the trainer's --fixed-order reverse pins to the same table."""
+    return _order.reverse_order(env.valid_vertices)
 
 
 def markowitz_order(env) -> np.ndarray:
-    """Greedy minimum Markowitz degree order over valid vertices.
-
-    Eliminates intermediate equations before scalar contractions, preserving
-    non-empty Jacobian out-dimensions for structural approximations.
-    """
-    from graphax.incremental import IncrementalJaxpr
-    cfg = env.config
-    ij = IncrementalJaxpr(cfg.jaxpr, tuple(cfg.argnums), list(env.consts),
-                          list(env.args), track_faces=False)
-    eliminable = set(int(v) for v in env.valid_vertices)
-    order = []
-    while eliminable:
-        scores = {}
-        for v in eliminable:
-            v_var = cfg.jaxpr.eqns[v - 1].outvars[0]
-            preds = [u for u in ij.graph if v_var in ij.graph[u]]
-            succs = list(ij.graph.get(v_var, {}).keys())
-            deg = len(preds) * len(succs)
-            scores[v] = deg
-        best_v = min(scores.keys(), key=lambda v: (scores[v], v))
-        order.append(best_v)
-        eliminable.remove(best_v)
-        ij.eliminate(best_v, (), None)
-    return np.array(order, dtype=np.int32)
+    """The STATIC minimum Markowitz degree order (finding 59). ONE
+    implementation, common/order.py (ticket .64); the trainer's --fixed-order
+    markowitz pins to the same table, so the sweep and the trainer agree."""
+    return _order.fixed_order_for_env("markowitz", env)
 
 
 def empty_plan(n_steps: int):
@@ -1102,7 +1094,11 @@ def measure(env, eval_samples, order, plan):
     wall = time.perf_counter() - t0
     r = np.asarray(reward, dtype=np.float64)
     st = consume_per_face_stats()
-    m_parity = consume_mem_parity()
+    # Ticket .49 made the drain return {"records", "measured", "dropped"};
+    # the plan's own record is the last TERMINAL one (the paired reference
+    # writes its own, non-terminal record beside it).
+    m_parity = [rec for rec in consume_mem_parity()["records"]
+                if rec.get("terminal", True)]
 
     static_temp = 0.0
     runtime_watermark = float(-r[REWARD_INDEX["peak_memory"]])
@@ -1156,6 +1152,12 @@ CSV_FIELDS = [
     # this lacks the column, and a missing value is read back as `loss_drop`,
     # which is what all of them are.
     "quality_metric",
+    # WHAT THE OLD EDGE GOT at every face join (ticket .56): "same" or
+    # "exact". Rows written before 2026-09-04 lack the column; every one of
+    # them ran under the then-default, which was "same" unless the launcher
+    # exported ALPHAGRAD_NEW_SLOT_JOIN=0 (the R1-R3 / face_attrib / forensics
+    # launchers did -- see UNBIASED_PARETO_AND_MEASUREMENT.md sec 7(c)).
+    "approx_old",
 ]
 
 
@@ -1178,6 +1180,7 @@ def config_stamp(args):
                        f"/cfg:{int(args.latency_warmup)}"),
         "config_note": args.config_note,
         "quality_metric": str(args.quality_metric),
+        "approx_old": str(args.approx_old),
         # WHICH PHYSICAL DEVICE measured this row. If plan A and plan B are
         # measured by different actors, a systematic per-device offset lands
         # straight in PPO's within-batch advantage comparison.

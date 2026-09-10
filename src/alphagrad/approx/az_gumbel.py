@@ -52,6 +52,7 @@ os.environ.setdefault("ALPHAGRAD_BKSTEP", "0")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 from alphagrad.approx.az_args import make_argparser  # noqa: E402
+from alphagrad.approx.common.order import fixed_order_for_env as _fixed_order_for_env  # noqa: E402
 A = make_argparser().parse_args()
 os.environ["ALPHAGRAD_NN_HIDDEN"] = str(A.nn_hidden)
 # propagate task to the measure-server child (inherits our env at spawn)
@@ -104,18 +105,13 @@ _GAZ_MGRAD = os.environ.get("ALPHAGRAD_GAZ_MEASURE_GRAD", "1") == "1"
 LOSS = get_fn(TASK)
 # ORDER-ONLY / EXACT ARM (--no-approx-head): no plan can approximate anything,
 # so every plan returns the EXACT gradient and the quality channel is a
-# CONSTANT (measured on TLM order-only: cos=+0.885 on every episode). It
-# therefore contributes zero gradient while the 200-step loss-drop walk that
-# produces it costs 200 executions of the plan -- twice the entire latency
-# budget of 100. Resolve the env default to "none" and say so; an explicit
-# ALPHAGRAD_QUALITY_METRIC is always honoured.
-if (os.environ.get("ALPHAGRAD_QUALITY_METRIC", "auto").strip().lower()
-        in ("", "auto") and bool(A.no_approx_head)):
-    os.environ["ALPHAGRAD_QUALITY_METRIC"] = "none"
-    print("[gaz] ORDER-ONLY arm (--no-approx-head): the quality channel is "
-          "constant by construction, so it is NOT computed "
-          "(ALPHAGRAD_QUALITY_METRIC=none). Set it explicitly to override.",
-          flush=True)
+# CONSTANT (measured on TLM order-only: cos=+0.885 on every episode). The env
+# default used to be forced to "none" here because the 200-step loss-drop walk
+# that produced it cost 200 executions of the plan. The default is grad_cosine
+# now (owner ruling 2026-09-02: grad-cosine in EVERY run and sweep, including
+# the order-only arm), one candidate execution plus one rev-exact reference
+# execution per plan, so the order-only arm reports it too.
+# ALPHAGRAD_QUALITY_METRIC=none stays selectable by name.
 ARGN = infer_argnums(TASK)
 k0 = jax.random.PRNGKey(0); ak, ek = jax.random.split(k0)
 xs = get_args(TASK, ak, dataset=DSET)
@@ -215,6 +211,25 @@ if _GAZ_RAY_N > 0:
 env = eqx.tree_at(lambda e: e.eval_args_samples, env, ev)
 jaxpr = closed.jaxpr
 VALID = list(np.asarray(env.valid_vertices, dtype=np.int32)); NV = len(VALID)
+# --fixed-order (ticket dsnn-3qm.64): the static order table of
+# common/order.py, or None for free. Every legality read below goes through
+# _pin_legal, so under a pin exactly one vertex is legal at every step.
+FIXED_ORDER = _fixed_order_for_env(A.fixed_order, env)
+print(f"[gaz] fixed order: {A.fixed_order}"
+      + ("" if FIXED_ORDER is None else f" {FIXED_ORDER[:6].tolist()} ..."),
+      flush=True)
+
+
+def _pin_legal(legal):
+    """The legal set under the fixed order: the FIRST table vertex that is
+    still legal, alone; the set itself when the order is free."""
+    if FIXED_ORDER is None or not legal:
+        return legal
+    _still = {int(v) for v in legal}
+    for _v in FIXED_ORDER:
+        if int(_v) in _still:
+            return [type(legal[0])(_v)]
+    return legal
 # Two vertex-indexing conventions coexist: net_eval/rollouts use
 # ``VALID.index(v)`` while every head indexes by ``v - 1`` (vertex logits,
 # vertex contexts, vmem slots, axis_state rows). They agree only while VALID
@@ -580,7 +595,11 @@ _CH_ACTIVE = jnp.array([1.0, 1.0, 0.0, 1.0])       # flops row inert (no head)
 # ``_scale_output_heads`` ran here — leaving AZ's initial vertex logits at full
 # scale with non-zero biases, i.e. a BIASED Gumbel root prior.
 from alphagrad.approx.common.agent_factory import (      # noqa: E402
-    apply_policy_arch, build_and_init_agent, az_w4, ALGO_HEAD_FIELDS)
+    apply_policy_arch, build_and_init_agent, az_w4, ALGO_HEAD_FIELDS,
+    refuse_removed_env_knobs)
+
+# Knobs that became flags (dsnn-3qm.44) are REFUSED if still exported.
+refuse_removed_env_knobs()
 
 _ns = _ppo_make_argparser().parse_args([])
 apply_policy_arch(
@@ -605,6 +624,7 @@ if A.no_approx_head:
     print("[gaz] EXACT arm: no approximation head; searching the elimination "
           "ORDER only (face actions and live faces forced off).", flush=True)
 _ns.seed = A.seed
+_ns.face_none_bias = float(A.face_none_bias)
 _ft_table, _ft_py, _n_factors, _max_rules = _ppo_build_factor_table(_ns)
 agent = build_and_init_agent(
     _ns, len(jaxpr.eqns), _n_factors, _max_rules, seed=A.seed)
@@ -1070,8 +1090,7 @@ def rollout_value(state, carry, depth):
     """
     for _ in range(depth):
         legal = PT.legal(VALID)
-        if os.environ.get("ALPHAGRAD_FORCE_REV_ORDER", "0") == "1" and legal:
-            legal = [max(legal)]   # rev: highest first
+        legal = _pin_legal(legal)
         if not legal:
             break
         vlog, out, _v = _eval_node(state, carry)
@@ -1394,8 +1413,7 @@ def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
     sampled ~ w_hat (the improved beta at the root; None on the exact arm).
     """
     legal = PT.legal(VALID)
-    if os.environ.get("ALPHAGRAD_FORCE_REV_ORDER", "0") == "1" and legal:
-        legal = [max(legal)]   # rev: highest first
+    legal = _pin_legal(legal)
     vlog, head_out, v_root = _eval_node(state, carry)
     ctxs = head_out[1]
     la = np.array([int(v) - 1 for v in legal], dtype=np.int32)
@@ -1837,8 +1855,7 @@ def _run(args) -> int:
             with PT.branch():
                 while True:
                     _wlegal = PT.legal(VALID)
-                    if os.environ.get("ALPHAGRAD_FORCE_REV_ORDER", "0") == "1" and _wlegal:
-                        _wlegal = [max(_wlegal)]   # rev: highest first
+                    _wlegal = _pin_legal(_wlegal)
                     if not _wlegal:
                         break
                     _wv = _wlegal[int(rng.integers(len(_wlegal)))]
@@ -1996,8 +2013,7 @@ def _run(args) -> int:
         _dtl = os.environ.get("ALPHAGRAD_GAZ_DECISION_TIMELOG", "0") == "1"
         while True:
             legal = PT.legal(VALID)
-            if os.environ.get("ALPHAGRAD_FORCE_REV_ORDER", "0") == "1" and legal:
-                legal = [max(legal)]   # rev: highest first
+            legal = _pin_legal(legal)
             if not legal:
                 break
             _t_dec = time.perf_counter() if _dtl else 0.0

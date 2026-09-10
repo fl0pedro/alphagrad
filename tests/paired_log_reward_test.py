@@ -1,0 +1,317 @@
+"""THE PAIRED LOG-DIFFERENCE COST CHANNELS (ticket dsnn-3qm.9).
+
+Under ``--cost-form paired-log`` reward slots 2 (latency_ns) and 5
+(peak_memory) carry ``-(log cost(candidate) - log cost(rev-exact))``, with
+rev-exact -- the reverse order, every face None -- measured in the SAME
+callback right after the candidate, through the same executable path and the
+same instrument. Pinned here on the 64-wide toy scalar loss of
+tests/mem_channel_test.py (no TLM, no data generator, CPU, the spec-native
+instrument ALPHAGRAD_DIRECT_MEASURE=1):
+
+1. REV-EXACT SCORES EXACTLY 0 on the memory channel (same executable, same
+   static temp) and within the drift floor on latency (two back-to-back
+   timings of one executable). With the per-rep timer stubbed to a constant
+   both channels are exactly 0.
+2. A CHEAPER PLAN scores a NEGATIVE Delta (a positive slot): the
+   skip-everything plan, whose temp is exactly 0 and takes the one-byte
+   floor; a COSTLIER plan (forward order) scores a positive Delta.
+3. THE REFERENCE IS RE-MEASURED EVERY EPISODE: one `_campaign_measure_cost`
+   call per terminal callback, none for non-terminal steps.
+4. Non-terminal steps carry 0.0 in both slots under this form.
+5. The reference rides the drain (``consume_plan_records()["paired_ref"]``)
+   and the plan-log record, in positive units.
+6. FLAG OFF (``absolute``, the reader's default) is the measured number,
+   negated -- the library-level half of the flag-off bit-identity gate; the
+   trajectory-level half is the ALPHAGRAD_EQ_DUMP run.
+"""
+from __future__ import annotations
+
+import math
+import os
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
+os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
+os.environ["ALPHAGRAD_QUALITY_METRIC"] = "none"
+os.environ["ALPHAGRAD_DIRECT_MEASURE"] = "1"
+os.environ["ALPHAGRAD_COST_FORM"] = "paired-log"
+os.environ.pop("ALPHAGRAD_PLAN_LOG", None)
+os.environ.pop("ALPHAGRAD_MEM_CHANNEL", None)
+
+import jax                                                      # noqa: E402
+import jax.numpy as jnp                                         # noqa: E402
+import numpy as np                                              # noqa: E402
+import pytest                                                   # noqa: E402
+
+import alphagrad.approx.env as envmod                           # noqa: E402
+from alphagrad.approx.env import (                              # noqa: E402
+    FACE_SLOTS,
+    MAX_FACES,
+    MAX_RULES_PER_VERTEX,
+    NUM_REWARDS,
+    REWARD_INDEX,
+    StepAction,
+    VertexEliminationEnv,
+)
+
+_MEM = REWARD_INDEX["peak_memory"]
+_LAT = REWARD_INDEX["latency_ns"]
+_FLOOR = envmod._MEM_LOG_FLOOR_BYTES
+
+_N = 64
+_rng = np.random.default_rng(0)
+_W1 = jnp.asarray(_rng.standard_normal((_N, _N), dtype=np.float32) / 8.0)
+_W2 = jnp.asarray(_rng.standard_normal((_N, _N), dtype=np.float32) / 8.0)
+_X = jnp.asarray(np.linspace(-1.0, 1.0, _N, dtype=np.float32))
+
+
+def _toy(x):
+    h = jnp.tanh(_W1 @ x)
+    y = jnp.tanh(_W2 @ h)
+    return jnp.sum(y * y)
+
+
+def _make_env(**kw):
+    closed = jax.make_jaxpr(_toy)(_X)
+    kw.setdefault("measure_latency", True)
+    kw.setdefault("num_data_points", 2)
+    kw.setdefault("reps_per_point", 2)
+    kw.setdefault("latency_inner_reps", 2)
+    return VertexEliminationEnv.from_jaxpr(
+        closed, args=[_X], argnums=(0,), num_envs=0, target_fun=_toy, **kw,
+    )
+
+
+def _run_plan(env, order, skip_everything=False, stop_after=None):
+    """One episode: ``order`` with no rules; every face of every vertex
+    SKIPPED when ``skip_everything``. Returns the terminal reward vector, or
+    the reward after ``stop_after`` steps when given."""
+    state = env.reset()
+    no_rules = jnp.full((MAX_RULES_PER_VERTEX, 3), -1, jnp.int32)
+    no_rules = no_rules.at[..., 2].set(0)
+    for k, v in enumerate(order):
+        face_rows = jnp.full((MAX_FACES, FACE_SLOTS, 3), -1, jnp.int32)
+        face_skip = (jnp.ones((MAX_FACES,), jnp.int32) if skip_everything
+                     else jnp.zeros((MAX_FACES,), jnp.int32))
+        state = env.step(
+            state,
+            StepAction(jnp.asarray(v, jnp.int32), no_rules,
+                       face_rows, face_skip),
+        ).state
+        if stop_after is not None and k + 1 == stop_after:
+            return np.asarray(state.reward)
+    return np.asarray(state.reward)
+
+
+def _rev_order(env):
+    return sorted(int(x) for x in np.asarray(env.valid_vertices))[::-1]
+
+
+@pytest.fixture(autouse=True)
+def _drain():
+    envmod.consume_plan_records()
+    yield
+    envmod.consume_plan_records()
+
+
+# --------------------------------------------------------------------------
+# 0. the pure function and the reader
+# --------------------------------------------------------------------------
+
+def test_paired_log_costs_pure():
+    # identity: exactly 0 on both channels
+    assert envmod.paired_log_costs(1.5e5, 512.0, 1.5e5, 512.0) == (0.0, 0.0, 0)
+    # cheaper on both: negative Delta
+    d_lat, d_mem, n = envmod.paired_log_costs(7.5e4, 256.0, 1.5e5, 512.0)
+    assert d_lat == pytest.approx(math.log(0.5))
+    assert d_mem == pytest.approx(math.log(0.5))
+    assert n == 0
+    # latency 0.0 = NOT MEASURED passes through as 0.0; memory still pairs
+    d_lat, d_mem, n = envmod.paired_log_costs(0.0, 1024.0, 0.0, 512.0)
+    assert d_lat == 0.0 and d_mem == pytest.approx(math.log(2.0))
+    # THE FLOOR: a zero temp reads as one byte, once, and is counted
+    d_lat, d_mem, n = envmod.paired_log_costs(1.0e5, 0.0, 1.0e5, 512.0)
+    assert d_mem == pytest.approx(-math.log(512.0 / _FLOOR))
+    assert n == 1
+    assert _FLOOR == 1.0
+    # both sides at zero: exactly 0, counted twice
+    assert envmod.paired_log_costs(1.0e5, 0.0, 1.0e5, 0.0) == (0.0, 0.0, 2)
+
+
+def test_cost_form_reader(monkeypatch):
+    assert envmod.cost_form() == "paired-log"          # this module's setting
+    monkeypatch.delenv("ALPHAGRAD_COST_FORM", raising=False)
+    assert envmod.cost_form() == "absolute"            # absent = absolute
+    monkeypatch.setenv("ALPHAGRAD_COST_FORM", " Paired-Log ")
+    assert envmod.cost_form() == "paired-log"
+    monkeypatch.setenv("ALPHAGRAD_COST_FORM", "ratio")
+    with pytest.raises(ValueError, match="cost-form"):
+        envmod.cost_form()
+
+
+# --------------------------------------------------------------------------
+# 1. rev-exact scores 0
+# --------------------------------------------------------------------------
+
+def test_rev_exact_scores_exactly_zero_on_memory_and_inside_drift_on_latency():
+    env = _make_env()
+    r = _run_plan(env, _rev_order(env))
+    recs = envmod.consume_plan_records()["paired_ref"]["records"]
+    assert len(recs) == 1
+    rec = recs[0]
+    # Same executable on both sides: the static temp is the same number.
+    assert rec["temp_bytes"] == rec["candidate_memory_bytes"] > 0.0
+    assert float(r[_MEM]) == 0.0
+    # Two back-to-back timings of one executable: a DRIFT FLOOR sample. A
+    # shared CPU box moves well under 2x between adjacent windows.
+    d_lat = -float(r[_LAT])
+    print(f"[paired-log] rev-exact vs itself: Delta_lat={d_lat:+.4f} "
+          f"(ratio {math.exp(d_lat):.3f}); temp={rec['temp_bytes']:.0f} B "
+          f"lat={rec['latency_ns']/1e3:.1f} us")
+    assert abs(d_lat) < math.log(2.0)
+    assert rec["latency_ns"] > 0.0 and rec["mem_floored"] == 0
+    assert rec["order"] == _rev_order(env)
+
+
+def test_identity_scores_exactly_zero_with_a_deterministic_instrument(
+        monkeypatch):
+    """With the per-rep timer stubbed to a constant, the pair is exact on
+    BOTH channels: the reward form has no offset of its own."""
+    real = envmod._time_one_rep
+
+    def _const_rep(ex, eval_args, devices, inner):
+        _l, _p, _s, out = real(ex, eval_args, devices, inner)
+        return 123_456.0, _p, _s, out
+
+    monkeypatch.setattr(envmod, "_time_one_rep", _const_rep)
+    env = _make_env()
+    r = _run_plan(env, _rev_order(env))
+    assert float(r[_LAT]) == 0.0
+    assert float(r[_MEM]) == 0.0
+
+
+# --------------------------------------------------------------------------
+# 2. cheaper scores negative Delta, costlier scores positive Delta
+# --------------------------------------------------------------------------
+
+def test_cheaper_plan_scores_negative_delta_and_takes_the_floor():
+    env = _make_env()
+    rev = _rev_order(env)
+    r_skip = _run_plan(env, rev, skip_everything=True)
+    rec = envmod.consume_plan_records()["paired_ref"]["records"][-1]
+    temp_ref = rec["temp_bytes"]
+    temp_skip = rec["candidate_memory_bytes"]
+    # Measured on this toy (job 63632): rev-exact 512 B, skip-everything 0 B.
+    assert temp_ref > 0.0
+    assert temp_skip == 0.0
+    d_mem = math.log(max(temp_skip, _FLOOR)) - math.log(temp_ref)
+    assert -float(r_skip[_MEM]) == pytest.approx(d_mem)
+    assert float(r_skip[_MEM]) > 0.0                    # cheaper -> above 0
+    assert -float(r_skip[_MEM]) == pytest.approx(-math.log(temp_ref))
+    assert rec["mem_floored"] == 1
+    print(f"[paired-log] skip-everything: Delta_mem={d_mem:+.3f} "
+          f"(temp {temp_skip:.0f} -> floor {_FLOOR:.0f} B vs ref "
+          f"{temp_ref:.0f} B) Delta_lat={-float(r_skip[_LAT]):+.3f}")
+
+
+def test_costlier_plan_scores_positive_delta():
+    env = _make_env()
+    rev = _rev_order(env)
+    r_fwd = _run_plan(env, rev[::-1])                   # forward mode
+    rec = envmod.consume_plan_records()["paired_ref"]["records"][-1]
+    # The reference is rev-exact REGARDLESS of the candidate's order.
+    assert rec["order"] == rev
+    assert rec["candidate_memory_bytes"] > rec["temp_bytes"]
+    assert float(r_fwd[_MEM]) < 0.0                     # costlier -> below 0
+    assert -float(r_fwd[_MEM]) == pytest.approx(
+        math.log(rec["candidate_memory_bytes"]) - math.log(rec["temp_bytes"]))
+    assert rec["mem_floored"] == 0
+
+
+# --------------------------------------------------------------------------
+# 3./4. one reference per terminal callback; non-terminal steps carry 0
+# --------------------------------------------------------------------------
+
+def test_reference_is_measured_once_per_terminal_callback(monkeypatch):
+    calls = []
+    real = envmod._campaign_measure_cost
+
+    def _counting(ex, *a, **k):
+        calls.append(1)
+        return real(ex, *a, **k)
+
+    monkeypatch.setattr(envmod, "_campaign_measure_cost", _counting)
+    env = _make_env()
+    rev = _rev_order(env)
+    _run_plan(env, rev)
+    assert len(calls) == 1                              # one episode, one ref
+    _run_plan(env, rev)                                 # same plan again...
+    assert len(calls) == 2                              # ...measured anew
+    _run_plan(env, rev, skip_everything=True)
+    assert len(calls) == 3
+    out = envmod.consume_plan_records()
+    assert len(out["paired_ref"]["records"]) == 3
+    assert out["paired_ref"]["dropped"] == 0
+    # ...and the candidate was measured on every step (terminal_rewards_only
+    # is off on this env), yet the reference only at the terminal one.
+    assert out["mem_parity"]["measured"] == 3 * len(rev)
+
+
+def test_non_terminal_steps_carry_zero_costs():
+    env = _make_env()
+    rev = _rev_order(env)
+    assert len(rev) >= 2
+    r_mid = _run_plan(env, rev, stop_after=1)
+    assert float(r_mid[_LAT]) == 0.0 and float(r_mid[_MEM]) == 0.0
+    assert envmod.consume_plan_records()["paired_ref"]["records"] == []
+
+
+# --------------------------------------------------------------------------
+# 5. the drain and the plan-log record
+# --------------------------------------------------------------------------
+
+def test_summary_and_plan_log_record_carry_the_reference(monkeypatch):
+    monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
+    env = _make_env()
+    rev = _rev_order(env)
+    r = _run_plan(env, rev)
+    _run_plan(env, rev, skip_everything=True)
+    out = envmod.consume_plan_records()
+    refs = out["paired_ref"]["records"]
+    s = envmod.paired_ref_summary(refs)
+    assert s["n"] == 2 and s["mem_floored"] == 1
+    assert s["latency_ns"] > 0.0 and s["temp_bytes"] > 0.0
+    assert s["temp_bytes"] == pytest.approx(
+        np.mean([x["temp_bytes"] for x in refs]))
+    rec = out["records"][0]
+    assert rec["cost_form"] == "paired-log"
+    assert rec["ref_temp_bytes"] == refs[0]["temp_bytes"]
+    assert rec["ref_latency_ns"] == refs[0]["latency_ns"]
+    assert rec["ref_watermark_bytes"] == refs[0]["watermark_bytes"]
+    assert rec["candidate_memory_bytes"] == rec["mem_temp_bytes"]
+    assert rec["mem_log_floored"] == 0
+    assert rec["rewards"][_MEM] == float(r[_MEM]) == 0.0
+    assert out["records"][1]["mem_log_floored"] == 1
+    assert envmod.consume_plan_records()["paired_ref"] == {
+        "records": [], "dropped": 0}
+
+
+# --------------------------------------------------------------------------
+# 6. flag off = the measured number, negated
+# --------------------------------------------------------------------------
+
+def test_absolute_form_is_the_measured_number(monkeypatch):
+    monkeypatch.setenv("ALPHAGRAD_COST_FORM", "absolute")
+    env = _make_env()
+    r = _run_plan(env, _rev_order(env))
+    out = envmod.consume_plan_records()
+    term = [x for x in out["mem_parity"]["records"] if x["terminal"]]
+    assert -float(r[_MEM]) == term[-1]["static_temp_bytes"] > 0.0
+    assert -float(r[_LAT]) >= envmod._LAT_FLOOR_NS
+    assert out["paired_ref"] == {"records": [], "dropped": 0}
+    keep = [i for i in range(NUM_REWARDS) if i not in (_MEM, _LAT)]
+    monkeypatch.setenv("ALPHAGRAD_COST_FORM", "paired-log")
+    r2 = _run_plan(env, _rev_order(env))
+    # Nothing but the two cost slots moves between the forms.
+    assert np.array_equal(r[keep].astype(np.float64),
+                          r2[keep].astype(np.float64)), (r, r2)

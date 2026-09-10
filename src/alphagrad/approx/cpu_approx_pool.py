@@ -76,7 +76,7 @@ def _sentinel_callback_output(
     sigma meaningless for every real plan measured afterwards.
 
     KNOWN INCONSISTENCY, deliberately left alone here: slot 7
-    (``frob_residual_idx``, now ``grad_coverage``) gets ``_SENTINEL_REWARD_VALUE``
+    (``frob_residual_idx``, reward slot 7, RESERVED since 2026-09-03) gets ``_SENTINEL_REWARD_VALUE``
     from THIS writer but ``-1.0`` from ``env._SENTINEL_BAD_REWARD``, and it is
     also bounded [-1, 1]. Changing it would change the value of an existing
     live channel, which is not this workstream's to change; it is recorded so
@@ -97,6 +97,17 @@ def _sentinel_callback_output(
     if sparsity_idx is not None and 0 <= int(sparsity_idx) < int(num_rewards):
         reward[int(sparsity_idx)] = -1.0
     return tokens, eqn_ids, reward
+
+
+def _is_toolchain_fault(exc: BaseException) -> bool:
+    """True for env.MeasureToolchainFault, however Ray wrapped it."""
+    try:
+        from alphagrad.approx.env import MeasureToolchainFault
+        if isinstance(exc, MeasureToolchainFault):
+            return True
+    except Exception:
+        pass
+    return "TOOLCHAIN FAULT" in str(exc)
 
 
 class CpuApproxPool:
@@ -889,6 +900,13 @@ class CpuApproxPool:
                     held[j] = None
                     _sentinel_slot(i)
                 except Exception as _exc:
+                    # The actor's measure toolchain gate fired (finding 03).
+                    # Ray re-raises the actor's exception as a RayTaskError
+                    # that is ALSO an instance of the original class; the
+                    # text match covers a pickling failure. This must stop
+                    # the run, not become one more [SENTINEL] line.
+                    if _is_toolchain_fault(_exc):
+                        raise
                     self._n_other_errors += 1
                     print(
                         f"[SENTINEL] batch other-error slot={i} "

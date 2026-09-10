@@ -90,6 +90,13 @@ def add_az_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--no-live-faces", dest="live_faces", action="store_false",
         help="Disable the live per-face token stream (default: enabled).")
     p.set_defaults(face_actions=True, live_faces=True)
+    p.add_argument(
+        "--face-none-bias", type=float, default=0.0,
+        help="Face-head IDENTITY-INIT prior, the AZ counterpart of PPO "
+        "--face-none-bias: +B on each slot's OP_NONE logit and -B on SKIP "
+        "after init (common/agent_factory.apply_face_none_bias). 0 "
+        "(default) = off. Replaces the env var ALPHAGRAD_FACE_NONE_BIAS "
+        "(ticket dsnn-3qm.44), which is refused at startup if set.")
     p.add_argument("--out", default=os.path.expanduser("~/dsnn/az_gumbel_out"))
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-name", default="az_gumbel")

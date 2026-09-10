@@ -872,334 +872,31 @@ def _record_zero_work_plan() -> None:
     _ZERO_WORK_PLANS[0] += 1
 
 
-# ==========================================================================
-# GRADIENT COVERAGE  (2026-08-27)
-# ==========================================================================
-# THE HACK THIS CLOSES. On the TransformerLM target a SINGLE skipped face
-# removes 62-73% of the backward pass AND zeroes the gradient of most
-# trainable parameters (measured: k24/f0 freezes 11 of 16 leaves, k22/f0 12,
-# k19/f0 14, k13/f1 15 -- run_analysis/landscape/face_forensics.json). The
-# 200-step Adam quality probe scores those plans at 0.9258 against an exact
-# 0.9260 -- a 0.02% gap -- and the discrimination gets 50-200x WORSE at longer
-# horizons (gap 0.000215 -> 0.000004 from 200 to 3200 steps), because the walk
-# measures single-batch overfitting, which a small subset of the parameters
-# achieves on its own. So NO horizon of that probe can separate a full
-# backward pass from a third of one. Coverage measures the thing directly.
-#
-# DEFINITION. For a plan P and one fixed measurement point x:
-#   g_a = P's gradient output at x       (the compiled approx executable)
-#   g_e = the SAME order done exactly at x (``_do_compile_exact``)
-# per output leaf l (one leaf per entry of ``config.argnums``):
-#   n_a[l] = ||g_a[l]||_2 ,  n_e[l] = ||g_e[l]||_2
-#   counted(l)  <=>  n_e[l] > eps   (epsilon policy below)
-#   ratio[l]    = min(1, n_a[l] / n_e[l])   -- NaN/inf in g_a scores 0
-#   min_leaf_ratio    = min over counted leaves of ratio[l]   (1.0 if none)
-#   frac_leaves_zeroed = #{counted l : n_a[l] == 0 or non-finite} / #counted
-#
-# EPSILON POLICY (explicit, because it decides what "frozen" means). A leaf
-# whose EXACT norm is at or below
-#     eps = max(_GRAD_COV_EPS_ABS, _GRAD_COV_EPS_REL * max_l n_e[l])
-# is UNCOUNTED: it carries no gradient under the exact reference either, so an
-# approximation cannot be blamed for zeroing it, and dividing by it would
-# manufacture a 0/0. Uncounted leaves are excluded from BOTH the min and the
-# denominator of frac_zeroed, and their number is reported
-# (``n_uncounted``) so a silently-empty denominator is visible. Defaults
-# 1e-12 (relative) and 1e-30 (absolute); override with
-# ALPHAGRAD_GRAD_COV_EPS_REL / _ABS. With every leaf uncounted the plan is
-# reported as ``undefined`` and is NEVER rejected.
-#
-# THE WIRE. One reward slot (7, ``grad_coverage``) carries both numbers,
-# losslessly, because they are mutually exclusive by construction: a zeroed
-# leaf has ratio exactly 0 and is therefore the minimum, so
-# ``frac_zeroed > 0`` implies ``min_leaf_ratio == 0``. Encoding:
-#     channel = +min_leaf_ratio      when frac_zeroed == 0   -> ( 0, 1]
-#     channel = -frac_leaves_zeroed  when frac_zeroed  > 0   -> [-1, 0)
-# so the channel is bounded [-1, 1], monotone in "how much of the gradient
-# survives", and needs NO symlog. The all-frozen end (-1.0) coincides with the
-# value ``_SENTINEL_BAD_REWARD`` already writes into slot 7.
-#
-# COST. n_a comes from an execution the measurement loop ALREADY ran (point 0
-# of the campaign budget), so it is free apart from the norm reductions. n_e
-# needs the exact executable, which is memoised per (order, arg shapes,
-# device, measurement point) in ``_EXACT_LEAF_NORMS`` -- under a fixed order
-# that is ONE compile and ONE execution per process, amortised over every
-# plan. Measured overhead is published as ``grad_cov/wall_frac``.
-_GRAD_COV_EPS_REL = float(os.environ.get("ALPHAGRAD_GRAD_COV_EPS_REL", "1e-12"))
-_GRAD_COV_EPS_ABS = float(os.environ.get("ALPHAGRAD_GRAD_COV_EPS_ABS", "1e-30"))
-# Per-(order, point) exact per-leaf gradient norms. Small: one tuple of floats
-# per distinct elimination order per process.
-_EXACT_LEAF_NORMS: dict = {}
-# Plans REJECTED by the hard guard (frac_leaves_zeroed > 0). Counted on its
-# OWN counter -- not folded into _TRUNCATED_PLANS -- because a rejection is a
-# verdict about the PLAN, while a truncation is the apparatus giving up, and
-# the two must never be read as one number. It DOES bump _DEGENERATE_PLANS so
-# the legacy aggregate keeps meaning "transitions excluded from the gradient".
-_FROZEN_GRAD_PLANS = [0]
-_GRAD_COV_STATS: dict = {
-    "n": 0,                 # coverage measurements taken
-    "n_undefined": 0,       # every leaf uncounted, or the exact ref failed
-    "n_rejected": 0,        # guard fired
-    "sum_min_ratio": 0.0,
-    "min_min_ratio": 1.0,
-    "sum_frac_zeroed": 0.0,
-    "max_frac_zeroed": 0.0,
-    "wall_s": 0.0,          # wall spent INSIDE the coverage block
-    "measure_wall_s": 0.0,  # wall of the whole measure+quality phase
-    "last": None,           # full per-leaf record of the last measurement
-}
-
-
-def grad_coverage_enabled() -> bool:
-    """Is gradient coverage measured at all?
-
-    DEFAULT OFF AT THE LIBRARY LEVEL, ON AT THE CLI. ``ppo.py``'s
-    ``--reject-frozen-grads`` defaults to True and exports
-    ALPHAGRAD_REJECT_FROZEN_GRADS=1 before ray.init, so a campaign gets the
-    guard by default; a bare import of env.py (landscape_map.py, the forensics
-    scripts, and -- the reason this is not a module default -- a measure actor
-    respawned inside an ALREADY RUNNING job that was launched before this
-    commit) gets the historical behaviour unless the variable is set.
-    """
-    if os.environ.get("ALPHAGRAD_GRAD_COVERAGE", "") not in ("", "0"):
-        return True
-    if os.environ.get("ALPHAGRAD_REJECT_FROZEN_GRADS", "0") == "1":
-        return True
-    try:
-        return float(os.environ.get("ALPHAGRAD_GRAD_COVERAGE_WEIGHT", "0")) != 0.0
-    except ValueError:
-        return False
-
-
-def reject_frozen_grads() -> bool:
-    """Is the HARD GUARD armed? (``--reject-frozen-grads``)"""
-    return os.environ.get("ALPHAGRAD_REJECT_FROZEN_GRADS", "0") == "1"
-
-
-def _leaf_norms(out, has_aux: bool) -> list[float]:
-    """Per-leaf L2 norms of a jacve output, in ``config.argnums`` order.
-
-    LEAF-SET CONVENTION (workstream A4; pinned by
-    ``tests/test_seed_vertices_dropped.py``). A **0-d output leaf is not a
-    countable leaf** and is reported as ``nan``.
-
-    WHY. A 0-d differentiated slot is a SEED / DIRECTION scalar, never a
-    weight. Under ``--seed-vertices`` the appended argnum is the tangent seed
-    ``t`` and its output leaf is ``d(loss)/dt`` -- a directional derivative,
-    not a parameter gradient. Two other places in this file already say so and
-    act on it: ``_walk_argnums`` excludes 0-d argnums from the Adam walk
-    ("stepping it moves every weight by ``t*ones`` and saturates the net"),
-    and ``generate_eval_samples`` leaves 0-d argnums at their injected value.
-    Counting the seed here contradicted both.
-
-    WHAT IT DECIDED. ``--reject-frozen-grads`` (default ON) sentinels a WHOLE
-    PLAN as soon as any counted leaf is zeroed. With the seed counted, a plan
-    could be destroyed on the SEED's gradient -- a verdict about the seeding
-    apparatus dressed up as a verdict about the plan, which is precisely the
-    error ``_truncated_reward``'s docstring warns about.
-
-    WHY ``nan`` and not a dropped entry, or 0.0. Dropping would break the
-    positional alignment with ``config.argnums`` that the forensics records
-    (``zeroed``, ``ratios``) are read by. 0.0 would claim a MEASURED zero
-    where there was an exclusion. ``nan`` is neither: ``_grad_coverage``'s
-    pre-existing rule "the exact reference does not differentiate it either,
-    so an approximation cannot be blamed" already routes it to UNCOUNTED
-    (``nan > eps`` is False) with no new branch, and the logged
-    ``exact_norms``/``approx_norms`` stay honest.
-
-    On every 1-d-or-larger leaf this is still exactly what
-    ``ls_face_forensics.py`` computes (float32 norm of every ``tree_leaves``
-    entry), so the forensics numbers remain comparable leaf by leaf; the only
-    divergence is the scalar seed, which no longer exists in any launcher.
-    """
-    out = out[1] if has_aux else out
-    leaves = jax.tree_util.tree_leaves(out)
-    return [float("nan") if jnp.ndim(l) == 0
-            else float(jnp.linalg.norm(jnp.asarray(l, dtype=jnp.float32)))
-            for l in leaves]
-
-
-def _exact_leaf_norms(order_key: bytes, digest: bytes, compile_fn, eval_args,
-                      has_aux: bool) -> list[float]:
-    """Memoised per-leaf norms of the EXACT gradient at one measurement point.
-
-    Keyed on (exact_cache_key, eval-args digest) -- exactly what the exact
-    executable and its output depend on. ONE compile + ONE execution per
-    (order, point) per process; every subsequent plan on that order reads the
-    cache. Bounded to 8 entries.
-    """
-    key = order_key + b"|" + digest
-    hit = _EXACT_LEAF_NORMS.get(key)
-    if hit is not None:
-        return hit
-    norms = _leaf_norms(compile_fn()(*eval_args), has_aux)
-    if len(_EXACT_LEAF_NORMS) >= 8:
-        _EXACT_LEAF_NORMS.clear()
-    _EXACT_LEAF_NORMS[key] = norms
-    return norms
-
-
-def _grad_coverage(approx_norms, exact_norms) -> dict:
-    """The coverage record. See the block comment above for the definition."""
-    n = min(len(approx_norms), len(exact_norms))
-    a = [float(x) for x in approx_norms[:n]]
-    e = [float(x) for x in exact_norms[:n]]
-    # 0-d (seed/direction) leaves arrive as nan from `_leaf_norms` and are
-    # NEVER countable -- see its docstring for the convention. They are
-    # kept out of the eps scale too: a bare max() over a list containing
-    # nan is order-dependent in Python and would silently poison eps.
-    _finite_e = [x for x in e if np.isfinite(x)]
-    n_uncountable = len(e) - len(_finite_e)
-    eps = max(_GRAD_COV_EPS_ABS,
-              _GRAD_COV_EPS_REL * (max(_finite_e) if _finite_e else 0.0))
-    ratios: list[float] = []
-    counted: list[int] = []
-    zeroed: list[int] = []
-    for i in range(n):
-        # nan (0-d seed leaf) fails this comparison, so the A4 leaf-set
-        # convention needs no branch of its own here.
-        if not (e[i] > eps):
-            ratios.append(float("nan"))       # uncounted
-            continue
-        counted.append(i)
-        ai = a[i]
-        if not np.isfinite(ai) or ai == 0.0:
-            ratios.append(0.0)
-            zeroed.append(i)
-        else:
-            ratios.append(min(1.0, ai / e[i]))
-    if not counted:
-        return {"defined": False, "min_leaf_ratio": 1.0, "frac_zeroed": 0.0,
-                "n_leaves": n, "n_counted": 0, "n_uncounted": n,
-                "n_zeroed": 0, "zeroed": [], "ratios": ratios,
-                "n_uncountable": n_uncountable,
-                "approx_norms": a, "exact_norms": e, "channel": 1.0,
-                "leaf_mismatch": len(approx_norms) != len(exact_norms)}
-    min_ratio = min(ratios[i] for i in counted)
-    frac_zeroed = len(zeroed) / float(len(counted))
-    return {
-        "defined": True,
-        "min_leaf_ratio": float(min_ratio),
-        "frac_zeroed": float(frac_zeroed),
-        "n_leaves": n,
-        "n_counted": len(counted),
-        "n_uncounted": n - len(counted),
-        # Of which this many were EXCLUDED BY CONVENTION (0-d seed /
-        # direction leaves, marked nan by `_leaf_norms`), as opposed to
-        # uncounted because the exact reference norm was <= eps.
-        "n_uncountable": n_uncountable,
-        "n_zeroed": len(zeroed),
-        "zeroed": zeroed,
-        "ratios": ratios,
-        "approx_norms": a,
-        "exact_norms": e,
-        # The one-slot encoding (see the block comment).
-        "channel": float(-frac_zeroed if zeroed else min_ratio),
-        "leaf_mismatch": len(approx_norms) != len(exact_norms),
-    }
-
-
-def _record_grad_coverage(cov: dict) -> None:
-    s = _GRAD_COV_STATS
-    s["n"] += 1
-    s["last"] = cov
-    if not cov["defined"]:
-        s["n_undefined"] += 1
-        return
-    s["sum_min_ratio"] += cov["min_leaf_ratio"]
-    s["min_min_ratio"] = min(s["min_min_ratio"], cov["min_leaf_ratio"])
-    s["sum_frac_zeroed"] += cov["frac_zeroed"]
-    s["max_frac_zeroed"] = max(s["max_frac_zeroed"], cov["frac_zeroed"])
-
-
-_FROZEN_GRAD_SEEN: list = []
-
-
-def _record_frozen_grad_plan(cov: dict, o_list) -> None:
-    """A plan the HARD GUARD refused. VISIBLY counted, never silent.
-
-    This is the failure mode bug (c) of docs/UNBIASED_PARETO_AND_MEASUREMENT.md
-    describes: NEW_SLOT_JOIN=1 plans were routed through ``_trace_truncate``
-    and vanished from the gradient with no counter and no line in any log, so
-    "the res slot was unreachable all along" went unnoticed for a whole
-    campaign. A rejection here bumps a DEDICATED counter that ppo.py drains
-    every episode onto ``grad_cov/rejected_this_ep``, and prints the first one
-    plus every 50th with the leaf census attached.
-    """
-    _FROZEN_GRAD_PLANS[0] += 1
-    _DEGENERATE_PLANS[0] += 1
-    _GRAD_COV_STATS["n_rejected"] += 1
-    k = _FROZEN_GRAD_PLANS[0]
-    if k == 1 or k % 50 == 0:
-        print(f"[grad-cov] REJECTED #{k}: {cov['n_zeroed']}/{cov['n_counted']} "
-              f"trainable leaves have ZERO gradient under this plan "
-              f"(frac_zeroed={cov['frac_zeroed']:.4f}, "
-              f"min_leaf_ratio={cov['min_leaf_ratio']:.4g}, "
-              f"uncounted={cov['n_uncounted']}) zeroed_leaves="
-              f"{cov['zeroed'][:24]} order_len={len(o_list)}", flush=True)
-
-
-def consume_frozen_grad_plan_count() -> int:
-    """Pop the count of plans the hard guard refused this period."""
-    n = _FROZEN_GRAD_PLANS[0]
-    _FROZEN_GRAD_PLANS[0] = 0
-    return n
-
-
-def consume_grad_coverage_stats() -> dict:
-    """Pop the per-period coverage aggregate (mirrors the other pollers)."""
-    s = _GRAD_COV_STATS
-    n = max(int(s["n"]), 0)
-    ndef = n - int(s["n_undefined"])
-    out = {
-        "count": n,
-        "undefined": int(s["n_undefined"]),
-        "rejected": int(s["n_rejected"]),
-        "mean_min_leaf_ratio": (s["sum_min_ratio"] / ndef) if ndef else float("nan"),
-        "min_min_leaf_ratio": s["min_min_ratio"] if ndef else float("nan"),
-        "mean_frac_zeroed": (s["sum_frac_zeroed"] / ndef) if ndef else float("nan"),
-        "max_frac_zeroed": s["max_frac_zeroed"] if ndef else float("nan"),
-        "wall_s": s["wall_s"],
-        "measure_wall_s": s["measure_wall_s"],
-        "wall_frac": (s["wall_s"] / s["measure_wall_s"]
-                      if s["measure_wall_s"] > 0 else float("nan")),
-    }
-    s.update({"n": 0, "n_undefined": 0, "n_rejected": 0, "sum_min_ratio": 0.0,
-              "min_min_ratio": 1.0, "sum_frac_zeroed": 0.0,
-              "max_frac_zeroed": 0.0, "wall_s": 0.0, "measure_wall_s": 0.0})
-    return out
-
-
 # ---------------------------------------------------------------------------
 # THE FIDELITY CHANNEL (reward slot 8) -- CLIPPED RELATIVE FROBENIUS.
 # ---------------------------------------------------------------------------
 # Owner's choice, 2026-08-28: "clipped relative-Frobenius TRAINED, cosine
 # LOGGED, gradient coverage a hard GUARD." This block is the trained half; the
-# cosine subsample is `cos_log_every` below and the guard is `_grad_coverage`
-# above. The three are deliberately different instruments on the same pair of
-# Jacobians and are NOT interchangeable:
+# cosine subsample is `cos_log_every` below. (The coverage guard was REMOVED
+# 2026-09-03 by owner ruling, ticket dsnn-3qm.15: no guard, no reward channel,
+# no value head; reward slot 7 is reserved and never populated.) The two
+# remaining instruments read the same pair of Jacobians and are NOT
+# interchangeable:
 #
-#   * coverage is a PER-LEAF, ZERO/NON-ZERO verdict. It answers "does every
-#     trainable parameter still receive a gradient at all?" and nothing else --
-#     which is exactly what a hard guard should answer, and exactly why it is a
-#     bad training signal: it is flat over the entire region where all leaves
-#     are alive.
 #   * fidelity is a MAGNITUDE. `1 - ||J_e - J_a||_F / ||J_e||_F`, clipped to
 #     [-1, 1]. It is defined (and equals 0) when the approximated gradient is
 #     identically zero, where the cosine is 0/0.
 #   * the cosine is an ANGLE and ignores magnitude entirely: a plan that halves
 #     every entry of the Jacobian scores cos == 1.0 and rel_frob == 0.5.
 #
-# COST. Both fidelity and the cosine need the EXACT Jacobian. Under the default
+# COST. Both fidelity and the cosine need the EXACT Jacobian. Under the
 # `loss_drop` quality metric the exact executable is otherwise never compiled or
 # run -- that is where loss_drop's 0.22 s / 40 MB per plan (vs the cosine's
-# 9.70 s / 4.24 GB) comes from. So fidelity is NOT free by itself. What makes it
-# cheap in practice is that `--reject-frozen-grads` (default ON) ALREADY
-# materialises the exact Jacobian at measurement point 0 for the coverage
-# guard: `_exact_ref_scores` folds the residual, the exact-norm and the cosine
-# into that SAME single exact execution, so with the guard on the marginal cost
-# of the fidelity channel is the per-leaf reductions plus holding one extra
-# Jacobian alive -- not a second 9.70 s reference. With the guard OFF the
-# channel pays the full exact reference and says so in the log.
+# 9.70 s / 4.24 GB) comes from. So fidelity is NOT free: unless the quality
+# metric is grad_cosine/jac_cosine (which build the reference per point and
+# hand the residual over for free), the channel pays one exact execution per
+# terminal plan through `_exact_ref_scores`, and its price is published as
+# ``fidelity/wall_amortised_s``.
 _FIDELITY_STATS: dict = {
     "n": 0,                 # fidelity measurements taken
     "sum": 0.0,
@@ -1220,8 +917,8 @@ _COS_LOG_SEEN = [0]
 def fidelity_enabled() -> bool:
     """Is the clipped-relative-Frobenius channel (slot 8) measured?
 
-    DEFAULT OFF AT THE LIBRARY LEVEL, exactly like `grad_coverage_enabled`, and
-    for the same reason: measurement happens in Ray measure actors that are
+    DEFAULT OFF AT THE LIBRARY LEVEL, because measurement happens in Ray
+    measure actors that are
     separate processes and may be RESPAWNED inside a job launched before this
     commit. ``ppo.configure_fidelity`` exports the variables before ``ray.init``.
     """
@@ -1243,8 +940,8 @@ def cos_log_every() -> int:
     plan per process.
 
     NOTE the asymmetry that makes this flag mostly unnecessary in practice: when
-    the exact reference is materialised anyway (the coverage guard, the fidelity
-    channel, or ALPHAGRAD_QUALITY_METRIC=cosine), the cosine is one extra
+    the exact reference is materialised anyway (the fidelity channel, or
+    ALPHAGRAD_QUALITY_METRIC=cosine), the cosine is one extra
     per-leaf dot product on leaves that are already resident, so it is taken on
     EVERY such plan regardless of this stride. The stride only ever FORCES an
     exact reference that nothing else asked for.
@@ -1389,20 +1086,20 @@ def consume_fidelity_stats() -> dict:
 # confirmed TLM reward hack -- one skipped face that deletes 62-73% of the
 # backward pass and freezes 11-15 of 16 parameter leaves, which the 200-step
 # quality probe prices at 0.02% (0.9258 vs 0.9260) -- scores NEAR the ceiling
-# too. This channel rewards deleting computation, which is exactly the
-# behaviour `--reject-frozen-grads` exists to refuse. So:
-#   * the guard is a HARD PRECONDITION of a non-zero weight
-#     (`ppo.configure_sparsity` raises if `--no-reject-frozen-grads` is set);
+# too. This channel rewards deleting computation. The gradient-coverage guard
+# that used to refuse such plans (and was a HARD PRECONDITION of a non-zero
+# weight here) was REMOVED 2026-09-03 by owner ruling -- no guard, never a
+# reward gate (ticket dsnn-3qm.15) -- so NOTHING refuses them now. So:
 #   * a SENTINELLED plan takes the channel's FLOOR, not its ceiling, so a
-#     rejected destroyer can never be crowned on sparsity;
+#     sentinelled destroyer can never be crowned on sparsity;
 #   * and the channel is DEFAULT OFF and default weight 0 -- logged, not
 #     trained -- until somebody has looked at what it correlates with.
 # #################################################################
 #
 # COST. The tally is filled while `jacve` is TRACED, so it is free on any
 # trace that was going to happen: the approx executable is compiled for every
-# plan, and the exact one is materialised for every terminal plan by the
-# `--reject-frozen-grads` guard (see `_exact_ref_scores`). When the compile
+# plan, and the exact one is materialised whenever the fidelity channel or a
+# cosine quality metric builds it (see `_exact_ref_scores`). When the compile
 # cache serves an executable WITHOUT tracing, the tally is recovered with an
 # abstract `jax.eval_shape` walk of the same elimination -- traced, never
 # compiled, never executed. Those fallbacks are counted and their wall is
@@ -1431,8 +1128,8 @@ _EXACT_STORE_BYTES: dict = {}
 def sparsity_enabled() -> bool:
     """Is the stored-byte sparsity channel (slot 10) measured?
 
-    DEFAULT OFF AT THE LIBRARY LEVEL, exactly like `fidelity_enabled` and
-    `grad_coverage_enabled`, and for the same reason: measurement happens in
+    DEFAULT OFF AT THE LIBRARY LEVEL, exactly like `fidelity_enabled`, and
+    for the same reason: measurement happens in
     Ray measure actors that are separate processes and may be RESPAWNED inside
     a job launched before this commit. ``ppo.configure_sparsity`` exports the
     variables before ``ray.init``.
@@ -1572,79 +1269,48 @@ def consume_sparsity_stats() -> dict:
 def _residual_scores(exact_out, approx_out, has_aux: bool):
     """``(rel_frob, cos)`` of ``approx_out`` against ``exact_out``, STREAMED.
 
-    Same arithmetic and the same epsilon policy as `_quality_metrics` (the
-    per-leaf accumulation of <e,a>, ||e||^2, ||a||^2, ||e-a||^2 that exists
-    precisely so a >=4 GB flat concatenate is never materialised); this variant
-    exists only because the coverage path holds the two outputs at a different
-    place in `_callback` and needs the exact leaves for its own norms in the
-    same pass. Returns ``(nan, nan)`` on the same "broken comparison" cases
-    `_quality_metrics` scores worst -- the caller decides what a broken
-    comparison means for the channel.
+    The same accumulator as `_quality_metrics` (``_gradient_similarity``: the
+    per-leaf <e,a>, ||e||^2, ||a||^2, ||e-a||^2 that exists precisely so a
+    >=4 GB flat concatenate is never materialised, with the exact-structure
+    check of ticket .62 -- a mismatch RAISES ``GradientStructureMismatch``,
+    a dead path is zero, an implicit dim is compared analytically). This
+    variant exists only because the fidelity path holds the two outputs at a
+    different place in `_callback`. Returns ``(nan, nan)`` when the exact side
+    has nothing to compare against.
     """
     e_out = exact_out[1] if has_aux else exact_out
     a_out = approx_out[1] if has_aux else approx_out
-    a_out = _align_jac(a_out, e_out)
-    leaves_e = jax.tree_util.tree_leaves(e_out)
-    leaves_a = jax.tree_util.tree_leaves(a_out)
-    if not leaves_e or not leaves_a or len(leaves_e) != len(leaves_a):
+    leaves_e = _gradient_leaves(e_out)
+    if not leaves_e or all(x is None for x in leaves_e):
         return float("nan"), float("nan")
-    if any(getattr(a, "shape", None) != getattr(e, "shape", None)
-           for a, e in zip(leaves_a, leaves_e)):
+    dot, ee, aa, rr, _total = _gradient_similarity(e_out, a_out, "fidelity")
+    if _total == 0:
         return float("nan"), float("nan")
-    dot = ee = aa = rr = None
-    for e, a in zip(leaves_e, leaves_a):
-        _cdt = jnp.promote_types(jnp.promote_types(e.dtype, a.dtype),
-                                 jnp.float32)
-        ef = jnp.ravel(e).astype(_cdt)
-        af = jnp.ravel(a).astype(_cdt)
-        _d = jnp.sum(ef * af)
-        _e2 = jnp.sum(jnp.abs(ef) ** 2)
-        _a2 = jnp.sum(jnp.abs(af) ** 2)
-        _r2 = jnp.sum(jnp.abs(ef - af) ** 2)
-        dot = _d if dot is None else dot + _d
-        ee = _e2 if ee is None else ee + _e2
-        aa = _a2 if aa is None else aa + _a2
-        rr = _r2 if rr is None else rr + _r2
     exact_norm = jnp.sqrt(ee)
     approx_norm = jnp.sqrt(aa)
-    rel_frob = jnp.sqrt(rr) / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
+    rel_frob = jnp.sqrt(jnp.maximum(rr, 0.0)) / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
     cos = jnp.real(dot / (jnp.maximum(exact_norm, jnp.sqrt(1e-7))
                           * jnp.maximum(approx_norm, jnp.sqrt(1e-7))))
     return float(rel_frob), float(cos)
 
 
-def _exact_ref_scores(order_key: bytes, digest: bytes, compile_fn, eval_args,
-                      has_aux: bool, approx_out=None, want_cos: bool = False):
-    """ONE exact execution serving the coverage guard AND the fidelity channel.
+def _exact_ref_scores(compile_fn, eval_args, has_aux: bool, approx_out,
+                      want_cos: bool = False):
+    """ONE exact execution serving the fidelity channel (and the cosine log).
 
-    Returns ``(exact_norms, rel_frob, cos)``; ``rel_frob``/``cos`` are ``None``
-    when ``approx_out`` is ``None`` (coverage only -- the pre-A2 behaviour) and
-    ``cos`` is ``None`` unless ``want_cos``.
+    Returns ``(rel_frob, cos)``; ``cos`` is ``None`` unless ``want_cos``.
 
-    THE POINT OF THIS FUNCTION is that the exact Jacobian is the expensive
-    object and it is needed by two consumers. `_exact_leaf_norms` (kept, and
-    still the only path when fidelity is off) memoises just the per-leaf norms
-    and drops the leaves immediately, so it cannot serve a residual; when a
-    residual IS wanted the leaves must survive one more pass, and doing that
-    twice would double the most expensive thing in the measurement. So: execute
-    once, score everything, drop. The norms are still memoised on the way out,
-    so a repeat order pays nothing for the coverage half.
+    The exact Jacobian is the expensive object: execute once, score
+    everything, drop. (Until 2026-09-03 this call also fed the gradient-
+    coverage guard's per-leaf norms and memoised them; the guard is gone.)
     """
-    key = order_key + b"|" + digest
-    if approx_out is None:
-        return _exact_leaf_norms(order_key, digest, compile_fn, eval_args,
-                                 has_aux), None, None
     out = compile_fn()(*eval_args)
     _FIDELITY_STATS["exact_execs"] += 1
     try:
-        norms = _leaf_norms(out, has_aux)
         rel_frob, cos = _residual_scores(out, approx_out, has_aux)
     finally:
         out = None
-    if len(_EXACT_LEAF_NORMS) >= 8:
-        _EXACT_LEAF_NORMS.clear()
-    _EXACT_LEAF_NORMS[key] = norms
-    return norms, rel_frob, (cos if want_cos else None)
+    return rel_frob, (cos if want_cos else None)
 
 
 def consume_truncated_plan_count() -> int:
@@ -1724,8 +1390,8 @@ def consume_per_face_stats() -> dict:
 # and for why the replayable spec is the raw integer WIRE and not a rendered
 # ``seq``.
 #
-# WHY THE RECORD IS BUILT HERE AND NOT IN THE TRAINER. Three of the five
-# things the record must carry only exist in this process:
+# WHY THE RECORD IS BUILT HERE AND NOT IN THE TRAINER. One of the things
+# the record must carry only exists in this process:
 #   * the per-kind APPLIED / IDEMPOTENT-NO-OP counts. ``_PER_FACE_STATS`` is a
 #     module global written by the per-face legality hook and consumed per LOG
 #     STEP, which is why ppo.py's own comment says the applied counts "CANNOT
@@ -1735,13 +1401,10 @@ def consume_per_face_stats() -> dict:
 #     callback measures one plan and the pollers cannot interleave with it (a
 #     Ray actor runs one task at a time; the trainer's io_callback is
 #     synchronous on the main thread). The delta is clamped at 0 so a poll
-#     that did interleave under-reports rather than reporting a negative;
-#   * the per-leaf COVERAGE CENSUS. ``_grad_coverage`` returns the per-leaf
-#     approx/exact norms and ratios and they are then aggregated away; only
-#     the one-float slot-7 encoding reaches the trainer;
-#   * the plans the frozen-gradient HARD GUARD sentinelled. Those return early
-#     with ``_SENTINEL_BAD_REWARD`` and are, by construction, losers -- so
-#     they are recorded at that return too, flagged ``sentinelled``.
+#     that did interleave under-reports rather than reporting a negative.
+#   (Until 2026-09-03 the record also carried the per-leaf gradient-coverage
+#   census and a ``sentinelled`` flag for plans the coverage guard refused;
+#   both went with the guard, ticket dsnn-3qm.15.)
 #
 # COST. Everything written is already materialised host-side; nothing here
 # adds a device operation, an executable, an exact reference or a compile.
@@ -1750,7 +1413,6 @@ def consume_per_face_stats() -> dict:
 _PLAN_LOG_ENV = "ALPHAGRAD_PLAN_LOG"
 _PLAN_LOG_CAP_ENV = "ALPHAGRAD_PLAN_LOG_CAP"
 _PLAN_LOG_MAX_FACES_ENV = "ALPHAGRAD_PLAN_LOG_MAX_FACES"
-_PLAN_LOG_MAX_LEAVES_ENV = "ALPHAGRAD_PLAN_LOG_MAX_LEAVES"
 _PLAN_RECORDS: list = []
 _PLAN_LOG_DROPPED = [0]
 _PLAN_LOG_WARNED: list = []
@@ -1791,11 +1453,6 @@ def _plan_log_max_faces() -> int:
     return _plan_log_int_env(_PLAN_LOG_MAX_FACES_ENV, 0)
 
 
-def _plan_log_max_leaves() -> int:
-    """0 = record every leaf of the coverage census."""
-    return _plan_log_int_env(_PLAN_LOG_MAX_LEAVES_ENV, 0)
-
-
 def _record_plan(rec: dict) -> None:
     if len(_PLAN_RECORDS) >= _plan_log_cap():
         _PLAN_LOG_DROPPED[0] += 1
@@ -1805,14 +1462,36 @@ def _record_plan(rec: dict) -> None:
 
 def consume_plan_records() -> dict:
     """Pop this process's plan records (mirrors the other pollers)."""
+    _fb_n = int(_MEASURE_COMPILE_FALLBACKS["n"])
     out = {"records": list(_PLAN_RECORDS),
            "dropped": int(_PLAN_LOG_DROPPED[0]),
            "terminals": int(_PLAN_LOG_TERMINALS[0]),
+           # MEASURE TOOLCHAIN TELEMETRY (finding 03 sec 6). Drained HERE
+           # because the measure compiles happen in THIS process -- the
+           # actor under --ray-measure -- and this dict is the one the
+           # actor already hands to the trainer. Reading the trainer's own
+           # globals is the mistake that made grad_cov/* read 0 (ticket 07).
+           # `compile_fallbacks` is the delta since the previous drain;
+           # `_total` is the process lifetime count (resets on respawn).
+           "compile_fallbacks": max(
+               0, _fb_n - int(_MEASURE_FALLBACKS_AT_LAST_DRAIN[0])),
+           "compile_fallbacks_total": _fb_n,
+           "toolchain_ok": bool(_MEASURE_TOOLCHAIN["ok"]),
+           "toolchain_host": str(_MEASURE_TOOLCHAIN["host"]),
+           # MEMORY PARITY (ticket .49): the watermark logged beside the
+           # channel, per measurement, drained on the same trip for the
+           # same reason as the toolchain counters above.
+           "mem_parity": consume_mem_parity(),
+           # THE PAIRED REFERENCE (ticket .9): one record per rev-exact
+           # measurement, same trip, same reason (the trainer logs
+           # ref/latency_ns and ref/temp_bytes from these; ticket .45).
+           "paired_ref": consume_paired_refs(),
            "enabled": plan_log_enabled(),
            "pid": os.getpid()}
     _PLAN_RECORDS.clear()
     _PLAN_LOG_DROPPED[0] = 0
     _PLAN_LOG_TERMINALS[0] = 0
+    _MEASURE_FALLBACKS_AT_LAST_DRAIN[0] = _fb_n
     return out
 
 
@@ -1849,53 +1528,11 @@ def _plan_face_delta(before: dict | None, after: dict | None) -> dict:
     }
 
 
-def _plan_coverage_census(cov: dict | None) -> dict:
-    """The per-leaf coverage census for ONE plan.
-
-    ``{"measured": False}`` when the coverage block did not run for this
-    plan (channel off, or the exact reference could not be built) --
-    DISTINCT from a census that ran and found nothing frozen, which the
-    aggregate ``grad_cov/*`` keys cannot tell apart.
-    """
-    if not cov:
-        return {"measured": False}
-    n = _plan_log_max_leaves()
-
-    def _cut(xs):
-        xs = list(xs or ())
-        return xs[:n] if (n and len(xs) > n) else xs
-
-    ratios = _cut(cov.get("ratios"))
-    out = {
-        "measured": True,
-        "defined": bool(cov.get("defined", False)),
-        "min_leaf_ratio": float(cov.get("min_leaf_ratio", float("nan"))),
-        # The brief's name for `_grad_coverage`'s `frac_zeroed`.
-        "frac_leaves_zeroed": float(cov.get("frac_zeroed", float("nan"))),
-        "channel": float(cov.get("channel", 0.0)),
-        "n_leaves": int(cov.get("n_leaves", 0)),
-        "n_counted": int(cov.get("n_counted", 0)),
-        "n_uncounted": int(cov.get("n_uncounted", 0)),
-        "n_uncountable": int(cov.get("n_uncountable", 0)),
-        "n_zeroed": int(cov.get("n_zeroed", 0)),
-        "zeroed": [int(i) for i in _cut(cov.get("zeroed"))],
-        "leaf_ratios": [float(x) for x in ratios],
-        "approx_norms": [float(x) for x in _cut(cov.get("approx_norms"))],
-        "exact_norms": [float(x) for x in _cut(cov.get("exact_norms"))],
-        "leaf_mismatch": bool(cov.get("leaf_mismatch", False)),
-        "leaves_recorded": len(ratios),
-        "leaves_elided": max(0, len(list(cov.get("ratios") or ())) -
-                             len(ratios)),
-    }
-    if cov.get("error"):
-        out["error"] = str(cov["error"])
-    return out
-
-
 def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
-                          reward_vec, cov, face_before, face_after,
+                          reward_vec, face_before, face_after,
                           counts_from_trace: bool,
-                          sentinelled: bool) -> None:
+                          mem_parity: dict | None = None,
+                          paired_ref: dict | None = None) -> None:
     """Append ONE terminal plan to this process's plan log. Never raises.
 
     A logging failure must not kill a measurement, but it must not be
@@ -1903,20 +1540,51 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
     """
     try:
         from alphagrad.approx.common import plan_log as _plog
+        from alphagrad.approx.common.masks import (
+            reduce_axis_space as _reduce_axis_space)
         rec = {
             "schema": _plog.SCHEMA,
             "pid": os.getpid(),
             "wall_time": time.time(),
-            # The frozen-gradient HARD GUARD refused this plan: it returned
-            # `_SENTINEL_BAD_REWARD`, trained nothing and was never ranked.
-            # It is a loser BY CONSTRUCTION and the reason this flag exists.
-            "sentinelled": bool(sentinelled),
             # False = the approx compile came from the cache, so graphax
             # never re-traced the elimination and the per-face hook was
             # never invoked: `applied`/`skipped`/`idempotent_noop` are all
             # 0 because NOTHING WAS COUNTED, not because nothing applied.
             # `requested` is exact either way (it is read off the wire).
             "counts_from_trace": bool(counts_from_trace),
+            # WHICH old-edge configuration measured this plan (ticket .56):
+            # "same" (old carries new's approximation) or "exact". Read from
+            # the same function the face emitter reads, so the record cannot
+            # disagree with the measurement.
+            "approx_old": approx_old(),
+            # WHICH quantity reward slot 5 holds (ticket .49) and BOTH
+            # memory numbers of this plan's timed executable, so a record
+            # can be re-scored on the other channel without a re-measure.
+            "mem_channel": mem_channel(),
+            "mem_temp_bytes": (mem_parity or {}).get("static_temp_bytes"),
+            "mem_watermark_bytes": (mem_parity or {}).get(
+                "runtime_peak_bytes"),
+            "mem_peak_source": (mem_parity or {}).get(
+                "peak_source", "not_measured"),
+            # WHICH coordinate space the Reduce axes were applied in
+            # (ticket .20): "physical" (wire token -> physical val axis at
+            # decode -> canonical slot at graphax) or "canonical" (the
+            # pre-ticket read). A replay must convert the same way.
+            "reduce_axis_space": _reduce_axis_space(),
+            # HOW slots 2 and 5 are expressed (ticket .9) and, under
+            # paired-log, the rev-exact reference this plan was paired
+            # with, in POSITIVE units -- so a record can be re-scored in
+            # absolute units (candidate_* fields) or against a different
+            # reference without a re-measure. None under absolute.
+            "cost_form": cost_form(),
+            "ref_latency_ns": (paired_ref or {}).get("latency_ns"),
+            "ref_temp_bytes": (paired_ref or {}).get("temp_bytes"),
+            "ref_watermark_bytes": (paired_ref or {}).get("watermark_bytes"),
+            "candidate_latency_ns": (paired_ref or {}).get(
+                "candidate_latency_ns"),
+            "candidate_memory_bytes": (paired_ref or {}).get(
+                "candidate_memory_bytes"),
+            "mem_log_floored": (paired_ref or {}).get("mem_floored"),
         }
         rec.update(_plog.encode_wires(
             order, rule_specs, face_specs, face_skips,
@@ -1927,7 +1595,18 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
                           np.asarray(reward_vec).reshape(-1).tolist()]
         rec["reward_names"] = list(REWARD_NAMES)
         rec.update(_plan_face_delta(face_before, face_after))
-        rec["coverage"] = _plan_coverage_census(cov)
+        # Degraded-fusion compiles taken WHILE THIS PLAN WAS MEASURED (a
+        # delta since the previous record in this pid; measurements are
+        # sequential per actor). Non-zero = this plan's latency came from a
+        # less-fused executable and is not comparable with a plan at 0.
+        # `toolchain_ok` False = the link toolchain of this node failed the
+        # gate probe or a real measure compile (finding 03).
+        _fb_n = int(_MEASURE_COMPILE_FALLBACKS["n"])
+        rec["compile_fallbacks"] = max(
+            0, _fb_n - int(_MEASURE_FALLBACKS_AT_LAST_RECORD[0]))
+        rec["compile_fallbacks_total"] = _fb_n
+        rec["toolchain_ok"] = bool(_MEASURE_TOOLCHAIN["ok"])
+        _MEASURE_FALLBACKS_AT_LAST_RECORD[0] = _fb_n
         _record_plan(rec)
     except Exception as _exc:          # pragma: no cover - telemetry only
         if not _PLAN_LOG_WARNED:
@@ -2100,14 +1779,19 @@ _AXIS_FEAT_GROUP_ID = 3
 #   6 quality          — THE quality channel. Which QUANTITY sits in it is
 #                        selected by ``ALPHAGRAD_QUALITY_METRIC`` (see
 #                        ``quality_metric()`` below):
-#                          "loss_drop" (the default for any scalar-loss
-#                            target, i.e. every trainable example) -- the
-#                            relative loss drop of a 200-step Adam walk driven
-#                            by THIS PLAN's gradient, probed on a fixed batch
-#                            of 512 real MNIST images. Pearson 0.922 against
-#                            final downstream test accuracy vs 0.610 for the
+#                          "grad_cosine" (the default for any scalar-loss
+#                            target, i.e. every trainable example; owner
+#                            ruling 2026-09-02) -- the cosine between THIS
+#                            PLAN's gradient and the rev-exact gradient on the
+#                            same probe batch of real data, at init.
+#                          "loss_drop" (by name only) -- the relative loss
+#                            drop of a 200-step Adam walk driven by THIS
+#                            PLAN's gradient, probed on a fixed batch of 512
+#                            real MNIST images. Pearson 0.922 against final
+#                            downstream test accuracy vs 0.610 for the
 #                            Jacobian cosine, at 0.22 s / 40 MB per plan vs
-#                            9.70 s / 4.24 GB.
+#                            9.70 s / 4.24 GB; but finding 51 shows it can
+#                            score 0.885 while the gradient points elsewhere.
 #                          "cosine" (legacy) — cosine similarity between the
 #                            flattened approximated and exact Jacobians,
 #                            aggregated over the calibration samples.
@@ -2119,9 +1803,16 @@ _AXIS_FEAT_GROUP_ID = 3
 #                        REWARD_NAMES) must not claim "cosine" for a number
 #                        that is not one. The concrete metric is published as
 #                        ``quality/metric``.
-#   7 grad_coverage    — per-leaf gradient coverage, bounded [-1, 1]. See
-#                        ``_grad_coverage``. Historically ``frob_residual``;
-#                        the alias below keeps index 7 addressable by that name.
+#   7 grad_coverage    — RESERVED, AND THIS ENV NEVER POPULATES IT. It held
+#                        per-leaf gradient coverage from 2026-08-27 until the
+#                        owner ruling of 2026-09-03 (ticket dsnn-3qm.15) removed
+#                        the guard, the channel and the value head; before that
+#                        it was the dead ``frob_residual`` slot. The NAME and
+#                        the INDEX stay so archived plan logs and the
+#                        index-keyed reward_scaling mirror keep their meaning
+#                        (the same convention slot 9 uses). The alias below
+#                        keeps index 7 addressable as ``frob_residual`` for the
+#                        pool's sentinel wire. This env emits 0.0 here, always.
 #   8 fidelity         — CLIPPED RELATIVE FROBENIUS (workstream A2, owner's
 #                        choice 2026-08-28):
 #
@@ -2152,8 +1843,7 @@ _AXIS_FEAT_GROUP_ID = 3
 #                        (ppo's --fidelity-weight / ALPHAGRAD_FIDELITY). It needs
 #                        the EXACT Jacobian, which under the default loss_drop
 #                        quality metric is otherwise never built -- see
-#                        `_exact_ref_scores` for how it shares that one exact
-#                        execution with the gradient-coverage guard.
+#                        `_exact_ref_scores`.
 #   9 bkstep_acc     — RESERVED, AND THIS ENV NEVER POPULATES IT. The
 #                        slot belongs to the DEPRECATED Ray line, whose
 #                        table (`common.reward_scaling.REWARD_NAMES`)
@@ -2198,6 +1888,7 @@ REWARD_NAMES: tuple[str, ...] = (
     "bytes_accessed",
     "peak_memory",
     "quality",
+    # RESERVED (held gradient coverage until 2026-09-03); never populated here.
     "grad_coverage",
     "fidelity",
     # RESERVED for the deprecated Ray line; never populated here.
@@ -2208,8 +1899,8 @@ REWARD_INDEX = {name: i for i, name in enumerate(REWARD_NAMES)}
 # BACK-COMPAT ALIAS for slot 7. The slot was ``frob_residual`` until
 # 2026-08-27 and had been DEAD since the quality channel absorbed it (see the
 # REWARD_NAMES comment above: "the env still emits the frob_residual slot ...
-# but nothing reads it"). It now carries GRADIENT COVERAGE -- see
-# ``_grad_coverage`` below -- and the alias keeps every historical call site
+# but nothing reads it"), carried GRADIENT COVERAGE from 2026-08-27 and is
+# RESERVED since 2026-09-03. The alias keeps every historical call site
 # (cpu_approx_pool's sentinel writer, alpha0's --lambda-frob, az_gumbel) on
 # index 7. Exactly the precedent slot 6 set when cosine_sim became quality.
 REWARD_INDEX["frob_residual"] = REWARD_INDEX["grad_coverage"]
@@ -2218,7 +1909,7 @@ REWARD_INDEX["frob_residual"] = REWARD_INDEX["grad_coverage"]
 # not move; only its display name changed, so the alias is exact.
 REWARD_INDEX["cosine_sim"] = REWARD_INDEX["quality"]
 COMPUTE_REWARD_INDICES = tuple(range(0, 6))  # cost components
-# quality (loss_drop / cosine), gradient coverage, clipped relative
+# quality (loss_drop / cosine), the reserved slot 7, clipped relative
 # Frobenius, the reserved bkstep slot and stored-byte sparsity. These are
 # the "higher is better" channels: they are NOT stored negated and must
 # not be treated as costs. Mirrors reward_scaling._QUALITY_REWARD_INDICES.
@@ -2236,11 +1927,14 @@ SENTINEL_COST = -1e10
 # slot 8 both live in [-1, 1], and stamping -1e10 into a bounded channel would
 # make its PopArt sigma meaningless for every real plan measured afterwards.
 _SENTINEL_BOUNDED_FLOOR = {
-    REWARD_INDEX["frob_residual"]: -1.0,   # grad_coverage: all leaves frozen
+    # RESERVED slot 7: was the coverage floor ("all leaves frozen"). Kept
+    # at -1.0 so the sentinel vector is byte-identical to every archived
+    # one; nothing reads the slot.
+    REWARD_INDEX["frob_residual"]: -1.0,
     REWARD_INDEX["fidelity"]: -1.0,        # rel_frob >= 2, the clip floor
     # SPARSITY TAKES ITS FLOOR ON A SENTINELLED PLAN, NOT ITS CEILING.
-    # This is the single most important line in the channel. A plan the
-    # coverage guard rejects is, overwhelmingly, a plan that DELETED
+    # This is the single most important line in the channel. A sentinelled
+    # plan is, overwhelmingly, a plan that DELETED
     # computation -- which is the sparsity ceiling. Leaving the slot at
     # 0.0 (or letting it inherit SENTINEL_COST) would let the destroyer
     # top the sparsity ranking it was sentinelled for.
@@ -2312,6 +2006,12 @@ class EnvState(NamedTuple):
     #                                out axes 0..out_len-1, then primal
     #                                axes out_len.. ) and `row[2]` indexes
     #                                :data:`COMPRESS_KINDS`.
+    #                                Ticket .20: under --face-slot-frames
+    #                                slot and --reduce-axis-space physical
+    #                                `row[1]` is the LOGICAL dim of the
+    #                                slot's tensor; masks.reduce_axis_spaces
+    #                                resolves it to the physical val axis
+    #                                at decode.
     #   row[0] == QUANT_SENTINEL:    QUANT with `row[1]` indexing
     #                                :data:`QUANT_DTYPES`. `row[2]` is
     #                                unused (kept at 0).
@@ -2437,7 +2137,7 @@ class EnvConfig(NamedTuple):
     # target's output avals. Recorded on the CONFIG (not just validated in
     # from_jaxpr) because ``_callback`` sees only the config, and
     # ``quality_metric()``'s ``auto`` default needs it to decide between the
-    # loss-drop walk (defined only for a scalar loss) and the legacy Jacobian
+    # gradient cosine (defined only for a scalar loss) and the legacy Jacobian
     # cosine.
     scalar_target: bool = False
     # DEPRECATED AND UNREAD. ``--measure-grad`` used to decide what was traced.
@@ -3001,41 +2701,265 @@ def _flatten_jacobians(jac):
     return jnp.concatenate(flats)
 
 
-def _align_jac(jac_approx, jac_exact):
-    """Align each approx-Jacobian/grad leaf to its exact leaf's LAYOUT before
-    comparison. graphax ``jacve`` returns some weight grads in the transposed
-    (dL/dW^T) layout for certain elimination orders; flattening them as-is makes
-    a (256,784) vs (784,256) ravel near-orthogonal, so cosine/frob become a
-    layout ARTIFACT that badly underestimates true gradient quality. Transpose a
-    2-D leaf back when its shape is the exact leaf's reverse; leave other
-    mismatches for the size/shape guard downstream. (Ported from the fat-line
-    stash — the fix that lifted Spearman-vs-trainability 0.67 -> 0.79.)"""
+_JAC_DENSE_WARNED: list = []
+
+
+class GradientStructureMismatch(RuntimeError):
+    """Two gradient pytrees that must share one structure do not (ticket
+    dsnn-3qm.62). Raised by the grad-cosine and fidelity comparisons instead
+    of the silent 0.0 clamp that hid finding 60; the measure actors re-raise
+    it and the run stops. The message names the site and the leaf."""
+
+
+def _align_jac(jac_approx, jac_exact, site: str = "jac_cosine"):
+    """Align each approx-Jacobian leaf to its exact leaf's LAYOUT before the
+    ANALYTIC JACOBIAN-COSINE comparison (the benchmarks whose target is a full
+    Jacobian: Helmholtz, RoeFlux, ...). graphax ``jacve`` returns some
+    Jacobian blocks in the transposed layout for certain elimination orders;
+    flattening them as-is makes a (256,784) vs (784,256) ravel near-orthogonal.
+    Transpose a 2-D leaf back when its shape is the exact leaf's reverse.
+
+    Ticket .62: this is NOT on the grad-cosine or fidelity path any more (a
+    parameter gradient has ONE layout, graphax's output contract), and a
+    pytree that cannot be mapped against its reference RAISES instead of
+    being returned unaligned (the blanket ``except`` that swallowed finding
+    60's ``tree_map`` error is gone)."""
     def _al(a, e):
+        # A dead path (None) and a SparseTensor pass through: the comparison
+        # scores the first as zero and checks the second's layout itself.
+        if a is None or e is None or _is_sparse_tensor(a) or _is_sparse_tensor(e):
+            return a
         if getattr(a, "shape", None) == getattr(e, "shape", None):
             return a
         if getattr(a, "ndim", 0) == 2 and a.shape == e.shape[::-1]:
+            print(f"[{site}] aligning a transposed Jacobian leaf "
+                  f"{a.shape} -> {e.shape}", flush=True)
             return a.T
         return a
     try:
-        return jax.tree_util.tree_map(_al, jac_approx, jac_exact)
-    except Exception:
-        return jac_approx
+        return jax.tree_util.tree_map(
+            _al, jac_approx, jac_exact,
+            is_leaf=lambda x: x is None or _is_sparse_tensor(x))
+    except Exception as exc:
+        raise GradientStructureMismatch(
+            f"[{site}] the approximated Jacobian pytree cannot be mapped "
+            f"against the exact one: {type(exc).__name__}: "
+            f"{' '.join(str(exc).split())[:600]}") from exc
 
 
-_COST_REF: dict = {}
-# ``clamps``       total gate firings this process
-# ``unclamped``    bounded ring of the campaign latencies (ns) of terminal
-#                  plans the gate did NOT clamp -- the denominator of the
-#                  floor/plan ratio telemetry below.
-# ``instrument``   the campaign instrument parameters the last floor was
-#                  measured with, logged so a future re-fork is visible.
-_QUALITY_GATE_STATS: dict = {"clamps": 0, "unclamped": [], "instrument": None}
-# (order, arg-shape, device)-keyed floor cache: `exact_cache_key` already
-# digests exactly that, so a repeat offender order is measured ONCE.
-_ORDER_FLOOR_CACHE: dict = {}
-_ORDER_FLOOR_CACHE_MAX = 256
-# One legacy-vs-campaign audit print per process (see _gate_order_floor).
-_FLOOR_AUDIT_DONE: list = []
+def _gradient_leaves(tree):
+    """The gradient leaves of a ``jacve`` output IN ORDER, with a dead path
+    (``None``, a face SKIP deleted every path to that parameter) kept as a
+    ``None`` leaf so the two sides pair up positionally."""
+    return jax.tree_util.tree_leaves(
+        tree, is_leaf=lambda x: x is None or _is_sparse_tensor(x))
+
+
+def _is_sparse_tensor(x) -> bool:
+    from graphax.sparse.tensor import SparseTensor
+    return isinstance(x, SparseTensor)
+
+
+def _leaf_shape(x):
+    if x is None:
+        return None
+    if _is_sparse_tensor(x):
+        return tuple(int(d.logical_size) for d in x.dims)
+    return tuple(int(v) for v in getattr(x, "shape", ()))
+
+
+def _gradient_similarity(jac_exact, jac_approx, site: str):
+    """``(dot, ||e||^2, ||a||^2, ||e - a||^2, n_exact_elements)`` accumulated
+    PER LEAF over the two gradient pytrees, with EXACT structure equality
+    (ticket dsnn-3qm.62) and no densification of the approximated side.
+
+    Per pair of leaves (e, a), in ``jacve`` output order:
+
+      * ``a is None`` (dead path after a SKIP): the plan's gradient for that
+        parameter IS zero -- dot 0, ||a||^2 0, residual ||e||^2. Not a
+        structure fault: graphax's dense path returns zeros there too.
+      * ``a`` a plain array: its shape must equal ``e``'s.
+      * ``a`` a SparseTensor: its logical shape must equal ``e``'s and it
+        must be in PARAMETER LAYOUT (graphax's output contract: the val axes
+        in dim order). A materialized tensor compares like an array. An
+        IMPLICIT dim (``axis is None``, the storage of a Reduce'd gradient:
+        one representative broadcast along that dim) is compared
+        ANALYTICALLY -- ``<e, bcast(a)> = <sum_over_implicit(e), a>`` and
+        ``||bcast(a)||^2 = N_implicit * ||a||^2`` -- so the approximated side
+        is never materialized (owner Q1: no densify). A uniform tensor
+        (``val is None``) is the same with a 0-d representative.
+      * anything else in a returned gradient (a diagonal pair, a compressed
+        index, a mismatched layout, a mismatched logical shape, a leaf
+        count that differs) RAISES ``GradientStructureMismatch``.
+
+    The exact side must be materialized (an array, or a SparseTensor with
+    every dim materialized) -- it is the exact gradient.
+    """
+    leaves_e = _gradient_leaves(jac_exact)
+    leaves_a = _gradient_leaves(jac_approx)
+    if len(leaves_e) != len(leaves_a):
+        raise GradientStructureMismatch(
+            f"[{site}] {len(leaves_a)} gradient leaves against "
+            f"{len(leaves_e)} exact leaves: approx shapes "
+            f"{[_leaf_shape(x) for x in leaves_a]} vs exact "
+            f"{[_leaf_shape(x) for x in leaves_e]}")
+    dot = ee = aa = rr = None
+    total = 0
+    for i, (e, a) in enumerate(zip(leaves_e, leaves_a)):
+        if e is None:
+            raise GradientStructureMismatch(
+                f"[{site}] exact leaf {i} is a dead path (None); the exact "
+                f"reference must carry every parameter gradient")
+        if _is_sparse_tensor(e):
+            if e.val is not None and all(d.axis is not None and not d.is_sparse
+                                         for d in e.dims):
+                from graphax.sparse.ops.output_layout import is_parameter_layout
+                if not is_parameter_layout(e):
+                    raise GradientStructureMismatch(
+                        f"[{site}] exact leaf {i} is not in parameter layout: "
+                        f"dims {e.dims}, val {e.val.shape}")
+                e_arr = e.val * e.scalar_mult if e.scalar_mult is not None else e.val
+            else:
+                # A FULL JACOBIAN leaf (a non-scalar target: the analytic AD
+                # benchmarks, or a Diag that survived to the boundary) carries
+                # a diagonal pair or a uniform fill. The exact reference of a
+                # Jacobian is materialized here, as the legacy Jacobian cosine
+                # did; a scalar loss never reaches this branch (its exact
+                # gradient is dense-stored, finding 61).
+                e_arr = e.dense()
+                if not _JAC_DENSE_WARNED:
+                    _JAC_DENSE_WARNED.append(1)
+                    print(f"[{site}] exact leaf {i} is a structured Jacobian "
+                          f"(dims {e.dims}); the reference is materialized for "
+                          "the comparison", flush=True)
+        else:
+            e_arr = e
+        e_shape = tuple(int(v) for v in e_arr.shape)
+        total += int(e_arr.size)
+        _cdt = jnp.promote_types(e_arr.dtype, jnp.float32)
+        ef = jnp.asarray(e_arr).astype(_cdt)
+        _e2 = jnp.sum(jnp.abs(ef) ** 2)
+        if a is None:
+            _d = jnp.zeros((), _cdt)
+            _a2 = jnp.zeros((), _cdt)
+            _r2 = _e2
+        elif _is_sparse_tensor(a):
+            a_shape = _leaf_shape(a)
+            if a_shape != e_shape:
+                raise GradientStructureMismatch(
+                    f"[{site}] leaf {i}: logical shape {a_shape} vs exact "
+                    f"{e_shape}; dims {a.dims}")
+            if any(getattr(d, "is_compressed", False) for d in a.dims):
+                raise GradientStructureMismatch(
+                    f"[{site}] leaf {i} carries a compressed index in a "
+                    f"returned gradient: dims {a.dims}")
+            if any(d.is_sparse for d in a.dims):
+                # A diagonal pair in the approximated leaf: a Jacobian target
+                # (see the exact branch above). Compared on its dense form.
+                a_arr = a.dense()
+                if tuple(int(v) for v in a_arr.shape) != e_shape:
+                    raise GradientStructureMismatch(
+                        f"[{site}] leaf {i}: dense shape {a_arr.shape} vs exact "
+                        f"{e_shape}; dims {a.dims}")
+                _cdt = jnp.promote_types(_cdt, jnp.promote_types(a_arr.dtype, jnp.float32))
+                ef = ef.astype(_cdt)
+                af = jnp.asarray(a_arr).astype(_cdt)
+                _d = jnp.sum(ef * af)
+                _a2 = jnp.sum(jnp.abs(af) ** 2)
+                _r2 = jnp.sum(jnp.abs(ef - af) ** 2)
+                dot = _d if dot is None else dot + _d
+                ee = _e2 if ee is None else ee + _e2
+                aa = _a2 if aa is None else aa + _a2
+                rr = _r2 if rr is None else rr + _r2
+                continue
+            from graphax.sparse.ops.output_layout import is_parameter_layout
+            if a.val is not None and not is_parameter_layout(a):
+                raise GradientStructureMismatch(
+                    f"[{site}] leaf {i} is not in parameter layout: dims "
+                    f"{a.dims}, val {a.val.shape} (graphax output contract, "
+                    f"ticket .62)")
+            implicit = tuple(pos for pos, d in enumerate(a.dims) if d.axis is None)
+            _cdt = jnp.promote_types(_cdt, jnp.promote_types(a.dtype, jnp.float32))
+            ef = ef.astype(_cdt)
+            mult = jnp.asarray(a.scalar_mult, dtype=_cdt)
+            if a.val is None:
+                a_rep = mult.reshape(())          # uniform: every cell = scalar_mult
+            else:
+                a_rep = jnp.asarray(a.val).astype(_cdt) * mult
+            n_bcast = 1
+            for pos in implicit:
+                n_bcast *= int(a.dims[pos].logical_size)
+            e_red = jnp.sum(ef, axis=implicit) if implicit else ef
+            if tuple(int(v) for v in a_rep.shape) != tuple(int(v) for v in e_red.shape):
+                raise GradientStructureMismatch(
+                    f"[{site}] leaf {i}: stored shape {a_rep.shape} does not "
+                    f"match the exact leaf reduced over the implicit dims "
+                    f"{implicit}: {e_red.shape}; dims {a.dims}")
+            _d = jnp.sum(e_red * a_rep)
+            _a2 = n_bcast * jnp.sum(jnp.abs(a_rep) ** 2)
+            _r2 = _e2 - 2.0 * _d + _a2
+        else:
+            a_shape = tuple(int(v) for v in getattr(a, "shape", ()))
+            if a_shape != e_shape:
+                raise GradientStructureMismatch(
+                    f"[{site}] leaf {i}: shape {a_shape} vs exact {e_shape}")
+            _cdt = jnp.promote_types(_cdt, jnp.promote_types(a.dtype, jnp.float32))
+            ef = ef.astype(_cdt)
+            af = jnp.asarray(a).astype(_cdt)
+            _d = jnp.sum(ef * af)
+            _a2 = jnp.sum(jnp.abs(af) ** 2)
+            _r2 = jnp.sum(jnp.abs(ef - af) ** 2)
+        dot = _d if dot is None else dot + _d
+        ee = _e2 if ee is None else ee + _e2
+        aa = _a2 if aa is None else aa + _a2
+        rr = _r2 if rr is None else rr + _r2
+    return dot, ee, aa, rr, total
+
+
+# ---------------------------------------------------------------------------
+# THE PAIRED REFERENCE (ticket dsnn-3qm.9). Under ``--cost-form paired-log``
+# every terminal measurement also measures REV-EXACT -- the reverse order,
+# every face None, the jax.grad-equivalent -- in the same callback, right
+# after the candidate, through the same executable path and the same
+# instrument (`_campaign_measure_cost` -> `_time_one_rep`, same eval args,
+# same points x reps, same inner-reps, same warmup, same median). The cost
+# channels then carry the LOG-DIFFERENCE ``Delta_c = log cost_c(candidate)
+# - log cost_c(rev-exact)`` (stored negated like every cost slot), so
+# rev-exact scores 0 by construction and a GPU-state drift of 18-20 % between
+# processes cancels instead of masquerading as a win. One record per
+# reference measurement is kept here and drained with the plan records
+# (`consume_plan_records` -> ``"paired_ref"``), so the trainer can log the
+# reference in positive units (ref/latency_ns, ref/temp_bytes; ticket .45).
+#
+# Until 2026-09-04 this block held the additive quality gate
+# (ALPHAGRAD_QUALITY_GATE_MIN, `_apply_quality_gate`, the per-order floor
+# and the global rev reference). The gate clamped a destroyed plan's costs to
+# a CACHED exact reference -- not paired, and the floor was measured with a
+# different instrument for the whole v57-v66 campaign (see `_time_one_rep`).
+# The quality floor that replaces it is a reward channel option in ppo.py
+# (--quality-floor), not a clamp on the cost channels.
+_PAIRED_REF: list = []
+_PAIRED_REF_DROPPED = [0]
+_PAIRED_REF_CAP = 65536
+
+# THE FLOOR UNDER log(temp). ``memory_analysis().temp_size_in_bytes`` is an
+# exact integer count of bytes and a plan whose gradient graph dead-code
+# elimination removed entirely reports EXACTLY 0 (job 63632: every sampled
+# NeuralNetwork plan with 5-11 skips), so log(temp) needs a floor. One byte
+# is the smallest non-zero value the instrument can report, so the floor
+# replaces only an exact 0 and never a measured value: it is not a cap
+# (Delta_mem stays unbounded below in the size of the reference, which the
+# owner ruled for -- no cap by default, ticket .9 Q37), and log(1 B) = 0
+# makes a zero-temp plan's Delta_mem read directly as -log(temp_ref in
+# bytes) -- "how many nats of temporaries the reference has". The
+# alternative, flooring at the reference's own temp, would zero the memory
+# channel for every zero-temp plan and HIDE the absorber's prize instead of
+# leaving it to the quality floor to price (finding 53: that pricing is
+# tau's and lambda's job, not the cost channel's). Latency needs no floor:
+# a measured latency is already clamped up to `_LAT_FLOOR_NS`, and 0.0
+# means "not measured" and stays 0.0 (see `paired_log_costs`). Every
+# floored reading is counted in the reference record (``mem_floored``).
+_MEM_LOG_FLOOR_BYTES = 1.0
 
 
 def _time_one_rep(ex, eval_args, unique_devices, inner):
@@ -3047,9 +2971,10 @@ def _time_one_rep(ex, eval_args, unique_devices, inner):
     inline loop this replaced).
 
     THIS IS THE SINGLE INSTRUMENT. Both the campaign measurement loop
-    (the number a plan is scored on) and the quality gate's exact-cost
-    floor (the number a destroyed plan is clamped to) call it, with the
-    same parameters, so the clamp compares like with like.
+    (the number a plan is scored on) and the paired rev-exact reference
+    (the number it is log-differenced against, ticket dsnn-3qm.9; until
+    2026-09-04 the quality gate's exact-cost floor) call it, with the
+    same parameters, so the pair compares like with like.
 
     It did not use to. Until 2026-08-26 the floor was timed by
     ``_measure_exec_cost`` -- median of 3 laps of 20 back-to-back
@@ -3163,8 +3088,10 @@ def _campaign_measure_cost(ex, eval_args_list, unique_devices,
     untimed executions per point, reduced by ``_aggregate_samples``
     (the same median the plan's own channels get).
 
-    Used for the quality gate's exact floor so the floor is, literally,
-    the number the campaign path would have printed for that plan.
+    Used for the paired rev-exact reference (ticket dsnn-3qm.9; the
+    quality gate's exact floor until 2026-09-04) so the reference is,
+    literally, the number the campaign path would have printed for that
+    plan.
     """
     _lat: list[float] = []
     _peak: list[float] = []
@@ -3197,349 +3124,140 @@ def _resolve_warmup(config) -> int:
     return _w
 
 
-def _instrument_label() -> str:
-    """Human-readable dump of the campaign instrument parameters the
-    gate floor was measured with. Printed with every floor and every
-    logged clamp: if a future edit re-forks the two measurement paths,
-    the parameters stop matching the run's own launcher flags and the
-    regression is visible in the log instead of silently worth -13%."""
-    _p = _QUALITY_GATE_STATS.get("instrument")
-    if not _p:
-        return "campaign (parameters not yet recorded)"
-    return ("campaign points={points} reps={reps} inner={inner} "
-            "warmup={warmup} agg=median".format(**_p))
+def _paired_log_delta(candidate: float, reference: float,
+                      floor: float) -> float:
+    """``log(max(candidate, floor)) - log(max(reference, floor))``."""
+    return (math.log(max(float(candidate), floor))
+            - math.log(max(float(reference), floor)))
 
 
-def _record_unclamped_latency(latency_ns: float) -> None:
-    """Bounded ring of the campaign latencies of terminal plans the gate
-    let through -- the denominator of the floor/plan ratio telemetry."""
-    if not (latency_ns > 0.0):
-        return
-    _ring = _QUALITY_GATE_STATS["unclamped"]
-    _ring.append(float(latency_ns))
-    if len(_ring) > 512:
-        del _ring[:-512]
+def paired_log_costs(latency_ns: float, peak_memory: float,
+                     ref_latency_ns: float, ref_memory: float
+                     ) -> tuple[float, float, int]:
+    """The two cost channels as PAIRED LOG-DIFFERENCES against rev-exact.
 
+    ``(Delta_lat, Delta_mem, n_floored)``. ``Delta_c = log cost_c(candidate)
+    - log cost_c(rev-exact)``: negative = the candidate is cheaper. The
+    caller stores both negated, like every cost slot, so a cheaper plan
+    scores above 0 and rev-exact scores exactly 0.
 
-def _order_floor(order_key, compile_fn, measure_fn, legacy_measure_fn=None):
-    """The quality gate's PER-ORDER exact floor: what this plan's own
-    elimination order costs done exactly, measured ONCE per
-    `order_key`.
-
-    `order_key` is the caller's exact-compile cache key, which already
-    digests (order, arg shapes/dtypes, device) -- the complete set of
-    things the exact executable's cost depends on. Approximation specs
-    are deliberately NOT in it: the exact executable ignores them, so
-    every plan that destroyed the SAME order shares one measurement
-    instead of paying a fresh compile+measure per clamp.
-
-    `measure_fn(ex)` must be the campaign instrument
-    (``_campaign_measure_cost`` bound to this run's eval args and
-    points/reps/inner/warmup). `legacy_measure_fn(ex)`, when given,
-    re-times the FIRST floor of the process with the pre-2026-08-26
-    3x20 protocol and prints both -- so every run records, in its own
-    conditions, how large the instrument gap it used to pay was.
+    Latency ``0.0`` means NOT MEASURED (``config.measure_latency`` off) and
+    passes through as 0.0 -- for the pair, since candidate and reference
+    are measured under one config. A measured latency is never 0: the
+    campaign path clamps it up to `_LAT_FLOOR_NS` first. Memory is
+    floored at `_MEM_LOG_FLOOR_BYTES` on BOTH sides (see the constant for
+    why one byte), and ``n_floored`` says how many of the two readings the
+    floor replaced.
     """
-    _hit = _ORDER_FLOOR_CACHE.get(order_key)
-    if _hit is not None:
-        return _hit
-    _ex = compile_fn()
-    _val = measure_fn(_ex)
-    if legacy_measure_fn is not None and not _FLOOR_AUDIT_DONE:
-        _FLOOR_AUDIT_DONE.append(1)
-        try:
-            _leg_l, _leg_m = legacy_measure_fn(_ex)
-            print(f"[measure] quality gate floor AUDIT: campaign "
-                  f"instrument {_val[0]/1e3:.1f}us vs legacy 3x20 "
-                  f"{_leg_l/1e3:.1f}us (legacy/campaign "
-                  f"{(_leg_l/_val[0]) if _val[0] else float('nan'):.3f}"
-                  f") | peak {_val[1]/1e6:.1f}MB vs {_leg_m/1e6:.1f}MB",
-                  flush=True)
-        except Exception as _aexc:
-            print(f"[measure] quality gate floor AUDIT skipped "
-                  f"({type(_aexc).__name__}: {str(_aexc)[:80]})",
-                  flush=True)
-    print(f"[measure] quality gate floor: order-key="
-          f"{order_key.hex()[:8] if isinstance(order_key, bytes) else order_key}"
-          f" lat={_val[0]/1e3:.1f}us peak={_val[1]/1e6:.1f}MB"
-          f" | instrument={_instrument_label()}", flush=True)
-    if len(_ORDER_FLOOR_CACHE) >= _ORDER_FLOOR_CACHE_MAX:
-        _ORDER_FLOOR_CACHE.clear()
-    _ORDER_FLOOR_CACHE[order_key] = _val
-    return _val
-
-
-def _measure_exec_cost(ex, base_args):
-    """LEGACY light protocol -- (latency_ns, peak_bytes) of a compiled
-    executable from 3 laps of 20 back-to-back executions.
-
-    NOT the instrument anything is scored with. It survives only as (a)
-    the last-resort fallback for the global rev reference when no
-    campaign eval args are available and (b) the comparison arm of the
-    one-shot floor audit, which prints how far it lands from the
-    campaign instrument. Timing a floor with this while the thing being
-    floored is timed by ``_time_one_rep`` is exactly the bug that paid
-    destruction -13% for the whole v57-v66 campaign; see
-    ``_time_one_rep``'s docstring before reaching for it.
-
-    (Original docstring: measured with the gate's own light protocol
-    (3x20 perf_counter, allocator-delta peak with static fallback).
-    Shared by the global rev reference and the per-order floor so the
-    clamp compares like with like -- true between the two REFERENCES,
-    false between the floor and the plan being floored.)
-    """
-    out = ex(*base_args)
-    jax.block_until_ready(out)
-    _devs = set()
-    for _l in jax.tree_util.tree_leaves(out):
-        try:
-            _devs |= set(_l.devices())
-        except Exception:
-            pass
-    _have = bool(_devs) and all(
-        (d.memory_stats() or {}).get("peak_bytes_in_use") is not None
-        for d in _devs)
-    for _ in range(3):
-        jax.block_until_ready(ex(*base_args))
-    _base = 0.0
-    if _have:
-        _base = sum(float((d.memory_stats() or {}).get(
-            "bytes_in_use", 0.0)) for d in _devs)
-        for d in _devs:
-            try:
-                d.client.clear_memory_stats()
-            except Exception:
-                pass
-    _laps = []
-    for _ in range(3):
-        _t0 = time.perf_counter()
-        for _ in range(20):
-            out = ex(*base_args)
-        jax.block_until_ready(out)
-        _laps.append((time.perf_counter() - _t0) / 20)
-    _lat = float(np.median(_laps) * 1e9)
-    if _have:
-        _peak = max(0.0, sum(float((d.memory_stats() or {}).get(
-            "peak_bytes_in_use", 0.0)) for d in _devs) - _base)
+    if latency_ns > 0.0 and ref_latency_ns > 0.0:
+        d_lat = _paired_log_delta(latency_ns, ref_latency_ns, _LAT_FLOOR_NS)
     else:
-        _peak = float(_memory_analysis_bytes(ex) or 0.0)
-    return _lat, _peak
+        d_lat = 0.0
+    n_floored = int(float(peak_memory) < _MEM_LOG_FLOOR_BYTES) + int(
+        float(ref_memory) < _MEM_LOG_FLOOR_BYTES)
+    d_mem = _paired_log_delta(peak_memory, ref_memory, _MEM_LOG_FLOOR_BYTES)
+    return float(d_lat), float(d_mem), n_floored
 
 
-def _exact_cost_reference(config, base_args, measure_fn=None):
-    """(latency_ns, peak_bytes) of the EXACT 'rev' plan -- the additive
-    quality gate's GLOBAL fallback floor, used only when the per-order
-    floor could not be built. Measured ONCE per process through the same
-    compile path (_compile_measure).
-
-    `measure_fn(ex) -> (latency_ns, peak_bytes)` is THE INSTRUMENT and
-    the campaign path passes its own (``_campaign_measure_cost`` bound
-    to this run's eval args / points / reps / inner-reps) so the
-    reference is timed exactly like the plans it floors. It defaults to
-    the legacy 3x20 protocol only for callers that have no campaign eval
-    args to hand -- which reintroduces the instrument mismatch, so the
-    fallback announces itself.
-    """
-    if "ref" in _COST_REF:
-        return _COST_REF["ref"]
-    _legacy = measure_fn is None
-    if _legacy:
-        def measure_fn(_ex):
-            return _measure_exec_cost(_ex, base_args)
+def _static_temp_bytes(compiled) -> float | None:
+    """``compiled.memory_analysis().temp_size_in_bytes`` -- the quantity
+    reward slot 5 holds under ``--mem-channel temp`` (ticket .49) -- or
+    None when the executable exposes no analysis."""
     try:
-        from graphax import jacve as _jacve
-        ex = _compile_measure(
-            jax.jit(
-                _jacve(config.target_fun, "rev",
-                       argnums=config.argnums, has_aux=config.has_aux,
-                       sparse_representation=config.sparse),
-                keep_unused=True,
-            ).lower(*base_args))
-        _lat, _peak = measure_fn(ex)
-        _COST_REF["ref"] = (_lat, _peak)
-        print(f"[measure] quality gate armed: exact-rev reference "
-              f"latency={_lat/1e3:.1f}us peak={_peak/1e6:.1f}MB "
-              f"(qmin={os.environ.get('ALPHAGRAD_QUALITY_GATE_MIN')}; "
-              f"instrument="
-              + ("LEGACY 3x20 -- NOT the campaign instrument, this "
-                 "reference under-reads by ~13%"
-                 if _legacy else _instrument_label()) + ")",
-              flush=True)
-    except Exception as _exc:
-        print(f"[measure] WARNING quality gate: exact-rev reference "
-              f"failed ({type(_exc).__name__}: {str(_exc)[:120]}) -- "
-              f"gate fails OPEN", flush=True)
-        _COST_REF["ref"] = None
-    return _COST_REF["ref"]
+        ma = compiled.memory_analysis()
+    except Exception:
+        return None
+    if ma is None:
+        return None
+    return float(getattr(ma, "temp_size_in_bytes", 0) or 0.0)
 
 
-def _apply_quality_gate(latency_ns, peak_memory, quality, is_terminal,
-                        has_quality, config, base_args,
-                        order_floor_fn=None, ref_measure_fn=None):
-    """ADDITIVE quality gate: below ALPHAGRAD_QUALITY_GATE_MIN the cost
-    channels are FLOORED at the exact-reverse reference -- destruction
-    pays what exact computation pays, so it gains nothing, while every
-    channel stays a plain additive term. Cost channels are PENALTIES:
-    scaling them toward zero would reward destruction, hence the clamp
-    form. No-op unless the env var is set, quality was actually
-    measured this step, and it fell below the threshold.
+def _record_paired_ref(rec: dict) -> None:
+    if len(_PAIRED_REF) >= _PAIRED_REF_CAP:
+        _PAIRED_REF_DROPPED[0] += 1
+        return
+    _PAIRED_REF.append(rec)
 
-    ``ALPHAGRAD_QUALITY_GATE_MIN`` unset or ``0`` disables the gate
-    entirely: no floor is measured, no compile is triggered, and both
-    cost channels pass through byte-identically.
 
-    THE FLOOR AND THE PLAN MUST SHARE AN INSTRUMENT. `order_floor_fn`
-    is expected to time the same-order exact executable with
-    ``_campaign_measure_cost`` at this run's own points/reps/inner-reps;
-    `ref_measure_fn` does the same for the global rev fallback. Timing
-    the floor with a throughput protocol while the plan is timed by the
-    campaign loop is what made the floor land 13-15% below an honest
-    exact plan for the whole v57-v66 campaign -- i.e. paid destruction a
-    bonus through the very mechanism meant to forbid it.
+def consume_paired_refs() -> dict:
+    """Pop this process's paired-reference records (see `_PAIRED_REF`).
+
+    ``{"records": [...], "dropped": int}``. Rides `consume_plan_records`,
+    like the memory-parity drain, because the reference is measured in the
+    process that measured the candidate -- the Ray measure actor under
+    --ray-measure -- and the trainer's own module globals never see it.
     """
-    try:
-        _qmin = float(os.environ.get(
-            "ALPHAGRAD_QUALITY_GATE_MIN", "0") or 0.0)
-    except ValueError:
-        _qmin = 0.0
-    if (_qmin <= 0.0 or not is_terminal or not has_quality
-            or float(quality) >= _qmin):
-        # Terminal plans the gate lets through are the denominator of
-        # the floor/plan ratio telemetry below: if the floor ever drifts
-        # away from what honest plans are charged, the ratio moves.
-        if is_terminal and has_quality and _qmin > 0.0:
-            _record_unclamped_latency(latency_ns)
-        return latency_ns, peak_memory
-    # Prefer the SAME-ORDER exact floor: a destroyed plan pays what its
-    # OWN order would cost done exactly, so destruction is strictly
-    # dominated at every fixed order while order search stays rewarded
-    # (the global rev reference under-floored: random orders measure
-    # ~500x above rev, so a clamped-to-rev SKIP still "won" latency).
-    _ref = None
-    _oom_floor_bytes = 0.0
-    if order_floor_fn is not None:
-        try:
-            _ref = order_floor_fn()
-        except Exception as _exc:
-            _m = str(_exc)
-            # A genuine allocation OOM on the per-order exact floor means
-            # this ORDER's honest cost is AT LEAST the failed allocation.
-            # Falling back to the tiny rev floor would mint a second-order
-            # cliff (destroy + pick an order whose exact plan cannot even
-            # compile -> cheapest floor in the pool); carry the requested
-            # bytes into the MEMORY floor instead.
-            import re as _re
-            _g = _re.search(
-                r"allocate ([0-9.]+)\s*([KMGT])iB", _m)
-            if _g:
-                _oom_floor_bytes = float(_g.group(1)) * {
-                    "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40,
-                }[_g.group(2)]
-            print(f"[measure] quality gate: per-order floor failed "
-                  f"({type(_exc).__name__}: {_m[:120]}) -- "
-                  f"falling back to the rev reference"
-                  + (f" + OOM mem floor "
-                     f"{_oom_floor_bytes/2**30:.1f}GiB"
-                     if _oom_floor_bytes else ""), flush=True)
-    if _ref is None:
-        _ref = _exact_cost_reference(config, base_args, ref_measure_fn)
-        if _ref is not None and _oom_floor_bytes > 0.0:
-            _ref = (_ref[0], max(_ref[1], _oom_floor_bytes))
-    if _ref is None:
-        return latency_ns, peak_memory
-    _rl, _rm = _ref
-    _QUALITY_GATE_STATS["clamps"] += 1
-    if _QUALITY_GATE_STATS["clamps"] == 1 \
-            or _QUALITY_GATE_STATS["clamps"] % 50 == 0:
-        # RATIO TELEMETRY: the floor against the median campaign latency
-        # of the terminal plans the gate did NOT clamp. Both numbers now
-        # come from the same instrument, so a healthy run prints a ratio
-        # near 1 for an exact-cost floor; a ratio that drifts below 1
-        # again means the two measurement paths have re-forked and
-        # destruction is being paid a bonus.
-        _ring = _QUALITY_GATE_STATS["unclamped"]
-        _med = float(np.median(_ring)) if _ring else 0.0
-        _ratio = (f"{_rl/_med:.3f}" if _med > 0.0 else "n/a")
-        print(f"[measure] quality gate CLAMP "
-              f"#{_QUALITY_GATE_STATS['clamps']}: q={float(quality):.4f}"
-              f" < {_qmin}; lat {latency_ns/1e3:.1f}->"
-              f"{max(latency_ns, _rl)/1e3:.1f}us"
-              f" | floor={_rl/1e3:.1f}us peak_floor={_rm/1e6:.1f}MB"
-              f" | floor/median-unclamped={_ratio} (n={len(_ring)})"
-              f" | instrument={_instrument_label()}", flush=True)
-    return max(latency_ns, _rl), max(peak_memory, _rm)
+    out = {"records": list(_PAIRED_REF), "dropped": int(_PAIRED_REF_DROPPED[0])}
+    _PAIRED_REF.clear()
+    _PAIRED_REF_DROPPED[0] = 0
+    return out
 
 
-def _quality_metrics(jac_exact, jac_approx):
+def paired_ref_summary(records) -> dict:
+    """Per-period reference numbers for the log dict, in POSITIVE units
+    (ticket .45): the mean rev-exact latency in ns and static temp bytes
+    (and watermark bytes), how many references were taken, and how many
+    memory readings (candidate or reference) the log floor replaced."""
+    _lat = [float(r["latency_ns"]) for r in records
+            if r.get("latency_ns") is not None and r["latency_ns"] > 0.0]
+    _tmp = [float(r["temp_bytes"]) for r in records
+            if r.get("temp_bytes") is not None]
+    _wm = [float(r["watermark_bytes"]) for r in records
+           if r.get("watermark_bytes") is not None]
+    return {
+        "n": int(len(records)),
+        "latency_ns": float(np.mean(_lat)) if _lat else float("nan"),
+        "temp_bytes": float(np.mean(_tmp)) if _tmp else float("nan"),
+        "watermark_bytes": float(np.mean(_wm)) if _wm else float("nan"),
+        "mem_floored": int(sum(int(r.get("mem_floored", 0)) for r in records)),
+    }
+
+
+def _quality_metrics(jac_exact, jac_approx, *, align: bool = False,
+                     site: str = "grad_cosine"):
     """`(cosine_sim, relative_frobenius)` of `jac_approx` against `jac_exact`.
 
-    Returns the WORST score `(0.0, 1.0)` when either side has no leaves,
-    mismatched shapes, or zero size. The old fallback returned (1.0, 0.0) —
-    "perfect" — which as a REWARD is a degeneracy backdoor: a plan that
-    destroys the Jacobian's shape (e.g. a terminal COMPRESS) out-scored every
-    honest approximation on all quality channels. A broken comparison is
-    evidence of a broken plan, so it must score as such.
+    Ticket dsnn-3qm.62: the two gradient pytrees are compared with EXACT
+    structure equality by ``_gradient_similarity`` -- a leaf count, logical
+    shape or layout mismatch RAISES ``GradientStructureMismatch``; a dead
+    path (None) is a zero gradient; an implicit (Reduce'd) dim is compared
+    analytically, never densified. The old silent ``(0.0, 1.0)`` clamp on a
+    shape mismatch is what hid finding 60 (an engine-induced axis
+    permutation read as quality 0.0 on every applied plan of the .41 sweep).
 
-    ``ALPHAGRAD_DEBUG_QUALITY=1`` enables a one-line diagnostic print
-    when cosine_sim collapses to ~0 with non-zero norms — used to
-    investigate the persistent ``reward_mean/cosine_sim=0`` we see
-    on the PPO dynamic-substeps path. The print fires only when the
-    formula would have produced a meaningful value but didn't.
+    ``align=True`` is the ANALYTIC JACOBIAN-COSINE path only (``jac_cosine``,
+    the full-Jacobian benchmarks): ``_align_jac`` transposes a 2-D block
+    back first and raises when the trees cannot be mapped.
+
+    Returns the WORST score `(0.0, 1.0)` only when the exact side has no
+    leaves or zero size (nothing to compare against; a broken reference, not
+    a broken plan).
+
+    ``ALPHAGRAD_DEBUG_QUALITY=1`` enables a one-line diagnostic print.
     """
-    # Layout-align the approx leaves to the exact layout (transpose-back) so
-    # cosine/frob compare the SAME entries, not a transposed-layout artifact.
-    jac_approx = _align_jac(jac_approx, jac_exact)
-    # PER-LEAF accumulation (2026-08-04). The old flatten+concatenate built a
-    # >=4GB flat copy of EACH side, and XLA's concatenate kernel faults with
-    # CUDA_ERROR_ILLEGAL_ADDRESS on >=2^31-byte operands once allocations sit
-    # high enough in the address space (residency-dependent: the identical
-    # concatenate passes in an empty process; reproduced with PLAIN EXACT
-    # leaves and fresh elementwise copies at nn256 batch 512 — the v45b
-    # measure-actor crash). Accumulating <e,a>, ||e||², ||a||², ||e-a||² per
-    # leaf is mathematically identical (same eps semantics as ``cossim``:
-    # each side clamped at sqrt(1e-7)) and never materializes the flats.
-    leaves_e = jax.tree_util.tree_leaves(jac_exact)
-    leaves_a = jax.tree_util.tree_leaves(jac_approx)
-    if not leaves_e or not leaves_a or len(leaves_e) != len(leaves_a):
+    if align:
+        jac_approx = _align_jac(jac_approx, jac_exact, site=site)
+    leaves_e = _gradient_leaves(jac_exact)
+    if not leaves_e or all(x is None for x in leaves_e):
         return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
-    if any(getattr(a, "shape", None) != getattr(e, "shape", None)
-           for a, e in zip(leaves_a, leaves_e)):
-        return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
-    _total = sum(int(getattr(e, "size", 0)) for e in leaves_e)
-    if _total == 0:
-        return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
-
     # Measure GPUs rotate but the exact reference is cached, so the two can
     # land on different devices -> jitted ops raise "Received incompatible
     # devices". Co-locate onto the reference's device (read-only, one transfer
     # only when they differ).
     try:
-        _ed = next(iter(leaves_e[0].devices()))
-        leaves_a = [
-            jax.device_put(a, _ed)
-            if next(iter(a.devices())) is not _ed else a
-            for a in leaves_a
-        ]
+        _ed = next(iter(next(x for x in leaves_e if x is not None
+                             and not _is_sparse_tensor(x)).devices()))
+        jac_approx = jax.tree_util.tree_map(
+            lambda a: (jax.device_put(a, _ed)
+                       if hasattr(a, "devices") and next(iter(a.devices())) is not _ed
+                       else a),
+            jac_approx)
     except Exception:
         pass
 
-    dot = ee = aa = rr = None
-    for e, a in zip(leaves_e, leaves_a):
-        # Promote per pair to at least f32 (bf16-Quant'd leaves square
-        # horribly in bf16); complex leaves promote to their complex type —
-        # the plain product (no conjugate) matches the old ``cossim``.
-        _cdt = jnp.promote_types(jnp.promote_types(e.dtype, a.dtype),
-                                 jnp.float32)
-        ef = jnp.ravel(e).astype(_cdt)
-        af = jnp.ravel(a).astype(_cdt)
-        _d = jnp.sum(ef * af)
-        _e2 = jnp.sum(jnp.abs(ef) ** 2)
-        _a2 = jnp.sum(jnp.abs(af) ** 2)
-        _r2 = jnp.sum(jnp.abs(ef - af) ** 2)
-        dot = _d if dot is None else dot + _d
-        ee = _e2 if ee is None else ee + _e2
-        aa = _a2 if aa is None else aa + _a2
-        rr = _r2 if rr is None else rr + _r2
+    dot, ee, aa, rr, _total = _gradient_similarity(jac_exact, jac_approx, site)
+    if _total == 0:
+        return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
     exact_norm = jnp.sqrt(ee)
     approx_norm = jnp.sqrt(aa)
     cos = dot / (jnp.maximum(exact_norm, jnp.sqrt(1e-7))
@@ -3548,23 +3266,47 @@ def _quality_metrics(jac_exact, jac_approx):
     # making the accumulated dot complex. Use the real part — matches the
     # reward path's existing real cast.
     cos = jnp.real(cos)
-    rel_frob = jnp.sqrt(rr) / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
+    rel_frob = jnp.sqrt(jnp.maximum(rr, 0.0)) / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
 
     if os.environ.get("ALPHAGRAD_DEBUG_QUALITY", "0") == "1":
-        approx_norm = float(approx_norm)
-        e_norm = float(exact_norm)
-        # Now that ``_callback`` only invokes ``_quality_metrics`` on
-        # the terminal step (partial-order zero-Jacobian case is
-        # short-circuited upstream), every line here represents a
-        # real terminal evaluation. ``flush=True`` because Ray actor
-        # stdout is line-buffered.
         print(
             f"[quality-debug] cos={float(cos):+.4f} frob={float(rel_frob):+.4f} "
-            f"||exact||={e_norm:.3g} ||approx||={approx_norm:.3g} "
+            f"||exact||={float(exact_norm):.3g} ||approx||={float(approx_norm):.3g} "
             f"size={_total}",
             flush=True,
         )
     return cos, rel_frob
+
+
+def _warn_cosine_is_now_grad_cosine() -> None:
+    """One-shot, loud: ``cosine`` no longer means the Jacobian cosine."""
+    if _COSINE_RENAME_WARNED:
+        return
+    _COSINE_RENAME_WARNED.append(1)
+    print(
+        "[measure] NOTE ALPHAGRAD_QUALITY_METRIC=cosine is DEPRECATED and its "
+        "MEANING HAS CHANGED: it now resolves to 'grad_cosine' (the gradient "
+        "cosine at init over ALPHAGRAD_GRAD_COSINE_K probe batches) for any "
+        "scalar-loss target, and to 'jac_cosine' (the legacy Jacobian cosine "
+        "at the calibration samples) only for the analytic AD benchmarks. "
+        "Ask for 'jac_cosine' explicitly to reproduce a pre-2026-08-28 run.",
+        flush=True,
+    )
+
+
+def _grad_cosine_k() -> int:
+    """How many probe batches the gradient cosine averages over.
+
+    K=1 is the default because it is the value that keeps the channel at
+    EXACTLY ONE exact execution per terminal plan -- the same reference count
+    the Jacobian cosine paid -- and because the bake-off found K>1 buys
+    essentially no extra correlation on this target.
+    """
+    try:
+        return max(1, int(os.environ.get("ALPHAGRAD_GRAD_COSINE_K", "1")))
+    except ValueError:
+        return 1
+
 
 
 # ---------------------------------------------------------------------------
@@ -3622,14 +3364,16 @@ def _quality_metrics(jac_exact, jac_approx):
 #     been measured -- is WEAK: 0.350 Pearson / 0.413 Spearman, worse than
 #     every cosine variant including the legacy one. It should stay LOGGED and
 #     should NOT be given a trained slot on this evidence.
-#   * loss_drop remains the `auto` default: its Pearson 0.885 is within noise
-#     of the K=1 gradient cosine's 0.874, but note it is WORSE on Spearman
-#     (0.765 vs 0.805) while costing 200x more. If the default is ever
-#     revisited, the gradient cosine is the cheaper equal -- that call is the
-#     owner's and is NOT made here.
+#   * loss_drop remained the `auto` default until 2026-09-02: its Pearson
+#     0.885 is within noise of the K=1 gradient cosine's 0.874, but note it is
+#     WORSE on Spearman (0.765 vs 0.805) while costing 200x more. The owner
+#     made the call on 2026-09-02 (ticket dsnn-3qm.39, finding 51: a plan can
+#     score 0.885 on loss_drop while its gradient points elsewhere): `auto` IS
+#     the gradient cosine for every scalar-loss target, and loss_drop is
+#     selectable by name only.
 #
-# So slot 6 now holds the LOSS DROP OF A SHORT ADAM WALK DRIVEN BY THE PLAN'S
-# OWN GRADIENT:
+# Under ALPHAGRAD_QUALITY_METRIC=loss_drop slot 6 holds the LOSS DROP OF A
+# SHORT ADAM WALK DRIVEN BY THE PLAN'S OWN GRADIENT:
 #
 #     L0      = loss(W0, probe)
 #     W_{t+1} = adam(W_t, plan_gradient(W_t, batch))     t = 0 .. T-1
@@ -3682,18 +3426,111 @@ def _grad_cosine_k() -> int:
 
 
 
+_GRAD_ORACLE_ENV = "ALPHAGRAD_GRAD_ORACLE"
+_GRAD_ORACLE_DONE: set = set()
+_GRAD_ORACLE_STATS = {"checks": 0, "rel_l2_max": 0.0}
+
+
+class GradientOracleFailure(RuntimeError):
+    """The exact gradient of an elimination order disagrees with ``jax.grad``
+    (oracle A, ticket dsnn-3qm.62). The run aborts: every quality number of
+    that order would be measured against a wrong reference."""
+
+
+def grad_oracle() -> str:
+    """``"reference"`` (default) or ``"off"``: whether the exact gradient of
+    every elimination order is checked ONCE per process against ``jax.grad``
+    before it serves as the quality reference (oracle A, owner Q6/Q21;
+    ``--grad-oracle`` on ppo.py and landscape_map, published as
+    ``ALPHAGRAD_GRAD_ORACLE`` so the measure actors read the same value)."""
+    want = os.environ.get(_GRAD_ORACLE_ENV, "reference").strip().lower()
+    if want not in ("reference", "off"):
+        raise ValueError(
+            f"{_GRAD_ORACLE_ENV}={want!r}: expected 'reference' or 'off'")
+    return want
+
+
+def _grad_oracle_check(config, compiled_exact, base_args, device, order_key,
+                       *, rel_tol: float = 1e-4):
+    """Oracle A: the SAME-ORDER exact gradient (the quality reference of this
+    callback) against ``jax.grad`` of the target on the real probe batch, once
+    per process and order. Densifying the exact output here is the oracle's
+    job, not the reward path's. Raises ``GradientOracleFailure`` when the
+    relative L2 distance exceeds ``rel_tol`` (float32 reduction order sits at
+    1e-7..1e-6; a wrong Jacobian sits at 1e-1..1)."""
+    if grad_oracle() == "off" or compiled_exact is None:
+        return
+    key = (tuple(int(v) for v in order_key), str(device))
+    if key in _GRAD_ORACLE_DONE:
+        return
+    # jax.grad needs a scalar loss and a real probe batch; the analytic
+    # Jacobian benchmarks have neither, and their grad-cosine is undefined
+    # anyway (the walk falls back to jac_cosine there).
+    if config.target_fun is None or not getattr(config, "scalar_target", False):
+        return
+    data = _probe_batch(config, base_args, role="train", index=0)
+    if data is None:
+        return
+    a = list(base_args)
+    if data is not None:
+        for slot in range(min(2, len(data))):
+            a[slot] = jax.device_put(jnp.asarray(data[slot]), device)
+    out = compiled_exact(*a)
+    jac_e = out[1] if config.has_aux else out
+    leaves = _gradient_leaves(jac_e)
+    ref = jax.grad(config.target_fun, argnums=config.argnums,
+                   has_aux=config.has_aux)(*a)
+    ref = ref[0] if config.has_aux else ref
+    ref_leaves = jax.tree_util.tree_leaves(ref)
+    if len(leaves) != len(ref_leaves):
+        raise GradientOracleFailure(
+            f"[grad-oracle] order {key[0][:6]}...: {len(leaves)} exact "
+            f"gradient leaves against {len(ref_leaves)} from jax.grad")
+    num = den = 0.0
+    for i, (e, r) in enumerate(zip(leaves, ref_leaves)):
+        if e is None:
+            raise GradientOracleFailure(
+                f"[grad-oracle] order {key[0][:6]}...: exact leaf {i} is a "
+                f"dead path")
+        e_arr = e.dense() if _is_sparse_tensor(e) else e
+        e_np = np.asarray(e_arr, dtype=np.float64)
+        r_np = np.asarray(r, dtype=np.float64)
+        if e_np.shape != r_np.shape:
+            raise GradientOracleFailure(
+                f"[grad-oracle] order {key[0][:6]}...: exact leaf {i} has "
+                f"shape {e_np.shape}, jax.grad {r_np.shape}")
+        num += float(np.sum((e_np - r_np) ** 2))
+        den += float(np.sum(r_np ** 2))
+    rel = math.sqrt(num) / max(math.sqrt(den), 1e-30)
+    _GRAD_ORACLE_STATS["checks"] += 1
+    _GRAD_ORACLE_STATS["rel_l2_max"] = max(_GRAD_ORACLE_STATS["rel_l2_max"], rel)
+    print(f"[grad-oracle] order {key[0][:6]}... on {device}: exact gradient "
+          f"vs jax.grad rel_l2={rel:.3e} ({len(leaves)} leaves)", flush=True)
+    if not (rel <= rel_tol):
+        raise GradientOracleFailure(
+            f"[grad-oracle] order {key[0][:6]}... on {device}: the exact "
+            f"gradient differs from jax.grad by rel_l2={rel:.3e} > {rel_tol}; "
+            f"the quality reference of this order is wrong -- abort")
+    _GRAD_ORACLE_DONE.add(key)
+
+
 def quality_metric(config=None) -> str:
-    """``"loss_drop"`` or ``"cosine"`` — WHICH quantity reward slot 6 holds.
+    """``"grad_cosine"``, ``"jac_cosine"``, ``"loss_drop"`` or ``"none"`` —
+    WHICH quantity reward slot 6 holds.
 
     ``ALPHAGRAD_QUALITY_METRIC`` selects it; the default ``auto`` resolves to
-    ``loss_drop`` whenever the measured graph IS a scalar loss, which is now a
-    FACT READ OFF THE TRACED JAXPR (``EnvConfig.scalar_target``, set by
-    ``from_jaxpr`` from the target's output avals) rather than a flag. Every
-    trainable example is model + loss, so ``auto`` is ``loss_drop`` for all of
-    them; it falls back to the legacy ``cosine`` only for the analytic AD
+    ``grad_cosine`` (owner ruling 2026-09-02, ticket dsnn-3qm.39: the cosine
+    between the plan's gradient and the rev-exact gradient on the same probe
+    batch) whenever the measured graph IS a scalar loss, which is a FACT READ
+    OFF THE TRACED JAXPR (``EnvConfig.scalar_target``, set by ``from_jaxpr``
+    from the target's output avals) rather than a flag. Every trainable
+    example is model + loss, so ``auto`` is ``grad_cosine`` for all of them;
+    it falls back to the legacy ``jac_cosine`` only for the analytic AD
     benchmarks (Helmholtz / RoeFlux / Lighthouse / RobotArm / BlackScholes /
-    Simple), whose target is a full Jacobian and for which an Adam walk on
-    "the loss" is not defined. Read identically by the
+    Simple), whose target is a full Jacobian and which have no loss and no
+    data generator. ``loss_drop`` (the 200-step Adam walk) stays selectable
+    BY NAME and is never the default: finding 51 shows a plan scoring 0.885
+    on loss_drop while its gradient points elsewhere. Read identically by the
     trainer and by every CpuApproximationActor — both run THIS function inside
     THIS module's ``_callback``, so the two paths cannot disagree.
     """
@@ -3732,10 +3569,9 @@ def quality_metric(config=None) -> str:
     # overhead, vs 100 executions for the whole latency channel).
     #
     # The COST channels are untouched by this: with no quality sample
-    # ``cosines`` stays empty, so ``_apply_quality_gate`` is handed
-    # has_quality=False and returns its inputs unchanged -- latency_ns and
-    # peak_memory are bit-identical to a run that computed the walk and threw
-    # the number away.
+    # ``cosines`` stays empty and nothing downstream reads it into the cost
+    # slots -- latency_ns and peak_memory are bit-identical to a run that
+    # computed the walk and threw the number away.
     if want in ("none", "off", "skip"):
         return "none"
     if want not in ("auto", ""):
@@ -3743,7 +3579,7 @@ def quality_metric(config=None) -> str:
             f"{_QUALITY_METRIC_ENV} must be one of "
             f"auto/loss_drop/grad_cosine/jac_cosine/cosine/none, got {want!r}"
         )
-    return ("loss_drop" if bool(getattr(config, "scalar_target", False))
+    return ("grad_cosine" if bool(getattr(config, "scalar_target", False))
             else "jac_cosine")
 
 
@@ -3799,7 +3635,7 @@ def _walk_probe_seed() -> int:
 # Ray measure actor are SEPARATE PROCESSES with separate ``_PROBE_BATCH``
 # dicts, so the rotation index must be readable by both without new plumbing --
 # the same "one env var, read by one module, by both sides" discipline the rest
-# of the measurement configuration uses (``ppo.configure_grad_coverage``,
+# of the measurement configuration uses (``ppo.configure_fidelity``,
 # ``masks.set_diag_per_face``).
 #
 # CAVEAT, RAISED BY A3 AND CLOSED BY A2: Ray workers inherit the driver's
@@ -4252,8 +4088,8 @@ _MEM_FALLBACK_WARNED: list = []
 # One-shot warning flag for an undefinable loss-drop walk (see _callback).
 _WALK_UNDEFINED_WARNED: list = []
 # One-shot warning when the EXACT reference gradient cannot be built (see the
-# fail-soft branch of the coverage block in `_callback`).
-_GRAD_COV_REF_WARNED: list = []
+# fail-soft branch of the fidelity block in `_callback`).
+_FID_REF_WARNED: list = []
 # One-shot flag for the walk's starting-point fingerprint line.
 _WALK_FINGERPRINT: list = []
 # ...and a COUNT, because the latch alone means a run can silently change what
@@ -4285,7 +4121,8 @@ def consume_static_peak_fallbacks() -> int:
 
 
 # ---------------------------------------------------------------------------
-# MEMORY PARITY (ALPHAGRAD_MEM_PARITY=1, default on; 0 disables).
+# MEMORY PARITY (always on since ticket dsnn-3qm.49; the ALPHAGRAD_MEM_PARITY
+# switch is gone -- the record is what the watermark is LOGGED through).
 #
 # Two different quantities have been called "the" memory cost of a plan:
 #
@@ -4303,30 +4140,130 @@ def consume_static_peak_fallbacks() -> int:
 # from a silent in-place substitution into an explicit field of the record.
 # ---------------------------------------------------------------------------
 _MEM_PARITY: list = []
-_MEM_PARITY_ON = os.environ.get("ALPHAGRAD_MEM_PARITY", "1") != "0"
+# Measurements this process completed since the last drain, and records
+# the ring refused past the cap. ``records + dropped == measured`` is the
+# invariant `check_mem_parity_complete` asserts in every measuring process
+# (ticket dsnn-3qm.49, folded from .32): a measured plan without a parity
+# record means the watermark was never logged beside the channel.
+_MEM_PARITY_MEASURED = [0]
+_MEM_PARITY_DROPPED = [0]
+_MEM_PARITY_CAP = 65536
+
+# THE MEMORY CHANNEL (ticket dsnn-3qm.49, ruling .29). What reward slot 5
+# (``peak_memory``, stored negated) HOLDS:
+#   temp       the plan's own compiled executable's XLA static temp bytes
+#              (``compiled.memory_analysis().temp_size_in_bytes``) -- the
+#              default. Finding 41: on TLM the runtime watermark is
+#              temp + 2.104 MB with R^2 = 1.000000, so temp carries the
+#              same ranking with 8x the relative dynamic range and no
+#              allocator quantum; finding 49: the watermark channel read
+#              sigma = 0 over 16,192 wave-1 plans.
+#   watermark  the runtime ``peak_bytes_in_use`` delta over the timed
+#              window (the pre-.49 channel; on a backend without allocator
+#              statistics the in-place static substitution of
+#              ``_note_static_peak_fallback``). Kept for the flag-off
+#              bit-identity gate (ALPHAGRAD_EQ_DUMP).
+# Under both the OTHER quantity is recorded beside it by `_record_mem_parity`
+# and drained through `consume_mem_parity`. Published by ppo.py from
+# --mem-channel before ray.init, exactly like ALPHAGRAD_APPROX_OLD: the
+# flag is the only user surface, the variable is the transport to the Ray
+# measure actors, and this function is the one reader.
+_MEM_CHANNEL_ENV = "ALPHAGRAD_MEM_CHANNEL"
+MEM_CHANNEL_CHOICES = ("temp", "watermark")
+
+
+def mem_channel() -> str:
+    """``"temp"`` or ``"watermark"`` -- WHICH quantity reward slot 5 holds.
+
+    Absent (a process not started through ppo.py) means the declared
+    default ``temp``. Anything else is a hand edit, not a fallback.
+    """
+    want = os.environ.get(_MEM_CHANNEL_ENV, "temp").strip().lower()
+    if want not in MEM_CHANNEL_CHOICES:
+        raise ValueError(
+            f"{_MEM_CHANNEL_ENV} must be one of {MEM_CHANNEL_CHOICES} (set "
+            f"by ppo.py from --mem-channel), got {want!r}")
+    return want
+
+
+# THE COST FORM (ticket dsnn-3qm.9). HOW reward slots 2 (latency_ns) and 5
+# (peak_memory) are expressed:
+#   absolute    the measured number, stored negated -- the pre-.9 form, kept
+#               for the flag-off bit-identity gate (ALPHAGRAD_EQ_DUMP).
+#   paired-log  the log-difference against rev-exact measured PAIRED in the
+#               same callback (see `_PAIRED_REF`): ``-(log cost(candidate) -
+#               log cost(rev-exact))``, so rev-exact scores 0 and a cheaper
+#               plan scores above 0. The campaign form (ppo.py --cost-form
+#               defaults to it).
+# Same transport as --mem-channel: ppo.py publishes the flag before ray.init,
+# the Ray measure actors read it through this one function. ABSENT means
+# ``absolute``, unlike `mem_channel`: the paired form costs a second compile
+# and a second measurement per terminal plan and changes what two slots MEAN,
+# so a process that was not started through ppo.py (a test module, the other
+# drivers, landscape_map -- which takes its own ratios from absolute numbers)
+# never gets it implicitly.
+_COST_FORM_ENV = "ALPHAGRAD_COST_FORM"
+COST_FORM_CHOICES = ("absolute", "paired-log")
+
+
+def cost_form() -> str:
+    """``"absolute"`` or ``"paired-log"`` -- HOW slots 2 and 5 are expressed.
+
+    Absent means ``absolute`` (see the block above for why this default
+    differs from `mem_channel`'s). Anything else is a hand edit.
+    """
+    want = os.environ.get(_COST_FORM_ENV, "absolute").strip().lower()
+    if want not in COST_FORM_CHOICES:
+        raise ValueError(
+            f"{_COST_FORM_ENV} must be one of {COST_FORM_CHOICES} (set by "
+            f"ppo.py from --cost-form), got {want!r}")
+    return want
+
+
+def check_mem_parity_complete(mp: dict, where: str) -> None:
+    """Assert every measured plan left a parity record (records + dropped
+    == measured). Called in the process that measured -- the actor under
+    --ray-measure -- and again by the trainer on the merged totals."""
+    _n = len(mp.get("records", ()))
+    _d = int(mp.get("dropped", 0))
+    _m = int(mp.get("measured", 0))
+    if _n + _d != _m:
+        raise MemChannelFault(
+            f"memory parity {where}: {_m} plans were measured but "
+            f"{_n} parity records (+{_d} dropped at the cap) exist -- the "
+            f"runtime watermark was not logged beside the channel for "
+            f"{_m - _n - _d} plan(s)")
 
 
 def _record_mem_parity(compiled, runtime_peak, source: str,
-                       is_terminal: bool) -> None:
-    """One (static, runtime, source) triple per measurement."""
-    if not _MEM_PARITY_ON or compiled is None:
-        return
+                       is_terminal: bool) -> dict | None:
+    """One (static, runtime, source) triple per measurement.
+
+    Returns the record (the channel reads ``static_temp_bytes`` off it),
+    or None when there is no executable to analyse.
+    """
+    if compiled is None:
+        return None
     _t0 = time.perf_counter()
     try:
         ma = compiled.memory_analysis()
     except Exception:
         ma = None
     if ma is None:
-        _st = _so = None
+        _st = _so = _sa = None
     else:
         _st = float(getattr(ma, "temp_size_in_bytes", 0) or 0.0)
         _so = float(getattr(ma, "output_size_in_bytes", 0) or 0.0)
+        _sa = float(getattr(ma, "argument_size_in_bytes", 0) or 0.0)
     rec = {
         "static_temp_bytes": _st,
         "static_output_bytes": _so,
+        "static_argument_bytes": _sa,
         "static_total_bytes": None if _st is None else _st + _so,
         "runtime_peak_bytes": (None if runtime_peak is None
                                else float(runtime_peak)),
+        # WHICH of the two the reward slot took (see `mem_channel`).
+        "channel": mem_channel(),
         # "runtime_delta"   the reward's peak_memory IS the measured delta;
         # "static_fallback" allocator stats were unavailable and the STATIC
         #                   estimate was substituted in place (a different
@@ -4336,7 +4273,10 @@ def _record_mem_parity(compiled, runtime_peak, source: str,
         "peak_source": source,
         "terminal": bool(is_terminal),
     }
-    _MEM_PARITY.append(rec)
+    if len(_MEM_PARITY) >= _MEM_PARITY_CAP:
+        _MEM_PARITY_DROPPED[0] += 1
+    else:
+        _MEM_PARITY.append(rec)
     _prof_add("cb.mem_parity", time.perf_counter() - _t0)
     if os.environ.get("ALPHAGRAD_DEBUG_MEASURE", "0") == "1":
         _s, _r = rec["static_total_bytes"], rec["runtime_peak_bytes"]
@@ -4344,13 +4284,60 @@ def _record_mem_parity(compiled, runtime_peak, source: str,
         print(f"[mem-parity] static(temp+out)={_s} runtime_peak={_r} "
               f"runtime/static={_f} source={source} "
               f"terminal={bool(is_terminal)}", flush=True)
+    return rec
 
 
-def consume_mem_parity() -> list:
-    """Pop the per-period memory-parity records (see ``_record_mem_parity``)."""
-    out = list(_MEM_PARITY)
+def consume_mem_parity() -> dict:
+    """Pop the per-period memory-parity records (see ``_record_mem_parity``).
+
+    ``{"records": [...], "measured": int, "dropped": int}`` -- the counts
+    are what `check_mem_parity_complete` compares. Drained in the process
+    that measured: it rides `consume_plan_records`, which the Ray measure
+    actors already hand to the trainer (the ticket-07 trap: a counter the
+    actor wrote is invisible in the trainer's own module globals).
+    """
+    out = {"records": list(_MEM_PARITY),
+           "measured": int(_MEM_PARITY_MEASURED[0]),
+           "dropped": int(_MEM_PARITY_DROPPED[0])}
     _MEM_PARITY.clear()
+    _MEM_PARITY_MEASURED[0] = 0
+    _MEM_PARITY_DROPPED[0] = 0
     return out
+
+
+def mem_parity_summary(records) -> dict:
+    """Per-period numbers for the log dict (ticket .45 names them): the mean
+    and the worst (largest and smallest) ``watermark - temp`` in bytes over
+    the records that carry both, the two means, and how many records took
+    the static substitution instead of a runtime watermark."""
+    _gaps = []
+    _temps = []
+    _marks = []
+    _fallbacks = 0
+    for _r in records:
+        _t = _r.get("static_temp_bytes")
+        _w = _r.get("runtime_peak_bytes")
+        if _r.get("peak_source") == "static_fallback":
+            _fallbacks += 1
+        if _t is not None:
+            _temps.append(float(_t))
+        if _w is not None:
+            _marks.append(float(_w))
+        if _t is not None and _w is not None:
+            _gaps.append(float(_w) - float(_t))
+    _g = np.asarray(_gaps, dtype=np.float64)
+    return {
+        "n": int(len(records)),
+        "n_paired": int(_g.size),
+        "gap_mean_bytes": float(_g.mean()) if _g.size else float("nan"),
+        "gap_max_bytes": float(_g.max()) if _g.size else float("nan"),
+        "gap_min_bytes": float(_g.min()) if _g.size else float("nan"),
+        "temp_mean_bytes": (float(np.mean(_temps)) if _temps
+                            else float("nan")),
+        "watermark_mean_bytes": (float(np.mean(_marks)) if _marks
+                                 else float("nan")),
+        "static_fallbacks": int(_fallbacks),
+    }
 
 
 def _cb_slot(x, i, E):
@@ -4538,14 +4525,46 @@ def decode_vertex_rule_specs(jaxpr, vertex, spec_rows) -> tuple:
     rows are silently skipped — same best-effort semantics the measurement
     has always had.
     """
+    frame = vertex_frame(jaxpr, vertex)
+    if frame is None:
+        return ()
+    return decode_rule_specs_in_frame(frame[0], frame[1], spec_rows)
+
+
+def vertex_frame(jaxpr, vertex):
+    """``(out_shape, primal_shapes)`` of the eliminated vertex's OWN equation.
+
+    The frame the per-vertex wire rows are decoded in -- and, of a face's
+    three slots, the frame of ``lhs`` only (d central / d in_edge). ``None``
+    when the vertex has no decodable output or no non-literal input.
+    """
     eqn = jaxpr.eqns[vertex - 1]
     if not eqn.outvars or not hasattr(eqn.outvars[0], "aval"):
-        return ()
+        return None
     out_shape = eqn.outvars[0].aval.shape
-    out_len = len(out_shape)
     primal_shapes = [iv.aval.shape for iv in eqn.invars if hasattr(iv, "aval")]
     if not primal_shapes:
-        return ()  # no non-literal inputs → no edges to transform
+        return None  # no non-literal inputs → no edges to transform
+    return out_shape, primal_shapes
+
+
+def slot_frame(st):
+    """``(out_shape, [primal_shape])`` of ONE live face-slot tensor, in
+    LOGICAL sizes (``Index.logical_size``, the numbering ``Diag(i, j)``,
+    ``dim_logical_sizes`` and ``rule_is_legal`` share). Ticket .18, D2: the
+    frame a slot's wire row is decoded in is the tensor the slot is handed,
+    not the vertex's equation."""
+    return (tuple(int(d.logical_size) for d in st.out_dims),
+            [tuple(int(d.logical_size) for d in st.primal_dims)])
+
+
+def decode_rule_specs_in_frame(out_shape, primal_shapes, spec_rows) -> tuple:
+    """The wire -> transform decode of :func:`decode_vertex_rule_specs` in an
+    EXPLICIT frame: ``Diag.j = len(out_shape) + bi2`` and a Reduce axis must
+    lie in ``out_shape ++ primal_shape`` of THIS frame. One decoder, two
+    frames: :func:`decode_vertex_rule_specs` calls it on the vertex frame,
+    :func:`make_slot_frame_hook` on each slot's own (:func:`slot_frame`)."""
+    out_len = len(out_shape)
 
     rules: list = []  # mixed list[Diag | Compress | Quant]
     used_axes: set[int] = set()
@@ -4641,11 +4660,214 @@ def decode_vertex_rule_specs(jaxpr, vertex, spec_rows) -> tuple:
     return tuple(rules)
 
 
-# #72: apply a face's `new`-slot approximation to the EXISTING EDGE at the
-# join as well as to the contraction result, so compute is saved on both
-# operands of the add. Set 0 to restore the contraction-only behaviour --
-# the two are NOT comparable, since this changes the measured object.
-_NEW_SLOT_JOIN = os.environ.get("ALPHAGRAD_NEW_SLOT_JOIN", "1") != "0"
+def slot_rules_for_row(st, one_row) -> tuple:
+    """The rules :func:`make_slot_frame_hook` WOULD apply to ``st`` for the
+    wire row ``one_row`` -- the decode in this tensor's own frame
+    (:func:`slot_frame`) plus ticket .20's logical-dim -> physical-axis
+    conversion for COMPRESS.
+
+    Module-level and used by BOTH the hook and ``masks.slot_legality``, so the
+    mask asks the row the same question the engine will: one decoder, one
+    conversion, per tensor. The mask needs it per TENSOR because a slot's hook
+    is installed at several graphax sites (:func:`face_slot_sites`) and the
+    same row decodes differently in each site's frame.
+    """
+    from alphagrad.approx.common.masks import (
+        compress_rules_to_physical, reduce_axes_physical)
+    from alphagrad.approx.common.plan_log import kind_of_slot
+
+    row = tuple(int(x) for x in one_row)
+    spec_rows = [list(row)] + [[-1, -1, 0]] * (MAX_RULES_PER_VERTEX - 1)
+    out_shape, primal_shapes = slot_frame(st)
+    rules = decode_rule_specs_in_frame(out_shape, primal_shapes, spec_rows)
+    physical = (kind_of_slot(row[0], COMPRESS_SENTINEL, QUANT_SENTINEL)
+                == "compress" and reduce_axes_physical())
+    if physical and rules:
+        rules = compress_rules_to_physical(st, rules)
+    return rules
+
+
+def make_slot_frame_hook(one_row, *, stats: dict | None = None,
+                         gated: bool = False):
+    """ONE face slot's hook under ``--face-slot-frames slot`` (ticket .18, D2).
+
+    Decodes the slot's wire row ``(b0, b1, b2)`` at APPLY time, in the frame
+    of the live tensor graphax hands the slot (:func:`slot_frame`), then
+    applies through :func:`make_live_masked_hook` -- same legality, same
+    projection, same ``applied`` / ``skipped`` counters. A row that names no
+    dim of this slot (a Diag on a slot with no out side, a Reduce axis past
+    the slot's rank) is counted ``skipped_<kind>`` like any other miss:
+    ``requested`` is read off the wire, so leaving it uncounted would inflate
+    ``applied_fraction``.
+
+    The decode is memoised per frame, so the tokenizer's replay of the same
+    hook on the same shapes decodes once. ``hook.rules_for(st)`` exposes the
+    decoded rules for a tensor (tests, .59's apply-rate audit).
+    """
+    from alphagrad.approx.common.masks import (
+        face_counts_armed, make_live_masked_hook, reduce_axes_physical,
+        reduce_axis_spaces)
+    from alphagrad.approx.common.plan_log import kind_of_slot
+
+    row = tuple(int(x) for x in one_row)
+    kind = kind_of_slot(row[0], COMPRESS_SENTINEL, QUANT_SENTINEL)
+    cache: dict = {}
+
+    def _decoded(st):
+        out_shape, primal_shapes = slot_frame(st)
+        # --reduce-axis-space physical (ticket .20): the wire token is a
+        # LOGICAL dim of this slot's tensor; the rule handed to the hook
+        # names the PHYSICAL axis that dim is stored in, so the memo key
+        # carries the storage layout, not only the logical frame.
+        physical = kind == "compress" and reduce_axes_physical()
+        key = (out_shape, primal_shapes[0],
+               reduce_axis_spaces(st).phys_of_dim if physical else None)
+        hit = cache.get(key)
+        if hit is None:
+            rules = slot_rules_for_row(st, row)
+            inner = (make_live_masked_hook(rules, stats=stats, gated=gated)
+                     if rules else None)
+            hit = cache[key] = (rules, inner)
+        return hit
+
+    def _hook(st):
+        _rules, inner = _decoded(st)
+        if inner is None:
+            if (kind is not None and stats is not None
+                    and (not gated or face_counts_armed())):
+                stats["skipped"] = stats.get("skipped", 0) + 1
+                stats[f"skipped_{kind}"] = stats.get(f"skipped_{kind}", 0) + 1
+            return st
+        return inner(st)
+
+    _hook.rules_for = lambda st: _decoded(st)[0]
+    return _hook
+
+
+# #72 / ticket .56 -- THE OLD EDGE. A face accumulation multiplies lhs by
+# rhs into `new` and adds `new` onto the existing predecessor-to-successor
+# edge (the OLD edge) when that edge exists. ``--approx-old`` says what the
+# old edge gets:
+#   same  -- the SAME approximation as `new` (the two-op face form with the
+#            new-slot hook in graphax's `jr`), so both operands of the add
+#            carry one structure and the add stays elementwise cheap. The
+#            declared default.
+#   exact -- the old edge is left exact (the bare 3-tuple; graphax never
+#            reaches the join hooks). It already holds the sum of
+#            approximated and exact contributions from earlier accumulations.
+# The two are NOT comparable, since the choice changes the measured object.
+# ppo.py publishes the flag as ALPHAGRAD_APPROX_OLD before ray.init -- one
+# hand-off variable, one reader, the same shape as ALPHAGRAD_QUALITY_METRIC --
+# so the trainer and every measure actor resolve the SAME configuration and
+# the plan log records what actually ran. Read at call time, never at import.
+_APPROX_OLD_ENV = "ALPHAGRAD_APPROX_OLD"
+APPROX_OLD_CHOICES = ("same", "exact")
+
+
+def approx_old() -> str:
+    """``"same"`` or ``"exact"`` -- what the OLD edge gets at a face's join.
+
+    The user surface is ``ppo.py --approx-old``; unset means the declared
+    default ``same``. Anything else is a programming error, not a fallback.
+    """
+    want = os.environ.get(_APPROX_OLD_ENV, "same").strip().lower()
+    if want not in APPROX_OLD_CHOICES:
+        raise ValueError(
+            f"{_APPROX_OLD_ENV} must be one of {APPROX_OLD_CHOICES} (set by "
+            f"ppo.py from --approx-old), got {want!r}")
+    return want
+
+
+def face_entry_from_slots(slots, at_site=None):
+    """ONE face's ``face_transforms`` entry from its decoded per-slot hooks
+    ``(lhs, rhs, new)`` -- the ONLY place a face wire becomes a graphax
+    entry (ticket .17, D1). ``_face_dict_for_vertex`` (the measurement),
+    ``live_faces.LiveFaceStream._decided`` (the head's tokens),
+    ``plan_tokens.PlanTokenizer.face_transforms`` (the AZ tokens) and
+    ``masks.LiveVertexMaskOracle._face_ft`` (the mask replay) all go through
+    here, so one wire has one transform semantics and ``approx_old()`` has
+    one reader.
+
+    #72. A bare 3-tuple means CONTRACTION ONLY to graphax
+    (_normalize_perpath, core.py:797): pre/post hit the two
+    contraction operands and `new` the contraction RESULT, while
+    the join hooks stay None. The requested semantics is that a
+    `new`-slot approximation ALSO applies to the existing edge
+    this result is added to, so compute is saved on both
+    operands of the join.
+
+    graphax already wires that: `_h_rhs` is applied to `_edge`
+    -- the existing edge -- immediately before the add
+    (core.py:1679). So emit the TWO-OP form and put the new-slot
+    hook in `rhs`.
+
+    `lhs` stays None on purpose: `new` has already transformed
+    the contraction result at core.py:1657, and `lhs` hits that
+    SAME tensor at 1678, so setting it would apply the
+    approximation twice. `res` (the summed edge) is a decision
+    the head does not make.
+
+    Faces with no existing edge are unaffected -- graphax simply
+    never reaches the join hooks for them.
+
+    --approx-old exact leaves the old edge alone: the bare 3-tuple
+    is emitted and graphax never reaches the join hooks.
+
+    ``at_site(site, hook)`` -- OPTIONAL per-SITE adapter, and the reason this
+    function takes one at all: a slot's ONE hook object is installed at more
+    than one graphax site (``new`` AND ``jr`` under ``same``; ``jres`` alone
+    under ``exact``), so graphax invokes it on more than one TENSOR. A caller
+    that has to tell those tensors apart -- the legality probe, which needs
+    one mask per tensor the hook will meet -- cannot do it from the entry,
+    because the object is identical at every position. ``at_site`` is called
+    once per placement with the site name and returns the object to place
+    there. Default: the hook itself everywhere, which is what the measurement
+    installs. The site names are graphax's own (:func:`graphax.core.
+    _unpack_face_slots`), prefixed ``res:`` for the four result sites.
+
+    SITE NAMES ARE NOT DECORATION. ``_probe_faces`` builds its recording entry
+    through THIS function precisely so the set of sites it records can never
+    drift from the set the measurement installs -- the drift that made the
+    ``new`` slot's mask clear Diags the engine refused on the old edge
+    (finding 72, ticket .59 fault 1).
+    """
+    def _at(site, hook):
+        if hook is None or at_site is None:
+            return hook
+        return at_site(site, hook)
+
+    _new_hook = slots[2] if len(slots) > 2 else None
+    if _new_hook is not None and approx_old() == "same":
+        core3 = (_at("lhs", slots[0]), _at("rhs", slots[1]),
+                 _at("res:new", _new_hook))
+        return (core3, (None, _at("res:jr", _new_hook), None))
+    if at_site is None:
+        return tuple(slots)
+    # The BARE triple's third position is graphax's POST-JOIN ``jres``, not
+    # ``new`` (_unpack_face_slots): a different tensor again, so it gets its
+    # own site name.
+    return (_at("lhs", slots[0]), _at("rhs", slots[1]),
+            _at("res:jres", _new_hook) if len(slots) > 2 else None)
+
+
+def face_slot_sites() -> tuple[tuple[str, ...], ...]:
+    """Per slot ``(lhs, rhs, new)``, the graphax SITES
+    :func:`face_entry_from_slots` places that slot's single hook at, under the
+    CURRENT :func:`approx_old`. The FIRST entry is the site the per-slot mask
+    is named for; the rest are the extra tensors the same wire row also lands
+    on, which the mask has to be intersected over.
+
+    DERIVED by calling the entry builder itself with tagging probes rather
+    than restated, so the two cannot drift.
+    """
+    got: list[list[str]] = [[], [], []]
+
+    def _tag(site, hook):
+        got[int(hook)].append(site)
+        return hook
+
+    face_entry_from_slots((0, 1, 2), at_site=_tag)
+    return tuple(tuple(g) for g in got)
 
 
 def _face_dict_for_vertex(config, ij, v, face_row, face_skip):
@@ -4656,8 +4878,6 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip):
     which rides the tokenizer's own IncrementalJaxpr instead of replaying a
     second, byte-identical elimination."""
     from graphax import SKIP_FACE, faces_of
-    from alphagrad.approx.common.masks import make_live_masked_hook
-
     keys = faces_of(ij.graph, ij.tgraph, int(v), config.jaxpr)
     if len(keys) > _FACE_CAP_STATS["max_seen"]:
         _FACE_CAP_STATS["max_seen"] = len(keys)
@@ -4683,43 +4903,22 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip):
             one_row = [[int(x) for x in face_row[f][s]]] + [
                 [-1, -1, 0]
             ] * (MAX_RULES_PER_VERTEX - 1)
-            rules = decode_vertex_rule_specs(config.jaxpr, int(v), one_row)
-            # THE per-FACE sink. Under --live-faces the per-vertex rows are
-            # all-exact END rows, so the per-vertex sink below is never
-            # constructed and this is the ONLY place approx_applied/* can come
-            # from. ``gated`` because these same objects are replayed by the
-            # face-enum walk right below and by the tokenizer -- only the
-            # armed scope inside ``_do_compile_approx`` is the measurement.
+            # Ticket .18, D2. A vertex frame would describe the lhs tensor
+            # only; rhs and new carry other out/primal dims. So the row is
+            # decoded when the slot's LIVE tensor is in hand
+            # (make_slot_frame_hook), through the same per-face sink.
+            # THE per-FACE sink: under --live-faces the per-vertex rows are
+            # all-exact END rows, so the per-vertex sink is never constructed
+            # and this is the ONLY place approx_applied/* can come from.
+            # ``gated`` because these same objects are replayed by the
+            # face-enum walk and by the tokenizer -- only the armed scope
+            # inside ``_do_compile_approx`` is the measurement.
             slots.append(
-                make_live_masked_hook(tuple(rules), stats=_PER_FACE_STATS,
-                                      gated=True) if rules else None)
+                make_slot_frame_hook(one_row[0], stats=_PER_FACE_STATS,
+                                     gated=True)
+                if one_row[0][0] != -1 else None)
         if any(sl is not None for sl in slots):
-            # #72. A bare 3-tuple means CONTRACTION ONLY to graphax
-            # (_normalize_perpath, core.py:797): pre/post hit the two
-            # contraction operands and `new` the contraction RESULT, while
-            # the join hooks stay None. The requested semantics is that a
-            # `new`-slot approximation ALSO applies to the existing edge
-            # this result is added to, so compute is saved on both
-            # operands of the join.
-            #
-            # graphax already wires that: `_h_rhs` is applied to `_edge`
-            # -- the existing edge -- immediately before the add
-            # (core.py:1679). So emit the TWO-OP form and put the new-slot
-            # hook in `rhs`.
-            #
-            # `lhs` stays None on purpose: `new` has already transformed
-            # the contraction result at core.py:1657, and `lhs` hits that
-            # SAME tensor at 1678, so setting it would apply the
-            # approximation twice. `res` (the summed edge) is a decision
-            # the head does not make.
-            #
-            # Faces with no existing edge are unaffected -- graphax simply
-            # never reaches the join hooks for them.
-            _new_hook = slots[2] if len(slots) > 2 else None
-            if _new_hook is not None and _NEW_SLOT_JOIN:
-                per_face[key] = (tuple(slots), (None, _new_hook, None))
-            else:
-                per_face[key] = tuple(slots)
+            per_face[key] = face_entry_from_slots(slots)
     return per_face
 
 
@@ -4756,7 +4955,228 @@ def _measure_compiler_options():
     }
 
 
+# ---------------------------------------------------------------------------
+# MEASURE TOOLCHAIN GATE (finding 03, ticket dsnn-3qm.21).
+#
+# `xla_gpu_enable_llvm_module_compilation_parallelism` splits the module, and
+# splitting means LINKING: XLA shells out to the first `nvlink` it finds. On
+# pgi15-gpu16/17 that was /usr/local/cuda/bin/nvlink -- a SYMLINK pointing at
+# cuda-12.8 -- while the venv's ptxas (nvidia_cuda_nvcc_cu12 12.9.86) emits
+# 12.9 cubins, so nvlink refused every one:
+#     nvlink fatal : Input file '...cubin' newer than toolkit (129 vs 128)
+# `_compile_measure` matched the "INTERNAL" signature and silently swapped in
+# the degraded-fusion executable. That contaminated 51% of wave-1 arm w1b and
+# 97% of w1c and was found only in post-hoc log analysis. gpu15 and gpu16 run
+# the SAME driver (580.178.04): it was never a driver mismatch.
+#
+# The gate compiles a tiny throwaway module with the LIVE measure options at
+# the first measure compile of every measuring process (trainer, every
+# CpuApproximationActor, every respawn), which is the one site no call path
+# can bypass. Measured cost 0.07 s; a 4-op probe trips the fault as reliably
+# as a 40-op one (job 62796).
+#
+# THE PROBE MUST NOT BE CACHEABLE. Measured (job 62809): a persistent-cache
+# entry written on a healthy node is reused verbatim on the broken one and
+# the fault never fires, so a cacheable probe is a false-negative generator.
+# See `_toolchain_probe_compile` for how the cache is bypassed and why the
+# obvious way (jax_enable_compilation_cache=False) is wrong.
+#
+# Default = abort. A silent repair that swaps the toolkit would be the same
+# class of invisible change as the bug. A SKIP IS A FAILURE.
+# ---------------------------------------------------------------------------
+
+# Published by ppo.py from --measure-toolchain-gate BEFORE ray.init, exactly
+# like ALPHAGRAD_QUALITY_METRIC: the measure actors run this module's
+# `_compile_measure` in their own processes, and one env var read by ONE
+# function is what makes trainer and actors unable to disagree. This is the
+# transport, not a knob -- the flag is the only control.
+_MEASURE_TOOLCHAIN_GATE_ENV = "ALPHAGRAD_MEASURE_TOOLCHAIN_GATE"
+_MEASURE_TOOLCHAIN_GATE_MODES = ("abort", "warn", "off")
+
+# Process-global gate state. `ok` goes False on a probe failure OR a link
+# fault in a real measure compile; every plan record and every
+# `consume_plan_records` drain carries it.
+_MEASURE_TOOLCHAIN = {"checked": False, "ok": True, "detail": "",
+                      "mode": "", "host": "", "link_faults": 0}
+
+# The XLA error text of a link-toolchain fault. Either line alone is
+# sufficient (finding 03 sec 1).
+_LINK_FAULT_SIGNATURES = ("nvlink", "The CUDA linking API did not work")
+
+
+class MeasureToolchainFault(RuntimeError):
+    """The measure compile toolchain on THIS node is broken.
+
+    Deliberately its own class: the measurement sentinel machinery
+    (``cpu_approx_worker.evaluate``, ``CpuApproxPool.evaluate_batch``)
+    absorbs every other exception into a sentinel row and lets the run
+    continue, which for THIS fault would mean a run that measures nothing
+    or measures degraded executables while exiting 0. Both re-raise it.
+    """
+
+
+class MemChannelFault(MeasureToolchainFault):
+    """The memory channel could not be read for a measured plan, or a
+    measured plan left no parity record (ticket dsnn-3qm.49).
+
+    A subclass of :class:`MeasureToolchainFault` ON PURPOSE: the sentinel
+    machinery re-raises that class instead of absorbing it into a sentinel
+    row, and a plan scored on a memory channel that read nothing is exactly
+    the run that must not continue exiting 0 (a skip is a failure).
+    """
+
+
+def measure_toolchain_gate_mode() -> str:
+    """``abort`` | ``warn`` | ``off`` -- THE one reader of the gate mode.
+
+    Absent (a process not started through ppo.py, e.g. a test or a tool)
+    means ``abort``. A value outside the three modes raises: argparse
+    already validated the flag, so garbage here is a hand edit.
+    """
+    want = os.environ.get(_MEASURE_TOOLCHAIN_GATE_ENV, "abort").strip().lower()
+    if want not in _MEASURE_TOOLCHAIN_GATE_MODES:
+        raise ValueError(
+            f"{_MEASURE_TOOLCHAIN_GATE_ENV}={want!r} is not one of "
+            f"{_MEASURE_TOOLCHAIN_GATE_MODES}; it is published from "
+            f"--measure-toolchain-gate, not set by hand")
+    return want
+
+
+def _is_link_toolchain_fault(msg: str) -> bool:
+    return any(_sig in msg for _sig in _LINK_FAULT_SIGNATURES)
+
+
+def _tool_version(name: str, path: str | None = None) -> str:
+    """``'12.9.86 at /usr/local/cuda-12.9/bin/ptxas'`` for the ``ptxas`` /
+    ``nvlink`` FIRST ON PATH -- the one XLA shells out to -- or a reason.
+    With ``path`` given, that binary instead."""
+    import re
+    import shutil
+    import subprocess
+    p = path if path is not None else shutil.which(name)
+    if p is None:
+        return "not on PATH"
+    if not os.path.exists(p):
+        return f"absent ({p})"
+    try:
+        txt = subprocess.run([p, "--version"], capture_output=True,
+                             text=True, timeout=20).stdout
+    except Exception as _exc:
+        return f"unreadable at {p} ({type(_exc).__name__})"
+    m = re.search(r"release (\d+\.\d+), V(\d+\.\d+\.\d+)", txt)
+    return f"{m.group(2)} at {p}" if m else f"unparsed version at {p}"
+
+
+def _venv_ptxas_version() -> str:
+    """The ptxas the venv ships (nvidia_cuda_nvcc_cu12): with none on PATH
+    this is the one XLA compiles PTX with, and the release its cubins carry
+    -- the '129' in 'newer than toolkit (129 vs 128)'."""
+    import sysconfig
+    p = os.path.join(sysconfig.get_paths()["purelib"], "nvidia", "cuda_nvcc",
+                     "bin", "ptxas")
+    return _tool_version("ptxas", p)
+
+
+def _toolchain_probe_compile():
+    """Compile a tiny throwaway executable with the LIVE measure options,
+    BYPASSING the persistent compile cache. Returns the lowered object.
+
+    Two mechanisms, both needed:
+
+    * UNIQUE KEY. A fresh random constant is baked into the module, so its
+      cache key has never been written by any process on any node and the
+      lookup cannot hit. The input is a ``ShapeDtypeStruct``: a concrete
+      ``jnp.ones`` would run eager helper ops OUTSIDE this function's
+      control and those DO get cached (measured locally).
+    * NO WRITE. The compile-time threshold is raised for this one compile
+      (thread-local jax state), so the probe never leaves an entry behind
+      even under JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0.
+
+    NOT ``jax_enable_compilation_cache=False``: ``compilation_cache.
+    is_cache_used`` latches its answer on the first compile of the process,
+    and this gate IS the first measure compile in every actor -- it would
+    switch the persistent cache off for the whole process.
+    """
+    import secrets
+    from jax._src import config as _jcfg
+    _c = 1.0 + secrets.randbits(52) / float(1 << 52)
+
+    def _probe(x):
+        y = jnp.sin(x * _c)
+        y = jnp.tanh(y) + 0.5
+        y = y @ jnp.eye(y.shape[-1], dtype=y.dtype)
+        return jnp.log1p(jnp.abs(y))
+
+    with _jcfg.persistent_cache_min_compile_time_secs(1e9):
+        lowered = jax.jit(_probe).lower(
+            jax.ShapeDtypeStruct((16, 16), jnp.float32))
+        lowered.compile(compiler_options=_measure_compiler_options())
+    return lowered
+
+
+def _toolchain_fault_message(where: str, detail: str) -> str:
+    import socket
+    host = socket.gethostname()
+    detail = " ".join(str(detail).split())[:400]
+    return (
+        f"[measure] TOOLCHAIN FAULT on {host} ({where}): the live measure "
+        f"compile options do not produce a working executable, so every "
+        f"measurement on this node would silently be a degraded-fusion "
+        f"FALLBACK and not comparable with the other nodes.\n"
+        f"  fault:  {detail}\n"
+        f"  ptxas:  {_tool_version('ptxas')} (PATH); "
+        f"{_venv_ptxas_version()} (venv)\n"
+        f"  nvlink: {_tool_version('nvlink')} (PATH)\n"
+        f"  /usr/local/cuda -> {os.path.realpath('/usr/local/cuda')}\n"
+        f"  FIX: put a toolkit whose ptxas and nvlink MATCH first on PATH in "
+        f"the job script (tools/gen_fq_launchers.py does this; finding 03 "
+        f"sec 4a). Not xla_gpu_cuda_data_dir: it silences the error for any "
+        f"path. --measure-toolchain-gate warn runs anyway and tags every "
+        f"plan; off skips the probe.")
+
+
+def _measure_toolchain_check() -> dict:
+    """One-time per-process gate on the measure compile toolchain."""
+    if _MEASURE_TOOLCHAIN["checked"]:
+        return _MEASURE_TOOLCHAIN
+    import socket
+    mode = measure_toolchain_gate_mode()
+    host = socket.gethostname()
+    _MEASURE_TOOLCHAIN["checked"] = True
+    _MEASURE_TOOLCHAIN["mode"] = mode
+    _MEASURE_TOOLCHAIN["host"] = host
+    if mode == "off":
+        print(f"[measure] toolchain gate OFF on {host} "
+              f"(--measure-toolchain-gate off): a broken link toolchain on "
+              f"this node is NOT probed", flush=True)
+        return _MEASURE_TOOLCHAIN
+    t0 = time.perf_counter()
+    try:
+        _toolchain_probe_compile()
+    except Exception as _exc:
+        detail = f"{type(_exc).__name__}: {_exc}"
+    else:
+        print(f"[measure] toolchain gate OK on {host} "
+              f"({time.perf_counter() - t0:.2f}s; ptxas "
+              f"{_tool_version('ptxas')} (PATH), {_venv_ptxas_version()} "
+              f"(venv); nvlink {_tool_version('nvlink')} (PATH))",
+              flush=True)
+        return _MEASURE_TOOLCHAIN
+    _MEASURE_TOOLCHAIN["ok"] = False
+    _MEASURE_TOOLCHAIN["detail"] = " ".join(detail.split())[:400]
+    msg = _toolchain_fault_message("gate probe", detail)
+    if mode == "warn":
+        print(msg, file=sys.stderr, flush=True)
+        return _MEASURE_TOOLCHAIN
+    raise MeasureToolchainFault(msg)
+
+
 _MEASURE_COMPILE_FALLBACKS = {"n": 0}
+# Fallback count at the previous plan record / drain in THIS process, so a
+# per-plan and a per-episode DELTA can be attributed (measurements are
+# sequential per actor: pure_callback(vmap_method="sequential")).
+_MEASURE_FALLBACKS_AT_LAST_RECORD = [0]
+_MEASURE_FALLBACKS_AT_LAST_DRAIN = [0]
 
 
 def _compile_measure(lowered):
@@ -4769,13 +5189,35 @@ def _compile_measure(lowered):
     defeat the fallback). The fallback executable is less fused, so its
     latency reads conservatively -- a real measurement, not a sentinel;
     every use is printed and counted so the bias stays visible.
-    ALPHAGRAD_MEASURE_COMPILE_FALLBACK=0 disables."""
+    ALPHAGRAD_MEASURE_COMPILE_FALLBACK=0 disables.
+
+    A LINK-toolchain fault (nvlink refusing a newer ptxas cubin) is NOT
+    fallbackable: see the MEASURE TOOLCHAIN GATE block above."""
+    _measure_toolchain_check()
     try:
         return lowered.compile(compiler_options=_measure_compiler_options())
     except Exception as _e:
+        _m = str(_e)
+        # A LINK-toolchain fault is an ENVIRONMENT fault, not a plan-specific
+        # compiler bug: it recurs on every plan for the whole job and
+        # silently degrades every latency on this node. Absorbing it into
+        # the per-plan retry is how it hid inside wave 1 (finding 03). The
+        # gate above should have caught it; reaching here means the
+        # environment changed mid-run. Only --measure-toolchain-gate warn
+        # takes the degraded set, and then the plan is TAGGED
+        # (compile_fallbacks / toolchain_ok in its record).
+        _link_fault = _is_link_toolchain_fault(_m)
+        if _link_fault:
+            _MEASURE_TOOLCHAIN["ok"] = False
+            _MEASURE_TOOLCHAIN["detail"] = " ".join(_m.split())[:400]
+            _MEASURE_TOOLCHAIN["link_faults"] += 1
+            if (measure_toolchain_gate_mode() != "warn"
+                    or os.environ.get("ALPHAGRAD_MEASURE_COMPILE_FALLBACK",
+                                      "1") == "0"):
+                raise MeasureToolchainFault(_toolchain_fault_message(
+                    "measure compile, mid-run", _m)) from _e
         if os.environ.get("ALPHAGRAD_MEASURE_COMPILE_FALLBACK", "1") == "0":
             raise
-        _m = str(_e)
         # "Shared memory size limit exceeded" is labelled
         # RESOURCE_EXHAUSTED but is a compiler KERNEL-CONFIG failure
         # (XLA chose a tile above the SM's shared-mem budget -- observed
@@ -4786,7 +5228,7 @@ def _compile_measure(lowered):
         # fusion-pass graph bug -- observed on an exact TLM plan
         # (fusion.113, Blackwell); by construction a degraded-fusion
         # retry can avoid the offending fusion.
-        if not any(_sig in _m for _sig in (
+        if not _link_fault and not any(_sig in _m for _sig in (
                 "ptxas exited", "Triton kernel", "INTERNAL",
                 "Shared memory size limit", "A cycle is detected")):
             raise
@@ -5077,13 +5519,6 @@ def _callback(
     is skipped entirely until the elimination order is complete.
     """
     _pf_last = [time.perf_counter()]
-    # THE COVERAGE COST DENOMINATOR. `grad_cov/wall_frac` divides the coverage
-    # block's wall by the WHOLE callback's -- compile, measurement, quality
-    # walk and all. Timing it from a later point (e.g. the start of the
-    # measurement loop) puts the coverage block's own EXACT COMPILE in the
-    # numerator and not in the denominator, which reads a ~300% overhead on
-    # a target whose measurement is microseconds. Same instrument, both sides.
-    _cb_t0 = _pf_last[0]
 
     def _pf(key):
         now = time.perf_counter()
@@ -5092,26 +5527,30 @@ def _callback(
 
     partial_order, partial_specs = _get_partials(order, sparsity_specs, stop)
     is_terminal = int(stop) >= len(order)
-    # SPARSITY (reward slot 10). Read ONCE per callback, like `_gcov_on`
-    # and `_fid_on` -- but bound HERE, not beside them, because
+    # SPARSITY (reward slot 10). Read ONCE per callback, like `_fid_on`
+    # -- but bound HERE, not beside it, because
     # `_do_compile_approx` closes over it and is CALLED long before that
     # point. Terminal only: mid-rollout the elimination is a prefix, and
     # slots 6/7/8 already establish that convention.
     _sparsity_on = bool(is_terminal) and sparsity_enabled()
     # A6 PLAN LOG (``ALPHAGRAD_PLAN_LOG``), terminal only for the same reason
-    # slots 6/7/8 are. Two snapshots are taken HERE and differenced at the
-    # return: ``_PER_FACE_STATS``, because it is process-global and only a
-    # per-callback delta can be attributed to this plan; and the IDENTITY of
-    # the last coverage census, because ``_record_grad_coverage`` overwrites
-    # one shared "last" slot and a stale census from the previous plan must
-    # never be reported as this one's. `_plan_traced` is set by
+    # slots 6/7/8 are. A snapshot of ``_PER_FACE_STATS`` is taken HERE and
+    # differenced at the return, because it is process-global and only a
+    # per-callback delta can be attributed to this plan. `_plan_traced` is set by
     # `_do_compile_approx`, which runs only on a compile-cache MISS -- the
     # exact condition under which the per-face counters saw this plan.
     _plan_log_on = bool(is_terminal) and plan_log_enabled()
     if _plan_log_on:
         _PLAN_LOG_TERMINALS[0] += 1
+    # THE COST FORM (ticket .9): under ``paired-log`` the terminal step
+    # measures rev-exact beside the candidate and the two cost slots become
+    # log-differences (see `_PAIRED_REF`). Terminal only, like slots 6/8/10:
+    # a partial order's cost against rev-exact is not a statement about a
+    # plan, so non-terminal steps carry 0.0 in slots 2 and 5 under this form
+    # (training uses terminal rewards strictly; ruling 2026-09-01).
+    _paired = bool(is_terminal) and cost_form() == "paired-log"
+    _paired_ref_rec = None
     _plan_pf0 = dict(_PER_FACE_STATS) if _plan_log_on else None
-    _plan_cov0 = _GRAD_COV_STATS.get("last") if _plan_log_on else None
     _plan_traced = [False]
 
     o_list = [int(x) for x in partial_order.tolist()]
@@ -5566,8 +6005,8 @@ def _callback(
 
     def _do_compile_exact():
         # Wrapped, not duplicated: every consumer of the exact
-        # executable (the cosine quality metric, the coverage guard's
-        # `_exact_ref_scores`, the quality gate's order floor) reaches it
+        # executable (the cosine quality metric, the fidelity channel's
+        # `_exact_ref_scores`) reaches it
         # through this one closure, so arming here is what makes the
         # sparsity denominator FREE on the reference somebody else is
         # already paying for.
@@ -5619,6 +6058,46 @@ def _callback(
     if callback_device is not None:
         h_ex.update(repr(callback_device).encode())
     exact_cache_key = h_ex.digest()
+
+    # THE PAIRED REFERENCE (ticket .9): rev-exact = the reverse order over
+    # the SAME vertex set the candidate eliminated, no rule on any vertex,
+    # no action on any face. Built through the same ``jacve`` call shape an
+    # identity candidate gets from `_jacve_fn(approx=True)` -- ``transforms``
+    # is the empty list and ``face_transforms`` None whenever a plan has no
+    # rule and no face action -- so an identity plan and its reference are
+    # the SAME executable and land on the same lowering path (ticket .24's
+    # armed-vs-unarmed question is thereby moot for the pair; its GPU
+    # landing test still stands). Descending vertex ids IS graphax's
+    # ``"rev"`` over these vertices (core._checkify_order). The COMPILE is
+    # cached like every other executable (order, arg shapes, device); the
+    # MEASUREMENT is taken anew in every terminal callback, right after the
+    # candidate's -- that is what makes it paired.
+    _rev_order = sorted(o_list, reverse=True)
+    h_rf = hashlib.blake2b(digest_size=16)
+    h_rf.update(np.asarray(_rev_order, dtype=np.int32).tobytes())
+    for a in args_for_lower:
+        if hasattr(a, "shape") and hasattr(a, "dtype"):
+            h_rf.update(repr(a.shape).encode())
+            h_rf.update(repr(a.dtype).encode())
+    if callback_device is not None:
+        h_rf.update(repr(callback_device).encode())
+    paired_ref_key = h_rf.digest()
+
+    def _do_compile_paired_ref():
+        return _compile_measure(
+            jax.jit(
+                jacve(
+                    config.target_fun,
+                    list(_rev_order),
+                    argnums=config.argnums,
+                    has_aux=config.has_aux,
+                    sparse_representation=config.sparse,
+                    transforms=[],
+                    face_transforms=None,
+                ),
+                keep_unused=True,
+            ).lower(*args_for_lower)
+        )
 
     # RESOURCE-LIMIT TRUNCATION (OOM) — "Time Limits in RL" applied to memory.
     #
@@ -5758,6 +6237,9 @@ def _callback(
     # Jacobian, so under ``ALPHAGRAD_QUALITY_METRIC=loss_drop`` the exact
     # executable is not compiled and not executed at all. That is where the
     # 9.70 s -> 0.22 s and 4.24 GB -> 40 MB per-plan saving comes from.
+    # Under the default grad_cosine (2026-09-02) the exact executable IS
+    # built -- its compile is cached on ``exact_cache_key`` -- and executed
+    # once per plan on the probe batch, as the rev-exact reference.
     _qmetric = quality_metric(config)
     if is_terminal and _qmetric in ("jac_cosine", "grad_cosine"):
         try:
@@ -5772,6 +6254,12 @@ def _callback(
     else:
         compiled_exact = None
     _pf("cb.xla_compile")
+    # ORACLE A (ticket .62): the same-order exact gradient against jax.grad,
+    # once per process and order, before it serves as the quality reference.
+    if compiled_exact is not None and _qmetric == "grad_cosine":
+        _grad_oracle_check(config, compiled_exact, list(args),
+                           callback_device, o_list)
+        _pf("cb.grad_oracle")
 
     # XLA cost analysis — flops + bytes accessed. Falls back to 0 when the
     # backend doesn't expose them (CPU sometimes returns an empty dict).
@@ -5828,19 +6316,12 @@ def _callback(
     # (~41.7GB at batch 512) before scoring — an OOM-truncation source that
     # said nothing about the plan.
     # Samples of THE QUALITY CHANNEL (reward slot 6). Historical name: under
-    # ALPHAGRAD_QUALITY_METRIC=cosine it holds one Jacobian cosine per
-    # calibration point; under the default loss_drop it holds exactly ONE
-    # entry, the plan's 200-step Adam-walk loss drop.
+    # ALPHAGRAD_QUALITY_METRIC=jac_cosine it holds one Jacobian cosine per
+    # calibration point; under the default grad_cosine (and under loss_drop)
+    # it holds exactly ONE entry per plan.
     cosines: list = []
     latency_samples: list[float] = []
     peak_mem_samples: list[float] = []
-    # GRADIENT COVERAGE state for this plan (see the block comment on
-    # `_grad_coverage`). `_gcov_on` is read ONCE per callback so a mid-episode
-    # env-var flip cannot make one plan's coverage incomparable with the next.
-    _gcov_on = bool(is_terminal) and grad_coverage_enabled()
-    _gcov_approx_norms = None
-    _gcov_eval_args = None
-    _gcov_measure_t0 = _cb_t0
     # FIDELITY (reward slot 8) + the COSINE LOG subsample. Both need the exact
     # Jacobian, and under ALPHAGRAD_QUALITY_METRIC=cosine one is already being
     # built and scored PER POINT below -- in that case take the residual from
@@ -5857,6 +6338,7 @@ def _callback(
     # resident Jacobian, so only do it when a residual is actually wanted.
     _fid_needs_ref = (_fid_on or _cos_due) and not _fid_from_quality
     _fid_approx_out = None
+    _fid_eval_args = None
     _rel_frobs: list = []
     _cos_logged: list = []
     # WHICH quantity the peak samples hold (see _record_mem_parity): the
@@ -5868,10 +6350,10 @@ def _callback(
     # compiled fine can still exhaust the device here. Excluded from the
     # gradient rather than scored.
     try:
-        # THE MEASUREMENT INPUTS, materialised ONCE. The quality gate's
-        # per-order floor re-measures the exact executable over exactly
-        # this list, with exactly the parameters below, so a clamped plan
-        # and an honest plan are timed on the same data with the same
+        # THE MEASUREMENT INPUTS, materialised ONCE. The paired rev-exact
+        # reference (ticket .9) measures its executable over exactly
+        # this list, with exactly the parameters below, so the candidate
+        # and its reference are timed on the same data with the same
         # instrument (see _time_one_rep). Built inside the try so a
         # device_put OOM still truncates rather than escaping.
         eval_args_all: list = []
@@ -5903,10 +6385,6 @@ def _callback(
         # gate floor is a FRESH compile every time it is measured. One
         # untimed execution costs one execution and removes the whole class.
         _warmup = _resolve_warmup(config)
-        _QUALITY_GATE_STATS["instrument"] = {
-            "points": n_points, "reps": n_reps,
-            "inner": _inner, "warmup": _warmup,
-        }
         for i in range(n_points):
             eval_args_i = eval_args_all[i]
 
@@ -5925,10 +6403,10 @@ def _callback(
             # ``ResourceMonitor`` (not its C++ tracker) leaks. peak_memory +
             # latency_ns are zero for the run.
             # ONE instrument (see _time_one_rep): this loop and the
-            # quality gate's exact floor call the same function with the
-            # same (points, reps, inner, warmup), so the floor is exactly
-            # what the campaign path would have printed for the same-order
-            # exact plan -- not a throughput timing that reads 13% low.
+            # paired rev-exact reference call the same function with the
+            # same (points, reps, inner, warmup), so the reference is
+            # exactly what the campaign path would have printed for the
+            # rev-exact plan -- not a throughput timing that reads 13% low.
             for _w in range(_warmup):
                 jax.block_until_ready(compiled_cost(*eval_args_i))
             for _rep in range(n_reps):
@@ -5937,49 +6415,42 @@ def _callback(
                 latency_samples.append(_lat_ns)
                 peak_mem_samples.append(_peak_b)
 
-            # GRADIENT COVERAGE, approx half. Point 0 only, terminal only.
-            # Scored HERE, off the execution the loop already ran, and the
-            # Jacobian is dropped immediately (the streamed-quality rule at
-            # the top of this loop: never hold a second full Jacobian).
-            # Costs the norm reductions and one device sync, no extra exec.
-            if (_gcov_on or _fid_needs_ref) and is_terminal and i == 0:
-                _gc_t0 = time.perf_counter()
+            # FIDELITY, approx half. Point 0 only, terminal only. Taken HERE,
+            # off the execution the loop already ran (the streamed-quality
+            # rule at the top of this loop: never hold a second full
+            # Jacobian beyond the one the channel needs).
+            if _fid_needs_ref and is_terminal and i == 0:
                 _dense = out_approx
                 if compiled_cost is not compiled_approx:
                     # The timed executable was the sparse-boundary one; the
-                    # coverage comparison needs DENSE leaves for shape parity
-                    # with the exact reference. One extra execution, and only
-                    # under ALPHAGRAD_MEASURE_SPARSE.
+                    # residual needs DENSE leaves for shape parity with the
+                    # exact reference. One extra execution, and only under
+                    # ALPHAGRAD_MEASURE_SPARSE.
                     _dense = compiled_approx(*eval_args_i)
-                if _gcov_on:
-                    _gcov_approx_norms = _leaf_norms(_dense, config.has_aux)
-                _gcov_eval_args = eval_args_i
-                if _fid_needs_ref:
-                    # THE ONE EXTRA RESIDENT JACOBIAN the fidelity channel
-                    # costs. Held from point 0 until the exact-reference block,
-                    # which runs AFTER the whole cost loop -- so the expensive
-                    # half (the exact execution and the per-leaf reductions) is
-                    # never inside a timing or peak-memory window, the
-                    # invariant the coverage block already keeps.
-                    #
-                    # WHY HOLDING IT DOES NOT CORRUPT THE PEAK CHANNEL, which
-                    # is the obvious worry: `_time_one_rep`'s peak is an
-                    # ABOVE-BASELINE DELTA -- it snapshots `bytes_in_use`
-                    # before the rep and subtracts it -- so a retained
-                    # allocation raises the BASELINE, not the delta. Points
-                    # 1..N-1 are timed and measured exactly as they would be
-                    # with the channel off.
-                    #
-                    # WHAT IT DOES COST is residency: one extra full Jacobian
-                    # for the length of the loop, i.e. more OOM headroom used
-                    # on a big target (the streamed-quality note above sizes
-                    # these at ~4 GB each at batch 512). At the moment of
-                    # scoring the exact reference is alive alongside it, which
-                    # is the SAME pair the legacy cosine path holds per point,
-                    # so the ceiling is that path's, not double it.
-                    _fid_approx_out = _dense
+                _fid_eval_args = eval_args_i
+                # THE ONE EXTRA RESIDENT JACOBIAN the fidelity channel
+                # costs. Held from point 0 until the exact-reference block,
+                # which runs AFTER the whole cost loop -- so the expensive
+                # half (the exact execution and the per-leaf reductions) is
+                # never inside a timing or peak-memory window.
+                #
+                # WHY HOLDING IT DOES NOT CORRUPT THE PEAK CHANNEL, which
+                # is the obvious worry: `_time_one_rep`'s peak is an
+                # ABOVE-BASELINE DELTA -- it snapshots `bytes_in_use`
+                # before the rep and subtracts it -- so a retained
+                # allocation raises the BASELINE, not the delta. Points
+                # 1..N-1 are timed and measured exactly as they would be
+                # with the channel off.
+                #
+                # WHAT IT DOES COST is residency: one extra full Jacobian
+                # for the length of the loop, i.e. more OOM headroom used
+                # on a big target (the streamed-quality note above sizes
+                # these at ~4 GB each at batch 512). At the moment of
+                # scoring the exact reference is alive alongside it, which
+                # is the SAME pair the legacy cosine path holds per point,
+                # so the ceiling is that path's, not double it.
+                _fid_approx_out = _dense
                 _dense = None
-                _GRAD_COV_STATS["wall_s"] += time.perf_counter() - _gc_t0
 
             if compiled_cost is not compiled_approx and compiled_exact is not None:
                 # The timed run above used the sparse-boundary executable;
@@ -6013,11 +6484,34 @@ def _callback(
                 # reference is already resident for the cosine.
                 _jac_a = out_approx[1] if config.has_aux else out_approx
                 _jac_e = out_exact[1] if config.has_aux else out_exact
-                _cos, _rf = _quality_metrics(_jac_e, _jac_a)
+                _cos, _rf = _quality_metrics(_jac_e, _jac_a, align=True,
+                                             site="jac_cosine")
                 cosines.append(_cos)
                 if _fid_on:
                     _rel_frobs.append(float(_rf))
                     _cos_logged.append(float(_cos))
+
+        # ---- THE PAIRED REFERENCE (ticket .9) ----------------------------
+        # Measured HERE, back to back with the candidate's cost loop above
+        # and BEFORE the quality walk, so nothing expensive sits between
+        # the two halves of the pair. Same executable path (see
+        # `_do_compile_paired_ref`), same eval args, same points x reps,
+        # same inner-reps, same warmup, same median: `_campaign_measure_cost`
+        # is `_time_one_rep` in a loop, exactly like the loop above. The
+        # static temp is read off the reference executable the same way
+        # `_record_mem_parity` reads the candidate's.
+        _ref_lat_ns = 0.0
+        _ref_peak = 0.0
+        _ref_temp = None
+        if _paired:
+            _pf("cb.exec_measure")
+            _ref_ex = cached_compile(
+                b"paired-ref:" + paired_ref_key, _do_compile_paired_ref)
+            _ref_lat_ns, _ref_peak = _campaign_measure_cost(
+                _ref_ex, eval_args_all, unique_devices, _inner, _warmup,
+                n_reps)
+            _ref_temp = _static_temp_bytes(_ref_ex)
+            _pf("cb.paired_ref")
 
         # ---- LOSS-DROP QUALITY ------------------------------------------
         # ONE walk per PLAN (not per data point): the probe batch is fixed
@@ -6104,17 +6598,31 @@ def _callback(
     )
     # BOTH memory numbers, per measurement, with the source of the one that
     # trains made explicit (see _record_mem_parity).
-    _record_mem_parity(compiled_cost,
-                       peak_memory if peak_mem_samples else None,
-                       _peak_src, is_terminal)
+    _MEM_PARITY_MEASURED[0] += 1
+    _mp = _record_mem_parity(compiled_cost,
+                             peak_memory if peak_mem_samples else None,
+                             _peak_src, is_terminal)
+    if mem_channel() == "temp":
+        # THE MEMORY CHANNEL (ticket .49, ruling .29): slot 5 is the static
+        # temp bytes of the executable that was just timed; the watermark
+        # it replaced stays in the parity record. No executable or no
+        # memory_analysis() is a fault, not a zero.
+        if _mp is None or _mp["static_temp_bytes"] is None:
+            raise MemChannelFault(
+                "memory channel: memory_analysis() returned nothing for the "
+                "timed executable, so the static temp bytes of this plan "
+                "cannot be read (peak_source=%s)" % _peak_src)
+        peak_memory = float(_mp["static_temp_bytes"])
 
     # ------------------------------------------------------------------
     # Quality family — reward slot 6 (``quality``) + frob_residual.
     # ------------------------------------------------------------------
     # WHICH quantity lands in slot 6 is ``quality_metric(config)``:
-    # ``loss_drop`` (the default for any scalar-loss target) = the loss drop of
-    # a 200-step Adam walk driven by this plan's gradient; ``cosine`` = the
-    # legacy Jacobian cosine. Both are "higher is better", both are ~[0, 1]
+    # ``grad_cosine`` (the default for any scalar-loss target) = the cosine
+    # between this plan's gradient and the rev-exact gradient; ``loss_drop``
+    # (by name) = the loss drop of a 200-step Adam walk driven by this plan's
+    # gradient; ``jac_cosine`` = the legacy Jacobian cosine. All are "higher
+    # is better", all are ~[0, 1]
     # (loss_drop can reach -1 when the walk diverges), so every downstream
     # consumer — PopArt's per-channel sigma floor, --lambda-acc, the symlog
     # bypass, the mult gate — keeps its calibration.
@@ -6154,58 +6662,65 @@ def _callback(
         cosine_sim = 0.0
         frob_residual = 0.0
 
-    # ---- ADDITIVE QUALITY GATE (owner 2026-08-09): see
-    # _apply_quality_gate. Fires only when quality was MEASURED this
-    # step (terminal + cosines non-empty) and fell below the env-var
-    # threshold; clamps the two campaign cost channels to the
-    # exact-reverse reference so destruction has no cost advantage.
-    def _gate_order_floor():
-        # LAZY: only clamped plans pay this compile+measure. `_order_floor`
-        # memoises on `exact_cache_key`, which digests exactly (order, arg
-        # shapes/dtypes, device) -- everything the exact executable's cost
-        # depends on -- so a repeat offender order is measured ONCE per
-        # process, not once per clamp.
-        return _order_floor(
-            exact_cache_key,
-            lambda: cached_compile(b"exact:" + exact_cache_key,
-                                   _do_compile_exact),
-            # THE SAME INSTRUMENT as the plan being floored: same eval
-            # args, same points x reps, same inner-reps, same warmup,
-            # same median.
-            lambda _ex: _campaign_measure_cost(
-                _ex, eval_args_all, unique_devices, _inner, _warmup, n_reps),
-            legacy_measure_fn=lambda _ex: _measure_exec_cost(
-                _ex, list(args_for_lower)),
-        )
-
-    def _gate_ref_measure(_ex):
-        # Global rev fallback, timed by the campaign instrument too, so
-        # the fail-open path cannot reintroduce the mismatch.
-        return _campaign_measure_cost(
-            _ex, eval_args_all, unique_devices, _inner, _warmup, n_reps)
-    # ``args_for_lower`` (not ``args``): the global rev fallback must be
-    # lowered onto the SAME device the plans are measured on, or the
-    # fail-open floor is a CPU timing clamped onto GPU plans -- a second
-    # instrument mismatch in the same clamp. Identical object whenever
-    # --exec-on-gpu is off.
-    latency_ns, peak_memory = _apply_quality_gate(
-        latency_ns, peak_memory, cosine_sim, is_terminal,
-        bool(cosines), config, list(args_for_lower),
-        order_floor_fn=_gate_order_floor,
-        ref_measure_fn=_gate_ref_measure)
+    # ---- THE COST FORM (ticket .9): see `_PAIRED_REF` and
+    # `paired_log_costs`. Under ``absolute`` the two slots below carry the
+    # measured numbers exactly as before (the flag-off bit-identity arm).
+    if cost_form() == "paired-log":
+        if _paired:
+            # The reference's memory is the SAME quantity as the candidate's
+            # (ticket .49): static temp under --mem-channel temp, the
+            # runtime watermark (or its static substitution) otherwise.
+            if mem_channel() == "temp":
+                if _ref_temp is None:
+                    raise MemChannelFault(
+                        "paired reference: memory_analysis() returned "
+                        "nothing for the rev-exact executable, so its static "
+                        "temp bytes cannot be read")
+                _ref_mem = float(_ref_temp)
+            else:
+                _ref_mem = float(_ref_peak)
+            # Same fake-fast clamp the candidate's latency got above, so a
+            # zero-work reference cannot make the pair implausible either.
+            if 0.0 < _ref_lat_ns < _LAT_FLOOR_NS:
+                _ref_lat_ns = _LAT_FLOOR_NS
+            if not config.measure_latency:
+                _ref_lat_ns = 0.0
+            _abs_lat, _abs_mem = latency_ns, peak_memory
+            latency_ns, peak_memory, _n_floored = paired_log_costs(
+                _abs_lat, _abs_mem, _ref_lat_ns, _ref_mem)
+            _paired_ref_rec = {
+                # POSITIVE units (ticket .45 logs these as ref/*).
+                "latency_ns": float(_ref_lat_ns),
+                "temp_bytes": _ref_temp,
+                "watermark_bytes": float(_ref_peak),
+                "memory_bytes": float(_ref_mem),
+                "mem_channel": mem_channel(),
+                "candidate_latency_ns": float(_abs_lat),
+                "candidate_memory_bytes": float(_abs_mem),
+                "delta_latency": float(latency_ns),
+                "delta_memory": float(peak_memory),
+                "mem_floored": int(_n_floored),
+                "order": list(_rev_order),
+            }
+            _record_paired_ref(_paired_ref_rec)
+            if os.environ.get("ALPHAGRAD_DEBUG_MEASURE", "0") == "1":
+                print(f"[paired-ref] rev-exact lat={_ref_lat_ns/1e3:.1f}us "
+                      f"mem={_ref_mem:.0f}B | candidate "
+                      f"lat={_abs_lat/1e3:.1f}us mem={_abs_mem:.0f}B | "
+                      f"Delta_lat={latency_ns:+.4f} Delta_mem={peak_memory:+.4f}"
+                      f" floored={_n_floored}", flush=True)
+        else:
+            latency_ns, peak_memory = 0.0, 0.0
     _pf("cb.quality")
 
     # ------------------------------------------------------------------
-    # GRADIENT COVERAGE -- reward slot 7 (``grad_coverage``) + the HARD GUARD.
+    # FIDELITY -- reward slot 8. See the block comment above `fidelity_enabled`.
     # ------------------------------------------------------------------
     # Runs AFTER the cost measurement (so nothing it does is inside a timing
-    # or peak-memory window) and after the quality gate (so a clamped plan is
-    # still checked). See `_grad_coverage` for the definition, the epsilon
-    # policy and the one-slot encoding.
-    _GRAD_COV_STATS["measure_wall_s"] += (
-        time.perf_counter() - _gcov_measure_t0)
-    grad_coverage = 0.0
-    # FIDELITY (slot 8) -- see the block comment above `fidelity_enabled`.
+    # or peak-memory window; until 2026-09-04 also after the quality gate,
+    # so a clamped plan was still scored). Until 2026-09-03 this block also ran the gradient-
+    # coverage census and the frozen-gradient HARD GUARD on the same exact
+    # reference; both were removed by owner ruling (ticket dsnn-3qm.15).
     fidelity = 0.0
     _fid_measured = False
     # (A) Under ALPHAGRAD_QUALITY_METRIC=cosine the residual was scored PER
@@ -6223,50 +6738,32 @@ def _callback(
             fidelity, frob_residual,
             float(np.median(np.asarray(_cos_logged, dtype=np.float64)))
             if _cos_logged else None)
-    if _gcov_on or _fid_needs_ref:
-        _gc_t0 = time.perf_counter()
-    if (_gcov_on or _fid_needs_ref) and _gcov_eval_args is not None:
-        _ex_norms = None
+    if _fid_needs_ref and _fid_eval_args is not None:
+        _fid_t0 = time.perf_counter()
         _rf_m = None
         _cos_m = None
         try:
-            # ONE exact execution for BOTH consumers. With `approx_out=None`
-            # (fidelity off) this is exactly the memoised norms-only path the
-            # guard has always used.
-            _ex_norms, _rf_m, _cos_m = _exact_ref_scores(
-                exact_cache_key,
-                _eval_digest(_gcov_eval_args),
+            _rf_m, _cos_m = _exact_ref_scores(
                 lambda: cached_compile(b"exact:" + exact_cache_key,
                                        _do_compile_exact),
-                _gcov_eval_args,
+                _fid_eval_args,
                 config.has_aux,
                 approx_out=_fid_approx_out,
-                want_cos=bool(_fid_needs_ref),
+                want_cos=True,
             )
         except Exception as _exc:
             _fid_approx_out = None
             # FAIL SOFT, LOUDLY. The exact reference is apparatus, not plan
-            # quality: if graphax cannot build it (or it OOMs) the coverage is
-            # UNDEFINED and the guard must not fire -- refusing a plan because
-            # our own reference failed is exactly the "score it BADLY" error
-            # `_truncated_reward`'s docstring warns about.
-            _record_grad_coverage({"defined": False, "min_leaf_ratio": 1.0,
-                                   "frac_zeroed": 0.0, "n_leaves": 0,
-                                   "n_counted": 0, "n_uncounted": 0,
-                                   "n_zeroed": 0, "zeroed": [], "ratios": [],
-                                   "approx_norms": [], "exact_norms": [],
-                                   "channel": 0.0, "leaf_mismatch": False,
-                                   "error": f"{type(_exc).__name__}: {_exc}"})
-            if not _GRAD_COV_REF_WARNED:
-                _GRAD_COV_REF_WARNED.append(1)
-                print("[grad-cov] WARNING: the EXACT reference gradient could "
-                      "not be built for this order; coverage is UNDEFINED and "
-                      "the guard is inert for every affected plan: "
+            # quality: an exact reference we could not build is apparatus
+            # failure, and scoring the plan -1.0 for it would be the very
+            # bias `_truncated_reward` warns about. The slot stays 0.0 =
+            # "not measured".
+            if not _FID_REF_WARNED:
+                _FID_REF_WARNED.append(1)
+                print("[fidelity] WARNING: the EXACT reference gradient could "
+                      "not be built for this order; fidelity is NOT MEASURED "
+                      "for every affected plan: "
                       f"{type(_exc).__name__}: {str(_exc)[:160]}", flush=True)
-            # FIDELITY FAILS SOFT TOO, and for the same reason: an exact
-            # reference we could not build is apparatus failure, and scoring
-            # the plan -1.0 for it would be the very bias `_truncated_reward`
-            # warns about. The slot stays 0.0 = "not measured".
         else:
             _fid_approx_out = None
             if _rf_m is not None:
@@ -6286,64 +6783,15 @@ def _callback(
             elif _cos_m is not None:
                 # Cosine subsample with the channel off: record the cosine and
                 # DO NOT touch the fidelity counter, so the amortised-cost line
-                # attributes the exact reference to the right consumer. (This
-                # branch also covers the coverage-only case, where both are
-                # None and nothing is recorded -- in particular branch (A) has
-                # already recorded its own measurement and must not be
-                # double-counted here.)
+                # attributes the exact reference to the right consumer.
+                # (Branch (A) has already recorded its own measurement and
+                # must not be double-counted here.)
                 _record_fidelity(None, None, _cos_m)
-            # FIDELITY-ONLY runs are possible (--fidelity-weight with
-            # --no-reject-frozen-grads): then nothing measured coverage, the
-            # guard is not armed, and slot 7 keeps its "not measured" 0.0.
-            _cov = (_grad_coverage(_gcov_approx_norms, _ex_norms)
-                    if (_gcov_on and _gcov_approx_norms is not None) else None)
-            if _cov is not None:
-                _record_grad_coverage(_cov)
-                grad_coverage = _cov["channel"]
-            if _cov is not None and _cov["defined"] \
-                    and _cov["frac_zeroed"] > 0.0 and reject_frozen_grads():
-                # HARD GUARD. Reuse of the DEGENERATE-PLAN path, deliberately:
-                # `_SENTINEL_BAD_REWARD` is the exact vector train_episode's
-                # `_is_degen` recognises (all six cost channels at
-                # SENTINEL_COST), which forces the advantage to 0, drops the
-                # step from the value target, and sentinels the row everywhere
-                # it is RANKED (top-N, best_global, Pareto) -- so a plan that
-                # freezes a parameter can never be crowned and teaches nothing.
-                # It is NOT `_trace_truncate`: that path is for apparatus
-                # failure, and routing a plan-quality verdict through it is
-                # precisely bug (c) (the res-slot plans that disappeared from
-                # the gradient with no counter). `_record_frozen_grad_plan`
-                # gives this its own visible counter and stdout line.
-                _GRAD_COV_STATS["wall_s"] += time.perf_counter() - _gc_t0
-                if _fid_needs_ref:
-                    _FIDELITY_STATS["wall_s"] += (
-                        time.perf_counter() - _gc_t0)
-                # A6: a guard rejection is a LOSER by construction and is
-                # the single most informative row in the plan log -- it is
-                # the plan that froze a gradient. Recorded BEFORE the early
-                # return, with the census that condemned it attached.
-                if _plan_log_on:
-                    _record_terminal_plan(
-                        order=o_list, rule_specs=partial_specs,
-                        face_specs=_faces_np, face_skips=_skips_np,
-                        reward_vec=_SENTINEL_BAD_REWARD, cov=_cov,
-                        face_before=_plan_pf0, face_after=_PER_FACE_STATS,
-                        counts_from_trace=bool(_plan_traced[0]),
-                        sentinelled=True)
-                _record_frozen_grad_plan(_cov, o_list)
-                return tokens, eqn_ids, _SENTINEL_BAD_REWARD
-        _GRAD_COV_STATS["wall_s"] += time.perf_counter() - _gc_t0
-        # Attributed to the fidelity channel ONLY when it is what forced the
-        # exact reference: with the coverage guard already paying for it the
-        # marginal cost is the per-leaf reductions, and the amortised line
-        # must not claim the guard's wall as the channel's price.
-        if _fid_needs_ref:
-            _FIDELITY_STATS["wall_s"] += time.perf_counter() - _gc_t0
-    _pf("cb.grad_coverage")
+        _FIDELITY_STATS["wall_s"] += time.perf_counter() - _fid_t0
+    _pf("cb.fidelity")
     # ------------------------------------------------------------------
     # SPARSITY -- reward slot 10. See the block comment on
-    # `_SPARSITY_STATS` for the definition and for why a weight on this
-    # channel requires the coverage guard.
+    # `_SPARSITY_STATS` for the definition and the hackability warning.
     # ------------------------------------------------------------------
     sparsity = 0.0
     if _sparsity_on:
@@ -6381,10 +6829,10 @@ def _callback(
             -bytes_accessed,
             -peak_memory,
             cosine_sim,
-            # Slot 7: GRADIENT COVERAGE, not frob. 0.0 whenever coverage was
-            # not measured -- byte-identical to what the dead frob slot
-            # emitted (`frob_residual = 0.0` for every real plan).
-            grad_coverage,
+            # Slot 7: RESERVED (gradient coverage until 2026-09-03, the dead
+            # frob slot before that). A literal 0.0, always -- byte-identical
+            # to what the slot carried on every plan with the census off.
+            0.0,
             # Slot 8: FIDELITY = clip(1 - rel_frob, -1, 1). 0.0 whenever it was
             # not measured (non-terminal, channel off, or the exact reference
             # failed), matching the sparse-terminal convention of slot 6.
@@ -6444,19 +6892,14 @@ def _callback(
             )
 
     # ---- A6 PLAN LOG: this plan, win or lose -------------------------
-    # `_GRAD_COV_STATS["last"]` is only THIS plan's census when it is a
-    # different object than the one snapshotted at entry; otherwise the
-    # coverage block did not run for this plan and the census is recorded
-    # as "not measured" rather than as somebody else's numbers.
     if _plan_log_on:
-        _cov_now = _GRAD_COV_STATS.get("last")
         _record_terminal_plan(
             order=o_list, rule_specs=partial_specs,
             face_specs=_faces_np, face_skips=_skips_np,
             reward_vec=_reward_slots,
-            cov=(_cov_now if _cov_now is not _plan_cov0 else None),
             face_before=_plan_pf0, face_after=_PER_FACE_STATS,
-            counts_from_trace=bool(_plan_traced[0]), sentinelled=False)
+            counts_from_trace=bool(_plan_traced[0]),
+            mem_parity=_mp, paired_ref=_paired_ref_rec)
 
     return tokens, eqn_ids, rewards
 

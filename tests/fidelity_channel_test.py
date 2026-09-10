@@ -15,7 +15,7 @@ cosine LOGGED, gradient coverage a hard GUARD". What is pinned here:
 
 2. THE TWO CHANNEL TABLES AGREE. ``env.REWARD_NAMES`` is a strict PREFIX of
    ``common.reward_scaling.REWARD_NAMES``; slot 7 is ``grad_coverage`` in BOTH
-   (it was renamed in only one of them by `bcb61a1`); slot 8 is ``fidelity``;
+   (RESERVED since 2026-09-03, never populated); slot 8 is ``fidelity``;
    slot 9 stays ``bkstep_acc``, because persisted PopArt / calibration state is
    keyed by INDEX and must never be renumbered.
 
@@ -37,8 +37,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
 for _k in ("ALPHAGRAD_FIDELITY", "ALPHAGRAD_FIDELITY_WEIGHT",
-           "ALPHAGRAD_COS_LOG_EVERY", "ALPHAGRAD_REJECT_FROZEN_GRADS",
-           "ALPHAGRAD_GRAD_COVERAGE", "ALPHAGRAD_GRAD_COVERAGE_WEIGHT"):
+           "ALPHAGRAD_COS_LOG_EVERY"):
     os.environ.pop(_k, None)
 
 import numpy as np                                              # noqa: E402
@@ -140,11 +139,14 @@ def test_halved_jacobian_separates_fidelity_from_the_cosine():
 
 
 def test_broken_comparison_is_not_silently_perfect():
+    """Ticket .62: a leaf-count or shape mismatch is a measurement fault and
+    RAISES (the actors re-raise it, the run stops); it is never a score. The
+    NaN it used to return still maps to the worst fidelity."""
     e = _leaves([[1.0, 2.0]])
     a = _leaves([[1.0, 2.0]], [3.0])
-    rf, cos = envmod._residual_scores(e, a, has_aux=False)
-    assert not np.isfinite(rf) and not np.isfinite(cos)
-    assert envmod.clipped_rel_frob(rf) == -1.0
+    with pytest.raises(envmod.GradientStructureMismatch):
+        envmod._residual_scores(e, a, has_aux=False)
+    assert envmod.clipped_rel_frob(float("nan")) == -1.0
 
 
 def test_residual_matches_quality_metrics_on_the_same_pair():
@@ -272,8 +274,7 @@ def test_mu0_args_lambda_frob_default_is_zero():
 
 # ------------------------------------------------ 4. flag-off bit-identity
 def _args(**kw):
-    d = dict(reject_frozen_grads=False, grad_coverage_weight=0.0,
-             fidelity_weight=0.0, cos_log_every=0,
+    d = dict(fidelity_weight=0.0, cos_log_every=0,
              symlog_channels="all", no_symlog=False, reward_mode="additive",
              rewards=["cmp", "mem", "acc"], lambda_cmp=1.0, lambda_mem=1.0,
              lambda_acc=16.0, cmp_type="latency", mem_type="peak_memory")
@@ -317,21 +318,6 @@ def test_flag_on_appends_exactly_one_head_on_slot_8_and_is_idempotent():
     assert envmod.fidelity_enabled()
     wts = ppo._build_head_weights(_args(fidelity_weight=4.0))
     assert [float(x) for x in wts] == [1.0, 1.0, 16.0, 4.0]
-
-
-def test_coverage_then_fidelity_gives_a_deterministic_five_head_order():
-    ppo.configure_grad_coverage(
-        _args(reject_frozen_grads=True, grad_coverage_weight=2.0))
-    ppo.configure_fidelity(_args(fidelity_weight=4.0))
-    assert ppo.HEAD_NAMES == ("latency", "mem", "quality", "grad_cov",
-                              "fidelity")
-    assert ppo.HEAD_REWARD_INDICES[3:] == (GSLOT, FSLOT)
-    wts = ppo._build_head_weights(
-        _args(reject_frozen_grads=True, grad_coverage_weight=2.0,
-              fidelity_weight=4.0))
-    assert [float(x) for x in wts] == [1.0, 1.0, 16.0, 2.0, 4.0]
-    for k in ("ALPHAGRAD_REJECT_FROZEN_GRADS", "ALPHAGRAD_GRAD_COVERAGE_WEIGHT"):
-        os.environ.pop(k, None)
 
 
 def test_symlog_exempt_set_is_unchanged_when_the_channel_is_off():

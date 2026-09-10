@@ -185,8 +185,8 @@ def merge_pool_plan_records(pool) -> dict:
     records ``env._record_terminal_plan`` appends. With the Ray pool active
     the measurement callback runs in the ACTOR processes, so the trainer's
     own list only ever holds the terminals it measured itself (the
-    ``ALPHAGRAD_POOL_TERMINAL_LOCAL`` rows) -- every other plan, including
-    every plan the frozen-gradient guard sentinelled, would be missing from
+    ``ALPHAGRAD_POOL_TERMINAL_LOCAL`` rows) -- every other plan would be
+    missing from
     a log the whole point of which is that nothing is missing.
 
     Each record is stamped with the ``actor`` it came from before it is
@@ -201,7 +201,17 @@ def merge_pool_plan_records(pool) -> dict:
     out = {"records": [], "dropped": 0, "actors_polled": 0,
            "actors_failed": 0, "have_pool": pool is not None,
            "actors_seen": 0, "error": None, "terminals": 0,
-           "actors_disabled": 0}
+           "actors_disabled": 0,
+           # Measure toolchain telemetry (finding 03): summed over actors;
+           # ``toolchain_ok`` is False if ANY polled actor's node failed.
+           "compile_fallbacks": 0, "compile_fallbacks_total": 0,
+           "toolchain_ok": True,
+           # Memory parity (ticket .49): the actors' (temp, watermark)
+           # records and the counts `env.check_mem_parity_complete` compares.
+           "mem_parity": {"records": [], "measured": 0, "dropped": 0},
+           # The paired rev-exact reference (ticket .9): one record per
+           # reference measurement the actors took.
+           "paired_ref": {"records": [], "dropped": 0}}
     try:
         import ray as _ray
         actors = list(pool.live_actors()) if pool is not None else []
@@ -212,11 +222,30 @@ def merge_pool_plan_records(pool) -> dict:
     for _h in actors:
         try:
             _s = _ray.get(_h.consume_plan_records.remote(), timeout=30)
-        except Exception:
+        except Exception as _exc:
+            # An actor whose memory parity is incomplete raises
+            # env.MemChannelFault from its drain; that is an apparatus
+            # fault and must not be counted as a failed poll.
+            from alphagrad.approx.cpu_approx_pool import _is_toolchain_fault
+            if _is_toolchain_fault(_exc):
+                raise
             out["actors_failed"] += 1
             continue
         out["actors_polled"] += 1
         out["terminals"] += int((_s or {}).get("terminals", 0))
+        _mp = (_s or {}).get("mem_parity") or {}
+        out["mem_parity"]["records"].extend(_mp.get("records", ()))
+        out["mem_parity"]["measured"] += int(_mp.get("measured", 0))
+        out["mem_parity"]["dropped"] += int(_mp.get("dropped", 0))
+        _pr = (_s or {}).get("paired_ref") or {}
+        out["paired_ref"]["records"].extend(_pr.get("records", ()))
+        out["paired_ref"]["dropped"] += int(_pr.get("dropped", 0))
+        out["compile_fallbacks"] += int(
+            (_s or {}).get("compile_fallbacks", 0))
+        out["compile_fallbacks_total"] += int(
+            (_s or {}).get("compile_fallbacks_total", 0))
+        out["toolchain_ok"] = out["toolchain_ok"] and bool(
+            (_s or {}).get("toolchain_ok", True))
         if not (_s or {}).get("enabled", True):
             out["actors_disabled"] += 1
         _aid = (_s or {}).get("actor_id")
