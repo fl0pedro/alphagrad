@@ -285,8 +285,6 @@ class MicroPPOAgent(eqx.Module):
     vertex_policy: Any        # ppo.PointerVertexPolicy
     value_pool_query: jax.Array
     value_head: Any           # MLP value-pooled -> (NUM_REWARDS,)
-    cost_pool_query: jax.Array  # cost-head aux: own attention-pool query
-    cost_head: Any            # MLP cost-pooled -> (NUM_REWARDS,) measured 4-tuple
     micro_action_policy: Any  # heads.MicroActionPolicy
 
     embd_dim: int = eqx.field(static=True)
@@ -334,12 +332,11 @@ class MicroPPOAgent(eqx.Module):
         )
         self.value_pool_query = jrand.normal(keys[3], (embd_dim,)) * 0.02
         self.value_head = MLP(embd_dim, NUM_REWARDS, value_dims, key=keys[4])
-        # Cost-head aux (ALPHAGRAD_COST_HEAD_AUX): own attention pool + MLP
-        # predicting the TERMINAL MEASURED 4-tuple in symlog space. Same shape
-        # as the Phase-1 probe head. Always constructed (cheap); only trained
-        # when the flag is on (weight 0 otherwise => value/policy unchanged).
-        self.cost_pool_query = jrand.normal(keys[6], (embd_dim,)) * 0.02
-        self.cost_head = MLP(embd_dim, NUM_REWARDS, value_dims, key=keys[7])
+        # keys[6] and keys[7] are deliberately UNDRAWN. They fed the
+        # cost-head aux task, which is gone (its flag defaulted off, no CLI
+        # exposed it and no launcher set it, so it never took gradient).
+        # ``jrand.split(key, 8)`` above is kept at 8 so every parameter that
+        # remains is initialised from exactly the key it had before.
         self.micro_action_policy = MicroActionPolicy(
             embd_dim=embd_dim, num_heads=num_heads,
             max_substeps=max_substeps, key=keys[5],
@@ -374,17 +371,6 @@ class MicroPPOAgent(eqx.Module):
         attn = jax.nn.softmax(scores, axis=-1)
         pooled = jnp.sum(attn[:, None] * enc_x, axis=0)
         return self.value_head(pooled)  # (NUM_REWARDS,)
-
-    def cost_from_encoding(self, enc_x, token_mask):
-        """Cost-head aux prediction: raw MEASURED 4-tuple (symlog space) from
-        the cost head's OWN attention pool over the shared encoder output."""
-        scores = (enc_x @ self.cost_pool_query) / jnp.sqrt(
-            jnp.float32(self.embd_dim)
-        )
-        scores = jnp.where(token_mask, scores, -1e9)
-        attn = jax.nn.softmax(scores, axis=-1)
-        pooled = jnp.sum(attn[:, None] * enc_x, axis=0)
-        return self.cost_head(pooled)  # (NUM_REWARDS,) symlog measured cost
 
     def policy_value_from_encoding(self, enc_x, token_mask):
         """``(vertex_logits (V,), vertex_contexts (V, E), value (K,))``."""
@@ -508,21 +494,6 @@ class PPORayWorker:
         _env_every = str(_os_ck.environ.get("ALPHAGRAD_CHECKPOINT_EVERY", "") or "").strip()
         if _env_every:
             self._checkpoint_every = int(_env_every)
-        # Cost-head auxiliary task (bridge-cse). OFF => weight 0 => the aux
-        # loss term vanishes and the update is byte-identical to baseline.
-        self._cost_head_aux = (
-            _os_ck.environ.get("ALPHAGRAD_COST_HEAD_AUX", "0").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
-        self._cost_head_aux_weight = float(
-            _os_ck.environ.get("ALPHAGRAD_COST_HEAD_AUX_WEIGHT", "0.3") or 0.3
-        ) if self._cost_head_aux else 0.0
-        # Encoder-grad flow toggle (default ON = the representation-learning
-        # benefit). OFF => stop_gradient on the encoder ctx for the aux loss.
-        self._cost_head_aux_encoder_grad = (
-            _os_ck.environ.get("ALPHAGRAD_COST_HEAD_AUX_ENCODER_GRAD", "1").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
         if self.args.no_jit:
             jax.config.update("jax_disable_jit", True)
         os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -1882,19 +1853,6 @@ class PPORayWorker:
         priority_weights_j = self.reward_weights     # (NUM_REWARDS,)
         active_count = jnp.maximum(jnp.sum(channel_mask_j), jnp.float32(1.0))
         factor_tables = self.factor_tables
-        # Cost-head aux constants (bridge-cse). Weight 0 when the flag is OFF
-        # -> the aux term drops out -> update byte-identical.
-        _cost_aux_weight_j = jnp.float32(self._cost_head_aux_weight)
-        _cost_aux_enc_grad = bool(self._cost_head_aux_encoder_grad)
-        # supervise ONLY the 4 measured target channels (latency_ns,
-        # xla_peak_memory, flops, cosine_sim); mask over NUM_REWARDS.
-        from alphagrad.approx.env import REWARD_INDEX as _RI
-        _cost_tgt_names = ["latency_ns", "xla_peak_memory", "flops", "cosine_sim"]
-        _cost_mask_np = np.zeros((NUM_REWARDS,), dtype=np.float32)
-        for _cn in _cost_tgt_names:
-            _cost_mask_np[_RI[_cn]] = 1.0
-        _cost_target_mask_j = jnp.asarray(_cost_mask_np)
-        _cost_active_k = jnp.float32(len(_cost_tgt_names))
         from alphagrad.approx.ppo import _axis_features_from_state
         from alphagrad.approx.common.gae import gdpo_normalise_advantages
 
@@ -1909,7 +1867,6 @@ class PPORayWorker:
                 actions, op_a, i_a, j_a, exp_a, f_a, kind_a, q_a,
                 axis_state_a, axis_valid_a, pair_valid_a, compress_valid_a,
                 old_log_probs, returns, advantages, valid,
-                cost_target, cost_valid,
             ) = batch
             if is_gdpo:
                 adv_scalar = gdpo_normalise_advantages(
@@ -1922,20 +1879,13 @@ class PPORayWorker:
 
             def per_sample(tok, eqn, av, v_act, op, i_s, j_s, exp_s, f_s,
                            kind_s, q_s, ax_st, ax_va, pv_s, cv_s,
-                           olp, ret, adv, k,
-                           cost_target, cost_valid):
+                           olp, ret, adv, k):
                 enc_x, token_mask = agent.encode_tokens(
                     tok, key=k, eqn_ids=eqn,
                 )
                 vertex_logits, vertex_contexts, value = (
                     agent.policy_value_from_encoding(enc_x, token_mask)
                 )
-                # Cost-head aux prediction (symlog measured 4-tuple). Encoder
-                # grad flow toggle: stop_gradient on enc_x when disabled so the
-                # aux loss trains only the cost head (default: flows into the
-                # shared encoder = the representation-learning benefit).
-                _enc_for_cost = enc_x if _cost_aux_enc_grad else jax.lax.stop_gradient(enc_x)
-                cost_pred = agent.cost_from_encoding(_enc_for_cost, token_mask)
                 # Same avail mask the rollout sampled under, so the vertex
                 # log-prob ratio is exact (legacy loss skipped this).
                 masked_v = jnp.where(av > 0.5, vertex_logits, -1e9)
@@ -1996,25 +1946,16 @@ class PPORayWorker:
                     value_loss = jnp.sum(
                         per_channel_se * channel_mask_j
                     ) / active_count
-                # AUX cost loss for THIS sample: Huber(cost_pred, symlog(target))
-                # over the 4 target channels, gated by cost_valid (terminal &
-                # non-failed). symlog matches the Phase-1 probe target space.
-                _cost_tgt_sl = jnp.sign(cost_target) * jnp.log1p(jnp.abs(cost_target))
-                _cost_err = optax.huber_loss(cost_pred, _cost_tgt_sl, delta=1.0)  # (K,)
-                _cost_err = jnp.sum(_cost_err * _cost_target_mask_j) / _cost_active_k
-                cost_aux_l = _cost_err * cost_valid  # 0 on non-terminal/failed
                 return (policy_loss, value_loss, entropy, per_head, logratio,
-                        n_components, cost_aux_l, cost_valid)
+                        n_components)
 
-            (p_l, v_l, ent, per_head_ent, logratio, n_comp,
-             cost_aux_l, cost_valid_v) = jax.vmap(
+            (p_l, v_l, ent, per_head_ent, logratio, n_comp) = jax.vmap(
                 per_sample
             )(
                 tokens, eqn_ids, avail,
                 actions, op_a, i_a, j_a, exp_a, f_a, kind_a, q_a,
                 axis_state_a, axis_valid_a, pair_valid_a, compress_valid_a,
                 old_log_probs, returns, adv_scalar, keys,
-                cost_target, cost_valid,
             )
             # Failed rows stay INCLUDED (bounded-negative penalty upstream
             # gives them a repulsive advantage) — same as the legacy loss.
@@ -2022,14 +1963,8 @@ class PPORayWorker:
             ppo_loss = jnp.mean(p_l)
             value_loss = jnp.mean(v_l)
             entropy_loss = -jnp.mean(ent)
-            # AUX cost-head loss: mean over the TERMINAL (cost_valid=1) samples
-            # only, weighted by ALPHAGRAD_COST_HEAD_AUX_WEIGHT (0 when OFF ->
-            # this term vanishes -> total is byte-identical to baseline).
-            _cost_n = jnp.maximum(jnp.sum(cost_valid_v), 1.0)
-            cost_aux_loss = jnp.sum(cost_aux_l) / _cost_n
             total = (ppo_loss + value_coef * value_loss
-                     + entropy_coef * entropy_loss
-                     + _cost_aux_weight_j * cost_aux_loss)
+                     + entropy_coef * entropy_loss)
             head_means = jnp.mean(per_head_ent, axis=0)  # (6,)
             # Fix 3: approx_kl for logging + Fix 2 KL early-stop. Schulman
             # low-variance non-negative estimator mean((r-1) - logratio).
@@ -2062,8 +1997,6 @@ class PPORayWorker:
                 "entropy/vertex": head_means[0],
                 "entropy/micro": head_means[1],
                 "total_loss": total,
-                "cost_head/aux_loss": cost_aux_loss,
-                "cost_head/n_terminal": _cost_n,
             }
             return total, aux
 
@@ -3095,16 +3028,6 @@ class PPORayWorker:
         # failed/sentinel). Flows into every minibatch so the loss can drop
         # failed rows (see loss_fn's ``valid`` arg).
         parts["valid"] = (_flat((~buf_failed).astype(np.float32)), ())
-        # Cost-head aux targets: the RAW MEASURED per-channel 4-tuple
-        # (buf_reward_vec_measured_raw, (T,N,K)) + a terminal-and-non-failed
-        # mask so the aux Huber loss only supervises real terminal
-        # measurements. Flattened to (N*T, K) / (N*T,) like the other parts.
-        parts["cost_target"] = (
-            _flat(buf_reward_vec_measured_raw, (NUM_REWARDS,)), (NUM_REWARDS,),
-        )
-        parts["cost_valid"] = (
-            _flat((buf_dones.astype(bool) & ~buf_failed).astype(np.float32)), (),
-        )
         if self.advantage_norm == "gdpo":
             parts["returns"] = (
                 returns_b.reshape(N * T, NUM_REWARDS), (NUM_REWARDS,),
@@ -3206,7 +3129,6 @@ class PPORayWorker:
                 mb["pair_valid"][i], mb["compress_valid"][i],
                 mb["log_probs"][i], mb["returns"][i], mb["advantages"][i],
                 mb["valid"][i],
-                mb["cost_target"][i], mb["cost_valid"][i],
             )
             key, mb_key = jrand.split(key)
             agent, opt_state, aux = self._update_step(

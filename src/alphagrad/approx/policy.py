@@ -4,6 +4,8 @@ PPO (``ppo_ray_worker``) and Gumbel-AlphaZero (``az_gumbel``) train the SAME
 network — :class:`MicroPPOAgent`: a causal-Palimpsa encoder over the
 append-only tokenized jaxpr, a ``PointerVertexPolicy`` over the eliminable
 vertices, the autoregressive micro-action heads, and a per-channel value head.
+The cost-head auxiliary task is GONE: its flag defaulted off, no CLI exposed it
+and no launcher set it, so it allocated two modules that never took gradient.
 PPO consumes the value head directly; GAZ reuses the vertex logits as its
 search prior and the value head as the leaf evaluator — no extra network, only
 a different consumer. Building both through one factory keeps the two trainers
