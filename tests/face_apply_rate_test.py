@@ -13,11 +13,17 @@ This test drives every sampled wire row through the path the MEASUREMENT uses
 reads the engine's own counters. A rejection is ``skipped_<kind>`` and the
 assertion is that it is zero.
 
-TWO GRAPHS ON PURPOSE. The legality comes from the stream's tokenizer and the
-apply runs on a separate ``IncrementalJaxpr`` advanced with the same wire rows,
-because that is the production arrangement (ppo.py rides the stream tokenizer
-for the mask and the ``_ElimChain`` for the face keys). If the two ever build
-different edges from one order, this test is where it shows.
+TWO ARMS, BECAUSE TWO DEFECTS. ``_walk_one_graph`` puts the mask and the apply
+on ONE tokenizer, so it states the per-slot legality claim alone. ``_walk``
+keeps the production pair of graphs (ppo.py rides the stream tokenizer for the
+mask and a second ``IncrementalJaxpr`` for the face keys), so it states that
+claim PLUS the duplication. Mixing them could not name either: the duplicated
+graph rejects Reduce rows on its own, and that would hide whether the legality
+itself is sound.
+
+AGGREGATED OVER SEEDS. A rejection appears on some seeds and not others, so a
+per-seed strict xfail XPASSes on the clean ones and fails for the wrong reason.
+Each claim is ONE test summing all ``N_SAMPLES`` seeds.
 
 Targets: nn256 (VmappedNeuralNetwork on mnist) and TLM, five random samples
 each, minimum Markowitz degree order.
@@ -151,8 +157,135 @@ def _row_to_wire(op, i, j, axis, dtype_idx, n_out):
     return (-1, -1, 0)
 
 
+
+def _walk_one_graph(target, seed, slots_on=None):
+    """One sampled plan with the mask and the apply ON THE SAME GRAPH.
+
+    ``_walk`` keeps the production pair of graphs; this owns a single
+    ``IncrementalPathTokenizer``, reads the per-slot legality off it through
+    ``LiveFaceStream._probe_faces`` (whose ``_Snapshot`` undoes the speculative
+    elimination) and then runs the real elimination on that same graph.
+
+    WHY BOTH. The two arrangements fail for different reasons, and a test that
+    mixed them could not name either: the duplicated graph contributes its own
+    rejections (finding 71: 4 of 9 Reduce, plus a face-key-list disagreement on
+    3 of 95 steps), which would mask whether the per-slot legality itself is
+    sound. This arm is the legality claim; ``_walk`` is the legality claim PLUS
+    the duplication.
+    """
+    from graphax import IncrementalPathTokenizer
+    from alphagrad.approx.common.masks import slot_legality
+    from alphagrad.approx.env import face_slot_sites
+
+    jaxpr, consts, args, argnums = target
+    vv = _valid_vertices(jaxpr, args, consts, argnums)
+    order = markowitz_order(jaxpr, argnums, consts, args, vv)
+    total_v = len(jaxpr.eqns)
+    F = MAX_FACES
+
+    lf = LiveFaceStream(jaxpr, argnums, consts, args,
+                        vocab=512, max_faces=F, max_axes=N_AX)
+    tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
+                                  vocab_size=512)
+    tk.base_tokens()
+    config = SimpleNamespace(jaxpr=jaxpr)
+    pol, tables = _policy(F)
+    feats = _features()
+    ctx = jnp.zeros((pol.embd_dim,), jnp.float32)
+    sites = face_slot_sites()
+
+    envmod._PER_FACE_STATS.clear()
+    requested = {k: 0 for k in KINDS}
+
+    for n in range(len(order)):
+        v = int(order[n])
+        keys = list(tk.ij.faces(v))
+        src = lf._probe_faces(tk, v, keys, True, slots=True, stat="slot") or {}
+        nf = min(len(keys), F)
+        sizes = np.zeros((F, FACE_SLOTS, N_AX), np.int32)
+        pair = np.zeros((F, FACE_SLOTS, N_AX, N_AX), np.float32)
+        comp = np.zeros((F, FACE_SLOTS, N_AX), np.float32)
+        quant = np.zeros((F, FACE_SLOTS, 2), np.float32)
+        nout = np.zeros((F, FACE_SLOTS), np.int32)
+        for k in range(nf):
+            by = src.get(keys[k]) or {}
+            for sl, site_list in enumerate(sites):
+                st = by.get(site_list[0])
+                if st is None:
+                    continue
+                also = tuple(by[x] for x in site_list[1:]
+                             if by.get(x) is not None)
+                L = slot_legality(st, N_AX, also=also)
+                sizes[k, sl], nout[k, sl] = L.sizes, L.n_out
+                pair[k, sl], comp[k, sl], quant[k, sl] = L.pair, L.comp, L.quant
+
+        rows = np.full((F, FACE_SLOTS, 3), -1, np.int32)
+        rows[..., 2] = 0
+        skips = np.zeros((F,), np.int32)
+        for f in range(nf):
+            key = jrand.PRNGKey(seed * 1000003 + n * 97 + f)
+            _skip, row, *_ = pol.sample_face(
+                feats, tables, key, f,
+                jnp.asarray(pair[f]), jnp.asarray(comp[f]), jnp.asarray(1.0),
+                face_context=ctx, face_sizes_f=jnp.asarray(sizes[f]),
+                face_quant_f=jnp.asarray(quant[f]))
+            for sl in range(FACE_SLOTS):
+                if slots_on is not None and _SLOT_SITES[sl] not in slots_on:
+                    continue
+                op = int(row["op_type"][sl])
+                if op == OP_NONE:
+                    continue
+                w = _row_to_wire(op, row["i"][sl], row["j"][sl], row["i"][sl],
+                                 row["quant_dtype"][sl], nout[f, sl])
+                if w is None:
+                    continue
+                requested[_OP_KIND[op]] += 1
+                rows[f, sl] = w
+        per_face = _face_dict_for_vertex(config, tk.ij, v, rows, skips)
+        arm_face_counts()
+        try:
+            tk.ij.eliminate(v, (), per_face or None)
+        finally:
+            disarm_face_counts()
+
+    out = dict(envmod._PER_FACE_STATS)
+    envmod._PER_FACE_STATS.clear()
+    return requested, out
+
+
+def _totals(walk, target, label, slots_on):
+    """Sum one walk over every seed. AGGREGATED ON PURPOSE: a rejection shows
+    up on some seeds and not others, so a per-seed strict xfail would XPASS on
+    the clean ones and fail for the wrong reason."""
+    req = {k: 0 for k in KINDS}
+    got: dict = {}
+    for seed in range(N_SAMPLES):
+        r, st = walk(target, seed, slots_on)
+        for k in KINDS:
+            req[k] += r[k]
+        for k, val in st.items():
+            got[k] = got.get(k, 0) + int(val)
+    assert sum(req.values()) > 0, (
+        f"{label}: the head requested nothing, so the test proved nothing")
+    return req, got
+
+
+def _assert_no_rejection(walk, target, label, slots_on=None):
+    req, stats = _totals(walk, target, label, slots_on)
+    for kind in KINDS:
+        skipped = int(stats.get(f"skipped_{kind}", 0))
+        assert skipped == 0, (
+            f"{label}: {skipped} {kind} rows the mask cleared were REJECTED "
+            f"at apply time over {N_SAMPLES} seeds "
+            f"({int(stats.get(f'applied_{kind}', 0))} applied, {req[kind]} "
+            f"requested). stats={stats}")
+    assert int(stats.get("skipped", 0)) == 0, stats
+
+
 def _walk(target, seed, slots_on=None):
-    """One sampled plan. Returns the engine's per-face counters."""
+    """One sampled plan on the PRODUCTION pair of graphs: the legality comes
+    from the stream's tokenizer and the apply runs on a separate
+    ``IncrementalJaxpr`` advanced with the same wire rows."""
     jaxpr, consts, args, argnums = target
     vv = _valid_vertices(jaxpr, args, consts, argnums)
     order = markowitz_order(jaxpr, argnums, consts, args, vv)
@@ -218,48 +351,43 @@ def _walk(target, seed, slots_on=None):
 
 
 # --------------------------------------------------------------------------
-# THE OPERAND SLOTS. lhs and rhs are the two edge Jacobians the contraction
-# reads, and their masks are exact: measured 0 rejections over 36 Diag, 72
-# Reduce and 104 Quant requests on TLM (job 64619), alone and together.
-# --------------------------------------------------------------------------
-@pytest.mark.parametrize("seed", range(N_SAMPLES))
-def test_nn256_operand_slots_reject_nothing(nn256, seed):
-    _assert_zero_rejection(nn256, seed, "nn256", slots_on=("lhs", "rhs"))
-
-
-@pytest.mark.parametrize("seed", range(N_SAMPLES))
-def test_tlm_operand_slots_reject_nothing(tlm, seed):
-    _assert_zero_rejection(tlm, seed, "tlm", slots_on=("lhs", "rhs"))
-
-
-# --------------------------------------------------------------------------
-# THE RESULT SLOT, ALONE. Finding 72 (job 64634, TLM, 3 seeds, every slot
-# armed) attributed every rejection to the graphax SITE the hook ran at:
+# ONE GRAPH: the per-slot legality claim by itself.
 #
-#   site      kind      invocations  legal  rejected
-#   lhs       diag               16     16         0
-#   rhs       diag               18     18         0
-#   res:jr    diag                7      1         6   <- fault 1
-#   res:new   diag               32     26         6   <- fault 2
+# The mask and the apply run on the SAME tokenizer, so nothing here can be
+# blamed on the duplicated elimination graph. Measured on TLM, 3 seeds, the
+# rejections attributed to the graphax SITE the hook ran at (job 64637, after
+# the site-set fix):
 #
-# FAULT 1 was the site SET. `env.face_entry_from_slots` installs the `new`
-# hook at TWO graphax sites under the default --approx-old same: `res:new` on
-# the fresh contraction and `res:jr` on the EXISTING OLD EDGE. The legality
-# probe hard-coded `((lhs, rhs, new), (None, None, None))` and recorded the
-# contraction result only, so the old edge -- a different tensor, measured
-# with a physically coupled pair where the result has a free one -- had no
-# mask at all. Fixed: `_probe_faces` builds its recording entry THROUGH
-# `face_entry_from_slots`, and `slot_legality(also=...)` ANDs over every site.
-# With `new` armed alone all `res:jr` rejections were fault 1, so this passes.
+#   slots armed    diag req/skip   reduce req/skip   quant req/skip
+#   lhs                 18 / 0           31 / 0           50 / 0
+#   rhs                 18 / 0           41 / 0           54 / 0
+#   new                 27 / 0           39 / 0           49 / 0
+#   lhs+rhs             36 / 0           72 / 0          104 / 0
+#   lhs+rhs+new         60 / 6          114 / 4          152 / 0   <- fault 2
 # --------------------------------------------------------------------------
-@pytest.mark.parametrize("seed", range(N_SAMPLES))
-def test_tlm_result_slot_alone_rejects_nothing(tlm, seed):
-    _assert_zero_rejection(tlm, seed, "tlm", slots_on=("new",))
+def test_tlm_operand_slots_reject_nothing_on_one_graph(tlm):
+    _assert_no_rejection(_walk_one_graph, tlm, "tlm one-graph lhs+rhs",
+                         slots_on=("lhs", "rhs"))
 
 
-@pytest.mark.parametrize("seed", range(N_SAMPLES))
-def test_nn256_result_slot_alone_rejects_nothing(nn256, seed):
-    _assert_zero_rejection(nn256, seed, "nn256", slots_on=("new",))
+def test_nn256_operand_slots_reject_nothing_on_one_graph(nn256):
+    _assert_no_rejection(_walk_one_graph, nn256, "nn256 one-graph lhs+rhs",
+                         slots_on=("lhs", "rhs"))
+
+
+def test_tlm_result_slot_alone_rejects_nothing_on_one_graph(tlm):
+    """FAULT 1, FIXED. The `new` hook is installed at TWO graphax sites under
+    the default --approx-old same -- `res:new` on the fresh contraction and
+    `res:jr` on the EXISTING OLD EDGE -- and the legality probe used to record
+    the first only. Before the fix `res:jr` refused 6 of 7 Diag invocations and
+    1 of 3 Reduce (job 64633); after it, 0 of 1 and 0 of 4 (job 64637)."""
+    _assert_no_rejection(_walk_one_graph, tlm, "tlm one-graph new",
+                         slots_on=("new",))
+
+
+def test_nn256_result_slot_alone_rejects_nothing_on_one_graph(nn256):
+    _assert_no_rejection(_walk_one_graph, nn256, "nn256 one-graph new",
+                         slots_on=("new",))
 
 
 def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
@@ -280,33 +408,30 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
             os.environ[envmod._APPROX_OLD_ENV] = want
             sites = envmod.face_slot_sites()
             assert sites[0] == ("lhs",) and sites[1] == ("rhs",), sites
-            assert sites[2][0].startswith("res:"), sites
-            if want == "same":
-                assert sites[2] == ("res:new", "res:jr"), sites
-            else:
-                assert sites[2] == ("res:jres",), sites
+            assert sites[2] == (("res:new", "res:jr") if want == "same"
+                                else ("res:jres",)), sites
             flat = {x for per in sites for x in per}
             lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
                                 max_faces=MAX_FACES, max_axes=N_AX)
             specs = np.zeros((len(jaxpr.eqns), 1, 3), np.int32)
             tk = lf._tokenizer_at(np.asarray(order), specs, 0)
-            seen = set()
+            seen: set = set()
             for v in [int(x) for x in order[:12]]:
-                keys = list(tk.ij.faces(v))
-                got = lf._probe_faces(tk, v, keys, True, slots=True,
-                                      stat="slot") or {}
+                got = lf._probe_faces(tk, v, list(tk.ij.faces(v)), True,
+                                      slots=True, stat="slot") or {}
                 for by_site in got.values():
                     seen |= set(by_site)
             assert seen, f"{want}: the probe recorded no site at all"
             assert seen <= flat, (
                 f"{want}: the probe records sites the entry never installs: "
                 f"{sorted(seen - flat)}")
-            # `res:jr` only exists on a face with an old edge, so the probe
+            # `res:jr` exists only on a face WITH an old edge, so the probe
             # legitimately records fewer sites than the topology lists -- but
-            # never a site outside it, and never fewer than the always-present
+            # never a site outside it, and never fewer than the unconditional
             # ones.
             assert {"lhs", "rhs", sites[2][0]} <= seen, (
-                f"{want}: probe missed {sorted({'lhs', 'rhs', sites[2][0]} - seen)}")
+                f"{want}: probe missed "
+                f"{sorted({'lhs', 'rhs', sites[2][0]} - seen)}")
     finally:
         if prev is None:
             os.environ.pop(envmod._APPROX_OLD_ENV, None)
@@ -316,16 +441,17 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
 
 # --------------------------------------------------------------------------
 # FAULT 2, STILL OPEN. Arming lhs and rhs makes `res:new` itself reject: 6 of
-# 32 Diag and 4 of 39 Reduce (job 64634), against 0 of 32 and 0 of 39 with
-# `new` armed alone. `new` holds the PRODUCT of lhs and rhs, so approximating
-# an operand changes the tensor `new`'s mask was read from -- and the head
-# draws all three slots from ONE distribution, so no mask computed before the
-# draw can know the operands' choices. Not fixable at the mask as structured:
-# it needs the slots decoded in APPLY order (re-probe `new` after lhs/rhs are
-# sampled) or the `new` slot turned into a graphax CHOOSER (core.py:1328 --
-# the hook is handed the live operand and returns the action it picked).
+# 26 Diag and 4 of 40 Reduce on one graph (job 64637), against 0 of 27 and 0
+# of 39 with `new` armed alone. `new` holds the PRODUCT of lhs and rhs, so
+# approximating an operand changes the tensor `new`'s mask was read from -- and
+# the head draws all three slots from ONE distribution, so no mask computed
+# before the draw can know the operands' choices. NOT fixable at the mask as
+# structured: it needs the slots decoded in APPLY order (re-probe `new` once
+# lhs/rhs are sampled) or the `new` slot turned into a graphax CHOOSER
+# (core.py:1328 -- the hook is handed the live operand and returns the action
+# it picked).
 #
-# STRICT xfail, so this flips to a failure the moment fault 2 is fixed. Do not
+# STRICT xfail, so it flips to a failure the moment fault 2 is fixed. Do not
 # relax it to a skip: a mask that clears an action the engine then refuses is
 # the defect dsnn-3qm.59 deliverable 3 exists to forbid.
 # --------------------------------------------------------------------------
@@ -333,37 +459,72 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
                    reason="dsnn-3qm.59 fault 2: arming lhs/rhs moves the "
                           "contraction result, so the `new` mask read off the "
                           "un-approximated product clears rows the engine "
-                          "refuses (6 of 32 Diag, 4 of 39 Reduce on TLM)")
-@pytest.mark.parametrize("seed", range(N_SAMPLES))
-def test_tlm_every_slot_rejects_nothing(tlm, seed):
-    _assert_zero_rejection(tlm, seed, "tlm")
+                          "refuses (6 of 26 Diag, 4 of 40 Reduce on TLM)")
+def test_tlm_every_slot_rejects_nothing_on_one_graph(tlm):
+    _assert_no_rejection(_walk_one_graph, tlm, "tlm one-graph all slots")
 
 
 @pytest.mark.xfail(strict=True,
                    reason="dsnn-3qm.59 fault 2: same operand-coupling defect "
                           "on nn256")
-@pytest.mark.parametrize("seed", range(N_SAMPLES))
-def test_nn256_every_slot_rejects_nothing(nn256, seed):
-    _assert_zero_rejection(nn256, seed, "nn256")
+def test_nn256_every_slot_rejects_nothing_on_one_graph(nn256):
+    _assert_no_rejection(_walk_one_graph, nn256, "nn256 one-graph all slots")
 
 
-def _assert_zero_rejection(target, seed, label, slots_on=None):
-    requested, stats = _walk(target, seed, slots_on)
-    total_req = sum(requested.values())
-    assert total_req > 0, (
-        f"{label} seed {seed}: the head requested nothing, so the test "
-        f"proved nothing. stats={stats}")
-    for kind in KINDS:
-        skipped = int(stats.get(f"skipped_{kind}", 0))
-        applied = int(stats.get(f"applied_{kind}", 0))
-        assert skipped == 0, (
-            f"{label} seed {seed}: {skipped} {kind} rows the mask cleared "
-            f"were REJECTED at apply time ({applied} applied, "
-            f"{requested[kind]} requested). stats={stats}")
-    # Every request the engine saw was applied, so the two counts must agree.
-    assert int(stats.get("skipped", 0)) == 0, stats
-    assert int(stats.get("applied", 0)) == sum(
-        int(stats.get(f"applied_{k}", 0)) for k in KINDS), stats
+# --------------------------------------------------------------------------
+# TWO GRAPHS: the production arrangement, and a SEPARATE open defect.
+#
+# ppo.py rides the stream tokenizer for the mask and a second
+# ``IncrementalJaxpr`` for the face keys. Finding 71 measured that the two
+# disagree about the FACE KEY LIST on 3 of 95 TLM steps (first at step 3,
+# vertex 8: the stream graph reports 0 keys, the apply graph 1), so row `f` of
+# the wire can describe a different face than the mask did. It also owns
+# Reduce rejections the single graph does not: with only lhs+rhs armed -- where
+# neither fault above can fire -- two graphs reject 3 Reduce over 5 TLM seeds
+# and one graph rejects none. Measured identically on the branch tip BEFORE the
+# site-set fix (job 64642 against 07fc4c4), so it is not a consequence of it.
+#
+# The fix is ticket .59's single-graph merge: one IncrementalJaxpr owns both
+# the legality and the apply. Until then, STRICT xfail.
+# --------------------------------------------------------------------------
+@pytest.mark.xfail(strict=True,
+                   reason="dsnn-3qm.59 (one graph): the legality tokenizer and "
+                          "the apply IncrementalJaxpr disagree on 3 of 95 TLM "
+                          "steps; 3 Reduce rows rejected over 5 seeds with only "
+                          "lhs+rhs armed, 0 on one graph")
+def test_tlm_operand_slots_reject_nothing_on_two_graphs(tlm):
+    _assert_no_rejection(_walk, tlm, "tlm two-graph lhs+rhs",
+                         slots_on=("lhs", "rhs"))
+
+
+@pytest.mark.xfail(strict=True,
+                   reason="dsnn-3qm.59 (one graph): same duplication defect on "
+                          "nn256, 1 Reduce row over 5 seeds")
+def test_nn256_operand_slots_reject_nothing_on_two_graphs(nn256):
+    _assert_no_rejection(_walk, nn256, "nn256 two-graph lhs+rhs",
+                         slots_on=("lhs", "rhs"))
+
+
+@pytest.mark.xfail(strict=True,
+                   reason="dsnn-3qm.59 (one graph): the `new` slot alone is "
+                          "clean on one graph and rejects 2 Reduce rows over 5 "
+                          "TLM seeds on two")
+def test_tlm_result_slot_alone_rejects_nothing_on_two_graphs(tlm):
+    _assert_no_rejection(_walk, tlm, "tlm two-graph new", slots_on=("new",))
+
+
+@pytest.mark.xfail(strict=True,
+                   reason="dsnn-3qm.59: fault 2 and the duplicated graph "
+                          "together")
+def test_tlm_every_slot_rejects_nothing_on_two_graphs(tlm):
+    _assert_no_rejection(_walk, tlm, "tlm two-graph all slots")
+
+
+@pytest.mark.xfail(strict=True,
+                   reason="dsnn-3qm.59: fault 2 and the duplicated graph "
+                          "together, nn256")
+def test_nn256_every_slot_rejects_nothing_on_two_graphs(nn256):
+    _assert_no_rejection(_walk, nn256, "nn256 two-graph all slots")
 
 
 def test_the_counters_are_silent_outside_the_armed_scope(tlm):
