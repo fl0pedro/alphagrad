@@ -214,6 +214,25 @@ def test_lossless_puts_no_join_hook_at_all(monkeypatch):
     assert [site for site, _, _ in log] == ["new"], log
 
 
+def test_an_UNARMED_face_gets_no_join_policy(monkeypatch):
+    """A face whose three slots are all None computes an EXACT contraction.
+
+    The old edge it merges into may legitimately be WIDER than that exact
+    contraction, because it accumulated approximated contributions at earlier
+    steps. A `lossy` policy there would project it down to a container nobody
+    asked to approximate -- information lost on a face the plan marked exact --
+    and it would falsify the documented property that a SKIP-only or exact plan
+    makes this flag inert.
+    """
+    monkeypatch.delenv("ALPHAGRAD_APPROX_OLD", raising=False)
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", "lossy")
+    entry = envmod.face_entry_from_slots((None, None, None))
+    assert entry == ((None, None, None), (None, None, None)), entry
+    # one armed slot is enough to bring the policy back
+    entry = envmod.face_entry_from_slots((None, None, lambda st: st))
+    assert entry[1][1] is not None and entry[1][1].mode == "lossy"
+
+
 def test_the_default_is_lossy(monkeypatch):
     entry, log, _ = _emit_and_eliminate(monkeypatch, None)
     assert envmod.approx_add() == "lossy"

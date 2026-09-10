@@ -4945,10 +4945,30 @@ def face_entry_from_slots(slots, at_site=None):
     core3 = (_at("lhs", slots[0]), _at("rhs", slots[1]),
              _at("res:new", _new_hook))
     mode = approx_add()
-    if mode == "lossy":
+    # AN UNARMED FACE STAYS EXACT, and the gate lives HERE.
+    #
+    # ``--approx-add`` says how the two addends of the ADD meet, and that is
+    # only a question when one of them was approximated. A face whose three
+    # slots are all None computes an EXACT contraction, and the old edge it
+    # merges into may legitimately be WIDER than that contraction (it
+    # accumulated approximated contributions at earlier steps). Installing a
+    # ``lossy`` policy there would project that old edge down to a container
+    # nobody asked to approximate -- information lost on a face the plan marked
+    # exact. It would also falsify the documented property that a SKIP-only or
+    # exact plan makes this flag INERT (``tools/gen_fq_launchers.py``).
+    #
+    # The three production callers (``_face_dict_for_vertex``,
+    # ``live_faces._decided``, ``masks.LiveVertexMaskOracle._face_ft``) each
+    # already skip an all-None face before calling here, so this gate changes
+    # nothing today. It lives here anyway because this function is "the ONLY
+    # place a face wire becomes a graphax entry": a guard held in three copies
+    # at the call sites is exactly the duplication that let the probe's site
+    # list drift from the measurement's (finding 72).
+    _armed = any(h is not None for h in (slots[0], slots[1], _new_hook))
+    if mode == "lossy" and _armed:
         return (core3, (None, MatchFreshJoin(on_outcome=_join_outcome_sink()),
                         None))
-    if mode == "lossless":
+    if mode in ("lossy", "lossless"):
         return (core3, (None, None, None))
     raise NotImplementedError(
         f"face_entry_from_slots: --approx-add {mode!r} is accepted by "
