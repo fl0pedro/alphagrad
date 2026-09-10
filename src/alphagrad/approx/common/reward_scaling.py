@@ -1266,7 +1266,6 @@ def build_wandb_log_dict(stats: dict, state: dict, ep: int) -> dict:
             or k.startswith("entropy/")
             or k.startswith("popart/")
             or k.startswith("ppo/")
-            or k.startswith("cost_head/")
         ):
             log_dict[k] = v
     return log_dict
