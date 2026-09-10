@@ -4660,6 +4660,33 @@ def decode_rule_specs_in_frame(out_shape, primal_shapes, spec_rows) -> tuple:
     return tuple(rules)
 
 
+def slot_rules_for_row(st, one_row) -> tuple:
+    """The rules :func:`make_slot_frame_hook` WOULD apply to ``st`` for the
+    wire row ``one_row`` -- the decode in this tensor's own frame
+    (:func:`slot_frame`) plus ticket .20's logical-dim -> physical-axis
+    conversion for COMPRESS.
+
+    Module-level and used by BOTH the hook and ``masks.slot_legality``, so the
+    mask asks the row the same question the engine will: one decoder, one
+    conversion, per tensor. The mask needs it per TENSOR because a slot's hook
+    is installed at several graphax sites (:func:`face_slot_sites`) and the
+    same row decodes differently in each site's frame.
+    """
+    from alphagrad.approx.common.masks import (
+        compress_rules_to_physical, reduce_axes_physical)
+    from alphagrad.approx.common.plan_log import kind_of_slot
+
+    row = tuple(int(x) for x in one_row)
+    spec_rows = [list(row)] + [[-1, -1, 0]] * (MAX_RULES_PER_VERTEX - 1)
+    out_shape, primal_shapes = slot_frame(st)
+    rules = decode_rule_specs_in_frame(out_shape, primal_shapes, spec_rows)
+    physical = (kind_of_slot(row[0], COMPRESS_SENTINEL, QUANT_SENTINEL)
+                == "compress" and reduce_axes_physical())
+    if physical and rules:
+        rules = compress_rules_to_physical(st, rules)
+    return rules
+
+
 def make_slot_frame_hook(one_row, *, stats: dict | None = None,
                          gated: bool = False):
     """ONE face slot's hook under ``--face-slot-frames slot`` (ticket .18, D2).
@@ -4678,12 +4705,11 @@ def make_slot_frame_hook(one_row, *, stats: dict | None = None,
     decoded rules for a tensor (tests, .59's apply-rate audit).
     """
     from alphagrad.approx.common.masks import (
-        compress_rules_to_physical, face_counts_armed, make_live_masked_hook,
-        reduce_axes_physical, reduce_axis_spaces)
+        face_counts_armed, make_live_masked_hook, reduce_axes_physical,
+        reduce_axis_spaces)
     from alphagrad.approx.common.plan_log import kind_of_slot
 
     row = tuple(int(x) for x in one_row)
-    spec_rows = [list(row)] + [[-1, -1, 0]] * (MAX_RULES_PER_VERTEX - 1)
     kind = kind_of_slot(row[0], COMPRESS_SENTINEL, QUANT_SENTINEL)
     cache: dict = {}
 
@@ -4698,10 +4724,7 @@ def make_slot_frame_hook(one_row, *, stats: dict | None = None,
                reduce_axis_spaces(st).phys_of_dim if physical else None)
         hit = cache.get(key)
         if hit is None:
-            rules = decode_rule_specs_in_frame(out_shape, primal_shapes,
-                                               spec_rows)
-            if physical and rules:
-                rules = compress_rules_to_physical(st, rules)
+            rules = slot_rules_for_row(st, row)
             inner = (make_live_masked_hook(rules, stats=stats, gated=gated)
                      if rules else None)
             hit = cache[key] = (rules, inner)
@@ -4755,7 +4778,7 @@ def approx_old() -> str:
     return want
 
 
-def face_entry_from_slots(slots):
+def face_entry_from_slots(slots, at_site=None):
     """ONE face's ``face_transforms`` entry from its decoded per-slot hooks
     ``(lhs, rhs, new)`` -- the ONLY place a face wire becomes a graphax
     entry (ticket .17, D1). ``_face_dict_for_vertex`` (the measurement),
@@ -4789,11 +4812,62 @@ def face_entry_from_slots(slots):
 
     --approx-old exact leaves the old edge alone: the bare 3-tuple
     is emitted and graphax never reaches the join hooks.
+
+    ``at_site(site, hook)`` -- OPTIONAL per-SITE adapter, and the reason this
+    function takes one at all: a slot's ONE hook object is installed at more
+    than one graphax site (``new`` AND ``jr`` under ``same``; ``jres`` alone
+    under ``exact``), so graphax invokes it on more than one TENSOR. A caller
+    that has to tell those tensors apart -- the legality probe, which needs
+    one mask per tensor the hook will meet -- cannot do it from the entry,
+    because the object is identical at every position. ``at_site`` is called
+    once per placement with the site name and returns the object to place
+    there. Default: the hook itself everywhere, which is what the measurement
+    installs. The site names are graphax's own (:func:`graphax.core.
+    _unpack_face_slots`), prefixed ``res:`` for the four result sites.
+
+    SITE NAMES ARE NOT DECORATION. ``_probe_faces`` builds its recording entry
+    through THIS function precisely so the set of sites it records can never
+    drift from the set the measurement installs -- the drift that made the
+    ``new`` slot's mask clear Diags the engine refused on the old edge
+    (finding 72, ticket .59 fault 1).
     """
+    def _at(site, hook):
+        if hook is None or at_site is None:
+            return hook
+        return at_site(site, hook)
+
     _new_hook = slots[2] if len(slots) > 2 else None
     if _new_hook is not None and approx_old() == "same":
-        return (tuple(slots), (None, _new_hook, None))
-    return tuple(slots)
+        core3 = (_at("lhs", slots[0]), _at("rhs", slots[1]),
+                 _at("res:new", _new_hook))
+        return (core3, (None, _at("res:jr", _new_hook), None))
+    if at_site is None:
+        return tuple(slots)
+    # The BARE triple's third position is graphax's POST-JOIN ``jres``, not
+    # ``new`` (_unpack_face_slots): a different tensor again, so it gets its
+    # own site name.
+    return (_at("lhs", slots[0]), _at("rhs", slots[1]),
+            _at("res:jres", _new_hook) if len(slots) > 2 else None)
+
+
+def face_slot_sites() -> tuple[tuple[str, ...], ...]:
+    """Per slot ``(lhs, rhs, new)``, the graphax SITES
+    :func:`face_entry_from_slots` places that slot's single hook at, under the
+    CURRENT :func:`approx_old`. The FIRST entry is the site the per-slot mask
+    is named for; the rest are the extra tensors the same wire row also lands
+    on, which the mask has to be intersected over.
+
+    DERIVED by calling the entry builder itself with tagging probes rather
+    than restated, so the two cannot drift.
+    """
+    got: list[list[str]] = [[], [], []]
+
+    def _tag(site, hook):
+        got[int(hook)].append(site)
+        return hook
+
+    face_entry_from_slots((0, 1, 2), at_site=_tag)
+    return tuple(tuple(g) for g in got)
 
 
 def _face_dict_for_vertex(config, ij, v, face_row, face_skip):

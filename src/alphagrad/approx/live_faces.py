@@ -847,11 +847,22 @@ class LiveFaceStream:
         Nothing it touches survives, which is what lets it run against the
         live prefix tokenizer instead of a private rebuild of it.
 
-        ``slots=True`` (``--face-slot-frames``, ticket .18 D3) records the
-        THREE operand slots instead of the result site, through the two-op
-        face form ``((lhs, rhs, new), (None, None, None))`` -- the sites the
-        env's per-slot hooks are applied at -- and returns
-        ``{face key: {"lhs" | "rhs" | "new": live SparseTensor}}``.
+        ``slots=True`` (ticket .18 D3) records ONE TENSOR PER GRAPHAX SITE,
+        through ``env.face_entry_from_slots`` itself -- the single place a
+        face wire becomes a graphax entry -- so the sites recorded here are
+        by construction the sites the measurement installs. Returns
+        ``{face key: {site: live SparseTensor}}`` keyed by
+        ``env.face_slot_sites()``'s names (``"lhs"``, ``"rhs"``, ``"res:new"``
+        and, when the face HAS an old edge, ``"res:jr"``).
+
+        Finding 72 / ticket .59 fault 1: this used to hard-code
+        ``((lhs, rhs, new), (None, None, None))``, recording the fresh
+        contraction and nothing else, while the measurement's entry put the
+        SAME ``new`` hook on graphax's ``jr`` -- the existing OLD EDGE, a
+        different tensor with its own index structure. The mask then cleared
+        Diags the engine refused there (6 of 32 on TLM). Hard-coding the entry
+        form in a second place is what allowed the drift, so it is not
+        hard-coded in a second place any more.
         """
         from jax._src import core as _jcore
         from graphax.core import _eliminate_vertex
@@ -874,8 +885,14 @@ class LiveFaceStream:
             return _rec
 
         if slots:
-            ft = {k: ((_mk(k, "lhs"), _mk(k, "rhs"), _mk(k, "new")),
-                      (None, None, None)) for k in keys}
+            from alphagrad.approx.env import face_entry_from_slots
+            # ONE recorder per SITE: face_entry_from_slots installs a slot's
+            # single hook at several sites, and `at_site` is the only way to
+            # tell those invocations apart (the objects are identical).
+            ft = {k: face_entry_from_slots(
+                      (0, 1, 2),
+                      at_site=lambda site, _h, k=k: _mk(k, site))
+                  for k in keys}
         else:
             ft = {k: (None, None, _mk(k)) for k in keys}
         prev = approx_active()
@@ -1020,8 +1037,20 @@ class LiveFaceStream:
         Same memo, same dispatch-mode AND, same face-key indexing and same
         "unvisited face = all zero" contract as :meth:`face_dim_sizes`; a
         pure read of the prefix tokenizer, like it.
+
+        AND OVER SITES, not just over dispatch modes (finding 72, .59 fault
+        1). A slot's ONE hook is invoked at every site
+        ``env.face_slot_sites()`` lists for it, on a DIFFERENT tensor each
+        time -- ``new`` also lands on the existing old edge under the default
+        ``--approx-old same``. The first site names the slot and supplies
+        ``sizes`` / ``n_out`` (the frame the wire is written in); the rest are
+        handed to ``slot_legality(also=...)``, which re-decodes the same wire
+        row in each one's frame. A merge-free face has no old edge, graphax
+        never reaches its join hooks, the probe records no tensor for that
+        site, and its mask is unchanged.
         """
         from alphagrad.approx.common.masks import slot_legality
+        from alphagrad.approx.env import face_slot_sites
 
         F, N = self.max_faces, self.max_axes
         S = len(_SLOT_SITES)
@@ -1055,16 +1084,21 @@ class LiveFaceStream:
                     for m in self._SIZE_DISPATCH_MODES]
         n_faces = min(len(keys), F)
         src = per_mode[0] or (per_mode[1] if len(per_mode) > 1 else {})
+        sites = face_slot_sites()
         for k in range(n_faces):
             kk = keys[k]
             by_site = src.get(kk)
-            for s, site in enumerate(_SLOT_SITES):
+            for s, site_list in enumerate(sites):
+                site = site_list[0]
                 st = None if by_site is None else by_site.get(site)
                 if st is None:
                     self.stats["slot_miss"] += 1
                     continue
+                also = () if by_site is None else tuple(
+                    by_site[x] for x in site_list[1:] if by_site.get(x)
+                    is not None)
                 try:
-                    L = slot_legality(st, N)
+                    L = slot_legality(st, N, also=also)
                 except Exception:
                     self.stats["slot_miss"] += 1
                     continue
@@ -1077,8 +1111,11 @@ class LiveFaceStream:
                     stm = (mode.get(kk) or {}).get(site)
                     if stm is None:
                         continue
+                    alsom = tuple(
+                        (mode.get(kk) or {})[x] for x in site_list[1:]
+                        if (mode.get(kk) or {}).get(x) is not None)
                     try:
-                        Lm = slot_legality(stm, N)
+                        Lm = slot_legality(stm, N, also=alsom)
                         pm &= Lm.pair
                         cm &= Lm.comp
                         qm &= Lm.quant

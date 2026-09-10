@@ -1917,8 +1917,35 @@ class SlotLegality(NamedTuple):
     quant: np.ndarray    # (len(FACE_QUANT_DTYPES),) bool
 
 
+def row_legal_on(st, one_row, max_axes: int = 8) -> bool:
+    """Is the WIRE ROW ``one_row`` applied by the hook on tensor ``st``?
+
+    The row is decoded in ``st``'s own frame by the very function the apply
+    path uses (``env.slot_rules_for_row``) and every rule it yields is put to
+    :func:`hook_rule_is_legal`. A row that decodes to nothing in this frame is
+    ILLEGAL, because that is exactly the case ``make_slot_frame_hook`` counts
+    ``skipped_<kind>``.
+
+    Needed because one slot's hook is installed at SEVERAL graphax sites
+    (``env.face_slot_sites``) and the same row decodes differently in each
+    site's frame -- the mask has to hold on all of them.
+    """
+    from alphagrad.approx.env import slot_rules_for_row
+
+    N = int(max_axes)
+    try:
+        rules = slot_rules_for_row(st, one_row)
+    except Exception:
+        return False
+    if not rules:
+        return False
+    return all(hook_rule_is_legal(st, r, max_dims=N, max_axes=N)
+               for r in rules)
+
+
 def slot_legality(st, max_axes: int = 8,
-                  dtypes: tuple = FACE_QUANT_DTYPES) -> SlotLegality:
+                  dtypes: tuple = FACE_QUANT_DTYPES,
+                  also=()) -> SlotLegality:
     """Per-slot legality FROM THE SLOT'S OWN LIVE TENSOR (ticket .18, D3).
 
     Every entry is the answer of :func:`hook_rule_is_legal` -- the predicate
@@ -1928,8 +1955,28 @@ def slot_legality(st, max_axes: int = 8,
     it" and "the hook applies it" are the same statement, slot by slot; that
     equality is what ``tests/face_slot_frames_test.py`` pins and what .59's
     apply-rate-equals-request-rate test can stand on.
+
+    ``also`` -- THE OTHER TENSORS THE SAME HOOK MEETS (finding 72, ticket .59
+    fault 1). A slot's single hook object is installed at every site
+    :func:`~alphagrad.approx.env.face_slot_sites` lists for it: under the
+    default ``--approx-old same`` the ``new`` hook runs on the fresh
+    contraction AND, via graphax's ``jr``, on the EXISTING OLD EDGE; under
+    ``exact`` it runs on the POST-JOIN sum instead. Those tensors carry their
+    own index structure -- measured on TLM: identical logical sizes, a
+    physically coupled pair on the old edge where the contraction result has a
+    free one -- so a row legal on one is not legal on the others. The mask is
+    therefore the AND over every site, each re-decoded in its own frame
+    (:func:`row_legal_on`). ``sizes`` / ``n_out`` stay the PRIMARY site's,
+    because they are the frame the head's ``(i, j)`` and the wire's
+    ``bi2 = j - n_out`` are written in.
+
+    Empty ``also`` is the single-site case and leaves the result untouched --
+    which is what a merge-free face genuinely is: graphax never reaches its
+    join hooks, so the probe records no extra tensor for it.
     """
     from graphax.sparse.micro_actions import Compress, Diag
+
+    from alphagrad.approx.env import COMPRESS_SENTINEL
 
     N = int(max_axes)
     sizes = dim_logical_sizes(st, N)
@@ -1937,6 +1984,7 @@ def slot_legality(st, max_axes: int = 8,
     n_log = n_out + len(st.primal_dims)
     pair = np.zeros((N, N), dtype=bool)
     comp = np.zeros((N,), dtype=bool)
+    others = tuple(s for s in also if s is not None)
     for i in range(min(n_log, N)):
         for j in range(min(n_log, N)):
             if i == j or (i < n_out) == (j < n_out):
@@ -1945,17 +1993,31 @@ def slot_legality(st, max_axes: int = 8,
             g = math.gcd(int(sizes[i]), int(sizes[j]))
             if g <= 1:
                 continue  # the decoder drops 0/1 factors: a no-op
-            pair[i, j] = hook_rule_is_legal(
+            ok = hook_rule_is_legal(
                 st, Diag(i=io, j=jp, factor=g), max_dims=N, max_axes=N)
+            if ok and others:
+                # The wire form of this pair -- the OUT-side relative position
+                # first, the PRIMAL-side one second, factor -1 = joint gcd --
+                # exactly as env.micro_actions_to_rule_specs_jax writes it.
+                row = (io, jp - n_out, -1)
+                ok = all(row_legal_on(o, row, N) for o in others)
+            pair[i, j] = ok
     for a in range(min(n_log, N)):
         rule = Compress(axes=(a,), kind="mean")
         if reduce_axes_physical():
             # Ticket .20: the head's token is a LOGICAL dim; the hook applies
             # the PHYSICAL axis the decode resolves it to. Same conversion.
             rule = compress_rules_to_physical(st, (rule,))[0]
-        comp[a] = hook_rule_is_legal(st, rule, max_dims=N, max_axes=N)
+        ok = hook_rule_is_legal(st, rule, max_dims=N, max_axes=N)
+        if ok and others:
+            row = (COMPRESS_SENTINEL, a, 0)
+            ok = all(row_legal_on(o, row, N) for o in others)
+        comp[a] = ok
+    quant = quant_valid_mask(st, dtypes)
+    for o in others:
+        quant = quant & quant_valid_mask(o, dtypes)
     return SlotLegality(sizes=sizes, n_out=int(n_out), pair=pair, comp=comp,
-                        quant=quant_valid_mask(st, dtypes))
+                        quant=quant)
 
 
 def couple_quant_rules(rules, applied_dtype=None):

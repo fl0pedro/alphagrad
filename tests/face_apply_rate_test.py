@@ -233,35 +233,115 @@ def test_tlm_operand_slots_reject_nothing(tlm, seed):
 
 
 # --------------------------------------------------------------------------
-# THE RESULT SLOT. Two faults, both measured on TLM in job 64619, both open:
+# THE RESULT SLOT, ALONE. Finding 72 (job 64634, TLM, 3 seeds, every slot
+# armed) attributed every rejection to the graphax SITE the hook ran at:
 #
-#   1. `new` alone rejects 6 of 32 Diag requests (19%) and 1 of 39 Reduce.
-#      lhs, rhs and lhs+rhs reject NOTHING, so this is specific to the
-#      contraction result -- the one tensor graphax itself computes. Leading
-#      suspect: `LiveFaceStream._size_probe_identity` is a per-VERTEX callable,
-#      which is what sets graphax's `_is_approx_cfg`, while the measured run
-#      carries an empty per-vertex tuple and puts everything in
-#      `face_transforms`. The probe and the measurement would then build the
-#      result through two different code paths.
-#   2. Arming lhs and rhs DOUBLES it (6 -> 12 Diag, 1 -> 5 Reduce), because
-#      `new` holds their product: approximating an operand moves the tensor
-#      `new`'s mask was read from.
+#   site      kind      invocations  legal  rejected
+#   lhs       diag               16     16         0
+#   rhs       diag               18     18         0
+#   res:jr    diag                7      1         6   <- fault 1
+#   res:new   diag               32     26         6   <- fault 2
 #
-# STRICT xfail, so this flips to a failure the moment either is fixed. Do not
+# FAULT 1 was the site SET. `env.face_entry_from_slots` installs the `new`
+# hook at TWO graphax sites under the default --approx-old same: `res:new` on
+# the fresh contraction and `res:jr` on the EXISTING OLD EDGE. The legality
+# probe hard-coded `((lhs, rhs, new), (None, None, None))` and recorded the
+# contraction result only, so the old edge -- a different tensor, measured
+# with a physically coupled pair where the result has a free one -- had no
+# mask at all. Fixed: `_probe_faces` builds its recording entry THROUGH
+# `face_entry_from_slots`, and `slot_legality(also=...)` ANDs over every site.
+# With `new` armed alone all `res:jr` rejections were fault 1, so this passes.
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("seed", range(N_SAMPLES))
+def test_tlm_result_slot_alone_rejects_nothing(tlm, seed):
+    _assert_zero_rejection(tlm, seed, "tlm", slots_on=("new",))
+
+
+@pytest.mark.parametrize("seed", range(N_SAMPLES))
+def test_nn256_result_slot_alone_rejects_nothing(nn256, seed):
+    _assert_zero_rejection(nn256, seed, "nn256", slots_on=("new",))
+
+
+def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
+    """THE INVARIANT FAULT 1 BROKE, stated directly.
+
+    ``face_slot_sites()`` is derived from ``face_entry_from_slots`` itself, so
+    it IS the set of sites the measurement installs. The probe must record a
+    tensor for each of them, or a slot's mask answers for a tensor the hook is
+    not applied to. Checked under BOTH ``--approx-old`` settings, because the
+    bare 3-tuple moves the third slot to ``res:jres``.
+    """
+    jaxpr, consts, args, argnums = tlm
+    vv = _valid_vertices(jaxpr, args, consts, argnums)
+    order = markowitz_order(jaxpr, argnums, consts, args, vv)
+    prev = os.environ.get(envmod._APPROX_OLD_ENV)
+    try:
+        for want in envmod.APPROX_OLD_CHOICES:
+            os.environ[envmod._APPROX_OLD_ENV] = want
+            sites = envmod.face_slot_sites()
+            assert sites[0] == ("lhs",) and sites[1] == ("rhs",), sites
+            assert sites[2][0].startswith("res:"), sites
+            if want == "same":
+                assert sites[2] == ("res:new", "res:jr"), sites
+            else:
+                assert sites[2] == ("res:jres",), sites
+            flat = {x for per in sites for x in per}
+            lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+                                max_faces=MAX_FACES, max_axes=N_AX)
+            specs = np.zeros((len(jaxpr.eqns), 1, 3), np.int32)
+            tk = lf._tokenizer_at(np.asarray(order), specs, 0)
+            seen = set()
+            for v in [int(x) for x in order[:12]]:
+                keys = list(tk.ij.faces(v))
+                got = lf._probe_faces(tk, v, keys, True, slots=True,
+                                      stat="slot") or {}
+                for by_site in got.values():
+                    seen |= set(by_site)
+            assert seen, f"{want}: the probe recorded no site at all"
+            assert seen <= flat, (
+                f"{want}: the probe records sites the entry never installs: "
+                f"{sorted(seen - flat)}")
+            # `res:jr` only exists on a face with an old edge, so the probe
+            # legitimately records fewer sites than the topology lists -- but
+            # never a site outside it, and never fewer than the always-present
+            # ones.
+            assert {"lhs", "rhs", sites[2][0]} <= seen, (
+                f"{want}: probe missed {sorted({'lhs', 'rhs', sites[2][0]} - seen)}")
+    finally:
+        if prev is None:
+            os.environ.pop(envmod._APPROX_OLD_ENV, None)
+        else:
+            os.environ[envmod._APPROX_OLD_ENV] = prev
+
+
+# --------------------------------------------------------------------------
+# FAULT 2, STILL OPEN. Arming lhs and rhs makes `res:new` itself reject: 6 of
+# 32 Diag and 4 of 39 Reduce (job 64634), against 0 of 32 and 0 of 39 with
+# `new` armed alone. `new` holds the PRODUCT of lhs and rhs, so approximating
+# an operand changes the tensor `new`'s mask was read from -- and the head
+# draws all three slots from ONE distribution, so no mask computed before the
+# draw can know the operands' choices. Not fixable at the mask as structured:
+# it needs the slots decoded in APPLY order (re-probe `new` after lhs/rhs are
+# sampled) or the `new` slot turned into a graphax CHOOSER (core.py:1328 --
+# the hook is handed the live operand and returns the action it picked).
+#
+# STRICT xfail, so this flips to a failure the moment fault 2 is fixed. Do not
 # relax it to a skip: a mask that clears an action the engine then refuses is
 # the defect dsnn-3qm.59 deliverable 3 exists to forbid.
 # --------------------------------------------------------------------------
 @pytest.mark.xfail(strict=True,
-                   reason="dsnn-3qm.59: the `new` slot's mask clears Diag and "
-                          "Reduce rows the apply path refuses (19% of Diag on "
-                          "TLM); arming lhs/rhs doubles it")
+                   reason="dsnn-3qm.59 fault 2: arming lhs/rhs moves the "
+                          "contraction result, so the `new` mask read off the "
+                          "un-approximated product clears rows the engine "
+                          "refuses (6 of 32 Diag, 4 of 39 Reduce on TLM)")
 @pytest.mark.parametrize("seed", range(N_SAMPLES))
 def test_tlm_every_slot_rejects_nothing(tlm, seed):
     _assert_zero_rejection(tlm, seed, "tlm")
 
 
 @pytest.mark.xfail(strict=True,
-                   reason="dsnn-3qm.59: same `new`-slot defect on nn256")
+                   reason="dsnn-3qm.59 fault 2: same operand-coupling defect "
+                          "on nn256")
 @pytest.mark.parametrize("seed", range(N_SAMPLES))
 def test_nn256_every_slot_rejects_nothing(nn256, seed):
     _assert_zero_rejection(nn256, seed, "nn256")
