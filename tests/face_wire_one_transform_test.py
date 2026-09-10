@@ -9,12 +9,12 @@ hooks the post-join sum ``jres``). The head chose one transform and the
 measurement scored another.
 
 Ruling: the two-op form is canonical. Every decoder now builds its entry
-through ``env.face_entry_from_slots``, so ``env.approx_old()`` is the one
+through ``env.face_entry_from_slots``, so ``env.approx_add()`` is the one
 reader of the old-edge configuration and one wire decodes to one entry.
 
 This is the ticket-16 diff probe
 (``.scratch/trustworthy-approx-search/probes/t16/probe_d1.py``) run on the
-ticket-.56 toy graph, never TLM. Pinned, for BOTH ``--approx-old`` values:
+ticket-.56 toy graph, never TLM. Pinned, for BOTH ``--approx-add`` values:
 
 1. The site set graphax's own ``_unpack_face_slots`` derives from each
    decoder's entry is identical across the four decoders (env, live_faces,
@@ -47,6 +47,7 @@ from graphax import SKIP_FACE, IncrementalJaxpr                 # noqa: E402
 from graphax.core import (                                      # noqa: E402
     _force, _is_two_op_slots, _stable_var_index, _unpack_face_slots)
 from graphax.sparse.micro_actions import QUANT_DTYPES           # noqa: E402
+from graphax.sparse.ops.join import FaceJoinPolicy               # noqa: E402
 
 import alphagrad.approx.env as envmod                           # noqa: E402
 from alphagrad.approx.common.masks import LiveVertexMaskOracle  # noqa: E402
@@ -152,8 +153,11 @@ def _instrument(entry, v, log):
     lhs, rhs, jres, new, join = _unpack_face_slots(entry, v)
 
     def w(h, site):
-        if h is None:
-            return None
+        # A FaceJoinPolicy is not callable and is dispatched on by TYPE, so
+        # wrapping it would make graphax take the hook branch and die. Pass it
+        # through: it records nothing by design (see the token test).
+        if h is None or isinstance(h, FaceJoinPolicy):
+            return h
 
         def g(t):
             din = None if t.val is None else str(t.val.dtype)
@@ -182,20 +186,21 @@ def _run_elim(T, v, prefix, entry):
     return log, edt
 
 
-def _set(monkeypatch, approx_old):
-    monkeypatch.setenv("ALPHAGRAD_APPROX_OLD", approx_old)
-    assert envmod.approx_old() == approx_old
+def _set(monkeypatch, approx_add):
+    monkeypatch.delenv("ALPHAGRAD_APPROX_OLD", raising=False)
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", approx_add)
+    assert envmod.approx_add() == approx_add
 
 
 # --------------------------------------------------------------------------
 # 1 + 2. the ticket-16 diff probe: an EMPTY diff across the four decoders
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("approx_old", ["same", "exact"])
+@pytest.mark.parametrize("approx_add", ["lossy", "lossless"])
 @pytest.mark.parametrize("face", [_JOIN, _MERGE_FREE],
                          ids=["join", "merge-free"])
-def test_the_diff_probe_is_empty(monkeypatch, approx_old, face):
-    _set(monkeypatch, approx_old)
+def test_the_diff_probe_is_empty(monkeypatch, approx_add, face):
+    _set(monkeypatch, approx_add)
     T = _toy()
     v, prefix = face
     rows, skips = _quant_new_rows()
@@ -206,11 +211,16 @@ def test_the_diff_probe_is_empty(monkeypatch, approx_old, face):
     forms = {n: _site_set(d[T.key], v) for n, d in dicts.items()}
     env_form, env_sites, env_hooks = forms["env"]
     # env is the reference: what the measurement applies.
-    if approx_old == "same":
+    # #73: BOTH values emit the TWO-OP form with `new` on the fresh
+    # contraction. `lossy` adds a join POLICY at `jr` -- not the slot's hook,
+    # which is the whole point: one wire row, one tensor, one mask.
+    if approx_add == "lossy":
         assert env_form == "two-op" and env_sites == {"new", "jr"}, forms["env"]
-        assert env_hooks["new"] is env_hooks["jr"], "old must carry new's hook"
+        assert env_hooks["new"] is not env_hooks["jr"], \
+            "the old edge must NOT carry the new slot's hook any more"
+        assert isinstance(env_hooks["jr"], FaceJoinPolicy), env_hooks["jr"]
     else:
-        assert env_form == "flat" and env_sites == {"jres"}, forms["env"]
+        assert env_form == "two-op" and env_sites == {"new"}, forms["env"]
     diff = {n: (f, sorted(env_sites - s), sorted(s - env_sites))
             for n, (f, s, _) in forms.items()
             if f != env_form or s != env_sites}
@@ -219,14 +229,16 @@ def test_the_diff_probe_is_empty(monkeypatch, approx_old, face):
     # The same sites FIRE, in the same order, with the same dtype
     # transitions, and the edge ends in the same dtype.
     ref_log, ref_dt = _run_elim(T, v, prefix, dicts["env"][T.key])
-    if v == _JOIN[0] and approx_old == "same":
-        assert [s for s, _, _ in ref_log] == ["new", "jr"], ref_log
+    if v == _JOIN[0]:
+        # Under BOTH values the only HOOK that fires is `new`, on the fresh
+        # contraction. `lossy`'s reconciliation is a policy, not a hook: it
+        # is dispatched on by type and never reaches
+        # `_apply_face_transform`, so it records nothing here. That is
+        # measured, not assumed -- see the token test below for what it means
+        # for the head's observation.
+        assert [s for s, _, _ in ref_log] == ["new"], ref_log
         assert all(din == "float32" and dout == "bfloat16"
                    for _, din, dout in ref_log), ref_log
-    elif v == _JOIN[0]:
-        # the flat triple's slot 2 lands at the post-join site; graphax
-        # tags it ``res`` -- the old edge is left alone.
-        assert [s for s, _, _ in ref_log] == ["res"], ref_log
     for name in ("live_faces", "plan_tokens", "masks"):
         log, dt = _run_elim(T, v, prefix, dicts[name][T.key])
         assert log == ref_log, (name, log, ref_log)
@@ -257,45 +269,65 @@ def _tokens_from_env_dict(T, rows, skips):
     return [int(t) for t in pt.tk.eliminate(1, (), ft)]
 
 
-@pytest.mark.parametrize("approx_old", ["same", "exact"])
-def test_head_tokens_equal_the_measured_graphs_tokens(monkeypatch, approx_old):
-    _set(monkeypatch, approx_old)
+@pytest.mark.parametrize("approx_add", ["lossy", "lossless"])
+def test_head_tokens_equal_the_measured_graphs_tokens(monkeypatch, approx_add):
+    _set(monkeypatch, approx_add)
     T = _toy()
     rows, skips = _quant_new_rows()
     assert _tokens_from_wire(T, rows, skips) == _tokens_from_env_dict(
         T, rows, skips)
 
 
-def test_the_head_sees_the_old_edge_choice(monkeypatch):
+def test_the_add_choice_is_INVISIBLE_in_the_token_stream(monkeypatch):
+    """MEASURED CONSEQUENCE OF #73, pinned so it cannot change unnoticed.
+
+    Under the retired ``--approx-old same`` the old edge carried the new slot's
+    own Quant, so the join face's token chunk differed from ``exact``'s -- the
+    head could SEE the configuration in its observation. A join POLICY is
+    dispatched on by type in graphax's merge branch and never reaches
+    ``_apply_face_transform``, so it emits no ``approx`` record and the token
+    stream is IDENTICAL under both values.
+
+    That is correct for what the tokens are (the plan's micro-actions, and a
+    reconciliation is not one) and it is a real limitation: within an episode
+    the head cannot observe which join semantics it ran under. It is still
+    learnable, because the REWARD carries it -- the two values change the
+    measured cost and quality, which is exactly why they are declared NOT
+    comparable. A future ``choose`` value emits the bit from the head itself,
+    so the head knows its own choice without needing to read it back.
+    """
     T = _toy()
     rows, skips = _quant_new_rows()
-    _set(monkeypatch, "same")
-    same = _tokens_from_wire(T, rows, skips)
-    _set(monkeypatch, "exact")
-    exact = _tokens_from_wire(T, rows, skips)
-    assert same != exact, "the join face's chunk must carry the old-edge cast"
-    # An all-NONE wire is untouched by the configuration: no entry is built.
+    _set(monkeypatch, "lossy")
+    lossy = _tokens_from_wire(T, rows, skips)
+    _set(monkeypatch, "lossless")
+    lossless = _tokens_from_wire(T, rows, skips)
+    assert lossy == lossless, (
+        "a join policy must record no micro-action; if the streams differ, "
+        "something is recording the reconciliation as an approximation")
+    # An all-NONE wire builds no entry at all, under either value.
     blank = np.full((MAX_FACES, FACE_SLOTS, 3), -1, np.int32)
     blank[..., 2] = 0
-    _set(monkeypatch, "same")
+    _set(monkeypatch, "lossy")
     a = _tokens_from_wire(T, blank, skips)
-    _set(monkeypatch, "exact")
+    _set(monkeypatch, "lossless")
     assert a == _tokens_from_wire(T, blank, skips)
 
 
 # --------------------------------------------------------------------------
-# 4. one reader: the head side goes through env.approx_old, nothing else
+# 4. one reader: the head side goes through env.approx_add, nothing else
 # --------------------------------------------------------------------------
 
-def test_the_head_side_reads_through_env_approx_old(monkeypatch):
-    # The hand-off variable says "same"; env.approx_old is made to say
-    # "exact". Every decoder must follow approx_old, so none of them reads
+def test_the_head_side_reads_through_env_approx_add(monkeypatch):
+    # The hand-off variable says "lossy"; env.approx_add is made to say
+    # "lossless". Every decoder must follow approx_add, so none of them reads
     # the variable on its own.
-    monkeypatch.setenv("ALPHAGRAD_APPROX_OLD", "same")
-    monkeypatch.setattr(envmod, "approx_old", lambda: "exact")
+    monkeypatch.delenv("ALPHAGRAD_APPROX_OLD", raising=False)
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", "lossy")
+    monkeypatch.setattr(envmod, "approx_add", lambda: "lossless")
     T = _toy()
     v, prefix = _JOIN
     rows, skips = _quant_new_rows()
     for name, d in _four_dicts(T, v, prefix, rows, skips).items():
         form, sites, _ = _site_set(d[T.key], v)
-        assert (form, sites) == ("flat", {"jres"}), (name, form, sites)
+        assert (form, sites) == ("two-op", {"new"}), (name, form, sites)

@@ -1041,12 +1041,14 @@ class LiveFaceStream:
         AND OVER SITES, not just over dispatch modes (finding 72, .59 fault
         1). A slot's ONE hook is invoked at every site
         ``env.face_slot_sites()`` lists for it, on a DIFFERENT tensor each
-        time -- ``new`` also lands on the existing old edge under the default
-        ``--approx-old same``. The first site names the slot and supplies
+        time. Under ``--approx-add`` (finding 73) every slot has exactly ONE
+        site, so the AND is over one tensor; the retired ``--approx-old same``
+        also landed ``new`` on the existing old edge, which is the drift this
+        construction exists to survive. The first site names the slot and supplies
         ``sizes`` / ``n_out`` (the frame the wire is written in); the rest are
         handed to ``slot_legality(also=...)``, which re-decodes the same wire
         row in each one's frame. A merge-free face has no old edge, graphax
-        never reaches its join hooks, the probe records no tensor for that
+        never reaches its join position, the probe records no tensor for that
         site, and its mask is unchanged.
         """
         from alphagrad.approx.common.masks import slot_legality

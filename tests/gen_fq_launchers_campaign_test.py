@@ -29,14 +29,14 @@ _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
 
 CAMPAIGN_NODES_ALLOWED = {"pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18"}
 PHASE1_NAMES = [
-    "p1a_skip_oldsame_lq5",
-    "p1b_all_oldsame_lq5",
-    "p1c_all_oldexact_lq5",
-    "p1d_reduce_oldsame_lq5",
-    "p1e_quant_oldsame_lq5",
-    "p1f_diag_oldsame_lq5",
-    "p1g_none_free_oldsame_lq5",
-    "p1h_all_free_oldsame_lq5",
+    "p1a_skip_addlossy_lq5",
+    "p1b_all_addlossy_lq5",
+    "p1c_all_addlossless_lq5",
+    "p1d_reduce_addlossy_lq5",
+    "p1e_quant_addlossy_lq5",
+    "p1f_diag_addlossy_lq5",
+    "p1g_none_free_addlossy_lq5",
+    "p1h_all_free_addlossy_lq5",
 ]
 _PLACEHOLDER = re.compile(r"\$\{([A-Z0-9_]+):\?[^}]*\}")
 
@@ -165,14 +165,14 @@ def test_the_measurement_environment_is_still_exported(gen, campaign):
 
 # ------------------------------------------- 4. names encode the knobs
 
-def test_each_name_encodes_profile_old_edge_and_price(gen, campaign):
+def test_each_name_encodes_profile_face_add_and_price(gen, campaign):
     for a in campaign:
         cli = _cli(gen, a)
         name = a["name"]
         prof = cli["--approx-profile"]
         prof_tok = "winner" if _PLACEHOLDER.search(prof) else prof
         assert f"_{prof_tok}_" in name, (name, prof)
-        assert f"_old{cli['--approx-old']}" in name, name
+        assert f"_add{cli['--approx-add']}" in name, name
         if "--preference-conditioned" not in cli:
             assert f"_lq{cli['--lambda-acc']}" in name, name
         elif cli.get("--reward-mode") == "lagrangian":
@@ -247,14 +247,15 @@ def test_phase1_and_phase2_run_raw_quality_no_floor(gen, campaign):
 
 # ------------------------------------------------- 6. per-phase shapes
 
-def test_the_all_rev_pair_differs_only_in_the_old_edge(gen, campaign):
-    same = _by_name(campaign, "p1b_all_oldsame_lq5")
-    exact = _by_name(campaign, "p1c_all_oldexact_lq5")
+def test_the_all_rev_pair_differs_only_in_the_face_add(gen, campaign):
+    same = _by_name(campaign, "p1b_all_addlossy_lq5")
+    exact = _by_name(campaign, "p1c_all_addlossless_lq5")
     cs, ce = _cli(gen, same), _cli(gen, exact)
-    assert cs["--approx-old"] == "same" and ce["--approx-old"] == "exact"
+    assert (cs["--approx-add"] == "lossy"
+            and ce["--approx-add"] == "lossless")
     assert cs["--approx-profile"] == ce["--approx-profile"] == "all"
     for k in set(cs) | set(ce):
-        if k in ("--approx-old", "--name"):
+        if k in ("--approx-add", "--name"):
             continue
         assert cs.get(k) == ce.get(k), k
     for k in ("kind", "node", "time", "gpus", "env", "phase"):
@@ -264,11 +265,11 @@ def test_the_all_rev_pair_differs_only_in_the_old_edge(gen, campaign):
     ts, te = gen.render(same), gen.render(exact)
     assert "test_face_two_op_form.py" in ts     # the two-op pre-flight (.56)
     assert "test_face_two_op_form.py" not in te
-    assert "  --approx-old exact\n" in te
+    assert "  --approx-add lossless\n" in te
 
 
 def test_the_diag_arm_is_emitted_and_held(gen, campaign):
-    diag = _by_name(campaign, "p1f_diag_oldsame_lq5")
+    diag = _by_name(campaign, "p1f_diag_addlossy_lq5")
     assert diag.get("held") and "dsnn-3qm.25" in diag["held"]
     text = gen.render(diag)
     assert "*** HELD" in text
@@ -290,29 +291,29 @@ def test_the_order_arms_lift_the_pin_and_the_others_keep_it(gen, campaign):
         text = gen.render(a)
         cli = _cli(gen, a)
         assert "ALPHAGRAD_FORCE_REV_ORDER" not in text, a["name"]
-        if a["name"] in ("p1g_none_free_oldsame_lq5",
-                         "p1h_all_free_oldsame_lq5"):
+        if a["name"] in ("p1g_none_free_addlossy_lq5",
+                         "p1h_all_free_addlossy_lq5"):
             assert cli["--fixed-order"] == "free", a["name"]
             assert a["time"] == "24:00:00", a["name"]
         else:
             assert cli["--fixed-order"] == "markowitz", a["name"]
-    order_only = _cli(gen, _by_name(campaign, "p1g_none_free_oldsame_lq5"))
+    order_only = _cli(gen, _by_name(campaign, "p1g_none_free_addlossy_lq5"))
     assert order_only["--approx-profile"] == "none"
     assert "--no-approx-head" not in order_only   # the profile IS the switch
     assert "--exact" not in order_only
-    free = _cli(gen, _by_name(campaign, "p1h_all_free_oldsame_lq5"))
+    free = _cli(gen, _by_name(campaign, "p1h_all_free_addlossy_lq5"))
     assert free["--approx-profile"] == "all"
-    assert _cli(gen, _by_name(campaign, "p1a_skip_oldsame_lq5"))["--approx-profile"] == "skip"
-    assert _cli(gen, _by_name(campaign, "p1d_reduce_oldsame_lq5"))["--approx-profile"] == "reduce"
-    assert _cli(gen, _by_name(campaign, "p1e_quant_oldsame_lq5"))["--approx-profile"] == "quant"
-    assert _cli(gen, _by_name(campaign, "p1f_diag_oldsame_lq5"))["--approx-profile"] == "diag"
+    assert _cli(gen, _by_name(campaign, "p1a_skip_addlossy_lq5"))["--approx-profile"] == "skip"
+    assert _cli(gen, _by_name(campaign, "p1d_reduce_addlossy_lq5"))["--approx-profile"] == "reduce"
+    assert _cli(gen, _by_name(campaign, "p1e_quant_addlossy_lq5"))["--approx-profile"] == "quant"
+    assert _cli(gen, _by_name(campaign, "p1f_diag_addlossy_lq5"))["--approx-profile"] == "diag"
 
 
 def test_phase2_channel_arms(gen, campaign):
     p2 = {a["name"]: _cli(gen, a) for a in campaign if a["phase"] == 2}
-    assert set(p2) == {"p2a_winner_oldsame_latq_lq5", "p2b_winner_oldsame_memq_lq5"}
-    assert p2["p2a_winner_oldsame_latq_lq5"]["--rewards"] == "cmp acc"
-    assert p2["p2b_winner_oldsame_memq_lq5"]["--rewards"] == "mem acc"
+    assert set(p2) == {"p2a_winner_addlossy_latq_lq5", "p2b_winner_addlossy_memq_lq5"}
+    assert p2["p2a_winner_addlossy_latq_lq5"]["--rewards"] == "cmp acc"
+    assert p2["p2b_winner_addlossy_memq_lq5"]["--rewards"] == "mem acc"
     for cli in p2.values():
         assert _PLACEHOLDER.search(cli["--approx-profile"]), cli["--approx-profile"]
         assert "P1_PROFILE" in cli["--approx-profile"]
@@ -320,12 +321,12 @@ def test_phase2_channel_arms(gen, campaign):
 
 def test_phase3_ladder_p0_p1_l(gen, campaign):
     p3 = {a["name"]: _cli(gen, a) for a in campaign if a["phase"] == 3}
-    assert set(p3) == {"p3a_winner_oldsame_pref",
-                       "p3b_winner_oldsame_pref_tau09",
-                       "p3c_winner_oldsame_dual_tau09"}
-    p0, p1, lag = (p3["p3a_winner_oldsame_pref"],
-                   p3["p3b_winner_oldsame_pref_tau09"],
-                   p3["p3c_winner_oldsame_dual_tau09"])
+    assert set(p3) == {"p3a_winner_addlossy_pref",
+                       "p3b_winner_addlossy_pref_tau09",
+                       "p3c_winner_addlossy_dual_tau09"}
+    p0, p1, lag = (p3["p3a_winner_addlossy_pref"],
+                   p3["p3b_winner_addlossy_pref_tau09"],
+                   p3["p3c_winner_addlossy_dual_tau09"])
     for cli in (p0, p1, lag):
         assert "--preference-conditioned" in cli
     assert "--quality-floor" not in p0 and p0["--reward-mode"] == "additive"
@@ -386,7 +387,7 @@ def test_setting_the_winner_constant_puts_the_profile_in_the_name(gen):
         a = gen.campaign_arm(phase=9, tag="z", profile="WINNER",
                              node="pgi15-gpu15", what="x",
                              prediction="x", falsifier="x")
-        assert a["name"] == "p9z_skip_oldsame_lq5"
+        assert a["name"] == "p9z_skip_addlossy_lq5"
         assert a["cli"]["--approx-profile"] == "skip"
         assert "P1_PROFILE" not in gen.render(a)
     finally:
@@ -408,7 +409,8 @@ def test_ppo_argparse_accepts_every_campaign_command_line(gen, campaign):
         assert ns.terminal_rewards_only, a["name"]
         assert ns.cost_form == "paired-log" and ns.mem_channel == "temp", a["name"]
         assert ns.quality_metric == "grad_cosine", a["name"]
-        assert ns.approx_old == cli["--approx-old"], a["name"]
+        assert ns.approx_add == cli["--approx-add"], a["name"]
+        assert ns.approx_old is None, a["name"]
         assert ns.face_none_bias == float(gen.FACE_NONE_BIAS_MVP), a["name"]
         assert ns.scale_face_head == float(gen.SCALE_FACE_HEAD_MVP), a["name"]
         assert ns.face_logit_clamp == float(gen.FACE_LOGIT_CLAMP_MVP), a["name"]

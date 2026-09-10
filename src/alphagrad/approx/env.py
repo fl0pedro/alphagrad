@@ -1552,11 +1552,15 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             # 0 because NOTHING WAS COUNTED, not because nothing applied.
             # `requested` is exact either way (it is read off the wire).
             "counts_from_trace": bool(counts_from_trace),
-            # WHICH old-edge configuration measured this plan (ticket .56):
-            # "same" (old carries new's approximation) or "exact". Read from
-            # the same function the face emitter reads, so the record cannot
-            # disagree with the measurement.
-            "approx_old": approx_old(),
+            # HOW THE FACE ADD's TWO ADDENDS MET while this plan was measured
+            # (ticket .56, finding 73): "lossy" (both forced into the
+            # approximated contraction's container) or "lossless" (the union
+            # of the two supports). Read from the same function the face
+            # emitter reads, so the record cannot disagree with the
+            # measurement. NOT poolable with the retired ``approx_old``
+            # column of pre-2026-09-10 records: "same" and "exact" named a
+            # different computation -- see env.approx_add's block comment.
+            "approx_add": approx_add(),
             # WHICH quantity reward slot 5 holds (ticket .49) and BOTH
             # memory numbers of this plan's timed executable, so a record
             # can be re-scored on the other channel without a re-measure.
@@ -4165,7 +4169,7 @@ _MEM_PARITY_CAP = 65536
 #              bit-identity gate (ALPHAGRAD_EQ_DUMP).
 # Under both the OTHER quantity is recorded beside it by `_record_mem_parity`
 # and drained through `consume_mem_parity`. Published by ppo.py from
-# --mem-channel before ray.init, exactly like ALPHAGRAD_APPROX_OLD: the
+# --mem-channel before ray.init, exactly like ALPHAGRAD_APPROX_ADD: the
 # flag is the only user surface, the variable is the transport to the Ray
 # measure actors, and this function is the one reader.
 _MEM_CHANNEL_ENV = "ALPHAGRAD_MEM_CHANNEL"
@@ -4955,7 +4959,7 @@ def face_entry_from_slots(slots, at_site=None):
 def face_slot_sites() -> tuple[tuple[str, ...], ...]:
     """Per slot ``(lhs, rhs, new)``, the graphax SITES
     :func:`face_entry_from_slots` places that slot's single hook at, under the
-    CURRENT :func:`approx_old`. The FIRST entry is the site the per-slot mask
+    CURRENT :func:`approx_add`. The FIRST entry is the site the per-slot mask
     is named for; the rest are the extra tensors the same wire row also lands
     on, which the mask has to be intersected over.
 
