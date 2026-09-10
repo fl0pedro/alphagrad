@@ -1958,10 +1958,8 @@ def slot_legality(st, max_axes: int = 8,
 
     ``also`` -- THE OTHER TENSORS THE SAME HOOK MEETS (finding 72, ticket .59
     fault 1). A slot's single hook object is installed at every site
-    :func:`~alphagrad.approx.env.face_slot_sites` lists for it: under the
-    default ``--approx-old same`` the ``new`` hook runs on the fresh
-    contraction AND, via graphax's ``jr``, on the EXISTING OLD EDGE; under
-    ``exact`` it runs on the POST-JOIN sum instead. Those tensors carry their
+    :func:`~alphagrad.approx.env.face_slot_sites` lists for it, and those
+    tensors carry their
     own index structure -- measured on TLM: identical logical sizes, a
     physically coupled pair on the old edge where the contraction result has a
     free one -- so a row legal on one is not legal on the others. The mask is
@@ -1970,9 +1968,18 @@ def slot_legality(st, max_axes: int = 8,
     because they are the frame the head's ``(i, j)`` and the wire's
     ``bi2 = j - n_out`` are written in.
 
-    Empty ``also`` is the single-site case and leaves the result untouched --
-    which is what a merge-free face genuinely is: graphax never reaches its
-    join hooks, so the probe records no extra tensor for it.
+    UNDER ``--approx-add`` (finding 73) EVERY SLOT HAS EXACTLY ONE SITE, so
+    ``also`` is empty and this reduces to the single-tensor question. It is
+    kept, and kept exercised, because it is the invariant that makes the
+    reduction SAFE: the site list comes from the entry builder itself, so if a
+    future value of ``--approx-add`` puts a slot's hook at a second tensor
+    again, the mask widens with it instead of going quietly stale. That
+    staleness was the defect -- the retired ``--approx-old same`` installed the
+    ``new`` hook at the fresh contraction AND at the pre-existing old edge, and
+    one mask answered for one of them.
+
+    Empty ``also`` is also what a merge-free face genuinely is: graphax never
+    reaches its join position, so the probe records no extra tensor for it.
     """
     from graphax.sparse.micro_actions import Compress, Diag
 

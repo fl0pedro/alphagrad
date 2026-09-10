@@ -81,6 +81,8 @@ from alphagrad.approx.common.order import (
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
     quality_metric as _env_quality_metric,
+    APPROX_ADD_CHOICES,
+    APPROX_ADD_DEFAULT,
     _AXIS_FEAT_GROUP_ID,
     consume_degenerate_plan_count,
     consume_fidelity_stats,
@@ -4503,20 +4505,29 @@ def make_argparser() -> argparse.ArgumentParser:
         "actors resolve the SAME metric as the trainer.",
     )
     p.add_argument(
-        "--approx-old",
-        choices=["same", "exact"],
-        default="same",
-        help="THE OLD EDGE (ticket .56). A face accumulation multiplies lhs "
-        "by rhs into new and adds new onto the existing predecessor-to-"
-        "successor edge (old) when that edge exists. same = old carries the "
-        "SAME approximation as new (graphax's two-op face form, the new-slot "
-        "hook in jr), so both operands of the add carry one structure; "
-        "exact = old is left exact because it already holds the sum of "
-        "approximated and exact contributions from earlier accumulations. "
+        "--approx-add",
+        choices=list(APPROX_ADD_CHOICES),
+        default=APPROX_ADD_DEFAULT,
+        help="THE ADD (ticket .56, finding 73). A face accumulation "
+        "multiplies lhs by rhs into new and, when the predecessor-to-"
+        "successor edge already exists, ADDS new onto it. Every "
+        "approximation lands on the contraction side; this flag says how the "
+        "ADD's two addends -- the fresh contraction and the old edge -- are "
+        "made to meet. lossy = force both into ONE container, the one the "
+        "approximated new slot landed on, projecting the old edge onto it, so "
+        "the add costs what the head chose. lossless = keep the most "
+        "information possible: the sum's support is the UNION of the two "
+        "supports, so no non-zero of either addend is dropped (graphax's "
+        "sparse + already builds that container: meta gcd, block lcm). "
         "The two are NOT comparable: the choice changes the measured object. "
-        "Published as ALPHAGRAD_APPROX_OLD (read by env.approx_old) so the "
+        "Published as ALPHAGRAD_APPROX_ADD (read by env.approx_add) so the "
         "Ray measure actors resolve the SAME configuration as the trainer; "
         "every plan-log record carries the value that measured it.",
+    )
+    p.add_argument(
+        "--approx-old",
+        default=None,
+        help=argparse.SUPPRESS,     # RETIRED -- see _retired_approx_old below
     )
     p.add_argument(
         "--reduce-axis-space",
@@ -6392,15 +6403,28 @@ def main():
     # like every other arm. --quality-metric none stays selectable by name.
     _qm = str(args.quality_metric)
     os.environ["ALPHAGRAD_QUALITY_METRIC"] = _qm
-    # OLD-EDGE CONFIGURATION (ticket .56), same hand-off shape as the quality
+    # THE FACE ADD (ticket .56, finding 73), same hand-off shape as the quality
     # channel: the flag is the ONLY user surface; the variable is how the Ray
     # measure actors (their own processes) resolve the value the trainer was
-    # given. env.approx_old() is the one reader -- _face_dict_for_vertex emits
-    # the two-op face form under "same" and the bare triple under "exact", and
-    # every plan-log record carries the value that measured it.
-    os.environ["ALPHAGRAD_APPROX_OLD"] = str(args.approx_old)
-    print(f"[alphagrad] old edge at the face join (--approx-old) = "
-          f"{args.approx_old}", flush=True)
+    # given. env.approx_add() is the one reader -- face_entry_from_slots emits
+    # graphax's two-op face form under BOTH values, with the `new` slot's hook
+    # at `res:new` and a join POLICY at `jr` under "lossy" / nothing under
+    # "lossless", and every plan-log record carries the value that measured it.
+    if getattr(args, "approx_old", None) is not None:
+        # A launcher that names a retired switch believes it chose something.
+        # Say so rather than ignoring it: `same` and `exact` name a DIFFERENT
+        # computation than any --approx-add value (env.approx_add's block
+        # comment says why), so there is no safe alias to map it onto.
+        raise SystemExit(
+            f"--approx-old is RETIRED (you passed {args.approx_old!r}). Use "
+            f"--approx-add {{{','.join(APPROX_ADD_CHOICES)}}}. The old "
+            f"values are NOT aliases: `same` installed one wire row on two "
+            f"differently-structured tensors and `exact` approximated the "
+            f"post-join SUM. Choose explicitly.")
+    os.environ.pop("ALPHAGRAD_APPROX_OLD", None)
+    os.environ["ALPHAGRAD_APPROX_ADD"] = str(args.approx_add)
+    print(f"[alphagrad] the face ADD (--approx-add) = "
+          f"{args.approx_add}", flush=True)
     # THE MEMORY CHANNEL (ticket .49), same transport, same reason: the
     # measure actors run env._callback in their own processes and
     # env.mem_channel is the one reader. The flag is the only control.

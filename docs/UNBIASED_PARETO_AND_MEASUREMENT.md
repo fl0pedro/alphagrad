@@ -105,10 +105,17 @@ Set explicitly in all five launchers. See §7(c): the default (`1`) emits a face
 form no graphax on disk accepts. **WORKED-AROUND.**
 
 *2026-09-04 (ticket .56): the env var no longer exists. The old-edge
-configuration is the argument `--approx-old {same,exact}` on `ppo.py`,
-`landscape_map.py` and `coverage_beam.py`; `=0` here corresponds to
+configuration became the argument `--approx-old {same,exact}` on `ppo.py`,
+`landscape_map.py` and `coverage_beam.py`; `=0` here corresponded to
 `--approx-old exact`, `=1` to `--approx-old same`. The lines above describe
 what these runs did, not a live switch.*
+
+*2026-09-10 (finding 73): `--approx-old` is RETIRED and raises. The switch is
+`--approx-add {lossy,lossless}`, and the values are NOT aliases of the old ones
+— `same` installed one wire row on two differently-structured tensors and
+`exact` approximated the post-join SUM, so a run recorded under either old value
+measured a different object than any `--approx-add` value does. Rows carrying the
+`approx_old` column must not be pooled with rows carrying `approx_add`.*
 
 ### 1.6 `GRAPHAX_QUANT_PULLDOWN=1` for the archive phases
 
@@ -654,10 +661,22 @@ approximation; it just does not also apply it to the existing edge at the join �
 and `env.py` states the two forms are **not comparable**. **The root cause is
 unfixed and the v57–v66 logs have not been audited for how many plans it ate.**
 
-*2026-09-04 (ticket .56): `ALPHAGRAD_NEW_SLOT_JOIN` is removed. The switch is
-`--approx-old {same,exact}` (`same` = the two-op form described here, the
+*2026-09-04 (ticket .56): `ALPHAGRAD_NEW_SLOT_JOIN` is removed. The switch
+became `--approx-old {same,exact}` (`same` = the two-op form described here, the
 default; `exact` = the plain 3-tuple the workaround selected), and every
 plan-log record carries the value that measured it.*
+
+*2026-09-10 (finding 73): retired again, and this time the defect described
+above is FIXED rather than configured around. `same` installed the SAME hook
+object at graphax's `res:new` and at `jr`, so one wire row ran on two tensors
+whose logical dims agreed and whose STORAGE did not — a legal block subdivision
+on one and an idempotent no-op on the other — and one legality mask answered for
+one of them (finding 72, fault 1). The switch is now
+`--approx-add {lossy,lossless}`; under BOTH values the slot's hook is installed
+at `res:new` ONLY and the ADD is expressed as a join POLICY that is handed both
+addends and returns them in one container. Measured on TLM, `new` armed alone:
+32 Diag requested with 0 rejected, against 27/0 under the finding-72 mask fix
+and 32/6 before it.*
 
 ### (d) DIAG per-face masking: implemented, measured, changes nothing — **commit `39d8bd1`, flag default OFF**
 

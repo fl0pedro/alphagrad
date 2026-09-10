@@ -376,11 +376,16 @@ def test_nn256_operand_slots_reject_nothing_on_one_graph(nn256):
 
 
 def test_tlm_result_slot_alone_rejects_nothing_on_one_graph(tlm):
-    """FAULT 1, FIXED. The `new` hook is installed at TWO graphax sites under
-    the default --approx-old same -- `res:new` on the fresh contraction and
-    `res:jr` on the EXISTING OLD EDGE -- and the legality probe used to record
-    the first only. Before the fix `res:jr` refused 6 of 7 Diag invocations and
-    1 of 3 Reduce (job 64633); after it, 0 of 1 and 0 of 4 (job 64637)."""
+    """FAULT 1, FIXED AT THE ROOT (#73).
+
+    The `new` hook used to be installed at TWO graphax sites under the retired
+    ``--approx-old same`` -- ``res:new`` on the fresh contraction and
+    ``res:jr`` on the EXISTING OLD EDGE -- and the legality probe recorded the
+    first only: ``res:jr`` refused 6 of 7 Diag invocations and 1 of 3 Reduce
+    (job 64633). Finding 72 made the MASK cover both sites, which fixed the
+    rejections at the cost of 32 -> 27 Diag requests. ``--approx-add`` removes
+    the second site instead: the ADD is a join POLICY, so one wire row meets
+    one tensor and the requests come back."""
     _assert_no_rejection(_walk_one_graph, tlm, "tlm one-graph new",
                          slots_on=("new",))
 
@@ -396,20 +401,24 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
     ``face_slot_sites()`` is derived from ``face_entry_from_slots`` itself, so
     it IS the set of sites the measurement installs. The probe must record a
     tensor for each of them, or a slot's mask answers for a tensor the hook is
-    not applied to. Checked under BOTH ``--approx-old`` settings, because the
-    bare 3-tuple moves the third slot to ``res:jres``.
+    not applied to. Checked under BOTH ``--approx-add`` settings.
+
+    #73: under BOTH values every slot now has exactly ONE site, and the `new`
+    slot's is ``res:new`` -- the fresh contraction, which is the tensor the
+    probe records and the mask is computed on. That is fault 1 removed at the
+    root rather than masked around: the retired ``--approx-old same`` listed
+    ``("res:new", "res:jr")`` here, two tensors for one wire row.
     """
     jaxpr, consts, args, argnums = tlm
     vv = _valid_vertices(jaxpr, args, consts, argnums)
     order = markowitz_order(jaxpr, argnums, consts, args, vv)
-    prev = os.environ.get(envmod._APPROX_OLD_ENV)
+    prev = os.environ.get(envmod._APPROX_ADD_ENV)
+    os.environ.pop(envmod._APPROX_OLD_ENV, None)
     try:
-        for want in envmod.APPROX_OLD_CHOICES:
-            os.environ[envmod._APPROX_OLD_ENV] = want
+        for want in envmod.APPROX_ADD_CHOICES:
+            os.environ[envmod._APPROX_ADD_ENV] = want
             sites = envmod.face_slot_sites()
-            assert sites[0] == ("lhs",) and sites[1] == ("rhs",), sites
-            assert sites[2] == (("res:new", "res:jr") if want == "same"
-                                else ("res:jres",)), sites
+            assert sites == (("lhs",), ("rhs",), ("res:new",)), (want, sites)
             flat = {x for per in sites for x in per}
             lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
                                 max_faces=MAX_FACES, max_axes=N_AX)
@@ -425,18 +434,17 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
             assert seen <= flat, (
                 f"{want}: the probe records sites the entry never installs: "
                 f"{sorted(seen - flat)}")
-            # `res:jr` exists only on a face WITH an old edge, so the probe
-            # legitimately records fewer sites than the topology lists -- but
-            # never a site outside it, and never fewer than the unconditional
-            # ones.
+            # Every site in the topology is now unconditional (a join POLICY
+            # is not a slot hook and has no mask), so the probe must record
+            # exactly the topology -- never a site outside it, never fewer.
             assert {"lhs", "rhs", sites[2][0]} <= seen, (
                 f"{want}: probe missed "
                 f"{sorted({'lhs', 'rhs', sites[2][0]} - seen)}")
     finally:
         if prev is None:
-            os.environ.pop(envmod._APPROX_OLD_ENV, None)
+            os.environ.pop(envmod._APPROX_ADD_ENV, None)
         else:
-            os.environ[envmod._APPROX_OLD_ENV] = prev
+            os.environ[envmod._APPROX_ADD_ENV] = prev
 
 
 # --------------------------------------------------------------------------

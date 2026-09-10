@@ -96,7 +96,7 @@ LANDSCAPE_FLAGS = [
     "--archive-max-measure", "--face-inventory", "--inventory-only",
     "--singleton-skip-sweep", "--sweep-stride", "--noise-floor-reps",
     "--report-only", "--tag", "--config-note", "--max-seconds",
-    "--approx-old",
+    "--approx-add",
 ]
 # wandb, as THREE constants rather than one opaque string, so the
 # pre-flight below and the emitted command line are provably the same
@@ -131,7 +131,7 @@ REQUIRED_FLAGS = [
     "--face-edge-mem",
     "--per-face-masks",
     "--plan-log",
-    "--approx-old",
+    "--approx-add",
     # Phase-0d flags the campaign arms (tickets .50-.54) pass: the profile
     # (.40), the cost form and the quality floor (.9), the memory channel
     # (.49), the init knobs (.44), the decode frames (.18, .20), the reward
@@ -171,10 +171,11 @@ REQUIRED_FLAGS_FILES = [
 # yet (ALPHAGRAD_FORCE_REV_ORDER, ALPHAGRAD_MAX_FACES, ALPHAGRAD_POLICY).
 PROMOTED_ENV_VARS = [
     "ALPHAGRAD_FACE_NONE_BIAS",        # --face-none-bias (.44)
-    "ALPHAGRAD_NEW_SLOT_JOIN",         # --approx-old (.56)
+    "ALPHAGRAD_NEW_SLOT_JOIN",         # --approx-add (.56)
     "ALPHAGRAD_QUALITY_GATE_MIN",      # deleted; --quality-floor (.9)
     "ALPHAGRAD_QUALITY_METRIC",        # --quality-metric (.39)
-    "ALPHAGRAD_APPROX_OLD",            # --approx-old (.56)
+    "ALPHAGRAD_APPROX_OLD",            # RETIRED (.56/73): env.approx_add raises
+    "ALPHAGRAD_APPROX_ADD",            # --approx-add (.56, finding 73)
     "ALPHAGRAD_MEM_CHANNEL",           # --mem-channel (.49)
     "ALPHAGRAD_MEM_PARITY",            # deleted (.49): parity always recorded
     "ALPHAGRAD_COST_FORM",             # --cost-form (.9)
@@ -238,8 +239,9 @@ SHARED_ENV = [
     ("ALPHAGRAD_MAX_FACES", "2538"),
     ("ALPHAGRAD_MAX_DELTA_TOKENS", "32768"),
     ("ALPHAGRAD_MAX_EQNS", "512"),
-    # The old-edge configuration (formerly ALPHAGRAD_NEW_SLOT_JOIN) is an
-    # ARGUMENT now: --approx-old in SHARED_CLI (ticket .56).
+    # The face-ADD configuration (formerly ALPHAGRAD_NEW_SLOT_JOIN, then
+    # ALPHAGRAD_APPROX_OLD) is an ARGUMENT now: --approx-add in SHARED_CLI
+    # (ticket .56, finding 73).
     ("ALPHAGRAD_POLICY", "palimpsa"),
     # The elimination order is an ARGUMENT now: --fixed-order on every train
     # arm (ticket .64; ALPHAGRAD_FORCE_REV_ORDER fails loudly when set).
@@ -392,13 +394,15 @@ SHARED_CLI = [
     # THE TRAINED QUALITY CHANNEL.  auto means grad_cosine since 2026-09-02;
     # the explicit pin is redundant and kept on purpose.
     ("--quality-metric", "grad_cosine"),
-    # THE OLD EDGE (ticket .56).  same = the new-slot approximation also hits
-    # the existing predecessor-to-successor edge at the join (graphax's two-op
-    # face form; the pre-flight below VERIFIES graphax accepts it), exact =
-    # the old edge is left exact.  NOT comparable across values.  The
-    # declared default, named so no arm inherits an unstated one; an arm
-    # overrides it in `cli`, or `arm_per_approx_old` emits it once per value.
-    ("--approx-old", "same"),
+    # THE FACE ADD (ticket .56, finding 73).  lossy = both addends are forced
+    # into the container the approximated `new` slot landed on, the old edge
+    # projected onto it (graphax's MatchFreshJoin at the two-op entry's `jr`
+    # position; the pre-flight below VERIFIES graphax accepts the form),
+    # lossless = the sum's support is the UNION of the two supports and no
+    # non-zero is dropped.  NOT comparable across values.  The declared
+    # default, named so no arm inherits an unstated one; an arm overrides it
+    # in `cli`, or `arm_per_approx_add` emits it once per value.
+    ("--approx-add", "lossy"),
     # THE MEASURE TOOLCHAIN GATE (finding 03).  abort is the default; named
     # so no arm can inherit a stale warn.  A SKIP IS A FAILURE.
     ("--measure-toolchain-gate", "abort"),
@@ -489,21 +493,22 @@ def arm(**kw):
     ARMS.append(kw)
 
 
-# The two old-edge configurations of ticket .56.  The owner's ruling: both run
-# at least once, as ONE PAIRED PAIR on the all-rev arm of .50, not in every
-# experiment.  `arm_per_approx_old` is how .43 emits that pair: one arm per
-# value, the value on the command line and in the name, everything else
-# byte-identical.  Nothing calls it yet -- .43 does.
-APPROX_OLD_CONFIGS = ("same", "exact")
+# The two face-ADD configurations of ticket .56 (finding 73 renamed them from
+# the retired `same` / `exact`, which named a DIFFERENT computation -- see
+# alphagrad.approx.env.approx_add).  The owner's ruling: both run at least
+# once, as ONE PAIRED PAIR on the all-rev arm of .50, not in every experiment.
+# `arm_per_approx_add` is how .43 emits that pair: one arm per value, the value
+# on the command line and in the name, everything else byte-identical.
+APPROX_ADD_CONFIGS = ("lossy", "lossless")
 
 
-def arm_per_approx_old(**kw):
-    """Emit ``kw`` once per --approx-old value: ``<name>_old<value>``."""
-    for cfg in APPROX_OLD_CONFIGS:
+def arm_per_approx_add(**kw):
+    """Emit ``kw`` once per --approx-add value: ``<name>_add<value>``."""
+    for cfg in APPROX_ADD_CONFIGS:
         a = dict(kw)
-        a["name"] = f"{kw['name']}_old{cfg}"
-        a["job"] = f"{kw['job']}-old{cfg}"
-        a["cli"] = dict(kw.get("cli", {}), **{"--approx-old": cfg})
+        a["name"] = f"{kw['name']}_add{cfg}"
+        a["job"] = f"{kw['job']}-add{cfg}"
+        a["cli"] = dict(kw.get("cli", {}), **{"--approx-add": cfg})
         arm(**a)
 
 
@@ -1113,15 +1118,15 @@ not a launch.""",
 # (same / exact), not in every experiment.  "all-rev" is read as ALL
 # classes under the reverse pin -- the wave-1 shape ticket .50 names, and
 # the only phase-1 arm where the old-edge choice can act at all: a SKIP-only
-# or exact plan writes no rule into any slot, so `--approx-old` is inert
+# or exact plan writes no rule into any slot, so `--approx-add` is inert
 # there (see the face_attrib env note).
 #
 # NAMES encode the phase, the profile, the order (free = pin lifted; rev is
-# the default and unnamed), the old edge, the channel set when not all
+# the default and unnamed), the face ADD, the channel set when not all
 # three, and the price: lq<lambda_q> for a fixed lambda, pref for
 # preference conditioning (P0), pref_tau<tau> for the floored P1, dual_tau
-# <tau> for the Lagrangian L.  p1c_all_oldexact_lq5 is phase 1, arm c, all
-# classes, reverse order, old edge exact, lambda_q = 5.
+# <tau> for the Lagrangian L.  p1c_all_addlossless_lq5 is phase 1, arm c, all
+# classes, reverse order, face ADD lossless, lambda_q = 5.
 #
 # INIT MVP (ticket .36 / finding 51 D.1; ALL TUNABLE, the owner's ruling):
 # --face-none-bias 4, --scale-face-head 0.1, --face-logit-clamp 15,
@@ -1171,14 +1176,14 @@ identity drift, which confirms the objective, not the init, as the blocker."""
 
 def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
                  prediction: str, falsifier: str,
-                 order: str = "markowitz", approx_old: str = "same",
+                 order: str = "markowitz", approx_add: str = "lossy",
                  rewards: str = "cmp mem acc", form: str = "fixed",
                  lambda_q: str = LAMBDA_Q_MVP, advantage_norm: str = "none",
                  seed: str = CAMPAIGN_SEED, time: str | None = None,
                  held: str | None = None, depends: str | None = None) -> dict:
     """One row of the campaign table -> one `arm(...)`.  Returns the arm."""
     assert order in ("markowitz", "reverse", "free"), order
-    assert approx_old in APPROX_OLD_CONFIGS, approx_old
+    assert approx_add in APPROX_ADD_CONFIGS, approx_add
     assert form in _FORMS, form
     assert rewards in _CHANNEL_TOKEN, rewards
     assert advantage_norm in ("none", "popart"), advantage_norm
@@ -1194,7 +1199,7 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
     name = f"p{phase}{tag}_{prof_tok}"
     if order != "markowitz":
         name += f"_{order}"
-    name += f"_old{approx_old}"
+    name += f"_add{approx_add}"
     if rewards != "cmp mem acc":
         name += f"_{_CHANNEL_TOKEN[rewards]}"
     name += f"_{lam_tok}"
@@ -1211,7 +1216,7 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
         # every fixed-order arm, reverse only as the control (.60), free
         # for the order arms.  One table, common/order.py.
         "--fixed-order": order,
-        "--approx-old": approx_old,
+        "--approx-add": approx_add,
         "--face-none-bias": FACE_NONE_BIAS_MVP,
         "--scale-face-head": SCALE_FACE_HEAD_MVP,
         "--face-logit-clamp": FACE_LOGIT_CLAMP_MVP,
@@ -1277,22 +1282,24 @@ Reduce, Quant and Diag are masked; the face head chooses skip / none.""",
     falsifier=_P1_FALSIFIER,
 )
 
-for _tag, _old in (("b", "same"), ("c", "exact")):
+for _tag, _old in (("b", "lossy"), ("c", "lossless")):
     campaign_arm(
-        phase=1, tag=_tag, profile="all", approx_old=_old,
-        node=CAMPAIGN_NODES[1 if _old == "same" else 2],
-        what=f"""ALL-REV, old edge {_old.upper()} (--approx-old {_old}).  Every
+        phase=1, tag=_tag, profile="all", approx_add=_old,
+        node=CAMPAIGN_NODES[1 if _old == "lossy" else 2],
+        what=f"""ALL-REV, face ADD {_old.upper()} (--approx-add {_old}).  Every
 class legal under the reverse pin -- the wave-1 shape under the new reward,
 and the class-ablation reference the single-class arms are read against.
-The paired pair of ticket .56: p1b (same) and p1c (exact) are byte-identical
-except for --approx-old; they are NOT comparable as a reward difference (the
-choice changes the measured object) but as a pair they show whether the old
-edge's approximation moves the temp or the quality of the same plans.""",
+The paired pair of ticket .56: p1b (lossy) and p1c (lossless) are
+byte-identical except for --approx-add; they are NOT comparable as a reward
+difference (the choice changes the measured object) but as a pair they show
+whether forcing the ADD's two addends into one container -- instead of keeping
+the union of their supports -- moves the temp or the quality of the same
+plans.""",
         prediction=CAMPAIGN_P1_PREDICTION + f"""
   * this arm does NO BETTER on paired latency than p1a (SKIP-only): the
     latency wins are skips, and the extra classes buy temp (Reduce) or
     nothing (Diag, finding 54) at a quality price.
-  * old edge {_old}: same and exact differ in paired/temp_ratio_* and
+  * face ADD {_old}: lossy and lossless differ in paired/temp_ratio_* and
     paired/grad_cosine_* for plans carrying Reduce or Quant rules, and are
     identical for SKIP-only plans (the old edge is inert without a rule).""",
         falsifier=_P1_FALSIFIER + """
@@ -1585,7 +1592,7 @@ COMMON="--example TransformerLM --dataset wikitext2 \
  --exec-on-gpu \
  --cmp-type latency --mem-type peak_memory \
  --num-data-points 5 --reps-per-point 4 \
- --quality-metric grad_cosine --approx-old same --walk-steps 200 \
+ --quality-metric grad_cosine --approx-add lossy --walk-steps 200 \
  --out-dir $OUT"
 
 run_on () {   # $1 = gpu index, $2 = label, rest = args
@@ -1656,12 +1663,13 @@ arm(
         # AND cheapest.  Relevant here because this arm's quality channel IS
         # grad_cosine.
         "ALPHAGRAD_GRAD_COSINE_K": "1",
-        # --approx-old is left at the shared default (same).  The
-        # hand-written predecessor forced the old edge exact because the
+        # --approx-add is left at the shared default (lossy).  The
+        # hand-written predecessor forced the old edge EXACT because the
         # PINNED graphax 4ea0bf8 rejects the res-slot two-op form; the live
         # graphax accepts it (e5fd46c) and the two-op pre-flight above
         # VERIFIES that before any phase runs.  It is inert for QB in any
-        # case -- a SKIP-only plan writes no rule into any slot.
+        # case -- a SKIP-only plan writes no rule into any slot, so there is
+        # no approximated contraction for the ADD to reconcile against.
         #
         # ---- DROPPED FROM THE TRAINING STACK -----------------------------
         # SHARED_ENV describes ppo.py.  One of these does not merely add noise
@@ -1888,7 +1896,7 @@ def render(a: dict) -> str:
     L.append(f"#   64 = a flag this launcher needs is not defined in {_flagsrc}")
     L.append("#   65 = argparse rejected the assembled command line")
     L.append("#   66 = a tool this launcher invokes does not exist")
-    L.append("#   70 = graphax cannot lower the two-op face form --approx-old same asks for")
+    L.append("#   70 = graphax cannot lower the two-op face form --approx-add asks for")
     if _has_wandb:
         L.append("#   71 = --wandb online, but this node cannot reach or"
                  " authenticate to wandb")
@@ -1917,9 +1925,9 @@ def render(a: dict) -> str:
     L.append("  exit 64")
     L.append("fi")
     L.append("")
-    _approx_old = dict(_merge_cli(a.get("cli", {}))).get("--approx-old", "same")
-    if kind != "cpu" and _approx_old == "same":
-        L.append("# --approx-old same emits the res-slot two-op face form.")
+    _approx_add = dict(_merge_cli(a.get("cli", {}))).get("--approx-add", "lossy")
+    if kind != "cpu":
+        L.append(f"# --approx-add {_approx_add} emits the res-slot two-op face form.")
         L.append("# On a graphax that rejects it, EVERY plan putting a rule in the")
         L.append("# res/new slot dies in _trace_truncate SILENTLY -- no counter, no")
         L.append("# log line.  That went unnoticed for a whole campaign.  VERIFY.")
@@ -1928,7 +1936,7 @@ def render(a: dict) -> str:
         L.append("    $HOME/dsnn/graphax/tests/misc/test_face_two_op_form.py \\")
         L.append("    -p no:cacheprovider >/tmp/twoop_$SLURM_JOB_ID.log 2>&1 || {")
         L.append('    echo "ABORT(70): graphax rejects the res-slot two-op form,"')
-        L.append('    echo "           but --approx-old same emits it."')
+        L.append('    echo "           but --approx-add emits it."')
         L.append("    tail -20 /tmp/twoop_$SLURM_JOB_ID.log")
         L.append("    exit 70")
         L.append("  }")

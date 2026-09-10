@@ -333,10 +333,21 @@ def test_face_dict_applies_in_the_slot_frame_end_to_end():
     assert st.get("skipped_compress", 0) == 1, st
 
 
-def test_two_op_form_puts_the_new_slot_hook_on_the_old_edge():
-    """Unchanged contract (ticket .56): under --approx-old same the third
-    slot's hook also rides in graphax's ``jr``. With slot frames it decodes
-    in the OLD edge's own frame when it gets there."""
+def test_two_op_form_keeps_the_new_slot_hook_OFF_the_old_edge():
+    """CHANGED contract (ticket .56, finding 73).
+
+    The entry is still graphax's TWO-OP form -- ``new`` hooks the fresh
+    contraction, BEFORE any join -- but the ``jr`` position no longer holds the
+    slot's hook. Under ``--approx-add lossy`` it holds a join POLICY, which is
+    handed both addends and makes them share one container; under ``lossless``
+    it holds nothing. Either way the slot's wire row is decoded in exactly ONE
+    frame, which is the frame its legality mask was computed in.
+
+    The retired ``--approx-old same`` put the SAME hook object in ``jr`` too,
+    so one row decoded in two different frames and the mask answered for one of
+    them (finding 72, fault 1).
+    """
+    from graphax.sparse.ops.join import FaceJoinPolicy
     closed = _closed(_chain, _ARGS)
     config = SimpleNamespace(jaxpr=closed.jaxpr)
     ij, keys, key, _st = _x_face(closed, _ARGS)
@@ -345,8 +356,15 @@ def test_two_op_form_puts_the_new_slot_hook_on_the_old_edge():
     per_face = _face_dict_for_vertex(config, ij, 1, rows, skips)
     entry = per_face[key]
     assert len(entry) == 2 and len(entry[0]) == 3 and len(entry[1]) == 3
-    assert entry[0][2] is entry[1][1]
+    assert entry[0][2] is not None
+    assert entry[0][2] is not entry[1][1], \
+        "the old edge must not carry the new slot's hook any more"
+    assert entry[1][1] is None or isinstance(entry[1][1], FaceJoinPolicy)
+    assert entry[1][0] is None and entry[1][2] is None
     assert entry[0][0] is None and entry[0][1] is None
+    # the mask's site list agrees: ONE site for the `new` slot
+    import alphagrad.approx.env as _e
+    assert _e.face_slot_sites()[2] == ("res:new",), _e.face_slot_sites()
 
 
 # ==========================================================================
