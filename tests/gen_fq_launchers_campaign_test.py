@@ -209,7 +209,6 @@ def test_every_campaign_arm_carries_the_shared_contract(gen, campaign):
                      " --terminal-rewards-only ",
                      " --plan-log auto ", " --episodes 250 ",
                      " --measure-toolchain-gate abort ",
-                     " --face-slot-frames slot ",
                      " --reduce-axis-space physical ",
                      f" --gate-winners-table {gen.GATE_WINNERS_TABLE} ",
                      f" --face-none-bias {gen.FACE_NONE_BIAS_MVP} ",

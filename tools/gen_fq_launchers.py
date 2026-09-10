@@ -144,7 +144,6 @@ REQUIRED_FLAGS = [
     "--mem-channel",
     "--scale-face-head",
     "--face-logit-clamp",
-    "--face-slot-frames",
     "--reduce-axis-space",
     "--rewards",
     "--lambda-acc",
@@ -179,7 +178,6 @@ PROMOTED_ENV_VARS = [
     "ALPHAGRAD_MEM_CHANNEL",           # --mem-channel (.49)
     "ALPHAGRAD_MEM_PARITY",            # deleted (.49): parity always recorded
     "ALPHAGRAD_COST_FORM",             # --cost-form (.9)
-    "ALPHAGRAD_FACE_SLOT_FRAMES",      # --face-slot-frames (.18)
     "ALPHAGRAD_REDUCE_AXIS_SPACE",     # --reduce-axis-space (.20)
     "ALPHAGRAD_MEASURE_TOOLCHAIN_GATE",  # --measure-toolchain-gate (.21)
     "ALPHAGRAD_PLAN_LOG",              # --plan-log
@@ -418,10 +416,10 @@ SHARED_CLI = [
     # beside it (measure/mem_parity/*).  --mem-type peak_memory above still
     # selects WHICH slot --lambda-mem weights.
     ("--mem-channel", "temp"),
-    # THE DECODE FRAMES (tickets .18 and .20): each face slot decodes in its
-    # own tensor's frame, Reduce axes are physical val axes.  The ppo.py
-    # defaults; named so no arm inherits the pre-ticket read.
-    ("--face-slot-frames", "slot"),
+    # THE REDUCE AXIS SPACE (ticket .20): Reduce axes are physical val axes.
+    # The ppo.py default; named so no arm inherits the pre-ticket read.
+    # Ticket .18's sibling --face-slot-frames is GONE: each face slot always
+    # decodes in its own tensor's frame, so there is nothing to name.
     ("--reduce-axis-space", "physical"),
     # GATE G1 (ticket .45): the sweep winners of .41 by (vertex, primitive,
     # kind).  ppo.py accepts an absent file (gate/g1/present = 0, one
@@ -1308,8 +1306,8 @@ campaign_arm(
     depends="ticket .55: the fidelity fixes .17-.20 (landed on the integration branch)",
     what="""REDUCE-ONLY (--approx-profile reduce).  The class where the memory
 saving is (finding 05: 110/114 applied, 0.79x XLA temp on TLM).  Reduce axes
-are physical val axes decoded per slot (--reduce-axis-space physical,
---face-slot-frames slot; tickets .18, .20).""",
+are physical val axes decoded per slot (--reduce-axis-space physical;
+tickets .18, .20).""",
     prediction=CAMPAIGN_P1_PREDICTION + """
   * this is the arm that moves the TEMP channel: a plan at
     paired/temp_ratio_best <= 0.8 with q >= 0.9 by ep50, and the latency

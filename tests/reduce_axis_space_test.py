@@ -24,7 +24,7 @@ What is pinned:
     block-diagonal pair) an emitted ``Compress.axes`` names exactly the
     physical axis graphax drops, and a masked axis is never applied;
   * the same, end to end, on all three slots (lhs, rhs, new) of a real
-    elimination under ``--face-slot-frames slot``, with the per-slot mask
+    elimination under the per-slot decode frames, with the per-slot mask
     equal to the hook's verdict, with and without ``--per-face-masks``;
   * ``canonical`` is the pre-ticket code path, byte for byte, in every
     predicate and in the hook;
@@ -55,7 +55,7 @@ from alphagrad.approx.common import masks as M                  # noqa: E402
 from alphagrad.approx.common.masks import (                     # noqa: E402
     arm_face_counts, compress_rules_to_physical, compress_to_graphax,
     disarm_face_counts, reduce_axes_physical, reduce_axis_mask,
-    reduce_axis_space, reduce_axis_spaces, set_face_slot_frames,
+    reduce_axis_space, reduce_axis_spaces,
     set_per_face_masks, set_reduce_axis_space, slot_legality)
 from alphagrad.approx.env import (                              # noqa: E402
     COMPRESS_SENTINEL, FACE_SLOTS, MAX_FACES, MAX_RULES_PER_VERTEX,
@@ -72,16 +72,14 @@ SLOTS = ("lhs", "rhs", "new")
 
 @pytest.fixture(autouse=True)
 def _defaults():
-    """Every test starts from the defaults (physical, slot frames, per-face
-    masks off) and leaves them."""
+    """Every test starts from the defaults (physical, per-face masks off) and
+    leaves them. Per-slot decode frames are not a setting any more."""
     set_reduce_axis_space("physical")
-    set_face_slot_frames(True)
     set_per_face_masks(False)
     try:
         yield
     finally:
         set_reduce_axis_space("physical")
-        set_face_slot_frames(True)
         set_per_face_masks(False)
         disarm_face_counts()
 

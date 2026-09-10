@@ -684,33 +684,30 @@ def per_face_masks_enabled() -> bool:
     return bool(_PER_FACE_MASKS[0])
 
 
-# --face-slot-frames (ticket dsnn-3qm.18, defects D2 and D3). A face has
-# three operand slots -- lhs (d central / d in_edge), rhs (d out_edge /
-# d central), new (d out_edge / d in_edge) -- and they are NOT alike: under a
-# scalar loss rhs and new have an EMPTY out side on every face (finding 54)
-# while lhs carries the vertex's own out dims. ``slot`` (the default) decodes
-# each slot's wire row in the frame of the live tensor that slot is handed
-# (``env.make_slot_frame_hook``) and masks each slot of the 94-logit head with
-# that slot's own sizes / Diag-pair / Reduce-axis / Quant legality
-# (``LiveFaceStream.face_slot_legality`` -> ``UnifiedFacePolicy``).
-# ``vertex`` is the pre-ticket behaviour -- one vertex frame and one legality
-# vector, probed from the result tensor, broadcast to all three slots -- kept
-# only so the flag-off bit-identity gate (ALPHAGRAD_EQ_DUMP) can reach it.
-# Same discipline as --per-face-masks: republished to the environment so the
-# Ray measure actors decode the wire in the same frame as the trainer.
-_FACE_SLOT_FRAMES = [os.environ.get("ALPHAGRAD_FACE_SLOT_FRAMES", "1")
-                     not in ("0", "", "false", "False", "no")]
-
-
-def set_face_slot_frames(enabled: bool) -> None:
-    """Install the ``--face-slot-frames`` setting process-wide (and in the
-    environment, for the measure actors)."""
-    _FACE_SLOT_FRAMES[0] = bool(enabled)
-    os.environ["ALPHAGRAD_FACE_SLOT_FRAMES"] = "1" if enabled else "0"
-
-
-def face_slot_frames_enabled() -> bool:
-    return bool(_FACE_SLOT_FRAMES[0])
+# PER-SLOT DECODE FRAMES AND PER-SLOT LEGALITY ARE THE ONLY BEHAVIOUR
+# (ticket dsnn-3qm.18, defects D2 and D3). A face has three operand slots --
+# lhs (d central / d in_edge), rhs (d out_edge / d central), new (d out_edge /
+# d in_edge) -- and they are NOT alike: under a scalar loss rhs and new have an
+# EMPTY out side on every face (finding 54) while lhs carries the vertex's own
+# out dims. Every slot's wire row is therefore decoded in the frame of the live
+# tensor that slot is handed (``env.make_slot_frame_hook``) and every slot of
+# the 94-logit head is masked with that slot's own sizes / Diag-pair /
+# Reduce-axis / Quant legality (``LiveFaceStream.face_slot_legality`` ->
+# ``UnifiedFacePolicy``).
+#
+# The old per-VERTEX alternative (one frame, one legality vector broadcast to
+# all three slots) is GONE, not flag-gated. Finding 70 measured what it cost on
+# TLM under the minimum Markowitz order: 655 of the head's requests rejected at
+# apply time and 149 legal actions never offered, against exactly 0 and 0 for
+# the per-slot frames, and the Reduce apply rate 23.95% -> 30.28%.
+#
+# A launcher that still names the retired switch is a launcher that believes it
+# turned the fix off. Say so instead of ignoring it.
+if os.environ.get("ALPHAGRAD_FACE_SLOT_FRAMES") is not None:
+    raise RuntimeError(
+        "ALPHAGRAD_FACE_SLOT_FRAMES is retired (ticket dsnn-3qm.18): per-slot "
+        "decode frames and per-slot legality are the only behaviour. Remove "
+        "the variable and the --face-slot-frames argument from the launcher.")
 
 
 # --reduce-axis-space (ticket dsnn-3qm.20, defect D5). A Reduce (Compress)

@@ -52,7 +52,7 @@ import alphagrad.approx.env as envmod                           # noqa: E402
 from alphagrad.approx.common import masks as M                  # noqa: E402
 from alphagrad.approx.common.masks import (                     # noqa: E402
     FACE_QUANT_DTYPES, arm_face_counts, disarm_face_counts,
-    face_slot_frames_enabled, set_face_slot_frames, slot_legality)
+    slot_legality)
 from alphagrad.approx.env import (                              # noqa: E402
     COMPRESS_SENTINEL, FACE_SLOTS, MAX_FACES, MAX_RULES_PER_VERTEX,
     _face_dict_for_vertex, decode_rule_specs_in_frame,
@@ -168,21 +168,31 @@ def _pad(row):
 
 
 @pytest.fixture(autouse=True)
-def _slot_frames_on():
-    """Every test starts from the DEFAULT (slot frames on) and leaves it."""
-    set_face_slot_frames(True)
+def _counters_disarmed():
+    """Per-slot frames are the ONLY behaviour, so there is nothing to set."""
     try:
         yield
     finally:
-        set_face_slot_frames(True)
         disarm_face_counts()
 
 
 # ==========================================================================
-# 0. THE DEFAULT
+# 0. THE RETIRED SWITCH
 # ==========================================================================
-def test_default_is_slot_frames():
-    assert face_slot_frames_enabled()
+def test_the_retired_env_var_is_refused_not_ignored():
+    """A launcher that still sets ALPHAGRAD_FACE_SLOT_FRAMES believes it chose
+    a decode frame. The variable is gone, so importing masks with it set must
+    FAIL rather than silently run the per-slot path the launcher asked to
+    leave. Checked in a subprocess because the guard runs at import."""
+    import subprocess
+    import sys
+    env = dict(os.environ)
+    env["ALPHAGRAD_FACE_SLOT_FRAMES"] = "0"
+    r = subprocess.run(
+        [sys.executable, "-c", "import alphagrad.approx.common.masks"],
+        env=env, capture_output=True, text=True)
+    assert r.returncode != 0, r.stdout
+    assert "ALPHAGRAD_FACE_SLOT_FRAMES is retired" in r.stderr, r.stderr
 
 
 # ==========================================================================
@@ -291,8 +301,7 @@ def test_face_dict_applies_in_the_slot_frame_end_to_end():
     closed = _closed(_chain, _ARGS)
     config = SimpleNamespace(jaxpr=closed.jaxpr)
 
-    def run(rows_by_slot, slot_frames):
-        set_face_slot_frames(slot_frames)
+    def run(rows_by_slot):
         ij, keys, key, _st = _x_face(closed, _ARGS)
         f = keys.index(key)
         rows, skips = _blank_rows()
@@ -313,21 +322,15 @@ def test_face_dict_applies_in_the_slot_frame_end_to_end():
     legal = {"lhs": (COMPRESS_SENTINEL, 1, 0), "rhs": (COMPRESS_SENTINEL, 0, 0),
              "new": (COMPRESS_SENTINEL, 0, 0)}
     for site, row in legal.items():
-        st = run({site: row}, True)
+        st = run({site: row})
         assert st.get("applied_compress", 0) == 1, (site, st)
         assert st.get("skipped_compress", 0) == 0, (site, st)
-    # The lhs row (axis 1) is what the vertex frame would ALSO have admitted
-    # on rhs and new, where no such axis exists.
-    st = run({"lhs": legal["lhs"]}, False)
-    assert st.get("applied_compress", 0) == 1, st
 
-    bad = {"rhs": (COMPRESS_SENTINEL, 1, 0)}
-    st_slot = run(bad, True)
-    st_vert = run(bad, False)
-    assert st_slot.get("applied_compress", 0) == 0, st_slot
-    assert st_slot.get("skipped_compress", 0) == 1, st_slot
-    assert st_vert.get("applied_compress", 0) == 0, st_vert
-    assert st_vert.get("skipped_compress", 0) == 1, st_vert
+    # Axis 1 exists on lhs only. Requested on rhs it names no dim of that
+    # slot, so it is a COUNTED miss, not silence.
+    st = run({"rhs": (COMPRESS_SENTINEL, 1, 0)})
+    assert st.get("applied_compress", 0) == 0, st
+    assert st.get("skipped_compress", 0) == 1, st
 
 
 def test_two_op_form_puts_the_new_slot_hook_on_the_old_edge():
@@ -733,40 +736,26 @@ def test_rank_2_inputs_take_the_pre_ticket_broadcast_path():
 
 
 # ==========================================================================
-# 4. FLAG OFF -- the pre-ticket path
+# 4. EVERY REQUESTED ROW GETS A SLOT-FRAME HOOK
 # ==========================================================================
-def test_vertex_frames_decode_every_slot_in_the_vertex_frame():
-    """With ``--face-slot-frames vertex`` the face dict is built from
-    ``decode_vertex_rule_specs`` exactly as before: a row that names no dim
-    of the vertex frame yields NO hook (the slot stays None), while the slot
-    frame yields a hook for every requested row."""
+def test_every_requested_row_gets_a_slot_frame_hook():
+    """The face dict carries a ``make_slot_frame_hook`` for every wire row
+    that is not the end sentinel, whether or not the row names a dim of that
+    slot. A row that names nothing is a counted miss at apply time (see the
+    D2 test above), which is why the hook must exist to count it."""
     closed = _closed(_chain, _ARGS)
     config = SimpleNamespace(jaxpr=closed.jaxpr)
     ij, keys, key, _st = _x_face(closed, _ARGS)
     rows, skips = _blank_rows()
     f = keys.index(key)
     rows[f, 0] = (COMPRESS_SENTINEL, 2, 0)      # axis 2: in no frame here
-    rows[f, 1] = (COMPRESS_SENTINEL, 1, 0)      # axis 1: vertex frame only
-    set_face_slot_frames(False)
-    old = _face_dict_for_vertex(config, ij, 1, rows, skips)
-    set_face_slot_frames(True)
+    rows[f, 1] = (COMPRESS_SENTINEL, 1, 0)      # axis 1: lhs frame only
     new = _face_dict_for_vertex(config, ij, 1, rows, skips)
-    o = old[key] if not (len(old[key]) == 2 and len(old[key][0]) == 3) \
-        else old[key][0]
     n_ = new[key] if not (len(new[key]) == 2 and len(new[key][0]) == 3) \
         else new[key][0]
-    assert o[0] is None and o[1] is not None and o[2] is None
     assert n_[0] is not None and n_[1] is not None and n_[2] is None
-    assert not hasattr(o[1], "rules_for")
+    assert hasattr(n_[0], "rules_for")
     assert hasattr(n_[1], "rules_for")
-
-
-def test_the_setter_republishes_to_the_environment():
-    """The Ray measure actors import ``masks`` fresh: the setting reaches
-    them through the environment, exactly like --per-face-masks."""
-    set_face_slot_frames(False)
-    assert os.environ["ALPHAGRAD_FACE_SLOT_FRAMES"] == "0"
-    assert not face_slot_frames_enabled()
-    set_face_slot_frames(True)
-    assert os.environ["ALPHAGRAD_FACE_SLOT_FRAMES"] == "1"
-    assert face_slot_frames_enabled()
+    # The row that names no dim of its slot decodes to NO rule, and the hook
+    # says so rather than inventing one.
+    assert n_[0].rules_for(_st) == () or n_[0].rules_for(_st) is None

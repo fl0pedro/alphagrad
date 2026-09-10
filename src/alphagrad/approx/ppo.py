@@ -117,7 +117,6 @@ from alphagrad.approx.common.face_driver import (
     bind_step_callbacks,
     build_live_face_stream,
     make_face_callbacks,
-    make_face_sizes_callback,
     make_face_slot_legality_callback,
 )
 from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
@@ -4520,24 +4519,6 @@ def make_argparser() -> argparse.ArgumentParser:
         "every plan-log record carries the value that measured it.",
     )
     p.add_argument(
-        "--face-slot-frames",
-        choices=["slot", "vertex"],
-        default="slot",
-        help="Ticket dsnn-3qm.18 (defects D2, D3). A face's three operand "
-        "slots (lhs, rhs, new) hold three different tensors (finding 54: "
-        "rhs and new have no out side under a scalar loss). slot = each "
-        "slot decodes its wire row in ITS OWN live tensor's frame (Diag.j "
-        "= out_len + bi2 and the Reduce axis range of that tensor) and, "
-        "with --per-face-masks --live-faces, the head masks each slot with "
-        "that slot's own sizes, Diag-pair, Reduce-axis and Quant legality, "
-        "probed from that slot. vertex = the pre-ticket behaviour: one "
-        "vertex frame and one legality vector (the result tensor's) for all "
-        "three slots. Kept only for the flag-off bit-identity gate "
-        "(ALPHAGRAD_EQ_DUMP). Published as ALPHAGRAD_FACE_SLOT_FRAMES so the "
-        "Ray measure actors decode the wire in the trainer's frame; every "
-        "plan-log record carries the value that measured it.",
-    )
-    p.add_argument(
         "--reduce-axis-space",
         choices=["physical", "canonical"],
         default="physical",
@@ -6185,8 +6166,7 @@ def main():
     # to os.environ so the measure actors, which build their own hooks in their
     # own processes, inherit the same setting.
     from alphagrad.approx.common.masks import (
-        set_diag_per_face, set_face_slot_frames, set_per_face_masks,
-        set_reduce_axis_space)
+        set_diag_per_face, set_per_face_masks, set_reduce_axis_space)
     set_diag_per_face(
         bool(getattr(args, "diag_per_face", False)),
         rule=str(getattr(args, "diag_per_face_rule", "largest")),
@@ -6199,12 +6179,6 @@ def main():
         bool(getattr(args, "per_face_masks", False)),
         repair_axis=not bool(getattr(args, "no_per_face_repair_axis", False)),
     )
-    # --face-slot-frames (ticket .18), same discipline: the per-slot decode
-    # runs inside the measure actors' own processes.
-    set_face_slot_frames(
-        str(getattr(args, "face_slot_frames", "slot")) == "slot")
-    print(f"[alphagrad] face decode frame (--face-slot-frames) = "
-          f"{getattr(args, 'face_slot_frames', 'slot')}", flush=True)
     # --reduce-axis-space (ticket .20), same discipline: the decode and the
     # graphax-boundary conversion run inside the measure actors' processes.
     set_reduce_axis_space(str(getattr(args, "reduce_axis_space", "physical")))
@@ -6856,10 +6830,6 @@ def main():
     # with the flag off none of the extra arrays below is ever created: no new
     # callback output, no new trajectory leaf, no shape change anywhere.
     _PFM = bool(getattr(args, "per_face_masks", False))
-    # --face-slot-frames slot (ticket .18): the SIZES half below is probed and
-    # stored PER SLOT (F, S, ...) instead of per face; "vertex" keeps the
-    # historical (F, ...) arrays and code path.
-    _SLOT_FRAMES = str(getattr(args, "face_slot_frames", "slot")) == "slot"
     if _PFM and not getattr(args, "face_actions", False):
         raise ValueError(
             "--per-face-masks needs --face-actions: it masks the per-FACE "
@@ -7424,10 +7394,9 @@ def main():
         # --per-face-masks SIZES half (A1b): built unconditionally (it is
         # one closure) but only CALLED under `_PFM_SIZES` below, so the
         # flag-off trace has no extra callback and no extra host work.
-        # --face-slot-frames slot: the per-SLOT probe instead (ticket .18).
-        _live_face_sizes = (
-            make_face_slot_legality_callback if _SLOT_FRAMES
-            else make_face_sizes_callback)(
+        # Per-SLOT, always (ticket .18): the per-face probe recorded the
+        # RESULT tensor only and broadcast it to lhs / rhs / new.
+        _live_face_sizes = make_face_slot_legality_callback(
             _LIVE_FACES, max_faces=_F_FACES,
             max_axes=MAX_AXES_PER_VERTEX, prof_sink=_env_prof_add)
 
@@ -7488,8 +7457,10 @@ def main():
                            and not getattr(args, "no_approx_head", False))
     _PFM_SIZES = bool(_PFM and (not _NO_ORACLE or _PFM_LIVE_SIZES))
     # Per-SLOT legality (ticket .18, D3) rides the live-stream sizes half:
-    # sizes, quant, Diag-pair and Reduce-axis masks per (face, slot).
-    _PFM_SLOT = bool(_PFM_LIVE_SIZES and _SLOT_FRAMES)
+    # sizes, quant, Diag-pair and Reduce-axis masks per (face, slot). There is
+    # no per-vertex alternative any more -- the per-slot frames are the only
+    # behaviour -- so this is exactly "the live sizes half is available".
+    _PFM_SLOT = bool(_PFM_LIVE_SIZES)
     if _PFM:
         print("[cfg] --per-face-masks: apply-time projection ON; "
               "per-face SIZES + QUANT mask "

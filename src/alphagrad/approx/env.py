@@ -1541,7 +1541,6 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
     try:
         from alphagrad.approx.common import plan_log as _plog
         from alphagrad.approx.common.masks import (
-            face_slot_frames_enabled as _face_slot_frames_enabled,
             reduce_axis_space as _reduce_axis_space)
         rec = {
             "schema": _plog.SCHEMA,
@@ -1558,10 +1557,6 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             # the same function the face emitter reads, so the record cannot
             # disagree with the measurement.
             "approx_old": approx_old(),
-            # WHICH decode frame the face wires were applied in (ticket .18):
-            # True = each slot's own live tensor, False = the vertex frame
-            # broadcast to all three slots. A replay must decode the same way.
-            "face_slot_frames": bool(_face_slot_frames_enabled()),
             # WHICH quantity reward slot 5 holds (ticket .49) and BOTH
             # memory numbers of this plan's timed executable, so a record
             # can be re-scored on the other channel without a re-measure.
@@ -4809,9 +4804,6 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip):
     which rides the tokenizer's own IncrementalJaxpr instead of replaying a
     second, byte-identical elimination."""
     from graphax import SKIP_FACE, faces_of
-    from alphagrad.approx.common.masks import (
-        face_slot_frames_enabled, make_live_masked_hook)
-
     keys = faces_of(ij.graph, ij.tgraph, int(v), config.jaxpr)
     if len(keys) > _FACE_CAP_STATS["max_seen"]:
         _FACE_CAP_STATS["max_seen"] = len(keys)
@@ -4837,26 +4829,20 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip):
             one_row = [[int(x) for x in face_row[f][s]]] + [
                 [-1, -1, 0]
             ] * (MAX_RULES_PER_VERTEX - 1)
-            if face_slot_frames_enabled():
-                # Ticket .18, D2. The vertex frame below describes the lhs
-                # tensor only; rhs and new carry other out/primal dims. So
-                # the row is decoded when the slot's LIVE tensor is in hand
-                # (make_slot_frame_hook), through the same per-face sink.
-                slots.append(
-                    make_slot_frame_hook(one_row[0], stats=_PER_FACE_STATS,
-                                         gated=True)
-                    if one_row[0][0] != -1 else None)
-                continue
-            rules = decode_vertex_rule_specs(config.jaxpr, int(v), one_row)
-            # THE per-FACE sink. Under --live-faces the per-vertex rows are
-            # all-exact END rows, so the per-vertex sink below is never
-            # constructed and this is the ONLY place approx_applied/* can come
-            # from. ``gated`` because these same objects are replayed by the
-            # face-enum walk right below and by the tokenizer -- only the
-            # armed scope inside ``_do_compile_approx`` is the measurement.
+            # Ticket .18, D2. A vertex frame would describe the lhs tensor
+            # only; rhs and new carry other out/primal dims. So the row is
+            # decoded when the slot's LIVE tensor is in hand
+            # (make_slot_frame_hook), through the same per-face sink.
+            # THE per-FACE sink: under --live-faces the per-vertex rows are
+            # all-exact END rows, so the per-vertex sink is never constructed
+            # and this is the ONLY place approx_applied/* can come from.
+            # ``gated`` because these same objects are replayed by the
+            # face-enum walk and by the tokenizer -- only the armed scope
+            # inside ``_do_compile_approx`` is the measurement.
             slots.append(
-                make_live_masked_hook(tuple(rules), stats=_PER_FACE_STATS,
-                                      gated=True) if rules else None)
+                make_slot_frame_hook(one_row[0], stats=_PER_FACE_STATS,
+                                     gated=True)
+                if one_row[0][0] != -1 else None)
         if any(sl is not None for sl in slots):
             per_face[key] = face_entry_from_slots(slots)
     return per_face
