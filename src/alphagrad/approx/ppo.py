@@ -6403,12 +6403,13 @@ def main():
     # like every other arm. --quality-metric none stays selectable by name.
     _qm = str(args.quality_metric)
     os.environ["ALPHAGRAD_QUALITY_METRIC"] = _qm
-    # OLD-EDGE CONFIGURATION (ticket .56), same hand-off shape as the quality
+    # THE FACE ADD (ticket .56, finding 73), same hand-off shape as the quality
     # channel: the flag is the ONLY user surface; the variable is how the Ray
     # measure actors (their own processes) resolve the value the trainer was
-    # given. env.approx_add() is the one reader -- _face_dict_for_vertex emits
-    # the two-op face form under "same" and the bare triple under "exact", and
-    # every plan-log record carries the value that measured it.
+    # given. env.approx_add() is the one reader -- face_entry_from_slots emits
+    # graphax's two-op face form under BOTH values, with the `new` slot's hook
+    # at `res:new` and a join POLICY at `jr` under "lossy" / nothing under
+    # "lossless", and every plan-log record carries the value that measured it.
     if getattr(args, "approx_old", None) is not None:
         # A launcher that names a retired switch believes it chose something.
         # Say so rather than ignoring it: `same` and `exact` name a DIFFERENT
