@@ -104,14 +104,17 @@ def _policy(F):
             precompute_factor_tables(64))
 
 
-def _features(sizes_row):
-    sz = jnp.asarray(np.asarray(sizes_row, np.int32), jnp.int32)
-    sz = jnp.maximum(sz, 1)
+def _features():
+    """ONE AxisTokenFeatures. ``sample_face`` builds the per-slot list itself
+    (``_slot_inputs`` -> ``_face_feats_1``) from ``face_sizes_f``, so handing it
+    a list here is what the rank check rejects -- the per-slot sizes ride
+    ``face_sizes_f`` (S, N), not the features."""
+    sz = jnp.ones((N_AX,), jnp.int32) * 2
     return AxisTokenFeatures(
         size=sz, log_size=jnp.log(sz.astype(jnp.float32)),
         tag_bits=jnp.zeros((N_AX, AXIS_TAG_BITS), jnp.float32),
         group_id=-jnp.ones((N_AX,), jnp.int32),
-        valid_mask=(sz > 1).astype(jnp.float32))
+        valid_mask=jnp.ones((N_AX,), jnp.float32))
 
 
 def _row_to_wire(op, i, j, axis, dtype_idx, n_out):
@@ -142,6 +145,7 @@ def _walk(target, seed):
                           track_faces=False)
     config = SimpleNamespace(jaxpr=jaxpr)
     pol, tables = _policy(MAX_FACES)
+    feats = _features()
     ctx = jnp.zeros((pol.embd_dim,), jnp.float32)
 
     rows_hist = np.full((total_v, MAX_FACES, FACE_SLOTS, 3), -1, np.int32)
@@ -161,7 +165,6 @@ def _walk(target, seed):
         skips = skips_hist[n]
         for f in range(nf):
             key = jrand.PRNGKey(seed * 1000003 + n * 97 + f)
-            feats = [_features(sizes[f, s]) for s in range(FACE_SLOTS)]
             _skip, row, _lp, _ent, _ar, _, _ = pol.sample_face(
                 feats, tables, key, f,
                 jnp.asarray(pair[f]), jnp.asarray(comp[f]),
