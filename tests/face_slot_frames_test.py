@@ -745,7 +745,7 @@ def test_every_requested_row_gets_a_slot_frame_hook():
     D2 test above), which is why the hook must exist to count it."""
     closed = _closed(_chain, _ARGS)
     config = SimpleNamespace(jaxpr=closed.jaxpr)
-    ij, keys, key, _st = _x_face(closed, _ARGS)
+    ij, keys, key, store = _x_face(closed, _ARGS)
     rows, skips = _blank_rows()
     f = keys.index(key)
     rows[f, 0] = (COMPRESS_SENTINEL, 2, 0)      # axis 2: in no frame here
@@ -756,6 +756,8 @@ def test_every_requested_row_gets_a_slot_frame_hook():
     assert n_[0] is not None and n_[1] is not None and n_[2] is None
     assert hasattr(n_[0], "rules_for")
     assert hasattr(n_[1], "rules_for")
-    # The row that names no dim of its slot decodes to NO rule, and the hook
-    # says so rather than inventing one.
-    assert n_[0].rules_for(_st) == () or n_[0].rules_for(_st) is None
+    # Row 0 names axis 2, which no slot of this face has. The hook exists (so
+    # the miss is counted) and decodes to NOTHING on the lhs tensor.
+    assert n_[0].rules_for(store["lhs"]) == ()
+    # Row 1 names axis 1, which the lhs tensor does have.
+    assert len(n_[1].rules_for(store["lhs"])) == 1
