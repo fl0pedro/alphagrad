@@ -589,7 +589,10 @@ What each result makes us do next. One row per experiment; no row says
    "audit v57–v66 for `NEW_SLOT_JOIN=1` casualties" is still open, and any
    archive statistic from that era may be biased by silently-dropped plans.
    *2026-09-04 (ticket .56): the env var is gone; the switch is
-   `--approx-old {same,exact}` (`same` = the former `=1`, the default), and
+   `--approx-add {lossy,lossless}` (`lossy` = the declared default; it
+   replaced `--approx-old {same,exact}`, which is RETIRED and raises because
+   neither old value names the computation its replacement measures — finding
+   73), and
    the pre-flight verifies the two-op form whenever an arm runs `same`.*
 8. **`landscape_map` cannot name `grad_cosine`.** Its `--quality-metric`
    choices are `loss_drop, cosine, none`. On a scalar-loss target `cosine`

@@ -26,7 +26,7 @@ ticket-.56 toy graph, never TLM. Pinned, for BOTH ``--approx-add`` values:
    env's own dict -- the tokens describe the graph the measurement builds.
    Under ``same`` the join face's tokens differ from ``exact``'s: the head
    now sees the old-edge choice it is scored on.
-4. The head-side decoders reach the configuration through ``env.approx_old``
+4. The head-side decoders reach the configuration through ``env.approx_add``
    and nothing else (no second reader of the hand-off variable).
 """
 from __future__ import annotations
