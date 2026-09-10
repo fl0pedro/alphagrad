@@ -187,13 +187,16 @@ def make_argparser() -> argparse.ArgumentParser:
                         "comparable across values -- see the module "
                         "docstring. 'cosine' is deprecated in env.py and "
                         "resolves to grad_cosine with a warning.")
-    p.add_argument("--approx-old", default="same", choices=["same", "exact"],
-                   help="What the OLD edge gets at a face's join (ticket "
-                        ".56): same = the new-slot approximation also hits "
-                        "the existing predecessor-to-successor edge (graphax's "
-                        "two-op form); exact = the old edge is left exact. "
-                        "NOT comparable across values; stamped into every "
-                        "row. Mirrors ppo.py --approx-old.")
+    p.add_argument("--approx-add", default=_APPROX_ADD_DEFAULT,
+                   choices=list(_APPROX_ADD_CHOICES),
+                   help="How the face ADD's two addends meet (ticket .56, "
+                        "finding 73): lossy = force both into the container "
+                        "the approximated new slot landed on, projecting the "
+                        "old edge onto it; lossless = the sum's support is "
+                        "the UNION of the two, dropping no non-zero. NOT "
+                        "comparable across values; stamped into every row. "
+                        "Mirrors ppo.py --approx-add.")
+    p.add_argument("--approx-old", default=None, help=argparse.SUPPRESS)
     p.add_argument("--walk-steps", type=int, default=200)
     p.add_argument("--walk-lr", type=float, default=1e-3)
     p.add_argument("--walk-probe-seed", type=int, default=0)
@@ -304,6 +307,18 @@ def make_argparser() -> argparse.ArgumentParser:
     return p
 
 
+# --- --approx-add choices, RESTATED and CROSS-CHECKED ----------------------
+# The canonical list is ``env.APPROX_ADD_CHOICES``, but this module builds its
+# argparser BEFORE importing alphagrad on purpose: several env knobs below are
+# read at IMPORT of ``alphagrad.approx.env`` (``ALPHAGRAD_MEASURE_ACTOR``), so
+# pulling env in up here would read them before they are set. The literal is
+# therefore a copy, and ``tests/approx_add_test.py`` asserts it still equals
+# ``env.APPROX_ADD_CHOICES`` / ``env.APPROX_ADD_DEFAULT`` -- a drift is a test
+# failure, not a silently different choice list.
+_APPROX_ADD_CHOICES = ("lossy", "lossless")
+_APPROX_ADD_DEFAULT = "lossy"
+
+
 if __name__ == "__main__":
     ARGS = make_argparser().parse_args()
 else:
@@ -325,7 +340,13 @@ os.environ.setdefault("ALPHAGRAD_UNIFIED_FACE_ENUM", "1")
 # (one env var, one reader, so two paths cannot disagree) -- mirror ppo.py.
 os.environ["ALPHAGRAD_QUALITY_METRIC"] = str(ARGS.quality_metric)
 os.environ["ALPHAGRAD_GRAD_ORACLE"] = str(ARGS.grad_oracle)
-os.environ["ALPHAGRAD_APPROX_OLD"] = str(ARGS.approx_old)
+if getattr(ARGS, "approx_old", None) is not None:
+    raise SystemExit(
+        f"--approx-old is RETIRED (you passed {ARGS.approx_old!r}). Use "
+        f"--approx-add {{{','.join(_APPROX_ADD_CHOICES)}}}; the old values are "
+        f"NOT aliases (see alphagrad.approx.env).")
+os.environ.pop("ALPHAGRAD_APPROX_OLD", None)
+os.environ["ALPHAGRAD_APPROX_ADD"] = str(ARGS.approx_add)
 os.environ["ALPHAGRAD_WALK_STEPS"] = str(int(ARGS.walk_steps))
 os.environ["ALPHAGRAD_WALK_LR"] = repr(float(ARGS.walk_lr))
 os.environ["ALPHAGRAD_WALK_PROBE_SEED"] = str(int(ARGS.walk_probe_seed))
@@ -1152,12 +1173,17 @@ CSV_FIELDS = [
     # this lacks the column, and a missing value is read back as `loss_drop`,
     # which is what all of them are.
     "quality_metric",
-    # WHAT THE OLD EDGE GOT at every face join (ticket .56): "same" or
-    # "exact". Rows written before 2026-09-04 lack the column; every one of
-    # them ran under the then-default, which was "same" unless the launcher
-    # exported ALPHAGRAD_NEW_SLOT_JOIN=0 (the R1-R3 / face_attrib / forensics
-    # launchers did -- see UNBIASED_PARETO_AND_MEASUREMENT.md sec 7(c)).
-    "approx_old",
+    # HOW THE FACE ADD's TWO ADDENDS MET (ticket .56, finding 73): "lossy" or
+    # "lossless". Rows written before 2026-09-10 carry the RETIRED
+    # ``approx_old`` column instead ("same" / "exact"), which named a
+    # different computation -- `same` installed one wire row on two
+    # differently-structured tensors and `exact` approximated the post-join
+    # SUM -- so the two columns must NOT be pooled. Rows written before
+    # 2026-09-04 lack even that column; every one of them ran under the
+    # then-default "same" unless the launcher exported
+    # ALPHAGRAD_NEW_SLOT_JOIN=0 (the R1-R3 / face_attrib / forensics launchers
+    # did -- see UNBIASED_PARETO_AND_MEASUREMENT.md sec 7(c)).
+    "approx_add",
 ]
 
 
@@ -1180,7 +1206,7 @@ def config_stamp(args):
                        f"/cfg:{int(args.latency_warmup)}"),
         "config_note": args.config_note,
         "quality_metric": str(args.quality_metric),
-        "approx_old": str(args.approx_old),
+        "approx_add": str(args.approx_add),
         # WHICH PHYSICAL DEVICE measured this row. If plan A and plan B are
         # measured by different actors, a systematic per-device offset lands
         # straight in PPO's within-batch advantage comparison.

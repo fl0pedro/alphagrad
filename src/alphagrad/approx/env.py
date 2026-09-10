@@ -4744,110 +4744,212 @@ def make_slot_frame_hook(one_row, *, stats: dict | None = None,
     return _hook
 
 
-# #72 / ticket .56 -- THE OLD EDGE. A face accumulation multiplies lhs by
-# rhs into `new` and adds `new` onto the existing predecessor-to-successor
-# edge (the OLD edge) when that edge exists. ``--approx-old`` says what the
-# old edge gets:
-#   same  -- the SAME approximation as `new` (the two-op face form with the
-#            new-slot hook in graphax's `jr`), so both operands of the add
-#            carry one structure and the add stays elementwise cheap. The
-#            declared default.
-#   exact -- the old edge is left exact (the bare 3-tuple; graphax never
-#            reaches the join hooks). It already holds the sum of
-#            approximated and exact contributions from earlier accumulations.
-# The two are NOT comparable, since the choice changes the measured object.
-# ppo.py publishes the flag as ALPHAGRAD_APPROX_OLD before ray.init -- one
+# #73 / ticket .56 -- THE ADD. A face accumulation multiplies lhs by rhs into
+# `new` and, when the predecessor-to-successor edge ALREADY exists, adds `new`
+# onto it. Two addends: the FRESH contraction and the OLD EDGE.
+#
+# The flag is ``--approx-add``, not ``--approx-old``: an approximation only
+# ever lands on the CONTRACTION side (that is what the three face slots are),
+# and what this flag actually governs is how the two addends of the ADD are
+# made to meet. Naming it after the old edge said the old edge was the subject;
+# it is the object.
+#
+#   lossy    -- force the two addends into ONE container, the one the
+#               approximated `new` slot landed on. The old edge is projected
+#               onto that support, so the add costs what the head's choice
+#               costs. Replaces ``same``.
+#   lossless -- keep the most information possible: the sum's support is the
+#               UNION of the two addends' supports, so no non-zero of either
+#               addend is dropped. Replaces ``exact`` (which was neither: it
+#               put the `new` slot's rule on the POST-JOIN SUM, approximating
+#               the merge instead of the contraction).
+#
+# WHY ``same`` AND ``exact`` ARE GONE RATHER THAN ALIASED. Both old names map
+# onto a DIFFERENT object than their replacement measures:
+#   * ``same`` installed the SAME hook object at graphax's `res:new` AND `jr`,
+#     so one wire row ran on two tensors with two different index structures
+#     and one legality mask answered for one of them (finding 72, fault 1).
+#     ``lossy`` installs the row at `res:new` ONLY and reconciles the addends
+#     structurally, which is a different computation, not a rename.
+#   * ``exact`` moved the row to `res:jres`, the post-join sum. ``lossless``
+#     puts it back on the fresh contraction and leaves the add alone.
+# A launcher that still names a retired value believes it chose a semantics
+# that no longer exists, so both the CLI flag and the hand-off variable RAISE
+# and name the replacement (the repo's error taxonomy).
+#
+# ppo.py publishes the flag as ALPHAGRAD_APPROX_ADD before ray.init -- one
 # hand-off variable, one reader, the same shape as ALPHAGRAD_QUALITY_METRIC --
 # so the trainer and every measure actor resolve the SAME configuration and
 # the plan log records what actually ran. Read at call time, never at import.
-_APPROX_OLD_ENV = "ALPHAGRAD_APPROX_OLD"
-APPROX_OLD_CHOICES = ("same", "exact")
+_APPROX_ADD_ENV = "ALPHAGRAD_APPROX_ADD"
+_APPROX_OLD_ENV = "ALPHAGRAD_APPROX_OLD"          # RETIRED, raises
+APPROX_ADD_CHOICES = ("lossy", "lossless")
+#: The declared default. ``lossy`` and not ``lossless`` because the measured
+#: cost of a union container is not a detail: on TLM (seq 16, dmodel 64,
+#: vocab 256, min-Markowitz, 3 seeds) the summed edge's ``val`` is 9.8 MB
+#: under the union against 0.33 MB for the approximated addend -- a ~30x
+#: inflation that would make the cost channel measure the union blow-up
+#: rather than the approximation the head chose, i.e. punish the head for
+#: approximating at all. ``lossy`` also continues the previous declared
+#: default (``same``) for the ADD's cost behaviour.
+APPROX_ADD_DEFAULT = "lossy"
+_RETIRED_APPROX_OLD = {"same": "lossy", "exact": "lossless"}
 
 
-def approx_old() -> str:
-    """``"same"`` or ``"exact"`` -- what the OLD edge gets at a face's join.
+def approx_add() -> str:
+    """One of :data:`APPROX_ADD_CHOICES` -- how the two addends of a face ADD
+    are made to meet.
 
-    The user surface is ``ppo.py --approx-old``; unset means the declared
-    default ``same``. Anything else is a programming error, not a fallback.
+    The user surface is ``ppo.py --approx-add``; unset means
+    :data:`APPROX_ADD_DEFAULT`. Anything else is a programming error, not a
+    fallback -- including the retired ``same`` / ``exact``, which named a
+    different computation (see the block comment above).
     """
-    want = os.environ.get(_APPROX_OLD_ENV, "same").strip().lower()
-    if want not in APPROX_OLD_CHOICES:
+    if _APPROX_OLD_ENV in os.environ:
         raise ValueError(
-            f"{_APPROX_OLD_ENV} must be one of {APPROX_OLD_CHOICES} (set by "
-            f"ppo.py from --approx-old), got {want!r}")
+            f"{_APPROX_OLD_ENV} is RETIRED and is still set to "
+            f"{os.environ[_APPROX_OLD_ENV]!r}. The flag is now "
+            f"--approx-add / {_APPROX_ADD_ENV} with values "
+            f"{APPROX_ADD_CHOICES}. The old values are not aliases: `same` "
+            f"installed one wire row on two differently-structured tensors "
+            f"and `exact` approximated the post-join SUM, so neither names "
+            f"the object its replacement measures. Unset it and choose "
+            f"explicitly.")
+    want = os.environ.get(_APPROX_ADD_ENV, APPROX_ADD_DEFAULT).strip().lower()
+    if want in _RETIRED_APPROX_OLD:
+        raise ValueError(
+            f"{_APPROX_ADD_ENV}={want!r} names a RETIRED --approx-old value. "
+            f"The nearest replacement is {_RETIRED_APPROX_OLD[want]!r}, but it "
+            f"is NOT the same computation -- see alphagrad.approx.env for why. "
+            f"Choose one of {APPROX_ADD_CHOICES} deliberately.")
+    if want not in APPROX_ADD_CHOICES:
+        raise ValueError(
+            f"{_APPROX_ADD_ENV} must be one of {APPROX_ADD_CHOICES} (set by "
+            f"ppo.py from --approx-add), got {want!r}")
     return want
+
+
+def _join_outcome_sink():
+    """The telemetry sink handed to a join policy, or ``None`` when unarmed.
+
+    A reconciliation is NOT a micro-action: it applies no rule off the wire and
+    must never land in ``applied_<kind>`` / ``skipped_<kind>``, which are the
+    apply-rate numerators. It gets its own counters in the same dict:
+
+    * ``join_<mode>``              -- merges reconciled under that mode;
+    * ``join_matched_target``      -- of those, the ones whose common container
+      IS the one the policy aimed at. For ``lossless`` that is the union and
+      always true; for ``lossy`` it is the fresh contraction's container, and
+      ``join_wider_than_target`` is the honest count of merges whose add came
+      out WIDER -- and therefore more expensive -- than the head asked for.
+
+    Gated on ``face_counts_armed`` exactly as ``make_slot_frame_hook``'s
+    counters are, so the tokenizer's and the face-enum walk's replays of the
+    same hook objects do not inflate the measurement.
+    """
+    from alphagrad.approx.common.masks import face_counts_armed
+
+    def _sink(outcome):
+        if not face_counts_armed():
+            return
+
+        def _bump(key):
+            _PER_FACE_STATS[key] = _PER_FACE_STATS.get(key, 0) + 1
+
+        _bump(f"join_{outcome.mode}")
+        _bump("join_matched_target" if outcome.matched_target
+              else "join_wider_than_target")
+        if outcome.rules:
+            _bump("join_projected")
+    return _sink
 
 
 def face_entry_from_slots(slots, at_site=None):
     """ONE face's ``face_transforms`` entry from its decoded per-slot hooks
-    ``(lhs, rhs, new)`` -- the ONLY place a face wire becomes a graphax
-    entry (ticket .17, D1). ``_face_dict_for_vertex`` (the measurement),
+    ``(lhs, rhs, new)`` -- the ONLY place a face wire becomes a graphax entry
+    (ticket .17, D1). ``_face_dict_for_vertex`` (the measurement),
     ``live_faces.LiveFaceStream._decided`` (the head's tokens),
     ``plan_tokens.PlanTokenizer.face_transforms`` (the AZ tokens) and
     ``masks.LiveVertexMaskOracle._face_ft`` (the mask replay) all go through
-    here, so one wire has one transform semantics and ``approx_old()`` has
+    here, so one wire has one transform semantics and :func:`approx_add` has
     one reader.
 
-    #72. A bare 3-tuple means CONTRACTION ONLY to graphax
-    (_normalize_perpath, core.py:797): pre/post hit the two
-    contraction operands and `new` the contraction RESULT, while
-    the join hooks stay None. The requested semantics is that a
-    `new`-slot approximation ALSO applies to the existing edge
-    this result is added to, so compute is saved on both
-    operands of the join.
+    #73. EVERY APPROXIMATION LANDS ON THE CONTRACTION SIDE. The three slots
+    are the two contraction operands and its result, so the entry is always
+    the TWO-OP form with ``new`` at graphax's ``res:new`` -- the fresh
+    contraction, BEFORE any join. The `new` slot's wire row therefore meets
+    exactly ONE tensor, which is the tensor :func:`slot_rules_for_row` and
+    ``masks.slot_legality`` are computed on: "the mask admits it" and "the hook
+    applies it" are again one statement.
 
-    graphax already wires that: `_h_rhs` is applied to `_edge`
-    -- the existing edge -- immediately before the add
-    (core.py:1679). So emit the TWO-OP form and put the new-slot
-    hook in `rhs`.
+    That is the #73 change. Under the retired ``--approx-old same`` the SAME
+    hook object was also installed at ``jr``, the pre-existing old edge, so one
+    row ran on two tensors whose logical dims agreed and whose STORAGE did not
+    -- a legal block subdivision on one, an idempotent no-op on the other
+    (finding 72, fault 1). The ADD is no longer expressed as "apply the same
+    rule twice"; it is expressed as a JOIN POLICY.
 
-    `lhs` stays None on purpose: `new` has already transformed
-    the contraction result at core.py:1657, and `lhs` hits that
-    SAME tensor at 1678, so setting it would apply the
-    approximation twice. `res` (the summed edge) is a decision
-    the head does not make.
+    THE JOIN POLICY sits at the ``jr`` position and is handed BOTH addends by
+    graphax (``core._eliminate_vertex``; see
+    :mod:`graphax.sparse.ops.join`). It returns both, in ONE container:
 
-    Faces with no existing edge are unaffected -- graphax simply
-    never reaches the join hooks for them.
+    * ``lossy``    -> ``MatchFreshJoin``: the common container is the one the
+      approximated ``new`` slot landed on, with the old edge projected onto it.
+    * ``lossless`` -> NO POLICY AT ALL. graphax's sparse ``+`` already builds
+      the UNION container for a union op -- meta ``gcd``, block ``lcm``
+      (``elementwise._pair_metric``) -- which IS "the largest of the two
+      structures along each dim". Installing ``UnionJoin`` would compute the
+      same container twice and move no value, so ``lossless`` emits the join
+      triple ALL-None and lets the add do it. Measured exact: max relative
+      error 0 over every merge face of the TLM census.
 
-    --approx-old exact leaves the old edge alone: the bare 3-tuple
-    is emitted and graphax never reaches the join hooks.
+    ``jl`` and ``jres`` stay None here. ``jl`` would hit the tensor ``new``
+    has already transformed, with no intervening op, so it can express nothing
+    ``new`` cannot; ``jres`` is the post-join SUM, which is not a decision the
+    contraction-side head makes. Both are the positions the LEARNED variants
+    will occupy and are deliberately left free.
 
-    ``at_site(site, hook)`` -- OPTIONAL per-SITE adapter, and the reason this
-    function takes one at all: a slot's ONE hook object is installed at more
-    than one graphax site (``new`` AND ``jr`` under ``same``; ``jres`` alone
-    under ``exact``), so graphax invokes it on more than one TENSOR. A caller
-    that has to tell those tensors apart -- the legality probe, which needs
-    one mask per tensor the hook will meet -- cannot do it from the entry,
-    because the object is identical at every position. ``at_site`` is called
-    once per placement with the site name and returns the object to place
-    there. Default: the hook itself everywhere, which is what the measurement
-    installs. The site names are graphax's own (:func:`graphax.core.
-    _unpack_face_slots`), prefixed ``res:`` for the four result sites.
+    A merge-free face is unaffected: graphax never reaches the join position,
+    so the policy never runs and there is nothing to reconcile.
+
+    ``at_site(site, hook)`` -- OPTIONAL per-SITE adapter. A slot's hook object
+    could be installed at more than one graphax site, and a caller that has to
+    tell those invocations apart -- the legality probe, which needs one mask
+    per tensor the hook will meet -- cannot do it from the entry, because the
+    object would be identical at every position. ``at_site`` is called once per
+    placement with the site name and returns the object to place there.
+    Default: the hook itself, which is what the measurement installs. The site
+    names are graphax's own (:func:`graphax.core._unpack_face_slots`), prefixed
+    ``res:`` for the four result sites.
 
     SITE NAMES ARE NOT DECORATION. ``_probe_faces`` builds its recording entry
     through THIS function precisely so the set of sites it records can never
     drift from the set the measurement installs -- the drift that made the
     ``new`` slot's mask clear Diags the engine refused on the old edge
-    (finding 72, ticket .59 fault 1).
+    (finding 72, ticket .59 fault 1). The join POLICY is not passed through
+    ``at_site``: it is not a hook, it applies no wire row, and there is no mask
+    for it to answer for.
     """
+    from graphax.sparse.ops.join import MatchFreshJoin
+
     def _at(site, hook):
         if hook is None or at_site is None:
             return hook
         return at_site(site, hook)
 
     _new_hook = slots[2] if len(slots) > 2 else None
-    if _new_hook is not None and approx_old() == "same":
-        core3 = (_at("lhs", slots[0]), _at("rhs", slots[1]),
-                 _at("res:new", _new_hook))
-        return (core3, (None, _at("res:jr", _new_hook), None))
-    if at_site is None:
-        return tuple(slots)
-    # The BARE triple's third position is graphax's POST-JOIN ``jres``, not
-    # ``new`` (_unpack_face_slots): a different tensor again, so it gets its
-    # own site name.
-    return (_at("lhs", slots[0]), _at("rhs", slots[1]),
-            _at("res:jres", _new_hook) if len(slots) > 2 else None)
+    core3 = (_at("lhs", slots[0]), _at("rhs", slots[1]),
+             _at("res:new", _new_hook))
+    mode = approx_add()
+    if mode == "lossy":
+        return (core3, (None, MatchFreshJoin(on_outcome=_join_outcome_sink()),
+                        None))
+    if mode == "lossless":
+        return (core3, (None, None, None))
+    raise NotImplementedError(
+        f"face_entry_from_slots: --approx-add {mode!r} is accepted by "
+        f"approx_add() but has no entry form here. A value that cannot be "
+        f"built must not silently fall back to another one.")
 
 
 def face_slot_sites() -> tuple[tuple[str, ...], ...]:
