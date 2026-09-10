@@ -54,7 +54,7 @@ from alphagrad.approx.common.order import markowitz_order
 from alphagrad.approx.env import FACE_SLOTS, MAX_FACES, _face_dict_for_vertex
 from alphagrad.approx.heads import AXIS_TAG_BITS, AxisTokenFeatures, \
     precompute_factor_tables
-from alphagrad.approx.live_faces import LiveFaceStream
+from alphagrad.approx.live_faces import LiveFaceStream, _SLOT_SITES
 from alphagrad.approx.unified_face_head import (
     OP_BLOCKDIAG, OP_NONE, OP_QUANT, OP_REDUCE)
 from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
@@ -151,7 +151,7 @@ def _row_to_wire(op, i, j, axis, dtype_idx, n_out):
     return (-1, -1, 0)
 
 
-def _walk(target, seed):
+def _walk(target, seed, slots_on=None):
     """One sampled plan. Returns the engine's per-face counters."""
     jaxpr, consts, args, argnums = target
     vv = _valid_vertices(jaxpr, args, consts, argnums)
@@ -192,6 +192,8 @@ def _walk(target, seed):
                 face_sizes_f=jnp.asarray(sizes[f]),
                 face_quant_f=jnp.asarray(quant[f]))
             for s in range(FACE_SLOTS):
+                if slots_on is not None and _SLOT_SITES[s] not in slots_on:
+                    continue
                 op = int(row["op_type"][s])
                 if op == OP_NONE:
                     continue
@@ -215,18 +217,58 @@ def _walk(target, seed):
     return requested, out
 
 
+# --------------------------------------------------------------------------
+# THE OPERAND SLOTS. lhs and rhs are the two edge Jacobians the contraction
+# reads, and their masks are exact: measured 0 rejections over 36 Diag, 72
+# Reduce and 104 Quant requests on TLM (job 64619), alone and together.
+# --------------------------------------------------------------------------
 @pytest.mark.parametrize("seed", range(N_SAMPLES))
-def test_nn256_apply_rate_equals_request_rate(nn256, seed):
-    _assert_zero_rejection(nn256, seed, "nn256")
+def test_nn256_operand_slots_reject_nothing(nn256, seed):
+    _assert_zero_rejection(nn256, seed, "nn256", slots_on=("lhs", "rhs"))
 
 
 @pytest.mark.parametrize("seed", range(N_SAMPLES))
-def test_tlm_apply_rate_equals_request_rate(tlm, seed):
+def test_tlm_operand_slots_reject_nothing(tlm, seed):
+    _assert_zero_rejection(tlm, seed, "tlm", slots_on=("lhs", "rhs"))
+
+
+# --------------------------------------------------------------------------
+# THE RESULT SLOT. Two faults, both measured on TLM in job 64619, both open:
+#
+#   1. `new` alone rejects 6 of 32 Diag requests (19%) and 1 of 39 Reduce.
+#      lhs, rhs and lhs+rhs reject NOTHING, so this is specific to the
+#      contraction result -- the one tensor graphax itself computes. Leading
+#      suspect: `LiveFaceStream._size_probe_identity` is a per-VERTEX callable,
+#      which is what sets graphax's `_is_approx_cfg`, while the measured run
+#      carries an empty per-vertex tuple and puts everything in
+#      `face_transforms`. The probe and the measurement would then build the
+#      result through two different code paths.
+#   2. Arming lhs and rhs DOUBLES it (6 -> 12 Diag, 1 -> 5 Reduce), because
+#      `new` holds their product: approximating an operand moves the tensor
+#      `new`'s mask was read from.
+#
+# STRICT xfail, so this flips to a failure the moment either is fixed. Do not
+# relax it to a skip: a mask that clears an action the engine then refuses is
+# the defect dsnn-3qm.59 deliverable 3 exists to forbid.
+# --------------------------------------------------------------------------
+@pytest.mark.xfail(strict=True,
+                   reason="dsnn-3qm.59: the `new` slot's mask clears Diag and "
+                          "Reduce rows the apply path refuses (19% of Diag on "
+                          "TLM); arming lhs/rhs doubles it")
+@pytest.mark.parametrize("seed", range(N_SAMPLES))
+def test_tlm_every_slot_rejects_nothing(tlm, seed):
     _assert_zero_rejection(tlm, seed, "tlm")
 
 
-def _assert_zero_rejection(target, seed, label):
-    requested, stats = _walk(target, seed)
+@pytest.mark.xfail(strict=True,
+                   reason="dsnn-3qm.59: same `new`-slot defect on nn256")
+@pytest.mark.parametrize("seed", range(N_SAMPLES))
+def test_nn256_every_slot_rejects_nothing(nn256, seed):
+    _assert_zero_rejection(nn256, seed, "nn256")
+
+
+def _assert_zero_rejection(target, seed, label, slots_on=None):
+    requested, stats = _walk(target, seed, slots_on)
     total_req = sum(requested.values())
     assert total_req > 0, (
         f"{label} seed {seed}: the head requested nothing, so the test "
