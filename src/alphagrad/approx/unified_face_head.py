@@ -74,7 +74,28 @@ SLOT_WIDTH = S_DTYPE + 1                    # 31
 
 O_SKIP = 0
 O_SLOT0 = 1
-HEAD_WIDTH = O_SLOT0 + FACE_SLOTS * SLOT_WIDTH   # 94
+# --- the #73 APPEND (ticket .56). Every field base above keeps its index. ---
+# [0:94) unchanged; [94:95) the `choose` bit; [95:126) learned1, the OLD EDGE
+# (graphax `res:jr`); [126:157) learned2, the SUMMED EDGE (`res:jres`).
+#
+# JOIN_SLOTS are slot blocks of the SAME 31-wide shape as the three
+# contraction slots, so `slot_base` / `S_OP` / `score`'s per-slot loop cover
+# them unchanged. They are APPENDED AFTER the choose bit, which is why
+# `slot_base` needs a branch rather than one multiply: `O_SLOT0 + 31*3` is 94,
+# the choose bit's own index. The alternative -- the bit last, at 156 -- would
+# make `slot_base` a single expression, and it was rejected because the
+# offsets above are the ones the review and the goldens are written against.
+O_CHOOSE = O_SLOT0 + FACE_SLOTS * SLOT_WIDTH     # 94
+JOIN_SLOTS = 2
+O_JOIN0 = O_CHOOSE + 1                           # 95
+N_HEAD_SLOTS = FACE_SLOTS + JOIN_SLOTS           # 5
+HEAD_WIDTH = O_JOIN0 + JOIN_SLOTS * SLOT_WIDTH   # 157
+
+#: ``choose`` encoding. 0 = ``lossy``, 1 = ``lossless``. 0 is the canonical
+#: no-op value every forced field is written to, and ``lossy`` is the declared
+#: default of ``--approx-add``, so a golden that zeroes this field reproduces
+#: the default behaviour rather than a third thing.
+JOIN_LOSSY, JOIN_LOSSLESS = 0, 1
 
 # --face-logit-clamp (v62 saturation guard, ppo.py sets this right after
 # argparse, BEFORE any jit trace -- UnifiedFaceHead.logits reads it at
@@ -94,11 +115,36 @@ def set_logit_clamp(c: float) -> None:
 
 
 def slot_base(s: int) -> int:
-    return O_SLOT0 + SLOT_WIDTH * s
+    """Logit offset of slot ``s``'s 31-wide block.
+
+    ``s < FACE_SLOTS`` -> the three contraction slots at 1, 32, 63, unchanged.
+    ``s >= FACE_SLOTS`` -> the join slots at 95, 126, i.e. AFTER the choose bit
+    at 94. The branch is the price of putting the bit at 94 (see the layout
+    comment); it is not an accident.
+    """
+    if not (0 <= s < N_HEAD_SLOTS):
+        raise IndexError(
+            f"slot {s} out of range [0, {N_HEAD_SLOTS}); the head has "
+            f"{FACE_SLOTS} contraction slots and {JOIN_SLOTS} join slots.")
+    if s < FACE_SLOTS:
+        return O_SLOT0 + SLOT_WIDTH * s
+    return O_JOIN0 + SLOT_WIDTH * (s - FACE_SLOTS)
 
 
 class FaceFields(NamedTuple):
-    """One face's complete decision. Slot fields are (S,)."""
+    """One face's complete decision.
+
+    Slot fields are ``(N_HEAD_SLOTS,)``: the three CONTRACTION slots
+    (lhs, rhs, new) followed by the two JOIN slots (learned1 on the old edge,
+    learned2 on the summed edge). ``join`` is the per-face ``choose`` bit.
+
+    A field the running ``--approx-add`` value does not use is FORCED to its
+    canonical no-op here (``join = JOIN_LOSSY``, a join slot's ``op =
+    OP_NONE``) and contributes exactly zero log-prob and zero entropy, the
+    same discipline a padding face and a slot behind ``skip == 1`` get. That
+    is what keeps ``sample`` and ``score`` scoring the same variable, and so
+    the PPO ratio at 1 on epoch 0.
+    """
     skip: jax.Array          # () int32
     op: jax.Array            # (S,) int32
     i: jax.Array             # (S,) int32, 0-based 0..5
@@ -106,6 +152,19 @@ class FaceFields(NamedTuple):
     axis: jax.Array          # (S,) int32, 0..8
     reduce_fn: jax.Array     # (S,) int32
     dtype_idx: jax.Array     # (S,) int32 {0: float32, 1: bfloat16}
+    join: jax.Array = None   # () int32, JOIN_LOSSY / JOIN_LOSSLESS
+
+    @property
+    def join_bit(self) -> jax.Array:
+        """``join``, or the canonical ``JOIN_LOSSY`` when absent.
+
+        ``join`` defaults to ``None`` so every existing construction of
+        ``FaceFields`` -- tests, goldens, the AZ tokenizer -- keeps working and
+        means what it used to mean: no ``choose`` decision. Reading it through
+        here is what stops a ``None`` reaching the scorer.
+        """
+        return (jnp.asarray(JOIN_LOSSY, jnp.int32) if self.join is None
+                else self.join)
 
 
 def _cat_logp_ent(logits, mask, idx):
@@ -222,16 +281,88 @@ class UnifiedFaceHead(eqx.Module):
         return z
 
     # ------------------------------------------------------------------ score
+    @staticmethod
+    def _check_mask_slots(*masks) -> int:
+        """How many slots the caller's masks describe: FACE_SLOTS or
+        N_HEAD_SLOTS, never anything else.
+
+        A mask row that nobody computed must not be invented here. Padding a
+        3-row mask up to 5 with all-ones would CLEAR every action on the two
+        join slots -- on tensors the probe never looked at -- which is exactly
+        the "mask admits it, hook refuses it" defect finding 72 exists to
+        forbid. So a short mask means "the join slots are not in play", a full
+        mask means "they are", and anything else raises.
+        """
+        rows = {int(m.shape[0]) for m in masks if m is not None}
+        if rows - {FACE_SLOTS, N_HEAD_SLOTS}:
+            raise ValueError(
+                f"face masks must have {FACE_SLOTS} or {N_HEAD_SLOTS} slot "
+                f"rows, got {sorted(rows)}. A padded row would clear actions "
+                f"on a tensor no mask was computed from.")
+        if len(rows) > 1:
+            raise ValueError(
+                f"face masks disagree on their slot count: {sorted(rows)}. "
+                f"One decision, one slot count.")
+        return rows.pop() if rows else FACE_SLOTS
+
+    @staticmethod
+    def _join_gates(join_slot_ok):
+        """``(JOIN_SLOTS,)`` float gates; ``None`` means both join slots dead.
+
+        Dead is the right default: every ``--approx-add`` value except the
+        learned ones leaves those slots unused, and an unused field must
+        contribute exactly zero rather than take gradient from a reward it had
+        no part in.
+        """
+        if join_slot_ok is None:
+            return jnp.zeros((JOIN_SLOTS,), jnp.float32)
+        g = jnp.asarray(join_slot_ok, jnp.float32).reshape(-1)
+        if g.shape[0] != JOIN_SLOTS:
+            raise ValueError(
+                f"join_slot_ok must have {JOIN_SLOTS} entries (learned1, "
+                f"learned2), got {g.shape[0]}.")
+        return g
+
     def score(self, z, fields: FaceFields, *, op_mask, i_mask, j_mask,
-              axis_mask, dtype_mask=None, pair_ok=None, face_valid=True, approx_ok=True):
+              axis_mask, dtype_mask=None, pair_ok=None, face_valid=True,
+              approx_ok=True, choose_ok=False, join_slot_ok=None):
         """(log_prob, entropy, arity) of ``fields`` under logits ``z``.
 
-        Masks are (S, ...) so each slot can carry its own legality; the caller
-        passes the oracle's per-face masks. `face_valid` / `approx_ok` are the
-        gates that force a padding face or a disallowed variant to contribute
-        exactly zero -- sample() applies the SAME gates, which is what keeps
-        the ratio at 1 before any update.
+        Masks are ``(S, ...)`` so each slot can carry its own legality; the
+        caller passes the oracle's per-face masks. ``S`` may be
+        ``FACE_SLOTS`` (the three contraction slots only) or
+        ``N_HEAD_SLOTS``; anything else raises, because a silently padded mask
+        row would clear actions on a tensor nobody computed a mask from.
+
+        ``face_valid`` / ``approx_ok`` are the gates that force a padding face
+        or a disallowed variant to contribute exactly zero. ``choose_ok`` and
+        ``join_slot_ok`` are the same discipline for the #73 fields:
+
+        ``choose_ok`` -- the ``choose`` bit is a LIVE decision (true only under
+        ``--approx-add choose``). False forces it to the canonical
+        ``JOIN_LOSSY`` with zero log-prob and zero entropy.
+
+        ``join_slot_ok`` -- ``(JOIN_SLOTS,)``, per join slot, live only under
+        the value that uses it (``learned1`` for slot 3, ``learned2`` for slot
+        4). Default: both dead, which is what every value except the learned
+        ones means.
+
+        THERE IS NO LEGALITY MASK ON THE ``choose`` BIT, and that is measured,
+        not assumed. Both arms are always formable: ``lossless`` is the plain
+        sparse add, and ``lossy`` ends in
+        ``graphax.sparse.ops.join.unify_containers``, which equalises the two
+        addends' containers unconditionally -- 23 of 23 TLM merge faces formed
+        ``lossy`` with 0 raises (finding 73). So the bit is free and a mask
+        would be a mask of all-ones. If that ever stops being true the bit
+        needs one, which is why
+        ``tests/approx_add_test.py::test_the_choose_bit_needs_no_legality_mask``
+        pins the claim on the engine rather than trusting this comment.
+
+        sample() applies the SAME gates, which is what keeps the ratio at 1
+        before any update.
         """
+        n_slots = self._check_mask_slots(op_mask, i_mask, j_mask, axis_mask)
+        join_slot_ok = self._join_gates(join_slot_ok)
         gate_face = jnp.asarray(face_valid, jnp.float32) * jnp.asarray(
             approx_ok, jnp.float32)
 
@@ -249,9 +380,22 @@ class UnifiedFaceHead(eqx.Module):
         ent = jnp.where(_on, e_skip, _z)
         arity = gate_face
 
+        # THE `choose` BIT. Gated by `choose_ok` and by the face gate, and
+        # SELECTED not multiplied, for the same reason every other gate here
+        # is: a 0.0 multiplier on a log-prob that is legitimately -inf is NaN.
+        _cho_on = _on & (jnp.asarray(choose_ok, jnp.float32) > 0.5)
+        lp_cho, e_cho = _bern_logp_ent(
+            z[O_CHOOSE], fields.join_bit > JOIN_LOSSY)
+        logp = logp + jnp.where(_cho_on, lp_cho, _z)
+        ent = ent + jnp.where(_cho_on, e_cho, _z)
+
         active = gate_face * (fields.skip == 0).astype(jnp.float32)
         _act = active > 0.5
-        for s in range(FACE_SLOTS):
+        for s in range(n_slots):
+            # A JOIN slot is live only under the value that uses it. Dead ->
+            # the same zero contribution a slot behind `skip == 1` gets.
+            slot_on = (_act if s < FACE_SLOTS
+                       else _act & (join_slot_ok[s - FACE_SLOTS] > 0.5))
             b = slot_base(s)
             op = fields.op[s]
             lp_op, e_op = _cat_logp_ent(
@@ -291,20 +435,28 @@ class UnifiedFaceHead(eqx.Module):
                       + jnp.where(is_bd, e_i + e_j, _z0)
                       + jnp.where(is_rd, e_ax + e_fn, _z0)
                       + jnp.where(is_qt, e_dt, _z0))
-            logp = logp + jnp.where(_act, slot_lp, _z)
-            ent = ent + jnp.where(_act, slot_e, _z)
-            arity = arity + active * (op != OP_NONE).astype(jnp.float32)
+            logp = logp + jnp.where(slot_on, slot_lp, _z)
+            ent = ent + jnp.where(slot_on, slot_e, _z)
+            arity = arity + (active * slot_on.astype(jnp.float32)
+                             * (op != OP_NONE).astype(jnp.float32))
         return logp, ent, arity
 
     # ----------------------------------------------------------------- sample
     def sample(self, ctx, key, *, op_mask, i_mask, j_mask, axis_mask,
-               dtype_mask=None, pair_ok=None, face_valid=True, approx_ok=True):
+               dtype_mask=None, pair_ok=None, face_valid=True, approx_ok=True,
+               choose_ok=False, join_slot_ok=None):
         """Draw one face decision. Returns ``(z, FaceFields, lp, ent, arity)``.
 
         Every field is drawn from the SINGLE forward pass ``z`` -- nothing is
         conditioned on a previously drawn slot, and nothing is unrolled.
+
+        ``choose_ok`` / ``join_slot_ok`` gate the #73 fields exactly as
+        :meth:`score` documents, and are applied HERE as well as there: a field
+        that is forced in one and drawn in the other is the ratio bug.
         """
         z = self.logits(ctx)
+        n_slots = self._check_mask_slots(op_mask, i_mask, j_mask, axis_mask)
+        join_gate = self._join_gates(join_slot_ok)
         # One skip key, five per slot (op, i, j, axis, reduce_fn), then one
         # dtype key per slot. The dtype Bernoulli used to share k[4] with the
         # reduce_fn categorical: under threefry a scalar uniform and the
@@ -315,8 +467,15 @@ class UnifiedFaceHead(eqx.Module):
         # split(key, n)[i] does not depend on n under
         # jax_threefry_partitionable, so every other draw is the same as
         # before for the same seed.
-        keys = jrand.split(key, 1 + FACE_SLOTS * 6)
-        dt_keys = keys[1 + FACE_SLOTS * 5:]
+        # The key budget is written in N_HEAD_SLOTS, not FACE_SLOTS: the two
+        # join slots draw from their own keys. split(key, n)[i] does not depend
+        # on n under jax_threefry_partitionable, so slots 0-2 and the skip draw
+        # EXACTLY what they drew at 94 logits for the same seed -- the #73
+        # append does not move any existing random draw. The choose bit's key
+        # is appended last for the same reason.
+        keys = jrand.split(key, 2 + N_HEAD_SLOTS * 6)
+        dt_keys = keys[1 + N_HEAD_SLOTS * 5:]
+        cho_key = keys[1 + N_HEAD_SLOTS * 6]
 
         p_skip = jnn.sigmoid(z[O_SKIP])
         skip = (jrand.uniform(keys[0]) < p_skip).astype(jnp.int32)
@@ -325,8 +484,15 @@ class UnifiedFaceHead(eqx.Module):
         skip = skip * jnp.asarray(approx_ok, jnp.int32) \
             * jnp.asarray(face_valid, jnp.int32)
 
+        # The `choose` bit. Forced to the canonical JOIN_LOSSY when the running
+        # value does not use it, which is also what score() scores then.
+        join = (jrand.uniform(cho_key) < jnn.sigmoid(z[O_CHOOSE])
+                ).astype(jnp.int32)
+        join = join * jnp.asarray(choose_ok, jnp.int32) \
+            * jnp.asarray(face_valid, jnp.int32)
+
         ops, iis, jjs, axs, fns, dts = [], [], [], [], [], []
-        for s in range(FACE_SLOTS):
+        for s in range(n_slots):
             b = slot_base(s)
             k = keys[1 + 5 * s:1 + 5 * (s + 1)]
             op = _sample_cat(z[b + S_OP:b + S_I], op_mask[s], k[0])
@@ -340,6 +506,19 @@ class UnifiedFaceHead(eqx.Module):
             dm = jnp.ones((2,), jnp.float32) if dtype_mask is None else dtype_mask[s]
             z_dt = jnp.stack([0.0, z[b + S_DTYPE]])
             dt = _sample_cat(z_dt, dm, dt_keys[s])
+            if s >= FACE_SLOTS:
+                # A dead join slot is forced to OP_NONE with every sub-field
+                # at 0 -- the same canonical no-op a slot behind `skip == 1`
+                # carries. Forcing the VALUE as well as zeroing the log-prob
+                # matters: the wire is built from these fields, so a dead slot
+                # must also emit no rule.
+                live = join_gate[s - FACE_SLOTS] > 0.5
+                op = jnp.where(live, op, jnp.asarray(OP_NONE, jnp.int32))
+                i_idx = jnp.where(live, i_idx, 0)
+                j_idx = jnp.where(live, j_idx, 0)
+                ax = jnp.where(live, ax, 0)
+                fn = jnp.where(live, fn, 0)
+                dt = jnp.where(live, dt, 0)
             ops.append(op); iis.append(i_idx); jjs.append(j_idx)
             axs.append(ax); fns.append(fn); dts.append(dt)
 
@@ -347,10 +526,11 @@ class UnifiedFaceHead(eqx.Module):
             skip=skip,
             op=jnp.stack(ops), i=jnp.stack(iis), j=jnp.stack(jjs),
             axis=jnp.stack(axs), reduce_fn=jnp.stack(fns),
-            dtype_idx=jnp.stack(dts),
+            dtype_idx=jnp.stack(dts), join=join,
         )
         lp, ent, arity = self.score(
             z, fields, op_mask=op_mask, i_mask=i_mask, j_mask=j_mask,
             axis_mask=axis_mask, dtype_mask=dtype_mask, pair_ok=pair_ok,
-            face_valid=face_valid, approx_ok=approx_ok)
+            face_valid=face_valid, approx_ok=approx_ok,
+            choose_ok=choose_ok, join_slot_ok=join_slot_ok)
         return z, fields, lp, ent, arity
