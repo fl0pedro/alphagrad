@@ -204,7 +204,16 @@ def _walk_one_graph(target, seed, slots_on=None):
     pol, tables = _policy(F)
     feats = _features()
     ctx = jnp.zeros((pol.embd_dim,), jnp.float32)
+    # THE TOPOLOGY'S WIDTH, not FACE_SLOTS. `face_slot_sites()` reports five
+    # slots since #73 (the three contraction slots, then learned1 on the old
+    # edge and learned2 on the summed edge), so the mask arrays are sized from
+    # it. The POLICY and the wire below still cover the contraction band, so the
+    # join rows are computed and then sliced off -- which is what `face_driver`
+    # does on the trainer path, and the prefix assertion is the same one.
     sites = face_slot_sites()
+    S_ALL = len(sites)
+    assert tuple(x[0] for x in sites[:FACE_SLOTS]) == (
+        "lhs", "rhs", "res:new"), sites
 
     envmod._PER_FACE_STATS.clear()
     requested = {k: 0 for k in KINDS}
@@ -214,11 +223,11 @@ def _walk_one_graph(target, seed, slots_on=None):
         keys = list(tk.ij.faces(v))
         src = lf._probe_faces(tk, v, keys, True, slots=True, stat="slot") or {}
         nf = min(len(keys), F)
-        sizes = np.zeros((F, FACE_SLOTS, N_AX), np.int32)
-        pair = np.zeros((F, FACE_SLOTS, N_AX, N_AX), np.float32)
-        comp = np.zeros((F, FACE_SLOTS, N_AX), np.float32)
-        quant = np.zeros((F, FACE_SLOTS, 2), np.float32)
-        nout = np.zeros((F, FACE_SLOTS), np.int32)
+        sizes = np.zeros((F, S_ALL, N_AX), np.int32)
+        pair = np.zeros((F, S_ALL, N_AX, N_AX), np.float32)
+        comp = np.zeros((F, S_ALL, N_AX), np.float32)
+        quant = np.zeros((F, S_ALL, 2), np.float32)
+        nout = np.zeros((F, S_ALL), np.int32)
         for k in range(nf):
             by = src.get(keys[k]) or {}
             for sl, site_list in enumerate(sites):
@@ -236,11 +245,17 @@ def _walk_one_graph(target, seed, slots_on=None):
         skips = np.zeros((F,), np.int32)
         for f in range(nf):
             key = jrand.PRNGKey(seed * 1000003 + n * 97 + f)
+            # SLICED TO THE CONTRACTION BAND, like face_driver does: the policy
+            # builds per-slot features for the three contraction slots, and the
+            # join rows above were computed to prove they CAN be (and to mask
+            # learned1/learned2 once the wire carries them), not to be fed in.
             _skip, row, *_ = pol.sample_face(
                 feats, tables, key, f,
-                jnp.asarray(pair[f]), jnp.asarray(comp[f]), jnp.asarray(1.0),
-                face_context=ctx, face_sizes_f=jnp.asarray(sizes[f]),
-                face_quant_f=jnp.asarray(quant[f]))
+                jnp.asarray(pair[f][:FACE_SLOTS]),
+                jnp.asarray(comp[f][:FACE_SLOTS]), jnp.asarray(1.0),
+                face_context=ctx,
+                face_sizes_f=jnp.asarray(sizes[f][:FACE_SLOTS]),
+                face_quant_f=jnp.asarray(quant[f][:FACE_SLOTS]))
             for sl in range(FACE_SLOTS):
                 if slots_on is not None and _SLOT_SITES[sl] not in slots_on:
                     continue

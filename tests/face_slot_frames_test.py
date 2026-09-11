@@ -394,11 +394,20 @@ def test_slot_legality_is_per_slot_and_matches_the_recorded_tensors():
     order, specs, n = _exact_prefix(total_v, total_v - 1)   # everything but 1
     sizes, quant, pair, comp, nout, nf = lf.face_slot_legality(
         order, specs, n, 1)
-    assert sizes.shape == (MAX_F, FACE_SLOTS, N_AX)
-    assert quant.shape == (MAX_F, FACE_SLOTS, 2)
-    assert pair.shape == (MAX_F, FACE_SLOTS, N_AX, N_AX)
-    assert comp.shape == (MAX_F, FACE_SLOTS, N_AX)
-    assert nout.shape == (MAX_F, FACE_SLOTS)
+    # ONE ROW PER SLOT THE ENTRY BUILDER HOOKS, which since #73 is five: the
+    # three contraction slots, then learned1 on the old edge and learned2 on the
+    # summed edge. The width comes from `env.face_slot_sites()` so the mask
+    # cannot go stale behind the topology, and the contraction slots are its
+    # PREFIX -- which is what lets the trainer path narrow to them.
+    from alphagrad.approx.env import face_slot_sites as _sites
+    S_ALL = len(_sites())
+    assert tuple(x[0] for x in _sites()[:FACE_SLOTS]) == (
+        "lhs", "rhs", "res:new"), _sites()
+    assert sizes.shape == (MAX_F, S_ALL, N_AX)
+    assert quant.shape == (MAX_F, S_ALL, 2)
+    assert pair.shape == (MAX_F, S_ALL, N_AX, N_AX)
+    assert comp.shape == (MAX_F, S_ALL, N_AX)
+    assert nout.shape == (MAX_F, S_ALL)
     assert int(nf) >= 1
 
     _ij, keys, store = _walk_to(closed, _ARGS, 1)
