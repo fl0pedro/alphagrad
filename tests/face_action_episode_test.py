@@ -142,6 +142,69 @@ def test_one_episode_completes_and_scores_at_every_width(monkeypatch, mode):
 
 
 @pytest.mark.parametrize("mode", MODES)
+def test_a_SAMPLED_record_survives_the_whole_chain(monkeypatch, mode):
+    """The full chain in ONE test: head -> record -> StepAction -> env -> reward.
+
+    The test above builds the wire itself, which checks the SHAPE the
+    declaration sizes. This one draws the record from the REAL head through
+    ``UnifiedFacePolicy.sample`` and pushes it through the REAL
+    ``Agent.to_env_action_dynamic`` before the env sees it, so the translator
+    call, the per-face channel forwarding and the env's acceptance are one
+    statement rather than two hops joined by a test fixture.
+
+    ``to_env_action_dynamic`` uses no ``self``, so it is called unbound and this
+    costs no Agent. The drawn rows may well be illegal on a 4-vertex toy --
+    ``make_live_masked_hook`` skips a rule its own operand refuses, per slot,
+    which is the designed behaviour and is not what is under test here.
+    """
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", mode)
+    monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
+    from alphagrad.approx.heads import (
+        AXIS_TAG_BITS, AxisTokenFeatures, MicroAction, OP_END,
+        precompute_factor_tables)
+    from alphagrad.approx.ppo import Agent
+    from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
+
+    env = _env()
+    ax = env.axis_state_static
+    n_ax = int(ax.shape[1])
+    sz = jnp.full((n_ax,), 4, jnp.int32)
+    feats = AxisTokenFeatures(
+        size=sz, log_size=jnp.log(sz.astype(jnp.float32)),
+        tag_bits=jnp.zeros((n_ax, AXIS_TAG_BITS), jnp.float32),
+        group_id=-jnp.ones((n_ax,), jnp.int32),
+        valid_mask=jnp.ones((n_ax,), jnp.float32))
+    pol = UnifiedFacePolicy(32, num_heads=2, max_faces=MAX_FACES,
+                            key=jrand.PRNGKey(0), approx_add=mode)
+    fa, *_ = pol.sample(
+        None, feats, precompute_factor_tables(64), jrand.PRNGKey(5),
+        jnp.ones((MAX_FACES, n_ax, n_ax), jnp.float32),
+        jnp.ones((MAX_FACES, n_ax), jnp.float32),
+        jnp.ones((MAX_FACES,), jnp.float32))
+    REC.check(fa, mode, MAX_FACES, where="sampled for the episode")
+
+    zero = jnp.zeros((1,), jnp.int32)
+    micro = MicroAction(
+        op_type=jnp.full((1,), OP_END, jnp.int32), i=zero, j=zero,
+        exponents=jnp.zeros((1, 9), jnp.int32), factor=zero,
+        compress_kind=zero, quant_dtype=zero,
+        quant_scale_sign=jnp.ones((1,), jnp.int32),
+        quant_scale_frac=jnp.zeros((1,), jnp.float32))
+
+    state = env.reset()
+    for v in [int(x) for x in np.asarray(env.valid_vertices)]:
+        sa = Agent.to_env_action_dynamic(None, v - 1, micro, ax, face_action=fa)
+        assert tuple(sa.face_rows.shape) == (MAX_FACES, REC.n_slots(mode), 3)
+        assert (sa.face_join is None) != ("join" in REC.names(mode))
+        state = env.step(state, sa._replace(
+            target_vertex=jnp.asarray(v, jnp.int32))).state
+    reward = np.asarray(state.reward)
+    recs = envmod.consume_plan_records()["records"]
+    assert np.all(np.isfinite(reward)), (mode, reward.tolist())
+    assert len(recs) == 1 and recs[0]["approx_add"] == mode
+
+
+@pytest.mark.parametrize("mode", MODES)
 def test_the_join_channel_exists_exactly_where_the_width_says(monkeypatch, mode):
     """The per-face channel rides the wire iff the head has the bit.
 
