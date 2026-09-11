@@ -1566,6 +1566,15 @@ def test_the_two_passes_draw_the_same_rows(tlm):
     new, then face 1's), #77 in STAGE order (every face's lhs and rhs, then
     every face's new). The rows and masks must not depend on that, and this is
     the test that says so.
+
+    MODE-MATCHED, because the comparison would otherwise be about the dispatch
+    flag and not about the two passes. ``decide_faces`` FORCES
+    ``approx_active`` True; ``decide_vertex_faces`` leaves it alone, which is
+    what makes it exact about the caller's own elimination (the flag gates the
+    elemental / planner lowering inside ``sparse_matmul``, so the two settings
+    contract the same operands into different index structure). Here the vertex
+    pass is asked for the forced mode so that the only remaining difference is
+    the route.
     """
     from graphax import IncrementalPathTokenizer
 
@@ -1599,7 +1608,8 @@ def test_the_two_passes_draw_the_same_rows(tlm):
             skips = np.zeros((MAX_FACES,), np.int32)
             seen: list = []
             if pass_ == "vertex":
-                dec = lf.decide_vertex_faces(tk, v, _mk(seen), skips=skips)
+                dec = lf.decide_vertex_faces(tk, v, _mk(seen), skips=skips,
+                                             approx_dispatch=True)
             else:
                 dec = lf.decide_faces(tk, v, keys, _mk(seen), skips=skips)
             out.append((dec.rows.copy(), dec.sizes.copy(), dec.nout.copy(),

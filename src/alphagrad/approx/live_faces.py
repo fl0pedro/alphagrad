@@ -1580,7 +1580,8 @@ class LiveFaceStream:
     # ``jr`` reads -- so the bijection above says nothing about them and this
     # pass raises rather than answering. :meth:`decide_faces` is the pass for
     # those, and it stays for exactly that reason.
-    def decide_vertex_faces(self, tk, vertex, draw, *, skips=None):
+    def decide_vertex_faces(self, tk, vertex, draw, *, skips=None,
+                            approx_dispatch=None):
         """Decide every CONTRACTION slot of ``vertex`` with NO elimination.
 
         ``draw(f, s, legality)`` is called once per (face ``f``, slot ``s``),
@@ -1600,6 +1601,26 @@ class LiveFaceStream:
         the same reason :meth:`decide_faces` needs them: graphax tests
         ``face_transforms[key] is SKIP_FACE`` before running any of a face's
         hooks, so a skip cannot be chosen by a mask.
+
+        ``approx_dispatch`` -- ``None`` (the default) LEAVES
+        ``graphax.sparse.elemental.dispatch.approx_active`` ALONE, so the mask
+        is composed under the very dispatch mode the caller's elimination will
+        run under. THAT IS NOT COSMETIC AND IT IS THE SECOND STALENESS SOURCE
+        THIS PASS HAD TO CLOSE: the flag gates the elemental composition layer
+        inside ``sparse_matmul`` and the planner/einsum lowering
+        (``graphax.sparse.lower.matmul``: ``if not approx_active(): return
+        None``), so the two settings contract the SAME operands into tensors
+        with different index structure and different dtype. Measured here: with
+        the flag forced ON, as :meth:`_probe_faces` and :meth:`decide_faces` do,
+        3 of 2154 per-(face, slot) mask fields disagreed with the tensor the
+        real apply path hands the hook on TLM -- all three the QUANT row, all
+        three at ``res:new``, all three a face whose operand carried a Quant --
+        and with the flag left alone, 0 of 2154. ``face_slot_legality``
+        intersects BOTH modes because a probe run before the draw cannot know
+        which one the measurement will take; this pass does not need to guess,
+        because it runs in the caller's own process with the caller's own flag.
+        Pass ``True`` / ``False`` only to answer about a mode that is NOT the
+        current one.
 
         Returns :class:`DecidedFaces`, with ``rows`` the wire and the five mask
         fields the legality each row was drawn under -- the arrays PPO has to
@@ -1682,7 +1703,8 @@ class LiveFaceStream:
         demand = set(ij.jaxpr.outvars)
 
         prev = approx_active()
-        set_approx_active(True)
+        if approx_dispatch is not None:
+            set_approx_active(bool(approx_dispatch))
         try:
             with _Snapshot(tk):
                 self.stats["vertex_probe"] += 1
@@ -1697,7 +1719,8 @@ class LiveFaceStream:
                     # -1 = exact) and never let a probe take the rollout down.
                     self.stats["vertex_probe_fail"] += 1
         finally:
-            set_approx_active(prev)
+            if approx_dispatch is not None:
+                set_approx_active(prev)
         return DecidedFaces(rows=rows, sizes=sizes, quant=quant, pair=pair,
                             comp=comp, nout=nout, n_faces=np.int32(n_faces))
 
@@ -1707,8 +1730,9 @@ class LiveFaceStream:
         stays readable and so the ``except`` there covers exactly this."""
         from jax._src import core as _jcore
         from graphax import SKIP_FACE
-        from graphax.core import (contract_face_operands, face_config_is_approx,
-                                  prepare_face_operands, _force)
+        from graphax.core import (_apply_face_transform, contract_face_operands,
+                                  face_config_is_approx, prepare_face_operands,
+                                  _force)
         from alphagrad.approx.common.masks import slot_legality
         from alphagrad.approx.env import (
             face_entry_from_slots, make_slot_frame_hook)
@@ -1825,10 +1849,22 @@ class LiveFaceStream:
                     h = make_slot_frame_hook(
                         tuple(int(x) for x in rows[f, s]), stats=seen,
                         gated=False)
+                    # THROUGH GRAPHAX'S OWN SLOT WRAPPER, not by calling the
+                    # hook directly: `_apply_face_transform` is what the
+                    # elimination wraps every slot hook in, and it owns two
+                    # behaviours a direct call does not have -- a ValueError is
+                    # the documented best-effort MISS (operand returned
+                    # unchanged, nothing recorded) and the result is put to
+                    # `_assert_sparse_tensor_consistency`. Calling the hook
+                    # bare would make a miss an exception here and a skip
+                    # there, which is a mask/apply divergence of exactly the
+                    # kind this pass exists to remove.
                     if s == 0:
-                        a = h(a)
+                        a = _apply_face_transform(a, h, "lhs", int(vertex),
+                                                  None)
                     else:
-                        b = h(b)
+                        b = _apply_face_transform(b, h, "rhs", int(vertex),
+                                                  None)
                     if seen.get("skipped"):
                         self.stats["vertex_self_skip"] += 1
                 # ``contract_face_operands(prepare_face_operands(...))`` IS
@@ -1867,7 +1903,9 @@ class LiveFaceStream:
             # `slot_legality` and not staleness.
             seen = {}
             with _jcore.set_current_trace(ij.trace):
-                make_slot_frame_hook(row, stats=seen, gated=False)(new_st)
+                _apply_face_transform(
+                    new_st, make_slot_frame_hook(row, stats=seen, gated=False),
+                    "res", int(vertex), None, log_slot="res:new")
             if seen.get("skipped"):
                 self.stats["vertex_self_skip"] += 1
 
@@ -1894,7 +1932,7 @@ class LiveFaceStream:
 
     def vertex_face_decisions(self, order, specs, n, vertex, draw, *,
                               skips=None, face_rows_hist=None,
-                              face_skips_hist=None):
+                              face_skips_hist=None, approx_dispatch=None):
         """:meth:`decide_vertex_faces` against the PREFIX tokenizer of step
         ``n`` -- the :meth:`face_slot_decisions` of the structural pass.
 
@@ -1923,7 +1961,8 @@ class LiveFaceStream:
                 pair=np.zeros((F, S, N, N), np.float32),
                 comp=np.zeros((F, S, N), np.float32),
                 nout=np.zeros((F, S), np.int32), n_faces=np.int32(0))
-        return self.decide_vertex_faces(tk, vertex, draw, skips=skips)
+        return self.decide_vertex_faces(tk, vertex, draw, skips=skips,
+                                        approx_dispatch=approx_dispatch)
 
     def consume_stats(self) -> dict:
         out = dict(self.stats)
