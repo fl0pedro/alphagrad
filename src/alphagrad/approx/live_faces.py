@@ -1136,12 +1136,25 @@ class LiveFaceStream:
         site, and its mask is unchanged.
        
         EVERY ROW HERE IS READ BEFORE ANY DECISION IS MADE, and for the three
-        DEPENDENT sites that is stale rather than wrong -- see
-        :meth:`decide_faces`, which is the same question asked in apply order.
+        DEPENDENT sites that is stale rather than wrong. Two methods ask the
+        same question after the decisions land:
+        :meth:`decide_faces` (one speculative elimination, every slot a graphax
+        chooser -- the only one that can answer for ``res:jr`` and
+        ``res:jres``), and :meth:`decide_vertex_faces` (NO elimination at all:
+        ``n`` in-edge forces + ``m`` out-edge forces + ``n*m`` calls of
+        ``graphax.contract_face_operands``, which answers for ``res:new`` and
+        refuses the other two).
+
         This method stays, and stays memoised, because its answer is a pure
         function of the prefix and because the two OPERAND rows it produces are
         exact (measured: 0 rejections of 36 requests with ``lhs`` and ``rhs``
-        armed). ``res:new`` / ``res:jr`` / ``res:jres`` are not.
+        armed). ``res:new`` / ``res:jr`` / ``res:jres`` are not: on TLM, 5
+        seeds, one graph, the production draw convention, 15 of 526 rows this
+        mask clears are REFUSED at apply time, against 0 of 522 for either
+        exact pass (job 64928). It also costs MORE than the exact one: 7.663
+        ms/vertex here against 5.492 for :meth:`decide_vertex_faces` on the
+        same prefix path, because this runs TWO speculative eliminations (the
+        ``_SIZE_DISPATCH_MODES`` intersection) and that one runs none.
         """
         from alphagrad.approx.common.masks import slot_legality
         from alphagrad.approx.env import face_slot_sites
