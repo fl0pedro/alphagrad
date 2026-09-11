@@ -170,9 +170,22 @@ def _emit_and_eliminate(monkeypatch, approx_add):
 # 1. ONE SITE per slot, under every value -- finding 72 fault 1 at the root
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("cfg", ["lossy", "lossless"])
+#: The site topology PER ``--approx-add`` value. The width is the value's
+#: (owner ruling 2026-09-11), so the site list is too: three sites under the
+#: contraction-only values, four under ``learned1``, five under ``learned2``.
+SITES_PER_VALUE = {
+    "lossy":    (("lhs",), ("rhs",), ("res:new",)),
+    "lossless": (("lhs",), ("rhs",), ("res:new",)),
+    "choose":   (("lhs",), ("rhs",), ("res:new",)),
+    "learned1": (("lhs",), ("rhs",), ("res:new",), ("res:jr",)),
+    "learned2": (("lhs",), ("rhs",), ("res:new",), ("res:jr",),
+                 ("res:jres",)),
+}
+
+
+@pytest.mark.parametrize("cfg", list(SITES_PER_VALUE))
 def test_the_new_slot_hook_is_installed_at_exactly_one_site(monkeypatch, cfg):
-    """The mask and the hook must answer for the SAME tensor.
+    """The mask and the hook must answer for the SAME tensor, at every width.
 
     ``masks.slot_legality`` computes a slot's legality from ONE tensor and ANDs
     over the extra sites ``env.face_slot_sites()`` reports. With exactly one
@@ -180,11 +193,50 @@ def test_the_new_slot_hook_is_installed_at_exactly_one_site(monkeypatch, cfg):
     which is the whole of finding 72's fault 1: ``--approx-old same`` put the
     ``new`` hook on the pre-existing old edge as well, and the mask never saw
     that tensor.
+
+    STILL DERIVED, not restated: ``face_slot_sites`` calls the entry builder
+    with tagging probes, so this table is checked against what the builder
+    actually installs rather than against a second copy of the rule.
     """
     monkeypatch.delenv("ALPHAGRAD_APPROX_OLD", raising=False)
     monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", cfg)
     sites = envmod.face_slot_sites()
-    assert sites == (("lhs",), ("rhs",), ("res:new",)), sites
+    assert sites == SITES_PER_VALUE[cfg], (cfg, sites)
+    assert all(len(x) == 1 for x in sites), sites
+    # ...and the WIDTH is the head's own, from the one layout table.
+    from alphagrad.approx.unified_face_head import head_layout
+    assert len(sites) == head_layout(cfg).n_slots == envmod.wire_slots()
+
+
+@pytest.mark.parametrize("cfg,width,n_slots", [
+    ("lossy", 94, 3), ("lossless", 94, 3), ("choose", 95, 3),
+    ("learned1", 125, 4), ("learned2", 156, 5)])
+def test_the_wire_width_is_the_head_width(monkeypatch, cfg, width, n_slots):
+    """ONE source of truth for the width, and a mismatch RAISES.
+
+    The head's logit count, the number of slots ``face_entry_from_slots``
+    accepts and ``wire_slots()`` all come from one table. A wire narrower than
+    the configuration would drop a row the head drew and scored; a wider one
+    would apply a row the head has no logits for.
+    """
+    from alphagrad.approx.unified_face_head import head_layout
+    monkeypatch.delenv("ALPHAGRAD_APPROX_OLD", raising=False)
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", cfg)
+    assert head_layout(cfg).width == width
+    assert envmod.wire_slots() == n_slots
+    hooks = tuple([lambda st: st] * n_slots)
+    envmod.face_entry_from_slots(hooks, with_policy=False)
+    for bad in (n_slots - 1, n_slots + 1):
+        if bad < 1:
+            continue
+        with pytest.raises(ValueError, match="face slots"):
+            envmod.face_entry_from_slots(
+                tuple([lambda st: st] * bad), with_policy=False)
+    import numpy as _np
+    rows = _np.zeros((2, n_slots, 3), _np.int32)
+    assert envmod.wire_slots_of_rows(rows) == n_slots
+    with pytest.raises(ValueError, match="wire row array"):
+        envmod.wire_slots_of_rows(_np.zeros((2, n_slots + 1, 3), _np.int32))
 
 
 # --------------------------------------------------------------------------
@@ -255,12 +307,21 @@ def test_at_join_lets_the_legality_probe_drop_the_policy(monkeypatch):
         (None, None, hook), at_join=lambda p: seen.append(p.mode) or None)
     assert seen == ["lossy"], seen
     assert entry == ((None, None, hook), (None, None, None)), entry
+    # with_policy=False says it more directly AND does not consult the arm, which
+    # is what lets the probe run under `choose` (where it holds no bit).
+    entry = envmod.face_entry_from_slots((None, None, hook), with_policy=False)
+    assert entry == ((None, None, hook), (None, None, None)), entry
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", "choose")
+    entry = envmod.face_entry_from_slots((None, None, hook), with_policy=False)
+    assert entry == ((None, None, hook), (None, None, None)), entry
+    assert envmod.face_slot_sites()[:3] == (("lhs",), ("rhs",), ("res:new",))
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", "lossy")
     # and the default keeps the live policy
     entry = envmod.face_entry_from_slots((None, None, hook))
     assert entry[1][1] is not None and entry[1][1].mode == "lossy"
     # every site a slot hook reaches is pre-join, which is what makes the
     # drop safe -- stated here so the two cannot drift
-    assert envmod.face_slot_sites() == (("lhs",), ("rhs",), ("res:new",))
+    assert envmod.face_slot_sites()[:3] == (("lhs",), ("rhs",), ("res:new",))
 
 
 def test_the_default_is_lossless(monkeypatch):
@@ -327,6 +388,173 @@ def test_lossless_drops_no_non_zero(monkeypatch):
     # and the plain add -- which is what `lossless` actually emits -- agrees
     plain = np.asarray((a + b).dense(), np.float64)
     assert np.max(np.abs(plain - ref)) == 0.0, np.max(np.abs(plain - ref))
+
+
+# --------------------------------------------------------------------------
+# 2b. `choose`: one bit per face, and NO legality mask on it
+# --------------------------------------------------------------------------
+
+def test_choose_is_a_value_and_does_not_fix_the_join(monkeypatch):
+    monkeypatch.delenv("ALPHAGRAD_APPROX_OLD", raising=False)
+    assert "choose" in envmod.APPROX_ADD_CHOICES
+    assert "choose" not in envmod.APPROX_ADD_FIXED
+    # `choose` is the ONLY value that does not fix the join semantics. The two
+    # learned values have no bit either -- they fix it at the UNION, because
+    # both addends have already been shaped by the model's own picks (owner
+    # ruling 2026-09-11) -- so they ARE fixed values.
+    assert envmod.APPROX_ADD_FIXED == ("lossy", "lossless", "learned1",
+                                       "learned2")
+    assert envmod.JOIN_SEMANTICS == ("lossy", "lossless")
+    assert envmod.APPROX_ADD_CHOICES == ("lossy", "lossless", "choose",
+                                         "learned1", "learned2")
+    assert envmod.APPROX_ADD_CLI == ("lossy", "lossless")
+
+
+@pytest.mark.parametrize("cfg", ["learned1", "learned2"])
+def test_the_learned_values_reconcile_with_the_UNION(monkeypatch, cfg):
+    """NO CHOOSE BIT, AND THE ADD USES THE UNION. Owner ruling 2026-09-11.
+
+    The head's pick answers the container question: slot 3 approximates the old
+    edge, slot 4 the sum. Compressing further at the merge would silently
+    override a decision the model made, and the union is exact. So
+    ``resolve_join_mode`` answers ``lossless`` -- and still REFUSES a per-face
+    override, because there is no per-face container decision to make.
+    """
+    from alphagrad.approx.unified_face_head import head_layout
+    monkeypatch.delenv("ALPHAGRAD_APPROX_OLD", raising=False)
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", cfg)
+    assert envmod.approx_add() == cfg
+    assert envmod.resolve_join_mode() == "lossless"
+    assert envmod.resolve_join_mode("lossless") == "lossless"
+    with pytest.raises(ValueError, match="FIXES"):
+        envmod.resolve_join_mode("lossy")
+    # the head has no bit to read, and asking for one raises
+    lay = head_layout(cfg)
+    assert not lay.has_choose
+    with pytest.raises(IndexError):
+        lay.choose_index
+    # ...and the entry carries NO join policy, because lossless installs none:
+    # graphax's sparse + already builds the union container.
+    n = lay.n_slots
+    entry = envmod.face_entry_from_slots(tuple([lambda st: st] * n))
+    assert entry[1][0] is None, entry
+    assert not hasattr(entry[1][1], "mode"), entry
+
+
+def test_the_bit_has_ONE_decoder(monkeypatch):
+    """The head's encoding and the engine's reading of it cannot drift."""
+    from alphagrad.approx.unified_face_head import JOIN_LOSSY, JOIN_LOSSLESS
+    assert (JOIN_LOSSY, JOIN_LOSSLESS) == (0, 1)
+    assert envmod.join_mode_of_bit(JOIN_LOSSY) == "lossy"
+    assert envmod.join_mode_of_bit(JOIN_LOSSLESS) == "lossless"
+
+
+def test_choose_without_the_bit_RAISES_rather_than_defaulting(monkeypatch):
+    """A path that has not been taught the bit must not measure `lossy`.
+
+    Under ``choose`` the semantics is the head's decision. Defaulting here
+    would measure the plan under a join the policy did not pick, while the
+    log-prob the trainer stored scored the one it did -- a silent mismatch
+    between the action and the thing that was rewarded.
+    """
+    monkeypatch.delenv("ALPHAGRAD_APPROX_OLD", raising=False)
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", "choose")
+    with pytest.raises(ValueError, match="PER FACE"):
+        envmod.resolve_join_mode(None)
+    with pytest.raises(ValueError, match="PER FACE"):
+        envmod.face_entry_from_slots((None, None, lambda st: st))
+
+
+@pytest.mark.parametrize("bit,want", [(0, "lossy"), (1, "lossless")])
+def test_choose_honours_the_bit_per_face(monkeypatch, bit, want):
+    from graphax.sparse.ops.join import FaceJoinPolicy
+    monkeypatch.delenv("ALPHAGRAD_APPROX_OLD", raising=False)
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", "choose")
+    entry = envmod.face_entry_from_slots(
+        (None, None, lambda st: st),
+        mode=envmod.join_mode_of_bit(bit))
+    jr = entry[1][1]
+    if want == "lossy":
+        assert isinstance(jr, FaceJoinPolicy) and jr.mode == "lossy"
+    else:
+        assert jr is None, jr
+
+
+def test_a_FIXED_value_refuses_a_per_face_override(monkeypatch):
+    """A wire must not be able to override the flag."""
+    monkeypatch.delenv("ALPHAGRAD_APPROX_OLD", raising=False)
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", "lossy")
+    assert envmod.resolve_join_mode("lossy") == "lossy"
+    with pytest.raises(ValueError, match="FIXES"):
+        envmod.resolve_join_mode("lossless")
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", "lossless")
+    with pytest.raises(ValueError, match="FIXES"):
+        envmod.resolve_join_mode("lossy")
+
+
+def test_an_unknown_per_face_mode_raises(monkeypatch):
+    monkeypatch.delenv("ALPHAGRAD_APPROX_OLD", raising=False)
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", "choose")
+    with pytest.raises(ValueError, match="per-face join mode"):
+        envmod.resolve_join_mode("choose")
+    with pytest.raises(ValueError, match="per-face join mode"):
+        envmod.resolve_join_mode("same")
+
+
+def test_the_choose_bit_needs_no_legality_mask():
+    """BOTH ARMS ARE ALWAYS FORMABLE -- the claim the head's comment makes.
+
+    This is a claim about the ENGINE, not about the head, so it is checked on
+    the engine: on addend pairs whose layouts DISAGREE in each of the ways the
+    TLM census found, `lossy` must return two structurally identical addends
+    without raising, and `lossless` must too. If that ever stops being true the
+    bit needs a mask and this test is the thing that says so.
+
+    Measured on the real structures (finding 73): 23 of 23 TLM merge faces
+    formed `lossy`, 0 raises, and the common container was the fresh one every
+    time.
+    """
+    from graphax.sparse.indexes import DenseIndex, DiagonalIndex
+    from graphax.sparse.ops.join import container_of, reconcile_addends
+    from graphax.sparse.tensor import SparseTensor
+    N = 4
+
+    def dense_pair(v):
+        return SparseTensor((DenseIndex(0, N, 0),), (DenseIndex(1, N, 1),),
+                            jnp.asarray(v, jnp.float32), fill_value=None)
+
+    def diag_pair(v):
+        return SparseTensor((DiagonalIndex(0, N, 0, 1),),
+                            (DiagonalIndex(1, N, 0, 0),),
+                            jnp.asarray(v, jnp.float32), fill_value=None)
+
+    def implicit():
+        return SparseTensor((DenseIndex(0, N, None),),
+                            (DenseIndex(1, N, None),), None,
+                            scalar_mult=jnp.asarray(0.5, jnp.float32),
+                            fill_value=None)
+
+    rng = np.random.default_rng(0)
+    a_d = dense_pair(rng.normal(size=(N, N)))
+    b_d = dense_pair(rng.normal(size=(N, N)))
+    a_g = diag_pair(rng.normal(size=(N,)))
+    b_g = diag_pair(rng.normal(size=(N,)))
+    cases = {
+        "dense vs diagonal": (a_d, b_g),
+        "diagonal vs dense": (a_g, b_d),
+        "dense vs dense": (a_d, b_d),
+        "diagonal vs diagonal": (a_g, b_g),
+        "dense vs implicit": (a_d, implicit()),
+        "implicit vs dense": (implicit(), b_d),
+        "implicit vs diagonal": (implicit(), b_g),
+    }
+    for name, (fresh, old) in cases.items():
+        for mode in ("lossy", "lossless"):
+            f2, o2, out = reconcile_addends(fresh, old, mode)
+            assert container_of(f2) == container_of(o2), (
+                f"{mode} on {name}: addends not identical\n"
+                f"  {container_of(f2)}\n  {container_of(o2)}")
+            assert out.mode == mode
 
 
 # --------------------------------------------------------------------------
@@ -422,6 +650,13 @@ def test_ppo_declares_the_flag_with_default_lossless():
         ["--approx-add", "lossy"]).approx_add == "lossy"
     with pytest.raises(SystemExit):
         p.parse_args(["--approx-add", "same"])
+    # `choose`, `learned1` and `learned2` are honoured by the engine and size
+    # the head, but are not reachable from the CLI: the rollout wire carries
+    # neither the bit nor the learned slots' rows. Offering them would mean a
+    # run that raises on its first armed face.
+    for _unreachable in ("choose", "learned1", "learned2"):
+        with pytest.raises(SystemExit):
+            p.parse_args(["--approx-add", _unreachable])
     with pytest.raises(SystemExit):
         p.parse_args(["--approx-add", "1"])
 
@@ -444,5 +679,8 @@ def test_landscape_maps_restated_choice_list_still_agrees():
     argparser BEFORE importing alphagrad (several env knobs are read at import
     of ``env``). The copy is allowed; DRIFT is not."""
     lm = pytest.importorskip("alphagrad.approx.tools.landscape_map")
-    assert lm._APPROX_ADD_CHOICES == envmod.APPROX_ADD_CHOICES
+    # The CLI-REACHABLE values: `choose` needs a per-face wire channel this tool
+    # does not have, and the learned values widen the head past the wire rows it
+    # replays, so none of the three is offered here.
+    assert lm._APPROX_ADD_CHOICES == envmod.APPROX_ADD_CLI
     assert lm._APPROX_ADD_DEFAULT == envmod.APPROX_ADD_DEFAULT

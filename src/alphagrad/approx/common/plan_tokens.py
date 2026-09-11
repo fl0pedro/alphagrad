@@ -165,8 +165,8 @@ class PlanTokenizer:
         the fix is to index by the enumeration the DECIDING tokenizer used.
         """
         from alphagrad.approx.env import (
-            FACE_SLOTS, MAX_RULES_PER_VERTEX, decode_vertex_rule_specs,
-            face_entry_from_slots)
+            MAX_RULES_PER_VERTEX, decode_vertex_rule_specs,
+            face_entry_from_slots, wire_slots_of_rows)
         from alphagrad.approx.common.masks import make_live_masked_hook
         from graphax import SKIP_FACE
 
@@ -188,7 +188,11 @@ class PlanTokenizer:
             if rows is None or f >= rows.shape[0]:
                 continue
             slots = []
-            for s in range(FACE_SLOTS):
+            # AS MANY SLOTS AS THE CONFIGURATION HAS (2026-09-11). Looping
+            # FACE_SLOTS would silently drop a learned join row under
+            # --approx-add learned1 / learned2; `wire_slots_of_rows` raises
+            # instead, naming the producer that has not been widened.
+            for s in range(wire_slots_of_rows(rows)):
                 row = [[int(x) for x in rows[f][s]]] + [
                     [-1, -1, 0]] * (MAX_RULES_PER_VERTEX - 1)
                 try:
