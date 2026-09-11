@@ -473,24 +473,21 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
     slots wait at, and it is deliberately not half-landed here.
     """
     F, N = int(max_faces), int(max_axes)
-    # THE TRAINER CONSUMES THE CONTRACTION BAND ONLY, and says so.
+    # THE TRAINER CONSUMES EVERY SLOT THE WIDTH HAS, and nothing is narrowed.
     #
     # `face_slot_legality` returns one mask row per slot the entry builder places
     # a hook for, which is `env.wire_slots()`: three under lossy / lossless /
     # choose, four under learned1 (+ the OLD EDGE), five under learned2 (+ the
-    # SUMMED EDGE). The policy's per-slot features and the rollout wire cover the
-    # three CONTRACTION slots only, so:
+    # SUMMED EDGE). Until 2026-09-11 the policy's per-slot shapes and the rollout
+    # wire stopped at the three CONTRACTION slots, so this callback narrowed to
+    # them and RAISED for anything wider. Both are now `wire_slots()` wide
+    # (ticket dsnn-3qm.56), so the rows go through untouched and NARROWING would
+    # be the defect: a slot the width has would go unscored while the engine
+    # still applies its wire row.
     #
-    #   * three rows -> nothing to narrow, and the prefix assertion below is what
-    #     pins that the three are the ones we think they are;
-    #   * more than three -> RAISE, here, at setup. Narrowing would hand the head
-    #     three mask rows for a four- or five-slot layout, and although the head
-    #     refuses that too (`_check_mask_slots`), the place that KNOWS it is
-    #     dropping a band is this one, and a flag that dies at setup is better
-    #     than one that dies mid-run.
-    #
-    # The prefix assertion is load-bearing: if a future value reordered the
-    # bands, a silent `[:3]` would hand the head three masks belonging to other
+    # The prefix assertion below is load-bearing for a different reason now: the
+    # head's slot 0/1/2 are the contraction operands by position, so if a future
+    # value reordered the bands those three mask rows would belong to other
     # tensors -- the mask/tensor mismatch of finding 72, from the other side.
     from alphagrad.approx.env import FACE_SLOTS as _CONTRACTION_SLOTS
     from alphagrad.approx.env import face_slot_sites as _sites
