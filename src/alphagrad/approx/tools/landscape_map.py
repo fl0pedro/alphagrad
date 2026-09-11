@@ -1115,6 +1115,7 @@ def measure(env, eval_samples, order, plan):
         jnp.asarray(specs),
         jnp.asarray(face_specs),
         jnp.asarray(face_skips),
+        None,              # no per-face join bit: landscape_map fixes the join
         int(len(order)),
         *eval_samples,
     )

@@ -278,11 +278,11 @@ class CpuApproximationServer:
             # (P3 host shard) pass the real wire rows through. `point_idx`
             # is gone from _callback and is not forwarded.
             from alphagrad.approx.env import (
-                MAX_FACES as _MAX_FACES, FACE_SLOTS as _FACE_SLOTS)
+                MAX_FACES as _MAX_FACES, wire_slots as _wire_slots)
             _n_ord = int(np.asarray(order_j).shape[0])
             if face_specs is None:
                 _face_specs = np.full(
-                    (_n_ord, _MAX_FACES, _FACE_SLOTS, 3), -1, dtype=np.int32)
+                    (_n_ord, _MAX_FACES, _wire_slots(), 3), -1, dtype=np.int32)
                 _face_skips = np.zeros((_n_ord, _MAX_FACES), dtype=np.int32)
             else:
                 _face_specs = np.asarray(face_specs, dtype=np.int32)
@@ -295,6 +295,10 @@ class CpuApproximationServer:
                 specs_j,
                 _face_specs,
                 _face_skips,
+                # The pool's actors do not carry the --approx-add choose join
+                # bit (env._remote_callback raises when one is present), so
+                # the join semantics is the configuration's here.
+                None,
                 int(step),
                 *es,
                 init=bool(init),

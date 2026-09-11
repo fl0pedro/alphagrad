@@ -549,7 +549,7 @@ def _get_resource_monitor(unique_devices):
     return mon
 
 
-def _face_wire_keys(faces_np, skips_np, n):
+def _face_wire_keys(faces_np, skips_np, n, joins_np=None):
     """Per-vertex compact hashable identity of the face wire rows.
 
     The stream cache keys on the face history, and the history it was keyed
@@ -572,6 +572,15 @@ def _face_wire_keys(faces_np, skips_np, n):
         return ()
     f = np.ascontiguousarray(faces_np[:n]).reshape(n, -1)
     s = np.ascontiguousarray(skips_np[:n]).reshape(n, -1)
+    # THE JOIN BIT IS PART OF THE WIRE'S IDENTITY. Two prefixes that differ
+    # only in a per-face join bit describe DIFFERENT computations (one merge
+    # reconciled into the fresh contraction's container, the other into the
+    # union), so a key that ignored the bit would serve one plan's cached
+    # stream -- and, through the same signature, one plan's cached
+    # elimination -- for the other. Appended to each vertex's tuple, so a
+    # configuration without the bit produces byte-identical keys to before.
+    j = (None if joins_np is None
+         else np.ascontiguousarray(joins_np[:n]).reshape(n, -1))
     fr, fc = np.nonzero(f != -1)
     sr, sc = np.nonzero(s != 0)
     fb = np.searchsorted(fr, np.arange(n + 1))
@@ -583,6 +592,7 @@ def _face_wire_keys(faces_np, skips_np, n):
     return tuple(
         (fc[fb[k]:fb[k + 1]].tobytes(), fv[fb[k]:fb[k + 1]].tobytes(),
          sc[sb[k]:sb[k + 1]].tobytes(), sv[sb[k]:sb[k + 1]].tobytes())
+        + (() if j is None else (j[k].astype(np.int32).tobytes(),))
         for k in range(n)
     )
 
@@ -590,7 +600,8 @@ def _face_wire_keys(faces_np, skips_np, n):
 def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
                                tok_rules_by_v, ft_by_vertex=None,
                                face_key=None,
-                               face_rows_list=None, face_skips_list=None):
+                               face_rows_list=None, face_skips_list=None,
+                               face_joins_list=None):
     """Full append-only observation stream for the prefix ``o_list``
     (ALPHAGRAD_INCREMENTAL_TOKENS=1): base tokens + one block per elimination
     (path tokens + ``approx`` echoes), from graphax's IncrementalPathTokenizer
@@ -706,7 +717,9 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
         if _unified:
             _pf_v = _face_dict_for_vertex(
                 config, tk.ij, int(v), face_rows_list[_ki],
-                face_skips_list[_ki])
+                face_skips_list[_ki],
+                face_join=(None if face_joins_list is None
+                           else face_joins_list[_ki]))
             if _pf_v:
                 ft_out[int(v)] = _pf_v
         else:
@@ -1532,7 +1545,8 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
                           reward_vec, face_before, face_after,
                           counts_from_trace: bool,
                           mem_parity: dict | None = None,
-                          paired_ref: dict | None = None) -> None:
+                          paired_ref: dict | None = None,
+                          face_joins=None) -> None:
     """Append ONE terminal plan to this process's plan log. Never raises.
 
     A logging failure must not kill a measurement, but it must not be
@@ -1561,6 +1575,20 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             # column of pre-2026-09-10 records: "same" and "exact" named a
             # different computation -- see env.approx_add's block comment.
             "approx_add": approx_add(),
+            # THE PER-FACE JOIN BITS, under --approx-add choose only (None
+            # otherwise, which is what `approx_add` above then answers for the
+            # whole plan). Recorded because the container a merge reconciled
+            # into is part of WHAT WAS MEASURED, and under `choose` the
+            # configuration no longer says it -- the head does, per face. A
+            # replay that read only `approx_add` would reproduce a different
+            # computation. Per eliminated vertex, live faces only, as
+            # "lossy"/"lossless" names rather than raw bits so the record does
+            # not depend on JOIN_LOSSY's numeric value.
+            "face_joins": (
+                None if face_joins is None else
+                [[join_mode_of_bit(b) for b in row]
+                 for row in np.asarray(face_joins)[
+                     :, :_plan_log_max_faces()].tolist()]),
             # WHICH quantity reward slot 5 holds (ticket .49) and BOTH
             # memory numbers of this plan's timed executable, so a record
             # can be re-scored on the other channel without a re-measure.
@@ -2027,7 +2055,7 @@ class EnvState(NamedTuple):
     # sparsity_specs rows; row[0] == -1 ⇒ no approximation for that slot.
     # ``face_skips[k, f] == 1`` ⇒ face f of the k-th eliminated vertex is
     # SKIPPED (graphax.SKIP_FACE — the path's contraction never happens).
-    face_specs: Array  # (N, MAX_FACES, FACE_SLOTS, 3) int32
+    face_specs: Array  # (N, MAX_FACES, wire_slots(), 3) int32
     face_skips: Array  # (N, MAX_FACES) int32
     # LEGACY full-stream observation. Under ``EnvConfig.delta_obs`` these are
     # degenerate ``(1,)`` sentinels and ``delta_*`` below carries the
@@ -2060,6 +2088,14 @@ class EnvState(NamedTuple):
     max_steps: int
     reward: Array  # (NUM_REWARDS,) float32; see REWARD_NAMES for layout
     terminated: bool
+    # --approx-add choose: the per-face JOIN bit history, index-aligned with
+    # ``order`` exactly as ``face_skips`` is. ``None`` under every value that
+    # FIXES the join semantics -- not zeros, because 0 means ``lossy`` and a
+    # zero-filled channel would silently measure every merge under a container
+    # the policy never picked. A ``None`` leaf is an empty pytree node, so the
+    # jit carry is shape-stable per configuration and the flag-off state is
+    # byte-identical to the pre-flag one.
+    face_joins: Array | None = None  # (N, MAX_FACES) int32
 
 
 class EnvOut(NamedTuple):
@@ -2072,8 +2108,18 @@ class StepAction(NamedTuple):
     target_vertex: Array  # scalar int32
     rule_specs: Array  # (MAX_RULES_PER_VERTEX, 3) int32; row [base_idx1, base_idx2, factor]; base_idx1 < 0 marks unused
     # P1 per-path actions. None ⇒ per-vertex mode, byte-identical to before.
-    face_rows: Array | None = None  # (MAX_FACES, FACE_SLOTS, 3) int32 spec rows
+    # The SLOT axis is :func:`wire_slots` wide -- the head's --approx-add width
+    # (3 / 3 / 3 / 4 / 5), NOT ``FACE_SLOTS`` (always the 3 contraction slots).
+    face_rows: Array | None = None  # (MAX_FACES, wire_slots(), 3) int32 rows
     face_skip: Array | None = None  # (MAX_FACES,) int32; 1 ⇒ SKIP_FACE
+    # --approx-add choose: ONE bit per face, 0 = lossy, 1 = lossless
+    # (:func:`join_mode_of_bit`). ``None`` at every width that FIXES the join
+    # semantics, which is what makes :func:`resolve_join_mode` answer from the
+    # configuration instead. A SEPARATE channel from ``face_skip`` on purpose:
+    # "drop this face's contraction" and "which container the ADD uses" are
+    # unrelated decisions, and packing them into one field would make every
+    # reader of a field called "skip" wrong.
+    face_join: Array | None = None  # (MAX_FACES,) int32
 
 
 class EnvConfig(NamedTuple):
@@ -4869,15 +4915,30 @@ _JOIN_SEMANTICS_OF = {
 APPROX_ADD_FIXED = tuple(k for k in APPROX_ADD_CHOICES
                          if _JOIN_SEMANTICS_OF[k] is not None)
 
-#: The values ``ppo.py`` and ``landscape_map`` OFFER on the command line. The
-#: other three are honoured by the engine and the head but need a trainer wire
-#: that does not exist yet -- ``choose`` needs ``FaceAction.join`` plus the
-#: trajectory and batch fields so the replay scores the bit ``sample`` drew, and
-#: the learned values need the policy's per-slot features and the rollout wire
-#: widened past the contraction band. A run started with one would raise (at the
-#: head's mask-row check, or at the first armed merge face), and a flag that
-#: dies mid-run is worse than one that is not offered.
-APPROX_ADD_CLI = ("lossy", "lossless")
+#: The values ``ppo.py`` and ``landscape_map`` OFFER on the command line.
+#:
+#: ALL FIVE, since 2026-09-11 (ticket dsnn-3qm.56): the trainer wire that kept
+#: the other three off this tuple now exists. What it was missing, and where it
+#: came from:
+#:
+#: * ``choose`` needed a JOIN field on the action record, carried from the
+#:   head's draw to the env's measurement. The record is declared once in
+#:   ``alphagrad.approx.face_action`` and every use derives from it, so the bit
+#:   reaches ``FaceAction.join`` -> the stored trajectory leaf -> the loss
+#:   replay -> ``StepAction.face_join`` -> ``EnvState.face_joins`` ->
+#:   :func:`_face_dict_for_vertex`. ``sample`` and ``evaluate`` score the same
+#:   variable at width 95 (``tests/test_face_head94.py``).
+#: * ``learned1`` / ``learned2`` needed the per-slot SHAPES to follow the head's
+#:   width instead of ``FACE_SLOTS``. They do: ``UnifiedFacePolicy`` sizes every
+#:   per-slot array from ``head_layout(approx_add).n_slots``, the rollout wire
+#:   and the env state are :func:`wire_slots` wide, and
+#:   ``face_driver.make_face_slot_legality_callback`` hands the head one mask
+#:   row per slot instead of narrowing to three.
+#:
+#: ``FACE_SLOTS`` still means the three CONTRACTION slots, so every
+#: ``range(FACE_SLOTS)`` loop is still right; :func:`wire_slots_of_rows` and
+#: ``face_action.check`` are what make a mis-slotted row RAISE.
+APPROX_ADD_CLI = APPROX_ADD_CHOICES
 #: The declared default, ``lossless``: OWNER RULING 2026-09-10 (`90e0ab85` on
 #: hostperf-caches). It overrides the trade-off the implementation measured, and
 #: the measurement is kept here because it says what the ruling costs rather
@@ -5766,7 +5827,8 @@ def consume_live_chain_stats() -> dict:
 
 
 def _live_face_transforms(config, consts, args, o_list, specs_list,
-                          face_rows_list, face_skips_list, wire_sig):
+                          face_rows_list, face_skips_list, wire_sig,
+                          face_joins_list=None):
     """`_face_transforms_for_order` served from live state. Same result."""
     from graphax.incremental import IncrementalJaxpr
     from alphagrad.approx.common.masks import make_live_masked_hook
@@ -5774,8 +5836,9 @@ def _live_face_transforms(config, consts, args, o_list, specs_list,
     K = len(o_list)
     base = (id(config.jaxpr), tuple(config.argnums))
     if wire_sig is None:
-        wire_sig = _face_wire_keys(np.asarray(face_rows_list),
-                                   np.asarray(face_skips_list), K)
+        wire_sig = _face_wire_keys(
+            np.asarray(face_rows_list), np.asarray(face_skips_list), K,
+            None if face_joins_list is None else np.asarray(face_joins_list))
     _ord = np.ascontiguousarray(np.asarray(o_list, dtype=np.int64))
     _sp = np.ascontiguousarray(np.asarray(specs_list, dtype=np.int64))
     okey, skey = _ord.tobytes(), _sp.tobytes()
@@ -5811,7 +5874,9 @@ def _live_face_transforms(config, consts, args, o_list, specs_list,
             k = ch.n
             v = int(o_list[k])
             per_face = _face_dict_for_vertex(
-                config, ch.ij, v, face_rows_list[k], face_skips_list[k])
+                config, ch.ij, v, face_rows_list[k], face_skips_list[k],
+                face_join=(None if face_joins_list is None
+                           else face_joins_list[k]))
             if per_face:
                 ch.out[v] = per_face
             vertex_rules = decode_vertex_rule_specs(
@@ -5839,7 +5904,7 @@ def _live_face_transforms(config, consts, args, o_list, specs_list,
 
 def _face_transforms_for_order(config, consts, args, o_list, specs_list,
                                face_rows_list, face_skips_list,
-                               wire_sig=None):
+                               wire_sig=None, face_joins_list=None):
     """Per-vertex ``face_transforms`` dicts for graphax, from the wire arrays.
 
     Face KEYS are graph-state dependent, so enumerate with ``faces_of`` on a
@@ -5860,7 +5925,7 @@ def _face_transforms_for_order(config, consts, args, o_list, specs_list,
     if _FACE_LIVE_STATE and len(o_list):
         return _live_face_transforms(
             config, consts, args, o_list, specs_list, face_rows_list,
-            face_skips_list, wire_sig)
+            face_skips_list, wire_sig, face_joins_list)
 
     ij = None
     out: dict[int, dict] = {}
@@ -5905,7 +5970,9 @@ def _face_transforms_for_order(config, consts, args, o_list, specs_list,
     for k in range(_start, len(o_list)):
         v = int(o_list[k])
         per_face = _face_dict_for_vertex(
-            config, ij, v, face_rows_list[k], face_skips_list[k])
+            config, ij, v, face_rows_list[k], face_skips_list[k],
+            face_join=(None if face_joins_list is None
+                       else face_joins_list[k]))
         if per_face:
             out[v] = per_face
         vertex_rules = decode_vertex_rule_specs(
@@ -5941,6 +6008,7 @@ def _callback(
     sparsity_specs,
     face_specs,
     face_skips,
+    face_joins,
     stop,
     *eval_samples,
     init: bool = False,
@@ -5997,6 +6065,9 @@ def _callback(
     # the per-vertex mode and must stay byte-identical to it).
     _faces_np = np.asarray(face_specs)[: len(o_list)]
     _skips_np = np.asarray(face_skips)[: len(o_list)]
+    # --approx-add choose only; None under every fixed value (EnvState).
+    _joins_np = (None if face_joins is None
+                 else np.asarray(face_joins)[: len(o_list)])
     ft_by_vertex = None
     _have_face_actions = bool(
         len(o_list) and (np.any(_skips_np == 1)
@@ -6015,7 +6086,8 @@ def _callback(
     # cache's `face_key` further down -- they used to build one each.
     _wire_sig = None
     if _have_face_actions:
-        _wire_sig = _face_wire_keys(_faces_np, _skips_np, len(o_list))
+        _wire_sig = _face_wire_keys(_faces_np, _skips_np, len(o_list),
+                                    _joins_np)
     _pf("cb.face_wire_sig")
     if _have_face_actions and not _unified_fe:
         # NUMPY, not `.tolist()`: `_face_dict_for_vertex` pulls the three
@@ -6029,6 +6101,7 @@ def _callback(
         ft_by_vertex = _face_transforms_for_order(
             config, consts, args, o_list, specs_list,
             _faces_np, _skips_np, wire_sig=_wire_sig,
+            face_joins_list=_joins_np,
         )
     _pf("cb.face_enum")
 
@@ -6099,6 +6172,7 @@ def _callback(
             # padding cost (O(T^2) per episode).
             face_rows_list=_faces_np if _fe_inline else None,
             face_skips_list=_skips_np if _fe_inline else None,
+            face_joins_list=_joins_np if _fe_inline else None,
             # PER-STEP signatures (not one whole-prefix blob) so the stream
             # cache can find the parent at every ancestor cut under face
             # actions instead of replaying the whole prefix cold each step.
@@ -6375,6 +6449,13 @@ def _callback(
     # a face-actioned plan (and vice versa).
     h.update(np.asarray(face_specs, dtype=np.int32).tobytes())
     h.update(np.asarray(face_skips, dtype=np.int32).tobytes())
+    # SO IS THE JOIN BIT, for exactly the same reason: under --approx-add
+    # choose two plans can share (order, specs, face rows, skips) and differ
+    # only in which container a merge reconciles into, which is a different
+    # executable. Absent under every fixed value, so the key is byte-identical
+    # to before there.
+    if face_joins is not None:
+        h.update(np.asarray(face_joins, dtype=np.int32).tobytes())
     h.update(int(stop).to_bytes(4, "little", signed=False))
     # Include the shape signature of args_for_lower so we don't
     # collide across rollouts that share (order, specs) but differ
@@ -7331,6 +7412,7 @@ def _callback(
         _record_terminal_plan(
             order=o_list, rule_specs=partial_specs,
             face_specs=_faces_np, face_skips=_skips_np,
+            face_joins=_joins_np,
             reward_vec=_reward_slots,
             face_before=_plan_pf0, face_after=_PER_FACE_STATS,
             counts_from_trace=bool(_plan_traced[0]),
@@ -7594,8 +7676,8 @@ class VertexEliminationEnv:
 
         if batched:
             def _remote_callback_batched(args, consts, order, specs,
-                                         face_specs, face_skips, step,
-                                         *eval_samples):
+                                         face_specs, face_skips, face_joins,
+                                         step, *eval_samples):
                 # P3: the pool stack CARRIES face wires now (worker builds
                 # empty ones only when handed None), so face-action rows
                 # ship through instead of raising. TERMINAL rows measure on
@@ -7632,6 +7714,30 @@ class VertexEliminationEnv:
                 rk = [np.ascontiguousarray(
                           np.asarray(_cb_slot(face_skips, i, E))[:_sti[i]])
                       for i in range(E)]
+                rj = ([None] * E if face_joins is None else
+                      [np.ascontiguousarray(
+                          np.asarray(_cb_slot(face_joins, i, E))[:_sti[i]])
+                       for i in range(E)])
+                # THE POOL PROTOCOL DOES NOT CARRY THE JOIN BIT, AND SAYS SO.
+                # `CpuApproxPool.evaluate_batch` takes face_specs / face_skips
+                # and nothing else, so a remote row would be measured under
+                # the configuration's default container while the trainer
+                # stored the log-prob of the bit the head actually drew --
+                # finding 72's action/reward mismatch, one process boundary
+                # along. Rows served IN-PROCESS below DO carry it, so this is
+                # a pool-protocol gap and not a semantics gap; widening
+                # `cpu_approx_pool` / `cpu_approx_actors` / `cpu_approx_worker`
+                # by one keyword is the remaining work (ticket dsnn-3qm.56).
+                if face_joins is not None and _remote:
+                    raise NotImplementedError(
+                        "--approx-add choose decides the face join PER FACE, "
+                        "and the Ray measurement pool's protocol carries only "
+                        "face_specs / face_skips. The actors would measure "
+                        f"every merge under {approx_add()!r}'s default "
+                        "container while the stored log-prob scored the bit "
+                        "the head drew. Run choose without a measure pool, or "
+                        "with ALPHAGRAD_POOL_TERMINAL_LOCAL=1 and no "
+                        "non-terminal remote rows.")
                 _any_faces = any(
                     (f[..., 0] >= 0).any() or (k == 1).any()
                     or (f[..., 0] == COMPRESS_SENTINEL).any()
@@ -7694,7 +7800,7 @@ class VertexEliminationEnv:
                         self.config,
                         _cb_slot(args, i, E),
                         _cb_slot(consts, i, E),
-                        ro[i], rs[i], rf[i], rk[i], _sti[i],
+                        ro[i], rs[i], rf[i], rk[i], rj[i], _sti[i],
                         *[_cb_slot(x, i, E) for x in eval_samples],
                         init=init,
                     )
@@ -7710,9 +7816,18 @@ class VertexEliminationEnv:
             return _remote_callback_batched
 
         def _remote_callback(args, consts, order, specs, face_specs,
-                             face_skips, step, *eval_samples):
+                             face_skips, face_joins, step, *eval_samples):
             # The Ray pool path predates face actions (DEPRECATED line) —
             # they are dropped here; the pool's own env measures per-vertex.
+            if face_joins is not None:
+                raise NotImplementedError(
+                    "--approx-add choose needs the per-face join bit at the "
+                    "measurement, and this UNBATCHED Ray pool closure drops "
+                    "the face wires entirely (its actors measure per-vertex). "
+                    "It would measure every merge under the configuration's "
+                    "default while the trainer stored the log-prob of the bit "
+                    "the head drew. Use the batched pool path "
+                    "(ALPHAGRAD_BATCHED_CALLBACK) or no pool.")
             eval_samples_t = tuple(eval_samples) if eval_samples else None
             _mw0 = time.perf_counter()
             try:
@@ -7841,12 +7956,18 @@ class VertexEliminationEnv:
         )
         initial_specs = initial_specs.at[..., 2].set(0)  # factor=0 default for unused rows
         initial_face_specs = jnp.full(
-            (initial_order.shape[0], MAX_FACES, FACE_SLOTS, 3), -1,
+            (initial_order.shape[0], MAX_FACES, wire_slots(), 3), -1,
             dtype=jnp.int32,
         )
         initial_face_skips = jnp.zeros(
             (initial_order.shape[0], MAX_FACES), dtype=jnp.int32
         )
+        # THE JOIN CHANNEL EXISTS IFF THE WIDTH HAS THE BIT. `None` under every
+        # fixed value, so `resolve_join_mode` answers from the configuration
+        # and a flag-off state carries no extra leaf at all.
+        initial_face_joins = (
+            jnp.zeros((initial_order.shape[0], MAX_FACES), dtype=jnp.int32)
+            if approx_add() not in APPROX_ADD_FIXED else None)
 
         if self.config.delta_obs:
             # The base stream is a host-side CONSTANT (base_observation()),
@@ -7867,6 +7988,7 @@ class VertexEliminationEnv:
                 initial_specs,
                 initial_face_specs,
                 initial_face_skips,
+                initial_face_joins,
                 0,
                 *(self.eval_args_samples
                   if self.eval_args_samples is not None else ()),
@@ -7886,6 +8008,7 @@ class VertexEliminationEnv:
             sparsity_specs=initial_specs,
             face_specs=initial_face_specs,
             face_skips=initial_face_skips,
+            face_joins=initial_face_joins,
             tokens=tokens,
             eqn_ids=eqn_ids,
             delta_tokens=delta_tokens,
@@ -7913,12 +8036,15 @@ class VertexEliminationEnv:
         if isinstance(action, StepAction):
             target_vertex = jnp.asarray(action.target_vertex, dtype=jnp.int32)
             rule_specs = jnp.asarray(action.rule_specs, dtype=jnp.int32)
+            face_join = None
             if action.face_rows is not None:
                 face_rows = jnp.asarray(action.face_rows, dtype=jnp.int32)
                 face_skip = jnp.asarray(action.face_skip, dtype=jnp.int32)
+                if action.face_join is not None:
+                    face_join = jnp.asarray(action.face_join, dtype=jnp.int32)
             else:
                 face_rows = jnp.full(
-                    (MAX_FACES, FACE_SLOTS, 3), -1, dtype=jnp.int32
+                    (MAX_FACES, wire_slots(), 3), -1, dtype=jnp.int32
                 )
                 face_skip = jnp.zeros((MAX_FACES,), dtype=jnp.int32)
         else:
@@ -7926,8 +8052,22 @@ class VertexEliminationEnv:
             sp_type = action // MAX_TOKENS
             target_vertex = action % MAX_TOKENS
             rule_specs = _legacy_sp_to_specs(sp_type)
-            face_rows = jnp.full((MAX_FACES, FACE_SLOTS, 3), -1, dtype=jnp.int32)
+            face_rows = jnp.full((MAX_FACES, wire_slots(), 3), -1, dtype=jnp.int32)
             face_skip = jnp.zeros((MAX_FACES,), dtype=jnp.int32)
+            face_join = None
+        # THE BIT AND THE CHANNEL MUST BOTH EXIST OR NEITHER. A bit with no
+        # channel to store it in would be dropped between `sample` and the
+        # measurement; a channel with no bit would be measured as all-lossy.
+        # Both are the action/reward mismatch of finding 72, so both raise.
+        if (face_join is None) != (state.face_joins is None):
+            raise ValueError(
+                f"--approx-add {approx_add()!r}: the action "
+                f"{'carries' if face_join is not None else 'carries no'} "
+                f"per-face join bit while the env state "
+                f"{'has' if state.face_joins is None else 'has no'} nowhere to "
+                f"keep it. Under 'choose' both exist; under every fixed value "
+                f"neither does and `resolve_join_mode` answers from the "
+                f"configuration.")
 
         idx = state.step_count
         new_step = idx + 1
@@ -7941,6 +8081,9 @@ class VertexEliminationEnv:
 
         new_order = curr_order[shifted.astype(jnp.int32)].at[idx].set(target_vertex)
         new_specs = curr_specs[shifted.astype(jnp.int32)].at[idx].set(rule_specs)
+        new_face_joins = (
+            None if face_join is None else
+            state.face_joins[shifted.astype(jnp.int32)].at[idx].set(face_join))
         new_face_specs = (
             state.face_specs[shifted.astype(jnp.int32)].at[idx].set(face_rows)
         )
@@ -7971,6 +8114,7 @@ class VertexEliminationEnv:
             new_specs,
             new_face_specs,
             new_face_skips,
+            new_face_joins,
             new_step,
             *(() if _drop_bound
               else (self.eval_args_samples
@@ -8010,6 +8154,7 @@ class VertexEliminationEnv:
             sparsity_specs=new_specs,
             face_specs=new_face_specs,
             face_skips=new_face_skips,
+            face_joins=new_face_joins,
             tokens=tokens,
             eqn_ids=eqn_ids,
             delta_tokens=delta_tokens,
@@ -8123,6 +8268,8 @@ class VertexEliminationEnv:
             # through the same reorder so the state stays well-formed.
             face_specs=state.face_specs[shifted.astype(jnp.int32)],
             face_skips=state.face_skips[shifted.astype(jnp.int32)],
+            face_joins=(None if state.face_joins is None else
+                        state.face_joins[shifted.astype(jnp.int32)]),
             tokens=jnp.zeros_like(state.tokens),
             eqn_ids=jnp.zeros_like(state.eqn_ids),
             # Legacy sentinels, byte-identical to what `step()` writes on
@@ -8212,7 +8359,7 @@ class VertexEliminationEnv:
             order=initial_order,
             sparsity_specs=initial_specs,
             face_specs=jnp.full(
-                (initial_order.shape[0], MAX_FACES, FACE_SLOTS, 3), -1,
+                (initial_order.shape[0], MAX_FACES, wire_slots(), 3), -1,
                 dtype=jnp.int32,
             ),
             face_skips=jnp.zeros(

@@ -107,8 +107,8 @@ def pad_face_outputs(max_faces, fr, fs, fa, f_pair, f_comp, f_valid, f_cnt,
     ``fa`` is a ``heads.FaceAction`` of numpy arrays; returns the same tuple
     shape padded, all numpy.
     """
-    from alphagrad.approx.heads import FaceAction, OP_END
-    from alphagrad.approx.env import FACE_SLOTS
+    from alphagrad.approx import face_action as _rec
+    from alphagrad.approx.env import wire_slots
 
     F = int(max_faces)
     fr = np.asarray(fr, np.int32)
@@ -126,22 +126,18 @@ def pad_face_outputs(max_faces, fr, fs, fa, f_pair, f_comp, f_valid, f_cnt,
         out[:fb] = x
         return out
 
+    # The wire rows are `wire_slots()` wide, not FACE_SLOTS: under
+    # --approx-add learned1 / learned2 the engine applies 4 / 5 rows per face.
     fr2 = np.broadcast_to(
-        _END_SPEC_ROW, (F, int(FACE_SLOTS), 3)).astype(np.int32).copy()
+        _END_SPEC_ROW, (F, int(wire_slots()), 3)).astype(np.int32).copy()
     fr2[:fb] = fr
     fs2 = _fill(np.asarray(fs, np.int32), 0)
-    fa2 = FaceAction(
-        skip=_fill(fa.skip, 0),
-        op_type=_fill(fa.op_type, int(OP_END)),
-        i=_fill(fa.i, 0),
-        j=_fill(fa.j, 0),
-        exponents=_fill(fa.exponents, 0),
-        factor=_fill(fa.factor, 0),
-        compress_kind=_fill(fa.compress_kind, 0),
-        quant_dtype=_fill(fa.quant_dtype, 0),
-        quant_scale_sign=_fill(fa.quant_scale_sign, 1),
-        quant_scale_frac=_fill(fa.quant_scale_frac, 0.0),
-    )
+    # THE FILL VALUES ARE THE DECLARATION'S. This function restated all ten
+    # fields and their canonical inactive values by hand, which made it the
+    # sixth place a new face action field had to be added -- and the one where
+    # a wrong fill would have been invisible, because a padding face's row is
+    # never scored and only the ENV would have seen it.
+    fa2 = _rec.fill_like(fa, F)
     fp = np.asarray(f_pair)
     fp2 = np.broadcast_to(fp[0], (F,) + fp.shape[1:]).copy()
     fp2[:fb] = fp

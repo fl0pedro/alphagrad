@@ -42,8 +42,9 @@ from alphagrad.approx.env import (
     COMPRESS_SENTINEL, FACE_SLOTS, MAX_RULES_PER_VERTEX, QUANT_SENTINEL,
     make_slot_frame_hook,
 )
+from alphagrad.approx.face_action import FaceAction
 from alphagrad.approx.heads import (
-    AXIS_TAG_BITS, AxisTokenFeatures, FaceAction,
+    AXIS_TAG_BITS, AxisTokenFeatures,
     _approx_allowed, precompute_factor_tables,
 )
 from alphagrad.approx.live_faces import LiveFaceStream

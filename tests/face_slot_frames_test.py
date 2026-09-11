@@ -676,7 +676,7 @@ def test_masked_head_equals_pruned_head_per_slot():
 
 
 def _as_face_action(row, skip, F=4):
-    from alphagrad.approx.heads import FaceAction
+    from alphagrad.approx.face_action import FaceAction
 
     def _pad(v):
         v = jnp.asarray(v)

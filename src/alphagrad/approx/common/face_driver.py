@@ -493,25 +493,32 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
     # bands, a silent `[:3]` would hand the head three masks belonging to other
     # tensors -- the mask/tensor mismatch of finding 72, from the other side.
     from alphagrad.approx.env import FACE_SLOTS as _CONTRACTION_SLOTS
-    from alphagrad.approx.env import approx_add as _approx_add
     from alphagrad.approx.env import face_slot_sites as _sites
-    S = int(_CONTRACTION_SLOTS)
+    from alphagrad.approx.env import wire_slots as _wire_slots
+    # THE WIRE'S WIDTH, NOT THE CONTRACTION BAND (2026-09-11, ticket
+    # dsnn-3qm.56). This used to be `S = FACE_SLOTS` plus a NotImplementedError
+    # for anything wider, because the trainer wire stopped at the contraction
+    # band. It no longer does: `UnifiedFacePolicy` sizes every per-slot shape
+    # from `head_layout(approx_add).n_slots` and the rollout carries
+    # `wire_slots()` rows, so handing the head all of the rows
+    # `face_slot_legality` computed is now correct -- and narrowing would be
+    # the defect (a slot the width HAS going unscored while the engine applies
+    # its row).
+    S = int(_wire_slots())
     _topology = _sites()
-    if tuple(x[0] for x in _topology[:S]) != ("lhs", "rhs", "res:new"):
+    _C = int(_CONTRACTION_SLOTS)
+    if tuple(x[0] for x in _topology[:_C]) != ("lhs", "rhs", "res:new"):
         raise RuntimeError(
             f"the contraction slots are no longer the prefix of the face slot "
-            f"topology ({_topology}); narrowing the legality masks to the first "
-            f"{S} rows would hand the head masks computed from other tensors.")
+            f"topology ({_topology}); the head's slot 0/1/2 masks would come "
+            f"from other tensors.")
     if len(_topology) != S:
-        raise NotImplementedError(
-            f"--approx-add {_approx_add()!r} gives the face head "
-            f"{len(_topology)} slots ({_topology}), and the trainer wire covers "
-            f"the {S} contraction slots only: the policy has no per-slot "
-            f"features for the learned join slots and the rollout does not carry "
-            f"their rows. Narrowing the legality masks here would train a head "
-            f"whose extra slots the engine still applies. The remaining work is "
-            f"transport, not design (finding 73 section 9b, ticket "
-            f"dsnn-3qm.56).")
+        raise RuntimeError(
+            f"the face slot topology has {len(_topology)} sites ({_topology}) "
+            f"and env.wire_slots() says {S}. Both derive from "
+            f"unified_face_head._LAYOUT_SPEC, so they cannot disagree unless "
+            f"one of them stopped reading it -- and a mask row per site is the "
+            f"invariant finding 72 exists for.")
     _perf = None
     if prof_sink is not None:
         import time as _time
