@@ -3615,6 +3615,34 @@ def quality_metric(config=None) -> str:
     """
     want = os.environ.get(_QUALITY_METRIC_ENV, "auto").strip().lower()
     if want in ("loss_drop", "lossdrop", "walk"):
+        # `loss_drop` IS ONLY DEFINED FOR A SCALAR-LOSS TARGET, and that is a
+        # FACT off the traced jaxpr (`EnvConfig.scalar_target`), not a flag.
+        # The walk's first step is `L0 = float(target_fun(*args))`, so an
+        # analytic AD benchmark -- Helmholtz / RoeFlux / Lighthouse / RobotArm /
+        # BlackScholes / Simple, whose target is a full Jacobian -- reaches it
+        # with a RANK-1 output and dies as
+        # `TypeError: Only scalar arrays can be converted to Python scalars`,
+        # five frames inside a host callback, at the FIRST TERMINAL measurement.
+        # Measured: `--example Helmholtz --quality-metric loss_drop` fails that
+        # way on every --approx-add value, and the traceback names neither the
+        # flag nor the example.
+        #
+        # `auto` has always consulted `scalar_target` (the bottom of this
+        # function); selecting the metric BY NAME skipped the same fact. It does
+        # not any more: this is the repo's error taxonomy, not a rank fix --
+        # reshaping or indexing that `float()` would compute a "loss drop" for
+        # a target that has no loss.
+        if config is not None and not bool(
+                getattr(config, "scalar_target", False)):
+            raise ValueError(
+                f"{_QUALITY_METRIC_ENV}={want!r} (--quality-metric loss_drop) "
+                f"needs a SCALAR-LOSS target: the walk scores "
+                f"`float(target_fun(...))` and this target's output is not a "
+                f"scalar (EnvConfig.scalar_target is False), so the walk would "
+                f"raise at the first terminal measurement instead of here. The "
+                f"analytic AD benchmarks have no loss and no data generator -- "
+                f"use --quality-metric jac_cosine for them, or `auto`, which "
+                f"reads the same fact and picks jac_cosine by itself.")
         return "loss_drop"
     if want in ("grad_cosine", "gradcos", "grad_cos"):
         return "grad_cosine"
