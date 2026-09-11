@@ -1597,7 +1597,7 @@ class LiveFaceStream:
     # pass raises rather than answering. :meth:`decide_faces` is the pass for
     # those, and it stays for exactly that reason.
     def decide_vertex_faces(self, tk, vertex, draw, *, skips=None,
-                            approx_dispatch=None):
+                            approx_dispatch=None, approx_cfg=None):
         """Decide every CONTRACTION slot of ``vertex`` with NO elimination.
 
         ``draw(f, s, legality)`` is called once per (face ``f``, slot ``s``),
@@ -1637,6 +1637,19 @@ class LiveFaceStream:
         because it runs in the caller's own process with the caller's own flag.
         Pass ``True`` / ``False`` only to answer about a mode that is NOT the
         current one.
+
+        ``approx_cfg`` -- ``None`` (the default) DERIVES graphax's
+        ``_is_approx_cfg`` from the entry forms the measurement will install, via
+        :func:`graphax.face_config_is_approx`, which is the elimination's own
+        predicate. It is the second flag that is an ARGUMENT of the contraction
+        (it gates the reconciler peel and the re-evaluation of
+        ``need_contract``), and the derivation is what makes this pass exact
+        about `IncrementalJaxpr.eliminate`, whose ``transforms=()`` leaves the
+        flag to the face dict. Override it only to answer about a DIFFERENT
+        caller: ``True`` is what :meth:`decide_faces` and :meth:`_probe_faces`
+        effectively run under, because they install a per-vertex CALLABLE
+        transform, and comparing the two passes' answers is only meaningful with
+        both flags matched.
 
         Returns :class:`DecidedFaces`, with ``rows`` the wire and the five mask
         fields the legality each row was drawn under -- the arrays PPO has to
@@ -1727,7 +1740,8 @@ class LiveFaceStream:
                 try:
                     self._decide_vertex_body(
                         ij, int(vertex), specs, draw, _skipped, demand, N, S,
-                        rows, sizes, quant, pair, comp, nout)
+                        rows, sizes, quant, pair, comp, nout,
+                        approx_cfg=approx_cfg)
                 except Exception as exc:
                     # Same contract as `_probe_faces` and `decide_faces`: a
                     # vertex graphax cannot trace has no legal approximation
@@ -1750,7 +1764,8 @@ class LiveFaceStream:
                             comp=comp, nout=nout, n_faces=np.int32(n_faces))
 
     def _decide_vertex_body(self, ij, vertex, specs, draw, skipped, demand, N,
-                            S, rows, sizes, quant, pair, comp, nout):
+                            S, rows, sizes, quant, pair, comp, nout,
+                            approx_cfg=None):
         """The two stages. Split out so the snapshot / arming wrapper above
         stays readable and so the ``except`` there covers exactly this."""
         from jax._src import core as _jcore
@@ -1842,7 +1857,8 @@ class LiveFaceStream:
             if all(h is None for h in hooks):
                 continue  # an all-None face installs no entry (env's gate)
             ft_probe[sp.key] = face_entry_from_slots(hooks)
-        approx = bool(face_config_is_approx(ft_probe))
+        approx = (bool(face_config_is_approx(ft_probe)) if approx_cfg is None
+                  else bool(approx_cfg))
         # THE ONE CASE THE FLAG IS NOT YET DECIDED. Under a `lossy` join an
         # ARMED face carries a `FaceJoinPolicy`, which arms the flag -- and slot
         # 2 can arm a face whose operands are both exact. The flag is then a
@@ -1851,7 +1867,8 @@ class LiveFaceStream:
         # installs NO policy at all (env._JOIN_SEMANTICS_OF) so nothing in
         # stage 2 can move the flag; this detects the `lossy`-and-nothing-armed
         # case and says so rather than silently masking from the wrong flag.
-        _flag_undecided = (not approx) and self._lossy_join_active()
+        _flag_undecided = (approx_cfg is None and not approx
+                           and self._lossy_join_active())
         if _flag_undecided:
             self.stats["vertex_flag_undecided"] += 1
 
@@ -1957,7 +1974,8 @@ class LiveFaceStream:
 
     def vertex_face_decisions(self, order, specs, n, vertex, draw, *,
                               skips=None, face_rows_hist=None,
-                              face_skips_hist=None, approx_dispatch=None):
+                              face_skips_hist=None, approx_dispatch=None,
+                              approx_cfg=None):
         """:meth:`decide_vertex_faces` against the PREFIX tokenizer of step
         ``n`` -- the :meth:`face_slot_decisions` of the structural pass.
 
@@ -1987,7 +2005,8 @@ class LiveFaceStream:
                 comp=np.zeros((F, S, N), np.float32),
                 nout=np.zeros((F, S), np.int32), n_faces=np.int32(0))
         return self.decide_vertex_faces(tk, vertex, draw, skips=skips,
-                                        approx_dispatch=approx_dispatch)
+                                        approx_dispatch=approx_dispatch,
+                                        approx_cfg=approx_cfg)
 
     def consume_stats(self) -> dict:
         out = dict(self.stats)
