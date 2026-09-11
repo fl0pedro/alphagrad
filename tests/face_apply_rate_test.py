@@ -139,6 +139,27 @@ def _features():
         valid_mask=jnp.ones((N_AX,), jnp.float32))
 
 
+def _jit_draw(pol, feats, ctx, tables):
+    """ONE jitted draw, reused by every walk.
+
+    A DYNAMIC mask needs one head call per (face, slot) instead of one per face,
+    and an EAGER ``sample_face`` costs 35 ms against 0.28 ms jitted (probe
+    t75_cost) -- 78 ms eager inside the decide pass's trace escape. Left eager
+    this file would take hours and would mostly be measuring the harness. The
+    rollout jits it too (``UnifiedPolicy._face_loop`` runs inside the jitted
+    rollout step), so jitting here is the faithful choice as well as the fast
+    one, and ``test_the_jitted_draw_is_the_eager_draw`` pins that it changes no
+    draw.
+    """
+    @jax.jit
+    def _d(key, f, pr, cp, sz, qt):
+        sk, row, _lp, _e, _ar, _sp, _od = pol.sample_face(
+            feats, tables, key, f, pr, cp, jnp.asarray(1.0),
+            face_context=ctx, face_sizes_f=sz, face_quant_f=qt)
+        return (sk, row["op_type"], row["i"], row["j"], row["quant_dtype"])
+    return _d
+
+
 def _diag_wire(i, j, n_out):
     """``(bi1, bi2)`` or None, MIRRORING ``env.micro_actions_to_rule_specs_jax``.
 
@@ -224,6 +245,7 @@ def _walk_one_graph(target, seed, slots_on=None):
     pol, tables = _policy(F)
     feats = _features()
     ctx = jnp.zeros((pol.embd_dim,), jnp.float32)
+    draw_jit = _jit_draw(pol, feats, ctx, tables)
     # THE TOPOLOGY'S WIDTH, not a restated FACE_SLOTS. `face_slot_sites()`
     # reports as many slots as --approx-add has (three under the default
     # lossless, four under learned1, five under learned2), so the mask arrays
@@ -269,18 +291,17 @@ def _walk_one_graph(target, seed, slots_on=None):
             key = jrand.PRNGKey(seed * 1000003 + _n * 97 + f)
             # SLICED TO THE CONTRACTION BAND, like face_driver does: the policy
             # builds per-slot features for the three contraction slots only.
-            _skip, row, *_ = pol.sample_face(
-                feats, tables, key, f,
+            _skip, op_t, ii, jj, dt = draw_jit(
+                key, f,
                 jnp.asarray(pair[f][:FACE_SLOTS]),
-                jnp.asarray(comp[f][:FACE_SLOTS]), jnp.asarray(1.0),
-                face_context=ctx,
-                face_sizes_f=jnp.asarray(sizes[f][:FACE_SLOTS]),
-                face_quant_f=jnp.asarray(quant[f][:FACE_SLOTS]))
-            op = int(row["op_type"][s])
+                jnp.asarray(comp[f][:FACE_SLOTS]),
+                jnp.asarray(sizes[f][:FACE_SLOTS]),
+                jnp.asarray(quant[f][:FACE_SLOTS]))
+            op = int(np.asarray(op_t)[s])
             if op == OP_NONE:
                 return None
-            w = _row_to_wire(op, row["i"][s], row["j"][s], row["i"][s],
-                             row["quant_dtype"][s], L.n_out)
+            ii, jj, dt = np.asarray(ii), np.asarray(jj), np.asarray(dt)
+            w = _row_to_wire(op, ii[s], jj[s], ii[s], dt[s], L.n_out)
             if w is None:
                 return None
             requested[_OP_KIND[op]] += 1
@@ -365,6 +386,7 @@ def _walk(target, seed, slots_on=None):
     pol, tables = _policy(MAX_FACES)
     feats = _features()
     ctx = jnp.zeros((pol.embd_dim,), jnp.float32)
+    draw_jit = _jit_draw(pol, feats, ctx, tables)
     S_ALL = len(face_slot_sites())
 
     rows_hist = np.full((total_v, MAX_FACES, S_ALL, 3), -1, np.int32)
@@ -399,18 +421,17 @@ def _walk(target, seed, slots_on=None):
             if slots_on is not None and _SLOT_SITES[s] not in slots_on:
                 return None
             key = jrand.PRNGKey(seed * 1000003 + _n * 97 + f)
-            _skip, row, *_ = pol.sample_face(
-                feats, tables, key, f,
+            _skip, op_t, ii, jj, dt = draw_jit(
+                key, f,
                 jnp.asarray(pair[f][:FACE_SLOTS]),
-                jnp.asarray(comp[f][:FACE_SLOTS]), jnp.asarray(1.0),
-                face_context=ctx,
-                face_sizes_f=jnp.asarray(sizes[f][:FACE_SLOTS]),
-                face_quant_f=jnp.asarray(quant[f][:FACE_SLOTS]))
-            op = int(row["op_type"][s])
+                jnp.asarray(comp[f][:FACE_SLOTS]),
+                jnp.asarray(sizes[f][:FACE_SLOTS]),
+                jnp.asarray(quant[f][:FACE_SLOTS]))
+            op = int(np.asarray(op_t)[s])
             if op == OP_NONE:
                 return None
-            w = _row_to_wire(op, row["i"][s], row["j"][s], row["i"][s],
-                             row["quant_dtype"][s], L.n_out)
+            ii, jj, dt = np.asarray(ii), np.asarray(jj), np.asarray(dt)
+            w = _row_to_wire(op, ii[s], jj[s], ii[s], dt[s], L.n_out)
             if w is None:
                 return None
             requested[_OP_KIND[op]] += 1
@@ -625,6 +646,7 @@ def _walk_join_slots(target, seed, arm):
     pol, tables = _policy(F)
     feats = _features()
     ctx = jnp.zeros((pol.embd_dim,), jnp.float32)
+    draw_jit = _jit_draw(pol, feats, ctx, tables)
 
     envmod._PER_FACE_STATS.clear()
     requested = {k: 0 for k in KINDS}
@@ -643,17 +665,15 @@ def _walk_join_slots(target, seed, arm):
                 return jnp.asarray(np.repeat(
                     np.asarray(a)[None], FACE_SLOTS, 0))
 
-            _sk, row, *_ = pol.sample_face(
-                feats, tables, key, f,
-                _rep(L.pair.astype(np.float32)),
-                _rep(L.comp.astype(np.float32)), jnp.asarray(1.0),
-                face_context=ctx, face_sizes_f=_rep(L.sizes),
-                face_quant_f=_rep(L.quant.astype(np.float32)))
-            op = int(row["op_type"][0])
+            _sk, op_t, ii, jj, dt = draw_jit(
+                key, f, _rep(L.pair.astype(np.float32)),
+                _rep(L.comp.astype(np.float32)), _rep(L.sizes),
+                _rep(L.quant.astype(np.float32)))
+            op = int(np.asarray(op_t)[0])
             if op == OP_NONE:
                 return None
-            w = _row_to_wire(op, row["i"][0], row["j"][0], row["i"][0],
-                             row["quant_dtype"][0], L.n_out)
+            ii, jj, dt = np.asarray(ii), np.asarray(jj), np.asarray(dt)
+            w = _row_to_wire(op, ii[0], jj[0], ii[0], dt[0], L.n_out)
             if w is None:
                 return None
             requested[_OP_KIND[op]] += 1
@@ -1087,3 +1107,40 @@ def test_the_decide_pass_answers_at_every_approx_add_width(tlm):
             os.environ.pop(envmod._APPROX_ADD_ENV, None)
         else:
             os.environ[envmod._APPROX_ADD_ENV] = prev
+
+
+def test_the_jitted_draw_is_the_eager_draw():
+    """THE WALKS ABOVE JIT THE HEAD, so jit must move no sample.
+
+    A dynamic mask costs one head call per (face, slot); eager that is 35-78 ms
+    a call and this file would take hours. If jit changed a draw -- a fused
+    reduction reordering a float and flipping a categorical at a tie -- the
+    rejection counts would be over a different plan than findings 73/74
+    measured, and the xfail flips would be comparing two different things.
+    Stated over masks that are HALF ILLEGAL, because a half-masked softmax is
+    where a tie is reachable at all.
+    """
+    pol, tables = _policy(MAX_FACES)
+    feats = _features()
+    ctx = jnp.zeros((pol.embd_dim,), jnp.float32)
+    dj = _jit_draw(pol, feats, ctx, tables)
+    rng = np.random.default_rng(11)
+    S = FACE_SLOTS
+    n = 0
+    for t in range(40):
+        pr = (rng.random((S, N_AX, N_AX)) < 0.5).astype(np.float32)
+        cp = (rng.random((S, N_AX)) < 0.5).astype(np.float32)
+        sz = np.full((S, N_AX), 4, np.int32)
+        qt = np.ones((S, 2), np.float32)
+        k = jrand.PRNGKey(t)
+        _sk, row, *_ = pol.sample_face(
+            feats, tables, k, 0, jnp.asarray(pr), jnp.asarray(cp),
+            jnp.asarray(1.0), face_context=ctx, face_sizes_f=jnp.asarray(sz),
+            face_quant_f=jnp.asarray(qt))
+        got = dj(k, 0, jnp.asarray(pr), jnp.asarray(cp), jnp.asarray(sz),
+                 jnp.asarray(qt))
+        want = (_sk, row["op_type"], row["i"], row["j"], row["quant_dtype"])
+        for a, b in zip(want, got):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+            n += 1
+    assert n == 40 * 5
