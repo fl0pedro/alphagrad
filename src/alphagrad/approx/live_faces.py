@@ -1615,10 +1615,10 @@ class LiveFaceStream:
         None``), so the two settings contract the SAME operands into tensors
         with different index structure and different dtype. Measured here: with
         the flag forced ON, as :meth:`_probe_faces` and :meth:`decide_faces` do,
-        3 of 2154 per-(face, slot) mask fields disagreed with the tensor the
+        3 of 2145 per-(face, slot) mask fields disagreed with the tensor the
         real apply path hands the hook on TLM -- all three the QUANT row, all
         three at ``res:new``, all three a face whose operand carried a Quant --
-        and with the flag left alone, 0 of 2154. ``face_slot_legality``
+        and with the flag left alone, 0 of 2145. ``face_slot_legality``
         intersects BOTH modes because a probe run before the draw cannot know
         which one the measurement will take; this pass does not need to guess,
         because it runs in the caller's own process with the caller's own flag.
