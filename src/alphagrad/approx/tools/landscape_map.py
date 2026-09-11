@@ -371,7 +371,6 @@ from alphagrad.approx.env import (                            # noqa: E402
 )
 from alphagrad.approx.common.masks import (                   # noqa: E402
     quant_valid_mask,
-    compress_slot_mask,
     slot_legality,
     diag_valid_mask,
     diag_pair_gcd,
