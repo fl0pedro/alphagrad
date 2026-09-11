@@ -289,7 +289,11 @@ class LiveFaceStream:
                       "vertex_operand_probes": 0, "vertex_contractions": 0,
                       "vertex_draw": 0, "vertex_face_absent": 0,
                       "vertex_self_skip": 0, "vertex_key_collision": 0,
-                      "vertex_flag_undecided": 0, "vertex_flag_flip": 0}
+                      "vertex_flag_undecided": 0, "vertex_flag_flip": 0,
+                      # `--approx-add choose`: the entry builder needs a
+                      # per-face join BIT this pass does not hold, so the
+                      # approx flag is ASSUMED True (the conservative arm).
+                      "vertex_flag_assumed": 0}
         # The last exception `decide_vertex_faces` swallowed, as text. See the
         # `except` there: a failure COUNT is not a diagnosis.
         self.last_vertex_error: str | None = None
@@ -1846,6 +1850,7 @@ class LiveFaceStream:
         # measurement will install are built here from the rows just drawn and
         # handed to graphax's own predicate.
         ft_probe: dict = {}
+        _entry_unknown = False
         for sp in specs:
             if skipped(sp.f):
                 ft_probe[sp.key] = SKIP_FACE
@@ -1856,9 +1861,26 @@ class LiveFaceStream:
                 for s in range(S))
             if all(h is None for h in hooks):
                 continue  # an all-None face installs no entry (env's gate)
-            ft_probe[sp.key] = face_entry_from_slots(hooks)
-        approx = (bool(face_config_is_approx(ft_probe)) if approx_cfg is None
-                  else bool(approx_cfg))
+            try:
+                ft_probe[sp.key] = face_entry_from_slots(hooks)
+            except Exception:
+                # `--approx-add choose` resolves the join from a PER-FACE BIT
+                # that this pass does not hold, and `resolve_join_mode` rightly
+                # RAISES rather than guessing (finding 74). The bit only
+                # decides between `lossy` and `lossless`, and the `lossy` arm
+                # installs a `FaceJoinPolicy` on an ARMED face, which ARMS
+                # `_is_approx_cfg`. So the conservative answer -- the one that
+                # cannot mask from a flag the elimination will not have -- is
+                # True, and it is counted so a `choose` run does not look
+                # exact by accident.
+                _entry_unknown = True
+        if approx_cfg is not None:
+            approx = bool(approx_cfg)
+        elif _entry_unknown:
+            approx = True
+            self.stats["vertex_flag_assumed"] += 1
+        else:
+            approx = bool(face_config_is_approx(ft_probe))
         # THE ONE CASE THE FLAG IS NOT YET DECIDED. Under a `lossy` join an
         # ARMED face carries a `FaceJoinPolicy`, which arms the flag -- and slot
         # 2 can arm a face whose operands are both exact. The flag is then a
@@ -1868,6 +1890,7 @@ class LiveFaceStream:
         # stage 2 can move the flag; this detects the `lossy`-and-nothing-armed
         # case and says so rather than silently masking from the wrong flag.
         _flag_undecided = (approx_cfg is None and not approx
+                           and not _entry_unknown
                            and self._lossy_join_active())
         if _flag_undecided:
             self.stats["vertex_flag_undecided"] += 1

@@ -1580,6 +1580,65 @@ def test_the_vertex_pass_refuses_the_learned_join_slots(tlm):
             os.environ[envmod._APPROX_ADD_ENV] = prev
 
 
+def test_the_vertex_pass_answers_under_approx_add_choose(tlm):
+    """`choose` HAS THREE SLOTS, SO THE PASS MUST ANSWER -- and it cannot know
+    the join arm.
+
+    ``--approx-add choose`` gives the face the three CONTRACTION slots and picks
+    the join semantics from a PER-FACE BIT the head draws.
+    ``env.face_entry_from_slots`` rightly RAISES without that bit rather than
+    defaulting to an arm (finding 74), and this pass builds an entry only to ask
+    graphax for ``_is_approx_cfg``. The bit decides between ``lossy`` and
+    ``lossless``, and only ``lossy`` installs a ``FaceJoinPolicy``, which is what
+    arms the flag -- so the answer that cannot mask from a flag the elimination
+    will not have is TRUE, taken and COUNTED (``vertex_flag_assumed``) rather
+    than left to an exception that would lose the whole vertex's decisions.
+
+    What this asserts is exactly that: it ANSWERS (no ``vertex_probe_fail``), it
+    offers something, and it says out loud that it assumed.
+    """
+    from graphax import IncrementalPathTokenizer
+
+    jaxpr, consts, args, argnums = tlm
+    vv = _valid_vertices(jaxpr, args, consts, argnums)
+    order = markowitz_order(jaxpr, argnums, consts, args, vv)
+    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+                        max_faces=MAX_FACES, max_axes=N_AX)
+    tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
+                                  vocab_size=512)
+    tk.base_tokens()
+    prev = os.environ.get(envmod._APPROX_ADD_ENV)
+    os.environ[envmod._APPROX_ADD_ENV] = "choose"
+    try:
+        assert envmod.wire_slots() == FACE_SLOTS
+        armed = 0
+        for v in list(order)[:25]:
+            v = int(v)
+
+            def _draw(f, s, L):
+                ax = np.flatnonzero(L.comp)
+                if ax.size == 0:
+                    return None
+                return (int(envmod.COMPRESS_SENTINEL), int(ax[0]), 0)
+
+            dec = lf.decide_vertex_faces(tk, v, _draw)
+            armed += int((np.asarray(dec.rows)[..., 0] != -1).sum())
+            tk.ij.eliminate(v, (), None)
+        st = lf.consume_stats()
+    finally:
+        if prev is None:
+            os.environ.pop(envmod._APPROX_ADD_ENV, None)
+        else:
+            os.environ[envmod._APPROX_ADD_ENV] = prev
+    assert st["vertex_probe_fail"] == 0, (
+        f"the pass failed under --approx-add choose: {st}")
+    assert armed > 0, "nothing was offered -- vacuous"
+    assert st["vertex_flag_assumed"] > 0, (
+        f"the pass did not have to assume the approx flag under `choose`, which "
+        f"means `face_entry_from_slots` answered without the per-face join bit "
+        f"-- the guard finding 74 landed is gone. {st}")
+
+
 def test_the_two_passes_draw_the_same_rows(tlm):
     """#77's pass and #75's pass DECIDE THE SAME PLAN.
 
