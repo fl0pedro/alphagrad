@@ -4805,7 +4805,7 @@ APPROX_ADD_FIXED = ("lossy", "lossless")
 #: rather than the approximation the head chose, i.e. punish the head for
 #: approximating at all. ``lossy`` also continues the previous declared
 #: default (``same``) for the ADD's cost behaviour.
-APPROX_ADD_DEFAULT = "lossy"
+APPROX_ADD_DEFAULT = "lossless"
 _RETIRED_APPROX_OLD = {"same": "lossy", "exact": "lossless"}
 
 
@@ -5007,8 +5007,6 @@ def face_entry_from_slots(slots, at_site=None, at_join=None, mode=None,
     arithmetic for a result nothing reads -- and under ``choose`` the probe does
     not even have the bit, so asking for the arm would raise.
     """
-    from graphax.sparse.ops.join import MatchFreshJoin
-
     def _at(site, hook):
         if hook is None or at_site is None:
             return hook
@@ -5049,6 +5047,7 @@ def face_entry_from_slots(slots, at_site=None, at_join=None, mode=None,
     # list drift from the measurement's (finding 72).
     _armed = any(h is not None for h in (slots[0], slots[1], _new_hook))
     if mode == "lossy" and _armed:
+        from graphax.sparse.ops.join import MatchFreshJoin
         policy = MatchFreshJoin(on_outcome=_join_outcome_sink())
         if at_join is not None:
             policy = at_join(policy)

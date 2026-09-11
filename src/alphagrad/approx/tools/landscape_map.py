@@ -320,7 +320,7 @@ def make_argparser() -> argparse.ArgumentParser:
 # `face_join` channel, so `choose` would raise at the first armed merge face.
 # Not offered rather than offered-and-broken.
 _APPROX_ADD_CHOICES = ("lossy", "lossless")
-_APPROX_ADD_DEFAULT = "lossy"
+_APPROX_ADD_DEFAULT = "lossless"
 
 
 if __name__ == "__main__":

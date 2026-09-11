@@ -119,8 +119,13 @@ def _recorder(hook, site, log):
     would not be the same object graphax dispatches on. Its firing is observed
     through the join counters and through the addends it returns instead.
     """
-    from graphax.sparse.ops.join import FaceJoinPolicy
-    if hook is None or isinstance(hook, FaceJoinPolicy):
+    try:
+        from graphax.sparse.ops.join import FaceJoinPolicy
+        if isinstance(hook, FaceJoinPolicy):
+            return hook
+    except ImportError:
+        pass
+    if hook is None:
         return hook
 
     def _h(st):
@@ -267,11 +272,11 @@ def test_at_join_lets_the_legality_probe_drop_the_policy(monkeypatch):
     assert envmod.face_slot_sites() == (("lhs",), ("rhs",), ("res:new",))
 
 
-def test_the_default_is_lossy(monkeypatch):
+def test_the_default_is_lossless(monkeypatch):
     entry, log, _ = _emit_and_eliminate(monkeypatch, None)
-    assert envmod.approx_add() == "lossy"
-    assert envmod.APPROX_ADD_DEFAULT == "lossy"
-    assert entry[1][1] is not None and entry[1][1].mode == "lossy"
+    assert envmod.approx_add() == "lossless"
+    assert envmod.APPROX_ADD_DEFAULT == "lossless"
+    assert entry[1][1] is None
 
 
 def test_lossy_returns_two_structurally_identical_addends(monkeypatch):
@@ -545,12 +550,12 @@ def test_every_plan_record_carries_the_configuration(monkeypatch, cfg):
 # 4. the flag on ppo.py
 # --------------------------------------------------------------------------
 
-def test_ppo_declares_the_flag_with_default_lossy():
+def test_ppo_declares_the_flag_with_default_lossless():
     ppo = pytest.importorskip("alphagrad.approx.ppo")
     p = ppo.make_argparser()
-    assert p.parse_args([]).approx_add == "lossy"
+    assert p.parse_args([]).approx_add == "lossless"
     assert p.parse_args(
-        ["--approx-add", "lossless"]).approx_add == "lossless"
+        ["--approx-add", "lossy"]).approx_add == "lossy"
     with pytest.raises(SystemExit):
         p.parse_args(["--approx-add", "same"])
     # `choose` is honoured by the engine but not yet reachable from the CLI,
