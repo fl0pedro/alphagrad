@@ -3615,34 +3615,12 @@ def quality_metric(config=None) -> str:
     """
     want = os.environ.get(_QUALITY_METRIC_ENV, "auto").strip().lower()
     if want in ("loss_drop", "lossdrop", "walk"):
-        # `loss_drop` IS ONLY DEFINED FOR A SCALAR-LOSS TARGET, and that is a
-        # FACT off the traced jaxpr (`EnvConfig.scalar_target`), not a flag.
-        # The walk's first step is `L0 = float(target_fun(*args))`, so an
-        # analytic AD benchmark -- Helmholtz / RoeFlux / Lighthouse / RobotArm /
-        # BlackScholes / Simple, whose target is a full Jacobian -- reaches it
-        # with a RANK-1 output and dies as
-        # `TypeError: Only scalar arrays can be converted to Python scalars`,
-        # five frames inside a host callback, at the FIRST TERMINAL measurement.
-        # Measured: `--example Helmholtz --quality-metric loss_drop` fails that
-        # way on every --approx-add value, and the traceback names neither the
-        # flag nor the example.
-        #
-        # `auto` has always consulted `scalar_target` (the bottom of this
-        # function); selecting the metric BY NAME skipped the same fact. It does
-        # not any more: this is the repo's error taxonomy, not a rank fix --
-        # reshaping or indexing that `float()` would compute a "loss drop" for
-        # a target that has no loss.
-        if config is not None and not bool(
-                getattr(config, "scalar_target", False)):
-            raise ValueError(
-                f"{_QUALITY_METRIC_ENV}={want!r} (--quality-metric loss_drop) "
-                f"needs a SCALAR-LOSS target: the walk scores "
-                f"`float(target_fun(...))` and this target's output is not a "
-                f"scalar (EnvConfig.scalar_target is False), so the walk would "
-                f"raise at the first terminal measurement instead of here. The "
-                f"analytic AD benchmarks have no loss and no data generator -- "
-                f"use --quality-metric jac_cosine for them, or `auto`, which "
-                f"reads the same fact and picks jac_cosine by itself.")
+        # NAME RESOLUTION ONLY. Whether `loss_drop` is DEFINED for the running
+        # target is a different question and is answered in
+        # `_loss_drop_quality`, which is the thing that needs a scalar loss;
+        # `tests/quality_metric_names_test.py` pins this function as a pure
+        # name -> metric map for BOTH target kinds, and conflating the two
+        # would break that contract to say something it does not claim.
         return "loss_drop"
     if want in ("grad_cosine", "gradcos", "grad_cos"):
         return "grad_cosine"
@@ -4063,6 +4041,31 @@ def _loss_drop_quality(config, compiled_approx, base_args, device=None,
             return None
         return _sanitise_grad([leaves[p] for p in _grad_pos], weights)
 
+    # `loss_drop` IS ONLY DEFINED FOR A SCALAR-LOSS TARGET, and that is a FACT
+    # off the traced jaxpr (`EnvConfig.scalar_target`), not a flag. The line
+    # below is `float(target_fun(...))`, so an analytic AD benchmark --
+    # Helmholtz / RoeFlux / Lighthouse / RobotArm / BlackScholes / Simple, whose
+    # target is a full Jacobian -- used to reach it with a RANK-1 output and die
+    # as `TypeError: Only scalar arrays can be converted to Python scalars`,
+    # five frames inside a host callback, at the FIRST TERMINAL measurement,
+    # naming neither the flag nor the example. Measured 2026-09-11:
+    # `--example Helmholtz --quality-metric loss_drop` failed that way on EVERY
+    # --approx-add value, on the base as well, and read like a wire regression.
+    #
+    # A NAMED error, not a `return None`: None here means "the walk is undefined
+    # for this env" and the caller prints a warning and scores nothing, which is
+    # right for a missing data generator but wrong for a flag the user typed.
+    # And not a reshape or an index either -- that would compute a "loss drop"
+    # for a target that has no loss.
+    if not bool(getattr(config, "scalar_target", False)):
+        raise ValueError(
+            "--quality-metric loss_drop (ALPHAGRAD_QUALITY_METRIC=loss_drop) "
+            "needs a SCALAR-LOSS target: the walk scores "
+            "`float(target_fun(...))` and this target's output is not a scalar "
+            "(EnvConfig.scalar_target is False). The analytic AD benchmarks "
+            "have no loss and no data generator -- use --quality-metric "
+            "jac_cosine for them, or `auto`, which reads the same fact and "
+            "picks jac_cosine by itself.")
     L0 = float(_call_loss(w))
     if not np.isfinite(L0) or abs(L0) < 1e-12:
         return None

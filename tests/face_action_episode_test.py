@@ -259,28 +259,43 @@ def test_a_row_array_at_the_WRONG_width_is_refused_by_the_env(monkeypatch, mode)
                                skip, join)).state
 
 
-def test_loss_drop_on_a_NON_SCALAR_target_is_refused_at_resolution(monkeypatch):
-    """`--quality-metric loss_drop` needs a scalar loss, and says so EARLY.
+def test_loss_drop_on_a_NON_SCALAR_target_is_REFUSED_BY_NAME_not_by_TypeError():
+    """``--quality-metric loss_drop`` needs a scalar loss, and SAYS SO.
 
     The walk's first step is ``float(target_fun(...))``. An analytic AD
     benchmark's target is a full Jacobian, so that used to raise
     ``TypeError: Only scalar arrays can be converted to Python scalars`` five
     frames inside a host callback at the FIRST TERMINAL measurement, naming
-    neither the flag nor the example -- which is how a launcher with this
-    combination looked like a wire regression on every --approx-add value at
-    once. ``auto`` always consulted ``EnvConfig.scalar_target``; selecting the
-    metric by NAME now consults the same fact.
+    neither the flag nor the example -- which is how a launcher carrying that
+    combination looked like a wire regression on every ``--approx-add`` value at
+    once (measured 2026-09-11: it failed identically on the base).
+
+    THE REFUSAL LIVES WHERE THE WALK IS, NOT IN THE NAME RESOLVER.
+    ``quality_metric`` is a pure name -> metric map and
+    ``tests/quality_metric_names_test.py`` pins it as one for BOTH target kinds;
+    putting a validity check there broke that contract to say something it does
+    not claim. ``_loss_drop_quality`` is the function that needs the scalar loss,
+    so it is the function that refuses -- with a NAMED ValueError, never a
+    ``return None`` (which means "the walk is undefined for this env" and is
+    answered with a warning) and never a reshape.
     """
-    monkeypatch.setenv("ALPHAGRAD_QUALITY_METRIC", "loss_drop")
-    cfg_scalar = type("C", (), {"scalar_target": True})()
-    cfg_vector = type("C", (), {"scalar_target": False})()
-    assert envmod.quality_metric(cfg_scalar) == "loss_drop"
-    with pytest.raises(ValueError, match="SCALAR-LOSS"):
-        envmod.quality_metric(cfg_vector)
-    # `auto` reads the same fact and picks for itself, as it always did.
-    monkeypatch.setenv("ALPHAGRAD_QUALITY_METRIC", "auto")
-    assert envmod.quality_metric(cfg_vector) == "jac_cosine"
-    assert envmod.quality_metric(cfg_scalar) == "grad_cosine"
+    import inspect
+    src = inspect.getsource(envmod._loss_drop_quality)
+    assert "scalar_target" in src, (
+        "_loss_drop_quality no longer checks EnvConfig.scalar_target, so a "
+        "non-scalar target reaches float(target_fun(...)) again")
+    # The name resolver's contract is UNCHANGED, both kinds, by construction.
+    for kind in (True, False):
+        cfg = type("C", (), {"scalar_target": kind})()
+        old = os.environ.get("ALPHAGRAD_QUALITY_METRIC")
+        os.environ["ALPHAGRAD_QUALITY_METRIC"] = "loss_drop"
+        try:
+            assert envmod.quality_metric(cfg) == "loss_drop"
+        finally:
+            if old is None:
+                os.environ.pop("ALPHAGRAD_QUALITY_METRIC", None)
+            else:
+                os.environ["ALPHAGRAD_QUALITY_METRIC"] = old
 
 
 def test_no_scalar_conversion_is_applied_to_a_WHOLE_record_field():
