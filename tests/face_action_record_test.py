@@ -26,8 +26,9 @@ Nothing here enumerates the fields. Every expectation is computed from
   leaf, so there is no list of names to go stale, and ``check_carrier`` refuses
   a carrier that grew the flat ``face_*`` leaves back;
 * use 3's reader is checked with an ACCESS RECORDER: ``evaluate_face`` is run
-  against a proxy that logs every field it touches, and the set it touched must
-  equal ``face_action.scored_names(mode)``. A declared scored field nobody reads
+  against a proxy that logs every field it touches, and that set must CONTAIN
+  every ``face_action.scored_names(mode)`` and INTERSECT
+  ``derived_names(mode)`` not at all. A declared scored field nobody reads
   therefore FAILS, and so does a derived field somebody reads;
 * use 4 is checked with the same recorder on ``to_env_action_dynamic``, against
   ``translator_names()`` plus the per-face channels;
@@ -190,9 +191,22 @@ def test_use3_evaluate_reads_every_SCORED_field_and_no_DERIVED_one(mode):
     fa = _one_face_record(pol, f, tables, pair, comp, valid)
     rec = _Recorder(fa)
     pol.evaluate_face(f, tables, rec, 0, pair[0], comp[0], valid[0])
-    assert rec.seen == set(REC.scored_names(mode)), (
-        mode, sorted(rec.seen), sorted(REC.scored_names(mode)))
-    assert not (rec.seen & set(REC.derived_names(mode)))
+    # EVERY scored field this width declares is read back. This is the half
+    # that fails when a new declared decision never reaches the loss.
+    missed = set(REC.scored_names(mode)) - rec.seen
+    assert not missed, (mode, "scored but never read by evaluate", sorted(missed))
+    # NO derived field is read. They carry no decision, so reading one back
+    # would be the loss scoring a variable nothing chose -- and it would also
+    # hide a drifted derivation, which the codec round-trip test catches only
+    # because nothing reads these.
+    assert not (rec.seen & set(REC.derived_names(mode))), (
+        mode, sorted(rec.seen & set(REC.derived_names(mode))))
+    # And nothing OUTSIDE the declaration is touched. A width-restricted field
+    # is legitimately read at every width -- reading it is how the decoder
+    # learns the width does not have it (and then RAISES if it is populated) --
+    # so the bound is the declaration's scored set over all widths.
+    assert rec.seen <= set(REC.scored_names()), (
+        mode, sorted(rec.seen - set(REC.scored_names())))
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -239,7 +253,12 @@ def test_use4_the_wire_takes_EXACTLY_the_declared_translator_fields(mode,
         quant_scale_frac=jnp.zeros((1,), jnp.float32))
     ax = jnp.zeros((2, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM), jnp.int32)
     sa = Agent.to_env_action_dynamic(None, 0, act, ax, face_action=rec)
-    want = set(REC.translator_names()) | set(REC.per_face_names(mode))
+    # The translator fields (derived from the declaration) plus EVERY declared
+    # per-face channel. The per-face ones are read at every width because
+    # reading them is how the wire learns whether this width has them -- so the
+    # expectation is the declaration's per-face set over all widths, and a NEW
+    # per-face field the wire does not forward fails here.
+    want = set(REC.translator_names()) | set(REC.per_face_names())
     assert rec.seen == want, (mode, sorted(rec.seen), sorted(want))
     assert isinstance(sa, StepAction)
     assert tuple(sa.face_rows.shape) == (1, REC.n_slots(mode), 3)
@@ -309,28 +328,36 @@ def test_a_NEW_field_in_the_declaration_breaks_every_use(monkeypatch):
     monkeypatch.setitem(REC._BY_NAME, "ghost", extra)
 
     mode = "lossless"
-    # use 1: the policy's record now lacks a declared field.
     pol, f, tables, pair, comp, valid = _env(mode)
-    fa, *_ = pol.sample(None, f, tables, jrand.PRNGKey(3), pair, comp, valid)
+
+    # USE 1 fails AT THE SOURCE, not only in a test: the policy's wire row no
+    # longer carries every declared field, and `_rows` refuses to return it.
     with pytest.raises(ValueError, match="ghost"):
-        REC.check(fa, mode, F)
-    # the wire-row key set no longer matches the declaration.
+        pol.sample(None, f, tables, jrand.PRNGKey(3), pair, comp, valid)
+
+    # The record validator every use calls refuses the old record too.
+    stale = FaceAction(**{fld.name: jnp.zeros(
+        ((F, 3) if fld.per_slot else (F,)) + fld.tail,
+        getattr(jnp, fld.dtype))
+        for fld in REC.FACE_ACTION_FIELDS[:-2] if fld.present(mode)})
     with pytest.raises(ValueError, match="ghost"):
-        REC.check_wire_row_keys(
-            {k: None for k in ("op_type", "i", "j", "exponents", "factor",
-                               "compress_kind", "quant_dtype",
-                               "quant_scale_sign", "quant_scale_frac")},
-            mode)
-    # use 3: evaluate reads the scored fields, and `ghost` is now one of them.
-    one = FaceAction(skip=fa.skip[:1],
-                     **{k: getattr(fa, k)[:1] for k in REC.per_slot_names(mode)
-                        if getattr(fa, k) is not None})
-    rec = _Recorder(one)
-    pol.evaluate_face(f, tables, rec, 0, pair[0], comp[0], valid[0])
+        REC.check(stale, mode, F)
+
+    # USE 3's reader does not read it, so the use-3 agreement test FAILS --
+    # which is the property being demonstrated: a declared field nobody scores
+    # cannot pass silently.
+    rec = _Recorder(stale)
+    try:
+        pol.evaluate_face(f, tables, rec, 0, pair[0], comp[0], valid[0])
+    except Exception:
+        pass        # raising is also a failure, and also acceptable
     assert "ghost" not in rec.seen
-    assert rec.seen != set(REC.scored_names(mode)), (
+    assert set(REC.scored_names(mode)) - rec.seen == {"ghost"}, (
         "the use-3 agreement test would have PASSED with a declared field "
         "nobody reads -- the recorder is not doing its job")
+
+    # USE 4's wire does not forward it either.
+    assert "ghost" not in REC.translator_names()
 
 
 def test_the_declaration_is_importable_without_ppo():

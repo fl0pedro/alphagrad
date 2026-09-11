@@ -3942,6 +3942,19 @@ class Agent(eqx.Module):
         # (env._face_dict_for_vertex says the same where it decodes them).
         # `face_join` is None at every width without the choose bit, which is
         # what `env.resolve_join_mode` then answers from the configuration.
+        # A per-face field the declaration gains needs a StepAction channel of
+        # its own, and there is no way to derive that -- so say it HERE, where
+        # the forwarding is written, instead of letting the new decision be
+        # dropped on the way to the env.
+        _PF = set(_rec.per_face_names())
+        if _PF != {"skip", "join"}:
+            raise NotImplementedError(
+                f"face_action.FACE_ACTION_FIELDS declares the per-face fields "
+                f"{sorted(_PF)}; this wire forwards 'skip' and 'join' only. A "
+                f"per-face decision needs its own StepAction channel (packing "
+                f"it into another field's bits would make every reader of that "
+                f"field wrong) and its own env.EnvState history array, as "
+                f"`face_join` / `face_joins` have.")
         return StepAction(
             target_vertex=jnp.asarray(vertex_idx + 1, dtype=jnp.int32),
             rule_specs=rule_specs,
