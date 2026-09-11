@@ -869,6 +869,18 @@ def _face_plan(agent, precomputed, enc_carry, avail,
     # passed correctly-shaped face arrays; they were filled with -1.
     env_action = agent.to_env_action_dynamic(
         vertex_idx, actions, AXIS_STATE, face_action=fa)
+    # AZ's wire is (face_rows, face_skip) and nothing else -- `plan_wires`
+    # rebuilds exactly those two from the committed prefix. A per-face JOIN bit
+    # would be DROPPED here: the measurement would reconcile every merge under
+    # the configuration's default container while the head picked per face. That
+    # is finding 72's action/reward mismatch, so it raises instead.
+    if env_action.face_join is not None:
+        raise NotImplementedError(
+            "--approx-add choose decides the face join PER FACE, and the AZ "
+            "wire carries face_rows / face_skip only (plan_wires rebuilds "
+            "those two). Widening it means a third array through `plan_wires`, "
+            "the prefix state and `measure_one_plan`; until then AZ runs under "
+            "a value that FIXES the join semantics (ticket dsnn-3qm.56).")
     features = _axis_feats(AXIS_STATE[vertex_idx], AXIS_VALID[vertex_idx])
     return (env_action.face_rows, env_action.face_skip, fa, f_pair, f_comp,
             f_valid, f_cnt, f_dt, f_de, f_ends, v_context, features, face_ent,
