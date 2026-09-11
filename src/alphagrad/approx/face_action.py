@@ -2,23 +2,32 @@
 
 WHY THIS MODULE EXISTS
 ----------------------
-One face decision used to be described by hand in FOUR places that had to
-agree or PPO broke silently:
+One face decision used to be written out by hand in SEVEN places that had to
+agree or PPO broke silently. The four the 2026-09-11 brief named:
 
 1. ``heads.FaceAction`` -- the fields ``UnifiedFacePolicy.sample`` emits;
 2. ``ppo.Trajectory`` -- ten ``face_*`` leaves the rollout stored;
-3. ``ppo.TrainBatch`` + ``Agent._face_replay`` -- the ten leaves the loss
-   re-assembled into a ``FaceAction`` before re-scoring it;
-4. ``Agent.to_env_action_dynamic`` -- where the fields become the env's
+3. ``ppo.TrainBatch`` + ``Agent.evaluate``'s ``FaceAction(...)`` rebuild -- the
+   ten leaves the loss re-assembled before re-scoring them;
+4. ``Agent.to_env_action_dynamic`` -- where eight of them become the env's
    ``(F, S, 3)`` wire rows.
 
-plus two more nobody counted: ``ppo._zero_face_action`` and
-``common.face_buckets.pad_face_outputs``, each of which restated all ten
-fields AND their canonical inactive values.
+and three nobody had counted, each restating the names AND the canonical
+inactive values a second and third time:
 
-Adding a field meant six edits. FORGETTING THE THIRD IS SILENT: ``evaluate``
-then scores a variable ``sample`` never drew, no error is raised, and the PPO
-ratio simply drifts off 1. That failure mode is what this module deletes.
+5. ``ppo._zero_face_action``;
+6. ``common.face_buckets.pad_face_outputs``;
+7. ``Agent._face_loop``'s ``wire0`` carry init.
+
+(``Agent._face_row_specs`` restated use 4's eight argument names a second time
+as well.)
+
+FORGETTING NUMBER 3 IS SILENT: ``evaluate`` then scores a variable ``sample``
+never drew, no error is raised, no shape disagrees, and the PPO ratio simply
+drifts off 1 while every number the run reports stays plausible. That failure
+mode is what this module deletes -- and it deletes it for uses 2 and 3
+STRUCTURALLY: the carriers hold the record as ONE leaf, so there is no list of
+ten names left to keep in step.
 
 WHAT IS DECLARED AND WHAT IS DERIVED
 ------------------------------------
@@ -420,13 +429,15 @@ def check(fa, mode: str | None = None, max_faces: int | None = None, *,
     mode = _mode(mode)
     tag = f" ({where})" if where else ""
     if max_faces is None:
-        skip = getattr(fa, "skip", None)
-        if skip is None:
+        # `skip` is the one field present at every width and always `(F,)`, so
+        # it is the only honest place to infer the face count from.
+        shape = np.shape(getattr(fa, "skip", None))
+        if len(shape) != 1:
             raise ValueError(
-                f"face action record{tag} has no `skip`, so its face count "
-                f"cannot be inferred; pass max_faces explicitly.")
-        max_faces = int(np.asarray(getattr(skip, "shape", ())[0]
-                                  if getattr(skip, "shape", ()) else 0))
+                f"face action record{tag}: `skip` has shape {shape}, expected "
+                f"(MAX_FACES,), so the face count cannot be inferred. Pass "
+                f"max_faces explicitly.")
+        max_faces = int(shape[0])
     F, S = int(max_faces), n_slots(mode)
     for f in FACE_ACTION_FIELDS:
         x = getattr(fa, f.name, None)
