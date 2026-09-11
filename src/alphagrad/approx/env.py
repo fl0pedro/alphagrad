@@ -5085,36 +5085,27 @@ def face_slot_sites() -> tuple[tuple[str, ...], ...]:
     DERIVED by calling the entry builder itself with tagging probes rather
     than restated, so the two cannot drift.
 
-    EVERY ARM IS DERIVED, AND THEY MUST AGREE. The two ``--approx-add`` arms
-    differ only in what sits at ``jr`` -- a join policy or nothing -- and a
-    policy is not a slot hook and answers to no mask, so the SLOT topology is
-    the same under both. Deriving both and requiring equality is what makes
-    ``choose`` answerable here at all: its arm is a per-face decision, so there
-    is no single configuration to ask, and an answer that depended on the arm
-    would be a per-slot mask depending on a bit drawn in the same forward pass
-    -- finding 72's fault 2 with a new face. That raises rather than being
-    averaged over.
+    DERIVED WITH ``need_join=False``, and that is the whole reason this function
+    can answer under EVERY ``--approx-add`` value including ``choose``. The join
+    position holds a POLICY or nothing; a policy is not a slot hook, applies no
+    wire row and answers to no mask, so it contributes no site and the slot
+    topology cannot depend on which arm runs. Asking for an arm here would be
+    asking a question this function does not need the answer to -- and under
+    ``choose`` the arm is a per-face bit that the mask, which runs BEFORE the
+    draw, does not have.
+
+    If a future value ever put a SLOT HOOK at a join site, it would appear here
+    automatically, because the site list is whatever the entry builder tags --
+    never a restatement.
     """
-    def _derive(mode):
-        got: list[list[str]] = [[], [], []]
+    got: list[list[str]] = [[], [], []]
 
-        def _tag(site, hook):
-            got[int(hook)].append(site)
-            return hook
+    def _tag(site, hook):
+        got[int(hook)].append(site)
+        return hook
 
-        face_entry_from_slots((0, 1, 2), at_site=_tag, mode=mode)
-        return tuple(tuple(g) for g in got)
-
-    per_arm = {m: _derive(m) for m in APPROX_ADD_FIXED}
-    sites = set(per_arm.values())
-    if len(sites) != 1:
-        raise RuntimeError(
-            f"the --approx-add arms place a slot's HOOKS at different sites: "
-            f"{per_arm}. Then a per-slot mask would depend on which arm ran, "
-            f"and under 'choose' that arm is a bit drawn in the same forward "
-            f"pass as the slot rows -- ticket dsnn-3qm.59 fault 2. It must be "
-            f"designed for, not averaged over.")
-    return sites.pop()
+    face_entry_from_slots((0, 1, 2), at_site=_tag, need_join=False)
+    return tuple(tuple(g) for g in got)
 
 
 def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
