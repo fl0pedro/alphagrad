@@ -221,7 +221,7 @@ def _row_to_wire(op, i, j, axis, dtype_idx, n_out):
 
 
 
-def _walk_one_graph(target, seed, slots_on=None):
+def _walk_one_graph(target, seed, slots_on=None, pass_="vertex"):
     """One sampled plan with the mask and the apply ON THE SAME GRAPH.
 
     ``_walk`` keeps the production pair of graphs; this owns a single
@@ -253,6 +253,16 @@ def _walk_one_graph(target, seed, slots_on=None):
     own masks, so ``S`` calls with progressively filled mask rows draw exactly
     what one call with all of them draws -- pinned by
     ``test_the_per_slot_draws_equal_one_joint_draw``.
+
+    THE MASK IS THE EXACT PER-VERTEX ONE SINCE #77. ``decide_vertex_faces``
+    runs NO speculative elimination: it forces the ``n`` in-edge and ``m``
+    out-edge Jacobians ONCE each, applies the drawn operand rows through the
+    apply path's own hook, and composes each face's ``res:new`` structure with
+    ``graphax.contract_face_operands`` -- THE FUNCTION ``_eliminate_vertex``
+    ITSELF CALLS. ``pass_="decide"`` selects finding 75's chooser pass (one
+    speculative elimination per vertex) instead, which is what the
+    learned-join-slot arm still needs and what
+    ``test_the_two_passes_draw_the_same_rows`` compares against.
     """
     from graphax import IncrementalPathTokenizer
     from alphagrad.approx.env import face_slot_sites
@@ -333,7 +343,10 @@ def _walk_one_graph(target, seed, slots_on=None):
             requested[_OP_KIND[op]] += 1
             return w
 
-        dec = lf.decide_faces(tk, v, keys, _draw, skips=skips)
+        if pass_ == "vertex":
+            dec = lf.decide_vertex_faces(tk, v, _draw, skips=skips)
+        else:
+            dec = lf.decide_faces(tk, v, keys, _draw, skips=skips)
         per_face = _face_dict_for_vertex(config, tk.ij, v, dec.rows, skips)
         arm_face_counts()
         try:
@@ -343,7 +356,7 @@ def _walk_one_graph(target, seed, slots_on=None):
 
     out = dict(envmod._PER_FACE_STATS)
     out.update({f"lf_{k}": v for k, v in lf.consume_stats().items()
-                if k.startswith("decide") and v})
+                if (k.startswith("decide") or k.startswith("vertex")) and v})
     envmod._PER_FACE_STATS.clear()
     return requested, out
 
@@ -385,6 +398,19 @@ def _assert_no_rejection(walk, target, label, slots_on=None):
         f"{label}: the decide pass's own apply refused "
         f"{stats['lf_decide_self_skip']} rows it had just cleared")
     assert int(stats.get("lf_decide_multi_site", 0)) == 0, stats
+    # #77's pass carries the same self-check, and two more: a face-key collision
+    # RAISES (so a non-zero count could only mean the raise was caught) and a
+    # `lossy` join armed only by slot 2 would have been masked under the wrong
+    # `_is_approx_cfg`.
+    assert int(stats.get("lf_vertex_self_skip", 0)) == 0, (
+        f"{label}: the vertex pass's own apply refused "
+        f"{stats['lf_vertex_self_skip']} rows it had just cleared")
+    assert int(stats.get("lf_vertex_key_collision", 0)) == 0, stats
+    assert int(stats.get("lf_vertex_flag_flip", 0)) == 0, stats
+    assert int(stats.get("lf_vertex_probe_fail", 0)) == 0, (
+        f"{label}: the vertex pass failed on "
+        f"{stats['lf_vertex_probe_fail']} vertices, so its mask rows are "
+        f"whatever it had taken before the failure")
 
 
 def _walk(target, seed, slots_on=None):
@@ -1222,3 +1248,380 @@ def test_the_jitted_draw_is_the_eager_draw():
             np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
             n += 1
     assert n == 40 * 5
+
+
+# ==========================================================================
+# #77: THE EXACT PER-VERTEX MASK. The four tests below are the claims the
+# design rests on, in the order they have to hold.
+# ==========================================================================
+def _real_res_tensors(lf, tk, vertex, keys, rows, skips):
+    """``{(f, s): the tensor the REAL elimination hands that slot's hook}``.
+
+    The recorders are installed THROUGH ``env.face_entry_from_slots`` -- the one
+    place a face wire becomes a graphax entry -- so the sites recorded are by
+    construction the sites the measurement installs; hard-coding the entry form
+    in a second place is finding 72's fault 1 exactly.
+
+    ``transforms=()``, which is what ``IncrementalJaxpr.eliminate(v, (), ft)``
+    passes, so ``_is_approx_cfg`` comes from
+    ``graphax.face_config_is_approx(face_transforms)`` and not from a probe's
+    per-vertex callable. That matters: arming it would compare the pass against
+    a THIRD code path (it gates the reconciler peel and the re-evaluation of
+    ``need_contract``), and under ``--approx-add lossless`` the measurement runs
+    with it OFF.
+    """
+    from jax._src import core as _jcore
+    from graphax.core import _eliminate_vertex
+    from alphagrad.approx.env import (
+        face_entry_from_slots, make_slot_frame_hook, wire_slots)
+    from alphagrad.approx.live_faces import _Snapshot
+
+    S = wire_slots()
+    seen: dict = {}
+
+    def _wrap(f, s):
+        row = tuple(int(x) for x in rows[f, s])
+        inner = None if row[0] == -1 else make_slot_frame_hook(row)
+
+        def _h(st):
+            seen.setdefault((f, s), st)
+            return st if inner is None else inner(st)
+        return _h
+
+    ft = {}
+    for f in range(min(len(keys), MAX_FACES)):
+        if int(np.asarray(skips).reshape(-1)[f]) == 1:
+            continue
+        ft[keys[f]] = face_entry_from_slots(
+            tuple(_wrap(f, s) for s in range(S)), with_policy=False)
+    with _Snapshot(tk) as snap:
+        ij = snap.ij
+        with _jcore.set_current_trace(ij.trace):
+            _eliminate_vertex(int(vertex), ij.jaxpr, ij.graph, ij.tgraph,
+                              ij.vo, False, transforms=(),
+                              face_transforms=ft)
+    return seen
+
+
+@pytest.mark.parametrize("target_name", ["tlm", "nn256"])
+def test_the_structural_contraction_is_the_apply_paths_own(target_name, tlm,
+                                                           nn256):
+    """THE CLAIM THAT MAKES #77 SOUND: the composed structure IS the real one.
+
+    ``decide_vertex_faces`` computes ``res:new``'s mask from
+    ``graphax.prepare_face_operands`` + ``graphax.contract_face_operands``
+    applied to the decided operands, WITHOUT running an elimination. Those two
+    functions are the two halves of ``_eliminate_vertex``'s own contraction --
+    lifted out of it and called BY it -- so the mask is not a second copy of the
+    structure algebra. A second copy is what produced finding 72's fault 1 (6 of
+    32 Diag rows the mask cleared refused at apply time), so "not a second copy"
+    has to be a measurement and not an assurance.
+
+    ON EVERY FACE AND EVERY CONTRACTION SLOT, with the decided rows installed:
+    the five ``SlotLegality`` fields the pass recorded against
+    ``masks.slot_legality`` on the tensor the real elimination hands that slot's
+    hook. Field by field, not just ``sizes``: ``pair`` is the ``(N, N)`` Diag
+    mask and it is the field a storage difference moves (finding 72's first
+    disagreeing field was ``pair``, with ``sizes`` and ``n_out`` identical).
+
+    A face graphax never visits -- an edge Jacobian that forces to ``None``,
+    which ``faces_of`` lists optimistically -- must be ABSENT ON BOTH SIDES: the
+    real elimination never invokes its hook and the pass must leave an all-zero
+    mask row, i.e. offer nothing. Counted separately so the test cannot pass by
+    comparing nothing.
+    """
+    from graphax import IncrementalPathTokenizer
+    from alphagrad.approx.common.masks import slot_legality
+
+    target = {"tlm": tlm, "nn256": nn256}[target_name]
+    jaxpr, consts, args, argnums = target
+    vv = _valid_vertices(jaxpr, args, consts, argnums)
+    order = markowitz_order(jaxpr, argnums, consts, args, vv)
+    F = MAX_FACES
+    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+                        max_faces=F, max_axes=N_AX)
+    tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
+                                  vocab_size=512)
+    tk.base_tokens()
+    config = SimpleNamespace(jaxpr=jaxpr)
+    pol, tables = _policy(F)
+    feats = _features()
+    ctx = jnp.zeros((pol.embd_dim,), jnp.float32)
+    draw_jit = _jit_draw(pol, feats, ctx, tables)
+
+    compared = both_absent = 0
+    bad = []
+    for n in range(len(order)):
+        v = int(order[n])
+        keys = list(tk.ij.faces(v))
+        skips = np.zeros((F,), np.int32)
+        sizes = np.zeros((F, FACE_SLOTS, N_AX), np.int32)
+        pair = np.zeros((F, FACE_SLOTS, N_AX, N_AX), np.float32)
+        comp = np.zeros((F, FACE_SLOTS, N_AX), np.float32)
+        quant = np.zeros((F, FACE_SLOTS, 2), np.float32)
+
+        def _draw(f, s, L, _n=n):
+            sizes[f, s] = L.sizes
+            pair[f, s] = L.pair.astype(np.float32)
+            comp[f, s] = L.comp.astype(np.float32)
+            quant[f, s] = L.quant.astype(np.float32)
+            key = jrand.PRNGKey(_n * 97 + f)
+            _sk, op_t, ii, jj, dt = draw_jit(
+                key, f, jnp.asarray(pair[f]), jnp.asarray(comp[f]),
+                jnp.asarray(sizes[f]), jnp.asarray(quant[f]))
+            op = int(np.asarray(op_t)[s])
+            if op == OP_NONE:
+                return None
+            ii, jj, dt = np.asarray(ii), np.asarray(jj), np.asarray(dt)
+            return _row_to_wire(op, ii[s], jj[s], ii[s], dt[s], L.n_out)
+
+        dec = lf.decide_vertex_faces(tk, v, _draw, skips=skips)
+        real = _real_res_tensors(lf, tk, v, keys, dec.rows, skips)
+        for f in range(min(len(keys), F)):
+            for s in range(FACE_SLOTS):
+                st = real.get((f, s))
+                if st is None:
+                    zero = not (np.asarray(dec.sizes[f, s]).any()
+                                or np.asarray(dec.pair[f, s]).any()
+                                or np.asarray(dec.comp[f, s]).any()
+                                or np.asarray(dec.quant[f, s]).any())
+                    assert zero, (
+                        f"vertex {v} face {f} slot {s}: the real elimination "
+                        f"never invoked this hook, but the pass offered a "
+                        f"non-empty mask for it")
+                    both_absent += 1
+                    continue
+                L = slot_legality(st, N_AX)
+                got = (np.asarray(dec.sizes[f, s]), int(dec.nout[f, s]),
+                       np.asarray(dec.pair[f, s]) > 0.5,
+                       np.asarray(dec.comp[f, s]) > 0.5,
+                       np.asarray(dec.quant[f, s]) > 0.5)
+                want = (L.sizes, L.n_out, L.pair, L.comp, L.quant)
+                for name, g, w in zip(
+                        ("sizes", "n_out", "pair", "comp", "quant"), got, want):
+                    compared += 1
+                    if not np.array_equal(np.asarray(g), np.asarray(w)):
+                        bad.append(
+                            f"vertex {v} face {f} slot {s} field {name}: "
+                            f"composed {np.asarray(g).tolist()} != real "
+                            f"{np.asarray(w).tolist()} (real val.shape="
+                            f"{None if st.val is None else st.val.shape}, "
+                            f"dtype={st.dtype}, rows="
+                            f"{[tuple(int(x) for x in dec.rows[f, q]) for q in range(FACE_SLOTS)]})")
+        per_face = _face_dict_for_vertex(config, tk.ij, v, dec.rows, skips)
+        tk.ij.eliminate(v, (), per_face or None)
+
+    assert compared > 0, "nothing was compared -- vacuous"
+    assert not bad, (
+        f"{len(bad)} of {compared} field comparisons disagree between the "
+        f"composed structure and the tensor the real apply path hands the hook "
+        f"({both_absent} (face, slot) pairs absent on both sides). The "
+        f"structure algebra has a second copy after all:\n  "
+        + "\n  ".join(bad[:12]))
+
+
+def test_faces_of_is_face_specs_of_projected(tlm):
+    """ONE ENUMERATION. ``face_specs_of`` is the loop and ``faces_of`` is its
+    projection onto ``key``, so a caller that needs a face's OPERANDS cannot
+    drift from the key list ``_eliminate_vertex`` looks up. Checked at every
+    vertex of a real order, because the graph is rewired by every elimination
+    and the two could agree on the first one and not the fifty-first.
+
+    The same walk counts the MULTI-OUTPUT FACE-KEY COLLISION ``faces_of``'s
+    docstring calls rare. Measured on TLM and nn256 under minimum Markowitz
+    (finding 77): ZERO eliminated equations have more than one output variable
+    at all, so the collision's PRECONDITION never occurs -- which is why
+    ``decide_vertex_faces`` raises on a collision rather than widening the key.
+    A target that did collide would otherwise have one wire row configure two
+    faces and one mask row describe two tensors, silently.
+    """
+    from graphax import IncrementalPathTokenizer
+    from graphax.core import face_specs_of, faces_of
+
+    jaxpr, consts, args, argnums = tlm
+    vv = _valid_vertices(jaxpr, args, consts, argnums)
+    order = markowitz_order(jaxpr, argnums, consts, args, vv)
+    tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
+                                  vocab_size=512)
+    tk.base_tokens()
+    n_faces = n_multi = n_collide = 0
+    for v in order:
+        v = int(v)
+        g, tg = tk.ij.graph, tk.ij.tgraph
+        specs = face_specs_of(g, tg, v, jaxpr)
+        assert [sp.key for sp in specs] == faces_of(g, tg, v, jaxpr), v
+        assert [sp.f for sp in specs] == list(range(len(specs))), v
+        for sp in specs:
+            assert sp.central in g, (v, sp)
+            assert sp.in_edge in (tg.get(sp.central) or {}), (v, sp)
+            assert sp.out_edge in g[sp.central], (v, sp)
+        n_faces += len(specs)
+        if len({id(sp.central) for sp in specs}) > 1:
+            n_multi += 1
+        if len({sp.key for sp in specs}) != len(specs):
+            n_collide += 1
+        tk.ij.eliminate(v, (), None)
+    assert n_faces > 0
+    assert n_multi == 0, (
+        f"{n_multi} vertices have more than one LIVE output variable on TLM; "
+        f"finding 77 measured 0, so the collision precondition has appeared "
+        f"and decide_vertex_faces's raise may now fire")
+    assert n_collide == 0, f"{n_collide} vertices have a repeated face key"
+
+
+def test_the_vertex_pass_runs_no_elimination(tlm):
+    """THE "NO SPECULATIVE ELIMINATION" CLAIM, AS COUNTERS.
+
+    The pass is supposed to cost ``n`` in-edge forces + ``m`` out-edge forces +
+    ``n*m`` structural contractions per vertex and NOT one elimination, so the
+    three terms of the proof are counted and the elimination counters of the two
+    other passes must be untouched. ``n + m <= 2 * n*m`` with equality only at
+    ``n == m == 1`` is the cheap algebraic check that the operand probes are
+    DEDUPLICATED -- the whole point of re-seeding from ``_pre_raw`` /
+    ``_post_raw`` being a per-neighbour read rather than a per-face one.
+    """
+    from graphax import IncrementalPathTokenizer
+
+    jaxpr, consts, args, argnums = tlm
+    vv = _valid_vertices(jaxpr, args, consts, argnums)
+    order = markowitz_order(jaxpr, argnums, consts, args, vv)
+    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+                        max_faces=MAX_FACES, max_axes=N_AX)
+    tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
+                                  vocab_size=512)
+    tk.base_tokens()
+    faces = 0
+    for v in order:
+        v = int(v)
+        faces += len(list(tk.ij.faces(v)))
+        lf.decide_vertex_faces(tk, v, lambda f, s, L: None,
+                               skips=np.zeros((MAX_FACES,), np.int32))
+        tk.ij.eliminate(v, (), None)
+    st = lf.consume_stats()
+    assert st["vertex_probe"] == len(order), st
+    assert st["vertex_probe_fail"] == 0, st
+    for dead in ("size_probe", "slot_probe", "decide_probe"):
+        assert st[dead] == 0, (
+            f"{dead} = {st[dead]}: the vertex pass ran a speculative "
+            f"elimination, which is the thing it exists not to do. {st}")
+    nm = st["vertex_contractions"]
+    npm = st["vertex_operand_probes"]
+    assert nm > 0 and npm > 0, st
+    assert nm + st["vertex_face_absent"] == faces, (nm, st, faces)
+    assert npm <= 2 * nm, (
+        f"{npm} operand probes for {nm} faces: the in-edge and out-edge "
+        f"Jacobians are not being forced once each. {st}")
+
+
+def test_the_vertex_pass_refuses_the_learned_join_slots(tlm):
+    """IT SAYS SO RATHER THAN ANSWERING. ``res:jr`` (the old edge) and
+    ``res:jres`` (the summed edge) are the two tensors the #77 proof does NOT
+    cover: an earlier face's merge WRITES the edge a later face's ``jr`` reads,
+    so they are not a function of a face's own operands and no per-face
+    composition can reach them. Measured, finding 75: 3 of 594 and 20 of 741
+    rows the static mask cleared are refused there.
+
+    ``decide_faces`` -- one speculative elimination per vertex, every slot a
+    chooser -- is the pass for those, and it is kept for exactly this reason;
+    the learned-join assertions above are what exercise it.
+    """
+    from graphax import IncrementalPathTokenizer
+
+    jaxpr, consts, args, argnums = tlm
+    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+                        max_faces=MAX_FACES, max_axes=N_AX)
+    tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
+                                  vocab_size=512)
+    tk.base_tokens()
+    prev = os.environ.get(envmod._APPROX_ADD_ENV)
+    try:
+        for want, n_slots in (("lossless", 3), ("learned1", 4),
+                              ("learned2", 5)):
+            os.environ[envmod._APPROX_ADD_ENV] = want
+            assert envmod.wire_slots() == n_slots, want
+            if n_slots == FACE_SLOTS:
+                lf.decide_vertex_faces(tk, int(1), lambda f, s, L: None)
+                continue
+            with pytest.raises(NotImplementedError, match="res:jr"):
+                lf.decide_vertex_faces(tk, int(1), lambda f, s, L: None)
+    finally:
+        if prev is None:
+            os.environ.pop(envmod._APPROX_ADD_ENV, None)
+        else:
+            os.environ[envmod._APPROX_ADD_ENV] = prev
+
+
+def test_the_two_passes_draw_the_same_rows(tlm):
+    """#77's pass and #75's pass DECIDE THE SAME PLAN.
+
+    Both are exact, so they must agree -- and they reach the answer by different
+    routes (a composition of two graphax functions against a whole speculative
+    elimination with choosers), which is what makes the agreement evidence
+    rather than a tautology. The draw is made deterministic in ``(f, s)`` and
+    independent of the mask so that a disagreement localises to the MASK: if the
+    two passes offered different legality, the rows would still be equal, and
+    the mask arrays below are what would differ.
+
+    CALL ORDER DIFFERS ON PURPOSE. #75 draws in APPLY order (face 0's lhs, rhs,
+    new, then face 1's), #77 in STAGE order (every face's lhs and rhs, then
+    every face's new). The rows and masks must not depend on that, and this is
+    the test that says so.
+    """
+    from graphax import IncrementalPathTokenizer
+
+    jaxpr, consts, args, argnums = tlm
+    vv = _valid_vertices(jaxpr, args, consts, argnums)
+    order = markowitz_order(jaxpr, argnums, consts, args, vv)
+    rng_rows = {}
+
+    def _mk(seen):
+        def _draw(f, s, L):
+            seen.append((f, s))
+            ax = np.flatnonzero(L.comp)
+            if ax.size == 0:
+                return None
+            # deterministic in (f, s), NOT in call order
+            return (int(envmod.COMPRESS_SENTINEL),
+                    int(ax[(f * 3 + s) % ax.size]), 0)
+        return _draw
+
+    def _run(pass_):
+        lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+                            max_faces=MAX_FACES, max_axes=N_AX)
+        tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts),
+                                      list(args), vocab_size=512)
+        tk.base_tokens()
+        config = SimpleNamespace(jaxpr=jaxpr)
+        out = []
+        for v in order:
+            v = int(v)
+            keys = list(tk.ij.faces(v))
+            skips = np.zeros((MAX_FACES,), np.int32)
+            seen: list = []
+            if pass_ == "vertex":
+                dec = lf.decide_vertex_faces(tk, v, _mk(seen), skips=skips)
+            else:
+                dec = lf.decide_faces(tk, v, keys, _mk(seen), skips=skips)
+            out.append((dec.rows.copy(), dec.sizes.copy(), dec.nout.copy(),
+                        dec.pair.copy(), dec.comp.copy(), dec.quant.copy(),
+                        int(dec.n_faces), sorted(seen)))
+            per_face = _face_dict_for_vertex(config, tk.ij, v, dec.rows, skips)
+            tk.ij.eliminate(v, (), per_face or None)
+        return out
+
+    a, b = _run("vertex"), _run("decide")
+    assert len(a) == len(b)
+    names = ("rows", "sizes", "nout", "pair", "comp", "quant", "n_faces",
+             "draw set")
+    diffs = []
+    for n, (x, y) in enumerate(zip(a, b)):
+        for name, xi, yi in zip(names, x, y):
+            same = (xi == yi if name in ("n_faces", "draw set")
+                    else np.array_equal(xi, yi))
+            if not same:
+                diffs.append(f"step {n} vertex {int(order[n])} field {name}")
+    assert sum(int(x[6]) for x in a) > 0, "no faces -- vacuous"
+    assert not diffs, (
+        f"{len(diffs)} per-vertex fields differ between the #77 structural pass "
+        f"and the #75 chooser pass; both claim to be exact, so at most one of "
+        f"them is:\n  " + "\n  ".join(diffs[:20]))

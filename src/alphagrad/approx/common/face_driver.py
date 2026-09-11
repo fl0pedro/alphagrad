@@ -31,6 +31,7 @@ from alphagrad.approx.live_faces import LiveFaceStream
 __all__ = [
     "build_live_face_stream",
     "make_face_callbacks",
+    "make_face_vertex_decide_callback",
     "bind_step_callbacks",
     "EdgeSlotTable",
 ]
@@ -457,20 +458,33 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
     the in-edge and out-edge Jacobians, 0 rejections of 36 requests -- and WRONG
     for ``res:new``, which holds their product: 6 of 26 Diag and 4 of 40 Reduce
     rows the mask cleared are refused at apply time once the operands are armed,
-    against 0 of 27 with ``new`` armed alone.
+    against 0 of 27 with ``new`` armed alone. On the production draw convention
+    (all three slots from one head call) the same defect measures 23 of 526 rows
+    over 5 seeds, and BOTH exact passes --
+    :meth:`~alphagrad.approx.live_faces.LiveFaceStream.decide_faces` and
+    :meth:`~alphagrad.approx.live_faces.LiveFaceStream.decide_vertex_faces` --
+    measure 0 of 522 on the same walk.
 
-    :meth:`LiveFaceStream.decide_faces` is the fix and it is NOT wired here. It
-    inverts the control flow: the head must be called from the host decide pass,
-    once per (face, slot), because slot 2's mask does not exist until slots 0 and
-    1 have been decided AND APPLIED, whereas this callback hands the device face
-    loop every mask up front. The rollout-shaped fix needs no host head call --
-    ``res:new``'s tensor is the contraction of THIS face's own two operands and
-    nothing else, so a SECOND pass over the same device loop, fed a mask
-    refreshed by one ``decide_faces`` call with slots 0 and 1 pinned to the rows
-    pass 1 drew, is correct for it -- and it needs the ``(F, S, 3)`` spec rows
-    out of ``UnifiedPolicy._face_loop``, which currently discards them. That is
-    transport in the same place ``--approx-add choose`` and the learned join
-    slots wait at, and it is deliberately not half-landed here.
+    THE FIX IS :func:`make_face_vertex_decide_callback`, WHICH IS NOT WIRED
+    HERE EITHER, and the reason is transport rather than design. Slot 2's mask
+    does not exist until slots 0 and 1 are decided and applied, so an exact mask
+    cannot be handed to the device loop UP FRONT, which is the only shape this
+    callback has. Either the decision moves to the host (one call per vertex,
+    rows and masks out together -- that callback) or a second host call
+    refreshes slot 2 after a first device pass (two round trips; finding 75
+    section 8 costed that shape at 7.06 ms/vertex by composition). The one-call
+    shape is the cheaper of the two AND the exact one, and it is affordable
+    because :meth:`LiveFaceStream.decide_vertex_faces` runs NO speculative
+    elimination and therefore takes its draws outside any jaxpr trace -- the
+    ``jax.ensure_compile_time_eval`` escape finding 75's chooser design needed is
+    what cost it 8.957 ms/vertex on the head channel.
+
+    What neither can do without ``ppo.py``: ``UnifiedPolicy._face_loop`` decides
+    on device inside a ``lax.while_loop`` and DISCARDS the ``(F, S, 3)`` spec
+    rows it computes. A host decision has to replace that loop's draw, or a
+    device refresh has to read its rows. That is the same transport
+    ``--approx-add choose`` and the learned join slots wait at, and it is
+    deliberately not half-landed here.
     """
     F, N = int(max_faces), int(max_axes)
     # THE TRAINER CONSUMES THE CONTRACTION BAND ONLY, and says so.
@@ -562,6 +576,142 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
              jax.ShapeDtypeStruct((F, S), jnp.int32)),
             order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
             vmap_method="broadcast_all")
+
+    return _cb
+
+
+def make_face_vertex_decide_callback(live_faces, *, max_faces, max_axes,
+                                     draw, prof_sink=None):
+    """``cb(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
+    skips, draw_args...)`` -> ``(rows (F,S,3) int32, sizes (F,S,N) int32,
+    quant (F,S,2) f32, pair (F,S,N,N) f32, comp (F,S,N) f32, n_out (F,S) int32,
+    n_faces ())``.
+
+    ONE HOST CALL PER VERTEX, and the rows come back WITH the masks.
+
+    WHY THE ROWS AND THE MASKS IN ONE CALL. Slot 2's tensor IS the contraction
+    of slots 0 and 1, so its mask does not exist until they are decided
+    (dsnn-3qm.59 fault 2, measured: 23 of 526 rows the STATIC mask cleared are
+    refused at apply time). A mask callback that runs before the draw therefore
+    cannot answer for slot 2, and a second callback after the draw is a second
+    host round trip per vertex -- the shape finding 75 section 8 costed at
+    7.06 ms/vertex by composition. Taking the DRAW inside the one call removes
+    the round trip instead of adding one, and it is affordable for exactly one
+    reason: :meth:`~alphagrad.approx.live_faces.LiveFaceStream.decide_vertex_faces`
+    runs NO speculative elimination, so nothing here is inside a jaxpr trace and
+    the draw pays no ``jax.ensure_compile_time_eval``. That escape -- not the
+    head's arithmetic -- is what cost finding 75's chooser design 8.957
+    ms/vertex on the head channel against the static mask's 0.437.
+
+    ``draw`` is a HOST callable ``draw(f, s, legality, *args) -> row | None``,
+    where ``args`` are the extra (already-concrete) arrays the callback was
+    handed after ``skips``. It is called once per (face, slot) the pass reaches,
+    in stage order: every face's slot 0 and slot 1, then every face's slot 2.
+    A slot's draw is conditioned on nothing but its OWN mask row
+    (``UnifiedFaceHead.sample`` gives slot ``s`` its own key slice and its own
+    logit block; 0 of 252 field cells differed between per-slot and joint draws,
+    finding 75), which is what makes the stage split produce the joint draw's
+    own sample and keeps PPO's stored log-prob over the variable that was acted
+    on.
+
+    THE MASKS ARE RETURNED BECAUSE PPO HAS TO STORE THEM. The loss replay
+    re-reads ``face_pair_valid`` / ``face_comp_valid`` / ``face_sizes`` /
+    ``face_quant`` verbatim and never recomputes them, so the arrays the
+    behaviour policy masked with are the arrays ``evaluate`` must rescore with.
+
+    NOT WIRED INTO THE ROLLOUT HERE, and the reason is transport, not design:
+    ``UnifiedPolicy._face_loop`` draws on device inside a ``lax.while_loop`` and
+    discards the ``(F, S, 3)`` spec rows it computes, and that loop is not this
+    module's to restructure. What this callback needs from it is the loop
+    REPLACED by this one call's ``rows`` -- the decision moves to the host, and
+    the log-prob / entropy / arity rescore runs on device from the returned
+    masks, which is the same ``evaluate`` path the loss already uses.
+    """
+    F, N = int(max_faces), int(max_axes)
+    from alphagrad.approx.env import FACE_SLOTS as _CONTRACTION_SLOTS
+    from alphagrad.approx.env import face_slot_sites as _sites
+    S = int(_CONTRACTION_SLOTS)
+    _topology = _sites()
+    # The same prefix assertion `make_face_slot_legality_callback` carries, and
+    # for the same reason: `decide_vertex_faces` answers the CONTRACTION band
+    # only, so if a future value reordered the bands this would hand the head
+    # masks belonging to other tensors.
+    if tuple(x[0] for x in _topology[:S]) != ("lhs", "rhs", "res:new"):
+        raise RuntimeError(
+            f"the contraction slots are no longer the prefix of the face slot "
+            f"topology ({_topology}).")
+    if len(_topology) != S:
+        raise NotImplementedError(
+            f"decide_vertex_faces answers the {S} contraction slots; this "
+            f"--approx-add gives the face {len(_topology)} ({_topology}). The "
+            f"OLD EDGE (res:jr) and the SUMMED EDGE (res:jres) depend on "
+            f"SIBLING faces' decisions, so they are not a function of a face's "
+            f"own operands: use LiveFaceStream.decide_faces for those.")
+    _perf = None
+    if prof_sink is not None:
+        import time as _time
+        _perf = _time.perf_counter
+
+    def _one(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
+             skips, args):
+        dec = live_faces.vertex_face_decisions(
+            order, spec_hist, int(np.asarray(step_count)),
+            int(np.asarray(vertex_idx)) + 1,
+            lambda f, s, L: draw(f, s, L, *args),
+            skips=np.asarray(skips),
+            face_rows_hist=face_hist, face_skips_hist=skip_hist)
+        return (np.asarray(dec.rows, np.int32)[:F, :S, :3],
+                np.asarray(dec.sizes, np.int32)[:F, :S, :N],
+                np.asarray(dec.quant, np.float32)[:F, :S, :2],
+                np.asarray(dec.pair, np.float32)[:F, :S, :N, :N],
+                np.asarray(dec.comp, np.float32)[:F, :S, :N],
+                np.asarray(dec.nout, np.int32)[:F, :S],
+                np.asarray(dec.n_faces, np.int32))
+
+    def _host(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
+              skips, *args):
+        _t0 = _perf() if _perf is not None else None
+        try:
+            _order = np.asarray(order)
+            if _order.ndim == 1:
+                return _one(order, spec_hist, step_count, vertex_idx,
+                            face_hist, skip_hist, skips, args)
+            B = _order.shape[0]
+            outs = (np.full((B, F, S, 3), -1, np.int32),
+                    np.zeros((B, F, S, N), np.int32),
+                    np.zeros((B, F, S, 2), np.float32),
+                    np.zeros((B, F, S, N, N), np.float32),
+                    np.zeros((B, F, S, N), np.float32),
+                    np.zeros((B, F, S), np.int32),
+                    np.zeros((B,), np.int32))
+            outs[0][..., 2] = 0
+            _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
+            _vi, _sk = np.asarray(vertex_idx), np.asarray(skips)
+            _fh, _kh = np.asarray(face_hist), np.asarray(skip_hist)
+            _a = [np.asarray(x) for x in args]
+            for i in range(B):
+                got = _one(_order[i], _sh[i], _sc[i], _vi[i], _fh[i], _kh[i],
+                           _sk[i], tuple(x[i] for x in _a))
+                for dst, src in zip(outs, got):
+                    dst[i] = src
+            return outs
+        finally:
+            if _perf is not None:
+                prof_sink("faces.vertex_decide", _perf() - _t0)
+
+    def _cb(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
+            skips, *args):
+        return jax.pure_callback(
+            _host,
+            (jax.ShapeDtypeStruct((F, S, 3), jnp.int32),
+             jax.ShapeDtypeStruct((F, S, N), jnp.int32),
+             jax.ShapeDtypeStruct((F, S, 2), jnp.float32),
+             jax.ShapeDtypeStruct((F, S, N, N), jnp.float32),
+             jax.ShapeDtypeStruct((F, S, N), jnp.float32),
+             jax.ShapeDtypeStruct((F, S), jnp.int32),
+             jax.ShapeDtypeStruct((), jnp.int32)),
+            order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
+            skips, *args, vmap_method="broadcast_all")
 
     return _cb
 
