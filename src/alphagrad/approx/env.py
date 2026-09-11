@@ -1541,6 +1541,38 @@ def _plan_face_delta(before: dict | None, after: dict | None) -> dict:
     }
 
 
+def _encode_face_joins(face_joins, face_specs, face_skips):
+    """The plan log's ``face_joins`` column: ``[[ [face, mode], ... ], ...]``.
+
+    ONE entry per (vertex, face) whose join bit actually DECIDED something --
+    a face that is not skipped and carries at least one live slot row, which is
+    exactly the condition :func:`_face_dict_for_vertex` builds an entry under
+    and therefore the only place the bit is read. Sparse for the same reason
+    ``plan_log.encode_wires`` is: ``MAX_FACES`` is a provable bound (2538 on the
+    flagship) against a measured ~1.24 live faces per vertex, so a dense row
+    would be >99% padding.
+
+    ``None`` under every ``--approx-add`` value that FIXES the join semantics;
+    the record's ``approx_add`` column answers for the whole plan there.
+    """
+    if face_joins is None:
+        return None
+    fj = np.asarray(face_joins)
+    fs = np.asarray(face_specs)
+    fk = np.asarray(face_skips)
+    out = []
+    for k in range(fj.shape[0]):
+        row = []
+        for f in range(min(fj.shape[1], fs.shape[1])):
+            if int(fk[k, f]) == 1:
+                continue
+            if not np.any(fs[k, f, :, 0] != -1):
+                continue
+            row.append([f, join_mode_of_bit(fj[k, f])])
+        out.append(row)
+    return out
+
+
 def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
                           reward_vec, face_before, face_after,
                           counts_from_trace: bool,
@@ -1584,11 +1616,8 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             # computation. Per eliminated vertex, live faces only, as
             # "lossy"/"lossless" names rather than raw bits so the record does
             # not depend on JOIN_LOSSY's numeric value.
-            "face_joins": (
-                None if face_joins is None else
-                [[join_mode_of_bit(b) for b in row]
-                 for row in np.asarray(face_joins)[
-                     :, :_plan_log_max_faces()].tolist()]),
+            "face_joins": _encode_face_joins(
+                face_joins, face_specs, face_skips),
             # WHICH quantity reward slot 5 holds (ticket .49) and BOTH
             # memory numbers of this plan's timed executable, so a record
             # can be re-scored on the other channel without a re-measure.
