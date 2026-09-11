@@ -310,32 +310,37 @@ def test_a_row_array_at_the_WRONG_width_is_refused_by_the_env(monkeypatch, mode)
                                skip, join)).state
 
 
-def test_loss_drop_on_a_NON_SCALAR_target_is_REFUSED_BY_NAME_not_by_TypeError():
-    """``--quality-metric loss_drop`` needs a scalar loss, and SAYS SO.
+def test_loss_drop_on_a_NON_SCALAR_target_is_refused_AT_SETUP_by_ppo():
+    """``--quality-metric loss_drop`` needs a scalar loss, and ppo says so EARLY.
 
-    The walk's first step is ``float(target_fun(...))``. An analytic AD
-    benchmark's target is a full Jacobian, so that used to raise
-    ``TypeError: Only scalar arrays can be converted to Python scalars`` five
-    frames inside a host callback at the FIRST TERMINAL measurement, naming
-    neither the flag nor the example -- which is how a launcher carrying that
-    combination looked like a wire regression on every ``--approx-add`` value at
-    once (measured 2026-09-11: it failed identically on the base).
+    The walk's first step is ``float(target_fun(...))``, so an analytic AD
+    benchmark -- whose target is a full Jacobian -- used to reach it with a
+    rank-1 output and die as ``TypeError: Only scalar arrays can be converted to
+    Python scalars`` five frames inside a host callback at the first terminal
+    measurement, naming neither the flag nor the example. That is how a launcher
+    carrying the pair looked like a face-wire regression on every
+    ``--approx-add`` value at once (it failed identically on the base).
 
-    THE REFUSAL LIVES WHERE THE WALK IS, NOT IN THE NAME RESOLVER.
-    ``quality_metric`` is a pure name -> metric map and
-    ``tests/quality_metric_names_test.py`` pins it as one for BOTH target kinds;
-    putting a validity check there broke that contract to say something it does
-    not claim. ``_loss_drop_quality`` is the function that needs the scalar loss,
-    so it is the function that refuses -- with a NAMED ValueError, never a
-    ``return None`` (which means "the walk is undefined for this env" and is
-    answered with a warning) and never a reshape.
+    THE CHECK IS IN ppo, AND TWO EARLIER PLACEMENTS IN env WERE WRONG:
+    ``quality_metric()`` is a pure name -> metric map that
+    ``tests/quality_metric_names_test.py`` deliberately pins for BOTH target
+    kinds; and ``_loss_drop_quality`` answers "the walk is undefined for this
+    env" with ``None`` plus a loud warning, so raising there broke seven
+    ``walk_heldout_test`` cases that hand it a stub config. ``env`` also cannot
+    answer the question reliably -- ``EnvConfig.scalar_target`` is False for
+    plenty of genuinely scalar targets, because it is only set when
+    ``measure_grad`` / ``scalar_target`` is passed. The fact lives in
+    ``ppo._has_scalar_loss(args.example)``.
     """
     import inspect
-    src = inspect.getsource(envmod._loss_drop_quality)
-    assert "scalar_target" in src, (
-        "_loss_drop_quality no longer checks EnvConfig.scalar_target, so a "
-        "non-scalar target reaches float(target_fun(...)) again")
-    # The name resolver's contract is UNCHANGED, both kinds, by construction.
+    from alphagrad.approx import ppo as _ppo
+    src = inspect.getsource(_ppo.main)
+    assert "needs a SCALAR-LOSS target" in src, (
+        "ppo.main no longer refuses --quality-metric loss_drop on a "
+        "non-scalar-loss example, so the run dies at the first terminal "
+        "measurement with a TypeError instead")
+    # env is UNTOUCHED on both counts: the name resolver still answers for both
+    # target kinds, and the walk still answers "undefined" with None.
     for kind in (True, False):
         cfg = type("C", (), {"scalar_target": kind})()
         old = os.environ.get("ALPHAGRAD_QUALITY_METRIC")
@@ -347,6 +352,7 @@ def test_loss_drop_on_a_NON_SCALAR_target_is_REFUSED_BY_NAME_not_by_TypeError():
                 os.environ.pop("ALPHAGRAD_QUALITY_METRIC", None)
             else:
                 os.environ["ALPHAGRAD_QUALITY_METRIC"] = old
+    assert "SCALAR-LOSS" not in inspect.getsource(envmod._loss_drop_quality)
 
 
 def test_no_scalar_conversion_is_applied_to_a_WHOLE_record_field():

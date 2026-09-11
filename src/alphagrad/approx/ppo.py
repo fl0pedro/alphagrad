@@ -6431,6 +6431,40 @@ def main():
     # measurement time was the graph mismatch that produced the old stack's
     # zero-gradient bug.
     _scalar_target = _has_scalar_loss(args.example)
+    # --quality-metric loss_drop NEEDS A SCALAR LOSS, AND THIS IS WHERE WE KNOW.
+    #
+    # The walk's first step is `float(target_fun(...))` (env._loss_drop_quality),
+    # so an analytic AD benchmark -- Helmholtz / RoeFlux / Lighthouse / RobotArm
+    # / BlackScholes / Simple, whose target is a full Jacobian -- reaches it with
+    # a RANK-1 output and dies as `TypeError: Only scalar arrays can be
+    # converted to Python scalars`, five frames inside a host callback, at the
+    # FIRST TERMINAL measurement, naming neither the flag nor the example.
+    # Measured 2026-09-11: `--example Helmholtz --quality-metric loss_drop`
+    # failed exactly that way on every --approx-add value, on the base too, and
+    # read like a face-wire regression. `campaign_launchers/a4_smoke.sbatch`
+    # still carries the pair.
+    #
+    # REFUSED HERE, NOT IN env. Two earlier attempts put the check in env and
+    # both were wrong: `quality_metric()` is a pure NAME -> METRIC map that
+    # `tests/quality_metric_names_test.py` deliberately pins for BOTH target
+    # kinds, and `_loss_drop_quality` answers "the walk is undefined for this
+    # env" with `None` plus a loud warning -- raising there broke seven
+    # `walk_heldout_test` cases that hand it a stub config, and
+    # `EnvConfig.scalar_target` is False for plenty of genuinely scalar targets
+    # because it is only set when `measure_grad`/`scalar_target` is passed. The
+    # fact this check needs is `_has_scalar_loss(args.example)`, which exists
+    # only here, and a flag that dies at SETUP is the repo's stated preference.
+    if str(getattr(args, "quality_metric", "")).strip().lower() in (
+            "loss_drop", "lossdrop", "walk") and not _scalar_target:
+        raise SystemExit(
+            f"--quality-metric loss_drop needs a SCALAR-LOSS target, and "
+            f"--example {args.example} is not one: the walk scores "
+            f"`float(target_fun(...))` and this target's output is a full "
+            f"Jacobian, so the run would die inside the first terminal "
+            f"measurement with a TypeError naming neither the flag nor the "
+            f"example. Use --quality-metric jac_cosine for the analytic AD "
+            f"benchmarks, or `auto`, which reads the same fact and picks "
+            f"jac_cosine by itself.")
     target_fn = get_fn(args.example)
     xs = get_args(args.example, args_key, dataset=dataset_for_call)
     gen = data_gen(
