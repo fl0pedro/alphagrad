@@ -448,6 +448,29 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
     the live path with per-slot masks, and ``n_out`` feeds the wire encoder.
     All but ``n_out`` enter the head's masks and are stored, so the loss
     re-masks with exactly what the behaviour policy masked with.
+
+    THESE MASKS ARE STATIC, AND THAT IS STILL A KNOWN DEFECT FOR SLOT 2
+    (dsnn-3qm.59 fault 2, finding 75). ``face_slot_legality`` reads every slot's
+    tensor from ONE recording probe per vertex in which no decision has been
+    made. Measured on TLM, minimum Markowitz, 5 seeds, through the real apply
+    path: that is EXACT for ``lhs`` and ``rhs`` -- nothing at this vertex moves
+    the in-edge and out-edge Jacobians, 0 rejections of 36 requests -- and WRONG
+    for ``res:new``, which holds their product: 6 of 26 Diag and 4 of 40 Reduce
+    rows the mask cleared are refused at apply time once the operands are armed,
+    against 0 of 27 with ``new`` armed alone.
+
+    :meth:`LiveFaceStream.decide_faces` is the fix and it is NOT wired here. It
+    inverts the control flow: the head must be called from the host decide pass,
+    once per (face, slot), because slot 2's mask does not exist until slots 0 and
+    1 have been decided AND APPLIED, whereas this callback hands the device face
+    loop every mask up front. The rollout-shaped fix needs no host head call --
+    ``res:new``'s tensor is the contraction of THIS face's own two operands and
+    nothing else, so a SECOND pass over the same device loop, fed a mask
+    refreshed by one ``decide_faces`` call with slots 0 and 1 pinned to the rows
+    pass 1 drew, is correct for it -- and it needs the ``(F, S, 3)`` spec rows
+    out of ``UnifiedPolicy._face_loop``, which currently discards them. That is
+    transport in the same place ``--approx-add choose`` and the learned join
+    slots wait at, and it is deliberately not half-landed here.
     """
     F, N = int(max_faces), int(max_axes)
     # THE TRAINER CONSUMES THE CONTRACTION BAND ONLY, and says so.

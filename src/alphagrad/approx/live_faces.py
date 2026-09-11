@@ -1109,6 +1109,14 @@ class LiveFaceStream:
         row in each one's frame. A merge-free face has no old edge, graphax
         never reaches its join position, the probe records no tensor for that
         site, and its mask is unchanged.
+       
+        EVERY ROW HERE IS READ BEFORE ANY DECISION IS MADE, and for the three
+        DEPENDENT sites that is stale rather than wrong -- see
+        :meth:`decide_faces`, which is the same question asked in apply order.
+        This method stays, and stays memoised, because its answer is a pure
+        function of the prefix and because the two OPERAND rows it produces are
+        exact (measured: 0 rejections of 36 requests with ``lhs`` and ``rhs``
+        armed). ``res:new`` / ``res:jr`` / ``res:jres`` are not.
         """
         from alphagrad.approx.common.masks import slot_legality
         from alphagrad.approx.env import face_slot_sites

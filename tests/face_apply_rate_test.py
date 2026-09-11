@@ -257,6 +257,13 @@ def _walk_one_graph(target, seed, slots_on=None):
             pair[f, s] = L.pair.astype(np.float32)
             comp[f, s] = L.comp.astype(np.float32)
             quant[f, s] = L.quant.astype(np.float32)
+            if s >= FACE_SLOTS:
+                # A LEARNED join slot. This walk is the CONTRACTION claim and
+                # the policy has per-slot features for three slots only
+                # (`_face_masks` loops `range(FACE_SLOTS)`), so the mask row is
+                # recorded above -- which is what proves it CAN be -- and
+                # nothing is drawn. `_walk_join_slots` is the arm that draws it.
+                return None
             if slots_on is not None and _SLOT_SITES[s] not in slots_on:
                 return None
             key = jrand.PRNGKey(seed * 1000003 + _n * 97 + f)
@@ -382,6 +389,13 @@ def _walk(target, seed, slots_on=None):
             pair[f, s] = L.pair.astype(np.float32)
             comp[f, s] = L.comp.astype(np.float32)
             quant[f, s] = L.quant.astype(np.float32)
+            if s >= FACE_SLOTS:
+                # A LEARNED join slot. This walk is the CONTRACTION claim and
+                # the policy has per-slot features for three slots only
+                # (`_face_masks` loops `range(FACE_SLOTS)`), so the mask row is
+                # recorded above -- which is what proves it CAN be -- and
+                # nothing is drawn. `_walk_join_slots` is the arm that draws it.
+                return None
             if slots_on is not None and _SLOT_SITES[s] not in slots_on:
                 return None
             key = jrand.PRNGKey(seed * 1000003 + _n * 97 + f)
