@@ -32,16 +32,27 @@ The idempotent re-request is NOT a rejection and not a win either: the hook
 applies it and nothing changes (masks.rule_is_idempotent_noop). It lands in
 ``applied_<kind>``, so the test reports the honest split beside the counts.
 
-THE MASK IS DYNAMIC SINCE #75 (2026-09-11). Every walk here decides its slots
-through ``LiveFaceStream.decide_faces``: ONE speculative elimination per vertex
-in which each slot is a graphax chooser that reads ``masks.slot_legality`` off
-the tensor in hand, draws, and applies the decided row through the apply path's
-own hook, so the next site sees what the measurement will see. The four cases
-that used to be STRICT xfails naming dsnn-3qm.59 fault 2 -- `res:new` with the
-operands armed on TLM and on nn256, `res:jr` and `res:jres` with the contraction
-slots armed -- are ASSERTIONS now. The five that remain are the DUPLICATED GRAPH,
-a separate open defect the dynamic mask cannot touch because the mask and the
-apply run on two graphs there.
+THE MASK IS DYNAMIC SINCE #75 AND EXACT PER VERTEX SINCE #77 (2026-09-11). The
+four cases that used to be STRICT xfails naming dsnn-3qm.59 fault 2 -- `res:new`
+with the operands armed on TLM and on nn256, `res:jr` and `res:jres` with the
+contraction slots armed -- are ASSERTIONS, and they are reached by TWO different
+passes on purpose:
+
+* the two ``res:new`` claims go through ``LiveFaceStream.decide_vertex_faces``
+  (#77): NO speculative elimination, ``n`` in-edge forces + ``m`` out-edge
+  forces + ``n*m`` calls of ``graphax.contract_face_operands`` -- the function
+  ``_eliminate_vertex`` itself calls -- with the operand rows drawn first and
+  applied through the apply path's own hook. Sound because the face ->
+  written-edge map of one vertex elimination is a BIJECTION, so no face's
+  operands depend on another face's decision;
+* the two learned-join claims go through ``LiveFaceStream.decide_faces`` (#75):
+  ONE speculative elimination per vertex with every slot a graphax chooser.
+  ``res:jr`` and ``res:jres`` DO depend on sibling faces -- an earlier face's
+  merge writes the edge a later face's ``jr`` reads -- so the bijection says
+  nothing about them and the per-vertex composition refuses to answer.
+
+The five that remain xfailing are the DUPLICATED GRAPH, a separate open defect
+neither pass can touch because the mask and the apply run on two graphs there.
 
 ONE HEAD CALL PER (face, slot), not one per face, because slot ``s``'s mask does
 not exist until slots before it have been decided and applied. That changes no
@@ -830,13 +841,20 @@ def test_learned2_alone_rejects_nothing(tlm):
 # be applied to. `LiveFaceStream.decide_faces` takes the whole vertex's decisions
 # inside ONE speculative elimination in which every slot is a graphax chooser, so
 # learned1 sees the old edge AS THE EARLIER FACE'S MERGE LEFT IT and learned2 the
-# sum of this face's own approximated addends. Measured, job __JOB_SRC__, TLM,
-# min-Markowitz, 5 seeds, the same walk run twice in one process with only the
-# mask source changed:
+# sum of this face's own approximated addends. Measured, finding 75 job 64889,
+# TLM, min-Markowitz, 5 seeds, the same walk run twice in one process with only
+# the mask source changed:
 #
 #   armed        static: requested / rejected     dynamic: requested / rejected
-#   0,1,2,3        __S2B__                          __S2A__
-#   0,1,2,4        __S3B__                          __S3A__
+#   0,1,2,3        594 / 3                          595 / 0
+#   0,1,2,4        741 / 20                         734 / 0
+#
+# THESE TWO STAY ON `decide_faces`, and that is not laziness. `res:jr` and
+# `res:jres` are the two tensors #77's per-vertex composition does NOT reach: an
+# earlier face's merge WRITES the edge a later face's `jr` reads, so they are
+# not a function of a face's own operands. `decide_vertex_faces` raises rather
+# than answering for them -- see
+# `test_the_vertex_pass_refuses_the_learned_join_slots`.
 #
 # The request counts move because the dynamic mask is a DIFFERENT mask -- it
 # clears what the live tensor allows, not what an all-exact graph allowed -- so
@@ -883,9 +901,20 @@ def test_learned2_rejects_nothing_with_the_contraction_slots_armed(tlm):
 # meet. The head is called once per (face, slot) instead of once per face, which
 # changes no draw -- see `test_the_per_slot_draws_equal_one_joint_draw`.
 #
-# MEASURED, job __JOB_SRC__, TLM, 5 seeds, the same walk twice in one process:
-#   static  __S1B__
-#   dynamic __S1A__
+# AND SINCE #77 THE MASK NEEDS NO SPECULATIVE ELIMINATION AT ALL. `_walk_one_graph`
+# decides through `decide_vertex_faces`: n in-edge forces + m out-edge forces +
+# n*m calls of `graphax.contract_face_operands`, the function `_eliminate_vertex`
+# itself calls.
+#
+# MEASURED, job 64928, TLM, min-Markowitz, 5 seeds, one process, one machine, the
+# SAME walk with only the mask source changed (`.../probes/t77vertexmask/t77_vertex.py`):
+#   static (one recording probe per vertex)  526 requested, 15 REJECTED
+#   decide (#75, one elimination, choosers)  522 requested,  0 REJECTED
+#   vertex (#77, no elimination)             522 requested,  0 REJECTED
+# and on nn256, 97/2 -> 96/0 -> 96/0. The #77 pass's composed `res:new` structure
+# agreed with the tensor the real apply path hands the hook on 2145 of 2145
+# per-(face, slot) mask fields on TLM and 495 of 495 on nn256
+# (`test_the_structural_contraction_is_the_apply_paths_own`).
 # --------------------------------------------------------------------------
 def test_tlm_every_slot_rejects_nothing_on_one_graph(tlm):
     _assert_no_rejection(_walk_one_graph, tlm, "tlm one-graph all slots")
