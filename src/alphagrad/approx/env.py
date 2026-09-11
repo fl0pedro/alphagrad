@@ -6081,6 +6081,7 @@ def _callback(
     h.update(np.asarray(face_specs, dtype=np.int32).tobytes())
     h.update(np.asarray(face_skips, dtype=np.int32).tobytes())
     h.update(int(stop).to_bytes(4, "little", signed=False))
+    h.update(b"sparse" if bool(config.sparse) else b"dense")
     # Include the shape signature of args_for_lower so we don't
     # collide across rollouts that share (order, specs) but differ
     # in batch shape.
@@ -6191,6 +6192,7 @@ def _callback(
     # on. Bit-identical result, strictly more cache-friendly.
     h_ex = hashlib.blake2b(digest_size=16)
     h_ex.update(np.asarray(partial_order, dtype=np.int32).tobytes())
+    h_ex.update(b"sparse" if bool(config.sparse) else b"dense")
     for a in args_for_lower:
         if hasattr(a, "shape") and hasattr(a, "dtype"):
             h_ex.update(repr(a.shape).encode())
@@ -6215,6 +6217,7 @@ def _callback(
     _rev_order = sorted(o_list, reverse=True)
     h_rf = hashlib.blake2b(digest_size=16)
     h_rf.update(np.asarray(_rev_order, dtype=np.int32).tobytes())
+    h_rf.update(b"sparse" if bool(config.sparse) else b"dense")
     for a in args_for_lower:
         if hasattr(a, "shape") and hasattr(a, "dtype"):
             h_rf.update(repr(a.shape).encode())
