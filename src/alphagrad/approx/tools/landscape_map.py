@@ -152,6 +152,12 @@ def make_argparser() -> argparse.ArgumentParser:
     # Elimination order (default: markowitz per owner ruling)
     p.add_argument("--order", choices=["markowitz", "reverse"], default="markowitz",
                    help="Elimination order to evaluate approximations on (default: markowitz).")
+    p.add_argument("--ref-order", choices=["reverse", "same"], default="reverse",
+                   help="Order of the paired exact reference (default: reverse per owner ruling Q8/Q19).")
+    p.add_argument("--oracle-b", action="store_true",
+                   help="Oracle B (ticket .63): verify sparse vs dense "
+                        "(sparse_representation=False) for a sampled handful "
+                        "of plans per class.")
     p.add_argument("--exec-on-gpu", action="store_true")
     p.add_argument("--cmp-type", default="latency")
     # The launchers (run_campaign_2node.sh:144, run_campaign_gpu2node.sh)
@@ -1188,6 +1194,8 @@ CSV_FIELDS = [
     # ALPHAGRAD_NEW_SLOT_JOIN=0 (the R1-R3 / face_attrib / forensics launchers
     # did -- see UNBIASED_PARETO_AND_MEASUREMENT.md sec 7(c)).
     "approx_add",
+    "order",
+    "ref_order",
 ]
 
 
@@ -1211,6 +1219,8 @@ def config_stamp(args):
         "config_note": args.config_note,
         "quality_metric": str(args.quality_metric),
         "approx_add": str(args.approx_add),
+        "order": str(getattr(args, "order", "markowitz")),
+        "ref_order": str(getattr(args, "ref_order", "reverse")),
         # WHICH PHYSICAL DEVICE measured this row. If plan A and plan B are
         # measured by different actors, a systematic per-device offset lands
         # straight in PPO's within-batch advantage comparison.
@@ -1321,7 +1331,9 @@ def summarise(rows):
 
 def write_markdown(path, summ, notes, args, extra):
     L = []
-    L.append(f"# Approximation landscape on the {getattr(args, 'order', 'markowitz')} order\n")
+    ref_name = getattr(args, "ref_order", "reverse")
+    cand_order = getattr(args, "order", "markowitz")
+    L.append(f"# Approximation landscape on the {cand_order} order (reference: {ref_name}-exact)\n")
     L.append(f"- target: `{args.example}` / `{args.dataset}` "
              f"(hidden {args.hidden_dim}, layers {args.num_layers}, "
              f"vocab {args.vocab_size})")
@@ -1329,10 +1341,10 @@ def write_markdown(path, summ, notes, args, extra):
              f"(scalar-loss target, "
              f"quality={args.quality_metric}, walk {args.walk_steps} steps)")
     L.append(f"- {args.reps} INDEPENDENT paired trials per plan; every "
-             f"candidate measured back-to-back with its own exact reference "
+             f"candidate measured back-to-back with the paired {ref_name}-exact reference "
              f"and reported as a RATIO")
     L.append("")
-    L.append("## Ratios (candidate / its own paired exact reference)\n")
+    L.append(f"## Ratios (candidate / paired {ref_name}-exact reference)\n")
     L.append("")
     L.append("`rules applied / skipped` is how many face rules graphax "
              "actually landed vs silently dropped as not fitting their "
@@ -1655,6 +1667,34 @@ def combined_report(args):
                      {k for k in (prim or summ) if k.startswith("arch:")})
 
 
+def run_oracle_b(env, eval_samples, order, plans):
+    """Oracle B: verify sparse vs dense (sparse_representation=False) for a
+    small sample of plans per class (ticket dsnn-3qm.63, owner Q21)."""
+    import copy
+    print("[landscape] running Oracle B (sparse vs dense representation check)...", flush=True)
+    sampled = {}
+    for op in ("skip", "quant", "compress", "diag"):
+        for pid, pl in plans.items():
+            if pl["op"] == op:
+                sampled[op] = (pid, pl)
+                break
+    dense_cfg = env.config._replace(sparse=False)
+    env_dense = copy.copy(env)
+    object.__setattr__(env_dense, "config", dense_cfg)
+    oracle_b_results = {}
+    for op, (pid, pl) in sampled.items():
+        m_sp = measure(env, eval_samples, order, pl)
+        m_de = measure(env_dense, eval_samples, order, pl)
+        q_sp = m_sp["quality"]
+        q_de = m_de["quality"]
+        diff = abs(q_sp - q_de)
+        print(f"  [oracle-b] {op:8s} ({pid[:32]}): sparse_q={q_sp:.6f} dense_q={q_de:.6f} diff={diff:.2e}", flush=True)
+        assert diff < 1e-3, f"Oracle B failed for {pid}: sparse quality {q_sp} != dense quality {q_de} (diff {diff})"
+        oracle_b_results[pid] = {"op": op, "sparse_quality": q_sp, "dense_quality": q_de, "diff": diff}
+    print("[landscape] Oracle B: all checked classes passed!", flush=True)
+    return oracle_b_results
+
+
 # ---------------------------------------------------------------------------
 def main():
     args = ARGS
@@ -1676,8 +1716,9 @@ def main():
         order = markowitz_order(env)
     else:
         order = rev_order(env)
-    print(f"[landscape] {len(order)} valid vertices; {args.order} order "
-          f"{order[:6].tolist()}...{order[-3:].tolist()}", flush=True)
+    ref_order = rev_order(env) if getattr(args, "ref_order", "reverse") == "reverse" else order
+    print(f"[landscape] {len(order)} valid vertices; candidate {args.order} order "
+          f"{order[:6].tolist()}...{order[-3:].tolist()}, reference {getattr(args, 'ref_order', 'reverse')} order", flush=True)
 
     INV = None
     if args.face_inventory or args.inventory_only or args.singleton_sweep \
@@ -1907,6 +1948,9 @@ def main():
         print("[landscape] --dry-run: nothing measured", flush=True)
         return
 
+    if getattr(args, "oracle_b", False):
+        run_oracle_b(env, eval_samples, order, plans)
+
     # --- measure ------------------------------------------------------------
     done = load_done(csv_path)
     stamp = config_stamp(args)
@@ -1924,6 +1968,16 @@ def main():
         nonlocal stop
         # WARMUP
         for w in range(args.warmup_trials):
+            ref_key = ("__reference__", -1 - w, "warmup")
+            if ref_key not in done and _budget_left():
+                try:
+                    m_ref = measure(env, eval_samples, ref_order, ident_plan)
+                    done[ref_key] = m_ref
+                    print(f"[landscape] warmup reference ({getattr(args, 'ref_order', 'reverse')}-exact) "
+                          f"lat={m_ref['latency_ns']:.0f}ns ({m_ref['wall_s']:.1f}s)", flush=True)
+                except Exception:
+                    traceback.print_exc()
+                    print("[landscape] WARMUP FAILED for reference", flush=True)
             for pid, plan in sub_plans.items():
                 key = (pid, -1 - w, "warmup")
                 if key in done or not _budget_left():
@@ -1959,7 +2013,7 @@ def main():
                     break
                 porder = sub_orders[pid]
                 for role, use_plan, use_order in (
-                        ("reference", ident_plan, order),
+                        ("reference", ident_plan, ref_order),
                         ("candidate", plan, porder)):
                     key = (pid, trial, role)
                     if key in done:

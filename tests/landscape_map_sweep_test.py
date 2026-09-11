@@ -165,3 +165,23 @@ def test_shard_partitioning(helmholtz_setup):
 
     orig_non_ident = set(k for k in plans if k != "identity")
     assert all_sharded_non_ident == orig_non_ident
+
+
+def test_ref_order_defaults_to_reverse():
+    """The default reference order is rev_order (ticket dsnn-3qm.63, owner Q8/Q19)."""
+    parser = make_argparser()
+    args = parser.parse_args(["--singleton-sweep"])
+    assert args.order == "markowitz"
+    assert args.ref_order == "reverse"
+
+
+def test_oracle_b_sparse_vs_dense(helmholtz_setup):
+    """Oracle B: verify sparse vs dense representation agreement on sampled plans (dsnn-3qm.63)."""
+    from alphagrad.approx.tools.landscape_map import run_oracle_b
+    env, eval_samples, order, inv = helmholtz_setup
+    plans, _ = build_singleton_sweep_plans(env, order, inv)
+    results = run_oracle_b(env, eval_samples, order, plans)
+    assert len(results) == 4
+    for pid, res in results.items():
+        assert res["diff"] < 1e-3, f"Oracle B failed for {pid}: diff={res['diff']}"
+
