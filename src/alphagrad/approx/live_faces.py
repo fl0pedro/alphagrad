@@ -1321,6 +1321,26 @@ class LiveFaceStream:
         t75_feas, question 3: 0 of 252 field cells differed between ``S``
         sequential calls with progressively refined masks and ONE call with all
         of them).
+
+        ``draw`` CANNOT READ A TOKEN CHUNK, and that is a hard limit of this
+        shape rather than an omission. :meth:`chunk_ex` builds face ``f``'s chunk
+        by calling :meth:`_tokenizer_at` and then :meth:`_decided` and running a
+        whole speculative elimination of its own, inside its own
+        :class:`_Snapshot` on the same tokenizer -- so calling it from inside
+        this pass would truncate THIS pass's equations out from under it. A
+        caller that needs the ``--live-faces`` interleave (read face ``f``'s
+        contraction tokens, THEN approximate face ``f``) must therefore use this
+        pass as a mask REFRESH rather than as the single decision point: draw
+        slots 0 and 1 in the per-face loop that reads the chunks, call this with
+        a ``draw`` that returns those rows for slots 0 and 1 and ``None`` for the
+        rest -- which records their masks without deciding them -- and draw the
+        dependent slots in a second pass over the same per-face loop. That is
+        sound for ``res:new`` specifically, because ``res:new`` is the
+        contraction of THIS face's own two operands and of nothing a sibling face
+        touches. It is NOT sound for ``res:jr`` / ``res:jres``, whose tensors
+        depend on sibling faces' decisions, so those two have to be decided in
+        one pass -- which is what the join-slot tests do, and why the trainer
+        does not offer them yet.
         """
         from jax._src import core as _jcore
         import jax as _jax
