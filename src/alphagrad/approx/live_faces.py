@@ -290,6 +290,9 @@ class LiveFaceStream:
                       "vertex_draw": 0, "vertex_face_absent": 0,
                       "vertex_self_skip": 0, "vertex_key_collision": 0,
                       "vertex_flag_undecided": 0, "vertex_flag_flip": 0}
+        # The last exception `decide_vertex_faces` swallowed, as text. See the
+        # `except` there: a failure COUNT is not a diagnosis.
+        self.last_vertex_error: str | None = None
         self._sizes: dict = {}        # (prefix, vertex) -> (sizes, quant, n)
         self._slots: dict = {}        # (prefix, vertex) -> per-slot legality
 
@@ -1712,12 +1715,21 @@ class LiveFaceStream:
                     self._decide_vertex_body(
                         ij, specs, draw, _skipped, demand, N, S,
                         rows, sizes, quant, pair, comp, nout)
-                except Exception:
+                except Exception as exc:
                     # Same contract as `_probe_faces` and `decide_faces`: a
                     # vertex graphax cannot trace has no legal approximation
                     # either, so keep the decisions taken so far (the rest stay
                     # -1 = exact) and never let a probe take the rollout down.
+                    #
+                    # The LAST failure is kept, because "the pass failed on 196
+                    # of 475 vertices" is not a diagnosis and the counter alone
+                    # cannot become one. A probe or test that sees
+                    # `vertex_probe_fail` non-zero can print
+                    # `last_vertex_error` and say WHY.
                     self.stats["vertex_probe_fail"] += 1
+                    self.last_vertex_error = (
+                        f"vertex {int(vertex)}: "
+                        f"{type(exc).__name__}: {exc}")
         finally:
             if approx_dispatch is not None:
                 set_approx_active(prev)
