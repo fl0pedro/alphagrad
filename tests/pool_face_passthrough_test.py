@@ -21,7 +21,7 @@ import numpy as np
 import alphagrad.approx.env as E
 from alphagrad.approx.cpu_approx_worker import CpuApproximationServer
 from alphagrad.approx.env import (
-    EnvConfig, FACE_SLOTS, MAX_FACES, MAX_RULES_PER_VERTEX, _callback,
+    EnvConfig, MAX_FACES, MAX_RULES_PER_VERTEX, _callback, wire_slots,
 )
 
 
@@ -45,7 +45,7 @@ def _wires(V, seed=0):
     order = np.asarray(rng.permutation(np.arange(1, V + 1)), np.int32)
     specs = np.full((V, MAX_RULES_PER_VERTEX, 3), -1, np.int32)
     specs[..., 2] = 0
-    faces = np.full((V, MAX_FACES, FACE_SLOTS, 3), -1, np.int32)
+    faces = np.full((V, MAX_FACES, wire_slots(), 3), -1, np.int32)
     faces[..., 2] = 0
     skips = np.zeros((V, MAX_FACES), np.int32)
     for i in range(V):
@@ -93,7 +93,7 @@ def test_server_without_faces_unchanged():
     cfg, consts, args = _setup()
     V = len(cfg.jaxpr.eqns)
     order, specs, _f, _s = _wires(V, seed=1)
-    empty_f = np.full((V, MAX_FACES, FACE_SLOTS, 3), -1, np.int32)
+    empty_f = np.full((V, MAX_FACES, wire_slots(), 3), -1, np.int32)
     empty_k = np.zeros((V, MAX_FACES), np.int32)
     srv = CpuApproximationServer(SimpleNamespace(
         config=cfg, args=args, consts=consts, eval_args_samples=None))

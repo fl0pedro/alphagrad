@@ -221,19 +221,14 @@ def test_unknown_approx_add_has_no_width():
 
 
 # ===================================================================== B
-@pytest.mark.parametrize("mode", MODES)
-def test_sample_score_parity_is_exactly_zero(mode):
-    """log-prob AND entropy, EXACTLY 0 apart, at every width.
-
-    The failure mode is silent: a field drawn in sample() and forced in
-    score() (or the reverse) just moves the PPO ratio off 1.
-    """
+def _parity_head(mode, n_draws):
+    """sample -> score INSIDE the head: the logits and the FaceFields."""
     lay = head_layout(mode)
     head = _head(mode)
     ctx = _ctx()
     om, im, jm, am = _masks(lay.n_slots)
     dlp, dent = [], []
-    for s in range(120):
+    for s in range(n_draws):
         z, f, lp, ent, ar = head.sample(
             ctx, jrand.PRNGKey(7000 + s), op_mask=om, i_mask=im, j_mask=jm,
             axis_mask=am)
@@ -242,8 +237,73 @@ def test_sample_score_parity_is_exactly_zero(mode):
         dlp.append(abs(float(lp) - float(lp2)))
         dent.append(abs(float(ent) - float(e2)))
         assert float(ar) == float(a2)
-    assert max(dlp) == 0.0, (mode, max(dlp))
-    assert max(dent) == 0.0, (mode, max(dent))
+        # The `choose` bit is part of the decision being scored, so a width
+        # that has one must actually be carrying it here.
+        assert (f.join is None) != lay.has_choose
+    return dlp, dent
+
+
+def _parity_record(mode, n_draws):
+    """sample -> THE ACTION RECORD -> evaluate, through the POLICY.
+
+    THE EXTENSION (2026-09-11, ticket dsnn-3qm.56). The head agreeing with
+    itself is NOT the property PPO needs: `sample` emits an action RECORD that
+    the rollout stores and the loss re-reads, and a field the record drops
+    leaves the head-level parity at exactly 0 while the ratio walks off 1. The
+    `choose` bit was exactly that field -- the head drew it and the wire could
+    not carry it -- so the parity claim is stated at BOTH levels now, with the
+    same numbers and the same name.
+    """
+    from alphagrad.approx.face_action import FaceAction
+    from alphagrad.approx.heads import (
+        AXIS_TAG_BITS, AxisTokenFeatures, precompute_factor_tables)
+    from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
+
+    sizes = (8, 8, 4, 16, 6, 4)
+    sz = jnp.asarray(sizes, jnp.int32)
+    feats = AxisTokenFeatures(
+        size=sz, log_size=jnp.log(jnp.maximum(sz, 1).astype(jnp.float32)),
+        tag_bits=jnp.zeros((len(sizes), AXIS_TAG_BITS), jnp.float32),
+        group_id=-jnp.ones((len(sizes),), jnp.int32),
+        valid_mask=jnp.ones((len(sizes),), jnp.float32))
+    tables = precompute_factor_tables(64)
+    pol = UnifiedFacePolicy(E, num_heads=2, max_faces=2,
+                            key=jrand.PRNGKey(0), approx_add=mode)
+    n = len(sizes)
+    pv = jnp.ones((n, n), jnp.float32)
+    cv = jnp.ones((n,), jnp.float32)
+    dlp, dent = [], []
+    for s in range(n_draws):
+        sk, row, lp, ent, ar, _sp, _od = pol.sample_face(
+            feats, tables, jrand.PRNGKey(7000 + s), 0, pv, cv,
+            jnp.asarray(1.0))
+        fa = FaceAction(skip=jnp.asarray(sk)[None],
+                        **{k: jnp.asarray(v)[None] for k, v in row.items()})
+        lp2, e2, a2, _sp2, _od2 = pol.evaluate_face(
+            feats, tables, fa, 0, pv, cv, jnp.asarray(1.0))
+        dlp.append(abs(float(lp) - float(lp2)))
+        dent.append(abs(float(ent) - float(e2)))
+        assert float(ar) == float(a2)
+    return dlp, dent
+
+
+@pytest.mark.parametrize("level", ["head", "record"])
+@pytest.mark.parametrize("mode", MODES)
+def test_sample_score_parity_is_exactly_zero(mode, level):
+    """log-prob AND entropy, EXACTLY 0 apart, at every width AND at both levels.
+
+    The failure mode is silent: a field drawn in sample() and forced in
+    score() (or the reverse) just moves the PPO ratio off 1.
+
+    ``level="head"``   sample -> score on the logits and the FaceFields.
+    ``level="record"`` sample_face -> the ACTION RECORD -> evaluate_face, i.e.
+                       including the round trip through the wire fields the
+                       rollout stores. This is the level the PPO ratio actually
+                       lives at, and the one the `choose` bit used to fail.
+    """
+    dlp, dent = (_parity_head if level == "head" else _parity_record)(mode, 120)
+    assert max(dlp) == 0.0, (mode, level, max(dlp))
+    assert max(dent) == 0.0, (mode, level, max(dent))
 
 
 @pytest.mark.parametrize("mode", MODES)

@@ -99,7 +99,6 @@ from alphagrad.approx.env import (
     _AXIS_FEAT_IS_COMPRESSED,
     _AXIS_FEAT_IS_OUTPUT,
     _AXIS_FEAT_SIZE,
-    FACE_SLOTS,
     MAX_AXES_PER_VERTEX,
     MAX_FACES as ENV_MAX_FACES,
     MAX_RULES_PER_VERTEX,
@@ -114,6 +113,7 @@ from alphagrad.approx.env import (
     StepAction,
     VertexEliminationEnv,
     micro_actions_to_rule_specs_jax,
+    wire_slots as _env_wire_slots,
 )
 from alphagrad.approx.common import carry_stream as _carry_stream
 from alphagrad.approx.common.face_driver import (
@@ -124,6 +124,8 @@ from alphagrad.approx.common.face_driver import (
     make_face_slot_legality_callback,
 )
 from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
+from alphagrad.approx.face_action import FaceAction
+from alphagrad.approx import face_action as _rec
 from alphagrad.approx.heads import (
     COMPRESS_KINDS,
     MAX_EXPONENT,
@@ -137,7 +139,6 @@ from alphagrad.approx.heads import (
     OP_QUANT,
     QUANT_DTYPES,
     AxisTokenFeatures,
-    FaceAction,
     FacePathPolicy,
     FactorTables,
     MicroAction,
@@ -1119,8 +1120,8 @@ def _causal_quality_mask(face_valid, face_skip, face_op_type):
 
     Shapes: face_valid/face_skip (..., F), face_op_type (..., F, S);
     returns float32 (...,). Computed from the SAME stored batch fields the
-    loss replay consumes (_face_replay reads batch.face_skip /
-    batch.face_op_type), so the rollout-collected and replay-recomputed
+    loss replay consumes (_face_replay reads batch.face_action.skip /
+    .op_type), so the rollout-collected and replay-recomputed
     paths see one identical mask by construction. Pinned by
     tests/credit_fix_test.py.
     """
@@ -1467,19 +1468,15 @@ def _zero_micro_dists(max_substeps, n_axes):
     return op_d, ij_d, ij_d, exp_d, kind_d
 
 
-def _zero_face_action():
-    """Canonical inactive FaceAction (padding faces: no skip, END slots)."""
-    F, S = ENV_MAX_FACES, FACE_SLOTS
-    z2 = jnp.zeros((F, S), jnp.int32)
-    return FaceAction(
-        skip=jnp.zeros((F,), jnp.int32),
-        op_type=jnp.full((F, S), OP_END, dtype=jnp.int32),
-        i=z2, j=z2,
-        exponents=jnp.zeros((F, S, MAX_PRIMES), jnp.int32),
-        factor=z2, compress_kind=z2, quant_dtype=z2,
-        quant_scale_sign=jnp.ones((F, S), jnp.int32),
-        quant_scale_frac=jnp.zeros((F, S), jnp.float32),
-    )
+def _zero_face_action(mode: str | None = None):
+    """Canonical inactive FaceAction (padding faces: no skip, END slots).
+
+    DERIVED: the fields, their dtypes, their slot width and their canonical
+    inactive values are all one column of
+    ``face_action.FACE_ACTION_FIELDS``. This function used to restate all ten
+    by hand, which made it the fifth place a new field had to be added.
+    """
+    return _rec.zeros(mode, ENV_MAX_FACES)
 
 
 # ---------------------------------------------------------------------------
@@ -1617,16 +1614,16 @@ class Trajectory(NamedTuple):
     # stored face masks are the loss's re-masking source (ratio-1), and
     # face_old_logp is the behaviour policy's joint face log-prob (skip gates
     # + slot heads) captured at sample time.
-    face_skip: jax.Array          # (MAX_FACES,) int32
-    face_op_type: jax.Array       # (MAX_FACES, FACE_SLOTS) int32
-    face_i: jax.Array             # (MAX_FACES, FACE_SLOTS) int32
-    face_j: jax.Array             # (MAX_FACES, FACE_SLOTS) int32
-    face_exponents: jax.Array     # (MAX_FACES, FACE_SLOTS, MAX_PRIMES) int32
-    face_factor: jax.Array        # (MAX_FACES, FACE_SLOTS) int32
-    face_compress_kind: jax.Array # (MAX_FACES, FACE_SLOTS) int32
-    face_quant_dtype: jax.Array   # (MAX_FACES, FACE_SLOTS) int32
-    face_quant_scale_sign: jax.Array  # (MAX_FACES, FACE_SLOTS) int32
-    face_quant_scale_frac: jax.Array  # (MAX_FACES, FACE_SLOTS) float32
+    # THE ACTION RECORD, AS ONE LEAF. Declared once in
+    # `face_action.FACE_ACTION_FIELDS`; its fields, dtypes and slot width
+    # (which follows the head's --approx-add layout, not FACE_SLOTS) come from
+    # there. It used to be ten `face_*` leaves restated here AND in TrainBatch
+    # AND re-assembled in `_face_replay` -- three hand-written copies of one
+    # decision, where forgetting the third made `evaluate` score a variable
+    # `sample` never drew with no error anywhere. There is nothing to forget
+    # now: the rollout stores the record the policy returned, and the loss
+    # re-scores that object.
+    face_action: FaceAction
     face_pair_valid: jax.Array    # (MAX_FACES, N, N) float32
     face_comp_valid: jax.Array    # (MAX_FACES, N) float32
     face_valid: jax.Array         # (MAX_FACES,) float32
@@ -1752,16 +1749,8 @@ class TrainBatch(NamedTuple):
     micro_compress_valid: jax.Array  # (MAX_AXES_PER_VERTEX,)
     axis_state: jax.Array  # (total_v, MAX_AXES_PER_VERTEX, AXIS_FEATURE_DIM) int32
     axis_valid_mask: jax.Array  # (total_v, MAX_AXES_PER_VERTEX)
-    face_skip: jax.Array
-    face_op_type: jax.Array
-    face_i: jax.Array
-    face_j: jax.Array
-    face_exponents: jax.Array
-    face_factor: jax.Array
-    face_compress_kind: jax.Array
-    face_quant_dtype: jax.Array
-    face_quant_scale_sign: jax.Array
-    face_quant_scale_frac: jax.Array
+    # ONE leaf, from `face_action.FACE_ACTION_FIELDS` -- see Trajectory.
+    face_action: FaceAction
     face_pair_valid: jax.Array
     face_comp_valid: jax.Array
     face_valid: jax.Array
@@ -1811,6 +1800,17 @@ class TrainBatch(NamedTuple):
     # --per-face-masks (see Trajectory): threaded exactly like face_heads.
     face_sizes: jax.Array = None       # (MAX_FACES, N) int32
     face_quant: jax.Array = None       # (MAX_FACES,) float32
+
+
+# THE FOUR USES MUST AGREE, AND THIS IS WHERE THE CARRIERS ARE CHECKED.
+#
+# Checked AT IMPORT, not only under pytest: a carrier that lost the
+# `face_action` leaf (or grew the flat `face_*` leaves back) would otherwise
+# fail by storing a field the loss never re-scores, and that failure is silent
+# -- the PPO ratio simply leaves 1. `tests/face_action_record_test.py` states
+# the same property per field and per `--approx-add` width.
+_rec.check_carrier(Trajectory, where="the rollout's stored trajectory leaf")
+_rec.check_carrier(TrainBatch, where="the loss-side replay's batch")
 
 
 # ---------------------------------------------------------------------------
@@ -3185,15 +3185,23 @@ class Agent(eqx.Module):
         the axis state's IS_OUTPUT column, which is the VERTEX's; each slot
         gets that column rewritten to its own out rank so ``bi2 = j - n_out``
         is taken in the frame the slot's hook decodes in."""
-        def _one(op, i, j, factor, kind, dtype, qsign, qfrac, ax_st):
+        def _one(*args):
+            *fields, ax_st = args
+            op, i, j, factor, kind, dtype, qsign, qfrac = fields
             return micro_actions_to_rule_specs_jax(
                 op[None], i[None], j[None], factor[None], ax_st,
                 compress_kinds=kind[None], quant_dtypes=dtype[None],
                 quant_scale_signs=qsign[None], quant_scale_fracs=qfrac[None],
             )[0]
 
+        # THE SLOT AXIS IS THE HEAD'S, NOT `FACE_SLOTS`. Under --approx-add
+        # learned1 / learned2 the head decides 4 / 5 slots and the engine
+        # applies 4 / 5 wire rows; broadcasting the frame to 3 would drop the
+        # learned rows silently. `env.wire_slots_of_rows` re-checks the width
+        # one step later, so a mismatch raises rather than passing.
+        _S = self.face_path_policy.n_slots
         if nout_f is None:
-            ax = jnp.broadcast_to(axis_state_v, (FACE_SLOTS,)
+            ax = jnp.broadcast_to(axis_state_v, (_S,)
                                   + tuple(axis_state_v.shape))
         else:
             from alphagrad.approx.env import _AXIS_FEAT_IS_OUTPUT
@@ -3201,17 +3209,27 @@ class Agent(eqx.Module):
                       < jnp.asarray(nout_f, jnp.int32)[:, None]
                       ).astype(axis_state_v.dtype)
             ax = jnp.broadcast_to(
-                axis_state_v, (FACE_SLOTS,) + tuple(axis_state_v.shape)
+                axis_state_v, (_S,) + tuple(axis_state_v.shape)
             ).at[:, :, _AXIS_FEAT_IS_OUTPUT].set(_isout)
+        # USE 4, DERIVED. `translator_names()` is the declaration's own answer
+        # to "which record fields does micro_actions_to_rule_specs_jax take",
+        # so this call and `to_env_action_dynamic`'s cannot pass different
+        # sets -- which they could, and silently, when both listed the eight
+        # names by hand.
         return jax.vmap(_one)(
-            row["op_type"], row["i"], row["j"], row["factor"],
-            row["compress_kind"], row["quant_dtype"],
-            row["quant_scale_sign"], row["quant_scale_frac"], ax,
+            *(row[k] for k in _rec.translator_names()), ax,
         ).astype(jnp.int32)
 
-    _WIRE_KEYS = ("op_type", "i", "j", "exponents", "factor",
-                  "compress_kind", "quant_dtype", "quant_scale_sign",
-                  "quant_scale_frac")
+    def _wire_keys(self):
+        """The per-face wire buffers `_face_loop` carries: every declared field
+        except ``skip``, which it tracks separately.
+
+        DERIVED from the declaration at the RUNNING width, so
+        ``--approx-add choose``'s join bit joins the carry with no edit here.
+        """
+        _names = _rec.names(self.face_path_policy.approx_add)
+        assert _names[0] == "skip", _names
+        return _names[1:]
 
     @staticmethod
     def participation_mask(total_v, owner, face_ends, face_valid):
@@ -3258,7 +3276,9 @@ class Agent(eqx.Module):
         unrolled loop's padding iterations had."""
         pol = self.face_path_policy
         F = pol.max_faces
-        S = FACE_SLOTS
+        # The SHAPE width, which is the head's --approx-add width (3/3/3/4/5),
+        # never `FACE_SLOTS` (always the 3 CONTRACTION slots).
+        S = pol.n_slots
         if getattr(pol, "endpoint_read", False) and endpoint_rows is None:
             raise ValueError(
                 "face_path_policy.endpoint_read is on but endpoint_rows is "
@@ -3272,17 +3292,16 @@ class Agent(eqx.Module):
                 "caller must pass the (K, E) edge-memory read rows "
                 "(az_gumbel does not support --face-edge-mem yet).")
         n = jnp.minimum(jnp.asarray(n_faces, jnp.int32), F)
-        wire0 = (
-            jnp.full((F, S), OP_END, dtype=jnp.int32),     # op_type
-            jnp.zeros((F, S), jnp.int32),                  # i
-            jnp.zeros((F, S), jnp.int32),                  # j
-            jnp.zeros((F, S, MAX_PRIMES), jnp.int32),      # exponents
-            jnp.zeros((F, S), jnp.int32),                  # factor
-            jnp.zeros((F, S), jnp.int32),                  # compress_kind
-            jnp.zeros((F, S), jnp.int32),                  # quant_dtype
-            jnp.ones((F, S), jnp.int32),                   # quant_scale_sign
-            jnp.zeros((F, S), jnp.float32),                # quant_scale_frac
-        )
+        # The carry's initial wire is the CANONICAL INACTIVE RECORD, which the
+        # declaration already defines (it is the same object
+        # `_zero_face_action` and `face_buckets.pad_face_outputs` use). Stating
+        # the nine fills here by hand was the seventh place one decision was
+        # described, and the one place a wrong fill would have been invisible:
+        # a padding face's row is never scored, so only the ENV would have
+        # noticed.
+        _WK = self._wire_keys()
+        _z0 = _rec.zeros(pol.approx_add, F)
+        wire0 = tuple(getattr(_z0, k) for k in _WK)
         W = MAX_DELTA_TOKENS
         st0 = (jnp.asarray(0, jnp.int32), enc_carry, jnp.array(0.0),
                jnp.array(0.0), jnp.zeros((F,), jnp.int32),
@@ -3391,8 +3410,7 @@ class Agent(eqx.Module):
                 None if face_nout is None else face_nout[f]))
             skips = skips.at[f].set(sk.astype(jnp.int32))
             cnts = cnts.at[f].set(ct_eff)
-            wa = tuple(w.at[f].set(row[k])
-                       for w, k in zip(wa, self._WIRE_KEYS))
+            wa = tuple(w.at[f].set(row[k]) for w, k in zip(wa, _WK))
             out = (f + 1, carry, logp + lp, ent + e, skips, cnts, rs, wa,
                    ftok, feqn, off + ct_eff, fends.at[f].set(ends_f))
             if _EM:
@@ -3405,7 +3423,8 @@ class Agent(eqx.Module):
         _st = lax.while_loop(lambda st: st[0] < n, _body, st0)
         (_f, _c, logp, ent, skips, cnts, _rs, wa, ftok, feqn,
          _off, fends) = _st[:12]
-        fa = FaceAction(skip=skips, **dict(zip(self._WIRE_KEYS, wa)))
+        fa = FaceAction(skip=skips, **dict(zip(_WK, wa)))
+        _rec.check(fa, pol.approx_add, F, where="Agent._face_loop")
         # Layout: (fa, logp, ent, cnts, ftok, feqn, fends) then the edge-mem
         # pair (if any) then the face heads (if any) -- heads LAST so the
         # historical `[:7]` / edge `[7:9]` unpacks are untouched.
@@ -3896,9 +3915,17 @@ class Agent(eqx.Module):
                 rule_specs=rule_specs,
             )
 
-        # P1c: one spec row per (face, slot) — the same translator, run on
+        # USE 4: one spec row per (face, slot) — the same translator, run on
         # length-1 sequences; END translates to the all-(-1) unused row.
-        def _one(op, i, j, factor, kind, dtype, qsign, qfrac):
+        #
+        # THE ARGUMENT LIST IS THE DECLARATION'S. `translator_names()` is the
+        # one answer to "which record fields does the translator take", shared
+        # with `_face_row_specs`, so the two cannot pass different sets -- they
+        # could, and silently, when both named the eight fields by hand.
+        _TK = _rec.translator_names()
+
+        def _one(*fields):
+            op, i, j, factor, kind, dtype, qsign, qfrac = fields
             rows = micro_actions_to_rule_specs_jax(
                 op[None], i[None], j[None], factor[None], axis_state_v,
                 compress_kinds=kind[None], quant_dtypes=dtype[None],
@@ -3907,16 +3934,34 @@ class Agent(eqx.Module):
             return rows[0]
 
         face_rows = jax.vmap(jax.vmap(_one))(
-            face_action.op_type, face_action.i, face_action.j,
-            face_action.factor, face_action.compress_kind,
-            face_action.quant_dtype, face_action.quant_scale_sign,
-            face_action.quant_scale_frac,
-        )
+            *(getattr(face_action, k) for k in _TK))
+        # THE PER-FACE CHANNELS ride beside the rows, one field each, never
+        # packed into another field's bits: `face_skip` means "drop this face's
+        # contraction" and `face_join` means "which container the ADD uses",
+        # and a reader of either must not have to know about the other
+        # (env._face_dict_for_vertex says the same where it decodes them).
+        # `face_join` is None at every width without the choose bit, which is
+        # what `env.resolve_join_mode` then answers from the configuration.
+        # A per-face field the declaration gains needs a StepAction channel of
+        # its own, and there is no way to derive that -- so say it HERE, where
+        # the forwarding is written, instead of letting the new decision be
+        # dropped on the way to the env.
+        _PF = set(_rec.per_face_names())
+        if _PF != {"skip", "join"}:
+            raise NotImplementedError(
+                f"face_action.FACE_ACTION_FIELDS declares the per-face fields "
+                f"{sorted(_PF)}; this wire forwards 'skip' and 'join' only. A "
+                f"per-face decision needs its own StepAction channel (packing "
+                f"it into another field's bits would make every reader of that "
+                f"field wrong) and its own env.EnvState history array, as "
+                f"`face_join` / `face_joins` have.")
         return StepAction(
             target_vertex=jnp.asarray(vertex_idx + 1, dtype=jnp.int32),
             rule_specs=rule_specs,
             face_rows=face_rows.astype(jnp.int32),
             face_skip=face_action.skip.astype(jnp.int32),
+            face_join=(None if face_action.join is None
+                       else face_action.join.astype(jnp.int32)),
         )
 
 
@@ -4508,17 +4553,13 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--approx-add",
-        # ONLY THE TWO CONTRACTION-WIDTH VALUES ARE CLI-REACHABLE
-        # (env.APPROX_ADD_CLI). `choose`, `learned1` and `learned2` exist in
-        # env.APPROX_ADD_CHOICES, size the head (95 / 125 / 156 logits) and are
-        # honoured by the engine, but the TRAINER WIRE is unfinished: the
-        # policy's per-slot features and the rollout wire cover the contraction
-        # band only, and `choose` additionally needs FaceAction.join plus the
-        # trajectory and batch fields so the replay scores the bit sample drew.
-        # A run started with one would raise -- at the head's mask-row check or
-        # at the first armed merge face -- and a flag that dies mid-run is worse
-        # than one that is not offered. Offer them when the transport lands
-        # (finding 73 section 9, finding 74).
+        # ALL FIVE VALUES ARE CLI-REACHABLE since 2026-09-11 (env.APPROX_ADD_CLI
+        # is env.APPROX_ADD_CHOICES). The trainer wire that kept `choose`,
+        # `learned1` and `learned2` off the list now exists: the action record
+        # is declared once (alphagrad.approx.face_action) so the join bit
+        # travels through all four of its uses, and every per-slot shape
+        # follows the head's --approx-add width instead of FACE_SLOTS. See
+        # env.APPROX_ADD_CLI for what each value needed.
         choices=list(APPROX_ADD_CLI),
         default=APPROX_ADD_DEFAULT,
         help="THE ADD (ticket .56, finding 73). A face accumulation "
@@ -4532,9 +4573,7 @@ def make_argparser() -> argparse.ArgumentParser:
         "information possible: the sum's support is the UNION of the two "
         "supports, so no non-zero of either addend is dropped (graphax's "
         "sparse + already builds that container: meta gcd, block lcm). "
-        "(Three further values exist in env.APPROX_ADD_CHOICES and are "
-        "honoured by the engine and the head, but are not offered here until "
-        "the trainer wire carries them: choose -- the head picks the container "
+        "(Three further values: choose -- the head picks the container "
         "per face from its own extra Bernoulli; learned1 -- the head gets a "
         "FOURTH slot that approximates the OLD EDGE itself; learned2 -- a "
         "FIFTH that approximates the ADD OUTPUT. The learned values have no "
@@ -6392,6 +6431,40 @@ def main():
     # measurement time was the graph mismatch that produced the old stack's
     # zero-gradient bug.
     _scalar_target = _has_scalar_loss(args.example)
+    # --quality-metric loss_drop NEEDS A SCALAR LOSS, AND THIS IS WHERE WE KNOW.
+    #
+    # The walk's first step is `float(target_fun(...))` (env._loss_drop_quality),
+    # so an analytic AD benchmark -- Helmholtz / RoeFlux / Lighthouse / RobotArm
+    # / BlackScholes / Simple, whose target is a full Jacobian -- reaches it with
+    # a RANK-1 output and dies as `TypeError: Only scalar arrays can be
+    # converted to Python scalars`, five frames inside a host callback, at the
+    # FIRST TERMINAL measurement, naming neither the flag nor the example.
+    # Measured 2026-09-11: `--example Helmholtz --quality-metric loss_drop`
+    # failed exactly that way on every --approx-add value, on the base too, and
+    # read like a face-wire regression. `campaign_launchers/a4_smoke.sbatch`
+    # still carries the pair.
+    #
+    # REFUSED HERE, NOT IN env. Two earlier attempts put the check in env and
+    # both were wrong: `quality_metric()` is a pure NAME -> METRIC map that
+    # `tests/quality_metric_names_test.py` deliberately pins for BOTH target
+    # kinds, and `_loss_drop_quality` answers "the walk is undefined for this
+    # env" with `None` plus a loud warning -- raising there broke seven
+    # `walk_heldout_test` cases that hand it a stub config, and
+    # `EnvConfig.scalar_target` is False for plenty of genuinely scalar targets
+    # because it is only set when `measure_grad`/`scalar_target` is passed. The
+    # fact this check needs is `_has_scalar_loss(args.example)`, which exists
+    # only here, and a flag that dies at SETUP is the repo's stated preference.
+    if str(getattr(args, "quality_metric", "")).strip().lower() in (
+            "loss_drop", "lossdrop", "walk") and not _scalar_target:
+        raise SystemExit(
+            f"--quality-metric loss_drop needs a SCALAR-LOSS target, and "
+            f"--example {args.example} is not one: the walk scores "
+            f"`float(target_fun(...))` and this target's output is a full "
+            f"Jacobian, so the run would die inside the first terminal "
+            f"measurement with a TypeError naming neither the flag nor the "
+            f"example. Use --quality-metric jac_cosine for the analytic AD "
+            f"benchmarks, or `auto`, which reads the same fact and picks "
+            f"jac_cosine by itself.")
     target_fn = get_fn(args.example)
     xs = get_args(args.example, args_key, dataset=dataset_for_call)
     gen = data_gen(
@@ -8350,9 +8423,14 @@ def main():
                         # Cheap (static shapes, trace time) and names the
                         # mistake instead of surfacing it as a broadcast error
                         # 5 frames deep in the head.
-                        _want = (((ENV_MAX_FACES, FACE_SLOTS,
+                        # THE WIRE's width, not FACE_SLOTS: under
+                        # --approx-add learned1 / learned2 the per-slot masks
+                        # carry 4 / 5 rows, one per slot the head decides and
+                        # the engine applies.
+                        _WS = _env_wire_slots()
+                        _want = (((ENV_MAX_FACES, _WS,
                                    MAX_AXES_PER_VERTEX),
-                                  (ENV_MAX_FACES, FACE_SLOTS, 2))
+                                  (ENV_MAX_FACES, _WS, 2))
                                  if _PFM_SLOT else
                                  ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX),
                                   (ENV_MAX_FACES,)))
@@ -8369,7 +8447,7 @@ def main():
                     face_old_logp = jnp.array(0.0)
                     # --face-slot-frames: the pair / comp masks carry a slot
                     # axis on the live path (see _PFM_SLOT).
-                    _sl = (FACE_SLOTS,) if _PFM_SLOT else ()
+                    _sl = (_env_wire_slots(),) if _PFM_SLOT else ()
                     face_pair_v = jnp.zeros(
                         (ENV_MAX_FACES,) + _sl + (MAX_AXES_PER_VERTEX,
                          MAX_AXES_PER_VERTEX), jnp.float32)
@@ -8612,16 +8690,8 @@ def main():
                 micro_compress_valid=micro_compress_valid,
                 axis_state=state.axis_state,
                 axis_valid_mask=state.axis_valid_mask,
-                face_skip=face_action.skip,
-                face_op_type=face_action.op_type,
-                face_i=face_action.i,
-                face_j=face_action.j,
-                face_exponents=face_action.exponents,
-                face_factor=face_action.factor,
-                face_compress_kind=face_action.compress_kind,
-                face_quant_dtype=face_action.quant_dtype,
-                face_quant_scale_sign=face_action.quant_scale_sign,
-                face_quant_scale_frac=face_action.quant_scale_frac,
+                # USE 2: the record, whole. Ten named copies before.
+                face_action=face_action,
                 face_pair_valid=face_pair_v,
                 face_comp_valid=face_comp_v,
                 face_valid=face_valid_v,
@@ -8735,24 +8805,13 @@ def main():
             quant_scale_sign=batch.micro_quant_scale_sign_seq,
             quant_scale_frac=batch.micro_quant_scale_frac_seq,
         )
-        # P1c: the stored per-path decisions, as one vmapped pytree. None when
-        # --face-actions is off (static) — evaluate then skips the face pass.
-        face_actions_b = (
-            FaceAction(
-                skip=batch.face_skip,
-                op_type=batch.face_op_type,
-                i=batch.face_i,
-                j=batch.face_j,
-                exponents=batch.face_exponents,
-                factor=batch.face_factor,
-                compress_kind=batch.face_compress_kind,
-                quant_dtype=batch.face_quant_dtype,
-                quant_scale_sign=batch.face_quant_scale_sign,
-                quant_scale_frac=batch.face_quant_scale_frac,
-            )
-            if args.face_actions
-            else None
-        )
+        # USE 3: the stored per-path decisions, as one vmapped pytree. None
+        # when --face-actions is off (static) — evaluate then skips the face
+        # pass. IT IS THE SAME OBJECT THE ROLLOUT STORED, not a re-assembly
+        # from ten named batch leaves: that re-assembly is the place a
+        # forgotten field made `evaluate` score a variable `sample` never drew,
+        # silently, and there is nothing left here to forget.
+        face_actions_b = batch.face_action if args.face_actions else None
 
         def _pfm_checked(fsz, fqt):
             """--per-face-masks: the loss must re-mask with the SAME arrays
@@ -8761,8 +8820,9 @@ def main():
             enter the loss rather than discovered as a broadcast error inside
             the head."""
             if _PFM_SLOT:
-                _w = ((ENV_MAX_FACES, FACE_SLOTS, MAX_AXES_PER_VERTEX),
-                      (ENV_MAX_FACES, FACE_SLOTS, 2))
+                _WS = _env_wire_slots()
+                _w = ((ENV_MAX_FACES, _WS, MAX_AXES_PER_VERTEX),
+                      (ENV_MAX_FACES, _WS, 2))
                 _g = (tuple(fsz.shape[-3:]), tuple(fqt.shape[-3:]))
             else:
                 _w = ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX), (ENV_MAX_FACES,))
@@ -10096,7 +10156,8 @@ def main():
         _lag_mask_frac = jnp.asarray(-1.0, jnp.float32)
         if bool(getattr(args, "lag_causal_mask", False)):
             _lag_m = _causal_quality_mask(
-                traj.face_valid, traj.face_skip, traj.face_op_type)
+                traj.face_valid, traj.face_action.skip,
+                traj.face_action.op_type)
             _lag_mask_frac = jnp.mean(_lag_m)
             _pref_eff = _pref_eff.at[
                 ..., HEAD_NAMES.index("quality")].multiply(_lag_m)
@@ -10277,16 +10338,7 @@ def main():
             micro_compress_valid=traj.micro_compress_valid,
             axis_state=traj.axis_state,
             axis_valid_mask=traj.axis_valid_mask,
-            face_skip=traj.face_skip,
-            face_op_type=traj.face_op_type,
-            face_i=traj.face_i,
-            face_j=traj.face_j,
-            face_exponents=traj.face_exponents,
-            face_factor=traj.face_factor,
-            face_compress_kind=traj.face_compress_kind,
-            face_quant_dtype=traj.face_quant_dtype,
-            face_quant_scale_sign=traj.face_quant_scale_sign,
-            face_quant_scale_frac=traj.face_quant_scale_frac,
+            face_action=traj.face_action,
             face_pair_valid=traj.face_pair_valid,
             face_comp_valid=traj.face_comp_valid,
             face_valid=traj.face_valid,
@@ -10616,15 +10668,16 @@ def main():
         if _fv is not None:
             _fv = _fv.astype(jnp.float32)
             _fv_n = jnp.maximum(jnp.sum(_fv), 1.0)
-        if getattr(traj, "face_skip", None) is not None:
-            _fsk = traj.face_skip.astype(jnp.float32)
+        _fa = getattr(traj, "face_action", None)
+        if _fa is not None and _fa.skip is not None:
+            _fsk = _fa.skip.astype(jnp.float32)
             if _fv is not None:
                 _face_skip_p = jnp.sum(_fsk * _fv) / _fv_n
             else:
                 _face_skip_p = jnp.mean(_fsk)
         else:
             _face_skip_p = jnp.array(0.0, dtype=jnp.float32)
-        _fop = getattr(traj, "face_op_type", None)
+        _fop = None if _fa is None else _fa.op_type
         if _fop is not None:
             _fop = _fop.astype(jnp.int32)
             if _fv is not None:
@@ -10645,7 +10698,7 @@ def main():
                 # face contributing all of its slots to `skip`. The five
                 # classes {skip, none, diag, compress, quant} are mutually
                 # exclusive and sum to 1 on both trainers.
-                _fk = getattr(traj, "face_skip", None)
+                _fk = None if _fa is None else _fa.skip
                 if _fk is not None:
                     _keep = (1.0 - _fk.astype(jnp.float32))[..., None]
                 else:

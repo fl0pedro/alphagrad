@@ -24,8 +24,10 @@ import jax
 import jax.numpy as jnp
 import jax.random as jrand
 
+from alphagrad.approx.face_action import FaceAction
+from alphagrad.approx import face_action as _rec
 from alphagrad.approx.heads import (
-    AxisTokenFeatures, FaceAction, FactorTables, MAX_PRIMES,
+    AxisTokenFeatures, FactorTables, MAX_PRIMES,
     _approx_allowed, _compute_axis_masks, _compute_op_legality,
     quant_hardware_masks,
 )
@@ -33,8 +35,17 @@ from alphagrad.approx.unified_micro import _BF16_SLOT, _F32_SLOT, _KIND_MAP
 from alphagrad.approx.unified_face_head import (
     CONTRACTION_LAYOUT, FACE_SLOTS, MAX_PAIR_IDX, NUM_APPROX_OPS,
     NUM_REDUCE_AXES, OP_BLOCKDIAG, OP_NONE, OP_QUANT, OP_REDUCE, S_OP,
-    UnifiedFaceHead, FaceFields, slot_base,
+    UnifiedFaceHead, FaceFields,
 )
+
+
+#: Record field -> the ``FaceFields`` attribute that holds it, for the per-FACE
+#: fields only (the per-slot ones go through ``_rows``' op-dependent encoding).
+#: ``skip`` is here for completeness; ``_wire_row`` skips it because the caller
+#: already receives it. A record field with no entry RAISES in ``_wire_row``
+#: rather than being dropped -- adding a per-face field to the declaration
+#: without telling the head which logit drew it must not silently store a zero.
+_FIELDS_OF_RECORD = {"skip": "skip", "join": "join"}
 
 
 class UnifiedFacePolicy(eqx.Module):
@@ -115,6 +126,28 @@ class UnifiedFacePolicy(eqx.Module):
         self.head = UnifiedFaceHead(embd_dim, in_dim=_in,
                                     key=keys[1], approx_add=approx_add)
 
+    # ------------------------------------------------------------- the width
+    @property
+    def layout(self):
+        """The head's :class:`FaceHeadLayout` -- THE source of the slot count.
+
+        ``FACE_SLOTS`` is 3 and keeps meaning "the CONTRACTION slots", so the
+        loops that iterate them stay correct at every width. Every SHAPE in
+        this module asks ``self.n_slots`` instead, which is the head's own
+        ``--approx-add`` width (3 / 3 / 3 / 4 / 5). Mixing the two is exactly
+        how a learned join row gets applied to a tensor nothing was decided
+        for.
+        """
+        return self.head.layout
+
+    @property
+    def n_slots(self) -> int:
+        return self.head.layout.n_slots
+
+    @property
+    def approx_add(self) -> str:
+        return self.head.layout.mode
+
     # ------------------------------------------------------------ masks
     @staticmethod
     def _fit(v, n):
@@ -137,7 +170,7 @@ class UnifiedFacePolicy(eqx.Module):
 
         IT STOPPED BEING TRUE (ticket .18, D3; finding 54): the three slots
         hold three different tensors. When ``features`` is a LIST of
-        ``FACE_SLOTS`` per-slot features -- with ``pair_valid_f`` (S, N, N),
+        ``self.n_slots`` per-slot features -- with ``pair_valid_f`` (S, N, N),
         ``comp_valid_f`` (S, N) and ``quant_legality_mask`` (S, D) to match,
         all from ``LiveFaceStream.face_slot_legality`` -- each slot's masks
         come from ITS OWN legality (:meth:`_slot_masks_1`) and are stacked.
@@ -153,14 +186,15 @@ class UnifiedFacePolicy(eqx.Module):
             i_diag, i_compress, j_diag, _ = _compute_axis_masks(
                 features, pair_valid=pair_valid_f,
                 compress_valid=comp_valid_f)
+            _S = self.n_slots
             om = jnp.broadcast_to(self._fit(op_legal, NUM_APPROX_OPS),
-                                  (FACE_SLOTS, NUM_APPROX_OPS))
+                                  (_S, NUM_APPROX_OPS))
             im = jnp.broadcast_to(self._fit(i_diag, MAX_PAIR_IDX),
-                                  (FACE_SLOTS, MAX_PAIR_IDX))
+                                  (_S, MAX_PAIR_IDX))
             jm = jnp.broadcast_to(self._fit(j_diag, MAX_PAIR_IDX),
-                                  (FACE_SLOTS, MAX_PAIR_IDX))
+                                  (_S, MAX_PAIR_IDX))
             am = jnp.broadcast_to(self._fit(i_compress, NUM_REDUCE_AXES),
-                                  (FACE_SLOTS, NUM_REDUCE_AXES))
+                                  (_S, NUM_REDUCE_AXES))
             # Non-coprime (i, j) table: gcd == 1 admits only factor 1, a no-op.
             #
             # PER-FACE UNDER --per-face-masks. `features` here is `_face_feats_1`'s
@@ -172,14 +206,14 @@ class UnifiedFacePolicy(eqx.Module):
             sz = self._pair_sizes(features)
             g = jnp.gcd(sz[:, None], sz[None, :])
             pair_ok = jnp.broadcast_to((g > 1).astype(jnp.float32),
-                                       (FACE_SLOTS, MAX_PAIR_IDX, MAX_PAIR_IDX))
+                                       (_S, MAX_PAIR_IDX, MAX_PAIR_IDX))
             dm = jnp.broadcast_to(self._fit(quant_legality_mask, 2),
-                                  (FACE_SLOTS, 2))
+                                  (_S, 2))
             return om, im, jm, am, pair_ok, dm
         outs = [self._slot_masks_1(features[s], pair_valid_f[s],
                                    comp_valid_f[s], quant_legality_mask[s],
                                    op_override)
-                for s in range(FACE_SLOTS)]
+                for s in range(self.n_slots)]
         return tuple(jnp.stack([o[k] for o in outs]) for k in range(6))
 
     def _slot_masks_1(self, features, pair_valid, comp_valid,
@@ -238,7 +272,7 @@ class UnifiedFacePolicy(eqx.Module):
                or (face_quant_f is not None and jnp.ndim(face_quant_f) >= 1))
         if not per:
             return None
-        S = FACE_SLOTS
+        S = self.n_slots
 
         def _rows_of(x, rank):
             x = jnp.asarray(x)
@@ -342,7 +376,7 @@ class UnifiedFacePolicy(eqx.Module):
         # its OWN sizes, so the factor is the gcd on the tensor the Diag hits.
         if isinstance(features, list):
             sz = jnp.stack([self._pair_sizes(f) for f in features])
-            _s = jnp.arange(FACE_SLOTS)
+            _s = jnp.arange(self.n_slots)
             N_i = sz[_s, jnp.clip(fields.i, 0, MAX_PAIR_IDX - 1)]
             N_j = sz[_s, jnp.clip(fields.j, 0, MAX_PAIR_IDX - 1)]
         else:
@@ -356,8 +390,8 @@ class UnifiedFacePolicy(eqx.Module):
             jnp.prod(jnp.where(primes > 0, primes, 1) ** exps, axis=-1)
             .astype(jnp.int32), 1)
 
-        zeros = jnp.zeros((FACE_SLOTS,), jnp.int32)
-        return dict(
+        _S = self.n_slots
+        row = dict(
             op_type=op,
             i=jnp.where(is_rd, fields.axis, jnp.where(is_bd, fields.i, 0)
                         ).astype(jnp.int32),
@@ -370,8 +404,101 @@ class UnifiedFacePolicy(eqx.Module):
             quant_dtype=jnp.where(
                 is_qt, jnp.where(fields.dtype_idx > 0, _BF16_SLOT, _F32_SLOT),
                 0).astype(jnp.int32),
-            quant_scale_sign=jnp.ones((FACE_SLOTS,), jnp.int32),
-            quant_scale_frac=jnp.zeros((FACE_SLOTS,), jnp.float32),
+            quant_scale_sign=jnp.ones((_S,), jnp.int32),
+            quant_scale_frac=jnp.zeros((_S,), jnp.float32),
+        )
+        # THE DECLARATION IS THE KEY SET. A key it does not know is a field
+        # nothing stores; a declared key missing here is a field `sample`
+        # leaves at a default and `evaluate` then scores. Both raise.
+        _rec.check_wire_row_keys(row, self.approx_add, where="_rows")
+        return row
+
+    # ------------------------------------------- the codec, as ONE PAIR
+    #
+    # `_wire_row` and `_fields_of` are the encode/decode halves of the SAME
+    # mapping, and they live next to each other because the third use of the
+    # action record (`Agent._face_replay` -> `evaluate_face`) is the one whose
+    # omission is SILENT: score a field sample never drew, or skip one it did,
+    # and the PPO ratio leaves 1 with no error anywhere.
+    #
+    # What makes them provably a pair is not this comment but
+    # `tests/face_action_record_test.py`, which round-trips
+    # FaceFields -> _wire_row -> _fields_of -> _wire_row at every
+    # `--approx-add` width and requires bit equality -- on the DERIVED fields
+    # too, which `score` does not read and which therefore have to be
+    # RE-DERIVED identically rather than carried.
+
+    def _wire_row(self, fields: FaceFields, features, tables):
+        """ONE face's complete slice of the action record.
+
+        The per-slot wire fields (:meth:`_rows`) PLUS every per-FACE field the
+        running width declares other than ``skip``, which the caller already
+        has. Under ``choose`` that is the join bit, which rides the wire as
+        ``face_join[f]`` -- the channel ``env._face_dict_for_vertex`` decodes
+        with ``join_mode_of_bit``.
+        """
+        row = self._rows(fields, features, tables)
+        for name in _rec.per_face_names(self.approx_add):
+            if name == "skip":
+                continue
+            try:
+                attr = _FIELDS_OF_RECORD[name]
+            except KeyError:
+                raise KeyError(
+                    f"face_action.FACE_ACTION_FIELDS declares the per-face "
+                    f"field {name!r} but unified_face_policy."
+                    f"_FIELDS_OF_RECORD does not say which FaceFields "
+                    f"attribute holds it, so `sample` would store a default "
+                    f"and `evaluate` would score it. Add the mapping (and the "
+                    f"logit in UnifiedFaceHead) before declaring the field."
+                ) from None
+            v = getattr(fields, attr)
+            if v is None:
+                raise ValueError(
+                    f"the {self.approx_add!r} head declares the per-face "
+                    f"record field {name!r} but FaceFields carries None for "
+                    f"it. A default written here would be a decision the head "
+                    f"never drew.")
+            row[name] = jnp.asarray(v, _rec.field(name).np_dtype)
+        return row
+
+    def _fields_of(self, fa: FaceAction, f) -> FaceFields:
+        """Face ``f`` of a STORED record, back as the head's own ``FaceFields``.
+
+        The exact inverse of :meth:`_wire_row` for the SCORED fields, which are
+        the only ones `score` reads: COMPRESS parked its axis in ``i``, DIAG
+        parked the pair, QUANT's dtype slot decodes to the head's 0/1 index.
+        The DERIVED fields (``factor`` / ``exponents`` and the two quant-scale
+        constants) are deliberately NOT read: they carry no decision, and
+        reading them back would invent a variable for the loss to score.
+        """
+        op = fa.op_type[f]
+        is_rd = op == OP_REDUCE
+        join = None
+        if self.layout.has_choose:
+            if fa.join is None:
+                raise ValueError(
+                    "--approx-add 'choose' decides the join PER FACE and this "
+                    "stored record has join=None: the rollout dropped the bit "
+                    "between `sample` and the replay. Scoring JOIN_LOSSY here "
+                    "would make `evaluate` score a decision the behaviour "
+                    "policy never drew -- the ratio would not be 1 at epoch 0.")
+            join = jnp.asarray(fa.join[f], jnp.int32)
+        elif fa.join is not None:
+            raise ValueError(
+                f"a stored face record carries a join bit but --approx-add "
+                f"{self.approx_add!r} has no choose logit to score it against.")
+        return FaceFields(
+            skip=fa.skip[f],
+            op=op,
+            i=jnp.where(is_rd, 0, fa.i[f]).astype(jnp.int32),
+            j=fa.j[f].astype(jnp.int32),
+            axis=jnp.where(is_rd, fa.i[f], 0).astype(jnp.int32),
+            reduce_fn=jnp.argmax(
+                (_KIND_MAP[None, :] == fa.compress_kind[f][:, None]
+                 ).astype(jnp.int32), axis=-1).astype(jnp.int32),
+            dtype_idx=(fa.quant_dtype[f] == _BF16_SLOT).astype(jnp.int32),
+            join=join,
         )
 
     # -------------------------------------------------- ONE face at a time
@@ -444,7 +571,7 @@ class UnifiedFacePolicy(eqx.Module):
             ctx_f, key, op_mask=om, i_mask=im, j_mask=jm, axis_mask=am,
             dtype_mask=dm, pair_ok=pair_ok, face_valid=face_valid_f > 0.5,
             approx_ok=approx_ok)
-        return (fields.skip, self._rows(fields, ff, tables), lp, e, ar,
+        return (fields.skip, self._wire_row(fields, ff, tables), lp, e, ar,
                 jax.nn.sigmoid(z[0]), self._op_dist(z))
 
     def evaluate_face(self, features: AxisTokenFeatures,
@@ -477,21 +604,10 @@ class UnifiedFacePolicy(eqx.Module):
                 ff, _pv, _cv, _qm, op_legality_override, tables)
         ctx_f = self._repr(face_context)
         z = self.head.logits(ctx_f)
-        # Read the fields back off the stored wire rows -- the inverse of
-        # _rows. COMPRESS parked the axis in `i`, DIAG parked the pair.
-        op = fa.op_type[f]
-        is_rd = op == OP_REDUCE
-        fields = FaceFields(
-            skip=fa.skip[f],
-            op=op,
-            i=jnp.where(is_rd, 0, fa.i[f]).astype(jnp.int32),
-            j=fa.j[f].astype(jnp.int32),
-            axis=jnp.where(is_rd, fa.i[f], 0).astype(jnp.int32),
-            reduce_fn=jnp.argmax(
-                (_KIND_MAP[None, :] == fa.compress_kind[f][:, None]
-                 ).astype(jnp.int32), axis=-1).astype(jnp.int32),
-            dtype_idx=(fa.quant_dtype[f] == _BF16_SLOT).astype(jnp.int32),
-        )
+        # The stored record, back as the head's own decision -- `_wire_row`'s
+        # inverse, and the one place the PPO ratio's "same variable" claim is
+        # made good.
+        fields = self._fields_of(fa, f)
         approx_ok = (jnp.asarray(allow_skip, dtype=jnp.float32)
                      if allow_skip is not None
                      else (1.0 if getattr(self, "allow_skip", False)
@@ -502,14 +618,16 @@ class UnifiedFacePolicy(eqx.Module):
             approx_ok=approx_ok)
         return lp, e, ar, jax.nn.sigmoid(z[0]), self._op_dist(z)
 
-    @staticmethod
-    def _op_dist(z):
-        # `slot_base`, not a restated `1 + 31*s`: one source of truth for the
-        # offsets, and it raises rather than slicing if the band ever moves.
+    def _op_dist(self, z):
+        # `layout.slot_base`, not a restated `1 + 31*s`: one source of truth
+        # for the offsets, and it raises rather than slicing if the band ever
+        # moves. EVERY slot the width has, not the three contraction ones: a
+        # learned slot whose op distribution nobody reported would be invisible
+        # in the telemetry while the engine applied its row.
+        _b = self.layout.slot_base
         return jax.nn.softmax(
-            jnp.stack([z[slot_base(s) + S_OP:slot_base(s) + S_OP
-                         + NUM_APPROX_OPS]
-                       for s in range(FACE_SLOTS)]), axis=-1)
+            jnp.stack([z[_b(s) + S_OP:_b(s) + S_OP + NUM_APPROX_OPS]
+                       for s in range(self.n_slots)]), axis=-1)
 
     # ------------------------------------------------------------ sample
     def sample(self, vertex_context, features: AxisTokenFeatures,
@@ -550,12 +668,17 @@ class UnifiedFacePolicy(eqx.Module):
             skip_probs.append(sp)
             rows.append(row)
             op_dists.append(od)
-            q_lps.append(jnp.zeros((FACE_SLOTS,), jnp.float32))
+            q_lps.append(jnp.zeros((self.n_slots,), jnp.float32))
 
+        # THE RECORD, stacked over faces from the declaration's own key set:
+        # `skip` plus whatever `_wire_row` carried, per-slot and per-face
+        # alike. Nothing is named twice, so a field added to
+        # FACE_ACTION_FIELDS arrives here with no edit.
         fa = FaceAction(
             skip=jnp.stack(skips),
             **{k: jnp.stack([r[k] for r in rows]) for k in rows[0]},
         )
+        _rec.check(fa, self.approx_add, F, where="UnifiedFacePolicy.sample")
         return (fa, logp, ent, arity, jnp.stack(skip_probs),
                 jnp.stack(op_dists), jnp.stack(q_lps))
 
@@ -590,6 +713,6 @@ class UnifiedFacePolicy(eqx.Module):
             arity = arity + ar
             skip_probs.append(sp)
             op_dists.append(od)
-            q_lps.append(jnp.zeros((FACE_SLOTS,), jnp.float32))
+            q_lps.append(jnp.zeros((self.n_slots,), jnp.float32))
         return (logp, ent, arity, jnp.stack(skip_probs),
                 jnp.stack(op_dists), jnp.stack(q_lps))

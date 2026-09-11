@@ -1826,24 +1826,22 @@ class MicroActionPolicy(eqx.Module):
 # ---------------------------------------------------------------------------
 
 
-class FaceAction(NamedTuple):
-    """Per-face decisions for ONE vertex elimination, padded to MAX_FACES.
-
-    ``skip[f] == 1`` ⇒ that face's contraction is dropped (graphax.SKIP_FACE)
-    and its slot fields are canonical END/zeros. Slot fields are indexed
-    ``[face, slot]`` with slot order (pre, post, new); ``op_type == OP_END``
-    means "no approximation for that slot"."""
-
-    skip: jax.Array              # (F,) int32
-    op_type: jax.Array           # (F, S) int32
-    i: jax.Array                 # (F, S) int32
-    j: jax.Array                 # (F, S) int32
-    exponents: jax.Array         # (F, S, MAX_PRIMES) int32
-    factor: jax.Array            # (F, S) int32
-    compress_kind: jax.Array     # (F, S) int32
-    quant_dtype: jax.Array       # (F, S) int32
-    quant_scale_sign: jax.Array  # (F, S) int32
-    quant_scale_frac: jax.Array  # (F, S) float32 — scale head's u ∈ [0,1]
+# ``FaceAction`` IS NOT DECLARED HERE ANY MORE (2026-09-11, ticket dsnn-3qm.56).
+#
+# One face decision used to be described by hand in four places -- this
+# NamedTuple, ``ppo.Trajectory``, ``ppo.TrainBatch`` / ``Agent._face_replay``
+# and ``Agent.to_env_action_dynamic`` -- and they had to agree or ``evaluate``
+# scored a variable ``sample`` never drew: no error, no crash, the PPO ratio
+# just drifts off 1. The record is declared ONCE now, in
+# ``alphagrad.approx.face_action.FACE_ACTION_FIELDS``, and every use is derived
+# from it -- including the per-slot axis width, which follows the head's
+# ``--approx-add`` layout and not ``FACE_SLOTS``.
+#
+#     from alphagrad.approx.face_action import FaceAction
+#
+# This module deliberately does NOT re-export it: ``face_action`` reads
+# ``MAX_PRIMES`` and ``OP_END`` from here, so a back-import would be a cycle
+# whose failure mode depends on which module was imported first.
 
 
 def _approx_allowed(op_override):
@@ -2036,6 +2034,10 @@ class FacePathPolicy(eqx.Module):
                 [getattr(a, field) for a in slot_actions]
             ).reshape(F, S, *jnp.shape(getattr(slot_actions[0], field)))
 
+        # Local import: `face_action` reads MAX_PRIMES / OP_END from this
+        # module, so a module-level import here would be a cycle. FacePathPolicy
+        # is the LEGACY per-slot policy; it builds the same declared record.
+        from alphagrad.approx.face_action import FaceAction
         fa = FaceAction(
             skip=jnp.stack(skips),
             op_type=_stack("op_type"), i=_stack("i"), j=_stack("j"),
