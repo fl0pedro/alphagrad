@@ -267,7 +267,29 @@ class LiveFaceStream:
                       # at two sites again).
                       "decide_probe": 0, "decide_draw": 0,
                       "decide_probe_fail": 0, "decide_self_skip": 0,
-                      "decide_multi_site": 0}
+                      "decide_multi_site": 0,
+                      # `decide_vertex_faces` (#77): the EXACT per-vertex pass,
+                      # NO elimination. `vertex_probe` counts the passes,
+                      # `vertex_operand_probes` the n + m forced operand edges
+                      # and `vertex_contractions` the n*m structural
+                      # compositions -- the three terms of the proof, so the
+                      # "no speculative elimination" claim is a counter rather
+                      # than a comment. `vertex_face_absent` is an enumerated
+                      # face whose edge Jacobian forces to None, which graphax
+                      # skips too (an all-zero mask row, i.e. nothing offered).
+                      # `vertex_self_skip` must be 0 -- a row the apply hook
+                      # refuses on the very tensor it was drawn from is a defect
+                      # in `slot_legality`, not staleness.
+                      # `vertex_key_collision` is the multi-output face-key
+                      # collision (measured 0 on TLM and nn256; it RAISES);
+                      # `vertex_flag_undecided` / `vertex_flag_flip` are the one
+                      # case graphax's `_is_approx_cfg` is not a function of
+                      # stage 1 alone (a `lossy` join armed only by slot 2).
+                      "vertex_probe": 0, "vertex_probe_fail": 0,
+                      "vertex_operand_probes": 0, "vertex_contractions": 0,
+                      "vertex_draw": 0, "vertex_face_absent": 0,
+                      "vertex_self_skip": 0, "vertex_key_collision": 0,
+                      "vertex_flag_undecided": 0, "vertex_flag_flip": 0}
         self._sizes: dict = {}        # (prefix, vertex) -> (sizes, quant, n)
         self._slots: dict = {}        # (prefix, vertex) -> per-slot legality
 
@@ -1484,6 +1506,424 @@ class LiveFaceStream:
                 nout=np.zeros((F, S), np.int32), n_faces=np.int32(0))
         return self.decide_faces(tk, vertex, keys, draw, skips=skips,
                                  approx=approx)
+
+    # -- the EXACT per-vertex mask, NO speculative elimination (.59, #77) ---
+    #
+    # THE PROOF. Let vertex ``j`` have predecessors ``P = {i1..in}`` and
+    # successors ``S = {k1..km}``. Its faces are ``P x S``, and for face
+    # ``(p, s)``
+    #
+    #     reads  = { e(p,j), e(j,s), e(p,s) }      writes = { e(p,s) }
+    #
+    # For ``f != g``, ``writes(f) & reads(g)`` is EMPTY:
+    #
+    #   * ``e(pf,sf) == e(pg,j)`` needs ``sf == j``, impossible -- ``sf`` is a
+    #     successor of ``j`` and the graph is acyclic;
+    #   * ``e(pf,sf) == e(j,sg)`` needs ``pf == j``, impossible likewise;
+    #   * ``e(pf,sf) == e(pg,sg)`` needs ``f == g``.
+    #
+    # So the face -> written-edge map is a BIJECTION onto ``P x S``, and the
+    # ``lhs`` / ``rhs`` reads are re-seeded per face from graphax's own
+    # ``_pre_raw`` / ``_post_raw`` (``core.py``: "an ``rhs`` transform must
+    # affect THIS face only, not the rest of the out_edge's fan-in"). Therefore
+    #
+    #     new(p,s) = contract(a_ps(e(p,j)), b_ps(e(j,s)))
+    #
+    # with ``a_ps`` / ``b_ps`` this face's own operand decisions and NOTHING
+    # else -- no sibling face, no ordering. Every ``val.shape`` and every
+    # ``SparseTensor`` metadata field the mask reads is a PURE FUNCTION of the
+    # PRE-elimination graph and the decision vector.
+    #
+    # WHAT THAT BUYS. :meth:`decide_faces` reached the same answer by running a
+    # whole speculative elimination per vertex with every slot a graphax
+    # chooser; the arithmetic there is right, but it pays an elimination and --
+    # because the choosers run under ``jcore.set_current_trace(ij.trace)`` -- it
+    # pays ``jax.ensure_compile_time_eval`` on EVERY draw, which is where
+    # finding 75 measured the head channel going 0.437 -> 8.957 ms/vertex. This
+    # pass pays NEITHER:
+    #
+    #   * ``n`` forces of the in-edge Jacobians + ``m`` forces of the out-edge
+    #     Jacobians + ``n*m`` calls of ``graphax.contract_face_operands`` --
+    #     THE FUNCTION THE REAL ELIMINATION CALLS, not a second copy of the
+    #     structure algebra (a second copy is exactly what produced finding
+    #     72's fault 1);
+    #   * every ``draw`` is taken OUTSIDE the jaxpr trace, because the trace is
+    #     only needed where jax equations are actually emitted (the forces and
+    #     the contractions), and this pass can leave it per face instead of
+    #     running inside it from end to end.
+    #
+    # WHY TWO STAGES. The head draws all three slots from ONE vector, so the
+    # operand decisions and the ``new`` decision are nominally simultaneous;
+    # but ``new``'s tensor IS the contraction of the decided operands, so its
+    # mask cannot exist until they are decided. The resolution needs no
+    # elimination and no re-probe: draw slots 0 and 1 for every face against
+    # masks that are pure functions of the prefix (stage 1), then compose and
+    # draw slot 2 (stage 2). Finding 75's measurement that a slot's draw is
+    # conditioned on nothing but its OWN mask row
+    # (``UnifiedFaceHead.sample`` splits ``1 + 6*n_slots (+1)`` keys and gives
+    # slot ``s`` its own slice and its own logit block; 0 of 252 field cells
+    # differed) is what makes the split scoreable with no new trajectory field.
+    #
+    # THE STAGES ARE PER VERTEX, NOT PER FACE, and that is not a convenience:
+    # graphax's ``_is_approx_cfg`` is computed ONCE for the whole elimination
+    # from the WHOLE ``face_transforms`` dict, and it gates the reconciler peel
+    # and the re-evaluation of ``need_contract`` inside
+    # ``prepare_face_operands``. A per-face split would have to guess it.
+    # Hoisting stage 2 behind all of stage 1 means the flag is known exactly
+    # (:func:`graphax.face_config_is_approx` on the entry forms the measurement
+    # will install) before the first ``new`` structure is composed.
+    #
+    # WHAT IT DOES NOT COVER, and must not pretend to: ``res:jr`` (the OLD
+    # EDGE) and ``res:jres`` (the SUMMED EDGE), i.e. slots 3 and 4 under
+    # ``--approx-add learned1`` / ``learned2``. Those two tensors DO depend on
+    # sibling faces -- an earlier face's merge writes the edge a later face's
+    # ``jr`` reads -- so the bijection above says nothing about them and this
+    # pass raises rather than answering. :meth:`decide_faces` is the pass for
+    # those, and it stays for exactly that reason.
+    def decide_vertex_faces(self, tk, vertex, draw, *, skips=None):
+        """Decide every CONTRACTION slot of ``vertex`` with NO elimination.
+
+        ``draw(f, s, legality)`` is called once per (face ``f``, slot ``s``),
+        with ``legality`` a
+        :class:`~alphagrad.approx.common.masks.SlotLegality` computed on the
+        tensor that slot's hook will be handed at apply time. It returns the
+        wire row ``(b0, b1, b2)`` or ``None`` for "leave this slot exact".
+        ``draw`` is called OUTSIDE the jaxpr trace and needs no
+        ``jax.ensure_compile_time_eval``: the only work this pass does under
+        the trace is forcing the operand edges and composing the contractions.
+
+        CALL ORDER IS STAGE ORDER, NOT APPLY ORDER: every face's slot 0 and
+        slot 1, then every face's slot 2. See the block comment above for why
+        that is exact and why the split has to be per vertex.
+
+        ``skips`` -- the ``(F,)`` per-face SKIP decisions, already made, for
+        the same reason :meth:`decide_faces` needs them: graphax tests
+        ``face_transforms[key] is SKIP_FACE`` before running any of a face's
+        hooks, so a skip cannot be chosen by a mask.
+
+        Returns :class:`DecidedFaces`, with ``rows`` the wire and the five mask
+        fields the legality each row was drawn under -- the arrays PPO has to
+        store, because its loss replay rescores from the stored mask and never
+        recomputes it.
+
+        Raises:
+            NotImplementedError: if ``--approx-add`` gives the face more than
+                the three contraction slots. Slots 3 / 4 sit on tensors that
+                DO depend on sibling faces; answering them from a per-face
+                composition would be the staleness this pass exists to remove,
+                one level down.
+            RuntimeError: if two of ``vertex``'s faces share a
+                ``face_transforms`` key. ``faces_of``'s key omits the central
+                variable, so a multi-output equation whose output variables
+                share an ``(in_edge, out_edge)`` pair would have ONE row
+                configure TWO faces. Measured zero on TLM and nn256 under
+                minimum Markowitz (finding 77: zero eliminated equations have
+                more than one output variable at all), which is why this
+                raises instead of widening the key -- a silent collision is
+                the one outcome that must not happen.
+        """
+        from graphax.core import face_specs_of
+        from graphax.sparse.elemental.dispatch import (
+            approx_active, set_approx_active)
+        from alphagrad.approx.env import FACE_SLOTS, wire_slots
+
+        F, N = self.max_faces, self.max_axes
+        S = wire_slots()
+        if S != FACE_SLOTS:
+            raise NotImplementedError(
+                f"decide_vertex_faces answers the {FACE_SLOTS} CONTRACTION "
+                f"slots, and --approx-add gives the face {S}. Slots "
+                f"{FACE_SLOTS}.. sit on the OLD EDGE (graphax res:jr) and the "
+                f"SUMMED EDGE (res:jres), whose tensors depend on SIBLING "
+                f"faces' decisions -- an earlier face's merge writes the edge a "
+                f"later face's jr reads -- so they are not a function of this "
+                f"face's own operands and cannot be composed here. Use "
+                f"decide_faces (one speculative elimination, every slot a "
+                f"chooser) for those.")
+        rows = np.full((F, S, 3), -1, np.int32)
+        rows[..., 2] = 0
+        sizes = np.zeros((F, S, N), np.int32)
+        quant = np.zeros((F, S, 2), np.float32)
+        pair = np.zeros((F, S, N, N), np.float32)
+        comp = np.zeros((F, S, N), np.float32)
+        nout = np.zeros((F, S), np.int32)
+
+        ij = tk.ij
+        specs = face_specs_of(ij.graph, ij.tgraph, int(vertex), ij.jaxpr)
+        # ONE ROW, ONE FACE. `faces_of`'s key omits the central variable, so a
+        # repeated key would have one wire row configure two faces and one mask
+        # row describe two tensors. Counted before anything else because the
+        # whole pass is indexed by `f`, which is `faces_of`'s position.
+        _seen_keys: dict = {}
+        for _sp in specs:
+            if _sp.key in _seen_keys:
+                self.stats["vertex_key_collision"] += 1
+                raise RuntimeError(
+                    f"vertex {int(vertex)} has two faces with the same "
+                    f"face_transforms key {_sp.key}: central variables "
+                    f"{_seen_keys[_sp.key]} and {_sp.central}. One wire row "
+                    f"would configure both faces and one mask row would "
+                    f"describe both tensors. faces_of's key omits the central "
+                    f"variable; this equation has "
+                    f"{len(ij.jaxpr.eqns[int(vertex) - 1].outvars)} output "
+                    f"variables.")
+            _seen_keys[_sp.key] = _sp.central
+        n_faces = min(len(specs), F)
+        specs = specs[:n_faces]
+
+        def _skipped(f):
+            return (skips is not None
+                    and int(np.asarray(skips).reshape(-1)[f]) == 1)
+
+        # ``_demand_head_vars`` is ``set(jaxpr.outvars)`` in
+        # ``_eliminate_vertex``; the contraction's demand-dense branch keys off
+        # membership, so it is reproduced from the same source rather than
+        # assumed off.
+        demand = set(ij.jaxpr.outvars)
+
+        prev = approx_active()
+        set_approx_active(True)
+        try:
+            with _Snapshot(tk):
+                self.stats["vertex_probe"] += 1
+                try:
+                    self._decide_vertex_body(
+                        ij, specs, draw, _skipped, demand, N, S,
+                        rows, sizes, quant, pair, comp, nout)
+                except Exception:
+                    # Same contract as `_probe_faces` and `decide_faces`: a
+                    # vertex graphax cannot trace has no legal approximation
+                    # either, so keep the decisions taken so far (the rest stay
+                    # -1 = exact) and never let a probe take the rollout down.
+                    self.stats["vertex_probe_fail"] += 1
+        finally:
+            set_approx_active(prev)
+        return DecidedFaces(rows=rows, sizes=sizes, quant=quant, pair=pair,
+                            comp=comp, nout=nout, n_faces=np.int32(n_faces))
+
+    def _decide_vertex_body(self, ij, specs, draw, skipped, demand, N, S,
+                            rows, sizes, quant, pair, comp, nout):
+        """The two stages. Split out so the snapshot / arming wrapper above
+        stays readable and so the ``except`` there covers exactly this."""
+        from jax._src import core as _jcore
+        from graphax import SKIP_FACE
+        from graphax.core import (contract_face_operands, face_config_is_approx,
+                                  prepare_face_operands, _force)
+        from alphagrad.approx.common.masks import slot_legality
+        from alphagrad.approx.env import (
+            face_entry_from_slots, make_slot_frame_hook)
+
+        # ---- the n + m OPERAND PROBES -----------------------------------
+        #
+        # UNDER THE TRACE, because forcing an unevaluated ``LazyEdge`` emits jax
+        # equations and they have to land in the persistent frame (the snapshot
+        # truncates them). ``_force`` memoises on the edge, so this forces each
+        # edge exactly once no matter how many faces read it -- which is the
+        # ``n + m`` of the proof rather than ``2nm``.
+        #
+        # The tensors are the ones graphax hands the ``lhs`` / ``rhs`` hooks
+        # VERBATIM: ``_eliminate_vertex`` sets ``pre_val = _pre_raw`` and
+        # re-seeds ``post_val = _post_raw`` per face before applying them, so
+        # the operand a slot hook meets depends on ONE of the two neighbours
+        # and on no decision at all.
+        lhs_st: dict = {}
+        rhs_st: dict = {}
+        with _jcore.set_current_trace(ij.trace):
+            for sp in specs:
+                ck = id(sp.central)
+                kl, kr = (ck, id(sp.in_edge)), (ck, id(sp.out_edge))
+                if kl not in lhs_st:
+                    lhs_st[kl] = _force(ij.tgraph[sp.central][sp.in_edge])
+                if kr not in rhs_st:
+                    rhs_st[kr] = _force(ij.graph[sp.central][sp.out_edge])
+        self.stats["vertex_operand_probes"] += len(lhs_st) + len(rhs_st)
+
+        def _operands(sp):
+            ck = id(sp.central)
+            return (lhs_st[(ck, id(sp.in_edge))],
+                    rhs_st[(ck, id(sp.out_edge))])
+
+        # ---- STAGE 1: every face's lhs and rhs --------------------------
+        #
+        # OUTSIDE THE TRACE. `slot_legality` reads shapes and dims, and `draw`
+        # is a policy head; neither needs the jaxpr frame, and keeping them out
+        # of it is what removes `jax.ensure_compile_time_eval` from the draw.
+        mask1: dict = {}
+        for sp in specs:
+            f = sp.f
+            if skipped(f):
+                continue
+            lhs, rhs = _operands(sp)
+            if lhs is None or rhs is None:
+                # graphax `continue`s a face whose edge Jacobian forces to
+                # None, so no hook of it is ever invoked: the all-zero row is
+                # the right answer and it is counted rather than guessed at.
+                self.stats["vertex_face_absent"] += 1
+                continue
+            for s, st in ((0, lhs), (1, rhs)):
+                L = slot_legality(st, N)
+                mask1[(f, s)] = L
+                sizes[f, s] = L.sizes
+                nout[f, s] = L.n_out
+                pair[f, s] = L.pair.astype(np.float32)
+                comp[f, s] = L.comp.astype(np.float32)
+                quant[f, s] = L.quant.astype(np.float32)
+                w = draw(f, s, L)
+                self.stats["vertex_draw"] += 1
+                if w is not None:
+                    rows[f, s] = tuple(int(x) for x in w)
+
+        # ---- the APPROX FLAG, exactly as the elimination will compute it -
+        #
+        # `_is_approx_cfg` gates the reconciler peel and the re-evaluation of
+        # `need_contract` from the PEELED operands, so a wrong flag is a wrong
+        # `new` structure. It is a property of the WHOLE face_transforms dict,
+        # which is why stage 2 sits behind ALL of stage 1: the entry forms the
+        # measurement will install are built here from the rows just drawn and
+        # handed to graphax's own predicate.
+        ft_probe: dict = {}
+        for sp in specs:
+            if skipped(sp.f):
+                ft_probe[sp.key] = SKIP_FACE
+                continue
+            hooks = tuple(
+                None if int(rows[sp.f, s, 0]) == -1
+                else make_slot_frame_hook(tuple(int(x) for x in rows[sp.f, s]))
+                for s in range(S))
+            if all(h is None for h in hooks):
+                continue  # an all-None face installs no entry (env's gate)
+            ft_probe[sp.key] = face_entry_from_slots(hooks)
+        approx = bool(face_config_is_approx(ft_probe))
+        # THE ONE CASE THE FLAG IS NOT YET DECIDED. Under a `lossy` join an
+        # ARMED face carries a `FaceJoinPolicy`, which arms the flag -- and slot
+        # 2 can arm a face whose operands are both exact. The flag is then a
+        # function of the stage-2 draws, which is the one circularity the
+        # hoisting does not break. Under every other value `face_slot_sites`
+        # installs NO policy at all (env._JOIN_SEMANTICS_OF) so nothing in
+        # stage 2 can move the flag; this detects the `lossy`-and-nothing-armed
+        # case and says so rather than silently masking from the wrong flag.
+        _flag_undecided = (not approx) and self._lossy_join_active()
+        if _flag_undecided:
+            self.stats["vertex_flag_undecided"] += 1
+
+        # ---- STAGE 2: every face's `new` --------------------------------
+        for sp in specs:
+            f = sp.f
+            if skipped(f) or (f, 0) not in mask1:
+                continue
+            lhs, rhs = _operands(sp)
+            with _jcore.set_current_trace(ij.trace):
+                # THE APPLY PATH'S OWN HOOK on the operands, so the tensors fed
+                # to the contraction are the tensors the measurement will feed
+                # it. Not a second copy of the decode: `make_slot_frame_hook`
+                # is the object `env._face_dict_for_vertex` installs.
+                a, b = lhs, rhs
+                for s in (0, 1):
+                    if int(rows[f, s, 0]) == -1:
+                        continue
+                    seen: dict = {}
+                    h = make_slot_frame_hook(
+                        tuple(int(x) for x in rows[f, s]), stats=seen,
+                        gated=False)
+                    if s == 0:
+                        a = h(a)
+                    else:
+                        b = h(b)
+                    if seen.get("skipped"):
+                        self.stats["vertex_self_skip"] += 1
+                # ``contract_face_operands(prepare_face_operands(...))`` IS
+                # ``_eliminate_vertex``'s contraction -- the same two functions,
+                # in the same order, with the same flags. `post` is the
+                # out-edge Jacobian and `pre` the in-edge one, which is the
+                # operand order the engine uses (``_post_val @ _pre_val``).
+                ops = prepare_face_operands(b, a, approx=approx)
+                new_st = contract_face_operands(
+                    ops, count_ops=False,
+                    demand_dense=sp.out_edge in demand).val
+            self.stats["vertex_contractions"] += 1
+            L = slot_legality(new_st, N)
+            s = 2
+            sizes[f, s] = L.sizes
+            nout[f, s] = L.n_out
+            pair[f, s] = L.pair.astype(np.float32)
+            comp[f, s] = L.comp.astype(np.float32)
+            quant[f, s] = L.quant.astype(np.float32)
+            w = draw(f, s, L)
+            self.stats["vertex_draw"] += 1
+            if w is None:
+                continue
+            row = tuple(int(x) for x in w)
+            rows[f, s] = row
+            if _flag_undecided:
+                # The flag DID move: this face is armed only by slot 2, the
+                # join is lossy, so the measurement will run with
+                # `_is_approx_cfg` True while this mask was computed with it
+                # False. Loud, because the alternative is a stale mask.
+                self.stats["vertex_flag_flip"] += 1
+            # THE PASS'S OWN SELF-CHECK, the same one `decide_faces` carries: a
+            # skip here means `make_slot_frame_hook` refuses, ON THE VERY
+            # TENSOR the row was drawn from, a row `slot_legality` cleared --
+            # i.e. the mask and the hook disagree, which is a defect in
+            # `slot_legality` and not staleness.
+            seen = {}
+            with _jcore.set_current_trace(ij.trace):
+                make_slot_frame_hook(row, stats=seen, gated=False)(new_st)
+            if seen.get("skipped"):
+                self.stats["vertex_self_skip"] += 1
+
+    @staticmethod
+    def _lossy_join_active() -> bool:
+        """Does the running ``--approx-add`` install a ``FaceJoinPolicy``?
+
+        Asked of the entry builder rather than of the flag's name, so a future
+        value cannot change the answer without changing this one too.
+        """
+        from graphax.sparse.ops.join import FaceJoinPolicy
+        from alphagrad.approx.env import face_entry_from_slots, wire_slots
+
+        def _probe(st):
+            return st
+        try:
+            entry = face_entry_from_slots(
+                tuple(_probe for _ in range(wire_slots())))
+        except Exception:
+            return True  # cannot rule it out -> say so
+        from graphax.core import _iter_face_hooks
+        return any(isinstance(h, FaceJoinPolicy)
+                   for h in _iter_face_hooks(entry))
+
+    def vertex_face_decisions(self, order, specs, n, vertex, draw, *,
+                              skips=None, face_rows_hist=None,
+                              face_skips_hist=None):
+        """:meth:`decide_vertex_faces` against the PREFIX tokenizer of step
+        ``n`` -- the :meth:`face_slot_decisions` of the structural pass.
+
+        NOT MEMOISED, for :meth:`face_slot_decisions`' reason: the result
+        depends on ``draw``, i.e. on the policy and the key. A ``draw`` that
+        returns ``None`` everywhere makes it a pure MASK read, and THAT answer
+        is a pure function of the prefix -- which is what lets it stand in for
+        :meth:`face_slot_legality`.
+        """
+        from alphagrad.approx.env import wire_slots
+
+        order = np.asarray(order).reshape(-1)
+        specs = np.asarray(specs)
+        n, vertex = int(n), int(vertex)
+        frh, fsh = self._hist(face_rows_hist, face_skips_hist)
+        try:
+            tk = self._tokenizer_at(order, specs, n, frh, fsh)
+        except Exception:
+            self.stats["failures"] += 1
+            F, N, S = self.max_faces, self.max_axes, wire_slots()
+            rows = np.full((F, S, 3), -1, np.int32)
+            rows[..., 2] = 0
+            return DecidedFaces(
+                rows=rows, sizes=np.zeros((F, S, N), np.int32),
+                quant=np.zeros((F, S, 2), np.float32),
+                pair=np.zeros((F, S, N, N), np.float32),
+                comp=np.zeros((F, S, N), np.float32),
+                nout=np.zeros((F, S), np.int32), n_faces=np.int32(0))
+        return self.decide_vertex_faces(tk, vertex, draw, skips=skips)
 
     def consume_stats(self) -> dict:
         out = dict(self.stats)
