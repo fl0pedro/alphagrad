@@ -427,6 +427,11 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
     prev = os.environ.get(envmod._APPROX_ADD_ENV)
     os.environ.pop(envmod._APPROX_OLD_ENV, None)
     try:
+        # Every value, INCLUDING `choose`. Under `choose` the join arm is a
+        # per-face decision, so `face_slot_sites` derives BOTH arms and requires
+        # them to agree -- which is the claim being checked here: the site
+        # topology is a property of where the slot HOOKS go, and the arms differ
+        # only in what sits at `jr`, which is not a slot hook.
         for want in envmod.APPROX_ADD_CHOICES:
             os.environ[envmod._APPROX_ADD_ENV] = want
             sites = envmod.face_slot_sites()

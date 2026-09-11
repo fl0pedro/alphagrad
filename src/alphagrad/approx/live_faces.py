@@ -890,16 +890,18 @@ class LiveFaceStream:
             # ONE recorder per SITE: face_entry_from_slots installs a slot's
             # single hook at several sites, and `at_site` is the only way to
             # tell those invocations apart (the objects are identical).
-            # at_join -> None: the join POLICY is dropped for the probe. Safe,
-            # because every site a slot hook is installed at is PRE-JOIN, so
-            # the reconciliation cannot change a tensor recorded here, and this
-            # elimination is undone in full by the snapshot. Keeping it would
-            # make every probe pay the reconciliation's arithmetic for a result
-            # nothing reads.
+            # need_join=False: no join at all for the probe, and the arm is
+            # not consulted. Safe, because every site a slot hook is installed
+            # at is PRE-JOIN, so the reconciliation cannot change a tensor
+            # recorded here, and this elimination is undone in full by the
+            # snapshot. Keeping it would make every probe pay the
+            # reconciliation's arithmetic for a result nothing reads -- and
+            # under `--approx-add choose` the probe does not hold the per-face
+            # bit, so asking for the arm would raise.
             ft = {k: face_entry_from_slots(
                       (0, 1, 2),
                       at_site=lambda site, _h, k=k: _mk(k, site),
-                      at_join=lambda _p: None)
+                      need_join=False)
                   for k in keys}
         else:
             ft = {k: (None, None, _mk(k)) for k in keys}

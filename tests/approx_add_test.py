@@ -250,6 +250,15 @@ def test_at_join_lets_the_legality_probe_drop_the_policy(monkeypatch):
         (None, None, hook), at_join=lambda p: seen.append(p.mode) or None)
     assert seen == ["lossy"], seen
     assert entry == ((None, None, hook), (None, None, None)), entry
+    # need_join=False says it more directly AND does not consult the arm, which
+    # is what lets the probe run under `choose` (where it holds no bit).
+    entry = envmod.face_entry_from_slots((None, None, hook), need_join=False)
+    assert entry == ((None, None, hook), (None, None, None)), entry
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", "choose")
+    entry = envmod.face_entry_from_slots((None, None, hook), need_join=False)
+    assert entry == ((None, None, hook), (None, None, None)), entry
+    assert envmod.face_slot_sites() == (("lhs",), ("rhs",), ("res:new",))
+    monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", "lossy")
     # and the default keeps the live policy
     entry = envmod.face_entry_from_slots((None, None, hook))
     assert entry[1][1] is not None and entry[1][1].mode == "lossy"

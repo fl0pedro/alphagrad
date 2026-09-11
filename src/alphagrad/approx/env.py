@@ -4925,7 +4925,8 @@ def _join_outcome_sink():
     return _sink
 
 
-def face_entry_from_slots(slots, at_site=None, at_join=None, mode=None):
+def face_entry_from_slots(slots, at_site=None, at_join=None, mode=None,
+                          need_join=True):
     """ONE face's ``face_transforms`` entry from its decoded per-slot hooks
     ``(lhs, rhs, new)`` -- the ONLY place a face wire becomes a graphax entry
     (ticket .17, D1). ``_face_dict_for_vertex`` (the measurement),
@@ -4996,13 +4997,15 @@ def face_entry_from_slots(slots, at_site=None, at_join=None, mode=None):
     site. It returns the object to place at ``jr``; the default is the policy
     itself.
 
-    The legality probe passes ``at_join=lambda _p: None``. That is SAFE, not a
-    shortcut: every site a slot hook is installed at is PRE-JOIN
+    ``need_join=False`` -- the caller wants NO join at all, and the arm is then
+    not consulted. The legality probe uses it. That is SAFE, not a shortcut:
+    every site a slot hook is installed at is PRE-JOIN
     (:func:`face_slot_sites` is all ``lhs`` / ``rhs`` / ``res:new``), so the
     reconciliation cannot change any tensor the probe is recording, and the
     probe's elimination runs inside a snapshot that is undone in full. Leaving
     the live policy in would make every probe perform the reconciliation's
-    arithmetic for a result nothing reads.
+    arithmetic for a result nothing reads -- and under ``choose`` the probe does
+    not even have the bit, so asking for the arm would raise.
     """
     from graphax.sparse.ops.join import MatchFreshJoin
 
@@ -5014,6 +5017,16 @@ def face_entry_from_slots(slots, at_site=None, at_join=None, mode=None):
     _new_hook = slots[2] if len(slots) > 2 else None
     core3 = (_at("lhs", slots[0]), _at("rhs", slots[1]),
              _at("res:new", _new_hook))
+    if not need_join:
+        # THE CALLER DOES NOT WANT A JOIN AT ALL, so the arm is not consulted.
+        # That is not a shortcut: under `choose` the arm is a per-face decision
+        # the caller may not have, and `resolve_join_mode` would rightly raise
+        # -- but a caller that is discarding the join has nothing to lose by
+        # not knowing it. The legality probe is the case: every site a SLOT
+        # hook is installed at is pre-join (`face_slot_sites`), so no arm can
+        # change a tensor it records, and its elimination is undone by its
+        # snapshot anyway.
+        return (core3, (None, None, None))
     mode = resolve_join_mode(mode)
     # AN UNARMED FACE STAYS EXACT, and the gate lives HERE.
     #
@@ -5057,15 +5070,37 @@ def face_slot_sites() -> tuple[tuple[str, ...], ...]:
 
     DERIVED by calling the entry builder itself with tagging probes rather
     than restated, so the two cannot drift.
+
+    EVERY ARM IS DERIVED, AND THEY MUST AGREE. The two ``--approx-add`` arms
+    differ only in what sits at ``jr`` -- a join policy or nothing -- and a
+    policy is not a slot hook and answers to no mask, so the SLOT topology is
+    the same under both. Deriving both and requiring equality is what makes
+    ``choose`` answerable here at all: its arm is a per-face decision, so there
+    is no single configuration to ask, and an answer that depended on the arm
+    would be a per-slot mask depending on a bit drawn in the same forward pass
+    -- finding 72's fault 2 with a new face. That raises rather than being
+    averaged over.
     """
-    got: list[list[str]] = [[], [], []]
+    def _derive(mode):
+        got: list[list[str]] = [[], [], []]
 
-    def _tag(site, hook):
-        got[int(hook)].append(site)
-        return hook
+        def _tag(site, hook):
+            got[int(hook)].append(site)
+            return hook
 
-    face_entry_from_slots((0, 1, 2), at_site=_tag)
-    return tuple(tuple(g) for g in got)
+        face_entry_from_slots((0, 1, 2), at_site=_tag, mode=mode)
+        return tuple(tuple(g) for g in got)
+
+    per_arm = {m: _derive(m) for m in APPROX_ADD_FIXED}
+    sites = set(per_arm.values())
+    if len(sites) != 1:
+        raise RuntimeError(
+            f"the --approx-add arms place a slot's HOOKS at different sites: "
+            f"{per_arm}. Then a per-slot mask would depend on which arm ran, "
+            f"and under 'choose' that arm is a bit drawn in the same forward "
+            f"pass as the slot rows -- ticket dsnn-3qm.59 fault 2. It must be "
+            f"designed for, not averaged over.")
+    return sites.pop()
 
 
 def _face_dict_for_vertex(config, ij, v, face_row, face_skip,

@@ -50,8 +50,8 @@ from init_scheme_test import (                                  # noqa: E402
 from alphagrad.approx.common.agent_factory import (             # noqa: E402
     REMOVED_ENV_KNOBS, apply_face_none_bias, refuse_removed_env_knobs)
 from alphagrad.approx.unified_face_head import (                # noqa: E402
-    FACE_SLOTS, NUM_APPROX_OPS, OP_NONE, O_SKIP, S_OP, _cat_logp_ent,
-    slot_base)
+    FACE_SLOTS, HEAD_WIDTH, NUM_APPROX_OPS, OP_NONE, O_SKIP, S_OP,
+    _cat_logp_ent, slot_base)
 
 _ALPHAGRAD = pathlib.Path(__file__).resolve().parents[1]
 _ENV = "ALPHAGRAD_FACE_NONE_BIAS"
@@ -85,7 +85,11 @@ def _init_probs(bias, scale_face_head=0.0, seed=11):
     a = _agent(_ns(face_none_bias=float(bias),
                    scale_face_head=float(scale_face_head)), seed=seed)
     z = a.face_path_policy.head.logits(jnp.zeros((EMBD,)))
-    assert z.shape == (1 + FACE_SLOTS * 31,)
+    # HEAD_WIDTH, not 1 + FACE_SLOTS*31: the head grew to 157 in #73 (the
+    # choose bit at 94 and two join slot blocks after it). The analytic
+    # probabilities below are unaffected -- they read each CONTRACTION slot's
+    # own op block, whose offsets are unmoved, which is the point of appending.
+    assert z.shape == (HEAD_WIDTH,)
     p_skip = float(jax.nn.sigmoid(z[O_SKIP]))
     all_ops_legal = jnp.ones((NUM_APPROX_OPS,))
     p_none = []
