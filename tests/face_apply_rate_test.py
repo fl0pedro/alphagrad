@@ -79,16 +79,20 @@ def _closed(fn, xs):
 
 
 # ==========================================================================
-# nn256 AND THE FACE ADD: nn256 CANNOT EXERCISE IT. Measured (finding 73, jobs
-# 64653 and 64659): VmappedNeuralNetwork on mnist has ZERO MERGE FACES among
-# armed faces -- graphax's `res:jl` and `res:jr` were invoked 0 times on every
-# seed, with the `new` slot armed alone AND with all three slots armed. A face
-# merge needs the contraction to land on an edge that ALREADY exists, and on
-# this target no armed face does.
+# nn256 BARELY EXERCISES THE FACE ADD, so a green nn256 run is NOT evidence
+# that the ADD works. Measured, finding 73:
 #
-# So `--approx-add` has no effect whatsoever on nn256, and a GREEN nn256 run is
-# NOT evidence that the ADD works. Every nn256 case below tests the per-slot
-# contraction legality only. The ADD is measured on TLM.
+#   jobs 64653 / 64659: with the `new` slot armed alone AND with all three
+#     armed, graphax's `res:jl` and `res:jr` were invoked ZERO times on every
+#     seed -- NO ARMED FACE on this target is a merge face.
+#   job 64803: the legality probe, which visits every face and not only the
+#     armed ones, recorded a tensor at `res:jr` on 1 of 33 faces. So exactly one
+#     merge face exists; it is just never the one an approximation lands on.
+#
+# A face merge needs the contraction to land on an edge that ALREADY exists, and
+# VmappedNeuralNetwork on mnist almost never does. Every nn256 case below
+# therefore tests the per-slot CONTRACTION legality only. The ADD, and the two
+# learned join slots, are measured on TLM.
 # ==========================================================================
 @pytest.fixture(scope="module")
 def nn256():
@@ -480,6 +484,173 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
             os.environ.pop(envmod._APPROX_ADD_ENV, None)
         else:
             os.environ[envmod._APPROX_ADD_ENV] = prev
+
+
+# ==========================================================================
+# THE TWO LEARNED JOIN SLOTS (#73): learned1 on the OLD EDGE (graphax
+# ``res:jr``) and learned2 on the SUMMED EDGE (``res:jres``). Each is masked
+# from the tensor its decision actually lands on -- the probe records one tensor
+# per site and ``slot_legality`` is computed on that site's own tensor.
+#
+# MEASURED (job 64803, TLM, one graph, min-Markowitz, 3 seeds), rejection rate
+# from the engine's own counters:
+#
+#   armed slots                  requested   rejected
+#   3      (learned1 alone)             14          0
+#   4      (learned2 alone)             92          0
+#   0,1,2  (contraction only)          341          0
+#   0,1,2,3                            354          0     <- learned1 immune
+#   0,1,2,4                            430          7     <- FAULT 2
+#   0,1,2,3,4                          443          7
+#
+# and the same under both --approx-add arms (lossy: 0/352 and 7/441).
+#
+# WHY learned1 IS IMMUNE AND learned2 IS NOT, which is the useful part. The OLD
+# EDGE is a pre-existing edge built by EARLIER eliminations; this face's lhs /
+# rhs / new rules do not touch it, so arming them cannot stale a mask read from
+# it. The SUMMED EDGE is ``new + old``, so it carries this face's own
+# contraction approximations -- and a mask computed before the draw is exactly
+# what goes stale, which is dsnn-3qm.59 fault 2 one level further along.
+#
+# So learned1 gets an ASSERTION and learned2 a STRICT xfail. Do not relax the
+# xfail to a skip: a mask that clears an action the engine then refuses is the
+# defect deliverable 3 exists to forbid.
+# ==========================================================================
+def _walk_join_slots(target, seed, arm):
+    """Arm the JOIN slots (and optionally the contraction slots), each drawn
+    against ITS OWN mask row, and return (requested, engine stats).
+
+    Each slot is sampled with a separate head call against its own mask row.
+    That is a PROBE, not the production path -- the rollout wire does not carry
+    the join band yet -- but the MASK and the TENSOR are the production ones,
+    which is what a rejection rate is about.
+    """
+    from graphax import IncrementalPathTokenizer
+    from alphagrad.approx.common.masks import slot_legality
+    from alphagrad.approx.env import face_slot_sites
+
+    jaxpr, consts, args, argnums = target
+    vv = _valid_vertices(jaxpr, args, consts, argnums)
+    order = markowitz_order(jaxpr, argnums, consts, args, vv)
+    F = MAX_FACES
+    sites = face_slot_sites()
+    S_ALL = len(sites)
+
+    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+                        max_faces=F, max_axes=N_AX)
+    tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
+                                  vocab_size=512)
+    tk.base_tokens()
+    config = SimpleNamespace(jaxpr=jaxpr)
+    pol, tables = _policy(F)
+    feats = _features()
+    ctx = jnp.zeros((pol.embd_dim,), jnp.float32)
+
+    envmod._PER_FACE_STATS.clear()
+    requested = {k: 0 for k in KINDS}
+    for n in range(len(order)):
+        v = int(order[n])
+        keys = list(tk.ij.faces(v))
+        src = lf._probe_faces(tk, v, keys, True, slots=True, stat="slot") or {}
+        nf = min(len(keys), F)
+        sizes = np.zeros((F, S_ALL, N_AX), np.int32)
+        pair = np.zeros((F, S_ALL, N_AX, N_AX), np.float32)
+        comp = np.zeros((F, S_ALL, N_AX), np.float32)
+        quant = np.zeros((F, S_ALL, 2), np.float32)
+        nout = np.zeros((F, S_ALL), np.int32)
+        for k in range(nf):
+            by = src.get(keys[k]) or {}
+            for sl, site_list in enumerate(sites):
+                st = by.get(site_list[0])
+                if st is None:
+                    continue
+                L = slot_legality(st, N_AX)
+                sizes[k, sl], nout[k, sl] = L.sizes, L.n_out
+                pair[k, sl], comp[k, sl], quant[k, sl] = (
+                    L.pair, L.comp, L.quant)
+
+        rows = np.full((F, S_ALL, 3), -1, np.int32)
+        rows[..., 2] = 0
+        skips = np.zeros((F,), np.int32)
+        for f in range(nf):
+            key = jrand.PRNGKey(seed * 1000003 + n * 97 + f)
+            for sl in arm:
+                def _rep(a):
+                    return jnp.asarray(a[f][sl][None].repeat(FACE_SLOTS, 0))
+                _sk, row, *_ = pol.sample_face(
+                    feats, tables, jrand.fold_in(key, sl), f,
+                    _rep(pair), _rep(comp), jnp.asarray(1.0),
+                    face_context=ctx, face_sizes_f=_rep(sizes),
+                    face_quant_f=_rep(quant))
+                op = int(row["op_type"][0])
+                if op == OP_NONE:
+                    continue
+                w = _row_to_wire(op, row["i"][0], row["j"][0],
+                                 row["i"][0], row["quant_dtype"][0],
+                                 nout[f, sl])
+                if w is None:
+                    continue
+                requested[_OP_KIND[op]] += 1
+                rows[f, sl] = w
+        per_face = _face_dict_for_vertex(config, tk.ij, v, rows, skips)
+        arm_face_counts()
+        try:
+            tk.ij.eliminate(v, (), per_face or None)
+        finally:
+            disarm_face_counts()
+    out = dict(envmod._PER_FACE_STATS)
+    envmod._PER_FACE_STATS.clear()
+    return requested, out
+
+
+def _join_totals(target, arm):
+    req = {k: 0 for k in KINDS}
+    skip = {k: 0 for k in KINDS}
+    for seed in range(N_SAMPLES):
+        r, st = _walk_join_slots(target, seed, arm)
+        for k in KINDS:
+            req[k] += r[k]
+            skip[k] += int(st.get(f"skipped_{k}", 0))
+    return req, skip
+
+
+def test_learned1_rejects_nothing_even_with_the_contraction_slots_armed(tlm):
+    """learned1 is masked from the OLD EDGE, which this face cannot move.
+
+    The old edge is built by EARLIER eliminations, so arming lhs / rhs / new
+    cannot stale a mask read from it. That is why this is an assertion and
+    learned2's is an xfail.
+    """
+    req, skip = _join_totals(tlm, (0, 1, 2, 3))
+    assert sum(req.values()) > 0, "nothing was requested -- vacuous"
+    assert sum(skip.values()) == 0, (req, skip)
+
+
+def test_learned1_alone_rejects_nothing(tlm):
+    req, skip = _join_totals(tlm, (3,))
+    assert sum(req.values()) > 0, "nothing was requested -- vacuous"
+    assert sum(skip.values()) == 0, (req, skip)
+
+
+def test_learned2_alone_rejects_nothing(tlm):
+    """With the contraction slots UNARMED the summed edge is exact, so the mask
+    read from it is still valid at apply time."""
+    req, skip = _join_totals(tlm, (4,))
+    assert sum(req.values()) > 0, "nothing was requested -- vacuous"
+    assert sum(skip.values()) == 0, (req, skip)
+
+
+@pytest.mark.xfail(strict=True,
+                   reason="dsnn-3qm.59 fault 2, one level further along: the "
+                          "SUMMED edge is new + old, so it carries this face's "
+                          "own contraction approximations, and learned2's mask "
+                          "is read from it BEFORE those rows are drawn. "
+                          "Measured 7 of 430 rejected on TLM (5 Diag, 2 "
+                          "Reduce), under both --approx-add arms, and 0 when "
+                          "the contraction slots are unarmed.")
+def test_learned2_rejects_nothing_with_the_contraction_slots_armed(tlm):
+    req, skip = _join_totals(tlm, (0, 1, 2, 4))
+    assert sum(skip.values()) == 0, (req, skip)
 
 
 # --------------------------------------------------------------------------
