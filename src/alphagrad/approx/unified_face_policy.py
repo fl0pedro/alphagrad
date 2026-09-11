@@ -604,8 +604,9 @@ class UnifiedFacePolicy(eqx.Module):
                 ff, _pv, _cv, _qm, op_legality_override, tables)
         ctx_f = self._repr(face_context)
         z = self.head.logits(ctx_f)
-        # Read the fields back off the stored wire rows -- the inverse of
-        # _rows. COMPRESS parked the axis in `i`, DIAG parked the pair.
+        # The stored record, back as the head's own decision -- `_wire_row`'s
+        # inverse, and the one place the PPO ratio's "same variable" claim is
+        # made good.
         fields = self._fields_of(fa, f)
         approx_ok = (jnp.asarray(allow_skip, dtype=jnp.float32)
                      if allow_skip is not None
