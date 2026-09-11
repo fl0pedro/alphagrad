@@ -1409,14 +1409,6 @@ class LiveFaceStream:
                 return out
             return _chooser
 
-        ft = {}
-        for f in range(n_faces):
-            if skips is not None and int(np.asarray(skips).reshape(-1)[f]) == 1:
-                ft[keys[f]] = SKIP_FACE
-                continue
-            ft[keys[f]] = face_entry_from_slots(
-                tuple(_mk(f, s) for s in range(S)), with_policy=False)
-
         # with_policy=False, for the reason `_probe_faces` uses it and one more.
         # A join POLICY is not a slot hook: it answers to no mask and applies no
         # wire row, so it can change no decision taken here. Under every value
@@ -1427,6 +1419,14 @@ class LiveFaceStream:
         # policy at all (env._JOIN_SEMANTICS_OF, finding 74 section 7). It is
         # also the only form that can answer under `--approx-add choose`, where
         # the arm is a per-face bit this pass does not hold.
+        ft = {}
+        for f in range(n_faces):
+            if skips is not None and int(np.asarray(skips).reshape(-1)[f]) == 1:
+                ft[keys[f]] = SKIP_FACE
+                continue
+            ft[keys[f]] = face_entry_from_slots(
+                tuple(_mk(f, s) for s in range(S)), with_policy=False)
+
         prev = approx_active()
         set_approx_active(bool(approx))
         try:
