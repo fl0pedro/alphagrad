@@ -450,7 +450,28 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
     re-masks with exactly what the behaviour policy masked with.
     """
     F, N = int(max_faces), int(max_axes)
-    S = 3   # lhs, rhs, new -- live_faces._SLOT_SITES
+    # THE TRAINER CONSUMES THE CONTRACTION BAND ONLY, and says so.
+    #
+    # `face_slot_legality` returns one mask row per slot the entry builder places
+    # a hook for, which since #73 is five: lhs, rhs, new, learned1 (the old
+    # edge), learned2 (the summed edge). The policy's per-slot features and the
+    # rollout wire still cover the three contraction slots, so this callback
+    # NARROWS to them -- deliberately, and asserted below rather than left as a
+    # bare `S = 3` that happens to slice correctly.
+    #
+    # The assertion is the load-bearing part: it pins that the contraction slots
+    # are the PREFIX of the topology. If a future value reordered the bands, a
+    # silent `[:3]` would hand the head three masks belonging to other tensors
+    # -- the mask/tensor mismatch of finding 72, arrived at from the other side.
+    from alphagrad.approx.env import FACE_SLOTS as _CONTRACTION_SLOTS
+    from alphagrad.approx.env import face_slot_sites as _sites
+    S = int(_CONTRACTION_SLOTS)
+    _topology = _sites()
+    if tuple(x[0] for x in _topology[:S]) != ("lhs", "rhs", "res:new"):
+        raise RuntimeError(
+            f"the contraction slots are no longer the prefix of the face slot "
+            f"topology ({_topology}); narrowing the legality masks to the first "
+            f"{S} rows would hand the head masks computed from other tensors.")
     _perf = None
     if prof_sink is not None:
         import time as _time

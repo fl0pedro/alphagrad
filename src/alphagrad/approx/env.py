@@ -4793,6 +4793,26 @@ def make_slot_frame_hook(one_row, *, stats: dict | None = None,
 # the plan log records what actually ran. Read at call time, never at import.
 _APPROX_ADD_ENV = "ALPHAGRAD_APPROX_ADD"
 _APPROX_OLD_ENV = "ALPHAGRAD_APPROX_OLD"          # RETIRED, raises
+#: THE WIRE'S SLOT BANDS (#73). ``FACE_SLOTS`` keeps meaning "the CONTRACTION
+#: slots" -- lhs, rhs, new -- so every existing ``range(FACE_SLOTS)`` loop stays
+#: correct without being read. The two JOIN slots are appended after them:
+#:
+#:     0..2  contraction: lhs, rhs, new
+#:     3     learned1, the OLD EDGE    (graphax ``jr``)
+#:     4     learned2, the SUMMED EDGE (graphax ``jres``)
+#:
+#: ROUTE CHOSEN, and why: the join rows ride the EXISTING ``face_specs`` array
+#: widened from 3 slots to 5, not a second array beside it. The wire's transport
+#: is already built -- ``face_specs`` is carried wholesale through the env state,
+#: the callback, the plan record, the rollout and the replay (32 sites in env.py
+#: and about 25 in ppo.py) -- so widening changes shape-bearing CONSTRUCTIONS and
+#: no transport, while a second array would have to duplicate all of it. It also
+#: keeps the head's already-5-row ``FaceFields`` un-split: splitting it at the
+#: policy boundary and rejoining it in env is exactly where a row could be
+#: mis-slotted.
+JOIN_WIRE_SLOTS = 2
+N_WIRE_SLOTS = FACE_SLOTS + JOIN_WIRE_SLOTS
+
 APPROX_ADD_CHOICES = ("lossy", "lossless", "choose")
 #: The values whose join semantics is FIXED for the whole run. ``choose`` is
 #: not one of them: it is decided per FACE by the head's bit.
@@ -4941,7 +4961,7 @@ def _join_outcome_sink():
 
 
 def face_entry_from_slots(slots, at_site=None, at_join=None, mode=None,
-                          need_join=True):
+                          with_policy=True):
     """ONE face's ``face_transforms`` entry from its decoded per-slot hooks
     ``(lhs, rhs, new)`` -- the ONLY place a face wire becomes a graphax entry
     (ticket .17, D1). ``_face_dict_for_vertex`` (the measurement),
@@ -5012,34 +5032,53 @@ def face_entry_from_slots(slots, at_site=None, at_join=None, mode=None,
     site. It returns the object to place at ``jr``; the default is the policy
     itself.
 
-    ``need_join=False`` -- the caller wants NO join at all, and the arm is then
-    not consulted. The legality probe uses it. That is SAFE, not a shortcut:
-    every site a slot hook is installed at is PRE-JOIN
-    (:func:`face_slot_sites` is all ``lhs`` / ``rhs`` / ``res:new``), so the
-    reconciliation cannot change any tensor the probe is recording, and the
-    probe's elimination runs inside a snapshot that is undone in full. Leaving
-    the live policy in would make every probe perform the reconciliation's
-    arithmetic for a result nothing reads -- and under ``choose`` the probe does
-    not even have the bit, so asking for the arm would raise.
+    ``with_policy=False`` -- place the slot HOOKS but no join POLICY, and do not
+    consult the arm. The legality probe uses it, and it is SAFE rather than
+    convenient: the probe needs the TENSORS each slot hook will meet, which the
+    hooks alone deliver, while the reconciliation only changes values and is
+    undone by the probe's snapshot anyway. Leaving the live policy in would make
+    every probe pay the reconciliation's arithmetic for a result nothing reads
+    -- and under ``choose`` the probe holds no bit, so asking for the arm would
+    raise.
+
+    FIVE SLOTS, OPTIONALLY. ``slots`` is either the three CONTRACTION slots
+    (lhs, rhs, new) or those plus the two JOIN slots, in order:
+
+        3  learned1 -- the OLD EDGE,    graphax ``jr``
+        4  learned2 -- the SUMMED EDGE, graphax ``jres``
+
+    Any other length raises. The LENGTH is what declares whether join rows are
+    present, so a join row cannot be mis-slotted into a contraction position or
+    the reverse: there is no width at which the bands could be confused.
+
+    learned1's hook lands on the old edge under BOTH arms, but by two routes,
+    because under ``lossless`` there is no policy to hang it off: as the
+    policy's ``pre`` under ``lossy`` (running FIRST, so the reconciliation still
+    has the last word on the structure and the two addends still come out
+    identical) and as a plain ``jr`` hook under ``lossless``. Same tensor, same
+    site name, so one mask describes it either way.
     """
     def _at(site, hook):
         if hook is None or at_site is None:
             return hook
         return at_site(site, hook)
 
+    if len(slots) not in (FACE_SLOTS, N_WIRE_SLOTS):
+        raise ValueError(
+            f"face_entry_from_slots takes {FACE_SLOTS} slots (contraction "
+            f"only) or {N_WIRE_SLOTS} (plus learned1 on the old edge and "
+            f"learned2 on the summed edge), got {len(slots)}. The length is "
+            f"what says which bands are present; an in-between width could "
+            f"only be a mis-slotted row.")
     _new_hook = slots[2] if len(slots) > 2 else None
+    _l1 = slots[FACE_SLOTS] if len(slots) > FACE_SLOTS else None
+    _l2 = slots[FACE_SLOTS + 1] if len(slots) > FACE_SLOTS + 1 else None
     core3 = (_at("lhs", slots[0]), _at("rhs", slots[1]),
              _at("res:new", _new_hook))
-    if not need_join:
-        # THE CALLER DOES NOT WANT A JOIN AT ALL, so the arm is not consulted.
-        # That is not a shortcut: under `choose` the arm is a per-face decision
-        # the caller may not have, and `resolve_join_mode` would rightly raise
-        # -- but a caller that is discarding the join has nothing to lose by
-        # not knowing it. The legality probe is the case: every site a SLOT
-        # hook is installed at is pre-join (`face_slot_sites`), so no arm can
-        # change a tensor it records, and its elimination is undone by its
-        # snapshot anyway.
-        return (core3, (None, None, None))
+    jr_hook = _at("res:jr", _l1)
+    jres_hook = _at("res:jres", _l2)
+    if not with_policy:
+        return (core3, (None, jr_hook, jres_hook))
     mode = resolve_join_mode(mode)
     # AN UNARMED FACE STAYS EXACT, and the gate lives HERE.
     #
@@ -5060,15 +5099,21 @@ def face_entry_from_slots(slots, at_site=None, at_join=None, mode=None,
     # place a face wire becomes a graphax entry": a guard held in three copies
     # at the call sites is exactly the duplication that let the probe's site
     # list drift from the measurement's (finding 72).
-    _armed = any(h is not None for h in (slots[0], slots[1], _new_hook))
+    _armed = any(h is not None
+                 for h in (slots[0], slots[1], _new_hook, _l1, _l2))
     if mode == "lossy" and _armed:
         from graphax.sparse.ops.join import MatchFreshJoin
-        policy = MatchFreshJoin(on_outcome=_join_outcome_sink())
+        # learned1 rides the policy's `pre`, which graphax applies to the old
+        # edge BEFORE the reconciliation -- so the reconciliation still has the
+        # last word and the two addends still come out structurally identical.
+        policy = MatchFreshJoin(pre=jr_hook,
+                                on_outcome=_join_outcome_sink())
         if at_join is not None:
             policy = at_join(policy)
-        return (core3, (None, policy, None))
+        return (core3, (None, policy, jres_hook))
     if mode in ("lossy", "lossless"):
-        return (core3, (None, None, None))
+        # No policy: learned1 is a PLAIN hook at `jr`. Same tensor, same site.
+        return (core3, (None, jr_hook, jres_hook))
     raise NotImplementedError(
         f"face_entry_from_slots: --approx-add {mode!r} is accepted by "
         f"approx_add() but has no entry form here. A value that cannot be "
@@ -5085,7 +5130,7 @@ def face_slot_sites() -> tuple[tuple[str, ...], ...]:
     DERIVED by calling the entry builder itself with tagging probes rather
     than restated, so the two cannot drift.
 
-    DERIVED WITH ``need_join=False``, and that is the whole reason this function
+    DERIVED WITH ``with_policy=False``, and that is the whole reason this function
     can answer under EVERY ``--approx-add`` value including ``choose``. The join
     position holds a POLICY or nothing; a policy is not a slot hook, applies no
     wire row and answers to no mask, so it contributes no site and the slot
@@ -5098,13 +5143,14 @@ def face_slot_sites() -> tuple[tuple[str, ...], ...]:
     automatically, because the site list is whatever the entry builder tags --
     never a restatement.
     """
-    got: list[list[str]] = [[], [], []]
+    got: list[list[str]] = [[] for _ in range(N_WIRE_SLOTS)]
 
     def _tag(site, hook):
         got[int(hook)].append(site)
         return hook
 
-    face_entry_from_slots((0, 1, 2), at_site=_tag, need_join=False)
+    face_entry_from_slots(tuple(range(N_WIRE_SLOTS)), at_site=_tag,
+                          with_policy=False)
     return tuple(tuple(g) for g in got)
 
 

@@ -435,7 +435,10 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
         for want in envmod.APPROX_ADD_CHOICES:
             os.environ[envmod._APPROX_ADD_ENV] = want
             sites = envmod.face_slot_sites()
-            assert sites == (("lhs",), ("rhs",), ("res:new",)), (want, sites)
+            assert sites == (("lhs",), ("rhs",), ("res:new",),
+                             ("res:jr",), ("res:jres",)), (want, sites)
+            # ONE site per slot is the invariant, not the count.
+            assert all(len(x) == 1 for x in sites), (want, sites)
             flat = {x for per in sites for x in per}
             lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
                                 max_faces=MAX_FACES, max_axes=N_AX)

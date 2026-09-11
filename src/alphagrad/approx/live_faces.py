@@ -890,18 +890,20 @@ class LiveFaceStream:
             # ONE recorder per SITE: face_entry_from_slots installs a slot's
             # single hook at several sites, and `at_site` is the only way to
             # tell those invocations apart (the objects are identical).
-            # need_join=False: no join at all for the probe, and the arm is
-            # not consulted. Safe, because every site a slot hook is installed
-            # at is PRE-JOIN, so the reconciliation cannot change a tensor
-            # recorded here, and this elimination is undone in full by the
+            # with_policy=False: the slot HOOKS go in (so every tensor a slot
+            # will meet is recorded, INCLUDING the old edge and the summed edge)
+            # but no join POLICY, and the arm is not consulted. The probe needs
+            # the tensors, which the hooks deliver; the reconciliation only
+            # changes values and this elimination is undone in full by the
             # snapshot. Keeping it would make every probe pay the
             # reconciliation's arithmetic for a result nothing reads -- and
             # under `--approx-add choose` the probe does not hold the per-face
             # bit, so asking for the arm would raise.
+            from alphagrad.approx.env import N_WIRE_SLOTS
             ft = {k: face_entry_from_slots(
-                      (0, 1, 2),
+                      tuple(range(N_WIRE_SLOTS)),
                       at_site=lambda site, _h, k=k: _mk(k, site),
-                      need_join=False)
+                      with_policy=False)
                   for k in keys}
         else:
             ft = {k: (None, None, _mk(k)) for k in keys}
@@ -1065,7 +1067,14 @@ class LiveFaceStream:
         from alphagrad.approx.env import face_slot_sites
 
         F, N = self.max_faces, self.max_axes
-        S = len(_SLOT_SITES)
+        # S FROM THE SITE TOPOLOGY, not from the 3-name contraction tuple. The
+        # mask must have one row per slot the entry builder places a hook for,
+        # or a slot's decision would be drawn under a row nobody filled in --
+        # which is finding 72's fault 1 with the bands the other way round.
+        # `face_slot_sites()` derives that list by calling the entry builder, so
+        # this widens by itself when a value adds a slot.
+        sites = face_slot_sites()
+        S = len(sites)
         order = np.asarray(order).reshape(-1)
         specs = np.asarray(specs)
         n, vertex = int(n), int(vertex)
@@ -1096,7 +1105,6 @@ class LiveFaceStream:
                     for m in self._SIZE_DISPATCH_MODES]
         n_faces = min(len(keys), F)
         src = per_mode[0] or (per_mode[1] if len(per_mode) > 1 else {})
-        sites = face_slot_sites()
         for k in range(n_faces):
             kk = keys[k]
             by_site = src.get(kk)
