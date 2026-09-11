@@ -5187,7 +5187,18 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
             per_face[key] = SKIP_FACE
             continue
         slots = []
-        for s in range(FACE_SLOTS):
+        # AS MANY SLOTS AS THE ROWS CARRY. `face_row` is (F, S, 3) with S either
+        # FACE_SLOTS (contraction only) or N_WIRE_SLOTS (plus learned1 on the old
+        # edge and learned2 on the summed edge). The WIDTH is what says which
+        # bands are present, and face_entry_from_slots raises on anything
+        # between, so a join row cannot land in a contraction slot.
+        _n_slots = int(np.asarray(face_row).shape[1])
+        if _n_slots not in (FACE_SLOTS, N_WIRE_SLOTS):
+            raise ValueError(
+                f"face_row has {_n_slots} slot rows; expected {FACE_SLOTS} "
+                f"(contraction only) or {N_WIRE_SLOTS} (plus the two join "
+                f"slots). An in-between width could only be a mis-slotted row.")
+        for s in range(_n_slots):
             # The decoder walks all MAX_RULES slots — pad the single face
             # row with end-sentinels.
             # `face_row` may be a numpy view (the caller no longer pays for a
