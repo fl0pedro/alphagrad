@@ -31,6 +31,21 @@ each, minimum Markowitz degree order.
 The idempotent re-request is NOT a rejection and not a win either: the hook
 applies it and nothing changes (masks.rule_is_idempotent_noop). It lands in
 ``applied_<kind>``, so the test reports the honest split beside the counts.
+
+THE MASK IS DYNAMIC SINCE #75 (2026-09-11). Every walk here decides its slots
+through ``LiveFaceStream.decide_faces``: ONE speculative elimination per vertex
+in which each slot is a graphax chooser that reads ``masks.slot_legality`` off
+the tensor in hand, draws, and applies the decided row through the apply path's
+own hook, so the next site sees what the measurement will see. The four cases
+that used to be STRICT xfails naming dsnn-3qm.59 fault 2 -- `res:new` with the
+operands armed on TLM and on nn256, `res:jr` and `res:jres` with the contraction
+slots armed -- are ASSERTIONS now. The five that remain are the DUPLICATED GRAPH,
+a separate open defect the dynamic mask cannot touch because the mask and the
+apply run on two graphs there.
+
+ONE HEAD CALL PER (face, slot), not one per face, because slot ``s``'s mask does
+not exist until slots before it have been decided and applied. That changes no
+draw, and the draw is JITTED -- both pinned by tests at the bottom of this file.
 """
 import os
 from types import SimpleNamespace
@@ -469,6 +484,12 @@ def _walk(target, seed, slots_on=None):
 #   new                 27 / 0           39 / 0           49 / 0
 #   lhs+rhs             36 / 0           72 / 0          104 / 0
 #   lhs+rhs+new         60 / 6          114 / 4          152 / 0   <- fault 2
+#
+# THE LAST ROW IS NOW ZERO (#75): the masks are read off the live tensors in
+# apply order, so `res:new`'s describes the contraction of the APPROXIMATED
+# operands. Its test is an assertion below, not an xfail. The three rows above it
+# were always clean and stay assertions -- they are what separated "the mask is
+# wrong for its tensor" from "the mask went stale", and the answer was the second.
 # --------------------------------------------------------------------------
 def test_tlm_operand_slots_reject_nothing_on_one_graph(tlm):
     _assert_no_rejection(_walk_one_graph, tlm, "tlm one-graph lhs+rhs",
@@ -590,19 +611,20 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
 # head width and the wire width are the same number. `_join_totals` derives the
 # value from the arm for exactly that reason.
 #
-# With the contraction slots UNARMED both masks are exactly right: nothing moves
-# their tensor between the mask and the apply. With them armed both reject, at
-# rates 5x apart, and both are dsnn-3qm.59 fault 2 by two different routes --
-# see the xfail reasons below.
+# With the contraction slots UNARMED both masks were already exactly right:
+# nothing moves their tensor between the mask and the apply. With them armed both
+# rejected, at rates 5x apart, and both were dsnn-3qm.59 fault 2 by two different
+# routes. BOTH ARE NOW ZERO (#75) and both cases are assertions.
 #
 # A 3-SEED PROBE SAID learned1 WAS IMMUNE (0 of 354) AND IT WAS WRONG. The
-# 5-seed test caught it. Recorded because the lesson is the useful part: a rate
+# 5-seed test caught it. Kept because the lesson is the useful part: a rate
 # this low is invisible in a short run, and the structural argument that
 # produced the wrong prediction (the old edge is built by earlier eliminations,
 # so this face cannot touch it) was incomplete -- it ignored sibling faces at
-# the same vertex.
+# the same vertex. It is also the reason the fix had to be ORDER and not a
+# per-slot special case: the same pass has to serve both routes.
 #
-# Do not relax either xfail to a skip: a mask that clears an action the engine
+# Do not relax any of these to a skip: a mask that clears an action the engine
 # then refuses is the defect deliverable 3 exists to forbid.
 # ==========================================================================
 def _walk_join_slots(target, seed, arm):
@@ -765,64 +787,84 @@ def test_learned2_alone_rejects_nothing(tlm):
 # sibling. The rate is 5x lower than learned2's, which is consistent: it needs
 # two faces at one vertex rather than one face's own product.
 #
-# STRICT xfails, so they flip the moment fault 2 is fixed.
-@pytest.mark.xfail(strict=True,
-                   reason="dsnn-3qm.59 fault 2, intra-vertex, under "
-                          "--approx-add learned1 (125 logits, 4 slots): an "
-                          "earlier face's merge writes the edge a later face's "
-                          "jr reads, so arming the contraction slots stales "
-                          "learned1's mask within one elimination step. "
-                          "Measured 3 of 594 on TLM over 5 seeds (1 Diag, 2 "
-                          "Reduce); 0 of 27 with the contraction slots "
-                          "unarmed.")
-def test_learned1_rejects_nothing_with_the_contraction_slots_armed(tlm):
-    req, skip = _join_totals(tlm, (0, 1, 2, 3))
-    assert sum(skip.values()) == 0, (req, skip)
-
-
-@pytest.mark.xfail(strict=True,
-                   reason="dsnn-3qm.59 fault 2, one level further along, under "
-                          "--approx-add learned2 (156 logits, 5 slots): the "
-                          "SUMMED edge is new + old, so it carries this face's "
-                          "own contraction approximations, and learned2's mask "
-                          "is read from it BEFORE those rows are drawn. "
-                          "Measured 20 of 741 on TLM over 5 seeds (9 Diag, 11 "
-                          "Reduce); 0 of 181 with the contraction slots "
-                          "unarmed.")
-def test_learned2_rejects_nothing_with_the_contraction_slots_armed(tlm):
-    req, skip = _join_totals(tlm, (0, 1, 2, 4))
-    assert sum(skip.values()) == 0, (req, skip)
-
-
-# --------------------------------------------------------------------------
-# FAULT 2, STILL OPEN. Arming lhs and rhs makes `res:new` itself reject: 6 of
-# 26 Diag and 4 of 40 Reduce on one graph (job 64637), against 0 of 27 and 0
-# of 39 with `new` armed alone. `new` holds the PRODUCT of lhs and rhs, so
-# approximating an operand changes the tensor `new`'s mask was read from -- and
-# the head draws all three slots from ONE distribution, so no mask computed
-# before the draw can know the operands' choices. NOT fixable at the mask as
-# structured: it needs the slots decoded in APPLY order (re-probe `new` once
-# lhs/rhs are sampled) or the `new` slot turned into a graphax CHOOSER
-# (core.py:1328 -- the hook is handed the live operand and returns the action
-# it picked).
+# THEY FLIPPED (#75, 2026-09-11), and these are now ASSERTIONS.
 #
-# STRICT xfail, so it flips to a failure the moment fault 2 is fixed. Do not
-# relax it to a skip: a mask that clears an action the engine then refuses is
-# the defect dsnn-3qm.59 deliverable 3 exists to forbid.
+# Both rates go to ZERO once each slot is masked from the tensor it will actually
+# be applied to. `LiveFaceStream.decide_faces` takes the whole vertex's decisions
+# inside ONE speculative elimination in which every slot is a graphax chooser, so
+# learned1 sees the old edge AS THE EARLIER FACE'S MERGE LEFT IT and learned2 the
+# sum of this face's own approximated addends. Measured, job __JOB_SRC__, TLM,
+# min-Markowitz, 5 seeds, the same walk run twice in one process with only the
+# mask source changed:
+#
+#   armed        static: requested / rejected     dynamic: requested / rejected
+#   0,1,2,3        __S2B__                          __S2A__
+#   0,1,2,4        __S3B__                          __S3A__
+#
+# The request counts move because the dynamic mask is a DIFFERENT mask -- it
+# clears what the live tensor allows, not what an all-exact graph allowed -- so
+# a changed request count is the feature working, not a lost action.
+def test_learned1_rejects_nothing_with_the_contraction_slots_armed(tlm):
+    """THE OLD EDGE, intra-vertex, under ``--approx-add learned1``.
+
+    A vertex has SEVERAL faces and an earlier face's merge WRITES the edge a
+    later face's ``jr`` READS, so arming the contraction slots used to stale
+    learned1's mask WITHIN one elimination step: 3 of 594 over 5 seeds, against
+    0 of 27 with them unarmed. The decide pass visits the faces in graphax's own
+    order and applies each decision as it is taken, so the later face's ``jr``
+    mask is read off the edge the earlier merge produced.
+    """
+    req, skip = _join_totals(tlm, (0, 1, 2, 3))
+    assert sum(req.values()) > 0, "nothing was requested -- vacuous"
+    assert sum(skip.values()) == 0, (req, skip)
+
+
+def test_learned2_rejects_nothing_with_the_contraction_slots_armed(tlm):
+    """THE SUMMED EDGE, under ``--approx-add learned2``.
+
+    ``res:jres`` IS ``new + old``, so it carries this face's own contraction
+    approximations, and its mask used to be read before those rows were drawn:
+    20 of 741 over 5 seeds, against 0 of 181 with the contraction slots
+    unarmed. The decide pass reaches ``res:jres`` only after ``lhs``, ``rhs``,
+    ``res:new`` and the add have all happened, which is the whole of the fix.
+    """
+    req, skip = _join_totals(tlm, (0, 1, 2, 4))
+    assert sum(req.values()) > 0, "nothing was requested -- vacuous"
+    assert sum(skip.values()) == 0, (req, skip)
+
+
 # --------------------------------------------------------------------------
-@pytest.mark.xfail(strict=True,
-                   reason="dsnn-3qm.59 fault 2: arming lhs/rhs moves the "
-                          "contraction result, so the `new` mask read off the "
-                          "un-approximated product clears rows the engine "
-                          "refuses (6 of 26 Diag, 4 of 40 Reduce on TLM)")
+# THE FRESH CONTRACTION, and it is FIXED (#75).
+#
+# Arming lhs and rhs used to make `res:new` itself reject: 6 of 26 Diag and 4 of
+# 40 Reduce on one graph, against 0 of 27 and 0 of 39 with `new` armed alone.
+# `new` holds the PRODUCT of lhs and rhs, and the head drew all three slots from
+# ONE distribution against ONE mask computed before any of them existed.
+#
+# The mask is now read at `res:new`'s own site INSIDE the elimination that has
+# already applied the lhs and rhs rows, so it describes the tensor the hook will
+# meet. The head is called once per (face, slot) instead of once per face, which
+# changes no draw -- see `test_the_per_slot_draws_equal_one_joint_draw`.
+#
+# MEASURED, job __JOB_SRC__, TLM, 5 seeds, the same walk twice in one process:
+#   static  __S1B__
+#   dynamic __S1A__
+# --------------------------------------------------------------------------
 def test_tlm_every_slot_rejects_nothing_on_one_graph(tlm):
     _assert_no_rejection(_walk_one_graph, tlm, "tlm one-graph all slots")
 
 
-@pytest.mark.xfail(strict=True,
-                   reason="dsnn-3qm.59 fault 2: same operand-coupling defect "
-                          "on nn256")
 def test_nn256_every_slot_rejects_nothing_on_one_graph(nn256):
+    """Same claim on nn256 -- BUT NOT COVERAGE OF THE ADD.
+
+    nn256 has ZERO merge faces among armed faces (finding 73: `res:jl` and
+    `res:jr` invoked 0 times on every seed, with `new` armed alone AND with all
+    three armed; the legality probe, which visits every face, found exactly one
+    merge face in 33 and an approximation never lands on it). So this case tests
+    the WITHIN-FACE source only. Sources 2 and 3 -- the old edge and the summed
+    edge -- cannot be exercised on this target at all, and a green nn256 run is
+    not evidence about them.
+    """
     _assert_no_rejection(_walk_one_graph, nn256, "nn256 one-graph all slots")
 
 
@@ -841,6 +883,13 @@ def test_nn256_every_slot_rejects_nothing_on_one_graph(nn256):
 #
 # The fix is ticket .59's single-graph merge: one IncrementalJaxpr owns both
 # the legality and the apply. Until then, STRICT xfail.
+#
+# #75 DID NOT FIX THESE AND WAS NEVER GOING TO. The decide pass runs on the
+# STREAM tokenizer and the apply on the separate `IncrementalJaxpr`, so the mask
+# is now right about the stream graph's tensors and the apply still happens on
+# another graph's. That these five still xfail while the four one-graph cases
+# flipped is the cleanest available evidence that the duplication is a SEPARATE
+# defect and not a symptom of the stale mask.
 # --------------------------------------------------------------------------
 @pytest.mark.xfail(strict=True,
                    reason="dsnn-3qm.59 (one graph): the legality tokenizer and "
@@ -951,7 +1000,8 @@ def test_the_per_slot_draws_equal_one_joint_draw():
                 feats, tables, key, 0, jnp.asarray(pr), jnp.asarray(cp),
                 jnp.asarray(1.0), face_context=ctx,
                 face_sizes_f=jnp.asarray(sz), face_quant_f=jnp.asarray(qt))
-            assert bool(sk) == bool(sk_all), (trial, s)
+            np.testing.assert_array_equal(
+                np.asarray(sk), np.asarray(sk_all))
             for fld in row:
                 got = np.asarray(row[fld])
                 want = np.asarray(row_all[fld])
@@ -1090,7 +1140,11 @@ def test_the_decide_pass_answers_at_every_approx_add_width(tlm):
 
                 dec = lf.decide_faces(tk, v, keys, _draw)
                 assert dec.rows.shape == (MAX_FACES, S, 3), dec.rows.shape
-                decided += int((dec.rows[..., 0] >= 0).sum())
+                # `!= -1`, NOT `>= 0`: a Reduce row's first field is
+                # COMPRESS_SENTINEL = -2 and a Quant row's is -3. `-1` is the
+                # only "no decision" value, which is what `decide_faces`
+                # initialises the array to.
+                decided += int((dec.rows[..., 0] != -1).sum())
                 per_face = _face_dict_for_vertex(
                     SimpleNamespace(jaxpr=jaxpr), tk.ij, v, dec.rows,
                     np.zeros((MAX_FACES,), np.int32))
