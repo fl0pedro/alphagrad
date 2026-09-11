@@ -178,8 +178,8 @@ def _walk_one_graph(target, seed, slots_on=None):
     """One sampled plan with the mask and the apply ON THE SAME GRAPH.
 
     ``_walk`` keeps the production pair of graphs; this owns a single
-    ``IncrementalPathTokenizer``, reads the per-slot legality off it through
-    ``LiveFaceStream._probe_faces`` (whose ``_Snapshot`` undoes the speculative
+    ``IncrementalPathTokenizer``, decides every face slot on it through
+    ``LiveFaceStream.decide_faces`` (whose ``_Snapshot`` undoes the speculative
     elimination) and then runs the real elimination on that same graph.
 
     WHY BOTH. The two arrangements fail for different reasons, and a test that
@@ -188,15 +188,31 @@ def _walk_one_graph(target, seed, slots_on=None):
     3 of 95 steps), which would mask whether the per-slot legality itself is
     sound. This arm is the legality claim; ``_walk`` is the legality claim PLUS
     the duplication.
+
+    THE MASK IS DYNAMIC (#75, .59 fault 2). Every slot is drawn against
+    ``masks.slot_legality`` read off the LIVE tensor at that slot's own graphax
+    site, inside the one speculative elimination that also APPLIES each decided
+    row as it is taken -- so ``res:new``'s mask describes the contraction of the
+    ALREADY-APPROXIMATED operands, ``res:jr``'s the old edge as earlier faces'
+    merges left it, and ``res:jres``'s the sum of this face's own approximated
+    addends. It used to read all of them from one recording probe in which no
+    decision had been made, which is what made the three strict xfails below
+    strict xfails.
+
+    ONE HEAD CALL PER (face, slot) rather than one per face, because a slot's
+    mask does not exist until the slots before it have been decided. That
+    changes NO draw: ``UnifiedFaceHead.sample`` gives slot ``s`` its own key
+    slice and its own logit block and conditions it on nothing but slot ``s``'s
+    own masks, so ``S`` calls with progressively filled mask rows draw exactly
+    what one call with all of them draws -- pinned by
+    ``test_the_per_slot_draws_equal_one_joint_draw``.
     """
     from graphax import IncrementalPathTokenizer
-    from alphagrad.approx.common.masks import slot_legality
     from alphagrad.approx.env import face_slot_sites
 
     jaxpr, consts, args, argnums = target
     vv = _valid_vertices(jaxpr, args, consts, argnums)
     order = markowitz_order(jaxpr, argnums, consts, args, vv)
-    total_v = len(jaxpr.eqns)
     F = MAX_FACES
 
     lf = LiveFaceStream(jaxpr, argnums, consts, args,
@@ -225,34 +241,27 @@ def _walk_one_graph(target, seed, slots_on=None):
     for n in range(len(order)):
         v = int(order[n])
         keys = list(tk.ij.faces(v))
-        src = lf._probe_faces(tk, v, keys, True, slots=True, stat="slot") or {}
-        nf = min(len(keys), F)
+        # The mask rows fill in AS THE DECISIONS LAND: row s is written by the
+        # chooser at slot s's own site, and the head call for slot s reads this
+        # array. Rows past s are still zero, which cannot reach slot s's draw.
         sizes = np.zeros((F, S_ALL, N_AX), np.int32)
         pair = np.zeros((F, S_ALL, N_AX, N_AX), np.float32)
         comp = np.zeros((F, S_ALL, N_AX), np.float32)
         quant = np.zeros((F, S_ALL, 2), np.float32)
         nout = np.zeros((F, S_ALL), np.int32)
-        for k in range(nf):
-            by = src.get(keys[k]) or {}
-            for sl, site_list in enumerate(sites):
-                st = by.get(site_list[0])
-                if st is None:
-                    continue
-                also = tuple(by[x] for x in site_list[1:]
-                             if by.get(x) is not None)
-                L = slot_legality(st, N_AX, also=also)
-                sizes[k, sl], nout[k, sl] = L.sizes, L.n_out
-                pair[k, sl], comp[k, sl], quant[k, sl] = L.pair, L.comp, L.quant
-
-        rows = np.full((F, FACE_SLOTS, 3), -1, np.int32)
-        rows[..., 2] = 0
         skips = np.zeros((F,), np.int32)
-        for f in range(nf):
-            key = jrand.PRNGKey(seed * 1000003 + n * 97 + f)
+
+        def _draw(f, s, L, _n=n):
+            sizes[f, s] = L.sizes
+            nout[f, s] = L.n_out
+            pair[f, s] = L.pair.astype(np.float32)
+            comp[f, s] = L.comp.astype(np.float32)
+            quant[f, s] = L.quant.astype(np.float32)
+            if slots_on is not None and _SLOT_SITES[s] not in slots_on:
+                return None
+            key = jrand.PRNGKey(seed * 1000003 + _n * 97 + f)
             # SLICED TO THE CONTRACTION BAND, like face_driver does: the policy
-            # builds per-slot features for the three contraction slots, and the
-            # join rows above were computed to prove they CAN be (and to mask
-            # learned1/learned2 once the wire carries them), not to be fed in.
+            # builds per-slot features for the three contraction slots only.
             _skip, row, *_ = pol.sample_face(
                 feats, tables, key, f,
                 jnp.asarray(pair[f][:FACE_SLOTS]),
@@ -260,19 +269,18 @@ def _walk_one_graph(target, seed, slots_on=None):
                 face_context=ctx,
                 face_sizes_f=jnp.asarray(sizes[f][:FACE_SLOTS]),
                 face_quant_f=jnp.asarray(quant[f][:FACE_SLOTS]))
-            for sl in range(FACE_SLOTS):
-                if slots_on is not None and _SLOT_SITES[sl] not in slots_on:
-                    continue
-                op = int(row["op_type"][sl])
-                if op == OP_NONE:
-                    continue
-                w = _row_to_wire(op, row["i"][sl], row["j"][sl], row["i"][sl],
-                                 row["quant_dtype"][sl], nout[f, sl])
-                if w is None:
-                    continue
-                requested[_OP_KIND[op]] += 1
-                rows[f, sl] = w
-        per_face = _face_dict_for_vertex(config, tk.ij, v, rows, skips)
+            op = int(row["op_type"][s])
+            if op == OP_NONE:
+                return None
+            w = _row_to_wire(op, row["i"][s], row["j"][s], row["i"][s],
+                             row["quant_dtype"][s], L.n_out)
+            if w is None:
+                return None
+            requested[_OP_KIND[op]] += 1
+            return w
+
+        dec = lf.decide_faces(tk, v, keys, _draw, skips=skips)
+        per_face = _face_dict_for_vertex(config, tk.ij, v, dec.rows, skips)
         arm_face_counts()
         try:
             tk.ij.eliminate(v, (), per_face or None)
@@ -280,6 +288,8 @@ def _walk_one_graph(target, seed, slots_on=None):
             disarm_face_counts()
 
     out = dict(envmod._PER_FACE_STATS)
+    out.update({f"lf_{k}": v for k, v in lf.consume_stats().items()
+                if k.startswith("decide") and v})
     envmod._PER_FACE_STATS.clear()
     return requested, out
 
@@ -311,12 +321,29 @@ def _assert_no_rejection(walk, target, label, slots_on=None):
             f"({int(stats.get(f'applied_{kind}', 0))} applied, {req[kind]} "
             f"requested). stats={stats}")
     assert int(stats.get("skipped", 0)) == 0, stats
+    # THE DECIDE PASS'S OWN SELF-CHECK. `decide_faces` applies each decided row
+    # through `env.make_slot_frame_hook` -- the apply path's own hook -- on the
+    # tensor the row was drawn from, with a LOCAL stats dict. A skip counted
+    # there means the mask cleared a row the hook refuses ON THAT VERY TENSOR,
+    # i.e. a defect in `slot_legality` rather than staleness. It is a different
+    # claim from the engine counters above and it is checked separately.
+    assert int(stats.get("lf_decide_self_skip", 0)) == 0, (
+        f"{label}: the decide pass's own apply refused "
+        f"{stats['lf_decide_self_skip']} rows it had just cleared")
+    assert int(stats.get("lf_decide_multi_site", 0)) == 0, stats
 
 
 def _walk(target, seed, slots_on=None):
-    """One sampled plan on the PRODUCTION pair of graphs: the legality comes
-    from the stream's tokenizer and the apply runs on a separate
-    ``IncrementalJaxpr`` advanced with the same wire rows."""
+    """One sampled plan on the PRODUCTION pair of graphs: the decisions are
+    taken on the stream's tokenizer and the apply runs on a separate
+    ``IncrementalJaxpr`` advanced with the same wire rows.
+
+    The mask is DYNAMIC here too (#75), so whatever this arm still rejects is
+    the DUPLICATION and nothing else -- which is the point of keeping the two
+    arms apart.
+    """
+    from alphagrad.approx.env import face_slot_sites
+
     jaxpr, consts, args, argnums = target
     vv = _valid_vertices(jaxpr, args, consts, argnums)
     order = markowitz_order(jaxpr, argnums, consts, args, vv)
@@ -331,45 +358,57 @@ def _walk(target, seed, slots_on=None):
     pol, tables = _policy(MAX_FACES)
     feats = _features()
     ctx = jnp.zeros((pol.embd_dim,), jnp.float32)
+    S_ALL = len(face_slot_sites())
 
-    rows_hist = np.full((total_v, MAX_FACES, FACE_SLOTS, 3), -1, np.int32)
+    rows_hist = np.full((total_v, MAX_FACES, S_ALL, 3), -1, np.int32)
     rows_hist[..., 2] = 0
     skips_hist = np.zeros((total_v, MAX_FACES), np.int32)
 
     envmod._PER_FACE_STATS.clear()
     requested = {k: 0 for k in KINDS}
-    noops = {k: 0 for k in KINDS}
 
     for n in range(len(order)):
         v = int(order[n])
-        sizes, quant, pair, comp, nout, nf = lf.face_slot_legality(
-            order, specs, n, v, rows_hist, skips_hist)
-        nf = int(nf)
-        rows = rows_hist[n]
-        skips = skips_hist[n]
-        for f in range(nf):
-            key = jrand.PRNGKey(seed * 1000003 + n * 97 + f)
-            _skip, row, _lp, _ent, _ar, _, _ = pol.sample_face(
+        F = MAX_FACES
+        sizes = np.zeros((F, S_ALL, N_AX), np.int32)
+        pair = np.zeros((F, S_ALL, N_AX, N_AX), np.float32)
+        comp = np.zeros((F, S_ALL, N_AX), np.float32)
+        quant = np.zeros((F, S_ALL, 2), np.float32)
+        nout = np.zeros((F, S_ALL), np.int32)
+
+        def _draw(f, s, L, _n=n):
+            sizes[f, s] = L.sizes
+            nout[f, s] = L.n_out
+            pair[f, s] = L.pair.astype(np.float32)
+            comp[f, s] = L.comp.astype(np.float32)
+            quant[f, s] = L.quant.astype(np.float32)
+            if slots_on is not None and _SLOT_SITES[s] not in slots_on:
+                return None
+            key = jrand.PRNGKey(seed * 1000003 + _n * 97 + f)
+            _skip, row, *_ = pol.sample_face(
                 feats, tables, key, f,
-                jnp.asarray(pair[f]), jnp.asarray(comp[f]),
-                jnp.asarray(1.0), face_context=ctx,
-                face_sizes_f=jnp.asarray(sizes[f]),
-                face_quant_f=jnp.asarray(quant[f]))
-            for s in range(FACE_SLOTS):
-                if slots_on is not None and _SLOT_SITES[s] not in slots_on:
-                    continue
-                op = int(row["op_type"][s])
-                if op == OP_NONE:
-                    continue
-                w = _row_to_wire(op, row["i"][s], row["j"][s], row["i"][s],
-                                 row["quant_dtype"][s], nout[f, s])
-                if w is None:
-                    # No wire form. The engine drops it too, so it is not a
-                    # request the apply path ever sees.
-                    continue
-                requested[_OP_KIND[op]] += 1
-                rows[f, s] = w
-        per_face = _face_dict_for_vertex(config, ij, v, rows, skips)
+                jnp.asarray(pair[f][:FACE_SLOTS]),
+                jnp.asarray(comp[f][:FACE_SLOTS]), jnp.asarray(1.0),
+                face_context=ctx,
+                face_sizes_f=jnp.asarray(sizes[f][:FACE_SLOTS]),
+                face_quant_f=jnp.asarray(quant[f][:FACE_SLOTS]))
+            op = int(row["op_type"][s])
+            if op == OP_NONE:
+                return None
+            w = _row_to_wire(op, row["i"][s], row["j"][s], row["i"][s],
+                             row["quant_dtype"][s], L.n_out)
+            if w is None:
+                return None
+            requested[_OP_KIND[op]] += 1
+            return w
+
+        dec = lf.face_slot_decisions(order, specs, n, v, _draw,
+                                     skips=skips_hist[n],
+                                     face_rows_hist=rows_hist,
+                                     face_skips_hist=skips_hist)
+        rows_hist[n] = dec.rows
+        per_face = _face_dict_for_vertex(config, ij, v, rows_hist[n],
+                                        skips_hist[n])
         arm_face_counts()
         try:
             ij.eliminate(v, (), per_face or None)
@@ -533,12 +572,19 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
 # ==========================================================================
 def _walk_join_slots(target, seed, arm):
     """Arm the JOIN slots (and optionally the contraction slots), each drawn
-    against ITS OWN mask row, and return (requested, engine stats).
+    against ITS OWN DYNAMIC mask row, and return (requested, engine stats).
 
     Each slot is sampled with a separate head call against its own mask row.
     That is a PROBE, not the production path -- the rollout wire does not carry
     the join band yet -- but the MASK and the TENSOR are the production ones,
     which is what a rejection rate is about.
+
+    #75: the mask row for slot ``sl`` is now read off the live tensor at slot
+    ``sl``'s own graphax site INSIDE the one speculative elimination that also
+    applies every earlier decision, so ``res:jr`` is masked from the old edge AS
+    EARLIER FACES' MERGES LEFT IT and ``res:jres`` from the sum of this face's
+    own approximated addends. Before, all five rows came from one recording
+    probe in which nothing had been decided.
 
     ``--approx-add`` MUST ALREADY NAME A VALUE WIDE ENOUGH FOR ``arm`` (the
     caller sets it; see ``_join_totals``). Since 2026-09-11 arming slot 3 IS
@@ -547,7 +593,6 @@ def _walk_join_slots(target, seed, arm):
     / ``wire_slots`` answer from the configuration alone.
     """
     from graphax import IncrementalPathTokenizer
-    from alphagrad.approx.common.masks import slot_legality
     from alphagrad.approx.env import face_slot_sites
 
     jaxpr, consts, args, argnums = target
@@ -572,54 +617,44 @@ def _walk_join_slots(target, seed, arm):
     for n in range(len(order)):
         v = int(order[n])
         keys = list(tk.ij.faces(v))
-        src = lf._probe_faces(tk, v, keys, True, slots=True, stat="slot") or {}
-        nf = min(len(keys), F)
-        sizes = np.zeros((F, S_ALL, N_AX), np.int32)
-        pair = np.zeros((F, S_ALL, N_AX, N_AX), np.float32)
-        comp = np.zeros((F, S_ALL, N_AX), np.float32)
-        quant = np.zeros((F, S_ALL, 2), np.float32)
-        nout = np.zeros((F, S_ALL), np.int32)
-        for k in range(nf):
-            by = src.get(keys[k]) or {}
-            for sl, site_list in enumerate(sites):
-                st = by.get(site_list[0])
-                if st is None:
-                    continue
-                L = slot_legality(st, N_AX)
-                sizes[k, sl], nout[k, sl] = L.sizes, L.n_out
-                pair[k, sl], comp[k, sl], quant[k, sl] = (
-                    L.pair, L.comp, L.quant)
-
-        rows = np.full((F, S_ALL, 3), -1, np.int32)
-        rows[..., 2] = 0
         skips = np.zeros((F,), np.int32)
-        for f in range(nf):
-            key = jrand.PRNGKey(seed * 1000003 + n * 97 + f)
-            for sl in arm:
-                def _rep(a):
-                    return jnp.asarray(a[f][sl][None].repeat(FACE_SLOTS, 0))
-                _sk, row, *_ = pol.sample_face(
-                    feats, tables, jrand.fold_in(key, sl), f,
-                    _rep(pair), _rep(comp), jnp.asarray(1.0),
-                    face_context=ctx, face_sizes_f=_rep(sizes),
-                    face_quant_f=_rep(quant))
-                op = int(row["op_type"][0])
-                if op == OP_NONE:
-                    continue
-                w = _row_to_wire(op, row["i"][0], row["j"][0],
-                                 row["i"][0], row["quant_dtype"][0],
-                                 nout[f, sl])
-                if w is None:
-                    continue
-                requested[_OP_KIND[op]] += 1
-                rows[f, sl] = w
-        per_face = _face_dict_for_vertex(config, tk.ij, v, rows, skips)
+
+        def _draw(f, sl, L, _n=n):
+            if sl not in arm:
+                return None
+            key = jrand.fold_in(
+                jrand.PRNGKey(seed * 1000003 + _n * 97 + f), sl)
+
+            def _rep(a):
+                return jnp.asarray(np.repeat(
+                    np.asarray(a)[None], FACE_SLOTS, 0))
+
+            _sk, row, *_ = pol.sample_face(
+                feats, tables, key, f,
+                _rep(L.pair.astype(np.float32)),
+                _rep(L.comp.astype(np.float32)), jnp.asarray(1.0),
+                face_context=ctx, face_sizes_f=_rep(L.sizes),
+                face_quant_f=_rep(L.quant.astype(np.float32)))
+            op = int(row["op_type"][0])
+            if op == OP_NONE:
+                return None
+            w = _row_to_wire(op, row["i"][0], row["j"][0], row["i"][0],
+                             row["quant_dtype"][0], L.n_out)
+            if w is None:
+                return None
+            requested[_OP_KIND[op]] += 1
+            return w
+
+        dec = lf.decide_faces(tk, v, keys, _draw, skips=skips)
+        per_face = _face_dict_for_vertex(config, tk.ij, v, dec.rows, skips)
         arm_face_counts()
         try:
             tk.ij.eliminate(v, (), per_face or None)
         finally:
             disarm_face_counts()
     out = dict(envmod._PER_FACE_STATS)
+    out.update({f"lf_{k}": val for k, val in lf.consume_stats().items()
+                if k.startswith("decide") and val})
     envmod._PER_FACE_STATS.clear()
     return requested, out
 
@@ -647,6 +682,8 @@ def _join_totals(target, arm):
             for k in KINDS:
                 req[k] += r[k]
                 skip[k] += int(st.get(f"skipped_{k}", 0))
+            assert int(st.get("lf_decide_self_skip", 0)) == 0, st
+            assert int(st.get("lf_decide_multi_site", 0)) == 0, st
         return req, skip
     finally:
         if prev is None:
@@ -829,3 +866,210 @@ def test_the_counters_are_silent_outside_the_armed_scope(tlm):
     per_face = _face_dict_for_vertex(config, ij, v, rows, skips)
     ij.eliminate(v, (), per_face or None)      # NOT armed
     assert envmod._PER_FACE_STATS == {}, envmod._PER_FACE_STATS
+
+
+# ==========================================================================
+# THE DYNAMIC MASK ITSELF (#75, dsnn-3qm.59 fault 2). Three properties, each
+# stated so it can FAIL rather than merely be described.
+# ==========================================================================
+def test_the_per_slot_draws_equal_one_joint_draw():
+    """SAMPLING SLOT BY SLOT CHANGES NO DRAW, so PPO still scores one variable.
+
+    A dynamic mask forces one head call per (face, slot): slot ``s``'s mask does
+    not exist until slots ``< s`` have been decided and applied. That is only
+    safe if slot ``s``'s draw is a function of ``(key, ctx, slot s's masks)``
+    alone -- otherwise the log-prob the trainer stores would be over a
+    distribution the replay cannot rebuild, and the PPO ratio would not be 1 at
+    epoch 0 even with the mask stored verbatim.
+
+    ``UnifiedFaceHead.sample`` splits ``1 + 6*n_slots (+1)`` keys and gives slot
+    ``s`` the slice ``keys[1+5s:1+5(s+1)]`` plus ``dt_keys[s]`` against its own
+    31-logit block, so nothing is conditioned on a previously drawn slot. This
+    states the CONSEQUENCE rather than the mechanism: ``S`` calls whose mask rows
+    fill in one at a time must draw exactly what ONE call with every row filled
+    draws, field for field, and the skip bit must agree too (the skip logit's
+    only masks are ``face_valid`` and ``approx_ok``, never a slot's tensor
+    legality).
+    """
+    pol, tables = _policy(MAX_FACES)
+    feats = _features()
+    ctx = jnp.zeros((pol.embd_dim,), jnp.float32)
+    rng = np.random.default_rng(0)
+    S = FACE_SLOTS
+    checked = 0
+    for trial in range(8):
+        final_pair = (rng.random((S, N_AX, N_AX)) < 0.5).astype(np.float32)
+        final_comp = (rng.random((S, N_AX)) < 0.5).astype(np.float32)
+        sz = np.full((S, N_AX), 4, np.int32)
+        qt = np.ones((S, 2), np.float32)
+        key = jrand.PRNGKey(trial)
+        sk_all, row_all, lp_all, *_ = pol.sample_face(
+            feats, tables, key, 0, jnp.asarray(final_pair),
+            jnp.asarray(final_comp), jnp.asarray(1.0), face_context=ctx,
+            face_sizes_f=jnp.asarray(sz), face_quant_f=jnp.asarray(qt))
+        # the partially-filled arrays a decide pass really hands the head:
+        # rows 0..s are live, rows past s are still ZERO.
+        for s in range(S):
+            live = (np.arange(S) <= s)
+            pr = np.where(live[:, None, None], final_pair, 0.0)
+            cp = np.where(live[:, None], final_comp, 0.0)
+            sk, row, lp, *_ = pol.sample_face(
+                feats, tables, key, 0, jnp.asarray(pr), jnp.asarray(cp),
+                jnp.asarray(1.0), face_context=ctx,
+                face_sizes_f=jnp.asarray(sz), face_quant_f=jnp.asarray(qt))
+            assert bool(sk) == bool(sk_all), (trial, s)
+            for fld in row:
+                got = np.asarray(row[fld])
+                want = np.asarray(row_all[fld])
+                if got.ndim == 0:
+                    continue
+                assert got[s] == want[s], (trial, s, fld, got[s], want[s])
+                checked += 1
+    assert checked > 0
+
+
+def test_the_operand_slots_were_never_stale_and_the_dependent_ones_were(tlm):
+    """THE DEFECT, LOCALISED -- and the reason only some slots needed fixing.
+
+    ``face_slot_legality`` reads every slot's tensor from one recording probe in
+    which NO decision has been made. Measured (findings 72-74) that is harmless
+    for ``lhs`` and ``rhs`` -- nothing at this vertex moves the in-edge and
+    out-edge Jacobians, and arming them alone rejects nothing -- and wrong for
+    the three dependent sites.
+
+    So the claim here is a DIFFERENCE, not an equality: on the same vertex and
+    the same graph, the dynamic pass must agree with the static probe on slots 0
+    and 1 (otherwise the fix moved something it had no business moving) and must
+    DISAGREE somewhere on a dependent slot (otherwise it is not dynamic at all
+    and the xfails below would have flipped for no reason).
+    """
+    from alphagrad.approx.env import face_slot_sites
+
+    jaxpr, consts, args, argnums = tlm
+    vv = _valid_vertices(jaxpr, args, consts, argnums)
+    order = markowitz_order(jaxpr, argnums, consts, args, vv)
+    specs = np.zeros((len(jaxpr.eqns), 1, 3), np.int32)
+    S_ALL = len(face_slot_sites())
+    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+                        max_faces=MAX_FACES, max_axes=N_AX)
+    rows_hist = np.full((len(jaxpr.eqns), MAX_FACES, S_ALL, 3), -1, np.int32)
+    rows_hist[..., 2] = 0
+    skips_hist = np.zeros((len(jaxpr.eqns), MAX_FACES), np.int32)
+
+    same_operand = dep_diff = dep_same = 0
+    rng = np.random.default_rng(0)
+    for n in range(len(order)):
+        v = int(order[n])
+        st_sz, st_q, st_pair, st_comp, st_no, nf = lf.face_slot_legality(
+            order, specs, n, v, rows_hist, skips_hist)
+        nf = int(nf)
+        if nf == 0:
+            continue
+        dyn_pair = np.zeros_like(st_pair)
+        dyn_comp = np.zeros_like(st_comp)
+        seen = set()
+
+        def _draw(f, sl, L):
+            dyn_pair[f, sl] = L.pair.astype(np.float32)
+            dyn_comp[f, sl] = L.comp.astype(np.float32)
+            seen.add((f, sl))
+            # A REAL approximation on every slot, or the dependent tensors would
+            # never move and this test could not tell the two passes apart.
+            ax = np.flatnonzero(L.comp)
+            if ax.size == 0:
+                return None
+            return (int(envmod.COMPRESS_SENTINEL),
+                    int(rng.choice(ax)), 0)
+
+        dec = lf.face_slot_decisions(order, specs, n, v, _draw,
+                                     skips=skips_hist[n],
+                                     face_rows_hist=rows_hist,
+                                     face_skips_hist=skips_hist)
+        rows_hist[n] = dec.rows
+        for f in range(nf):
+            for sl in range(S_ALL):
+                if (f, sl) not in seen:
+                    continue
+                eq = (np.array_equal(dyn_pair[f, sl], st_pair[f, sl])
+                      and np.array_equal(dyn_comp[f, sl], st_comp[f, sl]))
+                if sl < 2:
+                    assert eq, (
+                        f"vertex {v} face {f} slot {sl}: the dynamic pass "
+                        f"disagrees with the static probe on an OPERAND slot, "
+                        f"whose tensor nothing at this vertex moves")
+                    same_operand += 1
+                elif eq:
+                    dep_same += 1
+                else:
+                    dep_diff += 1
+    assert same_operand > 0, "no operand slot was reached -- vacuous"
+    assert dep_diff > 0, (
+        f"the dynamic mask never differed from the static one on a dependent "
+        f"slot ({dep_same} agreed, {dep_diff} differed) -- it is not dynamic")
+
+
+def test_the_decide_pass_answers_at_every_approx_add_width(tlm):
+    """ONE SITE PER SLOT, AT ALL FIVE WIDTHS, and a decision at each.
+
+    ``--approx-add`` is five head widths (94 / 95 / 125 / 156 logits, slot base
+    ``1 + 31*s``) and three wire widths (3 / 4 / 5 slots). The decide pass sizes
+    itself from ``env.wire_slots()`` and installs one chooser per slot through
+    ``env.face_entry_from_slots``, so it must answer under every one of them --
+    including ``choose``, where the join arm is a per-face bit the pass does not
+    hold (it builds the entry ``with_policy=False``, the same reason
+    ``face_slot_sites`` can).
+
+    ``decide_multi_site`` must stay 0: a slot whose chooser fired twice would be
+    one wire row meeting two tensors, which is finding 72's fault 1.
+    """
+    from graphax import IncrementalPathTokenizer
+
+    jaxpr, consts, args, argnums = tlm
+    vv = _valid_vertices(jaxpr, args, consts, argnums)
+    order = markowitz_order(jaxpr, argnums, consts, args, vv)
+    prev = os.environ.get(envmod._APPROX_ADD_ENV)
+    os.environ.pop(envmod._APPROX_OLD_ENV, None)
+    try:
+        for want in envmod.APPROX_ADD_CHOICES:
+            os.environ[envmod._APPROX_ADD_ENV] = want
+            S = envmod.wire_slots()
+            sites = envmod.face_slot_sites()
+            assert len(sites) == S and all(len(x) == 1 for x in sites), sites
+            lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+                                max_faces=MAX_FACES, max_axes=N_AX)
+            tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts),
+                                          list(args), vocab_size=512)
+            tk.base_tokens()
+            rng = np.random.default_rng(1)
+            reached = set()
+            decided = 0
+            for v in [int(x) for x in order[:20]]:
+                keys = list(tk.ij.faces(v))
+
+                def _draw(f, sl, L):
+                    reached.add(sl)
+                    ax = np.flatnonzero(L.comp)
+                    if ax.size == 0:
+                        return None
+                    return (int(envmod.COMPRESS_SENTINEL),
+                            int(rng.choice(ax)), 0)
+
+                dec = lf.decide_faces(tk, v, keys, _draw)
+                assert dec.rows.shape == (MAX_FACES, S, 3), dec.rows.shape
+                decided += int((dec.rows[..., 0] >= 0).sum())
+                per_face = _face_dict_for_vertex(
+                    SimpleNamespace(jaxpr=jaxpr), tk.ij, v, dec.rows,
+                    np.zeros((MAX_FACES,), np.int32))
+                tk.ij.eliminate(v, (), per_face or None)
+            st = lf.consume_stats()
+            assert st["decide_probe"] == 20, (want, st)
+            assert st["decide_multi_site"] == 0, (want, st)
+            assert st["decide_self_skip"] == 0, (want, st)
+            assert st["decide_probe_fail"] == 0, (want, st)
+            assert decided > 0, f"{want}: nothing was decided -- vacuous"
+            assert reached >= {0, 1, 2}, (want, sorted(reached))
+    finally:
+        if prev is None:
+            os.environ.pop(envmod._APPROX_ADD_ENV, None)
+        else:
+            os.environ[envmod._APPROX_ADD_ENV] = prev

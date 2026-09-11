@@ -49,6 +49,8 @@ from __future__ import annotations
 import os
 import warnings
 
+from typing import NamedTuple
+
 import numpy as np
 
 
@@ -170,6 +172,35 @@ _PREFIX_EXTEND = os.environ.get("ALPHAGRAD_FACE_PREFIX_EXTEND", "1") == "1"
 # records and reports them in this order.
 _SLOT_SITES = ("lhs", "rhs", "new")
 
+class DecidedFaces(NamedTuple):
+    """What one vertex's dynamic decision pass produced.
+
+    ``rows`` is the wire -- ``(F, S, 3)`` int32, ``-1`` where no approximation
+    was chosen -- and the five mask fields are the legality each row was drawn
+    under, per face and per slot, read off the live tensor AT THAT SLOT'S SITE
+    after every earlier decision had landed. The masks are part of the result
+    rather than a by-product because PPO's loss replay rescores from the STORED
+    mask and never recomputes it, so these are the arrays that have to reach
+    the trajectory for ``sample`` and ``evaluate`` to score the same variable.
+
+    ``sizes`` / ``nout`` are the slot's own frame, which is the frame the wire
+    row is written in (``bi2 = j - n_out``) -- the same contract
+    ``masks.SlotLegality`` states per tensor.
+    """
+    rows: np.ndarray      # (F, S, 3) int32
+    sizes: np.ndarray     # (F, S, N) int32
+    quant: np.ndarray     # (F, S, 2) float32
+    pair: np.ndarray      # (F, S, N, N) float32
+    comp: np.ndarray      # (F, S, N) float32
+    nout: np.ndarray      # (F, S) int32
+    n_faces: np.int32
+
+
+def _wire_slots() -> int:
+    from alphagrad.approx.env import wire_slots
+    return wire_slots()
+
+
 class LiveFaceStream:
     """Per-face token chunks for one graph, cached across env steps."""
 
@@ -224,7 +255,19 @@ class LiveFaceStream:
                       # --face-slot-frames (`face_slot_legality`): the same
                       # four, for the per-SLOT probe.
                       "slot_probe": 0, "slot_hit": 0,
-                      "slot_probe_fail": 0, "slot_miss": 0}
+                      "slot_probe_fail": 0, "slot_miss": 0,
+                      # `decide_faces` (.59 fault 2): `decide_probe` counts
+                      # the ONE extra elimination per vertex, `decide_draw`
+                      # the decisions taken inside it, `decide_self_skip`
+                      # rows the apply path refused ON THE TENSOR IT WAS
+                      # DRAWN FROM (must be 0 -- that is the whole claim),
+                      # `decide_multi_site` invocations of a slot's chooser
+                      # past the first (0 under every --approx-add value,
+                      # non-zero only if a future value puts one slot's hook
+                      # at two sites again).
+                      "decide_probe": 0, "decide_draw": 0,
+                      "decide_probe_fail": 0, "decide_self_skip": 0,
+                      "decide_multi_site": 0}
         self._sizes: dict = {}        # (prefix, vertex) -> (sizes, quant, n)
         self._slots: dict = {}        # (prefix, vertex) -> per-slot legality
 
@@ -1157,6 +1200,262 @@ class LiveFaceStream:
                 self._slots.pop(dk, None)
         self._slots[ck] = res
         return res
+
+
+    # -- the DYNAMIC per-slot mask (ticket .59 fault 2) ---------------------
+    #
+    # WHAT WAS STALE. :meth:`face_slot_legality` records its tensors in ONE
+    # speculative elimination per vertex whose slot hooks are RECORDERS -- they
+    # return the operand unchanged -- so every tensor it answers about is the
+    # tensor an ALL-EXACT plan would produce. The mask is therefore computed
+    # against a graph in which no decision has been made, and three things move
+    # the tensor between that reading and the apply (findings 72 section "Fault
+    # 2", 73 section 9b, 74 section 8; all measured on TLM, minimum Markowitz,
+    # 5 seeds, through the real apply path with the engine's own
+    # ``skipped_<kind>`` counters):
+    #
+    #   1. WITHIN A FACE, across slots. ``res:new`` holds the contraction of
+    #      ``lhs`` and ``rhs``. Approximate either operand and the tensor the
+    #      ``new`` mask described no longer exists. ``new`` armed alone rejects
+    #      0 of 27 Diag; with the operands armed, 6 of 26 Diag and 4 of 40
+    #      Reduce.
+    #   2. ACROSS FACES at one vertex. An earlier face's merge WRITES the edge a
+    #      later face's ``res:jr`` reads, so arming the contraction slots stales
+    #      learned1's mask WITHIN one elimination step: 0 of 27 alone, 3 of 594
+    #      with them armed.
+    #   3. THE SUMMED EDGE. ``res:jres`` IS ``new + old``, so it carries this
+    #      face's own contraction approximations: 0 of 181 alone, 20 of 741 with
+    #      them armed.
+    #
+    # All three are ORDER, not arithmetic: graphax's face loop is strictly
+    # sequential (``core._eliminate_vertex``: ``lhs`` -> ``rhs`` -> contract ->
+    # ``res:new`` -> ``jl`` -> ``jr`` -> ``+`` -> ``res:jres``, faces visited
+    # out-edge-major / in-edge-minor, and ``graph``/``tgraph`` are written once
+    # per face inside the innermost loop), so every tensor a decision needs to
+    # be masked from ALREADY EXISTS by the time that decision's hook is
+    # invoked -- just not before the elimination starts.
+    #
+    # WHAT THIS DOES. ONE speculative elimination per vertex in which every slot
+    # is a graphax CHOOSER (``core._apply_face_transform``'s callable branch,
+    # which exists for exactly this: "a policy cannot know their index structure
+    # until this moment; masking legal actions requires seeing the tensor"). At
+    # each site the chooser
+    #
+    #   * computes ``masks.slot_legality`` on THE TENSOR IN HAND,
+    #   * calls the caller's ``draw`` with it -- outside the jaxpr trace, see
+    #     ``jax.ensure_compile_time_eval`` below -- to get a wire row,
+    #   * and applies that row through ``env.make_slot_frame_hook``, THE APPLY
+    #     PATH'S OWN HOOK, so the tensor the next site sees is the tensor the
+    #     measurement will produce.
+    #
+    # so the mask is recomputed as decisions land without a single re-probe: the
+    # elimination itself is the propagation. Nothing is copied and nothing is
+    # retraced -- :class:`_Snapshot` undoes the pass in place, exactly as it
+    # already does for the recording probe, and the persistent
+    # ``IncrementalJaxpr`` trace is extended and truncated rather than rebuilt.
+    #
+    # WHY NOT RE-PROBE PER DECISION (the obvious reading of "recompute as
+    # decisions land"): it is the same answer at F*S times the cost, and that
+    # cost is the one ``_tokenizer_at``'s prefix cache exists to remove. See
+    # finding 75 for the measurement that rejected it.
+    #
+    # WHY THE DECIDED ROW, NOT THE CHOSEN ACTION, IS WHAT LEAVES THIS PASS. The
+    # chooser could hand graphax the micro-action directly and never mention a
+    # wire row; the measured elimination would then be the only place the
+    # decision exists. It has to be a ROW because the row is what the rest of
+    # the system already transports: ``_decided`` replays faces ``0..f-1`` from
+    # rows to build face ``f``'s token chunk (so a decision that only exists
+    # after the real elimination is circular), ``plan_log`` records rows, and
+    # the PPO replay rescores from the stored mask. Deciding into a row keeps
+    # ONE graphax-facing apply path (``make_slot_frame_hook``) and leaves the
+    # measured elimination byte-identical to what it is today.
+    def decide_faces(self, tk, vertex, keys, draw, *, skips=None,
+                     approx: bool = True):
+        """Decide every face slot of ``vertex`` IN APPLY ORDER, one elimination.
+
+        ``draw(f, s, legality)`` is called once per (face ``f``, slot ``s``)
+        that graphax actually reaches, in the order graphax reaches them, with
+        ``legality`` a :class:`~alphagrad.approx.common.masks.SlotLegality`
+        computed on the live tensor at that slot's own site. It returns the
+        wire row ``(b0, b1, b2)`` to install there, or ``None`` for "leave this
+        slot exact".
+
+        ``draw`` IS CALLED OUTSIDE THE JAXPR TRACE. The pass runs under
+        ``jcore.set_current_trace(ij.trace)``, so an unguarded ``jnp`` op inside
+        a hook is traced into the persistent frame and its result is a
+        ``DynamicJaxprTracer`` -- measured: ``jnp.asarray(1.) + jnp.asarray(2.)``
+        inside a hook is a tracer, and the same expression inside
+        ``jax.ensure_compile_time_eval()`` is the concrete ``3.0``. A policy head
+        is jnp, and a tracer cannot be turned into a wire row, so the escape is
+        a requirement of the design and not a convenience.
+
+        ``skips`` -- the ``(F,)`` per-face SKIP decisions, which must already be
+        made: graphax tests ``face_transforms[key] is SKIP_FACE`` BEFORE it runs
+        any of the face's hooks, so a skip cannot be chosen by a chooser. This
+        costs nothing in distribution terms: the skip draw reads the head's
+        logit 0 and its only masks are ``face_valid`` and ``approx_ok``, neither
+        of which is a per-slot tensor legality (``UnifiedFacePolicy.sample_face``
+        takes ``approx_ok`` from ``allow_skip`` / ``op_legality_override``, never
+        from ``pair_valid`` / ``comp_valid``), so the skip drawn before this pass
+        is the skip a rescore against the FINAL masks reproduces.
+
+        Returns :class:`DecidedFaces`: the wire rows AND the per-(face, slot)
+        legality each row was drawn under. The masks are returned because they
+        are what PPO has to store -- the loss replay rescores from the stored
+        ``face_pair_valid`` / ``face_comp_valid`` / ``face_sizes`` /
+        ``face_quant`` arrays and never recomputes them, so storing THESE keeps
+        ``sample`` and ``evaluate`` scoring the same variable. That they can be
+        drawn slot by slot and rescored in one call is a property of the head,
+        measured rather than assumed: ``UnifiedFaceHead.sample`` splits
+        ``1 + 6*n_slots (+1)`` keys and slot ``s`` reads ``keys[1+5s:1+5(s+1)]``
+        plus ``dt_keys[s]`` against slot ``s``'s own logit block and slot ``s``'s
+        own masks, so nothing is conditioned on another slot's draw (probe
+        t75_feas, question 3: 0 of 252 field cells differed between ``S``
+        sequential calls with progressively refined masks and ONE call with all
+        of them).
+        """
+        from jax._src import core as _jcore
+        import jax as _jax
+        from graphax import SKIP_FACE
+        from graphax.core import _eliminate_vertex
+        from graphax.sparse.elemental.dispatch import (
+            approx_active, set_approx_active,
+        )
+        from alphagrad.approx.common.masks import slot_legality
+        from alphagrad.approx.env import (
+            face_entry_from_slots, make_slot_frame_hook, wire_slots)
+
+        F, N = self.max_faces, self.max_axes
+        S = wire_slots()
+        rows = np.full((F, S, 3), -1, np.int32)
+        rows[..., 2] = 0
+        sizes = np.zeros((F, S, N), np.int32)
+        quant = np.zeros((F, S, 2), np.float32)
+        pair = np.zeros((F, S, N, N), np.float32)
+        comp = np.zeros((F, S, N), np.float32)
+        nout = np.zeros((F, S), np.int32)
+        n_faces = min(len(keys), F)
+        decided: dict = {}
+
+        def _mk(f, s):
+            def _chooser(st):
+                if (f, s) in decided:
+                    # A slot's hook reached a SECOND site. Under every current
+                    # --approx-add value `face_slot_sites()` is one site per
+                    # slot, so this cannot fire; if a future value brings the
+                    # two-site form back (the shape of finding 72's fault 1),
+                    # the row already drawn is what the measurement will install
+                    # at both sites, so installing it here too is what keeps
+                    # this pass faithful -- and the counter says it happened.
+                    self.stats["decide_multi_site"] += 1
+                    row = decided[(f, s)]
+                    return st if row is None else (
+                        make_slot_frame_hook(row)(st))
+                L = slot_legality(st, N)
+                sizes[f, s] = L.sizes
+                nout[f, s] = L.n_out
+                pair[f, s] = L.pair.astype(np.float32)
+                comp[f, s] = L.comp.astype(np.float32)
+                quant[f, s] = L.quant.astype(np.float32)
+                with _jax.ensure_compile_time_eval():
+                    w = draw(f, s, L)
+                self.stats["decide_draw"] += 1
+                if w is None:
+                    decided[(f, s)] = None
+                    return st
+                row = tuple(int(x) for x in w)
+                decided[(f, s)] = row
+                rows[f, s] = row
+                # THE APPLY PATH'S OWN HOOK, not a second copy of the decode
+                # (finding 72's fault 1 was exactly a second copy of the entry
+                # form). `stats` is a LOCAL dict so the pass never touches
+                # `env._PER_FACE_STATS`, and a skip counted in it means the
+                # apply path refused a row on the very tensor it was drawn
+                # from -- i.e. the mask and the hook disagree, which is the
+                # defect this pass exists to remove, so it is counted and
+                # visible rather than papered over.
+                seen: dict = {}
+                out = make_slot_frame_hook(row, stats=seen, gated=False)(st)
+                if seen.get("skipped"):
+                    self.stats["decide_self_skip"] += 1
+                return out
+            return _chooser
+
+        ft = {}
+        for f in range(n_faces):
+            if skips is not None and int(np.asarray(skips).reshape(-1)[f]) == 1:
+                ft[keys[f]] = SKIP_FACE
+                continue
+            ft[keys[f]] = face_entry_from_slots(
+                tuple(_mk(f, s) for s in range(S)), with_policy=False)
+
+        # with_policy=False, for the reason `_probe_faces` uses it and one more.
+        # A join POLICY is not a slot hook: it answers to no mask and applies no
+        # wire row, so it can change no decision taken here. Under every value
+        # in `APPROX_ADD_CHOICES` that is provable rather than probable -- the
+        # only value whose join is `lossy` has exactly THREE slots, so it has no
+        # hook at `jr` or `jres` for a reconciliation to sit in front of, and
+        # `learned1` / `learned2` reconcile with the UNION, which installs no
+        # policy at all (env._JOIN_SEMANTICS_OF, finding 74 section 7). It is
+        # also the only form that can answer under `--approx-add choose`, where
+        # the arm is a per-face bit this pass does not hold.
+        prev = approx_active()
+        set_approx_active(bool(approx))
+        try:
+            with _Snapshot(tk) as snap:
+                ij = snap.ij
+                try:
+                    self.stats["decide_probe"] += 1
+                    with _jcore.set_current_trace(ij.trace):
+                        _eliminate_vertex(
+                            int(vertex), ij.jaxpr, ij.graph, ij.tgraph, ij.vo,
+                            False, transforms=(self._size_probe_identity,),
+                            face_transforms=ft)
+                except Exception:
+                    # Same contract as `_probe_faces`: a vertex graphax cannot
+                    # trace has no legal approximation either, so keep the
+                    # decisions taken so far (the rest stay -1, i.e. exact) and
+                    # never let a probe take the rollout down.
+                    self.stats["decide_probe_fail"] += 1
+        finally:
+            set_approx_active(prev)
+        return DecidedFaces(rows=rows, sizes=sizes, quant=quant, pair=pair,
+                            comp=comp, nout=nout, n_faces=np.int32(n_faces))
+
+    def face_slot_decisions(self, order, specs, n, vertex, draw, *,
+                            skips=None, face_rows_hist=None,
+                            face_skips_hist=None, approx: bool = True):
+        """:meth:`decide_faces` against the PREFIX tokenizer of step ``n``.
+
+        The tokenizer comes from :meth:`_tokenizer_at`, so the decisions are
+        taken on the same graph ``face_slot_legality`` reads and at the same
+        cost in prefix terms -- one cache lookup, not a replay.
+
+        NOT MEMOISED, and it must not be: the result depends on ``draw``, i.e.
+        on the policy and the key, so a ``(prefix, vertex)`` memo would serve
+        one step's decisions to the next. :meth:`face_slot_legality`'s memo is
+        sound only because its answer is a pure function of the prefix.
+        """
+        order = np.asarray(order).reshape(-1)
+        specs = np.asarray(specs)
+        n, vertex = int(n), int(vertex)
+        frh, fsh = self._hist(face_rows_hist, face_skips_hist)
+        try:
+            tk = self._tokenizer_at(order, specs, n, frh, fsh)
+            keys = list(tk.ij.faces(vertex))
+        except Exception:
+            self.stats["failures"] += 1
+            F, N, S = self.max_faces, self.max_axes, _wire_slots()
+            rows = np.full((F, S, 3), -1, np.int32)
+            rows[..., 2] = 0
+            return DecidedFaces(
+                rows=rows, sizes=np.zeros((F, S, N), np.int32),
+                quant=np.zeros((F, S, 2), np.float32),
+                pair=np.zeros((F, S, N, N), np.float32),
+                comp=np.zeros((F, S, N), np.float32),
+                nout=np.zeros((F, S), np.int32), n_faces=np.int32(0))
+        return self.decide_faces(tk, vertex, keys, draw, skips=skips,
+                                 approx=approx)
 
     def consume_stats(self) -> dict:
         out = dict(self.stats)
