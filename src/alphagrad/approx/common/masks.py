@@ -1278,8 +1278,8 @@ class LiveVertexMaskOracle:
 
     NO ARGUMENT DATA IS USED. The builder runs on fresh jaxpr tracers, and only
     ``SparseTensor`` index metadata and ``val.shape`` are read; the throwaway
-    equations the probes trace are discarded. Cost is ~4 ms per candidate
-    vertex on the nn256 graph (two probes, see ``_DISPATCH_MODES``).
+    equations the probes trace are discarded. Cost is ~2 ms per candidate
+    vertex on the nn256 graph (single probe on single engine).
     """
 
     def __init__(self, jaxpr, consts, args, argnums, *, max_axes: int = 8):
@@ -1295,27 +1295,18 @@ class LiveVertexMaskOracle:
         self.reset()
 
     # -- episode bookkeeping ------------------------------------------------
-    # TWO graphs, one per elemental-dispatch setting. ``_callback`` runs the
-    # SAME order through ``vertex_elimination_jaxpr`` (which sets
-    # ``dispatch.approx_active``) for the op counts and, under
-    # ALPHAGRAD_MEASURE_VIA_AOJ=1, through ``IncrementalJaxpr`` (which does
-    # not) for the measured executable. The flag gates the elemental
-    # composition layer inside ``sparse_matmul``, so the two paths build
-    # STRUCTURALLY DIFFERENT edges from the same order (measured on nn256
-    # vertex 7: ``val=(16,10,63)`` vs ``val=(10,63)`` with an implicit pair).
-    # An action has to be legal on both or the first one to run sentinels the
-    # measurement, so the oracle tracks both and intersects.
-    _DISPATCH_MODES = (True, False)
+    # Under the single contraction engine (dsnn-3qm.65), a single IncrementalJaxpr
+    # instance tracks the live graph. _incrs retains mapping {True: incr, False: incr}
+    # for backwards compatibility with callers indexing _incrs[True].
 
     def reset(self):
         """Rewind to the un-eliminated graph (call at env reset)."""
-        self._incrs = {
-            m: self._IncrementalJaxpr(
-                self.jaxpr, self._argnums, list(self._consts),
-                list(self._args),
-            )
-            for m in self._DISPATCH_MODES
-        }
+        incr = self._IncrementalJaxpr(
+            self.jaxpr, self._argnums, list(self._consts),
+            list(self._args),
+        )
+        self._incr = incr
+        self._incrs = {True: incr, False: incr}
         self._eliminated: set[int] = set()
 
     def advance(self, vertex: int, rules=(), face_wires=None):
@@ -1335,31 +1326,22 @@ class LiveVertexMaskOracle:
         decoded from it drift as soon as the face head approximates.
         Decoding mirrors ``live_faces.LiveFaceStream._decided`` (position-
         independent wire decode, ``make_live_masked_hook`` wrap, SKIP_FACE
-        for skips), with keys from :func:`graphax.core.faces_of` on each
-        dispatch mode's own live graph. Default ``None`` = the historical
+        for skips), with keys from :func:`graphax.core.faces_of` on the
+        live graph. Default ``None`` = the historical
         exact-face replay every mask consumer keeps.
         """
-        from graphax.sparse.elemental.dispatch import (
-            approx_active, set_approx_active,
-        )
-
         vertex = int(vertex)
-        prev = approx_active()
-        try:
-            for mode, incr in self._incrs.items():
-                set_approx_active(mode)
+        incr = self._incr
+        ft = None
+        if face_wires is not None:
+            try:
+                ft = self._face_ft(incr, vertex, face_wires)
+            except Exception:
+                # A face decode must never take the replay down --
+                # worst case is the historical exact-face behaviour.
                 ft = None
-                if face_wires is not None:
-                    try:
-                        ft = self._face_ft(incr, vertex, face_wires)
-                    except Exception:
-                        # A face decode must never take the replay down --
-                        # worst case is the historical exact-face behaviour.
-                        ft = None
-                incr.eliminate(vertex, rules=tuple(rules),
-                               face_transforms=ft or None)
-        finally:
-            set_approx_active(prev)
+        incr.eliminate(vertex, rules=tuple(rules),
+                       face_transforms=ft or None)
         self._eliminated.add(vertex)
 
     def _face_ft(self, incr, vertex, face_wires):
@@ -1413,21 +1395,11 @@ class LiveVertexMaskOracle:
         oracle's own state is unchanged and the caller may probe every
         candidate before choosing one.
 
-        ``approx`` selects the ``graphax.sparse.elemental.dispatch``
-        ``approx_active`` flag. It is NOT cosmetic: the flag gates the elemental
-        composition layer inside ``sparse_matmul``, so the two settings produce
-        contractions with genuinely different index structure (measured on
-        nn256 vertex 7: ``val=(16,10,63)`` with the flag on vs ``val=(10,63)``
-        with a compressed-away implicit pair with it off). ``_callback``
-        exercises BOTH — ``vertex_elimination_jaxpr`` sets the flag for its
-        op-count pass, the AOJ builder (``ALPHAGRAD_MEASURE_VIA_AOJ=1``) never
-        does — so :meth:`vertex_mask` intersects over both.
+        ``approx`` is retained for backwards compatibility with callers (single
+        contraction engine under dsnn-3qm.65).
         """
         from jax._src import core as _jcore
         from graphax.core import _eliminate_vertex
-        from graphax.sparse.elemental.dispatch import (
-            approx_active, set_approx_active,
-        )
 
         seen: list = []
 
@@ -1435,14 +1407,10 @@ class LiveVertexMaskOracle:
             seen.append(st)
             return st
 
-        incr = self._incrs[bool(approx)]
+        incr = self._incr
         graph = _shallow_copy_graph(incr.graph)
         tgraph = _shallow_copy_graph(incr.tgraph)
         n_eqns0 = len(incr.trace.frame.tracing_eqns)
-        # The probe transform is a CALLABLE, which is what puts core.py on its
-        # approx code path -- the same path the real run takes.
-        prev = approx_active()
-        set_approx_active(bool(approx))
         try:
             with _jcore.set_current_trace(incr.trace):
                 try:
@@ -1451,19 +1419,8 @@ class LiveVertexMaskOracle:
                         transforms=(_record,), face_transforms=None,
                     )
                 except Exception as exc:
-                    # graphax cannot trace this elimination (observed on the
-                    # xent graph: an add of a tensor and its own transpose,
-                    # (16,10,784,256) vs (16,10,256,784), from the open
-                    # canonical-output-order gap in _normalize_inputs).
-                    # A vertex that cannot be eliminated has no LEGAL
-                    # approximation, so return the faces seen so far and let
-                    # vertex_mask's all() intersection admit nothing -- the
-                    # policy then eliminates it exactly. Never transpose a
-                    # side to make the add fit: guessing the axis order
-                    # silently corrupts the Jacobian the reward is built on.
                     _record_probe_failure(int(vertex), bool(approx), exc)
         finally:
-            set_approx_active(prev)
             # Throw away the equations the probe traced; nothing ever
             # materialises this builder's jaxpr, but the list would grow
             # without bound over an episode.
@@ -1534,10 +1491,7 @@ class LiveVertexMaskOracle:
         if not primal_shapes:
             return pair, comp
 
-        # Intersect over BOTH elemental-dispatch settings (see _DISPATCH_MODES).
-        faces = []
-        for mode in self._DISPATCH_MODES:
-            faces += self.probe_faces(vertex, approx=mode)
+        faces = self.probe_faces(vertex)
         if not faces:
             return pair, comp
 
@@ -1632,12 +1586,7 @@ class LiveVertexMaskOracle:
         it fits ALL of them -- which is why per-vertex DIAG is structurally
         almost always illegal. A per-face slot only has to fit ITS OWN operand,
         so the per-face masks are a strict superset of the intersected one.
-
-        Faces are index-aligned across ``_DISPATCH_MODES`` (``probe_faces``
-        returns them in ``_eliminate_vertex`` visit order, the same for both), so
-        face ``k`` is intersected only with face ``k`` of the other mode -- an
-        action must still be legal on BOTH dispatch paths, just not on other
-        faces. Rows ``>= n_faces`` stay all-zero padding.
+        Rows ``>= n_faces`` stay all-zero padding.
 
         Deliberately a separate method rather than a refactor of
         :meth:`vertex_mask`: that one is on the live per-vertex training path and
@@ -1705,45 +1654,37 @@ class LiveVertexMaskOracle:
         if not primal_shapes:
             return pair, comp, sizes, quant, 0
 
-        probes = {m: self.probe_faces(vertex, approx=m)
-                  for m in self._DISPATCH_MODES}
-        per_mode = [fs for fs in probes.values() if fs]
-        if not per_mode:
+        faces = self.probe_faces(vertex)
+        if not faces:
             return pair, comp, sizes, quant, 0
-        n_faces = min(min(len(fs) for fs in per_mode), F)
-        # The size source is the approx=True graph -- the one
-        # ``vertex_elimination_jaxpr`` builds for the op counts, and the one
-        # ``face_features`` already reads. Falls back to the other mode only
-        # if that probe produced nothing at all.
-        sizes_src = probes.get(True) or probes.get(False) or []
+        n_faces = min(len(faces), F)
+        sizes_src = faces
 
         edge_phys_axes = out_len + max((len(ps) for ps in primal_shapes), default=0)
         n_primal = min(len(ps) for ps in primal_shapes)
 
         for k in range(n_faces):
-            faces_k = [fs[k] for fs in per_mode]
+            st = faces[k]
 
             if per_face:
                 if k < len(sizes_src):
                     sizes[k] = dim_logical_sizes(sizes_src[k], N)
-                qm = np.ones((len(quant_dtypes),), dtype=bool)
-                for st in faces_k:
-                    qm &= quant_valid_mask(st, quant_dtypes)
+                qm = quant_valid_mask(st, quant_dtypes)
                 quant[k] = bool(qm.any())
 
             # --- COMPRESS: vertex_mask's screens, this face only ------------
             if edge_phys_axes > 1:
-                face_comp = [compress_valid_mask(st, N) for st in faces_k]
+                comp_m = compress_valid_mask(st, N)
                 for a in range(N):
                     if a >= out_len and any(
                         a - out_len >= len(ps) for ps in primal_shapes
                     ):
                         continue
-                    if all(m[a] for m in face_comp):
+                    if comp_m[a]:
                         comp[k, a] = True
 
             # --- DIAG: vertex_mask's screens, this face only -----------------
-            face_diag = [diag_valid_mask(st, N) for st in faces_k]
+            dm = diag_valid_mask(st, N)
             for bi1 in range(out_len):
                 n1 = int(out_shape[bi1])
                 for bi2 in range(n_primal):
@@ -1761,18 +1702,13 @@ class LiveVertexMaskOracle:
                             g_ref = math.gcd(g_ref, int(ps[bi2]))
                     if g_ref <= 1:
                         continue
-                    ok = True
-                    for st, dm in zip(faces_k, face_diag):
-                        if not dm[i, j]:
-                            ok = False
-                            break
-                        base, span = diag_pair_factor_space(st, i, j)
-                        if base != 1 or span % g_ref != 0:
-                            ok = False
-                            break
-                    if ok:
-                        pair[k, i, j] = True
-                        pair[k, j, i] = True
+                    if not dm[i, j]:
+                        continue
+                    base, span = diag_pair_factor_space(st, i, j)
+                    if base != 1 or span % g_ref != 0:
+                        continue
+                    pair[k, i, j] = True
+                    pair[k, j, i] = True
         return pair, comp, sizes, quant, n_faces
 
     def masks(self, candidates=None):

@@ -221,9 +221,6 @@ SHARED_ENV = [
     ("XLA_PYTHON_CLIENT_PREALLOCATE", "false"),
     ("XLA_FLAGS",
      '"--xla_gpu_enable_triton_gemm=false --xla_gpu_autotune_level=0"'),
-    # --- graphax: PLANNER path for exact lowering + L5 demand-emit (v42-proven)
-    ("GRAPHAX_PLANNER_EXACT", "1"),
-    ("GRAPHAX_DEMAND_EMIT", "1"),
     # PULLUP, not pulldown.  Every TLM arm before R1 ran PULLDOWN=1, so
     # bf16-native compute was the thing paying for the approximation; at
     # pullup the cost axis is the approximation ITSELF.
@@ -1657,8 +1654,6 @@ arm(
         "ALPHAGRAD_MAX_FACES": "2538",
         "ALPHAGRAD_MAX_DELTA_TOKENS": "32768",
         "ALPHAGRAD_MEASURE_WARMUP": "1",
-        "GRAPHAX_PLANNER_EXACT": "1",
-        "GRAPHAX_DEMAND_EMIT": "1",
         # K=1 is the settled grad-cosine variant (949f1af): most predictive
         # AND cheapest.  Relevant here because this arm's quality channel IS
         # grad_cosine.
