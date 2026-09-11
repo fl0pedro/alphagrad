@@ -534,11 +534,7 @@ def measure(state):
         else:
             _, _, reward = _callback(
                 env.config, env.args, env.consts, jnp.asarray(order),
-                # `None` = no per-face join bit: AZ runs under a width
-                # that FIXES the join semantics (env.resolve_join_mode
-                # answers from the configuration). --approx-add choose is not
-                # reachable from az_gumbel, which has no FaceAction.join wire.
-                jnp.asarray(specs), *_zface, None, n, *ev,
+                jnp.asarray(specs), *_zface, n, *ev,
             )
             reward = np.asarray(reward, dtype=np.float64)
     except (KeyboardInterrupt, SystemExit):

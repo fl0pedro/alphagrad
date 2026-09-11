@@ -6088,10 +6088,10 @@ def _callback(
     sparsity_specs,
     face_specs,
     face_skips,
-    face_joins,
     stop,
     *eval_samples,
     init: bool = False,
+    face_joins=None,
 ):
     """Stage A reward harness: returns `(tokens, rewards)` where `rewards` is
     the canonical `(NUM_REWARDS,)` float32 vector documented at the top of this
@@ -7739,7 +7739,22 @@ class VertexEliminationEnv:
         with ``ppo.py`` / non-Ray callers.
         """
         if self._remote_pool is None:
-            _fn = partial(_callback, self.config, init=init)
+            # THE JOIN CHANNEL IS KEYWORD-ONLY ON `_callback`, ON PURPOSE.
+            # `io_callback` / `pure_callback` pass their operands POSITIONALLY,
+            # and this env's own plumbing sends `face_joins` between
+            # `face_skips` and `stop` -- but `_callback` is called directly from
+            # a dozen other places (the measure actors, landscape_map, az_gumbel,
+            # six test modules), and adding a positional there silently shifted
+            # `stop` into `face_joins` for every one of them. Measured: it turned
+            # `tests/delta_obs_emission_test.py` from 8 passed to 4 failed.
+            # So the adapter absorbs the positional here and `_callback`'s
+            # signature is UNCHANGED for everybody else.
+            def _fn(args, consts, order, specs, face_specs, face_skips,
+                    face_joins, stop, *eval_samples):
+                return _callback(
+                    self.config, args, consts, order, specs, face_specs,
+                    face_skips, stop, *eval_samples, init=init,
+                    face_joins=face_joins)
             # Only the STEP callback runs under vmap; reset() is called once,
             # unbatched, and must not be wrapped.
             return _batched_host(_fn) if (batched and _BATCHED_CALLBACK) else _fn
@@ -7880,9 +7895,9 @@ class VertexEliminationEnv:
                         self.config,
                         _cb_slot(args, i, E),
                         _cb_slot(consts, i, E),
-                        ro[i], rs[i], rf[i], rk[i], rj[i], _sti[i],
+                        ro[i], rs[i], rf[i], rk[i], _sti[i],
                         *[_cb_slot(x, i, E) for x in eval_samples],
-                        init=init,
+                        init=init, face_joins=rj[i],
                     )
                     tk[i] = np.asarray(t_i)
                     ei[i] = np.asarray(e_i)

@@ -295,10 +295,6 @@ class CpuApproximationServer:
                 specs_j,
                 _face_specs,
                 _face_skips,
-                # The pool's actors do not carry the --approx-add choose join
-                # bit (env._remote_callback raises when one is present), so
-                # the join semantics is the configuration's here.
-                None,
                 int(step),
                 *es,
                 init=bool(init),

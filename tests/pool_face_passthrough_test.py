@@ -75,7 +75,7 @@ def test_server_face_tokens_equal_inline_callback():
         _clear()
         t_ref, e_ref, _ = _callback(
             cfg, args, consts, jnp.asarray(order), jnp.asarray(specs),
-            jnp.asarray(faces), jnp.asarray(skips), None, stop, init=True)
+            jnp.asarray(faces), jnp.asarray(skips), stop, init=True)
         _clear()
         t_srv, e_srv, _ = srv.evaluate(
             order, specs, stop, face_specs=faces, face_skips=skips,
@@ -101,7 +101,7 @@ def test_server_without_faces_unchanged():
     _clear()
     t_ref, e_ref, _ = _callback(
         cfg, args, consts, jnp.asarray(order), jnp.asarray(specs),
-        jnp.asarray(empty_f), jnp.asarray(empty_k), None, stop, init=True)
+        jnp.asarray(empty_f), jnp.asarray(empty_k), stop, init=True)
     _clear()
     t_srv, e_srv, _ = srv.evaluate(order, specs, stop, init=True)
     assert getattr(srv, "last_eval_error", None) is None, srv.last_eval_error
