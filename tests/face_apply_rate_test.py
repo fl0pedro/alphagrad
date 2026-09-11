@@ -1018,7 +1018,11 @@ def test_the_per_slot_draws_equal_one_joint_draw():
                 want = np.asarray(row_all[fld])
                 if got.ndim == 0:
                     continue
-                assert got[s] == want[s], (trial, s, fld, got[s], want[s])
+                # array_equal, not `==`: `exponents` is (S, MAX_PRIMES), so
+                # `got[s]` is a VECTOR for that field and `==` is ambiguous.
+                np.testing.assert_array_equal(
+                    got[s], want[s],
+                    err_msg=f"trial {trial} slot {s} field {fld}")
                 checked += 1
     assert checked > 0
 
@@ -1156,9 +1160,18 @@ def test_the_decide_pass_answers_at_every_approx_add_width(tlm):
                 # only "no decision" value, which is what `decide_faces`
                 # initialises the array to.
                 decided += int((dec.rows[..., 0] != -1).sum())
+                # `choose` decides the join PER FACE, so the wire must carry
+                # the bit and `_face_dict_for_vertex` RAISES without it rather
+                # than defaulting -- which is the right behaviour and the reason
+                # this is passed here instead of being worked around. The decide
+                # pass itself never needs the bit (it builds the entry
+                # `with_policy=False`), which is what lets it answer under
+                # `choose` at all.
+                _join = (np.zeros((MAX_FACES,), np.int32)
+                         if want == "choose" else None)
                 per_face = _face_dict_for_vertex(
                     SimpleNamespace(jaxpr=jaxpr), tk.ij, v, dec.rows,
-                    np.zeros((MAX_FACES,), np.int32))
+                    np.zeros((MAX_FACES,), np.int32), face_join=_join)
                 tk.ij.eliminate(v, (), per_face or None)
             st = lf.consume_stats()
             assert st["decide_probe"] == 20, (want, st)
