@@ -228,6 +228,57 @@ def test_the_join_channel_exists_exactly_where_the_width_says(monkeypatch, mode)
         _run_episode(mode, join_bit=None if has_bit else 1)
 
 
+def test_a_FIXED_value_carries_NO_EXTRA_LEAF_and_no_extra_positional(monkeypatch):
+    """Two ways the join channel could have cost a flag-off run something.
+
+    (1) THE PYTREE. `EnvState.face_joins` is `None` under every value that FIXES
+    the join semantics, and `None` is a leaf-FREE pytree node -- but only if
+    nothing re-materialises it as a zeros array on the way through. Checked by
+    LEAF COUNT through the whole carry: reset, every step, and the shifted
+    prefix `_replace` the terminal path builds. `choose` is the control: it MUST
+    add exactly one leaf, or the channel is not being carried at all.
+
+    (2) THE SIGNATURE. `env._callback` is called directly, POSITIONALLY, from
+    about a dozen places -- six test modules plus the measure actors,
+    landscape_map and az_gumbel. Inserting `face_joins` as a positional
+    parameter between `face_skips` and `stop` shifted `stop` into it for every
+    one of them, and turned `tests/delta_obs_emission_test.py` from 8 passed to
+    4 failed. So `face_joins` is KEYWORD-ONLY, and this pins that: the eighth
+    positional parameter must still be `stop`.
+    """
+    import inspect
+    sig = inspect.signature(envmod._callback)
+    pos = [n for n, prm in sig.parameters.items()
+           if prm.kind is prm.POSITIONAL_OR_KEYWORD]
+    assert pos[:8] == ["config", "args", "consts", "order", "sparsity_specs",
+                       "face_specs", "face_skips", "stop"], pos
+    assert sig.parameters["face_joins"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert sig.parameters["face_joins"].default is None
+
+    counts = {}
+    for mode in ("lossless", "choose"):
+        monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", mode)
+        monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
+        env = _env()
+        state = env.reset()
+        n0 = len(jax.tree_util.tree_leaves(state))
+        no_rules = jnp.full((MAX_RULES_PER_VERTEX, 3), -1,
+                            jnp.int32).at[..., 2].set(0)
+        rows, skip, join = _wire_at(mode, join_bit=1 if mode == "choose" else None)
+        assert (state.face_joins is None) == (mode != "choose")
+        for v in [int(x) for x in np.asarray(env.valid_vertices)]:
+            state = env.step(state, StepAction(
+                jnp.asarray(v, jnp.int32), no_rules, rows, skip, join)).state
+            assert len(jax.tree_util.tree_leaves(state)) == n0, (
+                mode, "the step changed the carry's leaf count")
+            assert (state.face_joins is None) == (mode != "choose")
+        counts[mode] = n0
+        envmod.consume_plan_records()
+    assert counts["choose"] == counts["lossless"] + 1, (
+        "the join channel must cost EXACTLY one leaf under `choose` and none "
+        f"under a fixed value; got {counts}")
+
+
 @pytest.mark.parametrize("mode", MODES)
 def test_a_row_array_at_the_WRONG_width_is_refused_by_the_env(monkeypatch, mode):
     """The declaration's width and the env's must be ONE number.
