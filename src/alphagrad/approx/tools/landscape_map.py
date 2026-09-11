@@ -372,6 +372,7 @@ from alphagrad.approx.env import (                            # noqa: E402
 from alphagrad.approx.common.masks import (                   # noqa: E402
     quant_valid_mask,
     compress_slot_mask,
+    slot_legality,
     diag_valid_mask,
     diag_pair_gcd,
 )
@@ -690,9 +691,12 @@ def build_singleton_sweep_plans(env, order, inv):
                 plan_orders[pid_q] = order
 
             # 3. REDUCE (mean first, every legal axis)
-            c_mask = compress_slot_mask(st, 8)
+            # Wire row expects a logical dimension index; slot_legality.comp
+            # tests logical dimensions, unlike compress_slot_mask which indexes
+            # canonical slots (dsnn-3qm.73).
+            leg = slot_legality(st, 8)
             for a in range(8):
-                if c_mask[a]:
+                if leg.comp[a]:
                     pid_r = f"singleton:reduce:k{k}.f{f}:{sname}:ax{a}"
                     row_r = [COMPRESS_SENTINEL, a, mean_idx]
                     pl_r = build_singleton_plan(env, order, k, f, op="compress",
@@ -701,6 +705,7 @@ def build_singleton_sweep_plans(env, order, inv):
                     pl_r["budget"] = f"{face_tag}:{sname}:ax{a}"
                     plans[pid_r] = pl_r
                     plan_orders[pid_r] = order
+
 
             # 4. DIAG (explicit gcd > 1 per legal axis pair, never -1)
             d_mask = diag_valid_mask(st, 8)

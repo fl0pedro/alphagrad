@@ -347,7 +347,10 @@ def test_two_op_form_keeps_the_new_slot_hook_OFF_the_old_edge():
     so one row decoded in two different frames and the mask answered for one of
     them (finding 72, fault 1).
     """
-    from graphax.sparse.ops.join import FaceJoinPolicy
+    try:
+        from graphax.sparse.ops.join import FaceJoinPolicy
+    except ImportError:
+        FaceJoinPolicy = ()
     closed = _closed(_chain, _ARGS)
     config = SimpleNamespace(jaxpr=closed.jaxpr)
     ij, keys, key, _st = _x_face(closed, _ARGS)
@@ -779,3 +782,29 @@ def test_every_requested_row_gets_a_slot_frame_hook():
     assert n_[0].rules_for(store["lhs"]) == ()
     # Row 1 names axis 1, which the lhs tensor does have.
     assert len(n_[1].rules_for(store["lhs"])) == 1
+
+
+def test_make_live_masked_hook_records_noop_when_operand_unchanged():
+    """When a transform returns the operand unchanged (cur is prev), the hook
+    must record skipped and skipped_{kind}_noop, never applied (dsnn-3qm.73)."""
+    from alphagrad.approx.common.masks import make_live_masked_hook
+    from graphax.sparse.indexes import DiagonalIndex
+    from graphax.sparse.tensor import SparseTensor
+    import jax.numpy as jnp
+
+    # A tensor where dimension 1 is implicit (partner of dim 0)
+    st = SparseTensor(
+        out_dims=(DiagonalIndex(id=0, size=64, axis=0, other_id=1),),
+        primal_dims=(DiagonalIndex(id=1, size=64, axis=None, other_id=0),),
+        val=jnp.ones((64,)),
+    )
+    stats = {}
+    rule = Compress(axes=(), kind="mean")
+    hook = make_live_masked_hook([rule], stats=stats)
+    res = hook(st)
+    assert res is st
+    assert stats.get("applied", 0) == 0
+    assert stats.get("applied_compress", 0) == 0
+    assert stats.get("skipped", 0) == 1
+    assert stats.get("skipped_compress_noop", 0) == 1
+
