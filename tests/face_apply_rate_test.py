@@ -166,6 +166,17 @@ def _jit_draw(pol, feats, ctx, tables):
     one, and ``test_the_jitted_draw_is_the_eager_draw`` pins that it changes no
     draw.
     """
+    # WARM THE HARDWARE SCAN EAGERLY FIRST. `sample_face` calls
+    # `graphax.sparse.micro_actions.quant_hardware_masks()` when
+    # `quant_legality_mask` is None, and that function MEMOISES a jnp array --
+    # its own docstring says "Warm this once at build (eagerly, before any jit)
+    # so the jnp.dot probes never run under trace." If the first caller in a
+    # process is under jit, the cache holds a DynamicJaxprTracer and the next
+    # EAGER caller dies with UnexpectedTracerError (measured: job 64889's
+    # episode probe, leak created at micro_actions.py:299).
+    from graphax.sparse.micro_actions import quant_hardware_masks
+    quant_hardware_masks()
+
     @jax.jit
     def _d(key, f, pr, cp, sz, qt):
         sk, row, _lp, _e, _ar, _sp, _od = pol.sample_face(
