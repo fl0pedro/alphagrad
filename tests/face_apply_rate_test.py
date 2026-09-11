@@ -208,12 +208,12 @@ def _walk_one_graph(target, seed, slots_on=None):
     pol, tables = _policy(F)
     feats = _features()
     ctx = jnp.zeros((pol.embd_dim,), jnp.float32)
-    # THE TOPOLOGY'S WIDTH, not FACE_SLOTS. `face_slot_sites()` reports five
-    # slots since #73 (the three contraction slots, then learned1 on the old
-    # edge and learned2 on the summed edge), so the mask arrays are sized from
-    # it. The POLICY and the wire below still cover the contraction band, so the
-    # join rows are computed and then sliced off -- which is what `face_driver`
-    # does on the trainer path, and the prefix assertion is the same one.
+    # THE TOPOLOGY'S WIDTH, not a restated FACE_SLOTS. `face_slot_sites()`
+    # reports as many slots as --approx-add has (three under the default
+    # lossless, four under learned1, five under learned2), so the mask arrays
+    # are sized from it and this walk is correct at every width. The prefix
+    # assertion is `face_driver`'s: the contraction slots must be the first
+    # three rows, or narrowing to them would hand the head other tensors' masks.
     sites = face_slot_sites()
     S_ALL = len(sites)
     assert tuple(x[0] for x in sites[:FACE_SLOTS]) == (
@@ -451,11 +451,20 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
         # them to agree -- which is the claim being checked here: the site
         # topology is a property of where the slot HOOKS go, and the arms differ
         # only in what sits at `jr`, which is not a slot hook.
+        _SITES = {
+            "lossy":    (("lhs",), ("rhs",), ("res:new",)),
+            "lossless": (("lhs",), ("rhs",), ("res:new",)),
+            "choose":   (("lhs",), ("rhs",), ("res:new",)),
+            "learned1": (("lhs",), ("rhs",), ("res:new",), ("res:jr",)),
+            "learned2": (("lhs",), ("rhs",), ("res:new",), ("res:jr",),
+                         ("res:jres",)),
+        }
         for want in envmod.APPROX_ADD_CHOICES:
             os.environ[envmod._APPROX_ADD_ENV] = want
             sites = envmod.face_slot_sites()
-            assert sites == (("lhs",), ("rhs",), ("res:new",),
-                             ("res:jr",), ("res:jres",)), (want, sites)
+            # The WIDTH is the value's since 2026-09-11: three sites under the
+            # contraction-only values, four under learned1, five under learned2.
+            assert sites == _SITES[want], (want, sites)
             # ONE site per slot is the invariant, not the count.
             assert all(len(x) == 1 for x in sites), (want, sites)
             flat = {x for per in sites for x in per}
@@ -495,12 +504,17 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
 # MEASURED (job 64808, TLM, one graph, min-Markowitz, 5 seeds -- the same
 # N_SAMPLES these tests use), rejection rate from the engine's own counters:
 #
-#   armed slots                  requested   rejected   rate
-#   3      (learned1 alone)             27          0  0.000
-#   4      (learned2 alone)            181          0  0.000
-#   0,1,2,3                           594          3  0.005
-#   0,1,2,4                           741         20  0.027
-#   0,1,2,3,4                         767         21  0.027
+#   --approx-add   armed slots              requested   rejected   rate
+#   learned1       3      (learned1 alone)         27          0  0.000
+#   learned2       4      (learned2 alone)        181          0  0.000
+#   learned1       0,1,2,3                        594          3  0.005
+#   learned2       0,1,2,4                        741         20  0.027
+#   learned2       0,1,2,3,4                      767         21  0.027
+#
+# THE VALUE IS NOT A FREE CHOICE NEXT TO THE ARM (2026-09-11): slot 3 exists
+# only under `learned1` and above, slot 4 only under `learned2`, because the
+# head width and the wire width are the same number. `_join_totals` derives the
+# value from the arm for exactly that reason.
 #
 # With the contraction slots UNARMED both masks are exactly right: nothing moves
 # their tensor between the mask and the apply. With them armed both reject, at
@@ -525,6 +539,12 @@ def _walk_join_slots(target, seed, arm):
     That is a PROBE, not the production path -- the rollout wire does not carry
     the join band yet -- but the MASK and the TENSOR are the production ones,
     which is what a rejection rate is about.
+
+    ``--approx-add`` MUST ALREADY NAME A VALUE WIDE ENOUGH FOR ``arm`` (the
+    caller sets it; see ``_join_totals``). Since 2026-09-11 arming slot 3 IS
+    ``learned1`` and arming slot 4 IS ``learned2``: the width is not a knob a
+    probe can turn independently of the configuration, and ``face_slot_sites``
+    / ``wire_slots`` answer from the configuration alone.
     """
     from graphax import IncrementalPathTokenizer
     from alphagrad.approx.common.masks import slot_legality
@@ -605,27 +625,49 @@ def _walk_join_slots(target, seed, arm):
 
 
 def _join_totals(target, arm):
-    req = {k: 0 for k in KINDS}
-    skip = {k: 0 for k in KINDS}
-    for seed in range(N_SAMPLES):
-        r, st = _walk_join_slots(target, seed, arm)
-        for k in KINDS:
-            req[k] += r[k]
-            skip[k] += int(st.get(f"skipped_{k}", 0))
-    return req, skip
+    """Totals over ``N_SAMPLES`` seeds, under the ``--approx-add`` value whose
+    WIDTH owns the armed slots.
+
+    Slot 3 exists only under ``learned1`` and above; slot 4 only under
+    ``learned2``. So the value is derived from the arm rather than passed in:
+    asking for slot 4 under ``learned1`` has to be impossible, not merely
+    discouraged, and ``env.face_entry_from_slots`` raises on the width mismatch
+    if it ever is.
+    """
+    want = "learned2" if max(arm) >= 4 else "learned1"
+    prev = os.environ.get(envmod._APPROX_ADD_ENV)
+    os.environ.pop(envmod._APPROX_OLD_ENV, None)
+    os.environ[envmod._APPROX_ADD_ENV] = want
+    try:
+        assert envmod.wire_slots() == (5 if want == "learned2" else 4)
+        req = {k: 0 for k in KINDS}
+        skip = {k: 0 for k in KINDS}
+        for seed in range(N_SAMPLES):
+            r, st = _walk_join_slots(target, seed, arm)
+            for k in KINDS:
+                req[k] += r[k]
+                skip[k] += int(st.get(f"skipped_{k}", 0))
+        return req, skip
+    finally:
+        if prev is None:
+            os.environ.pop(envmod._APPROX_ADD_ENV, None)
+        else:
+            os.environ[envmod._APPROX_ADD_ENV] = prev
 
 
 def test_learned1_alone_rejects_nothing(tlm):
     """THE MASK IS RIGHT FOR ITS TENSOR. With the contraction slots unarmed,
     nothing upstream moves the old edge between the mask and the apply, and
-    learned1 refuses nothing: 0 of 27 over 5 seeds."""
+    learned1 refuses nothing: 0 of 27 over 5 seeds. Run under
+    ``--approx-add learned1``, the 125-logit / 4-slot width."""
     req, skip = _join_totals(tlm, (3,))
     assert sum(req.values()) > 0, "nothing was requested -- vacuous"
     assert sum(skip.values()) == 0, (req, skip)
 
 
 def test_learned2_alone_rejects_nothing(tlm):
-    """Same statement for the summed edge: 0 of 181 over 5 seeds."""
+    """Same statement for the summed edge: 0 of 181 over 5 seeds. Run under
+    ``--approx-add learned2``, the 156-logit / 5-slot width."""
     req, skip = _join_totals(tlm, (4,))
     assert sum(req.values()) > 0, "nothing was requested -- vacuous"
     assert sum(skip.values()) == 0, (req, skip)
@@ -654,19 +696,22 @@ def test_learned2_alone_rejects_nothing(tlm):
 #
 # STRICT xfails, so they flip the moment fault 2 is fixed.
 @pytest.mark.xfail(strict=True,
-                   reason="dsnn-3qm.59 fault 2, intra-vertex: an earlier face's "
-                          "merge writes the edge a later face's jr reads, so "
-                          "arming the contraction slots stales learned1's mask "
-                          "within one elimination step. Measured 3 of 594 on "
-                          "TLM over 5 seeds (1 Diag, 2 Reduce); 0 of 27 with "
-                          "the contraction slots unarmed.")
+                   reason="dsnn-3qm.59 fault 2, intra-vertex, under "
+                          "--approx-add learned1 (125 logits, 4 slots): an "
+                          "earlier face's merge writes the edge a later face's "
+                          "jr reads, so arming the contraction slots stales "
+                          "learned1's mask within one elimination step. "
+                          "Measured 3 of 594 on TLM over 5 seeds (1 Diag, 2 "
+                          "Reduce); 0 of 27 with the contraction slots "
+                          "unarmed.")
 def test_learned1_rejects_nothing_with_the_contraction_slots_armed(tlm):
     req, skip = _join_totals(tlm, (0, 1, 2, 3))
     assert sum(skip.values()) == 0, (req, skip)
 
 
 @pytest.mark.xfail(strict=True,
-                   reason="dsnn-3qm.59 fault 2, one level further along: the "
+                   reason="dsnn-3qm.59 fault 2, one level further along, under "
+                          "--approx-add learned2 (156 logits, 5 slots): the "
                           "SUMMED edge is new + old, so it carries this face's "
                           "own contraction approximations, and learned2's mask "
                           "is read from it BEFORE those rows are drawn. "

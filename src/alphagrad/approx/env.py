@@ -4768,11 +4768,24 @@ def make_slot_frame_hook(one_row, *, stats: dict | None = None,
 #               put the `new` slot's rule on the POST-JOIN SUM, approximating
 #               the merge instead of the contraction).
 #   choose   -- the HEAD picks one of the two PER FACE, one bit, from its own
-#               logit (``unified_face_head.O_CHOOSE``). The bit rides the wire
-#               as ``face_join[f]``: 0 = lossy, 1 = lossless
+#               logit (``unified_face_head``'s ``layout.choose_index``). The bit
+#               rides the wire as ``face_join[f]``: 0 = lossy, 1 = lossless
 #               (``JOIN_LOSSY`` / ``JOIN_LOSSLESS``). There is NO legality mask
 #               on it, because both arms are always formable -- see
 #               ``face_entry_from_slots``.
+#   learned1 -- the head gets a FOURTH slot, which approximates the OLD EDGE
+#               itself (graphax ``res:jr``). NO choose bit: the model picks the
+#               old edge's approximation directly, and that pick is what answers
+#               the container question. The ADD then reconciles with the UNION.
+#   learned2 -- a FIFTH slot on top of learned1's, approximating the ADD OUTPUT
+#               (graphax ``res:jres``). Again no bit, again union at the merge;
+#               the learned output approximation compresses the sum, which is
+#               where the loss belongs and is in the plan's action record.
+#
+# EACH VALUE IS ITS OWN HEAD WIDTH -- 94, 94, 95, 125, 156 logits -- so a field
+# a value does not use does not exist rather than being gated off. See the
+# ``unified_face_head`` module docstring for the arithmetic and ``wire_slots``
+# for the matching wire width.
 #
 # WHY ``same`` AND ``exact`` ARE GONE RATHER THAN ALIASED. Both old names map
 # onto a DIFFERENT object than their replacement measures:
@@ -4793,30 +4806,78 @@ def make_slot_frame_hook(one_row, *, stats: dict | None = None,
 # the plan log records what actually ran. Read at call time, never at import.
 _APPROX_ADD_ENV = "ALPHAGRAD_APPROX_ADD"
 _APPROX_OLD_ENV = "ALPHAGRAD_APPROX_OLD"          # RETIRED, raises
-#: THE WIRE'S SLOT BANDS (#73). ``FACE_SLOTS`` keeps meaning "the CONTRACTION
-#: slots" -- lhs, rhs, new -- so every existing ``range(FACE_SLOTS)`` loop stays
-#: correct without being read. The two JOIN slots are appended after them:
+#: THE WIRE'S SLOT BANDS (#73, rewidthed 2026-09-11). ``FACE_SLOTS`` keeps
+#: meaning "the CONTRACTION slots" -- lhs, rhs, new -- so every existing
+#: ``range(FACE_SLOTS)`` loop stays correct without being read. The JOIN slots
+#: come after them, AND HOW MANY THERE ARE IS THE RUNNING VALUE'S ANSWER
+#: (:func:`wire_slots`):
 #:
-#:     0..2  contraction: lhs, rhs, new
-#:     3     learned1, the OLD EDGE    (graphax ``jr``)
-#:     4     learned2, the SUMMED EDGE (graphax ``jres``)
+#:     0..2  contraction: lhs, rhs, new          every value
+#:     3     learned1, the OLD EDGE    (``jr``)   learned1, learned2
+#:     4     learned2, the SUMMED EDGE (``jres``) learned2
+#:
+#: So the wire is 3 slots wide under ``lossy`` / ``lossless`` / ``choose``, 4
+#: under ``learned1`` and 5 under ``learned2`` -- the same widths the head is
+#: built at, from the same table
+#: (``unified_face_head._LAYOUT_SPEC``). ONE source of truth, so a wire row
+#: cannot describe a slot the head has no logits for.
 #:
 #: ROUTE CHOSEN, and why: the join rows ride the EXISTING ``face_specs`` array
-#: widened from 3 slots to 5, not a second array beside it. The wire's transport
+#: widened from 3 slots, not a second array beside it. The wire's transport
 #: is already built -- ``face_specs`` is carried wholesale through the env state,
 #: the callback, the plan record, the rollout and the replay (32 sites in env.py
 #: and about 25 in ppo.py) -- so widening changes shape-bearing CONSTRUCTIONS and
 #: no transport, while a second array would have to duplicate all of it. It also
-#: keeps the head's already-5-row ``FaceFields`` un-split: splitting it at the
-#: policy boundary and rejoining it in env is exactly where a row could be
-#: mis-slotted.
-JOIN_WIRE_SLOTS = 2
-N_WIRE_SLOTS = FACE_SLOTS + JOIN_WIRE_SLOTS
+#: keeps the head's ``FaceFields`` un-split: splitting it at the policy boundary
+#: and rejoining it in env is exactly where a row could be mis-slotted.
 
-APPROX_ADD_CHOICES = ("lossy", "lossless", "choose")
+#: Every valid ``--approx-add``. The two learned values were added on
+#: 2026-09-11 with the width ruling: they are not "lossy/lossless plus an extra
+#: slot", they are their own widths, and under them the model's own pick
+#: answers the container question instead of a choose bit.
+APPROX_ADD_CHOICES = ("lossy", "lossless", "choose", "learned1", "learned2")
+
+#: The two CONTAINER semantics a single merge can be reconciled under. This is
+#: the range of :func:`resolve_join_mode` and of :func:`join_mode_of_bit`; it is
+#: NOT the list of ``--approx-add`` values, which is why the two are separate
+#: names now that ``learned1`` / ``learned2`` exist and both reconcile under the
+#: union.
+JOIN_SEMANTICS = ("lossy", "lossless")
+
+#: ``--approx-add`` value -> the join semantics it FIXES, or ``None`` when the
+#: value decides per face.
+#:
+#: ``learned1`` and ``learned2`` map to ``lossless`` -- THE UNION -- by owner
+#: ruling 2026-09-11, and the reason is worth stating where a reader would ask
+#: it: under those values both addends have ALREADY been shaped by the model's
+#: own picks (slot 3 on the old edge, slot 4 on the sum), so compressing them
+#: further at the merge would silently override a decision the model made, and
+#: the union is exact. Under ``learned2`` the learned output approximation then
+#: compresses the sum -- which is the model's decision, applied at the place the
+#: loss belongs, and recorded in the plan's action log rather than happening
+#: inside the add.
+_JOIN_SEMANTICS_OF = {
+    "lossy": "lossy",
+    "lossless": "lossless",
+    "choose": None,
+    "learned1": "lossless",
+    "learned2": "lossless",
+}
+
 #: The values whose join semantics is FIXED for the whole run. ``choose`` is
 #: not one of them: it is decided per FACE by the head's bit.
-APPROX_ADD_FIXED = ("lossy", "lossless")
+APPROX_ADD_FIXED = tuple(k for k in APPROX_ADD_CHOICES
+                         if _JOIN_SEMANTICS_OF[k] is not None)
+
+#: The values ``ppo.py`` and ``landscape_map`` OFFER on the command line. The
+#: other three are honoured by the engine and the head but need a trainer wire
+#: that does not exist yet -- ``choose`` needs ``FaceAction.join`` plus the
+#: trajectory and batch fields so the replay scores the bit ``sample`` drew, and
+#: the learned values need the policy's per-slot features and the rollout wire
+#: widened past the contraction band. A run started with one would raise (at the
+#: head's mask-row check, or at the first armed merge face), and a flag that
+#: dies mid-run is worse than one that is not offered.
+APPROX_ADD_CLI = ("lossy", "lossless")
 #: The declared default, ``lossless``: OWNER RULING 2026-09-10 (`90e0ab85` on
 #: hostperf-caches). It overrides the trade-off the implementation measured, and
 #: the measurement is kept here because it says what the ruling costs rather
@@ -4878,13 +4939,19 @@ def approx_add() -> str:
 
 
 def resolve_join_mode(mode=None) -> str:
-    """The join semantics for ONE face: ``"lossy"`` or ``"lossless"``.
+    """The join semantics for ONE face: ``"lossy"`` or ``"lossless"``
+    (:data:`JOIN_SEMANTICS`).
 
     ``mode`` is the per-FACE override the ``choose`` bit decodes to. ``None``
     means "take it from the configuration", which is only answerable when the
     configuration FIXES it:
 
-    * a fixed value (:data:`APPROX_ADD_FIXED`) answers for every face;
+    * a fixed value (:data:`APPROX_ADD_FIXED`) answers for every face, through
+      :data:`_JOIN_SEMANTICS_OF`. For ``lossy`` / ``lossless`` that is the value
+      itself; for ``learned1`` / ``learned2`` it is ``lossless``, THE UNION --
+      see :data:`_JOIN_SEMANTICS_OF` for why, because this is the one place a
+      reader asks "the learned values have no choose bit, so which container
+      does the add use?";
     * ``choose`` does NOT -- the decision is the head's, one bit per face, so a
       caller that reaches here with ``mode=None`` under ``choose`` has lost the
       bit somewhere between the wire and the entry builder. That raises. It must
@@ -4893,26 +4960,45 @@ def resolve_join_mode(mode=None) -> str:
       would score a decision that never ran.
     """
     cfg = approx_add()
+    fixed = _JOIN_SEMANTICS_OF[cfg]
     if mode is None:
-        if cfg in APPROX_ADD_FIXED:
-            return cfg
+        if fixed is not None:
+            return fixed
         raise ValueError(
             f"--approx-add {cfg!r} decides the join PER FACE, so "
             f"face_entry_from_slots needs an explicit mode for this face and "
             f"got None. The bit rides the wire as face_join[f]; a caller that "
             f"drops it has lost the head's decision, and defaulting here would "
             f"measure a plan under a semantics the policy did not choose.")
-    if mode not in APPROX_ADD_FIXED:
+    if mode not in JOIN_SEMANTICS:
         raise ValueError(
-            f"per-face join mode must be one of {APPROX_ADD_FIXED}, got "
+            f"per-face join mode must be one of {JOIN_SEMANTICS}, got "
             f"{mode!r}.")
-    if cfg in APPROX_ADD_FIXED and mode != cfg:
+    if fixed is not None and mode != fixed:
         raise ValueError(
-            f"--approx-add {cfg!r} FIXES the join semantics, but this face was "
-            f"handed mode={mode!r}. A per-face override is only meaningful "
-            f"under 'choose'; accepting it here would let a wire silently "
-            f"override the flag.")
+            f"--approx-add {cfg!r} FIXES the join semantics at {fixed!r}, but "
+            f"this face was handed mode={mode!r}. A per-face override is only "
+            f"meaningful under 'choose'; accepting it here would let a wire "
+            f"silently override the flag. (Under the learned values the model "
+            f"picks the approximations and the ADD reconciles with the union; "
+            f"there is no per-face container decision to make.)")
     return mode
+
+
+def wire_slots(mode: str | None = None) -> int:
+    """How many slots one face's wire row carries under ``--approx-add``.
+
+    3 under ``lossy`` / ``lossless`` / ``choose``, 4 under ``learned1``, 5 under
+    ``learned2`` -- DERIVED from the head's own layout table, not restated here,
+    so the wire width and the head width are one number. ``mode`` defaults to
+    :func:`approx_add`.
+
+    This is what replaced the fixed ``N_WIRE_SLOTS = 5``: a wire five slots wide
+    under ``lossless`` would carry two rows the head has no logits for, and the
+    engine would apply them.
+    """
+    from alphagrad.approx.unified_face_head import head_layout
+    return head_layout(approx_add() if mode is None else mode).n_slots
 
 
 def join_mode_of_bit(bit) -> str:
@@ -5041,36 +5127,52 @@ def face_entry_from_slots(slots, at_site=None, at_join=None, mode=None,
     -- and under ``choose`` the probe holds no bit, so asking for the arm would
     raise.
 
-    FIVE SLOTS, OPTIONALLY. ``slots`` is either the three CONTRACTION slots
-    (lhs, rhs, new) or those plus the two JOIN slots, in order:
+    AS MANY SLOTS AS THE RUNNING VALUE HAS, EXACTLY. ``len(slots)`` must equal
+    :func:`wire_slots` -- 3 under ``lossy`` / ``lossless`` / ``choose``, 4 under
+    ``learned1``, 5 under ``learned2``:
 
-        3  learned1 -- the OLD EDGE,    graphax ``jr``
-        4  learned2 -- the SUMMED EDGE, graphax ``jres``
+        0..2  contraction: lhs, rhs, new
+        3     learned1 -- the OLD EDGE,    graphax ``jr``
+        4     learned2 -- the SUMMED EDGE, graphax ``jres``
 
-    Any other length raises. The LENGTH is what declares whether join rows are
-    present, so a join row cannot be mis-slotted into a contraction position or
-    the reverse: there is no width at which the bands could be confused.
+    Any other length raises, and the check is EQUALITY rather than "3 or 5"
+    (2026-09-11). The width is not a caller's choice any more, it is the
+    configuration's, and it is the same number the HEAD is built at
+    (``unified_face_head._LAYOUT_SPEC``). A wire four slots wide under
+    ``lossless`` would carry a row the head has no logits for and the engine
+    would apply it; a wire three wide under ``learned1`` would drop a row the
+    head drew and scored. Both are silent, so both raise.
 
-    learned1's hook lands on the old edge under BOTH arms, but by two routes,
-    because under ``lossless`` there is no policy to hang it off: as the
-    policy's ``pre`` under ``lossy`` (running FIRST, so the reconciliation still
-    has the last word on the structure and the two addends still come out
-    identical) and as a plain ``jr`` hook under ``lossless``. Same tensor, same
-    site name, so one mask describes it either way.
+    learned1's hook lands on the old edge as a PLAIN ``jr`` hook, and learned2's
+    on the summed edge at ``jres``. Under the 2026-09-11 widths that is the only
+    route either of them takes: ``learned1`` / ``learned2`` reconcile with the
+    UNION (``_JOIN_SEMANTICS_OF``), ``lossless`` installs no policy, so there is
+    no policy for a learned hook to ride. The ``pre=`` wiring below is kept
+    because it is the CORRECT route if a future value ever pairs a ``lossy``
+    container with a learned old-edge slot -- under such a value the hook must
+    run BEFORE the reconciliation, so the reconciliation still has the last word
+    and the two addends still come out structurally identical -- but no value in
+    :data:`APPROX_ADD_CHOICES` reaches it today, because every value whose join
+    is ``lossy`` has exactly three slots and therefore no learned1 hook to pass.
     """
     def _at(site, hook):
         if hook is None or at_site is None:
             return hook
         return at_site(site, hook)
 
-    if len(slots) not in (FACE_SLOTS, N_WIRE_SLOTS):
+    _want = wire_slots()
+    if len(slots) != _want:
         raise ValueError(
-            f"face_entry_from_slots takes {FACE_SLOTS} slots (contraction "
-            f"only) or {N_WIRE_SLOTS} (plus learned1 on the old edge and "
-            f"learned2 on the summed edge), got {len(slots)}. The length is "
-            f"what says which bands are present; an in-between width could "
-            f"only be a mis-slotted row.")
-    _new_hook = slots[2] if len(slots) > 2 else None
+            f"--approx-add {approx_add()!r} has {_want} face slots "
+            f"({FACE_SLOTS} contraction"
+            + ("" if _want == FACE_SLOTS else
+               " + learned1 on the old edge" if _want == FACE_SLOTS + 1 else
+               " + learned1 on the old edge + learned2 on the summed edge")
+            + f"), and face_entry_from_slots got {len(slots)}. The WIDTH is "
+            f"the configuration's, not the caller's, and it is the width the "
+            f"head is built at: a row the head has no logits for must not be "
+            f"applied, and a row the head drew must not be dropped.")
+    _new_hook = slots[2]
     _l1 = slots[FACE_SLOTS] if len(slots) > FACE_SLOTS else None
     _l2 = slots[FACE_SLOTS + 1] if len(slots) > FACE_SLOTS + 1 else None
     core3 = (_at("lhs", slots[0]), _at("rhs", slots[1]),
@@ -5103,9 +5205,13 @@ def face_entry_from_slots(slots, at_site=None, at_join=None, mode=None,
                  for h in (slots[0], slots[1], _new_hook, _l1, _l2))
     if mode == "lossy" and _armed:
         from graphax.sparse.ops.join import MatchFreshJoin
-        # learned1 rides the policy's `pre`, which graphax applies to the old
-        # edge BEFORE the reconciliation -- so the reconciliation still has the
-        # last word and the two addends still come out structurally identical.
+        # `pre` is the position a learned OLD-EDGE hook would occupy under a
+        # lossy container: graphax applies it before the reconciliation, so the
+        # reconciliation still has the last word and the two addends still come
+        # out structurally identical. Under the current value table `jr_hook` is
+        # always None here -- every lossy value has three slots (see the
+        # docstring) -- and it is wired anyway rather than asserted away, because
+        # the alternative is a branch for a state that cannot happen.
         policy = MatchFreshJoin(pre=jr_hook,
                                 on_outcome=_join_outcome_sink())
         if at_join is not None:
@@ -5143,15 +5249,41 @@ def face_slot_sites() -> tuple[tuple[str, ...], ...]:
     automatically, because the site list is whatever the entry builder tags --
     never a restatement.
     """
-    got: list[list[str]] = [[] for _ in range(N_WIRE_SLOTS)]
+    n = wire_slots()
+    got: list[list[str]] = [[] for _ in range(n)]
 
     def _tag(site, hook):
         got[int(hook)].append(site)
         return hook
 
-    face_entry_from_slots(tuple(range(N_WIRE_SLOTS)), at_site=_tag,
-                          with_policy=False)
+    face_entry_from_slots(tuple(range(n)), at_site=_tag, with_policy=False)
     return tuple(tuple(g) for g in got)
+
+
+def wire_slots_of_rows(rows) -> int:
+    """The slot count of a ``(F, S, 3)`` wire-row array, CHECKED.
+
+    ONE place the rows' width meets :func:`wire_slots`, so a caller that loops
+    over a row array cannot decide for itself how many bands are present. A row
+    array narrower than the configuration would drop a slot the head drew and
+    scored; a wider one would apply a row the head has no logits for. Both are
+    silent, so both raise here -- including the trainer path under the learned
+    values, whose rows still carry the contraction band only (finding 73 section
+    9b: the policy's per-slot features and the rollout wire are not widened
+    yet).
+    """
+    n = int(np.asarray(rows).shape[-2])
+    want = wire_slots()
+    if n != want:
+        raise ValueError(
+            f"a face wire row array carries {n} slots but --approx-add "
+            f"{approx_add()!r} has {want} "
+            f"(FACE_SLOTS={FACE_SLOTS} contraction + "
+            f"{want - FACE_SLOTS} learned join). The rows and the head are "
+            f"built at the same width by construction; a mismatch means the "
+            f"producer of these rows has not been widened -- the trainer wire "
+            f"for the learned join slots is not built (ticket dsnn-3qm.56).")
+    return n
 
 
 def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
@@ -5187,17 +5319,10 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
             per_face[key] = SKIP_FACE
             continue
         slots = []
-        # AS MANY SLOTS AS THE ROWS CARRY. `face_row` is (F, S, 3) with S either
-        # FACE_SLOTS (contraction only) or N_WIRE_SLOTS (plus learned1 on the old
-        # edge and learned2 on the summed edge). The WIDTH is what says which
-        # bands are present, and face_entry_from_slots raises on anything
-        # between, so a join row cannot land in a contraction slot.
-        _n_slots = int(np.asarray(face_row).shape[1])
-        if _n_slots not in (FACE_SLOTS, N_WIRE_SLOTS):
-            raise ValueError(
-                f"face_row has {_n_slots} slot rows; expected {FACE_SLOTS} "
-                f"(contraction only) or {N_WIRE_SLOTS} (plus the two join "
-                f"slots). An in-between width could only be a mis-slotted row.")
+        # AS MANY SLOTS AS THE CONFIGURATION HAS, and the rows must already
+        # carry exactly that many: `wire_slots_of_rows` is the one place the two
+        # meet. `face_row` is (F, S, 3).
+        _n_slots = wire_slots_of_rows(face_row)
         for s in range(_n_slots):
             # The decoder walks all MAX_RULES slots — pad the single face
             # row with end-sentinels.

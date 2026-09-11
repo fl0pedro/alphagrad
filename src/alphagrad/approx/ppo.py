@@ -82,8 +82,9 @@ from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
     quality_metric as _env_quality_metric,
     APPROX_ADD_CHOICES,
+    APPROX_ADD_CLI,
     APPROX_ADD_DEFAULT,
-    APPROX_ADD_FIXED,
+    approx_add as _env_approx_add,
     _AXIS_FEAT_GROUP_ID,
     consume_degenerate_plan_count,
     consume_fidelity_stats,
@@ -4507,13 +4508,18 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--approx-add",
-        # ONLY THE FIXED VALUES ARE CLI-REACHABLE. `choose` exists in
-        # env.APPROX_ADD_CHOICES and the engine honours it per face, but the
-        # ROLLOUT WIRE does not carry face_join yet, so a run started with it
-        # would raise at the first armed merge face. A flag that dies mid-run
-        # is worse than one that is not offered: offer it when the transport
-        # lands (finding 73 section 9).
-        choices=list(APPROX_ADD_FIXED),
+        # ONLY THE TWO CONTRACTION-WIDTH VALUES ARE CLI-REACHABLE
+        # (env.APPROX_ADD_CLI). `choose`, `learned1` and `learned2` exist in
+        # env.APPROX_ADD_CHOICES, size the head (95 / 125 / 156 logits) and are
+        # honoured by the engine, but the TRAINER WIRE is unfinished: the
+        # policy's per-slot features and the rollout wire cover the contraction
+        # band only, and `choose` additionally needs FaceAction.join plus the
+        # trajectory and batch fields so the replay scores the bit sample drew.
+        # A run started with one would raise -- at the head's mask-row check or
+        # at the first armed merge face -- and a flag that dies mid-run is worse
+        # than one that is not offered. Offer them when the transport lands
+        # (finding 73 section 9, finding 74).
+        choices=list(APPROX_ADD_CLI),
         default=APPROX_ADD_DEFAULT,
         help="THE ADD (ticket .56, finding 73). A face accumulation "
         "multiplies lhs by rhs into new and, when the predecessor-to-"
@@ -4526,9 +4532,14 @@ def make_argparser() -> argparse.ArgumentParser:
         "information possible: the sum's support is the UNION of the two "
         "supports, so no non-zero of either addend is dropped (graphax's "
         "sparse + already builds that container: meta gcd, block lcm). "
-        "(A third value, choose -- the head picks per face from its own logit "
-        "-- exists in env.APPROX_ADD_CHOICES and is honoured by the engine, "
-        "but is not offered here until the rollout wire carries the bit.) "
+        "(Three further values exist in env.APPROX_ADD_CHOICES and are "
+        "honoured by the engine and the head, but are not offered here until "
+        "the trainer wire carries them: choose -- the head picks the container "
+        "per face from its own extra Bernoulli; learned1 -- the head gets a "
+        "FOURTH slot that approximates the OLD EDGE itself; learned2 -- a "
+        "FIFTH that approximates the ADD OUTPUT. The learned values have no "
+        "per-face container bit: the model's own picks answer that question, "
+        "and the add then reconciles with the union.) "
         "The values are NOT comparable: the choice changes the measured "
         "object. "
         "Published as ALPHAGRAD_APPROX_ADD (read by env.approx_add) so the "
@@ -5597,12 +5608,22 @@ def _build_agent(
     if getattr(args, "face_actions", False) and not getattr(
             args, "no_approx_head", False) and getattr(
             args, "unified_face_head", False):
-        # 94 outputs = 32*3 - 2: ONE skip Bernoulli for the whole face (it
-        # deletes the contraction, so it is a property of the face, not of an
-        # operand slot) plus 31 fields for each of the pre/post/new slots,
-        # from a single MLP forward. The reduce axis is a SOFTMAX over 9, so
-        # one slot IS one rule row -- that is what makes max_substeps=1
-        # structural and deletes _emit.
+        # 31 fields per slot plus ONE shared skip Bernoulli (a skip deletes the
+        # contraction, so it is a property of the face, not of an operand slot),
+        # from a single MLP forward. The reduce axis is a SOFTMAX over 9, so one
+        # slot IS one rule row -- that is what makes max_substeps=1 structural
+        # and deletes _emit.
+        #
+        # THE WIDTH IS --approx-add's (ticket dsnn-3qm.56, owner ruling
+        # 2026-09-11): 94 logits under lossy/lossless, 95 under choose (one
+        # extra Bernoulli), 125 under learned1 (a fourth slot, the OLD EDGE's
+        # own approximation), 156 under learned2 (a fifth, the ADD OUTPUT's).
+        # It is an ARCHITECTURE parameter and it is PLUMBED -- this is the one
+        # place the value reaches the head -- and cross-checked against
+        # env.approx_add() below so the head, the wire and the engine cannot be
+        # built at three different widths.
+        _approx_add = str(getattr(args, "approx_add", None)
+                          or APPROX_ADD_DEFAULT)
         face_path_policy = UnifiedFacePolicy(
             embd_dim=args.embd_dim,
             num_heads=args.num_heads,
@@ -5614,7 +5635,24 @@ def _build_agent(
             endpoint_read=bool(getattr(args, "face_endpoint_read", False)),
             edge_mem=bool(getattr(args, "face_edge_mem", False)),
             allow_skip=bool(getattr(args, "approx_profile", None) == "skip"),
+            approx_add=_approx_add,
         )
+        # ONE SOURCE OF TRUTH, CHECKED HERE. main() publishes --approx-add as
+        # ALPHAGRAD_APPROX_ADD before anything is built, and env.approx_add() is
+        # what the WIRE width (env.wire_slots) and the ENGINE (resolve_join_mode)
+        # read. If this builder were handed a different value the checkpoint
+        # would be the wrong shape for the plans it is asked to score, and every
+        # logit index past the skip would describe a different field. A silent
+        # slice is the failure this refuses.
+        _env_add = _env_approx_add()
+        if _approx_add != _env_add:
+            raise ValueError(
+                f"the face head is being built for --approx-add "
+                f"{_approx_add!r} while env.approx_add() resolves to "
+                f"{_env_add!r} (ALPHAGRAD_APPROX_ADD). The head width, the wire "
+                f"width and the engine's join semantics all come from that one "
+                f"value; building at two of them would size the checkpoint for "
+                f"a head the wire does not feed.")
     elif getattr(args, "face_actions", False) and not getattr(
             args, "no_approx_head", False):
         # FacePathPolicy is retired: 32 encoder + 24 head calls per vertex,

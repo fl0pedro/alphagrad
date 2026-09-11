@@ -1,14 +1,39 @@
-"""ONE approximation head per FACE. 94 outputs, one forward pass, one sample.
+"""ONE approximation head per FACE, one forward pass, one sample.
 
 The per-vertex 32-output head, restructured for the per-path action space the
 environment already consumes (``env.FACE_SLOTS = 3``, ``face_rows[v][f][s]``,
 ``face_skips[v][f]`` -> ``jacve(face_transforms=...)``).
 
-LAYOUT (94 logits)
-------------------
+THE WIDTH IS A FUNCTION OF ``--approx-add``
+-------------------------------------------
+Owner ruling 2026-09-11 (ticket dsnn-3qm.56). A field the running value does
+not use is not gated off -- IT DOES NOT EXIST, so it cannot be indexed, cannot
+hold a parameter and cannot take a gradient:
+
+    --approx-add   width            contents
+    lossy          31*3 + 1 =  94   skip + the three contraction slots
+    lossless       31*3 + 1 =  94   skip + the three contraction slots
+    choose         31*3 + 2 =  95   + ONE Bernoulli, lossy vs lossless per face
+    learned1       31*4 + 1 = 125   + slot 3: the OLD EDGE's own approximation
+    learned2       31*5 + 1 = 156   + slot 4: the ADD OUTPUT's own approximation
+
+READ THE ARITHMETIC: ``learned1`` and ``learned2`` are ``31*N + 1``, NOT
+``+2``. THEY HAVE NO CHOOSE BIT. Under those values the model does not pick
+lossy-or-lossless; it picks the old edge's (and, under ``learned2``, the sum's)
+approximation DIRECTLY, and that pick is what answers the container question.
+
+WHICH CONTAINER THE ADD THEN USES under ``learned1`` / ``learned2``: the UNION,
+i.e. ``lossless`` (owner ruling, ``env.resolve_join_mode``). Both addends have
+already been shaped by the model's own picks, so compressing further would
+silently override a decision the model made, and the union is exact. Under
+``learned2`` the learned output approximation then compresses the sum, which is
+the model's decision and the right place for the loss.
+
+LAYOUT
+------
     [0:1)   skip        Bernoulli -- ONE for the whole face
 
-    then slot s in (pre=lhs, post=rhs, new=res) at ``1 + SLOT_WIDTH*s``:
+    then slot s at ``1 + SLOT_WIDTH*s`` -- ONE multiply, at EVERY width:
       +0 :+4    op          softmax {blockdiag, reduce, quant, none}
       +4 :+10   i           softmax over 1..6
       +10:+16   j           softmax over 1..6
@@ -16,7 +41,16 @@ LAYOUT (94 logits)
       +25:+30   reduce fn   softmax {mean, min, max, abs_min, abs_max}
       +30:+31   dtype       Bernoulli {float32, bfloat16}
 
-    31 per slot, 3 slots = 93, plus the one shared skip = 94 = 32*3 - 2.
+    and, under ``choose`` ONLY, the join bit immediately after the last slot
+    block, at ``1 + SLOT_WIDTH*n_slots`` = 94.
+
+The slot blocks TILE from 1 upwards with no hole, so slot ``s``'s base is
+``1 + 31*s`` whatever the width is -- slot 3 is at 94 under ``learned1``, which
+is exactly where ``choose``'s bit sits under ``choose``. The two never coexist:
+``choose`` has three slots and ``learned1`` has no bit. An earlier layout put
+the bit at 94 under EVERY value and started the join slots at 95, which is why
+``slot_base`` used to need a branch "the price of putting the bit at 94". That
+justification is GONE, and so is the branch.
 
 WHAT CHANGED, AND WHY
 ---------------------
@@ -53,6 +87,8 @@ import jax
 import jax.nn as jnn
 import jax.numpy as jnp
 import jax.random as jrand
+from dataclasses import dataclass
+from functools import lru_cache
 from typing import NamedTuple
 
 OP_BLOCKDIAG, OP_REDUCE, OP_QUANT, OP_NONE = 0, 1, 2, 3
@@ -74,28 +110,115 @@ SLOT_WIDTH = S_DTYPE + 1                    # 31
 
 O_SKIP = 0
 O_SLOT0 = 1
-# --- the #73 APPEND (ticket .56). Every field base above keeps its index. ---
-# [0:94) unchanged; [94:95) the `choose` bit; [95:126) learned1, the OLD EDGE
-# (graphax `res:jr`); [126:157) learned2, the SUMMED EDGE (`res:jres`).
-#
-# JOIN_SLOTS are slot blocks of the SAME 31-wide shape as the three
-# contraction slots, so `slot_base` / `S_OP` / `score`'s per-slot loop cover
-# them unchanged. They are APPENDED AFTER the choose bit, which is why
-# `slot_base` needs a branch rather than one multiply: `O_SLOT0 + 31*3` is 94,
-# the choose bit's own index. The alternative -- the bit last, at 156 -- would
-# make `slot_base` a single expression, and it was rejected because the
-# offsets above are the ones the review and the goldens are written against.
-O_CHOOSE = O_SLOT0 + FACE_SLOTS * SLOT_WIDTH     # 94
-JOIN_SLOTS = 2
-O_JOIN0 = O_CHOOSE + 1                           # 95
-N_HEAD_SLOTS = FACE_SLOTS + JOIN_SLOTS           # 5
-HEAD_WIDTH = O_JOIN0 + JOIN_SLOTS * SLOT_WIDTH   # 157
 
-#: ``choose`` encoding. 0 = ``lossy``, 1 = ``lossless``. 0 is the canonical
-#: no-op value every forced field is written to, and ``lossy`` is the declared
-#: default of ``--approx-add``, so a golden that zeroes this field reproduces
-#: the default behaviour rather than a third thing.
+#: ``choose`` encoding. 0 = ``lossy``, 1 = ``lossless``. 0 is the value a
+#: golden that zeroes the field reproduces, and it is the only value the bit
+#: can hold under a layout that has no bit -- i.e. nowhere, because such a
+#: layout refuses the field entirely.
 JOIN_LOSSY, JOIN_LOSSLESS = 0, 1
+
+#: ``--approx-add`` value -> (number of 31-wide slot blocks, has a choose bit).
+#: THE ONE TABLE the width, the slot count and the bit's presence come from;
+#: :func:`head_layout` is the only reader. See the module docstring for the
+#: arithmetic and for why the learned values carry no bit.
+_LAYOUT_SPEC: dict[str, tuple[int, bool]] = {
+    "lossy":    (FACE_SLOTS,     False),
+    "lossless": (FACE_SLOTS,     False),
+    "choose":   (FACE_SLOTS,     True),
+    "learned1": (FACE_SLOTS + 1, False),
+    "learned2": (FACE_SLOTS + 2, False),
+}
+
+
+@dataclass(frozen=True)
+class FaceHeadLayout:
+    """ONE ``--approx-add`` value's head geometry: the SINGLE SOURCE OF TRUTH.
+
+    Everything that constructs the head, sizes a checkpoint or indexes a logit
+    asks this object, so none of them can disagree -- and every question it
+    cannot answer RAISES instead of returning a number that would silently
+    slice into somebody else's field:
+
+    * :meth:`slot_base` raises ``IndexError`` for a slot this width does not
+      contain. Not a wrap-around, not a clamp: the block is not there.
+    * :attr:`choose_index` raises ``IndexError`` unless the value is
+      ``choose``. The learned values have no bit (module docstring), and a
+      caller that asks for one has lost track of which value is running.
+    """
+
+    mode: str
+    n_slots: int
+    has_choose: bool
+
+    @property
+    def width(self) -> int:
+        """The number of logits. ``1 + 31*n_slots (+1 under ``choose``)``."""
+        return O_SLOT0 + SLOT_WIDTH * self.n_slots + int(self.has_choose)
+
+    @property
+    def n_join_slots(self) -> int:
+        """Slots beyond the three contraction ones: 0, 1 (learned1) or 2."""
+        return self.n_slots - FACE_SLOTS
+
+    def slot_base(self, s: int) -> int:
+        """Logit offset of slot ``s``'s 31-wide block: ``1 + 31*s``.
+
+        ONE MULTIPLY, at every width, because the slot blocks tile upwards from
+        1 with no hole -- ``choose``'s bit sits AFTER the last block, not
+        between blocks 2 and 3.
+        """
+        if not (0 <= int(s) < self.n_slots):
+            raise IndexError(
+                f"slot {s} does not exist in the {self.mode!r} head: it has "
+                f"{self.n_slots} slots ({FACE_SLOTS} contraction + "
+                f"{self.n_join_slots} join) and {self.width} logits. The "
+                f"field is absent at this width, not gated off -- indexing it "
+                f"would land in another field.")
+        return O_SLOT0 + SLOT_WIDTH * int(s)
+
+    @property
+    def choose_index(self) -> int:
+        """Logit index of the per-face ``lossy``/``lossless`` Bernoulli.
+
+        ``1 + 31*n_slots`` = 94, i.e. immediately after the last slot block.
+        Raises unless the running value is ``choose``.
+        """
+        if not self.has_choose:
+            raise IndexError(
+                f"--approx-add {self.mode!r} has NO choose bit: its head is "
+                f"{self.width} logits = 31*{self.n_slots} + 1. Only 'choose' "
+                f"carries one. Under the learned values the model picks the "
+                f"old edge's approximation directly and the ADD reconciles "
+                f"with the UNION (env.resolve_join_mode), so there is no bit "
+                f"to read.")
+        return O_SLOT0 + SLOT_WIDTH * self.n_slots
+
+
+@lru_cache(maxsize=None)
+def head_layout(mode: str) -> FaceHeadLayout:
+    """The :class:`FaceHeadLayout` of one ``--approx-add`` value.
+
+    ``mode`` is the value itself, PLUMBED in as an architecture parameter (it
+    reaches the head through ``UnifiedFacePolicy(approx_add=...)`` from
+    ``ppo._build_agent``), never read from the environment here: a width that
+    depended on a global would make a checkpoint's shape depend on a variable
+    nobody passed to the constructor.
+    """
+    try:
+        n_slots, has_choose = _LAYOUT_SPEC[mode]
+    except (KeyError, TypeError):
+        raise ValueError(
+            f"--approx-add {mode!r} has no head layout. Known values: "
+            f"{sorted(_LAYOUT_SPEC)}. A value whose width is unknown must not "
+            f"fall back to another value's width -- the checkpoint and every "
+            f"logit index would silently describe a different head.") from None
+    return FaceHeadLayout(mode=mode, n_slots=n_slots, has_choose=has_choose)
+
+
+#: The layout of the CONTRACTION-ONLY head -- ``lossy`` / ``lossless``, 94
+#: logits, three slots, no bit. It is the default for a caller that names no
+#: value, and the bound :func:`slot_base` checks against.
+CONTRACTION_LAYOUT = head_layout("lossless")
 
 # --face-logit-clamp (v62 saturation guard, ppo.py sets this right after
 # argparse, BEFORE any jit trace -- UnifiedFaceHead.logits reads it at
@@ -114,36 +237,35 @@ def set_logit_clamp(c: float) -> None:
     LOGIT_CLAMP[0] = float(c)
 
 
-def slot_base(s: int) -> int:
-    """Logit offset of slot ``s``'s 31-wide block.
+def slot_base(s: int, layout: FaceHeadLayout | None = None) -> int:
+    """Logit offset of slot ``s``'s 31-wide block: ``1 + 31*s``.
 
-    ``s < FACE_SLOTS`` -> the three contraction slots at 1, 32, 63, unchanged.
-    ``s >= FACE_SLOTS`` -> the join slots at 95, 126, i.e. AFTER the choose bit
-    at 94. The branch is the price of putting the bit at 94 (see the layout
-    comment); it is not an accident.
+    ``layout`` defaults to :data:`CONTRACTION_LAYOUT`, so a bare
+    ``slot_base(s)`` answers for the three contraction slots -- 1, 32, 63 --
+    and raises ``IndexError`` for anything beyond them. That default is SAFE
+    rather than convenient: the three contraction bases are the SAME at every
+    width (the blocks tile from 1 with no hole), which is exactly what the
+    2026-09-11 layout buys, so a caller looping ``range(FACE_SLOTS)`` is right
+    under every value. A caller that wants a JOIN slot must say which layout it
+    is indexing, because whether that slot exists at all is a property of the
+    running ``--approx-add`` value.
     """
-    if not (0 <= s < N_HEAD_SLOTS):
-        raise IndexError(
-            f"slot {s} out of range [0, {N_HEAD_SLOTS}); the head has "
-            f"{FACE_SLOTS} contraction slots and {JOIN_SLOTS} join slots.")
-    if s < FACE_SLOTS:
-        return O_SLOT0 + SLOT_WIDTH * s
-    return O_JOIN0 + SLOT_WIDTH * (s - FACE_SLOTS)
+    return (CONTRACTION_LAYOUT if layout is None else layout).slot_base(s)
 
 
 class FaceFields(NamedTuple):
     """One face's complete decision.
 
-    Slot fields are ``(N_HEAD_SLOTS,)``: the three CONTRACTION slots
-    (lhs, rhs, new) followed by the two JOIN slots (learned1 on the old edge,
-    learned2 on the summed edge). ``join`` is the per-face ``choose`` bit.
+    Slot fields are ``(layout.n_slots,)``: the three CONTRACTION slots (lhs,
+    rhs, new), then -- only at a width that HAS them -- learned1 on the old
+    edge and learned2 on the summed edge.
 
-    A field the running ``--approx-add`` value does not use is FORCED to its
-    canonical no-op here (``join = JOIN_LOSSY``, a join slot's ``op =
-    OP_NONE``) and contributes exactly zero log-prob and zero entropy, the
-    same discipline a padding face and a slot behind ``skip == 1`` get. That
-    is what keeps ``sample`` and ``score`` scoring the same variable, and so
-    the PPO ratio at 1 on epoch 0.
+    ``join`` is the per-face ``choose`` bit and is PRESENT IFF the running
+    layout has one. ``None`` is not "the default value of the bit", it is "this
+    decision has no bit", which is the only honest reading now that a layout
+    without a bit has no logit to score it against: :meth:`UnifiedFaceHead.score`
+    raises either way round (a bit under a layout that has none, a missing bit
+    under ``choose``) rather than substituting a value the head never drew.
     """
     skip: jax.Array          # () int32
     op: jax.Array            # (S,) int32
@@ -152,19 +274,7 @@ class FaceFields(NamedTuple):
     axis: jax.Array          # (S,) int32, 0..8
     reduce_fn: jax.Array     # (S,) int32
     dtype_idx: jax.Array     # (S,) int32 {0: float32, 1: bfloat16}
-    join: jax.Array = None   # () int32, JOIN_LOSSY / JOIN_LOSSLESS
-
-    @property
-    def join_bit(self) -> jax.Array:
-        """``join``, or the canonical ``JOIN_LOSSY`` when absent.
-
-        ``join`` defaults to ``None`` so every existing construction of
-        ``FaceFields`` -- tests, goldens, the AZ tokenizer -- keeps working and
-        means what it used to mean: no ``choose`` decision. Reading it through
-        here is what stops a ``None`` reaching the scorer.
-        """
-        return (jnp.asarray(JOIN_LOSSY, jnp.int32) if self.join is None
-                else self.join)
+    join: jax.Array = None   # () int32 under `choose`, else None
 
 
 def _cat_logp_ent(logits, mask, idx):
@@ -253,12 +363,21 @@ def j_mask_given_i(i_idx, j_mask, pair_ok=None):
 
 
 class UnifiedFaceHead(eqx.Module):
-    """embd_dim -> 94 logits -> one complete per-face approximation decision."""
+    """``embd_dim`` -> ``layout.width`` logits -> one complete per-face decision.
+
+    The width is the layout's, and the layout is the running ``--approx-add``
+    value's (module docstring). ``proj``'s output size, every logit index
+    :meth:`score` reads and the number of mask rows it accepts all come from
+    that ONE object, so a checkpoint built under one value cannot be read under
+    another: the shapes differ and equinox refuses.
+    """
 
     proj: eqx.nn.MLP
+    layout: FaceHeadLayout = eqx.field(static=True)
 
     def __init__(self, embd_dim: int, *, in_dim: int | None = None,
-                 hidden: int | None = None, key):
+                 hidden: int | None = None, key,
+                 approx_add: str = CONTRACTION_LAYOUT.mode):
         """``in_dim`` is the width of the face REPRESENTATION the head reads.
 
         It is 3*embd_dim under :class:`UnifiedFacePolicy`, whose input is
@@ -266,8 +385,21 @@ class UnifiedFaceHead(eqx.Module):
         contexts and the face's own palimpsa readout. It defaults to
         ``embd_dim`` so the single-vector callers (tests, the blind path)
         keep working unchanged.
+
+        ``approx_add`` is the ARCHITECTURE parameter that sets the OUTPUT
+        width, exactly like ``value_dims`` sets a value head's. It is plumbed
+        from ``ppo._build_agent``'s ``args.approx_add`` through
+        ``UnifiedFacePolicy``; it is NOT read from the environment here,
+        because a checkpoint's shape must not depend on a variable nobody
+        passed to the constructor. ``ppo._build_agent`` cross-checks the value
+        it plumbs against ``env.approx_add()`` so the two cannot drift.
+
+        The default is the CONTRACTION-ONLY layout -- 94 logits, the
+        ``lossy`` / ``lossless`` width, which is also ``APPROX_ADD_DEFAULT``
+        and the width every caller built before the join slots existed.
         """
-        self.proj = eqx.nn.MLP(in_dim or embd_dim, HEAD_WIDTH,
+        self.layout = head_layout(approx_add)
+        self.proj = eqx.nn.MLP(in_dim or embd_dim, self.layout.width,
                                hidden or embd_dim, depth=1, key=key)
 
     def logits(self, ctx):
@@ -281,71 +413,89 @@ class UnifiedFaceHead(eqx.Module):
         return z
 
     # ------------------------------------------------------------------ score
-    @staticmethod
-    def _check_mask_slots(*masks) -> int:
-        """How many slots the caller's masks describe: FACE_SLOTS or
-        N_HEAD_SLOTS, never anything else.
+    def _check_mask_slots(self, *masks) -> int:
+        """Require EXACTLY ``layout.n_slots`` mask rows, and return that.
 
-        A mask row that nobody computed must not be invented here. Padding a
-        3-row mask up to 5 with all-ones would CLEAR every action on the two
-        join slots -- on tensors the probe never looked at -- which is exactly
-        the "mask admits it, hook refuses it" defect finding 72 exists to
-        forbid. So a short mask means "the join slots are not in play", a full
-        mask means "they are", and anything else raises.
+        A mask row that nobody computed must not be invented here, and a slot
+        the width HAS must not be left unscored. Padding a 3-row mask up to 4
+        with all-ones would clear every action on the learned slot -- on a
+        tensor the probe never looked at -- which is the "mask admits it, hook
+        refuses it" defect finding 72 exists to forbid; silently scoring only
+        the first three of four slots is the same defect from the other side,
+        with slot 3's logits taking no gradient while the engine applies its
+        row. So both are refused here.
+
+        THIS IS WHERE THE UNFINISHED TRAINER WIRE SURFACES. Under ``learned1``
+        / ``learned2`` the head has 4 / 5 slots while the policy's per-slot
+        features and the rollout wire still cover the three contraction slots
+        (``face_driver.make_face_slot_callback`` narrows to them deliberately),
+        so a trainer run under those values reaches here with 3 rows and RAISES
+        -- which is the honest boundary, named in the message, rather than a
+        head that trains three of its four slots.
         """
         rows = {int(m.shape[0]) for m in masks if m is not None}
-        if rows - {FACE_SLOTS, N_HEAD_SLOTS}:
+        want = self.layout.n_slots
+        if rows - {want}:
             raise ValueError(
-                f"face masks must have {FACE_SLOTS} or {N_HEAD_SLOTS} slot "
+                f"the {self.layout.mode!r} head has {want} slots "
+                f"({self.layout.width} logits) and needs exactly {want} mask "
                 f"rows, got {sorted(rows)}. A padded row would clear actions "
-                f"on a tensor no mask was computed from.")
-        if len(rows) > 1:
-            raise ValueError(
-                f"face masks disagree on their slot count: {sorted(rows)}. "
-                f"One decision, one slot count.")
-        return rows.pop() if rows else FACE_SLOTS
+                f"on a tensor no mask was computed from; a short one would "
+                f"leave a slot the width HAS unscored while the engine still "
+                f"applies its wire row. If this is {want} > {FACE_SLOTS}: the "
+                f"policy's per-slot features and the rollout wire still cover "
+                f"the {FACE_SLOTS} contraction slots only -- the trainer wire "
+                f"for the learned join slots is not built (finding 73 section "
+                f"9b, ticket dsnn-3qm.56).")
+        return want
 
-    @staticmethod
-    def _join_gates(join_slot_ok):
-        """``(JOIN_SLOTS,)`` float gates; ``None`` means both join slots dead.
+    def _join_bit(self, fields: FaceFields):
+        """The ``choose`` bit to score, RAISING on either mismatch.
 
-        Dead is the right default: every ``--approx-add`` value except the
-        learned ones leaves those slots unused, and an unused field must
-        contribute exactly zero rather than take gradient from a reward it had
-        no part in.
+        A bit under a layout that has none cannot be scored -- there is no
+        logit for it -- and a missing bit under ``choose`` must not become
+        ``JOIN_LOSSY``: the plan would then be measured under a join the policy
+        did not pick while the log-prob the trainer stored scored the one it
+        did. That is the silent action/reward mismatch of finding 72, and it is
+        the same reason ``env.resolve_join_mode`` raises on a missing bit.
         """
-        if join_slot_ok is None:
-            return jnp.zeros((JOIN_SLOTS,), jnp.float32)
-        g = jnp.asarray(join_slot_ok, jnp.float32).reshape(-1)
-        if g.shape[0] != JOIN_SLOTS:
+        if not self.layout.has_choose:
+            if fields.join is not None:
+                raise ValueError(
+                    f"FaceFields carries a join bit but --approx-add "
+                    f"{self.layout.mode!r} has no choose logit to score it "
+                    f"against ({self.layout.width} logits = 31*"
+                    f"{self.layout.n_slots} + 1). Under the learned values the "
+                    f"model picks the old edge's approximation directly and "
+                    f"the ADD reconciles with the UNION; there is no bit.")
+            return None
+        if fields.join is None:
             raise ValueError(
-                f"join_slot_ok must have {JOIN_SLOTS} entries (learned1, "
-                f"learned2), got {g.shape[0]}.")
-        return g
+                "--approx-add 'choose' decides the join PER FACE from the "
+                "head's own bit, and this FaceFields has join=None. Defaulting "
+                "to JOIN_LOSSY would score a decision the head never drew: "
+                "sample() and score() would disagree and the PPO ratio would "
+                "not be 1 at epoch 0. The bit rides the wire as face_join[f].")
+        return fields.join
 
     def score(self, z, fields: FaceFields, *, op_mask, i_mask, j_mask,
               axis_mask, dtype_mask=None, pair_ok=None, face_valid=True,
-              approx_ok=True, choose_ok=False, join_slot_ok=None):
+              approx_ok=True):
         """(log_prob, entropy, arity) of ``fields`` under logits ``z``.
 
         Masks are ``(S, ...)`` so each slot can carry its own legality; the
-        caller passes the oracle's per-face masks. ``S`` may be
-        ``FACE_SLOTS`` (the three contraction slots only) or
-        ``N_HEAD_SLOTS``; anything else raises, because a silently padded mask
-        row would clear actions on a tensor nobody computed a mask from.
+        caller passes the oracle's per-face masks. ``S`` must be exactly
+        ``self.layout.n_slots`` -- see :meth:`_check_mask_slots`.
 
         ``face_valid`` / ``approx_ok`` are the gates that force a padding face
-        or a disallowed variant to contribute exactly zero. ``choose_ok`` and
-        ``join_slot_ok`` are the same discipline for the #73 fields:
-
-        ``choose_ok`` -- the ``choose`` bit is a LIVE decision (true only under
-        ``--approx-add choose``). False forces it to the canonical
-        ``JOIN_LOSSY`` with zero log-prob and zero entropy.
-
-        ``join_slot_ok`` -- ``(JOIN_SLOTS,)``, per join slot, live only under
-        the value that uses it (``learned1`` for slot 3, ``learned2`` for slot
-        4). Default: both dead, which is what every value except the learned
-        ones means.
+        or a disallowed variant to contribute exactly zero. There are no gates
+        for the ``choose`` bit or the learned slots any more, and that is the
+        2026-09-11 correction rather than an omission: WHETHER THOSE FIELDS
+        EXIST IS THE WIDTH'S ANSWER. A field this layout does not contain has
+        no logit, no parameter and no index -- ``layout.slot_base`` and
+        ``layout.choose_index`` raise ``IndexError`` for it -- so it cannot
+        take a gradient from a reward it had no part in, which is what the old
+        ``choose_ok`` / ``join_slot_ok`` gates were for.
 
         THERE IS NO LEGALITY MASK ON THE ``choose`` BIT, and that is measured,
         not assumed. Both arms are always formable: ``lossless`` is the plain
@@ -362,7 +512,7 @@ class UnifiedFaceHead(eqx.Module):
         before any update.
         """
         n_slots = self._check_mask_slots(op_mask, i_mask, j_mask, axis_mask)
-        join_slot_ok = self._join_gates(join_slot_ok)
+        join_bit = self._join_bit(fields)
         gate_face = jnp.asarray(face_valid, jnp.float32) * jnp.asarray(
             approx_ok, jnp.float32)
 
@@ -380,23 +530,20 @@ class UnifiedFaceHead(eqx.Module):
         ent = jnp.where(_on, e_skip, _z)
         arity = gate_face
 
-        # THE `choose` BIT. Gated by `choose_ok` and by the face gate, and
-        # SELECTED not multiplied, for the same reason every other gate here
-        # is: a 0.0 multiplier on a log-prob that is legitimately -inf is NaN.
-        _cho_on = _on & (jnp.asarray(choose_ok, jnp.float32) > 0.5)
-        lp_cho, e_cho = _bern_logp_ent(
-            z[O_CHOOSE], fields.join_bit > JOIN_LOSSY)
-        logp = logp + jnp.where(_cho_on, lp_cho, _z)
-        ent = ent + jnp.where(_cho_on, e_cho, _z)
+        # THE `choose` BIT, present iff this width has one. Gated by the face
+        # gate and SELECTED not multiplied, for the same reason every other
+        # gate here is: a 0.0 multiplier on a log-prob that is legitimately
+        # -inf is NaN.
+        if join_bit is not None:
+            lp_cho, e_cho = _bern_logp_ent(
+                z[self.layout.choose_index], join_bit > JOIN_LOSSY)
+            logp = logp + jnp.where(_on, lp_cho, _z)
+            ent = ent + jnp.where(_on, e_cho, _z)
 
         active = gate_face * (fields.skip == 0).astype(jnp.float32)
         _act = active > 0.5
         for s in range(n_slots):
-            # A JOIN slot is live only under the value that uses it. Dead ->
-            # the same zero contribution a slot behind `skip == 1` gets.
-            slot_on = (_act if s < FACE_SLOTS
-                       else _act & (join_slot_ok[s - FACE_SLOTS] > 0.5))
-            b = slot_base(s)
+            b = self.layout.slot_base(s)
             op = fields.op[s]
             lp_op, e_op = _cat_logp_ent(
                 z[b + S_OP:b + S_I], op_mask[s], op)
@@ -435,47 +582,39 @@ class UnifiedFaceHead(eqx.Module):
                       + jnp.where(is_bd, e_i + e_j, _z0)
                       + jnp.where(is_rd, e_ax + e_fn, _z0)
                       + jnp.where(is_qt, e_dt, _z0))
-            logp = logp + jnp.where(slot_on, slot_lp, _z)
-            ent = ent + jnp.where(slot_on, slot_e, _z)
-            arity = arity + (active * slot_on.astype(jnp.float32)
-                             * (op != OP_NONE).astype(jnp.float32))
+            logp = logp + jnp.where(_act, slot_lp, _z)
+            ent = ent + jnp.where(_act, slot_e, _z)
+            arity = arity + active * (op != OP_NONE).astype(jnp.float32)
         return logp, ent, arity
 
     # ----------------------------------------------------------------- sample
     def sample(self, ctx, key, *, op_mask, i_mask, j_mask, axis_mask,
-               dtype_mask=None, pair_ok=None, face_valid=True, approx_ok=True,
-               choose_ok=False, join_slot_ok=None):
+               dtype_mask=None, pair_ok=None, face_valid=True, approx_ok=True):
         """Draw one face decision. Returns ``(z, FaceFields, lp, ent, arity)``.
 
         Every field is drawn from the SINGLE forward pass ``z`` -- nothing is
-        conditioned on a previously drawn slot, and nothing is unrolled.
-
-        ``choose_ok`` / ``join_slot_ok`` gate the #73 fields exactly as
-        :meth:`score` documents, and are applied HERE as well as there: a field
-        that is forced in one and drawn in the other is the ratio bug.
+        conditioned on a previously drawn slot, and nothing is unrolled. The
+        fields drawn are exactly the ones this width contains, which is what
+        keeps :meth:`score` scoring the same variable.
         """
         z = self.logits(ctx)
         n_slots = self._check_mask_slots(op_mask, i_mask, j_mask, axis_mask)
-        join_gate = self._join_gates(join_slot_ok)
         # One skip key, five per slot (op, i, j, axis, reduce_fn), then one
-        # dtype key per slot. The dtype Bernoulli used to share k[4] with the
-        # reduce_fn categorical: under threefry a scalar uniform and the
-        # first Gumbel of a categorical read the same counter word of the
-        # key, so the pair was coupled (P(bf16 | mean) 0.01-0.04 against
-        # 0.6 for every other fn, finding 56 D8) while score() adds
-        # lp_fn + lp_dt as independent terms. The dtype keys are APPENDED:
-        # split(key, n)[i] does not depend on n under
-        # jax_threefry_partitionable, so every other draw is the same as
-        # before for the same seed.
-        # The key budget is written in N_HEAD_SLOTS, not FACE_SLOTS: the two
-        # join slots draw from their own keys. split(key, n)[i] does not depend
-        # on n under jax_threefry_partitionable, so slots 0-2 and the skip draw
-        # EXACTLY what they drew at 94 logits for the same seed -- the #73
-        # append does not move any existing random draw. The choose bit's key
-        # is appended last for the same reason.
-        keys = jrand.split(key, 2 + N_HEAD_SLOTS * 6)
-        dt_keys = keys[1 + N_HEAD_SLOTS * 5:]
-        cho_key = keys[1 + N_HEAD_SLOTS * 6]
+        # dtype key per slot, then -- only under `choose` -- the bit's. The
+        # dtype Bernoulli used to share k[4] with the reduce_fn categorical:
+        # under threefry a scalar uniform and the first Gumbel of a categorical
+        # read the same counter word of the key, so the pair was coupled
+        # (P(bf16 | mean) 0.01-0.04 against 0.6 for every other fn, finding 56
+        # D8) while score() adds lp_fn + lp_dt as independent terms.
+        #
+        # THE BUDGET IS WIDTH-DEPENDENT AND THAT MOVES NO DRAW.
+        # `split(key, n)[i]` does not depend on n under
+        # jax_threefry_partitionable, so the skip and slots 0-2 draw EXACTLY
+        # what they draw at every other width -- and at the 94-logit width the
+        # budget is `1 + 3*6` = 19 keys with the dtype keys at 16, 17, 18,
+        # which is byte for byte the pre-join-slot head's budget.
+        keys = jrand.split(key, 1 + n_slots * 6 + int(self.layout.has_choose))
+        dt_keys = keys[1 + n_slots * 5:]
 
         p_skip = jnn.sigmoid(z[O_SKIP])
         skip = (jrand.uniform(keys[0]) < p_skip).astype(jnp.int32)
@@ -484,16 +623,19 @@ class UnifiedFaceHead(eqx.Module):
         skip = skip * jnp.asarray(approx_ok, jnp.int32) \
             * jnp.asarray(face_valid, jnp.int32)
 
-        # The `choose` bit. Forced to the canonical JOIN_LOSSY when the running
-        # value does not use it, which is also what score() scores then.
-        join = (jrand.uniform(cho_key) < jnn.sigmoid(z[O_CHOOSE])
-                ).astype(jnp.int32)
-        join = join * jnp.asarray(choose_ok, jnp.int32) \
-            * jnp.asarray(face_valid, jnp.int32)
+        # The `choose` bit, drawn iff this width has one. There is nothing to
+        # force otherwise: a width without the bit has no logit and
+        # `FaceFields.join` stays None, which is what score() then scores.
+        join = None
+        if self.layout.has_choose:
+            join = (jrand.uniform(keys[1 + n_slots * 6])
+                    < jnn.sigmoid(z[self.layout.choose_index])
+                    ).astype(jnp.int32)
+            join = join * jnp.asarray(face_valid, jnp.int32)
 
         ops, iis, jjs, axs, fns, dts = [], [], [], [], [], []
         for s in range(n_slots):
-            b = slot_base(s)
+            b = self.layout.slot_base(s)
             k = keys[1 + 5 * s:1 + 5 * (s + 1)]
             op = _sample_cat(z[b + S_OP:b + S_I], op_mask[s], k[0])
             i_idx = _sample_cat(z[b + S_I:b + S_J], i_mask[s], k[1])
@@ -506,19 +648,6 @@ class UnifiedFaceHead(eqx.Module):
             dm = jnp.ones((2,), jnp.float32) if dtype_mask is None else dtype_mask[s]
             z_dt = jnp.stack([0.0, z[b + S_DTYPE]])
             dt = _sample_cat(z_dt, dm, dt_keys[s])
-            if s >= FACE_SLOTS:
-                # A dead join slot is forced to OP_NONE with every sub-field
-                # at 0 -- the same canonical no-op a slot behind `skip == 1`
-                # carries. Forcing the VALUE as well as zeroing the log-prob
-                # matters: the wire is built from these fields, so a dead slot
-                # must also emit no rule.
-                live = join_gate[s - FACE_SLOTS] > 0.5
-                op = jnp.where(live, op, jnp.asarray(OP_NONE, jnp.int32))
-                i_idx = jnp.where(live, i_idx, 0)
-                j_idx = jnp.where(live, j_idx, 0)
-                ax = jnp.where(live, ax, 0)
-                fn = jnp.where(live, fn, 0)
-                dt = jnp.where(live, dt, 0)
             ops.append(op); iis.append(i_idx); jjs.append(j_idx)
             axs.append(ax); fns.append(fn); dts.append(dt)
 
@@ -531,6 +660,5 @@ class UnifiedFaceHead(eqx.Module):
         lp, ent, arity = self.score(
             z, fields, op_mask=op_mask, i_mask=i_mask, j_mask=j_mask,
             axis_mask=axis_mask, dtype_mask=dtype_mask, pair_ok=pair_ok,
-            face_valid=face_valid, approx_ok=approx_ok,
-            choose_ok=choose_ok, join_slot_ok=join_slot_ok)
+            face_valid=face_valid, approx_ok=approx_ok)
         return z, fields, lp, ent, arity

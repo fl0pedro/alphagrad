@@ -394,11 +394,12 @@ def test_slot_legality_is_per_slot_and_matches_the_recorded_tensors():
     order, specs, n = _exact_prefix(total_v, total_v - 1)   # everything but 1
     sizes, quant, pair, comp, nout, nf = lf.face_slot_legality(
         order, specs, n, 1)
-    # ONE ROW PER SLOT THE ENTRY BUILDER HOOKS, which since #73 is five: the
-    # three contraction slots, then learned1 on the old edge and learned2 on the
-    # summed edge. The width comes from `env.face_slot_sites()` so the mask
-    # cannot go stale behind the topology, and the contraction slots are its
-    # PREFIX -- which is what lets the trainer path narrow to them.
+    # ONE ROW PER SLOT THE ENTRY BUILDER HOOKS, which is as many as
+    # --approx-add has: three under the default lossless, four under learned1
+    # (+ the old edge), five under learned2 (+ the summed edge). The width comes
+    # from `env.face_slot_sites()` so the mask cannot go stale behind the
+    # topology, and the contraction slots are its PREFIX -- which is what lets
+    # the trainer path narrow to them.
     from alphagrad.approx.env import face_slot_sites as _sites
     S_ALL = len(_sites())
     assert tuple(x[0] for x in _sites()[:FACE_SLOTS]) == (

@@ -453,17 +453,24 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
     # THE TRAINER CONSUMES THE CONTRACTION BAND ONLY, and says so.
     #
     # `face_slot_legality` returns one mask row per slot the entry builder places
-    # a hook for, which since #73 is five: lhs, rhs, new, learned1 (the old
-    # edge), learned2 (the summed edge). The policy's per-slot features and the
-    # rollout wire still cover the three contraction slots, so this callback
-    # NARROWS to them -- deliberately, and asserted below rather than left as a
-    # bare `S = 3` that happens to slice correctly.
+    # a hook for, which is `env.wire_slots()`: three under lossy / lossless /
+    # choose, four under learned1 (+ the OLD EDGE), five under learned2 (+ the
+    # SUMMED EDGE). The policy's per-slot features and the rollout wire cover the
+    # three CONTRACTION slots only, so:
     #
-    # The assertion is the load-bearing part: it pins that the contraction slots
-    # are the PREFIX of the topology. If a future value reordered the bands, a
-    # silent `[:3]` would hand the head three masks belonging to other tensors
-    # -- the mask/tensor mismatch of finding 72, arrived at from the other side.
+    #   * three rows -> nothing to narrow, and the prefix assertion below is what
+    #     pins that the three are the ones we think they are;
+    #   * more than three -> RAISE, here, at setup. Narrowing would hand the head
+    #     three mask rows for a four- or five-slot layout, and although the head
+    #     refuses that too (`_check_mask_slots`), the place that KNOWS it is
+    #     dropping a band is this one, and a flag that dies at setup is better
+    #     than one that dies mid-run.
+    #
+    # The prefix assertion is load-bearing: if a future value reordered the
+    # bands, a silent `[:3]` would hand the head three masks belonging to other
+    # tensors -- the mask/tensor mismatch of finding 72, from the other side.
     from alphagrad.approx.env import FACE_SLOTS as _CONTRACTION_SLOTS
+    from alphagrad.approx.env import approx_add as _approx_add
     from alphagrad.approx.env import face_slot_sites as _sites
     S = int(_CONTRACTION_SLOTS)
     _topology = _sites()
@@ -472,6 +479,16 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
             f"the contraction slots are no longer the prefix of the face slot "
             f"topology ({_topology}); narrowing the legality masks to the first "
             f"{S} rows would hand the head masks computed from other tensors.")
+    if len(_topology) != S:
+        raise NotImplementedError(
+            f"--approx-add {_approx_add()!r} gives the face head "
+            f"{len(_topology)} slots ({_topology}), and the trainer wire covers "
+            f"the {S} contraction slots only: the policy has no per-slot "
+            f"features for the learned join slots and the rollout does not carry "
+            f"their rows. Narrowing the legality masks here would train a head "
+            f"whose extra slots the engine still applies. The remaining work is "
+            f"transport, not design (finding 73 section 9b, ticket "
+            f"dsnn-3qm.56).")
     _perf = None
     if prof_sink is not None:
         import time as _time

@@ -389,8 +389,8 @@ class LiveFaceStream:
         """
         from graphax import SKIP_FACE
         from alphagrad.approx.env import (
-            FACE_SLOTS, MAX_RULES_PER_VERTEX, decode_vertex_rule_specs,
-            face_entry_from_slots)
+            MAX_RULES_PER_VERTEX, decode_vertex_rule_specs,
+            face_entry_from_slots, wire_slots_of_rows)
         from alphagrad.approx.common.masks import make_live_masked_hook
 
         keys = list(tk.ij.faces(int(vertex)))
@@ -400,7 +400,11 @@ class LiveFaceStream:
                 ft[keys[f]] = SKIP_FACE
                 continue
             slots = []
-            for s in range(FACE_SLOTS):
+            # AS MANY SLOTS AS THE CONFIGURATION HAS (2026-09-11). Looping
+            # FACE_SLOTS would silently drop a learned join row under
+            # --approx-add learned1 / learned2; `wire_slots_of_rows` raises
+            # instead, naming the producer that has not been widened.
+            for s in range(wire_slots_of_rows(face_rows)):
                 row = [list(int(x) for x in face_rows[f][s])] + [
                     [-1, -1, 0]] * (MAX_RULES_PER_VERTEX - 1)
                 try:
@@ -899,9 +903,9 @@ class LiveFaceStream:
             # reconciliation's arithmetic for a result nothing reads -- and
             # under `--approx-add choose` the probe does not hold the per-face
             # bit, so asking for the arm would raise.
-            from alphagrad.approx.env import N_WIRE_SLOTS
+            from alphagrad.approx.env import wire_slots
             ft = {k: face_entry_from_slots(
-                      tuple(range(N_WIRE_SLOTS)),
+                      tuple(range(wire_slots())),
                       at_site=lambda site, _h, k=k: _mk(k, site),
                       with_policy=False)
                   for k in keys}

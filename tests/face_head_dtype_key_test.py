@@ -37,7 +37,7 @@ import jax.random as jrand                                      # noqa: E402
 import numpy as np                                              # noqa: E402
 
 from alphagrad.approx.unified_face_head import (                # noqa: E402
-    FACE_SLOTS, FaceFields, HEAD_WIDTH, MAX_PAIR_IDX, NUM_APPROX_OPS,
+    CONTRACTION_LAYOUT, FACE_SLOTS, FaceFields, MAX_PAIR_IDX, NUM_APPROX_OPS,
     NUM_REDUCE_AXES, NUM_REDUCE_FNS, O_SKIP, OP_BLOCKDIAG, OP_NONE, OP_QUANT,
     OP_REDUCE, S_AXIS, S_DTYPE, S_I, S_J, S_OP, S_RFN, UnifiedFaceHead,
     _sample_cat, j_mask_given_i, slot_base)
@@ -172,8 +172,12 @@ def _fixed_fields(op_val, dt, fn):
 def test_score_of_a_fixed_action_is_unchanged():
     head, _ = _head_and_ctx()
     m = _masks()
-    z = jnp.asarray(np.sin(np.arange(HEAD_WIDTH, dtype=np.float32) * 0.37)
-                    * 2.0)
+    # The CONTRACTION-ONLY width (94): these goldens were computed on the
+    # lossy/lossless head, which is what `UnifiedFaceHead(...)` builds when no
+    # --approx-add is named. A wider value is a DIFFERENT head with different
+    # parameters, so the goldens cannot be shared across widths.
+    z = jnp.asarray(np.sin(np.arange(CONTRACTION_LAYOUT.width,
+                                     dtype=np.float32) * 0.37) * 2.0)
     for (op_val, dt, fn), (lp_g, ent_g, ar_g) in _GOLDEN.items():
         lp, ent, ar = head.score(z, _fixed_fields(op_val, dt, fn), **m)
         assert abs(float(lp) - lp_g) < 1e-5, (op_val, dt, fn, float(lp), lp_g)

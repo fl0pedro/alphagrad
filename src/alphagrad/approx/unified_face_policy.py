@@ -31,13 +31,14 @@ from alphagrad.approx.heads import (
 )
 from alphagrad.approx.unified_micro import _BF16_SLOT, _F32_SLOT, _KIND_MAP
 from alphagrad.approx.unified_face_head import (
-    FACE_SLOTS, MAX_PAIR_IDX, NUM_APPROX_OPS, NUM_REDUCE_AXES,
-    OP_BLOCKDIAG, OP_NONE, OP_QUANT, OP_REDUCE, UnifiedFaceHead, FaceFields,
+    CONTRACTION_LAYOUT, FACE_SLOTS, MAX_PAIR_IDX, NUM_APPROX_OPS,
+    NUM_REDUCE_AXES, OP_BLOCKDIAG, OP_NONE, OP_QUANT, OP_REDUCE, S_OP,
+    UnifiedFaceHead, FaceFields, slot_base,
 )
 
 
 class UnifiedFacePolicy(eqx.Module):
-    """One 94-output decision per face; three operand slots, no unrolling.
+    """One decision per face; three operand slots, no unrolling.
 
     THE FACE'S INPUT IS ITS OWN PALIMPSA LATENT, AND NOTHING ELSE
     (2026-08-15). The head reads ``face_latent`` -- the parameter-free
@@ -82,7 +83,8 @@ class UnifiedFacePolicy(eqx.Module):
                  use_group_embedding: bool = False,
                  endpoint_read: bool = False,
                  edge_mem: bool = False,
-                 allow_skip: bool = False):
+                 allow_skip: bool = False,
+                 approx_add: str = CONTRACTION_LAYOUT.mode):
         # num_heads / num_encoder_layers / max_groups / use_group_embedding
         # configured the deleted per-face AxisSetEncoder. They stay in the
         # signature because every trainer builds this policy positionally
@@ -103,8 +105,15 @@ class UnifiedFacePolicy(eqx.Module):
         # policy.
         _in = embd_dim * (1 + (2 if self.endpoint_read else 0)
                           + (2 if self.edge_mem else 0))
+        # `approx_add` sets the head's OUTPUT WIDTH: 94 logits under
+        # lossy/lossless, 95 under choose, 125 under learned1, 156 under
+        # learned2 (``unified_face_head`` module docstring). It is an
+        # architecture parameter like `embd_dim`, PLUMBED from
+        # ``ppo._build_agent``'s ``args.approx_add``, and that builder
+        # cross-checks it against ``env.approx_add()`` so the head, the wire and
+        # the engine cannot be built at three different widths.
         self.head = UnifiedFaceHead(embd_dim, in_dim=_in,
-                                    key=keys[1])
+                                    key=keys[1], approx_add=approx_add)
 
     # ------------------------------------------------------------ masks
     @staticmethod
@@ -495,8 +504,11 @@ class UnifiedFacePolicy(eqx.Module):
 
     @staticmethod
     def _op_dist(z):
+        # `slot_base`, not a restated `1 + 31*s`: one source of truth for the
+        # offsets, and it raises rather than slicing if the band ever moves.
         return jax.nn.softmax(
-            jnp.stack([z[1 + 31 * s:1 + 31 * s + NUM_APPROX_OPS]
+            jnp.stack([z[slot_base(s) + S_OP:slot_base(s) + S_OP
+                         + NUM_APPROX_OPS]
                        for s in range(FACE_SLOTS)]), axis=-1)
 
     # ------------------------------------------------------------ sample
