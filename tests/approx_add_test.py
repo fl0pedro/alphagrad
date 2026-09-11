@@ -407,7 +407,17 @@ def test_choose_is_a_value_and_does_not_fix_the_join(monkeypatch):
     assert envmod.JOIN_SEMANTICS == ("lossy", "lossless")
     assert envmod.APPROX_ADD_CHOICES == ("lossy", "lossless", "choose",
                                          "learned1", "learned2")
-    assert envmod.APPROX_ADD_CLI == ("lossy", "lossless")
+    # EVERY value is CLI-reachable since 2026-09-11 (ticket dsnn-3qm.56): the
+    # trainer wire that kept the other three off this tuple exists now -- the
+    # action record is declared once (alphagrad.approx.face_action) so the join
+    # bit travels through all four of its uses, and every per-slot shape follows
+    # the head's --approx-add width instead of FACE_SLOTS.
+    assert envmod.APPROX_ADD_CLI == envmod.APPROX_ADD_CHOICES
+    # A REPLAY tool's list is NARROWER, and that is not a drift: a replay has no
+    # head, so `choose`'s per-face bit does not exist for it to carry and the
+    # learned slots' rows are wider than its wires.
+    assert envmod.APPROX_ADD_CLI_REPLAY == ("lossy", "lossless")
+    assert set(envmod.APPROX_ADD_CLI_REPLAY) <= set(envmod.APPROX_ADD_CHOICES)
 
 
 @pytest.mark.parametrize("cfg", ["learned1", "learned2"])
@@ -682,5 +692,9 @@ def test_landscape_maps_restated_choice_list_still_agrees():
     # The CLI-REACHABLE values: `choose` needs a per-face wire channel this tool
     # does not have, and the learned values widen the head past the wire rows it
     # replays, so none of the three is offered here.
-    assert lm._APPROX_ADD_CHOICES == envmod.APPROX_ADD_CLI
+    # Against the REPLAY list, not the trainer's: landscape_map rebuilds wires
+    # from a stored plan and has no per-face join channel (see
+    # env.APPROX_ADD_CLI_REPLAY for why each missing value is missing).
+    assert lm._APPROX_ADD_CHOICES == envmod.APPROX_ADD_CLI_REPLAY
+    assert set(lm._APPROX_ADD_CHOICES) <= set(envmod.APPROX_ADD_CHOICES)
     assert lm._APPROX_ADD_DEFAULT == envmod.APPROX_ADD_DEFAULT

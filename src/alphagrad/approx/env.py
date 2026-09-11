@@ -4968,6 +4968,26 @@ APPROX_ADD_FIXED = tuple(k for k in APPROX_ADD_CHOICES
 #: ``range(FACE_SLOTS)`` loop is still right; :func:`wire_slots_of_rows` and
 #: ``face_action.check`` are what make a mis-slotted row RAISE.
 APPROX_ADD_CLI = APPROX_ADD_CHOICES
+
+#: The values a PLAN REPLAY tool can offer, which is NOT the trainer's list.
+#:
+#: A replay (``tools/landscape_map``, and anything else that reconstructs wires
+#: from a stored plan rather than drawing them) has no head, so:
+#:
+#: * ``choose`` is unreachable -- the join is a PER-FACE decision the head made,
+#:   and a replay that filled the channel with zeros would measure every merge
+#:   under ``lossy`` while claiming to replay the plan. That is the silent
+#:   action/reward mismatch, so the value is not offered rather than defaulted;
+#: * ``learned1`` / ``learned2`` are unreachable while a tool's ``face_specs``
+#:   are ``FACE_SLOTS`` wide -- :func:`wire_slots_of_rows` refuses those rows,
+#:   which is correct, and widening the tool is what would make the values
+#:   available.
+#:
+#: ``tools/landscape_map`` restates this literal (it builds its argparser before
+#: importing env on purpose) and ``tests/approx_add_test.py`` asserts the two
+#: still agree, so a drift is a test failure rather than a silently different
+#: choice list.
+APPROX_ADD_CLI_REPLAY = ("lossy", "lossless")
 #: The declared default, ``lossless``: OWNER RULING 2026-09-10 (`90e0ab85` on
 #: hostperf-caches). It overrides the trade-off the implementation measured, and
 #: the measurement is kept here because it says what the ruling costs rather

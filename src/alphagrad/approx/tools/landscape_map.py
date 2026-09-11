@@ -308,14 +308,16 @@ def make_argparser() -> argparse.ArgumentParser:
 
 
 # --- --approx-add choices, RESTATED and CROSS-CHECKED ----------------------
-# The canonical list is ``env.APPROX_ADD_CLI``, but this module builds its
+# The canonical list is ``env.APPROX_ADD_CLI_REPLAY`` -- the REPLAY list, which
+# is deliberately NARROWER than the trainer's ``env.APPROX_ADD_CLI`` (all five
+# values since 2026-09-11, ticket dsnn-3qm.56). This module builds its
 # argparser BEFORE importing alphagrad on purpose: several env knobs below are
 # read at IMPORT of ``alphagrad.approx.env`` (``ALPHAGRAD_MEASURE_ACTOR``), so
 # pulling env in up here would read them before they are set. The literal is
 # therefore a copy, and ``tests/approx_add_test.py`` asserts it still equals
-# ``env.APPROX_ADD_CLI`` / ``env.APPROX_ADD_DEFAULT`` -- a drift is a test
+# ``env.APPROX_ADD_CLI_REPLAY`` / ``env.APPROX_ADD_DEFAULT`` -- a drift is a test
 # failure, not a silently different choice list.
-# The CLI-REACHABLE values only. `choose` decides the join per face from the
+# The REPLAYABLE values only. `choose` decides the join per face from the
 # head's bit and this tool replays plans through `_face_dict_for_vertex` without
 # a `face_join` channel; `learned1` / `learned2` widen the head to a fourth and
 # fifth slot the replayed wire rows do not carry, which `env.wire_slots_of_rows`
