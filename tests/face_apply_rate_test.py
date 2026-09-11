@@ -492,29 +492,30 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
 # from the tensor its decision actually lands on -- the probe records one tensor
 # per site and ``slot_legality`` is computed on that site's own tensor.
 #
-# MEASURED (job 64803, TLM, one graph, min-Markowitz, 3 seeds), rejection rate
-# from the engine's own counters:
+# MEASURED (job 64808, TLM, one graph, min-Markowitz, 5 seeds -- the same
+# N_SAMPLES these tests use), rejection rate from the engine's own counters:
 #
-#   armed slots                  requested   rejected
-#   3      (learned1 alone)             14          0
-#   4      (learned2 alone)             92          0
-#   0,1,2  (contraction only)          341          0
-#   0,1,2,3                            354          0     <- learned1 immune
-#   0,1,2,4                            430          7     <- FAULT 2
-#   0,1,2,3,4                          443          7
+#   armed slots                  requested   rejected   rate
+#   3      (learned1 alone)             27          0  0.000
+#   4      (learned2 alone)            181          0  0.000
+#   0,1,2,3                           594          3  0.005
+#   0,1,2,4                           741         20  0.027
+#   0,1,2,3,4                         767         21  0.027
 #
-# and the same under both --approx-add arms (lossy: 0/352 and 7/441).
+# With the contraction slots UNARMED both masks are exactly right: nothing moves
+# their tensor between the mask and the apply. With them armed both reject, at
+# rates 5x apart, and both are dsnn-3qm.59 fault 2 by two different routes --
+# see the xfail reasons below.
 #
-# WHY learned1 IS IMMUNE AND learned2 IS NOT, which is the useful part. The OLD
-# EDGE is a pre-existing edge built by EARLIER eliminations; this face's lhs /
-# rhs / new rules do not touch it, so arming them cannot stale a mask read from
-# it. The SUMMED EDGE is ``new + old``, so it carries this face's own
-# contraction approximations -- and a mask computed before the draw is exactly
-# what goes stale, which is dsnn-3qm.59 fault 2 one level further along.
+# A 3-SEED PROBE SAID learned1 WAS IMMUNE (0 of 354) AND IT WAS WRONG. The
+# 5-seed test caught it. Recorded because the lesson is the useful part: a rate
+# this low is invisible in a short run, and the structural argument that
+# produced the wrong prediction (the old edge is built by earlier eliminations,
+# so this face cannot touch it) was incomplete -- it ignored sibling faces at
+# the same vertex.
 #
-# So learned1 gets an ASSERTION and learned2 a STRICT xfail. Do not relax the
-# xfail to a skip: a mask that clears an action the engine then refuses is the
-# defect deliverable 3 exists to forbid.
+# Do not relax either xfail to a skip: a mask that clears an action the engine
+# then refuses is the defect deliverable 3 exists to forbid.
 # ==========================================================================
 def _walk_join_slots(target, seed, arm):
     """Arm the JOIN slots (and optionally the contraction slots), each drawn
@@ -614,29 +615,53 @@ def _join_totals(target, arm):
     return req, skip
 
 
-def test_learned1_rejects_nothing_even_with_the_contraction_slots_armed(tlm):
-    """learned1 is masked from the OLD EDGE, which this face cannot move.
-
-    The old edge is built by EARLIER eliminations, so arming lhs / rhs / new
-    cannot stale a mask read from it. That is why this is an assertion and
-    learned2's is an xfail.
-    """
-    req, skip = _join_totals(tlm, (0, 1, 2, 3))
-    assert sum(req.values()) > 0, "nothing was requested -- vacuous"
-    assert sum(skip.values()) == 0, (req, skip)
-
-
 def test_learned1_alone_rejects_nothing(tlm):
+    """THE MASK IS RIGHT FOR ITS TENSOR. With the contraction slots unarmed,
+    nothing upstream moves the old edge between the mask and the apply, and
+    learned1 refuses nothing: 0 of 27 over 5 seeds."""
     req, skip = _join_totals(tlm, (3,))
     assert sum(req.values()) > 0, "nothing was requested -- vacuous"
     assert sum(skip.values()) == 0, (req, skip)
 
 
 def test_learned2_alone_rejects_nothing(tlm):
-    """With the contraction slots UNARMED the summed edge is exact, so the mask
-    read from it is still valid at apply time."""
+    """Same statement for the summed edge: 0 of 181 over 5 seeds."""
     req, skip = _join_totals(tlm, (4,))
     assert sum(req.values()) > 0, "nothing was requested -- vacuous"
+    assert sum(skip.values()) == 0, (req, skip)
+
+
+# Both learned slots DO reject once the contraction slots are armed, at very
+# different rates, and both are dsnn-3qm.59 fault 2 -- by two different routes.
+#
+#   armed        requested  rejected   rate
+#   0,1,2,3            594         3  0.005
+#   0,1,2,4            741        20  0.027
+#   0,1,2,3,4          767        21  0.027
+#
+# learned2, the SUMMED edge: it IS `new + old`, so it directly carries this
+# face's own contraction approximations. Plain fault 2.
+#
+# learned1, the OLD EDGE: I predicted this one was immune, on the argument that
+# the old edge is built by EARLIER eliminations and this face's rules cannot
+# touch it. A 3-seed probe agreed (0 of 354) and the 5-seed test did not (3 of
+# 594). The argument was incomplete: a vertex has SEVERAL faces, and an earlier
+# face's merge WRITES the edge a later face's `jr` READS, so arming the
+# contraction slots changes sibling faces' old edges WITHIN one elimination step.
+# That is the intra-vertex cross-face coupling finding 72 listed as fault 2's
+# sibling. The rate is 5x lower than learned2's, which is consistent: it needs
+# two faces at one vertex rather than one face's own product.
+#
+# STRICT xfails, so they flip the moment fault 2 is fixed.
+@pytest.mark.xfail(strict=True,
+                   reason="dsnn-3qm.59 fault 2, intra-vertex: an earlier face's "
+                          "merge writes the edge a later face's jr reads, so "
+                          "arming the contraction slots stales learned1's mask "
+                          "within one elimination step. Measured 3 of 594 on "
+                          "TLM over 5 seeds (1 Diag, 2 Reduce); 0 of 27 with "
+                          "the contraction slots unarmed.")
+def test_learned1_rejects_nothing_with_the_contraction_slots_armed(tlm):
+    req, skip = _join_totals(tlm, (0, 1, 2, 3))
     assert sum(skip.values()) == 0, (req, skip)
 
 
@@ -645,9 +670,9 @@ def test_learned2_alone_rejects_nothing(tlm):
                           "SUMMED edge is new + old, so it carries this face's "
                           "own contraction approximations, and learned2's mask "
                           "is read from it BEFORE those rows are drawn. "
-                          "Measured 7 of 430 rejected on TLM (5 Diag, 2 "
-                          "Reduce), under both --approx-add arms, and 0 when "
-                          "the contraction slots are unarmed.")
+                          "Measured 20 of 741 on TLM over 5 seeds (9 Diag, 11 "
+                          "Reduce); 0 of 181 with the contraction slots "
+                          "unarmed.")
 def test_learned2_rejects_nothing_with_the_contraction_slots_armed(tlm):
     req, skip = _join_totals(tlm, (0, 1, 2, 4))
     assert sum(skip.values()) == 0, (req, skip)
