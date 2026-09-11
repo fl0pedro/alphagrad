@@ -660,13 +660,15 @@ def test_ppo_declares_the_flag_with_default_lossless():
         ["--approx-add", "lossy"]).approx_add == "lossy"
     with pytest.raises(SystemExit):
         p.parse_args(["--approx-add", "same"])
-    # `choose`, `learned1` and `learned2` are honoured by the engine and size
-    # the head, but are not reachable from the CLI: the rollout wire carries
-    # neither the bit nor the learned slots' rows. Offering them would mean a
-    # run that raises on its first armed face.
-    for _unreachable in ("choose", "learned1", "learned2"):
-        with pytest.raises(SystemExit):
-            p.parse_args(["--approx-add", _unreachable])
+    # ALL FIVE ARE REACHABLE since 2026-09-11 (ticket dsnn-3qm.56). They used to
+    # raise here because the rollout wire carried neither the per-face join bit
+    # nor the learned slots' rows; it carries both now -- the action record is
+    # declared once (alphagrad.approx.face_action) and every per-slot shape
+    # follows the head's --approx-add width. Asserted from env.APPROX_ADD_CLI so
+    # this list cannot drift from the one argparse was built with.
+    for _v in envmod.APPROX_ADD_CLI:
+        assert p.parse_args(["--approx-add", _v]).approx_add == _v
+    assert set(envmod.APPROX_ADD_CLI) == set(envmod.APPROX_ADD_CHOICES)
     with pytest.raises(SystemExit):
         p.parse_args(["--approx-add", "1"])
 
