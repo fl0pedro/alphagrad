@@ -1713,7 +1713,7 @@ class LiveFaceStream:
                 self.stats["vertex_probe"] += 1
                 try:
                     self._decide_vertex_body(
-                        ij, specs, draw, _skipped, demand, N, S,
+                        ij, int(vertex), specs, draw, _skipped, demand, N, S,
                         rows, sizes, quant, pair, comp, nout)
                 except Exception as exc:
                     # Same contract as `_probe_faces` and `decide_faces`: a
@@ -1736,8 +1736,8 @@ class LiveFaceStream:
         return DecidedFaces(rows=rows, sizes=sizes, quant=quant, pair=pair,
                             comp=comp, nout=nout, n_faces=np.int32(n_faces))
 
-    def _decide_vertex_body(self, ij, specs, draw, skipped, demand, N, S,
-                            rows, sizes, quant, pair, comp, nout):
+    def _decide_vertex_body(self, ij, vertex, specs, draw, skipped, demand, N,
+                            S, rows, sizes, quant, pair, comp, nout):
         """The two stages. Split out so the snapshot / arming wrapper above
         stays readable and so the ``except`` there covers exactly this."""
         from jax._src import core as _jcore
