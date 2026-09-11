@@ -4797,14 +4797,29 @@ APPROX_ADD_CHOICES = ("lossy", "lossless", "choose")
 #: The values whose join semantics is FIXED for the whole run. ``choose`` is
 #: not one of them: it is decided per FACE by the head's bit.
 APPROX_ADD_FIXED = ("lossy", "lossless")
-#: The declared default. ``lossy`` and not ``lossless`` because the measured
-#: cost of a union container is not a detail: on TLM (seq 16, dmodel 64,
-#: vocab 256, min-Markowitz, 3 seeds) the summed edge's ``val`` is 9.8 MB
-#: under the union against 0.33 MB for the approximated addend -- a ~30x
-#: inflation that would make the cost channel measure the union blow-up
-#: rather than the approximation the head chose, i.e. punish the head for
-#: approximating at all. ``lossy`` also continues the previous declared
-#: default (``same``) for the ADD's cost behaviour.
+#: The declared default, ``lossless``: OWNER RULING 2026-09-10 (`90e0ab85` on
+#: hostperf-caches). It overrides the trade-off the implementation measured, and
+#: the measurement is kept here because it says what the ruling costs rather
+#: than being an argument against it.
+#:
+#: MEASURED (TLM seq 16 / dmodel 64 / vocab 256, one graph, min-Markowitz,
+#: 3 seeds, finding 73): the summed edge's ``val`` is 17.8 MB under the union
+#: against 8.8 MB under ``lossy`` with the `new` slot armed alone, and 22.3
+#: against 9.1 MB with all three armed -- 2.03x and 2.46x. So under this default
+#: an approximated merge face costs roughly twice the storage it would under
+#: ``lossy``, and a cost channel reading stored bytes will see that as a price
+#: the head pays for approximating.
+#:
+#: The ruling is nonetheless the safer default for a SEARCH: ``lossless`` drops
+#: no non-zero of either addend (max relative error 5.112e-08, float noise), so
+#: the only information a plan loses is what its own slots asked to lose. Under
+#: ``lossy`` the ADD silently discards part of the old edge as well, which is
+#: not in the plan's action record. Paying storage to keep the measured object
+#: equal to the chosen object is the conservative trade.
+#:
+#: NOTE the flop channel cannot see any of this: ``_ew_op_count`` counts logical
+#: extent, not stored cells, and reports the two values as identical
+#: (ticket dsnn-3qm.76).
 APPROX_ADD_DEFAULT = "lossless"
 _RETIRED_APPROX_OLD = {"same": "lossy", "exact": "lossless"}
 
