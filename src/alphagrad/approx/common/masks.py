@@ -2103,7 +2103,7 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
                 if _alt is None:
                     _bump("skipped")
                     _bump(f"skipped_{_kind}")
-                    if _project_on(rule) and rule_is_idempotent_noop(
+                    if rule_is_idempotent_noop(
                             cur, rule, max_dims=max_dims, max_axes=max_axes):
                         # Distinguish the idempotent re-request (DIAG: already
                         # coupled at exactly this granularity; COMPRESS: every
@@ -2118,6 +2118,7 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
                     live = _alt
                     _bump(f"repaired_{_kind}")
             try:
+                prev = cur
                 if isinstance(live, Diag):
                     cur = apply_diag(cur, live)
                 elif isinstance(live, Compress):
@@ -2132,8 +2133,12 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
                     _bump("skipped")
                     _bump(f"skipped_{_kind}")
                     continue
-                _bump("applied")
-                _bump(f"applied_{_kind}")
+                if cur is prev:
+                    _bump("skipped")
+                    _bump(f"skipped_{_kind}_noop")
+                else:
+                    _bump("applied")
+                    _bump(f"applied_{_kind}")
             except ValueError:
                 # The mask is meant to make this unreachable; if a case slips
                 # through, leaving the operand exact is strictly better than

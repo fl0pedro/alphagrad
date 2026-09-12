@@ -82,6 +82,25 @@ def test_build_singleton_sweep_plans(helmholtz_setup):
             assert factor > 1
 
 
+def test_build_singleton_sweep_plans_avoids_implicit_noop(helmholtz_setup):
+    """build_singleton_sweep_plans uses slot_legality.comp so reduce plans
+    never target implicit dimensions that collapse to no-ops (dsnn-3qm.73)."""
+    from alphagrad.approx.env import slot_rules_for_row
+    env, _, order, inv = helmholtz_setup
+    plans, _ = build_singleton_sweep_plans(env, order, inv)
+    for pid, p in plans.items():
+        if p["op"] == "compress":
+            w = p["wires"][0]
+            k, f, s = int(w["k"]), int(w["f"]), int(w["slot"])
+            entry = [e for e in inv if int(e["k"]) == k and int(e["f"]) == f][0]
+            st = entry["tensors"][s]
+            rules = slot_rules_for_row(st, w["row"])
+            assert rules, f"Plan {pid} decoded to empty rules on its live tensor"
+            for r in rules:
+                assert r.axes, f"Plan {pid} decoded to Compress with empty axes on its live tensor"
+
+
+
 def test_measure_singleton_and_stacks(helmholtz_setup):
     env, eval_samples, order, inv = helmholtz_setup
     plans, plan_orders = build_singleton_sweep_plans(env, order, inv)
