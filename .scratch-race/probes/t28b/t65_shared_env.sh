@@ -1,0 +1,39 @@
+# t28b (lane B of the .28 race): the campaign's SHARED_ENV (alphagrad/tools/gen_fq_launchers.py) for the
+# engine probe, value for value, EXCEPT the two engine knobs: the probe sets
+# GRAPHAX_EINSUM_GENERAL and GRAPHAX_PLANNER_EXACT itself around every
+# ``.lower()`` and removes an inherited value at import.  Source AFTER the
+# path-related items are set (t57_env.sh on a GPU node; the CPU job sets them
+# by hand).
+export GRAPHAX_DEMAND_EMIT=1
+export GRAPHAX_QUANT_PULLDOWN=0
+# --- TLM target shape (v42 baseline)
+export ALPHAGRAD_TLM_SEQ=32
+export ALPHAGRAD_TLM_DMODEL=128
+export ALPHAGRAD_TLM_VOCAB=1024
+export ALPHAGRAD_MAX_FACES=2538
+export ALPHAGRAD_MAX_DELTA_TOKENS=32768
+export ALPHAGRAD_MAX_EQNS=512
+export ALPHAGRAD_POLICY=palimpsa
+# ALPHAGRAD_FORCE_REV_ORDER is REMOVED here: the integration base of this race
+# (alphagrad ae2852a9) raises on it (ticket dsnn-3qm.64 promoted it to
+# --fixed-order). The probe passes both orders explicitly, so nothing is lost.
+export ALPHAGRAD_GRAD_COSINE_K=1
+export ALPHAGRAD_ACTOR_PROF_EVERY=20
+export ALPHAGRAD_INCREMENTAL_TOKENS=1
+export ALPHAGRAD_DEBUG_APPROX_PROB=1
+export ALPHAGRAD_CLEAR_JIT_CACHES_EVERY=0
+export ALPHAGRAD_DEBUG_MEM=1
+export ALPHAGRAD_SKIP_COST_ANALYSIS=1
+export ALPHAGRAD_DEBUG_MEASURE=1
+export ALPHAGRAD_DEBUG_DEGEN=1
+export ALPHAGRAD_PROFILE=1
+export ALPHAGRAD_EXTEND_CHUNK=128
+export ALPHAGRAD_EXTEND_UNROLL=32
+export ALPHAGRAD_MULS_SENTINEL_CAP=5e12
+export ALPHAGRAD_SKIP_COUNT_OPS=1
+export ALPHAGRAD_DIRECT_MEASURE=1
+export ALPHAGRAD_FACE_ENUM_CACHE=1
+export ALPHAGRAD_UNIFIED_FACE_ENUM=1
+export ALPHAGRAD_BATCHED_CALLBACK=1
+export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=2
+export ALPHAGRAD_MEASURE_TOOLCHAIN_GATE=abort
