@@ -83,3 +83,8 @@ def test_the_golden_is_not_trivial():
     r = _run_gate("--assert-golden-nontrivial")
     assert r.returncode == 0, _report(
         "the RECORDED golden is trivial (or unreadable)", r)
+    # rc == 0 alone would also be what a gate that IGNORED the flag returns
+    # (it would run the whole trace and report a PASS), so the mode has to
+    # identify itself or this test could pass without checking the golden.
+    assert "the recorded golden" in r.stdout, _report(
+        "--assert-golden-nontrivial did not run the golden check", r)
