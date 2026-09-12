@@ -2780,7 +2780,7 @@ def _flatten_jacobians(jac):
     return jnp.concatenate(flats)
 
 
-_JAC_DENSE_WARNED: list = []
+_JAC_LAZY_NOTED: list = []
 
 
 class GradientStructureMismatch(RuntimeError):
@@ -2850,7 +2850,14 @@ def _leaf_shape(x):
 def _gradient_similarity(jac_exact, jac_approx, site: str):
     """``(dot, ||e||^2, ||a||^2, ||e - a||^2, n_exact_elements)`` accumulated
     PER LEAF over the two gradient pytrees, with EXACT structure equality
-    (ticket dsnn-3qm.62) and no densification of the approximated side.
+    (ticket dsnn-3qm.62) and NEITHER SIDE MATERIALIZED (owner ruling (c),
+    2026-09-12: "the comparison should remain lazy, should not need to
+    materialize, and we definitely don't want to densify").
+
+    All four accumulators are bilinear forms, so they contract from the two
+    STORAGE forms; ``graphax.sparse.ops.bilinear`` does that arithmetic and
+    that module's docstring carries the algebra and the measurements behind it.
+    Nothing here calls ``SparseTensor.dense()`` any more -- on either side.
 
     Per pair of leaves (e, a), in ``jacve`` output order:
 
@@ -2858,22 +2865,34 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
         parameter IS zero -- dot 0, ||a||^2 0, residual ||e||^2. Not a
         structure fault: graphax's dense path returns zeros there too.
       * ``a`` a plain array: its shape must equal ``e``'s.
-      * ``a`` a SparseTensor: its logical shape must equal ``e``'s and it
-        must be in PARAMETER LAYOUT (graphax's output contract: the val axes
-        in dim order). A materialized tensor compares like an array. An
-        IMPLICIT dim (``axis is None``, the storage of a Reduce'd gradient:
-        one representative broadcast along that dim) is compared
-        ANALYTICALLY -- ``<e, bcast(a)> = <sum_over_implicit(e), a>`` and
-        ``||bcast(a)||^2 = N_implicit * ||a||^2`` -- so the approximated side
-        is never materialized (owner Q1: no densify). A uniform tensor
-        (``val is None``) is the same with a 0-d representative.
-      * anything else in a returned gradient (a diagonal pair, a compressed
-        index, a mismatched layout, a mismatched logical shape, a leaf
-        count that differs) RAISES ``GradientStructureMismatch``.
+      * ``a`` a SparseTensor: its LOGICAL shape must equal ``e``'s, and a
+        fully materialized one must be in PARAMETER LAYOUT (graphax's output
+        contract: the val axes in dim order). A compressed index in a returned
+        gradient RAISES.
+      * an IMPLICIT dim (``axis is None``, the storage of a Reduce'd gradient)
+        is contracted ANALYTICALLY -- ``<e, bcast(a)> = <sum_implicit(e), a>``,
+        ``||bcast(a)||^2 = N_implicit ||a||^2`` -- and a DIAGONAL PAIR is
+        contracted at its structure positions only, by a gather the size of
+        the stored ``val``. A uniform tensor (``val is None``) never builds a
+        buffer at all, so the degenerate dead leaf (only implicit dims,
+        ``scalar_mult == 0``) costs nothing.
+      * a leaf count, logical shape or layout mismatch RAISES
+        ``GradientStructureMismatch``.
 
-    The exact side must be materialized (an array, or a SparseTensor with
-    every dim materialized) -- it is the exact gradient.
+    The EXACT side is no longer materialized either. A structured exact leaf
+    (a full Jacobian target: the analytic AD benchmarks, or a Diag that
+    survived to the boundary) used to be ``e.dense()``d purely so the sum could
+    be taken; it is now contracted in place.
+
+    When the two storage forms share no compact frame -- neither side fully
+    materialized AND their structures differ -- this RAISES rather than
+    densifying one of them. Densifying there would be the same defect with a
+    longer stack trace, so the fix is to extend
+    ``graphax.sparse.ops.bilinear``, and the message says so.
     """
+    from graphax.sparse.ops.bilinear import (
+        LazyContractionUnsupported, bilinear_accumulators, squared_norm)
+
     leaves_e = _gradient_leaves(jac_exact)
     leaves_a = _gradient_leaves(jac_approx)
     if len(leaves_e) != len(leaves_a):
@@ -2889,6 +2908,7 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
             raise GradientStructureMismatch(
                 f"[{site}] exact leaf {i} is a dead path (None); the exact "
                 f"reference must carry every parameter gradient")
+        e_shape = _leaf_shape(e)
         if _is_sparse_tensor(e):
             if e.val is not None and all(d.axis is not None and not d.is_sparse
                                          for d in e.dims):
@@ -2897,97 +2917,56 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
                     raise GradientStructureMismatch(
                         f"[{site}] exact leaf {i} is not in parameter layout: "
                         f"dims {e.dims}, val {e.val.shape}")
-                e_arr = e.val * e.scalar_mult if e.scalar_mult is not None else e.val
-            else:
-                # A FULL JACOBIAN leaf (a non-scalar target: the analytic AD
-                # benchmarks, or a Diag that survived to the boundary) carries
-                # a diagonal pair or a uniform fill. The exact reference of a
-                # Jacobian is materialized here, as the legacy Jacobian cosine
-                # did; a scalar loss never reaches this branch (its exact
-                # gradient is dense-stored, finding 61).
-                e_arr = e.dense()
-                if not _JAC_DENSE_WARNED:
-                    _JAC_DENSE_WARNED.append(1)
-                    print(f"[{site}] exact leaf {i} is a structured Jacobian "
-                          f"(dims {e.dims}); the reference is materialized for "
-                          "the comparison", flush=True)
-        else:
-            e_arr = e
-        e_shape = tuple(int(v) for v in e_arr.shape)
-        total += int(e_arr.size)
-        _cdt = jnp.promote_types(e_arr.dtype, jnp.float32)
-        ef = jnp.asarray(e_arr).astype(_cdt)
-        _e2 = jnp.sum(jnp.abs(ef) ** 2)
+            elif not _JAC_LAZY_NOTED:
+                _JAC_LAZY_NOTED.append(1)
+                print(f"[{site}] exact leaf {i} is a structured Jacobian "
+                      f"(dims {e.dims}); it is contracted LAZILY -- neither "
+                      "side is materialized (ticket dsnn-3qm.62 ruling (c))",
+                      flush=True)
+        total += int(np.prod(e_shape)) if e_shape else 1
+        _cdt = jnp.promote_types(getattr(e, "dtype", jnp.float32), jnp.float32)
+        if a is not None:
+            _cdt = jnp.promote_types(
+                _cdt, jnp.promote_types(getattr(a, "dtype", jnp.float32),
+                                        jnp.float32))
         if a is None:
+            _e2 = squared_norm(e, _cdt)
             _d = jnp.zeros((), _cdt)
             _a2 = jnp.zeros((), _cdt)
             _r2 = _e2
-        elif _is_sparse_tensor(a):
+        else:
             a_shape = _leaf_shape(a)
             if a_shape != e_shape:
                 raise GradientStructureMismatch(
                     f"[{site}] leaf {i}: logical shape {a_shape} vs exact "
-                    f"{e_shape}; dims {a.dims}")
-            if any(getattr(d, "is_compressed", False) for d in a.dims):
-                raise GradientStructureMismatch(
-                    f"[{site}] leaf {i} carries a compressed index in a "
-                    f"returned gradient: dims {a.dims}")
-            if any(d.is_sparse for d in a.dims):
-                # A diagonal pair in the approximated leaf: a Jacobian target
-                # (see the exact branch above). Compared on its dense form.
-                a_arr = a.dense()
-                if tuple(int(v) for v in a_arr.shape) != e_shape:
+                    f"{e_shape}"
+                    + (f"; dims {a.dims}" if _is_sparse_tensor(a) else ""))
+            if _is_sparse_tensor(a):
+                if any(getattr(d, "is_compressed", False) for d in a.dims):
                     raise GradientStructureMismatch(
-                        f"[{site}] leaf {i}: dense shape {a_arr.shape} vs exact "
-                        f"{e_shape}; dims {a.dims}")
-                _cdt = jnp.promote_types(_cdt, jnp.promote_types(a_arr.dtype, jnp.float32))
-                ef = ef.astype(_cdt)
-                af = jnp.asarray(a_arr).astype(_cdt)
-                _d = jnp.sum(ef * af)
-                _a2 = jnp.sum(jnp.abs(af) ** 2)
-                _r2 = jnp.sum(jnp.abs(ef - af) ** 2)
-                dot = _d if dot is None else dot + _d
-                ee = _e2 if ee is None else ee + _e2
-                aa = _a2 if aa is None else aa + _a2
-                rr = _r2 if rr is None else rr + _r2
-                continue
-            from graphax.sparse.ops.output_layout import is_parameter_layout
-            if a.val is not None and not is_parameter_layout(a):
+                        f"[{site}] leaf {i} carries a compressed index in a "
+                        f"returned gradient: dims {a.dims}")
+                if a.val is not None and not any(d.is_sparse for d in a.dims):
+                    from graphax.sparse.ops.output_layout import (
+                        is_parameter_layout)
+                    if not is_parameter_layout(a):
+                        raise GradientStructureMismatch(
+                            f"[{site}] leaf {i} is not in parameter layout: "
+                            f"dims {a.dims}, val {a.val.shape} (graphax "
+                            f"output contract, ticket .62)")
+            try:
+                _d, _e2, _a2 = bilinear_accumulators(e, a, dtype=_cdt)
+            except LazyContractionUnsupported as exc:
                 raise GradientStructureMismatch(
-                    f"[{site}] leaf {i} is not in parameter layout: dims "
-                    f"{a.dims}, val {a.val.shape} (graphax output contract, "
-                    f"ticket .62)")
-            implicit = tuple(pos for pos, d in enumerate(a.dims) if d.axis is None)
-            _cdt = jnp.promote_types(_cdt, jnp.promote_types(a.dtype, jnp.float32))
-            ef = ef.astype(_cdt)
-            mult = jnp.asarray(a.scalar_mult, dtype=_cdt)
-            if a.val is None:
-                a_rep = mult.reshape(())          # uniform: every cell = scalar_mult
-            else:
-                a_rep = jnp.asarray(a.val).astype(_cdt) * mult
-            n_bcast = 1
-            for pos in implicit:
-                n_bcast *= int(a.dims[pos].logical_size)
-            e_red = jnp.sum(ef, axis=implicit) if implicit else ef
-            if tuple(int(v) for v in a_rep.shape) != tuple(int(v) for v in e_red.shape):
-                raise GradientStructureMismatch(
-                    f"[{site}] leaf {i}: stored shape {a_rep.shape} does not "
-                    f"match the exact leaf reduced over the implicit dims "
-                    f"{implicit}: {e_red.shape}; dims {a.dims}")
-            _d = jnp.sum(e_red * a_rep)
-            _a2 = n_bcast * jnp.sum(jnp.abs(a_rep) ** 2)
+                    f"[{site}] leaf {i}: the exact and approximated leaves "
+                    f"cannot be contracted without materializing one of them, "
+                    f"and materializing is what ticket dsnn-3qm.62 ruling (c) "
+                    f"forbids. {exc}") from exc
+            # The residual from the other three, which is what the analytic
+            # branch has done since .62 landed: it agrees with the direct
+            # sum of squares to float32 rounding (measured 2026-09-12, worst
+            # relative disagreement 1.1e-7 over the pair fixtures).
             _r2 = _e2 - 2.0 * _d + _a2
-        else:
-            a_shape = tuple(int(v) for v in getattr(a, "shape", ()))
-            if a_shape != e_shape:
-                raise GradientStructureMismatch(
-                    f"[{site}] leaf {i}: shape {a_shape} vs exact {e_shape}")
-            _cdt = jnp.promote_types(_cdt, jnp.promote_types(a.dtype, jnp.float32))
-            ef = ef.astype(_cdt)
-            af = jnp.asarray(a).astype(_cdt)
-            _d = jnp.sum(ef * af)
-            _a2 = jnp.sum(jnp.abs(af) ** 2)
-            _r2 = jnp.sum(jnp.abs(ef - af) ** 2)
         dot = _d if dot is None else dot + _d
         ee = _e2 if ee is None else ee + _e2
         aa = _a2 if aa is None else aa + _a2
