@@ -254,8 +254,8 @@ def test_the_probe_is_memoized_per_prefix_and_vertex():
     for _ in range(5):
         lf.face_dim_sizes(order, specs, n, total_v)
     st = lf.consume_stats()
-    assert st["size_probe"] == len(LiveFaceStream._SIZE_DISPATCH_MODES), (
-        f"expected one probe per dispatch mode, got {st['size_probe']}")
+    assert st["size_probe"] == 1, (
+        f"expected ONE probe (one engine, dsnn-3qm.65), got {st['size_probe']}")
     assert st["size_hit"] == 4, st
 
 

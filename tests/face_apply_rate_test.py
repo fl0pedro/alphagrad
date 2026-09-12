@@ -1655,17 +1655,17 @@ def test_the_two_passes_draw_the_same_rows(tlm):
     every face's new). The rows and masks must not depend on that, and this is
     the test that says so.
 
-    MODE-MATCHED ON BOTH FLAGS, because the comparison would otherwise be about
-    the flags and not about the two passes. TWO of graphax's settings are
-    ARGUMENTS of the contraction and ``decide_faces`` forces both:
-    ``approx_active`` (it gates the elemental / planner lowering inside
-    ``sparse_matmul``) and ``_is_approx_cfg`` (it gates the reconciler peel and
-    the re-evaluation of ``need_contract``), the second because that pass
-    installs a per-vertex CALLABLE transform. ``decide_vertex_faces`` derives
-    both from the caller instead, which is what makes it exact about
-    ``IncrementalJaxpr.eliminate``. Here it is asked for the forced values, so
-    the only remaining difference is the ROUTE: a composition of two graphax
-    functions against a whole speculative elimination with choosers.
+    MODE-MATCHED, because the comparison would otherwise be about the flag
+    and not about the two passes. ONE of graphax's settings is an ARGUMENT of
+    the contraction and ``decide_faces`` forces it: ``_is_approx_cfg`` (it
+    gates the reconciler peel and the re-evaluation of ``need_contract``),
+    because that pass installs a per-vertex CALLABLE transform.
+    ``decide_vertex_faces`` derives it from the caller instead, which is what
+    makes it exact about ``IncrementalJaxpr.eliminate``. Here it is asked for
+    the forced value, so the only remaining difference is the ROUTE: a
+    composition of two graphax functions against a whole speculative
+    elimination with choosers. (The second flag this used to match,
+    ``approx_active``, went with the second engine, dsnn-3qm.65.)
     """
     from graphax import IncrementalPathTokenizer
 
@@ -1700,7 +1700,6 @@ def test_the_two_passes_draw_the_same_rows(tlm):
             seen: list = []
             if pass_ == "vertex":
                 dec = lf.decide_vertex_faces(tk, v, _mk(seen), skips=skips,
-                                             approx_dispatch=True,
                                              approx_cfg=True)
             else:
                 dec = lf.decide_faces(tk, v, keys, _mk(seen), skips=skips)

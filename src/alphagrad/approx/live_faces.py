@@ -894,7 +894,6 @@ class LiveFaceStream:
     # so no approximation is offered on a face the elimination never
     # contracts. That is the correct answer, and it is counted (`size_miss`)
     # rather than being silently indistinguishable from a real zero.
-    _SIZE_DISPATCH_MODES = (True, False)
 
     @staticmethod
     def _size_probe_identity(st):
@@ -908,9 +907,12 @@ class LiveFaceStream:
         """
         return st
 
-    def _probe_faces(self, tk, vertex, keys, approx, slots: bool = False,
+    def _probe_faces(self, tk, vertex, keys, slots: bool = False,
                      stat: str = "size"):
-        """``{face key: live SparseTensor}`` for one dispatch mode.
+        """``{face key: live SparseTensor}`` from ONE speculative elimination.
+
+        One probe, on the one contraction engine (dsnn-3qm.65): the second
+        dispatch mode this used to intersect over is gone with the planner.
 
         Runs INSIDE a :class:`_Snapshot`, so the speculative elimination is
         undone in full -- graph, transpose graph, ``vo``, traced equations,
@@ -1056,12 +1058,10 @@ class LiveFaceStream:
             self.stats["failures"] += 1
             return sizes, quant, np.int32(0)
 
-        per_mode = [self._probe_faces(tk, vertex, keys, m)
-                    for m in self._SIZE_DISPATCH_MODES]
+        src = self._probe_faces(tk, vertex, keys)
         # Index space = the ENUMERATION, because that is what `f` means in
         # `_face_loop` / `chunk_ex` / `n_faces`.
         n_faces = min(len(keys), F)
-        src = per_mode[0] or (per_mode[1] if len(per_mode) > 1 else {})
         for k in range(n_faces):
             kk = keys[k]
             st = src.get(kk)
@@ -1144,8 +1144,9 @@ class LiveFaceStream:
         mask clears are REFUSED at apply time, against 0 of 522 for either
         exact pass (job 64928). It also costs MORE than the exact one: 7.663
         ms/vertex here against 5.492 for :meth:`decide_vertex_faces` on the
-        same prefix path, because this runs TWO speculative eliminations (the
-        ``_SIZE_DISPATCH_MODES`` intersection) and that one runs none.
+        same prefix path, because this runs a speculative elimination and that
+        one runs none (the 7.663 was measured with the two dispatch-mode probes
+        of the two-engine era; dsnn-3qm.65 left one).
         """
         from alphagrad.approx.common.masks import slot_legality
         from alphagrad.approx.env import face_slot_sites
@@ -1184,11 +1185,8 @@ class LiveFaceStream:
             self.stats["failures"] += 1
             return empty
 
-        per_mode = [self._probe_faces(tk, vertex, keys, m, slots=True,
-                                      stat="slot")
-                    for m in self._SIZE_DISPATCH_MODES]
+        src = self._probe_faces(tk, vertex, keys, slots=True, stat="slot")
         n_faces = min(len(keys), F)
-        src = per_mode[0] or (per_mode[1] if len(per_mode) > 1 else {})
         for k in range(n_faces):
             kk = keys[k]
             by_site = src.get(kk)
@@ -1306,8 +1304,7 @@ class LiveFaceStream:
     # the PPO replay rescores from the stored mask. Deciding into a row keeps
     # ONE graphax-facing apply path (``make_slot_frame_hook``) and leaves the
     # measured elimination byte-identical to what it is today.
-    def decide_faces(self, tk, vertex, keys, draw, *, skips=None,
-                     approx: bool = True):
+    def decide_faces(self, tk, vertex, keys, draw, *, skips=None):
         """Decide every face slot of ``vertex`` IN APPLY ORDER, one elimination.
 
         ``draw(f, s, legality)`` is called once per (face ``f``, slot ``s``)
@@ -1375,9 +1372,6 @@ class LiveFaceStream:
         import jax as _jax
         from graphax import SKIP_FACE
         from graphax.core import _eliminate_vertex
-        from graphax.sparse.elemental.dispatch import (
-            approx_active, set_approx_active,
-        )
         from alphagrad.approx.common.masks import slot_legality
         from alphagrad.approx.env import (
             face_entry_from_slots, make_slot_frame_hook, wire_slots)
@@ -1456,26 +1450,21 @@ class LiveFaceStream:
             ft[keys[f]] = face_entry_from_slots(
                 tuple(_mk(f, s) for s in range(S)), with_policy=False)
 
-        prev = approx_active()
-        set_approx_active(bool(approx))
-        try:
-            with _Snapshot(tk) as snap:
-                ij = snap.ij
-                try:
-                    self.stats["decide_probe"] += 1
-                    with _jcore.set_current_trace(ij.trace):
-                        _eliminate_vertex(
-                            int(vertex), ij.jaxpr, ij.graph, ij.tgraph, ij.vo,
-                            False, transforms=(self._size_probe_identity,),
-                            face_transforms=ft)
-                except Exception:
-                    # Same contract as `_probe_faces`: a vertex graphax cannot
-                    # trace has no legal approximation either, so keep the
-                    # decisions taken so far (the rest stay -1, i.e. exact) and
-                    # never let a probe take the rollout down.
-                    self.stats["decide_probe_fail"] += 1
-        finally:
-            set_approx_active(prev)
+        with _Snapshot(tk) as snap:
+            ij = snap.ij
+            try:
+                self.stats["decide_probe"] += 1
+                with _jcore.set_current_trace(ij.trace):
+                    _eliminate_vertex(
+                        int(vertex), ij.jaxpr, ij.graph, ij.tgraph, ij.vo,
+                        False, transforms=(self._size_probe_identity,),
+                        face_transforms=ft)
+            except Exception:
+                # Same contract as `_probe_faces`: a vertex graphax cannot
+                # trace has no legal approximation either, so keep the
+                # decisions taken so far (the rest stay -1, i.e. exact) and
+                # never let a probe take the rollout down.
+                self.stats["decide_probe_fail"] += 1
         return DecidedFaces(rows=rows, sizes=sizes, quant=quant, pair=pair,
                             comp=comp, nout=nout, n_faces=np.int32(n_faces))
 
@@ -1588,7 +1577,7 @@ class LiveFaceStream:
     # pass raises rather than answering. :meth:`decide_faces` is the pass for
     # those, and it stays for exactly that reason.
     def decide_vertex_faces(self, tk, vertex, draw, *, skips=None,
-                            approx_dispatch=None, approx_cfg=None):
+                            approx_cfg=None):
         """Decide every CONTRACTION slot of ``vertex`` with NO elimination.
 
         ``draw(f, s, legality)`` is called once per (face ``f``, slot ``s``),
@@ -1609,30 +1598,20 @@ class LiveFaceStream:
         ``face_transforms[key] is SKIP_FACE`` before running any of a face's
         hooks, so a skip cannot be chosen by a mask.
 
-        ``approx_dispatch`` -- ``None`` (the default) LEAVES
-        ``graphax.sparse.elemental.dispatch.approx_active`` ALONE, so the mask
-        is composed under the very dispatch mode the caller's elimination will
-        run under. THAT IS NOT COSMETIC AND IT IS THE SECOND STALENESS SOURCE
-        THIS PASS HAD TO CLOSE: the flag gates the elemental composition layer
-        inside ``sparse_matmul`` and the planner/einsum lowering
-        (``graphax.sparse.lower.matmul``: ``if not approx_active(): return
-        None``), so the two settings contract the SAME operands into tensors
-        with different index structure and different dtype. Measured here: with
-        the flag forced ON, as :meth:`_probe_faces` and :meth:`decide_faces` do,
-        3 of 2145 per-(face, slot) mask fields disagreed with the tensor the
-        real apply path hands the hook on TLM -- all three the QUANT row, all
-        three at ``res:new``, all three a face whose operand carried a Quant --
-        and with the flag left alone, 0 of 2145. ``face_slot_legality``
-        intersects BOTH modes because a probe run before the draw cannot know
-        which one the measurement will take; this pass does not need to guess,
-        because it runs in the caller's own process with the caller's own flag.
-        Pass ``True`` / ``False`` only to answer about a mode that is NOT the
-        current one.
+        There used to be an ``approx_dispatch`` argument here for graphax's
+        ``approx_active`` flag, the second staleness source this pass had to
+        close: the flag selected the elemental / planner lowering inside
+        ``sparse_matmul``, so the two settings contracted the SAME operands into
+        tensors with different index structure and dtype (measured on TLM: 3 of
+        2145 per-(face, slot) mask fields differed between the forced and the
+        caller's mode, all three the QUANT row at ``res:new``). dsnn-3qm.65
+        removed the second engine and the flag with it; there is one lowering
+        now and nothing left to match.
 
         ``approx_cfg`` -- ``None`` (the default) DERIVES graphax's
         ``_is_approx_cfg`` from the entry forms the measurement will install, via
         :func:`graphax.face_config_is_approx`, which is the elimination's own
-        predicate. It is the second flag that is an ARGUMENT of the contraction
+        predicate. It is the one flag that is an ARGUMENT of the contraction
         (it gates the reconciler peel and the re-evaluation of
         ``need_contract``), and the derivation is what makes this pass exact
         about `IncrementalJaxpr.eliminate`, whose ``transforms=()`` leaves the
@@ -1664,8 +1643,6 @@ class LiveFaceStream:
                 the one outcome that must not happen.
         """
         from graphax.core import face_specs_of
-        from graphax.sparse.elemental.dispatch import (
-            approx_active, set_approx_active)
         from alphagrad.approx.env import FACE_SLOTS, wire_slots
 
         F, N = self.max_faces, self.max_axes
@@ -1716,45 +1693,32 @@ class LiveFaceStream:
             return (skips is not None
                     and int(np.asarray(skips).reshape(-1)[f]) == 1)
 
-        # ``_demand_head_vars`` is ``set(jaxpr.outvars)`` in
-        # ``_eliminate_vertex``; the contraction's demand-dense branch keys off
-        # membership, so it is reproduced from the same source rather than
-        # assumed off.
-        demand = set(ij.jaxpr.outvars)
-
-        prev = approx_active()
-        if approx_dispatch is not None:
-            set_approx_active(bool(approx_dispatch))
-        try:
-            with _Snapshot(tk):
-                self.stats["vertex_probe"] += 1
-                try:
-                    self._decide_vertex_body(
-                        ij, int(vertex), specs, draw, _skipped, demand, N, S,
-                        rows, sizes, quant, pair, comp, nout,
-                        approx_cfg=approx_cfg)
-                except Exception as exc:
-                    # Same contract as `_probe_faces` and `decide_faces`: a
-                    # vertex graphax cannot trace has no legal approximation
-                    # either, so keep the decisions taken so far (the rest stay
-                    # -1 = exact) and never let a probe take the rollout down.
-                    #
-                    # The LAST failure is kept, because "the pass failed on 196
-                    # of 475 vertices" is not a diagnosis and the counter alone
-                    # cannot become one. A probe or test that sees
-                    # `vertex_probe_fail` non-zero can print
-                    # `last_vertex_error` and say WHY.
-                    self.stats["vertex_probe_fail"] += 1
-                    self.last_vertex_error = (
-                        f"vertex {int(vertex)}: "
-                        f"{type(exc).__name__}: {exc}")
-        finally:
-            if approx_dispatch is not None:
-                set_approx_active(prev)
+        with _Snapshot(tk):
+            self.stats["vertex_probe"] += 1
+            try:
+                self._decide_vertex_body(
+                    ij, int(vertex), specs, draw, _skipped, N, S,
+                    rows, sizes, quant, pair, comp, nout,
+                    approx_cfg=approx_cfg)
+            except Exception as exc:
+                # Same contract as `_probe_faces` and `decide_faces`: a
+                # vertex graphax cannot trace has no legal approximation
+                # either, so keep the decisions taken so far (the rest stay
+                # -1 = exact) and never let a probe take the rollout down.
+                #
+                # The LAST failure is kept, because "the pass failed on 196
+                # of 475 vertices" is not a diagnosis and the counter alone
+                # cannot become one. A probe or test that sees
+                # `vertex_probe_fail` non-zero can print
+                # `last_vertex_error` and say WHY.
+                self.stats["vertex_probe_fail"] += 1
+                self.last_vertex_error = (
+                    f"vertex {int(vertex)}: "
+                    f"{type(exc).__name__}: {exc}")
         return DecidedFaces(rows=rows, sizes=sizes, quant=quant, pair=pair,
                             comp=comp, nout=nout, n_faces=np.int32(n_faces))
 
-    def _decide_vertex_body(self, ij, vertex, specs, draw, skipped, demand, N,
+    def _decide_vertex_body(self, ij, vertex, specs, draw, skipped, N,
                             S, rows, sizes, quant, pair, comp, nout,
                             approx_cfg=None):
         """The two stages. Split out so the snapshot / arming wrapper above
@@ -1925,9 +1889,7 @@ class LiveFaceStream:
                 # out-edge Jacobian and `pre` the in-edge one, which is the
                 # operand order the engine uses (``_post_val @ _pre_val``).
                 ops = prepare_face_operands(b, a, approx=approx)
-                new_st = contract_face_operands(
-                    ops, count_ops=False,
-                    demand_dense=sp.out_edge in demand).val
+                new_st = contract_face_operands(ops, count_ops=False).val
             self.stats["vertex_contractions"] += 1
             L = slot_legality(new_st, N)
             s = 2
@@ -1984,8 +1946,7 @@ class LiveFaceStream:
 
     def vertex_face_decisions(self, order, specs, n, vertex, draw, *,
                               skips=None, face_rows_hist=None,
-                              face_skips_hist=None, approx_dispatch=None,
-                              approx_cfg=None):
+                              face_skips_hist=None, approx_cfg=None):
         """:meth:`decide_vertex_faces` against the PREFIX tokenizer of step
         ``n`` -- the :meth:`face_slot_decisions` of the structural pass.
 
@@ -2015,7 +1976,6 @@ class LiveFaceStream:
                 comp=np.zeros((F, S, N), np.float32),
                 nout=np.zeros((F, S), np.int32), n_faces=np.int32(0))
         return self.decide_vertex_faces(tk, vertex, draw, skips=skips,
-                                        approx_dispatch=approx_dispatch,
                                         approx_cfg=approx_cfg)
 
     def consume_stats(self) -> dict:

@@ -4581,10 +4581,10 @@ def decode_vertex_rule_specs(jaxpr, vertex, spec_rows) -> tuple:
         shape-preservation assertion. It is gone, because the premise is false
         and the cost was severe:
 
-        * graphax's nominal-shape asserts are EXACT-AD only — core.py gates
-          them on ``not _perpath and not _is_approx_cfg and not approx_active()``
-          — and ``apply_compress`` drops the axis POINTER (``Index.axis =
-          None``), not the logical size, so a compressed edge still contracts.
+        * graphax's stored-edge shape check (``core._set_inner``, ungated
+          since dsnn-3qm.71) reads the LOGICAL shape, and ``apply_compress``
+          drops the axis POINTER (``Index.axis = None``), not the logical
+          size, so a compressed edge still contracts and still passes it.
           The over-conservative structural guard the note referred to was
           removed from ``apply_compress`` on 2026-07-15.
         * MEASURED (2026-08-15, ``compress_probe``/``compress_probe2``, CPU):

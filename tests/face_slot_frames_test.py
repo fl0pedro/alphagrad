@@ -514,7 +514,8 @@ def test_the_slot_probe_is_a_pure_read_and_memoized():
     for _ in range(4):
         lf.face_slot_legality(order, specs, n, total_v)
     st = lf.consume_stats()
-    assert st["slot_probe"] == len(LiveFaceStream._SIZE_DISPATCH_MODES), st
+    # ONE probe: the single engine has one dispatch mode (dsnn-3qm.65).
+    assert st["slot_probe"] == 1, st
     assert st["slot_hit"] == 3, st
     after = lf.chunk(order, specs, n, total_v, vspecs, rows, skips, 0)
     for a, b in zip(before, after):
