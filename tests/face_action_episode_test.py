@@ -31,14 +31,21 @@ WHAT IT ASSERTS, per value:
      value it carries none.
 
 WHAT IT DELIBERATELY DOES NOT EXERCISE, and why (labelled, not hidden): the
-QUALITY channel is off (``ALPHAGRAD_QUALITY_METRIC=none``). In this environment
-``env._gradient_similarity`` imports ``graphax.sparse.ops.output_layout``, which
-exists in NO graphax commit of ``core-v2``, so every terminal measurement that
-reaches the cosine channel raises ``ModuleNotFoundError`` inside the host
-callback -- on the BASE as well as here (measured: ``tests/plan_log_test.py`` is
-5 failed and ``tests/reward_slot7_reserved_test.py`` 3 failed at ``9f5f643a``
-too). Leaving the channel on would make this module fail for a reason that has
-nothing to do with the face wire, which is the opposite of what it is for.
+QUALITY channel is off (``ALPHAGRAD_QUALITY_METRIC=none``). The reason used to be
+that it COULD NOT be on: ``env._gradient_similarity`` imports
+``graphax.sparse.ops.output_layout``, which existed on no ``core-v2`` commit, so
+every terminal measurement that reached the cosine channel raised
+``ModuleNotFoundError`` inside the host callback -- on the BASE as well as here
+(measured: ``tests/plan_log_test.py`` was 5 failed and
+``tests/reward_slot7_reserved_test.py`` 3 failed at ``9f5f643a`` too).
+
+THAT IS FIXED (2026-09-12): the graphax half of ticket .62 was merged, so the
+module exists and the channel computes -- graphax ``cdabc9e`` and later. The
+channel stays off here for the ORIGINAL, narrower reason only: this module's
+subject is the face wire, and a quality measurement would make it fail for
+reasons that have nothing to do with the wire. The grad-cosine channel itself is
+covered by ``tests/quality_default_grad_cosine_test.py`` and
+``tests/face_actions_env_test.py``.
 """
 from __future__ import annotations
 
