@@ -68,6 +68,8 @@ import os
 import pathlib
 import sys
 
+import pytest
+
 _WATCHED = ("ALPHAGRAD_", "GRAPHAX_")
 
 
@@ -182,6 +184,37 @@ def _frozen_values() -> dict[str, object]:
 
 _conflict_report: list[str] = []
 
+# test nodeid -> {variable: (value before the test, value after it)} for every
+# ALPHAGRAD_*/GRAPHAX_* variable a test changed and did not put back.
+_run_phase_leaks: dict[str, dict[str, tuple[str | None, str | None]]] = {}
+
+
+@pytest.fixture(autouse=True)
+def _report_run_phase_configuration_leaks(request):
+    """REPORT -- deliberately not repair -- any ALPHAGRAD_*/GRAPHAX_* variable a
+    test changes and does not put back.
+
+    The collection-time half of this hazard is gated above. The run-phase half is
+    the same hazard one phase later: a test that writes ``os.environ`` directly
+    instead of through ``monkeypatch`` changes the configuration of every test
+    that runs after it. Nothing in the fourteen failures this file documents was
+    caused by a run-phase leak, so this half only measures: restoring the
+    environment here would quietly change the meaning of any test that (wrongly)
+    relies on a predecessor's write, and that is a change to make deliberately
+    with the list in hand, not as a side effect. The list is printed in the
+    terminal summary.
+    """
+    before = _watched_env()
+    yield
+    after = _watched_env()
+    changed = {
+        key: (before.get(key), after.get(key))
+        for key in set(before) | set(after)
+        if before.get(key) != after.get(key)
+    }
+    if changed:
+        _run_phase_leaks[request.node.nodeid] = changed
+
 
 def pytest_collection_finish(session):
     if _dead_writes:
@@ -235,6 +268,23 @@ def pytest_collection_finish(session):
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    if _run_phase_leaks:
+        terminalreporter.section("CONFIGURATION LEFT CHANGED BY A TEST")
+        terminalreporter.write_line(
+            "These tests changed an ALPHAGRAD_*/GRAPHAX_* variable and did not "
+            "put it back, so every test after them ran under the new value. "
+            "Use monkeypatch.setenv / delenv instead of os.environ.")
+        shown = 0
+        for nodeid, changed in _run_phase_leaks.items():
+            for key, (old, new) in sorted(changed.items()):
+                if shown >= 40:
+                    terminalreporter.write_line(
+                        f"    ... and more, {len(_run_phase_leaks)} tests in "
+                        f"total left something changed")
+                    return
+                terminalreporter.write_line(
+                    f"    {nodeid}: {key} {old!r} -> {new!r}")
+                shown += 1
     if _conflict_report:
         terminalreporter.section("CONFIGURATION CONFLICT", red=True, bold=True)
         for line in _conflict_report:

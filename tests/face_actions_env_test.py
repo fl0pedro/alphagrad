@@ -10,6 +10,7 @@ import os
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from alphagrad.approx.env import (
     FACE_SLOTS,
@@ -29,6 +30,25 @@ _X4 = jnp.asarray(np.linspace(0.1, 0.9, 4, dtype=np.float32))
 def _square(x):
     e = _M @ x
     return _P @ e, _Q @ e
+
+
+@pytest.fixture(autouse=True)
+def _the_quality_channel_this_module_measures(monkeypatch):
+    """THE DEFAULT QUALITY METRIC, declared rather than assumed.
+
+    Both assertions below read the quality slot (``REWARD_INDEX["cosine_sim"]``)
+    and one of them requires it to be 1.0 on the exact plan. With
+    ALPHAGRAD_QUALITY_METRIC=none the channel is switched off and the slot reads
+    0.0, so the module fails with no hint that a configuration -- not the face
+    wire -- is what moved. That is what happened for the whole campaign:
+    tests/mem_channel_test.py and tests/paired_log_reward_test.py set
+    QUALITY_METRIC=none at MODULE SCOPE, pytest imports every module during
+    collection, and this module is collected earlier (f < m < p), so by the time
+    its tests ran the channel was off. Those two modules now declare that in a
+    fixture of their own; this one declares the default it needs, so it no
+    longer depends on nobody else having spoken.
+    """
+    monkeypatch.delenv("ALPHAGRAD_QUALITY_METRIC", raising=False)
 
 
 def _make_env():
