@@ -35,19 +35,41 @@ Two things must hold, and neither is visible in any metric we log:
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
-# PINNED, not inherited (the suite runs one process per module, so these are
-# ours to set). aa0774c8 changed BOTH delta-budget defaults in one commit:
-# ALPHAGRAD_MAX_DELTA_TOKENS 1024 -> 32768 (sized from the measured TLM
-# distribution) and overflow clip -> raise. Under those defaults nothing in
-# this module's graph overflows (the diag block is 2190 tokens), so the
-# clip-branch assertions below would be vacuous -- their own guard says so.
-# Pinning the OLD pair keeps the clip path genuinely exercised; the new
-# RAISE default is covered by the pure-defaults subprocess cases at the
-# bottom of this file. Must be set before the env import: env.py freezes
-# MAX_DELTA_TOKENS / _DELTA_OVERFLOW into module constants at first import.
-os.environ["ALPHAGRAD_MAX_DELTA_TOKENS"] = "1024"
-os.environ["ALPHAGRAD_DELTA_OVERFLOW"] = "clip"
+# THIS MODULE DOES NOT PIN THE DELTA BUDGET AT IMPORT, AND MUST NOT.
+#
+# ``env.py`` freezes MAX_DELTA_TOKENS and _DELTA_OVERFLOW into module constants
+# at its FIRST import, and ``pytest tests/`` imports EVERY test module during
+# collection before it runs the first test. So the two assignments that used to
+# stand here --
+#
+#     os.environ["ALPHAGRAD_MAX_DELTA_TOKENS"] = "1024"
+#     os.environ["ALPHAGRAD_DELTA_OVERFLOW"] = "clip"
+#
+# -- under the comment "PINNED, not inherited (the suite runs one process per
+# module, so these are ours to set)" did two wrong things and one right thing
+# only when this module happened to be run alone:
+#
+#  1. THEY DID NOT TAKE. Any module collected earlier (a < d) imported
+#     alphagrad first and froze the defaults, 32768 and "raise". The diag block
+#     on this graph is 2190 tokens, so it never clipped, and
+#     ``test_base_plus_deltas_reconstructs_the_stream[True]`` died on its own
+#     "this graph no longer exercises the MAX_DELTA_TOKENS clip" guard -- the
+#     guard working exactly as designed, on a pin that had silently lost a
+#     race.
+#  2. THEY LEAKED. The variables stayed set in the shared process for the rest
+#     of the run, so ``tests/per_face_apply_test.py``, whose subprocess probe
+#     asserts "the default MAX_DELTA_TOKENS is 32768", inherited a pinned value
+#     and failed too. (Measured: by the end of collection the variable read
+#     4096, because ``tests/policy_regression_gate.py`` wrote over this 1024
+#     later -- job 64984 E6. Either value breaks a probe of the default.)
+#
+# The clip path is still exercised on every run -- see
+# ``test_the_clip_is_exercised_at_the_old_budget_in_its_own_interpreter``,
+# which pins 1024+clip in a FRESH interpreter, where a pin is the only thing
+# that can work. The RAISE default has its own fresh-interpreter cases at the
+# bottom of this file.
 
+import pathlib                                                    # noqa: E402
 import subprocess                                                 # noqa: E402
 import sys                                                        # noqa: E402
 
@@ -139,17 +161,21 @@ def _cold_stream(prefix, specs_np, vocab=_VOCAB):
     return stream, seg
 
 
-@pytest.mark.parametrize("diag", [False, True])
-def test_base_plus_deltas_reconstructs_the_stream(diag):
+def _check_reconstruction(diag, require_clip=False):
     """base_observation() + every step's delta IS the append-only stream.
 
     Up to the documented CLIP: a block longer than MAX_DELTA_TOKENS loses its
     tail, and -- unlike the old absolute cursor, which deferred that tail to
     the next step and attributed it to the wrong vertex -- the tail is simply
-    dropped. Clipping is the pinned ALPHAGRAD_DELTA_OVERFLOW=clip opt-out
-    (module top); the default since aa0774c8 is to RAISE. ``diag=True`` on
-    this graph produces a 2190-token block against the pinned 1024 budget,
-    so the clipping branch is genuinely exercised.
+    dropped. Clipping is the ALPHAGRAD_DELTA_OVERFLOW=clip opt-out; the default
+    since aa0774c8 is to RAISE.
+
+    A PLAIN FUNCTION, not a test, because it is called from two places: the
+    in-process test below at whatever budget ``env.py`` froze, and the
+    fresh-interpreter test that pins 1024+clip -- where ``diag=True`` on this
+    graph produces a 2190-token block and ``require_clip`` demands that the
+    clipping branch actually ran. The in-process caller cannot demand that: it
+    does not own the frozen budget (see the module header).
     """
     specs = _specs(diag)
     specs_np = np.asarray(specs)
@@ -191,10 +217,27 @@ def test_base_plus_deltas_reconstructs_the_stream(diag):
 
     assert rebuilt_t == exp_t, "base + deltas != the (clip-aware) stream"
     assert rebuilt_e == exp_e, "eqn ids diverged"
-    if diag:
+    if require_clip:
         assert clipped, (
-            "this graph no longer exercises the MAX_DELTA_TOKENS clip, so the "
-            "clip-aware comparison above is vacuous")
+            f"this graph no longer exercises the MAX_DELTA_TOKENS clip at the "
+            f"pinned budget {MAX_DELTA_TOKENS}, so the clip-aware comparison "
+            f"above is vacuous")
+    return clipped
+
+
+@pytest.mark.parametrize("diag", [False, True])
+def test_base_plus_deltas_reconstructs_the_stream(diag):
+    """The reconstruction, at whatever delta budget this process froze.
+
+    The CLIP half of the claim is not asserted here and cannot be: the budget
+    belongs to whichever module imported ``env`` first (module header), so on a
+    32768-wide budget this graph's 2190-token diag block simply fits. What this
+    case does pin, at every budget, is that base + deltas is the stream token
+    for token and eqn-id for eqn-id.
+    ``test_the_clip_is_exercised_at_the_old_budget_in_its_own_interpreter``
+    covers the clip itself, on every run.
+    """
+    _check_reconstruction(diag)
 
 
 def test_the_delta_describes_the_APPROXIMATED_graph():
@@ -260,15 +303,56 @@ def test_reset_carries_an_empty_delta_and_no_callback():
 # scrubbed -- pure library defaults, exactly what a bare `import` gets.
 
 
-def _run_pure_defaults(script: str) -> None:
+def _run_in_a_fresh_interpreter(script: str, **pins: str) -> None:
+    """Run ``script`` in a child interpreter whose ALPHAGRAD_* configuration is
+    EXACTLY ``pins`` -- every inherited ALPHAGRAD_* variable is scrubbed first.
+
+    The scrub is the contract: a constant ``env.py`` freezes at its first import
+    can only be set by a process that has not imported it yet, and "what the
+    defaults are" can only be observed by a process that inherited none. With
+    no pins this is the pure-defaults probe; with pins it is the only way this
+    module can still pin a non-default budget now that it no longer mutates the
+    shared process at import time (see the module header).
+    """
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("ALPHAGRAD_")}
+    env.update(pins)
     r = subprocess.run([sys.executable, "-c", script],
                        env=env, capture_output=True, text=True, timeout=600)
     assert r.returncode == 0, (
-        f"pure-defaults probe failed (rc={r.returncode})\n"
+        f"fresh-interpreter probe failed (rc={r.returncode}, pins={pins})\n"
         f"--- stdout ---\n{r.stdout}\n--- stderr ---\n{r.stderr}")
     assert "PROBE-OK" in r.stdout, r.stdout
+
+
+def _run_pure_defaults(script: str) -> None:
+    _run_in_a_fresh_interpreter(script)
+
+
+def test_the_clip_is_exercised_at_the_old_budget_in_its_own_interpreter():
+    """THE CLIP BRANCH, on every run, at the 1024-token budget + clip opt-out.
+
+    This is the case the module-level ``os.environ`` pins were for, moved to
+    the one place a pin can still work. A fresh interpreter with
+    ALPHAGRAD_MAX_DELTA_TOKENS=1024 and ALPHAGRAD_DELTA_OVERFLOW=clip freezes
+    those constants before anything imports ``env``, so this graph's
+    2190-token diag block genuinely overflows and ``require_clip`` fails if it
+    ever stops doing so. The shared-process case above runs the same
+    reconstruction at whatever budget the process happens to hold.
+    """
+    here = str(pathlib.Path(__file__).resolve().parent)
+    _run_in_a_fresh_interpreter(
+        "import sys\n"
+        f"sys.path.insert(0, {here!r})\n"
+        "import delta_obs_emission_test as M\n"
+        "assert M.MAX_DELTA_TOKENS == 1024, M.MAX_DELTA_TOKENS\n"
+        "from alphagrad.approx.env import _DELTA_OVERFLOW\n"
+        "assert _DELTA_OVERFLOW == 'clip', _DELTA_OVERFLOW\n"
+        "assert M._check_reconstruction(True, require_clip=True)\n"
+        "print('PROBE-OK')\n",
+        ALPHAGRAD_MAX_DELTA_TOKENS="1024",
+        ALPHAGRAD_DELTA_OVERFLOW="clip",
+    )
 
 
 def test_delta_overflow_raises_under_pure_defaults():

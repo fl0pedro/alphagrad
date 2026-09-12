@@ -701,7 +701,21 @@ def main(argv=None):
                     help="write the live trace as JSON and exit")
     ap.add_argument("--golden", default=str(GOLDEN))
     ap.add_argument("--steps", type=int, default=None)
+    ap.add_argument("--assert-golden-nontrivial", action="store_true",
+                    help="run assert_nontrivial against the RECORDED golden "
+                         "and exit; traces nothing. The pytest wrapper uses "
+                         "this so it never has to import this module into the "
+                         "shared pytest process, whose configuration the "
+                         "module-scope pins above would rewrite.")
     a = ap.parse_args(argv)
+
+    if a.assert_golden_nontrivial:
+        if not Path(a.golden).exists():
+            print(f"[gate] NO GOLDEN at {a.golden}", file=sys.stderr)
+            return 2
+        assert_nontrivial(json.loads(Path(a.golden).read_text()))
+        print(f"[gate] the recorded golden at {a.golden} is non-trivial")
+        return 0
 
     live = run_trace(steps=a.steps)
     assert_nontrivial(live)

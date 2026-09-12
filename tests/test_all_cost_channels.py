@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 from alphagrad.approx.env import (
     MAX_RULES_PER_VERTEX,
@@ -67,27 +68,47 @@ def _env_for(target_fn, args, *, measure_latency: bool):
     )
 
 
-def _force_real_cost_measurement(monkeypatch):
-    """Undo cross-module env pollution + enable env.py's CPU memory path.
+@pytest.fixture(autouse=True)
+def _the_configuration_this_module_measures_under(monkeypatch):
+    """THE CONFIGURATION THIS MODULE'S ASSERTIONS ARE ABOUT, declared rather
+    than inherited -- because this module reads the reward vector's cost slots
+    directly and every knob below changes what those slots MEAN.
 
-    ``ALPHAGRAD_SKIP_COST_ANALYSIS=1`` is set at import time by
-    test_incremental_encoder / test_ppo_az_parity /
-    test_rollout_scan_equivalence, and pytest imports all modules during
-    collection, so it is live here through no fault of the env. It makes
-    env.py skip ``cost_analysis()`` entirely -> flops and bytes_accessed read
-    0 by design.
+    ``pytest tests/`` imports every test module during collection and only then
+    runs the first test, so whatever a module-level ``os.environ[...] = ...``
+    anywhere in the suite left behind is live here through no fault of this
+    module. Three of these four lines are therefore UNDOING a collection-time
+    mutation, and the module must name them all or it is measuring something
+    it did not choose:
 
-    ``ALPHAGRAD_DIRECT_MEASURE=1`` selects the measurement path that falls
-    back to the compiled executable's ``memory_analysis()`` when the device
-    has no allocator stats -- i.e. on CPU, where ResourceMonitor's peak is
-    always 0. Both env vars are read inside the callback, so monkeypatch is
-    enough and nothing leaks to other modules.
+    * ALPHAGRAD_SKIP_COST_ANALYSIS=1 is set at import by
+      test_incremental_encoder / test_ppo_az_parity /
+      test_rollout_scan_equivalence. It makes env.py skip ``cost_analysis()``
+      entirely, so flops and bytes_accessed read 0 BY DESIGN.
+    * ALPHAGRAD_COST_FORM=paired-log used to be set at import by
+      tests/paired_log_reward_test.py (now a fixture there). Under the
+      paired-log form every cost slot is a LOG-DIFFERENCE against rev-exact,
+      so a channel that matches the reference reads exactly 0.0 -- and this
+      module's "channel populated iff != 0" assertion then reports it missing.
+      That is what made two of these three tests red in the full suite and
+      green alone. Cleared here: the claims below are about the ABSOLUTE form.
+    * ALPHAGRAD_MEM_CHANNEL is cleared for the same reason: slot 5 must be the
+      default channel, not whichever one another module selected.
+    * ALPHAGRAD_DIRECT_MEASURE=1 is this module's own choice, not a repair: it
+      selects the measurement path that falls back to the compiled
+      executable's ``memory_analysis()`` when the device has no allocator
+      stats -- i.e. on CPU, where ResourceMonitor's peak is always 0.
+
+    Every one of these is re-read inside the callback, so ``monkeypatch`` is
+    both sufficient and the only correct tool: nothing leaks to other modules.
     """
     monkeypatch.setenv("ALPHAGRAD_SKIP_COST_ANALYSIS", "0")
     monkeypatch.setenv("ALPHAGRAD_DIRECT_MEASURE", "1")
+    monkeypatch.delenv("ALPHAGRAD_COST_FORM", raising=False)
+    monkeypatch.delenv("ALPHAGRAD_MEM_CHANNEL", raising=False)
 
 
-def test_all_six_cost_channels_populate_when_measure_latency_on(monkeypatch):
+def test_all_six_cost_channels_populate_when_measure_latency_on():
     """The vital assertion: with --measure-latency on, every cost-family
     index (0..5) is non-zero after one successful env step. A pool-
     starvation / timeout sentinel would zero ALL of them; a half-
@@ -95,7 +116,6 @@ def test_all_six_cost_channels_populate_when_measure_latency_on(monkeypatch):
     """
     from graphax import examples
 
-    _force_real_cost_measurement(monkeypatch)
     print("\n[env] all 6 cost channels populate (measure_latency=True)")
     x = jnp.array([0.05, 0.15, 0.25, 0.35], dtype=jnp.float32)
     env = _env_for(examples.Helmholtz, (x,), measure_latency=True)
@@ -116,7 +136,7 @@ def test_all_six_cost_channels_populate_when_measure_latency_on(monkeypatch):
     print(f"  all 6 channels populated; {len(nonzero)} nonzero values")
 
 
-def test_latency_is_zero_when_measure_latency_off(monkeypatch):
+def test_latency_is_zero_when_measure_latency_off():
     """Inverse check: with measure_latency=False, latency_ns is hardcoded
     to 0.0 (env.py:1356-1360) but every other cost channel still populates.
     Confirms the conditional is the only differentiator — so adding
@@ -124,7 +144,6 @@ def test_latency_is_zero_when_measure_latency_off(monkeypatch):
     """
     from graphax import examples
 
-    _force_real_cost_measurement(monkeypatch)
     print("\n[env] latency_ns=0 when measure_latency=False (but others populate)")
     x = jnp.array([0.05, 0.15, 0.25, 0.35], dtype=jnp.float32)
     env = _env_for(examples.Helmholtz, (x,), measure_latency=False)

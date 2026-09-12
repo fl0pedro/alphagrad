@@ -45,15 +45,21 @@ import os
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
-# No quality channel: the toy has no data generator, and the memory channel
-# is what is under test. One process per module (finding 47), so this
-# module owns its configuration.
-os.environ["ALPHAGRAD_QUALITY_METRIC"] = "none"
-# The one instrument this module makes claims about (see the docstring).
-os.environ["ALPHAGRAD_DIRECT_MEASURE"] = "1"
-os.environ.pop("ALPHAGRAD_PLAN_LOG", None)
-os.environ.pop("ALPHAGRAD_MEM_CHANNEL", None)
-os.environ.pop("ALPHAGRAD_COST_FORM", None)
+# THE MEASUREMENT CONFIGURATION IS DECLARED IN A FIXTURE, NOT HERE. See
+# ``_the_configuration_this_module_measures_under`` below; this comment records
+# why, because the old form cost the campaign three red tests.
+#
+# "One process per module (finding 47), so this module owns its configuration"
+# used to stand here above four ``os.environ[...]`` assignments. It is not true
+# of the suite: ``pytest tests/`` IMPORTS EVERY TEST MODULE during collection
+# and only then runs the first test, so a module-level assignment is a
+# COLLECTION-TIME mutation of one shared process and the LAST module collected
+# wins. This module popped ALPHAGRAD_COST_FORM at its own import; four files
+# later in collection order ``tests/paired_log_reward_test.py`` (m < p) set it
+# to "paired-log" at ITS import. Every test below then ran under the PAIRED-LOG
+# cost form while this module's docstring claims the ABSOLUTE one and reads slot
+# 5 as the temp -- so slot 5 held a log-difference against rev-exact instead.
+# Run alone, nothing re-set it afterwards and the module passed.
 
 import jax                                                      # noqa: E402
 import jax.numpy as jnp                                         # noqa: E402
@@ -122,6 +128,33 @@ def _rev_order(env):
 
 def _terminal_records(mp):
     return [r for r in mp["records"] if r["terminal"]]
+
+
+@pytest.fixture(autouse=True)
+def _the_configuration_this_module_measures_under(monkeypatch):
+    """The process-global knobs this module's claims are made under, in force
+    for the duration of each test and restored afterwards.
+
+    * ALPHAGRAD_QUALITY_METRIC=none -- the toy has no data generator and the
+      memory channel is what is under test.
+    * ALPHAGRAD_DIRECT_MEASURE=1 -- the one instrument this module makes claims
+      about (see the module docstring: under the ResourceMonitor instrument a
+      CPU node reports a flat 256-260 B device peak for every plan).
+    * no ALPHAGRAD_COST_FORM -- the ABSOLUTE form, under which slot 5 IS the
+      temp. The paired-log form's slot 5 is a log-difference and is
+      tests/paired_log_reward_test.py's subject.
+    * no ALPHAGRAD_MEM_CHANNEL / ALPHAGRAD_PLAN_LOG -- the default channel and
+      no plan log; the tests that want them set them themselves.
+
+    autouse so it also covers tests that take no fixture argument, and
+    ``monkeypatch`` so the values do not outlive the module the way the
+    module-scope assignments they replaced did.
+    """
+    monkeypatch.setenv("ALPHAGRAD_QUALITY_METRIC", "none")
+    monkeypatch.setenv("ALPHAGRAD_DIRECT_MEASURE", "1")
+    monkeypatch.delenv("ALPHAGRAD_PLAN_LOG", raising=False)
+    monkeypatch.delenv("ALPHAGRAD_MEM_CHANNEL", raising=False)
+    monkeypatch.delenv("ALPHAGRAD_COST_FORM", raising=False)
 
 
 @pytest.fixture

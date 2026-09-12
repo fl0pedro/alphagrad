@@ -55,6 +55,18 @@ testpaths = ["tests", "src/alphagrad/approx/tests"]
 # regression test; run them directly if wanted.
 # Both naming styles are in use (test_*.py under tests/, *_test.py elsewhere).
 python_files = ["test_*.py", "*_test.py"]
+# THE SUITE COMMAND IS `pytest`, NOT `pytest tests/` (owner ruling 2026-09-12).
+# `pytest tests/` collects 1371 and `pytest` 1460 -- the 89 in the second root
+# had never been inside any number this campaign quoted, including the "14
+# pre-existing failures" baseline. Measured 2026-09-12: all 89 pass on both
+# sides of that diff in 48 s WHEN THAT ROOT IS RUN ALONE. Both roots in ONE
+# process is a different experiment and costs one PRE-EXISTING failure in the
+# first root -- tests/landscape_map_sweep_test.py::
+# test_measure_singleton_and_stacks, identical on both sides of the diff -- plus
+# a cross-root ALPHAGRAD_INCREMENTAL_TOKENS conflict that the root conftest.py
+# now reports and that the guard under tests/ could not see.
+# `docs/VALIDATION_GATES.md` section 1 carries the table and the caveat; read it
+# before concluding the command is broken.
 # -ra prints the reason for every skip. The quarantine convention (62062c58)
 # records why a module cannot run in the skip message itself, so without -ra
 # that record never reaches the person running the suite.

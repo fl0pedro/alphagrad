@@ -14,6 +14,129 @@ long time the only one anybody ran. Pick by what your change can break.
 
 ## 1. Unit tests — pin the *contracts*
 
+### The command is `pytest`. Not `pytest tests/`.
+
+```
+pytest                 # 1460 tests: BOTH declared roots
+pytest tests/          # 1371 tests: the 89 in src/alphagrad/approx/tests are invisible
+```
+
+`pyproject.toml` declares `testpaths = ["tests", "src/alphagrad/approx/tests"]`
+and says that naming both roots *"is what makes the suite a gate rather than a
+sample"*. Until 2026-09-12 every number this campaign quoted came from `pytest
+tests/`, which overrides that declaration — including the `14 pre-existing
+failures` baseline. The 89 unseen tests include `test_env_callback.py` (the
+measurement callback) and `test_jacobian_equals_grad.py` (the gradient oracle
+the grad-cosine channel rests on). Use `pytest`.
+
+**It is not free, and here is the bill.** Measured 2026-09-12 on one node each
+side (jobs 65009 / 65012, `pgi15-cpu1` / `pgi15-cpu2`, same command both sides):
+
+| command | `wip/fix14-20260912` | `wip/lazycmp-20260912` |
+|---|---|---|
+| `pytest tests/` | 0 failed, 1332 passed | 0 failed, 1354 passed |
+| `pytest` (both roots) | **1 failed**, 1420 passed | **1 failed**, 1442 passed |
+
+The one failure is the same test on both sides —
+`tests/landscape_map_sweep_test.py::test_measure_singleton_and_stacks` — so it is
+**pre-existing and caused by turning the second root on**, not by any change. It
+passes with its module alone (4 of 4 runs on each side) and 0 of 60 repeats in a
+five-module subset, so it is the configuration-dependency class this file's
+companion `conftest` essay documents: a module in the second root leaves a
+configuration that the first root's measurement then runs under. The earlier
+claim that "all 89 pass, zero new failures" was measured on the second root
+**alone**, which is a different experiment from both roots in one process.
+
+**And the root `conftest.py` catches the conflict that does it, which the guard
+under `tests/` could not see:**
+
+```
+[config] CROSS-MODULE CONFIGURATION CONFLICT AT COLLECTION TIME.
+  ALPHAGRAD_INCREMENTAL_TOKENS
+      tests/carry_heads_remat_equiv_test.py left it '1'
+      src/alphagrad/approx/tests/test_env_callback.py left it '0'
+```
+
+One module in each root, different values, filename order decides. That section
+is absent from the base run of the same command. Whether this specific variable
+is what breaks `landscape_map_sweep_test` is **not established** — it is the only
+cross-root conflict the guard reports, which makes it the first thing to check.
+Note that the conflict gate fails the run on its own, so `pytest` exits 1 on this
+branch even when no test fails; that is the gate working as designed, and the
+remedy is to fix the conflict, not to switch the command back.
+
+### `EXHAUSTIVE=1` — the suite's count is a DRAW, and this measures the spread
+
+```
+EXHAUSTIVE=1 pytest                       # repeats the measurement tests 50x, rest once
+EXHAUSTIVE=1 EXHAUSTIVE_REPEATS=100 pytest
+```
+
+**Run it over the WHOLE suite, not over a hand-picked subset.** Measured
+2026-09-12 (job 65008): `tests/landscape_map_sweep_test.py::test_measure_singleton_and_stacks`
+fails **60 of 60** repeats when its module is run alone and passes in the full
+suite, and both tests in `tests/test_all_cost_channels.py` fail **60 of 60** in
+a five-module subset and **0 of 60** with their module alone. Those are
+order/configuration dependencies, not noise — the same class of bug
+`tests/conftest.py` documents, pointing the other way: the test needs a
+configuration some earlier module happens to establish. A subset is a different
+experiment, and the summary now says `ALWAYS` rather than a rate so the two
+cannot be confused.
+
+Some tests here assert on a **wall-clock latency**, on a **drift ratio between
+two adjacent timings**, or on a **measured byte count**. Their result is a draw
+from a distribution, so `0 failed` is one sample, not a fact, and two runs of
+the same commit can legitimately differ. There is no enumerable sample space —
+the randomness is wall-clock assertions, allocator state and compile-cache
+state — so repetition is the only instrument.
+
+`EXHAUSTIVE=1` repeats every test declared in
+`_pytest_config_guard.MEASUREMENT_TESTS` `EXHAUSTIVE_REPEATS` times (default 50)
+and prints a **per-test failure rate** plus the worst rate as the suite's noise
+floor, so a landing decision can be stated as *"N always, plus these M
+sometimes"* instead of a single integer. Everything else runs once, which is the
+check that the remainder is deterministic.
+
+`MEASUREMENT_TESTS` is a **declaration with a reason per entry**, derived by
+reading every assertion in both roots. A test that starts asserting on a clock
+belongs in it; one that stops should leave.
+
+**A rate without a node name means nothing.** Measured 2026-09-12, same
+commits, same command, 60 repeats, `JAX_PLATFORMS=cpu` on both:
+
+| node | `measure_instrument_test::test_reference_matches...` | `paired_log_reward_test::...drift_on_latency` |
+|---|---|---|
+| `pgi15-cpu2` (job 65008) | 2 / 60 = **3.3 %** | 1 / 60 = **1.7 %** (repeat 0) |
+| `pgi15-gpu17` CPUs (job 65019, load 0.21) | 7 / 60 = **11.7 %** (repeats 18, 22, 39, 42, 45, 46, 51) | **0 / 60** |
+
+A 3.5x difference for the same test on the same code, from the machine alone.
+Record the node with every rate, and run all repeats of a given test on ONE node
+— otherwise you are measuring node-to-node variation and calling it flakiness.
+
+**And the rate is not stable run to run either.** `EXHAUSTIVE=1 pytest` over the
+full suite, twice on `pgi15-gpu17`, same commits, 40 minutes apart (jobs 65019 /
+65020): `measure_instrument_test` **31 / 60 = 51.7 %** then **2 / 60 = 3.3 %**.
+So **do not quote a single noise-floor figure.** What IS reproducible is the SET
+of tests that can move. Across six configurations on two machines, of the 18
+measured assertions in both roots exactly **two** ever failed:
+
+* `tests/measure_instrument_test.py::test_reference_matches_the_campaign_measurement_of_the_same_executable` — observed 0 % to 52 %
+* `tests/paired_log_reward_test.py::test_rev_exact_scores_exactly_zero_on_memory_and_inside_drift_on_latency` — observed 0 % to 5 %
+
+The other sixteen were 0 / 60 every time. **Build a green/red gate on the set, not
+on a count.** The rate does rise monotonically with the number of modules sharing
+the process (alone → five modules: 1.7 % → 3.3 % on `pgi15-cpu2`, 0 % → 11.7 % on
+`pgi15-gpu17`), which is ticket `dsnn-3qm.75`'s title measured as a curve and
+points at a process-global that accumulates.
+
+**Repeat 0 is the only cold execution** — cold compile cache, cold allocator,
+first trace — and a suite run executes each test exactly once, always cold, so a
+warm-sensitive test's rate here is a **lower bound**. Whether a flake prefers
+repeat 0 is itself machine-dependent: it did on `pgi15-cpu2` and did not on
+`pgi15-gpu17`. That is why the summary prints the failing **indices** rather than
+only a rate.
+
+
 The one that matters most is **sampling == replay**, i.e. the PPO ratio is
 exactly 1 at epoch 0. The stored old log-prob *is* the sampling log-prob, so any
 divergence means the loss reconstructs the behaviour policy differently from how
