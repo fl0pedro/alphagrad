@@ -209,9 +209,6 @@ def face_var_targets_host(oracle, vertex, max_faces):
         return _hook
 
     try:
-        from graphax.sparse.elemental.dispatch import (
-            approx_active, set_approx_active,
-        )
         incr = oracle._incrs[True]
         graph = _shallow_copy_graph(incr.graph)
         tgraph = _shallow_copy_graph(incr.tgraph)
@@ -222,8 +219,6 @@ def face_var_targets_host(oracle, vertex, max_faces):
                   (None, None, None))
               for k in set(keys)}
         n_eqns0 = len(incr.trace.frame.tracing_eqns)
-        prev = approx_active()
-        set_approx_active(True)
         try:
             with _jcore.set_current_trace(incr.trace):
                 _eliminate_vertex(
@@ -231,7 +226,6 @@ def face_var_targets_host(oracle, vertex, max_faces):
                     transforms=(), face_transforms=ft,
                 )
         finally:
-            set_approx_active(prev)
             # Drop the equations the probe traced (probe_faces' hygiene: the
             # list would grow without bound over an episode otherwise).
             del incr.trace.frame.tracing_eqns[n_eqns0:]

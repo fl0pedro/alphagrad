@@ -868,14 +868,9 @@ class LiveFaceStream:
     # `face_masks_and_sizes(per_face=True)`, so the two are comparable (and
     # `tests/per_face_sizes_live_test.py` asserts they agree face for face):
     #
-    #   * both dispatch modes are probed (`approx_active` True and False --
-    #     `probe_faces`' `_DISPATCH_MODES`), because the measurement path
-    #     exercises both and an action must be legal on both;
-    #   * the SIZES come from the approx=True graph (the one
-    #     `vertex_elimination_jaxpr` builds), falling back to the other mode
-    #     only if that probe produced nothing;
+    #   * probed on the single contraction engine (dsnn-3qm.65);
     #   * `quant[k]` is 1 iff some dtype the 94-slot head can emit is a
-    #     legal, NON-idempotent cast on EVERY mode's operand;
+    #     legal, NON-idempotent cast on the operand;
     #   * a per-vertex transform (an identity callable) is installed for the
     #     probe, exactly as `probe_faces` does, because that is what arms
     #     graphax's `_is_approx_cfg` -- the code path the real run takes.
@@ -943,9 +938,6 @@ class LiveFaceStream:
         """
         from jax._src import core as _jcore
         from graphax.core import _eliminate_vertex
-        from graphax.sparse.elemental.dispatch import (
-            approx_active, set_approx_active,
-        )
 
         seen: dict = {}
 
@@ -983,28 +975,23 @@ class LiveFaceStream:
                   for k in keys}
         else:
             ft = {k: (None, None, _mk(k)) for k in keys}
-        prev = approx_active()
-        set_approx_active(bool(approx))
-        try:
-            with _Snapshot(tk) as snap:
-                ij = snap.ij
-                try:
-                    self.stats[f"{stat}_probe"] += 1
-                    with _jcore.set_current_trace(ij.trace):
-                        _eliminate_vertex(
-                            int(vertex), ij.jaxpr, ij.graph, ij.tgraph, ij.vo,
-                            False, transforms=(self._size_probe_identity,),
-                            face_transforms=ft,
-                        )
-                except Exception:
-                    # A vertex graphax cannot trace has no legal
-                    # approximation either: keep the faces seen so far (the
-                    # rest stay zero, i.e. nothing offered) and never let a
-                    # probe take the rollout down. Same contract as
-                    # `probe_faces`.
-                    self.stats[f"{stat}_probe_fail"] += 1
-        finally:
-            set_approx_active(prev)
+        with _Snapshot(tk) as snap:
+            ij = snap.ij
+            try:
+                self.stats[f"{stat}_probe"] += 1
+                with _jcore.set_current_trace(ij.trace):
+                    _eliminate_vertex(
+                        int(vertex), ij.jaxpr, ij.graph, ij.tgraph, ij.vo,
+                        False, transforms=(self._size_probe_identity,),
+                        face_transforms=ft,
+                    )
+            except Exception:
+                # A vertex graphax cannot trace has no legal
+                # approximation either: keep the faces seen so far (the
+                # rest stay zero, i.e. nothing offered) and never let a
+                # probe take the rollout down. Same contract as
+                # `probe_faces`.
+                self.stats[f"{stat}_probe_fail"] += 1
         return seen
 
     def face_dim_sizes(self, order, specs, n, vertex,
