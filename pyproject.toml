@@ -55,6 +55,13 @@ testpaths = ["tests", "src/alphagrad/approx/tests"]
 # regression test; run them directly if wanted.
 # Both naming styles are in use (test_*.py under tests/, *_test.py elsewhere).
 python_files = ["test_*.py", "*_test.py"]
+# THE SUITE COMMAND IS `pytest`, NOT `pytest tests/` (owner ruling 2026-09-12).
+# `pytest tests/` collects 1371 and `pytest` 1460 -- the 89 in the second root
+# had never been inside any number this campaign quoted, including the "14
+# pre-existing failures" baseline. Measured 2026-09-12: all 89 pass on both
+# sides of that diff in 48 s, so naming the roots you already declared costs
+# 48 seconds. `docs/VALIDATION_GATES.md` section 1 is where this is written
+# down for the next person, together with EXHAUSTIVE=1.
 # -ra prints the reason for every skip. The quarantine convention (62062c58)
 # records why a module cannot run in the skip message itself, so without -ra
 # that record never reaches the person running the suite.

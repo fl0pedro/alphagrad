@@ -1,9 +1,9 @@
-"""THE COLLECTION-TIME CONFIGURATION GUARD, for the ``tests/`` root.
+"""THE COLLECTION-TIME CONFIGURATION GUARD, at the repository ROOT.
 
-Kept deliberately beside the root ``conftest.py`` (owner ruling 2026-09-12:
-"COPY, do not move. Divergence does not have to be strictly prohibited.") so
-that a run scoped to this subtree still gets the guard. When both are active
-the root one is primary and this one's hooks are no-ops.
+This conftest covers BOTH declared test roots (``tests`` and
+``src/alphagrad/approx/tests``), which is what ``pytest`` with no arguments
+runs. ``tests/conftest.py`` is kept as well, so ``pytest tests/...`` from
+anywhere still gets the guard (owner ruling 2026-09-12: COPY, do not move).
 
 The guard's logic lives in ``_pytest_config_guard.py`` at the REPOSITORY ROOT
 and is shared by both conftests rather than duplicated; read that file for what
@@ -27,7 +27,7 @@ import sys
 import pytest
 
 _GUARD_NAME = "_alphagrad_config_guard"
-_GUARD_PATH = (pathlib.Path(__file__).resolve().parent.parent
+_GUARD_PATH = (pathlib.Path(__file__).resolve().parent
                / "_pytest_config_guard.py")
 
 if _GUARD_NAME in sys.modules:

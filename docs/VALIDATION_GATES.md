@@ -14,6 +14,51 @@ long time the only one anybody ran. Pick by what your change can break.
 
 ## 1. Unit tests — pin the *contracts*
 
+### The command is `pytest`. Not `pytest tests/`.
+
+```
+pytest                 # 1460 tests: BOTH declared roots
+pytest tests/          # 1371 tests: the 89 in src/alphagrad/approx/tests are invisible
+```
+
+`pyproject.toml` declares `testpaths = ["tests", "src/alphagrad/approx/tests"]`
+and says that naming both roots *"is what makes the suite a gate rather than a
+sample"*. Until 2026-09-12 every number this campaign quoted came from `pytest
+tests/`, which overrides that declaration — including the `14 pre-existing
+failures` baseline. The 89 unseen tests include `test_env_callback.py` (the
+measurement callback) and `test_jacobian_equals_grad.py` (the gradient oracle
+the grad-cosine channel rests on). Measured 2026-09-12: all 89 pass on both
+sides of the fix14 diff, in 48 s. Use `pytest`.
+
+### `EXHAUSTIVE=1` — the suite's count is a DRAW, and this measures the spread
+
+```
+EXHAUSTIVE=1 pytest                       # repeats the measurement tests 50x, rest once
+EXHAUSTIVE=1 EXHAUSTIVE_REPEATS=100 pytest tests/mem_channel_test.py \
+                                          tests/paired_log_reward_test.py \
+                                          tests/measure_instrument_test.py \
+                                          tests/test_all_cost_channels.py
+```
+
+Some tests here assert on a **wall-clock latency**, on a **drift ratio between
+two adjacent timings**, or on a **measured byte count**. Their result is a draw
+from a distribution, so `0 failed` is one sample, not a fact, and two runs of
+the same commit can legitimately differ. There is no enumerable sample space —
+the randomness is wall-clock assertions, allocator state and compile-cache
+state — so repetition is the only instrument.
+
+`EXHAUSTIVE=1` repeats every test declared in
+`_pytest_config_guard.MEASUREMENT_TESTS` `EXHAUSTIVE_REPEATS` times (default 50)
+and prints a **per-test failure rate** plus the worst rate as the suite's noise
+floor, so a landing decision can be stated as *"N always, plus these M
+sometimes"* instead of a single integer. Everything else runs once, which is the
+check that the remainder is deterministic.
+
+`MEASUREMENT_TESTS` is a **declaration with a reason per entry**, derived by
+reading every assertion in both roots. A test that starts asserting on a clock
+belongs in it; one that stops should leave.
+
+
 The one that matters most is **sampling == replay**, i.e. the PPO ratio is
 exactly 1 at epoch 0. The stored old log-prob *is* the sampling log-prob, so any
 divergence means the loss reconstructs the behaviour policy differently from how
