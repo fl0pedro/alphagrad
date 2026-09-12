@@ -705,7 +705,8 @@ class PomoRunner:
         realized vertex order is ``orders[n]``.
         """
         n_env = len(envs)
-        assert n_env <= self.N
+        if not (n_env <= self.N):
+            raise ValueError(f"{n_env} envs exceed the pool size N={self.N}")
         lam_j = jnp.asarray(np.asarray(lam, np.float32))
         for env in envs:
             env.reset()

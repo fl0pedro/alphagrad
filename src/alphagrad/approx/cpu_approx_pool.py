@@ -708,7 +708,8 @@ class CpuApproxPool:
         from ray.exceptions import GetTimeoutError, RayActorError
 
         N = len(order_batch)
-        assert len(specs_batch) == N and len(step_batch) == N
+        if not (len(specs_batch) == N and len(step_batch) == N):
+            raise ValueError(f"batch length mismatch: orders {N}, specs {len(specs_batch)}, steps {len(step_batch)}")
 
         # Pre-allocate output buffers + sentinel mask.
         tokens_out = np.zeros((N, self._max_tokens), dtype=np.int32)

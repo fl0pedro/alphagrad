@@ -1341,11 +1341,10 @@ class PPORayWorker:
             from alphagrad.transformer.encoder import BiPalimpsaMixer
             _layer0 = self.agent.encoder.layers[0]
             _mixer = getattr(_layer0, "attn_layer", None)
-            assert isinstance(_mixer, BiPalimpsaMixer), (
-                "ALPHAGRAD_POLICY=palimpsa_bi but MicroPPOAgent encoder "
+            if not (isinstance(_mixer, BiPalimpsaMixer)):
+                raise RuntimeError("ALPHAGRAD_POLICY=palimpsa_bi but MicroPPOAgent encoder "
                 f"layer 0 mixer is {type(_mixer).__name__}, not "
-                "BiPalimpsaMixer — policy did not reach the Ray rollout path."
-            )
+                "BiPalimpsaMixer — policy did not reach the Ray rollout path.")
             print(
                 "[ppo_ray_worker] VERIFIED BiPalimpsaMixer active on "
                 f"encoder ({self.agent.encoder.num_layers} layers)",
@@ -3939,10 +3938,9 @@ class PPORayWorker:
         vector in-place from a driver-side caller.
         """
         weights_np = np.asarray(weights_np, dtype=np.float32)
-        assert weights_np.shape == self.reward_weights_np.shape, (
-            f"weights shape mismatch: got {weights_np.shape}, "
-            f"expected {self.reward_weights_np.shape}"
-        )
+        if not (weights_np.shape == self.reward_weights_np.shape):
+            raise ValueError(f"weights shape mismatch: got {weights_np.shape}, "
+            f"expected {self.reward_weights_np.shape}")
         self.reward_weights_np = weights_np
         self.reward_weights = jnp.asarray(weights_np, dtype=jnp.float32)
         # Keep the GDPO channel mask in sync — calibration can change

@@ -653,7 +653,8 @@ def aggregate_per_channel_stats(
           (empty list if ``action_seq`` was not provided).
     """
     T, N, R = buf_reward_vec_np.shape
-    assert R == NUM_REWARDS, f"expected NUM_REWARDS={NUM_REWARDS}, got {R}"
+    if not (R == NUM_REWARDS):
+        raise ValueError(f"expected NUM_REWARDS={NUM_REWARDS}, got {R}")
 
     valid_mask = filter_sentinel_mask(buf_reward_vec_np, sentinel)  # (T, N)
 

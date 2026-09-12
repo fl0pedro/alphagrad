@@ -7632,7 +7632,8 @@ class VertexEliminationEnv:
                     "registered target must BE model + loss (see "
                     "common.examples.get_fn), or drop scalar_target."
                 )
-        assert (argnums is None and args is None) or not (args is None or args is None)
+        if argnums is not None and args is None:
+            raise ValueError("argnums requires args: pass both or neither")
         config = EnvConfig(
             jaxpr=jaxpr.jaxpr,
             argnums=tuple(range(len(jaxpr.invars)))

@@ -235,8 +235,8 @@ def _pin_legal(legal):
 # vertex contexts, vmem slots, axis_state rows). They agree only while VALID
 # is contiguous 1..NV. Fail loudly rather than silently scoring the wrong
 # vertex on a task whose jaxpr has an early output eqn.
-assert VALID == list(range(1, NV + 1)), (
-    f"VALID must be contiguous 1..{NV} for the vertex-index conventions to "
+if not (VALID == list(range(1, NV + 1))):
+    raise RuntimeError(f"VALID must be contiguous 1..{NV} for the vertex-index conventions to "
     f"agree; got {VALID[:8]}...")
 TOTAL_V = len(jaxpr.eqns)
 # ONE graph model. `PlanTokenizer.legal` reads the TOKENIZER's own
@@ -262,14 +262,14 @@ try:
     BASE_OWN = env.base_owners()
 except Exception:
     BASE_OWN = None
-assert int(_ebn) == BASE_N, (
-    f"base stream length disagrees: PlanTokenizer {BASE_N} vs "
+if not (int(_ebn) == BASE_N):
+    raise RuntimeError(f"base stream length disagrees: PlanTokenizer {BASE_N} vs "
     f"env.base_observation() {int(_ebn)}")
-assert np.array_equal(np.asarray(_ebt)[:BASE_N], np.asarray(_BASE_TOKS)), (
-    "base token stream disagrees between PlanTokenizer and "
+if not (np.array_equal(np.asarray(_ebt)[:BASE_N], np.asarray(_BASE_TOKS))):
+    raise RuntimeError("base token stream disagrees between PlanTokenizer and "
     "env.base_observation()")
-assert np.array_equal(np.asarray(_ebe)[:BASE_N], np.asarray(_BASE_IDS)), (
-    "base eqn ids disagree between PlanTokenizer and env.base_observation()")
+if not (np.array_equal(np.asarray(_ebe)[:BASE_N], np.asarray(_BASE_IDS))):
+    raise RuntimeError("base eqn ids disagree between PlanTokenizer and env.base_observation()")
 del _ebt, _ebe, _ebn
 print(f"[gaz] path tokenizer: base={BASE_N} tokens "
       f"(per-step delta budget {MAX_DELTA_TOKENS}, total_v={TOTAL_V})",
@@ -721,8 +721,8 @@ from alphagrad.approx.ppo import (                     # noqa: E402
     _ATTN_ENTROPY_ON,
 )
 
-assert agent.micro_action_policy is None, (
-    "the per-VERTEX approximation head is still built -- AZ approximates per "
+if agent.micro_action_policy is not None:
+    raise RuntimeError("the per-VERTEX approximation head is still built -- AZ approximates per "
     "FACE now, and a live micro head would be a second, untrained action "
     "space PPO does not have")
 # #79: the EXACT arm legitimately has no face head. On the APPROX arm its
@@ -730,11 +730,11 @@ assert agent.micro_action_policy is None, (
 # per FACE, like PPO), and losing it silently is how the head went untrained
 # before.
 if _EXACT_ARM:
-    assert agent.face_path_policy is None, (
-        "--no-approx-head was passed but a per-face head was still built")
+    if agent.face_path_policy is not None:
+        raise RuntimeError("--no-approx-head was passed but a per-face head was still built")
 else:
-    assert agent.face_path_policy is not None, (
-        "no per-face head was built: check face_actions/unified_face_head/"
+    if agent.face_path_policy is None:
+        raise RuntimeError("no per-face head was built: check face_actions/unified_face_head/"
         "live_faces in the agent factory call above")
 
 LIVE_FACES = build_live_face_stream(
@@ -1047,8 +1047,8 @@ def _assert_face_accounting(f_cnt, f_valid, d, n_faces, vertex, tk_faces):
     _FACE_STEPS[0] += 1
     if total >= MAX_DELTA_TOKENS:
         _FACE_WINDOW_SATURATED[0] += 1
-    assert total <= MAX_DELTA_TOKENS, (
-        f"vertex {vertex}: face chunks total {total} > the emission window "
+    if not (total <= MAX_DELTA_TOKENS):
+        raise RuntimeError(f"vertex {vertex}: face chunks total {total} > the emission window "
         f"{MAX_DELTA_TOKENS} -- the per-face clamp did not hold")
     if n_faces != tk_faces:
         _dbg = _face_count_diag(vertex)
@@ -1333,8 +1333,8 @@ def _draw_face_sequence(vertex, head_out, carry, prefix_arrays, rng,
         jnp.asarray(_o_arr), jnp.asarray(_sp_h),
         jnp.asarray(_n, jnp.int32), jnp.asarray(_f_use), jnp.asarray(_s_use),
         _key)
-    assert int(_vi) == int(vertex) - 1, (
-        f"the one-hot availability mask did not force the searched vertex: "
+    if not (int(_vi) == int(vertex) - 1):
+        raise RuntimeError(f"the one-hot availability mask did not force the searched vertex: "
         f"head picked {int(_vi) + 1}, search wanted {int(vertex)}")
     fr = np.asarray(fr, np.int32)
     fs = np.asarray(fs, np.int32)
@@ -1349,8 +1349,8 @@ def _draw_face_sequence(vertex, head_out, carry, prefix_arrays, rng,
         # the same divergence `_assert_face_accounting` catches at commit,
         # surfaced here for every draw.
         _ndec = int(np.sum(f_valid > 0.5))
-        assert _ndec == int(n_live), (
-            f"vertex {vertex}: bucketed draw decided {_ndec} faces at width "
+        if not (_ndec == int(n_live)):
+            raise RuntimeError(f"vertex {vertex}: bucketed draw decided {_ndec} faces at width "
             f"{_fb} but the authoritative enumeration has {n_live} -- "
             f"face_count_fn and face_keys_of disagree")
         (fr, fs, fa, f_pair, f_comp, f_valid, f_cnt,
@@ -1379,9 +1379,10 @@ def _pack_search_draws(cands):
     vidx = np.zeros((D,), np.int32)
     w = np.zeros((D,), np.float32)
     rows = [dd for c in cands for dd in c.get("draws", ())]
-    assert rows, "no face draws to pack on the approx arm"
-    assert len(rows) <= D, (
-        f"{len(rows)} search draws exceed the D_MAX_DRAWS={D} storage pad")
+    if not (rows):
+        raise RuntimeError("no face draws to pack on the approx arm")
+    if not (len(rows) <= D):
+        raise RuntimeError(f"{len(rows)} search draws exceed the D_MAX_DRAWS={D} storage pad")
     _z = lambda a: np.zeros((D,) + a.shape, a.dtype)
     fpair, fcomp = _z(rows[0]["f_pair"]), _z(rows[0]["f_comp"])
     fvalid, fcnt = _z(rows[0]["f_valid"]), _z(rows[0]["f_cnt"])
@@ -1458,8 +1459,8 @@ def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
                                    int(prefix_arrays[4]))
     surv = list(cands)
     for _phase, (_n_expect, _n_draws, _depth) in enumerate(plan):
-        assert len(surv) == _n_expect, (
-            f"halving drifted from phase_plan: {len(surv)} survivors, "
+        if not (len(surv) == _n_expect):
+            raise RuntimeError(f"halving drifted from phase_plan: {len(surv)} survivors, "
             f"plan says {_n_expect}")
         depth = min(int(_depth), NV)
         for c in surv:
@@ -1655,7 +1656,8 @@ def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
             for dd, wh in zip(c["draws"], _w_hat):
                 dd["w_hat"] = float(wh)
         _cd = chosen["draws"]
-        assert _cd, "chosen vertex has no face draws on the approx arm"
+        if not (_cd):
+            raise RuntimeError("chosen vertex has no face draws on the approx arm")
         _wh = np.array([dd["w_hat"] for dd in _cd], dtype=np.float64)
         _wh = _wh / _wh.sum()
         exec_draw = _cd[int(rng.choice(len(_cd), p=_wh))]

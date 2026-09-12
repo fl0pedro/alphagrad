@@ -82,8 +82,8 @@ class PlanTokenizer:
         toks = [int(t) for t in self.tk.base_tokens()]
         ids = [int(g) for g in self.tk.last_eqn_ids()]
         if self._base is not None:
-            assert toks == self._base[0] and ids == self._base[1], (
-                "base stream is not a constant of the jaxpr -- the carry "
+            if not (toks == self._base[0] and ids == self._base[1]):
+                raise RuntimeError("base stream is not a constant of the jaxpr -- the carry "
                 "bootstrap and every episode's stream would disagree")
         else:
             self._base = (toks, ids)

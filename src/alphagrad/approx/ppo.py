@@ -3228,7 +3228,8 @@ class Agent(eqx.Module):
         ``--approx-add choose``'s join bit joins the carry with no edit here.
         """
         _names = _rec.names(self.face_path_policy.approx_add)
-        assert _names[0] == "skip", _names
+        if not (_names[0] == "skip"):
+            raise RuntimeError(_names)
         return _names[1:]
 
     @staticmethod

@@ -127,7 +127,8 @@ def kronecker_preferences(
     """
     K = int(num_rewards)
     B = int(num_envs)
-    assert K >= 1, f"num_rewards must be >= 1, got {K}"
+    if not (K >= 1):
+        raise ValueError(f"num_rewards must be >= 1, got {K}")
     if K == 1:
         out = jnp.ones((B, 1), dtype=jnp.float32)
         if active_mask is not None:

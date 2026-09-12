@@ -842,7 +842,8 @@ class VertexEliminationEnv:
         terminal_rewards_only: bool = False,
         remote_eval_fn: Callable | None = None,
     ):
-        assert (argnums is None and args is None) or not (args is None or args is None)
+        if argnums is not None and args is None:
+            raise ValueError("argnums requires args: pass both or neither")
         config = EnvConfig(
             jaxpr=jaxpr.jaxpr,
             argnums=tuple(range(len(jaxpr.invars)))

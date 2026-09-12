@@ -149,24 +149,27 @@ def main(argv=None):
             reps=2, inner=2, timeout=a.timeout)
         _row("huge_jacrev(40GB, 8GiB cap)", res)
         results["demo_infeasible"] = res
-        assert res.get("status") == "infeasible" and not res.get("executed"), (
-            "infeasible-plan demo FAILED", res)
+        if not (res.get("status") == "infeasible" and not res.get("executed")):
+            raise RuntimeError(("infeasible-plan demo FAILED", res))
 
         res2 = client.measure(**{**common, **_SPECS["jacve_rev"]})
         _row("jacve_rev(after-infeasible)", res2)
         results["after_infeasible"] = res2
-        assert res2.get("status") == "ok", ("run did not continue", res2)
+        if not (res2.get("status") == "ok"):
+            raise RuntimeError(("run did not continue", res2))
 
         print("\n[demo] hard worker crash -> respawn:", flush=True)
         r = client.request({"cmd": "crash"})
         print(f"  crash scored: {r}", flush=True)
         results["crash_score"] = r
-        assert r.get("status") == "infeasible" and r.get("reason") == "worker_died", r
+        if not (r.get("status") == "infeasible" and r.get("reason") == "worker_died"):
+            raise RuntimeError(r)
 
         res3 = client.measure(**{**common, **_SPECS["jacve_rev"]})
         _row("jacve_rev(after-crash)", res3)
         results["after_crash"] = res3
-        assert res3.get("status") == "ok", ("respawn measurement FAILED", res3)
+        if not (res3.get("status") == "ok"):
+            raise RuntimeError(("respawn measurement FAILED", res3))
         print(f"  [demo] worker respawns so far: {client.respawns}", flush=True)
 
     print("\nELIMRL_GATE_SUMMARY "

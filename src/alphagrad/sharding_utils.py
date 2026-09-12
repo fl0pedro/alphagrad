@@ -41,8 +41,10 @@ def get_factorizations(n: int, num_factors: int) -> Sequence[Sequence[int]]:
     Returns:
         Sequence[Sequence[int]]: _description_
     """
-    assert n > 0, "`n` has to be greater than 0!"
-    assert num_factors > 2, "`num_factors` has to be greater than 2!"
+    if not (n > 0):
+        raise ValueError("`n` has to be greater than 0!")
+    if not (num_factors > 2):
+        raise ValueError("`num_factors` has to be greater than 2!")
     # actually a leetcode problem
     # returns a list of tuples `factors` that all divide a given number
     # no duplicates allowed
