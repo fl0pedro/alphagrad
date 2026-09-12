@@ -113,6 +113,22 @@ A 3.5x difference for the same test on the same code, from the machine alone.
 Record the node with every rate, and run all repeats of a given test on ONE node
 — otherwise you are measuring node-to-node variation and calling it flakiness.
 
+**And the rate is not stable run to run either.** `EXHAUSTIVE=1 pytest` over the
+full suite, twice on `pgi15-gpu17`, same commits, 40 minutes apart (jobs 65019 /
+65020): `measure_instrument_test` **31 / 60 = 51.7 %** then **2 / 60 = 3.3 %**.
+So **do not quote a single noise-floor figure.** What IS reproducible is the SET
+of tests that can move. Across six configurations on two machines, of the 18
+measured assertions in both roots exactly **two** ever failed:
+
+* `tests/measure_instrument_test.py::test_reference_matches_the_campaign_measurement_of_the_same_executable` — observed 0 % to 52 %
+* `tests/paired_log_reward_test.py::test_rev_exact_scores_exactly_zero_on_memory_and_inside_drift_on_latency` — observed 0 % to 5 %
+
+The other sixteen were 0 / 60 every time. **Build a green/red gate on the set, not
+on a count.** The rate does rise monotonically with the number of modules sharing
+the process (alone → five modules: 1.7 % → 3.3 % on `pgi15-cpu2`, 0 % → 11.7 % on
+`pgi15-gpu17`), which is ticket `dsnn-3qm.75`'s title measured as a curve and
+points at a process-global that accumulates.
+
 **Repeat 0 is the only cold execution** — cold compile cache, cold allocator,
 first trace — and a suite run executes each test exactly once, always cold, so a
 warm-sensitive test's rate here is a **lower bound**. Whether a flake prefers

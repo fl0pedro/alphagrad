@@ -325,10 +325,12 @@ def _exhaustive_summary(write_line, section):
     write_line("NOISE FLOOR: the worst NON-deterministic per-test failure rate "
                "above is %.1f%%. A suite count is reproducible only to within "
                "the tests on this list." % (100.0 * worst_noise))
-    write_line("CAVEAT 1, measured: THIS RATE IS A PROPERTY OF THIS MACHINE. "
-               "The same test, same commit, same command gave 3.3%% on "
-               "pgi15-cpu2 and 11.7%% on pgi15-gpu17's CPUs (jobs 65008 / "
-               "65019, 2026-09-12). Report the node with the rate.")
+    write_line("CAVEAT 1, measured: DO NOT QUOTE THIS AS A FIGURE. The same "
+               "test, same commit, same command gave 3.3%% on pgi15-cpu2 and "
+               "11.7%% on pgi15-gpu17 (jobs 65008 / 65019), and 51.7%% then "
+               "3.3%% on pgi15-gpu17 twice 40 minutes apart (65019 / 65020). "
+               "The reproducible thing is the SET of tests that can move, not "
+               "the rate. Report the node, and report the set.")
     write_line("CAVEAT 2: repeat 0 is the only COLD execution (cold compile "
                "cache, cold allocator, first trace) and a suite run executes "
                "each test exactly once, always cold -- so a warm-sensitive "
