@@ -75,10 +75,14 @@ equally decidable:
 
 Scope: ALPHAGRAD_* and GRAPHAX_* only -- the project's own knobs, which is the
 blast radius above. JAX_*, XLA_* and CUDA_VISIBLE_DEVICES are deliberately NOT
-watched: they are set before the jax import by nearly every module, and the
-three modules that do assign conflicting CUDA_VISIBLE_DEVICES values
-(environment_interaction_test, runtime_game_test, seq_transformer_test) collect
-ZERO tests today, which is ticket dsnn-3qm.78's subject and not this guard's.
+watched, and the reason is checked rather than assumed: they are set with
+``setdefault`` before the jax import by nearly every module, and the only three
+that ASSIGN conflicting CUDA_VISIBLE_DEVICES values --
+environment_interaction_test (2), runtime_game_test (0,1,2,3) and
+seq_transformer_test (3) -- all call ``pytest.skip(allow_module_level=True)`` on
+LINE 3, before the ``os.environ`` line is ever reached, so those three writes
+never execute at all. If a live module ever starts assigning a device list, add
+the prefix here.
 """
 from __future__ import annotations
 
