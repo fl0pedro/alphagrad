@@ -65,7 +65,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 #
 # The clip path is still exercised on every run -- see
 # ``test_the_clip_is_exercised_at_the_old_budget_in_its_own_interpreter``,
-# which pins 1024+clip in a FRESH interpreter, where a pin is the only thing
+# which pins a 256-token budget + clip in a FRESH interpreter, where a pin is the only thing
 # that can work. The RAISE default has its own fresh-interpreter cases at the
 # bottom of this file.
 
@@ -178,7 +178,7 @@ def _check_reconstruction(diag, require_clip=False):
 
     A PLAIN FUNCTION, not a test, because it is called from two places: the
     in-process test below at whatever budget ``env.py`` froze, and the
-    fresh-interpreter test that pins 1024+clip -- where ``diag=True`` on this
+    fresh-interpreter test that pins 256+clip -- where ``diag=True`` on this
     graph produces a block past the budget and ``require_clip`` demands that the
     clipping branch actually ran. The in-process caller cannot demand that: it
     does not own the frozen budget (see the module header).
@@ -303,7 +303,7 @@ def test_reset_carries_an_empty_delta_and_no_callback():
 
 # --------------------------------------------------------------------------
 # The RAISE default (aa0774c8). env.py freezes MAX_DELTA_TOKENS and
-# _DELTA_OVERFLOW at first import and this module pins 1024+clip above, so
+# _DELTA_OVERFLOW at first import and this module pins 256+clip below, so
 # the default behaviour can only be observed in a fresh interpreter with the
 # knobs unset. Each case below runs one, with every ALPHAGRAD_* variable
 # scrubbed -- pure library defaults, exactly what a bare `import` gets.
