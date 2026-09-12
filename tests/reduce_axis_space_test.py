@@ -300,7 +300,9 @@ def test_emitted_axis_names_the_axis_graphax_drops(name, per_face):
         else:
             assert out is st, (name, a)
             if p is None:
-                assert stats.get("skipped_compress_noop", 0) == int(per_face)
+                # An implicit axis is an idempotent no-op, and the no-op split
+                # is recorded whether or not per-face masks are on (.73).
+                assert stats.get("skipped_compress_noop", 0) == 1
         checked += 1
     assert checked == sp.n_dims
     assert applied_n == sum(1 for p in sp.phys_of_dim
