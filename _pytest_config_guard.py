@@ -182,6 +182,10 @@ MEASUREMENT_TESTS: dict[str, str] = {
         "A -- fails any cost channel that reads 0.0, latency_ns included",
     "tests/test_all_cost_channels.py::test_latency_is_zero_when_measure_latency_off":
         "A/C -- the inverse pin, on the same measured channels",
+    "tests/test_all_cost_channels.py::"
+    "test_target_fun_none_early_return_zeros_jit_channels":
+        "A/C -- asserts the measured flops/latency/bytes/peak channels are all "
+        "0.0 on the early return; shares its module's measured configuration",
     "tests/landscape_map_sweep_test.py::test_measure_singleton_and_stacks":
         "A -- measure() wraps a real _callback in perf_counter and the test "
         "asserts its latency_ns is finite",
