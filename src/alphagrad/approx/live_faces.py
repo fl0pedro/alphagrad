@@ -1073,18 +1073,11 @@ class LiveFaceStream:
             except Exception:
                 self.stats["size_miss"] += 1
                 continue
-            qm = np.ones((len(FACE_QUANT_DTYPES),), dtype=bool)
-            seen_any = False
-            for mode in per_mode:
-                stm = mode.get(kk)
-                if stm is None:
-                    continue
-                try:
-                    qm &= quant_valid_mask(stm, FACE_QUANT_DTYPES)
-                except Exception:
-                    qm[:] = False
-                seen_any = True
-            quant[k] = 1.0 if (seen_any and bool(qm.any())) else 0.0
+            try:
+                qm = quant_valid_mask(st, FACE_QUANT_DTYPES)
+            except Exception:
+                qm = np.zeros((len(FACE_QUANT_DTYPES),), dtype=bool)
+            quant[k] = 1.0 if bool(qm.any()) else 0.0
 
         res = (sizes, quant, np.int32(n_faces))
         if len(self._sizes) >= 4096:
@@ -1206,28 +1199,9 @@ class LiveFaceStream:
                     continue
                 sizes[k, s] = L.sizes
                 nout[k, s] = L.n_out
-                pm = L.pair.copy()
-                cm = L.comp.copy()
-                qm = L.quant.copy()
-                for mode in per_mode[1:]:
-                    stm = (mode.get(kk) or {}).get(site)
-                    if stm is None:
-                        continue
-                    alsom = tuple(
-                        (mode.get(kk) or {})[x] for x in site_list[1:]
-                        if (mode.get(kk) or {}).get(x) is not None)
-                    try:
-                        Lm = slot_legality(stm, N, also=alsom)
-                        pm &= Lm.pair
-                        cm &= Lm.comp
-                        qm &= Lm.quant
-                    except Exception:
-                        pm[:] = False
-                        cm[:] = False
-                        qm[:] = False
-                pair[k, s] = pm.astype(np.float32)
-                comp[k, s] = cm.astype(np.float32)
-                quant[k, s] = qm.astype(np.float32)
+                pair[k, s] = L.pair.astype(np.float32)
+                comp[k, s] = L.comp.astype(np.float32)
+                quant[k, s] = L.quant.astype(np.float32)
 
         res = (sizes, quant, pair, comp, nout, np.int32(n_faces))
         if len(self._slots) >= 4096:
