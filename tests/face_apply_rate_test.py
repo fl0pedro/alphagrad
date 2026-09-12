@@ -617,7 +617,7 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
             tk = lf._tokenizer_at(np.asarray(order), specs, 0)
             seen: set = set()
             for v in [int(x) for x in order[:12]]:
-                got = lf._probe_faces(tk, v, list(tk.ij.faces(v)), True,
+                got = lf._probe_faces(tk, v, list(tk.ij.faces(v)),
                                       slots=True, stat="slot") or {}
                 for by_site in got.values():
                     seen |= set(by_site)

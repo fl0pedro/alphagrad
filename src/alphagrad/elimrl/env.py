@@ -67,13 +67,11 @@ from jax._src.core import Var as _Var
 from graphax.core import (
     _acts_as_identity,
     _build_graph,
-    _compressed_dims,
     _drain_or_unload_pre,
     _drain_transforms,
     _force,
     _identity_passthrough,
     _is_scalar_st,
-    _materialize_for_op,
     append_pre_transforms,
     prepend_post_transforms,
     unload_post_transforms,
@@ -110,8 +108,6 @@ def _contract(post_val, pre_val):
         edge_outval = prepend_post_transforms(post_val, edge_outval)
     if len(pre_val.pre_transforms) > 0:
         edge_outval = append_pre_transforms(pre_val, edge_outval)
-    if _compressed_dims(edge_outval):
-        edge_outval = _materialize_for_op(edge_outval)
     return edge_outval
 
 

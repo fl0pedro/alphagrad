@@ -134,8 +134,11 @@ def test_face_masks_is_unchanged_by_the_new_combined_method():
 
 
 def test_flag_off_hook_is_bit_identical_for_every_kind():
-    """With the flag off an illegal COMPRESS / QUANT is still DROPPED, with the
-    historical counters and nothing else -- no projection, no noop split."""
+    """With the flag off an illegal COMPRESS / QUANT is still DROPPED and
+    never PROJECTED. The no-op split is NOT gated on the flag any more
+    (dsnn-3qm.73): a request that would leave the operand unchanged is
+    labelled ``skipped_{kind}_noop`` whether or not per-face masks are on,
+    so ``applied_fraction`` never reads a no-op as a success."""
     _o, faces = _all_faces(_mlp, list(_MLP_ARGS))
     seen = 0
     for _v, _k, st in faces:
@@ -146,8 +149,12 @@ def test_flag_off_hook_is_bit_identical_for_every_kind():
             out = make_live_masked_hook(rules, max_dims=N_AX, max_axes=N_AX,
                                         stats=s)(st)
         assert "repaired_compress" not in s
-        assert "skipped_compress_noop" not in s
-        assert "skipped_quant_noop" not in s
+        assert "applied_compress" not in s
+        assert "applied_quant" not in s
+        for rule, kind in zip(rules, ("compress", "quant")):
+            noop = rule_is_idempotent_noop(st, rule, max_dims=N_AX,
+                                           max_axes=N_AX)
+            assert (f"skipped_{kind}_noop" in s) == noop, (kind, noop, s)
         assert s.get("skipped_raised", 0) == 0
         assert out is not None
         seen += 1
@@ -275,9 +282,14 @@ def test_quant_noop_is_skipped_and_labelled_when_the_flag_is_on():
         cur = str(val.dtype)
         s_off: dict = {}
         with _in_trace(_o):
-            make_live_masked_hook((Quant(dtype=cur),), max_dims=N_AX,
-                                  max_axes=N_AX, stats=s_off)(st)
-        assert s_off.get("applied_quant") == 1, "flag off: counted as applied"
+            out_off = make_live_masked_hook((Quant(dtype=cur),), max_dims=N_AX,
+                                            max_axes=N_AX, stats=s_off)(st)
+        # Flag off used to count this as applied (dsnn-3qm.73 closed that):
+        # the operand is handed back unchanged, so it is a no-op either way.
+        assert out_off is st
+        assert s_off.get("applied_quant") is None, "flag off: counted as applied"
+        assert s_off.get("skipped_quant") == 1
+        assert s_off.get("skipped_quant_noop") == 1
         s_on: dict = {}
         with _flag(True), _in_trace(_o):
             out = make_live_masked_hook((Quant(dtype=cur),), max_dims=N_AX,
