@@ -240,3 +240,49 @@ def test_two_incompatible_structures_raise_rather_than_densifying():
     implicit = _st(jnp.arange(4.0) + 1.0, (4, 4), implicit=(0,))
     with pytest.raises(GradientStructureMismatch, match="without materializing"):
         _quality_metrics([diag], [implicit])
+
+
+def test_the_HELMHOLTZ_leaf_pair_compares_without_materializing():
+    """THE REGRESSION PIN. Helmholtz's grad-cosine compares an exact leaf stored
+    as a ONE-BLOCK pair (``size=1, axis=None, block_size=4, block_axis=0/1`` --
+    a plain dense 4x4 wearing a pair's clothes) against an approximated leaf
+    stored as a PURE DIAGONAL (``size=4, axis=0, block_size=None,
+    block_axis=None``, ``val (4,)``). The dims are transcribed from the measured
+    census (job 65010, pgi15-cpu2).
+
+    An earlier draft of the lazy contraction refused both forms on the grounds
+    that graphax only reaches them through ``dense(hard=True)``, and that turned
+    ``tests/landscape_map_sweep_test.py::test_measure_singleton_and_stacks`` red
+    on all four plan classes. Both are now handled, and the comparison still
+    materializes neither side.
+    """
+    exact = SparseTensor(
+        (DiagonalIndex(0, 1, axis=None, other_id=1, block_size=4, block_axis=0),),
+        (DiagonalIndex(1, 1, axis=None, other_id=0, block_size=4, block_axis=1),),
+        jnp.asarray(S), check_consistency=False)
+    approx = SparseTensor(
+        (DiagonalIndex(0, 4, axis=0, other_id=1),),
+        (DiagonalIndex(1, 4, axis=0, other_id=0),),
+        jnp.asarray(jnp.diagonal(S)), check_consistency=False)
+    assert exact.shape == (4, 4) and approx.shape == (4, 4)
+
+    calls = []
+    real = SparseTensor.dense
+
+    def spy(self, **kw):
+        calls.append(tuple(int(d.logical_size) for d in self.dims))
+        return real(self, **kw)
+
+    SparseTensor.dense = spy
+    try:
+        cos, frob = _quality_metrics([exact], [approx])
+    finally:
+        SparseTensor.dense = real
+    assert calls == [], f"the comparison densified: {calls}"
+
+    # the oracle: the same comparison on the two dense forms
+    dense_a = jnp.diag(jnp.diagonal(S))
+    cos_d, frob_d = _quality_metrics([jnp.asarray(S)], [dense_a])
+    assert float(cos) == pytest.approx(float(cos_d), abs=1e-5)
+    assert float(frob) == pytest.approx(float(frob_d), abs=1e-5)
+    assert 0.0 < float(cos) < 1.0, "the fixture must actually be an approximation"
