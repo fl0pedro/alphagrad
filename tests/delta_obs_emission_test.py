@@ -179,7 +179,7 @@ def _check_reconstruction(diag, require_clip=False):
     A PLAIN FUNCTION, not a test, because it is called from two places: the
     in-process test below at whatever budget ``env.py`` froze, and the
     fresh-interpreter test that pins 1024+clip -- where ``diag=True`` on this
-    graph produces a 2190-token block and ``require_clip`` demands that the
+    graph produces a block past the budget and ``require_clip`` demands that the
     clipping branch actually ran. The in-process caller cannot demand that: it
     does not own the frozen budget (see the module header).
     """
@@ -237,7 +237,7 @@ def test_base_plus_deltas_reconstructs_the_stream(diag):
 
     The CLIP half of the claim is not asserted here and cannot be: the budget
     belongs to whichever module imported ``env`` first (module header), so on a
-    32768-wide budget this graph's 2190-token diag block simply fits. What this
+    32768-wide budget this graph's diag block simply fits. What this
     case does pin, at every budget, is that base + deltas is the stream token
     for token and eqn-id for eqn-id.
     ``test_the_clip_is_exercised_at_the_old_budget_in_its_own_interpreter``
@@ -336,14 +336,17 @@ def _run_pure_defaults(script: str) -> None:
 
 
 def test_the_clip_is_exercised_at_the_old_budget_in_its_own_interpreter():
-    """THE CLIP BRANCH, on every run, at the 1024-token budget + clip opt-out.
+    """THE CLIP BRANCH, on every run, at a 256-token budget + clip opt-out.
 
     This is the case the module-level ``os.environ`` pins were for, moved to
     the one place a pin can still work. A fresh interpreter with
-    ALPHAGRAD_MAX_DELTA_TOKENS=1024 and ALPHAGRAD_DELTA_OVERFLOW=clip freezes
-    those constants before anything imports ``env``, so this graph's
-    diag block genuinely overflows and ``require_clip`` fails if it
-    ever stops doing so. The shared-process case above runs the same
+    ALPHAGRAD_MAX_DELTA_TOKENS=256 and ALPHAGRAD_DELTA_OVERFLOW=clip freezes
+    those constants before anything imports ``env``, so this graph's diag
+    block genuinely overflows and ``require_clip`` fails if it ever stops
+    doing so. (The budget was 1024 for the old elementwise graph, whose
+    densified diag block ran to 2190 tokens; the matmul graph's blocks are
+    shorter, so the pin moved down. The value is not a contract, the clip
+    branch running is.) The shared-process case above runs the same
     reconstruction at whatever budget the process happens to hold.
     """
     here = str(pathlib.Path(__file__).resolve().parent)
@@ -351,12 +354,12 @@ def test_the_clip_is_exercised_at_the_old_budget_in_its_own_interpreter():
         "import sys\n"
         f"sys.path.insert(0, {here!r})\n"
         "import delta_obs_emission_test as M\n"
-        "assert M.MAX_DELTA_TOKENS == 1024, M.MAX_DELTA_TOKENS\n"
+        "assert M.MAX_DELTA_TOKENS == 256, M.MAX_DELTA_TOKENS\n"
         "from alphagrad.approx.env import _DELTA_OVERFLOW\n"
         "assert _DELTA_OVERFLOW == 'clip', _DELTA_OVERFLOW\n"
         "assert M._check_reconstruction(True, require_clip=True)\n"
         "print('PROBE-OK')\n",
-        ALPHAGRAD_MAX_DELTA_TOKENS="1024",
+        ALPHAGRAD_MAX_DELTA_TOKENS="256",
         ALPHAGRAD_DELTA_OVERFLOW="clip",
     )
 
