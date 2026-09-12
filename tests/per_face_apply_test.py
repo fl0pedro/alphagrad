@@ -143,6 +143,23 @@ def test_env_exposes_the_per_face_switch():
 # --------------------------------------------------------------------------- #
 
 def _run_env_import(extra_env):
+    """Import ``env`` in a FRESH interpreter with EXACTLY ``extra_env`` of the
+    project's own knobs set, and report what it froze.
+
+    THE CHILD ENVIRONMENT IS SCRUBBED OF EVERY ``ALPHAGRAD_*`` VARIABLE, and
+    that is the whole point of the helper rather than an optimisation. These
+    cases assert what ``env.py`` freezes FROM A GIVEN CONFIGURATION, including
+    the empty one ("the default is 32768"). It used to pass ``dict(os.environ)``
+    through, so under ``pytest tests/`` the child inherited whatever a module
+    collected earlier had assigned at ITS import -- pytest imports every test
+    module before running the first test, and ``tests/delta_obs_emission_test``
+    set ALPHAGRAD_MAX_DELTA_TOKENS=1024 there. The default case then measured
+    1024, asserted 32768 and failed; run alone, nothing had assigned it and the
+    same case passed. A test of a default must not be able to inherit one.
+
+    ``JAX_*`` / ``XLA_*`` / ``CUDA_*`` and PATH-like variables are kept: the
+    child still has to find an interpreter and a CPU backend.
+    """
     import os
     import subprocess
     import sys
@@ -151,9 +168,9 @@ def _run_env_import(extra_env):
         "LEGACY_STREAM_TOKENS, MAX_DELTA_TOKENS;"
         "print(LEGACY_STREAM_TOKENS, MAX_DELTA_TOKENS)"
     )
-    env = dict(os.environ)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("ALPHAGRAD_")}
     env["ALPHAGRAD_DISABLE_RESOURCE_MONITOR"] = "1"
-    env.pop("ALPHAGRAD_MAX_TOKENS", None)
     env.update(extra_env)
     return subprocess.run([sys.executable, "-c", src], capture_output=True,
                           text=True, env=env, timeout=300)

@@ -32,11 +32,17 @@ import os
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
-os.environ["ALPHAGRAD_QUALITY_METRIC"] = "none"
-os.environ["ALPHAGRAD_DIRECT_MEASURE"] = "1"
-os.environ["ALPHAGRAD_COST_FORM"] = "paired-log"
-os.environ.pop("ALPHAGRAD_PLAN_LOG", None)
-os.environ.pop("ALPHAGRAD_MEM_CHANNEL", None)
+# THE MEASUREMENT CONFIGURATION IS DECLARED IN A FIXTURE, NOT HERE -- see
+# ``_the_configuration_this_module_measures_under`` below.
+#
+# It used to be five ``os.environ[...]`` statements at module scope, and
+# ALPHAGRAD_COST_FORM="paired-log" among them was a process-wide mutation
+# performed AT COLLECTION TIME: ``pytest tests/`` imports every test module
+# before it runs the first test, so this line put the whole run into the
+# paired-log cost form. ``tests/mem_channel_test.py`` (collected four files
+# earlier, m < p) and ``tests/test_all_cost_channels.py`` both measure under
+# the ABSOLUTE form and both read slot 5 directly; they went red for this, and
+# passed the moment they were run without this module in the same process.
 
 import jax                                                      # noqa: E402
 import jax.numpy as jnp                                         # noqa: E402
@@ -105,6 +111,24 @@ def _run_plan(env, order, skip_everything=False, stop_after=None):
 
 def _rev_order(env):
     return sorted(int(x) for x in np.asarray(env.valid_vertices))[::-1]
+
+
+@pytest.fixture(autouse=True)
+def _the_configuration_this_module_measures_under(monkeypatch):
+    """THE PAIRED-LOG COST FORM, in force for this module's tests only.
+
+    ``ALPHAGRAD_COST_FORM`` is re-read on every measurement, so a fixture is
+    enough -- and a module-scope assignment is actively wrong: it puts the whole
+    pytest process into the paired-log form from COLLECTION onwards, and the
+    modules that measure the ABSOLUTE form (tests/mem_channel_test.py,
+    tests/test_all_cost_channels.py) then read slot 5 -- which they document as
+    the temp -- as a log-difference against rev-exact.
+    """
+    monkeypatch.setenv("ALPHAGRAD_QUALITY_METRIC", "none")
+    monkeypatch.setenv("ALPHAGRAD_DIRECT_MEASURE", "1")
+    monkeypatch.setenv("ALPHAGRAD_COST_FORM", "paired-log")
+    monkeypatch.delenv("ALPHAGRAD_PLAN_LOG", raising=False)
+    monkeypatch.delenv("ALPHAGRAD_MEM_CHANNEL", raising=False)
 
 
 @pytest.fixture(autouse=True)
