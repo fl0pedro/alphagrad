@@ -221,8 +221,15 @@ def _measurement_reason(nodeid: str) -> str | None:
 
 
 _REP_PARAM = "__exhaustive_rep"
-# base nodeid -> [outcome, ...] for the call phase of every repeat.
-_rep_outcomes: dict[str, list[str]] = {}
+# base nodeid -> {repeat index: outcome} for the call phase of every repeat.
+# The INDEX is kept, not just the count: repeat 0 is the only COLD one (first
+# execution in the process, cold compile cache, cold allocator) and a
+# cold-start effect would otherwise be averaged away. Measured 2026-09-12
+# (job 65008): measure_instrument_test's flake fired on repeat 0 and on no
+# other, 1 of 60, and the latency-drift test likewise fired only on repeat 0.
+# That is WHY a within-process repeat rate UNDERSTATES what a suite run sees:
+# a suite run executes each test exactly once, always cold.
+_rep_outcomes: dict[str, dict[int, str]] = {}
 
 
 def generate_tests(metafunc):
@@ -239,10 +246,15 @@ def generate_tests(metafunc):
     metafunc.parametrize(_REP_PARAM, range(_repeats()))
 
 
-def _base_nodeid(nodeid: str) -> str:
-    if _REP_PARAM not in nodeid and not nodeid.endswith("]"):
-        return nodeid
-    return nodeid.split("[")[0] if "[" in nodeid else nodeid
+def _split_nodeid(nodeid: str) -> tuple[str, int]:
+    """``(base nodeid, repeat index)``; index -1 when not one of our repeats."""
+    if "[" not in nodeid or not nodeid.endswith("]"):
+        return nodeid, -1
+    base, _, tail = nodeid.partition("[")
+    try:
+        return base, int(tail[:-1])
+    except ValueError:
+        return base, -1
 
 
 def runtest_logreport(report):
@@ -250,11 +262,13 @@ def runtest_logreport(report):
         return
     if _measurement_reason(report.nodeid) is None:
         return
-    if report.when == "call":
-        _rep_outcomes.setdefault(_base_nodeid(report.nodeid), []).append(
-            report.outcome)
-    elif report.when == "setup" and report.outcome == "failed":
-        _rep_outcomes.setdefault(_base_nodeid(report.nodeid), []).append("failed")
+    if report.when == "call" or (report.when == "setup"
+                                and report.outcome == "failed"):
+        base, rep = _split_nodeid(report.nodeid)
+        slot = _rep_outcomes.setdefault(base, {})
+        key = rep if rep >= 0 else -(len(slot) + 1)
+        if slot.get(key) != "failed":        # a setup failure wins over a skip
+            slot[key] = "failed" if report.outcome == "failed" else report.outcome
 
 
 def _exhaustive_summary(write_line, section):
@@ -268,20 +282,43 @@ def _exhaustive_summary(write_line, section):
     write_line("EXHAUSTIVE_REPEATS=%d. A rate, not a pass/fail: these tests "
                "assert on a clock or on measured bytes, so one run is one "
                "draw (ticket dsnn-3qm.75)." % _repeats())
-    worst = 0.0
+    worst_noise = 0.0
+    deterministic = []
     for nodeid in sorted(_rep_outcomes):
         outs = _rep_outcomes[nodeid]
-        nfail = sum(1 for o in outs if o == "failed")
-        rate = nfail / len(outs)
-        worst = max(worst, rate)
-        write_line("  %5.1f%%  %3d/%-3d failed   %s"
-                   % (100.0 * rate, nfail, len(outs), nodeid))
-        write_line("           reason declared: %s"
-                   % _measurement_reason(nodeid))
+        fails = sorted(k for k, v in outs.items() if v == "failed")
+        rate = len(fails) / max(len(outs), 1)
+        if len(fails) == len(outs) and len(outs) > 1:
+            deterministic.append(nodeid)
+            tag = "ALWAYS"
+        else:
+            worst_noise = max(worst_noise, rate)
+            tag = "%5.1f%%" % (100.0 * rate)
+        write_line("  %-7s %3d/%-3d failed   %s"
+                   % (tag, len(fails), len(outs), nodeid))
+        write_line("           reason declared: %s" % _measurement_reason(nodeid))
+        if fails and len(fails) != len(outs):
+            write_line("           failing repeats: %s%s"
+                       % (fails[:12], "" if 0 not in fails else
+                          "   <-- includes repeat 0, the only COLD one"))
     write_line("")
-    write_line("NOISE FLOOR: the worst per-test failure rate above is %.1f%%. "
-               "A suite count is therefore only reproducible to within the "
-               "tests on this list." % (100.0 * worst))
+    if deterministic:
+        write_line("NOT NOISE -- these failed EVERY repeat, so they are "
+                   "deterministic for this selection, not random:")
+        for nodeid in deterministic:
+            write_line("    %s" % nodeid)
+        write_line("  A test that fails every repeat of a SUBSET and passes in "
+                   "the full suite is order- or configuration-dependent, which "
+                   "is a different bug from noise. Re-run it under the full "
+                   "suite before calling it broken.")
+        write_line("")
+    write_line("NOISE FLOOR: the worst NON-deterministic per-test failure rate "
+               "above is %.1f%%. A suite count is reproducible only to within "
+               "the tests on this list." % (100.0 * worst_noise))
+    write_line("CAVEAT, measured: a within-process repeat is WARM after repeat "
+               "0, and the flakes observed so far fire on repeat 0 only -- so "
+               "this rate is a LOWER BOUND on what a suite run (one cold "
+               "execution per test) sees.")
 
 
 

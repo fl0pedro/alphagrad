@@ -34,11 +34,19 @@ sides of the fix14 diff, in 48 s. Use `pytest`.
 
 ```
 EXHAUSTIVE=1 pytest                       # repeats the measurement tests 50x, rest once
-EXHAUSTIVE=1 EXHAUSTIVE_REPEATS=100 pytest tests/mem_channel_test.py \
-                                          tests/paired_log_reward_test.py \
-                                          tests/measure_instrument_test.py \
-                                          tests/test_all_cost_channels.py
+EXHAUSTIVE=1 EXHAUSTIVE_REPEATS=100 pytest
 ```
+
+**Run it over the WHOLE suite, not over a hand-picked subset.** Measured
+2026-09-12 (job 65008): `tests/landscape_map_sweep_test.py::test_measure_singleton_and_stacks`
+fails **60 of 60** repeats when its module is run alone and passes in the full
+suite, and both tests in `tests/test_all_cost_channels.py` fail **60 of 60** in
+a five-module subset and **0 of 60** with their module alone. Those are
+order/configuration dependencies, not noise — the same class of bug
+`tests/conftest.py` documents, pointing the other way: the test needs a
+configuration some earlier module happens to establish. A subset is a different
+experiment, and the summary now says `ALWAYS` rather than a rate so the two
+cannot be confused.
 
 Some tests here assert on a **wall-clock latency**, on a **drift ratio between
 two adjacent timings**, or on a **measured byte count**. Their result is a draw
@@ -57,6 +65,15 @@ check that the remainder is deterministic.
 `MEASUREMENT_TESTS` is a **declaration with a reason per entry**, derived by
 reading every assertion in both roots. A test that starts asserting on a clock
 belongs in it; one that stops should leave.
+
+**What a within-process rate can and cannot tell you.** Repeat 0 is the only
+*cold* execution — cold compile cache, cold allocator, first trace. Measured
+2026-09-12: both genuine flakes fired on **repeat 0 and on no other**
+(`measure_instrument_test` 1 of 60 with its module alone;
+`paired_log_reward_test`'s latency-drift test 1 of 60 in the five-module set).
+A suite run executes each test exactly once, always cold, so the rate this mode
+prints is a **lower bound** on what a suite run sees. The summary prints the
+failing repeat indices for exactly this reason, and says so.
 
 
 The one that matters most is **sampling == replay**, i.e. the PPO ratio is
