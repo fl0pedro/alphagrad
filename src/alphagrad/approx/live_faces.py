@@ -1444,7 +1444,7 @@ class LiveFaceStream:
 
     def face_slot_decisions(self, order, specs, n, vertex, draw, *,
                             skips=None, face_rows_hist=None,
-                            face_skips_hist=None, approx: bool = True):
+                            face_skips_hist=None):
         """:meth:`decide_faces` against the PREFIX tokenizer of step ``n``.
 
         The tokenizer comes from :meth:`_tokenizer_at`, so the decisions are
@@ -1474,8 +1474,7 @@ class LiveFaceStream:
                 pair=np.zeros((F, S, N, N), np.float32),
                 comp=np.zeros((F, S, N), np.float32),
                 nout=np.zeros((F, S), np.int32), n_faces=np.int32(0))
-        return self.decide_faces(tk, vertex, keys, draw, skips=skips,
-                                 approx=approx)
+        return self.decide_faces(tk, vertex, keys, draw, skips=skips)
 
     # -- the EXACT per-vertex mask, NO speculative elimination (.59, #77) ---
     #

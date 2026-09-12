@@ -76,6 +76,7 @@ from graphax.core import (
     prepend_post_transforms,
     unload_post_transforms,
 )
+from graphax.sparse.ops.matmul import scale_by_scalar
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +99,12 @@ def _contract(post_val, pre_val):
     if need:
         if _is_scalar_st(_post_val) and _is_scalar_st(_pre_val):
             edge_outval = _post_val * _pre_val
+        elif _is_scalar_st(_post_val) or _is_scalar_st(_pre_val):
+            # ONE rank-0 edge is a SCALE, not a matmul; matmul raises on it
+            # (ScalarMatmul, dsnn-3qm.68). Same routing as core._eliminate_vertex.
+            _sc, _tn = ((_post_val, _pre_val) if _is_scalar_st(_post_val)
+                        else (_pre_val, _post_val))
+            edge_outval = scale_by_scalar(_tn, _sc)
         else:
             edge_outval = _post_val @ _pre_val
     elif pre_val.val is not None:
