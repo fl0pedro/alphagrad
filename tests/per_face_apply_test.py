@@ -150,12 +150,15 @@ def _run_env_import(extra_env):
     that is the whole point of the helper rather than an optimisation. These
     cases assert what ``env.py`` freezes FROM A GIVEN CONFIGURATION, including
     the empty one ("the default is 32768"). It used to pass ``dict(os.environ)``
-    through, so under ``pytest tests/`` the child inherited whatever a module
-    collected earlier had assigned at ITS import -- pytest imports every test
-    module before running the first test, and ``tests/delta_obs_emission_test``
-    set ALPHAGRAD_MAX_DELTA_TOKENS=1024 there. The default case then measured
-    1024, asserted 32768 and failed; run alone, nothing had assigned it and the
-    same case passed. A test of a default must not be able to inherit one.
+    through, so under ``pytest tests/`` the child inherited whatever any module
+    had assigned at ITS import: pytest imports every test module before running
+    the first test, so by the time this test RUNS the variable holds the last
+    such write. Two modules wrote it -- ``delta_obs_emission_test`` 1024 and
+    ``policy_regression_gate.py`` 4096 -- and the value the child actually
+    inherited was **4096** (measured: job 64984 E6 printed the post-collection
+    environment). Either value makes the default case assert 32768 against a
+    smaller number and fail. Run alone, nothing had assigned it and the same
+    case passed. A test of a default must not be able to inherit one.
 
     ``JAX_*`` / ``XLA_*`` / ``CUDA_*`` and PATH-like variables are kept: the
     child still has to find an interpreter and a CPU backend.

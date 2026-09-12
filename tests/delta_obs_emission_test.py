@@ -58,8 +58,10 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 #     race.
 #  2. THEY LEAKED. The variables stayed set in the shared process for the rest
 #     of the run, so ``tests/per_face_apply_test.py``, whose subprocess probe
-#     asserts "the default MAX_DELTA_TOKENS is 32768", inherited 1024 and
-#     failed too.
+#     asserts "the default MAX_DELTA_TOKENS is 32768", inherited a pinned value
+#     and failed too. (Measured: by the end of collection the variable read
+#     4096, because ``tests/policy_regression_gate.py`` wrote over this 1024
+#     later -- job 64984 E6. Either value breaks a probe of the default.)
 #
 # The clip path is still exercised on every run -- see
 # ``test_the_clip_is_exercised_at_the_old_budget_in_its_own_interpreter``,

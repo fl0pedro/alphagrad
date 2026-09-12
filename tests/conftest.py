@@ -20,10 +20,28 @@ configuration"):
     imported it first), so the pin was a DEAD WRITE and the module's own
     "this graph no longer exercises the clip" guard fired; and the variable
     stayed set, so ``tests/per_face_apply_test.py``'s subprocess probe for
-    "the default is 32768" inherited 1024 and failed too. One + one failures.
+    "the default is 32768" inherited a pinned value (4096 by the end of
+    collection, ``policy_regression_gate.py`` having written over the 1024)
+    and failed too. One + one failures.
   * ``tests/policy_regression_gate_test.py`` imported a module that pins ten
     ALPHAGRAD_* variables at import, then ran a BIT-IDENTICAL comparison under
-    a configuration those pins had failed to establish. One failure.
+    a configuration those pins had failed to establish. The gate's own diff
+    names the field: ``window: golden=4096 live=32768``, which IS
+    ALPHAGRAD_MAX_DELTA_TOKENS. One failure.
+  * ``tests/face_actions_env_test.py`` (2): both of its assertions read the
+    quality slot, and ``mem_channel_test`` / ``paired_log_reward_test`` set
+    ALPHAGRAD_QUALITY_METRIC=none at module scope (f < m < p), so the channel
+    was off and the slot read 0.0.
+
+WHAT THIS GUARD DOES NOT CATCH, stated so nobody trusts it further than it goes:
+a UNILATERAL claim. ALPHAGRAD_QUALITY_METRIC=none was written by two modules with
+the SAME value, so there is no conflict to see, and the module it broke
+(face_actions_env_test) never declared that it wanted the default. Flagging every
+collection-time write instead would flag the ~20 modules that use
+``os.environ.setdefault`` as a legitimate "I need this if nobody has spoken"
+before importing env. The remedy for the unilateral case is the other half of
+this change: a module whose measurement depends on a knob DECLARES it in a
+fixture, and face_actions_env_test now does.
 
 Every one of those modules passed when run alone. The aggregate suite number
 never said why.
