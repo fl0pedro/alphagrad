@@ -51,7 +51,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 #
 #  1. THEY DID NOT TAKE. Any module collected earlier (a < d) imported
 #     alphagrad first and froze the defaults, 32768 and "raise". The diag block
-#     on this graph is 2190 tokens, so it never clipped, and
+#     on the old graph was 2190 tokens, so it never clipped, and
 #     ``test_base_plus_deltas_reconstructs_the_stream[True]`` died on its own
 #     "this graph no longer exercises the MAX_DELTA_TOKENS clip" guard -- the
 #     guard working exactly as designed, on a pin that had silently lost a
@@ -94,7 +94,13 @@ def _append_only(monkeypatch):
 
 
 def _fn(x, y):
-    return jnp.tanh(jnp.sin(x) * y) + jnp.exp(jnp.sin(x) * y)
+    # A matmul, not an elementwise product: every Jacobian of the old graph
+    # was a diagonal pair, and the lazy engine (dsnn-3qm.28.2, .71) keeps it
+    # one through the contractions, so no DIAG is legal anywhere on it and the
+    # "deltas differ" claim below had nothing to apply. The old engine
+    # densified the contracted edge, which is what made a DIAG legal there.
+    # ``sin(x) @ y`` has a dense (4,4 | 4,4) Jacobian at the matmul.
+    return jnp.tanh(jnp.sin(x) @ y) + jnp.exp(jnp.sin(x) @ y)
 
 
 ARGS = (jnp.ones((4, 4)) * 0.5, jnp.ones((4, 4)) * 0.4)
@@ -336,7 +342,7 @@ def test_the_clip_is_exercised_at_the_old_budget_in_its_own_interpreter():
     the one place a pin can still work. A fresh interpreter with
     ALPHAGRAD_MAX_DELTA_TOKENS=1024 and ALPHAGRAD_DELTA_OVERFLOW=clip freezes
     those constants before anything imports ``env``, so this graph's
-    2190-token diag block genuinely overflows and ``require_clip`` fails if it
+    diag block genuinely overflows and ``require_clip`` fails if it
     ever stops doing so. The shared-process case above runs the same
     reconstruction at whatever budget the process happens to hold.
     """
