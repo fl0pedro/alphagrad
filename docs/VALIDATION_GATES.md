@@ -27,8 +27,43 @@ sample"*. Until 2026-09-12 every number this campaign quoted came from `pytest
 tests/`, which overrides that declaration — including the `14 pre-existing
 failures` baseline. The 89 unseen tests include `test_env_callback.py` (the
 measurement callback) and `test_jacobian_equals_grad.py` (the gradient oracle
-the grad-cosine channel rests on). Measured 2026-09-12: all 89 pass on both
-sides of the fix14 diff, in 48 s. Use `pytest`.
+the grad-cosine channel rests on). Use `pytest`.
+
+**It is not free, and here is the bill.** Measured 2026-09-12 on one node each
+side (jobs 65009 / 65012, `pgi15-cpu1` / `pgi15-cpu2`, same command both sides):
+
+| command | `wip/fix14-20260912` | `wip/lazycmp-20260912` |
+|---|---|---|
+| `pytest tests/` | 0 failed, 1332 passed | 0 failed, 1354 passed |
+| `pytest` (both roots) | **1 failed**, 1420 passed | **1 failed**, 1442 passed |
+
+The one failure is the same test on both sides —
+`tests/landscape_map_sweep_test.py::test_measure_singleton_and_stacks` — so it is
+**pre-existing and caused by turning the second root on**, not by any change. It
+passes with its module alone (4 of 4 runs on each side) and 0 of 60 repeats in a
+five-module subset, so it is the configuration-dependency class this file's
+companion `conftest` essay documents: a module in the second root leaves a
+configuration that the first root's measurement then runs under. The earlier
+claim that "all 89 pass, zero new failures" was measured on the second root
+**alone**, which is a different experiment from both roots in one process.
+
+**And the root `conftest.py` catches the conflict that does it, which the guard
+under `tests/` could not see:**
+
+```
+[config] CROSS-MODULE CONFIGURATION CONFLICT AT COLLECTION TIME.
+  ALPHAGRAD_INCREMENTAL_TOKENS
+      tests/carry_heads_remat_equiv_test.py left it '1'
+      src/alphagrad/approx/tests/test_env_callback.py left it '0'
+```
+
+One module in each root, different values, filename order decides. That section
+is absent from the base run of the same command. Whether this specific variable
+is what breaks `landscape_map_sweep_test` is **not established** — it is the only
+cross-root conflict the guard reports, which makes it the first thing to check.
+Note that the conflict gate fails the run on its own, so `pytest` exits 1 on this
+branch even when no test fails; that is the gate working as designed, and the
+remedy is to fix the conflict, not to switch the command back.
 
 ### `EXHAUSTIVE=1` — the suite's count is a DRAW, and this measures the spread
 
