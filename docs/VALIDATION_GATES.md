@@ -66,14 +66,24 @@ check that the remainder is deterministic.
 reading every assertion in both roots. A test that starts asserting on a clock
 belongs in it; one that stops should leave.
 
-**What a within-process rate can and cannot tell you.** Repeat 0 is the only
-*cold* execution — cold compile cache, cold allocator, first trace. Measured
-2026-09-12: both genuine flakes fired on **repeat 0 and on no other**
-(`measure_instrument_test` 1 of 60 with its module alone;
-`paired_log_reward_test`'s latency-drift test 1 of 60 in the five-module set).
-A suite run executes each test exactly once, always cold, so the rate this mode
-prints is a **lower bound** on what a suite run sees. The summary prints the
-failing repeat indices for exactly this reason, and says so.
+**A rate without a node name means nothing.** Measured 2026-09-12, same
+commits, same command, 60 repeats, `JAX_PLATFORMS=cpu` on both:
+
+| node | `measure_instrument_test::test_reference_matches...` | `paired_log_reward_test::...drift_on_latency` |
+|---|---|---|
+| `pgi15-cpu2` (job 65008) | 2 / 60 = **3.3 %** | 1 / 60 = **1.7 %** (repeat 0) |
+| `pgi15-gpu17` CPUs (job 65019, load 0.21) | 7 / 60 = **11.7 %** (repeats 18, 22, 39, 42, 45, 46, 51) | **0 / 60** |
+
+A 3.5x difference for the same test on the same code, from the machine alone.
+Record the node with every rate, and run all repeats of a given test on ONE node
+— otherwise you are measuring node-to-node variation and calling it flakiness.
+
+**Repeat 0 is the only cold execution** — cold compile cache, cold allocator,
+first trace — and a suite run executes each test exactly once, always cold, so a
+warm-sensitive test's rate here is a **lower bound**. Whether a flake prefers
+repeat 0 is itself machine-dependent: it did on `pgi15-cpu2` and did not on
+`pgi15-gpu17`. That is why the summary prints the failing **indices** rather than
+only a rate.
 
 
 The one that matters most is **sampling == replay**, i.e. the PPO ratio is

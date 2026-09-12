@@ -226,13 +226,19 @@ def _measurement_reason(nodeid: str) -> str | None:
 
 _REP_PARAM = "__exhaustive_rep"
 # base nodeid -> {repeat index: outcome} for the call phase of every repeat.
-# The INDEX is kept, not just the count: repeat 0 is the only COLD one (first
-# execution in the process, cold compile cache, cold allocator) and a
-# cold-start effect would otherwise be averaged away. Measured 2026-09-12
-# (job 65008): measure_instrument_test's flake fired on repeat 0 and on no
-# other, 1 of 60, and the latency-drift test likewise fired only on repeat 0.
-# That is WHY a within-process repeat rate UNDERSTATES what a suite run sees:
-# a suite run executes each test exactly once, always cold.
+# The INDEX is kept, not just the count, because repeat 0 is the only COLD one
+# (first execution in the process: cold compile cache, cold allocator, first
+# trace) and a cold-start effect would otherwise be averaged away. Whether a
+# given flake prefers repeat 0 is itself MACHINE-DEPENDENT and was measured both
+# ways on 2026-09-12:
+#   pgi15-cpu2  (job 65008): measure_instrument 2/60, paired_log drift 1/60, and
+#               the drift firing was on repeat 0.
+#   pgi15-gpu17 (job 65019, same commits, same command, CPU backend, load 0.21):
+#               measure_instrument 7/60 -- repeats 18, 22, 39, 42, 45, 46, 51,
+#               NOT repeat 0 -- and the drift test 0/60.
+# So: 3.3% vs 11.7% for the SAME test on the SAME code, a 3.5x difference from
+# the machine alone, and the cold-start reading holds on one node and not the
+# other. A rate reported without its node name means nothing.
 _rep_outcomes: dict[str, dict[int, str]] = {}
 
 
@@ -319,10 +325,17 @@ def _exhaustive_summary(write_line, section):
     write_line("NOISE FLOOR: the worst NON-deterministic per-test failure rate "
                "above is %.1f%%. A suite count is reproducible only to within "
                "the tests on this list." % (100.0 * worst_noise))
-    write_line("CAVEAT, measured: a within-process repeat is WARM after repeat "
-               "0, and the flakes observed so far fire on repeat 0 only -- so "
-               "this rate is a LOWER BOUND on what a suite run (one cold "
-               "execution per test) sees.")
+    write_line("CAVEAT 1, measured: THIS RATE IS A PROPERTY OF THIS MACHINE. "
+               "The same test, same commit, same command gave 3.3%% on "
+               "pgi15-cpu2 and 11.7%% on pgi15-gpu17's CPUs (jobs 65008 / "
+               "65019, 2026-09-12). Report the node with the rate.")
+    write_line("CAVEAT 2: repeat 0 is the only COLD execution (cold compile "
+               "cache, cold allocator, first trace) and a suite run executes "
+               "each test exactly once, always cold -- so a warm-sensitive "
+               "test's rate here is a LOWER BOUND. Whether a flake prefers "
+               "repeat 0 is itself machine-dependent (it did on pgi15-cpu2, "
+               "it did not on pgi15-gpu17), so the indices above are printed "
+               "rather than summarised.")
 
 
 
