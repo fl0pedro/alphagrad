@@ -109,6 +109,15 @@ def _frozen_at_env_import() -> frozenset[str]:
     # is imported, so an import here would make THIS FILE the first importer
     # and freeze MAX_DELTA_TOKENS / MAX_FACES from the bare job environment,
     # taking the race away from the modules that currently win it.
+    #
+    # find_spec does import the PARENT packages in order to read their
+    # __path__, so it is only safe because of two facts about this tree, both
+    # checked: ``src/alphagrad/__init__.py`` imports nothing eagerly (its
+    # vertexgame exports are behind a module __getattr__, deliberately, so that
+    # importing alphagrad does not pull in JAX), and ``src/alphagrad/approx/``
+    # has NO ``__init__.py`` at all -- it is a namespace package, so resolving
+    # ``alphagrad.approx`` executes no code. If either ever changes, this must
+    # become a plain path lookup.
     try:
         spec = importlib.util.find_spec("alphagrad.approx.env")
         path = pathlib.Path(spec.origin)
