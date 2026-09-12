@@ -347,10 +347,7 @@ def test_two_op_form_keeps_the_new_slot_hook_OFF_the_old_edge():
     so one row decoded in two different frames and the mask answered for one of
     them (finding 72, fault 1).
     """
-    try:
-        from graphax.sparse.ops.join import FaceJoinPolicy
-    except ImportError:
-        FaceJoinPolicy = ()
+    from graphax.sparse.ops.join import FaceJoinPolicy
     closed = _closed(_chain, _ARGS)
     config = SimpleNamespace(jaxpr=closed.jaxpr)
     ij, keys, key, _st = _x_face(closed, _ARGS)

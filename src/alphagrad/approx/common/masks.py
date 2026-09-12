@@ -2118,6 +2118,17 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
                     live = _alt
                     _bump(f"repaired_{_kind}")
             try:
+                # WHAT A NO-OP IS, in one sentence: the hook hands back the
+                # operand it received. The apply functions return their input
+                # object unchanged when the request changes nothing
+                # (core._micro_applied documents the identity check as the
+                # reliable signal; every real micro-action builds a new
+                # SparseTensor), so ``cur is prev`` after the apply is the
+                # authoritative test (ticket dsnn-3qm.73: a Reduce on the
+                # 'new' slot reported APPLIED while the jaxpr stayed
+                # byte-identical). ``rule_is_idempotent_noop`` above is the
+                # a-priori form of the SAME question, consulted only where
+                # the mask forbade applying; it never overrides this one.
                 prev = cur
                 if isinstance(live, Diag):
                     cur = apply_diag(cur, live)
@@ -2134,7 +2145,11 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
                     _bump(f"skipped_{_kind}")
                     continue
                 if cur is prev:
+                    # Same three counters as the mask-rejected no-op above, so
+                    # skipped_{kind}_noop is a subset of skipped_{kind} at
+                    # both sites and applied_fraction has one denominator.
                     _bump("skipped")
+                    _bump(f"skipped_{_kind}")
                     _bump(f"skipped_{_kind}_noop")
                 else:
                     _bump("applied")
