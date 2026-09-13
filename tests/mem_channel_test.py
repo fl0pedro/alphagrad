@@ -219,8 +219,13 @@ def test_watermark_minus_temp_is_near_constant_across_plans(channel):
     # Finding 41: 72 B of gap spread over 58,309x of temp on TLM. On this
     # toy the CPU substitution puts (output + argument) bytes in the gap,
     # which only moves when XLA folds an output to a constant (the
-    # skip-everything plan): 276 B against a 33 kB temp spread.
-    assert gap_spread <= 0.05 * temp_spread, (gap_spread, temp_spread)
+    # skip-everything plan). So: rev and forward share ONE gap exactly, and
+    # the folded plan's gap is smaller by at most those bytes. The old bound
+    # (5% of the temp spread) assumed forward mode densified a 33 kB temp on
+    # this toy; the lazy engine (dsnn-3qm.28.2) leaves 768 B, which made the
+    # bound tighter than the instrument it was checking.
+    assert gaps[0] == gaps[2], gaps
+    assert 0.0 <= gaps[0] - gaps[1] <= float(_X.nbytes + 4), (gaps, _X.nbytes)
     summary = envmod.mem_parity_summary(recs)
     assert summary["n"] == 3 and summary["n_paired"] == 3
     assert summary["gap_max_bytes"] == float(gaps.max())
