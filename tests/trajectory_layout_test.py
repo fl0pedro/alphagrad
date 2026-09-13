@@ -17,8 +17,26 @@ or falls on.
    shows why: face f's chunk is face f-1's approximation echo followed by
    face f's own contraction, so the concatenation of a vertex's chunks stops
    at the last face's contraction and the last face's approximation echo --
-   which IS in the step emission -- is in no chunk. The stored buffer is a
-   strict PREFIX of the emission, with its own length and its own padding.
+   which IS in the step emission -- is in no chunk. The stored buffer has its
+   own length and its own padding.
+
+   WHICH DECISION ACTUALLY EMITS AN ECHO, and why the old form of that test
+   could never find one. graphax writes an ``approx`` block only when
+   ``core._apply_face_transform`` records a micro-action: a literal
+   ``Diag`` / ``Compress`` / ``Quant``, or a CHOOSER callable that returns
+   one. alphagrad installs neither. ``env.make_slot_frame_hook`` is a plain
+   tensor-returning callable, so graphax takes the ``out = _chosen`` branch,
+   applies the transform and calls ``_record_micro`` for nobody -- the face
+   sink gets no record and ``last_face_segments`` reports ``split == end``.
+   So NO (vertex, slot, rule) triple on ANY graph can put an echo into a
+   chunk through the slot wire; the old search was hunting something the
+   engine cannot produce, which is why jobs 65344/65346 came back empty and
+   why probe 65347 finds head == 0 even for rows that visibly change the
+   emission. The one face decision that DOES emit an approximation block on
+   this path is the SKIP channel: ``face_skips[f] == 1`` becomes
+   ``graphax.SKIP_FACE``, which ``core._eliminate_vertex`` records directly
+   as ``approx SKIP {}``. The test below therefore decides with SKIP, and
+   reads the echo it expects off the emission env's OWN builder produces.
 
 3. NARROWER ID DTYPES (NOT landed). Token ids do not fit in uint8 at the
    vocabulary the runs use, and the delta count rides in slot 0 of the SAME
@@ -151,6 +169,32 @@ def _perceptron():
     return cj.jaxpr, cj.literals, args
 
 
+def _reference_step(jaxpr, argnums, consts, args, vertex, rows, skips,
+                    vocab=512):
+    """``(tokens, [(start, split, end)])`` of ONE vertex's elimination.
+
+    Built through ``env._face_dict_for_vertex`` -- THE builder the measurement
+    and ``LiveFaceStream._decided`` both use -- so this reference carries the
+    same transforms the stream replays, and the echo it reports is graphax's
+    own, not a re-derivation. ``[split:end]`` of a segment IS the face's
+    approximation part (``IncrementalPathTokenizer.last_face_segments``).
+    """
+    from types import SimpleNamespace
+
+    from graphax import IncrementalPathTokenizer
+
+    from alphagrad.approx.env import _face_dict_for_vertex
+
+    ref = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
+                                   vocab_size=vocab)
+    ref.base_tokens()
+    keys = list(ref.ij.faces(int(vertex)))
+    ft = _face_dict_for_vertex(SimpleNamespace(jaxpr=jaxpr), ref.ij,
+                               int(vertex), rows, skips, keys=keys)
+    toks = [int(t) for t in ref.eliminate(int(vertex), (), ft)]
+    return toks, ref.last_face_segments()
+
+
 def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own():
     """THE REASON `face_delta_tokens` IS NOT THE NEXT STEP'S `delta_tokens`.
 
@@ -158,94 +202,128 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
     followed by face ``f``'s own contraction, and reports the echo's length as
     ``head``. So every face's echo is carried by its SUCCESSOR's chunk, and
     the last face of a vertex has no successor: its echo is in the step's
-    emission and in none of the stored chunks. The stored buffer is therefore
-    a strict prefix of the emission, shorter by that echo.
+    emission and in none of the stored chunks.
 
-    The (vertex, slot, rule) triple is SEARCHED, not assumed: on a small graph
-    most face slots are handed a scalar, where nothing is legal and the hook
-    correctly skips whatever it is given. Asserting on a fixed triple would
-    pin the fail-soft path and call it a pass.
+    The decision is the SKIP channel, which is the only face decision that
+    emits an approximation block at all on this path (module docstring,
+    section 2) and is legal on every face by construction -- it is a wire bit,
+    not a masked rule, so nothing here can pass by silently skipping a
+    decision the engine refused. The VERTEX is still searched: a vertex with
+    one face has no successor to carry anything.
+
+    Every claim is checked against the emission ``_reference_step`` gets from
+    env's own builder, token for token, so a change in what graphax emits
+    fails here rather than being absorbed.
     """
-    from alphagrad.approx.env import COMPRESS_SENTINEL
+    from alphagrad.approx.env import wire_slots
     from alphagrad.approx.live_faces import LiveFaceStream
 
     jaxpr, consts, args = _perceptron()
     argnums = (2, 3, 4, 5)
     V = len(jaxpr.eqns)
-    MR, F, S = 8, 8, 3
+    MR, F, S = 8, 8, wire_slots()
+    VOCAB = 512
 
-    lfs = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+    lfs = LiveFaceStream(jaxpr, argnums, consts, args, vocab=VOCAB,
                          max_faces=F, max_axes=8, window=8192)
     order = np.zeros((V,), np.int32)
     specs = -np.ones((V, MR, 3), np.int32)
     vspecs = -np.ones((MR, 3), np.int32)
-    rows = -np.ones((F, S, 3), np.int32)
-    skips = np.zeros((F,), np.int32)
+    exact = -np.ones((F, S, 3), np.int32)
+    no_skip = np.zeros((F,), np.int32)
 
-    from graphax.sparse.micro_actions import QUANT_DTYPES
-    from alphagrad.approx.env import QUANT_SENTINEL
+    def _skips(upto):
+        """Faces ``0..upto-1`` skipped, the rest exact -- exactly the prefix
+        ``_decided`` replays when the stream is asked for face ``upto``."""
+        s = np.zeros((F,), np.int32)
+        s[:upto] = 1
+        return s
 
-    # QUANT first: a narrowing cast is legal on almost any float operand,
-    # where a DIAG or COMPRESS needs an axis structure a small graph rarely
-    # has (job 65344 found no echo with DIAG/COMPRESS alone). Index 0 is the
-    # catalog's float32 (an identity cast on a float32 operand, masked
-    # illegal), so start at 1. The wire row index is the CATALOG index.
-    trials = [np.array([QUANT_SENTINEL, k, 0], np.int32)
-              for k in range(1, len(QUANT_DTYPES))]
-    trials += [np.array([COMPRESS_SENTINEL, ax, 0], np.int32)
-               for ax in range(6)]
-    trials += [np.array([i, j, -1], np.int32)
-               for i in range(4) for j in range(4) if i != j]
-
-    found = None
+    vertex, n_faces = None, 0
     for cand in range(1, V + 1):
         lfs._chunks.clear()
-        n_faces = int(lfs.chunk(order, specs, 0, cand, vspecs, rows,
-                                skips, 0)[3])
-        if n_faces < 2:
-            continue
-        lfs._chunks.clear()
-        plain = lfs.chunk(order, specs, 0, cand, vspecs, rows, skips, 1)
-        for slot in range(S):
-            for tr in trials:
-                dec = rows.copy()
-                dec[0, slot] = tr
-                lfs._chunks.clear()
-                got = lfs.chunk(order, specs, 0, cand, vspecs, dec, skips, 1)
-                if int(got[5]) > 0:
-                    found = (cand, slot, tr, plain, got)
-                    break
-            if found:
-                break
-        if found:
+        k = int(lfs.chunk(order, specs, 0, cand, vspecs, exact, no_skip, 0)[3])
+        if k >= 2:
+            vertex, n_faces = cand, k
             break
+    assert vertex is not None, (
+        "no vertex of this graph has two faces, so no face has a successor "
+        "and the echo cannot be read off it")
 
-    assert found is not None, (
-        "no decision on face 0 put an approximation echo into face 1's "
-        "chunk -- this graph no longer exercises the echo, so the prefix "
-        "claim cannot be read off it.")
-    cand, slot, tr, plain, got = found
+    # An EXACT vertex emits no approximation at all: no face has an echo, so
+    # no chunk has a head. This is the control -- without it a head of 0 on
+    # the skipped run could not be told from "the stream never reports one".
+    exact_toks, exact_segs = _reference_step(
+        jaxpr, argnums, consts, args, vertex, exact, no_skip, VOCAB)
+    assert len(exact_segs) == n_faces
+    assert all(sp == e for _s, sp, e in exact_segs), (
+        f"vertex {vertex} emitted an approximation with no decision made: "
+        f"{exact_segs}")
+    for f in range(n_faces):
+        lfs._chunks.clear()
+        assert int(lfs.chunk(order, specs, 0, vertex, vspecs, exact,
+                             no_skip, f)[5]) == 0
 
-    # Face 0's chunk NEVER carries an echo: it has no predecessor.
+    # Now SKIP. Face f's chunk is read with faces 0..f-1 decided and face f
+    # still undecided, so the emission it comes from is `_skips(f)`.
+    heads = []
+    for f in range(n_faces):
+        sk = _skips(f)
+        toks_f, segs_f = _reference_step(
+            jaxpr, argnums, consts, args, vertex, exact, sk, VOCAB)
+        lfs._chunks.clear()
+        tok, _ids, cnt, nf, _ends, head = lfs.chunk(
+            order, specs, 0, vertex, vspecs, exact, sk, f)
+        cnt, head = int(cnt), int(head)
+        assert int(nf) == n_faces
+        assert cnt > 0, (
+            f"face {f} of vertex {vertex} handed back an empty chunk -- the "
+            f"stream fell to its soft-failure path, so nothing below is a "
+            f"statement about the echo. stats={dict(lfs.stats)}")
+        heads.append(head)
+        if f == 0:
+            # No predecessor, so nothing to echo.
+            assert head == 0
+            continue
+        start, split, end = segs_f[f - 1]
+        assert end > split, (
+            f"face {f - 1} of vertex {vertex} was SKIPPED but emitted no "
+            f"approximation block ({segs_f}); graphax no longer records a "
+            f"skip, so this test can say nothing about the echo")
+        assert head == end - split, (
+            f"face {f}'s chunk reports a {head}-token echo against face "
+            f"{f - 1}'s {end - split}-token approximation block")
+        assert [int(t) for t in tok[:head]] == toks_f[split:end], (
+            f"face {f}'s chunk does not OPEN on face {f - 1}'s approximation "
+            f"block")
+        # ... and the rest of the chunk is face f's OWN contraction, which
+        # starts where face f's segment starts.
+        assert [int(t) for t in tok[head:cnt]] == toks_f[
+            segs_f[f][0]:segs_f[f][1]]
+
+    # THE GAP. With every face decided, the emission ends on the LAST face's
+    # approximation block -- and the chunk that would carry it is chunk
+    # `n_faces`, which does not exist.
+    all_toks, all_segs = _reference_step(
+        jaxpr, argnums, consts, args, vertex, exact, _skips(n_faces), VOCAB)
+    last_start, last_split, last_end = all_segs[n_faces - 1]
+    assert last_end > last_split, (
+        "the last face emitted no approximation block, so this vertex cannot "
+        "show the gap")
+    assert last_end == len(all_toks)
     lfs._chunks.clear()
-    dec = rows.copy()
-    dec[0, slot] = tr
-    first = lfs.chunk(order, specs, 0, cand, vspecs, dec, skips, 0)
-    assert int(first[5]) == 0
+    past = lfs.chunk(order, specs, 0, vertex, vspecs, exact,
+                     _skips(n_faces), n_faces)
+    assert int(past[2]) == 0 and int(past[5]) == 0, (
+        "there is a chunk past the last face, so the last face's echo would "
+        "have a carrier after all")
 
-    # Face 1's chunk OPENS on face 0's echo. (Its total is not
-    # `plain + head`: approximating face 0 also changes the operand face 1
-    # contracts, so face 1's own contraction moves too. The echo is the
-    # point, not the arithmetic.)
-    assert int(plain[5]) == 0
-    assert int(got[5]) > 0
-    assert int(got[2]) >= int(got[5])
-
-    # Therefore: the concatenation of every chunk of this vertex reaches the
-    # LAST face's contraction and stops. The last face's own echo -- the same
-    # kind of block that just showed up as `got[5]` tokens -- is emitted by
-    # the env and stored by no chunk. That is the gap that makes
-    # `face_delta_tokens != delta_tokens` of the next step.
+    # Counted: the chunks carry the echoes of faces 0..n-2 and no other. The
+    # last face's echo is emitted and stored by nothing, which is the gap that
+    # makes `face_delta_tokens` a different buffer from the step emission.
+    echoes = [e - sp for _s, sp, e in all_segs]
+    assert heads == [0] + echoes[:-1]
+    assert sum(heads) == sum(echoes) - echoes[-1] < sum(echoes)
 
 
 # --------------------------------------------------------------------------
