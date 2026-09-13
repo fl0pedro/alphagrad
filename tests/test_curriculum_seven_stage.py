@@ -68,9 +68,16 @@ def test_quant_smallest_float_mask():
     op = m["op_type_mask"]
     # QUANT and END are legal; DIAG and COMPRESS blocked.
     assert op.tolist() == [False, False, True, True]
-    # quant_dtype_mask has exactly one True entry at index 13 (float4_e2m1fn).
+    # quant_dtype_mask has exactly one True entry: the narrowest float of
+    # the catalog (a float8 member since the catalog is byte-sized and up).
+    import jax.numpy as jnp
+    from graphax.sparse.micro_actions import QUANT_DTYPES
+    bits = [(jnp.finfo(jnp.dtype(n)).bits, i) for i, n in enumerate(QUANT_DTYPES)
+            if jnp.issubdtype(jnp.dtype(n), jnp.floating)]
+    want = min(bits)[1]
+    assert QUANT_DTYPES[want].startswith("float8"), QUANT_DTYPES[want]
     assert m["quant_dtype_mask"].sum() == 1
-    assert m["quant_dtype_mask"][13]
+    assert m["quant_dtype_mask"][want], (want, QUANT_DTYPES[want])
 
 
 def test_diag_factor_excludes_minus_one():
