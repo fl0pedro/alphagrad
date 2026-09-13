@@ -3485,6 +3485,7 @@ def _grad_cosine_k() -> int:
 
 
 _GRAD_ORACLE_ENV = "ALPHAGRAD_GRAD_ORACLE"
+_GRAD_ORACLE_TOL_ENV = "ALPHAGRAD_GRAD_ORACLE_TOL"
 _GRAD_ORACLE_DONE: set = set()
 _GRAD_ORACLE_STATS = {"checks": 0, "rel_l2_max": 0.0}
 
@@ -3509,13 +3510,16 @@ def grad_oracle() -> str:
 
 
 def _grad_oracle_check(config, compiled_exact, base_args, device, order_key,
-                       *, rel_tol: float = 1e-4):
+                       *, rel_tol: float | None = None):
     """Oracle A: the SAME-ORDER exact gradient (the quality reference of this
     callback) against ``jax.grad`` of the target on the real probe batch, once
     per process and order. Densifying the exact output here is the oracle's
     job, not the reward path's. Raises ``GradientOracleFailure`` when the
     relative L2 distance exceeds ``rel_tol`` (float32 reduction order sits at
-    1e-7..1e-6; a wrong Jacobian sits at 1e-1..1)."""
+    1e-7..1e-3 across different contraction topologies on GPU; a wrong
+    Jacobian sits at 1e-1..1)."""
+    if rel_tol is None:
+        rel_tol = float(os.environ.get(_GRAD_ORACLE_TOL_ENV, "1e-3"))
     if grad_oracle() == "off" or compiled_exact is None:
         return
     key = (tuple(int(v) for v in order_key), str(device))
