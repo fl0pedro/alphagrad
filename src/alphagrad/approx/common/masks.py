@@ -1355,35 +1355,13 @@ class LiveVertexMaskOracle:
         fs = np.asarray(face_skips)
         if not (np.any(fs == 1) or np.any(fr >= 0)):
             return None
-        from graphax import SKIP_FACE
-        from graphax.core import faces_of
-        from alphagrad.approx.env import (
-            MAX_RULES_PER_VERTEX, decode_vertex_rule_specs,
-            face_entry_from_slots, wire_slots_of_rows)
+        from types import SimpleNamespace
+        from alphagrad.approx.env import _face_dict_for_vertex
 
-        keys = faces_of(incr.graph, incr.tgraph, int(vertex), incr.jaxpr)
-        ft: dict = {}
-        for f in range(min(len(keys), fr.shape[0])):
-            if int(fs[f]) == 1:
-                ft[keys[f]] = SKIP_FACE
-                continue
-            slots = []
-            # AS MANY SLOTS AS THE CONFIGURATION HAS (2026-09-11). Looping
-            # FACE_SLOTS would silently drop a learned join row under
-            # --approx-add learned1 / learned2; `wire_slots_of_rows` raises
-            # instead, naming the producer that has not been widened.
-            for s in range(wire_slots_of_rows(fr)):
-                row = [[int(x) for x in fr[f][s]]] + [
-                    [-1, -1, 0]] * (MAX_RULES_PER_VERTEX - 1)
-                try:
-                    rls = decode_vertex_rule_specs(
-                        self.jaxpr, int(vertex), row)
-                except Exception:
-                    rls = ()
-                slots.append(make_live_masked_hook(tuple(rls))
-                             if rls else None)
-            if any(sl is not None for sl in slots):
-                ft[keys[f]] = face_entry_from_slots(slots)
+        # THE builder (env._face_dict_for_vertex): rows decode in each slot
+        # tensor's frame at apply time, as the measurement decodes them.
+        ft = _face_dict_for_vertex(
+            SimpleNamespace(jaxpr=incr.jaxpr), incr, int(vertex), fr, fs)
         return ft or None
 
     @property

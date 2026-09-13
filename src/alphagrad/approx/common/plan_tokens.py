@@ -164,11 +164,8 @@ class PlanTokenizer:
         either way); only the key list the per-face plan is indexed by is. So
         the fix is to index by the enumeration the DECIDING tokenizer used.
         """
-        from alphagrad.approx.env import (
-            MAX_RULES_PER_VERTEX, decode_vertex_rule_specs,
-            face_entry_from_slots, wire_slots_of_rows)
-        from alphagrad.approx.common.masks import make_live_masked_hook
-        from graphax import SKIP_FACE
+        from types import SimpleNamespace
+        from alphagrad.approx.env import _face_dict_for_vertex, wire_slots
 
         if face_rows is None and face_skips is None:
             return None
@@ -176,33 +173,22 @@ class PlanTokenizer:
             keys = list(self.tk.ij.faces(int(vertex)))
         else:
             keys = list(keys)
-        rows = (None if face_rows is None
-                else np.asarray(face_rows, np.int32))
-        skips = (None if face_skips is None
-                 else np.asarray(face_skips, np.int32).reshape(-1))
-        ft: dict = {}
-        for f in range(len(keys)):
-            if skips is not None and f < skips.shape[0] and int(skips[f]) == 1:
-                ft[keys[f]] = SKIP_FACE
-                continue
-            if rows is None or f >= rows.shape[0]:
-                continue
-            slots = []
-            # AS MANY SLOTS AS THE CONFIGURATION HAS (2026-09-11). Looping
-            # FACE_SLOTS would silently drop a learned join row under
-            # --approx-add learned1 / learned2; `wire_slots_of_rows` raises
-            # instead, naming the producer that has not been widened.
-            for s in range(wire_slots_of_rows(rows)):
-                row = [[int(x) for x in rows[f][s]]] + [
-                    [-1, -1, 0]] * (MAX_RULES_PER_VERTEX - 1)
-                try:
-                    r = decode_vertex_rule_specs(
-                        self.jaxpr, int(vertex), row)
-                except Exception:
-                    r = ()
-                slots.append(make_live_masked_hook(tuple(r)) if r else None)
-            if any(sl is not None for sl in slots):
-                ft[keys[f]] = face_entry_from_slots(slots)
+        n = len(keys)
+        if face_rows is None:
+            rows = np.full((n, wire_slots(), 3), -1, np.int32)
+            rows[..., 2] = 0
+        else:
+            rows = np.asarray(face_rows, np.int32)
+        if face_skips is None:
+            skips = np.zeros((max(n, rows.shape[0]),), np.int32)
+        else:
+            skips = np.asarray(face_skips, np.int32).reshape(-1)
+        # THE builder (env._face_dict_for_vertex): the rows decode in each
+        # slot tensor's frame at apply time, exactly as the measurement
+        # decodes them -- see its docstring for the drift this closes.
+        ft = _face_dict_for_vertex(
+            SimpleNamespace(jaxpr=self.jaxpr), self.tk.ij, int(vertex),
+            rows, skips, keys=keys)
         return ft or None
 
     def eliminate(self, vertex, vertex_specs=None, face_rows=None,

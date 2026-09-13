@@ -5390,9 +5390,28 @@ def wire_slots_of_rows(rows) -> int:
 
 
 def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
-                          face_join=None):
+                          face_join=None, *, keys=None, upto=None):
     """ONE vertex's ``{face_key: slots|SKIP_FACE}`` from its wire rows,
     enumerated on ``ij``'s CURRENT graph — call BEFORE eliminating ``v``.
+
+    THE ONE BUILDER. The measurement, the live-face stream's prefix replay
+    (``live_faces.LiveFaceStream._decided``), the AZ plan tokenizer
+    (``plan_tokens.PlanTokenizer.face_transforms``) and the mask oracle's wire
+    replay (``masks.LiveVertexMaskOracle._face_ft``) all build their entries
+    here, so one wire row decodes to one transform: in the SLOT TENSOR's frame
+    at apply time (:func:`make_slot_frame_hook`), never in the vertex's nominal
+    frame. The head-side decoders used to decode in the vertex frame
+    (``decode_vertex_rule_specs``); a COMPRESS axis or a DIAG pair then landed
+    on different dims in the stream's prefix than in the measured graph, the
+    stream's operand drifted, and 7 of 839 rows the decide-time mask cleared
+    were idempotent no-ops on the real operand (probe 65266/65270 on the
+    dsnn-3qm.59 stage-2 smoke: with this builder the mask refuses all 7).
+
+    ``keys`` -- the face keys to index the rows by; ``None`` enumerates them
+    on ``ij``. A deciding tokenizer passes its own list so a later, shrunk
+    enumeration cannot apply row ``f`` to a different face. ``upto`` -- build
+    faces ``0..upto-1`` only (the stream reads face ``f`` on the prefix of the
+    faces before it).
 
     ``face_join`` -- the ``(MAX_FACES,)`` int32 per-face JOIN bit of
     ``--approx-add choose`` (0 = lossy, 1 = lossless). ``None`` under a value
@@ -5405,7 +5424,10 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
     which rides the tokenizer's own IncrementalJaxpr instead of replaying a
     second, byte-identical elimination."""
     from graphax import SKIP_FACE, faces_of
-    keys = faces_of(ij.graph, ij.tgraph, int(v), config.jaxpr)
+    if keys is None:
+        keys = faces_of(ij.graph, ij.tgraph, int(v), config.jaxpr)
+    else:
+        keys = list(keys)
     if len(keys) > _FACE_CAP_STATS["max_seen"]:
         _FACE_CAP_STATS["max_seen"] = len(keys)
     if len(keys) > MAX_FACES:
@@ -5417,7 +5439,13 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
             f"vertex {v}: {len(keys)} faces exceed the derived bound "
             f"{MAX_FACES} -- the subset argument is violated")
     per_face: dict = {}
+    face_row = np.asarray(face_row)
+    face_skip = np.asarray(face_skip).reshape(-1)
     for f, key in enumerate(keys[:MAX_FACES]):
+        if upto is not None and f >= int(upto):
+            break
+        if f >= face_skip.shape[0] or f >= face_row.shape[0]:
+            break
         if int(face_skip[f]) == 1:
             per_face[key] = SKIP_FACE
             continue

@@ -455,42 +455,21 @@ class LiveFaceStream:
     def _decided(self, tk, vertex, face_rows, face_skips, upto):
         """``{face_key: slots|SKIP_FACE}`` for faces ``0..upto-1``.
 
-        Position-independent: the same wire rows decode to the same rules for
-        the vertex being decided now and for an OLDER prefix vertex being
-        replayed, which is what ``_face_transforms_for_order`` also does.
+        Built by ``env._face_dict_for_vertex`` -- THE builder the measurement
+        uses -- so the prefix this stream replays carries exactly the
+        transforms the measured graph carries, each row decoded in its slot
+        tensor's frame at apply time. This used to decode the rows in the
+        vertex frame (``decode_vertex_rule_specs``); the stream's operands
+        drifted from the measured ones and the decide-time masks cleared rows
+        that were no-ops on the real operand (see the builder's docstring).
         """
-        from graphax import SKIP_FACE
-        from alphagrad.approx.env import (
-            MAX_RULES_PER_VERTEX, decode_vertex_rule_specs,
-            face_entry_from_slots, wire_slots_of_rows)
-        from alphagrad.approx.common.masks import make_live_masked_hook
+        from types import SimpleNamespace
+        from alphagrad.approx.env import _face_dict_for_vertex
 
         keys = list(tk.ij.faces(int(vertex)))
-        ft: dict = {}
-        for f in range(min(upto, len(keys))):
-            if int(face_skips[f]) == 1:
-                ft[keys[f]] = SKIP_FACE
-                continue
-            slots = []
-            # AS MANY SLOTS AS THE CONFIGURATION HAS (2026-09-11). Looping
-            # FACE_SLOTS would silently drop a learned join row under
-            # --approx-add learned1 / learned2; `wire_slots_of_rows` raises
-            # instead, naming the producer that has not been widened.
-            for s in range(wire_slots_of_rows(face_rows)):
-                row = [list(int(x) for x in face_rows[f][s])] + [
-                    [-1, -1, 0]] * (MAX_RULES_PER_VERTEX - 1)
-                try:
-                    # No position gate: COMPRESS is admitted for every vertex,
-                    # so the chunk the head reads and the graph the env
-                    # measures carry the same reduction.
-                    rules = decode_vertex_rule_specs(
-                        self.jaxpr, int(vertex), row)
-                except Exception:
-                    rules = ()
-                slots.append(make_live_masked_hook(tuple(rules))
-                             if rules else None)
-            if any(sl is not None for sl in slots):
-                ft[keys[f]] = face_entry_from_slots(slots)
+        ft = _face_dict_for_vertex(
+            SimpleNamespace(jaxpr=self.jaxpr), tk.ij, int(vertex),
+            face_rows, face_skips, keys=keys, upto=int(upto))
         return keys, ft
 
     # -- what the elimination ACTUALLY emitted ------------------------------
