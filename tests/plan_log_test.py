@@ -379,15 +379,31 @@ def test_a_plan_that_raises_is_still_recorded_and_the_error_still_reaches_the_ca
     the raise is the apparatus telling the operator to raise the budget.
     """
     monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
-    monkeypatch.setenv("ALPHAGRAD_MAX_DELTA_TOKENS", "1")
-    monkeypatch.setenv("ALPHAGRAD_DELTA_OVERFLOW", "raise")
     envmod.consume_plan_records()
+    # MAX_DELTA_TOKENS sizes static wire shapes and is read once at import,
+    # so it cannot be shrunk per test. The raise is injected instead at the
+    # tokenizer's length hook, which `_callback_measured` reaches AFTER it
+    # has counted the terminal (the counter sits at the top of the call, the
+    # hook inside the tokenization block) -- the same point in the call at
+    # which the real overflow raised in job 65339. Only the terminal call
+    # raises, so the episode reaches it.
+    _orig = envmod._record_token_length
+
+    def _overflow_at_the_terminal(raw_len):
+        _orig(raw_len)
+        if int(envmod._PLAN_LOG_TERMINALS[0]) > 0:
+            raise ValueError("[alphagrad.approx.env] token DELTA truncated: "
+                             "injected overflow at the tokenizer")
+
+    monkeypatch.setattr(envmod, "_record_token_length",
+                        _overflow_at_the_terminal)
     env = _make_env()
     with pytest.raises(ValueError, match="token DELTA truncated"):
         _run_episode(env, skip_face_of_vertex=1)
     out = envmod.consume_plan_records()
-    if out["terminals"] == 0:
-        pytest.skip("this env raised before the terminal step")
+    assert out["terminals"] == 1, (
+        f"the injected raise fired {out['terminals']} terminal(s) in: the "
+        "hook must run after the counter, once, at the terminal step")
     assert len(out["records"]) == out["terminals"], (
         f"{out['terminals']} terminal(s) counted, {len(out['records'])} "
         f"record(s): a crashed plan left no trace")
