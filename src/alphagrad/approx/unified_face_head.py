@@ -10,14 +10,18 @@ Owner ruling 2026-09-11 (ticket dsnn-3qm.56). A field the running value does
 not use is not gated off -- IT DOES NOT EXIST, so it cannot be indexed, cannot
 hold a parameter and cannot take a gradient:
 
-    --approx-add   width            contents
-    lossy          31*3 + 1 =  94   skip + the three contraction slots
-    lossless       31*3 + 1 =  94   skip + the three contraction slots
-    choose         31*3 + 2 =  95   + ONE Bernoulli, lossy vs lossless per face
-    learned1       31*4 + 1 = 125   + slot 3: the OLD EDGE's own approximation
-    learned2       31*5 + 1 = 156   + slot 4: the ADD OUTPUT's own approximation
+    --approx-add   width              contents           (W = SLOT_WIDTH)
+    lossy          W*3 + 1            skip + the three contraction slots
+    lossless       W*3 + 1            skip + the three contraction slots
+    choose         W*3 + 2            + ONE Bernoulli, lossy vs lossless per face
+    learned1       W*4 + 1            + slot 3: the OLD EDGE's own approximation
+    learned2       W*5 + 1            + slot 4: the ADD OUTPUT's own approximation
 
-READ THE ARITHMETIC: ``learned1`` and ``learned2`` are ``31*N + 1``, NOT
+``SLOT_WIDTH = 30 + len(masks.FACE_QUANT_DTYPES)``: 31 while the dtype field
+was a Bernoulli over {float32, bfloat16} (widths 94 / 94 / 95 / 125 / 156),
+34 with the four-float set (103 / 103 / 104 / 137 / 171).
+
+READ THE ARITHMETIC: ``learned1`` and ``learned2`` are ``W*N + 1``, NOT
 ``+2``. THEY HAVE NO CHOOSE BIT. Under those values the model does not pick
 lossy-or-lossless; it picks the old edge's (and, under ``learned2``, the sum's)
 approximation DIRECTLY, and that pick is what answers the container question.
@@ -39,18 +43,17 @@ LAYOUT
       +10:+16   j           softmax over 1..6
       +16:+25   reduce axis softmax over 9
       +25:+30   reduce fn   softmax {mean, min, max, abs_min, abs_max}
-      +30:+31   dtype       Bernoulli {float32, bfloat16}
+      +30:+30+K dtype       softmax over ``masks.FACE_QUANT_DTYPES`` (K names)
 
     and, under ``choose`` ONLY, the join bit immediately after the last slot
-    block, at ``1 + SLOT_WIDTH*n_slots`` = 94.
+    block, at ``1 + SLOT_WIDTH*n_slots``.
 
 The slot blocks TILE from 1 upwards with no hole, so slot ``s``'s base is
-``1 + 31*s`` whatever the width is -- slot 3 is at 94 under ``learned1``, which
-is exactly where ``choose``'s bit sits under ``choose``. The two never coexist:
-``choose`` has three slots and ``learned1`` has no bit. An earlier layout put
-the bit at 94 under EVERY value and started the join slots at 95, which is why
-``slot_base`` used to need a branch "the price of putting the bit at 94". That
-justification is GONE, and so is the branch.
+``1 + SLOT_WIDTH*s`` whatever the width is -- slot 3 sits where ``choose``'s
+bit sits under ``choose``. The two never coexist: ``choose`` has three slots
+and ``learned1`` has no bit. An earlier layout put the bit after slot 2 under
+EVERY value and started the join slots one later, which is why ``slot_base``
+used to need a branch. That justification is GONE, and so is the branch.
 
 WHAT CHANGED, AND WHY
 ---------------------
@@ -91,6 +94,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import NamedTuple
 
+from alphagrad.approx.common.masks import (
+    FACE_QUANT_DTYPES, NUM_FACE_QUANT_DTYPES)
+
 OP_BLOCKDIAG, OP_REDUCE, OP_QUANT, OP_NONE = 0, 1, 2, 3
 NUM_APPROX_OPS = 4
 MAX_PAIR_IDX = 6
@@ -106,7 +112,7 @@ S_J = S_I + MAX_PAIR_IDX                    # 10
 S_AXIS = S_J + MAX_PAIR_IDX                 # 16
 S_RFN = S_AXIS + NUM_REDUCE_AXES            # 25
 S_DTYPE = S_RFN + NUM_REDUCE_FNS            # 30
-SLOT_WIDTH = S_DTYPE + 1                    # 31
+SLOT_WIDTH = S_DTYPE + NUM_FACE_QUANT_DTYPES  # 30 + K (34 for the four floats)
 
 O_SKIP = 0
 O_SLOT0 = 1
@@ -152,7 +158,7 @@ class FaceHeadLayout:
 
     @property
     def width(self) -> int:
-        """The number of logits. ``1 + 31*n_slots (+1 under ``choose``)``."""
+        """The number of logits. ``1 + SLOT_WIDTH*n_slots (+1 under ``choose``)``."""
         return O_SLOT0 + SLOT_WIDTH * self.n_slots + int(self.has_choose)
 
     @property
@@ -161,7 +167,7 @@ class FaceHeadLayout:
         return self.n_slots - FACE_SLOTS
 
     def slot_base(self, s: int) -> int:
-        """Logit offset of slot ``s``'s 31-wide block: ``1 + 31*s``.
+        """Logit offset of slot ``s``'s ``SLOT_WIDTH``-wide block: ``1 + SLOT_WIDTH*s``.
 
         ONE MULTIPLY, at every width, because the slot blocks tile upwards from
         1 with no hole -- ``choose``'s bit sits AFTER the last block, not
@@ -180,13 +186,13 @@ class FaceHeadLayout:
     def choose_index(self) -> int:
         """Logit index of the per-face ``lossy``/``lossless`` Bernoulli.
 
-        ``1 + 31*n_slots`` = 94, i.e. immediately after the last slot block.
+        ``1 + SLOT_WIDTH*n_slots``, i.e. immediately after the last slot block.
         Raises unless the running value is ``choose``.
         """
         if not self.has_choose:
             raise IndexError(
                 f"--approx-add {self.mode!r} has NO choose bit: its head is "
-                f"{self.width} logits = 31*{self.n_slots} + 1. Only 'choose' "
+                f"{self.width} logits = {SLOT_WIDTH}*{self.n_slots} + 1. Only 'choose' "
                 f"carries one. Under the learned values the model picks the "
                 f"old edge's approximation directly and the ADD reconciles "
                 f"with the UNION (env.resolve_join_mode), so there is no bit "
@@ -273,7 +279,7 @@ class FaceFields(NamedTuple):
     j: jax.Array             # (S,) int32, 0-based 0..5
     axis: jax.Array          # (S,) int32, 0..8
     reduce_fn: jax.Array     # (S,) int32
-    dtype_idx: jax.Array     # (S,) int32 {0: float32, 1: bfloat16}
+    dtype_idx: jax.Array     # (S,) int32, index into masks.FACE_QUANT_DTYPES
     join: jax.Array = None   # () int32 under `choose`, else None
 
 
@@ -562,8 +568,9 @@ class UnifiedFaceHead(eqx.Module):
             lp_fn, e_fn = _cat_logp_ent(
                 z[b + S_RFN:b + S_DTYPE],
                 jnp.ones((NUM_REDUCE_FNS,), jnp.float32), fields.reduce_fn[s])
-            dm = jnp.ones((2,), jnp.float32) if dtype_mask is None else dtype_mask[s]
-            z_dt = jnp.stack([0.0, z[b + S_DTYPE]])
+            dm = (jnp.ones((NUM_FACE_QUANT_DTYPES,), jnp.float32)
+                  if dtype_mask is None else dtype_mask[s])
+            z_dt = z[b + S_DTYPE:b + SLOT_WIDTH]
             lp_dt, e_dt = _cat_logp_ent(z_dt, dm, fields.dtype_idx[s])
 
             # SELECT, never multiply. A branch mask of 0.0 times a -inf
@@ -645,8 +652,9 @@ class UnifiedFaceHead(eqx.Module):
             ax = _sample_cat(z[b + S_AXIS:b + S_RFN], axis_mask[s], k[3])
             fn = _sample_cat(z[b + S_RFN:b + S_DTYPE],
                              jnp.ones((NUM_REDUCE_FNS,), jnp.float32), k[4])
-            dm = jnp.ones((2,), jnp.float32) if dtype_mask is None else dtype_mask[s]
-            z_dt = jnp.stack([0.0, z[b + S_DTYPE]])
+            dm = (jnp.ones((NUM_FACE_QUANT_DTYPES,), jnp.float32)
+                  if dtype_mask is None else dtype_mask[s])
+            z_dt = z[b + S_DTYPE:b + SLOT_WIDTH]
             dt = _sample_cat(z_dt, dm, dt_keys[s])
             ops.append(op); iis.append(i_idx); jjs.append(j_idx)
             axs.append(ax); fns.append(fn); dts.append(dt)

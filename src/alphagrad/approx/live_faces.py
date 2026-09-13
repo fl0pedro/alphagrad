@@ -53,6 +53,8 @@ from typing import NamedTuple
 
 import numpy as np
 
+from alphagrad.approx.common.masks import NUM_FACE_QUANT_DTYPES
+
 
 # Sized from the MEASURED distribution on the MNIST xent graph, not guessed:
 # 192 chunks, mean 403 tokens, max 1456. At 96 the window clipped 83 of 206
@@ -189,7 +191,7 @@ class DecidedFaces(NamedTuple):
     """
     rows: np.ndarray      # (F, S, 3) int32
     sizes: np.ndarray     # (F, S, N) int32
-    quant: np.ndarray     # (F, S, 2) float32
+    quant: np.ndarray     # (F, S, K) float32, K = len(masks.FACE_QUANT_DTYPES)
     pair: np.ndarray      # (F, S, N, N) float32
     comp: np.ndarray      # (F, S, N) float32
     nout: np.ndarray      # (F, S) int32
@@ -1145,7 +1147,7 @@ class LiveFaceStream:
             return hit
 
         sizes = np.zeros((F, S, N), np.int32)
-        quant = np.zeros((F, S, 2), np.float32)
+        quant = np.zeros((F, S, NUM_FACE_QUANT_DTYPES), np.float32)
         pair = np.zeros((F, S, N, N), np.float32)
         comp = np.zeros((F, S, N), np.float32)
         nout = np.zeros((F, S), np.int32)
@@ -1334,7 +1336,7 @@ class LiveFaceStream:
         rows = np.full((F, S, 3), -1, np.int32)
         rows[..., 2] = 0
         sizes = np.zeros((F, S, N), np.int32)
-        quant = np.zeros((F, S, 2), np.float32)
+        quant = np.zeros((F, S, NUM_FACE_QUANT_DTYPES), np.float32)
         pair = np.zeros((F, S, N, N), np.float32)
         comp = np.zeros((F, S, N), np.float32)
         nout = np.zeros((F, S), np.int32)
@@ -1449,7 +1451,7 @@ class LiveFaceStream:
             rows[..., 2] = 0
             return DecidedFaces(
                 rows=rows, sizes=np.zeros((F, S, N), np.int32),
-                quant=np.zeros((F, S, 2), np.float32),
+                quant=np.zeros((F, S, NUM_FACE_QUANT_DTYPES), np.float32),
                 pair=np.zeros((F, S, N, N), np.float32),
                 comp=np.zeros((F, S, N), np.float32),
                 nout=np.zeros((F, S), np.int32), n_faces=np.int32(0))
@@ -1613,7 +1615,7 @@ class LiveFaceStream:
         rows = np.full((F, S, 3), -1, np.int32)
         rows[..., 2] = 0
         sizes = np.zeros((F, S, N), np.int32)
-        quant = np.zeros((F, S, 2), np.float32)
+        quant = np.zeros((F, S, NUM_FACE_QUANT_DTYPES), np.float32)
         pair = np.zeros((F, S, N, N), np.float32)
         comp = np.zeros((F, S, N), np.float32)
         nout = np.zeros((F, S), np.int32)
@@ -1923,7 +1925,7 @@ class LiveFaceStream:
             rows[..., 2] = 0
             return DecidedFaces(
                 rows=rows, sizes=np.zeros((F, S, N), np.int32),
-                quant=np.zeros((F, S, 2), np.float32),
+                quant=np.zeros((F, S, NUM_FACE_QUANT_DTYPES), np.float32),
                 pair=np.zeros((F, S, N, N), np.float32),
                 comp=np.zeros((F, S, N), np.float32),
                 nout=np.zeros((F, S), np.int32), n_faces=np.int32(0))

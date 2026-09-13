@@ -69,6 +69,39 @@ _F32_SLOT = _dtype_slot("float32", 0)
 _BF16_SLOT = _dtype_slot("bfloat16", min(1, NUM_QUANT_DTYPES - 1))
 
 
+def _face_dtype_slots():
+    """Runtime ``QUANT_DTYPES`` index of every ``masks.FACE_QUANT_DTYPES``
+    name -- the wire's dtype column for the face head's ``dtype_idx``. A name
+    this runtime's catalog lacks RAISES: the head would otherwise emit a row
+    the measurement cannot decode."""
+    from alphagrad.approx.common.masks import FACE_QUANT_DTYPES
+    out = []
+    for name in FACE_QUANT_DTYPES:
+        idx = _dtype_slot(name, -1)
+        if idx < 0:
+            raise ValueError(
+                f"face QUANT dtype {name!r} is not in this runtime's "
+                f"QUANT_DTYPES ({[str(d) for d in QUANT_DTYPES]}); the face "
+                f"head cannot offer it.")
+        out.append(idx)
+    return jnp.asarray(out, jnp.int32)
+
+
+#: ``(K,)`` int32 -- head ``dtype_idx`` -> runtime dtype index (the wire).
+FACE_DTYPE_SLOTS = _face_dtype_slots()
+
+
+def face_dtype_idx_of(slot):
+    """Inverse of :data:`FACE_DTYPE_SLOTS`: a wire dtype column -> the head's
+    ``dtype_idx``. A column outside the face set maps to 0 (float32), which
+    is the value the rows carry on every non-QUANT slot."""
+    slot = jnp.asarray(slot, jnp.int32)
+    hit = (FACE_DTYPE_SLOTS == slot[..., None])
+    return jnp.where(jnp.any(hit, axis=-1),
+                     jnp.argmax(hit.astype(jnp.int32), axis=-1), 0
+                     ).astype(jnp.int32)
+
+
 class _Fields(NamedTuple):
     """The subset of ApproxAction that ``_emit`` consumes."""
     skip: jax.Array

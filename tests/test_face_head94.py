@@ -8,16 +8,20 @@ layout claim here is parametrised over all five values rather than restated
 for one:
 
     --approx-add   width            contents
-    lossy          31*3 + 1 =  94   skip + the three contraction slots
-    lossless       31*3 + 1 =  94   skip + the three contraction slots
-    choose         31*3 + 2 =  95   + ONE Bernoulli, lossy vs lossless per face
-    learned1       31*4 + 1 = 125   + slot 3, the OLD EDGE's approximation
-    learned2       31*5 + 1 = 156   + slot 4, the ADD OUTPUT's approximation
+    lossy          W*3 + 1          skip + the three contraction slots
+    lossless       W*3 + 1          skip + the three contraction slots
+    choose         W*3 + 2          + ONE Bernoulli, lossy vs lossless per face
+    learned1       W*4 + 1          + slot 3, the OLD EDGE's approximation
+    learned2       W*5 + 1          + slot 4, the ADD OUTPUT's approximation
+
+with ``W = SLOT_WIDTH = 30 + len(masks.FACE_QUANT_DTYPES)``: 31 (94 logits)
+while the dtype field was a Bernoulli over {float32, bfloat16}, 34 (103) with
+the four-float set. The filename keeps the historical 94.
 
 The properties that matter are the ones whose violation is SILENT:
 
   A. the slot blocks TILE from 1 upwards with no gap or overlap, at every
-     width, so slot ``s`` is at ``1 + 31*s`` whatever the value is. An
+     width, so slot ``s`` is at ``1 + W*s`` whatever the value is. An
      off-by-one here reads another field's logit and nothing ever raises.
   A2. A FIELD A WIDTH DOES NOT CONTAIN CANNOT BE INDEXED AT ALL. This replaced
      the older "a gated-off field contributes exactly zero" test: at a narrower
@@ -48,6 +52,7 @@ import jax, jax.numpy as jnp, jax.random as jrand
 import numpy as np
 import pytest
 
+from alphagrad.approx.common.masks import NUM_FACE_QUANT_DTYPES
 from alphagrad.approx.unified_face_head import (
     CONTRACTION_LAYOUT, UnifiedFaceHead, FaceFields, SLOT_WIDTH, FACE_SLOTS,
     NUM_APPROX_OPS, MAX_PAIR_IDX, NUM_REDUCE_AXES, NUM_REDUCE_FNS,
@@ -57,10 +62,11 @@ from alphagrad.approx.unified_face_head import (
 )
 
 #: THE OWNER'S ARITHMETIC, restated as a literal so a change to the layout
-#: table has to change this number too. `31*N + 1` for the learned values --
+#: table has to change this number too. `W*N + 1` for the learned values --
 #: NOT `+2`: they have no choose bit.
-WIDTHS = {"lossy": 94, "lossless": 94, "choose": 95,
-          "learned1": 125, "learned2": 156}
+_W = SLOT_WIDTH
+WIDTHS = {"lossy": 3 * _W + 1, "lossless": 3 * _W + 1, "choose": 3 * _W + 2,
+          "learned1": 4 * _W + 1, "learned2": 5 * _W + 1}
 MODES = list(WIDTHS)
 E = 32
 
@@ -97,9 +103,10 @@ def test_width_is_the_owners_arithmetic(mode):
     lay = head_layout(mode)
     assert lay.width == WIDTHS[mode], (mode, lay.width)
     assert lay.width == O_SLOT0 + SLOT_WIDTH * lay.n_slots + int(lay.has_choose)
-    assert SLOT_WIDTH == 31
+    assert SLOT_WIDTH == S_DTYPE + NUM_FACE_QUANT_DTYPES
+    assert SLOT_WIDTH == 34, "the four-float set: 30 + 4"
     assert O_SKIP == 0 and O_SLOT0 == 1
-    # The learned values are 31*N + 1, NOT +2: no choose bit.
+    # The learned values are W*N + 1, NOT +2: no choose bit.
     if mode in ("learned1", "learned2"):
         assert not lay.has_choose
         assert lay.width == SLOT_WIDTH * lay.n_slots + 1
@@ -113,7 +120,7 @@ def test_slot_bases_are_one_multiply_at_every_width(mode):
     # The three CONTRACTION bases are the same number at every width -- that
     # width-independence is what the 2026-09-11 layout buys, and it is why a
     # bare `slot_base(s)` over range(FACE_SLOTS) is right under every value.
-    assert bases[:FACE_SLOTS] == [1, 32, 63]
+    assert bases[:FACE_SLOTS] == [1, 1 + _W, 1 + 2 * _W]
     assert bases[:FACE_SLOTS] == [slot_base(s) for s in range(FACE_SLOTS)]
 
 

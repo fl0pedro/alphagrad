@@ -54,11 +54,11 @@ from alphagrad.approx.ppo import (
 from alphagrad.approx.unified_face_head import (
     FACE_SLOTS, MAX_PAIR_IDX, NUM_APPROX_OPS, NUM_REDUCE_AXES, NUM_REDUCE_FNS,
     OP_BLOCKDIAG, OP_NONE, OP_QUANT, OP_REDUCE, S_AXIS, S_DTYPE, S_I, S_J,
-    S_OP, S_RFN, UnifiedFaceHead, _cat_logp_ent, _bern_logp_ent,
+    SLOT_WIDTH, S_OP, S_RFN, UnifiedFaceHead, _cat_logp_ent, _bern_logp_ent,
     j_mask_given_i, slot_base,
 )
 from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
-from alphagrad.approx.unified_micro import _BF16_SLOT, _KIND_MAP
+from alphagrad.approx.unified_micro import face_dtype_idx_of, _KIND_MAP
 from alphagrad.elimrl.baselines import tlm_target
 
 N_AX = 8
@@ -365,9 +365,9 @@ def test_masked_equals_pruned_head_across_all_profiles(profile):
                 elif op == OP_QUANT:
                     legal_dt = np.asarray(dm[s]) > 0.5
                     assert legal_dt.any()
-                    bf = int(row["quant_dtype"][s]) == int(_BF16_SLOT)
-                    l, e, _ = _pruned_cat(np.array([0.0, zn[b + S_DTYPE]]),
-                                          legal_dt, 1 if bf else 0)
+                    dti = int(face_dtype_idx_of(int(row["quant_dtype"][s])))
+                    l, e, _ = _pruned_cat(zn[b + S_DTYPE:b + SLOT_WIDTH],
+                                          legal_dt, dti)
                     ref_lp += l
                     ref_e += e
                 else:
@@ -437,7 +437,7 @@ def test_tlm_sampled_action_zero_rejection():
                         applied_ops["reduce"] += 1
                     elif op == OP_QUANT:
                         dt = int(row["quant_dtype"][s])
-                        dt_idx = 1 if dt == int(_BF16_SLOT) else 0
+                        dt_idx = int(face_dtype_idx_of(dt))
                         requested_ops["quant"] += 1
                         assert bool(quant[f, s, dt_idx] > 0.5), (v, f, s, dt, dt_idx)
                         applied_ops["quant"] += 1

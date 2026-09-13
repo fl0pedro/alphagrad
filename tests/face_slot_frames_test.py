@@ -585,8 +585,8 @@ def test_masked_head_equals_pruned_head_per_slot():
     """
     from alphagrad.approx.unified_face_head import (
         NUM_REDUCE_FNS, OP_BLOCKDIAG, OP_NONE, OP_QUANT, OP_REDUCE, S_AXIS,
-        S_DTYPE, S_I, S_J, S_OP, S_RFN, j_mask_given_i, slot_base)
-    from alphagrad.approx.unified_micro import _BF16_SLOT, _KIND_MAP
+        SLOT_WIDTH, S_DTYPE, S_I, S_J, S_OP, S_RFN, j_mask_given_i, slot_base)
+    from alphagrad.approx.unified_micro import face_dtype_idx_of, _KIND_MAP
     kinds = np.asarray(_KIND_MAP)
     # The reference inverts fn -> compress_kind, as evaluate_face does.
     assert len(set(kinds.tolist())) == len(kinds), kinds
@@ -663,9 +663,9 @@ def test_masked_head_equals_pruned_head_per_slot():
                 elif op == OP_QUANT:
                     legal_dt = np.asarray(dm[s]) > 0.5
                     assert legal_dt.any()
-                    bf = int(row["quant_dtype"][s]) == int(_BF16_SLOT)
-                    l, e, _ = _pruned_cat(np.array([0.0, zn[b + S_DTYPE]]),
-                                          legal_dt, 1 if bf else 0)
+                    dti = int(face_dtype_idx_of(int(row["quant_dtype"][s])))
+                    l, e, _ = _pruned_cat(zn[b + S_DTYPE:b + SLOT_WIDTH],
+                                          legal_dt, dti)
                     ref_lp += l
                     ref_e += e
                 else:

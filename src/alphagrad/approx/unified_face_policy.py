@@ -31,7 +31,9 @@ from alphagrad.approx.heads import (
     _approx_allowed, _compute_axis_masks, _compute_op_legality,
     quant_hardware_masks,
 )
-from alphagrad.approx.unified_micro import _BF16_SLOT, _F32_SLOT, _KIND_MAP
+from alphagrad.approx.common.masks import NUM_FACE_QUANT_DTYPES
+from alphagrad.approx.unified_micro import (
+    FACE_DTYPE_SLOTS, _KIND_MAP, face_dtype_idx_of)
 from alphagrad.approx.unified_face_head import (
     CONTRACTION_LAYOUT, FACE_SLOTS, MAX_PAIR_IDX, NUM_APPROX_OPS,
     NUM_REDUCE_AXES, OP_BLOCKDIAG, OP_NONE, OP_QUANT, OP_REDUCE, S_OP,
@@ -207,8 +209,9 @@ class UnifiedFacePolicy(eqx.Module):
             g = jnp.gcd(sz[:, None], sz[None, :])
             pair_ok = jnp.broadcast_to((g > 1).astype(jnp.float32),
                                        (_S, MAX_PAIR_IDX, MAX_PAIR_IDX))
-            dm = jnp.broadcast_to(self._fit(quant_legality_mask, 2),
-                                  (_S, 2))
+            dm = jnp.broadcast_to(
+                self._fit(quant_legality_mask, NUM_FACE_QUANT_DTYPES),
+                (_S, NUM_FACE_QUANT_DTYPES))
             return om, im, jm, am, pair_ok, dm
         outs = [self._slot_masks_1(features[s], pair_valid_f[s],
                                    comp_valid_f[s], quant_legality_mask[s],
@@ -246,7 +249,7 @@ class UnifiedFacePolicy(eqx.Module):
         am = self._fit(i_compress, NUM_REDUCE_AXES)
         reduce_legal = (jnp.sum(am) > 0.0).astype(jnp.float32)
 
-        dm = self._fit(quant_legality_mask, 2)
+        dm = self._fit(quant_legality_mask, NUM_FACE_QUANT_DTYPES)
         quant_legal = (jnp.sum(dm) > 0.0).astype(jnp.float32)
 
         none_legal = 1.0
@@ -402,8 +405,7 @@ class UnifiedFacePolicy(eqx.Module):
             compress_kind=jnp.where(is_rd, _KIND_MAP[fields.reduce_fn], 0
                                     ).astype(jnp.int32),
             quant_dtype=jnp.where(
-                is_qt, jnp.where(fields.dtype_idx > 0, _BF16_SLOT, _F32_SLOT),
-                0).astype(jnp.int32),
+                is_qt, FACE_DTYPE_SLOTS[fields.dtype_idx], 0).astype(jnp.int32),
             quant_scale_sign=jnp.ones((_S,), jnp.int32),
             quant_scale_frac=jnp.zeros((_S,), jnp.float32),
         )
@@ -497,7 +499,7 @@ class UnifiedFacePolicy(eqx.Module):
             reduce_fn=jnp.argmax(
                 (_KIND_MAP[None, :] == fa.compress_kind[f][:, None]
                  ).astype(jnp.int32), axis=-1).astype(jnp.int32),
-            dtype_idx=(fa.quant_dtype[f] == _BF16_SLOT).astype(jnp.int32),
+            dtype_idx=face_dtype_idx_of(fa.quant_dtype[f]),
             join=join,
         )
 
@@ -523,19 +525,20 @@ class UnifiedFacePolicy(eqx.Module):
     def _quant_mask_1(quant_legality_mask, face_quant_f):
         """The hardware dtype mask narrowed by THIS face's QUANT legality.
 
-        ``face_quant_f`` is either a scalar float (0/1) or a (2,) float array
-        representing [f32_legal, bf16_legal]. Slices quant_legality_mask to the
-        head's 2 dtype classes ('float32', 'bfloat16').
+        ``face_quant_f`` is either a scalar float (0/1) or a ``(K,)`` float
+        array over ``masks.FACE_QUANT_DTYPES``. The hardware mask is indexed by
+        the runtime catalog, so it is GATHERED at the face set's runtime
+        indices (``FACE_DTYPE_SLOTS``), never sliced positionally.
         """
         if quant_legality_mask is None:
             quant_legality_mask = quant_hardware_masks()[0]
-        qhw = jnp.asarray(quant_legality_mask, jnp.float32)[:2]
+        qhw = jnp.asarray(quant_legality_mask, jnp.float32)[FACE_DTYPE_SLOTS]
         if face_quant_f is None:
             return qhw
         fq = jnp.asarray(face_quant_f, jnp.float32)
         if fq.ndim == 0:
             return qhw * fq
-        return qhw * fq[:2]
+        return qhw * fq[:NUM_FACE_QUANT_DTYPES]
 
     def sample_face(self, features: AxisTokenFeatures,
                     tables: FactorTables, key, f: int, pair_valid_f,

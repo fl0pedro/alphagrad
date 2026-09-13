@@ -46,6 +46,7 @@ import jax.nn as jnn
 import jax.numpy as jnp
 import jax.random as jrand
 import numpy as np
+from alphagrad.approx.common.masks import NUM_FACE_QUANT_DTYPES  # noqa: E402
 import optax
 from tqdm import tqdm
 
@@ -8577,7 +8578,7 @@ def main():
                         _WS = _env_wire_slots()
                         _want = (((ENV_MAX_FACES, _WS,
                                    MAX_AXES_PER_VERTEX),
-                                  (ENV_MAX_FACES, _WS, 2))
+                                  (ENV_MAX_FACES, _WS, NUM_FACE_QUANT_DTYPES))
                                  if _PFM_SLOT else
                                  ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX),
                                   (ENV_MAX_FACES,)))
@@ -8622,7 +8623,8 @@ def main():
                             (ENV_MAX_FACES,) + _sl + (MAX_AXES_PER_VERTEX,),
                             jnp.int32)
                         face_quant_v = jnp.zeros(
-                            (ENV_MAX_FACES,) + _sl + ((2,) if _PFM_SLOT else ()),
+                            (ENV_MAX_FACES,) + _sl
+                            + ((NUM_FACE_QUANT_DTYPES,) if _PFM_SLOT else ()),
                             jnp.float32)
                 if _DEBUG_ORDER:
                     # avail = how many vertices are still selectable; picked =

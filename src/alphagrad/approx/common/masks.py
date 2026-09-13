@@ -762,7 +762,14 @@ def reduce_axes_physical() -> bool:
 # not the full ``QUANT_DTYPES`` catalog -- is the QUANT action set a face can
 # actually request. Kept here rather than imported from ``heads`` so this
 # module stays importable inside the measure actors without pulling equinox.
-FACE_QUANT_DTYPES = ("float32", "bfloat16")
+#: The face head's QUANT choices, index = the head's ``dtype_idx``. The same
+#: names as graphax's ``POLICY_QUANT_DTYPES`` (its strict guard). float32 is
+#: the exact entry; the three narrow floats are the ones with a whole-graph
+#: temp-memory win on Blackwell (bf16 -28%, e5m2 -27%, e4m3fn -11%; sweep64).
+#: No integer target (int8 q 0.91 used widely, int16 no memory win) and no
+#: float16 / float4 (+33% / +5% temp).
+FACE_QUANT_DTYPES = ("float32", "bfloat16", "float8_e5m2", "float8_e4m3fn")
+NUM_FACE_QUANT_DTYPES = len(FACE_QUANT_DTYPES)
 
 
 class ReduceAxisSpaces(NamedTuple):
