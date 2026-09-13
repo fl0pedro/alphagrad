@@ -43,22 +43,48 @@ def _wire(order, *, skip=(), face_kind=None, rule_kind=None):
 
 
 def _record(order, lat_ns, q, *, temp=1000.0, ref_lat=None, ref_temp=None,
-            sentinel=False, **wire_kw):
+            sentinel=False, cost_form="paired-log", watermark=None,
+            ref_watermark=None, **wire_kw):
+    """One plan-log record, shaped like the ones env.py writes.
+
+    ``cost_form="paired-log"`` is the settled form (ticket .9, every
+    2026-09-13 arm): reward slots 2 and 5 hold NEGATED LOG-DIFFERENCES, not
+    ns and bytes, and the absolute units live in ``candidate_latency_ns`` /
+    ``mem_temp_bytes`` beside the reference.  Reading ns off the reward slot
+    under this form is what made every paired ratio NaN in job 65321.
+    """
     rec = encode_wires(*_wire(order, **wire_kw),
                        compress_sentinel=COMPRESS_SENTINEL,
                        quant_sentinel=QUANT_SENTINEL)
     rew = [0.0] * len(REWARD_NAMES)
-    rew[REWARD_NAMES.index("latency_ns")] = -1e10 if sentinel else -float(lat_ns)
-    rew[REWARD_NAMES.index("peak_memory")] = -1e10 if sentinel else -float(temp)
+    if cost_form == "paired-log" and not sentinel:
+        _rl = float(ref_lat) if ref_lat else float(lat_ns)
+        _rt = float(ref_temp) if ref_temp else float(temp)
+        rew[REWARD_NAMES.index("latency_ns")] = -math.log(
+            max(float(lat_ns), 1.0) / max(_rl, 1.0))
+        rew[REWARD_NAMES.index("peak_memory")] = -math.log(
+            max(float(temp), 1.0) / max(_rt, 1.0))
+    else:
+        rew[REWARD_NAMES.index("latency_ns")] = (
+            -1e10 if sentinel else -float(lat_ns))
+        rew[REWARD_NAMES.index("peak_memory")] = (
+            -1e10 if sentinel else -float(temp))
     rew[REWARD_NAMES.index("quality")] = 0.0 if sentinel else float(q)
     rec["rewards"] = rew
     rec["reward_names"] = list(REWARD_NAMES)
+    rec["cost_form"] = cost_form
     rec["mem_temp_bytes"] = None if sentinel else float(temp)
     rec["mem_channel"] = "temp"
+    if not sentinel:
+        rec[gt.CANDIDATE_LATENCY_KEY] = float(lat_ns)
+        rec[gt.WATERMARK_KEY] = float(
+            watermark if watermark is not None else temp * 2.0)
     if ref_lat is not None:
         rec[gt.REF_LATENCY_KEY] = float(ref_lat)
     if ref_temp is not None:
         rec[gt.REF_TEMP_KEY] = float(ref_temp)
+        rec[gt.REF_WATERMARK_KEY] = float(
+            ref_watermark if ref_watermark is not None else ref_temp * 2.0)
     return rec
 
 
@@ -116,11 +142,18 @@ def _fake_episode():
     fvalid = np.array([1.0, 1.0, 0.0])
     fquant = np.array([1.0, 0.0, 0.0])
     legal = gt.legal_counts_from_masks(fpair, fcomp, fvalid, fquant, None)
+    # THE DRAIN THE FIELDS WERE COMPUTED FROM (ticket .7).  Two records the
+    # trainer's own env owned, four the measure actors owned, and the
+    # actors' own terminal count agrees with what arrived here.
+    drain_local = {"records": recs[:2]}
+    drain_pool = {"records": recs[2:], "terminals": 4, "dropped": 0,
+                  "actors_seen": 2, "actors_failed": 0}
     return dict(records=recs, head_names=HEADS, all_rets=all_rets,
                 reward_names=REWARD_NAMES, critic=critic,
                 face_entropy_nats=1.2, legal=legal, winners=winners,
                 vertex_primitive=vprim, quality_floor=0.985,
-                offline_contrast=0.013)
+                offline_contrast=0.013, mask_source=gt.MASK_SOURCE_ORACLE,
+                drain_local=drain_local, drain_pool=drain_pool)
 
 
 # ---------------------------------------------------------------------------
@@ -280,10 +313,92 @@ def test_g2_appended_head_and_non_finite_rows():
 def test_g3_legal_counts_mirror_the_head_leaves():
     ep = _fake_episode()
     n, skip_legal = ep["legal"]
-    # face 0: 1 + 2 pairs + 2 axes x 5 fns + 1 dtype = 14 per slot
-    # face 1: 1 + 0 + 1 x 5 + 0 = 6 per slot; face 2 is not live
-    assert n.tolist() == [[14, 14, 14], [6, 6, 6]]
+    G = gt.face_head_geometry()
+    # face 0: 1 (None) + 2 ordered pairs + 2 axes x REDUCE_FNS + the legal
+    # QUANT casts; face 1: 1 + 0 + 1 axis x REDUCE_FNS + 0; face 2 not live.
+    # EVERY TERM IS DERIVED.  A fourth QUANT dtype or a sixth reduce fn moves
+    # both the head and this expectation; a literal here would let the floor
+    # go on describing the head that stopped running.
+    f0 = 1 + 2 + 2 * G["n_reduce_fns"] + G["n_quant_default"]
+    f1 = 1 + 0 + 1 * G["n_reduce_fns"] + 0
+    assert n.tolist() == [[f0] * G["n_slots"], [f1] * G["n_slots"]]
     assert skip_legal.tolist() == [True, True]
+
+
+def test_g3_geometry_is_derived_from_the_head_layout_not_typed():
+    from alphagrad.approx.unified_face_head import head_layout, _LAYOUT_SPEC
+    from alphagrad.approx.common.masks import FACE_QUANT_DTYPES
+    for mode in sorted(_LAYOUT_SPEC):
+        G = gt.face_head_geometry(mode)
+        lay = head_layout(mode)
+        assert G["width"] == lay.width
+        assert G["n_slots"] == lay.n_slots
+        assert G["n_quant_dtypes"] == len(FACE_QUANT_DTYPES)
+        # The owner's 2026-09-13 ruling: the dtype field is a FOUR-way
+        # categorical and the operand's own dtype is masked, so a face whose
+        # mask says only "QUANT is legal" offers K - 1 casts.
+        assert G["n_quant_default"] == len(FACE_QUANT_DTYPES) - 1
+        assert G["quant_dtypes"] == tuple(FACE_QUANT_DTYPES)
+    with pytest.raises(ValueError):
+        gt.face_head_geometry("no-such-approx-add")
+
+
+def test_g3_floor_follows_the_slot_count_of_the_running_width():
+    """The floor is summed over the slots THIS width has.
+
+    ``learned1`` / ``learned2`` add join slots; a floor computed over a fixed
+    three would understate every one of them.
+    """
+    N = 6
+    fpair = np.ones((1, N, N))
+    fcomp = np.ones((1, 9))
+    for mode in ("lossless", "learned1", "learned2"):
+        n, sk = gt.legal_counts_from_masks(
+            fpair, fcomp, np.ones(1), np.ones(1), None, approx_add=mode)
+        G = gt.face_head_geometry(mode)
+        assert n.shape == (1, G["n_slots"])
+        fl = gt.uniform_floor(n, sk)
+        assert fl["n_outcomes_max"] == 1 + int(n[0, 0]) ** G["n_slots"]
+
+
+def test_g3_a_quant_legality_bit_is_not_a_count():
+    """The oracle's per-face QUANT array is (F,) -- 'some cast is legal' --
+    and the head then offers every dtype but the operand's own.  Counting it
+    as ONE choice is the K = 2 arithmetic; under the four floats it
+    understates the floor on every face that allows QUANT."""
+    N = 6
+    fpair = np.zeros((1, N, N))
+    fcomp = np.zeros((1, N))
+    G = gt.face_head_geometry()
+    n, _ = gt.legal_counts_from_masks(fpair, fcomp, np.ones(1), np.ones(1))
+    assert n[0, 0] == 1 + G["n_quant_default"]
+    # An explicit (F, K) row is taken literally: two legal casts, not K - 1.
+    per_dtype = np.zeros((1, G["n_quant_dtypes"]))
+    per_dtype[0, 1] = per_dtype[0, 2] = 1.0
+    n, _ = gt.legal_counts_from_masks(fpair, fcomp, np.ones(1), per_dtype)
+    assert n[0, 0] == 1 + 2
+    # QUANT illegal on this face: nothing added.
+    n, _ = gt.legal_counts_from_masks(fpair, fcomp, np.ones(1), np.zeros(1))
+    assert n[0, 0] == 1
+
+
+def test_g3_live_slot_masks_count_each_slot_and_each_dtype():
+    """The live path (--live-faces, every campaign arm) hands per-SLOT,
+    per-DTYPE masks; the floor reads both axes off the array."""
+    G = gt.face_head_geometry()
+    F, S, N, K = 2, G["n_slots"], 6, G["n_quant_dtypes"]
+    pair = np.zeros((F, S, N, N))
+    comp = np.zeros((F, S, N))
+    quant = np.zeros((F, S, K))
+    pair[0, 0, 0, 1] = 1.0                 # one ordered pair, slot 0 only
+    comp[0, 1, :2] = 1.0                   # two reduce axes, slot 1 only
+    quant[0, 2, 1:] = 1.0                  # K - 1 casts, slot 2 only
+    n, sk = gt.legal_counts_from_slot_masks(pair, comp, quant, F)
+    assert n[0].tolist()[:3] == [2, 1 + 2 * G["n_reduce_fns"], 1 + (K - 1)]
+    assert n[1].tolist() == [1] * S        # face 1: nothing legal but None
+    assert sk.tolist() == [True, True]
+    with pytest.raises(ValueError):
+        gt.legal_counts_from_slot_masks(pair[0], comp, quant, F)
 
 
 def test_g3_profile_override_removes_classes():
@@ -316,17 +431,26 @@ def test_g3_uniform_floor_arithmetic():
     assert fl["arity_norm"] == pytest.approx(math.log(2))
 
 
-def test_g3_full_94_logit_head_floor_is_stated():
-    # Everything legal on a 6-axis face: 1 + 30 ordered pairs + 9 x 5 + 1 = 77
-    # per slot, N = 1 + 77^3 = 456534, log N = 13.03 nats per face.
+def test_g3_everything_legal_floor_is_the_width_s_own_arithmetic():
+    """The floor of a face on which every choice is legal, stated from the
+    LAYOUT.  Under the 2026-09-13 head (103 logits = 1 + 34*3, the four-float
+    QUANT categorical) that is 1 + 30 ordered pairs + 9 x 5 reduce + 3 casts
+    = 79 per slot, N = 1 + 79^3.  The assertion is written against
+    ``face_head_geometry`` so it MOVES WITH THE LAYOUT: if the table changes
+    and the floor code does not, ``max_outcomes_per_face`` and the counted
+    floor disagree and this test fails."""
     N = 6
     fpair = np.ones((1, N, N))
     fcomp = np.ones((1, 9))
+    G = gt.face_head_geometry()
     n, sk = gt.legal_counts_from_masks(fpair, fcomp, np.ones(1), np.ones(1), None)
-    assert n.tolist() == [[77, 77, 77]]
+    per_slot = (1 + G["n_pair_idx"] * (G["n_pair_idx"] - 1)
+                + G["n_reduce_axes"] * G["n_reduce_fns"] + G["n_quant_default"])
+    assert n.tolist() == [[per_slot] * G["n_slots"]]
     fl = gt.uniform_floor(n, sk)
-    assert fl["per_face"] == pytest.approx(math.log(1 + 77 ** 3))
-    assert fl["per_face"] == pytest.approx(13.0314, abs=1e-3)
+    assert fl["n_outcomes_max"] == G["max_outcomes_per_face"]
+    assert fl["per_face"] == pytest.approx(
+        math.log(1 + per_slot ** G["n_slots"]))
 
 
 def test_g3_fields_compare_entropy_to_the_floor():
@@ -425,3 +549,153 @@ def test_critic_stash_is_pop_once():
     assert c is not None and c["targets"].shape == (2, 3, 3)
     assert gt.env_preferences(c).shape == (2, 3)
     assert gt.pop_critic() is None
+
+
+# ---------------------------------------------------------------------------
+# 10. THE SETTLED COST FORM.  Under --cost-form paired-log the reward slot is
+#     a log-difference, not a measurement; a ratio built from it is fiction.
+# ---------------------------------------------------------------------------
+def test_paired_log_latency_comes_from_the_record_not_the_reward_slot():
+    rec = _record(REV, 900.0, 0.99, ref_lat=1000.0, ref_temp=1000.0)
+    # The slot really does hold the log-difference, positive for a win.
+    slot = rec["rewards"][REWARD_NAMES.index("latency_ns")]
+    assert slot == pytest.approx(-math.log(0.9))
+    assert slot > 0.0                       # NEGATING IT GIVES A NEGATIVE "ns"
+    assert gt.record_latency_ns(rec) == pytest.approx(900.0)
+    out = gt.episode_fields([rec], head_names=HEADS)
+    assert out["paired/lat_ratio_best"] == pytest.approx(0.9)
+    assert out["paired/n_with_ref"] == 1
+
+
+def test_paired_log_without_the_absolute_field_is_nan_never_invented():
+    rec = _record(REV, 900.0, 0.99, ref_lat=1000.0, ref_temp=1000.0)
+    del rec[gt.CANDIDATE_LATENCY_KEY]
+    assert math.isnan(gt.record_latency_ns(rec))
+    out = gt.episode_fields([rec], head_names=HEADS)
+    assert math.isnan(out["paired/lat_ratio_mean"])
+    assert out["paired/n_with_ref"] == 0
+    # the temp channel is unaffected: it never rode the reward slot
+    assert out["paired/temp_ratio_best"] == pytest.approx(1.0)
+
+
+def test_absolute_cost_form_still_reads_the_negated_reward_slot():
+    rec = _record(REV, 900.0, 0.99, ref_lat=1000.0, ref_temp=1000.0,
+                  cost_form="absolute")
+    del rec[gt.CANDIDATE_LATENCY_KEY]
+    assert gt.record_latency_ns(rec) == pytest.approx(900.0)
+
+
+def test_reference_temp_key_is_the_one_env_writes():
+    """env.py writes ``ref_temp_bytes``.  Reading ``ref_mem_temp_bytes`` --
+    a name nothing has ever written -- made paired/temp_ratio_* NaN in every
+    run from 2026-09-05 to 2026-09-13 while the number sat on the record."""
+    assert gt.REF_TEMP_KEY == "ref_temp_bytes"
+    rec = _record(REV, 900.0, 0.99, ref_lat=1000.0, ref_temp=2000.0,
+                  temp=1000.0)
+    assert set(rec) & set(gt.REF_TEMP_KEY_ALIASES) == {gt.REF_TEMP_KEY}
+    out = gt.episode_fields([rec], head_names=HEADS)
+    assert out["paired/temp_ratio_best"] == pytest.approx(0.5)
+    # a plan log written under the retired name still scores
+    old = dict(rec)
+    old["ref_mem_temp_bytes"] = old.pop(gt.REF_TEMP_KEY)
+    out = gt.episode_fields([old], head_names=HEADS)
+    assert out["paired/temp_ratio_best"] == pytest.approx(0.5)
+
+
+def test_watermark_rides_beside_the_temp_channel():
+    """The .45 contract asks for the watermark BESIDE the temp channel; the
+    record carries both, so the paired panel carries both."""
+    rec = _record(REV, 900.0, 0.99, ref_lat=1000.0, ref_temp=1000.0,
+                  temp=800.0, watermark=1600.0, ref_watermark=4000.0)
+    out = gt.episode_fields([rec], head_names=HEADS)
+    assert out["paired/temp_ratio_best"] == pytest.approx(0.8)
+    assert out["paired/watermark_ratio_best"] == pytest.approx(0.4)
+    assert out["paired/n_with_watermark"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 11. G5's drift floor must exist on the order the campaign runs.
+# ---------------------------------------------------------------------------
+MARKOWITZ = [2, 4, 1, 3]          # not descending: no plan is ever rev-exact
+
+
+def test_drift_floor_comes_from_the_repeated_paired_reference():
+    """Under --fixed-order markowitz NO candidate is rev-exact on the wire,
+    so the rev-exact-candidate floor is structurally undefined and G5 had
+    nothing to compare a spread against.  Ticket .9 re-measures the SAME
+    reference once per candidate: its spread within the episode IS the
+    instrument drift."""
+    recs = [_record(MARKOWITZ, 900.0, 0.9, ref_lat=1000.0, ref_temp=1000.0),
+            _record(MARKOWITZ, 910.0, 0.9, ref_lat=1020.0, ref_temp=1000.0),
+            _record(MARKOWITZ, 905.0, 0.9, ref_lat=1010.0, ref_temp=1000.0)]
+    out = gt.episode_fields(recs, head_names=HEADS)
+    assert out["gate/g5/n_rev_exact"] == 0
+    assert math.isnan(out["gate/g5/drift_floor_lat_revexact"])
+    # (1020 - 1000) / 1010 = 0.0198
+    assert out["gate/g5/drift_floor_lat"] == pytest.approx(20.0 / 1010.0)
+    assert out["gate/g5/drift_floor_temp"] == pytest.approx(0.0)
+    assert out["gate/g5/drift_floor_n"] == 3
+
+
+def test_g5_present_is_zero_without_a_preference():
+    recs = [_record(MARKOWITZ, 900.0, 0.9, ref_lat=1000.0, ref_temp=1000.0)]
+    out = gt.episode_fields(recs, head_names=HEADS)
+    assert out["gate/g5/present"] == 0
+    assert out["gate/g5/n_unmatched"] == 1
+    assert gt.episode_fields(**_fake_episode())["gate/g5/present"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 12. TICKET .7: a counter drained in a process that does not own it.
+# ---------------------------------------------------------------------------
+def test_drain_provenance_flags_counters_read_in_the_wrong_process():
+    """The shape of the cancelled canary 65319: the measure actors report 16
+    terminal plans and ZERO records reach the trainer, so every gate field
+    below is computed over an empty episode while the counters say 16."""
+    canary = {"records": [], "terminals": 16, "dropped": 0,
+              "actors_seen": 1, "actors_failed": 0}
+    out = gt.drain_provenance({"records": []}, canary)
+    assert out["measure/drain/pool_terminals"] == 16
+    assert out["measure/drain/pool_records"] == 0
+    assert out["measure/drain/undrained"] == 16
+    assert out["measure/drain/ok"] == 0
+    with pytest.raises(gt.DrainProvenanceError) as e:
+        gt.drain_provenance({"records": []}, canary, strict=True)
+    assert "16" in str(e.value)
+
+
+def test_drain_provenance_is_ok_when_every_terminal_arrived():
+    ep = _fake_episode()
+    out = gt.episode_fields(**ep)
+    assert out["measure/drain/ok"] == 1
+    assert out["measure/drain/undrained"] == 0
+    assert out["measure/drain/local_records"] == 2
+    assert out["measure/drain/pool_records"] == 4
+    assert out["measure/drain/pool_terminals"] == 4
+    # a dropped record is accounted for, not undrained
+    ok = gt.drain_provenance(None, {"records": [1, 2], "terminals": 3,
+                                    "dropped": 1, "actors_seen": 1})
+    assert ok["measure/drain/undrained"] == 0 and ok["measure/drain/ok"] == 1
+
+
+def test_drain_provenance_flags_an_actor_that_could_not_be_polled():
+    out = gt.drain_provenance(None, {"records": [1], "terminals": 1,
+                                     "actors_seen": 2, "actors_failed": 1})
+    assert out["measure/drain/ok"] == 0
+    assert out["measure/drain/actors_failed"] == 1
+    with pytest.raises(gt.DrainProvenanceError):
+        gt.drain_provenance(None, {"records": [1], "terminals": 1,
+                                   "actors_seen": 2, "actors_failed": 1},
+                            strict=True)
+
+
+# ---------------------------------------------------------------------------
+# 13. The table IS the contract: a documented field nobody emits is a fault.
+# ---------------------------------------------------------------------------
+def test_a_documented_field_that_is_never_emitted_raises(monkeypatch):
+    monkeypatch.setattr(
+        gt, "FIELD_TABLE",
+        gt.FIELD_TABLE + (("gate/g9/invented", "count", "nothing", "G9"),))
+    with pytest.raises(KeyError) as e:
+        gt.episode_fields([], head_names=HEADS)
+    assert "gate/g9/invented" in str(e.value)

@@ -11791,6 +11791,7 @@ def main():
                 from alphagrad.approx.env import (
                     consume_plan_records as _plog_consume)
                 _plog_local = _plog_consume()
+                _plog_pool = None
                 _plog_recs = list(_plog_local["records"])
                 _plog_dropped = int(_plog_local["dropped"])
                 _plog_actors = 0
@@ -11862,8 +11863,15 @@ def main():
                     print(f"[plan-log] ep{ep}: pool drain failed "
                           f"({_plog_exc!r}) -- pooled plans are MISSING",
                           file=sys.stderr, flush=True)
-                # The gate telemetry below reads the same drained records.
+                # The gate telemetry below reads the same drained records,
+                # AND the two drain summaries, so measure/drain/* can say
+                # whether what the actors counted actually arrived here
+                # (ticket .7: a counter read in a process that does not own
+                # it reads 0 and nothing says so).
                 host_state["_gate_records"] = list(_plog_recs)
+                host_state["_gate_drain"] = (
+                    {"records": list(_plog_local.get("records") or ())},
+                    dict(_plog_pool or {}))
                 _plog_n0 = int(host_state.get("_plan_log_written", 0))
                 for _plog_j, _plog_r in enumerate(_plog_recs):
                     _plog_r["episode"] = int(ep)
@@ -11941,6 +11949,7 @@ def main():
         # gate). Field table: docs/GATE_TELEMETRY.md.
         try:
             _gate_recs = host_state.pop("_gate_records", [])
+            _gate_drain = host_state.pop("_gate_drain", (None, None))
             if "_gate_winners" not in host_state:
                 _gw, _gw_why = _gate_telemetry.load_winners_table(
                     getattr(args, "gate_winners_table", None))
@@ -11962,7 +11971,61 @@ def main():
                 except Exception as _gexc:
                     _gate_telemetry.print_reason(
                         "G1 primitive map absent", repr(_gexc))
-                if getattr(args, "face_actions", False) and not _NO_ORACLE:
+                host_state["_gate_mask_source"] = (
+                    _gate_telemetry.MASK_SOURCE_NONE)
+                _goo = np.asarray(op_legality_override, np.float32)
+                _gon = bool(getattr(args, "approx_profile", None)
+                            == "skip") or bool(np.any(_goo[:3] > 0.5))
+                if not getattr(args, "face_actions", False):
+                    _gate_telemetry.print_reason(
+                        "G3 floor absent", "no face head in this run")
+                elif _LIVE_FACES is not None:
+                    # THE LIVE PATH, WHICH IS EVERY CAMPAIGN ARM.
+                    # `_NO_ORACLE` is true whenever --live-faces is on, so
+                    # the oracle probe below never ran on the runs that
+                    # matter and every gate/g3/* floor field read NaN. The
+                    # live stream answers the same question per SLOT and
+                    # per QUANT dtype: `face_slot_legality` at the reset
+                    # state (no vertex eliminated, no face decided) is the
+                    # legality the head is masked by on its first look at
+                    # each face, and it is a pure function of the prefix,
+                    # so this costs one memoised probe per valid vertex,
+                    # once per run.
+                    try:
+                        _gvv = [int(_v) for _v in env.valid_vertices]
+                        _z32 = np.zeros((0,), np.int32)
+                        _gp, _gc, _gq, _gn = [], [], [], 0
+                        for _v in _gvv:
+                            (_sz, _qt, _pr, _cp, _no, _nf) = (
+                                _LIVE_FACES.face_slot_legality(
+                                    _z32, np.zeros((0, 1), np.int32), 0, _v))
+                            _nf = int(_nf)
+                            if _nf <= 0:
+                                continue
+                            _gp.append(np.asarray(_pr)[:_nf])
+                            _gc.append(np.asarray(_cp)[:_nf])
+                            _gq.append(np.asarray(_qt)[:_nf])
+                            _gn += _nf
+                        if _gn <= 0:
+                            raise RuntimeError(
+                                "the live face stream reported 0 faces over "
+                                f"{len(_gvv)} valid vertices at the reset "
+                                "state")
+                        host_state["_gate_legal"] = (
+                            _gate_telemetry.legal_counts_from_slot_masks(
+                                np.concatenate(_gp, 0),
+                                np.concatenate(_gc, 0),
+                                np.concatenate(_gq, 0), _gn,
+                                op_override=_goo, face_head_on=_gon,
+                                approx_add=str(getattr(
+                                    args, "approx_add",
+                                    _gate_telemetry.APPROX_ADD_DEFAULT))))
+                        host_state["_gate_mask_source"] = (
+                            _gate_telemetry.MASK_SOURCE_LIVE_SLOTS)
+                    except Exception as _gexc:
+                        _gate_telemetry.print_reason(
+                            "G3 floor absent (live slot masks)", repr(_gexc))
+                elif not _NO_ORACLE:
                     try:
                         _gm = _oracle_face_masks_host(
                             np.zeros((0,), np.int32), np.zeros((0,), np.int32), 0)
@@ -11972,19 +12035,21 @@ def main():
                         _gfv = np.concatenate([_gm[4][_v] for _v in _gvv], 0)
                         _gfq = (np.concatenate([_gm[6][_v] for _v in _gvv], 0)
                                 if len(_gm) > 6 else None)
-                        _goo = np.asarray(op_legality_override, np.float32)
-                        _gon = bool(getattr(args, "approx_profile", None)
-                                    == "skip") or bool(np.any(_goo[:3] > 0.5))
                         host_state["_gate_legal"] = (
                             _gate_telemetry.legal_counts_from_masks(
                                 _gfp, _gfc, _gfv, _gfq, _goo,
-                                face_head_on=_gon))
+                                face_head_on=_gon,
+                                approx_add=str(getattr(
+                                    args, "approx_add",
+                                    _gate_telemetry.APPROX_ADD_DEFAULT))))
+                        host_state["_gate_mask_source"] = (
+                            _gate_telemetry.MASK_SOURCE_ORACLE)
                     except Exception as _gexc:
                         _gate_telemetry.print_reason(
                             "G3 floor absent", repr(_gexc))
                 else:
                     _gate_telemetry.print_reason(
-                        "G3 floor absent", "no face head in this run")
+                        "G3 floor absent", "no legality source in this run")
             log_dict.update(_gate_telemetry.episode_fields(
                 _gate_recs,
                 head_names=HEAD_NAMES,
@@ -12000,7 +12065,14 @@ def main():
                 quality_floor=getattr(
                     args, _gate_telemetry.QUALITY_FLOOR_ATTR, None),
                 offline_contrast=getattr(
-                    args, "gate_offline_contrast", None)))
+                    args, "gate_offline_contrast", None),
+                approx_add=str(getattr(
+                    args, "approx_add",
+                    _gate_telemetry.APPROX_ADD_DEFAULT)),
+                mask_source=int(host_state.get(
+                    "_gate_mask_source",
+                    _gate_telemetry.MASK_SOURCE_NONE)),
+                drain_local=_gate_drain[0], drain_pool=_gate_drain[1]))
         except Exception as _gexc:
             _gate_telemetry.print_reason(
                 f"ep{ep} telemetry FAILED, fields absent", repr(_gexc))

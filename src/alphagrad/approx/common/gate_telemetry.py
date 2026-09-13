@@ -59,9 +59,27 @@ from alphagrad.approx.common.plan_log import decode_wires, kind_of_slot
 # Ticket .9's per-plan rev-exact reference, positive units, on the plan-log
 # record. Absent until .9 lands -> the paired fields read NaN.
 REF_LATENCY_KEY = "ref_latency_ns"
-REF_TEMP_KEY = "ref_mem_temp_bytes"
+# THE NAME THE RECORD ACTUALLY CARRIES.  env.py's plan record writes the
+# paired reference's static temp as ``ref_temp_bytes`` (env.py ~1643,
+# beside ``ref_latency_ns`` and ``ref_watermark_bytes``).  This module read
+# ``ref_mem_temp_bytes`` until 2026-09-13 -- a name nothing has ever
+# written -- so ``paired/temp_ratio_*`` read NaN in EVERY run since .45
+# landed while the number sat on the record.  The alias list is read in
+# order so a plan log written under either name still scores.
+REF_TEMP_KEY = "ref_temp_bytes"
+REF_TEMP_KEY_ALIASES = (REF_TEMP_KEY, "ref_mem_temp_bytes")
+# The runtime watermark of the SAME paired reference (ticket .49): the
+# contract asks for the watermark beside the temp channel, so the paired
+# panel carries its ratio next to the temp ratio rather than only the
+# per-episode means under measure/mem_parity/*.
+REF_WATERMARK_KEY = "ref_watermark_bytes"
+# THE PLAN'S OWN COST IN ABSOLUTE UNITS.  Under --cost-form paired-log the
+# reward slots hold log-differences, so the record carries the ns and the
+# bytes separately (env.py ~1646) and every ratio here is built from these.
+CANDIDATE_LATENCY_KEY = "candidate_latency_ns"
 # Ticket .49's memory fields on the record (always present since .49).
 TEMP_KEY = "mem_temp_bytes"
+WATERMARK_KEY = "mem_watermark_bytes"
 # Ticket .9's quality floor flag on ``args`` (None = no floor set).
 QUALITY_FLOOR_ATTR = "quality_floor"
 
@@ -70,10 +88,27 @@ QUALITY_FLOOR_ATTR = "quality_floor"
 SENTINEL_COST = -1e10
 _SENTINEL_EDGE = SENTINEL_COST * 0.99
 
-# Head layout of the 94-logit face head (unified_face_head.py): a skip
-# Bernoulli, then FACE_SLOTS slots of (op, i, j, axis, reduce_fn, dtype).
-FACE_SLOTS = 3
-NUM_REDUCE_FNS = 5
+# THE FACE HEAD'S GEOMETRY IS DERIVED, NEVER TYPED (owner ruling
+# 2026-09-13).  ``unified_face_head`` is the single source of truth for the
+# width, the slot count and every per-slot field size; ``masks`` owns the
+# QUANT dtype set, which is now the FOUR floats (float32, bfloat16,
+# float8_e5m2, float8_e4m3fn).  The G3 uniform floor counts the leaves
+# ``UnifiedFaceHead.score`` can reach, so it MUST move when this table
+# moves: a literal here (the old ``FACE_SLOTS = 3`` / one legal cast) makes
+# the floor describe a head that is not running, and G3 then compares the
+# entropy against the wrong number in a direction nobody notices.
+from alphagrad.approx.unified_face_head import (  # noqa: E402
+    FACE_SLOTS, MAX_PAIR_IDX, NUM_REDUCE_AXES, NUM_REDUCE_FNS, SLOT_WIDTH,
+    head_layout)
+from alphagrad.approx.common.masks import (  # noqa: E402
+    FACE_QUANT_DTYPES, NUM_FACE_QUANT_DTYPES)
+
+#: The ``--approx-add`` value whose layout the floor is computed under when
+#: the caller names none.  ``lossless`` is the one value every 2026-09-13
+#: arm runs (owner ruling); it is NOT a fallback for an unknown value --
+#: ``head_layout`` raises on those.
+APPROX_ADD_DEFAULT = "lossless"
+
 # Order of the (NUM_OPS,) legality override the trainer builds
 # (ppo._op_legality_for_variant): DIAG, COMPRESS (= Reduce), QUANT, END.
 OP_DIAG, OP_COMPRESS, OP_QUANT = 0, 1, 2
@@ -105,6 +140,12 @@ FIELD_TABLE: tuple[tuple[str, str, str, str], ...] = (
     ("paired/grad_cosine_mean", "cosine", "mean quality (reward slot 'quality') over live records", "G4"),
     ("paired/grad_cosine_median", "cosine", "median of the same", "G4"),
     ("paired/grad_cosine_best", "cosine", "max of the same", "G4"),
+    ("paired/watermark_ratio_mean", "ratio", "mean of " + WATERMARK_KEY + " / " + REF_WATERMARK_KEY + ": the runtime watermark BESIDE the temp channel (ticket .49)", "G5"),
+    ("paired/watermark_ratio_median", "ratio", "median of the same", "G5"),
+    ("paired/watermark_ratio_best", "ratio", "min of the same", "G5"),
+    ("paired/n_with_watermark", "count", "live records carrying both watermark numbers", "-"),
+    ("paired/ref_latency_ns_mean", "ns", "mean of " + REF_LATENCY_KEY + ": the rev-exact reference re-measured once per candidate", "G5"),
+    ("paired/ref_temp_bytes_mean", "bytes", "mean of " + REF_TEMP_KEY + ": the same reference's static temp", "G5"),
     # G1
     ("gate/g1/present", "0/1", "1 when a winners table was loaded (--gate-winners-table)", "G1"),
     ("gate/g1/n_winners", "count", "rows in the winners table", "G1"),
@@ -125,6 +166,10 @@ FIELD_TABLE: tuple[tuple[str, str, str, str], ...] = (
     ("gate/g3/entropy_over_floor", "ratio", "face_entropy_nats / uniform_floor_nats", "G3"),
     ("gate/g3/n_faces", "count", "faces the floor was computed over", "G3"),
     ("gate/g3/n_outcomes_max", "count", "largest legal joint-outcome count of any face", "G3"),
+    ("gate/g3/n_slots", "count", "slots the floor was summed over: head_layout(--approx-add).n_slots, never a literal", "G3"),
+    ("gate/g3/head_width", "count", "head_layout(--approx-add).width, the logit count the floor describes", "G3"),
+    ("gate/g3/n_quant_dtypes", "count", "len(masks.FACE_QUANT_DTYPES): the QUANT categorical the floor counts leaves of", "G3"),
+    ("gate/g3/mask_source", "0/1/2", "where the legality came from: 0 none, 1 the oracle probe, 2 the live per-slot masks", "G3"),
     # G4
     ("gate/g4/n", "count", "live records with a finite quality", "G4"),
     ("gate/g4/q_zero_frac", "fraction", "share of those with quality exactly 0 (destroyed Jacobian)", "G4"),
@@ -136,13 +181,25 @@ FIELD_TABLE: tuple[tuple[str, str, str, str], ...] = (
     ("gate/g5/{corner}/best_temp_ratio", "ratio", "min paired temp ratio among them", "G5"),
     ("gate/g5/spread_lat", "ratio", "max - min over corners of best_lat_ratio", "G5"),
     ("gate/g5/spread_temp", "ratio", "max - min over corners of best_temp_ratio", "G5"),
+    ("gate/g5/present", "0/1", "1 when at least one live record sat at a named corner (a preference reached the telemetry); 0 on an arm without --preference-conditioned, where a spread is undefined rather than 0", "G5"),
     ("gate/g5/n_rev_exact", "count", "live records whose plan IS rev-exact (reverse order, no approximation)", "G5"),
-    ("gate/g5/drift_floor_lat", "ratio", "max - min of the latency ratio over those rev-exact records (their ratio is pure drift)", "G5"),
-    ("gate/g5/drift_floor_temp", "ratio", "the same for the temp ratio (0 when the static temp is deterministic)", "G5"),
+    ("gate/g5/drift_floor_lat", "ratio", "PAIRED-REFERENCE drift: (max - min) / mean of " + REF_LATENCY_KEY + " over this episode's live records -- the same rev-exact plan re-measured once per candidate, so its spread is pure instrument drift. Defined on every order, including --fixed-order markowitz where no candidate is itself rev-exact", "G5"),
+    ("gate/g5/drift_floor_temp", "ratio", "the same over " + REF_TEMP_KEY + " (0 when the static temp is deterministic)", "G5"),
+    ("gate/g5/drift_floor_n", "count", "records the drift floor was computed over", "G5"),
+    ("gate/g5/drift_floor_lat_revexact", "ratio", "max - min of the latency RATIO over the rev-exact records only; NaN with fewer than two (the pre-2026-09-13 definition, kept for the reverse-order control)", "G5"),
+    ("gate/g5/drift_floor_temp_revexact", "ratio", "the same for the temp ratio", "G5"),
     ("gate/g5/n_unmatched", "count", "records that matched no env row (no preference known)", "G5"),
     # G6
     ("gate/g6/present", "0/1", "1 when --gate-offline-contrast was given", "G6"),
     ("gate/g6/offline_contrast", "fraction", "ticket .42's offline contrast, copied from the flag; NaN when absent", "G6"),
+    # DRAIN PROVENANCE (ticket .7's failure mode, named by the .45 contract)
+    ("measure/drain/local_records", "count", "plan records the TRAINER's own env handed over this episode", "drain"),
+    ("measure/drain/pool_records", "count", "plan records the MEASURE ACTORS handed over this episode", "drain"),
+    ("measure/drain/pool_terminals", "count", "terminal plans the measure actors say they measured", "drain"),
+    ("measure/drain/undrained", "count", "pool_terminals not accounted for by pool_records + dropped: a counter incremented in the actor and read in a process that does not own it reads > 0 here", "drain"),
+    ("measure/drain/ok", "0/1", "1 when undrained == 0 and every polled actor answered", "drain"),
+    ("measure/drain/actors_seen", "count", "measure actors the pool knows about", "drain"),
+    ("measure/drain/actors_failed", "count", "actors that could not be polled: their plans are MISSING", "drain"),
 )
 
 # Logged by other tickets' code on the same drain; listed so the doc is one table.
@@ -261,8 +318,39 @@ def record_is_live(rec: dict) -> bool:
     return True
 
 
+def _first_float(rec: dict, keys) -> float:
+    for k in keys:
+        v = _get_float(rec, k)
+        if math.isfinite(v):
+            return v
+    return NAN
+
+
 def record_latency_ns(rec: dict) -> float:
-    """POSITIVE measured latency in ns (the reward slot stores -ns)."""
+    """POSITIVE measured latency of THIS plan, in ns.
+
+    THE REWARD SLOT IS NOT THE LATENCY under the settled cost form.  With
+    ``--cost-form paired-log`` (ticket .9, every 2026-09-13 arm) slot
+    ``latency_ns`` holds ``-(log lat_candidate - log lat_ref)`` -- a
+    dimensionless log-difference that is POSITIVE for a plan faster than the
+    reference.  Negating it gave a negative "latency" and the ``> 0`` guard
+    below turned every paired ratio into NaN: that is why
+    ``paired/lat_ratio_*`` and ``paired/n_with_ref`` read NaN / 0 in job
+    65321 while ``ref_latency_ns`` sat on every record.
+
+    ``candidate_latency_ns`` is the ns env.py records beside the reference
+    for exactly this purpose ("so a record can be re-scored in absolute
+    units", env.py ~1646).  It is preferred; the negated reward slot is the
+    fallback for a record written under ``--cost-form absolute``, where the
+    slot really is ``-ns``.
+    """
+    v = _get_float(rec, CANDIDATE_LATENCY_KEY)
+    if math.isfinite(v) and v > 0.0:
+        return v
+    if str(rec.get("cost_form") or "") == "paired-log":
+        # The slot is a log-difference here; there is no ns to recover and
+        # inventing one from it would be a fabricated measurement.
+        return NAN
     i = _idx(rec.get("reward_names"), "latency_ns")
     if i is None or i >= len(rec.get("rewards") or ()):
         return NAN
@@ -277,6 +365,17 @@ def record_temp_bytes(rec: dict) -> float:
     """XLA static temp bytes of the plan's timed executable (ticket .49)."""
     v = _get_float(rec, TEMP_KEY)
     return v if (math.isfinite(v) and v >= 0.0) else NAN
+
+
+def record_watermark_bytes(rec: dict) -> float:
+    """Runtime peak watermark of the plan's timed executable (ticket .49),
+    the number logged BESIDE the temp channel."""
+    v = _get_float(rec, WATERMARK_KEY)
+    return v if (math.isfinite(v) and v >= 0.0) else NAN
+
+
+def record_ref_temp_bytes(rec: dict) -> float:
+    return _first_float(rec, REF_TEMP_KEY_ALIASES)
 
 
 def record_quality(rec: dict) -> float:
@@ -301,12 +400,23 @@ def record_is_rev_exact(rec: dict) -> bool:
 
 
 def paired_ratios(records) -> dict:
-    """Per-record arrays: latency ratio, temp ratio, quality, liveness,
-    rev-exactness. Ratios are NaN where the record lacks .9's reference."""
+    """Per-record arrays: latency ratio, static-temp ratio, watermark ratio,
+    quality, liveness, rev-exactness, and the reference's own measurements.
+
+    Ratios are NaN where the record lacks ticket .9's reference.  The
+    ``ref_*`` arrays are kept because they are the SAME rev-exact plan
+    re-measured once per candidate, in the same actor, back to back: their
+    spread within one episode is pure instrument drift, and that is the
+    drift floor G5 compares a front spread against on an order where no
+    candidate is itself rev-exact (every ``--fixed-order markowitz`` arm).
+    """
     n = len(records)
     lat = np.full(n, NAN)
     temp = np.full(n, NAN)
+    wm = np.full(n, NAN)
     q = np.full(n, NAN)
+    ref_lat = np.full(n, NAN)
+    ref_temp = np.full(n, NAN)
     live = np.zeros(n, dtype=bool)
     rev = np.zeros(n, dtype=bool)
     has_ref = np.zeros(n, dtype=bool)
@@ -317,14 +427,23 @@ def paired_ratios(records) -> dict:
             continue
         q[k] = record_quality(rec)
         c_lat, r_lat = record_latency_ns(rec), _get_float(rec, REF_LATENCY_KEY)
+        if math.isfinite(r_lat) and r_lat > 0.0:
+            ref_lat[k] = r_lat
         if math.isfinite(c_lat) and math.isfinite(r_lat) and r_lat > 0.0:
             lat[k] = c_lat / r_lat
             has_ref[k] = True
-        c_t, r_t = record_temp_bytes(rec), _get_float(rec, REF_TEMP_KEY)
+        c_t, r_t = record_temp_bytes(rec), record_ref_temp_bytes(rec)
+        if math.isfinite(r_t) and r_t > 0.0:
+            ref_temp[k] = r_t
         if math.isfinite(c_t) and math.isfinite(r_t) and r_t > 0.0:
             temp[k] = c_t / r_t
-    return {"lat_ratio": lat, "temp_ratio": temp, "quality": q,
-            "live": live, "rev_exact": rev, "has_ref": has_ref}
+        c_w, r_w = record_watermark_bytes(rec), _get_float(rec,
+                                                           REF_WATERMARK_KEY)
+        if math.isfinite(c_w) and math.isfinite(r_w) and r_w > 0.0:
+            wm[k] = c_w / r_w
+    return {"lat_ratio": lat, "temp_ratio": temp, "watermark_ratio": wm,
+            "quality": q, "live": live, "rev_exact": rev, "has_ref": has_ref,
+            "ref_latency_ns": ref_lat, "ref_temp_bytes": ref_temp}
 
 
 # ---------------------------------------------------------------------------
@@ -534,12 +653,133 @@ def explained_variance_per_head(targets, predictions, head_names) -> dict:
 # ---------------------------------------------------------------------------
 # G3 -- face-head entropy against its uniform floor.
 # ---------------------------------------------------------------------------
+def face_head_geometry(approx_add: str = APPROX_ADD_DEFAULT) -> dict:
+    """The per-slot choice arithmetic of the RUNNING face head, DERIVED.
+
+    Every number here comes from ``unified_face_head`` (the layout table
+    ``_LAYOUT_SPEC``, the per-slot field offsets) or from
+    ``common.masks.FACE_QUANT_DTYPES``.  Nothing is typed, so a width change
+    -- a fourth QUANT dtype, a join slot, another reduce fn -- moves the G3
+    floor with it instead of leaving G3 comparing the head's entropy against
+    the arithmetic of a head that stopped running.
+
+    ``n_quant_default`` is the number of legal QUANT dtypes on a face whose
+    mask says only "QUANT is legal here" without saying which casts: the
+    operand's own dtype is masked (ticket .40 D4; finding 62 measured
+    ``slot_legality.quant == [False, True, True, True]`` over the four
+    floats), so it is ``K - 1``, not 1.
+    """
+    layout = head_layout(approx_add)
+    if layout.width != O_SLOT0_OFFSET + SLOT_WIDTH * layout.n_slots + int(
+            layout.has_choose):
+        raise ValueError(
+            f"head_layout({approx_add!r}) reports width {layout.width}, which "
+            f"is not 1 + {SLOT_WIDTH}*{layout.n_slots}"
+            f"{' + 1' if layout.has_choose else ''}. The G3 floor counts the "
+            f"leaves of THAT arithmetic; a width that does not match it would "
+            f"make the floor describe a different head.")
+    return {
+        "mode": layout.mode,
+        "width": int(layout.width),
+        "n_slots": int(layout.n_slots),
+        "slot_width": int(SLOT_WIDTH),
+        "n_pair_idx": int(MAX_PAIR_IDX),
+        "n_reduce_axes": int(NUM_REDUCE_AXES),
+        "n_reduce_fns": int(NUM_REDUCE_FNS),
+        "n_quant_dtypes": int(NUM_FACE_QUANT_DTYPES),
+        "n_quant_default": int(NUM_FACE_QUANT_DTYPES) - 1,
+        "quant_dtypes": tuple(FACE_QUANT_DTYPES),
+        # The number of legal joint outcomes per face if EVERY choice of
+        # every slot were legal, skip included.  The upper bound the live
+        # masks cut down; logged so a run states the head it ran.
+        "max_outcomes_per_face": 1 + (
+            1 + MAX_PAIR_IDX * (MAX_PAIR_IDX - 1)
+            + NUM_REDUCE_AXES * NUM_REDUCE_FNS
+            + (NUM_FACE_QUANT_DTYPES - 1)) ** int(layout.n_slots),
+    }
+
+
+#: ``unified_face_head.O_SLOT0`` under a name that says what it is here.
+O_SLOT0_OFFSET = 1
+
+
+def legal_counts_from_slot_masks(pair, comp, quant, n_faces, *,
+                                 op_override=None, face_head_on=True,
+                                 approx_add: str = APPROX_ADD_DEFAULT):
+    """Per-face, PER-SLOT legal choice counts from the LIVE per-slot masks.
+
+    ``LiveFaceStream.face_slot_legality`` returns ``pair (F, S, N, N)``,
+    ``comp (F, S, N)`` and ``quant (F, S, K)`` -- the masks the head is
+    actually masked by on the ``--live-faces`` path, per slot and per QUANT
+    dtype.  This is the source the G3 floor MUST use on that path: the
+    oracle probe :func:`legal_counts_from_masks` reads is switched off
+    whenever ``--live-faces`` is on (``ppo._NO_ORACLE``), which is every
+    campaign arm -- so before 2026-09-13 every ``gate/g3/*`` floor field
+    read NaN in every run that mattered.
+
+    ``S`` comes from the array, and the array's ``S`` comes from
+    ``env.face_slot_sites()``, which follows ``--approx-add``; ``K`` comes
+    from the array too.  Nothing here is a literal.
+
+    Returns ``(n_choices (F_live, S) int64, skip_legal (F_live,) bool)``.
+    """
+    geom = face_head_geometry(approx_add)
+    pair = np.asarray(pair, dtype=np.float64)
+    comp = np.asarray(comp, dtype=np.float64)
+    quant = np.asarray(quant, dtype=np.float64)
+    if pair.ndim != 4 or comp.ndim != 3 or quant.ndim != 3:
+        raise ValueError(
+            f"per-slot masks must be (F,S,N,N), (F,S,N) and (F,S,K); got "
+            f"{pair.shape}, {comp.shape}, {quant.shape}. A silently reshaped "
+            f"mask would give a floor for a head nobody ran.")
+    nf = int(n_faces)
+    if nf < 0 or nf > pair.shape[0]:
+        raise ValueError(f"n_faces {nf} outside the mask's face axis "
+                         f"{pair.shape[0]}")
+    S = int(pair.shape[1])
+    if S < geom["n_slots"]:
+        raise ValueError(
+            f"the per-slot masks carry {S} slots but --approx-add "
+            f"{geom['mode']!r} has {geom['n_slots']}: a slot the width HAS "
+            f"would go uncounted in the G3 floor.")
+    d_ok, r_ok, q_ok = _op_override_flags(op_override)
+    n = np.ones((nf, S), dtype=np.int64)
+    for f in range(nf):
+        for s in range(S):
+            per_slot = 1                      # the None leaf
+            if d_ok:
+                pm = pair[f, s] > 0.5
+                np.fill_diagonal(pm, False)   # j_mask_given_i removes i
+                per_slot += int(pm.sum())
+            if r_ok:
+                per_slot += int((comp[f, s] > 0.5).sum()) * geom["n_reduce_fns"]
+            if q_ok:
+                per_slot += int((quant[f, s] > 0.5).sum())
+            n[f, s] = per_slot
+    skip_legal = np.full(nf, bool(face_head_on), dtype=bool)
+    return n, skip_legal
+
+
+def _op_override_flags(op_override):
+    if op_override is None:
+        return True, True, True
+    oo = np.asarray(op_override, dtype=np.float64).reshape(-1)
+    return (bool(oo[OP_DIAG] > 0.5) if oo.size > OP_DIAG else True,
+            bool(oo[OP_COMPRESS] > 0.5) if oo.size > OP_COMPRESS else True,
+            bool(oo[OP_QUANT] > 0.5) if oo.size > OP_QUANT else True)
+
+
 def legal_counts_from_masks(fpair, fcomp, fvalid, fquant=None,
-                            op_override=None, *, n_reduce_fns=NUM_REDUCE_FNS,
-                            face_head_on=True):
-    """Per-face legal choice counts for the 94-logit head, from the oracle's
-    per-face masks (the arrays ``face_masks_all`` carries; ticket .59's
-    bottom-up rule, ticket .40's profile override).
+                            op_override=None, *, n_reduce_fns=None,
+                            face_head_on=True,
+                            approx_add: str = APPROX_ADD_DEFAULT):
+    """Per-face legal choice counts for the RUNNING face head, from the
+    oracle's per-face masks (the arrays ``face_masks_all`` carries; ticket
+    .59's bottom-up rule, ticket .40's profile override).
+
+    THE ORACLE PATH ONLY.  ``ppo._NO_ORACLE`` is true whenever
+    ``--live-faces`` is on, so every campaign arm takes
+    :func:`legal_counts_from_slot_masks` instead.
 
     ``fpair`` (F, N, N) pair legality (already gcd-screened by the env),
     ``fcomp`` (F, N) reduce-axis legality, ``fvalid`` (F,) live faces,
@@ -555,18 +795,25 @@ def legal_counts_from_masks(fpair, fcomp, fvalid, fquant=None,
     path); under --face-slot-frames each slot has its own live masks and
     the floor logged is the static one.
     """
+    geom = face_head_geometry(approx_add)
+    n_reduce_fns = (geom["n_reduce_fns"] if n_reduce_fns is None
+                    else int(n_reduce_fns))
+    n_slots = geom["n_slots"]
+    n_quant_default = geom["n_quant_default"]
     fpair = np.asarray(fpair, dtype=np.float64)
     fcomp = np.asarray(fcomp, dtype=np.float64)
     fvalid = np.asarray(fvalid, dtype=np.float64).reshape(-1)
     live = np.nonzero(fvalid > 0.5)[0]
-    if op_override is None:
-        d_ok, r_ok, q_ok = True, True, True
-    else:
-        oo = np.asarray(op_override, dtype=np.float64).reshape(-1)
-        d_ok = bool(oo[OP_DIAG] > 0.5) if oo.size > OP_DIAG else True
-        r_ok = bool(oo[OP_COMPRESS] > 0.5) if oo.size > OP_COMPRESS else True
-        q_ok = bool(oo[OP_QUANT] > 0.5) if oo.size > OP_QUANT else True
-    n = np.ones((live.size, FACE_SLOTS), dtype=np.int64)
+    d_ok, r_ok, q_ok = _op_override_flags(op_override)
+    fq2 = None
+    fq1 = None
+    if fquant is not None:
+        fq = np.asarray(fquant, dtype=np.float64)
+        if fq.ndim == 2 and fq.shape[1] == geom["n_quant_dtypes"]:
+            fq2 = fq          # (F, K): an exact per-dtype legality row
+        else:
+            fq1 = fq.reshape(-1)   # (F,): "QUANT is legal on this face"
+    n = np.ones((live.size, n_slots), dtype=np.int64)
     for row, f in enumerate(live):
         per_slot = 1
         if d_ok and fpair.ndim == 3 and f < fpair.shape[0]:
@@ -574,13 +821,21 @@ def legal_counts_from_masks(fpair, fcomp, fvalid, fquant=None,
             np.fill_diagonal(pm, False)          # j_mask_given_i removes i
             per_slot += int(pm.sum())
         if r_ok and fcomp.ndim == 2 and f < fcomp.shape[0]:
-            per_slot += int((fcomp[f] > 0.5).sum()) * int(n_reduce_fns)
+            per_slot += int((fcomp[f] > 0.5).sum()) * n_reduce_fns
         if q_ok:
-            if fquant is None:
-                per_slot += 1
+            if fq2 is not None:
+                per_slot += int((fq2[f] > 0.5).sum()) if f < fq2.shape[0] else 0
+            elif fq1 is not None:
+                # A LEGALITY BIT IS NOT A COUNT.  The oracle's per-face QUANT
+                # array is (F,) -- "some cast is legal here" -- and the head
+                # then offers every dtype but the operand's own, i.e. K - 1
+                # of the four floats.  Adding 1 here (the pre-2026-09-13
+                # code, written when the set was {float32, bfloat16}) states
+                # a floor for a two-dtype head.
+                per_slot += (n_quant_default
+                             if (f < fq1.size and fq1[f] > 0.5) else 0)
             else:
-                fq = np.asarray(fquant, dtype=np.float64).reshape(-1)
-                per_slot += int(fq[f] > 0.5) if f < fq.size else 0
+                per_slot += n_quant_default
         n[row, :] = per_slot
     skip_legal = np.full(live.size, bool(face_head_on), dtype=bool)
     return n, skip_legal
@@ -613,7 +868,21 @@ def uniform_floor(n_choices, skip_legal) -> dict:
             "n_outcomes_max": int(N.max())}
 
 
-def g3_face_entropy(face_entropy_nats, n_choices=None, skip_legal=None) -> dict:
+#: ``gate/g3/mask_source`` values.
+MASK_SOURCE_NONE, MASK_SOURCE_ORACLE, MASK_SOURCE_LIVE_SLOTS = 0, 1, 2
+
+
+def g3_face_entropy(face_entropy_nats, n_choices=None, skip_legal=None, *,
+                    approx_add: str = APPROX_ADD_DEFAULT,
+                    mask_source: int = MASK_SOURCE_NONE) -> dict:
+    """G3: the head's entropy against the floor of the head that ran.
+
+    The three geometry rows are DERIVED from ``head_layout(approx_add)`` and
+    ``masks.FACE_QUANT_DTYPES`` on every call, so a run states the head its
+    floor was computed for and a layout change cannot leave a stale floor
+    looking valid.
+    """
+    geom = face_head_geometry(approx_add)
     fl = (uniform_floor(n_choices, skip_legal)
           if n_choices is not None and skip_legal is not None
           else {"per_face": NAN, "arity_norm": NAN, "n_faces": 0,
@@ -627,7 +896,11 @@ def g3_face_entropy(face_entropy_nats, n_choices=None, skip_legal=None) -> dict:
             "gate/g3/uniform_floor_per_face_nats": fl["per_face"],
             "gate/g3/entropy_over_floor": ratio,
             "gate/g3/n_faces": fl["n_faces"],
-            "gate/g3/n_outcomes_max": fl["n_outcomes_max"]}
+            "gate/g3/n_outcomes_max": fl["n_outcomes_max"],
+            "gate/g3/n_slots": geom["n_slots"],
+            "gate/g3/head_width": geom["width"],
+            "gate/g3/n_quant_dtypes": geom["n_quant_dtypes"],
+            "gate/g3/mask_source": int(mask_source)}
 
 
 # ---------------------------------------------------------------------------
@@ -698,10 +971,39 @@ def match_records_to_envs(records, all_rets, reward_names) -> np.ndarray:
     return out
 
 
+def _relative_spread(x) -> float:
+    """(max - min) / |mean| of the finite entries, NaN below two entries.
+
+    Dimensionless so a latency drift in ns and a memory drift in bytes are
+    comparable with a RATIO spread, which is what G5 subtracts them from.
+    """
+    v = _finite(x)
+    if v.size < 2:
+        return NAN
+    m = float(np.abs(v.mean()))
+    if not (m > 0.0):
+        return NAN
+    return float((v.max() - v.min()) / m)
+
+
 def g5_front_spread(lat_ratio, temp_ratio, corners, head_names,
-                    rev_exact=None, live=None) -> dict:
+                    rev_exact=None, live=None,
+                    ref_latency_ns=None, ref_temp_bytes=None) -> dict:
     """Per corner: the best paired ratios among plans measured under it;
-    the spread across corners; the live drift floor from rev-exact plans."""
+    the spread across corners; and the DRIFT FLOOR the spread must beat.
+
+    THE DRIFT FLOOR COMES FROM THE PAIRED REFERENCE, not from candidates
+    that happen to be rev-exact.  ``record_is_rev_exact`` is decided on the
+    wire -- strictly descending elimination order, no rule, no face row --
+    and under ``--fixed-order markowitz`` (every 2026-09-13 arm) NO plan
+    ever satisfies it, so the old floor was structurally NaN and G5 had
+    nothing to compare against.  Ticket .9 re-measures the SAME rev-exact
+    reference once per candidate, in the same actor, back to back: the
+    spread of ``ref_latency_ns`` / ``ref_temp_bytes`` within one episode is
+    exactly the instrument's own noise on the same computation.  The
+    rev-exact-candidate definition is kept beside it under
+    ``*_revexact`` for the reverse-order control of ticket .60.
+    """
     lat = np.asarray(lat_ratio, dtype=np.float64).reshape(-1)
     temp = np.asarray(temp_ratio, dtype=np.float64).reshape(-1)
     n = lat.size
@@ -724,14 +1026,80 @@ def g5_front_spread(lat_ratio, temp_ratio, corners, head_names,
     fl, ft = _finite(bests_lat), _finite(bests_temp)
     out["gate/g5/spread_lat"] = float(fl.max() - fl.min()) if fl.size >= 2 else NAN
     out["gate/g5/spread_temp"] = float(ft.max() - ft.min()) if ft.size >= 2 else NAN
+    # PRESENT: did ANY live record sit at a named corner?  An arm without
+    # --preference-conditioned has one implicit weighting and no simplex to
+    # spread over; saying so beats emitting NaN with no reason.
+    out["gate/g5/present"] = int(any(
+        c is not None for c, lv in zip(corners, live) if lv))
     rsel = rev & live
     out["gate/g5/n_rev_exact"] = int(rsel.sum())
     rl, rt = _finite(lat[rsel]), _finite(temp[rsel])
-    out["gate/g5/drift_floor_lat"] = float(rl.max() - rl.min()) if rl.size >= 2 else NAN
-    out["gate/g5/drift_floor_temp"] = float(rt.max() - rt.min()) if rt.size >= 2 else NAN
+    out["gate/g5/drift_floor_lat_revexact"] = (
+        float(rl.max() - rl.min()) if rl.size >= 2 else NAN)
+    out["gate/g5/drift_floor_temp_revexact"] = (
+        float(rt.max() - rt.min()) if rt.size >= 2 else NAN)
+    rlat = (np.full(n, NAN) if ref_latency_ns is None
+            else np.asarray(ref_latency_ns, dtype=np.float64).reshape(-1))
+    rtmp = (np.full(n, NAN) if ref_temp_bytes is None
+            else np.asarray(ref_temp_bytes, dtype=np.float64).reshape(-1))
+    out["gate/g5/drift_floor_lat"] = _relative_spread(rlat[live])
+    out["gate/g5/drift_floor_temp"] = _relative_spread(rtmp[live])
+    out["gate/g5/drift_floor_n"] = int(_finite(rlat[live]).size)
     out["gate/g5/n_unmatched"] = int(sum(1 for c, lv in zip(corners, live)
                                          if lv and c is None))
     return out
+
+
+# ---------------------------------------------------------------------------
+# DRAIN PROVENANCE -- ticket .7's failure mode, which the .45 contract names.
+# ---------------------------------------------------------------------------
+class DrainProvenanceError(ValueError):
+    """A counter was read in a process that does not own it.
+
+    Ticket .7: ``grad_cov/*`` incremented inside the Ray measure actors and
+    was drained in the trainer, so it read 0 for all 16,192 plans of wave 1
+    and nothing said so.  The same shape reappeared in the cancelled canary
+    65319: ``pool_terminals=16`` beside ``pooled=0``.
+    """
+
+
+def drain_provenance(local=None, pool=None, *, strict: bool = False) -> dict:
+    """Audit one episode's plan-record drain against what the actors say
+    they measured.
+
+    ``local`` is ``env.consume_plan_records()``'s own summary (the trainer's
+    process), ``pool`` is ``measure_pool.merge_pool_plan_records``'s.  The
+    actors count their terminals themselves; if the records that reached
+    this process do not account for them, a counter incremented in the
+    actor is being read here and the telemetry built on it is fiction.
+
+    ``strict=True`` raises :class:`DrainProvenanceError` instead of
+    reporting, for the test that must FAIL on the .7 shape.
+    """
+    local = dict(local or {})
+    pool = dict(pool or {})
+    n_local = len(list(local.get("records") or ()))
+    n_pool = len(list(pool.get("records") or ()))
+    terminals = int(pool.get("terminals", 0) or 0)
+    dropped = int(pool.get("dropped", 0) or 0)
+    seen = int(pool.get("actors_seen", 0) or 0)
+    failed = int(pool.get("actors_failed", 0) or 0)
+    undrained = max(0, terminals - (n_pool + dropped))
+    ok = int(undrained == 0 and failed == 0)
+    if strict and not ok:
+        raise DrainProvenanceError(
+            f"the measure actors report {terminals} terminal plan(s) but "
+            f"{n_pool} record(s) (+{dropped} dropped) reached this process "
+            f"and {failed} actor(s) could not be polled: {undrained} plan(s) "
+            f"are counted where they are NOT owned (ticket .7). Every gate "
+            f"field computed from this drain would understate by that many.")
+    return {"measure/drain/local_records": n_local,
+            "measure/drain/pool_records": n_pool,
+            "measure/drain/pool_terminals": terminals,
+            "measure/drain/undrained": int(undrained),
+            "measure/drain/ok": ok,
+            "measure/drain/actors_seen": seen,
+            "measure/drain/actors_failed": failed}
 
 
 # ---------------------------------------------------------------------------
@@ -818,7 +1186,10 @@ def env_preferences(critic) -> np.ndarray | None:
 def episode_fields(records, *, head_names, all_rets=None, reward_names=None,
                    critic=None, face_entropy_nats=None, legal=None,
                    winners=None, vertex_primitive=None, quality_floor=None,
-                   offline_contrast=None, corner_tol: float = 0.9) -> dict:
+                   offline_contrast=None, corner_tol: float = 0.9,
+                   approx_add: str = APPROX_ADD_DEFAULT,
+                   mask_source: int = MASK_SOURCE_NONE,
+                   drain_local=None, drain_pool=None) -> dict:
     """Every gate field for one episode. Missing inputs give NaN / 0 /
     absent-flags, never an exception from a missing piece.
 
@@ -837,17 +1208,26 @@ def episode_fields(records, *, head_names, all_rets=None, reward_names=None,
     out["paired/n_with_ref"] = int((pr["has_ref"] & live).sum())
     for key, arr, best in (("lat_ratio", pr["lat_ratio"], "min"),
                            ("temp_ratio", pr["temp_ratio"], "min"),
+                           ("watermark_ratio", pr["watermark_ratio"], "min"),
                            ("grad_cosine", pr["quality"], "max")):
-        s = summary(arr[live], best=best)
-        out[f"paired/{key}_mean"] = s["mean"]
-        out[f"paired/{key}_median"] = s["median"]
-        out[f"paired/{key}_best"] = s["best"]
+        st = summary(arr[live], best=best)
+        out[f"paired/{key}_mean"] = st["mean"]
+        out[f"paired/{key}_median"] = st["median"]
+        out[f"paired/{key}_best"] = st["best"]
+    out["paired/n_with_watermark"] = int(
+        np.isfinite(pr["watermark_ratio"][live]).sum())
+    out["paired/ref_latency_ns_mean"] = summary(
+        pr["ref_latency_ns"][live])["mean"]
+    out["paired/ref_temp_bytes_mean"] = summary(
+        pr["ref_temp_bytes"][live])["mean"]
     out.update(g1_recovery(records, winners, vertex_primitive))
     out.update(explained_variance_per_head(
         None if not critic else critic.get("targets"),
         None if not critic else critic.get("predictions"), head_names))
     n_choices, skip_legal = (legal if legal is not None else (None, None))
-    out.update(g3_face_entropy(face_entropy_nats, n_choices, skip_legal))
+    out.update(g3_face_entropy(face_entropy_nats, n_choices, skip_legal,
+                               approx_add=approx_add,
+                               mask_source=mask_source))
     out.update(g4_quality_fractions(pr["quality"][live], quality_floor))
     prefs = env_preferences(critic)
     env_of = match_records_to_envs(records, all_rets, reward_names)
@@ -860,8 +1240,20 @@ def episode_fields(records, *, head_names, all_rets=None, reward_names=None,
             corners.append(preference_corner(prefs[e], head_names, corner_tol))
     out.update(g5_front_spread(pr["lat_ratio"], pr["temp_ratio"], corners,
                                head_names, rev_exact=pr["rev_exact"],
-                               live=live))
+                               live=live,
+                               ref_latency_ns=pr["ref_latency_ns"],
+                               ref_temp_bytes=pr["ref_temp_bytes"]))
     out.update(g6_offline_contrast(offline_contrast))
+    out.update(drain_provenance(drain_local, drain_pool))
+    missing = documented_fields(head_names) - set(out)
+    if missing:
+        # THE CONTRACT IS THE TABLE.  A field the table names and this
+        # function does not emit is a silently absent gate input, which the
+        # error policy of tickets .43/.45 forbids outright.
+        raise KeyError(
+            f"gate telemetry did not emit {len(missing)} documented "
+            f"field(s): {sorted(missing)}. Either emit them or take them out "
+            f"of FIELD_TABLE -- a gate must not read a name nobody writes.")
     return out
 
 
