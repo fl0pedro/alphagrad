@@ -623,7 +623,7 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
     """
     from graphax import IncrementalPathTokenizer
 
-    # `vocab_size` is the TOTAL id space: 230 reserved structural tokens + 10
+    # `vocab_size` is the TOTAL id space: 223 reserved structural tokens (230 before the byte-only catalog) + 10
     # digits, leaving `vocab - 240` symbols for the NAME alphabet (the
     # tokenizer needs >= 2); a name past the alphabet spells itself out by
     # concatenation. 512 == the launchers' --vocab-size == the policy

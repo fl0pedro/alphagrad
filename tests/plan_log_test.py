@@ -398,7 +398,9 @@ def test_a_plan_that_raises_is_still_recorded_and_the_error_still_reaches_the_ca
     monkeypatch.setattr(envmod, "_record_token_length",
                         _overflow_at_the_terminal)
     env = _make_env()
-    with pytest.raises(ValueError, match="token DELTA truncated"):
+    # The raise crosses `jax.io_callback`, which re-raises it as a
+    # `JaxRuntimeError` whose message quotes the original. Match the text.
+    with pytest.raises(Exception, match="token DELTA truncated"):
         _run_episode(env, skip_face_of_vertex=1)
     out = envmod.consume_plan_records()
     assert out["terminals"] == 1, (

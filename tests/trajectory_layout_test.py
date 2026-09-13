@@ -182,8 +182,18 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
     rows = -np.ones((F, S, 3), np.int32)
     skips = np.zeros((F,), np.int32)
 
-    trials = [np.array([COMPRESS_SENTINEL, ax, 0], np.int32)
-              for ax in range(6)]
+    from graphax.sparse.micro_actions import QUANT_DTYPES
+    from alphagrad.approx.env import QUANT_SENTINEL
+
+    # QUANT first: a narrowing cast is legal on almost any float operand,
+    # where a DIAG or COMPRESS needs an axis structure a small graph rarely
+    # has (job 65344 found no echo with DIAG/COMPRESS alone). Index 0 is the
+    # catalog's float32 (an identity cast on a float32 operand, masked
+    # illegal), so start at 1. The wire row index is the CATALOG index.
+    trials = [np.array([QUANT_SENTINEL, k, 0], np.int32)
+              for k in range(1, len(QUANT_DTYPES))]
+    trials += [np.array([COMPRESS_SENTINEL, ax, 0], np.int32)
+               for ax in range(6)]
     trials += [np.array([i, j, -1], np.int32)
                for i in range(4) for j in range(4) if i != j]
 
@@ -270,22 +280,27 @@ def _encoder_tokenizer(vocab_size):
         list(args), vocab_size=vocab_size)
 
 
-def test_the_reserved_token_vocabulary_is_two_hundred_thirty_slots():
+def test_a_byte_wide_id_space_leaves_too_few_name_symbols():
     """The number the byte budget is computed from.
 
     graphax appends vocabulary tokens by design ("New markers MUST be
-    appended"), so this WILL move. When it does, update the count quoted in
-    ``env.py``'s ALPHAGRAD_INCR_TOKEN_VOCAB comment and in
-    ``tests/delta_obs_emission_test.py``'s docstring, both of which state 230,
-    and recheck whether a 256-wide id space still leaves usable name symbols.
+    appended"), so the reserved count moves: it was 230 before the byte-only
+    catalog and is 223 after it (job 65344). The test therefore pins the
+    CONSEQUENCE, not the count: a 256-wide id space leaves fewer than 32 name
+    symbols, against 279 at the 512 the env and the launchers run, and a name
+    alphabet that small spells names out of several atoms and lengthens every
+    delta (see the ALPHAGRAD_INCR_TOKEN_VOCAB comment in ``env.py``).
     """
     from graphax.jaxpr import get_vocab
 
     vocab, _, _ = get_vocab(_DIGIT_BASE)
-    assert len(vocab) == 230, (
-        f"the reserved vocabulary is now {len(vocab)} slots, not 230. "
-        f"A 256-wide id space would leave "
-        f"{256 - len(vocab) - _DIGIT_BASE} name symbols.")
+    reserved = len(vocab) + _DIGIT_BASE
+    names_at_256 = 256 - reserved
+    names_at_512 = 512 - reserved
+    assert 0 < names_at_256 < 32, (
+        f"the reserved vocabulary is {len(vocab)} slots plus {_DIGIT_BASE} "
+        f"digits, so a byte leaves {names_at_256} name symbols")
+    assert names_at_512 >= 8 * names_at_256
 
 
 def test_the_incremental_token_ids_at_the_configured_vocabulary_do_not_fit_in_a_byte():

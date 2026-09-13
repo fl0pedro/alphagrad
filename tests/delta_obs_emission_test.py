@@ -29,7 +29,7 @@ Two things must hold, and neither is visible in any metric we log:
      pins this: any mismatch breaks the concatenation at the first base token
      that differs. It says nothing about WHICH id space is right; the
      default IS the launchers' ``--vocab-size 512`` now, so the tokenizer
-     and the policy embedding name one id space (230 reserved + 10 digits
+     and the policy embedding name one id space (223 reserved + 10 digits
      + 272 name symbols, max id 511).
 """
 import os
