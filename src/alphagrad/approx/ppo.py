@@ -5040,7 +5040,9 @@ def make_argparser() -> argparse.ArgumentParser:
              "instead of falling back to a legal pair.")
     p.add_argument(
         "--per-face-masks", action="store_true",
-        help="PER-FACE masking for EVERY approximation (the generalisation of "
+        help="ALWAYS ON with --face-actions; the flag is kept so old launchers "
+             "still parse, and it only checks its own precondition. "
+             "PER-FACE masking for EVERY approximation (the generalisation of "
              "--diag-per-face). Approximation legality is decided at three "
              "layers that disagree about granularity -- nominal/per-vertex, "
              "the oracle face probe, and the live operand at apply time -- and "
@@ -6358,6 +6360,15 @@ def _setup_jax_compile_cache() -> None:
 
 def main():
     args = make_argparser().parse_args()
+    # Per-face masks are not a choice: with the face head only the apply-time
+    # (per-face, per-slot) mask decides, so it is always on; without the face
+    # head there is no per-face action space and the per-vertex mask is all
+    # there is. The flag itself is kept for old launchers.
+    if args.per_face_masks and not args.face_actions:
+        raise ValueError(
+            "--per-face-masks needs --face-actions: it masks the per-FACE "
+            "action space, and without the face head there is none.")
+    args.per_face_masks = bool(args.face_actions)
     # Knobs that became flags (dsnn-3qm.44) are REFUSED if a launcher still
     # exports them, never read: an ignored export would run the knob OFF.
     from alphagrad.approx.common.agent_factory import refuse_removed_env_knobs
@@ -7081,11 +7092,7 @@ def main():
     # --per-face-masks (workstream A1). A PYTHON bool, read at trace time, so
     # with the flag off none of the extra arrays below is ever created: no new
     # callback output, no new trajectory leaf, no shape change anywhere.
-    _PFM = bool(getattr(args, "per_face_masks", False))
-    if _PFM and not getattr(args, "face_actions", False):
-        raise ValueError(
-            "--per-face-masks needs --face-actions: it masks the per-FACE "
-            "action space, and without the face head there is none.")
+    _PFM = bool(getattr(args, "per_face_masks", False))  # == face_actions (main())
 
     def _oracle_face_masks_host(order, spec_hist, step_count):
         _pt0 = _prof_time.perf_counter()
