@@ -213,8 +213,9 @@ def compute_ppo_variant_masks(
         compress_kind head defaults to ``mean`` (kind 0); factor and
         quant masks are unrestricted (irrelevant under COMPRESS).
       * ``quant_smallest_float`` — op_type ∈ {QUANT, END}; quant_dtype
-        restricted to the smallest float (``float4_e2m1fn``, index 13
-        in QUANT_DTYPES); factor mask unrestricted (irrelevant).
+        restricted to the narrowest float in QUANT_DTYPES (fewest bits,
+        first such entry; a float8 member since the catalog is byte-sized
+        and up); factor mask unrestricted (irrelevant).
       * ``diag_factor`` — op_type ∈ {DIAG, END}; factor table
         ``{2,3,4,8,16} ∩ full_factor_table`` (no -1).
       * ``compress`` — op_type ∈ {COMPRESS, END}; factor=-1 only
@@ -257,16 +258,22 @@ def compute_ppo_variant_masks(
         op_mask[_OP_DIAG] = False
         op_mask[_OP_QUANT] = False
     elif variant == "quant_smallest_float":
-        # QUANT-only with smallest-float dtype.
-        # graphax.sparse.micro_actions.QUANT_DTYPES has
-        # ``float4_e2m1fn`` at index 13 (counted from the canonical
-        # tuple defined there). If the head size is smaller than 14
-        # (downstream changed the dtype list), fall back to the
-        # highest available index.
+        # QUANT-only with the narrowest float in the catalog, looked up by
+        # its bit width rather than by a fixed index (the index used to be
+        # hard-coded to float4 at 13, with a silent fallback).
+        import jax.numpy as _jnp
+        from graphax.sparse.micro_actions import QUANT_DTYPES as _QD
         op_mask[_OP_DIAG] = False
         op_mask[_OP_COMPRESS] = False
         quant_dtype_mask[:] = False
-        smallest_float_idx = min(13, num_quant_dtypes - 1)
+        floats = [(_jnp.finfo(_jnp.dtype(n)).bits, i)
+                  for i, n in enumerate(_QD[:num_quant_dtypes])
+                  if _jnp.issubdtype(_jnp.dtype(n), _jnp.floating)]
+        if not floats:
+            raise ValueError(
+                "quant_smallest_float: QUANT_DTYPES has no float entry "
+                f"within the head's {num_quant_dtypes} dtypes: {_QD}")
+        smallest_float_idx = min(floats)[1]
         quant_dtype_mask[smallest_float_idx] = True
     elif variant == "diag_factor":
         op_mask[_OP_COMPRESS] = False
