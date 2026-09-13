@@ -110,12 +110,18 @@ end.
 | `paired/lat_ratio_mean` | ratio | mean over live records of latency_ns / ref_latency_ns | G5 |
 | `paired/lat_ratio_median` | ratio | median of the same | G5 |
 | `paired/lat_ratio_best` | ratio | min of the same (fastest plan) | G5 |
-| `paired/temp_ratio_mean` | ratio | mean of mem_temp_bytes / ref_mem_temp_bytes | G5 |
+| `paired/temp_ratio_mean` | ratio | mean of mem_temp_bytes / ref_temp_bytes | G5 |
 | `paired/temp_ratio_median` | ratio | median of the same | G5 |
 | `paired/temp_ratio_best` | ratio | min of the same (leanest plan) | G5 |
 | `paired/grad_cosine_mean` | cosine | mean quality (reward slot 'quality') over live records | G4 |
 | `paired/grad_cosine_median` | cosine | median of the same | G4 |
 | `paired/grad_cosine_best` | cosine | max of the same | G4 |
+| `paired/watermark_ratio_mean` | ratio | mean of mem_watermark_bytes / ref_watermark_bytes: the runtime watermark BESIDE the temp channel (ticket .49) | G5 |
+| `paired/watermark_ratio_median` | ratio | median of the same | G5 |
+| `paired/watermark_ratio_best` | ratio | min of the same | G5 |
+| `paired/n_with_watermark` | count | live records carrying both watermark numbers | - |
+| `paired/ref_latency_ns_mean` | ns | mean of ref_latency_ns: the rev-exact reference re-measured once per candidate | G5 |
+| `paired/ref_temp_bytes_mean` | bytes | mean of ref_temp_bytes: the same reference's static temp | G5 |
 | `gate/g1/present` | 0/1 | 1 when a winners table was loaded (--gate-winners-table) | G1 |
 | `gate/g1/n_winners` | count | rows in the winners table | G1 |
 | `gate/g1/n_recovered` | count | winners whose (vertex, class) some plan this episode applied | G1 |
@@ -133,6 +139,10 @@ end.
 | `gate/g3/entropy_over_floor` | ratio | face_entropy_nats / uniform_floor_nats | G3 |
 | `gate/g3/n_faces` | count | faces the floor was computed over | G3 |
 | `gate/g3/n_outcomes_max` | count | largest legal joint-outcome count of any face | G3 |
+| `gate/g3/n_slots` | count | slots the floor was summed over: head_layout(--approx-add).n_slots, never a literal | G3 |
+| `gate/g3/head_width` | count | head_layout(--approx-add).width, the logit count the floor describes | G3 |
+| `gate/g3/n_quant_dtypes` | count | len(masks.FACE_QUANT_DTYPES): the QUANT categorical the floor counts leaves of | G3 |
+| `gate/g3/mask_source` | 0/1/2 | where the legality came from: 0 none, 1 the oracle probe, 2 the live per-slot masks | G3 |
 | `gate/g4/n` | count | live records with a finite quality | G4 |
 | `gate/g4/q_zero_frac` | fraction | share of those with quality exactly 0 (destroyed Jacobian) | G4 |
 | `gate/g4/tau` | cosine | the quality floor in force (--quality-floor, ticket .9); NaN if none | G4 |
@@ -142,12 +152,23 @@ end.
 | `gate/g5/{corner}/best_temp_ratio` | ratio | min paired temp ratio among them | G5 |
 | `gate/g5/spread_lat` | ratio | max - min over corners of best_lat_ratio | G5 |
 | `gate/g5/spread_temp` | ratio | max - min over corners of best_temp_ratio | G5 |
+| `gate/g5/present` | 0/1 | 1 when at least one live record sat at a named corner (a preference reached the telemetry); 0 on an arm without --preference-conditioned, where a spread is undefined rather than 0 | G5 |
 | `gate/g5/n_rev_exact` | count | live records whose plan IS rev-exact (reverse order, no approximation) | G5 |
-| `gate/g5/drift_floor_lat` | ratio | max - min of the latency ratio over those rev-exact records (their ratio is pure drift) | G5 |
-| `gate/g5/drift_floor_temp` | ratio | the same for the temp ratio (0 when the static temp is deterministic) | G5 |
+| `gate/g5/drift_floor_lat` | ratio | PAIRED-REFERENCE drift: (max - min) / mean of ref_latency_ns over this episode's live records -- the same rev-exact plan re-measured once per candidate, so its spread is pure instrument drift. Defined on every order, including --fixed-order markowitz where no candidate is itself rev-exact | G5 |
+| `gate/g5/drift_floor_temp` | ratio | the same over ref_temp_bytes (0 when the static temp is deterministic) | G5 |
+| `gate/g5/drift_floor_n` | count | records the drift floor was computed over | G5 |
+| `gate/g5/drift_floor_lat_revexact` | ratio | max - min of the latency RATIO over the rev-exact records only; NaN with fewer than two (the pre-2026-09-13 definition, kept for the reverse-order control) | G5 |
+| `gate/g5/drift_floor_temp_revexact` | ratio | the same for the temp ratio | G5 |
 | `gate/g5/n_unmatched` | count | records that matched no env row (no preference known) | G5 |
 | `gate/g6/present` | 0/1 | 1 when --gate-offline-contrast was given | G6 |
 | `gate/g6/offline_contrast` | fraction | ticket .42's offline contrast, copied from the flag; NaN when absent | G6 |
+| `measure/drain/local_records` | count | plan records the TRAINER's own env handed over this episode | drain |
+| `measure/drain/pool_records` | count | plan records the MEASURE ACTORS handed over this episode | drain |
+| `measure/drain/pool_terminals` | count | terminal plans the measure actors say they measured | drain |
+| `measure/drain/undrained` | count | pool_terminals not accounted for by pool_records + dropped: a counter incremented in the actor and read in a process that does not own it reads > 0 here | drain |
+| `measure/drain/ok` | 0/1 | 1 when undrained == 0 and every polled actor answered | drain |
+| `measure/drain/actors_seen` | count | measure actors the pool knows about | drain |
+| `measure/drain/actors_failed` | count | actors that could not be polled: their plans are MISSING | drain |
 | `measure/compile_fallbacks_this_ep` | count | ppo.py plan-log block; env.consume_plan_records (ticket .21) | toolchain |
 | `measure/compile_fallbacks_total` | count | same drain, process lifetime | toolchain |
 | `measure/toolchain_ok` | 0/1 | same drain; 0 = a measure process failed the toolchain gate | toolchain |
