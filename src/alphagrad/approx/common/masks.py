@@ -1956,7 +1956,7 @@ def couple_quant_rules(rules, applied_dtype=None):
     """Quant contraction coupling: **one quantization per turn**, and the
     second operand of a contraction INHERITS the first's dtype.
 
-    The hardware compat matrix is largely self-only (int4 only dots with int4),
+    The hardware compat matrix is largely self-only (float8 only dots with float8),
     so letting the policy pick an independent dtype for the post operand mostly
     produces an illegal contraction. Rather than mask that choice away, the
     spec's resolution is to make it automatic: the first Quant in a turn is the

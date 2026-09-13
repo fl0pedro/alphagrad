@@ -26,10 +26,10 @@ def test_decode_compress():
 
 def test_decode_quant_float4():
     from graphax.sparse.micro_actions import QUANT_DTYPE_INDEX
-    idx = QUANT_DTYPE_INDEX["float4_e2m1fn"]
+    idx = QUANT_DTYPE_INDEX["float8_e5m2"]
     assert render_action_row([5, OP_QUANT, 0, 0, 0, idx]) == (
         5,
-        'quant("float4_e2m1fn")',
+        'quant("float8_e5m2")',
     )
 
 
@@ -54,7 +54,7 @@ def test_render_pure_ve_collapse():
 
 def test_render_grouped_with_approx():
     from graphax.sparse.micro_actions import QUANT_DTYPE_INDEX
-    f4 = QUANT_DTYPE_INDEX["float4_e2m1fn"]
+    f4 = QUANT_DTYPE_INDEX["float8_e5m2"]
     seq = [
         [5, OP_QUANT, 0, 0, 0, f4],
         [5, OP_COMPRESS, 0, 0, 0, 0],
@@ -68,7 +68,7 @@ def test_render_grouped_with_approx():
         (
             5,
             [
-                'quant("float4_e2m1fn")',
+                'quant("float8_e5m2")',
                 'compress(axis=0, kind="mean")',
                 "diag(i=1, j=2, factor=4)",
             ],
@@ -148,7 +148,7 @@ def test_parse_recorded_seq_skip_low_precision_quant():
     from alphagrad.approx.common.seq_replay import parse_recorded_seq
     from graphax.sparse.micro_actions import QUANT_DTYPE_INDEX
 
-    f4 = QUANT_DTYPE_INDEX["float4_e2m1fn"]
+    f4 = QUANT_DTYPE_INDEX["float8_e5m2"]
     bf16 = QUANT_DTYPE_INDEX["bfloat16"]
     seq = [
         [0, OP_QUANT, 0, 0, 0, f4],     # dropped under skip flag

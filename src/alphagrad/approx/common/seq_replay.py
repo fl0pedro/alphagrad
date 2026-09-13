@@ -212,7 +212,7 @@ def _resolve_diag_factor(
 
 
 _LOW_PRECISION_QUANT_DTYPES = frozenset(
-    d for d in QUANT_DTYPES if d.startswith(("float4", "float8", "int2", "int4", "uint2", "uint4"))
+    d for d in QUANT_DTYPES if d.startswith("float8")
 )
 
 

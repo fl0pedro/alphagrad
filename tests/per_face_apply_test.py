@@ -25,12 +25,12 @@ from alphagrad.approx.common.masks import (
 # --------------------------------------------------------------------------- #
 
 def test_second_quant_in_a_turn_inherits_the_first_dtype():
-    """int4 only contracts with int4, so the post operand must inherit rather
+    """int8 only contracts with int8, so the post operand must inherit rather
     than pick freely (one quantization decision per turn)."""
-    rules = (Quant(dtype="int4"), Quant(dtype="float32"))
+    rules = (Quant(dtype="int8"), Quant(dtype="float32"))
     coupled, in_force = couple_quant_rules(rules)
-    assert in_force == "int4"
-    assert [r.dtype for r in coupled] == ["int4", "int4"]
+    assert in_force == "int8"
+    assert [r.dtype for r in coupled] == ["int8", "int8"]
 
 
 def test_coupling_keeps_the_policys_sign_choice():
@@ -50,8 +50,8 @@ def test_coupling_is_a_noop_for_consistent_or_nonquant_rules():
 
 def test_dtype_already_in_force_from_earlier_in_the_turn_is_respected():
     coupled, in_force = couple_quant_rules((Quant(dtype="float32"),),
-                                           applied_dtype="int4")
-    assert in_force == "int4" and coupled[0].dtype == "int4"
+                                           applied_dtype="int8")
+    assert in_force == "int8" and coupled[0].dtype == "int8"
 
 
 # --------------------------------------------------------------------------- #
