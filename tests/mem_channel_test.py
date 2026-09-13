@@ -216,16 +216,19 @@ def test_watermark_minus_temp_is_near_constant_across_plans(channel):
           f"gap={gaps.tolist()} spread temp={temp_spread:.0f} "
           f"gap={gap_spread:.0f}")
     assert temp_spread > 0.0
-    # Finding 41: 72 B of gap spread over 58,309x of temp on TLM. On this
-    # toy the CPU substitution puts (output + argument) bytes in the gap,
-    # which only moves when XLA folds an output to a constant (the
-    # skip-everything plan). So: rev and forward share ONE gap exactly, and
-    # the folded plan's gap is smaller by at most those bytes. The old bound
-    # (5% of the temp spread) assumed forward mode densified a 33 kB temp on
-    # this toy; the lazy engine (dsnn-3qm.28.2) leaves 768 B, which made the
-    # bound tighter than the instrument it was checking.
-    assert gaps[0] == gaps[2], gaps
-    assert 0.0 <= gaps[0] - gaps[1] <= float(_X.nbytes + 4), (gaps, _X.nbytes)
+    # Finding 41: 72 B of gap spread over 58,309x of temp on TLM. Under the
+    # static fallback the watermark IS temp + output + argument bytes
+    # (`_memory_analysis_bytes`), so the gap is exactly the output and
+    # argument bytes the record carries, and it moves only when XLA folds an
+    # output to a constant (the skip-everything plan). The old bound (5% of
+    # the temp spread) assumed forward mode densified a 33 kB temp on this
+    # toy; the lazy engine (dsnn-3qm.28.2) leaves 768 B, which made the
+    # bound tighter than the instrument it was checking. Name the identity.
+    outs = np.asarray([r["static_output_bytes"] for r in recs], np.float64)
+    argb = np.asarray([r["static_argument_bytes"] for r in recs], np.float64)
+    assert np.array_equal(gaps, outs + argb), (gaps, outs, argb)
+    assert gaps[0] == gaps[2], gaps            # rev and forward: same buffers
+    assert gaps[1] <= gaps[0], gaps            # the folded plan only shrinks
     summary = envmod.mem_parity_summary(recs)
     assert summary["n"] == 3 and summary["n_paired"] == 3
     assert summary["gap_max_bytes"] == float(gaps.max())
