@@ -1238,6 +1238,20 @@ def episode_fields(records, *, head_names, all_rets=None, reward_names=None,
             corners.append(None)
         else:
             corners.append(preference_corner(prefs[e], head_names, corner_tol))
+    # WHY G5 IS EMPTY, SAID OUT LOUD.  The join is bit-equality between a
+    # record's reward vector and a row of THIS episode's terminal rewards, so
+    # it fails outright when the plan records arrive one episode late -- which
+    # is what a lagging measure-actor drain does (measure/drain/undrained > 0).
+    # Without this line the corners are just NaN and the reason is invisible.
+    _n_live = int(live.sum())
+    if _n_live and all(c is None for c, lv in zip(corners, live) if lv):
+        print_reason(
+            "G5 corners empty",
+            f"none of {_n_live} live plan record(s) joined an env row: "
+            f"prefs={'absent' if prefs is None else prefs.shape}, "
+            f"all_rets={'absent' if all_rets is None else np.shape(all_rets)}. "
+            f"A lagging drain (measure/drain/undrained) puts the records in a "
+            f"later episode than the reward rows they must match.")
     out.update(g5_front_spread(pr["lat_ratio"], pr["temp_ratio"], corners,
                                head_names, rev_exact=pr["rev_exact"],
                                live=live,
