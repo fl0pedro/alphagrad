@@ -127,6 +127,9 @@ def _the_configuration_this_module_measures_under(monkeypatch):
     monkeypatch.setenv("ALPHAGRAD_QUALITY_METRIC", "none")
     monkeypatch.setenv("ALPHAGRAD_DIRECT_MEASURE", "1")
     monkeypatch.setenv("ALPHAGRAD_COST_FORM", "paired-log")
+    # The floor policy this module's numbers were computed under. The
+    # reference floor has its own tests at the bottom of the file.
+    monkeypatch.setenv("ALPHAGRAD_PAIRED_COST_FLOOR", "byte")
     monkeypatch.delenv("ALPHAGRAD_PLAN_LOG", raising=False)
     monkeypatch.delenv("ALPHAGRAD_MEM_CHANNEL", raising=False)
 
@@ -339,3 +342,79 @@ def test_absolute_form_is_the_measured_number(monkeypatch):
     # Nothing but the two cost slots moves between the forms.
     assert np.array_equal(r[keep].astype(np.float64),
                           r2[keep].astype(np.float64)), (r, r2)
+
+
+# --------------------------------------------------------------------------
+# 6. THE PAIRED-COST FLOOR (ticket .9, owner decision 2026-09-13)
+#
+# The absorber -- the plan that skips every face -- allocates nothing and
+# runs in microseconds. Under the one-byte floor it collected
+# log(ref_temp / 1 B) nats of memory credit: 17.3 nats on TLM, 29.7 over
+# both channels on the Markowitz order (finding 63, job 65308). The
+# reference floor prices that at 0 without touching any plan that costs
+# more than the reference, which on the Markowitz order is all of them.
+# --------------------------------------------------------------------------
+
+def test_floor_reader_defaults_to_reference_and_refuses_a_typo(monkeypatch):
+    monkeypatch.delenv("ALPHAGRAD_PAIRED_COST_FLOOR", raising=False)
+    assert envmod.paired_cost_floor() == "reference"
+    monkeypatch.setenv("ALPHAGRAD_PAIRED_COST_FLOOR", " Reference ")
+    assert envmod.paired_cost_floor() == "reference"
+    monkeypatch.setenv("ALPHAGRAD_PAIRED_COST_FLOOR", "byte")
+    assert envmod.paired_cost_floor() == "byte"
+    monkeypatch.setenv("ALPHAGRAD_PAIRED_COST_FLOOR", "none")
+    with pytest.raises(ValueError, match="PAIRED_COST_FLOOR"):
+        envmod.paired_cost_floor()
+
+
+def test_reference_floor_prices_the_absorber_at_zero(monkeypatch):
+    """The measured TLM absorber against the measured rev-exact reference."""
+    ref_lat, ref_mem = 2.32e5, 3.362e7       # rev-exact on TLM (job 65308)
+    abs_lat, abs_mem = 1.4932e4, 0.0         # skip@all: 15 us, no temp
+
+    monkeypatch.setenv("ALPHAGRAD_PAIRED_COST_FLOOR", "byte")
+    d_lat, d_mem, n = envmod.paired_log_costs(abs_lat, abs_mem, ref_lat, ref_mem)
+    assert d_mem == pytest.approx(-math.log(ref_mem / 1.0))
+    assert -d_mem > 17.0, "the one-byte floor hands the absorber 17+ nats"
+    assert -d_lat > 2.0
+    assert n == 1
+
+    monkeypatch.setenv("ALPHAGRAD_PAIRED_COST_FLOOR", "reference")
+    d_lat, d_mem, n = envmod.paired_log_costs(abs_lat, abs_mem, ref_lat, ref_mem)
+    assert d_mem == 0.0 and d_lat == 0.0, "no credit below the reference"
+    assert n == 1, "the floored reading is still counted"
+
+
+def test_reference_floor_leaves_an_honest_markowitz_plan_alone(monkeypatch):
+    """Every Markowitz plan costs MORE than rev-exact (temp 32x to 56x,
+    finding 63), so the floor never touches one, and the signal between the
+    identity and the best memory saver survives intact."""
+    ref_lat, ref_mem = 2.32e5, 3.362e7
+    ident_lat, ident_mem = 7.7192e7, 1.930e9          # Markowitz identity
+    best_lat, best_mem = 0.246 * ident_lat, 0.587 * ident_mem
+
+    out = {}
+    for policy in ("byte", "reference"):
+        monkeypatch.setenv("ALPHAGRAD_PAIRED_COST_FLOOR", policy)
+        out[policy] = (envmod.paired_log_costs(ident_lat, ident_mem, ref_lat, ref_mem),
+                       envmod.paired_log_costs(best_lat, best_mem, ref_lat, ref_mem))
+    assert out["byte"] == out["reference"]
+    (id_lat, id_mem, _), (bs_lat, bs_mem, _) = out["reference"]
+    assert id_mem == pytest.approx(math.log(ident_mem / ref_mem))
+    assert bs_mem < id_mem and (id_mem - bs_mem) == pytest.approx(-math.log(0.587))
+    assert (id_lat - bs_lat) == pytest.approx(-math.log(0.246))
+
+
+def test_reference_floor_costs_a_sub_reference_plan_its_difference(monkeypatch):
+    """The one case the floor does change: a plan cheaper than the reference.
+    On the reverse order the best float8 quant sits at 0.86x rev-exact temp
+    and forfeits those 0.15 nats. Recorded so the trade is not a surprise."""
+    ref_lat, ref_mem = 2.32e5, 3.362e7
+    cand_mem = 0.859 * ref_mem
+    monkeypatch.setenv("ALPHAGRAD_PAIRED_COST_FLOOR", "byte")
+    _, d_byte, _ = envmod.paired_log_costs(ref_lat, cand_mem, ref_lat, ref_mem)
+    monkeypatch.setenv("ALPHAGRAD_PAIRED_COST_FLOOR", "reference")
+    _, d_ref, n = envmod.paired_log_costs(ref_lat, cand_mem, ref_lat, ref_mem)
+    assert d_byte == pytest.approx(math.log(0.859))
+    assert abs(d_byte) == pytest.approx(0.152, abs=0.002)
+    assert d_ref == 0.0 and n == 1

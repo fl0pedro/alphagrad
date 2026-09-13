@@ -4758,6 +4758,20 @@ def make_argparser() -> argparse.ArgumentParser:
         "what slot 5 holds.",
     )
     p.add_argument(
+        "--paired-cost-floor",
+        choices=["reference", "byte"],
+        default="reference",
+        help="THE PAIRED-COST FLOOR (ticket dsnn-3qm.9, owner decision "
+        "2026-09-13 on finding 63). Both cost channels are floored on BOTH "
+        "sides before the log. reference (the DEFAULT): the floor is the "
+        "paired reference's own cost, so no plan earns credit for being "
+        "cheaper than the exact plan it is measured against -- the "
+        "skip-everything plan's memory prize is 0 instead of the 17.3 nats "
+        "it used to collect on TLM, and lambda_q = 16 clears the contrast "
+        "gate instead of needing 32. byte: the pre-2026-09-13 floor (one "
+        "byte of memory, 100 ns of latency); use it only to reproduce a run "
+        "made under it.")
+    p.add_argument(
         "--cost-form",
         choices=["absolute", "paired-log"],
         default="paired-log",
@@ -6671,6 +6685,16 @@ def main():
     # THE COST FORM (ticket .9), same transport, same reason: env.cost_form
     # is the one reader; the paired reference is measured inside the actors.
     os.environ["ALPHAGRAD_COST_FORM"] = str(args.cost_form)
+    # The floor travels the same way and for the same reason: the paired
+    # costs are computed inside the measure actor.
+    os.environ["ALPHAGRAD_PAIRED_COST_FLOOR"] = str(args.paired_cost_floor)
+    print(f"[alphagrad] paired-cost floor (--paired-cost-floor) = "
+          f"{args.paired_cost_floor}"
+          + (" (both channels floored at the reference's own cost; a plan "
+             "cheaper than rev-exact earns no credit for the difference)"
+             if args.paired_cost_floor == "reference"
+             else " (one byte / 100 ns; the pre-2026-09-13 floor)"),
+          flush=True)
     print(f"[alphagrad] cost form (reward slots 2 and 5, --cost-form) = "
           f"{args.cost_form}"
           + (" (paired log-difference against rev-exact, measured beside "

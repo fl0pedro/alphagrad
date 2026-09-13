@@ -3023,6 +3023,53 @@ _PAIRED_REF_CAP = 65536
 # floored reading is counted in the reference record (``mem_floored``).
 _MEM_LOG_FLOOR_BYTES = 1.0
 
+#: The paired-cost floor POLICY (``--paired-cost-floor``, ticket .9,
+#: owner decision 2026-09-13 on finding 63).
+#:
+#: ``"byte"`` is the behaviour above: memory floors at one byte, latency at
+#: ``_LAT_FLOOR_NS``, and a plan that allocates nothing earns
+#: ``log(ref_temp / 1 B)`` nats. Measured on TLM: 17.3 nats on the memory
+#: channel alone, 29.7 nats over both channels on the Markowitz order
+#: (finding 63, absorber job 65308). Pricing that with the quality floor
+#: alone needs ``lambda_q > 32``.
+#:
+#: ``"reference"`` floors BOTH channels at the reference's own cost, so no
+#: plan earns credit for being cheaper than the exact reference it is paired
+#: against. The absorber's memory prize becomes exactly 0 instead of -17.3
+#: nats, and ``lambda_q = 16`` then clears the contrast gate. Honest plans are
+#: untouched wherever they cost MORE than the reference, which on the
+#: Markowitz order is every one of them (their temp is 32x to 56x rev-exact).
+#: A plan that really is cheaper than the reference loses that part of its
+#: credit: on the reverse order the best float8 quant sits at 0.86x rev-exact,
+#: so it forfeits 0.15 nats. Every floored reading is counted in
+#: ``mem_floored`` on the reference record.
+#:
+#: This SUPERSEDES the ruling recorded in the comment above (ticket .9 Q37,
+#: "no cap by default, leave the absorber's prize to tau and lambda"). That
+#: ruling was taken before the absorber was measured. Set
+#: ``--paired-cost-floor byte`` to reproduce a run made under it.
+#: Transported by ENV VAR, like `cost_form` and `mem_channel` and for the
+#: same reason: :func:`paired_log_costs` runs inside the MEASURE ACTOR, a
+#: separate process, so a module-level setting in the trainer would not
+#: reach it. ppo.py's ``--paired-cost-floor`` is the only writer.
+_PAIRED_COST_FLOOR_ENV = "ALPHAGRAD_PAIRED_COST_FLOOR"
+PAIRED_COST_FLOOR_CHOICES = ("byte", "reference")
+
+
+def paired_cost_floor() -> str:
+    """``"reference"`` (the default) or ``"byte"``.
+
+    Anything else raises: a typo must not silently restore the unpriced
+    absorber.
+    """
+    want = os.environ.get(_PAIRED_COST_FLOOR_ENV, "reference").strip().lower()
+    if want not in PAIRED_COST_FLOOR_CHOICES:
+        raise ValueError(
+            f"{_PAIRED_COST_FLOOR_ENV} must be one of "
+            f"{PAIRED_COST_FLOOR_CHOICES} (set by ppo.py from "
+            f"--paired-cost-floor), got {want!r}")
+    return want
+
 
 def _time_one_rep(ex, eval_args, unique_devices, inner):
     """ONE timing repetition of `ex` under THE campaign protocol.
@@ -3206,18 +3253,26 @@ def paired_log_costs(latency_ns: float, peak_memory: float,
     Latency ``0.0`` means NOT MEASURED (``config.measure_latency`` off) and
     passes through as 0.0 -- for the pair, since candidate and reference
     are measured under one config. A measured latency is never 0: the
-    campaign path clamps it up to `_LAT_FLOOR_NS` first. Memory is
-    floored at `_MEM_LOG_FLOOR_BYTES` on BOTH sides (see the constant for
-    why one byte), and ``n_floored`` says how many of the two readings the
+    campaign path clamps it up to `_LAT_FLOOR_NS` first.
+
+    BOTH channels are floored on BOTH sides, at the policy
+    :func:`paired_cost_floor` names (``--paired-cost-floor``): the
+    reference's own cost by default, the one-byte / 100-ns pair under
+    ``byte``. ``n_floored`` says how many of the two MEMORY readings the
     floor replaced.
     """
+    _ref_floor = paired_cost_floor() == "reference"
+    lat_floor = (max(_LAT_FLOOR_NS, float(ref_latency_ns)) if _ref_floor
+                 else _LAT_FLOOR_NS)
+    mem_floor = (max(_MEM_LOG_FLOOR_BYTES, float(ref_memory)) if _ref_floor
+                 else _MEM_LOG_FLOOR_BYTES)
     if latency_ns > 0.0 and ref_latency_ns > 0.0:
-        d_lat = _paired_log_delta(latency_ns, ref_latency_ns, _LAT_FLOOR_NS)
+        d_lat = _paired_log_delta(latency_ns, ref_latency_ns, lat_floor)
     else:
         d_lat = 0.0
-    n_floored = int(float(peak_memory) < _MEM_LOG_FLOOR_BYTES) + int(
-        float(ref_memory) < _MEM_LOG_FLOOR_BYTES)
-    d_mem = _paired_log_delta(peak_memory, ref_memory, _MEM_LOG_FLOOR_BYTES)
+    n_floored = int(float(peak_memory) < mem_floor) + int(
+        float(ref_memory) < mem_floor)
+    d_mem = _paired_log_delta(peak_memory, ref_memory, mem_floor)
     return float(d_lat), float(d_mem), n_floored
 
 
