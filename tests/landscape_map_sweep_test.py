@@ -185,3 +185,30 @@ def test_oracle_b_sparse_vs_dense(helmholtz_setup):
     for pid, res in results.items():
         assert res["diff"] < 1e-3, f"Oracle B failed for {pid}: diff={res['diff']}"
 
+
+
+def test_singleton_sweep_enumerates_one_quant_per_dtype(helmholtz_setup):
+    """``--quant-dtypes`` adds one Quant singleton per legal slot per dtype;
+    the bfloat16 ids keep their ``:bf16`` suffix so rows written before
+    2026-09-13 still match; ``--singleton-ops quant`` yields quants only."""
+    import pytest
+    from alphagrad.approx.tools import landscape_map as LM
+    env, eval_samples, order, inv = helmholtz_setup
+    base, _ = LM.build_singleton_sweep_plans(env, order, inv)
+    multi, _ = LM.build_singleton_sweep_plans(
+        env, order, inv, quant_dtypes=("bfloat16", "float8_e5m2", "int8"))
+    bf16 = [k for k in base if k.startswith("singleton:quant:")]
+    assert bf16 and all(k.endswith(":bf16") for k in bf16)
+    assert set(bf16) <= set(multi)
+    e5 = [k for k in multi if k.endswith(":float8_e5m2")]
+    i8 = [k for k in multi if k.endswith(":int8")]
+    assert len(e5) == len(bf16) and len(i8) == len(bf16), (len(bf16), len(e5), len(i8))
+    non_quant = {k for k in base if not k.startswith("singleton:quant:")}
+    assert non_quant == {k for k in multi if not k.startswith("singleton:quant:")}
+    only_q, _ = LM.build_singleton_sweep_plans(
+        env, order, inv, quant_dtypes=("int8",), ops=("quant",))
+    assert only_q and all(k.startswith("singleton:quant:") for k in only_q)
+    with pytest.raises(ValueError):
+        LM.build_singleton_sweep_plans(env, order, inv, ops=("quant", "bogus"))
+    with pytest.raises(ValueError):
+        LM.build_singleton_sweep_plans(env, order, inv, quant_dtypes=("float99",))

@@ -282,6 +282,19 @@ def make_argparser() -> argparse.ArgumentParser:
                         "(class x face x slot x legal sub-arguments).")
     p.add_argument("--singleton-skip-sweep", dest="singleton_sweep",
                    action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--quant-dtypes", default="bfloat16",
+                   help="Comma-separated Quant target dtypes for the singleton "
+                        "sweep (one singleton per legal slot per dtype). Default "
+                        "bfloat16, the 2026-09-12 panel. Measured 2026-09-13 on "
+                        "Blackwell with every face slot quantized: float8_e5m2 "
+                        "and float8_e4m3fn are usable (q 0.995 / 0.998, temp "
+                        "-27% / -11%), int8 costs q 0.91, int16 / float4 / "
+                        "float16 save no memory, unsigned targets are refused.")
+    p.add_argument("--singleton-ops", default="skip,quant,reduce,diag",
+                   help="Which singleton classes the sweep enumerates "
+                        "(subset of skip,quant,reduce,diag). A second phase "
+                        "that adds Quant dtypes to a finished panel passes "
+                        "'quant' alone.")
     p.add_argument("--f-star-threshold", type=float, default=0.8,
                    help="Quality threshold q* for F* inclusion (default: 0.8).")
     p.add_argument("--stack-ladder", default="",
@@ -652,17 +665,38 @@ def build_singleton_plan(env, order, k: int, f: int, op: str, slot: int = 0,
     }
 
 
-def build_singleton_sweep_plans(env, order, inv):
+_SINGLETON_OPS = ("skip", "quant", "reduce", "diag")
+
+
+def _quant_pid_suffix(dtype: str) -> str:
+    """``bf16`` for bfloat16 (every row written before 2026-09-13 carries that
+    name, and the ids must keep matching); the catalog name for the rest."""
+    return "bf16" if dtype == "bfloat16" else dtype
+
+
+def build_singleton_sweep_plans(env, order, inv, quant_dtypes=("bfloat16",),
+                                ops=_SINGLETON_OPS):
     """Exhaustive singletons over all live faces on order:
     - SKIP: 1 per face
-    - QUANT: bf16 per legal slot
+    - QUANT: one per legal slot per dtype in ``quant_dtypes``
     - REDUCE: mean per legal axis per slot
     - DIAG: explicit gcd per legal out-primal axis pair per slot (never -1)
+
+    ``ops`` selects the classes; an unknown name raises.
     """
+    ops = tuple(ops)
+    bad = [o for o in ops if o not in _SINGLETON_OPS]
+    if bad:
+        raise ValueError(f"--singleton-ops {bad} not in {_SINGLETON_OPS}")
+    quant_dtypes = tuple(quant_dtypes)
+    missing = [d for d in quant_dtypes if d not in QUANT_DTYPES]
+    if missing:
+        raise ValueError(f"--quant-dtypes {missing} not in QUANT_DTYPES="
+                         f"{list(QUANT_DTYPES)}")
     plans = {}
     plan_orders = {}
 
-    bf16_idx = QUANT_DTYPES.index("bfloat16")
+    quant_idx = {d: QUANT_DTYPES.index(d) for d in quant_dtypes}
     mean_idx = COMPRESS_KINDS.index("mean")
     slot_names = ["lhs", "rhs", "new"]
 
@@ -678,12 +712,13 @@ def build_singleton_sweep_plans(env, order, inv):
         face_short = f"v{v}/{prim}"
 
         # 1. SKIP (1 per face)
-        pid_skip = f"singleton:skip:k{k}.f{f}:{face_short}"
-        pl_skip = build_singleton_plan(env, order, k, f, op="skip")
-        pl_skip["op"] = "skip"
-        pl_skip["budget"] = face_tag
-        plans[pid_skip] = pl_skip
-        plan_orders[pid_skip] = order
+        if "skip" in ops:
+            pid_skip = f"singleton:skip:k{k}.f{f}:{face_short}"
+            pl_skip = build_singleton_plan(env, order, k, f, op="skip")
+            pl_skip["op"] = "skip"
+            pl_skip["budget"] = face_tag
+            plans[pid_skip] = pl_skip
+            plan_orders[pid_skip] = order
 
         # For slots lhs(0), rhs(1), new(2):
         for s in range(3):
@@ -692,16 +727,21 @@ def build_singleton_sweep_plans(env, order, inv):
                 continue
             sname = slot_names[s]
 
-            # 2. QUANT (bf16 only)
-            if quant_valid_mask(st, ("bfloat16",))[0]:
-                pid_q = f"singleton:quant:k{k}.f{f}:{sname}:bf16"
-                row_q = [QUANT_SENTINEL, bf16_idx, 0]
-                pl_q = build_singleton_plan(env, order, k, f, op="quant",
-                                            slot=s, row=row_q)
-                pl_q["op"] = "quant"
-                pl_q["budget"] = f"{face_tag}:{sname}"
-                plans[pid_q] = pl_q
-                plan_orders[pid_q] = order
+            # 2. QUANT (one per legal dtype)
+            if "quant" in ops:
+                legal = quant_valid_mask(st, quant_dtypes)
+                for di, dtype in enumerate(quant_dtypes):
+                    if not legal[di]:
+                        continue
+                    pid_q = (f"singleton:quant:k{k}.f{f}:{sname}:"
+                             f"{_quant_pid_suffix(dtype)}")
+                    row_q = [QUANT_SENTINEL, quant_idx[dtype], 0]
+                    pl_q = build_singleton_plan(env, order, k, f, op="quant",
+                                                slot=s, row=row_q)
+                    pl_q["op"] = "quant"
+                    pl_q["budget"] = f"{face_tag}:{sname}:{dtype}"
+                    plans[pid_q] = pl_q
+                    plan_orders[pid_q] = order
 
             # 3. REDUCE (mean first, every legal axis)
             # Wire row expects a logical dimension index; slot_legality.comp
@@ -709,7 +749,7 @@ def build_singleton_sweep_plans(env, order, inv):
             # canonical slots (dsnn-3qm.73).
             leg = slot_legality(st, 8)
             for a in range(8):
-                if leg.comp[a]:
+                if "reduce" in ops and leg.comp[a]:
                     pid_r = f"singleton:reduce:k{k}.f{f}:{sname}:ax{a}"
                     row_r = [COMPRESS_SENTINEL, a, mean_idx]
                     pl_r = build_singleton_plan(env, order, k, f, op="compress",
@@ -721,6 +761,8 @@ def build_singleton_sweep_plans(env, order, inv):
 
 
             # 4. DIAG (explicit gcd > 1 per legal axis pair, never -1)
+            if "diag" not in ops:
+                continue
             d_mask = diag_valid_mask(st, 8)
             n_out = len(getattr(st, "out_dims", ()))
             dims = tuple(getattr(st, "out_dims", ())) + tuple(getattr(st, "primal_dims", ()))
@@ -1802,7 +1844,12 @@ def main():
         if stride > 1:
             print(f"[landscape] singleton sweep: subsampling {len(picked_inv)} of {len(INV)} faces (stride {stride})",
                   flush=True)
-        s_plans, s_orders = build_singleton_sweep_plans(env, order, picked_inv)
+        s_plans, s_orders = build_singleton_sweep_plans(
+            env, order, picked_inv,
+            quant_dtypes=tuple(x.strip() for x in args.quant_dtypes.split(",")
+                               if x.strip()),
+            ops=tuple(x.strip() for x in args.singleton_ops.split(",")
+                      if x.strip()))
         print(f"[landscape] singleton sweep: {len(s_plans)} singleton plans generated across live faces",
               flush=True)
         plans.update(s_plans)
