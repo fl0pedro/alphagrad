@@ -584,6 +584,21 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
     return _cb
 
 
+def replay_stage1_draw(f, s, _legality, rows):
+    """The ``draw`` of a STAGE-2 REFRESH: slots 0 and 1 replay the rows a
+    device loop already drew (``rows`` is its ``(F, S, 3)`` carry, ``-1`` in
+    column 0 for "exact"), slot 2 draws nothing. Driving
+    :meth:`~alphagrad.approx.live_faces.LiveFaceStream.decide_vertex_faces`
+    with this makes its returned masks the legality of every slot ON THE
+    DECIDED OPERANDS, and leaves the slot-2 draw to the device (ticket .59
+    fault 2). Shared by ``ppo.py`` and the policy gate so the two cannot
+    drift."""
+    if s >= 2:
+        return None
+    r = rows[int(f), int(s)]
+    return None if int(r[0]) == -1 else tuple(int(x) for x in r)
+
+
 def make_face_vertex_decide_callback(live_faces, *, max_faces, max_axes,
                                      draw, prof_sink=None):
     """``cb(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,

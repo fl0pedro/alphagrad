@@ -260,10 +260,27 @@ def build_case():
         window=MAX_DELTA_TOKENS, cache=64,
     )
     chunk_cb, count_cb = make_face_callbacks(stream, window=MAX_DELTA_TOKENS)
+    # THE CAMPAIGN PATH (2026-09-13): every launcher passes --per-face-masks,
+    # so the head reads PER-SLOT legality from the live stream and slot 2 is
+    # refreshed on the decided operands (stage 2, ticket .59 fault 2). Until
+    # today the gate replayed the blind face path and the stage-2 wiring
+    # moved nothing in it. The same three objects ppo.py builds, from the
+    # same module, so the gate pins what the trainer runs.
+    from alphagrad.approx.common.face_driver import (
+        make_face_slot_legality_callback, make_face_vertex_decide_callback,
+        replay_stage1_draw)
+    from alphagrad.approx.common.masks import set_per_face_masks
+    set_per_face_masks(True)
+    sizes_cb = make_face_slot_legality_callback(
+        stream, max_faces=MAX_FACES, max_axes=MAX_AXES_PER_VERTEX)
+    decide_cb = make_face_vertex_decide_callback(
+        stream, max_faces=MAX_FACES, max_axes=MAX_AXES_PER_VERTEX,
+        draw=replay_stage1_draw)
 
     return dict(
         env=env, agent=agent, stream=stream,
         chunk_cb=chunk_cb, count_cb=count_cb,
+        sizes_cb=sizes_cb, decide_cb=decide_cb,
         total_v=total_v, num_valid=num_valid, valid=valid,
         vertex_valid_static=build_vertex_valid_static(valid, total_v),
         factor_tables=precompute_factor_tables(64),
@@ -277,7 +294,8 @@ def build_case():
 def run_trace(case=None, steps=None):
     """One seeded rollout -> the semantic trace (a plain JSON-able dict)."""
     from alphagrad.approx.common import carry_stream as CS
-    from alphagrad.approx.common.face_driver import bind_step_callbacks
+    from alphagrad.approx.common.face_driver import (
+        bind_sizes_callback, bind_step_callbacks)
     from alphagrad.approx.common.masks import vertex_avail_at_step
     from alphagrad.approx.ppo import _mask_vertex_logits
 
@@ -330,6 +348,15 @@ def run_trace(case=None, steps=None):
             case["chunk_cb"], case["count_cb"],
             state.order, state.sparsity_specs, state.step_count,
             state.face_specs, state.face_skips)
+        sizes_fn = bind_sizes_callback(
+            case["sizes_cb"],
+            state.order, state.sparsity_specs, state.step_count,
+            state.face_specs, state.face_skips)
+
+        def decide_fn(_v, _skips, _rows, _o=state.order,
+                      _s=state.sparsity_specs, _k=state.step_count,
+                      _fh=state.face_specs, _kh=state.face_skips):
+            return case["decide_cb"](_o, _s, _k, _v, _fh, _kh, _skips, _rows)
 
         (vertex_idx, micro, vertex_dist, _od, _id_, _jd, _ed, _kd,
          micro_qlp, micro_pair_v, micro_comp_v, face_out, value,
@@ -339,6 +366,7 @@ def run_trace(case=None, steps=None):
             eqn_ids=None,
             preference=None, precomputed=precomputed,
             face_chunk_fn=chunk_fn, face_count_fn=count_fn,
+            face_sizes_fn=sizes_fn, face_decide_fn=decide_fn,
             enc_carry=enc_carry,
         )
         v = int(vertex_idx)

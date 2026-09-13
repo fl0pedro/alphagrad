@@ -123,6 +123,7 @@ from alphagrad.approx.common.face_driver import (
     make_face_callbacks,
     make_face_slot_legality_callback,
     make_face_vertex_decide_callback,
+    replay_stage1_draw,
 )
 from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
 from alphagrad.approx.face_action import FaceAction
@@ -7660,15 +7661,9 @@ def main():
         # slot-2 mask, which is the measured-wrong behaviour.
         _FACE_STAGE2 = os.environ.get("ALPHAGRAD_FACE_STAGE2", "1") == "1"
 
-        def _stage1_replay_draw(f, s, _legality, rows):
-            if s >= 2:
-                return None            # stage 2: mask only, the device draws
-            r = rows[int(f), int(s)]
-            return None if int(r[0]) == -1 else tuple(int(x) for x in r)
-
         _live_face_decide = (make_face_vertex_decide_callback(
             _LIVE_FACES, max_faces=_F_FACES, max_axes=MAX_AXES_PER_VERTEX,
-            draw=_stage1_replay_draw, prof_sink=_env_prof_add)
+            draw=replay_stage1_draw, prof_sink=_env_prof_add)
             if _FACE_STAGE2 else None)
         print("[cfg] face slot-2 mask: "
               + ("EXACT (stage-2 host composition on the decided operands, "
