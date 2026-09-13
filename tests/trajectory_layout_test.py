@@ -267,7 +267,7 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
         that is true by construction; for ``rule`` the row has to apply."""
         rows, skips = _wire(k)
         try:
-            _t, _toks, segs = _reference_step(
+            _toks, segs = _reference_step(
                 jaxpr, argnums, consts, args, cand, rows, skips, VOCAB)
         except Exception:
             return False
