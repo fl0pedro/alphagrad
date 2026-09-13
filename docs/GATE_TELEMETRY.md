@@ -80,6 +80,41 @@ Conventions:
 - **G5 present.** `gate/g5/present` is 0 on an arm without
   `--preference-conditioned`: there is one implicit weighting and no simplex
   to spread over, which is a stated absence rather than a NaN with no reason.
+- **The G5 join.** G5 needs the preference a plan was measured under. The
+  preference is known per env. The plan record is written in the measure
+  process, which does not know the env. `match_records_to_envs` ties the two
+  together, and it tries two joins in this order.
+  1. The identity join. A record that carries `env_index` names its env row
+     outright. No code writes that key today. The branch is already in place.
+     After some code writes the key, the identity wins over the reward vector.
+     `gate/g5/join_mode` reads 2 here.
+  2. The reward-vector join, in float32. `gate/g5/join_mode` reads 1 here.
+     The record and the env row hold the same reward vector. The vector is
+     therefore the key. The two copies are not the same dtype.
+     `env._callback_measured` builds the reward slots as Python floats. The
+     plan record keeps that list. The callback declares a float32 result
+     (`env._callback_shape`). The trainer therefore gets
+     `jnp.array(_reward_slots, dtype=jnp.float32)`. The record holds a
+     float64 number and the env row holds its float32 image. The join casts
+     BOTH sides to float32 and compares them for exact equality. It compares
+     every reward name that both sides carry, not two of them.
+- **Why the float32 cast is not a tolerance.** Under `--cost-form absolute`
+  every reward slot came from `float(jnp.median(...))`. Each slot was already
+  a float32 value. The old float64 comparison therefore worked. Under
+  `--cost-form paired-log` (ticket .9, every 2026-09-13 arm) slot 2 and slot 5
+  hold `math.log(candidate) - math.log(reference)` in float64. That value is
+  almost never exact in float32. Job 65340 joined 0 of 4 records for this
+  reason alone. The drain was complete and the preferences were present. The
+  cast repeats the lossy step the transport already took. The comparison
+  stays exact equality in the space the env row lives in.
+- **G5 join failures print what they observed.** The module prints one
+  `[gate] G5 corners empty` line for an episode whose live records all miss
+  the corners. The line carries the join mode, the drain counts and the
+  preference shape. It
+  gives the record count and the joined count. It then gives the first
+  unmatched record and the nearest env row. It ends with the reward slot
+  that shows the largest gap. It names no cause that this episode did not
+  measure.
 - **G2** is per head, on `_value_target(estim_returns)` against the head's
   prediction (the pair the value loss compares), over every (env, step) of the
   episode. NaN when the target is constant.
@@ -160,6 +195,8 @@ end.
 | `gate/g5/drift_floor_lat_revexact` | ratio | max - min of the latency RATIO over the rev-exact records only; NaN with fewer than two (the pre-2026-09-13 definition, kept for the reverse-order control) | G5 |
 | `gate/g5/drift_floor_temp_revexact` | ratio | the same for the temp ratio | G5 |
 | `gate/g5/n_unmatched` | count | records that matched no env row (no preference known) | G5 |
+| `gate/g5/n_joined` | count | plan records the join tied to an env row this episode. Zero here beside a complete drain means the join failed and not the drain (job 65340) | G5 |
+| `gate/g5/join_mode` | 0/1/2 | which join ran. 0 is none (no env rows, or no shared reward slot), 1 is the float32 reward-vector join, 2 is the env_index identity | G5 |
 | `gate/g6/present` | 0/1 | 1 when --gate-offline-contrast was given | G6 |
 | `gate/g6/offline_contrast` | fraction | ticket .42's offline contrast, copied from the flag; NaN when absent | G6 |
 | `measure/drain/local_records` | count | plan records the TRAINER's own env handed over this episode | drain |

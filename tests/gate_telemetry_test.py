@@ -88,6 +88,30 @@ def _record(order, lat_ns, q, *, temp=1000.0, ref_lat=None, ref_temp=None,
     return rec
 
 
+def _f32(x) -> float:
+    """A value that survives the float32 transport unchanged.
+
+    Every reward slot that is NOT a paired log-difference reaches the record
+    through ``float(_aggregate_samples(...))``, i.e. through a float32 jnp
+    median, so it is already a float32 value. Test inputs that model those
+    slots must be too, or they blame the wrong slot for the 65340 join.
+    """
+    return float(np.float32(x))
+
+
+def _env_rows(records) -> np.ndarray:
+    """The terminal reward rows AS THE TRAINER RECEIVES THEM.
+
+    ``env._callback_measured`` hands the plan record its ``_reward_slots``
+    list of PYTHON floats (float64) and returns ``jnp.array(_reward_slots,
+    dtype=jnp.float32)`` to the trainer, because ``env._callback_shape``
+    declares a float32 result. So an env row is the FLOAT32 IMAGE of the
+    record's float64 slots, and building the rows here in float64 is exactly
+    what hid the job 65340 join failure from this file.
+    """
+    return np.array([r["rewards"] for r in records], dtype=np.float32)
+
+
 # One fake episode: 6 envs, 3 heads, reference latency 1000 ns, temp 1000 B.
 REV = [4, 3, 2, 1]
 
@@ -110,7 +134,7 @@ def _fake_episode():
         # env 5: sentinelled measurement, must be ignored everywhere
         _record(REV, 0.0, 0.0, sentinel=True),
     ]
-    all_rets = np.array([r["rewards"] for r in recs], dtype=np.float64)
+    all_rets = _env_rows(recs)
     prefs = np.array([[1.0, 0.0, 0.0],
                       [0.0, 0.0, 1.0],
                       [0.95, 0.05, 0.0],
@@ -537,10 +561,152 @@ def test_g5_preference_corner_rule():
 
 def test_g5_join_uses_each_env_row_once_and_tolerates_no_rows():
     recs = [_record(REV, 900.0, 0.99), _record(REV, 900.0, 0.99)]
-    rets = np.array([recs[0]["rewards"]], dtype=np.float64)
+    rets = _env_rows(recs[:1])
     env_of = gt.match_records_to_envs(recs, rets, REWARD_NAMES)
     assert env_of.tolist() == [0, -1]
     assert gt.match_records_to_envs(recs, None, REWARD_NAMES).tolist() == [-1, -1]
+
+
+# ---------------------------------------------------------------------------
+# 7b. THE JOIN ITSELF (job 65340): a complete drain that joined nothing.
+# ---------------------------------------------------------------------------
+def test_a_paired_log_latency_slot_is_float64_and_its_env_row_is_float32():
+    """The two values that differ, in one assertion.
+
+    Under ``--cost-form paired-log`` slot 2 is ``math.log(candidate) -
+    math.log(reference)``, computed in float64 and kept in the record. The
+    env row is its float32 image. They are equal in float32 and unequal in
+    float64, which is the whole of the 65340 join failure.
+    """
+    il = REWARD_NAMES.index("latency_ns")
+    rec = _record(REV, 900.0, _f32(0.99), ref_lat=1000.0, ref_temp=1000.0)
+    slot = rec["rewards"][il]
+    row = float(_env_rows([rec])[0][il])
+    assert slot == pytest.approx(-math.log(0.9))
+    assert slot != row
+    assert float(np.float32(slot)) == row
+
+
+def test_the_65340_shape_a_complete_drain_whose_records_joined_no_env_row():
+    """Four terminals, four records, four env rows, and the pre-fix join
+    matched none of them. The float32 join matches all four."""
+    il = REWARD_NAMES.index("latency_ns")
+    iq = REWARD_NAMES.index("quality")
+    recs = [_record(REV, lat, _f32(q), ref_lat=1000.0, ref_temp=1000.0)
+            for lat, q in ((900.0, 0.99), (950.0, 0.98),
+                           (980.0, 0.97), (1010.0, 0.96))]
+    rows = _env_rows(recs)
+    # The join this replaced: float64 equality on latency_ns and quality.
+    # The quality slot agrees (it is float32-exact on both sides); the
+    # paired-log latency slot alone is enough to match nothing.
+    wide = rows.astype(np.float64)
+    for r in recs:
+        assert np.any(wide[:, iq] == r["rewards"][iq])
+        assert not np.any((wide[:, il] == r["rewards"][il])
+                          & (wide[:, iq] == r["rewards"][iq]))
+    details: dict = {}
+    env_of = gt.match_records_to_envs(recs, rows, REWARD_NAMES,
+                                      details=details)
+    assert env_of.tolist() == [0, 1, 2, 3]
+    assert details["n_joined"] == 4
+    assert details["mode"] == gt.JOIN_MODE_REWARDS
+    assert details["columns"] == list(REWARD_NAMES)
+
+
+def test_the_fake_episode_joins_every_record_to_the_env_row_that_measured_it():
+    out = gt.episode_fields(**_fake_episode())
+    assert out["gate/g5/n_joined"] == 6
+    assert out["gate/g5/join_mode"] == gt.JOIN_MODE_REWARDS
+
+
+def test_the_join_prefers_the_env_index_a_record_carries_over_its_rewards():
+    """Two records the reward vector cannot tell apart, and an identity that
+    can. The identity wins and the order it gives is the one taken."""
+    recs = [_record(REV, 900.0, 0.99), _record(REV, 900.0, 0.99)]
+    recs[0][gt.ENV_INDEX_KEY] = 1
+    recs[1][gt.ENV_INDEX_KEY] = 0
+    details: dict = {}
+    env_of = gt.match_records_to_envs(recs, _env_rows(recs), REWARD_NAMES,
+                                      details=details)
+    assert env_of.tolist() == [1, 0]
+    assert details["mode"] == gt.JOIN_MODE_IDENTITY
+    assert details["n_joined"] == 2
+
+
+def test_an_env_index_that_no_env_row_owns_is_reported_and_never_invented():
+    recs = [_record(REV, 900.0, 0.99)]
+    recs[0][gt.ENV_INDEX_KEY] = 7
+    details: dict = {}
+    env_of = gt.match_records_to_envs(recs, _env_rows(recs), REWARD_NAMES,
+                                      details=details)
+    assert env_of.tolist() == [-1]
+    assert details["first_unmatched"]["key"] == {gt.ENV_INDEX_KEY: 7}
+    assert "out of range" in details["why"]
+
+
+def test_one_record_without_the_identity_sends_the_whole_join_to_the_rewards():
+    recs = [_record(REV, 900.0, 0.99), _record(REV, 950.0, 0.98)]
+    recs[0][gt.ENV_INDEX_KEY] = 0
+    details: dict = {}
+    gt.match_records_to_envs(recs, _env_rows(recs), REWARD_NAMES,
+                             details=details)
+    assert details["mode"] == gt.JOIN_MODE_REWARDS
+
+
+def test_the_join_compares_only_the_reward_names_both_sides_carry():
+    rec = _record(REV, 900.0, _f32(0.99), ref_lat=1000.0, ref_temp=1000.0)
+    rows = np.concatenate(
+        [_env_rows([rec]), np.array([[1.5]], np.float32)], axis=1)
+    names = list(REWARD_NAMES) + ["a_channel_the_record_predates"]
+    details: dict = {}
+    env_of = gt.match_records_to_envs([rec], rows, names, details=details)
+    assert env_of.tolist() == [0]
+    assert details["columns"] == list(REWARD_NAMES)
+
+
+def test_a_slot_that_is_not_a_number_on_both_sides_still_joins():
+    rec = _record(REV, 900.0, _f32(0.99), ref_lat=1000.0, ref_temp=1000.0)
+    rec["rewards"][REWARD_NAMES.index("sparsity")] = float("nan")
+    assert gt.match_records_to_envs(
+        [rec], _env_rows([rec]), REWARD_NAMES).tolist() == [0]
+
+
+def test_the_join_reports_the_first_unmatched_record_and_its_nearest_env_row():
+    recs = [_record(REV, 900.0, _f32(0.99), ref_lat=1000.0, ref_temp=1000.0)]
+    rows = _env_rows(recs).copy()
+    rows[0, REWARD_NAMES.index("quality")] += np.float32(0.25)
+    details: dict = {}
+    env_of = gt.match_records_to_envs(recs, rows, REWARD_NAMES,
+                                      details=details)
+    assert env_of.tolist() == [-1]
+    assert details["first_unmatched"]["record"] == 0
+    assert details["nearest"]["env"] == 0
+    assert details["nearest"]["worst_name"] == "quality"
+    assert details["nearest"]["worst_diff"] == pytest.approx(0.25, abs=1e-6)
+
+
+def test_the_corners_empty_line_reports_what_it_observed_and_blames_nothing(
+        capsys):
+    """The line this replaced named a lagging drain that job 65340 had
+    already disproved. The replacement prints only measurements."""
+    ep = _fake_episode()
+    # Env rows from plans that are not in this episode's record set: a join
+    # that finds nothing, with the drain and the preferences both intact.
+    ep["all_rets"] = _env_rows(
+        [_record(REV, 1234.0 + i, _f32(0.5), ref_lat=1000.0, ref_temp=1000.0)
+         for i in range(6)])
+    out = gt.episode_fields(**ep)
+    assert out["gate/g5/n_joined"] == 0
+    err = capsys.readouterr().err
+    assert "G5 corners empty" in err
+    assert "joined 0 of 6 plan record(s)" in err
+    assert "live records=5" in err
+    assert "prefs=(6, 3)" in err
+    assert "pool_terminals=4" in err and "undrained=0" in err
+    assert "first unmatched record #0" in err
+    assert "nearest env row" in err
+    assert "largest gap on" in err
+    assert "lagging" not in err
 
 
 # ---------------------------------------------------------------------------

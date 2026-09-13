@@ -1444,6 +1444,19 @@ _PLAN_LOG_WARNED: list = []
 # 0 records with N terminals means the recorder itself dropped them. Without
 # it "the plan log is empty" is not a diagnosable statement.
 _PLAN_LOG_TERMINALS = [0]
+# THE ENV SLOT THIS CALLBACK IS SERVING (gate G5's join). `_batched_host`
+# loops over the batch SERIALLY and in slot order, and `_callback` runs
+# inside that loop, so the slot the loop is on IS the env row the trainer
+# will store the returned reward vector in. The plan record stamps it as
+# `env_index`, which gives gate_telemetry.match_records_to_envs an identity
+# to join on instead of two float reward slots. -1 = unknown: an unbatched
+# call (reset), or a measure actor, which never sees the trainer's slots.
+_ENV_SLOT = [-1]
+
+
+def current_env_slot() -> int:
+    """The env row of the callback running right now, or -1."""
+    return int(_ENV_SLOT[0])
 
 # The four telemetry buckets the per-face hook maintains, per approximation
 # class. ``other`` exists because ``masks._kind_of`` emits it for a rule that
@@ -1673,6 +1686,13 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
         rec["rewards"] = [float(x) for x in
                           np.asarray(reward_vec).reshape(-1).tolist()]
         rec["reward_names"] = list(REWARD_NAMES)
+        # THE ENV ROW THIS PLAN WAS MEASURED FOR (gate G5's join,
+        # gate_telemetry.ENV_INDEX_KEY). Omitted, not set to -1, when the
+        # slot is unknown: the gate's identity join is all-or-nothing, and a
+        # -1 would claim an identity this record does not have.
+        _slot = current_env_slot()
+        if _slot >= 0:
+            rec["env_index"] = _slot
         rec.update(_plan_face_delta(face_before, face_after))
         # Degraded-fusion compiles taken WHILE THIS PLAN WAS MEASURED (a
         # delta since the previous record in this pid; measurements are
@@ -4532,7 +4552,13 @@ def _batched_host(fn, n_out: int = 3):
                    for l in jax.tree_util.tree_leaves(a)][:12], flush=True)
         outs = [[] for _ in range(n_out)]
         for i in range(E):
-            r = fn(*[_cb_slot(x, i, E) for x in a])
+            # The slot is the env row (see `_ENV_SLOT`). Cleared in a
+            # `finally` so a raising plan cannot stamp the next one.
+            _ENV_SLOT[0] = i
+            try:
+                r = fn(*[_cb_slot(x, i, E) for x in a])
+            finally:
+                _ENV_SLOT[0] = -1
             for k in range(n_out):
                 outs[k].append(np.asarray(r[k]))
         return tuple(np.stack(o, axis=0) for o in outs)

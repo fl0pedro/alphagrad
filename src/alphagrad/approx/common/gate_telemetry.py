@@ -189,6 +189,8 @@ FIELD_TABLE: tuple[tuple[str, str, str, str], ...] = (
     ("gate/g5/drift_floor_lat_revexact", "ratio", "max - min of the latency RATIO over the rev-exact records only; NaN with fewer than two (the pre-2026-09-13 definition, kept for the reverse-order control)", "G5"),
     ("gate/g5/drift_floor_temp_revexact", "ratio", "the same for the temp ratio", "G5"),
     ("gate/g5/n_unmatched", "count", "records that matched no env row (no preference known)", "G5"),
+    ("gate/g5/n_joined", "count", "plan records the join tied to an env row this episode. Zero here beside a complete drain means the join failed and not the drain (job 65340)", "G5"),
+    ("gate/g5/join_mode", "0/1/2", "which join ran. 0 is none (no env rows, or no shared reward slot), 1 is the float32 reward-vector join, 2 is the env_index identity", "G5"),
     # G6
     ("gate/g6/present", "0/1", "1 when --gate-offline-contrast was given", "G6"),
     ("gate/g6/offline_contrast", "fraction", "ticket .42's offline contrast, copied from the flag; NaN when absent", "G6"),
@@ -937,38 +939,277 @@ def preference_corner(pref, head_names, tol: float = 0.9) -> str | None:
     return str(head_names[j])
 
 
-def match_records_to_envs(records, all_rets, reward_names) -> np.ndarray:
-    """Env row of each record, or -1. A record carries the terminal reward
-    vector it was measured with; ``all_rets`` (num_envs, NUM_REWARDS) holds
-    the same vectors by env, so equality on latency_ns and quality is the
-    join (bit-equal floats from one host array). Each env row is used once."""
+# ---------------------------------------------------------------------------
+# THE RECORD -> ENV JOIN.  G5 needs the PREFERENCE a plan was measured under,
+# and the preference is known per ENV while the plan record is written in the
+# measure process, which has no env index.  Two joins, in this order.
+#
+# 1. THE IDENTITY JOIN.  A record that carries ``env_index`` says outright
+#    which env row it belongs to.  Nothing writes that key yet; the report
+#    of 2026-09-13 states the env.py / ppo.py change that would.  The branch
+#    is here so the identity wins the moment the key exists.
+#
+# 2. THE REWARD-VECTOR JOIN, in float32.  ``env._callback_measured`` builds
+#    the reward slots as PYTHON floats (``_reward_slots``) and hands THAT
+#    list to the plan record, then returns ``jnp.array(_reward_slots,
+#    dtype=jnp.float32)`` to the trainer, because the callback's declared
+#    result dtype is float32 (``env._callback_shape``).  So the two copies
+#    of one number are a float64 original and its float32 image, and they
+#    are bit-equal only when the original is representable in float32.
+#
+#    Under ``--cost-form absolute`` every slot came from
+#    ``float(jnp.median(...))``, i.e. it was ALREADY a float32 value, and
+#    the join worked.  Under ``--cost-form paired-log`` (ticket .9, every
+#    2026-09-13 arm) slot 2 and slot 5 are ``math.log(candidate) -
+#    math.log(reference)`` computed in float64, which is essentially never
+#    float32-exact.  That is why job 65340 joined 0 of 4 records while the
+#    drain was complete (4 terminals, 4 records) and the preferences were
+#    present (prefs=(4, 3)): the gate compared 0.05163000000000000 against
+#    0.05163000151515007.
+#
+#    The fix is not a tolerance.  The join compares the FLOAT32 IMAGE of
+#    both sides, which is the same lossy step the transport already took,
+#    so the comparison stays EXACT equality in the space the env row lives
+#    in.  It also compares every reward name both sides carry, not two of
+#    them, so a tie needs eleven equal slots rather than two.
+# ---------------------------------------------------------------------------
+#: The key a plan record carries when the process that measured it knows
+#: which env row it belongs to.  See docs/GATE_TELEMETRY.md, "The G5 join".
+ENV_INDEX_KEY = "env_index"
+
+#: The dtype the terminal reward vector is TRANSPORTED in (env._callback_shape).
+JOIN_DTYPE = np.float32
+
+#: gate/g5/join_mode.
+JOIN_MODE_NONE = 0        # no env rows, or no comparable column
+JOIN_MODE_REWARDS = 1     # the float32 reward-vector join
+JOIN_MODE_IDENTITY = 2    # every record carried ENV_INDEX_KEY
+
+
+def record_env_index(rec) -> int | None:
+    """The env row this record names, or None when it names none."""
+    v = rec.get(ENV_INDEX_KEY) if hasattr(rec, "get") else None
+    if v is None:
+        return None
+    try:
+        i = int(v)
+    except (TypeError, ValueError):
+        return None
+    return i if i >= 0 else None
+
+
+def _join_columns(env_names, rec_names, n_cols):
+    """``[(env column, record column), ...]`` for every reward name BOTH
+    sides carry, in the env's order. Name-keyed, so a reordered or extended
+    ``reward_names`` on either side narrows the join instead of breaking it.
+    """
+    env_names = [str(x) for x in (env_names or ())]
+    rec_names = [str(x) for x in (rec_names or ())]
+    where: dict = {}
+    for j, nm in enumerate(rec_names):
+        where.setdefault(nm, j)
+    return [(i, where[nm]) for i, nm in enumerate(env_names)
+            if i < int(n_cols) and nm in where]
+
+
+def _record_key(rec, cols):
+    """This record's reward vector on ``cols``, in the transport dtype."""
+    rews = rec.get("rewards")
+    if rews is None or not cols:
+        return None
+    try:
+        v = np.asarray(rews, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if any(j >= v.size for _i, j in cols):
+        return None
+    return v[[j for _i, j in cols]].astype(JOIN_DTYPE)
+
+
+def _rows_equal(key, block) -> np.ndarray:
+    """Exact equality per env row, with NaN counting as equal to NaN (a NaN
+    slot is a measurement that did not happen on BOTH copies, not a
+    mismatch)."""
+    k = key[None, :]
+    return ((block == k) | (np.isnan(block) & np.isnan(k))).all(axis=1)
+
+
+def _nearest_row(key, block):
+    """``(env row, per-column absolute difference)`` of the closest row.
+
+    Closest = smallest LARGEST per-column difference. A column that is NaN
+    on one side and a number on the other counts as infinitely far, so a
+    row that agrees on ten slots and disagrees on one still reads as the
+    near miss it is.
+    """
+    a = key.astype(np.float64)[None, :]
+    b = block.astype(np.float64)
+    a_nan, b_nan = np.isnan(a), np.isnan(b)
+    d = np.abs(np.where(a_nan | b_nan, 0.0, b - a))
+    d = np.where(a_nan ^ b_nan, np.inf, d)
+    return int(np.argmin(d.max(axis=1))), d
+
+
+def match_records_to_envs(records, all_rets, reward_names, *,
+                          details=None) -> np.ndarray:
+    """Env row of each record, or -1. Each env row is used at most once.
+
+    ``details``, when a dict is passed in, is filled with WHAT THE JOIN
+    OBSERVED -- the mode it used, the columns it compared, how many records
+    joined, and the first unmatched record beside its nearest env row. That
+    is what :func:`join_report` turns into the stderr line, so the gate
+    reports a measurement instead of a guess.
+    """
+    records = list(records or ())
     n = len(records)
     out = np.full(n, -1, dtype=np.int64)
-    if all_rets is None:
+    info: dict = {"mode": JOIN_MODE_NONE, "n_records": n, "n_env_rows": 0,
+                  "n_env_cols": 0, "columns": [], "n_joined": 0,
+                  "why": "", "first_unmatched": None, "nearest": None}
+
+    def _finish():
+        info["n_joined"] = int((out >= 0).sum())
+        if details is not None:
+            details.update(info)
         return out
+
+    if all_rets is None:
+        info["why"] = "the gate was handed no terminal reward rows"
+        return _finish()
     A = np.asarray(all_rets, dtype=np.float64)
     if A.ndim != 2 or A.shape[0] == 0:
-        return out
-    il, iq = _idx(reward_names, "latency_ns"), _idx(reward_names, "quality")
-    if il is None or iq is None or A.shape[1] <= max(il, iq):
-        return out
+        info["why"] = (f"the terminal reward rows have shape "
+                       f"{np.shape(all_rets)}, not (num_envs, NUM_REWARDS)")
+        return _finish()
+    info["n_env_rows"], info["n_env_cols"] = int(A.shape[0]), int(A.shape[1])
     used = np.zeros(A.shape[0], dtype=bool)
+
+    # 1. THE IDENTITY JOIN -- all or nothing, so a half-stamped drain does
+    #    not silently mix two joins with different failure modes.
+    ids = [record_env_index(r) for r in records]
+    if n and all(i is not None for i in ids):
+        info["mode"] = JOIN_MODE_IDENTITY
+        for k, e in enumerate(ids):
+            if e < A.shape[0] and not used[e]:
+                out[k] = e
+                used[e] = True
+            elif info["first_unmatched"] is None:
+                info["first_unmatched"] = {
+                    "record": k, "key": {ENV_INDEX_KEY: e}}
+                info["nearest"] = None
+                info["why"] = (f"record {k} names env {e}, which is "
+                               + ("out of range" if e >= A.shape[0]
+                                  else "already taken by an earlier record"))
+        return _finish()
+
+    # 2. THE FLOAT32 REWARD-VECTOR JOIN.
+    info["mode"] = JOIN_MODE_REWARDS
+    _cols_cache: dict = {}
     for k, rec in enumerate(records):
-        names, rews = rec.get("reward_names"), rec.get("rewards")
-        if not names or rews is None:
+        names = rec.get("reward_names")
+        if not names:
+            if info["first_unmatched"] is None:
+                info["first_unmatched"] = {"record": k, "key": {}}
+                info["why"] = "the record carries no reward_names"
             continue
-        jl, jq = _idx(names, "latency_ns"), _idx(names, "quality")
-        if jl is None or jq is None or max(jl, jq) >= len(rews):
+        ckey = tuple(str(x) for x in names)
+        if ckey not in _cols_cache:
+            cols = _join_columns(reward_names, names, A.shape[1])
+            block = (A[:, [i for i, _j in cols]].astype(JOIN_DTYPE)
+                     if cols else None)
+            _cols_cache[ckey] = (cols, block)
+        cols, block = _cols_cache[ckey]
+        info["columns"] = [str(reward_names[i]) for i, _j in cols]
+        if not cols:
+            info["why"] = ("the record and the env rows share no reward "
+                           "name, so there is nothing to compare")
             continue
-        try:
-            lat, q = float(rews[jl]), float(rews[jq])
-        except (TypeError, ValueError):
+        key = _record_key(rec, cols)
+        if key is None:
+            if info["first_unmatched"] is None:
+                info["first_unmatched"] = {"record": k, "key": {}}
+                info["why"] = "the record carries no usable reward vector"
             continue
-        hit = np.nonzero((~used) & (A[:, il] == lat) & (A[:, iq] == q))[0]
+        hit = np.nonzero((~used) & _rows_equal(key, block))[0]
         if hit.size:
             out[k] = int(hit[0])
             used[hit[0]] = True
-    return out
+            continue
+        if info["first_unmatched"] is None:
+            e, d = _nearest_row(key, block)
+            w = int(np.argmax(d[e]))
+            names_c = [str(reward_names[i]) for i, _j in cols]
+            raw = np.asarray(rec["rewards"], dtype=np.float64).reshape(-1)
+            info["first_unmatched"] = {
+                "record": k,
+                "key": dict(zip(names_c, [float(x) for x in key]))}
+            info["nearest"] = {
+                "env": e,
+                "key": dict(zip(names_c, [float(x) for x in block[e]])),
+                "worst_name": names_c[w],
+                "worst_record": float(key[w]),
+                # The record's UNCAST slot beside its float32 image. A gap
+                # that is visible here and not in `worst_record` is a dtype
+                # story, which is the one job 65340 turned out to be.
+                "worst_record_raw": float(raw[cols[w][1]]),
+                "worst_env": float(block[e][w]),
+                "worst_diff": float(d[e][w])}
+            info["why"] = (
+                f"no env row equals record {k} on all {len(cols)} shared "
+                f"reward slot(s)")
+    return _finish()
+
+
+def join_report(details, *, prefs=None, drain=None, n_live=None) -> str:
+    """The G5 join, as OBSERVED. Numbers only: no cause is named that this
+    episode did not measure."""
+    d = dict(details or {})
+    mode = {JOIN_MODE_NONE: "none", JOIN_MODE_REWARDS: "reward-vector",
+            JOIN_MODE_IDENTITY: f"identity ({ENV_INDEX_KEY})"}.get(
+                int(d.get("mode", JOIN_MODE_NONE)), "unknown")
+    parts = [f"joined {int(d.get('n_joined', 0))} of "
+             f"{int(d.get('n_records', 0))} plan record(s) to an env row",
+             f"join={mode}"]
+    if n_live is not None:
+        parts.append(f"live records={int(n_live)}")
+    parts.append(f"env rows={int(d.get('n_env_rows', 0))}"
+                 f"x{int(d.get('n_env_cols', 0))}")
+    cols = list(d.get("columns") or ())
+    parts.append(f"slots compared={len(cols)}"
+                 + (f" {cols}" if cols else ""))
+    parts.append("prefs=" + ("absent" if prefs is None
+                             else str(tuple(np.shape(prefs)))))
+    if drain:
+        parts.append(
+            "drain: local={} pool={} pool_terminals={} undrained={} "
+            "actors_failed={}".format(
+                int(drain.get("measure/drain/local_records", 0)),
+                int(drain.get("measure/drain/pool_records", 0)),
+                int(drain.get("measure/drain/pool_terminals", 0)),
+                int(drain.get("measure/drain/undrained", 0)),
+                int(drain.get("measure/drain/actors_failed", 0))))
+    if d.get("why"):
+        parts.append(str(d["why"]))
+    fu, nr = d.get("first_unmatched"), d.get("nearest")
+    if fu:
+        parts.append("first unmatched record #{}: {}".format(
+            fu.get("record"), _fmt_key(fu.get("key"))))
+    if nr:
+        parts.append("nearest env row {}: {}".format(
+            nr.get("env"), _fmt_key(nr.get("key"))))
+        parts.append(
+            "largest gap on {}: record {!r} (uncast {!r}) vs env {!r}, "
+            "difference {:.3e}".format(
+                nr.get("worst_name"), nr.get("worst_record"),
+                nr.get("worst_record_raw"), nr.get("worst_env"),
+                nr.get("worst_diff", NAN)))
+    return "; ".join(parts) + "."
+
+
+def _fmt_key(key) -> str:
+    if not key:
+        return "(empty)"
+    return " ".join(f"{k}={v!r}" for k, v in key.items())
 
 
 def _relative_spread(x) -> float:
@@ -1230,7 +1471,12 @@ def episode_fields(records, *, head_names, all_rets=None, reward_names=None,
                                mask_source=mask_source))
     out.update(g4_quality_fractions(pr["quality"][live], quality_floor))
     prefs = env_preferences(critic)
-    env_of = match_records_to_envs(records, all_rets, reward_names)
+    drain = drain_provenance(drain_local, drain_pool)
+    _join: dict = {}
+    env_of = match_records_to_envs(records, all_rets, reward_names,
+                                   details=_join)
+    out["gate/g5/n_joined"] = int(_join.get("n_joined", 0))
+    out["gate/g5/join_mode"] = int(_join.get("mode", JOIN_MODE_NONE))
     corners = []
     for k in range(len(records)):
         e = int(env_of[k])
@@ -1238,27 +1484,28 @@ def episode_fields(records, *, head_names, all_rets=None, reward_names=None,
             corners.append(None)
         else:
             corners.append(preference_corner(prefs[e], head_names, corner_tol))
-    # WHY G5 IS EMPTY, SAID OUT LOUD.  The join is bit-equality between a
-    # record's reward vector and a row of THIS episode's terminal rewards, so
-    # it fails outright when the plan records arrive one episode late -- which
-    # is what a lagging measure-actor drain does (measure/drain/undrained > 0).
-    # Without this line the corners are just NaN and the reason is invisible.
+    # WHY G5 IS EMPTY, MEASURED RATHER THAN GUESSED.  The line this replaced
+    # blamed a lagging measure-actor drain, and job 65340 disproved that on
+    # the spot: the drain was complete (4 terminals, 4 records), the
+    # preferences were there (prefs=(4, 3)), and the join still returned
+    # nothing, because it compared a float64 reward slot against its float32
+    # image (see THE RECORD -> ENV JOIN above).  `join_report` prints what
+    # this episode actually observed -- the drain counts, the preference
+    # shape, how many of how many records joined, and the first unmatched
+    # record beside the env row nearest to it -- and names no cause the
+    # numbers do not carry.
     _n_live = int(live.sum())
     if _n_live and all(c is None for c, lv in zip(corners, live) if lv):
-        print_reason(
-            "G5 corners empty",
-            f"none of {_n_live} live plan record(s) joined an env row: "
-            f"prefs={'absent' if prefs is None else prefs.shape}, "
-            f"all_rets={'absent' if all_rets is None else np.shape(all_rets)}. "
-            f"A lagging drain (measure/drain/undrained) puts the records in a "
-            f"later episode than the reward rows they must match.")
+        print_reason("G5 corners empty",
+                     join_report(_join, prefs=prefs, drain=drain,
+                                 n_live=_n_live))
     out.update(g5_front_spread(pr["lat_ratio"], pr["temp_ratio"], corners,
                                head_names, rev_exact=pr["rev_exact"],
                                live=live,
                                ref_latency_ns=pr["ref_latency_ns"],
                                ref_temp_bytes=pr["ref_temp_bytes"]))
     out.update(g6_offline_contrast(offline_contrast))
-    out.update(drain_provenance(drain_local, drain_pool))
+    out.update(drain)
     missing = documented_fields(head_names) - set(out)
     if missing:
         # THE CONTRACT IS THE TABLE.  A field the table names and this
