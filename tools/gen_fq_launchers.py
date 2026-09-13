@@ -77,9 +77,11 @@ def _face_head_geometry(mode: str):
     """(width, quant dtypes) of the face head under ``--approx-add mode``.
 
     DERIVED from ``alphagrad.approx.unified_face_head.head_layout`` and
-    ``common.masks.FACE_QUANT_DTYPES``, never typed: the head went from 94 to
-    103 logits when the Quant dtype set grew from {f32, bf16} to the four
-    floats (f32, bf16, f8e5m2, f8e4m3fn), and a launcher header that said 94
+    ``common.masks.FACE_QUANT_DTYPES``, never typed: the head gained nine
+    logits (three slots x three extra dtype logits: a four-way softmax
+    replaced the one-logit Bernoulli) when the Quant dtype set grew from
+    {f32, bf16} to the four floats (f32, bf16, f8e5m2, f8e4m3fn), and a
+    launcher header that still said the old number
     would have described a head that no longer exists.  RAISES when the
     library cannot be imported -- falling back to a literal is exactly the
     stale-launcher failure this function exists to prevent.
@@ -965,8 +967,8 @@ earns its slot.
 
 THIS ARM: {_what}.
 
-The order is the --fixed-order argument (ticket .64; it was the import-time
-env var ALPHAGRAD_FORCE_REV_ORDER until 2026-09-05).
+The order is the --fixed-order argument (ticket .64; previously an
+import-time environment variable before 2026-09-05).
 
 WHAT LIFTING THE PIN COSTS.  Face count 115 (rev) -> ~313 (random), ~2.7x the
 face work; distinct edge keys 101 -> 206-286; the face stratum flips from
