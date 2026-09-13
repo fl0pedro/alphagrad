@@ -40,13 +40,23 @@ _ALPHAGRAD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
 _PPO = os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx", "ppo.py")
 
+# THE APPROVED REWARD, PINNED (owner ruling 2026-09-13, priced in finding
+# 63).  These are the numbers the whole campaign is judged at; a change to
+# either must be a deliberate edit HERE as well as in the generator.  The
+# token is in every arm NAME because an arm called `lq5` that passes
+# --lambda-acc 16 -- or one called lq16 with no quality floor -- is exactly
+# the drift that made this morning's launchers wrong.
+LAMBDA_Q = "16"
+TAU = "0.90"
+REWARD_TOKEN = "hinge_tau09_lq16"
+
 PHASE1_NAMES = [
-    "p1a_skip_lq5",
-    "p1b_reduce_lq5",
-    "p1c_quant_lq5",
-    "p1d_diag_lq5",
-    "p1e_none_free_lq5",
-    "p1f_all_free_lq5",
+    f"p1a_skip_{REWARD_TOKEN}",
+    f"p1b_reduce_{REWARD_TOKEN}",
+    f"p1c_quant_{REWARD_TOKEN}",
+    f"p1d_diag_{REWARD_TOKEN}",
+    f"p1e_none_free_{REWARD_TOKEN}",
+    f"p1f_all_free_{REWARD_TOKEN}",
 ]
 PHASE1_PROFILES = ["skip", "reduce", "quant", "diag", "none", "all"]
 _PLACEHOLDER = re.compile(r"\$\{([A-Z0-9_]+):\?[^}]*\}")
@@ -130,7 +140,7 @@ def test_no_campaign_arm_is_held(gen, campaign):
     for a in campaign:
         assert not a.get("held"), a["name"]
         assert "ABORT(73)" not in gen.render(a), a["name"]
-    diag = _by_name(campaign, "p1d_diag_lq5")
+    diag = _by_name(campaign, f"p1d_diag_{REWARD_TOKEN}")
     assert ".25" in diag["depends"]
 
 
@@ -225,7 +235,10 @@ def test_every_campaign_arm_carries_the_required_flags(gen, campaign):
                      " --plan-log auto ", " --episodes 250 ",
                      " --measure-toolchain-gate abort ",
                      " --reduce-axis-space physical ",
-                     f" --gate-winners-table {gen.CAMPAIGN_GATE_WINNERS_TABLE} ",
+                     f" --gate-winners-table "
+                     f"{gen.CAMPAIGN_GATE_WINNERS_TABLES[cli['--fixed-order']]} ",
+                     f" --gate-offline-contrast "
+                     f"{gen.GATE_OFFLINE_CONTRAST[cli['--fixed-order']]} ",
                      " --lambda-cmp 1 ", " --lambda-mem 1 ",
                      " --wandb online "):
             assert frag in joined, (a["name"], frag)
@@ -255,27 +268,96 @@ def test_the_order_is_markowitz_except_on_the_two_order_arms(gen, campaign):
         cli = _cli(gen, a)
         text = gen.render(a)
         assert "ALPHAGRAD_FORCE_REV_ORDER" not in text, a["name"]
-        if a["name"] in ("p1e_none_free_lq5", "p1f_all_free_lq5"):
+        if a["name"] in (f"p1e_none_free_{REWARD_TOKEN}", f"p1f_all_free_{REWARD_TOKEN}"):
             assert cli["--fixed-order"] == "free", a["name"]
             assert a["time"] == "24:00:00", a["name"]
             assert "_free_" in a["name"]
         else:
             assert cli["--fixed-order"] == "markowitz", a["name"]
             assert "_free" not in a["name"] and "_reverse" not in a["name"]
-    order_only = _cli(gen, _by_name(campaign, "p1e_none_free_lq5"))
+    order_only = _cli(gen, _by_name(campaign, f"p1e_none_free_{REWARD_TOKEN}"))
     assert order_only["--approx-profile"] == "none"
     assert "--no-approx-head" not in order_only   # the profile IS the switch
     assert "--exact" not in order_only
-    assert _cli(gen, _by_name(campaign, "p1f_all_free_lq5"))["--approx-profile"] == "all"
+    assert _cli(gen, _by_name(campaign, f"p1f_all_free_{REWARD_TOKEN}"))["--approx-profile"] == "all"
 
 
-def test_phase1_and_phase2_run_raw_quality_no_floor(gen, campaign):
+def test_the_approved_reward_is_on_every_arm(gen, campaign):
+    """Owner ruling 2026-09-13, priced in finding 63: P1 hinge,
+    --quality-floor 0.90, --lambda-acc 16, --lambda-cmp 1, --lambda-mem 1.
+
+    The generator's own constants are pinned against this test's copies, so
+    changing one without the other fails here rather than shipping 17
+    launchers that run a reward nobody approved.
+    """
+    assert gen.LAMBDA_Q_MVP == LAMBDA_Q
+    assert gen.QUALITY_FLOOR_TAU == TAU
     for a in campaign:
         cli = _cli(gen, a)
-        if a["phase"] in (1, 2):
+        assert cli["--lambda-cmp"] == "1", a["name"]
+        assert cli["--lambda-mem"] == "1", a["name"]
+        assert cli["--cost-form"] == "paired-log", a["name"]
+        assert cli["--mem-channel"] == "temp", a["name"]
+        if a["phase"] == 3 and a["name"].endswith(f"pref_lq{LAMBDA_Q}"):
+            # P0 is the ONE arm that lifts the floor: that IS its question.
             assert "--quality-floor" not in cli, a["name"]
-            assert "--preference-conditioned" not in cli, a["name"]
-            assert cli["--lambda-acc"] == gen.LAMBDA_Q_MVP, a["name"]
+            continue
+        assert cli["--quality-floor"] == TAU, a["name"]
+        if cli.get("--reward-mode") == "lagrangian":
+            # lambda is the dual variable here; --lambda-acc is ignored.
+            assert cli["--lag-eta"] == gen.DUAL_ETA, a["name"]
+            assert cli["--lag-min"] == gen.DUAL_LAMBDA_MIN, a["name"]
+            assert cli["--lag-max"] == gen.DUAL_LAMBDA_MAX, a["name"]
+        else:
+            assert cli["--lambda-acc"] == LAMBDA_Q, a["name"]
+
+
+def test_no_arm_carries_the_retired_lambda_five(gen, campaign):
+    """The launchers this generator emitted on the morning of 2026-09-13
+    passed --lambda-acc 5 with no quality floor.  Finding 63 prices that at
+    contrast -20.6 on the Markowitz order: the skip-everything absorber
+    outscores every honest plan.  Neither the flag nor the name may come
+    back."""
+    for a in campaign:
+        cli = _cli(gen, a)
+        assert cli.get("--lambda-acc") != "5", a["name"]
+        assert "lq5" not in a["name"], a["name"]
+        assert "lq5" not in gen.render(a), a["name"]
+
+
+def test_gate_g1_points_at_the_sweep64_table_for_this_arms_order(gen, campaign):
+    """The staged copy at campaign/sweep41/winners.csv is byte-for-byte the
+    sweep64 MARKOWITZ table under a name that says sweep41.  A reverse-order
+    arm pointed at it would report a recovery against the other order's
+    winners."""
+    assert "sweep41" not in str(gen.CAMPAIGN_GATE_WINNERS_TABLES)
+    for a in campaign:
+        cli = _cli(gen, a)
+        want = gen.CAMPAIGN_GATE_WINNERS_TABLES[cli["--fixed-order"]]
+        assert cli["--gate-winners-table"] == want, a["name"]
+        assert "sweep64" in want
+        assert "sweep41" not in gen.render(a), a["name"]
+
+
+def test_gate_g6_carries_the_pre_run_contrast_of_this_arms_order(gen, campaign):
+    """G6's number cannot be measured by the run it judges, so the launcher
+    carries it (finding 63: +0.19 on Markowitz, 0.00 on reverse).  Without
+    it gate/g6/offline_contrast reads NaN for 250 episodes."""
+    for a in campaign:
+        cli = _cli(gen, a)
+        want = gen.GATE_OFFLINE_CONTRAST[cli["--fixed-order"]]
+        assert cli["--gate-offline-contrast"] == want, a["name"]
+        assert float(want) >= 0.0
+
+
+def test_the_launcher_states_that_the_cost_floor_is_not_landed_yet(gen, campaign):
+    """--paired-cost-floor {byte,reference} is NOT in ppo.make_argparser as
+    of this commit, and finding 63's contrast assumes the reference floor.
+    No arm may pass the flag, and every arm must SAY so in its header."""
+    for a in campaign:
+        text = gen.render(a)
+        assert "--paired-cost-floor" not in " ".join(gen.cli_tokens(a)), a["name"]
+        assert "paired-cost-floor" in text, a["name"]
 
 
 # ------------------------------------------------- 4. the environment
@@ -396,10 +478,40 @@ def test_gate_telemetry_has_no_switch_and_its_input_is_passed(gen, campaign):
     assert os.path.exists(os.path.join(_ALPHAGRAD, "docs", "GATE_TELEMETRY.md"))
     for a in campaign:
         cli = _cli(gen, a)
-        assert cli["--gate-winners-table"] == gen.CAMPAIGN_GATE_WINNERS_TABLE
+        assert (cli["--gate-winners-table"]
+                == gen.CAMPAIGN_GATE_WINNERS_TABLES[cli["--fixed-order"]])
+        assert (cli["--gate-offline-contrast"]
+                == gen.GATE_OFFLINE_CONTRAST[cli["--fixed-order"]])
         text = gen.render(a)
         assert "gate G1 winners table" in text, a["name"]
         assert "episode_fields" in text, a["name"]   # the header says where
+        assert "measure/drain/" in text, a["name"]   # the .7 audit is named
+
+
+def test_every_contract_field_the_arm_will_emit_is_documented(gen, campaign):
+    """Ticket .45: the launcher carries the two inputs, and ppo.py emits the
+    whole table unconditionally.  This pins that the table the arms will be
+    read against is the one docs/GATE_TELEMETRY.md states, and that the nine
+    quantities the ticket names all have a field."""
+    from alphagrad.approx.common import gate_telemetry as gt
+    heads = ("latency", "mem", "quality")
+    names = gt.documented_fields(heads)
+    for want in ("paired/lat_ratio_best",          # paired latency ratio
+                 "paired/temp_ratio_best",         # paired memory ratio (temp)
+                 "paired/watermark_ratio_best",    # the watermark beside it
+                 "paired/grad_cosine_mean",        # grad-cosine
+                 "gate/g4/q_zero_frac",            # the q = 0 fraction
+                 "gate/g3/uniform_floor_nats",     # entropy against its floor
+                 "gate/g2/ev_latency",             # EV per value head
+                 "gate/g1/recovery",               # recovered sweep winners
+                 "gate/g5/spread_lat",             # front spread at the corners
+                 "gate/g5/drift_floor_lat",        # what the spread must beat
+                 "measure/drain/ok"):              # ticket .7
+        assert want in names, want
+    # the floor is derived from the head the arms run, not from a literal
+    geom = gt.face_head_geometry(gen.APPROX_ADD)
+    assert geom["width"] == gen.FACE_HEAD_WIDTH
+    assert geom["n_quant_default"] == len(gen.FACE_QUANT_DTYPES) - 1
 
 
 # ------------------------------------------------- 7. the builder raises
@@ -426,7 +538,7 @@ def test_campaign_arm_raises_on_a_row_outside_the_rulings(gen):
                 gen.campaign_arm(**kw)
         assert len(gen.ARMS) == n0
         a = gen.campaign_arm(**ok)
-        assert a["name"] == "p9z_skip_lq5" and len(gen.ARMS) == n0 + 1
+        assert a["name"] == f"p9z_skip_{REWARD_TOKEN}" and len(gen.ARMS) == n0 + 1
         assert a["cli"]["--approx-add"] == "lossless"
         assert a["cli"]["--fixed-order"] == "markowitz"
     finally:
@@ -450,7 +562,7 @@ def test_setting_the_winner_constant_puts_the_profile_in_the_name(gen):
         a = gen.campaign_arm(phase=9, tag="z", profile="WINNER",
                              node=gen.CAMPAIGN_NODES[0], what="x",
                              prediction="x", falsifier="x")
-        assert a["name"] == "p9z_skip_lq5"
+        assert a["name"] == f"p9z_skip_{REWARD_TOKEN}"
         assert a["cli"]["--approx-profile"] == "skip"
         assert "P1_PROFILE" not in gen.render(a)
     finally:
@@ -467,14 +579,20 @@ def test_each_name_encodes_profile_order_channels_and_price(gen, campaign):
         prof = cli["--approx-profile"]
         prof_tok = "winner" if _PLACEHOLDER.search(prof) else prof
         assert f"_{prof_tok}_" in name, (name, prof)
-        if "--preference-conditioned" not in cli:
-            assert f"_lq{cli['--lambda-acc']}" in name, name
-        elif cli.get("--reward-mode") == "lagrangian":
+        if cli.get("--reward-mode") == "lagrangian":
             assert "_dual" in name, name
+            assert f"eta{gen.DUAL_ETA.replace('.', '')}" in name, name
         else:
-            assert "_pref" in name, name
+            # The price is in the name, and it is the price the flag carries.
+            assert f"_lq{cli['--lambda-acc']}" in name, name
+        if "--preference-conditioned" in cli:
+            assert "_pref" in name or "_dual" in name, name
+        else:
+            assert "_hinge_" in name, name
         if "--quality-floor" in cli:
-            assert f"tau{cli['--quality-floor'].replace('.', '')}" in name, name
+            # "0.90" -> "09": the name states tau without a trailing zero.
+            tok = cli["--quality-floor"].replace(".", "").rstrip("0") or "0"
+            assert f"tau{tok}" in name, name
         else:
             assert "tau" not in name, name
         if cli.get("--advantage-norm") == "popart":
@@ -487,9 +605,9 @@ def test_each_name_encodes_profile_order_channels_and_price(gen, campaign):
 
 def test_phase2_channel_arms(gen, campaign):
     p2 = {a["name"]: _cli(gen, a) for a in campaign if a["phase"] == 2}
-    assert set(p2) == {"p2a_winner_latq_lq5", "p2b_winner_memq_lq5"}
-    assert p2["p2a_winner_latq_lq5"]["--rewards"] == "cmp acc"
-    assert p2["p2b_winner_memq_lq5"]["--rewards"] == "mem acc"
+    assert set(p2) == {f"p2a_winner_latq_{REWARD_TOKEN}", f"p2b_winner_memq_{REWARD_TOKEN}"}
+    assert p2[f"p2a_winner_latq_{REWARD_TOKEN}"]["--rewards"] == "cmp acc"
+    assert p2[f"p2b_winner_memq_{REWARD_TOKEN}"]["--rewards"] == "mem acc"
     for cli in p2.values():
         assert _PLACEHOLDER.search(cli["--approx-profile"]), cli["--approx-profile"]
         assert "P1_PROFILE" in cli["--approx-profile"]
@@ -497,10 +615,11 @@ def test_phase2_channel_arms(gen, campaign):
 
 def test_phase3_ladder_p0_p1_l(gen, campaign):
     p3 = {a["name"]: _cli(gen, a) for a in campaign if a["phase"] == 3}
-    assert set(p3) == {"p3a_winner_pref", "p3b_winner_pref_tau09",
-                       "p3c_winner_dual_tau09"}
-    p0, p1, lag = (p3["p3a_winner_pref"], p3["p3b_winner_pref_tau09"],
-                   p3["p3c_winner_dual_tau09"])
+    n0, n1, nl = (f"p3a_winner_pref_lq{LAMBDA_Q}",
+                  f"p3b_winner_pref_tau09_lq{LAMBDA_Q}",
+                  f"p3c_winner_dual_tau09_eta20")
+    assert set(p3) == {n0, n1, nl}
+    p0, p1, lag = p3[n0], p3[n1], p3[nl]
     for cli in (p0, p1, lag):
         assert "--preference-conditioned" in cli
     assert "--quality-floor" not in p0 and p0["--reward-mode"] == "additive"
@@ -508,6 +627,12 @@ def test_phase3_ladder_p0_p1_l(gen, campaign):
     assert p1["--reward-mode"] == "additive"
     assert lag["--quality-floor"] == gen.QUALITY_FLOOR_TAU
     assert lag["--reward-mode"] == "lagrangian"
+    # eta 2.0, lambda in [12, 32] (owner ruling 2026-09-13): one episode of
+    # full violation (q = 0 at tau = 0.90) moves lambda by 1.8, and 12 is the
+    # smallest weight that puts the Markowitz absorber below the baseline.
+    assert lag["--lag-eta"] == "2.0"
+    assert lag["--lag-min"] == "12" and lag["--lag-max"] == "32"
+    assert lag["--lag-init"] == LAMBDA_Q
 
 
 def test_phase4_popart_sets_no_symlog_at_every_site(gen, campaign):

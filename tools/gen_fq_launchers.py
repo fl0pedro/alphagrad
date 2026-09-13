@@ -1210,9 +1210,49 @@ not a launch.""",
 FACE_NONE_BIAS_MVP = "4"
 SCALE_FACE_HEAD_MVP = "0.1"
 FACE_LOGIT_CLAMP_MVP = "15"
-LAMBDA_Q_MVP = "5"
-QUALITY_FLOOR_TAU = "0.9"
+
+# ---------------------------------------------------------------------------
+# THE APPROVED REWARD (owner ruling 2026-09-13, from finding 63's measured
+# absorber).  NOT the finding-51 window: that window (3.95-6.8) was measured
+# on the REVERSE order with the WATERMARK memory channel, where the
+# skip-everything absorber gains almost nothing.  On the Markowitz order with
+# the static temp channel the absorber gains 9.8 nats, and finding 63 measures
+# the contrast
+#
+#     contrast = R(best feasible) - max(R(absorber), R(baseline))
+#
+# at lambda_q = 8 -> -0.7, 12 -> +1.9, 16 -> +1.9, 32 -> +1.9 (P1 hinge,
+# tau = 0.90, both channels floored at the rev-exact cost).  lambda_q = 16 is
+# 1.33x the 12 the absorber needs.  EVERY phase-1 arm carries it, and the
+# hinge with it: the `lq5` arms the generator emitted this morning passed
+# --lambda-acc 5 and NO quality floor, which finding 63 prices at
+# contrast -20.6 -- the absorber wins outright.
+# ---------------------------------------------------------------------------
+LAMBDA_Q_MVP = "16"
+QUALITY_FLOOR_TAU = "0.90"
+# Dual ascent (arm L only): lam <- clip(lam + eta*(violation - target), min, max).
+DUAL_ETA = "2.0"
+DUAL_LAMBDA_MIN = "12"
+DUAL_LAMBDA_MAX = "32"
 CAMPAIGN_SEED = "250197"
+
+# ---------------------------------------------------------------------------
+# GATE G6 (ticket .45): the pre-run offline contrast of ticket .42, by the
+# order the arm runs on.  Finding 63, at the approved lambda_q = 16 / tau =
+# 0.90 / P1 hinge with both channels floored at the rev-exact cost:
+#
+#   Markowitz  +1.9 nats, ~19 % of the absorber's 9.8-nat scale  -> 0.19
+#   reverse     0.0 nats: there is nothing to gain on that order -> 0.00
+#
+# THE FLOOR THIS ASSUMES IS NOT IN THE TRAINER YET.  env._MEM_LOG_FLOOR_BYTES
+# is still one byte, and --paired-cost-floor {byte,reference} is not in
+# make_argparser as of alphagrad 0863bd4.  Under the one-byte floor the same
+# configuration prices at contrast -13.4 on Markowitz.  The launchers carry
+# the APPROVED number and the pre-flight below says so, so a run that lands
+# before the floor change is not silently judged against a number its own
+# reward cannot reach.
+# ---------------------------------------------------------------------------
+GATE_OFFLINE_CONTRAST = {"markowitz": "0.19", "free": "0.19", "reverse": "0.00"}
 
 # The profiles of ticket .40 (ppo.py --approx-profile choices) and the orders
 # of ticket .64 (common/order.py FIXED_ORDER_CHOICES).  Typed here because
@@ -1256,9 +1296,23 @@ CAMPAIGN_RUNS = f"{CAMPAIGN_ROOT}/runs"
 CAMPAIGN_PY = "/Scratch/assmuth/t57/stack/venv/bin/python"
 CAMPAIGN_WANDB_HOME = "/Scratch/assmuth/t57/home"     # .netrc + .config/wandb
 CAMPAIGN_CACHE = "/Scratch/assmuth/mrg/cache"          # dsnn_wikitext, dsnn_mnist
-# GATE G1 (ticket .45) on a node without a home: the sweep winners of .41 are
-# read from /Scratch.  .41 writes (or copies) its winners table HERE.
-CAMPAIGN_GATE_WINNERS_TABLE = f"{CAMPAIGN_ROOT}/sweep41/winners.csv"
+# GATE G1 (ticket .45) on a node without a home: the sweep winners are read
+# from /Scratch.  THE TABLE IS THE SWEEP64 ONE, BY ORDER (owner ruling
+# 2026-09-13): 4029 rows at q >= 0.80 on Markowitz, 2969 on reverse.  The
+# staged copy at {CAMPAIGN_ROOT}/sweep41/winners.csv is byte-for-byte the
+# sweep64 MARKOWITZ table under a name that says sweep41 -- a reverse-order
+# arm pointed at it would be scored against winners from the other order and
+# report a recovery that means nothing.  One table per order, named here.
+CAMPAIGN_GATE_WINNERS_TABLES = {
+    "markowitz": "/Scratch/assmuth/sweep64/runs/markowitz/winners.csv",
+    "reverse": "/Scratch/assmuth/sweep64/runs/reverse/winners.csv",
+    # The free-order arms start from the Markowitz pin and the reward signal
+    # lives on that order (finding 63); vertex ids are jaxpr equation indices
+    # and do not depend on the elimination order, so the Markowitz winner set
+    # is the meaningful one to recover.
+    "free": "/Scratch/assmuth/sweep64/runs/markowitz/winners.csv",
+}
+CAMPAIGN_GATE_WINNERS_TABLE = CAMPAIGN_GATE_WINNERS_TABLES["markowitz"]
 
 # ---------------------------------------------------------------------------
 # THE CAMPAIGN ENVIRONMENT (owner ruling 2026-09-13: args only).  A campaign
@@ -1329,16 +1383,35 @@ _CHANNEL_TOKEN = {"cmp mem acc": "latmemq", "cmp acc": "latq", "mem acc": "memq"
 _FORMS = ("fixed", "P0", "P1", "L")
 _P1_PLACEHOLDER = "${P1_PROFILE:?export P1_PROFILE to the phase-1 winning profile}"
 
-CAMPAIGN_HEAD = f"""THE CAMPAIGN (tickets .50-.54) under the settled reward: three
-trained channels -- paired log-difference latency, paired log-difference
-static temp memory (both against rev-exact measured in the same actor, back
-to back; --cost-form paired-log, --mem-channel temp) and grad-cosine (raw, no
-gate, no clamp) -- terminal rewards only, gamma = GAE lambda = 1, additive,
-raw advantages, classic init with the MVP face-head init (--face-none-bias
-{FACE_NONE_BIAS_MVP}, --scale-face-head {SCALE_FACE_HEAD_MVP},
---face-logit-clamp {FACE_LOGIT_CLAMP_MVP}), the static Markowitz order
-(--fixed-order markowitz, ticket .64) unless the row lifts it, the face ADD
---approx-add {APPROX_ADD} (the one value), one seed, 250 episodes.
+CAMPAIGN_HEAD = f"""THE CAMPAIGN (tickets .50-.54) under the APPROVED REWARD
+(owner ruling 2026-09-13, priced in finding 63): three trained channels --
+paired log-difference latency, paired log-difference static temp memory (both
+against rev-exact measured in the same actor, back to back; --cost-form
+paired-log, --mem-channel temp) and the P1 HINGE on grad-cosine
+(--quality-floor {QUALITY_FLOOR_TAU}, so slot 6 carries -max(0, tau - q)) --
+weighted --lambda-cmp 1 --lambda-mem 1 --lambda-acc {LAMBDA_Q_MVP}.  Terminal
+rewards only, gamma = GAE lambda = 1, additive, raw advantages, classic init
+with the MVP face-head init (--face-none-bias {FACE_NONE_BIAS_MVP},
+--scale-face-head {SCALE_FACE_HEAD_MVP}, --face-logit-clamp
+{FACE_LOGIT_CLAMP_MVP}), the static Markowitz order (--fixed-order markowitz,
+ticket .64) unless the row lifts it, the face ADD --approx-add {APPROX_ADD}
+(the one value), one seed, 250 episodes.
+
+WHY lambda_q = {LAMBDA_Q_MVP} AND NOT 5.  Finding 63 measured the
+skip-everything absorber on THIS order and THIS channel: it gains 9.8 nats,
+and the contrast R(best feasible) - max(R(absorber), R(baseline)) is -20.6 at
+lambda_q = 8 without a floor, -0.7 at 8 with one, +1.9 from 12 up.  The
+finding-51 window (3.95-6.8) was measured on the REVERSE order with the
+WATERMARK channel, where the absorber gains nothing; it does not transfer.
+{LAMBDA_Q_MVP} is 1.33x the 12 the Markowitz absorber needs.
+
+THE COST FLOOR THIS ASSUMES IS NOT IN THE TRAINER YET.  Finding 63's numbers
+floor BOTH cost channels at the paired rev-exact cost before the log;
+env._MEM_LOG_FLOOR_BYTES is still one byte and there is no
+--paired-cost-floor flag in make_argparser.  Under the one-byte floor the
+same configuration prices at contrast -13.4 on Markowitz -- the absorber
+wins.  Do not read a phase-1 result as a reward-design result until that
+lands (ticket .9).
 
 THE FACE HEAD is one flat MLP of {FACE_HEAD_WIDTH} logits (derived from
 alphagrad.approx.unified_face_head.head_layout({APPROX_ADD!r}).width at
@@ -1354,9 +1427,13 @@ all {CAMPAIGN_GPUS} GPUs of the node held by this job.
 THE GATE G1-G6 TELEMETRY of ticket .45 (paired/*, gate/g1..g6/*, measure/*)
 has NO switch: ppo.py's host_log computes it from the drained plan records
 every episode (alphagrad.approx.common.gate_telemetry.episode_fields; field
-table docs/GATE_TELEMETRY.md).  The launcher supplies G1's one input,
---gate-winners-table; G1 reports present = 0 while sweep .41 has not
-written the file."""
+table docs/GATE_TELEMETRY.md).  The launcher supplies the TWO inputs the
+trainer cannot measure for itself: --gate-winners-table (G1, the sweep64
+table for THIS arm's order) and --gate-offline-contrast (G6, finding 63's
+pre-run number for this reward on this order).  measure/drain/* audits that
+the plans the measure actors counted are the plans these fields were
+computed from (ticket .7): measure/drain/ok = 0 means a counter is being
+read in a process that does not own it and every panel understates."""
 
 CAMPAIGN_P1_PREDICTION = """REGISTERED BEFORE THE RUN (finding 51 D.1, ticket .50);
 NEVER EDITED AFTERWARDS.  Episode-0 survivors (q > 0 plans) >= 75 percent of
@@ -1413,9 +1490,15 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
         prof_val = P1_WINNER_PROFILE or _P1_PLACEHOLDER
     else:
         prof_tok = prof_val = profile
-    tau_tok = QUALITY_FLOOR_TAU.replace(".", "")
-    lam_tok = {"fixed": f"lq{lambda_q}", "P0": "pref",
-               "P1": f"pref_tau{tau_tok}", "L": f"dual_tau{tau_tok}"}[form]
+    tau_tok = QUALITY_FLOOR_TAU.replace(".", "").rstrip("0") or "0"
+    # THE NAME STATES THE REWARD IT RUNS.  `fixed` is no longer "raw quality
+    # at lambda_q": it is the approved P1 HINGE at tau, so it says so.  An arm
+    # named lq5 that passes --lambda-acc 16, or named lq16 with no floor,
+    # is the drift this token exists to prevent.
+    lam_tok = {"fixed": f"hinge_tau{tau_tok}_lq{lambda_q}",
+               "P0": f"pref_lq{lambda_q}",
+               "P1": f"pref_tau{tau_tok}_lq{lambda_q}",
+               "L": f"dual_tau{tau_tok}_eta{DUAL_ETA.replace('.', '')}"}[form]
     name = f"p{phase}{tag}_{prof_tok}"
     if order != "markowitz":
         name += f"_{order}"
@@ -1440,24 +1523,49 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
         "--scale-face-head": SCALE_FACE_HEAD_MVP,
         "--face-logit-clamp": FACE_LOGIT_CLAMP_MVP,
         "--rewards": rewards,
+        # THE APPROVED CHANNEL WEIGHTS (owner ruling 2026-09-13, finding 63).
         "--lambda-cmp": "1",
         "--lambda-mem": "1",
         "--lambda-acc": lambda_q,
+        # THE P1 HINGE, ON EVERY ARM.  Reward slot 6 carries
+        # -max(0, tau - q) instead of raw q (ticket .9).  This is the form
+        # finding 63 priced: without it the skip-everything absorber outscores
+        # every honest plan by 20+ nats and the arm learns to allocate
+        # nothing.  Phase 3's P0 arm is the ONE arm that lifts it, and it
+        # lifts it on purpose, as its question.
+        "--quality-floor": QUALITY_FLOOR_TAU,
         # THE MEASUREMENT (owner ruling 2026-09-13): one Ray measure actor
         # on its own GPU, the node held by this job.
         "--ray-measure": CAMPAIGN_RAY_MEASURE,
         "--ray-measure-timeout": CAMPAIGN_RAY_MEASURE_TIMEOUT,
-        # G1's input lives on /Scratch on a node without a home (finding 57).
-        "--gate-winners-table": CAMPAIGN_GATE_WINNERS_TABLE,
+        # THE GATE .45 INPUTS, the two the trainer cannot measure for itself.
+        # G1's winners table lives on /Scratch on a node without a home
+        # (finding 57) and is the SWEEP64 table for THIS arm's order.
+        "--gate-winners-table": CAMPAIGN_GATE_WINNERS_TABLES[order],
+        # G6's pre-run number (finding 63), so the run carries the contrast
+        # it is judged against instead of reading NaN.
+        "--gate-offline-contrast": GATE_OFFLINE_CONTRAST[order],
     }
     if form in ("P0", "P1", "L"):
         cli["--preference-conditioned"] = None
-    if form in ("P1", "L"):
-        cli["--quality-floor"] = QUALITY_FLOOR_TAU
+    if form == "P0":
+        # THE ONE ARM WITHOUT THE FLOOR: P0 is raw quality by definition
+        # (finding 63's P0 form), and phase 3 exists to compare it against
+        # the hinge.  Deleted rather than overwritten so the launcher does
+        # not carry a flag whose value contradicts its name.
+        cli["--quality-floor"] = _DELETE
     if form == "L":
-        # Lambda by dual ascent (--lag-*, ppo.py defaults); --lambda-acc is
-        # ignored in this mode and --quality-floor sets --lag-tau.
+        # Lambda by dual ascent; --lambda-acc is ignored in this mode and
+        # --quality-floor sets --lag-tau.  eta 2.0 with lambda in [12, 32]
+        # (owner ruling 2026-09-13): one episode of full violation
+        # (q = 0 at tau = 0.90) raises lambda by 1.8, and the floor of 12 is
+        # the smallest weight that puts the Markowitz absorber below the
+        # baseline (finding 63).
         cli["--reward-mode"] = "lagrangian"
+        cli["--lag-eta"] = DUAL_ETA
+        cli["--lag-min"] = DUAL_LAMBDA_MIN
+        cli["--lag-max"] = DUAL_LAMBDA_MAX
+        cli["--lag-init"] = lambda_q
     if advantage_norm == "popart":
         # The recorded trap (ticket .53): --no-symlog must be set with
         # PopArt, and the three symlog sites must agree.  --symlog-channels

@@ -183,6 +183,21 @@ def test_missing_inputs_give_absent_flags_not_exceptions():
     assert out["gate/g3/n_faces"] == 0
 
 
+def test_the_markdown_doc_carries_the_rendered_table_verbatim():
+    """docs/GATE_TELEMETRY.md IS FIELD_TABLE rendered.  A field added to the
+    module and not to the doc (or the other way round) is a gate reading a
+    name nobody agreed to, so the doc is checked against the renderer rather
+    than maintained by hand."""
+    import os
+    doc = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "docs", "GATE_TELEMETRY.md")
+    with open(doc) as fh:
+        text = fh.read()
+    assert gt.render_field_table().strip() in text, (
+        "docs/GATE_TELEMETRY.md is out of date; paste in:\n"
+        + gt.render_field_table())
+
+
 def test_documented_table_covers_every_gate_letter_and_renders():
     letters = {row[3] for row in gt.FIELD_TABLE}
     assert {"G1", "G2", "G3", "G4", "G5", "G6"} <= letters
@@ -501,9 +516,14 @@ def test_g5_records_join_envs_by_reward_vector_and_land_on_corners():
     assert out["gate/g5/spread_temp"] == pytest.approx(1.0 - 0.7)
     # env 4 sat in the interior: live but at no corner
     assert out["gate/g5/n_unmatched"] == 1
-    # drift floor from the two rev-exact plans: 1.02 - 1.00
+    # the rev-exact-CANDIDATE floor, kept for the reverse-order control:
+    # the two rev-exact plans differ by 1.02 - 1.00
     assert out["gate/g5/n_rev_exact"] == 2
-    assert out["gate/g5/drift_floor_lat"] == pytest.approx(0.02)
+    assert out["gate/g5/drift_floor_lat_revexact"] == pytest.approx(0.02)
+    # the floor G5 actually uses is the spread of the REPEATED REFERENCE,
+    # which this episode pins at 1000 ns for every plan: zero drift.
+    assert out["gate/g5/drift_floor_lat"] == pytest.approx(0.0)
+    assert out["gate/g5/present"] == 1
     assert out["gate/g5/drift_floor_temp"] == pytest.approx(0.0)
 
 

@@ -19,8 +19,17 @@ Conventions:
 
 - **Ratio** = candidate / rev-exact, paired (same actor, back to back, warm),
   dimensionless, < 1 = cheaper. The per-plan reference is ticket .9's plan-log
-  fields `ref_latency_ns` and `ref_mem_temp_bytes` (positive units); until .9
-  lands the ratio fields read NaN and `paired/n_with_ref` reads 0.
+  fields `ref_latency_ns`, `ref_temp_bytes` and `ref_watermark_bytes`
+  (positive units), and the candidate's own side is `candidate_latency_ns`,
+  `mem_temp_bytes` and `mem_watermark_bytes`.
+- **NOT the reward slot.** Under `--cost-form paired-log` (ticket .9, every
+  2026-09-13 arm) reward slots 2 and 5 hold `-(log cost - log ref)`, a
+  dimensionless log-difference, NOT `-ns` and `-bytes`. Reading a latency off
+  the slot gave a negative number and the positivity guard turned every
+  `paired/lat_ratio_*` into NaN between 2026-09-05 and 2026-09-13 (job 65321).
+  The module reads the absolute fields and refuses to reconstruct ns from a
+  log-difference; a record written under `--cost-form absolute` still falls
+  back to the negated slot.
 - **Positive units.** The reward vector stores costs negated; every ns / bytes
   value here is positive.
 - **Live** = not sentinelled (no cost channel at -1e10). Every count and
@@ -30,20 +39,47 @@ Conventions:
 - **Rev-exact** is decided on the wire (reverse order, no rule, no face row),
   not on a label.
 - **Corner** = the env's preference put >= 90 % of its mass on one head.
-- **G3 floor.** For face f with per-slot legal choice counts n_s (1 for None +
-  ordered Diag pairs i != j + reduce axes x 5 reduce fns + non-identity Quant
-  dtypes, each term only when its op is legal under ticket .59's bottom-up rule
-  and ticket .40's profile mask), the legal joint outcomes number
-  N_f = [skip legal] + prod_s n_s. `uniform_floor_per_face_nats` is the mean of
-  log N_f. The trainer's `entropy/approx_head` divides the summed face entropy
-  by the arity (one per valid face plus one per non-None slot), so the
+- **G3 floor, DERIVED.** For face f with per-slot legal choice counts n_s
+  (1 for None + ordered Diag pairs i != j + reduce axes x reduce fns +
+  legal Quant dtypes, each term only when its op is legal under ticket .59's
+  bottom-up rule and ticket .40's profile mask), the legal joint outcomes
+  number N_f = [skip legal] + prod_s n_s. `uniform_floor_per_face_nats` is the
+  mean of log N_f. The trainer's `entropy/approx_head` divides the summed face
+  entropy by the arity (one per valid face plus one per non-None slot), so the
   comparable `uniform_floor_nats` is sum_f log N_f / sum_f E[arity_f] with,
   under the uniform law, E[arity_f] = 1 + (prod_s n_s / N_f) sum_s (1 - 1/n_s).
-  With every choice legal on a 6-axis face the 94-logit head has
-  n_s = 1 + 30 + 45 + 1 = 77 per slot and N_f = 1 + 77^3 = 456,534, i.e.
-  13.03 nats per face; the live masks make it far smaller, which is why the
-  floor is computed from them (once per run, from the reset-state oracle probe
-  of every face of every valid vertex) and not stated as a constant.
+  EVERY CONSTANT IN THAT ARITHMETIC COMES FROM
+  `unified_face_head.head_layout(--approx-add)` and
+  `common.masks.FACE_QUANT_DTYPES`, never from a literal
+  (`gate_telemetry.face_head_geometry`): the slot count is the running
+  width's, and the QUANT term is the FOUR-way dtype categorical
+  (float32, bfloat16, float8_e5m2, float8_e4m3fn) with the operand's own
+  dtype masked (ticket .40 D4), so a face whose mask says only "QUANT is
+  legal" offers K - 1 = 3 casts, not 1. Under the 2026-09-13 head (103
+  logits = 1 + 34*3) a 6-axis face with everything legal has
+  n_s = 1 + 30 + 45 + 3 = 79 and N_f = 1 + 79^3 = 493,040, i.e. 13.11 nats
+  per face; the live masks make it far smaller, which is why the floor is
+  computed from them and not stated as a constant. `gate/g3/n_slots`,
+  `gate/g3/head_width` and `gate/g3/n_quant_dtypes` put the derivation in the
+  run so a floor can never quietly describe a head that stopped running.
+- **Where the G3 masks come from.** `gate/g3/mask_source` is 2 on the LIVE
+  path (`--live-faces`, every campaign arm): `LiveFaceStream.face_slot_legality`
+  at the reset state, per face, per slot and per QUANT dtype. It is 1 on the
+  oracle path and 0 when neither is available. Before 2026-09-13 only the
+  oracle path existed and `ppo._NO_ORACLE` is true whenever `--live-faces` is
+  on, so every `gate/g3/*` floor field read NaN in every run that mattered.
+- **G5 drift floor.** The floor a front spread must beat is the spread of the
+  PAIRED REFERENCE, not of candidates that happen to be rev-exact: ticket .9
+  re-measures the same rev-exact plan once per candidate in the same actor,
+  so `(max - min) / mean` of `ref_latency_ns` within an episode is the
+  instrument's own noise on the same computation. The old definition needed a
+  candidate that is rev-exact ON THE WIRE (strictly descending order, no rule,
+  no face row), which under `--fixed-order markowitz` is never any of them, so
+  it was structurally NaN on every campaign arm; it is kept under
+  `*_revexact` for the reverse-order control of ticket .60.
+- **G5 present.** `gate/g5/present` is 0 on an arm without
+  `--preference-conditioned`: there is one implicit weighting and no simplex
+  to spread over, which is a stated absence rather than a NaN with no reason.
 - **G2** is per head, on `_value_target(estim_returns)` against the head's
   prediction (the pair the value loss compares), over every (env, step) of the
   episode. NaN when the target is constant.
@@ -55,7 +91,17 @@ Conventions:
 Counters are drained in the process that increments them (ticket .7): the
 toolchain and memory-parity rows below are logged by `ppo.py`'s plan-log block
 off `env.consume_plan_records` (merged with the measure pool's) and are listed
-here so the gate reads one table.
+here so the gate reads one table. `measure/drain/*` AUDITS that: the measure
+actors count their own terminal plans, and `measure/drain/undrained` is what
+those counters claim minus what actually reached this process. It reads 0 on a
+healthy episode and the number of lost plans on the ticket .7 shape -- the
+cancelled canary 65319 logged `pool_terminals=16` beside `pooled=0`, i.e. every
+gate field that episode was computed over an empty record set.
+`gate_telemetry.drain_provenance(..., strict=True)` raises on it.
+
+`episode_fields` RAISES if the table below names a field it does not emit: a
+gate input that is silently absent is the failure tickets .43 and .45 exist to
+end.
 
 | field | unit | source | gate |
 |---|---|---|---|
