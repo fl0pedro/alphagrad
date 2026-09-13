@@ -661,6 +661,34 @@ def test_phase5_is_five_seeds_of_one_configuration(gen, campaign):
 
 # ------------------------------------ 9. the wave arms keep their runtime
 
+def test_every_arm_including_the_wave_arms_gets_a_real_winners_table(gen):
+    """One mechanism: SHARED_CLI carries the _ByOrder sentinel and _merge_cli
+    resolves it from the arm's own --fixed-order.  The wave arms previously
+    carried ~/dsnn/run_analysis/sweep41/winners.csv, a path nothing has ever
+    written, so gate/g1/present read 0 in every one of them."""
+    for a in gen.ARMS:
+        if a.get("kind") != "train":
+            continue
+        cli = _cli(gen, a)
+        tbl = cli["--gate-winners-table"]
+        assert isinstance(tbl, str), (a["name"], tbl)
+        assert tbl == gen.CAMPAIGN_GATE_WINNERS_TABLES[cli["--fixed-order"]]
+        assert "run_analysis" not in tbl and "sweep41" not in tbl
+        assert tbl.startswith("/Scratch/")
+
+
+def test_an_order_without_a_sweep_raises_instead_of_borrowing_one(gen):
+    saved = dict(gen.CAMPAIGN_GATE_WINNERS_TABLES)
+    try:
+        del gen.CAMPAIGN_GATE_WINNERS_TABLES["reverse"]
+        with pytest.raises(ValueError) as e:
+            gen._merge_cli({"--fixed-order": "reverse"})
+        assert "winners table" in str(e.value)
+    finally:
+        gen.CAMPAIGN_GATE_WINNERS_TABLES.clear()
+        gen.CAMPAIGN_GATE_WINNERS_TABLES.update(saved)
+
+
 def test_the_wave_arms_keep_the_home_runtime_and_the_shared_env(gen):
     waves = [a for a in gen.ARMS if a["kind"] == "train" and not a.get("phase")]
     assert waves
@@ -739,7 +767,10 @@ def test_ppo_argparse_accepts_every_campaign_command_line(gen, campaign):
         assert ns.scale_face_head == float(gen.SCALE_FACE_HEAD_MVP), a["name"]
         assert ns.face_logit_clamp == float(gen.FACE_LOGIT_CLAMP_MVP), a["name"]
         assert ns.plan_log == "auto" and ns.episodes == 250, a["name"]
-        assert ns.gate_winners_table == gen.CAMPAIGN_GATE_WINNERS_TABLE, a["name"]
+        assert (ns.gate_winners_table
+                == gen.CAMPAIGN_GATE_WINNERS_TABLES[ns.fixed_order]), a["name"]
+        assert ns.gate_offline_contrast == float(
+            gen.GATE_OFFLINE_CONTRAST[ns.fixed_order]), a["name"]
         assert ns.advantage_norm == cli.get("--advantage-norm", "none"), a["name"]
         assert ns.reward_mode == cli.get("--reward-mode", "additive"), a["name"]
         assert ns.no_approx_head is False, a["name"]

@@ -131,11 +131,24 @@ FACE_HEAD_WIDTH, FACE_QUANT_DTYPES = _face_head_geometry(APPROX_ADD)
 # ---------------------------------------------------------------------------
 LANDSCAPE_TOOL = f"{REPO}/src/alphagrad/approx/tools/landscape_map.py"
 
-# GATE G1 (ticket .45) reads the sweep winners of ticket .41 from here.  The
-# sweep has not run; ppo.py logs gate/g1/present = 0 while the file is
-# absent, and the pre-flight prints whether it is there.  When .41 lands it
-# writes its winners table (columns vertex, primitive, kind) to THIS path.
-GATE_WINNERS_TABLE = f"{HOME_DSNN}/run_analysis/sweep41/winners.csv"
+# GATE G1 (ticket .45) reads the sweep winners from a table that depends on
+# the arm's ELIMINATION ORDER: a plan applied at vertex v on the Markowitz
+# order is a different opportunity from the same vertex on the reverse order,
+# and the two sweeps found different winners (4029 rows vs 2969).  An arm
+# pointed at the other order's table reports a recovery fraction that means
+# nothing, so the value is resolved per arm in `_merge_cli` from the arm's own
+# --fixed-order.  The tables are the SWEEP64 ones (owner ruling 2026-09-13);
+# CAMPAIGN_GATE_WINNERS_TABLES below is the map, and the old
+# ~/dsnn/run_analysis/sweep41/winners.csv path is gone -- nothing ever wrote
+# it, so every launcher carrying it logged gate/g1/present = 0 forever.
+class _ByOrder:
+    """Sentinel: resolve this flag's value from the arm's --fixed-order."""
+
+    def __repr__(self) -> str:        # so a stray copy is visible in a diff
+        return "<resolved from --fixed-order>"
+
+
+GATE_WINNERS_TABLE = _ByOrder()
 
 # Flags fq_face_attrib passes to landscape_map.py.  Grepped against THE TOOL
 # THAT IS ACTUALLY INVOKED, not against ppo.py: this launcher lived outside
@@ -1539,9 +1552,10 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
         "--ray-measure": CAMPAIGN_RAY_MEASURE,
         "--ray-measure-timeout": CAMPAIGN_RAY_MEASURE_TIMEOUT,
         # THE GATE .45 INPUTS, the two the trainer cannot measure for itself.
-        # G1's winners table lives on /Scratch on a node without a home
-        # (finding 57) and is the SWEEP64 table for THIS arm's order.
-        "--gate-winners-table": CAMPAIGN_GATE_WINNERS_TABLES[order],
+        # G1's winners table is inherited from SHARED_CLI and resolved from
+        # this arm's --fixed-order by `_merge_cli` (ONE mechanism, so a wave
+        # arm cannot get a different rule from a campaign arm); it lives on
+        # /Scratch because the GPU nodes mount no home (finding 57).
         # G6's pre-run number (finding 63), so the run carries the contrast
         # it is judged against instead of reading NaN.
         "--gate-offline-contrast": GATE_OFFLINE_CONTRAST[order],
@@ -2079,6 +2093,21 @@ def _merge_cli(overrides: dict) -> list[tuple[str, str | None]]:
         if flag in seen or val is _DELETE:
             continue
         merged.append((flag, val))
+    # G1's table follows the arm's own order (see GATE_WINNERS_TABLE).  Done
+    # after the merge so the order an arm OVERRIDES is the one that decides.
+    order = dict(merged).get("--fixed-order")
+    if any(isinstance(v, _ByOrder) for _, v in merged):
+        try:
+            table = CAMPAIGN_GATE_WINNERS_TABLES[order]
+        except KeyError:
+            raise ValueError(
+                f"--fixed-order {order!r} has no gate G1 winners table. "
+                f"Known: {sorted(CAMPAIGN_GATE_WINNERS_TABLES)}. An arm whose "
+                f"order has no sweep must not silently inherit another "
+                f"order's winners -- G1 would report a recovery against "
+                f"opportunities this run never had.") from None
+        merged = [(f, table if isinstance(v, _ByOrder) else v)
+                  for f, v in merged]
     return merged
 
 
@@ -2409,7 +2438,8 @@ def render(a: dict) -> str:
         L.append(f'  echo "[preflight] gate G1 winners table present: {_gw}"')
         L.append("else")
         L.append(f'  echo "[preflight] gate G1 winners table ABSENT ({_gw}):'
-                 ' gate/g1/present will read 0 until sweep .41 writes it"')
+                 ' gate/g1/present will read 0 and gate/g1/recovery* will be'
+                 ' meaningless for this whole run"')
         L.append("fi")
         L.append("")
     L.append("ARGS=(")
