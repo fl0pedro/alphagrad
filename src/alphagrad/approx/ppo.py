@@ -122,6 +122,7 @@ from alphagrad.approx.common.face_driver import (
     build_live_face_stream,
     make_face_callbacks,
     make_face_slot_legality_callback,
+    make_face_vertex_decide_callback,
 )
 from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
 from alphagrad.approx.face_action import FaceAction
@@ -2807,6 +2808,7 @@ class Agent(eqx.Module):
         face_chunk_fn=None,       # (f, vertex_specs, rows, skips) -> that face's token chunk
         face_count_fn=None,       # vertex -> ACTUAL face count (while_loop trip count)
         face_sizes_fn=None,       # --per-face-masks on --live-faces: vertex -> ((F,N) live dim sizes, (F,) QUANT legality)
+        face_decide_fn=None,      # exact slot-2 masks (.59 fault 2): (vertex, skips, stage-1 rows) -> the two-stage pass's masks
         enc_carry=None,           # step carry the per-face SIDE carry branches from
         endpoint_rows=None,       # (V+1, E) read(base+dyn) rows (--face-endpoint-read)
         edge_rows=None,           # (K, E) edge-memory read rows (--face-edge-mem)
@@ -3075,10 +3077,79 @@ class Agent(eqx.Module):
                     face_sizes=f_sizes,
                     face_quant=f_quant,
                     face_nout=f_nout,
+                    want_stage2=(face_decide_fn is not None),
                 )
+                _fctx = _rs1 = None
+                if face_decide_fn is not None:
+                    _fctx, _rs1 = _fl_out[-2:]
+                    _fl_out = _fl_out[:-2]
                 (fa, face_logp, face_ent, f_cnt, f_dt,
                  f_de, f_ends) = _fl_out[:7]
                 _fl_tail = _fl_out[7:]  # (f_eslots, f_ewr)? + (f_heads)?
+                if face_decide_fn is not None:
+                    # STAGE 2 (ticket .59 fault 2, finding 75). The loop above
+                    # drew every slot against masks read BEFORE any decision:
+                    # exact for `lhs` and `rhs` (nothing at this vertex moves
+                    # the in-edge and out-edge Jacobians), stale for `new`,
+                    # whose tensor IS the contraction of the two operands just
+                    # decided (measured: 23 of 526 cleared rows refused at
+                    # apply time). One host call composes each face's `new`
+                    # from the stage-1 rows -- the two-stage pass, driven with
+                    # these rows for slots 0 and 1 and drawing nothing for
+                    # slot 2 -- and hands back every slot's mask. Every face is
+                    # then re-drawn ON DEVICE against those masks from its
+                    # STORED context: slot s draws from its own key slice and
+                    # its own logit block, so slots 0 and 1 reproduce bit for
+                    # bit and only slot 2 moves (pinned by
+                    # test_the_per_slot_draws_equal_one_joint_draw). The masks
+                    # that ride out below are the stage-2 ones, so the loss
+                    # rescores the variable that was acted on.
+                    _pol = self.face_path_policy
+                    _F = _pol.max_faces
+                    _dec = face_decide_fn(vertex_idx, fa.skip, _rs1)
+                    (_rows2_unused, _sizes2, _quant2, _pair2, _comp2,
+                     _nout2, _nf2) = _dec
+                    _n2 = jnp.minimum(jnp.asarray(_n_faces if _n_faces is not None
+                                                  else face_count_fn(vertex_idx),
+                                                  jnp.int32), _F)
+                    _live = jnp.arange(_F, dtype=jnp.int32) < _n2
+                    _WK2 = self._wire_keys()
+
+                    def _redraw(f, ctx_f, pair_f, comp_f, valid_f, sizes_f,
+                                quant_f, nout_f):
+                        sk, row, lp, e, _ar, _sp, _od = _pol.sample_face(
+                            features, factor_tables,
+                            jrand.fold_in(face_key, f), f, pair_f, comp_f,
+                            valid_f, face_context=ctx_f,
+                            face_sizes_f=sizes_f, face_quant_f=quant_f,
+                            op_legality_override=op_legality_override)
+                        rs_f = self._face_row_specs(
+                            row, axis_state[vertex_idx], nout_f)
+                        return (sk.astype(jnp.int32),
+                                tuple(row[k] for k in _WK2), lp, e, rs_f)
+
+                    _sk2, _wa2, _lp2, _e2, _rs2 = jax.vmap(_redraw)(
+                        jnp.arange(_F, dtype=jnp.int32), _fctx, _pair2,
+                        _comp2, f_valid, _sizes2, _quant2, _nout2)
+                    # Padding faces never ran in the loop: END rows, no skip,
+                    # zero score -- the same contract the loop's carry had.
+                    _z2 = _rec.zeros(_pol.approx_add, _F)
+
+                    def _keep(new, zero):
+                        m = _live.reshape((_F,) + (1,) * (jnp.ndim(new) - 1))
+                        return jnp.where(m, new, zero)
+
+                    _rs_pad = -jnp.ones_like(_rs2).at[..., 2].set(0)
+                    fa = FaceAction(
+                        skip=_keep(_sk2, jnp.zeros((_F,), jnp.int32)),
+                        **{k: _keep(w, getattr(_z2, k))
+                           for k, w in zip(_WK2, _wa2)})
+                    _rec.check(fa, _pol.approx_add, _F,
+                               where="Agent.sample_action_dynamic[stage2]")
+                    face_logp = jnp.sum(jnp.where(_live, _lp2, 0.0))
+                    face_ent = jnp.sum(jnp.where(_live, _e2, 0.0))
+                    f_pair, f_comp = _pair2, _comp2
+                    f_sizes, f_quant, f_nout = _sizes2, _quant2, _nout2
             face_out = (fa, face_logp, face_ent, f_pair, f_comp, f_valid,
                         f_cnt, f_dt, f_de, f_ends)
             # --face-edge-mem appends the read slots + write metadata;
@@ -3263,9 +3334,15 @@ class Agent(eqx.Module):
                    vertex_idx, vertex_specs, axis_state_v,
                    op_legality_override, n_faces, endpoint_rows=None,
                    edge_rows=None, face_sizes=None, face_quant=None,
-                   face_nout=None):
+                   face_nout=None, want_stage2=False):
         """Read face f's chunk, decide face f, repeat -- for the ACTUAL face
         count, as a while_loop.
+
+        ``want_stage2`` (the exact slot-2 mask, ticket .59 fault 2): also
+        carry every face's head CONTEXT and return ``(contexts (F, D), rows
+        (F, S, 3))`` as the last two elements, so the caller can hand the
+        stage-1 rows to the host, get slot 2's exact masks back, and re-draw
+        the faces on device against them without re-encoding anything.
 
         The width F is the provable per-graph bound (196 on nn256-xent) and
         a python loop unrolled F copies of the encoder scan into the
@@ -3320,8 +3397,23 @@ class Agent(eqx.Module):
         _RH = _face_read_needs_head()
         if _RH:
             st0 = st0 + (jnp.zeros((F,), jnp.int32),)
+        if want_stage2:
+            # The context width is the encoder summary (an empty chunk leaves
+            # the carry alone and returns the zero summary) plus whatever the
+            # endpoint / edge reads concatenate below.
+            _, _summ0 = self._face_encode(
+                enc_carry, jnp.zeros((W,), jnp.int32),
+                -jnp.ones((W,), jnp.int32), jnp.asarray(0, jnp.int32))
+            _D = int(_summ0.shape[-1])
+            if getattr(pol, "endpoint_read", False):
+                _D += 2 * int(endpoint_rows.shape[1])
+            if _EM:
+                _D += 2 * int(edge_rows.shape[1])
+            st0 = st0 + (jnp.zeros((F, _D), _summ0.dtype),)
 
         def _body(st):
+            if want_stage2:
+                st, fctx = st[:-1], st[-1]
             _hds = st[-1] if _RH else None
             _st_core = st[:-1] if _RH else st
             if _EM:
@@ -3396,6 +3488,8 @@ class Agent(eqx.Module):
                 _elr = jnp.where((_els >= 0)[:, None],
                                  edge_rows[_eli], 0.0)
                 summ = jnp.concatenate([summ, _elr[0], _elr[1]])
+            if want_stage2:
+                fctx = fctx.at[f].set(summ)
             sk, row, lp, e, _ar, _sp, _od = pol.sample_face(
                 features, factor_tables, jrand.fold_in(key, f),
                 f, f_pair[f], f_comp[f], f_valid[f], face_context=summ,
@@ -3419,18 +3513,28 @@ class Agent(eqx.Module):
                              fwr.at[f].set(ei_f[2:4]))
             if _RH:
                 out = out + (_hds.at[f].set(hd_eff),)
+            if want_stage2:
+                out = out + (fctx,)
             return out
 
         _st = lax.while_loop(lambda st: st[0] < n, _body, st0)
+        _fctx = None
+        if want_stage2:
+            _st, _fctx = _st[:-1], _st[-1]
         (_f, _c, logp, ent, skips, cnts, _rs, wa, ftok, feqn,
          _off, fends) = _st[:12]
         fa = FaceAction(skip=skips, **dict(zip(_WK, wa)))
         _rec.check(fa, pol.approx_add, F, where="Agent._face_loop")
         # Layout: (fa, logp, ent, cnts, ftok, feqn, fends) then the edge-mem
         # pair (if any) then the face heads (if any) -- heads LAST so the
-        # historical `[:7]` / edge `[7:9]` unpacks are untouched.
+        # historical `[:7]` / edge `[7:9]` unpacks are untouched. Under
+        # ``want_stage2`` the contexts and the stage-1 rows come LAST of all
+        # and the caller pops them before it reads the tail.
         _tail = tuple(_st[12:])
-        return (fa, logp, ent, cnts, ftok, feqn, fends) + _tail
+        out = (fa, logp, ent, cnts, ftok, feqn, fends) + _tail
+        if want_stage2:
+            out = out + (_fctx, _rs)
+        return out
 
     def _face_replay(self, features, factor_tables, fa,
                      f_pair, f_comp, f_valid, enc_carry, face_chunks,
@@ -7503,6 +7607,7 @@ def main():
     _LIVE_FACES = None
     _live_face = _live_face_count = None
     _live_face_sizes = None
+    _live_face_decide = None
     _EDGE_TABLE = None
     if getattr(args, "live_faces", False):
         _LIVE_FACES = build_live_face_stream(
@@ -7546,6 +7651,31 @@ def main():
         _live_face_sizes = make_face_slot_legality_callback(
             _LIVE_FACES, max_faces=_F_FACES,
             max_axes=MAX_AXES_PER_VERTEX, prof_sink=_env_prof_add)
+        # The exact slot-2 masks (ticket .59 fault 2): the two-stage pass,
+        # driven with the rollout's own stage-1 rows for slots 0 and 1 and
+        # drawing nothing for slot 2, so what comes back is the legality of
+        # `new` ON THE DECIDED OPERANDS. Wired only where the per-slot masks
+        # are (the live stream with the contraction band), and switchable
+        # for an A/B of its cost: ALPHAGRAD_FACE_STAGE2=0 keeps the static
+        # slot-2 mask, which is the measured-wrong behaviour.
+        _FACE_STAGE2 = os.environ.get("ALPHAGRAD_FACE_STAGE2", "1") == "1"
+
+        def _stage1_replay_draw(f, s, _legality, rows):
+            if s >= 2:
+                return None            # stage 2: mask only, the device draws
+            r = rows[int(f), int(s)]
+            return None if int(r[0]) == -1 else tuple(int(x) for x in r)
+
+        _live_face_decide = (make_face_vertex_decide_callback(
+            _LIVE_FACES, max_faces=_F_FACES, max_axes=MAX_AXES_PER_VERTEX,
+            draw=_stage1_replay_draw, prof_sink=_env_prof_add)
+            if _FACE_STAGE2 else None)
+        print("[cfg] face slot-2 mask: "
+              + ("EXACT (stage-2 host composition on the decided operands, "
+                 "one call per vertex; ALPHAGRAD_FACE_STAGE2=0 for the "
+                 "static one)" if _FACE_STAGE2 else
+                 "STATIC (ALPHAGRAD_FACE_STAGE2=0): known wrong for `new`, "
+                 "finding 75"), flush=True)
 
     # Live elimination chains: one per concurrent env, plus the previous
     # episode's, which the LRU only sheds once the new ones exist. Sized like
@@ -8294,6 +8424,7 @@ def main():
             face_chunk_fn = None
             face_count_fn = None
             face_sizes_fn = None
+            face_decide_fn = None
             if _LIVE_FACES is not None:
                 # The FULL per-face history rides along: `_rows`/`_skips` are
                 # the CURRENT vertex's in-flight decisions (the face loop's
@@ -8316,6 +8447,18 @@ def main():
                         state.step_count,
                         state.face_specs, state.face_skips,
                     )
+                    if _live_face_decide is not None:
+                        # Same prefix and history as the sizes: the stage-2
+                        # masks must be composed on the tokenizer state the
+                        # stage-1 masks were read from.
+                        def face_decide_fn(_v, _skips, _rows,
+                                           _o=state.order,
+                                           _s=state.sparsity_specs,
+                                           _k=state.step_count,
+                                           _fh=state.face_specs,
+                                           _kh=state.face_skips):
+                            return _live_face_decide(
+                                _o, _s, _k, _v, _fh, _kh, _skips, _rows)
 
             if args.dynamic_substeps:
                 # Live per-vertex DIAG/COMPRESS masks for the current graph
@@ -8387,6 +8530,7 @@ def main():
                     face_chunk_fn=face_chunk_fn,
                     face_count_fn=face_count_fn,
                     face_sizes_fn=face_sizes_fn,
+                    face_decide_fn=face_decide_fn,
                     enc_carry=enc_carry2,
                     endpoint_rows=_ep_rows,
                     edge_rows=_em_rows,
