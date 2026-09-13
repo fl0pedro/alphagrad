@@ -1571,6 +1571,95 @@ def _window_copy(tokens_buf, eqn_ids_buf, pos, count, width):
     return jnp.where(keep, toks, 0), jnp.where(keep, eqns, -1)
 
 
+# ---------------------------------------------------------------------------
+# BIT-PACKED MASK STORAGE. ONE place states the layout; everything else calls
+# these two functions.
+#
+# WHY. The three stored face masks -- `face_pair_valid` (F, [S,] N, N),
+# `face_comp_valid` (F, [S,] N) and `face_quant` (F, S, K) -- are strictly
+# 0/1. Their producer is `common.masks.slot_legality`, whose `pair` / `comp` /
+# `quant` fields are numpy BOOL arrays that the host callback casts to float32
+# (`live_faces.face_slot_legality`), and the static fallback builds them from
+# `axis_valid_mask`, which is 0/1 too. One bit of information was riding in 32.
+# At the transformer width (F=1920, N=8) `face_pair_valid` alone cost 491 KB
+# per step per environment; a 95-step rollout over 16 environments stored
+# 1.4 GB of it.
+#
+# LAYOUT. `pack_mask_bits` ravels EVERY axis the caller names in `shape` into
+# one bit stream and packs that stream into uint8 words along a single new LAST
+# axis of width ``ceil(prod(shape) / 8)``. Axes LEFT of `shape` are untouched:
+# the rollout's step axis, the vmap's environment axis and the loss's flattened
+# sample axis all keep their meaning, and the loss's
+# ``x.reshape(-1, *x.shape[2:])`` still does what it did.
+#
+# BIT ORDER is LITTLE: element ``k`` of the ravelled stream is bit ``k % 8`` of
+# word ``k // 8``, counting from the LEAST significant bit. When ``prod(shape)``
+# is not a multiple of 8 the high bits of the last word are zero, and `unpack`
+# drops them by count.
+#
+# The unpacked width is NOT recoverable from the packed array, so every unpack
+# is handed its shape explicitly (`_FM_PAIR_SHAPE` / `_FM_COMP_SHAPE` /
+# `_FM_QUANT_SHAPE` in `main()` derive the three from the same two flags the
+# rollout's `face_out` shape guard reads). `unpack_mask_bits`
+# returns 0/1 float32 -- the same values, bit for bit, that the rollout packed,
+# so the loss re-masks with exactly what the behaviour policy masked with and
+# the PPO ratio is still 1 at epoch 0.
+#
+# THE SAMPLER IS NOT ON THIS PATH. `_face_loop` reads the masks it was handed,
+# unpacked, exactly as before; only the copy that goes into the `Trajectory`
+# is packed.
+# ---------------------------------------------------------------------------
+MASK_BIT_ORDER = "little"
+
+
+def _mask_bit_count(shape) -> int:
+    n = 1
+    for s in shape:
+        n *= int(s)
+    return n
+
+
+def pack_mask_bits(x, shape):
+    """Pack the 0/1 mask ``x`` (trailing axes ``shape``) into uint8 words.
+
+    Returns ``(*leading, ceil(prod(shape) / 8))`` uint8. Raises when ``x`` does
+    not end in ``shape`` -- a silently mis-shaped mask would unpack into the
+    wrong rows and leave the PPO ratio != 1 with no error anywhere.
+    """
+    x = jnp.asarray(x)
+    shape = tuple(int(s) for s in shape)
+    k = len(shape)
+    if x.ndim < k or tuple(x.shape[x.ndim - k:]) != shape:
+        raise ValueError(
+            f"pack_mask_bits: array shape {tuple(x.shape)} does not end in "
+            f"the declared mask shape {shape}.")
+    lead = tuple(x.shape[:x.ndim - k])
+    flat = jnp.reshape(x, lead + (_mask_bit_count(shape),)) > 0.5
+    return jnp.packbits(flat, axis=-1, bitorder=MASK_BIT_ORDER)
+
+
+def unpack_mask_bits(p, shape, dtype=jnp.float32):
+    """Inverse of :func:`pack_mask_bits`. Returns 0/1 in ``dtype``."""
+    p = jnp.asarray(p)
+    if p.dtype != jnp.uint8:
+        raise ValueError(
+            f"unpack_mask_bits: expected uint8 bit words, got {p.dtype}. The "
+            "trajectory stores these masks PACKED; an unpacked array here "
+            "means a producer skipped pack_mask_bits.")
+    shape = tuple(int(s) for s in shape)
+    n = _mask_bit_count(shape)
+    want = (n + 7) // 8
+    if p.ndim < 1 or int(p.shape[-1]) != want:
+        raise ValueError(
+            f"unpack_mask_bits: last axis is {tuple(p.shape)[-1:]} words, but "
+            f"mask shape {shape} ({n} bits) packs into {want}.")
+    # Sliced, not `count=`: the high bits of the last word are the zero
+    # padding `pack_mask_bits` left there, and a plain slice says so without
+    # depending on the optional argument.
+    bits = jnp.unpackbits(p, axis=-1, bitorder=MASK_BIT_ORDER)[..., :n]
+    return jnp.reshape(bits, tuple(p.shape[:-1]) + shape).astype(dtype)
+
+
 class Trajectory(NamedTuple):
     preference: jax.Array  # (NUM_VALUE_HEADS,) — weights V_latency/V_mem/V_cos
     vertex_idx: jax.Array
@@ -1627,8 +1716,11 @@ class Trajectory(NamedTuple):
     # now: the rollout stores the record the policy returned, and the loss
     # re-scores that object.
     face_action: FaceAction
-    face_pair_valid: jax.Array    # (MAX_FACES, N, N) float32
-    face_comp_valid: jax.Array    # (MAX_FACES, N) float32
+    # BIT-PACKED (see pack_mask_bits above): uint8 words over the ravelled
+    # (MAX_FACES, [S,] N, N) / (MAX_FACES, [S,] N) 0/1 mask. The loss unpacks
+    # them back to float32 before they reach the head.
+    face_pair_valid: jax.Array    # (ceil(MAX_FACES*[S*]N*N / 8),) uint8
+    face_comp_valid: jax.Array    # (ceil(MAX_FACES*[S*]N / 8),) uint8
     face_valid: jax.Array         # (MAX_FACES,) float32
     # The face's IDENTITY: its (in_edge, out_edge) endpoint vertices, 1-based
     # with 0 = "no vertex" (a jaxpr input). Stored for the same reason the
@@ -1721,8 +1813,10 @@ class Trajectory(NamedTuple):
     # rule_is_legal use. `face_quant` is 1 iff some emittable dtype is a legal,
     # NON-IDEMPOTENT cast on that face's operand. None-when-off, like the probe
     # / edge-mem / face-read fields above: no extra leaf, no shape change.
-    face_sizes: jax.Array = None       # (MAX_FACES, N) int32
-    face_quant: jax.Array = None       # (MAX_FACES,) float32
+    face_sizes: jax.Array = None       # (MAX_FACES, [S,] N) int32
+    # BIT-PACKED like the two masks above: uint8 words over the ravelled
+    # (MAX_FACES, S, K) (or (MAX_FACES,) without --face-slot-frames) 0/1 mask.
+    face_quant: jax.Array = None       # (ceil(MAX_FACES*S*K / 8),) uint8
 
 
 class TrainBatch(NamedTuple):
@@ -1754,6 +1848,8 @@ class TrainBatch(NamedTuple):
     axis_valid_mask: jax.Array  # (total_v, MAX_AXES_PER_VERTEX)
     # ONE leaf, from `face_action.FACE_ACTION_FIELDS` -- see Trajectory.
     face_action: FaceAction
+    # BIT-PACKED uint8, carried through the shuffle exactly as stored -- see
+    # `pack_mask_bits`. `_dynamic_loss_fn` unpacks them once per minibatch.
     face_pair_valid: jax.Array
     face_comp_valid: jax.Array
     face_valid: jax.Array
@@ -7776,6 +7872,22 @@ def main():
                  "no per-face sizes to hand the head. Only the apply-time "
                  "half is active."), flush=True)
 
+    # THE UNPACKED SHAPES OF THE THREE BIT-PACKED STORED MASKS, derived ONCE
+    # from the same two flags the rollout's shape guard reads. The packed leaf
+    # cannot state its own width (see `pack_mask_bits`), so the rollout and the
+    # loss must name the same shapes or the loss would re-mask with rows the
+    # rollout never drew under -- silent, exactly like a wrong `face_out` slot.
+    # Deriving both ends from this one call is what makes that impossible.
+    _FM_PAIR_SHAPE = ((ENV_MAX_FACES,)
+                      + ((_env_wire_slots(),) if _PFM_SLOT else ())
+                      + (MAX_AXES_PER_VERTEX, MAX_AXES_PER_VERTEX))
+    _FM_COMP_SHAPE = ((ENV_MAX_FACES,)
+                      + ((_env_wire_slots(),) if _PFM_SLOT else ())
+                      + (MAX_AXES_PER_VERTEX,))
+    _FM_QUANT_SHAPE = ((ENV_MAX_FACES, _env_wire_slots(),
+                        NUM_FACE_QUANT_DTYPES) if _PFM_SLOT
+                       else (ENV_MAX_FACES,))
+
     if getattr(args, "live_faces", False):
         # Both are load-bearing, not stylistic. Without --face-actions there
         # is no per-face decision to condition. Without --incremental-encode
@@ -8830,8 +8942,12 @@ def main():
             # Stored for the same reason face_pair_valid is -- the loss has to
             # re-mask with the identical values or the ratio is not 1.
             if _PFM_SIZES:
+                # `face_quant` is a 0/1 legality mask, so it is BIT-PACKED like
+                # the two masks above. `face_sizes` is not -- it carries axis
+                # LENGTHS, not bits.
                 _fr_fields = dict(_fr_fields, face_sizes=face_sizes_v,
-                                  face_quant=face_quant_v)
+                                  face_quant=pack_mask_bits(face_quant_v,
+                                                            _FM_QUANT_SHAPE))
             transition = Trajectory(
                 preference=preference.astype(jnp.float32),
                 vertex_idx=jnp.asarray(vertex_idx, dtype=jnp.int32),
@@ -8865,8 +8981,12 @@ def main():
                 axis_valid_mask=state.axis_valid_mask,
                 # USE 2: the record, whole. Ten named copies before.
                 face_action=face_action,
-                face_pair_valid=face_pair_v,
-                face_comp_valid=face_comp_v,
+                # BIT-PACKED on the way in (see `pack_mask_bits`). The
+                # sampler above read the UNPACKED arrays it was handed; only
+                # the stored copy is packed, and the loss unpacks it back to
+                # the same 0/1 float32 before the head sees it.
+                face_pair_valid=pack_mask_bits(face_pair_v, _FM_PAIR_SHAPE),
+                face_comp_valid=pack_mask_bits(face_comp_v, _FM_COMP_SHAPE),
                 face_valid=face_valid_v,
                 face_endpoints=face_ends_v,
                 face_old_logp=jnp.asarray(face_old_logp, jnp.float32),
@@ -8985,6 +9105,20 @@ def main():
         # forgotten field made `evaluate` score a variable `sample` never drew,
         # silently, and there is nothing left here to forget.
         face_actions_b = batch.face_action if args.face_actions else None
+
+        # THE STORED MASKS, UNPACKED. The trajectory carries them as uint8 bit
+        # words (see `pack_mask_bits`); the head and `_face_replay` take them
+        # as 0/1 float32, which is what the rollout sampled under. Unpacked
+        # ONCE per minibatch here rather than at each of the four use sites
+        # below, and from the SAME `_FM_*_SHAPE` the rollout packed with, so
+        # the two ends cannot name different widths.
+        if args.face_actions:
+            _fpv_b = unpack_mask_bits(batch.face_pair_valid, _FM_PAIR_SHAPE)
+            _fcv_b = unpack_mask_bits(batch.face_comp_valid, _FM_COMP_SHAPE)
+            _fqt_b = (unpack_mask_bits(batch.face_quant, _FM_QUANT_SHAPE)
+                      if _PFM_SIZES else None)
+        else:
+            _fpv_b = _fcv_b = _fqt_b = None
 
         def _pfm_checked(fsz, fqt):
             """--per-face-masks: the loss must re-mask with the SAME arrays
@@ -9413,8 +9547,8 @@ def main():
                 batch.micro_pair_valid,
                 batch.micro_compress_valid,
                 face_actions_b,
-                batch.face_pair_valid,
-                batch.face_comp_valid,
+                _fpv_b,
+                _fcv_b,
                 batch.face_valid,
                 batch.face_endpoints,
                 pc_logits, pc_ctx, pc_value,
@@ -9424,7 +9558,7 @@ def main():
                 *((pc_eprows,) if _EP_READ else ()),
                 *((pc_emrows, batch.face_eslots) if _EDGE_MEM else ()),
                 *((batch.face_heads,) if _FACE_HEADS else ()),
-                *((_pfm_checked(batch.face_sizes, batch.face_quant))
+                *((_pfm_checked(batch.face_sizes, _fqt_b))
                   if _PFM_SIZES else ()),
             )
             if args.face_actions
@@ -9568,8 +9702,8 @@ def main():
                     batch.axis_state,
                     batch.axis_valid_mask,
                     face_actions_b,
-                    batch.face_pair_valid,
-                    batch.face_comp_valid,
+                    _fpv_b,
+                    _fcv_b,
                     batch.face_valid,
                     batch.face_endpoints,
                     pc_carry,
@@ -9579,7 +9713,7 @@ def main():
                     *((pc_eprows,) if _EP_READ else ()),
                     *((pc_emrows, batch.face_eslots) if _EDGE_MEM else ()),
                     *((batch.face_heads,) if _FACE_HEADS else ()),
-                    *((_pfm_checked(batch.face_sizes, batch.face_quant))
+                    *((_pfm_checked(batch.face_sizes, _fqt_b))
                       if _PFM_SIZES else ()),
                 )
             )
