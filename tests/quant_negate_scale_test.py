@@ -22,7 +22,13 @@ from graphax.sparse.micro_actions import Quant, apply_quant
 from graphax.sparse.tensor import SparseTensor
 
 
-def test_apply_quant_negate_and_scale():
+def test_apply_quant_negate_and_scale(monkeypatch):
+    # The negate head is the ONE legitimate use of an unsigned target: the
+    # caller knows the tensor is single-signed and folds that sign into
+    # scalar_mult. Unsigned targets are refused by default since 2026-09-13
+    # (a mixed-sign tensor loses one sign: measured cosine 0.68), so this
+    # test opts in explicitly.
+    monkeypatch.setenv("GRAPHAX_QUANT_MASK_UNSIGNED", "0")
     # The singleton pattern real gxf tests use: SparseTensor([], [], val).
     # An all-negative value is the v13 chain-kill case.
     val = jnp.float32(-0.5)
