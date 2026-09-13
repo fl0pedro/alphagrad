@@ -404,8 +404,14 @@ def run_trace(case=None, steps=None):
         }
 
         if face_out is not None:
+            # The first ten are the historical tuple. Under --per-face-masks
+            # the rollout appends the two PER-SLOT arrays the head masked
+            # with (sizes (F, S, N), quant (F, S, 2)); since 2026-09-13 those
+            # are the STAGE-2 masks, so they are pinned below as well.
             (fa, f_logp, f_ent, f_pair, f_comp, f_valid, f_cnt, f_dt,
-             f_de, f_ends) = face_out
+             f_de, f_ends) = face_out[:10]
+            f_slot_sizes = face_out[10] if len(face_out) > 10 else None
+            f_slot_quant = face_out[11] if len(face_out) > 11 else None
             n_live = int(np.sum(np.asarray(f_valid) > 0.5))
             cnt = np.asarray(f_cnt, np.int32)
             tot = int(cnt[:n_live].sum()) if n_live else 0
@@ -467,6 +473,16 @@ def run_trace(case=None, steps=None):
         ]
         if face_action is not None:
             n_live = rec["face"]["n_live"]
+            if f_slot_sizes is not None:
+                # THE STAGE-2 MASKS (ticket .59 fault 2): per slot, the live
+                # sizes and the QUANT legality every row above was drawn
+                # under, live faces only. A change here is a change in what
+                # the head was allowed to choose.
+                _ss = np.asarray(f_slot_sizes)[:n_live]
+                _sq = np.asarray(f_slot_quant, np.float32)[:n_live]
+                rec["face_slot_sizes"] = _ss.astype(int).tolist()
+                rec["face_slot_quant"] = [
+                    [_f32bits(float(x)) for x in row.reshape(-1)] for row in _sq]
             rec["face_rows"] = [
                 [[int(c) for c in slot] for slot in face]
                 for face in np.asarray(env_action.face_rows)[:n_live]
