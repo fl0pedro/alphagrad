@@ -832,7 +832,17 @@ def consume_distributions() -> dict:
 # log-only muls_adds_fmas / max_io_sum channels and the op-count cap; the
 # trained objective (latency, peak_memory, frob) never reads it, and it costs
 # more than the compile it guards once plans do real work.
-_SKIP_COUNT_OPS = os.environ.get("ALPHAGRAD_SKIP_COUNT_OPS", "0") == "1"
+# READ PER CALL, not frozen at import. A module constant here is a
+# COLLECTION-ORDER HAZARD: ~35 test modules set the variable with
+# ``os.environ.setdefault`` at their own import time, so whichever of them
+# pytest imports first decides the setting for every test that shares the
+# process, and a test that sets the variable itself changes nothing. Measured
+# 2026-09-13: tests/test_all_cost_channels.py asserts the counted channels are
+# non-zero and fails whenever it is collected beside tests/plan_log_test.py,
+# passing only because xdist usually puts them in different workers.
+def skip_count_ops() -> bool:
+    """Is the symbolic count pass off in THIS process right now?"""
+    return os.environ.get("ALPHAGRAD_SKIP_COUNT_OPS", "0") == "1"
 
 # EXACT-JACOBIAN REUSE ACROSS ENVS (ALPHAGRAD_CACHE_EXACT=1, default on).
 #
@@ -6436,7 +6446,7 @@ def _callback(
     # compare), so the pre-XLA guard against compile-monster plans is gone. The
     # OOM handler still catches device exhaustion, but NOT the v15-style
     # compile hang. Re-enable the count pass if that reappears.
-    if _SKIP_COUNT_OPS:
+    if skip_count_ops():
         muls_adds_fmas = 0.0
         max_io_sum = 0.0
     else:
@@ -6509,7 +6519,7 @@ def _callback(
     # v15 plans measured ~4e12 muls; the default cap only fires on true
     # blowups.
     _muls_cap = float(os.environ.get("ALPHAGRAD_MULS_SENTINEL_CAP", "5e13"))
-    if not _SKIP_COUNT_OPS and muls_adds_fmas > _muls_cap:
+    if not skip_count_ops() and muls_adds_fmas > _muls_cap:
         _record_truncated_plan()
         if _dbg_measure or os.environ.get("ALPHAGRAD_DEBUG_DEGEN", "0") == "1":
             print(f"[trunc] MULS-CAP muls={muls_adds_fmas:.3g} > "
@@ -7331,7 +7341,7 @@ def _callback(
         # same skip flag as the count pass.
         # memory_analysis() walks the compiled HLO, which is not free on the
         # big graphs a working policy produces.
-        if not _SKIP_COUNT_OPS:
+        if not skip_count_ops():
             _approx_bytes = _memory_analysis_bytes(compiled_approx)
             _exact_bytes = (
                 _memory_analysis_bytes(compiled_exact)
@@ -7554,7 +7564,7 @@ def _callback(
     # 200-step Adam walk therefore never moves the weights, and the loss drop
     # is exactly 0.0 -- the floor for any plan that does not actively diverge.
     # This is telemetry only.
-    if (not _SKIP_COUNT_OPS and is_terminal
+    if (not skip_count_ops() and is_terminal
             and (muls_adds_fmas <= 0.0) and (flops <= 0.0)):
         _record_zero_work_plan()
         if os.environ.get("ALPHAGRAD_DEBUG_DEGEN", "0") == "1":
