@@ -367,3 +367,30 @@ def test_every_terminal_is_a_record_under_the_normal_path(monkeypatch):
     assert out["terminals"] == len(out["records"]) == 1
     assert out["records"][0].get("refused") is None
     assert out["records"][0].get("sentinelled") is not True
+
+
+def test_a_plan_that_raises_is_still_recorded_and_the_error_still_reaches_the_caller(monkeypatch):
+    """A counted terminal is a record, whatever killed the measurement.
+
+    The observation-delta overflow is the reachable raise: it fires inside
+    the tokenizer, long after the terminal counter and long before the
+    record. Job 65339 lost three of four plans to it. The record must
+    appear, name the exception, and the exception must still propagate --
+    the raise is the apparatus telling the operator to raise the budget.
+    """
+    monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
+    monkeypatch.setenv("ALPHAGRAD_MAX_DELTA_TOKENS", "1")
+    monkeypatch.setenv("ALPHAGRAD_DELTA_OVERFLOW", "raise")
+    envmod.consume_plan_records()
+    env = _make_env()
+    with pytest.raises(ValueError, match="token DELTA truncated"):
+        _run_episode(env, skip_face_of_vertex=1)
+    out = envmod.consume_plan_records()
+    if out["terminals"] == 0:
+        pytest.skip("this env raised before the terminal step")
+    assert len(out["records"]) == out["terminals"], (
+        f"{out['terminals']} terminal(s) counted, {len(out['records'])} "
+        f"record(s): a crashed plan left no trace")
+    rec = out["records"][-1]
+    assert rec["refused"].startswith("raised:ValueError")
+    assert rec["sentinelled"] is True and rec["replayable"] is False

@@ -6160,6 +6160,62 @@ def _callback(
     init: bool = False,
     face_joins=None,
 ):
+    """THE PLAN LOG'S LAST GUARANTEE: a counted terminal is a record.
+
+    :func:`_callback_measured` counts the terminal at the top and writes its
+    record at the bottom, and its four deliberate refusals each write one on
+    the way out. An EXCEPTION between the two writes nothing, so the trainer
+    reads `pool_terminals=N ... wrote=0` and cannot tell a crashed plan from
+    a plan that never ran. Measured 2026-09-13 (job 65339): a TLM arm whose
+    observation delta overflowed `MAX_DELTA_TOKENS` raised inside the
+    tokenizer, and four counted terminals left one record.
+
+    This wrapper records whatever the failed call counted and RE-RAISES. It
+    never swallows: the raise is the apparatus telling the operator to fix
+    the configuration, and that ruling stands.
+    """
+    _t0 = int(_PLAN_LOG_TERMINALS[0])
+    _r0 = len(_PLAN_RECORDS)
+    try:
+        return _callback_measured(
+            config, args, consts, order, sparsity_specs, face_specs,
+            face_skips, stop, *eval_samples, init=init, face_joins=face_joins)
+    except BaseException as _exc:
+        # Only when THIS call counted a terminal and wrote nothing for it.
+        if int(_PLAN_LOG_TERMINALS[0]) > _t0 and len(_PLAN_RECORDS) == _r0:
+            try:
+                _n = int(np.asarray(order).reshape(-1).shape[0]
+                         if stop is None else int(stop))
+                _record_terminal_plan(
+                    order=[int(x) for x in
+                           np.asarray(order).reshape(-1)[:_n].tolist()],
+                    rule_specs=np.asarray(sparsity_specs)[:_n],
+                    face_specs=np.asarray(face_specs)[:_n],
+                    face_skips=np.asarray(face_skips)[:_n],
+                    face_joins=(None if face_joins is None
+                                else np.asarray(face_joins)[:_n]),
+                    reward_vec=_SENTINEL_BAD_REWARD,
+                    face_before=None, face_after=_PER_FACE_STATS,
+                    counts_from_trace=False,
+                    refused=f"raised:{type(_exc).__name__}")
+            except Exception:
+                pass          # a logging failure must not mask the real one
+        raise
+
+
+def _callback_measured(
+    config: EnvConfig,
+    args,
+    consts,
+    order,
+    sparsity_specs,
+    face_specs,
+    face_skips,
+    stop,
+    *eval_samples,
+    init: bool = False,
+    face_joins=None,
+):
     """Stage A reward harness: returns `(tokens, rewards)` where `rewards` is
     the canonical `(NUM_REWARDS,)` float32 vector documented at the top of this
     file. Every component is computed every (non-init) call, except `latency`
