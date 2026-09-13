@@ -616,7 +616,12 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
             specs = np.zeros((len(jaxpr.eqns), 1, 3), np.int32)
             tk = lf._tokenizer_at(np.asarray(order), specs, 0)
             seen: set = set()
-            for v in [int(x) for x in order[:12]]:
+            # The first twelve vertices WITH faces: since dsnn-3qm.74 faces_of
+            # lists only the faces the elimination reaches, and the first
+            # twelve vertices of the Markowitz order on TLM have none.
+            with_faces = [int(x) for x in order if tk.ij.faces(int(x))][:12]
+            assert with_faces, f"{want}: no vertex with faces in the order"
+            for v in with_faces:
                 got = lf._probe_faces(tk, v, list(tk.ij.faces(v)),
                                       slots=True, stat="slot") or {}
                 for by_site in got.values():
