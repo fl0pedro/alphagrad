@@ -315,3 +315,52 @@ def test_gate_mode_and_plan_log_leave_the_reward_bit_identical(monkeypatch):
         assert np.array_equal(r[keep].astype(np.float64),
                               rewards[0][keep].astype(np.float64)), (
             r, rewards[0])
+
+
+# --------------------------------------------------------------------------
+# A REFUSED PLAN IS A RECORD (canary job 65319, 2026-09-13)
+#
+# The terminal counter fires at the top of `env._callback` and the record is
+# written at the bottom. Four `return`s in between -- the op-count cap, a
+# missing target function, an untraceable graph and an OOM -- used to drop
+# the record while the counter had already fired. The trainer then printed
+# `pool_terminals=16 ... wrote=0 total=0` for every episode of a 250-episode
+# campaign arm, and the whole run left no replayable evidence.
+# --------------------------------------------------------------------------
+
+def test_a_plan_refused_by_the_op_count_cap_is_still_recorded(monkeypatch):
+    """The muls cap is the reachable refusal: set it to 0 and every plan
+    trips it. The record must exist, carry the reason, and be marked as not
+    replayable -- its rewards are a sentinel, not a measurement."""
+    monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
+    monkeypatch.setenv("ALPHAGRAD_MULS_SENTINEL_CAP", "0")
+    monkeypatch.delenv("ALPHAGRAD_SKIP_COUNT_OPS", raising=False)
+    envmod.consume_plan_records()
+    env = _make_env()
+    _run_episode(env, skip_face_of_vertex=1)
+    out = envmod.consume_plan_records()
+    assert out["terminals"] == 1
+    assert len(out["records"]) == out["terminals"], (
+        f"{out['terminals']} terminal(s) counted, {len(out['records'])} "
+        f"record(s) written: a refused plan was dropped")
+    rec = out["records"][0]
+    assert rec["refused"] == "muls-cap"
+    assert rec["sentinelled"] is True
+    assert rec["replayable"] is False
+    assert len(rec["rewards"]) == NUM_REWARDS
+    # the wire is still there, so the refusal can be attributed to a plan
+    assert rec["order"] and "faces" in rec
+
+
+def test_every_terminal_is_a_record_under_the_normal_path(monkeypatch):
+    """The control: with no cap, terminals and records still agree. This is
+    the invariant the refusal paths broke, stated once for both."""
+    monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
+    monkeypatch.delenv("ALPHAGRAD_MULS_SENTINEL_CAP", raising=False)
+    envmod.consume_plan_records()
+    env = _make_env()
+    _run_episode(env, skip_face_of_vertex=1)
+    out = envmod.consume_plan_records()
+    assert out["terminals"] == len(out["records"]) == 1
+    assert out["records"][0].get("refused") is None
+    assert out["records"][0].get("sentinelled") is not True

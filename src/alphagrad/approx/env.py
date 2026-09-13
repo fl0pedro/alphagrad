@@ -1578,8 +1578,16 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
                           counts_from_trace: bool,
                           mem_parity: dict | None = None,
                           paired_ref: dict | None = None,
-                          face_joins=None) -> None:
+                          face_joins=None, refused: str | None = None) -> None:
     """Append ONE terminal plan to this process's plan log. Never raises.
+
+    ``refused`` names the resource limit or fault that stopped the
+    measurement (``"degenerate"``, ``"muls-cap"``, ``"no-target-fun"``,
+    ``"untraceable"``, ``"oom"``). The record then carries ``refused`` and
+    ``sentinelled = True``, and its reward vector is the sentinel the
+    callback returned, not a measurement. A refused plan IS a record: the
+    log's contract is every terminal plan, win or lose, and a refusal is
+    the single most important thing it can report.
 
     A logging failure must not kill a measurement, but it must not be
     invisible either: the first one prints to stderr with its exception.
@@ -1668,6 +1676,10 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
         rec["compile_fallbacks_total"] = _fb_n
         rec["toolchain_ok"] = bool(_MEASURE_TOOLCHAIN["ok"])
         _MEASURE_FALLBACKS_AT_LAST_RECORD[0] = _fb_n
+        if refused is not None:
+            rec["refused"] = str(refused)
+            rec["sentinelled"] = True
+            rec["replayable"] = False
         _record_plan(rec)
     except Exception as _exc:          # pragma: no cover - telemetry only
         if not _PLAN_LOG_WARNED:
@@ -6193,6 +6205,25 @@ def _callback(
     # --approx-add choose only; None under every fixed value (EnvState).
     _joins_np = (None if face_joins is None
                  else np.asarray(face_joins)[: len(o_list)])
+
+    def _log_refused(reason: str, reward_vec):
+        """Record a terminal plan the callback REFUSES to measure.
+
+        Every ``return`` between the terminal counter above and the record
+        at the bottom of this function used to drop the record while the
+        counter had already fired, so the trainer saw
+        ``pool_terminals=16 ... wrote=0`` and the log of a whole campaign was
+        empty (canary job 65319, 2026-09-13). A refusal is a plan-log record
+        like any other, marked ``refused`` and ``sentinelled``."""
+        if not _plan_log_on:
+            return
+        _record_terminal_plan(
+            order=o_list, rule_specs=partial_specs,
+            face_specs=_faces_np, face_skips=_skips_np,
+            face_joins=_joins_np,
+            reward_vec=reward_vec,
+            face_before=_plan_pf0, face_after=_PER_FACE_STATS,
+            counts_from_trace=False, refused=reason)
     ft_by_vertex = None
     _have_face_actions = bool(
         len(o_list) and (np.any(_skips_np == 1)
@@ -6484,7 +6515,9 @@ def _callback(
             print(f"[trunc] MULS-CAP muls={muls_adds_fmas:.3g} > "
                   f"{_muls_cap:.3g} step={int(stop)} order={o_list} "
                   f"(excluded from gradient)", flush=True)
-        return tokens, eqn_ids, _truncated_reward()
+        _tr = _truncated_reward()
+        _log_refused("muls-cap", _tr)
+        return tokens, eqn_ids, _tr
 
     # If no `target_fun` is supplied, we can't compile/execute. Skip every
     # execution-derived metric and return a partial reward vector.
@@ -6497,6 +6530,7 @@ def _callback(
         rewards = jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
         rewards = rewards.at[REWARD_INDEX["muls_adds_fmas"]].set(-muls_adds_fmas)
         rewards = rewards.at[REWARD_INDEX["max_io_sum"]].set(-max_io_sum)
+        _log_refused("no-target-fun", rewards)
         return tokens, eqn_ids, rewards
 
     # ------------------------------------------------------------------
@@ -6787,7 +6821,9 @@ def _callback(
 
     def _trace_truncate(where: str, exc: BaseException):
         _record_untraceable_plan(exc)
-        return tokens, eqn_ids, _truncated_reward()
+        _tr = _truncated_reward()
+        _log_refused(f"untraceable:{where}", _tr)
+        return tokens, eqn_ids, _tr
 
     def _oom_truncate(where: str, exc: BaseException):
         _record_truncated_plan()
@@ -6801,7 +6837,9 @@ def _callback(
         print(f"[trunc] OOM during {where} step={int(stop)} order={o_list} "
               f"(excluded from gradient): {type(exc).__name__}: "
               f"{str(exc)[:160]}", flush=True)
-        return tokens, eqn_ids, _truncated_reward()
+        _tr = _truncated_reward()
+        _log_refused(f"oom:{where}", _tr)
+        return tokens, eqn_ids, _tr
 
     try:
         compiled_approx = cached_compile(
