@@ -26,6 +26,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from alphagrad.approx.common.masks import NUM_FACE_QUANT_DTYPES
+
 from alphagrad.approx.live_faces import LiveFaceStream
 
 __all__ = [
@@ -554,7 +556,7 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
                             face_hist, skip_hist)
             B = _order.shape[0]
             outs = (np.zeros((B, F, S, N), np.int32),
-                    np.zeros((B, F, S, 2), np.float32),
+                    np.zeros((B, F, S, NUM_FACE_QUANT_DTYPES), np.float32),
                     np.zeros((B, F, S, N, N), np.float32),
                     np.zeros((B, F, S, N), np.float32),
                     np.zeros((B, F, S), np.int32))
@@ -574,7 +576,7 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
         return jax.pure_callback(
             _host,
             (jax.ShapeDtypeStruct((F, S, N), jnp.int32),
-             jax.ShapeDtypeStruct((F, S, 2), jnp.float32),
+             jax.ShapeDtypeStruct((F, S, NUM_FACE_QUANT_DTYPES), jnp.float32),
              jax.ShapeDtypeStruct((F, S, N, N), jnp.float32),
              jax.ShapeDtypeStruct((F, S, N), jnp.float32),
              jax.ShapeDtypeStruct((F, S), jnp.int32)),
@@ -698,7 +700,7 @@ def make_face_vertex_decide_callback(live_faces, *, max_faces, max_axes,
             B = _order.shape[0]
             outs = (np.full((B, F, S, 3), -1, np.int32),
                     np.zeros((B, F, S, N), np.int32),
-                    np.zeros((B, F, S, 2), np.float32),
+                    np.zeros((B, F, S, NUM_FACE_QUANT_DTYPES), np.float32),
                     np.zeros((B, F, S, N, N), np.float32),
                     np.zeros((B, F, S, N), np.float32),
                     np.zeros((B, F, S), np.int32),
@@ -724,7 +726,7 @@ def make_face_vertex_decide_callback(live_faces, *, max_faces, max_axes,
             _host,
             (jax.ShapeDtypeStruct((F, S, 3), jnp.int32),
              jax.ShapeDtypeStruct((F, S, N), jnp.int32),
-             jax.ShapeDtypeStruct((F, S, 2), jnp.float32),
+             jax.ShapeDtypeStruct((F, S, NUM_FACE_QUANT_DTYPES), jnp.float32),
              jax.ShapeDtypeStruct((F, S, N, N), jnp.float32),
              jax.ShapeDtypeStruct((F, S, N), jnp.float32),
              jax.ShapeDtypeStruct((F, S), jnp.int32),

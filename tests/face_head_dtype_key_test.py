@@ -36,6 +36,7 @@ import jax.numpy as jnp                                         # noqa: E402
 import jax.random as jrand                                      # noqa: E402
 import numpy as np                                              # noqa: E402
 
+from alphagrad.approx.common.masks import NUM_FACE_QUANT_DTYPES
 from alphagrad.approx.unified_face_head import (                # noqa: E402
     CONTRACTION_LAYOUT, FACE_SLOTS, FaceFields, MAX_PAIR_IDX, NUM_APPROX_OPS,
     NUM_REDUCE_AXES, NUM_REDUCE_FNS, O_SKIP, OP_BLOCKDIAG, OP_NONE, OP_QUANT,
@@ -45,7 +46,9 @@ from alphagrad.approx.unified_face_head import (                # noqa: E402
 S = FACE_SLOTS
 E = 32
 N_DRAWS = 100_000
-CHI2_CRIT_DF4_P001 = 18.47
+#: chi-square critical values at p = 0.001, by degrees of freedom
+#: (NUM_REDUCE_FNS - 1) * (NUM_FACE_QUANT_DTYPES - 1): 4 (two dtypes), 12 (four).
+CHI2_CRIT_P001 = {4: 18.47, 12: 32.91}
 
 
 def _masks():
@@ -84,12 +87,13 @@ def test_dtype_draw_is_independent_of_reduce_fn():
     dt = np.asarray(fields.dtype_idx)
     for s in range(S):
         chi2, table = _chi2_independence(fn[:, s], dt[:, s],
-                                         NUM_REDUCE_FNS, 2)
-        p_bf16_given_fn = table[:, 1] / table.sum(1)
-        assert chi2 < CHI2_CRIT_DF4_P001, (
-            f"slot {s}: chi-square {chi2:.1f} on df=4 (critical "
-            f"{CHI2_CRIT_DF4_P001}); P(bf16 | reduce_fn) = "
-            f"{np.round(p_bf16_given_fn, 3).tolist()}")
+                                         NUM_REDUCE_FNS, NUM_FACE_QUANT_DTYPES)
+        df = (NUM_REDUCE_FNS - 1) * (NUM_FACE_QUANT_DTYPES - 1)
+        p_dtype_given_fn = table / table.sum(1, keepdims=True)
+        assert chi2 < CHI2_CRIT_P001[df], (
+            f"slot {s}: chi-square {chi2:.1f} on df={df} (critical "
+            f"{CHI2_CRIT_P001[df]}); P(dtype | reduce_fn) = "
+            f"{np.round(p_dtype_given_fn, 3).tolist()}")
 
 
 # --------------------------------------------------------------------------

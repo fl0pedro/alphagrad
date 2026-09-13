@@ -139,7 +139,7 @@ def test_the_logits_tile_exactly_once(mode):
             covered[b + lo:b + hi] += 1
     assert (covered == 1).all(), (mode, covered.min(), covered.max())
     assert ((S_I - S_OP) + (S_J - S_I) + (S_AXIS - S_J) + (S_RFN - S_AXIS)
-            + (S_DTYPE - S_RFN) + 1 == SLOT_WIDTH)
+            + (S_DTYPE - S_RFN) + NUM_FACE_QUANT_DTYPES == SLOT_WIDTH)
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -157,9 +157,10 @@ def test_the_collision_at_94_is_the_design_not_an_accident():
     branch. The earlier layout reserved 94 for the bit at EVERY value and
     started the join slots at 95, which is the branch that is gone.
     """
-    assert head_layout("choose").choose_index == 94
-    assert head_layout("learned1").slot_base(FACE_SLOTS) == 94
-    assert head_layout("learned2").slot_base(FACE_SLOTS) == 94
+    after_contraction = O_SLOT0 + SLOT_WIDTH * FACE_SLOTS     # 94 at W=31, 103 at W=34
+    assert head_layout("choose").choose_index == after_contraction
+    assert head_layout("learned1").slot_base(FACE_SLOTS) == after_contraction
+    assert head_layout("learned2").slot_base(FACE_SLOTS) == after_contraction
     assert not head_layout("learned1").has_choose
     assert head_layout("choose").n_slots == FACE_SLOTS
 
@@ -188,7 +189,7 @@ def test_a_slot_the_width_does_not_have_cannot_be_indexed(mode):
 def test_the_choose_bit_exists_only_under_choose(mode):
     lay = head_layout(mode)
     if mode == "choose":
-        assert lay.choose_index == 94
+        assert lay.choose_index == O_SLOT0 + SLOT_WIDTH * FACE_SLOTS
         return
     with pytest.raises(IndexError):
         lay.choose_index
