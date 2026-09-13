@@ -442,10 +442,19 @@ def run_trace(case=None, steps=None):
                 ],
                 # the LEGALITY masks, as index lists: this is the field the
                 # v22-v28 sentinel collision silently emptied.
-                "pair_valid": [_pairs(np.asarray(f_pair)[f])
-                               for f in range(n_live)],
-                "comp_valid": [_idx(np.asarray(f_comp)[f])
-                               for f in range(n_live)],
+                # Per SLOT since --per-face-masks rides the live stream
+                # (pair (F, S, N, N), comp (F, S, N)); the blind path's
+                # per-face (F, N, N) / (F, N) is still accepted.
+                "pair_valid": [
+                    ([_pairs(m) for m in np.asarray(f_pair)[f]]
+                     if np.asarray(f_pair).ndim == 4
+                     else _pairs(np.asarray(f_pair)[f]))
+                    for f in range(n_live)],
+                "comp_valid": [
+                    ([_idx(m) for m in np.asarray(f_comp)[f]]
+                     if np.asarray(f_comp).ndim == 3
+                     else _idx(np.asarray(f_comp)[f]))
+                    for f in range(n_live)],
                 # the live-faces STREAM's own output: how many tokens each
                 # face read, and a hash of the tokens themselves (live prefix
                 # of the emission window only, never the padded tail).
