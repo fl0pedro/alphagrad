@@ -303,6 +303,12 @@ def make_argparser() -> argparse.ArgumentParser:
                    help="Number of random samples M per stack size N (default: 5).")
     p.add_argument("--pair-samples", type=int, default=0,
                    help="Number of random pair samples from F* (0 = disabled).")
+    p.add_argument("--stacks-only", action="store_true",
+                   help="Skip the singleton phase: build F* from EVERY "
+                        "rows_*.csv in --out-dir (all shards of a finished "
+                        "singleton panel), draw the stacks / pairs from it, "
+                        "and measure only those. With --shard the stack plans "
+                        "are sliced per shard (deterministic: sorted ids).")
     p.add_argument("--shard", default="",
                    help="Shard specification 'I/N' (0-indexed, e.g. '0/4') to evaluate a slice of plans.")
     p.add_argument("--sweep-stride", type=int, default=1,
@@ -782,6 +788,42 @@ def build_singleton_sweep_plans(env, order, inv, quant_dtypes=("bfloat16",),
                             plan_orders[pid_d] = order
 
     return plans, plan_orders
+
+
+def shard_slice(items, shard: str):
+    """The slice of ``items`` (a list of ``(pid, plan)``) that shard ``I/N``
+    owns: contiguous chunks of ``ceil(len / N)``. The SAME rule the singleton
+    phase uses, on a list every shard builds identically."""
+    if not shard:
+        return list(items)
+    shard_idx, num_shards = (int(x) for x in shard.split("/"))
+    chunk = math.ceil(len(items) / num_shards) if items else 0
+    return list(items)[shard_idx * chunk:(shard_idx + 1) * chunk]
+
+
+def load_done_all(out_dir: str):
+    """Every measured row under ``out_dir`` (all shards, all phases), keyed like
+    :func:`load_done`. Later files win on a duplicate key; the sort makes the
+    winner deterministic."""
+    import glob
+    done = {}
+    for f in sorted(glob.glob(os.path.join(out_dir, "rows_*.csv"))):
+        done.update(load_done(f))
+    return done
+
+
+def f_star_items_from(plans, done, reps: int, threshold: float):
+    """The singletons of ``plans`` whose mean candidate quality over ``reps``
+    trials in ``done`` reaches ``threshold``, in ``plans`` order."""
+    out = []
+    for pid, pl in plans.items():
+        if not pid.startswith("singleton:"):
+            continue
+        q_vals = [float(done[(pid, t, "candidate")]["quality"])
+                  for t in range(reps) if (pid, t, "candidate") in done]
+        if q_vals and np.mean(q_vals) >= threshold:
+            out.append((pid, pl))
+    return out
 
 
 def compose_stack_plan(env, order, singletons_list, pid: str, op: str, budget: str):
@@ -1979,6 +2021,9 @@ def main():
                              "wires": _named(p)}
                        for pid, p in plans_dict.items()}, fh, indent=2)
 
+    # Every shard builds the SAME full plan dict; F* for the stack phase is
+    # drawn from it, not from this shard's slice.
+    all_plans_pre_shard = dict(plans)
     if args.shard:
         parts = [int(x) for x in args.shard.split("/")]
         shard_idx, num_shards = parts[0], parts[1]
@@ -2107,21 +2152,23 @@ def main():
                           f"q={m['quality']:.4f} ({m['wall_s']:.1f}s)", flush=True)
 
     # 1. Execute initial plans (identity + singletons/ladder/archive)
-    _execute_plans(plans, plan_orders)
+    if args.stacks_only:
+        print("[landscape] --stacks-only: singleton phase skipped, F* comes "
+              f"from every rows_*.csv under {args.out_dir}", flush=True)
+    else:
+        _execute_plans(plans, plan_orders)
 
     # 2. Draw and execute F* stacks/pairs post-singleton
-    if (args.stack_ladder or args.pair_samples > 0) and not stop and not args.shard:
-        f_star_items = []
-        for pid, pl in plans.items():
-            if not pid.startswith("singleton:"):
-                continue
-            q_vals = [
-                float(done[(pid, t, "candidate")]["quality"])
-                for t in range(args.reps)
-                if (pid, t, "candidate") in done
-            ]
-            if q_vals and np.mean(q_vals) >= args.f_star_threshold:
-                f_star_items.append((pid, pl))
+    if (args.stack_ladder or args.pair_samples > 0) and not stop:
+        if args.shard or args.stacks_only:
+            # F* over the FULL singleton set, from every shard's rows (and
+            # every phase's: a second Quant-dtype phase writes its own files).
+            done_all = load_done_all(args.out_dir)
+            f_star_items = f_star_items_from(
+                all_plans_pre_shard, done_all, args.reps, args.f_star_threshold)
+        else:
+            f_star_items = f_star_items_from(
+                plans, done, args.reps, args.f_star_threshold)
         print(f"[landscape] F* set: {len(f_star_items)} singletons meet quality >= {args.f_star_threshold:.2f}",
               flush=True)
         if f_star_items:
@@ -2132,6 +2179,11 @@ def main():
                 pair_samples=args.pair_samples,
             )
             print(f"[landscape] generated {len(stack_plans)} stack/pair plans from F*", flush=True)
+            if args.shard:
+                mine = shard_slice(sorted(stack_plans.items()), args.shard)
+                stack_plans = dict(mine)
+                stack_orders = {pid: stack_orders[pid] for pid in stack_plans}
+                print(f"[landscape] shard {args.shard}: {len(stack_plans)} of them", flush=True)
             if stack_plans:
                 plans.update(stack_plans)
                 plan_orders.update(stack_orders)

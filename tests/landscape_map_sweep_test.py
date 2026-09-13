@@ -212,3 +212,35 @@ def test_singleton_sweep_enumerates_one_quant_per_dtype(helmholtz_setup):
         LM.build_singleton_sweep_plans(env, order, inv, ops=("quant", "bogus"))
     with pytest.raises(ValueError):
         LM.build_singleton_sweep_plans(env, order, inv, quant_dtypes=("float99",))
+
+
+def test_stack_phase_draws_f_star_from_every_shard_and_slices_deterministically(tmp_path):
+    """F* for the stack phase comes from ALL rows_*.csv under --out-dir, and
+    the stack plans are sliced per shard by the same contiguous-chunk rule
+    the singleton phase uses, on a sorted id list every shard builds alike."""
+    from alphagrad.approx.tools import landscape_map as LM
+    # two shards' rows files, one plan each, plus a second-phase file
+    rows = {
+        "rows_s0_s0.csv": [("singleton:skip:k1.f0:v1/add", 0.95), ("singleton:skip:k1.f0:v1/add", 0.97)],
+        "rows_s1_s1.csv": [("singleton:quant:k2.f0:lhs:bf16", 0.50)],
+        "rows_q2_s0.csv": [("singleton:quant:k2.f0:lhs:int8", 0.90)],
+    }
+    for name, recs in rows.items():
+        with open(tmp_path / name, "w", newline="") as fh:
+            import csv
+            w = csv.DictWriter(fh, fieldnames=LM.CSV_FIELDS); w.writeheader()
+            for t, (pid, q) in enumerate(recs):
+                row = {k: "" for k in LM.CSV_FIELDS}
+                row.update({"plan_id": pid, "trial": t, "role": "candidate", "quality": q})
+                w.writerow(row)
+    plans = {pid: {"wires": []} for pid in
+             ("identity", "singleton:skip:k1.f0:v1/add", "singleton:quant:k2.f0:lhs:bf16",
+              "singleton:quant:k2.f0:lhs:int8", "singleton:diag:k3.f0:new:p0.0.fac2")}
+    done = LM.load_done_all(str(tmp_path))
+    fstar = LM.f_star_items_from(plans, done, reps=5, threshold=0.8)
+    assert [pid for pid, _ in fstar] == ["singleton:skip:k1.f0:v1/add", "singleton:quant:k2.f0:lhs:int8"]
+    items = sorted({f"stack:{i}": {} for i in range(10)}.items())
+    parts = [LM.shard_slice(items, f"{i}/3") for i in range(3)]
+    assert [len(x) for x in parts] == [4, 4, 2]
+    assert sum(parts, []) == items
+    assert LM.shard_slice(items, "") == items
