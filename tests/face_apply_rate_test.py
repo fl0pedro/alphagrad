@@ -51,8 +51,11 @@ passes on purpose:
   merge writes the edge a later face's ``jr`` reads -- so the bijection says
   nothing about them and the per-vertex composition refuses to answer.
 
-The five that remain xfailing are the DUPLICATED GRAPH, a separate open defect
-neither pass can touch because the mask and the apply run on two graphs there.
+The five TWO-GRAPH cases were strict xfails until 2026-09-13 (finding 61): the
+stream's prefix replay decoded face rows in the VERTEX frame while the apply
+decoded them in the SLOT TENSOR's frame, so the two graphs carried different
+approximations and disagreed from the first such row on. One builder now
+(``env._face_dict_for_vertex``), and the five are assertions.
 
 ONE HEAD CALL PER (face, slot), not one per face, because slot ``s``'s mask does
 not exist until slots before it have been decided and applied. That changes no
@@ -941,64 +944,41 @@ def test_nn256_every_slot_rejects_nothing_on_one_graph(nn256):
 
 
 # --------------------------------------------------------------------------
-# TWO GRAPHS: the production arrangement, and a SEPARATE open defect.
+# TWO GRAPHS: the production arrangement. Assertions since finding 61.
 #
 # ppo.py rides the stream tokenizer for the mask and a second
-# ``IncrementalJaxpr`` for the face keys. Finding 71 measured that the two
-# disagree about the FACE KEY LIST on 3 of 95 TLM steps (first at step 3,
-# vertex 8: the stream graph reports 0 keys, the apply graph 1), so row `f` of
-# the wire can describe a different face than the mask did. It also owns
-# Reduce rejections the single graph does not: with only lhs+rhs armed -- where
-# neither fault above can fire -- two graphs reject 3 Reduce over 5 TLM seeds
-# and one graph rejects none. Measured identically on the branch tip BEFORE the
-# site-set fix (job 64642 against 07fc4c4), so it is not a consequence of it.
-#
-# The fix is ticket .59's single-graph merge: one IncrementalJaxpr owns both
-# the legality and the apply. Until then, STRICT xfail.
-#
-# #75 DID NOT FIX THESE AND WAS NEVER GOING TO. The decide pass runs on the
-# STREAM tokenizer and the apply on the separate `IncrementalJaxpr`, so the mask
-# is now right about the stream graph's tensors and the apply still happens on
-# another graph's. That these five still xfail while the four one-graph cases
-# flipped is the cleanest available evidence that the duplication is a SEPARATE
-# defect and not a symptom of the stale mask.
+# ``IncrementalJaxpr`` for the apply. Finding 71 measured that the two
+# disagreed about the FACE KEY LIST on 3 of 95 TLM steps and that, with only
+# lhs+rhs armed, two graphs rejected 3 Reduce rows over 5 TLM seeds where one
+# graph rejected none. Finding 61 (2026-09-13, probe jobs 65266/65270) named
+# the cause: ``LiveFaceStream._decided`` decoded the wire rows in the vertex
+# frame (``decode_vertex_rule_specs``) while the apply decoded them in each
+# slot tensor's frame (``make_slot_frame_hook``). A COMPRESS axis or a DIAG
+# pair then landed on different dims in the two prefixes, so the stream's
+# operands and face keys drifted from the measured graph's. Since alphagrad
+# 618b896b every head-side decoder builds its entries through
+# ``env._face_dict_for_vertex``; the two graphs are the same graph again, and
+# the five cases below hold without an xfail. ``face_wire_one_decoder_test``
+# pins the single decoder directly.
 # --------------------------------------------------------------------------
-@pytest.mark.xfail(strict=True,
-                   reason="dsnn-3qm.59 (one graph): the legality tokenizer and "
-                          "the apply IncrementalJaxpr disagree on 3 of 95 TLM "
-                          "steps; 3 Reduce rows rejected over 5 seeds with only "
-                          "lhs+rhs armed, 0 on one graph")
 def test_tlm_operand_slots_reject_nothing_on_two_graphs(tlm):
     _assert_no_rejection(_walk, tlm, "tlm two-graph lhs+rhs",
                          slots_on=("lhs", "rhs"))
 
 
-@pytest.mark.xfail(strict=True,
-                   reason="dsnn-3qm.59 (one graph): same duplication defect on "
-                          "nn256, 1 Reduce row over 5 seeds")
 def test_nn256_operand_slots_reject_nothing_on_two_graphs(nn256):
     _assert_no_rejection(_walk, nn256, "nn256 two-graph lhs+rhs",
                          slots_on=("lhs", "rhs"))
 
 
-@pytest.mark.xfail(strict=True,
-                   reason="dsnn-3qm.59 (one graph): the `new` slot alone is "
-                          "clean on one graph and rejects 2 Reduce rows over 5 "
-                          "TLM seeds on two")
 def test_tlm_result_slot_alone_rejects_nothing_on_two_graphs(tlm):
     _assert_no_rejection(_walk, tlm, "tlm two-graph new", slots_on=("new",))
 
 
-@pytest.mark.xfail(strict=True,
-                   reason="dsnn-3qm.59: fault 2 and the duplicated graph "
-                          "together")
 def test_tlm_every_slot_rejects_nothing_on_two_graphs(tlm):
     _assert_no_rejection(_walk, tlm, "tlm two-graph all slots")
 
 
-@pytest.mark.xfail(strict=True,
-                   reason="dsnn-3qm.59: fault 2 and the duplicated graph "
-                          "together, nn256")
 def test_nn256_every_slot_rejects_nothing_on_two_graphs(nn256):
     _assert_no_rejection(_walk, nn256, "nn256 two-graph all slots")
 
