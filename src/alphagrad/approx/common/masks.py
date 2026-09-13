@@ -2012,6 +2012,190 @@ def face_counts_armed() -> bool:
     return _COUNT_ARMED[0] > 0
 
 
+def _rule_kind(rule) -> str:
+    """Telemetry label for a rule — the REALITY histogram's bucket."""
+    from graphax.sparse.micro_actions import Compress, Diag, Quant
+
+    if isinstance(rule, Diag):
+        return "diag"
+    if isinstance(rule, Compress):
+        return "compress"
+    if isinstance(rule, Quant):
+        return "quant"
+    return "other"
+
+
+def _projection_armed(rule) -> bool:
+    """Is the per-face projection armed for THIS rule's kind?
+
+    ``--diag-per-face`` is the DIAG-only predecessor and stays exactly that;
+    ``--per-face-masks`` arms all three. Both off = the historical
+    drop-on-illegal hook.
+    """
+    from graphax.sparse.micro_actions import Diag
+
+    if _PER_FACE_MASKS[0]:
+        return True
+    return isinstance(rule, Diag) and _DIAG_PER_FACE[0]
+
+
+def decide_masked_rule(st, rule, *, max_dims: int = 8, max_axes: int = 8,
+                       bump=None):
+    """THE decision one requested rule gets on one live operand.
+
+    Returns the micro-action to APPLY to ``st`` — already projected to this
+    face and already converted to the axis space ``apply_compress`` reads — or
+    ``None`` when the rule is declined. Bumps the ``skipped`` / ``repaired``
+    counters through ``bump``; the ``applied`` / ``skipped_*_noop`` pair is NOT
+    decided here, because whether an action changed the tensor is only knowable
+    after it ran (:func:`bump_masked_outcome`).
+
+    ONE DECODER, ONE DECISION (finding 61). :func:`make_live_masked_hook`
+    (which applies the action itself, for the per-vertex ``transforms`` list)
+    and :func:`make_live_masked_chooser` (which hands the action to graphax, so
+    graphax applies AND records it) both call this and nothing else, so the
+    measured stream and the decide-time stream cannot answer the mask
+    differently.
+    """
+    from graphax.sparse.micro_actions import Compress, Diag, Quant
+
+    def _bump(key):
+        if bump is not None:
+            bump(key)
+
+    kind = _rule_kind(rule)
+    live = rule
+    if not hook_rule_is_legal(st, live, max_dims=max_dims, max_axes=max_axes):
+        # PER-FACE MASKING. The requested rule was chosen against the vertex's
+        # nominal sizes and a probe of the face; this operand has its own legal
+        # set, so ask for the nearest thing in it rather than dropping the
+        # action. Off by default.
+        _alt = None
+        if _projection_armed(rule):
+            _alt = project_rule_to_face(st, rule, max_dims=max_dims,
+                                        max_axes=max_axes)
+            if _alt is not None and not hook_rule_is_legal(
+                    st, _alt, max_dims=max_dims, max_axes=max_axes):
+                # The projection is meant to make this unreachable; never
+                # apply an action the mask has not cleared.
+                _alt = None
+        if _alt is None:
+            _bump("skipped")
+            _bump(f"skipped_{kind}")
+            if rule_is_idempotent_noop(st, rule, max_dims=max_dims,
+                                       max_axes=max_axes):
+                # Distinguish the idempotent re-request (DIAG: already coupled
+                # at exactly this granularity; COMPRESS: every addressed slot
+                # implicit or extent-1; QUANT: already this dtype) from a
+                # genuine miss. Without this split `applied_fraction` reads a
+                # correct no-op as a failure, which is how DIAG came to look
+                # inert -- and how QUANT came to look like it always worked.
+                _bump(f"skipped_{kind}_noop")
+            return None
+        if _alt is not rule:
+            live = _alt
+            _bump(f"repaired_{kind}")
+    if not isinstance(live, (Diag, Compress, Quant)):
+        _bump("skipped")
+        _bump(f"skipped_{kind}")
+        return None
+    if isinstance(live, Compress) and reduce_axes_physical():
+        # THE GRAPHAX BOUNDARY (ticket .20): physical val axes -> canonical
+        # slots, the space apply_compress reads. It is part of the DECISION,
+        # not of the apply: the action handed to graphax must already name the
+        # axes graphax will read.
+        try:
+            live = compress_to_graphax(st, live)
+        except ValueError:
+            # reduce_axis_mask refuses an unaddressable physical axis first, so
+            # the mask is meant to make this unreachable; leaving the operand
+            # exact is strictly better than killing the episode's measurement.
+            _bump("skipped_raised")
+            _bump(f"skipped_{kind}")
+            return None
+    return live
+
+
+def bump_masked_outcome(rule, applied: bool, bump=None) -> None:
+    """Count ONE decided rule once its outcome is known.
+
+    WHAT A NO-OP IS, in one sentence: the operand handed back is the operand
+    received. The apply functions return their input object unchanged when the
+    request changes nothing (``graphax.core._micro_applied`` documents the
+    identity check as the reliable signal; every real micro-action builds a new
+    SparseTensor), so ``applied`` is that identity test and nothing else
+    (ticket dsnn-3qm.73: a Reduce on the 'new' slot reported APPLIED while the
+    jaxpr stayed byte-identical). ``rule_is_idempotent_noop`` in
+    :func:`decide_masked_rule` is the a-priori form of the SAME question,
+    consulted only where the mask forbade applying; it never overrides this one.
+
+    The same three counters as the mask-rejected no-op, so
+    ``skipped_{kind}_noop`` is a subset of ``skipped_{kind}`` at both sites and
+    ``applied_fraction`` has one denominator.
+    """
+    if bump is None:
+        return
+    kind = _rule_kind(rule)
+    if applied:
+        bump("applied")
+        bump(f"applied_{kind}")
+    else:
+        bump("skipped")
+        bump(f"skipped_{kind}")
+        bump(f"skipped_{kind}_noop")
+
+
+def make_live_masked_chooser(rules, *, max_dims: int = 8, max_axes: int = 8,
+                             stats: dict | None = None, gated: bool = False):
+    """``rules`` as the CHOOSER graphax invokes per face slot.
+
+    The difference from :func:`make_live_masked_hook` is WHO APPLIES. This form
+    decides and hands the chosen micro-action back to graphax, which applies it
+    through ``core._apply_micro`` and records it through ``core._record_micro``
+    -- so the decision lands in the token stream as a labelled ``approx``
+    block. The hook form applies the action itself, which is invisible to the
+    transform log (graphax's own comment: a plain tensor-returning callable is
+    NOT visible) and is why every DIAG / COMPRESS / QUANT the face head placed
+    used to leave no marker at all (finding 64).
+
+    ONE ACTION PER CALL, because graphax applies exactly one per chooser
+    result. A slot's wire row decodes to at most one rule
+    (``env.decode_rule_specs_in_frame`` stops at the first end sentinel), so
+    this is the shape of the wire and not a restriction on it -- and a request
+    this form cannot carry RAISES rather than dropping the rules it cannot
+    represent.
+
+    ``chosen_applied`` is graphax's callback with the outcome; it is what keeps
+    ``applied`` / ``skipped_*_noop`` reading the post-apply identity test that
+    also decides whether a block is emitted.
+    """
+    coupled, _ = couple_quant_rules(rules)
+    if len(coupled) > 1:
+        raise ValueError(
+            f"a face slot chooser was built with {len(coupled)} rules "
+            f"({coupled!r}); graphax applies ONE micro-action per chooser "
+            f"result, so this request cannot be represented on the slot path. "
+            f"Install the rules as separate slots, or use "
+            f"make_live_masked_hook for the per-vertex transforms list.")
+
+    def _bump(key):
+        if stats is None or (gated and not _COUNT_ARMED[0]):
+            return
+        stats[key] = stats.get(key, 0) + 1
+
+    def _chooser(st):
+        if not coupled:
+            return None
+        return decide_masked_rule(st, coupled[0], max_dims=max_dims,
+                                  max_axes=max_axes, bump=_bump)
+
+    def _chosen_applied(action, applied):
+        bump_masked_outcome(action, bool(applied), _bump)
+
+    _chooser.chosen_applied = _chosen_applied
+    return _chooser
+
+
 def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
                           stats: dict | None = None, gated: bool = False):
     """Wrap ``rules`` into the per-vertex callable graphax applies PER FACE.
@@ -2027,9 +2211,18 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
     rather than silently approximating nothing. ``gated=True`` restricts those
     counts to an :func:`arm_face_counts` scope -- see the note above; use it
     whenever the same hook is replayed on graphs that are not the measured one.
+
+    THIS FORM APPLIES; :func:`make_live_masked_chooser` decides and lets graphax
+    apply. Both take their decision from :func:`decide_masked_rule` and count
+    the outcome through :func:`bump_masked_outcome`, so the only difference
+    between them is WHO calls ``_apply_micro`` -- and therefore whether the
+    action reaches the token stream as an ``approx`` block. This form is the one
+    the PER-VERTEX ``transforms`` list needs, because that list can carry
+    several rules for one operand and each rule's legality is decided against
+    the tensor the PREVIOUS one produced, which a single chooser result cannot
+    say.
     """
-    from graphax.sparse.micro_actions import (
-        apply_compress, apply_diag, apply_quant, Compress, Diag, Quant)
+    from graphax.core import _apply_micro
 
     def _bump(key):
         if stats is None or (gated and not _COUNT_ARMED[0]):
@@ -2038,113 +2231,24 @@ def make_live_masked_hook(rules, *, max_dims: int = 8, max_axes: int = 8,
 
     coupled, _ = couple_quant_rules(rules)
 
-    def _kind_of(rule):
-        """Telemetry label for a rule — the REALITY histogram's bucket."""
-        if isinstance(rule, Diag):
-            return "diag"
-        if isinstance(rule, Compress):
-            return "compress"
-        if isinstance(rule, Quant):
-            return "quant"
-        return "other"
-
-    def _project_on(rule) -> bool:
-        """Is the per-face projection armed for THIS rule's kind?
-
-        ``--diag-per-face`` is the DIAG-only predecessor and stays exactly
-        that; ``--per-face-masks`` arms all three. Both off = the historical
-        drop-on-illegal hook.
-        """
-        if _PER_FACE_MASKS[0]:
-            return True
-        return isinstance(rule, Diag) and _DIAG_PER_FACE[0]
-
-    def _legal(st, rule):
-        """The arm's legality predicate. ONE definition, used by BOTH the
-        initial test and the post-projection re-verify -- a projection cleared
-        by a laxer predicate than the one that rejected the original is how a
-        repair turns into a raise."""
-        return hook_rule_is_legal(st, rule, max_dims=max_dims,
-                                  max_axes=max_axes)
-
     def _hook(st):
         cur = st
         for rule in coupled:
-            _kind = _kind_of(rule)
-            live = rule
-            if not _legal(cur, live):
-                # PER-FACE MASKING. The requested rule was chosen against the
-                # vertex's nominal sizes and a probe of the face; this operand
-                # has its own legal set, so ask for the nearest thing in it
-                # rather than dropping the action. Off by default.
-                _alt = None
-                if _project_on(rule):
-                    _alt = project_rule_to_face(cur, rule, max_dims=max_dims,
-                                                max_axes=max_axes)
-                    if _alt is not None and not _legal(cur, _alt):
-                        # The projection is meant to make this unreachable;
-                        # never apply an action the mask has not cleared.
-                        _alt = None
-                if _alt is None:
-                    _bump("skipped")
-                    _bump(f"skipped_{_kind}")
-                    if rule_is_idempotent_noop(
-                            cur, rule, max_dims=max_dims, max_axes=max_axes):
-                        # Distinguish the idempotent re-request (DIAG: already
-                        # coupled at exactly this granularity; COMPRESS: every
-                        # addressed slot implicit or extent-1; QUANT: already
-                        # this dtype) from a genuine miss. Without this split
-                        # `applied_fraction` reads a correct no-op as a
-                        # failure, which is how DIAG came to look inert -- and
-                        # how QUANT came to look like it always worked.
-                        _bump(f"skipped_{_kind}_noop")
-                    continue
-                if _alt is not rule:
-                    live = _alt
-                    _bump(f"repaired_{_kind}")
+            live = decide_masked_rule(cur, rule, max_dims=max_dims,
+                                      max_axes=max_axes, bump=_bump)
+            if live is None:
+                continue
             try:
-                # WHAT A NO-OP IS, in one sentence: the hook hands back the
-                # operand it received. The apply functions return their input
-                # object unchanged when the request changes nothing
-                # (core._micro_applied documents the identity check as the
-                # reliable signal; every real micro-action builds a new
-                # SparseTensor), so ``cur is prev`` after the apply is the
-                # authoritative test (ticket dsnn-3qm.73: a Reduce on the
-                # 'new' slot reported APPLIED while the jaxpr stayed
-                # byte-identical). ``rule_is_idempotent_noop`` above is the
-                # a-priori form of the SAME question, consulted only where
-                # the mask forbade applying; it never overrides this one.
                 prev = cur
-                if isinstance(live, Diag):
-                    cur = apply_diag(cur, live)
-                elif isinstance(live, Compress):
-                    # THE GRAPHAX BOUNDARY (ticket .20): physical val axes
-                    # -> canonical slots, the space apply_compress reads.
-                    cur = apply_compress(
-                        cur, compress_to_graphax(cur, live)
-                        if reduce_axes_physical() else live)
-                elif isinstance(live, Quant):
-                    cur = apply_quant(cur, live)
-                else:
-                    _bump("skipped")
-                    _bump(f"skipped_{_kind}")
-                    continue
-                if cur is prev:
-                    # Same three counters as the mask-rejected no-op above, so
-                    # skipped_{kind}_noop is a subset of skipped_{kind} at
-                    # both sites and applied_fraction has one denominator.
-                    _bump("skipped")
-                    _bump(f"skipped_{_kind}")
-                    _bump(f"skipped_{_kind}_noop")
-                else:
-                    _bump("applied")
-                    _bump(f"applied_{_kind}")
+                cur = _apply_micro(cur, live)
             except ValueError:
                 # The mask is meant to make this unreachable; if a case slips
                 # through, leaving the operand exact is strictly better than
-                # killing the episode's measurement.
+                # killing the measurement of the episode.
                 _bump("skipped_raised")
-                _bump(f"skipped_{_kind}")
+                _bump(f"skipped_{_rule_kind(rule)}")
+                continue
+            bump_masked_outcome(rule, cur is not prev, _bump)
         return cur
 
     return _hook

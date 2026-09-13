@@ -1234,9 +1234,11 @@ class LiveFaceStream:
     #   * computes ``masks.slot_legality`` on THE TENSOR IN HAND,
     #   * calls the caller's ``draw`` with it -- outside the jaxpr trace, see
     #     ``jax.ensure_compile_time_eval`` below -- to get a wire row,
-    #   * and applies that row through ``env.make_slot_frame_hook``, THE APPLY
-    #     PATH'S OWN HOOK, so the tensor the next site sees is the tensor the
-    #     measurement will produce.
+    #   * and decides that row through ``env.make_slot_frame_hook``, THE APPLY
+    #     PATH'S OWN HOOK, handing the action it picks back to graphax -- which
+    #     applies AND RECORDS it, so the tensor the next site sees is the tensor
+    #     the measurement will produce and the block the stream carries is the
+    #     block the measurement carries.
     #
     # so the mask is recomputed as decisions land without a single re-probe: the
     # elimination itself is the propagation. Nothing is copied and nothing is
@@ -1257,8 +1259,9 @@ class LiveFaceStream:
     # rows to build face ``f``'s token chunk (so a decision that only exists
     # after the real elimination is circular), ``plan_log`` records rows, and
     # the PPO replay rescores from the stored mask. Deciding into a row keeps
-    # ONE graphax-facing apply path (``make_slot_frame_hook``) and leaves the
-    # measured elimination byte-identical to what it is today.
+    # ONE graphax-facing apply path (``make_slot_frame_hook`` decides, graphax
+    # applies) and leaves the measured elimination byte-identical to what this
+    # pass traced.
     def decide_faces(self, tk, vertex, keys, draw, *, skips=None):
         """Decide every face slot of ``vertex`` IN APPLY ORDER, one elimination.
 
@@ -1344,6 +1347,14 @@ class LiveFaceStream:
         decided: dict = {}
 
         def _mk(f, s):
+            # The slot hook of the LAST call, so graphax's outcome callback
+            # reaches the object whose counters it is about. The hook IS a
+            # chooser now, so what this returns is an action and graphax is
+            # what applies and RECORDS it -- which is how a decided rule
+            # reaches this pass's token stream as an ``approx`` block, exactly
+            # as it reaches the measurement's.
+            held: dict = {}
+
             def _chooser(st):
                 if (f, s) in decided:
                     # A slot's hook reached a SECOND site. Under every current
@@ -1355,8 +1366,11 @@ class LiveFaceStream:
                     # this pass faithful -- and the counter says it happened.
                     self.stats["decide_multi_site"] += 1
                     row = decided[(f, s)]
-                    return st if row is None else (
-                        make_slot_frame_hook(row)(st))
+                    if row is None:
+                        return None
+                    h = make_slot_frame_hook(row)
+                    held["hook"] = h
+                    return h(st)
                 L = slot_legality(st, N)
                 sizes[f, s] = L.sizes
                 nout[f, s] = L.n_out
@@ -1368,7 +1382,7 @@ class LiveFaceStream:
                 self.stats["decide_draw"] += 1
                 if w is None:
                     decided[(f, s)] = None
-                    return st
+                    return None
                 row = tuple(int(x) for x in w)
                 decided[(f, s)] = row
                 rows[f, s] = row
@@ -1381,10 +1395,19 @@ class LiveFaceStream:
                 # defect this pass exists to remove, so it is counted and
                 # visible rather than papered over.
                 seen: dict = {}
-                out = make_slot_frame_hook(row, stats=seen, gated=False)(st)
+                h = make_slot_frame_hook(row, stats=seen, gated=False)
+                held["hook"] = h
+                out = h(st)
                 if seen.get("skipped"):
                     self.stats["decide_self_skip"] += 1
                 return out
+
+            def _chosen_applied(action, applied):
+                h = held.get("hook")
+                if h is not None:
+                    h.chosen_applied(action, applied)
+
+            _chooser.chosen_applied = _chosen_applied
             return _chooser
 
         # with_policy=False, for the reason `_probe_faces` uses it and one more.
