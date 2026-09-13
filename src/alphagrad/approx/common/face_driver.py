@@ -605,7 +605,7 @@ def make_face_vertex_decide_callback(live_faces, *, max_faces, max_axes,
                                      draw, prof_sink=None):
     """``cb(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
     skips, draw_args...)`` -> ``(rows (F,S,3) int32, sizes (F,S,N) int32,
-    quant (F,S,2) f32, pair (F,S,N,N) f32, comp (F,S,N) f32, n_out (F,S) int32,
+    quant (F,S,K) f32, pair (F,S,N,N) f32, comp (F,S,N) f32, n_out (F,S) int32,
     n_faces ())``.
 
     ONE HOST CALL PER VERTEX, and the rows come back WITH the masks.

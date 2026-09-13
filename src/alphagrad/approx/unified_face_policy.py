@@ -265,7 +265,7 @@ class UnifiedFacePolicy(eqx.Module):
         """Per-slot inputs, or ``None`` when every input is per-FACE.
 
         The per-slot arrays come from ``face_slot_legality``
-        (``--face-slot-frames``): sizes (S, N), quant (S, 2), pair (S, N, N),
+        (``--face-slot-frames``): sizes (S, N), quant (S, K), pair (S, N, N),
         comp (S, N). Any one of them present switches the whole face to the
         per-slot path; the others are broadcast to match, so an oracle-path
         pair mask can still travel with live per-slot sizes.

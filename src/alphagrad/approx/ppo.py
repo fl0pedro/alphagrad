@@ -8971,7 +8971,7 @@ def main():
             if _PFM_SLOT:
                 _WS = _env_wire_slots()
                 _w = ((ENV_MAX_FACES, _WS, MAX_AXES_PER_VERTEX),
-                      (ENV_MAX_FACES, _WS, 2))
+                      (ENV_MAX_FACES, _WS, NUM_FACE_QUANT_DTYPES))
                 _g = (tuple(fsz.shape[-3:]), tuple(fqt.shape[-3:]))
             else:
                 _w = ((ENV_MAX_FACES, MAX_AXES_PER_VERTEX), (ENV_MAX_FACES,))
