@@ -1257,15 +1257,20 @@ CAMPAIGN_SEED = "250197"
 #   Markowitz  +1.9 nats, ~19 % of the absorber's 9.8-nat scale  -> 0.19
 #   reverse     0.0 nats: there is nothing to gain on that order -> 0.00
 #
-# THE FLOOR THIS ASSUMES IS NOT IN THE TRAINER YET.  env._MEM_LOG_FLOOR_BYTES
-# is still one byte, and --paired-cost-floor {byte,reference} is not in
-# make_argparser as of alphagrad 0863bd4.  Under the one-byte floor the same
-# configuration prices at contrast -13.4 on Markowitz.  The launchers carry
-# the APPROVED number and the pre-flight below says so, so a run that lands
-# before the floor change is not silently judged against a number its own
-# reward cannot reach.
+# THE FLOOR THIS ASSUMES IS IN THE TRAINER since alphagrad b2c89170:
+# --paired-cost-floor {reference,byte} defaults to `reference`, which floors
+# both channels at the paired reference's own cost.  Every campaign arm
+# passes it explicitly, so the launcher records the reward it ran under
+# instead of inheriting a default that may move.  Under the old one-byte
+# floor (--paired-cost-floor byte) the same configuration prices at contrast
+# -13.4 on Markowitz and the absorber wins.
 # ---------------------------------------------------------------------------
 GATE_OFFLINE_CONTRAST = {"markowitz": "0.19", "free": "0.19", "reverse": "0.00"}
+
+#: The paired-cost floor every campaign arm runs under (ppo.py
+#: --paired-cost-floor).  `reference` is what finding 63 priced and what the
+#: owner approved; `byte` is the pre-2026-09-13 floor.
+PAIRED_COST_FLOOR = "reference"
 
 # The profiles of ticket .40 (ppo.py --approx-profile choices) and the orders
 # of ticket .64 (common/order.py FIXED_ORDER_CHOICES).  Typed here because
@@ -1418,13 +1423,11 @@ finding-51 window (3.95-6.8) was measured on the REVERSE order with the
 WATERMARK channel, where the absorber gains nothing; it does not transfer.
 {LAMBDA_Q_MVP} is 1.33x the 12 the Markowitz absorber needs.
 
-THE COST FLOOR THIS ASSUMES IS NOT IN THE TRAINER YET.  Finding 63's numbers
-floor BOTH cost channels at the paired rev-exact cost before the log;
-env._MEM_LOG_FLOOR_BYTES is still one byte and there is no
---paired-cost-floor flag in make_argparser.  Under the one-byte floor the
-same configuration prices at contrast -13.4 on Markowitz -- the absorber
-wins.  Do not read a phase-1 result as a reward-design result until that
-lands (ticket .9).
+THE COST FLOOR: --paired-cost-floor {PAIRED_COST_FLOOR} (alphagrad
+b2c89170, ticket .9).  Finding 63's numbers floor BOTH cost channels at the
+paired rev-exact cost before the log, and this arm passes that explicitly.
+Under the old one-byte floor (--paired-cost-floor byte) the same
+configuration prices at contrast -13.4 on Markowitz and the absorber wins.
 
 THE FACE HEAD is one flat MLP of {FACE_HEAD_WIDTH} logits (derived from
 alphagrad.approx.unified_face_head.head_layout({APPROX_ADD!r}).width at
@@ -1547,6 +1550,10 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
         # nothing.  Phase 3's P0 arm is the ONE arm that lifts it, and it
         # lifts it on purpose, as its question.
         "--quality-floor": QUALITY_FLOOR_TAU,
+        # THE COST FLOOR (ticket .9, alphagrad b2c89170).  Passed even though
+        # it is the trainer default: an arm's launcher must record the reward
+        # it ran under, and this one moved on 2026-09-13.
+        "--paired-cost-floor": PAIRED_COST_FLOOR,
         # THE MEASUREMENT (owner ruling 2026-09-13): one Ray measure actor
         # on its own GPU, the node held by this job.
         "--ray-measure": CAMPAIGN_RAY_MEASURE,

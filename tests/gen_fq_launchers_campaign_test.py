@@ -350,14 +350,33 @@ def test_gate_g6_carries_the_pre_run_contrast_of_this_arms_order(gen, campaign):
         assert float(want) >= 0.0
 
 
-def test_the_launcher_states_that_the_cost_floor_is_not_landed_yet(gen, campaign):
-    """--paired-cost-floor {byte,reference} is NOT in ppo.make_argparser as
-    of this commit, and finding 63's contrast assumes the reference floor.
-    No arm may pass the flag, and every arm must SAY so in its header."""
+def test_every_arm_passes_the_approved_cost_floor(gen, campaign):
+    """--paired-cost-floor landed in ppo.make_argparser (alphagrad b2c89170)
+    and finding 63's contrast assumes its `reference` setting. Every arm
+    passes it EXPLICITLY -- a launcher must record the reward it ran under,
+    not inherit a default that moved once already -- and every header says
+    what the old floor would have priced."""
+    assert gen.PAIRED_COST_FLOOR == "reference"
     for a in campaign:
+        cli = _cli(gen, a)
+        assert cli["--paired-cost-floor"] == "reference", a["name"]
         text = gen.render(a)
-        assert "--paired-cost-floor" not in " ".join(gen.cli_tokens(a)), a["name"]
-        assert "paired-cost-floor" in text, a["name"]
+        assert "--paired-cost-floor reference" in text, a["name"]
+        assert "-13.4" in text, (a["name"], "the header must price the old floor")
+
+
+def test_the_cost_floor_flag_exists_in_the_trainer(gen):
+    """The generator may not emit a flag the trainer would refuse."""
+    import subprocess
+    import sys
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import alphagrad.approx.ppo as P;"
+         "a=P.make_argparser().parse_args(['--paired-cost-floor','reference']);"
+         "print(a.paired_cost_floor)"],
+        capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip().endswith("reference")
 
 
 # ------------------------------------------------- 4. the environment
