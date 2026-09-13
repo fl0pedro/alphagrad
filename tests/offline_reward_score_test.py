@@ -19,9 +19,12 @@ def _summary(tmp_path):
     """Three plans on an order whose identity costs 10x latency and 4x
     memory against rev-exact: a clean saver, a gradient killer, and a
     low-quality saver."""
+    # rev-exact costs 1000 ns / 100 B; ratios are against it, so the absolute
+    # costs are ratio * rev-exact.
     def e(lat, mem, q, op="quant"):
         return {"op": op, "quality": {"mean": q}, "latency_ratio": {"mean": lat},
-                "static_temp_ratio": {"mean": mem}, "mem_ratio": {"mean": mem}}
+                "static_temp_ratio": {"mean": mem}, "mem_ratio": {"mean": mem},
+                "latency_ns": {"mean": 1000.0 * lat}, "static_temp": {"mean": 100.0 * mem}}
     summ = {
         "identity [gpu0]": e(10.0, 4.0, 1.0, "identity"),
         "identity [gpu1]": e(10.0, 4.0, 1.0, "identity"),
@@ -105,3 +108,35 @@ def test_cli_writes_markdown_and_json(tmp_path):
     assert "| P0 | 4 | 0.9 |" in text and "| P1 | 4 | 0.9 |" in text
     data = json.loads((tmp_path / "report.json").read_text())
     assert set(data) == {"union"} and len(data["union"]) == 2
+
+
+def test_floors_cap_the_absorbers_gain(tmp_path):
+    """With the trainer's one-byte floor a zero-temp plan gains log(ref/1 B);
+    flooring at the reverse-exact cost caps the gain at the order's own
+    distance from rev-exact."""
+    ref_lat, ref_mem = 10_000.0, 400.0          # the toy identity (10x, 4x rev-exact)
+    a0 = S.absorber_point(100.0, 0.0, 0.0, ref_lat_ns=ref_lat, ref_temp_bytes=ref_mem)
+    assert a0.dmem == pytest.approx(math.log(1.0 / 400.0))
+    assert a0.dlat == pytest.approx(math.log(100.0 / 10_000.0))
+    fl = S.Floors(lat_ns=1000.0, temp_bytes=100.0)     # rev-exact costs
+    a1 = S.absorber_point(100.0, 0.0, 0.0, ref_lat_ns=ref_lat, ref_temp_bytes=ref_mem, floors=fl)
+    assert a1.dmem == pytest.approx(math.log(100.0 / 400.0))
+    assert a1.dlat == pytest.approx(math.log(1000.0 / 10_000.0))
+    # the same floors apply to the sweep points: the zero-temp skip no longer
+    # sits at log(1/400) but at the floor
+    pts = {p.plan_id: p for p in S.points_from_sweep_summary(_summary(tmp_path), floors=fl)}
+    assert pts["singleton:skip:k2.f0:v9/log"].dmem == pytest.approx(math.log(100.0 / 400.0))
+    assert pts["identity"].dlat == 0.0 and pts["identity"].dmem == 0.0
+
+
+def test_cli_accepts_a_measured_absorber(tmp_path):
+    out = tmp_path / "r.md"
+    rc = S.main(["--sweep-summary", f"toy={_summary(tmp_path)}", "--lambda-q", "4", "--tau", "0.9",
+                 "--absorber", "toy=100,0,0,10000,400", "--out", str(out)])
+    assert rc == 0
+    rows = json.loads((tmp_path / "r.json").read_text())["union"]
+    # the measured absorber (gain log(100) + log(400) ~ 10.6 nats) beats the
+    # in-sweep q = 0 plan and becomes the floor under both forms
+    for r in rows:
+        assert r["n_absorbers"] == 2
+        assert r["R_absorber"] > 5.0

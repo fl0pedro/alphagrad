@@ -70,12 +70,39 @@ def _kind_of(plan_id: str) -> str:
     return {"reduce": "compress"}.get(parts[1], parts[1]) if len(parts) > 1 else parts[0]
 
 
+#: The trainer's floor under log() for the memory channel
+#: (``env._MEM_LOG_FLOOR_BYTES``): one byte. A plan that allocates nothing
+#: therefore gains ``log(ref_temp / 1 B)`` nats on the memory channel.
+TRAINER_MEM_FLOOR_BYTES = 1.0
+
+
+@dataclass(frozen=True)
+class Floors:
+    """Absolute cost floors applied to BOTH sides before the log.
+
+    ``lat_ns`` / ``temp_bytes`` of ``None`` mean "no floor" (latency) and the
+    trainer's one-byte floor (memory). Passing the reverse-exact costs here
+    asks: what does the reward look like if nothing below the cheapest exact
+    plan earns credit?"""
+    lat_ns: float | None = None
+    temp_bytes: float | None = None
+
+    def lat(self, x: float) -> float:
+        return x if self.lat_ns is None else max(x, self.lat_ns)
+
+    def mem(self, x: float) -> float:
+        return max(x, TRAINER_MEM_FLOOR_BYTES if self.temp_bytes is None else self.temp_bytes)
+
+
 def points_from_sweep_summary(path: str, *, reference: str = "identity",
-                              source: str | None = None) -> list[Point]:
+                              source: str | None = None,
+                              floors: Floors = Floors()) -> list[Point]:
     """Per-plan points from a landscape_map combined summary.
 
-    ``reference='identity'`` divides every ratio by the order's own identity
-    ratio (median over configs); ``'rev-exact'`` keeps the paired ratios.
+    Works on the ABSOLUTE per-plan costs (``latency_ns``, ``static_temp``)
+    so the floors apply; ``reference='identity'`` divides by the order's own
+    identity (median over configs), ``'rev-exact'`` by the paired reverse-exact
+    cost (identity cost / identity ratio).
     """
     summ = json.load(open(path))["summary"]
     per: dict[str, list] = {}
@@ -84,28 +111,42 @@ def points_from_sweep_summary(path: str, *, reference: str = "identity",
         per.setdefault(pid, []).append(v)
     if "identity" not in per:
         raise ValueError(f"{path}: no 'identity' entry, cannot re-base")
-    lat0 = statistics.median(_num(v["latency_ratio"]) for v in per["identity"])
-    mem0 = statistics.median(_num(v["static_temp_ratio"]) for v in per["identity"])
-    if reference == "rev-exact":
-        lat0 = mem0 = 1.0
-    elif reference != "identity":
+    ident = per["identity"]
+    lat_id = statistics.median(_num(v["latency_ns"]) for v in ident)
+    mem_id = statistics.median(_num(v["static_temp"]) for v in ident)
+    if reference == "identity":
+        lat_ref, mem_ref = lat_id, mem_id
+    elif reference == "rev-exact":
+        lat_ref = lat_id / statistics.median(_num(v["latency_ratio"]) for v in ident)
+        mem_ref = mem_id / statistics.median(_num(v["static_temp_ratio"]) for v in ident)
+    else:
         raise ValueError(f"reference must be 'identity' or 'rev-exact', got {reference!r}")
+    lat_ref, mem_ref = floors.lat(lat_ref), floors.mem(mem_ref)
     src = source or path
     out = []
     for pid, vals in per.items():
-        lat = statistics.median(_num(v["latency_ratio"]) for v in vals) / lat0
-        mem = statistics.median(_num(v["static_temp_ratio"]) for v in vals) / mem0
+        lat = floors.lat(statistics.median(_num(v["latency_ns"]) for v in vals))
+        mem = floors.mem(statistics.median(_num(v["static_temp"]) for v in vals))
         q = statistics.median(_num(v["quality"]) for v in vals)
-        if not (lat > 0 and mem > 0) or math.isnan(q):
-            # a skip at the output can zero the temp; log(0) is not a reward,
-            # it is a plan that measured nothing. Skip it, loudly.
+        if not (lat > 0) or math.isnan(q):
             print(f"[score] drop {pid}: lat={lat:g} mem={mem:g} q={q:g}", file=sys.stderr)
             continue
-        out.append(Point(pid, src, _kind_of(pid), math.log(lat), math.log(mem), q))
+        out.append(Point(pid, src, _kind_of(pid), math.log(lat / lat_ref), math.log(mem / mem_ref), q))
     return out
 
 
-def points_from_plan_log(path: str, *, source: str | None = None) -> list[Point]:
+def absorber_point(lat_ns: float, temp_bytes: float, q: float, *, ref_lat_ns: float,
+                   ref_temp_bytes: float, floors: Floors = Floors(),
+                   source: str = "measured") -> Point:
+    """The measured skip-everything plan as a point against an explicit
+    reference (the order's identity), under the same floors."""
+    lat = floors.lat(lat_ns) / floors.lat(ref_lat_ns)
+    mem = floors.mem(temp_bytes) / floors.mem(ref_temp_bytes)
+    return Point("absorber:skip@all", source, "skip", math.log(lat), math.log(mem), q)
+
+
+def points_from_plan_log(path: str, *, source: str | None = None,
+                         floors: Floors = Floors()) -> list[Point]:
     """Per-plan points from a plan log; the reference is the log's own exact
     plans (median latency / memory of every record with no request)."""
     recs = []
@@ -121,15 +162,17 @@ def points_from_plan_log(path: str, *, source: str | None = None) -> list[Point]
     exact = [r for r in recs if not r.get("sentinelled") and r["requested"]["total"] == 0]
     if not exact:
         raise ValueError(f"{path}: no exact plan (requested.total == 0) to serve as reference")
-    lat0 = statistics.median(-float(r["rewards"][i_lat]) for r in exact)
-    mem0 = statistics.median(-float(r["rewards"][i_mem]) for r in exact)
+    lat0 = floors.lat(statistics.median(-float(r["rewards"][i_lat]) for r in exact))
+    mem0 = floors.mem(statistics.median(-float(r["rewards"][i_mem]) for r in exact))
     src = source or path
     out = []
     for k, r in enumerate(recs):
         if r.get("sentinelled"):
             continue
-        lat, mem, q = -float(r["rewards"][i_lat]), -float(r["rewards"][i_mem]), float(r["rewards"][i_q])
-        if not (lat > 0 and mem > 0):
+        lat = floors.lat(-float(r["rewards"][i_lat]))
+        mem = floors.mem(-float(r["rewards"][i_mem]))
+        q = float(r["rewards"][i_q])
+        if not (lat > 0):
             continue
         req = r["requested"]
         kind = "identity" if req["total"] == 0 else "plan"
@@ -222,6 +265,14 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--tau", type=str, default="0.8,0.9,0.95")
     p.add_argument("--forms", type=str, default="P0,P1")
     p.add_argument("--absorber-q", type=float, default=0.05)
+    p.add_argument("--floor-lat-ns", type=float, default=None,
+                   help="clip every latency at this floor before the log (default: none)")
+    p.add_argument("--floor-temp-bytes", type=float, default=None,
+                   help="clip every temp memory at this floor before the log "
+                        "(default: the trainer's one byte)")
+    p.add_argument("--absorber", action="append", default=[],
+                   help="a measured skip-everything plan for one source: "
+                        "SOURCE=lat_ns,temp_bytes,q,ref_lat_ns,ref_temp_bytes (repeatable)")
     p.add_argument("--eta-fraction", type=float, default=0.1)
     p.add_argument("--separate", action="store_true",
                    help="score each source on its own instead of the union")
@@ -239,14 +290,23 @@ def _split_label(spec: str) -> tuple[str | None, str]:
 
 def main(argv=None) -> int:
     args = make_argparser().parse_args(argv)
+    floors = Floors(lat_ns=args.floor_lat_ns, temp_bytes=args.floor_temp_bytes)
     groups: dict[str, list[Point]] = {}
     for spec in args.sweep_summary:
         name, path = _split_label(spec)
-        pts = points_from_sweep_summary(path, reference=args.reference, source=name)
+        pts = points_from_sweep_summary(path, reference=args.reference, source=name,
+                                        floors=floors)
         groups[name or path] = pts
     for spec in args.plan_log:
         name, path = _split_label(spec)
-        groups[name or path] = points_from_plan_log(path, source=name)
+        groups[name or path] = points_from_plan_log(path, source=name, floors=floors)
+    for spec in args.absorber:
+        name, rest = spec.split("=", 1)
+        lat, mem, q, rlat, rmem = (float(x) for x in rest.split(","))
+        if name not in groups:
+            raise SystemExit(f"--absorber {name}: no such source among {sorted(groups)}")
+        groups[name].append(absorber_point(lat, mem, q, ref_lat_ns=rlat, ref_temp_bytes=rmem,
+                                           floors=floors, source=name))
     if not groups:
         raise SystemExit("nothing to score: pass --sweep-summary and/or --plan-log")
     lam_qs = tuple(float(x) for x in args.lambda_q.split(","))
