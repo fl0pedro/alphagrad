@@ -2924,11 +2924,15 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
                       "side is materialized (ticket dsnn-3qm.62 ruling (c))",
                       flush=True)
         total += int(np.prod(e_shape)) if e_shape else 1
-        _cdt = jnp.promote_types(getattr(e, "dtype", jnp.float32), jnp.float32)
+        # graphax's compute-dtype rule, not ``jnp.promote_types``: a Quant'd
+        # leaf can be float8 / int4, which JAX refuses to promote implicitly
+        # (measured 2026-09-13: an all-slots float8 plan raised
+        # TypePromotionError here, after the engine had contracted it fine).
+        from graphax.sparse.dtype_compute import _compute_dtype
+        _cdt = _compute_dtype(getattr(e, "dtype", jnp.float32), jnp.float32)
         if a is not None:
-            _cdt = jnp.promote_types(
-                _cdt, jnp.promote_types(getattr(a, "dtype", jnp.float32),
-                                        jnp.float32))
+            _cdt = _compute_dtype(
+                _cdt, getattr(a, "dtype", jnp.float32), jnp.float32)
         if a is None:
             _e2 = squared_norm(e, _cdt)
             _d = jnp.zeros((), _cdt)
