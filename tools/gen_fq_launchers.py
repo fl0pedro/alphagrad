@@ -11,6 +11,9 @@ way to change a launcher.
 
     python3 tools/gen_fq_launchers.py --out ~/dsnn            # write
     python3 tools/gen_fq_launchers.py --out ~/dsnn --check    # diff only
+    python3 tools/gen_fq_launchers.py --dry-run --out /Scratch/.../t43_launchers \
+                                      --against ~/dsnn        # write OUTSIDE the
+                                      # tree, diff against the tree, touch nothing
 
 Every emitted file is `bash -n` checked before it is written (a previous bulk
 edit silently uncommented ~40 launchers; syntax is verified, never eyeballed).
@@ -18,7 +21,16 @@ edit silently uncommented ~40 launchers; syntax is verified, never eyeballed).
 The plan these launchers execute, with the registered predictions and the
 decision table, is docs/EXPERIMENT_PLAN.md.  The wave 0-4 arms are the 2026-08
 running comparison; THE CAMPAIGN section (tickets .50-.54, one declarative
-row per arm, `campaign_arm`) is the phase 1-5 plan of finding 53.
+row per arm, `campaign_arm`) is the phase 1-5 plan of finding 53, regenerated
+2026-09-13 (ticket .43) under the owner's rulings of that day: the static
+Markowitz order (--fixed-order markowitz, .64), ONE face-ADD value
+(--approx-add lossless; the all-rev pair of .56 is dropped), the four-dtype
+Quant head whose width is DERIVED (never a literal), args only (the env vars a
+campaign launcher exports are the TLM target shape and the Ray/measure
+plumbing; a knob that still has no flag is exported under a TODO header, never
+silently), one 8-GPU Blackwell job per node on pgi15-gpu19/20, --ray-measure 1.
+The gate telemetry of .45 has no switch: ppo.py emits gate/*, paired/* and
+measure/* every episode; the launcher supplies G1's input (--gate-winners-table).
 """
 
 from __future__ import annotations
@@ -26,7 +38,6 @@ from __future__ import annotations
 import argparse
 import difflib
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,6 +57,51 @@ import tempfile
 
 REPO = "/Users/assmuth/dsnn/alphagrad"
 HOME_DSNN = "/Users/assmuth/dsnn"
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SRC = os.path.join(os.path.dirname(_HERE), "src")
+
+# ---------------------------------------------------------------------------
+# THE FACE ADD (ticket .56, finding 73; owner ruling 2026-09-13): ONE value,
+# lossless, on every training arm.  The sum's support is the UNION of the two
+# addends' supports and no non-zero is dropped.  The `lossy` / `lossless`
+# paired pair that ticket .56 once asked for on the all-rev arm is DROPPED
+# (the learned join values -- choose, learned1, learned2 -- are benched and
+# the pair's reading depended on them).  `campaign_arm` REFUSES any other
+# value; there is no `arm_per_approx_add` any more.
+# ---------------------------------------------------------------------------
+APPROX_ADD = "lossless"
+
+
+def _face_head_geometry(mode: str):
+    """(width, quant dtypes) of the face head under ``--approx-add mode``.
+
+    DERIVED from ``alphagrad.approx.unified_face_head.head_layout`` and
+    ``common.masks.FACE_QUANT_DTYPES``, never typed: the head gained nine
+    logits (three slots x three extra dtype logits: a four-way softmax
+    replaced the one-logit Bernoulli) when the Quant dtype set grew from
+    {f32, bf16} to the four floats (f32, bf16, f8e5m2, f8e4m3fn), and a
+    launcher header that still said the old number
+    would have described a head that no longer exists.  RAISES when the
+    library cannot be imported -- falling back to a literal is exactly the
+    stale-launcher failure this function exists to prevent.
+    """
+    if _SRC not in sys.path:
+        sys.path.insert(0, _SRC)
+    try:
+        from alphagrad.approx.unified_face_head import head_layout
+        from alphagrad.approx.common.masks import FACE_QUANT_DTYPES
+    except Exception as exc:  # noqa: BLE001 -- re-raised with the remedy
+        raise ImportError(
+            f"gen_fq_launchers derives the face-head width from "
+            f"{_SRC}/alphagrad/approx/unified_face_head.py and cannot import "
+            f"it ({exc!r}).  Run the generator inside the project venv "
+            f"(uv run --no-sync python tools/gen_fq_launchers.py ...); it "
+            f"does not fall back to a typed width.") from exc
+    return int(head_layout(mode).width), tuple(FACE_QUANT_DTYPES)
+
+
+FACE_HEAD_WIDTH, FACE_QUANT_DTYPES = _face_head_geometry(APPROX_ADD)
 
 # ---------------------------------------------------------------------------
 # THE LANDSCAPE MEASUREMENT ARMS import from the LIVE trees, not from the
@@ -75,11 +131,24 @@ HOME_DSNN = "/Users/assmuth/dsnn"
 # ---------------------------------------------------------------------------
 LANDSCAPE_TOOL = f"{REPO}/src/alphagrad/approx/tools/landscape_map.py"
 
-# GATE G1 (ticket .45) reads the sweep winners of ticket .41 from here.  The
-# sweep has not run; ppo.py logs gate/g1/present = 0 while the file is
-# absent, and the pre-flight prints whether it is there.  When .41 lands it
-# writes its winners table (columns vertex, primitive, kind) to THIS path.
-GATE_WINNERS_TABLE = f"{HOME_DSNN}/run_analysis/sweep41/winners.csv"
+# GATE G1 (ticket .45) reads the sweep winners from a table that depends on
+# the arm's ELIMINATION ORDER: a plan applied at vertex v on the Markowitz
+# order is a different opportunity from the same vertex on the reverse order,
+# and the two sweeps found different winners (4029 rows vs 2969).  An arm
+# pointed at the other order's table reports a recovery fraction that means
+# nothing, so the value is resolved per arm in `_merge_cli` from the arm's own
+# --fixed-order.  The tables are the SWEEP64 ones (owner ruling 2026-09-13);
+# CAMPAIGN_GATE_WINNERS_TABLES below is the map, and the old
+# ~/dsnn/run_analysis/sweep41/winners.csv path is gone -- nothing ever wrote
+# it, so every launcher carrying it logged gate/g1/present = 0 forever.
+class _ByOrder:
+    """Sentinel: resolve this flag's value from the arm's --fixed-order."""
+
+    def __repr__(self) -> str:        # so a stray copy is visible in a diff
+        return "<resolved from --fixed-order>"
+
+
+GATE_WINNERS_TABLE = _ByOrder()
 
 # Flags fq_face_attrib passes to landscape_map.py.  Grepped against THE TOOL
 # THAT IS ACTUALLY INVOKED, not against ppo.py: this launcher lived outside
@@ -153,6 +222,19 @@ REQUIRED_FLAGS = [
     "--preference-conditioned",
     "--gate-winners-table",
     "--gate-offline-contrast",
+    # Ticket .43 (2026-09-13): the order (.64), the Ray measurement fan-out
+    # the campaign runs under, and the face-path preconditions ppo.py now
+    # REQUIRES rather than defaults (--face-actions --unified-face-head
+    # --live-faces --dynamic-substeps; --per-face-masks is always on with
+    # --face-actions and still accepted).
+    "--fixed-order",
+    "--ray-measure",
+    "--ray-measure-timeout",
+    "--terminal-rewards-only",
+    "--face-actions",
+    "--unified-face-head",
+    "--live-faces",
+    "--dynamic-substeps",
 ]
 
 # The files the pre-flight greps REQUIRED_FLAGS in.  ppo.py defines every
@@ -191,6 +273,8 @@ PROMOTED_ENV_VARS = [
     # Dropped 2026-09-01 (4be3ff7d): graphax no longer reads it.  The
     # on-disk wave launchers that still export it predate that commit.
     "GRAPHAX_ALLOW_PARTIAL_ORDER",
+    "ALPHAGRAD_FORCE_REV_ORDER",       # --fixed-order (.64); a set var raises
+    "GRAPHAX_PLANNER_EXACT",           # removed with the second engine (.65)
 ]
 
 class _Delete:
@@ -348,8 +432,8 @@ def _toolchain_block(kind: str) -> str:
             .replace("@ON_FAULT@", on_fault).rstrip())
 
 # ---------------------------------------------------------------------------
-# SHARED CLI.  Ordered list of (group-comment, [tokens]).  Arms override by
-# flag name in `cli` (None deletes the flag).
+# SHARED CLI.  Ordered list of (flag, value).  Arms override by flag name in
+# `cli` (None = a bare store_true flag; _DELETE removes the flag).
 # ---------------------------------------------------------------------------
 
 SHARED_CLI = [
@@ -391,15 +475,19 @@ SHARED_CLI = [
     # THE TRAINED QUALITY CHANNEL.  auto means grad_cosine since 2026-09-02;
     # the explicit pin is redundant and kept on purpose.
     ("--quality-metric", "grad_cosine"),
-    # THE FACE ADD (ticket .56, finding 73).  lossy = both addends are forced
-    # into the container the approximated `new` slot landed on, the old edge
-    # projected onto it (graphax's MatchFreshJoin at the two-op entry's `jr`
-    # position; the pre-flight below VERIFIES graphax accepts the form),
-    # lossless = the sum's support is the UNION of the two supports and no
-    # non-zero is dropped.  NOT comparable across values.  The declared
-    # default, named so no arm inherits an unstated one; an arm overrides it
-    # in `cli`, or `arm_per_approx_add` emits it once per value.
-    ("--approx-add", "lossy"),
+    # THE FACE ADD (ticket .56, finding 73; owner ruling 2026-09-13): ONE
+    # value, APPROX_ADD = lossless, on every training arm -- the sum's support
+    # is the UNION of the two addends' supports and no non-zero is dropped
+    # (the pre-flight below VERIFIES graphax accepts the two-op form).  Named
+    # so no arm inherits an unstated default; `campaign_arm` refuses any
+    # other value.
+    ("--approx-add", APPROX_ADD),
+    # THE FIXED ORDER (ticket .64): the static minimum Markowitz degree order
+    # of the exact graph, one table (common/order.py) shared with the sweep.
+    # The ppo.py default since 2026-09-05; named so every fixed-order arm
+    # carries it on its own command line.  The order arms override it with
+    # `free`; `reverse` is the control of .60 only.
+    ("--fixed-order", "markowitz"),
     # THE MEASURE TOOLCHAIN GATE (finding 03).  abort is the default; named
     # so no arm can inherit a stale warn.  A SKIP IS A FAILURE.
     ("--measure-toolchain-gate", "abort"),
@@ -450,8 +538,16 @@ SHARED_CLI = [
     ("--scale-face-head", "0"),
     ("--set-pointer", None),
     ("--face-actions", None),
+    # ALWAYS ON with --face-actions (ppo.py only checks its precondition);
+    # still accepted, and named so the launcher states the masking it runs
+    # under rather than inheriting it.
+    ("--per-face-masks", None),
     ("--unified-face-head", None),
     ("--live-faces", None),
+    # The heads.py MicroActionPolicy (the ppo.py default; ppo.py REQUIRES it
+    # beside --face-actions --unified-face-head --live-faces when the KL
+    # trust region is on).  Named so the requirement is on the command line.
+    ("--dynamic-substeps", None),
     ("--hidden-dim", "256"),
     ("--vocab-size", "512"),
     ("--num-layers", "3"),
@@ -490,23 +586,10 @@ def arm(**kw):
     ARMS.append(kw)
 
 
-# The two face-ADD configurations of ticket .56 (finding 73 renamed them from
-# the retired `same` / `exact`, which named a DIFFERENT computation -- see
-# alphagrad.approx.env.approx_add).  The owner's ruling: both run at least
-# once, as ONE PAIRED PAIR on the all-rev arm of .50, not in every experiment.
-# `arm_per_approx_add` is how .43 emits that pair: one arm per value, the value
-# on the command line and in the name, everything else byte-identical.
-APPROX_ADD_CONFIGS = ("lossy", "lossless")
-
-
-def arm_per_approx_add(**kw):
-    """Emit ``kw`` once per --approx-add value: ``<name>_add<value>``."""
-    for cfg in APPROX_ADD_CONFIGS:
-        a = dict(kw)
-        a["name"] = f"{kw['name']}_add{cfg}"
-        a["job"] = f"{kw['job']}-add{cfg}"
-        a["cli"] = dict(kw.get("cli", {}), **{"--approx-add": cfg})
-        arm(**a)
+# (The `lossy` / `lossless` paired pair of ticket .56 -- `arm_per_approx_add`,
+# one arm per value on the all-rev arm -- was removed 2026-09-13: the owner
+# benched the learned join values and ruled ONE value, APPROX_ADD, everywhere.
+# `campaign_arm` raises on any other value.)
 
 
 # ===========================  WAVE 0  =======================================
@@ -897,8 +980,8 @@ earns its slot.
 
 THIS ARM: {_what}.
 
-The order is the --fixed-order argument (ticket .64; it was the import-time
-env var ALPHAGRAD_FORCE_REV_ORDER until 2026-09-05).
+The order is the --fixed-order argument (ticket .64; previously an
+import-time environment variable before 2026-09-05).
 
 WHAT LIFTING THE PIN COSTS.  Face count 115 (rev) -> ~313 (random), ~2.7x the
 face work; distinct edge keys 101 -> 206-286; the face stratum flips from
@@ -1055,7 +1138,7 @@ only the mask moves.  All three modes are already pinned rollout == replay by
 tests/face_read_point_test.py, so the PPO ratio is safe in every arm.
 
 WHAT IT FIXES.  Face f's chunk is [approx-echo(f-1) || header+contraction(f)],
-so chunk-mean produces the head's 94 logits from a token-count-weighted blend
+so chunk-mean produces the head's {FACE_HEAD_WIDTH} logits from a token-count-weighted blend
 of the PREVIOUS face's approximation with THIS face's contraction, and there is
 no type channel to separate them -- the head cannot tell how much of its
 pooled input came from the previous face.  own-span-mean masks the pooling at
@@ -1100,30 +1183,37 @@ not a launch.""",
 #
 # ONE ROW PER ARM (`campaign_arm(...)` calls below); the owner edits a row
 # or one of the MVP constants and regenerates.  Every campaign arm: the TLM
-# target, latency + static temp memory + grad-cosine, --discount 1.0
+# target, latency + static temp memory + grad-cosine (--mem-channel temp,
+# --quality-metric grad_cosine, --cost-form paired-log), --discount 1.0
 # --gae-lambda 1.0 --terminal-rewards-only --reward-mode additive
 # --advantage-norm none (SHARED_CLI; the P4 and L rows override ONE of them
-# by design), NO quality gate, ONE seed, 250 episodes, --plan-log auto, the
-# .45 gate telemetry (ppo.py emits it every episode; the launcher passes
-# --gate-winners-table), nodes pgi15-gpu15/16/18 only.  Phase order
-# (finding 53 Q27; ticket .55: the Reduce, Quant and Diag arms waited for
-# .16-.20, which have landed): SKIP-only -> all-rev -> Reduce -> Quant ->
-# Diag (HELD, ticket .25) -> order-only -> free; then phase 2 (channels),
-# 3 (P0 -> P1 -> L), 4 (PopArt), 5 (five seeds).
+# by design), the static Markowitz order (--fixed-order markowitz, .64;
+# `free` on the two order arms), --approx-add lossless (the ONE value),
+# --face-none-bias 4, NO quality gate, ONE seed, 250 episodes, --plan-log
+# auto, --ray-measure 1, the .45 gate telemetry (ppo.py emits it every
+# episode, no switch; the launcher passes --gate-winners-table), one 8-GPU
+# Blackwell job per node on pgi15-gpu19/20.  Phase order (finding 53 Q27;
+# ticket .55: the Reduce, Quant and Diag arms waited for .16-.20, which have
+# landed): SKIP-only -> Reduce -> Quant -> Diag -> order-only -> free; then
+# phase 2 (channels), 3 (P0 -> P1 -> L), 4 (PopArt), 5 (five seeds).
 #
-# THE OLD EDGE (ticket .56) runs as ONE PAIRED PAIR on the all-rev arm
-# (same / exact), not in every experiment.  "all-rev" is read as ALL
-# classes under the reverse pin -- the wave-1 shape ticket .50 names, and
-# the only phase-1 arm where the old-edge choice can act at all: a SKIP-only
-# or exact plan writes no rule into any slot, so `--approx-add` is inert
-# there (see the face_attrib env note).
+# PHASE-1 TABLE (ticket .50, owner ruling 2026-09-13): SKIP-only,
+# Reduce-only, Quant-only, Diag-only, order-only (the `none` profile of .40,
+# the one spelling of --no-approx-head), free (order + all classes).  The
+# all-rev x2 arms (the lossy / lossless pair of .56) are DROPPED: they
+# depended on the learned join values, which are benched.  Diag-only is
+# emitted as a live arm, not held: under the Markowitz order Diag is legal on
+# rhs 112/131, new 113/131 and old 14/14 TLM sites (finding 59, ticket .64),
+# which is the condition ticket .50 attached to it; ticket .25 (what Diag
+# MEANS on a scalar loss) is still open and is named in the arm's DEPENDS.
 #
-# NAMES encode the phase, the profile, the order (free = pin lifted; rev is
-# the default and unnamed), the face ADD, the channel set when not all
-# three, and the price: lq<lambda_q> for a fixed lambda, pref for
-# preference conditioning (P0), pref_tau<tau> for the floored P1, dual_tau
-# <tau> for the Lagrangian L.  p1c_all_addlossless_lq5 is phase 1, arm c, all
-# classes, reverse order, face ADD lossless, lambda_q = 5.
+# NAMES encode the phase, the profile, the order (free = pin lifted;
+# markowitz is the default and unnamed), the channel set when not all three,
+# and the price: lq<lambda_q> for a fixed lambda, pref for preference
+# conditioning (P0), pref_tau<tau> for the floored P1, dual_tau<tau> for the
+# Lagrangian L.  p1b_reduce_lq5 is phase 1, arm b, Reduce only, Markowitz
+# order, lambda_q = 5.  (The face ADD is no longer in the name: there is one
+# value.)
 #
 # INIT MVP (ticket .36 / finding 51 D.1; ALL TUNABLE, the owner's ruling):
 # --face-none-bias 4, --scale-face-head 0.1, --face-logit-clamp 15,
@@ -1133,12 +1223,165 @@ not a launch.""",
 FACE_NONE_BIAS_MVP = "4"
 SCALE_FACE_HEAD_MVP = "0.1"
 FACE_LOGIT_CLAMP_MVP = "15"
-LAMBDA_Q_MVP = "5"
-QUALITY_FLOOR_TAU = "0.9"
-# gpu17 has cuda-12.8 only and no 12.9 nvlink, so the toolchain block exits
-# 72 there (ticket .21); gpu16 needs the block and every launcher has it.
-CAMPAIGN_NODES = ("pgi15-gpu15", "pgi15-gpu18", "pgi15-gpu16")
+
+# ---------------------------------------------------------------------------
+# THE APPROVED REWARD (owner ruling 2026-09-13, from finding 63's measured
+# absorber).  NOT the finding-51 window: that window (3.95-6.8) was measured
+# on the REVERSE order with the WATERMARK memory channel, where the
+# skip-everything absorber gains almost nothing.  On the Markowitz order with
+# the static temp channel the absorber gains 9.8 nats, and finding 63 measures
+# the contrast
+#
+#     contrast = R(best feasible) - max(R(absorber), R(baseline))
+#
+# at lambda_q = 8 -> -0.7, 12 -> +1.9, 16 -> +1.9, 32 -> +1.9 (P1 hinge,
+# tau = 0.90, both channels floored at the rev-exact cost).  lambda_q = 16 is
+# 1.33x the 12 the absorber needs.  EVERY phase-1 arm carries it, and the
+# hinge with it: the `lq5` arms the generator emitted this morning passed
+# --lambda-acc 5 and NO quality floor, which finding 63 prices at
+# contrast -20.6 -- the absorber wins outright.
+# ---------------------------------------------------------------------------
+LAMBDA_Q_MVP = "16"
+QUALITY_FLOOR_TAU = "0.90"
+# Dual ascent (arm L only): lam <- clip(lam + eta*(violation - target), min, max).
+DUAL_ETA = "2.0"
+DUAL_LAMBDA_MIN = "12"
+DUAL_LAMBDA_MAX = "32"
 CAMPAIGN_SEED = "250197"
+
+# ---------------------------------------------------------------------------
+# GATE G6 (ticket .45): the pre-run offline contrast of ticket .42, by the
+# order the arm runs on.  Finding 63, at the approved lambda_q = 16 / tau =
+# 0.90 / P1 hinge with both channels floored at the rev-exact cost:
+#
+#   Markowitz  +1.9 nats, ~19 % of the absorber's 9.8-nat scale  -> 0.19
+#   reverse     0.0 nats: there is nothing to gain on that order -> 0.00
+#
+# THE FLOOR THIS ASSUMES IS NOT IN THE TRAINER YET.  env._MEM_LOG_FLOOR_BYTES
+# is still one byte, and --paired-cost-floor {byte,reference} is not in
+# make_argparser as of alphagrad 0863bd4.  Under the one-byte floor the same
+# configuration prices at contrast -13.4 on Markowitz.  The launchers carry
+# the APPROVED number and the pre-flight below says so, so a run that lands
+# before the floor change is not silently judged against a number its own
+# reward cannot reach.
+# ---------------------------------------------------------------------------
+GATE_OFFLINE_CONTRAST = {"markowitz": "0.19", "free": "0.19", "reverse": "0.00"}
+
+# The profiles of ticket .40 (ppo.py --approx-profile choices) and the orders
+# of ticket .64 (common/order.py FIXED_ORDER_CHOICES).  Typed here because
+# importing ppo.py costs a jax session; the campaign test cross-checks both
+# against make_argparser so a drift is caught, not trusted.
+PROFILES = ("all", "skip", "reduce", "quant", "diag", "none")
+FIXED_ORDERS = ("markowitz", "reverse", "free")
+
+# ---------------------------------------------------------------------------
+# THE CAMPAIGN HARDWARE (owner ruling 2026-09-13).  One sbatch per node, all
+# eight Blackwell GPUs of the node, on pgi15-gpu19 / pgi15-gpu20.  The trainer
+# takes device 0 (--gpus 0, the ppo.py default) and the --ray-measure actor
+# device 1 (ppo.py pins idx + 1 through RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_
+# DEVICES); holding the node is what makes the timed executions mean anything
+# (co-residency measured CV 0.0000% -> 49.7%).
+# ---------------------------------------------------------------------------
+CAMPAIGN_NODES = ("pgi15-gpu19", "pgi15-gpu20")
+CAMPAIGN_GPUS = 8
+CAMPAIGN_GRES = ("gpu:nvidia_rtx_pro_6000_blackwell_max-q_workstation_edition"
+                 f":{CAMPAIGN_GPUS}")
+CAMPAIGN_CPUS = 128
+CAMPAIGN_MEM = "800G"          # the nodes have 1.5 TB; 100 G per GPU
+CAMPAIGN_RAY_MEASURE = "1"
+CAMPAIGN_RAY_MEASURE_TIMEOUT = "600"
+
+# ---------------------------------------------------------------------------
+# THE CAMPAIGN STACK (finding 57).  The pgi15 GPU nodes mount NO home
+# directory (/Users/assmuth is ENOENT on gpu15..20 and cpu2); /Scratch is the
+# one writable filesystem every node and the head share.  So a campaign
+# launcher does not `cd ~/dsnn/alphagrad` and does not `uv run`: it runs the
+# relocated venv of finding 57 against alphagrad/graphax worktrees staged
+# under CAMPAIGN_STACK, with a node-local $HOME that receives the two wandb
+# credential files.  The pre-flight refuses (exit 66) when any of these is
+# missing.  The owner stages the stack once per campaign commit:
+#   git -C ~/dsnn/alphagrad worktree add --detach CAMPAIGN_STACK/alphagrad <sha>
+#   git -C ~/dsnn/graphax   worktree add --detach CAMPAIGN_STACK/graphax   <sha>
+# ---------------------------------------------------------------------------
+CAMPAIGN_ROOT = "/Scratch/assmuth/campaign"
+CAMPAIGN_STACK = f"{CAMPAIGN_ROOT}/stack"
+CAMPAIGN_RUNS = f"{CAMPAIGN_ROOT}/runs"
+CAMPAIGN_PY = "/Scratch/assmuth/t57/stack/venv/bin/python"
+CAMPAIGN_WANDB_HOME = "/Scratch/assmuth/t57/home"     # .netrc + .config/wandb
+CAMPAIGN_CACHE = "/Scratch/assmuth/mrg/cache"          # dsnn_wikitext, dsnn_mnist
+# GATE G1 (ticket .45) on a node without a home: the sweep winners are read
+# from /Scratch.  THE TABLE IS THE SWEEP64 ONE, BY ORDER (owner ruling
+# 2026-09-13): 4029 rows at q >= 0.80 on Markowitz, 2969 on reverse.  The
+# staged copy at {CAMPAIGN_ROOT}/sweep41/winners.csv is byte-for-byte the
+# sweep64 MARKOWITZ table under a name that says sweep41 -- a reverse-order
+# arm pointed at it would be scored against winners from the other order and
+# report a recovery that means nothing.  One table per order, named here.
+CAMPAIGN_GATE_WINNERS_TABLES = {
+    "markowitz": "/Scratch/assmuth/sweep64/runs/markowitz/winners.csv",
+    "reverse": "/Scratch/assmuth/sweep64/runs/reverse/winners.csv",
+    # The free-order arms start from the Markowitz pin and the reward signal
+    # lives on that order (finding 63); vertex ids are jaxpr equation indices
+    # and do not depend on the elimination order, so the Markowitz winner set
+    # is the meaningful one to recover.
+    "free": "/Scratch/assmuth/sweep64/runs/markowitz/winners.csv",
+}
+CAMPAIGN_GATE_WINNERS_TABLE = CAMPAIGN_GATE_WINNERS_TABLES["markowitz"]
+
+# ---------------------------------------------------------------------------
+# THE CAMPAIGN ENVIRONMENT (owner ruling 2026-09-13: args only).  A campaign
+# launcher exports EXACTLY three kinds of variable, and the campaign test
+# refuses any export outside them:
+#
+#   CAMPAIGN_ENV      the TLM target shape (the target's size comes from these,
+#                     not from --hidden-dim/--vocab-size/--num-layers, which
+#                     size the POLICY) and the three measurement-plumbing
+#                     variables the smoke runs under.  No XLA_*, no JAX_*.
+#   NO_FLAG_ENV       knobs that CHANGE THE RUN and still have no flag in
+#                     ppo.py.  Exported because the run is wrong or dead
+#                     without them, and named in a TODO block in the launcher
+#                     header so the departure from "args only" is never
+#                     silent.  Each entry carries its evidence.
+#   STACK_ENV         where the code, the data and the credentials are
+#                     (finding 57).  Plumbing, not knobs.
+# ---------------------------------------------------------------------------
+CAMPAIGN_ENV = [
+    ("ALPHAGRAD_TLM_SEQ", "32"),
+    ("ALPHAGRAD_TLM_DMODEL", "128"),
+    ("ALPHAGRAD_TLM_VOCAB", "1024"),
+    # --ray-measure requires it (ppo.py: "Requires ALPHAGRAD_BATCHED_CALLBACK=1").
+    ("ALPHAGRAD_BATCHED_CALLBACK", "1"),
+    ("RAY_TMPDIR", "/tmp/ray_$SLURM_JOB_ID"),
+    # Ray must leave the actor's CUDA_VISIBLE_DEVICES pin alone (ppo.py
+    # exports it into the actor's runtime_env too; the driver copy is what
+    # reaches Ray's worker startup).
+    ("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1"),
+]
+
+# (var, value, evidence) -- see NO_FLAG_ENV above.  Promote to a flag and
+# DELETE the row; the campaign test pins that every row is exported AND
+# named in the header's TODO block.
+NO_FLAG_ENV = [
+    ("ALPHAGRAD_POLICY", "palimpsa",
+     "the encoder backbone.  ppo.py make_argparser has no --policy flag; "
+     "ppo.py reads os.environ ALPHAGRAD_POLICY with default 'transformer' "
+     "and RAISES under --incremental-encode unless it is 'palimpsa' (the "
+     "delta observation needs the causal carry).  README 'there is no CLI "
+     "flag'."),
+    ("ALPHAGRAD_SKIP_COST_ANALYSIS", "1",
+     "skip Compiled.cost_analysis() per measurement: it leaks ~3.5 GB per "
+     "episode of C++ HloCostAnalysis state (env.py), which over 250 "
+     "episodes kills the job; the flops / bytes_accessed channels it feeds "
+     "are LOGGED, never trained (--rewards cmp mem acc).  No flag exists."),
+]
+
+STACK_ENV_NAMES = ("HOME", "PYTHONPATH", "DSNN_WIKITEXT_DIR", "DSNN_MNIST_DIR",
+                   "PATH")   # PATH: the measure toolchain block (finding 03)
+
+#: Every `export NAME=` a campaign launcher may contain.  The test derives the
+#: rendered set and asserts equality with this one.
+CAMPAIGN_ENV_ALLOWED = frozenset(
+    [k for k, _ in CAMPAIGN_ENV] + [k for k, _, _ in NO_FLAG_ENV]
+    + list(STACK_ENV_NAMES))
 
 # THE WINNERS.  None = not decided: the arm is emitted with a shell
 # placeholder the owner exports at submit time (the W1_BIAS pattern) and
@@ -1153,16 +1396,57 @@ _CHANNEL_TOKEN = {"cmp mem acc": "latmemq", "cmp acc": "latq", "mem acc": "memq"
 _FORMS = ("fixed", "P0", "P1", "L")
 _P1_PLACEHOLDER = "${P1_PROFILE:?export P1_PROFILE to the phase-1 winning profile}"
 
-CAMPAIGN_HEAD = """THE CAMPAIGN (tickets .50-.54) under the settled reward: three
-trained channels -- paired log-difference latency, paired log-difference
-static temp memory (both against rev-exact measured in the same actor, back
-to back; --cost-form paired-log, --mem-channel temp) and grad-cosine (raw, no
-gate, no clamp) -- terminal rewards only, gamma = GAE lambda = 1, additive,
-raw advantages, classic init with the MVP face-head init (--face-none-bias 4,
---scale-face-head 0.1, --face-logit-clamp 15), one seed, 250 episodes.  The
-gate G1-G6 telemetry of ticket .45 (paired/*, gate/g1..g6/*, measure/*) is
-logged every episode; G1 reads the sweep winners from --gate-winners-table
-and reports present = 0 while sweep .41 has not written it."""
+CAMPAIGN_HEAD = f"""THE CAMPAIGN (tickets .50-.54) under the APPROVED REWARD
+(owner ruling 2026-09-13, priced in finding 63): three trained channels --
+paired log-difference latency, paired log-difference static temp memory (both
+against rev-exact measured in the same actor, back to back; --cost-form
+paired-log, --mem-channel temp) and the P1 HINGE on grad-cosine
+(--quality-floor {QUALITY_FLOOR_TAU}, so slot 6 carries -max(0, tau - q)) --
+weighted --lambda-cmp 1 --lambda-mem 1 --lambda-acc {LAMBDA_Q_MVP}.  Terminal
+rewards only, gamma = GAE lambda = 1, additive, raw advantages, classic init
+with the MVP face-head init (--face-none-bias {FACE_NONE_BIAS_MVP},
+--scale-face-head {SCALE_FACE_HEAD_MVP}, --face-logit-clamp
+{FACE_LOGIT_CLAMP_MVP}), the static Markowitz order (--fixed-order markowitz,
+ticket .64) unless the row lifts it, the face ADD --approx-add {APPROX_ADD}
+(the one value), one seed, 250 episodes.
+
+WHY lambda_q = {LAMBDA_Q_MVP} AND NOT 5.  Finding 63 measured the
+skip-everything absorber on THIS order and THIS channel: it gains 9.8 nats,
+and the contrast R(best feasible) - max(R(absorber), R(baseline)) is -20.6 at
+lambda_q = 8 without a floor, -0.7 at 8 with one, +1.9 from 12 up.  The
+finding-51 window (3.95-6.8) was measured on the REVERSE order with the
+WATERMARK channel, where the absorber gains nothing; it does not transfer.
+{LAMBDA_Q_MVP} is 1.33x the 12 the Markowitz absorber needs.
+
+THE COST FLOOR THIS ASSUMES IS NOT IN THE TRAINER YET.  Finding 63's numbers
+floor BOTH cost channels at the paired rev-exact cost before the log;
+env._MEM_LOG_FLOOR_BYTES is still one byte and there is no
+--paired-cost-floor flag in make_argparser.  Under the one-byte floor the
+same configuration prices at contrast -13.4 on Markowitz -- the absorber
+wins.  Do not read a phase-1 result as a reward-design result until that
+lands (ticket .9).
+
+THE FACE HEAD is one flat MLP of {FACE_HEAD_WIDTH} logits (derived from
+alphagrad.approx.unified_face_head.head_layout({APPROX_ADD!r}).width at
+generation time, never typed): three {(FACE_HEAD_WIDTH - 1) // 3}-wide slot
+blocks, each with a four-way Quant dtype softmax over
+{", ".join(FACE_QUANT_DTYPES)} (the operand's own dtype is masked, ticket
+.40 D4); no flag selects the dtype set.
+
+MEASUREMENT: --ray-measure {CAMPAIGN_RAY_MEASURE} actor on its own GPU
+(timeout {CAMPAIGN_RAY_MEASURE_TIMEOUT} s), ALPHAGRAD_BATCHED_CALLBACK=1,
+all {CAMPAIGN_GPUS} GPUs of the node held by this job.
+
+THE GATE G1-G6 TELEMETRY of ticket .45 (paired/*, gate/g1..g6/*, measure/*)
+has NO switch: ppo.py's host_log computes it from the drained plan records
+every episode (alphagrad.approx.common.gate_telemetry.episode_fields; field
+table docs/GATE_TELEMETRY.md).  The launcher supplies the TWO inputs the
+trainer cannot measure for itself: --gate-winners-table (G1, the sweep64
+table for THIS arm's order) and --gate-offline-contrast (G6, finding 63's
+pre-run number for this reward on this order).  measure/drain/* audits that
+the plans the measure actors counted are the plans these fields were
+computed from (ticket .7): measure/drain/ok = 0 means a counter is being
+read in a process that does not own it and every panel understates."""
 
 CAMPAIGN_P1_PREDICTION = """REGISTERED BEFORE THE RUN (finding 51 D.1, ticket .50);
 NEVER EDITED AFTERWARDS.  Episode-0 survivors (q > 0 plans) >= 75 percent of
@@ -1171,32 +1455,66 @@ HELD (present in >= 20 percent of plans) at ep100 and at ep250.  Fail =
 identity drift, which confirms the objective, not the init, as the blocker."""
 
 
+class CampaignRowError(ValueError):
+    """A campaign row asks for something the owner's rulings forbid or the
+    trainer does not have.  Raised, never rendered: a launcher that quietly
+    drops or substitutes a flag is the failure this generator exists to end."""
+
+
+def _require(cond: bool, msg: str) -> None:
+    if not cond:
+        raise CampaignRowError(msg)
+
+
 def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
                  prediction: str, falsifier: str,
-                 order: str = "markowitz", approx_add: str = "lossy",
+                 order: str = "markowitz", approx_add: str = APPROX_ADD,
                  rewards: str = "cmp mem acc", form: str = "fixed",
                  lambda_q: str = LAMBDA_Q_MVP, advantage_norm: str = "none",
                  seed: str = CAMPAIGN_SEED, time: str | None = None,
                  held: str | None = None, depends: str | None = None) -> dict:
-    """One row of the campaign table -> one `arm(...)`.  Returns the arm."""
-    assert order in ("markowitz", "reverse", "free"), order
-    assert approx_add in APPROX_ADD_CONFIGS, approx_add
-    assert form in _FORMS, form
-    assert rewards in _CHANNEL_TOKEN, rewards
-    assert advantage_norm in ("none", "popart"), advantage_norm
-    assert node in CAMPAIGN_NODES, node
+    """One row of the campaign table -> one `arm(...)`.  Returns the arm.
+
+    Raises :class:`CampaignRowError` on a row outside the rulings: an order
+    not in FIXED_ORDERS, a profile not in PROFILES (or WINNER), a face ADD
+    other than APPROX_ADD, a node off the campaign nodes, an unknown reward
+    form / channel set / advantage normalisation.
+    """
+    _require(order in FIXED_ORDERS,
+             f"order {order!r} is not one of {FIXED_ORDERS} (ticket .64)")
+    _require(approx_add == APPROX_ADD,
+             f"--approx-add {approx_add!r} is not allowed: owner ruling "
+             f"2026-09-13 runs every arm on {APPROX_ADD!r} only (the learned "
+             f"join values are benched, the lossy/lossless pair is dropped)")
+    _require(profile == "WINNER" or profile in PROFILES,
+             f"profile {profile!r} is not one of {PROFILES} or WINNER (.40)")
+    _require(form in _FORMS, f"form {form!r} is not one of {_FORMS}")
+    _require(rewards in _CHANNEL_TOKEN,
+             f"rewards {rewards!r} is not one of {tuple(_CHANNEL_TOKEN)}")
+    _require(advantage_norm in ("none", "popart"),
+             f"advantage_norm {advantage_norm!r} is not none|popart")
+    _require(node in CAMPAIGN_NODES,
+             f"node {node!r} is not one of {CAMPAIGN_NODES} (one 8-GPU "
+             f"Blackwell job per node, owner ruling 2026-09-13)")
+    _require(bool(what and prediction and falsifier),
+             "every campaign row carries what, prediction and falsifier")
     if profile == "WINNER":
         prof_tok = P1_WINNER_PROFILE or "winner"
         prof_val = P1_WINNER_PROFILE or _P1_PLACEHOLDER
     else:
         prof_tok = prof_val = profile
-    tau_tok = QUALITY_FLOOR_TAU.replace(".", "")
-    lam_tok = {"fixed": f"lq{lambda_q}", "P0": "pref",
-               "P1": f"pref_tau{tau_tok}", "L": f"dual_tau{tau_tok}"}[form]
+    tau_tok = QUALITY_FLOOR_TAU.replace(".", "").rstrip("0") or "0"
+    # THE NAME STATES THE REWARD IT RUNS.  `fixed` is no longer "raw quality
+    # at lambda_q": it is the approved P1 HINGE at tau, so it says so.  An arm
+    # named lq5 that passes --lambda-acc 16, or named lq16 with no floor,
+    # is the drift this token exists to prevent.
+    lam_tok = {"fixed": f"hinge_tau{tau_tok}_lq{lambda_q}",
+               "P0": f"pref_lq{lambda_q}",
+               "P1": f"pref_tau{tau_tok}_lq{lambda_q}",
+               "L": f"dual_tau{tau_tok}_eta{DUAL_ETA.replace('.', '')}"}[form]
     name = f"p{phase}{tag}_{prof_tok}"
     if order != "markowitz":
         name += f"_{order}"
-    name += f"_add{approx_add}"
     if rewards != "cmp mem acc":
         name += f"_{_CHANNEL_TOKEN[rewards]}"
     name += f"_{lam_tok}"
@@ -1218,18 +1536,50 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
         "--scale-face-head": SCALE_FACE_HEAD_MVP,
         "--face-logit-clamp": FACE_LOGIT_CLAMP_MVP,
         "--rewards": rewards,
+        # THE APPROVED CHANNEL WEIGHTS (owner ruling 2026-09-13, finding 63).
         "--lambda-cmp": "1",
         "--lambda-mem": "1",
         "--lambda-acc": lambda_q,
+        # THE P1 HINGE, ON EVERY ARM.  Reward slot 6 carries
+        # -max(0, tau - q) instead of raw q (ticket .9).  This is the form
+        # finding 63 priced: without it the skip-everything absorber outscores
+        # every honest plan by 20+ nats and the arm learns to allocate
+        # nothing.  Phase 3's P0 arm is the ONE arm that lifts it, and it
+        # lifts it on purpose, as its question.
+        "--quality-floor": QUALITY_FLOOR_TAU,
+        # THE MEASUREMENT (owner ruling 2026-09-13): one Ray measure actor
+        # on its own GPU, the node held by this job.
+        "--ray-measure": CAMPAIGN_RAY_MEASURE,
+        "--ray-measure-timeout": CAMPAIGN_RAY_MEASURE_TIMEOUT,
+        # THE GATE .45 INPUTS, the two the trainer cannot measure for itself.
+        # G1's winners table is inherited from SHARED_CLI and resolved from
+        # this arm's --fixed-order by `_merge_cli` (ONE mechanism, so a wave
+        # arm cannot get a different rule from a campaign arm); it lives on
+        # /Scratch because the GPU nodes mount no home (finding 57).
+        # G6's pre-run number (finding 63), so the run carries the contrast
+        # it is judged against instead of reading NaN.
+        "--gate-offline-contrast": GATE_OFFLINE_CONTRAST[order],
     }
     if form in ("P0", "P1", "L"):
         cli["--preference-conditioned"] = None
-    if form in ("P1", "L"):
-        cli["--quality-floor"] = QUALITY_FLOOR_TAU
+    if form == "P0":
+        # THE ONE ARM WITHOUT THE FLOOR: P0 is raw quality by definition
+        # (finding 63's P0 form), and phase 3 exists to compare it against
+        # the hinge.  Deleted rather than overwritten so the launcher does
+        # not carry a flag whose value contradicts its name.
+        cli["--quality-floor"] = _DELETE
     if form == "L":
-        # Lambda by dual ascent (--lag-*, ppo.py defaults); --lambda-acc is
-        # ignored in this mode and --quality-floor sets --lag-tau.
+        # Lambda by dual ascent; --lambda-acc is ignored in this mode and
+        # --quality-floor sets --lag-tau.  eta 2.0 with lambda in [12, 32]
+        # (owner ruling 2026-09-13): one episode of full violation
+        # (q = 0 at tau = 0.90) raises lambda by 1.8, and the floor of 12 is
+        # the smallest weight that puts the Markowitz absorber below the
+        # baseline (finding 63).
         cli["--reward-mode"] = "lagrangian"
+        cli["--lag-eta"] = DUAL_ETA
+        cli["--lag-min"] = DUAL_LAMBDA_MIN
+        cli["--lag-max"] = DUAL_LAMBDA_MAX
+        cli["--lag-init"] = lambda_q
     if advantage_norm == "popart":
         # The recorded trap (ticket .53): --no-symlog must be set with
         # PopArt, and the three symlog sites must agree.  --symlog-channels
@@ -1237,11 +1587,14 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
         cli["--advantage-norm"] = "popart"
         cli["--no-symlog"] = None
         cli["--symlog-channels"] = "none"
+    # No per-arm env: the campaign environment is CAMPAIGN_ENV + NO_FLAG_ENV
+    # + the stack plumbing, rendered by `render` for runtime "scratch", and
+    # nothing else (owner ruling 2026-09-13: args only).
     env: dict = {}
     a = dict(
-        name=name, job=job, kind="train", node=node,
+        name=name, job=job, kind="train", runtime="scratch", node=node,
         time=time or ("24:00:00" if order == "free" else "12:00:00"),
-        gpus=4, env=env, cli=cli, phase=phase,
+        gpus=CAMPAIGN_GPUS, env=env, cli=cli, phase=phase,
         purpose=CAMPAIGN_HEAD + f"\n\nPHASE {phase}, ARM {name}: {what}",
         prediction=prediction, falsifier=falsifier,
     )
@@ -1258,146 +1611,121 @@ def campaign_arms() -> list[dict]:
 
 
 # ---------------------------  PHASE 1 (ticket .50)  --------------------------
-# Class ablation, one seed each.  Reverse pin on, so ONLY the approximations
-# are learned, except the two order arms.
+# Class ablation, one seed each, on the static Markowitz order (ticket .64),
+# so ONLY the approximations are learned -- except the two order arms, which
+# lift the pin.  THE TABLE IS THIS TUPLE: (tag, profile, order, what,
+# prediction, falsifier, depends); `campaign_arm` turns each row into an arm,
+# and the nodes alternate gpu19 / gpu20 by row.  The campaign test pins the
+# rendered arm list against this tuple's tags and profiles.
 _P1_FALSIFIER = """If the arm drifts to identity (approx_prob/none > 0.99 and no
 plan outside the drift floor by ep100) or collapses to q = 0 for the majority
 of plans, the CLASS is not where the objective's contrast lives; say so, do
 not retune the init on this arm."""
 
-campaign_arm(
-    phase=1, tag="a", profile="skip", node=CAMPAIGN_NODES[0],
-    what="""SKIP-ONLY (--approx-profile skip).  The first arm of the campaign
+_P1_FIDELITY_DEP = ("ticket .55: the fidelity fixes .17-.20 (landed on the "
+                    "integration branch)")
+
+PHASE1_TABLE = (
+    ("a", "skip", "markowitz",
+     """SKIP-ONLY (--approx-profile skip).  The first arm of the campaign
 and the class the archived wins belong to: every archived winner at ratio
 0.52-0.58 carries ONE face wire and zero applied rules (the win IS a skip).
 Reduce, Quant and Diag are masked; the face head chooses skip / none.""",
-    prediction=CAMPAIGN_P1_PREDICTION + """
+     CAMPAIGN_P1_PREDICTION + """
   * this arm finds the one-face SKIP band (1-15 skips per plan) and holds a
     plan at paired latency ratio <= 0.6 with q >= 0.9; the static temp ratio
-    stays at 1.0 within the drift floor (a skip on the reverse order does
-    not move XLA temp on TLM; finding 05).""",
-    falsifier=_P1_FALSIFIER,
-)
-
-for _tag, _old in (("b", "lossy"), ("c", "lossless")):
-    campaign_arm(
-        phase=1, tag=_tag, profile="all", approx_add=_old,
-        node=CAMPAIGN_NODES[1 if _old == "lossy" else 2],
-        what=f"""ALL-REV, face ADD {_old.upper()} (--approx-add {_old}).  Every
-class legal under the reverse pin -- the wave-1 shape under the new reward,
-and the class-ablation reference the single-class arms are read against.
-The paired pair of ticket .56: p1b (lossy) and p1c (lossless) are
-byte-identical except for --approx-add; they are NOT comparable as a reward
-difference (the choice changes the measured object) but as a pair they show
-whether forcing the ADD's two addends into one container -- instead of keeping
-the union of their supports -- moves the temp or the quality of the same
-plans.""",
-        prediction=CAMPAIGN_P1_PREDICTION + f"""
-  * this arm does NO BETTER on paired latency than p1a (SKIP-only): the
-    latency wins are skips, and the extra classes buy temp (Reduce) or
-    nothing (Diag, finding 54) at a quality price.
-  * face ADD {_old}: lossy and lossless differ in paired/temp_ratio_* and
-    paired/grad_cosine_* for plans carrying Reduce or Quant rules, and are
-    identical for SKIP-only plans (the old edge is inert without a rule).""",
-        falsifier=_P1_FALSIFIER + """
-If p1b and p1c are indistinguishable on every paired panel, the old edge is
-inert on this target at this init and ticket .56's pair is answered: run
-'same' only from then on.""",
-    )
-
-campaign_arm(
-    phase=1, tag="d", profile="reduce", node=CAMPAIGN_NODES[0],
-    depends="ticket .55: the fidelity fixes .17-.20 (landed on the integration branch)",
-    what="""REDUCE-ONLY (--approx-profile reduce).  The class where the memory
+    stays at 1.0 within the drift floor (a skip does not move XLA temp on
+    TLM; finding 05, re-read under the Markowitz order by .63).""",
+     _P1_FALSIFIER,
+     None),
+    ("b", "reduce", "markowitz",
+     """REDUCE-ONLY (--approx-profile reduce).  The class where the memory
 saving is (finding 05: 110/114 applied, 0.79x XLA temp on TLM).  Reduce axes
 are physical val axes decoded per slot (--reduce-axis-space physical;
 tickets .18, .20).""",
-    prediction=CAMPAIGN_P1_PREDICTION + """
+     CAMPAIGN_P1_PREDICTION + """
   * this is the arm that moves the TEMP channel: a plan at
     paired/temp_ratio_best <= 0.8 with q >= 0.9 by ep50, and the latency
     ratio inside 1.0 +/- the drift floor (Reduce saves bytes, not time).""",
-    falsifier=_P1_FALSIFIER + """
+     _P1_FALSIFIER + """
 If paired/temp_ratio_best never leaves the drift floor over 250 episodes,
-the temp channel has no reachable contrast under the reverse pin and phase
+the temp channel has no reachable contrast under the Markowitz pin and phase
 2's memory+q arm is CANCELLED as answered.""",
-)
-
-campaign_arm(
-    phase=1, tag="e", profile="quant", node=CAMPAIGN_NODES[1],
-    depends="ticket .55: the fidelity fixes .17-.20 (landed on the integration branch)",
-    what="""QUANT-ONLY (--approx-profile quant).  f32 <-> bf16 only; the
-operand's own dtype is illegal (ticket .40 D4), so every Quant action
-changes the stored dtype.  Pullup (GRAPHAX_QUANT_PULLDOWN=0): the
-approximation itself pays, not bf16-native compute.""",
-    prediction=CAMPAIGN_P1_PREDICTION + """
+     _P1_FIDELITY_DEP),
+    ("c", "quant", "markowitz",
+     f"""QUANT-ONLY (--approx-profile quant).  Four target dtypes
+({", ".join(FACE_QUANT_DTYPES)}); the operand's own dtype is illegal
+(ticket .40 D4), so every Quant action changes the stored dtype.  Pullup:
+the approximation itself pays, not bf16-native compute.""",
+     CAMPAIGN_P1_PREDICTION + """
   * NO q = 0 plan in this arm (quant@all reads q ~ 0.93, finding 51 D.2);
     the best plan is a mild latency win (ratio ~ 0.95) at q > 0.9, and the
-    temp ratio moves below 1 (bf16 halves the stored bytes it touches).""",
-    falsifier=_P1_FALSIFIER + """
+    temp ratio moves below 1 (a narrower dtype halves or quarters the
+    stored bytes it touches).""",
+     _P1_FALSIFIER + """
 If gate/g4/q_zero_frac > 0.1 in this arm, a Quant rule destroys the
 gradient on some face: that is a fidelity defect (ticket .16 class), not a
 class result, and the arm is stopped and the plan log handed to .16.""",
-)
-
-campaign_arm(
-    phase=1, tag="f", profile="diag", node=CAMPAIGN_NODES[2],
-    held="""Ticket dsnn-3qm.25 (what Diag means on a scalar-loss target) is
-an OWNER DECISION PENDING.  Findings 52 and 54: under the reverse order Diag
-has an out-primal pair only on the lhs slot (111 of 114 TLM sites, 23 free
-of coupling); rhs, new and old have empty out lists, so no Diag fires on a
-stored slot.  Ticket .60 (Markowitz order) tests whether Diag becomes useful
-under a non-reverse order before .25 is ruled.  This launcher exits 73
-until the owner removes held= from its row.""",
-    depends="tickets .25 (owner ruling) and .55",
-    what="""DIAG-ONLY (--approx-profile diag).  Emitted so the table is
-complete and the arm is one regeneration from launch; HELD (see above).
-If released as a NEGATIVE CONTROL it is read for temp and quality moving
-NOT AT ALL on the 23 free lhs sites (finding 54, option B of .25).""",
-    prediction=CAMPAIGN_P1_PREDICTION + """
-  * as a negative control: paired/temp_ratio_* and paired/lat_ratio_* stay
-    inside the drift floor for every plan; gate/g1/recovery_diag is NaN or 0;
-    the face head's Diag mass is spent on actions that change nothing.""",
-    falsifier="""If Diag moves the temp ratio outside the drift floor on any
-stored slot under the reverse order, findings 52 and 54 are wrong and .25
-must be re-opened on that record.""",
-)
-
-campaign_arm(
-    phase=1, tag="g", profile="none", order="free", node=CAMPAIGN_NODES[0],
-    what="""ORDER-ONLY (--approx-profile none; the pointer head live,
+     _P1_FIDELITY_DEP),
+    ("d", "diag", "markowitz",
+     """DIAG-ONLY (--approx-profile diag).  Under the static Markowitz order
+Diag has an out-primal pair on rhs 112/131, new 113/131 and old 14/14 TLM
+sites (finding 59) -- the condition ticket .50 attached to this arm, which
+the reverse order never met (findings 52, 54: lhs only, 23 free sites).
+Read for whether a Diag on a STORED slot moves temp at a quality price.""",
+     CAMPAIGN_P1_PREDICTION + """
+  * Diag on stored slots moves paired/temp_ratio_* below 1 on some plans
+    (a block-diagonal stores fewer cells) at a quality price that keeps the
+    best plan under q = 0.9; gate/g1/recovery_diag is defined (not NaN)
+    because the Markowitz sweep of .63 has Diag winners to recover.""",
+     _P1_FALSIFIER + """
+If no Diag action changes temp or quality outside the drift floor on any
+stored slot, Diag is inert on TLM under this order too and .25 is answered
+by measurement: keep it in the action space as a documented no-op.""",
+     "ticket .25 (what Diag MEANS on a scalar loss: still open; this arm "
+     "measures it under the Markowitz order) and .55"),
+    ("e", "none", "free",
+     """ORDER-ONLY (--approx-profile none; the pointer head live,
 --fixed-order free).  --approx-profile none removes the
-approximation heads (equivalent to --no-approx-head): the pure elimination-
-order control.  The axis with real range: across orders the temp channel
-spans ~80x while under the pin every archived winner reads 1.0000 (wave 2
-text).  Each distinct order pays its own rev-exact pairing, hence 24 h.""",
-    prediction="""REGISTERED BEFORE THE RUN; NEVER EDITED AFTERWARDS.
+approximation heads (the one spelling of --no-approx-head): the pure
+elimination-order control.  The axis with real range: across orders the
+temp channel spans ~80x while under a pin every archived winner reads
+1.0000 (wave 2 text).  Each distinct order pays its own rev-exact pairing,
+hence 24 h.""",
+     """REGISTERED BEFORE THE RUN; NEVER EDITED AFTERWARDS.
   * at least one plan whose paired latency ratio against rev-exact is below
-    0.95 and whose temp ratio is below 0.5 by ep100 -- or, if reverse is
-    unbeatable on TLM, every plan sits at or above 1.0 on both channels and
-    the policy converges to the reverse order (gate/g5/n_rev_exact rises
-    toward 16 per episode).""",
-    falsifier="""If no plan beats rev-exact outside the drift floor over 250
+    0.95 and whose temp ratio is below 0.5 by ep100 -- or, if no order beats
+    rev-exact on TLM, every plan sits at or above 1.0 on both channels and
+    the policy converges to one order (gate/g5/n_rev_exact rises toward 16
+    per episode).""",
+     """If no plan beats rev-exact outside the drift floor over 250
 episodes, reverse is optimal-or-unbeatable-by-this-policy on TLM and the
-order axis is CLOSED for this campaign; the free arm p1h is then read as
-p1b plus noise, not as a two-lever result.""",
-)
-
-campaign_arm(
-    phase=1, tag="h", profile="all", order="free", node=CAMPAIGN_NODES[1],
-    depends="p1b (all-rev) and p1g (order-only): the two halves it is read against",
-    what="""FREE (order + all classes; --approx-profile all, the pin
-lifted).  Both levers.  Read ONLY against p1b (same classes, pinned) and
-p1g (same order freedom, no classes); every other pair is a two-knob
-difference.""",
-    prediction="""REGISTERED BEFORE THE RUN; NEVER EDITED AFTERWARDS.
-  * p1h does NO BETTER than the better of p1b and p1g on either paired
-    channel: the approximation wins are attached to faces of the reverse
-    elimination and do not survive reordering, and reordering pays a face
-    count ~2.7x higher (115 -> ~313 faces) for the same rules.""",
-    falsifier="""If p1h beats BOTH halves outside the drift floor on the same
+order axis is CLOSED for this campaign; the free arm p1f is then read as
+the class arms plus noise, not as a two-lever result.""",
+     None),
+    ("f", "all", "free",
+     """FREE (order + all classes; --approx-profile all, the pin
+lifted).  Both levers.  Read ONLY against the single-class arms (same
+order pin, one class each) and p1e (same order freedom, no classes); every
+other pair is a two-knob difference.""",
+     """REGISTERED BEFORE THE RUN; NEVER EDITED AFTERWARDS.
+  * p1f does NO BETTER than the better of the best class arm and p1e on
+    either paired channel: the approximation wins are attached to faces of
+    one elimination order and do not survive reordering, and reordering
+    pays a face count ~2.7x higher (115 -> ~313 faces) for the same rules.""",
+     """If p1f beats BOTH halves outside the drift floor on the same
 plans, order and approximation compose and the phase-2 channel arms run on
 the free profile rather than the pinned one; say so before phase 2 starts.""",
+     "p1a-p1d (the class arms) and p1e (order-only): the halves it is read "
+     "against"),
 )
+
+for _i, (_tag, _prof, _order, _what, _pred, _fals, _dep) in enumerate(PHASE1_TABLE):
+    campaign_arm(
+        phase=1, tag=_tag, profile=_prof, order=_order,
+        node=CAMPAIGN_NODES[_i % len(CAMPAIGN_NODES)],
+        what=_what, prediction=_pred, falsifier=_fals, depends=_dep,
+    )
 
 # ---------------------------  PHASE 2 (ticket .51)  --------------------------
 # Channel arms on the phase-1 winner: each cost channel alone with quality,
@@ -1433,7 +1761,7 @@ for _tag, _form, _node, _what in (
      f"P1: --preference-conditioned --quality-floor {QUALITY_FLOOR_TAU} (2-D "
      "front; slot 6 is the hinge -max(0, tau - q), so the third weight "
      "prices violations only)."),
-    ("c", "L", CAMPAIGN_NODES[2],
+    ("c", "L", CAMPAIGN_NODES[0],
      f"L: --reward-mode lagrangian --preference-conditioned --quality-floor "
      f"{QUALITY_FLOOR_TAU}: the Dirichlet runs over (latency, memory) only "
      "and lambda, the dual variable ascended once per episode on the mean "
@@ -1488,7 +1816,7 @@ does not, the finding-51 reading is wrong and must be re-stated.""",
 for _i, _seed in enumerate(FIVE_SEEDS):
     campaign_arm(
         phase=5, tag="abcde"[_i], profile="WINNER", rewards=P2_WINNER_CHANNELS,
-        form=P3_WINNER_FORM, seed=_seed, node=CAMPAIGN_NODES[_i % 3],
+        form=P3_WINNER_FORM, seed=_seed, node=CAMPAIGN_NODES[_i % len(CAMPAIGN_NODES)],
         depends="phases 1-4 (the winner constants); one node per seed, one ppo job per node",
         what=f"""FIVE SEEDS, seed {_seed} ({_i + 1} of 5).  The distribution
 claim: no result of this campaign is reported as a distribution before all
@@ -1589,7 +1917,7 @@ COMMON="--example TransformerLM --dataset wikitext2 \
  --exec-on-gpu \
  --cmp-type latency --mem-type peak_memory \
  --num-data-points 5 --reps-per-point 4 \
- --quality-metric grad_cosine --approx-add lossy --walk-steps 200 \
+ --quality-metric grad_cosine --approx-add @APPROX_ADD@ --walk-steps 200 \
  --out-dir $OUT"
 
 run_on () {   # $1 = gpu index, $2 = label, rest = args
@@ -1632,7 +1960,7 @@ echo "FACE ATTRIBUTION DONE $(date). alphagrad $AG_SHA graphax $GX_SHA"
 ls -la $OUT
 echo "=========================================================="
 """.replace("@TOOL@", LANDSCAPE_TOOL).replace("@REPO@", REPO) \
-   .replace("@HOME_DSNN@", HOME_DSNN)
+   .replace("@HOME_DSNN@", HOME_DSNN).replace("@APPROX_ADD@", APPROX_ADD)
 
 
 arm(
@@ -1658,13 +1986,14 @@ arm(
         # AND cheapest.  Relevant here because this arm's quality channel IS
         # grad_cosine.
         "ALPHAGRAD_GRAD_COSINE_K": "1",
-        # --approx-add is left at the shared default (lossy).  The
-        # hand-written predecessor forced the old edge EXACT because the
-        # PINNED graphax 4ea0bf8 rejects the res-slot two-op form; the live
-        # graphax accepts it (e5fd46c) and the two-op pre-flight above
-        # VERIFIES that before any phase runs.  It is inert for QB in any
-        # case -- a SKIP-only plan writes no rule into any slot, so there is
-        # no approximated contraction for the ADD to reconcile against.
+        # --approx-add is APPROX_ADD (lossless), the one value every arm
+        # runs.  The hand-written predecessor forced the old edge EXACT
+        # because the PINNED graphax 4ea0bf8 rejects the res-slot two-op
+        # form; the live graphax accepts it (e5fd46c) and the two-op
+        # pre-flight above VERIFIES that before any phase runs.  It is
+        # inert for QB in any case -- a SKIP-only plan writes no rule into
+        # any slot, so there is no approximated contraction for the ADD to
+        # reconcile against.
         #
         # ---- DROPPED FROM THE TRAINING STACK -----------------------------
         # SHARED_ENV describes ppo.py.  One of these does not merely add noise
@@ -1764,6 +2093,21 @@ def _merge_cli(overrides: dict) -> list[tuple[str, str | None]]:
         if flag in seen or val is _DELETE:
             continue
         merged.append((flag, val))
+    # G1's table follows the arm's own order (see GATE_WINNERS_TABLE).  Done
+    # after the merge so the order an arm OVERRIDES is the one that decides.
+    order = dict(merged).get("--fixed-order")
+    if any(isinstance(v, _ByOrder) for _, v in merged):
+        try:
+            table = CAMPAIGN_GATE_WINNERS_TABLES[order]
+        except KeyError:
+            raise ValueError(
+                f"--fixed-order {order!r} has no gate G1 winners table. "
+                f"Known: {sorted(CAMPAIGN_GATE_WINNERS_TABLES)}. An arm whose "
+                f"order has no sweep must not silently inherit another "
+                f"order's winners -- G1 would report a recovery against "
+                f"opportunities this run never had.") from None
+        merged = [(f, table if isinstance(v, _ByOrder) else v)
+                  for f, v in merged]
     return merged
 
 
@@ -1790,13 +2134,83 @@ def cli_tokens(a: dict) -> list[str]:
     return toks
 
 
+def is_scratch(a: dict) -> bool:
+    """True for an arm that runs on the /Scratch stack of finding 57 (every
+    campaign arm); False for the home-directory runtime of the wave arms."""
+    return a.get("runtime", "home") == "scratch"
+
+
+def _python(a: dict) -> str:
+    """The interpreter invocation of this arm's runtime."""
+    return "$PY" if is_scratch(a) else "uv run --no-sync python"
+
+
+def _repo_paths(a: dict) -> tuple[str, str]:
+    """(alphagrad checkout, graphax checkout) the launcher runs against."""
+    if is_scratch(a):
+        return f"{CAMPAIGN_STACK}/alphagrad", f"{CAMPAIGN_STACK}/graphax"
+    return "~/dsnn/alphagrad", "~/dsnn/graphax"
+
+
+def _scratch_stack_block() -> list[str]:
+    """The environment of a campaign arm: the stack, the plumbing, the TLM
+    shape, the measurement vars, the no-flag knobs.  Nothing else."""
+    L = [
+        "# ---------------------- THE STACK (finding 57) ------------------------",
+        "# The pgi15 GPU nodes mount NO home directory; /Scratch is the one",
+        "# filesystem every node and the head share.  66 = the stack, the venv,",
+        "# the data cache or the wandb credentials are not staged on it.",
+        f"PY={CAMPAIGN_PY}",
+        f'for P in "$PY" {CAMPAIGN_STACK}/alphagrad/src/alphagrad/approx/ppo.py \\',
+        f"         {CAMPAIGN_STACK}/graphax/src/graphax {CAMPAIGN_WANDB_HOME}/.netrc \\",
+        f"         {CAMPAIGN_CACHE}/dsnn_wikitext; do",
+        '  [ -e "$P" ] || { echo "ABORT(66): $P does not exist -- stage the'
+        ' campaign stack (finding 57; CAMPAIGN_STACK in'
+        ' tools/gen_fq_launchers.py) before submitting"; exit 66; }',
+        "done",
+        "# A node-local HOME with the two wandb credential files copied in",
+        "# (finding 57 sec 3): wandb online needs .netrc, nothing else lives here.",
+        "export HOME=/tmp/fq_home_$SLURM_JOB_ID",
+        'mkdir -p "$HOME"',
+        f'cp -r {CAMPAIGN_WANDB_HOME}/. "$HOME/"',
+        'chmod 600 "$HOME/.netrc"',
+        f"export PYTHONPATH={CAMPAIGN_STACK}/graphax/src:{CAMPAIGN_STACK}/alphagrad/src",
+        f"export DSNN_WIKITEXT_DIR={CAMPAIGN_CACHE}/dsnn_wikitext",
+        f"export DSNN_MNIST_DIR={CAMPAIGN_CACHE}/dsnn_mnist",
+        f"cd {CAMPAIGN_STACK}/alphagrad",
+        "",
+        "# ---------------------- THE ENVIRONMENT (args only) -------------------",
+        "# Owner ruling 2026-09-13: every knob is an ARGUMENT.  Exported here:",
+        "# the TLM TARGET shape (the target's size comes from these, not from",
+        "# --hidden-dim/--vocab-size/--num-layers, which size the POLICY) and",
+        "# the Ray / measurement plumbing.  No XLA_*, no JAX_*; the campaign",
+        "# test refuses any export outside CAMPAIGN_ENV_ALLOWED.",
+    ]
+    for k, v in CAMPAIGN_ENV:
+        L.append(f"export {k}={v}")
+    L.append("")
+    L.append("# TODO (ticket .43): knobs that still have NO FLAG in ppo.py -- named")
+    L.append("# in the header's TODO block with their evidence; promote and delete.")
+    for k, v, _why in NO_FLAG_ENV:
+        L.append(f"export {k}={v}")
+    return L
+
+
 def render(a: dict) -> str:
     kind = a["kind"]
     gpus = a.get("gpus", 0)
+    scratch = is_scratch(a)
+    py = _python(a)
+    ag_repo, gx_repo = _repo_paths(a)
     L = ["#!/bin/bash"]
     L.append("#SBATCH -p " + ("pgi15-cpu" if kind == "cpu" else "pgi15"))
     L.append(f"#SBATCH -w {a['node']}")
-    if gpus:
+    if scratch:
+        # THE CAMPAIGN HARDWARE: the whole Blackwell node, by its gres name.
+        L.append(f"#SBATCH --gres={CAMPAIGN_GRES}")
+        L.append(f"#SBATCH -c {CAMPAIGN_CPUS}")
+        L.append(f"#SBATCH --mem={CAMPAIGN_MEM}")
+    elif gpus:
         L.append(f"#SBATCH --gres=gpu:{gpus}")
         L.append("#SBATCH -c 64")
         L.append("#SBATCH --mem=400G")
@@ -1805,7 +2219,15 @@ def render(a: dict) -> str:
         L.append("#SBATCH --mem=64G")
     L.append(f"#SBATCH -t {a['time']}")
     L.append(f"#SBATCH -J {a['job']}")
-    L.append(f"#SBATCH -o {HOME_DSNN}/{a['name']}_%j.log")
+    if scratch:
+        # -D and -o on /Scratch: a launcher whose -o names the missing home
+        # fails at launch with ExitCode 0:53 (finding 57).  CAMPAIGN_RUNS
+        # must exist before sbatch (slurm opens the log first): the owner
+        # creates it once when staging the stack.
+        L.append(f"#SBATCH -D {CAMPAIGN_STACK}/alphagrad")
+        L.append(f"#SBATCH -o {CAMPAIGN_RUNS}/{a['name']}_%j.log")
+    else:
+        L.append(f"#SBATCH -o {HOME_DSNN}/{a['name']}_%j.log")
     L.append("#")
     L.append("# " + "=" * 72)
     L.append(_wrap_comment(a["purpose"]))
@@ -1826,6 +2248,17 @@ def render(a: dict) -> str:
         L.append("#")
         L.append("# *** HELD -- NOT TO BE SUBMITTED UNTIL THE OWNER RELEASES IT ***")
         L.append(_wrap_comment(a["held"], "#   "))
+    if scratch and NO_FLAG_ENV:
+        # The departure from "args only", stated where the owner reads.
+        L.append("#")
+        L.append("# *** TODO (ticket .43): ENV VARS WITHOUT A FLAG -- exported, never silent ***")
+        L.append("#   Owner ruling 2026-09-13: args only.  These knobs have no flag in")
+        L.append("#   ppo.py make_argparser yet and the run is wrong or dead without them,")
+        L.append("#   so the launcher exports them HERE and says so.  Promote each to a")
+        L.append("#   flag (the .44 pattern) and delete its NO_FLAG_ENV row.")
+        for k, v, why in NO_FLAG_ENV:
+            L.append(f"#   {k}={v}")
+            L.append(_wrap_comment(why, "#       "))
     L.append("# " + "=" * 72)
     L.append("#")
     L.append("# GENERATED BY tools/gen_fq_launchers.py -- DO NOT EDIT IN PLACE.")
@@ -1862,19 +2295,26 @@ def render(a: dict) -> str:
         L.append(a["body"])
         return "\n".join(L) + "\n"
 
-    # --- shared env block
-    L.append(PREAMBLE.format(repo=REPO).rstrip())
-    over = a.get("env", {})
-    for k, v in SHARED_ENV:
-        if k == "RAY_TMPDIR":
-            continue
-        nv = over.get(k, v)
-        if nv is _DELETE:
-            continue
-        L.append(f"export {k}={nv}")
-    for k, v in over.items():
-        if k not in {kk for kk, _ in SHARED_ENV} and v is not _DELETE:
-            L.append(f"export {k}={v}")
+    # --- the environment
+    if scratch:
+        if a.get("env"):
+            raise CampaignRowError(
+                f"{a['name']}: a campaign arm carries no per-arm env "
+                f"(got {sorted(a['env'])}); every knob is an argument")
+        L.extend(_scratch_stack_block())
+    else:
+        L.append(PREAMBLE.format(repo=REPO).rstrip())
+        over = a.get("env", {})
+        for k, v in SHARED_ENV:
+            if k == "RAY_TMPDIR":
+                continue
+            nv = over.get(k, v)
+            if nv is _DELETE:
+                continue
+            L.append(f"export {k}={nv}")
+        for k, v in over.items():
+            if k not in {kk for kk, _ in SHARED_ENV} and v is not _DELETE:
+                L.append(f"export {k}={v}")
     L.append("")
     L.append(_toolchain_block(kind))
     L.append("")
@@ -1920,15 +2360,17 @@ def render(a: dict) -> str:
     L.append("  exit 64")
     L.append("fi")
     L.append("")
-    _approx_add = dict(_merge_cli(a.get("cli", {}))).get("--approx-add", "lossy")
+    _approx_add = dict(_merge_cli(a.get("cli", {}))).get("--approx-add", APPROX_ADD)
     if kind != "cpu":
+        _twoop = (f"{gx_repo}/tests/misc/test_face_two_op_form.py" if scratch
+                  else "$HOME/dsnn/graphax/tests/misc/test_face_two_op_form.py")
         L.append(f"# --approx-add {_approx_add} emits the res-slot two-op face form.")
         L.append("# On a graphax that rejects it, EVERY plan putting a rule in the")
         L.append("# res/new slot dies in _trace_truncate SILENTLY -- no counter, no")
         L.append("# log line.  That went unnoticed for a whole campaign.  VERIFY.")
         L.append('if [ "${FQ_SKIP_TWOOP:-0}" != "1" ]; then')
-        L.append("  JAX_PLATFORMS=cpu uv run --no-sync python -m pytest -q -x \\")
-        L.append("    $HOME/dsnn/graphax/tests/misc/test_face_two_op_form.py \\")
+        L.append(f"  JAX_PLATFORMS=cpu {py} -m pytest -q -x \\")
+        L.append(f"    {_twoop} \\")
         L.append("    -p no:cacheprovider >/tmp/twoop_$SLURM_JOB_ID.log 2>&1 || {")
         L.append('    echo "ABORT(70): graphax rejects the res-slot two-op form,"')
         L.append('    echo "           but --approx-add emits it."')
@@ -1941,8 +2383,8 @@ def render(a: dict) -> str:
 
     if kind == "probe" or a.get("needs_tool"):
         L.append('echo "HOST=$(hostname) JOB=$SLURM_JOB_ID"')
-        L.append('echo "ag=$(git -C ~/dsnn/alphagrad rev-parse --short HEAD)'
-                 ' gx=$(git -C ~/dsnn/graphax rev-parse --short HEAD)"')
+        L.append(f'echo "ag=$(git -C {ag_repo} rev-parse --short HEAD)'
+                 f' gx=$(git -C {gx_repo} rev-parse --short HEAD)"')
         if kind != "cpu":
             L.append("nvidia-smi --query-gpu=index,name,memory.total"
                      " --format=csv,noheader")
@@ -1960,7 +2402,7 @@ def render(a: dict) -> str:
     L.append("# Layer 3: wandb credentials + a real authenticated round-trip")
     L.append("# from THIS node to THIS entity, before hours are spent.  ~2 s.")
     L.append('if [ "${FQ_SKIP_WANDB_CHECK:-0}" != "1" ]; then')
-    L.append("  JAX_PLATFORMS=cpu uv run --no-sync python - "
+    L.append(f"  JAX_PLATFORMS=cpu {py} - "
              "<<'FQ_WANDB_EOF' || {")
     L.append("import sys, wandb")
     L.append(f"ENT, PROJ = {WANDB_ENTITY!r}, {WANDB_PROJECT!r}")
@@ -1996,7 +2438,8 @@ def render(a: dict) -> str:
         L.append(f'  echo "[preflight] gate G1 winners table present: {_gw}"')
         L.append("else")
         L.append(f'  echo "[preflight] gate G1 winners table ABSENT ({_gw}):'
-                 ' gate/g1/present will read 0 until sweep .41 writes it"')
+                 ' gate/g1/present will read 0 and gate/g1/recovery* will be'
+                 ' meaningless for this whole run"')
         L.append("fi")
         L.append("")
     L.append("ARGS=(")
@@ -2010,7 +2453,7 @@ def render(a: dict) -> str:
     L.append("# --advantage-norm value valid on the ray surface but not this one)")
     L.append("# that a name-only grep cannot see.  JAX_PLATFORMS=cpu so it does")
     L.append("# not touch a GPU.")
-    L.append("JAX_PLATFORMS=cpu uv run --no-sync python -c \\")
+    L.append(f"JAX_PLATFORMS=cpu {py} -c \\")
     L.append("\"import sys; from alphagrad.approx.ppo import make_argparser;\\")
     L.append(" make_argparser().parse_args(sys.argv[1:]);\\")
     L.append(" print('[preflight] argparse accepted the command line')\" \\")
@@ -2025,69 +2468,127 @@ def render(a: dict) -> str:
     L.append("fi")
     L.append("")
     L.append('echo "HOST=$(hostname) JOB=$SLURM_JOB_ID"')
-    L.append('echo "ag=$(git -C ~/dsnn/alphagrad rev-parse --short HEAD)'
-             ' gx=$(git -C ~/dsnn/graphax rev-parse --short HEAD)"')
+    L.append(f'echo "ag=$(git -C {ag_repo} rev-parse --short HEAD)'
+             f' gx=$(git -C {gx_repo} rev-parse --short HEAD)"')
     L.append("nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader")
     L.append("")
-    L.append("CUDA_VISIBLE_DEVICES=0,1,2,3 uv run --no-sync python \\")
+    if scratch:
+        # All GPUs of the node are visible: the trainer takes device 0
+        # (--gpus 0, the ppo.py default) and the --ray-measure actor device 1
+        # (ppo.py pins idx + 1 under RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES).
+        L.append(f"{py} \\")
+    else:
+        L.append(f"CUDA_VISIBLE_DEVICES=0,1,2,3 {py} \\")
     L.append('  src/alphagrad/approx/ppo.py "${ARGS[@]}"')
     L.append('echo "TRAINER exited with $?"')
     return "\n".join(L) + "\n"
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=HOME_DSNN)
+def _bash_n(text: str) -> str | None:
+    """``bash -n`` the text; return stderr on a syntax error, else None."""
+    with tempfile.NamedTemporaryFile("w", suffix=".sbatch", delete=False) as fh:
+        fh.write(text)
+        tmp = fh.name
+    try:
+        chk = subprocess.run(["bash", "-n", tmp], capture_output=True, text=True)
+        return None if chk.returncode == 0 else chk.stderr
+    finally:
+        os.unlink(tmp)
+
+
+def _diff(old: str | None, text: str, path: str) -> tuple[str, str]:
+    """('MISSING' | 'DRIFT' | 'ok', unified diff text)."""
+    if old is None:
+        return "MISSING", ""
+    if old == text:
+        return "ok", ""
+    return "DRIFT", "".join(difflib.unified_diff(
+        old.splitlines(keepends=True), text.splitlines(keepends=True),
+        fromfile=f"{path} (on disk)", tofile=f"{path} (generated)"))
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--out", default=HOME_DSNN,
+                    help="where the launchers are written (default: the tree)")
     ap.add_argument("--check", action="store_true",
                     help="render, syntax-check and DIFF against what is on "
-                         "disk; write nothing; exit non-zero on any drift")
-    ns = ap.parse_args()
+                         "disk under --out; write nothing; exit non-zero on "
+                         "any drift")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="write every launcher to --out, which must lie OUTSIDE "
+                         "--against, and diff each against its copy in "
+                         "--against.  The tree is never touched.  Also writes "
+                         "<out>/DRIFT.diff (every diff) and <out>/SUMMARY.txt.")
+    ap.add_argument("--against", default=HOME_DSNN,
+                    help="the tree a --dry-run diffs against (default: the tree)")
+    ns = ap.parse_args(argv)
+
+    if ns.check and ns.dry_run:
+        raise SystemExit("--check and --dry-run are exclusive: --check writes "
+                         "nothing, --dry-run writes outside the tree")
+    out = os.path.realpath(os.path.expanduser(ns.out))
+    against = os.path.realpath(os.path.expanduser(ns.against))
+    if ns.dry_run:
+        if out == against or out.startswith(against + os.sep):
+            raise SystemExit(
+                f"--dry-run refuses to write into the tree it diffs against "
+                f"({ns.against}); pass an --out OUTSIDE it")
+        os.makedirs(out, exist_ok=True)
 
     rc = 0
-    drifted = []
+    drifted: list[str] = []
+    summary: list[str] = []
+    diffs: list[str] = []
     for a in ARMS:
         text = render(a)
-        path = os.path.join(ns.out, f"fq_{a['name']}.sbatch")
-        with tempfile.NamedTemporaryFile("w", suffix=".sbatch",
-                                         delete=False) as fh:
-            fh.write(text)
-            tmp = fh.name
-        chk = subprocess.run(["bash", "-n", tmp], capture_output=True, text=True)
-        if chk.returncode != 0:
-            print(f"SYNTAX ERROR in {path}:\n{chk.stderr}", file=sys.stderr)
-            os.unlink(tmp)
+        fname = f"fq_{a['name']}.sbatch"
+        path = os.path.join(out, fname)
+        err = _bash_n(text)
+        if err is not None:
+            print(f"SYNTAX ERROR in {path}:\n{err}", file=sys.stderr)
             rc = 1
             continue
-        if ns.check:
-            # A --check that only ran `bash -n` reported "ok" for a launcher
-            # whose on-disk copy had drifted arbitrarily far from the
-            # generator -- it proved the FILE WAS SHELL, not that it was THIS
-            # file.  Diff, and make drift a non-zero exit.
+        if ns.check or ns.dry_run:
+            ref = path if ns.check else os.path.join(against, fname)
             old = None
-            if os.path.exists(path):
-                with open(path) as fh:
+            if os.path.exists(ref):
+                with open(ref) as fh:
                     old = fh.read()
-            if old is None:
-                print(f"MISSING       {path} (would be created)")
-                drifted.append(path)
-                rc = 1
-            elif old != text:
-                print(f"DRIFT         {path}")
-                sys.stdout.writelines(difflib.unified_diff(
-                    old.splitlines(keepends=True),
-                    text.splitlines(keepends=True),
-                    fromfile=f"{path} (on disk)",
-                    tofile=f"{path} (generated)"))
-                drifted.append(path)
-                rc = 1
+            status, d = _diff(old, text, ref)
+            summary.append(f"{status:<8} {ref}")
+            if status == "MISSING":
+                print(f"MISSING       {ref} (would be created)")
+                drifted.append(ref)
+            elif status == "DRIFT":
+                print(f"DRIFT         {ref}")
+                drifted.append(ref)
+                diffs.append(d)
+                if ns.check:
+                    sys.stdout.write(d)
             else:
-                print(f"ok            {path}")
-            os.unlink(tmp)
-            continue
-        shutil.move(tmp, path)
+                print(f"ok            {ref}")
+            if ns.check:
+                rc = rc or (1 if status != "ok" else 0)
+                continue
+        with open(path, "w") as fh:
+            fh.write(text)
         os.chmod(path, 0o644)
         print(f"wrote {path}")
-    if ns.check and drifted:
+    if ns.dry_run:
+        with open(os.path.join(out, "DRIFT.diff"), "w") as fh:
+            fh.writelines(diffs)
+        n_miss = sum(1 for s in summary if s.startswith("MISSING"))
+        n_drift = sum(1 for s in summary if s.startswith("DRIFT"))
+        n_ok = sum(1 for s in summary if s.startswith("ok"))
+        head = (f"gen_fq_launchers --dry-run: {len(ARMS)} launchers rendered to "
+                f"{out}; against {against}: {n_ok} ok, {n_drift} DRIFT, "
+                f"{n_miss} MISSING; {sum(d.count(chr(10)) for d in diffs)} "
+                f"diff lines in DRIFT.diff")
+        with open(os.path.join(out, "SUMMARY.txt"), "w") as fh:
+            fh.write(head + "\n" + "\n".join(summary) + "\n")
+        print(head)
+    elif ns.check and drifted:
         print(f"\n{len(drifted)} launcher(s) differ from the generator:",
               file=sys.stderr)
         for d in drifted:

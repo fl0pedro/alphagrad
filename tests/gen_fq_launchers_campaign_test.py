@@ -1,18 +1,29 @@
 """Ticket .43 -- the campaign arms (phases 1-5, tickets .50-.54) on the
-launcher generator.
+launcher generator, regenerated 2026-09-13 under the owner's rulings.
 
 Launchers are generated (tools/gen_fq_launchers.py), never hand-edited, so
-the campaign contract is pinned on the generator: every campaign arm renders
-to valid bash; every flag it passes is defined in the files the pre-flight
-greps (ppo.py, gate_telemetry.py); no arm carries an env-var knob that has a
-flag (owner ruling 2026-09-03: args only); every name encodes its profile,
-its old-edge value and its price; the shared contract (TLM, three channels,
-paired-log cost form, static temp memory, grad-cosine, gamma = GAE lambda =
-1, terminal rewards, additive, raw advantages, no quality gate, one seed,
-250 episodes, plan log on, gate telemetry inputs, gpu15/16/18 only) holds
-on every arm; and the per-phase shapes (the .56 paired pair, the held Diag
-arm, the two order arms, P0 / P1 / L, PopArt, five seeds) are what the
-tickets ask for.
+the campaign contract is pinned on the generator:
+
+  1. THE PHASE-1 TABLE (ticket .50): SKIP-only, Reduce-only, Quant-only,
+     Diag-only, order-only (profile none, --fixed-order free), free (all,
+     free); the all-rev x2 arms are gone; every arm comes from PHASE1_TABLE.
+  2. THE WIDTH: the face head's logit count in every campaign header is
+     head_layout(APPROX_ADD).width, and no rendered launcher says "94 logits".
+  3. THE REQUIRED FLAGS on every campaign arm: --fixed-order markowitz
+     (free on the order arms), --approx-add lossless and nothing else,
+     --face-none-bias 4, --mem-channel temp, --quality-metric grad_cosine,
+     --cost-form paired-log, --reward-mode additive, --terminal-rewards-only,
+     --ray-measure 1 --ray-measure-timeout 600, --per-face-masks with
+     --face-actions, --gate-winners-table.
+  4. THE ENVIRONMENT: no promoted env var, no XLA_* / JAX_* flag, no
+     ALPHAGRAD_FORCE_REV_ORDER; every `export` is in CAMPAIGN_ENV_ALLOWED;
+     the no-flag knobs are exported AND named in the header's TODO block.
+  5. THE HARDWARE: one 8-GPU Blackwell job per node on gpu19/gpu20, -c 128,
+     the /Scratch stack of finding 57 (no ~/dsnn, no uv run).
+  6. THE GATE TELEMETRY (ticket .45): ppo.py has no switch for it; the
+     launcher passes G1's input.
+  7. campaign_arm RAISES (CampaignRowError) on a row outside the rulings.
+  8. ppo.py's own argparse accepts every campaign command line.
 """
 from __future__ import annotations
 
@@ -20,25 +31,36 @@ import importlib.util
 import os
 import re
 import subprocess
+import sys
 import tempfile
 
 import pytest
 
 _ALPHAGRAD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
+_PPO = os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx", "ppo.py")
 
-CAMPAIGN_NODES_ALLOWED = {"pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18"}
+# THE APPROVED REWARD, PINNED (owner ruling 2026-09-13, priced in finding
+# 63).  These are the numbers the whole campaign is judged at; a change to
+# either must be a deliberate edit HERE as well as in the generator.  The
+# token is in every arm NAME because an arm called `lq5` that passes
+# --lambda-acc 16 -- or one called lq16 with no quality floor -- is exactly
+# the drift that made this morning's launchers wrong.
+LAMBDA_Q = "16"
+TAU = "0.90"
+REWARD_TOKEN = "hinge_tau09_lq16"
+
 PHASE1_NAMES = [
-    "p1a_skip_addlossy_lq5",
-    "p1b_all_addlossy_lq5",
-    "p1c_all_addlossless_lq5",
-    "p1d_reduce_addlossy_lq5",
-    "p1e_quant_addlossy_lq5",
-    "p1f_diag_addlossy_lq5",
-    "p1g_none_free_addlossy_lq5",
-    "p1h_all_free_addlossy_lq5",
+    f"p1a_skip_{REWARD_TOKEN}",
+    f"p1b_reduce_{REWARD_TOKEN}",
+    f"p1c_quant_{REWARD_TOKEN}",
+    f"p1d_diag_{REWARD_TOKEN}",
+    f"p1e_none_free_{REWARD_TOKEN}",
+    f"p1f_all_free_{REWARD_TOKEN}",
 ]
+PHASE1_PROFILES = ["skip", "reduce", "quant", "diag", "none", "all"]
 _PLACEHOLDER = re.compile(r"\$\{([A-Z0-9_]+):\?[^}]*\}")
+_EXPORT = re.compile(r"^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=", re.M)
 
 
 @pytest.fixture(scope="module")
@@ -78,46 +100,100 @@ def _tokens(gen, a, profile="skip") -> list[str]:
     return [_PLACEHOLDER.sub(profile, t) for t in gen.cli_tokens(a)]
 
 
-# ------------------------------------------------------------ 1. the shape
+def _bash_n(text: str) -> str | None:
+    with tempfile.NamedTemporaryFile("w", suffix=".sbatch", delete=False) as fh:
+        fh.write(text)
+    try:
+        chk = subprocess.run(["bash", "-n", fh.name],
+                             capture_output=True, text=True)
+        return None if chk.returncode == 0 else chk.stderr
+    finally:
+        os.unlink(fh.name)
 
-def test_the_phase1_table_is_the_one_ticket_50_asks_for(campaign):
-    p1 = [a["name"] for a in campaign if a["phase"] == 1]
-    assert p1 == PHASE1_NAMES
+
+# ------------------------------------------------------------ 1. the table
+
+def test_the_phase1_table_is_the_one_ticket_50_asks_for(gen, campaign):
+    p1 = [a for a in campaign if a["phase"] == 1]
+    assert [a["name"] for a in p1] == PHASE1_NAMES
+    assert [_cli(gen, a)["--approx-profile"] for a in p1] == PHASE1_PROFILES
+    # one table: the rows ARE the arms, in order
+    assert [r[0] for r in gen.PHASE1_TABLE] == list("abcdef")
+    assert [r[1] for r in gen.PHASE1_TABLE] == PHASE1_PROFILES
+    assert [r[2] for r in gen.PHASE1_TABLE] == ["markowitz"] * 4 + ["free"] * 2
+    # the all-rev x2 arms (the .56 lossy/lossless pair) are gone
+    assert not any("_all_lq" in a["name"] for a in p1)
+    assert not any("addloss" in a["name"] for a in campaign)
     phases = sorted({a["phase"] for a in campaign})
     assert phases == [1, 2, 3, 4, 5]
     assert len([a for a in campaign if a["phase"] == 2]) == 2
     assert len([a for a in campaign if a["phase"] == 3]) == 3
     assert len([a for a in campaign if a["phase"] == 4]) == 1
     assert len([a for a in campaign if a["phase"] == 5]) == 5
+    assert len(campaign) == 17
+    assert len({a["name"] for a in campaign}) == len(campaign)
+
+
+def test_no_campaign_arm_is_held(gen, campaign):
+    # Diag-only is a LIVE arm under the Markowitz order (finding 59); the
+    # hold on ticket .25 is named in its DEPENDS line, not enforced.
+    for a in campaign:
+        assert not a.get("held"), a["name"]
+        assert "ABORT(73)" not in gen.render(a), a["name"]
+    diag = _by_name(campaign, f"p1d_diag_{REWARD_TOKEN}")
+    assert ".25" in diag["depends"]
 
 
 def test_every_campaign_arm_renders_to_valid_bash(gen, campaign):
     for a in campaign:
         text = gen.render(a)
         assert text.startswith("#!/bin/bash\n"), a["name"]
-        with tempfile.NamedTemporaryFile("w", suffix=".sbatch",
-                                         delete=False) as fh:
-            fh.write(text)
-        try:
-            chk = subprocess.run(["bash", "-n", fh.name],
-                                 capture_output=True, text=True)
-            assert chk.returncode == 0, (a["name"], chk.stderr)
-        finally:
-            os.unlink(fh.name)
+        err = _bash_n(text)
+        assert err is None, (a["name"], err)
 
 
-# -------------------------------------------------- 2. REQUIRED_FLAGS check
+# ------------------------------------------------------------ 2. the width
+
+def test_the_face_head_width_is_derived_from_head_layout(gen, campaign):
+    sys.path.insert(0, os.path.join(_ALPHAGRAD, "src"))
+    from alphagrad.approx.unified_face_head import head_layout
+    from alphagrad.approx.common.masks import FACE_QUANT_DTYPES
+    assert gen.APPROX_ADD == "lossless"
+    assert gen.FACE_HEAD_WIDTH == head_layout(gen.APPROX_ADD).width
+    assert gen.FACE_QUANT_DTYPES == tuple(FACE_QUANT_DTYPES)
+    assert len(gen.FACE_QUANT_DTYPES) == 4
+    # the head grew from 94 to 103 with the four-dtype set; the number in
+    # the launchers is the library's, not the generator's
+    assert gen.FACE_HEAD_WIDTH == 1 + 3 * (30 + len(FACE_QUANT_DTYPES))
+    for a in campaign:
+        text = gen.render(a)
+        assert f"{gen.FACE_HEAD_WIDTH} logits" in text, a["name"]
+        for dt in FACE_QUANT_DTYPES:
+            assert dt in text, (a["name"], dt)
+    for a in gen.ARMS:
+        assert "94 logits" not in gen.render(a), a["name"]
+    src = open(_GEN).read()
+    assert "94 logits" not in src
+    assert "103 logits" not in src
+
+
+def test_the_width_derivation_raises_instead_of_falling_back(gen):
+    with pytest.raises(ValueError):
+        gen._face_head_geometry("no-such-approx-add")
+
+
+# -------------------------------------------------- 3. the required flags
 
 def test_required_flags_are_all_defined_where_the_preflight_greps(
         gen, flag_sources):
     # The pre-flight does `grep -qF -- "\"$F\"" $FLAGSRC`; this is that grep.
     missing = [f for f in gen.REQUIRED_FLAGS if f'"{f}"' not in flag_sources]
     assert not missing, missing
-    assert "--approx-profile" in gen.REQUIRED_FLAGS
-    assert "--cost-form" in gen.REQUIRED_FLAGS
-    assert "--quality-floor" in gen.REQUIRED_FLAGS
-    assert "--mem-channel" in gen.REQUIRED_FLAGS
-    assert "--gate-winners-table" in gen.REQUIRED_FLAGS
+    for f in ("--approx-profile", "--cost-form", "--quality-floor",
+              "--mem-channel", "--gate-winners-table", "--fixed-order",
+              "--ray-measure", "--ray-measure-timeout", "--per-face-masks",
+              "--face-none-bias", "--approx-add", "--terminal-rewards-only"):
+        assert f in gen.REQUIRED_FLAGS, f
 
 
 def test_every_flag_a_campaign_arm_passes_is_defined(gen, campaign,
@@ -134,70 +210,9 @@ def test_every_flag_a_campaign_arm_passes_is_defined(gen, campaign,
             assert f" {f} " in text or f" {f};" in text, (a["name"], f)
 
 
-# ------------------------------------------------------- 3. no env-var knob
-
-def test_no_campaign_arm_carries_an_env_var_knob(gen, campaign):
-    for a in campaign:
-        text = gen.render(a)
-        for var in gen.PROMOTED_ENV_VARS:
-            assert var not in a.get("env", {}), (a["name"], var)
-            assert f"export {var}=" not in text, (a["name"], var)
-            assert f"{var}=" not in text, (a["name"], var)
-        # the two deleted knobs of ticket .9 / .56 by name as well
-        assert "QUALITY_GATE_MIN" not in text, a["name"]
-        assert "NEW_SLOT_JOIN" not in text, a["name"]
-        assert "GRAPHAX_ALLOW_PARTIAL_ORDER" not in text, a["name"]
-
-
-def test_the_measurement_environment_is_still_exported(gen, campaign):
-    # What the owner allows to stay an env var: the measurement environment
-    # and the import-time settings that have no flag.
-    for a in campaign:
-        text = gen.render(a)
-        for line in ("export ALPHAGRAD_SKIP_COUNT_OPS=1",
-                     "export ALPHAGRAD_TLM_SEQ=32",
-                     "export ALPHAGRAD_TLM_DMODEL=128",
-                     "export ALPHAGRAD_TLM_VOCAB=1024",
-                     "export ALPHAGRAD_MAX_FACES=2538",
-                     "export JAX_COMPILATION_CACHE_DIR=$HOME/.jaxcache_$(hostname -s)"):
-            assert line in text, (a["name"], line)
-
-
-# ------------------------------------------- 4. names encode the knobs
-
-def test_each_name_encodes_profile_face_add_and_price(gen, campaign):
-    for a in campaign:
-        cli = _cli(gen, a)
-        name = a["name"]
-        prof = cli["--approx-profile"]
-        prof_tok = "winner" if _PLACEHOLDER.search(prof) else prof
-        assert f"_{prof_tok}_" in name, (name, prof)
-        assert f"_add{cli['--approx-add']}" in name, name
-        if "--preference-conditioned" not in cli:
-            assert f"_lq{cli['--lambda-acc']}" in name, name
-        elif cli.get("--reward-mode") == "lagrangian":
-            assert "_dual" in name, name
-        else:
-            assert "_pref" in name, name
-        if "--quality-floor" in cli:
-            assert f"tau{cli['--quality-floor'].replace('.', '')}" in name, name
-        else:
-            assert "tau" not in name, name
-        if cli.get("--advantage-norm") == "popart":
-            assert name.endswith("_popart"), name
-        if cli["--seed"] != gen.CAMPAIGN_SEED:
-            assert f"_s{cli['--seed']}" in name, name
-        assert a["job"] == name.replace("_", "-")
-        assert cli["--name"] == a["job"]
-    assert len({a["name"] for a in campaign}) == len(campaign)
-
-
-# ------------------------------------------------ 5. the shared contract
-
-def test_every_campaign_arm_carries_the_shared_contract(gen, campaign):
+def test_every_campaign_arm_carries_the_required_flags(gen, campaign):
     for a in campaign:
         toks = _tokens(gen, a)
-        text = gen.render(a)
         cli = _cli(gen, a)
         joined = " " + " ".join(toks) + " "
         for frag in (" --example TransformerLM ", " --exec-on-gpu ",
@@ -207,118 +222,392 @@ def test_every_campaign_arm_carries_the_shared_contract(gen, campaign):
                      " --quality-metric grad_cosine ",
                      " --discount 1.0 ", " --gae-lambda 1.0 ",
                      " --terminal-rewards-only ",
-                     " --plan-log auto ", " --episodes 250 ",
-                     " --measure-toolchain-gate abort ",
-                     " --reduce-axis-space physical ",
-                     f" --gate-winners-table {gen.GATE_WINNERS_TABLE} ",
+                     f" --approx-add {gen.APPROX_ADD} ",
                      f" --face-none-bias {gen.FACE_NONE_BIAS_MVP} ",
                      f" --scale-face-head {gen.SCALE_FACE_HEAD_MVP} ",
                      f" --face-logit-clamp {gen.FACE_LOGIT_CLAMP_MVP} ",
+                     " --face-actions ", " --per-face-masks ",
+                     " --unified-face-head ", " --live-faces ",
+                     " --dynamic-substeps ", " --set-pointer ",
+                     " --incremental-encode ",
+                     f" --ray-measure {gen.CAMPAIGN_RAY_MEASURE} ",
+                     f" --ray-measure-timeout {gen.CAMPAIGN_RAY_MEASURE_TIMEOUT} ",
+                     " --plan-log auto ", " --episodes 250 ",
+                     " --measure-toolchain-gate abort ",
+                     " --reduce-axis-space physical ",
+                     f" --gate-winners-table "
+                     f"{gen.CAMPAIGN_GATE_WINNERS_TABLES[cli['--fixed-order']]} ",
+                     f" --gate-offline-contrast "
+                     f"{gen.GATE_OFFLINE_CONTRAST[cli['--fixed-order']]} ",
                      " --lambda-cmp 1 ", " --lambda-mem 1 ",
                      " --wandb online "):
             assert frag in joined, (a["name"], frag)
+        assert gen.FACE_NONE_BIAS_MVP == "4"
+        assert cli["--approx-add"] == "lossless", a["name"]
+        assert toks.count("--approx-add") == 1, a["name"]
         assert cli["--rewards"] in ("cmp mem acc", "cmp acc", "mem acc")
         if cli.get("--reward-mode") != "lagrangian":
             assert " --reward-mode additive " in joined, a["name"]
         if cli.get("--advantage-norm") != "popart":
             assert " --advantage-norm none " in joined, a["name"]
-        # one seed per arm
+        # one seed per arm, one order per arm
         assert toks.count("--seed") == 1, a["name"]
-        # every arm is a 4-GPU training job holding its node
-        assert a["kind"] == "train" and a.get("gpus") == 4, a["name"]
-        assert a["node"] in CAMPAIGN_NODES_ALLOWED, (a["name"], a["node"])
-        assert "pgi15-gpu17" not in text, a["name"]
-        # the toolchain gate (ticket .21) is in every launcher
-        assert "ABORT(72)" in text, a["name"]
+        assert toks.count("--fixed-order") == 1, a["name"]
+        # no quality gate anywhere in the campaign
+        assert "QUALITY_GATE" not in gen.render(a), a["name"]
         # registered prediction and falsifier in the header
+        text = gen.render(a)
         assert "# REGISTERED PREDICTION" in text, a["name"]
         assert "# FALSIFICATION CRITERION:" in text, a["name"]
         assert "REGISTERED BEFORE THE RUN" in text, a["name"]
+        assert "ABORT(72)" in text, a["name"]   # the toolchain gate (.21)
 
 
-def test_phase1_and_phase2_run_raw_quality_no_floor(gen, campaign):
+def test_the_order_is_markowitz_except_on_the_two_order_arms(gen, campaign):
     for a in campaign:
         cli = _cli(gen, a)
-        if a["phase"] in (1, 2):
-            assert "--quality-floor" not in cli, a["name"]
-            assert "--preference-conditioned" not in cli, a["name"]
-            assert cli["--lambda-acc"] == gen.LAMBDA_Q_MVP, a["name"]
-
-
-# ------------------------------------------------- 6. per-phase shapes
-
-def test_the_all_rev_pair_differs_only_in_the_face_add(gen, campaign):
-    same = _by_name(campaign, "p1b_all_addlossy_lq5")
-    exact = _by_name(campaign, "p1c_all_addlossless_lq5")
-    cs, ce = _cli(gen, same), _cli(gen, exact)
-    assert (cs["--approx-add"] == "lossy"
-            and ce["--approx-add"] == "lossless")
-    assert cs["--approx-profile"] == ce["--approx-profile"] == "all"
-    for k in set(cs) | set(ce):
-        if k in ("--approx-add", "--name"):
-            continue
-        assert cs.get(k) == ce.get(k), k
-    for k in ("kind", "node", "time", "gpus", "env", "phase"):
-        if k == "node":
-            continue  # one ppo job per node: the pair sits on two nodes
-        assert same[k] == exact[k], k
-    ts, te = gen.render(same), gen.render(exact)
-    # The two-op pre-flight runs under BOTH values now (.56, finding 73):
-    # `lossless` is the two-op form with an all-None join triple and `lossy`
-    # adds a join policy to it, so both need graphax to accept the form. Under
-    # the retired names only `same` did, because `exact` emitted the bare
-    # triple.
-    assert "test_face_two_op_form.py" in ts
-    assert "test_face_two_op_form.py" in te
-    assert "  --approx-add lossless\n" in te
-
-
-def test_the_diag_arm_is_emitted_and_held(gen, campaign):
-    diag = _by_name(campaign, "p1f_diag_addlossy_lq5")
-    assert diag.get("held") and "dsnn-3qm.25" in diag["held"]
-    text = gen.render(diag)
-    assert "*** HELD" in text
-    assert 'if [ "${FQ_RELEASE_HELD:-0}" != "1" ]; then' in text
-    assert "ABORT(73)" in text and "  exit 73\n" in text
-    # the guard sits before anything runs
-    assert text.index("exit 73") < text.index("export RAY_TMPDIR")
-    for a in campaign:
-        if a is diag:
-            continue
-        assert not a.get("held"), a["name"]
-        assert "ABORT(73)" not in gen.render(a), a["name"]
-
-
-def test_the_order_arms_lift_the_pin_and_the_others_keep_it(gen, campaign):
-    # Ticket .64: the order is the --fixed-order ARGUMENT; the env var is gone
-    # from every launcher (a set var fails loudly in common/masks.py).
-    for a in campaign:
         text = gen.render(a)
-        cli = _cli(gen, a)
         assert "ALPHAGRAD_FORCE_REV_ORDER" not in text, a["name"]
-        if a["name"] in ("p1g_none_free_addlossy_lq5",
-                         "p1h_all_free_addlossy_lq5"):
+        if a["name"] in (f"p1e_none_free_{REWARD_TOKEN}", f"p1f_all_free_{REWARD_TOKEN}"):
             assert cli["--fixed-order"] == "free", a["name"]
             assert a["time"] == "24:00:00", a["name"]
+            assert "_free_" in a["name"]
         else:
             assert cli["--fixed-order"] == "markowitz", a["name"]
-    order_only = _cli(gen, _by_name(campaign, "p1g_none_free_addlossy_lq5"))
+            assert "_free" not in a["name"] and "_reverse" not in a["name"]
+    order_only = _cli(gen, _by_name(campaign, f"p1e_none_free_{REWARD_TOKEN}"))
     assert order_only["--approx-profile"] == "none"
     assert "--no-approx-head" not in order_only   # the profile IS the switch
     assert "--exact" not in order_only
-    free = _cli(gen, _by_name(campaign, "p1h_all_free_addlossy_lq5"))
-    assert free["--approx-profile"] == "all"
-    assert _cli(gen, _by_name(campaign, "p1a_skip_addlossy_lq5"))["--approx-profile"] == "skip"
-    assert _cli(gen, _by_name(campaign, "p1d_reduce_addlossy_lq5"))["--approx-profile"] == "reduce"
-    assert _cli(gen, _by_name(campaign, "p1e_quant_addlossy_lq5"))["--approx-profile"] == "quant"
-    assert _cli(gen, _by_name(campaign, "p1f_diag_addlossy_lq5"))["--approx-profile"] == "diag"
+    assert _cli(gen, _by_name(campaign, f"p1f_all_free_{REWARD_TOKEN}"))["--approx-profile"] == "all"
+
+
+def test_the_approved_reward_is_on_every_arm(gen, campaign):
+    """Owner ruling 2026-09-13, priced in finding 63: P1 hinge,
+    --quality-floor 0.90, --lambda-acc 16, --lambda-cmp 1, --lambda-mem 1.
+
+    The generator's own constants are pinned against this test's copies, so
+    changing one without the other fails here rather than shipping 17
+    launchers that run a reward nobody approved.
+    """
+    assert gen.LAMBDA_Q_MVP == LAMBDA_Q
+    assert gen.QUALITY_FLOOR_TAU == TAU
+    for a in campaign:
+        cli = _cli(gen, a)
+        assert cli["--lambda-cmp"] == "1", a["name"]
+        assert cli["--lambda-mem"] == "1", a["name"]
+        assert cli["--cost-form"] == "paired-log", a["name"]
+        assert cli["--mem-channel"] == "temp", a["name"]
+        if a["phase"] == 3 and a["name"].endswith(f"pref_lq{LAMBDA_Q}"):
+            # P0 is the ONE arm that lifts the floor: that IS its question.
+            assert "--quality-floor" not in cli, a["name"]
+            continue
+        assert cli["--quality-floor"] == TAU, a["name"]
+        if cli.get("--reward-mode") == "lagrangian":
+            # lambda is the dual variable here; --lambda-acc is ignored.
+            assert cli["--lag-eta"] == gen.DUAL_ETA, a["name"]
+            assert cli["--lag-min"] == gen.DUAL_LAMBDA_MIN, a["name"]
+            assert cli["--lag-max"] == gen.DUAL_LAMBDA_MAX, a["name"]
+        else:
+            assert cli["--lambda-acc"] == LAMBDA_Q, a["name"]
+
+
+def test_no_arm_carries_the_retired_lambda_five(gen, campaign):
+    """The launchers this generator emitted on the morning of 2026-09-13
+    passed --lambda-acc 5 with no quality floor.  Finding 63 prices that at
+    contrast -20.6 on the Markowitz order: the skip-everything absorber
+    outscores every honest plan.  Neither the flag nor the name may come
+    back."""
+    for a in campaign:
+        cli = _cli(gen, a)
+        assert cli.get("--lambda-acc") != "5", a["name"]
+        assert "lq5" not in a["name"], a["name"]
+        assert "lq5" not in gen.render(a), a["name"]
+
+
+def test_gate_g1_points_at_the_sweep64_table_for_this_arms_order(gen, campaign):
+    """The staged copy at campaign/sweep41/winners.csv is byte-for-byte the
+    sweep64 MARKOWITZ table under a name that says sweep41.  A reverse-order
+    arm pointed at it would report a recovery against the other order's
+    winners."""
+    assert "sweep41" not in str(gen.CAMPAIGN_GATE_WINNERS_TABLES)
+    for a in campaign:
+        cli = _cli(gen, a)
+        want = gen.CAMPAIGN_GATE_WINNERS_TABLES[cli["--fixed-order"]]
+        assert cli["--gate-winners-table"] == want, a["name"]
+        assert "sweep64" in want
+        assert "sweep41" not in gen.render(a), a["name"]
+
+
+def test_gate_g6_carries_the_pre_run_contrast_of_this_arms_order(gen, campaign):
+    """G6's number cannot be measured by the run it judges, so the launcher
+    carries it (finding 63: +0.19 on Markowitz, 0.00 on reverse).  Without
+    it gate/g6/offline_contrast reads NaN for 250 episodes."""
+    for a in campaign:
+        cli = _cli(gen, a)
+        want = gen.GATE_OFFLINE_CONTRAST[cli["--fixed-order"]]
+        assert cli["--gate-offline-contrast"] == want, a["name"]
+        assert float(want) >= 0.0
+
+
+def test_the_launcher_states_that_the_cost_floor_is_not_landed_yet(gen, campaign):
+    """--paired-cost-floor {byte,reference} is NOT in ppo.make_argparser as
+    of this commit, and finding 63's contrast assumes the reference floor.
+    No arm may pass the flag, and every arm must SAY so in its header."""
+    for a in campaign:
+        text = gen.render(a)
+        assert "--paired-cost-floor" not in " ".join(gen.cli_tokens(a)), a["name"]
+        assert "paired-cost-floor" in text, a["name"]
+
+
+# ------------------------------------------------- 4. the environment
+
+def test_no_campaign_arm_exports_a_promoted_var_or_an_xla_flag(gen, campaign):
+    for a in campaign:
+        text = gen.render(a)
+        assert a.get("env", {}) == {}, a["name"]
+        for var in gen.PROMOTED_ENV_VARS:
+            assert f"{var}=" not in text, (a["name"], var)
+        for frag in ("QUALITY_GATE_MIN", "NEW_SLOT_JOIN", "GRAPHAX_ALLOW_PARTIAL_ORDER",
+                     "ALPHAGRAD_FORCE_REV_ORDER", "GRAPHAX_PLANNER_EXACT",
+                     "GRAPHAX_QUANT_PULLDOWN", "ALPHAGRAD_MAX_FACES"):
+            assert frag not in text, (a["name"], frag)
+        # no XLA memory flag, no XLA flag at all, no JAX cache/platform var
+        for line in text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            assert "XLA_" not in line, (a["name"], line)
+            assert "export JAX_" not in line, (a["name"], line)
+            assert "JAX_COMPILATION_CACHE_DIR" not in line, (a["name"], line)
+
+
+def test_every_export_in_a_campaign_launcher_is_allowed(gen, campaign):
+    allowed = set(gen.CAMPAIGN_ENV_ALLOWED)
+    for a in campaign:
+        text = gen.render(a)
+        exported = set(_EXPORT.findall(text))
+        assert exported <= allowed, (a["name"], sorted(exported - allowed))
+        # and the allowed set is exactly what is exported (nothing dormant)
+        assert exported == allowed, (a["name"], sorted(allowed - exported))
+        for k, v in gen.CAMPAIGN_ENV:
+            assert f"export {k}={v}\n" in text, (a["name"], k)
+    # the three measurement-plumbing vars and the TLM shape, nothing else of
+    # the ALPHAGRAD_* / RAY_* kind
+    campaign_env = {k for k, _ in gen.CAMPAIGN_ENV}
+    assert campaign_env == {"ALPHAGRAD_TLM_SEQ", "ALPHAGRAD_TLM_DMODEL",
+                            "ALPHAGRAD_TLM_VOCAB", "ALPHAGRAD_BATCHED_CALLBACK",
+                            "RAY_TMPDIR",
+                            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"}
+    assert dict(gen.CAMPAIGN_ENV)["ALPHAGRAD_BATCHED_CALLBACK"] == "1"
+    assert dict(gen.CAMPAIGN_ENV)["RAY_TMPDIR"] == "/tmp/ray_$SLURM_JOB_ID"
+
+
+def test_no_flag_knobs_are_exported_and_named_in_the_todo_header(gen, campaign):
+    """A knob without a flag is a departure from 'args only'; it is exported
+    (the run is wrong or dead without it) AND declared in the header."""
+    names = {k for k, _, _ in gen.NO_FLAG_ENV}
+    assert "ALPHAGRAD_POLICY" in names          # ppo.py has no --policy flag
+    for k, v, why in gen.NO_FLAG_ENV:
+        assert why and len(why) > 40, k
+    for a in campaign:
+        text = gen.render(a)
+        assert "*** TODO (ticket .43): ENV VARS WITHOUT A FLAG" in text, a["name"]
+        for k, v, _why in gen.NO_FLAG_ENV:
+            assert f"export {k}={v}\n" in text, (a["name"], k)
+            assert f"#   {k}={v}\n" in text, (a["name"], k)
+    # and the claim "no flag" is TRUE against ppo.py's argparser today
+    src = open(_PPO).read()
+    assert '"--policy"' not in src
+    assert '"--skip-cost-analysis"' not in src
+
+
+# ------------------------------------------------- 5. the hardware / stack
+
+def test_one_eight_gpu_blackwell_job_per_node_on_gpu19_gpu20(gen, campaign):
+    assert gen.CAMPAIGN_NODES == ("pgi15-gpu19", "pgi15-gpu20")
+    assert gen.CAMPAIGN_GPUS == 8 and gen.CAMPAIGN_CPUS == 128
+    for a in campaign:
+        text = gen.render(a)
+        assert a["kind"] == "train" and a["gpus"] == 8, a["name"]
+        assert gen.is_scratch(a), a["name"]
+        assert a["node"] in gen.CAMPAIGN_NODES, (a["name"], a["node"])
+        assert ("#SBATCH --gres=gpu:nvidia_rtx_pro_6000_blackwell_max-q_"
+                "workstation_edition:8\n") in text, a["name"]
+        assert "#SBATCH -c 128\n" in text, a["name"]
+        assert f"#SBATCH -w {a['node']}\n" in text
+        assert f"#SBATCH -D {gen.CAMPAIGN_STACK}/alphagrad\n" in text
+        assert f"#SBATCH -o {gen.CAMPAIGN_RUNS}/" in text
+        for bad in ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu17", "pgi15-gpu18"):
+            assert bad not in text, (a["name"], bad)
+        # the /Scratch stack of finding 57: no home, no uv
+        for line in text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            assert "uv run" not in line, (a["name"], line)
+            assert "~/dsnn" not in line and "$HOME/dsnn" not in line, (a["name"], line)
+            assert "/Users/assmuth" not in line, (a["name"], line)
+        assert f"PY={gen.CAMPAIGN_PY}\n" in text
+        assert f"cd {gen.CAMPAIGN_STACK}/alphagrad\n" in text
+        assert "ABORT(66)" in text
+        assert 'src/alphagrad/approx/ppo.py "${ARGS[@]}"' in text
+        assert "CUDA_VISIBLE_DEVICES=0,1,2,3" not in text, a["name"]
+    # both nodes are used, and phase 1 alternates them
+    p1 = [a for a in campaign if a["phase"] == 1]
+    assert [a["node"] for a in p1] == [gen.CAMPAIGN_NODES[i % 2] for i in range(6)]
+    assert {a["node"] for a in campaign} == set(gen.CAMPAIGN_NODES)
+
+
+# ------------------------------------------------- 6. the gate telemetry
+
+def test_gate_telemetry_has_no_switch_and_its_input_is_passed(gen, campaign):
+    """Ticket .45: ppo.py emits gate/*, paired/*, measure/* every episode from
+    host_log with no flag to turn it on or off; the launcher's part is G1's
+    input.  Pinned on the source so a future switch cannot silently default
+    to off."""
+    from alphagrad.approx.ppo import make_argparser
+    from alphagrad.approx.common import gate_telemetry
+    ap = make_argparser()
+    opts = {s for act in ap._actions for s in act.option_strings}
+    assert "--gate-winners-table" in opts and "--gate-offline-contrast" in opts
+    assert not [o for o in opts if "telemetry" in o], opts
+    src = open(_PPO).read()
+    assert "_gate_telemetry.episode_fields(" in src
+    assert "log_dict.update(_gate_telemetry.episode_fields(" in src
+    assert callable(gate_telemetry.episode_fields)
+    assert callable(gate_telemetry.add_gate_args)
+    assert os.path.exists(os.path.join(_ALPHAGRAD, "docs", "GATE_TELEMETRY.md"))
+    for a in campaign:
+        cli = _cli(gen, a)
+        assert (cli["--gate-winners-table"]
+                == gen.CAMPAIGN_GATE_WINNERS_TABLES[cli["--fixed-order"]])
+        assert (cli["--gate-offline-contrast"]
+                == gen.GATE_OFFLINE_CONTRAST[cli["--fixed-order"]])
+        text = gen.render(a)
+        assert "gate G1 winners table" in text, a["name"]
+        assert "episode_fields" in text, a["name"]   # the header says where
+        assert "measure/drain/" in text, a["name"]   # the .7 audit is named
+
+
+def test_every_contract_field_the_arm_will_emit_is_documented(gen, campaign):
+    """Ticket .45: the launcher carries the two inputs, and ppo.py emits the
+    whole table unconditionally.  This pins that the table the arms will be
+    read against is the one docs/GATE_TELEMETRY.md states, and that the nine
+    quantities the ticket names all have a field."""
+    from alphagrad.approx.common import gate_telemetry as gt
+    heads = ("latency", "mem", "quality")
+    names = gt.documented_fields(heads)
+    for want in ("paired/lat_ratio_best",          # paired latency ratio
+                 "paired/temp_ratio_best",         # paired memory ratio (temp)
+                 "paired/watermark_ratio_best",    # the watermark beside it
+                 "paired/grad_cosine_mean",        # grad-cosine
+                 "gate/g4/q_zero_frac",            # the q = 0 fraction
+                 "gate/g3/uniform_floor_nats",     # entropy against its floor
+                 "gate/g2/ev_latency",             # EV per value head
+                 "gate/g1/recovery",               # recovered sweep winners
+                 "gate/g5/spread_lat",             # front spread at the corners
+                 "gate/g5/drift_floor_lat",        # what the spread must beat
+                 "measure/drain/ok"):              # ticket .7
+        assert want in names, want
+    # the floor is derived from the head the arms run, not from a literal
+    geom = gt.face_head_geometry(gen.APPROX_ADD)
+    assert geom["width"] == gen.FACE_HEAD_WIDTH
+    assert geom["n_quant_default"] == len(gen.FACE_QUANT_DTYPES) - 1
+
+
+# ------------------------------------------------- 7. the builder raises
+
+def test_campaign_arm_raises_on_a_row_outside_the_rulings(gen):
+    n0 = len(gen.ARMS)
+    ok = dict(phase=9, tag="z", profile="skip", node=gen.CAMPAIGN_NODES[0],
+              what="x", prediction="x", falsifier="x")
+    bad = [
+        dict(ok, node="pgi15-gpu17"),
+        dict(ok, node="pgi15-gpu15"),
+        dict(ok, approx_add="lossy"),
+        dict(ok, approx_add="learned2"),
+        dict(ok, profile="everything"),
+        dict(ok, order="random"),
+        dict(ok, form="P9"),
+        dict(ok, rewards="cmp"),
+        dict(ok, advantage_norm="zscore"),
+        dict(ok, what=""),
+    ]
+    try:
+        for kw in bad:
+            with pytest.raises(gen.CampaignRowError):
+                gen.campaign_arm(**kw)
+        assert len(gen.ARMS) == n0
+        a = gen.campaign_arm(**ok)
+        assert a["name"] == f"p9z_skip_{REWARD_TOKEN}" and len(gen.ARMS) == n0 + 1
+        assert a["cli"]["--approx-add"] == "lossless"
+        assert a["cli"]["--fixed-order"] == "markowitz"
+    finally:
+        del gen.ARMS[n0:]
+    assert len(gen.ARMS) == n0
+    assert issubclass(gen.CampaignRowError, ValueError)
+
+
+def test_a_campaign_arm_with_a_per_arm_env_is_refused_at_render(gen):
+    a = dict(next(x for x in gen.ARMS if x.get("phase")))
+    a["env"] = {"ALPHAGRAD_MAX_FACES": "2538"}
+    with pytest.raises(gen.CampaignRowError):
+        gen.render(a)
+
+
+def test_setting_the_winner_constant_puts_the_profile_in_the_name(gen):
+    n0 = len(gen.ARMS)
+    saved = gen.P1_WINNER_PROFILE
+    try:
+        gen.P1_WINNER_PROFILE = "skip"
+        a = gen.campaign_arm(phase=9, tag="z", profile="WINNER",
+                             node=gen.CAMPAIGN_NODES[0], what="x",
+                             prediction="x", falsifier="x")
+        assert a["name"] == f"p9z_skip_{REWARD_TOKEN}"
+        assert a["cli"]["--approx-profile"] == "skip"
+        assert "P1_PROFILE" not in gen.render(a)
+    finally:
+        gen.P1_WINNER_PROFILE = saved
+        del gen.ARMS[n0:]
+
+
+# ------------------------------------------ 8. names and later phases
+
+def test_each_name_encodes_profile_order_channels_and_price(gen, campaign):
+    for a in campaign:
+        cli = _cli(gen, a)
+        name = a["name"]
+        prof = cli["--approx-profile"]
+        prof_tok = "winner" if _PLACEHOLDER.search(prof) else prof
+        assert f"_{prof_tok}_" in name, (name, prof)
+        if cli.get("--reward-mode") == "lagrangian":
+            assert "_dual" in name, name
+            assert f"eta{gen.DUAL_ETA.replace('.', '')}" in name, name
+        else:
+            # The price is in the name, and it is the price the flag carries.
+            assert f"_lq{cli['--lambda-acc']}" in name, name
+        if "--preference-conditioned" in cli:
+            assert "_pref" in name or "_dual" in name, name
+        else:
+            assert "_hinge_" in name, name
+        if "--quality-floor" in cli:
+            # "0.90" -> "09": the name states tau without a trailing zero.
+            tok = cli["--quality-floor"].replace(".", "").rstrip("0") or "0"
+            assert f"tau{tok}" in name, name
+        else:
+            assert "tau" not in name, name
+        if cli.get("--advantage-norm") == "popart":
+            assert name.endswith("_popart"), name
+        if cli["--seed"] != gen.CAMPAIGN_SEED:
+            assert f"_s{cli['--seed']}" in name, name
+        assert a["job"] == name.replace("_", "-")
+        assert cli["--name"] == a["job"]
 
 
 def test_phase2_channel_arms(gen, campaign):
     p2 = {a["name"]: _cli(gen, a) for a in campaign if a["phase"] == 2}
-    assert set(p2) == {"p2a_winner_addlossy_latq_lq5", "p2b_winner_addlossy_memq_lq5"}
-    assert p2["p2a_winner_addlossy_latq_lq5"]["--rewards"] == "cmp acc"
-    assert p2["p2b_winner_addlossy_memq_lq5"]["--rewards"] == "mem acc"
+    assert set(p2) == {f"p2a_winner_latq_{REWARD_TOKEN}", f"p2b_winner_memq_{REWARD_TOKEN}"}
+    assert p2[f"p2a_winner_latq_{REWARD_TOKEN}"]["--rewards"] == "cmp acc"
+    assert p2[f"p2b_winner_memq_{REWARD_TOKEN}"]["--rewards"] == "mem acc"
     for cli in p2.values():
         assert _PLACEHOLDER.search(cli["--approx-profile"]), cli["--approx-profile"]
         assert "P1_PROFILE" in cli["--approx-profile"]
@@ -326,12 +615,11 @@ def test_phase2_channel_arms(gen, campaign):
 
 def test_phase3_ladder_p0_p1_l(gen, campaign):
     p3 = {a["name"]: _cli(gen, a) for a in campaign if a["phase"] == 3}
-    assert set(p3) == {"p3a_winner_addlossy_pref",
-                       "p3b_winner_addlossy_pref_tau09",
-                       "p3c_winner_addlossy_dual_tau09"}
-    p0, p1, lag = (p3["p3a_winner_addlossy_pref"],
-                   p3["p3b_winner_addlossy_pref_tau09"],
-                   p3["p3c_winner_addlossy_dual_tau09"])
+    n0, n1, nl = (f"p3a_winner_pref_lq{LAMBDA_Q}",
+                  f"p3b_winner_pref_tau09_lq{LAMBDA_Q}",
+                  f"p3c_winner_dual_tau09_eta20")
+    assert set(p3) == {n0, n1, nl}
+    p0, p1, lag = p3[n0], p3[n1], p3[nl]
     for cli in (p0, p1, lag):
         assert "--preference-conditioned" in cli
     assert "--quality-floor" not in p0 and p0["--reward-mode"] == "additive"
@@ -339,7 +627,12 @@ def test_phase3_ladder_p0_p1_l(gen, campaign):
     assert p1["--reward-mode"] == "additive"
     assert lag["--quality-floor"] == gen.QUALITY_FLOOR_TAU
     assert lag["--reward-mode"] == "lagrangian"
-    assert lag.get("--loss-mode", "multi_head") == "multi_head"
+    # eta 2.0, lambda in [12, 32] (owner ruling 2026-09-13): one episode of
+    # full violation (q = 0 at tau = 0.90) moves lambda by 1.8, and 12 is the
+    # smallest weight that puts the Markowitz absorber below the baseline.
+    assert lag["--lag-eta"] == "2.0"
+    assert lag["--lag-min"] == "12" and lag["--lag-max"] == "32"
+    assert lag["--lag-init"] == LAMBDA_Q
 
 
 def test_phase4_popart_sets_no_symlog_at_every_site(gen, campaign):
@@ -363,49 +656,97 @@ def test_phase5_is_five_seeds_of_one_configuration(gen, campaign):
             if k in ("--seed", "--name"):
                 continue
             assert ref.get(k) == cli.get(k), (a["name"], k)
-    assert len({a["node"] for a in p5}) == 3   # spread over the three nodes
+    assert {a["node"] for a in p5} == set(gen.CAMPAIGN_NODES)
 
 
-# ------------------------------------------ 7. the campaign_arm builder
+# ------------------------------------ 9. the wave arms keep their runtime
 
-def test_campaign_arm_refuses_a_node_outside_the_allowed_set(gen):
-    n0 = len(gen.ARMS)
+def test_every_arm_including_the_wave_arms_gets_a_real_winners_table(gen):
+    """One mechanism: SHARED_CLI carries the _ByOrder sentinel and _merge_cli
+    resolves it from the arm's own --fixed-order.  The wave arms previously
+    carried ~/dsnn/run_analysis/sweep41/winners.csv, a path nothing has ever
+    written, so gate/g1/present read 0 in every one of them."""
+    for a in gen.ARMS:
+        if a.get("kind") != "train":
+            continue
+        cli = _cli(gen, a)
+        tbl = cli["--gate-winners-table"]
+        assert isinstance(tbl, str), (a["name"], tbl)
+        assert tbl == gen.CAMPAIGN_GATE_WINNERS_TABLES[cli["--fixed-order"]]
+        assert "run_analysis" not in tbl and "sweep41" not in tbl
+        assert tbl.startswith("/Scratch/")
+
+
+def test_an_order_without_a_sweep_raises_instead_of_borrowing_one(gen):
+    saved = dict(gen.CAMPAIGN_GATE_WINNERS_TABLES)
     try:
-        with pytest.raises(AssertionError):
-            gen.campaign_arm(phase=9, tag="z", profile="skip",
-                             node="pgi15-gpu17", what="x",
-                             prediction="x", falsifier="x")
-        with pytest.raises(AssertionError):
-            gen.campaign_arm(phase=9, tag="z", profile="skip",
-                             node="pgi15-gpu15", form="P9", what="x",
-                             prediction="x", falsifier="x")
+        del gen.CAMPAIGN_GATE_WINNERS_TABLES["reverse"]
+        with pytest.raises(ValueError) as e:
+            gen._merge_cli({"--fixed-order": "reverse"})
+        assert "winners table" in str(e.value)
     finally:
-        del gen.ARMS[n0:]
-    assert len(gen.ARMS) == n0
+        gen.CAMPAIGN_GATE_WINNERS_TABLES.clear()
+        gen.CAMPAIGN_GATE_WINNERS_TABLES.update(saved)
 
 
-def test_setting_the_winner_constant_puts_the_profile_in_the_name(gen):
-    n0 = len(gen.ARMS)
-    saved = gen.P1_WINNER_PROFILE
-    try:
-        gen.P1_WINNER_PROFILE = "skip"
-        a = gen.campaign_arm(phase=9, tag="z", profile="WINNER",
-                             node="pgi15-gpu15", what="x",
-                             prediction="x", falsifier="x")
-        assert a["name"] == "p9z_skip_addlossy_lq5"
-        assert a["cli"]["--approx-profile"] == "skip"
-        assert "P1_PROFILE" not in gen.render(a)
-    finally:
-        gen.P1_WINNER_PROFILE = saved
-        del gen.ARMS[n0:]
+def test_the_wave_arms_keep_the_home_runtime_and_the_shared_env(gen):
+    waves = [a for a in gen.ARMS if a["kind"] == "train" and not a.get("phase")]
+    assert waves
+    for a in waves:
+        assert not gen.is_scratch(a), a["name"]
+        text = gen.render(a)
+        assert "uv run --no-sync python" in text, a["name"]
+        assert "CUDA_VISIBLE_DEVICES=0,1,2,3" in text, a["name"]
+        assert f"  --approx-add {gen.APPROX_ADD}\n" in text, a["name"]
+        assert "  --fixed-order " in text, a["name"]
+        assert "ALPHAGRAD_FORCE_REV_ORDER" not in text, a["name"]
 
 
-# --------------------------------- 8. ppo.py's own argparse accepts them
+# ------------------------------------------- 10. --dry-run writes outside
+
+def test_dry_run_writes_outside_the_tree_and_diffs_against_it(gen, tmp_path):
+    tree = tmp_path / "tree"
+    out = tmp_path / "out"
+    tree.mkdir()
+    # one launcher "in the tree" that drifted, one identical, the rest missing
+    arms = gen.ARMS
+    (tree / f"fq_{arms[0]['name']}.sbatch").write_text("#!/bin/bash\n# stale\n")
+    (tree / f"fq_{arms[1]['name']}.sbatch").write_text(gen.render(arms[1]))
+    rc = gen.main(["--dry-run", "--out", str(out), "--against", str(tree)])
+    assert rc == 0
+    written = sorted(p.name for p in out.glob("fq_*.sbatch"))
+    assert written == sorted(f"fq_{a['name']}.sbatch" for a in arms)
+    assert (out / "DRIFT.diff").exists() and (out / "SUMMARY.txt").exists()
+    summary = (out / "SUMMARY.txt").read_text()
+    assert f"{len(arms)} launchers rendered" in summary
+    assert "1 ok, 1 DRIFT" in summary and f"{len(arms) - 2} MISSING" in summary
+    assert f"DRIFT    {tree / ('fq_' + arms[0]['name'] + '.sbatch')}" in summary
+    assert "# stale" in (out / "DRIFT.diff").read_text()
+    # the tree was not touched
+    assert sorted(p.name for p in tree.glob("*")) == sorted(
+        [f"fq_{arms[0]['name']}.sbatch", f"fq_{arms[1]['name']}.sbatch"])
+    assert (tree / f"fq_{arms[0]['name']}.sbatch").read_text() == "#!/bin/bash\n# stale\n"
+    # refuses to write INTO the tree
+    with pytest.raises(SystemExit):
+        gen.main(["--dry-run", "--out", str(tree), "--against", str(tree)])
+    with pytest.raises(SystemExit):
+        gen.main(["--dry-run", "--out", str(tree / "sub"), "--against", str(tree)])
+    with pytest.raises(SystemExit):
+        gen.main(["--dry-run", "--check", "--out", str(out), "--against", str(tree)])
+
+
+# --------------------------------- 11. ppo.py's own argparse accepts them
 
 def test_ppo_argparse_accepts_every_campaign_command_line(gen, campaign):
     # Layer 2 of the launcher's pre-flight, run here without a node.
     from alphagrad.approx.ppo import make_argparser
     ap = make_argparser()
+    prof_action = next(act for act in ap._actions
+                       if "--approx-profile" in act.option_strings)
+    assert tuple(prof_action.choices) == gen.PROFILES
+    order_action = next(act for act in ap._actions
+                        if "--fixed-order" in act.option_strings)
+    assert set(order_action.choices) == set(gen.FIXED_ORDERS)
     for a in campaign:
         toks = _tokens(gen, a, profile="skip")
         ns = ap.parse_args(toks)
@@ -414,15 +755,25 @@ def test_ppo_argparse_accepts_every_campaign_command_line(gen, campaign):
         assert ns.terminal_rewards_only, a["name"]
         assert ns.cost_form == "paired-log" and ns.mem_channel == "temp", a["name"]
         assert ns.quality_metric == "grad_cosine", a["name"]
-        assert ns.approx_add == cli["--approx-add"], a["name"]
+        assert ns.approx_add == "lossless", a["name"]
         assert ns.approx_old is None, a["name"]
+        assert ns.fixed_order == cli["--fixed-order"], a["name"]
+        assert ns.approx_profile == ("skip" if "P1_PROFILE" in cli["--approx-profile"]
+                                     else cli["--approx-profile"]), a["name"]
+        assert ns.face_actions and ns.per_face_masks and ns.unified_face_head
+        assert ns.live_faces and ns.dynamic_substeps and ns.incremental_encode
+        assert ns.ray_measure == 1 and ns.ray_measure_timeout == 600.0, a["name"]
         assert ns.face_none_bias == float(gen.FACE_NONE_BIAS_MVP), a["name"]
         assert ns.scale_face_head == float(gen.SCALE_FACE_HEAD_MVP), a["name"]
         assert ns.face_logit_clamp == float(gen.FACE_LOGIT_CLAMP_MVP), a["name"]
         assert ns.plan_log == "auto" and ns.episodes == 250, a["name"]
-        assert ns.gate_winners_table == gen.GATE_WINNERS_TABLE, a["name"]
+        assert (ns.gate_winners_table
+                == gen.CAMPAIGN_GATE_WINNERS_TABLES[ns.fixed_order]), a["name"]
+        assert ns.gate_offline_contrast == float(
+            gen.GATE_OFFLINE_CONTRAST[ns.fixed_order]), a["name"]
         assert ns.advantage_norm == cli.get("--advantage-norm", "none"), a["name"]
         assert ns.reward_mode == cli.get("--reward-mode", "additive"), a["name"]
+        assert ns.no_approx_head is False, a["name"]
         if "--quality-floor" in cli:
             assert ns.quality_floor == float(cli["--quality-floor"]), a["name"]
         else:
