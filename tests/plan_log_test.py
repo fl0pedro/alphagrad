@@ -333,8 +333,12 @@ def test_a_plan_refused_by_the_op_count_cap_is_still_recorded(monkeypatch):
     trips it. The record must exist, carry the reason, and be marked as not
     replayable -- its rewards are a sentinel, not a measurement."""
     monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
-    monkeypatch.setenv("ALPHAGRAD_MULS_SENTINEL_CAP", "0")
-    monkeypatch.delenv("ALPHAGRAD_SKIP_COUNT_OPS", raising=False)
+    # -1, so any counted op count trips it. `_SKIP_COUNT_OPS` is a MODULE
+    # CONSTANT read at env.py import time, and this file sets the env var at
+    # ITS import (line 31), so deleting the variable here would change
+    # nothing: set the constant.
+    monkeypatch.setenv("ALPHAGRAD_MULS_SENTINEL_CAP", "-1")
+    monkeypatch.setattr(envmod, "_SKIP_COUNT_OPS", False)
     envmod.consume_plan_records()
     env = _make_env()
     _run_episode(env, skip_face_of_vertex=1)
