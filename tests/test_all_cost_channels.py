@@ -92,6 +92,13 @@ def _the_configuration_this_module_measures_under(monkeypatch):
       module's "channel populated iff != 0" assertion then reports it missing.
       That is what made two of these three tests red in the full suite and
       green alone. Cleared here: the claims below are about the ABSOLUTE form.
+    * ALPHAGRAD_SKIP_COUNT_OPS=1 is set at import by about 35 modules
+      (``os.environ.setdefault``). It skips the symbolic count pass, so
+      muls_adds_fmas and max_io_sum read 0 BY DESIGN -- slots 0 and 3, two of
+      the six this module is about. Undoing it had no effect until
+      2026-09-13, because env.py froze the knob in a module constant at
+      import; it is read per call now (``env.skip_count_ops``), so this line
+      is both necessary and sufficient.
     * ALPHAGRAD_MEM_CHANNEL is cleared for the same reason: slot 5 must be the
       default channel, not whichever one another module selected.
     * ALPHAGRAD_DIRECT_MEASURE=1 is this module's own choice, not a repair: it
@@ -103,6 +110,7 @@ def _the_configuration_this_module_measures_under(monkeypatch):
     both sufficient and the only correct tool: nothing leaks to other modules.
     """
     monkeypatch.setenv("ALPHAGRAD_SKIP_COST_ANALYSIS", "0")
+    monkeypatch.setenv("ALPHAGRAD_SKIP_COUNT_OPS", "0")
     monkeypatch.setenv("ALPHAGRAD_DIRECT_MEASURE", "1")
     monkeypatch.delenv("ALPHAGRAD_COST_FORM", raising=False)
     monkeypatch.delenv("ALPHAGRAD_MEM_CHANNEL", raising=False)
