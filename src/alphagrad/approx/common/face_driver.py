@@ -542,7 +542,7 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
             order, spec_hist, int(np.asarray(step_count)),
             int(np.asarray(vertex_idx)) + 1, face_hist, skip_hist)
         return (np.asarray(sz, np.int32)[:F, :S, :N],
-                np.asarray(qt, np.float32)[:F, :S, :2],
+                np.asarray(qt, np.float32)[:F, :S, :NUM_FACE_QUANT_DTYPES],
                 np.asarray(pr, np.float32)[:F, :S, :N, :N],
                 np.asarray(cp, np.float32)[:F, :S, :N],
                 np.asarray(no, np.int32)[:F, :S])
@@ -683,7 +683,7 @@ def make_face_vertex_decide_callback(live_faces, *, max_faces, max_axes,
             face_rows_hist=face_hist, face_skips_hist=skip_hist)
         return (np.asarray(dec.rows, np.int32)[:F, :S, :3],
                 np.asarray(dec.sizes, np.int32)[:F, :S, :N],
-                np.asarray(dec.quant, np.float32)[:F, :S, :2],
+                np.asarray(dec.quant, np.float32)[:F, :S, :NUM_FACE_QUANT_DTYPES],
                 np.asarray(dec.pair, np.float32)[:F, :S, :N, :N],
                 np.asarray(dec.comp, np.float32)[:F, :S, :N],
                 np.asarray(dec.nout, np.int32)[:F, :S],

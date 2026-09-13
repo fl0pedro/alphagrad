@@ -406,7 +406,7 @@ def run_trace(case=None, steps=None):
         if face_out is not None:
             # The first ten are the historical tuple. Under --per-face-masks
             # the rollout appends the two PER-SLOT arrays the head masked
-            # with (sizes (F, S, N), quant (F, S, 2)); since 2026-09-13 those
+            # with (sizes (F, S, N), quant (F, S, K)); since 2026-09-13 those
             # are the STAGE-2 masks, so they are pinned below as well.
             (fa, f_logp, f_ent, f_pair, f_comp, f_valid, f_cnt, f_dt,
              f_de, f_ends) = face_out[:10]
