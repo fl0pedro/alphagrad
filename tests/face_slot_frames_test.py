@@ -59,6 +59,7 @@ from alphagrad.approx.env import (                              # noqa: E402
     decode_vertex_rule_specs, make_slot_frame_hook, slot_frame,
     vertex_frame)
 from alphagrad.approx.live_faces import LiveFaceStream          # noqa: E402
+from alphagrad.approx.common.masks import NUM_FACE_QUANT_DTYPES
 
 try:
     from jax.extend.core import ClosedJaxpr
@@ -405,7 +406,7 @@ def test_slot_legality_is_per_slot_and_matches_the_recorded_tensors():
     assert tuple(x[0] for x in _sites()[:FACE_SLOTS]) == (
         "lhs", "rhs", "res:new"), _sites()
     assert sizes.shape == (MAX_F, S_ALL, N_AX)
-    assert quant.shape == (MAX_F, S_ALL, 2)
+    assert quant.shape == (MAX_F, S_ALL, NUM_FACE_QUANT_DTYPES)
     assert pair.shape == (MAX_F, S_ALL, N_AX, N_AX)
     assert comp.shape == (MAX_F, S_ALL, N_AX)
     assert nout.shape == (MAX_F, S_ALL)
@@ -558,7 +559,7 @@ def _slot_inputs():
     comp[0, :2] = 1.0
     comp[1, 0] = 1.0
     comp[2, 0] = 1.0
-    quant = np.zeros((S, 2), np.float32)
+    quant = np.zeros((S, NUM_FACE_QUANT_DTYPES), np.float32)
     quant[0, 1] = 1.0
     quant[1, 1] = 1.0
     return (jnp.asarray(sizes), jnp.asarray(quant), jnp.asarray(pair),

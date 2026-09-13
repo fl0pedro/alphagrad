@@ -90,6 +90,7 @@ from alphagrad.approx.live_faces import LiveFaceStream, _SLOT_SITES
 from alphagrad.approx.unified_face_head import (
     OP_BLOCKDIAG, OP_NONE, OP_QUANT, OP_REDUCE)
 from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
+from alphagrad.approx.common.masks import NUM_FACE_QUANT_DTYPES
 from alphagrad.elimrl.baselines import tlm_target
 
 N_AX = 8
@@ -316,7 +317,7 @@ def _walk_one_graph(target, seed, slots_on=None, pass_="vertex"):
         sizes = np.zeros((F, S_ALL, N_AX), np.int32)
         pair = np.zeros((F, S_ALL, N_AX, N_AX), np.float32)
         comp = np.zeros((F, S_ALL, N_AX), np.float32)
-        quant = np.zeros((F, S_ALL, 2), np.float32)
+        quant = np.zeros((F, S_ALL, NUM_FACE_QUANT_DTYPES), np.float32)
         nout = np.zeros((F, S_ALL), np.int32)
         skips = np.zeros((F,), np.int32)
 
@@ -465,7 +466,7 @@ def _walk(target, seed, slots_on=None):
         sizes = np.zeros((F, S_ALL, N_AX), np.int32)
         pair = np.zeros((F, S_ALL, N_AX, N_AX), np.float32)
         comp = np.zeros((F, S_ALL, N_AX), np.float32)
-        quant = np.zeros((F, S_ALL, 2), np.float32)
+        quant = np.zeros((F, S_ALL, NUM_FACE_QUANT_DTYPES), np.float32)
         nout = np.zeros((F, S_ALL), np.int32)
 
         def _draw(f, s, L, _n=n):
@@ -1055,7 +1056,7 @@ def test_the_per_slot_draws_equal_one_joint_draw():
         final_pair = (rng.random((S, N_AX, N_AX)) < 0.5).astype(np.float32)
         final_comp = (rng.random((S, N_AX)) < 0.5).astype(np.float32)
         sz = np.full((S, N_AX), 4, np.int32)
-        qt = np.ones((S, 2), np.float32)
+        qt = np.ones((S, NUM_FACE_QUANT_DTYPES), np.float32)
         key = jrand.PRNGKey(trial)
         sk_all, row_all, lp_all, *_ = pol.sample_face(
             feats, tables, key, 0, jnp.asarray(final_pair),
@@ -1269,7 +1270,7 @@ def test_the_jitted_draw_is_the_eager_draw():
         pr = (rng.random((S, N_AX, N_AX)) < 0.5).astype(np.float32)
         cp = (rng.random((S, N_AX)) < 0.5).astype(np.float32)
         sz = np.full((S, N_AX), 4, np.int32)
-        qt = np.ones((S, 2), np.float32)
+        qt = np.ones((S, NUM_FACE_QUANT_DTYPES), np.float32)
         k = jrand.PRNGKey(t)
         _sk, row, *_ = pol.sample_face(
             feats, tables, k, 0, jnp.asarray(pr), jnp.asarray(cp),
@@ -1392,7 +1393,7 @@ def test_the_structural_contraction_is_the_apply_paths_own(target_name, tlm,
         sizes = np.zeros((F, FACE_SLOTS, N_AX), np.int32)
         pair = np.zeros((F, FACE_SLOTS, N_AX, N_AX), np.float32)
         comp = np.zeros((F, FACE_SLOTS, N_AX), np.float32)
-        quant = np.zeros((F, FACE_SLOTS, 2), np.float32)
+        quant = np.zeros((F, FACE_SLOTS, NUM_FACE_QUANT_DTYPES), np.float32)
 
         def _draw(f, s, L, _n=n):
             sizes[f, s] = L.sizes

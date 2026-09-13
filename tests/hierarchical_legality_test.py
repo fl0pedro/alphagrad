@@ -59,6 +59,7 @@ from alphagrad.approx.unified_face_head import (
 )
 from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
 from alphagrad.approx.unified_micro import face_dtype_idx_of, _KIND_MAP
+from alphagrad.approx.common.masks import NUM_FACE_QUANT_DTYPES
 from alphagrad.elimrl.baselines import tlm_target
 
 N_AX = 8
@@ -93,7 +94,7 @@ def _slot_inputs():
     comp[0, :2] = 1.0
     comp[1, 0] = 1.0
     comp[2, 0] = 1.0
-    quant = np.zeros((S, 2), np.float32)
+    quant = np.zeros((S, NUM_FACE_QUANT_DTYPES), np.float32)
     quant[0, 1] = 1.0   # slot 0: bf16 legal
     quant[1, 1] = 1.0   # slot 1: bf16 legal
     # slot 2: neither legal (quant[2] = [0, 0])
@@ -206,7 +207,8 @@ def test_d4_identity_quant_masking():
     z = head.logits(ctx)
 
     # float32 operand: only bf16 is legal (dm = [0, 1])
-    dm_f32 = jnp.array([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]], jnp.float32)
+    # an f32 operand with ONLY bfloat16 legal: the draw is then deterministic
+    dm_f32 = jnp.zeros((3, NUM_FACE_QUANT_DTYPES), jnp.float32).at[:, 1].set(1.0)
     op_m = jnp.array([[0.0, 0.0, 1.0, 1.0]] * 3, jnp.float32)  # Quant or None legal
     im = jnp.zeros((3, MAX_PAIR_IDX), jnp.float32)
     jm = jnp.zeros((3, MAX_PAIR_IDX), jnp.float32)

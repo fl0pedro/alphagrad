@@ -143,23 +143,26 @@ def test_other_draws_keep_the_documented_key_layout():
 # (op, dtype_idx, reduce_fn) -> (log_prob, entropy, arity) of the fixed
 # action below under the formula-built z, as computed on 0de8562 (before the
 # key fix). score() takes no key, so these may not move.
+# Recorded 2026-09-13 on the four-float head (SLOT_WIDTH 34, width 103):
+# the dtype field is a 4-way categorical, so every row that scores it
+# moved from the two-dtype Bernoulli values.
 _GOLDEN = {
-    (OP_BLOCKDIAG, 0, 0): (-18.3910866, 12.9543247, 4.0),
-    (OP_BLOCKDIAG, 0, 3): (-18.3910866, 12.9543247, 4.0),
-    (OP_BLOCKDIAG, 1, 0): (-18.3910866, 12.9543247, 4.0),
-    (OP_BLOCKDIAG, 1, 3): (-18.3910866, 12.9543247, 4.0),
-    (OP_REDUCE, 0, 0): (-15.9752541, 14.0296965, 4.0),
-    (OP_REDUCE, 0, 3): (-19.7695656, 14.0296965, 4.0),
-    (OP_REDUCE, 1, 0): (-15.9752541, 14.0296965, 4.0),
-    (OP_REDUCE, 1, 3): (-19.7695656, 14.0296965, 4.0),
-    (OP_QUANT, 0, 0): (-5.8218083, 6.0022840, 4.0),
-    (OP_QUANT, 0, 3): (-5.8218083, 6.0022840, 4.0),
-    (OP_QUANT, 1, 0): (-8.9324436, 6.0022840, 4.0),
-    (OP_QUANT, 1, 3): (-8.9324436, 6.0022840, 4.0),
-    (OP_NONE, 0, 0): (-3.2549269, 4.4599562, 1.0),
-    (OP_NONE, 0, 3): (-3.2549269, 4.4599562, 1.0),
-    (OP_NONE, 1, 0): (-3.2549269, 4.4599562, 1.0),
-    (OP_NONE, 1, 3): (-3.2549269, 4.4599562, 1.0),
+    (OP_BLOCKDIAG, 0, 0): (-17.6859608, 13.3440704, 4.0),
+    (OP_BLOCKDIAG, 0, 3): (-17.6859608, 13.3440704, 4.0),
+    (OP_BLOCKDIAG, 1, 0): (-17.6859608, 13.3440704, 4.0),
+    (OP_BLOCKDIAG, 1, 3): (-17.6859608, 13.3440704, 4.0),
+    (OP_REDUCE, 0, 0): (-16.3722954, 14.9236660, 4.0),
+    (OP_REDUCE, 0, 3): (-20.9385719, 14.9236660, 4.0),
+    (OP_REDUCE, 1, 0): (-16.3722954, 14.9236660, 4.0),
+    (OP_REDUCE, 1, 3): (-20.9385719, 14.9236660, 4.0),
+    (OP_QUANT, 0, 0): (-11.5787430, 8.0769119, 4.0),
+    (OP_QUANT, 0, 3): (-11.5787430, 8.0769119, 4.0),
+    (OP_QUANT, 1, 0): (-10.2028112, 8.0769119, 4.0),
+    (OP_QUANT, 1, 3): (-10.2028112, 8.0769119, 4.0),
+    (OP_NONE, 0, 0): (-3.6160471, 4.5792131, 1.0),
+    (OP_NONE, 0, 3): (-3.6160471, 4.5792131, 1.0),
+    (OP_NONE, 1, 0): (-3.6160471, 4.5792131, 1.0),
+    (OP_NONE, 1, 3): (-3.6160471, 4.5792131, 1.0),
 }
 
 
