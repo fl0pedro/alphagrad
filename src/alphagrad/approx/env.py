@@ -7839,9 +7839,12 @@ def _callback_measured(
         # with the SAME instrument (see _time_one_rep) -- but since
         # 2026-09-14 over its OWN number of points, so the list is built to
         # whichever of the two is longer and each half takes its prefix.
-        # The candidate reads `eval_args_all[:n_points]` and the reference
-        # `eval_args_all[:n_ref_points]`; at the campaign defaults the two
-        # are both 5 and the list is exactly what it always was. Built
+        # The candidate's windows walk `eval_args_all[:n_points]` round
+        # robin and the reference's walk `eval_args_all[:n_ref_points]`; at
+        # the campaign defaults the two are both 5 and the list is exactly
+        # what it always was. A half with fewer windows than points simply
+        # does not reach the later ones, which is what the budget means.
+        # Built
         # inside the try so a device_put OOM still truncates rather than
         # escaping.
         eval_args_all: list = []
