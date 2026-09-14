@@ -38,10 +38,12 @@ or falls on.
    as ``approx SKIP {}``. The test below therefore decides with SKIP, and
    reads the echo it expects off the emission env's OWN builder produces.
 
-3. NARROWER ID DTYPES (NOT landed). Token ids do not fit in uint8 at the
-   vocabulary the runs use, and the delta count rides in slot 0 of the SAME
-   buffer as the equation ids, one value above what int16 can hold at the
-   default budget. Both are pinned below.
+3. THE NARROW TOKEN WIRE (landed 2026-09-13). Token ids ride as uint8 at a
+   vocabulary of 256, the delta count rides in its own little-endian int32
+   over the first four byte slots of the wire, and the equation-id buffer is
+   GONE together with the palimpsa relational forget gate it fed. What used to
+   be pinned here as a REFUSAL ("token ids do not fit in a byte at 512") is
+   now pinned as the positive property.
 """
 from __future__ import annotations
 
@@ -170,7 +172,7 @@ def _perceptron():
 
 
 def _reference_step(jaxpr, argnums, consts, args, vertex, rows, skips,
-                    vocab=512):
+                    vocab=None):
     """``(tokens, [(start, split, end)])`` of ONE vertex's elimination.
 
     Built through ``env._face_dict_for_vertex`` -- THE builder the measurement
@@ -183,10 +185,11 @@ def _reference_step(jaxpr, argnums, consts, args, vertex, rows, skips,
 
     from graphax import IncrementalPathTokenizer
 
+    from alphagrad.approx.common.token_vocab import incr_token_vocab
     from alphagrad.approx.env import _face_dict_for_vertex
 
     ref = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
-                                   vocab_size=vocab)
+                                   vocab_size=incr_token_vocab(vocab))
     ref.base_tokens()
     keys = list(ref.ij.faces(int(vertex)))
     ft = _face_dict_for_vertex(SimpleNamespace(jaxpr=jaxpr), ref.ij,
@@ -222,7 +225,7 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
     argnums = (2, 3, 4, 5)
     V = len(jaxpr.eqns)
     MR, F, S = 8, 8, wire_slots()
-    VOCAB = 512
+    VOCAB = None            # the one resolver's answer (256)
 
     lfs = LiveFaceStream(jaxpr, argnums, consts, args, vocab=VOCAB,
                          max_faces=F, max_axes=8, window=8192)
@@ -242,7 +245,7 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
     vertex, n_faces = None, 0
     for cand in range(1, V + 1):
         lfs._chunks.clear()
-        k = int(lfs.chunk(order, specs, 0, cand, vspecs, exact, no_skip, 0)[3])
+        k = int(lfs.chunk(order, specs, 0, cand, vspecs, exact, no_skip, 0)[2])
         if k >= 2:
             vertex, n_faces = cand, k
             break
@@ -262,7 +265,7 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
     for f in range(n_faces):
         lfs._chunks.clear()
         assert int(lfs.chunk(order, specs, 0, vertex, vspecs, exact,
-                             no_skip, f)[5]) == 0
+                             no_skip, f)[4]) == 0
 
     # Now SKIP. Face f's chunk is read with faces 0..f-1 decided and face f
     # still undecided, so the emission it comes from is `_skips(f)`.
@@ -272,7 +275,7 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
         toks_f, segs_f = _reference_step(
             jaxpr, argnums, consts, args, vertex, exact, sk, VOCAB)
         lfs._chunks.clear()
-        tok, _ids, cnt, nf, _ends, head = lfs.chunk(
+        tok, cnt, nf, _ends, head = lfs.chunk(
             order, specs, 0, vertex, vspecs, exact, sk, f)
         cnt, head = int(cnt), int(head)
         assert int(nf) == n_faces
@@ -314,7 +317,7 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
     lfs._chunks.clear()
     past = lfs.chunk(order, specs, 0, vertex, vspecs, exact,
                      _skips(n_faces), n_faces)
-    assert int(past[2]) == 0 and int(past[5]) == 0, (
+    assert int(past[1]) == 0 and int(past[4]) == 0, (
         "there is a chunk past the last face, so the last face's echo would "
         "have a carrier after all")
 
@@ -327,16 +330,14 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
 
 
 # --------------------------------------------------------------------------
-# 3. NARROW ID DTYPES (landed 2026-09-13)
+# 3. THE NARROW TOKEN WIRE (landed 2026-09-13)
 # --------------------------------------------------------------------------
 #
-# Token ids ride as uint8, equation ids as int16, and the delta count -- which
-# fits in neither -- rides in its own little-endian int32 header at the front
-# of the token wire. The tests below pin the three things that make that
-# exact: the vocabulary fits a byte, the count survives values above 255 and
-# above 32767, and an equation id past int16 raises on the host instead of
-# wrapping negative (where the relational gate would read it as "no
-# equation").
+# Token ids ride as uint8 at a vocabulary of 256, the delta count rides in its
+# own little-endian int32 across the first four byte slots of the wire, and the
+# equation-id buffer is GONE -- with the palimpsa relational forget gate it fed
+# and with the (MAX_EQNS,) histogram that reproduced the gate inside the
+# recurrence. The tests below pin all three.
 
 _DIGIT_BASE = 10
 
@@ -447,7 +448,7 @@ def test_a_vocabulary_wider_than_a_byte_raises_because_the_wire_would_wrap():
 
 def test_the_live_face_stream_refuses_a_vocabulary_wider_than_a_byte():
     """The face chunks are a slice of the SAME emission, so they carry the
-    same ids and must be built at the same id space."""
+    same tokens and must be built at the same id space."""
     from alphagrad.approx.live_faces import LiveFaceStream
 
     jaxpr, consts, args = _perceptron()
@@ -483,42 +484,29 @@ def test_the_trainer_default_embedding_width_is_the_tokenizer_vocabulary():
     assert int(args.vocab_size) == incr_token_vocab()
 
 
-def test_the_delta_count_header_is_its_own_int32_outside_both_id_buffers():
+def test_the_delta_count_header_is_its_own_int32_outside_the_token_buffer():
     """THE HEADER SCHEME.
 
-    The count used to ride in slot 0 of BOTH wire buffers (``t[0] = n``,
-    ``e[0] = n``). A count up to ``MAX_DELTA_TOKENS`` fits neither uint8 nor
-    int16, so it moved out: the first ``DELTA_HEADER_SLOTS`` byte slots of the
-    TOKEN buffer are one little-endian int32, the same slots of the EQUATION
-    buffer carry the pad sentinel and are read by nobody, and the ids start at
-    ``DELTA_HEADER_SLOTS`` in both.
+    The count used to ride in slot 0 of the token buffer (``t[0] = n``). A
+    count up to ``MAX_DELTA_TOKENS`` does not fit in a byte, so it moved out:
+    the first ``DELTA_HEADER_SLOTS`` slots of the wire are one little-endian
+    int32 and the tokens start after them.
     """
     from alphagrad.approx import env as _env
 
-    stream = list(range(20))
-    seg_ids = [0] * 20
-    t, e = _env._delta_observation(stream, seg_ids, 5)
-    t = np.asarray(t)
-    e = np.asarray(e)
+    t = np.asarray(_env._delta_observation(list(range(20)), 5))
     assert t.dtype == np.uint8
-    assert e.dtype == np.int16
-    assert t.shape == e.shape == (_env.DELTA_HEADER_SLOTS
-                                 + _env.MAX_DELTA_TOKENS,)
-    # The header says 15, and it is NOT in either id stream.
+    assert t.shape == (_env.DELTA_HEADER_SLOTS + _env.MAX_DELTA_TOKENS,)
     assert int(_env.decode_delta_header(t)) == 15
-    assert list(np.asarray(e[:_env.DELTA_HEADER_SLOTS])) == [
-        _env.DELTA_EQN_PAD] * _env.DELTA_HEADER_SLOTS
     H = _env.DELTA_HEADER_SLOTS
     assert list(t[H:H + 15]) == list(range(5, 20))
-    assert list(e[H:H + 15]) == [0] * 15
-    assert int(e[H + 15]) == _env.DELTA_EQN_PAD
     assert int(t[H + 15]) == _env.DELTA_TOKEN_PAD
 
 
 def test_a_delta_count_above_a_byte_and_above_int_sixteen_survives_the_header():
     """THE ROUND TRIP THE HEADER EXISTS FOR.
 
-    256 is the first count uint8 cannot hold and 32768 is the first int16
+    256 is the first count a byte cannot hold and 32768 is the first int16
     cannot; both are real delta lengths at the default budget. The header must
     return them exactly, or the encoder reads a truncated delta and its
     recurrence desyncs from the stream for the rest of the episode.
@@ -529,12 +517,9 @@ def test_a_delta_count_above_a_byte_and_above_int_sixteen_survives_the_header():
               int(_env.MAX_DELTA_TOKENS)):
         if n > _env.MAX_DELTA_TOKENS:
             continue
-        stream = [1] * n
-        seg_ids = [0] * n
-        t, e = _env._delta_observation(stream, seg_ids, 0)
-        assert int(_env.decode_delta_header(np.asarray(t))) == n, (
-            f"a delta of {n} tokens came back as "
-            f"{int(_env.decode_delta_header(np.asarray(t)))}")
+        t = np.asarray(_env._delta_observation([1] * n, 0))
+        got = int(_env.decode_delta_header(t))
+        assert got == n, f"a delta of {n} tokens came back as {got}"
 
 
 def test_the_header_codec_round_trips_every_count_the_budget_allows():
@@ -560,109 +545,162 @@ def test_token_id_zero_is_a_real_token_so_padding_is_read_from_the_count():
 
     from alphagrad.approx import env as _env
 
-    vocab, n_vocab, _ = get_vocab(_DIGIT_BASE)
+    _vocab, n_vocab, _ = get_vocab(_DIGIT_BASE)
     assert n_vocab[0] == "-", (
         "token 0 is no longer '-'; recheck whether 0 can still occur inside a "
         "real stream before relaxing anything that depends on this")
 
-    stream = [0] * 7
-    t, e = _env._delta_observation(stream, [0] * 7, 0)
-    assert int(_env.decode_delta_header(np.asarray(t))) == 7
+    t = np.asarray(_env._delta_observation([0] * 7, 0))
+    assert int(_env.decode_delta_header(t)) == 7
     H = _env.DELTA_HEADER_SLOTS
-    assert list(np.asarray(t)[H:H + 7]) == [0] * 7
-
-
-def test_an_equation_id_above_int_sixteen_raises_on_the_host():
-    """THE RAISE THAT REPLACES A SILENT WRAP.
-
-    ``IncrementalPathTokenizer._eqn_seg`` is a stream-global counter that
-    nothing bounds. Cast to int16 it would go NEGATIVE past 32767, and
-    negative means "no equation" to the relational gate -- a change of meaning,
-    not a change of precision.
-    """
-    from alphagrad.approx import env as _env
-
-    with pytest.raises(ValueError, match="exceeds 32767"):
-        _env._delta_observation([1, 2, 3], [0, 32768, 1], 0)
-
-    # 32767 itself is fine: the bound is inclusive.
-    t, e = _env._delta_observation([1, 2, 3], [0, 32767, 1], 0)
-    H = _env.DELTA_HEADER_SLOTS
-    assert int(np.asarray(e)[H + 1]) == 32767
+    assert list(t[H:H + 7]) == [0] * 7
 
 
 def test_a_token_id_above_a_byte_raises_on_the_host():
+    """THE RAISE THAT REPLACES A SILENT WRAP. A token past 255 means the
+    tokenizer was built at a vocabulary the wire cannot carry."""
     from alphagrad.approx import env as _env
 
     with pytest.raises(ValueError, match="outside .0, 255."):
-        _env._delta_observation([1, 256, 3], [0, 0, 0], 0)
-
-
-def test_the_max_eqns_gate_clip_sits_far_below_the_int_sixteen_bound():
-    """HOW THE TWO BOUNDS INTERACT.
-
-    ``ppo.MAX_EQNS`` (4096 by default) clips every equation id into
-    ``[0, MAX_EQNS)`` at the relational-gate histogram, so ids past it already
-    share the top bucket. The int16 bound is eight times higher, which means
-    the clip ALWAYS bites first and the raise never changes a gate value that
-    the clip was not already collapsing. The raise still earns its place: a
-    wrapped id goes NEGATIVE, and negative is not "the top bucket", it is "no
-    equation at all".
-    """
-    from alphagrad.approx.ppo import MAX_EQNS
-    from alphagrad.approx.common.token_vocab import DELTA_EQN_MAX
-
-    assert MAX_EQNS - 1 < DELTA_EQN_MAX
-    assert DELTA_EQN_MAX >= 8 * MAX_EQNS
+        _env._delta_observation([1, 256, 3], 0)
+    # 255 itself is fine: the bound is inclusive.
+    t = np.asarray(_env._delta_observation([1, 255, 3], 0))
+    assert int(t[_env.DELTA_HEADER_SLOTS + 1]) == 255
 
 
 # --------------------------------------------------------------------------
-# 3b. the stored buffers, both ends
+# 3b. the equation ids are GONE, at both ends
 # --------------------------------------------------------------------------
 
-def test_the_env_state_delta_buffers_are_uint8_and_int16_at_reset():
-    """THE ROLLOUT STORE. ``reset`` is the one place both buffers are built
-    from nothing, so it is where a widened dtype would reappear."""
+def test_the_equation_id_budget_knob_raises_instead_of_being_ignored():
+    """A knob whose name still reads like a budget but which nothing consults
+    is how a run gets mis-read, so ``ALPHAGRAD_MAX_EQNS`` raises -- the same
+    policy ``ALPHAGRAD_MAX_TOKENS`` got when it was deleted. Checked in a
+    FRESH interpreter, because ``ppo`` reads it once at import."""
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("ALPHAGRAD_")}
+    env["JAX_PLATFORMS"] = "cpu"
+    env["ALPHAGRAD_MAX_EQNS"] = "4096"
+    env["PATH"] = os.environ.get("PATH", "")
+    env["PYTHONPATH"] = os.environ.get("PYTHONPATH", "")
+    env["HOME"] = os.environ.get("HOME", "/tmp")
+    r = subprocess.run(
+        [sys.executable, "-c",
+         "import alphagrad.approx.ppo"],
+        env=env, capture_output=True, text=True, timeout=900)
+    assert r.returncode != 0, "ALPHAGRAD_MAX_EQNS was accepted silently"
+    assert "ALPHAGRAD_MAX_EQNS is GONE" in r.stderr, r.stderr[-2000:]
+
+
+def test_the_encoder_carry_has_three_leaves_and_no_equation_histogram():
+    """``cumhist`` was ``(MAX_EQNS,) = 4096`` float32 PER STEP PER SAMPLE in
+    the trajectory, and ``nvalid`` a scalar beside it. Both existed only to
+    reproduce the relational forget-gate features inside the recurrence."""
+    from alphagrad.approx.ppo import EncCarry
+
+    assert EncCarry._fields == ("M", "I", "pos")
+
+
+def test_the_palimpsa_mixers_have_no_relational_gate_and_take_no_equation_ids():
+    """THE CONSUMER, removed. A ``rel_gate`` left behind would be a dead
+    parameter the optimizer still updates, and an ``eqn_ids`` argument left
+    behind would be a silent no-op for any caller that still passed one."""
+    import inspect
+
+    from alphagrad.transformer.palimpsa_encoder import (
+        BiPalimpsaMixer, PalimpsaEncoder, PalimpsaEncoderLayer, PalimpsaMixer,
+    )
+
+    for cls in (PalimpsaMixer, BiPalimpsaMixer):
+        assert not hasattr(cls, "_relational_gate_mod")
+        assert "rel_gate" not in cls.__dataclass_fields__
+        assert "eqn_ids" not in inspect.signature(cls.__call__).parameters
+    for cls in (PalimpsaEncoderLayer, PalimpsaEncoder):
+        assert "eqn_ids" not in inspect.signature(cls.__call__).parameters
+
+
+def test_a_built_palimpsa_encoder_refuses_equation_ids():
+    """The removal reaches the INSTANCE, not only the class: a caller that
+    still hands this encoder ids gets a TypeError, loudly."""
+    import jax.random as jrand
+
+    from alphagrad.transformer import make_encoder
+
+    enc = make_encoder("palimpsa", 1, 2, 8, 16, key=jrand.PRNGKey(0))
+    xs = jnp.zeros((4, 8), jnp.float32)
+    out = enc(xs, key=jrand.PRNGKey(1))
+    assert out.shape == (4, 8)
+    with pytest.raises(TypeError):
+        enc(xs, eqn_ids=jnp.zeros((4,), jnp.int32), key=jrand.PRNGKey(1))
+
+
+def test_no_trajectory_or_train_batch_leaf_carries_equation_ids():
+    """THE STORE. Four leaves went: ``delta_eqns``, ``face_delta_eqns``,
+    ``enc_cumhist`` and ``enc_nvalid``."""
+    from alphagrad.approx.ppo import Trajectory, TrainBatch
+
+    for cls in (Trajectory, TrainBatch):
+        names = set(cls.__dataclass_fields__)
+        assert "delta_eqns" not in names
+        assert "face_delta_eqns" not in names
+        assert "enc_cumhist" not in names
+        assert "enc_nvalid" not in names
+        assert "delta_tokens" in names
+        assert "delta_count" in names
+
+
+def test_the_env_state_carries_tokens_and_a_count_and_no_equation_buffer():
+    """THE ROLLOUT STORE. ``reset`` is the one place the buffer is built from
+    nothing, so it is where a widened dtype or a resurrected id buffer would
+    reappear."""
     from alphagrad.approx import env as _env
 
+    assert "delta_eqns" not in _env.EnvState._fields
     e = _make_delta_env()
     st = e.reset()
     assert np.asarray(st.delta_tokens).dtype == np.uint8
-    assert np.asarray(st.delta_eqns).dtype == np.int16
     assert np.asarray(st.delta_count).dtype == np.int32
     assert np.asarray(st.delta_tokens).shape == (_env.MAX_DELTA_TOKENS,)
-    assert np.asarray(st.delta_eqns).shape == (_env.MAX_DELTA_TOKENS,)
 
 
-def test_the_callback_wire_declares_the_narrow_dtypes_and_the_header_width():
+def test_the_callback_wire_is_two_arrays_of_the_declared_width_and_dtype():
     """THE WIRE, as ``io_callback`` enforces it. The Ray measurement pool
-    preallocates at ``env.obs_width`` / ``env.wire_token_dtype``, so these
-    three descriptions of one buffer are checked against each other here."""
+    preallocates at ``env.obs_width`` / ``env.wire_token_dtype`` and stacks
+    ``env.wire_arity`` arrays, so these descriptions of one buffer are checked
+    against each other here."""
     from alphagrad.approx import env as _env
 
     e = _make_delta_env()
     assert e.obs_width == _env.DELTA_HEADER_SLOTS + _env.MAX_DELTA_TOKENS
     assert e.wire_token_dtype is _env.DELTA_TOKEN_DTYPE
-    assert e.wire_eqn_dtype is _env.DELTA_EQN_DTYPE
     shp = e._callback_shape
-    assert shp[0].shape == shp[1].shape == (e.obs_width,)
+    assert e.wire_arity == len(shp) == 2, (
+        "the delta wire is (tokens, reward); a third array means the "
+        "equation-id buffer came back")
+    assert shp[0].shape == (e.obs_width,)
     assert shp[0].dtype == jnp.uint8
-    assert shp[1].dtype == jnp.int16
+    assert shp[1].shape == (_env.NUM_REWARDS,)
+    # And the env refuses to invent an equation dtype it does not have.
+    with pytest.raises(RuntimeError, match="no equation-id buffer"):
+        e.wire_eqn_dtype
 
 
 def test_the_loss_reads_the_delta_through_a_cast_so_the_gather_stays_int32():
-    """THE LOSS END. ``encode_extend`` is the single reader of both stored
-    buffers; it casts to int32 before the embedding gather and before the
-    relational comparison, so a narrow store cannot change the arithmetic."""
-    from alphagrad.approx.ppo import MAX_EQNS      # noqa: F401
-
+    """THE LOSS END. ``encode_extend`` is the single reader of the stored
+    buffer; it casts to int32 before the embedding gather, so a byte-wide
+    store cannot change the arithmetic. Its signature also no longer takes an
+    equation buffer."""
     import inspect
 
     from alphagrad.approx.ppo import Agent
 
     src = inspect.getsource(Agent.encode_extend)
     assert 'fill_value=0).astype(jnp.int32)' in src
-    assert 'fill_value=-1).astype(jnp.int32)' in src
+    assert "eqn" not in inspect.signature(Agent.encode_extend).parameters
+    assert "eqn_ids_buf" not in src
 
 
 def _make_delta_env():
