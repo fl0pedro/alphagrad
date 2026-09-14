@@ -344,6 +344,9 @@ class BinPolicy:
                 f"{LOG2_MAX_ENV}={self.cap}")
         self.recent = deque(maxlen=self.window)
         self.log2 = self.initial
+        # The bin the LAST episode ran at, or None before the first one.
+        # Only used to decide whether a bin change is worth a log line.
+        self.last_used = None
 
     def record(self, length) -> None:
         """Note one episode's LONGEST stream (both streams, all environments).
@@ -389,7 +392,16 @@ def run_episode(policy, what, fn, log=print):
     (`policy.record(...)`), because only the caller sees the cursors the
     rollout came back with.
     """
+    previous = policy.last_used
     n = policy.pick()
+    policy.last_used = n
+    if previous is not None and n != previous:
+        # THE BIN MOVED WITHOUT AN OVERFLOW. One line, because a bin change
+        # is a recompile the first time and an operator reading the log has
+        # no other way to see the drift. Down is as normal as up here.
+        log("[episode-stream] bin 2^%d -> 2^%d for %s (recent max %d slots, "
+            "margin %g)"
+            % (previous, n, what, max(policy.recent), policy.margin))
     while True:
         try:
             return fn(n)
@@ -401,6 +413,7 @@ def run_episode(policy, what, fn, log=print):
             if length:
                 policy.record(length)
             old, n = n, policy.bump(n)
+            policy.last_used = n
             log("[episode-stream] bin 2^%d -> 2^%d, repeating %s: %s"
                 % (old, n, what, inner))
 

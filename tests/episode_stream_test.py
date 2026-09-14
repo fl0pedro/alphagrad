@@ -359,6 +359,33 @@ def test_the_driver_repeats_an_overflowing_episode_one_bin_up_and_records_it():
     assert p.pick() == 22
 
 
+def test_the_driver_logs_one_line_when_the_bin_moves_without_an_overflow():
+    """A bin change is a recompile the first time it happens, and an
+    operator reading the log has no other way to see the drift. Down gets a
+    line exactly as up does."""
+    p = ES.BinPolicy(19, history=2, margin=2.0)
+    lines = []
+
+    def episode(n):
+        return n
+
+    # First episode: no previous bin, so nothing to report.
+    assert ES.run_episode(p, "episode 0", episode, log=lines.append) == 19
+    assert lines == []
+
+    # Two short episodes push the bin down, and that is one line.
+    p.record(1_000)
+    p.record(1_000)
+    assert ES.run_episode(p, "episode 1", episode, log=lines.append) == 11
+    assert len(lines) == 1
+    assert "2^19 -> 2^11" in lines[0] and "episode 1" in lines[0]
+
+    # A bin that does not move says nothing.
+    p.record(1_000)
+    assert ES.run_episode(p, "episode 2", episode, log=lines.append) == 11
+    assert len(lines) == 1
+
+
 def test_the_driver_recognises_the_overflow_after_the_runtime_wrapped_it():
     """The raise happens inside a `jax.pure_callback`, so it comes back out
     through XLA and the runtime may wrap it in its own error class. The
