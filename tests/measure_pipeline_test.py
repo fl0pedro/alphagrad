@@ -771,3 +771,197 @@ def test_the_call_site_parked_counters_read_the_park_before_they_drain():
                 f"{name} at line {line} of ppo.py drains a counter without "
                 f"reading _POOL_DRAIN first; pipelined, it would report the "
                 f"wrong episode's number")
+
+
+# ----------------------- 7. the zero of a one-element counter (job 65715)
+
+def test_the_fresh_state_keeps_every_one_element_counter_one_element_long():
+    """CANARY JOB 65715. Nine of the per-episode accumulators are `[0]`, a
+    number every reader indexes. The driver used to reset them by emptying
+    every list, which is not zero but a MISSING ELEMENT, and the next
+    `consume_plan_records` raised IndexError.
+    """
+    from alphagrad.approx import env as ENV
+
+    fixed = ENV.episode_telemetry_fixed_counters()
+    # The ones the traceback named have to be in there.
+    for name in ("_PLAN_LOG_TERMINALS", "_PLAN_LOG_DROPPED",
+                 "_TOKLEN_SUM", "_DEGENERATE_PLANS"):
+        assert name in fixed, (name, fixed)
+    outer = ENV.episode_telemetry_snapshot()
+    try:
+        # Fill them, then reset, and check the SHAPE survived.
+        ENV._PLAN_LOG_TERMINALS[0] = 7
+        ENV._PLAN_LOG_DROPPED[0] = 3
+        ENV._TOKLEN_SUM[0] = 99
+        ENV._PLAN_RECORDS.append({"what": "a record"})
+        ENV.episode_telemetry_reset()
+        for name in fixed:
+            assert len(getattr(ENV, name)) == 1, name
+            assert getattr(ENV, name)[0] == 0, name
+        # And the collections really are empty.
+        assert ENV._PLAN_RECORDS == []
+    finally:
+        ENV.episode_telemetry_restore(outer)
+
+
+def test_a_discard_drain_and_restore_leaves_consume_plan_records_well_formed():
+    """(a) of the follow-up. The exact call that raised, after the exact
+    sequence a discarded attempt puts the containers through."""
+    from alphagrad.approx import env as ENV
+
+    outer = ENV.episode_telemetry_snapshot()
+    try:
+        ENV._PLAN_RECORDS.clear()
+        ENV._PLAN_LOG_TERMINALS[0] = 0
+        ENV._PLAN_LOG_DROPPED[0] = 0
+        # What the driver does at the top of an attempt.
+        snap = ENV.episode_telemetry_snapshot()
+        # What one attempt's callbacks do.
+        ENV._record_plan({"env_index": 0})
+        ENV._PLAN_LOG_TERMINALS[0] += 1
+        # What the discard does: drain (and drop), then put the containers
+        # back to what the attempt found.
+        dropped = ENV.consume_plan_records()
+        assert dropped["terminals"] == 1
+        ENV.episode_telemetry_restore(snap)
+        # And now the call that raised in job 65715.
+        out = ENV.consume_plan_records()
+        assert isinstance(out, dict)
+        assert out["records"] == [] and out["terminals"] == 0
+        assert out["dropped"] == 0
+        for key in ("compile_fallbacks", "compile_fallbacks_total",
+                    "toolchain_ok", "mem_parity", "paired_ref", "enabled",
+                    "pid"):
+            assert key in out, key
+    finally:
+        ENV.episode_telemetry_restore(outer)
+
+
+def test_two_overflow_repeats_then_a_collect_leaves_the_counters_readable():
+    """(b) of the follow-up: the sequence of job 65715 at unit level.
+
+    Pipeline armed, a pool present, TWO window-bin repeats of episode 0, then
+    the successful attempt's collect, then the next episode's first read. The
+    collect is where the reset happens, and the read after it is what used to
+    raise.
+    """
+    import sys
+    import types
+
+    from alphagrad.approx import env as ENV
+    from alphagrad.approx.common import episode_stream as ES
+
+    class _Actor:
+        def __init__(self):
+            self.records = []
+
+        class _M:
+            def __init__(self, v):
+                self._v = v
+
+            def remote(self):
+                return self._v
+
+        def __getattr__(self, name):
+            if name == "consume_plan_records":
+                out = {"records": self.records, "dropped": 0,
+                       "terminals": len(self.records), "actor_id": 1,
+                       "enabled": True}
+                self.records = []
+                return _Actor._M(out)
+            raise AttributeError(name)
+
+    class _Pool:
+        def __init__(self, actor):
+            self._actor = actor
+
+        def live_actors(self):
+            return [self._actor]
+
+    fake_ray = types.ModuleType("ray")
+    fake_ray.get = lambda x, timeout=None: x
+    saved_ray = sys.modules.get("ray")
+    sys.modules["ray"] = fake_ray
+    outer = ENV.episode_telemetry_snapshot()
+    try:
+        from alphagrad.approx.common.measure_pool import (
+            merge_pool_plan_records)
+
+        ENV.episode_telemetry_reset()
+        actor = _Actor()
+        pool = _Pool(actor)
+        policy = ES.BinPolicy(8, history=4, margin=2.0)
+        held = {"attempt": 0}
+
+        def attempt(n):
+            held["snapshot"] = ENV.episode_telemetry_snapshot()
+            ENV.set_plan_log_attempt(held["attempt"])
+            # One episode's worth of trainer-side counting, including the
+            # one-element counters the crash was about.
+            for e in range(2):
+                ENV._record_plan({"env_index": e, "bin": n})
+                actor.records.append({"env_index": -1, "bin": n})
+            ENV._PLAN_LOG_TERMINALS[0] += 2
+            ENV._record_token_length(1234)
+            # TWO repeats: the bin has to climb 8 -> 9 -> 10.
+            return "attempt-%d" % n, (
+                ES.StreamOverflow(env_index=1, step=4, length=1 << (n + 1),
+                                  log2=n)
+                if n < 10 else None)
+
+        def discard(_result):
+            merge_pool_plan_records(pool)
+            ENV.consume_plan_records()
+            ENV.episode_telemetry_restore(held["snapshot"])
+            held["attempt"] += 1
+
+        assert ES.run_episode(policy, "episode 0", attempt,
+                              log=lambda _l: None,
+                              on_discard=discard) == "attempt-10"
+        assert held["attempt"] == 2, "the sequence needs TWO repeats"
+
+        # THE COLLECT. Park this episode's counters and reset the live ones.
+        parked = ENV.episode_telemetry_snapshot()
+        ENV.episode_telemetry_reset()
+
+        # THE NEXT EPISODE'S FIRST READS, which is where job 65715 raised.
+        ENV._record_token_length(99)          # indexes _TOKLEN_SUM[0]
+        ENV._record_plan({"env_index": 0, "bin": "next"})
+        ENV._PLAN_LOG_TERMINALS[0] += 1
+        live = ENV.consume_plan_records()
+        assert live["terminals"] == 1
+        assert [r["bin"] for r in live["records"]] == ["next"]
+
+        # And the parked episode still reads back as its own.
+        ENV.episode_telemetry_restore(parked)
+        kept = ENV.consume_plan_records()
+        assert kept["terminals"] == 2
+        assert [r["bin"] for r in kept["records"]] == [10, 10]
+        assert [r["attempt"] for r in kept["records"]] == [2, 2]
+    finally:
+        ENV.episode_telemetry_restore(outer)
+        ENV.set_plan_log_attempt(0)
+        if saved_ray is None:
+            del sys.modules["ray"]
+        else:
+            sys.modules["ray"] = saved_ray
+
+
+def test_no_driver_fabricates_a_zero_by_emptying_every_list():
+    """The shape of the bug, pinned as source.
+
+    `episode_telemetry_reset` exists so nobody has to know which of these
+    containers are counters and which are collections. A driver that builds
+    its own zero is the defect of job 65715 coming back.
+    """
+    import inspect
+
+    from alphagrad.approx import ppo
+
+    src = inspect.getsource(ppo)
+    assert "episode_telemetry_reset()" in src, (
+        "ppo.py no longer resets the per-episode accumulators through env.py")
+    assert "_telemetry_zero" not in src, (
+        "ppo.py fabricates its own telemetry zero again; env.py owns what "
+        "zero means for its containers (canary job 65715)")

@@ -9499,3 +9499,45 @@ def episode_telemetry_restore(snapshot: dict) -> None:
         else:
             container.clear()
             container.update(value)
+
+
+# THE FRESH-PROCESS STATE, captured at IMPORT, before any callback has run.
+# This is what "zero" means for these containers, and it is captured rather
+# than fabricated because the two kinds here do not have the same zero.
+#
+# NINE OF THEM ARE ONE-ELEMENT COUNTERS. `_PLAN_LOG_TERMINALS`,
+# `_PLAN_LOG_DROPPED`, `_TOKLEN_SUM` and the rest are `[0]`, and every reader
+# indexes element 0. Emptying such a list is not zero, it is a MISSING
+# ELEMENT, and the next read raises IndexError. Canary job 65715 died exactly
+# there: a driver that reset the accumulators by emptying every list ran two
+# window-bin repeats of episode 0, emptied `_PLAN_LOG_TERMINALS` on the
+# successful attempt's collect, and `consume_plan_records` raised on the next
+# drain. The others are COLLECTIONS and their zero is empty. Restoring a copy
+# of the import-time state gets both right and cannot drift, because it is
+# literally what a fresh process has.
+_EPISODE_TELEMETRY_FRESH = {
+    _n: _telemetry_copy(globals()[_n]) for _n in _EPISODE_TELEMETRY_NAMES}
+
+
+def episode_telemetry_reset() -> None:
+    """Put every per-episode accumulator back to its FRESH-PROCESS state.
+
+    For a driver that PARKS an episode's counters and then wants the next
+    episode to count from zero. A COPY of the fresh state is restored, so a
+    later append cannot reach into the template and change what "fresh" means.
+    """
+    episode_telemetry_restore(
+        {_n: _telemetry_copy(_v)
+         for _n, _v in _EPISODE_TELEMETRY_FRESH.items()})
+
+
+def episode_telemetry_fixed_counters() -> tuple:
+    """The accumulators that are FIXED-SIZE counters, not collections.
+
+    A list here is a number every reader indexes. Emptying one is the bug
+    above. Derived from the import-time state rather than listed by hand, so
+    a new counter cannot be forgotten.
+    """
+    return tuple(
+        _n for _n, _v in _EPISODE_TELEMETRY_FRESH.items()
+        if isinstance(_v, list) and len(_v) > 0)
