@@ -62,8 +62,10 @@ def main():
     # a vertex with more than one face, please
     v, nf = None, 0
     for cand in range(1, V + 1):
-        _t, _i, _c, n = lfs.chunk(order, specs, 0, cand, vspecs, rows,
-                                  skips, 0)[:4]
+        # `chunk` is (tokens, count, n_faces, ends, head) since the
+        # equation-id buffer was removed.
+        _t, _c, n = lfs.chunk(order, specs, 0, cand, vspecs, rows,
+                              skips, 0)[:3]
         if int(n) > nf:
             v, nf = cand, int(n)
         if nf >= 3:
@@ -76,7 +78,7 @@ def main():
     # --- 1. chunks carry tokens ------------------------------------------
     counts = []
     for f in range(nf):
-        t, i, c, n = lfs.chunk(order, specs, 0, v, vspecs, rows, skips, f)[:4]
+        t, c, n = lfs.chunk(order, specs, 0, v, vspecs, rows, skips, f)[:3]
         counts.append(int(c))
         print(f"  face {f}: {int(c):4d} tokens  n_faces={int(n)}")
     if all(c > 0 for c in counts):
@@ -90,13 +92,13 @@ def main():
     # the whole step, because there are no approximation blocks to interleave.
     from graphax import IncrementalPathTokenizer
     tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
-                                  vocab_size=512)
+                                  vocab_size=256)
     tk.base_tokens()
     full = [int(t) for t in tk.eliminate(v, ())]
     cat = []
     for f in range(nf):
-        t, _i, c, _n = lfs.chunk(order, specs, 0, v, vspecs, rows,
-                                  skips, f)[:4]
+        t, c, _n = lfs.chunk(order, specs, 0, v, vspecs, rows,
+                             skips, f)[:3]
         cat += [int(x) for x in t[:int(c)]]
     if cat == full:
         print(f"PASS 2  chunks concatenate to the real step ({len(full)} tok)")
@@ -120,7 +122,7 @@ def main():
                            b"", b"")]
     nxt_used = [int(t) for t in tk_used.eliminate(v, ())]
     tk_clean = IncrementalPathTokenizer(
-        jaxpr, argnums, list(consts), list(args), vocab_size=512)
+        jaxpr, argnums, list(consts), list(args), vocab_size=256)
     tk_clean.base_tokens()
     nxt_clean = [int(t) for t in tk_clean.eliminate(v, ())]
     if same and nxt_used == nxt_clean:
@@ -139,8 +141,8 @@ def main():
     found = None
     for cand in range(1, V + 1):
         lfs._chunks.clear()
-        _t, _i, _c, nfc = lfs.chunk(order, specs, 0, cand, vspecs, rows,
-                                    skips, 0)[:4]
+        _t, _c, nfc = lfs.chunk(order, specs, 0, cand, vspecs, rows,
+                                skips, 0)[:3]
         if int(nfc) < 2:
             continue
         lfs._chunks.clear()

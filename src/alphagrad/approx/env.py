@@ -4952,29 +4952,54 @@ def slot_rules_for_row(st, one_row) -> tuple:
 
 def make_slot_frame_hook(one_row, *, stats: dict | None = None,
                          gated: bool = False):
-    """ONE face slot's hook under ``--face-slot-frames slot`` (ticket .18, D2).
+    """ONE face slot's CHOOSER under ``--face-slot-frames slot`` (ticket .18,
+    D2).
 
     Decodes the slot's wire row ``(b0, b1, b2)`` at APPLY time, in the frame
     of the live tensor graphax hands the slot (:func:`slot_frame`), then
-    applies through :func:`make_live_masked_hook` -- same legality, same
-    projection, same ``applied`` / ``skipped`` counters. A row that names no
-    dim of this slot (a Diag on a slot with no out side, a Reduce axis past
-    the slot's rank) is counted ``skipped_<kind>`` like any other miss:
-    ``requested`` is read off the wire, so leaving it uncounted would inflate
-    ``applied_fraction``.
+    DECIDES through :func:`~alphagrad.approx.common.masks.make_live_masked_chooser`
+    -- same legality, same projection, same ``applied`` / ``skipped`` counters.
+    A row that names no dim of this slot (a Diag on a slot with no out side, a
+    Reduce axis past the slot's rank) is counted ``skipped_<kind>`` like any
+    other miss: ``requested`` is read off the wire, so leaving it uncounted
+    would inflate ``applied_fraction``.
+
+    IT RETURNS THE ACTION, NOT THE TENSOR, and that is what puts the decision
+    in the token stream. graphax writes an ``approx`` block only from
+    ``core._record_micro``, which runs for a literal micro-action or for a
+    chooser that RETURNS one; a callable that returns a tensor is applied and
+    recorded by nobody (graphax says so in ``_apply_face_transform``). This
+    hook used to be that third kind, so every DIAG / COMPRESS / QUANT the face
+    head placed was applied to the Jacobian and left no marker at all -- only
+    SKIP, which is a wire bit graphax records itself, ever reached the stream
+    (finding 64). Returning the action makes graphax the ONE apply site for a
+    face rule, and the block it records is byte-identical to the one a literal
+    action records.
+
+    ``None`` means DECLINE (graphax returns the operand untouched): the row
+    decoded to nothing in this frame, the mask refused it, or the wire slot is
+    empty. A decline emits no block, which is right -- nothing was applied.
 
     The decode is memoised per frame, so the tokenizer's replay of the same
     hook on the same shapes decodes once. ``hook.rules_for(st)`` exposes the
     decoded rules for a tensor (tests, .59's apply-rate audit).
+    ``hook.chosen_applied(action, applied)`` is graphax's outcome callback; it
+    is what keeps ``applied`` and ``skipped_<kind>_noop`` reading the same
+    post-apply identity test that decides whether a block is emitted at all.
     """
     from alphagrad.approx.common.masks import (
-        face_counts_armed, make_live_masked_hook, reduce_axes_physical,
+        face_counts_armed, make_live_masked_chooser, reduce_axes_physical,
         reduce_axis_spaces)
     from alphagrad.approx.common.plan_log import kind_of_slot
 
     row = tuple(int(x) for x in one_row)
     kind = kind_of_slot(row[0], COMPRESS_SENTINEL, QUANT_SENTINEL)
     cache: dict = {}
+    # The inner chooser of the LAST decode, so graphax's outcome callback
+    # reaches the object that holds this frame's counters. graphax calls it
+    # immediately after the call that returned the action, on the same thread
+    # and before any other slot runs.
+    last: dict = {}
 
     def _decoded(st):
         out_shape, primal_shapes = slot_frame(st)
@@ -4988,22 +5013,29 @@ def make_slot_frame_hook(one_row, *, stats: dict | None = None,
         hit = cache.get(key)
         if hit is None:
             rules = slot_rules_for_row(st, row)
-            inner = (make_live_masked_hook(rules, stats=stats, gated=gated)
+            inner = (make_live_masked_chooser(rules, stats=stats, gated=gated)
                      if rules else None)
             hit = cache[key] = (rules, inner)
         return hit
 
     def _hook(st):
         _rules, inner = _decoded(st)
+        last["inner"] = inner
         if inner is None:
             if (kind is not None and stats is not None
                     and (not gated or face_counts_armed())):
                 stats["skipped"] = stats.get("skipped", 0) + 1
                 stats[f"skipped_{kind}"] = stats.get(f"skipped_{kind}", 0) + 1
-            return st
+            return None
         return inner(st)
 
+    def _chosen_applied(action, applied):
+        inner = last.get("inner")
+        if inner is not None:
+            inner.chosen_applied(action, applied)
+
     _hook.rules_for = lambda st: _decoded(st)[0]
+    _hook.chosen_applied = _chosen_applied
     return _hook
 
 
@@ -5448,6 +5480,10 @@ def face_entry_from_slots(slots, at_site=None, at_join=None, mode=None,
     and the two addends still come out structurally identical -- but no value in
     :data:`APPROX_ADD_CHOICES` reaches it today, because every value whose join
     is ``lossy`` has exactly three slots and therefore no learned1 hook to pass.
+    It is also not yet a route a DECISION can survive: ``FaceJoinPolicy.pre`` is
+    called directly rather than through ``core._apply_face_transform``, so a
+    chooser there would be applied and never recorded, and the branch RAISES
+    rather than losing the marker.
     """
     def _at(site, hook):
         if hook is None or at_site is None:
@@ -5504,8 +5540,23 @@ def face_entry_from_slots(slots, at_site=None, at_join=None, mode=None,
         # reconciliation still has the last word and the two addends still come
         # out structurally identical. Under the current value table `jr_hook` is
         # always None here -- every lossy value has three slots (see the
-        # docstring) -- and it is wired anyway rather than asserted away, because
-        # the alternative is a branch for a state that cannot happen.
+        # docstring).
+        #
+        # AND IT MUST STAY NONE. Every other hook position goes through
+        # `graphax.core._apply_face_transform`, which applies a chooser's action
+        # AND RECORDS it as an `approx` block; `FaceJoinPolicy.reconcile` calls
+        # `pre` DIRECTLY and takes back a tensor, so a slot hook there would be
+        # a decision applied to the Jacobian with no marker in the stream --
+        # exactly the defect finding 64 named. A wire that asks for it is
+        # refused rather than applied unrecorded.
+        if jr_hook is not None:
+            raise NotImplementedError(
+                "face_entry_from_slots: --approx-add lossy would put slot "
+                f"{FACE_SLOTS}'s hook in FaceJoinPolicy.pre, which graphax "
+                "applies directly instead of through _apply_face_transform, so "
+                "the rule would be applied and left out of the token stream. "
+                "Give the join slot its own graphax hook position before "
+                "wiring it here.")
         policy = MatchFreshJoin(pre=jr_hook,
                                 on_outcome=_join_outcome_sink())
         if at_join is not None:

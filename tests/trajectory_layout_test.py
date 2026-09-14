@@ -20,23 +20,24 @@ or falls on.
    which IS in the step emission -- is in no chunk. The stored buffer has its
    own length and its own padding.
 
-   WHICH DECISION ACTUALLY EMITS AN ECHO, and why the old form of that test
-   could never find one. graphax writes an ``approx`` block only when
+   WHICH DECISIONS EMIT AN ECHO. graphax writes an ``approx`` block only when
    ``core._apply_face_transform`` records a micro-action: a literal
-   ``Diag`` / ``Compress`` / ``Quant``, or a CHOOSER callable that returns
-   one. alphagrad installs neither. ``env.make_slot_frame_hook`` is a plain
-   tensor-returning callable, so graphax takes the ``out = _chosen`` branch,
-   applies the transform and calls ``_record_micro`` for nobody -- the face
-   sink gets no record and ``last_face_segments`` reports ``split == end``.
-   So NO (vertex, slot, rule) triple on ANY graph can put an echo into a
-   chunk through the slot wire; the old search was hunting something the
-   engine cannot produce, which is why jobs 65344/65346 came back empty and
-   why probe 65347 finds head == 0 even for rows that visibly change the
-   emission. The one face decision that DOES emit an approximation block on
-   this path is the SKIP channel: ``face_skips[f] == 1`` becomes
-   ``graphax.SKIP_FACE``, which ``core._eliminate_vertex`` records directly
-   as ``approx SKIP {}``. The test below therefore decides with SKIP, and
-   reads the echo it expects off the emission env's OWN builder produces.
+   ``Diag`` / ``Compress`` / ``Quant``, or a CHOOSER callable that RETURNS
+   one. Until 2026-09-13 alphagrad installed neither --
+   ``env.make_slot_frame_hook`` was a plain tensor-returning callable, so
+   graphax took the ``out = _chosen`` branch, applied the transform and called
+   ``_record_micro`` for nobody; the face sink got no record and
+   ``last_face_segments`` reported ``split == end``. NO (vertex, slot, rule)
+   triple on ANY graph could put an echo into a chunk through the slot wire,
+   which is why jobs 65344/65346 came back empty and why probe 65347 found
+   head == 0 even for rows that visibly changed the emission (finding 64).
+   The hook is a CHOOSER now: it decides and hands the action back, graphax
+   applies AND records it. So BOTH face decision channels emit an echo, and
+   the test below decides with each in turn -- ``skip``
+   (``face_skips[f] == 1`` becomes ``graphax.SKIP_FACE``, which
+   ``core._eliminate_vertex`` records directly as ``approx SKIP {}``) and
+   ``rule`` (a slot wire row) -- reading the echo it expects off the emission
+   env's OWN builder produces.
 
 3. THE NARROW TOKEN WIRE (landed 2026-09-13). Token ids ride as uint8 at a
    vocabulary of 256, the delta count rides in its own little-endian int32
@@ -198,7 +199,19 @@ def _reference_step(jaxpr, argnums, consts, args, vertex, rows, skips,
     return toks, ref.last_face_segments()
 
 
-def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own():
+def _quant_row(dtype="bfloat16"):
+    """The wire row for ``QUANT <dtype>`` -- the slot RULE this test decides
+    with. A cast is legal on any slot that stores values, so it finds an
+    applied rule on every face without a search over geometry."""
+    from graphax.sparse.micro_actions import QUANT_DTYPES
+    from alphagrad.approx.env import QUANT_SENTINEL
+
+    return (QUANT_SENTINEL, QUANT_DTYPES.index(dtype), 0)
+
+
+@pytest.mark.parametrize("channel", ["skip", "rule"])
+def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
+        channel):
     """THE REASON `face_delta_tokens` IS NOT THE NEXT STEP'S `delta_tokens`.
 
     ``LiveFaceStream.chunk`` returns face ``f-1``'s approximation echo
@@ -207,12 +220,16 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
     the last face of a vertex has no successor: its echo is in the step's
     emission and in none of the stored chunks.
 
-    The decision is the SKIP channel, which is the only face decision that
-    emits an approximation block at all on this path (module docstring,
-    section 2) and is legal on every face by construction -- it is a wire bit,
-    not a masked rule, so nothing here can pass by silently skipping a
-    decision the engine refused. The VERTEX is still searched: a vertex with
-    one face has no successor to carry anything.
+    BOTH FACE DECISION CHANNELS ARE CHECKED. ``skip`` is the wire bit graphax
+    records itself, legal on every face by construction. ``rule`` is a slot
+    wire row -- a QUANT on the ``lhs`` slot -- which until 2026-09-13 emitted
+    NO block at all, because ``env.make_slot_frame_hook`` returned a tensor and
+    graphax records a chooser's result only when the chooser returns the
+    micro-action itself (module docstring, section 2). The hook is a chooser
+    now, so a rule decision has an echo exactly as a skip does, and the
+    prefix property below is the same statement for both. The VERTEX is still
+    searched: a vertex with one face has no successor to carry anything, and
+    for ``rule`` every face must actually apply the row.
 
     Every claim is checked against the emission ``_reference_step`` gets from
     env's own builder, token for token, so a change in what graphax emits
@@ -234,28 +251,48 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
     vspecs = -np.ones((MR, 3), np.int32)
     exact = -np.ones((F, S, 3), np.int32)
     no_skip = np.zeros((F,), np.int32)
+    row = _quant_row()
 
-    def _skips(upto):
-        """Faces ``0..upto-1`` skipped, the rest exact -- exactly the prefix
+    def _wire(upto):
+        """Faces ``0..upto-1`` decided, the rest exact -- exactly the prefix
         ``_decided`` replays when the stream is asked for face ``upto``."""
-        s = np.zeros((F,), np.int32)
-        s[:upto] = 1
-        return s
+        rows = exact.copy()
+        skips = np.zeros((F,), np.int32)
+        if channel == "skip":
+            skips[:upto] = 1
+        else:
+            for g in range(upto):
+                rows[g, 0] = row
+        return rows, skips
+
+    def _all_faces_decide(cand, k):
+        """Does every face of ``cand`` emit a block once decided? For ``skip``
+        that is true by construction; for ``rule`` the row has to apply."""
+        rows, skips = _wire(k)
+        try:
+            _toks, segs = _reference_step(
+                jaxpr, argnums, consts, args, cand, rows, skips, VOCAB)
+        except Exception:
+            return False
+        return len(segs) == k and all(e > sp for _s, sp, e in segs)
 
     vertex, n_faces = None, 0
     for cand in range(1, V + 1):
         lfs._chunks.clear()
+        # `chunk` returns (tokens, count, n_faces, ends, head) -- FIVE
+        # values since the equation-id buffer was removed, so `n_faces` is
+        # index 2.
         k = int(lfs.chunk(order, specs, 0, cand, vspecs, exact, no_skip, 0)[2])
-        if k >= 2:
+        if k >= 2 and _all_faces_decide(cand, k):
             vertex, n_faces = cand, k
             break
     assert vertex is not None, (
-        "no vertex of this graph has two faces, so no face has a successor "
-        "and the echo cannot be read off it")
+        f"no vertex of this graph has two or more faces that all emit a "
+        f"{channel} block, so no face has a successor to read an echo off")
 
     # An EXACT vertex emits no approximation at all: no face has an echo, so
     # no chunk has a head. This is the control -- without it a head of 0 on
-    # the skipped run could not be told from "the stream never reports one".
+    # the decided run could not be told from "the stream never reports one".
     exact_toks, exact_segs = _reference_step(
         jaxpr, argnums, consts, args, vertex, exact, no_skip, VOCAB)
     assert len(exact_segs) == n_faces
@@ -267,16 +304,16 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
         assert int(lfs.chunk(order, specs, 0, vertex, vspecs, exact,
                              no_skip, f)[4]) == 0
 
-    # Now SKIP. Face f's chunk is read with faces 0..f-1 decided and face f
-    # still undecided, so the emission it comes from is `_skips(f)`.
+    # Now DECIDE. Face f's chunk is read with faces 0..f-1 decided and face f
+    # still undecided, so the emission it comes from is `_wire(f)`.
     heads = []
     for f in range(n_faces):
-        sk = _skips(f)
+        rows_f, sk = _wire(f)
         toks_f, segs_f = _reference_step(
-            jaxpr, argnums, consts, args, vertex, exact, sk, VOCAB)
+            jaxpr, argnums, consts, args, vertex, rows_f, sk, VOCAB)
         lfs._chunks.clear()
         tok, cnt, nf, _ends, head = lfs.chunk(
-            order, specs, 0, vertex, vspecs, exact, sk, f)
+            order, specs, 0, vertex, vspecs, rows_f, sk, f)
         cnt, head = int(cnt), int(head)
         assert int(nf) == n_faces
         assert cnt > 0, (
@@ -290,9 +327,10 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
             continue
         start, split, end = segs_f[f - 1]
         assert end > split, (
-            f"face {f - 1} of vertex {vertex} was SKIPPED but emitted no "
-            f"approximation block ({segs_f}); graphax no longer records a "
-            f"skip, so this test can say nothing about the echo")
+            f"face {f - 1} of vertex {vertex} was decided ({channel}) but "
+            f"emitted no approximation block ({segs_f}); graphax no longer "
+            f"records this decision, so this test can say nothing about the "
+            f"echo")
         assert head == end - split, (
             f"face {f}'s chunk reports a {head}-token echo against face "
             f"{f - 1}'s {end - split}-token approximation block")
@@ -307,16 +345,17 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
     # THE GAP. With every face decided, the emission ends on the LAST face's
     # approximation block -- and the chunk that would carry it is chunk
     # `n_faces`, which does not exist.
+    all_rows, all_sk = _wire(n_faces)
     all_toks, all_segs = _reference_step(
-        jaxpr, argnums, consts, args, vertex, exact, _skips(n_faces), VOCAB)
+        jaxpr, argnums, consts, args, vertex, all_rows, all_sk, VOCAB)
     last_start, last_split, last_end = all_segs[n_faces - 1]
     assert last_end > last_split, (
         "the last face emitted no approximation block, so this vertex cannot "
         "show the gap")
     assert last_end == len(all_toks)
     lfs._chunks.clear()
-    past = lfs.chunk(order, specs, 0, vertex, vspecs, exact,
-                     _skips(n_faces), n_faces)
+    past = lfs.chunk(order, specs, 0, vertex, vspecs, all_rows, all_sk,
+                     n_faces)
     assert int(past[1]) == 0 and int(past[4]) == 0, (
         "there is a chunk past the last face, so the last face's echo would "
         "have a carrier after all")

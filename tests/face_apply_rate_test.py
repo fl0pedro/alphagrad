@@ -290,7 +290,7 @@ def _walk_one_graph(target, seed, slots_on=None, pass_="vertex"):
     lf = LiveFaceStream(jaxpr, argnums, consts, args,
                         vocab=256, max_faces=F, max_axes=N_AX)
     tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
-                                  vocab_size=512)
+                                  vocab_size=256)
     tk.base_tokens()
     config = SimpleNamespace(jaxpr=jaxpr)
     pol, tables = _policy(F)
@@ -719,7 +719,7 @@ def _walk_join_slots(target, seed, arm):
     lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                         max_faces=F, max_axes=N_AX)
     tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
-                                  vocab_size=512)
+                                  vocab_size=256)
     tk.base_tokens()
     config = SimpleNamespace(jaxpr=jaxpr)
     pol, tables = _policy(F)
@@ -1178,7 +1178,7 @@ def test_the_decide_pass_answers_at_every_approx_add_width(tlm):
             lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                                 max_faces=MAX_FACES, max_axes=N_AX)
             tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts),
-                                          list(args), vocab_size=512)
+                                          list(args), vocab_size=256)
             tk.base_tokens()
             rng = np.random.default_rng(1)
             reached = set()
@@ -1356,7 +1356,7 @@ def test_the_structural_contraction_is_the_apply_paths_own(target_name, tlm,
     lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                         max_faces=F, max_axes=N_AX)
     tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
-                                  vocab_size=512)
+                                  vocab_size=256)
     tk.base_tokens()
     config = SimpleNamespace(jaxpr=jaxpr)
     pol, tables = _policy(F)
@@ -1457,7 +1457,7 @@ def test_faces_of_is_face_specs_of_projected(tlm):
     vv = _valid_vertices(jaxpr, args, consts, argnums)
     order = markowitz_order(jaxpr, argnums, consts, args, vv)
     tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
-                                  vocab_size=512)
+                                  vocab_size=256)
     tk.base_tokens()
     n_faces = n_multi = n_collide = 0
     for v in order:
@@ -1503,7 +1503,7 @@ def test_the_vertex_pass_runs_no_elimination(tlm):
     lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                         max_faces=MAX_FACES, max_axes=N_AX)
     tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
-                                  vocab_size=512)
+                                  vocab_size=256)
     tk.base_tokens()
     faces = 0
     for v in order:
@@ -1546,7 +1546,7 @@ def test_the_vertex_pass_refuses_the_learned_join_slots(tlm):
     lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                         max_faces=MAX_FACES, max_axes=N_AX)
     tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
-                                  vocab_size=512)
+                                  vocab_size=256)
     tk.base_tokens()
     prev = os.environ.get(envmod._APPROX_ADD_ENV)
     try:
@@ -1591,7 +1591,7 @@ def test_the_vertex_pass_answers_under_approx_add_choose(tlm):
     lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                         max_faces=MAX_FACES, max_axes=N_AX)
     tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
-                                  vocab_size=512)
+                                  vocab_size=256)
     tk.base_tokens()
     prev = os.environ.get(envmod._APPROX_ADD_ENV)
     os.environ[envmod._APPROX_ADD_ENV] = "choose"
@@ -1675,7 +1675,7 @@ def test_the_two_passes_draw_the_same_rows(tlm):
         lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                             max_faces=MAX_FACES, max_axes=N_AX)
         tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts),
-                                      list(args), vocab_size=512)
+                                      list(args), vocab_size=256)
         tk.base_tokens()
         config = SimpleNamespace(jaxpr=jaxpr)
         out = []
