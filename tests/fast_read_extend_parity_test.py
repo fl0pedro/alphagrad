@@ -270,3 +270,41 @@ def test_a_window_shorter_than_one_chunk_still_reads_under_the_fast_grid():
             _os.environ.pop("ALPHAGRAD_PALIMPSA_READ", None)
         else:
             _os.environ["ALPHAGRAD_PALIMPSA_READ"] = prev
+
+
+# --------------------------------------------------------------------------
+# the count-proportional backward
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("read", READS)
+def test_the_count_proportional_backward_agrees_with_the_scan_form(
+        read, agent, tokens, monkeypatch):
+    """``ALPHAGRAD_COUNT_VJP=1`` replaces the fold's ``scan`` + ``cond`` with a
+    hand-written ``while_loop`` in both directions (``common/count_vjp.py``).
+
+    It is ORTHOGONAL to the read: it decides HOW MANY chunks run, the read
+    decides what happens inside one. Under the fast read a chunk body is a
+    Pallas ``custom_vjp`` rather than a token scan, and ``count_loop`` rebuilds
+    that body's VJP with ``jax.vjp`` -- which is exactly what a nested
+    ``custom_vjp`` is for. This pins that the two forms still land on the same
+    value and the same gradient with the fast read in force.
+    """
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", read)
+    c0 = _carry(agent)
+    dyn, static = eqx.partition(agent, eqx.is_inexact_array)
+
+    def loss(d):
+        a = eqx.combine(d, static)
+        _c, (s, _n) = _folded(a, c0, tokens, COUNT, 2 * CHUNK_C)
+        return jnp.sum(s ** 2)
+
+    monkeypatch.setenv("ALPHAGRAD_COUNT_VJP", "0")
+    v_scan = float(loss(dyn))
+    g_scan = jax.grad(loss)(dyn)
+    monkeypatch.setenv("ALPHAGRAD_COUNT_VJP", "1")
+    v_loop = float(loss(dyn))
+    g_loop = jax.grad(loss)(dyn)
+
+    assert abs(v_loop - v_scan) <= 1e-5 * max(abs(v_scan), 1.0)
+    pairs = list(zip(jax.tree.leaves(g_loop), jax.tree.leaves(g_scan)))
+    worst = max(_rel(a, b) for a, b in pairs if np.max(np.abs(b)) > 0)
+    assert worst < 1e-4, f"count_loop gradient gap {worst:.3e}"
