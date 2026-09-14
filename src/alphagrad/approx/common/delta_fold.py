@@ -49,6 +49,8 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from . import count_vjp as _cvjp
+
 
 def default_chunk() -> int:
     return int(os.environ.get("ALPHAGRAD_FOLD_CHUNK", "1024"))
@@ -201,14 +203,8 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
             (jnp.maximum(jnp.asarray(budget, jnp.int32), 0) + C - 1) // C,
             nb).astype(jnp.int32)
 
-    def _body(state, xs):
-        if b_tok is None:
-            i = xs
-            off = i * C
-            tk = None            # read INSIDE `_run`; see below
-        else:
-            i, tk = xs
-            off = i * C
+    def _make_run(i, tk):
+        off = i * C
         # Tokens remaining once this chunk starts, clipped into [0, C]. A
         # chunk beyond the delta gets 0 and contributes nothing.
         c_cnt = jnp.clip(cnt - off, 0, C)
@@ -227,12 +223,62 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
                 agent, enc, tk_c, c_cnt, C, par)
             return (enc2, fold_fn(acc, rows_c, valid_c, off))
 
+        return _run
+
+    def _body(state, xs):
+        if b_tok is None:
+            i, tk = xs, None     # read INSIDE `_run`; see above
+        else:
+            i, tk = xs
+        _run = _make_run(i, tk)
         if budget is None:
             return _run(state), None
         return lax.cond(i < nb_live, _run, lambda s: s, state), None
 
     use_remat = (os.environ.get("ALPHAGRAD_FOLD_REMAT", "1") != "0"
                  if remat is None else bool(remat))
+
+    # COUNT-PROPORTIONAL BACKWARD (owner ruling 2026-09-14). With a budget the
+    # scan below is `nb = ceil(window / chunk)` iterations long whatever the
+    # real delta is, in the forward pass and again in the backward pass,
+    # because reverse-mode AD cannot transpose a `while_loop`. Inside a
+    # `custom_vjp` it never has to: `count_vjp.count_loop` runs the live
+    # chunks with a `while_loop` in BOTH directions and hand-writes the
+    # reverse sweep. See `common/count_vjp.py` for why the numbers do not
+    # move and why the residual claim does not either.
+    #
+    # Only on the differentiated path (`budget is not None`): with no budget
+    # the trip count is already the static `nb` and there is nothing to skip.
+    # Only with remat: the custom_vjp ALWAYS recomputes the chunk's forward in
+    # the backward, so `ALPHAGRAD_FOLD_REMAT=0`, which exists to ask for the
+    # stored-residual form, keeps the scan.
+    if budget is not None and use_remat and _cvjp.enabled():
+        _cf0, _ci0, _cspec = _cvjp.split_inexact(carry)
+        if len(_ci0) <= 1:
+            def _cbody(i, st):
+                cf, acc = st
+                # The integer leaf of the encode carry is `pos`, and the chunk
+                # body never reads it: `_encode_chunk` either calls the
+                # parallel path (which takes its tokens as an argument) or
+                # `encode_extend(start=0)`. So freezing it here changes
+                # nothing, and its final value is the clipped addition below.
+                enc = _cvjp.merge_inexact(cf, _ci0, _cspec)
+                _tk = None if b_tok is None else b_tok[i]
+                enc2, acc2 = _make_run(i, _tk)((enc, acc))
+                _f2, _o2, _ = _cvjp.split_inexact(enc2)
+                return (_f2, acc2), None
+
+            (cf_f, acc_f), _ = _cvjp.count_loop(
+                _cbody, (_cf0, init_acc), nb=nb, nb_live=nb_live)
+            # `pos` advances by `clip(cnt - i*C, 0, C)` on every LIVE chunk,
+            # which sums to `min(cnt, nb_live * C)` exactly -- the same
+            # integer the scan/cond form arrives at, since the skipped chunks
+            # freeze the carry and advance nothing.
+            _adv = jnp.clip(cnt, 0, nb_live * C)
+            enc_f = _cvjp.merge_inexact(
+                cf_f, [x + _adv for x in _ci0], _cspec)
+            return enc_f, acc_f
+
     body = jax.checkpoint(_body) if use_remat else _body
     _xs = (jnp.arange(nb, dtype=jnp.int32) if b_tok is None
            else (jnp.arange(nb, dtype=jnp.int32), b_tok))
