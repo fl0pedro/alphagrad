@@ -135,6 +135,37 @@ _PERCEPTRON_ARGNUMS = (2, 3, 4, 5)
 _MAX_SEEDS = 60
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _put_the_per_face_mask_setting_back():
+    """``build_case`` turns --per-face-masks ON PROCESS-WIDE and never puts it
+    back, so in a full-suite run every alphabetically later module inherited
+    the flag-on hook. That is what made ``per_face_apply_test`` see an
+    "illegal" Diag get PROJECTED instead of dropped, and what made
+    ``per_face_masks_test::test_default_is_off`` read the setting this module
+    left behind rather than the default.
+
+    The flag has to stay on for THIS module's tests: the campaign path the
+    stream claim is about is the per-slot legality path, and the step loop
+    below reads it at call time. So the restore is module TEARDOWN, and it is
+    exact -- the two module flags and the two environment variables
+    ``set_per_face_masks`` republishes, back to whatever they were, including
+    "unset".
+    """
+    from alphagrad.approx.common import masks as _M
+    flags = (_M._PER_FACE_MASKS[0], _M._PER_FACE_REPAIR_AXIS[0])
+    names = ("ALPHAGRAD_PER_FACE_MASKS", "ALPHAGRAD_PER_FACE_REPAIR_AXIS")
+    envs = {k: os.environ.get(k) for k in names}
+    try:
+        yield
+    finally:
+        _M._PER_FACE_MASKS[0], _M._PER_FACE_REPAIR_AXIS[0] = flags
+        for k, v in envs.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def _build_case(seed):
     """One ``policy_regression_gate.build_case()`` over OUR graph/seed.
 
