@@ -598,6 +598,27 @@ def log2_of_row(row_length: int, max_delta_tokens: int, chunk=None) -> int:
     return int(bin_slots).bit_length() - 1
 
 
+def validate_window_against_row(window, row_length, where="", chunk=None):
+    """The reader's window and the row it reads MUST agree. Raises if not.
+
+    The row is `2^n + TAIL(window)`. A reader whose window is larger than
+    the one the row was built for runs its last chunk off the end, and
+    `dynamic_slice` CLAMPS an out-of-range start instead of raising, so it
+    would return SHIFTED tokens in silence. This is the one place the two
+    numbers meet, so it is checked here.
+    """
+    try:
+        return log2_of_row(int(row_length), int(window), chunk)
+    except ValueError as exc:
+        raise ValueError(
+            f"{where or 'episode stream'}: a reader at the window bin "
+            f"{int(window)} was handed a {int(row_length)}-slot row, which "
+            f"is not 2^n + {stream_tail(int(window), chunk)} for any n. The "
+            f"window bin the loss reads at and the window bin the row's "
+            f"tail was sized from must be the same number."
+        ) from exc
+
+
 def grow(log2: int) -> int:
     """One doubling, or a raise at the cap (owner ruling Q1)."""
     cap = log2_max()

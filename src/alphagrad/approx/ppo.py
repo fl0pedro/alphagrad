@@ -2968,6 +2968,7 @@ class Agent(eqx.Module):
         enc_carry=None,           # step carry the per-face SIDE carry branches from
         endpoint_rows=None,       # (V+1, E) read(base+dyn) rows (--face-endpoint-read)
         edge_rows=None,           # (K, E) edge-memory read rows (--face-edge-mem)
+        delta_window=None,        # the per-step DELTA WINDOW BIN; None = the hard cap
     ):
         """Same as :meth:`sample_action` but routes the rule head through
         :class:`MicroActionPolicy`. ``axis_state`` and ``axis_valid_mask``
@@ -3200,7 +3201,8 @@ class Agent(eqx.Module):
                 # gathers zero contexts, and the blind `sample` path above
                 # already used the vertex context for both slots.
                 f_ends = jnp.zeros((_F, 2), jnp.int32)
-                f_dt = jnp.zeros((MAX_DELTA_TOKENS,), DELTA_TOKEN_DTYPE)
+                f_dt = jnp.zeros((int(delta_window or MAX_DELTA_TOKENS),),
+                                 DELTA_TOKEN_DTYPE)
                 _fl_tail = ()   # no live-face stream -> no per-face tail
             else:
                 if self.micro_action_policy is None:
@@ -3232,6 +3234,7 @@ class Agent(eqx.Module):
                     face_quant=f_quant,
                     face_nout=f_nout,
                     want_stage2=(face_decide_fn is not None),
+                    window=delta_window,
                 )
                 _fctx = _rs1 = None
                 if face_decide_fn is not None:
@@ -3346,8 +3349,13 @@ class Agent(eqx.Module):
     # stored decisions off the STORED chunks. They must stay gate for gate
     # identical or the ratio is not 1 at epoch 0.
     # ------------------------------------------------------------------
-    def _face_encode(self, carry, tokens, count, pool_from=None):
+    def _face_encode(self, carry, tokens, count, pool_from=None,
+                     window=None):
         """Extend the side carry by one face's chunk; ``(carry, summary)``.
+
+        ``window`` is the per-step DELTA WINDOW BIN. None means the hard cap
+        ``MAX_DELTA_TOKENS``, which is what az_gumbel and every direct test
+        caller pass and what keeps their trace identical.
 
         ``pool_from`` (--face-read own-span-mean / last-row) is the chunk's
         approx-echo PREFIX length: the number of leading rows that belong to
@@ -3369,9 +3377,11 @@ class Agent(eqx.Module):
         """
         _mode = _FACE_READ[0]
 
+        _W_ENC = int(window or MAX_DELTA_TOKENS)
+
         def _run(c):
             c2, rows, valid = self.encode_extend(
-                c, tokens, count, window=MAX_DELTA_TOKENS, start=0)
+                c, tokens, count, window=_W_ENC, start=0)
             # THE SAME SCATTER, KEYED BY FACE. One chunk is one segment, so
             # this is `_vmem.scatter` with a single key -- the identical
             # primitive the vertex slots are built from, and it has no
@@ -3490,9 +3500,23 @@ class Agent(eqx.Module):
                    vertex_idx, vertex_specs, axis_state_v,
                    op_legality_override, n_faces, endpoint_rows=None,
                    edge_rows=None, face_sizes=None, face_quant=None,
-                   face_nout=None, want_stage2=False):
+                   face_nout=None, want_stage2=False, window=None):
         """Read face f's chunk, decide face f, repeat -- for the ACTUAL face
         count, as a while_loop.
+
+        ``window`` is the per-step DELTA WINDOW BIN and it sizes the step's
+        face CONCATENATION buffer (quantity Q3 of the window design). None
+        means the hard cap, which is what az_gumbel and the direct tests
+        pass.
+
+        THE COUNTS THAT RIDE OUT ARE THE RAW ONES. The buffer write below
+        still clamps to what fits, so a doomed attempt cannot write out of
+        bounds, but the stored count is what the host ACTUALLY emitted. That
+        is what lets the caller see a face concatenation longer than the bin
+        and repeat the episode one window bin up, instead of silently
+        truncating the tokens the head reads -- which changes the ACTION and
+        not merely the padding. When nothing overflows the two are equal, so
+        this is a no-op everywhere the clamp was already dead.
 
         ``want_stage2`` (the exact slot-2 mask, ticket .59 fault 2): also
         carry every face's head CONTEXT and return ``(contexts (F, D), rows
@@ -3536,7 +3560,8 @@ class Agent(eqx.Module):
         _WK = self._wire_keys()
         _z0 = _rec.zeros(pol.approx_add, F)
         wire0 = tuple(getattr(_z0, k) for k in _WK)
-        W = MAX_DELTA_TOKENS
+        # THE STEP'S FACE CONCATENATION BUFFER, at the window BIN.
+        W = int(window or MAX_DELTA_TOKENS)
         st0 = (jnp.asarray(0, jnp.int32), enc_carry, jnp.array(0.0),
                jnp.array(0.0), jnp.zeros((F,), jnp.int32),
                jnp.zeros((F,), jnp.int32),
@@ -3563,7 +3588,7 @@ class Agent(eqx.Module):
             # endpoint / edge reads concatenate below.
             _, _summ0 = self._face_encode(
                 enc_carry, jnp.zeros((W,), DELTA_TOKEN_DTYPE),
-                jnp.asarray(0, jnp.int32))
+                jnp.asarray(0, jnp.int32), window=W)
             _D = int(_summ0.shape[-1])
             if getattr(pol, "endpoint_read", False):
                 _D += 2 * int(endpoint_rows.shape[1])
@@ -3606,7 +3631,17 @@ class Agent(eqx.Module):
             # ct_eff clamps to the remaining buffer AND feeds the encoder,
             # so sampling and the loss truncate identically if a step's
             # chunks ever exceed the window.
-            ct_eff = jnp.minimum(jnp.asarray(ct_f, jnp.int32), W - off)
+            #
+            # THE CLAMP IS NO LONGER SILENT (window-bin design, risk 7.2).
+            # It used to be effectively dead, because W was the 32768 cap.
+            # At a binned W it is reachable, and a truncated chunk changes
+            # the TOKENS THE HEAD READS, hence the action -- not padding.
+            # So the RAW count rides out in `cnts` below and the caller
+            # turns `sum(cnts) > W` into a window overflow, which discards
+            # the whole attempt and repeats it one bin up. The clamp stays
+            # only so the discarded attempt's writes stay inside the buffer.
+            ct_raw = jnp.asarray(ct_f, jnp.int32)
+            ct_eff = jnp.minimum(ct_raw, W - off)
             _ar_w = jnp.arange(W, dtype=jnp.int32)
             _m = _ar_w < ct_eff
             ftok = ftok.at[off + _ar_w].set(
@@ -3618,7 +3653,7 @@ class Agent(eqx.Module):
             hd_eff = (jnp.minimum(jnp.asarray(hd_f, jnp.int32), ct_eff)
                       if _RH else None)
             carry, summ = self._face_encode(carry, tk_f, ct_eff,
-                                            pool_from=hd_eff)
+                                            pool_from=hd_eff, window=W)
             if getattr(pol, "endpoint_read", False):
                 # ENDPOINT-SLOT READ (--face-endpoint-read,
                 # docs/FACE_LATENT_INFO_LOSS.md section 4): concatenate the
@@ -3662,7 +3697,8 @@ class Agent(eqx.Module):
                 row, axis_state_v,
                 None if face_nout is None else face_nout[f]))
             skips = skips.at[f].set(sk.astype(jnp.int32))
-            cnts = cnts.at[f].set(ct_eff)
+            # RAW, not clamped -- see the docstring and the ct_eff comment.
+            cnts = cnts.at[f].set(ct_raw)
             wa = tuple(w.at[f].set(row[k]) for w, k in zip(wa, _WK))
             out = (f + 1, carry, logp + lp, ent + e, skips, cnts, rs, wa,
                    ftok, off + ct_eff, fends.at[f].set(ends_f))
@@ -3701,9 +3737,14 @@ class Agent(eqx.Module):
                      op_legality_override, face_bound=None,
                      face_win_budget=None, endpoint_rows=None,
                      face_ends=None, edge_rows=None, face_eslots=None,
-                     face_heads=None, face_sizes=None, face_quant=None):
+                     face_heads=None, face_sizes=None, face_quant=None,
+                     window=None):
         """Score the stored FaceAction against contexts pooled from ONE scan
         of the stored emission window.
+
+        ``window`` is the per-step DELTA WINDOW BIN. It is the SAME bin the
+        sampling side's ``_face_loop`` used, because it is the length of the
+        scan that reproduces those chunks. None means the hard cap.
 
         The chunks the head read at sampling concatenate to a prefix of this
         step's emission (the tail is the last face's approximation, which no
@@ -3733,6 +3774,8 @@ class Agent(eqx.Module):
         """
         pol = self.face_path_policy
         F = pol.max_faces
+        # THE WINDOW BIN. It must be the SAME one the sampling side used.
+        _W_RPL = int(window or MAX_DELTA_TOKENS)
         f_cnt, f_stream, f_off, f_row = face_chunks
         if getattr(pol, "endpoint_read", False) and (
                 endpoint_rows is None or face_ends is None):
@@ -3793,7 +3836,7 @@ class Agent(eqx.Module):
             # after the first to face 0 -- a plausible wrong answer, not a
             # crash, which is why delta_fold pins this in a dedicated test.
             _ends = jnp.cumsum(f_cnt.astype(jnp.int32))
-            _C, _nb, _pad_len = _fold.plan_chunks(MAX_DELTA_TOKENS)
+            _C, _nb, _pad_len = _fold.plan_chunks(_W_RPL)
 
             def _face_fold(acc, rows_c, valid_c, off):
                 s_acc, c_acc = acc
@@ -3809,7 +3852,7 @@ class Agent(eqx.Module):
 
             _, (_fs, _fc) = _fold.extend_fold(
                 self, enc_carry, f_stream, total,
-                window=MAX_DELTA_TOKENS,
+                window=_W_RPL,
                 init_acc=(jnp.zeros((F, self.embd_dim), jnp.float32),
                           jnp.zeros((F,), jnp.float32)),
                 fold_fn=_face_fold, budget=face_win_budget,
@@ -3820,10 +3863,10 @@ class Agent(eqx.Module):
             # buffer, so this is the one place the face stream still cuts a
             # window out -- exactly the window that used to be stored.
             _f_toks = _carry_stream._stream_window(
-                f_stream, f_off, f_row, MAX_DELTA_TOKENS)
+                f_stream, f_off, f_row, _W_RPL)
             _, rows, _valid = self.encode_extend(
                 enc_carry, _f_toks, total,
-                window=MAX_DELTA_TOKENS, start=0,
+                window=_W_RPL, start=0,
                 chunk=(None if face_win_budget is not None else 0),
                 budget=face_win_budget)
         # ONE SCATTER, KEYED BY FACE. The chunks concatenate in face order,
@@ -3974,6 +4017,7 @@ class Agent(eqx.Module):
         face_heads=None,       # stored (F,) approx-echo prefix lengths
         face_sizes=None,       # stored (F, N) live per-face dim sizes
         face_quant=None,       # stored (F,) per-face QUANT legality
+        delta_window=None,     # the per-step DELTA WINDOW BIN; None = the hard cap
     ):
         """Joint log-prob / entropy for a stored typed action sequence.
 
@@ -4116,6 +4160,7 @@ class Agent(eqx.Module):
                     face_heads=face_heads,
                     face_sizes=face_sizes,
                     face_quant=face_quant,
+                    window=delta_window,
                 )
             total_log_p = total_log_p + f_logp
             # Arity-normalised per the PER-HEAD ENTROPY NORMALISATION note
@@ -4318,6 +4363,32 @@ def make_argparser() -> argparse.ArgumentParser:
              "and re-runs that episode one bin up with the overflowing "
              "length recorded. The hard cap is "
              + _epstream.LOG2_MAX_ENV + ".")
+    p.add_argument(
+        "--delta-window-log2", type=int, default=0,
+        help="w, the PER-STEP DELTA WINDOW's bin. 2^w is the longest single "
+             "step's token delta the programs are compiled for, and it is "
+             "the slice env.step takes out of the transport wire. It is NOT "
+             "the wire: ALPHAGRAD_MAX_DELTA_TOKENS stays the hard cap and "
+             "the wire width, because the Ray measurement pool preallocates "
+             "at it once per run. The window is where the loss actually "
+             "pays -- ceil(2^w / ALPHAGRAD_FOLD_CHUNK) outer fold "
+             "iterations per advance, and a (2^w, embd_dim) float32 row "
+             "block per sample per K step. This value is the FIRST bin "
+             "only. 0 = derive it: " + _epstream.WIN_LOG2_ENV
+             + " if set, else " + _epstream.WIN_FIRST_BIN_RULE
+             + ". THEREAFTER THE DRIVER CHOOSES IT PER EPISODE, TOGETHER "
+             "WITH --episode-tokens-log2 but from its own history: "
+             + _epstream.WIN_SELECTION_RULE
+             + ". The two bins are independent in their arithmetic and "
+             "joint only in the compile key. A step whose delta, or whose "
+             "face chunks in total, pass 2^w set an overflow flag on the "
+             "DEVICE; after the rollout the driver reads it, logs one line, "
+             "throws the whole attempt away and re-runs that episode one "
+             "WINDOW bin up, leaving the stream bin alone. THE FLOOR "
+             "(" + _epstream.WIN_LOG2_MIN_ENV + ") IS NOT ONE: a window "
+             "below the fold chunk makes plan_chunks shrink the CHUNK, "
+             "which regroups the loss's float32 partial sums, so a bin "
+             "under it is REFUSED and not clamped.")
     p.add_argument("--no-jit", action="store_true")
     p.add_argument(
         "--var-probe", action="store_true",
@@ -7000,8 +7071,16 @@ def main():
         _BASE_OWN = env.base_owners()
     except Exception:
         _BASE_OWN = None
+    # THE FIRST WINDOW BIN, resolved here because the two prints below are
+    # about the WINDOW the programs scan and not about the hard cap. The
+    # `BinPolicy` that owns it is built later, from this same number.
+    _WIN_LOG2_0 = _epstream.resolve_window_log2(
+        MAX_DELTA_TOKENS,
+        override=int(getattr(args, "delta_window_log2", 0) or 0))
+    _WIN_TOK_0 = 1 << _WIN_LOG2_0
     print(f"[alphagrad] base token stream: {int(_BASE_N)} tokens "
-          f"(per-step delta budget {MAX_DELTA_TOKENS})", flush=True)
+          f"(per-step delta window bin {_WIN_TOK_0}, hard cap "
+          f"{MAX_DELTA_TOKENS})", flush=True)
     # THE BUDGET IS FREE ONLY IF THE SCAN IS PREFIX-PROPORTIONAL, and by
     # default it is NOT: `_extend_sequential` falls back to a FLAT
     # `lax.scan` over the whole window when ALPHAGRAD_EXTEND_CHUNK is 0
@@ -7015,9 +7094,9 @@ def main():
     # i.e. flat in `count` and linear in `window` at chunk=0 (29x for the
     # 1024 -> 32768 raise), and flat in `window` at chunk=256. Say so.
     if int(os.environ.get("ALPHAGRAD_EXTEND_CHUNK", "0")) <= 0 \
-            and MAX_DELTA_TOKENS > 2048:
+            and _WIN_TOK_0 > 2048:
         print(f"[alphagrad] WARNING: ALPHAGRAD_EXTEND_CHUNK is 0, so every "
-              f"encode_extend scans all {MAX_DELTA_TOKENS} window steps "
+              f"encode_extend scans all {_WIN_TOK_0} window steps "
               f"whatever the delta's real length is. Set "
               f"ALPHAGRAD_EXTEND_CHUNK (256 measured well) to make the "
               f"scan prefix-proportional; otherwise the delta budget is "
@@ -7844,6 +7923,7 @@ def main():
     # prefix, so the cost is n_faces eliminations per env step.
     _LIVE_FACES = None
     _live_face = _live_face_count = None
+    _live_face_for = None
     _live_face_sizes = None
     _live_face_decide = None
     _EDGE_TABLE = None
@@ -7878,9 +7958,27 @@ def main():
         if _EDGE_MEM:
             from alphagrad.approx.common.face_driver import EdgeSlotTable
             _EDGE_TABLE = EdgeSlotTable(int(_F_FACES))
-        _live_face, _live_face_count = make_face_callbacks(
-            _LIVE_FACES, window=MAX_DELTA_TOKENS, prof_sink=_env_prof_add,
-            edge_table=_EDGE_TABLE, emit_head=_FACE_HEADS)
+        # ONE STREAM, ONE SET OF CALLBACKS PER WINDOW BIN. The
+        # `LiveFaceStream` object holds the prefix tokenizer cache and must
+        # survive every bin change, so it is built once and at the HARD CAP
+        # -- it never truncates a chunk below the cap, and a chunk longer
+        # than the BIN rides out with its RAW count so the rollout can see
+        # the overflow (see `face_driver._fit`). The callbacks are pure
+        # closures over the stream and declare the bin's buffer width, so
+        # they are rebuilt per bin, which costs microseconds.
+        _FACE_CB_CACHE = {}
+
+        def _live_face_for(w):
+            _w = int(w)
+            hit = _FACE_CB_CACHE.get(_w)
+            if hit is None:
+                hit = make_face_callbacks(
+                    _LIVE_FACES, window=_w, prof_sink=_env_prof_add,
+                    edge_table=_EDGE_TABLE, emit_head=_FACE_HEADS)
+                _FACE_CB_CACHE[_w] = hit
+            return hit
+
+        _live_face, _live_face_count = _live_face_for(MAX_DELTA_TOKENS)
         # --per-face-masks SIZES half (A1b): built unconditionally (it is
         # one closure) but only CALLED under `_PFM_SIZES` below, so the
         # flag-off trace has no extra callback and no extra host work.
@@ -8504,8 +8602,15 @@ def main():
             "actions, so they need --face-actions together with "
             "--live-faces.")
 
-    def _episode_streams(log2):
+    def _episode_streams(log2, win_log2=None):
         """The episode stream(s), one zeroed row per environment.
+
+        `win_log2` is the WINDOW bin. It sizes the row's TAIL, because the
+        tail is exactly one write window plus whatever the fold's chunk
+        planner pads that window up to. Passing the window bin instead of
+        the cap is a second, free saving: at the shipped chunk the tail goes
+        from 32768 to the bin, which at the small bins the Helmholtz smoke
+        runs is most of the row.
 
         `2^log2 + TAIL` uint8 slots each (see `common.episode_stream`). They
         are allocated here and passed in because the bin is a SHAPE: a new
@@ -8516,7 +8621,9 @@ def main():
         loss actually reads it (`_EP_FACE`). None is not a pytree leaf, so
         it costs nothing to carry through the vmap and the scan.
         """
-        L = _epstream.stream_length(int(log2), MAX_DELTA_TOKENS)
+        _w = (MAX_DELTA_TOKENS if win_log2 is None
+              else (1 << int(win_log2)))
+        L = _epstream.stream_length(int(log2), _w)
         return (jnp.zeros((num_envs, L), DELTA_TOKEN_DTYPE),
                 jnp.zeros((num_envs, L), DELTA_TOKEN_DTYPE)
                 if _EP_FACE else None)
@@ -8529,15 +8636,42 @@ def main():
         _epstream.resolve_log2(
             MAX_DELTA_TOKENS, int(num_valid),
             override=int(getattr(args, "episode_tokens_log2", 0) or 0)))
+    # THE SECOND BIN, chosen with the first and from its own history: the
+    # PER-STEP DELTA WINDOW. It has a FLOOR that the stream bin does not --
+    # the fold chunk -- because a window under the chunk changes the chunk
+    # and regroups the loss's float32 sums. `resolve_window_log2` raises
+    # rather than clamping if the run asks for one under it.
+    _WIN_FLOOR = _epstream.window_floor_log2()
+    _WIN_CAP = _epstream.window_log2_max(MAX_DELTA_TOKENS)
+    _WIN_BIN = _epstream.BinPolicy(
+        _WIN_LOG2_0,
+        cap=_WIN_CAP, floor=_WIN_FLOOR,
+        history_env=_epstream.WIN_HISTORY_ENV,
+        margin_env=_epstream.WIN_MARGIN_ENV,
+        cap_env=_epstream.WIN_LOG2_MAX_ENV,
+        history_default=_epstream.WIN_HISTORY_DEFAULT,
+        margin_default=_epstream.WIN_MARGIN_DEFAULT)
+    _WIN0 = 1 << _WIN_BIN.initial
     print("[episode-stream] first bin 2^%d = %d slots per environment per "
           "stream, %d-slot tail, %d bytes per row (first bin: %s; per "
           "episode: %s; override the first with %s, cap %s=%d)"
           % (_EP_BIN.initial, 1 << _EP_BIN.initial,
-             _epstream.stream_tail(MAX_DELTA_TOKENS),
-             _epstream.stream_length(_EP_BIN.initial, MAX_DELTA_TOKENS),
+             _epstream.stream_tail(_WIN0),
+             _epstream.stream_length(_EP_BIN.initial, _WIN0),
              _epstream.FIRST_BIN_RULE, _epstream.SELECTION_RULE,
              _epstream.LOG2_ENV,
              _epstream.LOG2_MAX_ENV, _epstream.log2_max()), flush=True)
+    print("[delta-window] first bin 2^%d = %d tokens per step (floor 2^%d = "
+          "%d, the fold chunk; cap 2^%d = %d, the wire; %d outer fold "
+          "iterations per advance against %d at the cap) (first bin: %s; "
+          "per episode: %s; override the first with %s or "
+          "--delta-window-log2)"
+          % (_WIN_BIN.initial, _WIN0, _WIN_FLOOR, 1 << _WIN_FLOOR,
+             _WIN_CAP, 1 << _WIN_CAP,
+             _fold.plan_chunks(_WIN0)[1],
+             _fold.plan_chunks(MAX_DELTA_TOKENS)[1],
+             _epstream.WIN_FIRST_BIN_RULE, _epstream.WIN_SELECTION_RULE,
+             _epstream.WIN_LOG2_ENV), flush=True)
 
     # WHAT A DISCARDED ATTEMPT MUST NOT LEAVE BEHIND (review finding 5).
     # An episode that overflows its bin is thrown away and repeated one bin
@@ -8626,8 +8760,14 @@ def main():
                 "rollout_fn: nothing reads the face episode stream without "
                 "--face-actions and --live-faces, so it must not be "
                 "allocated (review finding 3).")
+        # THE WINDOW BIN, read off the ENV. It rides on `EnvConfig`, which
+        # rides in the env's pytree AUX data, so a different bin is a
+        # different treedef and this jit retraces by itself -- the same
+        # mechanism the stream bin gets from the row's shape. Nothing here
+        # reads a module constant, so the two cannot disagree.
+        _W_BIN = int(env_obj.delta_window)
         _EP_N = _epstream.log2_of_row(
-            int(ep_tokens.shape[0]), MAX_DELTA_TOKENS)
+            int(ep_tokens.shape[0]), _W_BIN)
         if _EP_FACE and int(ep_face_tokens.shape[0]) != int(
                 ep_tokens.shape[0]):
             raise ValueError(
@@ -8723,7 +8863,7 @@ def main():
             jnp.where(env_state.step_count > 0,
                       jnp.zeros((), jnp.int32),
                       jnp.array(-1, jnp.int32)).astype(jnp.int32),
-            window=MAX_DELTA_TOKENS,
+            window=_W_BIN,
             participants=_init_part,
         )
         init_enc_state = _init_pre + _init_post
@@ -8753,9 +8893,16 @@ def main():
             # function is under `jax.vmap`). `ep_ovl_c` is 0 until a step
             # would pass the bin; the face half is only here when the loss
             # reads it (`_EP_FACE`).
-            (ep_tok_c, ep_cur_c, ep_ovl_c, ep_ovs_c) = ep_state[:4]
+            # `wn_len_c` / `wn_stp_c` / `wn_knd_c` are the WINDOW bin's own
+            # overflow record, carried exactly like the stream's: 0 length
+            # until a step's delta, or a step's face chunks in total, pass
+            # 2^w. They are a SEPARATE record because a window overflow
+            # moves only the window bin and a stream overflow only the
+            # stream bin.
+            (ep_tok_c, ep_cur_c, ep_ovl_c, ep_ovs_c,
+             wn_len_c, wn_stp_c, wn_knd_c) = ep_state[:7]
             if _EP_FACE:
-                ep_ftok_c, ep_fcur_c = ep_state[4:]
+                ep_ftok_c, ep_fcur_c = ep_state[7:]
             sample_key, next_net_key = jrand.split(k, 2)
             vertex_avail_mask = vertex_avail_at_step(
                 state, vertex_valid_static, total_v, num_valid,
@@ -8796,6 +8943,15 @@ def main():
              ep_ovl_c, ep_ovs_c) = _ep_stream_step(
                 ep_tok_c, ep_cur_c, delta_tok, delta_count,
                 state.step_count, _EP_N, ep_ovl_c, ep_ovs_c)
+            # THE WINDOW CHECK, Q1: is this ONE step's delta longer than the
+            # window bin? `delta_count` is the EXACT host-side length; the
+            # buffer beside it is `2^w` wide, so a longer count means tokens
+            # the head will never read. Device arithmetic, no round trip,
+            # exactly like the stream check above.
+            wn_len_c, wn_stp_c, wn_knd_c = _epstream.carry_window_overflow(
+                wn_len_c, wn_stp_c, wn_knd_c,
+                delta_count, jnp.asarray(delta_count, jnp.int32) > _W_BIN,
+                state.step_count, _epstream.WINDOW_KIND_DELTA)
             # prof/envcb: scan glue (avail mask, key split, the delta unpack
             # above). Under the partial mark anchor this key used to absorb
             # the WHOLE env callback -- `prof/envstep` fired on EnvState's
@@ -8849,7 +9005,7 @@ def main():
                 # committed to the prefix. The prefix replay needs the latter
                 # or it rebuilds an exact graph the measurement never builds.
                 face_chunk_fn, face_count_fn = bind_step_callbacks(
-                    _live_face, _live_face_count,
+                    _live_face_for(_W_BIN)[0], _live_face_count,
                     state.order, state.sparsity_specs, state.step_count,
                     state.face_specs, state.face_skips,
                 )
@@ -8950,6 +9106,7 @@ def main():
                     enc_carry=enc_carry2,
                     endpoint_rows=_ep_rows,
                     edge_rows=_em_rows,
+                    delta_window=_W_BIN,
                 )
                 # prof/action: the vertex pointer sample + the micro/face
                 # head loop (INCLUDES the faces.live_chunk host callbacks,
@@ -9018,7 +9175,7 @@ def main():
                     face_valid_v = jnp.zeros((ENV_MAX_FACES,), jnp.float32)
                     face_ends_v = jnp.zeros((ENV_MAX_FACES, 2), jnp.int32)
                     face_cnt_v = jnp.zeros((ENV_MAX_FACES,), jnp.int32)
-                    face_dt_v = jnp.zeros((MAX_DELTA_TOKENS,),
+                    face_dt_v = jnp.zeros((_W_BIN,),
                                           DELTA_TOKEN_DTYPE)
                     if _EDGE_MEM:
                         face_eslots_v = -jnp.ones(
@@ -9127,13 +9284,13 @@ def main():
                     face_valid_v > 0.5).astype(jnp.int32)
                 _wr_ids = _edge_write_ids(
                     face_cnt_v, face_ewr_v[:, 1], face_ewr_v[:, 0],
-                    _n_live_f, next_state.delta_count, MAX_DELTA_TOKENS)
+                    _n_live_f, next_state.delta_count, _W_BIN)
                 (nxt_carry, nv_s_raw, nv_c_raw, nem_s_raw,
                  nem_c_raw) = _carry_stream.advance(
                     agent, enc_carry2, vmem_s2, vmem_c2,
                     next_state.delta_tokens,
                     next_state.delta_count, vertex_idx.astype(jnp.int32),
-                    window=MAX_DELTA_TOKENS, participants=step_part,
+                    window=_W_BIN, participants=step_part,
                     edge_mem=(emem_s2, emem_c2), edge_ids=_wr_ids,
                 )
             else:
@@ -9141,7 +9298,7 @@ def main():
                     agent, enc_carry2, vmem_s2, vmem_c2,
                     next_state.delta_tokens,
                     next_state.delta_count, vertex_idx.astype(jnp.int32),
-                    window=MAX_DELTA_TOKENS, participants=step_part,
+                    window=_W_BIN, participants=step_part,
                 )
             # The UNMARKED triple is what gets threaded (see next_enc_state):
             # `_pp_mark` adds a host-produced 0.0 to every numeric leaf, so
@@ -9236,15 +9393,31 @@ def main():
             if _EP_FACE:
                 _face_total = jnp.sum(
                     face_cnt_v.astype(jnp.int32)).astype(jnp.int32)
+                # THE WINDOW CHECK, Q3: did this step's face chunks TOTAL
+                # more than the window bin? `face_cnt_v` carries the RAW
+                # per-face counts (see `Agent._face_loop`), so this sum is
+                # what the host actually emitted, not what fitted. The
+                # concatenation buffer clamped its writes, and that clamp
+                # used to be the whole story -- silent, and a change of the
+                # ACTION rather than of the padding. It is a reported
+                # overflow now, of the same kind as the delta one and
+                # against the same bin.
+                wn_len_c, wn_stp_c, wn_knd_c = (
+                    _epstream.carry_window_overflow(
+                        wn_len_c, wn_stp_c, wn_knd_c,
+                        _face_total, _face_total > _W_BIN,
+                        state.step_count, _epstream.WINDOW_KIND_FACE))
                 (ep_ftok_c, face_offset, ep_fcur_n,
                  ep_ovl_c, ep_ovs_c) = _ep_stream_step(
                     ep_ftok_c, ep_fcur_c, face_dt_v, _face_total,
                     state.step_count, _EP_N, ep_ovl_c, ep_ovs_c)
                 ep_state_next = (ep_tok_c, ep_cur_n, ep_ovl_c, ep_ovs_c,
+                                 wn_len_c, wn_stp_c, wn_knd_c,
                                  ep_ftok_c, ep_fcur_n)
             else:
                 face_offset = jnp.zeros((), jnp.int32)
-                ep_state_next = (ep_tok_c, ep_cur_n, ep_ovl_c, ep_ovs_c)
+                ep_state_next = (ep_tok_c, ep_cur_n, ep_ovl_c, ep_ovs_c,
+                                 wn_len_c, wn_stp_c, wn_knd_c)
             transition = Trajectory(
                 preference=preference.astype(jnp.float32),
                 vertex_idx=jnp.asarray(vertex_idx, dtype=jnp.int32),
@@ -9324,7 +9497,12 @@ def main():
         # `(overflow length, overflow step)` start at 0: a real overflowing
         # length is above `2^n`, so 0 is an unambiguous "nothing yet".
         _ep_init = (ep_tokens, jnp.zeros((), jnp.int32),
-                    jnp.zeros((), jnp.int32), jnp.zeros((), jnp.int32))
+                    jnp.zeros((), jnp.int32), jnp.zeros((), jnp.int32),
+                    # The WINDOW bin's record: (length, step, kind). Same
+                    # convention -- 0 length is an unambiguous "nothing yet",
+                    # because an overflowing length is above 2^w.
+                    jnp.zeros((), jnp.int32), jnp.zeros((), jnp.int32),
+                    jnp.zeros((), jnp.int32))
         if _EP_FACE:
             _ep_init = _ep_init + (ep_face_tokens, jnp.zeros((), jnp.int32))
         _scan_init = (env_state, jnp.zeros((total_v,), dtype=jnp.int32),
@@ -9350,11 +9528,29 @@ def main():
         _ep_used = _ep_final[1]
         _ep_ftok_out = None
         if _EP_FACE:
-            _ep_used = jnp.maximum(_ep_used, _ep_final[5])
-            _ep_ftok_out = _ep_final[4]
+            _ep_used = jnp.maximum(_ep_used, _ep_final[8])
+            _ep_ftok_out = _ep_final[7]
+        # THE WINDOW BIN'S MEASUREMENT, from the device, per environment.
+        # `max(delta_count)` is Q1 and `max(sum(face_counts))` is Q3, and
+        # the window bin is sized from the larger of the two. This is the
+        # statistic the selection rule walks on, and it is the one the
+        # apparatus never had: `env._record_delta_length` is PROCESS-LOCAL,
+        # so under --ray-measure the driver's copy misses exactly the steps
+        # the campaign cares about (every offline run on the cluster logs
+        # `tokens/delta_max` as literally 0). This one is exact, covers
+        # every environment and every step, and does not care which process
+        # tokenized.
+        _win_used = jnp.max(traj.delta_count.astype(jnp.int32))
+        if _EP_FACE:
+            _face_used = jnp.max(
+                jnp.sum(traj.face_counts.astype(jnp.int32), axis=-1))
+        else:
+            _face_used = jnp.zeros((), jnp.int32)
         return (final_state, traj, all_raw_rewards[-1],
                 _ep_final[0], _ep_ftok_out, _ep_used,
-                _ep_final[2], _ep_final[3])
+                _ep_final[2], _ep_final[3],
+                _ep_final[4], _ep_final[5], _ep_final[6],
+                _win_used, _face_used)
 
     def loss_fn(
         agent,
@@ -9364,6 +9560,7 @@ def main():
         op_legality_override,
         kl_ref_coef=None,
         ep_streams=None,
+        delta_window=None,
     ):
         # Dynamic-substeps path branches off here so the legacy path
         # stays exactly as written. `_dynamic_loss_fn` lives below and
@@ -9374,11 +9571,11 @@ def main():
         if args.dynamic_substeps:
             return _dynamic_loss_fn(
                 agent, batch, key, op_legality_override, kl_ref_coef,
-                ep_streams,
+                ep_streams, delta_window,
             )
     def _dynamic_loss_fn(
         agent, batch: TrainBatch, key, op_legality_override,
-        kl_ref_coef=None, ep_streams=None,
+        kl_ref_coef=None, ep_streams=None, delta_window=None,
     ):
         """Dynamic-substeps loss: routes through MicroActionPolicy.evaluate.
 
@@ -9410,6 +9607,16 @@ def main():
                 "(the batch carries offsets into them, not token windows); "
                 "pass ep_streams=(ep_tokens, ep_face_tokens).")
         _ep_tok, _ep_ftok = ep_streams
+        # THE WINDOW BIN, as a plain Python int. This is the ONE thing in
+        # the loss's program that the bin changes, and it is where the
+        # ruling's saving lives: `ceil(W / C)` outer fold iterations per
+        # `advance`, and a `(W, embd_dim)` float32 row block per sample per
+        # K step. `train_episode` hands it down, so it is static by
+        # construction and part of that jit's cache key.
+        _W_LOSS = int(delta_window or MAX_DELTA_TOKENS)
+        _epstream.validate_window_against_row(
+            _W_LOSS, int(_ep_tok.shape[-1]),
+            where="_dynamic_loss_fn")
         if _ep_tok.ndim != 2:
             raise ValueError(
                 "_dynamic_loss_fn: the episode stream must be "
@@ -9553,6 +9760,7 @@ def main():
                 # re-masks with exactly what the behaviour policy masked with.
                 face_sizes=fsz,
                 face_quant=fqt,
+                delta_window=_W_LOSS,
             )
 
         # Re-derive each sample's encoding by extending its stored
@@ -9620,7 +9828,7 @@ def main():
                 # held, in the same order, with the same count bounding them
                 # -- so the arithmetic is bit-identical to the window form.
                 start=doff_k, row=eidx,
-                window=MAX_DELTA_TOKENS, participants=part_k,
+                window=_W_LOSS, participants=part_k,
                 # The loss is reverse-differentiated through this extend,
                 # so it cannot use the rollout's while_loop -- it passes
                 # the batch-wide `budget` instead and gets the scan/cond
@@ -9665,7 +9873,7 @@ def main():
                 agent, carry2, vs2, vc2,
                 _ep_tok, dcnt_k, own_k,
                 start=doff_k, row=eidx,
-                window=MAX_DELTA_TOKENS, participants=part_k,
+                window=_W_LOSS, participants=part_k,
                 chunk=None, budget=_delta_budget,
                 edge_mem=(es, ec), edge_ids=eids,
             )
@@ -9697,7 +9905,7 @@ def main():
                 if _EDGE_MEM:
                     _eids = _edge_write_ids(
                         _wrc[_k], _wrh[_k], _wrs[_k], _wrn[_k], dcnt[_k],
-                        MAX_DELTA_TOKENS)
+                        _W_LOSS)
                     carry2, vs2, vc2, es2, ec2 = _advance_edge_step(
                         carry2, vs2, vc2,
                         doff[_k], dcnt[_k], owner[_k], part[_k], eidx,
@@ -9769,7 +9977,7 @@ def main():
                     c2, s2, n2, es, ec = state
                     _do, _dc, _ow, _pa, _pr, _wc, _wh, _ws, _wn = x
                     _eids = _edge_write_ids(_wc, _wh, _ws, _wn, _dc,
-                                            MAX_DELTA_TOKENS)
+                                            _W_LOSS)
                     c2, s2, n2, es, ec = _advance_k_edge(
                         c2, s2, n2, _do, _dc, _ow, _pa, eidx, es, ec, _eids)
                 else:
@@ -9822,7 +10030,7 @@ def main():
                   "envs/minibatch, delta window %d, episode stream %d slots"
                   % (_ep_batch.delta_count.shape[1],
                      _ep_batch.delta_count.shape[0],
-                     MAX_DELTA_TOKENS, _ep_tok.shape[-1]), flush=True)
+                     _W_LOSS, _ep_tok.shape[-1]), flush=True)
             # vmap over ENVS (the sequence axis is the scan's), then flatten
             # (env, step) so everything downstream sees the flat batch it
             # always has. The stored anchors -- enc_M / enc_I / enc_pos /
@@ -10078,6 +10286,7 @@ def main():
                                 if _FACE_HEADS else None),
                     face_sizes=(per[-2] if _PFM_SIZES else None),
                     face_quant=(per[-1] if _PFM_SIZES else None),
+                    window=_W_LOSS,
                 )[0]
 
             _ref_logp = jax.lax.stop_gradient(
@@ -10516,7 +10725,27 @@ def main():
         vprobe_opt_state,
         kl_ref_coef_arg,
         ep_log2,
+        # THE WINDOW BIN, beside the stream bin. Both are plain Python ints
+        # and `eqx.filter_jit` treats a non-array argument as static, so the
+        # PAIR is this jit's cache key -- one traced rollout program and one
+        # traced loss program per pair, and a pair already compiled costs
+        # nothing to return to.
+        win_log2,
     ):
+        _W_EP = 1 << int(win_log2)
+        if int(env_obj.delta_window) != _W_EP:
+            # The env carries the bin as a SHAPE (EnvState.delta_tokens) and
+            # this argument carries it as a NUMBER (the loss's scan length).
+            # If they disagreed, the rollout would store deltas at one width
+            # and the loss would read them at another, and `dynamic_slice`
+            # clamps rather than raising -- a silent misread. The driver
+            # builds both from the same pick; this is what makes that a fact
+            # rather than a convention.
+            raise ValueError(
+                f"train_episode: the env's delta window is "
+                f"{int(env_obj.delta_window)} but win_log2={int(win_log2)} "
+                f"asks for {_W_EP}. Build the env with "
+                f"`env.with_delta_window(1 << win_log2)`.")
         subkey, key = jrand.split(key)
         rollout_key, key = jrand.split(key)
         rollout_keys = jrand.split(rollout_key, num_envs)
@@ -10528,10 +10757,13 @@ def main():
         # the curve isolates the ENCODER's drift rather than state drift).
         # See attention_entropy_diagnostic: representation diagnostic, not a
         # policy entropy.
-        _ep_tok0, _ep_ftok0 = _episode_streams(ep_log2)
+        _ep_tok0, _ep_ftok0 = _episode_streams(ep_log2, win_log2)
         (env_states, traj, total_rewards_full,
          ep_tokens, ep_face_tokens, ep_used_per_env,
-         ep_over_len_per_env, ep_over_step_per_env) = rollout_fn(
+         ep_over_len_per_env, ep_over_step_per_env,
+         win_over_len_per_env, win_over_step_per_env,
+         win_over_kind_per_env,
+         win_used_per_env, face_used_per_env) = rollout_fn(
             agent,
             env_obj,
             num_valid,
@@ -11151,6 +11383,11 @@ def main():
                     # FIRST argument only) and not sliced per minibatch:
                     # every sample carries its own `env_index`.
                     (ep_tokens, ep_face_tokens),
+                    # THE WINDOW BIN, a plain Python int. It is where the
+                    # loss actually pays: ceil(W / C) outer fold iterations
+                    # per advance and a (W, embd_dim) row block per sample
+                    # per K step.
+                    1 << int(win_log2),
                 )
                 # `has_aux` carries the probe's read-only view of the
                 # representation alongside the metrics. filter_grad does not
@@ -11507,6 +11744,21 @@ def main():
             # XLA or on when an asynchronous dispatch happens to fail.
             ep_over_len_per_env,
             ep_over_step_per_env,
+            # THE WINDOW BIN's overflow, the same way: the length that
+            # passed 2^w, the step it happened at and WHICH quantity went
+            # over (the step's delta, or its face chunks in total). A window
+            # overflow moves the window bin and leaves the stream bin alone.
+            win_over_len_per_env,
+            win_over_step_per_env,
+            win_over_kind_per_env,
+            # AND THE WINDOW BIN'S MEASUREMENT. The longest single-step
+            # delta and the longest per-step face concatenation this episode
+            # produced, per environment, read off the device. The driver
+            # records the larger of the two and picks the next episode's
+            # window bin from the recent history of those numbers. See
+            # `rollout_fn`'s return for why the host counter cannot be used.
+            win_used_per_env,
+            face_used_per_env,
         )
 
     if not args.no_jit:
@@ -13413,10 +13665,14 @@ def main():
                                     _fh.write(f"{ep}\t{_t:.9f}\t{_lab}\n")
                     _dst = _cds()
                     if _dst:
+                        # AGAINST THE BIN, not the cap. Occupancy measured
+                        # against a width the program no longer allocates
+                        # is how a previous defect hid.
+                        _wcap = int(1 << _WIN_BIN.log2)
                         _caps = {
                             "faces_per_vertex": int(ENV_MAX_FACES),
-                            "face_chunk_len": int(MAX_DELTA_TOKENS),
-                            "delta_len": int(MAX_DELTA_TOKENS),
+                            "face_chunk_len": _wcap,
+                            "delta_len": _wcap,
                         }
                         tqdm.write(
                             f"[ppdist ep={ep:3d}]\n  "
@@ -13426,8 +13682,7 @@ def main():
                         _fcl = _dst.get("face_chunk_len")
                         if _fpv and _fcl:
                             _real = float(np.mean(_fpv)) * float(np.mean(_fcl))
-                            _pad = float(ENV_MAX_FACES) * float(
-                                MAX_DELTA_TOKENS)
+                            _pad = float(ENV_MAX_FACES) * float(_wcap)
                             tqdm.write(
                                 f"[ppdist ep={ep:3d}] live-face buffer "
                                 f"occupancy: mean_faces="
@@ -13710,20 +13965,36 @@ def main():
             _wG, _wlive = [], []
             for _wi in range(int(args.popart_init_episodes)):
                 _wkey, key = jrand.split(key)
-                _wstates = reset_envs(env_episode)
-                def _wroll(_n, _k=_wkey, _s=_wstates):
+                def _wroll(_n, _w, _k=_wkey):
                     _ep_begin_attempt()
-                    _t0, _f0 = _episode_streams(_n)
+                    # THE ENV CARRIES THE WINDOW BIN, so the env states have
+                    # to be built at the bin this attempt runs at -- their
+                    # `delta_tokens` leaf IS the window. They are rebuilt
+                    # here rather than outside because a repeat may change
+                    # the bin, and `reset` is deterministic and makes no
+                    # host callback under delta_obs, so this is the same
+                    # states at the same width and nothing else.
+                    _env_w = env_episode.with_delta_window(_w)
+                    _s = reset_envs(_env_w)
+                    _t0, _f0 = _episode_streams(_n, _w)
                     _out = rollout_fn(
-                        agent, env_episode, num_valid, _s,
+                        agent, _env_w, num_valid, _s,
                         jrand.split(_k, num_envs), base_mem,
                         preferences_per_env, stage_override,
                         stage_pin_rules,
                         _wt,  # positional: vmap in_axes is a positional tuple
                         _t0, _f0, _EP_ENV_IDX,
                     )
-                    # The overflow arrives as two device arrays, read here
-                    # on the host AFTER the rollout finished (finding 2).
+                    # The overflows arrive as device arrays, read here on
+                    # the host AFTER the rollout finished (finding 2). THE
+                    # WINDOW IS CHECKED FIRST: a step whose delta does not
+                    # fit the window is also a meaningless cursor advance,
+                    # so reporting the stream overflow it drags along with
+                    # it would move the wrong bin.
+                    _wov = _epstream.window_overflow_from(
+                        _out[8], _out[9], _w, _out[10])
+                    if _wov is not None:
+                        return _out, _wov
                     return _out, _epstream.overflow_from(
                         _out[6], _out[7], _n)
                 # A random warm-up plan can emit MORE than a learned one, so
@@ -13731,11 +14002,14 @@ def main():
                 # length goes into the same history.
                 _ep_new_episode()
                 (_wend, _wtraj, _wtot, _wst, _wsf, _wused,
-                 _wovl, _wovs) = _epstream.run_episode(
+                 _wovl, _wovs, _wwl, _wws, _wwk,
+                 _wwin, _wface) = _epstream.run_episode(
                     _EP_BIN, "popart warm-up rollout %d" % _wi, _wroll,
                     log=lambda line: print(line, flush=True),
-                    on_discard=_ep_discard)
+                    on_discard=_ep_discard, window_policy=_WIN_BIN)
                 _EP_BIN.record(int(np.max(np.asarray(_wused))))
+                _WIN_BIN.record(int(max(int(np.max(np.asarray(_wwin))),
+                                        int(np.max(np.asarray(_wface))))))
                 _wr = _wtraj.reward                             # (E, T, R) raw
                 # Sentinel test on the RAW vector, identical to `_is_degen` in
                 # the loss. Testing it after symlog (as the old code did) can
@@ -13938,20 +14212,26 @@ def main():
 
         _ep_new_episode()
 
-        def _ep_attempt(_ep_n):
-            """ONE attempt at this episode, at the bin `2^_ep_n`.
+        def _ep_attempt(_ep_n, _win_n):
+            """ONE attempt at this episode, at the PAIR `(2^_ep_n, 2^_win_n)`.
 
             Returns the episode's whole result and the overflow the ROLLOUT
-            reported, or None. Reading the two overflow arrays blocks on
-            the rollout, which is one synchronisation per episode and the
-            only one the bin costs.
+            reported, or None. Reading the overflow arrays blocks on the
+            rollout, which is one synchronisation per episode and the only
+            one the bins cost.
+
+            THE WINDOW BIN IS CHECKED FIRST. A step whose delta does not fit
+            the window also advances the cursor by a length nothing will
+            ever read, so it usually drags a stream overflow along with it.
+            Reporting that one would move the wrong bin.
             """
             _ep_begin_attempt()
+            _env_w = env_episode.with_delta_window(1 << int(_win_n))
             _out = train_episode(
                 agent,
                 opt_state,
-                env_states,
-                env_episode,
+                reset_envs(_env_w),
+                _env_w,
                 base_mem,
                 preferences_per_env,
                 global_step,
@@ -13970,8 +14250,13 @@ def main():
                 vprobe_opt_state,
                 _kl_ref_coef_arg,
                 _ep_n,
+                int(_win_n),
             )
-            return _out, _epstream.overflow_from(_out[-2], _out[-1], _ep_n)
+            _wov = _epstream.window_overflow_from(
+                _out[-5], _out[-4], _win_n, _out[-3])
+            if _wov is not None:
+                return _out, _wov
+            return _out, _epstream.overflow_from(_out[-7], _out[-6], _ep_n)
         (
             agent,
             opt_state,
@@ -13995,17 +14280,31 @@ def main():
             _ep_used,
             _ep_over_len,
             _ep_over_step,
+            _win_over_len,
+            _win_over_step,
+            _win_over_kind,
+            _win_used,
+            _face_used,
         ) = _epstream.run_episode(
             _EP_BIN,
             "episode %d" % ep,
             _ep_attempt,
             log=lambda line: print(line, flush=True),
             on_discard=_ep_discard_episode,
+            window_policy=_WIN_BIN,
         )
         # THE MEASUREMENT THE NEXT BIN IS CHOSEN FROM. Recorded on success;
         # `run_episode` records the overflowing length itself when an
         # episode had to be repeated.
         _EP_BIN.record(int(_ep_used))
+        # AND THE WINDOW BIN'S, from the same rollout, on the device. The
+        # bin is sized from `max(Q1, Q3)` -- the longest single step's delta
+        # and the longest per-step face concatenation -- because the window
+        # bounds both of them and they are two views of the same
+        # elimination.
+        _win_max = int(np.max(np.asarray(_win_used)))
+        _face_max = int(np.max(np.asarray(_face_used)))
+        _WIN_BIN.record(max(_win_max, _face_max))
         if _xtr_on:
             # The trace has to stay open until the device is drained or the
             # timeline stops at the first output that happens to be ready.
@@ -14091,6 +14390,22 @@ def main():
                 "lagrangian/mean_raw_q": float(np.mean(_lag_q)),
                 "lagrangian/popart_frozen": float(_lag_frozen),
             }
+        # THE WINDOW BIN'S TELEMETRY, from the DEVICE. `tokens/delta_max`
+        # beside it is the host counter, which is process-local and reads 0
+        # under --ray-measure -- keep it, because it is the human-readable
+        # number and now has a sibling to be checked against, but the bin
+        # walks on these.
+        _win_extra = {
+            "tokens/delta_max_device": int(_win_max),
+            "tokens/face_total_max": int(_face_max),
+            "tokens/window_bin": int(1 << _WIN_BIN.log2),
+            "tokens/window_bin_log2": int(_WIN_BIN.log2),
+            "tokens/window_occupancy": (
+                float(max(_win_max, _face_max)) / float(1 << _WIN_BIN.log2)),
+            "tokens/episode_bin_log2": int(_EP_BIN.log2),
+        }
+        lag_extra = (_win_extra if lag_extra is None
+                     else dict(lag_extra, **_win_extra))
         host_log(
             ep,
             total_rewards_full,

@@ -205,6 +205,34 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
         import time as _time
         _perf = _time.perf_counter
 
+    def _fit(tok, cnt):
+        """The chunk in the WINDOW BIN's buffer, with the RAW count.
+
+        `window` is the per-step delta window BIN and the declared width of
+        the callback's token output. `live_faces.window` is the stream's own
+        buffer, which stays at the HARD CAP so that the stream never
+        truncates a chunk below the cap and so that its prefix cache is
+        shared by every bin. When the bin is smaller the buffer is cut here.
+
+        THE COUNT THAT RIDES OUT IS NOT CUT. A chunk longer than the bin is
+        a WINDOW OVERFLOW, and the rollout has to be able to see it: it
+        carries `sum(counts) > bin` out as a device flag, the driver
+        discards the whole attempt and repeats it one window bin up. Cutting
+        the count here instead would truncate the tokens the head reads,
+        which changes the ACTION and not merely the padding, and would do it
+        in silence -- the defect this replaces (`stats["truncated"]` was the
+        only trace of it).
+        """
+        t = np.asarray(tok)
+        c = int(cnt)
+        if t.shape[0] == W:
+            return t, c
+        out = np.zeros((W,), _TOKEN_DTYPE)
+        keep = min(c, W)
+        if keep > 0:
+            out[:keep] = t[:keep]
+        return out, c
+
     def _einfo_host(env_i, step_count, ekey, cvx, head, wrok):
         """One face's edge-slot wire, resolved against the host table."""
         edge_table.begin(env_i, int(step_count))
@@ -244,6 +272,7 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
                         face_hist, skip_hist,
                     )
                     _dist("face_chunk_len", cnt)
+                    tok, cnt = _fit(tok, cnt)
                     out1 = (tok, np.asarray(cnt, np.int32),
                             np.asarray(ends, np.int32),
                             _einfo_host(0, _sc1, ekey, cvx, head, wrok))
@@ -257,6 +286,7 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
                     face_hist, skip_hist,
                 )
                 _dist("face_chunk_len", cnt)
+                tok, cnt = _fit(tok, cnt)
                 out1 = (tok, np.asarray(cnt, np.int32),
                         np.asarray(ends, np.int32))
                 if emit_head:
@@ -298,7 +328,8 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
                         _vs[i], _fr[i], _fs[i], int(_ff[i]),
                         _fh[i], _kh[i],
                     )
-                toks[i], cnts[i] = tok, np.int32(cnt)
+                _tk_i, _ct_i = _fit(tok, cnt)
+                toks[i], cnts[i] = _tk_i, np.int32(_ct_i)
                 ends[i] = end
                 heads[i] = np.int32(head)
                 _dist("face_chunk_len", cnt)
