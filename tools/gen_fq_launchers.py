@@ -210,6 +210,11 @@ REQUIRED_FLAGS = [
     "--approx-profile",
     "--cost-form",
     "--quality-floor",
+    # The cost floor (.9, b2c89170): every training arm passes it explicitly,
+    # and a tree without the flag fails at argparse AFTER the preflight said
+    # yes (audit of 2026-09-14 on a 61-commit-old stack). Checked here so the
+    # preflight names the missing flag instead.
+    "--paired-cost-floor",
     "--mem-channel",
     "--scale-face-head",
     "--face-logit-clamp",
