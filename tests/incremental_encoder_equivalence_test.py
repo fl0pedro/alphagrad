@@ -20,6 +20,26 @@ from alphagrad.approx.ppo_ray_worker import MicroPPOAgent
 TOKENS = np.array([7, 11, 23, 5, 42, 13, 99, 31, 60, 8, 17, 25], dtype=np.int32)
 
 
+@pytest.fixture(autouse=True)
+def _exact_read():
+    """THIS MODULE PINS A PROPERTY OF THE EXACT OPERATOR, so it forces
+    ``ALPHAGRAD_PALIMPSA_READ=exact`` even though the shipped default is now
+    ``fast``.
+
+    The claim is that the incremental encode equals the full encode at every
+    split of a 12-token stream, down to one token at a time. Every one of those
+    splits sits inside a single 32-token chunk, so under the fast read each
+    piece starts its own chunk and reads a different (correct) approximation.
+
+    The fast read is pinned separately, on the properties it does have, in
+    ``tests/fast_read_extend_parity_test.py``.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("ALPHAGRAD_PALIMPSA_READ", "exact")
+        yield
+
+
+
 def _agent(seed=0):
     return MicroPPOAgent(vocab_size=512, embd_dim=32, num_layers=2, num_heads=2,
                          hidden_dim=64, num_vertices=16, value_dims=[32],

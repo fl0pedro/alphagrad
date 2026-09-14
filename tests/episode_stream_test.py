@@ -834,9 +834,15 @@ def test_the_snapshot_names_only_containers_this_module_still_defines():
 
 # -------------------------------------------------------------- 5. the read
 
+# THE CHUNKS ARE MULTIPLES OF 32. Under the shipped
+# ALPHAGRAD_PALIMPSA_READ=fast a multi-block fold has to start every block on
+# a multiple of 32 (see `delta_fold.plan_chunks`), and 48 is allowed because
+# the window clamps it to a single block. The claim under test is about WHERE
+# the reader takes its tokens from, not about the chunk width, and the counts
+# still sweep 0, 1, 17, 37, 63 and the full window.
 @pytest.mark.parametrize("window,count,chunk", [
-    (64, 64, 16), (64, 0, 16), (64, 1, 16), (64, 63, 16), (64, 17, 16),
-    (64, 64, 64), (64, 64, 7), (48, 37, 32),
+    (64, 64, 32), (64, 0, 32), (64, 1, 32), (64, 63, 32), (64, 17, 32),
+    (64, 64, 64), (64, 64, 128), (48, 37, 48),
 ])
 def test_the_chunked_read_from_the_stream_equals_the_read_from_the_window(
         window, count, chunk):
@@ -877,7 +883,7 @@ def test_the_chunked_read_from_the_stream_equals_the_read_from_the_window(
 
 def test_a_one_dimensional_stream_reads_the_same_span_as_a_row_of_a_batch():
     agent = StubAgent()
-    window, chunk, count, off = 64, 16, 40, 77
+    window, chunk, count, off = 64, 32, 40, 77
     rng = np.random.RandomState(5)
     win = rng.randint(1, 9, size=window).astype(np.uint8)
     L = ES.stream_length(10, window, chunk)
@@ -903,10 +909,10 @@ def test_the_reader_refuses_a_stream_whose_rank_does_not_match_the_row():
     win = jnp.zeros((64,), jnp.uint8)
     with pytest.raises(ValueError):
         extend_fold(agent, 0.0, win, jnp.asarray(8, jnp.int32), window=64,
-                    chunk=16, init_acc=init, fold_fn=fold, start=0, row=0)
+                    chunk=32, init_acc=init, fold_fn=fold, start=0, row=0)
     with pytest.raises(ValueError):
         extend_fold(agent, 0.0, win[None, :], jnp.asarray(8, jnp.int32),
-                    window=64, chunk=16, init_acc=init, fold_fn=fold, start=0)
+                    window=64, chunk=32, init_acc=init, fold_fn=fold, start=0)
 
 
 def test_the_k_window_is_one_contiguous_span_of_the_stream():

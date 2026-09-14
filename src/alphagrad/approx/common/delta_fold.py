@@ -87,14 +87,27 @@ def _encode_chunk(agent, enc, tk, c_cnt, C, parallel):
     """
     if _fast_read():
         fast = getattr(agent, "_extend_fast", None)
-        if fast is None:
+        if fast is not None:
+            valid = jnp.arange(C, dtype=jnp.int32) < jnp.asarray(
+                c_cnt, jnp.int32)
+            return fast(enc, tk, valid, c_cnt)
+        if getattr(agent, "_extend_parallel", None) is not None:
+            # A palimpsa agent with the associative-scan path but no fast one.
+            # Falling through would read the EXACT recurrence here and the fast
+            # one everywhere else, which is the one thing that must not happen
+            # silently, so it raises.
             raise RuntimeError(
-                "ALPHAGRAD_PALIMPSA_READ=fast but this agent has no "
-                "_extend_fast; the fold would silently fall back to the exact "
-                "read and disagree with every other call site.")
-        valid = jnp.arange(C, dtype=jnp.int32) < jnp.asarray(c_cnt, jnp.int32)
-        return fast(enc, tk, valid, c_cnt)
-    if parallel:
+                "ALPHAGRAD_PALIMPSA_READ=fast but this agent has "
+                "_extend_parallel and no _extend_fast; the fold would read the "
+                "exact recurrence here and the fast read at every other call "
+                "site.")
+        # NO PALIMPSA AT ALL. A stub whose only method is `encode_extend` (the
+        # fold's own tests, the episode-stream tests, the window-bin tests)
+        # carries its own recurrence and has no read to choose. There is
+        # nothing to fall back FROM, so it takes the ordinary path below. A
+        # real agent reaches `encode_extend` too, and that honours the flag
+        # through `_extend_sequential`'s `_walk`, so this is not a back door.
+    if parallel and not _fast_read():
         par = getattr(agent, "_extend_parallel", None)
         if par is not None:
             valid = jnp.arange(C, dtype=jnp.int32) < jnp.asarray(c_cnt,
@@ -128,19 +141,27 @@ def plan_chunks(window, chunk=None):
     W = int(window)
     if W <= 0:
         return C, 0, 0
-    if _fast_read():
-        # THE FAST READ'S OWN CHUNK GRID IS MEASURED FROM TOKEN 0 OF THE
-        # DELTA. Every fold chunk therefore has to start on a multiple of 32,
-        # or the rollout (which chunks by ALPHAGRAD_EXTEND_CHUNK) and the loss
-        # (which chunks by this) would cut the same delta at different places
-        # -- and a chunk boundary is exactly where the read stops
-        # approximating, so that is a real numerical difference and the PPO
-        # ratio would leave 1 at epoch 0. Round UP: rounding down could reach
-        # 0. The clamp to W below is safe on its own, because a single chunk
-        # starts at 0 whatever its width.
-        C = -(-C // _FAST_C) * _FAST_C
     C = min(C, W)
     nb = -(-W // C)
+    if _fast_read() and nb > 1 and C % _FAST_C:
+        # THE FAST READ'S CHUNK GRID STARTS AT TOKEN 0 OF THE DELTA. With more
+        # than one block the blocks begin at 0, C, 2C, ..., so C has to be a
+        # multiple of 32. Otherwise the rollout (which blocks by
+        # ALPHAGRAD_EXTEND_CHUNK) and the loss (which blocks by this) cut the
+        # same delta at different places. A chunk boundary is exactly where the
+        # read stops approximating, so that is a real numerical difference and
+        # the PPO ratio leaves 1 at epoch 0.
+        #
+        # It RAISES rather than rounding. Rounding is silent, and a launcher
+        # that asked for 100 and got 128 has no way to find out. ONE block is
+        # exempt because it starts at 0 whatever its width, which is what makes
+        # the `min(C, W)` clamp above safe for a window under the chunk.
+        raise ValueError(
+            f"ALPHAGRAD_FOLD_CHUNK={C} is not a multiple of the "
+            f"fast-palimpsa chunk {_FAST_C} and the window {W} needs {nb} "
+            "blocks. Under ALPHAGRAD_PALIMPSA_READ=fast every block must "
+            "start on a multiple of 32 tokens, or the rollout and the loss "
+            "read the same delta with different chunk boundaries.")
     return C, nb, nb * C
 
 
