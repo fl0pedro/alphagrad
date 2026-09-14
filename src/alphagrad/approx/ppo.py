@@ -14205,6 +14205,18 @@ def main():
         }
         lag_extra = (_win_extra if lag_extra is None
                      else dict(lag_extra, **_win_extra))
+        # THE PIPELINE'S OWN TELEMETRY (--measure-pipeline 1). How long the
+        # host actually waited for this episode's terminal rewards AFTER the
+        # previous episode's update was already on the GPU. `prof/measure_wait`
+        # is ~0 under the pipeline, so without this key the wait is invisible.
+        if _fe.get("collect_wait") is not None:
+            lag_extra = dict(lag_extra, **{
+                "measure/pipeline/collect_wait_s":
+                    float(_fe["collect_wait"]),
+                "measure/pipeline/sentinelled":
+                    int(_fe.get("sentinelled", 0)),
+                "measure/pipeline/ticket": int(_fe.get("ticket", -1)),
+            })
         host_log(
             ep,
             total_rewards_full,
@@ -14854,7 +14866,9 @@ def main():
             if _prev is not None:
                 _pipe_finish(_prev, _prev_out)
             _EP_CTX.update(win_max=_win_max, face_max=_face_max,
-                           xtr_on=False, pool_drain=_drain)
+                           xtr_on=False, pool_drain=_drain,
+                           collect_wait=_t_wait, ticket=_tkt,
+                           sentinelled=int(np.sum(_meas["sentinel"])))
             _PIPE_PENDING[0] = {
                 "roll": _roll,
                 "ctx": _EP_CTX,
