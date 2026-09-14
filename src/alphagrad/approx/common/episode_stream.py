@@ -224,6 +224,35 @@ def grow(log2: int) -> int:
     return int(log2) + 1
 
 
+# THE MARKER THE RAISE IS RECOGNISED BY when its TYPE did not survive.
+# `check_cursors` runs inside a `jax.pure_callback`, so its exception comes
+# back out through XLA, and the runtime is free to wrap it (jaxlib raises
+# its own error class with the original message attached). Matching on the
+# class alone would make the growth path depend on a jaxlib detail, and a
+# missed match is a CRASHED RUN instead of a grown bin.
+OVERFLOW_MARKER = "episode token stream overflow"
+
+
+def overflow_in(exc):
+    """The overflow inside ``exc``, however the runtime wrapped it, or None.
+
+    Looks for the typed exception anywhere in the `__cause__` /
+    `__context__` chain first, and falls back to :data:`OVERFLOW_MARKER` in
+    the text. Returns the exception to report, never a bare bool, so the
+    caller logs the real message.
+    """
+    seen = set()
+    cur = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, EpisodeStreamOverflow):
+            return cur
+        cur = cur.__cause__ or cur.__context__
+    if OVERFLOW_MARKER in str(exc):
+        return exc
+    return None
+
+
 def run_with_growth(state, what, fn, log=print):
     """THE DRIVER'S GROWTH LOOP, the owner's rule in one place (Q1).
 
@@ -241,11 +270,14 @@ def run_with_growth(state, what, fn, log=print):
     while True:
         try:
             return fn(state[0])
-        except EpisodeStreamOverflow as exc:
+        except Exception as exc:                       # noqa: BLE001
+            inner = overflow_in(exc)
+            if inner is None:
+                raise
             old = int(state[0])
             state[0] = grow(old)
             log("[episode-stream] bin 2^%d -> 2^%d, repeating %s: %s"
-                % (old, state[0], what, exc))
+                % (old, state[0], what, inner))
 
 
 class EpisodeStreamCapReached(Exception):

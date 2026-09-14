@@ -265,6 +265,63 @@ def test_the_driver_grows_the_bin_by_one_power_of_two_and_repeats_the_episode():
     assert "2^20 -> 2^21" in lines[1]
 
 
+def test_the_driver_recognises_the_overflow_after_the_runtime_wrapped_it():
+    """The raise happens inside a `jax.pure_callback`, so it comes back out
+    through XLA and the runtime may wrap it in its own error class. The
+    growth path must not depend on that class surviving."""
+    state = [19]
+    lines = []
+
+    def episode(n):
+        if n == 19:
+            try:
+                raise ES.EpisodeStreamOverflow(env_index=0, step=2,
+                                               length=(1 << n) + 3, log2=n)
+            except ES.EpisodeStreamOverflow as inner:
+                raise RuntimeError("XlaRuntimeError: callback failed") \
+                    from inner
+        return "done"
+
+    assert ES.run_with_growth(state, "episode 1", episode,
+                              log=lines.append) == "done"
+    assert state[0] == 20
+    assert "2^19 -> 2^20" in lines[0]
+
+
+def test_the_driver_recognises_the_overflow_by_its_text_alone():
+    """Last resort: neither the class nor the chain survived, only the
+    message. The marker is what the report then joins on."""
+    state = [19]
+    lines = []
+    calls = []
+
+    def episode(n):
+        calls.append(n)
+        if n == 19:
+            raise RuntimeError(
+                "jaxlib error: " + ES.OVERFLOW_MARKER
+                + ": environment 0 at step 2 would reach length 600000")
+        return "done"
+
+    assert ES.run_with_growth(state, "episode 1", episode,
+                              log=lines.append) == "done"
+    assert calls == [19, 20]
+    assert state[0] == 20
+
+
+def test_the_driver_re_raises_anything_that_is_not_an_overflow():
+    """A growth loop that swallowed the wrong exception would retry a real
+    bug until the cap and then report the cap instead of the bug."""
+    state = [19]
+
+    def episode(_n):
+        raise ValueError("something else entirely")
+
+    with pytest.raises(ValueError):
+        ES.run_with_growth(state, "episode 1", episode, log=lambda _l: None)
+    assert state[0] == 19
+
+
 def test_the_driver_does_not_swallow_the_cap(monkeypatch):
     monkeypatch.setenv(ES.LOG2_MAX_ENV, "20")
     state = [20]
