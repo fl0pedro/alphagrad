@@ -1021,6 +1021,185 @@ def _eval_digest(eval_args_list) -> bytes:
     return h.digest()
 
 
+# ---------------------------------------------------------------------------
+# PER-EPISODE PLAN DEDUPLICATION (owner ruling 2026-09-14).
+#
+# At the identity init all 16 terminal plans of an episode ARE THE SAME
+# PROGRAM, and a near-identity policy keeps producing duplicates for many
+# episodes after that. Measuring the same program sixteen times costs sixteen
+# times a second and learns nothing: the reward vector is a function of the
+# plan and of the episode's eval samples, and neither changes between the
+# duplicates.
+#
+# So: content-hash the plan (order, vertex rules, face rows, face skips, face
+# joins) together with the episode's eval-sample key, and inside ONE EPISODE
+# serve a repeat from the first measurement. The QUALITY channel is reused
+# too, because the gradient cosine depends on the plan alone.
+#
+# NEVER ACROSS EPISODES. The samples change, and a reading taken against last
+# episode's samples is not this episode's reading. The episode key below is
+# what enforces that: it carries both the published episode index and a
+# content digest of the samples, so a stale entry cannot survive either a new
+# episode or a resampling within one.
+#
+# PER MEASURE ACTOR. The actors are separate processes and share no memory,
+# so each measures a duplicated plan once. That is nearly the whole win in
+# WALL TIME anyway: the pool hands actor j the slots j, j+M, j+2M..., so with
+# M actors and 16 identical plans every actor measures its first slot and
+# serves the rest from its own cache, and the episode's measurement phase
+# costs one measurement instead of ceil(16/M). The pool cannot route by hash
+# to do better: `CpuApproxPool._evaluate_batch_impl` assigns slot i to actor
+# (i - wave_start), and a duplicate group larger than the number of waves
+# cannot be placed on one actor under that schedule.
+_PLAN_DEDUPE: dict = {}
+# The episode's measurement accounting, drained by `flush_measure_episode`.
+_MEASURE_EPISODE: dict = {
+    "key": None,          # the episode key these numbers belong to
+    "label": None,        # what to print for it
+    "n_plans": 0,         # terminal plans seen
+    "n_measured": 0,      # of those, actually measured
+    "secs": [],           # seconds per measured plan, both halves
+    "cand_secs": [],      # the candidate's half
+    "ref_secs": [],       # the reference's half
+}
+
+
+def measure_dedupe_enabled() -> bool:
+    """Is the per-episode duplicate cache armed? Default yes.
+
+    ``ALPHAGRAD_MEASURE_DEDUPE=0`` disarms it. Any tool that deliberately
+    measures THE SAME PLAN more than once -- `landscape_map`'s ``--reps``,
+    any drift or noise probe -- must disarm it, or every repeat after the
+    first returns the first one's numbers and the spread reads zero.
+
+    A SECOND PRECONDITION is enforced at the call site rather than here: a
+    measurement with no eval samples has no episode key, so it never dedupes
+    whatever this returns.
+    """
+    return os.environ.get("ALPHAGRAD_MEASURE_DEDUPE", "1") not in (
+        "0", "", "false", "False", "no")
+
+
+# The counts the most recent measurement in this process actually used.
+# Written at the bottom of `_callback_measured`; read by tools that need to
+# stamp a row with the protocol it was measured under, because under the time
+# budget that protocol is a property of the PLAN, not of the run.
+_LAST_MEASURE_COUNTS: dict = {}
+
+
+def last_measure_counts() -> dict:
+    """A copy of the counts the last measurement used, or an empty dict."""
+    return dict(_LAST_MEASURE_COUNTS)
+
+
+def _episode_measure_key(eval_samples) -> bytes:
+    """THE EPISODE a measurement belongs to, as bytes.
+
+    The published episode index and the attempt (both of which the trainer
+    republishes into the actor before every measurement) PLUS a content
+    digest of the episode's first eval sample. Either alone would be wrong:
+    the index is 0 in any process nobody published one into, and the samples
+    could in principle repeat.
+
+    Only the FIRST sample is digested. The samples are drawn together, once
+    per episode, so the first one identifies the draw, and digesting all of
+    them would hash the whole calibration set on every terminal callback.
+    """
+    import hashlib as _hl
+    h = _hl.blake2b(digest_size=16)
+    h.update(str(walk_episode()).encode())
+    h.update(b"/")
+    h.update(str(plan_log_attempt()).encode())
+    if eval_samples:
+        try:
+            h.update(_eval_digest([a[0] for a in eval_samples]))
+        except Exception:
+            # A digest we cannot take is a cache we must not use. Make the
+            # key unique so nothing can ever hit against it.
+            h.update(os.urandom(16))
+    return h.digest()
+
+
+def _plan_content_key(order, rule_specs, face_specs, face_skips,
+                      face_joins) -> bytes:
+    """Content hash of a PLAN: what graphax would be asked to build.
+
+    The elimination order, the per-vertex rules, the per-face rows, the
+    per-face skips and the per-face join bits -- exactly the five wires the
+    plan log records, and exactly what decides the executable. Two plans with
+    this hash in common produce the same program and therefore the same
+    reward vector against the same samples.
+    """
+    import hashlib as _hl
+    h = _hl.blake2b(digest_size=16)
+    h.update(np.asarray(order, dtype=np.int64).tobytes())
+    for part in (rule_specs, face_specs, face_skips, face_joins):
+        h.update(b"|")
+        if part is None:
+            h.update(b"none")
+            continue
+        # int32 is the wire dtype of all four, so this is a view plus one
+        # copy into the hash rather than a widening copy of a face array
+        # that is 95 x MAX_FACES x FACE_SLOTS x 3 on the flagship.
+        arr = np.asarray(part, dtype=np.int32)
+        h.update(repr(arr.shape).encode())
+        h.update(np.ascontiguousarray(arr).tobytes())
+    return h.digest()
+
+
+def flush_measure_episode() -> None:
+    """Print THE EPISODE LINE and reset the accounting. Idempotent.
+
+    One line per episode per measure actor, naming the median seconds a plan
+    cost to measure and the duplicate count. Called when the episode key
+    changes and again when the trainer drains the plan records, so the last
+    episode of a run is reported too.
+    """
+    st = _MEASURE_EPISODE
+    if not st["n_plans"]:
+        st["key"] = None
+        st["label"] = None
+        return
+    _secs = sorted(st["secs"])
+    _cand = sorted(st["cand_secs"])
+    _ref = sorted(st["ref_secs"])
+
+    def _med(xs):
+        if not xs:
+            return 0.0
+        n = len(xs)
+        return xs[n // 2] if n % 2 else 0.5 * (xs[n // 2 - 1] + xs[n // 2])
+
+    # THE PID IS PART OF THE LINE. The accounting is per measure ACTOR, and
+    # a campaign arm runs several, so three lines per episode is the expected
+    # output and each one has to say whose it is.
+    print(f"[measure] episode {st['label']} pid {os.getpid()}: median "
+          f"{_med(_secs):.3f} s/plan (candidate {_med(_cand):.3f} s, "
+          f"reference {_med(_ref):.3f} s) dedupe: {int(st['n_plans'])} "
+          f"plans {int(st['n_measured'])} measured", flush=True)
+    st["key"] = None
+    st["label"] = None
+    st["n_plans"] = 0
+    st["n_measured"] = 0
+    st["secs"] = []
+    st["cand_secs"] = []
+    st["ref_secs"] = []
+
+
+def _roll_measure_episode(key: bytes) -> None:
+    """Start a new episode's accounting when `key` changes.
+
+    Flushes the previous episode's line and drops the duplicate cache, which
+    is the one place the never-across-episodes rule is enforced.
+    """
+    if _MEASURE_EPISODE["key"] == key:
+        return
+    flush_measure_episode()
+    _PLAN_DEDUPE.clear()
+    _MEASURE_EPISODE["key"] = key
+    _MEASURE_EPISODE["label"] = str(walk_episode())
+
+
 _DEGENERATE_PLANS = [0]
 # Plans TRUNCATED for engineering reasons (resource limits: op-count cap,
 # OOM). Counted separately from zero-work plans because the two get opposite
@@ -1847,6 +2026,12 @@ def _record_plan(rec: dict) -> None:
 
 def consume_plan_records() -> dict:
     """Pop this process's plan records (mirrors the other pollers)."""
+    # THE EPISODE LINE (owner ruling 2026-09-14). The trainer drains this
+    # process once per episode, so the drain is the one moment an actor is
+    # certain an episode is over -- including the LAST one, which no
+    # following episode would ever roll over. `flush_measure_episode` is
+    # idempotent and silent when there is nothing to report.
+    flush_measure_episode()
     _fb_n = int(_MEASURE_COMPILE_FALLBACKS["n"])
     out = {"records": list(_PLAN_RECORDS),
            "dropped": int(_PLAN_LOG_DROPPED[0]),
@@ -1950,6 +2135,8 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
                           counts_from_trace: bool,
                           mem_parity: dict | None = None,
                           paired_ref: dict | None = None,
+                          measure_counts: dict | None = None,
+                          measured_from: int | None = None,
                           face_joins=None, refused: str | None = None) -> None:
     """Append ONE terminal plan to this process's plan log. Never raises.
 
@@ -2026,6 +2213,27 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             "candidate_memory_bytes": (paired_ref or {}).get(
                 "candidate_memory_bytes"),
             "mem_log_floored": (paired_ref or {}).get("mem_floored"),
+            # THE COUNTS THIS PLAN WAS ACTUALLY MEASURED WITH (owner ruling
+            # 2026-09-14). Under the time budget the protocol is no longer a
+            # constant of the run -- a slow plan earns fewer windows than a
+            # fast one, and a 121 us reference runs 50 executions per window
+            # where an 18 ms candidate runs 5 -- so a record that did not
+            # carry them could not be re-read. `measure_secs` is the
+            # execution time inside the timed windows of that half, which is
+            # what --measure-budget-secs is a target for.
+            "measure_inner": (measure_counts or {}).get("inner"),
+            "measure_windows": (measure_counts or {}).get("windows"),
+            "measure_secs": (measure_counts or {}).get("secs"),
+            "ref_measure_inner": (measure_counts or {}).get("ref_inner"),
+            "ref_measure_windows": (measure_counts or {}).get("ref_windows"),
+            "ref_measure_secs": (measure_counts or {}).get("ref_secs"),
+            # THE PLAN THIS ONE'S NUMBERS CAME FROM (owner ruling
+            # 2026-09-14). None on every measured plan. An integer names the
+            # index, within this episode and this measure actor, of the
+            # identical plan that WAS measured; this record then carries no
+            # timing fields of its own, because no timing happened.
+            "measured_from": (None if measured_from is None
+                              else int(measured_from)),
         }
         rec.update(_plog.encode_wires(
             order, rule_specs, face_specs, face_skips,
@@ -2601,6 +2809,40 @@ class EnvConfig(NamedTuple):
     # here so existing campaigns measure identically until a launcher opts in
     # via --latency-inner-reps).
     latency_inner_reps: int = 1
+    # THE CANDIDATE'S TIME BUDGET (owner ruling 2026-09-14).
+    #
+    # Until this ruling the candidate ran a FIXED 5 points x 4 reps x 50 inner
+    # = 1005 executions of the plan, whatever the plan cost. On the
+    # transformer arm one execution is 18.2 ms, so a plan cost 18.3 s to
+    # measure and an episode of 16 plans cost 293 s -- 73 percent of the
+    # episode -- for twenty samples of a reading whose coefficient of
+    # variation is 0.56 percent. The fixed counts were a specification
+    # (commit 61e7027e, "the spec's 20"), never a noise measurement.
+    #
+    # The counts are now derived from ONE warm-up execution's measured time
+    # `t`:
+    #     inner   = clamp(ceil(measure_window_secs / t), 5, 50)
+    #     windows = clamp(round(measure_budget_secs / (inner * t)),
+    #                     1, num_data_points * reps_per_point)
+    # so `num_data_points` and `reps_per_point` are CAPS on the window count,
+    # not the count itself, and the windows are spread ROUND-ROBIN over the
+    # data points (a plan with few windows still sees several samples).
+    #
+    # `measure_window_secs` is what keeps a timed window off the dispatch
+    # floor: at inner 5 the identity plan reads 20.7 percent high against
+    # inner 50 (docs/UNBIASED_PARETO_AND_MEASUREMENT.md), while 20 executions
+    # per window already read within 3 percent of 50. A 50 ms window buys a
+    # 121 us program the full 50 and an 18 ms program the floor of 5, which
+    # is the regime each of them needs.
+    #
+    # THE REFERENCE keeps its own WINDOW COUNT (`ref_num_data_points` x
+    # `ref_reps_per_point`, unchanged by this ruling) and takes only its INNER
+    # from the same window rule, applied to its own execution time.
+    #
+    # A SLOW PLAN GETS FEWER WINDOWS, by construction. The owner's ruling on
+    # that is explicit: slow runs do not matter, they are too large anyway.
+    measure_budget_secs: float = 1.0
+    measure_window_secs: float = 0.05
     # PER-FACE application. Off: the vertex's rule list is handed to graphax
     # literally and applied uniformly to EVERY face (so a rule must fit all of
     # them or it raises / is masked away). On: the rules are wrapped in a
@@ -3410,11 +3652,13 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
 # ---------------------------------------------------------------------------
 # THE PAIRED REFERENCE (ticket dsnn-3qm.9). Under ``--cost-form paired-log``
 # every terminal measurement also measures REV-EXACT -- the reverse order,
-# every face None, the jax.grad-equivalent -- in the same callback, right
-# after the candidate, through the same executable path and the same
-# instrument (`_campaign_measure_cost` -> `_time_one_rep`, same eval args,
-# same inner-reps, same warmup, same median -- but since 2026-09-14 its OWN
-# points x reps, see `EnvConfig.ref_num_data_points`). The cost
+# every face None, the jax.grad-equivalent -- in the same callback,
+# INTERLEAVED with the candidate window by window since 2026-09-14 (it used
+# to run as a second block right after it), through the same executable path
+# and the same instrument (`_time_one_rep`, same eval args, same warmup, same
+# median). Its POINTS x REPS are its own (`EnvConfig.ref_num_data_points`)
+# and so is its INNER, which the window rule derives from its own execution
+# time (`EnvConfig.measure_budget_secs`). The cost
 # channels then carry the LOG-DIFFERENCE ``Delta_c = log cost_c(candidate)
 # - log cost_c(rev-exact)`` (stored negated like every cost slot), so
 # rev-exact scores 0 by construction and a GPU-state drift of 18-20 % between
@@ -3627,17 +3871,19 @@ def _campaign_measure_cost(ex, eval_args_list, unique_devices,
     untimed executions per point, reduced by ``_aggregate_samples``
     (the same median the plan's own channels get).
 
-    Used for the paired rev-exact reference (ticket dsnn-3qm.9; the
-    quality gate's exact floor until 2026-09-04) so the reference is,
-    literally, the number the campaign path would have printed for that
-    plan.
+    NOT ON THE MEASUREMENT PATH SINCE 2026-09-14, and say so plainly: the
+    terminal callback measures the candidate and the paired rev-exact
+    reference in ONE INTERLEAVED LOOP now, window by window, so that the
+    two halves of the ratio occupy the same seconds (owner ruling; see
+    `interleave_windows`). It carried the reference from ticket
+    dsnn-3qm.9 until then, and the quality gate's exact floor until
+    2026-09-04.
 
-    The CALLER chooses the counts. Since the owner's ruling of 2026-09-14
-    the reference is handed `EnvConfig.ref_num_data_points` /
-    `ref_reps_per_point` rather than the candidate's, because the two
-    halves of the pair are 150x apart in cost and the shared budget left
-    the cheap half under-integrated. `inner` and `warmup` remain the
-    candidate's, so the per-window protocol is still one instrument.
+    It is kept because it is the FIXED-COUNT form of the instrument
+    written down in one place: `len(eval_args_list)` points x `n_reps`
+    windows, no budget, no window rule. The tests compare the callback's
+    reading against it, which is the property that matters -- one
+    instrument, whichever loop drives it.
     """
     _lat: list[float] = []
     _peak: list[float] = []
@@ -3668,6 +3914,99 @@ def _resolve_warmup(config) -> int:
     if _w == 0 and os.environ.get("ALPHAGRAD_MEASURE_WARMUP", "1") != "0":
         return 1
     return _w
+
+
+# ---------------------------------------------------------------------------
+# THE TIME BUDGET (owner ruling 2026-09-14). See `EnvConfig.measure_budget_secs`
+# for the measurement that motivates it.
+# ---------------------------------------------------------------------------
+# The floor and the ceiling of the inner-rep count. NOT configurable: 50 is the
+# one number of the protocol that was ever measured (inner 5 reads 20.7 percent
+# high on the identity plan, inner 20 within 3 percent of inner 50), and 5 is
+# the value every pre-2026-08 campaign ran, so nothing below it is a new
+# regime. What the window rule chooses is where BETWEEN them a given program
+# lands.
+MEASURE_INNER_MIN = 5
+MEASURE_INNER_MAX = 50
+
+
+def resolve_measure_inner(t_exec_s: float, window_s: float,
+                          hi: int = MEASURE_INNER_MAX) -> int:
+    """Executions per timed window for a program that takes `t_exec_s`.
+
+    ``clamp(ceil(window_s / t_exec_s), 5, hi)`` where `hi` is
+    ``--latency-inner-reps``. At the campaign's 50 that is the owner's rule
+    verbatim: a 121 us reference gets 50 (a 50 ms window would hold 413) and
+    an 18.2 ms candidate gets the floor of 5 (it would hold 3).
+
+    THE FLAG IS THE CEILING, never exceeded and never raised. Every caller
+    that configures a SMALLER inner than 5 -- the legacy default of 1, and
+    `landscape_map`'s 5 -- therefore measures exactly as it did before this
+    ruling: the window rule can only choose BETWEEN 5 and the flag, and a
+    flag below 5 collapses the interval onto itself.
+
+    A non-positive or non-finite `t_exec_s` is a broken probe, not an
+    infinitely fast program, and takes the ceiling -- the conservative end.
+    """
+    hi = max(1, int(hi))
+    lo = min(MEASURE_INNER_MIN, hi)
+    if not math.isfinite(t_exec_s) or t_exec_s <= 0.0:
+        return hi
+    want = math.ceil(float(window_s) / float(t_exec_s))
+    return int(min(hi, max(lo, want)))
+
+
+def resolve_measure_windows(t_exec_s: float, inner: int, budget_s: float,
+                            cap: int) -> int:
+    """Timed windows that fit `budget_s` seconds of executions, capped.
+
+    ``clamp(round(budget_s / (inner * t_exec_s)), 1, cap)``. `cap` is
+    ``num_data_points * reps_per_point`` for the candidate: under the ruling
+    those two flags are the CEILING on the sample count, never the count.
+
+    A broken probe (non-finite or non-positive `t_exec_s`) yields 1 window:
+    one honest sample beats an unbounded loop.
+    """
+    cap = max(1, int(cap))
+    if not math.isfinite(t_exec_s) or t_exec_s <= 0.0:
+        return 1
+    per_window = float(inner) * float(t_exec_s)
+    if per_window <= 0.0:
+        return 1
+    want = int(round(float(budget_s) / per_window))
+    return int(min(cap, max(1, want)))
+
+
+def interleave_windows(n_a: int, n_b: int) -> list:
+    """The A/B schedule of `n_a` candidate windows and `n_b` reference ones.
+
+    Returns a list of 0 (candidate) and 1 (reference) of length ``n_a + n_b``
+    in which the two streams are spread PROPORTIONALLY -- ``[0, 1, 0, 1, ...]``
+    when the counts are equal, and one candidate window every ``n_b / n_a``
+    reference windows when they are not.
+
+    WHY, and why not two blocks: the paired ratio's job is to cancel GPU
+    drift, and it can only cancel drift that is common to both halves. Two
+    back-to-back blocks put the whole reference measurement AFTER the whole
+    candidate measurement, so any clock or thermal excursion during the plan
+    lands on one half only. Interleaving puts the two halves in the same
+    seconds. The ratio is still computed from the two medians; only the ORDER
+    of the windows changes.
+    """
+    n_a = max(0, int(n_a))
+    n_b = max(0, int(n_b))
+    out: list = []
+    ia = ib = 0
+    total = n_a + n_b
+    for _ in range(total):
+        # Take from whichever stream is furthest behind its share.
+        if ib >= n_b or (ia < n_a and (ia + 0.5) * n_b <= (ib + 0.5) * n_a):
+            out.append(0)
+            ia += 1
+        else:
+            out.append(1)
+            ib += 1
+    return out
 
 
 def _paired_log_delta(candidate: float, reference: float,
@@ -6978,6 +7317,48 @@ def _callback_measured(
                      jnp.zeros(NUM_REWARDS, dtype=jnp.float32))
 
     # ------------------------------------------------------------------
+    # PER-EPISODE DEDUPLICATION (owner ruling 2026-09-14). See _PLAN_DEDUPE.
+    # ------------------------------------------------------------------
+    # Placed HERE, after the tokens exist and before anything is compiled or
+    # executed. The tokens are the next observation and must be produced for
+    # every env whatever happens; everything below this point is measurement,
+    # and for a plan this episode has already measured it would produce the
+    # same numbers a second time.
+    # The episode accounting runs whether or not the cache is armed, because
+    # it is also what prints the per-episode seconds-per-plan line.
+    _dedupe_key = None
+    _plan_index = -1
+    if is_terminal:
+        _roll_measure_episode(_episode_measure_key(eval_samples))
+        _plan_index = int(_MEASURE_EPISODE["n_plans"])
+        _MEASURE_EPISODE["n_plans"] = _plan_index + 1
+    # NO EVAL SAMPLES, NO CACHE. The ruling keys the cache on the plan AND on
+    # the episode's eval-sample key, and the samples are the only thing that
+    # tells one episode's measurement from another's when nobody publishes an
+    # episode index. A configuration that measures on the fixed `args` (every
+    # probe and every direct caller of `_callback`) therefore never dedupes:
+    # a cache that could not be bounded to an episode would live for the whole
+    # process and turn a deliberate re-measurement into a replay.
+    if is_terminal and measure_dedupe_enabled() and eval_samples:
+        _dedupe_key = _plan_content_key(
+            o_list, partial_specs, _faces_np, _skips_np, _joins_np)
+        _hit = _PLAN_DEDUPE.get(_dedupe_key)
+        if _hit is not None:
+            _from_idx, _hit_slots = _hit
+            if _plan_log_on:
+                _record_terminal_plan(
+                    order=o_list, rule_specs=partial_specs,
+                    face_specs=_faces_np, face_skips=_skips_np,
+                    face_joins=_joins_np,
+                    reward_vec=_hit_slots,
+                    face_before=_plan_pf0, face_after=_PER_FACE_STATS,
+                    counts_from_trace=False,
+                    measured_from=_from_idx)
+            _pf("cb.dedupe_hit")
+            return _wire(tokens, eqn_ids,
+                         jnp.array(_hit_slots, dtype=jnp.float32))
+
+    # ------------------------------------------------------------------
     # Compute family — graphax counters (always) → muls_adds_fmas, max_io_sum.
     # ------------------------------------------------------------------
     # Phase breadcrumb (ALPHAGRAD_DEBUG_MEASURE=1): printed BEFORE the two
@@ -7539,14 +7920,27 @@ def _callback_measured(
     # median smoothing from the original code is worth keeping).
     # ------------------------------------------------------------------
     # Measurement budget: `num_data_points` distinct eval samples x
-    # `reps_per_point` timing repetitions. Reps exist only to average timer
-    # noise, so without --measure-latency we take 1 rep per point. Quality is
-    # deterministic in the input, so it is computed ONCE PER POINT (not per
-    # rep) and medianed across points — the old code used point 0 only.
+    # `reps_per_point` timing repetitions is now the CAP on the number of
+    # timed windows, not the number itself (owner ruling 2026-09-14; see
+    # `EnvConfig.measure_budget_secs`). The windows a plan actually gets are
+    # derived from one warm-up execution's measured time so that the plan
+    # costs about `measure_budget_secs` of executions however fast or slow it
+    # is, and they are spread ROUND-ROBIN over the data points. Reps exist
+    # only to average timer noise, so without --measure-latency we take 1 rep
+    # per point. Quality is deterministic in the input, so it is computed ONCE
+    # PER POINT (not per rep) and medianed across points.
     n_points = max(1, int(getattr(config, "num_data_points", 5)))
     if eval_samples:
         n_points = min(n_points, len(eval_samples[0]))
     n_reps = max(1, int(getattr(config, "reps_per_point", 4))) if config.measure_latency else 1
+    _budget_s = float(getattr(config, "measure_budget_secs", 1.0) or 0.0)
+    _window_s = float(getattr(config, "measure_window_secs", 0.05) or 0.0)
+    if _budget_s <= 0.0 or _window_s <= 0.0:
+        raise ValueError(
+            "measure_budget_secs and measure_window_secs must both be > 0 "
+            f"(got {_budget_s!r} and {_window_s!r}); they set the per-plan "
+            "execution budget and the target timed-window duration, and a "
+            "zero would mean 'measure nothing'")
     # THE PAIRED REFERENCE'S OWN BUDGET, decoupled from the candidate's
     # (owner ruling 2026-09-14; see EnvConfig.ref_num_data_points for the
     # measurement that motivates it). The reference is 150x cheaper per
@@ -7620,9 +8014,12 @@ def _callback_measured(
         # with the SAME instrument (see _time_one_rep) -- but since
         # 2026-09-14 over its OWN number of points, so the list is built to
         # whichever of the two is longer and each half takes its prefix.
-        # The candidate reads `eval_args_all[:n_points]` and the reference
-        # `eval_args_all[:n_ref_points]`; at the campaign defaults the two
-        # are both 5 and the list is exactly what it always was. Built
+        # The candidate's windows walk `eval_args_all[:n_points]` round
+        # robin and the reference's walk `eval_args_all[:n_ref_points]`; at
+        # the campaign defaults the two are both 5 and the list is exactly
+        # what it always was. A half with fewer windows than points simply
+        # does not reach the later ones, which is what the budget means.
+        # Built
         # inside the try so a device_put OOM still truncates rather than
         # escaping.
         eval_args_all: list = []
@@ -7634,9 +8031,6 @@ def _callback_measured(
             if callback_device is not None:
                 _ea = [jax.device_put(d, callback_device) for d in _ea]
             eval_args_all.append(_ea)
-        # INSTRUMENT PARAMETERS (see _instrument_label): hoisted out of
-        # the point loop so the floor can be handed the identical values.
-        _inner = max(1, int(getattr(config, "latency_inner_reps", 1)))
         # WARMUP (config.latency_warmup): untimed executions before the
         # first timed rep, matching the elimrl/POMO worker's single warmup
         # call. Runs OUTSIDE every timing and memory window, so it can only
@@ -7654,84 +8048,209 @@ def _callback_measured(
         # gate floor is a FRESH compile every time it is measured. One
         # untimed execution costs one execution and removes the whole class.
         _warmup = _resolve_warmup(config)
-        for i in range(n_points):
-            eval_args_i = eval_args_all[i]
+        # THE CONFIGURED INNER-REP CEILING. Since the owner's ruling of
+        # 2026-09-14 `--latency-inner-reps` is the CEILING of the window
+        # rule, not the inner itself (see `resolve_measure_inner`): the
+        # campaign's 50 gives the ruling's clamp(., 5, 50) verbatim, and any
+        # caller that configures fewer than 5 measures exactly as before.
+        _cfg_inner = max(1, int(getattr(config, "latency_inner_reps", 1)))
 
-            # ResourceMonitor already runs ``jax.effects_barrier()`` in
-            # ``__enter__`` / ``__exit__``, so we don't need an extra
-            # ``block_until_ready`` on the result — the barriers drain the
-            # device queue both for the timer and the memory tracker.
-            #
-            # ``ALPHAGRAD_BYPASS_RESOURCE_MONITOR=1`` skips the construction +
-            # context manager entirely (vs. the lighter
-            # ``ALPHAGRAD_DISABLE_RESOURCE_MONITOR`` which only swapped the
-            # class to a no-op). This is the strongest cut available short
-            # of patching the import: no monitor object is created, no
-            # ``__enter__`` / ``__exit__`` runs, no ``stats`` dict is read.
-            # Used to isolate whether the per-call Python lifecycle around
-            # ``ResourceMonitor`` (not its C++ tracker) leaks. peak_memory +
-            # latency_ns are zero for the run.
-            # ONE instrument (see _time_one_rep): this loop and the
-            # paired rev-exact reference call the same function with the
-            # same (points, reps, inner, warmup), so the reference is
-            # exactly what the campaign path would have printed for the
-            # rev-exact plan -- not a throughput timing that reads 13% low.
+        # ---- THE PAIRED REFERENCE'S EXECUTABLE (ticket .9) --------------
+        # Compiled BEFORE the timing loop, because since 2026-09-14 its
+        # windows are INTERLEAVED with the candidate's instead of forming a
+        # second block after them. The compile is cached on `paired_ref_key`,
+        # which depends on neither half's counts, so this moves no work --
+        # only the moment the cache is consulted.
+        _ref_ex = None
+        if _paired:
+            _ref_ex = cached_compile(
+                b"paired-ref:" + paired_ref_key, _do_compile_paired_ref)
+
+        def _probe_one(ex, eval_args) -> float:
+            """Seconds of ONE execution of `ex`, measured on the WARM-UP.
+
+            THE LAST warm-up execution, and there are at least TWO. A single
+            warm-up is a COLD reading, and a cold reading here does not just
+            add noise to the counts, it can change the SCALE of the result:
+            the inner-rep count is ``ceil(window / t)``, so a `t` that reads
+            HIGH gives a SMALLER inner, and a small inner on a microsecond
+            program reads high against the dispatch floor (section 1.3 of
+            docs/UNBIASED_PARETO_AND_MEASUREMENT.md).
+
+            MEASURED, on the transformer arm (job 65666, one measure actor,
+            two episodes, one warm-up): the rev-exact reference settled at
+            138 us, but some plans' cold probe read about 2.5 ms and took
+            inner 20 instead of 50. Those plans then read up to 220 us, and
+            the reference's coefficient of variation over 112 plans was 9.6
+            percent against 2.1 percent under the fixed protocol. The second
+            warm-up costs one execution of the reference, 0.14 ms, and the
+            docs size the cold read as gone by the second reading (the
+            identity plan's first cold reading is 7.2 percent off and is
+            back inside 2 percent by reading two).
+
+            With ``ALPHAGRAD_MEASURE_WARMUP=0`` the budget still has to size
+            itself from something, so that configuration now pays exactly
+            TWO untimed executions per half per plan where it used to pay
+            none. They buy the counts.
+            """
+            _t = 0.0
+            for _w in range(max(2, _warmup)):
+                _p0 = time.perf_counter()
+                jax.block_until_ready(ex(*eval_args))
+                _t = time.perf_counter() - _p0
+            return _t
+
+        # ---- THE CANDIDATE'S BUDGET (owner ruling 2026-09-14) -----------
+        # One second of executions per plan, whatever the plan costs, instead
+        # of a fixed 5 x 4 x 50 = 1005 executions that cost 18.3 s on the
+        # transformer arm and 0.12 s on the reference. See
+        # `EnvConfig.measure_budget_secs`.
+        _warmed_cand: set = set()
+        _warmed_ref: set = set()
+        if config.measure_latency:
+            _t_cand = _probe_one(compiled_cost, eval_args_all[0])
+            _inner = resolve_measure_inner(_t_cand, _window_s, _cfg_inner)
+            _n_windows = resolve_measure_windows(
+                _t_cand, _inner, _budget_s, n_points * n_reps)
+        else:
+            # THE BUDGET IS A TIMING INSTRUMENT. With --measure-latency off
+            # there is no timer noise to integrate, `n_reps` is already 1,
+            # and this path stays exactly what it was before the ruling.
+            _t_cand = 0.0
+            _inner = _cfg_inner
+            _n_windows = n_points * n_reps
             for _w in range(_warmup):
-                jax.block_until_ready(compiled_cost(*eval_args_i))
-            for _rep in range(n_reps):
-                _lat_ns, _peak_b, _peak_src, out_approx = _time_one_rep(
-                    compiled_cost, eval_args_i, unique_devices, _inner)
+                jax.block_until_ready(compiled_cost(*eval_args_all[0]))
+        _warmed_cand.add(0)
+
+        # ---- THE REFERENCE'S BUDGET -------------------------------------
+        # It KEEPS ITS OWN WINDOW COUNT, `ref_num_data_points` x
+        # `ref_reps_per_point` (owner rulings of 2026-09-14, in that order):
+        # the reference is 150x cheaper per execution than the candidate on
+        # this order, so 160 windows of it cost about a second and it is the
+        # half that carries the paired ratio's noise. Only its INNER comes
+        # from the window rule, applied to ITS OWN execution time -- a 121 us
+        # program fills a 50 ms window 413 times over and takes the ceiling
+        # of 50, where the candidate takes the floor of 5.
+        _ref_inner = 0
+        _ref_windows = 0
+        if _paired:
+            if config.measure_latency:
+                _t_ref = _probe_one(_ref_ex, eval_args_all[0])
+                _ref_inner = resolve_measure_inner(
+                    _t_ref, _window_s, _cfg_inner)
+            else:
+                _t_ref = 0.0
+                _ref_inner = _cfg_inner
+                for _w in range(_warmup):
+                    jax.block_until_ready(_ref_ex(*eval_args_all[0]))
+            _ref_windows = n_ref_points * n_ref_reps
+            _warmed_ref.add(0)
+
+        # ---- THE INTERLEAVED TIMING LOOP --------------------------------
+        # A B A B ... (see `interleave_windows`), not two blocks: the paired
+        # ratio can only cancel drift that both halves saw, so the two halves
+        # have to occupy the same seconds. The windows of each half are
+        # spread ROUND-ROBIN over that half's data points, so a plan that
+        # earns only three windows still sees three different samples rather
+        # than three repetitions of sample 0.
+        #
+        # ResourceMonitor already runs ``jax.effects_barrier()`` in
+        # ``__enter__`` / ``__exit__``, so we don't need an extra
+        # ``block_until_ready`` on the result -- the barriers drain the
+        # device queue both for the timer and the memory tracker.
+        #
+        # ``ALPHAGRAD_BYPASS_RESOURCE_MONITOR=1`` skips the construction +
+        # context manager entirely (vs. the lighter
+        # ``ALPHAGRAD_DISABLE_RESOURCE_MONITOR`` which only swapped the
+        # class to a no-op). peak_memory + latency_ns are zero for the run.
+        #
+        # ONE instrument (see `_time_one_rep`): both halves call the same
+        # function, with the same warmup and the same window rule, so the
+        # reference is exactly what the campaign path would have printed for
+        # the rev-exact plan -- not a throughput timing that reads 13% low.
+        _ref_lat_samples: list[float] = []
+        _ref_peak_samples: list[float] = []
+        _ia = 0
+        _ib = 0
+        for _who in interleave_windows(_n_windows, _ref_windows):
+            if _who == 0:
+                _p = _ia % n_points
+                if _p not in _warmed_cand:
+                    for _w in range(_warmup):
+                        jax.block_until_ready(
+                            compiled_cost(*eval_args_all[_p]))
+                    _warmed_cand.add(_p)
+                _lat_ns, _peak_b, _peak_src, _out = _time_one_rep(
+                    compiled_cost, eval_args_all[_p], unique_devices, _inner)
+                # DROPPED IMMEDIATELY. The old loop kept the last timed
+                # output alive because the per-point quality work read it;
+                # that work now runs in its own loop below, so nothing needs
+                # it here and holding a full Jacobian across the timing loop
+                # is pure OOM headroom spent for nothing.
+                del _out
                 latency_samples.append(_lat_ns)
                 peak_mem_samples.append(_peak_b)
+                _ia += 1
+            else:
+                _p = _ib % n_ref_points
+                if _p not in _warmed_ref:
+                    for _w in range(_warmup):
+                        jax.block_until_ready(_ref_ex(*eval_args_all[_p]))
+                    _warmed_ref.add(_p)
+                _l, _pk, _s, _o = _time_one_rep(
+                    _ref_ex, eval_args_all[_p], unique_devices, _ref_inner)
+                del _o, _s
+                _ref_lat_samples.append(_l)
+                _ref_peak_samples.append(_pk)
+                _ib += 1
+        # SECONDS OF EXECUTION actually spent inside timed windows, per half.
+        # Window w of a half took ``latency_ns[w] * inner`` nanoseconds, which
+        # is the quantity the budget is a target for. Warm-ups, probes and the
+        # quality walk are outside it, by the same rule that keeps them
+        # outside the timing windows themselves.
+        _meas_secs = float(sum(latency_samples)) * _inner / 1e9
+        _ref_secs = float(sum(_ref_lat_samples)) * _ref_inner / 1e9
+        _pf("cb.exec_measure")
 
-            # FIDELITY, approx half. Point 0 only, terminal only. Taken HERE,
-            # off the execution the loop already ran (the streamed-quality
-            # rule at the top of this loop: never hold a second full
-            # Jacobian beyond the one the channel needs).
+        # ---- PER-POINT QUALITY, OUTSIDE every timed window --------------
+        # Until 2026-09-14 the per-point approximated Jacobian was taken off
+        # the LAST timed window of that point, which was free. The windows
+        # are now spread round-robin and a plan may earn FEWER windows than
+        # there are data points, so no point is guaranteed a timed execution
+        # of its own and the output has to be produced here.
+        #
+        # It costs ONE untimed execution per scored point, and only under the
+        # consumers that need one: `jac_cosine`, which scores per point, and
+        # the fidelity / cosine-log subsample, which needs point 0 alone. The
+        # campaign runs `grad_cosine`, which scores once per PLAN below, so on
+        # every campaign arm this loop executes nothing at all.
+        _quality_points = 0
+        if compiled_exact is not None and _qmetric == "jac_cosine":
+            _quality_points = n_points
+        elif _fid_needs_ref and is_terminal:
+            _quality_points = 1
+        for i in range(_quality_points):
+            eval_args_i = eval_args_all[i]
+            # DENSE by construction: `compiled_approx`, never the
+            # sparse-boundary `compiled_cost`, because the residual and the
+            # cosine both need leaf parity with the exact reference.
+            out_approx = compiled_approx(*eval_args_i)
+
+            # FIDELITY, approx half. Point 0 only, terminal only.
             if _fid_needs_ref and is_terminal and i == 0:
-                _dense = out_approx
-                if compiled_cost is not compiled_approx:
-                    # The timed executable was the sparse-boundary one; the
-                    # residual needs DENSE leaves for shape parity with the
-                    # exact reference. One extra execution, and only under
-                    # ALPHAGRAD_MEASURE_SPARSE.
-                    _dense = compiled_approx(*eval_args_i)
                 _fid_eval_args = eval_args_i
                 # THE ONE EXTRA RESIDENT JACOBIAN the fidelity channel
                 # costs. Held from point 0 until the exact-reference block,
-                # which runs AFTER the whole cost loop -- so the expensive
-                # half (the exact execution and the per-leaf reductions) is
-                # never inside a timing or peak-memory window.
-                #
-                # WHY HOLDING IT DOES NOT CORRUPT THE PEAK CHANNEL, which
-                # is the obvious worry: `_time_one_rep`'s peak is an
-                # ABOVE-BASELINE DELTA -- it snapshots `bytes_in_use`
-                # before the rep and subtracts it -- so a retained
-                # allocation raises the BASELINE, not the delta. Points
-                # 1..N-1 are timed and measured exactly as they would be
-                # with the channel off.
-                #
-                # WHAT IT DOES COST is residency: one extra full Jacobian
-                # for the length of the loop, i.e. more OOM headroom used
-                # on a big target (the streamed-quality note above sizes
-                # these at ~4 GB each at batch 512). At the moment of
-                # scoring the exact reference is alive alongside it, which
-                # is the SAME pair the legacy cosine path holds per point,
-                # so the ceiling is that path's, not double it.
-                _fid_approx_out = _dense
-                _dense = None
+                # which runs AFTER this loop -- so the expensive half (the
+                # exact execution and the per-leaf reductions) is never
+                # inside a timing or peak-memory window. Since 2026-09-14 it
+                # is no longer held across the timing loop either, because
+                # this loop runs after it.
+                _fid_approx_out = out_approx
 
-            if compiled_cost is not compiled_approx and compiled_exact is not None:
-                # The timed run above used the sparse-boundary executable;
-                # quality must compare DENSE outputs (shape parity with the
-                # exact reference). One untimed dense call, terminal only.
-                out_approx = compiled_approx(*eval_args_i)
-            # ``compiled_exact`` is only executed at the terminal step
-            # (see the ``is_terminal`` guard around its compile, above).
-            # For non-terminal steps we still loop n_samples times for
-            # ``compiled_approx`` (peak_memory + latency need it), but
-            # we skip the gold-standard execution that the quality
-            # comparison would otherwise consume.
+            # ``compiled_exact`` is only executed at the terminal step (see
+            # the ``is_terminal`` guard around its compile, above).
             if compiled_exact is not None and _qmetric == "jac_cosine":
                 _ex_key = _eval_digest(eval_args_i) if _CACHE_EXACT else None
                 _hit = _EXACT_CACHE.get(_ex_key) if _ex_key else None
@@ -7746,7 +8265,7 @@ def _callback_measured(
                         if len(_EXACT_CACHE) >= max(n_points, 1):
                             _EXACT_CACHE.clear()
                         _EXACT_CACHE[_ex_key] = out_exact
-                # Score THIS point now and let the pair go out of scope — cos
+                # Score THIS point now and let the pair go out of scope - cos
                 # is the trained quality channel under this metric, and the
                 # residual is NO LONGER DISCARDED (A2): it is the fidelity
                 # channel, and here it is genuinely free because the exact
@@ -7760,33 +8279,23 @@ def _callback_measured(
                     _rel_frobs.append(float(_rf))
                     _cos_logged.append(float(_cos))
 
-        # ---- THE PAIRED REFERENCE (ticket .9) ----------------------------
-        # Measured HERE, back to back with the candidate's cost loop above
-        # and BEFORE the quality walk, so nothing expensive sits between
-        # the two halves of the pair. Same executable path (see
-        # `_do_compile_paired_ref`), same eval args, same inner-reps, same
-        # warmup, same median: `_campaign_measure_cost` is `_time_one_rep`
-        # in a loop, exactly like the loop above. The static temp is read
-        # off the reference executable the same way `_record_mem_parity`
-        # reads the candidate's.
-        #
-        # THE POINTS AND THE REPS ARE ITS OWN (owner ruling 2026-09-14,
-        # `ref_num_data_points` / `ref_reps_per_point`). They used to be the
-        # candidate's, which handed the cheap half of a 150x-asymmetric pair
-        # a tenth of a second of integration and put 98 percent of the
-        # paired ratio's variance on it. The COMPILE CACHE KEY
-        # (`paired_ref_key`) does not depend on any of these counts, so
-        # changing them never recompiles the reference.
+        # ---- THE PAIRED REFERENCE'S READING (ticket .9) -----------------
+        # Reduced by the SAME median the candidate's channels get
+        # (`_aggregate_samples`), off windows taken in the same seconds as
+        # the candidate's. The static temp is read off the reference
+        # executable the same way `_record_mem_parity` reads the candidate's.
         _ref_lat_ns = 0.0
         _ref_peak = 0.0
         _ref_temp = None
         if _paired:
-            _pf("cb.exec_measure")
-            _ref_ex = cached_compile(
-                b"paired-ref:" + paired_ref_key, _do_compile_paired_ref)
-            _ref_lat_ns, _ref_peak = _campaign_measure_cost(
-                _ref_ex, eval_args_all[:n_ref_points], unique_devices,
-                _inner, _warmup, n_ref_reps)
+            _ref_lat_ns = (
+                float(_aggregate_samples(_ref_lat_samples,
+                                         want_top_quartile=True))
+                if _ref_lat_samples else 0.0)
+            _ref_peak = (
+                float(_aggregate_samples(_ref_peak_samples,
+                                         want_top_quartile=True))
+                if _ref_peak_samples else 0.0)
             _ref_temp = _static_temp_bytes(_ref_ex)
             _pf("cb.paired_ref")
 
@@ -8168,6 +8677,33 @@ def _callback_measured(
                 flush=True,
             )
 
+    # ---- THE COUNTS THIS PLAN WAS MEASURED WITH ----------------------
+    # (owner ruling 2026-09-14). Recorded rather than assumed: under the time
+    # budget the protocol is per-plan, not per-run.
+    _measure_counts = {
+        "inner": int(_inner),
+        "windows": int(_n_windows),
+        "secs": float(_meas_secs),
+        "ref_inner": int(_ref_inner),
+        "ref_windows": int(_ref_windows),
+        "ref_secs": float(_ref_secs),
+    }
+    _LAST_MEASURE_COUNTS.clear()
+    _LAST_MEASURE_COUNTS.update(_measure_counts)
+    if is_terminal:
+        _MEASURE_EPISODE["n_measured"] += 1
+        _MEASURE_EPISODE["secs"].append(float(_meas_secs) + float(_ref_secs))
+        _MEASURE_EPISODE["cand_secs"].append(float(_meas_secs))
+        _MEASURE_EPISODE["ref_secs"].append(float(_ref_secs))
+    # ---- THE DUPLICATE CACHE: this episode, this actor ----------------
+    # Stored AFTER the whole reward vector exists, so a plan that raised or
+    # was truncated on the way here leaves nothing behind for a duplicate to
+    # inherit. The stored value is the host-side slot list, which is what the
+    # duplicate's own `jnp.array` is built from and what its plan record
+    # carries -- no device array is retained.
+    if _dedupe_key is not None:
+        _PLAN_DEDUPE[_dedupe_key] = (int(_plan_index), list(_reward_slots))
+
     # ---- A6 PLAN LOG: this plan, win or lose -------------------------
     if _plan_log_on:
         _record_terminal_plan(
@@ -8177,7 +8713,8 @@ def _callback_measured(
             reward_vec=_reward_slots,
             face_before=_plan_pf0, face_after=_PER_FACE_STATS,
             counts_from_trace=bool(_plan_traced[0]),
-            mem_parity=_mp, paired_ref=_paired_ref_rec)
+            mem_parity=_mp, paired_ref=_paired_ref_rec,
+            measure_counts=_measure_counts)
 
     return _wire(tokens, eqn_ids, rewards)
 
@@ -8325,6 +8862,8 @@ class VertexEliminationEnv:
         # which would swallow them silently.
         ref_num_data_points: int = 5,
         ref_reps_per_point: int = 32,
+        measure_budget_secs: float = 1.0,
+        measure_window_secs: float = 0.05,
         latency_inner_reps: int = 1,
         latency_warmup: int = 0,
         per_face: bool = False,
@@ -8403,6 +8942,8 @@ class VertexEliminationEnv:
             reps_per_point=int(reps_per_point),
             ref_num_data_points=int(ref_num_data_points),
             ref_reps_per_point=int(ref_reps_per_point),
+            measure_budget_secs=float(measure_budget_secs),
+            measure_window_secs=float(measure_window_secs),
             latency_inner_reps=int(latency_inner_reps),
             latency_warmup=int(latency_warmup),
             per_face=bool(per_face),

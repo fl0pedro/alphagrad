@@ -818,6 +818,8 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         # `**_compat`), so forwarding them was a no-op. The campaign path's
         # median aggregation (env.py `_aggregate_samples`) needed no flag
         # to begin with.
+        measure_budget_secs=float(getattr(args, "measure_budget_secs", 1.0)),
+        measure_window_secs=float(getattr(args, "measure_window_secs", 0.05)),
         # Latency-measurement knobs — THIS env (inside the CpuApproximationActor)
         # does the actual pooled measurement, so the flags must be forwarded
         # here or --latency-inner-reps/--latency-warmup are silently inert

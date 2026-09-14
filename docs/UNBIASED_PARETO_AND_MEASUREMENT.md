@@ -66,6 +66,27 @@ the headline number purely from the inner-rep count. §7(a) shows the same
 protocol mismatch, between the quality gate's floor and the plan it floors,
 paid destruction a −13 % bonus in all twelve campaign runs.
 
+> **THE FLAG IS THE CEILING SINCE 2026-09-14 (owner ruling).** The number of
+> executions inside one timed window is no longer the flag. It is
+> `clamp(ceil(--measure-window-secs / t), 5, --latency-inner-reps)`, where `t`
+> is one warm-up execution of the program being timed. The rule exists because
+> the two halves of the paired ratio are 150x apart in cost on the Markowitz
+> order: at a 50 ms window the 121 us reference still takes the full 50 that
+> this section justifies, while the 18.2 ms candidate takes 5 — for that
+> program a window of 5 already lasts 91 ms, so it is nowhere near the
+> dispatch floor this section measured. Everything above still describes the
+> reference's half and every caller that passes `--latency-inner-reps 5` or
+> leaves it at 1, because the rule can never exceed the flag.
+>
+> The NUMBER OF WINDOWS is a budget too: `--num-data-points` x
+> `--reps-per-point` is now the cap, and a plan gets
+> `clamp(round(--measure-budget-secs / (inner * t)), 1, cap)` of them. A plan
+> therefore costs about one second of executions instead of a fixed 1005, and
+> a slow plan gets fewer samples. The two halves are interleaved window by
+> window rather than measured as two blocks. Each plan-log record carries the
+> counts it actually ran (`measure_inner`, `measure_windows`, `measure_secs`
+> and the same three for the reference), so a row is still self-describing.
+
 ### 1.4 Pinned code: alphagrad `c2b8104`, graphax `4ea0bf8`
 
 > **PA-PH REPRODUCIBILITY: RESOLVED (2026-08-30, ticket 22).** The PA-PH rows

@@ -420,3 +420,301 @@ def test_the_reference_compile_key_does_not_depend_on_the_rep_counts(
     b = _run(17)
     assert a and b
     assert set(a) == set(b)
+
+
+# ==========================================================================
+# THE PER-PLAN TIME BUDGET (owner ruling 2026-09-14)
+# ==========================================================================
+#
+# The candidate used to run a FIXED 5 points x 4 reps x 50 inner = 1005
+# executions of the plan whatever the plan cost. On the transformer arm one
+# execution is 18.2 ms, so a plan cost 18.3 s to measure and an episode of 16
+# plans cost 293 s of its 405 s, to take twenty samples of a reading whose
+# coefficient of variation is 0.56 percent.
+#
+# The counts now come from ONE warm-up execution's measured time: the window
+# rule picks the executions per window, the budget picks the number of
+# windows, and --num-data-points x --reps-per-point is the CAP on that
+# number. The reference keeps its own window count and takes only its inner
+# from the same rule, applied to its own execution time.
+
+
+def test_the_window_rule_reads_the_owners_numbers():
+    """clamp(ceil(window / t), 5, --latency-inner-reps), on the two programs
+    the ruling names."""
+    r = env_mod.resolve_measure_inner
+    # The rev-exact reference on the Markowitz order: 121 us. A 50 ms window
+    # would hold 413 executions, so it takes the ceiling of 50.
+    assert r(121e-6, 0.05, 50) == 50
+    # The candidate: 18.2 ms. The window holds 3, so it takes the floor of 5.
+    assert r(18.2e-3, 0.05, 50) == 5
+    # In between the rule is the arithmetic, not a clamp: a 2 ms program
+    # fills a 50 ms window 25 times.
+    assert r(2e-3, 0.05, 50) == 25
+    # THE FLAG IS THE CEILING. landscape_map runs --latency-inner-reps 5 and
+    # the legacy default is 1; both collapse the interval onto themselves, so
+    # those callers measure exactly what they measured before the ruling.
+    assert r(121e-6, 0.05, 5) == 5
+    assert r(121e-6, 0.05, 1) == 1
+    # A broken probe takes the ceiling, never an unbounded count.
+    assert r(0.0, 0.05, 50) == 50
+    assert r(float("nan"), 0.05, 50) == 50
+
+
+def test_the_budget_picks_the_windows_and_the_flags_are_caps():
+    """clamp(round(budget / (inner * t)), 1, num_data_points * reps)."""
+    w = env_mod.resolve_measure_windows
+    # The transformer candidate at inner 5: 5 x 18.2 ms = 91 ms a window, so
+    # one second buys 11 of them -- against the old 20, and against 1005
+    # executions rather than 55.
+    assert w(18.2e-3, 5, 1.0, 20) == 11
+    # A CHEAP plan is capped by --num-data-points x --reps-per-point, which
+    # is what makes those two flags caps rather than counts.
+    assert w(1e-5, 50, 1.0, 20) == 20
+    # A SLOW plan gets ONE window and the owner accepts that: slow runs do
+    # not matter, they are too large anyway.
+    assert w(10.0, 5, 1.0, 20) == 1
+    assert w(0.0, 5, 1.0, 20) == 1
+
+
+def test_the_two_halves_interleave_instead_of_blocking():
+    """A B A B, and proportionally when the counts differ.
+
+    Two blocks put the whole reference measurement after the whole candidate
+    measurement, so a clock or thermal excursion during a plan lands on one
+    half of the ratio only. The ratio can cancel only the drift both halves
+    saw.
+    """
+    il = env_mod.interleave_windows
+    assert il(3, 3) == [0, 1, 0, 1, 0, 1]
+    assert il(4, 0) == [0, 0, 0, 0]
+    assert il(0, 3) == [1, 1, 1]
+    # 11 candidate windows against 160 reference ones is the campaign shape.
+    sched = il(11, 160)
+    assert len(sched) == 171
+    assert sched.count(0) == 11
+    # NOT A BLOCK: the candidate's last window is nowhere near its first, and
+    # the first reference window comes long before the last candidate one.
+    first_c = sched.index(0)
+    last_c = len(sched) - 1 - sched[::-1].index(0)
+    assert last_c - first_c > 100, sched[:40]
+    assert sched.index(1) < last_c
+
+
+@pytest.fixture
+def _fresh_dedupe(monkeypatch):
+    """No duplicate cache and no episode accounting carried between tests.
+
+    THE SWITCH IS SET EXPLICITLY, because `landscape_map` writes
+    ``ALPHAGRAD_MEASURE_DEDUPE=0`` into the process AT IMPORT -- correctly,
+    it exists to measure the spread of repeated measurements of one plan --
+    and pytest imports every test module, `tests/landscape_map_sweep_test.py`
+    included, BEFORE it runs any test. Without this line these tests would
+    pass alone and fail in the suite, which is exactly the failure
+    `tests/policy_regression_gate_test.py`'s header records.
+    """
+    monkeypatch.setenv("ALPHAGRAD_MEASURE_DEDUPE", "1")
+    env_mod._PLAN_DEDUPE.clear()
+    env_mod._MEASURE_EPISODE.update(
+        {"key": None, "label": None, "n_plans": 0, "n_measured": 0,
+         "secs": [], "cand_secs": [], "ref_secs": []})
+    yield
+    env_mod._PLAN_DEDUPE.clear()
+    env_mod._MEASURE_EPISODE.update(
+        {"key": None, "label": None, "n_plans": 0, "n_measured": 0,
+         "secs": [], "cand_secs": [], "ref_secs": []})
+
+
+def test_the_budget_bounds_the_windows_end_to_end(_paired_log_cpu,
+                                                  _fresh_dedupe, monkeypatch):
+    """A budget smaller than one window leaves exactly one window.
+
+    End to end through the real callback, so this fails if the rule is
+    implemented and not wired. The toy is microseconds per execution, so a
+    budget of 1 nanosecond is "smaller than one window" for it.
+    """
+    seen: list[int] = []
+    real = env_mod._time_one_rep
+
+    def _counting(ex, eval_args, devices, inner):
+        seen.append(inner)
+        return real(ex, eval_args, devices, inner)
+
+    monkeypatch.setattr(env_mod, "_time_one_rep", _counting)
+    env = _one_instrument_toy_env(
+        num_data_points=2, reps_per_point=2,
+        ref_num_data_points=1, ref_reps_per_point=1,
+        measure_budget_secs=1e-9)
+    vs = sorted(int(v) for v in np.asarray(env.valid_vertices))
+    _walk(env, vs)
+    # One candidate window plus the reference's own one, which the budget
+    # does NOT govern: its count is ref_points x ref_reps.
+    assert len(seen) == 2, seen
+
+
+def test_the_candidate_windows_are_spread_over_the_data_points(
+        _paired_log_cpu, _fresh_dedupe, monkeypatch):
+    """ROUND-ROBIN, not all on sample 0.
+
+    The old loop ran every rep of point 0, then every rep of point 1. A plan
+    that now earns three windows out of a cap of twenty would have spent all
+    three on point 0 under that loop.
+    """
+    points: list[int] = []
+    real = env_mod._time_one_rep
+
+    def _counting(ex, eval_args, devices, inner):
+        points.append(float(np.asarray(eval_args[0]).reshape(-1)[0]))
+        return real(ex, eval_args, devices, inner)
+
+    monkeypatch.setattr(env_mod, "_time_one_rep", _counting)
+    env = _one_instrument_toy_env(num_data_points=3, reps_per_point=1)
+    order = sorted(int(v) for v in np.asarray(env.valid_vertices))
+    specs, faces, skips = _plan_arrays(len(order))
+    # Three data points, each recognisable by its first element.
+    samples = (jnp.asarray(
+        np.stack([np.full(16, float(k), dtype=np.float32)
+                  for k in (1.0, 2.0, 3.0)])),)
+    env_mod._callback(
+        env.config, env.args, env.consts, jnp.asarray(order), specs,
+        faces, skips, len(order), *samples)
+    assert sorted(set(points)) == [1.0, 2.0, 3.0], points
+
+
+def _plan_arrays(n):
+    """An all-exact plan of `n` vertices: no rule, no face action."""
+    from alphagrad.approx.env import (
+        FACE_SLOTS, MAX_FACES, MAX_RULES_PER_VERTEX)
+    specs = np.full((n, MAX_RULES_PER_VERTEX, 3), -1, np.int32)
+    specs[..., 2] = 0
+    faces = np.full((n, MAX_FACES, FACE_SLOTS, 3), -1, np.int32)
+    skips = np.zeros((n, MAX_FACES), np.int32)
+    return jnp.asarray(specs), jnp.asarray(faces), jnp.asarray(skips)
+
+
+# ==========================================================================
+# PER-EPISODE DEDUPLICATION (owner ruling 2026-09-14)
+# ==========================================================================
+#
+# At the identity init all 16 terminal plans of an episode are the same
+# program. Measuring it sixteen times costs sixteen seconds and learns
+# nothing: the reward vector is a function of the plan and of the episode's
+# eval samples, and neither changes between the duplicates.
+
+
+def _measure_once(env, order, samples):
+    """One terminal callback, returning (reward vector, windows timed)."""
+    specs, faces, skips = _plan_arrays(len(order))
+    return env_mod._callback(
+        env.config, env.args, env.consts, jnp.asarray(order), specs,
+        faces, skips, len(order), *samples)
+
+
+def test_a_repeated_plan_in_one_episode_is_measured_once(
+        _paired_log_cpu, _fresh_dedupe, monkeypatch):
+    """The second identical plan times NO windows and returns the first
+    plan's reward vector, bit for bit."""
+    n_windows = [0]
+    real = env_mod._time_one_rep
+
+    def _counting(ex, eval_args, devices, inner):
+        n_windows[0] += 1
+        return real(ex, eval_args, devices, inner)
+
+    monkeypatch.setattr(env_mod, "_time_one_rep", _counting)
+    env = _one_instrument_toy_env(num_data_points=2, reps_per_point=2)
+    order = sorted(int(v) for v in np.asarray(env.valid_vertices))
+    samples = (jnp.asarray(
+        np.stack([np.full(16, 0.5, dtype=np.float32),
+                  np.full(16, -0.5, dtype=np.float32)])),)
+
+    *_a, r1 = _measure_once(env, order, samples)
+    first = n_windows[0]
+    assert first > 0
+    *_b, r2 = _measure_once(env, order, samples)
+    assert n_windows[0] == first, "the duplicate was measured again"
+    assert np.array_equal(np.asarray(r1), np.asarray(r2))
+
+
+def test_the_cache_never_crosses_an_episode(_paired_log_cpu, _fresh_dedupe,
+                                            monkeypatch):
+    """New samples are a new episode, and a new episode re-measures.
+
+    The samples ARE the measurement's inputs, so a reading taken against last
+    episode's samples is not this episode's reading.
+    """
+    n_windows = [0]
+    real = env_mod._time_one_rep
+
+    def _counting(ex, eval_args, devices, inner):
+        n_windows[0] += 1
+        return real(ex, eval_args, devices, inner)
+
+    monkeypatch.setattr(env_mod, "_time_one_rep", _counting)
+    env = _one_instrument_toy_env(num_data_points=1, reps_per_point=1)
+    order = sorted(int(v) for v in np.asarray(env.valid_vertices))
+
+    def _samples(v):
+        return (jnp.asarray(np.full((1, 16), v, dtype=np.float32)),)
+
+    _measure_once(env, order, _samples(0.25))
+    first = n_windows[0]
+    _measure_once(env, order, _samples(0.75))
+    assert n_windows[0] > first, "a new episode's samples were served stale"
+
+
+def test_the_duplicates_record_says_where_its_numbers_came_from(
+        _paired_log_cpu, _fresh_dedupe, monkeypatch):
+    """The duplicate IS a plan-log record: same rewards, `measured_from`
+    naming the plan that was measured, and no timing fields of its own."""
+    monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
+    env_mod.consume_plan_records()
+    env = _one_instrument_toy_env(num_data_points=2, reps_per_point=2)
+    order = sorted(int(v) for v in np.asarray(env.valid_vertices))
+    samples = (jnp.asarray(
+        np.stack([np.full(16, 0.5, dtype=np.float32),
+                  np.full(16, -0.5, dtype=np.float32)])),)
+    _measure_once(env, order, samples)
+    _measure_once(env, order, samples)
+    recs = env_mod.consume_plan_records()["records"]
+    assert len(recs) == 2, recs
+    a, b = recs
+    assert a.get("measured_from") is None
+    assert b.get("measured_from") == 0
+    # THE COUNTS THE MEASURED PLAN RAN UNDER, on the measured record only.
+    assert int(a["measure_inner"]) >= 1
+    assert int(a["measure_windows"]) >= 1
+    assert float(a["measure_secs"]) > 0.0
+    assert int(a["ref_measure_windows"]) >= 1
+    # NO TIMING FIELDS OF ITS OWN on the duplicate: nothing was timed for it.
+    for k in ("measure_inner", "measure_windows", "measure_secs",
+              "ref_measure_inner", "ref_measure_windows", "ref_measure_secs",
+              "ref_latency_ns", "candidate_latency_ns"):
+        assert b.get(k) is None, (k, b.get(k))
+    # The rewards are the first plan's, which is the point of the cache.
+    assert a["rewards"] == b["rewards"]
+
+
+def test_the_dedupe_is_off_without_eval_samples(_paired_log_cpu,
+                                                _fresh_dedupe, monkeypatch):
+    """A cache that cannot be bounded to an episode is not kept.
+
+    Every probe and every direct caller of `_callback` measures on the fixed
+    `args`, with no samples and therefore no episode key. Those callers
+    re-measure, which is what they exist to do.
+    """
+    n_windows = [0]
+    real = env_mod._time_one_rep
+
+    def _counting(ex, eval_args, devices, inner):
+        n_windows[0] += 1
+        return real(ex, eval_args, devices, inner)
+
+    monkeypatch.setattr(env_mod, "_time_one_rep", _counting)
+    env = _one_instrument_toy_env(num_data_points=1, reps_per_point=1)
+    order = sorted(int(v) for v in np.asarray(env.valid_vertices))
+    specs, faces, skips = _plan_arrays(len(order))
+    for _ in range(2):
+        env_mod._callback(env.config, env.args, env.consts,
+                          jnp.asarray(order), specs, faces, skips, len(order))
+    assert n_windows[0] >= 2, n_windows

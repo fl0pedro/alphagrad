@@ -4959,10 +4959,33 @@ def make_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--latency-inner-reps", type=int, default=1,
-        help="Measurement protocol: executions per timed rep inside one "
-        "monitor window; elapsed time is divided by this, amortizing "
-        "dispatch/timer overhead (spec default 50; CLI default 1 keeps "
-        "existing campaigns' readings comparable).",
+        help="Measurement protocol: the CEILING on executions per timed "
+        "window. Elapsed time is divided by the executions, amortizing "
+        "dispatch/timer overhead. Since the owner ruling of 2026-09-14 the "
+        "window rule picks the actual count between 5 and this value from "
+        "one warm-up execution's measured time (see --measure-window-secs); "
+        "a value below 5 collapses the interval and fixes the count, which "
+        "is what every caller that sets 1 or 5 already got.",
+    )
+    p.add_argument(
+        "--measure-budget-secs", type=float, default=1.0,
+        help="THE PER-PLAN EXECUTION BUDGET in seconds (owner ruling "
+        "2026-09-14). The candidate's timed windows are chosen so the plan "
+        "costs about this much GPU time however fast or slow it is, instead "
+        "of a fixed 5x4x50 = 1005 executions that cost 18.3 s on the "
+        "transformer arm for a reading whose CV is 0.56 percent. "
+        "--num-data-points and --reps-per-point become the CAP on the "
+        "window count. A slow plan gets fewer windows, by design.",
+    )
+    p.add_argument(
+        "--measure-window-secs", type=float, default=0.05,
+        help="TARGET DURATION of one timed window (owner ruling "
+        "2026-09-14). Executions per window = clamp(ceil(this / one "
+        "execution), 5, --latency-inner-reps). This is what keeps a window "
+        "off the dispatch floor: at 5 executions the identity plan reads "
+        "20.7 percent high against 50, while 20 already read within 3 "
+        "percent of 50. At 0.05 s a 121 us reference takes 50 and an 18 ms "
+        "candidate takes 5.",
     )
     p.add_argument(
         "--measure-grad",
@@ -7114,6 +7137,8 @@ def main():
         # inner reps stay shared; only the points and the reps fork.
         ref_num_data_points=int(args.ref_num_data_points),
         ref_reps_per_point=int(args.ref_reps_per_point),
+        measure_budget_secs=float(args.measure_budget_secs),
+        measure_window_secs=float(args.measure_window_secs),
         latency_inner_reps=int(args.latency_inner_reps),
         # --face-actions IMPLIES per-face legality masking for the per-vertex
         # micro rules too: face slots are already live-mask-hooked, but a raw

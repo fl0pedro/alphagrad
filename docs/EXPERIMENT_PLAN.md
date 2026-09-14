@@ -62,8 +62,9 @@ identical and behaves differently.
 ### The measurement protocol, restated as a rule
 
 No latency claim in this campaign counts unless it is: **candidate and its own
-exact reference, same process, same GPU, back to back, warm**, reported as a
-**ratio**, at `--latency-inner-reps 50`, against the instrument's own null of
+exact reference, same process, same GPU, interleaved window by window, warm**,
+reported as a **ratio**, at `--latency-inner-reps 50`, against the
+instrument's own null of
 **1.0007 ± 0.0008** — and, where a distribution is claimed, over **5 seeds**.
 Absolute nanoseconds are recorded and are never the claim. Cross-actor
 absolute comparisons carry a systematic ~1.3 % bias floor (identity latency
