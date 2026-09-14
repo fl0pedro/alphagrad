@@ -41,7 +41,7 @@ env = VertexEliminationEnv.from_jaxpr(
     closed, args=xs, argnums=ARGN, num_envs=0, data_gen=gen, target_fun=LOSS,
     sparse=(os.environ.get("ALPHAGRAD_SPARSE", "0") == "1"),
     cmp_type="latency", mem_type="peak_memory", exec_on_gpu=True, measure_latency=True,
-    num_data_points=NDATA, reps_per_point=1, percentile_keep=0.60,
+    num_data_points=NDATA, reps_per_point=1,
     slow_exec_cutoff_seconds=0.0, flop_gate_threshold=0.0, measure_grad=True,
     latency_inner_reps=REPS, latency_timer="perf_counter")
 ev = generate_eval_samples(env, ek, NDATA)

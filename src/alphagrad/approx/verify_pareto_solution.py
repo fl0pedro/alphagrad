@@ -39,7 +39,7 @@ def build_env():
         num_envs=0, data_gen=gen, target_fun=target_fn,
         cmp_type="latency", mem_type="peak_memory", measure_latency=True,
         latency_samples=1, num_data_points=5, reps_per_point=4,
-        percentile_keep=0.60, slow_exec_cutoff_seconds=0.0,
+        slow_exec_cutoff_seconds=0.0,
         flop_gate_threshold=0.0,
     )
     eval_samples = generate_eval_samples(env, eval_key, 5)

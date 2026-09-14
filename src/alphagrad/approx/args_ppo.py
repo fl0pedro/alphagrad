@@ -179,26 +179,19 @@ def add_ppo_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "essentially all of the paired log ratio's 0.045-nat scatter. "
         "--latency-inner-reps stays SHARED between the two halves.",
     )
-    p.add_argument(
-        "--percentile-keep", type=float, default=0.60,
-        help="Percentile (in [0, 1]) used to aggregate the noisy-channel "
-        "pool. 0.60 = P60: 'slowest 60%% latency / highest 60%% memory / "
-        "worst 60%% frob'. Higher = more conservative / worse-case "
-        "reward signal. Applies to latency_ns, peak_memory, "
-        "frob_residual, cosine_sim.",
-    )
+    # --percentile-keep (P60 aggregate) and its trimmed-mean sibling
+    # --latency-winsor were DELETED 2026-09-14 (owner ruling, small fixes
+    # #1): both were read only by the legacy Ray/CPU workers below; the
+    # campaign path (env.py's `_aggregate_samples`) always aggregated the
+    # noisy-channel pool with a plain MEDIAN and never read either flag.
+    # The median stays; the flags are gone. See
+    # `test_percentile_keep_flag_is_gone` for the parser-level guard.
     # --- Latency-measurement noise control (see env.py EnvConfig) ----------
     # `--latency-inner-reps` is shared with az; see COMMON_DEFAULTS.
     p.add_argument(
         "--latency-warmup", type=int, default=0,
         help="Discard the first K executions per data point before timing "
         "(first-touch / cache warm-up). Try 3.",
-    )
-    p.add_argument(
-        "--latency-winsor", type=float, default=0.0,
-        help="If >0, aggregate the latency pool with a symmetric winsorized "
-        "mean at this trim fraction (e.g. 0.2) instead of --percentile-keep. "
-        "Empirically the most reproducible/discriminative latency estimator.",
     )
     p.add_argument(
         "--measure-grad", action="store_true",

@@ -812,14 +812,18 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         # --ref-reps-per-point silently inert in every pooled run.
         ref_num_data_points=int(getattr(args, "ref_num_data_points", 5)),
         ref_reps_per_point=int(getattr(args, "ref_reps_per_point", 32)),
-        percentile_keep=float(getattr(args, "percentile_keep", 0.60)),
+        # --percentile-keep and --latency-winsor were DELETED 2026-09-14
+        # (owner ruling, small fixes #1): both were dead here too -- neither
+        # ever became an EnvConfig field (from_jaxpr swallowed both into
+        # `**_compat`), so forwarding them was a no-op. The campaign path's
+        # median aggregation (env.py `_aggregate_samples`) needed no flag
+        # to begin with.
         # Latency-measurement knobs — THIS env (inside the CpuApproximationActor)
         # does the actual pooled measurement, so the flags must be forwarded
-        # here or --latency-winsor/--latency-inner-reps/--latency-warmup are
-        # silently inert in every pooled Ray run.
+        # here or --latency-inner-reps/--latency-warmup are silently inert
+        # in every pooled Ray run.
         latency_inner_reps=int(getattr(args, "latency_inner_reps", 1)),
         latency_warmup=int(getattr(args, "latency_warmup", 0)),
-        latency_winsor=float(getattr(args, "latency_winsor", 0.0)),
         # THE SCALAR-OUTPUT CONTRACT, armed by a property of the EXAMPLE:
         # True for every trainable family (registered target = model + loss),
         # False for the analytic AD benchmarks, which have no training loss.

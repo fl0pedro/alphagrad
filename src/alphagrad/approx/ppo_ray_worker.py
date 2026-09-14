@@ -4082,7 +4082,10 @@ class PPORayWorker:
         immediately free workers for stragglers — full core utilisation.
         Each task measures ONE data point (R reps) on a fixed core slice,
         so the per-reading latency stays consistent. The driver then
-        P60-aggregates each env's n_points reward vectors per channel.
+        median-aggregates each env's n_points reward vectors per channel
+        (owner ruling 2026-09-14, small fixes #1: --percentile-keep is
+        gone; the campaign path's env.py `_aggregate_samples` always used
+        a plain median, and this worker now matches it).
 
         Returns the same ``(tokens, eqn_ids, rewards, sentinel_mask)``
         contract as ``_fan_out_tokenize``.
@@ -4092,7 +4095,6 @@ class PPORayWorker:
 
         N = order_np.shape[0]
         n_points = max(int(getattr(self.args, "num_data_points", 5)), 1)
-        pk = float(getattr(self.args, "percentile_keep", 0.60))
 
         actors = None
         if self._cpu_pool is not None:
@@ -4124,21 +4126,23 @@ class PPORayWorker:
         rewards_out = np.zeros((N, NUM_REWARDS), dtype=np.float32)
         for e in range(N):
             base = e * n_points
-            # Per-point reward vectors for this env (each already P60'd
-            # over its R reps inside _callback).
+            # Per-point reward vectors for this env (each already
+            # median-aggregated over its R reps inside _callback).
             pr = np.stack([results[base + p][2] for p in range(n_points)])  # (P, K)
-            # Aggregate across points with the same "keep worst pk" rule
-            # the single-call path uses. Cost channels are stored negated
-            # (reward = -cost), so the worst-pk cost = -percentile(-reward).
-            # cosine_sim (index COSINE) is "higher better" + weight 0 — use
-            # the mean; everything else is a cost channel.
+            # Aggregate across points with the same MEDIAN rule the
+            # single-call path (env.py `_aggregate_samples`) uses. Cost
+            # channels are stored negated (reward = -cost); median commutes
+            # with negation (median(-x) == -median(x)), so no sign
+            # bookkeeping is needed here the way the old worst-pk percentile
+            # required. cosine_sim (index COSINE) is "higher better" +
+            # weight 0 — use the mean; everything else is a cost channel.
             agg = np.empty((NUM_REWARDS,), dtype=np.float32)
             _cos_idx = REWARD_INDEX["cosine_sim"]
             for k in range(NUM_REWARDS):
                 if k == _cos_idx:
                     agg[k] = float(np.mean(pr[:, k]))
                 else:
-                    agg[k] = -float(np.percentile(-pr[:, k], pk * 100.0))
+                    agg[k] = float(np.median(pr[:, k]))
             rewards_out[e] = agg
             tokens_out[e] = results[base][0]
             eqn_ids_out[e] = results[base][1]

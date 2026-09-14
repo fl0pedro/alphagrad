@@ -134,7 +134,6 @@ env = VertexEliminationEnv.from_jaxpr(
     # = 20. ALPHAGRAD_GAZ_REPS matches PPO's 4.
     num_data_points=A.ndata,
     reps_per_point=int(os.environ.get("ALPHAGRAD_GAZ_REPS", "4")),
-    percentile_keep=0.60,
     slow_exec_cutoff_seconds=0.0, flop_gate_threshold=0.0, measure_grad=_GAZ_MGRAD,
     latency_inner_reps=A.latency_inner_reps, latency_timer="perf_counter")
 ev = generate_eval_samples(env, ek, A.ndata)
@@ -185,8 +184,6 @@ if _GAZ_RAY_N > 0:
         "latency_inner_reps": int(A.latency_inner_reps),
         "latency_samples": 1,
         "latency_warmup": 0,
-        "latency_winsor": 0.0,
-        "percentile_keep": 0.60,
         "terminal_rewards_only": False,
         "num_eval_samples": int(A.ndata),
         "hidden_dim": 256,
