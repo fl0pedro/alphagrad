@@ -49,7 +49,8 @@ import pytest                                                   # noqa: E402
 # have imported it under different settings. `_face_loop` builds its buffers
 # from `env.MAX_DELTA_TOKENS`, so the stand-in chunks must match that.
 from alphagrad.approx.env import (                               # noqa: E402
-    MAX_DELTA_TOKENS as W, MAX_FACES as MAXF)
+    DELTA_TOKEN_DTYPE as _TOKEN_DTYPE, MAX_DELTA_TOKENS as W,
+    MAX_FACES as MAXF)
 
 TOTAL_V = 6
 EMBD = 32
@@ -127,7 +128,8 @@ def _chunk_fns(n, emit_head, empty_pool=False):
     def face_chunk_fn(f, vertex_idx, vertex_specs, rows, skips):
         ct = (f % 3) + 2
         ar = jnp.arange(W, dtype=jnp.int32)
-        tok = jnp.where(ar < ct, (f * 7 + ar) % 50 + 1, 0).astype(jnp.int32)
+        tok = jnp.where(ar < ct, (f * 7 + ar) % 50 + 1, 0).astype(
+            jnp.dtype(_TOKEN_DTYPE))
         ends = jnp.stack([(f % 3) + 1, (f % 2) + 1]).astype(jnp.int32)
         # The stand-in mirrors the real callback: tokens, count, endpoints.
         # There is no equation-id buffer any more.
@@ -307,19 +309,19 @@ def test_replay_without_heads_fails_loudly(agent, mode):
 
 # --------------------------- the wire: live_faces.chunk + the host callback
 class _StubStream:
-    """A LiveFaceStream stand-in: `chunk` returns the 6-tuple including the
-    approx-echo prefix length, exactly as the real one now does."""
+    """A LiveFaceStream stand-in: `chunk` returns the 5-tuple including the
+    approx-echo prefix length, exactly as the real one now does. FIVE, not
+    six: the equation-id buffer was removed on 2026-09-13. The tokens are
+    uint8 for the same reason the real ones are (``token_vocab``)."""
 
     def __init__(self, ct=5, head=2):
         self.ct, self.head = int(ct), int(head)
 
     def chunk(self, order, specs, n, vertex, vspecs, rows, skips, f,
               fh=None, kh=None):
-        tok = np.zeros((W,), np.int32)
-        ids = -np.ones((W,), np.int32)
-        tok[:self.ct] = np.arange(1, self.ct + 1, dtype=np.int32)
-        ids[:self.ct] = np.int32(f)
-        return (tok, ids, np.int32(self.ct), np.int32(3),
+        tok = np.zeros((W,), _TOKEN_DTYPE)
+        tok[:self.ct] = np.arange(1, self.ct + 1, dtype=_TOKEN_DTYPE)
+        return (tok, np.int32(self.ct), np.int32(3),
                 np.asarray([1, 2], np.int32), np.int32(self.head))
 
     def n_faces(self, *a, **k):
@@ -339,11 +341,11 @@ def _call_stub(emit_head):
 
 def test_callback_head_wire_is_gated_and_correct():
     off = _call_stub(False)
-    assert len(off) == 4                      # historical arity
+    assert len(off) == 3      # (tokens, count, endpoints) -- was 4 with ids
     on = _call_stub(True)
-    assert len(on) == 5
+    assert len(on) == 4
     assert int(on[-1]) == 2                   # the stub's approx-echo prefix
-    for a, b in zip(off, on[:4]):
+    for a, b in zip(off, on[:3]):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
 
