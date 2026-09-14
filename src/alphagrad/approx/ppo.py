@@ -8478,7 +8478,8 @@ def main():
     # check costs nothing, rather than per read where it would not be.
     if (int(_EP_ENV_IDX.shape[0]) != int(num_envs)
             or not bool(jnp.all(_EP_ENV_IDX
-                                == jnp.arange(num_envs, jnp.int32)))):
+                                == jnp.arange(num_envs,
+                                              dtype=jnp.int32)))):
         raise ValueError(
             f"the rollout's environment index must be exactly "
             f"0..{int(num_envs) - 1}, one row per environment; got "
