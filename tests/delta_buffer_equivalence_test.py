@@ -168,7 +168,7 @@ def test_base_buffer_is_sized_from_the_measured_distribution():
         f"measured base ({LARGEST_MEASURED_BASE}); the base encode would be "
         f"clipped and the carry would desync for the whole episode")
     for e, obs in enumerate(_OBS):
-        assert obs[0][2] <= BASE_W, f"env {e}: base {obs[0][2]} > BASE_W"
+        assert obs[0][1] <= BASE_W, f"env {e}: base {obs[0][1]} > BASE_W"
 
 
 def test_stream_len_hazard_is_live():
@@ -185,15 +185,15 @@ def test_stream_len_hazard_is_live():
     seen_interior_zero = False
     losses = []
     for e, obs in enumerate(_OBS):
-        for k, (tok, _eq, raw) in enumerate(obs):
+        for k, (tok, raw) in enumerate(obs):
             n_end = int(_stream_end(tok))
             n_count = int(_stream_len(tok))
             assert n_end == raw, (
                 f"env {e} step {k}: _stream_end {n_end} != true length {raw}")
             if n_count != raw:
                 seen_interior_zero = True
-        losses.append(obs[-1][2] - int(_stream_len(obs[-1][0])))
-    base_true = _OBS[0][0][2]
+        losses.append(obs[-1][1] - int(_stream_len(obs[-1][0])))
+    base_true = _OBS[0][0][1]
     base_counted = int(_stream_len(_OBS[0][0][0]))
     assert seen_interior_zero, (
         "this golden episode no longer exercises the id-0 collision -- the "
@@ -263,8 +263,8 @@ def test_delta_buffer_equals_the_stream_window_bitwise(env_i, delta_w):
             f"env {env_i} step {k}: cursors diverged "
             f"{int(old.pos)} vs {int(new.pos)}")
         cnt = _stream_end(tok) - old.pos
-        if int(old.pos) == obs[k - 1][2]:
-            assert int(cnt) == raw - obs[k - 1][2]
+        if int(old.pos) == obs[k - 1][1]:
+            assert int(cnt) == raw - obs[k - 1][1]
 
         dtok = _window_copy(tok, new.pos, cnt, delta_w)
         # (1) TOKEN FOR TOKEN against what the absolute cursor reads.
