@@ -260,6 +260,59 @@ class CpuApproxPool:
         self._n_oom_retries = 0
         self._n_oom_retry_success = 0
         self._n_proactive_recycles = 0
+        # ---- the PIPELINED submission (owner ruling 2026-09-14) ----
+        # One worker thread, created on first use, and at most ONE batch in
+        # flight on it. See `submit_batch` for why the limit is a fact of the
+        # apparatus rather than a conservative default.
+        self._submit_exec = None
+        self._submit_inflight = None
+
+    def submit_batch(self, *args, **kwargs):
+        """Start :meth:`evaluate_batch` on a worker thread; return its future.
+
+        THE MEASUREMENT IS NOT MOVED, ONLY THE WAIT. The thread calls the very
+        same ``evaluate_batch`` the blocking path calls -- the same waves, the
+        same per-actor cold/warm timeouts, the same OOM recycle and retry, the
+        same sentinel rows -- so a pipelined measurement and a blocking one
+        are the same measurement taken by the same actors. What moves is who
+        waits: the caller gets a future and can dispatch device work before it
+        blocks on the result.
+
+        ONE BATCH IN FLIGHT AT A TIME, and that is a fact about this pool, not
+        a cautious default. The same actors also serve the PER-STEP
+        TOKENIZATION of every rollout (``env._remote_callback_batched`` sends
+        every row to the pool unless ``ALPHAGRAD_POOL_TERMINAL_LOCAL=1``), and
+        Ray runs one task per actor at a time. A measurement left in flight
+        therefore occupies every actor it holds, and a rollout that started
+        underneath it would block behind it step for step. A second submit is
+        a programming error here, so it raises.
+        """
+        import concurrent.futures as _cf
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError(
+                    "submit_batch on a closed measure pool")
+            f = self._submit_inflight
+            if f is not None and not f.done():
+                raise RuntimeError(
+                    "the measure pool already has a batch in flight; collect "
+                    "it before submitting another. The actors also serve the "
+                    "per-step tokenization of the next rollout, so two "
+                    "batches in flight starve it.")
+            if self._submit_exec is None:
+                self._submit_exec = _cf.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="measure-submit")
+            fut = self._submit_exec.submit(
+                self.evaluate_batch, *args, **kwargs)
+            self._submit_inflight = fut
+        return fut
+
+    def has_batch_in_flight(self) -> bool:
+        """True while a :meth:`submit_batch` future is still running."""
+        with self._lock:
+            f = self._submit_inflight
+        return f is not None and not f.done()
 
     def _timeout_for(self, actor: Any) -> float:
         """Cold vs warm timeout for ``actor``. Returns 0 when the
@@ -1363,6 +1416,12 @@ class CpuApproxPool:
             self._closed = True
             old = list(self._alive)
             self._alive.clear()
+            _exec, self._submit_exec = self._submit_exec, None
+        if _exec is not None:
+            # A batch still in flight is measuring on actors this call is
+            # about to kill; wait for the thread to come back out of Ray
+            # rather than leaving it to raise into a dead cluster.
+            _exec.shutdown(wait=True)
         for a in old:
             try:
                 ray.kill(a, no_restart=True)

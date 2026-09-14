@@ -144,6 +144,27 @@ def merge_pool_collapse_stats(pool, cs: dict | None = None) -> dict:
     return out
 
 
+def fold_face_stats(out: dict | None, stats: dict | None) -> dict:
+    """Add one per-face counter dict into another and recompute the fraction.
+
+    The summation rule of :func:`merge_pool_face_stats`, named once so the
+    pipelined driver -- which drains the actors at COLLECT time and folds the
+    result in later -- cannot fold them a different way than the synchronous
+    path does.
+    """
+    out = dict(out or {})
+    for _k, _v in (stats or {}).items():
+        if _k == "applied_fraction":
+            continue
+        if isinstance(_v, bool) or not isinstance(_v, (int, float)):
+            continue
+        out[_k] = out.get(_k, 0) + _v
+    _tot = (out.get("applied", 0) + out.get("skipped", 0)
+            + out.get("skipped_raised", 0)) or 1
+    out["applied_fraction"] = out.get("applied", 0) / _tot
+    return out
+
+
 def merge_pool_face_stats(pool, pf: dict | None = None) -> dict:
     """Merge the measure actors' per-face apply counters into ``pf``.
 
@@ -173,16 +194,10 @@ def merge_pool_face_stats(pool, pf: dict | None = None) -> dict:
             _s = _ray.get(_h.consume_face_stats.remote(), timeout=10)
         except Exception:
             continue
-        for _k, _v in (_s or {}).items():
-            if _k == "applied_fraction":
-                continue
-            if isinstance(_v, bool) or not isinstance(_v, (int, float)):
-                continue
-            out[_k] = out.get(_k, 0) + _v
-    _tot = (out.get("applied", 0) + out.get("skipped", 0)
-            + out.get("skipped_raised", 0)) or 1
-    out["applied_fraction"] = out.get("applied", 0) / _tot
-    return out
+        out = fold_face_stats(out, _s)
+    # An empty poll still has to publish a fraction: an absent key is what
+    # the unconditional logging below this exists to prevent.
+    return fold_face_stats(out, {})
 
 
 def merge_pool_plan_records(pool) -> dict:
