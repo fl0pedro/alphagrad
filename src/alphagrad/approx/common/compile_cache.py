@@ -59,16 +59,42 @@ _local_errors = 0
 
 # Process-local executable memo in FRONT of the (optional) coordinator:
 # without one, cached_compile was a pass-through and every terminal step
-# re-traced+re-lowered+re-compiled repeated plans. FIFO-evicted; entries are
-# loaded jax.stages.Compiled objects (survive jax.clear_caches(); freed by
-# GC on eviction), so memory is bounded by the cap.
+# re-traced+re-lowered+re-compiled repeated plans. LRU-evicted (owner ruling
+# 2026-09-14, small fixes #2): a plain dict already preserves insertion
+# order, so eviction just pops ``next(iter(_LOCAL_CACHE))`` -- the entry
+# LEAST RECENTLY touched, whether that touch was its original insertion or a
+# later hit. Before this ruling a HIT never moved its entry, so the table
+# behaved as FIFO-by-first-write, and the rev-exact reference (looked up
+# once per plan under key ``b"paired-ref:" + paired_ref_key``, env.py
+# ~7614) — hit far more often than any single approx-plan key, but never
+# refreshed — was evicted under load exactly like a key touched only once.
+# Entries are loaded jax.stages.Compiled objects (survive jax.clear_caches();
+# freed by GC on eviction), so memory is bounded by the cap. Capacity is
+# unchanged; only the eviction ORDER is now LRU instead of FIFO.
 _LOCAL_CACHE: dict = {}
 _LOCAL_CACHE_CAP = int(os.environ.get(
     "ALPHAGRAD_LOCAL_COMPILE_CACHE_CAP", "32"))
 
 
+def _local_touch(cache_key: bytes) -> None:
+    """Move ``cache_key`` to the most-recently-used end of ``_LOCAL_CACHE``
+    (a dict's iteration order is insertion order; popping and reinserting a
+    key moves it to the end without touching any other entry or the
+    capacity). Call on every hit so eviction order is LRU, not FIFO."""
+    try:
+        _LOCAL_CACHE[cache_key] = _LOCAL_CACHE.pop(cache_key)
+    except KeyError:
+        pass
+
+
 def _local_store(cache_key: bytes, compiled: Any) -> None:
     if _LOCAL_CACHE_CAP <= 0:
+        return
+    if cache_key in _LOCAL_CACHE:
+        # Already resident (e.g. re-registered after a coordinator hit) --
+        # refresh its position, do not evict for it.
+        _LOCAL_CACHE.pop(cache_key)
+        _LOCAL_CACHE[cache_key] = compiled
         return
     while len(_LOCAL_CACHE) >= _LOCAL_CACHE_CAP:
         _LOCAL_CACHE.pop(next(iter(_LOCAL_CACHE)))
@@ -140,6 +166,7 @@ def cached_compile(
         _hit = _LOCAL_CACHE.get(cache_key)
         if _hit is not None:
             _local_hits += 1
+            _local_touch(cache_key)
             return _hit
     handle = _get_actor_handle()
     if handle is None:
