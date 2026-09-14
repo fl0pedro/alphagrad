@@ -1,26 +1,50 @@
 #!/usr/bin/env python3
-"""Owner ruling Q2 (2026-09-13): is the stored face stream of step t equal to
-the next step's delta, truncated?
+"""What the stored face stream actually is (owner ruling Q2, 2026-09-13,
+settled 2026-09-14).
 
-``ppo.Trajectory.face_delta_tokens[t]`` (built by ``Agent._face_loop`` from
-``LiveFaceStream`` chunks, during sampling, before the vertex's face
-decisions are final) and ``ppo.Trajectory.delta_tokens[t+1]`` (built by the
-env's OWN incremental tokenizer, from the real ``env.step`` transition that
-step t's decisions produced) are two arrays written by TWO DIFFERENT
-tokenizer instances over what should be the same prefix. Nothing in the repo
-asserted, before this file, that they agree. ``tests/trajectory_layout_test.py``
-proved the MECHANISM (a face's chunk carries its PREDECESSOR's echo, so the
-concatenation of a vertex's chunks is a prefix of the vertex's own emission,
-missing the last face's echo) against a freshly-built REFERENCE tokenizer on
-one hand-picked vertex. This file checks the same claim against the actual
-two-tokenizer pair, across a real multi-step rollout, using the real
-``--face-actions --unified-face-head --live-faces --per-face-masks
---dynamic-substeps`` policy path (``--incremental-encode`` has been mandatory
-since stage 2, see ``ppo.main``):
+The question was whether ``ppo.Trajectory.face_delta_tokens[t]`` (built by
+``Agent._face_loop`` from ``LiveFaceStream`` chunks DURING SAMPLING, before
+the vertex's face decisions are final) equals ``ppo.Trajectory
+.delta_tokens[t+1]`` (built by the env's OWN incremental tokenizer, from the
+real ``env.step`` transition step t's decisions produced), truncated to
+``sum(face_counts[t])``. It does not, in general -- and this file now PINS
+the actual fact, established against a real rollout (real Agent, real
+LiveFaceStream, real ``env.step``, ``--face-actions --unified-face-head
+--live-faces --per-face-masks --dynamic-substeps`` -- ``--incremental-encode``
+has been mandatory since stage 2, see ``ppo.main``) rather than asserting the
+(false) equality and failing by design:
 
-    face_delta_tokens[t][i] == delta_tokens[t+1][i]   for i < sum(face_counts[t])
-    face_delta_tokens[t][i] == 0 (pad)                for i >= sum(face_counts[t])
-    sum(face_counts[t]) <= delta_count[t+1]
+1. For every step t where every one of the vertex's live faces was left
+   UNDECIDED (no ``skip``, no live slot rule -- i.e. every face is still
+   exactly what the head saw) AND ``sum(face_counts[t]) > 0``, the two
+   streams DO agree on that shared prefix::
+
+       face_delta_tokens[t][:sum(face_counts[t])] == delta_tokens[t+1][:sum(face_counts[t])]
+
+   This is the case the original claim was implicitly built on: with nothing
+   decided, there is no approximation echo anywhere, so the face's chunk
+   (its raw contraction) and the real emission are the same tokens.
+
+2. For at least one step where a face WAS decided (skip or a live slot
+   rule), the two streams DIVERGE, and the first differing index is at or
+   after the START of the decided face's own chunk (``cumsum(face_counts)``
+   up to that face) -- never inside an earlier, still-undecided face's
+   share of the buffer.
+
+THE CONCRETE INSTANCE (cluster job 65383, commit 9581de20, seed 0, step 4).
+One live face (``n_live=1``), decided SKIP. ``face_counts[t] = [610, 0, ...]``
+(the chunk read the face's full raw contraction while undecided),
+``delta_count[t+1] = 12`` (the real emission is just the SKIP marker). First
+differing index 6: ``face_delta_tokens[t][6] = 143`` vs
+``delta_tokens[t+1][6] = 10``. Decoded context: the face-stream side reads
+``'&#c&#14fns#b#1a=reshape'`` (the raw, undecided contraction -- it names a
+real op, ``reshape``); the delta side reads ``'&#c&#14{}approxSKIP{'`` (the
+actual emission -- ``approx SKIP {}``). Exactly the divergence
+``Agent._face_loop``'s own docstring predicts ("chunk f's contraction is
+deliberately unhooked (the face is undecided when read)... emission-window
+replay measured ratio/max_log 778 at epoch 0"), and the live-rollout
+confirmation of the mechanism ``tests/trajectory_layout_test.py`` had already
+isolated against a hand-built reference on one hand-picked vertex.
 
 THE ROLLOUT. ``ppo.rollout_fn`` is a closure nested inside ``ppo.main`` (it
 reads ``main``'s parsed ``args`` and is built inside a decorator stack), so it
@@ -42,10 +66,11 @@ The graph is ``graphax.examples.Perceptron`` at the argnums
 item 2) to have a vertex whose faces echo an approximation under BOTH
 decision channels, ``skip`` (``face_skips[f] == 1``) and a slot ``rule``
 (a real op != ``OP_END``), since the 2e06129e chooser change made graphax
-record an ``approx`` block for either one. Twelve weight-init seeds are
-pooled (the vertex ORDER is pinned by markowitz on every seed, so only the
-face head's draws vary) so the rollout is checked against BOTH channels
-rather than against whichever one an untrained head happens to draw first.
+record an ``approx`` block for either one. Weight-init seeds are widened
+until BOTH relations above have at least one witness (in practice seed 0
+alone supplies both: several undecided early steps and the decided SKIP at
+step 4) -- never skipped or xfailed if a seed pool comes up short; the search
+just widens.
 
 ``tests/policy_regression_gate.py`` pins ``ALPHAGRAD_*``/environment
 configuration at IMPORT TIME (its own header explains why: ``env.py`` reads
@@ -103,9 +128,11 @@ def _perceptron_args():
 _PERCEPTRON_ARGS = _perceptron_args()
 _PERCEPTRON_ARGNUMS = (2, 3, 4, 5)
 
-# Weight-init seeds pooled for face-decision coverage. The vertex order is
-# pinned (markowitz), so only the face head's draws differ between them.
-_SEEDS = tuple(range(12))
+# Weight-init seeds are tried 0, 1, 2, ... (the vertex order is pinned by
+# markowitz, so only the face head's draws differ between them) until both
+# relations have a witness. This is a cap on the WIDENING, not a fixed pool:
+# exhausting it is a hard failure ("re-seed, do not skip"), never a skip.
+_MAX_SEEDS = 60
 
 
 def _build_case(seed):
@@ -250,147 +277,173 @@ def _tokenizer_for(case):
         vocab_size=vocab)
 
 
-def _check_pair(rec, tok):
-    """Assert the three relations for one (seed, t) pair. Fails LOUDLY, with
-    the first differing index (within whatever overlap exists), the two
-    token ids and their decode, on the first mismatch -- checked BEFORE the
-    length relation, so a length violation still reports the same
-    diagnostic (index / ids / decode) rather than a bare number."""
-    f_cnt, f_dt = rec["f_cnt"], rec["f_dt"]
-    next_dt, next_dc = rec["next_dt"], rec["next_dc"]
-    total = int(f_cnt.sum())
+def _decided_faces(rec):
+    """Which of this step's LIVE faces were actually decided, in face-index
+    order: ``skip == 1``, or a live slot rule (``op_type != OP_END`` on a
+    face that was not skipped). Empty iff every live face is still exactly
+    what the head saw -- undecided."""
+    n_live = rec["n_live"]
+    if n_live == 0:
+        return []
+    skip = rec["skip"][:n_live]
+    op = rec["op_type"][:n_live]
+    return [f for f in range(n_live)
+            if skip[f] == 1 or np.any(op[f] != OP_END)]
+
+
+def _first_difference(rec, total):
+    """The first index in ``[0, total)`` where ``face_delta_tokens[t]`` and
+    ``delta_tokens[t+1]`` disagree, or ``None`` if they agree throughout."""
+    f_dt, next_dt = rec["f_dt"], rec["next_dt"]
+    for i in range(total):
+        if int(f_dt[i]) != int(next_dt[i]):
+            return i
+    return None
+
+
+def _decode_ctx(rec, tok, i):
+    """Decoded +/- 4 token window around index ``i`` of both streams, for a
+    failure message."""
+    f_dt, next_dt = rec["f_dt"], rec["next_dt"]
     W = f_dt.shape[0]
-    overlap = min(total, next_dc, next_dt.shape[0])
+    lo, hi = max(0, i - 4), min(W, i + 5)
+    ctx_face = [int(x) for x in f_dt[lo:hi]]
+    ctx_next = [int(x) for x in next_dt[lo:hi]]
+    return (lo, hi, ctx_face, ctx_next,
+            tok.decode(ctx_face), tok.decode(ctx_next))
 
-    for i in range(overlap):
-        a, b = int(f_dt[i]), int(next_dt[i])
-        if a != b:
-            lo, hi = max(0, i - 4), min(W, i + 5)
-            ctx_face = [int(x) for x in f_dt[lo:hi]]
-            ctx_next = [int(x) for x in next_dt[lo:hi]]
-            pytest.fail(
-                "THE CLAIM IS FALSE: face_delta_tokens[t] diverges from "
-                "delta_tokens[t+1] inside the declared live prefix. The two "
-                "streams come from two different tokenizer instances (the "
-                "env's incremental stream and LiveFaceStream's own prefix "
-                "tokenizer) and they disagree.\n"
-                f"seed={rec['seed']} step={rec['t']} "
-                f"first differing index={i} of overlap {overlap} "
-                f"(sum(face_counts)={total}, delta_count[t+1]={next_dc})\n"
-                f"face_delta_tokens[t][{i}]={a}   "
-                f"delta_tokens[t+1][{i}]={b}\n"
-                f"context [{lo}:{hi}) face_delta_tokens  ={ctx_face}\n"
-                f"context [{lo}:{hi}) delta_tokens[t+1]  ={ctx_next}\n"
-                f"decode(face_delta_tokens context) ={tok.decode(ctx_face)!r}\n"
-                f"decode(delta_tokens[t+1] context)  ={tok.decode(ctx_next)!r}\n"
-                f"face_counts[t]={f_cnt.tolist()}")
 
-    if total > next_dc:
-        lo = max(0, next_dc - 4)
-        hi_face = min(W, next_dc + 8)
-        hi_next = min(next_dt.shape[0], next_dc + 8)
-        ctx_face = [int(x) for x in f_dt[lo:hi_face]]
-        ctx_next = [int(x) for x in next_dt[lo:hi_next]]
-        n_live = rec["n_live"]
+def _assert_undecided_prefix_matches(rec, tok, total):
+    """RELATION (1): with every live face still undecided, the stored face
+    stream and the successor's delta must agree on the shared prefix. Fails
+    LOUDLY, with the first differing index, the two token ids and their
+    decode, on the first mismatch."""
+    diff = _first_difference(rec, total)
+    if diff is None:
+        return
+    a, b = int(rec["f_dt"][diff]), int(rec["next_dt"][diff])
+    lo, hi, ctx_face, ctx_next, dec_face, dec_next = _decode_ctx(rec, tok, diff)
+    pytest.fail(
+        "RELATION (1) IS VIOLATED: every live face of this step was left "
+        "UNDECIDED (no skip, no live slot rule), so face_delta_tokens[t] and "
+        "delta_tokens[t+1] were expected to agree on their shared prefix -- "
+        "they do not.\n"
+        f"seed={rec['seed']} step={rec['t']} n_live={rec['n_live']} "
+        f"first differing index={diff} of {total} "
+        f"(sum(face_counts)={total}, delta_count[t+1]={rec['next_dc']})\n"
+        f"face_delta_tokens[t][{diff}]={a}   delta_tokens[t+1][{diff}]={b}\n"
+        f"context [{lo}:{hi}) face_delta_tokens ={ctx_face}\n"
+        f"context [{lo}:{hi}) delta_tokens[t+1] ={ctx_next}\n"
+        f"decode(face_delta_tokens context) ={dec_face!r}\n"
+        f"decode(delta_tokens[t+1] context)  ={dec_next!r}\n"
+        f"face_counts[t]={rec['f_cnt'].tolist()}")
+
+
+def _assert_decided_diverges_at_the_right_place(rec, tok, total, decided):
+    """RELATION (2): with at least one live face decided, face_delta_tokens[t]
+    and delta_tokens[t+1] must actually diverge, and not before the FIRST
+    decided face's own chunk starts (``cumsum(face_counts)`` up to that
+    face) -- an earlier, still-undecided face's share of the buffer is
+    exactly the raw contraction the real emission also contains. Fails
+    LOUDLY, with the same index/ids/decode diagnostic, if either half is
+    violated."""
+    f_cnt = rec["f_cnt"]
+    f0 = decided[0]
+    start = int(f_cnt[:f0].sum())
+    diff = _first_difference(rec, total)
+
+    if diff is None:
         pytest.fail(
-            "THE CLAIM IS FALSE: sum(face_counts[t]) exceeds delta_count[t+1] "
-            "-- the stored face stream (read from each face while its OWN "
-            "decision was still UNDECIDED, per _face_loop's docstring) is "
-            "LONGER than the delta the decision the head actually drew "
-            "produced (e.g. SKIP drops the raw contraction the head was "
-            "shown entirely, so the real emission is far shorter than the "
-            "chunk that was read to decide on it). The two streams agreed on "
-            f"their first {overlap} shared tokens, then the shorter one "
-            "(delta_tokens[t+1]) simply ended.\n"
-            f"seed={rec['seed']} step={rec['t']} n_live_faces={n_live} "
-            f"sum(face_counts)={total} delta_count[t+1]={next_dc}\n"
+            "RELATION (2) IS VIOLATED: a face was decided but "
+            "face_delta_tokens[t] and delta_tokens[t+1] agree everywhere in "
+            f"[0, {total}) anyway.\n"
+            f"seed={rec['seed']} step={rec['t']} n_live={rec['n_live']} "
+            f"decided faces={decided} decided_chunk_start={start} "
+            f"sum(face_counts)={total} delta_count[t+1]={rec['next_dc']}\n"
             f"face_counts[t]={f_cnt.tolist()} "
-            f"skip[:n_live]={rec['skip'][:n_live].tolist()} "
-            f"op_type[:n_live]={rec['op_type'][:n_live].tolist()}\n"
-            f"context around index {next_dc} (the successor's end):\n"
-            f"  face_delta_tokens[{lo}:{hi_face})={ctx_face}\n"
-            f"  delta_tokens[t+1][{lo}:{hi_next})={ctx_next}\n"
-            f"  decode(face_delta_tokens context) ={tok.decode(ctx_face)!r}\n"
-            f"  decode(delta_tokens[t+1] context)  ={tok.decode(ctx_next)!r}")
+            f"skip[:n_live]={rec['skip'][:rec['n_live']].tolist()} "
+            f"op_type[:n_live]={rec['op_type'][:rec['n_live']].tolist()}")
 
-    tail = f_dt[total:]
-    bad = np.flatnonzero(tail != 0)
-    if bad.size:
-        i = total + int(bad[0])
+    if diff < start:
+        lo, hi, ctx_face, ctx_next, dec_face, dec_next = _decode_ctx(
+            rec, tok, diff)
+        a, b = int(rec["f_dt"][diff]), int(rec["next_dt"][diff])
         pytest.fail(
-            "face_delta_tokens[t] carries a NON-ZERO token past "
-            "sum(face_counts[t]) -- the stored buffer is not zero-padded "
-            "where the claim says it must be.\n"
-            f"seed={rec['seed']} step={rec['t']} index={i} "
-            f"value={int(f_dt[i])} sum(face_counts)={total}")
+            "RELATION (2) IS VIOLATED: the streams diverged BEFORE the "
+            "decided face's own chunk -- an earlier, still-undecided face's "
+            "share of the buffer should have matched the real emission.\n"
+            f"seed={rec['seed']} step={rec['t']} n_live={rec['n_live']} "
+            f"decided faces={decided} decided_chunk_start={start} "
+            f"first differing index={diff} of {total}\n"
+            f"face_delta_tokens[t][{diff}]={a}   "
+            f"delta_tokens[t+1][{diff}]={b}\n"
+            f"context [{lo}:{hi}) face_delta_tokens ={ctx_face}\n"
+            f"context [{lo}:{hi}) delta_tokens[t+1] ={ctx_next}\n"
+            f"decode(face_delta_tokens context) ={dec_face!r}\n"
+            f"decode(delta_tokens[t+1] context)  ={dec_next!r}\n"
+            f"face_counts[t]={f_cnt.tolist()}")
 
-    return total, next_dc
 
+def test_the_stored_face_stream_is_what_the_head_read_before_the_decision_and_diverges_from_the_next_delta_exactly_at_a_decided_face():
+    """The positive pin (owner ruling Q2, settled 2026-09-14): the stored
+    face stream is the tokens the head read BEFORE each face's decision, not
+    a prefix of the next step's delta in general.
 
-def test_the_stored_face_stream_of_step_t_equals_the_next_steps_delta_truncated_to_its_length():
-    """Owner ruling Q2: face_delta_tokens[t] == delta_tokens[t+1][:sum(face_counts[t])],
-    zero-padded past that length, with sum(face_counts[t]) <= delta_count[t+1],
-    for every step t with a successor in the same episode.
+    (1) Every step whose live faces are ALL still undecided: the stored face
+        stream and the next step's delta agree on their shared prefix (no
+        decision, no divergence -- see ``_assert_undecided_prefix_matches``).
+    (2) At least one step where a face WAS decided (skip or a live slot
+        rule): the two streams diverge, and never before that decided face's
+        own chunk (see ``_assert_decided_diverges_at_the_right_place``).
 
     Checked against a REAL rollout (real Agent, real LiveFaceStream, real
-    env.step), pooled over twelve weight-init seeds on a fixed (markowitz)
-    vertex order, so the face head's draws vary while the graph and the order
-    stay fixed. Fails on the FIRST mismatch, anywhere, with the index, the two
-    token ids and their decode. If it does not fail, this also asserts that
-    both approximation channels (SKIP and a live slot rule) were genuinely
-    exercised somewhere in the pool -- otherwise a pass would only mean "no
-    approximation ever ran," which proves nothing about the claim.
+    env.step) on a fixed (markowitz) vertex order. Weight-init seeds widen
+    from 0 until both relations have a witness (``_MAX_SEEDS`` caps the
+    widening as a hard failure, never a skip -- "re-seed, do not skip").
+    Fails on the FIRST violation of (1), anywhere, with the index, the two
+    token ids and their decode; fails the same way if (2)'s witness turns out
+    to violate its own half, or if no decided step exists inside the cap.
     """
     tok = None
-    total_pairs = 0
-    ratios = []
-    gap_steps = 0
-    any_skip = False
-    any_rule = False
+    undecided_checked = 0
+    decided_checked = 0
+    last_seed = -1
 
-    for seed in _SEEDS:
+    for seed in range(_MAX_SEEDS):
+        last_seed = seed
         case, records = _run_episode(seed)
         if tok is None:
             tok = _tokenizer_for(case)
-        assert records, f"seed {seed}: no step recorded a face decision at all"
         for rec in records:
-            total, next_dc = _check_pair(rec, tok)
-            total_pairs += 1
-            if next_dc > 0:
-                ratios.append(total / next_dc)
-            if total < next_dc:
-                gap_steps += 1
+            total = int(rec["f_cnt"].sum())
+            if total == 0:
+                continue
+            decided = _decided_faces(rec)
+            if not decided:
+                _assert_undecided_prefix_matches(rec, tok, total)
+                undecided_checked += 1
+            else:
+                _assert_decided_diverges_at_the_right_place(
+                    rec, tok, total, decided)
+                decided_checked += 1
+        if undecided_checked > 0 and decided_checked > 0:
+            break
 
-            n_live = rec["n_live"]
-            if n_live:
-                skip = rec["skip"][:n_live]
-                op = rec["op_type"][:n_live]
-                if np.any(skip == 1):
-                    any_skip = True
-                not_skipped = op[skip == 0]
-                if not_skipped.size and np.any(not_skipped != OP_END):
-                    any_rule = True
+    assert undecided_checked > 0, (
+        f"no step across seeds 0..{last_seed} had every live face left "
+        "undecided with a non-empty chunk; re-seed (raise _MAX_SEEDS), do "
+        "not skip -- relation (1) has no witness")
+    assert decided_checked > 0, (
+        f"no step across seeds 0..{last_seed} decided ANY face (skip or a "
+        "live slot rule); re-seed (raise _MAX_SEEDS), do not skip -- "
+        "relation (2) has no witness")
 
-    assert total_pairs > 0, "no (seed, step) pair produced a face decision"
-    assert any_skip, (
-        f"no face used the SKIP bit across seeds {_SEEDS}; this pool cannot "
-        "claim coverage of the echo the skip channel emits")
-    assert any_rule, (
-        f"no live, non-skipped face drew a real slot rule (op_type != "
-        f"OP_END) across seeds {_SEEDS}; this pool cannot claim coverage of "
-        "the echo a rule emits")
-
-    max_ratio = max(ratios) if ratios else float("nan")
-    print(f"[one-stream] pairs_checked={total_pairs} "
-          f"max(sum(face_counts)/delta_count[t+1])={max_ratio:.6f} "
-          f"steps_with_gap={gap_steps} any_skip={any_skip} any_rule={any_rule}",
-          flush=True)
+    print(f"[one-stream] seeds_tried=0..{last_seed} "
+          f"undecided_steps_checked={undecided_checked} "
+          f"decided_steps_checked={decided_checked}", flush=True)
     # Also written to a file: `-q -x` (the sbatch template) does not show
     # captured stdout for a passing test.
     pathlib.Path(__file__).with_name("_onestream_stats.txt").write_text(
-        f"pairs_checked={total_pairs}\n"
-        f"max_ratio={max_ratio:.6f}\n"
-        f"steps_with_gap={gap_steps}\n"
-        f"any_skip={any_skip}\n"
-        f"any_rule={any_rule}\n"
-        f"seeds={list(_SEEDS)}\n")
+        f"seeds_tried=0..{last_seed}\n"
+        f"undecided_steps_checked={undecided_checked}\n"
+        f"decided_steps_checked={decided_checked}\n")
