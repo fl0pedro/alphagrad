@@ -286,15 +286,19 @@ def count_loop(body, carry, *, nb, nb_live, y_struct=None):
             def _one(c, f):
                 return conv((c, i), merge_inexact(f, co, cs_spec))
 
-            # MATCH THE SHIPPED PATH'S TRANSPOSE, not just its arithmetic.
-            # The scan form differentiates a `jax.checkpoint`-ed body, so its
-            # per-chunk backward is `remat_transpose`: recompute the forward,
-            # then transpose. A plain `jax.vjp` here is `linearize` +
-            # `transpose`, which is the same function through a different
-            # jaxpr -- and on the parallel chunk interior
-            # (`_extend_parallel`'s associative scan) the two forms' add
-            # trees came out about one float32 ulp apart. Checkpointing
-            # `_one` puts this backward on the same transpose as the old one.
+            # The same transpose the shipped path takes. The scan form
+            # differentiates a `jax.checkpoint`-ed body, so its per-chunk
+            # backward is `remat_transpose`: recompute the forward, then
+            # transpose. A plain `jax.vjp` is `linearize` + `transpose`, the
+            # same function through a different jaxpr.
+            #
+            # THIS WAS AN ATTEMPT TO CLOSE THE ULP GAP AND IT DOES NOT. The
+            # gap is the shipped body's `lax.cond`, not the transpose (see
+            # the module docstring), so matching the transpose could never
+            # have helped. It stays on because it is the closer analogue of
+            # the old path, and `ALPHAGRAD_COUNT_VJP_REMAT=0` drops the one
+            # extra recomputed forward per chunk that it costs. That setting
+            # is expected to be faster and has NOT been measured.
             _one_t = (jax.checkpoint(_one)
                       if os.environ.get("ALPHAGRAD_COUNT_VJP_REMAT", "1") != "0"
                       else _one)
