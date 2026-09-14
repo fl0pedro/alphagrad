@@ -33,24 +33,48 @@ would silently return SHIFTED tokens for that read. With the shipped chunk
 design's arithmetic is exact; `stream_tail()` keeps them equal for every
 other pair.
 
-GROWTH. The host knows every environment's exact stream length after each
+THE BIN IS CHOSEN, NOT ONLY GROWN (owner clarification of 2026-09-14). The
+bins are a SMALL SET OF COMPILED PROGRAMS, one per power of two, and the
+driver picks one per episode. Before each rollout it takes the smallest bin
+that holds the RECENT HISTORY: the longest episode stream of the last
+`ALPHAGRAD_EPISODE_TOKENS_HISTORY` episodes, times
+`ALPHAGRAD_EPISODE_TOKENS_MARGIN`. So a run drifts back DOWN to a smaller
+bin when the deltas shrink, and moves up only when an episode needs it. The
+compile per bin happens once, because jit keys on the static shape and the
+persistent JAX compilation cache carries it across runs, so switching
+between bins that are already compiled is free.
+
+OVERFLOW. The host knows every environment's exact stream length after each
 step, so the check is exact and it is one per step per environment rather
 than one per token. A step that would pass `2^n` raises
 :class:`EpisodeStreamOverflow` BEFORE the write. The driver catches it, logs
-one line, raises `n` by one, recompiles and REPEATS the episode. Growth is
-monotone within a run and stops at `ALPHAGRAD_EPISODE_TOKENS_LOG2_MAX` with
-a raise -- a runaway stream cannot fill the device in silence.
+one line, RE-RUNS THAT EPISODE at the next larger bin, and records the length
+that overflowed in the history, so the next episode's choice already knows
+about it. `ALPHAGRAD_EPISODE_TOKENS_LOG2_MAX` is a hard cap and a raise -- a
+runaway stream cannot fill the device in silence.
 """
 
 from __future__ import annotations
 
+import math
 import os
+from collections import deque
 
 import numpy as np
 
 # THE CONFIGURATION KNOBS, named once.
 LOG2_ENV = "ALPHAGRAD_EPISODE_TOKENS_LOG2"
 LOG2_MAX_ENV = "ALPHAGRAD_EPISODE_TOKENS_LOG2_MAX"
+HISTORY_ENV = "ALPHAGRAD_EPISODE_TOKENS_HISTORY"
+MARGIN_ENV = "ALPHAGRAD_EPISODE_TOKENS_MARGIN"
+
+# How many recent episodes the choice looks at, and how much room it leaves
+# above the longest of them. Eight episodes is long enough that one short
+# episode cannot shrink the bin under a run that is merely between two long
+# ones, and short enough that a real downward drift is picked up within a
+# few episodes. A margin of 2 is one doubling of headroom.
+HISTORY_DEFAULT = 8
+MARGIN_DEFAULT = 2.0
 
 # The hard cap's default. 2^24 slots is 16 MiB per environment per stream,
 # which is already four doublings past the measured transformer width; a run
@@ -61,6 +85,14 @@ LOG2_MAX_DEFAULT = 24
 FIRST_BIN_RULE = (
     "MAX_DELTA_TOKENS times the episode length, rounded UP to the next "
     "power of two, divided by 8"
+)
+
+# THE PER-EPISODE SELECTION RULE, STATED ONCE (the flag help quotes it too).
+SELECTION_RULE = (
+    "the smallest power of two that holds the longest episode stream of the "
+    "last " + HISTORY_ENV + " episodes (default "
+    + str(HISTORY_DEFAULT) + ") times " + MARGIN_ENV + " (default "
+    + str(MARGIN_DEFAULT) + "); with no history yet it is the first bin"
 )
 
 
@@ -99,6 +131,17 @@ def _int_env(name, default):
     if value < 0:
         raise ValueError(f"{name} must be >= 0, got {value}")
     return value
+
+
+def _float_env(name, default):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(
+            f"{name} must be a number, got {raw!r}") from None
 
 
 def log2_max() -> int:
@@ -253,31 +296,113 @@ def overflow_in(exc):
     return None
 
 
-def run_with_growth(state, what, fn, log=print):
-    """THE DRIVER'S GROWTH LOOP, the owner's rule in one place (Q1).
+def log2_for_length(length) -> int:
+    """The smallest `n` with `2^n >= length`. `n = 0` for an empty stream."""
+    n = int(max(0, int(length)))
+    if n <= 1:
+        return 0
+    return int(n - 1).bit_length()
 
-    ``state`` is a one-element mutable holding the current `n`; ``fn(n)``
-    runs the episode. On :class:`EpisodeStreamOverflow`: log ONE line with
-    the old bin, the new bin and what overflowed, raise `n` by one, and run
-    the SAME episode again. A new bin is a new stream shape, so the caller's
-    jit retraces by itself -- there is nothing to invalidate by hand.
+
+class BinPolicy:
+    """WHICH BIN THE NEXT EPISODE COMPILES FOR. The rule lives here only.
+
+    The bins are a small set of compiled programs, one per power of two, and
+    this picks one per episode by :data:`SELECTION_RULE`. It goes DOWN as
+    readily as up: an episode history that shrinks picks the smaller bin
+    again, and the program for it is already compiled, so the switch is
+    free.
+
+    `initial_log2` is what :meth:`pick` returns while the history is empty
+    (`ALPHAGRAD_EPISODE_TOKENS_LOG2` when set, else the measured first bin).
+    It is a STARTING POINT, not a floor: once real lengths are recorded, the
+    measurement decides.
+    """
+
+    def __init__(self, initial_log2, history=None, margin=None, cap=None):
+        self.initial = int(initial_log2)
+        if self.initial < 0:
+            raise ValueError(
+                f"the initial bin must be >= 0, got {self.initial}")
+        self.window = (_int_env(HISTORY_ENV, HISTORY_DEFAULT)
+                       if history is None else int(history))
+        if self.window < 1:
+            raise ValueError(
+                f"{HISTORY_ENV} must be at least 1 episode, got "
+                f"{self.window}")
+        self.margin = (_float_env(MARGIN_ENV, MARGIN_DEFAULT)
+                       if margin is None else float(margin))
+        if self.margin < 1.0:
+            # A margin below 1 asks for a bin SMALLER than a length already
+            # seen, i.e. an overflow on every episode by construction.
+            raise ValueError(
+                f"{MARGIN_ENV} must be at least 1.0, got {self.margin}")
+        self.cap = log2_max() if cap is None else int(cap)
+        if self.initial > self.cap:
+            raise ValueError(
+                f"the initial bin 2^{self.initial} is above the cap "
+                f"{LOG2_MAX_ENV}={self.cap}")
+        self.recent = deque(maxlen=self.window)
+        self.log2 = self.initial
+
+    def record(self, length) -> None:
+        """Note one episode's LONGEST stream (both streams, all environments).
+
+        Called on success with what the episode actually used, and on an
+        overflow with the length that overflowed, so the next choice already
+        knows about it.
+        """
+        self.recent.append(int(max(0, int(length))))
+
+    def pick(self) -> int:
+        """The bin for the next episode. See :data:`SELECTION_RULE`."""
+        if not self.recent:
+            self.log2 = self.initial
+            return self.log2
+        need = math.ceil(max(self.recent) * self.margin)
+        self.log2 = min(log2_for_length(need), self.cap)
+        return self.log2
+
+    def bump(self, log2) -> int:
+        """One doubling for the repeat of an episode that overflowed."""
+        self.log2 = grow(log2)
+        return self.log2
+
+
+def run_episode(policy, what, fn, log=print):
+    """Run ONE episode at the bin `policy` chose; repeat it a bin up on
+    overflow.
+
+    `fn(n)` runs the episode compiled for `2^n`. On
+    :class:`EpisodeStreamOverflow`: record the length that overflowed, log
+    ONE line with the old bin, the new bin and what overflowed, and run the
+    SAME episode again one bin up. A new bin is a new stream shape, so the
+    caller's jit retraces by itself; a bin it has already compiled costs
+    nothing to go back to.
 
     Nothing of the failed attempt survives: the caller rebinds the agent,
     the optimiser state and the env states only on RETURN, so the repeat
     starts from exactly the state the first attempt started from. The host
     callbacks of the failed attempt did run, so their counters saw it.
+
+    The caller records the SUCCESSFUL episode's length itself
+    (`policy.record(...)`), because only the caller sees the cursors the
+    rollout came back with.
     """
+    n = policy.pick()
     while True:
         try:
-            return fn(state[0])
+            return fn(n)
         except Exception as exc:                       # noqa: BLE001
             inner = overflow_in(exc)
             if inner is None:
                 raise
-            old = int(state[0])
-            state[0] = grow(old)
+            length = getattr(inner, "length", None)
+            if length:
+                policy.record(length)
+            old, n = n, policy.bump(n)
             log("[episode-stream] bin 2^%d -> 2^%d, repeating %s: %s"
-                % (old, state[0], what, inner))
+                % (old, n, what, inner))
 
 
 class EpisodeStreamCapReached(Exception):

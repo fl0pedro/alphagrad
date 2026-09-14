@@ -62,17 +62,25 @@ length. STATE THIS IN THE REPORT.
   offsets into one contiguous span.
   `MAX_DELTA_TOKENS` is unchanged. It is still the per-step transport width
   and the write window, and its overflow contract is the same.
-  The row is `2^n + MAX_DELTA_TOKENS` slots. `n` comes from
+  The row is `2^n + MAX_DELTA_TOKENS` slots. The FIRST `n` comes from
   `--episode-tokens-log2`. If that is 0, it comes from
   `ALPHAGRAD_EPISODE_TOKENS_LOG2`. If that is unset, it is MAX_DELTA_TOKENS
   times the episode length, rounded up to the next power of two, divided by
   8. That is 19 at the transformer width.
+  THE DRIVER THEN CHOOSES A BIN PER EPISODE (owner clarification
+  2026-09-14). The bins are a small set of compiled programs, one per power
+  of two. Before each rollout the driver takes the smallest bin that holds
+  the longest episode stream of the last `ALPHAGRAD_EPISODE_TOKENS_HISTORY`
+  episodes (default 8) times `ALPHAGRAD_EPISODE_TOKENS_MARGIN` (default 2).
+  So a run drifts back down to a smaller bin when the deltas shrink. The
+  compile per bin happens once, because jit keys on the static shape and the
+  persistent JAX compilation cache carries it across runs.
   A step that would pass `2^n` raises on the host before the write. The
-  driver logs one `[episode-stream]` line, grows `n` by one, recompiles and
-  repeats the episode. Growth is monotone and stops at
+  driver logs one `[episode-stream]` line, re-runs that episode one bin up,
+  and records the length that overflowed in the history. The hard cap is
   `ALPHAGRAD_EPISODE_TOKENS_LOG2_MAX`, which defaults to 24.
   The first bin holds the measured episode with a factor of 1.84. A per-step
-  length that doubled therefore costs exactly one growth.
+  length that doubled therefore costs exactly one step up.
   Design: `.scratch/trustworthy-approx-search/episode-stream-design.md`.
   Code: `src/alphagrad/approx/common/episode_stream.py`. Tests:
   `tests/episode_stream_test.py`.

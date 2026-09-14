@@ -4303,11 +4303,17 @@ def make_argparser() -> argparse.ArgumentParser:
              "uint8 row of 2^n + MAX_DELTA_TOKENS slots per episode and per "
              "stream (one for the step deltas, one for the face chunks); "
              "every step writes its delta at a cursor and the trajectory "
-             "stores the OFFSET, not the window. 0 = derive it: "
-             + _epstream.LOG2_ENV + " if set, else " + _epstream.FIRST_BIN_RULE
-             + ". A step that would pass 2^n raises on the host BEFORE the "
-             "write; the driver logs one line, grows n by one, recompiles "
-             "and repeats the episode, monotonically and up to "
+             "stores the OFFSET, not the window. This value is the FIRST "
+             "bin only. 0 = derive it: " + _epstream.LOG2_ENV
+             + " if set, else " + _epstream.FIRST_BIN_RULE
+             + ". THEREAFTER THE DRIVER CHOOSES A BIN PER EPISODE: "
+             + _epstream.SELECTION_RULE
+             + ". The bins are a small set of compiled programs, one per "
+             "power of two, so a run drifts back DOWN to a smaller bin when "
+             "the deltas shrink and the switch costs nothing. A step that "
+             "would pass 2^n raises on the host BEFORE the write; the "
+             "driver logs one line, re-runs that episode one bin up and "
+             "records the length. The hard cap is "
              + _epstream.LOG2_MAX_ENV + ".")
     p.add_argument("--no-jit", action="store_true")
     p.add_argument(
@@ -8474,27 +8480,23 @@ def main():
         return (jnp.zeros((num_envs, L), DELTA_TOKEN_DTYPE),
                 jnp.zeros((num_envs, L), DELTA_TOKEN_DTYPE))
 
-    # THE BIN, AND THE ONLY PLACE IT MOVES. Monotone within a run: it only
-    # ever grows, by one doubling, and only when an episode overflowed.
-    _EP_LOG2 = [_epstream.resolve_log2(
-        MAX_DELTA_TOKENS, int(num_valid),
-        override=int(getattr(args, "episode_tokens_log2", 0) or 0))]
+    # THE BIN, AND THE ONLY PLACE IT IS CHOSEN. The bins are a small set of
+    # compiled programs, one per power of two, and this object picks one per
+    # episode from the recent history. It goes DOWN as readily as up. The
+    # rule itself lives in `episode_stream.SELECTION_RULE`.
+    _EP_BIN = _epstream.BinPolicy(
+        _epstream.resolve_log2(
+            MAX_DELTA_TOKENS, int(num_valid),
+            override=int(getattr(args, "episode_tokens_log2", 0) or 0)))
     print("[episode-stream] first bin 2^%d = %d slots per environment per "
-          "stream, %d-slot tail, %d bytes per row (rule: %s; override with "
-          "%s, cap %s=%d)"
-          % (_EP_LOG2[0], 1 << _EP_LOG2[0],
+          "stream, %d-slot tail, %d bytes per row (first bin: %s; per "
+          "episode: %s; override the first with %s, cap %s=%d)"
+          % (_EP_BIN.initial, 1 << _EP_BIN.initial,
              _epstream.stream_tail(MAX_DELTA_TOKENS),
-             _epstream.stream_length(_EP_LOG2[0], MAX_DELTA_TOKENS),
-             _epstream.FIRST_BIN_RULE, _epstream.LOG2_ENV,
+             _epstream.stream_length(_EP_BIN.initial, MAX_DELTA_TOKENS),
+             _epstream.FIRST_BIN_RULE, _epstream.SELECTION_RULE,
+             _epstream.LOG2_ENV,
              _epstream.LOG2_MAX_ENV, _epstream.log2_max()), flush=True)
-
-    def _run_with_bin_growth(what, fn):
-        """The owner's growth rule (Q1). One implementation, in
-        `common.episode_stream.run_with_growth`; this only binds the run's
-        bin holder and the log line's sink."""
-        return _epstream.run_with_growth(
-            _EP_LOG2, what, fn,
-            log=lambda line: print(line, flush=True))
 
     @eqx.filter_jit
     # +1 entry for vertex_temperature (broadcast, not mapped): the PopArt
@@ -9229,8 +9231,14 @@ def main():
         )
         final_state = _carry_out[0]
         _ep_final = _carry_out[-1]
+        # The two streams and, LAST, how much of the bin this environment
+        # actually used. The driver records that length and chooses the next
+        # episode's bin from it (see `episode_stream.BinPolicy`), so it has
+        # to come back out of the rollout, not be inferred from the offsets.
+        # Both streams share one bin, so it is the larger of the two cursors.
+        _ep_used = jnp.maximum(_ep_final[1], _ep_final[3])
         return (final_state, traj, all_raw_rewards[-1],
-                _ep_final[0], _ep_final[2])
+                _ep_final[0], _ep_final[2], _ep_used)
 
     def loss_fn(
         agent,
@@ -10381,7 +10389,7 @@ def main():
         # policy entropy.
         _ep_tok0, _ep_ftok0 = _episode_streams(ep_log2)
         (env_states, traj, total_rewards_full,
-         ep_tokens, ep_face_tokens) = rollout_fn(
+         ep_tokens, ep_face_tokens, ep_used_per_env) = rollout_fn(
             agent,
             env_obj,
             num_valid,
@@ -11343,6 +11351,11 @@ def main():
             vprobes,
             vprobe_opt_state,
             vp_metrics,
+            # HOW MUCH OF THE BIN THIS EPISODE USED, the longest of the two
+            # streams over the environments. The driver records it and picks
+            # the next episode's bin from the recent history of these
+            # numbers (`episode_stream.BinPolicy`).
+            jnp.max(ep_used_per_env),
         )
 
     if not args.no_jit:
@@ -13558,9 +13571,13 @@ def main():
                         _t0, _f0, _EP_ENV_IDX,
                     )
                 # A random warm-up plan can emit MORE than a learned one, so
-                # this is a growth site like the training episode is.
-                _wend, _wtraj, _wtot, _wst, _wsf = _run_with_bin_growth(
-                    "popart warm-up rollout %d" % _wi, _wroll)
+                # this is a bin site like the training episode is, and its
+                # length goes into the same history.
+                (_wend, _wtraj, _wtot, _wst, _wsf,
+                 _wused) = _epstream.run_episode(
+                    _EP_BIN, "popart warm-up rollout %d" % _wi, _wroll,
+                    log=lambda line: print(line, flush=True))
+                _EP_BIN.record(int(np.max(np.asarray(_wused))))
                 _wr = _wtraj.reward                             # (E, T, R) raw
                 # Sentinel test on the RAW vector, identical to `_is_degen` in
                 # the loss. Testing it after symlog (as the old code did) can
@@ -13754,7 +13771,9 @@ def main():
             vprobes,
             vprobe_opt_state,
             vp_metrics,
-        ) = _run_with_bin_growth(
+            _ep_used,
+        ) = _epstream.run_episode(
+            _EP_BIN,
             "episode %d" % ep,
             lambda _ep_n: train_episode(
                 agent,
@@ -13780,7 +13799,12 @@ def main():
                 _kl_ref_coef_arg,
                 _ep_n,
             ),
+            log=lambda line: print(line, flush=True),
         )
+        # THE MEASUREMENT THE NEXT BIN IS CHOSEN FROM. Recorded on success;
+        # `run_episode` records the overflowing length itself when an
+        # episode had to be repeated.
+        _EP_BIN.record(int(_ep_used))
         if _xtr_on:
             # The trace has to stay open until the device is drained or the
             # timeline stops at the first output that happens to be ready.

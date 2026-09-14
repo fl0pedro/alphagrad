@@ -11,8 +11,9 @@ Six things are pinned here.
    the row length and the tail the write window needs.
 2. THE HOST CHECK. A step that would pass `2^n` raises, and the message
    names the environment, the step, the length and the bin.
-3. THE GROWTH. One doubling per overflow, the same episode run again, and
-   a raise instead of a runaway at the cap.
+3. THE BIN THE DRIVER CHOOSES. The selection rule, a shrinking episode
+   history picking the smaller bin again, the repeat one bin up on an
+   overflow, and a raise instead of a runaway at the cap.
 4. THE WRITE. A rollout of known deltas lands at the right offsets and the
    row IS their concatenation, byte for byte.
 5. THE READ. The chunked read from the stream at an offset equals the read
@@ -226,7 +227,96 @@ def test_the_check_refuses_a_cursor_and_count_pair_of_different_widths():
                          0, 8)
 
 
-# ------------------------------------------------------------ 3. the growth
+# ----------------------------------------- 3. the bin the driver CHOOSES
+
+def test_the_bin_with_no_history_yet_is_the_first_bin():
+    p = ES.BinPolicy(19, history=4, margin=2.0)
+    assert p.pick() == 19
+    assert p.pick() == 19
+
+
+def test_the_bin_is_the_smallest_power_of_two_holding_the_history_times_the_margin():
+    """The selection rule, stated once and quoted by the flag help."""
+    p = ES.BinPolicy(19, history=4, margin=2.0)
+    p.record(100_000)
+    # 100 000 x 2 = 200 000; the smallest power of two at or above it is
+    # 2^18 = 262 144.
+    assert p.pick() == 18
+    for fragment in ("smallest power of two", ES.HISTORY_ENV, ES.MARGIN_ENV):
+        assert fragment in ES.SELECTION_RULE
+
+
+def test_an_episode_history_that_shrinks_makes_the_driver_pick_the_smaller_bin():
+    """THE POINT OF THE RULING. The bin is chosen, not only grown: a run
+    whose deltas shrink drifts back DOWN, and the program for the smaller
+    bin is already compiled, so the switch costs nothing."""
+    p = ES.BinPolicy(19, history=3, margin=2.0)
+    for _ in range(3):
+        p.record(300_000)
+    big = p.pick()
+    assert big == 20                       # 600 000 -> 2^20
+
+    # Three shorter episodes push the long ones out of the window.
+    for _ in range(3):
+        p.record(20_000)
+    small = p.pick()
+    assert small == 16                     # 40 000 -> 2^16
+    assert small < big
+
+    # And it comes back up the moment a long episode reappears.
+    p.record(300_000)
+    assert p.pick() == 20
+
+
+def test_one_long_episode_inside_the_window_keeps_the_bin_up():
+    """The choice is the MAXIMUM over the window, not the mean, so a single
+    short episode between two long ones cannot shrink the bin under them."""
+    p = ES.BinPolicy(19, history=4, margin=2.0)
+    p.record(300_000)
+    p.record(1_000)
+    p.record(1_000)
+    assert p.pick() == 20
+
+
+def test_the_window_and_the_margin_come_from_the_environment(monkeypatch):
+    monkeypatch.setenv(ES.HISTORY_ENV, "2")
+    monkeypatch.setenv(ES.MARGIN_ENV, "1.0")
+    p = ES.BinPolicy(19)
+    assert p.window == 2
+    assert p.margin == 1.0
+    p.record(300_000)
+    assert p.pick() == 19                  # 300 000 -> 2^19, no margin
+    p.record(1_000)
+    p.record(1_000)
+    assert p.pick() == 10                  # the long one fell out of 2
+
+
+def test_a_margin_below_one_is_refused_because_it_asks_for_an_overflow(monkeypatch):
+    monkeypatch.setenv(ES.MARGIN_ENV, "0.5")
+    with pytest.raises(ValueError) as exc:
+        ES.BinPolicy(19)
+    assert ES.MARGIN_ENV in str(exc.value)
+
+
+def test_a_history_window_below_one_episode_is_refused(monkeypatch):
+    monkeypatch.setenv(ES.HISTORY_ENV, "0")
+    with pytest.raises(ValueError):
+        ES.BinPolicy(19)
+
+
+def test_the_chosen_bin_never_passes_the_hard_cap(monkeypatch):
+    monkeypatch.setenv(ES.LOG2_MAX_ENV, "18")
+    p = ES.BinPolicy(17)
+    p.record(10_000_000)
+    assert p.pick() == 18
+
+
+@pytest.mark.parametrize("length,want", [
+    (0, 0), (1, 0), (2, 1), (3, 2), (4, 2), (5, 3), (1024, 10), (1025, 11),
+])
+def test_the_smallest_power_of_two_holding_a_length(length, want):
+    assert ES.log2_for_length(length) == want
+
 
 def test_growing_the_bin_adds_exactly_one_power_of_two():
     assert ES.grow(19) == 20
@@ -241,10 +331,11 @@ def test_growth_stops_at_the_hard_cap_with_a_raise(monkeypatch):
     assert ES.LOG2_MAX_ENV in str(exc.value)
 
 
-def test_the_driver_grows_the_bin_by_one_power_of_two_and_repeats_the_episode():
-    """The owner's rule end to end: catch, log one line, grow by one,
-    run the SAME episode again -- with the new bin."""
-    state = [19]
+def test_the_driver_repeats_an_overflowing_episode_one_bin_up_and_records_it():
+    """The overflow half of the ruling: log one line, re-run THAT episode at
+    the next larger bin, and record the length that overflowed so the next
+    episode's choice already knows about it."""
+    p = ES.BinPolicy(19, history=4, margin=2.0)
     seen, lines = [], []
 
     def episode(n):
@@ -254,22 +345,25 @@ def test_the_driver_grows_the_bin_by_one_power_of_two_and_repeats_the_episode():
                                            length=(1 << n) + 5, log2=n)
         return "done at %d" % n
 
-    out = ES.run_with_growth(state, "episode 3", episode, log=lines.append)
+    out = ES.run_episode(p, "episode 3", episode, log=lines.append)
 
     assert out == "done at 21"
-    # The episode ran again at each bin, in order, and only grew.
+    # The episode ran again at each bin, in order, and only went up.
     assert seen == [19, 20, 21]
-    assert state[0] == 21
     assert len(lines) == 2
     assert "2^19 -> 2^20" in lines[0] and "episode 3" in lines[0]
     assert "2^20 -> 2^21" in lines[1]
+    # Both overflowing lengths are in the history, so the NEXT episode does
+    # not start back at a bin that cannot hold them.
+    assert list(p.recent) == [(1 << 19) + 5, (1 << 20) + 5]
+    assert p.pick() == 22
 
 
 def test_the_driver_recognises_the_overflow_after_the_runtime_wrapped_it():
     """The raise happens inside a `jax.pure_callback`, so it comes back out
     through XLA and the runtime may wrap it in its own error class. The
-    growth path must not depend on that class surviving."""
-    state = [19]
+    repeat must not depend on that class surviving."""
+    p = ES.BinPolicy(19, history=4, margin=2.0)
     lines = []
 
     def episode(n):
@@ -282,18 +376,15 @@ def test_the_driver_recognises_the_overflow_after_the_runtime_wrapped_it():
                     from inner
         return "done"
 
-    assert ES.run_with_growth(state, "episode 1", episode,
-                              log=lines.append) == "done"
-    assert state[0] == 20
+    assert ES.run_episode(p, "episode 1", episode, log=lines.append) == "done"
     assert "2^19 -> 2^20" in lines[0]
 
 
 def test_the_driver_recognises_the_overflow_by_its_text_alone():
     """Last resort: neither the class nor the chain survived, only the
-    message. The marker is what the report then joins on."""
-    state = [19]
-    lines = []
-    calls = []
+    message. The marker is what the driver then joins on."""
+    p = ES.BinPolicy(19, history=4, margin=2.0)
+    calls, lines = [], []
 
     def episode(n):
         calls.append(n)
@@ -303,35 +394,32 @@ def test_the_driver_recognises_the_overflow_by_its_text_alone():
                 + ": environment 0 at step 2 would reach length 600000")
         return "done"
 
-    assert ES.run_with_growth(state, "episode 1", episode,
-                              log=lines.append) == "done"
+    assert ES.run_episode(p, "episode 1", episode, log=lines.append) == "done"
     assert calls == [19, 20]
-    assert state[0] == 20
 
 
 def test_the_driver_re_raises_anything_that_is_not_an_overflow():
-    """A growth loop that swallowed the wrong exception would retry a real
+    """A repeat loop that swallowed the wrong exception would retry a real
     bug until the cap and then report the cap instead of the bug."""
-    state = [19]
+    p = ES.BinPolicy(19, history=4, margin=2.0)
 
     def episode(_n):
         raise ValueError("something else entirely")
 
     with pytest.raises(ValueError):
-        ES.run_with_growth(state, "episode 1", episode, log=lambda _l: None)
-    assert state[0] == 19
+        ES.run_episode(p, "episode 1", episode, log=lambda _l: None)
 
 
 def test_the_driver_does_not_swallow_the_cap(monkeypatch):
     monkeypatch.setenv(ES.LOG2_MAX_ENV, "20")
-    state = [20]
+    p = ES.BinPolicy(20, history=4, margin=2.0)
 
     def episode(n):
         raise ES.EpisodeStreamOverflow(env_index=0, step=0,
                                        length=(1 << n) + 1, log2=n)
 
     with pytest.raises(ES.EpisodeStreamCapReached):
-        ES.run_with_growth(state, "episode 0", episode, log=lambda _l: None)
+        ES.run_episode(p, "episode 0", episode, log=lambda _l: None)
 
 
 # ------------------------------------------------------------- 4. the write
