@@ -542,9 +542,13 @@ def test_the_face_stream_span_holds_the_tokens_the_stored_window_used_to_hold():
     cursor, spans = 0, []
     for rec in records:
         total = int(np.sum(rec["f_cnt"]))
-        # The host's check, exactly as the rollout asks it, BEFORE the write.
-        _ES.check_cursors(np.asarray([cursor], np.int64),
-                          np.asarray([total], np.int64), rec["t"], n)
+        # The bin check, exactly as the rollout makes it: device arithmetic
+        # that hands back the write offset and an overflow FLAG, never a
+        # raise (review finding 2). Nothing here may overflow, so the flag
+        # is the assertion.
+        off, end, over = _ES.write_offset(cursor, total, n)
+        assert not bool(over), (rec["t"], int(end), n)
+        assert int(off) == cursor
         window = jnp.asarray(rec["f_dt"].astype(np.uint8))
         stream = _ep_stream_write(stream, cursor, window, total)
         spans.append((cursor, total))

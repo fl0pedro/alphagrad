@@ -186,45 +186,82 @@ def test_a_row_that_is_not_a_power_of_two_plus_the_tail_is_refused():
         ES.log2_of_row(ES.stream_tail(W), W)
 
 
-# ----------------------------------------------- 2. the host overflow check
+# --------------------------------------------- 2. the DEVICE overflow check
 
-def test_a_step_that_stays_inside_the_bin_returns_its_cursors_unchanged():
-    cur = np.asarray([0, 100, 7], np.int32)
-    cnt = np.asarray([10, 10, 10], np.int32)
-    out = ES.check_cursors(cur, cnt, 3, 8)          # bin 256
-    assert np.array_equal(np.asarray(out), cur)
+def test_a_step_that_stays_inside_the_bin_writes_at_its_own_cursor():
+    off, end, over = ES.write_offset(100, 10, 8)          # bin 256
+    assert int(off) == 100
+    assert int(end) == 110
+    assert not bool(over)
 
 
-def test_a_step_that_would_pass_the_bin_raises_before_the_write():
+def test_a_step_that_would_pass_the_bin_raises_the_flag_and_clamps_itself():
     """The check is on the END of the write, not its start: a cursor that
-    still fits but a delta that does not is exactly the overflow."""
-    with pytest.raises(ES.EpisodeStreamOverflow):
-        ES.check_cursors(np.asarray([250], np.int32),
-                         np.asarray([10], np.int32), 4, 8)
+    still fits but a delta that does not is exactly the overflow.
+
+    Nothing raises. The offset is CLAMPED to the bin, so the write still
+    lands inside the row -- the row has a full window of tail after the bin
+    -- and the flag is what the driver acts on.
+    """
+    off, end, over = ES.write_offset(250, 10, 8)
+    assert bool(over)
+    assert int(end) == 260
+    assert int(off) == 256              # clamped to the bin, inside the row
     # A write that lands EXACTLY on the bin is legal: the bin is a length.
-    ES.check_cursors(np.asarray([246], np.int32),
-                     np.asarray([10], np.int32), 4, 8)
+    off, end, over = ES.write_offset(246, 10, 8)
+    assert not bool(over)
+    assert int(off) == 246 and int(end) == 256
 
 
-def test_the_overflow_message_names_the_environment_the_step_the_length_and_the_bin():
-    with pytest.raises(ES.EpisodeStreamOverflow) as exc:
-        ES.check_cursors(np.asarray([0, 0, 250], np.int32),
-                         np.asarray([1, 1, 10], np.int32), 17, 8)
-    err = exc.value
-    assert err.env_index == 2          # the row, which IS the environment
-    assert err.step == 17
-    assert err.length == 260
-    assert err.log2 == 8
-    text = str(err)
+def test_the_carry_keeps_the_first_overflow_of_the_episode_not_the_last():
+    """The log line must name the step the episode actually went wrong at."""
+    seen_len = jnp.zeros((), jnp.int32)
+    seen_step = jnp.zeros((), jnp.int32)
+    # Step 3 overflows at 300, step 7 would overflow at 400.
+    seen_len, seen_step = ES.carry_overflow(
+        seen_len, seen_step, jnp.asarray(300, jnp.int32),
+        jnp.asarray(True), 3)
+    seen_len, seen_step = ES.carry_overflow(
+        seen_len, seen_step, jnp.asarray(400, jnp.int32),
+        jnp.asarray(True), 7)
+    assert int(seen_len) == 300
+    assert int(seen_step) == 3
+
+
+def test_no_overflow_leaves_the_carry_at_zero():
+    """Zero length IS the "nothing yet" sentinel: a real overflowing length
+    is above the bin, so it can never be zero."""
+    out_len, out_step = ES.carry_overflow(
+        jnp.zeros((), jnp.int32), jnp.zeros((), jnp.int32),
+        jnp.asarray(110, jnp.int32), jnp.asarray(False), 4)
+    assert int(out_len) == 0 and int(out_step) == 0
+
+
+def test_the_host_reads_the_flags_back_as_one_record_naming_all_four():
+    """The environment, the step, the length and the bin, from the two
+    per-environment arrays the rollout returns."""
+    over = ES.overflow_from(np.asarray([0, 0, 260], np.int32),
+                            np.asarray([0, 0, 17], np.int32), 8)
+    assert over is not None
+    assert over.env_index == 2         # the row, which IS the environment
+    assert over.step == 17
+    assert over.length == 260
+    assert over.log2 == 8
+    text = str(over)
     for fragment in ("environment 2", "step 17", "260", "2^8", "256",
                      ES.LOG2_ENV):
         assert fragment in text, (fragment, text)
 
 
-def test_the_check_refuses_a_cursor_and_count_pair_of_different_widths():
+def test_an_episode_that_did_not_overflow_reports_nothing():
+    assert ES.overflow_from(np.zeros((4,), np.int32),
+                            np.zeros((4,), np.int32), 8) is None
+
+
+def test_the_host_read_refuses_a_length_and_step_pair_of_different_widths():
     with pytest.raises(ValueError):
-        ES.check_cursors(np.zeros((3,), np.int32), np.zeros((2,), np.int32),
-                         0, 8)
+        ES.overflow_from(np.zeros((3,), np.int32), np.zeros((2,), np.int32),
+                         8)
 
 
 # ----------------------------------------- 3. the bin the driver CHOOSES
@@ -235,44 +272,67 @@ def test_the_bin_with_no_history_yet_is_the_first_bin():
     assert p.pick() == 19
 
 
-def test_the_bin_is_the_smallest_power_of_two_holding_the_history_times_the_margin():
-    """The selection rule, stated once and quoted by the flag help."""
-    p = ES.BinPolicy(19, history=4, margin=2.0)
+def test_the_bin_moves_up_at_once_when_the_history_no_longer_fits_it():
+    """UP IS IMMEDIATE. One episode that does not fit is enough, and the
+    move is one power of two."""
+    p = ES.BinPolicy(17, history=4, margin=2.0)
     p.record(100_000)
-    # 100 000 x 2 = 200 000; the smallest power of two at or above it is
-    # 2^18 = 262 144.
+    # 100 000 x 2 = 200 000, which does not fit 2^17 = 131 072.
     assert p.pick() == 18
-    for fragment in ("smallest power of two", ES.HISTORY_ENV, ES.MARGIN_ENV):
+    for fragment in ("UP", "DOWN", ES.HISTORY_ENV, ES.MARGIN_ENV):
         assert fragment in ES.SELECTION_RULE
+
+
+def test_the_bin_does_not_move_down_on_a_partial_history_window():
+    """THE HYSTERESIS (review finding 1). A run at the default first bin
+    used to fall five doublings off ONE toy episode, and every move is a
+    retrace and a recompile of the rollout, the loss and the optimiser.
+    Down needs the WHOLE window to agree."""
+    p = ES.BinPolicy(15, history=8, margin=2.0)
+    p.record(40)                    # a five-step toy graph
+    assert p.pick() == 15           # NOT 2^10
+    for _ in range(6):
+        p.record(40)
+    assert len(p.recent) == 7
+    assert p.pick() == 15           # still one episode short of the window
+    p.record(40)
+    assert p.pick() == 14           # the window is full: one step down
 
 
 def test_an_episode_history_that_shrinks_makes_the_driver_pick_the_smaller_bin():
     """THE POINT OF THE RULING. The bin is chosen, not only grown: a run
     whose deltas shrink drifts back DOWN, and the program for the smaller
-    bin is already compiled, so the switch costs nothing."""
+    bin is already compiled, so the switch costs nothing. It just takes one
+    episode per power of two instead of all of them at once."""
     p = ES.BinPolicy(19, history=3, margin=2.0)
     for _ in range(3):
         p.record(300_000)
     big = p.pick()
-    assert big == 20                       # 600 000 -> 2^20
+    assert big == 20                       # 600 000 -> 2^20, one step up
 
-    # Three shorter episodes push the long ones out of the window.
+    # Three shorter episodes push the long ones out of the window. The
+    # target is 2^16 (40 000), and the walk down is one power of two per
+    # episode with the window staying full.
     for _ in range(3):
         p.record(20_000)
-    small = p.pick()
-    assert small == 16                     # 40 000 -> 2^16
-    assert small < big
+    seen = [p.pick()]
+    for _ in range(6):
+        p.record(20_000)
+        seen.append(p.pick())
+    assert seen == [19, 18, 17, 16, 16, 16, 16]
+    assert seen[-1] < big
 
     # And it comes back up the moment a long episode reappears.
     p.record(300_000)
-    assert p.pick() == 20
+    assert p.pick() == 17
 
 
 def test_one_long_episode_inside_the_window_keeps_the_bin_up():
     """The choice is the MAXIMUM over the window, not the mean, so a single
     short episode between two long ones cannot shrink the bin under them."""
-    p = ES.BinPolicy(19, history=4, margin=2.0)
+    p = ES.BinPolicy(20, history=4, margin=2.0)
     p.record(300_000)
+    p.record(1_000)
     p.record(1_000)
     p.record(1_000)
     assert p.pick() == 20
@@ -288,7 +348,10 @@ def test_the_window_and_the_margin_come_from_the_environment(monkeypatch):
     assert p.pick() == 19                  # 300 000 -> 2^19, no margin
     p.record(1_000)
     p.record(1_000)
-    assert p.pick() == 10                  # the long one fell out of 2
+    # The long one fell out of the 2-episode window, so the target is 2^10,
+    # and the walk down is one power of two per episode.
+    assert [p.pick()] + [p.pick() for _ in range(9)] == [
+        18, 17, 16, 15, 14, 13, 12, 11, 10, 10]
 
 
 def test_a_margin_below_one_is_refused_because_it_asks_for_an_overflow(monkeypatch):
@@ -304,11 +367,16 @@ def test_a_history_window_below_one_episode_is_refused(monkeypatch):
         ES.BinPolicy(19)
 
 
-def test_the_chosen_bin_never_passes_the_hard_cap(monkeypatch):
+def test_a_history_that_asks_for_more_than_the_cap_raises_it_does_not_clamp(
+        monkeypatch):
+    """A silent clamp at the cap (review finding 8) only moved the failure
+    to the overflow that followed, and named the wrong cause in the log."""
     monkeypatch.setenv(ES.LOG2_MAX_ENV, "18")
     p = ES.BinPolicy(17)
     p.record(10_000_000)
-    assert p.pick() == 18
+    with pytest.raises(ES.EpisodeStreamCapReached) as exc:
+        p.pick()
+    assert ES.LOG2_MAX_ENV in str(exc.value)
 
 
 @pytest.mark.parametrize("length,want", [
@@ -334,16 +402,22 @@ def test_growth_stops_at_the_hard_cap_with_a_raise(monkeypatch):
 def test_the_driver_repeats_an_overflowing_episode_one_bin_up_and_records_it():
     """The overflow half of the ruling: log one line, re-run THAT episode at
     the next larger bin, and record the length that overflowed so the next
-    episode's choice already knows about it."""
+    episode's choice already knows about it.
+
+    The episode REPORTS the overflow, it does not raise it. That is review
+    finding 2: a raise inside a `pure_callback` does not survive XLA, so the
+    driver used to recognise it by a substring of a jaxlib message.
+    """
     p = ES.BinPolicy(19, history=4, margin=2.0)
     seen, lines = [], []
 
     def episode(n):
         seen.append(n)
         if n < 21:
-            raise ES.EpisodeStreamOverflow(env_index=1, step=7,
-                                           length=(1 << n) + 5, log2=n)
-        return "done at %d" % n
+            return ("attempt at %d" % n,
+                    ES.StreamOverflow(env_index=1, step=7,
+                                      length=(1 << n) + 5, log2=n))
+        return "done at %d" % n, None
 
     out = ES.run_episode(p, "episode 3", episode, log=lines.append)
 
@@ -351,12 +425,56 @@ def test_the_driver_repeats_an_overflowing_episode_one_bin_up_and_records_it():
     # The episode ran again at each bin, in order, and only went up.
     assert seen == [19, 20, 21]
     assert len(lines) == 2
+    # ONE line, and it names the old bin, the new bin, the episode, the
+    # environment and the length.
+    for line in lines:
+        assert "\n" not in line
     assert "2^19 -> 2^20" in lines[0] and "episode 3" in lines[0]
+    assert "environment 1" in lines[0]
+    assert str((1 << 19) + 5) in lines[0]
     assert "2^20 -> 2^21" in lines[1]
     # Both overflowing lengths are in the history, so the NEXT episode does
     # not start back at a bin that cannot hold them.
     assert list(p.recent) == [(1 << 19) + 5, (1 << 20) + 5]
     assert p.pick() == 22
+
+
+def test_the_repeat_goes_straight_to_the_bin_the_overflowing_length_needs():
+    """One repeat, not one repeat per doubling. The length that overflowed
+    is a MEASUREMENT, so the bump uses it; only the per-episode drift is
+    limited to one power of two."""
+    p = ES.BinPolicy(10, history=4, margin=2.0)
+    seen = []
+
+    def episode(n):
+        seen.append(n)
+        if n < 16:
+            return None, ES.StreamOverflow(env_index=0, step=1,
+                                           length=40_000, log2=n)
+        return "done", None
+
+    assert ES.run_episode(p, "episode 0", episode,
+                          log=lambda _l: None) == "done"
+    # 40 000 needs 2^16, so the repeat goes there in ONE step.
+    assert seen == [10, 16]
+
+
+def test_the_driver_hands_the_discarded_attempt_to_the_caller():
+    """Review finding 5: a discarded attempt advanced host-side counters,
+    and the caller is the only one that can roll them back."""
+    p = ES.BinPolicy(19, history=4, margin=2.0)
+    discarded = []
+
+    def episode(n):
+        if n == 19:
+            return "attempt", ES.StreamOverflow(env_index=0, step=1,
+                                                length=(1 << 19) + 1,
+                                                log2=n)
+        return "done", None
+
+    assert ES.run_episode(p, "episode 0", episode, log=lambda _l: None,
+                          on_discard=discarded.append) == "done"
+    assert discarded == ["attempt"]
 
 
 def test_the_driver_logs_one_line_when_the_bin_moves_without_an_overflow():
@@ -367,67 +485,38 @@ def test_the_driver_logs_one_line_when_the_bin_moves_without_an_overflow():
     lines = []
 
     def episode(n):
-        return n
+        return n, None
 
     # First episode: no previous bin, so nothing to report.
     assert ES.run_episode(p, "episode 0", episode, log=lines.append) == 19
     assert lines == []
 
-    # Two short episodes push the bin down, and that is one line.
+    # Two short episodes fill the window and the bin steps down, and that is
+    # one line.
     p.record(1_000)
     p.record(1_000)
-    assert ES.run_episode(p, "episode 1", episode, log=lines.append) == 11
+    assert ES.run_episode(p, "episode 1", episode, log=lines.append) == 18
     assert len(lines) == 1
-    assert "2^19 -> 2^11" in lines[0] and "episode 1" in lines[0]
+    assert "2^19 -> 2^18" in lines[0] and "episode 1" in lines[0]
 
-    # A bin that does not move says nothing.
+    # A bin that does not move says nothing. 1000 x 2 = 2000 needs 2^11, so
+    # the walk down stops there; what is pinned here is that a step which
+    # does not move the bin is silent.
+    for _ in range(9):
+        p.record(1_000)
+        ES.run_episode(p, "episode n", episode, log=lines.append)
+    assert p.log2 == 11
+    assert len(lines) == 8              # 2^19 -> 2^18, then seven more
     p.record(1_000)
-    assert ES.run_episode(p, "episode 2", episode, log=lines.append) == 11
-    assert len(lines) == 1
+    assert ES.run_episode(p, "episode last", episode,
+                          log=lines.append) == 11
+    assert len(lines) == 8
 
 
-def test_the_driver_recognises_the_overflow_after_the_runtime_wrapped_it():
-    """The raise happens inside a `jax.pure_callback`, so it comes back out
-    through XLA and the runtime may wrap it in its own error class. The
-    repeat must not depend on that class surviving."""
-    p = ES.BinPolicy(19, history=4, margin=2.0)
-    lines = []
-
-    def episode(n):
-        if n == 19:
-            try:
-                raise ES.EpisodeStreamOverflow(env_index=0, step=2,
-                                               length=(1 << n) + 3, log2=n)
-            except ES.EpisodeStreamOverflow as inner:
-                raise RuntimeError("XlaRuntimeError: callback failed") \
-                    from inner
-        return "done"
-
-    assert ES.run_episode(p, "episode 1", episode, log=lines.append) == "done"
-    assert "2^19 -> 2^20" in lines[0]
-
-
-def test_the_driver_recognises_the_overflow_by_its_text_alone():
-    """Last resort: neither the class nor the chain survived, only the
-    message. The marker is what the driver then joins on."""
-    p = ES.BinPolicy(19, history=4, margin=2.0)
-    calls, lines = [], []
-
-    def episode(n):
-        calls.append(n)
-        if n == 19:
-            raise RuntimeError(
-                "jaxlib error: " + ES.OVERFLOW_MARKER
-                + ": environment 0 at step 2 would reach length 600000")
-        return "done"
-
-    assert ES.run_episode(p, "episode 1", episode, log=lines.append) == "done"
-    assert calls == [19, 20]
-
-
-def test_the_driver_re_raises_anything_that_is_not_an_overflow():
+def test_the_driver_does_not_catch_exceptions_at_all():
     """A repeat loop that swallowed the wrong exception would retry a real
-    bug until the cap and then report the cap instead of the bug."""
+    bug until the cap and then report the cap instead of the bug. There is
+    now no `except` in the driver, so nothing can be swallowed."""
     p = ES.BinPolicy(19, history=4, margin=2.0)
 
     def episode(_n):
@@ -442,7 +531,7 @@ def test_the_driver_does_not_swallow_the_cap(monkeypatch):
     p = ES.BinPolicy(20, history=4, margin=2.0)
 
     def episode(n):
-        raise ES.EpisodeStreamOverflow(env_index=0, step=0,
+        return None, ES.StreamOverflow(env_index=0, step=0,
                                        length=(1 << n) + 1, log2=n)
 
     with pytest.raises(ES.EpisodeStreamCapReached):
@@ -505,6 +594,233 @@ def test_the_write_masks_the_window_so_a_step_leaves_no_padding_behind():
     assert np.array_equal(row[3:8], np.full((5,), 7, np.uint8))
     assert not np.any(row[8:])
     assert not np.any(row[:3])
+
+
+# ------------------------------ 4b. the overflow, through the real machinery
+
+def _mini_rollout(counts, log2, window=64):
+    """THE ROLLOUT'S EPISODE-STREAM MACHINERY, and nothing else.
+
+    `ppo.rollout_fn` is a closure built inside `ppo.main` and cannot be
+    called on its own (`tests/one_stream_claim_test.py` explains that at
+    length). What IS reachable is the module-level helper its `step_fn`
+    calls, `ppo._ep_stream_step`, and the whole overflow mechanism is that
+    helper plus the scan carry. So this drives exactly that, under the same
+    `jax.vmap` over environments and `lax.scan` over steps the rollout uses,
+    with real counts. The end-to-end proof is the forced-overflow smoke on
+    the cluster; this is the part a unit test can hold.
+
+    Returns `(stream, cursor, overflow_length, overflow_step, offsets)`,
+    each with a leading environment axis, exactly as the rollout returns
+    them.
+    """
+    import jax
+    from jax import lax
+
+    from alphagrad.approx.ppo import _ep_stream_step
+
+    cnt = np.asarray(counts, np.int32)                 # (E, T)
+    n_env, n_step = cnt.shape
+    rng = np.random.RandomState(5)
+    toks = np.zeros((n_env, n_step, window), np.uint8)
+    for e in range(n_env):
+        for t in range(n_step):
+            toks[e, t, :cnt[e, t]] = rng.randint(
+                1, 250, size=int(cnt[e, t])).astype(np.uint8)
+    length = ES.stream_length(log2, window)
+
+    def one_env(tokens, counts_e):
+        def step(carry, xs):
+            stream, cur, ovl, ovs, t = carry
+            tok, c = xs
+            stream, off, cur, ovl, ovs = _ep_stream_step(
+                stream, cur, tok, c, t, log2, ovl, ovs)
+            return (stream, cur, ovl, ovs, t + 1), off
+
+        init = (jnp.zeros((length,), jnp.uint8),) + (
+            jnp.zeros((), jnp.int32),) * 4
+        (stream, cur, ovl, ovs, _t), offs = lax.scan(
+            step, init, (tokens, counts_e))
+        return stream, cur, ovl, ovs, offs
+
+    out = jax.vmap(one_env)(jnp.asarray(toks), jnp.asarray(cnt))
+    return out + (toks, cnt)
+
+
+def test_an_overflowing_rollout_reports_a_flag_and_the_driver_repeats_it():
+    """THE REPLACEMENT FOR THE `__cause__` TEST (review finding 2).
+
+    Nothing raises anywhere. The rollout runs to the END with a flag in its
+    carry, the host reads the flag afterwards, and the driver records the
+    length, logs ONE line and repeats the episode one bin up. The old test
+    built a `__cause__` chain the runtime never produced.
+    """
+    W = 64
+    # Environment 1 reaches 300 slots, past the 256-slot bin, at step 4.
+    counts = [[40, 40, 40, 40, 40],
+              [60, 60, 60, 60, 60]]
+    policy = ES.BinPolicy(8, history=4, margin=2.0)
+    seen, lines, discarded = [], [], []
+
+    def attempt(n):
+        seen.append(n)
+        out = _mini_rollout(counts, n, window=W)
+        return out, ES.overflow_from(out[2], out[3], n)
+
+    result = ES.run_episode(policy, "episode 0", attempt, log=lines.append,
+                            on_discard=lambda r: discarded.append(r))
+
+    # THE REPEAT. 300 needs 2^9, so one repeat, not one per doubling.
+    assert seen == [8, 9]
+    assert len(discarded) == 1
+
+    # THE ONE LINE, naming the old bin, the new bin, the episode, the
+    # environment and the length.
+    assert len(lines) == 1
+    assert "\n" not in lines[0]
+    for fragment in ("2^8 -> 2^9", "episode 0", "environment 1", "300"):
+        assert fragment in lines[0], (fragment, lines[0])
+
+    # THE RECORDED LENGTH is the one that overflowed, so the next episode's
+    # choice already knows about it.
+    assert list(policy.recent) == [300]
+
+    # THE DISCARDED ATTEMPT stayed inside its row -- the write offset is
+    # clamped to the bin, and the row has a full window of tail after it --
+    # so nothing was corrupted outside the attempt that was thrown away.
+    d_stream, d_cur, d_ovl, d_ovs = discarded[0][:4]
+    assert d_stream.shape == (2, ES.stream_length(8, W))
+    assert int(d_ovl[0]) == 0 and int(d_ovl[1]) == 300
+    assert int(d_ovs[1]) == 4
+    assert int(d_cur[1]) == 300
+
+    # THE TRAJECTORY THAT IS ACTUALLY USED is the repeat's, rebuilt whole at
+    # the larger bin, and it is the deltas concatenated byte for byte.
+    stream, cursor, ovl, ovs, offs, toks, cnt = result
+    assert stream.shape == (2, ES.stream_length(9, W))
+    assert not np.any(np.asarray(ovl))
+    assert not np.any(np.asarray(ovs))
+    assert [int(x) for x in np.asarray(cursor)] == [200, 300]
+    row = np.asarray(stream)
+    for e in range(2):
+        want = np.concatenate([toks[e, t, :cnt[e, t]]
+                               for t in range(cnt.shape[1])])
+        got = row[e, :int(cursor[e])]
+        assert np.array_equal(got, want), e
+        assert not np.any(row[e, int(cursor[e]):])
+        for t in range(cnt.shape[1]):
+            o = int(offs[e, t])
+            assert np.array_equal(row[e, o:o + cnt[e, t]],
+                                  toks[e, t, :cnt[e, t]])
+
+
+def test_a_rollout_that_fits_reports_no_overflow_and_never_repeats():
+    policy = ES.BinPolicy(8, history=4, margin=2.0)
+    seen, lines = [], []
+
+    def attempt(n):
+        seen.append(n)
+        out = _mini_rollout([[40, 40, 40]], n, window=64)
+        return out, ES.overflow_from(out[2], out[3], n)
+
+    ES.run_episode(policy, "episode 0", attempt, log=lines.append)
+    assert seen == [8]
+    assert lines == []
+
+
+def test_a_discarded_attempt_leaves_no_plan_records_or_terminals_behind():
+    """REVIEW FINDING 5. The device side of a discarded attempt vanishes on
+    its own; the host side does not. An overflow at a late step used to
+    DOUBLE-COUNT that episode's terminal plans, which is the artifact the
+    trustworthiness claims are built on.
+
+    After one overflow-and-repeat the plan log holds exactly ONE set of
+    terminal records for that episode, and they are the repeat's.
+    """
+    from alphagrad.approx import env as ENV
+
+    outer = ENV.episode_telemetry_snapshot()
+    try:
+        ENV._PLAN_RECORDS.clear()
+        ENV._PLAN_LOG_TERMINALS[0] = 0
+        ENV._TRUNCATED_PLANS[0] = 0
+
+        policy = ES.BinPolicy(8, history=4, margin=2.0)
+        held = {"attempt": 0}
+
+        def attempt(n):
+            # What the driver does at the top of every attempt.
+            held["snapshot"] = ENV.episode_telemetry_snapshot()
+            ENV.set_plan_log_attempt(held["attempt"])
+            # What one episode's env callbacks do to this module.
+            for e in range(3):
+                ENV._record_plan({"env_index": e, "bin": n})
+            ENV._PLAN_LOG_TERMINALS[0] += 3
+            ENV._TRUNCATED_PLANS[0] += 1
+            if n == 8:
+                return "attempt", ES.StreamOverflow(env_index=1, step=4,
+                                                    length=300, log2=n)
+            return "done", None
+
+        def discard(_result):
+            ENV.episode_telemetry_restore(held["snapshot"])
+            held["attempt"] += 1
+
+        assert ES.run_episode(policy, "episode 0", attempt,
+                              log=lambda _l: None,
+                              on_discard=discard) == "done"
+
+        drained = ENV.consume_plan_records()
+        assert drained["terminals"] == 3
+        assert len(drained["records"]) == 3
+        # And they are the REPEAT's records, not the discarded attempt's.
+        assert [r["bin"] for r in drained["records"]] == [9, 9, 9]
+        # Every record says WHICH attempt it came from, so two attempts at
+        # one episode are never two byte-identical records with nothing to
+        # tell them apart (verification jobs 65410 and 65413).
+        assert [r["attempt"] for r in drained["records"]] == [1, 1, 1]
+        assert ENV.consume_truncated_plan_count() == 1
+    finally:
+        ENV.episode_telemetry_restore(outer)
+        ENV.set_plan_log_attempt(0)
+
+
+def test_a_plan_record_says_which_attempt_at_the_episode_it_came_from():
+    """The stamp itself, without the driver around it."""
+    from alphagrad.approx import env as ENV
+
+    outer = ENV.episode_telemetry_snapshot()
+    try:
+        ENV._PLAN_RECORDS.clear()
+        ENV.set_plan_log_attempt(0)
+        ENV._record_plan({"what": "first try"})
+        assert ENV.plan_log_attempt() == 0
+        ENV.set_plan_log_attempt(2)
+        ENV._record_plan({"what": "third try"})
+        assert [r["attempt"] for r in ENV._PLAN_RECORDS] == [0, 2]
+        # The stamp is NOT rolled back by a restore: it has to keep counting
+        # across a discarded attempt, which is the one thing the rollback
+        # must not undo.
+        snap = ENV.episode_telemetry_snapshot()
+        ENV.set_plan_log_attempt(5)
+        ENV.episode_telemetry_restore(snap)
+        assert ENV.plan_log_attempt() == 5
+    finally:
+        ENV.episode_telemetry_restore(outer)
+        ENV.set_plan_log_attempt(0)
+
+
+def test_the_snapshot_names_only_containers_this_module_still_defines():
+    """A renamed accumulator that silently drops out of the snapshot is the
+    quiet gap the snapshot exists to close, so env.py refuses to import
+    with a stale name. This states the same thing from the outside."""
+    from alphagrad.approx import env as ENV
+
+    snap = ENV.episode_telemetry_snapshot()
+    assert set(snap) == set(ENV._EPISODE_TELEMETRY_NAMES)
+    assert "_PLAN_RECORDS" in snap and "_PLAN_LOG_TERMINALS" in snap
+    with pytest.raises(ValueError):
+        ENV.episode_telemetry_restore({"_PLAN_RECORDS": []})
 
 
 # -------------------------------------------------------------- 5. the read
