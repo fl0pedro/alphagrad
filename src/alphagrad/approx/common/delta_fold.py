@@ -113,7 +113,8 @@ def plan_chunks(window, chunk=None):
 
 
 def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
-                init_acc, fold_fn, budget=None, remat=None, parallel=None):
+                init_acc, fold_fn, budget=None, remat=None, parallel=None,
+                start=None, row=None):
     """Extend ``carry`` over ``window`` tokens, folding rows into an acc.
 
     ``fold_fn(acc, rows_c, valid_c, offset) -> acc`` sees one chunk at a time
@@ -131,13 +132,51 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
 
     Returns ``(new_carry, acc)``. NOTE the rows are never returned -- that is
     the point; a caller who needs them wants ``encode_extend``.
+
+    THE EPISODE STREAM (``start`` / ``row``). With neither, ``tokens`` is a
+    standalone ``(window,)`` buffer and the chunks are a reshape of it --
+    the historical path, untouched. With ``start``, ``tokens`` is the
+    EPISODE STREAM and chunk ``j`` is ``dynamic_slice(tokens, start + j*C,
+    C)``: no per-step window is materialised anywhere. ``row`` additionally
+    selects the environment when the stream arrives as ``(E, L)`` (the loss
+    holds every environment's row and each sample reads its own), which is
+    the same slice with one more leading index.
+
+    THE ROW MUST BE LONG ENOUGH FOR ``padded``, NOT ONLY FOR ``window``:
+    ``dynamic_slice`` CLAMPS an out-of-range start rather than raising, so a
+    short row returns shifted tokens in silence. ``episode_stream.
+    stream_tail`` sizes it; this is the reason that function exists.
     """
     C, nb, padded = plan_chunks(window, chunk)
     W = int(window)
-    pad = padded - W
-    if pad:
-        tokens = jnp.concatenate([tokens, jnp.zeros((pad,), tokens.dtype)])
-    b_tok = tokens[: nb * C].reshape(nb, C)
+    if start is None and row is None:
+        pad = padded - W
+        if pad:
+            tokens = jnp.concatenate(
+                [tokens, jnp.zeros((pad,), tokens.dtype)])
+        b_tok = tokens[: nb * C].reshape(nb, C)
+    else:
+        b_tok = None
+        _base = (jnp.zeros((), jnp.int32) if start is None
+                 else jnp.asarray(start, jnp.int32))
+        if row is None:
+            if tokens.ndim != 1:
+                raise ValueError(
+                    "extend_fold: start= reads a 1-D stream, got shape "
+                    f"{tokens.shape}; pass row= for an (E, L) stream")
+
+            def _chunk_tokens(off):
+                return lax.dynamic_slice(tokens, (_base + off,), (C,))
+        else:
+            if tokens.ndim != 2:
+                raise ValueError(
+                    "extend_fold: row= reads an (E, L) stream, got shape "
+                    f"{tokens.shape}")
+            _row = jnp.asarray(row, jnp.int32)
+
+            def _chunk_tokens(off):
+                return lax.dynamic_slice(
+                    tokens, (_row, _base + off), (1, C)).reshape(C)
     cnt = jnp.asarray(count, jnp.int32)
 
     # DYNAMIC TRIP COUNT, same reasoning as _extend_sequential's budget form.
@@ -163,8 +202,13 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
             nb).astype(jnp.int32)
 
     def _body(state, xs):
-        i, tk = xs
-        off = i * C
+        if b_tok is None:
+            i = xs
+            off = i * C
+            tk = _chunk_tokens(off)
+        else:
+            i, tk = xs
+            off = i * C
         # Tokens remaining once this chunk starts, clipped into [0, C]. A
         # chunk beyond the delta gets 0 and contributes nothing.
         c_cnt = jnp.clip(cnt - off, 0, C)
@@ -182,9 +226,9 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
     use_remat = (os.environ.get("ALPHAGRAD_FOLD_REMAT", "1") != "0"
                  if remat is None else bool(remat))
     body = jax.checkpoint(_body) if use_remat else _body
-    (enc_f, acc_f), _ = lax.scan(
-        body, (carry, init_acc),
-        (jnp.arange(nb, dtype=jnp.int32), b_tok))
+    _xs = (jnp.arange(nb, dtype=jnp.int32) if b_tok is None
+           else (jnp.arange(nb, dtype=jnp.int32), b_tok))
+    (enc_f, acc_f), _ = lax.scan(body, (carry, init_acc), _xs)
     return enc_f, acc_f
 
 

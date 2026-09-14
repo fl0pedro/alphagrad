@@ -159,10 +159,57 @@ from alphagrad.approx.common import delta_fold as _fold
 from alphagrad.approx.common import feature_probe as _fprobe
 from alphagrad.approx.common import var_probe as _vprobe
 from alphagrad.approx.common import gate_telemetry as _gate_telemetry
+from alphagrad.approx.common import episode_stream as _epstream
+from alphagrad.approx.common.episode_stream import EpisodeStreamOverflow
 
 # Same switch carry_stream reads, so one flag turns the whole fold on or
 # off rather than leaving half the consumers folded and half not.
 _FOLD_DELTA = os.environ.get("ALPHAGRAD_FOLD_DELTA", "1") != "0"
+
+
+def _ep_stream_offset(cursor, count, step, log2):
+    """The write offset for one step, AFTER the host has checked the bin.
+
+    A `pure_callback` and not a device predicate, because the contract is a
+    RAISE: the driver has to catch it, grow the bin and repeat the episode,
+    and nothing on the device can raise. `vmap_method="expand_dims"` hands
+    the host the whole environment batch in one call, rows in environment
+    order, so the row index IS the environment (the same convention
+    `env._batched_host` uses for `_ENV_SLOT`), and the cost is one host
+    round trip per STEP rather than one per environment per step.
+
+    THE RETURN VALUE IS THE POINT. The caller must use it as the write
+    offset: without that data dependency XLA is free to run the write
+    before the check, and `dynamic_update_slice` CLAMPS rather than
+    raising, so the overflow would land as silently shifted tokens.
+    """
+    return jax.pure_callback(
+        partial(_epstream.check_cursors, log2=int(log2)),
+        jax.ShapeDtypeStruct((), jnp.int32),
+        jnp.asarray(cursor, jnp.int32),
+        jnp.asarray(count, jnp.int32),
+        jnp.asarray(step, jnp.int32),
+        vmap_method="expand_dims",
+    )
+
+
+def _ep_stream_write(stream, offset, tokens, count):
+    """Write one step's window into the episode stream at ``offset``.
+
+    ONE `dynamic_update_slice` OF THE WHOLE WINDOW, no branch on the count:
+    that is what the row's TAIL of `MAX_DELTA_TOKENS` spare slots buys (see
+    `common.episode_stream`). The window is masked to the count first so
+    that the stream holds the deltas CONCATENATED and nothing else -- the
+    slots past the count would otherwise carry this window's padding until
+    the next step overwrote them, which reads the same (every reader is
+    bounded by a count) but does not SAY the same.
+    """
+    W = tokens.shape[0]
+    live = jnp.arange(W, dtype=jnp.int32) < jnp.asarray(count, jnp.int32)
+    masked = jnp.where(live, tokens, jnp.zeros((), tokens.dtype))
+    return lax.dynamic_update_slice(
+        stream, masked.astype(stream.dtype),
+        (jnp.asarray(offset, jnp.int32),))
 from alphagrad.utils import entropy, explained_variance
 
 # ---------------------------------------------------------------------------
@@ -1782,15 +1829,24 @@ class Trajectory(NamedTuple):
     # already computes in `_carry_heads`. The token windows that used to sit
     # here were the storage that made any face width expensive.
     face_counts: jax.Array        # (MAX_FACES,) int32
-    # THIS step's emission (the current vertex's contractions + approx
-    # echoes) -- the NEXT state's delta, i.e. what the chosen elimination
-    # produced. Not the same buffer as `delta_tokens` below (that is the
-    # PREVIOUS step's delta, the one this step's carry consumes), and it is
-    # what the face chunks concatenate to -- the loss scans it once from the
-    # stored carry's continuation and pools between chunk boundaries.
-    # NARROW IDS: uint8 (env.DELTA_TOKEN_DTYPE). The parallel equation-id
-    # buffer that used to sit beside this one is GONE.
-    face_delta_tokens: jax.Array  # (MAX_DELTA_TOKENS,) uint8
+    # WHERE this step's face chunks sit in the environment's FACE EPISODE
+    # STREAM (`common.episode_stream`). The window that used to be stored
+    # here -- a (MAX_DELTA_TOKENS,) uint8 copy of what the head read before
+    # its decision -- is now one span of `ep_face_tokens`, and this is its
+    # first slot. The span's length is `sum(face_counts)`; nothing reads
+    # past it.
+    #
+    # WHY THE FACE STREAM IS A SECOND STREAM AND NOT A VIEW OF THE FIRST:
+    # the chunks are what the head read BEFORE deciding, so on a decided
+    # face they diverge from the next step's delta, which carries the
+    # decision's block instead (measured, job 65383; pinned by
+    # tests/one_stream_claim_test.py). Two streams, one bin.
+    face_offset: jax.Array        # () int32
+    # The environment this row belongs to -- the index into the two episode
+    # streams. Stored per step because the minibatch shuffle mixes steps of
+    # different environments (`shuffle_and_batch`), so a sample must carry
+    # its own stream row with it.
+    env_index: jax.Array          # () int32
     # Phase 3b incremental encode (mandatory since stage 2). The PRE-step
     # encoder carry + vertex memory, and the delta's owner vertex —
     # everything the loss needs to re-derive this step's encoding by
@@ -1800,14 +1856,17 @@ class Trajectory(NamedTuple):
     enc_pos: jax.Array      # () int32
     vmem_sums: jax.Array    # (V+1, E)
     vmem_counts: jax.Array  # (V+1,)
-    # THIS step's delta, straight off the env, as a standalone buffer read
-    # from 0 plus its EXACT length -- the same shape the face stream stores.
-    # This IS the observation: there is no episode-wide token buffer any
-    # more, and no absolute cursor with which to index one.
-    # NARROW IDS: uint8 (env.DELTA_TOKEN_DTYPE). The count is its own int32
-    # -- it does NOT ride in slot 0 of the buffer any more, because
-    # MAX_DELTA_TOKENS does not fit in a byte.
-    delta_tokens: jax.Array   # (MAX_DELTA_TOKENS,) uint8
+    # WHERE this step's delta sits in the environment's EPISODE STREAM
+    # (`common.episode_stream`), plus its EXACT length. The per-step window
+    # that used to be stored here -- (MAX_DELTA_TOKENS,) uint8, about 90
+    # percent padding -- is now one span of `ep_tokens`, and the loss reads
+    # chunk j of it as `dynamic_slice(ep_tokens[e], delta_offset + j*C, C)`
+    # without materialising any window (owner ruling Q3).
+    # The stream is per ENVIRONMENT and per episode, so it is not a
+    # Trajectory leaf: `rollout_fn` returns it beside the trajectory.
+    # The count is its own int32 -- it does NOT ride in slot 0 of the
+    # buffer, because MAX_DELTA_TOKENS does not fit in a byte.
+    delta_offset: jax.Array   # () int32
     delta_count: jax.Array    # () int32
     delta_owner: jax.Array  # () int32 — vertex whose elimination emitted the delta
     # The slots that delta TOUCHES (vertex + its faces' endpoints), 0/1 over
@@ -1905,7 +1964,14 @@ class TrainBatch(NamedTuple):
     face_endpoints: jax.Array
     face_old_logp: jax.Array
     face_counts: jax.Array
-    face_delta_tokens: jax.Array
+    # Per-step SPANS into the two episode streams, not windows -- see
+    # Trajectory. The streams themselves are NOT in this batch: they are
+    # per-environment, the shuffle below is per (env, step) sample, and
+    # `_FULL_SCAN`'s reshape would fold a stream row into the sample axis.
+    # They are handed to the loss as their own argument and indexed by
+    # `env_index`.
+    face_offset: jax.Array
+    env_index: jax.Array
     enc_M: jax.Array
     enc_I: jax.Array
     enc_pos: jax.Array
@@ -1914,7 +1980,14 @@ class TrainBatch(NamedTuple):
     # WINDOWED (leading K axis, --grad-window; K=1 is the historical single
     # delta): the last K step deltas ending at THIS step, oldest first. The
     # enc_*/vmem_* above are the carry at the OLDEST of them.
-    delta_tokens: jax.Array        # (K, MAX_DELTA_TOKENS) uint8
+    # THE K DELTAS ARE ONE CONTIGUOUS SPAN of the episode stream -- it
+    # starts at `delta_offset[0]` and runs `sum(delta_count)` tokens -- so
+    # the gather that used to materialise every window K times is now K
+    # offsets. The loss still runs K separate `advance` calls, because each
+    # delta has its OWN owner and its OWN participation set; what went is
+    # the storage, not the arithmetic, which is why the result is
+    # bit-identical.
+    delta_offset: jax.Array        # (K,) int32
     delta_count: jax.Array         # (K,)
     delta_owner: jax.Array         # (K,)
     delta_participants: jax.Array  # (K, total_v + 1)
@@ -3642,8 +3715,14 @@ class Agent(eqx.Module):
         design's F scans over F stored windows. Gradient reaches palimpsa
         through this scan; truncation at the stored carry, as everywhere.
 
-        ``face_chunks`` is ``(counts (F,), tokens (W,))`` -- a PAIR since the
-        equation-id buffer was removed.
+        ``face_chunks`` is ``(counts (F,), stream (E, L), offset (), row
+        ())``: the per-face chunk lengths, the FACE EPISODE STREAM whole,
+        and this sample's span in it. The stored ``(W,)`` window it replaced
+        is now ``stream[row, offset : offset + sum(counts)]``, read chunk by
+        chunk with a ``dynamic_slice`` and never materialised. The stream
+        arrives whole, not sliced per sample, because the minibatch shuffle
+        is per (env, step) SAMPLE while the stream is per ENVIRONMENT --
+        ``row`` is what joins the two.
 
         ``face_bound`` / ``face_win_budget`` are the batch-wide (UNBATCHED,
         so the predicates stay real ``cond``s under the loss's vmap) bounds on
@@ -3654,7 +3733,7 @@ class Agent(eqx.Module):
         """
         pol = self.face_path_policy
         F = pol.max_faces
-        f_cnt, f_toks = face_chunks
+        f_cnt, f_stream, f_off, f_row = face_chunks
         if getattr(pol, "endpoint_read", False) and (
                 endpoint_rows is None or face_ends is None):
             raise ValueError(
@@ -3729,15 +3808,21 @@ class Agent(eqx.Module):
                 return (s_acc + s_c, c_acc + c_c)
 
             _, (_fs, _fc) = _fold.extend_fold(
-                self, enc_carry, f_toks, total,
+                self, enc_carry, f_stream, total,
                 window=MAX_DELTA_TOKENS,
                 init_acc=(jnp.zeros((F, self.embd_dim), jnp.float32),
                           jnp.zeros((F,), jnp.float32)),
-                fold_fn=_face_fold, budget=face_win_budget)
+                fold_fn=_face_fold, budget=face_win_budget,
+                start=f_off, row=f_row)
             face_latents = _fs / jnp.maximum(_fc, 1.0)[:, None]
         else:
+            # LEGACY, UNFOLDED BRANCH: `encode_extend` reads a standalone
+            # buffer, so this is the one place the face stream still cuts a
+            # window out -- exactly the window that used to be stored.
+            _f_toks = _carry_stream._stream_window(
+                f_stream, f_off, f_row, MAX_DELTA_TOKENS)
             _, rows, _valid = self.encode_extend(
-                enc_carry, f_toks, total,
+                enc_carry, _f_toks, total,
                 window=MAX_DELTA_TOKENS, start=0,
                 chunk=(None if face_win_budget is not None else 0),
                 budget=face_win_budget)
@@ -3879,7 +3964,7 @@ class Agent(eqx.Module):
         # trajectory stores it for `participation_mask` on the rollout side.
         face_ends=None,        # stored (F, 2) endpoint vertex ids (1-based)
         precomputed=None,      # 3b: (vertex_logits, vertex_contexts, value) from the carry path
-        face_chunks=None,      # (counts, emission tokens)
+        face_chunks=None,      # (counts, face stream, offset, stream row)
         face_carry=None,       # carry2: where the sampling side carry branched
         face_bound=None,       # batch-wide live-face bound (unbatched)
         face_win_budget=None,  # batch-wide emission-length bound (unbatched)
@@ -8357,10 +8442,68 @@ def main():
     def reset_envs(env_obj):
         return jax.vmap(lambda _: env_obj.reset())(jnp.arange(num_envs))
 
+    # The environment index each rollout row carries. Constant for the run,
+    # and the same order `env._batched_host` walks its slots in, so the row
+    # the overflow message names is the row the telemetry names.
+    _EP_ENV_IDX = jnp.arange(num_envs, dtype=jnp.int32)
+
+    def _episode_streams(log2):
+        """Two zeroed episode streams, one row per environment.
+
+        `2^log2 + TAIL` uint8 slots each (see `common.episode_stream`). They
+        are allocated here and passed in because the bin is a SHAPE: a new
+        bin is a new shape, and a new shape retraces `rollout_fn` by itself,
+        which is exactly what the growth path needs.
+        """
+        L = _epstream.stream_length(int(log2), MAX_DELTA_TOKENS)
+        return (jnp.zeros((num_envs, L), DELTA_TOKEN_DTYPE),
+                jnp.zeros((num_envs, L), DELTA_TOKEN_DTYPE))
+
+    # THE BIN, AND THE ONLY PLACE IT MOVES. Monotone within a run: it only
+    # ever grows, by one doubling, and only when an episode overflowed.
+    _EP_LOG2 = [_epstream.resolve_log2(MAX_DELTA_TOKENS, int(num_valid))]
+    print("[episode-stream] first bin 2^%d = %d slots per environment per "
+          "stream, %d-slot tail, %d bytes per row (rule: %s; override with "
+          "%s, cap %s=%d)"
+          % (_EP_LOG2[0], 1 << _EP_LOG2[0],
+             _epstream.stream_tail(MAX_DELTA_TOKENS),
+             _epstream.stream_length(_EP_LOG2[0], MAX_DELTA_TOKENS),
+             _epstream.FIRST_BIN_RULE, _epstream.LOG2_ENV,
+             _epstream.LOG2_MAX_ENV, _epstream.log2_max()), flush=True)
+
+    def _run_with_bin_growth(what, fn):
+        """Run ``fn(n)``; on an overflow grow the bin and REPEAT.
+
+        The owner's growth rule (Q1), in one place: catch the host's raise,
+        log one line with the old bin, the new bin and what overflowed,
+        recompile for `2^(n+1)` (a new bin is a new stream SHAPE, which
+        retraces `rollout_fn` by itself), and run the same episode again.
+        Nothing of the failed attempt survives -- the agent, the optimiser
+        state and the env states are only rebound on success -- so the
+        repeat starts from exactly the state the first attempt did.
+        """
+        while True:
+            try:
+                return fn(_EP_LOG2[0])
+            except EpisodeStreamOverflow as _ovf:
+                _old = _EP_LOG2[0]
+                _EP_LOG2[0] = _epstream.grow(_old)
+                print("[episode-stream] bin 2^%d -> 2^%d, repeating %s: %s"
+                      % (_old, _EP_LOG2[0], what, _ovf), flush=True)
+
     @eqx.filter_jit
     # +1 entry for vertex_temperature (broadcast, not mapped): the PopArt
     # warm-start flattens the vertex pointer to ~uniform over legal vertices.
-    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None, 0, None, None, None))
+    # +2 for the two EPISODE STREAMS, mapped: one uint8 row per environment,
+    # `2^n + TAIL` slots (see `common.episode_stream`). They arrive as
+    # ARGUMENTS rather than being allocated in here because the bin `2^n`
+    # has to be a shape, and a shape that comes in through an argument
+    # retraces this jit by itself when the driver grows the bin.
+    # +1 for the environment's own index, mapped: the trajectory stores it
+    # per step so a shuffled minibatch sample can find its stream row.
+    @partial(jax.vmap,
+             in_axes=(None, None, None, 0, 0, None, 0, None, None, None,
+                      0, 0, 0))
     def rollout_fn(
         agent,
         env_obj,
@@ -8372,8 +8515,27 @@ def main():
         op_legality_override,
         pin_rules_to_exact_jax,
         vertex_temperature=None,
+        ep_tokens=None,
+        ep_face_tokens=None,
+        env_index=None,
     ):
         keys = jrand.split(key, rollout_length)
+
+        # THE BIN, read off the row that arrived (see the in_axes note).
+        # Both streams share it -- one bin, two streams.
+        if ep_tokens is None or ep_face_tokens is None or env_index is None:
+            raise ValueError(
+                "rollout_fn: the two episode streams and the environment "
+                "index are required arguments (the streams carry the bin "
+                "as their shape); pass `_episode_streams(...)` for both "
+                "streams and `jnp.arange(num_envs)` for the index.")
+        _EP_N = _epstream.log2_of_row(
+            int(ep_tokens.shape[0]), MAX_DELTA_TOKENS)
+        if int(ep_face_tokens.shape[0]) != int(ep_tokens.shape[0]):
+            raise ValueError(
+                "rollout_fn: the delta stream and the face stream must "
+                f"share one bin, got {ep_tokens.shape[0]} and "
+                f"{ep_face_tokens.shape[0]} slots.")
 
         encode_key, scan_key = jrand.split(keys[0], 2)
 
@@ -8484,9 +8646,13 @@ def main():
 
         def step_fn(carry, k):
             if _EDGE_MEM:
-                state, elim_order, enc_state, prev_part, prev_wr = carry
+                (state, elim_order, enc_state, prev_part, prev_wr,
+                 ep_state) = carry
             else:
-                state, elim_order, enc_state, prev_part = carry
+                state, elim_order, enc_state, prev_part, ep_state = carry
+            # The two episode streams and their two cursors, one pair per
+            # environment (this whole function is under `jax.vmap`).
+            ep_tok_c, ep_cur_c, ep_ftok_c, ep_fcur_c = ep_state
             sample_key, next_net_key = jrand.split(k, 2)
             vertex_avail_mask = vertex_avail_at_step(
                 state, vertex_valid_static, total_v, num_valid,
@@ -8516,6 +8682,17 @@ def main():
             ).astype(jnp.int32)
             delta_tok = state.delta_tokens
             delta_count = state.delta_count
+            # THE EPISODE STREAM WRITE. The host is asked for the offset
+            # first -- that call raises if this step would pass the bin, and
+            # its RESULT is the offset, so the raise is strictly before the
+            # write (see `_ep_stream_offset`). The cursor then advances by
+            # the EXACT count, so the stream holds the episode's deltas
+            # concatenated in step order with nothing between them.
+            delta_offset = _ep_stream_offset(
+                ep_cur_c, delta_count, state.step_count, _EP_N)
+            ep_tok_c = _ep_stream_write(
+                ep_tok_c, delta_offset, delta_tok, delta_count)
+            ep_cur_n = ep_cur_c + jnp.asarray(delta_count, jnp.int32)
             # prof/envcb: scan glue (avail mask, key split, the delta unpack
             # above). Under the partial mark anchor this key used to absorb
             # the WHOLE env callback -- `prof/envstep` fired on EnvState's
@@ -8887,7 +9064,7 @@ def main():
                 vmem_sums=vmem_s, vmem_counts=vmem_c,
                 delta_owner=delta_owner,
                 delta_participants=prev_part,
-                delta_tokens=delta_tok,
+                delta_offset=delta_offset,
                 delta_count=jnp.asarray(delta_count, jnp.int32),
             )
 
@@ -8944,6 +9121,19 @@ def main():
                 _fr_fields = dict(_fr_fields, face_sizes=face_sizes_v,
                                   face_quant=pack_mask_bits(face_quant_v,
                                                             _FM_QUANT_SHAPE))
+            # THE FACE STREAM WRITE, the second stream on the same bin. Its
+            # span is `sum(face_counts)` -- the chunks the head actually
+            # read -- and NOT the emission window's full length: the last
+            # live face's approximation tail is in the emission and in no
+            # chunk, and no reader of this stream wants it.
+            _face_total = jnp.sum(
+                face_cnt_v.astype(jnp.int32)).astype(jnp.int32)
+            face_offset = _ep_stream_offset(
+                ep_fcur_c, _face_total, state.step_count, _EP_N)
+            ep_ftok_c = _ep_stream_write(
+                ep_ftok_c, face_offset, face_dt_v, _face_total)
+            ep_fcur_n = ep_fcur_c + _face_total
+            ep_state_next = (ep_tok_c, ep_cur_n, ep_ftok_c, ep_fcur_n)
             transition = Trajectory(
                 preference=preference.astype(jnp.float32),
                 vertex_idx=jnp.asarray(vertex_idx, dtype=jnp.int32),
@@ -8987,7 +9177,8 @@ def main():
                 face_endpoints=face_ends_v,
                 face_old_logp=jnp.asarray(face_old_logp, jnp.float32),
                 face_counts=face_cnt_v,
-                face_delta_tokens=face_dt_v,
+                face_offset=face_offset,
+                env_index=jnp.asarray(env_index, jnp.int32),
                 **_enc_fields,
                 **_probe_fields,
                 **_vp_fields,
@@ -9007,24 +9198,34 @@ def main():
                            jnp.sum(face_valid_v > 0.5).astype(jnp.int32))
                 return (
                     (next_state, elim_order, next_enc_state, step_part,
-                     next_wr),
+                     next_wr, ep_state_next),
                     (transition, raw_rewards),
                 )
             return (
-                (next_state, elim_order, next_enc_state, step_part),
+                (next_state, elim_order, next_enc_state, step_part,
+                 ep_state_next),
                 (transition, raw_rewards),
             )
 
+        # The two streams and their two cursors ride LAST in the scan carry,
+        # so a step's write is visible to the next step's cursor without any
+        # of the per-step trajectory leaves growing.
+        _ep_init = (ep_tokens, jnp.zeros((), jnp.int32),
+                    ep_face_tokens, jnp.zeros((), jnp.int32))
         _scan_init = (env_state, jnp.zeros((total_v,), dtype=jnp.int32),
                       init_enc_state, _init_part)
         if _EDGE_MEM:
             _scan_init = _scan_init + (_init_wr,)
-        (final_state, *_rest), (traj, all_raw_rewards) = lax.scan(
+        _scan_init = _scan_init + (_ep_init,)
+        _carry_out, (traj, all_raw_rewards) = lax.scan(
             step_fn,
             _scan_init,
             keys,
         )
-        return final_state, traj, all_raw_rewards[-1]
+        final_state = _carry_out[0]
+        _ep_final = _carry_out[-1]
+        return (final_state, traj, all_raw_rewards[-1],
+                _ep_final[0], _ep_final[2])
 
     def loss_fn(
         agent,
@@ -9033,6 +9234,7 @@ def main():
         pin_rules_to_exact_jax,
         op_legality_override,
         kl_ref_coef=None,
+        ep_streams=None,
     ):
         # Dynamic-substeps path branches off here so the legacy path
         # stays exactly as written. `_dynamic_loss_fn` lives below and
@@ -9042,11 +9244,12 @@ def main():
         # the JAX-traced arg is ignored there.)
         if args.dynamic_substeps:
             return _dynamic_loss_fn(
-                agent, batch, key, op_legality_override, kl_ref_coef
+                agent, batch, key, op_legality_override, kl_ref_coef,
+                ep_streams,
             )
     def _dynamic_loss_fn(
         agent, batch: TrainBatch, key, op_legality_override,
-        kl_ref_coef=None,
+        kl_ref_coef=None, ep_streams=None,
     ):
         """Dynamic-substeps loss: routes through MicroActionPolicy.evaluate.
 
@@ -9064,6 +9267,25 @@ def main():
         pref_or_none = (
             (lambda p: p) if args.preference_conditioned else (lambda _: None)
         )
+
+        # THE TWO EPISODE STREAMS, whole: `(num_envs, 2^n + TAIL)` uint8
+        # each. They are NOT batch leaves, on purpose. `shuffle_and_batch`
+        # (the default, K != 0) permutes (env, step) SAMPLES and would
+        # reshape a per-environment row into the sample axis; `_FULL_SCAN`'s
+        # flatten below would do the same. So they arrive unshuffled and
+        # every sample finds its own row through `batch.env_index`, which
+        # IS a per-step leaf and therefore rides through both shuffles.
+        if ep_streams is None:
+            raise ValueError(
+                "_dynamic_loss_fn: the two episode streams are required "
+                "(the batch carries offsets into them, not token windows); "
+                "pass ep_streams=(ep_tokens, ep_face_tokens).")
+        _ep_tok, _ep_ftok = ep_streams
+        if _ep_tok.ndim != 2 or _ep_ftok.ndim != 2:
+            raise ValueError(
+                "_dynamic_loss_fn: the episode streams must be "
+                f"(num_envs, length), got {_ep_tok.shape} and "
+                f"{_ep_ftok.shape}")
 
         # --grad-window 0: THE FULL-HORIZON PATH. The minibatch arrives as
         # whole TRAJECTORIES, `(envs_per_mb, T, ...)`, because a scan needs a
@@ -9232,11 +9454,18 @@ def main():
         _base_carry = _init0[0]
         _base_mem = _init0[1:]
 
-        def _advance_k(carry2, vs2, vc2, dtok_k, dcnt_k, own_k,
-                       part_k):
+        def _advance_k(carry2, vs2, vc2, doff_k, dcnt_k, own_k,
+                       part_k, eidx):
             return _carry_stream.advance(
                 agent, carry2, vs2, vc2,
-                dtok_k, dcnt_k, own_k,
+                _ep_tok, dcnt_k, own_k,
+                # THE READ IS THE WHOLE CHANGE (owner ruling Q3): chunk j is
+                # `dynamic_slice(ep_tokens[e], delta_offset + j*C, C)` and no
+                # per-step window is materialised anywhere on this path. The
+                # tokens the encode sees are the same bytes the stored window
+                # held, in the same order, with the same count bounding them
+                # -- so the arithmetic is bit-identical to the window form.
+                start=doff_k, row=eidx,
                 window=MAX_DELTA_TOKENS, participants=part_k,
                 # The loss is reverse-differentiated through this extend,
                 # so it cannot use the rollout's while_loop -- it passes
@@ -9271,8 +9500,8 @@ def main():
             else _advance_k
         )
 
-        def _advance_k_edge(carry2, vs2, vc2, dtok_k, dcnt_k, own_k,
-                            part_k, es, ec, eids):
+        def _advance_k_edge(carry2, vs2, vc2, doff_k, dcnt_k, own_k,
+                            part_k, eidx, es, ec, eids):
             # `_advance_k` + the --face-edge-mem write, in the SAME fold
             # (advance's edge_mem arm) -- so the loss re-derives the edge
             # memory the rollout read, bitwise, and gradient flows through
@@ -9280,7 +9509,8 @@ def main():
             # scatter.
             return _carry_stream.advance(
                 agent, carry2, vs2, vc2,
-                dtok_k, dcnt_k, own_k,
+                _ep_tok, dcnt_k, own_k,
+                start=doff_k, row=eidx,
                 window=MAX_DELTA_TOKENS, participants=part_k,
                 chunk=None, budget=_delta_budget,
                 edge_mem=(es, ec), edge_ids=eids,
@@ -9293,7 +9523,7 @@ def main():
         )
 
         def _carry_heads(M, I, pos, owner, part, vs, vc,
-                         pref, dtok, dcnt, *em):
+                         pref, doff, dcnt, eidx, *em):
             carry2 = EncCarry(M=M, I=I, pos=pos)
             vs2, vc2 = vs, vc
             if _EDGE_MEM:
@@ -9307,27 +9537,28 @@ def main():
             # no window from anything, so there is no length to get wrong.
             # PYTHON loop, not a scan: K is static, and at K=1 this is
             # literally the single call it replaced -- same ops, same order,
-            # bit-identical.
-            for _k in range(dtok.shape[0]):
+            # bit-identical. The K deltas are one contiguous span of this
+            # sample's stream row; each iteration reads its own sub-span.
+            for _k in range(doff.shape[0]):
                 if _EDGE_MEM:
                     _eids = _edge_write_ids(
                         _wrc[_k], _wrh[_k], _wrs[_k], _wrn[_k], dcnt[_k],
                         MAX_DELTA_TOKENS)
                     carry2, vs2, vc2, es2, ec2 = _advance_edge_step(
                         carry2, vs2, vc2,
-                        dtok[_k], dcnt[_k], owner[_k], part[_k],
+                        doff[_k], dcnt[_k], owner[_k], part[_k], eidx,
                         es2, ec2, _eids,
                     )
                 else:
                     carry2, vs2, vc2 = _advance_step(
                         carry2, vs2, vc2,
-                        dtok[_k], dcnt[_k], owner[_k], part[_k],
+                        doff[_k], dcnt[_k], owner[_k], part[_k], eidx,
                     )
             # carry2 is where the sampling side carry branched: the
             # stored pre-step carry advanced past the PREVIOUS delta.
             # The face replay continues from it over the stored emission
             # window. (The rows above are the previous delta's -- the
-            # WRONG tokens for face contexts; see face_delta_tokens.)
+            # WRONG tokens for face contexts; see Trajectory.face_offset.)
             _out = _carry_stream.heads(
                 agent, vs2, vc2,
                 base_mem=_base_mem,
@@ -9348,7 +9579,7 @@ def main():
                 _out = _out + (_vmem.read(es2, ec2),)
             return _out
 
-        def _episode_heads(dtok, dcnt, own, part, pref, *em):
+        def _episode_heads(doff, dcnt, own, part, pref, eidx, *em):
             """ONE episode, ONE `lax.scan`: gradient horizon T, not K.
 
             THE RECURRENCE IS ALREADY IN THE TRAJECTORY. The rollout carries
@@ -9382,16 +9613,16 @@ def main():
             def _body(state, x):
                 if _EDGE_MEM:
                     c2, s2, n2, es, ec = state
-                    _dt, _dc, _ow, _pa, _pr, _wc, _wh, _ws, _wn = x
+                    _do, _dc, _ow, _pa, _pr, _wc, _wh, _ws, _wn = x
                     _eids = _edge_write_ids(_wc, _wh, _ws, _wn, _dc,
                                             MAX_DELTA_TOKENS)
                     c2, s2, n2, es, ec = _advance_k_edge(
-                        c2, s2, n2, _dt, _dc, _ow, _pa, es, ec, _eids)
+                        c2, s2, n2, _do, _dc, _ow, _pa, eidx, es, ec, _eids)
                 else:
                     c2, s2, n2 = state
-                    _dt, _dc, _ow, _pa, _pr = x
+                    _do, _dc, _ow, _pa, _pr = x
                     c2, s2, n2 = _advance_k(
-                        c2, s2, n2, _dt, _dc, _ow, _pa)
+                        c2, s2, n2, _do, _dc, _ow, _pa, eidx)
                 # The heads run INSIDE the scan, off this step's POST memory:
                 # the K path's `heads` call, once per step, unchanged.
                 out = _carry_stream.heads(
@@ -9417,7 +9648,7 @@ def main():
             )
             _vs0, _vc0 = _carry_stream.zero_memory(total_v, args.embd_dim)
             _st0 = (_base_carry, _vs0, _vc0)
-            _xs = (dtok, dcnt, own, part, pref)
+            _xs = (doff, dcnt, own, part, pref)
             if _EDGE_MEM:
                 # The episode scan starts from an EMPTY edge memory (there
                 # is no anchor to read back: the whole point of grad-window
@@ -9434,10 +9665,10 @@ def main():
             # shape rather than leave the reader to infer it from the flag.
             # Trace time, so one line per compile and nothing per step.
             print("[grad-window 0] full-horizon scan: T=%d steps x %d "
-                  "envs/minibatch, delta window %d"
+                  "envs/minibatch, delta window %d, episode stream %d slots"
                   % (_ep_batch.delta_count.shape[1],
                      _ep_batch.delta_count.shape[0],
-                     _ep_batch.delta_tokens.shape[-1]), flush=True)
+                     MAX_DELTA_TOKENS, _ep_tok.shape[-1]), flush=True)
             # vmap over ENVS (the sequence axis is the scan's), then flatten
             # (env, step) so everything downstream sees the flat batch it
             # always has. The stored anchors -- enc_M / enc_I / enc_pos /
@@ -9447,9 +9678,12 @@ def main():
             _heads_out = jax.tree_util.tree_map(
                 lambda x: x.reshape(-1, *x.shape[2:]),
                 jax.vmap(_episode_heads)(
-                    _ep_batch.delta_tokens,
+                    _ep_batch.delta_offset,
                     _ep_batch.delta_count, _ep_batch.delta_owner,
                     _ep_batch.delta_participants, _ep_batch.preference,
+                    # One environment per scan, so its stream row is one
+                    # index -- constant along T, taken at step 0.
+                    _ep_batch.env_index[:, 0],
                     *((_ep_batch.delta_wr_cnt, _ep_batch.delta_wr_head,
                        _ep_batch.delta_wr_slot, _ep_batch.delta_wr_n)
                       if _EDGE_MEM else ()),
@@ -9461,7 +9695,7 @@ def main():
                 batch.delta_participants,
                 batch.vmem_sums, batch.vmem_counts,
                 batch.preference,
-                batch.delta_tokens, batch.delta_count,
+                batch.delta_offset, batch.delta_count, batch.env_index,
                 *((batch.emem_sums, batch.emem_counts,
                    batch.delta_wr_cnt, batch.delta_wr_head,
                    batch.delta_wr_slot, batch.delta_wr_n)
@@ -9502,17 +9736,19 @@ def main():
                 # [eprows?][emrows, eslots?][fheads?].
                 lambda pref, vidx, action, vmask, ax_st,
                 ax_vm, k, pv, cv, fa, fpv, fcv, fv, fen, pl, pc, pvl,
-                fct, fdt, fde, cy, *per:
+                fct, foff, eidx, cy, *per:
                 _eval_dyn(
                     pref, vidx, action, vmask, ax_st,
                     ax_vm, k, pv, cv, fa, fpv, fcv, fv, fen,
                     pc3=(pl, pc, pvl),
-                    # Chunk lengths + THIS step's emission window + the
-                    # branch-point carry: everything the behaviour
-                    # policy's face contexts were built from. Anything
-                    # else and the ratio is not 1.
-                    fch=((fct, fdt, fde) if _LIVE_FACES is not None
-                         else None),
+                    # Chunk lengths + the FACE EPISODE STREAM and this
+                    # step's span in it + the branch-point carry:
+                    # everything the behaviour policy's face contexts were
+                    # built from. Anything else and the ratio is not 1.
+                    # The stream is a CLOSURE value, so vmap leaves it
+                    # unbatched and each sample slices its own row.
+                    fch=((fct, _ep_ftok, foff, eidx)
+                         if _LIVE_FACES is not None else None),
                     fcy=(cy if _LIVE_FACES is not None else None),
                     fb=_face_bound,
                     fwb=_face_win_budget,
@@ -9546,7 +9782,8 @@ def main():
                 batch.face_endpoints,
                 pc_logits, pc_ctx, pc_value,
                 batch.face_counts,
-                batch.face_delta_tokens,
+                batch.face_offset,
+                batch.env_index,
                 pc_carry,
                 *((pc_eprows,) if _EP_READ else ()),
                 *((pc_emrows, batch.face_eslots) if _EDGE_MEM else ()),
@@ -9665,7 +9902,7 @@ def main():
         kl_ref_pen = jnp.zeros((), jnp.float32)
         if _KL_REF_ON:
             def _ref_face_logp(vidx, ax_st, ax_vm, fa, fpv, fcv, fv, fen,
-                               cy, fct, fdt, fde, *per):
+                               cy, fct, foff, eidx, *per):
                 """The face log-prob of the stored action under the FROZEN
                 reference, with the identical masks/carry/window the live
                 policy was just scored with -- anything else and the two
@@ -9674,7 +9911,7 @@ def main():
                 _feats = _axis_features_from_state(ax_st[vidx], ax_vm[vidx])
                 return _kl_ref_agent._face_replay(
                     _feats, factor_tables, fa, fpv, fcv, fv, cy,
-                    (fct, fdt, fde), op_legality_override,
+                    (fct, _ep_ftok, foff, eidx), op_legality_override,
                     face_bound=_face_bound,
                     face_win_budget=_face_win_budget,
                     endpoint_rows=(per[0] if _EP_READ else None),
@@ -9701,7 +9938,8 @@ def main():
                     batch.face_endpoints,
                     pc_carry,
                     batch.face_counts,
-                    batch.face_delta_tokens,
+                    batch.face_offset,
+                    batch.env_index,
                     *((pc_eprows,) if _EP_READ else ()),
                     *((pc_emrows, batch.face_eslots) if _EDGE_MEM else ()),
                     *((batch.face_heads,) if _FACE_HEADS else ()),
@@ -10123,6 +10361,7 @@ def main():
         vprobes,
         vprobe_opt_state,
         kl_ref_coef_arg,
+        ep_log2,
     ):
         subkey, key = jrand.split(key)
         rollout_key, key = jrand.split(key)
@@ -10135,7 +10374,9 @@ def main():
         # the curve isolates the ENCODER's drift rather than state drift).
         # See attention_entropy_diagnostic: representation diagnostic, not a
         # policy entropy.
-        env_states, traj, total_rewards_full = rollout_fn(
+        _ep_tok0, _ep_ftok0 = _episode_streams(ep_log2)
+        (env_states, traj, total_rewards_full,
+         ep_tokens, ep_face_tokens) = rollout_fn(
             agent,
             env_obj,
             num_valid,
@@ -10148,6 +10389,9 @@ def main():
             # vertex_temperature: None in training (the vmap in_axes tuple is
             # positional, so this must be passed explicitly).
             None,
+            _ep_tok0,
+            _ep_ftok0,
+            _EP_ENV_IDX,
         )
 
         # GAE on the (E, T, NUM_VALUE_HEADS) reward tensor.
@@ -10560,7 +10804,7 @@ def main():
         _T_steps = traj.delta_count.shape[1]
         _FULL_SCAN_EP = int(getattr(args, "grad_window", 1)) == 0
         if _FULL_SCAN_EP:
-            _w_dtok = traj.delta_tokens
+            _w_doff = traj.delta_offset
             _w_dcnt = traj.delta_count
             _w_down = traj.delta_owner
             _w_dpart = traj.delta_participants
@@ -10582,7 +10826,16 @@ def main():
             _w_idx = jnp.clip(_w_t, 0, _T_steps - 1)            # (T, K)
             _w_live = (_w_t >= 0)
             _w_anchor = _w_idx[:, 0]                            # (T,)
-            _w_dtok = traj.delta_tokens[:, _w_idx]
+            # THE K WINDOW IS K OFFSETS, NOT K WINDOWS. The gather that
+            # used to sit here, `traj.delta_tokens[:, _w_idx]`, materialised
+            # every (MAX_DELTA_TOKENS,) window K times -- (E, T, K, W) uint8.
+            # The K deltas are one contiguous span of the episode stream
+            # (it starts at `delta_offset[t-K+1]` and runs
+            # `sum(delta_count[t-K+1 .. t])` tokens), so the same indexing
+            # applied to the OFFSETS carries the same information at 4 bytes
+            # an entry. A clamped pre-episode entry keeps count 0 below,
+            # which makes its `advance` an exact no-op whatever its offset.
+            _w_doff = traj.delta_offset[:, _w_idx]
             _w_dcnt = jnp.where(_w_live[None], traj.delta_count[:, _w_idx], 0)
             _w_down = traj.delta_owner[:, _w_idx]
             _w_dpart = jnp.where(_w_live[None, ..., None],
@@ -10640,7 +10893,11 @@ def main():
             face_endpoints=traj.face_endpoints,
             face_old_logp=traj.face_old_logp,
             face_counts=traj.face_counts,
-            face_delta_tokens=traj.face_delta_tokens,
+            # Per-step SPANS into the two streams (see TrainBatch). Both
+            # ride as plain (num_envs, T) int32 leaves, so either shuffle
+            # slices them exactly as it slices `face_counts`.
+            face_offset=traj.face_offset,
+            env_index=traj.env_index,
             # --face-read: per-step, sliced by the same shuffle as
             # face_counts (both are (num_envs, T, MAX_FACES)); None when off.
             face_heads=traj.face_heads,
@@ -10653,7 +10910,7 @@ def main():
             enc_pos=_w_encp,
             vmem_sums=_w_vs,
             vmem_counts=_w_vc,
-            delta_tokens=_w_dtok,
+            delta_offset=_w_doff,
             delta_count=_w_dcnt,
             delta_owner=_w_down,
             delta_participants=_w_dpart,
@@ -10734,6 +10991,11 @@ def main():
                     # None when the trust region is off -- None is not a
                     # pytree leaf, so the trace is unchanged.
                     kl_ref_coef_arg,
+                    # The two episode streams, whole and unshuffled. Not
+                    # differentiated (filter_grad takes the gradient of the
+                    # FIRST argument only) and not sliced per minibatch:
+                    # every sample carries its own `env_index`.
+                    (ep_tokens, ep_face_tokens),
                 )
                 # `has_aux` carries the probe's read-only view of the
                 # representation alongside the metrics. filter_grad does not
@@ -13280,12 +13542,20 @@ def main():
             for _wi in range(int(args.popart_init_episodes)):
                 _wkey, key = jrand.split(key)
                 _wstates = reset_envs(env_episode)
-                _wend, _wtraj, _wtot = rollout_fn(
-                    agent, env_episode, num_valid, _wstates,
-                    jrand.split(_wkey, num_envs), base_mem,
-                    preferences_per_env, stage_override, stage_pin_rules,
-                    _wt,   # positional: vmap in_axes is a positional tuple
-                )
+                def _wroll(_n, _k=_wkey, _s=_wstates):
+                    _t0, _f0 = _episode_streams(_n)
+                    return rollout_fn(
+                        agent, env_episode, num_valid, _s,
+                        jrand.split(_k, num_envs), base_mem,
+                        preferences_per_env, stage_override,
+                        stage_pin_rules,
+                        _wt,  # positional: vmap in_axes is a positional tuple
+                        _t0, _f0, _EP_ENV_IDX,
+                    )
+                # A random warm-up plan can emit MORE than a learned one, so
+                # this is a growth site like the training episode is.
+                _wend, _wtraj, _wtot, _wst, _wsf = _run_with_bin_growth(
+                    "popart warm-up rollout %d" % _wi, _wroll)
                 _wr = _wtraj.reward                             # (E, T, R) raw
                 # Sentinel test on the RAW vector, identical to `_is_degen` in
                 # the loss. Testing it after symlog (as the old code did) can
@@ -13479,7 +13749,9 @@ def main():
             vprobes,
             vprobe_opt_state,
             vp_metrics,
-        ) = train_episode(
+        ) = _run_with_bin_growth(
+            "episode %d" % ep,
+            lambda _ep_n: train_episode(
             agent,
             opt_state,
             env_states,
@@ -13501,6 +13773,8 @@ def main():
             vprobes,
             vprobe_opt_state,
             _kl_ref_coef_arg,
+            _ep_n,
+            ),
         )
         if _xtr_on:
             # The trace has to stay open until the device is drained or the

@@ -215,10 +215,24 @@ def _credit_summary(sums, counts, rows, valid):
             counts.at[-1].add(jnp.sum(w)))
 
 
+def _stream_window(stream, start, row, window):
+    """Cut one step's ``window`` out of an episode stream.
+
+    Only the callers that cannot read chunk by chunk use this -- it is the
+    materialised window the episode stream exists to avoid.
+    """
+    s = jnp.asarray(start, jnp.int32)
+    if row is None:
+        return lax.dynamic_slice(stream, (s,), (int(window),))
+    r = jnp.asarray(row, jnp.int32)
+    return lax.dynamic_slice(stream, (r, s), (1, int(window))).reshape(
+        int(window))
+
+
 def advance(agent, enc_carry, vmem_sums, vmem_counts,
             delta_tokens, delta_count, owner, *, window,
             chunk=None, budget=None, participants=None,
-            edge_mem=None, edge_ids=None):
+            edge_mem=None, edge_ids=None, start=None, row=None):
     """Extend the carry by one step's delta; returns the new
     ``(enc_carry, vmem_sums, vmem_counts)``.
 
@@ -276,9 +290,19 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
     edge write costs no second encode. The return then appends the updated
     ``(emem_sums, emem_counts)``; with ``edge_mem=None`` the signature,
     the arithmetic and the trace are exactly the pre-flag ones.
+
+    THE EPISODE STREAM. ``start`` (and ``row`` for an ``(E, L)`` stream, the
+    shape the loss holds) say that ``delta_tokens`` is the environment's
+    whole episode stream and this delta begins at ``start``. The FOLDED
+    branch reads chunk ``j`` straight out of it with a ``dynamic_slice``;
+    the unfolded legacy branch cuts the ``window`` out first, because
+    ``encode_extend`` takes a standalone buffer. See
+    ``common.episode_stream``.
     """
     if edge_mem is not None and edge_ids is None:
         raise ValueError("advance: edge_mem given without edge_ids")
+    if row is not None and start is None:
+        raise ValueError("advance: row= given without start=")
     if _FOLD and participants is not None:
         # Only the PARTICIPATION branch folds. The authorship branch below is
         # the legacy path for callers without a face enumeration (unit tests),
@@ -288,7 +312,14 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
             agent, enc_carry, vmem_sums, vmem_counts, delta_tokens,
             delta_count, window=window, chunk=chunk,
             budget=budget, participants=participants,
-            edge_mem=edge_mem, edge_ids=edge_ids)
+            edge_mem=edge_mem, edge_ids=edge_ids, start=start, row=row)
+    if start is not None:
+        # LEGACY, UNFOLDED BRANCH. `encode_extend` reads a standalone
+        # buffer, so the delta's window is cut out of the stream first --
+        # the one place the episode stream still materialises a window, and
+        # it is the branch production does not run (`_FOLD` is on by
+        # default and the trainer always passes `participants`).
+        delta_tokens = _stream_window(delta_tokens, start, row, window)
     carry2, rows, valid = agent.encode_extend(
         enc_carry, delta_tokens, delta_count,
         window=window, start=0, chunk=chunk, budget=budget,
@@ -334,7 +365,7 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
 def _advance_folded(agent, enc_carry, vmem_sums, vmem_counts, delta_tokens,
                     delta_count, *, window, chunk=None,
                     budget=None, participants=None,
-                    edge_mem=None, edge_ids=None):
+                    edge_mem=None, edge_ids=None, start=None, row=None):
     """`advance`'s participation branch with the rows folded away.
 
     Everything the branch does with `rows` is LINEAR in two running
@@ -381,7 +412,7 @@ def _advance_folded(agent, enc_carry, vmem_sums, vmem_counts, delta_tokens,
     carry2, _acc = _fold.extend_fold(
         agent, enc_carry, delta_tokens, delta_count,
         window=window, chunk=chunk, budget=budget,
-        init_acc=init, fold_fn=fold)
+        init_acc=init, fold_fn=fold, start=start, row=row)
     tot_rows, n_rows = _acc[:2]
 
     part = jnp.asarray(participants, jnp.float32)
