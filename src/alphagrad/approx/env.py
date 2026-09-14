@@ -7897,20 +7897,32 @@ def _callback_measured(
         def _probe_one(ex, eval_args) -> float:
             """Seconds of ONE execution of `ex`, measured on the WARM-UP.
 
-            The warm-up is an execution the protocol already pays for (see
-            `_resolve_warmup`), so the probe costs nothing extra. It is a
-            COLD reading by construction -- the identity plan's first cold
-            execution reads about 7 percent below its settled value -- and
-            that is immaterial here, because the reading only chooses HOW
-            MANY windows and how many executions per window to run.
+            THE LAST warm-up execution, and there are at least TWO. A single
+            warm-up is a COLD reading, and a cold reading here does not just
+            add noise to the counts, it can change the SCALE of the result:
+            the inner-rep count is ``ceil(window / t)``, so a `t` that reads
+            HIGH gives a SMALLER inner, and a small inner on a microsecond
+            program reads high against the dispatch floor (section 1.3 of
+            docs/UNBIASED_PARETO_AND_MEASUREMENT.md).
 
-            ``max(1, _warmup)``: with ``ALPHAGRAD_MEASURE_WARMUP=0`` the
-            budget still has to size itself from something, so that
-            configuration now pays exactly ONE untimed execution per half
-            per plan where it used to pay none. It buys the counts.
+            MEASURED, on the transformer arm (job 65666, one measure actor,
+            two episodes, one warm-up): the rev-exact reference settled at
+            138 us, but some plans' cold probe read about 2.5 ms and took
+            inner 20 instead of 50. Those plans then read up to 220 us, and
+            the reference's coefficient of variation over 112 plans was 9.6
+            percent against 2.1 percent under the fixed protocol. The second
+            warm-up costs one execution of the reference, 0.14 ms, and the
+            docs size the cold read as gone by the second reading (the
+            identity plan's first cold reading is 7.2 percent off and is
+            back inside 2 percent by reading two).
+
+            With ``ALPHAGRAD_MEASURE_WARMUP=0`` the budget still has to size
+            itself from something, so that configuration now pays exactly
+            TWO untimed executions per half per plan where it used to pay
+            none. They buy the counts.
             """
             _t = 0.0
-            for _w in range(max(1, _warmup)):
+            for _w in range(max(2, _warmup)):
                 _p0 = time.perf_counter()
                 jax.block_until_ready(ex(*eval_args))
                 _t = time.perf_counter() - _p0
