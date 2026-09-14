@@ -163,6 +163,23 @@ def add_ppo_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "step is num_data_points × reps_per_point (default 5 × 4 = 20).",
     )
     p.add_argument(
+        "--ref-num-data-points", type=int, default=5,
+        help="THE PAIRED REV-EXACT REFERENCE's own data points, decoupled "
+        "from --num-data-points (owner ruling 2026-09-14). Default 5.",
+    )
+    p.add_argument(
+        "--ref-reps-per-point", type=int, default=32,
+        help="THE PAIRED REV-EXACT REFERENCE's own timing repetitions per "
+        "data point, decoupled from --reps-per-point (owner ruling "
+        "2026-09-14). Default 32, so the reference is measured 5 × 32 = 160 "
+        "times against the candidate's 5 × 4 = 20. One candidate execution "
+        "is 18.2 ms on the transformer arm and one reference execution is "
+        "0.121 ms, so a shared budget integrated the candidate for 18.3 s "
+        "and the reference for 0.12 s, and the reference then carried "
+        "essentially all of the paired log ratio's 0.045-nat scatter. "
+        "--latency-inner-reps stays SHARED between the two halves.",
+    )
+    p.add_argument(
         "--percentile-keep", type=float, default=0.60,
         help="Percentile (in [0, 1]) used to aggregate the noisy-channel "
         "pool. 0.60 = P60: 'slowest 60%% latency / highest 60%% memory / "

@@ -13,9 +13,17 @@ timed by a throughput protocol (3 laps of 20) while the plan it floored was
 timed by the campaign loop at --latency-inner-reps 5, so the floor read
 13-15% below an honest exact plan for the whole v57-v66 campaign. The paired
 reference of ticket .9 is measured by `_campaign_measure_cost`, which is
-`_time_one_rep` in the same loop the candidate runs, with the same (points,
-reps, inner, warmup) and the same median -- these tests pin that, plus the
-warmup and cold-start properties the instrument carries.
+`_time_one_rep` in the same loop the candidate runs, over the same eval args
+with the same (inner, warmup) and the same median -- these tests pin that,
+plus the warmup and cold-start properties the instrument carries.
+
+SINCE 2026-09-14 THE POINTS AND THE REPS ARE THE REFERENCE'S OWN (owner
+ruling; `EnvConfig.ref_num_data_points` / `ref_reps_per_point`, defaults 5
+and 32). That is not a second protocol: the per-window instrument is
+unchanged and only the SAMPLE COUNT differs, because the two halves of the
+pair are 150x apart in cost and the shared budget left the cheap half with a
+tenth of a second of integration. The last two tests in this module pin the
+fork end to end and pin that the reference's compile key is untouched by it.
 """
 import os
 
@@ -92,7 +100,14 @@ def test_reference_matches_the_campaign_measurement_of_the_same_executable():
     """INTEGRATION (CPU, real compile): the number the paired reference is
     charged equals the campaign-path measurement of the same executable.
     Same executable, same eval args, same instrument -- so the only
-    difference left is timer noise."""
+    difference left is timer noise.
+
+    STILL MEANINGFUL AFTER THE 2026-09-14 FORK. The counts are passed in
+    here, not read off a config, so this compares the two CODE PATHS at one
+    budget, which is the property it has always pinned. The fork changes how
+    many samples the reference takes, not what one sample means, and the
+    medians agree either way -- the test that the reference runs its OWN
+    counts is `test_the_reference_runs_its_own_points_and_reps` below."""
     import jax
     from graphax import jacve
 
@@ -258,3 +273,150 @@ def test_the_quality_gate_is_gone():
     # The name survives only in the block comment that records the deletion.
     assert src.count("ALPHAGRAD_QUALITY_GATE_MIN") == 1
     assert "ALPHAGRAD_QUALITY_GATE_MIN" not in os.environ
+
+
+# ==========================================================================
+# THE REFERENCE'S OWN BUDGET (owner ruling 2026-09-14)
+# ==========================================================================
+#
+# Until this ruling `_campaign_measure_cost` was handed the CANDIDATE's
+# `num_data_points` x `reps_per_point`. The two halves of the pair are not
+# the same size: on the transformer arm one candidate execution is 18.2 ms
+# and one reference execution is 0.121 ms, so the shared 5 x 4 budget bought
+# the candidate 18.3 s of integration and the reference 0.12 s. Measured over
+# 128 repeats of one plan (job 65468) the candidate reading has a coefficient
+# of variation of 0.56 percent and the reference 4.53 percent, and since the
+# two are independent the paired log ratio scatters by 0.045 nats, essentially
+# all of it the reference's.
+#
+# `EnvConfig.ref_num_data_points` / `ref_reps_per_point` (defaults 5 and 32)
+# fork the POINTS and the REPS only. The inner reps, the warmup, the eval
+# args and the median stay shared, so the tests above still describe one
+# instrument.
+
+
+def _one_instrument_toy_env(**kw):
+    """A 16-wide scalar loss, measured on the CPU, terminal rewards only.
+
+    Small on purpose: these tests count TIMED WINDOWS, so the cheapest graph
+    that still has several eliminable vertices is the right one.
+    """
+    import jax
+    from alphagrad.approx.env import VertexEliminationEnv
+
+    rng = np.random.default_rng(0)
+    W = jnp.asarray(rng.standard_normal((16, 16), dtype=np.float32) / 4.0)
+    x = jnp.asarray(np.linspace(-1.0, 1.0, 16, dtype=np.float32))
+
+    def toy(v):
+        return jnp.sum(jnp.tanh(W @ v) ** 2)
+
+    closed = jax.make_jaxpr(toy)(x)
+    kw.setdefault("measure_latency", True)
+    kw.setdefault("terminal_rewards_only", True)
+    kw.setdefault("latency_inner_reps", 1)
+    return VertexEliminationEnv.from_jaxpr(
+        closed, args=[x], argnums=(0,), num_envs=0, target_fun=toy, **kw)
+
+
+def _walk(env, order):
+    """Run `order` to the end with no rule and no face action."""
+    from alphagrad.approx.env import (
+        FACE_SLOTS, MAX_FACES, MAX_RULES_PER_VERTEX, StepAction)
+
+    state = env.reset()
+    no_rules = jnp.full((MAX_RULES_PER_VERTEX, 3), -1, jnp.int32)
+    no_rules = no_rules.at[..., 2].set(0)
+    faces = jnp.full((MAX_FACES, FACE_SLOTS, 3), -1, jnp.int32)
+    skips = jnp.zeros((MAX_FACES,), jnp.int32)
+    for v in order:
+        state = env.step(
+            state,
+            StepAction(jnp.asarray(v, jnp.int32), no_rules, faces, skips),
+        ).state
+    return state
+
+
+@pytest.fixture
+def _paired_log_cpu(monkeypatch):
+    """The cost form and the cheap channels these two tests measure under."""
+    monkeypatch.setenv("ALPHAGRAD_COST_FORM", "paired-log")
+    monkeypatch.setenv("ALPHAGRAD_QUALITY_METRIC", "none")
+    monkeypatch.setenv("ALPHAGRAD_DIRECT_MEASURE", "1")
+    monkeypatch.setenv("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
+    monkeypatch.setenv("ALPHAGRAD_SKIP_COUNT_OPS", "1")
+    monkeypatch.delenv("ALPHAGRAD_PLAN_LOG", raising=False)
+    yield
+    env_mod.consume_plan_records()
+
+
+def test_the_reference_runs_its_own_points_and_reps(_paired_log_cpu,
+                                                    monkeypatch):
+    """END TO END: the reference takes `ref_points x ref_reps` timed windows
+    and the candidate takes `points x reps`, in the SAME terminal callback.
+
+    Counted the way `test_a_throughput_protocol_would_read_low` counts, by
+    intercepting `_time_one_rep` -- but through the real callback, so this
+    fails if the fork is added to `_campaign_measure_cost` and not actually
+    wired at the call site. The candidate's order is the FORWARD one so its
+    executable can never be the reference's rev-exact one.
+    """
+    seen: list[int] = []
+    real = env_mod._time_one_rep
+
+    def _counting(ex, eval_args, devices, inner):
+        seen.append(id(ex))
+        return real(ex, eval_args, devices, inner)
+
+    monkeypatch.setattr(env_mod, "_time_one_rep", _counting)
+
+    env = _one_instrument_toy_env(
+        num_data_points=2, reps_per_point=2,
+        ref_num_data_points=3, ref_reps_per_point=5)
+    vs = sorted(int(v) for v in np.asarray(env.valid_vertices))
+    assert len(vs) >= 2
+    _walk(env, vs)                                   # forward order
+
+    from collections import Counter
+    counts = sorted(Counter(seen).values())
+    # One executable took 3 x 5 = 15 windows (the reference) and every other
+    # one took 2 x 2 = 4 (the candidate). Before the ruling every group was 4.
+    assert counts.count(15) == 1, counts
+    assert set(counts) == {4, 15}, counts
+
+
+def test_the_reference_compile_key_does_not_depend_on_the_rep_counts(
+        _paired_log_cpu, monkeypatch):
+    """`paired_ref_key` is the reverse order, the sparse flag, the argument
+    shapes and dtypes and the device -- and nothing else.
+
+    If a future edit folds the budget into the key, every change of
+    --ref-reps-per-point would recompile the reference (about 1.9 s) and,
+    worse, two arms that measure the same executable would stop sharing the
+    cross-actor compile cache. Pinned by running the same plan under two
+    different reference budgets and comparing the key the cache was asked
+    for.
+    """
+    from alphagrad.approx.common import compile_cache as _cc
+
+    def _run(ref_reps):
+        keys: list[bytes] = []
+        real = _cc.cached_compile
+
+        def _spy(cache_key, compile_fn):
+            keys.append(bytes(cache_key))
+            return real(cache_key, compile_fn)
+
+        monkeypatch.setattr(_cc, "cached_compile", _spy)
+        env = _one_instrument_toy_env(
+            num_data_points=2, reps_per_point=2,
+            ref_num_data_points=2, ref_reps_per_point=ref_reps)
+        vs = sorted(int(v) for v in np.asarray(env.valid_vertices))
+        _walk(env, vs)
+        monkeypatch.setattr(_cc, "cached_compile", real)
+        return [k for k in keys if k.startswith(b"paired-ref:")]
+
+    a = _run(3)
+    b = _run(17)
+    assert a and b
+    assert set(a) == set(b)

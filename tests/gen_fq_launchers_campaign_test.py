@@ -217,6 +217,11 @@ def test_every_campaign_arm_carries_the_required_flags(gen, campaign):
         joined = " " + " ".join(toks) + " "
         for frag in (" --example TransformerLM ", " --exec-on-gpu ",
                      " --measure-latency ", " --latency-inner-reps 50 ",
+                     # THE PAIRED REFERENCE'S OWN BUDGET (owner ruling
+                     # 2026-09-14), named explicitly on every training arm.
+                     # The inner reps stay SHARED at 50, above.
+                     " --ref-num-data-points 5 ",
+                     " --ref-reps-per-point 32 ",
                      " --cmp-type latency ", " --mem-type peak_memory ",
                      " --cost-form paired-log ", " --mem-channel temp ",
                      " --quality-metric grad_cosine ",

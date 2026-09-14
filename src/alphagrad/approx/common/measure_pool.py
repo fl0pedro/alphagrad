@@ -40,7 +40,8 @@ def spawn_measure_pool(args_dict: dict, *, n_actors: int, exec_on_gpu: bool,
 
     ``args_dict`` must describe the SAME measurement the caller's own env
     performs (``measure_grad``, ``per_face``, ``num_data_points``,
-    ``reps_per_point``, ``latency_inner_reps``, target/dataset): the actor
+    ``reps_per_point``, ``ref_num_data_points``, ``ref_reps_per_point``,
+    ``latency_inner_reps``, target/dataset): the actor
     rebuilds its env from this dict, so a mismatch means the actor measures a
     different graph than the search acts on — silently.
     """

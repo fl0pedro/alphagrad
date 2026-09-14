@@ -2401,6 +2401,28 @@ class EnvConfig(NamedTuple):
     # timing noise, so when latency isn't measured we collapse to 1 rep.
     num_data_points: int = 5
     reps_per_point: int = 4
+    # THE PAIRED REFERENCE'S OWN BUDGET (owner ruling 2026-09-14).
+    #
+    # The rev-exact reference used to be measured with the CANDIDATE's
+    # `num_data_points` x `reps_per_point`. That is the wrong budget for it,
+    # because the two halves of the pair are not the same size. Measured on
+    # the transformer arm (job 65468, 128 repeats of one plan): the candidate
+    # takes 18.2 ms per execution and the reference 0.121 ms, so the shared
+    # 5 x 4 budget buys the candidate 18.3 s of integration and the reference
+    # 0.12 s. The candidate reading then has a coefficient of variation of
+    # 0.56 percent and the reference 4.53 percent, the two are independent
+    # (the reference's lag-1 autocorrelation is 0.03) and so they add in
+    # quadrature: the paired log ratio scatters by 0.0446 nats, of which
+    # essentially all is the reference.
+    #
+    # 5 x 32 gives the reference 8005 executions, about 0.97 s, which is five
+    # percent of the plan's measurement time. It takes the reference's CV to
+    # about 1.6 percent and the paired ratio to about 2.0 percent -- half of
+    # today's noise. The INNER reps are NOT decoupled: `latency_inner_reps`
+    # stays shared between the two halves (owner ruling), because it is the
+    # one number of the protocol that was actually measured.
+    ref_num_data_points: int = 5
+    ref_reps_per_point: int = 32
     # Spec's accumulation loop: each timed rep executes the compiled fn this
     # many times inside ONE ResourceMonitor window and divides the elapsed
     # time, amortizing dispatch/timer overhead (spec default 50; kept at 1
@@ -3219,7 +3241,8 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
 # every face None, the jax.grad-equivalent -- in the same callback, right
 # after the candidate, through the same executable path and the same
 # instrument (`_campaign_measure_cost` -> `_time_one_rep`, same eval args,
-# same points x reps, same inner-reps, same warmup, same median). The cost
+# same inner-reps, same warmup, same median -- but since 2026-09-14 its OWN
+# points x reps, see `EnvConfig.ref_num_data_points`). The cost
 # channels then carry the LOG-DIFFERENCE ``Delta_c = log cost_c(candidate)
 # - log cost_c(rev-exact)`` (stored negated like every cost slot), so
 # rev-exact scores 0 by construction and a GPU-state drift of 18-20 % between
@@ -3436,6 +3459,13 @@ def _campaign_measure_cost(ex, eval_args_list, unique_devices,
     quality gate's exact floor until 2026-09-04) so the reference is,
     literally, the number the campaign path would have printed for that
     plan.
+
+    The CALLER chooses the counts. Since the owner's ruling of 2026-09-14
+    the reference is handed `EnvConfig.ref_num_data_points` /
+    `ref_reps_per_point` rather than the candidate's, because the two
+    halves of the pair are 150x apart in cost and the shared budget left
+    the cheap half under-integrated. `inner` and `warmup` remain the
+    candidate's, so the per-window protocol is still one instrument.
     """
     _lat: list[float] = []
     _peak: list[float] = []
@@ -7345,6 +7375,18 @@ def _callback_measured(
     if eval_samples:
         n_points = min(n_points, len(eval_samples[0]))
     n_reps = max(1, int(getattr(config, "reps_per_point", 4))) if config.measure_latency else 1
+    # THE PAIRED REFERENCE'S OWN BUDGET, decoupled from the candidate's
+    # (owner ruling 2026-09-14; see EnvConfig.ref_num_data_points for the
+    # measurement that motivates it). The reference is 150x cheaper per
+    # execution than the candidate on the Markowitz order, so the candidate's
+    # counts leave it with a tenth of a second of integration and it carries
+    # essentially all of the paired ratio's noise. The inner reps and the
+    # warmup stay SHARED; only the points and the reps fork here.
+    n_ref_points = max(1, int(getattr(config, "ref_num_data_points", 5)))
+    if eval_samples:
+        n_ref_points = min(n_ref_points, len(eval_samples[0]))
+    n_ref_reps = (max(1, int(getattr(config, "ref_reps_per_point", 32)))
+                  if config.measure_latency else 1)
 
     # Match the monitor to whichever device the compiled JIT actually runs
     # on. Without --exec-on-gpu the args arrive as CpuDevice JAX arrays
@@ -7402,13 +7444,17 @@ def _callback_measured(
     # gradient rather than scored.
     try:
         # THE MEASUREMENT INPUTS, materialised ONCE. The paired rev-exact
-        # reference (ticket .9) measures its executable over exactly
-        # this list, with exactly the parameters below, so the candidate
-        # and its reference are timed on the same data with the same
-        # instrument (see _time_one_rep). Built inside the try so a
-        # device_put OOM still truncates rather than escaping.
+        # reference (ticket .9) measures its executable over the SAME DATA
+        # with the SAME instrument (see _time_one_rep) -- but since
+        # 2026-09-14 over its OWN number of points, so the list is built to
+        # whichever of the two is longer and each half takes its prefix.
+        # The candidate reads `eval_args_all[:n_points]` and the reference
+        # `eval_args_all[:n_ref_points]`; at the campaign defaults the two
+        # are both 5 and the list is exactly what it always was. Built
+        # inside the try so a device_put OOM still truncates rather than
+        # escaping.
         eval_args_all: list = []
-        for i in range(n_points):
+        for i in range(max(n_points, n_ref_points)):
             if eval_samples:
                 _ea = [arg[i] for arg in eval_samples]
             else:
@@ -7546,11 +7592,19 @@ def _callback_measured(
         # Measured HERE, back to back with the candidate's cost loop above
         # and BEFORE the quality walk, so nothing expensive sits between
         # the two halves of the pair. Same executable path (see
-        # `_do_compile_paired_ref`), same eval args, same points x reps,
-        # same inner-reps, same warmup, same median: `_campaign_measure_cost`
-        # is `_time_one_rep` in a loop, exactly like the loop above. The
-        # static temp is read off the reference executable the same way
-        # `_record_mem_parity` reads the candidate's.
+        # `_do_compile_paired_ref`), same eval args, same inner-reps, same
+        # warmup, same median: `_campaign_measure_cost` is `_time_one_rep`
+        # in a loop, exactly like the loop above. The static temp is read
+        # off the reference executable the same way `_record_mem_parity`
+        # reads the candidate's.
+        #
+        # THE POINTS AND THE REPS ARE ITS OWN (owner ruling 2026-09-14,
+        # `ref_num_data_points` / `ref_reps_per_point`). They used to be the
+        # candidate's, which handed the cheap half of a 150x-asymmetric pair
+        # a tenth of a second of integration and put 98 percent of the
+        # paired ratio's variance on it. The COMPILE CACHE KEY
+        # (`paired_ref_key`) does not depend on any of these counts, so
+        # changing them never recompiles the reference.
         _ref_lat_ns = 0.0
         _ref_peak = 0.0
         _ref_temp = None
@@ -7559,8 +7613,8 @@ def _callback_measured(
             _ref_ex = cached_compile(
                 b"paired-ref:" + paired_ref_key, _do_compile_paired_ref)
             _ref_lat_ns, _ref_peak = _campaign_measure_cost(
-                _ref_ex, eval_args_all, unique_devices, _inner, _warmup,
-                n_reps)
+                _ref_ex, eval_args_all[:n_ref_points], unique_devices,
+                _inner, _warmup, n_ref_reps)
             _ref_temp = _static_temp_bytes(_ref_ex)
             _pf("cb.paired_ref")
 
@@ -8094,6 +8148,11 @@ class VertexEliminationEnv:
         latency_samples: int = 1,
         num_data_points: int = 5,
         reps_per_point: int = 4,
+        # The paired rev-exact reference's OWN budget (owner ruling
+        # 2026-09-14). Named explicitly rather than left to ``**_compat``,
+        # which would swallow them silently.
+        ref_num_data_points: int = 5,
+        ref_reps_per_point: int = 32,
         latency_inner_reps: int = 1,
         latency_warmup: int = 0,
         per_face: bool = False,
@@ -8170,6 +8229,8 @@ class VertexEliminationEnv:
             mem_type=mem_type,
             num_data_points=int(num_data_points),
             reps_per_point=int(reps_per_point),
+            ref_num_data_points=int(ref_num_data_points),
+            ref_reps_per_point=int(ref_reps_per_point),
             latency_inner_reps=int(latency_inner_reps),
             latency_warmup=int(latency_warmup),
             per_face=bool(per_face),

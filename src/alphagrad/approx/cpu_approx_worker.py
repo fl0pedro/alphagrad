@@ -805,6 +805,13 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         # silently falls back to the EnvConfig defaults (5×4=20 measures).
         num_data_points=int(getattr(args, "num_data_points", 5)),
         reps_per_point=int(getattr(args, "reps_per_point", 4)),
+        # THE PAIRED REV-EXACT REFERENCE's OWN budget (owner ruling
+        # 2026-09-14). Forwarded here for exactly the reason the two lines
+        # above are: THIS env, inside the measure actor, is the one that
+        # takes the reference measurement, so a missing forward would leave
+        # --ref-reps-per-point silently inert in every pooled run.
+        ref_num_data_points=int(getattr(args, "ref_num_data_points", 5)),
+        ref_reps_per_point=int(getattr(args, "ref_reps_per_point", 32)),
         percentile_keep=float(getattr(args, "percentile_keep", 0.60)),
         # Latency-measurement knobs — THIS env (inside the CpuApproximationActor)
         # does the actual pooled measurement, so the flags must be forwarded

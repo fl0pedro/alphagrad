@@ -4884,6 +4884,29 @@ def make_argparser() -> argparse.ArgumentParser:
         "quality/memory don't need repeats.",
     )
     p.add_argument(
+        "--ref-num-data-points", type=int, default=5,
+        help="THE PAIRED REV-EXACT REFERENCE's own number of data points, "
+        "decoupled from --num-data-points (owner ruling 2026-09-14). "
+        "Default 5.",
+    )
+    p.add_argument(
+        "--ref-reps-per-point", type=int, default=32,
+        help="THE PAIRED REV-EXACT REFERENCE's own timing repetitions per "
+        "data point, decoupled from --reps-per-point (owner ruling "
+        "2026-09-14). Default 32, so the reference is measured 5x32=160 "
+        "times against the candidate's 5x4=20. The two halves of the pair "
+        "are not the same size: measured on the transformer arm, one "
+        "candidate execution is 18.2 ms and one reference execution is "
+        "0.121 ms, so a SHARED budget gave the candidate 18.3 s of "
+        "integration and the reference 0.12 s. The candidate reading then "
+        "has a CV of 0.56 percent and the reference 4.53 percent, and the "
+        "paired log ratio scatters by 0.045 nats, essentially all of it "
+        "from the reference. 5x32 costs the reference about 1 s per plan, "
+        "five percent of the plan's measurement time, and halves the "
+        "paired ratio's noise. --latency-inner-reps is NOT decoupled: it "
+        "stays shared between the two halves.",
+    )
+    p.add_argument(
         "--latency-inner-reps", type=int, default=1,
         help="Measurement protocol: executions per timed rep inside one "
         "monitor window; elapsed time is divided by this, amortizing "
@@ -7036,6 +7059,10 @@ def main():
         measure_latency=measure_latency,
         num_data_points=int(args.num_data_points),
         reps_per_point=int(args.reps_per_point),
+        # THE PAIRED REFERENCE'S OWN BUDGET (owner ruling 2026-09-14). The
+        # inner reps stay shared; only the points and the reps fork.
+        ref_num_data_points=int(args.ref_num_data_points),
+        ref_reps_per_point=int(args.ref_reps_per_point),
         latency_inner_reps=int(args.latency_inner_reps),
         # --face-actions IMPLIES per-face legality masking for the per-vertex
         # micro rules too: face slots are already live-mask-hooked, but a raw

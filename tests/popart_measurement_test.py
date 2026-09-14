@@ -105,9 +105,13 @@ def test_measurement_flags_are_wired_not_swallowed():
     looked like it worked and did nothing."""
     a = make_argparser().parse_args(["--example", "X"])
     assert (a.num_data_points, a.reps_per_point) == (5, 4)   # spec 5 x 4 = 20
+    # THE PAIRED REFERENCE'S OWN BUDGET (owner ruling 2026-09-14): 5 x 32,
+    # decoupled from the candidate's 5 x 4.
+    assert (a.ref_num_data_points, a.ref_reps_per_point) == (5, 32)
     cfg = EnvConfig(jaxpr=None, argnums=(), has_aux=False, sparse=False,
                     cmp_type="flops", mem_type="peak_memory")
     assert (cfg.num_data_points, cfg.reps_per_point) == (5, 4)
+    assert (cfg.ref_num_data_points, cfg.ref_reps_per_point) == (5, 32)
 
 
 def test_advantage_norm_defaults_to_none():

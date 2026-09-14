@@ -487,6 +487,20 @@ SHARED_CLI = [
     ("--latency-inner-reps", "50"),
     ("--num-data-points", "5"),
     ("--reps-per-point", "4"),
+    # THE PAIRED REV-EXACT REFERENCE'S OWN BUDGET (owner ruling 2026-09-14).
+    # Named explicitly on every training arm, not left to the CLI default,
+    # for the same reason --num-data-points is: a launcher must say what it
+    # measured.  The two halves of the pair are 150x apart in cost on this
+    # order -- one candidate execution is 18.2 ms and one reference execution
+    # is 0.121 ms -- so the SHARED 5 x 4 budget gave the candidate 18.3 s of
+    # integration and the reference 0.12 s.  Measured over 128 repeats of one
+    # plan (job 65468): candidate CV 0.56 percent, reference CV 4.53 percent,
+    # paired log ratio sd 0.0446 nats, essentially all of it the reference.
+    # 5 x 32 costs the reference about 1 s per plan, five percent of the
+    # plan's measurement time, and halves the paired ratio's noise.  The
+    # INNER reps stay shared at 50 above (owner ruling).
+    ("--ref-num-data-points", "5"),
+    ("--ref-reps-per-point", "32"),
     ("--incremental-encode", None),
     # REAL measured latency and REAL measured peak memory. Non-negotiable.
     ("--cmp-type", "latency"),
