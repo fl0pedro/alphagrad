@@ -13974,7 +13974,7 @@ def main():
                     # the bin, and `reset` is deterministic and makes no
                     # host callback under delta_obs, so this is the same
                     # states at the same width and nothing else.
-                    _env_w = env_episode.with_delta_window(_w)
+                    _env_w = env_episode.with_delta_window(1 << int(_w))
                     _s = reset_envs(_env_w)
                     _t0, _f0 = _episode_streams(_n, _w)
                     _out = rollout_fn(
