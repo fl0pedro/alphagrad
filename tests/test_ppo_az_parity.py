@@ -161,9 +161,9 @@ def test_initial_vertex_logits_are_near_uniform(agents):
     """
     for agent in agents:
         toks = jnp.arange(1, 65, dtype=jnp.int32)
-        eqn_ids = jnp.zeros_like(toks)
-        logits, _ctx, _v = agent.encode(
-            toks, eqn_ids=eqn_ids, key=jax.random.PRNGKey(0))
+        # `encode` takes tokens alone since 2026-09-13: the equation-id
+        # relational bias went with the ids themselves.
+        logits, _ctx, _v = agent.encode(toks, key=jax.random.PRNGKey(0))
         finite = logits[jnp.isfinite(logits)]
         assert float(jnp.max(jnp.abs(finite))) < 0.5, (
             f"initial |logit| too large: {float(jnp.max(jnp.abs(finite)))}")

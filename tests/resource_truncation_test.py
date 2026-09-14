@@ -99,6 +99,6 @@ def test_zero_work_no_longer_returns_sentinel():
                             "alphagrad", "approx", "env.py")).read()
     assert "ZERO-WORK PLANS ARE KEPT" in src
     blk = src[src.index("ZERO-WORK PLANS ARE KEPT"):]
-    blk = blk[: blk.index("return tokens, eqn_ids, rewards")]
+    blk = blk[: blk.index("return _wire(tokens, eqn_ids, rewards)")]
     assert "_truncated_reward()" not in blk
     assert "_SENTINEL_BAD_REWARD" not in blk
