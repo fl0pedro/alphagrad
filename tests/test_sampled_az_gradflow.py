@@ -79,10 +79,9 @@ def setup():
     # rows makes the vertex CE test what its name says.
     W0 = 16
     base_tok = jnp.asarray((np.arange(W0) % 7 + 1).astype(np.int32))
-    base_eqn = jnp.zeros((W0,), jnp.int32)
     base_own = jnp.asarray(((np.arange(W0) % TOTAL_V) + 1).astype(np.int32))
     enc, vs, vc = _cs.init_carry(
-        agent, base_tok, base_eqn, W0, window=W0, total_v=TOTAL_V,
+        agent, base_tok, W0, window=W0, total_v=TOTAL_V,
         embd_dim=ns.embd_dim, base_owners=base_own)
 
     F = agent.face_path_policy.max_faces
@@ -116,10 +115,7 @@ def setup():
     dt = np.zeros((D, W), np.int32)
     dt[0, :5] = [1, 2, 3, 4, 5]
     dt[1, :4] = [2, 3, 4, 5]
-    de = np.full((D, W), -1, np.int32)
-    de[0, :5] = 0
-    de[1, :4] = 0
-    sd_dt, sd_de = jnp.asarray(dt), jnp.asarray(de)
+    sd_dt = jnp.asarray(dt)
     sd_fa = jax.tree_util.tree_map(
         lambda *xs: jnp.stack(xs), fa0, fa1, fa_pad)
 
@@ -132,7 +128,7 @@ def setup():
         la=jnp.arange(n_legal, dtype=jnp.int32),
         pi=jnp.asarray(pi_np[:n_legal]), pi_pad=jnp.asarray(pi_np),
         sd=(sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp, sd_fvalid,
-            sd_cnt, sd_dt, sd_de, sd_fa,
+            sd_cnt, sd_dt, sd_fa,
             # endpoint ids per draw: face 0 -> (1, 2), rest "no vertex"
             jnp.asarray(np.pad(np.array([[[1, 2]]] * D, np.int32),
                                ((0, 0), (0, F - 1), (0, 0)))),),

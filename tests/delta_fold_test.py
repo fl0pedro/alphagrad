@@ -28,22 +28,21 @@ class StubAgent:
 
     embd_dim = E
 
-    def encode_extend(self, carry, toks, eqns, count, *, window, start=0,
+    def encode_extend(self, carry, toks, count, *, window, start=0,
                       chunk=None, budget=None):
         del start, chunk, budget
         idx = jnp.arange(window, dtype=jnp.int32)
         valid = idx < count
 
         def step(c, x):
-            tok, eid, ok = x
+            tok, ok = x
             c2 = jnp.where(ok, c + tok.astype(jnp.float32), c)
             row = jnp.where(ok, c2 * (1.0 + jnp.arange(E, dtype=jnp.float32)),
                             jnp.zeros((E,), jnp.float32))
             return c2, row
 
-        c_out, rows = lax_scan(step, carry, (toks[:window], eqns[:window],
-                                             valid))
-        return c_out, rows, valid, eqns[:window]
+        c_out, rows = lax_scan(step, carry, (toks[:window], valid))
+        return c_out, rows, valid
 
 
 def lax_scan(f, init, xs):
@@ -54,21 +53,18 @@ def lax_scan(f, init, xs):
 def _mk(window, count, seed=0):
     r = np.random.RandomState(seed)
     toks = jnp.asarray(r.randint(1, 9, size=window).astype(np.int32))
-    eqns = jnp.asarray(np.where(r.rand(window) < 0.75,
-                                r.randint(0, 5, size=window), -1
-                                ).astype(np.int32))
-    return toks, eqns, jnp.asarray(count, jnp.int32)
+    return toks, jnp.asarray(count, jnp.int32)
 
 
-def _flat_sums(agent, toks, eqns, count, window):
-    """The reduction as the LIVE code does it: full-width rows, then sum."""
-    c, rows, valid, eq = agent.encode_extend(
-        0.0, toks, eqns, count, window=window)
+def _flat_sums(agent, toks, count, window):
+    """The reduction as the LIVE code does it: full-width rows, then sum.
+
+    TWO accumulators, not four: the eqn-owned / structural split went with
+    the equation ids (see ``carry_stream.advance``).
+    """
+    c, rows, valid = agent.encode_extend(0.0, toks, count, window=window)
     w = jnp.asarray(valid, jnp.float32)
-    w_eqn = w * (eq >= 0).astype(jnp.float32)
-    w_str = w - w_eqn
-    return c, (jnp.sum(rows * w_eqn[:, None], axis=0), jnp.sum(w_eqn),
-               jnp.sum(rows * w_str[:, None], axis=0), jnp.sum(w_str))
+    return c, (jnp.sum(rows * w[:, None], axis=0), jnp.sum(w))
 
 
 @pytest.mark.parametrize("window,count,chunk", [
@@ -77,10 +73,10 @@ def _flat_sums(agent, toks, eqns, count, window):
 ])
 def test_fold_matches_full_width_reduction(window, count, chunk):
     agent = StubAgent()
-    toks, eqns, cnt = _mk(window, count)
-    c_ref, ref = _flat_sums(agent, toks, eqns, cnt, window)
+    toks, cnt = _mk(window, count)
+    c_ref, ref = _flat_sums(agent, toks, cnt, window)
     init, fold = sum_reducer(E)
-    c_fold, acc = extend_fold(agent, 0.0, toks, eqns, cnt, window=window,
+    c_fold, acc = extend_fold(agent, 0.0, toks, cnt, window=window,
                               chunk=chunk, init_acc=init, fold_fn=fold)
     assert float(jnp.abs(c_fold - c_ref)) < 1e-5, "carry diverged"
     for a, b in zip(acc, ref):
@@ -91,31 +87,31 @@ def test_gradient_matches_too():
     """Values agreeing is not enough -- the loss differentiates through this."""
     agent = StubAgent()
     window, chunk = 64, 16
-    toks, eqns, cnt = _mk(window, 40, seed=3)
+    toks, cnt = _mk(window, 40, seed=3)
 
     def f_flat(c0):
-        _, (te, _ne, ts, _ns) = _flat_sums(agent, toks, eqns, cnt, window)
-        return jnp.sum(te) + jnp.sum(ts) + c0 * 0.0
+        _, (te, _ne) = _flat_sums(agent, toks, cnt, window)
+        return jnp.sum(te) + c0 * 0.0
 
     def f_fold(c0):
         init, fold = sum_reducer(E)
-        _, (te, _ne, ts, _ns) = extend_fold(
-            agent, c0, toks, eqns, cnt, window=window, chunk=chunk,
+        _, (te, _ne) = extend_fold(
+            agent, c0, toks, cnt, window=window, chunk=chunk,
             init_acc=init, fold_fn=fold)
-        return jnp.sum(te) + jnp.sum(ts)
+        return jnp.sum(te)
 
     def g_flat(c0):
-        c, rows, valid, eq = agent.encode_extend(
-            c0, toks, eqns, cnt, window=window)
+        c, rows, valid = agent.encode_extend(
+            c0, toks, cnt, window=window)
         w = jnp.asarray(valid, jnp.float32)
         return jnp.sum(rows * w[:, None])
 
     def g_fold(c0):
         init, fold = sum_reducer(E)
-        _, (te, ne, ts, ns) = extend_fold(
-            agent, c0, toks, eqns, cnt, window=window, chunk=chunk,
+        _, (te, _ne) = extend_fold(
+            agent, c0, toks, cnt, window=window, chunk=chunk,
             init_acc=init, fold_fn=fold)
-        return jnp.sum(te) + jnp.sum(ts)
+        return jnp.sum(te)
 
     assert bool(jnp.allclose(g_flat(0.5), g_fold(0.5), atol=1e-5))
     d_flat = jax.grad(g_flat)(0.5)
@@ -133,9 +129,9 @@ def test_face_key_offset_is_applied():
     """
     ends = jnp.asarray([10, 25, 40], jnp.int32)
     key = face_key_fn(ends)
-    first = key(jnp.zeros((10,), jnp.int32), 0)
-    second = key(jnp.zeros((10,), jnp.int32), 10)
-    third = key(jnp.zeros((10,), jnp.int32), 30)
+    first = key(10, 0)
+    second = key(10, 10)
+    third = key(10, 30)
     assert list(np.asarray(first)) == [0] * 10
     assert list(np.asarray(second)) == [1] * 10          # NOT 0
     assert list(np.asarray(third)) == [2] * 10           # NOT 0
@@ -144,11 +140,11 @@ def test_face_key_offset_is_applied():
 def test_segment_fold_matches_full_width_scatter():
     agent = StubAgent()
     window, chunk, F = 64, 16, 4
-    toks, eqns, cnt = _mk(window, 50, seed=5)
+    toks, cnt = _mk(window, 50, seed=5)
     ends = jnp.asarray([12, 28, 44, 64], jnp.int32)
 
-    _c, rows, valid, _eq = agent.encode_extend(
-        0.0, toks, eqns, cnt, window=window)
+    _c, rows, valid = agent.encode_extend(
+        0.0, toks, cnt, window=window)
     w = jnp.asarray(valid, jnp.float32)
     pos = jnp.arange(window, dtype=jnp.int32)
     fid = jnp.searchsorted(ends, pos, side="right").astype(jnp.int32)
@@ -158,7 +154,7 @@ def test_segment_fold_matches_full_width_scatter():
 
     init, fold = segment_reducer(E, F, face_key_fn(ends))
     _cf, (sums, counts) = extend_fold(
-        agent, 0.0, toks, eqns, cnt, window=window, chunk=chunk,
+        agent, 0.0, toks, cnt, window=window, chunk=chunk,
         init_acc=init, fold_fn=fold)
     assert bool(jnp.allclose(sums, ref_sums, atol=1e-5))
     assert bool(jnp.allclose(counts, ref_counts, atol=1e-5))
@@ -167,11 +163,11 @@ def test_segment_fold_matches_full_width_scatter():
 def test_chunk_size_does_not_change_the_answer():
     agent = StubAgent()
     window = 96
-    toks, eqns, cnt = _mk(window, 70, seed=7)
+    toks, cnt = _mk(window, 70, seed=7)
     outs = []
     for chunk in (8, 16, 32, 96, 128):
         init, fold = sum_reducer(E)
-        _c, acc = extend_fold(agent, 0.0, toks, eqns, cnt, window=window,
+        _c, acc = extend_fold(agent, 0.0, toks, cnt, window=window,
                               chunk=chunk, init_acc=init, fold_fn=fold)
         outs.append(acc[0])
     for o in outs[1:]:
@@ -187,10 +183,10 @@ def test_chunk_zero_is_the_encode_extend_sentinel_not_an_error():
     back to the fold's own chunk and the answer is unchanged.
     """
     agent = StubAgent()
-    toks, eqns, cnt = _mk(64, 40, seed=21)
-    ref = _flat_sums(agent, toks, eqns, cnt, 64)[1]
+    toks, cnt = _mk(64, 40, seed=21)
+    ref = _flat_sums(agent, toks, cnt, 64)[1]
     init, fold = sum_reducer(E)
-    _c, acc = extend_fold(agent, 0.0, toks, eqns, cnt, window=64, chunk=0,
+    _c, acc = extend_fold(agent, 0.0, toks, cnt, window=64, chunk=0,
                           init_acc=init, fold_fn=fold)
     for a, b in zip(acc, ref):
         assert bool(jnp.allclose(a, b, atol=1e-5))
@@ -217,12 +213,12 @@ def test_budget_skipping_is_exact(window, count, chunk, budget):
     cost 64x a 1024 delta: the cost folding exists to remove.
     """
     agent = StubAgent()
-    toks, eqns, cnt = _mk(window, count, seed=11)
+    toks, cnt = _mk(window, count, seed=11)
     init, fold = sum_reducer(E)
-    c_no, acc_no = extend_fold(agent, 0.0, toks, eqns, cnt, window=window,
+    c_no, acc_no = extend_fold(agent, 0.0, toks, cnt, window=window,
                                chunk=chunk, init_acc=init, fold_fn=fold)
     init2, fold2 = sum_reducer(E)
-    c_bd, acc_bd = extend_fold(agent, 0.0, toks, eqns, cnt, window=window,
+    c_bd, acc_bd = extend_fold(agent, 0.0, toks, cnt, window=window,
                                chunk=chunk, init_acc=init2, fold_fn=fold2,
                                budget=budget)
     assert float(jnp.abs(c_bd - c_no)) < 1e-5, "carry diverged under budget"
@@ -233,14 +229,14 @@ def test_budget_skipping_is_exact(window, count, chunk, budget):
 def test_budget_gradient_survives_the_cond():
     """cond must stay transposable -- while_loop here would kill the loss."""
     agent = StubAgent()
-    toks, eqns, cnt = _mk(128, 30, seed=13)
+    toks, cnt = _mk(128, 30, seed=13)
 
     def g(c0):
         init, fold = sum_reducer(E)
-        _, (te, _ne, ts, _ns) = extend_fold(
-            agent, c0, toks, eqns, cnt, window=128, chunk=16,
+        _, (te, _ne) = extend_fold(
+            agent, c0, toks, cnt, window=128, chunk=16,
             init_acc=init, fold_fn=fold, budget=30)
-        return jnp.sum(te) + jnp.sum(ts)
+        return jnp.sum(te)
 
     d = jax.grad(g)(0.5)
     assert bool(jnp.isfinite(d)) and float(jnp.abs(d)) > 0.0

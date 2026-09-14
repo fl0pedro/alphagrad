@@ -15,10 +15,10 @@ tokenizer streams) and asserts the two paths agree BITWISE, so it can be re-run
 unchanged after stage 2 deletes the old one:
 
   1. the delta buffer IS ``stream[pos : pos + W]``, token for token AND
-     eqn-id for eqn-id -- the absolute-cursor path never read anything the
+     token for token -- the absolute-cursor path never read anything the
      relative-cursor path does not carry;
   2. the encoder carry (M, I, cumhist, nvalid, pos), the emitted rows, the
-     valid mask and the eqn window are bitwise identical after EVERY step of
+     valid mask are bitwise identical after EVERY step of
      EVERY env, and so is the vertex-memory fold they feed;
   3. the base buffer reproduces the wide-window base encode bitwise;
   4. the per-face chunks and their counts are unchanged.
@@ -95,28 +95,25 @@ def _graph():
 
 
 def _observations(order):
-    """The per-step (tokens, eqn_ids, true_len) buffers the env emits for
-    ``order``, built exactly the way ``env._incremental_stream_tokens`` +
-    ``env._callback`` build them: base tokens, then one block per elimination,
-    pad-filled (0 for tokens, -1 for eqn ids)."""
+    """The per-step (tokens, true_len) buffers the env emits for ``order``,
+    built exactly the way ``env._incremental_stream_tokens`` +
+    ``env._callback`` build them: base tokens, then one block per
+    elimination, pad-filled with 0. ONE buffer: the equation-id half was
+    removed on 2026-09-13."""
     jaxpr, consts, args, argnums = _graph()
     tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
                                   vocab_size=VOCAB_TOK)
     stream = [int(t) for t in tk.base_tokens()]
-    seg = [int(g) for g in tk.last_eqn_ids()]
-    snaps = [(list(stream), list(seg))]
+    snaps = [list(stream)]
     for v in order:
         stream += [int(t) for t in tk.eliminate(int(v))]
-        seg += [int(g) for g in tk.last_eqn_ids()]
-        snaps.append((list(stream), list(seg)))
+        snaps.append(list(stream))
     bufs = []
-    for s, g in snaps:
+    for s in snaps:
         assert len(s) <= STREAM_W, f"golden stream {len(s)} > STREAM_W"
         t = np.zeros((STREAM_W,), np.int32)
-        e = np.full((STREAM_W,), -1, np.int32)
         t[:len(s)] = np.asarray(s, np.int32)
-        e[:len(g)] = np.asarray(g, np.int32)
-        bufs.append((jnp.asarray(t), jnp.asarray(e), len(s)))
+        bufs.append((jnp.asarray(t), len(s)))
     return bufs
 
 
@@ -222,34 +219,34 @@ def test_delta_buffer_equals_the_stream_window_bitwise(env_i, delta_w):
     agent, obs = _AGENT, _OBS[env_i]
     total_v = _V
 
-    def _fold(rows, eqns, valid):
-        ids = jnp.where((eqns >= 0) & (eqns < total_v), eqns, -1)
+    # The rows go to ONE slot per token position, keyed by position rather
+    # than by a stream-global segment id: those ids are gone, and reading
+    # them as vertex indices was bug #92 anyway.
+    def _fold(rows, valid):
+        ids = jnp.arange(rows.shape[0], dtype=jnp.int32) % total_v
         s = jnp.zeros((total_v + 1, EMBD), jnp.float32)
         c = jnp.zeros((total_v + 1,), jnp.float32)
         return _vmem.update_ids(s, c, rows, ids, valid)
 
     # --- base: wide window over the stream vs a base-sized buffer ---------
-    tok0, eqn0, raw0 = obs[0]
+    tok0, raw0 = obs[0]
     n0 = _stream_end(tok0)
     assert int(n0) == raw0
 
-    old, r_old, v_old, e_old = agent.encode_extend(
-        agent.carry_init(), tok0, eqn0, n0, window=STREAM_W)
-    btok, beqn = _window_copy(tok0, eqn0, 0, n0, BASE_W)
+    old, r_old, v_old = agent.encode_extend(
+        agent.carry_init(), tok0, n0, window=STREAM_W)
+    btok = _window_copy(tok0, 0, n0, BASE_W)
     assert np.array_equal(np.asarray(btok)[:raw0], np.asarray(tok0)[:raw0])
-    assert np.array_equal(np.asarray(beqn)[:raw0], np.asarray(eqn0)[:raw0])
     assert np.all(np.asarray(btok)[raw0:] == 0)
-    assert np.all(np.asarray(beqn)[raw0:] == -1)
-    new, r_new, v_new, e_new = agent.encode_extend(
-        agent.carry_init(), btok, beqn, n0, window=BASE_W, start=0)
+    new, r_new, v_new = agent.encode_extend(
+        agent.carry_init(), btok, n0, window=BASE_W, start=0)
     _carry_equal(old, new, f"env {env_i} base")
     assert np.array_equal(np.asarray(r_old)[:raw0], np.asarray(r_new)[:raw0])
     assert np.all(np.asarray(r_old)[raw0:] == 0.0)
     assert np.all(np.asarray(r_new)[raw0:] == 0.0)
     assert np.array_equal(np.asarray(v_old)[:raw0], np.asarray(v_new)[:raw0])
-    assert np.array_equal(np.asarray(e_old)[:raw0], np.asarray(e_new)[:raw0])
-    s_old, c_old = _fold(r_old, e_old, v_old)
-    s_new, c_new = _fold(r_new, e_new, v_new)
+    s_old, c_old = _fold(r_old[:BASE_W], v_old[:BASE_W])
+    s_new, c_new = _fold(r_new, v_new)
     assert np.array_equal(np.asarray(c_old), np.asarray(c_new))
     assert np.array_equal(np.asarray(s_old), np.asarray(s_new)), (
         "base vertex-memory fold differs, max|diff|="
@@ -257,7 +254,7 @@ def test_delta_buffer_equals_the_stream_window_bitwise(env_i, delta_w):
 
     # --- one step per elimination ----------------------------------------
     for k in range(1, len(obs)):
-        tok, eqn, raw = obs[k]
+        tok, raw = obs[k]
         # The two cursors must agree; they only equal the TRUE stream position
         # while no step has clipped (delta_w=1024 clips on this graph, exactly
         # as MAX_DELTA_TOKENS=2048 clips nn256's 5664-token deltas -- and both
@@ -269,31 +266,26 @@ def test_delta_buffer_equals_the_stream_window_bitwise(env_i, delta_w):
         if int(old.pos) == obs[k - 1][2]:
             assert int(cnt) == raw - obs[k - 1][2]
 
-        dtok, deqn = _window_copy(tok, eqn, new.pos, cnt, delta_w)
+        dtok = _window_copy(tok, new.pos, cnt, delta_w)
         # (1) TOKEN FOR TOKEN against what the absolute cursor reads.
         assert np.array_equal(
             np.asarray(dtok),
             np.asarray(_raw_window(tok, old.pos, delta_w, 0))), (
             f"env {env_i} step {k}: delta tokens != stream[pos:pos+W]")
-        assert np.array_equal(
-            np.asarray(deqn),
-            np.asarray(_raw_window(eqn, old.pos, delta_w, -1))), (
-            f"env {env_i} step {k}: delta eqn ids != stream[pos:pos+W]")
 
-        old, ro, vo, eo = agent.encode_extend(
-            old, tok, eqn, cnt, window=delta_w)
-        new, rn, vn, en = agent.encode_extend(
-            new, dtok, deqn, cnt, window=delta_w, start=0)
+        old, ro, vo = agent.encode_extend(
+            old, tok, cnt, window=delta_w)
+        new, rn, vn = agent.encode_extend(
+            new, dtok, cnt, window=delta_w, start=0)
         # (2) bitwise-identical encoder state after EVERY step
         _carry_equal(old, new, f"env {env_i} step {k}")
         assert np.array_equal(np.asarray(ro), np.asarray(rn)), (
             f"env {env_i} step {k}: rows differ, max|diff|="
             f"{np.max(np.abs(np.asarray(ro) - np.asarray(rn)))}")
         assert np.array_equal(np.asarray(vo), np.asarray(vn))
-        assert np.array_equal(np.asarray(eo), np.asarray(en))
 
-        so, co = _fold(ro, eo, vo)
-        sn, cn = _fold(rn, en, vn)
+        so, co = _fold(ro, vo)
+        sn, cn = _fold(rn, vn)
         assert np.array_equal(np.asarray(co), np.asarray(cn))
         assert np.array_equal(np.asarray(so), np.asarray(sn))
 
@@ -305,19 +297,19 @@ def test_loss_replay_needs_only_the_stored_buffer_and_count():
     -- no ``_stream_len``, no ``batch.tokens``."""
     agent, obs = _AGENT, _OBS[0]
     W = 4096
-    tok0, eqn0, raw0 = obs[0]
-    btok, beqn = _window_copy(tok0, eqn0, 0, raw0, BASE_W)
-    carry, _r, _v, _e = agent.encode_extend(
-        agent.carry_init(), btok, beqn, raw0, window=BASE_W, start=0)
+    tok0, raw0 = obs[0]
+    btok = _window_copy(tok0, 0, raw0, BASE_W)
+    carry, _r, _v = agent.encode_extend(
+        agent.carry_init(), btok, raw0, window=BASE_W, start=0)
     for k in range(1, len(obs)):
-        tok, eqn, _raw = obs[k]
+        tok, _raw = obs[k]
         cnt = _stream_end(tok) - carry.pos
-        dtok, deqn = _window_copy(tok, eqn, carry.pos, cnt, W)
+        dtok = _window_copy(tok, carry.pos, cnt, W)
         stored_carry, stored_cnt = carry, jnp.asarray(cnt, jnp.int32)
-        carry, rows, _v, _e = agent.encode_extend(
-            carry, dtok, deqn, cnt, window=W, start=0)
-        replay, rows2, _v2, _e2 = agent.encode_extend(
-            stored_carry, dtok, deqn, stored_cnt, window=W, start=0)
+        carry, rows, _v = agent.encode_extend(
+            carry, dtok, cnt, window=W, start=0)
+        replay, rows2, _v2 = agent.encode_extend(
+            stored_carry, dtok, stored_cnt, window=W, start=0)
         _carry_equal(carry, replay, f"loss replay step {k}")
         assert np.array_equal(np.asarray(rows), np.asarray(rows2))
 
@@ -354,29 +346,29 @@ def test_face_chunks_and_counts_unchanged():
         pytest.skip("no multi-face vertex on this graph")
 
     agent, obs = _AGENT, _OBS[0]
-    tok0, eqn0, raw0 = obs[0]
+    tok0, raw0 = obs[0]
     n0 = _stream_end(tok0)
-    c_old, _r, _v, _e = agent.encode_extend(
-        agent.carry_init(), tok0, eqn0, n0, window=STREAM_W)
-    btok, beqn = _window_copy(tok0, eqn0, 0, n0, BASE_W)
-    c_new, _r, _v, _e = agent.encode_extend(
-        agent.carry_init(), btok, beqn, n0, window=BASE_W, start=0)
+    c_old, _r, _v = agent.encode_extend(
+        agent.carry_init(), tok0, n0, window=STREAM_W)
+    btok = _window_copy(tok0, 0, n0, BASE_W)
+    c_new, _r, _v = agent.encode_extend(
+        agent.carry_init(), btok, n0, window=BASE_W, start=0)
     _carry_equal(c_old, c_new, "face branch point")
 
     counts = []
     for f in range(n_faces):
-        t, i, c, n = lfs.chunk(order, specs, 0, vertex, vspecs, rows, skips, f)[:4]
-        t2, i2, c2, n2 = lfs.chunk(order, specs, 0, vertex, vspecs, rows,
-                                   skips, f)[:4]
+        t, c, n = lfs.chunk(order, specs, 0, vertex, vspecs, rows,
+                            skips, f)[:3]
+        t2, c2, n2 = lfs.chunk(order, specs, 0, vertex, vspecs, rows,
+                               skips, f)[:3]
         # the chunk itself does not depend on the encoder at all
         assert np.array_equal(np.asarray(t), np.asarray(t2))
-        assert np.array_equal(np.asarray(i), np.asarray(i2))
         assert int(c) == int(c2) and int(n) == int(n2)
         counts.append(int(c))
         c_old, s_old = agent._face_encode(c_old, jnp.asarray(t),
-                                          jnp.asarray(i), jnp.asarray(c))
+                                          jnp.asarray(c))
         c_new, s_new = agent._face_encode(c_new, jnp.asarray(t),
-                                          jnp.asarray(i), jnp.asarray(c))
+                                          jnp.asarray(c))
         _carry_equal(c_old, c_new, f"face {f} side carry")
         assert np.array_equal(np.asarray(s_old), np.asarray(s_new)), (
             f"face {f} pooled context differs")
