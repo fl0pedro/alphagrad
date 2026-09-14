@@ -1170,9 +1170,12 @@ def flush_measure_episode() -> None:
         n = len(xs)
         return xs[n // 2] if n % 2 else 0.5 * (xs[n // 2 - 1] + xs[n // 2])
 
-    print(f"[measure] episode {st['label']}: median "
-          f"{_med(_secs):.2f} s/plan (candidate {_med(_cand):.2f} s, "
-          f"reference {_med(_ref):.2f} s) dedupe: {int(st['n_plans'])} "
+    # THE PID IS PART OF THE LINE. The accounting is per measure ACTOR, and
+    # a campaign arm runs several, so three lines per episode is the expected
+    # output and each one has to say whose it is.
+    print(f"[measure] episode {st['label']} pid {os.getpid()}: median "
+          f"{_med(_secs):.3f} s/plan (candidate {_med(_cand):.3f} s, "
+          f"reference {_med(_ref):.3f} s) dedupe: {int(st['n_plans'])} "
           f"plans {int(st['n_measured'])} measured", flush=True)
     st["key"] = None
     st["label"] = None
