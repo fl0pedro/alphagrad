@@ -841,7 +841,7 @@ def test_the_reading_does_not_depend_on_the_inner_rep_count(_monitor_path):
     program below its own 135 us reference.
     """
     import jax
-    ex, eval_args, _truth = _work_that_outlasts_its_dispatch()
+    ex, eval_args, truth_s = _work_that_outlasts_its_dispatch()
     devices = list(jax.local_devices())
     small, _p1, _s1, _o1 = env_mod._time_one_rep(ex, eval_args, devices, 1)
     large, _p2, _s2, _o2 = env_mod._time_one_rep(ex, eval_args, devices, 8)
@@ -850,6 +850,15 @@ def test_the_reading_does_not_depend_on_the_inner_rep_count(_monitor_path):
         f"inner 1 read {float(small)/1e6:.2f} ms/execution and inner 8 read "
         f"{float(large)/1e6:.2f} ms/execution; the instrument must not "
         "depend on the count")
+    # BOTH against the truth, not only against each other. A missing drain
+    # makes the reading track the DISPATCH, which is per-execution too -- so
+    # the ratio above stays near 1 while both halves are two orders of
+    # magnitude low. Measured: without the drain this pair read 11 us and
+    # 9 us for a 1233 us program, and the ratio test alone passed.
+    for _name, _r in (("inner 1", small), ("inner 8", large)):
+        assert float(_r) / 1e9 > 0.5 * truth_s, (
+            f"{_name} read {float(_r)/1e6:.3f} ms/execution for a program "
+            f"that takes {truth_s*1e3:.3f} ms")
 
 
 # ==========================================================================
@@ -916,10 +925,15 @@ def test_the_record_puts_each_half_on_its_own_side(
     samples = (jnp.asarray(
         np.stack([np.full(16, 0.5, dtype=np.float32),
                   np.full(16, -0.5, dtype=np.float32)])),)
+    # BOTH measurements before the drain: `consume_plan_records` ends the
+    # episode's accounting, and the dedupe cache is bounded to an episode.
+    _measure_once(env, order, samples)
     _measure_once(env, order, samples)
 
     assert ref_ids, "the paired reference was never compiled through the cache"
-    rec = env_mod.consume_plan_records()["records"][0]
+    recs = env_mod.consume_plan_records()["records"]
+    assert len(recs) == 2, recs
+    rec, dup = recs
 
     # 1. THE SIDES. The slow executable is the candidate's, the fast one the
     #    reference's -- not the other way round, and not both the same.
@@ -937,12 +951,12 @@ def test_the_record_puts_each_half_on_its_own_side(
     assert seq.count(0) >= 2 and seq.count(1) >= 2, seq
     assert seq != sorted(seq), seq
 
-    # 5. UNDER DEDUPE: the duplicate carries the measured plan's reward
-    #    vector, so the sides it was built from have to be right there too.
-    _measure_once(env, order, samples)
-    dup = env_mod.consume_plan_records()["records"][0]
+    # 5. UNDER DEDUPE: the second plan was NOT re-timed, and it carries the
+    #    measured plan's reward vector -- so the sides it was built from have
+    #    to be right there too.
     assert dup["measured_from"] == 0
     assert dup["rewards"][env_mod.REWARD_INDEX["latency_ns"]] == lat
+    assert dup.get("candidate_latency_ns") is None
 
 
 def test_a_candidate_cheaper_than_rev_exact_scores_above_zero(
