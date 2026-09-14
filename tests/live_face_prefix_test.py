@@ -211,7 +211,8 @@ def test_prefix_key_separates_plans_differing_only_in_face_decisions(disc):
     assert len(lfs._prefix) == 2, (
         f"two plans with the same order {order[:n].tolist()} and different "
         f"face wires {where} still share one prefix tokenizer")
-    assert int(new_a[2]) > 0 and int(new_b[2]) > 0
+    # chunk() is (tokens, count, n_faces, ends, head): the COUNT is slot 1.
+    assert int(new_a[1]) > 0 and int(new_b[1]) > 0
     assert not np.array_equal(new_a[0], new_b[0]), (
         f"face decision {where} left the next vertex's chunk unchanged")
 
@@ -235,8 +236,10 @@ def test_prefix_replay_matches_the_measurements_graph(disc):
 
     lfs._chunks.clear()
     lfs._prefix.clear()
-    tok, _ids, cnt, _nf = lfs.chunk(order, specs, n, v_cur, vspecs, rows0,
-                                    sk0, 0, faces_a, skips)[:4]
+    # (tokens, count, n_faces, ends, head) -- the parallel equation-id buffer
+    # was removed with the ids on 2026-09-13, so the count is slot 1.
+    tok, cnt, _nf = lfs.chunk(order, specs, n, v_cur, vspecs, rows0,
+                              sk0, 0, faces_a, skips)[:3]
     got = [int(x) for x in tok[:int(cnt)]]
     assert got == want_approx, (
         f"chunk read a graph the measurement never builds (decision {where}): "
@@ -245,8 +248,8 @@ def test_prefix_replay_matches_the_measurements_graph(disc):
     # ... and the OLD path reproduces the divergence it was suffering from.
     lfs._chunks.clear()
     lfs._prefix.clear()
-    tok_o, _i, cnt_o, _n = lfs.chunk(order, specs, n, v_cur, vspecs, rows0,
-                                     sk0, 0)[:4]
+    tok_o, cnt_o, _n = lfs.chunk(order, specs, n, v_cur, vspecs, rows0,
+                                 sk0, 0)[:3]
     assert [int(x) for x in tok_o[:int(cnt_o)]] == want_exact
 
 
