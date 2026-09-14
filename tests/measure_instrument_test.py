@@ -38,6 +38,7 @@ def _campaign_loop_reference(ex, eval_args_all, devices, inner, warmup, n_reps):
     """What ``_callback``'s measurement loop does, written out: warmup +
     n_points x n_reps calls to _time_one_rep, medianed. The reference must
     equal THIS, which is the whole point."""
+    import jax
     lat, peak = [], []
     for eval_args in eval_args_all:
         for _ in range(warmup):
@@ -107,6 +108,7 @@ def test_reference_matches_the_campaign_measurement_of_the_same_executable():
     many samples the reference takes, not what one sample means, and the
     medians agree either way -- the test that the reference runs its OWN
     counts is `test_the_reference_runs_its_own_points_and_reps` below."""
+    import jax
     from graphax import jacve
 
     rng = np.random.RandomState(0)
@@ -144,6 +146,7 @@ def test_reference_matches_the_campaign_measurement_of_the_same_executable():
 def test_campaign_measure_cost_honours_warmup_and_reps(monkeypatch):
     """Instrument parameters are actually plumbed: warmup calls happen outside
     the timing window, and points x reps samples are taken."""
+    import jax
     calls = {"warm": 0, "timed": 0}
 
     def _fake_rep(ex, eval_args, devices, inner):
@@ -190,6 +193,7 @@ def test_warmup_defaults_to_one_and_is_overridable(monkeypatch):
 def test_first_timed_sample_is_not_the_first_execution(monkeypatch):
     """The property that matters, pinned directly: at least one execution of
     the executable happens BEFORE the first timed rep of every data point."""
+    import jax
     log = []
 
     def _ex(*_a):
@@ -218,6 +222,7 @@ def test_reference_inherits_the_warmup(monkeypatch):
     """The reference is a FRESH compile the first time it is measured, so it
     is the most cold-start-exposed measurement in the loop. Routing it
     through _campaign_measure_cost makes it inherit the warmup."""
+    import jax
     execs = {"n": 0}
 
     def _ex(*_a):

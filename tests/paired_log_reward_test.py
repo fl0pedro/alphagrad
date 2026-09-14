@@ -260,22 +260,53 @@ def test_costlier_plan_scores_positive_delta():
 # --------------------------------------------------------------------------
 
 def test_reference_is_measured_once_per_terminal_callback(monkeypatch):
-    calls = []
-    real = envmod._campaign_measure_cost
+    """ONE full reference measurement per terminal callback, re-taken for a
+    plan that was already measured, and none at a non-terminal step.
+
+    COUNTED ON THE WINDOWS SINCE 2026-09-14. The reference used to be a
+    single call to `_campaign_measure_cost` placed after the candidate's
+    loop; the owner's ruling interleaves it with the candidate window by
+    window inside that loop, so there is no such call to count any more.
+    The property is unchanged and is pinned here on the thing that does the
+    measuring: the reference executable takes exactly
+    ``ref_num_data_points x ref_reps_per_point`` timed windows, once per
+    terminal callback.
+    """
+    from alphagrad.approx.common import compile_cache as _cc
+
+    ref_ex = []
+    real_cc = _cc.cached_compile
+
+    def _spy_compile(key, fn):
+        out = real_cc(key, fn)
+        if bytes(key).startswith(b"paired-ref:"):
+            ref_ex.append(out)
+        return out
+
+    seen = []
+    real_rep = envmod._time_one_rep
 
     def _counting(ex, *a, **k):
-        calls.append(1)
-        return real(ex, *a, **k)
+        seen.append(id(ex))
+        return real_rep(ex, *a, **k)
 
-    monkeypatch.setattr(envmod, "_campaign_measure_cost", _counting)
+    monkeypatch.setattr(_cc, "cached_compile", _spy_compile)
+    monkeypatch.setattr(envmod, "_time_one_rep", _counting)
     env = _make_env()
     rev = _rev_order(env)
+    per_cb = int(env.config.ref_num_data_points) * int(
+        env.config.ref_reps_per_point)
+
+    def _ref_windows():
+        assert ref_ex, "the paired reference was never compiled"
+        return seen.count(id(ref_ex[-1]))
+
     _run_plan(env, rev)
-    assert len(calls) == 1                              # one episode, one ref
+    assert _ref_windows() == per_cb                     # one episode, one ref
     _run_plan(env, rev)                                 # same plan again...
-    assert len(calls) == 2                              # ...measured anew
+    assert _ref_windows() == 2 * per_cb                 # ...measured anew
     _run_plan(env, rev, skip_everything=True)
-    assert len(calls) == 3
+    assert _ref_windows() == 3 * per_cb
     out = envmod.consume_plan_records()
     assert len(out["paired_ref"]["records"]) == 3
     assert out["paired_ref"]["dropped"] == 0
