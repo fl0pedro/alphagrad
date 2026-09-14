@@ -129,10 +129,22 @@ def default_log2(max_delta_tokens: int, episode_length: int) -> int:
     return max(0, bits - 3)
 
 
-def resolve_log2(max_delta_tokens: int, episode_length: int) -> int:
-    """`n` for this run: the env var if set, else :func:`default_log2`."""
+def resolve_log2(max_delta_tokens: int, episode_length: int,
+                 override=None) -> int:
+    """`n` for this run.
+
+    In order: the caller's `override` (the `--episode-tokens-log2` flag, 0
+    or None meaning "not given"), then `ALPHAGRAD_EPISODE_TOKENS_LOG2`, then
+    :func:`default_log2`. The cap applies to all three.
+    """
     raw = os.environ.get(LOG2_ENV)
-    if raw is None or raw == "":
+    if override:
+        n = int(override)
+        if n <= 0:
+            raise ValueError(
+                f"the episode stream bin must be a positive number of bits, "
+                f"got {override}")
+    elif raw is None or raw == "":
         n = default_log2(max_delta_tokens, episode_length)
     else:
         n = _int_env(LOG2_ENV, 0)

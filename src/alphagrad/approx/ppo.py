@@ -4285,8 +4285,11 @@ def make_argparser() -> argparse.ArgumentParser:
              "an exact reproduction of the previous behaviour -- gives "
              "palimpsa gradient from ONE delta and none from the elimination "
              "history. K>1 anchors the replay K-1 steps earlier and folds "
-             "the intervening deltas in with gradient, at K times the stored "
-             "delta buffers and K times the loss-side extend. "
+             "the intervening deltas in with gradient, at K times the "
+             "loss-side extend. (It no longer costs K times the stored "
+             "buffers: the K deltas are one contiguous span of the episode "
+             "token stream, so the window gather became K offsets -- see "
+             "--episode-tokens-log2.) "
              "K=0 selects the FULL-HORIZON path instead of a window: one "
              "`lax.scan` over the WHOLE episode from the base carry, so the "
              "gradient horizon is T rather than K, the per-step anchors and "
@@ -4294,6 +4297,18 @@ def make_argparser() -> argparse.ArgumentParser:
              "scaling with K (one scan body, not K unrolled ones). The "
              "minibatch axis moves from steps to SEQUENCES, because a scan "
              "needs a trajectory's steps in order.")
+    p.add_argument(
+        "--episode-tokens-log2", type=int, default=0,
+        help="n, the EPISODE TOKEN STREAM's bin. Each environment stores ONE "
+             "uint8 row of 2^n + MAX_DELTA_TOKENS slots per episode and per "
+             "stream (one for the step deltas, one for the face chunks); "
+             "every step writes its delta at a cursor and the trajectory "
+             "stores the OFFSET, not the window. 0 = derive it: "
+             + _epstream.LOG2_ENV + " if set, else " + _epstream.FIRST_BIN_RULE
+             + ". A step that would pass 2^n raises on the host BEFORE the "
+             "write; the driver logs one line, grows n by one, recompiles "
+             "and repeats the episode, monotonically and up to "
+             + _epstream.LOG2_MAX_ENV + ".")
     p.add_argument("--no-jit", action="store_true")
     p.add_argument(
         "--var-probe", action="store_true",
@@ -8461,7 +8476,9 @@ def main():
 
     # THE BIN, AND THE ONLY PLACE IT MOVES. Monotone within a run: it only
     # ever grows, by one doubling, and only when an episode overflowed.
-    _EP_LOG2 = [_epstream.resolve_log2(MAX_DELTA_TOKENS, int(num_valid))]
+    _EP_LOG2 = [_epstream.resolve_log2(
+        MAX_DELTA_TOKENS, int(num_valid),
+        override=int(getattr(args, "episode_tokens_log2", 0) or 0))]
     print("[episode-stream] first bin 2^%d = %d slots per environment per "
           "stream, %d-slot tail, %d bytes per row (rule: %s; override with "
           "%s, cap %s=%d)"

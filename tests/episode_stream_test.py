@@ -34,14 +34,47 @@ import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-import jax                                                        # noqa: E402
 import jax.numpy as jnp                                           # noqa: E402
 import numpy as np                                                # noqa: E402
 import pytest                                                     # noqa: E402
 
-from alphagrad.approx.common import episode_stream as ES          # noqa: E402
-from alphagrad.approx.common.delta_fold import (                  # noqa: E402
-    extend_fold, plan_chunks, sum_reducer)
+# EVERY ALPHAGRAD IMPORT HERE IS LAZY, ON PURPOSE. This module sorts FIRST
+# in tests/, and importing `alphagrad.approx` at module scope freezes
+# env.py's MAX_DELTA_TOKENS / MAX_FACES at COLLECTION time -- which turns
+# every later module's scale pin into a dead write (the config guard says so
+# out loud, and then that module measures under a width it did not choose).
+# Nothing here needs a scale, so nothing here takes one, and nothing here
+# imports before the first test body runs.
+class _LazyModule:
+    """Import on first attribute access, not at collection."""
+
+    def __init__(self, path):
+        self._path = path
+        self._mod = None
+
+    def __getattr__(self, name):
+        if self._mod is None:
+            import importlib
+
+            self._mod = importlib.import_module(self._path)
+        return getattr(self._mod, name)
+
+
+ES = _LazyModule("alphagrad.approx.common.episode_stream")
+_FOLD = _LazyModule("alphagrad.approx.common.delta_fold")
+
+
+def extend_fold(*a, **k):
+    return _FOLD.extend_fold(*a, **k)
+
+
+def plan_chunks(*a, **k):
+    return _FOLD.plan_chunks(*a, **k)
+
+
+def sum_reducer(*a, **k):
+    return _FOLD.sum_reducer(*a, **k)
+
 
 E = 4
 
@@ -451,14 +484,20 @@ def test_the_token_storage_is_under_twenty_kilobytes_per_step_per_environment():
     assert before / after > 5.0
 
 
-def test_the_row_holds_the_measured_episode_with_room_for_one_doubling():
-    """The first bin is not tight: at a measured ~3000 tokens a step a 95
-    step episode is ~285 000 slots against 2^19 = 524 288, so a per-step
-    length that doubled would still fit without a recompile."""
+def test_the_first_bin_holds_the_measured_episode_with_headroom_short_of_a_doubling():
+    """MEASURED, not assumed. At ~3000 tokens a step a 95 step episode is
+    285 000 slots against 2^19 = 524 288 -- a factor of 1.84, NOT the factor
+    of 2 the design note's size section claims. A per-step length that
+    actually doubled overflows and costs exactly one growth (2^20), which is
+    what the growth path is for. Pinned here so the claim and the arithmetic
+    cannot drift apart again."""
     n, T, measured = 19, 95, 3000
-    assert measured * T < (1 << n)
-    assert 2 * measured * T < (1 << n)
-    assert 4 * measured * T > (1 << n)     # and three doublings would not
+    used = measured * T
+    assert used < (1 << n)
+    assert 1.8 < (1 << n) / used < 1.9
+    # A doubled per-step length does NOT fit, and the next bin does.
+    assert 2 * used > (1 << n)
+    assert 2 * used < (1 << (n + 1))
 
 
 def test_the_stream_is_bytes_not_words():
