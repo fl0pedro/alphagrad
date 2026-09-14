@@ -812,7 +812,10 @@ def test_ppo_argparse_accepts_every_campaign_command_line(gen, campaign):
                                      else cli["--approx-profile"]), a["name"]
         assert ns.face_actions and ns.per_face_masks and ns.unified_face_head
         assert ns.live_faces and ns.dynamic_substeps and ns.incremental_encode
-        assert ns.ray_measure == 1 and ns.ray_measure_timeout == 600.0, a["name"]
+        # One PPO GPU, every other GPU a measure actor (owner ruling
+        # 2026-09-14, replacing the one-actor ruling of 2026-09-13).
+        assert ns.ray_measure == gen.CAMPAIGN_GPUS - 1, a["name"]
+        assert ns.ray_measure_timeout == 600.0, a["name"]
         assert ns.face_none_bias == float(gen.FACE_NONE_BIAS_MVP), a["name"]
         assert ns.scale_face_head == float(gen.SCALE_FACE_HEAD_MVP), a["name"]
         assert ns.face_logit_clamp == float(gen.FACE_LOGIT_CLAMP_MVP), a["name"]
