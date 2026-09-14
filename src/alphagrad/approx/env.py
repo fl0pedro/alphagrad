@@ -320,6 +320,26 @@ def consume_tokenization_truncation_stats() -> dict:
 # 4096 stops rather than silently desyncing the recurrence -- the failure
 # mode that made the old bound feel like it had to be generous. Raise the
 # env var if a new target trips it; do NOT switch to clip to hide it.
+# IT IS THE HARD CAP, NOT THE WINDOW (owner ruling 2026-09-14). This number
+# now means exactly two things and no longer means a third.
+#
+#   * it is the WIDTH OF THE WIRE. The host-to-device buffer is
+#     ``DELTA_HEADER_SLOTS + MAX_DELTA_TOKENS`` uint8 and stays that width,
+#     because three things outside the driver preallocate at it and none of
+#     them is under per-episode control: the Ray measurement pool
+#     (``ppo.py`` -> ``common/measure_pool.py``), the actor's failure
+#     sentinel (``cpu_approx_worker.py``) and the launcher pins in
+#     ``tools/gen_fq_launchers.py``.
+#   * it is the LOUD CEILING. ``_record_delta_truncation`` raises against
+#     it, so a delta the apparatus cannot carry at all stops the run.
+#
+# It is NO LONGER the window the rollout and the loss scan. That window is
+# the PER-EPISODE BIN ``EnvConfig.delta_window`` -- a power of two at or
+# below this cap, chosen from the recent measured maxima by
+# ``common.episode_stream`` and applied from ``env.step``'s slice of the
+# wire onwards. Every cost the bin targets (``ceil(W / C)`` outer fold
+# iterations, the ``(W, embd_dim)`` row block per sample per K step, the
+# ``(W,)`` edge-id vector) lives past that slice, not on the wire.
 MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "32768"))
 
 # ---------------------------------------------------------------------------
@@ -386,9 +406,55 @@ def decode_delta_header(tokens):
     return acc
 
 
-def delta_wire_width() -> int:
-    """Width of ONE delta wire buffer: the header plus the id budget."""
-    return DELTA_HEADER_SLOTS + MAX_DELTA_TOKENS
+def delta_wire_width(window=None) -> int:
+    """Width of ONE delta wire buffer: the header plus the id budget.
+
+    ``window`` is the per-episode delta window BIN. It defaults to the hard
+    cap, which is what every caller passes today: under the owner's ruling
+    of 2026-09-14 the WIRE stays at the cap and the bin applies from
+    ``env.step``'s slice of the wire onwards (see ``MAX_DELTA_TOKENS``). The
+    argument exists so that binning the wire too is one edit in
+    ``obs_width`` and not a rewrite -- the Ray pool's preallocation is what
+    blocks it, nothing here.
+    """
+    return DELTA_HEADER_SLOTS + int(window or MAX_DELTA_TOKENS)
+
+
+def validate_delta_window(window) -> int:
+    """Check a delta window bin and return it in TOKENS. 0 means the cap.
+
+    A bin must be a power of two, at most ``MAX_DELTA_TOKENS`` (it slices
+    the wire, so it cannot be wider than the wire) and at least the fold
+    chunk floor. The floor RAISES rather than clamping: a window below the
+    chunk changes the chunk size itself, which regroups the loss's float32
+    partial sums. ``common.episode_stream.DeltaWindowFloor`` says the rest.
+    """
+    w = int(window or 0)
+    if w == 0:
+        return int(MAX_DELTA_TOKENS)
+    if w < 0:
+        raise ValueError(
+            f"EnvConfig.delta_window must be >= 0 (0 meaning the cap), got "
+            f"{w}")
+    if w & (w - 1):
+        raise ValueError(
+            f"EnvConfig.delta_window must be a power of two, got {w}. The "
+            f"bins are a small set of compiled programs, one per power of "
+            f"two (owner ruling 2026-09-14).")
+    if w > MAX_DELTA_TOKENS:
+        raise ValueError(
+            f"EnvConfig.delta_window={w} is wider than the transport wire "
+            f"ALPHAGRAD_MAX_DELTA_TOKENS={MAX_DELTA_TOKENS}. The wire is "
+            f"the hard cap and the window is a slice of it.")
+    from alphagrad.approx.common import episode_stream as _epstream
+
+    floor = 1 << _epstream.window_floor_log2()
+    if w < floor:
+        raise _epstream.DeltaWindowFloor(
+            _epstream.log2_for_length(w), _epstream.window_floor_log2(),
+            _epstream.window_floor_tokens(),
+            f"EnvConfig.delta_window={w} was asked for")
+    return w
 
 # BASE-TOKEN budget for the delta-buffer observation path
 # (ALPHAGRAD_DELTA_TOKENS=1 in ppo.py). The base tokenized jaxpr is encoded
@@ -2248,7 +2314,7 @@ class EnvState(NamedTuple):
     # DELTA observation (``EnvConfig.delta_obs``): the tokens THIS step's
     # elimination emitted, as a standalone buffer read from 0, plus their
     # exact count. Degenerate ``(1,)`` / 0 when delta_obs is off.
-    delta_tokens: Array   # (MAX_DELTA_TOKENS,) uint8  (DELTA_TOKEN_DTYPE)
+    delta_tokens: Array   # (env.delta_window,) uint8  (DELTA_TOKEN_DTYPE)
     delta_count: Array    # () int32 -- the header, decoded off the wire
     # Per-vertex axis state — observation surface for the dynamic action
     # space. `axis_state` is a packed int32 array of (size, is_output,
@@ -2385,6 +2451,23 @@ class EnvConfig(NamedTuple):
     # protocol does not. Default 0 keeps every existing campaign bit-identical;
     # set it to 1 to match the reference protocol.
     latency_warmup: int = 0
+    # THE PER-STEP DELTA WINDOW BIN (owner ruling 2026-09-14). A power of
+    # two at or below MAX_DELTA_TOKENS, or 0 meaning "the cap".
+    #
+    # IT IS A SHAPE, not a budget: it sizes ``EnvState.delta_tokens`` and it
+    # is the slice ``step`` takes out of the wire. The wire itself stays at
+    # the cap (see MAX_DELTA_TOKENS), so this field changes nothing the Ray
+    # measurement pool or the actors preallocate.
+    #
+    # It rides on the CONFIG, which rides in the env's pytree AUX data, so
+    # two envs that differ only here have different treedefs and every
+    # ``eqx.filter_jit`` above them retraces by itself. That is the same
+    # retrace mechanism the episode-stream bin gets from its row shape.
+    #
+    # 0 is the default and it means "unchanged": an untouched caller -- the
+    # policy regression gate, every legacy trainer, every test that does not
+    # ask for a bin -- keeps exactly today's shapes and today's numbers.
+    delta_window: int = 0
 
 
 def _get_partials(order, sparsity_specs, stop):
@@ -7947,6 +8030,50 @@ class VertexEliminationEnv:
             axis_valid_static = jnp.asarray(axis_valid_np, dtype=jnp.float32)
         object.__setattr__(self, "axis_state_static", axis_state_static)
         object.__setattr__(self, "axis_valid_static", axis_valid_static)
+        # THE WINDOW BIN IS CHECKED WHERE THE ENV IS BUILT. It is one int
+        # comparison, and this runs on every `tree_unflatten` too, so a bin
+        # that is not a power of two or is under the fold chunk cannot reach
+        # a trace at all.
+        validate_delta_window(getattr(config, "delta_window", 0))
+
+    @property
+    def delta_window(self) -> int:
+        """The per-step delta window BIN, in tokens. The cap when unset.
+
+        This is the width of ``EnvState.delta_tokens`` and the slice
+        ``step`` takes out of the wire. It is NOT ``obs_width``: the wire
+        stays at ``DELTA_HEADER_SLOTS + MAX_DELTA_TOKENS``.
+        """
+        return validate_delta_window(
+            getattr(self.config, "delta_window", 0))
+
+    def with_delta_window(self, window):
+        """A copy of this env at a different window bin.
+
+        Everything bound on the env travels: the measurement pool and its
+        timeout, the eval samples, the static axis state, the valid-vertex
+        tuple. Losing the pool here would silently move every measurement
+        from the actors back into the driver, which is why this is a method
+        and not a `dataclasses.replace` at each call site.
+        """
+        w = validate_delta_window(window)
+        if int(getattr(self.config, "delta_window", 0) or 0) == int(
+                0 if w == MAX_DELTA_TOKENS else w):
+            return self
+        cfg = self.config._replace(
+            delta_window=int(0 if w == MAX_DELTA_TOKENS else w))
+        return type(self)(
+            cfg,
+            self.args,
+            self.consts,
+            self.valid_vertices,
+            self.num_envs,
+            self.eval_args_samples,
+            axis_state_static=self.axis_state_static,
+            axis_valid_static=self.axis_valid_static,
+            remote_pool=self._remote_pool,
+            remote_timeout_s=self._remote_timeout_s,
+        )
 
     @classmethod
     def from_jaxpr(
@@ -7973,6 +8100,10 @@ class VertexEliminationEnv:
         measure_grad: bool = False,
         scalar_target: bool = False,
         delta_obs: bool = False,
+        # THE PER-STEP DELTA WINDOW BIN. 0 means the hard cap, which is what
+        # every caller that does not bin passes and what keeps their shapes
+        # and their numbers exactly as they are. See EnvConfig.delta_window.
+        delta_window: int = 0,
         quality_rewarded=None,
         **_compat,
     ):
@@ -8050,6 +8181,7 @@ class VertexEliminationEnv:
             delta_obs=bool(delta_obs),
             measure_grad=bool(measure_grad),
             scalar_target=bool(_is_scalar),
+            delta_window=int(delta_window or 0),
         )
         return cls(
             config,
@@ -8554,7 +8686,10 @@ class VertexEliminationEnv:
             # step 0 nothing has been eliminated and the delta is empty.
             tokens = jnp.zeros((1,), dtype=jnp.int32)
             eqn_ids = jnp.zeros((1,), dtype=jnp.int32)
-            delta_tokens = jnp.zeros((MAX_DELTA_TOKENS,),
+            # THE BIN, not the cap: this buffer is carried through the whole
+            # rollout scan and read by the loss, so it is the shape the
+            # window bin exists to shrink.
+            delta_tokens = jnp.zeros((self.delta_window,),
                                      dtype=DELTA_TOKEN_DTYPE)
             delta_count = jnp.zeros((), dtype=jnp.int32)
         else:
@@ -8710,7 +8845,15 @@ class VertexEliminationEnv:
             # uint32 on the wire, int32 for indexing: exact, the host bounds
             # the count by MAX_DELTA_TOKENS before it encodes.
             delta_count = decode_delta_header(_cbout[0]).astype(jnp.int32)
-            delta_tokens = _cbout[0][DELTA_HEADER_SLOTS:]
+            # THE BIN'S SLICE OF THE WIRE. The wire is the cap wide; the
+            # state buffer is the window bin wide. `delta_count` is the
+            # EXACT host-side length and is NOT clipped here: a count past
+            # the bin is a window overflow, which the rollout carries out as
+            # a device flag and the driver turns into a repeat one bin up
+            # (`common.episode_stream`). Clipping it here instead would
+            # change the action in silence.
+            delta_tokens = _cbout[0][
+                DELTA_HEADER_SLOTS:DELTA_HEADER_SLOTS + self.delta_window]
             tokens = jnp.zeros((1,), dtype=jnp.int32)
             eqn_ids = jnp.zeros((1,), dtype=jnp.int32)
         else:
