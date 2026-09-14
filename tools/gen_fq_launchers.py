@@ -393,15 +393,72 @@ SHARED_ENV = [
     ("ALPHAGRAD_FACE_ENUM_CACHE", "1"),
     ("ALPHAGRAD_UNIFIED_FACE_ENUM", "1"),
     ("ALPHAGRAD_BATCHED_CALLBACK", "1"),
-    # PER NODE, never shared (owner ruling on ticket .21; finding 03 sec 5a):
-    # an entry written on a healthy node is reused verbatim on a node whose
-    # link toolchain is broken and the fault never fires.  That is why the
-    # wave-1 contamination was 51% / 97% rather than 100%, and why the
-    # contaminated plan set cannot be recovered from the node name.  Expanded
-    # by the shell ON THE NODE at job start.
-    ("JAX_COMPILATION_CACHE_DIR", "$HOME/.jaxcache_$(hostname -s)"),
-    ("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "2"),
 ]
+
+# ---------------------------------------------------------------------------
+# PER-NODE PERSISTENT JAX COMPILATION CACHE (owner ruling 2026-09-14, small
+# fixes #3).  /Scratch, never $HOME or /tmp: the pgi15 GPU nodes mount no
+# home directory (finding 57) and a /tmp cache dies with the job, so neither
+# warms across submissions.  Keyed by hostname, never shared across nodes
+# (same reasoning as the old ticket .21 PER NODE rule below, and the owner's
+# own: the nodes differ in GPUs and CPUs, so an executable compiled for one
+# node's ISA/driver must never be handed to another) -- an entry written on
+# a healthy node reused verbatim on a node whose link toolchain is broken is
+# exactly how the wave-1 contamination was 51%/97% rather than 100%.
+# Expanded by the shell ON THE NODE at job start; created before python
+# starts so a process that never calls common.cache.setup_jax_compile_cache
+# (which would otherwise os.makedirs it) does not hit ENOENT on first write.
+#
+# The other two exports make the cache take effect for a program of ANY
+# compile time / artifact size, not just the trainer's multi-second compiles
+# (installed JAX is 0.10.2.dev0+selfbuilt at /Scratch/assmuth/t57/stack/venv;
+# jax/_src/config.py: jax_persistent_cache_min_compile_time_secs defaults to
+# 1.0 second, jax_persistent_cache_min_entry_size_bytes defaults to 0 already
+# but is named here so it is never silently overridden -- both honoured by
+# this build). No XLA_FLAGS.
+#
+# JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES="" is the fix for a race the owner's
+# ruling did not anticipate but a live canary did: job 65500 on gpu19 (7
+# measure actors sharing this node's cache dir) died in one actor's evaluate
+# with "NOT_FOUND: .../xla_gpu_per_fusion_autotune_cache_dir/tmp/
+# tmp_per_fusion_cache__..._textproto".  This JAX build's
+# jax_persistent_cache_enable_xla_caches defaults to
+# 'xla_gpu_per_fusion_autotune_cache_dir' (jax/_src/config.py ~1427), which
+# jax/_src/compiler.py's get_compile_options (~262-283) turns on whenever the
+# persistent cache is enabled: it derives an autotune-cache subdirectory
+# under JAX_COMPILATION_CACHE_DIR and arms it UPDATE-mode for
+# `distributed.global_state.process_id == 0`, READ-mode otherwise. Every
+# measure actor here is an independent JAX runtime, not a participant in one
+# jax.distributed cluster, so EVERY actor defaults to process_id 0 and all N
+# of them write-mode the same per-fusion cache files -- the multi-writer
+# race behind the NOT_FOUND. Disabling it (empty string; the substring check
+# in get_compile_options treats "" as neither "all" nor containing either
+# cache name) turns off both optional XLA-side caches and leaves only the
+# base executable cache this ticket asks for -- a Python-level LRUCache
+# (jax/_src/lru_cache.py) that this ticket's directory change already makes
+# per-node and persistent, and which this JAX build only filelock-guards
+# when eviction is on (jax_compilation_cache_max_size != -1, not set here);
+# unlike the autotune cache it was neither asked for nor observed to race.
+JAX_CACHE_DIR_EXPR = "/Scratch/assmuth/jaxcache/$(hostname -s)"
+
+JAX_CACHE_ENV = [
+    ("JAX_COMPILATION_CACHE_DIR", JAX_CACHE_DIR_EXPR),
+    ("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0"),
+    ("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "0"),
+    ("JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES", ""),
+]
+
+
+def _jax_cache_lines() -> list[str]:
+    """``mkdir -p`` the per-node cache dir, then export the four JAX_*
+    names in JAX_CACHE_ENV.  Every arm that runs python calls this --
+    directly (the campaign and wave/cpu/tool render branches) or via the
+    ``@JAX_CACHE_BLOCK@`` placeholder (the one arm with a literal body)."""
+    L = [f"mkdir -p {JAX_CACHE_DIR_EXPR}"]
+    for k, v in JAX_CACHE_ENV:
+        L.append(f"export {k}={v}")
+    return L
+
 
 # ---------------------------------------------------------------------------
 # THE MEASURE TOOLCHAIN (finding 03, ticket dsnn-3qm.21).  The measure compile
@@ -695,7 +752,7 @@ reverted, so it is demonstrated to fail on the bug it targets.""",
     body=r"""
 export JAX_PLATFORMS=cpu
 export ALPHAGRAD_SKIP_COUNT_OPS=1
-export JAX_COMPILATION_CACHE_DIR=$HOME/.jaxcache_$(hostname -s)
+@JAX_CACHE_BLOCK@
 
 echo "=== GATE 1/3: tools/ratio_gates.sh ==="
 PY="$PY" tools/ratio_gates.sh
@@ -723,7 +780,8 @@ if [ $RG -ne 0 ] || [ $SM -ne 0 ] || [ $PL -ne 0 ]; then
   exit 1
 fi
 echo "W0 CPU GATES GREEN"
-""".replace("@CAMPAIGN_ROOT@", CAMPAIGN_ROOT),
+""".replace("@CAMPAIGN_ROOT@", CAMPAIGN_ROOT)
+      .replace("@JAX_CACHE_BLOCK@", "\n".join(_jax_cache_lines())),
 )
 
 arm(
@@ -1458,7 +1516,11 @@ STACK_ENV_NAMES = ("HOME", "PYTHONPATH", "DSNN_WIKITEXT_DIR", "DSNN_MNIST_DIR",
 #: rendered set and asserts equality with this one.
 CAMPAIGN_ENV_ALLOWED = frozenset(
     [k for k, _ in CAMPAIGN_ENV] + [k for k, _, _ in NO_FLAG_ENV]
-    + list(STACK_ENV_NAMES))
+    + list(STACK_ENV_NAMES)
+    # The per-node persistent JAX compile cache (owner ruling 2026-09-14,
+    # small fixes #3) is the one JAX_*/XLA_* exception the campaign test
+    # allows -- see JAX_CACHE_ENV.
+    + [k for k, _ in JAX_CACHE_ENV])
 
 # THE WINNERS.  None = not decided: the arm is emitted with a shell
 # placeholder the owner exports at submit time (the W1_BIAS pattern) and
@@ -2279,8 +2341,10 @@ def _scratch_stack_block() -> list[str]:
         "# Owner ruling 2026-09-13: every knob is an ARGUMENT.  Exported here:",
         "# the TLM TARGET shape (the target's size comes from these, not from",
         "# --hidden-dim/--vocab-size/--num-layers, which size the POLICY) and",
-        "# the Ray / measurement plumbing.  No XLA_*, no JAX_*; the campaign",
-        "# test refuses any export outside CAMPAIGN_ENV_ALLOWED.",
+        "# the Ray / measurement plumbing.  No XLA_*; the campaign test refuses",
+        "# any export outside CAMPAIGN_ENV_ALLOWED, JAX_* included -- the four",
+        "# names below (owner ruling 2026-09-14, small fixes #3) are the one",
+        "# allowed exception, the per-node persistent JAX compile cache.",
     ]
     for k, v in CAMPAIGN_ENV:
         L.append(f"export {k}={v}")
@@ -2289,6 +2353,8 @@ def _scratch_stack_block() -> list[str]:
     L.append("# in the header's TODO block with their evidence; promote and delete.")
     for k, v, _why in NO_FLAG_ENV:
         L.append(f"export {k}={v}")
+    L.append("")
+    L.extend(_jax_cache_lines())
     return L
 
 
@@ -2419,6 +2485,7 @@ def render(a: dict) -> str:
         for k, v in over.items():
             if k not in {kk for kk, _ in SHARED_ENV} and v is not _DELETE:
                 L.append(f"export {k}={v}")
+        L.extend(_jax_cache_lines())
     L.append("")
     L.append(_toolchain_block(kind))
     L.append("")

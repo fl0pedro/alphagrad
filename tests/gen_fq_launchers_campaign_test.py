@@ -15,9 +15,12 @@ the campaign contract is pinned on the generator:
      --cost-form paired-log, --reward-mode additive, --terminal-rewards-only,
      --ray-measure 1 --ray-measure-timeout 600, --per-face-masks with
      --face-actions, --gate-winners-table.
-  4. THE ENVIRONMENT: no promoted env var, no XLA_* / JAX_* flag, no
-     ALPHAGRAD_FORCE_REV_ORDER; every `export` is in CAMPAIGN_ENV_ALLOWED;
-     the no-flag knobs are exported AND named in the header's TODO block.
+  4. THE ENVIRONMENT: no promoted env var, no XLA_* flag, no
+     ALPHAGRAD_FORCE_REV_ORDER; every `export` is in CAMPAIGN_ENV_ALLOWED.
+     The one JAX_* exception (owner ruling 2026-09-14, small fixes #3) is
+     the four-line per-node persistent compile cache in JAX_CACHE_ENV; no
+     other JAX_* export is allowed. The no-flag knobs are exported AND
+     named in the header's TODO block.
   5. THE HARDWARE: one 8-GPU Blackwell job per node on gpu19/gpu20, -c 128,
      the /Scratch stack of finding 57 (no ~/dsnn, no uv run).
   6. THE GATE TELEMETRY (ticket .45): ppo.py has no switch for it; the
@@ -396,13 +399,70 @@ def test_no_campaign_arm_exports_a_promoted_var_or_an_xla_flag(gen, campaign):
                      "ALPHAGRAD_FORCE_REV_ORDER", "GRAPHAX_PLANNER_EXACT",
                      "GRAPHAX_QUANT_PULLDOWN", "ALPHAGRAD_MAX_FACES"):
             assert frag not in text, (a["name"], frag)
-        # no XLA memory flag, no XLA flag at all, no JAX cache/platform var
+        # no XLA memory flag, no XLA flag at all, no JAX cache/platform var --
+        # EXCEPT the per-node persistent JAX compile cache (owner ruling
+        # 2026-09-14, small fixes #3): exactly the mkdir and the four
+        # JAX_CACHE_ENV exports are allowed, verbatim, nothing else.
+        _jax_cache_exports = {f"export {k}={v}" for k, v in gen.JAX_CACHE_ENV}
+        _jax_cache_mkdir = f"mkdir -p {gen.JAX_CACHE_DIR_EXPR}"
         for line in text.splitlines():
             if line.lstrip().startswith("#"):
+                continue
+            stripped = line.strip()
+            if stripped in _jax_cache_exports or stripped == _jax_cache_mkdir:
                 continue
             assert "XLA_" not in line, (a["name"], line)
             assert "export JAX_" not in line, (a["name"], line)
             assert "JAX_COMPILATION_CACHE_DIR" not in line, (a["name"], line)
+
+
+def test_jax_cache_is_per_node_and_the_autotune_race_is_disabled(gen):
+    """Owner ruling 2026-09-14 (small fixes #3): one persistent JAX compile
+    cache dir per NODE (the nodes differ in GPUs/CPUs, and it must survive
+    across job submissions -- a per-$SLURM_JOB_ID dir never warms).
+
+    A live canary (job 65500 on gpu19, 7 measure actors sharing one node's
+    cache dir) showed WHY a shared per-node dir is not free: one actor died
+    in `evaluate` with a NOT_FOUND on
+    `xla_gpu_per_fusion_autotune_cache_dir/tmp/tmp_per_fusion_cache__..._textproto`.
+    This JAX build (0.10.2.dev0+selfbuilt,
+    /Scratch/assmuth/t57/stack/venv) defaults
+    `jax_persistent_cache_enable_xla_caches` to
+    'xla_gpu_per_fusion_autotune_cache_dir' (jax/_src/config.py ~1427), and
+    `jax/_src/compiler.py`'s `get_compile_options` (~262-283) arms that
+    subcache UPDATE-mode for `distributed.global_state.process_id == 0` --
+    which EVERY independent measure-actor process defaults to, since none
+    of them joins one `jax.distributed` cluster. All N actors on a node
+    then race UPDATE-mode writes to the same per-fusion cache files. The
+    fix keeps ONE shared executable-cache directory per node (so it still
+    warms across jobs, this ticket's actual ask) but disables the raced
+    autotune subcache outright, rather than routing it per actor PID."""
+    want = dict(gen.JAX_CACHE_ENV)
+    # per NODE: keyed by hostname, never by the job id (would defeat
+    # persistence across submissions and was never the race's cause anyway).
+    assert "hostname" in gen.JAX_CACHE_DIR_EXPR
+    assert "SLURM_JOB_ID" not in gen.JAX_CACHE_DIR_EXPR
+    assert want["JAX_COMPILATION_CACHE_DIR"] == gen.JAX_CACHE_DIR_EXPR
+    # "any compile time / any artifact size" -- both default otherwise.
+    assert want["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] == "0"
+    assert want["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] == "0"
+    # the autotune race: disabled outright (empty), not given a per-process
+    # subdirectory -- a per-PID path would also defeat the per-node
+    # executable-cache sharing this ticket asks for.
+    assert want["JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES"] == ""
+
+    # Every arm the generator renders (wave, cpu, tool, probe, campaign --
+    # not just the campaign fixture) runs python and must carry the SAME
+    # cache dir, created once, before python starts.
+    for a in gen.ARMS:
+        text = gen.render(a)
+        assert f"mkdir -p {gen.JAX_CACHE_DIR_EXPR}" in text, a["name"]
+        for k, v in gen.JAX_CACHE_ENV:
+            assert f"export {k}={v}\n" in text, (a["name"], k)
+        # ONE cache directory for the whole node -- not one per actor PID --
+        # so each export line appears exactly once per rendered launcher.
+        for k, _ in gen.JAX_CACHE_ENV:
+            assert text.count(f"export {k}=") == 1, (a["name"], k)
 
 
 def test_every_export_in_a_campaign_launcher_is_allowed(gen, campaign):
