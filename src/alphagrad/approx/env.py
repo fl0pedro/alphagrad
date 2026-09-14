@@ -340,8 +340,8 @@ MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "32768"))
 # THE COUNT HEADER. The exact host-side token count used to ride in slot 0 of
 # BOTH id buffers (`t[0] = n`, `e[0] = n`). A count up to MAX_DELTA_TOKENS
 # (32768 by default) does not fit in a byte, so the header had to leave the
-# token buffer's value space. It is now its OWN int32, written little-endian
-# across the first DELTA_HEADER_SLOTS byte slots of the wire; the tokens start
+# token buffer's value space. It is now its OWN uint32, written little-endian
+# across the first DELTA_HEADER_SLOTS byte slots of the wire (uint32); the tokens start
 # at index DELTA_HEADER_SLOTS.
 #
 # WHY FOUR BYTE SLOTS AND NOT A SEPARATE CALLBACK OUTPUT. The wire arity is
@@ -371,15 +371,18 @@ MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "32768"))
 
 
 def decode_delta_header(tokens):
-    """``() int32``: the count `encode_delta_header` wrote, off the wire.
+    """``() uint32``: the count `encode_delta_header` wrote, off the wire.
 
     THE ONE READER of the header layout on the device side. ``env.step`` calls
-    this and nothing else reconstructs the count.
+    this and nothing else reconstructs the count. Unsigned, so the full
+    32-bit range is a count (owner ruling 2026-09-14); the caller narrows to
+    int32 for indexing, which is exact because the host refuses any count
+    above MAX_DELTA_TOKENS before it encodes.
     """
-    h = jnp.asarray(tokens[:DELTA_HEADER_SLOTS]).astype(jnp.int32)
-    acc = jnp.zeros((), jnp.int32)
+    h = jnp.asarray(tokens[:DELTA_HEADER_SLOTS]).astype(jnp.uint32)
+    acc = jnp.zeros((), jnp.uint32)
     for i in range(DELTA_HEADER_SLOTS):
-        acc = acc + (h[i] << jnp.int32(8 * i))
+        acc = acc + (h[i] << jnp.uint32(8 * i))
     return acc
 
 
@@ -479,7 +482,7 @@ def _delta_observation(stream, last_start):
     and the modulation went with them.
 
     Slots ``[0, DELTA_HEADER_SLOTS)`` are the count header -- one
-    little-endian int32, see :func:`encode_delta_header`. The tokens start at
+    little-endian uint32, see :func:`encode_delta_header`. The tokens start at
     ``DELTA_HEADER_SLOTS`` and are pad-filled with 0.
 
     The count is the TOKENIZER'S OWN length. Nothing scans a padded buffer
@@ -8672,10 +8675,12 @@ class VertexEliminationEnv:
         reward = _cbout[-1]
         if self.config.delta_obs:
             # The first DELTA_HEADER_SLOTS byte slots of the wire are the
-            # exact host-side count as one little-endian int32 (see
+            # exact host-side count as one little-endian uint32 (see
             # `_delta_observation`); the tokens start after them.
             # `decode_delta_header` is the only reader of that layout.
-            delta_count = decode_delta_header(_cbout[0])
+            # uint32 on the wire, int32 for indexing: exact, the host bounds
+            # the count by MAX_DELTA_TOKENS before it encodes.
+            delta_count = decode_delta_header(_cbout[0]).astype(jnp.int32)
             delta_tokens = _cbout[0][DELTA_HEADER_SLOTS:]
             tokens = jnp.zeros((1,), dtype=jnp.int32)
             eqn_ids = jnp.zeros((1,), dtype=jnp.int32)
