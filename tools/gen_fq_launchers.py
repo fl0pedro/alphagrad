@@ -1337,7 +1337,14 @@ CAMPAIGN_GRES = ("gpu:nvidia_rtx_pro_6000_blackwell_max-q_workstation_edition"
                  f":{CAMPAIGN_GPUS}")
 CAMPAIGN_CPUS = 128
 CAMPAIGN_MEM = "800G"          # the nodes have 1.5 TB; 100 G per GPU
-CAMPAIGN_RAY_MEASURE = "1"
+# ONE PPO GPU, EVERY OTHER GPU A MEASURE ACTOR (owner ruling 2026-09-14,
+# replacing the one-actor ruling of 2026-09-13): the trainer keeps GPU 0 and
+# the terminal plans of an episode spread over the remaining GPUs of the
+# node. Canary job 65468 measured 16 plans per episode on ONE actor while six
+# Blackwells sat idle, at about 300 s per episode. The paired protocol runs
+# candidate and reference back to back inside one actor, so several actors
+# do not break the pairing.
+CAMPAIGN_RAY_MEASURE = str(CAMPAIGN_GPUS - 1)
 CAMPAIGN_RAY_MEASURE_TIMEOUT = "600"
 
 # GATE G1 (ticket .45) on a node without a home: the sweep winners are read
@@ -1403,6 +1410,12 @@ NO_FLAG_ENV = [
      "episode of C++ HloCostAnalysis state (env.py), which over 250 "
      "episodes kills the job; the flops / bytes_accessed channels it feeds "
      "are LOGGED, never trained (--rewards cmp mem acc).  No flag exists."),
+    ("ALPHAGRAD_PROFILE", "1",
+     "print the per-phase wall (rollout, measurement, loss) once per "
+     "episode from env.py's shared profiling sink (ppo.py ~7261).  Owner "
+     "ruling 2026-09-14: canary 65468 ran about 300 s per episode and "
+     "nothing in its log attributes the time, because the arms did not set "
+     "this.  Printing only; no flag exists."),
     ("ALPHAGRAD_SKIP_COUNT_OPS", "1",
      "skip the symbolic muls-count pass.  Canary job 65443 "
      "(fq_p1a_skip_hinge_tau09_lq16 on gpu19, stack at 12ed4936) wrote 48 "
@@ -1481,9 +1494,10 @@ blocks, each with a four-way Quant dtype softmax over
 {", ".join(FACE_QUANT_DTYPES)} (the operand's own dtype is masked, ticket
 .40 D4); no flag selects the dtype set.
 
-MEASUREMENT: --ray-measure {CAMPAIGN_RAY_MEASURE} actor on its own GPU
-(timeout {CAMPAIGN_RAY_MEASURE_TIMEOUT} s), ALPHAGRAD_BATCHED_CALLBACK=1,
-all {CAMPAIGN_GPUS} GPUs of the node held by this job.
+MEASUREMENT: --ray-measure {CAMPAIGN_RAY_MEASURE} actors, one per GPU the
+trainer does not hold (timeout {CAMPAIGN_RAY_MEASURE_TIMEOUT} s),
+ALPHAGRAD_BATCHED_CALLBACK=1, all {CAMPAIGN_GPUS} GPUs of the node held by
+this job. ALPHAGRAD_PROFILE=1 prints the per-phase wall every episode.
 
 THE GATE G1-G6 TELEMETRY of ticket .45 (paired/*, gate/g1..g6/*, measure/*)
 has NO switch: ppo.py's host_log computes it from the drained plan records
