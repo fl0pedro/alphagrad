@@ -1205,7 +1205,10 @@ def measure(env, eval_samples, order, plan):
     consume_mem_parity()
     specs, face_specs, face_skips = get_plan_arrays(plan, len(order))
     t0 = time.perf_counter()
-    _, _, reward = envmod._callback(
+    # The callback's arity is 2 under `delta_obs` (tokens, reward) and 3 on
+    # the legacy full-stream path (tokens, eqn_ids, reward). The reward is
+    # the LAST array either way, so read it from the end.
+    *_wire, reward = envmod._callback(
         env.config, env.args, env.consts,
         jnp.asarray(order),
         jnp.asarray(specs),

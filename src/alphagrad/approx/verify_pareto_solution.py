@@ -68,7 +68,9 @@ def replay(env, eval_samples, order, specs, label):
     ccmod.cached_compile = cc_cap
     rs = {}
     try:
-        _, _, reward = _callback(
+        # 2 arrays under `delta_obs`, 3 on the legacy full-stream path; the
+        # reward is the last one either way.
+        *_wire, reward = _callback(
             env.config, env.args, env.consts,
             jax.numpy.asarray(order), jax.numpy.asarray(specs), len(order),
             *eval_samples, raw_sink=rs,

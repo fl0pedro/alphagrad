@@ -531,7 +531,9 @@ def measure(state):
                 eval_samples=ev, init=False)
             reward = np.asarray(reward, dtype=np.float64)
         else:
-            _, _, reward = _callback(
+            # 2 arrays under `delta_obs`, 3 on the legacy full-stream path;
+            # the reward is the last one either way.
+            *_wire, reward = _callback(
                 env.config, env.args, env.consts, jnp.asarray(order),
                 jnp.asarray(specs), *_zface, n, *ev,
             )
