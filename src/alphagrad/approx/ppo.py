@@ -4379,7 +4379,14 @@ def make_argparser() -> argparse.ArgumentParser:
              + ". THEREAFTER THE DRIVER CHOOSES IT PER EPISODE, TOGETHER "
              "WITH --episode-tokens-log2 but from its own history: "
              + _epstream.WIN_SELECTION_RULE
-             + ". The two bins are independent in their arithmetic and "
+             + ". THE STEADY STATE IS NOT THE FIRST BIN: the bin settles at "
+             "the smallest power of two above the recent maximum step length "
+             "times " + _epstream.WIN_MARGIN_ENV + ", so on the transformer "
+             "(measured 3890 tokens per step) it walks to 8192 at the "
+             "default margin of "
+             + str(_epstream.WIN_MARGIN_DEFAULT)
+             + " and reaches 4096 only at a margin of 1.05 or less. The two "
+             "bins are independent in their arithmetic and "
              "joint only in the compile key. A step whose delta, or whose "
              "face chunks in total, pass 2^w set an overflow flag on the "
              "DEVICE; after the rollout the driver reads it, logs one line, "

@@ -3,7 +3,7 @@
 
 Design: `.scratch/trustworthy-approx-search/design-window-bin.md` (owner
 ruling 2026-09-14: bin the per-step window with the same rule as the stream
-bin, first bin 4096, the two chosen together).
+bin, first bin 2048, the two chosen together).
 
 `ALPHAGRAD_MAX_DELTA_TOKENS` used to bound three different quantities at
 once. It now bounds two -- the host-to-device wire and the loud ceiling --
@@ -175,19 +175,27 @@ def test_a_window_margin_below_one_is_refused_because_it_asks_for_a_bin_smaller_
     assert ES.WIN_MARGIN_ENV in str(exc.value)
 
 
-def test_the_first_window_bin_with_no_history_is_the_owners_four_thousand_and_ninety_six():
+def test_the_first_window_bin_with_no_history_is_the_owners_two_thousand_and_forty_eight():
     """The owner's ruling of 2026-09-14, and its two clamps.
 
-    The design proposed starting AT the cap; the owner chose 4096. It is
-    raised to the floor when the fold chunk is larger, and lowered to the
-    cap when `ALPHAGRAD_MAX_DELTA_TOKENS` is smaller -- a run at a 2048 cap
-    cannot start at 4096, because 4096 does not fit the wire.
+    The design proposed starting AT the cap; the owner chose 4096 and then
+    2048, to start low and grow. It is raised to the floor when the fold
+    chunk is larger, and lowered to the cap when `ALPHAGRAD_MAX_DELTA_TOKENS`
+    is smaller -- a run at a 1024 cap cannot start at 2048, because 2048 does
+    not fit the wire.
+
+    THE FIRST BIN IS NOT THE STEADY STATE. The selection rule above settles
+    at the smallest power of two above the recent maximum times the margin,
+    which on the measured transformer (3890 tokens) is 8192 at the default
+    margin of 1.5. The first bin is the guess made with no history at all,
+    and an overflow costs exactly one repeat because the repeat goes straight
+    to the bin the overflowing length needs.
     """
-    assert ES.WIN_LOG2_DEFAULT == 12
-    assert ES.resolve_window_log2(32768) == 12
+    assert ES.WIN_LOG2_DEFAULT == 11
+    assert ES.resolve_window_log2(32768) == 11
     # Smaller cap: the first bin follows it down.
-    assert ES.resolve_window_log2(2048) == 11
-    assert "4096" in ES.WIN_FIRST_BIN_RULE
+    assert ES.resolve_window_log2(1024) == 10
+    assert "2048" in ES.WIN_FIRST_BIN_RULE
 
 
 def test_the_environment_variable_and_the_flag_both_override_the_first_window_bin(

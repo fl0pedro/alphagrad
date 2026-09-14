@@ -95,8 +95,8 @@ MARGIN_ENV = "ALPHAGRAD_EPISODE_TOKENS_MARGIN"
 # host-to-device wire. It is NOT the window the rollout and the loss scan.
 # That window is a bin, chosen per episode by the same rule as the stream
 # bin, and it is where `ceil(W / C)` outer fold iterations are paid --
-# 32 of them at the cap against 4 at 4096, for a measured worst case of
-# 3890 tokens.
+# 32 of them at the cap against 2 at the first bin of 2048, for a measured
+# worst case of 3890 tokens.
 WIN_LOG2_ENV = "ALPHAGRAD_DELTA_WINDOW_LOG2"
 WIN_LOG2_MAX_ENV = "ALPHAGRAD_DELTA_WINDOW_LOG2_MAX"
 WIN_LOG2_MIN_ENV = "ALPHAGRAD_DELTA_WINDOW_LOG2_MIN"
@@ -116,19 +116,26 @@ EXTEND_CHUNK_ENV = "ALPHAGRAD_EXTEND_CHUNK"
 # window is `max(delta)` over one episode and is heavy-tailed. 1.5 over the
 # measured 3890 asks for 5835, i.e. the 8192 bin, which is the design's
 # recommendation; lowering it to 1.05 would pick 4096 with five percent of
-# headroom over a length already seen.
+# headroom over a length already seen. So the FIRST bin of 2048 and the
+# STEADY-STATE bin are two different numbers on the transformer, and that is
+# intended: the first bin is a guess with no data behind it, the steady-state
+# bin is this rule applied to a measurement.
 WIN_HISTORY_DEFAULT = 8
 WIN_MARGIN_DEFAULT = 1.5
 
-# THE FIRST WINDOW BIN (owner ruling 2026-09-14: 4096). With no history the
-# driver has no measurement, so it starts where the owner said and lets the
-# selection rule walk from there. An overflow on the first episode costs one
-# repeat, and the repeat goes straight to the bin the overflowing length
-# needs (`BinPolicy.bump`), so a wrong first guess costs one episode and not
-# one episode per doubling.
-WIN_LOG2_DEFAULT = 12
+# THE FIRST WINDOW BIN (owner ruling 2026-09-14: START AT 2048 AND GROW).
+# With no history the driver has no measurement, so it starts where the owner
+# said and lets the selection rule walk from there. An overflow on the first
+# episode costs one repeat, and the repeat goes straight to the bin the
+# overflowing length needs (`BinPolicy.bump`), so a wrong first guess costs
+# one episode and not one episode per doubling. Starting LOW is therefore the
+# cheap direction: on the measured transformer (3890 tokens per step) the
+# first episode overflows 2048 once and lands where the selection rule would
+# have put it anyway, and every run whose steps are genuinely short keeps a
+# bin half the size for the whole run.
+WIN_LOG2_DEFAULT = 11
 WIN_FIRST_BIN_RULE = (
-    "4096 tokens (2^" + str(WIN_LOG2_DEFAULT) + "), the owner's ruling of "
+    "2048 tokens (2^" + str(WIN_LOG2_DEFAULT) + "), the owner's ruling of "
     "2026-09-14, raised to " + WIN_LOG2_MIN_ENV + " when the fold chunk "
     "floor is larger and lowered to log2(ALPHAGRAD_MAX_DELTA_TOKENS) when "
     "the hard cap is smaller"
@@ -404,7 +411,7 @@ def resolve_window_log2(max_delta_tokens: int, override=None,
 
     In order: the caller's `override` (the `--delta-window-log2` flag, 0 or
     None meaning "not given"), then `ALPHAGRAD_DELTA_WINDOW_LOG2`, then the
-    owner's 4096. The floor and the cap apply to all three, and the floor
+    owner's 2048. The floor and the cap apply to all three, and the floor
     RAISES rather than clamping.
     """
     floor = window_floor_log2(chunk)
